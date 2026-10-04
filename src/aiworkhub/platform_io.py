@@ -22,6 +22,7 @@ import stat
 import subprocess
 import sys
 import time
+import traceback
 import unicodedata
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
@@ -2220,8 +2221,8 @@ def chmod_path(
 
 
 def _retry_windows_sharing_denial(
-    operation: str, path: str | os.PathLike[str], action: Callable[[], None]
-) -> None:
+    operation: str, path: str | os.PathLike[str], action: Callable[[], Any]
+) -> Any:
     """Run ``action``, riding out a transient Windows sharing denial.
 
     POSIX lets a path be replaced or unlinked while another process has it
@@ -2237,16 +2238,14 @@ def _retry_windows_sharing_denial(
     """
 
     if os.name != "nt":
-        action()
-        return
+        return action()
     deadline = time.monotonic() + WINDOWS_REPLACE_RETRY_SECONDS
     delay = 0.002
     attempts = 0
     while True:
         attempts += 1
         try:
-            action()
-            return
+            return action()
         except PermissionError as exc:
             if time.monotonic() >= deadline:
                 raise PermissionError(
@@ -2290,6 +2289,49 @@ def retrying_unlink(path: str | os.PathLike[str], *, missing_ok: bool = False) -
                 raise
 
     _retry_windows_sharing_denial("runtime_unlink_denied", path, unlink)
+
+
+def retrying_read_bytes(path: str | os.PathLike[str]) -> bytes:
+    """Read a just-written runtime artifact with :func:`atomic_replace`'s retry.
+
+    NF-2026-01351: on Windows an antivirus/indexer scan or a lingering reader of
+    a file this process just published can deny the read itself with a bare,
+    filename-less ``[Errno 13]`` (a byte-range lock surfaces from ``read()``,
+    not ``open()``). Only ``PermissionError`` is retried, within the same bound;
+    every other ``OSError`` surfaces at once, and POSIX reads exactly once.
+    Builtin ``open`` keeps this free of ``Path`` platform dispatch.
+    """
+
+    def read() -> bytes:
+        with open(path, "rb") as stream:
+            return stream.read()
+
+    return _retry_windows_sharing_denial("runtime_read_denied", path, read)
+
+
+_PACKAGE_DIR = os.path.normcase(os.path.dirname(os.path.abspath(__file__)))
+
+
+def exception_text_with_site(exc: BaseException) -> str:
+    """``str(exc)``, plus the raising aiworkhub frame for a filename-less OSError.
+
+    NF-2026-01351: a bare ``[Errno 13] Permission denied`` names neither path
+    nor operation, so a finalize failure could not be traced to its site. The
+    innermost frame inside this package is appended as ``(at file:line func)``;
+    an ``OSError`` that names its path is already actionable and is unchanged.
+    """
+
+    text = str(exc)
+    if not isinstance(exc, OSError) or exc.filename is not None:
+        return text
+    site = None
+    for frame, lineno in traceback.walk_tb(exc.__traceback__):
+        filename = os.path.normcase(os.path.abspath(frame.f_code.co_filename))
+        if filename.startswith(_PACKAGE_DIR + os.sep):
+            site = (os.path.basename(frame.f_code.co_filename), lineno, frame.f_code.co_name)
+    if site is None:
+        return text
+    return f"{text} (at {site[0]}:{site[1]} {site[2]})"
 
 
 class PublicationDurabilityError(OSError):

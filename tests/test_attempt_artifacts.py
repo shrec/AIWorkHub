@@ -1,7 +1,12 @@
 """Tests for aiworkhub.attempt_artifacts."""
 from __future__ import annotations
+import builtins
+import errno
+import io
 import json
+import os
 import pytest
+from aiworkhub import platform_io
 from aiworkhub.attempt_artifacts import (
     _ABSENT_SHA256_SENTINEL, _EMPTY_FILE_SHA256, ArtifactEntry,
     AttemptArtifactManifest, InvalidArtifactError, InvalidManifestError,
@@ -374,3 +379,58 @@ def test_path_drive_letter_anywhere_via_json_parse() -> None:
     d = _make_entry_dict(); d["path"] = "foo/C:/bar"
     with pytest.raises((InvalidManifestError, InvalidArtifactError)):
         parse_manifest_json(json.dumps({"attempt_id":"x","artifacts":[d]}))
+
+
+class _WindowsOs:
+    """``os`` as platform_io sees it on Windows, without faking the global
+    ``os.name`` that ``pathlib`` dispatches on (NF-2026-01351)."""
+
+    name = "nt"
+
+    def __getattr__(self, attribute: str):
+        return getattr(os, attribute)
+
+
+def _deny_reads_of(monkeypatch, filename: str, failures: int | None) -> list[str]:
+    """Deny the first ``failures`` opens of ``filename`` with a filename-less errno 13.
+
+    Both ``builtins.open`` and ``io.open`` are shadowed so the denial reaches a
+    ``Path.read_bytes`` re-read as well as the retrying reader.
+    """
+    real = io.open
+    calls: list[str] = []
+
+    def fake(path, *args, **kwargs):
+        if isinstance(path, (str, os.PathLike)) and os.path.basename(os.fspath(path)) == filename:
+            calls.append(os.fspath(path))
+            if failures is None or len(calls) <= failures:
+                raise PermissionError(errno.EACCES, "Permission denied")
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(platform_io, "os", _WindowsOs())
+    monkeypatch.setattr(builtins, "open", fake)
+    monkeypatch.setattr(io, "open", fake)
+    return calls
+
+
+def test_persist_json_bundle_rides_out_a_transient_manifest_read_denial(monkeypatch, tmp_path) -> None:
+    calls = _deny_reads_of(monkeypatch, "manifest.json", 1)
+
+    receipt = persist_json_bundle(tmp_path / "attempt-1", attempt_id="attempt-1", payloads=_bundle_payloads())
+
+    assert receipt["verified"] is True
+    assert len(calls) >= 2  # the denied read was retried, not surfaced
+    monkeypatch.undo()
+    assert verify_json_bundle(tmp_path / "attempt-1")["attempt_id"] == "attempt-1"
+
+
+def test_persist_json_bundle_surfaces_a_persistent_read_denial(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(platform_io, "WINDOWS_REPLACE_RETRY_SECONDS", 0.05)
+    calls = _deny_reads_of(monkeypatch, "usage.json", None)
+
+    with pytest.raises(PermissionError) as raised:
+        persist_json_bundle(tmp_path / "attempt-1", attempt_id="attempt-1", payloads=_bundle_payloads())
+
+    assert "runtime_read_denied" in str(raised.value)
+    assert "usage.json" in str(raised.value)
+    assert len(calls) > 1

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 
+from .platform_io import retrying_read_bytes
 from .worker_workspace import write_json_0600
 
 _ABSENT_SHA256_SENTINEL = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -285,8 +286,11 @@ def persist_json_bundle(
         data = _canonical_json_bytes(payloads[role])
         # Reuse the cross-platform owner-only atomic JSON writer, then hash the
         # exact committed bytes rather than the pre-write Python object.
+        # NF-2026-01351: every re-read of a just-published file rides out a
+        # transient Windows read denial (scanner/indexer) instead of failing
+        # finalize with a bare [Errno 13].
         write_json_0600(bundle_dir / filename, payloads[role])
-        committed = (bundle_dir / filename).read_bytes()
+        committed = retrying_read_bytes(bundle_dir / filename)
         if committed != data:
             raise InvalidArtifactError(
                 f"artifact byte fidelity mismatch for role {role!r}"
@@ -315,7 +319,7 @@ def persist_json_bundle(
         "attempt_id": attempt_id,
         "manifest_path": str(bundle_dir / MANIFEST_FILENAME),
         "manifest_sha256": hashlib.sha256(
-            (bundle_dir / MANIFEST_FILENAME).read_bytes()
+            retrying_read_bytes(bundle_dir / MANIFEST_FILENAME)
         ).hexdigest(),
         "artifact_count": len(entries),
         "roles": [entry.role for entry in manifest.artifacts],
@@ -330,7 +334,7 @@ def verify_json_bundle(bundle_dir: Path) -> dict[str, Any]:
     if bundle_dir.is_symlink() or manifest_path.is_symlink():
         raise InvalidManifestError("attempt artifact bundle identity is unsafe")
     try:
-        raw_manifest = manifest_path.read_text(encoding="utf-8")
+        raw_manifest = retrying_read_bytes(manifest_path).decode("utf-8")
     except OSError as exc:
         raise InvalidManifestError("attempt artifact manifest is unavailable") from exc
     manifest = parse_manifest_json(raw_manifest)
@@ -340,7 +344,7 @@ def verify_json_bundle(bundle_dir: Path) -> dict[str, Any]:
         if artifact_path.parent != bundle_dir or artifact_path.is_symlink():
             raise InvalidArtifactError("artifact path escaped or became a symlink")
         try:
-            data = artifact_path.read_bytes()
+            data = retrying_read_bytes(artifact_path)
         except OSError as exc:
             raise InvalidArtifactError(
                 f"artifact is unavailable for role {entry.role!r}"

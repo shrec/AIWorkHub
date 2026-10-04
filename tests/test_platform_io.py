@@ -1089,6 +1089,87 @@ def test_retrying_unlink_persistent_denial_names_operation_and_path(monkeypatch)
     assert 1 < len(calls) < 50
 
 
+def _denying_open(monkeypatch, calls: list[str], failures: int | None, exc_type=PermissionError):
+    """Shadow ``open`` in platform_io with a filename-less errno 13 (NF-2026-01351)."""
+    real = open
+
+    def fake(path, *args, **kwargs):
+        calls.append(os.fspath(path))
+        if failures is None or len(calls) <= failures:
+            raise exc_type(errno.EACCES if exc_type is PermissionError else errno.EIO, "denied")
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(platform_io, "open", fake, raising=False)
+
+
+def test_retrying_read_bytes_rides_out_a_transient_read_denial(monkeypatch, tmp_path):
+    target = tmp_path / "manifest.json"
+    target.write_bytes(b'{"artifacts":[]}\n')
+    target_name = str(target)  # no Path() once os.name is faked
+    calls: list[str] = []
+    slept = _fake_windows_clock(monkeypatch)
+    _denying_open(monkeypatch, calls, 2)
+
+    assert platform_io.retrying_read_bytes(target_name) == b'{"artifacts":[]}\n'
+    assert calls == [target_name] * 3
+    assert slept == [0.002, 0.004]
+
+
+def test_retrying_read_bytes_persistent_denial_names_operation_and_path(monkeypatch):
+    calls: list[str] = []
+    _fake_windows_clock(monkeypatch)
+    _denying_open(monkeypatch, calls, None)
+
+    with pytest.raises(PermissionError) as raised:
+        platform_io.retrying_read_bytes("attempt-artifacts/manifest.json")
+
+    assert str(raised.value).startswith("[Errno 13] runtime_read_denied: denied")
+    assert "attempt-artifacts/manifest.json" in str(raised.value)
+    assert 1 < len(calls) < 50
+
+
+def test_retrying_read_bytes_reads_once_on_posix_and_for_other_errors(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(platform_io.os, "name", "posix")
+    _denying_open(monkeypatch, calls, None)
+    with pytest.raises(PermissionError) as raised:
+        platform_io.retrying_read_bytes("a.json")
+    assert len(calls) == 1
+    assert "runtime_read_denied" not in str(raised.value)
+
+    calls.clear()
+    _fake_windows_clock(monkeypatch)
+    _denying_open(monkeypatch, calls, None, exc_type=OSError)
+    with pytest.raises(OSError) as raised:
+        platform_io.retrying_read_bytes("a.json")
+    assert len(calls) == 1 and raised.value.errno == errno.EIO
+
+
+def test_exception_text_with_site_names_the_package_frame_of_a_bare_oserror(monkeypatch):
+    monkeypatch.setattr(platform_io.os, "name", "posix")
+    _denying_open(monkeypatch, [], None)
+    with pytest.raises(PermissionError) as raised:
+        platform_io.retrying_read_bytes("a.json")
+
+    text = platform_io.exception_text_with_site(raised.value)
+
+    # The innermost aiworkhub frame, not this test file's fake ``open``.
+    assert text.startswith("[Errno 13] denied (at platform_io.py:")
+    assert text.endswith(" read)")
+
+
+def test_exception_text_with_site_keeps_named_and_non_os_errors(tmp_path):
+    with pytest.raises(FileNotFoundError) as missing:
+        platform_io.retrying_read_bytes(str(tmp_path / "gone.json"))
+    assert platform_io.exception_text_with_site(missing.value) == str(missing.value)
+    assert platform_io.exception_text_with_site(ValueError("x")) == "x"
+    # No package frame in the traceback: nothing to name.
+    try:
+        raise PermissionError(errno.EACCES, "Permission denied")
+    except PermissionError as exc:
+        assert platform_io.exception_text_with_site(exc) == "[Errno 13] Permission denied"
+
+
 def test_durable_atomic_replace_directory_open_failure_preserves_paths(
     tmp_path, monkeypatch
 ):

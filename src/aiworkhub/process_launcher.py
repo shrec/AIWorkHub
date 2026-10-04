@@ -53,6 +53,7 @@ from .platform_io import (
     available_memory_bytes as _available_memory_bytes,
     chmod_fd,
     chmod_path,
+    exception_text_with_site,
     is_windows,
     lock_fd,
     open_readonly_shared,
@@ -10128,11 +10129,11 @@ class ProcessManager:
                 if not lock_blocking:
                     raise
                 errors.append(
-                    f"attempt={attempt}:{type(exc).__name__}:{exc}"[:500]
+                    f"attempt={attempt}:{type(exc).__name__}:{exception_text_with_site(exc)}"[:500]
                 )
                 attempt_causes.append(exc)
             except Exception as exc:  # noqa: BLE001 - monitor must remain durable
-                errors.append(f"attempt={attempt}:{type(exc).__name__}:{exc}"[:500])
+                errors.append(f"attempt={attempt}:{type(exc).__name__}:{exception_text_with_site(exc)}"[:500])
                 attempt_causes.append(exc)
 
         events = self._request_events(request_id)
@@ -11950,7 +11951,9 @@ class ProcessManager:
                         cleanup = False
                         terminal_state = "release_pending"
             except Exception as exc:
-                error = str(exc)[:500]
+                # NF-2026-01351: a filename-less OSError (bare "[Errno 13]") names
+                # its raising aiworkhub frame so the site is traceable.
+                error = exception_text_with_site(exc)[:500]
                 if promoted:
                     cleanup = False
                     terminal_state = "review_pending"
@@ -12013,7 +12016,7 @@ class ProcessManager:
                     )
                 except Exception as exc:  # preserve the truthful terminal outcome
                     attempt_artifact_error = (
-                        f"attempt_artifact_persist_failed:{type(exc).__name__}:{exc}"
+                        f"attempt_artifact_persist_failed:{type(exc).__name__}:{exception_text_with_site(exc)}"
                     )[:500]
 
             if (

@@ -5,6 +5,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import sqlite3
@@ -8150,6 +8151,48 @@ def test_process_manager_enforced_timeout_retains_delta_not_candidate_failure(
     assert captured["changed_paths"] == ["changed.py"]
     assert captured["changed_path_hashes"] == {"changed.py": digest}
     assert captured["rework_delta"]["sealed"] is True
+
+
+def test_finalize_failed_bare_errno_13_names_its_raising_site(monkeypatch, tmp_path):
+    """NF-2026-01351: a filename-less ``[Errno 13] Permission denied`` from inside
+    finalize is recorded with its aiworkhub frame and still classifies as a
+    sandbox filesystem denial."""
+    from aiworkhub import terminal_failure_classification
+
+    manager, request_id, metadata_path, status_path = _finalize_retry_manager(tmp_path)
+    manager._append_event({
+        "request_id": request_id, "task_id": "TASK_B1", "runner": "claude_worker_b1",
+        "topic": "task_mcp", "adapter_id": "claude_cli", "state": "finalizing",
+        "metadata_path": str(metadata_path), "supervisor_status_path": str(status_path),
+        "pid": 999_999_999, "pid_start_ticks": 1,
+    })
+
+    def denied(_path):
+        # The fd-level shape: errno 13 with no filename attached.
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(process_launcher, "unlink_if_regular", denied)
+    monkeypatch.setattr(manager, "_exact_claim_state", lambda _metadata: "processing")
+    monkeypatch.setattr(manager, "_persist_attempt_artifacts", lambda *_a, **_k: None)
+    captured: dict = {}
+
+    def terminal_failure(_metadata, state, *, evidence, **_kwargs):
+        captured["state"] = state
+        captured.update(evidence)
+        return {"ok": True, "stderr": ""}
+
+    monkeypatch.setattr(manager, "_terminal_failure_exact", terminal_failure)
+    event = manager._finalize_isolated_request(request_id, 1)
+
+    assert event["state"] == captured["state"] == "finalize_failed"
+    assert re.fullmatch(
+        r"\[Errno 13\] Permission denied \(at process_launcher\.py:\d+ _finalize_isolated_request\)",
+        captured["error"],
+    ), captured["error"]
+    authority = terminal_failure_classification.terminal_event_authority(
+        state="finalize_failed", exit_code=1, error=captured["error"]
+    )
+    assert "sandbox_filesystem_denied" in authority["error"]
 
 
 @pytest.mark.parametrize(
