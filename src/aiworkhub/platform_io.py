@@ -2219,27 +2219,77 @@ def chmod_path(
         os.chmod(path, mode)
 
 
+def _retry_windows_sharing_denial(
+    operation: str, path: str | os.PathLike[str], action: Callable[[], None]
+) -> None:
+    """Run ``action``, riding out a transient Windows sharing denial.
+
+    POSIX lets a path be replaced or unlinked while another process has it
+    open, so there ``action`` runs exactly once. On Windows an open handle on
+    the path -- a poller's ``open()``+``json.load``, an antivirus or indexer
+    scan, a second launch -- makes ``os.replace`` and ``os.unlink`` fail with
+    ``PermissionError`` (winerror 5 or 32) for as long as that handle lives
+    (NF-2026-01348). Measured: even a ``FILE_SHARE_DELETE`` reader blocks
+    ``MoveFileExW``, so only the writer can absorb the race. The
+    retry is bounded by ``WINDOWS_REPLACE_RETRY_SECONDS`` with a short capped
+    exponential backoff; a denial that outlives it is re-raised naming the
+    operation and the path, which the bare ``[Errno 13]`` never did.
+    """
+
+    if os.name != "nt":
+        action()
+        return
+    deadline = time.monotonic() + WINDOWS_REPLACE_RETRY_SECONDS
+    delay = 0.002
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            action()
+            return
+        except PermissionError as exc:
+            if time.monotonic() >= deadline:
+                raise PermissionError(
+                    exc.errno or errno.EACCES,
+                    f"{operation}: {exc.strerror or exc} (after {attempts} attempts)",
+                    os.fspath(path),
+                ) from exc
+            time.sleep(delay)
+            # Capped low so a busy reader's short close windows are still hit.
+            delay = min(delay * 2, 0.032)
+
+
 def atomic_replace(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
     """Replace a path atomically, tolerating transient Windows sharing locks.
 
     POSIX permits replacing an open destination, so that path remains a single
     ``os.replace`` call. Windows readers can briefly deny deletion access; a
     short bounded retry prevents a harmless concurrent read from turning a
-    durable status write into a supervisor failure.
+    durable status write into a supervisor failure. Exhaustion raises
+    ``runtime_replace_denied`` naming the destination (NF-2026-01348).
     """
 
-    if os.name != "nt":
-        os.replace(source, destination)
-        return
-    deadline = time.monotonic() + WINDOWS_REPLACE_RETRY_SECONDS
-    while True:
+    _retry_windows_sharing_denial(
+        "runtime_replace_denied", destination, lambda: os.replace(source, destination)
+    )
+
+
+def retrying_unlink(path: str | os.PathLike[str], *, missing_ok: bool = False) -> None:
+    """``os.unlink`` with :func:`atomic_replace`'s bounded Windows retry.
+
+    Temp-file cleanup and runtime-file retirement hit the same transient
+    sharing denial as a replace; unretried, a cleanup error can also replace
+    the primary error in flight (NF-2026-01348).
+    """
+
+    def unlink() -> None:
         try:
-            os.replace(source, destination)
-            return
-        except PermissionError:
-            if time.monotonic() >= deadline:
+            os.unlink(path)
+        except FileNotFoundError:
+            if not missing_ok:
                 raise
-            time.sleep(0.01)
+
+    _retry_windows_sharing_denial("runtime_unlink_denied", path, unlink)
 
 
 class PublicationDurabilityError(OSError):

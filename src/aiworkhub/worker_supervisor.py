@@ -25,7 +25,7 @@ except ImportError:  # direct-script entrypoint
     from windows_job_structures import JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 
 try:
-    from .platform_io import atomic_replace, chmod_fd, chmod_path
+    from .platform_io import atomic_replace, chmod_fd, chmod_path, retrying_unlink
     from .provider_usage import live_total_tokens, read_provider_usage
     from .token_budget import (
         SampleKind,
@@ -37,7 +37,7 @@ try:
         supervisor_evidence,
     )
 except ImportError:  # direct-script entrypoint
-    from platform_io import atomic_replace, chmod_fd, chmod_path
+    from platform_io import atomic_replace, chmod_fd, chmod_path, retrying_unlink
     from provider_usage import live_total_tokens, read_provider_usage
     from token_budget import (  # type: ignore[no-redef]
         SampleKind,
@@ -161,7 +161,7 @@ def _write_json_0600(path: Path, payload: dict[str, Any]) -> None:
     finally:
         if fd >= 0:
             os.close(fd)
-        temp.unlink(missing_ok=True)
+        retrying_unlink(temp, missing_ok=True)
 
 
 def _open_0600(path: Path) -> BinaryIO:
@@ -1567,7 +1567,9 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
                 pass
         if windows_job is not None:
             windows_job.close()
-        cancel_path.unlink(missing_ok=True)
+        # A manager poller reading the cancel file must not crash this
+        # cleanup with a transient Windows sharing denial (NF-2026-01348).
+        retrying_unlink(cancel_path, missing_ok=True)
 
     if final_state == "cancelled":
         return 125

@@ -14133,12 +14133,14 @@ def write_json_0600(path: Path, payload: dict[str, Any]) -> None:
             os.fsync(fh.fileno())
         os.close(fd)
         fd = -1
-        os.replace(temp, path)
+        # The shared Windows-retrying replace: attempt manifests, metadata and
+        # review packets are read concurrently by pollers (NF-2026-01348).
+        atomic_replace(temp, path)
         chmod_path(path, 0o600)
     finally:
         if fd >= 0:
             os.close(fd)
-        temp.unlink(missing_ok=True)
+        _platform_io.retrying_unlink(temp, missing_ok=True)
 
 
 __all__ = [

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, NotRequired, TypedDict
 
 from .evidence_levels import EvidenceLevel
+from .platform_io import atomic_replace
 from .scoped_audit import ScopedAuditPacket, packet_fingerprint
 
 
@@ -1944,7 +1945,8 @@ def _write_review_packet_file(
             raise ReviewerEvidenceError("review_packet_file_identity_changed")
         if packet_path.is_symlink():
             raise ReviewerEvidenceError("review_packet_file_symlink")
-        os.replace(tmp_path, packet_path)
+        # Reviewer launches race pollers on Windows (NF-2026-01348).
+        atomic_replace(tmp_path, packet_path)
         tmp_path = None
         parent_after_replace = parent.stat()
         if (

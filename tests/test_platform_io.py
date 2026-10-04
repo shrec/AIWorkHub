@@ -978,6 +978,117 @@ def test_atomic_replace_retries_transient_windows_sharing_violation(monkeypatch)
     assert calls == [("seed.tmp", "AGENTS.md"), ("seed.tmp", "AGENTS.md")]
 
 
+def _fake_windows_clock(monkeypatch) -> list[float]:
+    """Pretend to be Windows with a clock that only ``sleep`` advances (NF-2026-01348)."""
+    slept: list[float] = []
+    now = [100.0]
+
+    def sleep(seconds: float) -> None:
+        slept.append(seconds)
+        now[0] += seconds
+
+    monkeypatch.setattr(platform_io.os, "name", "nt")
+    monkeypatch.setattr(platform_io.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(platform_io.time, "sleep", sleep)
+    return slept
+
+
+def _denying(real, caller: int, calls: list[tuple], failures: int | None):
+    """Raise errno 13 for this thread's first ``failures`` calls (None: always)."""
+
+    def call(*args):
+        if threading.get_ident() != caller:
+            return real(*args)
+        calls.append(args)
+        if failures is None or len(calls) <= failures:
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return None
+
+    return call
+
+
+def test_atomic_replace_rides_out_two_errno_13_denials(monkeypatch):
+    calls: list[tuple] = []
+    slept = _fake_windows_clock(monkeypatch)
+    monkeypatch.setattr(
+        platform_io.os, "replace", _denying(os.replace, threading.get_ident(), calls, 2)
+    )
+
+    platform_io.atomic_replace("manifest.json.tmp", "manifest.json")
+
+    assert calls == [("manifest.json.tmp", "manifest.json")] * 3
+    assert slept == [0.002, 0.004]
+
+
+def test_atomic_replace_persistent_denial_is_bounded_and_names_operation_and_path(
+    monkeypatch,
+):
+    calls: list[tuple] = []
+    slept = _fake_windows_clock(monkeypatch)
+    monkeypatch.setattr(
+        platform_io.os, "replace", _denying(os.replace, threading.get_ident(), calls, None)
+    )
+
+    with pytest.raises(PermissionError) as raised:
+        platform_io.atomic_replace("manifest.json.tmp", "attempt-artifacts/manifest.json")
+
+    message = str(raised.value)
+    assert message.startswith("[Errno 13] runtime_replace_denied: Permission denied")
+    assert f"(after {len(calls)} attempts)" in message
+    assert "attempt-artifacts/manifest.json" in message
+    assert raised.value.errno == errno.EACCES
+    assert isinstance(raised.value.__cause__, PermissionError)
+    # Bounded: the backoff stops at the deadline, each sleep capped low.
+    assert len(calls) == len(slept) + 1 < 50
+    assert max(slept) == 0.032
+    budget = platform_io.WINDOWS_REPLACE_RETRY_SECONDS
+    assert budget - 1e-9 <= sum(slept) < budget + 0.032
+
+
+def test_atomic_replace_does_not_retry_on_posix(monkeypatch):
+    calls: list[tuple] = []
+    monkeypatch.setattr(platform_io.os, "name", "posix")
+    monkeypatch.setattr(
+        platform_io.os, "replace", _denying(os.replace, threading.get_ident(), calls, None)
+    )
+
+    with pytest.raises(PermissionError) as raised:
+        platform_io.atomic_replace("a.tmp", "a.json")
+
+    assert len(calls) == 1
+    assert "runtime_replace_denied" not in str(raised.value)
+
+
+def test_retrying_unlink_retries_denial_and_honours_missing_ok(monkeypatch, tmp_path):
+    calls: list[tuple] = []
+    _fake_windows_clock(monkeypatch)
+    monkeypatch.setattr(
+        platform_io.os, "unlink", _denying(os.unlink, threading.get_ident(), calls, 2)
+    )
+    platform_io.retrying_unlink("cancel.json")
+    assert len(calls) == 3
+
+    monkeypatch.undo()
+    platform_io.retrying_unlink(tmp_path / "gone.tmp", missing_ok=True)
+    with pytest.raises(FileNotFoundError):
+        platform_io.retrying_unlink(tmp_path / "gone.tmp")
+
+
+def test_retrying_unlink_persistent_denial_names_operation_and_path(monkeypatch):
+    calls: list[tuple] = []
+    _fake_windows_clock(monkeypatch)
+    monkeypatch.setattr(
+        platform_io.os, "unlink", _denying(os.unlink, threading.get_ident(), calls, None)
+    )
+
+    with pytest.raises(PermissionError) as raised:
+        platform_io.retrying_unlink("runtime/.manifest.json.abc", missing_ok=True)
+
+    assert "runtime_unlink_denied" in str(raised.value)
+    assert "runtime/.manifest.json.abc" in str(raised.value)
+    assert 1 < len(calls) < 50
+
+
 def test_durable_atomic_replace_directory_open_failure_preserves_paths(
     tmp_path, monkeypatch
 ):

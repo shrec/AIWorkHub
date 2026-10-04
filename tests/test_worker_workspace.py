@@ -3623,6 +3623,26 @@ def test_sanitized_env_is_allowlisted_and_json_files_are_0600(
     assert json.loads(target.read_text(encoding="utf-8")) == {"ok": True}
 
 
+@pytest.mark.skipif(os.name != "nt", reason="POSIX replace ignores open readers")
+def test_write_json_0600_outlasts_a_poller_holding_the_manifest_open(tmp_path: Path):
+    """A reader's open handle makes os.replace fail on Windows (NF-2026-01348)."""
+    import threading
+
+    target = tmp_path / "attempt-artifacts" / "request" / "manifest.json"
+    worker_workspace.write_json_0600(target, {"generation": 1})
+    poller = target.open("rb")
+    releaser = threading.Timer(0.15, poller.close)
+    releaser.start()
+    try:
+        worker_workspace.write_json_0600(target, {"generation": 2})
+    finally:
+        releaser.cancel()
+        poller.close()
+
+    assert json.loads(target.read_text(encoding="utf-8")) == {"generation": 2}
+    assert [p.name for p in target.parent.iterdir()] == ["manifest.json"]
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Windows keeps provisioning behavior")
 def test_sanitized_env_verifies_preprovisioned_home_without_chmod(
     monkeypatch: pytest.MonkeyPatch,
