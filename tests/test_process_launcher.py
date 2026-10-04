@@ -1606,6 +1606,132 @@ def test_crash_retry_packet_rejects_cross_task_predecessor(tmp_path: Path) -> No
         )
 
 
+def test_crash_retry_packet_bounds_large_inherited_path_list_nf01347(
+    tmp_path: Path,
+) -> None:
+    """NF-2026-01347: a validation_failed predecessor with 108 inherited paths
+    pushed the packet over its cap, so every relaunch of the rework died with
+    ``crash_retry_packet_too_large`` before any provider ran. The path list is
+    a duplicate of the sealed rework overlay, so the bounded packet carries its
+    count, digest and overlay pointer instead, and the launch prompt builds."""
+    from dataclasses import replace
+
+    failing = [
+        {
+            "returncode": 1,
+            "argv": ["dotnet", "test", f"tests/EntryLink.Edge.Tests/Suite{i}.csproj"],
+            "stderr_tail": f"Assert.Equal() Failure {i}: " + ("expected local-cloud " * 60),
+        }
+        for i in range(12)
+    ]
+    process_dir, workspace, predecessor, overlay = _clean_exit_predecessor(
+        tmp_path,
+        checks=failing,
+        review={"target_state": "validation_failed", "error": "validation_failed"},
+    )
+    paths = tuple(
+        f"src/EntryLink.Edge/LocalCloud/Feature{i:03d}/LocalCloudEdgeSyncService.cs"
+        for i in range(108)
+    )
+    workspace = replace(workspace, inherited_rework_paths=paths)
+
+    path, packet = process_launcher._materialize_crash_retry_packet(
+        process_dir,
+        workspace,
+        task_id="TASK_SAME",
+        card={"rework_predecessor": {"request_id": predecessor}},
+        rework_overlay_packet=overlay,
+    )
+
+    assert path is not None and packet is not None
+    full_list_bytes = len(json.dumps(list(paths)).encode("utf-8"))
+    sealed = json.dumps(
+        packet, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    # The full list alone would have consumed most of the cap next to the delta.
+    assert full_list_bytes + packet["validation_failure_delta"]["packet_bytes"] > (
+        process_launcher.MAX_CRASH_RETRY_PACKET_BYTES
+    )
+    assert len(sealed) <= process_launcher.MAX_CRASH_RETRY_PACKET_BYTES
+    assert packet["inherited_paths"] == []
+    manifest = packet["inherited_paths_manifest"]
+    assert manifest["count"] == 108
+    assert manifest["paths_sha256"] == hashlib.sha256(
+        json.dumps(sorted(paths), separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    assert manifest["home_relative_path"] == "task_mcp_worker_runtime/rework_overlay.json"
+    assert packet["rework_overlay_sha256"] == "b" * 64
+    # The failure evidence itself is kept, not traded away for the paths.
+    assert packet["validation_failure_delta"]["failure_count"] >= 1
+    assert json.loads(path.read_text(encoding="utf-8")) == packet
+
+    feedback = "Return to the edge local-cloud contract and fix the sync gap. " * 85
+    assert len(feedback) >= 5217
+    prompt = process_launcher.build_worker_prompt(
+        task_id="TASK_SAME",
+        runner="claude_worker_b1",
+        topic="task_mcp",
+        card={
+            "task_id": "TASK_SAME",
+            "objective": "Finish phase 1 edge local-cloud wiring.",
+            "allowed_writes": list(paths),
+            "review_feedback": feedback,
+            "rework_predecessor": {"request_id": predecessor},
+        },
+        crash_retry_packet=packet,
+    )
+    assert prompt.count("CRASH_RETRY_PACKET_JSON:") == 1
+    assert feedback in prompt
+    assert all(p in prompt for p in paths)
+
+
+def test_crash_retry_packet_unfittable_names_measured_size_nf01347(
+    tmp_path: Path,
+) -> None:
+    """When the packet still exceeds the cap after the path list is bounded,
+    both refusal sites name the measured sealed size and the limit."""
+    process_dir, workspace, predecessor, overlay = _clean_exit_predecessor(
+        tmp_path,
+        checks=[],
+        review={},
+        with_bundle=False,
+    )
+    process_launcher.write_json_0600(
+        process_dir / f"{predecessor}.supervisor.json",
+        {"state": "supervisor_error", "exit_code": 1, "error": "bridge crashed"},
+    )
+    # Control bytes JSON-escape to six bytes each, so two 2 KiB tails alone
+    # exceed the 12 KiB packet cap.
+    for stream in ("stdout", "stderr"):
+        (process_dir / f"{predecessor}.{stream}.log").write_bytes(b"\x01" * 4096)
+    limit = process_launcher.MAX_CRASH_RETRY_PACKET_BYTES
+
+    with pytest.raises(process_launcher.WorkspaceError) as caught:
+        process_launcher._materialize_crash_retry_packet(
+            process_dir,
+            workspace,
+            task_id="TASK_SAME",
+            card={"rework_predecessor": {"request_id": predecessor}},
+            rework_overlay_packet=overlay,
+        )
+    prefix, _, measured = str(caught.value).partition(":")
+    size, _, cap = measured.partition(">")
+    assert prefix == "crash_retry_packet_too_large"
+    assert int(cap) == limit and int(size) > limit
+
+    oversized = {"stderr_tail": "x" * limit}
+    with pytest.raises(
+        ValueError, match=rf"^crash_retry_packet_too_large:\d+>{limit}$"
+    ):
+        process_launcher.build_worker_prompt(
+            task_id="TASK_SAME",
+            runner="claude_worker_b1",
+            topic="task_mcp",
+            card={"task_id": "TASK_SAME", "rework_predecessor": {}},
+            crash_retry_packet=oversized,
+        )
+
+
 def test_finalize_after_process_exit_retries_transient_failure(monkeypatch, tmp_path):
     manager = _manager(
         tmp_path,

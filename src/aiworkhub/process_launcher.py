@@ -3794,19 +3794,50 @@ def _materialize_crash_retry_packet(
         "stale_worktree_bytes_authoritative": False,
         "canonical_reread_savings_claimed": False,
     }
-    canonical = json.dumps(
-        packet,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    if len(canonical) > MAX_CRASH_RETRY_PACKET_BYTES:
-        raise WorkspaceError("crash_retry_packet_too_large")
-    packet["packet_sha256"] = hashlib.sha256(canonical).hexdigest()
+    sealed_bytes = _seal_crash_retry_packet(packet)
+    paths = packet["inherited_paths"]
+    if sealed_bytes > MAX_CRASH_RETRY_PACKET_BYTES and paths:
+        # NF-2026-01347: the path list grows with the predecessor (108 paths
+        # refused every relaunch of a rework), yet every path and its sha256
+        # are already sealed in the rework overlay bound by
+        # rework_overlay_sha256.  Carry the list's count and digest plus the
+        # overlay pointer so the failure evidence keeps its headroom.
+        packet["inherited_paths"] = []
+        packet["inherited_paths_manifest"] = {
+            "count": len(paths),
+            "paths_sha256": hashlib.sha256(
+                json.dumps(sorted(paths), separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+            "home_relative_path": "task_mcp_worker_runtime/rework_overlay.json",
+        }
+        sealed_bytes = _seal_crash_retry_packet(packet)
+    if sealed_bytes > MAX_CRASH_RETRY_PACKET_BYTES:
+        raise WorkspaceError(
+            f"crash_retry_packet_too_large:{sealed_bytes}>{MAX_CRASH_RETRY_PACKET_BYTES}"
+        )
     path = workspace.home / "task_mcp_worker_runtime" / "crash_retry_packet.json"
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     write_json_0600(path, packet)
     return path, packet
+
+
+def _seal_crash_retry_packet(packet: dict[str, Any]) -> int:
+    """Stamp ``packet_sha256`` over the unsealed packet; return the sealed size.
+
+    ``build_worker_prompt`` re-measures the sealed packet against the same cap,
+    so bounding only the unsealed bytes let an 83-byte window pass here and
+    then refuse the launch there (NF-2026-01347).
+    """
+    packet.pop("packet_sha256", None)
+    canonical = json.dumps(
+        packet, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    packet["packet_sha256"] = hashlib.sha256(canonical).hexdigest()
+    return len(
+        json.dumps(
+            packet, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+    )
 
 
 def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dict[str, Any]:
@@ -4418,8 +4449,11 @@ def build_worker_prompt(
             separators=(",", ":"),
             sort_keys=True,
         )
-        if len(retry_json.encode("utf-8")) > MAX_CRASH_RETRY_PACKET_BYTES:
-            raise ValueError("crash_retry_packet_too_large")
+        retry_size = len(retry_json.encode("utf-8"))
+        if retry_size > MAX_CRASH_RETRY_PACKET_BYTES:
+            raise ValueError(
+                f"crash_retry_packet_too_large:{retry_size}>{MAX_CRASH_RETRY_PACKET_BYTES}"
+            )
     retry_block = (
         "\n\nTrusted predecessor crash evidence (bounded and coordinator-bound; "
         "do not infer current files from this text):\nCRASH_RETRY_PACKET_JSON:\n"
