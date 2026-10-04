@@ -181,8 +181,8 @@ The goal is the same answers (or better), measured, in a fraction of the time.
   Java, C#, PHP. This replaces Python's stdlib-AST adapter and the regex/lexical
   adapters. Definitions and references come from each grammar's upstream
   `queries/tags.scm` plus local overrides. Grammars are compiled **statically
-  into `awh`** at pinned commits (CMake FetchContent by hash, or a vcpkg port where
-  one exists). That removes the grammar cache, its sandbox mirror and its ACL
+  into `awh`** from vendored sources pinned by hash in `third_party/grammars/`.
+  That removes the grammar cache, its sandbox mirror and its ACL
   grants (`tree_sitter_cache.py`).
 - **Non-semantic families** (JSON, YAML, TOML, XML, Markdown, …) keep
   truthful path/language/size/hash `FILE_EVIDENCE` only.
@@ -248,7 +248,7 @@ The goal is the same answers (or better), measured, in a fraction of the time.
 | Phase | Scope | Exit (measured) |
 |---|---|---|
 | **P0 Spec freeze** | Contract artifacts in `AIWorkhubCli/contracts/`: all tool schemas plus fingerprints, `sqlite_master` of every store, task FSM table, lock-file protocol (exact primitives/ranges), env contract, Source Graph reader revision behavior. Black-box **MCP record/replay parity harness** with a parameterized server command and volatile-field normalization (generalizes `tests/mcp_stdio_client_smoke.py` C1–C6). | Harness runs green Python-vs-Python on fixture repos. Contracts regenerate deterministically. |
-| **P1 Foundation** | CMake presets, vcpkg manifest, CI matrix (win-x64, linux-x64, linux-arm64, macos-arm64). Libraries: `base`, `platform` (fs, lock, env, minimal process), `storage` (sqlite, writer lease, migrate). `awh mcp` with transparent Python proxy; `awh call <tool> '{json}'`, `awh version`, `awh doctor` (skeleton). | The parity harness through `awh mcp` (100% proxied) is identical to direct Python. The cross-implementation writer-lease contention test is green. |
+| **P1 Foundation** | CMake presets, vendored deps, CI matrix (win-x64, linux-x64, linux-arm64, macos-arm64). Libraries: `base`, `platform` (fs, lock, env, minimal process), `storage` (sqlite, writer lease, migrate). `awh mcp` with transparent Python proxy; `awh call <tool> '{json}'`, `awh version`, `awh doctor` (skeleton). | The parity harness through `awh mcp` (100% proxied) is identical to direct Python. The cross-implementation writer-lease contention test is green. |
 | **P2 Source Graph** | 2a index, 2b 37 query modes plus tools, 2c daemon, watcher, partitions, Python ownership guard. | The section 6 parity gates. Native SG tools on by default. |
 | **P3 Core state** | Tasks (read → write → FSM), callbacks outbox, needfix, roadmap, kb, memory, session, context graph, dashboard read builders. CLI: `awh task create/list/show`, `awh status`. | Per-tool parity green. Python ownership guards for each store. |
 | **P4 Runtime and providers** | Process tree control, env-block builder, sandbox, providers (claude, codex, opencode, copilot, vscode_lm spool), routing/workforce/admission. CLI: `awh agent list/doctor/run`. | Native end-to-end smoke per provider per OS. Cancellation leaves no orphan processes (tested). |
@@ -264,7 +264,7 @@ owns each subsystem. Every MCP tool is also reachable as `awh call`.
 
 ```text
 AIWorkhubCli/
-  ARCHITECTURE.md  CMakeLists.txt  CMakePresets.json  vcpkg.json
+  ARCHITECTURE.md  CMakeLists.txt  CMakePresets.json
   cmake/                    toolchain + warnings + size-ratchet helpers
   contracts/                P0 frozen artifacts (generated, checked in)
   src/
@@ -272,17 +272,20 @@ AIWorkhubCli/
     sourcegraph/{index,lang,query,daemon,partition}/
     mcp/ cli/ app/            (+ later service dirs per phase)
     main.cpp
-  third_party/grammars/     pinned tree-sitter grammar sources (if not vcpkg)
+  third_party/              vendored, pinned sources (README lists sha256)
   tests/{unit,integration,parity}/
 ```
 
 ## 10. Build and dependencies
 
 - C++23, CMake ≥ 3.28 presets (`windows-msvc`, `windows-clang`, `linux-gcc`,
-  `linux-clang`, `macos-clang`), vcpkg manifest mode, static triplets.
-- Libraries: sqlite3 (FTS5 enabled), CLI11, nlohmann_json, spdlog,
-  Catch2, tree-sitter. asio arrives in P6. Use `std::format`/`std::print`
-  instead of fmt where the toolchain supports them.
+  `linux-clang`, `macos-clang`). The static MSVC runtime is used on Windows.
+- **Vendored dependencies** in `third_party/` (see its README for the pins and
+  sha256). There is no package manager at build time, so builds are hermetic
+  and work in the sandboxed, network-less validation lane, which also rejects
+  absolute host paths such as a vcpkg root. Vendored: sqlite3 amalgamation
+  (FTS5 enabled), CLI11, nlohmann_json, spdlog (`SPDLOG_USE_STD_FORMAT`, no fmt),
+  Catch2 amalgamated, tree-sitter core. asio arrives in P6.
 - Warnings are errors (`/W4 /permissive-`, `-Wall -Wextra -Wpedantic`).
   ASan/UBSan presets cover unit and integration tests on Linux and macOS.
 - Required at runtime: `git`. Optional per provider: `claude`, `codex`,
