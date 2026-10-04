@@ -8327,6 +8327,7 @@ class ProcessManager:
             callback_required=True,
             task_type="research",
             read_only=True,
+            review_target_task_id=target_task_id,  # NF-2026-01095: target's route
         )
         create_ok = created.get("ok") is True
         create_structured = (
@@ -8347,6 +8348,7 @@ class ProcessManager:
                 self._terminalize_reviewer_attempt(
                     request_id, reviewer_task_id, runner, adapter_id, reason=reason
                 )
+            core.release_review_wake(target_task_id, reason)  # NF-2026-01095
             return {"ok": False, "error": reason}
 
         def _fail(reason: str) -> dict[str, Any]:

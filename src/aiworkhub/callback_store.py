@@ -2024,6 +2024,51 @@ def seed_missing_review_callbacks(
     return seeded
 
 
+def release_deferred_review_wake(
+    conn: sqlite3.Connection, task_id: str, *, reason: str,
+) -> bool:
+    """NF-2026-01095: wake a review card's manager when its review chain cannot start.
+
+    A worker's ``review_ready`` wake is deferred while the system quality
+    review runs (``manager_callback_deferred``) and the chain announces it
+    later. A chain that cannot even create its reviewer card announces
+    nothing, so the card sat review_ready with no manager wake. This enqueues
+    exactly the wake the deferral held back -- the card's own review_ready
+    callback to its recorded origin/provider for the current claim episode,
+    deduplicated like every enqueue -- and records why. False when the card
+    is not in that review state, has no origin, or already has that wake.
+    """
+    _ensure_tasks_origin_thread_column(conn)
+    row = conn.execute(
+        "SELECT card_json, origin_thread_id FROM tasks WHERE task_id=?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    try:
+        card = json.loads(row["card_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        card = {}
+    if not isinstance(card, dict):
+        card = {}
+    episode_id = str(card.get("claim_epoch") or 0)
+    if not _task_still_in_matching_terminal_state(conn, task_id, "review_ready", episode_id):
+        return False
+    released = enqueue_callback(
+        conn,
+        task_id,
+        str(row["origin_thread_id"] or card.get("origin_thread_id") or "").strip(),
+        "review_ready",
+        provider=str(card.get("coordinator_provider") or "").strip().lower(),
+        episode_id=episode_id,
+    )
+    if released:
+        append_event(
+            conn, task_id, "review_wake_released", "",
+            {"episode_id": episode_id, "reason": str(reason or "")[:500]},
+        )
+    return released
+
+
 def _iso_plus_seconds(now_iso: str, delay_seconds: float) -> str:
     if delay_seconds <= 0:
         return ""

@@ -183,6 +183,12 @@ def _canonical_result(
 # a launcher shim may add one more, and no further, before the chain is refused.
 _CLAUDE_LAUNCHER_HOP_LIMIT = 2
 
+# NF-2026-01005: the official Windows Python launcher. ``"command": "py"`` in a
+# ``.mcp.json`` keeps ``py.exe`` alive as the parent of the interpreter it
+# spawns, so it is a re-exec hop exactly like the venv redirector. Matched by
+# exact image name only, and it still counts against the hop limit.
+_WINDOWS_PYTHON_LAUNCHER_IMAGES = frozenset({"py.exe", "pyw.exe"})
+
 
 def _claude_manager_identity() -> dict[str, str] | None:
     """Verify that this MCP server is the direct child of an interactive
@@ -257,10 +263,17 @@ def _claude_windows_manager_identity() -> dict[str, str] | None:
     Linux and could never pass here, leaving Claude unable to hold the manager
     seat on Windows at all.
 
-    Only a hop that is THIS interpreter's own image name, owned by the same
-    user, is skipped, and at most ``_CLAUDE_LAUNCHER_HOP_LIMIT`` of them: the
-    evidence that grants the seat is still one exact ``claude`` ancestor with a
-    valid, repository-bound descriptor.
+    The official Windows Python launcher is the other such hop (NF-2026-01005):
+    a ``.mcp.json`` with ``"command": "py", "args": ["-3", "-m", ...]`` makes
+    ``py.exe`` spawn ``python.exe`` as a CHILD and stay alive as its parent, so
+    the chain is claude.exe -> py.exe -> python.exe and the walk met ``py.exe``,
+    refused, and left the Claude chat without the manager seat.
+
+    Only a hop that is THIS interpreter's own image name or exactly ``py.exe``
+    / ``pyw.exe``, owned by the same user, is skipped, and at most
+    ``_CLAUDE_LAUNCHER_HOP_LIMIT`` of them: the evidence that grants the seat
+    is still one exact ``claude`` ancestor with a valid, repository-bound
+    descriptor.
     """
 
     parent_pid = os.getppid()
@@ -288,8 +301,9 @@ def _claude_windows_manager_identity() -> dict[str, str] | None:
         if "claude" in image:
             owner_pid = candidate
             break
-        if image != interpreter_image:
-            # Not our own re-exec stub: this chain does not belong to Claude.
+        if image != interpreter_image and image not in _WINDOWS_PYTHON_LAUNCHER_IMAGES:
+            # Not our own re-exec stub or the py launcher: this chain does not
+            # belong to Claude.
             return None
         candidate = candidate_parent
     if owner_pid is None:
@@ -890,6 +904,61 @@ def _manager_chat_session_origin() -> str:
 
     record = _active_manager_chat_record()
     return str(record.get("session_id") or "") if record else ""
+
+
+def _review_target_callback_binding(
+    target_task_id: str | None,
+) -> tuple[str, str, str, str] | None:
+    """NF-2026-01095: the callback route a system quality reviewer inherits.
+
+    The review chain commissions the reviewer from a background reconciler
+    whose own process ancestry is not the manager's, so the live route there
+    can be a pending Codex route with no thread. The reviewer's callbacks
+    belong to the manager that owns the target, so the card takes the
+    target's recorded ``(origin, manager_chat_session, provider,
+    route_state)``. None when there is no target or it has no
+    callback-capable origin; the live route then applies unchanged.
+    """
+    task_id = str(target_task_id or "").strip()
+    if not task_id:
+        return None
+    try:
+        card = task_store.get_task(repo_root(), task_id)
+    except (OSError, RuntimeError, sqlite3.Error, task_store.TaskStoreError):
+        return None
+    if not isinstance(card, dict):
+        return None
+    origin = str(card.get("origin_thread_id") or "").strip()
+    if not (_valid_origin_thread_id(origin) or _MANAGER_CHAT_SESSION_RE.fullmatch(origin)):
+        return None
+    provider = str(card.get("coordinator_provider") or "").strip().lower()
+    if provider not in ("codex", "claude", "copilot"):
+        return None
+    chat = str(card.get("manager_chat_session_id") or "").strip()
+    return (
+        origin,
+        chat if _MANAGER_CHAT_SESSION_RE.fullmatch(chat) else "",
+        provider,
+        str(card.get("manager_route_state") or ""),
+    )
+
+
+def release_review_wake(task_id: str, reason: str) -> bool:
+    """NF-2026-01095: wake ``task_id``'s manager because its system review cannot start.
+
+    :func:`callback_store.release_deferred_review_wake` on the canonical
+    store. Never raises: the caller is already reporting a failure.
+    """
+    try:
+        conn = _canonical_connect()
+    except (OSError, RuntimeError, sqlite3.Error, task_store.TaskStoreError):
+        return False
+    try:
+        return callback_store.release_deferred_review_wake(conn, task_id, reason=reason)
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
 
 
 WINDOW_ROUTE_DIR_REL = Path("config") / "routing" / "windows"
@@ -4040,6 +4109,8 @@ def create_task(
     validation_exemption: str | None = None,
     apply_contract_patch: str | None = None,
     wave_goal_binding: Mapping[str, Any] | None = None,
+    *,
+    review_target_task_id: str | None = None,
 ) -> dict[str, Any]:
     """Create one new canonical task card for the verified manager chat.
 
@@ -4079,6 +4150,11 @@ def create_task(
     ``None`` with origin ``undeclared`` and is never inferred. It only selects
     the worker's reasoning effort, never lowers the risk tier, and any other
     value is refused as ``invalid_difficulty``.
+
+    ``review_target_task_id`` is internal (no MCP tool passes it): a system
+    quality reviewer card names its target and inherits that target's
+    callback route instead of the live one (NF-2026-01095). The manager
+    identity and capability gates still apply.
     """
     identity = _claude_manager_identity() or _codex_manager_identity()
     if identity is None:
@@ -4708,6 +4784,11 @@ def create_task(
     # Keep the Codex/Claude thread when one was observed. Manager Chat is a
     # second destination, not a replacement, until that mux is removed.
     origin_thread_id = uuid_origin or chat_origin
+    provider = str(identity["provider"])
+    route_state = str(identity.get("route_state") or "")
+    inherited_route = _review_target_callback_binding(review_target_task_id)
+    if inherited_route is not None:
+        origin_thread_id, chat_origin, provider, route_state = inherited_route
     if callback_required and not origin_thread_id:
         provider_name = str(identity.get("provider") or "manager").strip().lower()
         missing_route = (
@@ -4719,7 +4800,6 @@ def create_task(
             f"callback_route_pending:{missing_route}",
             126,
         )
-    provider = str(identity["provider"])
     now = datetime.now(timezone.utc).isoformat()
     context_query = _task_context_query(
         title=title,
@@ -4750,7 +4830,7 @@ def create_task(
         "coordinator_provider": provider,
         "callback_required": bool(callback_required),
         "callback_supported": bool(origin_thread_id),
-        "manager_route_state": str(identity.get("route_state") or ""),
+        "manager_route_state": route_state,
         "acceptance": acceptance2,
         "read_only": read_only,
         "allowed_writes": writes2,

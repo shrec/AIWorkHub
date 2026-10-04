@@ -10737,6 +10737,51 @@ def test_quality_reviewer_launch_create_failure_terminalizes_without_ack(
     )
 
 
+def test_quality_reviewer_card_takes_the_target_route_and_a_create_failure_wakes_its_manager(
+    tmp_path, monkeypatch,
+):
+    # NF-2026-01095: the automatic launch runs in a background reconciler whose
+    # own route can be a pending Codex route with no thread. The reviewer card
+    # names its target so create_task binds the target's callback route, and a
+    # create that still fails releases the target's deferred manager wake
+    # instead of leaving it silently review_ready.
+    manager, _cards, _order, _started = _quality_reviewer_launch_harness(
+        tmp_path, monkeypatch
+    )
+    create_kwargs: list[dict] = []
+    released: list[tuple[str, str]] = []
+
+    def fail_create(**kwargs):
+        create_kwargs.append(kwargs)
+        return {
+            "ok": False,
+            "stderr": "callback_route_pending:codex_thread_id_not_observed",
+        }
+
+    monkeypatch.setattr(process_launcher.core, "create_task", fail_create)
+    monkeypatch.setattr(
+        process_launcher.core,
+        "release_review_wake",
+        lambda task_id, reason: released.append((task_id, reason)) or True,
+    )
+    receipt = manager.launch_quality_reviewer(
+        target_request_id="target-req-1",
+        target_task_id="TARGET_TASK_1",
+        reviewer_task_id="REVIEWER_TASK_1",
+        runner="claude_worker_reviewer",
+        adapter_id="claude_cli",
+        lens="correctness",
+    )
+
+    assert receipt["ok"] is False
+    assert [kw.get("review_target_task_id") for kw in create_kwargs] == ["TARGET_TASK_1"]
+    assert released == [(
+        "TARGET_TASK_1",
+        "quality_review_task_create_failed:"
+        "callback_route_pending:codex_thread_id_not_observed",
+    )]
+
+
 def test_quality_reviewer_launch_claim_failure_releases_reservation(
     tmp_path, monkeypatch,
 ):

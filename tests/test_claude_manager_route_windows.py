@@ -198,3 +198,110 @@ def test_a_missing_session_descriptor_is_refused(tmp_path, monkeypatch):
     )
 
     assert core._claude_windows_manager_identity() is None
+
+
+# NF-2026-01005: a ``.mcp.json`` that launches the server as
+# ``"command": "py", "args": ["-3", "-m", "aiworkhub.server"]`` keeps the
+# official Windows Python launcher alive as the server's parent, so the chain
+# is claude.exe -> py.exe -> python.exe. The launcher is a known re-exec hop
+# exactly like the venv redirector, and nothing else about the chain loosens.
+_LAUNCHER_PID = 41120
+
+
+def test_the_python_launcher_hop_grants_the_claude_seat(tmp_path, monkeypatch):
+    _bind(
+        monkeypatch,
+        tmp_path,
+        tree={
+            _SERVER_PID: (_LAUNCHER_PID, "python.exe"),
+            _LAUNCHER_PID: (_CLAUDE_PID, "py.exe"),
+            _CLAUDE_PID: (39124, "claude.exe"),
+        },
+    )
+    monkeypatch.setattr(core.sys, "executable", r"C:\Python313\python.exe")
+
+    assert core._claude_windows_manager_identity() == {
+        "provider": "claude",
+        "session_id": _SESSION_ID,
+        "window_id": f"claude_vscode_{_CLAUDE_PID}",
+    }
+
+
+def test_the_python_launcher_above_a_venv_redirector_grants_the_seat(tmp_path, monkeypatch):
+    _bind(
+        monkeypatch,
+        tmp_path,
+        tree={
+            _SERVER_PID: (_STUB_PID, "python.exe"),
+            _STUB_PID: (_LAUNCHER_PID, "python.exe"),
+            _LAUNCHER_PID: (_CLAUDE_PID, "PY.EXE"),
+            _CLAUDE_PID: (39124, "claude.exe"),
+        },
+    )
+
+    assert core._claude_windows_manager_identity() is not None
+
+
+@pytest.mark.parametrize("image", ["mypy.exe", "py.exe.bak", "copy.exe", "pyx.exe", "py"])
+def test_a_launcher_lookalike_image_is_refused(tmp_path, monkeypatch, image):
+    _bind(
+        monkeypatch,
+        tmp_path,
+        tree={
+            _SERVER_PID: (_LAUNCHER_PID, "python.exe"),
+            _LAUNCHER_PID: (_CLAUDE_PID, image),
+            _CLAUDE_PID: (39124, "claude.exe"),
+        },
+    )
+
+    assert core._claude_windows_manager_identity() is None
+
+
+def test_a_python_launcher_hop_owned_by_another_user_is_refused(tmp_path, monkeypatch):
+    _bind(
+        monkeypatch,
+        tmp_path,
+        tree={
+            _SERVER_PID: (_LAUNCHER_PID, "python.exe"),
+            _LAUNCHER_PID: (_CLAUDE_PID, "py.exe"),
+            _CLAUDE_PID: (39124, "claude.exe"),
+        },
+        owners={
+            _SERVER_PID: _SAME_USER,
+            _LAUNCHER_PID: "S-1-5-21-000000000-000000000-000000000-1002",
+            _CLAUDE_PID: _SAME_USER,
+        },
+    )
+
+    assert core._claude_windows_manager_identity() is None
+
+
+def test_python_launcher_hops_still_count_against_the_hop_limit(tmp_path, monkeypatch):
+    _bind(
+        monkeypatch,
+        tmp_path,
+        tree={
+            _SERVER_PID: (101, "python.exe"),
+            101: (102, "py.exe"),
+            102: (103, "python.exe"),
+            103: (_CLAUDE_PID, "py.exe"),
+            _CLAUDE_PID: (39124, "claude.exe"),
+        },
+    )
+
+    assert core._claude_windows_manager_identity() is None
+
+
+def test_a_python_launcher_chain_without_a_descriptor_is_refused(tmp_path, monkeypatch):
+    _bind(
+        monkeypatch,
+        tmp_path,
+        tree={
+            _SERVER_PID: (_LAUNCHER_PID, "python.exe"),
+            _LAUNCHER_PID: (_CLAUDE_PID, "py.exe"),
+            _CLAUDE_PID: (39124, "claude.exe"),
+        },
+        descriptor_pid=999999,
+    )
+
+    assert core._claude_windows_manager_identity() is None
