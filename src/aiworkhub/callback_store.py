@@ -1608,11 +1608,149 @@ def rebind_pending_callbacks(
                 "WHERE provider=? AND state='pending' AND origin_thread_id<>?",
                 (origin_thread_id, now, provider, origin_thread_id),
             )
+        _supersede_route_duplicates(conn, provider, origin_thread_id, now)
         conn.commit()
         return len(rows)
     except Exception:
         conn.rollback()
         raise
+
+
+ROUTE_DUPLICATE_REASON = "duplicate_of_live_callback_on_route"
+
+
+def _supersede_route_duplicates(
+    conn: sqlite3.Connection, provider: str, origin_thread_id: str, now: str,
+) -> int:
+    """NF-2026-00843: one route holds one wake per (task, transition, episode).
+
+    A rebind moves rows from many origins onto one, so the route can end up
+    holding the same wake twice, or a pending copy of one it already leased or
+    delivered. Keep the inflight/delivered row, else the oldest pending one, and
+    supersede the other pending copies; a pending batch left empty is superseded.
+    """
+    dupes = conn.execute(
+        "SELECT o.outbox_id, o.batch_id, o.task_id, o.transition FROM callback_outbox o "
+        "WHERE o.provider=? AND o.origin_thread_id=? AND o.state='pending' AND EXISTS ("
+        " SELECT 1 FROM callback_outbox d WHERE d.provider=o.provider"
+        " AND d.origin_thread_id=o.origin_thread_id AND d.task_id=o.task_id"
+        " AND d.transition=o.transition AND d.episode_id=o.episode_id"
+        " AND (d.state IN ('inflight','delivered')"
+        "      OR (d.state='pending' AND d.outbox_id<o.outbox_id)))",
+        (provider, origin_thread_id),
+    ).fetchall()
+    batches: set[str] = set()
+    for row in dupes:
+        conn.execute(
+            "UPDATE callback_outbox SET state='superseded', last_error=?, updated_at=? "
+            "WHERE outbox_id=? AND state='pending'",
+            (ROUTE_DUPLICATE_REASON, now, row["outbox_id"]),
+        )
+        append_event(
+            conn, row["task_id"], "callback_superseded", "",
+            {"transition": row["transition"], "reason": ROUTE_DUPLICATE_REASON},
+        )
+        if row["batch_id"]:
+            batches.add(str(row["batch_id"]))
+    _supersede_emptied_batches(conn, batches, now)
+    return len(dupes)
+
+
+_ADOPTABLE_PROVIDERS = ("codex", "claude", "copilot")
+
+
+def adopt_pending_callbacks(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    origin_thread_id: str,
+) -> dict[str, int]:
+    """NF-2026-00843: hand other providers' pending wakes to the verified manager.
+
+    :func:`rebind_pending_callbacks` moves rows only within one provider, so a
+    wake enqueued for a previous Codex manager was invisible to a new Claude
+    manager (and back). For every PENDING row of another provider whose task is
+    still in that terminal episode, this files one row on the adopting route
+    with the same task/transition/episode/event/request identity, then retires
+    the original as ``superseded`` (``adopted_by_<provider>``) with its recovery
+    budget spent, so neither its own dispatcher nor a verified-route seed can
+    revive it. The original row and a ``callback_adopted`` event keep the
+    originating route as provenance. Inflight, delivered and dead-letter rows
+    are never touched. When the adopting route already holds that wake live,
+    the original is retired as a duplicate; when its copy was retired, nothing
+    moves. One transaction; events are written after the commit.
+    """
+    _ensure_callback_outbox_table(conn)
+    _ensure_callback_batches_table(conn)
+    provider = str(provider or "").strip().lower()
+    origin_thread_id = str(origin_thread_id or "").strip()
+    if provider not in _ADOPTABLE_PROVIDERS or not origin_thread_id:
+        raise ValueError("a codex/claude/copilot provider and origin_thread_id are required")
+    others = tuple(p for p in _ADOPTABLE_PROVIDERS if p != provider)
+    adopted = duplicates = 0
+    events: list[tuple[str, dict[str, str]]] = []
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        candidates = conn.execute(
+            "SELECT outbox_id, batch_id, task_id, provider, origin_thread_id, transition, "
+            "episode_id, event_id, request_id FROM callback_outbox "
+            "WHERE state='pending' AND provider IN (?, ?) ORDER BY created_at ASC, outbox_id ASC",
+            others,
+        ).fetchall()
+        now = utc_now()
+        batches: set[str] = set()
+        for row in candidates:
+            key = (row["task_id"], row["transition"], row["episode_id"])
+            if not _task_still_in_matching_terminal_state(conn, *key):
+                continue  # stale: prune/claim supersede it, adoption never revives it
+            mine = conn.execute(
+                "SELECT state FROM callback_outbox WHERE task_id=? AND provider=? "
+                "AND origin_thread_id=? AND transition=? AND episode_id=? "
+                "ORDER BY outbox_id DESC LIMIT 1",
+                (key[0], provider, origin_thread_id, key[1], key[2]),
+            ).fetchone()
+            if mine is not None and mine["state"] not in ("pending", "inflight", "delivered"):
+                continue
+            if mine is None:
+                try:
+                    conn.execute(
+                        "INSERT INTO callback_outbox(task_id, provider, origin_thread_id, transition, "
+                        "episode_id, event_id, request_id, state, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                        (key[0], provider, origin_thread_id, key[1], key[2],
+                         row["event_id"], row["request_id"], now, now),
+                    )
+                except sqlite3.IntegrityError:
+                    continue  # a legacy UNIQUE row owns this identity; leave the original
+                outcome = "adopted"
+                adopted += 1
+            else:
+                outcome = "duplicate"
+                duplicates += 1
+            conn.execute(
+                "UPDATE callback_outbox SET state='superseded', last_error=?, "
+                "recovery_count=recovery_count+1, updated_at=? WHERE outbox_id=? AND state='pending'",
+                (f"adopted_by_{provider}" if outcome == "adopted" else ROUTE_DUPLICATE_REASON,
+                 now, row["outbox_id"]),
+            )
+            if row["batch_id"]:
+                batches.add(str(row["batch_id"]))
+            events.append((str(key[0]), {
+                "transition": str(key[1]),
+                "episode_id": str(key[2]),
+                "outcome": outcome,
+                "from_provider": str(row["provider"]),
+                "from_origin_thread_id": str(row["origin_thread_id"]),
+                "to_provider": provider,
+            }))
+        _supersede_emptied_batches(conn, batches, now)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    for task_id, payload in events:
+        append_event(conn, task_id, "callback_adopted", "", payload)
+    return {"scanned": len(candidates), "adopted": adopted, "duplicates_superseded": duplicates}
 
 
 STALE_PENDING_PRUNE_REASON = "stale_pending_pruned"
@@ -1963,6 +2101,13 @@ def seed_missing_review_callbacks(
                 },
             )
 
+        # NF-2026-00843: look for the row under the provider enqueue_callback
+        # stores it as. An mls- origin is filed as manager_chat, so a lookup by
+        # the caller's provider never found it and every dispatcher pass
+        # enqueued the wake again (275 copies of one blocked wake, measured).
+        lookup_provider = (
+            MANAGER_CHAT_PROVIDER if _MANAGER_CHAT_SESSION_RE.fullmatch(callback_origin) else provider
+        )
         # The dedup lookup keys on ``transition`` too: a task that already
         # has a review_ready row but is now (same episode) blocked has NO
         # wake for its CURRENT transition, and a transition-blind lookup
@@ -1972,13 +2117,13 @@ def seed_missing_review_callbacks(
             existing = conn.execute(
                 "SELECT outbox_id,batch_id,state,recovery_count FROM callback_outbox WHERE task_id=? AND provider=? "
                 "AND origin_thread_id=? AND transition=? AND episode_id=? LIMIT 1",
-                (task_id, provider, callback_origin, transition, episode_id),
+                (task_id, lookup_provider, callback_origin, transition, episode_id),
             ).fetchone()
         else:
             existing = conn.execute(
                 "SELECT outbox_id,batch_id,state,recovery_count FROM callback_outbox WHERE task_id=? AND provider=? "
                 "AND transition=? AND episode_id=? LIMIT 1",
-                (task_id, provider, transition, episode_id),
+                (task_id, lookup_provider, transition, episode_id),
             ).fetchone()
         if existing is not None:
             if (
@@ -2004,7 +2149,7 @@ def seed_missing_review_callbacks(
                 "SELECT outbox_id,batch_id,state,recovery_count FROM callback_outbox "
                 "WHERE task_id=? AND provider=? AND origin_thread_id=? AND episode_id=? "
                 "AND state IN ('dead_letter','superseded') AND recovery_count=0 LIMIT 1",
-                (task_id, provider, callback_origin, episode_id),
+                (task_id, lookup_provider, callback_origin, episode_id),
             ).fetchone()
             if stranded is not None and _task_still_in_matching_terminal_state(
                 conn, task_id, transition, episode_id
@@ -2331,9 +2476,32 @@ def callback_outbox_stats(conn: sqlite3.Connection) -> dict:
     ).fetchone()
     bound_task_count = origin_thread_bound_count(conn)
     total_task_count = task_count(conn)
+    # NF-2026-00843: backlog truth per provider -- how many pending rows, how
+    # old, how many are only repeat copies of a wake already on that route.
+    now = datetime.now(timezone.utc)
+    hour_ago = (now - timedelta(hours=1)).isoformat()
+    day_ago = (now - timedelta(days=1)).isoformat()
+    pending_by_provider = {
+        str(row["provider"] or ""): {
+            "count": int(row["n"]),
+            "oldest_created_at": str(row["oldest"] or ""),
+            "younger_than_1h": int(row["h1"] or 0),
+            "older_than_24h": int(row["d1"] or 0),
+            "duplicate_rows": int(row["n"]) - int(row["keys"]),
+        }
+        for row in conn.execute(
+            "SELECT provider, COUNT(*) AS n, MIN(created_at) AS oldest, "
+            "SUM(created_at >= ?) AS h1, SUM(created_at < ?) AS d1, "
+            "COUNT(DISTINCT task_id || char(31) || origin_thread_id || char(31) || "
+            "transition || char(31) || episode_id) AS keys "
+            "FROM callback_outbox WHERE state='pending' GROUP BY provider",
+            (hour_ago, day_ago),
+        )
+    }
     return {
         "total": sum(counts.values()),
         "by_state": counts,
+        "pending_by_provider": pending_by_provider,
         "threads_bound": bound_task_count,
         "bound_task_count": bound_task_count,
         "unbound_task_count": max(0, total_task_count - bound_task_count),

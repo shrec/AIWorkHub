@@ -3429,7 +3429,12 @@ def manager_bootstrap(
             "contract prose; it is unchanged while contract_sha256 is unchanged."
         )
     chat = _active_manager_chat_record()
-    if chat:
+    if chat and str((identity or {}).get("provider") or "") == "claude":
+        # NF-2026-00972: a verified Claude route keeps its own callback lane
+        # (claude_callback_wait accepts exactly this session). Reporting the
+        # Manager Chat seat instead told this chat its wakes go elsewhere.
+        reply["manager_chat_seat"] = chat
+    elif chat:
         # The owner seat is the open Manager Chat session. Codex may still
         # deliver on its own thread, but this reply must not look route-pending
         # just because that thread was never observed.
@@ -3451,7 +3456,36 @@ def manager_bootstrap(
             "manager_chat": chat,
         }
         reply["reason"] = ""
+    if bootstrap_call:
+        reply["callback_adoption"] = _adopt_callbacks_on_bootstrap(reply["manager_route"])
     return reply
+
+
+def _adopt_callbacks_on_bootstrap(route: Mapping[str, Any]) -> dict[str, Any]:
+    """NF-2026-00843: a verified manager's own bootstrap adopts other providers' pending wakes.
+
+    Only the bootstrap tool, never a watchdog: a manager starting is the act that
+    makes it current, so two open seats cannot keep pulling wakes from each other.
+    Only a callback-capable Claude/Codex route adopts; a pending route or the
+    Manager Chat seat (which mirrors every provider already) adopts nothing.
+    """
+    provider = str(route.get("provider") or "").strip().lower()
+    origin = str(route.get("thread_id") or route.get("session_id") or "").strip()
+    refused = str(route.get("callback_supported") or "").strip().lower() == "false"
+    if provider not in ("claude", "codex") or refused or not _valid_origin_thread_id(origin):
+        return {"adopted": 0, "reason": "callback_capable_manager_route_required"}
+    try:
+        conn = _canonical_connect()
+    except Exception as exc:  # noqa: BLE001 -- bootstrap must remain available
+        return {"adopted": 0, "reason": f"store_unavailable:{type(exc).__name__}"}
+    try:
+        return callback_store.adopt_pending_callbacks(
+            conn, provider=provider, origin_thread_id=origin,
+        )
+    except Exception as exc:  # noqa: BLE001 -- bootstrap must remain available
+        return {"adopted": 0, "reason": f"adoption_failed:{type(exc).__name__}"}
+    finally:
+        conn.close()
 
 
 def repository_current() -> dict[str, Any]:
@@ -11483,6 +11517,38 @@ def _watch_signature(rows: Sequence[Mapping[str, Any]], watch: Sequence[str]) ->
     return signature
 
 
+def _claude_lane_refusal() -> dict[str, Any]:
+    """NF-2026-00972: why the Claude callback lane refuses a non-Claude caller.
+
+    Mirrors manager_bootstrap: the open Manager Chat seat, else the verified
+    Codex route, owns this caller's wakes, and the reply names it. Only a caller
+    with no verified manager route at all gets ``verified_claude_manager_required``.
+    """
+    chat = _active_manager_chat_record()
+    if chat:
+        return {
+            "reason": "callback_lane_owned_by_manager_chat",
+            "owning_route": {
+                "provider": "manager_chat",
+                "session_id": chat["session_id"],
+                "delivery": "the Manager Chat loop delivers and acknowledges these wakes",
+            },
+        }
+    codex = _codex_manager_identity()
+    if codex:
+        return {
+            "reason": "callback_lane_owned_by_codex",
+            "owning_route": {
+                "provider": "codex",
+                "thread_id": str(codex.get("thread_id") or ""),
+                "route_state": str(codex.get("route_state") or ""),
+                "callback_supported": str(codex.get("callback_supported") or "false"),
+                "delivery": "the Codex extension delivers to the verified Codex thread",
+            },
+        }
+    return {"reason": "verified_claude_manager_required"}
+
+
 def claude_callback_wait(
     timeout_seconds: int = 240,
     ack_batch_id: str = "",
@@ -11511,7 +11577,7 @@ def claude_callback_wait(
     """
     identity = _claude_manager_identity()
     if identity is None:
-        return {"ok": False, "reason": "verified_claude_manager_required"}
+        return {"ok": False, **_claude_lane_refusal()}
     limits = callback_wait_limits()
     try:
         requested = int(timeout_seconds)
@@ -11657,7 +11723,7 @@ def claude_callback_ack(batch_id: str, lease_id: str) -> dict[str, Any]:
     member (``claude_callback_ack_by_reference``)."""
     identity = _claude_manager_identity()
     if identity is None:
-        return {"ok": False, "reason": "verified_claude_manager_required"}
+        return {"ok": False, **_claude_lane_refusal()}
     conn = _canonical_connect()
     try:
         acknowledged = callback_store.acknowledge_callback_batch(
@@ -11693,7 +11759,7 @@ def claude_callback_ack_by_reference(*, task_id: str = "", request_id: str = "")
     """
     identity = _claude_manager_identity()
     if identity is None:
-        return {"acknowledged": False, "batch_id": "", "reason": "verified_claude_manager_required"}
+        return {"acknowledged": False, "batch_id": "", **_claude_lane_refusal()}
     try:
         conn = _canonical_connect()
     except Exception as exc:  # noqa: BLE001 -- ack-by-reference is a courtesy, never a gate
