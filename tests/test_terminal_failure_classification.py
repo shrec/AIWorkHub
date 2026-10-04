@@ -827,6 +827,22 @@ def test_control_plane_code_is_the_module_constant_never_a_slice_of_the_input() 
     assert any(code is reason for reason in _CONTROL_PLANE_REASONS)
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "validation_toolchain_authority_receipt_card_identity_mismatch",
+        "validation_toolchain_authority_receipt_path_mismatch",
+    ],
+)
+def test_toolchain_receipt_refusal_is_the_finalize_failed_diagnostic(reason: str) -> None:
+    """NF-2026-01346: the two refusals measured on replays 1cf403ba, 42536dd8
+    and a162c3fd, exactly as the finalizer's ``WorkspaceError`` branch hands
+    them over, name the terminal event instead of ``unclassified``."""
+    result = terminal_event_authority(state="finalize_failed", exit_code=0, error=reason)
+    assert result["diagnostic"] == f"finalize_failed:{reason}:exit_code=0"
+    assert result["error"] == result["diagnostic"]
+
+
 # --------------------------------------------------------------------------- #
 # Fail-closed: everything that is NOT a recognised control-plane reason is
 # sanitised exactly as it was before.

@@ -478,6 +478,28 @@ _CONTROL_PLANE_REASONS: tuple[str, ...] = (
     # ``permission denied`` tail cannot win ``auth_forbidden`` for posix_shm
     # or named_semaphore backends.
     "validation_unsupported_in_sandbox",
+    # Toolchain-authority receipt refusals (NF-2026-01346): bare literals from
+    # ``toolchain_authority._verified_receipt_snapshot`` and worker_workspace's
+    # ``_authority_receipt_fact``/``_verify_authority_receipt_executable``,
+    # raised before (or instead of) any declared command running.
+    # No ``_SIGNATURES`` entry matches them, so a replay refused here was filed
+    # ``finalize_failed:unclassified:exit_code=0`` with the reason visible only
+    # in the attempt evidence.
+    "validation_toolchain_authority_secret_unavailable",
+    "validation_toolchain_authority_receipt_schema",
+    "validation_toolchain_authority_receipt_repository_mismatch",
+    "validation_toolchain_authority_receipt_path_mismatch",
+    "validation_toolchain_authority_receipt_registry_fingerprint_mismatch",
+    "validation_toolchain_authority_receipt_repository_fingerprint_mismatch",
+    "validation_toolchain_authority_receipt_request_id_mismatch",
+    "validation_toolchain_authority_receipt_card_identity_mismatch",
+    "validation_toolchain_authority_receipt_cache_identity_mismatch",
+    "validation_toolchain_authority_receipt_mac_mismatch",
+    "validation_toolchain_authority_receipt_malformed",
+    "validation_toolchain_authority_receipt_digest_mismatch",
+    "validation_toolchain_authority_executable_identity_drift",
+    "validation_toolchain_authority_executable_missing",
+    "validation_toolchain_authority_executable_unreceipted",
     # ------------------------------------------------------------------ #
     # WRAPPERS ONLY BELOW THIS LINE -- see the ordering note above.
     #

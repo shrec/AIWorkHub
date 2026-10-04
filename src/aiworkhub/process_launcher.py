@@ -6335,7 +6335,19 @@ class ProcessManager:
                     "quality_review": None,
                 }
                 if isinstance(receipt, Mapping):
-                    metadata[_toolchain_authority.RECEIPT_CARD_KEY] = dict(receipt)
+                    # NF-2026-01346: the preflight receipt (verified above
+                    # against the claim card) binds the STORED card identity,
+                    # but the finalizer verifies against this metadata, whose
+                    # ``immutable_inputs`` ``_with_dependency_inputs`` widened.
+                    # Copying it verbatim failed every dependent replay with
+                    # ``receipt_card_identity_mismatch`` before any declared
+                    # command ran. Re-bind it to the exact identity the
+                    # finalizer checks, which still runs every receipt check.
+                    metadata[_toolchain_authority.RECEIPT_CARD_KEY] = (
+                        _toolchain_authority.rebind_authority_receipt(
+                            receipt, self.repo, card, metadata
+                        )
+                    )
                 write_json_0600(metadata_path, metadata)
                 _write_terminal_authority_grant(
                     self._terminal_authority_grant_path(request_id),

@@ -4375,9 +4375,17 @@ def test_validation_only_replay_authorization_fails_closed_before_launch():
 
 
 @_requires_anchored_reads
+@pytest.mark.parametrize(
+    "dependency_inputs", [False, True], ids=["own_inputs", "dependency_inputs"]
+)
 def test_validation_only_replay_preserves_complete_toolchain_receipt_identity(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dependency_inputs: bool
 ) -> None:
+    """NF-2026-01346: ``_launch_isolated`` hands the replay the card AFTER
+    ``_with_dependency_inputs`` widened ``immutable_inputs``, while the receipt
+    was minted over the preflight card. The receipt the finalizer verifies
+    against the request metadata must be bound to that widened identity, or the
+    replay dies ``card_identity_mismatch`` before any declared command runs."""
     monkeypatch.setenv(
         "AIWORKHUB_TOOLCHAIN_AUTHORITY_HMAC_KEY",
         "hex:" + ("ce" * 32),
@@ -4418,6 +4426,18 @@ def test_validation_only_replay_preserves_complete_toolchain_receipt_identity(
         "one_episode_binding": True,
     }
     preflight["validation_only_replay_authorization"] = dict(authorization)
+    # The stored (and so the committed claim) card never carries the widened
+    # inputs; only the launch-local copy ``_launch_isolated`` builds does.
+    launch_card = preflight
+    if dependency_inputs:
+        preflight["depends_on"] = ["TASK_REPLAY_DEPENDENCY"]
+        monkeypatch.setattr(
+            manager,
+            "_load_dependency_card",
+            lambda _dep: {"allowed_writes": ["dep/output.json"]},
+        )
+        launch_card = manager._with_dependency_inputs(preflight)
+        assert launch_card["immutable_inputs"][-1] == "dep/output.json"
 
     workspace_path = tmp_path / "replay-worktree"
     workspace_path.mkdir()
@@ -4481,12 +4501,12 @@ def test_validation_only_replay_preserves_complete_toolchain_receipt_identity(
         adapter_id="claude_cli",
         model=None,
         timeout_seconds=30,
-        card=preflight,
+        card=launch_card,
         authorization=authorization,
         request_id=request_id,
     )
 
-    assert launched["ok"] is True
+    assert launched["ok"] is True, launched.get("blocked_reason")
     metadata = json.loads(
         (manager.process_dir / f"{request_id}.request.json").read_text(
             encoding="utf-8"
@@ -4494,6 +4514,7 @@ def test_validation_only_replay_preserves_complete_toolchain_receipt_identity(
     )
     assert metadata["allowed_writes"] == preflight["allowed_writes"]
     assert metadata["read_first"] == preflight["read_first"]
+    assert metadata["immutable_inputs"] == list(launch_card.get("immutable_inputs") or [])
     assert toolchain_authority.verify_authority_receipt(
         metadata[toolchain_authority.RECEIPT_CARD_KEY], manager.repo, metadata
     )

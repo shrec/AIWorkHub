@@ -239,6 +239,31 @@ def test_request_6ba3c9b1_cache_and_receipt_bind_repository_input_contract(
             toolchain_authority.verify_authority_receipt(receipt, tmp_path, mismatched)
 
 
+def test_rebind_moves_a_verified_receipt_to_the_widened_identity_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NF-2026-01346: a replay's finalizer verifies against metadata whose
+    ``immutable_inputs`` dependency materialization widened. The rebind must
+    verify for the claim card first and yield a receipt that passes the full
+    check for the widened identity -- and never re-bless a forged receipt."""
+    monkeypatch.setenv("AIWORKHUB_TOOLCHAIN_AUTHORITY_HMAC_KEY", "hex:" + ("ad" * 32))
+    card = {**_card(), "task_id": "TASK_REBIND", "request_id": "rebind-request-1"}
+    widened = {**card, "immutable_inputs": ["dep/output.json"]}
+    receipt = toolchain_authority.authority_receipt(_authority(tmp_path).evaluate(card), card)
+
+    rebound = toolchain_authority.rebind_authority_receipt(receipt, tmp_path, card, widened)
+
+    assert toolchain_authority.verify_authority_receipt(rebound, tmp_path, widened)
+    assert rebound["executables"] == receipt["executables"]
+    with pytest.raises(ValueError, match="receipt_card_identity_mismatch"):
+        toolchain_authority.verify_authority_receipt(rebound, tmp_path, card)
+    with pytest.raises(ValueError, match="receipt_card_identity_mismatch"):
+        toolchain_authority.rebind_authority_receipt(receipt, tmp_path, widened, widened)
+    forged = {**receipt, "receipt_mac": "0" * 64}
+    with pytest.raises(ValueError, match="receipt_mac_mismatch"):
+        toolchain_authority.rebind_authority_receipt(forged, tmp_path, card, widened)
+
+
 def test_executable_and_symlink_replacement_invalidate_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -8,7 +8,7 @@ import sys
 
 import pytest
 
-from aiworkhub import process_launcher, worker_workspace
+from aiworkhub import process_launcher, toolchain_authority, worker_workspace
 from aiworkhub.process_launcher_validation import replay_terminal_state
 from aiworkhub.worker_workspace import ValidationRunError
 from test_process_launcher import _requires_anchored_reads
@@ -279,3 +279,48 @@ def test_replay_finalize_error_stays_validation_failed_when_replay_terminal_stat
     )
     assert event["state"] == "validation_failed"
     assert terminal_calls == [("review", "validation_failed")]
+
+
+@_requires_anchored_reads
+def test_replay_toolchain_receipt_refusal_is_the_typed_top_level_diagnostic(
+    monkeypatch, tmp_path
+):
+    """NF-2026-01346: a receipt minted for another card identity (the preflight
+    card, before ``_with_dependency_inputs`` widened ``immutable_inputs``)
+    refuses the replay before any declared command runs. That refusal must be
+    the terminal event's own diagnostic, not ``finalize_failed:unclassified``
+    with the reason visible only in the attempt evidence."""
+    manager, workspace, terminal_calls = _build_manager(tmp_path, monkeypatch)
+    request_id = "req-nf01346"
+    preflight_identity = {
+        "task_id": "TASK_NF01195",
+        "request_id": request_id,
+        "validation": [f"{sys.executable} -c pass"],
+    }
+    receipt = toolchain_authority.authority_receipt(
+        toolchain_authority.ToolchainAuthority(manager.repo).evaluate(
+            preflight_identity
+        ),
+        preflight_identity,
+    )
+
+    event = _finalize(
+        manager,
+        workspace,
+        tmp_path,
+        request_id,
+        extra_metadata={
+            **preflight_identity,
+            "execution_mode": "validation_only_replay",
+            "sandbox_backend": "deterministic_validation",
+            "immutable_inputs": ["dep/output.json"],
+            toolchain_authority.RECEIPT_CARD_KEY: receipt,
+        },
+    )
+    assert event["state"] == "finalize_failed"
+    assert event["diagnostic"] == (
+        "finalize_failed:validation_toolchain_authority_receipt_card_identity_mismatch"
+        ":exit_code=0"
+    )
+    assert event["validation"] == []
+    assert terminal_calls == [("failure", "finalize_failed")]

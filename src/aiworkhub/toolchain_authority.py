@@ -18,7 +18,7 @@ import stat
 import tempfile
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
@@ -1168,6 +1168,42 @@ def verify_authority_receipt(
     """Verify a launch receipt against current repository/cache identity."""
     if receipt is None:
         return None
+    _verified_receipt_snapshot(receipt, repo, card)
+    return dict(receipt)
+
+
+def rebind_authority_receipt(
+    receipt: Mapping[str, Any],
+    repo: Path,
+    verified_card: Mapping[str, Any],
+    card: Mapping[str, Any],
+) -> dict[str, object]:
+    """Re-mint ``receipt``, verified for ``verified_card``, for ``card``.
+
+    NF-2026-01346: a validation-only replay verifies its preflight receipt
+    against the claim card, but its finalizer verifies against the request
+    metadata, whose ``immutable_inputs`` ``_with_dependency_inputs`` widened.
+    Every check (scalars, MAC, digest, executable identity) must pass for
+    ``verified_card`` first; only the card-bound ``cache_identity`` and the
+    digest, ``card_identity`` and MAC over it are then recomputed for ``card``,
+    so the finalizer still runs the full verification. Not re-evaluated:
+    that would re-probe dependency paths not yet produced, which
+    ``_with_dependency_inputs`` documents as harmless.
+    """
+    snapshot = _verified_receipt_snapshot(receipt, repo, verified_card)
+    authority = ToolchainAuthority(repo)
+    cache_identity, _metadata, _path = authority._cache_identity(
+        _load_project_registry(authority.repo), card
+    )
+    rebound = replace(snapshot, cache_identity=cache_identity)
+    return authority_receipt(
+        replace(rebound, digest=authority._payload_digest(rebound)), card
+    )
+
+
+def _verified_receipt_snapshot(
+    receipt: Mapping[str, Any], repo: Path, card: Mapping[str, Any]
+) -> AuthoritySnapshot:
     if receipt.get("schema_id") != RECEIPT_SCHEMA_ID:
         raise ValueError("validation_toolchain_authority_receipt_schema")
     authority = ToolchainAuthority(repo)
@@ -1237,4 +1273,4 @@ def verify_authority_receipt(
         raise ValueError("validation_toolchain_authority_receipt_digest_mismatch")
     if not authority._executable_identities_match(snapshot):
         raise ValueError("validation_toolchain_authority_executable_identity_drift")
-    return dict(receipt)
+    return snapshot
