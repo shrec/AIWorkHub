@@ -8208,6 +8208,11 @@ if (elements.managerChatTaskFilter && typeof elements.managerChatTaskFilter.addE
     renderManagerChatTaskBoard();
   });
 }
+elements.managerChatInput.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+  event.preventDefault();
+  elements.managerChatComposer.requestSubmit();
+});
 elements.managerChatComposer.addEventListener("submit", (event) => {
   event.preventDefault();
   if (elements.managerChatSend.disabled) return;

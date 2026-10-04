@@ -837,6 +837,30 @@ test("turn_end, error and session_close stop the Thinking timer even on an idle 
   }
 });
 
+test("Enter sends, Shift+Enter and IME composition do not", () => {
+  const harness = loadWebviewSlice();
+  harness.elements.managerChatComposer.requestSubmit = () => trigger(harness.elements.managerChatComposer, "submit");
+  harness.elements.managerChatBackendSelect.value = "codex_cli";
+  harness.elements.managerChatModelInput.value = "gpt-x";
+  const sends = () => harness.posts.filter((post) => post.type === "managerLoopSend").length;
+  let prevented = 0;
+  const key = (overrides) => trigger(harness.elements.managerChatInput, "keydown", {
+    key: "Enter", shiftKey: false, isComposing: false, preventDefault() { prevented += 1; }, ...overrides,
+  });
+
+  harness.elements.managerChatInput.value = "line one";
+  key({ shiftKey: true });
+  key({ isComposing: true });
+  key({ key: "a" });
+  assert.equal(sends(), 0);
+  assert.equal(prevented, 0, "Shift+Enter keeps inserting a newline");
+
+  key({});
+  assert.equal(sends(), 1);
+  assert.equal(prevented, 1);
+  assert.equal(harness.elements.managerChatInput.value, "");
+});
+
 test("the composer stays enabled with no session and while a turn is running", () => {
   const harness = loadWebviewSlice();
   assert.equal(harness.state.managerChatSession, null);
