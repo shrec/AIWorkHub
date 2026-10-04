@@ -982,7 +982,7 @@ def test_stream_tokens_keep_thinking_on_without_a_level_and_normalize_the_level(
         "opencode", "run", "--thinking", "hi",
     ]
     assert mlb.apply_manager_stream_tokens("claude_cli", ["claude", "-p"], " High ") == [
-        "claude", "-p", "--include-partial-messages", "--effort", "high",
+        "claude", "-p", "--include-partial-messages", "--thinking-display", "summarized", "--effort", "high",
     ]
     effort = ["-c", 'model_reasoning_effort="high"']
     assert mlb.apply_manager_stream_tokens("codex_cli", ["codex", "--json"], "high") == [

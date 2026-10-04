@@ -456,8 +456,12 @@ def manager_stream_tokens(backend_id: str, level: str = "") -> list[str]:
     """Flags that make a manager turn show thinking and honor a chosen depth.
 
     OpenCode hides thinking blocks unless ``--thinking`` is set. Claude's
-    stream stays dark until partial messages are requested. Effort tokens are
-    added only for a level the CLI documents.
+    stream stays dark until partial messages are requested, and in ``-p
+    stream-json`` mode it leaves the thinking display to the API default, which
+    for claude-opus-5 is omitted: thinking blocks arrive with empty text
+    (measured on CLI 2.1.280: 6 blocks, 0 chars; with ``--thinking-display
+    summarized``: 5 blocks, 5995 chars). Effort tokens are added only for a
+    level the CLI documents.
     """
 
     cleaned = str(level or "").strip().lower()
@@ -466,7 +470,7 @@ def manager_stream_tokens(backend_id: str, level: str = "") -> list[str]:
     if backend_id == "opencode_cli":
         return ["--thinking"]
     if backend_id == "claude_cli":
-        tokens = ["--include-partial-messages"]
+        tokens = ["--include-partial-messages", "--thinking-display", "summarized"]
         if cleaned:
             tokens.extend(("--effort", cleaned))
         return tokens

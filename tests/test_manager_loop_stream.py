@@ -47,6 +47,11 @@ def test_reasoning_depth_is_only_a_documented_flag() -> None:
         "claude",
         "-p",
         "--include-partial-messages",
+        # Without an explicit display claude-opus-5 streams thinking blocks with
+        # empty text in -p stream-json mode (measured on CLI 2.1.280: 6 blocks,
+        # 0 chars; with summarized: 5 blocks, 5995 chars).
+        "--thinking-display",
+        "summarized",
     ]
     codex = apply_manager_stream_tokens("codex_cli", ["codex", "exec", "-"], "high")
     assert codex[-3] == "-c"
