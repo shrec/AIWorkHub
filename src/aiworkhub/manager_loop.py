@@ -299,6 +299,17 @@ def _normalize(raw: object) -> tuple[str, dict[str, Any]]:
     return kind, dict(payload) if isinstance(payload, Mapping) else {"value": payload}
 
 
+def _measured_fill(events: Iterable[Mapping[str, Any]]) -> float | None:
+    """The last ``turn_end``'s provider-reported ``usage.context_fill``; ``None`` when unreported or invalid."""
+    ends = [event for event in events if event.get("type") == "turn_end"]
+    payload = ends[-1].get("payload") if ends else None
+    usage = payload.get("usage") if isinstance(payload, Mapping) else None
+    fill = usage.get("context_fill") if isinstance(usage, Mapping) else None
+    if isinstance(fill, bool) or not isinstance(fill, (int, float)) or not 0 <= fill < float("inf"):
+        return None
+    return float(fill)
+
+
 def _not_ok(source: str, result: Mapping[str, Any]) -> dict[str, str]:
     return {"source": source, "error": str(result.get("error") or "not_ok")[:240]}
 
@@ -670,8 +681,9 @@ class ManagerOrchestrator:
     is rotated or closed, so a second session -- from this process or another --
     is refused instead of running beside the first. Every backend event is
     logged as it arrives and every turn is recorded through the Context Graph
-    event writer. Once ``context_estimate_bytes`` crosses ``rotate_fraction`` of
-    ``context_window_bytes`` the session rotates and its successor starts on the
+    event writer. Once the provider-reported ``context_fill`` reaches ``rotate_fraction``
+    (or, while none is reported, ``context_estimate_bytes`` reaches that fraction of
+    ``context_window_bytes``) the session rotates and its successor starts on the
     same backend and model, rehydrated from the handoff; an explicit ``start``
     may pick any other backend and model.
     """
@@ -691,6 +703,7 @@ class ManagerOrchestrator:
     ) -> None:
         if not 0 < rotate_fraction <= 1:
             raise ValueError("rotate_fraction must be in (0, 1]")
+        self.rotate_fraction = rotate_fraction
         self.rotate_at_bytes = int(context_window_bytes * rotate_fraction)
         if self.rotate_at_bytes <= brief_builder.max_bytes:
             # Otherwise a session would already be past its own rotation point
@@ -1287,9 +1300,18 @@ class ManagerOrchestrator:
             "events": events,
             "errors": errors,
             "context_estimate_bytes": session.context_estimate_bytes,
+            "context_fill": _measured_fill(events),
+            "rotation_basis": "provider_context_fill",
             "rotation": None,
         }
-        if session.context_estimate_bytes >= self.rotate_at_bytes:
+        # NF-2026-01238 (a): the provider's measured fill decides when it reports one; the
+        # byte estimate only stands in, labelled as such, and an unreported fill stays None.
+        if result["context_fill"] is not None:
+            full = result["context_fill"] >= self.rotate_fraction
+        else:
+            result["rotation_basis"] = "byte_estimate"
+            full = session.context_estimate_bytes >= self.rotate_at_bytes
+        if full:
             result["rotation"] = self._rotate("context_threshold", successor=True)
         return result
 

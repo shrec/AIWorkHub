@@ -451,6 +451,44 @@ def test_crossing_the_threshold_rotates_into_a_rehydrated_successor(make) -> Non
     assert (successor.backend_id, successor.model) == ("fake", "model-a")
     assert "context_threshold" in harness.backends[0].messages[-1]
     assert harness.store.read_handoff(first.session_id) in harness.backends[1].briefs[0]
+    assert (below["context_fill"], below["rotation_basis"]) == (None, "byte_estimate")
+    assert (crossed["context_fill"], crossed["rotation_basis"]) == (None, "byte_estimate")
+
+
+def _measured(fill: Any) -> list[dict[str, Any]]:
+    usage = {"input": 1, "cache_read": 0, "cache_write": 0, "output": 1, "context_window": 200000, "context_fill": fill}
+    return [
+        {"type": "assistant_text", "payload": {"text": "ok"}},
+        {"type": "turn_end", "payload": {"usage": usage}},
+    ]
+
+
+def test_a_reported_context_fill_decides_rotation_over_the_byte_estimate(make) -> None:
+    # NF-2026-01238 (a): the provider's measured fill wins in both directions.
+    harness = make(brief_bytes=1024, context_window_bytes=2200, rotate_fraction=0.5)
+    harness.orch.start("fake", "model-a")
+    harness.backends[0].script.extend([_measured(0.1), _measured(0.5)])
+
+    under = harness.orch.send("x" * 1000)
+
+    assert under["context_estimate_bytes"] >= harness.orch.rotate_at_bytes
+    assert (under["context_fill"], under["rotation_basis"], under["rotation"]) == (0.1, "provider_context_fill", None)
+
+    full = harness.orch.send("short")
+
+    assert (full["context_fill"], full["rotation_basis"]) == (0.5, "provider_context_fill")
+    assert full["rotation"] is not None and full["rotation"]["successor"] == harness.orch.session
+
+
+@pytest.mark.parametrize("reported", [None, "0.9", True, -1, float("nan")])
+def test_an_unreported_or_invalid_fill_stays_unknown_and_falls_back_to_the_estimate(make, reported: Any) -> None:
+    harness = make()
+    harness.orch.start("fake", "model-a")
+    harness.backends[0].script.append(_measured(reported))
+
+    result = harness.orch.send("hello")
+
+    assert (result["context_fill"], result["rotation_basis"], result["rotation"]) == (None, "byte_estimate", None)
 
 
 def test_a_threshold_inside_the_brief_budget_is_refused(make) -> None:
