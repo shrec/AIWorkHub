@@ -38,7 +38,13 @@ path from its drive root -- ``repository_state``'s symlink check -- refused
 every path.  When such a call is denied, the answer is the host's own
 ``lstat`` of that exact directory, which the lane passes in
 ``AIWORKHUB_APPCONTAINER_ANCESTORS`` (``windows_appcontainer.
-ancestor_stat_facts``).  Only those directories, only on a denial.
+``ancestor_stat_facts``).  Only those directories, only on a denial.
+
+Not a call but the environment: CreateProcess into the container replaced
+TEMP and TMP with the adapter-shared ``...\AC\Temp`` and kept TMPDIR
+(NF-2026-01341).  In a validation launch -- the scratch env is set -- both are
+put back on TMPDIR, so every child this process starts inherits the request's
+own scratch.
 """
 
 import ctypes
@@ -52,6 +58,7 @@ _stat = os.stat
 _lstat = os.lstat
 _getfinalpathname_host = ntpath._getfinalpathname
 _ANCESTORS_ENV = "AIWORKHUB_APPCONTAINER_ANCESTORS"
+_SCRATCH_ENV = "AIWORKHUB_VALIDATION_EXEC_SCRATCH_ROOT"
 
 _OPEN_EXISTING = 3
 _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
@@ -149,3 +156,5 @@ if __name__ == "sitecustomize":
     _facts = _ancestor_facts(os.environ.get(_ANCESTORS_ENV))
     os.stat = _brokered(_stat, _facts)
     os.lstat = _brokered(_lstat, _facts)
+    if os.environ.get(_SCRATCH_ENV) and os.environ.get("TMPDIR"):
+        os.environ["TEMP"] = os.environ["TMP"] = os.environ["TMPDIR"]

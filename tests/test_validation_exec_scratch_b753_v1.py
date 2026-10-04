@@ -227,8 +227,8 @@ def test_validation_timeout_raises_and_cleans_scratch(
     captured: dict[str, Path] = {}
     real_provision = worker_workspace.provision_validation_exec_scratch
 
-    def _capture(ws: worker_workspace.WorkerWorkspace) -> Path:
-        scratch = real_provision(ws)
+    def _capture(ws: worker_workspace.WorkerWorkspace, **kwargs: object) -> Path:
+        scratch = real_provision(ws, **kwargs)
         captured["scratch"] = scratch
         return scratch
 
@@ -255,8 +255,8 @@ def test_scratch_removed_after_successful_run(
     captured: dict[str, Path] = {}
     real_provision = worker_workspace.provision_validation_exec_scratch
 
-    def _capture(ws: worker_workspace.WorkerWorkspace) -> Path:
-        scratch = real_provision(ws)
+    def _capture(ws: worker_workspace.WorkerWorkspace, **kwargs: object) -> Path:
+        scratch = real_provision(ws, **kwargs)
         captured["scratch"] = scratch
         return scratch
 
@@ -276,8 +276,8 @@ def test_scratch_removed_after_deliberate_validation_failure(
     captured: dict[str, Path] = {}
     real_provision = worker_workspace.provision_validation_exec_scratch
 
-    def _capture(ws: worker_workspace.WorkerWorkspace) -> Path:
-        scratch = real_provision(ws)
+    def _capture(ws: worker_workspace.WorkerWorkspace, **kwargs: object) -> Path:
+        scratch = real_provision(ws, **kwargs)
         captured["scratch"] = scratch
         return scratch
 
@@ -308,8 +308,8 @@ def test_scratch_removed_after_abrupt_cancellation_like_exception(
     captured: dict[str, Path] = {}
     real_provision = worker_workspace.provision_validation_exec_scratch
 
-    def _capture(ws: worker_workspace.WorkerWorkspace) -> Path:
-        scratch = real_provision(ws)
+    def _capture(ws: worker_workspace.WorkerWorkspace, **kwargs: object) -> Path:
+        scratch = real_provision(ws, **kwargs)
         captured["scratch"] = scratch
         return scratch
 
@@ -601,7 +601,7 @@ def test_run_validations_pins_request_local_scratch_root(
 
     monkeypatch.setattr(worker_workspace, "select_sandbox_backend", lambda: "landlock")
     monkeypatch.setattr(
-        worker_workspace, "provision_validation_exec_scratch", lambda _ws: scratch_dir
+        worker_workspace, "provision_validation_exec_scratch", lambda _ws, **_: scratch_dir
     )
     monkeypatch.setattr(worker_workspace, "cleanup_validation_exec_scratch", lambda _p: None)
     monkeypatch.setattr(

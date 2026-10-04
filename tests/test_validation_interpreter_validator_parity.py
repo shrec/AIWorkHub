@@ -1155,7 +1155,7 @@ def test_run_validations_records_final_module_interpreter_authority(
         ),
     )
     monkeypatch.setattr(
-        worker_workspace, "provision_validation_exec_scratch", lambda _workspace: scratch
+        worker_workspace, "provision_validation_exec_scratch", lambda _workspace, **_: scratch
     )
     monkeypatch.setattr(
         worker_workspace, "cleanup_validation_exec_scratch", lambda _scratch: None

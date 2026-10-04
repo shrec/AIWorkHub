@@ -985,7 +985,7 @@ def test_validation_records_carry_bounded_python_candidate_authority_reference(
         scratch.mkdir()
         monkeypatch.setattr(worker_workspace, "select_sandbox_backend", lambda: "landlock")
         monkeypatch.setattr(
-            worker_workspace, "provision_validation_exec_scratch", lambda _workspace: scratch
+            worker_workspace, "provision_validation_exec_scratch", lambda _workspace, **_: scratch
         )
         monkeypatch.setattr(
             worker_workspace, "cleanup_validation_exec_scratch", lambda _path: None
@@ -4491,7 +4491,7 @@ def test_validation_batch_retains_each_failed_command_and_bounded_streams(
     scratch.mkdir()
     monkeypatch.setattr(worker_workspace, "select_sandbox_backend", lambda: "landlock")
     monkeypatch.setattr(
-        worker_workspace, "provision_validation_exec_scratch", lambda _workspace: scratch
+        worker_workspace, "provision_validation_exec_scratch", lambda _workspace, **_: scratch
     )
     monkeypatch.setattr(worker_workspace, "cleanup_validation_exec_scratch", lambda _path: None)
     monkeypatch.setattr(
@@ -4539,7 +4539,7 @@ def test_validation_batch_records_pytest_outcomes_and_first_failure_block(
     scratch.mkdir()
     monkeypatch.setattr(worker_workspace, "select_sandbox_backend", lambda: "landlock")
     monkeypatch.setattr(
-        worker_workspace, "provision_validation_exec_scratch", lambda _workspace: scratch
+        worker_workspace, "provision_validation_exec_scratch", lambda _workspace, **_: scratch
     )
     monkeypatch.setattr(worker_workspace, "cleanup_validation_exec_scratch", lambda _path: None)
     monkeypatch.setattr(
@@ -5508,7 +5508,7 @@ class TestFocusedRegressionExercisesCandidate:
         monkeypatch.setattr(
             worker_workspace,
             "provision_validation_exec_scratch",
-            lambda _ws: scratch_dir,
+            lambda _ws, **_: scratch_dir,
         )
         cleanup_called = [False]
 
@@ -5629,7 +5629,7 @@ class TestFocusedRegressionExercisesCandidate:
         monkeypatch.setattr(
             worker_workspace,
             "provision_validation_exec_scratch",
-            lambda _ws: scratch_dir,
+            lambda _ws, **_: scratch_dir,
         )
         monkeypatch.setattr(
             worker_workspace,
@@ -5755,7 +5755,7 @@ class TestFocusedRegressionExercisesCandidate:
         monkeypatch.setattr(
             worker_workspace,
             "provision_validation_exec_scratch",
-            lambda _ws: scratch_dir,
+            lambda _ws, **_: scratch_dir,
         )
         monkeypatch.setattr(
             worker_workspace,
@@ -5834,7 +5834,7 @@ class TestFocusedRegressionExercisesCandidate:
         monkeypatch.setattr(
             worker_workspace,
             "provision_validation_exec_scratch",
-            lambda _ws: scratch_dir,
+            lambda _ws, **_: scratch_dir,
         )
         monkeypatch.setattr(
             worker_workspace,
@@ -5867,7 +5867,7 @@ def _landlock_run_harness(
     monkeypatch.setattr(
         worker_workspace,
         "provision_validation_exec_scratch",
-        lambda _ws: scratch_dir,
+        lambda _ws, **_: scratch_dir,
     )
     monkeypatch.setattr(
         worker_workspace,
@@ -5927,7 +5927,7 @@ def test_parallel_validation_requests_use_distinct_cache_and_temp(
     monkeypatch.setattr(
         worker_workspace,
         "provision_validation_exec_scratch",
-        lambda _ws: next(scratch_sequence),
+        lambda _ws, **_: next(scratch_sequence),
     )
 
     envs: list[dict[str, str]] = []

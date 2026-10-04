@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.25 — 2026-10-04
+
+### Fixed
+
+- Windows AppContainer validation commands get the request's own temp directory instead of the adapter-shared `AC\Temp`; non-Python commands run under a trampoline that restores TEMP/TMP (NF-2026-01341).
+- The recorded command stays the declared argv and exit codes are preserved. Includes the 0.12.24 same-range editor-correction recovery.
+
+### Qualification
+
+- Independent component regressions and an opt-in live AppContainer probe pass; installation, activation and live qualification are separate evidence.
+
 ## 0.12.23 — 2026-10-03
 
 ### Fixed

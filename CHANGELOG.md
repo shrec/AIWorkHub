@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.25] - 2026-10-04
+
+### Fixed
+
+- Windows AppContainer validation runs every command with the request's own temp directory. CreateProcess into the container replaced TEMP/TMP with the adapter-shared `...\AC\Temp` (stale build caches, failing `git init`); the exec scratch now lives under the request home, and a non-Python command starts under a Python trampoline whose site shim puts TEMP/TMP back on the request scratch (NF-2026-01341).
+- The recorded validation command stays the declared argv; exit codes, including unsigned Windows NTSTATUS values, are preserved.
+- Includes 0.12.24: authenticated same-range editor corrections are recovered (NF-2026-01322).
+
+### Qualification
+
+- AppContainer launcher, exec-scratch, interpreter-parity and worker-workspace regressions pass; an opt-in live AppContainer probe shows a nested child sees the request scratch instead of `AC\Temp`. Installation and live worker replay are separate checks.
+
 ## [0.12.23] - 2026-10-03
 
 ### Fixed

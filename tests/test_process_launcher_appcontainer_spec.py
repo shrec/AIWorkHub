@@ -1677,7 +1677,7 @@ def test_run_validations_resolves_appcontainer_interpreters_outside_the_worktree
         raise _Stop
 
     monkeypatch.setattr(worker_workspace, "_normalize_validation_interpreter_argv", _record)
-    monkeypatch.setattr(worker_workspace, "provision_validation_exec_scratch", lambda _ws: tmp_path)
+    monkeypatch.setattr(worker_workspace, "provision_validation_exec_scratch", lambda _ws, **_: tmp_path)
     workspace = SimpleNamespace(path=tmp_path, repo=tmp_path, home=tmp_path)
     with pytest.raises(_Stop):
         worker_workspace.run_validations(
@@ -1841,7 +1841,11 @@ def test_appcontainer_validation_grants_the_request_root_read_only_after_home_an
     grant = windows_appcontainer.ContainerGrant
     request = launches[0].request
     grants = list(request.filesystem_grants)
-    assert [item for item in grants if item.access != "traverse"] == [
+    # NF-2026-01341: a TMPDIR-bearing node command starts under the host
+    # interpreter, whose persistent install-root grants are not request grants.
+    assert [
+        item for item in grants if item.access != "traverse" and not item.persistent
+    ] == [
         grant(str(workspace.home), "modify"),
         grant(str(scratch), "modify"),
         grant(str(request_root), "read_execute"),
@@ -2101,7 +2105,7 @@ def test_host_git_runs_from_the_proven_record_with_only_canonical_config(
 def _routing_stubs(monkeypatch, tmp_path, git: str):
     workspace, _request_root, scratch = _request_layout(tmp_path)
     container: list[list[str]] = []
-    monkeypatch.setattr(worker_workspace, "provision_validation_exec_scratch", lambda _ws: scratch)
+    monkeypatch.setattr(worker_workspace, "provision_validation_exec_scratch", lambda _ws, **_: scratch)
     monkeypatch.setattr(worker_workspace, "cleanup_validation_exec_scratch", lambda _path: None)
     monkeypatch.setattr(worker_workspace, "python_candidate_authority", lambda _ws: {"digest": ""})
     monkeypatch.setattr(
@@ -2756,3 +2760,168 @@ def test_node_version_probe_reports_unknown_for_an_unresolvable_executable(
     assert worker_workspace._appcontainer_node_version(
         str(tmp_path / "missing" / "node.exe")
     ) == ""
+
+
+def _exited(code: int = 0):
+    return windows_appcontainer.AppContainerLifecycleResult(
+        windows_appcontainer.AppContainerLifecycleState.EXITED, exit_code=code
+    )
+
+
+def test_appcontainer_validation_scratch_lives_under_the_request_home(
+    tmp_path: Path, monkeypatch
+) -> None:
+    r"""NF-2026-01341: the repository temp is outside every sandbox root, so the
+    container got no grant there and fell back to the shared ``AC\Temp``; and
+    the request directory itself must keep only ``worktree`` and ``home``."""
+    monkeypatch.delenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False)
+    request_dir = _sandbox_request_dir(tmp_path, "req-nf1341")
+    worktree, home = request_dir / "worktree", request_dir / "home"
+    worktree.mkdir(parents=True)
+    home.mkdir()
+    workspace = SimpleNamespace(
+        request_id="req-nf1341", repo=tmp_path, path=worktree, home=home
+    )
+
+    scratch = worker_workspace.provision_validation_exec_scratch(
+        workspace, backend=worker_workspace.WINDOWS_APPCONTAINER_BACKEND
+    )
+    try:
+        assert scratch.parent == home.resolve()
+        assert sorted(os.listdir(request_dir)) == ["home", "worktree"]
+    finally:
+        worker_workspace.cleanup_validation_exec_scratch(scratch)
+
+
+def test_appcontainer_validation_starts_a_non_python_command_under_the_trampoline(
+    tmp_path: Path, monkeypatch, identity_osfhandle
+) -> None:
+    """NF-2026-01341: the host interpreter's sitecustomize restores TEMP/TMP
+    from TMPDIR before the declared command runs; the record keeps that
+    command."""
+    if not windows_appcontainer.is_python_executable(sys.executable):
+        pytest.skip("the trampoline needs a python*.exe host interpreter")
+    launches: list[_FakeValidationLaunch] = []
+    _stub_repo_id(monkeypatch)
+    _install_fake_launch(
+        monkeypatch, stdout=b"", stderr=b"", outcome=_exited(), sink=launches
+    )
+    request_dir = _sandbox_request_dir(tmp_path)
+    worktree, scratch = request_dir / "worktree", request_dir / "home" / "vx"
+    worktree.mkdir(parents=True)
+    scratch.mkdir(parents=True)
+    declared = [r"C:\Program Files\CMake\bin\cmake.exe", "--workflow", "--preset", "ci"]
+
+    result = worker_workspace._run_appcontainer_validation(
+        declared,
+        workspace=SimpleNamespace(repo=tmp_path, path=worktree, home=scratch.parent),
+        adapter_id="claude_cli",
+        cwd=worktree,
+        env={"PATH": "x", "TMPDIR": str(scratch), "TEMP": str(scratch), "TMP": str(scratch)},
+        timeout_seconds=30,
+    )
+
+    assert result.args == declared
+    request = launches[0].request
+    assert list(request.argv) == [
+        sys.executable,
+        "-c",
+        worker_workspace._APPCONTAINER_TEMP_TRAMPOLINE,
+        *declared,
+    ]
+    assert request.environment["PYTHONPATH"].split(os.pathsep)[0] == (
+        windows_appcontainer.APPCONTAINER_PYTHON_SITE
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows exit codes and site shim")
+def test_appcontainer_temp_trampoline_and_site_shim_on_the_host(tmp_path: Path) -> None:
+    trampoline = [sys.executable, "-c", worker_workspace._APPCONTAINER_TEMP_TRAMPOLINE]
+    for code in (0, 3, -1073741819):  # the last is 0xC0000005
+        child = [sys.executable, "-c", f"import os;os._exit({code})"]
+        assert subprocess.run([*trampoline, *child]).returncode == code & 0xFFFFFFFF
+    env = {
+        **os.environ,
+        "PYTHONPATH": windows_appcontainer.APPCONTAINER_PYTHON_SITE,
+        "TMPDIR": str(tmp_path),
+        "TEMP": "ac-temp",
+        "TMP": "ac-temp",
+    }
+    show = [sys.executable, "-c", "import os;print(os.environ['TEMP'], os.environ['TMP'])"]
+    env.pop(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, None)
+    unscoped = subprocess.run(show, env=env, capture_output=True, text=True, check=True)
+    assert unscoped.stdout.split() == ["ac-temp", "ac-temp"]
+    env[worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV] = str(tmp_path)
+    scoped = subprocess.run(show, env=env, capture_output=True, text=True, check=True)
+    assert scoped.stdout.split() == [str(tmp_path)] * 2
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or os.environ.get("AIWORKHUB_LIVE_APPCONTAINER_PROBE") != "1",
+    reason="live AppContainer probe: Windows and AIWORKHUB_LIVE_APPCONTAINER_PROBE=1",
+)
+def test_live_appcontainer_nested_child_sees_the_request_temp(tmp_path: Path) -> None:
+    r"""NF-2026-01341, measured: without the trampoline a nested child sees
+    ``...\AC\Temp``; with it, the request's own scratch."""
+    import msvcrt
+    import shutil
+
+    repo = Path(__file__).resolve().parents[1]
+    root = (repo / ".aiworkhub" / "runtime" / "worktrees").resolve()
+    live = root / f"live-{os.urandom(4).hex()}"
+    worktree, home = live / "worktree", live / "home"
+    scratch = home / "vx"
+    scratch.mkdir(parents=True)
+    worktree.mkdir()
+    env = {
+        "SystemRoot": os.environ["SystemRoot"],
+        "PATH": os.environ["SystemRoot"] + r"\System32",
+        "HOME": str(home),
+        "USERPROFILE": str(home),
+        "TMPDIR": str(scratch),
+        "TEMP": str(scratch),
+        "TMP": str(scratch),
+        worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV: str(scratch),
+        "PYTHONPATH": windows_appcontainer.APPCONTAINER_PYTHON_SITE,
+    }
+    grants = windows_appcontainer.request_scoped_grants(
+        env, str(worktree)
+    ) + windows_appcontainer.python_read_grants(
+        sys.executable, env["PYTHONPATH"], covered=[str(worktree), str(home)]
+    )
+    echo = [os.environ["ComSpec"], "/d", "/c", "echo %TEMP%"]
+    trampoline = [sys.executable, "-c", worker_workspace._APPCONTAINER_TEMP_TRAMPOLINE]
+    seen = {}
+    try:
+        for name, argv in {"bare": echo, "trampoline": [*trampoline, *echo]}.items():
+            out = tmp_path / f"{name}.txt"
+            fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+            launch = None
+            try:
+                os.set_inheritable(fd, True)
+                handle = msvcrt.get_osfhandle(fd)
+                launch = windows_appcontainer.launch_appcontainer(
+                    windows_appcontainer.AppContainerRequest(
+                        argv=argv,
+                        repo_id="aiworkhub-probe",
+                        worker_kind="probe",
+                        working_directory=str(worktree),
+                        environment=env,
+                        stdout_handle=handle,
+                        stderr_handle=handle,
+                        filesystem_grants=grants,
+                        agent_shell=False,
+                    )
+                )
+                result = launch.wait(60_000, terminate_on_timeout=True)
+                assert result.exit_code == 0, (name, out.read_text(errors="replace"))
+            finally:
+                if launch is not None:
+                    launch.close()
+                os.close(fd)
+            seen[name] = out.read_text(errors="replace").strip()
+    finally:
+        shutil.rmtree(live, ignore_errors=True)
+    print(f"\nTEMP seen: {seen}")
+    assert r"\ac\temp" in seen["bare"].lower()
+    assert seen["trampoline"].lower().endswith(r"\home\vx")

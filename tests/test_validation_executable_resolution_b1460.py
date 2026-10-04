@@ -268,7 +268,7 @@ def test_run_validations_resolves_ruff_before_landlock_exec(
     monkeypatch.setattr(
         worker_workspace,
         "provision_validation_exec_scratch",
-        lambda ws: tmp_path / "scratch",
+        lambda ws, **_: tmp_path / "scratch",
     )
     monkeypatch.setattr(worker_workspace, "cleanup_validation_exec_scratch", lambda path: None)
     monkeypatch.setattr(
@@ -663,7 +663,7 @@ def test_run_validations_passes_runtime_root_to_bubblewrap(
     monkeypatch.setattr(
         worker_workspace,
         "provision_validation_exec_scratch",
-        lambda ws: tmp_path / "scratch",
+        lambda ws, **_: tmp_path / "scratch",
     )
     monkeypatch.setattr(worker_workspace, "cleanup_validation_exec_scratch", lambda path: None)
 
@@ -1213,7 +1213,7 @@ def test_run_validations_mypy_declared_argv_bare_executed_is_repo_venv(
     monkeypatch.setattr(
         worker_workspace,
         "provision_validation_exec_scratch",
-        lambda ws: tmp_path / "scratch",
+        lambda ws, **_: tmp_path / "scratch",
     )
     monkeypatch.setattr(
         worker_workspace, "cleanup_validation_exec_scratch", lambda path: None
@@ -1286,7 +1286,7 @@ def test_run_validations_bare_pytest_executes_trusted_repo_interpreter(
     monkeypatch.setattr(
         worker_workspace,
         "provision_validation_exec_scratch",
-        lambda ws: tmp_path / "scratch",
+        lambda ws, **_: tmp_path / "scratch",
     )
     monkeypatch.setattr(
         worker_workspace, "cleanup_validation_exec_scratch", lambda path: None

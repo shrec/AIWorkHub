@@ -14,6 +14,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.25
+
+- Windows AppContainer validation commands get the request's own temp directory instead of the adapter-shared `AC\Temp`: the exec scratch lives under the request home and non-Python commands run under a trampoline that restores TEMP/TMP (NF-2026-01341).
+- The recorded command stays the declared argv and exit codes are preserved. Includes the 0.12.24 same-range editor-correction recovery.
+- Component regressions and an opt-in live AppContainer probe pass; installation and live worker replay are separate evidence.
+
 ## What's new in 0.12.23
 
 - Windows Source Graph writer contention uses a verified process-creation identity through the platform interface; PID-only or unknown identity stays fenced.

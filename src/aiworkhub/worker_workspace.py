@@ -7715,7 +7715,9 @@ def _probe_metadata_capable_dir(directory: Path) -> bool:
             replacement_path.unlink(missing_ok=True)
 
 
-def provision_validation_exec_scratch(workspace: WorkerWorkspace) -> Path:
+def provision_validation_exec_scratch(
+    workspace: WorkerWorkspace, *, backend: str | None = None
+) -> Path:
     """Create and return a private, request-unique, exec-capable scratch
     directory for one ``run_validations`` call.
 
@@ -7812,7 +7814,14 @@ def provision_validation_exec_scratch(workspace: WorkerWorkspace) -> Path:
         candidate_roots.insert(0, workspace.home)
         if request_boundary is not None:
             candidate_roots.insert(0, request_boundary)
-    if windows_default_scratch and repo_temp_validation is not None:
+    if backend == WINDOWS_APPCONTAINER_BACKEND:
+        # NF-2026-01341: the container is granted temp only inside its sandbox
+        # root, and the request directory must keep holding only ``worktree``
+        # and ``home`` (``_appcontainer_request_root``).  The repository temp
+        # sits outside every root, so the shared ``...\AC\Temp`` would win.
+        # ``bind_validation_helper_temp`` shortens a too-deep result.
+        candidate_roots = [workspace.home]
+    elif windows_default_scratch and repo_temp_validation is not None:
         # Windows needs no system-temp executable mount. Prefer the existing
         # repository authority over the much deeper union2 request boundary.
         candidate_roots.remove(repo_temp_validation)
@@ -12979,6 +12988,14 @@ def _appcontainer_request_root(workspace: WorkerWorkspace) -> Path:
     return path
 
 
+# NF-2026-01341: the declared command, run as a nested child so it inherits the
+# TEMP/TMP that appcontainer_site/sitecustomize.py restored; a Windows exit code
+# is unsigned 32-bit and ``sys.exit`` takes a C long.
+_APPCONTAINER_TEMP_TRAMPOLINE = (
+    "import subprocess,sys;c=subprocess.call(sys.argv[1:]);sys.exit(c-(c>>31<<32))"
+)
+
+
 # NF-2026-01009: node grew ``--experimental-test-isolation`` in v22.8.0 and
 # renamed it ``--test-isolation`` in v23.6.0.  Below 22.8 neither spelling
 # exists, and offering the wrong one makes node exit on a bad option -- a worse
@@ -13174,6 +13191,30 @@ def _run_appcontainer_validation(
     executable = str(argv[0]) if argv else ""
     effective_argv = list(argv)
     request_root = _appcontainer_request_root(workspace)
+    if _is_appcontainer_node_executable(executable):
+        # NF-2026-01009: the node counterpart of the Python adaptation below.
+        # This one rewrites argv rather than env, because what a node
+        # validation needs inside the container is different flags, not a shim
+        # on the import path.  The version probe is the only host call this
+        # adds, and every other command still reaches launch_appcontainer with
+        # the argv the card declared, byte for byte.
+        effective_argv = _appcontainer_node_validation_argv(
+            effective_argv, _appcontainer_node_version(executable)
+        )
+    launch_argv = effective_argv
+    if (
+        env.get("TMPDIR")
+        and not is_python_executable(executable)
+        and is_python_executable(sys.executable)
+    ):
+        # NF-2026-01341: CreateProcess into an AppContainer replaces TEMP/TMP
+        # with the adapter-shared ``...\AC\Temp`` (stale CMake caches, git init
+        # exit 128) and keeps TMPDIR; a nested CreateProcess keeps what its
+        # parent sets.  So a non-Python command starts as a child of the host
+        # interpreter, whose sitecustomize puts TEMP/TMP back on TMPDIR.  The
+        # recorded command stays ``effective_argv``.
+        executable = sys.executable
+        launch_argv = [executable, "-c", _APPCONTAINER_TEMP_TRAMPOLINE, *effective_argv]
     if is_python_executable(executable):
         # NF-40: first on PYTHONPATH, ahead of every candidate component, so
         # no candidate module can shadow it; granted below like any other
@@ -13185,16 +13226,6 @@ def _run_appcontainer_validation(
             ),
             APPCONTAINER_ANCESTORS_ENV: ancestor_stat_facts(str(request_root)),
         }
-    if _is_appcontainer_node_executable(executable):
-        # NF-2026-01009: the node counterpart of the Python adaptation above.
-        # This one rewrites argv rather than env, because what a node
-        # validation needs inside the container is different flags, not a shim
-        # on the import path.  The version probe is the only host call this
-        # adds, and every other command still reaches launch_appcontainer with
-        # the argv the card declared, byte for byte.
-        effective_argv = _appcontainer_node_validation_argv(
-            effective_argv, _appcontainer_node_version(executable)
-        )
     # NF-2026-00025: the request's directories, read-only (never the cd subdir
     # a candidate could have made a junction), as on every other backend; HOME
     # and temp modify; all revoked.  HOME and temp come first: the protected
@@ -13252,7 +13283,7 @@ def _run_appcontainer_validation(
         try:
             launch = launch_appcontainer(
                 AppContainerRequest(
-                    argv=list(effective_argv),
+                    argv=list(launch_argv),
                     repo_id=repo_id,
                     worker_kind=appcontainer_worker_kind(adapter_id),
                     working_directory=str(cwd),
@@ -13412,7 +13443,7 @@ def run_validations(
     # (every command passing, a failing command's WorkspaceError, a timeout,
     # or any other exception propagating out of this function).
     try:
-        scratch_dir = provision_validation_exec_scratch(workspace)
+        scratch_dir = provision_validation_exec_scratch(workspace, backend=selected_backend)
     except WorkspaceError as exc:
         # NF-2026-00458: no candidate command has run yet, so a scratch root
         # rejected specifically because the outer sandbox denies the exact

@@ -642,8 +642,8 @@ class TestRunValidationsPytestRepair(_TolerateNestedSeccompChmodDenial):
         captured: dict[str, Path] = {}
         real_provision = worker_workspace.provision_validation_exec_scratch
 
-        def _capture(ws: worker_workspace.WorkerWorkspace) -> Path:
-            scratch = real_provision(ws)
+        def _capture(ws: worker_workspace.WorkerWorkspace, **kwargs: object) -> Path:
+            scratch = real_provision(ws, **kwargs)
             captured["scratch"] = scratch
             return scratch
 
