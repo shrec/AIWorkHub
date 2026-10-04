@@ -202,14 +202,65 @@ The goal is the same answers (or better), measured, in a fraction of the time.
   readers react to a new build revision. A rebuild war between two daemons is
   prevented by the ownership handoff.
 
-**Queries (phase 2b)**
+**Semantic layer: LSP (phase 2b)**
+- **Why both layers.** tree-sitter gives every file a syntactic graph in every
+  environment, deterministically and with no external program. Name matching
+  alone leaves most call edges unresolved. The Python index on this repository
+  resolves 27% of 501,945 edges, and resolution is its slowest phase (19.8 s
+  of 36.7 s, measured 2026-10-04). A language server resolves those edges the
+  way the compiler does. LSP does not replace the parser. Servers are external
+  programs, they need project configuration (compile_commands.json, a venv, a
+  tsconfig), and they may be absent, as in the sandboxed validation lane. An
+  absent server never blocks or fails an index. It yields typed
+  `server_unavailable` evidence (rule 2).
+- **Servers.** Each language's server is explicit configuration in
+  `config/source_graph.json` (command, args, version probe). Nothing is
+  downloaded during a refresh. Targets: clangd (C, C++, CUDA through
+  compile_commands.json), basedpyright or pyright (Python),
+  typescript-language-server (JS, TS), gopls, rust-analyzer, jdtls, csharp-ls.
+  Python wires only Pyright and typescript-language-server today, and only for
+  definitions. This host has only clangd 21 installed, so the Python
+  enrichment does not run here.
+- **Requests.** LSP 3.17, negotiated per server capability.
+  `textDocument/definition` resolves edges, as it does today. Where the server
+  advertises them, the layer also uses `callHierarchy/incomingCalls|outgoingCalls`,
+  `textDocument/references`, `textDocument/implementation` and
+  `typeHierarchy/supertypes|subtypes`. The position encoding is negotiated
+  (utf-8 preferred). Conversion from the index's UTF-8 byte columns happens at
+  the boundary.
+- **Pipeline position.** The layer runs after the syntactic parse and lexical
+  resolution, before the write transaction and never inside it. The batch is
+  the unresolved and ambiguous call edges, plus the entities that `calls`,
+  `impact` and `trace` need. Sessions run in a pool sized from cores with
+  headroom. Their workspace is bounded and excludes `.aiworkhub`, worktrees
+  and `node_modules`. Every request and the whole batch have deadlines. Results
+  are sorted, so completion order cannot change the output.
+- **Provenance.** Each enriched edge records source and target hashes, the
+  server name and version, the config digest and a classification
+  (`repo_internal`, `external_stdlib`, `external_dependency`, `unresolved`,
+  `ambiguous`, `server_unavailable`) in the existing `lsp_*` tables. A changed
+  file, server or config revokes stale enrichment. A lexically resolved edge is
+  never overwritten to raise a ratio. An external target is evidence, not an
+  in-repo edge.
+- **Process control.** The LSP client reuses `platform/process` (handle list,
+  Job Object) and the JSON-RPC core of the MCP proxy. Only the framing differs:
+  `Content-Length` headers instead of NDJSON. Python's Windows LSP concurrency
+  failures (NF-2026-00038) do not carry over.
+- **Health.** Health reports typed per-language counts with denominators:
+  attempted, internal, external, ambiguous, unresolved, unavailable, stale and
+  latency. A missing server is never reported as green.
+- **Only if measured.** Query-time escalation (a warm session answering for
+  the focused symbol) and SCIP index ingestion are added only when the
+  retrieval eval shows a gap that batch enrichment leaves open.
+
+**Queries (phase 2c)**
 - All 37 modes are pure functions over a read-only snapshot connection. They share one
   ranking core and one budget/cursor implementation. The response shapes, evidence
   labels and receipt fields are the frozen Python contract.
 - Manager and worker surfaces (`*_source_graph_query`, health, refresh,
   ensure_started, stop, retrieval_eval) become native tools.
 
-**Daemon and partitions (phase 2c)**
+**Daemon and partitions (phase 2d)**
 - The refresh scheduler uses OS file watching (ReadDirectoryChangesW / inotify /
   FSEvents) with a bounded periodic reconcile as fallback (rule 5).
 - The worker partition is a composed view over a pinned base generation
@@ -222,6 +273,10 @@ The goal is the same answers (or better), measured, in a fraction of the time.
    with volatile fields normalized.
 3. Measured build time and peak memory against Python on this repository (1,188
    files) and on a C++ repository (MegoProject). The numbers are recorded, not claimed.
+4. LSP enrichment on the eval's `calls` and `impact` cases. In-repo precision
+   and recall must be at least Python's, with zero false-zero answers. Server
+   availability and coverage are reported per language. C and C++ through
+   clangd are measured on MegoProject and on `AIWorkhubCli` itself.
 
 ## 7. Process, sandbox and providers (phases 4–5)
 
@@ -249,7 +304,7 @@ The goal is the same answers (or better), measured, in a fraction of the time.
 |---|---|---|
 | **P0 Spec freeze** | Contract artifacts in `AIWorkhubCli/contracts/`: all tool schemas plus fingerprints, `sqlite_master` of every store, task FSM table, lock-file protocol (exact primitives/ranges), env contract, Source Graph reader revision behavior. Black-box **MCP record/replay parity harness** with a parameterized server command and volatile-field normalization (generalizes `tests/mcp_stdio_client_smoke.py` C1–C6). | Harness runs green Python-vs-Python on fixture repos. Contracts regenerate deterministically. |
 | **P1 Foundation** | CMake presets, vendored deps, CI matrix (win-x64, linux-x64, linux-arm64, macos-arm64). Libraries: `base`, `platform` (fs, lock, env, minimal process), `storage` (sqlite, writer lease, migrate). `awh mcp` with transparent Python proxy; `awh call <tool> '{json}'`, `awh version`, `awh doctor` (skeleton). | The parity harness through `awh mcp` (100% proxied) is identical to direct Python. The cross-implementation writer-lease contention test is green. |
-| **P2 Source Graph** | 2a index, 2b 37 query modes plus tools, 2c daemon, watcher, partitions, Python ownership guard. | The section 6 parity gates. Native SG tools on by default. |
+| **P2 Source Graph** | 2a syntactic index (tree-sitter), 2b LSP semantic layer, 2c 37 query modes plus tools, 2d daemon, watcher, partitions, Python ownership guard. | The section 6 parity gates. Native SG tools on by default. |
 | **P3 Core state** | Tasks (read → write → FSM), callbacks outbox, needfix, roadmap, kb, memory, session, context graph, dashboard read builders. CLI: `awh task create/list/show`, `awh status`. | Per-tool parity green. Python ownership guards for each store. |
 | **P4 Runtime and providers** | Process tree control, env-block builder, sandbox, providers (claude, codex, opencode, copilot, vscode_lm spool), routing/workforce/admission. CLI: `awh agent list/doctor/run`. | Native end-to-end smoke per provider per OS. Cancellation leaves no orphan processes (tested). |
 | **P5 Workspace and verify** | Worktree manager, provisioning (content-addressed templates, M20), diff collector, validation runner, evidence, review/quality gates, semantic edit. CLI: `awh verify/review/promote`, `awh task run/cancel`. | The accept/reject flow on a real card is identical to Python. |
