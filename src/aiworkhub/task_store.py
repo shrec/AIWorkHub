@@ -5228,8 +5228,9 @@ def recover_blocked_rework(
         or without a recorded rejected request identity
 
     ``scope_rejection_resolved`` (NF-2026-01169) is the verified manager's
-    audited resolution of a ``scope_rejected`` card on the same task ID.  The
-    recovery is always clean-root, whether or not the rejected worktree still
+    audited resolution of a ``scope_rejected`` card on the same task ID; a card
+    retention later blocked as ``finalize_failed`` for that same rejected
+    request stays admissible (NF-2026-01350).  The recovery is always clean-root, whether or not the rejected worktree still
     exists: that worktree holds out-of-scope writes and unsealed in-scope
     bytes, so ``rework_predecessor`` is removed and nothing is materialized.
     ``clean_root_recovery_authorization`` records recovery_mode
@@ -6532,7 +6533,22 @@ def recover_blocked_rework(
                     f"scope_rejection_resolution_not_applicable:{terminal_substatus}"
                 )
             card_substatus = str(card.get("terminal_substatus") or "")
-            if card_substatus != "scope_rejected":
+            # NF-2026-01350: a scope_rejected card waits in review, and when
+            # retention finds its worktree gone mark_review_workspace_missing
+            # blocks it as finalize_failed WITHOUT a terminal event, so the
+            # hard-blocker gate still reads scope_rejected.  That later state is
+            # the same rejection only when its retention record names the card's
+            # launch request, which the identity gate below binds to the
+            # rejected request.
+            retention_failure = card.get("workspace_retention_failure")
+            reclaimed_same_request = (
+                card_substatus == "finalize_failed"
+                and isinstance(retention_failure, dict)
+                and bool(card.get("launch_request_id"))
+                and retention_failure.get("request_id")
+                == card.get("launch_request_id")
+            )
+            if card_substatus != "scope_rejected" and not reclaimed_same_request:
                 return False, (
                     f"scope_rejection_resolution_not_applicable:{card_substatus}"
                 )

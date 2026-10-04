@@ -472,3 +472,127 @@ def test_nf01169_core_refuses_without_verified_manager(monkeypatch) -> None:
     assert core.recover_blocked_rework(
         "T_SCOPE", feedback_reason="resolved", scope_rejection_resolved=True,
     ) is refusal
+
+
+def _reclaim_review_worktree(repo: Path, task_id: str) -> None:
+    """NF-2026-01350 field path: the scope_rejected card waits in review, then
+    retention finds its worktree gone and blocks it as finalize_failed through
+    the real writer, which records no new terminal event."""
+    conn = sqlite3.connect(_db_path(repo))
+    try:
+        conn.execute(
+            "UPDATE tasks SET status='review', worker_status='review' WHERE task_id=?",
+            (task_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert task_store.mark_review_workspace_missing(
+        repo, task_id, runner=_RUNNER, request_id=_REQUEST_ID,
+        reason="review_workspace_missing",
+    ) == (True, "blocked")
+
+
+def _set_card_field(repo: Path, task_id: str, key: str, value: object) -> None:
+    _status, card = _row(repo, task_id)
+    if isinstance(value, dict) and isinstance(card.get(key), dict):
+        card[key] = {**card[key], **value}
+    else:
+        card[key] = value
+    conn = sqlite3.connect(_db_path(repo))
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?", (json.dumps(card), task_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _insert_reclaimed_scope_rejection(repo: Path, task_id: str, **overrides) -> None:
+    _insert_terminal_task(
+        repo, task_id,
+        request_identity={"request_id": _REQUEST_ID, "task_id": task_id},
+        **overrides,
+    )
+    _reclaim_review_worktree(repo, task_id)
+
+
+def test_nf01350_reclaimed_scope_rejected_review_recovers_only_with_flag(
+    tmp_path: Path,
+) -> None:
+    repo = _setup_repo(tmp_path)
+    task_id = "SCOPE_REJECTED_RECLAIMED_NF01350"
+    _insert_reclaimed_scope_rejection(repo, task_id)
+    status, card = _row(repo, task_id)
+    assert status == "blocked"
+    assert card["terminal_substatus"] == "finalize_failed"
+    assert card["terminal_review"]["substatus"] == "scope_rejected"
+    assert card["launch_request_id"] == _REQUEST_ID
+    before_card = _raw_card(repo, task_id)
+    before_events = _events(repo, task_id)
+
+    assert task_store.recover_blocked_rework(
+        repo, task_id, actor="coordinator", feedback_reason=_FEEDBACK,
+    ) == (False, "hard_blocker:scope_rejected")
+    assert _raw_card(repo, task_id) == before_card
+    assert _events(repo, task_id) == before_events
+
+    assert task_store.recover_blocked_rework(
+        repo, task_id, actor="coordinator", feedback_reason=_FEEDBACK,
+        scope_rejection_resolved=True,
+    ) == (True, "recovered")
+    _assert_scope_recovery(repo, task_id, before_events)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param(
+            "workspace_retention_failure", {"request_id": _OTHER_REQUEST_ID},
+            id="retention_bound_to_another_request",
+        ),
+        pytest.param(
+            "workspace_retention_failure", None,
+            id="finalize_failed_without_retention_record",
+        ),
+        pytest.param(
+            "launch_request_id", _OTHER_REQUEST_ID,
+            id="card_relaunched_under_another_request",
+        ),
+    ],
+)
+def test_nf01350_reclaimed_scope_rejection_refuses_foreign_identity(
+    tmp_path: Path, field: str, value: object,
+) -> None:
+    repo = _setup_repo(tmp_path)
+    task_id = "SCOPE_REJECTED_RECLAIMED_FOREIGN_NF01350"
+    _insert_reclaimed_scope_rejection(repo, task_id)
+    _set_card_field(repo, task_id, field, value)
+    before_card = _raw_card(repo, task_id)
+    before_events = _events(repo, task_id)
+
+    assert task_store.recover_blocked_rework(
+        repo, task_id, actor="coordinator", feedback_reason=_FEEDBACK,
+        scope_rejection_resolved=True,
+    ) == (False, "scope_rejection_resolution_not_applicable:finalize_failed")
+    assert _row(repo, task_id)[0] == "blocked"
+    assert _raw_card(repo, task_id) == before_card
+    assert _events(repo, task_id) == before_events
+
+
+def test_nf01350_reclaimed_scope_rejection_keeps_identity_agreement(
+    tmp_path: Path,
+) -> None:
+    repo = _setup_repo(tmp_path)
+    task_id = "SCOPE_REJECTED_RECLAIMED_SPLIT_NF01350"
+    _insert_reclaimed_scope_rejection(
+        repo, task_id, terminal_request_id=_OTHER_REQUEST_ID,
+    )
+    before_card = _raw_card(repo, task_id)
+
+    assert task_store.recover_blocked_rework(
+        repo, task_id, actor="coordinator", feedback_reason=_FEEDBACK,
+        scope_rejection_resolved=True,
+    ) == (False, "scope_rejection_resolution_request_identity_invalid")
+    assert _raw_card(repo, task_id) == before_card
