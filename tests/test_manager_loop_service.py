@@ -638,6 +638,87 @@ def test_send_with_half_a_route_is_refused_as_incomplete(
     assert backends == []
 
 
+def _persist_passive(tmp_path: Path) -> ml.ManagerSession:
+    """The repository's passive conversation, persisted by an earlier process under its own id."""
+
+    earlier = _FakeOrchestratorFactory.for_repository(tmp_path, lambda backend_id, model: None)
+    earlier._new_id = lambda: "mls-" + "2c" * 16
+    passive = earlier.ensure()
+    assert passive.passive
+    return passive
+
+
+def test_a_first_send_without_start_activates_the_persisted_passive_conversation(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    # NF-2026-00989: the picker route binds the repository's conversation by its own id;
+    # it is not retired for a second session, and a second send meanwhile is refused.
+    backends = _install_fakes(monkeypatch)
+    monkeypatch.setattr(
+        manager_loop_service, "authorize_selected_route", lambda repo, backend_id, model: (backend_id, model)
+    )
+    passive = _persist_passive(tmp_path)
+    gate = threading.Event()
+    started = FakeManagerBackend.start
+
+    def gated_start(self: FakeManagerBackend, brief: str) -> str:
+        self.gate = gate
+        return started(self, brief)
+
+    monkeypatch.setattr(FakeManagerBackend, "start", gated_start)
+
+    result = manager_loop_service.send(tmp_path, "hello", "fake", "model-a")
+
+    assert result["ok"] is True and result["session_id"] == passive.session_id
+    (backend,) = backends
+    assert backend.entered.wait(timeout=5)
+    assert manager_loop_service.send(tmp_path, "again", "fake", "model-a") == {
+        "ok": False, "error": "manager_turn_in_progress",
+    }
+    gate.set()
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+    assert (backend.backend_id, backend.model, backend.messages) == ("fake", "model-a", ["hello"])
+    store = manager_loop_service._entry_for(tmp_path).orchestrator.store
+    assert [(item.session_id, item.status) for item in store.sessions()] == [(passive.session_id, "active")]
+    pinned = manager_loop_service.status(tmp_path)["session"]
+    assert (pinned["session_id"], pinned["backend_id"], pinned["model"]) == (passive.session_id, "fake", "model-a")
+    assert len(backends) == 1
+
+
+def test_a_send_to_an_active_session_keeps_it_and_its_backend(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    backends = _install_fakes(monkeypatch)
+    monkeypatch.setattr(
+        manager_loop_service, "authorize_selected_route", lambda repo, backend_id, model: (backend_id, model)
+    )
+    opened = manager_loop_service.start(tmp_path, "fake", "model-a")["session"]["session_id"]
+
+    result = manager_loop_service.send(tmp_path, "hello", "fake", "model-a")
+
+    assert result["ok"] is True and result["session_id"] == opened
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+    (backend,) = backends
+    assert backend.messages == ["hello"] and not backend.closed
+
+
+def test_an_unavailable_route_leaves_the_persisted_passive_conversation_untouched(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    backends = _install_fakes(monkeypatch)
+    monkeypatch.setattr(manager_loop_service, "authorize_selected_route", lambda *a: None)
+    passive = _persist_passive(tmp_path)
+
+    result = manager_loop_service.send(tmp_path, "hello", "fake", "nope")
+
+    assert result == {"ok": False, "error": "manager_backend_unavailable:fake:nope"}
+    assert backends == []
+    store = manager_loop_service._entry_for(tmp_path).orchestrator.store
+    assert [(item.session_id, item.status, item.passive) for item in store.sessions()] == [
+        (passive.session_id, "active", True)
+    ]
+
+
 def test_racing_first_sends_pin_one_route_and_every_other_call_is_refused(
     monkeypatch: Any, tmp_path: Path
 ) -> None:

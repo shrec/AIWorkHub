@@ -916,7 +916,7 @@ class ManagerOrchestrator:
             self.store.delete_session(session_id)
 
     def continue_on_route(self, backend_id: str, model: str) -> ManagerSession:
-        """Attach the selected model to this conversation, or open the first one.
+        """Attach the selected model to this conversation, or to the one ``ensure`` attaches.
 
         The session belongs to the owner. The model is only the route for this
         turn. A different model rebinds this same session and does not open another.
@@ -940,9 +940,10 @@ class ManagerOrchestrator:
                 self._release_lock()
         with self._exclusive():
             if self._session is None:
-                opened = self._open(backend_id, model)
-                self.store.write_selection(opened.session_id)
-                return opened
+                # NF-2026-00989: a first send binds the repository's persisted conversation
+                # (selected, else the oldest passive) by its own id; it never retires it for a new one.
+                with self._queued():
+                    self._ensure()
             return self._bind_existing(backend_id, model)
 
     def _attach(self, session_id: str) -> ManagerSession:
