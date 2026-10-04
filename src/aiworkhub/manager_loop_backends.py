@@ -775,6 +775,8 @@ class CliManagerBackend:
         self._brief = ""
         self._conversation_id = ""
         self.reasoning_level = ""
+        # Stored image paths for the next turn only; the orchestrator sets them per send.
+        self.images: tuple[str, ...] = ()
         self._process: Any = None
         self._slot = threading.Lock()
     @property
@@ -812,6 +814,17 @@ class CliManagerBackend:
         return resume_argv(self.backend_id, argv, self._conversation_id)
 
     def _turn(self, message: str) -> Iterator[dict[str, Any]]:
+        images, self.images = tuple(self.images), ()
+        if images and self.backend_id == "opencode_cli":
+            yield _turn_error("images", f"manager_images_unsupported:{self.backend_id}")
+            return
+        # codex splits an --image value on ',' (measured on codex-cli 0.159.3).
+        if self.backend_id == "codex_cli" and any("," in path for path in images):
+            yield _turn_error("images", f"manager_image_path_unsupported:{self.backend_id}")
+            return
+        if images and self.backend_id == "claude_cli":
+            # Claude takes no image flag in print mode; its Read tool opens the files.
+            message = message + "\n\n" + "\n".join(f"Attached image: {path}" for path in images)
         resuming = bool(self._conversation_id)
         prompt = message if resuming else f"{self._brief}\n\n{message}".strip()
         plan = self._plan_builder(self.backend_id, prompt, self.repo, model=self.model)
@@ -820,6 +833,10 @@ class CliManagerBackend:
             return
         try:
             argv = apply_manager_stream_tokens(self.backend_id, self.argv_for(plan), self.reasoning_level)
+            if images and self.backend_id == "codex_cli":
+                # The attached --image=<path> form, before the positional prompt
+                # (`-`): a bare `-i <path> -` swallows the `-` as one more image.
+                argv = [*argv[:-1], *(f"--image={path}" for path in images), argv[-1]]
             cwd = plan.cwd
             stdin_text = getattr(plan, "stdin_text", None)
             if self._extra_env is None:

@@ -823,14 +823,19 @@ class ManagerOrchestrator:
         with self._exclusive():
             return self._open(backend_id, model)
 
-    def send(self, text: str, *, reasoning: str = "") -> dict[str, Any]:
-        """Run one turn; refused while another runs (the service queues owner sends)."""
+    def send(self, text: str, *, reasoning: str = "", images: tuple[str, ...] = ()) -> dict[str, Any]:
+        """Run one turn; refused while another runs (the service queues owner sends).
+
+        ``images`` are stored image file paths the backend hands its CLI; the
+        transcript records only how many there were.
+        """
         if not text.strip():
             raise ValueError("the message is empty")
         if self._backend is not None:
             self._backend.reasoning_level = str(reasoning or "").strip().lower()
+            self._backend.images = tuple(images)
         with self._exclusive():
-            return self._turn(text, "user_message", "")
+            return self._turn(text, "user_message", "", images=len(images))
 
     def record_error(self, payload: Mapping[str, Any]) -> dict[str, Any] | None:
         """Log one ``error`` event as the attached session's next turn; none attached logs nothing.
@@ -1272,10 +1277,12 @@ class ManagerOrchestrator:
         })
         return session
 
-    def _turn(self, message: str, inbound: str, task_id: str) -> dict[str, Any]:
+    def _turn(self, message: str, inbound: str, task_id: str, *, images: int = 0) -> dict[str, Any]:
         session, _ = self._active()
         turn = session.turn_count + 1
-        asked = {"text": message, "task_id": task_id} if task_id else {"text": message}
+        asked: dict[str, Any] = {"text": message, "task_id": task_id} if task_id else {"text": message}
+        if images:
+            asked["images"] = images
         self._record(session, turn, inbound, asked)
         events, grown, reply = self._exchange(session, turn, message)
         errors = [event["payload"] for event in events if event["type"] == "error"]

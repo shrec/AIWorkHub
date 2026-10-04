@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import sys
 import threading
@@ -29,6 +31,7 @@ class FakeManagerBackend:
         self.model = model
         self.briefs: list[str] = []
         self.messages: list[str] = []
+        self.images_seen: list[tuple[str, ...]] = []
         self.closed = False
         self.gate: threading.Event | None = None
         self.entered = threading.Event()
@@ -39,6 +42,7 @@ class FakeManagerBackend:
 
     def send(self, message: str) -> Iterator[dict[str, Any]]:
         self.messages.append(message)
+        self.images_seen.append(tuple(getattr(self, "images", ())))
         self.entered.set()
         if self.gate is not None:
             assert self.gate.wait(timeout=10)
@@ -163,7 +167,7 @@ def test_send_while_a_turn_is_running_is_queued_and_runs_next_on_the_same_sessio
     queued = manager_loop_service.send(tmp_path, "two", reasoning="High")
     assert queued == {"ok": True, "queued": True, "position": 1, "session_id": first["session_id"]}
     assert manager_loop_service.status(tmp_path)["send_queue"] == [
-        {"text": "two", "backend_id": "", "model": ""}
+        {"text": "two", "backend_id": "", "model": "", "images": 0}
     ]
     # Everything that is not an owner send still refuses while the turn runs.
     assert manager_loop_service.rotate(tmp_path, "x") == {"ok": False, "error": "manager_turn_in_progress"}
@@ -290,6 +294,128 @@ def test_a_queued_message_that_cannot_bind_its_route_is_that_turns_error_event(
     last = manager_loop_service.status(tmp_path)["last_turn"]
     assert last["ok"] is False and "manager_backend_unavailable:fake:model-b" in last["errors"][0]
     assert manager_loop_service.status(tmp_path)["running"] is False
+
+
+_PNG = b"\x89PNG\r\n\x1a\n" + b"pixels"
+_GIF = b"GIF89a" + b"frames"
+_WEBP = b"RIFF\x10\x00\x00\x00WEBPVP8 "
+
+
+def _attached(*blobs: bytes) -> list[dict[str, str]]:
+    return [
+        {"name": f"shot{index}", "data": base64.b64encode(blob).decode("ascii")}
+        for index, blob in enumerate(blobs)
+    ]
+
+
+def test_attached_images_are_stored_once_by_content_and_reach_the_backend_as_paths(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    backends = _install_fakes(monkeypatch)
+    session_id = manager_loop_service.start(tmp_path, "fake", "model-a")["session"]["session_id"]
+
+    result = manager_loop_service.send(tmp_path, "see these", images=_attached(_PNG, _GIF, _PNG))
+    assert result["ok"] is True
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+
+    folder = tmp_path / "manager_loop" / "attachments"
+    png = folder / f"{hashlib.sha256(_PNG).hexdigest()}.png"
+    gif = folder / f"{hashlib.sha256(_GIF).hexdigest()}.gif"
+    assert sorted(path.name for path in folder.iterdir()) == sorted([png.name, gif.name])
+    assert png.read_bytes() == _PNG and gif.read_bytes() == _GIF
+    assert backends[0].images_seen == [(str(png.resolve()), str(gif.resolve()), str(png.resolve()))]
+    # The transcript says how many images the message carried, never their bytes.
+    asked = [
+        event["payload"] for event in manager_loop_service.events(tmp_path, session_id)["events"]
+        if event["type"] == "user_message"
+    ]
+    assert asked == [{"text": "see these", "images": 3}]
+    log = (tmp_path / "manager_loop" / "events" / f"{session_id}.jsonl").read_text(encoding="utf-8")
+    assert base64.b64encode(_PNG).decode("ascii") not in log
+
+    # A later message without images carries none of the earlier ones.
+    manager_loop_service.send(tmp_path, "and now text only")
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+    assert backends[0].images_seen[1] == ()
+
+
+def test_a_queued_message_keeps_its_images_for_its_own_turn(monkeypatch: Any, tmp_path: Path) -> None:
+    backends = _install_fakes(monkeypatch)
+    manager_loop_service.start(tmp_path, "fake", "model-a")
+    backend = backends[0]
+    backend.gate = threading.Event()
+    manager_loop_service.send(tmp_path, "running")
+    assert backend.entered.wait(timeout=5)
+
+    assert manager_loop_service.send(tmp_path, "look", images=_attached(_WEBP))["queued"] is True
+    assert manager_loop_service.status(tmp_path)["send_queue"] == [
+        {"text": "look", "backend_id": "", "model": "", "images": 1}
+    ]
+    backend.gate.set()
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+    webp = tmp_path / "manager_loop" / "attachments" / f"{hashlib.sha256(_WEBP).hexdigest()}.webp"
+    assert backend.images_seen == [(), (str(webp.resolve()),)]
+
+
+def test_attached_images_are_validated_before_anything_is_stored_or_run(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    backends = _install_fakes(monkeypatch)
+    manager_loop_service.start(tmp_path, "fake", "model-a")
+    monkeypatch.setattr(manager_loop_service, "MANAGER_IMAGE_MAX_BYTES", 16)
+    send = manager_loop_service.send
+
+    assert send(tmp_path, "five", images=_attached(*[_PNG] * 5)) == {
+        "ok": False, "error": "manager_image_limit", "limit": 4,
+    }
+    assert send(tmp_path, "text", images=_attached(b"%PDF-1.7 not an image")) == {
+        "ok": False, "error": "manager_image_invalid:0:size",
+    }
+    assert send(tmp_path, "text", images=_attached(_GIF, b"plain text")) == {
+        "ok": False, "error": "manager_image_invalid:1:type",
+    }
+    assert send(tmp_path, "text", images=[{"name": "x", "data": "not base64!"}]) == {
+        "ok": False, "error": "manager_image_invalid:0:encoding",
+    }
+    assert send(tmp_path, "text", images=["bare string"]) == {
+        "ok": False, "error": "manager_image_invalid:0:encoding",
+    }
+    assert send(tmp_path, "  ", images=_attached(_PNG)) == {
+        "ok": False, "error": "manager_image_needs_text",
+    }
+    assert not (tmp_path / "manager_loop" / "attachments").exists()
+    assert backends[0].messages == []
+
+
+def test_stored_attachments_keep_only_the_newest_files(monkeypatch: Any, tmp_path: Path) -> None:
+    _install_fakes(monkeypatch)
+    manager_loop_service.start(tmp_path, "fake", "model-a")
+    monkeypatch.setattr(manager_loop_service, "MANAGER_IMAGE_KEEP", 2)
+    for blob in (_PNG + b"1", _PNG + b"2", _PNG + b"3"):
+        assert manager_loop_service.send(tmp_path, "one more", images=_attached(blob))["ok"] is True
+        assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+        time.sleep(0.02)
+
+    kept = sorted(path.name for path in (tmp_path / "manager_loop" / "attachments").iterdir())
+    assert kept == sorted(f"{hashlib.sha256(_PNG + tail).hexdigest()}.png" for tail in (b"2", b"3"))
+
+
+def test_the_send_tool_passes_attached_images_to_the_service(monkeypatch: Any, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        server.core,
+        "manager_bootstrap",
+        lambda: {"role": "manager", "repo": str(tmp_path), "manager_route": {"thread_id": "t1"}},
+    )
+    monkeypatch.setenv("AIWORKHUB_ALLOW_LAUNCH", "1")
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(manager_loop_service, "send", lambda *args: calls.append(args) or {"ok": True})
+
+    images = _attached(_PNG)
+    assert server.aiworkhub_manager_loop_send("look", images=images) == {"ok": True}
+    assert server.aiworkhub_manager_loop_send("plain") == {"ok": True}
+    assert calls[0][1:] == ("look", None, None, None, images)
+    assert calls[1][1:] == ("plain", None, None, None)
 
 
 def test_events_after_seq_returns_only_newer_events_and_respects_limit(

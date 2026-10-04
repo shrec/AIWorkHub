@@ -24,15 +24,20 @@ caller's repository through the shared manager route gate and pass it in.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import collections
 import dataclasses
+import hashlib
+import os
 import threading
+import uuid
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from .manager_loop import ManagerLoopError, ManagerOrchestrator, ManagerSession
 from .manager_loop_backends import MANAGER_BACKEND_IDS, cli_discovers_model, manager_backend_factory
-from . import callback_store, manager_loop_wake, model_settings, workforce_catalog
+from . import callback_store, manager_loop_wake, model_settings, platform_io, workforce_catalog
 
 _REGISTRY_LOCK = threading.Lock()
 _ENTRIES: dict[str, "_Entry"] = {}
@@ -43,6 +48,13 @@ default_callback_source = manager_loop_wake.default_callback_source
 
 SEND_QUEUE_LIMIT = 8
 SEND_QUEUE_PREVIEW_CHARS = 200
+
+# Owner image attachments: per message, per image, and the stored files kept
+# (newest first; above the queue's worst case of (SEND_QUEUE_LIMIT + 1) * 4).
+MANAGER_IMAGE_LIMIT = 4
+MANAGER_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+MANAGER_IMAGE_KEEP = 64
+_IMAGE_MAGIC = ((b"\x89PNG\r\n\x1a\n", "png"), (b"\xff\xd8\xff", "jpg"), (b"GIF87a", "gif"), (b"GIF89a", "gif"))
 
 NO_MANAGER_ROUTE_ERROR = "no_manager_route_available"
 NO_MANAGER_ROUTE_HINT = (
@@ -58,6 +70,7 @@ class _QueuedSend:
     text: str
     level: str
     route: tuple[str, str] | None
+    images: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass
@@ -336,7 +349,7 @@ def _queued_send_action(
         )
         if refused is not None:
             raise ManagerLoopError(str(refused.get("error") or "manager_send_queue_bind_failed"))
-        return orchestrator.send(queued.text, reasoning=queued.level)
+        return orchestrator.send(queued.text, reasoning=queued.level, images=queued.images)
 
     return action
 
@@ -560,12 +573,74 @@ def discard_session(repo: str | Path, session_id: str) -> dict[str, Any]:
     return {"ok": True, "session": session.to_json() if session is not None else None}
 
 
+def _image_extension(data: bytes) -> str:
+    for magic, extension in _IMAGE_MAGIC:
+        if data.startswith(magic):
+            return extension
+    return "webp" if data[:4] == b"RIFF" and data[8:12] == b"WEBP" else ""
+
+
+def _store_images(
+    folder: Path, images: Sequence[Mapping[str, Any]]
+) -> tuple[tuple[str, ...], dict[str, Any] | None]:
+    """Validate the owner's attached images and store each once, named by its content.
+
+    Each item is ``{"name": ..., "data": <base64>}``; only the stored files'
+    absolute paths travel on, so no image byte reaches the event log or a prompt.
+    Every item is checked (count, size, encoding, magic bytes) before any is stored.
+    """
+
+    if not isinstance(images, (list, tuple)) or len(images) > MANAGER_IMAGE_LIMIT:
+        return (), {"ok": False, "error": "manager_image_limit", "limit": MANAGER_IMAGE_LIMIT}
+    decoded: list[tuple[bytes, str]] = []
+    for index, image in enumerate(images):
+        data = image.get("data") if isinstance(image, Mapping) else None
+        if not isinstance(data, str):
+            return (), {"ok": False, "error": f"manager_image_invalid:{index}:encoding"}
+        # The cap's base64 length, checked first so an oversized string is never decoded.
+        if len(data) > (MANAGER_IMAGE_MAX_BYTES + 2) // 3 * 4:
+            return (), {"ok": False, "error": f"manager_image_invalid:{index}:size"}
+        try:
+            raw = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError):
+            return (), {"ok": False, "error": f"manager_image_invalid:{index}:encoding"}
+        if len(raw) > MANAGER_IMAGE_MAX_BYTES:
+            return (), {"ok": False, "error": f"manager_image_invalid:{index}:size"}
+        extension = _image_extension(raw)
+        if not extension:
+            return (), {"ok": False, "error": f"manager_image_invalid:{index}:type"}
+        decoded.append((raw, extension))
+    paths: list[str] = []
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        for raw, extension in decoded:
+            path = folder / f"{hashlib.sha256(raw).hexdigest()}.{extension}"
+            if path.exists():
+                os.utime(path)  # a re-sent image is fresh again for the keep bound below
+            else:
+                staging = folder / f".{path.name}.{uuid.uuid4().hex}.tmp"
+                try:
+                    staging.write_bytes(raw)
+                    platform_io.atomic_replace(staging, path)
+                finally:
+                    staging.unlink(missing_ok=True)
+            paths.append(str(path.resolve()))
+        stored = [path for path in folder.iterdir() if not path.name.startswith(".")]
+        stored.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        for stale in stored[MANAGER_IMAGE_KEEP:]:
+            stale.unlink(missing_ok=True)
+    except OSError as exc:
+        return (), {"ok": False, "error": f"manager_image_store_failed:{type(exc).__name__}"}
+    return tuple(paths), None
+
+
 def send(
     repo: str | Path,
     text: str,
     backend_id: str | None = None,
     model: str | None = None,
     reasoning: str | None = None,
+    images: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run one manager turn on a background thread.
 
@@ -582,7 +657,12 @@ def send(
     passive conversation pins the one route :func:`resolve_manager_route`
     names. A named-but-unrunnable route is refused at once, before anything
     is queued or spawned. ``reasoning`` is the owner's depth choice for this
-    turn; blank keeps the provider default.
+    turn; blank keeps the provider default. ``images`` (at most
+    :data:`MANAGER_IMAGE_LIMIT` png/jpeg/gif/webp, base64, each within
+    :data:`MANAGER_IMAGE_MAX_BYTES`) are validated and stored under the
+    session store's ``attachments`` before anything is queued; the turn gets
+    their paths and a backend that cannot read images reports it as the turn's
+    error. Images need text with them (``manager_image_needs_text``).
     """
 
     route: tuple[str, str] | None = None
@@ -596,13 +676,23 @@ def send(
                 "error": f"manager_backend_unavailable:{backend_id.strip()}:{model.strip()}",
             }
     level = str(reasoning or "").strip().lower()
+    paths: tuple[str, ...] = ()
+    if images:
+        if not text.strip():
+            return {"ok": False, "error": "manager_image_needs_text"}
+        entry, err = _entry_or_error(repo)
+        if err is not None:
+            return err
+        paths, err = _store_images(entry.orchestrator.store.root / "attachments", images)
+        if err is not None:
+            return err
     return _dispatch_turn(
         repo,
-        lambda orchestrator: orchestrator.send(text, reasoning=level),
+        lambda orchestrator: orchestrator.send(text, reasoning=level, images=paths),
         record_last_turn=True,
         pin_passive_route=bool(text.strip()),
         route=route,
-        queued=_QueuedSend(text=text, level=level, route=route),
+        queued=_QueuedSend(text=text, level=level, route=route, images=paths),
     )
 
 
@@ -660,6 +750,7 @@ def status(repo: str | Path) -> dict[str, Any]:
                 "text": item.text[:SEND_QUEUE_PREVIEW_CHARS],
                 "backend_id": item.route[0] if item.route else "",
                 "model": item.route[1] if item.route else "",
+                "images": len(item.images),
             }
             for item in pending
         ],

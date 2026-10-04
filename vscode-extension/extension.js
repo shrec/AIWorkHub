@@ -601,6 +601,11 @@ const MANAGER_LOOP_TOOLS = Object.freeze({
 // these tools are mutating and session-scoped, not the read-only dashboard
 // contract that check verifies (see pushRuntimeInfo).
 const MANAGER_LOOP_BACKENDS = new Set(["claude_cli", "codex_cli", "opencode_cli"]);
+// Owner image attachments: manager_loop_service.MANAGER_IMAGE_LIMIT and
+// MANAGER_IMAGE_MAX_BYTES (5 MiB) as its base64 length. The server re-checks
+// every byte; this refuses a malformed set before any MCP call.
+const MANAGER_CHAT_IMAGE_LIMIT = 4;
+const MANAGER_CHAT_IMAGE_MAX_BASE64 = Math.ceil((5 * 1024 * 1024) / 3) * 4;
 // Matches manager_loop._SESSION_ID_RE -- production ids look like
 // "mls-<32 hex>", but the bounded opaque shape is the contract, not the prefix.
 const MANAGER_SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$/;
@@ -11355,7 +11360,26 @@ function handleInboundMessage(view, message) {
         view.postMessage({ type: OUTBOUND_TYPES.managerLoopAction, action: "send", payload: { ok: false, error: "invalid_reasoning_level" } });
         return;
       }
-      runManagerLoopAction(view, "send", { text, backend_id: sendBackendId, model: sendModel, reasoning: sendReasoning });
+      const sendImages = message.images == null ? [] : message.images;
+      const imagesValid =
+        Array.isArray(sendImages) &&
+        sendImages.length <= MANAGER_CHAT_IMAGE_LIMIT &&
+        sendImages.every(
+          (image) =>
+            image &&
+            typeof image.data === "string" &&
+            image.data.length <= MANAGER_CHAT_IMAGE_MAX_BASE64 &&
+            /^[A-Za-z0-9+/]*={0,2}$/.test(image.data),
+        );
+      if (!imagesValid) {
+        view.postMessage({ type: OUTBOUND_TYPES.managerLoopAction, action: "send", payload: { ok: false, error: "invalid_images" } });
+        return;
+      }
+      const sendArgs = { text, backend_id: sendBackendId, model: sendModel, reasoning: sendReasoning };
+      if (sendImages.length) {
+        sendArgs.images = sendImages.map((image) => ({ name: String(image.name || "").slice(0, 200), data: image.data }));
+      }
+      runManagerLoopAction(view, "send", sendArgs);
       break;
     }
     case "managerLoopRotate":
@@ -12330,8 +12354,11 @@ function getHtmlForWebview(webview, extensionUri) {
         <button type="button" class="mc-latest" id="manager-chat-latest" hidden>↓ latest</button>
         <div class="sr-only" id="manager-chat-announcer" aria-live="polite"></div>
         <div class="manager-chat-notice" id="manager-chat-notice" hidden></div>
+        <ul class="manager-chat-attachments" id="manager-chat-attachments" aria-label="Attached images" hidden></ul>
         <form class="manager-chat-composer" id="manager-chat-composer">
           <textarea id="manager-chat-input" rows="2" placeholder="Message the manager" aria-label="Message the manager"></textarea>
+          <button type="button" id="manager-chat-attach" title="Attach PNG, JPEG, GIF or WebP images (or paste or drop them)">Attach</button>
+          <input type="file" id="manager-chat-file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
           <button type="submit" class="primary-button" id="manager-chat-send">Send</button>
         </form>
       </div>

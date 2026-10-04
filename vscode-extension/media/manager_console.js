@@ -6,6 +6,10 @@
 // output: strings go through createElement's textContent or
 // document.createTextNode, never innerHTML.
 
+function managerChatImageCount(count) {
+  return `${count} image${count === 1 ? "" : "s"} attached`;
+}
+
 function managerChatEventNode(event) {
   const type = String((event && event.type) || "");
   const payload = event && event.payload && typeof event.payload === "object" ? event.payload : {};
@@ -15,6 +19,9 @@ function managerChatEventNode(event) {
     const bubble = createElement("div", `manager-chat-bubble role-${type === "user_message" ? "user" : "assistant"}`);
     bubble.appendChild(createElement("span", "manager-chat-bubble-label sr-only", type === "user_message" ? "You" : "Manager"));
     bubble.appendChild(type === "assistant_text" ? managerConsoleMarkdown(payload.text) : document.createTextNode(String(payload.text || "")));
+    // The log records only how many images the owner attached, never the image.
+    const images = type === "user_message" ? numberValue(payload.images) : 0;
+    if (images > 0) bubble.appendChild(createElement("span", "manager-chat-bubble-images", managerChatImageCount(images)));
     return managerConsoleBlock(type, bubble);
   }
   if (type === "tool_call" || type === "tool_result") {

@@ -201,6 +201,35 @@ test("managerLoopSend with an unlisted backend is refused before any MCP call", 
   }]);
 });
 
+test("managerLoopSend forwards attached images and refuses a malformed set before any MCP call", async () => {
+  const harness = loadHostSlice();
+  harness.setClient(makeClient());
+  const view = makeView();
+  const send = (images) => harness.api.handleInboundMessage(view, {
+    type: "managerLoopSend", text: "look", backendId: "codex_cli", model: "gpt-x", images,
+  });
+
+  send(Array.from({ length: 5 }, () => ({ name: "a.png", data: "iVBORw0KGgo=" })));
+  send([{ name: "a.png", data: "<script>" }]);
+  send([{ name: "a.png", data: "A".repeat(7 * 1024 * 1024) }]);
+  await flush();
+
+  assert.equal(harness.managerLoopClientInstances.length, 0);
+  assert.deepEqual(plain(view.posts), Array.from({ length: 3 }, () => ({
+    type: harness.api.OUTBOUND_TYPES.managerLoopAction,
+    action: "send",
+    payload: { ok: false, error: "invalid_images" },
+  })));
+
+  send([{ name: "a.png", data: "iVBORw0KGgo=", extra: "dropped" }]);
+  await flush();
+  const call = harness.managerLoopClientInstances[0].calls.find((item) => item.name === "aiworkhub_manager_loop_send");
+  assert.deepEqual(plain(call.args), {
+    text: "look", backend_id: "codex_cli", model: "gpt-x", reasoning: "",
+    images: [{ name: "a.png", data: "iVBORw0KGgo=" }],
+  });
+});
+
 test("managerLoopEnsure reaches the gated client as aiworkhub_manager_loop_ensure with no args", async () => {
   const harness = loadHostSlice();
   harness.setClient(makeClient());
@@ -455,6 +484,9 @@ function loadWebviewSlice() {
     managerChatTaskFilter: Object.assign(makeFakeElement("select"), { value: "open" }),
     managerChatInput: makeFakeElement("textarea"),
     managerChatSend: makeFakeElement("button"),
+    managerChatAttach: makeFakeElement("button"),
+    managerChatFile: Object.assign(makeFakeElement("input"), { files: [], clicks: 0, click() { this.clicks += 1; } }),
+    managerChatAttachments: Object.assign(makeFakeElement("div"), { hidden: true }),
     headerManagerChatValue: makeFakeElement("strong"),
     headerManagerChatDetail: makeFakeElement("span"),
   };
@@ -487,6 +519,13 @@ function loadWebviewSlice() {
     state,
     elements,
     MANAGER_CHAT_POLL_MS: 1500,
+    // Reads at once, so a test sees the attached image right after the event.
+    FileReader: class {
+      readAsDataURL(file) {
+        this.result = `data:${file.type};base64,${file.base64}`;
+        this.onload();
+      }
+    },
   };
   vm.createContext(context);
   vm.runInContext(
@@ -859,6 +898,87 @@ test("Enter sends, Shift+Enter and IME composition do not", () => {
   assert.equal(sends(), 1);
   assert.equal(prevented, 1);
   assert.equal(harness.elements.managerChatInput.value, "");
+});
+
+function imageFile(name, type, base64, size) {
+  return { name, type, base64, size: size === undefined ? base64.length : size };
+}
+
+test("a pasted, dropped or chosen image attaches and Send carries it with the text", () => {
+  const harness = loadWebviewSlice();
+  const { elements } = harness;
+  elements.managerChatBackendSelect.value = "codex_cli";
+  elements.managerChatModelInput.value = "gpt-x";
+
+  trigger(elements.managerChatInput, "paste", { clipboardData: { files: [imageFile("shot.png", "image/png", "iVBORw0KGgo=")] } });
+  trigger(elements.managerChatComposer, "drop", { dataTransfer: { files: [imageFile("a.gif", "image/gif", "R0lGODlh")] } });
+  trigger(elements.managerChatAttach, "click");
+  assert.equal(elements.managerChatFile.clicks, 1, "Attach opens the file chooser");
+  elements.managerChatFile.files = [imageFile("b.webp", "image/webp", "UklGRg==")];
+  trigger(elements.managerChatFile, "change");
+
+  assert.equal(elements.managerChatAttachments.hidden, false);
+  assert.equal(elements.managerChatAttachments.children.length, 3);
+  elements.managerChatInput.value = "look";
+  trigger(elements.managerChatComposer, "submit");
+
+  assert.deepEqual(plain(harness.posts.at(-1)), {
+    type: "managerLoopSend",
+    text: "look",
+    backendId: "codex_cli",
+    model: "gpt-x",
+    reasoning: "",
+    images: [
+      { name: "shot.png", data: "iVBORw0KGgo=" },
+      { name: "a.gif", data: "R0lGODlh" },
+      { name: "b.webp", data: "UklGRg==" },
+    ],
+  });
+  assert.equal(elements.managerChatAttachments.hidden, true, "sent images leave the composer");
+
+  harness.api.renderManagerChatAction("send", { ok: false, error: "manager_image_invalid:0:type" });
+  assert.equal(elements.managerChatAttachments.children.length, 3, "a refused send gives the images back");
+});
+
+test("only four supported images within 5 MiB attach, and images need a message", () => {
+  const harness = loadWebviewSlice();
+  const { elements } = harness;
+  elements.managerChatBackendSelect.value = "codex_cli";
+  elements.managerChatModelInput.value = "gpt-x";
+  const drop = (...files) => trigger(elements.managerChatComposer, "drop", { dataTransfer: { files } });
+
+  drop(imageFile("notes.pdf", "application/pdf", "JVBERi0="));
+  assert.match(elements.managerChatNotice.textContent, /PNG, JPEG, GIF or WebP/);
+  drop(imageFile("huge.png", "image/png", "iVBORw0KGgo=", 5 * 1024 * 1024 + 1));
+  assert.match(elements.managerChatNotice.textContent, /5 MiB/);
+  drop(...[1, 2, 3, 4, 5].map((n) => imageFile(`s${n}.png`, "image/png", "iVBORw0KGgo=")));
+  assert.match(elements.managerChatNotice.textContent, /4 images/);
+  assert.equal(elements.managerChatAttachments.children.length, 4);
+
+  const chip = elements.managerChatAttachments.children[0];
+  trigger(chip.children.at(-1), "click");
+  assert.equal(elements.managerChatAttachments.children.length, 3, "a chip's remove button drops its image");
+
+  elements.managerChatInput.value = "";
+  trigger(elements.managerChatComposer, "submit");
+  assert.equal(harness.posts.filter((post) => post.type === "managerLoopSend").length, 0);
+  assert.match(elements.managerChatNotice.textContent, /message/);
+  assert.equal(elements.managerChatAttachments.children.length, 3, "the images wait for the message");
+});
+
+test("the transcript and the send queue say how many images a message carried", () => {
+  const harness = loadWebviewSlice();
+  const node = harness.api.managerChatEventNode({ seq: 1, turn: 1, type: "user_message", payload: { text: "look", images: 2 } });
+  assert.match(flattenNodes(node, []).map((part) => String(part.textContent || "")).join(""), /2 images attached/);
+
+  harness.api.renderManagerChatStatus({
+    ok: true,
+    running: true,
+    session: { session_id: "mls-aaaa1111bbbb2222", backend_id: "claude_cli", model: "opus" },
+    send_queue: [{ text: "later", images: 1 }],
+  });
+  const queued = flattenNodes(harness.elements.managerChatQueue, []).map((part) => String(part.textContent || "")).join("");
+  assert.match(queued, /1 image attached/);
 });
 
 test("the composer stays enabled with no session and while a turn is running", () => {
@@ -1411,6 +1531,9 @@ test("the Manager panel is a persistent sidebar and reuses existing theme tokens
     "manager-chat-composer",
     "manager-chat-input",
     "manager-chat-send",
+    "manager-chat-attach",
+    "manager-chat-file",
+    "manager-chat-attachments",
   ]) {
     assert.match(extensionSource, new RegExp(`id="${id}"`), `${id} must stay`);
   }

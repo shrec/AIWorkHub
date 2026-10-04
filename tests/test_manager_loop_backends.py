@@ -776,6 +776,64 @@ def test_opencode_discovery_failure_refuses_by_name_not_silently(tmp_path: Path,
     with pytest.raises(mlb.ManagerLoopError, match="manager_backend_unavailable:opencode_cli"):
         build("opencode_cli", "opencode-go/muse-spark-1.3-contributor")
 
+def test_codex_images_ride_as_attached_image_flags_before_the_prompt_on_fresh_and_resumed_turns(
+    tmp_path: Path,
+):
+    fake = FakeCli(tmp_path, [[{"type": "thread.started", "thread_id": "th-1"}], []])
+    cli = backend(fake, backend_id="codex_cli")
+    first, second = str(tmp_path / "a.png"), str(tmp_path / "b.gif")
+
+    cli.images = (first, second)
+    drain(cli.send("look at these"))
+    cli.images = (second,)
+    drain(cli.send("and this"))
+    drain(cli.send("no images"))
+
+    # Measured on codex-cli 0.159.3: `-i <path> -` swallows the stdin `-` as one
+    # more image; only the attached `--image=<path>` form leaves it the prompt.
+    assert fake.argv_calls[0][-3:] == [f"--image={first}", f"--image={second}", "look at these"]
+    assert fake.argv_calls[1][:4] == ["codex", "exec", "resume", "th-1"]
+    assert fake.argv_calls[1][-2:] == [f"--image={second}", "and this"]
+    assert not any(token.startswith("--image") for token in fake.argv_calls[2])
+    assert fake.prompts == ["look at these", "and this", "no images"]
+
+
+def test_a_codex_image_path_with_a_comma_is_refused_rather_than_split(tmp_path: Path):
+    fake = FakeCli(tmp_path, [[]])
+    cli = backend(fake, backend_id="codex_cli")
+    cli.images = (str(tmp_path / "a,b.png"),)
+
+    events = drain(cli.send("look"))
+    assert events == [
+        {"type": "error", "payload": {"source": "images", "error": "manager_image_path_unsupported:codex_cli"}}
+    ]
+    assert fake.argv_calls == []
+
+
+def test_claude_images_are_named_in_the_turn_text_for_its_read_tool(tmp_path: Path):
+    fake = FakeCli(tmp_path, [[{"type": "result", "usage": {}}]])
+    cli = backend(fake)
+    path = str(tmp_path / "a.png")
+    cli.images = (path,)
+
+    drain(cli.send("what is on screen"))
+    drain(cli.send("follow up"))
+    assert fake.prompts[0].endswith(f"what is on screen\n\nAttached image: {path}")
+    assert fake.prompts[1] == "follow up"
+
+
+def test_opencode_refuses_images_by_name_before_spawning(tmp_path: Path):
+    fake = FakeCli(tmp_path, [[]])
+    cli = backend(fake, backend_id="opencode_cli")
+    cli.images = (str(tmp_path / "a.png"),)
+
+    events = drain(cli.send("look"))
+    assert events == [
+        {"type": "error", "payload": {"source": "images", "error": "manager_images_unsupported:opencode_cli"}}
+    ]
+    assert fake.argv_calls == []
+
+
 def test_codex_resume_argv_uses_only_the_flags_exec_resume_accepts():
     first = ["codex", "exec", "--json", "-s", "workspace-write", "-C", "D:\repo", "--model", "m", "-"]
 

@@ -85,6 +85,7 @@ const state = {
   managerChatModel: null,
   managerChatModelByBackend: {},
   managerChatRunning: false,
+  managerChatImages: [],
   managerChatEvents: [],
   managerChatPartial: null,
   managerChatRenderLimit: MANAGER_CONSOLE_BLOCK_LIMIT,
@@ -358,6 +359,9 @@ const elements = {
   managerChatComposer: document.querySelector("#manager-chat-composer"),
   managerChatInput: document.querySelector("#manager-chat-input"),
   managerChatSend: document.querySelector("#manager-chat-send"),
+  managerChatAttach: document.querySelector("#manager-chat-attach"),
+  managerChatFile: document.querySelector("#manager-chat-file"),
+  managerChatAttachments: document.querySelector("#manager-chat-attachments"),
 };
 
 function createElement(tag, className, text) {
@@ -7401,6 +7405,8 @@ function renderManagerChatSendQueue(payload) {
       modelNode.appendChild(document.createTextNode(model));
       row.appendChild(modelNode);
     }
+    const images = item && typeof item === "object" && !Array.isArray(item) ? numberValue(item.images) : 0;
+    if (images > 0) row.appendChild(createElement("span", "manager-chat-queued-images", managerChatImageCount(images)));
     rows.push(row);
   }
   if (rows.length === 0) {
@@ -7539,7 +7545,11 @@ function renderManagerChatEventsResponse(payload) {
 
 function renderManagerChatAction(action, payload) {
   const pendingText = action === "send" ? state.managerChatPendingText : "";
-  if (action === "send") state.managerChatPendingText = "";
+  const pendingImages = action === "send" ? asArray(state.managerChatPendingImages) : [];
+  if (action === "send") {
+    state.managerChatPendingText = "";
+    state.managerChatPendingImages = [];
+  }
   if (payload && payload.ok === false) {
     if (action === "send") {
       // The submit set Running optimistically; a refusal ran nothing, so the
@@ -7549,6 +7559,10 @@ function renderManagerChatAction(action, payload) {
       state.managerChatThinkingSince = 0;
       if (pendingText && elements.managerChatInput && !elements.managerChatInput.value) {
         elements.managerChatInput.value = pendingText;
+      }
+      if (pendingImages.length && asArray(state.managerChatImages).length === 0) {
+        state.managerChatImages = pendingImages;
+        renderManagerChatAttachments();
       }
       applyManagerChatSessionUi();
       managerConsoleScheduleRender();
@@ -8208,6 +8222,78 @@ if (elements.managerChatTaskFilter && typeof elements.managerChatTaskFilter.addE
     renderManagerChatTaskBoard();
   });
 }
+// Owner image attachments (paste, drop, Attach). Mirrors the server limits in
+// manager_loop_service, which re-checks every byte; the composer keeps only
+// names and base64 and the chips show names, never the image.
+const MANAGER_CHAT_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+const MANAGER_CHAT_IMAGE_LIMIT = 4;
+const MANAGER_CHAT_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
+
+function renderManagerChatAttachments() {
+  const host = elements.managerChatAttachments;
+  if (!host) return;
+  const images = asArray(state.managerChatImages);
+  host.hidden = images.length === 0;
+  host.replaceChildren(
+    ...images.map((image, index) => {
+      const chip = createElement("li", "manager-chat-attachment", image.name);
+      const remove = createElement("button", "manager-chat-attachment-remove", "×");
+      remove.type = "button";
+      remove.setAttribute("aria-label", `Remove ${image.name}`);
+      remove.addEventListener("click", () => {
+        state.managerChatImages = asArray(state.managerChatImages).filter((_, at) => at !== index);
+        renderManagerChatAttachments();
+      });
+      chip.appendChild(remove);
+      return chip;
+    }),
+  );
+}
+
+function attachManagerChatImages(files) {
+  for (const file of Array.from(files || [])) {
+    const name = String(file.name || "image").slice(0, 200);
+    if (!MANAGER_CHAT_IMAGE_TYPES.has(file.type)) {
+      showManagerChatNotice(`${name} is not an image the manager can read: attach PNG, JPEG, GIF or WebP.`);
+      continue;
+    }
+    if (file.size > MANAGER_CHAT_IMAGE_MAX_BYTES) {
+      showManagerChatNotice(`${name} is larger than 5 MiB.`);
+      continue;
+    }
+    const reader = new FileReader();
+    reader.onerror = () => showManagerChatNotice(`${name} could not be read.`);
+    reader.onload = () => {
+      if (asArray(state.managerChatImages).length >= MANAGER_CHAT_IMAGE_LIMIT) {
+        showManagerChatNotice(`A message carries at most ${MANAGER_CHAT_IMAGE_LIMIT} images.`);
+        return;
+      }
+      const dataUrl = String(reader.result || "");
+      state.managerChatImages = [...asArray(state.managerChatImages), { name, data: dataUrl.slice(dataUrl.indexOf(",") + 1) }];
+      renderManagerChatAttachments();
+    };
+    reader.readAsDataURL(file);
+  }
+}
+
+if (elements.managerChatAttach && elements.managerChatFile) {
+  elements.managerChatAttach.addEventListener("click", () => elements.managerChatFile.click());
+  elements.managerChatFile.addEventListener("change", () => {
+    attachManagerChatImages(elements.managerChatFile.files);
+    elements.managerChatFile.value = "";
+  });
+}
+elements.managerChatInput.addEventListener("paste", (event) => {
+  const files = event.clipboardData && event.clipboardData.files;
+  if (!files || files.length === 0) return; // text pastes as usual
+  event.preventDefault();
+  attachManagerChatImages(files);
+});
+elements.managerChatComposer.addEventListener("dragover", (event) => event.preventDefault());
+elements.managerChatComposer.addEventListener("drop", (event) => {
+  event.preventDefault();
+  attachManagerChatImages(event.dataTransfer && event.dataTransfer.files);
+});
 elements.managerChatInput.addEventListener("keydown", (event) => {
   if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
   event.preventDefault();
@@ -8220,7 +8306,11 @@ elements.managerChatComposer.addEventListener("submit", (event) => {
   const route = managerChatSelectedRoute();
   const backendId = route.backendId;
   const model = route.model;
-  if (!text) return;
+  const images = asArray(state.managerChatImages);
+  if (!text) {
+    if (images.length) showManagerChatNotice("Add a message to send with the attached images.");
+    return;
+  }
   if (text === "/new") {
     vscode.postMessage({ type: "managerLoopNew" });
     elements.managerChatInput.value = "";
@@ -8236,15 +8326,20 @@ elements.managerChatComposer.addEventListener("submit", (event) => {
     showManagerChatNotice("Choose a model. This session continues on that model.");
     return;
   }
-  vscode.postMessage({
+  const send = {
     type: "managerLoopSend",
     text,
     backendId,
     model,
     reasoning: String(elements.managerChatReasoningSelect && elements.managerChatReasoningSelect.value || ""),
-  });
-  // Kept until the send's reply: a refusal puts it back in the composer.
+  };
+  if (images.length) send.images = images;
+  vscode.postMessage(send);
+  // Kept until the send's reply: a refusal puts them back in the composer.
   state.managerChatPendingText = text;
+  state.managerChatPendingImages = images;
+  state.managerChatImages = [];
+  renderManagerChatAttachments();
   elements.managerChatInput.value = "";
   // Optimistic Running label only. The composer stays enabled so the next
   // send can be queued; status.send_queue is what renders that queue.

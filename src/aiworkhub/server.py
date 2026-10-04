@@ -1885,7 +1885,11 @@ def aiworkhub_manager_loop_new() -> dict[str, Any]:
 
 @mcp.tool()
 def aiworkhub_manager_loop_send(
-    text: str, backend_id: str = "", model: str = "", reasoning: str = ""
+    text: str,
+    backend_id: str = "",
+    model: str = "",
+    reasoning: str = "",
+    images: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """MANAGER WRITE: run one manager turn in the background.
 
@@ -1899,13 +1903,17 @@ def aiworkhub_manager_loop_send(
     to that exact route (same route is a no-op, a switch re-opens with a
     mechanical handoff). Blank means "no selection" and keeps the legacy
     policy-default pin behavior. ``reasoning`` is the owner's depth choice.
+    ``images`` attaches up to 4 png/jpeg/gif/webp images, each
+    ``{"name": ..., "data": <base64>}`` within 5 MiB; claude_cli and
+    codex_cli read them, other backends refuse them as the turn's error.
     """
 
     root, refusal = _manager_loop_repo_root(launching=True)
     if refusal is not None:
         return refusal
+    attached = (images,) if images else ()
     return manager_loop_service.send(
-        root, text, backend_id or None, model or None, reasoning or None
+        root, text, backend_id or None, model or None, reasoning or None, *attached
     )
 
 
