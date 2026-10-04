@@ -13458,10 +13458,16 @@ class ProcessManager:
                 )
             )
             retryable_release_pending = latest_state == "release_pending"
+            # A scope rejection is re-judged by re-running finalization on the
+            # retained workspace: it reaches review_ready only if the scope
+            # check now passes, else it ends scope_rejected again with the
+            # current violation (NF-2026-01345).
+            retryable_scope_rejection = latest_state == "scope_rejected"
             if (
                 latest_state != "finalize_failed"
                 and not retryable_validation_failure
                 and not retryable_release_pending
+                and not retryable_scope_rejection
             ):
                 return {
                     "ok": False,

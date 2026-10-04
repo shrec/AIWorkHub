@@ -4797,6 +4797,9 @@ def retry_finalize_failed(
     Besides ``finalize_failed``, only the explicitly operational
     ``validation_exec_scratch_unavailable`` validation failure is eligible;
     ordinary product/test failures remain terminal and require rework.
+    ``scope_rejected`` is eligible too: the re-run repeats the scope check on
+    the same retained workspace, so it passes only when the delta is now in
+    scope and otherwise ends ``scope_rejected`` again (NF-2026-01345).
     """
     _readiness, db_path = _require_ready(root)
     # Serialized on the same lease as the terminal transitions it reverses: it
@@ -4849,7 +4852,10 @@ def retry_finalize_failed(
                 )
             )
         )
-        if terminal_substatus != "finalize_failed" and not retryable_validation_failure:
+        if (
+            terminal_substatus not in {"finalize_failed", "scope_rejected"}
+            and not retryable_validation_failure
+        ):
             return False, "terminal_substatus_not_retryable_finalization_failure"
         evidence_request_id = str(
             evidence.get("request_id")

@@ -1909,6 +1909,8 @@ def test_finalize_after_process_exit_emits_terminal_callback_fallback(
             "validation_failed",
             "validation_exec_scratch_unavailable:C:\\Temp:noexec",
         ),
+        # NF-2026-01345: a scope rejection re-runs the scope check in place.
+        ("scope_rejected", "scope_violation:$null"),
     ],
 )
 def test_retry_finalization_reuses_retained_workspace_without_provider(
@@ -12403,6 +12405,8 @@ def test_worker_runtime_policy_names_sandbox_validation_facts():
     assert "$AIWORKHUB_CANONICAL_PYTHON" in policy
     assert "validation_unsupported_in_sandbox:" in policy
     assert "never stub a denied call" in policy
+    # NF-2026-01345: a bash `> $null` / `> nul` leaves a stray worktree file.
+    assert "> /dev/null, never > $null or > nul" in policy
 
 
 def test_status_names_why_the_task_card_was_not_read(monkeypatch, tmp_path):

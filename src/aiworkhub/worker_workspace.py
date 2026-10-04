@@ -1116,6 +1116,44 @@ def _worktree_manifest(root: Path) -> dict[str, str | None]:
     return {relative: digest for (relative, _path), digest in zip(rows, hashes)}
 
 
+# Shell artifacts a worker's environment leaves behind without the worker
+# meaning to write them (NF-2026-01345): a PowerShell-style ``> $null`` or a
+# cmd-style ``> nul`` run under bash creates an empty regular file of that name,
+# and a crashing MSYS/Cygwin ``bash.exe`` drops ``*.stackdump``.  They are
+# environment residue, not candidate output, so they must neither fail the
+# scope check nor ever be promoted into the canonical tree.
+_SHELL_RESIDUE_NULL_NAMES = frozenset({"$null", "nul"})
+
+
+def _is_shell_residue(workspace: WorkerWorkspace, relative: str) -> bool:
+    """Return whether a candidate path is shell residue (NF-2026-01345).
+
+    A path the card explicitly names in ``allowed_writes`` is declared output
+    and is never residue; callers additionally keep any path the base commit
+    tracks.  A ``$null``/``nul`` file counts only while it is empty, so real
+    bytes under those names still reach the scope check.
+    """
+
+    normalized = _relative_repo_path(relative)
+    if normalized in {_relative_repo_path(raw) for raw in workspace.allowed_writes}:
+        return False
+    target = workspace.path / normalized
+    name = target.name.lower()
+    is_null_sink = name in _SHELL_RESIDUE_NULL_NAMES
+    if not is_null_sink and not name.endswith(".stackdump"):
+        return False
+    try:
+        # ``Path.is_file()`` is False for a Windows ``nul`` (a reserved device
+        # name), but the directory entry still reports the real regular file.
+        with os.scandir(target.parent) as entries:
+            entry = next((item for item in entries if item.name == target.name), None)
+        if entry is None or not entry.is_file(follow_symlinks=False):
+            return False
+        return not is_null_sink or entry.stat(follow_symlinks=False).st_size == 0
+    except OSError:
+        return False
+
+
 def _manifest_changed_paths(workspace: WorkerWorkspace, *, git_phase: str) -> list[str]:
     baseline = workspace.tree_baseline
     if baseline is None:
@@ -1125,6 +1163,8 @@ def _manifest_changed_paths(workspace: WorkerWorkspace, *, git_phase: str) -> li
         relative
         for relative in set(baseline) | set(current)
         if baseline.get(relative) != current.get(relative)
+        # Shell residue absent at creation is not candidate delta (NF-2026-01345).
+        and not (relative not in baseline and _is_shell_residue(workspace, relative))
     }
     # Rework predecessor bytes are intentionally present at workspace creation
     # yet still form part of the candidate delta against the canonical parent.
@@ -6923,6 +6963,22 @@ def changed_paths(
         _relative_repo_path(item)
         for item in (tracked.stdout + untracked.stdout).split("\x00")
         if item
+    }
+    # Shell residue the base commit does not track is environment noise, not
+    # candidate delta, even if the worker committed it; a base-tracked path
+    # keeps its delta whatever its name (NF-2026-01345).  The Git probe runs
+    # only for the rare residue-named path, never per changed file.
+    rows -= {
+        relative
+        for relative in rows
+        if _is_shell_residue(workspace, relative)
+        and _run(
+            ["git", "cat-file", "-e", f"{diff_ref}:{relative}"],
+            cwd=workspace.path,
+            timeout=git_timeout,
+            phase=git_phase,
+        ).returncode
+        != 0
     }
     for relative, initial_hash in workspace.workspace_baseline.items():
         current_hash = _hash_path(workspace.path / relative)

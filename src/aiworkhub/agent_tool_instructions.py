@@ -475,6 +475,8 @@ reports failure_class tool_unavailable: name it in the final message and
 continue no further; the coordinator-side supervisor will still run the
 canonical validation after exit.
 Never use git add -A or git add . and never touch paths outside allowed_writes.
+In bash discard output with > /dev/null, never > $null or > nul: those create a
+stray file in the worktree.
 
 SANDBOX_VALIDATION_FACTS: your worktree is a sparse checkout, so a declared
 .venv/bin/python does not exist inside it; the validation tool already resolves

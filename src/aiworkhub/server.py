@@ -4360,7 +4360,9 @@ def aiworkhub_agent_retry_finalization(
     revalidated before deterministic validation/finalization is re-entered.
     A validation failure is eligible only when its durable reason is the
     operational ``validation_exec_scratch_unavailable`` condition; ordinary
-    product/test failures remain non-retryable.
+    product/test failures remain non-retryable. A ``scope_rejected`` request is
+    eligible: the re-run repeats the scope check and reaches review_ready only
+    if the retained delta is now in scope (NF-2026-01345).
     """
 
     return process_launcher.default_manager().retry_finalization(

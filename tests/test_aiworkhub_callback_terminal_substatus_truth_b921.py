@@ -319,6 +319,44 @@ def test_operational_validation_scratch_failure_retries_without_new_attempt(tmp_
     }
 
 
+def test_scope_rejection_retries_finalization_without_new_attempt(tmp_path):
+    """NF-2026-01345: a scope rejection caused by shell residue is re-judged by
+    re-running finalization on the retained workspace, never by a relaunch."""
+    repo = _init_repo(tmp_path)
+    task_id = "TASK_SCOPE_REJECTED_RETRY"
+    runner = "claude_worker_b921"
+    request_id = f"request-{task_id.lower()}"
+    _seed_processing_task(
+        repo,
+        task_id,
+        origin_thread_id="thread-scope-rejected-retry",
+        runner=runner,
+    )
+    rejected = task_engine.mark_terminal_review(
+        repo,
+        task_id,
+        runner,
+        "scope_rejected",
+        evidence={"request_id": request_id, "error": "scope_violation:$null"},
+    )
+    assert rejected["ok"] is True
+    claim_epoch = task_store.get_task(repo, task_id)["claim_epoch"]
+
+    ok, state = task_store.retry_finalize_failed(
+        repo,
+        task_id,
+        runner=runner,
+        request_id=request_id,
+        actor="codex",
+    )
+
+    assert (ok, state) == (True, "processing")
+    after = task_store.get_task(repo, task_id)
+    assert after["claim_epoch"] == claim_epoch
+    assert after["finalization_retry"]["provider_relaunch"] is False
+    assert after["finalization_retry"]["source_substatus"] == "scope_rejected"
+
+
 def test_product_validation_failure_cannot_use_finalization_retry(tmp_path):
     repo = _init_repo(tmp_path)
     task_id = "TASK_PRODUCT_VALIDATION_FAILURE"
