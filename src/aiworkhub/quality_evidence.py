@@ -2835,8 +2835,9 @@ def run_builtin_static_checks(
             affected_paths=paths,
             summary="no changed Python/JavaScript/shell source required syntax parsing",
             provenance="builtin:diff_scoped_syntax",
-        ))
+    ))
     bug_report = known_bug_scanner.scan_changed_paths(root, paths)
+    skipped_paths = bug_report["skipped_paths"]
     checks.append(EvidenceCheck(
         check_id="builtin:known_bug_patterns",
         kind="security",
@@ -2845,13 +2846,18 @@ def run_builtin_static_checks(
         summary=json.dumps({
             "errors": bug_report["errors"], "warnings": bug_report["warnings"],
             "findings": bug_report["findings"][:20], "truncated": bug_report["truncated"],
+            "skipped_paths": skipped_paths,
             "evidence_summary": bug_report["evidence_summary"],
             "dedupe_summary": bug_report["dedupe_summary"],
             "source_revision_sha256": bug_report["source_revision_sha256"],
             "source_revision_scope": bug_report["source_revision_scope"],
         }, sort_keys=True)[:MAX_SUMMARY_CHARS],
         provenance="builtin:diff_scoped_known_bug_registry.v1",
-        error="" if bug_report["passed"] else "high_confidence_known_bug_pattern",
+        error=(
+            "" if bug_report["passed"]
+            else "high_confidence_known_bug_pattern" if bug_report["errors"]
+            else "known_bug_scan_skipped_uninspected_source"
+        ),
     ))
     eval_report = eval_artifact_gate.evaluate(root, changed_paths=list(paths))
     if eval_report["configured"]:

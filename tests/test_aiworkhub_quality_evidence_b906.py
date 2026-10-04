@@ -482,6 +482,16 @@ def _code_card() -> dict:
     return {"task_id": "T-1", "task_type": "code", "validation": ["pytest -q"]}
 
 
+def test_known_bug_check_labels_skip_truthfully(tmp_path: Path):
+    (tmp_path / "big.py").write_text("# " + "x" * 10_417_919, encoding="utf-8")
+    checks = qe.run_builtin_static_checks(tmp_path, changed_paths=["big.py"])
+    check = next(row for row in checks if row.check_id == "builtin:known_bug_patterns")
+    assert check.status == qe.STATUS_FAILED
+    assert check.error == "known_bug_scan_skipped_uninspected_source"
+    assert "file_exceeds_max_bytes" in check.summary
+    assert "skipped_paths" in check.summary
+
+
 def test_read_only_code_card_without_candidate_paths_has_no_code_risk():
     card = {"task_type": "code", "read_only": True, "validation": []}
 

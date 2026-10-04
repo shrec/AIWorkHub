@@ -53,6 +53,40 @@ def test_completion_builtin_blocks_high_confidence_pattern(tmp_path: Path):
     assert "static_pattern_not_runtime_reproduction" in check.summary
 
 
+def test_oversized_unsupported_json_is_not_read_nor_skipped(tmp_path: Path, monkeypatch):
+    """NF88 red->green: suffix applicability precedes the size gate."""
+    blob = tmp_path / "blob.json"
+    blob.write_bytes(b"x" * (known_bug_scanner.MAX_FILE_BYTES + 1))
+
+    def refuse_read(self, *args, **kwargs):
+        raise AssertionError(f"unsupported data was read: {self}")
+
+    monkeypatch.setattr(Path, "read_text", refuse_read)
+    findings, skip = known_bug_scanner._scan_path(tmp_path, "blob.json")
+    assert findings == []
+    assert skip is None
+    report = known_bug_scanner.scan_changed_paths(tmp_path, ["blob.json"])
+    assert report["passed"] is True
+    assert report["skipped_paths"] == []
+    assert report["findings"] == []
+
+
+def test_oversized_supported_code_stays_fail_closed(tmp_path: Path):
+    (tmp_path / "big.py").write_text("# " + "x" * known_bug_scanner.MAX_FILE_BYTES, encoding="utf-8")
+    findings, skip = known_bug_scanner._scan_path(tmp_path, "big.py")
+    assert findings == []
+    assert skip == {
+        "path": "big.py",
+        "reason": "file_exceeds_max_bytes",
+        "size_bytes": (tmp_path / "big.py").stat().st_size,
+        "max_bytes": known_bug_scanner.MAX_FILE_BYTES,
+    }
+    report = known_bug_scanner.scan_changed_paths(tmp_path, ["big.py"])
+    assert report["passed"] is False
+    assert report["errors"] == 0
+    assert report["skipped_paths"] == [skip]
+
+
 def test_transport_security_rules_cover_multiple_languages(tmp_path: Path):
     cases = {
         "client.py": "requests.get(url, verify=False)\n",

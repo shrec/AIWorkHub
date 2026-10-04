@@ -483,6 +483,14 @@ def _scan_path(root: Path, relative: str) -> tuple[list[dict], dict | None]:
     path = (root / relative).resolve(strict=False)
     if (path != root and root not in path.parents) or path.is_symlink() or not path.is_file():
         return [], None
+    suffix = path.suffix.lower()
+    rules = [rule for rule in RULES if suffix in rule.suffixes]
+    if not rules and suffix not in {".cu", ".cuh"}:
+        # Applicability precedes the size gate: an oversized file whose suffix
+        # no rule can ever match is out of scope for this scanner, so it is
+        # neither read nor reported as a blocking skip. Scannable files stay
+        # fail-closed below.
+        return [], None
     size = path.stat().st_size
     if size > MAX_FILE_BYTES:
         return [], {
@@ -491,10 +499,6 @@ def _scan_path(root: Path, relative: str) -> tuple[list[dict], dict | None]:
             "size_bytes": size,
             "max_bytes": MAX_FILE_BYTES,
         }
-    suffix = path.suffix.lower()
-    rules = [rule for rule in RULES if suffix in rule.suffixes]
-    if not rules and suffix not in {".cu", ".cuh"}:
-        return [], None
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
     code_lines = _masked_code_lines(text, suffix)
