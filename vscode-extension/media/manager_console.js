@@ -470,7 +470,8 @@ function managerConsoleMarkdown(text) {
 }
 
 function managerConsoleTurnFinished(turn) {
-  return (state.managerChatEvents || []).some((item) => item && item.turn === turn && ["turn_end", "assistant_text"].includes(item.type));
+  // NF-2026-01230: only turn_end ends a turn; a mid-turn assistant_text already settled its streamed text server side.
+  return (state.managerChatEvents || []).some((item) => item && item.turn === turn && item.type === "turn_end");
 }
 
 function managerConsolePartialIsCurrent(partial) {

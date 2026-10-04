@@ -1357,12 +1357,21 @@ test("partial-only provider responses render without persisting or announcing de
   const nodes = flattenNodes(harness.elements.managerChatTranscript, []);
   assert.ok(nodes.some((node) => node.className === "mc-caret"));
   assert.ok(nodes.some((node) => node.tag === "strong" && node.textContent === "world"));
+  // NF-2026-01230: a mid-turn assistant_text (between tool calls) keeps the turn's next
+  // partial streaming; only turn_end retires it.
+  const next = { session_id: session, turn: 3, text: "next", reasoning: "" };
   harness.api.renderManagerChatEventsResponse({
-    ok: true, session_id: session, partial,
+    ok: true, session_id: session, partial: next,
     events: [{ seq: 2, turn: 3, type: "assistant_text", payload: { text: "final" } }],
   });
-  assert.equal(harness.state.managerChatPartial, null);
+  assert.equal(harness.state.managerChatPartial, next);
   assert.equal(harness.elements.managerChatAnnouncer.textContent, "final");
+  assert.ok(flattenNodes(harness.elements.managerChatTranscript, []).some((node) => node.className === "mc-caret"));
+  harness.api.renderManagerChatEventsResponse({
+    ok: true, session_id: session, partial: next,
+    events: [{ seq: 3, turn: 3, type: "turn_end", payload: {} }],
+  });
+  assert.equal(harness.state.managerChatPartial, null);
   assert.ok(!flattenNodes(harness.elements.managerChatTranscript, []).some((node) => node.className === "mc-caret"));
   harness.api.renderManagerChatEventsResponse({ ok: true, session_id: session, events: [], partial: null });
   assert.equal(harness.state.managerChatPartial, null);
