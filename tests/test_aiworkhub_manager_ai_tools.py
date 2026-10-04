@@ -2346,6 +2346,11 @@ def test_manager_chat_event_tail_holds_the_longest_line_the_writer_can_log(tmp_p
         "four_byte": {"text": "\U0001f600" * (bound // 4)},
         "cut": {"text": '"' * (4 * bound)},
         "preview": {"note": '"' * (4 * cap)},
+        # NF-2026-01233: every bounded field filled at once escapes to about 912 KiB, so
+        # the writer's whole-line cap halves the field bounds until the line fits.
+        "every_field": {
+            key: "\x01" * limit for key, limit in manager_loop.FIELD_BOUNDS.items()
+        } | {"note": "\x01" * cap},
     }
 
     for name, payload in payloads.items():
@@ -2355,8 +2360,10 @@ def test_manager_chat_event_tail_holds_the_longest_line_the_writer_can_log(tmp_p
         )
         line = log.read_bytes().splitlines(keepends=True)[-1]
 
-        assert ("truncated" in event["payload"]) == (name in ("cut", "preview")), name
+        assert ("truncated" in event["payload"]) == (name in ("cut", "preview", "every_field")), name
         assert len(line) <= callback_store._MANAGER_CHAT_EVENT_TAIL_BYTES, name
+        assert len(line) <= manager_loop.MAX_EVENT_LINE_BYTES + 1, name
+        assert json.loads(line)["payload"] == event["payload"], name
         newest = callback_store._manager_chat_last_event_at(
             store.root, _SEAT_SESSION, not_after=now
         )

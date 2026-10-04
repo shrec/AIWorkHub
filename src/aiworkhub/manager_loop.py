@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, runtime_checkable
 
 from . import platform_io, repository_state
+from .callback_store import _MANAGER_CHAT_EVENT_TAIL_BYTES
 
 
 # v1 records pin a route to the session and carry no successor link; they stay readable
@@ -55,6 +56,10 @@ DEFAULT_ROTATE_FRACTION = 0.75
 MAX_EVENT_PAYLOAD_BYTES = 4 * 1024
 # Payload fields bounded on their own, so a long one is cut without losing the rest.
 FIELD_BOUNDS = {"output_tail": 8 * 1024, "output": 16 * 1024, "diff": 64 * 1024, "text": 64 * 1024}
+# NF-2026-01233: a logged line, newline included, fits the seat-hold reader's tail
+# whole however its fields escape, and the log is compacted by bytes as well as by count.
+MAX_EVENT_LINE_BYTES = _MANAGER_CHAT_EVENT_TAIL_BYTES - 1
+MAX_LOG_BYTES = 4 * 1024 * 1024
 _TAIL_READ_BYTES = 256 * 1024
 MAX_TURN_EVENTS = 1000
 MAX_LOG_EVENTS = 500
@@ -202,12 +207,13 @@ def _bounded_field(value: object, limit: int) -> tuple[object, int]:
     return _clip(text, limit), size
 
 
-def _bounded_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+def _bounded_payload(payload: Mapping[str, Any], shrink: int = 0) -> dict[str, Any]:
     """``payload`` as plain JSON with each :data:`FIELD_BOUNDS` field cut on its own.
 
     A cut bounded field leaves every other field intact and marks the payload
     ``truncated`` with the original bytes of what was cut. The remaining fields
     still collapse to a marked preview once they outgrow the payload bound.
+    ``shrink`` halves every field bound that many times.
     """
     rest = {key: value for key, value in payload.items() if key not in FIELD_BOUNDS}
     text = _json(rest)
@@ -220,7 +226,7 @@ def _bounded_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         cut = size
     for key, limit in FIELD_BOUNDS.items():
         if key in payload:
-            bounded[key], original = _bounded_field(payload[key], limit)
+            bounded[key], original = _bounded_field(payload[key], limit >> shrink)
             cut += original
     if cut:
         bounded.update(truncated=True, original_bytes=cut)
@@ -242,19 +248,32 @@ def _parsed(lines: Iterable[str]) -> list[dict[str, Any]]:
     return records
 
 
+def _tail_records(path: Path, enough: Callable[[list[dict[str, Any]]], bool]) -> list[dict[str, Any]]:
+    """The newest records of the log at ``path``, read from its end.
+
+    NF-2026-01233: the window starts at :data:`_TAIL_READ_BYTES` and doubles
+    until ``enough`` holds for the whole lines inside it or the file is read whole.
+    """
+    if not path.is_file():
+        return []
+    window = _TAIL_READ_BYTES
+    with path.open("rb") as handle:
+        size = handle.seek(0, os.SEEK_END)
+        while True:
+            start = max(0, size - window)
+            handle.seek(start)
+            data = handle.read()
+            if start:
+                data = data[data.find(b"\n") + 1:] if b"\n" in data else b""
+            records = _parsed(data.decode("utf-8", "ignore").splitlines())
+            if not start or enough(records):
+                return records
+            window *= 2
+
+
 def _last_seq(path: Path) -> int:
     """The highest ``seq`` in the log at ``path``, read from its tail; 0 when none."""
-    if not path.is_file():
-        return 0
-    with path.open("rb") as handle:
-        handle.seek(0, os.SEEK_END)
-        size = handle.tell()
-        handle.seek(max(0, size - _TAIL_READ_BYTES))
-        tail = handle.read()
-    records = _parsed(tail.decode("utf-8", "ignore").splitlines())
-    if not records and size > _TAIL_READ_BYTES:
-        records = _parsed(path.read_text(encoding="utf-8", errors="ignore").splitlines())
-    return max((int(item["seq"]) for item in records), default=0)
+    return max((int(item["seq"]) for item in _tail_records(path, bool)), default=0)
 
 
 def _ends_with_newline(path: Path) -> bool:
@@ -305,8 +324,10 @@ class SessionStore:
     persists a passive one), and the ``ensure.lock`` that queues concurrent
     ``ensure`` calls. Records, handoffs and selections are replaced whole
     through :func:`platform_io.atomic_replace`. An event log only grows by
-    appending one line per event; every ``max_events``-th ``seq`` compacts it
-    to its newest ``max_events`` lines through the same atomic writer. A torn
+    appending one line per event; every ``max_events``-th ``seq``, and any
+    append that would take it past ``max_bytes``, compacts it to its newest
+    ``max_events`` lines within half of ``max_bytes`` through the same atomic
+    writer, and readers take only the tail they need. A torn
     last line left by a crash mid-append is skipped by every read and closed
     by the next append. ``seq`` keeps counting, so a first ``seq`` above 1
     says how much was dropped. Closed sessions beyond ``keep_closed`` are
@@ -320,12 +341,14 @@ class SessionStore:
         *,
         max_events: int = MAX_LOG_EVENTS,
         keep_closed: int = KEEP_CLOSED_SESSIONS,
+        max_bytes: int = MAX_LOG_BYTES,
     ) -> None:
         if max_events < 1 or keep_closed < 1:
             raise ValueError("max_events and keep_closed must be at least 1")
         self.root = Path(root)
         self.repo_id = repo_id
         self.max_events = max_events
+        self.max_bytes = max_bytes
         self.keep_closed = keep_closed
 
     @classmethod
@@ -405,28 +428,49 @@ class SessionStore:
         path = self._path("handoffs", session_id)
         return path.read_text(encoding="utf-8") if path.is_file() else ""
 
-    def events(self, session_id: str) -> list[dict[str, Any]]:
-        """The newest ``max_events`` records; a torn or malformed line is skipped."""
+    def events(self, session_id: str, after_seq: int | None = None) -> list[dict[str, Any]]:
+        """The newest ``max_events`` records past ``after_seq``; a torn or malformed line is skipped.
+
+        NF-2026-01233: read from the log's tail, only as far back as needed.
+        """
         path = self._path("events", session_id)
-        lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
-        return _parsed(lines)[-self.max_events:]
+        past = (lambda item: True) if after_seq is None else (lambda item: item["seq"] > after_seq)
+        records = _tail_records(
+            path, lambda found: len(found) >= self.max_events or not all(map(past, found))
+        )
+        return [item for item in records[-self.max_events:] if past(item)]
 
     def append_event(self, session_id: str, event: Mapping[str, Any]) -> dict[str, Any]:
         """Append ``event`` with the next ``seq`` and a bounded payload; return it.
 
-        One line is appended; only when ``seq`` reaches a multiple of
-        ``max_events`` is the log compacted to its newest ``max_events`` records
-        and replaced whole through :func:`_publish`.
+        One line is appended, below :data:`MAX_EVENT_LINE_BYTES`: a line that
+        escapes past it has every field bound halved until it fits. Only when
+        ``seq`` reaches a multiple of ``max_events`` or the file would outgrow
+        ``max_bytes`` is the log compacted to its newest ``max_events`` records
+        within half of ``max_bytes`` and replaced whole through :func:`_publish`.
         """
         path = self._path("events", session_id)
         seq = _last_seq(path) + 1
-        record = {**event, "seq": seq, "payload": _bounded_payload(event.get("payload") or {})}
-        line = json.dumps(record, sort_keys=True)
-        if seq % self.max_events == 0:
+        payload = event.get("payload") or {}
+        # NF-2026-01233: one shrink per bit of the largest bound reaches empty fields.
+        for shrink in range(max(FIELD_BOUNDS.values()).bit_length() + 1):
+            record = {**event, "seq": seq, "payload": _bounded_payload(payload, shrink)}
+            line = json.dumps(record, sort_keys=True)
+            if len(line) <= MAX_EVENT_LINE_BYTES:
+                break
+        else:
+            raise ValueError("manager_event_envelope_over_line_cap")
+        size = path.stat().st_size if path.is_file() else 0
+        if seq % self.max_events == 0 or size + len(line) + 1 > self.max_bytes:
             lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
             prior = [json.dumps(item, sort_keys=True) for item in _parsed(lines)]
-            kept = prior[max(0, len(prior) - (self.max_events - 1)):] + [line]
-            _publish(path, "\n".join(kept) + "\n")
+            kept, room = [line], self.max_bytes // 2 - len(line) - 1
+            for item in reversed(prior[max(0, len(prior) - (self.max_events - 1)):]):
+                room -= len(item) + 1
+                if room < 0:
+                    break
+                kept.append(item)
+            _publish(path, "\n".join(reversed(kept)) + "\n")
             return record
         path.parent.mkdir(parents=True, exist_ok=True)
         torn = not _ends_with_newline(path)

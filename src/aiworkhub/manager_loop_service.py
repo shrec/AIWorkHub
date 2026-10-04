@@ -587,13 +587,13 @@ def events(
     entry, err = _entry_or_error(repo)
     if err is not None:
         return err
-    try:
-        all_events = entry.orchestrator.store.events(session_id)
-    except ManagerLoopError as exc:
-        return _error(exc)
     floor = int(after_seq)
     bound = max(0, int(limit))
-    filtered = [event for event in all_events if int(event.get("seq", 0)) > floor][:bound]
+    try:
+        # NF-2026-01233: the store reads only the tail past ``floor``, not the whole log.
+        filtered = entry.orchestrator.store.events(session_id, after_seq=floor)[:bound]
+    except ManagerLoopError as exc:
+        return _error(exc)
     partial = entry.orchestrator.partial
     mine = partial if partial and partial.get("session_id") == session_id else None
     return {"ok": True, "events": filtered, "partial": mine}

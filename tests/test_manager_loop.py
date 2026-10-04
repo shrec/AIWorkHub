@@ -612,6 +612,43 @@ def test_the_log_is_appended_between_compactions(tmp_path: Path, monkeypatch) ->
     assert [json.loads(line)["seq"] for line in log.read_text(encoding="utf-8").splitlines()] == [5, 6, 7, 8]
 
 
+def test_the_log_is_compacted_by_bytes_as_well_as_by_count(tmp_path: Path) -> None:
+    # NF-2026-01233: a few large lines outgrow the byte budget long before max_events.
+    store = ml.SessionStore(tmp_path, REPO_ID, max_events=500, max_bytes=8 * 1024)
+    log = tmp_path / "events" / "session-0001.jsonl"
+
+    for index in range(40):
+        store.append_event("session-0001", {"type": "assistant_text", "payload": {"text": f"{index}:" + "x" * 900}})
+        assert log.stat().st_size <= store.max_bytes
+
+    seqs = [event["seq"] for event in store.events("session-0001")]
+    assert seqs[-1] == 40 and seqs == list(range(seqs[0], 41)) and len(seqs) >= 4
+
+
+def test_events_after_seq_reads_only_the_tail_of_the_log(tmp_path: Path, monkeypatch) -> None:
+    # NF-2026-01233: a poll for the newest events never parses the whole log.
+    store = ml.SessionStore(tmp_path, REPO_ID)
+    for index in range(300):
+        store.append_event("session-0001", {"type": "assistant_text", "payload": {"text": str(index)}})
+    monkeypatch.setattr(ml, "_TAIL_READ_BYTES", 1024)
+    parsed: list[int] = []
+    real_parsed = ml._parsed
+
+    def counting(lines: Any) -> list[dict[str, Any]]:
+        lines = list(lines)
+        parsed.append(len(lines))
+        return real_parsed(lines)
+
+    monkeypatch.setattr(ml, "_parsed", counting)
+
+    newer = store.events("session-0001", after_seq=295)
+
+    assert [event["seq"] for event in newer] == [296, 297, 298, 299, 300]
+    assert sum(parsed) < 30
+    assert [event["seq"] for event in store.events("session-0001")] == list(range(1, 301))
+    assert store.events("session-0001", after_seq=300) == []
+
+
 def test_a_torn_tail_line_is_skipped_and_seq_keeps_increasing(tmp_path: Path) -> None:
     store = ml.SessionStore(tmp_path, REPO_ID)
     for index in range(2):
