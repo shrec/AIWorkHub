@@ -1940,7 +1940,9 @@ def aiworkhub_manager_loop_events(
 ) -> dict[str, Any]:
     """MANAGER READ: bounded session events, for incremental client polling.
 
-    Events with seq greater than after_seq, bounded to limit.
+    Events with seq greater than after_seq, bounded to limit, and ``partial``:
+    the running turn's streamed, unfinished text for this session, or null.
+    The partial is display only; it is never persisted or sent to a model.
     """
 
     root, refusal = _manager_loop_repo_root()
