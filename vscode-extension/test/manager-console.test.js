@@ -264,10 +264,14 @@ test("scrolled-up rendering retains position and bottom rendering follows", () =
   assert.equal(elements.managerChatLatest.hidden, true);
 });
 
-test("partial rejects a final assistant message and an older session or turn", () => {
+test("partial outlives a mid-turn assistant message and rejects a finished turn and an older session or turn", () => {
   const { api, state } = load([{ seq: 1, turn: 3, type: "user_message", payload: { text: "go" } }]);
   assert.equal(api.managerConsolePartialNodes({ session_id: "mls-old", turn: 3, text: "old" }).length, 0);
   assert.equal(api.managerConsolePartialNodes({ turn: 2, text: "old" }).length, 0);
+  // NF-2026-01230: the server settles the streamed text before it logs assistant_text, so
+  // the partial that follows is the turn's next message, not a stale copy of this one.
   state.managerChatEvents.push({ seq: 2, turn: 3, type: "assistant_text", payload: { text: "final" } });
+  assert.ok(api.managerConsolePartialNodes({ turn: 3, text: "next" }).length > 0);
+  state.managerChatEvents.push({ seq: 3, turn: 3, type: "turn_end", payload: {} });
   assert.equal(api.managerConsolePartialNodes({ turn: 3, text: "stale" }).length, 0);
 });
