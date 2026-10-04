@@ -62,15 +62,12 @@ MANAGER_CHAT_SEAT_CLOCK_SKEW = timedelta(minutes=5)
 # seed wakes the manager anyway, so a dead or held chain cannot strand the card.
 DEFERRED_REVIEW_WAKE_GRACE = timedelta(minutes=30)
 _MANAGER_CHAT_ACTIVITY_FIELDS = ("last_turn_at", "updated_at", "created_at")
-# ``manager_loop.SessionStore.append_event`` logs each event as one ASCII-escaped JSON line:
-# an envelope of about 100 bytes around a payload whose bounded fields are cut on their own
-# (``manager_loop.FIELD_BOUNDS``, the largest at 64 KiB) while the rest stays within
-# ``manager_loop.MAX_EVENT_PAYLOAD_BYTES``. Escaping writes a non-ASCII character as
-# ``\uXXXX``, 6 bytes for a 2-byte character and 12 for a 4-byte one, and a control
-# character as 6 bytes for its one, so a field grows to at most 6x its own size: 384 KiB
-# for the largest, and this tail holds that line whole. That writer is not in this module, so
-# ``test_manager_chat_event_tail_holds_the_longest_line_the_writer_can_log`` pins the
-# bound: it fails once a field bound is raised until 6x of it no longer fits here.
+# ``manager_loop.SessionStore.append_event`` logs each event as one ASCII-escaped JSON line
+# and keeps it at or below ``manager_loop.MAX_EVENT_LINE_BYTES`` (this tail minus one):
+# escaping can grow a field up to 6x, so a line that would pass the cap has every field bound
+# halved until it fits (NF-2026-01233). A tail of this size therefore always holds the newest
+# line whole. That writer is not in this module, so
+# ``test_manager_chat_event_tail_holds_the_longest_line_the_writer_can_log`` pins the bound.
 _MANAGER_CHAT_EVENT_TAIL_BYTES = 512 * 1024
 
 CALLBACK_OUTBOX_STATES: tuple[str, ...] = (
