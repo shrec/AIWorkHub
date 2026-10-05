@@ -8045,6 +8045,7 @@ def _finalize_retry_manager(tmp_path: Path, *, retained_delta: bool = False):
     return manager, request_id, metadata_path, status_path
 
 
+@_requires_anchored_reads
 def test_process_manager_worker_failed_retains_scoped_delta_without_outputs(
     monkeypatch, tmp_path
 ):
@@ -8096,6 +8097,7 @@ def test_process_manager_worker_failed_retains_scoped_delta_without_outputs(
     assert captured["rework_delta"]["sealed"] is True
 
 
+@_requires_anchored_reads
 def test_process_manager_enforced_timeout_retains_delta_not_candidate_failure(
     monkeypatch, tmp_path
 ):
