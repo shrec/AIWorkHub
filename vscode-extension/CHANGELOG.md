@@ -1,5 +1,21 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.28 — 2026-10-05
+
+### Fixed
+
+- Manager Chat: Enter sends; a send during a running turn is queued ahead of the next callback; the panel follows a session rotation and the Thinking timer no longer runs on; a refused send restores the text.
+- Manager Chat shows Claude's thinking; event log bounded by bytes with tail reads (NF-2026-01233); one provider error per failed turn (NF-2026-01232); first Send binds the persisted conversation (NF-2026-00989); measured-fill rotation (NF-2026-01238); partial survives a mid-turn message (NF-2026-01230).
+- A Claude manager behind the `py` launcher verifies (NF-2026-01005); callback wakes no longer multiply and move to the verified manager (NF-2026-00843, NF-2026-00972, NF-2026-01095).
+
+### Added
+
+- Manager Chat image attachments by paste, drop or Attach (up to 4 images, 5 MiB each).
+
+### Qualification
+
+- Independent component regressions pass; installation, activation and live qualification are separate evidence.
+
 ## 0.12.27 — 2026-10-05
 
 ### Fixed

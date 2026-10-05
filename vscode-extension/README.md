@@ -14,6 +14,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.28
+
+- Manager Chat: Enter sends (Shift+Enter keeps a newline); a message sent while a callback or other turn runs is queued and goes before the next callback wake instead of being refused; the panel follows a server-side session rotation instead of sticking on "Session closed" with an ever-growing Thinking timer; a refused send gives the text back.
+- Manager Chat shows Claude's thinking (`--thinking-display summarized`) and takes up to 4 PNG/JPEG/GIF/WebP images per message by paste, drop or Attach (Claude reads them by path, Codex gets `--image=`).
+- A Claude manager started through the Windows `py` launcher verifies as the manager again (NF-2026-01005); pending callbacks no longer multiply per route, and a verified manager adopts wakes queued for the previous provider (NF-2026-00843, NF-2026-00972).
+- Component regressions pass; installation and live manager replay are separate evidence.
+
 ## What's new in 0.12.27
 
 - Unblocks retained-candidate finalization on other repositories: `agent_retry_finalization` re-mints a toolchain receipt that only drifted (card identity, PATH, registry) and still refuses a forged one (NF-2026-01349); `scope_rejection_resolved` recovers a scope-rejected card that retention later blocked as `finalize_failed` (NF-2026-01350).

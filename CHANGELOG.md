@@ -6,6 +6,25 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.28] - 2026-10-05
+
+### Fixed
+
+- Manager Chat event log is bounded by bytes and polls read only its tail (NF-2026-01233, NF-2026-01244); a failed CLI turn is one error with the provider's own text (NF-2026-01232); a first Send binds the persisted conversation (NF-2026-00989); rotation uses the provider's measured context fill (NF-2026-01238); a streamed partial survives a mid-turn assistant message (NF-2026-01230).
+- Manager Chat panel: Enter sends, Shift+Enter keeps a newline; a server-side rotation is followed (a `session_close` and a periodic poll pull status); the Thinking timer belongs to one session and turn; a refused send reverts Running and restores the text.
+- `aiworkhub_manager_loop_send` queues an owner message behind a running turn (bounded, in memory, ahead of the next callback wake) and `aiworkhub_manager_loop_status` returns `send_queue`.
+- Claude manager turns request summarized thinking, so reasoning reaches the panel.
+- `_claude_windows_manager_identity` counts `py.exe`/`pyw.exe` as a re-exec hop (same-user SID per hop, hop limit unchanged) (NF-2026-01005); a system quality reviewer inherits its target's callback route and a reviewer-create failure releases the deferred review wake (NF-2026-01095).
+- Callback outbox: seeding looks up the provider a row is stored under, a rebind supersedes duplicate wakes on one route, a verified manager bootstrap adopts other providers' pending wakes, the Claude lane refusal names the owning route, and `callback_outbox_stats` reports `pending_by_provider` (NF-2026-00843, NF-2026-00972).
+
+### Added
+
+- Manager Chat image attachments: up to 4 PNG/JPEG/GIF/WebP images of at most 5 MiB per message, checked by magic bytes and stored once by content hash under the session store; only paths reach the backend and the log records only the count.
+
+### Qualification
+
+- Each fix has regressions that fail before and pass after; the touched suites pass. Installation and live manager replay are separate checks.
+
 ## [0.12.27] - 2026-10-05
 
 ### Fixed
