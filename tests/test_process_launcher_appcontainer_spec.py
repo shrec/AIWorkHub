@@ -17,6 +17,7 @@ import aiworkhub.process_launcher as process_launcher
 import aiworkhub.process_launcher_launch_isolated as module
 import aiworkhub.repository_state as repository_state
 import aiworkhub.windows_appcontainer as windows_appcontainer
+import aiworkhub.windows_build_env as windows_build_env
 import aiworkhub.worker_supervisor as worker_supervisor
 import aiworkhub.worker_workspace as worker_workspace
 import aiworkhub.worker_workspace_appcontainer_node as worker_workspace_appcontainer_node
@@ -1994,9 +1995,28 @@ def _host_diff_check(workspace, git):
     )
 
 
+def _require_host_owned_tmp(tmp_path: Path) -> None:
+    """Skip when the lane running this test can itself write ``tmp_path``.
+
+    Inside the windows_appcontainer validation lane ``tmp_path`` lives in that
+    lane's own granted temp, so ``appcontainer_writers`` names the validation
+    container's SID and ``_run_host_readonly_git`` refuses with
+    ``host_git_worktree_still_container_writable`` before it reaches whatever
+    the case is about.  That refusal is the production contract holding, not a
+    defect -- but the case needs a worktree only the host can write, so it has
+    nothing to prove here.  On a host-owned temp no writer is named and every
+    one of these runs exactly as before.
+    """
+    if windows_appcontainer.appcontainer_writers(str(tmp_path)):
+        pytest.skip(
+            "tmp_path is writable by this lane's own AppContainer SID; host-only test"
+        )
+
+
 def test_host_git_checks_the_candidate_with_attributes_from_head(tmp_path) -> None:
     """A candidate ``.gitattributes`` cannot switch the whitespace check off --
     plain ``git diff --check`` would honour it and pass."""
+    _require_host_owned_tmp(tmp_path)
     workspace, git = _linked_worktree(tmp_path)
     assert _host_diff_check(workspace, git).returncode == 0
 
@@ -2016,6 +2036,7 @@ def test_host_git_executes_nothing_the_candidate_configured(tmp_path, monkeypatc
     """The candidate can write its HOME and its worktree, never the canonical
     .git.  Config in HOME (global) and attributes in the worktree name drivers,
     an external diff and an fsmonitor hook; none of them may run on the host."""
+    _require_host_owned_tmp(tmp_path)
     workspace, git = _linked_worktree(tmp_path)
     sentinel = tmp_path / "executed"
     probe = tmp_path / "probe.py"
@@ -2054,6 +2075,7 @@ def test_host_git_executes_nothing_the_candidate_configured(tmp_path, monkeypatc
 def test_host_git_never_follows_a_rewritten_git_pointer(tmp_path, monkeypatch) -> None:
     """The worktree's .git file is candidate-writable: pointing it at a git dir
     the candidate built (with its own config) is refused before git starts."""
+    _require_host_owned_tmp(tmp_path)
     workspace, git = _linked_worktree(tmp_path)
     evil = tmp_path / "evil_gitdir"
     evil.mkdir()
@@ -2075,6 +2097,7 @@ def test_host_git_never_follows_a_rewritten_git_pointer(tmp_path, monkeypatch) -
 def test_host_git_runs_from_the_proven_record_with_only_canonical_config(
     tmp_path, monkeypatch
 ) -> None:
+    _require_host_owned_tmp(tmp_path)
     workspace, git = _linked_worktree(tmp_path)
     seen: dict = {}
 
@@ -2214,6 +2237,7 @@ def _leak_setup(tmp_path: Path):
 def test_host_git_refuses_a_planted_junction_and_never_runs_git(tmp_path, monkeypatch):
     """The review's reproduction, live: without the guard, the hardened
     command prints the outside file; with it, git never starts."""
+    _require_host_owned_tmp(tmp_path)
     workspace, git, outside = _leak_setup(tmp_path)
     import shutil
 
@@ -2235,6 +2259,7 @@ def test_host_git_refuses_a_planted_junction_and_never_runs_git(tmp_path, monkey
 
 @windows_only
 def test_host_git_refuses_a_nested_junction(tmp_path, monkeypatch):
+    _require_host_owned_tmp(tmp_path)
     workspace, git, outside = _leak_setup(tmp_path)
     (workspace.path / "pkg" / "deeper").mkdir()
     _junction(workspace.path / "pkg" / "deeper" / "j", outside)
@@ -2249,6 +2274,7 @@ def test_host_git_refuses_a_nested_junction(tmp_path, monkeypatch):
 @windows_only
 def test_host_git_refuses_a_junction_above_the_worktree(tmp_path, monkeypatch):
     """The worktree root itself, or anything up to the request root."""
+    _require_host_owned_tmp(tmp_path)
     workspace, git, outside = _leak_setup(tmp_path)
     started = _git_spy(monkeypatch)
     moved = tmp_path / "moved"
@@ -2263,6 +2289,7 @@ def test_host_git_refuses_a_junction_above_the_worktree(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("kind", ["directory", "file"])
 def test_host_git_refuses_a_symlink(tmp_path, monkeypatch, kind):
+    _require_host_owned_tmp(tmp_path)
     workspace, git, outside = _leak_setup(tmp_path)
     link = workspace.path / ("pkg2" if kind == "directory" else "a_link.py")
     target = outside if kind == "directory" else outside / "leak.py"
@@ -2281,6 +2308,7 @@ def test_host_git_refuses_a_symlink(tmp_path, monkeypatch, kind):
 def test_host_git_refuses_any_file_level_reparse_point(tmp_path, monkeypatch):
     """Any tag -- not only links: a file whose attributes carry the reparse bit
     (fake Win32 lstat, so it is deterministic on every platform)."""
+    _require_host_owned_tmp(tmp_path)
     workspace, git, _outside = _leak_setup(tmp_path)
     tagged = workspace.path / "pkg" / "leak.py"
     real_lstat = os.lstat
@@ -2303,6 +2331,7 @@ def test_host_git_refuses_any_file_level_reparse_point(tmp_path, monkeypatch):
 
 
 def test_host_git_refuses_a_hard_linked_file(tmp_path, monkeypatch):
+    _require_host_owned_tmp(tmp_path)
     workspace, git, outside = _leak_setup(tmp_path)
     (workspace.path / "pkg" / "leak.py").unlink()
     os.link(outside / "leak.py", workspace.path / "pkg" / "leak.py")
@@ -2316,6 +2345,7 @@ def test_host_git_refuses_a_hard_linked_file(tmp_path, monkeypatch):
 
 
 def test_host_git_still_runs_on_a_clean_worktree(tmp_path, monkeypatch):
+    _require_host_owned_tmp(tmp_path)
     workspace, git, _outside = _leak_setup(tmp_path)
     started = _git_spy(monkeypatch)
 
@@ -2326,6 +2356,7 @@ def test_host_git_still_runs_on_a_clean_worktree(tmp_path, monkeypatch):
 
 
 def test_host_git_fails_closed_past_the_walk_bound(tmp_path, monkeypatch):
+    _require_host_owned_tmp(tmp_path)
     workspace, git, _outside = _leak_setup(tmp_path)
     monkeypatch.setattr(worker_workspace, "_HOST_GIT_WALK_LIMIT", 2)
     started = _git_spy(monkeypatch)
@@ -2952,6 +2983,11 @@ def _run_dotnet_lane_validation(
     launches: list[_FakeValidationLaunch] = []
     prerestores: list[tuple[list[str], dict]] = []
     _stub_repo_id(monkeypatch)
+    # NF-2026-01337's overlay applies to every container command, so on a host
+    # that really has Visual Studio it would also land here.  Neutralised: what
+    # these cases own is the dotnet lane's own argv and env, byte for byte, and
+    # the build overlay is pinned by the cases at the end of this file.
+    monkeypatch.setattr(windows_build_env, "build_tool_env", lambda _env, **_k: {})
     monkeypatch.setattr(windows_appcontainer, "native_handle", lambda fd: fd)
     _install_fake_launch(
         monkeypatch,
@@ -3090,3 +3126,192 @@ def test_appcontainer_validation_reports_a_blocked_dotnet_prerestore(
     assert str(caught.value) == (
         "validation_executable_unavailable:dotnet_prerestore:no_canonical_project"
     )
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-01337 / EntryLink NF-44: the Windows build environment reaches the
+# container and the worker, and no other backend
+# ---------------------------------------------------------------------------
+
+_BUILD_OVERLAY = {"INCLUDE": r"C:\kit\include", "CMAKE_GENERATOR": "NMake Makefiles"}
+
+
+def _fake_build_overlay(asked: list[bool]):
+    """A ``build_tool_env`` stand-in recording the ``appcontainer`` it was asked.
+
+    The derivation itself is pinned in tests/test_windows_build_env.py against a
+    faked installation; what these cases own is whether the lane applies it, to
+    which commands, and with which flag.
+    """
+
+    def _overlay(_env, *, appcontainer):
+        asked.append(appcontainer)
+        return dict(_BUILD_OVERLAY)
+
+    return _overlay
+
+
+def test_worker_launch_env_adds_the_build_overlay_for_one_backend_only(
+    monkeypatch, tmp_path
+) -> None:
+    """NF-2026-01337: the worker inherited VS Code's stale PATH and no INCLUDE.
+
+    Every other backend's environment must stay byte-identical to before, so an
+    overlay is not merely absent from it -- it is never even derived.
+    """
+    asked: list[bool] = []
+    monkeypatch.setattr(process_launcher, "sanitized_env", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        process_launcher,
+        "worker_temp_environment",
+        lambda *_a, **_k: dict.fromkeys(
+            ("TMPDIR", "TMP", "TEMP"), str(tmp_path / "repo-temp")
+        ),
+    )
+    monkeypatch.setattr(
+        process_launcher, "worker_validation_affordance_env", lambda *_a, **_k: {}
+    )
+    monkeypatch.setattr(process_launcher, "build_tool_env", _fake_build_overlay(asked))
+
+    def _launch_env(backend, home):
+        return process_launcher.worker_launch_env(
+            "claude_cli",
+            repo=tmp_path / "repo",
+            request_id="request-1",
+            home=home,
+            sandbox_backend=backend,
+        )
+
+    contained = _launch_env("windows_appcontainer", tmp_path / "contained-home")
+    assert contained["INCLUDE"] == r"C:\kit\include"
+    assert contained["CMAKE_GENERATOR"] == "NMake Makefiles"
+    assert asked == [True]
+
+    for backend in ("bubblewrap", "landlock", "vscode_lm_in_process", None):
+        plain = _launch_env(backend, tmp_path / "plain-home")
+        assert "INCLUDE" not in plain, backend
+        assert "CMAKE_GENERATOR" not in plain, backend
+    assert asked == [True], "no other backend may even derive an overlay"
+
+
+@pytest.mark.parametrize("python_script", [False, True], ids=["cargo", "python"])
+def test_appcontainer_validation_carries_the_build_overlay_for_every_command(
+    tmp_path: Path, monkeypatch, python_script
+) -> None:
+    """EntryLink 006a validates through a python script that itself spawns cmake.
+
+    Gating the overlay on ``argv[0]`` would therefore never fire for the case
+    that needs it, so the lane applies it to every command on Windows.
+    """
+    launches: list[_FakeValidationLaunch] = []
+    asked: list[bool] = []
+    _stub_repo_id(monkeypatch)
+    monkeypatch.setattr(windows_appcontainer, "native_handle", lambda fd: fd)
+    _install_fake_launch(
+        monkeypatch,
+        stdout=b"",
+        stderr=b"",
+        outcome=windows_appcontainer.AppContainerLifecycleResult(
+            windows_appcontainer.AppContainerLifecycleState.EXITED, exit_code=0
+        ),
+        sink=launches,
+    )
+    monkeypatch.setattr(worker_workspace, "is_windows", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        windows_build_env, "build_tool_env", _fake_build_overlay(asked)
+    )
+    request_dir = _sandbox_request_dir(tmp_path)
+    request_dir.mkdir(parents=True, exist_ok=True)
+    worktree, home, scratch = (request_dir / n for n in ("wt", "home", "scratch"))
+    argv = ["cargo", "test"]
+    if python_script:
+        base = tmp_path / "Python312"
+        base.mkdir()
+        venv = tmp_path / ".venv"
+        (venv / "Scripts").mkdir(parents=True)
+        (venv / "Lib" / "site-packages").mkdir(parents=True)
+        interpreter = venv / "Scripts" / "python.exe"
+        interpreter.write_bytes(b"MZ")
+        (venv / "pyvenv.cfg").write_text(f"home = {base}\n", encoding="utf-8")
+        argv = [str(interpreter), "validate_entrylink_006a.py"]
+    declared = {"HOME": str(home), "TEMP": str(scratch), "PATH": "x"}
+
+    worker_workspace._run_appcontainer_validation(
+        argv,
+        workspace=SimpleNamespace(repo=tmp_path, path=worktree, home=home),
+        adapter_id="claude_cli",
+        cwd=worktree,
+        env=declared,
+        timeout_seconds=30,
+    )
+
+    environment = launches[0].request.environment
+    assert environment["INCLUDE"] == r"C:\kit\include"
+    assert environment["CMAKE_GENERATOR"] == "NMake Makefiles"
+    assert environment["PATH"] == "x"
+    assert asked == [True]
+    # The caller's own mapping is read, never rewritten underneath it.
+    assert declared == {"HOME": str(home), "TEMP": str(scratch), "PATH": "x"}
+
+
+def _appcontainer_exit(returncode: int, stderr: str):
+    """A container stand-in answering exactly one CompletedProcess."""
+
+    def _run(argv, **_kwargs):
+        return subprocess.CompletedProcess(list(argv), returncode, "", stderr)
+
+    return _run
+
+
+def test_a_ninja_pipe_denial_terminates_as_unsupported_in_this_sandbox(
+    tmp_path, monkeypatch
+) -> None:
+    """NF-2026-01337: ninja creates a global pipe an AppContainer may not.
+
+    Structural, so no build step ran and no candidate code was judged. It has
+    to leave as an environment restriction, never as a failing gate.
+    """
+    git = str(tmp_path / "bin" / "git.exe")
+    workspace, _container = _routing_stubs(monkeypatch, tmp_path, git)
+    monkeypatch.setattr(
+        worker_workspace,
+        "_run_appcontainer_validation",
+        _appcontainer_exit(1, "ninja: fatal: CreateNamedPipe: Access is denied\n"),
+    )
+
+    with pytest.raises(worker_workspace.WorkspaceError) as excinfo:
+        worker_workspace.run_validations(
+            workspace,
+            ["cmake --build build"],
+            backend="windows_appcontainer",
+            adapter_id="claude_cli",
+        )
+
+    assert str(excinfo.value) == (
+        f"{worker_workspace.VALIDATION_UNSUPPORTED_IN_SANDBOX}"
+        ":ninja_named_pipe_denied:cmake --build build"
+    )
+
+
+def test_a_plain_container_failure_is_still_the_candidates_failing_gate(
+    tmp_path, monkeypatch
+) -> None:
+    """The detector must not turn every non-zero container exit into a block."""
+    git = str(tmp_path / "bin" / "git.exe")
+    workspace, _container = _routing_stubs(monkeypatch, tmp_path, git)
+    monkeypatch.setattr(
+        worker_workspace,
+        "_run_appcontainer_validation",
+        _appcontainer_exit(1, "ninja: build stopped: subcommand failed.\n"),
+    )
+
+    with pytest.raises(worker_workspace.ValidationRunError) as excinfo:
+        worker_workspace.run_validations(
+            workspace,
+            ["cmake --build build"],
+            backend="windows_appcontainer",
+            adapter_id="claude_cli",
+        )
+
+    assert str(excinfo.value).startswith("validation_failed:cmake --build build")
+    assert worker_workspace.VALIDATION_UNSUPPORTED_IN_SANDBOX not in str(excinfo.value)

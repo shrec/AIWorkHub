@@ -157,6 +157,7 @@ from . import task_fsm
 from . import task_store
 from . import task_templates
 from . import toolchain_authority as _toolchain_authority
+from .windows_build_env import build_tool_env
 try:
     from . import project_context
 except ImportError:
@@ -606,6 +607,12 @@ def worker_launch_env(
             sandbox_backend=sandbox_backend,
         )
     )
+    if sandbox_backend == "windows_appcontainer":
+        # NF-2026-01337: this worker inherits VS Code's stale PATH and no
+        # INCLUDE/LIB/LIBPATH, so user-profile tools are invisible (WinError 5)
+        # and no C/C++ build runs.  Overlay only, appended only, and only for
+        # this backend -- every other backend's environment is byte-identical.
+        env.update(build_tool_env(env, appcontainer=True))
     return env
 
 

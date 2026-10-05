@@ -13150,6 +13150,11 @@ def _run_appcontainer_validation(
         effective_argv, env = _appcontainer_dotnet_validation_command(
             effective_argv, workspace=workspace, cwd=cwd, env=env
         )
+    from .windows_build_env import build_tool_env
+    if is_windows():
+        # NF-2026-01337: every command, python scripts included -- EntryLink
+        # 006a spawns cmake from one, so gating on argv[0] never fires.
+        env = {**env, **build_tool_env(env, appcontainer=True)}
     launch_argv = effective_argv
     if (
         env.get("TMPDIR")
@@ -13786,6 +13791,14 @@ def run_validations(
                         env=env,
                         timeout_seconds=bounded_timeout,
                     )
+                    from .windows_build_env import ninja_pipe_denied
+                    if result.returncode != 0 and ninja_pipe_denied(result.stdout, result.stderr):
+                        # NF-2026-01337: the global \\.\pipe\ninja_pid* an
+                        # AppContainer may never create -- no build step ran,
+                        # so this is an environment restriction, not a gate.
+                        raise _validation_unsupported_in_sandbox_error(
+                            f"ninja_named_pipe_denied:{command}"
+                        )
                 else:
                     result = subprocess.run(
                         wrapped,
