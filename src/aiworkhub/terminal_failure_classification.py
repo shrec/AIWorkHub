@@ -500,6 +500,10 @@ _CONTROL_PLANE_REASONS: tuple[str, ...] = (
     "validation_toolchain_authority_executable_identity_drift",
     "validation_toolchain_authority_executable_missing",
     "validation_toolchain_authority_executable_unreceipted",
+    # ``process_launcher_validation.py``'s ``validation_route_kwargs`` raises
+    # this cause when the recorded sandbox backend drifted; naming it here
+    # keeps the refusal out of ``unclassified`` (NF-2026-01346).
+    "validation_route_backend_mismatch",
     # ------------------------------------------------------------------ #
     # WRAPPERS ONLY BELOW THIS LINE -- see the ordering note above.
     #

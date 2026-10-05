@@ -843,6 +843,24 @@ def test_toolchain_receipt_refusal_is_the_finalize_failed_diagnostic(reason: str
     assert result["error"] == result["diagnostic"]
 
 
+def test_validation_route_backend_mismatch_is_the_finalize_failed_diagnostic() -> None:
+    """NF-2026-01346: ``process_launcher_validation.validation_route_kwargs``
+    refuses on backend drift with this cause; the terminal event names the
+    refusal instead of ``unclassified`` and never copies the caller's tail.
+    """
+    result = terminal_event_authority(
+        state="finalize_failed",
+        exit_code=0,
+        error="validation_route_backend_mismatch:expected=landlock:recorded=bwrap",
+    )
+    assert result["diagnostic"] == (
+        "finalize_failed:validation_route_backend_mismatch:exit_code=0"
+    )
+    assert result["error"] == result["diagnostic"]
+    assert "landlock" not in result["diagnostic"]
+    assert "bwrap" not in result["diagnostic"]
+
+
 # --------------------------------------------------------------------------- #
 # Fail-closed: everything that is NOT a recognised control-plane reason is
 # sanitised exactly as it was before.
