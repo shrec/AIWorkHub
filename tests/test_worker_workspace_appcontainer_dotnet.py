@@ -18,8 +18,10 @@ from types import SimpleNamespace
 import pytest
 
 from aiworkhub import worker_workspace_appcontainer_dotnet as dotnet_lane
+from aiworkhub import worker_workspace_appcontainer_dotnet_restore as dotnet_restore
 
 _ARTIFACTS = r"C:\req\home\dotnet-artifacts"
+_SEED_DIR = "dotnet-prerestore-seed"
 _SWITCHES = {
     "DOTNET_NOLOGO": "1",
     "DOTNET_SKIP_FIRST_TIME_EXPERIENCE": "1",
@@ -27,6 +29,14 @@ _SWITCHES = {
     "MSBUILDDISABLENODEREUSE": "1",
     "DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER": "1",
 }
+# The candidate project every candidate-only case below is seeded from: one
+# literal PackageReference and one literal TargetFramework, nothing else.
+_EDGE_CSPROJ = (
+    '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup>'
+    "<TargetFramework>net8.0</TargetFramework></PropertyGroup>"
+    '<ItemGroup><PackageReference Include="Serilog" Version="3.1.1" /></ItemGroup>'
+    "</Project>"
+)
 
 
 def _workspace(tmp_path: Path):
@@ -311,6 +321,12 @@ def test_prerestore_does_not_run_when_packages_are_not_needed(
 
 
 def test_prerestore_never_evaluates_the_candidate_tree(tmp_path, monkeypatch):
+    """An absolute candidate project is read as XML data, never restored.
+
+    It declares no ``PackageReference``, so there is nothing to seed and no
+    host restore runs at all -- and in particular the candidate file itself is
+    never handed to the host CLI, which would run its project targets.
+    """
     workspace = _workspace(tmp_path)
     (workspace.path / "app.csproj").write_text("<Project />", encoding="utf-8")
     runs = []
@@ -324,7 +340,7 @@ def test_prerestore_never_evaluates_the_candidate_tree(tmp_path, monkeypatch):
         dotnet_lane._appcontainer_dotnet_prerestore(
             argv, workspace, workspace.path, workspace.home
         )
-        == "no_canonical_project"
+        is None
     )
     assert runs == []
 
@@ -362,3 +378,632 @@ def test_lane_command_rewrites_dotnet_and_types_a_blocked_restore(tmp_path, monk
     assert str(caught.value) == (
         "validation_executable_unavailable:dotnet_prerestore:no_canonical_project"
     )
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-01366 follow-up: the three measured pre-restore causes
+# ---------------------------------------------------------------------------
+
+
+def _write(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_slnx_is_recognised_wherever_a_project_suffix_is(tmp_path: Path):
+    """Cause 1, at the vocabulary: ``.slnx`` is a project suffix like ``.sln``."""
+    assert ".slnx" in dotnet_lane._DOTNET_PROJECT_SUFFIXES
+    directory = _write(tmp_path / "s" / "EntryLink.Edge.slnx", "<Solution />").parent
+    assert dotnet_lane._canonical_project_in(directory)
+
+
+def test_prerestore_restores_a_canonical_slnx_argument(tmp_path, monkeypatch):
+    """Cause 1: a ``.slnx`` the canonical tree carries reaches the host restore."""
+    workspace = _workspace(tmp_path)
+    _write(
+        workspace.repo / "EntryLink.Edge.slnx",
+        '<Solution><Project Path="apps/edge/Edge.csproj" /></Solution>',
+    )
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "EntryLink.Edge.slnx"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        is None
+    )
+
+    assert Path(runs[0][0][2]) == workspace.repo / "EntryLink.Edge.slnx"
+
+
+def test_a_named_target_never_restores_a_different_solution_in_the_cwd(
+    tmp_path, monkeypatch
+):
+    """Cause 2: the cwd fallback must never substitute ``EntryLink.sln``."""
+    workspace = _workspace(tmp_path)
+    _write(workspace.repo / "EntryLink.sln", "Microsoft Visual Studio Solution File")
+    _write(
+        workspace.path / "EntryLink.Edge.slnx",
+        '<Solution><Project Path="apps/edge/Edge.csproj" /></Solution>',
+    )
+    _write(workspace.path / "apps" / "edge" / "Edge.csproj", _EDGE_CSPROJ)
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "EntryLink.Edge.slnx"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        is None
+    )
+
+    command = runs[0][0]
+    assert not any("EntryLink.sln" in token for token in command)
+    assert Path(command[2]).parent == workspace.home / _SEED_DIR
+
+
+def test_a_candidate_only_project_is_seeded_from_xml_data_only(tmp_path, monkeypatch):
+    """Cause 3: the host restore only ever sees the AIWorkHub-authored file."""
+    workspace = _workspace(tmp_path)
+    _write(workspace.path / "apps" / "edge" / "Edge.csproj", _EDGE_CSPROJ)
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "apps/edge/Edge.csproj"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        is None
+    )
+
+    command, kwargs = runs[0]
+    worktree = str(workspace.path)
+    assert all(worktree not in token for token in command)
+    assert worktree not in str(kwargs["cwd"])
+    assert command[1] == "restore"
+    forbidden = ("build", "test", "msbuild", "publish")
+    assert not any(token in forbidden for token in command)
+    seed = Path(command[2])
+    assert seed.parent == workspace.home / _SEED_DIR
+    generated = seed.read_text(encoding="utf-8")
+    assert 'Include="Serilog" Version="3.1.1"' in generated
+    assert "net8.0" in generated
+    assert "Edge.csproj" not in generated
+
+
+def test_the_candidate_closure_follows_references_and_central_versions(
+    tmp_path, monkeypatch
+):
+    """A ``.slnx`` closure, a ProjectReference and central package versions."""
+    workspace = _workspace(tmp_path)
+    _write(
+        workspace.path / "EntryLink.Edge.slnx",
+        '<Solution><Folder Name="/apps/">'
+        '<Project Path="apps\\edge\\Edge.csproj" /></Folder></Solution>',
+    )
+    _write(
+        workspace.path / "apps" / "edge" / "Edge.csproj",
+        '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup>'
+        "<TargetFrameworks>net8.0;net9.0</TargetFrameworks></PropertyGroup>"
+        '<ItemGroup><PackageReference Include="Serilog" />'
+        '<ProjectReference Include="..\\..\\libs\\Core\\Core.csproj" />'
+        "</ItemGroup></Project>",
+    )
+    _write(
+        workspace.path / "libs" / "Core" / "Core.csproj",
+        '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup>'
+        "<TargetFramework>net8.0</TargetFramework></PropertyGroup>"
+        '<ItemGroup><PackageReference Include="Polly" /></ItemGroup></Project>',
+    )
+    _write(
+        workspace.path / "Directory.Packages.props",
+        "<Project><ItemGroup>"
+        '<PackageVersion Include="Serilog" Version="3.1.1" />'
+        '<PackageVersion Include="Polly" Version="8.4.2" />'
+        "</ItemGroup></Project>",
+    )
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "EntryLink.Edge.slnx"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        is None
+    )
+
+    generated = Path(runs[0][0][2]).read_text(encoding="utf-8")
+    assert 'Include="Serilog" Version="3.1.1"' in generated
+    assert 'Include="Polly" Version="8.4.2"' in generated
+    declared = generated.split("<TargetFrameworks>")[1].split("<")[0]
+    assert sorted(declared.split(";")) == ["net8.0", "net9.0"]
+
+
+@pytest.mark.parametrize(
+    ("project", "expected"),
+    [
+        ('<!DOCTYPE p [<!ENTITY x "y">]><Project />', "project_xml_unsafe"),
+        ("<Project><ItemGroup></Project>", "project_xml_parse_error"),
+        (
+            "<Project><PropertyGroup><TargetFramework>net8.0</TargetFramework>"
+            "</PropertyGroup><ItemGroup>"
+            '<PackageReference Include="Serilog" Version="$(SerilogVersion)" />'
+            "</ItemGroup></Project>",
+            "non_literal_package_version",
+        ),
+        (
+            "<Project><PropertyGroup><TargetFramework>$(Tfm)</TargetFramework>"
+            "</PropertyGroup><ItemGroup>"
+            '<PackageReference Include="Serilog" Version="3.1.1" />'
+            "</ItemGroup></Project>",
+            "non_literal_target_framework",
+        ),
+        (
+            "<Project><PropertyGroup><TargetFramework>net8.0</TargetFramework>"
+            "</PropertyGroup><ItemGroup>"
+            '<PackageReference Include="Serilog" /></ItemGroup></Project>',
+            "package_version_unresolved",
+        ),
+        (
+            "<Project><ItemGroup>"
+            '<PackageReference Include="Serilog" Version="3.1.1" />'
+            "</ItemGroup></Project>",
+            "target_framework_unresolved",
+        ),
+    ],
+)
+def test_each_unusable_candidate_xml_has_its_own_environment_reason(
+    tmp_path, monkeypatch, project, expected
+):
+    """Every refusal is typed and named -- never a candidate validation_failed."""
+    workspace = _workspace(tmp_path)
+    _write(workspace.path / "apps" / "edge" / "Edge.csproj", project)
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "apps/edge/Edge.csproj"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        == expected
+    )
+    assert runs == []
+
+
+def test_a_named_target_in_neither_tree_is_a_named_environment_reason(
+    tmp_path, monkeypatch
+):
+    """Cause 2 again: a missing named target blocks, it does not fall back."""
+    workspace = _workspace(tmp_path)
+    _write(workspace.repo / "EntryLink.sln", "Microsoft Visual Studio Solution File")
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "apps/edge/Edge.csproj"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        == "candidate_target_missing"
+    )
+    assert runs == []
+
+
+def test_an_oversized_candidate_project_is_refused_by_the_byte_bound(
+    tmp_path, monkeypatch
+):
+    workspace = _workspace(tmp_path)
+    padding = " " * (dotnet_restore._MAX_PROJECT_BYTES + 1)
+    _write(
+        workspace.path / "apps" / "edge" / "Edge.csproj",
+        f"<Project><!--{padding}--></Project>",
+    )
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "apps/edge/Edge.csproj"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        == "project_xml_too_large"
+    )
+    assert runs == []
+
+
+def test_a_candidate_closure_wider_than_the_file_bound_is_refused(
+    tmp_path, monkeypatch
+):
+    workspace = _workspace(tmp_path)
+    count = dotnet_restore._MAX_PROJECT_FILES + 2
+    entries = "".join(
+        f'<Project Path="p{index}/p{index}.csproj" />' for index in range(count)
+    )
+    _write(workspace.path / "Wide.slnx", f"<Solution>{entries}</Solution>")
+    for index in range(count):
+        _write(
+            workspace.path / f"p{index}" / f"p{index}.csproj",
+            '<Project Sdk="Microsoft.NET.Sdk" />',
+        )
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "Wide.slnx"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        == "project_file_limit"
+    )
+    assert runs == []
+
+
+def test_a_nonzero_synthetic_restore_is_its_own_environment_reason(
+    tmp_path, monkeypatch
+):
+    workspace = _workspace(tmp_path)
+    _write(workspace.path / "apps" / "edge" / "Edge.csproj", _EDGE_CSPROJ)
+    _install_fake_run(monkeypatch, exit_code=7)
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "apps/edge/Edge.csproj"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        == "synthetic_restore_exit_7"
+    )
+
+
+def test_the_synthetic_restore_adds_no_source_beyond_the_host_packages_folder(
+    tmp_path, monkeypatch
+):
+    workspace = _workspace(tmp_path)
+    _write(workspace.path / "apps" / "edge" / "Edge.csproj", _EDGE_CSPROJ)
+    monkeypatch.setenv("NUGET_PACKAGES", str(tmp_path / "host-packages"))
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    dotnet_lane._appcontainer_dotnet_prerestore(
+        ["dotnet", "restore", "apps/edge/Edge.csproj"],
+        workspace,
+        workspace.path,
+        workspace.home,
+    )
+
+    command = runs[0][0]
+    assert command.count("--source") == 1
+    assert command[command.index("--source") + 1] == str(tmp_path / "host-packages")
+    assert command[command.index("--packages") + 1] == str(
+        workspace.home / ".nuget" / "packages"
+    )
+
+
+def test_no_environment_decision_is_derived_from_candidate_authored_output(
+    tmp_path, monkeypatch
+):
+    """validation_runner's structural-proof rule: no NU1301 string matching."""
+    workspace = _workspace(tmp_path)
+    _write(workspace.path / "apps" / "edge" / "Edge.csproj", _EDGE_CSPROJ)
+    noisy = "error NU1301: Unable to load the service index for source"
+
+    class _Noisy:
+        TimeoutExpired = subprocess.TimeoutExpired
+
+        @staticmethod
+        def run(command, **_kwargs):
+            return subprocess.CompletedProcess(command, 0, noisy, noisy)
+
+    monkeypatch.setattr(dotnet_lane, "subprocess", _Noisy)
+    monkeypatch.setattr(
+        dotnet_lane, "shutil", SimpleNamespace(which=lambda _name: r"C:\x\dotnet.exe")
+    )
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "apps/edge/Edge.csproj"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        is None
+    )
+    for module in (dotnet_lane, dotnet_restore):
+        assert "NU1301" not in Path(module.__file__).read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Rework: a canonical-backed target still has to seed what the candidate adds,
+# and a Directory.Build.props declares for every project beneath it
+# ---------------------------------------------------------------------------
+
+
+def test_a_canonical_target_also_seeds_the_project_the_candidate_adds(
+    tmp_path, monkeypatch
+):
+    """EntryLink 003c: the ``.slnx`` is canonical, the card adds ``apps/edge``.
+
+    The canonical restore stays first and unchanged; a second host restore then
+    seeds what the candidate added, naming only the AIWorkHub-authored file.
+    """
+    workspace = _workspace(tmp_path)
+    _write(workspace.repo / "EntryLink.Edge.slnx", "<Solution />")
+    _write(
+        workspace.path / "EntryLink.Edge.slnx",
+        '<Solution><Project Path="apps/edge/Edge.csproj" /></Solution>',
+    )
+    _write(workspace.path / "apps" / "edge" / "Edge.csproj", _EDGE_CSPROJ)
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "EntryLink.Edge.slnx"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        is None
+    )
+
+    assert len(runs) == 2
+    assert Path(runs[0][0][2]) == workspace.repo / "EntryLink.Edge.slnx"
+    seed = Path(runs[1][0][2])
+    assert seed == workspace.home / _SEED_DIR / dotnet_restore.SEED_PROJECT_NAME
+    assert all(str(workspace.path) not in token for token in runs[1][0])
+    assert 'Include="Serilog" Version="3.1.1"' in seed.read_text(encoding="utf-8")
+
+
+def test_a_supplementary_seed_drops_a_non_literal_row_instead_of_refusing(
+    tmp_path, monkeypatch
+):
+    """A literal ``PackageReference`` added beside a ``$(Prop)`` one is seeded.
+
+    The canonical restore has already seeded every canonical declaration, so a
+    row this module cannot resolve without evaluating candidate MSBuild is
+    dropped rather than turned into an environment block.
+    """
+    workspace = _workspace(tmp_path)
+    _write(workspace.repo / "apps" / "edge" / "Edge.csproj", "<Project />")
+    _write(
+        workspace.path / "apps" / "edge" / "Edge.csproj",
+        '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup>'
+        "<TargetFramework>net8.0</TargetFramework></PropertyGroup><ItemGroup>"
+        '<PackageReference Include="Serilog" Version="3.1.1" />'
+        '<PackageReference Include="Polly" Version="$(PollyVersion)" />'
+        "</ItemGroup></Project>",
+    )
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "apps/edge/Edge.csproj"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        is None
+    )
+
+    assert len(runs) == 2
+    generated = Path(runs[1][0][2]).read_text(encoding="utf-8")
+    assert 'Include="Serilog" Version="3.1.1"' in generated
+    assert "Polly" not in generated
+
+
+def test_a_candidate_directory_build_props_declares_the_target_framework(
+    tmp_path, monkeypatch
+):
+    """A repository that sets ``<TargetFramework>`` once, above the project.
+
+    Reading only the project files made every new project in such a repository
+    look as though it declared no target framework at all.
+    """
+    workspace = _workspace(tmp_path)
+    _write(
+        workspace.path / "Directory.Build.props",
+        "<Project><PropertyGroup>"
+        "<TargetFramework>net9.0</TargetFramework></PropertyGroup></Project>",
+    )
+    _write(
+        workspace.path / "apps" / "edge" / "Edge.csproj",
+        '<Project Sdk="Microsoft.NET.Sdk"><ItemGroup>'
+        '<PackageReference Include="Serilog" Version="3.1.1" />'
+        "</ItemGroup></Project>",
+    )
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "apps/edge/Edge.csproj"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        is None
+    )
+
+    generated = Path(runs[0][0][2]).read_text(encoding="utf-8")
+    assert "<TargetFrameworks>net9.0</TargetFrameworks>" in generated
+
+
+def test_a_global_package_reference_is_seeded_like_any_other_row(
+    tmp_path, monkeypatch
+):
+    """A repo-wide analyzer in ``Directory.Packages.props`` is a package too."""
+    workspace = _workspace(tmp_path)
+    _write(
+        workspace.path / "Directory.Packages.props",
+        "<Project><ItemGroup>"
+        '<GlobalPackageReference Include="Roslynator.Analyzers" Version="4.12.4" />'
+        "</ItemGroup></Project>",
+    )
+    _write(workspace.path / "apps" / "edge" / "Edge.csproj", _EDGE_CSPROJ)
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "apps/edge/Edge.csproj"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        is None
+    )
+
+    generated = Path(runs[0][0][2]).read_text(encoding="utf-8")
+    assert 'Include="Roslynator.Analyzers" Version="4.12.4"' in generated
+    assert 'Include="Serilog" Version="3.1.1"' in generated
+
+
+def test_a_supplementary_seed_still_refuses_unsafe_candidate_xml(
+    tmp_path, monkeypatch
+):
+    """Dropping a row is not dropping a bound: a ``DOCTYPE`` still refuses."""
+    workspace = _workspace(tmp_path)
+    _write(workspace.repo / "apps" / "edge" / "Edge.csproj", "<Project />")
+    _write(
+        workspace.path / "apps" / "edge" / "Edge.csproj",
+        '<!DOCTYPE p [<!ENTITY x "y">]><Project />',
+    )
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "apps/edge/Edge.csproj"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        == "project_xml_unsafe"
+    )
+    assert len(runs) == 1
+
+
+# ---------------------------------------------------------------------------
+# Rework: behind a successful canonical restore, a candidate-shaped limit is
+# the container build's verdict and not a host environment block
+# ---------------------------------------------------------------------------
+
+
+_EDGE_SLNF = (
+    '{"solution": {"path": "EntryLink.sln",'
+    ' "projects": ["apps/edge/Edge.csproj"]}}'
+)
+# A classic solution row for a project the card deleted from the worktree.
+_SLN_LISTING_OLD = (
+    "Microsoft Visual Studio Solution File, Format Version 12.00\n"
+    'Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Old", '
+    '"libs\\Old.csproj", "{1E2D3C4B-5A69-4788-8899-AABBCCDDEEFF}"\n'
+    "EndProject\n"
+)
+
+
+def test_a_canonical_slnf_target_is_not_blocked_by_the_kind_gate(
+    tmp_path, monkeypatch
+):
+    """A ``.slnf`` is a project suffix the seed reads only as a target name.
+
+    The canonical filter file is restored unchanged; the supplementary seed
+    behind it has no XML shape of its own to read, and a target the canonical
+    restore already covered is nothing left to seed rather than a block on every
+    canonical ``.slnf`` validation.
+    """
+    workspace = _workspace(tmp_path)
+    _write(workspace.repo / "EntryLink.Edge.slnf", _EDGE_SLNF)
+    _write(workspace.path / "EntryLink.Edge.slnf", _EDGE_SLNF)
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "EntryLink.Edge.slnf"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        is None
+    )
+
+    assert len(runs) == 1
+    assert Path(runs[0][0][2]) == workspace.repo / "EntryLink.Edge.slnf"
+
+
+def test_a_project_the_card_deleted_does_not_block_a_canonical_solution(
+    tmp_path, monkeypatch
+):
+    """A solution row whose project the card deleted is candidate-caused.
+
+    The canonical restore has already seeded every canonical declaration, so the
+    container build is what decides a missing project -- as ``validation_failed``
+    -- instead of this seed filing it as an environment block.
+    """
+    workspace = _workspace(tmp_path)
+    _write(workspace.repo / "EntryLink.sln", _SLN_LISTING_OLD)
+    _write(workspace.repo / "libs" / "Old.csproj", "<Project />")
+    # The candidate copy still lists libs/Old.csproj; the card deleted the file.
+    _write(workspace.path / "EntryLink.sln", _SLN_LISTING_OLD)
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "EntryLink.sln"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        is None
+    )
+
+    assert len(runs) == 1
+    assert Path(runs[0][0][2]) == workspace.repo / "EntryLink.sln"
+
+
+def test_a_strict_seed_still_names_a_project_the_solution_lists_but_lacks(
+    tmp_path, monkeypatch
+):
+    """Nothing else seeds a candidate-only solution, so the row still refuses."""
+    workspace = _workspace(tmp_path)
+    _write(workspace.path / "EntryLink.sln", _SLN_LISTING_OLD)
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "EntryLink.sln"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        == "candidate_project_missing"
+    )
+    assert runs == []

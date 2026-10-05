@@ -660,6 +660,9 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "worker_workspace_appcontainer_node.py",
         # ...and its AppContainer dotnet argv rewrite (NF-2026-01366).
         "worker_workspace_appcontainer_dotnet.py",
+        # ...which imports the candidate-XML pre-restore seed from this sibling,
+        # so the declared seed closure resolves it too (NF-2026-01366 follow-up).
+        "worker_workspace_appcontainer_dotnet_restore.py",
         # ...and its AppContainer C/C++ build environment (NF-2026-01337).
         "windows_build_env.py",
     ):

@@ -11,15 +11,30 @@ MSBuild in one process and move obj/bin to a request-scoped directory,
 ``_appcontainer_dotnet_env`` points the CLI at the request home, and
 ``_appcontainer_dotnet_prerestore`` seeds that home from the host once per
 request.  The recipe measured 76/76 build and 9/9 test green.
+
+The follow-up measured the seeding itself: ``.slnx`` was not a project suffix,
+a named target the canonical tree lacked fell back to whatever solution sat in
+the working directory, and a card that adds a project or a ``PackageReference``
+could not be seeded at all.  The named target is now authoritative -- restored
+from the canonical tree, from the synthetic project
+``worker_workspace_appcontainer_dotnet_restore`` authors out of candidate XML
+data, or from both when the candidate adds to a target the canonical tree
+already carries -- and anything else is a typed environment reason.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
+
+from .worker_workspace_appcontainer_dotnet_restore import (
+    _is_within,
+    synthetic_restore_project,
+)
 
 _DOTNET_EXECUTABLE_BASENAMES = frozenset({"dotnet", "dotnet.exe"})
 _DOTNET_ADAPTED_VERBS = frozenset({"build", "test", "restore", "publish"})
@@ -44,9 +59,17 @@ _DOTNET_PROJECT_SUFFIXES = (
     ".fsproj",
     ".vbproj",
     ".sln",
+    # The XML solution format. NF-2026-01366 measured EntryLink.Edge.slnx being
+    # skipped as "not a project", which sent the pre-restore to the cwd
+    # fallback and restored a different solution entirely.
+    ".slnx",
     ".slnf",
     ".proj",
 )
+# ``/p:Name=value``, ``/t:Build``, ``/m:1``: an MSBuild switch in the Windows
+# style. A POSIX absolute path deliberately does not match, so a positional
+# project argument is recognised identically on every OS.
+_DOTNET_SWITCH_SHAPE = re.compile(r"^/[A-Za-z][A-Za-z0-9_-]*[:=]")
 _DOTNET_PRERESTORE_PREFIX = "validation_executable_unavailable:dotnet_prerestore:"
 _DOTNET_PRERESTORE_TIMEOUT_SECONDS = 600
 _DOTNET_PRERESTORE_MARKER = ".aiworkhub-dotnet-prerestore"
@@ -165,13 +188,6 @@ def _host_nuget_packages() -> str:
     return configured or str(Path.home() / ".nuget" / "packages")
 
 
-def _is_within(path: str | Path, root: str | Path) -> bool:
-    """True when ``path`` is ``root`` or below it, without resolving links."""
-    child = os.path.normcase(os.path.abspath(str(path)))
-    parent = os.path.normcase(os.path.abspath(str(root)))
-    return child == parent or child.startswith(parent + os.sep)
-
-
 def _canonical_dotnet_cwd(workspace, cwd: str | Path) -> Path:
     """Map a candidate working directory onto the canonical tree."""
     absolute = os.path.abspath(str(cwd))
@@ -180,30 +196,74 @@ def _canonical_dotnet_cwd(workspace, cwd: str | Path) -> Path:
     return Path(workspace.repo)
 
 
-def _canonical_dotnet_project(
-    argv: Sequence[str], workspace, canonical_cwd: Path
-) -> list[str]:
-    """The positional project, only when the canonical tree carries it.
+def _is_dotnet_switch(token: str) -> bool:
+    """True for a flag rather than a positional target, on either path style.
 
-    An absolute candidate path, or a relative one the canonical tree does not
-    carry, is dropped rather than evaluated: restore runs project targets.
+    ``-x``/``--x`` and the MSBuild ``/p:Name=value`` shape are switches; a
+    POSIX absolute path such as ``/repo/app.csproj`` is not, which is what lets
+    these decisions be proven on any OS.
+    """
+    return token.startswith("-") or bool(_DOTNET_SWITCH_SHAPE.match(token))
+
+
+def _dotnet_target_token(argv: Sequence[str]) -> str | None:
+    """The project or solution ``argv`` names, before any tree is consulted.
+
+    Answered from argv alone: the pre-restore has to know that a target was
+    named even when neither tree carries it, because that is exactly the case
+    in which falling back to the working directory restores the wrong thing.
     """
     for token in argv[2:]:
-        lowered = token.lower()
-        if token.startswith(("-", "/")) or not lowered.endswith(
-            _DOTNET_PROJECT_SUFFIXES
-        ):
+        if _is_dotnet_switch(token):
             continue
-        candidate = Path(token)
-        if candidate.is_absolute():
-            if _is_within(token, workspace.repo) and candidate.is_file():
-                return [str(candidate)]
-            return []
+        if token.lower().endswith(_DOTNET_PROJECT_SUFFIXES):
+            return token
+    return None
+
+
+def _canonical_dotnet_project(
+    token: str, workspace, canonical_cwd: Path
+) -> str | None:
+    """The canonical file a named target maps to, or ``None``.
+
+    SECURITY: ``dotnet restore`` runs project targets, so the answer is always
+    a file inside ``workspace.repo``.  A candidate path is mapped onto the
+    canonical tree rather than returned, and a target the canonical tree does
+    not carry is ``None`` -- never a different file that happens to be nearby.
+    """
+    candidate = Path(token)
+    if candidate.is_absolute():
+        if _is_within(candidate, workspace.repo):
+            mapped = candidate
+        elif _is_within(candidate, workspace.path):
+            mapped = Path(workspace.repo) / os.path.relpath(
+                str(candidate), str(workspace.path)
+            )
+        else:
+            return None
+    else:
         mapped = canonical_cwd / candidate
-        if _is_within(mapped, workspace.repo) and mapped.is_file():
-            return [str(mapped)]
-        return []
-    return []
+    if _is_within(mapped, workspace.repo) and mapped.is_file():
+        return str(mapped)
+    return None
+
+
+def _candidate_dotnet_project(token: str, workspace, cwd: str | Path) -> Path | None:
+    """The candidate-worktree file a named target resolves to, or ``None``.
+
+    Only this file's XML is ever read:
+    ``worker_workspace_appcontainer_dotnet_restore`` turns that data into an
+    AIWorkHub-authored project, and the candidate file itself never reaches the
+    host CLI.
+    """
+    candidate = Path(token)
+    if candidate.is_absolute():
+        mapped = candidate
+    else:
+        mapped = Path(os.path.abspath(str(cwd))) / candidate
+    if not _is_within(mapped, workspace.path):
+        return None
+    return Path(os.path.abspath(str(mapped)))
 
 
 def _canonical_project_in(canonical_cwd: Path) -> bool:
@@ -219,6 +279,45 @@ def _canonical_project_in(canonical_cwd: Path) -> bool:
         return False
 
 
+def _dotnet_restore_one(
+    argv: Sequence[str],
+    project: Sequence[str],
+    restore_cwd: str | Path,
+    packages: Path,
+    home: str | Path,
+) -> int:
+    """Run the one offline host restore shape, and return its exit code.
+
+    Both seeds -- the canonical tree and an AIWorkHub-authored synthetic
+    project -- go through exactly this command, so the single local source, the
+    package destination and the request-scoped artifacts directory cannot drift
+    apart between them.
+    """
+    command = [
+        _resolved_dotnet_executable(str(argv[0])),
+        "restore",
+        *project,
+        "--packages",
+        str(packages),
+        "--source",
+        _host_nuget_packages(),
+        "-p:NuGetAudit=false",
+        "-nodeReuse:false",
+        "--artifacts-path",
+        str(Path(home) / _DOTNET_PRERESTORE_ARTIFACTS_DIRNAME),
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=str(restore_cwd),
+        capture_output=True,
+        check=False,
+        shell=False,
+        text=True,
+        timeout=_DOTNET_PRERESTORE_TIMEOUT_SECONDS,
+    )
+    return completed.returncode
+
+
 def _appcontainer_dotnet_prerestore(
     argv: Sequence[str],
     workspace,
@@ -228,14 +327,27 @@ def _appcontainer_dotnet_prerestore(
     """Seed the request-scoped package cache from the host, once per request.
 
     ``None`` means nothing blocks the container command, including for a verb
-    that needs no packages; a string is a short reason the caller surfaces as
-    a typed validation-environment failure.  Never raises.
+    that needs no packages and for a candidate target that declares no package
+    at all; a string is a short reason the caller surfaces as a typed
+    validation-environment failure.  Never raises.
 
-    SECURITY: ``dotnet restore`` runs project targets, so this never evaluates
-    a candidate file.  The working directory is mapped onto ``workspace.repo``,
-    a project argument is reused only when the canonical tree carries it, and
-    the only writes go to ``--packages`` under the request home and a
-    request-scoped ``--artifacts-path``.
+    SECURITY: ``dotnet restore`` runs project targets, so the host CLI is never
+    given a candidate file.  When ``argv`` names a target the canonical tree
+    carries, that canonical file is restored first, unchanged; a candidate file
+    of the same name then adds a SECOND, supplementary restore of the
+    AIWorkHub-authored synthetic project, which is how a card that adds a
+    project or a ``PackageReference`` to an existing solution gets its packages
+    (EntryLink 003c adds ``apps/edge`` to a canonical ``EntryLink.Edge.slnx``).
+    When the canonical tree lacks the target entirely, that synthetic project is
+    the only thing restored.  Either way the candidate XML is read as DATA and
+    the candidate file itself never reaches the CLI.  The cwd fallback is
+    reachable only when ``argv`` names no target at all, so a named target can
+    never be substituted by a different solution sitting in the same directory
+    -- the NF-2026-01366 wrong-solution pre-restore that filed an environment
+    block as candidate code.  The only writes go to ``--packages`` under the
+    request home and a request-scoped ``--artifacts-path``; no host source other
+    than the global packages folder is added, and no classification reads the
+    CLI's stdout or stderr.
     """
     try:
         if not _appcontainer_dotnet_needs_packages(argv):
@@ -246,38 +358,57 @@ def _appcontainer_dotnet_prerestore(
         if marker.exists():
             return None
         canonical_cwd = _canonical_dotnet_cwd(workspace, cwd)
-        project = _canonical_dotnet_project(argv, workspace, canonical_cwd)
-        if not project and not _canonical_project_in(canonical_cwd):
-            return "no_canonical_project"
-        command = [
-            _resolved_dotnet_executable(str(argv[0])),
-            "restore",
-            *project,
-            "--packages",
-            str(packages),
-            "--source",
-            _host_nuget_packages(),
-            "-p:NuGetAudit=false",
-            "-nodeReuse:false",
-            "--artifacts-path",
-            str(Path(home) / _DOTNET_PRERESTORE_ARTIFACTS_DIRNAME),
-        ]
+        token = _dotnet_target_token(argv)
+        synthetic = False
+        addition: Path | None = None
+        if token is None:
+            if not _canonical_project_in(canonical_cwd):
+                return "no_canonical_project"
+            project: list[str] = []
+            restore_cwd: Path = canonical_cwd
+        else:
+            canonical = _canonical_dotnet_project(token, workspace, canonical_cwd)
+            candidate = _candidate_dotnet_project(token, workspace, cwd)
+            if canonical is not None:
+                project = [canonical]
+                restore_cwd = canonical_cwd
+                if candidate is not None and candidate.is_file():
+                    addition = candidate
+            else:
+                if candidate is None:
+                    return "candidate_target_outside_worktree"
+                seed, reason = synthetic_restore_project(
+                    candidate, workspace.path, home
+                )
+                if reason is not None:
+                    return reason
+                if seed is None:
+                    return None
+                synthetic = True
+                project = [str(seed)]
+                restore_cwd = seed.parent
         marker.write_text("attempted\n", encoding="utf-8")
-        completed = subprocess.run(
-            command,
-            cwd=str(canonical_cwd),
-            capture_output=True,
-            check=False,
-            shell=False,
-            text=True,
-            timeout=_DOTNET_PRERESTORE_TIMEOUT_SECONDS,
+        returncode = _dotnet_restore_one(argv, project, restore_cwd, packages, home)
+        if returncode != 0:
+            if synthetic:
+                return f"synthetic_restore_exit_{returncode}"
+            return f"prerestore_exit_{returncode}"
+        if addition is None:
+            return None
+        seed, reason = synthetic_restore_project(
+            addition, workspace.path, home, supplementary=True
         )
+        if reason is not None:
+            return reason
+        if seed is None:
+            return None
+        returncode = _dotnet_restore_one(argv, [str(seed)], seed.parent, packages, home)
+        if returncode != 0:
+            return f"synthetic_restore_exit_{returncode}"
     except subprocess.TimeoutExpired:
         return "prerestore_timeout"
     except Exception as exc:
         return f"prerestore_failed:{type(exc).__name__}"
-    if completed.returncode != 0:
-        return f"prerestore_exit_{completed.returncode}"
     return None
 
 

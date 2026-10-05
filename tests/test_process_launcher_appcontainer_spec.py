@@ -2971,6 +2971,7 @@ def _run_dotnet_lane_validation(
     tmp_path: Path,
     monkeypatch,
     argv: list[str],
+    candidate_files: dict[str, str] | None = None,
 ):
     """Drive ``_run_appcontainer_validation`` for the dotnet lane, no dotnet.
 
@@ -3016,6 +3017,10 @@ def _run_dotnet_lane_validation(
     # carries a same-named decoy that must never reach the recorded argv.
     (canonical / "app.csproj").write_text("<Project />", encoding="utf-8")
     (worktree / "app.csproj").write_text("<Project />", encoding="utf-8")
+    for relative, body in (candidate_files or {}).items():
+        candidate = worktree / relative
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_text(body, encoding="utf-8")
     workspace = SimpleNamespace(
         repo=canonical, path=worktree, home=tmp_path / "home"
     )
@@ -3128,6 +3133,45 @@ def test_appcontainer_validation_reports_a_blocked_dotnet_prerestore(
     assert str(caught.value) == (
         "validation_executable_unavailable:dotnet_prerestore:no_canonical_project"
     )
+
+
+def test_appcontainer_validation_seeds_a_candidate_only_slnx_target(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A `.slnx` the canonical tree lacks is seeded from candidate XML data.
+
+    NF-2026-01366 follow-up: neither the candidate files nor the unrelated
+    canonical `app.csproj` may reach the host restore -- only the
+    AIWorkHub-authored synthetic project under the request home.
+    """
+    result, launches, prerestores, _declared, workspace = _run_dotnet_lane_validation(
+        tmp_path,
+        monkeypatch,
+        ["dotnet", "restore", "EntryLink.Edge.slnx"],
+        candidate_files={
+            "EntryLink.Edge.slnx": (
+                '<Solution><Project Path="apps/edge/Edge.csproj" /></Solution>'
+            ),
+            "apps/edge/Edge.csproj": (
+                '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup>'
+                "<TargetFramework>net8.0</TargetFramework></PropertyGroup>"
+                '<ItemGroup><PackageReference Include="Serilog" Version="3.1.1" />'
+                "</ItemGroup></Project>"
+            ),
+        },
+    )
+
+    assert list(launches[0].request.argv)[:2] == ["dotnet", "restore"]
+    assert result.args[:2] == ["dotnet", "restore"]
+    assert len(prerestores) == 1
+    command, kwargs = prerestores[0]
+    worktree = str(workspace.path)
+    assert all(worktree not in token for token in command)
+    assert worktree not in str(kwargs["cwd"])
+    assert not any("app.csproj" in token for token in command)
+    seed = Path(command[2])
+    assert seed.parent == Path(workspace.home) / "dotnet-prerestore-seed"
+    assert 'Include="Serilog" Version="3.1.1"' in seed.read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
