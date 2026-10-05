@@ -8195,6 +8195,65 @@ def test_finalize_failed_bare_errno_13_names_its_raising_site(monkeypatch, tmp_p
     assert "sandbox_filesystem_denied" in authority["error"]
 
 
+@pytest.mark.xfail(strict=True, reason="NF-2026-01358 patch pending in launcher")
+def test_launch_failed_bare_errno_13_names_its_phase_and_site(monkeypatch, tmp_path):
+    """NF-2026-01358: a filename-less ``[Errno 13] Permission denied`` raised while
+    provisioning the workspace is recorded with its launch phase and aiworkhub
+    frame, keeping the ``str(exc)`` prefix the failure classifier keys on."""
+    from aiworkhub import terminal_failure_classification
+
+    _open_gates(monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    auth_source = tmp_path / "coordinator-auth.json"
+    auth_source.write_text(json.dumps({"xai": {"type": "oauth"}}), encoding="utf-8")
+    # The grok route of the projection test above: a registered workforce
+    # identity, so the launch reaches workspace provisioning.
+    card = {**_card(task_id="TASK_NF1358"), "runner": "grok_runner", "topic": "code"}
+    manager = process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=tmp_path / "processes",
+        show_task=_show(lambda: card),
+        collision_guard=_collision,
+        adapter_builder=_plan(["kilo"], repo),
+    )
+    monkeypatch.setattr(manager, "_preflight_card", lambda *a, **k: dict(card))
+    monkeypatch.setattr(process_launcher, "_launch_project_context", lambda *a, **k: None)
+    monkeypatch.setattr(
+        process_launcher, "_sandbox_backend_for_adapter", lambda _adapter: "landlock"
+    )
+    monkeypatch.setattr(
+        process_launcher.kilo_auth, "resolve_kilo_auth_source", lambda **_k: auth_source
+    )
+
+    def denied(*_args, **_kwargs):
+        # The fd-level shape of a byte-range lock violation: no filename.
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(process_launcher, "create_workspace", denied)
+    result = manager._launch_isolated(
+        task_id="TASK_NF1358",
+        runner="grok_runner",
+        topic="code",
+        adapter_id="grok_kilo_cli",
+        model="xai/grok-4.6",
+        owner_prompt="",
+        timeout_seconds=30,
+    )
+
+    reason = result["blocked_reason"]
+    assert re.match(
+        r"\[Errno 13\] Permission denied \(at process_launcher_launch_isolated\.py:\d+ "
+        r"launch_isolated\) launch_phase=workspace_and_runtime_provision",
+        reason,
+    ), reason
+    authority = terminal_failure_classification.terminal_event_authority(
+        state="launch_failed", exit_code=None, error=reason
+    )
+    assert "sandbox_filesystem_denied" in authority["error"]
+
+
 @pytest.mark.parametrize(
     ("latest_state", "terminal_state"),
     [("cancel_requested", "cancelled"), ("finalizing", "worker_failed")],
