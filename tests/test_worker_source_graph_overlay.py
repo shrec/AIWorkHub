@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import hashlib
 import json
 from pathlib import Path
@@ -268,3 +269,132 @@ def test_overlay_identity_mismatch_fails_closed(tmp_path: Path) -> None:
         _verify_rework_overlay_packet(
             packet, "same-task", "successor-request", "test", authority,
         )
+
+
+def test_overlay_unsupported_fail_closed_is_digest_only_evidence_nf1369(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NF-1369: an inherited CMakeLists.txt delta (unsupported_fail_closed)
+    must not raise rework_overlay_extract_failed; it is digest-only evidence
+    alongside the .py file's symbols.
+    """
+    authority = tmp_path / "authority"
+    workspace = tmp_path / "workspace"
+    authority.mkdir()
+    workspace.mkdir()
+    bootstrap_repository(authority, repo_name="authority")
+    bootstrap_repository(workspace, repo_name="workspace")
+    _write(authority / "src/changed.py", "def canonical_symbol():\n    return 'old'\n")
+    _write(authority / "CMakeLists.txt", "add_executable(old old.cpp)\n")
+    source_graph.build_index(authority, incremental=False)
+
+    changed = b"def worktree_symbol():\n    return 'new'\n"
+    cmake = b"add_executable(app app.cpp)\n"
+    _write(workspace / "src/changed.py", changed.decode("utf-8"))
+    _write(workspace / "CMakeLists.txt", cmake.decode("utf-8"))
+    packet = _packet(authority, [
+        {
+            "path": "src/changed.py",
+            "sha256": hashlib.sha256(changed).hexdigest(),
+            "content_base64": base64.b64encode(changed).decode("ascii"),
+        },
+        {
+            "path": "CMakeLists.txt",
+            "sha256": hashlib.sha256(cmake).hexdigest(),
+            "content_base64": base64.b64encode(cmake).decode("ascii"),
+        },
+    ])
+    ctx = WorkerToolContext(
+        task_id="same-task",
+        runner="test",
+        topic="source_graph_reliability",
+        request_id="successor-request",
+        repo=workspace,
+        authority_repo=authority,
+        source_graph_targets=("src/changed.py", "CMakeLists.txt"),
+        allowed_writes=("src/changed.py", "CMakeLists.txt"),
+        session_topic="source_graph_reliability",
+        audit_ledger_path=None,
+        audit_hmac_key_path=None,
+        rework_overlay_packet=packet,
+    )
+
+    body = source_graph_query(
+        ctx, mode="body", query="worktree_symbol", target="src/changed.py",
+        workflow_stage="rework", compact_replay=False,
+    )
+    assert body["ok"] is True
+    assert body["authority_source"] == "rework_overlay"
+
+    focus = source_graph_query(
+        ctx, mode="focus", query="CMakeLists", target=None,
+        workflow_stage="rework", compact_replay=False,
+    )
+    assert focus["ok"] is True
+    focus_payload = json.loads(focus["content"])
+    cmake_rows = [
+        row for row in focus_payload["matches"]
+        if row.get("file_path") == "CMakeLists.txt"
+    ]
+    assert cmake_rows
+    for row in cmake_rows:
+        assert row["kind"] == "file"
+        assert "entities" not in row
+        assert row["status"] == "file_evidence_only"
+        assert row["source_hash"] == hashlib.sha256(cmake).hexdigest()
+
+
+def test_overlay_unknown_extraction_status_still_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority = tmp_path / "authority"
+    workspace = tmp_path / "workspace"
+    authority.mkdir()
+    workspace.mkdir()
+    bootstrap_repository(authority, repo_name="authority")
+    bootstrap_repository(workspace, repo_name="workspace")
+    _write(authority / "src/changed.py", "def canonical_symbol():\n    return 'old'\n")
+    source_graph.build_index(authority, incremental=False)
+
+    changed = b"def worktree_symbol():\n    return 'new'\n"
+    _write(workspace / "src/changed.py", changed.decode("utf-8"))
+    packet = _packet(authority, [
+        {
+            "path": "src/changed.py",
+            "sha256": hashlib.sha256(changed).hexdigest(),
+            "content_base64": base64.b64encode(changed).decode("ascii"),
+        },
+    ])
+    ctx = WorkerToolContext(
+        task_id="same-task",
+        runner="test",
+        topic="source_graph_reliability",
+        request_id="successor-request",
+        repo=workspace,
+        authority_repo=authority,
+        source_graph_targets=("src/changed.py",),
+        allowed_writes=("src/changed.py",),
+        session_topic="source_graph_reliability",
+        audit_ledger_path=None,
+        audit_hmac_key_path=None,
+        rework_overlay_packet=packet,
+    )
+
+    from aiworkhub import source_graph_ast
+
+    real_extract_file = source_graph_ast.extract_file
+
+    def fake_extract_file(*args, **kwargs):
+        result = real_extract_file(*args, **kwargs)
+        return dataclasses.replace(result, status="totally_unknown_status")
+
+    monkeypatch.setattr(source_graph_ast, "extract_file", fake_extract_file)
+
+    result = source_graph_query(
+        ctx, mode="body", query="worktree_symbol", target="src/changed.py",
+        workflow_stage="rework", compact_replay=False,
+    )
+    assert result["ok"] is False
+    assert "rework_overlay_extract_failed" in result["reason"]

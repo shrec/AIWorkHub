@@ -3357,8 +3357,10 @@ def _declared_input_file_payload(ctx: WorkerToolContext, relative_path: str) -> 
 
 _REWORK_OVERLAY_EXTRACT_OK = frozenset({"ok", "file_evidence_only"})
 _REWORK_OVERLAY_REPAIR_EVIDENCE_STATUS = "parse_error_fail_closed"
+_REWORK_OVERLAY_DIGEST_ONLY_STATUS = "unsupported_fail_closed"
 _REWORK_OVERLAY_EVIDENCE_ONLY = _REWORK_OVERLAY_EXTRACT_OK | frozenset({
     _REWORK_OVERLAY_REPAIR_EVIDENCE_STATUS,
+    _REWORK_OVERLAY_DIGEST_ONLY_STATUS,
 })
 
 
@@ -3589,6 +3591,9 @@ def _prepare_rework_overlay_view(
             raise WorkerToolError(
                 f"rework_overlay_extract_failed:{relative}:{extraction.status}"
             )
+        if extraction.status == _REWORK_OVERLAY_DIGEST_ONLY_STATUS:
+            digest_refs[relative] = observed_hash
+            continue
         if extraction.status == _REWORK_OVERLAY_REPAIR_EVIDENCE_STATUS:
             repair_evidence[relative] = {
                 "path": relative,
