@@ -1222,6 +1222,31 @@ def test_durable_atomic_replace_reports_post_commit_directory_sync_failure(
     assert destination.read_bytes() == b"new"
 
 
+def test_durable_atomic_replace_preserves_trailing_ctrl_z_0x1a(tmp_path):
+    # NF-2026-01365: a Windows text-mode CRT open strips a trailing 0x1A.
+    payload = b"A" * 4095 + b"\x1a"
+    source = tmp_path / "source.tmp"
+    destination = tmp_path / "canonical"
+    source.write_bytes(payload)
+    destination.write_bytes(b"prior")
+
+    platform_io.durable_atomic_replace(source, destination)
+
+    assert destination.read_bytes() == payload
+    assert not source.exists()
+
+
+def test_durable_atomic_replace_is_binary_for_newlines_and_double_ctrl_z(tmp_path):
+    payload = b"head\r\nmiddle\nraw\r\x00tail" + b"\x1a\x1a"
+    source = tmp_path / "source.tmp"
+    destination = tmp_path / "canonical"
+    source.write_bytes(payload)
+
+    platform_io.durable_atomic_replace(source, destination)
+
+    assert destination.read_bytes() == payload
+
+
 def test_identity_bound_replace_rejects_source_substitution_before_publication(
     tmp_path, monkeypatch
 ):
