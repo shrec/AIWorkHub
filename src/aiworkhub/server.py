@@ -4669,6 +4669,9 @@ def aiworkhub_agent_list_processes(
         "returned_count": 0,
         "truncated": scanned_count > 0 or total_count > scanned_count,
         "full_detail_available": True,
+        # NF-2026-01359: the cap that admits launches stays visible in the default view.
+        "concurrency_limit": payload.get("concurrency_limit"),
+        "workforce_cap": payload.get("workforce_cap"),
         "state_counts": bounded_counts(state_counts),
         "terminal_substatus_counts": bounded_counts(terminal_substatus_counts),
         "timing": {

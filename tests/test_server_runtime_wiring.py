@@ -236,6 +236,7 @@ def test_list_processes_summary_is_bounded_deterministic_and_truthful(monkeypatc
         "launch_enabled": True,
         "active_in_memory": 34,
         "concurrency_limit": 8,
+        "workforce_cap": {"effective_cap": 8, "source": "env"},
         "total_requests": 125,
         "processes": rows,
     }
@@ -258,6 +259,8 @@ def test_list_processes_summary_is_bounded_deterministic_and_truthful(monkeypatc
         "returned_count": 0,
         "truncated": True,
         "full_detail_available": True,
+        "concurrency_limit": 8,
+        "workforce_cap": {"effective_cap": 8, "source": "env"},
         "state_counts": {"blocked": 33, "review_ready": 33, "running": 34},
         "terminal_substatus_counts": {"review_ready": 33, "validation_failed": 33},
         "timing": {
