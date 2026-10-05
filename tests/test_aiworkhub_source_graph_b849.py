@@ -3257,12 +3257,13 @@ def test_materializer_emits_canonical_digest(tmp_path):
     ).hexdigest()
 
 
-def test_materializer_identity_distinct_fails():
+def test_materializer_identity_distinct_fails(tmp_path):
+    # tmp_path, not Path("/tmp"): the AppContainer validation lane cannot see a host D:\tmp.
     with pytest.raises(ValueError):
-        materialize_rework_overlay("same", "tsk", "same", "tsk2", Path("/tmp"), [])
+        materialize_rework_overlay("same", "tsk", "same", "tsk2", tmp_path, [])
     # Rework keeps the canonical task ID and distinguishes attempts by request.
     packet = json.loads(
-        materialize_rework_overlay("r1", "same", "r2", "same", Path("/tmp"), [])
+        materialize_rework_overlay("r1", "same", "r2", "same", tmp_path, [])
     )
     assert packet["successor_task_id"] == packet["predecessor_task_id"] == "same"
 
