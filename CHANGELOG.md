@@ -6,6 +6,24 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.31] - 2026-10-05
+
+### Fixed
+
+- New `windows_build_env`: the derived MSVC/Windows Kit build environment (vswhere, or a probe of the Program Files install tree where vswhere answers nothing inside an AppContainer), registry `PATH` appended behind the caller's own, `CMAKE_GENERATOR=NMake Makefiles` and `_CL_=/Z7` defaults in an AppContainer, each only where the caller declared none. It is applied to `worker_launch_env` for the `windows_appcontainer` backend and to every AppContainer validation command; `ninja: fatal: CreateNamedPipe: Access is denied` terminates as `validation_unsupported_in_sandbox` (NF-2026-01337).
+- AppContainer validation adapts `dotnet build/test/restore/publish` (derived Program Files, per-request NuGet and artifacts paths, a host-cache restore source) (NF-2026-01366).
+- `aiworkhub/__init__.py` makes the MSVC CRT default file mode binary through capability detection on `os.O_BINARY`; it covers the audited bare `os.open` sites without per-call edits (NF-2026-01365).
+- `validation_route_backend_mismatch` is a control-plane terminal cause (NF-2026-01346).
+- The host-git spec tests skip inside an AppContainer lane, whose own temp is container-writable by design.
+- The NF-2026-01113 rework rebase reads EOL attributes from the successor base (`--attr-source`) for both its clean and smudge filters: a sparse worktree holds no `.gitattributes`, and git 2.47 then converted nothing, so an `eol=crlf` repository received LF merged bytes.
+- `output_spill_store.retrieve_text` treats `NotADirectoryError` like a missing file, so a repository spill root occupied by a file falls through to the worker-writable root on POSIX (NF-2026-01162).
+- `windows_appcontainer.is_python_executable` parses its argument as a Windows path on every host.
+- Linux/macOS CI: fake CLIs and owner-only token/status files get their mode at `os.open` creation, Windows-only AppContainer tests skip elsewhere, the live probe imports `msvcrt` only on Windows, the NF-2026-01107 listing test allows the signal-0 liveness probe, and the dashboard snapshot test no longer reads the host checkout's context graph.
+
+### Qualification
+
+- Each fix has regressions that fail before and pass after; the touched suites and the full suite pass, and the live clang-cl and CMake/NMake/ctest builds pass inside the AppContainer validation lane. Installation and live replay are separate evidence.
+
 ## [0.12.30] - 2026-10-05
 
 ### Fixed

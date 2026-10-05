@@ -62,6 +62,14 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.31
+
+- C and C++ builds run inside the Windows AppContainer, in both the validation lane and the worker sandbox. MSVC/Windows Kit `INCLUDE`/`LIB`/`LIBPATH` are derived from the install tree (no `vcvars`, no shell), VS's cmake/ctest/clang-cl are appended to `PATH`, a fresh registry `PATH` replaces VS Code's stale one, `CMAKE_GENERATOR` defaults to NMake, and `_CL_=/Z7` avoids the PDB server the container cannot reach. ninja's `CreateNamedPipe` denial is reported as a sandbox restriction instead of a failing gate (NF-2026-01337).
+- `dotnet build`/`test`/`restore`/`publish` run in the AppContainer validation lane: Program Files is derived, NuGet and artifacts go to the request's own scratch, and restore is seeded from the host package cache (NF-2026-01366).
+- Every bare `os.open` in the process is binary on Windows (`_set_fmode(O_BINARY)` at package import), so no raw write gains CRLF and no read stops at 0x1A (NF-2026-01365).
+- A validation failure from a backend mismatch is classified as a control-plane cause (NF-2026-01346).
+- A rework overlay merged onto a newer base keeps the repository's `.gitattributes` line endings in a sparse worktree on every git version, and a spill root occupied by a file falls through to the worker-writable root on POSIX as it already did on Windows. The full suite passes on Linux and macOS again.
+
 ## What's new in 0.12.30
 
 - Source Graph partitions no longer go malformed on Windows: publishing a database whose last byte is 0x1A kept every byte, so quality reviewers whose prewarm failed with `database disk image is malformed` launch again (NF-2026-01365).

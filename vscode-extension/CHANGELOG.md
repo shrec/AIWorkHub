@@ -1,5 +1,19 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.31 — 2026-10-05
+
+### Fixed
+
+- C/C++ builds run inside the Windows AppContainer (derived MSVC env, VS tools on `PATH`, fresh registry `PATH`, NMake and `/Z7` defaults; ninja's pipe denial reported as a sandbox restriction) (NF-2026-01337).
+- `dotnet build/test/restore/publish` in the AppContainer validation lane (NF-2026-01366).
+- Bare `os.open` is binary on Windows process-wide (NF-2026-01365).
+- Backend-mismatch validation failures are control-plane causes (NF-2026-01346).
+- Rework overlay merges keep `.gitattributes` line endings in sparse worktrees; the POSIX spill-root fallback; Linux/macOS CI passes again.
+
+### Qualification
+
+- Independent component regressions pass; installation, activation and live qualification are separate evidence.
+
 ## 0.12.30 — 2026-10-05
 
 ### Fixed
