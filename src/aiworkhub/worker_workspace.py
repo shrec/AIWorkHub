@@ -6535,11 +6535,25 @@ def _canonical_worktree_delta_paths(repo: Path) -> list[str]:
         raise WorkspaceError(
             f"combined_tree_git_untracked_failed:{untracked.stderr[:300]}"
         )
+    from .repository_state import HUB_DIRNAME
+    from .storage_registry import RUNTIME_ONLY_PATTERNS
+
+    # NF-2026-01358: an unignored hub runtime file (task_queue.sqlite-shm,
+    # index.lock) is byte-range locked by a concurrent holder, and Windows fails
+    # the copy's read with a bare "[Errno 13] Permission denied". Live runtime
+    # state is never canonical content, so the combined tree leaves it out.
     rows = sorted(
         {
             _relative_repo_path(value)
             for value in (tracked.stdout + untracked.stdout).split("\x00")
             if value
+            and not (
+                value.startswith(f"{HUB_DIRNAME}/")
+                and any(
+                    fnmatch.fnmatchcase(PurePosixPath(value).name, pattern)
+                    for pattern in RUNTIME_ONLY_PATTERNS
+                )
+            )
         }
     )
     if len(rows) > MAX_SEED_FILES:

@@ -1517,6 +1517,58 @@ def _quality_review_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pat
     return repo
 
 
+def test_nf1358_review_workspace_skips_live_hub_runtime_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NF-2026-01358: the canonical repo's unignored hub runtime files are held
+    by concurrent holders; Windows failed the reviewer's copy of a locked byte
+    with a bare ``[Errno 13] Permission denied``. They are never review content,
+    while ordinary untracked files (``uv.lock``, hub config) still are."""
+    import sqlite3
+
+    from aiworkhub import platform_io
+
+    repo = _quality_review_repo(tmp_path, monkeypatch)
+    (repo / ".gitignore").write_text("*.sqlite\n", encoding="utf-8")
+    (repo / "source.py").write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", ".gitignore", "source.py"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "baseline"], cwd=repo, check=True)
+    hub = repo / ".aiworkhub"
+    (hub / "source_graph").mkdir(parents=True)
+    (hub / "models.json").write_text("{}\n", encoding="utf-8")
+    (repo / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    source = worker_workspace.create_workspace(
+        repo,
+        "3" * 32,
+        {"allowed_writes": ["source.py"], "required_outputs": []},
+        "validation",
+    )
+    (source.path / "source.py").write_text("value = 2\n", encoding="utf-8")
+    db = sqlite3.connect(hub / "task_queue.sqlite", isolation_level=None)
+    review = None
+    try:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("CREATE TABLE t (x)")
+        # An open write transaction holds the -shm write lock, as a concurrent
+        # reviewer's task-queue write does; index.lock is a Source Graph lease.
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("INSERT INTO t VALUES (1)")
+        with (hub / "source_graph" / "index.lock").open("a+b") as handle:
+            platform_io.lock_fd(handle.fileno(), blocking=False)
+            review, evidence = worker_workspace.create_quality_review_workspace(
+                source, "4" * 32, ["source.py"], "validation"
+            )
+
+        assert evidence["canonical_delta_paths"] == [".aiworkhub/models.json", "uv.lock"]
+        assert (review.path / "uv.lock").read_text(encoding="utf-8") == "version = 1\n"
+        assert not (review.path / ".aiworkhub" / "source_graph").exists()
+    finally:
+        db.close()
+        if review is not None:
+            worker_workspace.cleanup_workspace(repo, review.path, review.home)
+        worker_workspace.cleanup_workspace(repo, source.path, source.home)
+
+
 def test_nf469_review_workspace_materializes_explicit_target_inputs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

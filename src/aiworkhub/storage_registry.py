@@ -24,6 +24,19 @@ from .repository_state import HUB_DIRNAME, PathEscapeError, RepositoryState, ins
 STORAGE_REGISTRY_SCHEMA_ID = "aiworkhub.storage_registry.v1"
 STORAGE_REGISTRY_VERSION = 1
 STORAGE_REGISTRY_REL = Path(HUB_DIRNAME) / "config" / "storage.json"
+# Live runtime state: SQLite WAL/SHM sidecars and lock files are byte-range
+# locked by their holders, so they are never copied as content (NF-2026-01358).
+RUNTIME_ONLY_PATTERNS: tuple[str, ...] = (
+    "*.sqlite-wal",
+    "*.sqlite-shm",
+    "*.db-wal",
+    "*.db-shm",
+    "*.lock",
+    "*.sock",
+    "credentials/*",
+    "worktrees/*",
+    "backups/*",
+)
 
 CANONICAL_DATABASES: tuple[dict[str, str], ...] = (
     {
@@ -137,17 +150,7 @@ def default_registry_payload(repo_id: str) -> dict[str, Any]:
             "durable": False,
             "ignored": True,
             "path": "runtime",
-            "runtime_only_patterns": [
-                "*.sqlite-wal",
-                "*.sqlite-shm",
-                "*.db-wal",
-                "*.db-shm",
-                "*.lock",
-                "*.sock",
-                "credentials/*",
-                "worktrees/*",
-                "backups/*",
-            ],
+            "runtime_only_patterns": list(RUNTIME_ONLY_PATTERNS),
             "sqlite_policy": {
                 "main_files_are_durable": True,
                 "wal_shm_are_runtime_only": True,
