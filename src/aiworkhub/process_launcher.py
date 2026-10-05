@@ -5394,6 +5394,21 @@ class ProcessManager:
         )
 
     def _build_adapter(self, **kwargs: Any) -> Any:
+        if kwargs.get("executable_overrides") is None:
+            # NF-2026-01250: the executable registry is repo-owned runtime
+            # config, but an isolated launch builds its plan in the worktree,
+            # which never carries ``.aiworkhub/runtime``.  Resolve it here,
+            # against the canonical repo, so every launch path selects the
+            # same registered binary instead of falling back to PATH.
+            from .runtime_executable_registry import select_executable_overrides
+
+            overrides, registration_error = select_executable_overrides(
+                str(kwargs.get("adapter_id") or ""), self.repo, None
+            )
+            if registration_error is not None:
+                raise LaunchRejected(registration_error)
+            if overrides is not None:
+                kwargs["executable_overrides"] = overrides
         if self._adapter_builder is not None:
             return self._adapter_builder(**kwargs)
         from .runtime_adapters import build_adapter_command

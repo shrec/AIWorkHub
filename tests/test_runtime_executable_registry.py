@@ -142,6 +142,40 @@ def test_worker_adapter_command_uses_registered_executable(
     assert plan.argv[0] == str(registered)
 
 
+def test_isolated_launch_selects_the_canonical_repo_registration(
+    tmp_path: Path, linux_platform: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # NF-2026-01250: the isolated launch builds its plan with repo=<worktree>,
+    # which has no .aiworkhub/runtime; the launcher must still pick the
+    # registration the canonical repo owns, never PATH.
+    from aiworkhub import process_launcher
+
+    registered = _write_registration(tmp_path)
+    worktree = tmp_path / ".aiworkhub" / "runtime" / "worktrees" / "r1" / "worktree"
+    worktree.mkdir(parents=True)
+    _host_not_windows(monkeypatch)
+
+    plan = process_launcher.ProcessManager(repo=tmp_path)._build_adapter(
+        adapter_id=OPENCODE_CLI_ADAPTER,
+        prompt=PROMPT,
+        repo=worktree,
+        model=MODEL,
+        outer_sandbox_backend="landlock",
+    )
+
+    assert plan.launchable
+    assert plan.argv[0] == str(registered)
+
+    _manifest_path(tmp_path).write_text("{not json", encoding="utf-8")
+    with pytest.raises(process_launcher.LaunchRejected):
+        process_launcher.ProcessManager(repo=tmp_path)._build_adapter(
+            adapter_id=OPENCODE_CLI_ADAPTER,
+            prompt=PROMPT,
+            repo=worktree,
+            model=MODEL,
+            outer_sandbox_backend="landlock",
+        )
+
 def test_explicit_override_priority_beats_registration(
     tmp_path: Path, linux_platform: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
