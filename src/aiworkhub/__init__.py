@@ -68,6 +68,25 @@ def coordinator_config() -> tuple[str, str]:
 refresh_coordinator_config()
 
 
+# The MSVC CRT opens os.open fds in TEXT mode unless O_BINARY is passed, which
+# corrupts raw I/O (LF->CRLF on write, CR dropped and 0x1A treated as EOF on
+# read, a trailing 0x1A stripped by an O_RDWR open). Make binary the process
+# default here, before any submodule opens a file. Fails closed to the old
+# behaviour when ucrtbase/_set_fmode is unavailable.
+# The package init imports no aiworkhub submodule (tests block or omit
+# platform_io), so capability detection on os.O_BINARY is used instead.
+# ponytail: explicit os.O_BINARY flags remain the per-call-site alternative.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
+if _O_BINARY:
+    try:
+        import ctypes
+
+        ctypes.CDLL("ucrtbase")._set_fmode(_O_BINARY)
+    except (OSError, AttributeError):
+        pass
+
+
 def __getattr__(name: str):
     """Lazily expose selected submodules without import-order side effects."""
 
