@@ -6,6 +6,17 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.32] - 2026-10-05
+
+### Fixed
+
+- AppContainer .NET prerestore: `.slnx` and `.slnf` targets, the canonical solution selected over a sibling, and projects added by the card restored through a literal-XML synthetic seed (`AIWorkHubRestoreSeed.csproj`); a supplementary seed behind a canonical restore never blocks on a deleted or unsupported candidate project, while a strict seed still names a project its solution lists but lacks (NF-2026-01366).
+- `ProcessManager._build_adapter` selects the repo-owned executable registration from the canonical repository for every launch path; the isolated launch had passed its worktree, so the registry was never read and the registered OpenCode compat binary was ignored. A malformed or SHA-mismatched registration still fails the launch closed (NF-2026-01250).
+
+### Qualification
+
+- Each fix has a regression that fails before and passes after; the touched suites and the full suite pass. Native OpenCode/Muse provider and MCP qualification inside the AppContainer is separate live evidence.
+
 ## [0.12.31] - 2026-10-05
 
 ### Fixed

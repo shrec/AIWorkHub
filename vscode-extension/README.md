@@ -14,6 +14,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.32
+
+- .NET prerestore in the AppContainer handles `.slnx` solutions, restores the canonical solution instead of the first one found, and covers projects a card adds through a synthetic restore seed, so a new project no longer fails restore offline (NF-2026-01366).
+- A registered OpenCode executable (`.aiworkhub/runtime/executable_registration.json`) now applies to isolated worker launches: the launcher resolves the registration from the canonical repository instead of the worker's worktree, where `.aiworkhub/runtime` never exists, so AppContainer workers no longer fall back to the PATH `opencode.exe` (NF-2026-01250).
+
 ## What's new in 0.12.31
 
 - C and C++ builds run inside the Windows AppContainer, in both the validation lane and the worker sandbox. MSVC/Windows Kit `INCLUDE`/`LIB`/`LIBPATH` are derived from the install tree (no `vcvars`, no shell), VS's cmake/ctest/clang-cl are appended to `PATH`, a fresh registry `PATH` replaces VS Code's stale one, `CMAKE_GENERATOR` defaults to NMake, and `_CL_=/Z7` avoids the PDB server the container cannot reach. ninja's `CreateNamedPipe` denial is reported as a sandbox restriction instead of a failing gate (NF-2026-01337).

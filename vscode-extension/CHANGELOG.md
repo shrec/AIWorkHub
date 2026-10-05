@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.32 — 2026-10-05
+
+### Fixed
+
+- AppContainer .NET prerestore: `.slnx`, the canonical solution, and card-added projects via a synthetic seed (NF-2026-01366).
+- A registered OpenCode executable applies to isolated worker launches instead of falling back to PATH (NF-2026-01250).
+
+### Qualification
+
+- Independent component regressions pass; installation, activation and live qualification are separate evidence.
+
 ## 0.12.31 — 2026-10-05
 
 ### Fixed
