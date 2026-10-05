@@ -38,7 +38,7 @@ import time
 from ctypes import wintypes
 from dataclasses import dataclass, field, replace
 from functools import partial
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Callable, Mapping, Protocol, Sequence, cast
 
 try:
@@ -451,7 +451,7 @@ def ancestor_stat_facts(path: str) -> str:
 
 def is_python_executable(executable: str) -> bool:
     """A ``python*.exe`` -- the executables :func:`python_read_grants` serves."""
-    exe = Path(executable)
+    exe = PureWindowsPath(executable)
     return exe.name.lower().startswith("python") and exe.suffix.lower() == ".exe"
 
 

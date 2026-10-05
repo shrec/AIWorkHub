@@ -8366,7 +8366,16 @@ def _nf01107_listing_manager(monkeypatch, tmp_path, *, supervisor_pid, child_pid
     def forbid_signal(*_args, **_kwargs):
         raise AssertionError("the listing must never signal a process")
 
-    monkeypatch.setattr(process_launcher.os, "kill", forbid_signal)
+    real_kill = os.kill
+
+    def probe_only_kill(pid, sig):
+        # Signal 0 is the POSIX process_is_alive existence probe: it delivers
+        # nothing, so only a real signal breaks the read-only listing contract.
+        if sig != 0:
+            forbid_signal()
+        return real_kill(pid, sig)
+
+    monkeypatch.setattr(process_launcher.os, "kill", probe_only_kill)
     monkeypatch.setattr(process_launcher, "_terminate_process_group", forbid_signal)
     return manager, status_path
 

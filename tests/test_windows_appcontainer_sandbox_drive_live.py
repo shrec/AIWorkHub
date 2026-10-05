@@ -11,7 +11,6 @@ Opt-in: runs only on Windows with ``AIWORKHUB_LIVE_APPCONTAINER_PROBE=1``
 from __future__ import annotations
 
 import ctypes
-import msvcrt
 import os
 import shutil
 import stat
@@ -35,6 +34,8 @@ pytestmark = pytest.mark.skipif(
     os.name != "nt" or os.environ.get("AIWORKHUB_LIVE_APPCONTAINER_PROBE") != "1",
     reason="live AppContainer probe: Windows and AIWORKHUB_LIVE_APPCONTAINER_PROBE=1",
 )
+# Windows-only module: importing it unguarded fails collection elsewhere.
+msvcrt = pytest.importorskip("msvcrt")
 
 REPO = Path(__file__).resolve().parents[1]
 PYTHON = r"C:\Python312\python.exe"

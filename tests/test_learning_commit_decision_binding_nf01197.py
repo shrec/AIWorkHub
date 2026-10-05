@@ -15,6 +15,7 @@ instruction to reproduce with real transitions through the store/core API.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
@@ -67,14 +68,14 @@ def _coordinator_env(root: Path, tmp_path: Path, monkeypatch) -> None:
     canonical rejection path requires, so these tests exercise the real
     ``core.reject_review`` rather than a stand-in.
 
-    The token file is intentionally left at its default (umask) permissions:
-    tightening them with ``os.chmod`` is a test-hygiene step, not something
-    ``core.reject_review``'s gate reads back, and ``chmod`` is unavailable in
-    some sandboxes this suite runs in.
+    The token file is owner-only (0600) from creation, through ``os.open``'s
+    mode: the gate refuses any other mode on POSIX, and ``chmod`` is
+    unavailable in some sandboxes this suite runs in.
     """
     monkeypatch.setenv("AIWORKHUB_REPO", str(root))
     monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
     token = tmp_path / "coordinator.token"
+    os.close(os.open(token, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
     token.write_text("coord-token\n", encoding="utf-8")
     monkeypatch.setenv("BITNN_TASKCTL_COORDINATOR_TOKEN_FILE", str(token))
     monkeypatch.setenv("BITNN_TASKCTL_COORDINATOR_TOKEN", "coord-token")

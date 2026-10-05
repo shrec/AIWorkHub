@@ -651,6 +651,7 @@ if not defined CODEX_BIN (
 """,
         encoding="utf-8",
     )
+    shim.chmod(0o755)
     older_dir = codex_root / "bin" / "old"
     newer_dir = codex_root / "bin" / "new"
     older_dir.mkdir(parents=True)
@@ -684,6 +685,7 @@ def test_codex_windows_npm_forwarder_resolves_native_or_fails_closed(monkeypatch
         '@echo off\nrem Official npm launcher.\ncall "%APPDATA%\\npm\\codex.cmd" %*\nexit /b %ERRORLEVEL%\n',
         encoding="utf-8",
     )
+    shim.chmod(0o755)
     package = roaming / "npm" / "node_modules" / "@openai" / "codex"
     arch, triple = ("arm64", "aarch64-pc-windows-msvc") if case == "arm64" else ("x64", "x86_64-pc-windows-msvc")
     vendor = package / "vendor" if case == "bundled" else package / "node_modules" / "@openai" / f"codex-win32-{arch}" / "vendor"

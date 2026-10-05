@@ -286,7 +286,10 @@ class _FakeProvider:
         return {"bound_task_count": 0, "unbound_task_count": 0, "by_state": {}}
 
 
-def test_build_snapshot_is_functional() -> None:
+def test_build_snapshot_is_functional(monkeypatch) -> None:
+    # The snapshot also reads the host repository's context graph, which a
+    # clean checkout never initialized; this test is about the fake provider.
+    monkeypatch.setattr(dashboard.context_graph, "status", lambda _root: {})
     snapshot = dashboard.build_snapshot(_FakeProvider())
     assert snapshot["schema_version"] == 1
     assert snapshot["readonly"] is True

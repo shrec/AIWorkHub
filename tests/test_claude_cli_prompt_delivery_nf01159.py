@@ -384,6 +384,8 @@ def test_nf01159_claude_plan_carries_the_prompt_only_in_the_stdin_payload(
     repo = tmp_path / "repo"
     repo.mkdir()
     executable = tmp_path / "claude"
+    # Executable from creation: chmod is denied in the worker sandbox.
+    os.close(os.open(executable, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o755))
     executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
 
     plan = runtime_adapters.build_runtime_command(

@@ -348,12 +348,12 @@ def retrieve_text(locator: str, *, repo: Path | str) -> str:
     if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
         raise OutputSpillError("output_spill_store_locator_malformed")
     encoded: bytes | None = None
-    missing: FileNotFoundError | None = None
+    missing: OSError | None = None
     for root in _retrieval_roots(repo):
         try:
             encoded = (root / f"{digest}.txt").read_bytes()
             break
-        except FileNotFoundError as exc:
+        except (FileNotFoundError, NotADirectoryError) as exc:  # POSIX: a file holds the root
             missing = exc
         except OSError as exc:
             raise OutputSpillError(f"output_spill_store_retrieve_failed:{digest}") from exc

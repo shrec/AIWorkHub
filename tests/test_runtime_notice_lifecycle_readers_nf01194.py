@@ -86,7 +86,7 @@ def _seed_lifecycle(
     stderr_path = process_dir / f"{REQUEST_ID}.stderr.log"
     for p in (stdout_path, stderr_path):
         os.close(os.open(p, os.O_CREAT | os.O_WRONLY, 0o600))
-    status_path.write_text(json.dumps({"state": "running"}), encoding="utf-8")
+    worker_workspace.write_json_0600(status_path, {"state": "running"})
 
     worker_workspace.write_json_0600(metadata_path, {
         "request_id": REQUEST_ID,

@@ -1316,6 +1316,7 @@ def test_validation_worker_kind_matches_the_supervisor_container_identity(
     )["worker_kind"]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="AppContainer is Windows-only")
 def test_sandbox_argv_returns_the_real_argv_unchanged_under_appcontainer() -> None:
     argv = [r"C:\Python\python.exe", "-m", "pytest", "-q"]
     wrapped = worker_workspace.sandbox_argv(
@@ -1652,6 +1653,7 @@ def _planted_and_canonical_venvs(tmp_path: Path):
     return worktree, repo, target
 
 
+@pytest.mark.skipif(os.name != "nt", reason="AppContainer is Windows-only")
 def test_the_appcontainer_lane_never_resolves_the_worktree_interpreter(tmp_path: Path) -> None:
     worktree, repo, _target = _planted_and_canonical_venvs(tmp_path)
     workspace = SimpleNamespace(path=worktree, repo=repo)

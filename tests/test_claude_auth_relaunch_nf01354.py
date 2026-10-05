@@ -292,6 +292,8 @@ def test_nf01354_prompt_on_stdin_adapter_set_matches_the_plans_and_the_superviso
     repo = tmp_path / "repo"
     repo.mkdir()
     executable = tmp_path / "tool"
+    # Executable from creation: chmod is denied in the worker sandbox.
+    os.close(os.open(executable, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o755))
     executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     carrying = set()
     for adapter_id in runtime_adapters.SUPPORTED_ADAPTERS:

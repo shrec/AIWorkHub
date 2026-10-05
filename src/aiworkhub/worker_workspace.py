@@ -2836,11 +2836,14 @@ def _rework_base_drift_rebase(
                    for meta, path in zip(fields[::2], fields[1::2], strict=False)}
         merged: dict[str, bytes | None] = {}
         conflicts: list[str] = []
+        # The sparse worktree holds no .gitattributes and git 2.47 then
+        # converts nothing, so both EOL filters read S0's attributes.
+        attr_source = f"--attr-source={successor}"
         with tempfile.TemporaryDirectory(prefix="aiworkhub-rebase-") as scratch:
             sides = [Path(scratch, name) for name in ("ours", "base", "theirs")]
             for relative, theirs in (entry for entry in planned if entry[0] in drifted):
                 failed = f"rework_base_drift_blob_failed:{relative}"
-                clean = ("hash-object", "-w", f"--path={relative}", str(sides[2]))
+                clean = (attr_source, "hash-object", "-w", f"--path={relative}", str(sides[2]))
                 meta = drifted[relative]
                 ancestor, ours = (None if set(oid) == {"0"} else oid for oid in meta[2:4])
                 sides[2].write_bytes(theirs or b"")
@@ -2860,7 +2863,7 @@ def _rework_base_drift_rebase(
                 if result == "":
                     conflicts.append(relative)
                 else:
-                    checkout = ("cat-file", "--filters", f"--path={relative}", str(result))
+                    checkout = (attr_source, "cat-file", "--filters", f"--path={relative}", str(result))
                     merged[relative] = result and git(failed, *checkout)
         if conflicts:
             raise WorkspaceError(f"rework_base_drift:{','.join(sorted(conflicts))}")
