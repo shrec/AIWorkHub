@@ -41,7 +41,7 @@ every path.  When such a call is denied, the answer is the host's own
 ``ancestor_stat_facts``).  Only those directories, only on a denial.
 
 Not a call but the environment: CreateProcess into the container replaced
-TEMP and TMP with the adapter-shared ``...\AC\Temp`` and kept TMPDIR
+TEMP and TMP with the adapter-shared ``...\\AC\\Temp`` and kept TMPDIR
 (NF-2026-01341).  In a validation launch -- the scratch env is set -- both are
 put back on TMPDIR, so every child this process starts inherits the request's
 own scratch.
