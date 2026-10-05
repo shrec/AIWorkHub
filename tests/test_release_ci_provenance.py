@@ -125,3 +125,118 @@ def test_release_workflow_binds_manual_input_to_tag_commit_and_keeps_smoke_gates
         "platform-qualification",
     ):
         assert forbidden not in text
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def require_waiting(
+    payloads: list[dict[str, object]], *, wait_seconds: float, poll_seconds: float = 30.0
+) -> FakeClock:
+    clock = FakeClock()
+    with (
+        patch.object(provenance, "_request_json", side_effect=payloads),
+        patch.object(provenance.time, "monotonic", clock.monotonic),
+        patch.object(provenance.time, "sleep", clock.sleep),
+    ):
+        provenance.require_successful_push_ci(
+            repository="owner/repo",
+            sha="a" * 40,
+            workflow=".github/workflows/ci.yml",
+            token="secret",
+            wait_seconds=wait_seconds,
+            poll_seconds=poll_seconds,
+        )
+    return clock
+
+
+def test_wait_accepts_in_progress_run_that_then_succeeds():
+    clock = require_waiting(
+        [
+            {"workflow_runs": [run(status="in_progress", conclusion=None)]},
+            {"workflow_runs": [run()]},
+        ],
+        wait_seconds=300.0,
+    )
+    assert clock.sleeps == [30.0]
+
+
+def test_wait_rejects_queued_forever_at_deadline_after_bounded_sleeps():
+    queued = {"workflow_runs": [run(status="queued", conclusion=None)]}
+    clock = FakeClock()
+    with (
+        patch.object(provenance, "_request_json", return_value=queued) as request,
+        patch.object(provenance.time, "monotonic", clock.monotonic),
+        patch.object(provenance.time, "sleep", clock.sleep),
+    ):
+        with pytest.raises(provenance.ProvenanceError, match="timeout") as error:
+            provenance.require_successful_push_ci(
+                repository="owner/repo",
+                sha="a" * 40,
+                workflow=".github/workflows/ci.yml",
+                token="secret",
+                wait_seconds=100.0,
+                poll_seconds=30.0,
+            )
+    assert "no completed successful push CI run matched workflow and exact SHA" in str(
+        error.value
+    )
+    assert clock.sleeps == [30.0, 30.0, 30.0]
+    assert request.call_count == 4
+
+
+def test_wait_rejects_completed_failure_without_sleeping():
+    clock = FakeClock()
+    with (
+        patch.object(
+            provenance,
+            "_request_json",
+            return_value={"workflow_runs": [run(conclusion="failure")]},
+        ),
+        patch.object(provenance.time, "monotonic", clock.monotonic),
+        patch.object(provenance.time, "sleep", clock.sleep),
+    ):
+        with pytest.raises(provenance.ProvenanceError, match="completed without success"):
+            provenance.require_successful_push_ci(
+                repository="owner/repo",
+                sha="a" * 40,
+                workflow=".github/workflows/ci.yml",
+                token="secret",
+                wait_seconds=3000.0,
+            )
+    assert clock.sleeps == []
+
+
+def test_wait_accepts_run_registered_after_first_scan():
+    clock = require_waiting(
+        [
+            {"workflow_runs": [run(head_sha="b" * 40)]},
+            {"workflow_runs": [run()]},
+        ],
+        wait_seconds=300.0,
+    )
+    assert clock.sleeps == [30.0]
+
+
+def test_wait_main_defaults_to_bounded_wait_and_rejects_negative(monkeypatch, capsys):
+    monkeypatch.setenv("GITHUB_TOKEN", "secret")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repo")
+    assert provenance.DEFAULT_WAIT_SECONDS > 0
+    with patch.object(provenance, "require_successful_push_ci") as require_ci:
+        assert provenance.main(["--sha", "a" * 40]) == 0
+        assert require_ci.call_args.kwargs["wait_seconds"] == provenance.DEFAULT_WAIT_SECONDS
+        assert require_ci.call_args.kwargs["poll_seconds"] == provenance.DEFAULT_POLL_SECONDS
+        assert provenance.main(["--sha", "a" * 40, "--wait-seconds", "-1"]) == 1
+        assert provenance.main(["--sha", "a" * 40, "--poll-seconds", "0"]) == 1
+        assert require_ci.call_count == 1
+    assert "release CI provenance rejected" in capsys.readouterr().err
