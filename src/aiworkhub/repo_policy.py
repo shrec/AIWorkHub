@@ -1642,7 +1642,8 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
 WORKFORCE_SCHEMA_ID = "aiworkhub.workforce_capacity.v1"
 MAX_PROCESSES_ENV = "AIWORKHUB_MAX_PROCESSES"
 DEFAULT_MAX_PROCESSES = 4
-MAX_PROCESSES_CEILING = 256
+# The launcher admission ceiling; process_launcher enforces exactly this value.
+MAX_PROCESSES_CEILING = 32
 
 
 def resolve_workforce_cap(env: Mapping[str, str] | None = None) -> dict[str, Any]:

@@ -3388,6 +3388,9 @@ def manager_bootstrap(
             "status": "not_evaluated",
             "reason": "route_gate_call:the_bootstrap_tool_ensures_the_dispatcher",
         }
+    from . import repo_policy  # local import: cycle-safe
+
+    workforce_cap = repo_policy.resolve_workforce_cap()
     reply: dict[str, Any] = {
         "ok": True,
         "schema_id": MANAGER_BOOTSTRAP_SCHEMA_ID,
@@ -3413,6 +3416,8 @@ def manager_bootstrap(
         },
         "server_version": str(server_version),
         "runtime_generation": runtime_generation.status(),
+        # NF-2026-01359: the cap that admits this server's launches, with its source.
+        "workforce_cap": workforce_cap,
         "task_hygiene": hygiene,
         "task_health": _bootstrap_task_health(root, readiness),
         "dispatcher": dispatcher,

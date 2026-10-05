@@ -406,8 +406,6 @@ PROCESS_DIR_ENV = "AIWORKHUB_PROCESS_DIR"
 # Repository-local, non-durable runtime tree: .aiworkhub/runtime/process_logs/.
 PROCESS_LOG_DEFAULT_REL = Path(".aiworkhub/runtime/process_logs/process_events.jsonl")
 PROCESS_DIR_DEFAULT_REL = Path(".aiworkhub/runtime/process_logs/processes")
-DEFAULT_MAX_PROCESSES = 4
-MAX_CONFIGURED_PROCESSES = 32
 MAX_LOG_TAIL_BYTES = 64 * 1024
 MAX_RESEARCH_RESULT_BYTES = 32 * 1024 * 1024
 MAX_WORKER_STREAM_LOG_BYTES = 4 * 1024 * 1024
@@ -1543,11 +1541,8 @@ def launch_gates_open() -> bool:
 
 
 def _configured_limit() -> int:
-    try:
-        value = int(os.environ.get(MAX_PROCESSES_ENV, str(DEFAULT_MAX_PROCESSES)))
-    except ValueError:
-        value = DEFAULT_MAX_PROCESSES
-    return max(1, min(value, MAX_CONFIGURED_PROCESSES))
+    # NF-2026-01359: one resolver; bootstrap and list_processes report its source and reason.
+    return int(repo_policy.resolve_workforce_cap()["effective_cap"])
 
 
 def _safe_tail(path: Path, max_bytes: int = MAX_LOG_TAIL_BYTES) -> str:
@@ -14027,6 +14022,7 @@ class ProcessManager:
             "launch_enabled": launch_gates_open(),
             "active_in_memory": self._active_count(),
             "concurrency_limit": _configured_limit(),
+            "workforce_cap": repo_policy.resolve_workforce_cap(),
             "total_requests": len(latest),
             "processes": rows,
         }

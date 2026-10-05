@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from aiworkhub import quality_review, repo_policy, runtime_adapters
+from aiworkhub import process_launcher, quality_review, repo_policy, runtime_adapters
 
 
 def _initialized_root(tmp_path: Path) -> Path:
@@ -102,6 +102,16 @@ def test_unset_max_processes_falls_back_with_named_reason() -> None:
     assert resolved["effective_cap"] == repo_policy.DEFAULT_MAX_PROCESSES
     assert resolved["configured"] is False
     assert resolved["reason"] == "max_processes_unset_default_applied"
+
+
+def test_launcher_admits_by_the_reported_workforce_cap(monkeypatch) -> None:
+    # NF-2026-01359: admission and the reported cap come from one resolver.
+    monkeypatch.setenv("AIWORKHUB_MAX_PROCESSES", "64")
+    resolved = repo_policy.resolve_workforce_cap()
+    assert process_launcher._configured_limit() == resolved["effective_cap"] == 32
+    assert resolved["reason"] == "max_processes_above_ceiling_clamped:64->32"
+    monkeypatch.delenv("AIWORKHUB_MAX_PROCESSES")
+    assert process_launcher._configured_limit() == repo_policy.DEFAULT_MAX_PROCESSES
 
 
 # --------------------------------------------------------------------------
