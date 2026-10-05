@@ -125,6 +125,95 @@ def is_rework_attempt(metadata: Mapping[str, Any]) -> bool:
     return isinstance(predecessor, dict) and bool(predecessor)
 
 
+# NF-2026-01370 (a). One constant, minted here beside ``is_rework_attempt``
+# because this is the module that already owns what "a rework attempt" means.
+REWORK_NO_DELTA = "rework_no_delta"
+
+# How much of the refused path list travels with the reason. Bounded: the
+# refusal names which paths were reproduced, it is not a place for an
+# unbounded manifest.
+MAX_REWORK_NO_DELTA_REASON_PATH_CHARS = 400
+
+
+def rework_no_delta_refusal(
+    workspace: WorkerWorkspace,
+    metadata: Mapping[str, Any],
+    changed: list[str],
+    *,
+    validation_only_replay: bool,
+) -> str:
+    """Name a rework attempt that reproduced its predecessor byte for byte.
+
+    NF-2026-01370 (a). ``worker_workspace.validate_required_outputs`` counts
+    the SEALED inherited predecessor delta as a change. That is correct for a
+    ``validation_only_replay`` -- no provider ran, so there is nothing new to
+    require -- and a false green for a provider-relaunched rework: an attempt
+    that edited nothing still arrives at the finalizer with the predecessor's
+    paths in ``changed`` and reaches ``review_ready``.
+
+    The refusal is minted only when the attempt's changed path SET and every
+    per-path SHA-256 equal the rejected predecessor's ``changed_path_hashes``
+    -- the sealed inherited delta, re-measured through the same
+    ``changed_path_hashes`` owner the retention path seals with, so the two
+    sides can never be two different measurements. One
+    changed byte, one added path or one removed path is a real delta and is
+    never refused. An empty, absent or non-string-digest predecessor record
+    proves no identity to compare against, so it mints nothing and leaves the
+    ordinary mandatory-output and quality gates to decide.
+    """
+    if validation_only_replay or not is_rework_attempt(metadata):
+        return ""
+    sealed = (metadata.get("rework_predecessor") or {}).get("changed_path_hashes")
+    if not isinstance(sealed, dict) or not sealed:
+        return ""
+    inherited = {str(path): digest for path, digest in sealed.items()}
+    if any(not isinstance(digest, str) or not digest for digest in inherited.values()):
+        return ""
+    if set(inherited) != set(changed):
+        return ""
+    current = changed_path_hashes(workspace, list(changed))
+    if any(current.get(path) != digest for path, digest in inherited.items()):
+        return ""
+    reproduced = ",".join(sorted(inherited))
+    return (
+        f"{REWORK_NO_DELTA}:"
+        + reproduced[:MAX_REWORK_NO_DELTA_REASON_PATH_CHARS]
+    )
+
+
+# NF-2026-01370 (b). The typed marker that says WHY source_graph is reported
+# missing, so the gate evidence explains itself instead of only naming the
+# tool.
+SOURCE_GRAPH_LIVE_CALLS_ALL_FAILED = "source_graph_live_calls_all_failed"
+
+
+def source_graph_orientation_voided(
+    failed_source_graph_calls: int | None,
+    *,
+    live_calls: int,
+    successful_calls: int,
+) -> bool:
+    """Say whether injected orientation may no longer satisfy ``source_graph``.
+
+    NF-2026-01370 (b). Supervisor-injected orientation records the
+    COORDINATOR's own pre-launch query. It is evidence that the initial call
+    was already executed, and it says nothing at all about a worker that
+    issued live Source Graph calls and had EVERY one of them fail: crediting
+    it there turns a worker that discovered nothing into a satisfied gate.
+
+    ``failed_source_graph_calls`` is the already-decoded authenticated count.
+    ``None`` is a malformed count from the authenticated ledger and voids
+    orientation (an unreadable failure record is never a zero); an ABSENT
+    count decodes to ``0`` and voids nothing, so a verifier that never
+    reported the field behaves exactly as before.
+    """
+    if live_calls > 0 or successful_calls > 0:
+        return False
+    if failed_source_graph_calls is None:
+        return True
+    return failed_source_graph_calls >= 1
+
+
 def retained_rework_candidate_evidence(
     terminal_state: str,
     workspace: WorkerWorkspace,

@@ -2777,6 +2777,12 @@ _REASON_CAUSE: dict[str, str] = {
     },
     "scope_rejected": CAUSE_CANDIDATE_SCOPE,
     "validation_failed": CAUSE_CANDIDATE_CODE,
+    # NF-2026-01370: a rework that reproduced its predecessor byte for byte
+    # produced no candidate of its own. The remediation is a fresh provider
+    # rework -- emphatically NOT ACTION_VALIDATION_ONLY_REPLAY, which would
+    # replay the identical bytes forever, nor validation_environment, which
+    # blames the sandbox for work that was never done.
+    "rework_no_delta": CAUSE_CANDIDATE_CODE,
     "claude_subscription_session_refresh_required": CAUSE_PROVIDER_CREDENTIAL,
     "validation_unsupported_in_sandbox": CAUSE_SANDBOX_UNSUPPORTED,
     # Every control-plane reason that says the CARD ROW moved or that this

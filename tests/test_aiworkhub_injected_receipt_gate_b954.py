@@ -128,17 +128,27 @@ def _no_receipt_stdout(tmp_path: Path) -> Path:
     return stdout
 
 
-def _patch_verify(monkeypatch, *, live_source_graph: int = 0, successful: dict | None = None, policy_violations: int = 0) -> None:
+def _patch_verify(monkeypatch, *, live_source_graph: int = 0, successful: dict | None = None, policy_violations: int = 0, failed: dict | None = None) -> None:
     payload = dict(successful or {})
+    # NF-2026-01370: ``failed`` stays OMITTED by default so every case above
+    # keeps exercising the backward-compatible "no failure record" ledger.
+    failed_payload = failed if not isinstance(failed, dict) else dict(failed)
 
     def fake_verify(*_a, **_k):
-        return {
+        record = {
             "ok": True,
             "live_source_graph_calls": live_source_graph,
             "successful_call_count_by_tool": dict(payload),
             "policy_violations": policy_violations,
             "reason": "",
         }
+        if failed_payload is not None:
+            record["failed_call_count_by_tool"] = (
+                dict(failed_payload)
+                if isinstance(failed_payload, dict)
+                else failed_payload
+            )
+        return record
 
     monkeypatch.setattr(pl.worker_ai_tools_mcp, "verify_audit_ledger", fake_verify)
 
@@ -1273,3 +1283,90 @@ def test_worker_prompt_no_longer_requests_an_acknowledgement_line():
     assert "PROJECT_CONTEXT_RECEIPT" not in prompt
     assert "emit one bounded acknowledgement line" not in prompt
     assert "no acknowledgement line is required" in prompt
+
+
+# --- NF-2026-01370 (b): failed live Source Graph calls void orientation ----
+
+def test_failed_live_source_graph_calls_void_injected_orientation(
+    tmp_path, monkeypatch
+):
+    """Injected orientation is the COORDINATOR's own pre-launch query.
+
+    NF-2026-01370 (b), measured on EntryLink 006a: a worker whose live
+    Source Graph calls ALL failed (failed >= 1, successful 0, live 0) still
+    had the gate satisfied by ``supervisor_injected_orientation``, so an
+    attempt that discovered nothing read as fully oriented. The gate now
+    reports ``source_graph`` missing and names why. Everything else is
+    unchanged: a successful live call still wins, and a ledger with no
+    failures (or no failure record at all) still credits orientation.
+    """
+    bundle = _sha()
+    stdout = _write_receipt(tmp_path, bundle, section_count=1)
+    sections = _sections(("source_graph", True, 5, ""))
+
+    def _gate():
+        return pl._worker_mcp_live_call_gate(
+            _metadata(
+                tmp_path, bundle_sha=bundle, sections=sections, stdout=stdout
+            ),
+            "req",
+        )
+
+    _patch_verify(monkeypatch, failed={"source_graph": 2})
+    all_failed = _gate()
+    # The receipt is still acknowledged -- the injected bundle WAS delivered
+    # and read. It simply no longer answers for a worker that tried and
+    # failed, which is the whole defect.
+    assert all_failed["injected_context_acknowledged"] is True
+    assert all_failed["satisfied"] is False
+    assert all_failed["missing_tools"] == ["source_graph"]
+    assert all_failed["satisfaction_by_tool"]["source_graph"] == (
+        "source_graph_live_calls_all_failed"
+    )
+    assert "source_graph" in all_failed["reason"]
+
+    # A successful live call is stronger evidence than an earlier failure.
+    _patch_verify(
+        monkeypatch,
+        live_source_graph=1,
+        successful={"source_graph": 1},
+        failed={"source_graph": 1},
+    )
+    live = _gate()
+    assert live["satisfied"] is True
+    assert live["satisfaction_by_tool"]["source_graph"] == "live_worker_call"
+
+    # Zero failed calls: orientation satisfies the gate exactly as before.
+    _patch_verify(monkeypatch, failed={})
+    zero_failed = _gate()
+    assert zero_failed["satisfied"] is True
+    assert zero_failed["missing_tools"] == []
+    assert zero_failed["satisfaction_by_tool"]["source_graph"] == (
+        "supervisor_injected_orientation"
+    )
+
+    # A malformed count from the authenticated ledger is never a zero.
+    _patch_verify(monkeypatch, failed={"source_graph": "not-a-number"})
+    malformed = _gate()
+    assert malformed["satisfied"] is False
+    assert malformed["satisfaction_by_tool"]["source_graph"] == (
+        "source_graph_live_calls_all_failed"
+    )
+
+    # A malformed SUCCESS count never raises past the gate boundary: the
+    # ledger's numeric decode guard refuses it by name before any satisfaction.
+    _patch_verify(monkeypatch, live_source_graph=1, successful={"source_graph": "x"})
+    malformed_success = _gate()
+    assert malformed_success["satisfied"] is False
+    assert malformed_success["reason"] == (
+        "audit_ledger_numeric_decode_failed:successful_call_count_by_tool:source_graph"
+    )
+
+    # A PRESENT but non-dict failure container is malformed shape, not an
+    # absent failure record: it voids orientation rather than crediting it.
+    _patch_verify(monkeypatch, failed="corrupt")
+    malformed_container = _gate()
+    assert malformed_container["satisfied"] is False
+    assert malformed_container["satisfaction_by_tool"]["source_graph"] == (
+        "source_graph_live_calls_all_failed"
+    )

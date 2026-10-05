@@ -107,11 +107,15 @@ from .launch_zero_delta import (
 )
 from .process_launcher_evidence import (
     DELTA_RETAINING_TERMINAL_STATES,
+    REWORK_NO_DELTA as _REWORK_NO_DELTA,
+    SOURCE_GRAPH_LIVE_CALLS_ALL_FAILED as _SOURCE_GRAPH_LIVE_CALLS_ALL_FAILED,
     is_rework_attempt as _is_rework_attempt,
     path_manifest as _path_manifest,
     retained_candidate_identity_evidence as _retained_candidate_identity_evidence,
     retained_candidate_seal_evidence as _retained_candidate_seal_evidence,
     retained_rework_candidate_evidence,
+    rework_no_delta_refusal as _rework_no_delta_refusal,
+    source_graph_orientation_voided as _source_graph_orientation_voided,
 )
 from . import process_launcher_validation as _launcher_validation
 # The crash-retry packet moved to ``crash_retry_packet`` unchanged under the
@@ -862,8 +866,17 @@ _VALIDATION_ENVIRONMENT_RESTRICTION_PREFIXES = (
 
 
 def _terminal_state_for_workspace_error(exc: WorkspaceError) -> str:
-    if str(exc).startswith("validation_unsupported_in_sandbox"):
+    error = str(exc)
+    if error.startswith("validation_unsupported_in_sandbox"):
         return "finalize_failed"
+    if error.startswith(_REWORK_NO_DELTA):
+        # NF-2026-01370: reproducing the predecessor byte for byte is the
+        # WORKER's missing delta. ``finalize_failed`` projects to
+        # ``validation_environment`` in the learning taxonomy and would blame
+        # the sandbox for work that was never done; ``worker_failed`` names it
+        # and is in DELTA_RETAINING_TERMINAL_STATES, so the sealed predecessor
+        # delta survives for the next rework.
+        return "worker_failed"
     return _launcher_validation.terminal_state_for_workspace_error(exc)
 
 # Failure workspaces remain available through coordinator review.  Once a
@@ -3962,15 +3975,35 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     # proves the same initial call was already executed before launch. Cached,
     # failed, degraded, non-authoritative, or unverified evidence is excluded
     # from injected_tools and remains fail-closed.
+    successful_source_graph = _decode_ledger_int(successful.get("source_graph")) or 0
+    failed_counts = verification.get("failed_call_count_by_tool")
+    # A PRESENT but non-dict container is malformed ledger shape, not an absent
+    # failure record: it voids orientation (None) instead of crediting it as 0.
+    failed_source_graph = (
+        _decode_ledger_int(failed_counts.get("source_graph"))
+        if isinstance(failed_counts, dict)
+        else _decode_ledger_int(None) if failed_counts is None else None
+    )
     if live_source_graph_calls > 0:
         satisfaction_by_tool["source_graph"] = "live_worker_call"
+    elif _source_graph_orientation_voided(
+        failed_source_graph,
+        live_calls=live_source_graph_calls,
+        successful_calls=successful_source_graph,
+    ):
+        # NF-2026-01370: this worker DID call Source Graph live and every call
+        # failed.  Injected orientation is the coordinator's own pre-launch
+        # query, so it credits nothing here: the tool is missing and the typed
+        # marker records why.
+        satisfaction_by_tool["source_graph"] = _SOURCE_GRAPH_LIVE_CALLS_ALL_FAILED
+        missing.append("source_graph")
     elif (
         verification.get("ok") is True
         and source_graph_injected_acknowledged
         and "source_graph" in injected_tools
     ):
         satisfaction_by_tool["source_graph"] = "supervisor_injected_orientation"
-    elif int(successful.get("source_graph") or 0) > 0:
+    elif successful_source_graph > 0:
         satisfaction_by_tool["source_graph"] = "stale_or_cached"
         stale.append("source_graph")
     else:
@@ -11701,6 +11734,9 @@ class ProcessManager:
                             list(metadata.get("residual_contract_manifest") or []),
                         )
                         predecessor = metadata.get("rework_predecessor")
+                        validation_only_replay = (
+                            metadata.get("execution_mode") == "validation_only_replay"
+                        )
                         required_output_records = validate_required_outputs(
                             workspace,
                             metadata.get("required_outputs") or [],
@@ -11724,10 +11760,7 @@ class ProcessManager:
                                 predecessor if isinstance(predecessor, dict) else None
                             ),
                             strict_rework_inheritance=True,
-                            validation_only_replay=(
-                                metadata.get("execution_mode")
-                                == "validation_only_replay"
-                            ),
+                            validation_only_replay=validation_only_replay,
                         )
                         validated_required_paths = {
                             rec["path"]
@@ -11760,6 +11793,16 @@ class ProcessManager:
                             if rec.get("replay_evidence")
                         ]
                         changed = sorted(set(changed) | validated_required_paths)
+                        # NF-2026-01370: the sealed inherited delta counted as
+                        # a change above is the PREDECESSOR's work; a rework
+                        # that reproduced its exact paths and bytes made none
+                        # of its own. A validation-only replay is unaffected.
+                        rework_refusal = _rework_no_delta_refusal(
+                            workspace, metadata, changed,
+                            validation_only_replay=validation_only_replay,
+                        )
+                        if rework_refusal:
+                            raise WorkspaceError(rework_refusal)
                         if not changed:
                             if validation_only_replay_records:
                                 # Exact, manager-authorized replay is itself the
@@ -12021,7 +12064,9 @@ class ProcessManager:
                         },
                         **retained_candidate,
                     }
-                    if terminal_state == "finalize_failed" or (
+                    # ``worker_failed``: an attempt that produced no new work
+                    # is blocked, never sent to review (NF-2026-01370).
+                    if terminal_state in {"finalize_failed", "worker_failed"} or (
                         _is_operational_validation_failure(terminal_state, error)
                     ):
                         terminal_evidence["error"] = error[:500]
