@@ -6879,7 +6879,9 @@ async function nf1275VisibleActivityEndToEnd() {
         fs.writeFileSync(spec,JSON.stringify({schema_id:"aiworkhub.vscode_lm.worker_spec.v1",
           request_id:requestId,repo_id:"repo_test",workspace_path:workspace,workspace_home:home,
           response_path:response,activity_path:artifact,activity_capture:true,allowed_writes:[]}),{mode:0o600});
-        const python=path.join(root,".venv",process.platform==="win32"?"Scripts/python.exe":"bin/python");
+        // CI checks out no .venv; the runner's own interpreter then runs the relay.
+        const venv=path.join(root,".venv",process.platform==="win32"?"Scripts/python.exe":"bin/python");
+        const python=fs.existsSync(venv)?venv:(process.platform==="win32"?"python":"python3");
         const child=require("child_process").spawnSync(python,["-m","aiworkhub.vscode_lm_worker","--spec",spec],{
           cwd:root,encoding:"utf8",timeout:20000,
           env:{...process.env,AIWORKHUB_ALLOW_WRITES:"1",PYTHONPATH:[path.join(root,"src"),root].join(path.delimiter)},
