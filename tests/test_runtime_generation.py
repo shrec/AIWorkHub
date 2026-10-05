@@ -204,3 +204,61 @@ def test_an_unsuperseded_service_reports_its_own_generation(tmp_path, monkeypatc
     health = task_reconciler.reconciler_health(repo)
     assert health["owner_runtime_generation"] == "G1"
     assert health["own_runtime_generation"] == "G1"
+
+
+def test_status_reports_serving_current_and_stale(tmp_path):
+    """NF-2026-01357: a pinned old generation is reported, never silently served."""
+    storage = tmp_path / "gs"
+    module = _install(storage, "0.9.69-old")
+    dev = tmp_path / "checkout" / "src" / "aiworkhub" / "runtime_generation.py"
+
+    assert runtime_generation.status(dev) == {"serving": "", "current": "", "stale": False}
+    # current.json absent or unreadable: reported as "", never an error.
+    assert runtime_generation.status(module) == {"serving": "0.9.69-old", "current": "", "stale": False}
+    _point(storage, "0.9.69-old")
+    assert runtime_generation.status(module)["stale"] is False
+
+    _point(storage, "0.12.24-new")
+    report = runtime_generation.status(module)
+    assert report["serving"] == "0.9.69-old"
+    assert report["current"] == "0.12.24-new"
+    assert report["stale"] is True
+    assert "0.9.69-old" in report["warning"] and "0.12.24-new" in report["warning"]
+    assert str(storage / "bin" / "aiworkhub-mcp-server.py") in report["warning"]
+
+
+def test_bootstrap_and_repo_current_report_runtime_generation(tmp_path, monkeypatch):
+    from aiworkhub import core, task_store
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    assert task_store.initialize_repository(repo)["ok"]
+    monkeypatch.setenv("AIWORKHUB_REPO", str(repo))
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    monkeypatch.setattr(
+        core, "_codex_manager_identity",
+        lambda: {"provider": "codex", "session_id": "s-1", "thread_id": "s-1"},
+    )
+    monkeypatch.setattr(core, "_CONTRACT_DELIVERIES", {})
+    monkeypatch.setattr(core, "_run_off_request_path", lambda target, *, name: None)
+    storage = tmp_path / "gs"
+    module = _install(storage, "0.9.69-old")
+    monkeypatch.setattr(runtime_generation, "__file__", str(module))
+    _point(storage, "0.12.24-new")
+
+    bootstrap = core.manager_bootstrap()
+    current = core.repository_current()
+
+    expected = {"serving": "0.9.69-old", "current": "0.12.24-new", "stale": True}
+    for reply in (bootstrap, current):
+        assert {k: reply["runtime_generation"][k] for k in expected} == expected
+    assert bootstrap["warning"] == bootstrap["runtime_generation"]["warning"]
+    # Reporting never weakens identity: the route stays exactly as verified.
+    assert bootstrap["ok"] is True and bootstrap["manager_verified"] is True
+    assert current["manager_verified"] is True
+
+    (storage / "runtime" / "current.json").write_text("{not json", encoding="utf-8")
+    unreadable = core.manager_bootstrap()
+    assert unreadable["ok"] is True
+    assert unreadable["runtime_generation"] == {"serving": "0.9.69-old", "current": "", "stale": False}
+    assert "warning" not in unreadable

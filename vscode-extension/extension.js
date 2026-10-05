@@ -9403,17 +9403,25 @@ function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, pyt
   // so portableWorkspaceMcpCommand preserves it verbatim. options.vscodeVariables
   // still governs the downstream assertMcpConfigConsumable gate, not the command.
   const portableCommand = portableWorkspaceMcpCommand(python.command, repoRoot);
+  const argsPrefix = Array.isArray(python.argsPrefix) ? python.argsPrefix : [];
+  // NF-2026-01357: the host-stable launcher re-reads runtime/current.json at
+  // every process start, so an upgrade never strands this entry on the old
+  // generation's PYTHONPATH. Without one, pin the generation as before.
+  const launcherPath = options.launcherPath ? String(options.launcherPath) : "";
+  const serverArgs = launcherPath ? [...argsPrefix, launcherPath] : [...argsPrefix, "-m", "aiworkhub.server"];
+  const runtimeEnv = launcherPath ? {} : { PYTHONPATH: runtimeDir };
   let found = false;
   for (const [name, value] of Object.entries(servers)) {
     if (!value || typeof value !== "object") continue;
     const args = Array.isArray(value.args) ? value.args.map(String) : [];
-    const isAiWorkHub = name.toLowerCase() === "aiworkhub" || args.includes("aiworkhub.server");
+    const isAiWorkHub = name.toLowerCase() === "aiworkhub" || args.includes("aiworkhub.server")
+      || args.some((arg) => /aiworkhub-mcp-server\.py$/.test(arg));
     if (!isAiWorkHub) continue;
     found = true;
-    const nextArgs = [...(Array.isArray(python.argsPrefix) ? python.argsPrefix : []), "-m", "aiworkhub.server"];
+    const nextArgs = [...serverArgs];
     const nextEnv = {
       ...(value.env && typeof value.env === "object" ? value.env : {}),
-      PYTHONPATH: runtimeDir,
+      ...runtimeEnv,
       AIWORKHUB_REPO: repoRoot,
       AIWORKHUB_REPO_ROOT: repoRoot,
       AIWORKHUB_MCP_STDIO_BACKEND: "stdlib",
@@ -9424,6 +9432,7 @@ function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, pyt
     if (!Object.prototype.hasOwnProperty.call(nextEnv, "AIWORKHUB_ALLOW_LAUNCH")) {
       nextEnv.AIWORKHUB_ALLOW_LAUNCH = "1";
     }
+    if (launcherPath) delete nextEnv.PYTHONPATH;
     const next = { ...value, command: portableCommand, args: nextArgs, env: nextEnv, type: "stdio" };
     if (JSON.stringify(next) !== JSON.stringify(value)) {
       servers[name] = next;
@@ -9433,9 +9442,9 @@ function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, pyt
   if (!found) {
     servers.AIWorkHub = {
       command: portableCommand,
-      args: [...(Array.isArray(python.argsPrefix) ? python.argsPrefix : []), "-m", "aiworkhub.server"],
+      args: serverArgs,
       env: {
-        PYTHONPATH: runtimeDir,
+        ...runtimeEnv,
         AIWORKHUB_REPO: repoRoot,
         AIWORKHUB_REPO_ROOT: repoRoot,
         AIWORKHUB_MCP_STDIO_BACKEND: "stdlib",
@@ -9462,13 +9471,24 @@ function repairClaudeMcpConfigObject(document, runtimeDir, repoRoot, python) {
 function ensureWorkspaceMcpConfigsRepaired(context) {
   const folders = vscode.workspace.workspaceFolders || [];
   const runtimeDir = extensionRuntimeDir || resolveExtensionRuntimeDir(context.extensionUri.fsPath);
+  // NF-2026-01357: Claude Code keeps an .mcp.json entry across upgrades, so
+  // point it at the host-stable launcher whenever that layout is live.
+  let claudeLauncher = "";
+  if (folders.length && context.globalStorageUri && context.globalStorageUri.fsPath) {
+    try {
+      const launcher = materializeStableMcpLauncher(context);
+      if (stableMcpLauncherLayoutOk(launcher)) claudeLauncher = launcher;
+    } catch (err) {
+      if (outputChannel) outputChannel.appendLine(`[mcp] stable launcher unavailable; Claude Code MCP pins this generation: ${sanitizeErrorMessage(err)}`);
+    }
+  }
   let repaired = 0;
   for (const folder of folders) {
     const repoRoot = canonicalRepositoryRoot(folder.uri.fsPath);
     const python = findPythonCommand(repoRoot, { preflight: false });
     for (const spec of [
       { configPath: path.join(repoRoot, ".vscode", "mcp.json"), container: "servers", label: "VS Code/Copilot", vscodeVariables: true },
-      { configPath: path.join(repoRoot, ".mcp.json"), container: "mcpServers", label: "Claude Code", vscodeVariables: false },
+      { configPath: path.join(repoRoot, ".mcp.json"), container: "mcpServers", label: "Claude Code", vscodeVariables: false, launcherPath: claudeLauncher },
     ]) {
       let document = {};
       let corrupt = false;
@@ -9480,7 +9500,7 @@ function ensureWorkspaceMcpConfigsRepaired(context) {
           if (outputChannel) outputChannel.appendLine(`[mcp] ${spec.label} config is invalid/unreadable; repairing atomically`);
         }
       }
-      const result = repairMcpConfigObject(document, spec.container, runtimeDir, repoRoot, python, { vscodeVariables: spec.vscodeVariables });
+      const result = repairMcpConfigObject(document, spec.container, runtimeDir, repoRoot, python, { vscodeVariables: spec.vscodeVariables, launcherPath: spec.launcherPath });
       if (!result.changed && !corrupt) continue;
       // Refuse to persist a config a downstream consumer cannot use: a file
       // read outside VS Code must never carry an unexpanded VS Code variable

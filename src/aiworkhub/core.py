@@ -30,6 +30,7 @@ from . import (
 )
 from . import platform_io
 from . import repository_state
+from . import runtime_generation
 from . import shared_router
 from . import sqlite_readonly
 from . import db_writer
@@ -3411,6 +3412,7 @@ def manager_bootstrap(
             },
         },
         "server_version": str(server_version),
+        "runtime_generation": runtime_generation.status(),
         "task_hygiene": hygiene,
         "task_health": _bootstrap_task_health(root, readiness),
         "dispatcher": dispatcher,
@@ -3456,6 +3458,8 @@ def manager_bootstrap(
             "manager_chat": chat,
         }
         reply["reason"] = ""
+    if reply["runtime_generation"]["stale"]:
+        reply["warning"] = reply["runtime_generation"]["warning"]
     if bootstrap_call:
         reply["callback_adoption"] = _adopt_callbacks_on_bootstrap(reply["manager_route"])
     return reply
@@ -3504,6 +3508,7 @@ def repository_current() -> dict[str, Any]:
         "binding_source": _repository_binding_source(),
         "manager_verified": bool(identity),
         "manager_route": identity or {},
+        "runtime_generation": runtime_generation.status(),
     }
 
 

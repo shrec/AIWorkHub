@@ -90,3 +90,23 @@ def superseded(own_path: Path | str | None = None) -> bool:
 
     own, current = generation_pair(own_path)
     return own is not None and current is not None and own != current
+
+
+def status(own_path: Path | str | None = None) -> dict[str, object]:
+    """``{serving, current, stale}`` for bootstrap/repo_current (NF-2026-01357).
+
+    A client entry pinned to one generation's path keeps serving that code
+    after upgrades; ``stale`` names it, with the fix, instead of failing.
+    """
+
+    own, current = generation_pair(own_path)
+    stale = own is not None and current is not None and own != current
+    report: dict[str, object] = {"serving": own or "", "current": current or "", "stale": stale}
+    if stale:
+        launcher = _generation_root(own_path)[1].parent / "bin" / "aiworkhub-mcp-server.py"
+        report["warning"] = (
+            f"stale_runtime_generation: this MCP server runs generation {own} but "
+            f"runtime/current.json names {current}; re-register the MCP entry to the "
+            f"stable launcher: python {launcher}"
+        )
+    return report

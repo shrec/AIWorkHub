@@ -279,4 +279,71 @@ const {
   assert.strictEqual(result.changed, false);
 }
 
+{
+  // NF-2026-01357: a Claude Code .mcp.json entry pinned to one generation's
+  // PYTHONPATH kept serving 0.9.69 after upgrades. With a live host-stable
+  // launcher the entry names the launcher, which resolves current.json at
+  // every start; .vscode/mcp.json and a dead layout keep the generation pin.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-mcp-launcher-"));
+  const repo = path.join(root, "repo");
+  const storage = path.join(root, "storage");
+  const generation = (name) => {
+    const runtime = path.join(storage, "runtime", "generations", name, "runtime");
+    fs.mkdirSync(path.join(runtime, "aiworkhub"), { recursive: true });
+    fs.writeFileSync(path.join(runtime, "aiworkhub", "__init__.py"), "", "utf8");
+    fs.writeFileSync(
+      path.join(runtime, "aiworkhub", "server.py"),
+      `def main():\n    print("serving ${name}")\n    return 0\n`,
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(storage, "runtime", "current.json"),
+      JSON.stringify({ schema_id: "aiworkhub.stable_runtime.v1", generation: name, runtime_dir: runtime }),
+      "utf8",
+    );
+    return runtime;
+  };
+  fs.mkdirSync(repo, { recursive: true });
+  const claudePath = path.join(repo, ".mcp.json");
+  const staleRuntime = path.join(storage, "runtime", "generations", "0.9.69-old", "runtime");
+  fs.writeFileSync(claudePath, JSON.stringify({ mcpServers: { AIWorkHub: {
+    command: "python", args: ["-m", "aiworkhub.server"],
+    env: { PYTHONPATH: staleRuntime, AIWORKHUB_REPO: repo }, type: "stdio",
+  } } }), "utf8");
+  fakeVscode.workspace.workspaceFolders = [{ uri: { fsPath: repo } }];
+  const context = { extensionUri: { fsPath: "/extension" }, globalStorageUri: { fsPath: storage } };
+  try {
+    // Dead layout (no current.json): the generation pin is kept, nothing breaks.
+    ensureWorkspaceMcpConfigsRepaired(context);
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(claudePath, "utf8")).mcpServers.AIWorkHub.args.slice(-2), ["-m", "aiworkhub.server"]);
+
+    generation("0.12.24-new");
+    assert.strictEqual(ensureWorkspaceMcpConfigsRepaired(context), 1);
+    const launcher = path.join(storage, "bin", "aiworkhub-mcp-server.py");
+    const entry = JSON.parse(fs.readFileSync(claudePath, "utf8")).mcpServers.AIWorkHub;
+    assert.deepStrictEqual(entry.args.slice(-1), [launcher]);
+    assert.ok(!("PYTHONPATH" in entry.env), "the launcher owns the runtime path");
+    const vscodeEntry = JSON.parse(fs.readFileSync(path.join(repo, ".vscode", "mcp.json"), "utf8")).servers.AIWorkHub;
+    assert.deepStrictEqual(vscodeEntry.args.slice(-2), ["-m", "aiworkhub.server"]);
+    assert.ok(entry.env.AIWORKHUB_REPO && entry.env.AIWORKHUB_REPO === vscodeEntry.env.AIWORKHUB_REPO);
+    assert.strictEqual(ensureWorkspaceMcpConfigsRepaired(context), 0, "an upgraded entry is stable");
+
+    // The same entry follows current.json across an upgrade, with no rewrite.
+    const python = process.env.AIWORKHUB_TEST_PYTHON || (process.platform === "win32" ? "python" : "python3");
+    const run = () => require("child_process").spawnSync(python, [launcher], { encoding: "utf8", env: { ...process.env, PYTHONPATH: staleRuntime } });
+    const first = run();
+    if (first.error && first.error.code === "ENOENT") {
+      console.log("workspace-mcp-runtime-repair: launcher run skipped (no python)");
+    } else {
+      assert.strictEqual(first.stdout.trim(), "serving 0.12.24-new", first.stderr);
+      generation("0.12.25-next");
+      assert.strictEqual(run().stdout.trim(), "serving 0.12.25-next");
+      assert.strictEqual(ensureWorkspaceMcpConfigsRepaired(context), 0);
+    }
+  } finally {
+    fakeVscode.workspace.workspaceFolders = [];
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
 console.log("workspace-mcp-runtime-repair: PASS");
