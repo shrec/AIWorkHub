@@ -14,6 +14,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.33
+
+- A rework overlay that inherits a file Source Graph cannot index (for example `CMakeLists.txt`, reported `unsupported_fail_closed`) no longer fails every worker Source Graph call: the file is carried as digest-bound evidence only, and an unknown status still fails closed (NF-2026-01369).
+- A rework relaunch that reproduces its predecessor byte for byte now ends `worker_failed` (`rework_no_delta`) instead of returning to review as new work, and the Source Graph gate no longer counts supervisor-injected orientation as satisfied when all of the worker's own live Source Graph calls failed (`source_graph_live_calls_all_failed`) (NF-2026-01370).
+- A release tag pushed together with main is no longer rejected: the Release workflow's CI provenance check now waits for the push CI run at the exact release commit, fails at once if that run did not succeed, and fails closed after 3000 s (NF-2026-01372).
+
 ## What's new in 0.12.32
 
 - .NET prerestore in the AppContainer handles `.slnx` solutions, restores the canonical solution instead of the first one found, and covers projects a card adds through a synthetic restore seed, so a new project no longer fails restore offline (NF-2026-01366).

@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.33 — 2026-10-06
+
+### Fixed
+
+- Rework overlay: an inherited `unsupported_fail_closed` file (for example `CMakeLists.txt`) is digest-only evidence instead of failing every worker Source Graph call (NF-2026-01369).
+- A zero-delta rework ends `worker_failed` (`rework_no_delta`) instead of reaching review; failed live Source Graph calls void injected orientation (NF-2026-01370).
+- The Release workflow waits for the exact-commit push CI run instead of rejecting a release whose CI is still running (NF-2026-01372).
+
+### Qualification
+
+- Independent component regressions pass; installation, activation and live qualification are separate evidence.
+
 ## 0.12.32 — 2026-10-05
 
 ### Fixed

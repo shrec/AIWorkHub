@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.33] - 2026-10-06
+
+### Fixed
+
+- Worker Source Graph rework overlay: an inherited path whose extraction status is `unsupported_fail_closed` (for example `CMakeLists.txt`) is digest-bound `file_evidence_only` evidence instead of failing every worker Source Graph call; an unknown status still fails closed (NF-2026-01369).
+- A provider-relaunched rework whose changed paths and sha256 equal the predecessor's sealed `changed_path_hashes` terminates `worker_failed` with `rework_no_delta`, classified as candidate code, instead of reaching `review_ready`; `validation_only_replay` is unaffected. Supervisor-injected orientation no longer satisfies the worker Source Graph gate when every live Source Graph call the worker made failed (`source_graph_live_calls_all_failed`); a malformed or non-dict failure record fails closed (NF-2026-01370).
+- The Release workflow's exact-commit CI provenance check waits for the push CI run at the release SHA (rescans every 30 s, up to 3000 s) instead of checking once; main and the tag are pushed together, so the single check always ran while CI was still in progress and rejected every release. A completed non-success run fails at once, and the deadline fails closed (NF-2026-01372).
+
+### Qualification
+
+- Each fix has regressions for its new contract; the touched suites and the full suite pass. Installation and live replay are separate evidence.
+
 ## [0.12.32] - 2026-10-05
 
 ### Fixed
