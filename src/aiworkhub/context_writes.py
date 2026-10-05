@@ -116,6 +116,8 @@ def _open(repo: Path, db_id: str) -> sqlite3.Connection:
     _normalize_context_mutations_schema(con)
     if db_id == "memory":
         _normalize_memory_schema(con)
+    elif db_id == "kb":
+        _normalize_kb_schema(con)
     return con
 
 
@@ -340,6 +342,72 @@ def _normalize_memory_schema(con: sqlite3.Connection) -> None:
     result = _ensure_memories_fts(con)
     if not result.get("ok"):
         raise ContextWriteError(f"fts_normalization_failed:{result.get('error', 'unknown')}")
+
+
+def _kb_fts_needs_rebuild(con: sqlite3.Connection) -> list[str] | None:
+    """Triggers writing to ``entries_fts`` when the index needs rebuilding, else None."""
+    triggers = [
+        str(name)
+        for name, sql in con.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger'").fetchall()
+        if "entries_fts" in str(sql or "").lower()
+    ]
+    row = con.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='entries_fts'").fetchone()
+    columns = [str(col[1]) for col in con.execute("PRAGMA table_info(entries_fts)").fetchall()]
+    canonical = (
+        row is not None
+        and columns == ["key", "title", "body", "category", "tags"]
+        and "content=" not in "".join(str(row[0] or "").lower().split())
+    )
+    return None if canonical and not triggers else triggers
+
+
+def _normalize_kb_schema(con: sqlite3.Connection) -> None:
+    """Rebuild a legacy AITools ``entries_fts`` into the canonical shape (NF-2026-01356).
+
+    A KB migrated from AITools keeps ``entries_fts`` as an external-content
+    index over ``(key,title,body,tags)`` -- no ``category`` -- maintained by
+    triggers on ``entries``.  ``kb_write`` maintains the canonical
+    ``(key,title,body,category,tags)`` index explicitly, so every upsert failed
+    with ``table entries_fts has no column named category`` (reported to the
+    manager as ``context_write_failed:OperationalError``).  Like
+    ``_migrate_memories_schema``: drop every trigger that writes to
+    ``entries_fts``, recreate the index canonically and backfill rowid=id, in
+    one ``BEGIN IMMEDIATE`` transaction re-checked under the lock; any failure
+    rolls back untouched.  A canonical index is a read-only no-op.
+    """
+    if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='entries'").fetchone() is None:
+        return
+    if _kb_fts_needs_rebuild(con) is None:
+        return
+    step = "begin_immediate"
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        step = "recheck_under_lock"
+        triggers = _kb_fts_needs_rebuild(con)
+        if triggers is None:
+            con.rollback()
+            return
+        step = "drop_fts_triggers"
+        for name in triggers:
+            con.execute('DROP TRIGGER IF EXISTS "' + name.replace('"', '""') + '"')
+        step = "drop_entries_fts"
+        con.execute("DROP TABLE IF EXISTS entries_fts")
+        step = "create_entries_fts"
+        con.execute("CREATE VIRTUAL TABLE entries_fts USING fts5(key,title,body,category,tags)")
+        con.execute(
+            "INSERT INTO entries_fts(rowid,key,title,body,category,tags) "
+            "SELECT id,key,title,body,category,tags FROM entries"
+        )
+        step = "commit"
+        con.commit()
+    except Exception as exc:
+        try:
+            con.rollback()
+        except sqlite3.Error:
+            pass
+        raise ContextWriteError(
+            f"kb_fts_migration_failed:step={step}:{type(exc).__name__}:{str(exc)[:120]}"
+        ) from exc
 
 
 def _normalize_context_mutations_schema(con: sqlite3.Connection) -> None:

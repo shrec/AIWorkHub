@@ -334,6 +334,52 @@ def test_kb_write_legacy_not_null_timestamps_other_column_error(tmp_path: Path) 
     )
 
 
+def test_kb_write_upserts_on_legacy_aitools_external_content_fts(tmp_path: Path) -> None:
+    """NF-2026-01356: an AITools-migrated KB indexes (key,title,body,tags) by trigger."""
+    repo = _repo(tmp_path)
+    db = storage_registry.resolve_database_path(storage_registry.load_storage_registry(repo), "kb")
+    con = sqlite3.connect(db)
+    try:
+        con.executescript(
+            "DROP TABLE entries_fts; DROP TABLE entries;"
+            "CREATE TABLE entries(id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT NOT NULL UNIQUE,"
+            "title TEXT NOT NULL,body TEXT NOT NULL DEFAULT '',category TEXT NOT NULL DEFAULT 'note',"
+            "tags TEXT NOT NULL DEFAULT '',source_refs TEXT NOT NULL DEFAULT '',"
+            "created_at TEXT NOT NULL,updated_at TEXT NOT NULL);"
+            "CREATE VIRTUAL TABLE entries_fts USING fts5(key,title,body,tags,content=entries,"
+            "content_rowid=id,tokenize='unicode61 remove_diacritics 0');"
+            "CREATE TRIGGER entries_ai AFTER INSERT ON entries BEGIN "
+            "INSERT INTO entries_fts(rowid,key,title,body,tags) "
+            "VALUES(new.id,new.key,new.title,new.body,new.tags); END;"
+            "INSERT INTO entries(key,title,body,created_at,updated_at) "
+            "VALUES('old.k','Old','legacyterm','2026-01-01','2026-01-01');"
+        )
+        con.commit()
+    finally:
+        con.close()
+    base = dict(actor=_actor(), provenance="legacy fts regression", title="T")
+
+    created = context_writes.kb_write(
+        repo, **base, action="upsert", key="new.k", body="freshterm", idempotency_key="kb:aitools:0001",
+    )
+    updated = context_writes.kb_write(
+        repo, **base, action="upsert", key="old.k", body="replacedterm", idempotency_key="kb:aitools:0002",
+    )
+
+    assert created["ok"] and updated["ok"] and updated["entry_id"] == 1
+    con = sqlite3.connect(db)
+    try:
+        def match(term: str) -> list[int]:
+            return [r[0] for r in con.execute("SELECT rowid FROM entries_fts WHERE entries_fts MATCH ?", (term,))]
+
+        assert match("freshterm") == [created["entry_id"]]
+        assert match("replacedterm") == [1]
+        assert match("legacyterm") == []
+        assert con.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='trigger'").fetchone()[0] == 0
+    finally:
+        con.close()
+
+
 def test_memory_write_legacy_not_null_timestamps_write_paths(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     db = _replace_memories_table(
