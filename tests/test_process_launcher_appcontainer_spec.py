@@ -2932,3 +2932,161 @@ def test_live_appcontainer_nested_child_sees_the_request_temp(tmp_path: Path) ->
     print(f"\nTEMP seen: {seen}")
     assert r"\ac\temp" in seen["bare"].lower()
     assert seen["trampoline"].lower().endswith(r"\home\vx")
+
+
+def _run_dotnet_lane_validation(
+    tmp_path: Path,
+    monkeypatch,
+    argv: list[str],
+):
+    """Drive ``_run_appcontainer_validation`` for the dotnet lane, no dotnet.
+
+    The host pre-restore is the only host call the dotnet adaptation adds, so
+    it is the one thing stubbed; the fake launch still records the exact argv
+    and environment the container would have been given.
+    """
+    import subprocess
+
+    from aiworkhub import worker_workspace_appcontainer_dotnet as dotnet_lane
+
+    launches: list[_FakeValidationLaunch] = []
+    prerestores: list[tuple[list[str], dict]] = []
+    _stub_repo_id(monkeypatch)
+    monkeypatch.setattr(windows_appcontainer, "native_handle", lambda fd: fd)
+    _install_fake_launch(
+        monkeypatch,
+        stdout=b"",
+        stderr=b"",
+        outcome=windows_appcontainer.AppContainerLifecycleResult(
+            windows_appcontainer.AppContainerLifecycleState.EXITED,
+            exit_code=0,
+        ),
+        sink=launches,
+    )
+
+    def _fake_run(command, **kwargs):
+        prerestores.append((list(command), dict(kwargs)))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(dotnet_lane.subprocess, "run", _fake_run)
+    monkeypatch.setenv("NUGET_PACKAGES", str(tmp_path / "host-packages"))
+    worktree = tmp_path / "wt"
+    worktree.mkdir(exist_ok=True)
+    canonical = tmp_path / "canonical"
+    canonical.mkdir(exist_ok=True)
+    # Only the canonical tree may be evaluated on the host, so the candidate
+    # carries a same-named decoy that must never reach the recorded argv.
+    (canonical / "app.csproj").write_text("<Project />", encoding="utf-8")
+    (worktree / "app.csproj").write_text("<Project />", encoding="utf-8")
+    workspace = SimpleNamespace(
+        repo=canonical, path=worktree, home=tmp_path / "home"
+    )
+    declared_env = {"PATH": "x"}
+    result = worker_workspace._run_appcontainer_validation(
+        argv,
+        workspace=workspace,
+        adapter_id="claude_cli",
+        cwd=worktree,
+        env=declared_env,
+        timeout_seconds=30,
+    )
+    return result, launches, prerestores, declared_env, workspace
+
+
+def test_appcontainer_validation_launches_the_rewritten_dotnet_argv(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A dotnet build reaches the container with the lane argv and env."""
+    result, launches, prerestores, declared_env, workspace = _run_dotnet_lane_validation(
+        tmp_path, monkeypatch, ["dotnet", "build", "app.csproj"]
+    )
+
+    home = workspace.home
+    expected = [
+        "dotnet",
+        "build",
+        "--artifacts-path",
+        str(home / "dotnet-artifacts"),
+        "-m:1",
+        "-nodeReuse:false",
+        "-p:UseSharedCompilation=false",
+        "-p:NuGetAudit=false",
+        "app.csproj",
+    ]
+    assert list(launches[0].request.argv) == expected
+    assert result.args == expected
+
+    environment = launches[0].request.environment
+    assert environment["DOTNET_CLI_HOME"] == str(home)
+    assert environment["APPDATA"] == str(home / "AppData" / "Roaming")
+    assert environment["LOCALAPPDATA"] == str(home / "AppData" / "Local")
+    assert environment["NUGET_PACKAGES"] == str(home / ".nuget" / "packages")
+    assert environment["DOTNET_NOLOGO"] == "1"
+    assert environment["DOTNET_SKIP_FIRST_TIME_EXPERIENCE"] == "1"
+    assert environment["DOTNET_CLI_TELEMETRY_OPTOUT"] == "1"
+    assert environment["MSBUILDDISABLENODEREUSE"] == "1"
+    assert environment["DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER"] == "1"
+    assert environment["PATH"] == "x"
+    assert declared_env == {"PATH": "x"}
+
+    assert len(prerestores) == 1
+    command, kwargs = prerestores[0]
+    packages = str(home / ".nuget" / "packages")
+    assert command[command.index("--packages") + 1] == packages
+    assert command[command.index("--source") + 1] == str(tmp_path / "host-packages")
+    assert kwargs["shell"] is False
+    assert kwargs["timeout"] > 0
+    resolved_cwd = Path(kwargs["cwd"]).resolve()
+    assert resolved_cwd == Path(workspace.repo).resolve()
+    assert not str(resolved_cwd).startswith(str(Path(workspace.path).resolve()))
+    project = Path(command[2]).resolve()
+    assert project == (Path(workspace.repo) / "app.csproj").resolve()
+    assert not str(project).startswith(str(Path(workspace.path).resolve()))
+
+
+def test_appcontainer_validation_dotnet_lane_leaves_other_commands_unchanged(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A non-dotnet command keeps its declared argv and env byte for byte."""
+    result, launches, prerestores, declared_env, workspace = _run_dotnet_lane_validation(
+        tmp_path, monkeypatch, ["cargo", "test"]
+    )
+
+    assert list(launches[0].request.argv) == ["cargo", "test"]
+    assert result.args == ["cargo", "test"]
+    assert launches[0].request.environment == {"PATH": "x"}
+    assert declared_env == {"PATH": "x"}
+    assert prerestores == []
+    assert not (workspace.home / "dotnet-artifacts").exists()
+    assert not (workspace.home / ".nuget").exists()
+
+
+def test_appcontainer_validation_reports_a_blocked_dotnet_prerestore(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A blocked host pre-restore is a typed environment failure, not code."""
+    from aiworkhub import worker_workspace_appcontainer_dotnet as dotnet_lane
+
+    monkeypatch.setattr(
+        dotnet_lane,
+        "_appcontainer_dotnet_prerestore",
+        lambda *args, **kwargs: "no_canonical_project",
+    )
+    _stub_repo_id(monkeypatch)
+    worktree = tmp_path / "wt"
+    worktree.mkdir(exist_ok=True)
+    workspace = SimpleNamespace(
+        repo=tmp_path, path=worktree, home=tmp_path / "home"
+    )
+    with pytest.raises(OSError) as caught:
+        worker_workspace._run_appcontainer_validation(
+            ["dotnet", "build"],
+            workspace=workspace,
+            adapter_id="claude_cli",
+            cwd=worktree,
+            env={"PATH": "x"},
+            timeout_seconds=30,
+        )
+    assert str(caught.value) == (
+        "validation_executable_unavailable:dotnet_prerestore:no_canonical_project"
+    )

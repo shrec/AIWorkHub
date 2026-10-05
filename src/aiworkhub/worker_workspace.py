@@ -13139,6 +13139,17 @@ def _run_appcontainer_validation(
         effective_argv = _appcontainer_node_validation_argv(
             effective_argv, _appcontainer_node_version(executable)
         )
+    from .worker_workspace_appcontainer_dotnet import (
+        _appcontainer_dotnet_validation_command,
+        _is_appcontainer_dotnet_executable,
+    )
+    if _is_appcontainer_dotnet_executable(executable):
+        # NF-2026-01366: node reuse and the VBCSCompiler need AppContainer-denied
+        # global named pipes; obj/bin and the NuGet/APPDATA state must leave the
+        # read-only worktree, so the sibling module rewrites argv and env only.
+        effective_argv, env = _appcontainer_dotnet_validation_command(
+            effective_argv, workspace=workspace, cwd=cwd, env=env
+        )
     launch_argv = effective_argv
     if (
         env.get("TMPDIR")
