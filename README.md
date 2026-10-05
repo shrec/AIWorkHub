@@ -62,6 +62,13 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.30
+
+- Source Graph partitions no longer go malformed on Windows: publishing a database whose last byte is 0x1A kept every byte, so quality reviewers whose prewarm failed with `database disk image is malformed` launch again (NF-2026-01365).
+- `bodygrep` returns first-party hits before vendored ones (`third_party/`, `vendor/`, ...), so a large vendored tree no longer starves the budget (NF-2026-01363).
+- A refused Claude auth relaunch keeps its `worker_prompt_not_delivered:<detail>` reason, and its relaunch files age out with the run (NF-2026-01360).
+- The worker concurrency cap shows in the default `list_processes` summary (NF-2026-01359).
+
 ## What's new in 0.12.29
 
 - Quality reviewers can run in parallel again: a reviewer workspace no longer copies the hub's live database `-wal`/`-shm` and `.lock` files, whose locked bytes made concurrent reviewer launches fail with a bare `[Errno 13]` (NF-2026-01358).

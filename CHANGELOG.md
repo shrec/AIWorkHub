@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.30] - 2026-10-05
+
+### Fixed
+
+- `platform_io.durable_atomic_replace` opens the Windows fsync descriptor with `O_BINARY`; the CRT text-mode `O_RDWR` open stripped a trailing Ctrl-Z (0x1A), truncating a published SQLite partition by one byte and failing Source Graph prewarm for quality reviewers (NF-2026-01365).
+- `bodygrep` scans first-party files before vendored directories (`third_party`, `third-party`, `thirdparty`, `3rdparty`, `vendor`, `vendored`) with deterministic resume, so vendored literal matches cannot starve first-party hits (NF-2026-01363).
+- `supervisor_spawn_failure_cause` accepts the launcher-minted `worker_prompt_not_delivered:<detail>` shape; terminal log retention owns `<rid>.prompt`, `<rid>.relaunch-spec.json` and `<rid>.attempt1.*`; its enforcement lock is per repository (NF-2026-01360, NF-2026-01362).
+- The `list_processes` summary view includes `concurrency_limit` and `workforce_cap` (NF-2026-01359).
+- The AppContainer `sitecustomize` docstring no longer prints a `SyntaxWarning` in every validation run.
+
+### Qualification
+
+- Each fix has regressions that fail before and pass after; the touched suites and the full suite pass. Installation and live replay are separate evidence.
+
 ## [0.12.29] - 2026-10-05
 
 ### Fixed

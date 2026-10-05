@@ -1,5 +1,18 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.30 — 2026-10-05
+
+### Fixed
+
+- Source Graph partitions ending in byte 0x1A are published intact on Windows, so quality reviewers no longer fail prewarm with a malformed database (NF-2026-01365).
+- `bodygrep` returns first-party hits before vendored ones (NF-2026-01363).
+- Refused Claude auth relaunches keep their reason; relaunch files age out with their run (NF-2026-01360).
+- Worker concurrency cap in the default process list (NF-2026-01359).
+
+### Qualification
+
+- Independent component regressions pass; installation, activation and live qualification are separate evidence.
+
 ## 0.12.29 — 2026-10-05
 
 ### Fixed
