@@ -8195,7 +8195,6 @@ def test_finalize_failed_bare_errno_13_names_its_raising_site(monkeypatch, tmp_p
     assert "sandbox_filesystem_denied" in authority["error"]
 
 
-@pytest.mark.xfail(strict=True, reason="NF-2026-01358 patch pending in launcher")
 def test_launch_failed_bare_errno_13_names_its_phase_and_site(monkeypatch, tmp_path):
     """NF-2026-01358: a filename-less ``[Errno 13] Permission denied`` raised while
     provisioning the workspace is recorded with its launch phase and aiworkhub

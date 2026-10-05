@@ -91,6 +91,7 @@ LAUNCH_ISOLATED_SEAM_NAMES: tuple[str, ...] = (
     "core",
     "create_quality_review_workspace",
     "create_workspace",
+    "exception_text_with_site",
     "hashlib",
     "json",
     "kilo_auth",
@@ -315,6 +316,7 @@ def launch_isolated(
     core = _pl.core
     create_quality_review_workspace = _pl.create_quality_review_workspace
     create_workspace = _pl.create_workspace
+    exception_text_with_site = _pl.exception_text_with_site
     hashlib = _pl.hashlib
     json = _pl.json
     kilo_auth = _pl.kilo_auth
@@ -1516,6 +1518,11 @@ def launch_isolated(
             if expected
             else f"unexpected_launch_error:{type(exc).__name__}:{exc}"
         )
+        if isinstance(exc, OSError) and exc.filename is None:
+            # NF-2026-01358: a bare "[Errno 13] Permission denied" names no path,
+            # so record the phase and raising frame; the str(exc) prefix the
+            # failure classifier keys on is kept.
+            reason = f"{exception_text_with_site(exc)} launch_phase={launch_phase}"
         if (
             reserved_request_id is None
             and isinstance(exc, LaunchRejected)
