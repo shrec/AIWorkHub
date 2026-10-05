@@ -62,6 +62,13 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.29
+
+- Quality reviewers can run in parallel again: a reviewer workspace no longer copies the hub's live database `-wal`/`-shm` and `.lock` files, whose locked bytes made concurrent reviewer launches fail with a bare `[Errno 13]` (NF-2026-01358).
+- The worker concurrency cap is visible: `manager_bootstrap` and `aiworkhub_agent_list_processes` report `workforce_cap` (effective cap, `default`/`env` source, reason); it is still set by `AIWORKHUB_MAX_PROCESSES` in the MCP server env, default 4, ceiling 32 (NF-2026-01359).
+- A Claude worker relaunched after an auth refresh receives the exact original prompt, or fails closed with a named reason instead of running without it (NF-2026-01354).
+- Enabling a model in Settings works when its adapter was disabled; KB writes work on a legacy AITools knowledge base; a stale runtime generation is reported and Claude Code `.mcp.json` points at a stable launcher (NF-2026-01355, NF-2026-01356, NF-2026-01357).
+
 ## What's new in 0.12.28
 
 - Manager Chat: Enter sends (Shift+Enter keeps a newline); a message sent while a callback or other turn runs is queued and goes before the next callback wake instead of being refused; the panel follows a server-side session rotation instead of sticking on "Session closed" with an ever-growing Thinking timer; a refused send gives the text back.

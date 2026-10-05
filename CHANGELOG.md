@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.29] - 2026-10-05
+
+### Fixed
+
+- Reviewer and combined-validation workspaces skip live `.aiworkhub` runtime files (`*.sqlite-wal`/`-shm`, `*.db-wal`/`-shm`, `*.lock`, `*.sock`, `credentials/`, `worktrees/`, `backups/`) so a byte-range-locked file no longer fails a concurrent reviewer launch with a bare `[Errno 13]`; a filename-less launch `OSError` now records its `launch_phase` and aiworkhub raising frame (NF-2026-01358).
+- The Claude auth-retry relaunch replays the persisted prompt and launch spec after verifying the prompt SHA-256, the declared stdin byte count and argv; otherwise it fails closed as `spawn_failed`/126 with `worker_prompt_not_delivered`. The first attempt's logs are kept as `<rid>.attempt1.*` (NF-2026-01354).
+- `process_launcher` admits launches through `repo_policy.resolve_workforce_cap` (ceiling 32), and `manager_bootstrap` and `list_processes` report `workforce_cap` (NF-2026-01359).
+- Enabling a model in Settings lifts its own disabled adapter gate and pins that adapter's other models off (NF-2026-01355); a legacy AITools `entries_fts` is rebuilt to the canonical index so manager KB upsert stops failing (NF-2026-01356).
+- `manager_bootstrap` and `repo_current` report `runtime_generation` with a warning when the serving generation is stale, and the extension points the Claude Code `.mcp.json` at the stable `aiworkhub-mcp-server.py` launcher, keeping other env such as `AIWORKHUB_MAX_PROCESSES` (NF-2026-01357).
+
+### Qualification
+
+- Each fix has regressions that fail before and pass after; the touched suites and the full suite pass. Installation and live replay are separate evidence.
+
 ## [0.12.28] - 2026-10-05
 
 ### Fixed

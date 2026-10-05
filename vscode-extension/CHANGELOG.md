@@ -1,5 +1,18 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.29 — 2026-10-05
+
+### Fixed
+
+- Quality reviewers can run in parallel again: live hub database and lock files stay out of reviewer workspaces (NF-2026-01358).
+- A Claude worker relaunched after an auth refresh gets its exact prompt or fails closed (NF-2026-01354).
+- Worker concurrency cap reported in bootstrap and the process list (NF-2026-01359).
+- Settings: enabling a model lifts its disabled adapter gate (NF-2026-01355); KB writes on legacy knowledge bases (NF-2026-01356); stale runtime generation warning and stable `.mcp.json` launcher (NF-2026-01357).
+
+### Qualification
+
+- Independent component regressions pass; installation, activation and live qualification are separate evidence.
+
 ## 0.12.28 — 2026-10-05
 
 ### Fixed
