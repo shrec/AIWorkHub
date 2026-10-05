@@ -1327,6 +1327,20 @@ def _is_repository_root_generated_data_jsonl(relative_path: str) -> bool:
     return rel.startswith("data/") and rel.casefold().endswith(".jsonl")
 
 
+# Directory names that conventionally hold vendored, pinned third-party source
+# (``AIWorkhubCli/third_party/sqlite3``, ``vendor/``). Such files stay indexed;
+# this only ranks them behind first-party source where a bounded scan must
+# choose what to read first.
+VENDORED_DIR_NAMES = frozenset({
+    "third_party", "third-party", "thirdparty", "3rdparty", "vendor", "vendored",
+})
+
+
+def _is_vendored_path(relative_path: str) -> bool:
+    parts = relative_path.replace("\\", "/").strip("/").split("/")[:-1]
+    return any(part.casefold() in VENDORED_DIR_NAMES for part in parts)
+
+
 def _is_nested_linked_worktree_dir(repo_root: Path, directory: Path) -> bool:
     """True when ``directory`` is a linked git worktree below ``repo_root``.
 
@@ -5015,6 +5029,11 @@ _BODYGREP_SKIP_ALL_LINES = 1 << 62
 _BODYGREP_MAX_CURSOR_LINE_DIGITS = len(str(_BODYGREP_SKIP_ALL_LINES))
 
 
+def _bodygrep_scan_tier(file_path: str) -> int:
+    """Return the bodygrep walk tier: 0 for first-party, 1 for vendored."""
+    return 1 if _is_vendored_path(str(file_path)) else 0
+
+
 def _bodygrep_cursor_digest(term: str, target: str, budget: int) -> str:
     payload = f"{term}\x1f{target}\x1f{budget}".encode("utf-8")
     return hashlib.sha256(payload).hexdigest()[:16]
@@ -5213,11 +5232,17 @@ def bodygrep_query(
         ):
             raise SourceGraphError("bodygrep_target_invalid")
 
-    # A cursor resumes the ORDER BY file_path walk at ``file_path >=
-    # resume_file`` and skips lines already returned inside that file, so the
-    # rest of the repository stays reachable across pages instead of the scan
-    # ending forever at the first byte-cap or file-cap overrun. The cursor is
-    # bound to this exact (term, target, budget) tuple.
+    # The walk is ORDER BY (scan tier, file_path): first-party files before
+    # vendored ones. ``AIWorkhubCli/third_party/`` sorts before ``src/``, so a
+    # plain path order let a literal repeated through sqlite3.c or catch2 fill
+    # the match budget (or byte cap) before any first-party file was opened
+    # (NF-2026-01363). A cursor resumes at ``(tier, file_path) >= (tier of
+    # resume_file, resume_file)`` and skips lines already returned inside that
+    # file, so the rest of the repository stays reachable across pages instead
+    # of the scan ending forever at the first byte-cap or file-cap overrun. The
+    # tier is derived from the cursor's own file, so the same cursor always
+    # yields the same page. The cursor is bound to this exact (term, target,
+    # budget) tuple.
     resume = _decode_bodygrep_cursor(
         cursor, term=cursor_term, target=normalized_target, budget=budget,
     )
@@ -5225,8 +5250,19 @@ def bodygrep_query(
     resume_line = resume[1] if resume else 0
     conn = connect(resolve_db_path(repo_root), read_only=True)
     try:
-        resume_clause = " AND file_path >= ?" if resume_file is not None else ""
-        resume_param: tuple[Any, ...] = (resume_file,) if resume_file is not None else ()
+        conn.create_function(
+            "bodygrep_scan_tier", 1, _bodygrep_scan_tier, deterministic=True,
+        )
+        order = " ORDER BY bodygrep_scan_tier(file_path), file_path LIMIT ?"
+        resume_predicate = (
+            "(bodygrep_scan_tier(file_path) > ?"
+            " OR (bodygrep_scan_tier(file_path) = ? AND file_path >= ?))"
+        )
+        resume_clause = f" AND {resume_predicate}" if resume_file is not None else ""
+        resume_param: tuple[Any, ...] = ()
+        if resume_file is not None:
+            resume_tier = _bodygrep_scan_tier(resume_file)
+            resume_param = (resume_tier, resume_tier, resume_file)
         if normalized_target:
             exact = conn.execute(
                 "SELECT 1 FROM files WHERE file_path=? LIMIT 1",
@@ -5235,7 +5271,7 @@ def bodygrep_query(
             if exact:
                 query = (
                     "SELECT file_path FROM files WHERE file_path=?" + resume_clause
-                    + " ORDER BY file_path LIMIT ?"
+                    + order
                 )
                 params: tuple[Any, ...] = (
                     normalized_target, *resume_param, scan_file_cap + 1,
@@ -5249,12 +5285,12 @@ def bodygrep_query(
                 query = (
                     "SELECT file_path FROM files WHERE file_path LIKE ? ESCAPE '\\'"
                     + resume_clause
-                    + " ORDER BY file_path LIMIT ?"
+                    + order
                 )
                 params = (f"{escaped}/%", *resume_param, scan_file_cap + 1)
         else:
-            where = (" WHERE file_path >= ?" if resume_file is not None else "")
-            query = "SELECT file_path FROM files" + where + " ORDER BY file_path LIMIT ?"
+            where = (f" WHERE {resume_predicate}" if resume_file is not None else "")
+            query = "SELECT file_path FROM files" + where + order
             params = (*resume_param, scan_file_cap + 1)
         paths = [
             str(row["file_path"])
