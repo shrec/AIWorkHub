@@ -50,6 +50,7 @@ from . import learning_commit
 from . import needfix_store
 from .platform_io import (
     AdvisoryLockTimeout,
+    atomic_replace,
     available_memory_bytes as _available_memory_bytes,
     chmod_fd,
     chmod_path,
@@ -75,6 +76,8 @@ from .process_launcher_acceptance import finished_acceptance_result as _finished
 from .process_launcher_accept_review import accept_preview as _accept_preview_impl
 from .process_launcher_accept_review import accept_review as _accept_review_impl
 from .process_launcher_launch_isolated import launch_isolated as _launch_isolated_impl
+from .process_launcher_launch_isolated import relaunch_input_paths as _relaunch_input_paths
+from .process_launcher_launch_isolated import spawn_with_stdin_payload as _spawn_with_stdin_payload
 from .launch_replay_guard import (
     CARD_CONTENT_IDENTITY_KEYS,
     IDENTICAL_RELAUNCH_BLOCKED_REASON,
@@ -8878,11 +8881,13 @@ class ProcessManager:
                 with stdout_path.open("ab", buffering=0) as stdout_fh, stderr_path.open(
                     "ab", buffering=0
                 ) as stderr_fh:
-                    process = self._popen(
+                    # NF-2026-01354: a prompt-on-stdin plan gets its prompt here too.
+                    process = _spawn_with_stdin_payload(
+                        self._popen,
                         list(plan.argv),
+                        stdin_payload=runtime_adapters.plan_stdin_payload(plan),
                         cwd=str(plan.cwd),
                         env=child_env,
-                        stdin=subprocess.DEVNULL,
                         stdout=stdout_fh,
                         stderr=stderr_fh,
                         shell=False,
@@ -9898,65 +9903,121 @@ class ProcessManager:
         stderr_path = Path(str(metadata["stderr_path"]))
         cancel_path = Path(str(metadata["cancel_path"]))
         spec_path = self.process_dir / f"{request_id}.supervisor-spec.json"
-        for stale_path in (status_path, stdout_path, stderr_path, cancel_path):
-            unlink_if_regular(stale_path)
+        # NF-2026-01354: the first attempt's files are the 401's evidence, so
+        # they are rotated to ``<request>.attempt1.*`` beside them (one attempt,
+        # 0600), never deleted.  The retry count is persisted before anything
+        # is spawned, so a re-entered finalizer can never rotate twice.
+        identity = {key: metadata.get(key) for key in ("task_id", "runner", "topic", "model")}
+        rotated: dict[str, str] = {}
+        for label, path in (
+            ("status", status_path), ("stdout", stdout_path),
+            ("stderr", stderr_path), ("cancel", cancel_path),
+        ):
+            if path.is_file():
+                attempt1 = path.with_name(f"{request_id}.attempt1{path.name[len(request_id):]}")
+                atomic_replace(path, attempt1)
+                chmod_path(attempt1, 0o600)
+                rotated[label] = str(attempt1)
         _touch_0600(stdout_path)
         _touch_0600(stderr_path)
         timeout_seconds = int(metadata.get("timeout_seconds") or 30)
-        write_json_0600(
-            spec_path,
-            {
-                "argv": list(worker_argv),
-                "cwd": worker_cwd,
-                **_legacy_timeout_fields(timeout_seconds),
-                "status_path": str(status_path),
-                "cancel_path": str(cancel_path),
-                "stdout_path": str(stdout_path),
-                "stderr_path": str(stderr_path),
-                "max_output_bytes": MAX_WORKER_STREAM_LOG_BYTES,
-                "adapter_id": "claude_cli",
-                "token_budget": metadata.get("token_budget"),
-            },
-        )
-        launch_env = worker_launch_env(
-            "claude_cli",
-            repo=self.repo,
-            request_id=request_id,
-            home=workspace.home,
-            isolated_task_queue_db=True,
-        )
-        supervisor = _worker_supervisor_script()
-        process = self._popen(
-            [sys.executable, str(supervisor), "--spec", str(spec_path)],
-            cwd=worker_cwd,
-            env=launch_env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            shell=False,
-            **process_group_launch_kwargs(os.name),
-        )
-        start_ticks = _pid_start_ticks(process.pid)
-        if start_ticks is None:
-            _terminate_process_group(process.pid, grace_seconds=5.0)
-            raise WorkspaceError("supervisor_pid_identity_unavailable")
-        updated = {
-            **metadata,
-            "claude_auth_retry_count": 1,
-            "claude_auth_retry": {
-                "schema_id": "aiworkhub.claude_auth_retry.v1",
-                "http_status": classified["http_status"],
-                "session_id_sha256": classified["session_id_sha256"],
-                "credential_projection_refreshed": bool(
-                    projection.get("refreshed")
-                ),
-                "credential_projection_sha256": str(
-                    projection.get("destination_sha256") or ""
-                ),
-                "host_auth_refreshed": True,
-            },
+        retry_evidence = {
+            "schema_id": "aiworkhub.claude_auth_retry.v1",
+            "http_status": classified["http_status"],
+            "session_id_sha256": classified["session_id_sha256"],
+            "credential_projection_refreshed": bool(projection.get("refreshed")),
+            "credential_projection_sha256": str(projection.get("destination_sha256") or ""),
+            "host_auth_refreshed": True,
+            "attempt1_paths": rotated,
         }
-        write_json_0600(metadata_path, updated)
+        write_json_0600(metadata_path, {
+            **metadata, "claude_auth_retry_count": 1, "claude_auth_retry": retry_evidence,
+        })
+        self._append_event({
+            "request_id": request_id, **identity, "adapter_id": "claude_cli",
+            "state": "finalizing", "provider_process_alive": False,
+            "claude_auth_retry": retry_evidence,
+        })
+        # NF-2026-01354: replay the first launch's own spec and stdin bytes, or
+        # spawn nothing.  A relaunch that cannot prove it carries the same
+        # prompt is a prompt-delivery failure, never a second worker run.
+        prompt_path, relaunch_spec_path = _relaunch_input_paths(self.process_dir, request_id)
+        refusal = ""
+        try:
+            stdin_payload = prompt_path.read_bytes()
+            relaunch_spec = json.loads(relaunch_spec_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            refusal = f"worker_prompt_not_delivered:claude_auth_retry:relaunch_input_unreadable:{type(exc).__name__}"
+        else:
+            if hashlib.sha256(stdin_payload).hexdigest() != metadata.get("stdin_payload_sha256"):
+                refusal = "worker_prompt_not_delivered:claude_auth_retry:prompt_sha256_mismatch"
+            elif (
+                not isinstance(relaunch_spec, dict)
+                or relaunch_spec.get(runtime_adapters.WORKER_PROMPT_BYTES_SPEC_KEY) != len(stdin_payload)
+                or relaunch_spec.get("argv") != worker_argv
+            ):
+                refusal = "worker_prompt_not_delivered:claude_auth_retry:relaunch_spec_mismatch"
+        process = None
+        start_ticks = None
+        if not refusal:
+            write_json_0600(spec_path, relaunch_spec)
+            # Same environment rules as the first launch (launch_isolated):
+            # an AppContainer child needs its HOME-local TEMP and LOCALAPPDATA.
+            sandbox_backend = metadata.get("sandbox_backend")
+            launch_env = worker_launch_env(
+                "claude_cli",
+                repo=self.repo,
+                request_id=request_id,
+                home=(
+                    workspace.home
+                    if sandbox_backend
+                    in {"landlock", "windows_appcontainer", VSCODE_LM_IN_PROCESS_BACKEND}
+                    else None
+                ),
+                isolated_task_queue_db=True,
+                sandbox_backend=sandbox_backend,
+            )
+            if sandbox_backend == "windows_appcontainer" and os.environ.get("LOCALAPPDATA"):
+                launch_env["LOCALAPPDATA"] = os.environ["LOCALAPPDATA"]
+            try:
+                process = _spawn_with_stdin_payload(
+                    self._popen,
+                    [sys.executable, str(_worker_supervisor_script()), "--spec", str(spec_path)],
+                    stdin_payload=stdin_payload,
+                    cwd=worker_cwd,
+                    env=launch_env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    shell=False,
+                    **process_group_launch_kwargs(os.name),
+                )
+            except (LaunchRejected, OSError) as exc:
+                unlink_if_regular(spec_path)
+                refusal = str(exc)[:500] if isinstance(exc, LaunchRejected) else (
+                    f"supervisor_spawn_failed:{type(exc).__name__}"
+                )
+            else:
+                start_ticks = _pid_start_ticks(process.pid)
+                if start_ticks is None:
+                    _terminate_process_group(process.pid, grace_seconds=5.0)
+                    refusal = "supervisor_pid_identity_unavailable"
+        if refusal:
+            # Shaped like the supervisor's own refusal, so the finalizer settles
+            # it as the same retained spawn failure the supervisor would report.
+            refused = {
+                "state": "spawn_failed",
+                "exit_code": 126,
+                "spawn_phase": "worker_prompt_delivery",
+                "error": refusal,
+                "finished_at_epoch": time.time(),
+            }
+            write_json_0600(status_path, refused)
+            write_json_0600(metadata_path, {
+                **metadata, "claude_auth_retry_count": 1,
+                "claude_auth_retry": {**retry_evidence, "relaunch_refused": refusal},
+            })
+            return refused
+        assert process is not None
         started_at = _utcnow()
         live = _LiveProcess(
             request_id=request_id,
@@ -11193,8 +11254,20 @@ class ProcessManager:
                         workspace=workspace,
                         provider_launch_failure=provider_launch_failure,
                     )
-                    if retry_event is not None:
+                    if retry_event is not None and retry_event.get("state") != "spawn_failed":
                         return retry_event
+                    if retry_event is not None:
+                        # NF-2026-01354: the credential was refreshed but the
+                        # relaunch was refused before any spawn.  That is the
+                        # supervisor-shaped prompt-delivery spawn failure it
+                        # wrote, settled (and retained) exactly like one.
+                        supervisor_status = retry_event
+                        supervisor_state = "spawn_failed"
+                        exit_code = 126
+                        error = str(retry_event["error"])
+                        reason = terminal_failure_classification.recognised_reason(error)
+                        provider_launch_failure = None
+                if provider_launch_failure is not None:
                     # The auth-readiness circuit is a claim about the credential,
                     # so it only trips on an authentication-shaped Claude receipt:
                     # a rate/quota refusal must not re-authenticate the route.
@@ -12152,6 +12225,14 @@ class ProcessManager:
                     cleanup_workspace(workspace.repo, workspace.path, workspace.home)
                 except WorkspaceError as exc:
                     cleanup_error = f"cleanup_failed:{exc}"[:500]
+            # NF-2026-01354: no auth relaunch can follow a terminal event, so
+            # the prompt bytes and spec kept for one go with the request.  Best
+            # effort: a 0600 leftover must never cost the terminal event.
+            for relaunch_input in _relaunch_input_paths(self.process_dir, request_id):
+                try:
+                    unlink_if_regular(relaunch_input)
+                except OSError:
+                    pass
             # Derive fresh, live authority immediately before construction --
             # after every branch above has had its say -- never a cached value.
             final_terminal_failure_authority = _settle_terminal_failure_authority()

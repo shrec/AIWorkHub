@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -1559,7 +1560,15 @@ def test_claude_auth_refresh_retry_reuses_request_and_identical_worker_argv(
     stderr_path = process_dir / f"{request_id}.stderr.log"
     cancel_path = process_dir / f"{request_id}.cancel.json"
     worker_argv = [sys.executable, "-c", "print('same prompt')"]
+    # NF-2026-01354: the first launch persisted its exact stdin bytes and spec.
+    stdin_payload = b"same prompt"
+    (process_dir / f"{request_id}.prompt").write_bytes(stdin_payload)
+    worker_workspace.write_json_0600(
+        process_dir / f"{request_id}.relaunch-spec.json",
+        {"argv": worker_argv, "stdin_text_bytes": len(stdin_payload)},
+    )
     metadata = {
+        "stdin_payload_sha256": hashlib.sha256(stdin_payload).hexdigest(),
         "request_id": request_id,
         "task_id": "TASK_B1",
         "runner": "claude_worker_b1",
@@ -1584,10 +1593,13 @@ def test_claude_auth_refresh_retry_reuses_request_and_identical_worker_argv(
         process_dir=process_dir,
     )
     popen_calls: list[dict[str, object]] = []
+    delivered = bytearray()
 
     def fake_popen(argv, **kwargs):
         popen_calls.append({"argv": list(argv), **kwargs})
-        return SimpleNamespace(pid=4242)
+        return SimpleNamespace(pid=4242, stdin=SimpleNamespace(
+            write=delivered.extend, flush=lambda: None, close=lambda: None,
+        ))
 
     monkeypatch.setattr(manager, "_popen", fake_popen)
     monkeypatch.setattr(process_launcher, "_pid_start_ticks", lambda _pid: 17)
@@ -1609,11 +1621,19 @@ def test_claude_auth_refresh_retry_reuses_request_and_identical_worker_argv(
     )
 
     class FakeThread:
-        def __init__(self, **_kwargs):
-            pass
+        # The unnamed stdin feeder runs inline; the named monitor never starts.
+        def __init__(self, target=None, name=None, **_kwargs):
+            self._target = target if name is None else None
 
         def start(self) -> None:
+            if self._target is not None:
+                self._target()
+
+        def join(self, timeout=None) -> None:
             pass
+
+        def is_alive(self) -> bool:
+            return False
 
     monkeypatch.setattr(process_launcher.threading, "Thread", FakeThread)
 
@@ -1637,6 +1657,9 @@ def test_claude_auth_refresh_retry_reuses_request_and_identical_worker_argv(
     spec_path = process_dir / f"{request_id}.supervisor-spec.json"
     spec = json.loads(spec_path.read_text(encoding="utf-8"))
     assert spec["argv"] == worker_argv
+    assert spec["stdin_text_bytes"] == len(stdin_payload)
+    assert popen_calls[0]["stdin"] == subprocess.PIPE
+    assert bytes(delivered) == stdin_payload
     updated = json.loads(metadata_path.read_text(encoding="utf-8"))
     assert updated["claude_auth_retry_count"] == 1
     assert updated["claude_auth_retry"]["host_auth_refreshed"] is True

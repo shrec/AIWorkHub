@@ -78,11 +78,13 @@ def _spec(tmp_path: Path, argv: list[str], timeout: int = 10) -> tuple[Path, dic
     return spec_path, payload
 
 
-def _run_supervisor(spec_path: Path) -> subprocess.CompletedProcess[bytes]:
+def _run_supervisor(
+    spec_path: Path, prompt: bytes | None = None
+) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
         [sys.executable, str(Path(worker_supervisor.__file__)), "--spec", str(spec_path)],
         cwd="/",
-        stdin=subprocess.DEVNULL,
+        **({"stdin": subprocess.DEVNULL} if prompt is None else {"input": prompt}),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -534,14 +536,16 @@ def test_supervisor_records_claude_turn_usage_without_enforcing_legacy_cap(
         "print(json.dumps(event), flush=True); time.sleep(.4)"
     )
     spec_path, spec = _spec(tmp_path, [sys.executable, "-c", script])
+    # A claude_cli spec always declares its stdin prompt (NF-2026-01354).
     spec.update(
         adapter_id="claude_cli",
         token_budget={"cap_tokens": 100},
         heartbeat_interval_seconds=0.05,
+        **{worker_supervisor.WORKER_PROMPT_BYTES_SPEC_KEY: len(b"prompt")},
     )
     write_json_0600(spec_path, spec)
 
-    result = _run_supervisor(spec_path)
+    result = _run_supervisor(spec_path, b"prompt")
 
     assert result.returncode == 0, result.stderr.decode()
     status = _read_status(Path(spec["status_path"]))

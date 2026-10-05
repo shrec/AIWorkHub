@@ -22,7 +22,7 @@ if TYPE_CHECKING:  # names used only in annotations, which are never evaluated
     from .vscode_lm_bridge import BridgeRequest as _BridgeRequestT
     from .worker_workspace import WorkerWorkspace as _WorkerWorkspaceT
 
-__all__ = ["launch_isolated"]
+__all__ = ["launch_isolated", "relaunch_input_paths", "spawn_with_stdin_payload"]
 
 # Eight local-variable annotations in the moved body named ``Path``,
 # ``WorkerWorkspace`` and ``vscode_lm_bridge`` -- module-level imports in
@@ -102,9 +102,11 @@ LAUNCH_ISOLATED_SEAM_NAMES: tuple[str, ...] = (
     "project_context",
     "provision_opencode_worker_config",
     "quality_review",
+    "relaunch_input_paths",
     "reviewer_prewarm_capacity",
     "runtime_adapters",
     "sandbox_argv",
+    "spawn_with_stdin_payload",
     "subprocess",
     "sys",
     "task_engine",
@@ -124,8 +126,12 @@ LAUNCH_ISOLATED_SEAM_NAMES: tuple[str, ...] = (
 # seam, but it has no counterpart on ``process_launcher`` to read at call time
 # and it is expected to already be an attribute of this module -- both things
 # that would be drift for every other seam in ``LAUNCH_ISOLATED_SEAM_NAMES``.
+# The two NF-2026-01354 helpers are the same kind: ``ProcessManager`` imports
+# them from here for the Claude auth relaunch and the direct launch path.
 LAUNCH_ISOLATED_LOCAL_SEAM_NAMES: tuple[str, ...] = (
     "_appcontainer_supervisor_identity",
+    "relaunch_input_paths",
+    "spawn_with_stdin_payload",
 )
 
 
@@ -150,6 +156,87 @@ def _appcontainer_supervisor_identity(
         "repo_id": repo_id,
         "worker_kind": normalized_kind,
     }
+
+
+def relaunch_input_paths(process_dir: _PathT, request_id: str) -> tuple[_PathT, _PathT]:
+    """The exact prompt bytes and supervisor spec one Claude auth relaunch replays.
+
+    NF-2026-01354: the relaunch rebuilt its spec by hand, dropped the prompt
+    byte count, the AppContainer identity and the worker MCP bridge, and fed
+    the supervisor ``DEVNULL``.  Replaying the first launch's own spec and
+    stdin bytes leaves nothing for the two launches to disagree about.
+    """
+    return (
+        process_dir / f"{request_id}.prompt",
+        process_dir / f"{request_id}.relaunch-spec.json",
+    )
+
+
+def spawn_with_stdin_payload(
+    popen: Callable[..., Any],
+    argv: list[str],
+    *,
+    stdin_payload: bytes | None,
+    **popen_kwargs: Any,
+) -> Any:
+    """Start a process and deliver ``stdin_payload`` on its stdin, or fail loud.
+
+    NF-2026-01354: the one place a worker prompt is put on a pipe.  The isolated
+    launch, the Claude auth relaunch and the direct launch all spawn here, so a
+    second spawn site can no longer quietly hand a prompt-on-stdin CLI
+    ``DEVNULL``.  ``None`` keeps ``DEVNULL`` for a plan with no prompt.
+    """
+    from . import process_launcher as _pl
+
+    process = popen(
+        argv,
+        stdin=_pl.subprocess.PIPE if stdin_payload is not None else _pl.subprocess.DEVNULL,
+        **popen_kwargs,
+    )
+    if stdin_payload is None:
+        return process
+    # NF-2026-01159: this was a fire-and-forget daemon thread that swallowed
+    # every write error and closed the pipe in its ``finally`` even when nothing
+    # had been written, so a failed or short delivery reached the supervisor as
+    # a clean zero-byte EOF -- indistinguishable there from a plan that carries
+    # no prompt, and the worker was launched with ``stdin=DEVNULL``.  The feeder
+    # is still a thread so a reader that dies before reading cannot wedge this
+    # one, but its outcome is now read.  It cannot deadlock on a full pipe: the
+    # supervisor drains its whole stdin before it loads the spec or spawns.
+    delivery_error: list[str] = []
+
+    def _feed_supervisor_stdin() -> None:
+        try:
+            # The flushed write IS the delivery, so this is the only failure
+            # that can mean the prompt did not land.
+            process.stdin.write(stdin_payload)
+            process.stdin.flush()
+        except Exception as exc:
+            delivery_error.append(f"{type(exc).__name__}:{exc}")
+        finally:
+            # The close is what the reader sees as EOF, and CPython releases
+            # the descriptor even when the call raises, so a failure here
+            # cannot have cost an already flushed byte and must not reject a
+            # delivered prompt.
+            try:
+                process.stdin.close()
+            except Exception:
+                pass
+
+    feeder = _pl.threading.Thread(target=_feed_supervisor_stdin, daemon=True)
+    feeder.start()
+    feeder.join(timeout=60.0)
+    if feeder.is_alive():
+        delivery_error.append("delivery_timeout")
+    if delivery_error:
+        # The supervisor refuses a short delivery on its own side too; failing
+        # here as well keeps a launch that can never produce work from ever
+        # becoming a live request.
+        _pl._terminate_process_group(process.pid, grace_seconds=5.0)
+        raise _pl.LaunchRejected(
+            "worker_prompt_not_delivered:launcher:" + ";".join(delivery_error)[:200]
+        )
+    return process
 
 
 def launch_isolated(
@@ -286,7 +373,9 @@ def launch_isolated(
             except WorkspaceError:
                 pass
         if spec_path is not None:
-            unlink_if_regular(spec_path)
+            # NF-2026-01354: a launch that never went live leaves no relaunch inputs.
+            for launch_file in (spec_path, *relaunch_input_paths(spec_path.parent, str(request_id))):
+                unlink_if_regular(launch_file)
         if authority_path is not None:
             unlink_if_regular(authority_path)
         if bridge_request is not None:
@@ -981,6 +1070,10 @@ def launch_isolated(
                 claimed = True
 
             prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+            # NF-2026-01159: one encoder decides the prompt bytes.  NF-2026-01354:
+            # their hash is recorded so the auth relaunch can prove it replays
+            # exactly these bytes and nothing else.
+            stdin_payload = runtime_adapters.plan_stdin_payload(plan)
             context_delivery = _project_context_delivery(context_result, prompt_hash)
             metadata = {
                 "schema_id": "aiworkhub.task_mcp.isolated_request.v1",
@@ -1032,6 +1125,11 @@ def launch_isolated(
                 "cancel_path": str(cancel_path),
                 "metadata_path": str(metadata_path),
                 "prompt_sha256": prompt_hash,
+                "stdin_payload_sha256": (
+                    hashlib.sha256(stdin_payload).hexdigest()
+                    if stdin_payload is not None
+                    else None
+                ),
                 "prompt_budget": prompt_budget,
                 "vscode_lm_bridge": (
                     vscode_lm_bridge.bridge_request_metadata(bridge_request)
@@ -1210,13 +1308,11 @@ def launch_isolated(
                     "repo_id": identity["repo_id"],
                     "worker_kind": identity["worker_kind"],
                 }
-            # NF-2026-01159: one encoder decides the prompt bytes, and the
-            # supervisor is told how many to expect before it is able to spawn
-            # anything.  A count is not the prompt, so the spec, the logs and
-            # the receipts still carry no prompt text and the argv still
-            # carries no positional prompt.
-            stdin_payload = runtime_adapters.plan_stdin_payload(plan)
-            write_json_0600(spec_path, {
+            # NF-2026-01159: the supervisor is told how many prompt bytes to
+            # expect before it is able to spawn anything.  A count is not the
+            # prompt, so the spec, the logs and the receipts still carry no
+            # prompt text and the argv still carries no positional prompt.
+            supervisor_spec = {
                 "argv": worker_argv,
                 "cwd": launch_cwd,
                 **_legacy_timeout_fields(timeout_seconds),
@@ -1238,7 +1334,18 @@ def launch_isolated(
                 ),
                 **appcontainer_identity_fields,
                 **({"worker_mcp_bridge": worker_mcp_bridge} if worker_mcp_bridge else {}),
-            })
+            }
+            write_json_0600(spec_path, supervisor_spec)
+            if adapter_id == "claude_cli" and stdin_payload is not None:
+                # NF-2026-01354: the only adapter with an auth relaunch keeps
+                # what that relaunch must replay byte for byte; the request
+                # finalizer deletes both once no relaunch can follow.
+                prompt_path, relaunch_spec_path = relaunch_input_paths(
+                    self.process_dir, request_id
+                )
+                write_json_0600(relaunch_spec_path, supervisor_spec)
+                _touch_0600(prompt_path)
+                prompt_path.write_bytes(stdin_payload)
 
             supervisor = _worker_supervisor_script()
             # landlock confines the *real* isolated workspace.home
@@ -1263,68 +1370,17 @@ def launch_isolated(
             ):
                 raise _ReviewerReservationTerminalized(reserved_request_id)
             launch_phase = "supervisor_spawn"
-            process = self._popen(
+            process = spawn_with_stdin_payload(
+                self._popen,
                 [sys.executable, str(supervisor), "--spec", str(spec_path)],
+                stdin_payload=stdin_payload,
                 cwd=launch_cwd,
                 env=launch_env,
-                stdin=(
-                    subprocess.PIPE
-                    if stdin_payload is not None
-                    else subprocess.DEVNULL
-                ),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 shell=False,
                 **process_group_launch_kwargs(os.name),
             )
-            if stdin_payload is not None:
-                launch_phase = "supervisor_prompt_delivery"
-                # NF-2026-01159: this was a fire-and-forget daemon thread that
-                # swallowed every write error and closed the pipe in its
-                # ``finally`` even when nothing had been written, so a failed
-                # or short delivery reached the supervisor as a clean zero-byte
-                # EOF -- indistinguishable there from a plan that carries no
-                # prompt, and the worker was launched with ``stdin=DEVNULL``.
-                # The feeder is still a thread so a supervisor that dies before
-                # reading cannot wedge this one, but its outcome is now read.
-                # It cannot deadlock on a full pipe: the supervisor drains its
-                # whole stdin before it loads the spec or spawns anything.
-                delivery_error: list[str] = []
-
-                def _feed_supervisor_stdin() -> None:
-                    try:
-                        # The flushed write IS the delivery, so this is the
-                        # only failure that can mean the prompt did not land.
-                        process.stdin.write(stdin_payload)
-                        process.stdin.flush()
-                    except Exception as exc:
-                        delivery_error.append(f"{type(exc).__name__}:{exc}")
-                    finally:
-                        # The close is what the supervisor reads as EOF, and
-                        # CPython releases the descriptor even when the call
-                        # raises, so a failure here cannot have cost an already
-                        # flushed byte and must not reject a delivered prompt.
-                        try:
-                            process.stdin.close()
-                        except Exception:
-                            pass
-
-                feeder = threading.Thread(
-                    target=_feed_supervisor_stdin, daemon=True
-                )
-                feeder.start()
-                feeder.join(timeout=60.0)
-                if feeder.is_alive():
-                    delivery_error.append("delivery_timeout")
-                if delivery_error:
-                    # The supervisor refuses a short delivery on its own side
-                    # too; failing here as well keeps a launch that can never
-                    # produce work from ever becoming a live request.
-                    _terminate_process_group(process.pid, grace_seconds=5.0)
-                    raise LaunchRejected(
-                        "worker_prompt_not_delivered:launcher:"
-                        + ";".join(delivery_error)[:200]
-                    )
             started_at = _utcnow()
             launch_phase = "supervisor_pid_identity"
             start_ticks = _pid_start_ticks(process.pid)
@@ -1544,7 +1600,9 @@ def launch_isolated(
         ):
             reason += ":" + release_error
         if spec_path is not None:
-            unlink_if_regular(spec_path)
+            # NF-2026-01354: a launch that never went live leaves no relaunch inputs.
+            for launch_file in (spec_path, *relaunch_input_paths(spec_path.parent, str(request_id))):
+                unlink_if_regular(launch_file)
         if authority_path is not None:
             unlink_if_regular(authority_path)
         if claim_release_retained:

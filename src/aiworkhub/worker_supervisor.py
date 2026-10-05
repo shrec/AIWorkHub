@@ -862,6 +862,11 @@ def _validated_argv(value: Any) -> list[str]:
 # script next to its sibling modules, with no ``runtime_adapters`` on the path.
 WORKER_PROMPT_BYTES_SPEC_KEY = "stdin_text_bytes"
 WORKER_PROMPT_NOT_DELIVERED = "worker_prompt_not_delivered"
+# NF-2026-01354.  ``runtime_adapters.PROMPT_ON_STDIN_ADAPTERS``, spelled out for
+# the same standalone reason.  These CLIs read their prompt from stdin, so a
+# spec for one of them that declares no prompt bytes was written by a launcher
+# that lost the prompt -- the auth relaunch did exactly that -- and is refused.
+PROMPT_ON_STDIN_ADAPTERS = frozenset({"claude_cli", "codex_cli"})
 
 
 def _expected_prompt_bytes(spec: dict[str, Any]) -> int:
@@ -1151,7 +1156,11 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
         # stdin with a provider-worded error and zero changed files.  This runs
         # before any spawn and ahead of the backend branch below, so the
         # plain-subprocess and AppContainer paths are covered by one check.
-        if expected_prompt_bytes and prompt_bytes_delivered != expected_prompt_bytes:
+        # NF-2026-01354: for a prompt-on-stdin CLI an undeclared count is not
+        # "no prompt", it is a launcher that forgot one.
+        if (
+            expected_prompt_bytes and prompt_bytes_delivered != expected_prompt_bytes
+        ) or (not expected_prompt_bytes and adapter_id in PROMPT_ON_STDIN_ADAPTERS):
             _write_json_0600(status_path, {
                 "state": "spawn_failed",
                 "supervisor_pid": supervisor_pid,
@@ -1159,7 +1168,7 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
                 "spawn_phase": "worker_prompt_delivery",
                 "error": (
                     f"{WORKER_PROMPT_NOT_DELIVERED}:"
-                    f"expected_bytes={expected_prompt_bytes}:"
+                    f"expected_bytes={expected_prompt_bytes or 'undeclared'}:"
                     f"received_bytes={prompt_bytes_delivered}"
                 ),
                 "prompt_bytes_expected": expected_prompt_bytes,
