@@ -5743,6 +5743,15 @@ function renderSettings(payload, options = {}) {
             "May share OpenAI/Codex subscription budget · stays disabled until explicitly enabled",
           ));
         }
+        // NF-2026-01355: a stored adapter false is a hard gate with no switch of
+        // its own here; name it on the row whose toggle lifts it.
+        if (((modelPolicy.adapters || {})[family] || {})[String(route.adapter || "")] === false) {
+          routeCopy.appendChild(createElement(
+            "small",
+            "settings-model-warning",
+            `${String(route.adapter)} adapter disabled · enabling this model lifts the adapter gate`,
+          ));
+        }
         const routeControl = createElement("span", "switch-control");
         const routeInput = document.createElement("input");
         routeInput.type = "checkbox";

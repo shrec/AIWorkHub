@@ -1074,7 +1074,7 @@ test("Models renders every provider the bounded catalog returned, with per-provi
 // The heading matters on its own: what a hard ceiling refused is a fact about
 // the whole tree rather than about any one family, so it has nowhere else to be
 // stated and a test that only ever sees families could not catch its absence.
-function renderModelSettings(catalog) {
+function renderModelSettings(catalog, adapters = {}) {
   const start = appSource.indexOf("const OPENCODE_ADAPTER_ID = \"opencode_cli\";");
   const end = appSource.indexOf("function renderSettings(payload, options = {})");
   assert.notEqual(start, -1);
@@ -1129,7 +1129,7 @@ function renderModelSettings(catalog) {
       ok: true,
       revision: 2,
       features: {},
-      model_policy: { ok: true, revision: 2, providers: {}, catalog: ${JSON.stringify(catalog)} },
+      model_policy: { ok: true, revision: 2, providers: {}, adapters: ${JSON.stringify(adapters)}, catalog: ${JSON.stringify(catalog)} },
     });
     const families = [];
     const headings = [];
@@ -2722,4 +2722,33 @@ test("Models counts a producer's cap apart from this module's discovery bound", 
   const grokInput = collectByTag(grok, "input")[0];
   assert.equal(grokInput.disabled, false);
   assert.equal(grokInput.checked, true);
+});
+
+test("Models names a disabled adapter gate on the route whose toggle lifts it (NF-2026-01355)", () => {
+  // models.json can hold adapters.anthropic.claude_cli = false while every
+  // claude_cli leaf is true. The panel has no adapter switch, so an unchecked
+  // row with no reason was the whole story the owner got.
+  const workers = ["opus", "sonnet"].map((model) => ({
+    provider: "anthropic",
+    adapter: "claude_cli",
+    model,
+    worker_id: `claude-${model}`,
+    vendor_provider: "anthropic",
+    catalog_enabled: true,
+    effective_enabled: false,
+    inventory_only: false,
+  }));
+  const catalog = { discovered_model_count: 0, worker_count: 2, returned_worker_count: 2, workers };
+  const warnings = (families) => collectByClass(families[0], "settings-model-route").map((route) => {
+    const input = collectByTag(route, "input")[0];
+    assert.equal(input.disabled, false);
+    return collectByClass(route, "settings-model-warning").map((node) => node.textContent).join(" · ");
+  });
+
+  const gated = warnings(renderModelSettings(catalog, { anthropic: { claude_cli: false } }).families);
+  assert.deepEqual(gated, [
+    "claude_cli adapter disabled · enabling this model lifts the adapter gate",
+    "claude_cli adapter disabled · enabling this model lifts the adapter gate",
+  ]);
+  assert.deepEqual(warnings(renderModelSettings(catalog, { anthropic: { claude_cli: true } }).families), ["", ""]);
 });

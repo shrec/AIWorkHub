@@ -314,6 +314,24 @@ def _update_lock(path: Path):
         os.close(fd)
 
 
+def _catalog_route_models(root: Path, provider: str, adapter: str) -> set[str]:
+    """Catalog models whose repository-policy identity is (provider, adapter)."""
+    from . import workforce_catalog  # imports this module at load time
+
+    try:
+        workers = workforce_catalog.load_catalog(root).get("workers", [])
+    except workforce_catalog.WorkforceCatalogError:
+        return set()
+    return {
+        str(row.get("model") or "")
+        for row in workers
+        if isinstance(row, Mapping)
+        and row.get("model")
+        and policy_route_identity(str(row.get("provider") or ""), str(row.get("adapter_id") or ""))
+        == (provider, adapter)
+    }
+
+
 def update(
     repo_root: Path | str,
     *,
@@ -362,7 +380,20 @@ def update(
             for provider_key, transport in current["models"].items()
         }
         if model is not None:
-            models.setdefault(provider, {}).setdefault(adapter, {})[model] = enabled
+            transport_models = models.setdefault(provider, {}).setdefault(adapter, {})
+            transport_models[model] = enabled
+            # NF-2026-01355: Settings draws model rows but no adapter switch, so
+            # a stored adapter false could not be lifted from the panel. An
+            # explicit enable lifts this route's own adapter gate in the same
+            # revision and pins every sibling the gate kept off (stored leaves
+            # and catalog routes) to false: only the model acted on changes.
+            # ponytail: an inventory-only editor model with no stored leaf and
+            # no catalog row follows the default once its gate lifts.
+            if enabled and adapters.get(provider, {}).get(adapter) is False:
+                adapters[provider][adapter] = True
+                for sibling in set(transport_models) | _catalog_route_models(root, provider, adapter):
+                    if sibling != model:
+                        transport_models[sibling] = False
             # An OpenCode model toggle writes the canonical leaf. The launcher
             # also requires the vendor spelling of that same transport. A stored
             # vendor-adapter false is not a switch this toggle can show, so an

@@ -429,3 +429,48 @@ def test_cross_process_style_concurrent_cas_has_one_winner(tmp_path: Path) -> No
     state = model_settings.load(root)
     assert state["revision"] == 2
     assert sum(key in state["providers"] for key in ("first", "second")) == 1
+
+
+def test_settings_model_enable_lifts_its_disabled_adapter_gate_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NF-2026-01355: the panel has model rows but no adapter switch."""
+    from aiworkhub import core, dashboard_mcp_app
+
+    root = _repo(tmp_path, "root")
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+    revision = 0
+    # sonnet keeps no leaf: it is the built-in claude_cli catalog route.
+    for model in ("fable", "haiku", "opus"):
+        revision = model_settings.update(
+            root, provider="anthropic", adapter="claude_cli", model=model,
+            enabled=True, expected_revision=revision,
+        )["revision"]
+    revision = model_settings.update(
+        root, provider="anthropic", adapter="claude_cli", enabled=False,
+        expected_revision=revision,
+    )["revision"]
+
+    def route(model: str) -> bool:
+        return model_settings.evaluate(root, provider="anthropic", adapter="claude_cli", model=model)
+
+    assert not any(route(m) for m in ("fable", "haiku", "opus", "sonnet"))
+
+    # The Webview route toggle posts exactly this call.
+    result = dashboard_mcp_app.model_settings_update_view(
+        provider="anthropic", adapter="claude_cli", model="opus",
+        enabled=True, expected_revision=revision,
+    )
+
+    assert result["ok"] is True
+    assert route("opus") is True
+    # Only the model the owner acted on is enabled: stored siblings and the
+    # leafless built-in catalog route stay off.
+    assert [route(m) for m in ("fable", "haiku", "sonnet")] == [False, False, False]
+
+    # Disabling the adapter explicitly is still a hard gate.
+    model_settings.update(
+        root, provider="anthropic", adapter="claude_cli", enabled=False,
+        expected_revision=result["revision"],
+    )
+    assert route("opus") is False
