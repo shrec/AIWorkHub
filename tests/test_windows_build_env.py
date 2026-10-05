@@ -442,7 +442,8 @@ def test_the_caller_keeps_every_value_it_declared(tmp_path, monkeypatch):
         "LIB": r"C:\declared\lib",
         "LIBPATH": r"C:\declared\libpath",
         "CMAKE_GENERATOR": "Visual Studio 17 2022",
-        "PATH": r"C:\declared\bin",
+        # A real path, not "C:\...": os.pathsep is ":" off Windows.
+        "PATH": str(tmp_path / "declared-bin"),
     }
 
     overlay = wbe.build_tool_env(declared, appcontainer=True)
@@ -452,7 +453,7 @@ def test_the_caller_keeps_every_value_it_declared(tmp_path, monkeypatch):
     assert "LIBPATH" not in overlay
     assert "CMAKE_GENERATOR" not in overlay
     # PATH is the one key that may change, and only by growing at the end.
-    assert overlay["PATH"].split(os.pathsep)[0] == r"C:\declared\bin"
+    assert overlay["PATH"].split(os.pathsep)[0] == declared["PATH"]
 
 
 def test_the_overlay_appends_tool_directories_then_registry_entries(
@@ -468,10 +469,11 @@ def test_the_overlay_appends_tool_directories_then_registry_entries(
         },
     )
 
-    overlay = wbe.build_tool_env({"PATH": r"C:\caller\one"}, appcontainer=True)
+    caller = str(tmp_path / "caller-one")
+    overlay = wbe.build_tool_env({"PATH": caller}, appcontainer=True)
 
     assert overlay["PATH"].split(os.pathsep) == [
-        r"C:\caller\one",
+        caller,
         *install.tool_dirs,
         str(tmp_path / "user-tool"),
     ]
