@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -743,3 +744,79 @@ def test_pool_size_one_and_default_pool_delete_identically(
     assert sequential == pooled
     assert sequential[0]["deleted"] == 6
     assert terminal_log_retention._delete_worker_count() >= 1
+
+
+# --- NF-2026-01360: relaunch files age out with their run ---------------------
+
+
+def _relaunch_names(request_id: str) -> set[str]:
+    # Exact names: process_launcher_launch_isolated.relaunch_input_paths and the
+    # ``<rid>.attempt1<suffix>`` rotation in _retry_claude_auth_refresh.
+    return {
+        f"{request_id}.prompt",
+        f"{request_id}.relaunch-spec.json",
+        f"{request_id}.attempt1.stdout.log",
+        f"{request_id}.attempt1.stderr.log",
+        f"{request_id}.attempt1.supervisor.json",
+    }
+
+
+def test_enforce_deletes_relaunch_files_with_the_decided_run(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    done_id = "1" * 32
+    review_id = "2" * 32
+    _run(repo, done_id, "TASK_DONE")
+    _run(repo, review_id, "TASK_REVIEW")
+    process_root = repo / terminal_log_retention.PROCESS_FILES_RELATIVE_PATH
+    for name in _relaunch_names(done_id) | _relaunch_names(review_id):
+        (process_root / name).write_text("relaunch\n", encoding="utf-8")
+    # Similar names no run owns: never inventoried, never deleted.
+    lookalikes = {
+        f"{done_id}.attempt2.stdout.log",
+        f"{done_id}.prompt.bak",
+        f"{done_id[:-1]}.prompt",
+    }
+    for name in lookalikes:
+        (process_root / name).write_text("other\n", encoding="utf-8")
+
+    result = terminal_log_retention.enforce(repo)
+
+    assert result["status"] == "completed"
+    assert result["deleted"] == 1
+    assert result["deleted_files"] == len(terminal_log_retention._OWNED_SUFFIXES) + len(
+        _relaunch_names(done_id)
+    )
+    assert result["delete_errors"] == []
+    names = _process_names(repo)
+    assert not any(name.startswith(done_id) and name not in lookalikes for name in names)
+    assert _relaunch_names(review_id) <= names
+    assert lookalikes <= names
+
+
+# --- NF-2026-01362: the enforcement lock is per repository --------------------
+
+
+def test_enforce_lock_is_scoped_to_one_repository(tmp_path: Path) -> None:
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    repo_a = _repo(tmp_path / "a")
+    repo_b = _repo(tmp_path / "b")
+    _run(repo_b, "1" * 32, "TASK_DONE")
+
+    holder = terminal_log_retention._repository_enforcement_lock(repo_a.resolve())
+    assert holder.lock.acquire(blocking=False)
+    try:
+        assert terminal_log_retention.enforce(repo_a)["status"] == "already_running"
+        other = terminal_log_retention.enforce(repo_b)
+        assert other["status"] == "completed"
+        assert other["deleted"] == 1
+        assert terminal_log_retention.enforce(repo_a)["status"] == "already_running"
+    finally:
+        holder.lock.release()
+
+    assert terminal_log_retention.enforce(repo_a)["status"] == "completed"
+    # The map holds an entry only while someone references it.
+    del holder
+    gc.collect()
+    assert str(repo_a.resolve()) not in terminal_log_retention._enforcement_locks
+    assert str(repo_b.resolve()) not in terminal_log_retention._enforcement_locks

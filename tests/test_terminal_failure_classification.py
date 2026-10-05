@@ -3064,3 +3064,41 @@ def test_worker_prose_cannot_forge_a_vscode_lm_balance_failure(tmp_path, lines):
         state="worker_failed", error=None, stdout_path=stdout,
     )
     assert disposition["evidence"] != "refusal_kind=balance_exhausted"
+
+
+# --------------------------------------------------------------------------- #
+# NF-2026-01360: a refused Claude auth relaunch writes a supervisor-shaped
+# ``spawn_failed`` status whose ``error`` is the launcher-minted
+# ``worker_prompt_not_delivered:<detail>``. The finalizer records
+# ``supervisor_spawn_failure_cause(...) or "supervisor_spawn_failed"``, so a
+# withheld cause erased the reason the relaunch was refused.
+
+
+@pytest.mark.parametrize("refusal", [
+    "worker_prompt_not_delivered:claude_auth_retry:prompt_sha256_mismatch",
+    "worker_prompt_not_delivered:claude_auth_retry:relaunch_spec_mismatch",
+    "worker_prompt_not_delivered:claude_auth_retry:relaunch_input_unreadable:FileNotFoundError",
+])
+def test_relaunch_prompt_refusal_keeps_its_launcher_minted_reason(refusal: str) -> None:
+    status = {
+        "state": "spawn_failed",
+        "exit_code": 126,
+        "spawn_phase": "worker_prompt_delivery",
+        "error": refusal,
+    }
+    cause = tfc.supervisor_spawn_failure_cause("spawn_failed", status)
+    assert cause == refusal
+    assert (cause or "supervisor_spawn_failed") != "supervisor_spawn_failed"
+    assert refusal.partition(":")[0] in tfc._LAUNCHER_MINTED_REASONS
+    assert tfc.unclassified_reason_constants() == ()
+
+
+@pytest.mark.parametrize("error", [
+    "worker_prompt_not_delivered",
+    "worker_prompt_not_delivered:Bearer abcd1234",
+    "worker_prompt_not_delivered:api_key=sk-ABCDEFGHIJKLMNOP123456",
+    "worker_prompt_not_delivered:a:b:c:d:e",
+    "xworker_prompt_not_delivered:claude_auth_retry",
+])
+def test_relaunch_prompt_refusal_shape_stays_an_allowlist(error: str) -> None:
+    assert tfc.supervisor_spawn_failure_cause("spawn_failed", {"error": error}) is None

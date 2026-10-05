@@ -20,6 +20,7 @@ import stat
 import tempfile
 import threading
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -82,7 +83,56 @@ _BOUNDABLE_LOG_SUFFIXES = (".stdout.log", ".stderr.log")
 _REQUEST_RE = re.compile(r"^[a-f0-9]{32}$")
 _BATCH_RE = re.compile(r"^l[0-9]{8}T[0-9]{6}-[a-f0-9]{12}$")
 _OWNED_SUFFIXES = (".request.json", ".stderr.log", ".stdout.log", ".supervisor.json")
-_enforcement_lock = threading.Lock()
+# NF-2026-01360: the Claude auth relaunch keeps the replayed prompt and spec as
+# ``<rid>.prompt``/``<rid>.relaunch-spec.json``
+# (``process_launcher_launch_isolated.relaunch_input_paths``) and rotates the
+# first attempt's files to ``<rid>.attempt1<original suffix>``
+# (``process_launcher._retry_claude_auth_refresh``). They belong to the same run
+# and age out with it.
+_RELAUNCH_SUFFIXES = (".prompt", ".relaunch-spec.json")
+_ATTEMPT1_SUFFIXES = tuple(f".attempt1{suffix}" for suffix in _OWNED_SUFFIXES)
+_ALL_OWNED_SUFFIXES = _OWNED_SUFFIXES + _RELAUNCH_SUFFIXES + _ATTEMPT1_SUFFIXES
+
+
+def _owned_request_id(name: str) -> str:
+    """The request id an owned per-request file name belongs to, else ``""``.
+
+    The one ownership matcher for the inventory walk, quarantine and direct
+    deletion: a name is owned exactly when it is ``<32-hex id><owned suffix>``.
+    """
+    for suffix in _ALL_OWNED_SUFFIXES:
+        if name.endswith(suffix) and _REQUEST_RE.fullmatch(name[: -len(suffix)]):
+            return name[: -len(suffix)]
+    return ""
+
+
+class _RepositoryLock:
+    __slots__ = ("lock", "__weakref__")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+
+
+# NF-2026-01362: one enforcement lock per resolved repository root, held in a
+# WeakValueDictionary so an entry lives only while an enforce() references it --
+# the map is bounded by concurrent enforcements, never by repositories ever seen.
+_enforcement_locks: weakref.WeakValueDictionary[str, _RepositoryLock] = (
+    weakref.WeakValueDictionary()
+)
+_enforcement_locks_guard = threading.Lock()
+
+
+def _repository_enforcement_lock(root: Path) -> _RepositoryLock:
+    """This resolved repository root's enforcement lock, created on demand."""
+    key = str(root)
+    with _enforcement_locks_guard:
+        holder = _enforcement_locks.get(key)
+        if holder is None:
+            holder = _RepositoryLock()
+            _enforcement_locks[key] = holder
+        return holder
+
+
 # A terminal provider outcome can later gain a manager disposition in the same
 # process ledger.  The latter becomes the latest row, so omitting it made every
 # accepted run look live forever and exempted exactly the successful, finished
@@ -457,14 +507,7 @@ def _stat_owned_entries(
         info = _owned_regular_file(path, process_root)
         if info is None:
             continue
-        request_id = next(
-            (
-                path.name[: -len(suffix)]
-                for suffix in _OWNED_SUFFIXES
-                if path.name.endswith(suffix)
-            ),
-            "",
-        )
+        request_id = _owned_request_id(path.name)
         if not _REQUEST_RE.fullmatch(request_id):
             continue
         owned.append((request_id, {
@@ -872,7 +915,7 @@ def quarantine(repo_root: Path | str, *, preview_digest: str, confirm: bool) -> 
         complete = True
         for expected in item.get("files") or []:
             name = str(expected.get("name") or "")
-            if not any(name == f"{request_id}{suffix}" for suffix in _OWNED_SUFFIXES):
+            if _owned_request_id(name) != request_id:
                 complete = False
                 break
             source = process_root / name
@@ -1844,12 +1887,11 @@ def _delete_candidate(process_root: Path, item: Mapping[str, Any]) -> dict[str, 
             outcome["error"] = "request_id_invalid"
             return outcome
         expected_files = [entry for entry in item.get("files") or [] if isinstance(entry, Mapping)]
-        owned_names = {f"{request_id}{suffix}" for suffix in _OWNED_SUFFIXES}
         for expected in expected_files:
             name = str(expected.get("name") or "")
             info = (
                 _owned_regular_file(process_root / name, process_root)
-                if name in owned_names
+                if _owned_request_id(name) == request_id
                 else None
             )
             if (
@@ -1909,7 +1951,10 @@ def enforce(repo_root: Path | str) -> dict[str, Any]:
     """
 
     root = Path(repo_root).resolve()
-    if not _enforcement_lock.acquire(blocking=False):
+    # ``holder`` is the strong reference that keeps this repository's lock
+    # entry alive for exactly as long as this enforcement runs.
+    holder = _repository_enforcement_lock(root)
+    if not holder.lock.acquire(blocking=False):
         return {"ok": True, "status": "already_running", "repository_scoped": True}
     try:
         usage_backfill = backfill_usage_capture(root, confirm=True)
@@ -1975,7 +2020,7 @@ def enforce(repo_root: Path | str) -> dict[str, Any]:
             "next_deadline": next_deadline[1] if next_deadline else None,
         }
     finally:
-        _enforcement_lock.release()
+        holder.lock.release()
 
 
 __all__ = [

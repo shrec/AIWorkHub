@@ -1136,10 +1136,15 @@ _TERMINAL_STATE_NAMES: tuple[str, ...] = (
 
 # Launcher-minted reasons that are not transition refusals and so have no place
 # in ``_CONTROL_PLANE_REASONS``, but which a typed reason may still state: the
-# two cancellation/timeout verdicts ``_finalize_isolated_request`` writes.
+# two cancellation/timeout verdicts ``_finalize_isolated_request`` writes, and
+# the Claude auth relaunch's prompt-delivery refusal (NF-2026-01360), which
+# reaches the finalizer as ``worker_prompt_not_delivered:<detail>`` -- see
+# ``_LAUNCHER_MINTED_SPAWN_RE``.
+_WORKER_PROMPT_NOT_DELIVERED = "worker_prompt_not_delivered"
 _LAUNCHER_MINTED_REASONS: tuple[str, ...] = (
     "worker_cancelled",
     "worker_timed_out",
+    _WORKER_PROMPT_NOT_DELIVERED,
 )
 
 # The one registry every typed reason draws from. Values are the module's own
@@ -1322,9 +1327,18 @@ _SPAWN_FAILURE_CAUSE_MAX_CHARS = MAX_DIAGNOSTIC_CHARS if MAX_DIAGNOSTIC_CHARS <=
 # and discards it (see the "SECRET-SAFE" notes above) -- but that function
 # deliberately emits bounded supervisor text AS ITSELF, so nothing here may
 # spot-and-redact a credential shape (V7 rejects that heuristic). Text is
-# withheld unless it fullmatches this one fixed shape.
+# withheld unless it fullmatches one of the two fixed shapes below.
 _SPAWN_ERROR_SHAPE_RE = re.compile(
     r"[A-Z][A-Za-z0-9]{0,63}Error:[a-z0-9_]{1,64}(?:: hr=0x[0-9A-Fa-f]{1,8})?"
+)
+# NF-2026-01360: the second fixed shape -- the launcher-minted
+# ``worker_prompt_not_delivered:<detail>`` the Claude auth relaunch writes into a
+# supervisor-shaped ``spawn_failed`` status itself, each detail token a
+# lowercase literal or an exception type name. Without it the refusal was
+# withheld and filed as the generic ``supervisor_spawn_failed``.
+_LAUNCHER_MINTED_SPAWN_RE = re.compile(
+    re.escape(_WORKER_PROMPT_NOT_DELIVERED)
+    + r"(?::(?:[a-z0-9_]{1,64}|[A-Z][A-Za-z0-9]{0,63})){1,4}"
 )
 
 
@@ -1355,7 +1369,9 @@ def supervisor_spawn_failure_cause(
     if not isinstance(raw, str):
         return None
     text = raw[: 4 * _SPAWN_FAILURE_CAUSE_MAX_CHARS].strip()
-    if len(text) > _SPAWN_FAILURE_CAUSE_MAX_CHARS or not _SPAWN_ERROR_SHAPE_RE.fullmatch(text):
+    if len(text) > _SPAWN_FAILURE_CAUSE_MAX_CHARS or not (
+        _SPAWN_ERROR_SHAPE_RE.fullmatch(text) or _LAUNCHER_MINTED_SPAWN_RE.fullmatch(text)
+    ):
         return None
     return text
 
