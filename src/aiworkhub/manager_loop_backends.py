@@ -452,6 +452,10 @@ def _opencode_events(event: Mapping[str, Any], context: TurnContext) -> list[dic
 REASONING_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
 
 
+# ponytail: per process and resets on server restart.
+_CLAUDE_THINKING_DISPLAY_REJECTED = False
+
+
 def manager_stream_tokens(backend_id: str, level: str = "") -> list[str]:
     """Flags that make a manager turn show thinking and honor a chosen depth.
 
@@ -462,6 +466,11 @@ def manager_stream_tokens(backend_id: str, level: str = "") -> list[str]:
     (measured on CLI 2.1.280: 6 blocks, 0 chars; with ``--thinking-display
     summarized``: 5 blocks, 5995 chars). Effort tokens are added only for a
     level the CLI documents.
+
+    When a claude turn's CLI rejects ``--thinking-display`` (see
+    ``CliManagerBackend._turn``), this memo drops the flag for that one
+    immediate retry and for every later turn in this process, while keeping
+    ``--include-partial-messages`` and any ``--effort`` handling unchanged.
     """
 
     cleaned = str(level or "").strip().lower()
@@ -470,7 +479,9 @@ def manager_stream_tokens(backend_id: str, level: str = "") -> list[str]:
     if backend_id == "opencode_cli":
         return ["--thinking"]
     if backend_id == "claude_cli":
-        tokens = ["--include-partial-messages", "--thinking-display", "summarized"]
+        tokens = ["--include-partial-messages"]
+        if not _CLAUDE_THINKING_DISPLAY_REJECTED:
+            tokens += ["--thinking-display", "summarized"]
         if cleaned:
             tokens.extend(("--effort", cleaned))
         return tokens
@@ -859,6 +870,7 @@ class CliManagerBackend:
         watchdog.start()
         context = TurnContext()
         saw_error = False
+        streamed = False
         try:
             for raw in process.stdout or ():
                 event = _decode(raw)
@@ -873,6 +885,7 @@ class CliManagerBackend:
                         if saw_error:
                             continue
                         saw_error = True
+                    streamed = True
                     yield translated
         finally:
             watchdog.cancel()
@@ -882,6 +895,16 @@ class CliManagerBackend:
                 if self._process is process:
                     self._process = None
         if saw_error:
+            return
+        if (
+            code != 0 and not streamed and not expired.is_set()
+            and self.backend_id == "claude_cli" and "--thinking-display" in argv
+            and "unknown option" in stderr.lower() and "--thinking-display" in stderr
+        ):
+            # NF-2026-01353: retry once; the memo drops the flag (images are already in message).
+            global _CLAUDE_THINKING_DISPLAY_REJECTED
+            _CLAUDE_THINKING_DISPLAY_REJECTED = True
+            yield from self._turn(message)
             return
         if expired.is_set():
             yield _turn_error("timeout", f"manager_turn_timeout_seconds={self.timeout_seconds:g}")

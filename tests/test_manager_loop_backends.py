@@ -1047,3 +1047,115 @@ def test_stream_tokens_keep_thinking_on_without_a_level_and_normalize_the_level(
         "codex", "--json", *effort,
     ]
     assert mlb.apply_manager_stream_tokens("codex_cli", [], "high") == effort
+
+
+def _replay_cli_script(tmp_path: Path) -> Path:
+    script = tmp_path / "replay_cli.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            import sys
+
+            mode = sys.argv[1]
+            if mode == "reject":
+                print("error: unknown option '--thinking-display'", file=sys.stderr, flush=True)
+                sys.exit(1)
+            if mode == "success":
+                print('{"type": "system", "subtype": "init", "session_id": "conv-ok", "model": "claude-opus-5"}', flush=True)
+                print('{"type": "result", "usage": {}}', flush=True)
+                sys.exit(0)
+            print("some unrelated provider failure", file=sys.stderr, flush=True)
+            sys.exit(1)
+            """
+        ),
+        encoding="utf-8",
+    )
+    return script
+
+
+def test_a_claude_turn_retries_once_when_the_cli_rejects_thinking_display(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(mlb, "_CLAUDE_THINKING_DISPLAY_REJECTED", False)
+    monkeypatch.setattr(
+        mlb.cli_model_discovery,
+        "record_claude_resolution",
+        lambda repo, alias, resolved: None,
+    )
+    script = _replay_cli_script(tmp_path)
+    calls: list[list[str]] = []
+
+    def spawn(argv: Any, cwd: Any, stdin_text: Any = None) -> Any:
+        calls.append(list(argv))
+        mode = "reject" if len(calls) == 1 else "success"
+        return subprocess.Popen(
+            [sys.executable, str(script), mode],
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+        )
+
+    cli = mlb.CliManagerBackend(
+        "claude_cli",
+        "opus",
+        tmp_path,
+        plan_builder=lambda backend_id, prompt, repo, *, model="": SimplePlan(
+            _ADAPTER_SHAPES[backend_id](prompt, model), str(repo)
+        ),
+        spawn=spawn,
+    )
+    cli.start("brief")
+    events = list(cli.send("go"))
+
+    assert len(calls) == 2
+    assert "--thinking-display" in calls[0]
+    assert "--thinking-display" not in calls[1]
+    assert "--include-partial-messages" in calls[1]
+    assert events and all(event["type"] != "error" for event in events)
+    assert "--thinking-display" not in mlb.manager_stream_tokens("claude_cli")
+    assert "--include-partial-messages" in mlb.manager_stream_tokens("claude_cli")
+    cli.close()
+
+
+def test_a_claude_turn_with_unrelated_nonzero_exit_keeps_the_error_path(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(mlb, "_CLAUDE_THINKING_DISPLAY_REJECTED", False)
+    monkeypatch.setattr(
+        mlb.cli_model_discovery,
+        "record_claude_resolution",
+        lambda repo, alias, resolved: None,
+    )
+    script = _replay_cli_script(tmp_path)
+    calls: list[list[str]] = []
+
+    def spawn(argv: Any, cwd: Any, stdin_text: Any = None) -> Any:
+        calls.append(list(argv))
+        return subprocess.Popen(
+            [sys.executable, str(script), "other"],
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+        )
+
+    cli = mlb.CliManagerBackend(
+        "claude_cli",
+        "opus",
+        tmp_path,
+        plan_builder=lambda backend_id, prompt, repo, *, model="": SimplePlan(
+            _ADAPTER_SHAPES[backend_id](prompt, model), str(repo)
+        ),
+        spawn=spawn,
+    )
+    cli.start("brief")
+    events = list(cli.send("go"))
+    cli.close()
+
+    assert len(calls) == 1
+    errors = [event for event in events if event["type"] == "error"]
+    assert len(errors) == 1
+    assert "--thinking-display" in mlb.manager_stream_tokens("claude_cli")
