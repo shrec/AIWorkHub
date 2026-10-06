@@ -1827,14 +1827,14 @@ def _build_opencode_mcp_config(
     server: dict[str, Any] = {
         "type": "local",
         "command": _opencode_command_argv(mcp_command),
-        "enabled": True,
+        "codemode": False,
     }
     if environment is not None:
         server["environment"] = check_environment(environment)
     return {
         "$schema": OPENCODE_CONFIG_SCHEMA_URL,
         "permission": permission_contract(),
-        "mcp": {OPENCODE_WORKER_MCP_SERVER: server},
+        "mcp": {"servers": {OPENCODE_WORKER_MCP_SERVER: server}},
     }
 
 
@@ -1849,16 +1849,22 @@ def _validate_opencode_config(config: Any, *, role: str) -> Any:
     alias = OPENCODE_WORKER_MCP_SERVER
     if len(alias) > OPENCODE_NAME_MAX_CHARS:
         raise OpenCodeWorkerConfigError("alias_too_long", str(len(alias)))
-    servers = config["mcp"]
+    mcp = config["mcp"]
+    servers = mcp.get("servers") if isinstance(mcp, dict) else None
     server = servers.get(alias) if isinstance(servers, dict) else None
-    if not isinstance(server, dict) or list(servers) != [alias]:
+    if (
+        not isinstance(mcp, dict)
+        or list(mcp) != ["servers"]
+        or not isinstance(server, dict)
+        or list(servers) != [alias]
+    ):
         raise OpenCodeWorkerConfigError("malformed", "mcp_servers")
     if (
-        not {"type", "command", "enabled"}
+        not {"type", "command", "codemode"}
         <= set(server)
-        <= {"type", "command", "enabled", "environment"}
+        <= {"type", "command", "codemode", "environment"}
         or server["type"] != "local"
-        or server["enabled"] is not True
+        or server["codemode"] is not False
     ):
         raise OpenCodeWorkerConfigError("malformed", "mcp_server")
     try:
@@ -2310,6 +2316,9 @@ def build_runtime_command(
         argv = [
             executable,
             "run",
+            # A bare `run` shares the fixed managed-service port 55552 across
+            # seats; `--standalone` spawns a private `serve --stdio --port 0`.
+            "--standalone",
             "--format",
             "json",
             "--model",

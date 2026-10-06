@@ -886,9 +886,10 @@ def test_opencode_request_config_binds_the_exact_request_for_every_sandbox(
     assert delivered[_OC_NO_PROJECT] == "1"
     assert sorted(str(path) for path in tmp_path.rglob("*")) == before
     config = json.loads(delivered[_OC_ENV])
-    assert list(config["mcp"]) == ["awh"]
-    server = config["mcp"]["awh"]
-    assert server["type"] == "local" and server["enabled"] is True
+    assert list(config["mcp"]) == ["servers"]
+    assert list(config["mcp"]["servers"]) == ["awh"]
+    server = config["mcp"]["servers"]["awh"]
+    assert server["type"] == "local" and server["codemode"] is False
     source = json.loads(Path(runtime.claude_mcp_config_path).read_text(encoding="utf-8"))
     generated = source["mcpServers"][_MCP.SERVER_NAME]
     assert server["command"] == [generated["command"], *generated["args"]]
@@ -931,7 +932,8 @@ def test_opencode_request_configs_never_cross_repositories(tmp_path: Path) -> No
     assert str(tmp_path.resolve() / "repo-b") not in texts[0]
     assert str(tmp_path.resolve() / "repo-a") not in texts[1]
     for text, request_id in zip(texts, ("R-a", "R-b"), strict=True):
-        environment = json.loads(text)["mcp"]["awh"]["environment"]
+        servers = json.loads(text)["mcp"]["servers"]
+        environment = servers["awh"]["environment"]
         assert environment[_MCP.ENV_REQUEST_ID] == request_id
         for identity_key in ("AIWORKHUB_REPO_ROOT", "AIWORKHUB_REPO", "AIWORKHUB_REPO_ID"):
             assert identity_key not in environment
@@ -1148,7 +1150,7 @@ def test_generated_worker_runtime_feeds_the_request_local_opencode_config(
 
     delivered = _provision_opencode(workspace, runtime, authority)
 
-    server = json.loads(delivered[_OC_ENV])["mcp"]["awh"]
+    server = json.loads(delivered[_OC_ENV])["mcp"]["servers"]["awh"]
     assert server["command"][1:] == ["-m", "aiworkhub.worker_ai_tools_mcp"]
     assert server["command"][0] == sys.executable
     assert server["environment"] == runtime.env

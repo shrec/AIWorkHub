@@ -125,6 +125,7 @@ def test_opencode_argv_is_format_json_and_exact_provider_model(tmp_path: Path) -
     assert plan.argv == [
         str(executable),
         "run",
+        "--standalone",
         "--format",
         "json",
         "--model",
@@ -498,10 +499,12 @@ def test_opencode_worker_mcp_config_is_request_local_and_secret_free() -> None:
     for mcp_tool in runtime_adapters.OPENCODE_WORKER_MCP_TOOLS:
         name = runtime_adapters.opencode_mcp_tool_name(mcp_tool)
         assert permission[name] == runtime_adapters.OPENCODE_PERMISSION_ALLOW
-    server = config["mcp"][runtime_adapters.OPENCODE_WORKER_MCP_SERVER]
+    servers = config["mcp"]["servers"]
+    server = servers[runtime_adapters.OPENCODE_WORKER_MCP_SERVER]
     assert server["type"] == "local"
     assert server["command"] == list(command)
-    assert server["enabled"] is True
+    assert server["codemode"] is False
+    assert "enabled" not in server
     assert "environment" not in server
     assert "headers" not in server
     assert "oauth" not in server
@@ -544,8 +547,9 @@ def test_opencode_worker_mcp_tool_names_fit_muse_limit() -> None:
         if action == runtime_adapters.OPENCODE_PERMISSION_ALLOW
     }
     assert set(published) == allow_names == config_allow
-    assert list(config["mcp"]) == ["awh"]
-    assert old_alias not in config["mcp"]
+    assert list(config["mcp"]) == ["servers"]
+    assert list(config["mcp"]["servers"]) == ["awh"]
+    assert old_alias not in config["mcp"]["servers"]
     for mcp_tool in runtime_adapters.OPENCODE_WORKER_MCP_TOOLS:
         assert runtime_adapters.opencode_tool_is_allowed(f"{old_alias}_{mcp_tool}") is False
         assert "manager" not in mcp_tool
@@ -569,7 +573,7 @@ def _worker_config() -> dict[str, object]:
 
 def test_opencode_worker_mcp_config_binds_request_environment_from_allowlist_only() -> None:
     config = _worker_config()
-    assert config["mcp"]["awh"]["environment"] == _worker_env()
+    assert config["mcp"]["servers"]["awh"]["environment"] == _worker_env()
     assert runtime_adapters.validate_opencode_worker_config(config) == config
     for environment in (
         {"OPENAI_API_KEY": "sk-secret"},
@@ -618,20 +622,35 @@ def test_opencode_worker_mcp_environment_allowlist_is_the_generated_binding() ->
             "permission_contract_mismatch",
         ),
         (lambda c: c["permission"].update({"*": "allow"}), "permission_contract_mismatch"),
+        # The v1 shape OpenCode's ConfigMigrateV1.migrateMcp used to accept
+        # drops codemode and hands the seat Code Mode, so it is refused here.
         (
             lambda c: c["mcp"].update(
-                aiworkhub={"type": "local", "command": ["x"], "enabled": True}
+                awh={"type": "local", "command": ["x"], "enabled": True}
             ),
             "malformed",
         ),
-        (lambda c: c["mcp"]["awh"].update(enabled=False), "malformed"),
-        (lambda c: c["mcp"]["awh"].update(type="remote"), "malformed"),
+        (lambda c: c["mcp"].update(tools={"awh": True}), "malformed"),
         (
-            lambda c: c["mcp"]["awh"].update(headers={"Authorization": "Bearer x"}),
+            lambda c: c["mcp"]["servers"].update(
+                aiworkhub={"type": "local", "command": ["x"], "codemode": False}
+            ),
+            "malformed",
+        ),
+        (lambda c: c["mcp"]["servers"]["awh"].update(codemode=True), "malformed"),
+        (lambda c: c["mcp"]["servers"]["awh"].pop("codemode"), "malformed"),
+        (lambda c: c["mcp"]["servers"]["awh"].update(enabled=True), "malformed"),
+        (lambda c: c["mcp"]["servers"]["awh"].update(type="remote"), "malformed"),
+        (
+            lambda c: c["mcp"]["servers"]["awh"].update(
+                headers={"Authorization": "Bearer x"}
+            ),
             "malformed",
         ),
         (
-            lambda c: c["mcp"]["awh"]["environment"].update(OPENAI_API_KEY="sk-x"),
+            lambda c: c["mcp"]["servers"]["awh"]["environment"].update(
+                OPENAI_API_KEY="sk-x"
+            ),
             "malformed",
         ),
     ],
@@ -665,7 +684,8 @@ def test_opencode_worker_config_serializes_to_bounded_ascii_json() -> None:
     assert json.loads(text) == config
     assert next(iter(json.loads(text)["permission"])) == "*"
     oversized = copy.deepcopy(config)
-    oversized["mcp"]["awh"]["environment"]["AIWORKHUB_WORKER_MCP_TASK_ID"] = "x" * (
+    oversized_environment = oversized["mcp"]["servers"]["awh"]["environment"]
+    oversized_environment["AIWORKHUB_WORKER_MCP_TASK_ID"] = "x" * (
         runtime_adapters.OPENCODE_WORKER_CONFIG_MAX_BYTES
     )
     with pytest.raises(runtime_adapters.OpenCodeWorkerConfigError) as excinfo:
@@ -684,11 +704,13 @@ def _expected_config_text(permission: dict[str, str], environment: dict[str, str
             "$schema": runtime_adapters.OPENCODE_CONFIG_SCHEMA_URL,
             "permission": permission,
             "mcp": {
-                runtime_adapters.OPENCODE_WORKER_MCP_SERVER: {
-                    "type": "local",
-                    "command": command,
-                    "enabled": True,
-                    "environment": environment,
+                "servers": {
+                    runtime_adapters.OPENCODE_WORKER_MCP_SERVER: {
+                        "type": "local",
+                        "command": command,
+                        "codemode": False,
+                        "environment": environment,
+                    }
                 }
             },
         },
@@ -725,7 +747,8 @@ def test_worker_and_manager_opencode_configs_are_one_contract_with_two_roles() -
     # The two roles share the schema and the single server alias, and differ in
     # exactly one thing: the permission contract they are allowed to carry.
     assert worker["$schema"] == manager["$schema"]
-    assert list(worker["mcp"]) == list(manager["mcp"]) == ["awh"]
+    assert list(worker["mcp"]) == list(manager["mcp"]) == ["servers"]
+    assert list(worker["mcp"]["servers"]) == list(manager["mcp"]["servers"]) == ["awh"]
     assert worker["permission"] != manager["permission"]
 
     bare_worker = runtime_adapters.build_opencode_worker_mcp_config(command)
