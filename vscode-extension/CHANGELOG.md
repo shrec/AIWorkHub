@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.35 — 2026-10-06
+
+### Fixed
+
+- The worker bridge derives an omitted semantic-edit apply `idempotency_key`, so a second edit on an already-staged file no longer dies `semantic_edit_apply_input_invalid` (NF-2026-01373).
+- .NET worker seed restores centrally pinned transitive packages (NF-2026-01366).
+
+### Qualification
+
+- Independent component regressions pass; installation, activation and live qualification are separate evidence.
+
 ## 0.12.34 — 2026-10-06
 
 ### Fixed

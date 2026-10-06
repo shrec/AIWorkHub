@@ -62,6 +62,11 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.35
+
+- vscode_lm workers can make more than one edit in the same file again: a semantic-edit apply that omits `idempotency_key` gets one derived from the exact edit, instead of every second edit failing as invalid input (NF-2026-01373).
+- .NET workers restore repositories that pin transitive packages centrally (`CentralPackageTransitivePinningEnabled`) (NF-2026-01366).
+
 ## What's new in 0.12.34
 
 - Picking a conversation or a model in Manager Chat now makes it the manager: the pick renews the manager seat lease even for a conversation that has been idle, the model is pinned on the conversation, and the dashboard shows `manager_chat <backend>/<model>` instead of the window's `codex` route (NF-2026-01376).

@@ -6,6 +6,17 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.35] - 2026-10-06
+
+### Fixed
+
+- vscode_lm worker bridge: a `aiworkhub_worker_semantic_edit_apply` call that omits `idempotency_key` gets one derived from the exact (`target_id`, `new`) pair, so the fresh prepare/apply pair that follows a coordinate-shifting stage no longer fails `semantic_edit_apply_input_invalid` for every emulated-transport model; a model-supplied key is unchanged and the native MCP contract stays strict (NF-2026-01373).
+- .NET worker seed: with `CentralPackageTransitivePinningEnabled=true`, the synthetic restore also seeds the `Directory.Packages.props` `PackageVersion` rows that pin transitive packages, through the same identity/version allowlist gates, when no direct or global reference already declares the identity (NF-2026-01366).
+
+### Qualification
+
+- Each fix has a regression that fails before and passes after; the touched suites and the full suite pass. Installation and live replay are separate evidence.
+
 ## [0.12.34] - 2026-10-06
 
 ### Fixed

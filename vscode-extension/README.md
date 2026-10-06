@@ -14,6 +14,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.35
+
+- vscode_lm workers can make more than one edit in the same file again: a semantic-edit apply that omits `idempotency_key` gets one derived from the exact edit (NF-2026-01373).
+- .NET workers restore repositories that pin transitive packages centrally (NF-2026-01366).
+
 ## What's new in 0.12.34
 
 - Picking a conversation or a model in Manager Chat now makes it the manager: the pick renews the manager seat lease even for a conversation that has been idle, the model is pinned on the conversation, and the dashboard shows `manager_chat <backend>/<model>` instead of the window's `codex` route (NF-2026-01376).
