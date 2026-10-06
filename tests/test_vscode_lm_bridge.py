@@ -1545,6 +1545,24 @@ def test_nf1291_write_gate_and_scope_reject_before_mutation(nf1291_editor_bridge
     assert source.read_bytes() == b"before\nsecond\n"
 
 
+def test_nf1373_bridge_derives_idempotency_key_the_model_omitted(nf1291_editor_bridge):
+    """Request de6bf0a1: deepseek omitted the key 4 more times after it was named."""
+    manager, request = nf1291_editor_bridge
+    request_id = "1" * 32
+    source, *_ = request(request_id)
+    prepared = _nf1291_prepare(manager, request_id)
+    call = {"target_id": prepared["target_id"], "new": "after\n"}
+    applied = manager.invoke_vscode_lm_worker_tool(
+        request_id, "aiworkhub_worker_semantic_edit_apply", {**call, "provider_call_id": "nf1373.a"},
+    )
+    assert applied["ok"] is True and applied["idempotent_replay"] is False
+    replay = manager.invoke_vscode_lm_worker_tool(
+        request_id, "aiworkhub_worker_semantic_edit_apply", {**call, "provider_call_id": "nf1373.b"},
+    )
+    assert replay["ok"] is True and replay["idempotent_replay"] is True
+    assert source.read_bytes() == b"after\nsecond\n"
+
+
 def test_nf1291_source_graph_delivery_is_not_reemitted(nf1291_editor_bridge, monkeypatch):
     manager, request = nf1291_editor_bridge
     request_id = "1" * 32

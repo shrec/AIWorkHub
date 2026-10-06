@@ -12832,11 +12832,12 @@ class ProcessManager:
                     end_line=tool_input.get("end_line", 0),
                     include_fragment=tool_input.get("include_fragment") is True,
                 )
-            return session.apply(
-                target_id=tool_input.get("target_id", ""),
-                new=tool_input.get("new"),
-                idempotency_key=tool_input.get("idempotency_key", ""),
-            )
+            # NF-2026-01373: emulated models omit idempotency_key even when named;
+            # it only dedupes an identical replay, so derive it from that pair.
+            target_id, new = tool_input.get("target_id", ""), tool_input.get("new")
+            key = tool_input.get("idempotency_key") or "derived:" + hashlib.sha256(
+                f"{target_id}\0{new}".encode("utf-8")).hexdigest()
+            return session.apply(target_id=target_id, new=new, idempotency_key=key)
         if tool_name == "aiworkhub_manager_source_graph_query":
             identity = replace(ctx, provider_call_id="", provenance="")
             cached = self._vscode_lm_semantic_sessions.get(request_id)
