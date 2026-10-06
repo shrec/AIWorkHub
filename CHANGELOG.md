@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.36] - 2026-10-06
+
+### Fixed
+
+- vscode_lm worker bridge: one staged edit per required output is readiness, not completion. The bridge no longer finalizes offline the moment every required output has a staged edit; it finalizes on the worker's own `aiworkhub_manager_semantic_edit_finalize`, under forced staging, or after a turn with no Source Graph/stage progress, so a worker can land a second edit in an already-staged output. A Source Graph no-progress stop with every required output staged now finalizes that work instead of failing the run (NF-2026-01378).
+- Manager Chat: a Claude turn whose CLI rejects `--thinking-display` retries once without the flag and remembers the rejection for the process, instead of failing the turn with `unknown option` (NF-2026-01353).
+- OpenCode: a statusless `provider.no-route` error is sealed as a typed route failure instead of an unclassified terminal (NF-2026-01374).
+
+### Qualification
+
+- Each fix has a regression that fails before and passes after; the touched suites and the full suite pass. Installation and live replay are separate evidence.
+
 ## [0.12.35] - 2026-10-06
 
 ### Fixed

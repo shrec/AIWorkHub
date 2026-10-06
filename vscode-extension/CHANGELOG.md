@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.36 — 2026-10-06
+
+### Fixed
+
+- vscode_lm workers can make several edits in a required output again: readiness no longer finalizes the run after the first staged edit; the run ends on the worker's finalize or once it stops making progress (NF-2026-01378).
+- Manager Chat Claude turns retry once without `--thinking-display` when the installed CLI rejects that option (NF-2026-01353).
+- OpenCode statusless `provider.no-route` is a typed route failure (NF-2026-01374).
+
+### Qualification
+
+- Independent component regressions pass; installation, activation and live qualification are separate evidence.
+
 ## 0.12.35 — 2026-10-06
 
 ### Fixed

@@ -62,6 +62,12 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.36
+
+- vscode_lm workers can make several edits in the same required output again: the run no longer ends right after the first staged edit; it ends when the worker finalizes or stops making progress (NF-2026-01378).
+- Manager Chat Claude turns retry once without `--thinking-display` when the installed Claude CLI does not know that option (NF-2026-01353).
+- OpenCode's statusless `provider.no-route` error is reported as a typed route failure (NF-2026-01374).
+
 ## What's new in 0.12.35
 
 - vscode_lm workers can make more than one edit in the same file again: a semantic-edit apply that omits `idempotency_key` gets one derived from the exact edit, instead of every second edit failing as invalid input (NF-2026-01373).

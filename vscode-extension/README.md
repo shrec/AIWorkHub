@@ -14,6 +14,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.36
+
+- vscode_lm workers can make several edits in the same required output again: the run no longer ends right after the first staged edit (NF-2026-01378).
+- Manager Chat Claude turns retry once without `--thinking-display` when the installed Claude CLI does not know that option (NF-2026-01353).
+- OpenCode's statusless `provider.no-route` error is reported as a typed route failure (NF-2026-01374).
+
 ## What's new in 0.12.35
 
 - vscode_lm workers can make more than one edit in the same file again: a semantic-edit apply that omits `idempotency_key` gets one derived from the exact edit (NF-2026-01373).
