@@ -102,6 +102,8 @@ class ManagerSession:
     A legacy session is pinned to the ``backend_id`` and ``model`` it started on; a
     passive one leaves both empty, because its route belongs to each turn.
     ``previous_session_id`` names the closed session whose handoff a session continues.
+    ``updated_at`` is when the owner last picked it (continue, restore, a route); that
+    pick renews the manager seat lease like a turn does.
     """
 
     session_id: str
@@ -116,6 +118,7 @@ class ManagerSession:
     handoff_ref: str | None = None
     previous_session_id: str | None = None
     title: str = ""
+    updated_at: str = ""
 
     @property
     def passive(self) -> bool:
@@ -877,7 +880,7 @@ class ManagerOrchestrator:
             finally:
                 self._release_lock()
 
-    def attach(self, session_id: str) -> ManagerSession:
+    def attach(self, session_id: str, backend_id: str = "", model: str = "") -> ManagerSession:
         """Continue one saved conversation. No provider call and no Start.
 
         The chosen record becomes the repository's active session and the
@@ -885,12 +888,16 @@ class ManagerOrchestrator:
         process -- returns it instead of the oldest passive conversation.
         A closed record is reopened in place so its event log continues.
         Any other active record is closed through a mechanical handoff.
+        A ``backend_id``/``model`` pair pins that route on it without starting
+        it; the next turn or wake binds it. The pick renews the seat lease.
         Refused while this orchestrator is already inside a turn.
         """
         if not _SESSION_ID_RE.fullmatch(session_id):
             raise ManagerLoopError("session_id_invalid")
+        if bool(backend_id.strip()) != bool(model.strip()):
+            raise ValueError("backend_id and model go together")
         with self._queued(), self._exclusive():
-            return self._attach(session_id)
+            return self._attach(session_id, backend_id.strip(), model.strip())
 
     def begin_new(self) -> ManagerSession:
         """Close the current conversation and open a fresh passive one.
@@ -975,27 +982,42 @@ class ManagerOrchestrator:
                     self._ensure()
             return self._bind_existing(backend_id, model)
 
-    def _attach(self, session_id: str) -> ManagerSession:
+    def _attach(self, session_id: str, backend_id: str = "", model: str = "") -> ManagerSession:
         chosen = next(
             (item for item in self.store.sessions() if item.session_id == session_id),
             None,
         )
         if chosen is None:
             raise ManagerLoopError("session_not_found")
+        loaded = self._session
         if (
-            self._session is not None
+            loaded is not None
             and self._backend is not None
-            and self._session.session_id == chosen.session_id
+            and loaded.session_id == chosen.session_id
             and chosen.status == "active"
+            and (not backend_id or (loaded.backend_id, loaded.model) == (backend_id, model))
         ):
+            # The running backend already serves this conversation on this route.
             self._activate_selected(chosen)
-            self.store.write_selection(chosen.session_id)
-            return self._session
-        self._drop_backend()
-        chosen = self._activate_selected(chosen)
+            chosen = loaded
+        else:
+            self._drop_backend()
+            chosen = self._activate_selected(chosen)
+        route = {"backend_id": backend_id, "model": model} if backend_id else {}
+        chosen = self._owner_picked(chosen, **route)
         self.store.write_selection(chosen.session_id)
         self._session = chosen
         return chosen
+
+    def _owner_picked(self, session: ManagerSession, **changes: Any) -> ManagerSession:
+        """Save ``session`` as the owner's pick: ``updated_at`` renews its manager seat lease.
+
+        Only explicit acts call this (continue, restore, a picked route, binding a
+        route for a turn), never ``ensure``: opening the panel must not seize the seat.
+        """
+        session = dataclasses.replace(session, updated_at=self._clock(), **changes)
+        self.store.save(session)
+        return session
 
     def _begin_new(self) -> ManagerSession:
         self._drop_backend()
@@ -1022,7 +1044,7 @@ class ManagerOrchestrator:
             chosen = self._selected_session() or self._latest_session()
             if chosen is None:
                 return None
-            session = self._activate_selected(chosen)
+            session = self._owner_picked(self._activate_selected(chosen))
             self.store.write_selection(session.session_id)
         finally:
             self._release_lock()
@@ -1064,7 +1086,7 @@ class ManagerOrchestrator:
                     closed_at=None,
                     context_estimate_bytes=session.context_estimate_bytes + len(brief.encode("utf-8")),
                 )
-            self.store.save(session)
+            session = self._owner_picked(session)
             if not any(event.get("type") == "session_start" for event in self.store.events(session.session_id)):
                 self._record(session, session.turn_count, "session_start", {
                     "provider_ref": str(provider_ref),

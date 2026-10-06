@@ -263,6 +263,27 @@ test("managerLoopContinue and managerLoopNew reach the gated client; a short id 
   assert.equal(gatedClient.calls.filter((call) => call.name === "aiworkhub_manager_loop_continue").length, 1);
 });
 
+test("managerLoopContinue carries a picked route; an unlisted backend or half a route is dropped", async () => {
+  const harness = loadHostSlice();
+  harness.setClient(makeClient());
+  const view = makeView();
+  const sessionId = "mls-aaaa1111bbbb2222";
+
+  harness.api.handleInboundMessage(view, { type: "managerLoopContinue", sessionId, backendId: "claude_cli", model: "claude-opus-5-5" });
+  harness.api.handleInboundMessage(view, { type: "managerLoopContinue", sessionId, backendId: "evil_cli", model: "x" });
+  harness.api.handleInboundMessage(view, { type: "managerLoopContinue", sessionId, backendId: "codex_cli", model: " " });
+  await flush();
+
+  const continues = harness.managerLoopClientInstances[0].calls
+    .filter((call) => call.name === "aiworkhub_manager_loop_continue")
+    .map((call) => plain(call.args));
+  assert.deepEqual(continues, [
+    { session_id: sessionId, backend_id: "claude_cli", model: "claude-opus-5-5" },
+    { session_id: sessionId },
+    { session_id: sessionId },
+  ]);
+});
+
 test("managerLoopRestore and managerLoopRename reach the gated client", async () => {
   const harness = loadHostSlice();
   harness.setClient(makeClient());
@@ -1496,6 +1517,83 @@ test("the session picker lists saved conversations and continue/new stay on this
 
   trigger(harness.elements.managerChatNewSession, "click");
   assert.deepEqual(plain(harness.posts.at(-1)), { type: "managerLoopNew" });
+});
+
+test("picking a model pins it on the open conversation so it becomes the manager", () => {
+  const harness = loadWebviewSlice();
+  harness.state.featureSettings = MANAGER_CHAT_MODEL_POLICY_PAYLOAD;
+  harness.api.populateManagerChatModelOptions();
+  const select = harness.elements.managerChatModelInput;
+
+  select.value = "gpt-5-codex";
+  trigger(select, "change");
+  assert.equal(
+    harness.posts.some((post) => post.type === "managerLoopContinue"),
+    false,
+    "with no open conversation there is nothing to pin",
+  );
+
+  harness.state.managerChatSession = "mls-aaaa1111bbbb2222";
+  trigger(select, "change");
+  assert.deepEqual(plain(harness.posts.at(-1)), {
+    type: "managerLoopContinue",
+    sessionId: "mls-aaaa1111bbbb2222",
+    backendId: "codex_cli",
+    model: "gpt-5-codex",
+  });
+});
+
+test("while Manager Chat holds the seat, the current repo and coordinator line name it, not the window route", () => {
+  const code =
+    extractSlice(appSource, "function createElement(tag, className, text) {", "return element;\n}", "createElement") +
+    "\n" +
+    extractSlice(appSource, "function asArray(value) {", "return Array.isArray(value) ? value : [];\n}", "asArray") +
+    "\n" +
+    extractSlice(
+      appSource,
+      "function managerChatSeatLabel(snapshot) {",
+      'routing: "per-task coordinator_provider + thread/session identity",\n    });\n  }\n}',
+      "seat label renderers",
+    );
+  const state = { snapshot: null };
+  const elements = {
+    repoRouter: makeFakeElement("div"),
+    repoRouterList: makeFakeElement("div"),
+    targetState: makeFakeElement("span"),
+  };
+  const context = {
+    document: {
+      createElement: (tag) => makeFakeElement(tag),
+      createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }),
+      createDocumentFragment: () => ({ __isFragment: true, children: [], appendChild(child) { this.children.push(child); return child; } }),
+    },
+    state,
+    elements,
+  };
+  vm.createContext(context);
+  vm.runInContext(`"use strict";\n${code}\nthis.api = { renderKnownRepositories, renderCoordinatorTargets };`, context);
+  const seated = {
+    manager_identity_target: { selected_provider: "manager_chat", backend_id: "claude_cli", model: "claude-opus-5-5" },
+    known_repositories: {
+      repositories: [
+        { repo_name: "AIWorkHub", current_repo: true, selected_provider: "codex", extension_host_alive: true },
+        { repo_name: "Other", current_repo: false, selected_provider: "codex", extension_host_alive: true },
+      ],
+    },
+  };
+  state.snapshot = seated;
+
+  context.api.renderKnownRepositories(seated);
+  context.api.renderCoordinatorTargets({ selected_provider: "codex", targets: { codex: { capability_state: "ready" } } });
+
+  const [current, other] = elements.repoRouterList.children;
+  assert.equal(current.textContent, "● AIWorkHub · manager_chat claude_cli/claude-opus-5-5 · live");
+  assert.equal(other.textContent, "Other · codex · live", "another repository keeps its own window route");
+  assert.equal(elements.targetState.textContent, "automatic: manager_chat claude_cli/claude-opus-5-5 · ready");
+
+  state.snapshot = { manager_identity_target: { selected_provider: "codex" } };
+  context.api.renderCoordinatorTargets(state.coordinatorTargets);
+  assert.equal(elements.targetState.textContent, "automatic: codex · ready", "a released seat shows the window route again");
 });
 
 test("the model field is a <select>, not a free-text input", () => {

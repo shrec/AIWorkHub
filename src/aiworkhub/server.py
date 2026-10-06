@@ -1856,17 +1856,21 @@ def aiworkhub_manager_loop_discard(session_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def aiworkhub_manager_loop_continue(session_id: str) -> dict[str, Any]:
+def aiworkhub_manager_loop_continue(
+    session_id: str, backend_id: str = "", model: str = ""
+) -> dict[str, Any]:
     """MANAGER WRITE: continue one saved manager conversation.
 
     Synchronous and provider-free. The chosen record becomes the active
-    session and the persisted selection. Refused while a turn is running.
+    session and the persisted selection. A picked backend_id/model is
+    authorized and pinned on it without starting it; the pick renews the
+    manager seat. Refused while a turn is running.
     """
 
     root, refusal = _manager_loop_repo_root(launching=True)
     if refusal is not None:
         return refusal
-    return manager_loop_service.continue_session(root, session_id)
+    return manager_loop_service.continue_session(root, session_id, backend_id, model)
 
 
 @mcp.tool()

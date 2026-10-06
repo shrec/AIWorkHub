@@ -759,25 +759,41 @@ def status(repo: str | Path) -> dict[str, Any]:
     }
 
 
-def continue_session(repo: str | Path, session_id: str) -> dict[str, Any]:
-    """Attach the panel to one saved conversation. Refused while a turn runs."""
+def continue_session(
+    repo: str | Path, session_id: str, backend_id: str = "", model: str = ""
+) -> dict[str, Any]:
+    """Attach the panel to one saved conversation. Refused while a turn runs.
 
+    A picked ``backend_id``/``model`` is authorized like a send's route and pinned
+    on the conversation without starting it, so the pick alone makes it the seat.
+    """
+
+    route: tuple[str, str] = ("", "")
+    if backend_id.strip() or model.strip():
+        if not backend_id.strip() or not model.strip():
+            return {"ok": False, "error": "manager_route_selection_incomplete"}
+        authorized = authorize_selected_route(repo, backend_id.strip(), model.strip())
+        if authorized is None:
+            return {
+                "ok": False,
+                "error": f"manager_backend_unavailable:{backend_id.strip()}:{model.strip()}",
+            }
+        route = authorized
     entry, err = _entry_or_error(repo)
     if err is not None:
         return err
     if not entry.turn_lock.acquire(blocking=False):
         return {"ok": False, "error": "manager_turn_in_progress"}
     try:
-        session = entry.orchestrator.attach(session_id)
+        session = entry.orchestrator.attach(session_id, *route)
     except ManagerLoopError as exc:
         return _error(exc)
     except Exception as exc:  # noqa: BLE001 - continue must never cross the MCP boundary
         return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
     finally:
         entry.turn_lock.release()
-    # The consumer follows the attached conversation: one that holds the seat starts
-    # it (a conversation restored after idling past the lease had none), and one that
-    # fails the rule, passive or idle past the lease, stops a consumer that was running.
+    # The owner's pick renews the seat lease, so a bound conversation starts the
+    # consumer even after idling; a passive one has no route and stops a running one.
     _ensure_wake_started(entry, repo)
     return {"ok": True, "session": session.to_json()}
 

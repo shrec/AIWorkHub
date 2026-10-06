@@ -3816,6 +3816,7 @@ function renderSnapshot(snapshot) {
   renderWaveMiniRoadmap(snapshot);
   renderCallbackObservability(snapshot);
   renderKnownRepositories(snapshot);
+  if (state.coordinatorTargets) renderCoordinatorTargets(state.coordinatorTargets);
   if (storageReady) {
     renderSourceHealth(snapshot);
   }
@@ -3901,6 +3902,15 @@ function renderRuntimeInfo(info) {
   }
 }
 
+// While a Manager Chat conversation holds the manager seat, this repository's
+// manager is that conversation's model, not the window's coordinator route.
+function managerChatSeatLabel(snapshot) {
+  const target = snapshot && snapshot.manager_identity_target;
+  if (!target || target.selected_provider !== "manager_chat") return "";
+  const route = [target.backend_id, target.model].filter(Boolean).join("/");
+  return route ? `manager_chat ${route}` : "manager_chat";
+}
+
 function renderKnownRepositories(snapshot) {
   if (!elements.repoRouter || !elements.repoRouterList) {
     return;
@@ -3914,6 +3924,7 @@ function renderKnownRepositories(snapshot) {
     elements.repoRouterList.replaceChildren();
     return;
   }
+  const seat = managerChatSeatLabel(snapshot);
   const fragment = document.createDocumentFragment();
   for (const repo of repos) {
     const classes = ["repo-route"];
@@ -3921,7 +3932,7 @@ function renderKnownRepositories(snapshot) {
     if (repo.stale) classes.push("stale");
     const item = createElement("span", classes.join(" "));
     const name = String(repo.repo_name || "repo");
-    const selected = String(repo.selected_provider || "unknown");
+    const selected = String((repo.current_repo && seat) || repo.selected_provider || "unknown");
     const alive = repo.extension_host_alive ? "live" : "not-live";
     item.textContent = `${repo.current_repo ? "● " : ""}${name} · ${selected} · ${alive}${repo.stale ? " · stale" : ""}`;
     item.title = JSON.stringify({
@@ -3939,6 +3950,9 @@ function renderKnownRepositories(snapshot) {
 
 function renderCoordinatorTargets(info) {
   const payload = info && typeof info === "object" ? info : {};
+  // Kept so a snapshot that moves the seat re-renders this line without a new push.
+  state.coordinatorTargets = payload;
+  const seat = managerChatSeatLabel(state.snapshot);
   const selected = String(payload.selected_provider || "codex");
   const target = payload.targets && payload.targets[selected] ? payload.targets[selected] : {};
   const route = target.route && typeof target.route === "object" ? target.route : {};
@@ -3946,12 +3960,15 @@ function renderCoordinatorTargets(info) {
   if (elements.targetState) {
     const stateText = String(target.capability_state || "automatic");
     const reason = String(wake.reason || wake.action || "");
-    elements.targetState.textContent = `automatic: ${selected} · ${stateText}${reason ? ` · ${reason}` : ""}`;
+    elements.targetState.textContent = seat
+      ? `automatic: ${seat} · ready`
+      : `automatic: ${selected} · ${stateText}${reason ? ` · ${reason}` : ""}`;
     elements.targetState.title = JSON.stringify({
       repo_id: payload.repo_id,
       window_id: payload.window_id,
       claim_episode: payload.claim_episode,
       selected_provider: selected,
+      manager_seat: seat || undefined,
       capability_state: target.capability_state,
       thread_id: route.thread_id,
       session_id: route.session_id,
@@ -8190,6 +8207,16 @@ elements.managerChatModelInput.addEventListener("change", () => {
     elements.managerChatBackendSelect.value = route.backendId;
   }
   if (route.model && route.backendId) state.managerChatModelByBackend[route.backendId] = route.model;
+  // The pick is the seat: pin the route on the open conversation so it becomes
+  // the manager without waiting for a send.
+  if (route.model && route.backendId && state.managerChatSession) {
+    vscode.postMessage({
+      type: "managerLoopContinue",
+      sessionId: state.managerChatSession,
+      backendId: route.backendId,
+      model: route.model,
+    });
+  }
 });
 
 if (elements.managerChatSessionSelect && typeof elements.managerChatSessionSelect.addEventListener === "function") {

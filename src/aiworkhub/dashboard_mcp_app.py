@@ -2448,11 +2448,17 @@ def snapshot_view(
         }
         chat_route = manager.get("manager_route") if isinstance(manager, dict) else {}
         chat = chat_route.get("manager_chat") if isinstance(chat_route, dict) else None
+        if not isinstance(chat, dict) and isinstance(manager, dict):
+            # A Claude-identified child reports the seat beside its own route (NF-2026-00972).
+            chat = manager.get("manager_chat_seat")
         if isinstance(chat, dict) and chat.get("session_id"):
             snapshot["manager_identity_target"] = {
                 "selected_provider": "manager_chat",
                 "capability_state": "ready",
                 "reason": "",
+                "session_id": str(chat.get("session_id") or ""),
+                "backend_id": str(chat.get("backend_id") or ""),
+                "model": str(chat.get("model") or ""),
             }
     except Exception:  # noqa: BLE001 -- route diagnostics are optional
         snapshot["manager_identity_target"] = {}

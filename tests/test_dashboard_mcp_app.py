@@ -475,6 +475,31 @@ def test_snapshot_full_keeps_every_quarantine_row_and_the_whole_contract(monkeyp
     }
 
 
+@pytest.mark.parametrize("where", ["manager_route", "manager_chat_seat"])
+def test_snapshot_target_names_the_manager_chat_seat(monkeypatch, where):
+    seat = {"session_id": "mls-aaaa1111bbbb2222", "backend_id": "claude_cli", "model": "claude-opus-5-5"}
+    manager = _manager_reply()
+    if where == "manager_route":
+        manager["manager_route"]["manager_chat"] = seat
+    else:
+        # A Claude-identified child reports the seat beside its own route (NF-2026-00972).
+        manager["manager_chat_seat"] = seat
+    _stub_snapshot_sources(monkeypatch, manager=manager)
+
+    assert dashboard_mcp_app.snapshot_view()["manager_identity_target"] == {
+        "selected_provider": "manager_chat",
+        "capability_state": "ready",
+        "reason": "",
+        **seat,
+    }
+
+
+def test_snapshot_target_keeps_the_window_route_without_a_seat(monkeypatch):
+    _stub_snapshot_sources(monkeypatch, manager=_manager_reply())
+
+    assert dashboard_mcp_app.snapshot_view()["manager_identity_target"]["selected_provider"] == ""
+
+
 @pytest.mark.parametrize("digest", [None, "", "   "])
 def test_snapshot_default_without_a_digest_keeps_the_whole_contract(monkeypatch, digest):
     manager = _manager_reply()

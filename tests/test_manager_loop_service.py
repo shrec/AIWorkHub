@@ -1293,9 +1293,11 @@ def _seat_record(
     return session
 
 
-def test_restore_starts_no_wake_consumer_for_a_session_idle_past_the_seat_lease(
+def test_restore_renews_the_seat_lease_of_a_bound_session_idle_past_it(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
+    # Restore is an explicit attach (opening the chat never posts it), so it is the
+    # owner's pick and renews the seat lease like continue does.
     _install_fakes(monkeypatch)
     entry = manager_loop_service._entry_for(tmp_path)
     stale = _seat_record(entry, "mls-" + "0a" * 16, hours_idle=13)
@@ -1304,8 +1306,9 @@ def test_restore_starts_no_wake_consumer_for_a_session_idle_past_the_seat_lease(
 
     assert restored["ok"] is True
     assert restored["session"]["session_id"] == stale.session_id
-    assert entry.wake is None
-    assert manager_loop_service.status(tmp_path)["wake"]["running"] is False
+    assert restored["session"]["updated_at"]
+    assert entry.wake is not None
+    assert manager_loop_service.status(tmp_path)["wake"]["running"] is True
     assert manager_loop_service.close(tmp_path) == {"ok": True}
 
 
@@ -1431,7 +1434,7 @@ def test_a_same_route_send_to_a_bound_session_idle_past_the_lease_starts_its_wak
     )
     entry = manager_loop_service._entry_for(tmp_path)
     stale = _seat_record(entry, "mls-" + "1a" * 16, hours_idle=13)
-    assert manager_loop_service.restore(tmp_path)["session"]["session_id"] == stale.session_id
+    assert entry.orchestrator.restore_latest().session_id == stale.session_id
     assert entry.wake is None
 
     result = manager_loop_service.send(tmp_path, "hello", "fake", "model-a")
@@ -1451,7 +1454,7 @@ def test_a_routeless_send_to_a_bound_session_idle_past_the_lease_starts_its_wake
     backends = _install_fakes(monkeypatch)
     entry = manager_loop_service._entry_for(tmp_path)
     stale = _seat_record(entry, "mls-" + "1b" * 16, hours_idle=13)
-    assert manager_loop_service.restore(tmp_path)["session"]["session_id"] == stale.session_id
+    assert entry.orchestrator.restore_latest().session_id == stale.session_id
     # A turn needs a live backend and restore is provider-free: bind the session's own
     # route on the orchestrator directly, which arms no wake consumer.
     assert entry.orchestrator.continue_on_route("fake", "model-a").session_id == stale.session_id
@@ -1474,7 +1477,8 @@ def test_continue_session_starts_the_wake_for_a_bound_session_after_a_stale_rest
     _install_fakes(monkeypatch)
     entry = manager_loop_service._entry_for(tmp_path)
     stale = _seat_record(entry, "mls-" + "1c" * 16, hours_idle=13)
-    assert manager_loop_service.restore(tmp_path)["session"]["session_id"] == stale.session_id
+    # The orchestrator-level restore arms no wake consumer (the service's restore does).
+    assert entry.orchestrator.restore_latest().session_id == stale.session_id
     assert entry.wake is None
     fresh = _seat_record(entry, "mls-" + "1d" * 16)
 
@@ -1487,7 +1491,7 @@ def test_continue_session_starts_the_wake_for_a_bound_session_after_a_stale_rest
     assert manager_loop_service.close(tmp_path) == {"ok": True}
 
 
-def test_continue_session_starts_no_wake_for_a_session_idle_past_the_seat_lease(
+def test_continue_session_renews_the_seat_lease_of_a_session_idle_past_it(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
     _install_fakes(monkeypatch)
@@ -1498,9 +1502,72 @@ def test_continue_session_starts_no_wake_for_a_session_idle_past_the_seat_lease(
 
     assert attached["ok"] is True
     assert attached["session"]["session_id"] == stale.session_id
-    assert entry.wake is None
-    assert manager_loop_service.status(tmp_path)["wake"]["running"] is False
+    assert attached["session"]["updated_at"]
+    assert entry.wake is not None
+    assert manager_loop_service.status(tmp_path)["wake"]["running"] is True
     assert manager_loop_service.close(tmp_path) == {"ok": True}
+
+
+def test_continue_session_with_a_picked_route_pins_it_and_takes_the_seat(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    _install_fakes(monkeypatch)
+    monkeypatch.setattr(
+        manager_loop_service,
+        "authorize_selected_route",
+        lambda repo, backend_id, model: (backend_id, model),
+    )
+    entry = manager_loop_service._entry_for(tmp_path)
+    idle = _seat_record(entry, "mls-" + "1f" * 16, backend_id="", model="", hours_idle=13)
+
+    attached = manager_loop_service.continue_session(tmp_path, idle.session_id, "fake", "model-b")
+
+    assert attached["ok"] is True
+    assert (attached["session"]["backend_id"], attached["session"]["model"]) == ("fake", "model-b")
+    (saved,) = entry.orchestrator.store.sessions()
+    assert (saved.backend_id, saved.model) == ("fake", "model-b")
+    assert saved.updated_at
+    assert manager_loop_service.status(tmp_path)["wake"]["running"] is True
+    assert manager_loop_service.close(tmp_path) == {"ok": True}
+
+
+def test_continue_session_refuses_a_picked_route_that_is_not_authorized(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    _install_fakes(monkeypatch)
+    monkeypatch.setattr(manager_loop_service, "authorize_selected_route", lambda *_args: None)
+    entry = manager_loop_service._entry_for(tmp_path)
+    idle = _seat_record(entry, "mls-" + "2b" * 16, backend_id="", model="", hours_idle=13)
+
+    refused = manager_loop_service.continue_session(tmp_path, idle.session_id, "fake", "model-b")
+
+    assert refused == {"ok": False, "error": "manager_backend_unavailable:fake:model-b"}
+    (saved,) = entry.orchestrator.store.sessions()
+    assert (saved.backend_id, saved.model, saved.updated_at) == ("", "", "")
+    assert entry.wake is None
+
+
+def test_continue_session_refuses_half_a_route(monkeypatch: Any, tmp_path: Path) -> None:
+    _install_fakes(monkeypatch)
+    entry = manager_loop_service._entry_for(tmp_path)
+    idle = _seat_record(entry, "mls-" + "2c" * 16, backend_id="", model="")
+
+    refused = manager_loop_service.continue_session(tmp_path, idle.session_id, "fake", "")
+
+    assert refused == {"ok": False, "error": "manager_route_selection_incomplete"}
+
+
+def test_ensure_attaches_a_saved_session_without_renewing_its_seat_lease(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    _install_fakes(monkeypatch)
+    entry = manager_loop_service._entry_for(tmp_path)
+    stale = _seat_record(entry, "mls-" + "2d" * 16, hours_idle=13)
+
+    assert entry.orchestrator.ensure().session_id == stale.session_id
+
+    (saved,) = entry.orchestrator.store.sessions()
+    assert saved.updated_at == ""
 
 
 def _running_wake(entry: Any) -> Any:
@@ -1532,19 +1599,19 @@ def test_begin_new_stops_the_running_wake_consumer_for_the_passive_conversation_
     assert manager_loop_service.close(tmp_path) == {"ok": True}
 
 
-def test_continue_session_onto_a_session_idle_past_the_lease_stops_the_running_wake_consumer(
+def test_continue_session_onto_a_passive_conversation_stops_the_running_wake_consumer(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
     _install_fakes(monkeypatch)
     assert manager_loop_service.start(tmp_path, "fake", "model-a")["ok"] is True
     entry = manager_loop_service._entry_for(tmp_path)
     consumer = _running_wake(entry)
-    stale = _seat_record(entry, "mls-" + "2a" * 16, hours_idle=13)
+    passive = _seat_record(entry, "mls-" + "2a" * 16, backend_id="", model="")
 
-    attached = manager_loop_service.continue_session(tmp_path, stale.session_id)
+    attached = manager_loop_service.continue_session(tmp_path, passive.session_id)
 
     assert attached["ok"] is True
-    assert attached["session"]["session_id"] == stale.session_id
+    assert attached["session"]["session_id"] == passive.session_id
     assert entry.wake is None
     assert consumer.status()["running"] is False
     assert manager_loop_service.status(tmp_path)["wake"]["running"] is False
@@ -1676,23 +1743,6 @@ def test_a_session_swapped_for_a_passive_one_as_the_wake_is_armed_gets_no_consum
     )
 
     assert entry.orchestrator.session.passive
-    assert entry.wake is None
-    assert manager_loop_service.status(tmp_path)["wake"]["running"] is False
-    assert manager_loop_service.close(tmp_path) == {"ok": True}
-
-
-def test_a_session_swapped_for_one_idle_past_the_lease_as_the_wake_is_armed_gets_no_consumer(
-    monkeypatch: Any, tmp_path: Path
-) -> None:
-    stale_id = "mls-" + "3a" * 16
-
-    def swap(entry: Any) -> None:
-        _seat_record(entry, stale_id, hours_idle=13)
-        assert manager_loop_service.continue_session(tmp_path, stale_id)["ok"] is True
-
-    entry = _arm_the_wake_across_a_swap(monkeypatch, tmp_path, swap)
-
-    assert entry.orchestrator.session.session_id == stale_id
     assert entry.wake is None
     assert manager_loop_service.status(tmp_path)["wake"]["running"] is False
     assert manager_loop_service.close(tmp_path) == {"ok": True}

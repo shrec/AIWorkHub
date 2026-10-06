@@ -11367,7 +11367,17 @@ function handleInboundMessage(view, message) {
     case "managerLoopContinue": {
       const sessionId = String(message.sessionId || "");
       if (!MANAGER_SESSION_ID_RE.test(sessionId)) return;
-      runManagerLoopAction(view, "continue", { session_id: sessionId });
+      // A picked model travels with the continue: the server pins it on this
+      // conversation and the pick makes it the manager seat. An unlisted backend
+      // or a half route is dropped, so the continue stays a plain one.
+      const continueArgs = { session_id: sessionId };
+      const continueBackendId = String(message.backendId || "");
+      const continueModel = String(message.model || "").trim();
+      if (MANAGER_LOOP_BACKENDS.has(continueBackendId) && continueModel) {
+        continueArgs.backend_id = continueBackendId;
+        continueArgs.model = continueModel;
+      }
+      runManagerLoopAction(view, "continue", continueArgs);
       break;
     }
     case "managerLoopNew": {
