@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 from datetime import datetime, timezone
 from pathlib import Path
@@ -366,26 +367,48 @@ def _provider_model_rejection_from_output(
         for event in (outer, *nested):
             if str(event.get("type") or "").strip().lower() != "error":
                 continue
+            body = event.get("error")
+            if not isinstance(body, dict):
+                continue
+            error_type = str(body.get("type") or "").strip().lower()
+            error_code = str(body.get("code") or "").strip().lower()
             raw_status = event.get("status", event.get("error_status"))
             status = (
                 raw_status
                 if isinstance(raw_status, int) and not isinstance(raw_status, bool)
                 else 0
             )
-            if status not in _MODEL_REJECTION_STATUSES:
+            # NF-2026-01374: OpenCode emits a provider-owned top-level error
+            # envelope whose error.type is exactly ``provider.no-route`` and
+            # which carries no HTTP status.  Accept that one statusless case;
+            # every other error type keeps the existing {400,404} status gate
+            # and the existing model-shaped error-type/code sets entirely
+            # unchanged, and the message must still name the exact model THIS
+            # launch pinned so worker prose cannot mint it.  A carried
+            # non-integer status is retained as unsealed evidence, never erased
+            # into a statusless seal.
+            no_route = error_type == "provider.no-route" and (
+                (raw_status is None and event.get("error_status") is None)
+                or status in _MODEL_REJECTION_STATUSES
+            )
+            if status not in _MODEL_REJECTION_STATUSES and not no_route:
                 continue
-            body = event.get("error")
-            if not isinstance(body, dict):
-                continue
-            error_type = str(body.get("type") or "").strip().lower()
-            error_code = str(body.get("code") or "").strip().lower()
             if (
                 error_type not in _MODEL_REJECTION_ERROR_TYPES
                 and error_code not in _MODEL_REJECTION_ERROR_CODES
+                and not no_route
             ):
                 continue
             message = str(body.get("message") or "")
-            names_model = error_code in _MODEL_REJECTION_ERROR_CODES or model in message
+            names_model = (
+                re.search(
+                    r"(?<![\w./-])" + re.escape(model) + r"(?![\w./-])",
+                    message,
+                )
+                is not None
+                if no_route
+                else error_code in _MODEL_REJECTION_ERROR_CODES or model in message
+            )
             if not names_model:
                 continue
             sealed = {
@@ -393,9 +416,13 @@ def _provider_model_rejection_from_output(
                 "owner": "provider",
                 "sealed": True,
                 "code": (
-                    error_code
-                    if error_code in _MODEL_REJECTION_ERROR_CODES
-                    else "model_not_supported"
+                    "model_not_available"
+                    if no_route
+                    else (
+                        error_code
+                        if error_code in _MODEL_REJECTION_ERROR_CODES
+                        else "model_not_supported"
+                    )
                 ),
                 "http_status": status,
                 "model": model,
