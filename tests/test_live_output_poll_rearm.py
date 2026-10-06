@@ -169,7 +169,12 @@ def _run_harness() -> subprocess.CompletedProcess:
     return subprocess.run(
         [node, "-"],
         input=_HARNESS_JS,
-        env={"APP_JS": str(APP_JS), "PATH": os.environ.get("PATH", "")},
+        # Node 24 on Windows aborts at startup (ncrypto::CSPRNG) without SYSTEMROOT.
+        env={
+            "APP_JS": str(APP_JS),
+            "PATH": os.environ.get("PATH", ""),
+            "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
+        },
         capture_output=True,
         text=True,
         timeout=60,
