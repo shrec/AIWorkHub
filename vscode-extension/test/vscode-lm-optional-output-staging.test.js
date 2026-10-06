@@ -80,7 +80,8 @@ async function main() {
   const steps = [
     { name: "aiworkhub_manager_semantic_edit_stage", input: helperInput },
     { name: "aiworkhub_manager_semantic_edit_stage", input: requiredInput },
-    // The production transport auto-finalizes once the required output is staged.
+    // NF-2026-01378: staging the last required output is readiness, not completion.
+    { name: "aiworkhub_manager_semantic_edit_finalize", input: { summary: "Staged both outputs." } },
   ];
   let calls = 0;
   const model = {
@@ -98,7 +99,7 @@ async function main() {
   };
   const result = JSON.parse(await bridge.runVscodeLmTextProtocol(model, request, undefined,
     async () => { throw new Error("new-file staging must not fabricate an existing-file MCP apply"); }));
-  assert.equal(calls, 2, "completion must not consume another model call");
+  assert.equal(calls, 3, "the worker's own finalize ends the run");
   assert.deepEqual(result.creates.map((entry) => entry.path), [helper, required]);
 }
 

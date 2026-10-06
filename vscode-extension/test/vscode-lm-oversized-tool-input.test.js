@@ -253,7 +253,8 @@ async function oversizedStrikeIsKeyedToTheMissingOutput() {
   assert.strictEqual(envelope.schema_id, internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA);
   assert.deepStrictEqual(envelope.creates.map((create) => create.path), [alpha, bravo],
     "both required outputs must still reach the final envelope");
-  assert.strictEqual(turns, 4,
+  // NF-2026-01378: turn 5 replays the bravo stage; that stall finalizes offline.
+  assert.strictEqual(turns, 5,
     "one oversized payload for a never-corrected output must not terminate the run");
   assert.strictEqual(correction.result.error, "vscode_lm_tool_input_too_large",
     "bravo's first oversized payload gets the normal corrective re-prompt");

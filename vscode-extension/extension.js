@@ -5977,10 +5977,13 @@ async function runVscodeLmTextProtocol(
   const writableTask = request.request_kind !== "quality_review" &&
     Array.isArray(request.allowedWrites) && request.allowedWrites.length > 0;
   let creditedTurns = 0;
+  let lastTurnProgress = -1;
   // NF1290: 24 bounds uncredited turns; verified discovery/edit progress earns
   // continuation, without weakening duplicate/no-progress/finalization gates.
   for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS + creditedTurns; turn += 1) {
     const progressBeforeTurn = sourceGraphGuard.progressRevision();
+    const stalledLastTurn = progressBeforeTurn === lastTurnProgress;
+    lastTurnProgress = progressBeforeTurn;
     const sourceBeforeTurn = sourceGraphGuard.sourceEvidenceRevision();
     assertRequestActive();
     if (request.request_kind === "quality_review" &&
@@ -5994,9 +5997,12 @@ async function runVscodeLmTextProtocol(
       if (stagedEdits.hasChanges() && vscodeLmShouldKeepStagedEdit(writableTask, stagedEdits)) forceStagedEdit = true;
       else if (!writableTask || (stagedEdits && stagedEdits.hasChanges())) forceFinal = true;
     }
+    // NF-2026-01378: one staged edit per required output is readiness, not completion;
+    // finalize offline once the model stops progressing, so later edits to an output land.
     if (vscodeLmStagedOutputsReady(stagedEdits) && (
         forceStagedEdit
-        || (Array.isArray(request.required_outputs) && request.required_outputs.length > 0)
+        || (Array.isArray(request.required_outputs) && request.required_outputs.length > 0 &&
+          stalledLastTurn)
     )) {
       forceStagedEdit = false;
       forceFinal = true;
@@ -6555,6 +6561,11 @@ async function runVscodeLmTextProtocol(
       if (String(err && err.message || err) === "vscode_lm_request_cancelled") throw err;
       if (String(err && err.message || err) === "vscode_lm_source_graph_no_progress") {
         protocolTrace.push({ turn, phase: "source_graph", outcome: "duplicate_no_progress" });
+        // NF-2026-01378: a stall after every required output is staged ends the run with that work.
+        if (vscodeLmStagedOutputsReady(stagedEdits)) {
+          const offline = stagedEdits.finalize("Applied validated staged semantic edits.");
+          if (offline.ok) return JSON.stringify(offline.__finalEnvelope);
+        }
         throw vscodeLmProtocolFailure("vscode_lm_source_graph_no_progress", protocolTrace, lastProtocolPreview);
       }
       if (stageRead && !toolInputTooLarge) {
@@ -6761,8 +6772,11 @@ async function runVscodeLmAgent(
     request.allowedWrites.length > 0;
   let wrongToolViolations = 0;
   let creditedTurns = 0;
+  let lastTurnProgress = -1;
   for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS + creditedTurns; turn += 1) {
     const progressBeforeTurn = sourceGraphGuard.progressRevision();
+    const stalledLastTurn = progressBeforeTurn === lastTurnProgress;
+    lastTurnProgress = progressBeforeTurn;
     const sourceBeforeTurn = sourceGraphGuard.sourceEvidenceRevision();
     assertRequestActive();
     if (qualityReview && postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS && !reviewSubmitForced) {
@@ -6778,9 +6792,12 @@ async function runVscodeLmAgent(
         forceFinal = true;
       }
     }
+    // NF-2026-01378: one staged edit per required output is readiness, not completion;
+    // finalize offline once the model stops progressing, so later edits to an output land.
     if (vscodeLmStagedOutputsReady(stagedEdits) && (
         forceStagedEdit
-        || (Array.isArray(request.required_outputs) && request.required_outputs.length > 0)
+        || (Array.isArray(request.required_outputs) && request.required_outputs.length > 0 &&
+          stalledLastTurn)
     )) {
       forceStagedEdit = false;
       forceFinal = true;
@@ -7193,6 +7210,11 @@ async function runVscodeLmAgent(
         if (String(err && err.message || err) === "vscode_lm_request_cancelled") throw err;
         if (String(err && err.message || err) === "vscode_lm_source_graph_no_progress") {
           protocolTrace.push({ turn, phase: "source_graph", outcome: "duplicate_no_progress" });
+          // NF-2026-01378: a stall after every required output is staged ends the run with that work.
+          if (vscodeLmStagedOutputsReady(stagedEdits)) {
+            const offline = stagedEdits.finalize("Applied validated staged semantic edits.");
+            if (offline.ok) return JSON.stringify(offline.__finalEnvelope);
+          }
           throw vscodeLmProtocolFailure("vscode_lm_source_graph_no_progress", protocolTrace, lastProtocolPreview);
         }
         result = {

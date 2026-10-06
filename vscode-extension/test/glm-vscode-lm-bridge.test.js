@@ -4435,7 +4435,8 @@ async function nf723StagedFinalizationCompletenessChecks() {
   assert.deepStrictEqual(textEarlyResult.edits, []);
   assert.strictEqual(textEarlyResult.creates[0].path, createPath);
   assert.ok(textEarlyEdit);
-  assert.strictEqual(textEarlyCount, 3);
+  // NF-2026-01378: readiness finalizes after the first non-progress turn, not on the staging turn.
+  assert.strictEqual(textEarlyCount, 4);
 
   let nativeEarlyCount = 0;
   const nativeEarly = {
@@ -4469,7 +4470,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
   const nativeEarlyResult = JSON.parse(await runNative(nativeEarly));
   assert.deepStrictEqual(nativeEarlyResult.edits, []);
   assert.strictEqual(nativeEarlyResult.creates[0].path, createPath);
-  assert.strictEqual(nativeEarlyCount, 2);
+  assert.strictEqual(nativeEarlyCount, 3); // NF-2026-01378: the replayed create is the stall turn.
 
   let textProgressTurns = 0;
   let textProgressEdit = false;
@@ -7351,6 +7352,7 @@ async function nf1291ShiftedStageRecovery() {
         target_id: "shift-target-2", new: "FOUR", idempotency_key: "after-rejected-final" } },
       { name: "aiworkhub_manager_semantic_edit_stage", input: {
         operation: "create", file_path: created, content: "assert True\n" } },
+      { name: "aiworkhub_manager_semantic_edit_finalize", input: { summary: "recovered" } },
     ];
     let turn = 0;
     const model = { capabilities: { toolCalling: native },
@@ -7415,6 +7417,35 @@ async function nf1291ShiftedStageRecovery() {
     assert.equal(f.calls.filter(call => call.name.endsWith("_apply")).length, 2);
     assert.equal(turn, plan.length);
     assert.deepEqual(final.edits, []);
+    assert.equal(final.creates[0].path, created);
+  }
+  // NF-2026-01378: a second edit to an already-staged required output still lands.
+  for (const native of [false, true]) {
+    const f = fixture();
+    f.req.required_outputs = [file, created];
+    const plan = [
+      { name: "aiworkhub_worker_source_graph_query", input: { mode: "focus", query: "multi-edit-orientation" } },
+      { name: "aiworkhub_manager_semantic_edit_stage", input: { operation: "replace_range",
+        file_path: file, start_line: 1, end_line: 1, new: "ONE" } },
+      { name: "aiworkhub_manager_semantic_edit_stage", input: {
+        operation: "create", file_path: created, content: "assert True\n" } },
+      { name: "aiworkhub_manager_semantic_edit_stage", input: { operation: "replace_range",
+        file_path: file, start_line: 4, end_line: 4, new: "FOUR" } },
+      { name: "aiworkhub_manager_semantic_edit_finalize", input: { summary: "two edits, one output" } },
+    ];
+    let turn = 0;
+    const model = { capabilities: { toolCalling: native },
+      sendRequest: async () => {
+        const call = plan[turn++];
+        assert.ok(call, "readiness must not end the run before the model finishes");
+        const part = native ? { callId: "multi-edit-" + turn, ...call }
+          : { value: JSON.stringify({ schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA, ...call }) };
+        return { stream: (async function* () { yield part; })() };
+      } };
+    const run = native ? internals.runVscodeLmAgent : internals.runVscodeLmTextProtocol;
+    const final = JSON.parse(await run(model, f.req, undefined, f.invoke));
+    assert.equal(turn, plan.length, "the model's own finalize ends the run");
+    assert.deepEqual(f.lines(), ["ONE", "two", "three", "FOUR"], "both edits to one output land");
     assert.equal(final.creates[0].path, created);
   }
 }

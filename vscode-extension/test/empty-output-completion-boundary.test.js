@@ -107,10 +107,11 @@ for (const toolCalling of [false, true]) {
       assert.equal(result.creates.length, 1);
     });
   }
-  test(`${label}: explicit required outputs retain automatic completion`, async () => {
-    const model = modelFor(toolCalling, [{ name: stageName, input: create }]);
+  test(`${label}: explicit required outputs complete once the worker stops staging`, async () => {
+    // NF-2026-01378: readiness is not completion; the replayed stage is the stall that finalizes offline.
+    const model = modelFor(toolCalling, [{ name: stageName, input: create }, { name: stageName, input: create }]);
     const result = JSON.parse(await run(model, request(["tests/new.py"]), undefined, async () => ({ ok: true })));
-    assert.equal(model.turns, 1);
+    assert.equal(model.turns, 2);
     assert.equal(result.creates[0].path, "tests/new.py");
   });
   test(`${label}: unspecified legacy outputs retain the phase-count boundary`, async () => {
