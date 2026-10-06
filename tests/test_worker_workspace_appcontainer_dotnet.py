@@ -883,6 +883,182 @@ def test_a_global_package_reference_is_seeded_like_any_other_row(
     assert 'Include="Serilog" Version="3.1.1"' in generated
 
 
+def test_a_literal_pinning_property_seeds_every_pinned_version(
+    tmp_path, monkeypatch
+):
+    """A pinned transitive ``PackageVersion`` row is a package row too."""
+    workspace = _workspace(tmp_path)
+    _write(
+        workspace.path / "Directory.Packages.props",
+        "<Project><PropertyGroup>"
+        "<CentralPackageTransitivePinningEnabled>true"
+        "</CentralPackageTransitivePinningEnabled></PropertyGroup><ItemGroup>"
+        '<PackageVersion Include="Serilog" Version="3.1.1" />'
+        '<PackageVersion Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.12" />'
+        '<PackageVersion Include="Microsoft.OpenApi" Version="2.7.5" />'
+        "</ItemGroup></Project>",
+    )
+    _write(workspace.path / "apps" / "edge" / "Edge.csproj", _EDGE_CSPROJ)
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "apps/edge/Edge.csproj"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        is None
+    )
+
+    generated = Path(runs[0][0][2]).read_text(encoding="utf-8")
+    assert 'Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.12"' in generated
+    assert 'Include="Microsoft.OpenApi" Version="2.7.5"' in generated
+    assert 'Include="Serilog" Version="3.1.1"' in generated
+
+
+@pytest.mark.parametrize("pinning", ["", "false", "$(Pin)"])
+def test_without_the_literal_true_pinning_property_the_seed_is_unchanged(
+    tmp_path, monkeypatch, pinning
+):
+    """Only the literal ``true`` property turns pinned rows into seed rows."""
+    workspace = _workspace(tmp_path)
+    props = "<Project>"
+    if pinning:
+        props += (
+            "<PropertyGroup><CentralPackageTransitivePinningEnabled>"
+            f"{pinning}"
+            "</CentralPackageTransitivePinningEnabled></PropertyGroup>"
+        )
+    props += (
+        "<ItemGroup>"
+        '<PackageVersion Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.12" />'
+        '<PackageVersion Include="Microsoft.OpenApi" Version="2.7.5" />'
+        "</ItemGroup></Project>"
+    )
+    _write(workspace.path / "Directory.Packages.props", props)
+    _write(workspace.path / "apps" / "edge" / "Edge.csproj", _EDGE_CSPROJ)
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "apps/edge/Edge.csproj"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        is None
+    )
+
+    generated = Path(runs[0][0][2]).read_text(encoding="utf-8")
+    assert "SQLitePCLRaw.lib.e_sqlite3" not in generated
+    assert "Microsoft.OpenApi" not in generated
+    assert 'Include="Serilog" Version="3.1.1"' in generated
+
+
+def test_a_declared_identity_keeps_its_resolution_while_pinned(
+    tmp_path, monkeypatch
+):
+    """A project row already declared wins over the pinned ``PackageVersion``."""
+    workspace = _workspace(tmp_path)
+    _write(
+        workspace.path / "Directory.Packages.props",
+        "<Project><PropertyGroup>"
+        "<CentralPackageTransitivePinningEnabled>true"
+        "</CentralPackageTransitivePinningEnabled></PropertyGroup><ItemGroup>"
+        '<PackageVersion Include="Serilog" Version="2.0.0" />'
+        "</ItemGroup></Project>",
+    )
+    _write(workspace.path / "apps" / "edge" / "Edge.csproj", _EDGE_CSPROJ)
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "apps/edge/Edge.csproj"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        is None
+    )
+
+    generated = Path(runs[0][0][2]).read_text(encoding="utf-8")
+    assert generated.count('Include="Serilog"') == 1
+    assert 'Include="Serilog" Version="3.1.1"' in generated
+
+
+def test_a_pinned_non_literal_version_still_refuses_a_strict_seed(
+    tmp_path, monkeypatch
+):
+    """The existing non-literal row rule applies to pinned rows too."""
+    workspace = _workspace(tmp_path)
+    _write(
+        workspace.path / "Directory.Packages.props",
+        "<Project><PropertyGroup>"
+        "<CentralPackageTransitivePinningEnabled>true"
+        "</CentralPackageTransitivePinningEnabled></PropertyGroup><ItemGroup>"
+        '<PackageVersion Include="SQLitePCLRaw.lib.e_sqlite3" Version="$(V)" />'
+        "</ItemGroup></Project>",
+    )
+    _write(workspace.path / "apps" / "edge" / "Edge.csproj", _EDGE_CSPROJ)
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "apps/edge/Edge.csproj"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        == "non_literal_package_version"
+    )
+    assert runs == []
+
+
+def test_a_supplementary_seed_drops_a_non_literal_pinned_row(
+    tmp_path, monkeypatch
+):
+    """The pinned counterpart of the existing supplementary drop rule."""
+    workspace = _workspace(tmp_path)
+    _write(workspace.repo / "apps" / "edge" / "Edge.csproj", "<Project />")
+    _write(
+        workspace.path / "Directory.Packages.props",
+        "<Project><PropertyGroup>"
+        "<CentralPackageTransitivePinningEnabled>true"
+        "</CentralPackageTransitivePinningEnabled></PropertyGroup><ItemGroup>"
+        '<PackageVersion Include="SQLitePCLRaw.lib.e_sqlite3" Version="$(V)" />'
+        "</ItemGroup></Project>",
+    )
+    _write(
+        workspace.path / "apps" / "edge" / "Edge.csproj",
+        '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup>'
+        "<TargetFramework>net8.0</TargetFramework></PropertyGroup><ItemGroup>"
+        '<PackageReference Include="Serilog" Version="3.1.1" />'
+        "</ItemGroup></Project>",
+    )
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    assert (
+        dotnet_lane._appcontainer_dotnet_prerestore(
+            ["dotnet", "restore", "apps/edge/Edge.csproj"],
+            workspace,
+            workspace.path,
+            workspace.home,
+        )
+        is None
+    )
+
+    assert len(runs) == 2
+    generated = Path(runs[1][0][2]).read_text(encoding="utf-8")
+    assert "SQLitePCLRaw.lib.e_sqlite3" not in generated
+    assert 'Include="Serilog" Version="3.1.1"' in generated
+
+
 def test_a_supplementary_seed_still_refuses_unsafe_candidate_xml(
     tmp_path, monkeypatch
 ):

@@ -280,29 +280,44 @@ def _ancestor_files(
 
 def _central_data(
     props_files: Sequence[Path], reader: _BoundedXml
-) -> tuple[dict[str, str | None], list[tuple[str, str | None]]]:
+) -> tuple[
+    dict[str, str | None],
+    list[tuple[str, str | None]],
+    list[tuple[str, str | None]],
+]:
     """Central package management rows, read as data from the props files.
 
     ``PackageVersion`` supplies the version for a row a project declares
     without one, the nearest declaration winning.  ``GlobalPackageReference``
     is itself a package every project restores -- a repo-wide analyzer,
     typically -- so it comes back as a declared row rather than as a version.
+    When a props file sets ``CentralPackageTransitivePinningEnabled`` to the
+    literal text ``true``, every ``PackageVersion`` row is also returned as a
+    pinned row so the seed restores it too.
     """
     declared: dict[str, str | None] = {}
     repository_wide: list[tuple[str, str | None]] = []
+    pinned: dict[str, tuple[str, str | None]] = {}
+    pinning_enabled = False
     for props in props_files:
         for element in reader.root(props).iter():
             name = _local(element.tag)
+            if name == "CentralPackageTransitivePinningEnabled":
+                if "".join(element.itertext()).strip().lower() == "true":
+                    pinning_enabled = True
+                continue
             if name not in ("PackageVersion", "GlobalPackageReference"):
                 continue
             identity = (element.get("Include") or element.get("Update") or "").strip()
             if not identity:
                 continue
             if name == "PackageVersion":
-                declared[identity.lower()] = _declared_version(element)
+                version = _declared_version(element)
+                declared[identity.lower()] = version
+                pinned[identity.lower()] = (identity, version)
             else:
                 repository_wide.append((identity, _declared_version(element)))
-    return declared, repository_wide
+    return declared, repository_wide, list(pinned.values()) if pinning_enabled else []
 
 
 def _resolved_packages(
@@ -443,11 +458,14 @@ def synthetic_restore_project(
             for path in _ancestor_files(projects, root, _DIRECTORY_BUILD_NAME)
         ]
         packages, frameworks = _declared_data([*projects, *imported])
-        central, repository_wide = _central_data(
+        central, repository_wide, pinned = _central_data(
             _ancestor_files(projects, root, _CENTRAL_PACKAGES_NAME), reader
         )
+        declared_ids = {identity.lower() for identity, _ in [*packages, *repository_wide]}
         resolved = _resolved_packages(
-            [*packages, *repository_wide], central, supplementary=supplementary
+            [*packages, *repository_wide,
+             *(row for row in pinned if row[0].lower() not in declared_ids)],
+            central, supplementary=supplementary,
         )
         if not resolved:
             return None, None
