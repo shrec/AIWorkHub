@@ -7269,15 +7269,34 @@ class WorkerSemanticEditSession:
         self, *, target_id: str, new: str, idempotency_key: str
     ) -> dict[str, Any]:
         tool = "semantic_edit_apply"
-        if (
-            not isinstance(target_id, str)
-            or not target_id
-            or not isinstance(new, str)
-            or not isinstance(idempotency_key, str)
-            or not idempotency_key.strip()
-            or len(idempotency_key.encode("utf-8")) > 256
-        ):
-            return _violation(self.ctx, tool, "semantic_edit_apply_input_invalid")
+        # NF-2026-01373: name every bad field and the exact valid call, or an
+        # emulated-transport model retries the same incomplete call blind.
+        invalid_fields = [
+            name
+            for name, bad in (
+                ("target_id", not isinstance(target_id, str) or not target_id),
+                ("new", not isinstance(new, str)),
+                (
+                    "idempotency_key",
+                    not isinstance(idempotency_key, str)
+                    or not idempotency_key.strip()
+                    or len(idempotency_key.encode("utf-8")) > 256,
+                ),
+            )
+            if bad
+        ]
+        if invalid_fields:
+            return _violation(
+                self.ctx, tool, "semantic_edit_apply_input_invalid",
+                invalid_fields=invalid_fields,
+                next_call=(
+                    "Call aiworkhub_worker_semantic_edit_apply with exactly "
+                    "{target_id: <target_id returned by prepare>, new: "
+                    "<replacement text>, idempotency_key: <non-empty string of "
+                    "at most 256 UTF-8 bytes, unique to this edit>} and no "
+                    "other fields."
+                ),
+            )
         new_sha256 = hashlib.sha256(new.encode("utf-8")).hexdigest()
         with self._lock:
             existing = self._receipts.get(idempotency_key)

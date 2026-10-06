@@ -200,3 +200,35 @@ def test_apply_without_ledger_still_succeeds(tmp_path: Path) -> None:
     )
     assert applied["ok"] is True
     assert hashlib.sha256(module.read_bytes()).hexdigest() == applied["after_sha256"]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_fields"),
+    [
+        ({"idempotency_key": ""}, ["idempotency_key"]),
+        ({"idempotency_key": None}, ["idempotency_key"]),
+        ({"idempotency_key": "k" * 257}, ["idempotency_key"]),
+        ({"target_id": "", "new": None}, ["target_id", "new"]),
+    ],
+)
+def test_invalid_apply_input_names_each_bad_field(
+    tmp_path: Path, overrides: dict[str, object], expected_fields: list[str]
+) -> None:
+    """NF-2026-01373: the refusal says which field to fix and the valid call."""
+
+    repo = tmp_path / "worktree"
+    (repo / "src").mkdir(parents=True)
+    module = repo / "src" / "a.py"
+    module.write_bytes(b"ONE\n")
+    session = worker_tools.WorkerSemanticEditSession(_ctx(repo))
+    prepared = session.prepare(file_path="src/a.py", start_line=1, end_line=1)
+    call = {"target_id": prepared["target_id"], "new": "TWO\n", "idempotency_key": "k"}
+    call.update(overrides)
+
+    refused = session.apply(**call)
+
+    assert refused["ok"] is False
+    assert refused["reason"] == "semantic_edit_apply_input_invalid"
+    assert refused["invalid_fields"] == expected_fields
+    assert "idempotency_key" in refused["next_call"]
+    assert module.read_bytes() == b"ONE\n"
