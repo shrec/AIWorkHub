@@ -412,7 +412,7 @@ def test_request_local_opencode_config_and_home_reach_the_child_unchanged():
     delivered = json.loads(
         fake.spec.environment[runtime_adapters.OPENCODE_WORKER_CONFIG_ENV]
     )
-    server = delivered["mcp"]["awh"]
+    server = delivered["mcp"]["servers"]["awh"]
     assert server["command"][0] == "C:\\Python312\\python.exe"
     assert server["environment"]["AIWORKHUB_WORKER_MCP_AUDIT_HMAC_KEY_PATH"] == key
 

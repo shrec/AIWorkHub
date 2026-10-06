@@ -1267,8 +1267,9 @@ def test_opencode_launch_hands_the_supervisor_the_request_local_awh_config(
     assert runtime_adapters.validate_opencode_worker_config(config) is config
     assert env[runtime_adapters.OPENCODE_DISABLE_PROJECT_CONFIG_ENV] == "1"
     assert not {"OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_PERMISSION"} & set(env)
-    assert list(config["mcp"]) == ["awh"]
-    server = config["mcp"]["awh"]
+    assert list(config["mcp"]) == ["servers"]
+    assert list(config["mcp"]["servers"]) == ["awh"]
+    server = config["mcp"]["servers"]["awh"]
     assert server["command"] == [harness.runtime_command, "-m", _MCP.__name__]
     environment = server["environment"]
     assert environment[_MCP.ENV_REQUEST_ID] == _OPENCODE_REQUEST_ID
@@ -1307,7 +1308,7 @@ def test_opencode_launch_hands_the_supervisor_the_request_local_awh_config(
         worker_argv[worker_argv.index("--") + 1 :] if "--" in worker_argv else worker_argv
     )
     # Model pin and effort tokens are still the adapter plan's, untouched.
-    assert adapter_argv[1:6] == ["run", "--format", "json", "--model", _OPENCODE_MODEL]
+    assert adapter_argv[1:7] == ["run", "--standalone", "--format", "json", "--model", _OPENCODE_MODEL]
     assert adapter_argv[-1] == "prompt-text"
     assert "model" not in config and "provider" not in config
     # Request-local: the config lives only in the child environment.
@@ -1428,11 +1429,11 @@ def test_opencode_appcontainer_launch_uses_real_provisioning_and_sandbox_argv(
     worker_argv = [str(token) for token in spec["argv"]]
     # No Linux wrapper: the supervisor applies the AppContainer to this argv.
     assert "--landlock-exec" not in worker_argv
-    assert worker_argv[1:6] == ["run", "--format", "json", "--model", _OPENCODE_MODEL]
+    assert worker_argv[1:7] == ["run", "--standalone", "--format", "json", "--model", _OPENCODE_MODEL]
     ((_argv, spawn),) = harness.manager.popen_calls
     env = spawn["env"]
     assert env["HOME"] == str(workspace.home)
-    server = json.loads(env[runtime_adapters.OPENCODE_WORKER_CONFIG_ENV])["mcp"]["awh"]
+    server = json.loads(env[runtime_adapters.OPENCODE_WORKER_CONFIG_ENV])["mcp"]["servers"]["awh"]
     environment = server["environment"]
     assert environment[_MCP.ENV_REQUEST_ID] == _OPENCODE_REQUEST_ID
     assert environment[_MCP.ENV_REPO] == str(workspace.path)
