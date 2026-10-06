@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.34] - 2026-10-06
+
+### Fixed
+
+- Manager Chat seat: the owner's explicit pick (continue, restore, a picked model, binding a route for a turn) stamps `ManagerSession.updated_at` and renews the manager seat lease, so a conversation idle past `MANAGER_CHAT_SEAT_LEASE` becomes the manager again; opening the panel never does. `aiworkhub_manager_loop_continue` accepts `backend_id`/`model`, authorized like a send's route and pinned without starting the backend, and the webview sends the picked model with it. The dashboard target and the repository/coordinator lines show `manager_chat <backend>/<model>` instead of the window route (NF-2026-01376).
+- OpenCode workers: the generated config uses the native `mcp.servers.awh` shape with `codemode: false`, so OpenCode 2.0.16 no longer migrates it into Code Mode and hides the direct `awh_*` tools; workers launch `opencode run --standalone` instead of sharing the managed-service port 55552.
+- A refused `aiworkhub_worker_semantic_edit_apply` names each invalid field (`invalid_fields`) and the exact `next_call` shape instead of one undifferentiated `semantic_edit_apply_input_invalid` (NF-2026-01373).
+- vscode_lm bridge: the create obligation follows the published `required_create_paths` (create paths ∩ required outputs); a chosen optional create stays fidelity-checked, and absent metadata keeps every authorized create mandatory (NF-2026-01330).
+
+### Qualification
+
+- Each fix has regressions for its new contract; the touched suites and the full suite pass. Installation and live replay are separate evidence.
+
 ## [0.12.33] - 2026-10-06
 
 ### Fixed

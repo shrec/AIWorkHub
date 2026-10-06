@@ -1,5 +1,18 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.34 — 2026-10-06
+
+### Fixed
+
+- Picking a Manager Chat conversation or model makes it the manager seat: the pick renews the seat lease and pins the model, and the repository/coordinator lines show `manager_chat <backend>/<model>` instead of `codex` (NF-2026-01376).
+- OpenCode workers get the native `mcp.servers.awh` config with `codemode: false` and run `--standalone`, so the direct `awh_*` tools are visible and seats no longer collide on port 55552.
+- A refused worker semantic-edit apply names each invalid field and the valid next call (NF-2026-01373).
+- vscode_lm optional creates follow the exact `required_create_paths` (NF-2026-01330).
+
+### Qualification
+
+- Independent component regressions pass; installation, activation and live qualification are separate evidence.
+
 ## 0.12.33 — 2026-10-06
 
 ### Fixed

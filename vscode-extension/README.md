@@ -14,6 +14,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.34
+
+- Picking a conversation or a model in Manager Chat now makes it the manager: the pick renews the manager seat lease even for a conversation that has been idle, the model is pinned on the conversation, and the dashboard shows `manager_chat <backend>/<model>` instead of the window's `codex` route (NF-2026-01376).
+- OpenCode workers see the direct `awh_*` tools again: the generated config uses OpenCode 2.0.16's native `mcp.servers` shape with `codemode: false`, and each worker runs `opencode run --standalone` instead of sharing one service port.
+- A worker's refused semantic-edit apply now names each invalid field and the exact valid call, so the worker can correct it instead of retrying blind (NF-2026-01373).
+- vscode_lm workers are held only to the creates the card requires (`required_create_paths`); an optional create is still checked when made (NF-2026-01330).
+
 ## What's new in 0.12.33
 
 - A rework overlay that inherits a file Source Graph cannot index (for example `CMakeLists.txt`, reported `unsupported_fail_closed`) no longer fails every worker Source Graph call: the file is carried as digest-bound evidence only, and an unknown status still fails closed (NF-2026-01369).
