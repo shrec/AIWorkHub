@@ -861,6 +861,10 @@ def create_request(
     normalized_required_outputs = _normalize_required_outputs(required_outputs, allowed)
     parent_baseline = dict(workspace_parent_baseline or {})
     path_contracts: dict[str, dict[str, Any]] = {}
+    # ``create_paths`` is the authorized new-file scope, never the
+    # mandatory-create obligation.  Explicit card metadata narrows the
+    # obligation to canonical required outputs; absent metadata keeps
+    # the legacy fail-closed behaviour.
     create_paths: list[str] = []
     for relative in allowed:
         # Only exact declared paths receive a contract. Glob patterns remain
@@ -1024,6 +1028,11 @@ def create_request(
     if normalized_required_outputs is not None:
         shared["required_outputs"] = normalized_required_outputs
         worker["required_outputs"] = normalized_required_outputs
+        required_create_paths = sorted(
+            set(create_paths) & set(normalized_required_outputs)
+        )
+        shared["required_create_paths"] = required_create_paths
+        worker["required_create_paths"] = list(required_create_paths)
     _atomic_json(worker_spec_path, worker)
     _atomic_json(request_path, shared, allow_owner_claim_move=True)
     return BridgeRequest(

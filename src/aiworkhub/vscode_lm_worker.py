@@ -558,11 +558,21 @@ def _validate_allowed_path(raw_path: Any, allowed: list[str]) -> str:
 def _required_create_paths(
     create_paths: set[str] | None,
     allowed: list[str],
+    required_create_paths: set[str] | None = None,
 ) -> set[str]:
-    return {
+    validated = {
         _validate_allowed_path(value, allowed)
         for value in (create_paths or set())
     }
+    if required_create_paths is None:
+        # Legacy worker specs carry no explicit required-create metadata:
+        # permission to create stays the obligation, fail-closed.
+        return validated
+    required = {
+        _validate_allowed_path(value, allowed)
+        for value in required_create_paths
+    }
+    return validated & required
 
 
 def _check_required_creates(
@@ -586,13 +596,19 @@ def _v1_planned_outputs(
     edit: dict[str, Any],
     allowed: list[str],
     create_paths: set[str] | None = None,
+    required_create_paths: set[str] | None = None,
 ) -> list[tuple[str, str]]:
     files = edit.get("files")
     if not isinstance(files, list):
         raise RuntimeError("vscode_lm_edit_response_files_invalid")
     planned: list[tuple[str, str]] = []
     seen: set[str] = set()
-    required_creates = _required_create_paths(create_paths, allowed)
+    required_creates = _required_create_paths(
+        create_paths, allowed, required_create_paths
+    )
+    # Fidelity follows the authorized new-file scope, so a chosen optional
+    # create is still checked; the obligation stays ``required_creates``.
+    create_scope = _required_create_paths(create_paths, allowed)
     create_contents: dict[str, str] = {}
     for item in files:
         if not isinstance(item, dict) or not isinstance(item.get("content"), str):
@@ -606,7 +622,7 @@ def _v1_planned_outputs(
         if target.is_file() and not target.is_symlink():
             old_text = target.read_bytes().decode("utf-8", errors="replace")
         content = item["content"]
-        is_create = relative in required_creates
+        is_create = relative in create_scope
         if is_create:
             create_contents[relative] = content
         _check_edit_fidelity(
@@ -648,13 +664,16 @@ def _v2_planned_outputs(
     edit: dict[str, Any],
     allowed: list[str],
     create_paths: set[str] | None = None,
+    required_create_paths: set[str] | None = None,
 ) -> list[tuple[str, str]]:
     edits = edit.get("edits", [])
     creates = edit.get("creates", [])
     _validate_v2_counts(edits, creates)
     planned: list[tuple[str, str]] = []
     seen: set[str] = set()
-    required_creates = _required_create_paths(create_paths, allowed)
+    required_creates = _required_create_paths(
+        create_paths, allowed, required_create_paths
+    )
     create_contents: dict[str, str] = {}
 
     for item in edits:
@@ -780,6 +799,7 @@ def _v3_planned_outputs(
     edit: dict[str, Any],
     allowed: list[str],
     create_paths: set[str] | None = None,
+    required_create_paths: set[str] | None = None,
 ) -> tuple[list[tuple[str, str]], list[dict[str, Any]]]:
     """Plan hash-bound line-range edits without requiring old/full-file output."""
 
@@ -792,7 +812,9 @@ def _v3_planned_outputs(
     planned: list[tuple[str, str]] = []
     metrics: list[dict[str, Any]] = []
     seen: set[str] = set()
-    required_creates = _required_create_paths(create_paths, allowed)
+    required_creates = _required_create_paths(
+        create_paths, allowed, required_create_paths
+    )
     create_contents: dict[str, str] = {}
 
     groups: dict[str, dict[str, Any]] = {}
@@ -1556,13 +1578,25 @@ def run(spec_path: Path) -> dict[str, Any]:
         create_paths = {
             str(value) for value in spec.get("create_paths") or [] if str(value)
         }
+        # Absent or malformed metadata keeps the legacy fail-closed
+        # obligation: every authorized create is mandatory.
+        raw_required = spec.get("required_create_paths")
+        required_create_paths = (
+            {str(value) for value in raw_required}
+            if isinstance(raw_required, list)
+            else None
+        )
         if edit.get("schema_id") == EDIT_RESPONSE_SCHEMA_ID_V1:
-            planned = _v1_planned_outputs(workspace, edit, allowed, create_paths)
+            planned = _v1_planned_outputs(
+                workspace, edit, allowed, create_paths, required_create_paths
+            )
         elif edit.get("schema_id") == EDIT_RESPONSE_SCHEMA_ID_V2:
-            planned = _v2_planned_outputs(workspace, edit, allowed, create_paths)
+            planned = _v2_planned_outputs(
+                workspace, edit, allowed, create_paths, required_create_paths
+            )
         else:
             planned, semantic_metrics = _v3_planned_outputs(
-                workspace, edit, allowed, create_paths
+                workspace, edit, allowed, create_paths, required_create_paths
             )
         # Existing files are edited through the coordinator's authenticated
         # worker prepare/apply session before this final handoff. Python may

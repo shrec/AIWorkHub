@@ -4191,10 +4191,23 @@ function vscodeLmFidelityError(value, pathValue, operation, options = {}) {
   return reason ? `final_edit_fidelity_rejected:${reason}:${pathValue}:${operation}` : "";
 }
 
-function vscodeLmRequiredCreateError(items, contractByPath, contentKey, operation) {
+function vscodeLmRequiredCreateError(items, contractByPath, contentKey, operation, requiredCreatePaths) {
   const byPath = new Map((items || []).filter((item) => item && typeof item.path === "string")
     .map((item) => [vscodeLmNormalizedPath(item.path), item]));
-  for (const [requiredPath, contract] of contractByPath.entries()) {
+  // When the request published explicit required-create metadata, only
+  // those exact new-file obligations block finalization; an untouched
+  // optional new-file scope may be omitted. Legacy requests without that
+  // metadata keep the fail-closed contract: every create contract is
+  // mandatory.
+  // A chosen optional create is still checked for non-empty content.
+  const requiredPaths = Array.isArray(requiredCreatePaths)
+    ? [...requiredCreatePaths, ...byPath.keys()]
+    : [...contractByPath.entries()]
+        .filter(([, contract]) => contract && contract.action === "create")
+        .map(([filePath]) => filePath);
+  for (const rawPath of requiredPaths) {
+    const requiredPath = vscodeLmNormalizedPath(String(rawPath));
+    const contract = contractByPath.get(requiredPath);
     if (!contract || contract.action !== "create") continue;
     const item = byPath.get(requiredPath);
     if (!item) return `final_edit_fidelity_rejected:missing_required_create:${requiredPath}:${operation}`;
@@ -4232,7 +4245,7 @@ function vscodeLmMissingRequiredCreateInstruction(rejection, allowedWrites) {
     `Every file path must match allowed_writes=${JSON.stringify(allowedWrites)}.`;
 }
 
-function validateVscodeLmFinalEnvelope(envelope, allowedWrites, pathContracts = {}) {
+function validateVscodeLmFinalEnvelope(envelope, allowedWrites, pathContracts = {}, requiredCreatePaths) {
   if (!envelope || typeof envelope.summary !== "string") {
     return "final_shape_invalid";
   }
@@ -4241,7 +4254,7 @@ function validateVscodeLmFinalEnvelope(envelope, allowedWrites, pathContracts = 
   const contractByPath = vscodeLmContractMap(pathContracts);
   if (envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1) {
     if (!Array.isArray(envelope.files)) return "final_files_invalid";
-    const requiredCreateError = vscodeLmRequiredCreateError(envelope.files, contractByPath, "content", "v1_file");
+    const requiredCreateError = vscodeLmRequiredCreateError(envelope.files, contractByPath, "content", "v1_file", requiredCreatePaths);
     for (const file of envelope.files) {
       if (!file || typeof file.path !== "string" || typeof file.content !== "string") {
         return "final_file_invalid";
@@ -4260,7 +4273,7 @@ function validateVscodeLmFinalEnvelope(envelope, allowedWrites, pathContracts = 
   }
   if (envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2) {
     if (!Array.isArray(envelope.edits) || !Array.isArray(envelope.creates)) return "final_v2_shape_invalid";
-    const requiredCreateError = vscodeLmRequiredCreateError(envelope.creates, contractByPath, "content", "v2_create");
+    const requiredCreateError = vscodeLmRequiredCreateError(envelope.creates, contractByPath, "content", "v2_create", requiredCreatePaths);
     for (const edit of envelope.edits) {
       if (!edit || typeof edit.path !== "string" || typeof edit.current_sha256 !== "string" || !Array.isArray(edit.replacements)) return "final_edit_invalid";
       if (!/^[0-9a-f]{64}$/.test(edit.current_sha256)) return `final_hash_invalid:${edit.path}`;
@@ -4291,7 +4304,7 @@ function validateVscodeLmFinalEnvelope(envelope, allowedWrites, pathContracts = 
   if (!Array.isArray(envelope.edits) || !Array.isArray(envelope.creates)) {
     return "final_v2_shape_invalid";
   }
-  const requiredCreateError = vscodeLmRequiredCreateError(envelope.creates, contractByPath, "content", "v3_create");
+  const requiredCreateError = vscodeLmRequiredCreateError(envelope.creates, contractByPath, "content", "v3_create", requiredCreatePaths);
   for (const edit of envelope.edits) {
     if (!edit || typeof edit.path !== "string" || !Array.isArray(edit.ranges)) {
       return "final_edit_invalid:expected_edits_path_and_ranges";
@@ -4660,7 +4673,7 @@ function createVscodeLmStagedEditCollector(request) {
       edits: [...edits.values()].filter(edit => !edit.applied),
       creates: [...creates.values()],
     };
-    const error = validateVscodeLmFinalEnvelope(envelope, allowedWrites, pathContracts);
+    const error = validateVscodeLmFinalEnvelope(envelope, allowedWrites, pathContracts, request && request.required_create_paths);
     if (error) return { ok: false, reason: `semantic_edit_finalize_rejected:${error}`, ...progress };
     return {
       ok: true,
@@ -6199,7 +6212,7 @@ async function runVscodeLmTextProtocol(
         ));
         continue;
       }
-      const finalError = validateVscodeLmFinalEnvelope(envelope, request.allowedWrites, request.path_contracts);
+      const finalError = validateVscodeLmFinalEnvelope(envelope, request.allowedWrites, request.path_contracts, request.required_create_paths);
       const missingCreate = vscodeLmMissingRequiredCreateRejection(
         finalError, vscodeLmContractMap(request.path_contracts),
       );
@@ -6970,7 +6983,7 @@ async function runVscodeLmAgent(
         ));
         continue;
       }
-      const finalError = validateVscodeLmFinalEnvelope(envelope, request.allowedWrites, request.path_contracts);
+      const finalError = validateVscodeLmFinalEnvelope(envelope, request.allowedWrites, request.path_contracts, request.required_create_paths);
       const missingCreate = vscodeLmMissingRequiredCreateRejection(
         finalError, vscodeLmContractMap(request.path_contracts),
       );
@@ -13109,6 +13122,7 @@ module.exports = {
   deactivate,
   __testInternals: {
     createVscodeLmActivityJournal,
+    vscodeLmRequiredCreateError,
   vscodeLmActivityRedactText,
     vscodeLmActivityPreview,
     CODING_FOUNDATION_CARD_KEYS,
