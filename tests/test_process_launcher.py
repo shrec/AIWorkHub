@@ -1901,6 +1901,7 @@ def test_finalize_after_process_exit_emits_terminal_callback_fallback(
     )
 
 
+@pytest.mark.parametrize("seat_provider", ["claude", None])
 @pytest.mark.parametrize(
     ("terminal_state", "terminal_error"),
     [
@@ -1915,7 +1916,7 @@ def test_finalize_after_process_exit_emits_terminal_callback_fallback(
     ],
 )
 def test_retry_finalization_reuses_retained_workspace_without_provider(
-    monkeypatch, tmp_path, terminal_state, terminal_error
+    monkeypatch, tmp_path, terminal_state, terminal_error, seat_provider
 ):
     _open_gates(monkeypatch)
     from aiworkhub import worker_workspace
@@ -1998,6 +1999,14 @@ def test_retry_finalization_reuses_retained_workspace_without_provider(
 
     monkeypatch.setattr(manager, "_finalize_isolated_request", finalize)
 
+    # NF-2026-01394: a Claude manager's retry is never recorded as Codex.
+    monkeypatch.setattr(process_launcher.core, "_manager_chat_seat_identity", lambda: None)
+    monkeypatch.setattr(
+        process_launcher.core,
+        "_claude_manager_identity",
+        lambda: {"provider": seat_provider} if seat_provider else None,
+    )
+    monkeypatch.setattr(process_launcher.core, "_codex_manager_identity", lambda: None)
     result = manager.retry_finalization(request_id, "TASK_B1")
 
     assert result["ok"] is True, result
@@ -2011,6 +2020,9 @@ def test_retry_finalization_reuses_retained_workspace_without_provider(
             "claude_worker_b1",
             request_id,
         )
+        # With no manager identity the actor falls back to the chat provider.
+        expected = seat_provider or process_launcher.core._current_chat_provider()
+        assert transitions[0][1]["actor"] == expected
 
 
 _RECEIPT_DRIFT_PREFIX = "validation_toolchain_authority_receipt_"

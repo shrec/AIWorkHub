@@ -73,6 +73,7 @@ from . import storage_retention, terminal_failure_classification
 from .process_launcher_acceptance import accepted_outcome_receipt as _accepted_outcome_receipt
 from .process_launcher_acceptance import changed_path_hashes as _changed_path_hashes
 from .process_launcher_acceptance import finished_acceptance_result as _finished_acceptance_result
+from .process_launcher_accept_review import _accept_manager_identity
 from .process_launcher_accept_review import accept_preview as _accept_preview_impl
 from .process_launcher_accept_review import accept_review as _accept_review_impl
 from .process_launcher_launch_isolated import launch_isolated as _launch_isolated_impl
@@ -13515,7 +13516,12 @@ class ProcessManager:
                     task_id,
                     runner,
                     request_id,
-                    actor=core.CODEX_RUNNER,
+                    # NF-2026-01394: provenance names the verified calling
+                    # manager, never a hardcoded Codex default.
+                    actor=str(
+                        _accept_manager_identity(core).get("provider")
+                        or core._current_chat_provider()
+                    ),
                 )
                 if not transition.get("ok"):
                     return {
