@@ -1370,3 +1370,47 @@ def test_failed_live_source_graph_calls_void_injected_orientation(
     assert malformed_container["satisfaction_by_tool"]["source_graph"] == (
         "source_graph_live_calls_all_failed"
     )
+
+
+def test_context_ack_evidence_reports_coordinator_binding_without_receipt():
+    """NF-2026-01395: a claude_cli worker prints no receipt, so the evidence
+    reports the gate's coordinator-bound acknowledgement, not receipt_not_found."""
+    bundle = _sha()
+    missing = pl._project_context_receipt_from_output(Path("missing-stdout.log"))
+    assert missing["reason"] == "receipt_not_found"
+    metadata = {
+        "adapter_id": "claude_cli",
+        "project_context": {"bundle_sha256": bundle},
+        "project_context_delivery": {"injected": True, "section_count": 5},
+    }
+    bound = {
+        "injected_context_acknowledged": True,
+        "injected_context_acknowledgement_source": "coordinator_prompt_binding",
+    }
+
+    ack = pl._coordinator_bound_context_ack(missing, bound, metadata, "req")
+
+    assert ack["acknowledged"] is True
+    assert ack["reason"] == "coordinator_prompt_binding"
+    assert (ack["bundle_sha256"], ack["request_id"], ack["section_count"]) == (bundle, "req", 5)
+    unbound = {"injected_context_acknowledged": False, "injected_context_acknowledgement_source": ""}
+    assert pl._coordinator_bound_context_ack(missing, unbound, metadata, "req") == missing
+    assert pl._coordinator_bound_context_ack(missing, None, metadata, "req") == missing
+    # A found but unverifiable receipt keeps its specific reason and observed digest.
+    for reason in (
+        "receipt_bundle_sha256_invalid",
+        "receipt_bundle_sha256_mismatch",
+        "receipt_request_id_mismatch",
+        "receipt_section_count_invalid",
+    ):
+        found = {**missing, "bundle_sha256": _sha("other"), "reason": reason}
+        assert pl._coordinator_bound_context_ack(found, bound, metadata, "req") == found
+    # Without a 64-hex bundle digest and a positive section count there is no
+    # bundle identity to acknowledge.
+    for broken in (
+        {},
+        {"project_context": {"bundle_sha256": "short"}, "project_context_delivery": {"section_count": 5}},
+        {"project_context": {"bundle_sha256": bundle}, "project_context_delivery": {"section_count": 0}},
+        {"project_context": {"bundle_sha256": bundle}, "project_context_delivery": {"section_count": True}},
+    ):
+        assert pl._coordinator_bound_context_ack(missing, bound, broken, "req") == missing

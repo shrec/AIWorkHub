@@ -2122,6 +2122,46 @@ def _project_context_receipt_from_output(
     return result
 
 
+def _coordinator_bound_context_ack(
+    context_ack: dict[str, Any],
+    worker_mcp_gate: Mapping[str, Any] | None,
+    metadata: Mapping[str, Any],
+    request_id: str,
+) -> dict[str, Any]:
+    """Report the gate's coordinator-bound acknowledgement (NF-2026-01395).
+
+    A worker told not to print the receipt (claude_cli) leaves none in stdout,
+    so the stdout scan says ``receipt_not_found`` although the worker MCP gate
+    already acknowledged the injected bundle from coordinator facts.  The
+    evidence then reports that server-derived acknowledgement.
+    """
+    source = (worker_mcp_gate or {}).get("injected_context_acknowledgement_source")
+    # Only an absent receipt is upgraded; a found but unverifiable receipt keeps
+    # its specific failure reason and observed digest.
+    if context_ack.get("reason") != "receipt_not_found" or source != "coordinator_prompt_binding":
+        return context_ack
+    context = metadata.get("project_context")
+    delivery = metadata.get("project_context_delivery")
+    bundle_sha = str(context.get("bundle_sha256") or "") if isinstance(context, Mapping) else ""
+    section_count = delivery.get("section_count") if isinstance(delivery, Mapping) else None
+    # The receipt path's invariants: a 64-hex digest and a positive section count.
+    if not (
+        len(bundle_sha) == 64
+        and all(ch in "0123456789abcdef" for ch in bundle_sha)
+        and type(section_count) is int
+        and section_count > 0
+    ):
+        return context_ack
+    return {
+        **context_ack,
+        "acknowledged": True,
+        "bundle_sha256": bundle_sha,
+        "request_id": request_id[:160],
+        "section_count": section_count,
+        "reason": "coordinator_prompt_binding",
+    }
+
+
 REASONING_CONTEXT_ATTEMPT_EVENT_SCHEMA_ID = "aiworkhub.reasoning_context_attempt_event.v1"
 
 
@@ -12225,6 +12265,9 @@ class ProcessManager:
                 expected_bundle_sha256=str(
                     (metadata.get("project_context") or {}).get("bundle_sha256") or ""
                 ),
+            )
+            context_ack = _coordinator_bound_context_ack(
+                context_ack, worker_mcp_gate, metadata, request_id
             )
             attempt_evidence = _reasoning_context_attempt_from_output(
                 stdout_path, metadata, request_id
