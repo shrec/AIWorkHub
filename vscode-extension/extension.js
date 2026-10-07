@@ -4103,10 +4103,10 @@ function glmAgentProtocolPrompt(prompt, allowedWrites, pathContracts = {}) {
     `- After every intended fragment is staged, call ${VSCODE_LM_FINALIZE_EDIT_TOOL} with only a short truthful summary. Do not resend already-applied code; final edits are empty for authenticated applies, while new-file creates remain pending.\n` +
     `- Canonical offline create stage request: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_STAGE_EDIT_TOOL}","input":{"operation":"create","file_path":"<allowed-path>","content":"<full file content>"}}\n` +
     `- Canonical authenticated replace-range stage request uses the exact Source Graph range. A one-line pin of line 1 is not a complete replacement: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_STAGE_EDIT_TOOL}","input":{"operation":"replace_range","file_path":"<allowed-path>","start_line":"<source-graph-start>","end_line":"<source-graph-end>","new":"<complete replacement for that range>"}}\n` +
-    `- A worker edits an existing file with aiworkhub_worker_semantic_edit_prepare then aiworkhub_worker_semantic_edit_apply. Do not call manager semantic-edit tools.\n` +
+    `- Edit an existing file by calling ${VSCODE_LM_STAGE_EDIT_TOOL} replace_range directly with the exact start_line/end_line and the complete replacement; it needs no prior prepare; one turn may carry several stage calls. Do not call manager semantic-edit prepare/apply.\n` +
     `- Canonical offline finalize request: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_FINALIZE_EDIT_TOOL}","input":{"summary":"<short applied summary>"}}\n` +
     `- Canonical final response: {"schema_id":"${VSCODE_LM_EDIT_RESPONSE_SCHEMA}","summary":"<truthful summary>","edits":[{"path":"<allowed-path>","current_sha256":"<path-contract-sha256>","ranges":[{"start_line":"<source-graph-start>","end_line":"<source-graph-end>","new":"<complete replacement>","preserve_trailing_newline":true}]}],"creates":[{"path":"<new-allowed-path>","content":"<complete new file>"}]}. Use empty edits/creates arrays when that operation is not needed. Stage input operation/file_path fields are not final-response path/ranges fields.\n` +
-    `- Worker semantic-edit prepare/apply are provider-callable. Either use their pair or stage a replacement through the bridge, which executes the same authenticated pair. Never submit an offline existing-file replacement.\n` +
+    `- Worker semantic-edit prepare/apply are provider-callable, but each pair costs two turns; prefer one stage call per range, which executes the same authenticated pair. Never submit an offline existing-file replacement.\n` +
     `- Semantic edits must name an allowed path and use non-overlapping 1-based inclusive start_line/end_line values from Source Graph evidence.\n` +
     `- Each new value must contain the complete, substantive replacement for its declared range; it may be empty only for an intentional deletion. Do not echo old code. preserve_trailing_newline defaults true.\n` +
     `- creates must name an allowed path and contain complete, nonempty UTF-8 content. Every path_contract whose action is create MUST appear exactly once in creates.\n` +
@@ -5175,7 +5175,7 @@ function createVscodeLmSourceGraphGuard() {
       }
     },
     progressRevision() { return progressRevision; },
-    sourceEvidenceRevision() { return seenEvidence.size; },
+    sourceEvidenceRevision() { return seenEvidence.size; }, stageRevision() { return Math.max(0, seenStages.size - 1); }, // ranges after the first (NF-2026-01385)
   };
 }
 
@@ -5245,7 +5245,7 @@ function glmTextToolProtocolPrompt(prompt, allowedWrites, sourceGraphPrefetched 
       ? `- The only successful terminal action is an authenticated aiworkhub_worker_quality_review_submit request.\n`
       : `- After each tool result, either request another allowlisted tool or output the final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} object.\n` +
         `- Canonical stage request (replace_range) uses the exact Source Graph range. A one-line pin of line 1 is not a complete replacement: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${editStageName}","input":{"operation":"replace_range","file_path":"<allowed-path>","start_line":"<source-graph-start>","end_line":"<source-graph-end>","new":"<complete replacement for that range>"}}\n` +
-        `- A worker edits an existing file with aiworkhub_worker_semantic_edit_prepare then aiworkhub_worker_semantic_edit_apply. Do not call manager semantic-edit tools.\n` +
+        `- Edit an existing file by calling ${editStageName} replace_range directly with the exact start_line/end_line and the complete replacement; it needs no prior prepare; one stage per turn. Do not call manager semantic-edit prepare/apply.\n` +
         `- Canonical stage request (create): {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${editStageName}","input":{"operation":"create","file_path":"<allowed-path>","content":"<full file content>"}}\n` +
         `- Canonical finalize request: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${editFinalizeName}","input":{"summary":"<short applied summary>"}}\n`) +
     `- Allowed tool names: ${JSON.stringify(toolNames)}.\n` +
@@ -6023,7 +6023,7 @@ async function runVscodeLmTextProtocol(
     const progressBeforeTurn = sourceGraphGuard.progressRevision();
     const stalledLastTurn = progressBeforeTurn === lastTurnProgress;
     lastTurnProgress = progressBeforeTurn;
-    const sourceBeforeTurn = sourceGraphGuard.sourceEvidenceRevision();
+    const sourceBeforeTurn = sourceGraphGuard.sourceEvidenceRevision(); const stagesBeforeTurn = sourceGraphGuard.stageRevision();
     assertRequestActive();
     if (request.request_kind === "quality_review" &&
         postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS && !reviewSubmitForced) {
@@ -6719,7 +6719,7 @@ async function runVscodeLmTextProtocol(
     if (writableTask && sourceGraphGuard.progressRevision() !== progressBeforeTurn) {
       creditedTurns += 1; // One credit per provider turn, never per returned row/page.
     }
-    if (writableTask && sourceGraphGuard.sourceEvidenceRevision() !== sourceBeforeTurn) {
+    if (writableTask && (sourceGraphGuard.sourceEvidenceRevision() !== sourceBeforeTurn || (!forceStagedEdit && sourceGraphGuard.stageRevision() !== stagesBeforeTurn))) { // a free-phase stage turn is progress (NF-2026-01385)
       postSourceTurns = Math.max(0, postSourceTurns - 1);
     }
     protocolTrace.push({ turn, phase: "work", outcome: `tool:${envelope.name}` });
@@ -6816,7 +6816,7 @@ async function runVscodeLmAgent(
     const progressBeforeTurn = sourceGraphGuard.progressRevision();
     const stalledLastTurn = progressBeforeTurn === lastTurnProgress;
     lastTurnProgress = progressBeforeTurn;
-    const sourceBeforeTurn = sourceGraphGuard.sourceEvidenceRevision();
+    const sourceBeforeTurn = sourceGraphGuard.sourceEvidenceRevision(); const stagesBeforeTurn = sourceGraphGuard.stageRevision();
     assertRequestActive();
     if (qualityReview && postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS && !reviewSubmitForced) {
       reviewSubmitForced = true;
@@ -6901,7 +6901,7 @@ async function runVscodeLmAgent(
     );
     const options = vscodeLmLanguageModelRequestOptions(model, request);
     if (!forceFinal) {
-      options.tools = availableTools;
+      options.tools = reviewSubmitForced ? availableTools.filter((tool) => isQualityReviewSubmitTool(tool.name)) : availableTools; // NF-2026-01388
       options.toolMode = qualityReview || forceStagedEdit ||
         vscodeLmShouldKeepStagedEdit(writableTask, stagedEdits)
         ? vscode.LanguageModelChatToolMode.Required
@@ -7220,7 +7220,7 @@ async function runVscodeLmAgent(
         calls.map((call) => languageModelToolResultPart(call.callId, {
           ok: false,
           error: "vscode_lm_quality_review_submit_required",
-          corrective: true,
+          corrective: true, instruction: "The review work phase is complete. Call aiworkhub_worker_quality_review_submit now with your findings.",
         })),
       ));
       continue;
@@ -7322,7 +7322,7 @@ async function runVscodeLmAgent(
     if (writableTask && sourceGraphGuard.progressRevision() !== progressBeforeTurn) {
       creditedTurns += 1; // A multi-tool batch earns at most one continuation turn.
     }
-    if (writableTask && sourceGraphGuard.sourceEvidenceRevision() !== sourceBeforeTurn) {
+    if (writableTask && (sourceGraphGuard.sourceEvidenceRevision() !== sourceBeforeTurn || (!forceStagedEdit && sourceGraphGuard.stageRevision() !== stagesBeforeTurn))) { // a free-phase stage turn is progress (NF-2026-01385)
       postSourceTurns = Math.max(0, postSourceTurns - 1);
     } else {
       toolTurns += 1;
