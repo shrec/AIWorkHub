@@ -250,7 +250,7 @@ def test_snapshot_detects_cycle_created_by_superseded_dependency_rewrite():
 
 def test_snapshot_reports_write_scope_overlap_with_retained_processing_card():
     cards = [
-        _card("t1", status="processing", worker_status="claimed", allowed_writes=["src/a.py"]),
+        _card("t1", status="processing", worker_status="claimed", allowed_writes=["src/a.py"], launch_request_id=""),
         _card("t2", status="pending", allowed_writes=["src/a.py", "src/b.py"]),
     ]
     snap = task_plan.build_snapshot(cards)
@@ -258,14 +258,14 @@ def test_snapshot_reports_write_scope_overlap_with_retained_processing_card():
     assert "t2" not in snap["ready"]
 
 
-def test_snapshot_claims_only_one_of_two_overlapping_pending_tasks_in_queue_order():
+def test_snapshot_overlapping_pending_tasks_are_all_ready_in_queue_order():
     cards = [
         _card("t1", allowed_writes=["src/a.py"], created_at="2026-01-01T00:00:00Z"),
         _card("t2", allowed_writes=["src/a.py"], created_at="2026-01-02T00:00:00Z"),
     ]
     snap = task_plan.build_snapshot(cards)
-    assert snap["ready"] == ["t1"]
-    assert snap["write_scope_overlaps"]["t2"] == ["src/a.py"]
+    assert snap["ready"] == ["t1", "t2"]
+    assert snap["write_scope_overlaps"] == {}
 
 
 def test_snapshot_disjoint_writes_are_all_ready_in_parallel():
@@ -367,7 +367,7 @@ def test_paths_conflict_exact_parent_child_and_glob():
 
 def test_snapshot_write_scope_overlap_detects_glob_conflict():
     cards = [
-        _card("t1", status="processing", worker_status="claimed", allowed_writes=["src/**"]),
+        _card("t1", status="processing", worker_status="claimed", allowed_writes=["src/**"], launch_request_id=""),
         _card("t2", status="pending", allowed_writes=["src/x.py"]),
     ]
     snap = task_plan.build_snapshot(cards)
@@ -377,7 +377,7 @@ def test_snapshot_write_scope_overlap_detects_glob_conflict():
 
 def test_snapshot_write_scope_overlap_detects_parent_child_conflict():
     cards = [
-        _card("t1", status="processing", worker_status="claimed", allowed_writes=["out"]),
+        _card("t1", status="processing", worker_status="claimed", allowed_writes=["out"], launch_request_id=""),
         _card("t2", status="pending", allowed_writes=["out/a.json"]),
     ]
     snap = task_plan.build_snapshot(cards)
@@ -420,8 +420,8 @@ def test_snapshot_global_collision_truth_separates_independent_ready_card():
 
     # An unrelated global collision must never block the collision-free,
     # dependency-ready card.
-    assert "independent" in snap["ready"]
-    assert snap["write_scope_overlaps"] == {"collide_b": ["src/shared.py"]}
+    assert snap["ready"] == ["collide_a", "collide_b", "independent"]
+    assert snap["write_scope_overlaps"] == {}
 
 
 def test_snapshot_per_card_collision_truth_reports_only_involved_conflicts():
@@ -1120,7 +1120,7 @@ _PINNED_PREDECESSOR = {
 }
 
 
-def test_rework_card_wins_scope_over_fresh_card_of_same_priority():
+def test_rework_card_is_picked_before_fresh_card_of_same_priority():
     cards = [
         _card("A-fresh", priority="high", allowed_writes=["src/shared.py"]),
         _card(
@@ -1134,8 +1134,8 @@ def test_rework_card_wins_scope_over_fresh_card_of_same_priority():
 
     snap = task_plan.build_snapshot(cards)
 
-    assert snap["ready"] == ["Z-rework"]
-    assert snap["write_scope_overlaps"] == {"A-fresh": ["src/shared.py"]}
+    assert snap["ready"] == ["Z-rework", "A-fresh"]
+    assert snap["write_scope_overlaps"] == {}
 
 
 def test_claim_epoch_alone_marks_rework_card():
@@ -1146,8 +1146,8 @@ def test_claim_epoch_alone_marks_rework_card():
 
     snap = task_plan.build_snapshot(cards)
 
-    assert snap["ready"] == ["Z-rework"]
-    assert "A-fresh" in snap["write_scope_overlaps"]
+    assert snap["ready"] == ["Z-rework", "A-fresh"]
+    assert snap["write_scope_overlaps"] == {}
 
 
 def test_higher_priority_fresh_card_still_beats_rework_card():
@@ -1164,8 +1164,8 @@ def test_higher_priority_fresh_card_still_beats_rework_card():
 
     snap = task_plan.build_snapshot(cards)
 
-    assert snap["ready"] == ["Z-fresh"]
-    assert snap["write_scope_overlaps"] == {"A-rework": ["src/shared.py"]}
+    assert snap["ready"] == ["Z-fresh", "A-rework"]
+    assert snap["write_scope_overlaps"] == {}
 
 
 def test_scope_ordering_without_rework_cards_is_unchanged():
@@ -1179,9 +1179,23 @@ def test_scope_ordering_without_rework_cards_is_unchanged():
 
     snap = task_plan.build_snapshot(cards)
 
-    assert snap["ready"] == ["D-crit", "A-fresh"]
-    assert snap["write_scope_overlaps"] == {
-        "B-fresh": ["src/shared.py"],
-        "C-low": ["src/other.py"],
-        "E-epoch-zero": ["src/shared.py"],
-    }
+    assert snap["ready"] == ["D-crit", "A-fresh", "B-fresh", "E-epoch-zero", "C-low"]
+    assert snap["write_scope_overlaps"] == {}
+
+
+def test_snapshot_launched_owner_scope_is_shared_not_reserved():
+    cards = [
+        _card("t1", status="processing", worker_status="claimed", allowed_writes=["src/a.py"]),
+        _card(
+            "t2",
+            status="review",
+            worker_status="review",
+            launch_request_id="request-r",
+            allowed_writes=["src/b.py"],
+        ),
+        _card("t3", allowed_writes=["src/a.py", "src/b.py"]),
+    ]
+    snap = task_plan.build_snapshot(cards)
+    assert snap["ready"] == ["t3"]
+    assert snap["write_scope_overlaps"] == {}
+    assert snap["card_collision_free"]["t3"] is False

@@ -546,6 +546,17 @@ def _active_write_collisions(
     return records
 
 
+def writes_canonical_tree(card: dict[str, Any], lifecycle: str) -> bool:
+    """A processing/review card with no launch request edits the canonical tree.
+
+    Launched cards run in their own worktrees and merge at promotion
+    (NF-2026-01381); only such an in-place writer still owns its write scope.
+    """
+    if lifecycle not in RETAINED_STATES:
+        return False
+    return not str(card.get("launch_request_id") or "").strip()
+
+
 def lifecycle_state(card: dict[str, Any]) -> str:
     """Compact lifecycle classifier -- mirrors ``core._lifecycle_state``.
 
@@ -646,16 +657,16 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
 
     retained_paths: set[str] = set()
     for tid, c in by_id.items():
-        if lifecycle[tid] in RETAINED_STATES:
+        if writes_canonical_tree(c, lifecycle[tid]):
             retained_paths |= set(c.get("allowed_writes") or [])
 
-    # Keep pending-scope arbitration identical to launch_collision_guard.
-    # Otherwise the plan can advertise one overlapping card as ready while
-    # the atomic launch guard deterministically admits a different winner.
-    # Within one priority rank a card already returned for rework (pinned
-    # rework_predecessor or claim_epoch >= 1) keeps its write scope over
-    # never-started cards; letting a fresh card win strands the rework and
-    # can revert its predecessor's changes.  Priority still dominates.
+    # Keep scope arbitration identical to launch_collision_guard: only an
+    # in-place writer above reserves scope, so overlapping pending cards are
+    # all ready and merge at promotion (NF-2026-01381).  The order below is
+    # the pickup order.  Within one priority rank a card already returned for
+    # rework (pinned rework_predecessor or claim_epoch >= 1) is picked before
+    # never-started cards, so it promotes first and a fresh card merges onto
+    # it rather than the reverse.  Priority still dominates.
     priority_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "": 4}
 
     def is_rework(card: dict[str, Any]) -> bool:
@@ -688,7 +699,6 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
 
     ready: list[str] = []
     write_scope_overlaps: dict[str, list[str]] = {}
-    claimed_paths: set[str] = set(retained_paths)
     for c in ordered:
         tid = str(c["task_id"])
         if lifecycle[tid] != "pending":
@@ -698,12 +708,12 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
         if has_persisted_noncollision_blocker(c):
             continue
         my_writes = set(c.get("allowed_writes") or [])
-        overlap = {p for p in my_writes if _paths_conflict_any(p, claimed_paths)}
+        overlap = {p for p in my_writes if _paths_conflict_any(p, retained_paths)}
         if overlap:
             write_scope_overlaps[tid] = sorted(overlap)
             continue
+        # Another card sharing this scope runs in its own worktree (NF-2026-01381).
         ready.append(tid)
-        claimed_paths |= my_writes
 
     # Deterministic topological presentation metadata.  This never changes
     # claim authority: it projects the already-validated dependency map for

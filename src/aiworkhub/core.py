@@ -10268,23 +10268,19 @@ def launch_collision_guard(
 ) -> dict[str, Any]:
     """Check write-scope collisions that can block one exact launch.
 
-    The dashboard collision report intentionally includes every pending card
-    so managers can see future coordination needs.  A launcher must be more
-    precise: an unrelated planned collision cannot freeze the entire queue,
-    and a dependency-blocked pending card does not yet own write authority.
-    Processing/review cards always retain their scopes.  Among dependency-
-    ready pending contenders, a deterministic priority/task-id order admits
-    one winner so concurrent launch attempts cannot both pass preflight.
+    Every launched card runs in its own worktree and its promotion three-way
+    merges a file that changed since launch (NF-2026-01381), so cards whose
+    writes overlap run in parallel: neither a pending nor a launched card
+    reserves scope here.  A processing/review card with no launch request
+    edits the canonical tree in place (task_plan.writes_canonical_tree); it
+    alone still owns its scope and blocks the launch, exactly as the plan
+    snapshot reserves it.
     """
     command = ["launch-collision-guard", task_id]
     if print_json:
         command.append("--print")
     try:
         cards = _active_cards_for_collision_guard()
-        # Dependency completion and terminal-artifact replacement live outside
-        # the active-card slice.  The launch winner therefore has to come from
-        # the same full canonical snapshot used by task_plan_snapshot.
-        plan_snapshot = task_plan.build_snapshot(_full_cards_for_plan())
     except task_store.TaskStoreError as exc:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
 
@@ -10297,17 +10293,6 @@ def launch_collision_guard(
             stderr=f"collision_candidate_not_found:{task_id}",
             command=command,
         )
-
-    # Reuse the Plan-DAG's complete arbitration result.  Looking only at
-    # pairwise priority lets a pending card reserve one path here even when an
-    # active processing/review owner already prevents that card from launching
-    # on another path.  Such a transitive loser must not block the actual
-    # Plan-DAG winner.
-    admitted_pending = {
-        str(ready_task_id)
-        for ready_task_id in plan_snapshot.get("ready") or []
-    }
-
     candidate_paths = [
         normalized
         for raw_path in candidate.get("allowed_writes") or []
@@ -10333,9 +10318,9 @@ def launch_collision_guard(
         if not overlaps:
             continue
         lifecycle = task_store.canonical_status(other)
-        owns_scope = lifecycle in {"processing", "review"}
-        if lifecycle == "pending":
-            owns_scope = other_id in admitted_pending
+        # A launched card runs in its own worktree and merges at promotion
+        # (NF-2026-01381); only an in-place canonical writer owns its scope.
+        owns_scope = task_plan.writes_canonical_tree(other, lifecycle)
         if owns_scope:
             blockers.append(
                 {"task_id": other_id, "lifecycle": lifecycle, "paths": overlaps}

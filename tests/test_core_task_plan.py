@@ -448,7 +448,25 @@ def test_launch_collision_guard_blocks_processing_owner():
     assert payload["blockers"][0]["task_id"] == "owner"
 
 
-def test_launch_collision_guard_deterministically_selects_ready_pending_winner():
+def test_launch_collision_guard_admits_a_launched_isolated_owner():
+    repo = core.repo_root()
+    _insert_card(
+        repo,
+        "owner",
+        status="processing",
+        worker_status="claimed",
+        launch_request_id="request-live",
+        allowed_writes=["shared.py"],
+    )
+    _insert_card(repo, "candidate", allowed_writes=["shared.py"])
+
+    result = core.launch_collision_guard(task_id="candidate", print_json=True)
+
+    assert result["ok"] is True
+    assert json.loads(result["stdout"])["blockers"] == []
+
+
+def test_launch_collision_guard_admits_overlapping_pending_cards():
     repo = core.repo_root()
     _insert_card(repo, "a_first", allowed_writes=["shared.py"])
     _insert_card(repo, "z_second", allowed_writes=["shared.py"])
@@ -457,10 +475,10 @@ def test_launch_collision_guard_deterministically_selects_ready_pending_winner()
     second = core.launch_collision_guard(task_id="z_second", print_json=True)
 
     assert first["ok"] is True
-    assert second["ok"] is False
+    assert second["ok"] is True
 
 
-def test_plan_and_launch_guard_select_same_priority_winner():
+def test_plan_and_launch_guard_admit_overlapping_cards_in_priority_order():
     repo = core.repo_root()
     _insert_card(
         repo, "older_low", priority="low", created_at="2026-01-01T00:00:00+00:00",
@@ -475,10 +493,10 @@ def test_plan_and_launch_guard_select_same_priority_winner():
     critical_launch = core.launch_collision_guard(task_id="newer_critical", print_json=True)
     low_launch = core.launch_collision_guard(task_id="older_low", print_json=True)
 
-    assert snapshot["ready"] == ["newer_critical"]
+    assert snapshot["ready"] == ["newer_critical", "older_low"]
     assert critical_launch["ok"] is True
-    assert low_launch["ok"] is False
-    assert json.loads(low_launch["stdout"])["blockers"][0]["task_id"] == "newer_critical"
+    assert low_launch["ok"] is True
+    assert json.loads(low_launch["stdout"])["blockers"] == []
 
 
 def test_launch_guard_ignores_pending_contender_blocked_by_retained_scope():
