@@ -929,6 +929,34 @@ def test_opencode_seat_env_carries_both_seat_keys(tmp_path):
     config_text = env[runtime_adapters.OPENCODE_WORKER_CONFIG_ENV]
     assert "AIWORKHUB_MANAGER_SEAT_BACKEND" in config_text
     assert "AIWORKHUB_MANAGER_SEAT_TOKEN" in config_text
+
+
+def test_opencode_manager_turn_selects_the_seat_reasoning_variant(tmp_path):
+    model = "opencode-go/muse-1.3"
+    env = mlb.provision_manager_seat_env(
+        tmp_path,
+        "opencode_cli",
+        python_executable="python",
+        package_import_root="src",
+        model=model,
+    )
+    assert '"aiworkhub"' in env[runtime_adapters.OPENCODE_WORKER_CONFIG_ENV]
+    plan = SimplePlan(
+        ["opencode", "run", "--format", "json", "--model", model, "ask"],
+        str(tmp_path),
+    )
+    with_variant = mlb.CliManagerBackend(
+        "opencode_cli", model, tmp_path, extra_env=env
+    ).argv_for(plan)
+    at = with_variant.index("--model") + 1
+    assert with_variant[at] == f"{model}#aiworkhub"
+    without_env = mlb.CliManagerBackend(
+        "opencode_cli", model, tmp_path
+    ).argv_for(plan)
+    at = without_env.index("--model") + 1
+    assert without_env[at] == model
+
+
 def test_factory_provisions_seat_env_per_backend_at_build_time(tmp_path: Path):
     seen: list[tuple[str, str]] = []
 

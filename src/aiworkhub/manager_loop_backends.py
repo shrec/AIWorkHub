@@ -819,6 +819,16 @@ class CliManagerBackend:
         """This turn's argv: the adapter plan, minus what a manager turn cannot keep."""
         dropped = _DROPPED_TOKENS.get(self.backend_id, frozenset())
         argv = [token for token in plan.argv if token not in dropped]
+        # NF-2026-01384: opencode_cli runs the seat-declared reasoning variant,
+        # but only when the provisioned seat config declares it for this model.
+        if self.backend_id == "opencode_cli" and "--model" in argv[:-1]:
+            at = argv.index("--model") + 1
+            seat_config = (self._extra_env or {}).get(
+                runtime_adapters.OPENCODE_WORKER_CONFIG_ENV, ""
+            )
+            argv[at] = runtime_adapters.opencode_manager_variant_model(
+                argv[at], seat_config
+            )
         flag = _MCP_CONFIG_FLAGS.get(self.backend_id)
         if flag is not None and self.mcp_config_path is not None:
             argv.extend((flag, str(self.mcp_config_path)))
@@ -1023,8 +1033,8 @@ def provision_manager_seat_env(
     repo: Path | str,
     backend_id: str,
     *,
-    python_executable: str,
-    package_import_root: Path | str,
+    python_executable: str, package_import_root: Path | str,
+    model: str = "",
 ) -> dict[str, str]:
     """Seat MCP bindings for one manager backend: config files plus child env.
 
@@ -1072,9 +1082,9 @@ def provision_manager_seat_env(
         _write_0600(config_path, toml_text.encode("utf-8"))
         return {"CODEX_HOME": str(codex_home)}
     if backend_id == "opencode_cli":
+        command = [python_executable, "-m", "aiworkhub.server"]
         config = runtime_adapters.build_opencode_manager_mcp_config(
-            [python_executable, "-m", "aiworkhub.server"],
-            environment=server_env,
+            command, environment=server_env, model=model
         )
         return {
             runtime_adapters.OPENCODE_WORKER_CONFIG_ENV: (

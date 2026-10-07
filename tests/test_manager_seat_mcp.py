@@ -80,3 +80,58 @@ def test_opencode_manager_config_rejects_a_widened_permission() -> None:
     config["permission"]["awh_aiworkhub_agent_launch_task"] = ra.OPENCODE_PERMISSION_ALLOW
     with pytest.raises(ra.OpenCodeWorkerConfigError):
         ra.validate_opencode_manager_config(config)
+
+
+def test_opencode_manager_config_declares_the_reasoning_variant_for_a_provider_model() -> None:
+    model = "opencode-go/muse-1.3"
+    config = ra.build_opencode_manager_mcp_config(
+        [sys.executable, "-m", "aiworkhub.server"],
+        model=model,
+    )
+    assert config["provider"] == {
+        "opencode-go": {
+            "models": {
+                "muse-1.3": {
+                    "variants": {
+                        "aiworkhub": {"reasoningSummary": "detailed"}
+                    }
+                }
+            }
+        }
+    }
+    config_text = ra.serialize_opencode_manager_config(config)
+    assert (
+        ra.opencode_manager_variant_model(model, config_text)
+        == "opencode-go/muse-1.3#aiworkhub"
+    )
+    for bare_model in ("", "muse", "opencode-go/muse-1.3#high", "prov#x/m"):
+        built = ra.build_opencode_manager_mcp_config(
+            [sys.executable, "-m", "aiworkhub.server"],
+            model=bare_model,
+        )
+        assert "provider" not in built
+        assert ra.opencode_manager_variant_model(bare_model, config_text) == bare_model
+
+
+def test_opencode_provider_block_is_manager_only_and_exact() -> None:
+    provider_block = ra.build_opencode_manager_mcp_config(
+        [sys.executable, "-m", "aiworkhub.server"],
+        model="opencode-go/muse-1.3",
+    )["provider"]
+
+    worker_config = ra.build_opencode_worker_mcp_config(
+        [sys.executable, "-m", "aiworkhub.server"]
+    )
+    worker_config["provider"] = provider_block
+    with pytest.raises(ra.OpenCodeWorkerConfigError):
+        ra.validate_opencode_worker_config(worker_config)
+
+    widened = ra.build_opencode_manager_mcp_config(
+        [sys.executable, "-m", "aiworkhub.server"],
+        model="opencode-go/muse-1.3",
+    )
+    widened["provider"]["opencode-go"]["models"]["muse-1.3"]["variants"][
+        "aiworkhub"
+    ]["x"] = 1
+    with pytest.raises(ra.OpenCodeWorkerConfigError):
+        ra.validate_opencode_manager_config(widened)

@@ -119,6 +119,7 @@ def _seat_env_provider(repo_key: str) -> Callable[[str, str], Mapping[str, str]]
             backend_id,
             python_executable=sys.executable,
             package_import_root=worker_ai_tools_mcp.resolve_host_package_import_root(),
+            model=model,
         )
 
     return provide

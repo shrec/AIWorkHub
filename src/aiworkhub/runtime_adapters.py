@@ -1842,7 +1842,7 @@ def _validate_opencode_config(config: Any, *, role: str) -> Any:
     check_environment, permission_contract = _opencode_role_contract(role)
     if (
         not isinstance(config, dict)
-        or set(config) != {"$schema", "permission", "mcp"}
+        or set(config) - {"provider"} != {"$schema", "permission", "mcp"}
         or config["$schema"] != OPENCODE_CONFIG_SCHEMA_URL
     ):
         raise OpenCodeWorkerConfigError("malformed", "top_level")
@@ -1881,7 +1881,7 @@ def _validate_opencode_config(config: Any, *, role: str) -> Any:
     for name, action in permission.items():
         if action == OPENCODE_PERMISSION_ALLOW and len(name) > OPENCODE_NAME_MAX_CHARS:
             raise OpenCodeWorkerConfigError("tool_name_too_long", name)
-    return config
+    return _check_opencode_manager_provider(config, role)
 
 
 def _serialize_opencode_config(config: Any, *, role: str) -> str:
@@ -2078,13 +2078,93 @@ def opencode_manager_permission_contract() -> dict[str, str]:
     return permission
 
 
+OPENCODE_MANAGER_REASONING_VARIANT = "aiworkhub"
+
+
+def opencode_manager_reasoning_target(model: str) -> tuple[str, str] | None:
+    """Return the (provider, model) pair for the seat reasoning variant.
+
+    NF-2026-01384: the OpenCode manager seat may declare a provider model
+    variant with ``reasoningSummary: "detailed"``. An empty model, a model
+    without a provider ``/`` separator, or one that already carries an
+    explicit ``#variant`` is the owner's choice and is kept unchanged, so no
+    target is returned for those.
+    """
+    provider, separator, name = str(model or "").partition("/")
+    if not separator or not provider or not name or "#" in provider or "#" in name:
+        return None
+    return provider, name
+
+
+def _opencode_manager_provider_block(target: tuple[str, str]) -> dict[str, Any]:
+    """Declare the manager reasoning variant for one provider model."""
+    provider, name = target
+    return {
+        provider: {
+            "models": {
+                name: {
+                    "variants": {
+                        OPENCODE_MANAGER_REASONING_VARIANT: {
+                            "reasoningSummary": "detailed"
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
+def _check_opencode_manager_provider(config: Any, role: str) -> Any:
+    """Accept exactly the manager provider block, or no provider at all."""
+    if "provider" not in config:
+        return config
+    block = config["provider"]
+    try:
+        ((provider, entry),) = block.items()
+        ((name, _),) = entry["models"].items()
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise OpenCodeWorkerConfigError("malformed", "provider") from None
+    if role != OPENCODE_MANAGER_ROLE or block != _opencode_manager_provider_block(
+        (provider, name)
+    ):
+        raise OpenCodeWorkerConfigError("malformed", "provider")
+    return config
+
+
+def opencode_manager_variant_model(model: str, config_text: str) -> str:
+    """Return ``model#aiworkhub`` only when the seat config declares it.
+
+    NF-2026-01384: the turn runs the declared reasoning variant only when the
+    seat's serialized OpenCode config carries the exact provider block for
+    this model. An unparseable or non-matching config leaves the model
+    unchanged.
+    """
+    target = opencode_manager_reasoning_target(model)
+    if target is None or not config_text:
+        return model
+    try:
+        provider_block = json.loads(config_text).get("provider")
+    except (AttributeError, ValueError):
+        return model
+    if provider_block != _opencode_manager_provider_block(target):
+        return model
+    return f"{model}#{OPENCODE_MANAGER_REASONING_VARIANT}"
+
+
 def build_opencode_manager_mcp_config(
-    mcp_command: Sequence[str], *, environment: Mapping[str, str] | None = None
+    mcp_command: Sequence[str],
+    *,
+    environment: Mapping[str, str] | None = None,
+    model: str = "",
 ) -> dict[str, Any]:
     """Inert OpenCode config data: the seat server and the manager permissions."""
-    return _build_opencode_mcp_config(
+    config = _build_opencode_mcp_config(
         mcp_command, environment=environment, role=OPENCODE_MANAGER_ROLE
     )
+    target = opencode_manager_reasoning_target(model)
+    if target is not None:
+        config["provider"] = _opencode_manager_provider_block(target)
+    return config
 
 
 def validate_opencode_manager_config(config: Any) -> Any:
