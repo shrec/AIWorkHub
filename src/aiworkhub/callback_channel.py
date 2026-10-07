@@ -180,6 +180,7 @@ def _default_verified_manager_route() -> dict[str, Any]:
     """Resolve the verified manager route (identity) for THIS process.
 
     Uses the exact verified resolution the manager bootstrap uses --
+    ``core._manager_chat_seat_identity()`` (NF-2026-01383) first, then
     ``core._claude_manager_identity()`` then ``core._codex_manager_identity()``
     -- so the decision comes from the locally verified process chain / route
     record, never from chat prose or a guess. Returns ``{}`` when no manager
@@ -188,7 +189,11 @@ def _default_verified_manager_route() -> dict[str, Any]:
     try:
         from . import core
 
-        identity = core._claude_manager_identity() or core._codex_manager_identity()
+        identity = (
+            core._manager_chat_seat_identity()
+            or core._claude_manager_identity()
+            or core._codex_manager_identity()
+        )
     except Exception:  # noqa: BLE001 -- an unverifiable route is simply "no seat"
         return {}
     return dict(identity) if isinstance(identity, dict) else {}

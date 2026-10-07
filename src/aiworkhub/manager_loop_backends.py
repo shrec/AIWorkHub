@@ -1028,27 +1028,39 @@ def provision_manager_seat_env(
 ) -> dict[str, str]:
     """Seat MCP bindings for one manager backend: config files plus child env.
 
-    ``claude_cli`` needs nothing: it loads the project's ``.mcp.json``
-    ``AIWorkHub`` server with ``cwd=repo``. ``codex_cli`` gets an isolated
-    ``CODEX_HOME`` holding a manager ``config.toml`` (0600). ``opencode_cli``
-    gets the manager config through its config-content env (project config
-    disabled). The embedded server env carries the repo binding plus the
-    write gate (create needs it); launch is deliberately absent. Identity
-    (thread/episode) is never written here: it flows from the launching
-    gated child through process env inheritance, and forgery fails closed.
+    The seat identity binding (``AIWORKHUB_MANAGER_SEAT_BACKEND`` and
+    ``AIWORKHUB_MANAGER_SEAT_TOKEN``) is minted once per backend into a
+    0600 token file under ``.aiworkhub/runtime/manager-seat/`` and reused on
+    every later provision call, so the env token and the file always agree.
+    ``claude_cli`` needs no config file: it loads the project's ``.mcp.json``
+    ``AIWorkHub`` server with ``cwd=repo``, and Claude passes its environment
+    into that stdio server, so it returns exactly those two seat keys.
+    ``codex_cli`` gets an isolated ``CODEX_HOME`` holding a manager
+    ``config.toml`` (0600). ``opencode_cli`` gets the manager config through
+    its config-content env (project config disabled). The embedded server env
+    carries the repo binding plus the write gate (create needs it); launch is
+    deliberately absent. Thread and episode identity is never written here:
+    it flows from the launching gated child through process env inheritance,
+    and a forged token fails closed against the 0600 seat token file.
     """
     if backend_id not in MANAGER_BACKEND_IDS:
         raise ManagerLoopError(f"manager_backend_unsupported:{backend_id}")
     root = Path(repo).resolve()
+    seat_dir = root / ".aiworkhub" / "runtime" / MANAGER_SEAT_RUNTIME_DIRNAME
+    token = _read_or_mint_manager_seat_token(seat_dir / f"seat-token-{backend_id}")
     server_env = {
         "AIWORKHUB_REPO": str(root),
         "AIWORKHUB_REPO_ROOT": str(root),
         "AIWORKHUB_ALLOW_WRITES": "1",
         "PYTHONPATH": str(package_import_root),
+        "AIWORKHUB_MANAGER_SEAT_BACKEND": backend_id,
+        "AIWORKHUB_MANAGER_SEAT_TOKEN": token,
     }
     if backend_id == "claude_cli":
-        return {}
-    seat_dir = root / ".aiworkhub" / "runtime" / MANAGER_SEAT_RUNTIME_DIRNAME
+        return {
+            "AIWORKHUB_MANAGER_SEAT_BACKEND": backend_id,
+            "AIWORKHUB_MANAGER_SEAT_TOKEN": token,
+        }
     if backend_id == "codex_cli":
         codex_home = seat_dir / "codex-home"
         config_path = codex_home / "config.toml"
@@ -1071,3 +1083,18 @@ def provision_manager_seat_env(
             runtime_adapters.OPENCODE_DISABLE_PROJECT_CONFIG_ENV: "1",
         }
     raise ManagerLoopError(f"manager_seat_mcp_unsupported:{backend_id}")
+
+
+def _read_or_mint_manager_seat_token(token_path: Path) -> str:
+    """Return the backend's seat token, minting a 0600 file on first use."""
+    import secrets
+
+    try:
+        existing = token_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        existing = ""
+    if len(existing) == 64 and all(c in "0123456789abcdef" for c in existing):
+        return existing
+    token = secrets.token_hex(32)
+    _write_0600(token_path, token.encode("utf-8"))
+    return token

@@ -907,6 +907,45 @@ def _manager_chat_session_origin() -> str:
     return str(record.get("session_id") or "") if record else ""
 
 
+_MANAGER_SEAT_BACKEND_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+def _manager_chat_seat_identity() -> dict[str, str] | None:
+    """The Manager Chat seat this MCP server was provisioned for (NF-2026-01383).
+
+    ``provision_manager_seat_env`` gives the seat server its backend and a
+    per-backend 0600 token. Both must match the token file and the selected,
+    still-active Manager Chat record; anything else fails closed. The seat
+    inherits no Codex window route, so it is never route-pending.
+    """
+
+    backend = os.environ.get("AIWORKHUB_MANAGER_SEAT_BACKEND", "").strip()
+    token = os.environ.get("AIWORKHUB_MANAGER_SEAT_TOKEN", "").strip()
+    if not _MANAGER_SEAT_BACKEND_RE.fullmatch(backend) or len(token) != 64:
+        return None
+    token_path = repo_root() / ".aiworkhub" / "runtime" / "manager-seat" / f"seat-token-{backend}"
+    try:
+        expected = token_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8")):
+        return None
+    chat = _active_manager_chat_record()
+    if not chat or chat.get("backend_id") != backend:
+        return None
+    session_id = chat["session_id"]
+    return {
+        "provider": "manager_chat",
+        "session_id": session_id,
+        "thread_id": session_id,
+        "window_id": "",
+        "route_state": "ready",
+        "callback_supported": "true",
+        "backend_id": backend,
+        "model": chat.get("model", ""),
+    }
+
+
 def _review_target_callback_binding(
     target_task_id: str | None,
 ) -> tuple[str, str, str, str] | None:
@@ -1099,6 +1138,8 @@ def _verify_coordinator_capability(runner: str | None) -> tuple[bool, str]:
     out to taskctl.py and letting ITS ``_require_coordinator`` do the check
     inside a child process.
     """
+    if _manager_chat_seat_identity() is not None:
+        return True, "trusted_manager_chat_seat_route"
     claude_identity = _claude_manager_identity()
     if claude_identity is not None:
         return True, "trusted_claude_manager_route"
@@ -3360,7 +3401,7 @@ def manager_bootstrap(
     # GC pass picks it up: measured ~470 gate calls against 53 bootstraps in a
     # session, which is where the 2.77s per call was going.
     hygiene = _schedule_task_hygiene(run_when_due=bootstrap_call)
-    identity = _claude_manager_identity() or _codex_manager_identity()
+    identity = _manager_chat_seat_identity() or _claude_manager_identity() or _codex_manager_identity()
     provider = str((identity or {}).get("provider") or _current_chat_provider())
     root = repo_root()
     try:
@@ -3446,7 +3487,7 @@ def manager_bootstrap(
         # deliver on its own thread, but this reply must not look route-pending
         # just because that thread was never observed.
         previous = reply.get("manager_route") if isinstance(reply.get("manager_route"), dict) else {}
-        if previous:
+        if previous and str(previous.get("provider") or "") == "codex":
             reply["codex_route"] = dict(previous)
         reply["provider"] = "manager_chat"
         reply["role"] = "manager"
@@ -3502,7 +3543,7 @@ def repository_current() -> dict[str, Any]:
 
     root = repo_root()
     readiness = task_store.storage_readiness(root)
-    identity = _claude_manager_identity() or _codex_manager_identity()
+    identity = _manager_chat_seat_identity() or _claude_manager_identity() or _codex_manager_identity()
     return {
         "ok": bool(readiness.ready),
         "schema_id": "aiworkhub.repository_current.v1",
@@ -4200,7 +4241,7 @@ def create_task(
     callback route instead of the live one (NF-2026-01095). The manager
     identity and capability gates still apply.
     """
-    identity = _claude_manager_identity() or _codex_manager_identity()
+    identity = _manager_chat_seat_identity() or _claude_manager_identity() or _codex_manager_identity()
     if identity is None:
         return _lifecycle_error("manager_identity_required:task_create", 126)
     # Creation has no pre-existing card whose runner/topic could authorize the
@@ -5408,7 +5449,7 @@ def _sdlc_verified_repo() -> tuple[Any, str] | dict[str, Any]:
 
 
 def _sdlc_case_write_authority() -> dict[str, Any] | None:
-    identity = _claude_manager_identity() or _codex_manager_identity()
+    identity = _manager_chat_seat_identity() or _claude_manager_identity() or _codex_manager_identity()
     if identity is None:
         return _lifecycle_error("manager_identity_required:sdlc_case", 126)
     blocked = _canonical_write_gate("sdlc-case")

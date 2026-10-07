@@ -551,7 +551,14 @@ def _manager_rules() -> str:
     from . import agent_tool_instructions
 
     rules = agent_tool_instructions.POLICY.role
-    return "\n".join(["Manager role:", *(f"- {rule}" for rule in rules)])
+    return "\n".join(  # NF-2026-01383: seat role first
+        [
+            "Manager role:",
+            "- This Manager Chat session holds the manager seat for this repository: you run the project, create/launch/review cards and decide by measurement.",
+            "- The context section is history: any route, version, callback or blocker fact in it is stale until a live AIWorkHub MCP call confirms it; probe (aiworkhub_manager_bootstrap) instead of refusing on it.",
+            *(f"- {rule}" for rule in rules),
+        ]
+    )
 
 def _manager_event_write(**fields: Any) -> Mapping[str, Any]:
     """Bind this turn to the manager-chat thread, the way Codex binds its own.

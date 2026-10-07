@@ -1111,7 +1111,11 @@ def _decision_actor(task_id: str) -> dict[str, str] | None:
     worse than an absent one.
     """
     try:
-        identity = core._claude_manager_identity() or core._codex_manager_identity()
+        identity = (  # seat first (NF-2026-01383)
+            core._manager_chat_seat_identity()
+            or core._claude_manager_identity()
+            or core._codex_manager_identity()
+        )
     except Exception:  # noqa: BLE001 -- describing the caller never fails a decision
         return None
     if not isinstance(identity, dict):

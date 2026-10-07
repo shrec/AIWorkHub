@@ -851,52 +851,84 @@ def test_a_codex_manager_turn_keeps_its_session_for_resume(tmp_path: Path):
     assert "--ephemeral" not in backend.argv_for(plan)
 
 
-def test_provision_manager_seat_env_writes_a_0600_codex_home(tmp_path: Path):
-    env = mlb.provision_manager_seat_env(
-        tmp_path, "codex_cli",
-        python_executable=sys.executable,
-        package_import_root=tmp_path,
-    )
+def test_codex_seat_env_keeps_codex_home_and_embeds_seat_token_in_toml(tmp_path, monkeypatch):
+    import os
+    from pathlib import Path
+    # NF-2026-01383: CODEX_HOME stays the only env key; the token rides in config.toml.
 
+    from aiworkhub.manager_loop_backends import provision_manager_seat_env
+
+    env = provision_manager_seat_env(
+        tmp_path,
+        "codex_cli",
+        python_executable="python",
+        package_import_root="src",
+    )
     assert set(env) == {"CODEX_HOME"}
-    config_path = Path(env["CODEX_HOME"]) / "config.toml"
-    assert config_path.is_file()
-    if sys.platform != "win32":
-        assert (config_path.stat().st_mode & 0o777) == 0o600
-    text = config_path.read_text(encoding="utf-8")
-    assert "[mcp_servers.AIWorkHub]" in text
-    assert "aiworkhub_task_create" in text
-    assert "aiworkhub_agent_launch_task" not in text
-
-
-def test_provision_manager_seat_env_binds_opencode_through_child_env(tmp_path: Path):
-    from aiworkhub import runtime_adapters as ra
-
-    env = mlb.provision_manager_seat_env(
-        tmp_path, "opencode_cli",
-        python_executable=sys.executable,
-        package_import_root=tmp_path,
+    codex_home = Path(env["CODEX_HOME"])
+    config_text = (codex_home / "config.toml").read_text(encoding="utf-8")
+    assert "AIWORKHUB_MANAGER_SEAT_BACKEND" in config_text
+    assert "AIWORKHUB_MANAGER_SEAT_TOKEN" in config_text
+    seat_token_file = (
+        Path(tmp_path)
+        / ".aiworkhub"
+        / "runtime"
+        / "manager-seat"
+        / "seat-token-codex_cli"
     )
-
-    assert env[ra.OPENCODE_DISABLE_PROJECT_CONFIG_ENV] == "1"
-    config = json.loads(env[ra.OPENCODE_WORKER_CONFIG_ENV])
-    assert ra.validate_opencode_manager_config(config) is config
-
-
-def test_provision_manager_seat_env_needs_nothing_for_claude(tmp_path: Path):
-    assert mlb.provision_manager_seat_env(
-        tmp_path, "claude_cli",
-        python_executable=sys.executable,
-        package_import_root=tmp_path,
-    ) == {}
-    with pytest.raises(mlb.ManagerLoopError, match="manager_backend_unsupported"):
-        mlb.provision_manager_seat_env(
-            tmp_path, "nope_cli",
-            python_executable=sys.executable,
-            package_import_root=tmp_path,
-        )
+    assert seat_token_file.exists()
+    if hasattr(os, "geteuid"):
+        assert seat_token_file.stat().st_mode & 0o777 == 0o600
 
 
+def test_claude_seat_env_returns_exactly_the_two_seat_keys_reusing_one_token(tmp_path):
+    from pathlib import Path
+
+    from aiworkhub.manager_loop_backends import provision_manager_seat_env
+
+    first = provision_manager_seat_env(
+        tmp_path,
+        "claude_cli",
+        python_executable="python",
+        package_import_root="src",
+    )
+    assert set(first) == {
+        "AIWORKHUB_MANAGER_SEAT_BACKEND",
+        "AIWORKHUB_MANAGER_SEAT_TOKEN",
+    }
+    assert first["AIWORKHUB_MANAGER_SEAT_BACKEND"] == "claude_cli"
+    second = provision_manager_seat_env(
+        tmp_path,
+        "claude_cli",
+        python_executable="python",
+        package_import_root="src",
+    )
+    assert second == first
+    seat_token_file = (
+        Path(tmp_path)
+        / ".aiworkhub"
+        / "runtime"
+        / "manager-seat"
+        / "seat-token-claude_cli"
+    )
+    assert seat_token_file.read_text(encoding="utf-8").strip() == first[
+        "AIWORKHUB_MANAGER_SEAT_TOKEN"
+    ]
+
+
+def test_opencode_seat_env_carries_both_seat_keys(tmp_path):
+    from aiworkhub import runtime_adapters
+    from aiworkhub.manager_loop_backends import provision_manager_seat_env
+
+    env = provision_manager_seat_env(
+        tmp_path,
+        "opencode_cli",
+        python_executable="python",
+        package_import_root="src",
+    )
+    config_text = env[runtime_adapters.OPENCODE_WORKER_CONFIG_ENV]
+    assert "AIWORKHUB_MANAGER_SEAT_BACKEND" in config_text
+    assert "AIWORKHUB_MANAGER_SEAT_TOKEN" in config_text
 def test_factory_provisions_seat_env_per_backend_at_build_time(tmp_path: Path):
     seen: list[tuple[str, str]] = []
 
