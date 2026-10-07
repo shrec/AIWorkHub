@@ -549,9 +549,39 @@ def test_launch_with_an_explicit_tuple_derives_nothing(tmp_path, monkeypatch):
         runner="claude_opus-5",
         topic="coding",
         adapter_id="claude_cli",
+        model="claude-opus-5",
     )
     assert result["ok"] is True
     assert "launch_identity_derivation" not in result
+
+
+def test_an_explicit_tuple_without_a_model_pins_the_canonical_model(tmp_path, monkeypatch):
+    # NF-2026-01407: a claude_cli launch with model=None ran on the CLI's
+    # account default model instead of the runner's canonical route.
+    card = _launchable_card(task_id="T_EXPLICIT")
+    manager = _derivation_manager(tmp_path, card)
+    seen: dict[str, object] = {}
+
+    def _capture(**kwargs):
+        seen.update(kwargs)
+        return {"ok": True, "task_id": kwargs["task_id"]}
+
+    def _no_card_read(*_args, **_kwargs):
+        raise AssertionError("an explicit tuple needs no card read")
+
+    monkeypatch.setattr(manager, "_launch_direct_for_tests", _capture)
+    monkeypatch.setattr(manager, "_show_task", _no_card_read)
+    result = manager.launch(
+        task_id="T_EXPLICIT", runner="claude_opus-5", topic="coding", adapter_id="claude_cli"
+    )
+    assert result["ok"] is True
+    assert seen["model"] == "claude-opus-5"
+    assert result["launch_identity_derivation"]["derived_from"] == {"model": "canonical_workforce"}
+    seen.clear()
+    # An underivable explicit tuple keeps the prior unpinned launch, never a raw raise.
+    result = manager.launch(task_id="T_EXPLICIT", runner=" ", topic="coding", adapter_id="claude_cli")
+    assert result["ok"] is True
+    assert seen["model"] is None
 
 
 def _refuse_any_claim(manager, monkeypatch):

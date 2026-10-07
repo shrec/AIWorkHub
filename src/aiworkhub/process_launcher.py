@@ -73,7 +73,8 @@ from . import storage_retention, terminal_failure_classification
 from .process_launcher_acceptance import accepted_outcome_receipt as _accepted_outcome_receipt
 from .process_launcher_acceptance import changed_path_hashes as _changed_path_hashes
 from .process_launcher_acceptance import finished_acceptance_result as _finished_acceptance_result
-from .process_launcher_accept_review import _accept_manager_identity
+# Aliased: _accept_manager_identity is an accept_review local, never a launcher seam.
+from .process_launcher_accept_review import _accept_manager_identity as _calling_manager_identity
 from .process_launcher_accept_review import accept_preview as _accept_preview_impl
 from .process_launcher_accept_review import accept_review as _accept_review_impl
 from .process_launcher_launch_isolated import launch_isolated as _launch_isolated_impl
@@ -141,8 +142,10 @@ from .process_launcher_provider_failures import (
     _VSCODE_LM_BALANCE_EXHAUSTED as _VSCODE_LM_BALANCE_EXHAUSTED,
     _VSCODE_LM_PROVIDER_ERROR_SOURCE as _VSCODE_LM_PROVIDER_ERROR_SOURCE,
     _bounded_response_body_machine_code as _bounded_response_body_machine_code,
+    _coordinator_bound_context_ack,
     _is_bounded_machine_code as _is_bounded_machine_code,
     _opencode_provider_refusal_from_event as _opencode_provider_refusal_from_event,
+    _project_context_receipt_from_output,
     _provider_auth_failure_from_output,
     _provider_model_rejection_from_output,
     _provider_timeout_failure_from_output as _provider_timeout_failure_from_output,
@@ -1991,175 +1994,6 @@ def _launch_source_graph_request(
         return None
     request = (card.get("project_context") or {}).get("source_graph")
     return request if isinstance(request, dict) else None
-
-
-def _receipt_text_candidates(raw_line: str) -> list[str]:
-    """Return only provider-authenticated assistant-output payloads.
-
-    The worker prompt contains the complete acknowledgement template.  Raw
-    stdout therefore has no acknowledgement authority: a provider that echoes
-    its input would otherwise replay that template verbatim.  Supported JSONL
-    adapters bind assistant text to a typed output envelope at the
-    process/adapter boundary.
-    """
-    try:
-        event = json.loads(raw_line)
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(event, dict):
-        return []
-
-    candidates: list[str] = []
-
-    def add(value: Any) -> None:
-        if isinstance(value, str) and value.strip():
-            candidates.append(value.strip())
-
-    item = event.get("item")
-    if (
-        isinstance(item, dict)
-        and str(item.get("type") or "") == "agent_message"
-    ):
-        add(item.get("text"))  # Codex JSONL assistant output
-
-    data = event.get("data")
-    if (
-        isinstance(data, dict)
-        and str(event.get("type") or "") == "assistant.message"
-    ):
-        add(data.get("content"))  # DeepSeek/Copilot assistant output
-
-    message = event.get("message")
-    if (
-        isinstance(message, dict)
-        and str(message.get("role") or "") == "assistant"
-    ):
-        content = message.get("content")
-        if isinstance(content, list):
-            for block in content[:32]:
-                if isinstance(block, dict):
-                    add(block.get("text"))  # Claude stream-json
-        else:
-            add(content)
-    return candidates[:40]
-
-
-def _project_context_receipt_from_output(
-    path: Path,
-    *,
-    expected_bundle_sha256: str = "",
-    expected_request_id: str = "",
-) -> dict[str, Any]:
-    result = {
-        "schema_id": project_context.RECEIPT_SCHEMA_ID,
-        "acknowledged": False,
-        "bundle_sha256": "",
-        "prompt_sha256": "",
-        "request_id": "",
-        "section_count": 0,
-        "reason": "receipt_not_found",
-    }
-    # A receipt is normally emitted near the beginning of a streaming JSONL
-    # run.  Reading only the final 16 KiB loses it as soon as tool results make
-    # the stream larger (the 0.6.11 live canary produced 135 KiB).  Scan a
-    # bounded whole log; for unusually large logs keep symmetric head/tail
-    # windows so early receipts and late adapter summaries remain visible.
-    try:
-        size = path.stat().st_size if path.is_file() and not path.is_symlink() else 0
-    except OSError:
-        size = 0
-    if size <= MAX_RECEIPT_SCAN_BYTES:
-        text = _read_byte_range(path, 0, size)
-    else:
-        half = MAX_RECEIPT_SCAN_BYTES // 2
-        text = _read_byte_range(path, 0, half) + "\n" + _read_byte_range(path, size - half, half)
-    prefix = "PROJECT_CONTEXT_RECEIPT:"
-    expected = expected_bundle_sha256.strip().lower()
-    expected_request = expected_request_id.strip()
-    for line in reversed(text.splitlines()):
-        for candidate in _receipt_text_candidates(line):
-            marker = candidate.rfind(prefix)
-            if marker >= 0:
-                candidate = candidate[marker + len(prefix):].strip()
-            try:
-                value, _end = json.JSONDecoder().raw_decode(candidate)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(value, dict) or value.get("schema_id") != project_context.RECEIPT_SCHEMA_ID:
-                continue
-            bundle_sha = str(value.get("bundle_sha256") or "").strip().lower()
-            receipt_request = str(value.get("request_id") or "").strip()
-            section_raw = value.get("section_count") or 0
-            section_count = int(section_raw) if str(section_raw).isdigit() else 0
-            valid_sha = len(bundle_sha) == 64 and all(ch in "0123456789abcdef" for ch in bundle_sha)
-            matches = not expected or bundle_sha == expected
-            request_matches = not expected_request or receipt_request == expected_request
-            acknowledged = (
-                value.get("acknowledged") is True
-                and valid_sha
-                and matches
-                and request_matches
-                and section_count > 0
-            )
-            reason = str(value.get("reason") or "")[:160]
-            if not valid_sha:
-                reason = "receipt_bundle_sha256_invalid"
-            elif not matches:
-                reason = "receipt_bundle_sha256_mismatch"
-            elif not request_matches:
-                reason = "receipt_request_id_mismatch"
-            elif section_count <= 0:
-                reason = "receipt_section_count_invalid"
-            return {
-                "schema_id": project_context.RECEIPT_SCHEMA_ID,
-                "acknowledged": acknowledged,
-                "bundle_sha256": bundle_sha[:80],
-                "prompt_sha256": str(value.get("prompt_sha256") or "")[:80],
-                "request_id": receipt_request[:160],
-                "section_count": section_count,
-                "reason": reason,
-            }
-    return result
-
-
-def _coordinator_bound_context_ack(
-    context_ack: dict[str, Any],
-    worker_mcp_gate: Mapping[str, Any] | None,
-    metadata: Mapping[str, Any],
-    request_id: str,
-) -> dict[str, Any]:
-    """Report the gate's coordinator-bound acknowledgement (NF-2026-01395).
-
-    A worker told not to print the receipt (claude_cli) leaves none in stdout,
-    so the stdout scan says ``receipt_not_found`` although the worker MCP gate
-    already acknowledged the injected bundle from coordinator facts.  The
-    evidence then reports that server-derived acknowledgement.
-    """
-    source = (worker_mcp_gate or {}).get("injected_context_acknowledgement_source")
-    # Only an absent receipt is upgraded; a found but unverifiable receipt keeps
-    # its specific failure reason and observed digest.
-    if context_ack.get("reason") != "receipt_not_found" or source != "coordinator_prompt_binding":
-        return context_ack
-    context = metadata.get("project_context")
-    delivery = metadata.get("project_context_delivery")
-    bundle_sha = str(context.get("bundle_sha256") or "") if isinstance(context, Mapping) else ""
-    section_count = delivery.get("section_count") if isinstance(delivery, Mapping) else None
-    # The receipt path's invariants: a 64-hex digest and a positive section count.
-    if not (
-        len(bundle_sha) == 64
-        and all(ch in "0123456789abcdef" for ch in bundle_sha)
-        and type(section_count) is int
-        and section_count > 0
-    ):
-        return context_ack
-    return {
-        **context_ack,
-        "acknowledged": True,
-        "bundle_sha256": bundle_sha,
-        "request_id": request_id[:160],
-        "section_count": section_count,
-        "reason": "coordinator_prompt_binding",
-    }
 
 
 REASONING_CONTEXT_ATTEMPT_EVENT_SCHEMA_ID = "aiworkhub.reasoning_context_attempt_event.v1"
@@ -5997,6 +5831,20 @@ class ProcessManager:
             topic = identity_derivation["topic"]
             adapter_id = identity_derivation["adapter_id"]
             model = identity_derivation["model"]
+        elif not model:
+            # NF-2026-01407: an explicit runner/topic/adapter without a model
+            # still pins the canonical route model; unpinned, claude_cli ran on
+            # the CLI's account default. Nothing else is derived: no card read.
+            try:
+                identity_derivation = derive_launch_identity(
+                    self.repo, {}, runner=runner, topic=topic, adapter_id=adapter_id
+                )
+            except LaunchRejected:
+                # An underivable explicit tuple keeps the prior unpinned launch;
+                # preflight still validates the tuple itself.
+                identity_derivation = None
+            else:
+                model = identity_derivation["model"]
         isolated_kwargs: dict[str, Any] = {
             "task_id": task_id,
             "runner": runner,
@@ -13562,7 +13410,7 @@ class ProcessManager:
                     # NF-2026-01394: provenance names the verified calling
                     # manager, never a hardcoded Codex default.
                     actor=str(
-                        _accept_manager_identity(core).get("provider")
+                        _calling_manager_identity(core).get("provider")
                         or core._current_chat_provider()
                     ),
                 )
