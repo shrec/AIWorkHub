@@ -139,3 +139,26 @@ def test_manifest_fallback_drops_new_shell_residue(make) -> None:
         "other.txt",
         "out/result.txt",
     ]
+
+
+def test_python_bytecode_cache_is_residue_not_scope(make, repo: Path) -> None:
+    ws = make("residue-pycache", ["out/result.txt"])
+    (ws.path / "out" / "result.txt").write_bytes(b"result-v2\n")
+    (ws.path / "tools" / "__pycache__").mkdir(parents=True)
+    _write(ws.path / "tools" / "__pycache__" / "fetch_klines.cpython-312.pyc", b"bytecode")
+
+    changed = worker_workspace.enforce_scope(ws)
+    assert changed == ["out/result.txt"]
+    assert worker_workspace.promote(ws, changed) == ["out/result.txt"]
+    assert not (repo / "tools").exists()
+
+
+def test_bytecode_outside_pycache_still_fails_scope(make) -> None:
+    ws = make("residue-loose-pyc", ["out/result.txt"])
+    (ws.path / "secrets").mkdir()
+    _write(ws.path / "secrets" / "payload.pyc", b"not bytecode residue\n")
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match=r"scope_violation:secrets/payload\.pyc"
+    ):
+        worker_workspace.enforce_scope(ws)

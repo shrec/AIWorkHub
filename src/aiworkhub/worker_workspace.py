@@ -1122,9 +1122,9 @@ def _worktree_manifest(root: Path) -> dict[str, str | None]:
 # Shell artifacts a worker's environment leaves behind without the worker
 # meaning to write them (NF-2026-01345): a PowerShell-style ``> $null`` or a
 # cmd-style ``> nul`` run under bash creates an empty regular file of that name,
-# and a crashing MSYS/Cygwin ``bash.exe`` drops ``*.stackdump``.  They are
-# environment residue, not candidate output, so they must neither fail the
-# scope check nor ever be promoted into the canonical tree.
+# a crashing MSYS/Cygwin ``bash.exe`` drops ``*.stackdump``, and a validator that
+# imports a module drops ``__pycache__/*.pyc`` (NF-2026-01390).  They are environment
+# residue, not candidate output: never a scope failure, never promoted.
 _SHELL_RESIDUE_NULL_NAMES = frozenset({"$null", "nul"})
 
 
@@ -1143,7 +1143,8 @@ def _is_shell_residue(workspace: WorkerWorkspace, relative: str) -> bool:
     target = workspace.path / normalized
     name = target.name.lower()
     is_null_sink = name in _SHELL_RESIDUE_NULL_NAMES
-    if not is_null_sink and not name.endswith(".stackdump"):
+    is_bytecode = name.endswith(".pyc") and target.parent.name == "__pycache__"
+    if not is_null_sink and not is_bytecode and not name.endswith(".stackdump"):
         return False
     try:
         # ``Path.is_file()`` is False for a Windows ``nul`` (a reserved device
