@@ -123,6 +123,10 @@ def _merge_file(
                 str(base_tmp),
                 str(candidate_path),
             ],
+            # NF-2026-01401: never inside the caller's repository; in the
+            # AppContainer that cwd is a worker worktree whose gitdir the
+            # sandbox cannot read, and git merge-file dies there.
+            cwd=home,
             capture_output=True,
             timeout=60,
         )
@@ -133,7 +137,9 @@ def _merge_file(
             os.unlink(base_tmp)
         except OSError:
             pass
-    if result.returncode < 0 or result.returncode == 255:
+    # git caps a conflict count at 127; 128+ is a die/usage exit and 255 a
+    # negative error on Windows, never a conflict count (NF-2026-01401).
+    if result.returncode < 0 or result.returncode >= 128:
         return None, b""
     return result.returncode, result.stdout
 

@@ -267,3 +267,34 @@ def test_promotion_merge_errors_map_to_promotion_conflict():
         "promotion_merge_parent_changed:a",
     ):
         assert terminal_state_for_workspace_error(ww.WorkspaceError(error)) == "promotion_conflict"
+
+
+def test_merge_runs_outside_an_unreadable_caller_repository(monkeypatch, tmp_path, repo):
+    # NF-2026-01401: inside the AppContainer the validation cwd is a worker
+    # worktree whose gitdir the sandbox cannot read; git merge-file died with 128.
+    ws_a = _make_workspace(monkeypatch, tmp_path, repo, "nf1401A1")
+    ws_b = _make_workspace(monkeypatch, tmp_path, repo, "nf1401B1")
+    a_bytes = BASE_TEXT.replace(b"bravo\n", b"bravo_A\n")
+    (ws_a.path / "shared.txt").write_bytes(a_bytes)
+    (ws_b.path / "shared.txt").write_bytes(BASE_TEXT.replace(b"delta\n", b"delta_B\n"))
+    ww.promote(ws_a, ["shared.txt"])
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    (caller / ".git").write_text(f"gitdir: {tmp_path / 'missing' / '.git'}\n", encoding="utf-8")
+    monkeypatch.chdir(caller)
+
+    assert promotion_merge.promote_merged(ws_b, ["shared.txt"]) == ["shared.txt"]
+    assert (repo / "shared.txt").read_bytes() == a_bytes.replace(b"delta\n", b"delta_B\n")
+
+
+def test_git_die_exit_is_never_a_conflict_count(monkeypatch, tmp_path):
+    for code in (128, 129, 255):
+        monkeypatch.setattr(
+            promotion_merge.subprocess,
+            "run",
+            lambda argv, *a, _code=code, **k: subprocess.CompletedProcess(argv, _code, b"", b""),
+        )
+        assert promotion_merge._merge_file(tmp_path, tmp_path / "p", b"", tmp_path / "c") == (
+            None,
+            b"",
+        )
