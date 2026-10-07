@@ -628,6 +628,7 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "platform_io.py",
         # worker_workspace imports its promotion write helper relatively (NF-2026-01198).
         "promotion_write.py",
+        "promotion_merge.py",  # three-way promotion merge, imported locally (NF-2026-01381)
         # NF-2026-00841: worker_workspace loads this sibling at runtime through
         # ``__import__``, so the seed closure must carry it and this fixture
         # repository must therefore track it too.

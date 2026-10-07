@@ -13646,18 +13646,18 @@ class ProcessManager:
         return refuse_version_regression(projections)
 
     def _promote_accepted_candidate(
-        self, workspace: Any, changed: list[str]
+        self, workspace: Any, changed: list[str], merged_hashes: dict[str, str] | None = None
     ) -> list[str]:
         """Promote the sealed candidate, refusing a backwards version first.
 
-        This is the sole promotion write seam in :meth:`accept_review`: the
-        version-regression guard runs BEFORE ``promote`` writes a single byte,
-        so a stale-base candidate carrying an older version constant is refused
-        rather than promoted and then noticed by hand (NF-2026-00315).
+        The version-regression guard runs BEFORE any byte is written (NF-2026-00315);
+        a workspace with recorded base blobs promotes through the three-way merge.
         """
-
         self._refuse_backwards_version_promotion(workspace, changed)
-        return promote(workspace, changed)
+        if not getattr(workspace, "parent_baseline_blob", None):
+            return promote(workspace, changed)
+        from .promotion_merge import promote_merged  # NF-2026-01381 part A
+        return promote_merged(workspace, changed, merged_hashes=merged_hashes, promote_fn=promote)
 
     def _close_accepted_task_needfix(
         self, task_id: str, request_id: str

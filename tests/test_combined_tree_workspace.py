@@ -70,6 +70,7 @@ def test_combined_tree_contains_current_canonical_delta_and_candidate(
                 "canonical_delta_paths": ["base.txt"],
                 "observed_candidate_paths": ["feature.txt", "shared.txt"],
                 "candidate_paths_already_in_canonical": [],
+                "merged_paths": {},
             }
         finally:
             cleanup_workspace(combined.repo, combined.path, combined.home)

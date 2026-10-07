@@ -1077,7 +1077,7 @@ class _AcceptManager:
         return None
 
     # -- promotion seams ----------------------------------------------------
-    def _promote_accepted_candidate(self, workspace, changed) -> list[str]:
+    def _promote_accepted_candidate(self, workspace, changed, merged_hashes=None) -> list[str]:
         return list(changed)
 
     def _close_accepted_task_needfix(self, task_id, request_id) -> dict:

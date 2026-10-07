@@ -2517,8 +2517,11 @@ def accept_review(
                 "request_id": request_id,
                 "task_id": task_id,
             }
-
-        promoted = self._promote_accepted_candidate(workspace, changed)
+        # Promote exactly the merged bytes validated in the combined tree (NF-2026-01381 part A).
+        combined_tree = full_validation_snapshot.get("combined_tree") or {}
+        promoted = self._promote_accepted_candidate(
+            workspace, changed, merged_hashes=combined_tree.get("merged_paths")
+        )
 
         try:
             accepted_outcome_receipt = _accepted_outcome_receipt(

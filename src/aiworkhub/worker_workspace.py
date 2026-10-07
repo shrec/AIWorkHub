@@ -38,7 +38,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
@@ -556,6 +556,7 @@ class WorkerWorkspace:
     # work invisible by moving ``HEAD``.  ``None`` only for legacy metadata that
     # predates the pin, in which case the symbolic ``HEAD`` fallback is used.
     base_oid: str | None = None
+    parent_baseline_blob: dict[str, str] = field(default_factory=dict)
 
     def as_metadata(self) -> dict[str, Any]:
         return {
@@ -570,6 +571,7 @@ class WorkerWorkspace:
             "provisioning_timings_ms": dict(self.provisioning_timings_ms or {}),
             "inherited_rework_paths": list(self.inherited_rework_paths),
             "base_oid": self.base_oid,
+            "parent_baseline_blob": dict(self.parent_baseline_blob),
         }
 
     @classmethod
@@ -605,6 +607,7 @@ class WorkerWorkspace:
                 if payload.get("base_oid") is not None
                 else None
             ),
+            parent_baseline_blob=dict(payload.get("parent_baseline_blob") or {}),
         )
 
 
@@ -6088,6 +6091,8 @@ def create_workspace(
     except WorkspaceError:
         cleanup_workspace(repo, path, home)
         raise
+    from .promotion_merge import record_base_blobs
+
     workspace = WorkerWorkspace(
         request_id=request_id,
         repo=repo,
@@ -6103,6 +6108,7 @@ def create_workspace(
         },
         inherited_rework_paths=tuple(sorted(set(rework_seeded))),
         base_oid=base_oid,
+        parent_baseline_blob=record_base_blobs(baseline_root, baseline),
     )
     # Seal the exit-contract inputs the worker MCP server needs for
     # ``aiworkhub_worker_exit_preflight``.  Advisory only; never fails a launch.
@@ -6648,8 +6654,14 @@ def create_combined_validation_workspace(
                 for relative in baseline_paths
             },
         )
+        from .promotion_merge import merged_path_hashes, plan_merges  # NF-2026-01381 part A
+
+        merges = plan_merges(source_workspace, candidate)
         for relative in candidate:
-            _overlay_regular_path(source_workspace.path, combined.path, relative)
+            if relative in merges:
+                (combined.path / relative).write_bytes(merges[relative])
+            else:
+                _overlay_regular_path(source_workspace.path, combined.path, relative)
         observed = changed_paths(combined)
         unexpected = sorted(set(observed) - set(candidate))
         not_observed = sorted(set(candidate) - set(observed))
@@ -6676,6 +6688,7 @@ def create_combined_validation_workspace(
             "canonical_delta_paths": canonical_delta,
             "observed_candidate_paths": observed,
             "candidate_paths_already_in_canonical": already_in_canonical,
+            "merged_paths": merged_path_hashes(merges),
         }
     except Exception:
         cleanup_workspace(repo, combined.path, combined.home)

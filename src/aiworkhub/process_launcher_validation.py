@@ -502,7 +502,8 @@ def terminal_state_for_workspace_error(exc: WorkspaceError) -> str:
     )
     if error.startswith(validation_failures):
         return "validation_failed"
-    if error.startswith(("parent_changed", "promotion_scope")):
+    # promotion_merge_* errors (conflict / changed since validation / parent changed) are promotion conflicts (NF-2026-01381).
+    if error.startswith(("parent_changed", "promotion_scope", "promotion_merge")):
         return "promotion_conflict"
     if error.startswith(VALIDATION_ENVIRONMENT_RESTRICTION_PREFIXES):
         return "finalize_failed"
