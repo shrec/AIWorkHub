@@ -6552,11 +6552,13 @@ def _canonical_worktree_delta_paths(repo: Path) -> list[str]:
     # index.lock) is byte-range locked by a concurrent holder, and Windows fails
     # the copy's read with a bare "[Errno 13] Permission denied". Live runtime
     # state is never canonical content, so the combined tree leaves it out.
+    # NF-2026-01391: git lists an untracked nested repository or worktree as one
+    # ``dir/`` row it never descends into; it is not this repository's content.
     rows = sorted(
         {
             _relative_repo_path(value)
             for value in (tracked.stdout + untracked.stdout).split("\x00")
-            if value
+            if value and not value.endswith("/")
             and not (
                 value.startswith(f"{HUB_DIRNAME}/")
                 and any(

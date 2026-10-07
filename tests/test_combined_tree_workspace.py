@@ -227,3 +227,45 @@ def test_combined_tree_preserves_current_canonical_deletion(
             cleanup_workspace(combined.repo, combined.path, combined.home)
     finally:
         cleanup_workspace(candidate.repo, candidate.path, candidate.home)
+
+
+def test_combined_tree_skips_untracked_nested_worktree(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "AIWorkHub Test")
+    (repo / "candidate.txt").write_text("old\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "base")
+    # NF-2026-01391: an unrelated untracked nested worktree (a Claude Code agent
+    # worktree) is one ``dir/`` row of git's untracked listing.
+    _git(repo, "worktree", "add", "--detach", ".claude/worktrees/agent-x")
+    (repo / "loose.txt").write_text("loose\n", encoding="utf-8")
+
+    monkeypatch.setenv("AIWORKHUB_WORKTREE_ROOT", str(tmp_path / "worktrees"))
+    card = {
+        "allowed_writes": ["candidate.txt"],
+        "read_first": [],
+        "immutable_inputs": [],
+        "required_outputs": [],
+    }
+    candidate = create_workspace(repo, "candidate_nested_request", card, "validation")
+    try:
+        (candidate.path / "candidate.txt").write_text("new\n", encoding="utf-8")
+        combined, evidence = create_combined_validation_workspace(
+            candidate,
+            card,
+            ["candidate.txt"],
+        )
+        try:
+            assert evidence["canonical_delta_paths"] == ["loose.txt"]
+            assert (combined.path / "loose.txt").read_text(encoding="utf-8") == "loose\n"
+            assert not (combined.path / ".claude").exists()
+        finally:
+            cleanup_workspace(combined.repo, combined.path, combined.home)
+    finally:
+        cleanup_workspace(candidate.repo, candidate.path, candidate.home)
