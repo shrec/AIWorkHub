@@ -265,6 +265,72 @@ def test_several_production_roots_still_require_an_explicit_scope() -> None:
     assert project_context._skill_selection_context(card) is not None
 
 
+def test_undeclared_implementation_card_derives_a_context() -> None:
+    card = {
+        "allowed_writes": ["src/aiworkhub/x.py"],
+        "validation": ["python -m pytest tests/test_x.py -q"],
+    }
+    ctx = project_context._skill_selection_context(card)
+    assert ctx is not None
+    assert ctx["stage"] == "implementation"
+    assert "code_change" in ctx["triggers"]
+    assert "quality_gate" in ctx["applicability"]
+    assert ctx["risk"] == "medium"
+    assert ctx["task_family"] == "implementation"
+
+
+def test_declared_vocabulary_wins_over_derivation() -> None:
+    card = {
+        "allowed_writes": ["src/aiworkhub/x.py"],
+        "validation": ["python -m pytest tests/test_x.py -q"],
+        "skill_task_family": "bugfix",
+        "skill_stage": "review",
+        "skill_triggers": ["unknown_or_empty_result"],
+        "skill_applicability": ["observability_surface"],
+        "risk_tier": "high",
+    }
+    ctx = project_context._skill_selection_context(card)
+    assert ctx is not None
+    assert ctx["task_family"] == "bugfix"
+    assert ctx["stage"] == "review"
+    assert tuple(ctx["triggers"]) == ("unknown_or_empty_result",)
+    assert tuple(ctx["applicability"]) == ("observability_surface",)
+    assert ctx["risk"] == "high"
+
+
+def test_derived_stage_follows_card_lifecycle() -> None:
+    base = {
+        "allowed_writes": ["src/aiworkhub/x.py"],
+        "validation": ["python -m pytest tests/test_x.py -q"],
+    }
+
+    review_card = dict(base, task_id="QUALITY_REVIEW_X")
+    ctx = project_context._skill_selection_context(review_card)
+    assert ctx is not None and ctx["stage"] == "review"
+
+    rework_card = dict(base, claim_epoch=2)
+    ctx = project_context._skill_selection_context(rework_card)
+    assert ctx is not None and ctx["stage"] == "rework"
+
+    rework_pred_card = dict(base, rework_predecessor="R1")
+    ctx = project_context._skill_selection_context(rework_pred_card)
+    assert ctx is not None and ctx["stage"] == "rework"
+
+    impl_card = dict(base, claim_epoch=1)
+    ctx = project_context._skill_selection_context(impl_card)
+    assert ctx is not None and ctx["stage"] == "implementation"
+
+
+def test_card_with_nothing_derivable_selects_nothing() -> None:
+    assert project_context._skill_selection_context({"read_only": True}) is None
+    assert (
+        project_context._skill_selection_context(
+            {"read_only": True, "allowed_writes": []}
+        )
+        is None
+    )
+
+
 # ---------------------------------------------------------------------------
 # 3. risk_tier is populated at create, from the declared write scope
 # ---------------------------------------------------------------------------

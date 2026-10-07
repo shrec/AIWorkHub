@@ -1069,6 +1069,25 @@ def test_add_learning_commit_evidence_reports_no_commit_for_unknown_key(manager)
 def test_add_learning_commit_evidence_reports_when_card_declares_no_vocabulary(manager):
     mst.propose(**LEARNING_BASE)
     _seed_card(manager, "T_NOVOCAB", runner="claude_sonnet-5")
+    db = manager / ".aiworkhub" / "tasking" / "task_queue.sqlite"
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (
+                json.dumps(
+                    {
+                        "task_id": "T_NOVOCAB",
+                        "runner": "claude_sonnet-5",
+                        "read_only": True,
+                    }
+                ),
+                "T_NOVOCAB",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
     _seed_learning_commit(manager, "T_NOVOCAB", "req-3", outcome="accepted")
 
     result = mst.add_learning_commit_evidence(task_id="T_NOVOCAB", request_id="req-3")
@@ -1076,6 +1095,45 @@ def test_add_learning_commit_evidence_reports_when_card_declares_no_vocabulary(m
     assert result["ok"] is True
     assert result["reason"] == "card_declares_no_selection_vocabulary"
     assert result["recorded"] == []
+
+
+def test_add_learning_commit_evidence_records_for_an_undeclared_implementation_card(manager):
+    mst.propose(
+        **{
+            **LEARNING_BASE,
+            "identity": "learning-derived-skill",
+            "task_family": "implementation",
+            "stage": "implementation",
+            "triggers": ["code_change"],
+        }
+    )
+    _seed_card(manager, "T_DERIVED")
+    db = manager / ".aiworkhub" / "tasking" / "task_queue.sqlite"
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (
+                json.dumps(
+                    {
+                        "task_id": "T_DERIVED",
+                        "runner": "claude_sonnet-5",
+                        "allowed_writes": ["src/aiworkhub/foo.py"],
+                        "validation": ["python -m pytest tests/test_foo.py -q"],
+                    }
+                ),
+                "T_DERIVED",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    _seed_learning_commit(manager, "T_DERIVED", "req-d", outcome="accepted")
+
+    result = mst.add_learning_commit_evidence(task_id="T_DERIVED", request_id="req-d")
+
+    assert result["ok"] is True
+    assert [row["identity"] for row in result["recorded"]] == ["learning-derived-skill"]
 
 
 def test_add_learning_commit_evidence_uses_the_runtime_selection_derivation(manager):

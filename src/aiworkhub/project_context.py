@@ -1228,13 +1228,29 @@ def _production_path_scope(card: dict[str, Any]) -> str:
     return skill_registry.common_path_scope(production)
 
 
+_SKILL_APPLICABILITY_BY_SIGNAL = {
+    "public_api": "public_api_surface",
+    "authority_boundary": "authority_boundary_surface",
+    "concurrency": "concurrency_surface",
+    "schema_migration": "storage_schema_surface",
+    "security_sensitive": "security_surface",
+    "release": "release_surface",
+}
+
+
 def _skill_selection_context(card: dict[str, Any]) -> dict[str, Any] | None:
     """Return the card's selection context, or ``None`` when it declares none."""
-    from . import skill_registry
+    from . import quality_evidence, skill_registry
 
     resolved = dict(card)
     if not str(resolved.get("skill_task_family") or "").strip():
         family = _template_skill_task_family(card)
+        if not family:
+            fallback = (
+                "analysis" if card.get("read_only") is True else "implementation"
+            )
+            if fallback in skill_registry.SKILL_TASK_FAMILIES:
+                family = fallback
         if family:
             resolved["skill_task_family"] = family
     if not str(resolved.get("skill_path_scope") or "").strip():
@@ -1243,6 +1259,37 @@ def _skill_selection_context(card: dict[str, Any]) -> dict[str, Any] | None:
         ) or _production_path_scope(resolved)
         if scope:
             resolved["skill_path_scope"] = scope
+    if not str(resolved.get("risk_tier") or "").strip():
+        resolved["risk_tier"] = "medium"
+    if not str(resolved.get("skill_stage") or "").strip():
+        task_type = str(
+            card.get("request_kind") or card.get("task_type") or ""
+        ).strip().lower()
+        task_id = str(card.get("task_id") or "")
+        if task_type == "review" or task_id.startswith("QUALITY_REVIEW_"):
+            resolved["skill_stage"] = "review"
+        elif int(card.get("claim_epoch") or 0) >= 2 or card.get("rework_predecessor"):
+            resolved["skill_stage"] = "rework"
+        elif card.get("read_only") is True:
+            resolved["skill_stage"] = "orientation"
+        else:
+            resolved["skill_stage"] = "implementation"
+    if not resolved.get("skill_triggers") or not resolved.get("skill_applicability"):
+        signals = quality_evidence.derive_risk_signals(
+            card, card.get("allowed_writes") or []
+        )
+        if not resolved.get("skill_triggers") and signals:
+            resolved["skill_triggers"] = signals
+        if not resolved.get("skill_applicability"):
+            applicability = [
+                _SKILL_APPLICABILITY_BY_SIGNAL[signal]
+                for signal in signals
+                if signal in _SKILL_APPLICABILITY_BY_SIGNAL
+            ]
+            if card.get("validation"):
+                applicability.append("quality_gate")
+            if applicability:
+                resolved["skill_applicability"] = applicability
     return skill_registry.card_selection_context(resolved)
 
 
