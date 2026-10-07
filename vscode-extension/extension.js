@@ -4589,7 +4589,9 @@ function createVscodeLmStagedEditCollector(request) {
       return boundedReceipt(operation, filePath, input.content, { idempotent_replay: Boolean(existing) });
     }
     if (!contract || contract.action !== "edit") return reject(`action_mismatch:${filePath}:replace_range`);
-    if (edits.get(filePath)?.coordinatesShifted && !originalCoordinateBatch) {
+    // NF-2026-01404: a range ending above the first line-count change keeps its coordinates.
+    const shiftedFrom = edits.get(filePath)?.shiftedFrom;
+    if (Number.isSafeInteger(shiftedFrom) && !(input.end_line < shiftedFrom) && !originalCoordinateBatch) {
       recoveryPath = filePath;
       recoveryTarget = "";
       recoveryEvidence = [];
@@ -4668,8 +4670,11 @@ function createVscodeLmStagedEditCollector(request) {
         return reject(`apply_identity_mismatch:${filePath}`);
       }
       entry.applied = true;
-      entry.coordinatesShifted = Boolean(entry.coordinatesShifted) ||
-        replacementLineCount(input.new) !== input.end_line - input.start_line + 1;
+      // NF-2026-01404: only lines below the first line-count change move.
+      if (replacementLineCount(input.new) !== input.end_line - input.start_line + 1) {
+        entry.shiftedFrom = Math.min(entry.shiftedFrom ?? input.start_line, input.start_line);
+      }
+      entry.coordinatesShifted = Number.isSafeInteger(entry.shiftedFrom);
       entry.last_sha256 = mcpReceipt.after_sha256;
     }
     entry.ranges.push({ start_line: input.start_line, end_line: input.end_line,
@@ -4691,6 +4696,18 @@ function createVscodeLmStagedEditCollector(request) {
         ok: false,
         reason: "semantic_edit_required_outputs_correction_exhausted",
         ...(missingRequiredCreate ? { missingRequiredCreate } : {}),
+        ...progress,
+      };
+    }
+    // NF-2026-01404: a stage rejected for fresh-pair recovery is never dropped silently;
+    // it counts toward the bounded escape above, so it never blocks finalize forever.
+    if (recoveryPath) {
+      incompleteFinalizeCount += 1;
+      return {
+        ok: false,
+        reason: incompleteFinalizeCount >= 2
+          ? `semantic_edit_recovery_exhausted:${recoveryPath}`
+          : `semantic_edit_recovery_outstanding:${recoveryPath}`,
         ...progress,
       };
     }
@@ -4805,8 +4822,11 @@ function createVscodeLmStagedEditCollector(request) {
         new: input.new, preserve_trailing_newline: true, mcp_receipt: result });
     }
     entry.applied = true;
-    entry.coordinatesShifted = Boolean(entry.coordinatesShifted) ||
-      replacementLineCount(input.new) !== prepared.end_line - prepared.start_line + 1;
+    // NF-2026-01404: only lines below the first line-count change move.
+    if (replacementLineCount(input.new) !== prepared.end_line - prepared.start_line + 1) {
+      entry.shiftedFrom = Math.min(entry.shiftedFrom ?? prepared.start_line, prepared.start_line);
+    }
+    entry.coordinatesShifted = Number.isSafeInteger(entry.shiftedFrom);
     if (recoveryPath === prepared.path && recoveryTarget === input.target_id) {
       recoveryPath = ""; recoveryTarget = ""; recoveryEvidence = [];
     }

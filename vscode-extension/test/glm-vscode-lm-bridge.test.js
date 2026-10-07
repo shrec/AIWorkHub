@@ -7324,6 +7324,50 @@ async function nf1291ShiftedStageRecovery() {
     assert.equal(f.calls.length, beforeCalls, "shifted stage is refused before prepare/mutation");
     assert.deepEqual(f.lines(), ["inserted", "one", "two", "three", "four"]);
   }
+  // NF-2026-01404: a bottom-up range ending above the first line-count change keeps its
+  // coordinates; finalize never succeeds while a rejected stage awaits fresh-pair recovery.
+  {
+    const f = fixture();
+    const collector = internals.createVscodeLmStagedEditCollector(f.req);
+    assert.equal((await collector.stage({ operation: "replace_range", file_path: file,
+      start_line: 4, end_line: 4, new: "four\nfive" }, f.invoke)).ok, true);
+    assert.equal((await collector.stage({ operation: "replace_range", file_path: file,
+      start_line: 2, end_line: 2, new: "TWO" }, f.invoke)).ok, true, "range above the growth is current");
+    assert.deepEqual(f.lines(), ["one", "TWO", "three", "four", "five"]);
+    const shifted = await collector.stage({ operation: "replace_range", file_path: file,
+      start_line: 4, end_line: 4, new: "FOUR" }, f.invoke);
+    assert.match(shifted.reason, /coordinates_shifted_requires_fresh_worker_pair/);
+    // The recovery counts toward the bounded escape: it never blocks finalize forever.
+    const finals = [1, 2, 3].map(() => collector.finalize("recovery outstanding"));
+    assert.ok(finals.every(final => final.ok === false), "a rejected stage is never dropped silently");
+    assert.match(finals[0].reason, /semantic_edit_recovery_outstanding/);
+    assert.match(finals[1].reason, /exhausted/);
+    assert.match(finals[2].reason, /exhausted/);
+    assert.match((await collector.stage({ operation: "create", file_path: created,
+      content: "assert True\n" })).reason, /required_outputs_correction_exhausted/);
+  }
+  // NF-2026-01404: a completed fresh-pair recovery clears the gate and finalize succeeds.
+  {
+    const f = fixture();
+    const collector = internals.createVscodeLmStagedEditCollector(f.req);
+    assert.equal((await collector.stage({ operation: "replace_range", file_path: file,
+      start_line: 4, end_line: 4, new: "four\nfive" }, f.invoke)).ok, true);
+    const shifted = await collector.stage({ operation: "replace_range", file_path: file,
+      start_line: 5, end_line: 5, new: "FIVE" }, f.invoke);
+    assert.match(shifted.reason, /coordinates_shifted_requires_fresh_worker_pair/);
+    assert.match(collector.finalize("recovery outstanding").reason, /semantic_edit_recovery_outstanding/);
+    const dispatch = call => internals.invokeVscodeLmProtocolTool(call, f.req.requestId, f.invoke, collector);
+    await dispatch({ name: "aiworkhub_worker_source_graph_query",
+      input: { mode: "body", query: "app.four", target: file } });
+    await dispatch({ name: "aiworkhub_worker_semantic_edit_prepare",
+      input: { file_path: file, start_line: 5, end_line: 5 } });
+    await dispatch({ name: "aiworkhub_worker_semantic_edit_apply",
+      input: { target_id: "shift-target-2", new: "FIVE", idempotency_key: "nf1404-recovery" } });
+    assert.deepEqual(f.lines(), ["one", "two", "three", "four", "FIVE"]);
+    assert.equal((await collector.stage({ operation: "create", file_path: created,
+      content: "assert True\n" })).ok, true);
+    assert.equal(collector.finalize("recovered").ok, true);
+  }
   for (const directGrowth of [false, true]) {
     const f = fixture();
     const collector = internals.createVscodeLmStagedEditCollector(f.req);
