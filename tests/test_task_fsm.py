@@ -201,3 +201,42 @@ def test_every_verification_result_carries_an_evidence_support_field():
         verdict = task_fsm.deterministic_verification(substatus, validations, outputs)
         assert historical.issubset(verdict.keys())
         assert "evidence_support" in verdict
+
+
+def test_declared_but_unrun_validation_is_never_a_pass():
+    # NF-2026-01392 (AITrader): a finalize_failed first finalization recorded
+    # evidence_verdict passed=true from 7 required-output records while none of
+    # the card's declared validation commands had run.
+    outputs = [_PRESENT_OUTPUT]
+    unrun = task_fsm.evidence_verdict([], outputs, declared_validation_count=2)
+    assert unrun["passed"] is False
+    assert unrun["unrun_validation_count"] == 2
+    partial = task_fsm.evidence_verdict(
+        [_PASSING_VALIDATION], outputs, declared_validation_count=2
+    )
+    assert partial["passed"] is False
+    assert partial["unrun_validation_count"] == 1
+    complete = task_fsm.evidence_verdict(
+        [_PASSING_VALIDATION, _PASSING_VALIDATION], outputs, declared_validation_count=2
+    )
+    assert complete["passed"] is True
+    assert "unrun_validation_count" not in complete
+    result = task_fsm.deterministic_verification(
+        "review_ready", [], outputs, declared_validation_count=1
+    )
+    assert result["pass"] is False
+    assert (
+        task_fsm.evidence_support("validation_failed", unrun)
+        == task_fsm.EVIDENCE_SUPPORT_UNMEASURED
+    )
+
+
+def test_terminal_verification_bounds_the_pass_by_the_card_validation():
+    from aiworkhub import task_store
+
+    evidence = {"validation": [], "required_outputs": [_PRESENT_OUTPUT]}
+    result = task_store._deterministic_verification_for_evidence(
+        "review_ready", evidence, claim_epoch=1, card={"validation": ["python -m pytest -q"]}
+    )
+    assert result["pass"] is False
+    assert result["evidence_verdict"]["unrun_validation_count"] == 1

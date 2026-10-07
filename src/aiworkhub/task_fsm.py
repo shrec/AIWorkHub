@@ -238,6 +238,8 @@ def check_terminal_review_transition(
 def evidence_verdict(
     validations: list[Mapping[str, object]] | None,
     required_output_records: list[Mapping[str, object]] | None,
+    *,
+    declared_validation_count: int = 0,
 ) -> dict[str, object]:
     """Deterministic pass/fail predicate over already-recorded evidence rows.
 
@@ -293,12 +295,16 @@ def evidence_verdict(
     # and unchanged; this fixes the exported field that is otherwise copied,
     # green, straight into a terminal record as evidence_verdict.passed.
     nothing_measured = not validations and not required_output_records
+    # NF-2026-01392: a declared validation command with no recorded row never ran,
+    # and required-output records alone never prove the declared validations passed.
+    unrun_validation_count = max(0, declared_validation_count - len(validations))
     passed = (
         not nothing_measured
+        and not unrun_validation_count
         and not failed_validations
         and not missing_required_outputs
     )
-    return {
+    verdict: dict[str, object] = {
         "passed": passed,
         "nothing_measured": nothing_measured,
         "validation_count": len(validations),
@@ -306,6 +312,11 @@ def evidence_verdict(
         "required_output_count": len(required_output_records),
         "missing_required_output_count": len(missing_required_outputs),
     }
+    # Present only when nonzero, so a verdict recorded before NF-2026-01392
+    # recomputes byte-identically (sdlc_stage_evidence._verify_acceptance).
+    if unrun_validation_count:
+        verdict["unrun_validation_count"] = unrun_validation_count
+    return verdict
 
 
 # Terminal substatuses that represent a recorded success outcome eligible for
@@ -379,6 +390,11 @@ def evidence_support(substatus: str, verdict: Mapping[str, object]) -> str:
     if failed > 0 or missing > 0:
         return EVIDENCE_SUPPORT_SUPPORTED
 
+    # NF-2026-01392: a declared validation that never ran cannot contradict a
+    # validation-failure claim; the attempt is unmeasured, not self-contradicting.
+    if _count("unrun_validation_count"):
+        return EVIDENCE_SUPPORT_UNMEASURED
+
     # Nothing was measured at all: no validation ran and no required output
     # was checked, so nothing proves a validation failure either way. This is
     # an unmeasured attempt, not a measured one that failed.
@@ -397,6 +413,7 @@ def deterministic_verification(
     required_output_records: list[Mapping[str, object]] | None,
     *,
     claim_epoch: int = 0,
+    declared_validation_count: int = 0,
 ) -> dict[str, object]:
     """Deterministic, fail-closed pass/fail record for one terminal outcome.
 
@@ -409,7 +426,11 @@ def deterministic_verification(
     substatus = (substatus or "").strip()
     validations = list(validations or [])
     required_output_records = list(required_output_records or [])
-    verdict = evidence_verdict(validations, required_output_records)
+    verdict = evidence_verdict(
+        validations,
+        required_output_records,
+        declared_validation_count=declared_validation_count,
+    )
     try:
         epoch = max(0, int(claim_epoch))
     except (TypeError, ValueError):

@@ -2740,7 +2740,11 @@ def _enqueue_terminal_callback_row(
 
 
 def _deterministic_verification_for_evidence(
-    substatus: str, evidence_payload: Mapping[str, Any], *, claim_epoch: int
+    substatus: str,
+    evidence_payload: Mapping[str, Any],
+    *,
+    claim_epoch: int,
+    card: Mapping[str, Any] | None,
 ) -> Any:
     """Evaluate deterministic verification from one terminal evidence payload.
 
@@ -2750,11 +2754,15 @@ def _deterministic_verification_for_evidence(
     never the full authorized production/test write scope -- an
     authorized-but-untouched path must never appear here.
     """
+    # NF-2026-01392: the card's declared validation contract bounds a pass, so
+    # required-output records alone never read as a measured pass.
+    declared = (card or {}).get("validation")
     return task_fsm.deterministic_verification(
         substatus,
         evidence_payload.get("validation"),
         evidence_payload.get("required_outputs"),
         claim_epoch=claim_epoch,
+        declared_validation_count=len(declared) if isinstance(declared, list) else 0,
     )
 
 
@@ -2827,7 +2835,7 @@ def _mark_terminal_review_transaction(
         except (TypeError, ValueError):
             claim_epoch = 0
         deterministic_verification = _deterministic_verification_for_evidence(
-            substatus, evidence_payload, claim_epoch=claim_epoch
+            substatus, evidence_payload, claim_epoch=claim_epoch, card=card
         )
         terminal = {
             "substatus": substatus[:120],
@@ -3788,7 +3796,7 @@ def mark_terminal_failure(
                 f":current={card_claim_epoch}"
             )
         deterministic_verification = _deterministic_verification_for_evidence(
-            substatus, evidence_payload, claim_epoch=card_claim_epoch
+            substatus, evidence_payload, claim_epoch=card_claim_epoch, card=card
         )
         now = datetime.now(timezone.utc).isoformat()
         terminal = {

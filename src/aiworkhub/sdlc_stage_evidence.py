@@ -967,8 +967,13 @@ def _verify_acceptance(
     outputs = _records(sealed.get("required_outputs"), required=False)
     if validations is None or outputs is None:
         return "validation_evidence_malformed"
+    declared = card.get("validation")
     recomputed = task_fsm.deterministic_verification(
-        SEALED_SUBSTATUS, validations, outputs, claim_epoch=identity["claim_epoch"]
+        SEALED_SUBSTATUS,
+        validations,
+        outputs,
+        claim_epoch=identity["claim_epoch"],
+        declared_validation_count=len(declared) if isinstance(declared, list) else 0,
     )
     recorded = terminal.get("deterministic_verification")
     if (
