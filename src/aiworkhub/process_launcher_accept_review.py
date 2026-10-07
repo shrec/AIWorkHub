@@ -91,8 +91,10 @@ def _accept_manager_identity(core: Any) -> dict[str, Any]:
     fail an accept.
     """
     try:
-        return (
-            core._claude_manager_identity() or core._codex_manager_identity()
+        return (  # seat first (NF-2026-01383)
+            core._manager_chat_seat_identity()
+            or core._claude_manager_identity()
+            or core._codex_manager_identity()
         ) or {}
     except Exception:  # noqa: BLE001 -- describing the caller never fails an accept
         return {}
