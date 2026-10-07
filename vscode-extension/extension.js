@@ -3268,6 +3268,8 @@ function vscodeLmActivityPreview(value) {
       if (/^\s*[\[{]/.test(item)) {
         try { return redact(JSON.parse(item), depth + 1); } catch (_err) { /* non-JSON tool text */ }
       }
+      // Redaction is superlinear on long unbroken runs; text past twice the preview budget is never shown.
+      if (item.length > 2 * VSCODE_LM_ACTIVITY_PREVIEW_BYTES) { truncated = true; item = item.slice(0, 2 * VSCODE_LM_ACTIVITY_PREVIEW_BYTES); }
       return vscodeLmActivityRedactText(item);
     }
     if (!item || typeof item !== "object") return item;
@@ -3305,8 +3307,9 @@ function createVscodeLmActivityJournal(request) {
   }
   if (path.basename(home) !== "home" || path.basename(path.dirname(home)) !== request.requestId ||
       !VSCODE_LM_REQUEST_ID_RE.test(request.requestId)) throw new Error("vscode_lm_activity_path_identity_invalid");
-  if (request.activity_capture !== true) return { record() {}, finish() {}, status: () => "unknown" };
+  if (request.activity_capture !== true) return { record() {}, recordText() {}, finish() {}, status: () => "unknown" };
   let sequence = 0, bytes = 0, dropped = 0, ended = false, failed = false, identity = null;
+  let pendingKind = null, pendingText = "", pendingStarted = null;
   const status = () => failed ? "unavailable" : dropped ? "limited" : "available";
   const samePath = (left, right) => process.platform === "win32"
     ? path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase() : path.resolve(left) === path.resolve(right);
@@ -3360,6 +3363,16 @@ function createVscodeLmActivityJournal(request) {
   };
   const marker = end => ({kind:"status", capture_status:status(), dropped_events:dropped, capture_end:end,
     redaction_coverage:"recognized credential keys/assignments, bearer/API tokens, URL credentials; arbitrary secrets unknown"});
+  const flushTextRow = () => {
+    if (ended || failed || pendingKind === null) return;
+    if (bytes > VSCODE_LM_ACTIVITY_MAX_BYTES - 16 * 1024) { dropped += 1; pendingKind = null; pendingText = ""; pendingStarted = null; return; }
+    try {
+      const preview = vscodeLmActivityPreview(pendingText);
+      const kind = pendingKind;
+      pendingKind = null; pendingText = ""; pendingStarted = null;
+      append({kind, text: preview.text, preview_truncated: preview.truncated});
+    } catch (_err) { failed = true; }
+  };
   try { append(marker(false)); } catch (_err) { failed = true; }
   return {
     status,
@@ -3367,6 +3380,8 @@ function createVscodeLmActivityJournal(request) {
       if (ended || failed) return;
       // Reserve the final loss/status row rather than silently dropping its evidence.
       if (bytes > VSCODE_LM_ACTIVITY_MAX_BYTES - 16 * 1024) { dropped += 1; return; }
+      flushTextRow();
+      if (ended || failed) return;
       try {
         const input = details.tool_input === undefined ? null : vscodeLmActivityPreview(details.tool_input);
         const output = details.tool_result === undefined ? null : vscodeLmActivityPreview(details.tool_result);
@@ -3380,8 +3395,24 @@ function createVscodeLmActivityJournal(request) {
           preview_truncated:Boolean(input && input.truncated || output && output.truncated)});
       } catch (_err) { failed = true; }
     },
+    recordText(kind, text) {
+      if (ended || failed || (kind !== "assistant_text" && kind !== "reasoning")) return;
+      const piece = typeof text === "string" ? text : Array.isArray(text) ? text.join("") : "";
+      if (!piece) return;
+      if (pendingKind !== kind) flushTextRow();
+      if (ended || failed) return;
+      // Reserve the final loss/status row rather than silently dropping its evidence.
+      if (bytes > VSCODE_LM_ACTIVITY_MAX_BYTES - 16 * 1024) { dropped += 1; return; }
+      if (pendingKind === null) { pendingKind = kind; pendingText = ""; pendingStarted = Date.now(); }
+      pendingText += piece;
+      if (Date.now() - pendingStarted >= 1500 ||
+          pendingText.length >= VSCODE_LM_ACTIVITY_PREVIEW_BYTES) {
+        flushTextRow();
+      }
+    },
     finish() {
       if (ended) return;
+      flushTextRow();
       ended = true;
       if (!failed) { try { append(marker(true)); } catch (_err) { failed = true; } }
     },
@@ -3885,6 +3916,14 @@ function languageModelResponseText(part) {
     ? part instanceof vscode.LanguageModelTextPart
     : part.constructor === Object;
   return isText ? part.value : "";
+}
+
+function vscodeLmThinkingPartText(part) {
+  if (typeof vscode.LanguageModelThinkingPart !== "function" || !(part instanceof vscode.LanguageModelThinkingPart)) return "";
+  const value = part && part.value;
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.join("");
+  return "";
 }
 
 function languageModelToolResultPart(callId, value) {
@@ -5265,7 +5304,7 @@ async function collectVscodeLmResponseText(response, onProviderPart = null, canc
       const part = step.value;
       throwIfVscodeLmCancelled(cancellationToken);
       if (typeof onProviderPart === "function") {
-        try { onProviderPart(); } catch (_err) { /* liveness only */ }
+        try { onProviderPart(part); } catch (_err) { /* liveness only */ }
       }
       const responseText = languageModelResponseText(part);
       if (responseText) textParts.push(responseText);
@@ -6899,7 +6938,7 @@ async function runVscodeLmAgent(
       const part = step.value;
       assertRequestActive();
       if (typeof onProviderPart === "function") {
-        try { onProviderPart(); } catch (_err) { /* liveness only */ }
+        try { onProviderPart(part); } catch (_err) { /* liveness only */ }
       }
       assistantParts.push(part);
       if (isLanguageModelToolCallPart(part)) calls.push(part);
@@ -7652,7 +7691,15 @@ class VscodeLmBridgeHost {
         timeout_ms: Math.max(0, Math.min(Number(details.timeout_ms || 0), 86_400_000)),
         });
       };
-      const onProviderPart = () => writeProgress("provider_response", {}, 2000);
+      const onProviderPart = (part) => {
+        const thinking = vscodeLmThinkingPartText(part);
+        if (thinking) activityJournal.recordText("reasoning", thinking);
+        else {
+          const text = languageModelResponseText(part);
+          if (text) activityJournal.recordText("assistant_text", text);
+        }
+        writeProgress("provider_response", {}, 2000);
+      };
       const remainingMs = Math.max(1, Date.parse(String(request.deadline)) - Date.now());
       deadlineTimer = setTimeout(() => {
         source.cancel();
@@ -13153,7 +13200,7 @@ module.exports = {
   activate,
   deactivate,
   __testInternals: {
-    createVscodeLmActivityJournal,
+    createVscodeLmActivityJournal, vscodeLmThinkingPartText, collectVscodeLmResponseText,
     vscodeLmRequiredCreateError,
   vscodeLmActivityRedactText,
     vscodeLmActivityPreview,

@@ -4775,6 +4775,15 @@ function timelineEventFromObject(event, rawLine) {
     const status = event.kind === "status";
     const capture = ["available", "limited", "unavailable", "unknown"].includes(event.capture_status)
       ? event.capture_status : "unknown";
+    if (event.kind === "reasoning" || event.kind === "assistant_text") {
+      const textOutput = redactDisplayText(event.text || "", 8192);
+      if (event.kind === "reasoning") {
+        return {...reasoningRow(event.text, rawLine), activityOutput: textOutput};
+      }
+      return {kind: "event", title: "Assistant", label: "assistant", state: "running",
+        message: redactDisplayText(event.text || "", 180) || "(assistant response in progress)", metrics: [], raw: safeRawEvent(rawLine),
+        activityOutput: textOutput};
+    }
     return {
       kind: event.tool_state === "failed" ? "error" : "event",
       title: "Tool activity", label: status ? "Visible tool capture" : redactDisplayText(event.tool_name || "tool", 200),

@@ -24,6 +24,80 @@ class FakeCancellationTokenSource {
   }
   dispose() {}
 }
+
+async function nf1380TextActivityRows() {
+  assert.strictEqual(typeof internals.createVscodeLmActivityJournal, "function", "createVscodeLmActivityJournal must be on internals");
+  assert.strictEqual(typeof internals.vscodeLmThinkingPartText, "function", "vscodeLmThinkingPartText must be on internals");
+  assert.strictEqual(typeof internals.collectVscodeLmResponseText, "function", "collectVscodeLmResponseText must be on internals");
+  const previousThinkingPart = fakeVscode.LanguageModelThinkingPart;
+  const previousTextPart = fakeVscode.LanguageModelTextPart;
+  fakeVscode.LanguageModelThinkingPart = class { constructor(value) { this.value = value; } };
+  fakeVscode.LanguageModelTextPart = class { constructor(value) { this.value = value; } };
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "nf1380-"));
+  try {
+    const plainText = new fakeVscode.LanguageModelTextPart("plain");
+    assert.strictEqual(internals.vscodeLmThinkingPartText(new fakeVscode.LanguageModelThinkingPart(["th", "ink"])), "think");
+    assert.strictEqual(internals.vscodeLmThinkingPartText(new fakeVscode.LanguageModelThinkingPart("single")), "single");
+    assert.strictEqual(internals.vscodeLmThinkingPartText(plainText), "");
+    const seen = [];
+    const streamed = new fakeVscode.LanguageModelTextPart("spy text");
+    const response = { stream: (async function* () { yield streamed; }()) };
+    const collected = await internals.collectVscodeLmResponseText(response, (part) => seen.push(part));
+    assert.strictEqual(collected, "spy text");
+    assert.strictEqual(seen.length, 1);
+    assert.strictEqual(seen[0], streamed);
+    const requestId = "a".repeat(32);
+    const home = path.join(base, requestId, "home");
+    fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+    const journal = internals.createVscodeLmActivityJournal({
+      workspaceHome: home, requestId, repo_id: "repo_test", activity_capture: true,
+    });
+    const journalFile = path.join(home, ".aiworkhub_vscode_lm_activity.jsonl");
+    journal.recordText("assistant_text", "hello");
+    journal.recordText("assistant_text", " world");
+    journal.recordText("reasoning", "think sk-abcdefghijklmnop");
+    journal.record("read", { tool_state: "completed" });
+    journal.finish();
+    const rows = fs.readFileSync(journalFile, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    assert.deepStrictEqual(rows.map((event) => event.kind),
+      ["status", "assistant_text", "reasoning", "tool", "status"]);
+    assert.strictEqual(rows[1].text, "hello world");
+    assert.strictEqual(rows[2].text, "think [redacted]");
+    assert.strictEqual(rows[2].preview_truncated, false);
+    assert.strictEqual(rows[3].tool_name, "read");
+    assert.strictEqual(rows[4].capture_end, true);
+    assert.strictEqual(rows[4].dropped_events, 0);
+    const capRequestId = "b".repeat(32);
+    const capHome = path.join(base, capRequestId, "home");
+    fs.mkdirSync(capHome, { recursive: true, mode: 0o700 });
+    const capJournal = internals.createVscodeLmActivityJournal({
+      workspaceHome: capHome, requestId: capRequestId, repo_id: "repo_test", activity_capture: true,
+    });
+    const capFile = path.join(capHome, ".aiworkhub_vscode_lm_activity.jsonl");
+    let guard = 0;
+    while (capJournal.status() !== "limited" && guard < 10000) {
+      capJournal.recordText("assistant_text", "x".repeat(300 * 1024));
+      guard += 1;
+    }
+    assert(guard < 10000, "journal must reach the kept-size budget");
+    capJournal.recordText("assistant_text", "x".repeat(300 * 1024));
+    capJournal.finish();
+    const capText = fs.readFileSync(capFile, "utf8");
+    const capRows = capText.split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    assert.ok(Buffer.byteLength(capText, "utf8") <= 1024 * 1024, "1 MiB journal cap must hold");
+    assert.strictEqual(capRows[capRows.length - 1].kind, "status");
+    assert.strictEqual(capRows[capRows.length - 1].capture_end, true);
+    assert.ok(capRows[capRows.length - 1].dropped_events > 0, "skipped text must increment dropped_events");
+  } finally {
+    if (previousThinkingPart === undefined) delete fakeVscode.LanguageModelThinkingPart;
+    else fakeVscode.LanguageModelThinkingPart = previousThinkingPart;
+    if (previousTextPart === undefined) delete fakeVscode.LanguageModelTextPart;
+    else fakeVscode.LanguageModelTextPart = previousTextPart;
+    assert(path.resolve(base).startsWith(path.resolve(os.tmpdir()) + path.sep));
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+}
+
 const fakeVscode = {
   workspace: { workspaceFolders: [], getConfiguration: () => ({ get: (_key, fallback) => fallback }) },
   LanguageModelChatToolMode: { Auto: 1, Required: 2 },
@@ -7584,6 +7658,7 @@ async function main() {
   await nf1291AuthenticatedStageHandoff();
   await nf1290ProgressingProviderLoopsContinue();
   await nf1275VisibleActivityEndToEnd();
+  await nf1380TextActivityRows();
   await nf1255TypedReasoningCannotBecomeProtocolText();
   await nf1252FinalSchemaIsExplicitAndCorrectable();
   await nf998LiteralWhitespaceDoesNotCollide();

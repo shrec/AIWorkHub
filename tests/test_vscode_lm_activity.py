@@ -27,6 +27,39 @@ def write(path: Path, rows: list[dict[str, object]]) -> None:
                     encoding="utf-8")
     path.chmod(0o600)
 
+def test_text_rows_relay_redacted_and_tool_status_unchanged(tmp_path: Path) -> None:
+    home, path = journal(tmp_path)
+    write(path, [
+        row(1, tool_state="completed"),
+        row(2, kind="assistant_text", text="assistant authorization=short-secret"),
+        row(3, kind="reasoning", text="thinking sk-abcdefghijklmnop"),
+        row(4, kind="status", capture_status="available", capture_end=True, dropped_events=0),
+    ])
+    events = ActivityReader(path, home, "a" * 32, "repo_test").drain()
+    assert [event["kind"] for event in events] == ["tool", "assistant_text", "reasoning", "status"]
+    assert events[0]["tool_state"] == "completed"
+    assert events[1]["text"] == "assistant authorization=[redacted]"
+    assert events[2]["text"] == "thinking [redacted]"
+    assert events[3]["capture_end"] is True and events[3]["capture_status"] == "available"
+
+
+@pytest.mark.parametrize("payload, error", [
+    ({"kind": "assistant_text", "text": ""}, "vscode_lm_activity_text_invalid"),
+    ({"kind": "assistant_text"}, "vscode_lm_activity_text_invalid"),
+    ({"kind": "reasoning", "text": ""}, "vscode_lm_activity_text_invalid"),
+    ({"kind": "reasoning"}, "vscode_lm_activity_text_invalid"),
+    ({"kind": "chat_message", "text": "nope"}, "identity_or_sequence_invalid"),
+    ({"kind": "assistant_text", "text": "x" * 5000}, "vscode_lm_activity_metadata_limit"),
+])
+def test_text_kinds_require_nonempty_text_and_unknown_kinds_still_rejected(
+        tmp_path: Path, payload: dict[str, object], error: str) -> None:
+    from aiworkhub.vscode_lm_activity import ActivityCaptureError
+
+    home, path = journal(tmp_path)
+    write(path, [row(1, **payload)])
+    with pytest.raises(ActivityCaptureError, match=error):
+        ActivityReader(path, home, "a" * 32, "repo_test").drain()
+
 
 @pytest.mark.parametrize("windows", [False, True])
 def test_private_checks_dispatch_through_platform_interface(monkeypatch, windows: bool) -> None:

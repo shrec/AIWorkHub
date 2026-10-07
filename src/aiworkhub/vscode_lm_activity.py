@@ -27,7 +27,7 @@ _ASSIGNMENT = re.compile(
     r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s&,}]+)''', re.I
 )
 _ALLOWED = {
-    "schema_id", "request_id", "repo_id", "sequence", "kind", "call_id", "tool_name",
+    "schema_id", "request_id", "repo_id", "sequence", "kind", "text", "call_id", "tool_name",
     "tool_state", "tool_transport", "updated_at", "input_preview", "output_preview",
     "preview_truncated", "elapsed_ms", "error_code", "capture_status", "dropped_events",
     "capture_end", "redaction_coverage",
@@ -129,7 +129,7 @@ class ActivityReader:
         if not isinstance(value, dict) or set(value) - _ALLOWED or (
             value.get("schema_id") != ACTIVITY_SCHEMA or value.get("request_id") != self.request_id
             or value.get("repo_id") != self.repo_id or type(value.get("sequence")) is not int
-            or value["sequence"] != sequence or value.get("kind") not in {"tool", "status"}
+            or value["sequence"] != sequence or value.get("kind") not in {"tool", "status", "assistant_text", "reasoning"}
         ):
             raise ActivityCaptureError("vscode_lm_activity_identity_or_sequence_invalid")
         if value["kind"] == "tool":
@@ -137,12 +137,15 @@ class ActivityReader:
                 isinstance(value.get("call_id"), str) and 0 < len(value["call_id"]) <= 200
             ) or not isinstance(value.get("tool_name"), str) or len(value["tool_name"]) > 200:
                 raise ActivityCaptureError("vscode_lm_activity_tool_invalid")
+        elif value["kind"] in {"assistant_text", "reasoning"}:
+            if not (isinstance(value.get("text"), str) and value["text"]):
+                raise ActivityCaptureError("vscode_lm_activity_text_invalid")
         elif value.get("capture_status") not in {"available", "limited", "unavailable"}:
             raise ActivityCaptureError("vscode_lm_activity_status_invalid")
         for key in ("dropped_events", "elapsed_ms"):
             if key in value and (type(value[key]) is not int or not 0 <= value[key] <= 86_400_000):
                 raise ActivityCaptureError("vscode_lm_activity_count_invalid")
-        for key in ("input_preview", "output_preview", "error_code"):
+        for key in ("input_preview", "output_preview", "error_code", "text"):
             if key in value:
                 if not isinstance(value[key], str) or len(value[key].encode("utf-8")) > MAX_PREVIEW_BYTES:
                     raise ActivityCaptureError("vscode_lm_activity_preview_invalid")

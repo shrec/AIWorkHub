@@ -5,6 +5,7 @@ const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
 
+
 class FakeElement {
   constructor(tagName) {
     this.tagName = tagName;
@@ -137,6 +138,29 @@ function loadFormatter() {
 }
 
 const { api, document } = loadFormatter();
+  // NF-2026-01380: manager_console.js + app.js are already loaded in this global
+  // scope by loadFormatter(), so the webview binding is reachable directly.
+  assert.strictEqual(typeof timelineEventFromObject, "function", "timelineEventFromObject must be loaded by loadFormatter");
+  const reasoning = timelineEventFromObject({ type: "aiworkhub_tool_activity", kind: "reasoning", text: "token sk_abcdefghijklmnopq" }, "{}");
+  assert.strictEqual(reasoning.kind, "event");
+  assert.strictEqual(reasoning.title, "Reasoning");
+  assert.strictEqual(reasoning.label, "reasoning");
+  assert.strictEqual(typeof reasoning.activityOutput, "string");
+  assert.ok(!reasoning.activityOutput.includes("sk_abcdefghijklmnopq"), "reasoning row must redact secrets");
+  const assistant = timelineEventFromObject({ type: "aiworkhub_tool_activity", kind: "assistant_text", text: "hello sk_abcdefghijklmnopq" }, "{}");
+  assert.strictEqual(assistant.kind, "event");
+  assert.strictEqual(assistant.title, "Assistant");
+  assert.strictEqual(assistant.label, "assistant");
+  assert.strictEqual(assistant.state, "running");
+  assert.ok(assistant.message.includes("hello"), "assistant row must carry the text");
+  assert.ok(!assistant.activityOutput.includes("sk_abcdefghijklmnopq"), "assistant row must redact secrets");
+  const tool = timelineEventFromObject({ type: "aiworkhub_tool_activity", kind: "tool", tool_name: "read", tool_state: "completed", tool_transport: "native", call_id: "call-1", sequence: 1, input_preview: "in", output_preview: "out", preview_truncated: false }, "{}");
+  assert.strictEqual(tool.kind, "event");
+  assert.strictEqual(tool.title, "Tool activity");
+  assert.strictEqual(tool.label, "read");
+  assert.ok(tool.message.includes("native") && tool.message.includes("call-1") && tool.message.includes("sequence 1"));
+  assert.strictEqual(tool.activityInput, "in");
+  assert.strictEqual(tool.activityOutput, "out");
 assert(api, "formatter test hook is exposed");
 
 function lines(...events) {
