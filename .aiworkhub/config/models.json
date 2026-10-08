@@ -4,7 +4,7 @@
       "claude_cli": true
     },
     "xai": {
-      "grok_kilo_cli": false,
+      "grok_kilo_cli": true,
       "opencode_cli": true
     }
   },
@@ -113,7 +113,7 @@
     "opencode": true,
     "xai": true
   },
-  "revision": 281,
+  "revision": 282,
   "schema_id": "aiworkhub.model_settings.v1",
-  "updated_at": "2026-10-04T16:16:42.283338+00:00"
+  "updated_at": "2026-10-08T07:34:47.977464+00:00"
 }
