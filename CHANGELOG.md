@@ -6,6 +6,24 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.38] - 2026-10-08
+
+### Added
+
+- Skills: an accepted learning commit mines recurring lessons and proposes complete skill drafts on its own; a draft the registry already holds is reported as already proposed, never as a refusal (NF-2026-01412).
+- Skills: a proposed skill activates on its own once two independent accepted actors back it and no unresolved negative evidence argues against it; `aiworkhub_manager_skill_evidence_sweep` backfills evidence from past learning commits and reports skips by reason (NF-2026-01411).
+- Dashboard: the Skills window lists each skill with its lifecycle, owner, stages, usage counts and last use instead of one aggregate line (NF-2026-01399).
+
+### Fixed
+
+- Skills: learning-commit evidence reaches every stage a card traversed (first launch stage and rework), and a rejected review no longer stamps negative evidence on a skill (NF-2026-01411).
+- Skills: one over-cap skill no longer aborts the whole skills packet; it is excluded with a per-record reason, the rest are injected, and propose() refuses a record the packet could never emit (NF-2026-01416).
+- Grok (Kilo) and OpenCode workers receive the prompt on stdin instead of as one argv element, so a normal-size card no longer fails at spawn on Windows with `command_line_too_long` (NF-2026-01417).
+
+### Qualification
+
+- Each fix has a regression that fails before and passes after; the touched suites and the full suite pass. Installation and live replay are separate evidence.
+
 ## [0.12.37] - 2026-10-08
 
 ### Added

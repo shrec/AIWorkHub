@@ -1,5 +1,21 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.38 — 2026-10-08
+
+### Added
+
+- The Skills window lists each skill with its lifecycle, owner, stages, usage counts and last use (NF-2026-01399).
+- Bundled MCP runtime: accepted learning commits mine and propose skills on their own (NF-2026-01412); a skill backed by two independent accepted actors activates automatically, and a registered evidence sweep backfills past commits (NF-2026-01411).
+
+### Fixed
+
+- Bundled MCP runtime: skill evidence reaches every traversed stage and rejected reviews no longer stamp negatives (NF-2026-01411); one over-cap skill no longer aborts the skills packet (NF-2026-01416).
+- Bundled MCP runtime: Grok (Kilo) and OpenCode workers receive the prompt on stdin, so normal cards no longer fail at spawn on Windows (NF-2026-01417).
+
+### Qualification
+
+- Independent component regressions pass; installation, activation and live qualification are separate evidence.
+
 ## 0.12.37 — 2026-10-08
 
 ### Added

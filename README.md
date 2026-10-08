@@ -62,6 +62,13 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.38
+
+- The skill system runs end to end on its own: accepted learning commits mine recurring lessons into skill proposals (NF-2026-01412), evidence reaches every stage a card went through, and a skill backed by two independent accepted actors activates automatically (NF-2026-01411).
+- One oversized skill no longer blanks the whole skills packet; it is excluded with a reason and the rest are still injected (NF-2026-01416).
+- The dashboard Skills window shows each skill: what it does, its lifecycle, how often and when it was used (NF-2026-01399).
+- Grok (Kilo) and OpenCode workers get their prompt on stdin, so normal cards no longer fail at spawn on Windows with `command_line_too_long` (NF-2026-01417).
+
 ## What's new in 0.12.37
 
 - Skills actually work on ordinary cards: each card derives its skill selection context, so skills are selected and earn usage evidence (NF-2026-01397).
