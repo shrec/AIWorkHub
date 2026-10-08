@@ -76,6 +76,7 @@ node_modules/
 /docs/AUDIT_2026-08-03.md
 /docs/LIVE_BUG_BACKLOG_2026-08-03.md
 /docs/*_2026-*.md
+/docs/research/*_2026-*.md
 /docs/PONYTAIL_CAPABILITY_REVIEW.md
 /docs/reviews/*
 !/docs/reviews/README.md
