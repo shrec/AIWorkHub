@@ -1,5 +1,14 @@
 {
+  "env": {
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "250000",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "80"
+  },
   "permissions": {
+    "allow": [
+      "Bash(git -C D:/Dev/AIWorkHub/.claude/worktrees/agent-a967c15de704afe82 status --short --branch)",
+      "Bash(git -C D:/Dev/AIWorkHub/.claude/worktrees/agent-a967c15de704afe82 switch -c nf-2026-00027-prewarm-bound adae201)",
+      "mcp__AIWorkHub__aiworkhub_manager_semantic_edit_prepare"
+    ],
     "deny": [
       "Grep",
       "Glob",

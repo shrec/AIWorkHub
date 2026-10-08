@@ -1,5 +1,5 @@
 {
-  "revision": 28,
+  "revision": 29,
   "schema_id": "aiworkhub.workforce_catalog.v1",
   "workers": [
     {
@@ -465,6 +465,33 @@
         "semantic-edit"
       ],
       "worker_id": "deepseek-native-v4-pro"
+    },
+    {
+      "adapter_id": "vscode_lm",
+      "enabled": true,
+      "implementation_worker": true,
+      "manager": true,
+      "manager_score_adjustment": 0.0,
+      "max_context_tokens": 0,
+      "max_risk": "high",
+      "model": "gpt-6.1-sol",
+      "provider": "copilot",
+      "quality_ceiling": 1.0,
+      "reviewer": false,
+      "supports": [
+        "mechanical",
+        "code",
+        "research",
+        "review"
+      ],
+      "tools": [
+        "source-graph",
+        "session-manager",
+        "ai-memory",
+        "kb",
+        "semantic-edit"
+      ],
+      "worker_id": "gpt-6.1-sol"
     }
   ]
 }

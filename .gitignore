@@ -66,6 +66,13 @@ node_modules/
 /CODE_REVIEW_*.md
 /PROJECT_EVALUATION_*.md
 /AUDIT_TOKEN_ECONOMY_AND_AGENT_QUALITY_*.md
+/code_audit_report_*.md
+/.scratch_*.md
+# Host-local MCP client configs (absolute per-machine paths), shell crash dumps, pip cache.
+/.mcp.json
+/.cursor/
+*.stackdump
+/pip/
 /docs/AUDIT_2026-08-03.md
 /docs/LIVE_BUG_BACKLOG_2026-08-03.md
 /docs/*_2026-*.md
