@@ -986,6 +986,9 @@ def _seed_learning_commit(
 
 
 def test_add_learning_commit_evidence_matches_by_family_path_and_key(manager):
+    # NF-2026-01411: a rejected commit is no longer applicability evidence --
+    # it used to stamp NEGATIVE evidence on skills the rejected card never
+    # actually injected, so it now records nothing instead.
     mst.propose(**LEARNING_BASE)
     _seed_skill_card(manager, "T_LEARN1")
     _seed_learning_commit(manager, "T_LEARN1", "req-1", outcome="rejected")
@@ -993,18 +996,13 @@ def test_add_learning_commit_evidence_matches_by_family_path_and_key(manager):
     result = mst.add_learning_commit_evidence(task_id="T_LEARN1", request_id="req-1")
 
     assert result["ok"] is True
-    assert result["outcome"] == "rejected"
-    assert result["evidence_outcome"] == "negative"
-    assert result["actor_id"] == "worker.claude.sonnet.5"
-    assert result["actor_source"] == "task_card_runner"
-    assert [row["identity"] for row in result["recorded"]] == [LEARNING_BASE["identity"]]
+    assert result["reason"] == "rejected_commit_is_not_applicability_evidence"
+    assert result["recorded"] == []
 
     record = store.load_registry(manager).get(
         LEARNING_BASE["identity"], LEARNING_BASE["version"]
     )
-    assert record.evidence[-1].outcome is sr.EvidenceOutcome.NEGATIVE
-    assert record.evidence[-1].source == "T_LEARN1:req-1"
-    # Attaching evidence never activates, promotes, or injects anything.
+    assert record.evidence == ()
     assert record.lifecycle_state is sr.LifecycleState.PROPOSED
 
 
@@ -1200,11 +1198,40 @@ def test_sweep_learning_commit_evidence_processes_every_recorded_commit(manager)
         LEARNING_BASE["identity"], LEARNING_BASE["version"]
     )
     assert sr.independent_accepted_evidence_count(record) == 3
-    # Connecting the evidence never activates by itself: activation is still an
-    # explicit, separate manager call against the unchanged two-actor gate.
-    assert record.lifecycle_state is sr.LifecycleState.PROPOSED
-    activated = mst.activate(identity=LEARNING_BASE["identity"], version=LEARNING_BASE["version"])
-    assert activated["ok"] is True
+    # NF-2026-01411: gated auto-activation runs inside the evidence loop, so
+    # the second of these three distinct-actor commits already activates the
+    # record; it no longer waits on a separate manager activate() call.
+    assert record.lifecycle_state is sr.LifecycleState.ACTIVE
+    activated_identities = {(item["identity"], item["version"]) for item in result["activated"]}
+    assert (LEARNING_BASE["identity"], LEARNING_BASE["version"]) in activated_identities
+
+
+def test_sweep_learning_commit_evidence_reports_skip_reasons_and_is_idempotent(manager):
+    # NF-2026-01411: sweep_learning_commit_evidence now has a real caller and
+    # reports why a commit produced no row, plus what it activated.
+    mst.propose(**LEARNING_BASE)
+    _seed_skill_card(manager, "T_SKIP_ACCEPT", runner="claude_sonnet-5")
+    _seed_learning_commit(manager, "T_SKIP_ACCEPT", "req-a", outcome="accepted")
+    _seed_skill_card(manager, "T_SKIP_REJECT", runner="codex_gpt-5.5")
+    _seed_learning_commit(manager, "T_SKIP_REJECT", "req-b", outcome="rejected")
+
+    first = mst.sweep_learning_commit_evidence()
+
+    assert first["ok"] is True
+    assert first["skipped_by_reason"] == {"rejected_commit_is_not_applicability_evidence": 1}
+    assert first["recorded_total"] == 1
+
+    second = mst.sweep_learning_commit_evidence()
+
+    assert second["ok"] is True
+    assert second["recorded_total"] == 1
+    assert all(
+        row["idempotent"] for item in second["results"] for row in item.get("recorded") or []
+    )
+    record = store.load_registry(manager).get(
+        LEARNING_BASE["identity"], LEARNING_BASE["version"]
+    )
+    assert len(record.evidence) == 1
 
 
 def test_sweep_learning_commit_evidence_progresses_across_successive_calls(manager, monkeypatch):

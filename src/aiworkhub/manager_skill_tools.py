@@ -892,33 +892,46 @@ def add_learning_commit_evidence(*, task_id: str, request_id: str = "") -> dict[
     * KEY -- the exact ``task_id``/``request_id`` the learning ledger recorded
       the commit under (:func:`learning_commit_store.read_card_outcomes`),
       never a caller-supplied guess.
-    * FAMILY/PATH -- the commit's own card's selection context
+    * FAMILY/PATH/STAGE -- the commit's own card's selection context
       (:func:`project_context._skill_selection_context`), matched against each
       stored record's declared vocabulary with the identical predicate
       real-time selection uses (:func:`skill_registry.declared_match_reasons`).
       Matching is not gated on lifecycle, so a still-``proposed`` record --
       the one case that actually needs evidence to reach ``active`` -- is
-      reachable here.
+      reachable here. A reworked card's derived stage is ``rework``, which
+      never replaced the first-launch stage (``orientation`` for a read-only
+      card, otherwise ``implementation``) a worker actually saw, so a record
+      matching EITHER stage's vocabulary is matched; ``traversed_stages``
+      reports every stage checked, first-launch stage first.
     * ACTOR -- read off the card's own ``runner`` (:func:`_task_actor`), never
       typed, for the same reason :func:`add_task_evidence` never accepts one.
 
     A card with no adjudicated commit, no selection vocabulary, or an
     unreadable ledger returns ``ok: True`` with an exact ``reason`` and no
     ``recorded`` rows -- an unlinked commit is a fact, never a failure of
-    this call. A record-level write refusal (a stale advance, a rejected
+    this call. A ``rejected`` commit is likewise never applicability
+    evidence: the skills a rejected card happened to declare were never
+    validated by it, so this returns the same unlinked shape with zero rows
+    instead of stamping NEGATIVE evidence; that stays exclusively on
+    :func:`record_decision_evidence`, for skills actually injected into the
+    card. A record-level write refusal (a stale advance, a rejected
     ``add_evidence``) is reported per-record in ``unlinked`` and never
     raised: one contested record must not block every other matching
     record's evidence from landing.
 
-    This never activates, promotes, or injects anything: it only appends
-    evidence entries through the unchanged
-    :meth:`skill_registry.SkillRegistry.add_evidence` gate, and activation
-    still requires the store's own independent-actor floor.
+    Beyond appending evidence through the unchanged
+    :meth:`skill_registry.SkillRegistry.add_evidence` gate, every matched
+    record still ``proposed`` after its evidence is attached gets exactly one
+    activation attempt through the same path :func:`activate` uses, reported
+    per-record in ``activation`` and never in ``unlinked``: the registry's own
+    two-independent-actor, no-unresolved-negative gate is the only authority
+    for whether that attempt succeeds, so a refusal there is a fact about
+    that gate, never a failure of this call.
     """
     from . import learning_commit_store
     from . import project_context
 
-    root, _token, manager = _manager_context()
+    root, token, manager = _manager_context()
     if root is None:
         return manager
     if not core.writes_allowed():
@@ -950,6 +963,8 @@ def add_learning_commit_evidence(*, task_id: str, request_id: str = "") -> dict[
     if resolved is None:
         return _unlinked("no_learning_commit_for_this_key")
     resolved_request, decision = resolved
+    if decision == "rejected":
+        return _unlinked("rejected_commit_is_not_applicability_evidence")
     if decision not in DECISION_EVIDENCE_OUTCOMES:
         return _unlinked("learning_commit_outcome_not_adjudicated")
     evidence_outcome = DECISION_EVIDENCE_OUTCOMES[decision]
@@ -974,6 +989,13 @@ def add_learning_commit_evidence(*, task_id: str, request_id: str = "") -> dict[
     if context is None:
         return _unlinked("card_declares_no_selection_vocabulary")
 
+    if context.get("stage") == "rework":
+        first_launch_stage = "orientation" if card.get("read_only") is True else "implementation"
+        traversed_contexts = [{**context, "stage": first_launch_stage}, context]
+    else:
+        traversed_contexts = [context]
+    traversed_stages = [str(item.get("stage") or "") for item in traversed_contexts]
+
     try:
         _role, actor_id, anchor_task = _task_actor(root, task, require_finished=False)
     except sr.SkillRegistryError as exc:
@@ -989,11 +1011,16 @@ def add_learning_commit_evidence(*, task_id: str, request_id: str = "") -> dict[
     recorded: list[dict[str, Any]] = []
     unlinked: list[dict[str, Any]] = []
     for record in stored:
-        try:
-            reasons = sr.declared_match_reasons(record, context)
-        except sr.SkillRegistryError:
-            continue
-        if reasons is None:
+        matched = False
+        for candidate in traversed_contexts:
+            try:
+                reasons = sr.declared_match_reasons(record, candidate)
+            except sr.SkillRegistryError:
+                continue
+            if reasons is not None:
+                matched = True
+                break
+        if not matched:
             continue
         if any(
             item.source == anchor
@@ -1032,6 +1059,51 @@ def add_learning_commit_evidence(*, task_id: str, request_id: str = "") -> dict[
             "outcome": evidence_outcome, "idempotent": False,
         })
 
+    activation: list[dict[str, Any]] = []
+    for identity, version in sorted({(item["identity"], item["version"]) for item in recorded}):
+        try:
+            registry = store.load_registry(root)
+            current = registry.get(identity, version)
+        except (store.SkillStoreError, OSError, sqlite3.Error) as exc:
+            activation.append({
+                "identity": identity, "version": version, "activated": False,
+                "reason": f"skill_store_unreadable:{type(exc).__name__}",
+            })
+            continue
+        if current is None:
+            activation.append({
+                "identity": identity, "version": version, "activated": False,
+                "reason": "skill_version_not_stored",
+            })
+            continue
+        if current.lifecycle_state is not sr.LifecycleState.PROPOSED:
+            activation.append({
+                "identity": identity, "version": version, "activated": False,
+                "reason": f"lifecycle_state_not_proposed:{current.lifecycle_state.value}",
+            })
+            continue
+        injectable, inject_reason = skill_miner.injectability(current)
+        try:
+            authority = sr.Authority(sr.AuthorityRole.MANAGER, actor_id=_MANAGER_ACTOR, token=token)
+            expected = store.stored_state_digest(root, identity, version)
+            updated = registry.activate(identity, version, authority)
+            store.advance_record(root, updated, expected_state_digest=expected)
+        except sr.SkillRegistryError as exc:
+            reason = (
+                inject_reason
+                if not injectable and inject_reason != "lifecycle_state_is_proposed_not_active"
+                else exc.code
+            )
+            activation.append({"identity": identity, "version": version, "activated": False, "reason": reason})
+            continue
+        except (store.SkillStoreError, OSError, sqlite3.Error) as exc:
+            activation.append({
+                "identity": identity, "version": version, "activated": False,
+                "reason": str(exc)[:200],
+            })
+            continue
+        activation.append({"identity": identity, "version": version, "activated": True, "reason": "activated"})
+
     return {
         "ok": True,
         "schema_id": LEARNING_EVIDENCE_SCHEMA_ID,
@@ -1043,8 +1115,10 @@ def add_learning_commit_evidence(*, task_id: str, request_id: str = "") -> dict[
         "actor_source": "task_card_runner",
         "evidence_basis": "adjudicated_applicable_card",
         "matched_context": _context_payload(context),
+        "traversed_stages": traversed_stages,
         "recorded": recorded,
         "unlinked": unlinked,
+        "activation": activation,
         "manager": manager,
         "surface": "manager_mcp",
     }
@@ -1072,6 +1146,14 @@ def sweep_learning_commit_evidence(
     :data:`MAX_LEARNING_EVIDENCE_SWEEP` is reached in full across successive
     calls instead of replaying the lexicographically first window forever.
     ``next_cursor`` is ``""`` once nothing remains after this window.
+
+    ``skipped_by_reason`` counts, per exact :func:`add_learning_commit_evidence`
+    ``reason`` (a rejected commit, a card with no selection vocabulary, and so
+    on), how many of this window's commits produced no recorded row.
+    ``activated`` lists every identity/version this window's evidence pushed
+    across the registry's own activation gate -- a re-run over the same
+    window activates nothing twice, since the second pass sees an already
+    ``active`` record and attempts nothing further.
     """
     from . import learning_commit_store
 
@@ -1101,6 +1183,15 @@ def sweep_learning_commit_evidence(
         add_learning_commit_evidence(task_id=key.partition(":")[0], request_id=key.partition(":")[2])
         for key in window
     ]
+    skipped_by_reason: Counter[str] = Counter()
+    activated: list[dict[str, str]] = []
+    for item in results:
+        reason = item.get("reason")
+        if reason:
+            skipped_by_reason[reason] += 1
+        for entry in item.get("activation") or ():
+            if entry.get("activated"):
+                activated.append({"identity": entry["identity"], "version": entry["version"]})
     return {
         "ok": True,
         "schema_id": LEARNING_EVIDENCE_SCHEMA_ID,
@@ -1110,6 +1201,8 @@ def sweep_learning_commit_evidence(
         "commits_total": len(keys),
         "truncated": truncated,
         "recorded_total": sum(len(item.get("recorded") or []) for item in results),
+        "skipped_by_reason": dict(skipped_by_reason),
+        "activated": activated,
         "results": results,
         "manager": manager,
         "surface": "manager_mcp",

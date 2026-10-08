@@ -1759,6 +1759,25 @@ def aiworkhub_manager_skill_retirement_report(
     return manager_skill_tools.retirement_report(min_anchors=min_anchors)
 
 
+@mcp.tool()
+def aiworkhub_manager_skill_evidence_sweep(
+    limit: int = manager_skill_tools.MAX_LEARNING_EVIDENCE_SWEEP,
+    cursor: str = "",
+) -> dict[str, Any]:
+    """MANAGER WRITE: backfill learning-commit evidence for every recorded commit.
+
+    Bounded and resumable like every other sweep here: pass back
+    ``next_cursor`` to continue past a ledger larger than ``limit``. Reports
+    ``skipped_by_reason`` (why a window's commit produced no row -- rejected,
+    no selection vocabulary, and so on) and ``activated`` (every
+    identity/version this window's evidence pushed across the registry's own
+    two-actor activation gate). A second sweep over an unchanged window
+    records nothing new and activates nothing twice.
+    """
+
+    return manager_skill_tools.sweep_learning_commit_evidence(limit=limit, cursor=cursor)
+
+
 def _manager_loop_repo_root(
     *, launching: bool = False
 ) -> tuple[Path | None, dict[str, Any] | None]:
