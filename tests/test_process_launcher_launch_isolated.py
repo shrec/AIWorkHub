@@ -1309,7 +1309,9 @@ def test_opencode_launch_hands_the_supervisor_the_request_local_awh_config(
     )
     # Model pin and effort tokens are still the adapter plan's, untouched.
     assert adapter_argv[1:7] == ["run", "--standalone", "--format", "json", "--model", _OPENCODE_MODEL]
-    assert adapter_argv[-1] == "prompt-text"
+    # NF-2026-01417: opencode_cli now carries its prompt on stdin, not argv.
+    assert "prompt-text" not in adapter_argv
+    assert spec[runtime_adapters.WORKER_PROMPT_BYTES_SPEC_KEY] == len("prompt-text".encode("utf-8"))
     assert "model" not in config and "provider" not in config
     # Request-local: the config lives only in the child environment.
     assert not list(tmp_path.rglob("opencode*.json"))

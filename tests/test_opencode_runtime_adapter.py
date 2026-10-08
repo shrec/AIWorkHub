@@ -122,6 +122,7 @@ def test_opencode_argv_is_format_json_and_exact_provider_model(tmp_path: Path) -
     )
 
     assert plan.launchable is True
+    # NF-2026-01417: the prompt rides stdin_text now, never a positional argv element.
     assert plan.argv == [
         str(executable),
         "run",
@@ -130,9 +131,9 @@ def test_opencode_argv_is_format_json_and_exact_provider_model(tmp_path: Path) -
         "json",
         "--model",
         model,
-        prompt,
     ]
-    assert plan.argv.count(prompt) == 1
+    assert plan.stdin_text == prompt
+    assert prompt not in plan.argv
     assert not any("AUTH" in token or "KEY" in token for token in plan.argv)
 
 

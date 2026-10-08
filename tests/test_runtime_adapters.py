@@ -553,6 +553,7 @@ def test_grok_kilo_runtime_plan_is_exact_and_preserves_prompt(tmp_path):
     )
 
     assert plan.launchable is True
+    # NF-2026-01417: the prompt rides stdin_text now, never a positional argv element.
     assert plan.argv == [
         str(executable),
         "run",
@@ -564,9 +565,9 @@ def test_grok_kilo_runtime_plan_is_exact_and_preserves_prompt(tmp_path):
         "--dir",
         str(repo.resolve()),
         "--auto",
-        prompt,
     ]
-    assert plan.argv.count(prompt) == 1
+    assert plan.stdin_text == prompt
+    assert prompt not in plan.argv
     assert not any("AUTH" in token or "XDG_" in token for token in plan.argv)
 
 

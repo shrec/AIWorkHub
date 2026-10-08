@@ -1096,8 +1096,12 @@ def test_seat_turn_passes_merged_env_to_spawn(tmp_path: Path) -> None:
 
 def test_stream_tokens_keep_thinking_on_without_a_level_and_normalize_the_level() -> None:
     assert mlb.manager_stream_tokens("opencode_cli") == ["--thinking"]
+    # NF-2026-01417: apply_manager_stream_tokens now appends for opencode_cli too.
     assert mlb.apply_manager_stream_tokens("opencode_cli", ["opencode", "run", "hi"]) == [
-        "opencode", "run", "--thinking", "hi",
+        "opencode", "run", "hi", "--thinking",
+    ]
+    assert mlb.apply_manager_stream_tokens("opencode_cli", ["opencode", "run", "--model", "m"], "high") == [
+        "opencode", "run", "--model", "m", "--thinking",
     ]
     assert mlb.apply_manager_stream_tokens("claude_cli", ["claude", "-p"], " High ") == [
         "claude", "-p", "--include-partial-messages", "--thinking-display", "summarized", "--effort", "high",

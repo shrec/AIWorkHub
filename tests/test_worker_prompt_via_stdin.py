@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -18,8 +19,6 @@ from aiworkhub import runtime_adapters, windows_appcontainer, worker_supervisor 
 _OTHER_ARGV_PROMPT_ADAPTERS = (
     "deepseek_copilot_cli",
     "glm_copilot_cli",
-    "grok_kilo_cli",
-    "opencode_cli",
 )
 
 
@@ -77,7 +76,6 @@ def test_other_local_adapters_keep_the_prompt_in_argv_and_carry_no_stdin_text(
             adapter_id,
             prompt,
             repo,
-            model="opencode/big-pickle" if adapter_id == "opencode_cli" else None,
             executable_overrides={adapter_id: str(executable)},
         )
         assert plan.launchable is True, plan.validation_reason
@@ -104,6 +102,37 @@ def test_forty_thousand_character_prompt_stays_under_the_command_line_limit(
     assert plan.stdin_text == prompt
     command_line = windows_appcontainer.build_command_line(plan.argv)
     assert len(command_line) < 32767
+
+
+# NF-2026-01417: Kilo and OpenCode now take the worker prompt on stdin, not argv,
+# so a 40 KB+ prompt never pushes the launch command line past the Windows limit.
+@pytest.mark.parametrize(
+    ("adapter_id", "model", "executable_name"),
+    [
+        ("grok_kilo_cli", None, "kilo"),
+        ("opencode_cli", "opencode/big-pickle", "opencode"),
+    ],
+)
+def test_kilo_and_opencode_carry_a_forty_thousand_character_prompt_on_stdin(
+    tmp_path: Path, adapter_id: str, model: str | None, executable_name: str
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    executable = _fake_executable(tmp_path, executable_name)
+    prompt = "x" * 40_000
+
+    plan = runtime_adapters.build_runtime_command(
+        adapter_id,
+        prompt,
+        repo,
+        model=model,
+        executable_overrides={adapter_id: str(executable)},
+    )
+
+    assert plan.launchable is True, plan.validation_reason
+    assert plan.stdin_text == prompt
+    assert prompt not in plan.argv
+    assert len(subprocess.list2cmdline(plan.argv)) < 32767
 
 
 def _minimal_supervisor_spec(tmp_path: Path, argv: list[str]) -> dict[str, Any]:

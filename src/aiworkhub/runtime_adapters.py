@@ -2384,8 +2384,8 @@ def build_runtime_command(
             "--dir",
             cwd,
             "--auto",
-            prompt,
         ]
+        stdin_text = prompt
     elif adapter_id == OPENCODE_CLI_ADAPTER:
         resolved_model, model_error = resolve_opencode_model(model)
         if model_error:
@@ -2406,8 +2406,8 @@ def build_runtime_command(
             "--model",
             resolved_model,
             *effort_tokens,
-            prompt,
         ]
+        stdin_text = prompt
     else:  # Copilot CLI in BYOK mode for OpenAI-compatible local-worker adapters
         if adapter_id == DEEPSEEK_COPILOT_ADAPTER:
             resolved_model, model_error = resolve_deepseek_model(model)

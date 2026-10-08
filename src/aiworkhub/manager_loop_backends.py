@@ -494,8 +494,6 @@ def apply_manager_stream_tokens(backend_id: str, argv: list[str], level: str = "
     tokens = manager_stream_tokens(backend_id, level)
     if not tokens:
         return list(argv)
-    if backend_id == "opencode_cli" and argv:
-        return [*argv[:-1], *tokens, argv[-1]]
     if backend_id == "codex_cli" and argv and argv[-1] == "-":
         return [*argv[:-1], *tokens, "-"]
     return [*argv, *tokens]
