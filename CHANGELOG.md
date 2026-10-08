@@ -6,6 +6,17 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.39] - 2026-10-09
+
+### Added
+
+- Dashboard: the Tool Recipes window lists each recipe with its origin (canonical, conditional, mined), family, version, run counts, exit distribution and last use, and opens a per-recipe detail view instead of one aggregate line (NF-2026-01424).
+- Tool recipes: every accepted learning commit mines the recurring validation commands of accepted cards into proposed tool recipes on its own, the same way skills are mined (NF-2026-01425).
+
+### Qualification
+
+- Each change has regressions that fail before and pass after; the touched suites pass. Installation and live replay are separate evidence.
+
 ## [0.12.38] - 2026-10-08
 
 ### Added

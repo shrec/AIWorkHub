@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.39 — 2026-10-09
+
+### Added
+
+- The Tool Recipes window lists each recipe with origin, family, version, run counts, exit distribution and last use, with a per-recipe detail view (NF-2026-01424).
+- Bundled MCP runtime: accepted learning commits mine recurring validation commands into proposed tool recipes (NF-2026-01425).
+
+### Qualification
+
+- Independent component regressions pass; installation, activation and live qualification are separate evidence.
+
 ## 0.12.38 — 2026-10-08
 
 ### Added

@@ -14,6 +14,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.39
+
+- The dashboard Tool Recipes window shows each recipe: where it came from, what it does, how often it ran, how it exited and when it was last used (NF-2026-01424).
+- Tool recipes grow per project: accepted learning commits mine recurring validation commands into proposed recipes automatically (NF-2026-01425).
+
 ## What's new in 0.12.38
 
 - The skill system runs end to end on its own: accepted learning commits mine recurring lessons into skill proposals (NF-2026-01412), evidence reaches every stage a card went through, and a skill backed by two independent accepted actors activates automatically (NF-2026-01411).
