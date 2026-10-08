@@ -705,6 +705,301 @@ const skillsWithRows = {
   );
 }
 
+// ---------------------------------------------------------------------------
+// NF-2026-01424: the Tool Recipes WINDOW. "29 recipes" over one aggregate line
+// answered none of the questions an owner asks, so the dialog now renders KPI
+// tiles, a plain pipeline sentence, one table row per recipe with a text status
+// pill, and a per-row details expansion. The aggregate line stays the fallback
+// when rows are absent, and that is asserted too.
+// ---------------------------------------------------------------------------
+
+assert.match(generated, /function codingFoundationRecipesWindow/);
+assert.match(generated, /function codingFoundationRecordWindow/);
+assert.match(generated, /CODING_FOUNDATION_RECIPE_COLUMNS/);
+
+const recipeRows = [
+  {
+    id: "aiworkhub.git.status",
+    version: "1.0.0",
+    origin: "canonical",
+    purpose: "Report <script>alert(1)</script> worktree status",
+    task_kind: "test",
+    risk_class: "medium",
+    platforms: ["linux", "win32"],
+    status: "used",
+    runs: 7,
+    distinct_actors: 2,
+    attributed_runs: 5,
+    unattributed_runs: 2,
+    first_run_at: "2026-09-30T08:00:00Z",
+    last_run_at: "2026-10-07T12:00:00Z",
+    exit_distribution: { "completed:0": 6, "completed:1": 1 },
+  },
+  {
+    id: "aiworkhub.validation.package_gate_pytest",
+    version: "1.0.0",
+    origin: "conditional",
+    purpose: "Run the package gate",
+    task_kind: "test",
+    risk_class: "low",
+    platforms: [],
+    status: "never_used",
+    runs: 0,
+    distinct_actors: 0,
+    attributed_runs: 0,
+    unattributed_runs: 0,
+    first_run_at: "",
+    last_run_at: "",
+    exit_distribution: {},
+  },
+  {
+    id: "mined.legacy-probe",
+    version: "0.9.0",
+    origin: "mined",
+    purpose: "",
+    task_kind: "",
+    risk_class: "",
+    platforms: [],
+    status: "unregistered",
+    runs: 3,
+    distinct_actors: 0,
+    attributed_runs: 0,
+    unattributed_runs: 3,
+    first_run_at: "2026-08-01T09:00:00Z",
+    last_run_at: "2026-08-02T09:00:00Z",
+    exit_distribution: { timeout: 3 },
+  },
+];
+
+const recipesWithRows = {
+  schema_id: internals.CODING_FOUNDATION_SCHEMAS.tool_recipes,
+  state: "measured",
+  count: 2,
+  discovery_count: 2,
+  usage: {
+    state: "measured",
+    registered_count: 2,
+    used_count: 1,
+    unused_count: 1,
+    run_count: 10,
+    attributed_run_count: 5,
+    unattributed_run_count: 5,
+    distinct_actor_count: 2,
+  },
+  records: recipeRows,
+  records_total: 3,
+  records_truncated: false,
+};
+
+{
+  const harness = popupHarness();
+  harness.onMessage({
+    data: { type: "snapshot", payload: { snapshot_mode: "full", tool_recipes: recipesWithRows } },
+  });
+  harness.recipes.click();
+  const text = harness.body.textContent;
+
+  // (a) five KPI tiles.
+  for (const label of [
+    "Registered recipes", "Used at least once", "Never used", "Runs recorded", "Distinct actors",
+  ]) {
+    assert.ok(text.includes(label), `missing KPI tile: ${label}`);
+  }
+  assert.deepStrictEqual(
+    internals.codingFoundationRecipeKpis(internals.codingFoundationRecipeRowModel(recipesWithRows))
+      .map((tile) => tile.value),
+    ["2", "1", "1", "10", "2"],
+  );
+
+  // (b) one plain-language pipeline sentence naming all three seed routes and
+  // the fact that only the manager invokes a recipe today.
+  assert.match(text, /canonical seed every repository gets/);
+  assert.match(text, /conditional seed only for the toolchains this project actually has/);
+  assert.match(text, /mined recipes derived from past runs/);
+  assert.match(
+    text,
+    /A recipe runs only when the manager invokes it today, so 1 of 3 listed recipes have ever run and 1 never have; 1 row records runs for a version the registry no longer holds\./,
+  );
+
+  // (c) one table row per recipe, headed with scoped th cells.
+  const columns = byTag(harness.body, "TH").filter((th) => th.attrs.scope === "col");
+  assert.deepStrictEqual(
+    columns.map((th) => th.textContent),
+    ["Recipe", "What it does", "Status", "Runs", "Actors", "Last run"],
+  );
+  assert.strictEqual(byTag(harness.body, "TH").filter((th) => th.attrs.scope === "row").length, 3);
+  // Status is carried by the pill's TEXT. Colour never carries it alone.
+  const pills = descendants(harness.body)
+    .filter((node) => node.className === "coding-foundation-recipes-pill");
+  assert.deepStrictEqual(
+    pills.map((pill) => pill.textContent),
+    ["Used", "Never used", "Unregistered"],
+  );
+  assert.match(text, /invoked through the manager/);
+  assert.match(text, /registered and offered, but nobody has invoked it/);
+  assert.match(text, /runs recorded, but the registry no longer holds this version/);
+  assert.match(text, /7 runs \(5 attributed · 2 unattributed\)/);
+  assert.match(text, /Never run/);
+  assert.match(text, /2 actors/);
+  assert.match(text, /No attributed actor/);
+  // How the recipe got here rides the identity cell as a word.
+  for (const origin of ["canonical", "conditional", "mined"]) {
+    assert.ok(
+      descendants(harness.body).some((node) => node.textContent === origin),
+      `a recipe row must carry its origin badge: ${origin}`,
+    );
+  }
+
+  // (d) a per-row details expansion with the contract, platforms and exits.
+  assert.strictEqual(byTag(harness.body, "DETAILS").length, 3);
+  assert.strictEqual(byTag(harness.body, "SUMMARY").length, 3);
+  assert.match(text, /Task kind test · risk class medium · origin canonical/);
+  assert.match(text, /Task kind unknown · risk class unknown · origin mined/);
+  assert.match(text, /Platforms/);
+  assert.match(text, /Exit distribution/);
+  assert.match(text, /completed:0: 6/);
+  assert.match(text, /timeout: 3/);
+  assert.match(text, /No platform declared/);
+  assert.match(text, /No exit recorded/);
+  assert.match(text, /First run 2026-09-30T08:00:00Z · last run 2026-10-07T12:00:00Z/);
+  assert.match(text, /First run never · last run never/);
+  assert.match(text, /Purpose: none recorded/);
+  assert.match(text, /No purpose recorded/);
+
+  // Untrusted stored strings render as TEXT, never as markup.
+  assert.match(text, /Report <script>alert\(1\)<\/script> worktree status/);
+  assert.ok(
+    descendants(harness.body).every((node) => node.tagName !== "SCRIPT" && node.tagName !== "IMG"),
+    "stored text must never be parsed into elements",
+  );
+
+  // Layout comes from the VS Code theme variables the dashboard already uses.
+  const themed = descendants(harness.body)
+    .filter((node) => JSON.stringify(node.style).includes("var(--vscode-"));
+  assert.ok(themed.length >= 10, "the window must be themed with VS Code CSS variables");
+
+  // Refilling replaces the window instead of stacking a second one.
+  const rendered = harness.body.children.length;
+  harness.recipes.click();
+  assert.strictEqual(harness.body.children.length, rendered);
+  assert.strictEqual(byTag(harness.body, "DETAILS").length, 3);
+}
+
+{
+  // Zero records is an explicit empty state, not an empty table.
+  const harness = popupHarness();
+  harness.onMessage({
+    data: {
+      type: "snapshot",
+      payload: {
+        snapshot_mode: "full",
+        tool_recipes: {
+          schema_id: internals.CODING_FOUNDATION_SCHEMAS.tool_recipes,
+          state: "no_sample",
+          count: 0,
+          records: [],
+          records_total: 0,
+          records_truncated: false,
+        },
+      },
+    },
+  });
+  harness.recipes.click();
+  assert.match(harness.body.textContent, /No recipes yet/);
+  assert.strictEqual(byTag(harness.body, "TABLE").length, 0);
+  assert.doesNotMatch(harness.body.textContent, /Registered recipes/);
+}
+
+{
+  // Rows absent -> the old aggregate line, unchanged. A measured window is
+  // then retained across the summary refreshes that omit `records`.
+  const harness = popupHarness();
+  harness.onMessage({
+    data: { type: "snapshot", payload: { snapshot_mode: "full", tool_recipes: longRecipes } },
+  });
+  harness.recipes.click();
+  assert.strictEqual(byTag(harness.body, "TABLE").length, 0);
+  assert.match(harness.body.textContent, /8 used/);
+  assert.match(harness.body.textContent, /71 unattributed/);
+
+  harness.onMessage({
+    data: { type: "snapshot", payload: { snapshot_mode: "full", tool_recipes: recipesWithRows } },
+  });
+  harness.recipes.click();
+  assert.strictEqual(byTag(harness.body, "TABLE").length, 1);
+  harness.onMessage({
+    data: {
+      type: "snapshotSummary",
+      payload: {
+        snapshot_mode: "summary",
+        omitted_fields: internals.CODING_FOUNDATION_CARD_KEYS,
+      },
+    },
+  });
+  harness.recipes.click();
+  assert.strictEqual(byTag(harness.body, "TABLE").length, 1);
+  // The Skills window is a separate slot and must not have been filled by a
+  // recipes payload.
+  harness.skills.click();
+  assert.strictEqual(byTag(harness.body, "TABLE").length, 0);
+}
+
+{
+  // An absent `records` is not an empty registry, and above the bound every
+  // derived number is qualified rather than published as the population.
+  assert.strictEqual(internals.codingFoundationRecipeRowModel({ state: "measured" }), null);
+  const truncated = internals.codingFoundationRecipeRowModel({
+    records: [recipeRows[0]],
+    records_total: "unknown",
+    records_truncated: true,
+  });
+  assert.strictEqual(truncated.totalExact, false);
+  assert.strictEqual(truncated.rows.length, 1);
+  assert.strictEqual(
+    internals.codingFoundationRecipeSentence(truncated).endsWith(
+      "A recipe runs only when the manager invokes it today, so at least 1 of 1+ "
+        + "listed recipes have ever run and 0 never have.",
+    ),
+    true,
+  );
+  assert.deepStrictEqual(
+    internals.codingFoundationRecipeKpis(truncated).map((tile) => tile.label + ": " + tile.value),
+    [
+      "Registered recipes: 1+",
+      "Used at least once: 1 (first 1 shown)",
+      "Never used: 0 (first 1 shown)",
+      "Runs recorded: 7 (first 1 shown)",
+      "Distinct actors: Not measured",
+    ],
+  );
+  // Unmeasured and zero are different facts and never share a sentence.
+  assert.strictEqual(internals.codingFoundationRecipeRuns({}), "Not measured");
+  assert.strictEqual(internals.codingFoundationRecipeRuns({ runs: 0 }), "Never run");
+  assert.strictEqual(
+    internals.codingFoundationRecipeRuns({ runs: 1, attributed_runs: 1, unattributed_runs: 0 }),
+    "1 run (1 attributed · 0 unattributed)",
+  );
+  assert.strictEqual(internals.codingFoundationRecipeActors({}), "Not measured");
+  assert.strictEqual(
+    internals.codingFoundationRecipeActors({ distinct_actors: 0 }),
+    "No attributed actor",
+  );
+  assert.strictEqual(
+    internals.codingFoundationRecipeActors({ distinct_actors: 1 }),
+    "1 actor",
+  );
+  // A status named after an Object.prototype member must not resolve to one.
+  assert.strictEqual(
+    internals.codingFoundationRecipeStatus({ status: "constructor" }),
+    "constructor",
+  );
+  assert.strictEqual(internals.codingFoundationRecipeStatus({}), "Status not recorded");
+  assert.strictEqual(
+    internals.codingFoundationRecipeReason({ status: "constructor" }),
+    "no run state was recorded",
+  );
+}
+
 assert.match(html, /type="button"/);
 assert.doesNotMatch(generated, /\.innerHTML\s*=/);
 

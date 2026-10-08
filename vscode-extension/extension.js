@@ -11873,7 +11873,10 @@ function codingFoundationEl(doc, tag, options) {
   return node;
 }
 
-function codingFoundationSkillRowModel(projection) {
+// NF-2026-01424. Reading a bounded `records` list and disclosing its bound is
+// the same job for every per-record foundation window, so it has one owner and
+// each window adds only the tallies its own subject needs.
+function codingFoundationRecordRows(projection) {
   if (!projection || typeof projection !== "object" || Array.isArray(projection)) return null;
   // An absent `records` is not an empty registry: the summary snapshot omits
   // the field on every poll. Only an array is a measurement.
@@ -11883,14 +11886,9 @@ function codingFoundationSkillRowModel(projection) {
     const row = projection.records[i];
     if (row && typeof row === "object" && !Array.isArray(row)) rows.push(row);
   }
-  let injectable = 0;
-  let active = 0;
-  let waiting = 0;
-  for (let i = 0; i < rows.length; i += 1) {
-    if (rows[i].injectable === true) injectable += 1;
-    if (rows[i].effective_lifecycle === "active") active += 1;
-    if (rows[i].injectable_reason === "activation_evidence_below_two_distinct_actors") waiting += 1;
-  }
+  // Above the bound `records_total` is the string "unknown", which is not a
+  // count, so the shown rows become the total and `totalExact` says they are a
+  // floor rather than the population.
   const declared = codingFoundationBoundedCount(projection.records_total);
   const truncated = projection.records_truncated === true;
   return {
@@ -11898,15 +11896,34 @@ function codingFoundationSkillRowModel(projection) {
     truncated: truncated,
     total: declared == null ? rows.length : declared,
     totalExact: declared != null && !truncated,
+  };
+}
+
+function codingFoundationRecordTotal(model) {
+  return model.totalExact ? String(model.total) : model.rows.length + "+";
+}
+
+function codingFoundationSkillRowModel(projection) {
+  const base = codingFoundationRecordRows(projection);
+  if (base === null) return null;
+  let injectable = 0;
+  let active = 0;
+  let waiting = 0;
+  for (let i = 0; i < base.rows.length; i += 1) {
+    if (base.rows[i].injectable === true) injectable += 1;
+    if (base.rows[i].effective_lifecycle === "active") active += 1;
+    if (base.rows[i].injectable_reason === "activation_evidence_below_two_distinct_actors") waiting += 1;
+  }
+  return {
+    rows: base.rows,
+    truncated: base.truncated,
+    total: base.total,
+    totalExact: base.totalExact,
     injectable: injectable,
     active: active,
     waiting: waiting,
     injectedCards: codingFoundationBoundedCount(projection.records_injected_card_count),
   };
-}
-
-function codingFoundationSkillTotal(model) {
-  return model.totalExact ? String(model.total) : model.rows.length + "+";
 }
 
 function codingFoundationSkillReason(row) {
@@ -11971,7 +11988,7 @@ function codingFoundationSkillLastEvidence(row) {
 }
 
 function codingFoundationSkillSentence(model) {
-  const total = codingFoundationSkillTotal(model);
+  const total = codingFoundationRecordTotal(model);
   const clause = model.waiting
     ? model.waiting + (model.waiting === 1 ? " waits" : " wait")
       + " for accepted evidence from 2 different workers"
@@ -11999,7 +12016,7 @@ function codingFoundationSkillKpis(model) {
   // page, so neither takes the suffix.
   const shown = model.totalExact ? "" : " (first " + model.rows.length + " shown)";
   return [
-    { label: "Total skills", value: codingFoundationSkillTotal(model) },
+    { label: "Total skills", value: codingFoundationRecordTotal(model) },
     { label: "Active & injectable", value: String(model.injectable) + shown },
     { label: "Waiting for evidence", value: String(model.waiting) + shown },
     {
@@ -12176,25 +12193,31 @@ function codingFoundationSkillTableRow(doc, body, row) {
   return tr;
 }
 
-function codingFoundationSkillsWindow(doc, host, model) {
+// NF-2026-01424. The window CHROME -- empty state, KPI tiles, pipeline
+// sentence, scrolling table with scoped column headers, truncation caption and
+// one row per record -- is identical for every per-record foundation window,
+// so there is one renderer and `spec` carries what differs: the class prefix
+// every node keeps, the columns, and the three builders that know the subject.
+// The Tool Recipes window reuses this rather than forking a second copy of it.
+function codingFoundationRecordWindow(doc, host, model, spec) {
   const styles = CODING_FOUNDATION_SKILL_STYLES;
   const root = codingFoundationEl(doc, "div", {
-    className: "coding-foundation-skills", style: styles.window, parent: host,
+    className: spec.prefix, style: styles.window, parent: host,
   });
   if (model.rows.length === 0) {
     codingFoundationEl(doc, "p", {
-      className: "coding-foundation-skills-empty", style: styles.empty, parent: root,
-      text: "No skills yet. Nothing has been proposed, so nothing can reach a worker.",
+      className: spec.prefix + "-empty", style: styles.empty, parent: root,
+      text: spec.empty,
     });
     return root;
   }
   const kpis = codingFoundationEl(doc, "div", {
-    className: "coding-foundation-skills-kpis", style: styles.kpis, parent: root,
+    className: spec.prefix + "-kpis", style: styles.kpis, parent: root,
   });
-  const tiles = codingFoundationSkillKpis(model);
+  const tiles = spec.kpis(model);
   for (let i = 0; i < tiles.length; i += 1) {
     const tile = codingFoundationEl(doc, "div", {
-      className: "coding-foundation-skills-kpi", style: styles.kpi, parent: kpis,
+      className: spec.prefix + "-kpi", style: styles.kpi, parent: kpis,
     });
     codingFoundationEl(doc, "strong", {
       parent: tile, style: styles.kpiValue, text: tiles[i].value,
@@ -12204,36 +12227,319 @@ function codingFoundationSkillsWindow(doc, host, model) {
     });
   }
   codingFoundationEl(doc, "p", {
-    className: "coding-foundation-skills-pipeline", style: styles.sentence, parent: root,
-    text: codingFoundationSkillSentence(model),
+    className: spec.prefix + "-pipeline", style: styles.sentence, parent: root,
+    text: spec.sentence(model),
   });
   const scroll = codingFoundationEl(doc, "div", {
-    className: "coding-foundation-skills-scroll", style: styles.scroll, parent: root,
+    className: spec.prefix + "-scroll", style: styles.scroll, parent: root,
   });
   const table = codingFoundationEl(doc, "table", {
-    className: "coding-foundation-skills-table", style: styles.table, parent: scroll,
+    className: spec.prefix + "-table", style: styles.table, parent: scroll,
   });
   if (model.truncated) {
     codingFoundationEl(doc, "caption", {
       parent: table, style: styles.caption,
-      text: "Showing the first " + model.rows.length
-        + " stored records; the registry holds more.",
+      text: "Showing the first " + model.rows.length + " " + spec.caption,
     });
   }
   const headRow = codingFoundationEl(doc, "tr", {
     parent: codingFoundationEl(doc, "thead", { parent: table }),
   });
-  for (let i = 0; i < CODING_FOUNDATION_SKILL_COLUMNS.length; i += 1) {
+  for (let i = 0; i < spec.columns.length; i += 1) {
     codingFoundationEl(doc, "th", {
       parent: headRow, style: styles.th, attrs: { scope: "col" },
-      text: CODING_FOUNDATION_SKILL_COLUMNS[i],
+      text: spec.columns[i],
     });
   }
   const body = codingFoundationEl(doc, "tbody", { parent: table });
   for (let i = 0; i < model.rows.length; i += 1) {
-    codingFoundationSkillTableRow(doc, body, model.rows[i]);
+    spec.row(doc, body, model.rows[i]);
   }
   return root;
+}
+
+function codingFoundationSkillsWindow(doc, host, model) {
+  return codingFoundationRecordWindow(doc, host, model, {
+    prefix: "coding-foundation-skills",
+    empty: "No skills yet. Nothing has been proposed, so nothing can reach a worker.",
+    caption: "stored records; the registry holds more.",
+    columns: CODING_FOUNDATION_SKILL_COLUMNS,
+    kpis: codingFoundationSkillKpis,
+    sentence: codingFoundationSkillSentence,
+    row: codingFoundationSkillTableRow,
+  });
+}
+
+// NF-2026-01424. The Tool Recipes WINDOW. This panel reported "29 recipes" over
+// one aggregate line -- "14 used · 15 unused · 132 runs · 117 attributed · 15
+// unattributed · 2 actors" -- which answers none of the questions an owner
+// actually asks: which recipe does what, how often each one ran, by whom, and
+// when. Everything below reads the projection's per-recipe `records` list and
+// renders it under the two constraints the Skills window block above states in
+// full: no innerHTML anywhere, because a stored purpose containing
+// "<img onerror=...>" has to read as exactly those characters; and layout
+// through the CSSOM with VS Code theme variables, because this page's CSP
+// blocks a style attribute and an inline stylesheet outright. The style table,
+// the element helper, the record model and the window renderer are that
+// window's own -- reused here, never forked.
+const CODING_FOUNDATION_RECIPE_COLUMNS = [
+  "Recipe", "What it does", "Status", "Runs", "Actors", "Last run",
+];
+const CODING_FOUNDATION_RECIPE_STATUS = {
+  used: "Used",
+  never_used: "Never used",
+  unregistered: "Unregistered",
+};
+const CODING_FOUNDATION_RECIPE_REASONS = {
+  used: "invoked through the manager",
+  never_used: "registered and offered, but nobody has invoked it",
+  unregistered: "runs recorded, but the registry no longer holds this version",
+};
+
+function codingFoundationRecipeRowModel(projection) {
+  const base = codingFoundationRecordRows(projection);
+  if (base === null) return null;
+  let used = 0;
+  let neverUsed = 0;
+  let unregistered = 0;
+  let runs = 0;
+  for (let i = 0; i < base.rows.length; i += 1) {
+    const status = base.rows[i].status;
+    if (status === "used") used += 1;
+    if (status === "never_used") neverUsed += 1;
+    if (status === "unregistered") unregistered += 1;
+    const counted = codingFoundationBoundedCount(base.rows[i].runs);
+    if (counted != null) runs += counted;
+  }
+  // Distinct actors is NOT the sum of the per-recipe counts: two recipes run by
+  // one manager session are ONE actor overall and one apiece, so summing would
+  // report two. The repository-wide figure is the usage section's own
+  // measurement, so it is read from there or reported as unmeasured.
+  const usage = projection.usage && typeof projection.usage === "object"
+    && !Array.isArray(projection.usage)
+    ? projection.usage
+    : null;
+  return {
+    rows: base.rows,
+    truncated: base.truncated,
+    total: base.total,
+    totalExact: base.totalExact,
+    used: used,
+    neverUsed: neverUsed,
+    unregistered: unregistered,
+    runs: runs,
+    registered: usage && usage.state === "measured"
+      ? codingFoundationBoundedCount(usage.registered_count)
+      : null,
+    actors: usage && usage.state === "measured"
+      ? codingFoundationBoundedCount(usage.distinct_actor_count)
+      : null,
+  };
+}
+
+function codingFoundationRecipeStatus(row) {
+  const status = typeof row.status === "string" ? row.status : "";
+  // hasOwnProperty, not a bare lookup: a status named "constructor" would
+  // otherwise resolve against Object.prototype and render a function body.
+  if (Object.prototype.hasOwnProperty.call(CODING_FOUNDATION_RECIPE_STATUS, status)) {
+    return CODING_FOUNDATION_RECIPE_STATUS[status];
+  }
+  // An unrecognised status is shown verbatim rather than dropped: a state
+  // nobody has written a word for must not read as no state at all.
+  return status || "Status not recorded";
+}
+
+function codingFoundationRecipeReason(row) {
+  const status = typeof row.status === "string" ? row.status : "";
+  if (Object.prototype.hasOwnProperty.call(CODING_FOUNDATION_RECIPE_REASONS, status)) {
+    return CODING_FOUNDATION_RECIPE_REASONS[status];
+  }
+  return "no run state was recorded";
+}
+
+function codingFoundationRecipeRuns(row) {
+  const runs = codingFoundationBoundedCount(row.runs);
+  // Unmeasured and zero are different facts and must not share a sentence.
+  if (runs == null) return "Not measured";
+  if (runs === 0) return "Never run";
+  const attributed = codingFoundationBoundedCount(row.attributed_runs);
+  const unattributed = codingFoundationBoundedCount(row.unattributed_runs);
+  return runs + (runs === 1 ? " run" : " runs")
+    + " (" + (attributed == null ? "?" : attributed) + " attributed · "
+    + (unattributed == null ? "?" : unattributed) + " unattributed)";
+}
+
+function codingFoundationRecipeActors(row) {
+  const actors = codingFoundationBoundedCount(row.distinct_actors);
+  if (actors == null) return "Not measured";
+  // A run nobody could be attributed to is not a run by nobody-the-actor, so
+  // zero says there is no attributed actor rather than "0 actors".
+  if (actors === 0) return "No attributed actor";
+  return actors + (actors === 1 ? " actor" : " actors");
+}
+
+function codingFoundationRecipeExits(row) {
+  const exits = row.exit_distribution && typeof row.exit_distribution === "object"
+    && !Array.isArray(row.exit_distribution)
+    ? row.exit_distribution
+    : {};
+  const labels = Object.keys(exits);
+  const cells = [];
+  for (let i = 0; i < labels.length; i += 1) {
+    const counted = codingFoundationBoundedCount(exits[labels[i]]);
+    // "completed:0" and "completed:1" are different outcomes, so the store's
+    // own cell labels are rendered verbatim rather than folded into one word.
+    if (counted != null) cells.push(labels[i] + ": " + counted);
+  }
+  return cells;
+}
+
+function codingFoundationRecipeSentence(model) {
+  const total = codingFoundationRecordTotal(model);
+  // Above the row bound every count here counts the SHOWN rows, so the sentence
+  // scopes itself to them and says "at least". One page read as the whole
+  // registry is how "nothing is used" becomes a claim the evidence cannot carry.
+  const orphans = model.unregistered
+    ? "; " + model.unregistered
+      + (model.unregistered === 1 ? " row records runs" : " rows record runs")
+      + " for a version the registry no longer holds"
+    : "";
+  return "Recipes reach this registry three ways: a canonical seed every "
+    + "repository gets, a conditional seed only for the toolchains this project "
+    + "actually has, and mined recipes derived from past runs. A recipe runs "
+    + "only when the manager invokes it today, so "
+    + (model.totalExact ? "" : "at least ")
+    + model.used + " of " + total + " listed recipes have ever run and "
+    + model.neverUsed + " never have" + orphans + ".";
+}
+
+function codingFoundationRecipeKpis(model) {
+  // Same discipline for the tiles: above the bound these tallies count the
+  // shown rows only and say so. The registered and actor tiles are the
+  // provider's own unbounded measurements rather than sums over this page, so
+  // neither takes the suffix.
+  const shown = model.totalExact ? "" : " (first " + model.rows.length + " shown)";
+  return [
+    {
+      label: "Registered recipes",
+      value: model.registered == null
+        ? codingFoundationRecordTotal(model)
+        : String(model.registered),
+    },
+    { label: "Used at least once", value: String(model.used) + shown },
+    { label: "Never used", value: String(model.neverUsed) + shown },
+    { label: "Runs recorded", value: String(model.runs) + shown },
+    {
+      label: "Distinct actors",
+      value: model.actors == null ? "Not measured" : String(model.actors),
+    },
+  ];
+}
+
+function codingFoundationRecipeDetails(doc, host, row) {
+  const styles = CODING_FOUNDATION_SKILL_STYLES;
+  // <details>/<summary> is focusable and operable from the keyboard with no
+  // script and no ARIA, which is why it is used instead of a custom toggle.
+  const details = codingFoundationEl(doc, "details", {
+    className: "coding-foundation-recipes-details", style: styles.details, parent: host,
+  });
+  codingFoundationEl(doc, "summary", {
+    parent: details, style: styles.summary,
+    text: "Contract, platforms and exits for " + codingFoundationBoundText(row.id, 64),
+  });
+  const body = codingFoundationEl(doc, "div", { parent: details, style: styles.detailBody });
+  codingFoundationEl(doc, "p", {
+    parent: body, style: styles.sentence,
+    text: "Purpose: " + (row.purpose ? String(row.purpose) : "none recorded"),
+  });
+  codingFoundationEl(doc, "p", {
+    parent: body, style: styles.empty,
+    text: "Task kind " + (row.task_kind ? String(row.task_kind) : "unknown")
+      + " · risk class " + (row.risk_class ? String(row.risk_class) : "unknown")
+      + " · origin " + (row.origin ? String(row.origin) : "unknown"),
+  });
+  codingFoundationSkillTextList(
+    doc, body, "Platforms", row.platforms, "No platform declared", "ul"
+  );
+  codingFoundationSkillTextList(
+    doc, body, "Exit distribution", codingFoundationRecipeExits(row),
+    "No exit recorded", "ul"
+  );
+  codingFoundationEl(doc, "p", {
+    parent: body, style: styles.empty,
+    text: "First run " + (row.first_run_at ? String(row.first_run_at) : "never")
+      + " · last run " + (row.last_run_at ? String(row.last_run_at) : "never"),
+  });
+  return details;
+}
+
+function codingFoundationRecipeTableRow(doc, body, row) {
+  const styles = CODING_FOUNDATION_SKILL_STYLES;
+  const tr = codingFoundationEl(doc, "tr", {
+    className: "coding-foundation-recipes-row", parent: body,
+  });
+  const nameCell = codingFoundationEl(doc, "th", {
+    parent: tr, style: styles.rowHeader, attrs: { scope: "row" },
+  });
+  codingFoundationEl(doc, "span", {
+    parent: nameCell, text: codingFoundationBoundText(row.id, 64),
+  });
+  codingFoundationEl(doc, "span", {
+    parent: nameCell, style: styles.muted,
+    text: " " + codingFoundationBoundText(row.version, 24),
+  });
+  if (row.origin) {
+    // How the recipe got here is one of the owner's questions, so the origin
+    // rides the identity cell as a word rather than hiding in the expansion.
+    codingFoundationEl(doc, "span", {
+      parent: nameCell, style: styles.badge,
+      text: codingFoundationBoundText(row.origin, 16),
+    });
+  }
+  codingFoundationEl(doc, "td", {
+    parent: tr, style: styles.td,
+    text: row.purpose ? String(row.purpose) : "No purpose recorded",
+  });
+  const statusCell = codingFoundationEl(doc, "td", { parent: tr, style: styles.td });
+  // The pill carries the status WORD. Colour never carries it alone.
+  codingFoundationEl(doc, "span", {
+    parent: statusCell, className: "coding-foundation-recipes-pill",
+    style: styles.pill, text: codingFoundationRecipeStatus(row),
+  });
+  codingFoundationEl(doc, "span", {
+    parent: statusCell, style: styles.reason, text: codingFoundationRecipeReason(row),
+  });
+  codingFoundationEl(doc, "td", {
+    parent: tr, style: styles.td, text: codingFoundationRecipeRuns(row),
+  });
+  codingFoundationEl(doc, "td", {
+    parent: tr, style: styles.td, text: codingFoundationRecipeActors(row),
+  });
+  codingFoundationEl(doc, "td", {
+    parent: tr, style: styles.td,
+    text: row.last_run_at ? String(row.last_run_at) : "never",
+  });
+  const detailRow = codingFoundationEl(doc, "tr", {
+    className: "coding-foundation-recipes-detail-row", parent: body,
+  });
+  const detailCell = codingFoundationEl(doc, "td", {
+    parent: detailRow, style: styles.td,
+    attrs: { colspan: String(CODING_FOUNDATION_RECIPE_COLUMNS.length) },
+  });
+  codingFoundationRecipeDetails(doc, detailCell, row);
+  return tr;
+}
+
+function codingFoundationRecipesWindow(doc, host, model) {
+  return codingFoundationRecordWindow(doc, host, model, {
+    prefix: "coding-foundation-recipes",
+    empty: "No recipes yet. Nothing is registered, so the manager has nothing to invoke.",
+    caption: "registered recipes; the registry holds more.",
+    columns: CODING_FOUNDATION_RECIPE_COLUMNS,
+    kpis: codingFoundationRecipeKpis,
+    sentence: codingFoundationRecipeSentence,
+    row: codingFoundationRecipeTableRow,
+  });
 }
 
 // NF-2026-00675. A field the summary snapshot deliberately did not send must
@@ -12308,6 +12614,7 @@ function bindCodingFoundationDashboard(doc) {
   const dialogBody = root.getElementById("coding-foundation-dialog-body");
   let selectedKind = "";
   let skillWindow = null;
+  let recipeWindow = null;
   const fillFoundationDialog = function fillFoundationDialog(kind) {
     selectedKind = kind;
     const label = CODING_FOUNDATION_LABELS[kind] || kind;
@@ -12326,15 +12633,20 @@ function bindCodingFoundationDashboard(doc) {
       ? String(slot.card.dataset.foundationBreakdown || "")
       : "";
     if (!dialogBody) return;
-    // NF-2026-01399. The real Skills window, whenever the full snapshot
-    // carried per-record rows. The aggregate line stays the fallback for every
-    // other panel and for a snapshot with no rows -- a previously correct
-    // answer, never a blank and never an invented zero.
-    if (kind === "skills" && skillWindow && typeof root.createElement === "function") {
+    // NF-2026-01399, NF-2026-01424. The real Skills or Tool Recipes window,
+    // whenever the full snapshot carried per-record rows. The aggregate line
+    // stays the fallback for every other panel and for a snapshot with no
+    // rows -- a previously correct answer, never a blank and never an invented
+    // zero.
+    const isRecipes = kind === "tool_recipes";
+    const record = kind === "skills" ? skillWindow : (isRecipes ? recipeWindow : null);
+    if (record && typeof root.createElement === "function") {
       // Built DETACHED and attached last: a renderer that throws part-way then
       // leaves the aggregate line standing instead of an empty dialog, and
       // nothing has to swallow the error to get that.
-      const rendered = codingFoundationSkillsWindow(root, null, skillWindow);
+      const rendered = isRecipes
+        ? codingFoundationRecipesWindow(root, null, record)
+        : codingFoundationSkillsWindow(root, null, record);
       // Assigning textContent is what removes a previously rendered window, so
       // every refill starts from an empty body rather than stacking a second.
       dialogBody.textContent = "";
@@ -12371,6 +12683,8 @@ function bindCodingFoundationDashboard(doc) {
     // actually carried rows may replace what the full snapshot established --
     // the same rule renderCodingFoundationCards follows for the cards.
     if (rows) skillWindow = rows;
+    const recipeRows = codingFoundationRecipeRowModel(snap.tool_recipes);
+    if (recipeRows) recipeWindow = recipeRows;
     if (dialog && dialog.open && selectedKind) fillFoundationDialog(selectedKind);
   };
   if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
@@ -12435,8 +12749,9 @@ function codingFoundationDashboardSource() {
     "const CODING_FOUNDATION_SKILL_COLUMNS = " + JSON.stringify(CODING_FOUNDATION_SKILL_COLUMNS) + ";",
     "const CODING_FOUNDATION_SKILL_STYLES = " + JSON.stringify(CODING_FOUNDATION_SKILL_STYLES) + ";",
     codingFoundationEl.toString(),
+    codingFoundationRecordRows.toString(),
+    codingFoundationRecordTotal.toString(),
     codingFoundationSkillRowModel.toString(),
-    codingFoundationSkillTotal.toString(),
     codingFoundationSkillReason.toString(),
     codingFoundationSkillStatus.toString(),
     codingFoundationSkillEvidence.toString(),
@@ -12449,7 +12764,26 @@ function codingFoundationDashboardSource() {
     codingFoundationSkillHistory.toString(),
     codingFoundationSkillDetails.toString(),
     codingFoundationSkillTableRow.toString(),
+    codingFoundationRecordWindow.toString(),
     codingFoundationSkillsWindow.toString(),
+    // NF-2026-01424. The Tool Recipes window ships through this same list, and
+    // reuses the Skills window's style table, element helper, record model and
+    // window renderer. A helper left out here is a ReferenceError the direct
+    // unit calls cannot see, which is why the popup test executes this string.
+    "const CODING_FOUNDATION_RECIPE_COLUMNS = " + JSON.stringify(CODING_FOUNDATION_RECIPE_COLUMNS) + ";",
+    "const CODING_FOUNDATION_RECIPE_STATUS = " + JSON.stringify(CODING_FOUNDATION_RECIPE_STATUS) + ";",
+    "const CODING_FOUNDATION_RECIPE_REASONS = " + JSON.stringify(CODING_FOUNDATION_RECIPE_REASONS) + ";",
+    codingFoundationRecipeRowModel.toString(),
+    codingFoundationRecipeStatus.toString(),
+    codingFoundationRecipeReason.toString(),
+    codingFoundationRecipeRuns.toString(),
+    codingFoundationRecipeActors.toString(),
+    codingFoundationRecipeExits.toString(),
+    codingFoundationRecipeSentence.toString(),
+    codingFoundationRecipeKpis.toString(),
+    codingFoundationRecipeDetails.toString(),
+    codingFoundationRecipeTableRow.toString(),
+    codingFoundationRecipesWindow.toString(),
     renderCodingFoundationCards.toString(),
     bindCodingFoundationDashboard.toString(),
     "bindCodingFoundationDashboard();",
@@ -13754,6 +14088,14 @@ module.exports = {
     codingFoundationSkillKpis,
     codingFoundationSkillUsed,
     codingFoundationSkillsWindow,
+    codingFoundationRecipeRowModel,
+    codingFoundationRecipeStatus,
+    codingFoundationRecipeReason,
+    codingFoundationRecipeRuns,
+    codingFoundationRecipeActors,
+    codingFoundationRecipeSentence,
+    codingFoundationRecipeKpis,
+    codingFoundationRecipesWindow,
     renderCodingFoundationCards,
     bindCodingFoundationDashboard,
     codingFoundationHeaderMarkup,

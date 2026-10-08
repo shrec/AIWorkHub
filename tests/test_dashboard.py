@@ -4605,3 +4605,502 @@ def test_skills_window_reads_a_real_store_through_its_public_writer(
     assert row["injection_count"] == 1
     assert row["injected_cards"] == 1
     assert row["last_injected_at"] == row["last_selected_at"] != ""
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-01424: the Tool Recipes WINDOW. The panel reported "29 recipes" over
+# one aggregate line and could not say which recipe does what, how often each
+# ran, by whom or when. These tests pin the per-recipe rows behind that, on
+# exactly the pattern NF-2026-01399 established for the Skills window.
+# ---------------------------------------------------------------------------
+
+
+def _window_recipe(recipe_id, version="1.0.0", **overrides):
+    """One registrable manifest, with the contract fields the window renders."""
+    from aiworkhub import tool_recipes as tr
+
+    fields = {
+        "purpose": "",
+        "task_kind": tr.TaskKind.TEST,
+        "risk_class": tr.RiskClass.MEDIUM,
+        "platforms": (),
+        "argv": (tr.lit("echo"),),
+    }
+    fields.update(overrides)
+    return tr.Recipe(id=recipe_id, version=version, **fields)
+
+
+def _window_usage_row(recipe_id: str, version: str, **overrides: object) -> dict:
+    row: dict = {
+        "recipe_id": recipe_id,
+        "version": version,
+        "runs": 9,
+        "distinct_actors": 2,
+        "attributed_runs": 7,
+        "unattributed_runs": 2,
+        "first_run": "2026-10-01T08:00:00Z",
+        "last_run": "2026-10-07T12:00:00Z",
+        "returned_digest_bytes": 0,
+        "exit_distribution": {"completed:0": 8, "completed:1": 1},
+    }
+    row.update(overrides)
+    return row
+
+
+def _window_recipe_payload(recipes: list, usage: list, **extra: object) -> dict:
+    registered = {(recipe.id, recipe.version) for recipe in recipes}
+    used = {(row["recipe_id"], row["version"]) for row in usage}
+
+    def measured(field: str) -> int:
+        # One fixture deliberately carries an unreadable count, so the
+        # repository totals sum only what the store could actually have
+        # emitted rather than failing on the row under test.
+        return sum(row[field] for row in usage if isinstance(row.get(field), int))
+
+    payload: dict = {
+        "recipes": list(recipes),
+        "usage": list(usage),
+        "usage_totals": {
+            "runs": measured("runs"),
+            "distinct_actors": 2 if usage else 0,
+            "attributed_runs": measured("attributed_runs"),
+            "unattributed_runs": measured("unattributed_runs"),
+            "registered_count": len(registered),
+            "used_count": len(used & registered),
+            "unregistered_used_count": len(used - registered),
+        },
+    }
+    payload.update(extra)
+    return payload
+
+
+def _conditional_seed_recipe():
+    from aiworkhub import manager_recipe_tools
+
+    # Read the id off the module that OWNS the conditional seed list rather
+    # than restating one here, so a renamed recipe moves this test with it.
+    assert manager_recipe_tools.CONDITIONAL_RECIPES
+    return manager_recipe_tools.CONDITIONAL_RECIPES[0]
+
+
+def test_tool_recipes_window_rows_join_the_registry_with_its_usage() -> None:
+    conditional = _conditional_seed_recipe()
+    canonical = _window_recipe(
+        "aiworkhub.git.status",
+        purpose="Report <img src=x onerror=alert(1)> worktree status",
+        platforms=("linux", "win32"),
+    )
+    mined = _window_recipe("mined.legacy-probe", version="0.9.0")
+    provider = _FoundationProvider(
+        tool_recipes=_window_recipe_payload(
+            [canonical, conditional, mined],
+            [_window_usage_row(canonical.id, canonical.version)],
+        )
+    )
+
+    # ``_coding_foundation_projections`` is the step ``build_snapshot``
+    # delegates these panels to, and it is where the full/summary ownership
+    # gate lives, so it is the subject rather than a shortcut.
+    recipes = dashboard._coding_foundation_projections(provider, ownership="full")[
+        "tool_recipes"
+    ]
+
+    assert recipes["state"] == "measured"
+    assert recipes["records_total"] == 3
+    assert recipes["records_truncated"] is False
+    # Registry order, which ``list_recipes`` makes stable across refreshes.
+    assert [row["id"] for row in recipes["records"]] == [
+        canonical.id,
+        conditional.id,
+        mined.id,
+    ]
+    rows = {row["id"]: row for row in recipes["records"]}
+
+    used = rows[canonical.id]
+    assert used["status"] == "used"
+    assert used["version"] == "1.0.0"
+    assert used["origin"] == "canonical"
+    assert used["purpose"] == "Report <img src=x onerror=alert(1)> worktree status"
+    assert used["task_kind"] == canonical.task_kind.value
+    assert used["risk_class"] == canonical.risk_class.value
+    assert used["platforms"] == ["linux", "win32"]
+    assert used["runs"] == 9
+    assert used["distinct_actors"] == 2
+    assert used["attributed_runs"] == 7
+    assert used["unattributed_runs"] == 2
+    assert used["first_run_at"] == "2026-10-01T08:00:00Z"
+    assert used["last_run_at"] == "2026-10-07T12:00:00Z"
+    assert used["exit_distribution"] == {"completed:0": 8, "completed:1": 1}
+
+    # A registered recipe with no usage row has run zero times, and that is the
+    # actionable state rather than an omission.
+    for identity in (conditional.id, mined.id):
+        never = rows[identity]
+        assert never["status"] == "never_used", identity
+        assert never["runs"] == 0, identity
+        assert never["distinct_actors"] == 0, identity
+        assert never["attributed_runs"] == 0, identity
+        assert never["unattributed_runs"] == 0, identity
+        assert never["first_run_at"] == "", identity
+        assert never["last_run_at"] == "", identity
+        assert never["exit_distribution"] == {}, identity
+
+    # Origin is read off the owning list and the miner's id prefix, never
+    # stored twice and allowed to disagree with them.
+    assert rows[conditional.id]["origin"] == "conditional"
+    assert rows[mined.id]["origin"] == "mined"
+
+
+def test_tool_recipes_window_rows_disclose_their_own_bound() -> None:
+    # One recipe past the bound, with usage carried, so the projection builds
+    # rows and then has to say that what it published is a page rather than the
+    # population. 200 rows reading as "the whole registry" would be a new way to
+    # hide the same thing the aggregate line hid.
+    registry = [
+        _window_recipe(f"aiworkhub.probe.{index:03d}")
+        for index in range(dashboard._SKILL_RECORD_ROW_LIMIT + 1)
+    ]
+    provider = _FoundationProvider(
+        tool_recipes=_window_recipe_payload(
+            registry,
+            [_window_usage_row(registry[0].id, registry[0].version)],
+        )
+    )
+
+    recipes = dashboard._coding_foundation_projections(provider, ownership="full")[
+        "tool_recipes"
+    ]
+
+    assert len(recipes["records"]) == dashboard._SKILL_RECORD_ROW_LIMIT
+    assert recipes["records_truncated"] is True
+    # Not the length of the page it read: once rows are dropped the total is
+    # unknown, exactly as the Skills window reports it.
+    assert recipes["records_total"] == "unknown"
+    assert recipes["records"][0]["id"] == registry[0].id
+    assert recipes["records"][0]["status"] == "used"
+
+
+def test_tool_recipes_window_keeps_an_unregistered_usage_row() -> None:
+    # A receipt outlives the version it records, so a usage row whose manifest
+    # is gone is published as ``unregistered`` rather than silently dropped.
+    registered = _window_recipe("aiworkhub.git.status")
+    gone = _window_usage_row("aiworkhub.git.status", "0.1.0", runs=4)
+    provider = _FoundationProvider(
+        tool_recipes=_window_recipe_payload(
+            [registered],
+            [_window_usage_row(registered.id, registered.version), gone],
+        )
+    )
+
+    recipes = dashboard._coding_foundation_projections(provider, ownership="full")[
+        "tool_recipes"
+    ]
+
+    assert [(row["id"], row["version"], row["status"]) for row in recipes["records"]] == [
+        ("aiworkhub.git.status", "1.0.0", "used"),
+        ("aiworkhub.git.status", "0.1.0", "unregistered"),
+    ]
+    orphan = recipes["records"][1]
+    assert orphan["runs"] == 4
+    assert orphan["unattributed_runs"] == 2
+    # The manifest that held the contract is gone, so those fields are empty
+    # rather than invented.
+    assert orphan["purpose"] == ""
+    assert orphan["task_kind"] == ""
+    assert orphan["risk_class"] == ""
+    assert orphan["platforms"] == []
+    assert orphan["origin"] == "canonical"
+    assert recipes["records_total"] == 2
+    assert recipes["records_truncated"] is False
+
+
+def test_tool_recipes_window_skips_an_unprojectable_usage_row() -> None:
+    # One unreadable row is one missing row, never a missing window -- and the
+    # published rows are then a lower bound, disclosed as one.
+    registered = _window_recipe("aiworkhub.git.status")
+    broken = _window_usage_row("aiworkhub.git.status", "0.1.0", runs="many")
+    provider = _FoundationProvider(
+        tool_recipes=_window_recipe_payload(
+            [registered],
+            [_window_usage_row(registered.id, registered.version), broken],
+        )
+    )
+
+    recipes = dashboard._coding_foundation_projections(provider, ownership="full")[
+        "tool_recipes"
+    ]
+
+    assert [row["id"] for row in recipes["records"]] == ["aiworkhub.git.status"]
+    assert recipes["records"][0]["status"] == "used"
+    assert recipes["records_truncated"] is True
+    assert recipes["records_total"] == "unknown"
+
+
+def test_tool_recipes_window_discloses_an_unreadable_usage_entry() -> None:
+    # A usage entry whose identity cannot be read -- a non-string ``recipe_id``,
+    # or an element that is not a mapping at all -- is skipped, and the rows it
+    # leaves behind are then a lower bound rather than the population. Dropping
+    # measured runs in silence is the exact defect this window exists to
+    # remove, so it must not reappear one level down from the aggregate line.
+    registered = _window_recipe("aiworkhub.git.status")
+    readable = _window_usage_row(registered.id, registered.version)
+    payload = _window_recipe_payload([registered], [readable])
+    payload["usage"] = [readable, {"recipe_id": 7, "version": "1.0.0"}, "x"]
+    provider = _FoundationProvider(tool_recipes=payload)
+
+    recipes = dashboard._coding_foundation_projections(provider, ownership="full")[
+        "tool_recipes"
+    ]
+
+    # One unreadable entry is one missing row, never a missing window.
+    assert [(row["id"], row["status"]) for row in recipes["records"]] == [
+        ("aiworkhub.git.status", "used")
+    ]
+    assert recipes["records_truncated"] is True
+    assert recipes["records_total"] == "unknown"
+
+
+def test_tool_recipes_window_never_calls_a_bounded_out_recipe_unregistered() -> None:
+    # Registration is a property of the whole registry, not of the page of rows
+    # published. With headroom inside the page opened by a manifest this
+    # projection cannot read, a usage row for a recipe registered just PAST the
+    # bound must still be bounded out -- publishing it as ``unregistered`` with
+    # empty contract fields would be the window inventing a deleted manifest
+    # out of its own display bound. Driven at the projection directly because
+    # ``RecipeRegistry`` refuses a non-``Recipe`` entry, so the whole-snapshot
+    # path can never carry an unreadable manifest this far.
+    class _UnreadableManifest:
+        id = 7
+        version = "1.0.0"
+
+    registry: list = [
+        _window_recipe(f"aiworkhub.probe.{index:03d}")
+        for index in range(dashboard._SKILL_RECORD_ROW_LIMIT + 1)
+    ]
+    beyond = registry[dashboard._SKILL_RECORD_ROW_LIMIT]
+    registry[0] = _UnreadableManifest()
+
+    rows = dashboard._project_recipe_rows(
+        {
+            "recipes": registry,
+            "usage": [_window_usage_row(beyond.id, beyond.version)],
+        }
+    )
+
+    assert [row for row in rows["records"] if row["status"] == "unregistered"] == []
+    assert all(row["id"] != beyond.id for row in rows["records"])
+    # The page is short by the manifest it could not read, and says so.
+    assert len(rows["records"]) == dashboard._SKILL_RECORD_ROW_LIMIT - 1
+    assert rows["records_truncated"] is True
+    assert rows["records_total"] == "unknown"
+
+
+def test_tool_recipes_window_bounds_rows_and_the_exit_distribution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recipes_in = [_window_recipe(f"aiworkhub.probe-{index}") for index in range(3)]
+    crowded = {f"completed:{code}": 1 for code in range(12)}
+    provider = _FoundationProvider(
+        tool_recipes=_window_recipe_payload(
+            recipes_in,
+            [
+                _window_usage_row(
+                    recipes_in[0].id, recipes_in[0].version, exit_distribution=crowded
+                )
+            ],
+        )
+    )
+
+    projected = dashboard._coding_foundation_projections(provider, ownership="full")[
+        "tool_recipes"
+    ]
+    distribution = projected["records"][0]["exit_distribution"]
+    assert len(crowded) > dashboard._PROJECTION_LIST_LIMIT
+    assert len(distribution) == dashboard._PROJECTION_LIST_LIMIT
+    # Bounded in the store's own sorted cell order, so the bound falls in the
+    # same place on every refresh.
+    assert list(distribution) == sorted(crowded)[: dashboard._PROJECTION_LIST_LIMIT]
+
+    monkeypatch.setattr(dashboard, "_SKILL_RECORD_ROW_LIMIT", 2)
+    bounded = dashboard._coding_foundation_projections(provider, ownership="full")[
+        "tool_recipes"
+    ]
+    assert len(bounded["records"]) == 2
+    assert bounded["records_truncated"] is True
+    # Over the bound the page is NOT published as the population.
+    assert bounded["records_total"] == "unknown"
+
+
+def test_tool_recipes_window_summary_is_byte_identical_and_reads_no_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registered = _window_recipe("aiworkhub.git.status")
+    provider = _FoundationProvider(
+        tool_recipes=_window_recipe_payload(
+            [registered], [_window_usage_row(registered.id, registered.version)]
+        )
+    )
+    row_reads: list[str] = []
+    original = dashboard._project_recipe_rows
+    monkeypatch.setattr(
+        dashboard,
+        "_project_recipe_rows",
+        lambda mapping: row_reads.append("read") or original(mapping),
+    )
+
+    summary = dashboard._coding_foundation_projections(provider, ownership="summary")[
+        "tool_recipes"
+    ]
+    # The refresh hot path never even asks for the rows, so it cannot pay for
+    # them and cannot change what it publishes.
+    assert row_reads == []
+    assert [key for key in summary if key.startswith("records")] == []
+
+    full = dashboard._coding_foundation_projections(provider, ownership="full")[
+        "tool_recipes"
+    ]
+    assert row_reads == ["read"]
+    assert full["records_total"] == 1
+    # Every aggregate the panel reports is the same number under both
+    # ownerships, so the header card reads identically before and after.
+    for key in ("schema_id", "state", "availability", "count", "registry_count"):
+        assert full[key] == summary[key], key
+    for key in (
+        "state",
+        "registered_count",
+        "used_count",
+        "unused_count",
+        "run_count",
+        "distinct_actor_count",
+        "attributed_run_count",
+        "unattributed_run_count",
+    ):
+        assert full["usage"][key] == summary["usage"][key], key
+
+    # And the summary path cannot reach the new field AT ALL: the row read is
+    # gated on full ownership. Denying the read outright proves it -- a summary
+    # that touched it fails here instead of quietly publishing a changed
+    # payload -- and the payload it then produces is byte-identical.
+    monkeypatch.setattr(
+        dashboard,
+        "_project_recipe_rows",
+        lambda mapping: pytest.fail("summary ownership must never read per-recipe rows"),
+    )
+    denied = dashboard._coding_foundation_projections(provider, ownership="summary")[
+        "tool_recipes"
+    ]
+    assert json.dumps(denied, sort_keys=True) == json.dumps(summary, sort_keys=True)
+
+
+def test_tool_recipes_window_absent_without_usage_keeps_the_aggregate_line() -> None:
+    registered = _window_recipe("aiworkhub.git.status")
+    provider = _FoundationProvider(tool_recipes={"recipes": [registered]})
+
+    recipes = dashboard._coding_foundation_projections(provider, ownership="full")[
+        "tool_recipes"
+    ]
+
+    # The registry alone cannot say what RAN, so zero-count rows are not
+    # invented: the window keeps the aggregate line, which says so itself.
+    assert "records" not in recipes
+    assert recipes["state"] == "measured"
+    assert recipes["count"] == 1
+    assert recipes["usage"]["state"] == "unknown"
+
+
+def test_tool_recipes_window_store_usage_failure_degrades_like_today(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aiworkhub import tool_recipes_store as store
+
+    store.put_recipe(tmp_path, _window_recipe("aiworkhub.git.status"))
+
+    def refuse(*_args: object, **_kwargs: object) -> list:
+        raise store.ToolRecipeStoreUnsupportedError("json1 is unavailable")
+
+    monkeypatch.setattr(store, "usage_by_recipe", refuse)
+    provider = dashboard.DashboardProvider(repo_root=tmp_path)
+
+    recipes = dashboard._coding_foundation_projections(provider, ownership="full")[
+        "tool_recipes"
+    ]
+
+    # Exactly today's degradation: the panel keeps its registry count, the
+    # usage section reports unknown, and no rows are published off a read that
+    # failed. The refresh itself does not fail.
+    assert recipes["state"] == "measured"
+    assert recipes["count"] == 1
+    assert recipes["usage"]["state"] == "unknown"
+    assert "records" not in recipes
+
+
+def test_tool_recipes_window_reads_a_real_store_through_its_public_writers(
+    tmp_path: Path,
+) -> None:
+    """No doubles: the real writers feed the real readers.
+
+    Every fixture above hands the projection a usage mapping it wrote itself,
+    so none of them check that the keys the rows read are the keys
+    ``usage_by_recipe`` actually emits. This one writes a temporary store
+    through its OWN public writers and then compares the projected row against
+    that function's output.
+    """
+    from aiworkhub import tool_recipes as tr
+    from aiworkhub import tool_recipes_store as store
+
+    ran = _window_recipe("aiworkhub.git.status", purpose="Report worktree status")
+    idle = _window_recipe("aiworkhub.git.diff")
+    never = _window_recipe("mined.legacy-probe", version="0.9.0")
+    for recipe in (ran, idle, never):
+        store.put_recipe(tmp_path, recipe)
+    validated = tr.validate_invocation(ran, {})
+    # Two receipts, one attributed and one not, so the row has to report the
+    # attributed/unattributed split rather than a single total.
+    store.put_receipt(
+        tmp_path,
+        tr.build_receipt(
+            validated,
+            actor=tr.ActorIdentity(
+                kind=tr.ACTOR_KIND_MANAGER,
+                provider="claude",
+                session_id="session-1",
+            ),
+            returned_digest_bytes=4,
+        ),
+    )
+    store.put_receipt(tmp_path, tr.build_receipt(validated, returned_digest_bytes=9))
+    usage = store.usage_by_recipe(tmp_path)
+    assert [row["recipe_id"] for row in usage] == [ran.id]
+
+    provider = dashboard.DashboardProvider(repo_root=tmp_path)
+    recipes = dashboard._coding_foundation_projections(provider, ownership="full")[
+        "tool_recipes"
+    ]
+
+    rows = {row["id"]: row for row in recipes["records"]}
+    assert set(rows) == {ran.id, idle.id, never.id}
+    assert recipes["records_total"] == 3
+    assert recipes["records_truncated"] is False
+
+    row = rows[ran.id]
+    measured = usage[0]
+    assert row["status"] == "used"
+    assert row["purpose"] == "Report worktree status"
+    assert row["task_kind"] == ran.task_kind.value
+    assert row["risk_class"] == ran.risk_class.value
+    # Receipt-level and exactly the store's own numbers: two runs, one of them
+    # attributable to one distinct actor.
+    assert row["runs"] == measured["runs"] == 2
+    assert row["distinct_actors"] == measured["distinct_actors"] == 1
+    assert row["attributed_runs"] == measured["attributed_runs"] == 1
+    assert row["unattributed_runs"] == measured["unattributed_runs"] == 1
+    assert row["first_run_at"] == measured["first_run"] != ""
+    assert row["last_run_at"] == measured["last_run"] != ""
+    assert row["exit_distribution"] == measured["exit_distribution"]
+    assert row["exit_distribution"] == {tr.EXIT_STATUS_NOT_EXECUTED: 2}
+
+    for identity in (idle.id, never.id):
+        assert rows[identity]["status"] == "never_used", identity
+        assert rows[identity]["runs"] == 0, identity
+        assert rows[identity]["distinct_actors"] == 0, identity
+        assert rows[identity]["last_run_at"] == "", identity

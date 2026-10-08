@@ -150,9 +150,11 @@ GROUP BY population
 _DIGEST_PREFIX_LEN = 12
 _PROJECTION_LIST_LIMIT = 8
 _PROJECTION_TEXT_LIMIT = 80
-# NF-2026-01399. The owner-facing Skills window needs one row per stored
-# record, which the eight-item panel bound deliberately does not give it.
-# These three bound THAT list only; every other projected list keeps
+# NF-2026-01399, extended by NF-2026-01424. An owner-facing per-record window
+# needs one row per stored record, which the eight-item panel bound deliberately
+# does not give it. These three bound the ``records`` list of EVERY such window
+# -- the Skills window and the Tool Recipes window share them rather than each
+# naming its own 200 -- and every other projected list keeps
 # ``_PROJECTION_LIST_LIMIT``. They are disclosure bounds, not silent caps: over
 # ``_SKILL_RECORD_ROW_LIMIT`` the projection sets ``records_truncated`` and
 # refuses to publish the page it read as the population.
@@ -4011,6 +4013,272 @@ def _project_recipe_usage(mapping: Any, *, ownership: str) -> dict[str, Any]:
     return section
 
 
+def _conditional_recipe_ids() -> frozenset[str] | None:
+    """The recipe ids ``manager_recipe_tools`` seeds per project, read-only.
+
+    That module owns the conditional seed list, so the ids are READ off it
+    rather than restated here and allowed to drift. A module this process
+    cannot import leaves the origin ``"unknown"`` instead of reporting a
+    conditional recipe as canonical: an unread list is not evidence of absence.
+    """
+
+    try:
+        from aiworkhub import manager_recipe_tools
+    except ImportError:
+        return None
+    seeded = getattr(manager_recipe_tools, "CONDITIONAL_RECIPES", None)
+    if not isinstance(seeded, tuple):
+        return None
+    return frozenset(
+        recipe.id for recipe in seeded if isinstance(getattr(recipe, "id", None), str)
+    )
+
+
+def _recipe_origin(recipe_id: str, conditional: frozenset[str] | None) -> str:
+    """How one recipe reached the registry: mined, conditional or canonical.
+
+    ``mined`` is read off the id prefix the miner writes, the same way a Skills
+    row reads its own, so the two cannot be stored twice and disagree.
+    """
+
+    if recipe_id.startswith("mined."):
+        return "mined"
+    if conditional is None:
+        return "unknown"
+    return "conditional" if recipe_id in conditional else "canonical"
+
+
+def _recipe_sequence(registry: Any) -> list[Any] | None:
+    """The provider's manifests as a list, in the order the store returned them.
+
+    ``list_recipes`` orders by ``(recipe_id, version)``, so this order is stable
+    across refreshes. Deliberately NOT the registry ``_project_tool_recipes``
+    bounds to eight items for the panel: a window listing the first eight of
+    twenty-nine recipes would be a new way to hide the same thing.
+    """
+
+    if type(registry).__name__ == "RecipeRegistry":
+        return list(registry)
+    return list(registry) if isinstance(registry, list) else None
+
+
+def _recipe_enum_text(value: Any) -> str:
+    """One recipe enum field as owner-facing text, bounded like every other."""
+
+    return _projection_string(getattr(value, "value", value), 32) or ""
+
+
+def _recipe_exit_distribution(value: Any) -> dict[str, int]:
+    """Bounded exit histogram for one manifest, in a deterministic cell order.
+
+    ``completed:0`` and ``completed:1`` are different outcomes -- "the tool ran
+    and said no" is evidence a recipe exists to produce -- so the labels the
+    store composed are kept verbatim. Only the NUMBER of cells is bounded, and
+    they are taken sorted so the bound falls in the same place every refresh
+    rather than on whichever cells happened to be enumerated first.
+    """
+
+    if not isinstance(value, Mapping):
+        return {}
+    cells: dict[str, int] = {}
+    for label, runs in sorted(value.items(), key=lambda cell: str(cell[0])):
+        if len(cells) >= _PROJECTION_LIST_LIMIT:
+            break
+        text = _projection_string(label, 48)
+        counted = _projection_count(runs)
+        if text is not None and counted is not None:
+            cells[text] = counted
+    return cells
+
+
+def _recipe_usage_fields(usage: Any) -> dict[str, Any] | None:
+    """One ``usage_by_recipe`` row, or a measured zero when there is no row.
+
+    ``usage_by_recipe`` emits a row only for a manifest with at least one
+    receipt, by design: it reads the receipts table and knows nothing about what
+    is registered. A registered recipe with no row has therefore run zero
+    times, and the caller holding BOTH collections is the only one entitled to
+    say so -- which is what ``never_used`` is.
+
+    ``distinct_actors`` is carried as the store's own receipt-level COUNT. The
+    store exposes no per-recipe actor LIST and the per-recipe counts cannot be
+    summed into a repository total, so nothing is listed, summed or invented
+    here. A row whose counts cannot be read yields ``None`` so the caller skips
+    it and discloses the skip, rather than reading an unreadable count as zero.
+    """
+
+    if usage is None:
+        return {
+            "status": "never_used",
+            "runs": 0,
+            "distinct_actors": 0,
+            "attributed_runs": 0,
+            "unattributed_runs": 0,
+            "first_run_at": "",
+            "last_run_at": "",
+            "exit_distribution": {},
+        }
+    if not isinstance(usage, Mapping):
+        return None
+    runs = _projection_count(usage.get("runs"))
+    actors = _projection_count(usage.get("distinct_actors"))
+    attributed = _projection_count(usage.get("attributed_runs"))
+    unattributed = _projection_count(usage.get("unattributed_runs"))
+    if runs is None or actors is None or attributed is None or unattributed is None:
+        return None
+    return {
+        "status": "used",
+        "runs": runs,
+        "distinct_actors": actors,
+        "attributed_runs": attributed,
+        "unattributed_runs": unattributed,
+        # Bounded with slack, deliberately. The store stamps
+        # ``datetime.now(timezone.utc).isoformat()``, which is exactly 32
+        # characters with microseconds and a UTC offset, so a 32-character
+        # bound is correct only by coincidence: anything appended to that
+        # format would silently truncate one moment into a different moment.
+        "first_run_at": _projection_string(usage.get("first_run"), 40) or "",
+        "last_run_at": _projection_string(usage.get("last_run"), 40) or "",
+        "exit_distribution": _recipe_exit_distribution(usage.get("exit_distribution")),
+    }
+
+
+def _project_recipe_row(
+    key: tuple[str, str],
+    recipe: Any,
+    usage: Any,
+    conditional: frozenset[str] | None,
+) -> dict[str, Any] | None:
+    """Project ONE manifest identity joined with its run evidence.
+
+    ``recipe`` is ``None`` for a usage row whose manifest the registry no longer
+    holds -- a receipt outlives the version it records. Such a row is published
+    with its contract fields EMPTY and the status ``unregistered`` rather than
+    dropped: dropping it would silently remove runs the owner can already see
+    in the aggregate line, and inventing a purpose for a manifest that is gone
+    would be this projection describing something it cannot read.
+    """
+
+    identity = _projection_string(key[0], _SKILL_ROW_TEXT_LIMIT)
+    version = _projection_string(key[1], 32)
+    fields = _recipe_usage_fields(usage)
+    if identity is None or version is None or fields is None:
+        return None
+    if recipe is None:
+        fields["status"] = "unregistered"
+    purpose = _projection_string(getattr(recipe, "purpose", None), _SKILL_ROW_TEXT_LIMIT)
+    return {
+        "id": identity,
+        "version": version,
+        "origin": _recipe_origin(key[0], conditional),
+        "purpose": purpose or "",
+        "task_kind": _recipe_enum_text(getattr(recipe, "task_kind", None)),
+        "risk_class": _recipe_enum_text(getattr(recipe, "risk_class", None)),
+        "platforms": _skill_row_strings(getattr(recipe, "platforms", ()), 32),
+        **fields,
+    }
+
+
+def _project_recipe_rows(mapping: Any) -> dict[str, Any] | None:
+    """One projected row per registered recipe, joined with its usage row.
+
+    NF-2026-01424. The panel could say "29 recipes · 14 used · 132 runs" and
+    nothing about WHICH recipe does what, how often each ran, by whom or when.
+    These rows answer that, one per registered ``(recipe_id, version)`` in
+    registry order, each joined with the usage row carrying the same identity.
+
+    ``records`` is bounded by ``_SKILL_RECORD_ROW_LIMIT`` and discloses the
+    bound exactly as the Skills window does: above it ``records_truncated`` is
+    true and ``records_total`` stays ``"unknown"`` rather than publishing the
+    page it read as the population. An entry this projection cannot read is
+    SKIPPED and disclosed through those same two fields -- one unreadable row is
+    one missing row, never a missing window.
+
+    Returns ``None`` -- never an empty list -- when there is no registry, so the
+    window falls back to the aggregate line instead of reporting an unread store
+    as a repository with no recipes. A registry carried WITHOUT usage returns
+    ``None`` for the same reason: the registry alone cannot say what ran, and
+    zero-count rows built off an unread receipts table would report every
+    registered recipe as never used. The aggregate line already says
+    ``UNKNOWN usage`` for exactly that case.
+
+    That usage guard is checked FIRST, before the registry is sequenced at all,
+    because the no-usage path must also cost nothing. The summary panel bounds
+    its own inspection to ``_PROJECTION_LIST_LIMIT`` items, and materialising
+    the registry here only to discard it would read every element of a lazy
+    provider for a window this payload cannot populate.
+    """
+
+    if not isinstance(mapping, Mapping):
+        return None
+    measured = mapping.get("usage")
+    if not isinstance(measured, list):
+        return None
+    recipes = _recipe_sequence(mapping.get("registry", mapping.get("recipes")))
+    if recipes is None:
+        return None
+    unreadable = 0
+    usage_by_key: dict[tuple[str, str], Any] = {}
+    for entry in measured:
+        if isinstance(entry, Mapping):
+            used_id = entry.get("recipe_id")
+            used_version = entry.get("version")
+            if isinstance(used_id, str) and isinstance(used_version, str):
+                usage_by_key[(used_id, used_version)] = entry
+                continue
+        # A usage entry without a readable ``(recipe_id, version)`` can neither
+        # be joined to a manifest nor published on its own, so it is skipped --
+        # and COUNTED, because dropping measured runs without disclosing it is
+        # the same silence the aggregate line already imposed.
+        unreadable += 1
+    # Registration is a property of the WHOLE registry, never of the page of
+    # rows published below: a usage row naming a recipe registered beyond the
+    # bound is bounded out, not relabelled ``unregistered``. Only a key absent
+    # from the entire registry has actually lost its manifest.
+    registered_keys: set[tuple[str, str]] = set()
+    for registered in recipes:
+        known_id = getattr(registered, "id", None)
+        known_version = getattr(registered, "version", None)
+        if isinstance(known_id, str) and isinstance(known_version, str):
+            registered_keys.add((known_id, known_version))
+    conditional = _conditional_recipe_ids()
+    records: list[dict[str, Any]] = []
+    truncated = len(recipes) > _SKILL_RECORD_ROW_LIMIT
+    for recipe in recipes[:_SKILL_RECORD_ROW_LIMIT]:
+        recipe_id = getattr(recipe, "id", None)
+        version = getattr(recipe, "version", None)
+        if not isinstance(recipe_id, str) or not isinstance(version, str):
+            unreadable += 1
+            continue
+        key = (recipe_id, version)
+        row = _project_recipe_row(key, recipe, usage_by_key.get(key), conditional)
+        if row is None:
+            unreadable += 1
+            continue
+        records.append(row)
+    for orphan, entry in usage_by_key.items():
+        if orphan in registered_keys:
+            continue
+        if len(records) >= _SKILL_RECORD_ROW_LIMIT:
+            truncated = True
+            break
+        row = _project_recipe_row(orphan, None, entry, conditional)
+        if row is None:
+            unreadable += 1
+            continue
+        records.append(row)
+    if unreadable:
+        # The published rows are no longer everything this read covered, so
+        # every number derived from them is a lower bound and is published as
+        # one rather than letting a short list read as a complete one.
+        truncated = True
+    return {
+        "records": records,
+        "records_total": "unknown" if truncated else len(records),
+        "records_truncated": truncated,
+    }
+
+
 def _project_tool_recipes(
     payload: Any,
     *,
@@ -4135,15 +4403,25 @@ def _project_tool_recipes(
                     projected["receipts"] = items
                     projected["receipts_truncated"] = receipts_truncated
     projected["usage"] = _project_recipe_usage(mapping, ownership=ownership)
+    # NF-2026-01424. The per-recipe rows are a FULL-ownership field and nothing
+    # else, exactly as the Skills window's are (NF-2026-01399). The summary
+    # projection every refresh builds therefore stays byte-identical in keys and
+    # aggregate values to what it was before this list existed: ``ownership``
+    # gates the read, so ``_cheap_projection`` is never handed a key to strip.
+    row_fields = _project_recipe_rows(mapping) if ownership == "full" else None
     if registry_count == 0 and not has_receipts:
         empty = _projection_shell("tool_recipes", "no_sample", ownership)
         empty["invocation"] = {"state": "no_sample"}
         empty["cache"] = {"state": "no_sample"}
         empty["context"] = {"state": "no_sample"}
         empty["usage"] = projected["usage"]
+        if row_fields is not None:
+            empty.update(row_fields)
         if ownership == "summary":
             return _cheap_projection(empty)
         return empty
+    if row_fields is not None:
+        projected.update(row_fields)
     if ownership == "summary":
         return _cheap_projection(projected)
     return projected
