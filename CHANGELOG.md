@@ -6,6 +6,32 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.37] - 2026-10-08
+
+### Added
+
+- vscode_lm: the task live output previews the worker's text and reasoning while it runs (NF-2026-01380).
+- OpenCode: the manager seat declares and runs a readable-reasoning model variant, so its thinking streams into Manager Chat (NF-2026-01384).
+- Promotion three-way merges a candidate whose canonical parent changed since launch instead of refusing it (NF-2026-01381 part A).
+
+### Fixed
+
+- Manager Chat: the model picked in Manager Chat becomes the manager seat identity, and accept records that seat first (NF-2026-01383).
+- Task plan: a launched card no longer reserves its write scope; only an in-place canonical writer blocks an overlapping launch (NF-2026-01381 part B).
+- vscode_lm worker bridge: a forced review offers only submit, and staged ranges after the first refund a free-phase turn (NF-2026-01388, NF-2026-01385).
+- vscode_lm worker bridge: a bottom-up range ending above the first line-count change keeps its coordinates; finalize never drops a stage rejected for fresh-pair recovery, and an outstanding recovery counts toward the bounded finalize escape (NF-2026-01404).
+- Skills: an ordinary card derives its skill selection context, so skills are selected and earn usage evidence (NF-2026-01397).
+- Task FSM: a declared but unrun validation is never a measured pass (NF-2026-01392).
+- Worker workspace: a validator's `__pycache__/*.pyc` is shell residue, never a scope violation (NF-2026-01390); an untracked nested repository or worktree is never canonical delta (NF-2026-01391).
+- Promotion merge: `git merge-file` runs outside the caller repository, and a git die exit is never a conflict count (NF-2026-01401).
+- `retry_finalization` records the verified calling manager, never Codex (NF-2026-01394).
+- Context-ack evidence reports the coordinator-bound acknowledgement only for an absent receipt; a found but unverifiable receipt keeps its specific reason (NF-2026-01395).
+- A launch that names runner, topic and adapter but no model pins the runner's canonical model, so a `claude_cli` worker no longer runs on the CLI account default (NF-2026-01407).
+
+### Qualification
+
+- Each fix has a regression that fails before and passes after; the touched suites and the full suite pass. Installation and live replay are separate evidence.
+
 ## [0.12.36] - 2026-10-06
 
 ### Fixed

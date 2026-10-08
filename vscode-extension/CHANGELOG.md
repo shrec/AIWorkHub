@@ -1,5 +1,23 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.37 — 2026-10-08
+
+### Added
+
+- Task live output previews vscode_lm worker text and reasoning while it runs (NF-2026-01380).
+- The OpenCode manager seat runs a readable-reasoning variant, so its thinking streams into Manager Chat (NF-2026-01384).
+
+### Fixed
+
+- The model picked in Manager Chat becomes the manager seat identity (NF-2026-01383).
+- vscode_lm forced review offers only submit; later staged ranges refund a free-phase turn (NF-2026-01388, NF-2026-01385).
+- vscode_lm staged edits above the first line-count change keep their coordinates; finalize never drops a stage awaiting fresh-pair recovery and stays bounded (NF-2026-01404).
+- Bundled MCP runtime: skills select on ordinary cards (NF-2026-01397), unrun validation is never a pass (NF-2026-01392), plus promotion, workspace and review-evidence fixes (NF-2026-01381, NF-2026-01390, NF-2026-01391, NF-2026-01394, NF-2026-01395, NF-2026-01401, NF-2026-01407).
+
+### Qualification
+
+- Independent component regressions pass; installation, activation and live qualification are separate evidence.
+
 ## 0.12.36 — 2026-10-06
 
 ### Fixed

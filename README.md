@@ -62,6 +62,15 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.37
+
+- Skills actually work on ordinary cards: each card derives its skill selection context, so skills are selected and earn usage evidence (NF-2026-01397).
+- The model picked in Manager Chat becomes the manager; accept records that seat (NF-2026-01383). OpenCode's manager seat streams readable reasoning (NF-2026-01384).
+- Task live output shows vscode_lm worker text and reasoning as it runs (NF-2026-01380).
+- Parallel cards no longer block each other on a launched write scope, and promotion three-way merges a candidate whose parent moved (NF-2026-01381).
+- Review is stricter about evidence: an unrun validation is never a pass (NF-2026-01392); `.pyc` residue and nested worktrees are never scope violations or delta (NF-2026-01390, NF-2026-01391).
+- Fixes for promotion merge in the sandbox, retry_finalization identity, context-ack evidence and vscode_lm staged-edit coordinates (NF-2026-01401, NF-2026-01394, NF-2026-01395, NF-2026-01404, NF-2026-01388, NF-2026-01385); a launch without a model pins the runner's canonical model (NF-2026-01407).
+
 ## What's new in 0.12.36
 
 - vscode_lm workers can make several edits in the same required output again: the run no longer ends right after the first staged edit; it ends when the worker finalizes or stops making progress (NF-2026-01378).
