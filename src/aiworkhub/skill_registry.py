@@ -1380,6 +1380,12 @@ class SkillRuntimePacket:
 
     version: str = RUNTIME_PACKET_VERSION
     skills: tuple[SkillRuntimePacketRow, ...] = ()
+    # Rows the receipt selected but the packet could not carry: each is
+    # (identity, version, "packet_limit:<field>"). Never part of as_mapping()
+    # -- it is bookkeeping about what was left out, not packet content, so it
+    # never affects the canonical bytes a packet_sha256 or max_packet_bytes
+    # check sees (NF-2026-01416).
+    excluded: tuple[tuple[str, str, str], ...] = ()
 
     def as_mapping(self) -> dict[str, Any]:
         return {
@@ -2048,6 +2054,78 @@ def _resolve_selected_records(
     return resolved
 
 
+def _build_packet_row(
+    item: SkillSelection,
+    record: SkillRecord,
+    bound_context: Mapping[str, Any],
+    max_list_items: int,
+    max_string_bytes: int,
+) -> tuple[SkillRuntimePacketRow | None, str | None]:
+    """Build one packet row, or report which field breached a packet bound.
+
+    A ``skill_registry.packet_limit`` failure on any of these fields names the
+    row unemittable rather than propagating: the caller excludes that row and
+    keeps going. Any other failure (a grammar mismatch, a secret, an unsafe
+    path) still raises -- only a size bound turns into an exclusion.
+    """
+    fields: tuple[tuple[str, Any], ...] = (
+        ("identity", lambda: _bounded_packet_scalar(item.identity, "identity", max_string_bytes)),
+        ("version", lambda: _bounded_packet_scalar(item.version, "version", max_string_bytes)),
+        ("digest", lambda: _bounded_packet_scalar(item.digest, "digest", max_string_bytes)),
+        (
+            "reasons",
+            lambda: _bounded_packet_strings(item.reasons, "reasons", max_list_items, max_string_bytes),
+        ),
+        (
+            "applicability",
+            lambda: _bounded_packet_strings(
+                record.applicability, "applicability", max_list_items, max_string_bytes
+            ),
+        ),
+        (
+            "procedure_steps",
+            lambda: _bounded_packet_strings(
+                record.procedure_steps, "procedure_steps", max_list_items, max_string_bytes
+            ),
+        ),
+        (
+            "avoid_rules",
+            lambda: _bounded_packet_strings(
+                record.avoid_rules, "avoid_rules", max_list_items, max_string_bytes
+            ),
+        ),
+        (
+            "preferred_tools",
+            lambda: _bounded_packet_strings(
+                record.preferred_tools, "preferred_tools", max_list_items, max_string_bytes
+            ),
+        ),
+    )
+    values: dict[str, Any] = {}
+    for field_name, compute in fields:
+        try:
+            values[field_name] = compute()
+        except SkillRegistryError as exc:
+            if exc.code == "skill_registry.packet_limit":
+                return None, field_name
+            raise
+    row = SkillRuntimePacketRow(
+        identity=values["identity"],
+        version=values["version"],
+        digest=values["digest"],
+        reasons=_bind_canonical_packet_reasons(
+            _validate_packet_reasons(values["reasons"]), record, bound_context
+        ),
+        applicability=values["applicability"],
+        procedure_steps=values["procedure_steps"],
+        avoid_rules=values["avoid_rules"],
+        preferred_tools=values["preferred_tools"],
+    )
+    if set(row.as_mapping()) != _PACKET_ROW_KEYS:
+        _fail("skill_registry.receipt_extended", "packet row has unexpected keys")
+    return row, None
+
+
 def _emit_runtime_packet(
     resolved: list[tuple[SkillSelection, SkillRecord]],
     bound_context: Mapping[str, Any],
@@ -2056,47 +2134,38 @@ def _emit_runtime_packet(
     max_string_bytes: int,
     max_packet_bytes: int,
 ) -> SkillRuntimePacket:
+    """Resolve rows to a packet, excluding -- never raising for -- a row whose
+    content breaches a packet bound (NF-2026-01416).
+
+    A record that fails a size bound is dropped from ``skills`` and recorded
+    in ``excluded`` with reason ``packet_limit:<field>``, so one over-cap
+    record no longer zeroes every other selected record's injection. If the
+    assembled packet still exceeds ``max_packet_bytes``, rows are dropped from
+    the end -- the lowest-ranked survivors -- with reason
+    ``packet_limit:packet_bytes``, until it fits or none remain.
+    """
     rows: list[SkillRuntimePacketRow] = []
+    excluded: list[tuple[str, str, str]] = []
     for item, record in resolved:
-        identity = _bounded_packet_scalar(item.identity, "identity", max_string_bytes)
-        version = _bounded_packet_scalar(item.version, "version", max_string_bytes)
-        digest = _bounded_packet_scalar(item.digest, "digest", max_string_bytes)
-        claimed_reasons = _validate_packet_reasons(
-            _bounded_packet_strings(item.reasons, "reasons", max_list_items, max_string_bytes)
+        row, failed_field = _build_packet_row(
+            item, record, bound_context, max_list_items, max_string_bytes
         )
-        applicability = _bounded_packet_strings(
-            record.applicability, "applicability", max_list_items, max_string_bytes
-        )
-        procedure_steps = _bounded_packet_strings(
-            record.procedure_steps, "procedure_steps", max_list_items, max_string_bytes
-        )
-        avoid_rules = _bounded_packet_strings(
-            record.avoid_rules, "avoid_rules", max_list_items, max_string_bytes
-        )
-        preferred_tools = _bounded_packet_strings(
-            record.preferred_tools, "preferred_tools", max_list_items, max_string_bytes
-        )
-        row = SkillRuntimePacketRow(
-            identity=identity,
-            version=version,
-            digest=digest,
-            reasons=_bind_canonical_packet_reasons(claimed_reasons, record, bound_context),
-            applicability=applicability,
-            procedure_steps=procedure_steps,
-            avoid_rules=avoid_rules,
-            preferred_tools=preferred_tools,
-        )
-        if set(row.as_mapping()) != _PACKET_ROW_KEYS:
-            _fail("skill_registry.receipt_extended", "packet row has unexpected keys")
+        if failed_field is not None:
+            excluded.append((item.identity, item.version, f"packet_limit:{failed_field}"))
+            continue
         rows.append(row)
-    packet = SkillRuntimePacket(version=RUNTIME_PACKET_VERSION, skills=tuple(rows))
-    payload = packet.as_mapping()
-    if set(payload) != _PACKET_KEYS:
-        _fail("skill_registry.receipt_extended", "packet has unexpected keys")
-    encoded = canonical_json(payload).encode("utf-8")
-    if len(encoded) > max_packet_bytes:
-        _fail("skill_registry.packet_limit", "canonical packet exceeds max_packet_bytes")
-    return packet
+    while True:
+        packet = SkillRuntimePacket(
+            version=RUNTIME_PACKET_VERSION, skills=tuple(rows), excluded=tuple(excluded)
+        )
+        payload = packet.as_mapping()
+        if set(payload) != _PACKET_KEYS:
+            _fail("skill_registry.receipt_extended", "packet has unexpected keys")
+        encoded = canonical_json(payload).encode("utf-8")
+        if len(encoded) <= max_packet_bytes or not rows:
+            return packet
+        dropped = rows.pop()
+        excluded.append((dropped.identity, dropped.version, "packet_limit:packet_bytes"))
 
 
 def build_runtime_packet(
@@ -2132,6 +2201,42 @@ def build_runtime_packet(
         max_string_bytes=max_string_bytes,
         max_packet_bytes=max_packet_bytes,
     )
+
+
+def _reject_unemittable_record(record: SkillRecord) -> None:
+    """Fail closed at creation when a record could never be emitted as a
+    runtime packet row (NF-2026-01416).
+
+    Reuses the exact bound helpers :func:`_emit_runtime_packet` applies per
+    row -- never duplicating the limit values -- so a record that is
+    structurally unemittable is refused by :meth:`SkillRegistry.propose` and
+    :meth:`SkillRegistry.adopt` instead of silently dropping out of every
+    future selection's packet.
+    """
+    for field_name, values in (
+        ("applicability", record.applicability),
+        ("procedure_steps", record.procedure_steps),
+        ("avoid_rules", record.avoid_rules),
+        ("preferred_tools", record.preferred_tools),
+    ):
+        _bounded_packet_strings(values, field_name, MAX_PACKET_LIST_ITEMS, MAX_PACKET_STRING_BYTES)
+    row = SkillRuntimePacketRow(
+        identity=_bounded_packet_scalar(record.identity, "identity", MAX_PACKET_STRING_BYTES),
+        version=_bounded_packet_scalar(record.version, "version", MAX_PACKET_STRING_BYTES),
+        digest=skill_digest(record),
+        reasons=(),
+        applicability=record.applicability,
+        procedure_steps=record.procedure_steps,
+        avoid_rules=record.avoid_rules,
+        preferred_tools=record.preferred_tools,
+    )
+    packet = SkillRuntimePacket(version=RUNTIME_PACKET_VERSION, skills=(row,))
+    encoded = canonical_json(packet.as_mapping()).encode("utf-8")
+    if len(encoded) > MAX_PACKET_BYTES:
+        _fail(
+            "skill_registry.packet_limit",
+            "record exceeds max_packet_bytes as a single-row packet",
+        )
 
 
 def _validate_authority(authority: Any) -> Authority:
@@ -2195,6 +2300,7 @@ class SkillRegistry:
         authenticated authority, so one actor cannot forge independence.
         """
         record = validate_record(record)
+        _reject_unemittable_record(record)
         _validate_authority(authority)
         if record.lifecycle_state is not LifecycleState.PROPOSED:
             _fail(
@@ -2219,7 +2325,7 @@ class SkillRegistry:
         self._digest_index[digest] = key
         return record
 
-    def adopt(self, record: SkillRecord) -> SkillRecord:
+    def adopt(self, record: SkillRecord, *, enforce_packet_limit: bool = True) -> SkillRecord:
         """Adopt an already-validated record from a trusted reconstruction.
 
         Unlike :meth:`propose` -- which admits only an evidence-free ``proposed``
@@ -2232,8 +2338,17 @@ class SkillRegistry:
         pass :func:`validate_record`; an existing ``(identity, version)`` is
         never overwritten; and a content digest already bound to a *different*
         identity/version is never rebound.
+
+        ``enforce_packet_limit=False`` is for
+        :func:`skill_registry_store.load_registry` alone: a record already
+        durably persisted (and digest-verified on read) must stay loadable even
+        if it predates these packet bounds -- the violation then surfaces only
+        as a per-row ``excluded`` entry at selection time, never as a reason the
+        whole registry fails to load.
         """
         record = validate_record(record)
+        if enforce_packet_limit:
+            _reject_unemittable_record(record)
         key = (record.identity, record.version)
         if key in self._entries:
             _fail(

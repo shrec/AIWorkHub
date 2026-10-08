@@ -146,6 +146,7 @@ _RECEIPT_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("selected_count", "INTEGER NOT NULL DEFAULT 0"),
     ("injected_count", "INTEGER NOT NULL DEFAULT 0"),
     ("empty_reason", "TEXT NOT NULL DEFAULT ''"),
+    ("excluded_json", "TEXT NOT NULL DEFAULT '[]'"),
 )
 
 
@@ -701,8 +702,11 @@ def load_registry(
         # These records were reconstructed and digest-verified on read; adopt them
         # through the public API rather than ``propose`` (which admits only
         # evidence-free proposed records and would reject a persisted
-        # active/evidenced version).
-        registry.adopt(record)
+        # active/evidenced version). enforce_packet_limit=False: a record
+        # already durably persisted must stay loadable even if it predates the
+        # packet bounds -- the violation surfaces as a per-row exclusion at
+        # selection time instead (NF-2026-01416).
+        registry.adopt(record, enforce_packet_limit=False)
     return registry
 
 
@@ -838,12 +842,24 @@ def record_selection(
     column, so admitting free text would let one caller turn a bounded reason
     histogram into an open-ended one. :func:`record_selection_reported` reports
     that refusal like any other, so a launcher still never raises on it.
+
+    ``excluded`` carries the packet's own per-row exclusions -- a record whose
+    content breached a packet bound, or one dropped to fit
+    ``max_packet_bytes`` -- beside ``selected_count``/``injected_count``
+    (NF-2026-01416), so a truncated injection is attributable after the fact
+    instead of reading exactly like a selection that simply matched fewer
+    records.
     """
     task = _bounded_id(task_id, "task_id")
     request = str(request_id or "").strip()[:MAX_RECEIPT_ID_CHARS]
+    excluded_rows = getattr(packet, "excluded", ())
+    if not isinstance(excluded_rows, (list, tuple)):
+        excluded_rows = ()
+    excluded_rows = [list(row) for row in excluded_rows]
     rows = _packet_rows(packet)
     packet_sha = selection_packet_sha256(packet)
     selected_json = json.dumps(rows, sort_keys=True, separators=(",", ":"))
+    excluded_json = json.dumps(excluded_rows, separators=(",", ":"))
     injected = len(rows)
     selected = injected if selected_count is None else _bounded_count(selected_count)
     reason = str(empty_reason or "").strip()[:MAX_EMPTY_REASON_CHARS]
@@ -870,7 +886,7 @@ def record_selection(
         ensure_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
-            "SELECT packet_sha256,selected_count,injected_count,empty_reason "
+            "SELECT packet_sha256,selected_count,injected_count,empty_reason,excluded_json "
             "FROM skill_selection_receipts WHERE task_id=? AND request_id=?",
             (task, request),
         ).fetchone()
@@ -879,16 +895,17 @@ def record_selection(
             int(existing["selected_count"]),
             int(existing["injected_count"]),
             str(existing["empty_reason"] or ""),
-        ) == (packet_sha, selected, injected, reason)
+            str(existing["excluded_json"] or "[]"),
+        ) == (packet_sha, selected, injected, reason, excluded_json)
         if not idempotent:
             conn.execute(
                 "INSERT OR REPLACE INTO skill_selection_receipts "
                 "(task_id,request_id,packet_sha256,selected_json,context_json,created_at,"
-                "selected_count,injected_count,empty_reason) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
+                "selected_count,injected_count,empty_reason,excluded_json) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (
                     task, request, packet_sha, selected_json, context_json, _utcnow(),
-                    selected, injected, reason,
+                    selected, injected, reason, excluded_json,
                 ),
             )
         conn.commit()
@@ -901,6 +918,7 @@ def record_selection(
             "selected_count": selected,
             "injected_count": injected,
             "empty_reason": reason,
+            "excluded": excluded_rows,
             "idempotent": bool(idempotent),
             "replaced": bool(existing is not None and not idempotent),
         }
@@ -964,6 +982,14 @@ def _receipt_row(row: sqlite3.Row) -> dict[str, Any]:
         int(row["selected_count"]) if "selected_count" in columns else injected
     )
     reason = str(row["empty_reason"] or "") if measured else ""
+    excluded: list[Any] = []
+    if "excluded_json" in columns:
+        try:
+            parsed_excluded = json.loads(str(row["excluded_json"] or "[]"))
+        except (TypeError, ValueError):
+            parsed_excluded = []
+        if isinstance(parsed_excluded, list):
+            excluded = parsed_excluded
     return {
         "schema_id": SELECTION_RECEIPT_SCHEMA_ID,
         "task_id": str(row["task_id"]),
@@ -975,6 +1001,9 @@ def _receipt_row(row: sqlite3.Row) -> dict[str, Any]:
         "selected_count": selected,
         "injected_count": injected,
         "empty_reason": reason,
+        # Absent only for a row written before this column existed
+        # (NF-2026-01416); such a row carries no exclusion evidence at all.
+        "excluded": excluded,
         # Blank reason on an empty receipt is the ONE signal that separates a
         # row written before these columns existed from a measured empty one.
         "measured": bool(measured and (injected or reason)),

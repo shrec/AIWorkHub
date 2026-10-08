@@ -15,6 +15,7 @@ Three things are proved here, in this order:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sqlite3
@@ -633,6 +634,34 @@ def test_packet_reaches_the_worker_context_bundle(
     assert result.metadata["section_count"] == 3
 
 
+def test_packet_truncation_surfaces_in_the_metadata_bundle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """NF-2026-01416: a per-row exclusion reaches collect_project_context's own
+    metadata, not just the section _skills_section returns directly."""
+    good = _vocabulary_record(identity="good-skill")
+    bad = skill_registry.validate_record(
+        dataclasses.replace(
+            _vocabulary_record(identity="bad-skill"),
+            procedure_steps=("x" * 339,),
+        )
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    skill_registry_store.put_record(repo, good)
+    skill_registry_store.put_record(repo, bad)
+    _stub_context_tools(monkeypatch)
+
+    result = project_context.collect_project_context(repo, _vocabulary_card())
+
+    assert result is not None
+    section = next(
+        item for item in result.metadata["sections"] if item["name"] == "skills"
+    )
+    assert section["hit_count"] == 1
+    assert section["truncated"] is True
+
+
 # ---------------------------------------------------------------------------
 # 5. The declared skill tier is a FLOOR, proved through the same round trip
 # ---------------------------------------------------------------------------
@@ -1093,6 +1122,7 @@ def test_an_empty_receipt_records_why_rather_than_only_that(
             skill_registry.SELECTION_EMPTY_ACTIVE_VOCABULARY_UNSELECTABLE
         ),
         "failure_reason": "",
+        "excluded": (),
     }
 
 

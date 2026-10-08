@@ -764,6 +764,22 @@ def test_a_receipt_accepts_the_packet_object_the_selection_site_holds(tmp_path):
     assert [row["identity"] for row in result["skills"]] == ["a"]
 
 
+def test_a_selection_receipt_persists_the_packets_excluded_rows(tmp_path):
+    """NF-2026-01416: a packet's own per-row exclusions ride beside
+    selected_count/injected_count instead of being dropped on the floor."""
+    packet = sr.SkillRuntimePacket(
+        version="1.0.0",
+        skills=(),
+        excluded=(("bad-skill", "1.0.0", "packet_limit:procedure_steps"),),
+    )
+
+    result = store.record_selection(tmp_path, task_id="T1", request_id="R1", packet=packet)
+
+    assert result["excluded"] == [["bad-skill", "1.0.0", "packet_limit:procedure_steps"]]
+    stored = store.get_selection(tmp_path, "T1", "R1")
+    assert stored["excluded"] == [["bad-skill", "1.0.0", "packet_limit:procedure_steps"]]
+
+
 def test_injection_counts_are_recorded_never_replayed(tmp_path):
     store.record_selection(
         tmp_path, task_id="T1", request_id="R1", packet=_packet(("a", "1.0.0"))

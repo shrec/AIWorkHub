@@ -1218,18 +1218,25 @@ def test_runtime_packet_enforces_all_bounds_and_malformed_limits():
         "skill_registry.packet_limit",
         lambda: sr.build_runtime_packet([alpha, beta], receipt, max_selected=1),
     )
-    assert_fails(
-        "skill_registry.packet_limit",
-        lambda: sr.build_runtime_packet([alpha, beta], receipt, max_list_items=1),
-    )
-    assert_fails(
-        "skill_registry.packet_limit",
-        lambda: sr.build_runtime_packet([alpha, beta], receipt, max_string_bytes=3),
-    )
-    assert_fails(
-        "skill_registry.packet_limit",
-        lambda: sr.build_runtime_packet([alpha, beta], receipt, max_packet_bytes=10),
-    )
+    # NF-2026-01416: an over-cap field now excludes the offending row instead
+    # of raising and zeroing the whole packet.
+    list_limited = sr.build_runtime_packet([alpha, beta], receipt, max_list_items=1)
+    assert list_limited.skills == ()
+    assert {(row[0], row[2]) for row in list_limited.excluded} == {
+        ("alpha", "packet_limit:reasons"),
+        ("beta", "packet_limit:reasons"),
+    }
+    string_limited = sr.build_runtime_packet([alpha, beta], receipt, max_string_bytes=3)
+    assert string_limited.skills == ()
+    assert {(row[0], row[2]) for row in string_limited.excluded} == {
+        ("alpha", "packet_limit:identity"),
+        ("beta", "packet_limit:identity"),
+    }
+    # A packet that cannot fit even one row drops every row from the end
+    # instead of raising.
+    byte_limited = sr.build_runtime_packet([alpha, beta], receipt, max_packet_bytes=10)
+    assert byte_limited.skills == ()
+    assert {row[2] for row in byte_limited.excluded} == {"packet_limit:packet_bytes"}
     assert_fails(
         "skill_registry.invalid_type",
         lambda: sr.build_runtime_packet([alpha], receipt, max_selected=True),

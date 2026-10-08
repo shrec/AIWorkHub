@@ -1316,6 +1316,7 @@ def _skill_selection_metadata(section: dict[str, Any]) -> dict[str, Any]:
             "injected_count": None,
             "evidence_backed_count": None,
             "empty_reason": "",
+            "excluded": None,
             "failure_reason": section["degraded_reason"],
         }
     return {
@@ -1324,6 +1325,7 @@ def _skill_selection_metadata(section: dict[str, Any]) -> dict[str, Any]:
         "injected_count": section["injected_count"],
         "evidence_backed_count": section["evidence_backed_count"],
         "empty_reason": section["empty_reason"],
+        "excluded": section["excluded"],
         "failure_reason": "",
     }
 
@@ -1520,8 +1522,13 @@ def _skills_section(repo: Path, card: dict[str, Any]) -> dict[str, Any] | None:
         injected_count=len(packet.skills),
         evidence_backed_count=evidence_backed_count,
         empty_reason=empty_reason,
+        # A record excluded for breaching a packet bound, named here rather
+        # than hidden behind a shorter skills list (NF-2026-01416).
+        excluded=packet.excluded,
         content=content,
-        truncated=False,
+        # A packet-bound exclusion is a truncation of the selection, exactly
+        # like a byte/row cap trimming any other section.
+        truncated=len(packet.skills) < len(receipt.selected),
         # The packet row count is the hit count. It is taken from the packet
         # rather than inferred from the JSON shape, so an empty packet reads as
         # zero hits instead of one non-empty object.
