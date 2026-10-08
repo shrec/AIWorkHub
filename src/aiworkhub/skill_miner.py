@@ -500,18 +500,181 @@ def _candidate_identity(terms: Sequence[str], cards: Sequence[str]) -> str:
     return identity if skill_registry._IDENTITY_RE.match(identity) else f"mined.rule.{digest}"
 
 
-def _proposal_draft(
-    cluster: RuleCluster, identity: str
-) -> tuple[dict[str, Any], tuple[str, ...]]:
-    """Build the draft a manager passes to ``aiworkhub_manager_skill_propose``.
+MIN_LOADABLE_MEMBERS = 2
+MAX_PROCEDURE_STEPS = 8
+MAX_AVOID_RULES = 6
 
-    Only dimensions derivable from measured card evidence are filled in. The
-    two dimensions that decide relevance -- ``triggers`` and ``applicability``
-    -- are drawn from closed vocabularies and are left EMPTY, because inferring
-    a vocabulary token from prose is exactly how a mined skill set drifts to
-    instance level. They are named in the returned ``draft_incomplete`` tuple
-    so the caller is told what a human still owes.
+
+def _member_contexts(
+    repo: str | Path, cluster: RuleCluster
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Read each distinct member card and derive its runtime selection context.
+
+    Read-only, through the identical two calls real-time selection uses:
+    ``task_store.get_task`` then ``project_context._skill_selection_context``.
+    A card absent from the canonical store, or one whose context does not
+    resolve (for example no declared or derivable triggers/applicability),
+    contributes nothing and is simply omitted; the caller decides what too
+    few contributing members means.
     """
+    from . import project_context, task_store
+
+    repo_path = Path(repo)
+    members: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for task_id in cluster.distinct_cards:
+        try:
+            card = task_store.get_task(repo_path, task_id)
+        except Exception:  # noqa: BLE001 -- an unreadable card contributes nothing
+            continue
+        if not isinstance(card, dict):
+            continue
+        try:
+            context = project_context._skill_selection_context(card)
+        except skill_registry.SkillRegistryError:
+            continue
+        if context is None:
+            continue
+        members.append((card, context))
+    return members
+
+
+def _modal(values: Iterable[str]) -> str:
+    """The most common value; ties break to the lexicographically smallest.
+
+    Deterministic independent of ``Counter`` iteration order. Shared by
+    ``task_family`` and ``stage`` so one tie-break rule serves both.
+    """
+    counts = Counter(value for value in values if value)
+    if not counts:
+        return ""
+    best = max(counts.values())
+    return min(value for value, count in counts.items() if count == best)
+
+
+def _member_stage(card: Mapping[str, Any]) -> str:
+    """A member's first-launch stage: the skill must reach the first attempt.
+
+    Never ``review``/``rework`` -- a mined procedure serves the attempt a
+    correction eventually corrected, not the adjudication that corrected it.
+    """
+    return "orientation" if card.get("read_only") is True else "implementation"
+
+
+def _majority_tokens(token_lists: Sequence[Sequence[str]]) -> tuple[str, ...]:
+    """Closed-vocabulary tokens held by a STRICT majority of members.
+
+    Majority rather than unanimity, so one dissenting member cannot blank a
+    trigger every other member declares. Output is sorted, never the accident
+    of ``Counter`` iteration order.
+    """
+    total = len(token_lists)
+    if total == 0:
+        return ()
+    counts: Counter[str] = Counter()
+    for tokens in token_lists:
+        counts.update(set(tokens))
+    return tuple(sorted(token for token, count in counts.items() if count * 2 > total))
+
+
+def _confidence(distinct_cards: int, distinct_actors: int) -> float:
+    """Deterministic, bounded confidence from recurrence strength alone.
+
+    Not calibrated against outcomes: :func:`measure_retirement` already
+    explains why no injection/outcome denominator exists yet to calibrate
+    against. This rewards recurrence past the two floors the gate already
+    enforces (``MIN_DISTINCT_CARDS``, ``ADVISORY_MIN_DISTINCT_ACTORS``) and
+    stays capped below 1.0, because recurrence is not activation evidence --
+    only two independent accepted-evidence actors is.
+    """
+    card_margin = max(0, distinct_cards - MIN_DISTINCT_CARDS)
+    actor_margin = max(0, distinct_actors - ADVISORY_MIN_DISTINCT_ACTORS + 1)
+    return round(min(0.5 + 0.1 * card_margin + 0.1 * actor_margin, 0.95), 2)
+
+
+def _bounded_unique(texts: Iterable[str], limit: int) -> list[str]:
+    """First ``limit`` distinct, non-empty strings, order preserved."""
+    seen: dict[str, None] = {}
+    for text in texts:
+        if text:
+            seen[text] = None
+    return list(seen)[:limit]
+
+
+def _proposal_draft(
+    cluster: RuleCluster, identity: str, repo: str | Path | None = None
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Build the draft a manager (or the learning-commit auto-mining hook)
+    passes to ``aiworkhub_manager_skill_propose``.
+
+    With ``repo``, every dimension is derived mechanically, read-only, from
+    the cluster's own distinct member cards -- the identical derivation
+    runtime selection uses (see ``_member_contexts``). Below
+    ``MIN_LOADABLE_MEMBERS`` resolvable cards the family is still unmined
+    human-judgement territory and ``draft_incomplete`` says exactly why.
+    Without ``repo`` -- a caller inspecting the rule family in isolation,
+    never the ``mine``/``candidate_draft`` path, which always supplies one --
+    the closed-vocabulary dimensions stay exactly as empty as they were
+    before this derivation existed.
+    """
+    if repo is not None:
+        members = _member_contexts(repo, cluster)
+        if len(members) >= MIN_LOADABLE_MEMBERS:
+            cards = [card for card, _context in members]
+            contexts = [context for _card, context in members]
+            all_writes = [
+                str(item)
+                for card in cards
+                for item in (card.get("allowed_writes") or [])
+                if isinstance(item, str)
+            ]
+            scope = skill_registry.common_path_scope(all_writes)
+            corrections = [
+                member.excerpt
+                for member in cluster.members
+                if member.kind == "review_feedback.instruction"
+            ]
+            draft = {
+                "identity": identity,
+                "version": "0.1.0",
+                "scope": skill_registry.SkillScope.REPOSITORY.value,
+                "task_family": _modal(str(c.get("task_family") or "") for c in contexts),
+                "path_or_symbol": scope or skill_registry.SELECT_WILDCARD,
+                "risk": skill_registry.RiskLevel.MEDIUM.value,
+                "stage": _modal(_member_stage(card) for card in cards),
+                "triggers": list(
+                    _majority_tokens([list(c.get("triggers") or ()) for c in contexts])
+                ),
+                "applicability": list(
+                    _majority_tokens([list(c.get("applicability") or ()) for c in contexts])
+                ),
+                "confidence": _confidence(
+                    len(cluster.distinct_cards), len(cluster.distinct_actors)
+                ),
+                "procedure_steps": _bounded_unique(
+                    [cluster.representative.excerpt]
+                    + [member.excerpt for member in cluster.members],
+                    MAX_PROCEDURE_STEPS,
+                ),
+                "avoid_rules": _bounded_unique(corrections, MAX_AVOID_RULES),
+            }
+            return draft, ()
+        scope = skill_registry.common_path_scope(list(cluster.distinct_files))
+        draft = {
+            "identity": identity,
+            "version": "0.1.0",
+            "scope": skill_registry.SkillScope.REPOSITORY.value,
+            "task_family": "",
+            "path_or_symbol": scope or skill_registry.SELECT_WILDCARD,
+            "risk": skill_registry.RiskLevel.MEDIUM.value,
+            "stage": "implementation",
+            "triggers": [],
+            "applicability": [],
+            "confidence": 0.0,
+            "procedure_steps": [],
+            "avoid_rules": [],
+        }
+        return draft, ("member_cards_not_in_store",)
+
     scope = skill_registry.common_path_scope(list(cluster.distinct_files))
     draft = {
         "identity": identity,
@@ -534,12 +697,23 @@ def _proposal_draft(
     return draft, tuple(incomplete)
 
 
-def _candidate(decision: GateDecision, idf: Mapping[str, float]) -> dict[str, Any]:
+def _candidate(
+    decision: GateDecision, idf: Mapping[str, float], repo: str | Path | None = None
+) -> dict[str, Any]:
     cluster = decision.cluster
     terms = cluster.shared_terms(idf)
     cards = cluster.distinct_cards
-    identity = _candidate_identity(terms, cards)
-    draft, incomplete = _proposal_draft(cluster, identity)
+    # Keyed to the family's REPRESENTATIVE alone, never to the full growing
+    # membership: leader clustering (cluster_by_rule) never reassigns a
+    # family's representative once opened, only attaches new members to it,
+    # so this identity is stable across re-mining as a cluster gains members.
+    # ``terms``/``cards`` above stay membership-wide for the "rule_terms" and
+    # "provenance" reporting fields below, which SHOULD grow with the family.
+    identity = _candidate_identity(
+        sorted(cluster.representative.terms),
+        [cluster.representative.anchor or cluster.representative.task_id],
+    )
+    draft, incomplete = _proposal_draft(cluster, identity, repo)
     warnings: list[str] = []
     if decision.distinct_actors < ADVISORY_MIN_DISTINCT_ACTORS:
         warnings.append(
@@ -653,7 +827,7 @@ def mine(
             "advisory_min_distinct_actors": ADVISORY_MIN_DISTINCT_ACTORS,
         },
         "families": len(clusters),
-        "candidates": [_candidate(d, idf) for d in promoted[:MAX_CANDIDATES]],
+        "candidates": [_candidate(d, idf, repo) for d in promoted[:MAX_CANDIDATES]],
         "refused": dict(refused),
         "sensitivity": (
             _sensitivity(documents, idf, min_cards=min_cards, min_files=min_files)

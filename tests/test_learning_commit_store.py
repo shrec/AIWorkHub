@@ -225,6 +225,10 @@ def test_accepted_learning_commit_bootstraps_skill_evidence_idempotently(tmp_pat
     assert second["skill_evidence"]["recorded"][0]["idempotent"] is True
     assert second["commit_id"] == first["commit_id"]
     assert first["skill_evidence"]["evidence_basis"] == "adjudicated_applicable_card"
+    assert set(first["skill_mining"]) == {
+        "candidates", "proposed", "already_proposed", "refused_by_reason", "elapsed_ms",
+    }
+    assert isinstance(first["skill_mining"]["elapsed_ms"], (int, float))
 
 
 @pytest.mark.parametrize("failure", ["exception", "refusal", "unlinked", "after_write", "unreadable"])
@@ -261,6 +265,30 @@ def test_skill_bootstrap_projection_failure_retries_durable_learning(tmp_path, m
     assert second["commit_id"] == first["commit_id"]
     assert second["skill_evidence"]["state"] == "completed"
     assert len(store.load_registry(root).get("bootstrap-bugfix", "1.0.0").evidence) == 1
+
+
+def test_learning_commit_survives_a_forced_skill_mining_exception(tmp_path, monkeypatch):
+    """A mining defect is advisory and must never flip the commit's own
+    ``ok``/``failures`` -- the exact contract the projection-failure tests
+    above already hold ``skill_evidence`` to.
+    """
+    from aiworkhub import skill_miner
+
+    root, task_id, request_id, store = _bootstrap_skill_case(tmp_path, monkeypatch)
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("forced_mining_failure")
+
+    monkeypatch.setattr(skill_miner, "mine", _raise)
+    result = _commit(task_id, request_id)
+
+    assert result["ok"] is True
+    assert result.get("failures", {}) == {}
+    assert result["skill_mining"]["candidates"] == 0
+    assert result["skill_mining"]["proposed"] == []
+    assert result["skill_mining"]["refused_by_reason"]["mining"].startswith(
+        "skill_mining_failed:"
+    )
 
 
 @pytest.mark.parametrize("fault", ["blocked", "review", "processing", "stale_request", "absent_acceptance"])
@@ -307,6 +335,7 @@ def test_skill_bootstrap_producer_does_not_credit_other_learning_outcomes(tmp_pa
     assert result["ok"] is True
     assert result["outcome"] == outcome
     assert "skill_evidence" not in result
+    assert "skill_mining" not in result
     assert store.load_registry(root).get("bootstrap-bugfix", "1.0.0").evidence == ()
 
 

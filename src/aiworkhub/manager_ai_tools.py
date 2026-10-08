@@ -13,6 +13,7 @@ import os
 import secrets
 import sqlite3
 import threading
+import time
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
@@ -418,6 +419,64 @@ def kb_write(
     )
 
 
+_ALREADY_PROPOSED_REASON_CODES = frozenset(
+    {"skill_registry.immutable_identity", "skill_registry.immutable_digest"}
+)
+
+
+def _auto_mine_and_propose_skills(repo: Path) -> dict[str, Any]:
+    """Best-effort skill mining after one accepted learning commit.
+
+    Bounded and advisory: every failure here is caught and reported, never
+    raised, so a mining or proposal defect can never flip the commit's own
+    ``ok``/``failures`` -- the same contract ``skill_evidence`` above already
+    keeps. ``manager_skill_tools.propose`` (full form, unchanged) is the only
+    path to a stored record, and only a candidate whose ``draft_incomplete``
+    is empty ever reaches it; partial judgement is reported, never guessed.
+    A candidate whose identity or content digest the registry already holds
+    is not a failure -- ``propose`` refuses the duplicate with reason_code
+    ``immutable_identity``/``immutable_digest``, and that refusal is reported
+    as ``already_proposed``, never as ``refused_by_reason``. This is what
+    makes re-mining a cluster that gained members since its last proposal
+    safe: the newer draft's content differs, but its identity (bound to the
+    family's stable representative, never its growing membership) does not.
+    """
+    from . import manager_skill_tools, skill_miner
+
+    started = time.monotonic()
+    proposed: list[str] = []
+    already_proposed: list[str] = []
+    refused: dict[str, str] = {}
+    candidate_count = 0
+    try:
+        report = skill_miner.mine(repo, include_sensitivity=False)
+        candidates = report.get("candidates", [])
+        candidate_count = len(candidates)
+        for candidate in candidates:
+            identity = str(candidate.get("candidate_id") or "")
+            incomplete = candidate.get("draft_incomplete") or []
+            if incomplete:
+                refused[identity] = "draft_incomplete:" + ",".join(incomplete)
+                continue
+            draft = skill_miner.candidate_proposal_payload(candidate)
+            propose_result = manager_skill_tools.propose(**draft)
+            if propose_result.get("ok") is True:
+                proposed.append(identity)
+            elif propose_result.get("reason_code") in _ALREADY_PROPOSED_REASON_CODES:
+                already_proposed.append(identity)
+            else:
+                refused[identity] = str(propose_result.get("error") or "propose_refused")[:200]
+    except Exception as exc:  # noqa: BLE001 -- mining is advisory, never fatal to the commit
+        refused["mining"] = f"skill_mining_failed:{type(exc).__name__}"
+    return {
+        "candidates": candidate_count,
+        "proposed": proposed,
+        "already_proposed": already_proposed,
+        "refused_by_reason": refused,
+        "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
+    }
+
+
 def learning_commit(
     *,
     task_id: str,
@@ -487,6 +546,10 @@ def learning_commit(
                 **result.get("failures", {}),
                 "skill_evidence": evidence.get("reason") or "skill_evidence_unlinked",
             }
+        context, _manager_info = _manager_context()
+        result["skill_mining"] = _auto_mine_and_propose_skills(
+            context.authority_repo if context is not None else core.repo_root()
+        )
     return result
 
 
