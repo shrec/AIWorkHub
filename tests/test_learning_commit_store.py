@@ -18,6 +18,7 @@ from aiworkhub import (
     learning_commit,
     learning_commit_store,
     manager_ai_tools,
+    recipe_miner,
     task_store,
 )
 
@@ -229,6 +230,10 @@ def test_accepted_learning_commit_bootstraps_skill_evidence_idempotently(tmp_pat
         "candidates", "proposed", "already_proposed", "refused_by_reason", "elapsed_ms",
     }
     assert isinstance(first["skill_mining"]["elapsed_ms"], (int, float))
+    assert set(first["recipe_mining"]) == {
+        "candidates", "proposed", "already_proposed", "refused_by_reason", "elapsed_ms",
+    }
+    assert isinstance(first["recipe_mining"]["elapsed_ms"], (int, float))
 
 
 @pytest.mark.parametrize("failure", ["exception", "refusal", "unlinked", "after_write", "unreadable"])
@@ -291,6 +296,28 @@ def test_learning_commit_survives_a_forced_skill_mining_exception(tmp_path, monk
     )
 
 
+def test_learning_commit_survives_a_forced_recipe_mining_exception(tmp_path, monkeypatch):
+    """A recipe-mining defect is advisory and must never flip the commit's
+    own ``ok``/``failures`` -- the exact contract ``skill_mining`` above
+    already holds.
+    """
+    root, task_id, request_id, store = _bootstrap_skill_case(tmp_path, monkeypatch)
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("forced_recipe_mining_failure")
+
+    monkeypatch.setattr(recipe_miner, "mine", _raise)
+    result = _commit(task_id, request_id)
+
+    assert result["ok"] is True
+    assert result.get("failures", {}) == {}
+    assert result["recipe_mining"]["candidates"] == 0
+    assert result["recipe_mining"]["proposed"] == []
+    assert result["recipe_mining"]["refused_by_reason"]["mining"].startswith(
+        "recipe_mining_failed:"
+    )
+
+
 @pytest.mark.parametrize("fault", ["blocked", "review", "processing", "stale_request", "absent_acceptance"])
 def test_skill_bootstrap_producer_never_credits_unaccepted_card(tmp_path, monkeypatch, fault):
     root, task_id, request_id, store = _bootstrap_skill_case(tmp_path, monkeypatch)
@@ -336,6 +363,7 @@ def test_skill_bootstrap_producer_does_not_credit_other_learning_outcomes(tmp_pa
     assert result["outcome"] == outcome
     assert "skill_evidence" not in result
     assert "skill_mining" not in result
+    assert "recipe_mining" not in result
     assert store.load_registry(root).get("bootstrap-bugfix", "1.0.0").evidence == ()
 
 

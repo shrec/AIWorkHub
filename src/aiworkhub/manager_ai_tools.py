@@ -521,7 +521,7 @@ def learning_commit(
         task_id=task_id,
     )
     if result.get("commit_id") and result.get("outcome") == "accepted":
-        from . import manager_skill_tools
+        from . import manager_skill_tools, recipe_miner
 
         # Applicability evidence, never a claim that the procedure was invoked.
         # Retry even an idempotent learning commit: the optional projection may
@@ -548,6 +548,9 @@ def learning_commit(
             }
         context, _manager_info = _manager_context()
         result["skill_mining"] = _auto_mine_and_propose_skills(
+            context.authority_repo if context is not None else core.repo_root()
+        )
+        result["recipe_mining"] = recipe_miner.auto_mine_and_propose(
             context.authority_repo if context is not None else core.repo_root()
         )
     return result

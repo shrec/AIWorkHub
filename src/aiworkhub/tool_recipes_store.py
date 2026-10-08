@@ -131,6 +131,18 @@ CREATE INDEX IF NOT EXISTS idx_tool_recipe_receipts_created
     ON tool_recipe_receipts(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tool_recipe_receipts_recipe
     ON tool_recipe_receipts(recipe_id, version);
+CREATE TABLE IF NOT EXISTS recipe_proposals (
+    template_digest TEXT NOT NULL PRIMARY KEY,
+    recipe_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    draft_json TEXT NOT NULL,
+    provenance_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recipe_proposals_status
+    ON recipe_proposals(status);
 """
 
 
@@ -394,6 +406,128 @@ def load_registry(
     row is never silently served as if it were absent.
     """
     return RecipeRegistry(list_recipes(repo_root, limit=limit))
+
+
+# ---------------------------------------------------------------------------
+# Recipe proposals (mined, never registered).
+#
+# An ADDITIVE sibling table to ``tool_recipes``: a proposal is advisory
+# evidence that a validation command recurs, never a registry entry, and
+# nothing in this module (or anywhere else) promotes a row here into
+# ``tool_recipes``. Keyed by the mined template's own digest -- carried in
+# ``provenance["template_digest"]`` -- so re-mining a cluster that gained
+# members produces the SAME key and updates provenance in place rather than
+# minting a second row.
+# ---------------------------------------------------------------------------
+
+
+def put_proposal(
+    repo_root: str | Path, draft: dict[str, Any], provenance: dict[str, Any]
+) -> dict[str, Any]:
+    """Idempotently record one mined recipe draft as ``proposed``.
+
+    A second call for the same ``provenance["template_digest"]`` updates the
+    stored provenance only (growing cluster membership, a later sample
+    command) and reports ``already_proposed`` -- the draft itself, once
+    proposed, never changes underneath its own digest-derived identity.
+    """
+    template_digest = str(provenance.get("template_digest") or "")
+    recipe_id = str(draft.get("id") or "")
+    version = str(draft.get("version") or "")
+    if not template_digest or not recipe_id or not version:
+        raise ToolRecipeStoreError(
+            "put_proposal requires draft id/version and provenance template_digest"
+        )
+    draft_json = tool_recipes.canonical_json(draft)
+    provenance_json = tool_recipes.canonical_json(provenance)
+    now = _utcnow()
+    conn = _connect(repo_root)
+    try:
+        ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT 1 FROM recipe_proposals WHERE template_digest=?",
+            (template_digest,),
+        ).fetchone()
+        if existing is not None:
+            conn.execute(
+                "UPDATE recipe_proposals SET provenance_json=?, updated_at=? "
+                "WHERE template_digest=?",
+                (provenance_json, now, template_digest),
+            )
+            conn.commit()
+            return {
+                "schema_id": SCHEMA_ID,
+                "status": "already_proposed",
+                "recipe_id": recipe_id,
+                "version": version,
+                "template_digest": template_digest,
+            }
+        conn.execute(
+            "INSERT INTO recipe_proposals "
+            "(template_digest,recipe_id,version,draft_json,provenance_json,"
+            "status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            (
+                template_digest, recipe_id, version, draft_json, provenance_json,
+                "proposed", now, now,
+            ),
+        )
+        conn.commit()
+        return {
+            "schema_id": SCHEMA_ID,
+            "status": "proposed",
+            "recipe_id": recipe_id,
+            "version": version,
+            "template_digest": template_digest,
+        }
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def list_proposals(
+    repo_root: str | Path, *, limit: int = DEFAULT_LOAD_LIMIT
+) -> list[dict[str, Any]]:
+    """Return mined recipe proposals, bounded and fail-closed. Never creates the DB."""
+    path = _db_path(repo_root)
+    if not path.exists():
+        return []
+    bounded = max(1, min(int(limit), MAX_LOAD_LIMIT))
+    try:
+        conn = connect_readonly(path)
+    except (sqlite3.Error, OSError, ValueError):
+        return []
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT * FROM recipe_proposals ORDER BY created_at DESC LIMIT ?",
+            (bounded,),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+    proposals: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            draft = json.loads(row["draft_json"])
+            provenance = json.loads(row["provenance_json"])
+        except json.JSONDecodeError:
+            continue
+        proposals.append({
+            "template_digest": row["template_digest"],
+            "recipe_id": row["recipe_id"],
+            "version": row["version"],
+            "draft": draft,
+            "provenance": provenance,
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        })
+    return proposals
 
 
 # ---------------------------------------------------------------------------
