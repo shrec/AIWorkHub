@@ -4131,3 +4131,477 @@ def test_settings_view_uses_shared_catalog_preflight_without_hook_patch(
     assert "opencode/glm-4.5-free" in policy_models
     assert "openai/gpt-4o" in policy_models
     assert listing_calls == []
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-01399: the Skills WINDOW projection.
+#
+# The panel could say only "0 injectable · 2 accepted · 2 actors", which
+# answers none of the questions an owner asks. These cover the per-record
+# ``records`` list that answers them, and -- just as importantly -- that the
+# summary projection every refresh builds did not change by one key or one
+# number to get it.
+# ---------------------------------------------------------------------------
+
+
+def _skill_record(**overrides: object):
+    from aiworkhub import skill_registry as sr
+
+    data: dict = {
+        "identity": "commit-msg-check",
+        "version": "1.0.0",
+        "scope": "repository",
+        "task_family": "commit",
+        "path_or_symbol": "src/aiworkhub/skill_registry.py",
+        "risk": "medium",
+        "stage": "post-edit",
+        "triggers": ["commit"],
+        "confidence": 0.9,
+        "procedure_steps": ["Reject <img onerror=alert(1)> in a commit message"],
+    }
+    data.update(overrides)
+    return sr.SkillRecord.from_mapping(data)
+
+
+def _skill_evidence(actor_id: str, outcome: str = "accepted") -> dict:
+    return {
+        "source": f"file:{actor_id}.json",
+        "outcome": outcome,
+        "authority": "worker",
+        "actor_id": actor_id,
+        "note": "",
+    }
+
+
+class _SkillWindowProvider(_FoundationProvider):
+    """``_FoundationProvider``'s cheap fakes plus the REAL per-record reader.
+
+    ``get_skill_ownership_rows`` is bound straight off ``DashboardProvider``,
+    so the row material under test comes from the production producer rather
+    than from a second implementation written for the test.
+    """
+
+    get_skill_ownership_rows = dashboard.DashboardProvider.get_skill_ownership_rows
+
+    def __init__(self, registry: object, repo_root: Path) -> None:
+        super().__init__(skills=registry)
+        self.repo_root = repo_root
+
+
+def _install_skill_window_store(
+    monkeypatch: pytest.MonkeyPatch,
+    repo_root: Path,
+    records: list,
+    receipts: list,
+    counts: dict,
+) -> _SkillWindowProvider:
+    """Install ONE fixture skills store over the real store's page readers.
+
+    Only the three bounded DB readers are replaced, so ``load_registry`` and
+    ``activation_supported`` -- the owners of the two-independent-actor
+    demotion -- still run for real against the fixture rows. A fixture that
+    stubbed the demotion too could not tell a stored lifecycle from an
+    effective one, which is one of the facts the window exists to show.
+    """
+    from aiworkhub import skill_registry_store as store
+
+    monkeypatch.setattr(store, "list_records", lambda _root, **_kwargs: list(records))
+    monkeypatch.setattr(store, "list_selections", lambda _root, **_kwargs: list(receipts))
+    monkeypatch.setattr(store, "injection_counts", lambda _root, **_kwargs: dict(counts))
+    return _SkillWindowProvider(store.load_registry(repo_root), repo_root)
+
+
+def _skill_window_fixture(
+    monkeypatch: pytest.MonkeyPatch, repo_root: Path
+) -> _SkillWindowProvider:
+    """A proposed record with ONE actor, an active injectable record injected
+    into two cards, one ``mined.*`` proposal, and a RETIRED record whose
+    evidence also rests on one actor."""
+    proposed = _skill_record(evidence=[_skill_evidence("worker.glm.5.3")])
+    active = _skill_record(
+        identity="ratchet-guard",
+        version="2.0.0",
+        lifecycle_state="active",
+        procedure_steps=["Lower the ratchet, never raise it"],
+        avoid_rules=["never raise the ceiling"],
+        evidence=[_skill_evidence("worker.a"), _skill_evidence("worker.b")],
+    )
+    mined = _skill_record(
+        identity="mined.dashboard-projection",
+        version="0.1.0",
+        procedure_steps=[],
+        evidence=[_skill_evidence("worker.a"), _skill_evidence("worker.b")],
+    )
+    retired = _skill_record(
+        identity="retired-skill",
+        version="1.0.0",
+        lifecycle_state="retired",
+        evidence=[_skill_evidence("worker.glm.5.3")],
+    )
+    receipts = [
+        {
+            "task_id": "CARD_A",
+            "request_id": "r1",
+            "created_at": "2026-10-07T10:00:00Z",
+            "selected_count": 1,
+            "injected_count": 1,
+            "skills": [{"identity": "ratchet-guard", "version": "2.0.0"}],
+        },
+        {
+            "task_id": "CARD_B",
+            "request_id": "r2",
+            "created_at": "2026-10-08T11:00:00Z",
+            "selected_count": 1,
+            "injected_count": 1,
+            "skills": [{"identity": "ratchet-guard", "version": "2.0.0"}],
+        },
+        # Selected but NOT injected: the window must not report this as a use.
+        {
+            "task_id": "CARD_C",
+            "request_id": "r3",
+            "created_at": "2026-10-06T09:00:00Z",
+            "selected_count": 1,
+            "injected_count": 0,
+            "skills": [{"identity": "mined.dashboard-projection", "version": "0.1.0"}],
+        },
+    ]
+    return _install_skill_window_store(
+        monkeypatch,
+        repo_root,
+        [proposed, active, mined, retired],
+        receipts,
+        {"ratchet-guard@2.0.0": {"injected_cards": 2, "injected_requests": 2}},
+    )
+
+
+def test_skills_window_rows_report_lifecycle_reason_and_injection_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = _skill_window_fixture(monkeypatch, tmp_path)
+    # ``_coding_foundation_projections`` is the step ``build_snapshot``
+    # delegates these four panels to, and it is where the full/summary
+    # ownership gate lives, so it is the subject rather than a shortcut.
+    skills = dashboard._coding_foundation_projections(provider, ownership="full")[
+        "skills"
+    ]
+
+    assert skills["state"] == "measured"
+    assert skills["records_total"] == 4
+    assert skills["records_truncated"] is False
+    assert skills["records_injected_card_count"] == 2
+    rows = {row["identity"]: row for row in skills["records"]}
+    assert set(rows) == {
+        "commit-msg-check",
+        "ratchet-guard",
+        "mined.dashboard-projection",
+        "retired-skill",
+    }
+
+    waiting = rows["commit-msg-check"]
+    assert waiting["version"] == "1.0.0"
+    assert waiting["mined"] is False
+    assert waiting["stored_lifecycle"] == "proposed"
+    assert waiting["effective_lifecycle"] == "proposed"
+    assert waiting["injectable"] is False
+    assert waiting["injectable_reason"] == "activation_evidence_below_two_distinct_actors"
+    assert waiting["accepted_actor_ids"] == ["worker.glm.5.3"]
+    assert waiting["evidence_by_outcome"] == {"accepted": 1, "negative": 0}
+    assert waiting["what_it_does"] == "Reject <img onerror=alert(1)> in a commit message"
+    assert waiting["procedure_steps"] == [
+        "Reject <img onerror=alert(1)> in a commit message"
+    ]
+    assert waiting["vocabulary"]["task_family"] == "commit"
+    assert waiting["vocabulary"]["stage"] == "post-edit"
+    assert waiting["vocabulary"]["risk"] == "medium"
+    assert waiting["vocabulary"]["triggers"] == ["commit"]
+    assert len(waiting["evidence"]) == 1
+    assert waiting["evidence"][0]["outcome"] == "accepted"
+    assert waiting["evidence"][0]["actor_id"] == "worker.glm.5.3"
+    assert waiting["evidence"][0]["source"] == "file:worker.glm.5.3.json"
+    # Never selected and never injected reads as zero, not as a timestamp.
+    assert waiting["injection_count"] == 0
+    assert waiting["injected_cards"] == 0
+    assert waiting["selection_count"] == 0
+    assert waiting["last_injected_at"] == ""
+    assert waiting["last_selected_at"] == ""
+
+    reaching = rows["ratchet-guard"]
+    assert reaching["stored_lifecycle"] == "active"
+    assert reaching["effective_lifecycle"] == "active"
+    assert reaching["injectable"] is True
+    assert reaching["injectable_reason"] == ""
+    assert reaching["accepted_actor_ids"] == ["worker.a", "worker.b"]
+    assert reaching["avoid_rules"] == ["never raise the ceiling"]
+    assert reaching["injection_count"] == 2
+    assert reaching["injected_cards"] == 2
+    assert reaching["selection_count"] == 2
+    # The newest receipt wins, and ``created_at`` is this store's own UTC
+    # ISO-8601 stamp, so the latest string IS the latest moment.
+    assert reaching["last_injected_at"] == "2026-10-08T11:00:00Z"
+    assert reaching["last_selected_at"] == "2026-10-08T11:00:00Z"
+
+    mined = rows["mined.dashboard-projection"]
+    assert mined["mined"] is True
+    assert mined["injectable"] is False
+    assert mined["injectable_reason"] == "lifecycle_state_is_proposed_not_active"
+    assert mined["what_it_does"] == ""
+    assert mined["procedure_steps"] == []
+    # Selected once, injected never: the two are counted separately.
+    assert mined["selection_count"] == 1
+    assert mined["last_selected_at"] == "2026-10-06T09:00:00Z"
+    assert mined["injection_count"] == 0
+    assert mined["injected_cards"] == 0
+    assert mined["last_injected_at"] == ""
+
+    retired = rows["retired-skill"]
+    # The demotion targets ACTIVE and nothing else. ``activation_supported`` is
+    # an EVIDENCE predicate, which this one-actor record fails, and reporting a
+    # retired record as proposed would read as a skill still waiting for the
+    # evidence it was deliberately taken out of service despite.
+    assert retired["stored_lifecycle"] == "retired"
+    assert retired["effective_lifecycle"] == "retired"
+    assert retired["injectable"] is False
+
+
+def test_skills_window_summary_is_byte_identical_and_reads_no_per_record_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = _skill_window_fixture(monkeypatch, tmp_path)
+    ownership_reads: list[str] = []
+    original = dashboard._skill_ownership_rows
+    monkeypatch.setattr(
+        dashboard,
+        "_skill_ownership_rows",
+        lambda target: ownership_reads.append("read") or original(target),
+    )
+
+    summary = dashboard._coding_foundation_projections(provider, ownership="summary")[
+        "skills"
+    ]
+    # The refresh hot path never even asks for the rows, so it cannot pay for
+    # them.
+    assert ownership_reads == []
+    # ``_project_skills`` without ``ownership_rows`` IS the pre-change
+    # behaviour, so this is the before/after comparison and not a restatement.
+    baseline = dashboard._project_skills(
+        provider.get_skills_projection_input(),
+        ownership="summary",
+        input_state="present",
+    )
+    assert json.dumps(summary, sort_keys=True) == json.dumps(baseline, sort_keys=True)
+    assert [key for key in summary if key.startswith("records")] == []
+
+    full = dashboard._coding_foundation_projections(provider, ownership="full")["skills"]
+    assert ownership_reads == ["read"]
+    assert full["records_total"] == 4
+    for key in ("count", "lifecycle", "injectable_count", "accepted_evidence_count",
+                "distinct_actor_count", "active_non_injectable_reasons"):
+        assert full[key] == baseline[key], key
+
+
+def test_skills_window_demotes_unverified_active_and_discloses_truncation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Stored ACTIVE on one actor's evidence: the store serves it as proposed,
+    # and reporting only the stored value is how a record reads as active while
+    # no worker could ever receive it.
+    unverified = _skill_record(
+        identity="self-certified",
+        version="3.0.0",
+        lifecycle_state="active",
+        evidence=[_skill_evidence("worker.only")],
+    )
+    verified = _skill_record(
+        identity="ratchet-guard",
+        version="2.0.0",
+        lifecycle_state="active",
+        evidence=[_skill_evidence("worker.a"), _skill_evidence("worker.b")],
+    )
+    third = _skill_record(identity="third-skill", version="1.0.0")
+    provider = _install_skill_window_store(
+        monkeypatch, tmp_path, [unverified, verified, third], [], {}
+    )
+
+    skills = dashboard._coding_foundation_projections(provider, ownership="full")[
+        "skills"
+    ]
+    rows = {row["identity"]: row for row in skills["records"]}
+    assert rows["self-certified"]["stored_lifecycle"] == "active"
+    assert rows["self-certified"]["effective_lifecycle"] == "proposed"
+    assert rows["self-certified"]["injectable"] is False
+    assert rows["ratchet-guard"]["effective_lifecycle"] == "active"
+    assert skills["records_injected_card_count"] == 0
+
+    monkeypatch.setattr(dashboard, "_SKILL_RECORD_ROW_LIMIT", 2)
+    bounded = dashboard._coding_foundation_projections(provider, ownership="full")[
+        "skills"
+    ]
+    assert len(bounded["records"]) == 2
+    assert bounded["records_truncated"] is True
+    # Over the bound the page is NOT published as the population.
+    assert bounded["records_total"] == "unknown"
+
+
+def test_skills_window_absent_without_the_per_record_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = _skill_window_fixture(monkeypatch, tmp_path)
+
+    monkeypatch.setattr(_SkillWindowProvider, "get_skill_ownership_rows", None)
+    skills = dashboard._coding_foundation_projections(provider, ownership="full")[
+        "skills"
+    ]
+    # Absent rows must leave the aggregate line intact rather than publish an
+    # empty list, which the window would render as "no skills yet".
+    assert "records" not in skills
+    assert "records_state" not in skills
+    assert skills["state"] == "measured"
+    assert skills["count"] == 4
+
+    monkeypatch.setattr(
+        _SkillWindowProvider,
+        "get_skill_ownership_rows",
+        lambda self: (_ for _ in ()).throw(RuntimeError("store_unreadable")),
+    )
+    degraded = dashboard._coding_foundation_projections(provider, ownership="full")[
+        "skills"
+    ]
+    assert "records" not in degraded
+    assert degraded["count"] == 4
+    # A store that RAISED is not a store that was never asked. The window is
+    # told which it is looking at instead of being handed a silent ``None``.
+    assert degraded["records_state"] == "unreadable"
+    assert degraded["records_degraded_reason"] == "RuntimeError: store_unreadable"
+
+
+def test_skills_window_credits_injection_only_to_a_wholly_injected_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ``injected_count`` is a RECEIPT-level number: it says how MANY of the
+    # listed skills the packet carried, never WHICH. Crediting it to every
+    # listed skill reported a use for a skill the worker may never have seen.
+    first = _skill_record(identity="first-skill", version="1.0.0")
+    second = _skill_record(identity="second-skill", version="1.0.0")
+    provider = _install_skill_window_store(
+        monkeypatch,
+        tmp_path,
+        [first, second],
+        [
+            {
+                "task_id": "CARD_PARTIAL",
+                "request_id": "r1",
+                "created_at": "2026-10-08T12:00:00Z",
+                "selected_count": 2,
+                "injected_count": 1,
+                "skills": [
+                    {"identity": "first-skill", "version": "1.0.0"},
+                    {"identity": "second-skill", "version": "1.0.0"},
+                ],
+            }
+        ],
+        {},
+    )
+
+    skills = dashboard._coding_foundation_projections(provider, ownership="full")[
+        "skills"
+    ]
+    rows = {row["identity"]: row for row in skills["records"]}
+
+    for identity in ("first-skill", "second-skill"):
+        # Selection IS measured per listed skill, so it still counts.
+        assert rows[identity]["selection_count"] == 1, identity
+        assert rows[identity]["last_selected_at"] == "2026-10-08T12:00:00Z", identity
+        # Injection is not. A partially injected receipt names nobody, so it
+        # advances neither count nor anybody's last-injected timestamp.
+        assert rows[identity]["injection_count"] == 0, identity
+        assert rows[identity]["last_injected_at"] == "", identity
+
+
+def test_skills_window_bounds_the_accepted_actor_ids_it_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The window prints the LENGTH of this list as the actor count, so it takes
+    # the same per-row bound every other row list takes.
+    actor_ids = [f"worker.gen{index:02d}" for index in range(1, 11)]
+    crowded = _skill_record(
+        identity="crowded-evidence",
+        version="1.0.0",
+        evidence=[_skill_evidence(actor_id) for actor_id in actor_ids],
+    )
+    provider = _install_skill_window_store(monkeypatch, tmp_path, [crowded], [], {})
+
+    skills = dashboard._coding_foundation_projections(provider, ownership="full")[
+        "skills"
+    ]
+
+    assert len(actor_ids) > dashboard._PROJECTION_LIST_LIMIT
+    assert skills["records"][0]["accepted_actor_ids"] == (
+        actor_ids[: dashboard._PROJECTION_LIST_LIMIT]
+    )
+
+
+def test_skills_window_skips_an_unprojectable_entry_and_discloses_the_skip() -> None:
+    # One unreadable record is one missing row, never a missing window.
+    api = dashboard._load_skill_registry_api()
+    readable = {
+        "record": _skill_record(identity="readable-skill", version="1.0.0"),
+        "stored_lifecycle": "proposed",
+        "effective_lifecycle": "proposed",
+    }
+    unreadable = {
+        "record": None,
+        "stored_lifecycle": "proposed",
+        "effective_lifecycle": "proposed",
+    }
+
+    projected = dashboard._project_skill_rows(
+        api,
+        {
+            "rows": [readable, unreadable],
+            "truncated": False,
+            "injected_card_count": 0,
+        },
+    )
+
+    assert [row["identity"] for row in projected["records"]] == ["readable-skill"]
+    # The published rows are no longer the whole page, so every number derived
+    # from them is a lower bound and is disclosed as one.
+    assert projected["records_truncated"] is True
+    assert projected["records_total"] == "unknown"
+
+
+def test_skills_window_reads_a_real_store_through_its_public_writer(
+    tmp_path: Path,
+) -> None:
+    """No doubles: the real readers are driven with the real keywords.
+
+    Every fixture above replaces the three page readers with lambdas that
+    swallow ``**kwargs``, so none of them can fail when a reader's keyword
+    moves. This one writes a temporary store through its OWN public writers and
+    then calls the production reader, which is the only way the keywords at the
+    call site are checked against the signatures that answer them.
+    """
+    from aiworkhub import skill_registry_store as store
+
+    store.put_record(tmp_path, _skill_record(identity="real-skill", version="1.0.0"))
+    store.record_selection(
+        tmp_path,
+        task_id="CARD_REAL",
+        request_id="req-1",
+        packet={"skills": [{"identity": "real-skill", "version": "1.0.0"}]},
+    )
+    provider = _SkillWindowProvider(store.load_registry(tmp_path), tmp_path)
+
+    material = provider.get_skill_ownership_rows()
+
+    assert material is not None
+    assert [entry["record"].identity for entry in material["rows"]] == ["real-skill"]
+    assert material["truncated"] is False
+    assert material["injected_card_count"] == 1
+    row = material["rows"][0]
+    assert row["stored_lifecycle"] == "proposed"
+    assert row["effective_lifecycle"] == "proposed"
+    assert row["selection_count"] == 1
+    assert row["injection_count"] == 1
+    assert row["injected_cards"] == 1
+    assert row["last_injected_at"] == row["last_selected_at"] != ""

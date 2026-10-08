@@ -11763,6 +11763,479 @@ function codingFoundationCardModel(kind, projection) {
   };
 }
 
+// NF-2026-01399. The Skills WINDOW. This panel used to render one aggregate
+// string -- "0 injectable · 8 selection/injection receipts · 2 accepted · 2
+// actors · unknown" -- which answers none of the questions an owner actually
+// asks: which skills exist, what each one does, why it is not reaching
+// workers, and how many times and when each was injected. Everything below
+// reads the projection's per-record `records` list and renders it.
+//
+// Two constraints shape the implementation, and both are deliberate:
+//
+//   * No innerHTML, anywhere. An identity, a note, a mined source anchor and a
+//     procedure step are all untrusted STORED text, and a step containing
+//     "<img onerror=...>" has to read as exactly those characters. textContent
+//     is that escape, and unlike a helper call it cannot be forgotten on one
+//     field and still look right on the others.
+//   * Layout is set through the CSSOM (`node.style.prop = ...`), never a style
+//     attribute and never an inline <style>. This page's CSP is
+//     `style-src ${webview.cspSource}` with no nonce and no 'unsafe-inline',
+//     so both of those are blocked outright while CSSOM assignment is not.
+//     Every value below is a VS Code theme variable this dashboard already
+//     uses, and every node keeps a stable class name so a stylesheet in
+//     media/app.css can take the layout over without touching this file.
+const CODING_FOUNDATION_SKILL_REASONS = {
+  activation_evidence_below_two_distinct_actors:
+    "needs accepted evidence from 2 different workers",
+  unresolved_negative_evidence:
+    "blocked by negative evidence nobody has resolved",
+  lifecycle_state_is_proposed_not_active:
+    "has the evidence but is still proposed, so no manager has activated it",
+  lifecycle_state_is_retired: "retired, so no worker is offered it",
+};
+const CODING_FOUNDATION_SKILL_COLUMNS = [
+  "Skill", "What it does", "Status", "Evidence", "Used", "Last evidence",
+];
+const CODING_FOUNDATION_SKILL_STYLES = {
+  window: { display: "grid", gap: "12px" },
+  kpis: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(9rem, 1fr))", gap: "8px" },
+  kpi: {
+    display: "grid", gap: "2px", padding: "8px 10px", borderRadius: "4px",
+    background: "var(--vscode-editorWidget-background)",
+    border: "1px solid var(--vscode-editorWidget-border)",
+  },
+  kpiValue: { fontSize: "1.4em", fontWeight: "600", color: "var(--vscode-foreground)" },
+  kpiLabel: { fontSize: "0.85em", color: "var(--vscode-descriptionForeground)" },
+  sentence: { margin: "0", color: "var(--vscode-foreground)" },
+  // Columns do not stack without a media query, and media/app.css is not this
+  // card's to edit, so the table scrolls horizontally instead of clipping.
+  // Nothing is ever hidden: every cell wraps and every row stays reachable.
+  scroll: { overflowX: "auto", overscrollBehavior: "contain" },
+  table: { width: "100%", minWidth: "44rem", borderCollapse: "collapse", textAlign: "left" },
+  caption: {
+    captionSide: "top", textAlign: "left", paddingBottom: "4px",
+    color: "var(--vscode-descriptionForeground)",
+  },
+  th: {
+    padding: "6px 8px", fontWeight: "600", textAlign: "left",
+    color: "var(--vscode-descriptionForeground)",
+    borderBottom: "1px solid var(--vscode-editorWidget-border)",
+  },
+  rowHeader: {
+    padding: "6px 8px", fontWeight: "600", textAlign: "left", verticalAlign: "top",
+    color: "var(--vscode-foreground)", overflowWrap: "anywhere",
+    borderBottom: "1px solid var(--vscode-editorWidget-border)",
+  },
+  td: {
+    padding: "6px 8px", verticalAlign: "top", overflowWrap: "anywhere",
+    color: "var(--vscode-foreground)",
+    borderBottom: "1px solid var(--vscode-editorWidget-border)",
+  },
+  pill: {
+    display: "inline-block", padding: "0 6px", borderRadius: "8px", fontSize: "0.85em",
+    background: "var(--vscode-badge-background)", color: "var(--vscode-badge-foreground)",
+    border: "1px solid var(--vscode-contrastBorder, transparent)",
+  },
+  badge: {
+    display: "inline-block", marginLeft: "6px", padding: "0 5px", borderRadius: "8px",
+    fontSize: "0.8em", background: "var(--vscode-editorWidget-background)",
+    color: "var(--vscode-descriptionForeground)",
+    border: "1px solid var(--vscode-editorWidget-border)",
+  },
+  muted: { color: "var(--vscode-descriptionForeground)" },
+  reason: { display: "block", marginTop: "2px", color: "var(--vscode-foreground)" },
+  details: { marginTop: "2px" },
+  summary: { cursor: "pointer", color: "var(--vscode-textLink-foreground)" },
+  detailBody: { display: "grid", gap: "6px", paddingTop: "4px" },
+  chips: { display: "flex", flexWrap: "wrap", gap: "4px", listStyle: "none", margin: "0", padding: "0" },
+  list: { margin: "0", paddingLeft: "1.1em" },
+  empty: { margin: "0", color: "var(--vscode-descriptionForeground)" },
+};
+
+function codingFoundationEl(doc, tag, options) {
+  const node = doc.createElement(tag);
+  const opts = options || {};
+  if (opts.className) node.className = opts.className;
+  // Text is set as TEXT. See this block's header comment for why, and note
+  // that the token this file is forbidden to contain cannot appear even in a
+  // comment: these bodies are serialized into the Webview and the popup test
+  // asserts the generated string does not carry it.
+  if (opts.text != null) node.textContent = String(opts.text);
+  if (opts.style && node.style) {
+    const names = Object.keys(opts.style);
+    for (let i = 0; i < names.length; i += 1) node.style[names[i]] = opts.style[names[i]];
+  }
+  if (opts.attrs && typeof node.setAttribute === "function") {
+    const keys = Object.keys(opts.attrs);
+    for (let i = 0; i < keys.length; i += 1) node.setAttribute(keys[i], opts.attrs[keys[i]]);
+  }
+  if (opts.parent && typeof opts.parent.appendChild === "function") opts.parent.appendChild(node);
+  return node;
+}
+
+function codingFoundationSkillRowModel(projection) {
+  if (!projection || typeof projection !== "object" || Array.isArray(projection)) return null;
+  // An absent `records` is not an empty registry: the summary snapshot omits
+  // the field on every poll. Only an array is a measurement.
+  if (!Array.isArray(projection.records)) return null;
+  const rows = [];
+  for (let i = 0; i < projection.records.length; i += 1) {
+    const row = projection.records[i];
+    if (row && typeof row === "object" && !Array.isArray(row)) rows.push(row);
+  }
+  let injectable = 0;
+  let active = 0;
+  let waiting = 0;
+  for (let i = 0; i < rows.length; i += 1) {
+    if (rows[i].injectable === true) injectable += 1;
+    if (rows[i].effective_lifecycle === "active") active += 1;
+    if (rows[i].injectable_reason === "activation_evidence_below_two_distinct_actors") waiting += 1;
+  }
+  const declared = codingFoundationBoundedCount(projection.records_total);
+  const truncated = projection.records_truncated === true;
+  return {
+    rows: rows,
+    truncated: truncated,
+    total: declared == null ? rows.length : declared,
+    totalExact: declared != null && !truncated,
+    injectable: injectable,
+    active: active,
+    waiting: waiting,
+    injectedCards: codingFoundationBoundedCount(projection.records_injected_card_count),
+  };
+}
+
+function codingFoundationSkillTotal(model) {
+  return model.totalExact ? String(model.total) : model.rows.length + "+";
+}
+
+function codingFoundationSkillReason(row) {
+  if (row.injectable === true) return "reaching workers now";
+  const reason = typeof row.injectable_reason === "string" ? row.injectable_reason : "";
+  // hasOwnProperty, not a bare lookup: a reason named "constructor" would
+  // otherwise resolve against Object.prototype and render a function body.
+  const known = Object.prototype.hasOwnProperty.call(CODING_FOUNDATION_SKILL_REASONS, reason)
+    ? CODING_FOUNDATION_SKILL_REASONS[reason]
+    : "";
+  // An untranslated reason is shown verbatim rather than dropped: a reason
+  // nobody has written a sentence for must not read as no reason at all.
+  const text = known || reason || "not reaching workers; no reason was recorded";
+  if (reason !== "activation_evidence_below_two_distinct_actors") return text;
+  const actors = Array.isArray(row.accepted_actor_ids) ? row.accepted_actor_ids : [];
+  const named = actors.slice(0, 4).map(String).join(", ");
+  return text + "; has " + actors.length + (named ? " (" + named + ")" : "");
+}
+
+function codingFoundationSkillStatus(row) {
+  if (row.injectable === true) return "Reaching workers";
+  const lifecycle = typeof row.effective_lifecycle === "string" ? row.effective_lifecycle : "";
+  if (lifecycle === "retired") return "Retired";
+  if (lifecycle === "active") return "Active, blocked";
+  return "Waiting";
+}
+
+function codingFoundationSkillEvidence(row) {
+  const counts = row.evidence_by_outcome && typeof row.evidence_by_outcome === "object"
+    ? row.evidence_by_outcome
+    : {};
+  const accepted = codingFoundationBoundedCount(counts.accepted);
+  const negative = codingFoundationBoundedCount(counts.negative);
+  const actors = Array.isArray(row.accepted_actor_ids) ? row.accepted_actor_ids.length : 0;
+  return "accepted ✓ " + (accepted == null ? "?" : accepted)
+    + " / negative ✗ " + (negative == null ? "?" : negative)
+    + " / " + actors + (actors === 1 ? " actor" : " actors");
+}
+
+function codingFoundationSkillUsed(row) {
+  const cards = codingFoundationBoundedCount(row.injected_cards);
+  // Unmeasured and zero are different facts and must not share a sentence.
+  if (cards == null) return "Not measured";
+  if (cards === 0) return "Never injected";
+  const last = typeof row.last_injected_at === "string" && row.last_injected_at
+    ? row.last_injected_at
+    : "never";
+  return "Injected into " + cards + (cards === 1 ? " card" : " cards") + ", last " + last;
+}
+
+function codingFoundationSkillLastEvidence(row) {
+  const history = Array.isArray(row.evidence) ? row.evidence : [];
+  if (history.length === 0) return "No evidence yet";
+  const last = history[history.length - 1] && typeof history[history.length - 1] === "object"
+    ? history[history.length - 1]
+    : {};
+  const parts = [];
+  if (last.outcome) parts.push(String(last.outcome));
+  if (last.actor_id) parts.push(String(last.actor_id));
+  if (last.timestamp) parts.push(String(last.timestamp));
+  return parts.length ? parts.join(" · ") : "No evidence yet";
+}
+
+function codingFoundationSkillSentence(model) {
+  const total = codingFoundationSkillTotal(model);
+  const clause = model.waiting
+    ? model.waiting + (model.waiting === 1 ? " waits" : " wait")
+      + " for accepted evidence from 2 different workers"
+    : "";
+  // Above the row bound every count in this sentence counts the SHOWN rows, so
+  // the sentence scopes itself to them. One page read as the whole registry is
+  // how "no skill reaches workers" becomes a claim the evidence cannot carry.
+  if (model.injectable === 0) {
+    return (model.totalExact
+      ? "No skill reaches workers yet: "
+      : "No skill among the " + model.rows.length + " shown reaches workers: ")
+      + model.active + " of " + total
+      + " are active" + (clause ? "; " + clause : "") + ".";
+  }
+  return (model.totalExact ? "" : "at least ") + model.injectable + " of " + total
+    + (model.totalExact ? " skills" : " shown skills") + " reach workers; "
+    + (model.rows.length - model.injectable) + " do not"
+    + (clause ? ", and " + clause : "") + ".";
+}
+
+function codingFoundationSkillKpis(model) {
+  // Same discipline for the tiles: above the bound these two tallies count the
+  // shown rows only and say so. The total tile already discloses it as "N+",
+  // and the cards tile is counted over every receipt rather than over this
+  // page, so neither takes the suffix.
+  const shown = model.totalExact ? "" : " (first " + model.rows.length + " shown)";
+  return [
+    { label: "Total skills", value: codingFoundationSkillTotal(model) },
+    { label: "Active & injectable", value: String(model.injectable) + shown },
+    { label: "Waiting for evidence", value: String(model.waiting) + shown },
+    {
+      label: "Cards that received a skill",
+      value: model.injectedCards == null ? "Not measured" : String(model.injectedCards),
+    },
+  ];
+}
+
+function codingFoundationSkillTextList(doc, host, label, values, empty, tag) {
+  const styles = CODING_FOUNDATION_SKILL_STYLES;
+  const items = Array.isArray(values) ? values : [];
+  const section = codingFoundationEl(doc, "div", { parent: host });
+  codingFoundationEl(doc, "strong", { parent: section, text: label });
+  if (items.length === 0) {
+    codingFoundationEl(doc, "p", { parent: section, style: styles.empty, text: empty });
+    return section;
+  }
+  const list = codingFoundationEl(doc, tag || "ul", { parent: section, style: styles.list });
+  for (let i = 0; i < items.length; i += 1) {
+    codingFoundationEl(doc, "li", { parent: list, text: String(items[i]) });
+  }
+  return section;
+}
+
+function codingFoundationSkillChips(doc, host, vocabulary) {
+  const styles = CODING_FOUNDATION_SKILL_STYLES;
+  const vocab = vocabulary && typeof vocabulary === "object" && !Array.isArray(vocabulary)
+    ? vocabulary
+    : {};
+  const section = codingFoundationEl(doc, "div", { parent: host });
+  codingFoundationEl(doc, "strong", { parent: section, text: "Vocabulary" });
+  const chips = [];
+  const scalars = [
+    ["task family", vocab.task_family], ["stage", vocab.stage],
+    ["path or symbol", vocab.path_or_symbol], ["risk", vocab.risk],
+  ];
+  for (let i = 0; i < scalars.length; i += 1) {
+    if (scalars[i][1]) chips.push(scalars[i][0] + ": " + String(scalars[i][1]));
+  }
+  const lists = [["trigger", vocab.triggers], ["applies to", vocab.applicability]];
+  for (let i = 0; i < lists.length; i += 1) {
+    const values = Array.isArray(lists[i][1]) ? lists[i][1] : [];
+    for (let j = 0; j < values.length; j += 1) {
+      chips.push(lists[i][0] + ": " + String(values[j]));
+    }
+  }
+  if (chips.length === 0) {
+    codingFoundationEl(doc, "p", {
+      parent: section, style: styles.empty, text: "No selection vocabulary declared",
+    });
+    return section;
+  }
+  const list = codingFoundationEl(doc, "ul", { parent: section, style: styles.chips });
+  for (let i = 0; i < chips.length; i += 1) {
+    const item = codingFoundationEl(doc, "li", { parent: list });
+    codingFoundationEl(doc, "span", {
+      parent: item, className: "coding-foundation-skills-chip",
+      style: styles.pill, text: chips[i],
+    });
+  }
+  return section;
+}
+
+function codingFoundationSkillHistory(doc, host, row) {
+  const styles = CODING_FOUNDATION_SKILL_STYLES;
+  const history = Array.isArray(row.evidence) ? row.evidence : [];
+  const section = codingFoundationEl(doc, "div", { parent: host });
+  codingFoundationEl(doc, "strong", { parent: section, text: "Evidence history" });
+  if (history.length === 0) {
+    codingFoundationEl(doc, "p", {
+      parent: section, style: styles.empty, text: "No evidence recorded yet",
+    });
+    return section;
+  }
+  const list = codingFoundationEl(doc, "ul", { parent: section, style: styles.list });
+  for (let i = 0; i < history.length; i += 1) {
+    const item = history[i] && typeof history[i] === "object" ? history[i] : {};
+    const parts = [];
+    if (item.outcome) parts.push(String(item.outcome));
+    if (item.actor_id) parts.push(String(item.actor_id));
+    if (item.source) parts.push(String(item.source));
+    if (item.timestamp) parts.push(String(item.timestamp));
+    if (item.note) parts.push(String(item.note));
+    codingFoundationEl(doc, "li", {
+      parent: list,
+      text: parts.length ? parts.join(" · ") : "entry recorded with no detail",
+    });
+  }
+  return section;
+}
+
+function codingFoundationSkillDetails(doc, host, row) {
+  const styles = CODING_FOUNDATION_SKILL_STYLES;
+  // <details>/<summary> is focusable and operable from the keyboard with no
+  // script and no ARIA, which is why it is used instead of a custom toggle.
+  const details = codingFoundationEl(doc, "details", {
+    className: "coding-foundation-skills-details", style: styles.details, parent: host,
+  });
+  codingFoundationEl(doc, "summary", {
+    parent: details, style: styles.summary,
+    text: "Steps, vocabulary and evidence for "
+      + codingFoundationBoundText(row.identity, 64),
+  });
+  const body = codingFoundationEl(doc, "div", { parent: details, style: styles.detailBody });
+  codingFoundationSkillTextList(
+    doc, body, "Procedure steps", row.procedure_steps, "No procedure steps recorded", "ol"
+  );
+  codingFoundationSkillTextList(
+    doc, body, "Avoid", row.avoid_rules, "No avoid rules recorded", "ul"
+  );
+  codingFoundationSkillChips(doc, body, row.vocabulary);
+  codingFoundationSkillHistory(doc, body, row);
+  const selected = codingFoundationBoundedCount(row.selection_count);
+  codingFoundationEl(doc, "p", {
+    parent: body, style: styles.empty,
+    text: "Lifecycle: stored " + (row.stored_lifecycle || "unknown")
+      + ", effective " + (row.effective_lifecycle || "unknown")
+      + " · selected " + (selected == null ? "?" : selected)
+      + (selected === 1 ? " time, last " : " times, last ")
+      + (row.last_selected_at ? String(row.last_selected_at) : "never"),
+  });
+  return details;
+}
+
+function codingFoundationSkillTableRow(doc, body, row) {
+  const styles = CODING_FOUNDATION_SKILL_STYLES;
+  const tr = codingFoundationEl(doc, "tr", {
+    className: "coding-foundation-skills-row", parent: body,
+  });
+  const nameCell = codingFoundationEl(doc, "th", {
+    parent: tr, style: styles.rowHeader, attrs: { scope: "row" },
+  });
+  codingFoundationEl(doc, "span", {
+    parent: nameCell, text: codingFoundationBoundText(row.identity, 64),
+  });
+  codingFoundationEl(doc, "span", {
+    parent: nameCell, style: styles.muted,
+    text: " " + codingFoundationBoundText(row.version, 24),
+  });
+  if (row.mined === true) {
+    codingFoundationEl(doc, "span", { parent: nameCell, style: styles.badge, text: "mined" });
+  }
+  codingFoundationEl(doc, "td", {
+    parent: tr, style: styles.td,
+    text: row.what_it_does ? String(row.what_it_does) : "No procedure step recorded",
+  });
+  const statusCell = codingFoundationEl(doc, "td", { parent: tr, style: styles.td });
+  // The pill carries the status WORD. Colour never carries it alone.
+  codingFoundationEl(doc, "span", {
+    parent: statusCell, className: "coding-foundation-skills-pill",
+    style: styles.pill, text: codingFoundationSkillStatus(row),
+  });
+  codingFoundationEl(doc, "span", {
+    parent: statusCell, style: styles.reason, text: codingFoundationSkillReason(row),
+  });
+  codingFoundationEl(doc, "td", {
+    parent: tr, style: styles.td, text: codingFoundationSkillEvidence(row),
+  });
+  codingFoundationEl(doc, "td", {
+    parent: tr, style: styles.td, text: codingFoundationSkillUsed(row),
+  });
+  codingFoundationEl(doc, "td", {
+    parent: tr, style: styles.td, text: codingFoundationSkillLastEvidence(row),
+  });
+  const detailRow = codingFoundationEl(doc, "tr", {
+    className: "coding-foundation-skills-detail-row", parent: body,
+  });
+  const detailCell = codingFoundationEl(doc, "td", {
+    parent: detailRow, style: styles.td,
+    attrs: { colspan: String(CODING_FOUNDATION_SKILL_COLUMNS.length) },
+  });
+  codingFoundationSkillDetails(doc, detailCell, row);
+  return tr;
+}
+
+function codingFoundationSkillsWindow(doc, host, model) {
+  const styles = CODING_FOUNDATION_SKILL_STYLES;
+  const root = codingFoundationEl(doc, "div", {
+    className: "coding-foundation-skills", style: styles.window, parent: host,
+  });
+  if (model.rows.length === 0) {
+    codingFoundationEl(doc, "p", {
+      className: "coding-foundation-skills-empty", style: styles.empty, parent: root,
+      text: "No skills yet. Nothing has been proposed, so nothing can reach a worker.",
+    });
+    return root;
+  }
+  const kpis = codingFoundationEl(doc, "div", {
+    className: "coding-foundation-skills-kpis", style: styles.kpis, parent: root,
+  });
+  const tiles = codingFoundationSkillKpis(model);
+  for (let i = 0; i < tiles.length; i += 1) {
+    const tile = codingFoundationEl(doc, "div", {
+      className: "coding-foundation-skills-kpi", style: styles.kpi, parent: kpis,
+    });
+    codingFoundationEl(doc, "strong", {
+      parent: tile, style: styles.kpiValue, text: tiles[i].value,
+    });
+    codingFoundationEl(doc, "span", {
+      parent: tile, style: styles.kpiLabel, text: tiles[i].label,
+    });
+  }
+  codingFoundationEl(doc, "p", {
+    className: "coding-foundation-skills-pipeline", style: styles.sentence, parent: root,
+    text: codingFoundationSkillSentence(model),
+  });
+  const scroll = codingFoundationEl(doc, "div", {
+    className: "coding-foundation-skills-scroll", style: styles.scroll, parent: root,
+  });
+  const table = codingFoundationEl(doc, "table", {
+    className: "coding-foundation-skills-table", style: styles.table, parent: scroll,
+  });
+  if (model.truncated) {
+    codingFoundationEl(doc, "caption", {
+      parent: table, style: styles.caption,
+      text: "Showing the first " + model.rows.length
+        + " stored records; the registry holds more.",
+    });
+  }
+  const headRow = codingFoundationEl(doc, "tr", {
+    parent: codingFoundationEl(doc, "thead", { parent: table }),
+  });
+  for (let i = 0; i < CODING_FOUNDATION_SKILL_COLUMNS.length; i += 1) {
+    codingFoundationEl(doc, "th", {
+      parent: headRow, style: styles.th, attrs: { scope: "col" },
+      text: CODING_FOUNDATION_SKILL_COLUMNS[i],
+    });
+  }
+  const body = codingFoundationEl(doc, "tbody", { parent: table });
+  for (let i = 0; i < model.rows.length; i += 1) {
+    codingFoundationSkillTableRow(doc, body, model.rows[i]);
+  }
+  return root;
+}
+
 // NF-2026-00675. A field the summary snapshot deliberately did not send must
 // not read as a field the server could not produce. `snapshot_mode: "summary"`
 // keeps a bounded set and names the rest in `omitted_fields`; the webview then
@@ -11834,6 +12307,7 @@ function bindCodingFoundationDashboard(doc) {
   const dialogSummary = root.getElementById("coding-foundation-dialog-summary");
   const dialogBody = root.getElementById("coding-foundation-dialog-body");
   let selectedKind = "";
+  let skillWindow = null;
   const fillFoundationDialog = function fillFoundationDialog(kind) {
     selectedKind = kind;
     const label = CODING_FOUNDATION_LABELS[kind] || kind;
@@ -11851,7 +12325,23 @@ function bindCodingFoundationDashboard(doc) {
     const breakdown = slot && slot.card && slot.card.dataset
       ? String(slot.card.dataset.foundationBreakdown || "")
       : "";
-    if (dialogBody) dialogBody.textContent = breakdown || (slot && slot.detail ? String(slot.detail.textContent || "") : "");
+    if (!dialogBody) return;
+    // NF-2026-01399. The real Skills window, whenever the full snapshot
+    // carried per-record rows. The aggregate line stays the fallback for every
+    // other panel and for a snapshot with no rows -- a previously correct
+    // answer, never a blank and never an invented zero.
+    if (kind === "skills" && skillWindow && typeof root.createElement === "function") {
+      // Built DETACHED and attached last: a renderer that throws part-way then
+      // leaves the aggregate line standing instead of an empty dialog, and
+      // nothing has to swallow the error to get that.
+      const rendered = codingFoundationSkillsWindow(root, null, skillWindow);
+      // Assigning textContent is what removes a previously rendered window, so
+      // every refill starts from an empty body rather than stacking a second.
+      dialogBody.textContent = "";
+      dialogBody.appendChild(rendered);
+      return;
+    }
+    dialogBody.textContent = breakdown || (slot && slot.detail ? String(slot.detail.textContent || "") : "");
   };
   const openFoundationDialog = function openFoundationDialog(kind) {
     fillFoundationDialog(kind);
@@ -11873,6 +12363,14 @@ function bindCodingFoundationDashboard(doc) {
   }
   const apply = function applyCodingFoundationSnapshot(snapshot) {
     renderCodingFoundationCards(snapshot, elements);
+    const snap = snapshot && typeof snapshot === "object" && !Array.isArray(snapshot)
+      ? snapshot
+      : {};
+    const rows = codingFoundationSkillRowModel(snap.skills);
+    // A summary refresh omits `records` on every poll, so only a payload that
+    // actually carried rows may replace what the full snapshot established --
+    // the same rule renderCodingFoundationCards follows for the cards.
+    if (rows) skillWindow = rows;
     if (dialog && dialog.open && selectedKind) fillFoundationDialog(selectedKind);
   };
   if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
@@ -11930,6 +12428,28 @@ function codingFoundationDashboardSource() {
     codingFoundationSectionCount.toString(),
     codingFoundationCardModel.toString(),
     codingFoundationOmitted.toString(),
+    // NF-2026-01399. The Skills window ships into the Webview through this
+    // same list. A helper left out here is a ReferenceError the direct unit
+    // calls cannot see, which is why the popup test executes this exact string.
+    "const CODING_FOUNDATION_SKILL_REASONS = " + JSON.stringify(CODING_FOUNDATION_SKILL_REASONS) + ";",
+    "const CODING_FOUNDATION_SKILL_COLUMNS = " + JSON.stringify(CODING_FOUNDATION_SKILL_COLUMNS) + ";",
+    "const CODING_FOUNDATION_SKILL_STYLES = " + JSON.stringify(CODING_FOUNDATION_SKILL_STYLES) + ";",
+    codingFoundationEl.toString(),
+    codingFoundationSkillRowModel.toString(),
+    codingFoundationSkillTotal.toString(),
+    codingFoundationSkillReason.toString(),
+    codingFoundationSkillStatus.toString(),
+    codingFoundationSkillEvidence.toString(),
+    codingFoundationSkillUsed.toString(),
+    codingFoundationSkillLastEvidence.toString(),
+    codingFoundationSkillSentence.toString(),
+    codingFoundationSkillKpis.toString(),
+    codingFoundationSkillTextList.toString(),
+    codingFoundationSkillChips.toString(),
+    codingFoundationSkillHistory.toString(),
+    codingFoundationSkillDetails.toString(),
+    codingFoundationSkillTableRow.toString(),
+    codingFoundationSkillsWindow.toString(),
     renderCodingFoundationCards.toString(),
     bindCodingFoundationDashboard.toString(),
     "bindCodingFoundationDashboard();",
@@ -13227,6 +13747,13 @@ module.exports = {
     CODING_FOUNDATION_CARD_KEYS,
     CODING_FOUNDATION_SCHEMAS,
     codingFoundationCardModel,
+    codingFoundationSkillRowModel,
+    codingFoundationSkillReason,
+    codingFoundationSkillStatus,
+    codingFoundationSkillSentence,
+    codingFoundationSkillKpis,
+    codingFoundationSkillUsed,
+    codingFoundationSkillsWindow,
     renderCodingFoundationCards,
     bindCodingFoundationDashboard,
     codingFoundationHeaderMarkup,

@@ -61,14 +61,21 @@ const generated = internals.codingFoundationDashboardSource();
 
 function mockNode(initial) {
   const listeners = {};
-  return {
-    textContent: "",
+  const node = Object.assign({
+    tagName: "",
+    className: "",
     title: "",
     open: false,
     focused: false,
     restored: false,
     attrs: {},
     dataset: {},
+    // NF-2026-01399: `style` records CSSOM assignments and `children` records
+    // appendChild, which is what lets the Skills-window assertions check th
+    // scope, <details> and the VS Code theme variables the window sets.
+    style: {},
+    children: [],
+    ownText: "",
     listeners,
     setAttribute(name, next) {
       this.attrs[name] = next;
@@ -79,6 +86,10 @@ function mockNode(initial) {
     addEventListener(type, fn) {
       listeners[type] = listeners[type] || [];
       listeners[type].push(fn);
+    },
+    appendChild(child) {
+      this.children.push(child);
+      return child;
     },
     click(target) {
       const event = { target: target || this, currentTarget: this };
@@ -94,8 +105,38 @@ function mockNode(initial) {
       this.focused = false;
       this.restored = true;
     },
-    ...initial,
-  };
+  }, initial || {});
+  // textContent behaves as the real one does in the two ways that matter:
+  // reading concatenates descendant text, and WRITING replaces the children.
+  // A plain property would have let a refill stack a second window inside the
+  // dialog and still read correctly.
+  Object.defineProperty(node, "textContent", {
+    get() {
+      let text = node.ownText;
+      for (const child of node.children) text += child.textContent;
+      return text;
+    },
+    set(value) {
+      node.ownText = String(value);
+      node.children = [];
+    },
+    enumerable: true,
+    configurable: true,
+  });
+  return node;
+}
+
+function descendants(node, out) {
+  const acc = out || [];
+  for (const child of node.children) {
+    acc.push(child);
+    descendants(child, acc);
+  }
+  return acc;
+}
+
+function byTag(node, tag) {
+  return descendants(node).filter((child) => child.tagName === tag);
 }
 
 function popupHarness() {
@@ -127,7 +168,13 @@ function popupHarness() {
   };
   let onMessage = null;
   vm.runInNewContext(generated, {
-    document: { getElementById: (id) => nodes[id] || null },
+    document: {
+      getElementById: (id) => nodes[id] || null,
+      // NF-2026-01399: the Skills window builds real elements, so the harness
+      // has to hand out real-enough ones. The window is never rendered with
+      // innerHTML, which is why this is all the DOM surface it needs.
+      createElement: (tag) => mockNode({ tagName: String(tag).toUpperCase() }),
+    },
     window: {
       addEventListener(type, listener) {
         if (type === "message") onMessage = listener;
@@ -326,6 +373,336 @@ assert.doesNotMatch(css, /html\s*\{[^}]*overflow:\s*hidden/);
   assert.strictEqual(harness.title.textContent, "Semantic Edit");
   assert.strictEqual(harness.body.textContent, "Awaiting the full snapshot");
   assert.doesNotMatch(harness.body.textContent, /actors|injectable/);
+}
+
+// ---------------------------------------------------------------------------
+// NF-2026-01399: the Skills WINDOW. One aggregate string answered none of the
+// questions an owner asks, so the dialog now renders KPI tiles, a plain
+// pipeline sentence, one table row per record and a per-row details
+// expansion. The aggregate line stays the fallback when rows are absent, and
+// that is asserted too -- a window that blanked a rows-less snapshot would be
+// worse than the string it replaced.
+// ---------------------------------------------------------------------------
+
+assert.match(generated, /function codingFoundationSkillsWindow/);
+assert.match(generated, /CODING_FOUNDATION_SKILL_STYLES/);
+assert.match(generated, /var\(--vscode-/);
+
+const skillRows = [
+  {
+    identity: "commit-msg-check",
+    version: "1.0.0",
+    mined: false,
+    stored_lifecycle: "proposed",
+    effective_lifecycle: "proposed",
+    what_it_does: "Reject <img onerror=alert(1)> in a commit message",
+    procedure_steps: ["Reject <img onerror=alert(1)> in a commit message"],
+    avoid_rules: [],
+    vocabulary: {
+      task_family: "commit",
+      stage: "post-edit",
+      path_or_symbol: "src/aiworkhub/skill_registry.py",
+      risk: "medium",
+      triggers: ["commit"],
+      applicability: [],
+    },
+    injectable: false,
+    injectable_reason: "activation_evidence_below_two_distinct_actors",
+    accepted_actor_ids: ["worker.glm.5.3"],
+    evidence_by_outcome: { accepted: 1, negative: 0 },
+    evidence: [
+      {
+        outcome: "accepted",
+        actor_id: "worker.glm.5.3",
+        source: "file:<script>pwn</script>.json",
+        note: "",
+        resolved: false,
+      },
+    ],
+    injection_count: 0,
+    injected_cards: 0,
+    selection_count: 0,
+    last_selected_at: "",
+    last_injected_at: "",
+  },
+  {
+    identity: "ratchet-guard",
+    version: "2.0.0",
+    mined: false,
+    stored_lifecycle: "active",
+    effective_lifecycle: "active",
+    what_it_does: "Lower the ratchet, never raise it",
+    procedure_steps: ["Lower the ratchet, never raise it"],
+    avoid_rules: ["never raise the ceiling"],
+    vocabulary: {
+      task_family: "refactor",
+      stage: "pre-commit",
+      path_or_symbol: "tests/test_module_size_ratchet.py",
+      risk: "low",
+      triggers: ["ratchet"],
+      applicability: ["src/**"],
+    },
+    injectable: true,
+    injectable_reason: "",
+    accepted_actor_ids: ["worker.a", "worker.b"],
+    evidence_by_outcome: { accepted: 2, negative: 0 },
+    evidence: [
+      { outcome: "accepted", actor_id: "worker.a", source: "file:a.json", note: "", resolved: false },
+      { outcome: "accepted", actor_id: "worker.b", source: "file:b.json", note: "", resolved: false },
+    ],
+    injection_count: 2,
+    injected_cards: 2,
+    selection_count: 2,
+    last_selected_at: "2026-10-08T11:00:00Z",
+    last_injected_at: "2026-10-08T11:00:00Z",
+  },
+  {
+    identity: "mined.dashboard-projection",
+    version: "0.1.0",
+    mined: true,
+    stored_lifecycle: "proposed",
+    effective_lifecycle: "proposed",
+    what_it_does: "",
+    procedure_steps: [],
+    avoid_rules: [],
+    vocabulary: {
+      task_family: "", stage: "", path_or_symbol: "", risk: "", triggers: [], applicability: [],
+    },
+    injectable: false,
+    injectable_reason: "lifecycle_state_is_proposed_not_active",
+    accepted_actor_ids: ["worker.a", "worker.b"],
+    evidence_by_outcome: { accepted: 2, negative: 0 },
+    evidence: [],
+    injection_count: 0,
+    injected_cards: 0,
+    selection_count: 1,
+    last_selected_at: "2026-10-06T09:00:00Z",
+    last_injected_at: "",
+  },
+];
+
+const skillsWithRows = {
+  schema_id: internals.CODING_FOUNDATION_SCHEMAS.skills,
+  state: "measured",
+  count: 3,
+  lifecycle: { proposed: 2, active: 1, retired: 0 },
+  injectable_count: 1,
+  accepted_evidence_count: 5,
+  distinct_actor_count: 3,
+  active_non_injectable_reasons: [],
+  selection_injection: { state: "measured", count: 3 },
+  records: skillRows,
+  records_total: 3,
+  records_truncated: false,
+  records_injected_card_count: 2,
+};
+
+{
+  const harness = popupHarness();
+  harness.onMessage({
+    data: { type: "snapshot", payload: { snapshot_mode: "full", skills: skillsWithRows } },
+  });
+  harness.skills.click();
+  const text = harness.body.textContent;
+
+  // (a) four KPI tiles.
+  for (const label of [
+    "Total skills", "Active & injectable", "Waiting for evidence", "Cards that received a skill",
+  ]) {
+    assert.ok(text.includes(label), `missing KPI tile: ${label}`);
+  }
+
+  // (b) one plain-language pipeline sentence.
+  assert.match(
+    text,
+    /1 of 3 skills reach workers; 2 do not, and 1 waits for accepted evidence from 2 different workers\./,
+  );
+
+  // (c) one table row per record, headed with scoped th cells.
+  const columns = byTag(harness.body, "TH").filter((th) => th.attrs.scope === "col");
+  assert.deepStrictEqual(
+    columns.map((th) => th.textContent),
+    ["Skill", "What it does", "Status", "Evidence", "Used", "Last evidence"],
+  );
+  assert.strictEqual(byTag(harness.body, "TH").filter((th) => th.attrs.scope === "row").length, 3);
+  // Status is carried by the pill's TEXT. Colour never carries it alone.
+  const pills = descendants(harness.body)
+    .filter((node) => node.className === "coding-foundation-skills-pill");
+  assert.deepStrictEqual(
+    pills.map((pill) => pill.textContent),
+    ["Waiting", "Reaching workers", "Waiting"],
+  );
+  assert.match(text, /needs accepted evidence from 2 different workers; has 1 \(worker\.glm\.5\.3\)/);
+  assert.match(text, /has the evidence but is still proposed/);
+  assert.match(text, /reaching workers now/);
+  assert.match(text, /accepted ✓ 1 \/ negative ✗ 0 \/ 1 actor/);
+  assert.match(text, /Injected into 2 cards, last 2026-10-08T11:00:00Z/);
+  // A record never injected says so, and its last selection still says never.
+  assert.match(text, /Never injected/);
+  assert.match(text, /selected 1 time, last 2026-10-06T09:00:00Z/);
+  assert.match(text, /selected 0 times, last never/);
+  assert.ok(
+    descendants(harness.body).some((node) => node.textContent === "mined"),
+    "a mined.* identity must carry the mined badge",
+  );
+
+  // (d) a per-row details expansion with steps, vocabulary and evidence.
+  assert.strictEqual(byTag(harness.body, "DETAILS").length, 3);
+  assert.strictEqual(byTag(harness.body, "SUMMARY").length, 3);
+  assert.match(text, /Procedure steps/);
+  assert.match(text, /Vocabulary/);
+  assert.match(text, /Evidence history/);
+  assert.match(text, /task family: commit/);
+  assert.match(text, /applies to: src\/\*\*/);
+  assert.match(text, /Lifecycle: stored active, effective active/);
+  assert.match(text, /No procedure steps recorded/);
+  assert.match(text, /No selection vocabulary declared/);
+  assert.match(text, /No evidence recorded yet/);
+
+  // Untrusted stored strings render as TEXT, never as markup.
+  assert.match(text, /Reject <img onerror=alert\(1\)> in a commit message/);
+  assert.match(text, /file:<script>pwn<\/script>\.json/);
+  assert.ok(
+    descendants(harness.body).every((node) => node.tagName !== "IMG" && node.tagName !== "SCRIPT"),
+    "stored text must never be parsed into elements",
+  );
+
+  // Layout comes from the VS Code theme variables the dashboard already uses.
+  const themed = descendants(harness.body)
+    .filter((node) => JSON.stringify(node.style).includes("var(--vscode-"));
+  assert.ok(themed.length >= 10, "the window must be themed with VS Code CSS variables");
+
+  // Refilling replaces the window instead of stacking a second one.
+  const rendered = harness.body.children.length;
+  harness.skills.click();
+  assert.strictEqual(harness.body.children.length, rendered);
+  assert.strictEqual(byTag(harness.body, "DETAILS").length, 3);
+}
+
+{
+  // Zero records is an explicit empty state, not an empty table.
+  const harness = popupHarness();
+  harness.onMessage({
+    data: {
+      type: "snapshot",
+      payload: {
+        snapshot_mode: "full",
+        skills: {
+          schema_id: internals.CODING_FOUNDATION_SCHEMAS.skills,
+          state: "no_sample",
+          count: 0,
+          records: [],
+          records_total: 0,
+          records_truncated: false,
+          records_injected_card_count: 0,
+        },
+      },
+    },
+  });
+  harness.skills.click();
+  assert.match(harness.body.textContent, /No skills yet/);
+  assert.strictEqual(byTag(harness.body, "TABLE").length, 0);
+  assert.doesNotMatch(harness.body.textContent, /Total skills/);
+}
+
+{
+  // Rows absent -> the old aggregate line, unchanged. A measured window is
+  // then retained across the summary refreshes that omit `records`.
+  const harness = popupHarness();
+  harness.onMessage({
+    data: { type: "snapshot", payload: { snapshot_mode: "full", skills: longSkills } },
+  });
+  harness.skills.click();
+  assert.strictEqual(byTag(harness.body, "TABLE").length, 0);
+  assert.match(harness.body.textContent, /1 injectable/);
+  assert.match(harness.body.textContent, /activation_evidence_below_two_distinct_actors/);
+
+  harness.onMessage({
+    data: { type: "snapshot", payload: { snapshot_mode: "full", skills: skillsWithRows } },
+  });
+  harness.skills.click();
+  assert.strictEqual(byTag(harness.body, "TABLE").length, 1);
+  harness.onMessage({
+    data: {
+      type: "snapshotSummary",
+      payload: {
+        snapshot_mode: "summary",
+        omitted_fields: internals.CODING_FOUNDATION_CARD_KEYS,
+      },
+    },
+  });
+  harness.skills.click();
+  assert.strictEqual(byTag(harness.body, "TABLE").length, 1);
+}
+
+{
+  // An absent `records` is not an empty registry.
+  assert.strictEqual(internals.codingFoundationSkillRowModel({ state: "measured" }), null);
+  const truncated = internals.codingFoundationSkillRowModel({
+    records: [skillRows[0]],
+    records_total: "unknown",
+    records_truncated: true,
+  });
+  assert.strictEqual(truncated.totalExact, false);
+  assert.strictEqual(truncated.rows.length, 1);
+  // Above the bound EVERY derived number is qualified, not just the total: the
+  // sentence scopes itself to the shown rows, and so does each tile counted
+  // over them.
+  assert.strictEqual(
+    internals.codingFoundationSkillSentence(truncated),
+    "No skill among the 1 shown reaches workers: 0 of 1+ are active; "
+      + "1 waits for accepted evidence from 2 different workers.",
+  );
+  assert.strictEqual(
+    internals.codingFoundationSkillSentence({
+      rows: [{}, {}, {}], total: 3, totalExact: false, injectable: 1, active: 1, waiting: 1,
+    }),
+    "at least 1 of 3+ shown skills reach workers; 2 do not, and 1 waits for "
+      + "accepted evidence from 2 different workers.",
+  );
+  assert.deepStrictEqual(
+    internals.codingFoundationSkillKpis(truncated)
+      .map((tile) => tile.label + ": " + tile.value),
+    [
+      "Total skills: 1+",
+      "Active & injectable: 0 (first 1 shown)",
+      "Waiting for evidence: 1 (first 1 shown)",
+      "Cards that received a skill: Not measured",
+    ],
+  );
+  // An exact total leaves the tiles unqualified, so the suffix never reads as
+  // decoration.
+  assert.deepStrictEqual(
+    internals.codingFoundationSkillKpis(internals.codingFoundationSkillRowModel(skillsWithRows))
+      .map((tile) => tile.value),
+    ["3", "1", "1", "2"],
+  );
+  // Unmeasured and zero are different facts and never share a sentence.
+  assert.strictEqual(internals.codingFoundationSkillUsed({}), "Not measured");
+  assert.strictEqual(internals.codingFoundationSkillUsed({ injected_cards: 0 }), "Never injected");
+  assert.strictEqual(
+    internals.codingFoundationSkillUsed({ injected_cards: 1, last_injected_at: "" }),
+    "Injected into 1 card, last never",
+  );
+  // A reason named after an Object.prototype member must not resolve to one.
+  assert.strictEqual(
+    internals.codingFoundationSkillReason({ injectable: false, injectable_reason: "constructor" }),
+    "constructor",
+  );
+  assert.strictEqual(
+    internals.codingFoundationSkillReason({ injectable: false, injectable_reason: "" }),
+    "not reaching workers; no reason was recorded",
+  );
+  assert.strictEqual(
+    internals.codingFoundationSkillStatus({ injectable: false, effective_lifecycle: "retired" }),
+    "Retired",
+  );
+  assert.strictEqual(
+    internals.codingFoundationSkillSentence({
+      rows: [{}], total: 10, totalExact: true, injectable: 0, active: 0, waiting: 9,
+    }),
+    "No skill reaches workers yet: 0 of 10 are active; 9 wait for accepted evidence from 2 different workers.",
+  );
 }
 
 assert.match(html, /type="button"/);

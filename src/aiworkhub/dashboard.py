@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -149,6 +150,15 @@ GROUP BY population
 _DIGEST_PREFIX_LEN = 12
 _PROJECTION_LIST_LIMIT = 8
 _PROJECTION_TEXT_LIMIT = 80
+# NF-2026-01399. The owner-facing Skills window needs one row per stored
+# record, which the eight-item panel bound deliberately does not give it.
+# These three bound THAT list only; every other projected list keeps
+# ``_PROJECTION_LIST_LIMIT``. They are disclosure bounds, not silent caps: over
+# ``_SKILL_RECORD_ROW_LIMIT`` the projection sets ``records_truncated`` and
+# refuses to publish the page it read as the population.
+_SKILL_RECORD_ROW_LIMIT = 200
+_SKILL_ROW_TEXT_LIMIT = 240
+_SKILL_ROW_EVIDENCE_LIMIT = 10
 _PROJECTION_SCHEMA_IDS = {
     "development_rules": "aiworkhub.dashboard.development_rules.v1",
     "skills": "aiworkhub.dashboard.skills.v1",
@@ -2357,6 +2367,123 @@ class DashboardProvider:
         )
         return payload
 
+    def get_skill_ownership_rows(self) -> dict[str, Any] | None:
+        """FULL-ownership-only per-record read behind the Skills window.
+
+        NF-2026-01399. The Skills panel could say only "0 injectable · 2
+        accepted · 2 actors", which answers none of the questions an owner
+        asks: which skills exist, what each one does, why it is not reaching
+        workers, and how often and when each was actually injected. Every
+        number below is read from the skills store's OWN bounded readers --
+        the same ``list_records``/``list_selections``/``injection_counts`` that
+        ``manager_skill_tools.usage`` calls -- so the window and the manager
+        report cannot give two answers to one question. Read-only: nothing here
+        writes, activates or retires anything.
+
+        ``list_records`` carries the STORED lifecycle. ``load_registry`` serves
+        the EFFECTIVE one, because it adopts an ``active`` record whose own
+        evidence no longer meets the activation rule in force as ``proposed``.
+        Both are reported, and the demotion is asked of the store's own
+        ``activation_supported`` predicate rather than restated here.
+
+        The summary snapshot never calls this (see ``_skill_ownership_rows``),
+        so the dashboard's refresh hot path pays nothing for it.
+        """
+        store = _load_skill_registry_store()
+        if store is None:
+            return None
+        try:
+            # One row past the bound is read for the sole purpose of learning
+            # whether there IS more, which is what ``truncated`` discloses.
+            stored = store.list_records(
+                self.repo_root, limit=_SKILL_RECORD_ROW_LIMIT + 1
+            )
+            receipts = store.list_selections(self.repo_root)
+            injected = store.injection_counts(self.repo_root)
+        except (store.SkillStoreError, sqlite3.Error, OSError):
+            # Only the store's OWN failure modes degrade the window. A
+            # ``TypeError``/``AttributeError`` here means one of these three
+            # reader signatures no longer matches this call site, and a blanket
+            # ``except`` would report that broken reader as a repository with no
+            # skills. It propagates to ``_skill_ownership_rows``, which
+            # discloses the cause instead of swallowing it.
+            return None
+        usage: dict[str, dict[str, Any]] = {}
+        injected_cards: set[str] = set()
+        for receipt in receipts:
+            if not isinstance(receipt, Mapping):
+                continue
+            # ``created_at`` is this store's own UTC ISO-8601 stamp, so the
+            # lexicographic maximum IS the chronological one; no parse needed.
+            created = str(receipt.get("created_at") or "")
+            task_id = str(receipt.get("task_id") or "")
+            listed = [
+                row for row in receipt.get("skills") or () if isinstance(row, Mapping)
+            ]
+            injected_count = _bounded_int(receipt.get("injected_count"))
+            if injected_count > 0 and task_id:
+                # Card-level, and honest at that level: this card received SOME
+                # skill, which is exactly what "cards that received a skill"
+                # counts.
+                injected_cards.add(task_id)
+            # Per skill is a different question. ``injected_count`` says HOW
+            # MANY of the listed skills the packet carried, never WHICH, so it
+            # can be credited to a NAMED skill only when the whole receipt was
+            # injected. A partially injected receipt advances nobody's
+            # ``injection_count`` or ``last_injected_at`` rather than inventing
+            # a use for a skill the worker may never have seen.
+            whole_receipt_injected = injected_count >= len(listed) > 0
+            for row in listed:
+                key = f"{row.get('identity')}@{row.get('version')}"
+                entry = usage.setdefault(
+                    key,
+                    {
+                        "selection_count": 0,
+                        "last_selected_at": "",
+                        "injection_count": 0,
+                        "last_injected_at": "",
+                    },
+                )
+                entry["selection_count"] += 1
+                if created > entry["last_selected_at"]:
+                    entry["last_selected_at"] = created
+                if whole_receipt_injected:
+                    entry["injection_count"] += 1
+                    if created > entry["last_injected_at"]:
+                        entry["last_injected_at"] = created
+        rows: list[dict[str, Any]] = []
+        for record in stored[:_SKILL_RECORD_ROW_LIMIT]:
+            key = f"{record.identity}@{record.version}"
+            counts = injected.get(key) or {}
+            measured = usage.get(key) or {}
+            lifecycle = record.lifecycle_state.value
+            rows.append(
+                {
+                    "record": record,
+                    "stored_lifecycle": lifecycle,
+                    # The demotion targets ACTIVE and nothing else.
+                    # ``activation_supported`` is an EVIDENCE predicate, and a
+                    # retired or proposed record fails it for reasons that say
+                    # nothing about what selection would serve; asking it of
+                    # every lifecycle reported a retired record as proposed.
+                    "effective_lifecycle": (
+                        lifecycle
+                        if lifecycle != "active" or store.activation_supported(record)
+                        else "proposed"
+                    ),
+                    "injected_cards": _bounded_int(counts.get("injected_cards")),
+                    "injection_count": _bounded_int(measured.get("injection_count")),
+                    "last_injected_at": str(measured.get("last_injected_at") or ""),
+                    "selection_count": _bounded_int(measured.get("selection_count")),
+                    "last_selected_at": str(measured.get("last_selected_at") or ""),
+                }
+            )
+        return {
+            "rows": rows,
+            "truncated": len(stored) > _SKILL_RECORD_ROW_LIMIT,
+            "injected_card_count": len(injected_cards),
+        }
+
     def get_tool_recipes_projection_input(self) -> Any | None:
         api = _load_tool_recipes_api()
         if api is None:
@@ -3382,11 +3509,229 @@ def _project_skill_adoption(api: Any, records: list[Any], *, truncated: bool) ->
     }
 
 
+_SKILL_ROW_SUMMARY_FIELDS = ("summary", "description")
+
+
+def _skill_row_strings(values: Any, limit: int) -> list[str]:
+    """Bounded, portable text for one row's list field.
+
+    Both the item count and each item's length are bounded, and every string
+    goes through ``_projection_string`` -- the same redaction and portability
+    pass every other projected string takes. The row is owner-facing prose, so
+    it is still only as trustworthy as that pass makes it.
+    """
+
+    items: list[str] = []
+    for value in tuple(values or ())[:_PROJECTION_LIST_LIMIT]:
+        text = _projection_string(value, limit)
+        if text is not None:
+            items.append(text)
+    return items
+
+
+def _skill_row_summary(record: Any) -> Any:
+    """The record's own one-line description, if its schema carries one.
+
+    ``SkillRecord`` has no such field today, so this reads whichever name the
+    record actually exposes rather than inventing a sentence. A record with
+    neither a procedure step nor a description reports nothing, and the window
+    says so instead of printing a plausible-looking guess.
+    """
+
+    for field in _SKILL_ROW_SUMMARY_FIELDS:
+        value = getattr(record, field, None)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _skill_row_vocabulary(record: Any) -> dict[str, Any]:
+    """The declared selection vocabulary one record matches cards on."""
+
+    return {
+        "task_family": _projection_string(getattr(record, "task_family", None)) or "",
+        "stage": _projection_string(getattr(record, "stage", None)) or "",
+        "path_or_symbol": (
+            _projection_string(getattr(record, "path_or_symbol", None)) or ""
+        ),
+        "risk": (
+            _projection_string(getattr(getattr(record, "risk", None), "value", None), 16)
+            or ""
+        ),
+        "triggers": _skill_row_strings(getattr(record, "triggers", ()), _PROJECTION_TEXT_LIMIT),
+        "applicability": _skill_row_strings(
+            getattr(record, "applicability", ()), _PROJECTION_TEXT_LIMIT
+        ),
+    }
+
+
+def _skill_row_evidence(
+    api: Any, record: Any
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """One record's evidence history: the last entries, and the full counts.
+
+    ``evidence_by_outcome`` names every outcome in the vocabulary, zeros
+    included, exactly as ``manager_skill_tools.usage`` reports it -- an absent
+    key and a measured zero are different facts and the window must not have
+    to guess which it is looking at.
+    """
+
+    stored = tuple(getattr(record, "evidence", ()) or ())
+    counts = {outcome.value: 0 for outcome in api.EvidenceOutcome}
+    for item in stored:
+        outcome = getattr(getattr(item, "outcome", None), "value", None)
+        if outcome in counts:
+            counts[outcome] += 1
+    items: list[dict[str, Any]] = []
+    for item in stored[-_SKILL_ROW_EVIDENCE_LIMIT:]:
+        row: dict[str, Any] = {
+            "outcome": (
+                _projection_string(
+                    getattr(getattr(item, "outcome", None), "value", None), 16
+                )
+                or ""
+            ),
+            "actor_id": _projection_string(getattr(item, "actor_id", None)) or "",
+            "source": _projection_string(getattr(item, "source", None)) or "",
+            "note": (
+                _projection_string(getattr(item, "note", None), _SKILL_ROW_TEXT_LIMIT)
+                or ""
+            ),
+            "resolved": bool(getattr(item, "resolved", False)),
+        }
+        # Evidence entries carry no recorded-at column today. One is reported
+        # only when the stored entry actually has it, never defaulted, because
+        # a blank timestamp reads as "no record" and an invented one does not.
+        stamp = _projection_string(getattr(item, "timestamp", None), 32)
+        if stamp is not None:
+            row["timestamp"] = stamp
+        items.append(row)
+    return items, counts
+
+
+def _project_skill_row(api: Any, entry: Any) -> dict[str, Any] | None:
+    """Project ONE stored record into the owner-facing Skills-window row.
+
+    ``stored_lifecycle`` is what the row says; ``effective_lifecycle`` is what
+    selection actually serves, because the store adopts an ``active`` record
+    whose own evidence no longer meets the two-independent-actor rule as
+    ``proposed``. Reporting only one of them is how a record can read as active
+    while no worker could ever receive it.
+    """
+
+    if not isinstance(entry, Mapping):
+        return None
+    record = entry.get("record")
+    identity = _projection_string(getattr(record, "identity", None))
+    version = _projection_string(getattr(record, "version", None), 32)
+    if identity is None or version is None:
+        return None
+    injectable, reason = _skill_injectability(api, record)
+    steps = _skill_row_strings(
+        getattr(record, "procedure_steps", ()), _SKILL_ROW_TEXT_LIMIT
+    )
+    history, by_outcome = _skill_row_evidence(api, record)
+    # Bounded like every other row list, and by the same helper: the window
+    # prints the LENGTH of this list as the actor count, so reading it unbounded
+    # would state a count the rendered list cannot account for.
+    actors = _skill_row_strings(
+        api.independent_accepted_actor_ids(record), _PROJECTION_TEXT_LIMIT
+    )
+    what_it_does = steps[0] if steps else ""
+    if not what_it_does:
+        what_it_does = (
+            _projection_string(_skill_row_summary(record), _SKILL_ROW_TEXT_LIMIT) or ""
+        )
+    return {
+        "identity": identity,
+        "version": version,
+        # The miner writes every proposal it derives from card evidence under a
+        # "mined." identity prefix, so this is read off the identity rather
+        # than stored twice and allowed to disagree with it.
+        "mined": identity.startswith("mined."),
+        "stored_lifecycle": _projection_string(entry.get("stored_lifecycle"), 16) or "",
+        "effective_lifecycle": (
+            _projection_string(entry.get("effective_lifecycle"), 16) or ""
+        ),
+        "what_it_does": what_it_does,
+        "procedure_steps": steps,
+        "avoid_rules": _skill_row_strings(
+            getattr(record, "avoid_rules", ()), _SKILL_ROW_TEXT_LIMIT
+        ),
+        "vocabulary": _skill_row_vocabulary(record),
+        "injectable": bool(injectable),
+        "injectable_reason": _projection_string(reason, 96) or "",
+        "accepted_actor_ids": actors,
+        "evidence_by_outcome": by_outcome,
+        "evidence": history,
+        "injection_count": _projection_count(entry.get("injection_count")) or 0,
+        "injected_cards": _projection_count(entry.get("injected_cards")) or 0,
+        "selection_count": _projection_count(entry.get("selection_count")) or 0,
+        "last_selected_at": _projection_string(entry.get("last_selected_at"), 32) or "",
+        "last_injected_at": _projection_string(entry.get("last_injected_at"), 32) or "",
+    }
+
+
+def _project_skill_rows(api: Any, material: Any) -> dict[str, Any] | None:
+    """One projected row per stored record, bounded and disclosed.
+
+    ``records`` is the only projected list bound by
+    ``_SKILL_RECORD_ROW_LIMIT``; every other list in this projection keeps
+    ``_PROJECTION_LIST_LIMIT``. Above the bound ``records_truncated`` says so
+    and ``records_total`` stays ``"unknown"`` rather than publishing the page
+    as the population.
+
+    An entry this projection cannot read is SKIPPED, not fatal: one unreadable
+    record is one missing row, never a missing window. The published rows are
+    then no longer the whole page, so a skip is disclosed through the same two
+    fields a truncation is rather than letting a short list read as a complete
+    one.
+
+    Returns ``None`` -- never an empty list -- when there is no material to
+    read, so the window falls back to the aggregate line instead of reporting an
+    unread store as a repository with no skills. A store that could not be read
+    AT ALL is disclosed as ``records_state`` instead, because an unreadable
+    store and an unread one are different facts.
+    """
+
+    if not isinstance(material, Mapping):
+        return None
+    raw_rows = material.get("rows")
+    if not isinstance(raw_rows, list):
+        reason = _projection_string(material.get("degraded_reason"), 180)
+        if reason is not None:
+            return {"records_state": "unreadable", "records_degraded_reason": reason}
+        return None
+    truncated = bool(material.get("truncated"))
+    rows: list[dict[str, Any]] = []
+    skipped = 0
+    for entry in raw_rows[:_SKILL_RECORD_ROW_LIMIT]:
+        row = _project_skill_row(api, entry)
+        if row is None:
+            skipped += 1
+            continue
+        rows.append(row)
+    if skipped:
+        # The rows below are no longer the whole page, so every number derived
+        # from them is a lower bound and is published as one.
+        truncated = True
+    injected_cards = _projection_count(material.get("injected_card_count"))
+    return {
+        "records": rows,
+        "records_total": "unknown" if truncated else len(rows),
+        "records_truncated": truncated,
+        "records_injected_card_count": (
+            "unknown" if injected_cards is None else injected_cards
+        ),
+    }
+
+
 def _project_skills(
     payload: Any,
     *,
     ownership: str,
     input_state: str,
+    ownership_rows: Any = None,
 ) -> dict[str, Any]:
     if input_state != "present":
         return _projection_shell("skills", input_state, ownership)
@@ -3451,9 +3796,18 @@ def _project_skills(
             else {"state": "unknown", "denominator": "unknown"}
         ),
     }
+    # NF-2026-01399. The per-record rows are a FULL-ownership field and nothing
+    # else: ``ownership_rows`` is only ever read for the full snapshot, so the
+    # summary projection every refresh builds is byte-identical in keys and
+    # aggregate values to what it was before this list existed.
+    row_fields = (
+        _project_skill_rows(api, ownership_rows) if ownership == "full" else None
+    )
     if not records and not nested_measured:
         projected = _projection_shell("skills", "no_sample", ownership)
         projected.update(evidence)
+        if row_fields is not None:
+            projected.update(row_fields)
         if ownership == "summary":
             return _cheap_projection(projected)
         return projected
@@ -3486,6 +3840,8 @@ def _project_skills(
                 if type(value) is int and value >= 0:
                     projected[field] = value
     projected.update(evidence)
+    if row_fields is not None:
+        projected.update(row_fields)
     if ownership == "summary":
         return _cheap_projection(projected)
     return projected
@@ -3826,6 +4182,35 @@ def _semantic_edit_coverage_projection(
     return projected
 
 
+def _skill_ownership_rows(provider: Any) -> Any:
+    """Read the per-record Skills-window material, for FULL ownership only.
+
+    NF-2026-01399. Deliberately NOT folded into
+    ``_provider_projection_input``: that reader is what every summary refresh
+    calls for all three foundation panels, and the whole point of this hook is
+    that a summary snapshot never pays for a per-record selection/injection
+    read it will not render. A provider WITHOUT the hook yields ``None`` and the
+    window then shows the aggregate line it showed before -- a previously
+    correct answer rather than a measured zero invented from an unread store.
+
+    A provider that RAISES is a different fact and is reported as one. The
+    producer narrows its own store reads to the store's declared error types, so
+    anything arriving here is a programming-level mismatch -- a reader signature
+    that moved, an attribute that is gone -- and answering it with a bare
+    ``None`` would present a broken reader as a repository with nothing to show.
+    The cause is carried out as ``degraded_reason`` for the projection to
+    disclose; the refresh itself still does not fail.
+    """
+
+    getter = getattr(provider, "get_skill_ownership_rows", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter()
+    except Exception as exc:  # noqa: BLE001 - the window degrades; the refresh does not fail
+        return {"degraded_reason": f"{type(exc).__name__}: {exc}"}
+
+
 def _coding_foundation_projections(
     provider: Any,
     *,
@@ -3838,6 +4223,11 @@ def _coding_foundation_projections(
     skills_state, skills_payload = _provider_projection_input(
         provider, "get_skills_projection_input"
     )
+    skills_rows = (
+        _skill_ownership_rows(provider)
+        if ownership == "full" and skills_state == "present"
+        else None
+    )
     recipes_state, recipes_payload = _provider_projection_input(
         provider, "get_tool_recipes_projection_input"
     )
@@ -3846,7 +4236,10 @@ def _coding_foundation_projections(
             rules_payload, ownership=ownership, input_state=rules_state
         ),
         "skills": _project_skills(
-            skills_payload, ownership=ownership, input_state=skills_state
+            skills_payload,
+            ownership=ownership,
+            input_state=skills_state,
+            ownership_rows=skills_rows,
         ),
         "tool_recipes": _project_tool_recipes(
             recipes_payload, ownership=ownership, input_state=recipes_state
