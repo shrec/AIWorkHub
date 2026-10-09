@@ -14,6 +14,10 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.40
+
+- A sent-back card whose first attempt started from promoted-but-uncommitted files relaunches cleanly instead of failing with a false `rework_base_drift` (NF-2026-01431).
+
 ## What's new in 0.12.39
 
 - The dashboard Tool Recipes window shows each recipe: where it came from, what it does, how often it ran, how it exited and when it was last used (NF-2026-01424).

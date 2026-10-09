@@ -1,5 +1,15 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.40 — 2026-10-09
+
+### Fixed
+
+- Bundled MCP runtime: a rework relaunch rebases onto the predecessor's recorded launch-time canonical blob, so a predecessor seeded over uncommitted canonical bytes no longer fails with a false `rework_base_drift` (NF-2026-01431).
+
+### Qualification
+
+- Independent component regressions pass; installation, activation and live qualification are separate evidence.
+
 ## 0.12.39 — 2026-10-09
 
 ### Added

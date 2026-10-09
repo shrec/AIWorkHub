@@ -6,6 +6,16 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.40] - 2026-10-09
+
+### Fixed
+
+- Rework: the base-drift rebase uses the predecessor's recorded launch-time canonical blob as its three-way ancestor, so a predecessor provisioned over promoted-but-uncommitted canonical bytes no longer fails its relaunch with a false `rework_base_drift`; an unrecorded or digest-mismatched blob keeps the `base_oid` ancestor, and a predecessor deletion over an unchanged ancestor propagates (NF-2026-01431).
+
+### Qualification
+
+- Each change has regressions that fail before and pass after; the touched suites pass. Installation and live replay are separate evidence.
+
 ## [0.12.39] - 2026-10-09
 
 ### Added
