@@ -3043,6 +3043,39 @@ def failure_disposition_from_substatus(
     )
 
 
+def reviewer_route_behaviour_code(reason: Any) -> str:
+    """The vscode_lm behaviour code owning one reviewer's own reason, or ``""``.
+
+    Only the closed ``_VSCODE_LM_BEHAVIOUR_CODES`` vocabulary a reviewer's own
+    text-protocol turn can raise, or the wrapper's ``vscode_lm_request_failed``,
+    can select this -- never free provider or model prose.
+    """
+    for token in str(reason or "").strip().split(":"):
+        token = token.strip()
+        if token in _VSCODE_LM_BEHAVIOUR_CODES or token == "vscode_lm_request_failed":
+            return token
+    return ""
+
+
+def reviewer_route_retry_disposition(
+    code: str, *, terminal_state: str | None = None,
+) -> dict[str, Any]:
+    """The typed route_retry disposition for one reviewer's own vscode_lm code.
+
+    ``cause`` is :data:`CAUSE_PROVIDER_TRANSIENT`, so :data:`_ACTION_MATRIX`
+    gives ``route_retry`` on a distinct route -- the same action a
+    provider-asserted transient route failure already gets -- instead of the
+    generic ``manager_judgment_unknown`` an unrecognised reviewer reason would
+    otherwise fall to.
+    """
+    return _typed_disposition(
+        cause=CAUSE_PROVIDER_TRANSIENT,
+        evidence_authority=EVIDENCE_AUTHORITY_AIWORKHUB_REASON,
+        evidence=f"reviewer_route_behaviour={code}",
+        terminal_state=terminal_state,
+    )
+
+
 def failure_category_projection(disposition: Any) -> str:
     """Project one canonical disposition onto the Learning Commit vocabulary.
 

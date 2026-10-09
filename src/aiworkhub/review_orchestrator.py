@@ -245,6 +245,7 @@ def select_reviewer_route(
     lens: str,
     *,
     excluded_routes: frozenset[tuple[str, str, str]] = frozenset(),
+    excluded_adapters: frozenset[str] = frozenset(),
 ) -> Mapping[str, Any]:
     """Select one currently available review worker through canonical policy."""
     readiness = task_store.storage_readiness(repo)
@@ -286,7 +287,11 @@ def select_reviewer_route(
         if not all(identity) or identity in seen:
             continue
         seen.add(identity)
-        if identity in excluded_routes or _manager_reserved_codex_route(route):
+        if (
+            identity in excluded_routes
+            or route["adapter_id"] in excluded_adapters
+            or _manager_reserved_codex_route(route)
+        ):
             continue
         return route
     raise RuntimeError("review_route_unavailable:" + lens)
@@ -437,6 +442,25 @@ def reviewer_terminal_disposition(status: Any) -> dict[str, Any]:
             break
 
     sources = (evidence, terminal, latest, status)
+    # ``error``/``diagnostic`` on a terminal event are already the
+    # classifier's own closed-vocabulary strings, never provider text --
+    # see ``terminal_failure_classification.terminal_event_authority``.
+    reason = (
+        _structured_field(sources, "reason")
+        or _structured_field(sources, "error")
+        or _structured_field(sources, "diagnostic")
+    )
+    # NF-2026-01409: a reviewer's OWN vscode_lm turn-protocol code, buried
+    # past a wrapper like ``worker_failed:``, names the ADAPTER as the route
+    # failure -- not the candidate or the manager -- so it gets route_retry
+    # on a distinct route instead of a manager_judgment_unknown hold.
+    behaviour_code = terminal_failure_classification.reviewer_route_behaviour_code(
+        reason
+    )
+    if behaviour_code:
+        return terminal_failure_classification.reviewer_route_retry_disposition(
+            behaviour_code, terminal_state=state,
+        )
     return terminal_failure_classification.failure_disposition_from_substatus(
         terminal_substatus=state,
         sealed_diagnostics=sealed,
@@ -448,14 +472,7 @@ def reviewer_terminal_disposition(status: Any) -> dict[str, Any]:
             _structured_field(sources, "refusal_kind")
             or _structured_field(sources, "error_code")
         ),
-        # ``error``/``diagnostic`` on a terminal event are already the
-        # classifier's own closed-vocabulary strings, never provider text --
-        # see ``terminal_failure_classification.terminal_event_authority``.
-        reason=(
-            _structured_field(sources, "reason")
-            or _structured_field(sources, "error")
-            or _structured_field(sources, "diagnostic")
-        ),
+        reason=reason,
     )
 
 
@@ -2842,11 +2859,14 @@ class ReviewOrchestrator:
         reviewer_task_id: str,
         lens: str,
         excluded: frozenset[tuple[str, str, str]],
+        *,
+        excluded_adapters: frozenset[str] = frozenset(),
     ) -> dict[str, str]:
         if self.route_selector is select_reviewer_route:
             selected = select_reviewer_route(
                 self.manager.repo, reviewer_task_id, lens,
                 excluded_routes=excluded,
+                excluded_adapters=excluded_adapters,
             )
         else:
             selected = self.route_selector(self.manager.repo, reviewer_task_id, lens)
@@ -2858,7 +2878,7 @@ class ReviewOrchestrator:
         identity = _review_route_identity(route)
         if not all(identity) or _manager_reserved_codex_route(route):
             raise RuntimeError("review_route_identity_invalid")
-        if identity in excluded:
+        if identity in excluded or route["adapter_id"] in excluded_adapters:
             raise RuntimeError("review_route_unavailable:" + lens)
         return route
 
@@ -3074,7 +3094,22 @@ class ReviewOrchestrator:
             for row in attempts
             if row["state"] == "retired"
         )
-        route = self._select_attempt_route(reviewer_task_id, action.lens, excluded)
+        # NF-2026-01409: a retired attempt whose OWN reason names a vscode_lm
+        # turn-protocol code indicts the ADAPTER, not just the one model that
+        # happened to be ranked, so the next attempt excludes every route on
+        # that adapter -- not only the exact (runner, adapter_id, model) tried.
+        excluded_adapters = frozenset(
+            str(row["adapter_id"])
+            for row in attempts
+            if row["state"] == "retired"
+            and terminal_failure_classification.reviewer_route_behaviour_code(
+                row["failure_reason"]
+            )
+        )
+        route = self._select_attempt_route(
+            reviewer_task_id, action.lens, excluded,
+            excluded_adapters=excluded_adapters,
+        )
         with closing(_side_table_connection(self.db_path)) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(ROUTE_ATTEMPT_TABLE)
