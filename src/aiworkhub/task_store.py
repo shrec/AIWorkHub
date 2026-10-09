@@ -6704,6 +6704,42 @@ def recover_blocked_rework(
         predecessor_request_id = str(
             retained_predecessor.get("request_id") or ""
         ).strip()
+
+        # NF-2026-01405: process_launcher_evidence.rework_no_delta_refusal has
+        # to tell a predecessor that was rejected WITHOUT ever passing
+        # validation -- where re-running its exact bytes IS the recovery --
+        # from one that reached review on passing bytes.  Publish that terminal
+        # onto the predecessor record this recovery republishes.  Additive and
+        # optional: a record without the field keeps today's refusal.
+        #
+        # NF-2026-01169: the episode's terminal event is an attestation, never
+        # the source.  The card's own server-written state decides -- its
+        # ``terminal_substatus`` must name the same terminal and its
+        # ``launch_request_id`` the same request the predecessor record pins,
+        # and no identity published in the event may contradict that request.
+        # An inherited predecessor from an earlier episode therefore keeps
+        # whatever it already carried.
+        terminal_evidence = terminal_review.get("evidence")
+        contradicting_request_ids = {
+            str(source.get("request_id") or "").strip()
+            for source in (
+                terminal_review,
+                terminal_evidence,
+                terminal_evidence.get("request_identity")
+                if isinstance(terminal_evidence, dict)
+                else None,
+            )
+            if isinstance(source, dict)
+        } - {"", predecessor_request_id}
+        if (
+            isinstance(card.get("rework_predecessor"), dict)
+            and bool(terminal_substatus)
+            and bool(predecessor_request_id)
+            and str(card.get("terminal_substatus") or "") == terminal_substatus
+            and card.get("launch_request_id") == predecessor_request_id
+            and not contradicting_request_ids
+        ):
+            card["rework_predecessor"]["terminal_substatus"] = terminal_substatus
         rejection_rebind: dict[str, Any] | None = None
         if (
             isinstance(rebind_rejection, dict)

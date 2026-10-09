@@ -134,6 +134,16 @@ REWORK_NO_DELTA = "rework_no_delta"
 # unbounded manifest.
 MAX_REWORK_NO_DELTA_REASON_PATH_CHARS = 400
 
+# NF-2026-01405. The one recorded predecessor terminal for which reproducing
+# the predecessor's exact bytes IS the recovery rather than ignored reject
+# findings: a predecessor whose terminal was ``validation_failed`` never had a
+# passing validation, so re-running those bytes through validation is the only
+# thing that can decide them. Every other terminal -- ``review_ready`` (an
+# ordinary manager reject), ``worker_failed``, ``finalize_failed``, anything
+# else -- keeps the refusal, and so does an absent or non-matching field:
+# unknown is never an exemption.
+REWORK_NO_DELTA_EXEMPT_PREDECESSOR_TERMINAL = "validation_failed"
+
 
 def rework_no_delta_refusal(
     workspace: WorkerWorkspace,
@@ -160,10 +170,27 @@ def rework_no_delta_refusal(
     never refused. An empty, absent or non-string-digest predecessor record
     proves no identity to compare against, so it mints nothing and leaves the
     ordinary mandatory-output and quality gates to decide.
+
+    NF-2026-01405. The refusal stops a rework that ignored the reject findings
+    from reaching review on the predecessor's bytes -- which presumes those
+    bytes already passed validation once. When the predecessor's recorded
+    terminal substatus was ``validation_failed`` they never did, so re-running
+    them IS the recovery and nothing is minted: the ordinary validation,
+    quality and required-output gates then decide, a pass reaching
+    ``review_ready`` and a failure ending ``validation_failed`` exactly as
+    today. The substatus is read from the same ``rework_predecessor`` record
+    that publishes the sealed identity, so the exemption and the bytes it
+    exempts can never describe two different predecessors.
     """
     if validation_only_replay or not is_rework_attempt(metadata):
         return ""
-    sealed = (metadata.get("rework_predecessor") or {}).get("changed_path_hashes")
+    predecessor = metadata.get("rework_predecessor") or {}
+    if (
+        predecessor.get("terminal_substatus")
+        == REWORK_NO_DELTA_EXEMPT_PREDECESSOR_TERMINAL
+    ):
+        return ""
+    sealed = predecessor.get("changed_path_hashes")
     if not isinstance(sealed, dict) or not sealed:
         return ""
     inherited = {str(path): digest for path, digest in sealed.items()}
