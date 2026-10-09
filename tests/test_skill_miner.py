@@ -606,3 +606,119 @@ def test_both_mining_tools_are_registered_on_the_mcp_server():
     assert "aiworkhub_manager_skill_retirement_report" in names
     # And the existing hand-off it feeds is still there.
     assert "aiworkhub_manager_skill_propose" in names
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-01432: a long excerpt costs its own tail, never the whole proposal
+# ---------------------------------------------------------------------------
+
+
+# Each filler is appended AFTER the shared ASCII rule prose, so the statements
+# still cluster (``rule_terms`` only sees Latin words) while the 256-byte cut
+# lands inside the filler -- inside a multibyte code point for the Georgian one.
+_ASCII_FILLER = "every emitting branch must be enumerated before delivery " * 4
+_GEORGIAN_FILLER = (
+    "ყოველი გამცემი შტო უნდა ჩამოითვალოს სანამ ველის გარანტია მიწოდებულად ჩაითვლება " * 4
+)
+
+
+def _seed_long_family(root, filler):
+    """Three distinct cards in three distinct files, each over the byte bound.
+
+    The ``policy`` path marker is load-bearing, not decoration: it is what makes
+    ``project_context._skill_selection_context`` derive an applicability token,
+    and without one no member card resolves -- the draft would then carry no
+    procedure steps at all and these tests would bound an empty list.
+    """
+    for index in range(3):
+        seed_card(
+            root, f"card{index}", runner=f"worker{index}",
+            paths=[f"src/aiworkhub/policy{index}.py"],
+            instruction=f"{RULE} observed in round {index}. {filler}",
+        )
+
+
+def _only_draft(root):
+    report = skill_miner.mine(root)
+    assert report["candidates"], "the family must still be mined, not dropped"
+    return report["candidates"][0]["proposal_draft"]
+
+
+@pytest.mark.parametrize("filler", [_ASCII_FILLER, _GEORGIAN_FILLER],
+                         ids=["ascii", "multibyte"])
+def test_a_long_excerpt_is_cut_to_the_registry_bound_not_refused(manager, filler):
+    """The draft is PROPOSED; only the excerpt's tail is spent, not the proposal.
+
+    Before NF-2026-01432 the miner put raw 400-character excerpts into
+    ``procedure_steps``/``avoid_rules`` and ``skill_registry`` refused the whole
+    draft with ``packet_limit``, which is why an accepted learning commit mined
+    one candidate and proposed zero.
+    """
+    _seed_long_family(manager, filler)
+    draft = _only_draft(manager)
+    bounded = list(draft["procedure_steps"]) + list(draft["avoid_rules"])
+    assert bounded, "the draft must carry the mined prose, not discard it"
+    assert any(entry.endswith("…") for entry in bounded), "nothing was cut"
+    for entry in bounded:
+        encoded = entry.encode("utf-8")
+        assert len(encoded) <= sr.MAX_PACKET_STRING_BYTES
+        # Valid UTF-8, and never cut through a code point into a replacement.
+        assert encoded.decode("utf-8") == entry
+        assert "�" not in entry
+
+    # The gate that used to refuse it now admits it, through the registry's own
+    # public proposal path rather than a local copy of its bound checks.
+    record = sr.SkillRecord.from_mapping({
+        **draft,
+        "task_family": draft["task_family"] or "bugfix",
+        "triggers": list(draft["triggers"]) or ["t"],
+    })
+    registered = sr.SkillRegistry().propose(
+        record, sr.Authority(role=sr.AuthorityRole.WORKER, actor_id="worker.w1")
+    )
+    assert registered.lifecycle_state is sr.LifecycleState.PROPOSED
+
+
+def test_an_excerpt_inside_the_bound_reaches_the_draft_byte_identical(manager):
+    """Only an over-long string is touched; a short one is passed through whole."""
+    statements = []
+    for index in range(3):
+        text = f"{RULE} observed in round {index}"
+        assert len(text.encode("utf-8")) <= sr.MAX_PACKET_STRING_BYTES
+        statements.append(text)
+        seed_card(
+            manager, f"card{index}", runner=f"worker{index}",
+            paths=[f"src/aiworkhub/policy{index}.py"], instruction=text,
+        )
+    draft = _only_draft(manager)
+    assert set(statements) <= set(draft["procedure_steps"])
+    assert set(statements) <= set(draft["avoid_rules"])
+    assert not any("…" in entry for entry in draft["procedure_steps"])
+
+
+def test_long_excerpts_sharing_a_bounded_prefix_collapse_to_one_step(manager):
+    """Dedupe happens AFTER the cut, or the draft repeats itself verbatim.
+
+    Three statements that differ only past the bound would otherwise become
+    three steps a reader cannot tell apart, spending the step budget on one
+    sentence printed three times.
+    """
+    prefix = (RULE + " ") * 3
+    assert len(prefix.encode("utf-8")) > sr.MAX_PACKET_STRING_BYTES
+    for index in range(3):
+        seed_card(
+            manager, f"card{index}", runner=f"worker{index}",
+            paths=[f"src/aiworkhub/policy{index}.py"],
+            instruction=f"{prefix}and then it diverges at round {index}",
+        )
+    draft = _only_draft(manager)
+    assert len(draft["procedure_steps"]) == 1
+    assert len(draft["avoid_rules"]) == 1
+    assert draft["procedure_steps"][0].endswith("…")
+
+
+def test_the_mined_bound_is_the_registrys_own_constant():
+    """single_definition: the miner imports the limit and never restates it."""
+    assert sr.MAX_PACKET_STRING_BYTES == 256
+    assert not hasattr(skill_miner, "MAX_PACKET_STRING_BYTES")
+    assert "skill_registry.MAX_PACKET_STRING_BYTES" in inspect.getsource(skill_miner)

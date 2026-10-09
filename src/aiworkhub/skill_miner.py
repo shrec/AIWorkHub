@@ -591,10 +591,58 @@ def _confidence(distinct_cards: int, distinct_actors: int) -> float:
     return round(min(0.5 + 0.1 * card_margin + 0.1 * actor_margin, 0.95), 2)
 
 
-def _bounded_unique(texts: Iterable[str], limit: int) -> list[str]:
-    """First ``limit`` distinct, non-empty strings, order preserved."""
+# NF-2026-01432: an excerpt runs to MAX_EXCERPT_CHARS characters, but
+# ``skill_registry._bounded_packet_strings`` refuses the WHOLE draft when any
+# procedure step or avoid rule exceeds ``skill_registry.MAX_PACKET_STRING_BYTES``
+# -- so an honest long lesson used to cost the entire proposal instead of its own
+# tail. The limit is imported from the registry that enforces it and never
+# restated here, and the marker character is charged to that limit rather than
+# added on top of it.
+_EXCERPT_ELLIPSIS = "…"
+
+
+def _cut_to_bytes(text: str, max_bytes: int) -> str:
+    """``text`` cut to at most ``max_bytes`` UTF-8 bytes, still valid UTF-8.
+
+    A string already inside the bound is returned byte-identical. Otherwise the
+    cut prefers the last whitespace before the limit so a step ends on a word
+    rather than mid-token, and ``_EXCERPT_ELLIPSIS`` says it was cut. Because
+    the marker is subtracted from the budget before anything is kept, the
+    result is never one byte over. A bound too small to hold even the marker
+    yields ``""``, which the callers drop rather than emit a step that is
+    nothing but punctuation.
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    budget = max_bytes - len(_EXCERPT_ELLIPSIS.encode("utf-8"))
+    if budget <= 0:
+        return ""
+    # ``errors="ignore"`` discards only a trailing partial multibyte sequence,
+    # which is exactly what makes a byte slice decodable again. Multibyte text
+    # is therefore cut on a character boundary, never inside a code point.
+    head = encoded[:budget].decode("utf-8", errors="ignore")
+    for index in range(len(head) - 1, -1, -1):
+        if head[index].isspace():
+            head = head[:index]
+            break
+    return head.rstrip() + _EXCERPT_ELLIPSIS
+
+
+def _bounded_unique(
+    texts: Iterable[str], limit: int, *, max_bytes: int | None = None
+) -> list[str]:
+    """First ``limit`` distinct, non-empty strings, order preserved.
+
+    ``limit`` bounds the item COUNT. With ``max_bytes`` each string is cut by
+    :func:`_cut_to_bytes` FIRST and distinctness is decided on the cut text, so
+    two excerpts that differ only past the bound collapse into one entry
+    instead of two steps a reader cannot tell apart.
+    """
     seen: dict[str, None] = {}
     for text in texts:
+        if max_bytes is not None:
+            text = _cut_to_bytes(text, max_bytes)
         if text:
             seen[text] = None
     return list(seen)[:limit]
@@ -654,8 +702,13 @@ def _proposal_draft(
                     [cluster.representative.excerpt]
                     + [member.excerpt for member in cluster.members],
                     MAX_PROCEDURE_STEPS,
+                    max_bytes=skill_registry.MAX_PACKET_STRING_BYTES,
                 ),
-                "avoid_rules": _bounded_unique(corrections, MAX_AVOID_RULES),
+                "avoid_rules": _bounded_unique(
+                    corrections,
+                    MAX_AVOID_RULES,
+                    max_bytes=skill_registry.MAX_PACKET_STRING_BYTES,
+                ),
             }
             return draft, ()
         scope = skill_registry.common_path_scope(list(cluster.distinct_files))
