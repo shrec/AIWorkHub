@@ -673,9 +673,15 @@ def exec_scratch_denied_restriction(detail: str) -> str | None:
 
 
 def _is_failing_row(row: Mapping[str, Any]) -> bool:
-    # Mirror ``run_validations``: a row failed if it timed out or exited nonzero
-    # (launch/timeout rows carry returncode ``None``).
-    return bool(row.get("timed_out")) or row.get("returncode") != 0
+    # Mirror ``run_validations``: a row failed if it timed out, exited nonzero
+    # (launch/timeout rows carry returncode ``None``), or is a ctest row whose
+    # own output reports "No tests were found" (NF-2026-01338: ctest exits 0
+    # on an empty test set unless the preset sets noTestsAction=error).
+    return (
+        bool(row.get("timed_out"))
+        or row.get("returncode") != 0
+        or ctest_no_tests_found(row)
+    )
 
 
 def classify_validation_results(results: Iterable[Mapping[str, Any]]) -> TerminalState:
@@ -1201,6 +1207,30 @@ def _parse_pytest_summary_line(line: str) -> dict[str, int] | None:
     return outcomes
 
 
+_CTEST_PROGRAM_BASENAMES = frozenset({"ctest", "ctest.exe"})
+_CTEST_NO_TESTS_MARKER = "No tests were found"
+
+
+def ctest_no_tests_found(row: Mapping[str, Any]) -> bool:
+    """True when ``row`` invoked ctest and ctest's own output reports its
+    exact "No tests were found!!!" summary (NF-2026-01338).
+
+    ctest returns 0 in this case unless the preset sets
+    ``execution.noTestsAction=error``, unlike pytest, which exits 5 when it
+    collects zero tests -- so a returncode of 0 alone cannot be trusted for a
+    ctest row the way it can for every other validator.
+    """
+    argv = row.get("executed_argv") or row.get("argv") or []
+    if not isinstance(argv, (list, tuple)) or not argv:
+        return False
+    if _program_basename(str(argv[0])).lower() not in _CTEST_PROGRAM_BASENAMES:
+        return False
+    return any(
+        _CTEST_NO_TESTS_MARKER in str(row.get(field) or "")
+        for field in ("stdout_tail", "stdout_head", "stderr_tail", "stderr_head")
+    )
+
+
 def _pytest_outcomes_from_stdout(stdout: str) -> dict[str, int] | None:
     """The LAST pytest final-summary line's outcomes; ``None`` when none parsed."""
     outcomes: dict[str, int] | None = None
@@ -1288,6 +1318,7 @@ __all__ = [
     "classify_validation_results",
     "command_needs_multiprocessing_semlock",
     "construct_multiprocessing_semlock",
+    "ctest_no_tests_found",
     "dash_m_validator_modules",
     "decode_trusted_semlock_exit",
     "exec_scratch_denied_restriction",

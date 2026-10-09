@@ -13916,10 +13916,13 @@ def run_validations(
                         "environment": _validation_environment_provenance(env),
                     }
             results.append(record)
+        from . import validation_runner
+
         failed = [
             row
             for row in results
             if row.get("timed_out") or row.get("returncode") != 0
+            or validation_runner.ctest_no_tests_found(row)
         ]
         if failed:
             first = failed[0]
@@ -13929,8 +13932,6 @@ def run_validations(
             # environment restriction -- if any is a genuine gate failure the
             # batch stays ``validation_failed``, so a broken candidate is never
             # let through as merely blocked.
-            from . import validation_runner
-
             terminal = validation_runner.classify_validation_results(results)
             if terminal.state == validation_runner.VALIDATION_ENVIRONMENT_BLOCKED:
                 stderr_detail = str(first.get("stderr_tail") or "")[-1_000:].replace("\n", "\\n")
