@@ -518,6 +518,11 @@ except TypeError:
     # contract remains available through aiworkhub_manager_bootstrap.
     mcp = FastMCP("AIWorkHub MCP")
 
+# FastMCP has no version kwarg; clients read serverInfo.version from the low-level server.
+_lowlevel_server = getattr(mcp, "_mcp_server", None)
+if _lowlevel_server is not None:
+    _lowlevel_server.version = __version__
+
 
 if _MCP_SDK_AVAILABLE:
     _sdk_tool_decorator = mcp.tool
