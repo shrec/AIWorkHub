@@ -613,7 +613,7 @@ def test_deletion_only_hunk_without_canonical_graph_is_an_explicit_unknown(
     assert _targets(wrapped) == {"src/mod.py"}
 
 
-def test_deleted_lines_owned_by_no_canonical_symbol_are_an_explicit_unknown(
+def test_deleted_lines_owned_by_no_canonical_symbol_are_attributed_to_the_module_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -639,7 +639,7 @@ def test_deleted_lines_owned_by_no_canonical_symbol_are_an_explicit_unknown(
         canonical, candidate, "src/mod.py", digest, {"segments": [blank_lines]}
     )
 
-    assert "deleted-symbols-unresolved" in _unknown_ids(wrapped)
+    assert "deleted-symbols-unresolved" not in _unknown_ids(wrapped)
     assert _targets(wrapped) == {"src/mod.py"}
 
 

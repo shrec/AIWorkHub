@@ -408,8 +408,12 @@ def build_scoped_audits(
             deleted, unowned = _owners(baseline_rows, deleted_spans)
             # A replace leaves candidate lines to review, so only a missing graph is unresolved.
             replaced, _ = _owners(baseline_rows, replaced_spans)
-            if unowned or (replaced_spans and conn is None):
+            if (unowned and (conn is None or not baseline_rows)) or (
+                replaced_spans and conn is None
+            ):
                 unresolved_deletions.append(path)
+            elif unowned:
+                targets.setdefault(path, TargetSymbol(path, "module"))
             if not deleted_file and (
                 segments.malformed or not (segments.candidate or segments.baseline)
             ):
