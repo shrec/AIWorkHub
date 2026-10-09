@@ -102,6 +102,32 @@ CAPABILITY_VOCABULARY: tuple[str, ...] = (
     CAPABILITY_SOURCE_GRAPH_QUERY,
 )
 
+# ── Capability name normalization ──────────────────────────────────────────
+# A tool need or catalog entry may spell a capability hyphenated, snake_case,
+# or under an older alias; every spelling below resolves to the same
+# constant above so a caller never compares two tokens that mean one thing.
+_CAPABILITY_ALIASES: Mapping[str, str] = MappingProxyType(
+    {
+        "source_graph": CAPABILITY_SOURCE_GRAPH_QUERY,
+        "source_graph_query": CAPABILITY_SOURCE_GRAPH_QUERY,
+        "semantic_edit": CAPABILITY_WORKER_SEMANTIC_EDIT,
+        "worker_semantic_edit": CAPABILITY_WORKER_SEMANTIC_EDIT,
+        "reviewer_submit": CAPABILITY_REVIEWER_SUBMIT,
+    }
+)
+
+
+def canonical_capability(name: str) -> str | None:
+    """Resolve a hyphenated, snake_case or canonical spelling to its
+    route-contract capability ID, or ``None`` when ``name`` names no such
+    capability -- callers keep their catalog-based check for those.
+    """
+
+    token = str(name or "").strip().lower().replace("-", "_")
+    if token in CAPABILITY_VOCABULARY:
+        return token
+    return _CAPABILITY_ALIASES.get(token)
+
 # ── Exact reasons ──────────────────────────────────────────────────────────
 # Snake_case reason tokens in the vocabulary the preflight surface already
 # speaks, so an exclusion reads the same way an ``access_unavailable`` or a

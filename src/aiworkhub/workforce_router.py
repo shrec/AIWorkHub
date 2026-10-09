@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
+from . import provider_route_contracts
+
 
 TASK_KINDS: tuple[str, ...] = (
     "mechanical",
@@ -459,9 +461,22 @@ def _exclusion_reasons(task: TaskRequirements, worker: WorkerCapability) -> list
     if not task.kinds.issubset(worker.supports):
         missing = sorted(task.kinds - worker.supports)
         reasons.append(f"missing_capability:{','.join(missing)}")
-    if not task.tool_needs.issubset(worker.tools):
-        missing = sorted(task.tool_needs - worker.tools)
-        reasons.append(f"missing_tools:{','.join(missing)}")
+    # One capability vocabulary (NF-2026-00731): a tool need that normalizes to a
+    # route-contract capability is decided ONLY by provider_route_contracts, so
+    # this can never disagree with aiworkhub_environment_preflight.  A need
+    # outside the contract keeps the catalog check, with both sides already
+    # normalized the same way by TaskRequirements.build/WorkerCapability.build.
+    contract_needs: set[str] = set()
+    catalog_needs: set[str] = set()
+    for need in task.tool_needs:
+        capability = provider_route_contracts.canonical_capability(need)
+        (contract_needs if capability else catalog_needs).add(capability or need)
+    for capability in sorted(contract_needs):
+        if not provider_route_contracts.adapter_can_complete(worker.adapter_id, capability):
+            reasons.append(f"{provider_route_contracts.REASON_NOT_DECLARED}:{capability}")
+    missing_catalog = sorted(catalog_needs - worker.tools)
+    if missing_catalog:
+        reasons.append(f"missing_tools:{','.join(missing_catalog)}")
     if task.context_tokens and worker.max_context_tokens < task.context_tokens:
         reasons.append("context_too_large")
     if _risk_value(worker.max_risk) < _risk_value(task.risk):
