@@ -7,24 +7,31 @@ parent blob OIDs at workspace creation and merges drifted paths with
 ``git merge-file`` against that recorded base, so disjoint edits from two
 worktrees promote sequentially and overlapping edits fail closed with a named
 conflict error (NF-2026-01381).
+
+It also owns the rework base-drift rebase, which merges one predecessor
+worktree onto a newer successor base and prefers those same recorded blobs as
+its three-way ancestor (NF-2026-01113, NF-2026-01431).
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import stat
 import subprocess
 import tempfile
 from dataclasses import replace
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 from .worker_workspace import (
     WorkerWorkspace,
     WorkspaceError,
     _hash_path,
+    _isolated_worktree_base_oid,
+    _run,
     promote,
 )
 
@@ -254,3 +261,97 @@ def promote_merged(
         )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+ReworkRebase = Callable[[list[tuple[str, bytes | None]]], dict[str, bytes | None]]
+
+
+def rework_base_drift_rebase(
+    repo: Path, worktree: Path, source: WorkerWorkspace
+) -> ReworkRebase | None:
+    """3-way merge P0=``source.base_oid`` predecessor bytes onto S0
+    (NF-2026-01113): ours=S0, base=P0, theirs=predecessor; conflicts and
+    symlink/gitlink drift fail closed. ``changed_path_hashes`` pins theirs
+    before this merge, never the merged output.
+    """
+    base = source.base_oid
+    if not base or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", base) is None:
+        raise WorkspaceError("rework_base_invalid" if base else "rework_base_unknown")
+    if base == (successor := _isolated_worktree_base_oid(repo, worktree)):
+        return None
+
+    def git(failure: str, *args: str) -> Any:
+        done = _run(["git", *args], cwd=worktree, phase="rework_base_drift", text=False)
+        if done.returncode != 0 and failure:
+            raise WorkspaceError(failure)
+        return None if done.returncode else done.stdout
+
+    def rebase(planned: list[tuple[str, bytes | None]]) -> dict[str, bytes | None]:
+        names = [relative for relative, _ in planned]
+        argv = ("--literal-pathspecs", "diff-tree", "-r", "-z", base, successor, "--", *names)
+        fields = os.fsdecode(git("rework_base_drift_diff_failed", *argv)).split("\0")
+        drifted = {path: meta.split()  # [":old_mode", new_mode, P0 oid, S0 oid, status]
+                   for meta, path in zip(fields[::2], fields[1::2], strict=False)}
+        merged: dict[str, bytes | None] = {}
+        conflicts: list[str] = []
+        # The sparse worktree holds no .gitattributes and git 2.47 then
+        # converts nothing, so both EOL filters read S0's attributes.
+        attr_source = f"--attr-source={successor}"
+
+        def launch_ancestor(relative: str, failure: str, scratch_file: Path) -> str | None:
+            """P0's recorded launch-time canonical blob, re-cleaned for S0.
+
+            A predecessor provisioned over promoted-but-uncommitted canonical
+            bytes really started from those bytes, not from ``base``'s tree. The
+            ``base`` ancestor then makes ours AND theirs both look like they
+            added the seeded hunk, so an adjacent worker edit conflicts and the
+            relaunch fails with a false ``rework_base_drift`` (NF-2026-01431).
+            An unrecorded, misshaped, unreadable or digest-mismatched blob keeps
+            the ``base`` ancestor; the re-clean is required because an
+            un-normalised ancestor would conflict on EOL alone.
+            """
+            oid = source.parent_baseline_blob.get(relative)
+            if not oid or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", oid) is None:
+                return None
+            raw = _cat_blob(repo, oid)
+            digest = _parent_digest(source, relative)
+            if raw is None or digest is None or hashlib.sha256(raw).hexdigest() != digest:
+                return None
+            scratch_file.write_bytes(raw)
+            recorded = (attr_source, "hash-object", "-w", f"--path={relative}", str(scratch_file))
+            return os.fsdecode(git(failure, *recorded)).strip() or None
+
+        with tempfile.TemporaryDirectory(prefix="aiworkhub-rebase-") as scratch:
+            sides = [Path(scratch, name) for name in ("ours", "base", "theirs")]
+            for relative, theirs in (entry for entry in planned if entry[0] in drifted):
+                failed = f"rework_base_drift_blob_failed:{relative}"
+                clean = (attr_source, "hash-object", "-w", f"--path={relative}", str(sides[2]))
+                meta = drifted[relative]
+                ancestor, ours = (None if set(oid) == {"0"} else oid for oid in meta[2:4])
+                ancestor = launch_ancestor(relative, failed, sides[1]) or ancestor
+                sides[2].write_bytes(theirs or b"")
+                result = None if theirs is None else os.fsdecode(git(failed, *clean)).strip()
+                if {meta[0].lstrip(":"), meta[1]} - {"100644", "100755", "000000"}:
+                    result = ""
+                elif result in (ancestor, ours):
+                    result = ours
+                elif result is None and ancestor == ours:
+                    pass  # theirs deleted a path ours kept at its launch bytes: propagate the deletion
+                elif None in (ancestor, ours, result):
+                    result = ""
+                else:
+                    for side, oid in zip(sides, (ours, ancestor, result), strict=True):
+                        side.write_bytes(git(failed, "cat-file", "blob", str(oid)))
+                    three_way = git("", "merge-file", "-p", *map(str, sides))
+                    sides[2].write_bytes(three_way or b"")
+                    result = "" if three_way is None else os.fsdecode(git(failed, *clean)).strip()
+                if result == "":
+                    conflicts.append(relative)
+                else:
+                    checkout = (attr_source, "cat-file", "--filters", f"--path={relative}", str(result))
+                    merged[relative] = result and git(failed, *checkout)
+        if conflicts:
+            raise WorkspaceError(f"rework_base_drift:{','.join(sorted(conflicts))}")
+        return merged
+
+    return rebase

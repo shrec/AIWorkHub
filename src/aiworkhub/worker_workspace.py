@@ -43,6 +43,7 @@ from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 if TYPE_CHECKING:
+    from .promotion_merge import ReworkRebase
     from .toolchain_authority import AuthoritySnapshot
 
 
@@ -2791,7 +2792,11 @@ def _materialize_rework_predecessor(
     assert_gc_safe_workspace_shape(
         request_id, source_workspace.path, source_workspace.home, repo=repo
     )
-    rebase = _rework_base_drift_rebase(repo, worktree, source_workspace.base_oid)
+    # Deferred like ``record_base_blobs``: promotion_merge owns the recorded-blob
+    # three-way merges and imports this module at its top (NF-2026-01431).
+    from .promotion_merge import rework_base_drift_rebase
+
+    rebase = rework_base_drift_rebase(repo, worktree, source_workspace)
     if predecessor.get("delta_artifact") is not None:
         return materialize_rework_delta_artifact(
             artifact=predecessor.get("delta_artifact"),
@@ -2809,71 +2814,6 @@ def _materialize_rework_predecessor(
             worktree, source_workspace, hashes, allowed_writes, rebase=rebase
         )
     raise WorkspaceError("rework_predecessor_workspace_missing")
-
-
-_ReworkRebase = Callable[[list[tuple[str, bytes | None]]], dict[str, bytes | None]]
-
-
-def _rework_base_drift_rebase(
-    repo: Path, worktree: Path, base: str | None
-) -> _ReworkRebase | None:
-    """3-way merge P0=``base`` predecessor bytes onto S0 (NF-2026-01113): ours=S0,
-    base=P0, theirs=predecessor; conflicts and symlink/gitlink drift fail closed.
-    ``changed_path_hashes`` pins theirs before this merge, never the merged output.
-    """
-    if not base or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", base) is None:
-        raise WorkspaceError("rework_base_invalid" if base else "rework_base_unknown")
-    if base == (successor := _isolated_worktree_base_oid(repo, worktree)):
-        return None
-
-    def git(failure: str, *args: str) -> Any:
-        done = _run(["git", *args], cwd=worktree, phase="rework_base_drift", text=False)
-        if done.returncode != 0 and failure:
-            raise WorkspaceError(failure)
-        return None if done.returncode else done.stdout
-
-    def rebase(planned: list[tuple[str, bytes | None]]) -> dict[str, bytes | None]:
-        names = [relative for relative, _ in planned]
-        argv = ("--literal-pathspecs", "diff-tree", "-r", "-z", base, successor, "--", *names)
-        fields = os.fsdecode(git("rework_base_drift_diff_failed", *argv)).split("\0")
-        drifted = {path: meta.split()  # [":old_mode", new_mode, P0 oid, S0 oid, status]
-                   for meta, path in zip(fields[::2], fields[1::2], strict=False)}
-        merged: dict[str, bytes | None] = {}
-        conflicts: list[str] = []
-        # The sparse worktree holds no .gitattributes and git 2.47 then
-        # converts nothing, so both EOL filters read S0's attributes.
-        attr_source = f"--attr-source={successor}"
-        with tempfile.TemporaryDirectory(prefix="aiworkhub-rebase-") as scratch:
-            sides = [Path(scratch, name) for name in ("ours", "base", "theirs")]
-            for relative, theirs in (entry for entry in planned if entry[0] in drifted):
-                failed = f"rework_base_drift_blob_failed:{relative}"
-                clean = (attr_source, "hash-object", "-w", f"--path={relative}", str(sides[2]))
-                meta = drifted[relative]
-                ancestor, ours = (None if set(oid) == {"0"} else oid for oid in meta[2:4])
-                sides[2].write_bytes(theirs or b"")
-                result = None if theirs is None else os.fsdecode(git(failed, *clean)).strip()
-                if {meta[0].lstrip(":"), meta[1]} - {"100644", "100755", "000000"}:
-                    result = ""
-                elif result in (ancestor, ours):
-                    result = ours
-                elif None in (ancestor, ours, result):
-                    result = ""
-                else:
-                    for side, oid in zip(sides, (ours, ancestor, result), strict=True):
-                        side.write_bytes(git(failed, "cat-file", "blob", str(oid)))
-                    three_way = git("", "merge-file", "-p", *map(str, sides))
-                    sides[2].write_bytes(three_way or b"")
-                    result = "" if three_way is None else os.fsdecode(git(failed, *clean)).strip()
-                if result == "":
-                    conflicts.append(relative)
-                else:
-                    checkout = (attr_source, "cat-file", "--filters", f"--path={relative}", str(result))
-                    merged[relative] = result and git(failed, *checkout)
-        if conflicts:
-            raise WorkspaceError(f"rework_base_drift:{','.join(sorted(conflicts))}")
-        return merged
-
-    return rebase
 
 
 def _write_rework_path(destination: Path, relative: str, content: bytes | None) -> None:
@@ -2936,7 +2876,7 @@ def _materialize_rework_predecessor_from_worktree(
     source_workspace: WorkerWorkspace,
     hashes: dict[str, Any],
     allowed_writes: tuple[str, ...],
-    rebase: _ReworkRebase | None = None,
+    rebase: ReworkRebase | None = None,
 ) -> list[str]:
     """Copy the hash-pinned predecessor delta from the retained worktree."""
 
@@ -3317,7 +3257,7 @@ def materialize_rework_delta_artifact(
     worktree: Path,
     expected_path_hashes: dict[str, Any],
     allowed_writes: tuple[str, ...],
-    rebase: _ReworkRebase | None = None,
+    rebase: ReworkRebase | None = None,
 ) -> list[str]:
     """Verify and materialize one sealed changed/deleted-file delta."""
     planned = verify_rework_delta_artifact(

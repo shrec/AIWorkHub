@@ -25,6 +25,7 @@ if str(_SRC) not in sys.path:
 
 from aiworkhub import worker_workspace  # noqa: E402
 from aiworkhub import platform_io  # noqa: E402
+from aiworkhub import promotion_merge  # noqa: E402
 
 
 def _fchmod_permitted() -> bool:
@@ -2680,14 +2681,16 @@ def test_rework_overlay_blob_read_failure_raises_instead_of_deleting(
 ) -> None:
     """Only a path absent from the tree reads as None; other git failures raise."""
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
-    real_run = worker_workspace._run
+    # The rebase now lives in promotion_merge, so that module holds the ``_run``
+    # the injection has to replace (NF-2026-01431).
+    real_run = promotion_merge._run
 
     def failing_cat_file(argv: list[str], *args: object, **kwargs: object) -> object:
         if kwargs.get("phase") == "rework_base_drift" and "cat-file" in argv:
             return subprocess.CompletedProcess(argv, 128, b"", b"fatal: injected")
         return real_run(argv, *args, **kwargs)
 
-    monkeypatch.setattr(worker_workspace, "_run", failing_cat_file)
+    monkeypatch.setattr(promotion_merge, "_run", failing_cat_file)
     written: list[str] = []
     monkeypatch.setattr(
         worker_workspace,
@@ -2704,6 +2707,212 @@ def test_rework_overlay_blob_read_failure_raises_instead_of_deleting(
         )
     assert written == []
     assert (repo / "out" / "result.txt").read_bytes() == canonical
+
+
+# NF-2026-01431: the predecessor was provisioned over promoted-but-uncommitted
+# canonical bytes, so its hunk and the worker's adjacent one are not both new.
+_REBASE_SPLICE_AT = 4
+_SEEDED_HUNK = ("canonical-a\n",)
+_WORKER_HUNK = ("canonical-a\n", "worker-b\n")
+
+
+def _rebase_spliced(*inserted: str) -> bytes:
+    """Base lines with ``inserted`` spliced in at one point, so hunks are adjacent."""
+    lines = list(_REBASE_LINES)
+    return "".join(
+        lines[:_REBASE_SPLICE_AT] + list(inserted) + lines[_REBASE_SPLICE_AT:]
+    ).encode("utf-8")
+
+
+def _seed_dirty_canonical_rework(
+    repo: Path,
+    candidate: bytes | None,
+    *,
+    uncommitted: bytes,
+    committed: bytes,
+    blob_record: dict[str, str] | None = None,
+) -> worker_workspace.WorkerWorkspace:
+    """Successor for a predecessor provisioned over uncommitted canonical bytes.
+
+    ``uncommitted`` is in the canonical working tree while the predecessor is
+    provisioned, so the recorded ``parent_baseline_blob`` holds exactly the bytes
+    that worktree really started from; ``committed`` then becomes the successor's
+    base. ``blob_record`` replaces that recording to pin the fallback.
+    """
+    _commit_rebase_result(repo, _rebase_bytes(), "rebase base")
+    (repo / "out" / "result.txt").write_bytes(uncommitted)
+    predecessor = worker_workspace.create_workspace(
+        repo, "rebase-predecessor", {"allowed_writes": ["out/result.txt"]}, "validation"
+    )
+    try:
+        worker_path = predecessor.path / "out" / "result.txt"
+        if candidate is None:  # a predecessor that deleted the path it was given
+            worker_path.unlink()
+        else:
+            worker_path.write_bytes(candidate)
+        # None is the overlay's "expected absent" entry for a deleted path.
+        digest = None if candidate is None else hashlib.sha256(candidate).hexdigest()
+        metadata = predecessor.as_metadata()
+        # Not vacuous: the launch baseline must be the dirty bytes, not HEAD's.
+        assert metadata["parent_baseline"]["out/result.txt"].endswith(
+            hashlib.sha256(uncommitted).hexdigest()
+        )
+        if blob_record is not None:
+            metadata["parent_baseline_blob"] = blob_record
+        _commit_rebase_result(repo, committed, "canonical commits the seeded hunk")
+        return worker_workspace.create_workspace(
+            repo,
+            "rebase-successor",
+            {
+                "allowed_writes": ["out/result.txt"],
+                "rework_predecessor": {
+                    "schema_id": "aiworkhub.rework_predecessor.v1",
+                    "request_id": "rebase-predecessor",
+                    "task_id": "task-1",
+                    "claim_epoch": 1,
+                    "workspace": metadata,
+                    "changed_path_hashes": {"out/result.txt": digest},
+                },
+            },
+            "validation",
+        )
+    finally:
+        worker_workspace.cleanup_workspace(repo, predecessor.path, predecessor.home)
+
+
+def test_rework_overlay_rebases_onto_the_predecessor_launch_time_canonical_blob(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    """NF-2026-01431: committing the bytes the predecessor was seeded with is not drift.
+
+    Against the ``base_oid`` ancestor ours and theirs both look like they added
+    the seeded hunk, so the worker's adjacent edit collided and the relaunch
+    failed with a false ``rework_base_drift``.
+    """
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+    # LF checkout even on hosts with a global core.autocrlf=true.
+    assert _git(repo, "config", "core.autocrlf", "false").returncode == 0
+    seeded = _rebase_spliced(*_SEEDED_HUNK)
+    candidate = _rebase_spliced(*_WORKER_HUNK)
+    successor = _seed_dirty_canonical_rework(
+        repo, candidate, uncommitted=seeded, committed=seeded
+    )
+    try:
+        assert (successor.path / "out" / "result.txt").read_bytes() == candidate
+        assert successor.inherited_rework_paths == ("out/result.txt",)
+    finally:
+        worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
+
+
+@pytest.mark.parametrize("record", ["cleared", "digest_mismatch"])
+def test_rework_overlay_without_a_verified_launch_blob_keeps_the_base_ancestor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path, record: str
+) -> None:
+    """No verified recording, no substituted ancestor: the refusal stands.
+
+    An absent record and a recorded OID whose bytes miss the ``parent_baseline``
+    digest both fall back to ``base_oid`` -- exactly the ancestor that conflicts.
+    """
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+    assert _git(repo, "config", "core.autocrlf", "false").returncode == 0
+    written: list[str] = []
+    monkeypatch.setattr(
+        worker_workspace,
+        "_write_rework_path",
+        lambda destination, relative, content, **_: written.append(relative),
+    )
+    blob_record: dict[str, str] = {}
+    if record == "digest_mismatch":
+        (foreign := tmp_path / "foreign-blob").write_bytes(b"not the launch bytes\n")
+        blob_record = {
+            "out/result.txt": _git(
+                repo, "hash-object", "-w", str(foreign)
+            ).stdout.strip()
+        }
+    seeded = _rebase_spliced(*_SEEDED_HUNK)
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="^rework_base_drift:out/result.txt$"
+    ):
+        _seed_dirty_canonical_rework(
+            repo,
+            _rebase_spliced(*_WORKER_HUNK),
+            uncommitted=seeded,
+            committed=seeded,
+            blob_record=blob_record,
+        )
+    assert written == []
+    assert (repo / "out" / "result.txt").read_bytes() == seeded
+
+
+def test_rework_overlay_still_refuses_a_canonical_commit_on_the_worker_lines(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    """The launch-time ancestor narrows the merge; it never widens acceptance."""
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+    assert _git(repo, "config", "core.autocrlf", "false").returncode == 0
+    written: list[str] = []
+    monkeypatch.setattr(
+        worker_workspace,
+        "_write_rework_path",
+        lambda destination, relative, content, **_: written.append(relative),
+    )
+    committed = _rebase_spliced("canonical-a\n", "canonical-c\n")
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="^rework_base_drift:out/result.txt$"
+    ):
+        _seed_dirty_canonical_rework(
+            repo,
+            _rebase_spliced(*_WORKER_HUNK),
+            uncommitted=_rebase_spliced(*_SEEDED_HUNK),
+            committed=committed,
+        )
+    assert written == []
+    assert (repo / "out" / "result.txt").read_bytes() == committed
+
+
+@pytest.mark.parametrize(
+    "committed",
+    [
+        _rebase_spliced(*_SEEDED_HUNK),
+        _rebase_spliced("canonical-a\n", "canonical-c\n"),
+    ],
+    ids=["launch_bytes_committed", "canonical_moved_off_them"],
+)
+def test_rework_overlay_propagates_a_predecessor_deletion_over_the_launch_ancestor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path, committed: bytes
+) -> None:
+    """A deleted path whose ancestor is now the launch blob is still a deletion.
+
+    ``theirs`` is absent, so only ``ancestor == ours`` -- canonical holding the
+    bytes the predecessor started from -- makes the deletion safe to propagate; a
+    canonical commit that moved off those bytes stays a modify/delete refusal.
+    """
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+    assert _git(repo, "config", "core.autocrlf", "false").returncode == 0
+    seeded = _rebase_spliced(*_SEEDED_HUNK)
+    if committed != seeded:  # canonical moved off the launch bytes: modify/delete
+        written: list[str] = []
+        monkeypatch.setattr(
+            worker_workspace,
+            "_write_rework_path",
+            lambda destination, relative, content, **_: written.append(relative),
+        )
+        with pytest.raises(
+            worker_workspace.WorkspaceError, match="^rework_base_drift:out/result.txt$"
+        ):
+            _seed_dirty_canonical_rework(
+                repo, None, uncommitted=seeded, committed=committed
+            )
+        assert written == []
+        assert (repo / "out" / "result.txt").read_bytes() == committed
+    else:
+        successor = _seed_dirty_canonical_rework(
+            repo, None, uncommitted=seeded, committed=committed
+        )
+        try:
+            assert not (successor.path / "out" / "result.txt").exists()
+        finally:
+            worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
 
 
 def _rewrite_rework_delta_packet(
