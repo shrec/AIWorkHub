@@ -1860,7 +1860,12 @@ def _check_card_scoped_write_authority(
     if error:
         return {"allowed": False, "reason": "card_scoped_task_unresolved"}
     assert card is not None
-    if card.get("task_id") != task_id or card.get("runner") != runner or card.get("topic") != topic:
+    card_runner = card.get("runner")
+    runner_matches = (
+        isinstance(card_runner, str)
+        and canonical_runner_id(runner, (card_runner,)) == card_runner
+    )
+    if card.get("task_id") != task_id or not runner_matches or card.get("topic") != topic:
         return {"allowed": False, "reason": "card_scoped_identity_mismatch"}
     claimed_by = str(card.get("claimed_by") or "")
     lifecycle = _lifecycle_state(card)
@@ -1879,7 +1884,7 @@ def _check_card_scoped_write_authority(
         if (
             lifecycle == "processing"
             and worker_status == "claimed"
-            and claimed_by == runner
+            and claimed_by == card_runner
             and not str(card.get("launch_request_id") or "")
         ):
             # ``auto-pickup`` owns the claim but has no process request yet.
@@ -1888,7 +1893,7 @@ def _check_card_scoped_write_authority(
             # launch_request_id and rejects concurrent/different requests.
             return {"allowed": True, "reason": "card_scoped_launch_attach_allowed"}
         return {"allowed": False, "reason": f"card_scoped_claim_start_ineligible:{lifecycle}"}
-    if claimed_by != runner:
+    if claimed_by != card_runner:
         return {"allowed": False, "reason": f"card_scoped_claimed_by_mismatch:{claimed_by}"}
     if action == "review":
         if lifecycle == "processing":
