@@ -187,6 +187,16 @@ def card_contract_missing_inputs(
     Deliberately silent about host capability (a missing ruff, an absent module,
     a sandbox lane): those are repairable, the launcher repairs them, and the
     machine composing a card is not necessarily the machine that runs it.
+
+    Operand classification has exact parity with what ``worker_workspace``
+    applies at launch rather than a second, hand-rolled notion of "looks like a
+    path": commands are parsed with ``worker_workspace._parse_validation_command_detailed``
+    (so a ``cd`` target is honored the same way launch honors it),
+    option-with-value flags are skipped with ``worker_workspace._VALIDATION_OPTIONS_WITH_VALUE``,
+    and a command head is recognized as a trusted ``<python> -m <validator>``
+    invocation with ``worker_workspace._is_module_validator_invocation`` -- the
+    exact predicate launch itself calls before running the command, imported
+    rather than restated so the two checks cannot silently diverge.
     """
     commands = tuple(
         value
@@ -195,6 +205,8 @@ def card_contract_missing_inputs(
     )
     if not commands:
         return ()
+    from . import worker_workspace
+
     # A declared output is a capability the worker HAS: the card authorizes it
     # to create the file, so its absence today is the point of the card, not a
     # defect. Mirrors ``_exact_required_card_inputs``'s ``exempt`` set exactly.
@@ -213,47 +225,58 @@ def card_contract_missing_inputs(
     seen: set[str] = set()
     for command in commands:
         try:
-            tokens = shlex.split(command)
-        except ValueError:
+            tokens, _components, _tmpdir, cd_relative = (
+                worker_workspace._parse_validation_command_detailed(command)
+            )
+        except (ValueError, worker_workspace.WorkspaceError):
             continue
-        for raw in tokens:
+        skip_next = False
+        for token_index, raw in enumerate(tokens):
+            if skip_next:
+                skip_next = False
+                continue
+            if raw in worker_workspace._VALIDATION_OPTIONS_WITH_VALUE:
+                skip_next = True
+                continue
+            if token_index == 0:
+                name = PurePosixPath(raw.replace("\\", "/")).name
+                stem = name[:-4] if name.lower().endswith(".exe") else name
+                if (
+                    stem in worker_workspace._TRUSTED_VALIDATION_BARE_EXECUTABLES
+                    or worker_workspace._is_module_validator_invocation(list(tokens))
+                ):
+                    continue
             # A pytest node id authenticates only its file component; the
             # ``::class::test`` tail is selection metadata, not a path.
             token = raw.split("::", 1)[0]
             if not token or token.startswith("-") or token.startswith("/"):
                 continue
+            if any(char in token for char in "*?["):
+                continue
             if "/" not in token or ":" in token or "=" in token:
                 continue
-            suffix = PurePosixPath(token).suffix.lower()
-            if suffix not in _VALIDATION_INPUT_SUFFIXES:
-                continue
-            candidate = os.path.normpath(token)
+            candidate = token
+            if cd_relative:
+                candidate = os.path.normpath(str(PurePosixPath(cd_relative) / candidate))
+            else:
+                candidate = os.path.normpath(candidate)
             if candidate.startswith("..") or candidate in seen:
                 continue
             seen.add(candidate)
             posix = Path(candidate).as_posix()
             if posix in exempt or posix in generated:
                 continue
-            if not (repo / candidate).exists():
+            path = repo / candidate
+            if not path.exists():
                 findings.append((posix, CARD_CONTRACT_INPUT_MISSING))
+                continue
+            if path.is_dir() and not path.is_symlink():
                 continue
             if tracked and posix not in tracked:
                 prefix = posix + "/"
                 if not any(entry.startswith(prefix) for entry in tracked):
                     findings.append((posix, WORKER_WORKTREE_ABSENT))
     return tuple(findings)
-
-
-# The suffixes a validation-command token may name as an INPUT file. Restated
-# from ``worker_workspace._VALIDATION_FILE_SUFFIXES``; a token with any other
-# suffix (or none) is a selector, an option value or a directory and is never
-# treated as a missing input.
-_VALIDATION_INPUT_SUFFIXES = frozenset(
-    {
-        ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".ini", ".js", ".json",
-        ".mjs", ".py", ".sh", ".toml", ".ts", ".yaml", ".yml",
-    }
-)
 
 
 def declared_compiler_outputs(command: str) -> frozenset[str]:
