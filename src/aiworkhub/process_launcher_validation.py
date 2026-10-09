@@ -29,6 +29,173 @@ CombinedWorkspaceFactory = Callable[..., tuple[WorkerWorkspace, dict[str, Any]]]
 _VALIDATION_REPLAY_LOCK = Lock()
 _VALIDATION_REPLAYS_IN_FLIGHT: set[tuple[str, str, str]] = set()
 
+# --- NF-2026-01030: the manager-authorized host validation lane -------------
+#
+# A candidate whose declared validations fail only because the Windows
+# AppContainer validation lane cannot do something (symlink WinError 1314,
+# SemLock/fork-pool multiprocessing, dedicated-subprocess builds) terminalizes
+# as ``validation_failed``/``finalize_failed`` and nothing the hub measures can
+# move it: ``validation_runner.row_restriction`` deliberately refuses to
+# attribute an in-test failure to the environment.  The remedy is therefore a
+# MEASUREMENT in another lane -- never a classification of candidate stdout --
+# so a manager opts ONE exact request in and the same declared commands, the
+# same toolchain receipt and the same gates run again with the validation route
+# forced to the host backend.
+MANAGER_HOST_VALIDATION_LANE = "manager_host"
+# ``""`` is today's behaviour, byte for byte. Any other value is refused by name.
+VALIDATION_LANES: tuple[str, ...] = ("", MANAGER_HOST_VALIDATION_LANE)
+# The one existing no-sandbox backend token: ``_sandbox_backend_for_adapter``
+# already returns it for the editor-hosted routes and ``run_validations``
+# already executes the card's exact shell-free argv under it.  Reused rather
+# than restated, so this lane adds no second validation runner.
+HOST_VALIDATION_LANE_BACKEND = _worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND
+HOST_LANE_SEAL_UNVERIFIED = "host_lane_candidate_seal_unverified"
+# The only states whose retained candidate is still the review surface, so the
+# only ones a host-lane re-measurement can speak about.
+HOST_LANE_RETRYABLE_STATES = frozenset({"validation_failed", "finalize_failed"})
+PRIOR_LANE_FAILURE_SCHEMA_ID = "aiworkhub.prior_validation_lane_failure.v1"
+
+
+def normalized_validation_lane(value: Any) -> str:
+    """Return the empty default or the host lane; refuse any other by name."""
+    lane = str(value or "").strip()
+    if lane not in VALIDATION_LANES:
+        raise WorkspaceError(f"validation_lane_unsupported:{lane[:120]}")
+    return lane
+
+
+def is_manager_host_lane(metadata: Mapping[str, Any]) -> bool:
+    """Whether this exact request or route is recorded in the host lane."""
+    return (
+        normalized_validation_lane(metadata.get("validation_lane"))
+        == MANAGER_HOST_VALIDATION_LANE
+    )
+
+
+def prior_lane_failure_digest(
+    rows: Iterable[Mapping[str, Any]], *, backend: str
+) -> str:
+    """Digest exactly the failing rows of the lane this retry is leaving."""
+    payload = {
+        "schema_id": PRIOR_LANE_FAILURE_SCHEMA_ID,
+        "backend": str(backend or ""),
+        "rows": [
+            {
+                "command": str(row.get("command") or ""),
+                "returncode": row.get("returncode"),
+                "timed_out": bool(row.get("timed_out")),
+                "restriction": str(row.get("restriction") or ""),
+                "execution_boundary": str(row.get("execution_boundary") or ""),
+            }
+            for row in rows
+            if isinstance(row, Mapping)
+            and (row.get("timed_out") or row.get("returncode") not in (0, None))
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def host_lane_receipt_stamp(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """The lane fields every host-lane receipt row and event must carry.
+
+    ``{}`` for a request without the opt-in, so a receipt row, a lifecycle
+    event and a route produced outside the host lane stay byte-identical.
+    """
+    if not is_manager_host_lane(metadata):
+        return {}
+    return {
+        "validation_lane": MANAGER_HOST_VALIDATION_LANE,
+        "prior_validation_lane": str(metadata.get("prior_validation_lane") or ""),
+        "prior_lane_failure_digest": str(
+            metadata.get("prior_lane_failure_digest") or ""
+        ),
+    }
+
+
+def host_lane_request_metadata(
+    latest_event: Mapping[str, Any], metadata: Mapping[str, Any]
+) -> dict[str, Any]:
+    """The lane facts persisted on the request before finalization re-runs."""
+    prior_backend = str(
+        latest_event.get("sandbox_backend") or metadata.get("sandbox_backend") or ""
+    )
+    rows = latest_event.get("validation")
+    return {
+        "validation_lane": MANAGER_HOST_VALIDATION_LANE,
+        "prior_validation_lane": prior_backend,
+        "prior_lane_failure_digest": prior_lane_failure_digest(
+            rows if isinstance(rows, list) else (), backend=prior_backend
+        ),
+    }
+
+
+def retained_candidate_seal(
+    card: Mapping[str, Any], request_id: str
+) -> dict[str, Any]:
+    """The seal THIS request recorded at terminalization, or ``{}``.
+
+    ``retained_candidate_seal_evidence`` publishes it inside the terminal
+    envelope the card carries -- ``terminal_review`` for a review-visible
+    failure, ``terminal_failure`` otherwise.  The request identity is matched
+    so a newer attempt's seal can never authorize an older one.
+    """
+    for key in ("terminal_review", "terminal_failure"):
+        envelope = card.get(key)
+        if not isinstance(envelope, Mapping):
+            continue
+        evidence = envelope.get("evidence")
+        if not isinstance(evidence, Mapping):
+            continue
+        identity = evidence.get("request_identity")
+        identity = identity if isinstance(identity, Mapping) else {}
+        if request_id and request_id in {
+            str(evidence.get("request_id") or ""),
+            str(identity.get("request_id") or ""),
+        }:
+            return dict(evidence)
+    return {}
+
+
+def host_lane_seal_refusal(
+    seal: Mapping[str, Any],
+    observed_path_hashes: Callable[[list[str]], Mapping[str, str | None]],
+    current_changed_paths: Iterable[str],
+) -> str:
+    """Empty when the retained bytes still match the seal, else the reason.
+
+    Absent or incomplete evidence is never a pass: a request whose seal could
+    not be taken at terminalization is refused here by the same name as one
+    whose retained bytes have since drifted.  ``current_changed_paths`` is the
+    retained workspace's changed set as the caller's own enumerator reads it
+    NOW, and it is required rather than defaulted: a path that only started
+    differing AFTER the seal was taken is absent from the seal, so the per-path
+    comparison below could never see it and the host lane would re-measure
+    bytes the seal does not speak for.
+    """
+    sealed = seal.get("changed_path_hashes")
+    if not isinstance(sealed, Mapping) or not sealed:
+        return f"{HOST_LANE_SEAL_UNVERIFIED}:seal_missing"
+    paths = sorted(str(key) for key in sealed)
+    if any(not isinstance(sealed[path], str) or not sealed[path] for path in paths):
+        return f"{HOST_LANE_SEAL_UNVERIFIED}:seal_incomplete"
+    unsealed = sorted({str(path) for path in current_changed_paths} - set(paths))
+    if unsealed:
+        return (
+            f"{HOST_LANE_SEAL_UNVERIFIED}:unsealed_paths:" + ",".join(unsealed[:5])
+        )
+    observed = observed_path_hashes(paths)
+    drifted = [path for path in paths if observed.get(path) != sealed[path]]
+    if drifted:
+        return (
+            f"{HOST_LANE_SEAL_UNVERIFIED}:retained_bytes_changed:"
+            + ",".join(drifted[:5])
+        )
+    return ""
+
 
 def validation_route_kwargs(
     metadata: Mapping[str, Any],
@@ -38,10 +205,26 @@ def validation_route_kwargs(
     adapter_id = str(metadata.get("adapter_id") or "").strip()
     if not adapter_id:
         raise WorkspaceError("validation_route_adapter_missing")
-    expected_backend = sandbox_backend_for_adapter(adapter_id)
     recorded_backend = str(metadata.get("sandbox_backend") or "").strip()
     execution_mode = str(metadata.get("execution_mode") or "").strip()
-    route: dict[str, Any] = {"backend": expected_backend, "adapter_id": adapter_id}
+    route: dict[str, Any]
+    if is_manager_host_lane(metadata):
+        # NF-2026-01030: the manager authorized THIS request's rerun in the
+        # host lane, so the launch-bound backend is history rather than drift
+        # -- and the sandbox backend is not resolved at all, because the lane
+        # exists precisely for hosts where resolving it is the problem.
+        # ``worker_workspace.run_validations`` still owns which adapters may
+        # execute under this token and refuses the rest by name: the lane
+        # forces the route, it never widens that boundary.
+        route = {
+            "backend": HOST_VALIDATION_LANE_BACKEND,
+            "adapter_id": adapter_id,
+        }
+        if execution_mode == "validation_only_replay":
+            route["outer_validation_authority"] = True
+        return route
+    expected_backend = sandbox_backend_for_adapter(adapter_id)
+    route = {"backend": expected_backend, "adapter_id": adapter_id}
     if execution_mode == "validation_only_replay":
         if recorded_backend and recorded_backend not in {
             expected_backend,
@@ -296,12 +479,18 @@ def run_declared_validations(
     except ValueError as exc:
         raise WorkspaceError(str(exc)) from exc
 
+    # NF-2026-01030: the lane that produced a row travels ON the row, so the
+    # manager reads a measurement rather than inferring one.  Empty outside
+    # the host lane, which keeps every existing receipt row unchanged.
+    lane_stamp = host_lane_receipt_stamp(route_metadata)
+
     def with_roles(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
         materialized = [dict(row) for row in rows]
         if len(materialized) != len(roles):
             raise WorkspaceError("validation_receipt_count_mismatch")
         for row, role in zip(materialized, roles, strict=True):
             row["behavioral_role"] = role
+            row.update(lane_stamp)
         return materialized
 
     route = route_resolver(route_metadata)

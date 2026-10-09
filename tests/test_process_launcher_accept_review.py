@@ -1474,3 +1474,42 @@ def test_the_supplemental_rounds_sighted_report_makes_the_candidate_acceptable(
     assert "supplemental_inspection" not in result
     assert manager.reviewer_launches == []
     assert manager.implementation_relaunches == 0
+
+
+def test_accept_time_revalidation_uses_the_lane_recorded_on_the_latest_event(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """NF-2026-01030: accept_review revalidates in the request's OWN lane.
+
+    Every ``_run_declared_validations`` call in the moved body passes the
+    latest lifecycle event as the validation route metadata, and the finalizer
+    stamps the recorded lane onto that event.  So a manager-host request's
+    accept-time rerun resolves the host backend, while every other request
+    keeps the adapter sandbox backend it launched under -- unchanged.
+    """
+    calls = [
+        node
+        for node in ast.walk(_moved_function_node())
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_run_declared_validations"
+    ]
+    assert calls, "accept_review no longer revalidates the candidate"
+    assert all(
+        len(call.args) == 3
+        and isinstance(call.args[2], ast.Name)
+        and call.args[2].id == "latest"
+        for call in calls
+    )
+
+    launcher_validation = process_launcher._launcher_validation
+    monkeypatch.setattr(process_launcher, "select_sandbox_backend", lambda: "landlock")
+    sandbox_event = {"adapter_id": "claude_cli", "sandbox_backend": "landlock"}
+    host_event = {**sandbox_event, "validation_lane": "manager_host"}
+
+    assert process_launcher._validation_route_kwargs(sandbox_event)["backend"] == (
+        "landlock"
+    )
+    assert process_launcher._validation_route_kwargs(host_event)["backend"] == (
+        launcher_validation.HOST_VALIDATION_LANE_BACKEND
+    )

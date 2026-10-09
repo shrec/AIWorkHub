@@ -4391,6 +4391,7 @@ def aiworkhub_agent_cancel_task(
 def aiworkhub_agent_retry_finalization(
     request_id: str,
     task_id: str,
+    validation_lane: Literal["", "manager_host"] = "",
 ) -> dict[str, Any]:
     """COORDINATOR/WRITE-GATED: retry one retained finalization request.
 
@@ -4402,11 +4403,21 @@ def aiworkhub_agent_retry_finalization(
     product/test failures remain non-retryable. A ``scope_rejected`` request is
     eligible: the re-run repeats the scope check and reaches review_ready only
     if the retained delta is now in scope (NF-2026-01345).
+
+    ``validation_lane="manager_host"`` is the manager's explicit opt-in for a
+    candidate whose declared validations failed only because the sandbox
+    validation lane cannot execute them (NF-2026-01030). It makes any
+    ``validation_failed``/``finalize_failed`` request whose retained candidate
+    seal still verifies retryable, and re-runs the SAME declared commands with
+    the validation route forced to the host backend. All pass -> the normal
+    finalize path to review_ready; any failure -> ``validation_failed`` again,
+    now with host receipts. The lane is never derived from candidate output.
     """
 
     return process_launcher.default_manager().retry_finalization(
         request_id,
         task_id,
+        validation_lane=validation_lane,
     )
 
 

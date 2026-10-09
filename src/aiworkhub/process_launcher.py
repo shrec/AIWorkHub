@@ -12289,6 +12289,10 @@ class ProcessManager:
                     "evidence_and_transition": evidence_transition_duration_ms,
                 },
                 "cleanup_error": cleanup_error,
+                # NF-2026-01030: the lane this finalization measured in, plus
+                # the digest of the lane it left, travel on the finalization
+                # receipt -- and empty for every request without the opt-in.
+                **_launcher_validation.host_lane_receipt_stamp(metadata),
             }, disposition=(
                 "removed" if cleanup and not cleanup_error
                 else "retained_in_place"
@@ -13254,8 +13258,53 @@ class ProcessManager:
             }
         return {"ok": True, "request_id": request_id, "state": event["state"]}
 
-    def retry_finalization(self, request_id: str, task_id: str) -> dict[str, Any]:
-        """Retry retained deterministic finalization without a provider call."""
+    def _host_lane_seal_refusal(
+        self, task_id: str, request_id: str, workspace: WorkerWorkspace
+    ) -> str:
+        """NF-2026-01030: name why these retained bytes cannot be re-measured."""
+
+        def observed(paths: list[str]) -> dict[str, str | None]:
+            try:
+                return dict(_changed_path_hashes(workspace, paths))
+            except OSError:
+                return {}  # unreadable candidate bytes refuse, never pass
+
+        try:
+            card = _parse_card(self._show_task(task_id), task_id)
+        except Exception as exc:  # noqa: BLE001 - an unreadable card IS the refusal
+            return (
+                f"{_launcher_validation.HOST_LANE_SEAL_UNVERIFIED}:card_unreadable:"
+                + type(exc).__name__
+            )
+        try:
+            # The seal names only the paths that were already changed when it
+            # was taken, so the retained worktree's CURRENT changed set is read
+            # here with the same enumerator finalization uses for this
+            # workspace; an unreadable set refuses, never passes.
+            current_changed = changed_allowed_write_paths(workspace)
+        except (OSError, WorkspaceError) as exc:
+            return (
+                f"{_launcher_validation.HOST_LANE_SEAL_UNVERIFIED}"
+                f":changed_paths_unreadable:{type(exc).__name__}"
+            )
+        return _launcher_validation.host_lane_seal_refusal(
+            _launcher_validation.retained_candidate_seal(card, request_id),
+            observed,
+            current_changed,
+        )
+
+    def retry_finalization(
+        self, request_id: str, task_id: str, *, validation_lane: str = ""
+    ) -> dict[str, Any]:
+        """Retry retained deterministic finalization without a provider call.
+
+        ``validation_lane`` is the manager's explicit opt-in. Empty keeps
+        today's behaviour byte for byte; ``"manager_host"`` additionally makes
+        a ``validation_failed``/``finalize_failed`` request with a verifying
+        candidate seal retryable and forces the declared validations into the
+        host lane, so an environment-only sandbox failure is settled by
+        measurement rather than by reading candidate output (NF-2026-01030).
+        """
         if not core.writes_allowed():
             return {
                 "ok": False,
@@ -13263,6 +13312,16 @@ class ProcessManager:
                 "task_id": task_id,
                 "error": "write_gate_closed",
             }
+        try:
+            lane = _launcher_validation.normalized_validation_lane(validation_lane)
+        except WorkspaceError as exc:
+            return {
+                "ok": False,
+                "request_id": request_id,
+                "task_id": task_id,
+                "error": str(exc)[:200],
+            }
+        host_lane = lane == _launcher_validation.MANAGER_HOST_VALIDATION_LANE
         with self._request_lock(request_id):
             events = self._request_events(request_id)
             if not events:
@@ -13297,11 +13356,20 @@ class ProcessManager:
             # check now passes, else it ends scope_rejected again with the
             # current violation (NF-2026-01345).
             retryable_scope_rejection = latest_state == "scope_rejected"
+            # NF-2026-01030: the manager's host-lane opt-in widens retry to any
+            # validation_failed/finalize_failed reason -- the rerun MEASURES
+            # the candidate in another lane rather than reclassifying this
+            # one's output, so no error text is consulted.
+            retryable_host_lane = (
+                host_lane
+                and latest_state in _launcher_validation.HOST_LANE_RETRYABLE_STATES
+            )
             if (
                 latest_state != "finalize_failed"
                 and not retryable_validation_failure
                 and not retryable_release_pending
                 and not retryable_scope_rejection
+                and not retryable_host_lane
             ):
                 return {
                     "ok": False,
@@ -13391,6 +13459,22 @@ class ProcessManager:
                     "task_id": task_id,
                     "error": "finalization_retry_worker_not_successful",
                 }
+            if host_lane:
+                # The host lane re-measures the EXACT bytes the sandbox lane
+                # terminalized on, so that seal is verified against the
+                # retained worktree here -- before any transition -- and a
+                # drifted or unsealable candidate is refused by name with its
+                # state unchanged (NF-2026-01030).
+                seal_refusal = self._host_lane_seal_refusal(
+                    task_id, request_id, workspace
+                )
+                if seal_refusal:
+                    return {
+                        "ok": False,
+                        "request_id": request_id,
+                        "task_id": task_id,
+                        "error": seal_refusal,
+                    }
             # NF-2026-01349: a receipt that only drifted (widened request identity,
             # moved PATH/registry/executable) is re-minted by the same host preflight
             # launch ran; a tampered receipt is refused before any transition.
@@ -13428,11 +13512,17 @@ class ProcessManager:
                             )
                         )[:500],
                     }
+            if host_lane:
+                metadata.update(
+                    _launcher_validation.host_lane_request_metadata(latest, metadata)
+                )
             if refreshed_receipt is not None:
                 metadata[_toolchain_authority.RECEIPT_CARD_KEY] = refreshed_receipt
+            if refreshed_receipt is not None or host_lane:
                 write_json_0600(metadata_path, metadata)
             self._append_event({
                 **self._event_identity(events),
+                **_launcher_validation.host_lane_receipt_stamp(metadata),
                 "request_id": request_id,
                 "task_id": task_id,
                 "runner": runner,

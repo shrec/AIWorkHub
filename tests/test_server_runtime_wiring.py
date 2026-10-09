@@ -87,10 +87,11 @@ class _FakeManager:
         self.calls.append(("cancel", {"request_id": request_id, "reason": reason}))
         return {"ok": True, "request_id": request_id, "state": "cancelled"}
 
-    def retry_finalization(self, request_id, task_id):
+    def retry_finalization(self, request_id, task_id, *, validation_lane=""):
         self.calls.append(("retry_finalization", {
             "request_id": request_id,
             "task_id": task_id,
+            "validation_lane": validation_lane,
         }))
         return {
             "ok": True,
@@ -98,6 +99,7 @@ class _FakeManager:
             "task_id": task_id,
             "state": "review_ready",
             "provider_relaunched": False,
+            "validation_lane": validation_lane,
         }
 
     def list_processes(self, limit):
@@ -130,6 +132,27 @@ def test_runtime_tools_delegate_to_single_manager(monkeypatch):
         "cancel",
         "retry_finalization",
         "list",
+    ]
+    # NF-2026-01030: the default call still asks for no lane at all.
+    assert fake.calls[4][1]["validation_lane"] == ""
+
+
+def test_server_retry_finalization_passes_the_manager_host_lane_through(monkeypatch):
+    """NF-2026-01030: the opt-in reaches the manager verbatim, nothing derives it."""
+    fake = _FakeManager()
+    monkeypatch.setattr(process_launcher, "default_manager", lambda: fake)
+
+    result = server.aiworkhub_agent_retry_finalization(
+        "r1", "T1", validation_lane="manager_host"
+    )
+
+    assert result["validation_lane"] == "manager_host"
+    assert fake.calls == [
+        ("retry_finalization", {
+            "request_id": "r1",
+            "task_id": "T1",
+            "validation_lane": "manager_host",
+        }),
     ]
 
 
