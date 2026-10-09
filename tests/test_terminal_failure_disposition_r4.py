@@ -291,16 +291,13 @@ def test_route_seal_fires_on_the_real_nested_codex_shape(tmp_path):
     assert sealed["http_status"] == 400
 
 
-def test_route_seal_still_requires_the_message_to_name_this_launchs_model():
+def test_route_seal_still_requires_the_message_to_name_this_launchs_model(tmp_path):
     """The anti-forgery anchor survives the unwrapping."""
-    log = Path(__file__).parent / "__r4_anchor.log"
-    try:
-        log.write_text(CODEX_MODEL_REJECTION, encoding="utf-8")
-        assert process_launcher._provider_model_rejection_from_output(
-            log, "gpt-5.6-terra"
-        ) is None
-    finally:
-        log.unlink(missing_ok=True)
+    log = tmp_path / "anchor.log"
+    log.write_text(CODEX_MODEL_REJECTION, encoding="utf-8")
+    assert process_launcher._provider_model_rejection_from_output(
+        log, "gpt-5.6-terra"
+    ) is None
 
 
 def test_capacity_failure_is_not_a_route_seal(tmp_path):

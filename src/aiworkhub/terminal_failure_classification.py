@@ -1682,6 +1682,10 @@ PROVIDER_CODE_DISPOSITION: dict[str, str] = {
     "model_not_supported": FAILURE_CLASS_TRANSIENT,
     "model_not_available": FAILURE_CLASS_TRANSIENT,
     "unknown_model": FAILURE_CLASS_TRANSIENT,
+    # Claude's own per-response output-token cap: the request this route
+    # received cannot be served as shaped, same as the route itself being
+    # unusable for this account.
+    "max_output_tokens": FAILURE_CLASS_TRANSIENT,
     # provider-side load
     "overloaded_error": FAILURE_CLASS_TRANSIENT,
     "rate_limit_error": FAILURE_CLASS_TRANSIENT,
@@ -2089,6 +2093,19 @@ def _harvest_provider_event(event: object, found: dict[str, Any], depth: int = 0
         data = body.get("data")
         if not message and isinstance(data, dict) and isinstance(data.get("message"), str):
             message = data["message"]
+    if not code and kind == "result" and event.get("is_error") is True:
+        # The Claude CLI's own fixed sentence for its per-response
+        # output-token cap -- CLI-minted, not model prose, and read only
+        # from the ``result`` envelope's own ``result`` field, never from
+        # message content, so it cannot be forged the way
+        # ``test_worker_prose_cannot_forge_a_route_failure`` forbids.
+        result_text = event.get("result")
+        if (
+            isinstance(result_text, str)
+            and result_text.startswith("API Error: Claude's response exceeded the ")
+            and " output token maximum" in result_text
+        ):
+            code = "max_output_tokens"
     if code and not found["code"] and code in PROVIDER_CODE_DISPOSITION:
         # The KEY object is stored, never the parsed argument, so no provider
         # byte can reach a durable field through this path.
@@ -2745,6 +2762,7 @@ _PROVIDER_CODE_CAUSE: dict[str, str] = {
     "model_not_supported": CAUSE_PROVIDER_TRANSIENT,
     "model_not_available": CAUSE_PROVIDER_TRANSIENT,
     "unknown_model": CAUSE_PROVIDER_TRANSIENT,
+    "max_output_tokens": CAUSE_PROVIDER_TRANSIENT,
     "overloaded_error": CAUSE_PROVIDER_CAPACITY,
     "rate_limit_error": CAUSE_PROVIDER_CAPACITY,
     "authentication_failed": CAUSE_PROVIDER_CREDENTIAL,
