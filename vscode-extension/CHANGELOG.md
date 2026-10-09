@@ -1,5 +1,24 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.41 — 2026-10-09
+
+### Fixed
+
+- Bundled MCP runtime: `workforce_rank` and `environment_preflight` decide route-contract tool capabilities from one vocabulary, so a catalog spelling can no longer make rank and preflight disagree (NF-2026-00731).
+- Bundled MCP runtime: `retry_finalization` re-measures a candidate in the host lane when its validations fail only because the AppContainer lane cannot execute them, instead of stranding a correct candidate (NF-2026-01030).
+- Bundled MCP runtime: file enumeration honours `.gitignore`; ignored paths are excluded and dropped on refresh, while force-added tracked files stay indexed (NF-2026-01393).
+- Bundled MCP runtime: a rework that reproduces a `validation_failed` predecessor byte for byte with passing validation is accepted as the recovery instead of being refused as `rework_no_delta` (NF-2026-01405).
+- Bundled MCP runtime: a ctest row that found no tests is a failure, never a pass (NF-2026-01338).
+- Bundled MCP runtime: mined procedure steps are cut to the registry's byte bound instead of the whole proposal being refused for one long step (NF-2026-01432).
+- Bundled MCP runtime: a `template_unclassified` refusal names the closest template, the differing field and the audited escape (NF-2026-01441).
+- Bundled MCP runtime: deleted lines no canonical symbol owns are reviewed under the module target in indexed files instead of raising a permanent `deleted-symbols-unresolved` unknown (NF-2026-01437).
+- Bundled MCP runtime: a Claude per-response output-token cap is a transient provider failure that retries instead of blocking the card (NF-2026-01439).
+- Bundled MCP runtime: a card held for a transient retry is relaunched exactly once after its `retry_not_before`, instead of waiting for a manual retry (NF-2026-01438).
+
+### Qualification
+
+- Independent component regressions pass; installation, activation and live qualification are separate evidence.
+
 ## 0.12.40 — 2026-10-09
 
 ### Fixed

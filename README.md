@@ -62,6 +62,19 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.41
+
+- Rank and preflight agree on which workers can run a card (NF-2026-00731).
+- A correct candidate whose tests only fail inside the sandbox can be re-measured on the host instead of being stranded (NF-2026-01030).
+- Source Graph skips `.gitignore`d files (NF-2026-01393).
+- A rework that reproduces a sandbox-failed attempt with passing tests is accepted instead of refused (NF-2026-01405).
+- `ctest` with no tests found fails validation (NF-2026-01338).
+- One long lesson no longer costs a whole mined skill proposal (NF-2026-01432).
+- Task-creation refusals say which template was closest and what differs (NF-2026-01441).
+- Deleting blank lines or imports no longer blocks review with an unresolved-deletion unknown (NF-2026-01437).
+- Hitting Claude's output-token cap retries automatically (NF-2026-01439).
+- Transient-retry cards relaunch on their own when their wait expires (NF-2026-01438).
+
 ## What's new in 0.12.40
 
 - A sent-back card whose first attempt started from promoted-but-uncommitted files relaunches cleanly instead of failing with a false `rework_base_drift` (NF-2026-01431).
