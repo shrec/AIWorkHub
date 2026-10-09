@@ -819,3 +819,180 @@ def reconcile_after_accept(repo_root: Path | str, accepted_task_id: str, launch:
 
 def reconcile_startup(repo_root: Path | str, launch: LaunchFn, *, capacity: int | None = None) -> dict[str, Any]:
     return reconcile(repo_root, trigger_task_id="startup", launch=launch, capacity=capacity)
+
+
+def _transient_retry_state(card: Mapping[str, Any]) -> tuple[int, int] | None:
+    """Return ``(attempts, budget)`` for a card still inside its retry budget.
+
+    ``None`` for a card with no ``transient_retry`` record, an unparsable one,
+    or one whose stored ``attempts`` already exceeds its own ``budget`` --
+    none of those are a candidate for this relaunch.  Exhaustion itself is
+    handled entirely by ``task_store.mark_transient_retry`` refusing a further
+    attempt and the ordinary terminal path blocking the card; this is a
+    second, independent fail-closed check against a corrupted or hand-edited
+    record.
+    """
+    transient = card.get("transient_retry")
+    if not isinstance(transient, Mapping):
+        return None
+    try:
+        attempts = int(transient.get("attempts") or 0)
+        budget = int(transient.get("budget") or 0)
+    except (TypeError, ValueError):
+        return None
+    if attempts <= 0 or attempts > budget:
+        return None
+    return attempts, budget
+
+
+def _transient_retry_request_id(task_id: str, attempts: int) -> str:
+    return f"transient-retry-autolaunch:{task_id}:{attempts}"
+
+
+def reconcile_transient_due(
+    repo_root: Path | str,
+    *,
+    launch: LaunchFn,
+    capacity: int | None = None,
+) -> dict[str, Any]:
+    """Relaunch pending/unclaimed cards whose transient-retry backoff elapsed.
+
+    ``task_store.mark_transient_retry`` returns a card that failed on a
+    transient provider error to pending/unclaimed with ``card.transient_retry``
+    and ``retry_not_before`` set, but nothing relaunches it: ``reconcile``
+    above only fires for cards with ``depends_on``, at accept/startup. This is
+    the periodic-scan counterpart, run on every pass: it selects every
+    pending/unclaimed card still inside its own finite transient_retry budget
+    whose backoff (``core._transient_retry_backoff_active``) has elapsed, and
+    launches each through the identical ``launch`` callable and the same hold
+    bookkeeping (``_hold_for``/``_record_denial``/``_clear_hold``) ``reconcile``
+    uses -- so a concurrent duplicate attempt loses the race on the same
+    canonical ``claim_start_exact`` compare-and-update, never twice for one
+    attempt.
+
+    A card whose ``depends_on`` is not yet fully finished is left to
+    ``reconcile`` instead, which already understands a missing, failed, or
+    still-waiting dependency; this function never guesses at that state.
+    """
+    from . import core
+
+    root = Path(repo_root)
+    db = _repo_db(root)
+    outcome: dict[str, Any] = {
+        "ok": True,
+        "schema_id": SCHEMA_ID,
+        "repo_root": str(root),
+        "launched": [],
+        "delayed": [],
+        "skipped": [],
+    }
+    if not db.exists():
+        outcome["ok"] = False
+        outcome["error"] = "task_db_missing"
+        return outcome
+
+    with _write_connection(db) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        callback_store.init_db(conn)
+        _ensure_holds_table(conn)
+        conn.commit()
+        rows = _read_rows(conn)
+
+    now = _now()
+    launched_count = 0
+    for child in sorted(rows.values(), key=lambda r: r.task_id):
+        state = _transient_retry_state(child.card)
+        if state is None:
+            continue
+        attempts, _budget = state
+        if _state(child) != "pending" or child.worker_status.strip().lower() not in ACTIVE_WORKER_STATUSES:
+            continue
+        if core._transient_retry_backoff_active(child.card, now):
+            outcome["delayed"].append(
+                {
+                    "task_id": child.task_id,
+                    "reason": "transient_retry_not_due",
+                    "retry_not_before": str(child.card.get("retry_not_before") or ""),
+                }
+            )
+            continue
+        deps = _depends_on(child.card)
+        if deps:
+            dep_rows = [rows.get(dep) for dep in deps]
+            unmet = [
+                dep for dep, dep_row in zip(deps, dep_rows)
+                if dep_row is None or _state(dep_row) != "success"
+            ]
+            if unmet:
+                outcome["skipped"].append(
+                    {
+                        "task_id": child.task_id,
+                        "reason": "unmet_depends_on_owned_by_reconcile",
+                        "dependencies": unmet,
+                    }
+                )
+                continue
+        conn = _read_connection(db)
+        try:
+            hold = _hold_for(conn, child.task_id)
+        finally:
+            conn.close()
+        if hold is not None:
+            if child.updated_at and child.updated_at > hold["card_updated_at"]:
+                with _write_connection(db) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    _clear_hold(conn, child.task_id)
+                    conn.commit()
+            elif hold["kind"] == "deterministic":
+                outcome["skipped"].append(
+                    {
+                        "task_id": child.task_id,
+                        "reason": "deterministic_denial_hold:" + hold["reason"][:120],
+                    }
+                )
+                continue
+            elif hold["next_attempt_at"] > _now():
+                outcome["delayed"].append(
+                    {
+                        "task_id": child.task_id,
+                        "reason": "transient_backoff_hold",
+                        "next_attempt_at": hold["next_attempt_at"],
+                    }
+                )
+                continue
+        if capacity is not None and launched_count >= capacity:
+            outcome["delayed"].append({"task_id": child.task_id, "reason": "capacity"})
+            continue
+        request_id = _transient_retry_request_id(child.task_id, attempts)
+        result = dict(launch(child.task_id, child.runner, child.topic, request_id))
+        if result.get("ok"):
+            launched_count += 1
+            with _write_connection(db) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                _clear_hold(conn, child.task_id)
+                conn.commit()
+            outcome["launched"].append(
+                {
+                    "task_id": child.task_id,
+                    "runner": child.runner,
+                    "topic": child.topic,
+                    "attempts": attempts,
+                }
+            )
+        else:
+            denial = str(result.get("stderr") or result.get("error") or "")
+            with _write_connection(db) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                hold_state = _record_denial(conn, child, denial)
+                conn.commit()
+            outcome["delayed"].append(
+                {
+                    "task_id": child.task_id,
+                    "reason": "launch_not_claimed",
+                    "stderr": denial[:240],
+                    "denial_kind": hold_state["kind"],
+                    "attempts": hold_state["attempts"],
+                    "next_attempt_at": hold_state["next_attempt_at"],
+                }
+            )
+    return outcome

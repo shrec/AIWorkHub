@@ -15,7 +15,10 @@ only repeatedly drives the EXISTING
 path (scope validation, validation commands, promotion, ``taskctl review``
 for a clean exit; review/blocked routing with a normalized outcome for
 lost/timed-out/cancelled/failed work -- never pending, never automatic
-retry/relaunch) on a bounded scan interval, from a process that survives
+retry/relaunch, with one named exception: a card still inside its own
+finite ``task_store.mark_transient_retry`` budget is relaunched by
+``dependency_autolaunch.reconcile_transient_due`` once its backoff elapses)
+on a bounded scan interval, from a process that survives
 every MCP/VS Code/launcher restart. A single-instance advisory lock keeps
 one reconciler running per repo; the reconciliation work itself is already
 interprocess-safe via ``ProcessManager._registry_lock`` (flock), so a
@@ -42,6 +45,7 @@ from pathlib import Path
 from typing import Any
 
 from . import core
+from . import dependency_autolaunch
 from . import process_launcher
 from . import review_lifecycle
 from . import review_orchestrator
@@ -540,6 +544,10 @@ def run_scan(
     wave_goal_bindings = _scan_wave_goal_bindings(Path(mgr.repo).resolve())
     # After binding repair, so completion is decided on current goal pointers.
     wave_completion = _scan_wave_completion(Path(mgr.repo).resolve())
+    # The one named exception to "never automatic retry/relaunch": a card
+    # still inside its own finite transient_retry budget, relaunched through
+    # the same claim_start_exact compare-and-update reconcile_startup uses.
+    transient_retry_relaunch = _scan_transient_retry_relaunch(Path(mgr.repo).resolve())
     # Sequential by design, not fanned out across cores: the SDLC case store is
     # a single-writer SQLite file and the pass is bounded per scan, so parallel
     # writers would only contend for the same write lock.
@@ -560,6 +568,7 @@ def run_scan(
         "review_recovery": review_recovery,
         "wave_goal_bindings": wave_goal_bindings,
         "wave_completion": wave_completion,
+        "transient_retry_relaunch": transient_retry_relaunch,
         "sdlc_sync": sdlc,
     }
 
@@ -842,6 +851,32 @@ def _scan_wave_completion(repo: Path) -> dict[str, Any]:
         count_key="active",
         failure_state="unknown",
     )
+
+
+# A relaunch competes with worker finalization for the same scan pass, so the
+# budget stays well under the review drain's own ceiling (REVIEW_DRAIN_MAX_
+# ACTIONS=6): this is the rare path -- a provider failed transiently inside
+# its own card's finite budget -- not the common one.
+TRANSIENT_RETRY_RELAUNCH_CAPACITY = 4
+
+
+def _scan_transient_retry_relaunch(repo: Path) -> dict[str, Any]:
+    """Relaunch pending/unclaimed cards whose transient-retry backoff elapsed.
+
+    The named exception to "never automatic retry/relaunch" in the module
+    docstring: a card ``task_store.mark_transient_retry`` returned to pending
+    inside its own finite budget is relaunched here, through the identical
+    ``claim_start_exact`` compare-and-update ``reconcile_startup`` uses, never
+    before ``retry_not_before`` and never past its budget. A failure here is
+    isolated exactly like every other pass: recorded, and never blocking
+    worker finalization.
+    """
+    try:
+        return dependency_autolaunch.reconcile_transient_due(
+            repo, launch=core.claim_start_exact, capacity=TRANSIENT_RETRY_RELAUNCH_CAPACITY,
+        )
+    except Exception as exc:  # noqa: BLE001 -- never block worker reconcile
+        return {"ok": False, "state": "skipped", "reason": f"{type(exc).__name__}"[:80]}
 
 
 class ReconcilerService:
