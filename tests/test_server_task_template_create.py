@@ -118,7 +118,7 @@ def test_unclassified_raw_task_create_fails_without_escape(
         work_kind="generic",
     )
     assert result["ok"] is False
-    assert result["stderr"] == "template_unclassified"
+    assert result["stderr"].startswith("template_unclassified:")
     escaped = server.aiworkhub_task_create(
         task_id="TASK_NF390_RAW_OK",
         title="Raw audited escape",

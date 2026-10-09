@@ -1759,7 +1759,7 @@ def test_create_task_empty_optional_fields_fail_closed(
     empty_first["read_first"] = []
     missing_first = _create_generic_python_task("TASK_NF390_EMPTY_FIRST", empty_first)
     assert missing_first["ok"] is False
-    assert missing_first["stderr"] == "template_unclassified"
+    assert missing_first["stderr"].startswith("template_unclassified:")
     empty_roles = _generic_python_card()
     expected_roles = list(empty_roles["validation_roles"])
     empty_roles["validation_roles"] = []

@@ -1904,7 +1904,10 @@ def classify_task_card(
         card_view["template_provenance"] = template_provenance
         if template_provenance.get("template_name") == CUSTOM_TEMPLATE_NAME:
             if custom_escape != AUDITED_CUSTOM_ESCAPE:
-                raise TaskTemplateError("custom_escape_invalid")
+                raise TaskTemplateError(
+                    f"custom_escape_invalid:custom_template_escape expected "
+                    f"{AUDITED_CUSTOM_ESCAPE!r}, got {custom_escape!r}"
+                )
             return validate_template_provenance(
                 dict(template_provenance), expanded_card=card_view
             )
@@ -1914,6 +1917,20 @@ def classify_task_card(
         if authenticated is None:
             raise TaskTemplateError("template_legacy_identity_invalid")
         return authenticated
+    closest_template: str | None = None
+    closest_field: str | None = None
+    closest_rank = -1
+    field_rank = {
+        "expand_error": 0,
+        "allowed_writes": 1,
+        "required_outputs": 2,
+        "validation": 3,
+        "read_only": 4,
+        "work_kind": 5,
+        "read_first": 6,
+        "validation_roles": 7,
+        "minimality_contract": 8,
+    }
     for name, reason in candidates:
         try:
             if name == CALLER_VALIDATION_TEMPLATE_NAME:
@@ -1928,6 +1945,9 @@ def classify_task_card(
                     mandatory_changed_outputs=outputs,
                 )
         except TaskTemplateError:
+            rank = field_rank["expand_error"]
+            if rank > closest_rank:
+                closest_template, closest_field, closest_rank = name, "expand_error", rank
             continue
         if (
             expanded["allowed_writes"] != writes
@@ -1935,6 +1955,18 @@ def classify_task_card(
             or expanded["validation"] != commands
             or expanded["read_only"] is not read_only
         ):
+            bad_field = (
+                "allowed_writes"
+                if expanded["allowed_writes"] != writes
+                else "required_outputs"
+                if expanded["required_outputs"] != outputs
+                else "validation"
+                if expanded["validation"] != commands
+                else "read_only"
+            )
+            rank = field_rank[bad_field]
+            if rank > closest_rank:
+                closest_template, closest_field, closest_rank = name, bad_field, rank
             continue
         if (
             name == CALLER_VALIDATION_TEMPLATE_NAME
@@ -1943,15 +1975,27 @@ def classify_task_card(
             # Launch re-expands this card and compares work_kind exactly, so a
             # non-canonical declared kind must not classify here and then fail
             # authentication later.
+            rank = field_rank["work_kind"]
+            if rank > closest_rank:
+                closest_template, closest_field, closest_rank = name, "work_kind", rank
             continue
         if first != list(expanded["read_first"]):
+            rank = field_rank["read_first"]
+            if rank > closest_rank:
+                closest_template, closest_field, closest_rank = name, "read_first", rank
             continue
         if roles != list(expanded["validation_roles"]):
+            rank = field_rank["validation_roles"]
+            if rank > closest_rank:
+                closest_template, closest_field, closest_rank = name, "validation_roles", rank
             continue
         if (
             minimality_contract is not None
             and minimality_contract != expanded.get("minimality_contract")
         ):
+            rank = field_rank["minimality_contract"]
+            if rank > closest_rank:
+                closest_template, closest_field, closest_rank = name, "minimality_contract", rank
             continue
         stored = dict(card_view)
         for field in (
@@ -1979,5 +2023,13 @@ def classify_task_card(
             )
         return _custom_escape_provenance(card_view)
     if escape:
-        raise TaskTemplateError("custom_escape_invalid")
-    raise TaskTemplateError("template_unclassified")
+        raise TaskTemplateError(
+            f"custom_escape_invalid:custom_template_escape expected "
+            f"{AUDITED_CUSTOM_ESCAPE!r}, got {escape!r}"
+        )
+    message = (
+        f"template_unclassified:no registered template matched; closest "
+        f"{closest_template}: {closest_field} differs; or pass "
+        f"custom_template_escape='audited_custom_unclassified'"
+    )
+    raise TaskTemplateError(message[:512])
