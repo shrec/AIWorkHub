@@ -830,6 +830,67 @@ def _canonical_json_hash(value: Any) -> str:
     ).hexdigest()
 
 
+def _manager_correction_shape(
+    correction: Any, sealed_paths: list[str], sealed_hashes: dict[str, Any]
+) -> tuple[dict[str, str] | None, str]:
+    """The corrected digests one receipt's ``manager_correction`` declares.
+
+    Returns ``({path: corrected_digest}, "")`` when the optional object is
+    well-formed and consistent with the SEALED candidate it was applied to, and
+    ``(None, reason)`` otherwise. Each touched path must be one the candidate
+    changed, its declared candidate digest must be the sealed candidate digest,
+    and the corrected digest must differ from it: an object that claims to have
+    corrected bytes nobody sealed, or to have changed nothing, is malformed
+    rather than merely unverified (NF-2026-01436).
+    """
+    if not isinstance(correction, dict):
+        return None, "accepted_outcome_receipt_manager_correction_malformed"
+    fields = {
+        "patch_sha256", "finding_ids", "paths",
+        "candidate_path_hashes", "corrected_path_hashes", "reason",
+    }
+    if set(correction) != fields:
+        return None, "accepted_outcome_receipt_manager_correction_malformed"
+    paths = correction.get("paths")
+    finding_ids = correction.get("finding_ids")
+    candidate = correction.get("candidate_path_hashes")
+    corrected = correction.get("corrected_path_hashes")
+    if (
+        not _is_hex_digest(correction.get("patch_sha256"))
+        or not isinstance(correction.get("reason"), str)
+        or not isinstance(finding_ids, list)
+        or not finding_ids
+        or any(not isinstance(value, str) or not value for value in finding_ids)
+        or finding_ids != sorted(set(finding_ids))
+        or not isinstance(paths, list)
+        or not paths
+        or any(not isinstance(value, str) or not value for value in paths)
+        or paths != sorted(set(paths))
+        or not isinstance(candidate, dict)
+        or not isinstance(corrected, dict)
+        or paths != sorted(candidate)
+        or paths != sorted(corrected)
+        or any(
+            not _is_hex_digest(candidate[relative])
+            or not _is_hex_digest(corrected[relative])
+            or candidate[relative] == corrected[relative]
+            or relative not in sealed_paths
+            or candidate[relative] != sealed_hashes.get(relative)
+            for relative in paths
+        )
+    ):
+        return None, "accepted_outcome_receipt_manager_correction_malformed"
+    return {relative: str(corrected[relative]) for relative in paths}, ""
+
+
+def _is_hex_digest(value: Any) -> bool:
+    """True when ``value`` is one bare or ``sha256:``-prefixed sha256 digest."""
+    if not isinstance(value, str):
+        return False
+    bare = value.removeprefix("sha256:")
+    return len(bare) == 64 and all(char in "0123456789abcdef" for char in bare)
+
+
 def _validate_accepted_outcome_receipt(
     repo: Path,
     card: dict[str, Any],
@@ -844,8 +905,12 @@ def _validate_accepted_outcome_receipt(
         "base_oid", "promoted_paths", "changed_path_hashes",
         "attempt_artifact_manifest_id", "repository_revision",
     }
+    # ``manager_correction`` is the one OPTIONAL field (NF-2026-01436). A
+    # receipt without it is validated exactly as before, down to the error
+    # string; a receipt with it must also carry a well-formed one.
+    optional = {"manager_correction"} & set(receipt)
     if (
-        set(receipt) != required
+        set(receipt) != required | optional
         or receipt.get("schema_id") != ACCEPTED_OUTCOME_RECEIPT_SCHEMA
     ):
         return None, "accepted_outcome_receipt_malformed"
@@ -883,6 +948,18 @@ def _validate_accepted_outcome_receipt(
     hashes = sealed.get("changed_path_hashes")
     manifest = sealed.get("attempt_artifact_manifest")
     workspace = sealed.get("workspace") or {}
+    if not isinstance(hashes, dict) or not isinstance(manifest, dict):
+        return None, "accepted_outcome_receipt_sealed_evidence_missing"
+    # Without a correction this IS the sealed candidate map, so every
+    # comparison below is byte-identical to the pre-NF-2026-01436 behaviour.
+    expected_hashes: dict[str, Any] = hashes
+    if optional:
+        corrected, correction_error = _manager_correction_shape(
+            receipt.get("manager_correction"), paths, hashes
+        )
+        if corrected is None:
+            return None, correction_error
+        expected_hashes = {**hashes, **corrected}
     expected = {
         "schema_id": ACCEPTED_OUTCOME_RECEIPT_SCHEMA,
         "task_id": task_id,
@@ -890,11 +967,9 @@ def _validate_accepted_outcome_receipt(
         "claim_epoch": int(card.get("claim_epoch") or 0),
         "base_oid": str(workspace.get("base_oid") or ""),
         "promoted_paths": paths,
-        "changed_path_hashes": hashes,
+        "changed_path_hashes": expected_hashes,
         "attempt_artifact_manifest_id": _canonical_json_hash(manifest),
     }
-    if not isinstance(hashes, dict) or not isinstance(manifest, dict):
-        return None, "accepted_outcome_receipt_sealed_evidence_missing"
     if any(receipt.get(key) != value for key, value in expected.items()):
         return None, "accepted_outcome_receipt_identity_mismatch"
     canonical_hashes: dict[str, str | None] = {}
@@ -904,7 +979,7 @@ def _validate_accepted_outcome_receipt(
             hashlib.sha256(path.read_bytes()).hexdigest()
             if path.is_file() and not path.is_symlink() else None
         )
-    if canonical_hashes != hashes:
+    if canonical_hashes != expected_hashes:
         return None, "accepted_outcome_receipt_canonical_hash_mismatch"
     revision = "sha256:" + _canonical_json_hash({
         "base_oid": expected["base_oid"], "changed_path_hashes": canonical_hashes,

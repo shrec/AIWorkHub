@@ -12,6 +12,9 @@ this function no longer calls -- silently, with the tests still green.
 
 from __future__ import annotations
 
+import fnmatch
+import hashlib
+import re
 from typing import TYPE_CHECKING, Any, Mapping
 
 from . import manager_skill_tools
@@ -23,12 +26,15 @@ if TYPE_CHECKING:  # names used only in annotations, which are never evaluated
 __all__ = [
     "ACCEPT_BLOCKER_KINDS",
     "ACCEPT_PREVIEW_SCHEMA_ID",
+    "MANAGER_CORRECTION_SCHEMA_ID",
     "SUPPLEMENTAL_REVIEW_SCHEMA_ID",
+    "ManagerCorrectionError",
     "accept_preview",
     "accept_review",
     "bound_reviewer_request_ids",
     "bound_reviewer_rows",
     "bound_reviewer_task_ids",
+    "corrected_candidate_texts",
     "create_supplemental_inspection_rounds",
     "dispose_review_finding",
     "effective_requested_risk_tier",
@@ -38,6 +44,7 @@ __all__ = [
     "sealed_review_packet",
     "server_derived_risk_tier",
     "supplemental_rounds_completed",
+    "validate_manager_correction",
 ]
 
 _REVIEWER_USABLE_STATES = ("review_ready", "accepted")
@@ -395,6 +402,7 @@ def _refinement_blockers(
     *,
     finding_dispositions: list[Mapping[str, Any]] | None = None,
     disposition_rows: list[dict[str, Any]] | None = None,
+    manager_correction: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Findings on ALREADY-VERIFIED reports that will refuse this acceptance.
 
@@ -408,7 +416,18 @@ def _refinement_blockers(
     ``disposition_rows`` with its disposition and receipt digest; a
     ``dismissed`` non-blocking finding is not a blocker (NF-2026-01170), every
     other finding blocks exactly as before.
+
+    ``manager_correction`` is a record ALREADY validated by
+    :func:`validate_manager_correction` -- never a caller's claim. Each
+    ``confirmed``, non-blocking correctness/security finding it names is lifted
+    the same way a dismissal lifts one, and its ``disposition_rows`` entry says
+    ``lifted_by`` ``manager_correction`` (NF-2026-01436). A blocking severity is
+    never lifted and no other blocker is affected.
     """
+    corrected_finding_ids = frozenset(
+        str(value)
+        for value in ((manager_correction or {}).get("finding_ids") or ())
+    )
     by_finding = {
         (
             str(row.get("reviewer_request_id") or ""),
@@ -459,6 +478,23 @@ def _refinement_blockers(
                     dismissed_by_finding=dismissed_by_finding,
                 )
             )
+            # NF-2026-01436: a CONFIRMED non-blocking correctness/security
+            # finding the manager has actually fixed, with that fix validated
+            # before this ran. The uniqueness condition is the dismissal path's
+            # own: an id that is not unique across these reports names more than
+            # one finding, so correcting it cannot be proven and lifts nothing.
+            # A blocking severity falls through to the blocking branch below and
+            # is never lifted by either surface.
+            corrected = (
+                not lifted
+                and finding_id in corrected_finding_ids
+                and disposition == "confirmed"
+                and severity not in quality_evidence.BLOCKING_SEVERITIES
+                and lens
+                in {quality_evidence.LENS_CORRECTNESS, quality_evidence.LENS_SECURITY}
+                and finding_id_counts.get(finding_id) == 1
+            )
+            lifted = lifted or corrected
             if stored is not None and disposition_rows is not None:
                 disposition_rows.append(
                     {
@@ -469,6 +505,9 @@ def _refinement_blockers(
                         "disposition": disposition,
                         "receipt_sha256": str(stored.get("receipt_sha256") or ""),
                         "blocker_lifted": lifted,
+                        # Named only for a manager correction, so a row produced
+                        # by any other path keeps exactly the shape it had.
+                        **({"lifted_by": "manager_correction"} if corrected else {}),
                     }
                 )
             extra: dict[str, Any] = (
@@ -580,6 +619,437 @@ def bound_finding_dispositions(
             continue
         bound.append(dict(row))
     return bound
+
+
+def _selected_reviewer_rows(
+    reviewers: list[dict[str, Any]], reviewer_request_ids: list[str] | None
+) -> tuple[list[dict[str, Any]], list[str], str]:
+    """The reviewer rows one accept acts on, the unresolved ids, and the source.
+
+    ONE definition, read by :func:`fold_accept_blockers` and by
+    :func:`validate_manager_correction`: a manager correction may only name a
+    finding on a reviewer this accept actually selected, and "selected" has to
+    mean the same thing in both places -- otherwise a correction could lift a
+    blocker the fold never raised, or fail to lift one it did.
+    """
+    selected = (
+        None if reviewer_request_ids is None else [str(v) for v in reviewer_request_ids]
+    )
+    if selected is None:
+        return (
+            [row for row in reviewers if row["usable"]],
+            [],
+            "server_bound_reviewer_children",
+        )
+    known = {row["request_id"]: row for row in reviewers if row["request_id"]}
+    return (
+        [known[request_id] for request_id in selected if request_id in known],
+        [request_id for request_id in selected if request_id not in known],
+        "manager_named",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Manager correction on top of the sealed candidate (NF-2026-01436, flow A).
+#
+# Measured 2026-10-09: needfix-NF-2026-01334-r1 (request 515c092b) carried ONE
+# confirmed LOW correctness finding -- a duplicate test def -- and
+# ``accept_review`` still answered ``refinement_required`` with
+# ``blocking_severity`` false and ``disposition`` confirmed, because a confirmed
+# finding is a real defect and the accept path has no way to say "and here is
+# the fix". The only available next step was a full reject plus a rework round
+# plus two more high-risk reviewers, and the corrected work was archived instead
+# of accepted -- which is why the consumer seat measured ~54% learning-commit
+# coverage.
+#
+# A manager correction is a unified diff applied ON TOP of the sealed candidate
+# bytes, naming the confirmed non-blocking findings it repairs. Three rules make
+# it safe to accept rather than rework:
+#
+# * it is decided BEFORE any promotion or state change, and every refusal is the
+#   one typed ``manager_correction_invalid:<reason>`` with nothing written;
+# * it can only lift a CONFIRMED, non-blocking correctness/security finding --
+#   a blocking severity is never lifted and no other blocker is touched; and
+# * the reviewer receipts stay bound to the sealed candidate they actually read.
+#   The manager's bytes are a separate, separately hashed statement in the
+#   accepted-outcome receipt, never a re-keying of what a reviewer saw.
+# ---------------------------------------------------------------------------
+MANAGER_CORRECTION_SCHEMA_ID = "aiworkhub.manager_correction.v1"
+
+# The only fields a correction may carry; anything else refuses by name rather
+# than being silently dropped.
+MANAGER_CORRECTION_FIELDS = frozenset({"patch", "finding_ids", "reason"})
+
+# Bounded inputs: a correction is a small repair of an already-reviewed
+# candidate, never a second candidate. Each cap refuses by name instead of
+# reading further.
+MAX_MANAGER_CORRECTION_PATCH_BYTES = 256 * 1024
+MAX_MANAGER_CORRECTION_FILES = 16
+MAX_MANAGER_CORRECTION_HUNKS = 256
+MAX_MANAGER_CORRECTION_TARGET_BYTES = 4 * 1024 * 1024
+
+_MANAGER_CORRECTION_HUNK = re.compile(
+    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@"
+)
+
+# The non-content header lines a ``git diff`` preamble may carry before the
+# ``---``/``+++`` pair. Anything else outside a hunk is unparsable, not noise.
+_MANAGER_CORRECTION_PREAMBLE = (
+    "diff ",
+    "index ",
+    "old mode ",
+    "new mode ",
+    "similarity ",
+    "dissimilarity ",
+    "rename ",
+    "copy ",
+)
+
+
+class ManagerCorrectionError(Exception):
+    """One named reason a manager correction is refused.
+
+    Carries a reason token only -- never patch text, file content or a digest --
+    so the message can be returned to the caller verbatim.
+    """
+
+
+def _manager_correction_path(raw: str) -> str:
+    """The repo-relative path one diff header names, or a named refusal."""
+    candidate = raw.split("\t", 1)[0].strip()
+    if candidate in ("", "/dev/null"):
+        raise ManagerCorrectionError("patch_file_create_or_delete_unsupported")
+    for prefix in ("a/", "b/"):
+        if candidate.startswith(prefix):
+            candidate = candidate[len(prefix):]
+            break
+    normalized = candidate.replace("\\", "/")
+    if (
+        not normalized
+        or normalized.startswith("/")
+        or ".." in normalized.split("/")
+        or "\x00" in normalized
+        or any(char in normalized for char in "*?[")
+        or ":" in normalized
+    ):
+        raise ManagerCorrectionError("patch_path_invalid")
+    return normalized
+
+
+def corrected_candidate_texts(patch: str, read_text: Any) -> dict[str, str]:
+    """Apply one unified diff to the sealed candidate, strictly.
+
+    ``read_text(relative)`` supplies the preimage for each path the patch names
+    and may itself raise :class:`ManagerCorrectionError`. Every hunk must land
+    at the line its own header states and its context and deleted lines must
+    match the preimage exactly: there is no fuzz, no offset search and no
+    partial application. A patch that does not parse, names a path twice,
+    creates or deletes a file, renames one, or disagrees with a single byte of
+    the candidate raises and NOTHING is written anywhere -- this function
+    returns the corrected text and never touches the filesystem itself.
+
+    Lines are compared with ``\\n`` as the only terminator, which is what the
+    reader enforces for the preimage; a ``\\ No newline at end of file`` marker
+    refuses by name rather than being guessed at.
+    """
+    if not isinstance(patch, str) or not patch.strip():
+        raise ManagerCorrectionError("patch_empty")
+    if len(patch.encode("utf-8")) > MAX_MANAGER_CORRECTION_PATCH_BYTES:
+        raise ManagerCorrectionError("patch_too_large")
+    lines = patch.replace("\r\n", "\n").split("\n")
+    corrected: dict[str, str] = {}
+    hunks = 0
+    index = 0
+    while index < len(lines):
+        header = lines[index]
+        if not header.startswith("--- "):
+            if header.strip() and not header.startswith(_MANAGER_CORRECTION_PREAMBLE):
+                raise ManagerCorrectionError("patch_unparsable")
+            index += 1
+            continue
+        if index + 1 >= len(lines) or not lines[index + 1].startswith("+++ "):
+            raise ManagerCorrectionError("patch_unparsable")
+        old_path = _manager_correction_path(header[4:])
+        new_path = _manager_correction_path(lines[index + 1][4:])
+        if old_path != new_path:
+            raise ManagerCorrectionError("patch_rename_unsupported")
+        if new_path in corrected:
+            raise ManagerCorrectionError("patch_duplicate_file")
+        if len(corrected) >= MAX_MANAGER_CORRECTION_FILES:
+            raise ManagerCorrectionError("patch_too_many_files")
+        index += 2
+        source = read_text(new_path).split("\n")
+        trailing_newline = bool(source) and source[-1] == ""
+        if trailing_newline:
+            source = source[:-1]
+        out: list[str] = []
+        cursor = 0
+        saw_hunk = False
+        while index < len(lines):
+            match = _MANAGER_CORRECTION_HUNK.match(lines[index])
+            if match is None:
+                break
+            saw_hunk = True
+            hunks += 1
+            if hunks > MAX_MANAGER_CORRECTION_HUNKS:
+                raise ManagerCorrectionError("patch_too_many_hunks")
+            old_start = int(match.group(1))
+            old_count = 1 if match.group(2) is None else int(match.group(2))
+            new_count = 1 if match.group(4) is None else int(match.group(4))
+            # An insertion-only hunk states the line BEFORE the insertion point;
+            # every other hunk states its own first line, 1-indexed.
+            start = old_start - 1 if old_count else old_start
+            if start < cursor or start + old_count > len(source):
+                raise ManagerCorrectionError("patch_hunk_out_of_range")
+            out.extend(source[cursor:start])
+            cursor = start
+            index += 1
+            taken_old = 0
+            taken_new = 0
+            while taken_old < old_count or taken_new < new_count:
+                if index >= len(lines):
+                    raise ManagerCorrectionError("patch_hunk_truncated")
+                body = lines[index]
+                index += 1
+                if body.startswith("\\"):
+                    raise ManagerCorrectionError(
+                        "patch_no_newline_marker_unsupported"
+                    )
+                # A trimmed empty context line is the one accepted shorthand:
+                # the declared counts, not the line shape, end the hunk.
+                kind = body[:1] if body else " "
+                text = body[1:] if body else ""
+                if kind == "+":
+                    taken_new += 1
+                    out.append(text)
+                    continue
+                if kind not in (" ", "-"):
+                    raise ManagerCorrectionError("patch_unparsable")
+                if taken_old >= old_count or source[cursor] != text:
+                    raise ManagerCorrectionError("patch_context_mismatch")
+                taken_old += 1
+                cursor += 1
+                if kind == " ":
+                    taken_new += 1
+                    out.append(text)
+        if not saw_hunk:
+            raise ManagerCorrectionError("patch_no_hunks")
+        out.extend(source[cursor:])
+        corrected[new_path] = "\n".join(out) + ("\n" if trailing_newline else "")
+    if not corrected:
+        raise ManagerCorrectionError("patch_no_file_headers")
+    return corrected
+
+
+def _verified_manager_identity(self: Any, core: Any, path_cls: Any) -> tuple[str, str]:
+    """The verified manager actor for THIS repository, or a named refusal.
+
+    The narrow subset :func:`validate_manager_correction` needs: a bootstrap
+    that resolves the manager role for this exact repository and names both a
+    provider and a session. The write gate is deliberately not re-checked here
+    because ``accept_review`` has already refused ``write_gate_closed`` far
+    above; :func:`dispose_review_finding` keeps its own four-step ladder and its
+    own error strings, which this does not replace or change.
+    """
+    try:
+        route = core.manager_bootstrap()
+    except Exception:  # noqa: BLE001 -- an unresolvable route verifies nothing
+        return "", "manager_identity_unverified"
+    identity = route.get("manager_route") if isinstance(route, dict) else None
+    if not isinstance(identity, dict) or route.get("role") != "manager":
+        return "", "manager_identity_unverified"
+    try:
+        repo_matches = bool(route.get("repo")) and (
+            path_cls(str(route["repo"])).resolve() == self.repo
+        )
+    except (OSError, TypeError, ValueError):
+        repo_matches = False
+    if not repo_matches:
+        return "", "manager_repository_mismatch"
+    provider = str(identity.get("provider") or route.get("provider") or "").strip()
+    session_id = str(
+        identity.get("thread_id") or identity.get("session_id") or ""
+    ).strip()
+    if not provider or not session_id:
+        return "", "manager_session_identity_missing"
+    return f"{provider}:{session_id}", ""
+
+
+def validate_manager_correction(
+    self: Any,
+    correction: Any,
+    *,
+    card: Mapping[str, Any],
+    workspace: Any,
+    changed: list[str],
+    reviewers: list[dict[str, Any]],
+    reviewer_request_ids: list[str] | None,
+    finding_dispositions: list[Mapping[str, Any]],
+    core: Any,
+    path_cls: Any,
+) -> tuple[dict[str, Any] | None, dict[str, str], str]:
+    """Decide one manager correction BEFORE any promotion or state change.
+
+    Returns ``(record, corrected_texts, "")`` when the correction is valid and
+    ``(None, {}, reason)`` otherwise, in which case the caller refuses with
+    ``manager_correction_invalid:<reason>`` and changes nothing. Read-only
+    throughout: the corrected bytes are RETURNED for the caller to write to the
+    accept tree once every other cheap blocker has cleared, so a later refusal
+    cannot leave a half-corrected tree behind.
+
+    The ``record`` is this module's internal statement of the correction. Its
+    ``patch_sha256``/``finding_ids``/``paths``/``candidate_path_hashes``/
+    ``corrected_path_hashes``/``reason`` are the six fields
+    ``accepted_outcome_receipt`` binds; ``schema_id`` and ``actor`` stay here,
+    on the accept path, and are not part of the receipt identity.
+    """
+    if not isinstance(correction, Mapping):
+        return None, {}, "not_an_object"
+    unknown = sorted(set(correction) - MANAGER_CORRECTION_FIELDS)
+    if unknown:
+        return None, {}, ("unknown_field:" + ",".join(unknown))[:200]
+    patch = correction.get("patch")
+    raw_ids = correction.get("finding_ids")
+    reason = correction.get("reason")
+    if not isinstance(patch, str) or not patch.strip():
+        return None, {}, "patch_empty"
+    if (
+        not isinstance(raw_ids, (list, tuple))
+        or not raw_ids
+        or any(not isinstance(value, str) or not value.strip() for value in raw_ids)
+    ):
+        return None, {}, "finding_ids_empty"
+    if reason is not None and not isinstance(reason, str):
+        return None, {}, "reason_invalid"
+    actor, identity_reason = _verified_manager_identity(self, core, path_cls)
+    if identity_reason:
+        return None, {}, identity_reason
+
+    # The findings in play are exactly the ones ``_refinement_blockers`` reads:
+    # the ``defect`` findings on the SELECTED, usable reviewers' already-sealed
+    # receipts. Counting ids over that same population is what makes an
+    # ambiguous id refuse here rather than lift the wrong blocker there.
+    selected, _unresolved, _source = _selected_reviewer_rows(
+        reviewers, reviewer_request_ids
+    )
+    findings: dict[str, dict[str, str]] = {}
+    counts: dict[str, int] = {}
+    for row in selected:
+        if not row.get("usable"):
+            continue
+        receipt = row.get("receipt")
+        report = receipt.get("report") if isinstance(receipt, Mapping) else None
+        if not isinstance(report, Mapping):
+            continue
+        lens = str(report.get("lens") or row.get("lens") or "")
+        reported = report.get("findings")
+        for finding in reported if isinstance(reported, list) else []:
+            if not isinstance(finding, Mapping):
+                continue
+            finding_id = f"reviewer:{lens}:{str(finding.get('id') or '')}"
+            counts[finding_id] = counts.get(finding_id, 0) + 1
+            if finding.get("disposition") != "defect":
+                continue
+            findings[finding_id] = {
+                "lens": lens,
+                "severity": str(finding.get("severity") or ""),
+                "reviewer_request_id": str(row.get("request_id") or ""),
+            }
+    confirmed = {
+        (
+            str(row.get("reviewer_request_id") or ""),
+            str(row.get("finding_id") or ""),
+        )
+        for row in finding_dispositions
+        if isinstance(row, Mapping)
+        and str(row.get("disposition") or "") == "confirmed"
+    }
+    finding_ids = sorted({str(value) for value in raw_ids})
+    for finding_id in finding_ids:
+        finding = findings.get(finding_id)
+        if finding is None:
+            return None, {}, f"finding_not_found:{finding_id}"[:200]
+        if counts.get(finding_id, 0) != 1:
+            return None, {}, f"finding_id_ambiguous:{finding_id}"[:200]
+        if finding["severity"] in quality_evidence.BLOCKING_SEVERITIES:
+            return None, {}, f"finding_blocking_severity:{finding_id}"[:200]
+        if finding["lens"] not in {
+            quality_evidence.LENS_CORRECTNESS,
+            quality_evidence.LENS_SECURITY,
+        }:
+            return None, {}, f"finding_lens_not_correctable:{finding_id}"[:200]
+        if (finding["reviewer_request_id"], finding_id) not in confirmed:
+            return None, {}, f"finding_not_confirmed:{finding_id}"[:200]
+
+    allowed = [
+        value for value in (card.get("allowed_writes") or []) if isinstance(value, str)
+    ]
+    in_candidate = set(changed)
+    candidate_bytes: dict[str, bytes] = {}
+
+    def _read_candidate(relative: str) -> str:
+        # Scope is decided BEFORE the file is opened: a path outside the card's
+        # own ``allowed_writes`` is one this accept must not read, let alone
+        # promote, and saying so by name is what makes the refusal legible.
+        if not any(
+            relative == pattern or fnmatch.fnmatchcase(relative, pattern)
+            for pattern in allowed
+        ):
+            raise ManagerCorrectionError(
+                f"path_outside_allowed_writes:{relative}"[:200]
+            )
+        # A path the sealed candidate never changed is not in ``changed``, so it
+        # would be corrected in the accept tree and then never promoted or
+        # hash-verified. Refuse rather than promote half a correction.
+        if relative not in in_candidate:
+            raise ManagerCorrectionError(f"path_not_in_candidate:{relative}"[:200])
+        source = workspace.path / relative
+        if source.is_symlink() or not source.is_file():
+            raise ManagerCorrectionError(f"patch_target_missing:{relative}"[:200])
+        if source.stat().st_size > MAX_MANAGER_CORRECTION_TARGET_BYTES:
+            raise ManagerCorrectionError(f"patch_target_too_large:{relative}"[:200])
+        try:
+            raw = source.read_bytes()
+            text = raw.decode("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ManagerCorrectionError(
+                f"patch_target_unreadable:{relative}"[:200]
+            ) from exc
+        if "\r\n" in text:
+            raise ManagerCorrectionError(
+                f"patch_target_line_endings_unsupported:{relative}"[:200]
+            )
+        # The exact preimage the hunks were verified against, so the candidate
+        # digest below cannot come from a second, later read of the same file.
+        candidate_bytes[relative] = raw
+        return text
+
+    try:
+        corrected_texts = corrected_candidate_texts(patch, _read_candidate)
+    except ManagerCorrectionError as exc:
+        return None, {}, str(exc)[:200]
+
+    paths = sorted(corrected_texts)
+    candidate_hashes: dict[str, str] = {}
+    corrected_hashes: dict[str, str] = {}
+    for relative in paths:
+        before = candidate_bytes[relative]
+        after = corrected_texts[relative].encode("utf-8")
+        if before == after:
+            return None, {}, f"patch_changes_nothing:{relative}"[:200]
+        candidate_hashes[relative] = hashlib.sha256(before).hexdigest()
+        corrected_hashes[relative] = hashlib.sha256(after).hexdigest()
+    record: dict[str, Any] = {
+        "schema_id": MANAGER_CORRECTION_SCHEMA_ID,
+        "patch_sha256": hashlib.sha256(patch.encode("utf-8")).hexdigest(),
+        "finding_ids": finding_ids,
+        "paths": paths,
+        "candidate_path_hashes": candidate_hashes,
+        "corrected_path_hashes": corrected_hashes,
+        "reason": str(reason or "")[:2000],
+        "actor": actor,
+    }
+    return record, corrected_texts, ""
 
 
 def _blind_reviewer_lenses(reviewers: list[dict[str, Any]]) -> set[str]:
@@ -832,6 +1302,7 @@ def fold_accept_blockers(
     destructive_blockers: list[str] | None = None,
     confirm_destructive_change: bool = False,
     finding_dispositions: list[Mapping[str, Any]] | None = None,
+    manager_correction: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Every acceptance blocker decidable from persisted evidence alone.
 
@@ -862,15 +1333,9 @@ def fold_accept_blockers(
     selected = (
         None if reviewer_request_ids is None else [str(v) for v in reviewer_request_ids]
     )
-    known = {row["request_id"]: row for row in reviewers if row["request_id"]}
-    unresolved: list[str] = []
-    if selected is None:
-        chosen = [row for row in reviewers if row["usable"]]
-        source = "server_bound_reviewer_children"
-    else:
-        chosen = [known[request_id] for request_id in selected if request_id in known]
-        unresolved = [request_id for request_id in selected if request_id not in known]
-        source = "manager_named"
+    chosen, unresolved, source = _selected_reviewer_rows(
+        reviewers, reviewer_request_ids
+    )
     blockers: list[dict[str, Any]] = []
     if str(terminal_substatus) != "review_ready":
         blockers.append(
@@ -945,6 +1410,7 @@ def fold_accept_blockers(
             evidence_rows,
             finding_dispositions=finding_dispositions,
             disposition_rows=disposition_rows,
+            manager_correction=manager_correction,
         )
     )
     # NF-2026-01158: the refusal the accept fold WILL make for a lens nothing
@@ -1139,6 +1605,7 @@ ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
     "sealed_review_packet",
     "server_derived_risk_tier",
     "supplemental_rounds_completed",
+    "validate_manager_correction",
 )
 
 ACCEPT_REVIEW_SEAM_NAMES: tuple[str, ...] = (
@@ -1188,6 +1655,7 @@ def accept_review(
     reviewer_reports: list[dict[str, Any]] | None = None,
     reviewer_request_ids: list[str] | None = None,
     confirm_high_risk: bool = False,
+    manager_correction: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Coordinator/write-gated acceptance of one ``review_ready`` request.
 
@@ -1220,6 +1688,20 @@ def accept_review(
     reviewer. Whichever way they are chosen, EVERY id is still verified here by
     request id against its own sealed receipt -- defaulting changes who types
     the ids, never what is proven about them.
+
+    ``manager_correction`` -- ``None`` by default, in which case every path
+    below behaves exactly as it did before NF-2026-01436 -- is a unified diff
+    the verified manager applies ON TOP of the sealed candidate, naming the
+    confirmed non-blocking findings it repairs:
+    ``{"patch": <unified diff>, "finding_ids": ["reviewer:<lens>:<id>", ...],
+    "reason": str}``. It is validated by :func:`validate_manager_correction`
+    BEFORE any promotion or state change and refuses with one typed
+    ``manager_correction_invalid:<reason>``; a named confirmed finding's
+    ``refinement_required`` blocker is then lifted, the corrected bytes are what
+    the declared validations and the mechanical gate judge, and the
+    accepted-outcome receipt binds the patch digest together with the candidate
+    and corrected hashes. A blocking-severity finding is never lifted, and the
+    reviewer receipts stay bound to the sealed candidate they actually read.
     """
     # Every module-level name this function used while it lived in
     # ``process_launcher`` is re-bound here from that exact module object, so a
@@ -1502,6 +1984,16 @@ def accept_review(
             _card_is_readonly_research(card) and not readonly_quality_review
         )
         readonly_no_change = readonly_research or readonly_quality_review
+        # A no-change research/quality-review task has no candidate bytes to
+        # correct, so a correction aimed at one is refused before any evidence
+        # is read rather than silently ignored on the zero-promotion branches.
+        if manager_correction is not None and readonly_no_change:
+            return {
+                "ok": False,
+                "error": "manager_correction_invalid:no_change_task",
+                "request_id": request_id,
+                "task_id": task_id,
+            }
         try:
             attempt_artifact_receipt = self._verify_attempt_artifact_receipt(
                 request_id,
@@ -2129,6 +2621,37 @@ def accept_review(
                 candidate_sha256=_target_candidate_sha256(card),
                 receipt_sha256_by_reviewer=_sealed_receipt_sha256(reviewers),
             )
+            # NF-2026-01436: the manager correction is decided HERE -- before
+            # the combined tree, before a reviewer receipt is re-verified and
+            # before any byte is written anywhere. An invalid correction refuses
+            # with one typed error and leaves the accept tree, the canonical
+            # repo and the card exactly as they were.
+            correction_record: dict[str, Any] | None = None
+            corrected_texts: dict[str, str] = {}
+            accepted_path_hashes: dict[str, str | None] = stored_hashes
+            if manager_correction is not None:
+                correction_record, corrected_texts, correction_reason = (
+                    validate_manager_correction(
+                        self,
+                        manager_correction,
+                        card=card,
+                        workspace=workspace,
+                        changed=changed,
+                        reviewers=reviewers,
+                        reviewer_request_ids=reviewer_request_ids,
+                        finding_dispositions=sealed_finding_dispositions,
+                        core=core,
+                        path_cls=Path,
+                    )
+                )
+                if correction_record is None:
+                    return {
+                        "ok": False,
+                        "error": f"manager_correction_invalid:{correction_reason}"[:500],
+                        "request_id": request_id,
+                        "task_id": task_id,
+                        "promoted_paths": [],
+                    }
             accept_fold = fold_accept_blockers(
                 reviewers=reviewers,
                 reviewer_request_ids=reviewer_request_ids,
@@ -2138,6 +2661,13 @@ def accept_review(
                 **(
                     {"finding_dispositions": sealed_finding_dispositions}
                     if sealed_finding_dispositions
+                    else {}
+                ),
+                # Only a VALIDATED correction reaches the fold, so the lift it
+                # performs can never rest on a claim nothing checked.
+                **(
+                    {"manager_correction": correction_record}
+                    if correction_record is not None
                     else {}
                 ),
             )
@@ -2167,6 +2697,21 @@ def accept_review(
                     "effective_risk_tier": str(risk_profile["effective_tier"]),
                     "requested_risk_tier": effective_requested_tier,
                     "combined_tree_materialized": False,
+                }
+            # Nothing cheap refuses any more, so the manager's already-validated
+            # bytes go onto the accept tree HERE -- before the combined tree is
+            # materialized, before the declared validations run and before the
+            # mechanical gate reads a byte. Every one of them then judges the
+            # CORRECTED candidate, and the bytes promoted below are the bytes
+            # that passed. A refusal on any earlier line left the tree alone.
+            if correction_record is not None:
+                for relative in correction_record["paths"]:
+                    (workspace.path / relative).write_bytes(
+                        corrected_texts[relative].encode("utf-8")
+                    )
+                accepted_path_hashes = {
+                    **stored_hashes,
+                    **correction_record["corrected_path_hashes"],
                 }
             combined_tree: dict[str, Any] | None = None
             combined_tree_checks: list[dict[str, Any]] = []
@@ -2499,9 +3044,13 @@ def accept_review(
             )
             quality_gate["full_validation_snapshot"] = full_validation_snapshot
             _enforce_behavioral_gate(card, validations, quality_gate)
+            # ``accepted_path_hashes`` IS ``stored_hashes`` unless a manager
+            # correction was validated and applied above, in which case the
+            # corrected paths carry their corrected digests -- so this still
+            # proves the tree about to be promoted is the tree just validated.
             current_hashes = _changed_path_hashes(workspace, changed)
-            if set(current_hashes) != set(stored_hashes) or any(
-                current_hashes[relative] != stored_hashes.get(relative)
+            if set(current_hashes) != set(accepted_path_hashes) or any(
+                current_hashes[relative] != accepted_path_hashes.get(relative)
                 for relative in current_hashes
             ):
                 raise WorkspaceError("stored_hash_mismatch")
@@ -2533,8 +3082,15 @@ def accept_review(
                 claim_epoch=int(card.get("claim_epoch") or 0),
                 base_oid=str(workspace_meta.get("base_oid") or ""),
                 promoted_paths=promoted,
-                changed_path_hashes=stored_hashes,
+                changed_path_hashes=accepted_path_hashes,
                 attempt_artifact_manifest=attempt_artifact_receipt,
+                # Named only when a correction landed, so an accept without one
+                # calls exactly the receipt builder it always called.
+                **(
+                    {"manager_correction": correction_record}
+                    if correction_record is not None
+                    else {}
+                ),
             )
         except (OSError, TypeError, ValueError, WorkspaceError) as exc:
             return {
@@ -2686,7 +3242,7 @@ def accept_review(
             task_id=task_id,
             request_id=request_id,
             decision="accepted",
-            changed_path_hashes=stored_hashes,
+            changed_path_hashes=accepted_path_hashes,
             changed_paths=list(promoted),
             failure_category="",
         )

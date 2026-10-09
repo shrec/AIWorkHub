@@ -13809,6 +13809,7 @@ class ProcessManager:
         reviewer_reports: list[dict[str, Any]] | None = None,
         reviewer_request_ids: list[str] | None = None,
         confirm_high_risk: bool = False,
+        manager_correction: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Coordinator/write-gated acceptance of one ``review_ready`` request.
 
@@ -13827,6 +13828,7 @@ class ProcessManager:
             reviewer_reports=reviewer_reports,
             reviewer_request_ids=reviewer_request_ids,
             confirm_high_risk=confirm_high_risk,
+            manager_correction=manager_correction,
         )
 
     def accept_preview(

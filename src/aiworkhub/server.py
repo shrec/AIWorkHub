@@ -4542,6 +4542,7 @@ def aiworkhub_agent_accept_review(
     reviewer_reports: list[dict[str, Any]] | None = None,
     reviewer_request_ids: list[str] | None = None,
     confirm_high_risk: bool = False,
+    manager_correction: dict[str, Any] | None = None,
     include_card: CardInclude = "none",
 ) -> dict[str, Any]:
     """COORDINATOR/WRITE-GATED: accept one ``review_ready`` request, phase 2.
@@ -4556,6 +4557,23 @@ def aiworkhub_agent_accept_review(
     Medium-and-higher risk profiles also validate a fresh canonical+candidate
     combined tree and require strict reviewer findings; high/critical review
     requires an explicit ``confirm_high_risk`` decision.
+
+    ``manager_correction`` -- unset by default, and every other behaviour is
+    then exactly as before -- accepts the sealed candidate PLUS a manager patch
+    instead of rejecting it:
+    ``{"patch": <unified diff>, "finding_ids": ["reviewer:<lens>:<id>", ...],
+    "reason": str}``. It lifts the ``refinement_required`` blocker of each
+    named finding that a selected reviewer reported and
+    ``aiworkhub_agent_dispose_review_finding`` already recorded as
+    ``confirmed``, provided its severity is not blocking. The patch is
+    validated before any promotion or state change and refuses with
+    ``manager_correction_invalid:<reason>`` when the manager is unverified, the
+    patch does not apply to the sealed candidate bytes, a touched path is
+    outside the card's ``allowed_writes`` or not part of the candidate, no
+    finding is named, or a named finding is unconfirmed or blocking. The
+    declared validations and the mechanical gate then run on the CORRECTED
+    bytes, those are the bytes promoted, and the accepted-outcome receipt binds
+    the patch digest with the candidate and corrected hashes.
 
     A successful reply is the receipt (``aiworkhub.accept_review_receipt.v1``):
     promoted_paths, reviewer_finalization, acceptance_evidence_record,
@@ -4579,6 +4597,7 @@ def aiworkhub_agent_accept_review(
         reviewer_reports=reviewer_reports,
         reviewer_request_ids=reviewer_request_ids,
         confirm_high_risk=confirm_high_risk,
+        manager_correction=manager_correction,
     )
     if not isinstance(result, dict) or not result.get("ok"):
         return result
