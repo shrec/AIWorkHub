@@ -43,6 +43,7 @@ import re
 import secrets
 import shlex
 import shutil
+import subprocess
 import sqlite3
 import stat
 import sys
@@ -1375,9 +1376,72 @@ def _is_nested_linked_worktree_dir(repo_root: Path, directory: Path) -> bool:
     return False
 
 
-def iter_source_files(repo_root: Path) -> list[Path]:
+_GIT_LS_FILES_IGNORED_TIMEOUT_SECONDS = 30
+
+
+@dataclass(frozen=True, slots=True)
+class _GitIgnoreScan:
+    """One ``git ls-files`` probe of untracked, ignored paths.
+
+    ``applied`` is False when ``repo_root`` is not a git work tree or the
+    call otherwise failed; callers then keep today's enumeration unfiltered
+    instead of treating "could not ask git" as "nothing is ignored".
+    """
+
+    ignored_dirs: frozenset[str]
+    ignored_files: frozenset[str]
+    applied: bool
+    skip_reason: str
+
+
+def _scan_git_ignored_paths(repo_root: Path) -> _GitIgnoreScan:
+    """Ask git once which untracked paths its own ignore rules exclude.
+
+    Uses ``--directory`` so an entirely ignored directory is reported once
+    rather than file-by-file, matching how ``iter_source_files`` prunes
+    ``os.walk`` before it descends. A *tracked* file is never reported by
+    ``--others``, so one force-added despite matching an ignore pattern
+    stays indexed by construction.
+    """
+    try:
+        completed = subprocess.run(
+            [
+                "git", "-C", str(repo_root), "ls-files", "-z",
+                "--others", "--ignored", "--exclude-standard", "--directory",
+            ],
+            capture_output=True,
+            timeout=_GIT_LS_FILES_IGNORED_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _GitIgnoreScan(frozenset(), frozenset(), False, f"{type(exc).__name__}:{exc}")
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", "replace").strip()[:256]
+        return _GitIgnoreScan(
+            frozenset(), frozenset(), False,
+            f"source_graph_gitignore_unavailable:{completed.returncode}:{detail}",
+        )
+    entries = [
+        entry.decode("utf-8", "surrogateescape")
+        for entry in completed.stdout.split(b"\0")
+        if entry
+    ]
+    return _GitIgnoreScan(
+        frozenset(entry[:-1] for entry in entries if entry.endswith("/")),
+        frozenset(entry for entry in entries if not entry.endswith("/")),
+        True,
+        "",
+    )
+
+
+def iter_source_files(
+    repo_root: Path, *, gitignore_scan: _GitIgnoreScan | None = None,
+) -> list[Path]:
     repo_root = repo_root.resolve()
     policy = load_ignore_policy(repo_root)
+    gitignore = (
+        gitignore_scan if gitignore_scan is not None else _scan_git_ignored_paths(repo_root)
+    )
     out: list[Path] = []
     traversal_errors: list[str] = []
     indexed_extensions = policy.indexed_extensions
@@ -1408,6 +1472,8 @@ def iter_source_files(repo_root: Path) -> list[Path]:
                 continue
             if _glob_ignored(rel, policy.exclude_globs, is_dir=True):
                 continue
+            if gitignore.applied and rel in gitignore.ignored_dirs:
+                continue
             kept_dirs.append(dirname)
         dirnames[:] = sorted(kept_dirs)
         for filename in sorted(filenames):
@@ -1416,6 +1482,8 @@ def iter_source_files(repo_root: Path) -> list[Path]:
                 continue
             rel = path.relative_to(repo_root).as_posix()
             if _glob_ignored(rel, policy.exclude_globs):
+                continue
+            if gitignore.applied and rel in gitignore.ignored_files:
                 continue
             out.append(path)
     if traversal_errors:
@@ -1466,6 +1534,8 @@ class BuildReport:
     quality_reused: bool = False
     files_skipped: int = 0
     phase_seconds: dict[str, float] = field(default_factory=dict)
+    gitignore_applied: bool = True
+    gitignore_skip_reason: str = ""
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -1499,6 +1569,8 @@ class BuildReport:
             "hash_telemetry": self.hash_telemetry,
             "quality_reused": self.quality_reused,
             "phase_seconds": self.phase_seconds,
+            "gitignore_applied": self.gitignore_applied,
+            "gitignore_skip_reason": self.gitignore_skip_reason,
         }
 
 
@@ -3899,7 +3971,8 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
     repo_root = repo_root.resolve()
     resolved_db_path = db_path or resolve_db_path(repo_root)
     conn = connect(resolved_db_path)
-    files_on_disk = iter_source_files(repo_root)
+    gitignore_scan = _scan_git_ignored_paths(repo_root)
+    files_on_disk = iter_source_files(repo_root, gitignore_scan=gitignore_scan)
     seen_rel: set[str] = set()
     changed = unchanged = removed = entities_written = edges_written = 0
     skipped = 0
@@ -4501,6 +4574,8 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
         hash_telemetry=hash_telemetry,
         quality_reused=quality_reused,
         phase_seconds=phase_seconds,
+        gitignore_applied=gitignore_scan.applied,
+        gitignore_skip_reason=gitignore_scan.skip_reason,
     )
 
 
@@ -9846,6 +9921,19 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
     repo_root = repo_root.resolve()
     resolved = _validate_single_file_path(repo_root, path)
     rel = Path(path).as_posix()
+
+    # A path git's own ignore rules exclude is refused the same way an
+    # excluded-dir/glob path already is above: fail closed rather than
+    # silently indexing a corpus the repository asked to keep out.
+    gitignore = _scan_git_ignored_paths(repo_root)
+    if gitignore.applied:
+        ancestor = ""
+        for part in rel.split("/")[:-1]:
+            ancestor = f"{ancestor}/{part}" if ancestor else part
+            if ancestor in gitignore.ignored_dirs:
+                raise SourceGraphError(f"source_graph_single_file_gitignored:{rel}")
+        if rel in gitignore.ignored_files:
+            raise SourceGraphError(f"source_graph_single_file_gitignored:{rel}")
 
     # Reject unsupported extensions (no LanguageSpec entry).
     suffix = resolved.suffix.casefold()
