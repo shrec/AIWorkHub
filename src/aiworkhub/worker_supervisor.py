@@ -866,7 +866,12 @@ WORKER_PROMPT_NOT_DELIVERED = "worker_prompt_not_delivered"
 # the same standalone reason.  These CLIs read their prompt from stdin, so a
 # spec for one of them that declares no prompt bytes was written by a launcher
 # that lost the prompt -- the auth relaunch did exactly that -- and is refused.
-PROMPT_ON_STDIN_ADAPTERS = frozenset({"claude_cli", "codex_cli"})
+# NF-2026-01423: the set grew to grok_kilo_cli and opencode_cli when
+# NF-2026-01417 moved their prompts from argv to stdin; keep it equal to the
+# planner's copy or the supervisor spawns those two on an empty stdin.
+PROMPT_ON_STDIN_ADAPTERS = frozenset(
+    {"claude_cli", "codex_cli", "grok_kilo_cli", "opencode_cli"}
+)
 
 
 def _expected_prompt_bytes(spec: dict[str, Any]) -> int:
@@ -1521,7 +1526,16 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
             except OSError:
                 return ""
 
-        _child_rc = child.poll() if child is not None else None
+        # NF-2026-01456: the primary poll() may itself raise a teardown
+        # OSError (AppContainer close-during-poll), so this salvage read must
+        # never be able to replace the supervisor_error record with a second
+        # unhandled death that leaves state=running behind.
+        _child_rc = None
+        if child is not None:
+            try:
+                _child_rc = child.poll()
+            except Exception:
+                _child_rc = None
         _stdout_tail = _salvage_tail(stdout_path)
         _stderr_tail = _salvage_tail(stderr_path)
         try:

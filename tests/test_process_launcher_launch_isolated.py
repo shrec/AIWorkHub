@@ -1241,6 +1241,8 @@ def test_opencode_launch_hands_the_supervisor_the_request_local_awh_config(
 ) -> None:
     if backend == "bubblewrap" and os.name == "nt":
         pytest.skip("bubblewrap is a Linux sandbox")
+    if backend == "windows_appcontainer" and os.name != "nt":
+        pytest.skip("the AppContainer launch path is a Windows sandbox")
     harness = _prepare_opencode_launch(monkeypatch, tmp_path, backend)
     workspace = harness.workspace
     aliased = backend == "bubblewrap"
@@ -1270,20 +1272,39 @@ def test_opencode_launch_hands_the_supervisor_the_request_local_awh_config(
     assert list(config["mcp"]) == ["servers"]
     assert list(config["mcp"]["servers"]) == ["awh"]
     server = config["mcp"]["servers"]["awh"]
-    assert server["command"] == [harness.runtime_command, "-m", _MCP.__name__]
-    environment = server["environment"]
-    assert environment[_MCP.ENV_REQUEST_ID] == _OPENCODE_REQUEST_ID
-    assert environment[_MCP.ENV_REPO] == (
-        worker_workspace.SANDBOX_WORKSPACE if aliased else str(workspace.path)
-    )
-    # The audit binding is spelled where this worker's sandbox shows its HOME.
-    for key, name in (
-        (_MCP.ENV_AUDIT_LEDGER_PATH, "audit_ledger.jsonl"),
-        (_MCP.ENV_AUDIT_HMAC_KEY_PATH, "audit_hmac.key"),
-    ):
-        assert environment[key] == str(worker_home / "task_mcp_worker_runtime" / name)
     spec = _supervisor_spec(harness)
     assert spec is not None
+    if backend == "windows_appcontainer":
+        # NF-2026-00034 for OpenCode: the contained CLI starts only the pipe shim;
+        # the supervisor runs the real server on the host with the request binding.
+        assert server["command"][0].lower().endswith("powershell.exe")
+        assert "environment" not in server
+        bridge = spec["worker_mcp_bridge"]
+        assert server["command"] == bridge["shim_argv"]
+        assert [bridge["command"], *bridge["args"]] == [
+            harness.runtime_command, "-m", _MCP.__name__,
+        ]
+        environment = bridge["env"]
+        assert environment[_MCP.ENV_CONTAINED_WORKER_ADAPTER] == "opencode_cli"
+        assert environment[_MCP.ENV_REQUEST_ID] == _OPENCODE_REQUEST_ID
+        assert environment[_MCP.ENV_REPO] == str(workspace.path)
+        assert bridge["withheld_directories"] == [
+            str(harness.runtime.audit_ledger_path.parent.resolve())
+        ]
+    else:
+        assert "worker_mcp_bridge" not in spec
+        assert server["command"] == [harness.runtime_command, "-m", _MCP.__name__]
+        environment = server["environment"]
+        assert environment[_MCP.ENV_REQUEST_ID] == _OPENCODE_REQUEST_ID
+        assert environment[_MCP.ENV_REPO] == (
+            worker_workspace.SANDBOX_WORKSPACE if aliased else str(workspace.path)
+        )
+        # The audit binding is spelled where this worker's sandbox shows its HOME.
+        for key, name in (
+            (_MCP.ENV_AUDIT_LEDGER_PATH, "audit_ledger.jsonl"),
+            (_MCP.ENV_AUDIT_HMAC_KEY_PATH, "audit_hmac.key"),
+        ):
+            assert environment[key] == str(worker_home / "task_mcp_worker_runtime" / name)
     worker_argv = [str(token) for token in spec["argv"]]
     if backend == "landlock":
         assert _has_run(worker_argv, "--home", str(workspace.home))
@@ -1436,13 +1457,18 @@ def test_opencode_appcontainer_launch_uses_real_provisioning_and_sandbox_argv(
     env = spawn["env"]
     assert env["HOME"] == str(workspace.home)
     server = json.loads(env[runtime_adapters.OPENCODE_WORKER_CONFIG_ENV])["mcp"]["servers"]["awh"]
-    environment = server["environment"]
+    # The contained CLI gets only the pipe shim; the bridge carries the binding.
+    assert "environment" not in server
+    assert server["command"] == spec["worker_mcp_bridge"]["shim_argv"]
+    environment = spec["worker_mcp_bridge"]["env"]
     assert environment[_MCP.ENV_REQUEST_ID] == _OPENCODE_REQUEST_ID
     assert environment[_MCP.ENV_REPO] == str(workspace.path)
     assert environment[_MCP.ENV_AUTHORITY_REPO] == str(harness.authority)
+    assert environment[_MCP.ENV_CONTAINED_WORKER_ADAPTER] == "opencode_cli"
     ledger = Path(environment[_MCP.ENV_AUDIT_LEDGER_PATH])
     assert ledger.is_file()
     assert workspace.home.resolve() in ledger.resolve().parents
+    assert str(ledger.resolve().parent) in spec["worker_mcp_bridge"]["withheld_directories"]
 
     grants = windows_appcontainer.request_scoped_grants(env, str(workspace.path))
     traverse = {

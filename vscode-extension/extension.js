@@ -2,6 +2,7 @@ const vscode = require("vscode");
 const childProcess = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
+const net = require("net");
 const os = require("os");
 const path = require("path");
 const { StringDecoder } = require("string_decoder");
@@ -11,7 +12,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.12.41";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.12.45";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 // NF-2026-00643: this globalStorage trace directory was measured holding 1,102
 // files and 2,235,024,325 bytes (2.24 GB), largest single file 44,626,825 bytes
@@ -13863,6 +13864,10 @@ async function selectRepositoryCommand() {
 
 async function activate(context) {
   extensionContext = context;
+  // NF-154: VS Code drops NODE_OPTIONS for the shared extension host, so the flag must be set at runtime.
+  if (typeof net.setDefaultAutoSelectFamilyAttemptTimeout === "function") {
+    net.setDefaultAutoSelectFamilyAttemptTimeout(1000);
+  }
   initializeDebugTracing(context);
   debugTrace("activation.begin", { version: EXPECTED_MCP_PACKAGE_VERSION });
   outputChannel = createManagedOutputChannel();

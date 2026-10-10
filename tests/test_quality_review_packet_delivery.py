@@ -18,10 +18,16 @@ from aiworkhub import worker_ai_tools_mcp as worker_mcp
 
 CANDIDATE_PATH = "src/aiworkhub/quality_review.py"
 TASK_ID = "NF-2026-00259-PACKET-DELIVERY"
-# NF-2026-01108: the most a stdin-prompt reviewer (claude_cli, codex_cli) is
-# handed inline; past it, and for every other sighted adapter, the packet is a file.
+# NF-2026-01108: the most a stdin-prompt reviewer (claude_cli, codex_cli,
+# grok_kilo_cli, opencode_cli since NF-2026-01417) is handed inline; past it,
+# and for every other sighted adapter, the packet is a file.
 INLINE_CAP = qr.SIGHTED_INLINE_PACKET_MAX_BYTES
-STDIN_PROMPT_ADAPTERS = ("claude_cli", "codex_cli")
+STDIN_PROMPT_ADAPTERS = (
+    "claude_cli",
+    "codex_cli",
+    "grok_kilo_cli",
+    "opencode_cli",
+)
 
 # The exact capability set given to a reviewer on the vscode_lm_in_process
 # sandbox: a Source Graph query tool and a submit tool, and NO file-read tool.

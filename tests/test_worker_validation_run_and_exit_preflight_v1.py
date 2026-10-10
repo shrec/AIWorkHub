@@ -431,6 +431,27 @@ def test_appcontainer_bridge_moves_the_real_server_to_the_host(tmp_path: Path) -
     # ... and the directory holding the key and ledger stays closed to it.
     assert bridge["withheld_directories"] == [str(runtime_dir)]
     assert runtime.audit_hmac_key_path.parent == runtime.audit_ledger_path.parent
+    assert bridge["shim_argv"] == [shim["command"], *shim["args"]]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the shim is Windows PowerShell")
+def test_appcontainer_bridge_names_the_opencode_worker_container(tmp_path: Path) -> None:
+    home, _contract, runtime = _generated_runtime(tmp_path)
+    _config_path, bridge = w.appcontainer_mcp_bridge(
+        runtime, request_id="req1", home=home, stderr_path=tmp_path / "mcp.err",
+        adapter_id="opencode_cli",
+    )
+    assert bridge["env"][w.ENV_CONTAINED_WORKER_ADAPTER] == "opencode_cli"
+    assert bridge["shim_argv"][0].lower().endswith("powershell.exe")
+
+
+def test_appcontainer_bridge_refuses_an_unbridged_adapter(tmp_path: Path) -> None:
+    home, _contract, runtime = _generated_runtime(tmp_path)
+    with pytest.raises(w.WorkerToolError, match="bridge_adapter_unsupported:codex_cli"):
+        w.appcontainer_mcp_bridge(
+            runtime, request_id="req1", home=home, stderr_path=tmp_path / "mcp.err",
+            adapter_id="codex_cli",
+        )
 
 
 @pytest.mark.skipif(os.name != "nt", reason="the shim is Windows PowerShell")

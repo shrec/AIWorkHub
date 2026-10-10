@@ -9,6 +9,7 @@ in ``aiworkhub.dashboard_mcp_app``.
 
 from __future__ import annotations
 
+import html
 import json
 import sys
 from pathlib import Path
@@ -109,6 +110,21 @@ def test_html_escaping() -> None:
     escaped = process_launcher._sanitize_live_output_text("<script>alert(1)</script>")
     assert "<script>" not in escaped
     assert "&lt;script&gt;" in escaped
+
+
+def test_redaction_keeps_worker_jsonl_parseable_after_json_escapes() -> None:
+    secret = "abcd1234efgh5678ijkl9012mnop"
+    for text in (
+        "\u201cfile_evidence_only_for_this_path\u201d",
+        "\u2014file_evidence_only_for_this_path",
+        "line\nfile_evidence_only_for_this_long_path",
+        f"\u201c{secret}",
+    ):
+        line = json.dumps({"type": "aiworkhub_tool_activity", "kind": "reasoning", "text": text})
+        sanitized = html.unescape(process_launcher._sanitize_live_output_text(line))
+        parsed = json.loads(sanitized)
+        assert "redacted" in parsed["text"]
+        assert secret not in sanitized
 
 
 def test_secret_redaction(repo) -> None:

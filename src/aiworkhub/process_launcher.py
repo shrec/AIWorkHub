@@ -1664,10 +1664,14 @@ _C0_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 # never a claim of perfect secret detection, just a defensive mask so an API
 # key/session token pasted into a worker's stdout never survives verbatim
 # into the dashboard's Live Output panel.
-_LONG_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{24,}")
+# A JSON escape (\uXXXX, \n, ...) is matched first and kept whole, so a token starting right
+# after it is redacted without cutting the escape and breaking the worker's JSONL line.
+_LONG_TOKEN_RE = re.compile(r"(\\u[0-9A-Fa-f]{4}|\\.)|[A-Za-z0-9_\-]{24,}")
 
 
 def _redact_long_tokens(match: "re.Match[str]") -> str:
+    if match.group(1) is not None:
+        return match.group(1)
     token = match.group(0)
     if len(token) <= 8:
         return "…redacted…"

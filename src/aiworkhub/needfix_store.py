@@ -2145,6 +2145,286 @@ def resolve_from_commit_trailer(
         conn.close()
 
 
+_ORPHAN_RECONCILE_ELIGIBLE_STATUSES: tuple[str, ...] = ("task_created", "task_planned")
+
+# Card statuses whose closure the store cannot attribute to a verified
+# acceptance flow -- ``close_for_accepted_task`` only ever fires for canonical
+# status "accepted". Deliberately narrower than ``CLOSED_CARD_STATUSES``: a
+# directly-created merge/multi-finding card permanently (and correctly) hides
+# its referenced NeedFix records while canonical status "finished", by design
+# (see the explicit-reference link route in ``reconcile_unlinked_needfix``),
+# so only "archived" -- a closure no accept or merge-card flow ever produces
+# -- is reconciled here.
+_CLOSED_WITHOUT_ACCEPTANCE_CARD_STATUSES: frozenset[str] = frozenset(("archived",))
+
+
+def _card_accepted_outcome_evidence(
+    repo_root: str | Path, task_id: str
+) -> str | None:
+    """Return a bounded evidence ref when ``task_id`` has a verifiable
+    accepted outcome recorded independently of the live ``tasks`` row -- an
+    ``accept_review`` receipt in its durable task events, or an ``accepted``
+    learning-commit judgement -- else ``None``. Fails closed: any read error
+    here is treated as no evidence, never as a positive signal.
+    """
+    try:
+        from aiworkhub import task_store  # lazy: avoid a hard import cycle
+
+        events = task_store.get_task_events(repo_root, task_id)
+    except Exception:
+        events = []
+    for event in events or ():
+        if not isinstance(event, Mapping):
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, Mapping):
+            payload = event.get("detail")
+        if not isinstance(payload, Mapping):
+            raw = event.get("payload_json")
+            if isinstance(raw, str):
+                try:
+                    payload = json.loads(raw)
+                except (TypeError, ValueError):
+                    payload = None
+        if not isinstance(payload, Mapping):
+            continue
+        request_id = str(payload.get("request_id") or "")
+        if accepted_outcome_receipt_is_well_formed(
+            payload, task_id=task_id, request_id=request_id
+        ):
+            return f"accepted_receipt:{task_id}:{request_id}"
+
+    try:
+        from aiworkhub import learning_commit_store
+
+        outcomes = learning_commit_store.read_card_outcomes(repo_root)
+    except Exception:
+        outcomes = {}
+    entry = outcomes.get(task_id) if isinstance(outcomes, Mapping) else None
+    if isinstance(entry, Mapping) and str(entry.get("outcome") or "") == "accepted":
+        request_id = str(entry.get("request_id") or "")
+        suffix = f":{request_id}" if request_id else ""
+        return f"learning_commit:{task_id}{suffix}"
+    return None
+
+
+def _resolve_orphaned_conversion(
+    repo_root: str | Path,
+    needfix_id: str,
+    *,
+    prior_status: str,
+    reason: str,
+    evidence_ref: str,
+) -> dict[str, Any] | None:
+    """Resolve a task_created/task_planned NeedFix on verifiable evidence that
+    its (vanished) linked card's fix already landed. A second,
+    independently-gated direct writer straight to ``resolved`` -- same shape
+    as :func:`resolve_from_commit_trailer` -- not a new edge in the guarded
+    state machine (``VALID_TRANSITIONS`` is unchanged).
+    """
+    conn = _connect(repo_root)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT * FROM needfix WHERE id = ?", (needfix_id,)
+            ).fetchone()
+            if row is None or row["status"] != prior_status:
+                conn.rollback()
+                return None
+            evidence_refs = json.loads(row["evidence_refs_json"] or "[]")
+            if evidence_ref not in evidence_refs:
+                evidence_refs.append(evidence_ref)
+            now = _utcnow_iso()
+            cur = conn.execute(
+                "UPDATE needfix SET status = 'resolved', updated_at = ?, "
+                "resolved_at = ?, evidence_refs_json = ? "
+                "WHERE id = ? AND status = ?",
+                (now, now, json.dumps(evidence_refs), needfix_id, prior_status),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                return None
+            _record_event(conn, needfix_id, "orphaned_conversion_resolved", {
+                "prior_status": prior_status,
+                "reason": reason,
+                "evidence_ref": evidence_ref,
+            })
+            updated = conn.execute(
+                "SELECT * FROM needfix WHERE id = ?", (needfix_id,)
+            ).fetchone()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return _row_to_dict(updated)
+    finally:
+        conn.close()
+
+
+def _return_orphaned_conversion_to_accepted(
+    repo_root: str | Path,
+    needfix_id: str,
+    *,
+    prior_status: str,
+    reason: str,
+) -> dict[str, Any] | None:
+    """Return a task_created/task_planned NeedFix to accepted when its linked
+    card cannot verify the fix landed -- its card is gone, or archived without
+    ever running the accepted-task closure. Clears ``converted_task_id`` so
+    the stale link cannot immediately re-derive CLOSED on the very next read;
+    a fresh ``convert_needfix`` may claim it again. Same independently-gated
+    direct-writer shape as :func:`resolve_from_commit_trailer` -- not a new
+    ``VALID_TRANSITIONS`` edge.
+    """
+    conn = _connect(repo_root)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT * FROM needfix WHERE id = ?", (needfix_id,)
+            ).fetchone()
+            if row is None or row["status"] != prior_status:
+                conn.rollback()
+                return None
+            now = _utcnow_iso()
+            cur = conn.execute(
+                "UPDATE needfix SET status = 'accepted', updated_at = ?, "
+                "converted_task_id = NULL WHERE id = ? AND status = ?",
+                (now, needfix_id, prior_status),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                return None
+            _record_event(
+                conn, needfix_id, "orphaned_conversion_returned_to_accepted",
+                {"prior_status": prior_status, "reason": reason},
+            )
+            updated = conn.execute(
+                "SELECT * FROM needfix WHERE id = ?", (needfix_id,)
+            ).fetchone()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return _row_to_dict(updated)
+    finally:
+        conn.close()
+
+
+def reconcile_orphaned_conversions(
+    repo_root: str | Path,
+    *,
+    get_task_fn: Callable[[str], Mapping[str, Any] | None],
+    canonical_status_fn: Callable[[Mapping[str, Any]], str],
+) -> dict[str, Any]:
+    """Reconcile task_created/task_planned NeedFix rows a linked card can no
+    longer carry forward: a ``converted_task_id`` naming a card that no
+    longer exists, or one whose card was archived without ever running the
+    accepted-task closure. Resolved on verifiable evidence the fix landed
+    anyway (an ``accept_review`` receipt or an accepted learning-commit
+    judgement for that task id); otherwise returned to ``accepted`` so a
+    manager can decide -- never left stranded in ``task_created`` forever.
+
+    Idempotent and best-effort, same shape as :func:`reconcile_unlinked_needfix`:
+    a per-record failure (a card lookup that raises, a lost race) leaves that
+    record exactly as it was, to retry on the next read.
+    """
+    conn = _connect(repo_root)
+    try:
+        placeholders = ", ".join("?" for _ in _ORPHAN_RECONCILE_ELIGIBLE_STATUSES)
+        rows = conn.execute(
+            f"SELECT * FROM needfix WHERE status IN ({placeholders}) "
+            "AND converted_task_id IS NOT NULL AND converted_task_id != '' "
+            "ORDER BY created_at ASC",
+            _ORPHAN_RECONCILE_ELIGIBLE_STATUSES,
+        ).fetchall()
+        records = [_row_to_dict(r) for r in rows]
+    finally:
+        conn.close()
+
+    resolved: list[dict[str, Any]] = []
+    returned_to_accepted: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for record in records:
+        nfid = str(record.get("id") or "").strip()
+        converted_task_id = str(record.get("converted_task_id") or "").strip()
+        prior_status = str(record.get("status") or "").strip()
+        if (
+            not nfid
+            or not converted_task_id
+            or prior_status not in _ORPHAN_RECONCILE_ELIGIBLE_STATUSES
+        ):
+            continue
+        try:
+            card = get_task_fn(converted_task_id)
+        except Exception as exc:
+            skipped.append({
+                "needfix_id": nfid,
+                "reason": f"get_task_failed:{type(exc).__name__}",
+            })
+            continue
+
+        if card is None:
+            evidence_ref = _card_accepted_outcome_evidence(repo_root, converted_task_id)
+            if evidence_ref:
+                updated = _resolve_orphaned_conversion(
+                    repo_root, nfid, prior_status=prior_status,
+                    reason="linked_card_missing", evidence_ref=evidence_ref,
+                )
+                if updated is not None:
+                    resolved.append({
+                        "needfix_id": nfid, "reason": "linked_card_missing",
+                        "evidence_ref": evidence_ref,
+                    })
+                    continue
+            updated = _return_orphaned_conversion_to_accepted(
+                repo_root, nfid, prior_status=prior_status,
+                reason="linked_card_missing",
+            )
+            if updated is not None:
+                returned_to_accepted.append({
+                    "needfix_id": nfid, "reason": "linked_card_missing",
+                })
+            continue
+
+        try:
+            card_status = canonical_status_fn(card)
+        except Exception:
+            skipped.append({"needfix_id": nfid, "reason": "canonical_status_failed"})
+            continue
+        if card_status in _CLOSED_WITHOUT_ACCEPTANCE_CARD_STATUSES:
+            evidence_ref = _card_accepted_outcome_evidence(repo_root, converted_task_id)
+            if evidence_ref:
+                updated = _resolve_orphaned_conversion(
+                    repo_root, nfid, prior_status=prior_status,
+                    reason="linked_card_archived_accepted", evidence_ref=evidence_ref,
+                )
+                if updated is not None:
+                    resolved.append({
+                        "needfix_id": nfid, "reason": "linked_card_archived_accepted",
+                        "evidence_ref": evidence_ref,
+                    })
+                    continue
+            updated = _return_orphaned_conversion_to_accepted(
+                repo_root, nfid, prior_status=prior_status,
+                reason="linked_card_closed_unaccepted",
+            )
+            if updated is not None:
+                returned_to_accepted.append({
+                    "needfix_id": nfid, "reason": "linked_card_closed_unaccepted",
+                })
+
+    return {
+        "total_candidates": len(records),
+        "resolved": resolved,
+        "resolved_count": len(resolved),
+        "returned_to_accepted": returned_to_accepted,
+        "returned_to_accepted_count": len(returned_to_accepted),
+        "skipped": skipped,
+        "skipped_count": len(skipped),
+    }
+
 def update_needfix(
     repo_root: str | Path,
     needfix_id: str,

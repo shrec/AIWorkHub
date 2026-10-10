@@ -62,6 +62,27 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.45
+
+- A lost Kilo or OpenCode worker prompt now fails closed (`worker_prompt_not_delivered`) instead of launching the CLI on an empty stdin (NF-2026-01423).
+- Linux sandbox verified on WSL2 (Landlock+seccomp): the OpenCode chmod no-op answers success without changing modes while chown stays denied.
+- New `opencode_go_api_key_env` auth helper reads the projected OpenCode auth file fail-closed.
+
+## What's new in 0.12.44
+
+- Kilo/Grok workers on Linux run again: the chmod change from 0.12.43 now applies only to OpenCode workers (NF-2026-00153).
+
+## What's new in 0.12.43
+
+- OpenCode workers start in the Linux sandbox: a chmod inside the worker reports success without changing anything, instead of killing OpenCode's server (NF-2026-00153).
+
+## What's new in 0.12.42
+
+- OpenCode workers on Windows finish their work: the sandboxed CLI no longer hangs, and it reaches the AIWorkHub worker tools through the host bridge (NF-2026-01454).
+- Live output shows OpenCode, DeepSeek and GLM worker steps as readable rows (reasoning, tools, progress).
+- Non-ASCII provider output no longer shows up as unparsed lines.
+- Kilo cannot run in the Windows sandbox; use Grok through OpenCode.
+
 ## What's new in 0.12.41
 
 - Rank and preflight agree on which workers can run a card (NF-2026-00731).

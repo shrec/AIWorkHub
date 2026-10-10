@@ -1,5 +1,45 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.45 — 2026-10-11
+
+### Fixed
+
+- Workers: the prompt-on-stdin guard now covers the Kilo and OpenCode CLIs too, so a lost prompt fails closed instead of launching on an empty stdin (NF-2026-01423).
+- Bundled runtime 0.12.45: `opencode_go_api_key_env` auth helper and the Windows/Linux portability fix in the OpenCode launch-contract test.
+- Bundled runtime: the worker supervisor persists `supervisor_error` even when the AppContainer child teardown raises out of `poll()` (NF-2026-01456), so a dying contained worker never leaves its card on a stale `running` status.
+
+### Qualification
+
+- Linux sandbox (Landlock+seccomp) smoke verified on WSL2; suite green on Windows and Linux.
+
+## 0.12.44 — 2026-10-11
+
+### Fixed
+
+- Linux worker sandbox: the chmod no-op applies only to OpenCode workers again; Kilo/Grok and the other workers keep the 0.12.42 behaviour, which 0.12.43 had broken (NF-2026-00153).
+
+## 0.12.43 — 2026-10-11
+
+### Fixed
+
+- Linux worker sandbox: chmod-family calls report success without changing the mode in worker mode, so OpenCode 2.x workers start instead of dying on `EPERM` (NF-2026-00153).
+
+## 0.12.42 — 2026-10-11
+
+### Fixed
+
+- OpenCode workers on Windows reach the model turn (compat CLI winfix.5) and reach the worker MCP server through the host pipe bridge (NF-2026-01454).
+- Live output keeps JSON escapes intact during redaction, so non-ASCII provider lines parse.
+- Activation sets the dual-stack connect fallback at runtime (NF-154).
+
+### Added
+
+- Live output timeline rows for OpenCode/Kilo JSONL parts and DeepSeek/GLM VS Code LM events, with coalesced reasoning chunks and heartbeats.
+
+### Known limitations
+
+- Kilo cannot start inside the Windows AppContainer (Bun async `realpath` returns `EPERM`). Use Grok through OpenCode.
+
 ## 0.12.41 — 2026-10-09
 
 ### Fixed

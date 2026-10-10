@@ -2467,11 +2467,15 @@ def build_runtime_command(
 # never the prompt itself -- so the supervisor can tell a plan that has no
 # prompt apart from a plan whose prompt was lost before it arrived.
 WORKER_PROMPT_BYTES_SPEC_KEY = "stdin_text_bytes"
-# NF-2026-01354.  The adapters whose plan carries the prompt on stdin (the two
-# ``stdin_text = prompt`` branches above).  A supervisor spec for one of them
-# that omits WORKER_PROMPT_BYTES_SPEC_KEY was built by a launcher that forgot
-# the prompt, and the supervisor refuses it rather than spawn the CLI on EOF.
-PROMPT_ON_STDIN_ADAPTERS: frozenset[str] = frozenset({"claude_cli", "codex_cli"})
+# NF-2026-01354.  The adapters whose plan carries the prompt on stdin (the
+# four ``stdin_text = prompt`` branches above: claude_cli, codex_cli,
+# grok_kilo_cli and opencode_cli since NF-2026-01417).  A supervisor spec for
+# one of them that omits WORKER_PROMPT_BYTES_SPEC_KEY was built by a launcher
+# that forgot the prompt, and the supervisor refuses it rather than spawn the
+# CLI on EOF.
+PROMPT_ON_STDIN_ADAPTERS: frozenset[str] = frozenset(
+    {"claude_cli", "codex_cli", "grok_kilo_cli", "opencode_cli"}
+)
 
 
 def plan_stdin_payload(plan: object) -> bytes | None:

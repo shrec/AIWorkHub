@@ -355,8 +355,44 @@ def test_supervisor_error_status_salvages_bounded_child_outputs(
     assert "salvage-out" in salvage["stdout_tail"]
     assert "salvage-err" in salvage["stderr_tail"]
     assert salvage["child_returncode"] == 42
+def test_poll_teardown_error_still_persists_supervisor_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NF-2026-01456: an AppContainer child whose poll() raises a teardown
+    OSError (close-during-poll) must still land a supervisor_error status.
 
+    Measured on request 82cfa108be824721b03735d079a60b45: the main-loop
+    poll() raised during bridge/launch teardown, the except handler ran, and
+    its UNguarded salvage ``child.poll()`` raised the same error again -- the
+    supervisor died with its last persisted state still ``running``, so the
+    launcher classified ``worker_failed:supervisor_incomplete:state=running``.
+    The salvage read must swallow a raising poll and persist the record."""
+    real_popen = worker_supervisor.subprocess.Popen
 
+    def popen_with_raising_poll(argv, **kwargs):
+        child = real_popen(argv, **kwargs)
+
+        def raising_poll():
+            raise OSError("appcontainer_close_during_poll")
+
+        child.poll = raising_poll
+        return child
+
+    monkeypatch.setattr(worker_supervisor.signal, "signal", lambda *a, **k: None)
+    monkeypatch.setattr(worker_supervisor.subprocess, "Popen", popen_with_raising_poll)
+    spec_path, spec = _spec(
+        tmp_path,
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+    )
+
+    rc = worker_supervisor.supervise(spec)
+
+    assert rc == 126
+    status = _read_status(Path(spec["status_path"]))
+    assert status["state"] == "supervisor_error"
+    assert status["child_returncode"] is None
+    assert "appcontainer_close_during_poll" in status["error"]
 def test_supervisor_status_write_failure_emits_bounded_stderr_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

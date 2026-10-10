@@ -4770,7 +4770,147 @@ function reasoningTimelineEvent(event, rawLine) {
     rawLine,
   );
 }
+
+// OpenCode and Kilo `run --format json`: {type, sessionID, part:{type:"text"|"reasoning"|"tool"|"step-start"|"step-finish"}}.
+const OPENCODE_PART_TYPES = new Set(["text", "reasoning", "tool", "tool_use", "step_start", "step_finish"]);
+
+function opencodeRawEvent(event) {
+  const part = event.part && typeof event.part === "object" ? event.part : {};
+  const metadata = part.metadata && typeof part.metadata === "object" ? part.metadata : null;
+  if (!metadata || metadata.reasoningEncryptedContent === undefined) {
+    return safeRawEvent(event);
+  }
+  // Encrypted provider reasoning is opaque bookkeeping, never shown even in the raw row.
+  return safeRawEvent({...event, part: {...part, metadata: {...metadata, reasoningEncryptedContent: "[encrypted]"}}});
+}
+
+function opencodeToolText(value) {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch (_error) {
+    return String(value);
+  }
+}
+
+function opencodePartTimelineEvent(event) {
+  const part = event.part && typeof event.part === "object" && !Array.isArray(event.part) ? event.part : null;
+  if (!part || typeof event.type !== "string") {
+    return undefined;
+  }
+  const kind = event.type.toLowerCase().replace(/-/g, "_");
+  const partKind = String(part.type || "").toLowerCase().replace(/-/g, "_");
+  const resolved = kind.endsWith("part.updated") ? partKind : kind;
+  if (!OPENCODE_PART_TYPES.has(resolved) && !OPENCODE_PART_TYPES.has(partKind)) {
+    return undefined;
+  }
+  const raw = opencodeRawEvent(event);
+  const type = OPENCODE_PART_TYPES.has(resolved) ? resolved : partKind;
+  if (type === "step_start") {
+    return null;
+  }
+  if (type === "reasoning") {
+    const text = firstText(part.text);
+    return {...reasoningRow(text, raw), raw, activityOutput: text ? redactDisplayText(text, 8192) : undefined};
+  }
+  if (type === "text") {
+    const text = firstText(part.text);
+    return {
+      kind: "event", title: "Assistant", label: "assistant", state: "running",
+      message: redactDisplayText(text, 180) || "(assistant response in progress)",
+      metrics: [], raw, activityOutput: text ? redactDisplayText(text, 8192) : undefined,
+    };
+  }
+  if (type === "step_finish") {
+    const tokens = part.tokens && typeof part.tokens === "object" ? part.tokens : {};
+    const cache = tokens.cache && typeof tokens.cache === "object" ? tokens.cache : {};
+    const reason = firstText(part.reason);
+    return {
+      kind: "event", title: "Step finished", label: "step", state: "completed",
+      message: reason ? `reason ${redactDisplayText(reason, 48)}` : "Step completed",
+      metrics: [
+        tokens.input !== undefined ? `${formatCount(tokens.input)} in` : "",
+        tokens.output !== undefined ? `${formatCount(tokens.output)} out` : "",
+        numberValue(tokens.reasoning) ? `${formatCount(tokens.reasoning)} reasoning` : "",
+        numberValue(cache.read) ? `${formatCount(cache.read)} cached` : "",
+        part.cost !== undefined ? formatMoney(part.cost) : "",
+      ].filter(Boolean),
+      raw,
+    };
+  }
+  const state = part.state && typeof part.state === "object" ? part.state : {};
+  const status = firstText(state.status) || "running";
+  const failed = status === "error";
+  const name = redactDisplayText(firstText(part.tool, part.name, state.title) || "tool", 80);
+  const input = state.input !== undefined ? state.input : part.input;
+  const inputObject = input && typeof input === "object" ? input : {};
+  const summary = firstText(state.title !== name ? state.title : "", inputObject.command, inputObject.path,
+    inputObject.filePath, inputObject.pattern, inputObject.url, inputObject.query);
+  return {
+    kind: failed ? "error" : "event",
+    title: `Tool | ${name}`,
+    label: name,
+    state: failed ? "failed" : status,
+    message: redactDisplayText(failed ? firstText(state.error, summary) : summary, 180) || name,
+    metrics: [],
+    raw,
+    activityInput: redactDisplayText(opencodeToolText(input), 8192),
+    activityOutput: redactDisplayText(opencodeToolText(failed ? firstText(state.error, state.output) : state.output), 8192),
+  };
+}
+// VS Code LM workers (DeepSeek/GLM) emit an emulated tool call as a JSON envelope in assistant text.
+function vscodeLmToolRequest(text) {
+  const candidate = String(text || "").trim();
+  if (!candidate.startsWith("{") || !candidate.includes("aiworkhub.vscode_lm.tool_request")) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(candidate);
+    return parsed && typeof parsed === "object" && typeof parsed.name === "string" ? parsed : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function vscodeLmProgressEvent(event, rawLine) {
+  const phase = firstText(event.phase) || "progress";
+  if (phase === "tool_turn") {
+    const toolState = firstText(event.tool_state) || "unknown";
+    const failed = toolState === "failed" || Boolean(firstText(event.error_code));
+    return {
+      kind: failed ? "error" : "event",
+      title: "Tool turn",
+      label: redactDisplayText(firstText(event.tool_name) || "tool", 200),
+      state: toolState,
+      message: [
+        firstText(event.error_code) ? `error ${redactDisplayText(event.error_code, 80)}` : "",
+        firstText(event.timeout_phase) ? `timeout phase ${redactDisplayText(event.timeout_phase, 48)}` : "",
+      ].filter(Boolean).join(" | ") || `Tool ${toolState}`,
+      metrics: isMeasured(event.elapsed_ms) ? [`duration ${formatDuration(event.elapsed_ms)}`] : [],
+      raw: safeRawEvent(rawLine),
+    };
+  }
+  const labels = {
+    request_accepted: "Request accepted",
+    provider_response: "Model responding",
+  };
+  return {
+    kind: "event",
+    title: labels[phase] || `Progress | ${redactDisplayText(phase.replace(/[._-]+/g, " "), 48)}`,
+    label: "progress",
+    state: phase === "request_accepted" ? "started" : "running",
+    message: firstText(event.updated_at) ? `at ${redactDisplayText(event.updated_at, 40)}` : "Worker is active",
+    metrics: [],
+    raw: safeRawEvent(rawLine),
+    progressPhase: phase,
+  };
+}
+
 function timelineEventFromObject(event, rawLine) {
+  if (event.type === "aiworkhub_progress") {
+    return vscodeLmProgressEvent(event, rawLine);
+  }
   if (event.type === "aiworkhub_tool_activity") {
     const status = event.kind === "status";
     const capture = ["available", "limited", "unavailable", "unknown"].includes(event.capture_status)
@@ -4778,7 +4918,14 @@ function timelineEventFromObject(event, rawLine) {
     if (event.kind === "reasoning" || event.kind === "assistant_text") {
       const textOutput = redactDisplayText(event.text || "", 8192);
       if (event.kind === "reasoning") {
-        return {...reasoningRow(event.text, rawLine), activityOutput: textOutput};
+        return {...reasoningRow(event.text, rawLine), activityOutput: textOutput, reasoningChunk: String(event.text || "")};
+      }
+      const toolRequest = vscodeLmToolRequest(event.text);
+      if (toolRequest) {
+        const name = redactDisplayText(toolRequest.name, 200);
+        return {kind: "event", title: `Tool request | ${name}`, label: name, state: "requested",
+          message: redactDisplayText(opencodeToolText(toolRequest.input), 180) || name, metrics: [], raw: safeRawEvent(rawLine),
+          activityInput: redactDisplayText(opencodeToolText(toolRequest.input), 8192)};
       }
       return {kind: "event", title: "Assistant", label: "assistant", state: "running",
         message: redactDisplayText(event.text || "", 180) || "(assistant response in progress)", metrics: [], raw: safeRawEvent(rawLine),
@@ -4823,6 +4970,10 @@ function timelineEventFromObject(event, rawLine) {
       metrics: [],
       raw: safeRawEvent(rawLine),
     };
+  }
+  const opencodePartEvent = opencodePartTimelineEvent(event);
+  if (opencodePartEvent !== undefined) {
+    return opencodePartEvent;
   }
   const toolResultEvent = toolResultEventFromUserMessage(event, rawLine);
   if (toolResultEvent) {
@@ -4910,7 +5061,43 @@ function timelineEventsFromText(decoded) {
       raw: safeRawEvent(line),
     });
   }
-  return events;
+  return coalesceTimelineEvents(events);
+}
+
+// Streamed reasoning chunks and model heartbeats would otherwise push tool rows out of the 200-row window.
+function coalesceTimelineEvents(events) {
+  const merged = [];
+  let heartbeat = null;
+  let heartbeatCount = 0;
+  for (const event of events) {
+    if (event.progressPhase === "provider_response") {
+      heartbeat = event;
+      heartbeatCount += 1;
+      continue;
+    }
+    const previous = merged[merged.length - 1];
+    if (event.reasoningChunk !== undefined && previous && previous.reasoningChunk !== undefined) {
+      previous.reasoningChunk += event.reasoningChunk;
+      previous.reasoningChunks += 1;
+      previous.raw = event.raw;
+      continue;
+    }
+    merged.push(event.reasoningChunk !== undefined ? {...event, reasoningChunks: 1} : event);
+  }
+  for (const event of merged) {
+    if (event.reasoningChunks > 1) {
+      event.message = redactDisplayText(event.reasoningChunk, 180) || event.message;
+      event.activityOutput = redactDisplayText(event.reasoningChunk, 8192);
+      event.metrics = [`${formatCount(event.reasoningChunks)} chunks`];
+    }
+  }
+  if (heartbeat) {
+    // Placed where the latest heartbeat would sort: just before any final result row.
+    const summary = {...heartbeat, metrics: [`${formatCount(heartbeatCount)} updates`]};
+    const resultIndex = merged.findIndex((event) => event.kind === "result");
+    merged.splice(resultIndex === -1 ? merged.length : resultIndex, 0, summary);
+  }
+  return merged;
 }
 
 function formatDuration(milliseconds) {

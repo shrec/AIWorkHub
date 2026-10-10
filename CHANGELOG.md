@@ -6,6 +6,60 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.45] - 2026-10-11
+
+### Fixed
+
+- Workers: the NF-2026-01354 prompt-on-stdin guard now names every adapter whose plan carries the prompt on stdin. `grok_kilo_cli` and `opencode_cli` moved their prompt from argv to stdin in 0.12.34 (NF-2026-01417), but the guard set still named only claude/codex, so a launcher that lost a Kilo/OpenCode prompt would have spawned the CLI on an empty stdin instead of failing closed with `worker_prompt_not_delivered` (NF-2026-01423). Both copies (`runtime_adapters.PROMPT_ON_STDIN_ADAPTERS` and the standalone supervisor mirror) stay equal and are pinned by the existing drift test; the reviewer inline-packet set in `quality_review` follows the same four adapters.
+- OpenCode auth: `opencode_go_api_key_env` reads the projected `auth.json` in an isolated worker HOME and returns the `opencode-go` API key as an `OPENCODE_API_KEY` env mapping, fail-closed (`{}`) for every other document shape (added with its regression tests; no caller yet).
+- Worker supervisor: the `supervisor_error` salvage no longer re-raises a failing `child.poll()` (NF-2026-01456, measured on request 82cfa108be824721b03735d079a60b45: an AppContainer close-during-poll teardown error killed the supervisor with its persisted state still `running`, and the card landed `worker_failed:supervisor_incomplete`). The salvage read is guarded and the terminal record is always persisted; red/green regression included.
+
+### Qualification
+
+- Linux (WSL2 Ubuntu, kernel 6.18, real Landlock+seccomp): the 0.12.44 chmod no-op smoke test passes — chmod/fchmod return 0 without changing the mode, chown stays denied; `select_sandbox_backend` resolves `landlock`; the OpenCode landlock/bubblewrap launch-contract tests pass beside it.
+- The `windows_appcontainer` parameter of the OpenCode launch-contract test now skips on non-Windows hosts symmetrically with the Linux-only parameters, so the suite is green on both OSes.
+
+## [0.12.44] - 2026-10-11
+
+### Fixed
+
+- Linux worker sandbox: the 0.12.43 chmod no-op is limited to OpenCode workers (`opencode_cli`), the only CLI measured to need it. 0.12.43 applied it to every worker, and Kilo/Grok workers began aborting before doing any work (`MessageAbortedError: Aborted`, "Server did not acknowledge session completion"). All other workers get the 0.12.42 `EPERM` answer again (NF-2026-00153).
+
+### Qualification
+
+- Regressions pin the scope: `sandbox_argv` requests the no-op only for `opencode_cli` worker launches and never for validation, and `_landlock_exec` keeps `EPERM` without the flag. The Linux real-sandbox smoke test still needs a Linux run.
+
+## [0.12.43] - 2026-10-11
+
+### Fixed
+
+- Linux worker sandbox: in worker mode (no validation exec scratch) the chmod family (`chmod`, `fchmod`, `fchmodat`, `fchmodat2`) reports success without changing any mode, instead of `EPERM`. OpenCode 2.x chmods its own database at startup and its standalone server died on `EPERM` ("Standalone server exited before reporting readiness") (NF-2026-00153). No metadata can change; ownership, xattr, timestamp and `ptrace` stay denied, and the validation lane keeps its broker and `EPERM` answers.
+
+### Qualification
+
+- Unit regressions cover the worker/validation split and the filter actions; a Linux-only real Landlock+seccomp smoke test checks that chmod returns 0, the mode is unchanged and `chown` is still denied. That smoke test is skipped on Windows and still needs a Linux run.
+
+## [0.12.42] - 2026-10-11
+
+### Fixed
+
+- OpenCode workers on Windows: the compat CLI (winfix.5) no longer hangs inside the AppContainer when it stops an already-exited child, so the run reaches the model turn (NF-2026-01454).
+- OpenCode workers on Windows: the worker MCP server runs on the host and the contained OpenCode CLI reaches it through the pipe shim, as Claude workers do. Before this, the `awh` server closed because the sandbox cannot run the venv Python (NF-2026-01454).
+- Live output: worker JSONL redaction leaves JSON escape sequences (`\uXXXX`) intact, so long non-ASCII provider lines stay parseable instead of showing as unparsed lines.
+- Extension: activation sets a short dual-stack connect fallback at runtime, because VS Code drops `NODE_OPTIONS` for the shared extension host (NF-154).
+
+### Added
+
+- Live output: OpenCode/Kilo JSONL parts (reasoning, assistant text, tools, step metrics) and DeepSeek/GLM VS Code LM events (tool requests, tool turns, request progress) render as readable timeline rows; reasoning chunks and provider heartbeats are coalesced.
+
+### Known limitations
+
+- Kilo (`grok_kilo_cli`) cannot start inside the Windows AppContainer: its embedded Bun `fs.promises.realpath` fails with `EPERM` on every path. Use Grok through OpenCode.
+
+### Qualification
+
+- Each change has regressions that fail before and pass after; the touched suites and the extension tests pass. Installation and a live OpenCode replay are separate evidence.
+
 ## [0.12.41] - 2026-10-09
 
 ### Fixed

@@ -964,14 +964,34 @@ def launch_isolated(
                 # The generated request-local ``awh`` MCP config reaches the
                 # worker only through its own environment.  Any refusal is
                 # raised here, before the claim and before a supervisor spawns.
-                provider_env = {
-                    **(provider_env or {}),
-                    **provision_opencode_worker_config(
+                opencode_env = provision_opencode_worker_config(
+                    workspace,
+                    worker_mcp_runtime,
+                    backend=sandbox_backend,
+                    authority_repo=authority_repo,
+                )
+                if sandbox_backend == "windows_appcontainer":
+                    # NF-2026-00034 for OpenCode: the contained CLI cannot read the
+                    # venv or package root, so the validated server runs on the host.
+                    _bridge_config, worker_mcp_bridge = (
+                        worker_ai_tools_mcp.appcontainer_mcp_bridge(
+                            worker_mcp_runtime,
+                            request_id=request_id,
+                            home=workspace.home,
+                            stderr_path=self.process_dir / f"{request_id}.worker-mcp.stderr.log",
+                            adapter_id=adapter_id,
+                        )
+                    )
+                    opencode_env = provision_opencode_worker_config(
                         workspace,
                         worker_mcp_runtime,
                         backend=sandbox_backend,
                         authority_repo=authority_repo,
-                    ),
+                        bridge_shim_argv=worker_mcp_bridge["shim_argv"],
+                    )
+                provider_env = {
+                    **(provider_env or {}),
+                    **opencode_env,
                 }
             # Provision the request-owned temp authority before composing
             # the Landlock command.  sandbox_argv deliberately grants

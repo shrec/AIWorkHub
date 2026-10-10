@@ -61,10 +61,14 @@ _SOURCE_GRAPH_TOOL = "aiworkhub_worker_source_graph_query"
 _PACKET_READ_TOOL = "aiworkhub_worker_quality_review_packet_read"
 
 # Sighted adapters whose prompt reaches the child on stdin, never argv, so a large
-# inline packet cannot hit E2BIG: runtime_adapters.py:2185 (claude_cli) and :2214
-# (codex_cli) both set ``stdin_text = prompt``.  Every other sighted adapter keeps
-# the file transport, which is what protects its argv.
-_STDIN_PROMPT_ADAPTERS = frozenset({"claude_cli", "codex_cli"})
+# inline packet cannot hit E2BIG: claude_cli, codex_cli, grok_kilo_cli and
+# opencode_cli all set ``stdin_text = prompt`` in build_runtime_command (the
+# Kilo/OpenCode pair since NF-2026-01417, tracked by NF-2026-01423).  Every
+# other sighted adapter keeps the file transport, which is what protects its
+# argv.
+_STDIN_PROMPT_ADAPTERS = frozenset(
+    {"claude_cli", "codex_cli", "grok_kilo_cli", "opencode_cli"}
+)
 # The most such a reviewer is handed inline.  The file transport costs it a
 # quality_review_packet_read call per part (NF-2026-01108: 369 in 187 reviews,
 # 25% of all reviewer tool calls) and every call re-sends the whole context.

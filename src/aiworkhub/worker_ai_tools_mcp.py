@@ -8815,10 +8815,13 @@ def generate_worker_mcp_runtime(
 
 
 APPCONTAINER_BRIDGE_CONFIG_NAME = "worker_mcp_bridge.json"
-# The one adapter process_launcher_launch_isolated bridges (the server is the
+# The default adapter process_launcher_launch_isolated bridges (the server is the
 # one the generated Claude config names).  Bound into the bridged server's env
 # so validation_run can name the worker's own container (NF-2026-01120).
 APPCONTAINER_BRIDGE_ADAPTER_ID = "claude_cli"
+# Adapters whose contained CLI reaches the worker MCP server through the bridge:
+# a Python interpreter or package root is never readable from inside the container.
+APPCONTAINER_BRIDGE_ADAPTER_IDS: tuple[str, ...] = ("claude_cli", "opencode_cli")
 # Every binding that names a file the server reads or writes for authority.
 APPCONTAINER_BRIDGE_AUTHORITY_FILES: tuple[str, ...] = (
     ENV_AUDIT_LEDGER_PATH,
@@ -8830,7 +8833,12 @@ APPCONTAINER_BRIDGE_AUTHORITY_FILES: tuple[str, ...] = (
 
 
 def appcontainer_mcp_bridge(
-    runtime: WorkerMcpRuntime, *, request_id: str, home: Path, stderr_path: Path
+    runtime: WorkerMcpRuntime,
+    *,
+    request_id: str,
+    home: Path,
+    stderr_path: Path,
+    adapter_id: str = APPCONTAINER_BRIDGE_ADAPTER_ID,
 ) -> tuple[Path, dict[str, Any]]:
     """Split one Windows AppContainer worker's MCP runtime across the
     container boundary (NF-2026-00034).
@@ -8842,6 +8850,8 @@ def appcontainer_mcp_bridge(
     now starts on the host, marked contained so it executes nothing.  The
     runtime directory, which holds the audit key and ledger the worker never
     needs once the server lives outside, is withheld from the container.
+    The spec also carries ``shim_argv`` for a CLI (OpenCode) whose MCP config
+    is not the Claude file shape.
 
     Every file the host server reads for authority must be one the container
     cannot alter, so each lives in that withheld directory: the audit key and
@@ -8854,13 +8864,15 @@ def appcontainer_mcp_bridge(
 
     from . import windows_appcontainer
 
+    if adapter_id not in APPCONTAINER_BRIDGE_ADAPTER_IDS:
+        raise WorkerToolError(f"appcontainer_bridge_adapter_unsupported:{adapter_id}")
     runtime_dir = runtime.audit_ledger_path.parent.resolve()
     real = json.loads(runtime.claude_mcp_config_path.read_text(encoding="utf-8"))
     server = real["mcpServers"][SERVER_NAME]
     env = {
         **server["env"],
         ENV_CONTAINED_WORKER: "windows_appcontainer",
-        ENV_CONTAINED_WORKER_ADAPTER: APPCONTAINER_BRIDGE_ADAPTER_ID,
+        ENV_CONTAINED_WORKER_ADAPTER: adapter_id,
     }
     sealed = env.get(ENV_CONTRACT_PACKET_PATH)
     if sealed:
@@ -8885,6 +8897,7 @@ def appcontainer_mcp_bridge(
         "cwd": str(runtime_dir),
         "stderr_path": str(stderr_path),
         "withheld_directories": [str(runtime_dir)],
+        "shim_argv": [str(part) for part in shim],
     }
 
 

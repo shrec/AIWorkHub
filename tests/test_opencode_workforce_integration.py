@@ -921,6 +921,34 @@ def test_opencode_request_config_binds_the_exact_request_for_every_sandbox(
     assert "model" not in config and "provider" not in config
 
 
+def test_opencode_appcontainer_bridge_shim_replaces_the_contained_server(
+    tmp_path: Path,
+) -> None:
+    # NF-2026-00034 for OpenCode: the contained CLI cannot read the venv or the
+    # package root, so its ``awh`` server is the pipe shim with no environment.
+    workspace, runtime, authority = _opencode_request(tmp_path, "windows_appcontainer")
+    shim = ["C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "-NoLogo"]
+    delivered = worker_workspace.provision_opencode_worker_config(
+        workspace, runtime, backend="windows_appcontainer", authority_repo=authority,
+        bridge_shim_argv=shim,
+    )
+    server = json.loads(delivered[_OC_ENV])["mcp"]["servers"]["awh"]
+    assert server["command"] == shim
+    assert "environment" not in server
+    assert delivered[_OC_NO_PROJECT] == "1"
+
+
+def test_opencode_bridge_shim_is_refused_outside_the_appcontainer(tmp_path: Path) -> None:
+    workspace, runtime, authority = _opencode_request(tmp_path, "landlock")
+    with pytest.raises(
+        runtime_adapters.OpenCodeWorkerConfigError, match="bridge_backend_unsupported"
+    ):
+        worker_workspace.provision_opencode_worker_config(
+            workspace, runtime, backend="landlock", authority_repo=authority,
+            bridge_shim_argv=["shim.exe"],
+        )
+
+
 def test_opencode_request_configs_never_cross_repositories(tmp_path: Path) -> None:
     first = _opencode_request(tmp_path / "repo-a", request_id="R-a")
     second = _opencode_request(tmp_path / "repo-b", request_id="R-b")

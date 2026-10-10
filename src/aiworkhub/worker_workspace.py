@@ -36,7 +36,7 @@ import time
 import types
 import uuid
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
@@ -4072,6 +4072,7 @@ def provision_opencode_worker_config(
     *,
     backend: str,
     authority_repo: Path,
+    bridge_shim_argv: Sequence[str] | None = None,
 ) -> dict[str, str]:
     """The request-local OpenCode environment for one exact launch, or a typed refusal.
 
@@ -4174,10 +4175,19 @@ def provision_opencode_worker_config(
     elif not os.access(command, os.X_OK):
         raise error("command_not_executable", command)
 
+    if bridge_shim_argv is not None and backend != WINDOWS_APPCONTAINER_BACKEND:
+        raise error("bridge_backend_unsupported", str(backend))
     try:
-        config = runtime_adapters.build_opencode_worker_mcp_config(
-            [command, *args], environment=projected
-        )
+        if bridge_shim_argv is not None:
+            # NF-2026-00034 bridge: the server runs on the host with the bindings
+            # validated above; the contained CLI only starts the stdio<->pipe shim.
+            config = runtime_adapters.build_opencode_worker_mcp_config(
+                list(bridge_shim_argv), environment=None
+            )
+        else:
+            config = runtime_adapters.build_opencode_worker_mcp_config(
+                [command, *args], environment=projected
+            )
     except ValueError as exc:
         raise error("malformed", str(exc)) from exc
     return {
@@ -9455,6 +9465,11 @@ def sandbox_argv(
         # directory actually existing so a request without a provisioned temp
         # root (or an invalid identity) never widens the ruleset.
         worker_temp_flags = _landlock_worker_temp_flags(workspace)
+        noop_chmod_flags = (
+            ["--noop-chmod"]
+            if adapter_id == "opencode_cli" and validation_exec_scratch is None
+            else []
+        )
         return [
             sys.executable,
             str(Path(__file__).resolve()),
@@ -9466,6 +9481,7 @@ def sandbox_argv(
             *worker_temp_flags,
             *cwd_flags,
             *authority_flags,
+            *noop_chmod_flags,
             "--",
             *adapter_argv,
         ]
@@ -11507,7 +11523,9 @@ def _publish_metadata_authority_roots(roots: "tuple[str, ...]") -> None:
 
 
 def _apply_metadata_seccomp(
-    *, brokered_chmod_syscalls: "frozenset[str]" = frozenset()
+    *,
+    brokered_chmod_syscalls: "frozenset[str]" = frozenset(),
+    noop_chmod: bool = False,
 ) -> None:
     """Load the deny-only metadata filter for a child with no broker of its own.
 
@@ -11551,11 +11569,17 @@ def _apply_metadata_seccomp(
         raise WorkspaceError("seccomp_init_failed")
     try:
         action = _SCMP_ACT_ERRNO | errno.EPERM
+        # SECCOMP_RET_ERRNO with errno 0: the call reports success and the kernel never runs it.
+        noop_action = _SCMP_ACT_ERRNO
+        chmod_family = frozenset(_METADATA_BROKER_CHMOD_SYSCALLS)
         for name in denied:
             number = library.seccomp_syscall_resolve_name(name.encode("ascii"))
             if number < 0:
                 continue
-            result = library.seccomp_rule_add(context, action, number, 0)
+            rule_action = (
+                noop_action if noop_chmod and name in chmod_family else action
+            )
+            result = library.seccomp_rule_add(context, rule_action, number, 0)
             if result != 0:
                 raise WorkspaceError(f"seccomp_rule_failed:{name}:{-result}")
         result = library.seccomp_load(context)
@@ -11798,6 +11822,7 @@ def _landlock_exec(argv: list[str]) -> int:
     parser.add_argument("--worker-temp", default=None)
     parser.add_argument("--cwd", default=None)
     parser.add_argument("--outer-validation-authority", action="store_true")
+    parser.add_argument("--noop-chmod", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     command = list(args.command)
@@ -11918,7 +11943,11 @@ def _landlock_exec(argv: list[str]) -> int:
             exec_scratch, worker_temp, exempted_chmod_syscalls
         )
     )
-    _apply_metadata_seccomp(brokered_chmod_syscalls=exempted_chmod_syscalls)
+    # Only opencode 2.x needs it (it aborts on EPERM chmod of its own DB); other CLIs keep EPERM.
+    _apply_metadata_seccomp(
+        brokered_chmod_syscalls=exempted_chmod_syscalls,
+        noop_chmod=args.noop_chmod and exec_scratch is None,
+    )
     os.execvpe(command[0], command, os.environ.copy())
     return 126
 

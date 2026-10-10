@@ -26,17 +26,22 @@ from .platform_io import (
 
 __all__ = [
     "MAX_SOURCE_BYTES",
+    "OPENCODE_API_KEY_ENV",
     "OPENCODE_AUTH_RELATIVE_PATH",
     "OpenCodeAuthDestinationError",
     "OpenCodeAuthError",
     "OpenCodeAuthProjection",
     "OpenCodeAuthSourceError",
+    "opencode_go_api_key_env",
     "project_opencode_auth",
 ]
 
 OPENCODE_AUTH_RELATIVE_PATH = (
     Path(".local") / "share" / "opencode" / "auth.json"
 )
+# The env var name carrying the ``opencode-go`` provider's API key to a
+# headless OpenCode child (see ``opencode_go_api_key_env``).
+OPENCODE_API_KEY_ENV = "OPENCODE_API_KEY"
 MAX_SOURCE_BYTES = 1 << 20
 _READ_CHUNK_BYTES = 64 * 1024
 
@@ -248,3 +253,40 @@ def project_opencode_auth(
         destination=str(destination),
         byte_count=len(raw),
     )
+
+
+def opencode_go_api_key_env(isolated_home: StrPath) -> dict[str, str]:
+    """The ``opencode-go`` API key from one projected auth file, as env.
+
+    Returns ``{OPENCODE_API_KEY_ENV: key}`` when the isolated HOME's projected
+    ``auth.json`` carries a usable ``opencode-go`` block -- an object whose
+    ``type`` is ``"api"`` with a non-empty string ``key`` (stripped, so the
+    projection's byte-identical copy still tolerates padded input) -- and
+    ``{}`` for every other fact: no projected file, unreadable bytes, any
+    other document shape, or any other provider's credentials.  Fail-closed
+    and bounded like the projection itself: only the exact env mapping is
+    returned, never the document.
+    """
+    home = Path(os.fspath(isolated_home))
+    try:
+        raw = (home / OPENCODE_AUTH_RELATIVE_PATH).read_bytes()
+    except OSError:
+        return {}
+    if not raw or len(raw) > MAX_SOURCE_BYTES:
+        return {}
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(document, dict):
+        return {}
+    block = document.get("opencode-go")
+    if not isinstance(block, dict) or block.get("type") != "api":
+        return {}
+    key = block.get("key")
+    if not isinstance(key, str):
+        return {}
+    key = key.strip()
+    if not key:
+        return {}
+    return {OPENCODE_API_KEY_ENV: key}

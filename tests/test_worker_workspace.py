@@ -9768,6 +9768,177 @@ def test_landlock_exec_fallback_keeps_full_deny_without_a_proven_outer_broker(
         monkeypatch, tmp_path, measured=frozenset()
     )
     assert seen["brokered_chmod_syscalls"] == frozenset()
+    # A validation child keeps the EPERM answer; only a worker gets the no-op.
+    assert seen["noop_chmod"] is False
+
+
+def _landlock_exec_worker_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, extra: "list[str]"
+) -> dict[str, object]:
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(
+        worker_workspace, "_apply_landlock", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "_outer_metadata_broker_brokered_chmod_syscalls",
+        lambda exec_scratch: seen.update(probed=exec_scratch) or frozenset(),
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "_apply_metadata_seccomp",
+        lambda **kwargs: seen.update(kwargs),
+    )
+    monkeypatch.setattr(os, "chdir", lambda _path: None)
+
+    def execvpe(_file: str, _argv: list[str], _env: dict[str, str]) -> None:
+        raise RuntimeError("exec intercepted")
+
+    monkeypatch.setattr(os, "execvpe", execvpe)
+    with pytest.raises(RuntimeError, match="exec intercepted"):
+        worker_workspace._landlock_exec([
+            "--landlock-exec", "--workspace", str(tmp_path),
+            "--home", str(tmp_path), *extra, "--", "worker-cli",
+        ])
+    assert seen["probed"] is None
+    assert seen["brokered_chmod_syscalls"] == frozenset()
+    return seen
+
+
+def test_landlock_exec_opencode_worker_answers_chmod_family_with_a_noop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seen = _landlock_exec_worker_mode(monkeypatch, tmp_path, ["--noop-chmod"])
+    assert seen["noop_chmod"] is True
+
+
+def test_landlock_exec_other_workers_keep_eperm_for_chmod(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Kilo/Grok ran correctly on the EPERM answer; 0.12.43 broke it by widening the no-op.
+    seen = _landlock_exec_worker_mode(monkeypatch, tmp_path, [])
+    assert seen["noop_chmod"] is False
+
+
+@pytest.mark.parametrize(
+    ("adapter_id", "expected"),
+    [("opencode_cli", True), ("grok_kilo_cli", False), ("claude_cli", False)],
+)
+def test_landlock_sandbox_argv_requests_noop_chmod_only_for_opencode(
+    tmp_path: Path, adapter_id: str, expected: bool
+) -> None:
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id="noop-chmod-scope",
+        repo=tmp_path,
+        path=tmp_path / "worktree",
+        home=tmp_path / "home",
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    argv = worker_workspace.sandbox_argv(
+        workspace, adapter_id, ["worker-cli"], backend="landlock"
+    )
+    assert ("--noop-chmod" in argv[: argv.index("--")]) is expected
+    validation = worker_workspace.sandbox_argv(
+        workspace,
+        adapter_id,
+        ["validator"],
+        backend="landlock",
+        validation_exec_scratch=tmp_path / "scratch",
+    )
+    assert "--noop-chmod" not in validation
+
+
+def test_noop_chmod_filter_answers_only_the_chmod_family_with_errno_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rules: dict[str, int] = {}
+    names: dict[int, str] = {}
+
+    class _Library:
+        def seccomp_init(self, _action: int) -> int:
+            return 1
+
+        def seccomp_syscall_resolve_name(self, name: bytes) -> int:
+            names[len(names) + 1] = name.decode("ascii")
+            return len(names)
+
+        def seccomp_rule_add(self, _ctx: int, action: int, number: int, _count: int) -> int:
+            rules[names[number]] = action
+            return 0
+
+        def seccomp_load(self, _ctx: int) -> int:
+            return 0
+
+        def seccomp_release(self, _ctx: int) -> None:
+            return None
+
+    monkeypatch.setattr(worker_workspace, "_seccomp_library", lambda: _Library())
+    worker_workspace._apply_metadata_seccomp(noop_chmod=True)
+
+    eperm = worker_workspace._SCMP_ACT_ERRNO | errno.EPERM
+    chmod_family = set(worker_workspace._METADATA_BROKER_CHMOD_SYSCALLS)
+    assert set(rules) == set(worker_workspace._SECCOMP_DENIED_SYSCALLS)
+    for name, action in rules.items():
+        expected = worker_workspace._SCMP_ACT_ERRNO if name in chmod_family else eperm
+        assert action == expected, name
+    for retained in ("utimensat", "chown", "fchownat", "setxattr", "ptrace"):
+        assert rules[retained] == eperm
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Linux Landlock+seccomp worker sandbox")
+@pytest.mark.skipif(
+    worker_workspace.landlock_abi_version() < 1,
+    reason="Landlock is not supported by this kernel",
+)
+@pytest.mark.skipif(
+    worker_workspace._seccomp_library() is None,
+    reason="libseccomp is unavailable",
+)
+def test_real_worker_sandbox_chmod_succeeds_without_changing_the_mode(
+    tmp_path: Path,
+) -> None:
+    """opencode 2.x chmods its own DB at startup and dies on EPERM."""
+    workspace = tmp_path / "workspace"
+    home = tmp_path / "home"
+    workspace.mkdir()
+    home.mkdir(mode=0o700)
+    target = home / "opencode.db"
+    target.write_bytes(b"")
+    os.chmod(target, 0o640)
+    probe = (
+        "import os, stat, sys\n"
+        "p = sys.argv[1]\n"
+        "os.chmod(p, 0o600)\n"
+        "fd = os.open(p, os.O_RDONLY)\n"
+        "os.fchmod(fd, 0o600)\n"
+        "os.close(fd)\n"
+        "try:\n"
+        "    os.chown(p, os.getuid(), os.getgid())\n"
+        "    print('chown-allowed')\n"
+        "except PermissionError:\n"
+        "    print('chown-denied')\n"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(worker_workspace.__file__).resolve()),
+            "--landlock-exec",
+            "--workspace", str(workspace),
+            "--home", str(home),
+            "--noop-chmod",
+            "--",
+            sys.executable, "-c", probe, str(target),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "chown-denied"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
 
 
 def _install_modelled_boundary(

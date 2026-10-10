@@ -142,3 +142,40 @@ def test_existing_destination_symlink_fails_closed(tmp_path: Path) -> None:
     ):
         opencode_auth.project_opencode_auth(source, isolated)
     assert not outside.exists()
+
+
+def test_opencode_go_key_is_returned_as_env_from_the_projected_file(
+    tmp_path: Path,
+) -> None:
+    source = _source(
+        tmp_path,
+        b'{"opencode-go":{"type":"api","key":" credential-value-7f32b98a "},'
+        b'"openai":{"type":"oauth","access":"other"}}\n',
+    )
+    isolated = tmp_path / "isolated"
+    opencode_auth.project_opencode_auth(source, isolated)
+
+    assert opencode_auth.opencode_go_api_key_env(isolated) == {
+        "OPENCODE_API_KEY": _CREDENTIAL_SENTINEL
+    }
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        b'{"openai":{"token":"credential-value-7f32b98a"}}\n',
+        b'{"opencode-go":{"type":"api","key":""}}\n',
+        b'{"opencode-go":{"type":"api","key":7}}\n',
+        b'{"opencode-go":"credential-value-7f32b98a"}\n',
+    ],
+)
+def test_opencode_go_key_env_is_empty_without_a_usable_key(
+    tmp_path: Path, document: bytes
+) -> None:
+    isolated = tmp_path / "isolated"
+    opencode_auth.project_opencode_auth(_source(tmp_path, document), isolated)
+    assert opencode_auth.opencode_go_api_key_env(isolated) == {}
+
+
+def test_opencode_go_key_env_is_empty_without_a_projected_file(tmp_path: Path) -> None:
+    assert opencode_auth.opencode_go_api_key_env(tmp_path / "isolated") == {}

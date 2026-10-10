@@ -172,7 +172,7 @@ def _patch_launch_seams(monkeypatch, tmp_path, *, sandbox_backend, canonical_rep
     monkeypatch.setattr(
         process_launcher.worker_ai_tools_mcp,
         "appcontainer_mcp_bridge",
-        lambda runtime, *, request_id, home, stderr_path: (
+        lambda runtime, *, request_id, home, stderr_path, adapter_id="claude_cli": (
             tmp_path / "bridge.json",
             {"pipe": f"pipe-{request_id}", "stderr_path": str(stderr_path)},
         ),

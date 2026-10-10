@@ -975,6 +975,30 @@ def _reconcile_commit_trailers_on_read(repo: Path) -> None:
         pass
 
 
+def _reconcile_orphaned_conversions_on_read(
+    repo: Path, get_task_fn, canonical_status_fn,
+) -> None:
+    """Reconcile task_created/task_planned NeedFix rows whose linked card can
+    no longer carry the fix forward -- a missing card, or one archived
+    without ever running the accepted-task closure -- before deriving the
+    view.
+
+    Same self-healing shape as :func:`_reconcile_links_on_read`: runs on the
+    read an operator waits on, resolves on verifiable evidence (an
+    accept_review receipt or an accepted learning-commit judgement) or else
+    returns the record to ``accepted`` so a manager decides, and never raises
+    into a listing -- an unreconciled record simply stays as it was.
+    """
+    try:
+        needfix_store.reconcile_orphaned_conversions(
+            repo, get_task_fn=get_task_fn, canonical_status_fn=canonical_status_fn,
+        )
+    except Exception:
+        # Best-effort, same as _reconcile_links_on_read: an unreconciled
+        # record simply stays unreconciled rather than corrupting the read.
+        pass
+
+
 def _derive_active_surface(
     repo: Path,
     *,
@@ -1008,6 +1032,7 @@ def _derive_active_surface(
         include_archived=include_archived,
     )
     _reconcile_commit_trailers_on_read(repo)
+    _reconcile_orphaned_conversions_on_read(repo, get_task_fn, canonical_status_fn)
     return {
         "get_task_fn": get_task_fn,
         "canonical_status_fn": canonical_status_fn,
