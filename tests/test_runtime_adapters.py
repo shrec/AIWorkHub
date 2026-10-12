@@ -69,8 +69,8 @@ def test_claude_argv_is_current_noninteractive_shape(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("model", ["claude-haiku-4.5", "haiku"])
-def test_claude_cli_argv_uses_claude_code_haiku_spelling(monkeypatch, tmp_path, model):
-    """NF-2026-01019: Claude Code rejects the workforce's canonical id."""
+def test_claude_cli_argv_uses_the_haiku_family_alias(monkeypatch, tmp_path, model):
+    """Claude Code's --model always resolves a family alias to its latest model."""
     repo = tmp_path / "repo"
     repo.mkdir()
     executable = _executable(tmp_path, "claude")
@@ -84,11 +84,11 @@ def test_claude_cli_argv_uses_claude_code_haiku_spelling(monkeypatch, tmp_path, 
     )
 
     model_index = plan.argv.index("--model")
-    assert plan.argv[model_index + 1] == "claude-haiku-4-5"
+    assert plan.argv[model_index + 1] == "haiku"
 
 
-@pytest.mark.parametrize("model", ["claude-opus-5", "claude-sonnet-5"])
-def test_claude_cli_argv_unchanged_for_already_correct_models(monkeypatch, tmp_path, model):
+@pytest.mark.parametrize(("model", "alias"), [("claude-opus-5", "opus"), ("claude-sonnet-5", "sonnet")])
+def test_claude_cli_argv_uses_the_opus_and_sonnet_family_alias(monkeypatch, tmp_path, model, alias):
     repo = tmp_path / "repo"
     repo.mkdir()
     executable = _executable(tmp_path, "claude")
@@ -102,7 +102,7 @@ def test_claude_cli_argv_unchanged_for_already_correct_models(monkeypatch, tmp_p
     )
 
     model_index = plan.argv.index("--model")
-    assert plan.argv[model_index + 1] == model
+    assert plan.argv[model_index + 1] == alias
 
 
 def _claude_tool_lists(argv: list[str]) -> tuple[list[str], list[str]]:

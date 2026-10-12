@@ -22,7 +22,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from . import platform_io, reasoning_policy, runtime_executable_registry
+from . import cli_model_discovery, platform_io, reasoning_policy, runtime_executable_registry
 
 
 SUPPORTED_ADAPTERS: tuple[str, ...] = (
@@ -3024,26 +3024,29 @@ def _canonical_model_id(model: str | None) -> str:
     return _WORKFORCE_MODEL_ALIASES.get(stripped, stripped)
 
 
-# Claude Code CLI spelling overrides.  Claude Code (the ``claude`` CLI binary)
-# rejects the workforce's canonical id for this model and accepts only the
-# hyphenated form below; every other canonical id already matches what
-# Claude Code accepts and passes through unchanged.
-_CLAUDE_CLI_MODEL_ID_OVERRIDES: Mapping[str, str] = MappingProxyType(
+# Claude Code's own ``--model`` help says an alias (``opus``, ``sonnet``,
+# ``haiku``) always means the latest model of that family, so every canonical
+# Claude workforce id maps back to its bare alias here; any other, explicit
+# id (an owner-pinned spelling) passes through unchanged.
+_CLAUDE_CLI_FAMILY_ALIASES: Mapping[str, str] = MappingProxyType(
     {
-        "claude-haiku-4.5": "claude-haiku-4-5",
+        canonical: alias
+        for alias, canonical in _WORKFORCE_MODEL_ALIASES.items()
+        if alias in cli_model_discovery.CLAUDE_CLI_ALIASES
     }
 )
 
 
 def _claude_cli_model_id(model: str | None) -> str:
-    """Map a verified workforce model spelling to Claude Code's CLI spelling.
+    """Map a verified workforce model spelling to Claude Code's CLI ``--model``.
 
-    Resolves aliases (``haiku``) through :func:`_canonical_model_id` first, so
-    the returned id is always the spelling Claude Code's CLI accepts.
+    A bare alias or a canonical Claude workforce id both resolve to the
+    family alias, which Claude Code's CLI always expands to its latest
+    model; anything else passes through unchanged.
     """
 
     canonical = _canonical_model_id(model)
-    return _CLAUDE_CLI_MODEL_ID_OVERRIDES.get(canonical, canonical)
+    return _CLAUDE_CLI_FAMILY_ALIASES.get(canonical, canonical)
 
 
 # Claude CLI's documented ``--effort`` ladder.  Claude-5-class models attest

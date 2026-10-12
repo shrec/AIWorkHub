@@ -42,6 +42,7 @@ from . import core, rework_overlay_packet as _rework_overlay_packet
 from . import agent_tool_instructions
 from . import attempt_artifacts
 from . import claude_auth
+from . import cli_model_discovery
 from . import context_write_intents
 from . import context_writes
 from . import evidence_levels
@@ -9267,6 +9268,14 @@ class ProcessManager:
         claim_authority: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool, str]:
         usage = _usage_from_output(stdout_path, include_samples=True)
+        if adapter_id == "claude_cli":
+            try:
+                resolved = cli_model_discovery.claude_init_model(stdout_path)
+                if resolved:
+                    alias = runtime_adapters._claude_cli_model_id(model)
+                    cli_model_discovery.record_claude_resolution(self.repo, alias, resolved)
+            except Exception:  # noqa: BLE001 -- recording is observability, never a turn failure
+                pass
         usage["requested_model"] = model
         usage["execution_mode"] = execution_mode or "provider_worker"
         usage["provider_launched"] = execution_mode != "validation_only_replay"

@@ -146,3 +146,31 @@ def claude_models(repo_root: Path | str) -> list[dict[str, Any]]:
         label = f"{resolved} ({alias})" if resolved else alias
         models.append({"model": alias, "label": label})
     return models
+
+
+def claude_init_model(stdout_path: Path) -> str:
+    """First ``{"type": "system", "subtype": "init"}`` event's model, if any.
+
+    Reads at most the CLI's first 64 stdout lines; a missing, truncated or
+    corrupt stream yields "" rather than raising.
+    """
+
+    try:
+        with stdout_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for _ in range(64):
+                line = handle.readline()
+                if not line:
+                    break
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if (
+                    isinstance(event, dict)
+                    and event.get("type") == "system"
+                    and event.get("subtype") == "init"
+                ):
+                    return str(event.get("model") or "")
+    except OSError:
+        pass
+    return ""
