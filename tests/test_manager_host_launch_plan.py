@@ -61,7 +61,9 @@ def test_manager_argv_differs_from_the_worker_only_in_its_tool_lists(
         model="claude-opus-5",
         executable_overrides={"claude_cli": sys.executable},
     )
-    assert "claude-opus-5" in manager_plan.argv
+    # The canonical id reaches Claude Code as its family alias, which the CLI
+    # always expands to the latest model of that family.
+    assert manager_plan.argv[manager_plan.argv.index("--model") + 1] == "opus"
     assert "mcp__AIWorkHub" in manager_plan.argv
     assert not any(
         token.startswith("mcp__aiworkhub_worker_ai_tools__")
