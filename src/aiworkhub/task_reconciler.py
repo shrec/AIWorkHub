@@ -546,8 +546,9 @@ def run_scan(
     wave_completion = _scan_wave_completion(Path(mgr.repo).resolve())
     # The one named exception to "never automatic retry/relaunch": a card
     # still inside its own finite transient_retry budget, relaunched through
-    # the same claim_start_exact compare-and-update reconcile_startup uses.
-    transient_retry_relaunch = _scan_transient_retry_relaunch(Path(mgr.repo).resolve())
+    # mgr.launch, which performs the same claim_start_exact compare-and-update
+    # internally before spawning the worker.
+    transient_retry_relaunch = _scan_transient_retry_relaunch(mgr)
     # Sequential by design, not fanned out across cores: the SDLC case store is
     # a single-writer SQLite file and the pass is bounded per scan, so parallel
     # writers would only contend for the same write lock.
@@ -860,20 +861,36 @@ def _scan_wave_completion(repo: Path) -> dict[str, Any]:
 TRANSIENT_RETRY_RELAUNCH_CAPACITY = 4
 
 
-def _scan_transient_retry_relaunch(repo: Path) -> dict[str, Any]:
+def _scan_transient_retry_relaunch(mgr: process_launcher.ProcessManager) -> dict[str, Any]:
     """Relaunch pending/unclaimed cards whose transient-retry backoff elapsed.
 
     The named exception to "never automatic retry/relaunch" in the module
     docstring: a card ``task_store.mark_transient_retry`` returned to pending
-    inside its own finite budget is relaunched here, through the identical
-    ``claim_start_exact`` compare-and-update ``reconcile_startup`` uses, never
-    before ``retry_not_before`` and never past its budget. A failure here is
-    isolated exactly like every other pass: recorded, and never blocking
-    worker finalization.
+    inside its own finite budget is relaunched here, through ``mgr.launch`` on
+    the same ``ProcessManager`` this scan already holds. ``ProcessManager.launch``
+    performs the identical ``claim_start_exact`` compare-and-update internally
+    before it spawns the worker, so a concurrent duplicate attempt still loses
+    the race -- but unlike a bare claim, a due card now always ends up with a
+    real worker process, never before ``retry_not_before`` and never past its
+    budget. A failure here is isolated exactly like every other pass:
+    recorded, and never blocking worker finalization.
     """
+
+    def _launch(task_id: str, runner: str, topic: str, request_id: str) -> dict[str, Any]:
+        try:
+            result = mgr.launch(task_id=task_id, runner=runner, topic=topic)
+        except Exception as exc:  # noqa: BLE001 -- one bad spawn must not abort the whole relaunch pass
+            return {"ok": False, "stderr": f"launch_raised:{type(exc).__name__}"}
+        if result.get("ok"):
+            return {"ok": True}
+        return {
+            "ok": False,
+            "stderr": str(result.get("blocked_reason") or result.get("error") or ""),
+        }
+
     try:
         return dependency_autolaunch.reconcile_transient_due(
-            repo, launch=core.claim_start_exact, capacity=TRANSIENT_RETRY_RELAUNCH_CAPACITY,
+            Path(mgr.repo).resolve(), launch=_launch, capacity=TRANSIENT_RETRY_RELAUNCH_CAPACITY,
         )
     except Exception as exc:  # noqa: BLE001 -- never block worker reconcile
         return {"ok": False, "state": "skipped", "reason": f"{type(exc).__name__}"[:80]}

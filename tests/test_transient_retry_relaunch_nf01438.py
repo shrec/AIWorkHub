@@ -204,14 +204,78 @@ def test_card_with_unmet_depends_on_is_left_to_reconcile(tmp_path):
     assert skipped["reason"] == "unmet_depends_on_owned_by_reconcile"
 
 
-def test_production_scan_pass_wires_the_relaunch_through_claim_start_exact():
-    reconciler_source = (SRC / "aiworkhub" / "task_reconciler.py").read_text(encoding="utf-8")
-    assert "dependency_autolaunch.reconcile_transient_due" in reconciler_source
-    assert "core.claim_start_exact" in reconciler_source
-    assert "_scan_transient_retry_relaunch" in reconciler_source
-    assert "result[\"transient_retry_relaunch\"]" not in reconciler_source  # sanity: no stray literal
-    assert "\"transient_retry_relaunch\": transient_retry_relaunch," in reconciler_source
+def test_due_card_relaunches_through_mgr_launch_not_claim_start_exact(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path)
+    _insert_processing_card(root, "T5", runner="runner_t5", topic="task_mcp")
+    task_store.mark_transient_retry(root, "T5", runner="runner_t5", reason="provider_429")
+    _force_due(root, "T5")
 
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("claim_start_exact must not be called directly by the scan")
+
+    monkeypatch.setattr(task_reconciler.core, "claim_start_exact", _fail_if_called)
+
+    calls: list[tuple] = []
+
+    class _Mgr:
+        def __init__(self, repo: Path) -> None:
+            self.repo = repo
+
+        def launch(self, *, task_id: str, runner: str, topic: str) -> dict:
+            calls.append((task_id, runner, topic))
+            return {"ok": True}
+
+    outcome = task_reconciler._scan_transient_retry_relaunch(_Mgr(root))
+
+    assert calls == [("T5", "runner_t5", "task_mcp")]
+    assert [row["task_id"] for row in outcome["launched"]] == ["T5"]
+
+
+def test_launch_refusal_is_recorded_as_delayed_denial_with_stderr(tmp_path):
+    root = _init_repo(tmp_path)
+    _insert_processing_card(root, "T6", runner="runner_t6", topic="task_mcp")
+    task_store.mark_transient_retry(root, "T6", runner="runner_t6", reason="provider_429")
+    _force_due(root, "T6")
+
+    class _Mgr:
+        def __init__(self, repo: Path) -> None:
+            self.repo = repo
+
+        def launch(self, *, task_id: str, runner: str, topic: str) -> dict:
+            return {"ok": False, "blocked_reason": "capacity_exhausted"}
+
+    outcome = task_reconciler._scan_transient_retry_relaunch(_Mgr(root))
+
+    assert outcome["launched"] == []
+    [delayed] = [row for row in outcome["delayed"] if row["task_id"] == "T6"]
+    assert delayed["reason"] == "launch_not_claimed"
+    assert delayed["stderr"] == "capacity_exhausted"
+
+
+def test_launch_exception_for_one_card_does_not_abort_a_card_already_launched(tmp_path):
+    root = _init_repo(tmp_path)
+    _insert_processing_card(root, "T7", runner="runner_t7", topic="task_mcp")
+    task_store.mark_transient_retry(root, "T7", runner="runner_t7", reason="provider_429")
+    _force_due(root, "T7")
+    _insert_processing_card(root, "T8", runner="runner_t8", topic="task_mcp")
+    task_store.mark_transient_retry(root, "T8", runner="runner_t8", reason="provider_429")
+    _force_due(root, "T8")
+
+    class _Mgr:
+        def __init__(self, repo: Path) -> None:
+            self.repo = repo
+
+        def launch(self, *, task_id: str, runner: str, topic: str) -> dict:
+            if task_id == "T8":
+                raise OSError("spawn_failed")
+            return {"ok": True}
+
+    outcome = task_reconciler._scan_transient_retry_relaunch(_Mgr(root))
+
+    assert "T7" in [row["task_id"] for row in outcome["launched"]]
+    [delayed] = [row for row in outcome["delayed"] if row["task_id"] == "T8"]
+    assert delayed["reason"] == "launch_not_claimed"
+    assert delayed["stderr"].startswith("launch_raised:OSError")
 
 def test_run_scan_includes_the_transient_retry_relaunch_receipt(monkeypatch, tmp_path):
     class _Mgr:
