@@ -731,6 +731,7 @@ class ManagerOrchestrator:
         self._session: ManagerSession | None = None
         self._backend: ManagerBackend | None = None
         self._partial: dict[str, Any] | None = None
+        self._stop_requested: bool = False
 
     @property
     def partial(self) -> dict[str, Any] | None:
@@ -886,6 +887,16 @@ class ManagerOrchestrator:
                     backend.close()
             finally:
                 self._release_lock()
+
+    def interrupt(self) -> bool:
+        """End the running turn's backend now; never takes :meth:`_exclusive`, the turn thread holds it."""
+        running = self._slot.locked()
+        if running:
+            self._stop_requested = True
+            backend = self._backend
+            if backend is not None:
+                backend.close()
+        return running
 
     def attach(self, session_id: str, backend_id: str = "", model: str = "") -> ManagerSession:
         """Continue one saved conversation. No provider call and no Start.
@@ -1370,7 +1381,9 @@ class ManagerOrchestrator:
         Returns the logged events, the bytes they added to the model's context
         and the assistant text. A raise from the backend, at the call or
         mid-stream, is logged as an ``error`` event exactly like one the backend
-        reports itself, and the session stays usable either way.
+        reports itself, and the session stays usable either way. A stop
+        requested through :meth:`interrupt` while this turn is running turns
+        that error into ``turn_stopped`` instead, and the session stays usable.
         """
         _, backend = self._active()
         events: list[dict[str, Any]] = []
@@ -1386,16 +1399,23 @@ class ManagerOrchestrator:
                     events.append(self._record(session, turn, "error", capped))
                     break
                 kind, payload = _normalize(raw)
+                if kind == "error" and self._stop_requested:
+                    kind, payload = "turn_stopped", {"by": "owner"}
                 self._settle_partial(kind)
                 grown += len(_json(payload).encode("utf-8"))
                 if kind == "assistant_text":
                     texts.append(str(payload.get("text", "")))
                 events.append(self._record(session, turn, kind, payload))
         except Exception as exc:  # noqa: BLE001 - a failed turn is an error event, not a dead session
-            broke = {"source": "backend", "error": _failure(exc)}
-            events.append(self._record(session, turn, "error", broke))
+            if self._stop_requested:
+                broke: dict[str, Any] = {"by": "owner"}
+                events.append(self._record(session, turn, "turn_stopped", broke))
+            else:
+                broke = {"source": "backend", "error": _failure(exc)}
+                events.append(self._record(session, turn, "error", broke))
         finally:
             self._partial = None
+            self._stop_requested = False
         return events, grown, "".join(texts)
 
     def _rotate(self, reason: str, *, successor: bool) -> dict[str, Any]:

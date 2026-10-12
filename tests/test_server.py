@@ -91,8 +91,13 @@ print("closed startup unchanged")
 """
     for backend in ("sdk", "stdlib"):
         # Extend PYTHONPATH, never replace it: the AppContainer validation lane puts
-        # its path-resolution shim there (NF-2026-01176).
-        child_path = os.pathsep.join(filter(None, (str(_SRC), os.environ.get("PYTHONPATH"))))
+        # its path-resolution shim there (NF-2026-01176). That PYTHONPATH also carries
+        # site-packages, so the -S child drops every entry holding the SDK, or -S could
+        # not hide mcp/pydantic (NF-2026-01489).
+        inherited = [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p]
+        if backend == "stdlib":
+            inherited = [p for p in inherited if not (Path(p, "mcp").is_dir() or Path(p, "pydantic").is_dir())]
+        child_path = os.pathsep.join([str(_SRC), *inherited])
         env = dict(os.environ, AIWORKHUB_ALLOW_WRITES="0", PYTHONPATH=child_path)
         env["AIWORKHUB_MCP_STDIO_BACKEND"] = backend
         argv = [sys.executable] + (["-S"] if backend == "stdlib" else [])
@@ -301,6 +306,7 @@ def test_manager_loop_tools_refuse_a_non_manager_route(monkeypatch) -> None:
     assert server.aiworkhub_manager_loop_status() == refusal
     assert server.aiworkhub_manager_loop_events("any-session-id") == refusal
     assert server.aiworkhub_manager_loop_close() == refusal
+    assert server.aiworkhub_manager_loop_stop() == refusal
 
 
 def test_manager_loop_tools_forward_to_the_service_with_the_verified_repo_root(
@@ -397,6 +403,7 @@ def test_manager_loop_tools_refuse_a_manager_route_with_no_session_identity(monk
     assert server.aiworkhub_manager_loop_status() == missing_route_refusal
     assert server.aiworkhub_manager_loop_events("any-session-id") == missing_route_refusal
     assert server.aiworkhub_manager_loop_close() == missing_route_refusal
+    assert server.aiworkhub_manager_loop_stop() == missing_route_refusal
 
     monkeypatch.setattr(
         server.core,
@@ -414,6 +421,7 @@ def test_manager_loop_tools_refuse_a_manager_route_with_no_session_identity(monk
     assert server.aiworkhub_manager_loop_status() == no_identity_refusal
     assert server.aiworkhub_manager_loop_events("any-session-id") == no_identity_refusal
     assert server.aiworkhub_manager_loop_close() == no_identity_refusal
+    assert server.aiworkhub_manager_loop_stop() == no_identity_refusal
 
 
 def test_fallback_stdio_writer_is_binary_utf8_and_transport_safe() -> None:

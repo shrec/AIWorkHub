@@ -99,6 +99,7 @@ class _Entry:
     wake: manager_loop_wake.WakeConsumer | None = None
     wake_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
     wake_cap_per_hour: int = manager_loop_wake.DEFAULT_CAP_PER_HOUR
+    suspended: bool = False
 
 
 def _seat_env_provider(repo_key: str) -> Callable[[str, str], Mapping[str, str]]:
@@ -401,10 +402,13 @@ def _dispatch_turn(
     route: tuple[str, str] | None = None,
     on_finished: Callable[[bool], None] | None = None,
     queued: _QueuedSend | None = None,
+    clear_suspended: bool = False,
 ) -> dict[str, Any]:
     entry, err = _entry_or_error(repo)
     if err is not None:
         return err
+    if clear_suspended:
+        entry.suspended = False
     with entry.queue_lock:
         if not entry.turn_lock.acquire(blocking=False):
             return _enqueue_send(entry, queued)
@@ -483,6 +487,7 @@ def start(
     entry, err = _entry_or_error(repo)
     if err is not None:
         return err
+    entry.suspended = False
     if not entry.turn_lock.acquire(blocking=False):
         return {"ok": False, "error": "manager_turn_in_progress"}
     try:
@@ -695,6 +700,7 @@ def send(
         pin_passive_route=bool(text.strip()),
         route=route,
         queued=_QueuedSend(text=text, level=level, route=route, images=paths),
+        clear_suspended=True,
     )
 
 
@@ -784,6 +790,7 @@ def continue_session(
     entry, err = _entry_or_error(repo)
     if err is not None:
         return err
+    entry.suspended = False
     if not entry.turn_lock.acquire(blocking=False):
         return {"ok": False, "error": "manager_turn_in_progress"}
     try:
@@ -868,6 +875,34 @@ def close(repo: str | Path) -> dict[str, Any]:
         entry.turn_lock.release()
     _stop_wake(entry)
     return {"ok": True}
+
+
+def stop(repo: str | Path) -> dict[str, Any]:
+    """End a running turn's backend now, without waiting for it; a no-op while idle.
+
+    The queued owner sends waiting behind the running turn are dropped and
+    counted (``dropped_queued``); the wake consumer is retired and the entry
+    stays suspended until ``start``, ``send`` or ``continue_session`` clears
+    it, so a callback cannot restart the turn that was just stopped.
+    """
+
+    entry, err = _entry_or_error(repo)
+    if err is not None:
+        return err
+    with entry.queue_lock:
+        if not entry.turn_running:
+            return {"ok": True, "stopped": False, "dropped_queued": 0}
+        dropped = len(entry.send_queue)
+        entry.send_queue.clear()
+    entry.suspended = True
+    _stop_wake(entry)
+    try:
+        stopped = entry.orchestrator.interrupt()
+    except ManagerLoopError as exc:
+        return _error(exc)
+    except Exception as exc:  # noqa: BLE001 - stop must never cross the MCP boundary
+        return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
+    return {"ok": True, "stopped": stopped, "dropped_queued": dropped}
 
 
 def wait_for_idle(repo: str | Path, timeout: float | None = None) -> bool:
@@ -962,8 +997,13 @@ def _ensure_wake_started(entry: _Entry, repo: str | Path) -> None:
     The claim origin is read at claim time, so a session switch rebinds
     pending callbacks onto whichever conversation is active, and it is empty
     (nothing is claimed) once the attached session no longer holds the seat.
+
+    A no-op while ``entry.suspended``: a stopped turn stays that way until
+    ``start``, ``send`` or ``continue_session`` clears the suspension.
     """
 
+    if entry.suspended:
+        return
     with entry.wake_lock:
         if not _session_holds_seat(entry, entry.orchestrator.session):
             retired = _detach_wake(entry)

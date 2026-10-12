@@ -2157,6 +2157,16 @@ def aiworkhub_manager_loop_close() -> dict[str, Any]:
 
 
 @mcp.tool()
+def aiworkhub_manager_loop_stop() -> dict[str, Any]:
+    """MANAGER WRITE: end a running turn's CLI process now, without waiting for it."""
+
+    root, refusal = _manager_loop_repo_root()
+    if refusal is not None:
+        return refusal
+    return manager_loop_service.stop(root)
+
+
+@mcp.tool()
 def aiworkhub_manager_recipe_register(manifest: dict[str, Any]) -> dict[str, Any]:
     """MANAGER WRITE: register and persist one caller-defined tool recipe.
 

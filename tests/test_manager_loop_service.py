@@ -35,6 +35,7 @@ class FakeManagerBackend:
         self.closed = False
         self.gate: threading.Event | None = None
         self.entered = threading.Event()
+        self.process_ended_early = False
 
     def start(self, brief: str) -> str:
         self.briefs.append(brief)
@@ -46,6 +47,9 @@ class FakeManagerBackend:
         self.entered.set()
         if self.gate is not None:
             assert self.gate.wait(timeout=10)
+        if self.process_ended_early:
+            self.process_ended_early = False
+            return iter([{"type": "error", "payload": {"source": "backend", "error": "worker_failed"}}])
         return iter([
             {"type": "assistant_text", "payload": {"text": f"ack: {message}"}},
             {"type": "turn_end", "payload": {}},
@@ -53,6 +57,9 @@ class FakeManagerBackend:
 
     def close(self) -> None:
         self.closed = True
+        self.process_ended_early = True
+        if self.gate is not None and not self.gate.is_set():
+            self.gate.set()
 
 
 class _FakeOrchestratorFactory:
@@ -294,6 +301,96 @@ def test_a_queued_message_that_cannot_bind_its_route_is_that_turns_error_event(
     last = manager_loop_service.status(tmp_path)["last_turn"]
     assert last["ok"] is False and "manager_backend_unavailable:fake:model-b" in last["errors"][0]
     assert manager_loop_service.status(tmp_path)["running"] is False
+
+
+def test_stop_ends_the_running_turn_and_the_session_stays_usable(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    backends = _install_fakes(monkeypatch)
+    manager_loop_service.start(tmp_path, "fake", "model-a")
+    backend = backends[0]
+    backend.gate = threading.Event()
+
+    first = manager_loop_service.send(tmp_path, "one")
+    assert backend.entered.wait(timeout=5)
+
+    result = manager_loop_service.stop(tmp_path)
+    assert result == {"ok": True, "stopped": True, "dropped_queued": 0}
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+    assert backend.closed is True
+
+    settled = manager_loop_service.status(tmp_path)
+    assert settled["running"] is False
+    assert settled["last_turn"] == {"turn": 1, "ok": True, "errors": [], "reply": ""}
+    events = manager_loop_service.events(tmp_path, first["session_id"])
+    assert [event["type"] for event in events["events"]] == [
+        "session_start", "user_message", "turn_stopped",
+    ]
+
+    second = manager_loop_service.send(tmp_path, "two")
+    assert second["ok"] is True
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+    assert backend.messages == ["one", "two"]
+
+
+def test_stop_drops_and_counts_the_queued_sends(monkeypatch: Any, tmp_path: Path) -> None:
+    backends = _install_fakes(monkeypatch)
+    manager_loop_service.start(tmp_path, "fake", "model-a")
+    backend = backends[0]
+    backend.gate = threading.Event()
+
+    manager_loop_service.send(tmp_path, "one")
+    assert backend.entered.wait(timeout=5)
+    queued = manager_loop_service.send(tmp_path, "two")
+    assert queued["queued"] is True
+
+    result = manager_loop_service.stop(tmp_path)
+    assert result == {"ok": True, "stopped": True, "dropped_queued": 1}
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+    assert manager_loop_service.status(tmp_path)["send_queue"] == []
+    assert backend.messages == ["one"]
+
+
+def test_stop_suspends_the_entry_until_the_next_send_clears_it(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    backends = _install_fakes(monkeypatch)
+    manager_loop_service.start(tmp_path, "fake", "model-a")
+    backend = backends[0]
+    backend.gate = threading.Event()
+    entry = manager_loop_service._entry_for(tmp_path)
+
+    manager_loop_service.send(tmp_path, "one")
+    assert backend.entered.wait(timeout=5)
+    old_wake = entry.wake
+    assert old_wake is not None
+
+    assert manager_loop_service.stop(tmp_path)["ok"] is True
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+
+    assert entry.suspended is True
+    assert entry.wake is None
+    assert old_wake.status()["running"] is False
+
+    second = manager_loop_service.send(tmp_path, "two")
+    assert second["ok"] is True
+    assert entry.suspended is False
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+    assert manager_loop_service.status(tmp_path)["wake"]["running"] is True
+
+
+def test_stop_when_idle_is_a_no_op(monkeypatch: Any, tmp_path: Path) -> None:
+    _install_fakes(monkeypatch)
+    manager_loop_service.start(tmp_path, "fake", "model-a")
+    entry = manager_loop_service._entry_for(tmp_path)
+    wake_before = entry.wake
+
+    result = manager_loop_service.stop(tmp_path)
+
+    assert result == {"ok": True, "stopped": False, "dropped_queued": 0}
+    assert entry.suspended is False
+    assert entry.wake is wake_before
+    assert manager_loop_service.close(tmp_path) == {"ok": True}
 
 
 _PNG = b"\x89PNG\r\n\x1a\n" + b"pixels"
