@@ -391,6 +391,7 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
   "requestTerminalLogRestore",
   "requestTerminalLogPurge",
   "requestTaskArchive",
+  "requestTaskRestart",
   "requestTaskRestore",
   "requestTaskCleanup",
   "requestTaskQuarantineRestore",
@@ -408,6 +409,7 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
   "managerLoopSend",
   "managerLoopRotate",
   "managerLoopClose",
+  "managerLoopStop",
   "managerLoopStatus",
   "managerLoopEvents",
 ]);
@@ -579,6 +581,7 @@ const TERMINAL_LOG_RETENTION_TOOLS = Object.freeze({
 const TASK_RETENTION_TOOLS = Object.freeze({
   preview: "aiworkhub_dashboard_task_retention_preview",
   archive: "aiworkhub_dashboard_task_archive",
+  restart: "aiworkhub_dashboard_task_restart",
   restoreTask: "aiworkhub_dashboard_task_restore",
   quarantine: "aiworkhub_dashboard_task_quarantine",
   restoreBatch: "aiworkhub_dashboard_task_quarantine_restore",
@@ -597,6 +600,7 @@ const MANAGER_LOOP_TOOLS = Object.freeze({
   status: "aiworkhub_manager_loop_status",
   events: "aiworkhub_manager_loop_events",
   close: "aiworkhub_manager_loop_close",
+  stop: "aiworkhub_manager_loop_stop",
 });
 // The dashboard's Manager chat panel offers exactly these three CLI backends.
 // MANAGER_LOOP_TOOLS is deliberately never folded into EXPECTED_DASHBOARD_TOOL_NAMES:
@@ -10829,6 +10833,38 @@ async function runTaskArchive(view, taskId) {
   }
 }
 
+async function runTaskRestart(view, taskId) {
+  if (!TASK_ID_RE.test(taskId)) return;
+  const choice = await vscode.window.showWarningMessage(
+    `Restart task ${taskId}? This launches a fresh attempt for the task now.`,
+    { modal: true },
+    "Restart Task",
+  );
+  if (choice !== "Restart Task") return;
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const result = await client.callTool(TASK_RETENTION_TOOLS.restart, {
+      task_id: taskId,
+      reason: "owner manual restart from dashboard",
+      confirm: true,
+    });
+    if (!result || result.ok !== true) {
+      view.postMessage({ type: OUTBOUND_TYPES.error, message: (result && result.error) || "task_restart_failed" });
+      return;
+    }
+    const requestId = result.launch && result.launch.request_id;
+    view.postMessage({
+      type: OUTBOUND_TYPES.notification,
+      message: `Restarted ${taskId}: ${result.path} (request ${requestId})`,
+    });
+    await pushSnapshot(view);
+    await pushTaskDetail(view, taskId);
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+  }
+}
+
 async function runTaskRestore(view, taskId) {
   if (!TASK_ID_RE.test(taskId)) return;
   const choice = await vscode.window.showInformationMessage(
@@ -11416,6 +11452,11 @@ function handleInboundMessage(view, message) {
       if (TASK_ID_RE.test(taskId)) runTaskArchive(view, taskId);
       break;
     }
+    case "requestTaskRestart": {
+      const taskId = String(message.taskId || "");
+      if (TASK_ID_RE.test(taskId)) runTaskRestart(view, taskId);
+      break;
+    }
     case "requestTaskRestore": {
       const taskId = String(message.taskId || "");
       if (TASK_ID_RE.test(taskId)) runTaskRestore(view, taskId);
@@ -11552,6 +11593,9 @@ function handleInboundMessage(view, message) {
       vscode.window.showWarningMessage("Close this manager session?", { modal: true }, "Close").then((choice) => {
         if (choice === "Close") runManagerLoopAction(view, "close", {});
       });
+      break;
+    case "managerLoopStop":
+      runManagerLoopAction(view, "stop", {});
       break;
     case "managerLoopStatus":
       pushManagerLoopStatus(view);
@@ -13117,17 +13161,6 @@ function getHtmlForWebview(webview, extensionUri) {
       </span>
     </section>
 
-    <div class="context-meta">
-    <section class="target-selector" aria-label="Coordinator routing">
-      <span>Coordinator routing</span>
-      <strong id="target-state">Automatic by originating chat</strong>
-    </section>
-
-    <section class="repo-router" id="repo-router" aria-label="Shared repository router" hidden>
-      <span>Known repos</span>
-      <div id="repo-router-list"></div>
-    </section>
-    </div>
 
     <div class="workspace">
       <section class="task-workspace" aria-labelledby="task-heading">
@@ -13212,6 +13245,7 @@ function getHtmlForWebview(webview, extensionUri) {
             <p class="task-objective" id="detail-objective"></p>
             <div class="task-retention-actions" id="detail-task-actions">
               <button id="detail-archive-task" class="secondary-button" type="button" hidden>Archive task</button>
+              <button id="detail-restart-task" class="secondary-button" type="button" hidden>Restart task</button>
               <button id="detail-restore-task" class="secondary-button" type="button" hidden>Restore task</button>
             </div>
             <dl class="metadata-grid" id="detail-metadata"></dl>
@@ -13351,6 +13385,7 @@ function getHtmlForWebview(webview, extensionUri) {
           </select>
           <button type="button" id="manager-chat-rotate" disabled>Rotate</button>
           <button type="button" id="manager-chat-close" disabled>Close</button>
+          <button type="button" id="manager-chat-stop" disabled>Stop</button>
           <span class="connection-state" id="manager-chat-status" role="status" aria-live="polite">
             <span class="connection-dot" aria-hidden="true"></span>
             <span id="manager-chat-status-label">Idle</span>

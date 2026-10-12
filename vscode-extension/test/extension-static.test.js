@@ -153,9 +153,16 @@ assert.ok(ext.includes("function writeSharedRepoRouteRecord"));
 assert.ok(ext.includes("function removeSharedRepoRouteRecord"));
 assert.ok(ext.includes("aiworkhub.shared_repo_route.v1"));
 assert.ok(ext.includes('path.join(os.homedir(), ".aiworkhub", "router", "repos")'));
-assert.ok(ext.includes('id="repo-router"'));
-assert.ok(app.includes("function renderKnownRepositories"));
-assert.ok(app.includes("known_repositories"));
+assert.ok(!ext.includes('id="repo-router"'));
+assert.ok(!app.includes("function renderKnownRepositories"));
+assert.ok(!app.includes("known_repositories"));
+assert.ok(ext.includes('"requestTaskRestart"'));
+assert.ok(ext.includes('restart: "aiworkhub_dashboard_task_restart"'));
+assert.ok(ext.includes('id="detail-restart-task"'));
+assert.ok(app.includes('elements.detailRestartTask.hidden = status !== "pending" && status !== "blocked" && status !== "processing";'));
+assert.ok(ext.includes('"managerLoopStop"'));
+assert.ok(ext.includes('stop: "aiworkhub_manager_loop_stop"'));
+assert.ok(ext.includes('id="manager-chat-stop"'));
 
 // The same-host mux is materialized before it can be advertised, and the
 // application-scoped override is enabled only behind the explicit OpenAI
@@ -253,7 +260,7 @@ assert.ok(!ext.includes("thread_id: `codex:${WINDOW_SCOPE_ID}`"), "Codex route m
 assert.ok(ext.includes("target.route = { ...defaults.targets[provider].route, ...existingRoute }"));
 assert.ok(ext.includes("callback_required"));
 assert.ok(ext.includes("notify_and_open_chat"));
-assert.ok(app.includes('case "coordinatorTargets"'));
+assert.ok(!app.includes('case "coordinatorTargets"'));
 assert.ok(app.includes('type: "selectCoordinatorTarget"'));
 assert.ok(ext.includes('id="identity-manager-check"'));
 assert.ok(ext.includes('id="identity-route-check"'));

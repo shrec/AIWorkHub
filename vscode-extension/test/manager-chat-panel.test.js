@@ -423,6 +423,104 @@ test("managerLoopEvents with a malformed session id is dropped before any MCP ca
   assert.deepEqual(plain(view.posts), []);
 });
 
+test("managerLoopStop reaches the gated client immediately, with no confirmation modal", async () => {
+  const harness = loadHostSlice();
+  const client = makeClient();
+  harness.setClient(client);
+  const view = makeView();
+
+  harness.api.handleInboundMessage(view, { type: "managerLoopStop" });
+  await flush();
+
+  assert.equal(harness.warningCalls.length, 0, "stop is safe and urgent: no modal");
+  const gatedClient = harness.managerLoopClientInstances[0];
+  const call = gatedClient.calls.find((c) => c.name === "aiworkhub_manager_loop_stop");
+  assert.deepEqual(plain(call.args), {});
+});
+
+function loadTaskRestartSlice() {
+  const outbound = extractSlice(
+    extensionSource,
+    "const OUTBOUND_TYPES = Object.freeze({",
+    "});",
+    "OUTBOUND_TYPES (task restart)",
+  );
+  const taskIdRe = extractSlice(extensionSource, "const TASK_ID_RE = ", ";", "TASK_ID_RE (host)");
+  const tools = extractSlice(
+    extensionSource,
+    "const TASK_RETENTION_TOOLS = Object.freeze({",
+    "});",
+    "TASK_RETENTION_TOOLS",
+  );
+  const fn = extractSlice(
+    extensionSource,
+    "async function runTaskRestart(view, taskId) {",
+    "    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });\n  }\n}",
+    "runTaskRestart",
+  );
+
+  let currentClient = null;
+  const warningCalls = [];
+  const warningResponses = [];
+  const pushCalls = [];
+  const context = {
+    getMcpClient: () => currentClient,
+    sanitizeErrorMessage: (err) => String((err && err.message) || "mcp_unavailable"),
+    pushSnapshot: async () => {
+      pushCalls.push("snapshot");
+    },
+    pushTaskDetail: async (view, taskId) => {
+      pushCalls.push(`detail:${taskId}`);
+    },
+    vscode: {
+      window: {
+        showWarningMessage: (message, options, ...actions) => {
+          warningCalls.push({ message, options, actions });
+          const response = warningResponses.length ? warningResponses.shift() : actions[0];
+          return Promise.resolve(response);
+        },
+      },
+    },
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    `"use strict";\n${taskIdRe}\n${outbound}\n${tools}\n${fn}\n` +
+      "this.api = { runTaskRestart, TASK_RETENTION_TOOLS, OUTBOUND_TYPES };",
+    context,
+  );
+  return {
+    api: context.api,
+    warningCalls,
+    pushCalls,
+    queueWarningResponse(value) {
+      warningResponses.push(value);
+    },
+    setClient(client) {
+      currentClient = client;
+    },
+  };
+}
+
+test("runTaskRestart sends confirm:true only after the modal choice, and nothing on dismiss", async () => {
+  const harness = loadTaskRestartSlice();
+  const client = makeClient();
+  harness.setClient(client);
+  const view = makeView();
+
+  harness.queueWarningResponse(undefined);
+  await harness.api.runTaskRestart(view, "task-123");
+  assert.equal(client.calls.length, 0, "a dismissed modal must call nothing");
+  assert.equal(harness.pushCalls.length, 0);
+
+  await harness.api.runTaskRestart(view, "task-123");
+  assert.equal(client.calls.length, 1);
+  assert.deepEqual(plain(client.calls[0]), {
+    name: "aiworkhub_dashboard_task_restart",
+    args: { task_id: "task-123", reason: "owner manual restart from dashboard", confirm: true },
+  });
+  assert.deepEqual(harness.pushCalls, ["snapshot", "detail:task-123"]);
+});
+
 // ── media/app.js: transcript rendering, textContent-only, and after_seq polling ──
 
 function makeFakeElement(tag) {
@@ -555,6 +653,7 @@ function loadWebviewSlice() {
     managerChatStart: makeFakeElement("button"),
     managerChatRotate: makeFakeElement("button"),
     managerChatClose: makeFakeElement("button"),
+    managerChatStop: makeFakeElement("button"),
     managerChatStatus: makeFakeElement("span"),
     managerChatStatusLabel: makeFakeElement("span"),
     managerChatSessionLine: makeFakeElement("div"),
@@ -1654,59 +1753,6 @@ test("picking a model pins it on the open conversation so it becomes the manager
   });
 });
 
-test("while Manager Chat holds the seat, the current repo and coordinator line name it, not the window route", () => {
-  const code =
-    extractSlice(appSource, "function createElement(tag, className, text) {", "return element;\n}", "createElement") +
-    "\n" +
-    extractSlice(appSource, "function asArray(value) {", "return Array.isArray(value) ? value : [];\n}", "asArray") +
-    "\n" +
-    extractSlice(
-      appSource,
-      "function managerChatSeatLabel(snapshot) {",
-      'routing: "per-task coordinator_provider + thread/session identity",\n    });\n  }\n}',
-      "seat label renderers",
-    );
-  const state = { snapshot: null };
-  const elements = {
-    repoRouter: makeFakeElement("div"),
-    repoRouterList: makeFakeElement("div"),
-    targetState: makeFakeElement("span"),
-  };
-  const context = {
-    document: {
-      createElement: (tag) => makeFakeElement(tag),
-      createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }),
-      createDocumentFragment: () => ({ __isFragment: true, children: [], appendChild(child) { this.children.push(child); return child; } }),
-    },
-    state,
-    elements,
-  };
-  vm.createContext(context);
-  vm.runInContext(`"use strict";\n${code}\nthis.api = { renderKnownRepositories, renderCoordinatorTargets };`, context);
-  const seated = {
-    manager_identity_target: { selected_provider: "manager_chat", backend_id: "claude_cli", model: "claude-opus-5-5" },
-    known_repositories: {
-      repositories: [
-        { repo_name: "AIWorkHub", current_repo: true, selected_provider: "codex", extension_host_alive: true },
-        { repo_name: "Other", current_repo: false, selected_provider: "codex", extension_host_alive: true },
-      ],
-    },
-  };
-  state.snapshot = seated;
-
-  context.api.renderKnownRepositories(seated);
-  context.api.renderCoordinatorTargets({ selected_provider: "codex", targets: { codex: { capability_state: "ready" } } });
-
-  const [current, other] = elements.repoRouterList.children;
-  assert.equal(current.textContent, "● AIWorkHub · manager_chat claude_cli/claude-opus-5-5 · live");
-  assert.equal(other.textContent, "Other · codex · live", "another repository keeps its own window route");
-  assert.equal(elements.targetState.textContent, "automatic: manager_chat claude_cli/claude-opus-5-5 · ready");
-
-  state.snapshot = { manager_identity_target: { selected_provider: "codex" } };
-  context.api.renderCoordinatorTargets(state.coordinatorTargets);
-  assert.equal(elements.targetState.textContent, "automatic: codex · ready", "a released seat shows the window route again");
-});
-
 test("the model field is a <select>, not a free-text input", () => {
   assert.match(extensionSource, /<select id="manager-chat-model" class="compact-select" aria-label="Model for this session"><\/select>/);
   assert.doesNotMatch(extensionSource, /<input id="manager-chat-model"/);
@@ -1952,6 +1998,14 @@ test("the extension.js webview HTML carries a disabled #manager-chat-close butto
   assert.match(markup, /<button type="button" id="manager-chat-close" disabled>Close<\/button>/);
 });
 
+test("the extension.js webview HTML carries a disabled #manager-chat-stop button next to Close", () => {
+  const markup = extensionSource.slice(
+    extensionSource.indexOf('id="manager-chat-rotate"') - 40,
+    extensionSource.indexOf('id="manager-chat-status"'),
+  );
+  assert.match(markup, /<button type="button" id="manager-chat-stop" disabled>Stop<\/button>/);
+});
+
 test("opening the sidebar posts exactly one managerLoopStatus then one managerLoopRestore", () => {
   const harness = loadWebviewSlice();
   harness.posts.length = 0;
@@ -2050,6 +2104,20 @@ test("Close posts managerLoopClose only when enabled with a session; confirmatio
   assert.deepEqual(plain(harness.posts), []);
 });
 
+test("Stop posts managerLoopStop only when enabled; confirmation is host-side", () => {
+  const harness = loadWebviewSlice();
+  const { elements } = harness;
+  elements.managerChatStop.disabled = false;
+
+  trigger(elements.managerChatStop, "click");
+  assert.deepEqual(plain(harness.posts.at(-1)), { type: "managerLoopStop" });
+
+  harness.posts.length = 0;
+  elements.managerChatStop.disabled = true;
+  trigger(elements.managerChatStop, "click");
+  assert.deepEqual(plain(harness.posts), []);
+});
+
 test("a close reply returns the panel to the no-session state and refreshes status once", () => {
   const harness = loadWebviewSlice();
   harness.state.managerChatSession = "mls-" + "a".repeat(32);
@@ -2084,4 +2152,23 @@ test("applyManagerChatSessionUi enables Close under the same rule as Rotate", ()
   state.managerChatRunning = false;
   harness.api.applyManagerChatSessionUi();
   assert.equal(elements.managerChatClose.disabled, false);
+});
+
+test("applyManagerChatSessionUi enables Stop only while a turn is running", () => {
+  const harness = loadWebviewSlice();
+  const { elements, state } = harness;
+
+  state.managerChatSession = null;
+  state.managerChatRunning = false;
+  harness.api.applyManagerChatSessionUi();
+  assert.equal(elements.managerChatStop.disabled, true);
+
+  state.managerChatRunning = true;
+  harness.api.applyManagerChatSessionUi();
+  assert.equal(elements.managerChatStop.disabled, false);
+
+  state.managerChatSession = "mls-" + "b".repeat(32);
+  state.managerChatRunning = false;
+  harness.api.applyManagerChatSessionUi();
+  assert.equal(elements.managerChatStop.disabled, true, "a session alone must not enable Stop");
 });

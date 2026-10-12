@@ -456,7 +456,7 @@ const renderSource = [
 // and the helpers it needs run for real.
 const SNAPSHOT_SIBLING_RENDERERS = [
   "renderStorageState", "renderSummary", "renderManagerIdentity",
-  "renderCallbackObservability", "renderKnownRepositories", "renderSourceHealth",
+  "renderCallbackObservability", "renderSourceHealth",
   "renderFilterOptions", "renderTaskTable", "renderStats", "renderKpis",
   "renderUsage", "renderPlanDag", "renderWorkforce", "renderToolUse",
   "renderStorage", "renderSystemLogs", "renderReturns", "renderRuns",

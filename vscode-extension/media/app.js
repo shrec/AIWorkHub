@@ -306,6 +306,7 @@ const elements = {
   detailContent: document.querySelector("#detail-content"),
   detailObjective: document.querySelector("#detail-objective"),
   detailArchiveTask: document.querySelector("#detail-archive-task"),
+  detailRestartTask: document.querySelector("#detail-restart-task"),
   detailRestoreTask: document.querySelector("#detail-restore-task"),
   detailMetadata: document.querySelector("#detail-metadata"),
   detailValidation: document.querySelector("#detail-validation"),
@@ -325,9 +326,6 @@ const elements = {
   toast: document.querySelector("#toast"),
   extensionVersion: document.querySelector("#extension-version"),
   mcpRuntimeVersion: document.querySelector("#mcp-runtime-version"),
-  targetState: document.querySelector("#target-state"),
-  repoRouter: document.querySelector("#repo-router"),
-  repoRouterList: document.querySelector("#repo-router-list"),
   targetButtons: Array.from(document.querySelectorAll("[data-provider]")),
   managerChatSidebar: document.querySelector("#manager-chat-sidebar"),
   managerChatShell: document.querySelector("#dashboard-shell"),
@@ -338,6 +336,7 @@ const elements = {
   managerChatReasoningSelect: document.querySelector("#manager-chat-reasoning"),
   managerChatRotate: document.querySelector("#manager-chat-rotate"),
   managerChatClose: document.querySelector("#manager-chat-close"),
+  managerChatStop: document.querySelector("#manager-chat-stop"),
   managerChatStatus: document.querySelector("#manager-chat-status"),
   managerChatStatusLabel: document.querySelector("#manager-chat-status-label"),
   managerChatSessionLine: document.querySelector("#manager-chat-session-line"),
@@ -3815,8 +3814,6 @@ function renderSnapshot(snapshot) {
   renderManagerIdentity(snapshot);
   renderWaveMiniRoadmap(snapshot);
   renderCallbackObservability(snapshot);
-  renderKnownRepositories(snapshot);
-  if (state.coordinatorTargets) renderCoordinatorTargets(state.coordinatorTargets);
   if (storageReady) {
     renderSourceHealth(snapshot);
   }
@@ -3899,82 +3896,6 @@ function renderRuntimeInfo(info) {
       elements.reloadAlertTitle.textContent = "MCP runtime degraded";
     }
     elements.reloadAlertMessage.textContent = "";
-  }
-}
-
-// While a Manager Chat conversation holds the manager seat, this repository's
-// manager is that conversation's model, not the window's coordinator route.
-function managerChatSeatLabel(snapshot) {
-  const target = snapshot && snapshot.manager_identity_target;
-  if (!target || target.selected_provider !== "manager_chat") return "";
-  const route = [target.backend_id, target.model].filter(Boolean).join("/");
-  return route ? `manager_chat ${route}` : "manager_chat";
-}
-
-function renderKnownRepositories(snapshot) {
-  if (!elements.repoRouter || !elements.repoRouterList) {
-    return;
-  }
-  const payload = snapshot && snapshot.known_repositories && typeof snapshot.known_repositories === "object"
-    ? snapshot.known_repositories
-    : null;
-  const repos = payload ? asArray(payload.repositories).slice(0, 8) : [];
-  elements.repoRouter.hidden = repos.length === 0;
-  if (!repos.length) {
-    elements.repoRouterList.replaceChildren();
-    return;
-  }
-  const seat = managerChatSeatLabel(snapshot);
-  const fragment = document.createDocumentFragment();
-  for (const repo of repos) {
-    const classes = ["repo-route"];
-    if (repo.current_repo) classes.push("current");
-    if (repo.stale) classes.push("stale");
-    const item = createElement("span", classes.join(" "));
-    const name = String(repo.repo_name || "repo");
-    const selected = String((repo.current_repo && seat) || repo.selected_provider || "unknown");
-    const alive = repo.extension_host_alive ? "live" : "not-live";
-    item.textContent = `${repo.current_repo ? "● " : ""}${name} · ${selected} · ${alive}${repo.stale ? " · stale" : ""}`;
-    item.title = JSON.stringify({
-      repo_id: repo.repo_id,
-      window_id: repo.window_id,
-      selected_provider: selected,
-      extension_host_alive: repo.extension_host_alive,
-      stale: repo.stale,
-      updated_at: repo.updated_at,
-    });
-    fragment.appendChild(item);
-  }
-  elements.repoRouterList.replaceChildren(fragment);
-}
-
-function renderCoordinatorTargets(info) {
-  const payload = info && typeof info === "object" ? info : {};
-  // Kept so a snapshot that moves the seat re-renders this line without a new push.
-  state.coordinatorTargets = payload;
-  const seat = managerChatSeatLabel(state.snapshot);
-  const selected = String(payload.selected_provider || "codex");
-  const target = payload.targets && payload.targets[selected] ? payload.targets[selected] : {};
-  const route = target.route && typeof target.route === "object" ? target.route : {};
-  const wake = target.wake && typeof target.wake === "object" ? target.wake : {};
-  if (elements.targetState) {
-    const stateText = String(target.capability_state || "automatic");
-    const reason = String(wake.reason || wake.action || "");
-    elements.targetState.textContent = seat
-      ? `automatic: ${seat} · ready`
-      : `automatic: ${selected} · ${stateText}${reason ? ` · ${reason}` : ""}`;
-    elements.targetState.title = JSON.stringify({
-      repo_id: payload.repo_id,
-      window_id: payload.window_id,
-      claim_episode: payload.claim_episode,
-      selected_provider: selected,
-      manager_seat: seat || undefined,
-      capability_state: target.capability_state,
-      thread_id: route.thread_id,
-      session_id: route.session_id,
-      wake,
-      routing: "per-task coordinator_provider + thread/session identity",
-    });
   }
 }
 
@@ -4224,8 +4145,10 @@ function renderTaskDetail(card) {
   const taskId = String(card.task_id || state.selectedTaskId || "");
   elements.detailArchiveTask.dataset.taskId = taskId;
   elements.detailRestoreTask.dataset.taskId = taskId;
+  elements.detailRestartTask.dataset.taskId = taskId;
   elements.detailArchiveTask.hidden = status === "processing" || status === "review" || status === "archived";
   elements.detailRestoreTask.hidden = status !== "archived";
+  elements.detailRestartTask.hidden = status !== "pending" && status !== "blocked" && status !== "processing";
   detailMetadata(card);
 
   const validation = String(card.validation_status || "unreported");
@@ -7539,6 +7462,9 @@ function applyManagerChatSessionUi() {
   if (elements.managerChatClose) {
     elements.managerChatClose.disabled = !hasSession || state.managerChatRunning;
   }
+  if (elements.managerChatStop) {
+    elements.managerChatStop.disabled = !state.managerChatRunning;
+  }
   if (elements.managerChatNewSession) {
     elements.managerChatNewSession.disabled = state.managerChatRunning;
   }
@@ -7939,10 +7865,6 @@ window.addEventListener("message", (event) => {
     case "settings":
       renderSettings(message.payload);
       break;
-    case "coordinatorTargets": {
-      renderCoordinatorTargets(message.payload);
-      break;
-    }
     case "liveOutput": {
       renderLiveOutput(message.payload);
       break;
@@ -8220,6 +8142,11 @@ elements.detailArchiveTask.addEventListener("click", () => {
   if (TASK_ID_RE.test(taskId)) vscode.postMessage({ type: "requestTaskArchive", taskId });
 });
 
+elements.detailRestartTask.addEventListener("click", () => {
+  const taskId = String(elements.detailRestartTask.dataset.taskId || "");
+  if (TASK_ID_RE.test(taskId)) vscode.postMessage({ type: "requestTaskRestart", taskId });
+});
+
 elements.detailRestoreTask.addEventListener("click", () => {
   const taskId = String(elements.detailRestoreTask.dataset.taskId || "");
   if (TASK_ID_RE.test(taskId)) vscode.postMessage({ type: "requestTaskRestore", taskId });
@@ -8487,6 +8414,12 @@ if (elements.managerChatClose && typeof elements.managerChatClose.addEventListen
   elements.managerChatClose.addEventListener("click", () => {
     if (elements.managerChatClose.disabled || !state.managerChatSession) return;
     vscode.postMessage({ type: "managerLoopClose" });
+  });
+}
+if (elements.managerChatStop && typeof elements.managerChatStop.addEventListener === "function") {
+  elements.managerChatStop.addEventListener("click", () => {
+    if (elements.managerChatStop.disabled) return;
+    vscode.postMessage({ type: "managerLoopStop" });
   });
 }
 if (elements.managerChatTaskFilter && typeof elements.managerChatTaskFilter.addEventListener === "function") {
