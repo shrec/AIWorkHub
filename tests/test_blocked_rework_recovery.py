@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from aiworkhub import task_store, worker_workspace
+from aiworkhub import promotion_merge, task_store, worker_workspace
 
 
 def _symlink_or_skip(link: Path, target: Path, *, directory: bool = False) -> None:
@@ -3085,9 +3085,12 @@ def test_nf594_timed_out_gc_recovers_from_authenticated_sealed_delta(
     successor.mkdir()
     # A plain successor dir is not an isolated worktree; pin its base to the
     # predecessor's so no base-drift rebase runs and only the delta is tested.
+    # Patched where the rebase reads it: promotion_merge binds the name at its
+    # import, so patching worker_workspace only held when this test happened to
+    # be the first to import promotion_merge (order-dependent under xdist).
     predecessor_base = recovered["rework_predecessor"]["workspace"]["base_oid"]
     monkeypatch.setattr(
-        worker_workspace, "_isolated_worktree_base_oid", lambda *_a, **_k: predecessor_base,
+        promotion_merge, "_isolated_worktree_base_oid", lambda *_a, **_k: predecessor_base,
     )
     assert worker_workspace._materialize_rework_predecessor(
         repo, successor, recovered, tuple(recovered["allowed_writes"])
