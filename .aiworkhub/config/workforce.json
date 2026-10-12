@@ -1,5 +1,5 @@
 {
-  "revision": 29,
+  "revision": 30,
   "schema_id": "aiworkhub.workforce_catalog.v1",
   "workers": [
     {
@@ -174,8 +174,7 @@
       "supports": [
         "mechanical",
         "code",
-        "research",
-        "review"
+        "research"
       ],
       "tools": [
         "filesystem",
