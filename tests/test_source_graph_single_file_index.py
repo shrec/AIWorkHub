@@ -825,14 +825,15 @@ def test_index_file_rejects_oversized_fstat_before_read(tmp_path, monkeypatch):
     monkeypatch.setattr(sg, "SOURCE_GRAPH_AUTHENTICATED_FILE_BYTE_LIMIT", 4)
     read_calls = []
     real_read = sg.os.read
-    # sg.os IS the os module, so this patch is process-wide. Only this thread's
-    # reads are the subject: a background thread's os.read would otherwise be
-    # counted as the code under test reading, which is how the sibling test
-    # below became flaky under the full suite.
-    caller = threading.get_ident()
+    # sg.os IS the os module, so this patch is process-wide. Only reads of THIS
+    # file are the subject: a background thread's os.read, or the POSIX
+    # subprocess pipe reads of a git probe on this thread, would otherwise be
+    # counted as the code under test reading the oversized file.
+    target = os.stat(repo / "too_big.py")
 
     def record_read(fd: int, size: int) -> bytes:
-        if threading.get_ident() == caller:
+        status = os.fstat(fd)
+        if (status.st_dev, status.st_ino) == (target.st_dev, target.st_ino):
             read_calls.append((fd, size))
         return real_read(fd, size)
 
