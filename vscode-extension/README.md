@@ -14,6 +14,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.46
+
+- OpenCode models join the workforce chain and the Manager Chat picker (NF-2026-01454).
+- Compact manager replies by default (NF-2026-01447); Claude workers run the current Claude 5.5 models through Claude Code's family aliases.
+- Manager Chat restores its session on open and gains Rotate and Close; worker start skips a redundant health probe (NF-2026-01435).
+
 ## What's new in 0.12.45
 
 - A lost Kilo or OpenCode worker prompt now fails closed instead of launching the CLI on an empty stdin (NF-2026-01423).

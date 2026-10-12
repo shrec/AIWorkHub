@@ -6,6 +6,28 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.46] - 2026-10-12
+
+### Added
+
+- OpenCode: OpenCode models join the workforce chain and the Manager Chat model picker, which now lists up to 256 OpenCode model rows (NF-2026-01454).
+- Manager Chat: opening the panel restores the last session, Rotate starts a fresh one, a new Close button ends it, and each tool call shares one console row with its result.
+- Session: a manager `session_write` can amend or redact one existing event.
+
+### Changed
+
+- Context: manager task and NeedFix tools return compact replies by default; the full card stays one `include_card` away (NF-2026-01447).
+- Workers: Claude workers launch with Claude Code's own family aliases (`opus`, `sonnet`, `haiku`), so they follow the current Claude family (5.5 today) without a catalog change; the model picker shows each alias's resolved model id after its first run.
+- Workforce: quality review is no longer routed to `deepseek_vscode_lm`.
+
+### Fixed
+
+- Extension: the MCP preflight trusts the server version from the `initialize` reply and skips the `dashboard_health` probe when it matches, so worker start no longer waits on a health call (NF-2026-01435).
+
+### Qualification
+
+- Each change has regressions that fail before and pass after; the touched Python suites and the extension suite (`npm test`) pass. Installation and live replay are separate evidence.
+
 ## [0.12.45] - 2026-10-11
 
 ### Fixed

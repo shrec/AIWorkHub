@@ -62,6 +62,13 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.46
+
+- OpenCode models join the workforce chain and the Manager Chat picker (NF-2026-01454).
+- Manager tool replies are compact by default, so each manager turn reads less tool output (NF-2026-01447).
+- Claude workers follow Claude Code's own family aliases and run the current Claude 5.5 models; the picker shows the resolved id per alias.
+- Manager Chat restores its session on open and gains Rotate and Close; the MCP preflight skips a redundant health probe (NF-2026-01435).
+
 ## What's new in 0.12.45
 
 - A lost Kilo or OpenCode worker prompt now fails closed (`worker_prompt_not_delivered`) instead of launching the CLI on an empty stdin (NF-2026-01423).

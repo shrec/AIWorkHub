@@ -1,5 +1,20 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.46 — 2026-10-12
+
+### Added
+
+- OpenCode models in the workforce chain and the Manager Chat picker, up to 256 rows (NF-2026-01454).
+- Manager Chat restores the last session on open, wires Rotate, adds Close, and pairs each tool call with its result in one row.
+
+### Changed
+
+- Bundled runtime 0.12.46: compact manager task/NeedFix replies by default (NF-2026-01447); Claude workers follow Claude Code's family aliases, so they run the current Claude 5.5 models.
+
+### Fixed
+
+- MCP preflight trusts the `initialize` server version and skips the `dashboard_health` probe on a match (NF-2026-01435).
+
 ## 0.12.45 — 2026-10-11
 
 ### Fixed
