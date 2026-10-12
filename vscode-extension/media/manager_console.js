@@ -24,12 +24,33 @@ function managerChatEventNode(event) {
     if (images > 0) bubble.appendChild(createElement("span", "manager-chat-bubble-images", managerChatImageCount(images)));
     return managerConsoleBlock(type, bubble);
   }
-  if (type === "tool_call" || type === "tool_result") {
+  if (type === "tool_call") {
     const name = String(payload.name || payload.tool || "tool");
     const hint = managerChatToolHint(payload);
-    const row = createElement("details", "manager-chat-tool-row " + (type === "tool_result" ? "is-result" : "is-call"));
-    row.open = type === "tool_call";
-    const summary = type === "tool_result" ? name + " result" : name;
+    const hasResult = "output" in payload || "is_error" in payload;
+    const status = !hasResult ? "running" : payload.is_error ? "failed" : "done";
+    const row = createElement("details", "manager-chat-tool-row is-" + status);
+    row.open = status !== "done";
+    row.appendChild(createElement("summary", "", [name, hint, status].filter(Boolean).join(" · ")));
+    const body = createElement("div", "manager-chat-tool-row-body");
+    if ("input" in payload) {
+      body.appendChild(createElement("div", "manager-chat-tool-section", "input"));
+      appendManagerChatToolFields(body, payload.input, 0);
+    }
+    if (hasResult) {
+      body.appendChild(createElement("div", "manager-chat-tool-section", "output"));
+      appendManagerChatToolFields(body, payload.output, 0);
+    }
+    row.appendChild(body);
+    const task = hasResult ? managerConsoleTaskOf(payload) : null;
+    return task ? managerConsoleTaskNode(task, row) : managerConsoleBlock("tool_call", row);
+  }
+  if (type === "tool_result") {
+    const name = String(payload.name || payload.tool || "tool");
+    const hint = managerChatToolHint(payload);
+    const row = createElement("details", "manager-chat-tool-row is-result");
+    row.open = false;
+    const summary = name + " result";
     row.appendChild(createElement("summary", "", hint ? summary + " · " + hint : summary));
     const body = createElement("div", "manager-chat-tool-row-body");
     const rest = Object.assign({}, payload);
@@ -37,7 +58,7 @@ function managerChatEventNode(event) {
     delete rest.tool;
     appendManagerChatToolFields(body, rest, 0);
     row.appendChild(body);
-    const task = type === "tool_result" ? managerConsoleTaskOf(payload) : null;
+    const task = managerConsoleTaskOf(payload);
     return task ? managerConsoleTaskNode(task, row) : managerConsoleBlock(type, row);
   }
   if (type === "callback") {
@@ -200,6 +221,30 @@ function managerConsoleMergeCommands(events) {
     if (shown.has(id)) continue;
     shown.add(id);
     merged.push(latest.get(id));
+  }
+  return merged;
+}
+
+// FIFO per call_id; a result with no earlier unpaired call, or an empty call_id, stays standalone.
+function managerConsoleMergeTools(events) {
+  const pending = new Map();
+  const merged = [];
+  for (const event of events) {
+    const payload = event && event.payload;
+    const id = payload && payload.call_id;
+    if (id && event.type === "tool_call") {
+      const queue = pending.get(id) || [];
+      queue.push(merged.length);
+      pending.set(id, queue);
+    } else if (id && event.type === "tool_result" && pending.has(id)) {
+      const queue = pending.get(id);
+      const callIndex = queue.shift();
+      if (!queue.length) pending.delete(id);
+      const call = merged[callIndex];
+      merged[callIndex] = { ...call, payload: { ...call.payload, output: payload.output, is_error: payload.is_error } };
+      continue;
+    }
+    merged.push(event);
   }
   return merged;
 }
@@ -390,7 +435,7 @@ function renderManagerChatEvents() {
     }
     lastTurnEndTurn = null;
   };
-  for (const event of managerConsoleMergeCommands(state.managerChatEvents)) {
+  for (const event of managerConsoleMergeTools(managerConsoleMergeCommands(state.managerChatEvents))) {
     // Opencode closes every agent step with step_finish, which the backend
     // records as turn_end: collapse consecutive same-turn markers so one
     // turn renders one completion row (the last, with final usage).

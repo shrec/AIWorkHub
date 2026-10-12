@@ -57,7 +57,7 @@ function load(events = []) {
     slice(appSource, "function numberValue(value) {", "return Number.isFinite(parsed) ? parsed : 0;\n}"),
     slice(appSource, "function limitText(value, maxLength = 120) {", "return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}...`;\n}"),
   ].join("\n");
-  vm.runInContext(`${utilities}\n${consoleSource}\nthis.api = { managerChatEventNode, renderManagerChatEvents, managerConsoleMergeCommands, managerConsoleCompact, managerConsoleFooterText, managerConsoleTaskOf, managerConsoleApplyHairline, managerConsoleMarkdown, managerConsolePartialNodes, managerConsoleScheduleRender };`, context);
+  vm.runInContext(`${utilities}\n${consoleSource}\nthis.api = { managerChatEventNode, renderManagerChatEvents, managerConsoleMergeCommands, managerConsoleMergeTools, managerConsoleCompact, managerConsoleFooterText, managerConsoleTaskOf, managerConsoleApplyHairline, managerConsoleMarkdown, managerConsolePartialNodes, managerConsoleScheduleRender };`, context);
   return { api: context.api, elements, opened, frames, state: context.state };
 }
 
@@ -135,6 +135,120 @@ test("a task id in a tool result becomes a task block that opens the task", () =
   assert.ok(text(node).includes("Fix <b>it</b>"));
   flat(node).find((n) => n.tag === "button").listeners.click[0]();
   assert.deepEqual(opened, ["T-2026-00042"]);
+});
+
+test("a tool_call paired with its tool_result by call_id merges into one done row carrying input and output", () => {
+  const { api } = load();
+  const merged = api.managerConsoleMergeTools([
+    { seq: 1, turn: 1, type: "tool_call", payload: { call_id: "a1", name: "Read", input: { path: "x.py" } } },
+    { seq: 2, turn: 1, type: "tool_result", payload: { call_id: "a1", name: "Read", output: "contents", is_error: false } },
+  ]);
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].seq, 1);
+  const node = api.managerChatEventNode(merged[0]);
+  assert.equal(flat(node).filter((n) => n.tag === "details").length, 1);
+  assert.ok(text(node).includes("Read"));
+  assert.ok(text(node).includes("done"));
+  assert.ok(text(node).includes("x.py"));
+  assert.ok(text(node).includes("contents"));
+  assert.equal(flat(node).find((n) => n.tag === "details").open, false);
+});
+
+test("a tool_call with no result yet renders one running, open row", () => {
+  const { api } = load();
+  const node = api.managerChatEventNode({ type: "tool_call", payload: { call_id: "b1", name: "Bash", input: { command: "ls" } } });
+  assert.equal(flat(node).filter((n) => n.tag === "details").length, 1);
+  const row = flat(node).find((n) => n.tag === "details");
+  assert.equal(row.open, true);
+  assert.ok(text(node).includes("running"));
+  assert.ok(!text(node).includes("output"));
+});
+
+test("a failed tool_result merges into one failed, open row", () => {
+  const { api } = load();
+  const merged = api.managerConsoleMergeTools([
+    { seq: 1, turn: 1, type: "tool_call", payload: { call_id: "c1", name: "Bash", input: { command: "false" } } },
+    { seq: 2, turn: 1, type: "tool_result", payload: { call_id: "c1", name: "Bash", output: "boom", is_error: true } },
+  ]);
+  assert.equal(merged.length, 1);
+  const node = api.managerChatEventNode(merged[0]);
+  const row = flat(node).find((n) => n.tag === "details");
+  assert.equal(row.open, true);
+  assert.ok(text(node).includes("failed"));
+  assert.ok(text(node).includes("boom"));
+});
+
+test("a tool_result with no matching call, or an empty call_id, stays a standalone row", () => {
+  const { api } = load();
+  const orphan = api.managerConsoleMergeTools([
+    { seq: 1, turn: 1, type: "tool_result", payload: { call_id: "missing", name: "Read", output: "x", is_error: false } },
+  ]);
+  assert.equal(orphan.length, 1);
+  assert.equal(orphan[0].type, "tool_result");
+  const node = api.managerChatEventNode(orphan[0]);
+  assert.ok(text(node).includes("Read result"));
+  const empty = api.managerConsoleMergeTools([
+    { seq: 1, turn: 1, type: "tool_call", payload: { call_id: "", name: "Read", input: {} } },
+    { seq: 2, turn: 1, type: "tool_result", payload: { call_id: "", name: "Read", output: "x", is_error: false } },
+  ]);
+  assert.equal(empty.length, 2);
+  assert.equal(empty[1].type, "tool_result");
+});
+
+test("merging tool calls and results never mutates the original events", () => {
+  const { api } = load();
+  const call = { seq: 1, turn: 1, type: "tool_call", payload: { call_id: "d1", name: "Read", input: { path: "x" } } };
+  const result = { seq: 2, turn: 1, type: "tool_result", payload: { call_id: "d1", name: "Read", output: "y", is_error: false } };
+  const events = [call, result];
+  api.managerConsoleMergeTools(events);
+  assert.equal(call.payload.output, undefined);
+  assert.equal(events.length, 2);
+  assert.equal(events[0], call);
+  assert.equal(events[1], result);
+});
+
+test("a repeated call_id pairs results FIFO when providers reuse call ids across turns", () => {
+  const { api } = load();
+  const merged = api.managerConsoleMergeTools([
+    { seq: 1, turn: 1, type: "tool_call", payload: { call_id: "x", name: "Read", input: { path: "a" } } },
+    { seq: 2, turn: 1, type: "tool_result", payload: { call_id: "x", name: "Read", output: "a-out", is_error: false } },
+    { seq: 3, turn: 2, type: "tool_call", payload: { call_id: "x", name: "Read", input: { path: "b" } } },
+    { seq: 4, turn: 2, type: "tool_result", payload: { call_id: "x", name: "Read", output: "b-out", is_error: false } },
+  ]);
+  assert.equal(merged.length, 2);
+  assert.equal(merged[0].payload.output, "a-out");
+  assert.equal(merged[1].payload.output, "b-out");
+  const rows = merged.map((event) => flat(api.managerChatEventNode(event)).find((n) => n.tag === "details"));
+  assert.ok(rows.every((row) => row.open === false));
+});
+
+test("two calls sharing a call_id give the earlier one the result while the later stays running", () => {
+  const { api } = load();
+  const merged = api.managerConsoleMergeTools([
+    { seq: 1, turn: 1, type: "tool_call", payload: { call_id: "x", name: "Read", input: { path: "a" } } },
+    { seq: 2, turn: 1, type: "tool_call", payload: { call_id: "x", name: "Read", input: { path: "b" } } },
+    { seq: 3, turn: 1, type: "tool_result", payload: { call_id: "x", name: "Read", output: "a-out", is_error: false } },
+  ]);
+  assert.equal(merged.length, 2);
+  assert.equal(merged[0].payload.output, "a-out");
+  assert.equal(merged[1].payload.output, undefined);
+  assert.ok(text(api.managerChatEventNode(merged[0])).includes("done"));
+  assert.ok(text(api.managerChatEventNode(merged[1])).includes("running"));
+});
+
+test("a merged tool call whose result output carries a task_id renders as a task block", () => {
+  const { api, opened } = load();
+  const output = [{ type: "text", text: JSON.stringify({ task_id: "T-2026-00099", status: "review", title: "Merged task" }) }];
+  const merged = api.managerConsoleMergeTools([
+    { seq: 1, turn: 1, type: "tool_call", payload: { call_id: "m1", name: "aiworkhub_task_show", input: {} } },
+    { seq: 2, turn: 1, type: "tool_result", payload: { call_id: "m1", name: "aiworkhub_task_show", output, is_error: false } },
+  ]);
+  assert.equal(merged.length, 1);
+  const node = api.managerChatEventNode(merged[0]);
+  assert.ok(text(node).includes("T-2026-00099"));
+  assert.ok(text(node).includes("Merged task"));
+  flat(node).find((n) => n.tag === "button").listeners.click[0]();
+  assert.deepEqual(opened, ["T-2026-00099"]);
 });
 
 test("the hairline follows the last reported context fill", () => {
