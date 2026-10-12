@@ -1052,6 +1052,27 @@ def validate_manager_correction(
     return record, corrected_texts, ""
 
 
+def _restore_correction_originals(
+    workspace: _WorkerWorkspaceT, originals: Mapping[str, bytes]
+) -> list[str]:
+    """Write back the pre-correction bytes for every corrected path.
+
+    Called on every exit from ``accept_review`` that does not promote after
+    the corrected bytes were already written into the retained worktree
+    (NF-2026-01469): a correction applied but never accepted must not leave
+    the worktree ahead of what the next operation expects. Every path is
+    attempted even when an earlier one fails; the relative paths that could
+    not be restored are returned (empty list means all restored).
+    """
+    failed: list[str] = []
+    for relative, original in originals.items():
+        try:
+            (workspace.path / relative).write_bytes(original)
+        except OSError:
+            failed.append(relative)
+    return failed
+
+
 def _blind_reviewer_lenses(reviewers: list[dict[str, Any]]) -> set[str]:
     """Lenses whose ALREADY-SEALED reports show that nothing inspected them.
 
@@ -1592,6 +1613,7 @@ def accept_preview(self, request_id: str, task_id: str, **overrides: Any) -> dic
 # list is exactly the drift it exists to catch.
 ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
     "_accept_manager_identity",
+    "_restore_correction_originals",
     "_receipt_sha256",
     "_sealed_receipt_sha256",
     "_target_candidate_sha256",
@@ -2511,6 +2533,12 @@ def accept_review(
                 "needfix_closure": needfix_closure,
             }
 
+        # Snapshot of the pre-correction bytes for any path a manager
+        # correction overwrites below, so a non-promoting exit can restore
+        # the retained worktree (NF-2026-01469). Declared here, outside the
+        # try, so every except handler can read it regardless of where in
+        # the try an exception was raised.
+        correction_originals: dict[str, bytes] = {}
         try:
             changed = enforce_scope(
                 workspace,
@@ -2706,7 +2734,9 @@ def accept_review(
             # that passed. A refusal on any earlier line left the tree alone.
             if correction_record is not None:
                 for relative in correction_record["paths"]:
-                    (workspace.path / relative).write_bytes(
+                    target_path = workspace.path / relative
+                    correction_originals[relative] = target_path.read_bytes()
+                    target_path.write_bytes(
                         corrected_texts[relative].encode("utf-8")
                     )
                 accepted_path_hashes = {
@@ -2951,6 +2981,14 @@ def accept_review(
                     if accepted_finding_dispositions
                     else {}
                 ),
+                # Only a VALIDATED correction reaches the authoritative gate,
+                # so the lift it performs can never rest on a caller's claim
+                # nothing checked (NF-2026-01469).
+                **(
+                    {"corrected_finding_ids": correction_record["finding_ids"]}
+                    if correction_record is not None
+                    else {}
+                ),
             )
             quality_gate["combined_tree"] = combined_tree
             quality_gate["quality_policy_authority"] = policy_authority
@@ -3023,12 +3061,22 @@ def accept_review(
                     quality_gate=quality_gate,
                 )
                 if supplemental:
+                    error_message = (
+                        "revalidation_failed:quality_gate_failed:"
+                        + str(reason)[:400]
+                    )
+                    if correction_originals:
+                        failed_restores = _restore_correction_originals(
+                            workspace, correction_originals
+                        )
+                        if failed_restores:
+                            error_message += (
+                                ":correction_restore_failed:"
+                                + ",".join(failed_restores)[:200]
+                            )
                     return {
                         "ok": False,
-                        "error": (
-                            "revalidation_failed:quality_gate_failed:"
-                            + str(reason)[:400]
-                        ),
+                        "error": error_message,
                         "request_id": request_id,
                         "task_id": task_id,
                         "supplemental_inspection": supplemental,
@@ -3055,24 +3103,55 @@ def accept_review(
             ):
                 raise WorkspaceError("stored_hash_mismatch")
         except GitCommandTimeout as exc:
+            error_message = str(exc)[:500]
+            if correction_originals:
+                failed_restores = _restore_correction_originals(workspace, correction_originals)
+                if failed_restores:
+                    error_message += (
+                        ":correction_restore_failed:" + ",".join(failed_restores)[:200]
+                    )
             return {
                 "ok": False,
-                "error": str(exc)[:500],
+                "error": error_message,
                 "request_id": request_id,
                 "task_id": task_id,
             }
         except WorkspaceError as exc:
+            error_message = f"revalidation_failed:{exc}"
+            if correction_originals:
+                failed_restores = _restore_correction_originals(workspace, correction_originals)
+                if failed_restores:
+                    error_message += (
+                        ":correction_restore_failed:" + ",".join(failed_restores)[:200]
+                    )
             return {
                 "ok": False,
-                "error": f"revalidation_failed:{exc}",
+                "error": error_message,
                 "request_id": request_id,
                 "task_id": task_id,
             }
+        except BaseException:
+            # Any other exception after the correction write (an OSError from
+            # a later read/write on a second corrected path, or a raise from
+            # a validation/gate helper) still leaves CORRECTED bytes in the
+            # retained worktree unless they are restored before it propagates
+            # (NF-2026-01469).
+            if correction_originals:
+                _restore_correction_originals(workspace, correction_originals)
+            raise
         # Promote exactly the merged bytes validated in the combined tree (NF-2026-01381 part A).
         combined_tree = full_validation_snapshot.get("combined_tree") or {}
-        promoted = self._promote_accepted_candidate(
-            workspace, changed, merged_hashes=combined_tree.get("merged_paths")
-        )
+        try:
+            # NF-2026-01469: promotion can raise before writing any byte (a
+            # backwards-version refusal) or mid-write; either way CORRECTED
+            # bytes must not be left behind in the retained worktree.
+            promoted = self._promote_accepted_candidate(
+                workspace, changed, merged_hashes=combined_tree.get("merged_paths")
+            )
+        except BaseException:
+            if correction_originals:
+                _restore_correction_originals(workspace, correction_originals)
+            raise
 
         try:
             accepted_outcome_receipt = _accepted_outcome_receipt(

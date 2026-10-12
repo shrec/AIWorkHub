@@ -1499,6 +1499,7 @@ def fold_quality_verdict(
     review_packets: Mapping[str, Mapping[str, Any]] | None = None,
     supplemental_rounds: Mapping[str, int] | None = None,
     finding_dispositions: Iterable[Mapping[str, Any]] | None = None,
+    corrected_finding_ids: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Purely fold mechanical and reviewer evidence into one final verdict.
 
@@ -1516,6 +1517,8 @@ def fold_quality_verdict(
 
     dismissed_by_finding = dismissed_finding_receipts(finding_dispositions)
     manager_dismissed: list[dict[str, Any]] = []
+    corrected_ids = frozenset(str(value) for value in corrected_finding_ids)
+    manager_corrected: list[dict[str, Any]] = []
 
     profile = dict(risk_profile or resolve_risk_profile())
     effective_tier = profile.get("effective_tier")
@@ -1636,7 +1639,7 @@ def fold_quality_verdict(
     # A dismissal names a finding id, and two reports of one lens can reuse an
     # id: an id that is not unique across the reports is never suppressed.
     finding_id_counts: dict[str, int] = {}
-    if dismissed_by_finding:
+    if dismissed_by_finding or corrected_ids:
         for report in normalized_reports:
             for finding in report["findings"]:
                 counted_id = f"reviewer:{report['lens']}:{finding['id']}"
@@ -1678,6 +1681,24 @@ def fold_quality_verdict(
                             "disposition": "dismissed",
                             "classification": "manager_dismissed_reviewer_false_positive",
                             "receipt_sha256": dismissed_by_finding[finding_id],
+                        }
+                    )
+                    continue
+                if (
+                    finding_id in corrected_ids
+                    and finding["severity"] not in BLOCKING_SEVERITIES
+                    and finding_id_counts.get(finding_id) == 1
+                ):
+                    # A manager-corrected finding (NF-2026-01469): the fix was
+                    # already validated before this fold ran. A blocking
+                    # severity never reaches this branch, and an id that is
+                    # not unique across these reports is never lifted.
+                    manager_corrected.append(
+                        {
+                            "finding_id": finding_id,
+                            "lens": lens,
+                            "severity": str(finding["severity"]),
+                            "classification": "manager_corrected_finding",
                         }
                     )
                     continue
@@ -1830,6 +1851,13 @@ def fold_quality_verdict(
         **(
             {"manager_dismissed_findings": manager_dismissed}
             if manager_dismissed
+            else {}
+        ),
+        # Present only when a manager correction actually lifted a blocker, so
+        # a fold with no correction is byte-identical to before NF-2026-01469.
+        **(
+            {"manager_corrected_findings": manager_corrected}
+            if manager_corrected
             else {}
         ),
     }
@@ -2945,6 +2973,7 @@ def run_completion_quality_gate(
     supplemental_rounds: Mapping[str, int] | None = None,
     replay_binding: Mapping[str, Any] | None = None,
     finding_dispositions: Iterable[Mapping[str, Any]] | None = None,
+    corrected_finding_ids: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Execute the mandatory review-quality floor for one task delta.
 
@@ -3049,6 +3078,7 @@ def run_completion_quality_gate(
             review_packets=review_packets,
             supplemental_rounds=supplemental_rounds,
             finding_dispositions=finding_dispositions,
+            corrected_finding_ids=corrected_finding_ids,
         )
     except MalformedConfigError as exc:
         risk_profile = {}

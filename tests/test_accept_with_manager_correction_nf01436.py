@@ -202,14 +202,36 @@ def _fake_evidence_levels() -> SimpleNamespace:
     )
 
 
-def _fake_quality_evidence() -> SimpleNamespace:
+def _fake_quality_evidence(
+    *,
+    passed: bool = True,
+    blocking_checks: list[str] | None = None,
+    recorded_calls: list[dict] | None = None,
+) -> SimpleNamespace:
     """The mechanical gate, neutralised; the lens census is kept real.
 
     ``required_reviewer_lenses`` still demands the correctness lens, which is
     what makes the reviewer selection, the finding fold and the lift behave as
     they do in production. ``combined_tree_required`` is False so the test does
     not pay for a union workspace it asserts nothing about.
+
+    ``passed``/``blocking_checks`` let a caller simulate the gate refusing the
+    corrected candidate (NF-2026-01469 rollback coverage); ``recorded_calls``,
+    when given, collects every call's keyword arguments so a test can prove
+    exactly what ``accept_review`` passed the gate.
     """
+
+    def _run_completion_quality_gate(*args: object, **kwargs: object) -> dict:
+        if recorded_calls is not None:
+            recorded_calls.append(dict(kwargs))
+        return {
+            "schema_id": "aiworkhub.completion_quality_gate.v1",
+            "applicable": True,
+            "passed": passed,
+            "checks": [],
+            "blocking_checks": list(blocking_checks or []),
+        }
+
     return SimpleNamespace(
         STATUS_FAILED=quality_evidence.STATUS_FAILED,
         STATUS_PASSED=quality_evidence.STATUS_PASSED,
@@ -229,13 +251,7 @@ def _fake_quality_evidence() -> SimpleNamespace:
             "combined_tree_required": False,
             "explicit_human_approval_required": False,
         },
-        run_completion_quality_gate=lambda *a, **k: {
-            "schema_id": "aiworkhub.completion_quality_gate.v1",
-            "applicable": True,
-            "passed": True,
-            "checks": [],
-            "blocking_checks": [],
-        },
+        run_completion_quality_gate=_run_completion_quality_gate,
     )
 
 
@@ -445,6 +461,9 @@ def _accept_env(
     *,
     findings: list[dict] | None = None,
     dispositions: list[dict] | None = None,
+    gate_passed: bool = True,
+    gate_blocking_checks: list[str] | None = None,
+    gate_calls: list[dict] | None = None,
 ) -> _StubManager:
     workspace_path = tmp_path / "workspace"
     (workspace_path / "src" / "demo").mkdir(parents=True)
@@ -536,7 +555,15 @@ def _accept_env(
     )
     monkeypatch.setattr(process_launcher, "_enforce_behavioral_gate", lambda *a, **k: None)
     monkeypatch.setattr(process_launcher, "evidence_levels", _fake_evidence_levels())
-    monkeypatch.setattr(process_launcher, "quality_evidence", _fake_quality_evidence())
+    monkeypatch.setattr(
+        process_launcher,
+        "quality_evidence",
+        _fake_quality_evidence(
+            passed=gate_passed,
+            blocking_checks=gate_blocking_checks,
+            recorded_calls=gate_calls,
+        ),
+    )
     monkeypatch.setattr(process_launcher, "core", core)
     monkeypatch.setattr(
         process_launcher,
@@ -1027,3 +1054,245 @@ def test_accepted_outcome_receipt_refuses_a_correction_the_repo_does_not_hold(
     assert "manager_correction_receipt_mismatch" in str(
         excinfo.value
     ) or "post_promotion_candidate_mismatch" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-01469: the authoritative gate itself must honour the correction.
+# ---------------------------------------------------------------------------
+def _risk_profile_no_review() -> dict:
+    """A profile that makes no reviewer lens required.
+
+    The findings loop in ``fold_quality_verdict`` folds LENS_CORRECTNESS /
+    LENS_SECURITY findings unconditionally -- required lenses only gate the
+    independence/missing-reviewer machinery, which these tests assert
+    nothing about.
+    """
+    return {
+        "effective_tier": "low",
+        "required_reviewer_lenses": [],
+        "combined_tree_required": False,
+        "cross_provider_required": False,
+        "explicit_human_approval_required": False,
+    }
+
+
+def _judged_report(
+    finding: dict,
+    *,
+    lens: str = quality_evidence.LENS_CORRECTNESS,
+    provider: str = "claude",
+) -> dict:
+    """One normalizable reviewer report carrying exactly ``finding``."""
+    return {
+        "lens": lens,
+        "provider": provider,
+        "read_only": True,
+        "can_mutate_repo": False,
+        "findings": [
+            {
+                **finding,
+                "summary": finding.get("title", "finding"),
+                "evidence": finding.get("detail", "evidence"),
+            }
+        ],
+    }
+
+
+def test_fold_quality_verdict_corrected_finding_ids_lifts_a_confirmed_low_finding() -> None:
+    verdict = quality_evidence.fold_quality_verdict(
+        [],
+        risk_profile=_risk_profile_no_review(),
+        reviewer_reports=[_judged_report(_low_finding())],
+        corrected_finding_ids=[FINDING_ID],
+    )
+
+    assert verdict["passed"] is True
+    assert not any(
+        blocker.startswith("refinement_required:")
+        for blocker in verdict["blocking_evidence"]
+    )
+    assert verdict["manager_corrected_findings"] == [
+        {
+            "finding_id": FINDING_ID,
+            "lens": quality_evidence.LENS_CORRECTNESS,
+            "severity": "low",
+            "classification": "manager_corrected_finding",
+        }
+    ]
+
+
+def test_fold_quality_verdict_without_corrected_finding_ids_refuses_as_today() -> None:
+    verdict = quality_evidence.fold_quality_verdict(
+        [],
+        risk_profile=_risk_profile_no_review(),
+        reviewer_reports=[_judged_report(_low_finding())],
+    )
+
+    assert verdict["passed"] is False
+    assert verdict["blocking_evidence"] == [f"refinement_required:{FINDING_ID}"]
+    assert "manager_corrected_findings" not in verdict
+
+
+def test_fold_quality_verdict_never_lifts_a_blocking_severity() -> None:
+    verdict = quality_evidence.fold_quality_verdict(
+        [],
+        risk_profile=_risk_profile_no_review(),
+        reviewer_reports=[_judged_report(_blocking_finding())],
+        corrected_finding_ids=[BLOCKING_FINDING_ID],
+    )
+
+    assert verdict["passed"] is False
+    assert BLOCKING_FINDING_ID in verdict["blocking_evidence"]
+    assert "manager_corrected_findings" not in verdict
+
+
+def test_fold_quality_verdict_does_not_lift_a_duplicated_finding_id() -> None:
+    verdict = quality_evidence.fold_quality_verdict(
+        [],
+        risk_profile=_risk_profile_no_review(),
+        reviewer_reports=[
+            _judged_report(_low_finding(), provider="claude-a"),
+            _judged_report(_low_finding(), provider="claude-b"),
+        ],
+        corrected_finding_ids=[FINDING_ID],
+    )
+
+    assert verdict["passed"] is False
+    assert f"refinement_required:{FINDING_ID}" in verdict["blocking_evidence"]
+    assert "manager_corrected_findings" not in verdict
+
+
+def _correction_payload() -> dict:
+    return {
+        "patch": _patch(),
+        "finding_ids": [FINDING_ID],
+        "reason": "dropped the duplicated test def the reviewer confirmed",
+    }
+
+
+def test_accept_passes_corrected_finding_ids_to_the_quality_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict] = []
+    manager = _accept_env(tmp_path, monkeypatch, gate_calls=calls)
+
+    result = _accept(manager, manager_correction=_correction_payload())
+
+    assert result["ok"] is True, result.get("error")
+    assert len(calls) == 1
+    assert calls[0]["corrected_finding_ids"] == [FINDING_ID]
+
+
+def test_quality_gate_failure_restores_the_retained_worktree_after_a_correction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _accept_env(
+        tmp_path, monkeypatch, gate_passed=False, gate_blocking_checks=["x"]
+    )
+    workspace_path = Path(
+        manager.cards[TASK_ID]["terminal_review"]["evidence"]["workspace"]["path"]
+    )
+
+    result = _accept(manager, manager_correction=_correction_payload())
+
+    assert result["ok"] is False
+    assert "quality_gate_failed" in result["error"]
+    assert manager.promoted == []
+    # The corrected bytes were written into the retained worktree before the
+    # gate ran; a failed accept must restore the sealed CANDIDATE bytes there,
+    # not leave the CORRECTED ones behind (NF-2026-01469).
+    assert (workspace_path / TARGET).read_text(encoding="utf-8") == CANDIDATE
+
+
+def test_behavioral_gate_workspace_error_still_restores_the_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _accept_env(tmp_path, monkeypatch)
+    workspace_path = Path(
+        manager.cards[TASK_ID]["terminal_review"]["evidence"]["workspace"]["path"]
+    )
+
+    def _raise_workspace_error(*_a, **_k):
+        raise process_launcher.WorkspaceError("boom")
+
+    monkeypatch.setattr(
+        process_launcher, "_enforce_behavioral_gate", _raise_workspace_error
+    )
+
+    result = _accept(manager, manager_correction=_correction_payload())
+
+    assert result["ok"] is False
+    assert "revalidation_failed:" in result["error"]
+    # The CORRECTED bytes were written before the gate ran; a WorkspaceError
+    # raised by a later step must still restore the sealed CANDIDATE bytes
+    # (NF-2026-01469).
+    assert (workspace_path / TARGET).read_text(encoding="utf-8") == CANDIDATE
+
+
+def test_behavioral_gate_unnamed_exception_still_restores_the_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _accept_env(tmp_path, monkeypatch)
+    workspace_path = Path(
+        manager.cards[TASK_ID]["terminal_review"]["evidence"]["workspace"]["path"]
+    )
+
+    def _raise_runtime_error(*_a, **_k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        process_launcher, "_enforce_behavioral_gate", _raise_runtime_error
+    )
+
+    # An exception that is neither WorkspaceError nor GitCommandTimeout still
+    # propagates -- the accept call does not swallow it -- but the retained
+    # worktree must not be left holding the CORRECTED bytes (NF-2026-01469).
+    with pytest.raises(RuntimeError):
+        _accept(manager, manager_correction=_correction_payload())
+
+    assert (workspace_path / TARGET).read_text(encoding="utf-8") == CANDIDATE
+
+
+def test_restore_correction_originals_continues_past_a_failing_path(
+    tmp_path: Path,
+) -> None:
+    workspace_path = tmp_path / "workspace"
+    (workspace_path / "blocked_dir").mkdir(parents=True)
+    (workspace_path / "ok_file.txt").write_bytes(b"corrected")
+    workspace = SimpleNamespace(path=workspace_path)
+
+    failed = process_launcher_accept_review._restore_correction_originals(
+        workspace,
+        {
+            "blocked_dir": b"original-blocked",
+            "ok_file.txt": b"original-ok",
+        },
+    )
+
+    # The first path is a directory, so writing its original bytes raises --
+    # but the second path is still attempted and restored, and the failing
+    # path comes back so the caller can report it (NF-2026-01469).
+    assert failed == ["blocked_dir"]
+    assert (workspace_path / "ok_file.txt").read_bytes() == b"original-ok"
+
+
+def test_promote_failure_still_restores_the_retained_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _accept_env(tmp_path, monkeypatch)
+    workspace_path = Path(
+        manager.cards[TASK_ID]["terminal_review"]["evidence"]["workspace"]["path"]
+    )
+
+    def _raise_backwards_version(*_a, **_k):
+        raise process_launcher.WorkspaceError("backwards_version")
+
+    monkeypatch.setattr(manager, "_promote_accepted_candidate", _raise_backwards_version)
+
+    # Promotion can raise before writing any byte (a backwards-version
+    # refusal) or mid-write; either way the retained worktree must not be
+    # left holding the CORRECTED bytes (NF-2026-01469).
+    with pytest.raises(process_launcher.WorkspaceError):
+        _accept(manager, manager_correction=_correction_payload())
+
+    assert (workspace_path / TARGET).read_text(encoding="utf-8") == CANDIDATE
