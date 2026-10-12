@@ -971,6 +971,7 @@ def _provider_status(
             for value in eligible_observed_models
             if value not in opencode_free_tier_models
         ]
+        result["observed_models"] = route_eligible_models
         if eligible_observed_models and not route_eligible_models:
             result["provider_launchable"] = result["launchable"]
             result["launchable"] = False
