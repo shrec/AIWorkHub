@@ -90,7 +90,7 @@ class FakeChild extends EventEmitter {
       return;
     }
     if (message.method === "initialize") {
-      this._send({ protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "fake" } }, message.id);
+      this._send({ protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "fake", version: this.generation.version } }, message.id);
       return;
     }
     if (message.method === "notifications/initialized") {
@@ -426,8 +426,8 @@ async function testRuntimeInfoReusesHandshakeEvidenceDuringBackgroundConvergence
       fake.spawns[0].requests.filter(
         (request) => request.method === "tools/call" && request.tool === "aiworkhub_dashboard_health",
       ).length,
-      1,
-      "runtime info must reuse the handshake health evidence",
+      0,
+      "the handshake already carries serverInfo.version, so runtime info must never issue a redundant dashboard_health call",
     );
     assert.ok(client.runtimePreflight, "runtime info must join startup and retain handshake evidence");
     assert.strictEqual(client.runtimePreflight.matches, true, "handshake evidence must match the packaged runtime");

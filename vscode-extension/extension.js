@@ -1946,6 +1946,9 @@ class McpStdioClient {
     // lifecycle fact instead of issuing a redundant tools/list + health pair
     // while dispatcher/Source Graph startup calls are already in flight.
     this.runtimePreflight = null;
+    // Evidence captured from the handshake's own initialize reply; a match
+    // against EXPECTED_MCP_PACKAGE_VERSION skips the dashboard_health probe.
+    this.handshakeServerVersion = null;
     this.dispatcherEnsurePromise = null;
     this.backgroundConvergencePromise = null;
     this.restartAttempts = 0;
@@ -2333,14 +2336,20 @@ class McpStdioClient {
   }
 
   async _handshake() {
+    this.handshakeServerVersion = null;
+    let initializeResult;
     try {
-      await this.request("initialize", {
+      initializeResult = await this.request("initialize", {
         protocolVersion: MCP_PROTOCOL_VERSION,
         capabilities: {},
         clientInfo: { name: "aiworkhub-vscode", version: installedExtensionVersion() },
       });
     } catch (err) {
       throw new Error(`mcp_initialize_failed:${sanitizeErrorMessage(err)}`);
+    }
+    const handshakeVersion = initializeResult && initializeResult.serverInfo && initializeResult.serverInfo.version;
+    if (typeof handshakeVersion === "string" && handshakeVersion.length > 0) {
+      this.handshakeServerVersion = handshakeVersion;
     }
     this.notify("notifications/initialized", {});
     this.initialized = true;
@@ -2360,7 +2369,6 @@ class McpStdioClient {
   async _assertRuntimeVersionBeforeServices() {
     const startedAt = Date.now();
     let tools;
-    let health;
     try {
       const listed = await this.request("tools/list", {});
       tools = Array.isArray(listed && listed.tools) ? listed.tools : [];
@@ -2370,19 +2378,25 @@ class McpStdioClient {
       );
       throw new Error(`mcp_tools_list_failed:${sanitizeErrorMessage(err)}`);
     }
-    try {
-      health = extractToolResult(await this.request(
-        "tools/call", { name: DASHBOARD_TOOLS.health, arguments: {} },
-      ));
-    } catch (err) {
-      this.outputChannel.appendLine(
-        `[mcp] preflight failed phase=dashboard_health error=${sanitizeErrorMessage(err)} duration_ms=${Date.now() - startedAt}`,
-      );
-      throw new Error(`mcp_dashboard_health_failed:${sanitizeErrorMessage(err)}`);
+    let runtimeVersion;
+    if (this.handshakeServerVersion === EXPECTED_MCP_PACKAGE_VERSION) {
+      runtimeVersion = this.handshakeServerVersion;
+    } else {
+      let health;
+      try {
+        health = extractToolResult(await this.request(
+          "tools/call", { name: DASHBOARD_TOOLS.health, arguments: {} },
+        ));
+      } catch (err) {
+        this.outputChannel.appendLine(
+          `[mcp] preflight failed phase=dashboard_health error=${sanitizeErrorMessage(err)} duration_ms=${Date.now() - startedAt}`,
+        );
+        throw new Error(`mcp_dashboard_health_failed:${sanitizeErrorMessage(err)}`);
+      }
+      runtimeVersion = String((health && (health.server_version || health.version || health.package_version)) || "unavailable");
     }
     const names = new Set(tools.map((tool) => String((tool && tool.name) || "")));
     const missing = EXPECTED_DASHBOARD_TOOL_NAMES.filter((name) => !names.has(name));
-    const runtimeVersion = String((health && (health.server_version || health.version || health.package_version)) || "unavailable");
     this.runtimePreflight = {
       matches: missing.length === 0 && runtimeVersion === EXPECTED_MCP_PACKAGE_VERSION,
       missing: [...missing],
