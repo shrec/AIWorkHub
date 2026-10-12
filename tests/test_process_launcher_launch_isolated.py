@@ -1507,6 +1507,12 @@ def test_opencode_appcontainer_launch_refuses_without_measured_confinement(
         "probe",
         lambda: SimpleNamespace(available=probe_available, detail="fake win32"),
     )
+    # The real pipe shim lives in the Windows directory and refuses on a POSIX
+    # host before the confinement gate under test is reached; it is not this
+    # test's subject, so the gate is what refuses on every host.
+    monkeypatch.setattr(
+        windows_appcontainer, "worker_pipe_shim_argv", lambda pipe: ["shim.exe", pipe]
+    )
 
     result = _launch_opencode(harness)
 
