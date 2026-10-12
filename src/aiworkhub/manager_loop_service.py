@@ -512,7 +512,10 @@ def ensure(repo: str | Path) -> dict[str, Any]:
 
 
 def restore(repo: str | Path) -> dict[str, Any]:
-    """Attach the last saved conversation. Does not create one."""
+    """Attach the last saved conversation for reading. Does not create one.
+
+    Arms no callback wake: only an owner action (continue_session, send, ...) does.
+    """
 
     entry, err = _entry_or_error(repo)
     if err is not None:
@@ -523,8 +526,6 @@ def restore(repo: str | Path) -> dict[str, Any]:
         return _error(exc)
     except Exception as exc:  # noqa: BLE001 - restore must never cross the MCP boundary
         return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
-    if session is not None:
-        _ensure_wake_started(entry, repo)
     return {
         "ok": True,
         "session": session.to_json() if session is not None else None,

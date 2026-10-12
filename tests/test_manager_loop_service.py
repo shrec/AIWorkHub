@@ -1296,8 +1296,9 @@ def _seat_record(
 def test_restore_renews_the_seat_lease_of_a_bound_session_idle_past_it(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
-    # Restore is an explicit attach (opening the chat never posts it), so it is the
-    # owner's pick and renews the seat lease like continue does.
+    # Restore is an explicit attach (opening the chat never posts it on the owner's
+    # behalf -- it fires on every panel open); it renews the seat lease like continue
+    # does, but it arms no wake consumer -- only an owner action does that.
     _install_fakes(monkeypatch)
     entry = manager_loop_service._entry_for(tmp_path)
     stale = _seat_record(entry, "mls-" + "0a" * 16, hours_idle=13)
@@ -1307,8 +1308,8 @@ def test_restore_renews_the_seat_lease_of_a_bound_session_idle_past_it(
     assert restored["ok"] is True
     assert restored["session"]["session_id"] == stale.session_id
     assert restored["session"]["updated_at"]
-    assert entry.wake is not None
-    assert manager_loop_service.status(tmp_path)["wake"]["running"] is True
+    assert entry.wake is None
+    assert manager_loop_service.status(tmp_path)["wake"]["running"] is False
     assert manager_loop_service.close(tmp_path) == {"ok": True}
 
 
@@ -1328,7 +1329,7 @@ def test_restore_starts_no_wake_consumer_for_a_passive_conversation(
     assert manager_loop_service.close(tmp_path) == {"ok": True}
 
 
-def test_restore_starts_the_wake_consumer_for_a_fresh_bound_session(
+def test_restore_does_not_arm_the_wake_consumer(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
     _install_fakes(monkeypatch)
@@ -1339,6 +1340,12 @@ def test_restore_starts_the_wake_consumer_for_a_fresh_bound_session(
 
     assert restored["ok"] is True
     assert restored["session"]["session_id"] == fresh.session_id
+    assert entry.wake is None
+    assert manager_loop_service.status(tmp_path)["wake"]["running"] is False
+
+    attached = manager_loop_service.continue_session(tmp_path, fresh.session_id)
+
+    assert attached["ok"] is True
     assert entry.wake is not None
     assert manager_loop_service.status(tmp_path)["wake"]["running"] is True
     assert manager_loop_service.close(tmp_path) == {"ok": True}
@@ -1360,7 +1367,7 @@ def test_a_session_created_long_ago_but_used_within_the_lease_keeps_its_wake_con
         },
     )
 
-    assert manager_loop_service.restore(tmp_path)["ok"] is True
+    assert manager_loop_service.continue_session(tmp_path, session.session_id)["ok"] is True
 
     assert manager_loop_service.status(tmp_path)["wake"]["running"] is True
     assert manager_loop_service.close(tmp_path) == {"ok": True}
@@ -1477,7 +1484,8 @@ def test_continue_session_starts_the_wake_for_a_bound_session_after_a_stale_rest
     _install_fakes(monkeypatch)
     entry = manager_loop_service._entry_for(tmp_path)
     stale = _seat_record(entry, "mls-" + "1c" * 16, hours_idle=13)
-    # The orchestrator-level restore arms no wake consumer (the service's restore does).
+    # Neither the orchestrator-level restore nor manager_loop_service.restore arms a
+    # wake consumer; only an owner action like continue_session does.
     assert entry.orchestrator.restore_latest().session_id == stale.session_id
     assert entry.wake is None
     fresh = _seat_record(entry, "mls-" + "1d" * 16)

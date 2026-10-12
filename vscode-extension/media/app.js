@@ -7462,7 +7462,14 @@ function populateManagerChatModelOptions() {
     select.value = "";
   } else {
     const current = String(select.value || "");
+    const stillThere = models.some((entry) => entry.model === current);
     const fragment = document.createDocumentFragment();
+    if (!stillThere) {
+      const placeholder = createElement("option", "", "Choose a model");
+      placeholder.value = "";
+      placeholder.disabled = true;
+      fragment.appendChild(placeholder);
+    }
     for (const entry of models) {
       const option = createElement("option", "", entry.label || entry.model);
       option.value = entry.model;
@@ -7471,8 +7478,7 @@ function populateManagerChatModelOptions() {
       fragment.appendChild(option);
     }
     select.replaceChildren(fragment);
-    const stillThere = models.some((entry) => entry.model === current);
-    select.value = stillThere ? current : models[0].model;
+    select.value = stillThere ? current : "";
     const chosen = managerChatSelectedOption(select);
     if (chosen && chosen.dataset && chosen.dataset.backendId && elements.managerChatBackendSelect) {
       elements.managerChatBackendSelect.value = chosen.dataset.backendId;

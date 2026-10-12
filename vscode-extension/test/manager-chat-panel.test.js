@@ -1319,9 +1319,9 @@ test("the model select lists every enabled model and remembers which transport r
   harness.api.populateManagerChatModelOptions();
 
   const options = harness.elements.managerChatModelInput.children;
-  assert.deepEqual(options.map((option) => option.value), ["claude-opus-4-1", "claude-sonnet-5", "gpt-5-codex"]);
+  assert.deepEqual(options.map((option) => option.value), ["", "claude-opus-4-1", "claude-sonnet-5", "gpt-5-codex"]);
   assert.equal(options.find((option) => option.value === "gpt-5-codex").dataset.backendId, "codex_cli");
-  assert.equal(harness.elements.managerChatModelInput.value, "claude-opus-4-1");
+  assert.equal(harness.elements.managerChatModelInput.value, "", "no model is picked until the owner chooses one");
 });
 
 test("a discovered row's label is shown as the option text while the value stays the model that gets launched", () => {
@@ -1346,10 +1346,11 @@ test("a discovered row's label is shown as the option text while the value stays
   harness.api.populateManagerChatModelOptions();
 
   const options = harness.elements.managerChatModelInput.children;
-  assert.deepEqual(options.map((option) => option.value), ["opus", "fable"], "the value sent on Send is always the launched alias");
-  assert.equal(options[0].textContent, "claude-opus-5 (opus)", "the option shows the resolved version, not the bare alias");
-  assert.equal(options[1].textContent, "fable", "a row with no resolved version yet falls back to its bare name");
-  assert.equal(harness.elements.managerChatModelInput.value, "opus");
+  assert.deepEqual(options.map((option) => option.value), ["", "opus", "fable"], "the value sent on Send is always the launched alias");
+  assert.equal(options[1].textContent, "claude-opus-5 (opus)", "the option shows the resolved version, not the bare alias");
+  assert.equal(options[2].textContent, "fable", "a row with no resolved version yet falls back to its bare name");
+  assert.equal(harness.elements.managerChatModelInput.value, "", "nothing is picked until the owner chooses one");
+  harness.elements.managerChatModelInput.value = "opus";
   harness.elements.managerChatInput.value = "continue";
   trigger(harness.elements.managerChatComposer, "submit");
   assert.deepEqual(plain(harness.posts.at(-1)), {
@@ -1370,6 +1371,7 @@ test("choosing a model keeps the full list and resolves that model's transport",
   const route = harness.api.managerChatSelectedRoute();
 
   assert.deepEqual(harness.elements.managerChatModelInput.children.map((option) => option.value), [
+    "",
     "claude-opus-4-1",
     "claude-sonnet-5",
     "gpt-5-codex",
@@ -1435,11 +1437,55 @@ test("loading the sidebar lists every enabled model without opening a dialog", (
   harness.api.startManagerChatSidebar();
 
   assert.deepEqual(harness.elements.managerChatModelInput.children.map((option) => option.value), [
+    "",
     "claude-opus-4-1",
     "claude-sonnet-5",
     "gpt-5-codex",
   ]);
   assert.equal(harness.elements.managerChatDialog.showModalCalled, 0, "sidebar load never opens a modal dialog");
+});
+
+test("opening the chat with two enabled models and no previous selection leaves Send refused until the owner picks one", () => {
+  const harness = loadWebviewSlice();
+  harness.state.featureSettings = {
+    ok: true,
+    model_policy: {
+      ok: true,
+      catalog: {
+        workers: [
+          { provider: "anthropic", adapter: "claude_cli", model: "claude-opus-4-1", worker_id: "w1", effective_enabled: true, catalog_enabled: true },
+          { provider: "openai", adapter: "codex_cli", model: "gpt-5-codex", worker_id: "w4", effective_enabled: true, catalog_enabled: true },
+        ],
+      },
+      providers: {},
+    },
+  };
+  harness.posts.length = 0;
+
+  harness.api.startManagerChatSidebar();
+
+  assert.deepEqual(plain(harness.posts), [{ type: "managerLoopStatus" }, { type: "managerLoopRestore" }], "the sidebar opens posting only status and restore");
+  const select = harness.elements.managerChatModelInput;
+  assert.equal(select.value, "", "no model the owner never picked is pre-selected");
+  assert.equal(select.children[0].value, "");
+  assert.equal(select.children[0].disabled, true);
+  assert.equal(select.children[0].textContent, "Choose a model");
+
+  harness.elements.managerChatInput.value = "hello";
+  trigger(harness.elements.managerChatComposer, "submit");
+  assert.equal(harness.posts.some((post) => post.type === "managerLoopSend"), false, "send is refused without a picked model");
+  assert.equal(harness.elements.managerChatNotice.hidden, false);
+  assert.match(harness.elements.managerChatNotice.textContent, /Choose a model/);
+
+  select.value = "gpt-5-codex";
+  trigger(harness.elements.managerChatComposer, "submit");
+  assert.deepEqual(plain(harness.posts.at(-1)), {
+    type: "managerLoopSend",
+    text: "hello",
+    backendId: "codex_cli",
+    model: "gpt-5-codex",
+    reasoning: "",
+  });
 });
 
 test("opening the chat posts exactly one managerLoopRestore and does not attach a session before any reply", () => {
@@ -1526,6 +1572,7 @@ test("the task filter hides closed cards and slash commands stay on this session
   harness.state.featureSettings = MANAGER_CHAT_MODEL_POLICY_PAYLOAD;
   harness.elements.managerChatBackendSelect.value = "codex_cli";
   harness.api.populateManagerChatModelOptions();
+  harness.elements.managerChatModelInput.value = "gpt-5-codex";
   harness.state.tasks = [
     { task_id: "TASK_RUN", status: "processing", title: "ship" },
     { task_id: "TASK_DONE", status: "accepted", title: "landed" },
