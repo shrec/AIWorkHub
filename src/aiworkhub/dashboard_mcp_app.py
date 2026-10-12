@@ -3101,6 +3101,125 @@ def task_restore_view(task_id: str, reason: str = "", confirm: bool = False) -> 
     return response
 
 
+def task_restart_view(
+    task_id: str, reason: str = "", confirm: bool = False
+) -> dict[str, Any]:
+    """USER WRITE: restart one task through its existing canonical recovery path, then launch.
+
+    Dispatches on the card's measured ``task_store.canonical_status``: pending
+    launches directly; blocked recovers through ``core.retry_terminal_task``
+    (operational terminal substatus) or ``core.recover_blocked_rework``
+    (anything else); processing measures the claimed launch's liveness the
+    same way ``aiworkhub_agent_task_status`` does and either refuses
+    (still alive) or settles the dead claim through
+    ``core.reconcile_dead_processing_task`` and recovers the resulting blocked
+    card the same way before launching. review/finished/archived/
+    superseded refuse as ``not_restartable:<status>``. Every write stays
+    inside the core SQLite transaction each reused call already owns; this
+    module takes no lock of its own.
+    """
+    candidate = str(task_id or "")
+    bounded_reason = str(reason or "").strip()[:200] or "owner manual restart"
+    if confirm is not True:
+        response = {"ok": False, "error": "task_restart_confirmation_required"}
+    elif not dashboard._TASK_ID_RE.fullmatch(candidate):
+        response = {"ok": False, "error": "invalid_task_id"}
+    else:
+        try:
+            root = core.repo_root()
+            task = task_store.get_task(root, candidate)
+            if task is None:
+                response = {"ok": False, "error": "task_not_found"}
+            else:
+                try:
+                    response = _task_restart_dispatch(candidate, task, bounded_reason)
+                finally:
+                    storage_observability.invalidate(root)
+        except task_store.TaskStoreError as exc:
+            response = {"ok": False, "error": str(exc)[:240]}
+    response["task_id"] = candidate
+    response["server_tool"] = "aiworkhub_dashboard_task_restart"
+    response["authority_flags"] = _storage_write_authority_flags()
+    return response
+
+
+def _task_restart_dispatch(
+    task_id: str, task: Mapping[str, Any], reason: str
+) -> dict[str, Any]:
+    """Route by measured card state through existing core functions only, then launch."""
+    status = task_store.canonical_status(task)
+    steps: list[dict[str, Any]] = []
+
+    def _step(name: str, result: Mapping[str, Any]) -> bool:
+        ok = bool(result.get("ok"))
+        steps.append(
+            {
+                "step": name,
+                "ok": ok,
+                "error": None if ok else str(result.get("stderr") or result.get("error") or "")[:240],
+            }
+        )
+        return ok
+
+    def _blocked_recovery(card: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+        substatus = str(card.get("worker_status") or "").strip()
+        if substatus in core._RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES:
+            return "retry_terminal", core.retry_terminal_task(
+                task_id=task_id,
+                request_id=str(card.get("launch_request_id") or "").strip(),
+                terminal_substatus=substatus,
+                reason=reason,
+            )
+        return "recover_blocked_rework", core.recover_blocked_rework(
+            task_id, feedback_reason=reason
+        )
+
+    if status == "pending":
+        if str(task.get("worker_status") or "") != "unclaimed":
+            return {"ok": False, "error": "task_claimed"}
+        path = "launch"
+    elif status == "blocked":
+        path, result = _blocked_recovery(task)
+        if not _step(path, result):
+            return {"ok": False, "error": f"{path}_failed", "steps": steps}
+    elif status == "processing":
+        launch_request_id = str(task.get("launch_request_id") or "").strip()
+        liveness = (
+            process_launcher.default_manager().status(launch_request_id)
+            if launch_request_id
+            else {}
+        )
+        if isinstance(liveness, dict) and liveness.get("process_alive"):
+            return {"ok": False, "error": "task_running"}
+        reconcile_result = core.reconcile_dead_processing_task(
+            task_id, launch_request_id, int(task.get("claim_epoch") or 0)
+        )
+        if not _step("reconcile_dead_processing", reconcile_result):
+            return {"ok": False, "error": "reconcile_dead_processing_failed", "steps": steps}
+        current_task = task_store.get_task(core.repo_root(), task_id) or {}
+        blocked_path, blocked_result = _blocked_recovery(current_task)
+        if not _step(blocked_path, blocked_result):
+            return {"ok": False, "error": f"{blocked_path}_failed", "steps": steps}
+        path = f"reconcile_dead_processing+{blocked_path}"
+    else:
+        return {"ok": False, "error": f"not_restartable:{status}"}
+
+    launch_result = process_launcher.default_manager().launch(task_id=task_id)
+    launch_info = launch_result if isinstance(launch_result, dict) else {}
+    launched = _step("launch", launch_info)
+    return {
+        "ok": launched,
+        "error": None if launched else (steps[-1]["error"] or "launch_failed"),
+        "path": path,
+        "steps": steps,
+        "launch": {
+            "request_id": launch_info.get("request_id"),
+            "state": launch_info.get("state"),
+            "blocked_reason": launch_info.get("blocked_reason"),
+        },
+    }
+
+
 def _needfix_response(response: Mapping[str, Any], tool: str, *, write: bool = False) -> dict[str, Any]:
     """Attach dashboard authority metadata to one bounded NeedFix response.
 
@@ -4033,6 +4152,7 @@ TASK_RETENTION_READ_TOOLS: dict[str, Any] = {
 TASK_RETENTION_WRITE_TOOLS: dict[str, Any] = {
     "aiworkhub_dashboard_task_archive": task_archive_view,
     "aiworkhub_dashboard_task_restore": task_restore_view,
+    "aiworkhub_dashboard_task_restart": task_restart_view,
     "aiworkhub_dashboard_task_quarantine": task_quarantine_view,
     "aiworkhub_dashboard_task_quarantine_restore": task_quarantine_restore_view,
     "aiworkhub_dashboard_task_quarantine_purge": task_quarantine_purge_view,
