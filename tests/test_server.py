@@ -35,6 +35,10 @@ def test_needfix_closed_gate_refuses_before_normalization_or_storage(monkeypatch
 
 def test_needfix_closed_startup_sdk_and_dependency_free_dispatch(tmp_path) -> None:
     script = """
+try:
+    import sitecustomize  # noqa: F401 - -S skips site; the AppContainer lane shim must still load
+except ImportError:
+    pass
 import asyncio
 import importlib.util
 import json
@@ -86,7 +90,10 @@ assert needfix_store.get_needfix(root, seed["id"]) == before_row
 print("closed startup unchanged")
 """
     for backend in ("sdk", "stdlib"):
-        env = dict(os.environ, AIWORKHUB_ALLOW_WRITES="0", PYTHONPATH=str(_SRC))
+        # Extend PYTHONPATH, never replace it: the AppContainer validation lane puts
+        # its path-resolution shim there (NF-2026-01176).
+        child_path = os.pathsep.join(filter(None, (str(_SRC), os.environ.get("PYTHONPATH"))))
+        env = dict(os.environ, AIWORKHUB_ALLOW_WRITES="0", PYTHONPATH=child_path)
         env["AIWORKHUB_MCP_STDIO_BACKEND"] = backend
         argv = [sys.executable] + (["-S"] if backend == "stdlib" else [])
         result = subprocess.run(
