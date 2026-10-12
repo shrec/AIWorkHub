@@ -368,14 +368,16 @@ def test_a_corrupt_store_never_breaks_a_refresh(tmp_path):
     assert _projection(tmp_path)["state"] == "no_sample"
 
 
-# ``usage`` is the one key a store-backed projection can answer and a
-# hand-built registry cannot: usage is read from the RECEIPTS table, and a bare
-# ``RecipeRegistry`` has no store behind it to read. Both projections still
-# carry the key -- the shape is identical, which is what the extension renders
-# -- and the store's says ``measured`` where the registry's says ``unknown``.
-# Comparing the two on that key would assert that measuring is the same as not
-# measuring, so it is compared separately and explicitly below.
+# The one key the two sources legitimately differ on: a store can read the
+# receipts table and report ``measured`` usage, while a bare registry has
+# no receipts table and reports ``unknown`` (asserted directly in
+# test_only_a_store_backed_projection_can_measure_usage).
 _STORE_MEASURABLE_KEYS = ("usage",)
+
+
+# NF-2026-01424: the per-recipe rows need the receipts table, so only a
+# store-backed full projection carries them.
+_STORE_ROW_KEYS = ("records", "records_total", "records_truncated")
 
 
 def _without_store_measurements(projection):
@@ -399,20 +401,23 @@ def test_the_projection_keys_are_unchanged_by_the_new_source(tmp_path):
         tr.RecipeRegistry(()), ownership="full", input_state="present"
     )
     empty_store = _projection(tmp_path)
-    assert set(empty_store) == set(empty_direct)
-    assert _without_store_measurements(empty_store) == _without_store_measurements(
-        empty_direct
-    )
+    assert set(empty_store) - set(empty_direct) == set(_STORE_ROW_KEYS)
+    assert set(empty_direct) <= set(empty_store)
+    excluded = set(_STORE_MEASURABLE_KEYS) | set(_STORE_ROW_KEYS)
+    assert {k: v for k, v in empty_store.items() if k not in excluded} == {
+        k: v for k, v in empty_direct.items() if k not in excluded
+    }
 
     store.put_recipe(tmp_path, recipe)
     full_direct = dashboard._project_tool_recipes(
         tr.RecipeRegistry((recipe,)), ownership="full", input_state="present"
     )
     full_store = _projection(tmp_path)
-    assert set(full_store) == set(full_direct)
-    assert _without_store_measurements(full_store) == _without_store_measurements(
-        full_direct
-    )
+    assert set(full_store) - set(full_direct) == set(_STORE_ROW_KEYS)
+    assert set(full_direct) <= set(full_store)
+    assert {k: v for k, v in full_store.items() if k not in excluded} == {
+        k: v for k, v in full_direct.items() if k not in excluded
+    }
 
 
 def test_only_a_store_backed_projection_can_measure_usage(tmp_path):

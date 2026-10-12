@@ -73,17 +73,45 @@ def _seed_repo(repo: Path) -> None:
 
 def _make_fake_git(calls, *, head=HEAD, head_rc=0, log_stdout=NUMSTAT,
                    log_rc=0, log_raises=False):
-    """subprocess.run replacement recording every git invocation."""
+    """subprocess.run replacement recording every git invocation.
+
+    Mirrors real ``subprocess.run``: stdout/stderr come back as ``bytes``
+    unless the caller passes ``text``, ``universal_newlines``, ``encoding``
+    or ``errors``, in which case they come back as ``str``. The caller here
+    is ``_scan_git_ignored_paths``, which runs in bytes mode with none of
+    those kwargs, so the unscripted ls-files/check-ignore branch below must
+    hand back ``b""`` rather than ``""``.
+    """
+
+    def _encode(text, kwargs):
+        wants_text = bool(
+            kwargs.get("text")
+            or kwargs.get("universal_newlines")
+            or kwargs.get("encoding")
+            or kwargs.get("errors")
+        )
+        return text if wants_text else text.encode("utf-8")
 
     def fake_run(cmd, *args, **kwargs):
+        if "ls-files" in cmd or "check-ignore" in cmd:
+            # The source-graph gitignore scan is not a git-metrics walk.
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_encode("", kwargs), stderr=_encode("", kwargs)
+            )
         calls.append(list(cmd))
         if cmd[:2] == ["git", "rev-parse"]:
-            return subprocess.CompletedProcess(cmd, head_rc, stdout=head + "\n", stderr="")
+            return subprocess.CompletedProcess(
+                cmd, head_rc, stdout=_encode(head + "\n", kwargs), stderr=_encode("", kwargs)
+            )
         if cmd[:2] == ["git", "log"]:
             if log_raises:
                 raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 8))
-            return subprocess.CompletedProcess(cmd, log_rc, stdout=log_stdout, stderr="")
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(
+                cmd, log_rc, stdout=_encode(log_stdout, kwargs), stderr=_encode("", kwargs)
+            )
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=_encode("", kwargs), stderr=_encode("", kwargs)
+        )
 
     return fake_run
 
