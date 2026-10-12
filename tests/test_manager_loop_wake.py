@@ -861,13 +861,15 @@ def test_a_wake_rebinds_a_restored_session_onto_its_own_authorized_route(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
     # A session loaded from disk (a server restart, a panel reload) holds the seat
-    # but has no backend yet. Its callback must still reach the model.
+    # but has no backend yet. Restoring it arms nothing (NF-2026-01475); once the
+    # owner continues it, its callback must still reach the model.
     authority = _RouteAuthority(allowed=True)
     backends, ack_calls = _claim_one_callback(monkeypatch, authority)
     entry = manager_loop_service._entry_for(tmp_path)
     restored = _seat_record(entry, "mls-" + "0d" * 16)
 
     assert manager_loop_service.restore(tmp_path)["ok"] is True
+    assert manager_loop_service.continue_session(tmp_path, restored.session_id)["ok"] is True
     try:
         assert authority.called.wait(timeout=5)
         assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
@@ -889,9 +891,10 @@ def test_a_wake_never_rebinds_a_restored_session_onto_a_route_policy_no_longer_a
     authority = _RouteAuthority(allowed=False)
     backends, ack_calls = _claim_one_callback(monkeypatch, authority)
     entry = manager_loop_service._entry_for(tmp_path)
-    _seat_record(entry, "mls-" + "0e" * 16)
+    seated = _seat_record(entry, "mls-" + "0e" * 16)
 
     assert manager_loop_service.restore(tmp_path)["ok"] is True
+    assert manager_loop_service.continue_session(tmp_path, seated.session_id)["ok"] is True
     try:
         assert authority.called.wait(timeout=5)
         assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
