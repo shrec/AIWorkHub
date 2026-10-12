@@ -930,14 +930,42 @@ class CliManagerBackend:
             yield from flush(self.backend_id, context)
 
 
+# NF-2026-01454: one process-wide cache of the successful ``opencode models``
+# listing.  The probe is a live gateway round trip (seconds), the manager
+# picker asks per route candidate, and a failure stays uncached so a later
+# retry can succeed.
+_OPENCODE_MODELS_CACHE: list[str] | None = None
+_OPENCODE_MODELS_CACHE_LOCK = threading.Lock()
+
+
+def _set_opencode_models_cache(models: list[str]) -> None:
+    global _OPENCODE_MODELS_CACHE
+    with _OPENCODE_MODELS_CACHE_LOCK:
+        _OPENCODE_MODELS_CACHE = list(models)
+
+
 def _opencode_discovered_models() -> list[str]:
     """Bound ``opencode models`` probe; [] on any failure.
 
-    Lives here, not in :mod:`cli_model_discovery`, because that module never
-    spawns a process by contract -- every function there reads a file a CLI
-    already wrote. Bounds mirror ``repo_policy._list_opencode_models``.
+    The executable is resolved exactly the way a launch resolves it
+    (:func:`runtime_adapters.resolve_executable`): the manager MCP server's
+    PATH need not carry ``opencode`` for the picker to see the CLI's models,
+    because a host whose PATH lacks it measured as
+    ``manager_backend_unavailable:opencode_cli`` while the CLI was installed
+    and serving (NF-2026-01454).  The first successful probe result is
+    cached: ``opencode models`` costs seconds of gateway round trips, and the
+    manager picker asks per route candidate.
     """
-    executable = shutil.which("opencode")
+    cached = _OPENCODE_MODELS_CACHE
+    if cached is not None:
+        return list(cached)
+    try:
+        resolution = runtime_adapters.resolve_executable(
+            runtime_adapters.OPENCODE_CLI_ADAPTER
+        )
+    except Exception:  # noqa: BLE001 - discovery never raises into the picker
+        return []
+    executable = resolution.executable if resolution.ok else shutil.which("opencode")
     if not executable:
         return []
     try:
@@ -945,7 +973,7 @@ def _opencode_discovered_models() -> list[str]:
             [executable, "models"],
             check=False,
             capture_output=True,
-            timeout=5,
+            timeout=15,
         )
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return []
@@ -954,7 +982,10 @@ def _opencode_discovered_models() -> list[str]:
         payload = completed.stderr or b""
     if len(payload) > 64 * 1024:
         return []
-    return workforce_catalog.parse_opencode_models_output(payload)
+    models = workforce_catalog.parse_opencode_models_output(payload)
+    if models:
+        _set_opencode_models_cache(models)
+    return models
 
 
 def cli_discovers_model(repo: Path | str, backend_id: str, model: str) -> bool:

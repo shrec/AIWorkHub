@@ -35,11 +35,12 @@ def test_opencode_part_update_becomes_visible_thinking_and_tool() -> None:
 
 
 def test_reasoning_depth_is_only_a_documented_flag() -> None:
-    assert apply_manager_stream_tokens("opencode_cli", ["opencode", "run", "hello"], "high") == [
+    # The prompt rides stdin since NF-2026-01417, so an opencode manager argv
+    # ends with its flags -- there is no positional prompt token to keep last.
+    assert apply_manager_stream_tokens("opencode_cli", ["opencode", "run"], "high") == [
         "opencode",
         "run",
         "--thinking",
-        "hello",
     ]
     assert "--effort" in apply_manager_stream_tokens("claude_cli", ["claude", "-p"], "max")
     assert "max" in apply_manager_stream_tokens("claude_cli", ["claude", "-p"], "max")

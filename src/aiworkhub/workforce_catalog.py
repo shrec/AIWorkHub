@@ -38,6 +38,13 @@ from .platform_io import posix_path_modes_supported
 # Editor (vscode_lm) routes seed a single capability row per provider; when the
 # live editor host reports a catalog, that seed expands to one row per
 # discovered model.  Only these adapters read their model set from VS Code.
+# NF-2026-01454 note: opencode_cli deliberately stays OUT of this set.  Its
+# seed rows are concrete (exact models), and every OTHER hosted model is
+# authorized through the CLI-discovery fallback in
+# ``manager_loop_service.authorize_selected_route`` (bounded, cached probe),
+# not through family-stem expansion: the stem rule would project the seed's
+# manager capabilities onto every ``opencode/*`` free-tier row and break the
+# low-risk inventory contract discovered opencode rows keep.
 _DISCOVERY_ADAPTERS: frozenset[str] = frozenset({"glm_vscode_lm"})
 
 # These adapters all execute through the VS Code Language Model API.  The
@@ -157,7 +164,12 @@ _ANSI_ESCAPE_RE = re.compile(
     r"(?:\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_])"
 )
 _OPENCODE_MODELS_MAX_BYTES = 64 * 1024
-_OPENCODE_MODELS_MAX_ROWS = 64
+# NF-2026-01454: the hosted catalog grew past 64 entries (measured 74 on
+# 2026-10-11), and the cap silently dropped the tail of the alphabetical
+# listing -- ``xai/grok-4.7`` was listed by the CLI but invisible to the
+# manager picker.  256 keeps the parse bounded while covering the provider's
+# realistic model surface with headroom.
+_OPENCODE_MODELS_MAX_ROWS = 256
 
 
 def parse_opencode_models_output(raw: str | bytes | None) -> list[str]:
@@ -242,6 +254,15 @@ DEFAULT_WORKERS: tuple[dict[str, Any], ...] = (
     {"worker_id": "deepseek-v4-flash", "adapter_id": "deepseek_vscode_lm", "model": "deepseek-v4-flash", "provider": "deepseek", "supports": ["mechanical", "code"], "tools": ["filesystem", "source-graph", "session-manager", "ai-memory", "kb", "semantic-edit"], "max_context_tokens": 1_000_000, "max_risk": "medium", "quality_ceiling": 0.86},
     {"worker_id": "glm-5.2", "adapter_id": "glm_vscode_lm", "model": "glm-5.2", "provider": "zhipu", "supports": ["mechanical", "code", "research", "review"], "tools": ["filesystem", "source-graph", "session-manager", "ai-memory", "kb", "semantic-edit"], "max_context_tokens": 1_000_000, "max_risk": "high", "quality_ceiling": 0.95},
     {"worker_id": "grok-4.6", "adapter_id": "grok_kilo_cli", "model": "xai/grok-4.6", "provider": "xai", "supports": ["mechanical", "code", "research", "review"], "tools": ["filesystem", "source-graph", "session-manager", "ai-memory", "kb", "semantic-edit"], "max_context_tokens": 256_000, "max_risk": "high", "quality_ceiling": 0.97},
+    # OpenCode seat seeds (NF-2026-01454): the manager picker and
+    # ``catalog_declares_route`` refused every opencode_cli model because no
+    # catalog row carried the adapter, so a manager chat that asked for Muse
+    # died with ``manager_backend_unavailable`` even though the CLI was
+    # installed, authenticated and serving.  Every other hosted model stays
+    # CLI-discovered through the ``authorize_selected_route`` fallback (see
+    # the note above ``_DISCOVERY_ADAPTERS``), so it needs no catalog edit.
+    {"worker_id": "opencode-grok-4.6", "adapter_id": "opencode_cli", "model": "opencode-go/grok-4.6", "provider": "opencode", "supports": ["mechanical", "code", "research", "review"], "tools": ["filesystem", "source-graph", "session-manager", "ai-memory", "kb", "semantic-edit"], "max_context_tokens": 256_000, "max_risk": "high", "quality_ceiling": 0.97, "reviewer": True},
+    {"worker_id": "opencode-muse-spark-1.3", "adapter_id": "opencode_cli", "model": "opencode-go/muse-spark-1.3-contributor", "provider": "opencode", "supports": ["mechanical", "code", "research", "linguistic", "review"], "tools": ["filesystem", "source-graph", "session-manager", "ai-memory", "kb", "semantic-edit"], "max_context_tokens": 256_000, "max_risk": "high", "quality_ceiling": 0.96},
 )
 
 

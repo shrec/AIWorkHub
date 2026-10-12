@@ -99,10 +99,12 @@ def _snapshot(
 
 
 def _opencode_rows(snapshot: dict[str, object]) -> list[dict[str, object]]:
+    # The catalog also carries the vetted opencode_cli seed rows; these tests
+    # pin the CLI-discovered inventory only.
     return [
         row
         for row in snapshot["workers"]
-        if row["adapter_id"] == "opencode_cli"
+        if row["adapter_id"] == "opencode_cli" and row.get("discovered_from_opencode")
     ]
 
 
@@ -1184,3 +1186,18 @@ def test_generated_worker_runtime_feeds_the_request_local_opencode_config(
     assert server["environment"] == runtime.env
     assert server["environment"][_MCP.ENV_REQUEST_ID] == "R-gen-1"
     assert Path(server["environment"][_MCP.ENV_AUDIT_HMAC_KEY_PATH]).is_file()
+
+
+def test_vetted_opencode_seed_rows_sit_beside_the_discovered_inventory(
+    tmp_path: Path,
+) -> None:
+    seeds = {
+        str(row["model"])
+        for row in workforce_catalog.DEFAULT_WORKERS
+        if row["adapter_id"] == "opencode_cli"
+    }
+    assert seeds == {"opencode-go/grok-4.6", "opencode-go/muse-spark-1.3-contributor"}
+    snapshot = _snapshot(tmp_path, [_FREE])
+    rows = [row for row in snapshot["workers"] if row["adapter_id"] == "opencode_cli"]
+    assert {str(row["model"]) for row in rows} == seeds | {_FREE}
+    assert [row["model"] for row in _opencode_rows(snapshot)] == [_FREE]
