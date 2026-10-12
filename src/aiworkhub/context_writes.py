@@ -20,7 +20,9 @@ from . import context_graph, feature_settings, storage_registry, transcript_stor
 from .repository_state import RepositoryStateError
 
 
-SessionAction = Literal["start", "event", "checkpoint", "state", "handoff", "close"]
+SessionAction = Literal[
+    "start", "event", "checkpoint", "state", "handoff", "close", "amend", "redact"
+]
 MemoryAction = Literal["remember", "update", "supersede", "archive"]
 KbAction = Literal["upsert", "ingest", "supersede", "archive"]
 
@@ -544,16 +546,28 @@ def _idempotent(row: sqlite3.Row) -> dict[str, Any]:
         "entity_key": row["entity_key"], "created_at": row["created_at"],
     }
 
-
 def session_write(
     repo: Path, *, actor: dict[str, Any], action: SessionAction, topic: str,
     content: str, idempotency_key: str, provenance: str,
+    document_id: int | None = None,
 ) -> dict[str, Any]:
     identity = _identity(actor)
-    if action not in {"start", "event", "checkpoint", "state", "handoff", "close"}:
+    if action not in {
+        "start", "event", "checkpoint", "state", "handoff", "close",
+        "amend", "redact",
+    }:
         raise ContextWriteError("invalid_session_action")
+    # ``amend`` and ``redact`` are the manager's edit surface over EXISTING
+    # canonical transcript rows (see ``_lookup_session_document``): they name
+    # one exact document, never append.  Every other action appends and must
+    # not carry a document id.
+    if action in {"amend", "redact"}:
+        if not isinstance(document_id, int) or isinstance(document_id, bool) or document_id <= 0:
+            raise ContextWriteError("session_document_id_required_for_edit")
+    elif document_id is not None:
+        raise ContextWriteError("session_document_id_not_allowed_for_append")
     topic = _bounded(topic, field="topic", max_bytes=256)
-    content = _bounded(content, field="content", max_bytes=MAX_CONTENT_BYTES)
+    content = _bounded(content, field="content", max_bytes=MAX_CONTENT_BYTES, required=action != "redact")
     provenance = _bounded(provenance, field="provenance", max_bytes=MAX_PROVENANCE_BYTES)
     manager_graph_capture = (
         identity["role"] == "manager"
@@ -569,41 +583,74 @@ def session_write(
             return _idempotent(prior)
         timestamp = datetime.now(timezone.utc).isoformat()
         source_id = f"{identity['role']}:{identity['provider']}:{identity['session_id']}:{topic}"
-        doc_id = transcript_store.insert_document(
-            con,
-            source_id=source_id,
-            timestamp=timestamp,
-            kind=action,
-            content=content,
-            source="aiworkhub",
-            speaker=identity["role"],
-            tags=topic,
-        )
-        if manager_graph_capture:
-            registry = storage_registry.load_storage_registry(repo)
-            context_graph.append_session_document_in_transaction(
+        if action == "amend":
+            doc_id = _amend_session_document(
                 con,
-                repo_id=registry.repo.manifest.repo_id,
-                thread_id=identity["session_id"],
-                session_id=identity["session_id"],
-                provider=identity["provider"],
-                role=identity["role"],
-                action=action,
-                topic=topic,
+                document_id=document_id,
                 content=content,
-                document_id=doc_id,
-                # The context_graph projection keeps its own empty-string
-                # convention for a task-less write; only the audit trail
-                # (context_mutations, via _record) stores NULL.
-                task_id=identity["task_id"] or "",
-                occurred_at=timestamp,
+                topic=topic,
+                manager_graph_capture=manager_graph_capture,
+                repo=repo,
+                identity=identity,
+                timestamp=timestamp,
             )
+        elif action == "redact":
+            doc_id = _redact_session_document(
+                con,
+                document_id=document_id,
+                manager_graph_capture=manager_graph_capture,
+                repo=repo,
+            )
+        else:
+            doc_id = transcript_store.insert_document(
+                con,
+                source_id=source_id,
+                timestamp=timestamp,
+                kind=action,
+                content=content,
+                source="aiworkhub",
+                speaker=identity["role"],
+                tags=topic,
+            )
+            if manager_graph_capture:
+                registry = storage_registry.load_storage_registry(repo)
+                context_graph.append_session_document_in_transaction(
+                    con,
+                    repo_id=registry.repo.manifest.repo_id,
+                    thread_id=identity["session_id"],
+                    session_id=identity["session_id"],
+                    provider=identity["provider"],
+                    role=identity["role"],
+                    action=action,
+                    topic=topic,
+                    content=content,
+                    document_id=doc_id,
+                    # The context_graph projection keeps its own empty-string
+                    # convention for a task-less write; only the audit trail
+                    # (context_mutations, via _record) stores NULL.
+                    task_id=identity["task_id"] or "",
+                    occurred_at=timestamp,
+                )
         _record(
             con, idempotency_key=idempotency_key, component="session", action=action,
             entity_key=f"document:{doc_id}", actor=identity, provenance=provenance,
-            payload={"topic": topic, "content": content},
+            payload={
+                "topic": topic,
+                "content": content,
+                **({"document_id": document_id} if action in {"amend", "redact"} else {}),
+            },
         )
         con.commit()
+        if action == "redact":
+            return {
+                "ok": True, "idempotent": False, "action": action,
+                "document_id": document_id, "status": "redacted", "timestamp": timestamp,
+            }
+        if action == "amend":
+            return {
+                "ok": True, "idempotent": False, "action": action,
+                "document_id": doc_id, "status": "amended", "timestamp": timestamp,
+            }
         return {"ok": True, "idempotent": False, "action": action, "document_id": doc_id, "timestamp": timestamp}
     except sqlite3.IntegrityError as exc:
         con.rollback()
@@ -613,6 +660,61 @@ def session_write(
         raise
     finally:
         con.close()
+
+
+def _amend_session_document(
+    con: sqlite3.Connection, *,
+    document_id: int, content: str, topic: str,
+    manager_graph_capture: bool, repo: Path,
+    identity: dict[str, str | None], timestamp: str,
+) -> int:
+    """Rewrite one existing transcript document's content in this transaction.
+
+    The row keeps its identity (id, source_id, speaker, timestamp); only the
+    content and the topic-carried tags/kind columns are replaced, and the FTS
+    row is rebuilt by :func:`transcript_store.update_document`.  When the
+    context graph projection captured the original document, its mirrored
+    conversation event is rewritten through the same idempotent session
+    document projection so graph reads and transcript reads stay one fact.
+    """
+    try:
+        transcript_store.update_document(con, document_id, content=content, tags=topic)
+    except transcript_store.TranscriptStoreError as exc:
+        raise ContextWriteError(str(exc)) from exc
+    if manager_graph_capture:
+        registry = storage_registry.load_storage_registry(repo)
+        context_graph.rewrite_session_document_in_transaction(
+            con,
+            repo_id=registry.repo.manifest.repo_id,
+            document_id=document_id,
+            content=content,
+            occurred_at=timestamp,
+        )
+    return document_id
+
+
+def _redact_session_document(
+    con: sqlite3.Connection, *, document_id: int,
+    manager_graph_capture: bool, repo: Path,
+) -> int:
+    """Delete one existing transcript document and its FTS row, fail closed.
+
+    A missing id is a typed refusal, never a silent no-op: the caller promised
+    an exact document and the store cannot honor that promise.  The audit row
+    (``context_mutations``, written by the caller's ``_record``) keeps the
+    fact that a redaction happened, without the redacted content.  When the
+    context graph projection captured the document, its mirrored event and
+    every projection row derived from it are removed in the same transaction.
+    """
+    try:
+        transcript_store.delete_document(con, document_id)
+    except transcript_store.TranscriptStoreError as exc:
+        raise ContextWriteError(str(exc)) from exc
+    if manager_graph_capture:
+        context_graph.remove_session_document_in_transaction(
+            con, document_id=document_id
+        )
+    return document_id
 
 
 def _legacy_timestamp_columns(con: sqlite3.Connection, table: str) -> frozenset[str]:

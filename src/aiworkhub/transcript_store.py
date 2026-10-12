@@ -91,4 +91,103 @@ def delete_document_index(con: sqlite3.Connection, document_id: int) -> None:
     con.execute("DELETE FROM documents_fts WHERE rowid=?", (int(document_id),))
 
 
-__all__ = ["TranscriptStoreError", "delete_document_index", "insert_document"]
+def _id_column(info: list[sqlite3.Row]) -> str:
+    """The documents table's integer primary-key column name.
+
+    Fresh repositories use ``doc_id``; adopted legacy schemas used ``id``.
+    Whichever spelling exists is the rowid alias the FTS rowid must match.
+    """
+    for row in info:
+        if int(row[5] or 0):  # pk column
+            return str(row[1])
+    return "doc_id"
+
+
+def update_document(
+    con: sqlite3.Connection,
+    document_id: int,
+    *,
+    content: str,
+    kind: str | None = None,
+    tags: str | None = None,
+) -> None:
+    """Rewrite one existing document's content (and optionally kind/tags).
+
+    Works across both supported transcript schemas: the column set is
+    discovered the same way ``insert_document`` discovers it, so a rich
+    adopted schema keeps its provenance columns untouched while the content
+    (and the caller-provided kind/tags, when the column exists) is replaced.
+    The FTS row is rebuilt in the same transaction so search can never serve
+    the pre-edit text after the edit committed.
+    """
+    info = _table_info(con, "documents")
+    available = {str(row[1]) for row in info}
+    if "content" not in available:
+        raise TranscriptStoreError("transcript_schema_missing_core_columns")
+    id_column = _id_column(info)
+    # Verify the target exists BEFORE touching any index row: a typed
+    # refusal must leave the store exactly as it was.
+    if con.execute(
+        f"SELECT 1 FROM documents WHERE {id_column}=?", (int(document_id),)
+    ).fetchone() is None:
+        raise TranscriptStoreError(f"transcript_document_not_found:{document_id}")
+    # External-content FTS5 reads the CONTENT TABLE at delete time, so the
+    # FTS row MUST be deleted while it still mirrors the OLD text: deleting
+    # after the UPDATE silently leaves the old terms in the index (measured:
+    # MATCH 'before' kept matching after an update-then-delete sequence).
+    # A standalone FTS table is order-insensitive, so this order is safe for
+    # both schemas.
+    delete_document_index(con, document_id)
+    assignments = ["content=?"]
+    params: list[Any] = [content]
+    for column, value in (("kind", kind), ("tags", tags)):
+        if value is not None and column in available:
+            assignments.append(f"{column}=?")
+            params.append(value)
+    cur = con.execute(
+        f'UPDATE documents SET {",".join(assignments)} WHERE {id_column}=?',
+        (*params, int(document_id)),
+    )
+    if cur.rowcount != 1:
+        raise TranscriptStoreError(f"transcript_document_not_found:{document_id}")
+    fts_info = _table_info(con, "documents_fts")
+    fts_values = {"content": content}
+    if kind is not None:
+        fts_values["kind"] = kind
+    if tags is not None:
+        fts_values["tags"] = tags
+    fts_columns = [str(row[1]) for row in fts_info if str(row[1]) in fts_values]
+    if "content" not in fts_columns:
+        raise TranscriptStoreError("transcript_fts_missing_content")
+    con.execute(
+        f'INSERT INTO documents_fts(rowid,{",".join(fts_columns)}) '
+        f'VALUES({",".join("?" for _ in range(len(fts_columns) + 1))})',
+        (int(document_id), *(fts_values[name] for name in fts_columns)),
+    )
+
+
+def delete_document(con: sqlite3.Connection, document_id: int) -> str:
+    """Delete one document row and its FTS row; return its id column name.
+
+    Both supported schemas are handled through the discovered primary-key
+    column.  Returns the id column spelling so the caller can quote it in a
+    typed refusal instead of guessing the schema.
+    """
+    info = _table_info(con, "documents")
+    id_column = _id_column(info)
+    delete_document_index(con, document_id)
+    cur = con.execute(
+        f'DELETE FROM documents WHERE {id_column}=?', (int(document_id),)
+    )
+    if cur.rowcount != 1:
+        raise TranscriptStoreError(f"transcript_document_not_found:{document_id}")
+    return id_column
+
+
+__all__ = [
+    "TranscriptStoreError",
+    "delete_document",
+    "delete_document_index",
+    "insert_document",
+    "update_document",
+]

@@ -90,6 +90,145 @@ def test_session_write_supports_adopted_rich_transcript_schema(tmp_path: Path) -
         ).fetchone()[0] == 1
     finally:
         con.close()
+def _open_transcript(repo: Path) -> sqlite3.Connection:
+    db = storage_registry.resolve_database_path(
+        storage_registry.load_storage_registry(repo), "transcript"
+    )
+    return sqlite3.connect(db)
+
+
+def test_session_amend_rewrites_content_and_fts(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    original = context_writes.session_write(
+        repo, actor=_actor(), action="checkpoint", topic="release",
+        content="callback gate passed", idempotency_key="session:amend:0001",
+        provenance="amend regression",
+    )
+    amended = context_writes.session_write(
+        repo, actor=_actor(), action="amend", topic="release",
+        content="callback gate passed (corrected figures)",
+        document_id=original["document_id"],
+        idempotency_key="session:amend:0002", provenance="amend regression",
+    )
+    assert amended["ok"] and amended["status"] == "amended"
+    assert amended["document_id"] == original["document_id"]
+    con = _open_transcript(repo)
+    try:
+        row = con.execute(
+            "SELECT content FROM documents WHERE doc_id=?",
+            (original["document_id"],),
+        ).fetchone()
+        assert row[0] == "callback gate passed (corrected figures)"
+        assert con.execute(
+            "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH 'corrected'"
+        ).fetchone()[0] == 1
+        # Exactly one FTS row remains, serving the amended text only.
+        assert con.execute("SELECT COUNT(*) FROM documents_fts").fetchone()[0] == 1
+        # One append + one amend = two audited mutations, one document row.
+        assert con.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 1
+        assert con.execute(
+            "SELECT COUNT(*) FROM context_mutations WHERE action='amend'"
+        ).fetchone()[0] == 1
+    finally:
+        con.close()
+
+
+def test_session_amend_supports_adopted_rich_schema(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    db = _replace_with_rich_transcript_schema(repo)
+    original = context_writes.session_write(
+        repo, actor=_actor(), action="event", topic="legacy-edit",
+        content="before edit", idempotency_key="session:amend:rich:0001",
+        provenance="rich schema amend regression",
+    )
+    amended = context_writes.session_write(
+        repo, actor=_actor(), action="amend", topic="legacy-edit",
+        content="after edit", document_id=original["document_id"],
+        idempotency_key="session:amend:rich:0002", provenance="rich schema amend regression",
+    )
+    assert amended["ok"]
+    con = sqlite3.connect(db)
+    try:
+        assert con.execute(
+            "SELECT content FROM documents WHERE doc_id=?",
+            (original["document_id"],),
+        ).fetchone()[0] == "after edit"
+        # External-content FTS is rebuilt from the updated row.
+        assert con.execute(
+            "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH 'after'"
+        ).fetchone()[0] == 1
+        assert con.execute(
+            "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH 'before'"
+        ).fetchone()[0] == 0
+    finally:
+        con.close()
+
+
+def test_session_redact_deletes_the_document_and_fts(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    original = context_writes.session_write(
+        repo, actor=_actor(), action="event", topic="secret",
+        content="sensitive payload alpha-beta", idempotency_key="session:redact:0001",
+        provenance="redact regression",
+    )
+    redacted = context_writes.session_write(
+        repo, actor=_actor(), action="redact", topic="secret", content="",
+        document_id=original["document_id"],
+        idempotency_key="session:redact:0002", provenance="redact regression",
+    )
+    assert redacted["ok"] and redacted["status"] == "redacted"
+    con = _open_transcript(repo)
+    try:
+        assert con.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
+        assert con.execute(
+            "SELECT COUNT(*) FROM documents_fts"
+        ).fetchone()[0] == 0
+        # The audit keeps the FACT of the redaction, never the content.
+        audit = con.execute(
+            "SELECT payload_sha256 FROM context_mutations WHERE action='redact'"
+        ).fetchone()
+        assert audit is not None
+    finally:
+        con.close()
+
+
+def test_session_edit_refusals_are_typed(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    original = context_writes.session_write(
+        repo, actor=_actor(), action="event", topic="refusal",
+        content="kept", idempotency_key="session:refusal:0001",
+        provenance="refusal regression",
+    )
+    with pytest.raises(context_writes.ContextWriteError, match="session_document_id_required_for_edit"):
+        context_writes.session_write(
+            repo, actor=_actor(), action="amend", topic="refusal",
+            content="x", idempotency_key="session:refusal:0002",
+            provenance="refusal regression",
+        )
+    with pytest.raises(context_writes.ContextWriteError, match="session_document_id_not_allowed_for_append"):
+        context_writes.session_write(
+            repo, actor=_actor(), action="event", topic="refusal",
+            content="x", document_id=original["document_id"],
+            idempotency_key="session:refusal:0003", provenance="refusal regression",
+        )
+    with pytest.raises(context_writes.ContextWriteError, match="transcript_document_not_found"):
+        context_writes.session_write(
+            repo, actor=_actor(), action="amend", topic="refusal",
+            content="x", document_id=999999,
+            idempotency_key="session:refusal:0004", provenance="refusal regression",
+        )
+    with pytest.raises(context_writes.ContextWriteError, match="transcript_document_not_found"):
+        context_writes.session_write(
+            repo, actor=_actor(), action="redact", topic="refusal", content="",
+            document_id=999999,
+            idempotency_key="session:refusal:0005", provenance="refusal regression",
+        )
+    con = _open_transcript(repo)
+    try:
+        assert con.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 1
+    finally:
+        con.close()
+
 
 
 def test_memory_write_supports_update_supersede_and_archive(tmp_path: Path) -> None:

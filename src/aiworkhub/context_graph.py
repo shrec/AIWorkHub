@@ -500,6 +500,79 @@ def append_session_document_in_transaction(
     return {"ok": True, "idempotent": False, "event_id": event_id, "event_uid": event_uid}
 
 
+def rewrite_session_document_in_transaction(
+    con: sqlite3.Connection,
+    *,
+    repo_id: str,
+    document_id: int,
+    content: str,
+    occurred_at: str,
+) -> dict[str, Any]:
+    """Rewrite the conversation event mirrored from one Session document.
+
+    The session-document projection keys its event by ``source_ref``, so an
+    amend finds the exact event by that key and replaces its content (plus the
+    FTS row and the projection rows derived from it) inside the caller's
+    transaction.  Returns a typed refusal-shaped dict when no mirrored event
+    exists (the projection was disabled when the document was written); the
+    caller decides whether that is fatal.
+    """
+    source_ref = f"session_document:{document_id}"
+    row = con.execute(
+        "SELECT event_id FROM conversation_events WHERE source_ref=?", (source_ref,)
+    ).fetchone()
+    if row is None:
+        return {"ok": False, "mirrored": False, "source_ref": source_ref}
+    event_id = int(row["event_id"])
+    content_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    con.execute(
+        "UPDATE conversation_events SET content=?,occurred_at=?,content_sha256=? WHERE event_id=?",
+        (content, occurred_at, content_sha, event_id),
+    )
+    con.execute("DELETE FROM conversation_events_fts WHERE rowid=?", (event_id,))
+    event_uid = con.execute(
+        "SELECT event_uid FROM conversation_events WHERE event_id=?", (event_id,)
+    ).fetchone()["event_uid"]
+    con.execute(
+        "INSERT INTO conversation_events_fts(rowid,event_uid,content,source_ref) VALUES(?,?,?,?)",
+        (event_id, str(event_uid), content, source_ref),
+    )
+    updated = con.execute("SELECT * FROM conversation_events WHERE event_id=?", (event_id,)).fetchone()
+    assert updated is not None
+    _project_row(con, updated)
+    return {"ok": True, "mirrored": True, "event_id": event_id}
+
+
+def remove_session_document_in_transaction(
+    con: sqlite3.Connection,
+    *,
+    document_id: int,
+) -> dict[str, Any]:
+    """Delete the conversation event mirrored from one redacted Session document.
+
+    A redaction removes the mirrored event, its FTS row and every projection
+    row derived from it, inside the caller's transaction.  The mutation audit
+    trail (``context_mutations``, owned by ``context_writes``) still records
+    THAT a redaction happened -- never the redacted content.
+    """
+    source_ref = f"session_document:{document_id}"
+    row = con.execute(
+        "SELECT event_id FROM conversation_events WHERE source_ref=?", (source_ref,)
+    ).fetchone()
+    if row is None:
+        return {"ok": False, "mirrored": False, "source_ref": source_ref}
+    event_id = int(row["event_id"])
+    con.execute("DELETE FROM conversation_events_fts WHERE rowid=?", (event_id,))
+    con.execute(
+        "DELETE FROM context_edges WHERE source_event_id=?", (event_id,)
+    )
+    con.execute(
+        "DELETE FROM context_nodes WHERE source_event_id=?", (event_id,)
+    )
+    con.execute("DELETE FROM conversation_events WHERE event_id=?", (event_id,))
+    return {"ok": True, "mirrored": True, "event_id": event_id}
+
+
 def rebuild_projection(repo: Path | str) -> dict[str, Any]:
     if not feature_settings.enabled(repo, "context_graph"):
         return feature_settings.disabled_result("context_graph")

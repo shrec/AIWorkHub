@@ -371,7 +371,7 @@ def workforce_upsert(*, worker: dict[str, Any]) -> dict[str, Any]:
 
 def session_write(
     *, action: context_writes.SessionAction, topic: str, content: str,
-    idempotency_key: str, provenance: str,
+    idempotency_key: str, provenance: str, document_id: int | None = None,
 ) -> dict[str, Any]:
     context, manager = _manager_context(topic=topic)
     if context is not None and not feature_settings.enabled(context.authority_repo, "session_manager"):
@@ -380,6 +380,7 @@ def session_write(
         lambda repo, actor: context_writes.session_write(
             repo, actor=actor, action=action, topic=topic, content=content,
             idempotency_key=idempotency_key, provenance=provenance,
+            document_id=document_id,
         ),
         topic=topic,
     )

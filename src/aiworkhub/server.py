@@ -1443,12 +1443,24 @@ def aiworkhub_manager_session_write(
     content: str,
     idempotency_key: str,
     provenance: str,
+    document_id: int | None = None,
 ) -> dict[str, Any]:
-    """MANAGER WRITE: append one audited canonical Session Manager event."""
+    """MANAGER WRITE: append one audited canonical Session Manager event, or
+    edit one existing event.
+
+    Append actions: start, event, checkpoint, state, handoff, close (no
+    document_id).  Edit actions: ``amend`` rewrites the
+    content of one exact existing document (FTS rebuilt, audit row recorded,
+    context-graph mirror rewritten); ``redact`` deletes that document, its
+    FTS row and its graph mirror (audit keeps the fact of the redaction,
+    never the content).  Both require ``document_id`` and leave the document
+    count/id audit trail truthful.
+    """
 
     return manager_ai_tools.session_write(
         action=action, topic=topic, content=content,
         idempotency_key=idempotency_key, provenance=provenance,
+        document_id=document_id,
     )
 
 
