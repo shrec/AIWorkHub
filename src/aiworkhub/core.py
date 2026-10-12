@@ -14,7 +14,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -12266,6 +12266,46 @@ def needfix_show(needfix_id: str) -> dict[str, Any]:
     return ns.get_needfix(repo_root(), needfix_id)
 
 
+# NF-2026-01447: needfix_show was measured at avg 4 KB over 51 calls, max
+# 12 KB, almost all of it the filer-authored bodies. Past this cap a body is
+# replaced by its own identity so the row stays addressable; the authoritative
+# row from :func:`needfix_show` is unchanged, and this projection is applied at
+# the MCP boundary by callers that ask for it.
+NEEDFIX_BODY_MAX_BYTES = 1024
+_NEEDFIX_BODY_KEYS = ("description", "evidence", "scope", "provenance")
+
+
+def needfix_bodies_bounded(
+    row: Mapping[str, Any], *, full: bool = False
+) -> dict[str, Any]:
+    """Return ``row`` with each oversized filer-authored body folded.
+
+    The fold is per body and only when that body's own canonical JSON exceeds
+    :data:`NEEDFIX_BODY_MAX_BYTES`, so a short description is still returned
+    verbatim. A folded body reports ``{summarized, bytes, length, sha256}``:
+    ``bytes`` is its canonical JSON size, ``length`` its character or entry
+    count. ``full=True`` returns an exact copy.
+    """
+
+    result = dict(row)
+    if full:
+        return result
+    for key in _NEEDFIX_BODY_KEYS:
+        value = result.get(key)
+        if not isinstance(value, (str, list, dict)) or not value:
+            continue
+        size, digest = _evidence_identity(value)
+        if size <= NEEDFIX_BODY_MAX_BYTES:
+            continue
+        result[key] = {
+            "summarized": True,
+            "bytes": size,
+            "length": len(value),
+            "sha256": digest,
+        }
+    return result
+
+
 def needfix_add(
     title: str,
     description: str,
@@ -12460,11 +12500,158 @@ def needfix_events(needfix_id: str, limit: int = 100) -> list[dict[str, Any]]:
     return ns.list_events(repo_root(), needfix_id, limit=limit)
 
 
+# NF-2026-01447: convert refused ``plan_digest`` alone with "missing task_plan
+# fields: runner, topic", so the manager resent the whole plan it had just
+# previewed -- measured ~6 KB echoed three times on NF-2026-01452. Preview
+# records the exact plan it signed, keyed by the digest it returned, and
+# convert reuses it. Bounded and self-evicting: at most
+# PREVIEWED_PLAN_CACHE_MAX_ENTRIES live entries, LRU-evicted, each expiring
+# after PREVIEWED_PLAN_TTL_SECONDS, and never an authority -- it holds only the
+# plan body, while the digest comparison in needfix_convert stays the gate.
+PREVIEWED_PLAN_CACHE_MAX_ENTRIES = 32
+PREVIEWED_PLAN_TTL_SECONDS = 3600.0
+_previewed_plans: "OrderedDict[str, tuple[float, dict[str, Any]]]" = OrderedDict()
+_previewed_plan_lock = threading.Lock()
+_previewed_plan_counters: dict[str, int] = {
+    "writes": 0,
+    "hits": 0,
+    "misses": 0,
+    "evictions": 0,
+    "expirations": 0,
+}
+
+
+def _remember_previewed_plan(digest: Any, task_plan: Any) -> None:
+    """Record the exact plan one preview signed, under the digest it returned.
+
+    A preview with no plan body (already converted, or a store that returned
+    none) records nothing: an empty plan is not a plan a commit could reuse,
+    and caching it would let convert claim a previewed plan it never had.
+    """
+
+    if not digest or not isinstance(task_plan, Mapping) or not task_plan:
+        return
+    key = str(digest)
+    with _previewed_plan_lock:
+        _previewed_plans.pop(key, None)
+        _previewed_plans[key] = (time.monotonic(), dict(task_plan))
+        _previewed_plan_counters["writes"] += 1
+        while len(_previewed_plans) > PREVIEWED_PLAN_CACHE_MAX_ENTRIES:
+            _previewed_plans.popitem(last=False)
+            _previewed_plan_counters["evictions"] += 1
+
+
+def _previewed_plan(digest: Any) -> dict[str, Any] | None:
+    """The plan a preview signed under ``digest``, or None when it is not held."""
+
+    key = str(digest or "")
+    if not key:
+        return None
+    with _previewed_plan_lock:
+        entry = _previewed_plans.get(key)
+        if entry is None:
+            _previewed_plan_counters["misses"] += 1
+            return None
+        stored_at, plan = entry
+        if time.monotonic() - stored_at > PREVIEWED_PLAN_TTL_SECONDS:
+            del _previewed_plans[key]
+            _previewed_plan_counters["expirations"] += 1
+            _previewed_plan_counters["misses"] += 1
+            return None
+        _previewed_plans.move_to_end(key)
+        _previewed_plan_counters["hits"] += 1
+        return dict(plan)
+
+
+def previewed_plan_cache_stats() -> dict[str, Any]:
+    """Measured state of the bounded previewed-plan cache."""
+
+    with _previewed_plan_lock:
+        return {
+            "stored": len(_previewed_plans),
+            "capacity": PREVIEWED_PLAN_CACHE_MAX_ENTRIES,
+            "ttl_seconds": PREVIEWED_PLAN_TTL_SECONDS,
+            **_previewed_plan_counters,
+        }
+
+
+def previewed_plan_cache_invalidate() -> int:
+    """Drop every remembered plan; returns how many were held."""
+
+    with _previewed_plan_lock:
+        held = len(_previewed_plans)
+        _previewed_plans.clear()
+        return held
+
+
+def _validation_roles_requirement(task_plan: Any) -> dict[str, Any] | None:
+    """The validation roles one plan's ``work_kind`` must declare, and its gap.
+
+    ``quality_evidence.normalize_behavioral_contract`` is the single owner of
+    this contract and decides it at task creation; this reports what it will
+    require so a preview that looks valid cannot fail at commit with
+    ``behavioral_validation_roles_missing`` (NF-2026-01447). The required-role
+    table is read from that module rather than restated here.
+    """
+
+    if not isinstance(task_plan, Mapping):
+        return None
+    from . import quality_evidence
+
+    work_kind = str(task_plan.get("work_kind") or quality_evidence.WORK_KIND_GENERIC)
+    required = list(
+        quality_evidence._REQUIRED_BEHAVIORAL_ROLES.get(work_kind.strip().lower(), ())
+    )
+    declared = [
+        str(role or "").strip().lower()
+        for role in (task_plan.get("validation_roles") or [])
+    ]
+    requirement: dict[str, Any] = {
+        "work_kind": work_kind,
+        "required_roles": required,
+        "declared_roles": declared,
+        "validation_command_count": len(list(task_plan.get("validation") or [])),
+    }
+    try:
+        _kind, roles = quality_evidence.normalize_behavioral_contract(
+            work_kind,
+            list(task_plan.get("validation") or []),
+            task_plan.get("validation_roles"),
+        )
+    except ValueError as exc:
+        requirement["satisfied"] = False
+        requirement["refusal"] = str(exc)[:200]
+        return requirement
+    requirement["satisfied"] = True
+    requirement["resolved_roles"] = roles
+    return requirement
+
+
 def needfix_preview_convert(
     needfix_id: str, *, task_plan: dict[str, Any] | None = None
 ) -> dict[str, Any]:
+    """Preview one conversion and remember the exact plan it signs.
+
+    Adds ``plan_digest_accepted_alone`` -- true when :func:`needfix_convert`
+    can commit from ``plan_digest`` with no plan body -- and
+    ``validation_roles_requirement``, which names the roles this plan's
+    ``work_kind`` must declare (``bugfix``: reproduction, regression) and
+    whether the previewed plan already satisfies them.
+    """
     ns = _needfix_store_module()
-    return ns.preview_convert(repo_root(), needfix_id, task_plan=task_plan)
+    preview = ns.preview_convert(repo_root(), needfix_id, task_plan=task_plan)
+    if not isinstance(preview, dict):
+        return preview
+    digest = preview.get("plan_digest")
+    previewed = preview.get("task_plan")
+    _remember_previewed_plan(digest, previewed)
+    preview["plan_digest_accepted_alone"] = (
+        bool(digest) and isinstance(previewed, Mapping) and bool(previewed)
+    )
+    requirement = _validation_roles_requirement(previewed)
+    if requirement is not None:
+        preview["validation_roles_requirement"] = requirement
+    return preview
 
 
 def needfix_convert(
@@ -12485,6 +12672,10 @@ def needfix_convert(
     conversion must bind to a ``plan_digest`` the matching preview
     returned, so any NeedFix drift between preview and commit
     fails closed instead of silently committing a different plan.
+    ``plan_digest`` alone is sufficient: :func:`needfix_preview_convert`
+    remembers the exact plan it signed under that digest and this commits that
+    plan, so the body never has to be resent (NF-2026-01447). A digest this
+    process no longer holds is refused with ``previewed_plan_unavailable``.
     Idempotent already-task_created retries short-circuit before this
     enforcement, preserving reconciliation without a new create.
 
@@ -12545,7 +12736,24 @@ def needfix_convert(
                 "plan_digest is required to bind a confirmed conversion to "
                 "the previewed plan; re-preview before committing"
             )
-        card = ns.normalize_task_plan(needfix_snapshot, task_plan)
+        plan = task_plan
+        if plan is None:
+            # NF-2026-01447: ``plan_digest`` alone commits the exact plan the
+            # matching preview signed, so a manager never resends the body it
+            # just received (measured ~6 KB echoed three times on
+            # NF-2026-01452, because this refused with "missing task_plan
+            # fields: runner, topic"). Nothing is reconstructed or guessed: a
+            # digest this process no longer holds is refused outright, and the
+            # digest re-check below is unchanged, so NeedFix drift between
+            # preview and commit still fails closed.
+            plan = _previewed_plan(plan_digest)
+            if plan is None:
+                raise ns.NeedFixError(
+                    "previewed_plan_unavailable: no previewed plan is held for "
+                    f"plan_digest={str(plan_digest)[:16]}; call "
+                    "needfix_preview_convert again, or pass task_plan explicitly"
+                )
+        card = ns.normalize_task_plan(needfix_snapshot, plan)
         actual_digest = ns.plan_digest(card)
         if actual_digest != plan_digest:
             raise ns.NeedFixConflictError(

@@ -2799,14 +2799,77 @@ def skills_view() -> dict[str, Any]:
     }
 
 
-def storage_retention_preview_view() -> dict[str, Any]:
-    """READ-ONLY: fresh repository-scoped cleanup preview and batch list."""
+# NF-2026-01447: one measured preview replied at 22 KB, nearly all of it the
+# full candidate/protected/pinned/registration/quarantine lists. The default
+# answers with the counts, the byte lines, the preview_digest and the ten
+# largest candidates; ``include_items=true`` returns every list. The digest is
+# computed inside storage_retention over the candidate identities, not over
+# what this view renders, so quarantine reconfirmation is unaffected.
+_STORAGE_PREVIEW_TOP_CANDIDATES = 10
+
+
+def _storage_preview_items_folded(response: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep counts, bytes and the largest candidates; fold the long lists."""
+
+    folded = dict(response)
+    candidates = folded.get("candidates")
+    if isinstance(candidates, list):
+        rows = [item for item in candidates if isinstance(item, Mapping)]
+        top = sorted(
+            rows,
+            key=lambda item: (-int(item.get("size_bytes") or 0), str(item.get("id") or "")),
+        )[:_STORAGE_PREVIEW_TOP_CANDIDATES]
+        folded["candidates"] = [dict(item) for item in top]
+        folded["candidates_order"] = "size_bytes_desc"
+        folded["candidates_omitted"] = len(candidates) - len(top)
+    protected = folded.get("protected")
+    if isinstance(protected, list):
+        folded.pop("protected")
+        folded["protected_omitted"] = len(protected)
+    pinned = folded.get("pinned_predecessors")
+    if isinstance(pinned, list):
+        folded.pop("pinned_predecessors")
+        folded["pinned_predecessors_count"] = len(pinned)
+    health = folded.get("registration_health")
+    if isinstance(health, Mapping):
+        # Keeps preview_digest and every scalar count/verdict; drops the
+        # per-registration rows behind them.
+        folded["registration_health"] = {
+            key: value
+            for key, value in health.items()
+            if not isinstance(value, (list, dict))
+        }
+    quarantine = folded.get("quarantine")
+    if isinstance(quarantine, Mapping) and isinstance(quarantine.get("batches"), list):
+        batches = quarantine["batches"]
+        bounded = {key: value for key, value in quarantine.items() if key != "batches"}
+        bounded["batches_omitted"] = len(batches)
+        folded["quarantine"] = bounded
+    folded["include_items"] = False
+    folded["items_request"] = {
+        "tool": "aiworkhub_dashboard_storage_retention_preview",
+        "include_items": True,
+    }
+    return folded
+
+
+def storage_retention_preview_view(include_items: bool = False) -> dict[str, Any]:
+    """READ-ONLY: repository-scoped cleanup counts, bytes and top candidates.
+
+    Counts, byte lines and ``preview_digest`` are always exact; the candidate
+    list is the ten largest by ``size_bytes`` and the protected, pinned,
+    registration and quarantine-batch lists fold to their counts.
+    ``include_items=true`` returns the fresh preview and batch list in full.
+    """
     try:
         root = core.repo_root()
         response = storage_retention.preview(root)
         response["quarantine"] = storage_retention.list_batches(root)
     except storage_retention.StorageRetentionError as exc:
         response = {"ok": False, "error": str(exc)[:240]}
+    else:
+        if include_items is not True:
+            response = _storage_preview_items_folded(response)
     response["server_tool"] = "aiworkhub_dashboard_storage_retention_preview"
     response["authority_flags"] = _readonly_authority_flags()
     return response

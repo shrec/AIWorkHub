@@ -655,6 +655,126 @@ def _card_view(card: Mapping[str, Any], include_card: str) -> dict[str, Any] | N
     return None
 
 
+# NF-2026-01447: the card bodies the manager itself authored moments earlier.
+# Measured 2026-10-09 over 6 manager transcripts (3.13 MB of AIWorkHub tool
+# results): aiworkhub_task_show avg 11.5 KB/call, aiworkhub_agent_task_status
+# avg 11 KB (max 33 KB), and one aiworkhub_task_retry_terminal reply of 67,395
+# chars -- dominated by review_feedback (an 8 KB instruction plus up to 256
+# predecessor paths), the recovery feedback and the audit history. Folded to
+# the identity core already computes plus the counts a manager reads; the exact
+# text stays one detail="evidence"/detail="full" call away.
+_CARD_MANAGER_BODY_KEYS = ("review_feedback", "recovery_feedback", "history")
+_CARD_MANAGER_BODY_FACTS = ("schema_id", "predecessor_request_id", "reason_identity")
+_CARD_MANAGER_BODY_LISTS = ("predecessor_changed_paths", "residual_identities")
+
+
+def _fold_card_manager_bodies(card: Any) -> Any:
+    """Fold the manager-authored card bodies to identity plus their counts."""
+
+    if not isinstance(card, dict):
+        return card
+    result = dict(card)
+    for key in _CARD_MANAGER_BODY_KEYS:
+        value = result.get(key)
+        if not isinstance(value, (dict, list)) or not value:
+            continue
+        size, digest = core._evidence_identity(value)
+        folded: dict[str, Any] = {"summarized": True, "bytes": size, "sha256": digest}
+        if isinstance(value, list):
+            folded["count"] = len(value)
+        else:
+            for fact in _CARD_MANAGER_BODY_FACTS:
+                if fact in value:
+                    folded[fact] = value[fact]
+            # Counted only for a body that actually carries the list. A
+            # recovery delta has no predecessor paths, and reporting 0 for
+            # one it never had would read as "measured and empty".
+            for listed in _CARD_MANAGER_BODY_LISTS:
+                if listed in value:
+                    folded[f"{listed}_count"] = len(value[listed] or [])
+        result[key] = folded
+    return result
+
+
+def _review_findings_count(card: Any) -> int | None:
+    """Count the reviewer findings a card records, or None when it records none.
+
+    The findings live inside the ``quality_gate`` evidence blob that
+    ``core.summarize_evidence`` folds to identity, so a compact render would
+    otherwise lose the one number a manager reads them for. A card with no
+    reviewer reports answers None and the key is omitted rather than reported
+    as 0: an unmeasured review is not a clean one.
+    """
+
+    node: Any = card
+    for key in ("terminal_review", "evidence", "quality_gate", "quality_verdict"):
+        if not isinstance(node, Mapping):
+            return None
+        node = node.get(key)
+    reports = node.get("reviewer_reports") if isinstance(node, Mapping) else None
+    if not isinstance(reports, list):
+        return None
+    return sum(
+        len(report.get("findings") or [])
+        for report in reports
+        if isinstance(report, Mapping)
+    )
+
+
+# NF-2026-01447: a convert preview echoed the whole signed plan at ~6 KB, and
+# the manager resent it twice more because convert refused ``plan_digest``
+# alone (measured on NF-2026-01452). The plan body folds to the facts the
+# commit decision turns on; ``plan_digest`` itself is already a top-level key.
+def _needfix_plan_receipt(reply: Any, *, include_plan: bool, tool: str) -> Any:
+    """Fold a conversion preview/commit receipt's plan body to its facts."""
+
+    if not isinstance(reply, dict) or include_plan:
+        return reply
+    plan = reply.get("task_plan")
+    if not isinstance(plan, Mapping) or not plan:
+        return reply
+    size, digest = core._evidence_identity(dict(plan))
+    projected = dict(reply)
+    projected["task_plan"] = {
+        "summarized": True,
+        "bytes": size,
+        "sha256": digest,
+        "title": plan.get("title"),
+        "runner": plan.get("runner"),
+        "topic": plan.get("topic"),
+        "work_kind": plan.get("work_kind"),
+        "allowed_writes_count": len(plan.get("allowed_writes") or []),
+        "required_outputs_count": len(plan.get("required_outputs") or []),
+    }
+    projected["plan_request"] = {"tool": tool, "include_plan": True}
+    return projected
+
+
+# NF-2026-01447: with the contract suppressed, the bootstrap reply was measured
+# at up to 11 KB, most of it these two diagnostic bodies.
+_BOOTSTRAP_DIAGNOSTIC_KEYS = ("last", "reconciler", "details", "tasks", "rows")
+
+
+def _bootstrap_diagnostics_folded(value: Any) -> Any:
+    """Drop one bootstrap block's diagnostic bodies, keeping its own facts."""
+
+    if not isinstance(value, Mapping):
+        return value
+    omitted = [key for key in _BOOTSTRAP_DIAGNOSTIC_KEYS if key in value]
+    if not omitted:
+        return value
+    folded = {
+        key: item
+        for key, item in value.items()
+        if key not in _BOOTSTRAP_DIAGNOSTIC_KEYS
+    }
+    size, digest = core._evidence_identity(dict(value))
+    folded["diagnostics_omitted"] = omitted
+    folded["diagnostics_bytes"] = size
+    folded["diagnostics_sha256"] = digest
+    return folded
+
+
 def _without_argv_echo(result: dict[str, Any]) -> dict[str, Any]:
     """Drop ``command`` from an envelope: for reject_review its argv carries
     the manager's own reason verbatim (13.8% of the reply, 89% of it reason)."""
@@ -1043,6 +1163,7 @@ RiskSignal = Literal[
 def aiworkhub_manager_bootstrap(
     include_contract: bool = False,
     known_contract_sha256: str = "",
+    include_diagnostics: bool = False,
 ) -> dict[str, Any]:
     """CALL FIRST: mandatory repository manager contract and callback workflow.
 
@@ -1053,13 +1174,38 @@ def aiworkhub_manager_bootstrap(
     once per verified session and then suppressed with its sha; pass
     include_contract=true to re-read it, or known_contract_sha256 to prove you
     already hold it.
+
+    A reply that suppresses the contract (``contract_delivered=false``) is the
+    steady-state one, and it was measured at up to 11 KB -- most of it the last
+    hygiene pass's per-task detail and the reconciler's own internals, which no
+    caller gates on (NF-2026-01447). Those bodies are dropped from
+    ``task_hygiene``/``task_health`` and replaced by the names omitted plus the
+    block's sha256/bytes, so nothing silently disappears; the verdicts and
+    counts beside them stay exact. ``include_diagnostics=true`` keeps them.
     """
 
-    return core.manager_bootstrap(
+    reply = core.manager_bootstrap(
         include_contract=bool(include_contract),
         known_contract_sha256=str(known_contract_sha256 or ""),
         bootstrap_call=True,
     )
+    if (
+        not isinstance(reply, dict)
+        or bool(include_diagnostics)
+        or reply.get("contract_delivered")
+    ):
+        return reply
+    compact = dict(reply)
+    if "task_hygiene" in compact:
+        compact["task_hygiene"] = _bootstrap_diagnostics_folded(compact["task_hygiene"])
+    if "task_health" in compact:
+        compact["task_health"] = _bootstrap_diagnostics_folded(compact["task_health"])
+    compact["include_diagnostics"] = False
+    compact["diagnostics_request"] = {
+        "tool": "aiworkhub_manager_bootstrap",
+        "include_diagnostics": True,
+    }
+    return compact
 
 
 @mcp.tool()
@@ -2783,6 +2929,12 @@ def aiworkhub_task_show(
     exact (baselines still folded); ``detail="full"`` or ``full=True`` returns
     the exact stored card. Summary/evidence renders are compact JSON; ``full``
     keeps the indented one.
+
+    The manager-authored bodies (``review_feedback``, ``recovery_feedback``,
+    ``history``) fold to identity plus their counts in the summary render, and
+    every summary/evidence reply carries ``card_sha256``/``card_bytes`` plus
+    ``review_findings_count`` when the card records reviewer reports: measured
+    avg 11.5 KB/call over 31 calls (NF-2026-01447).
     """
 
     refusal = _detail_refusal(detail)
@@ -2794,12 +2946,18 @@ def aiworkhub_task_show(
     card = _envelope_card(result)
     if card is None:
         return result
+    identity = _card_identity(card)
+    findings = _review_findings_count(card)
     if detail == "summary":
         card = core.summarize_evidence(card)
         card = mcp_summary_folds.fold_task_card_facts(card)
+        card = _fold_card_manager_bodies(card)
     rendered = dict(result)
     rendered["stdout"] = json.dumps(card, ensure_ascii=False, default=str, separators=(",", ":"))
     rendered["detail"] = detail
+    rendered.update(identity)
+    if findings is not None:
+        rendered["review_findings_count"] = findings
     rendered["detail_request"] = {
         "evidence": {"tool": "aiworkhub_task_show", "task_id": task_id, "detail": "evidence"},
         "full": {"tool": "aiworkhub_task_show", "task_id": task_id, "detail": "full"},
@@ -3019,6 +3177,7 @@ def aiworkhub_task_retry_terminal(
     request_id: str,
     terminal_substatus: str,
     reason: str = "",
+    include_card: CardInclude = "none",
 ) -> dict[str, Any]:
     """COORDINATOR WRITE: retry one exact operational terminal episode.
 
@@ -3027,13 +3186,29 @@ def aiworkhub_task_retry_terminal(
     semantic validation/review failures remain on their established review
     workflow.  The same task ID is requeued and its append-only audit history
     is preserved.
+
+    Replies with a receipt (``aiworkhub.retry_terminal_receipt.v1``): task_id,
+    status, worker_status, card_sha256/card_bytes, and every server-derived
+    key the transition attached -- ``retried_request_id``,
+    ``terminal_substatus``, ``request_linkage``, ``workspace_retention``,
+    ``idempotent``. One measured call echoed the whole requeued card at 67,395
+    chars, review_feedback and rework_predecessor included (NF-2026-01447);
+    ``include_card`` = none (default) | summary | full brings it back.
     """
 
-    return core.retry_terminal_task(
+    refusal = _include_card_refusal(include_card)
+    if refusal is not None:
+        return refusal
+    return _lifecycle_receipt(
+        core.retry_terminal_task(
+            task_id=task_id,
+            request_id=request_id,
+            terminal_substatus=terminal_substatus,
+            reason=reason,
+        ),
+        schema_id="aiworkhub.retry_terminal_receipt.v1",
         task_id=task_id,
-        request_id=request_id,
-        terminal_substatus=terminal_substatus,
-        reason=reason,
+        include_card=include_card,
     )
 
 
@@ -4337,6 +4512,11 @@ def aiworkhub_agent_task_status(
     minimality contract fold to identity; named artifact/delivery/review receipts
     retain status, errors and explicit observed/unknown flags alongside identity.
     Failure/liveness fields and usage metrics stay exact.
+    The manager-authored bodies (``review_feedback``, ``recovery_feedback``,
+    ``history``) fold the same way, and the reply carries
+    ``card_sha256``/``card_bytes`` plus ``review_findings_count`` when the card
+    records reviewer reports: measured avg 11 KB/call over 48 calls, max 33 KB
+    (NF-2026-01447).
     ``"evidence"`` keeps all of the above exact (baselines still folded);
     ``"full"`` returns the raw status payload.
     """
@@ -4349,11 +4529,16 @@ def aiworkhub_agent_task_status(
         return result
     folded = dict(result)
     card = folded.get("task_card")
+    identity: dict[str, Any] | None = None
+    findings: int | None = None
     if isinstance(card, dict):
+        identity = _card_identity(card)
+        findings = _review_findings_count(card)
         card = core.summarize_card_baselines(card)
         if detail == "summary":
             card = core.summarize_evidence(card)
             card = mcp_summary_folds.fold_task_card_for_process_status(card)
+            card = _fold_card_manager_bodies(card)
         folded["task_card"] = card
     latest = folded.get("latest_event")
     if isinstance(latest, dict):
@@ -4362,6 +4547,10 @@ def aiworkhub_agent_task_status(
             latest = core.summarize_evidence(latest, paths=core.EVENT_EVIDENCE_PATHS)
             latest = mcp_summary_folds.fold_latest_event_for_process_status(latest)
         folded["latest_event"] = latest
+    if identity is not None:
+        folded.update(identity)
+    if findings is not None:
+        folded["review_findings_count"] = findings
     folded["detail"] = detail
     folded["detail_request"] = {
         "evidence": {"tool": "aiworkhub_agent_task_status", "request_id": request_id, "detail": "evidence"},
@@ -5341,9 +5530,19 @@ def needfix_list(
 
 
 @mcp.tool()
-def needfix_show(needfix_id: str) -> dict:
-    """Show one NeedFix by id."""
-    return core.needfix_show(needfix_id)
+def needfix_show(needfix_id: str, full: bool = False) -> dict:
+    """Show one NeedFix by id; a body over 1 KB folds to its own identity.
+
+    Measured 2026-10-09: 51 calls, avg 4 KB, max 12 KB, almost all of it the
+    description and evidence bodies the filer wrote (NF-2026-01447). Each body
+    whose own canonical bytes exceed ``core.NEEDFIX_BODY_MAX_BYTES`` is
+    replaced by ``{summarized, bytes, length, sha256}`` so it stays
+    addressable; a smaller body is returned verbatim and ``full=true`` returns
+    every byte.
+    """
+    return core.needfix_bodies_bounded(
+        core.needfix_show(needfix_id), full=bool(full)
+    )
 
 
 @mcp.tool()
@@ -5685,10 +5884,26 @@ def aiworkhub_manager_sdlc_case_for_task(task_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 def needfix_preview_convert(
-    needfix_id: str, task_plan: dict[str, Any] | None = None
+    needfix_id: str,
+    task_plan: dict[str, Any] | None = None,
+    include_plan: bool = False,
 ) -> dict:
-    """Preview an explicit workforce-bound task conversion."""
-    return core.needfix_preview_convert(needfix_id, task_plan=task_plan)
+    """Preview an explicit workforce-bound task conversion.
+
+    The reply keeps ``plan_digest``, ``plan_digest_accepted_alone`` and
+    ``validation_roles_requirement`` -- the three facts the commit decision
+    actually turns on -- and folds the signed plan body to its identity plus
+    title/runner/topic/work_kind and the allowed_writes and required_outputs
+    counts. ``include_plan=true`` returns the plan verbatim. Measured
+    2026-10-09 on NF-2026-01452: ~6 KB of plan echoed three times, because
+    convert then refused ``plan_digest`` alone (NF-2026-01447). It no longer
+    does, so the previewed plan never has to be resent.
+    """
+    return _needfix_plan_receipt(
+        core.needfix_preview_convert(needfix_id, task_plan=task_plan),
+        include_plan=bool(include_plan),
+        tool="needfix_preview_convert",
+    )
 
 
 @mcp.tool()
@@ -5696,10 +5911,22 @@ def needfix_convert(
     needfix_id: str,
     task_plan: dict[str, Any] | None = None,
     plan_digest: str | None = None,
+    include_plan: bool = False,
 ) -> dict:
-    """Commit the exact previewed workforce-bound task conversion."""
-    return core.needfix_convert(
-        needfix_id, task_plan=task_plan, plan_digest=plan_digest
+    """Commit the exact previewed workforce-bound task conversion.
+
+    ``plan_digest`` alone is enough: the matching preview remembered the exact
+    plan it signed and this commits that plan, so the body never has to be
+    resent. The digest re-check is unchanged, so NeedFix drift between preview
+    and commit still fails closed, and a digest this server no longer holds is
+    refused with ``previewed_plan_unavailable`` rather than reconstructed.
+    """
+    return _needfix_plan_receipt(
+        core.needfix_convert(
+            needfix_id, task_plan=task_plan, plan_digest=plan_digest
+        ),
+        include_plan=bool(include_plan),
+        tool="needfix_convert",
     )
 
 
