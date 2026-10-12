@@ -170,6 +170,9 @@ _OPENCODE_MODELS_MAX_BYTES = 64 * 1024
 # manager picker.  256 keeps the parse bounded while covering the provider's
 # realistic model surface with headroom.
 _OPENCODE_MODELS_MAX_ROWS = 256
+# Public alias: dashboard_mcp_app mirrors this cap for its own upstream
+# identity ceiling so the two can never drift apart.
+OPENCODE_MODELS_MAX_ROWS = _OPENCODE_MODELS_MAX_ROWS
 
 
 def parse_opencode_models_output(raw: str | bytes | None) -> list[str]:

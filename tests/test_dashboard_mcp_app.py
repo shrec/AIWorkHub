@@ -2319,13 +2319,14 @@ def test_enabled_route_past_the_upstream_discovery_cut_is_still_toggleable(
     tmp_path, monkeypatch
 ):
     # The defect this closes is a PRODUCER-side one, so nothing here stubs the
-    # producer. A host listing 201 OpenCode identities is handed to the shipped
-    # discovery path, and the enabled route sits at position 201 -- past the
-    # 64-row cap parse_opencode_models_output applies inside
-    # opencode_identities_from_preflight. MAX_MODEL_POLICY_SOURCE_ROWS = 512
-    # therefore never binds on this source and has nothing to reserve the pin
-    # against, which is exactly why a pin-aware ingestion bound alone did not
-    # fix this: the identity was gone before the bound could protect it.
+    # producer. A host listing one more OpenCode identity than the parser's
+    # own row cap is handed to the shipped discovery path, and the enabled
+    # route sits past that cap -- past what
+    # opencode_identities_from_preflight's parse_opencode_models_output call
+    # delivers. MAX_MODEL_POLICY_SOURCE_ROWS = 512 therefore never binds on
+    # this source and has nothing to reserve the pin against, which is
+    # exactly why a pin-aware ingestion bound alone did not fix this: the
+    # identity was gone before the bound could protect it.
     #
     # The row is drawn either way -- models.json named that exact route, which
     # is evidence in its own right -- but WHICH row it is drawn as is the second
@@ -2336,7 +2337,8 @@ def test_enabled_route_past_the_upstream_discovery_cut_is_still_toggleable(
     repo = tmp_path / "repo"
     repo.mkdir()
     task_store.initialize_repository(repo)
-    identities = [f"opencode/model-{index:03d}" for index in range(200)]
+    cap = dashboard_mcp_app.OPENCODE_UPSTREAM_IDENTITY_CEILING
+    identities = [f"opencode/model-{index:04d}" for index in range(cap)]
     identities.append("xai/grok-4.6")
 
     catalog, discovered = _declared_route_view(repo, monkeypatch, identities)
@@ -2346,10 +2348,11 @@ def test_enabled_route_past_the_upstream_discovery_cut_is_still_toggleable(
     # if an upstream bound is ever raised, this is the line that says so.
     assert len(discovered) < len(identities)
     assert "xai/grok-4.6" not in discovered
-    # The upstream cut is now the source's own reported truth. While `total` was
-    # taken from the delivered list this read 64 of 64 and `truncated` was
-    # structurally False -- a 201-identity host publishing itself as complete,
-    # because a 512-row bound cannot bind on a list already cut to 64.
+    # The upstream cut is now the source's own reported truth. While `total`
+    # was taken from the delivered list this read `cap` of `cap` and
+    # `truncated` was structurally False -- a (cap + 1)-identity host
+    # publishing itself as complete, because a 512-row bound cannot bind on a
+    # list already cut to the producer's own cap.
     source = catalog["opencode_source"]
     assert source["delivered"] == len(discovered)
     assert source["total"] == len(identities)
@@ -2384,9 +2387,15 @@ def test_enabled_route_past_the_upstream_discovery_cut_is_still_toggleable(
     assert catalog["declared_only_model_count"] == 0
     assert catalog["source_truncated_model_count"] == 1
     # The provider's size is stated over the host's population and not over the
-    # parser's. 64 of 64 was the understatement; 201 is what the host offered.
+    # parser's. `cap` of `cap` was the understatement; len(identities) is what
+    # the host offered.
     counts = {entry["provider"]: entry for entry in catalog["provider_counts"]}
-    assert counts["opencode"]["total"] == len(identities)
+    seed_opencode_models = {
+        row["model"]
+        for row in dashboard_mcp_app.workforce_catalog.DEFAULT_WORKERS
+        if row["adapter_id"] == "opencode_cli"
+    }
+    assert counts["opencode"]["total"] == len(set(identities) | seed_opencode_models)
     assert counts["opencode"]["truncated"] is True
     assert counts["opencode"]["total_is_lower_bound"] is False
 
@@ -2394,19 +2403,21 @@ def test_enabled_route_past_the_upstream_discovery_cut_is_still_toggleable(
 def test_producer_refused_opencode_routes_are_not_charged_to_this_bound(
     tmp_path, monkeypatch
 ):
-    # The same 201-identity host as above, read for a different fact: WHICH
-    # bound the missing rows are charged to. Every one of them was cut by the
-    # producer's own 64-identity ceiling before this module was offered
-    # anything, and MAX_MODEL_POLICY_SOURCE_ROWS = 512 cannot bind on a list of
-    # 64 -- so this ingestion refused nothing at all. Published as a single
-    # `absent_routes` figure, the Webview named this module's discovery bound
-    # as the cause, and an owner raising that limit would have recovered none
-    # of the rows. The producer's share is marked instead, as a strict subset
-    # of the same deduped population and never as a second count beside it.
+    # The same host as above, past the cap by several identities, read for a different
+    # fact: WHICH bound the missing rows are charged to. Every one of them
+    # was cut by the producer's own identity ceiling before this module was
+    # offered anything, and MAX_MODEL_POLICY_SOURCE_ROWS = 512 cannot bind on
+    # a list already at that ceiling -- so this ingestion refused nothing at
+    # all. Published as a single `absent_routes` figure, the Webview named
+    # this module's discovery bound as the cause, and an owner raising that
+    # limit would have recovered none of the rows. The producer's share is
+    # marked instead, as a strict subset of the same deduped population and
+    # never as a second count beside it.
     repo = tmp_path / "repo"
     repo.mkdir()
     task_store.initialize_repository(repo)
-    identities = [f"opencode/model-{index:03d}" for index in range(200)]
+    cap = dashboard_mcp_app.OPENCODE_UPSTREAM_IDENTITY_CEILING
+    identities = [f"opencode/model-{index:04d}" for index in range(cap + 8)]
     identities.append("xai/grok-4.6")
 
     catalog, discovered = _declared_route_view(repo, monkeypatch, identities)
@@ -2970,28 +2981,30 @@ def test_ceiling_represents_each_group_with_a_reserved_row_it_already_holds():
 def test_capped_producer_past_the_recovery_window_reports_a_floor(
     tmp_path, monkeypatch
 ):
-    # The 201-identity case above recovers the producer's entire input, so its
-    # total is a measurement and ``total_is_lower_bound`` is False -- that test
-    # is this one's control. The recovery is itself bounded, though:
-    # _opencode_offered_identities reads the snapshot only as far as
-    # MAX_MODEL_POLICY_SOURCE_ROW_CEILING. A host listing more than that trips
-    # the producer's 64-row cap AND leaves a tail past the recovery window, so
-    # the identities named here are a subset of what the host offered and a
-    # total counted over them is a floor. Detecting the producer's cap and then
-    # publishing an exact count over a population nobody here has seen is the
-    # same understatement the detection exists to remove, one layer in.
+    # The cap-plus-one-identity case above recovers the producer's entire
+    # input, so its total is a measurement and ``total_is_lower_bound`` is
+    # False -- that test is this one's control. The recovery is itself
+    # bounded, though: _opencode_offered_identities reads the snapshot only
+    # as far as MAX_MODEL_POLICY_SOURCE_ROW_CEILING. A host listing more than
+    # that trips the producer's own row cap AND leaves a tail past the
+    # recovery window, so the identities named here are a subset of what the
+    # host offered and a total counted over them is a floor. Detecting the
+    # producer's cap and then publishing an exact count over a population
+    # nobody here has seen is the same understatement the detection exists to
+    # remove, one layer in.
     repo = tmp_path / "repo"
     repo.mkdir()
     task_store.initialize_repository(repo)
+    cap = dashboard_mcp_app.OPENCODE_UPSTREAM_IDENTITY_CEILING
     window = dashboard_mcp_app.MAX_MODEL_POLICY_SOURCE_ROW_CEILING
     identities = [
-        f"opencode/model-{index:04d}" for index in range(window + 64)
+        f"opencode/model-{index:04d}" for index in range(window + cap)
     ]
     # The enabled route sits past the producer's cap but inside the window the
     # recovery can still read, so it arrives as a named refused identity rather
     # than as part of the unseen tail. The tail is what makes the total a floor;
     # this row is what shows the floor cost the owner no control.
-    identities[100] = "xai/grok-4.6"
+    identities[cap] = "xai/grok-4.6"
 
     catalog, discovered = _declared_route_view(repo, monkeypatch, identities)
 
@@ -3161,37 +3174,47 @@ def test_opencode_snapshot_at_the_producer_slice_reports_a_floor(
     tmp_path, monkeypatch
 ):
     # The other real producer cap, on the path where the snapshot carries the
-    # host's own list: repo_policy slices provider_observed_models at 128. The
-    # parser then cuts that to 64, so the identities between the two caps are
-    # recoverable and exact while anything past 128 is unseen -- and both facts
-    # are published at once. The recovery is not weakened by the floor, and the
-    # floor is not quietly filled in by the recovery.
+    # host's own list: repo_policy slices provider_observed_models at 128.
+    # NF-2026-01454 raised the parser's own row cap past that slice, so the
+    # parser now reads a 128-identity snapshot whole instead of cutting it
+    # further -- there is no local tail left for the recovery to find. The
+    # slice is still a second, independent producer's ceiling though, and a
+    # snapshot landing exactly on it may have cut a tail of the HOST's list
+    # before the parser ever saw it, so the total still has to be published
+    # as a floor. Reading the slice whole does not turn its own length into a
+    # measurement.
     repo = tmp_path / "repo"
     repo.mkdir()
     task_store.initialize_repository(repo)
     parser_cap = dashboard_mcp_app.OPENCODE_UPSTREAM_IDENTITY_CEILING
     slice_cap = 128
     identities = [f"opencode/model-{index:03d}" for index in range(slice_cap)]
-    # Past the parser's cap and inside the slice, so it arrives as a named
-    # refused identity rather than as part of the tail nobody here can see.
+    # Inside the slice and inside the parser's (now larger) cap, so it is
+    # read as an ordinary discovered identity -- the point of this test is
+    # the floor on the SLICE itself, not a parser cut that no longer happens
+    # here.
     identities[100] = "xai/grok-4.6"
 
     catalog, discovered = _declared_route_view(repo, monkeypatch, identities)
 
-    # The premises, again stated rather than assumed.
-    assert len(discovered) == parser_cap
+    # The premises, again stated rather than assumed: the slice sits beneath
+    # the parser's own cap, so it survives whole, yet it is still exactly at
+    # the readiness path's own ceiling.
+    assert slice_cap < parser_cap
+    assert len(discovered) == slice_cap
     assert slice_cap in dashboard_mcp_app.OPENCODE_UPSTREAM_OFFERED_CEILINGS
     assert slice_cap < dashboard_mcp_app.MAX_MODEL_POLICY_SOURCE_ROW_CEILING
 
     source = catalog["opencode_source"]
-    # Everything the slice carried, which is more than the parser delivered ...
+    # The parser's own cap never bound here, so there is nothing left for the
+    # recovery to add back on top of what it already read.
     assert source["total"] == slice_cap
-    assert source["delivered"] == parser_cap
-    assert source["upstream_refused"] == slice_cap - parser_cap
+    assert source["delivered"] == slice_cap
+    assert source["upstream_refused"] == 0
     assert source["truncated"] is True
-    # ... and still a floor, because the slice that carried it may have cut a
-    # tail of its own. An exact recovery inside a bounded window does not make
-    # the window's own length a measurement of the host.
+    # ... and still a floor: the slice that carried it may have cut a tail of
+    # its own, and reading that slice whole does not make its own length a
+    # measurement of the host.
     assert source["total_is_lower_bound"] is True
 
     counts = {entry["provider"]: entry for entry in catalog["provider_counts"]}
@@ -3205,11 +3228,13 @@ def test_opencode_snapshot_at_the_producer_slice_reports_a_floor(
     assert row["provider"] == "opencode"
     assert row["catalog_enabled"] is True
     assert row["effective_enabled"] is True
-    # Named by the source that did offer it rather than labelled as a route no
-    # host has: the floor is about the tail, not about this row.
-    assert row["source_truncated"] is True
     assert row["discovered_from_opencode"] is True
+    # The parser reads the whole slice now, so this route arrives through
+    # ordinary discovery rather than through a locally dropped tail -- unlike
+    # the recovery-window case above, there is no local cut here for
+    # ``source_truncated`` to name.
     assert row.get("declared_only") is not True
+    assert row.get("source_truncated") is not True
 
 
 # ---------------------------------------------------------------------------

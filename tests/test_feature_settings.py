@@ -172,8 +172,20 @@ def test_dashboard_exposes_and_updates_repository_model_policy(
     assert model_policy["revision"] == 0
     assert model_policy["configured"] is False
     assert model_policy["catalog"]["workers"]
+    # NF-2026-01454's two OpenCode seed rows (opencode-go/grok-4.6,
+    # opencode-go/muse-spark-1.3-contributor) are vetted, paid identities, not
+    # the generic ``opencode/*-free`` form model_settings default-enables, so
+    # they stay off until an owner explicitly opts in -- same as any other
+    # non-free OpenCode route. Every OTHER worker here has no such carve-out.
+    seed_opencode_models = {
+        row["model"]
+        for row in dashboard_mcp_app.workforce_catalog.DEFAULT_WORKERS
+        if row["adapter_id"] == "opencode_cli"
+    }
     assert all(
-        row["effective_enabled"] for row in model_policy["catalog"]["workers"]
+        row["effective_enabled"]
+        for row in model_policy["catalog"]["workers"]
+        if row["model"] not in seed_opencode_models
     )
     assert model_policy["catalog"]["discovered_model_count"] == 2
     copilot_models = {

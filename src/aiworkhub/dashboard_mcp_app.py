@@ -261,7 +261,7 @@ MAX_MODEL_POLICY_DECLARED_LEAVES = 1024
 # The two discovery boundaries this module reads are already bounded by their
 # own producers, and neither publishes a total beside the list it returns. So
 # the ingestion bounds below could not bind on them at all: 512 never binds on
-# a list a producer already cut to 64 or 128, which made the bound's own
+# a list a producer already cut to 256 or 128, which made the bound's own
 # ``truncated`` signal unable to fire and published the survivors' count as the
 # host's total. A provider was therefore understated, and a configured route
 # the producer had omitted was labelled as one no source ever offered.
@@ -271,14 +271,15 @@ MAX_MODEL_POLICY_DECLARED_LEAVES = 1024
 # evidence that an upstream bound bound, never to re-impose one here. A list
 # that comes back at its producer's ceiling is a list whose tail is unknown,
 # and that is what gets published rather than a total this module cannot see.
-OPENCODE_UPSTREAM_IDENTITY_CEILING = 64
+OPENCODE_UPSTREAM_IDENTITY_CEILING = workforce_catalog.OPENCODE_MODELS_MAX_ROWS
 EDITOR_UPSTREAM_MODEL_CEILING = 128
 
 # The OpenCode snapshot this module RECOVERS is bounded by its own producer too,
 # and not by the generic source ceiling above. ``repo_policy`` publishes
 # ``provider_observed_models`` either as ``parse_opencode_models_output``'s
-# 64-row read of ``opencode models`` or as a 128-row slice of the host's
-# observed list, so a recovered list can never reach
+# row read of ``opencode models``, bounded by that same
+# ``workforce_catalog.OPENCODE_MODELS_MAX_ROWS`` cap, or as a 128-row slice of
+# the host's observed list, so a recovered list can never reach
 # MAX_MODEL_POLICY_SOURCE_ROW_CEILING: a floor tested against that number was
 # unreachable outside a synthetic snapshot, and an at-cap host therefore
 # published its recovered length as an exact total -- the same understatement
@@ -290,6 +291,7 @@ OPENCODE_UPSTREAM_OFFERED_CEILINGS = (
     # module the producer's identity ceiling bound.
     OPENCODE_UPSTREAM_IDENTITY_CEILING,
     # The readiness path: repo_policy's slice of the host's observed list.
+    # Now the smaller of the two caps, since the CLI path's cap was raised.
     128,
 )
 
@@ -960,19 +962,27 @@ def _bounded_opencode_identities(
     #
     # Which lengths mean "cut" comes from the producer that WROTE this
     # snapshot, not from the ceiling this module happens to read it through.
-    # repo_policy publishes it as the parser's 64-row read or as a 128-row
-    # slice of the host's observed list, so it can never reach
-    # MAX_MODEL_POLICY_SOURCE_ROW_CEILING: tested against that number alone the
-    # floor was unreachable in production, and an at-cap host published its
-    # recovered length as an exact total. The recovery ceiling is still checked
-    # below it, because a snapshot read only that far has an unseen tail for
-    # this module's own reason, while a list longer than both producer caps was
-    # cut by neither and stays a measurement.
+    # repo_policy publishes it as the parser's row read, bounded by its own
+    # (now larger) row cap, or as a 128-row slice of the host's observed
+    # list, so it can never reach MAX_MODEL_POLICY_SOURCE_ROW_CEILING: tested
+    # against that number alone the floor was unreachable in production, and
+    # an at-cap host published its recovered length as an exact total. The
+    # recovery ceiling is still checked below it, because a snapshot read
+    # only that far has an unseen tail for this module's own reason, while a
+    # list longer than both producer caps was cut by neither and stays a
+    # measurement.
     offered_count = len(offered)
-    upstream_ceiling_bound = producer_capped and (
-        not offered
-        or offered_count in OPENCODE_UPSTREAM_OFFERED_CEILINGS
+    # A snapshot can sit exactly at a producer's own ceiling even when this
+    # module's parser cap is now large enough to read it whole: the parser's
+    # cap and repo_policy's 128-row readiness slice are two DIFFERENT
+    # producers, and either one landing on its own ceiling leaves an unseen
+    # tail regardless of whether entries/this parse needed to cut anything.
+    snapshot_at_producer_ceiling = bool(offered) and (
+        offered_count in OPENCODE_UPSTREAM_OFFERED_CEILINGS
         or offered_count >= MAX_MODEL_POLICY_SOURCE_ROW_CEILING
+    )
+    upstream_ceiling_bound = (
+        (producer_capped and not offered) or snapshot_at_producer_ceiling
     )
     return _bounded_identity_ingestion(
         entries,

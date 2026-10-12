@@ -4046,7 +4046,12 @@ def test_model_policy_exposes_opencode_identities_from_catalog_preflight(
     ]
     assert viewed["catalog"]["opencode_discovered_model_count"] >= 2
     assert policy_models
-    assert set(policy_models) == set(catalog_models)
+    seed_opencode_models = {
+        row["model"]
+        for row in workforce_catalog.DEFAULT_WORKERS
+        if row["adapter_id"] == "opencode_cli"
+    }
+    assert set(policy_models) == set(catalog_models) | seed_opencode_models
     assert "opencode/glm-4.5-free" in policy_models
     assert "openai/gpt-4o" in policy_models
     assert listing_calls == []
@@ -4127,7 +4132,12 @@ def test_settings_view_uses_shared_catalog_preflight_without_hook_patch(
         if row.get("discovered_from_opencode") or row.get("adapter") == "opencode_cli"
     ]
     assert viewed["catalog"]["opencode_discovered_model_count"] == len(catalog_models)
-    assert set(policy_models) == set(catalog_models)
+    seed_opencode_models = {
+        row["model"]
+        for row in workforce_catalog.DEFAULT_WORKERS
+        if row["adapter_id"] == "opencode_cli"
+    }
+    assert set(policy_models) == set(catalog_models) | seed_opencode_models
     assert "opencode/glm-4.5-free" in policy_models
     assert "openai/gpt-4o" in policy_models
     assert listing_calls == []
