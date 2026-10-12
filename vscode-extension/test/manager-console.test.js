@@ -34,6 +34,7 @@ function load(events = []) {
   elements.managerChatHairline.children.push(fakeElement("span"));
   const opened = [];
   const frames = [];
+  const posted = [];
   elements.managerChatAnnouncer = fakeElement("div");
   elements.managerChatLatest = fakeElement("button");
   const context = {
@@ -45,7 +46,12 @@ function load(events = []) {
     state: { managerChatEvents: events, managerChatSession: "mls-fixture", managerChatRunning: false },
     elements,
     requestTaskDetail: (id) => opened.push(id),
-    window: { requestAnimationFrame: (fn) => { frames.push(fn); return frames.length; } },
+    vscode: { postMessage: (message) => posted.push(message) },
+    window: {
+      requestAnimationFrame: (fn) => { frames.push(fn); return frames.length; },
+      setTimeout: () => 0,
+      clearTimeout: () => {},
+    },
     Date,
   };
   vm.createContext(context);
@@ -58,7 +64,7 @@ function load(events = []) {
     slice(appSource, "function limitText(value, maxLength = 120) {", "return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}...`;\n}"),
   ].join("\n");
   vm.runInContext(`${utilities}\n${consoleSource}\nthis.api = { managerChatEventNode, renderManagerChatEvents, managerConsoleMergeCommands, managerConsoleMergeTools, managerConsoleCompact, managerConsoleFooterText, managerConsoleTaskOf, managerConsoleApplyHairline, managerConsoleMarkdown, managerConsolePartialNodes, managerConsoleScheduleRender };`, context);
-  return { api: context.api, elements, opened, frames, state: context.state };
+  return { api: context.api, elements, opened, frames, posted, state: context.state };
 }
 
 function flat(node, out = []) {
@@ -388,4 +394,39 @@ test("partial outlives a mid-turn assistant message and rejects a finished turn 
   assert.ok(api.managerConsolePartialNodes({ turn: 3, text: "next" }).length > 0);
   state.managerChatEvents.push({ seq: 3, turn: 3, type: "turn_end", payload: {} });
   assert.equal(api.managerConsolePartialNodes({ turn: 3, text: "stale" }).length, 0);
+});
+
+test("assistant_text and user_message bubbles each have a copy button that posts the raw text", () => {
+  const { api, posted } = load();
+  const assistantNode = api.managerChatEventNode({ type: "assistant_text", payload: { text: "**bold** plan" } });
+  const assistantCopy = flat(assistantNode).find((n) => n.tag === "button" && n.className === "mc-copy");
+  assert.ok(assistantCopy);
+  assistantCopy.listeners.click[0]();
+  const userNode = api.managerChatEventNode({ type: "user_message", payload: { text: "go now" } });
+  const userCopy = flat(userNode).find((n) => n.tag === "button" && n.className === "mc-copy");
+  assert.ok(userCopy);
+  userCopy.listeners.click[0]();
+  assert.deepEqual(JSON.parse(JSON.stringify(posted)), [
+    { type: "copyText", text: "**bold** plan" },
+    { type: "copyText", text: "go now" },
+  ]);
+});
+
+test("a task node's copy button posts the id, title and status", () => {
+  const { api, posted } = load();
+  const output = [{ type: "text", text: JSON.stringify({ task_id: "T-2026-00099", status: "review", title: "Ship it" }) }];
+  const node = api.managerChatEventNode({ type: "tool_result", payload: { call_id: "m2", name: "aiworkhub_task_show", output, is_error: false } });
+  const copyButton = flat(node).find((n) => n.tag === "button" && n.className === "mc-copy");
+  assert.ok(copyButton);
+  copyButton.listeners.click[0]();
+  assert.deepEqual(JSON.parse(JSON.stringify(posted)), [{ type: "copyText", text: "T-2026-00099 — Ship it (review)" }]);
+});
+
+test("extension.js allowlists copyText and its handler refuses a non-string", () => {
+  const extensionSource = fs.readFileSync(path.join(__dirname, "..", "extension.js"), "utf8");
+  const allowlist = slice(extensionSource, "const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([", "\"requestStorageCleanup\",");
+  assert.ok(allowlist.includes("\"copyText\","));
+  const handler = slice(extensionSource, "case \"copyText\": {", "break;\n    }");
+  assert.ok(handler.includes("typeof text !== \"string\""));
+  assert.ok(handler.includes("copy_text_invalid"));
 });

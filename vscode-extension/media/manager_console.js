@@ -22,7 +22,9 @@ function managerChatEventNode(event) {
     // The log records only how many images the owner attached, never the image.
     const images = type === "user_message" ? numberValue(payload.images) : 0;
     if (images > 0) bubble.appendChild(createElement("span", "manager-chat-bubble-images", managerChatImageCount(images)));
-    return managerConsoleBlock(type, bubble);
+    const block = managerConsoleBlock(type, bubble);
+    block.appendChild(managerConsoleCopyButton(() => String(payload.text || "")));
+    return block;
   }
   if (type === "tool_call") {
     const name = String(payload.name || payload.tool || "tool");
@@ -207,6 +209,22 @@ function managerConsoleShowAll(label, onClick) {
   return button;
 }
 
+function managerConsoleCopyButton(getText) {
+  const button = createElement("button", "mc-copy", "Copy");
+  button.type = "button";
+  button.setAttribute("aria-label", "Copy");
+  button.setAttribute("title", "Copy");
+  let resetHandle = null;
+  button.addEventListener("click", () => {
+    const text = String(getText() || "");
+    vscode.postMessage({ type: "copyText", text });
+    button.textContent = "Copied";
+    if (resetHandle) window.clearTimeout(resetHandle);
+    resetHandle = window.setTimeout(() => { button.textContent = "Copy"; }, 1500);
+  });
+  return button;
+}
+
 function managerConsoleMergeCommands(events) {
   const latest = new Map();
   for (const event of events) {
@@ -335,7 +353,14 @@ function managerConsoleTaskNode(task, detail) {
   if (task.status) body.appendChild(createElement("span", "status-badge " + task.status, task.status));
   if (task.title) body.appendChild(createElement("span", "mc-task-title", task.title));
   if (detail) body.appendChild(detail);
-  return managerConsoleBlock("task", body);
+  const block = managerConsoleBlock("task", body);
+  block.appendChild(managerConsoleCopyButton(() => {
+    let text = String(task.id || "");
+    if (task.title) text += " — " + task.title;
+    if (task.status) text += " (" + task.status + ")";
+    return text;
+  }));
+  return block;
 }
 
 function managerConsoleCompact(value) {

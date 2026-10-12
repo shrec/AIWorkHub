@@ -363,6 +363,7 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
   "requestLiveOutput",
   "clearSystemLogs",
   "copySystemLogs",
+  "copyText",
   "requestMemory",
   "requestSessions",
   "requestKb",
@@ -11210,6 +11211,19 @@ function handleInboundMessage(view, message) {
         view.postMessage({ type: OUTBOUND_TYPES.notification, message: "System log copied" });
       }).catch(() => {
         view.postMessage({ type: OUTBOUND_TYPES.error, message: "system_log_copy_failed" });
+      });
+      break;
+    }
+    case "copyText": {
+      const text = message.text;
+      if (typeof text !== "string" || text.length > 1000000) {
+        view.postMessage({ type: OUTBOUND_TYPES.error, message: "copy_text_invalid" });
+        break;
+      }
+      Promise.resolve(vscode.env.clipboard.writeText(text)).then(() => {
+        view.postMessage({ type: OUTBOUND_TYPES.notification, message: "Copied" });
+      }).catch(() => {
+        view.postMessage({ type: OUTBOUND_TYPES.error, message: "copy_text_failed" });
       });
       break;
     }
