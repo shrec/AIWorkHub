@@ -54,6 +54,7 @@ LAUNCH_ISOLATED_SEAM_NAMES: tuple[str, ...] = (
     "_LiveProcess",
     "_ReviewerReservationTerminalized",
     "_VSCODE_LM_IN_PROCESS_ADAPTERS",
+    "_appcontainer_supervisor_env",
     "_appcontainer_supervisor_identity",
     "_bounded_launch_diagnostic",
     "_committed_claim_card",
@@ -280,6 +281,7 @@ def launch_isolated(
     _LiveProcess = _pl._LiveProcess
     _ReviewerReservationTerminalized = _pl._ReviewerReservationTerminalized
     _VSCODE_LM_IN_PROCESS_ADAPTERS = _pl._VSCODE_LM_IN_PROCESS_ADAPTERS
+    _appcontainer_supervisor_env = _pl._appcontainer_supervisor_env
     _bounded_launch_diagnostic = _pl._bounded_launch_diagnostic
     _committed_claim_card = _pl._committed_claim_card
     _enforce_quality_review_launch_binding = _pl._enforce_quality_review_launch_binding
@@ -1022,15 +1024,10 @@ def launch_isolated(
                 # known-folder APIs inside AppContainer.  Bind it to the
                 # request-local config provisioned above.
                 launch_env["CODEX_HOME"] = str(workspace.home / ".codex")
-            if sandbox_backend == "windows_appcontainer" and os.environ.get(
-                "LOCALAPPDATA"
-            ):
-                # Measured: with USERPROFILE isolated, the supervisor's
-                # known-folder fallback expands inside the isolated home and
-                # fails, so the child gets no LOCALAPPDATA and CreateProcessW
-                # refuses it with ERROR_ENVVAR_NOT_FOUND (203).  Hand the real
-                # path over like HOME and TMP; it names a path, grants nothing.
-                launch_env["LOCALAPPDATA"] = os.environ["LOCALAPPDATA"]
+            if sandbox_backend == "windows_appcontainer":
+                # NF-2026-01484: hand the supervisor's own LOCALAPPDATA/APPDATA
+                # to the child; see _appcontainer_supervisor_env for why.
+                _appcontainer_supervisor_env(launch_env)
             worker_argv = sandbox_argv(
                 workspace,
                 adapter_id,

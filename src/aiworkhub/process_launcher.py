@@ -206,6 +206,7 @@ from . import reviewer_prewarm_capacity
 from . import reviewer_reservation_recovery
 from . import terminal_authority
 from . import vscode_lm_bridge
+from . import windows_appcontainer
 # The worker-output semantic-edit evidence subject moved to
 # ``semantic_edit_evidence`` unchanged; re-imported under the original names so
 # call sites and ``process_launcher.<name>`` readers resolve.
@@ -623,6 +624,25 @@ def worker_launch_env(
         # this backend -- every other backend's environment is byte-identical.
         env.update(build_tool_env(env, appcontainer=True))
     return env
+
+
+def _appcontainer_supervisor_env(launch_env: dict[str, str]) -> None:
+    """Hand the supervisor's own LOCALAPPDATA/APPDATA to an AppContainer child.
+
+    NF-2026-01484: with USERPROFILE isolated to the request HOME, the
+    known-folder fallback inside the child expands under that HOME and
+    resolves to "" on first launch, or to a root inside HOME once a prior
+    attempt created it -- which ``_sensitive_roots`` then refuses to grant.
+    Hand over the supervisor's own values unconditionally so first launch and
+    the Claude auth retry agree; an unresolvable value is simply omitted and
+    this never raises.
+    """
+    local_appdata = windows_appcontainer.resolve_local_appdata()
+    if local_appdata:
+        launch_env["LOCALAPPDATA"] = local_appdata
+    roaming_appdata = windows_appcontainer.resolve_roaming_appdata()
+    if roaming_appdata:
+        launch_env["APPDATA"] = roaming_appdata
 
 
 def _worker_supervisor_script() -> Path:
@@ -9952,8 +9972,8 @@ class ProcessManager:
                 isolated_task_queue_db=True,
                 sandbox_backend=sandbox_backend,
             )
-            if sandbox_backend == "windows_appcontainer" and os.environ.get("LOCALAPPDATA"):
-                launch_env["LOCALAPPDATA"] = os.environ["LOCALAPPDATA"]
+            if sandbox_backend == "windows_appcontainer":
+                _appcontainer_supervisor_env(launch_env)
             try:
                 process = _spawn_with_stdin_payload(
                     self._popen,

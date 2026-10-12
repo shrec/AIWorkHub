@@ -1264,6 +1264,7 @@ def appcontainer_worker_kind(adapter_id: str) -> str:
 
 
 _LOCAL_APPDATA_ENV = "LOCALAPPDATA"
+_ROAMING_APPDATA_ENV = "APPDATA"
 
 
 class _KnownFolderId(ctypes.Structure):
@@ -1345,6 +1346,24 @@ def resolve_local_appdata() -> str:
         return ""
 
 
+def resolve_roaming_appdata() -> str:
+    """Return this user's RoamingAppData directory, or ``""`` if unresolvable.
+
+    Mirrors :func:`resolve_local_appdata`: the process environment is
+    preferred over the known-folder API, which the sanitized supervisor
+    environment falls back to for the real directory.
+    """
+    value = os.environ.get(_ROAMING_APPDATA_ENV, "").strip()
+    if value:
+        return value
+    if os.name != "nt":
+        return ""
+    try:
+        return _known_folder_path(_FOLDERID_ROAMING_APPDATA)
+    except (OSError, AttributeError, ValueError):
+        return ""
+
+
 def _token_profile_directory() -> str:
     """The REAL user's profile root, from the process token.
 
@@ -1411,9 +1430,9 @@ def _sensitive_roots() -> tuple[list[str], list[str]]:
     """
     if os.name != "nt":
         return [], []
+    roaming = resolve_roaming_appdata()
     try:
         profile = _token_profile_directory()
-        roaming = _known_folder_path(_FOLDERID_ROAMING_APPDATA)
         system = [
             _known_folder_path(_FOLDERID_PROGRAM_FILES),
             _known_folder_path(_FOLDERID_PROGRAM_FILES_X86),

@@ -1721,6 +1721,214 @@ def test_claude_auth_retry_stops_when_host_refresh_is_not_launchable(
     ) is None
 
 
+def _run_windows_appcontainer_auth_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    local_appdata: str,
+    roaming_appdata: str,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    """Drive ``_retry_claude_auth_refresh`` for ``windows_appcontainer`` and
+    return the captured ``Popen`` calls plus the finalizer's returned event.
+
+    NF-2026-01484: the retry must hand the child LOCALAPPDATA/APPDATA from
+    the same resolvers the first launch uses, never from ``os.environ``
+    directly -- so the resolvers are stubbed here and the ambient process
+    environment is left alone.
+    """
+    request_id = "r" * 32
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source_home = tmp_path / "source-home"
+    source_claude = source_home / ".claude"
+    source_claude.mkdir(parents=True, mode=0o700)
+    (source_claude / ".credentials.json").write_text(
+        '{"token":"fresh-host-token"}\n', encoding="utf-8"
+    )
+    workspace_root = tmp_path / "workspace"
+    worktree = workspace_root / "worktree"
+    home = workspace_root / "home"
+    worktree.mkdir(parents=True)
+    home.mkdir(mode=0o700)
+    (home / "tmp").mkdir(mode=0o700)
+    monkeypatch.setenv("HOME", str(source_home))
+    monkeypatch.setenv(process_launcher.ALLOW_LAUNCH_ENV, "1")
+    monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
+    monkeypatch.setenv(worker_workspace.SANDBOX_BACKEND_ENV, "windows_appcontainer")
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id=request_id,
+        repo=repo,
+        path=worktree,
+        home=home,
+        allowed_writes=("out/result.txt",),
+        parent_baseline={},
+        workspace_baseline={},
+        tree_baseline={},
+        base_oid="a" * 40,
+    )
+    process_dir = tmp_path / "processes"
+    process_dir.mkdir()
+    metadata_path = process_dir / f"{request_id}.request.json"
+    status_path = process_dir / f"{request_id}.supervisor.json"
+    stdout_path = process_dir / f"{request_id}.stdout.log"
+    stderr_path = process_dir / f"{request_id}.stderr.log"
+    cancel_path = process_dir / f"{request_id}.cancel.json"
+    worker_argv = [sys.executable, "-c", "print('same prompt')"]
+    stdin_payload = b"same prompt"
+    (process_dir / f"{request_id}.prompt").write_bytes(stdin_payload)
+    worker_workspace.write_json_0600(
+        process_dir / f"{request_id}.relaunch-spec.json",
+        {"argv": worker_argv, "stdin_text_bytes": len(stdin_payload)},
+    )
+    metadata = {
+        "stdin_payload_sha256": hashlib.sha256(stdin_payload).hexdigest(),
+        "request_id": request_id,
+        "task_id": "TASK_AC1",
+        "runner": "claude_worker_ac1",
+        "topic": "task_mcp",
+        "adapter_id": "claude_cli",
+        "model": None,
+        "timeout_seconds": 30,
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+        "supervisor_status_path": str(status_path),
+        "cancel_path": str(cancel_path),
+        "worker_argv": worker_argv,
+        "worker_cwd": str(worktree),
+        "prompt_sha256": "b" * 64,
+        "sandbox_backend": "windows_appcontainer",
+        "workspace": workspace.as_metadata(),
+    }
+    worker_workspace.write_json_0600(metadata_path, metadata)
+    manager = process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=process_dir,
+    )
+    popen_calls: list[dict[str, object]] = []
+    delivered = bytearray()
+
+    def fake_popen(argv, **kwargs):
+        popen_calls.append({"argv": list(argv), **kwargs})
+        return SimpleNamespace(pid=4242, stdin=SimpleNamespace(
+            write=delivered.extend, flush=lambda: None, close=lambda: None,
+        ))
+
+    monkeypatch.setattr(manager, "_popen", fake_popen)
+    monkeypatch.setattr(manager, "_monitor", lambda live: None)
+    monkeypatch.setattr(process_launcher, "_pid_start_ticks", lambda _pid: 17)
+    monkeypatch.setattr(process_launcher, "build_tool_env", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        process_launcher.windows_appcontainer,
+        "resolve_local_appdata",
+        lambda: local_appdata,
+    )
+    monkeypatch.setattr(
+        process_launcher.windows_appcontainer,
+        "resolve_roaming_appdata",
+        lambda: roaming_appdata,
+    )
+    monkeypatch.setattr(
+        process_launcher.claude_auth,
+        "refresh_subscription_session_for_retry",
+        lambda: {"launchable": True},
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_worker_supervisor_script",
+        lambda: Path(process_launcher.__file__),
+    )
+
+    class FakeThread:
+        # Unlike a thread skipped by name, every target here runs for real --
+        # including the monitor, which this fixture neuters separately -- so
+        # it must see its exact args/kwargs the way a real thread would.
+        def __init__(self, target=None, args=(), kwargs=None, name=None, **_kwargs):
+            self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
+
+        def start(self) -> None:
+            if self._target is not None:
+                self._target(*self._args, **self._kwargs)
+
+        def join(self, timeout=None) -> None:
+            pass
+
+        def is_alive(self) -> bool:
+            return False
+
+    monkeypatch.setattr(process_launcher.threading, "Thread", FakeThread)
+
+    event = manager._retry_claude_auth_refresh(
+        request_id=request_id,
+        metadata_path=metadata_path,
+        metadata=metadata,
+        workspace=workspace,
+        provider_launch_failure={
+            "http_status": 401,
+            "error_code": "authentication_failed",
+            "session_id": "session-1",
+        },
+    )
+    assert event is not None
+    assert len(popen_calls) == 1
+    return popen_calls, event
+
+
+def test_claude_auth_retry_appcontainer_env_gets_localappdata_and_appdata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    popen_calls, _event = _run_windows_appcontainer_auth_retry(
+        monkeypatch,
+        tmp_path,
+        local_appdata=r"C:\Real\Local",
+        roaming_appdata=r"C:\Real\Roaming",
+    )
+    env = popen_calls[0]["env"]
+    assert env["LOCALAPPDATA"] == r"C:\Real\Local"
+    assert env["APPDATA"] == r"C:\Real\Roaming"
+
+
+def test_claude_auth_retry_appcontainer_spawns_even_when_both_are_unresolvable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    popen_calls, event = _run_windows_appcontainer_auth_retry(
+        monkeypatch,
+        tmp_path,
+        local_appdata="",
+        roaming_appdata="",
+    )
+    env = popen_calls[0]["env"]
+    assert "LOCALAPPDATA" not in env
+    assert "APPDATA" not in env
+    assert event["state"] == "running"
+
+
+def test_claude_auth_retry_appcontainer_env_matches_the_single_helper(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """First launch (``launch_isolated``) and the auth retry both bind the
+    exact same ``_appcontainer_supervisor_env`` free variable from
+    ``process_launcher``, so the retry's env can never diverge from what a
+    direct call to that one helper produces.
+    """
+    popen_calls, _event = _run_windows_appcontainer_auth_retry(
+        monkeypatch,
+        tmp_path,
+        local_appdata=r"C:\Real\Local",
+        roaming_appdata=r"C:\Real\Roaming",
+    )
+    direct_env: dict[str, str] = {}
+    process_launcher._appcontainer_supervisor_env(direct_env)
+    env = popen_calls[0]["env"]
+    assert env["LOCALAPPDATA"] == direct_env["LOCALAPPDATA"]
+    assert env["APPDATA"] == direct_env["APPDATA"]
+
+
 def test_success_status_does_not_promote_after_exact_claim_ownership_is_lost(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

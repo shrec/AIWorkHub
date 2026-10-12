@@ -1995,6 +1995,16 @@ def test_resolve_local_appdata_fails_soft_when_the_lookup_breaks(monkeypatch):
     assert wac.resolve_local_appdata() == ""
 
 
+def test_resolve_roaming_appdata_prefers_the_process_environment(monkeypatch):
+    monkeypatch.setenv("APPDATA", r"C:\FromEnv")
+    monkeypatch.setattr(
+        wac,
+        "_known_folder_path",
+        lambda _folder: pytest.fail("known-folder lookup must not run when env has it"),
+    )
+    assert wac.resolve_roaming_appdata() == r"C:\FromEnv"
+
+
 def test_launch_hands_a_sanitized_child_environment_localappdata(monkeypatch):
     monkeypatch.setattr(
         wac, "resolve_local_appdata", lambda: r"C:\Users\u\AppData\Local"
@@ -2393,6 +2403,30 @@ def test_protected_trees_come_from_the_token_not_the_request_env(
         launch_appcontainer(make_request(filesystem_grants=[grant]), api=fake)
     assert "protected tree" in excinfo.value.detail
     assert fake.events == []
+
+
+@requires_host_win32_privileges
+@pytest.mark.skipif(os.name != "nt", reason="resolves real Windows locations")
+def test_sensitive_roots_roaming_never_resolves_inside_an_isolated_home(
+    tmp_path, monkeypatch
+):
+    """NF-2026-01484: the supervisor runs with USERPROFILE pointed at the
+    request HOME.  Once attempt 1 has created HOME\\AppData\\Roaming (the
+    Claude auth retry case), the protected list must come from APPDATA, not
+    from a known-folder lookup that expands %USERPROFILE% back into HOME.
+    """
+    home = tmp_path / "home"
+    (home / "AppData" / "Roaming").mkdir(parents=True)
+    real_roaming = tmp_path / "real-roaming"
+    real_roaming.mkdir()
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("APPDATA", str(real_roaming))
+    protected, _system = wac._sensitive_roots()
+    home_norm = os.path.normcase(os.path.normpath(str(home)))
+    assert not any(
+        root == home_norm or root.startswith(home_norm + os.sep)
+        for root in protected
+    )
 
 
 def test_request_scoped_grants_dedupe_and_skip_unset(tmp_path):
@@ -4134,6 +4168,8 @@ _PRIVILEGED_LANE_SKIP_TEST_NAMES = {
     # NF-2026-01039: a real junction and a real DefineDosDeviceW drive.
     "test_a_junction_out_of_the_sandbox_is_refused",
     "test_the_shim_final_path_keeps_the_sandbox_drive_spelling",
+    # NF-2026-01484: the real token profile and known folders.
+    "test_sensitive_roots_roaming_never_resolves_inside_an_isolated_home",
 }
 
 
