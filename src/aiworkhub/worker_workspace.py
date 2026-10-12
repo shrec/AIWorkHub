@@ -4086,6 +4086,7 @@ def provision_opencode_worker_config(
     nothing inherited can widen the exact worker allowlist.  Every refusal
     raises ``OpenCodeWorkerConfigError`` before a provider spawns.
     """
+    from . import opencode_auth
     from . import runtime_adapters
     from . import worker_ai_tools_mcp as mcp
 
@@ -4195,6 +4196,7 @@ def provision_opencode_worker_config(
             runtime_adapters.serialize_opencode_worker_config(config)
         ),
         runtime_adapters.OPENCODE_DISABLE_PROJECT_CONFIG_ENV: "1",
+        **opencode_auth.opencode_go_api_key_env(workspace.home),
     }
 
 
