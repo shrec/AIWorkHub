@@ -102,6 +102,8 @@ function loadHostSlice() {
   // Every gated child this test run spawns, in creation order -- lets tests
   // assert lazy creation, reuse and re-creation-after-dispose by identity.
   const managerLoopClientInstances = [];
+  const warningCalls = [];
+  const warningResponses = [];
 
   class FakeMcpStdioClient {
     constructor(repositoryRoot, outputChannel, repositoryIdentity, claimEpisode, options) {
@@ -129,6 +131,18 @@ function loadHostSlice() {
     McpStdioClient: FakeMcpStdioClient,
     sanitizeWebviewPayload: (value) => value,
     sanitizeErrorMessage: (err) => String((err && err.message) || "mcp_unavailable"),
+    // Confirmation modal: a queued response simulates a dismissed dialog
+    // (undefined); with none queued it auto-confirms with the offered label,
+    // matching how the other managerLoop* host tests exercise the real path.
+    vscode: {
+      window: {
+        showWarningMessage: (message, options, ...actions) => {
+          warningCalls.push({ message, options, actions });
+          const response = warningResponses.length ? warningResponses.shift() : actions[0];
+          return Promise.resolve(response);
+        },
+      },
+    },
   };
   vm.createContext(context);
   vm.runInContext(
@@ -139,6 +153,10 @@ function loadHostSlice() {
   return {
     api: context.api,
     managerLoopClientInstances,
+    warningCalls,
+    queueWarningResponse(value) {
+      warningResponses.push(value);
+    },
     setClient(client) {
       currentClient = client;
     },
@@ -322,6 +340,52 @@ test("managerLoopClose disposes the gated client; the next managerLoopStart spaw
   await flush();
   assert.equal(harness.managerLoopClientInstances.length, 2);
   assert.notEqual(harness.managerLoopClientInstances[1], firstClient);
+});
+
+test("managerLoopClose shows a modal confirmation before closing; a dismissed choice runs nothing", async () => {
+  const harness = loadHostSlice();
+  harness.setClient(makeClient());
+  const view = makeView();
+
+  harness.api.handleInboundMessage(view, { type: "managerLoopStart", backendId: "claude_cli", model: "opus" });
+  await flush();
+  const firstClient = harness.managerLoopClientInstances[0];
+
+  harness.queueWarningResponse(undefined);
+  harness.api.handleInboundMessage(view, { type: "managerLoopClose" });
+  await flush();
+
+  assert.equal(harness.warningCalls.length, 1);
+  assert.equal(harness.warningCalls[0].options.modal, true);
+  assert.equal(firstClient.terminated, false);
+
+  harness.api.handleInboundMessage(view, { type: "managerLoopClose" });
+  await flush();
+  assert.equal(firstClient.terminated, true);
+});
+
+test("managerLoopDelete shows a modal confirmation before discarding; a dismissed choice runs nothing", async () => {
+  const harness = loadHostSlice();
+  harness.setClient(makeClient());
+  const view = makeView();
+  const deleteId = "mls-aaaa1111bbbb2222";
+
+  harness.queueWarningResponse(undefined);
+  harness.api.handleInboundMessage(view, { type: "managerLoopDelete", sessionId: deleteId });
+  await flush();
+
+  assert.equal(harness.warningCalls.length, 1);
+  assert.equal(harness.warningCalls[0].options.modal, true);
+  assert.equal(harness.managerLoopClientInstances.length, 0);
+
+  harness.api.handleInboundMessage(view, { type: "managerLoopDelete", sessionId: deleteId });
+  await flush();
+
+  assert.equal(harness.managerLoopClientInstances.length, 1);
+  assert.deepEqual(
+    plain(harness.managerLoopClientInstances[0].calls.find((call) => call.name === "aiworkhub_manager_loop_discard").args),
+    { session_id: deleteId },
+  );
 });
 
 test("the gated manager loop client is torn down from all three required call sites", () => {
@@ -1378,14 +1442,14 @@ test("loading the sidebar lists every enabled model without opening a dialog", (
   assert.equal(harness.elements.managerChatDialog.showModalCalled, 0, "sidebar load never opens a modal dialog");
 });
 
-test("opening the chat does not attach a saved session or create one", () => {
+test("opening the chat posts exactly one managerLoopRestore and does not attach a session before any reply", () => {
   const harness = loadWebviewSlice();
   harness.state.managerChatSession = "mls-aaaa1111bbbb2222";
   harness.state.managerChatEvents = [{ seq: 2, type: "user_message", payload: { text: "old" } }];
 
   harness.api.startManagerChatSidebar();
 
-  assert.equal(harness.posts.some((post) => post.type === "managerLoopRestore"), false);
+  assert.equal(harness.posts.filter((post) => post.type === "managerLoopRestore").length, 1);
   assert.equal(harness.posts.some((post) => post.type === "managerLoopEnsure"), false);
   assert.deepEqual(plain(harness.posts.find((post) => post.type === "managerLoopStatus")), { type: "managerLoopStatus" });
   assert.equal(harness.state.managerChatSession, null);
@@ -1622,6 +1686,7 @@ test("the Manager panel is a persistent sidebar and reuses existing theme tokens
     "manager-chat-backend",
     "manager-chat-model",
     "manager-chat-rotate",
+    "manager-chat-close",
     "manager-chat-status",
     "manager-chat-transcript",
     "manager-chat-transcript",
@@ -1644,7 +1709,7 @@ test("the Manager panel is a persistent sidebar and reuses existing theme tokens
   assert.ok(shellAt !== -1 && shellAt < columnAt && columnAt < mainEnd && mainEnd < asideAt, "sidebar sits beside the dashboard column");
   assert.doesNotMatch(appSource, /managerChatDialog\.show\(/);
   assert.doesNotMatch(extensionSource, /id="manager-chat-start"/);
-  assert.doesNotMatch(extensionSource, /id="manager-chat-close"/);
+  assert.match(extensionSource, /id="manager-chat-close"/);
   assert.doesNotMatch(appSource, /managerChatDialog\.showModal\(/, "the sidebar never opens a modal dialog");
   assert.match(appSource, /function startManagerChatSidebar\(/);
   assert.match(appSource, /function toggleManagerChatSidebar\(/);
@@ -1828,4 +1893,148 @@ test("five partial provider batches coalesce and render the latest text once", (
   frames[0]();
   assert.equal(writes, 1);
   assert.ok(flattenNodes(box, []).some((node) => node.textContent === "partial 4"));
+});
+
+// ── Restore, Rotate and Close: the panel's own three session controls ───────
+
+test("the extension.js webview HTML carries a disabled #manager-chat-close button next to Rotate", () => {
+  const markup = extensionSource.slice(
+    extensionSource.indexOf('id="manager-chat-rotate"') - 40,
+    extensionSource.indexOf('id="manager-chat-status"'),
+  );
+  assert.match(markup, /<button type="button" id="manager-chat-close" disabled>Close<\/button>/);
+});
+
+test("opening the sidebar posts exactly one managerLoopStatus then one managerLoopRestore", () => {
+  const harness = loadWebviewSlice();
+  harness.posts.length = 0;
+
+  harness.api.startManagerChatSidebar();
+
+  const relevant = harness.posts.filter((post) => post.type === "managerLoopStatus" || post.type === "managerLoopRestore");
+  assert.deepEqual(plain(relevant), [{ type: "managerLoopStatus" }, { type: "managerLoopRestore" }]);
+});
+
+test("a restore reply with a session posts a status refresh and does not force the running flag", () => {
+  const harness = loadWebviewSlice();
+  const sessionId = "mls-" + "c".repeat(32);
+  harness.posts.length = 0;
+
+  harness.api.renderManagerChatAction("restore", { ok: true, session: { session_id: sessionId }, running: false });
+
+  assert.deepEqual(plain(harness.posts), [{ type: "managerLoopStatus" }]);
+  assert.equal(harness.state.managerChatRunning, false);
+});
+
+test("a restore reply with a null session keeps the no-session state", () => {
+  const harness = loadWebviewSlice();
+  harness.posts.length = 0;
+
+  harness.api.renderManagerChatAction("restore", { ok: true, session: null, running: false });
+
+  assert.equal(harness.state.managerChatSession, null);
+  assert.deepEqual(plain(harness.posts), [{ type: "managerLoopStatus" }]);
+});
+
+test("a restore error shows a notice and posts nothing further", () => {
+  const harness = loadWebviewSlice();
+  harness.posts.length = 0;
+
+  harness.api.renderManagerChatAction("restore", { ok: false, error: "manager_loop_unavailable:RuntimeError" });
+
+  assert.equal(harness.elements.managerChatNotice.hidden, false);
+  assert.match(harness.elements.managerChatNotice.textContent, /Manager error/);
+  assert.equal(harness.state.managerChatSession, null);
+  assert.deepEqual(plain(harness.posts), []);
+});
+
+test("Rotate posts the owner-requested reason only when enabled with a session", () => {
+  const harness = loadWebviewSlice();
+  const { elements } = harness;
+  harness.state.managerChatSession = "mls-" + "d".repeat(32);
+  elements.managerChatRotate.disabled = false;
+
+  trigger(elements.managerChatRotate, "click");
+  assert.deepEqual(plain(harness.posts.at(-1)), { type: "managerLoopRotate", reason: "owner_requested" });
+
+  harness.posts.length = 0;
+  elements.managerChatRotate.disabled = true;
+  trigger(elements.managerChatRotate, "click");
+  assert.deepEqual(plain(harness.posts), []);
+
+  harness.posts.length = 0;
+  elements.managerChatRotate.disabled = false;
+  harness.state.managerChatSession = null;
+  trigger(elements.managerChatRotate, "click");
+  assert.deepEqual(plain(harness.posts), []);
+});
+
+test("a rotate reply refreshes status and the current session's events", () => {
+  const harness = loadWebviewSlice();
+  const sessionId = "mls-" + "e".repeat(32);
+  harness.state.managerChatSession = sessionId;
+  harness.state.managerChatLastSeq = 7;
+
+  harness.api.renderManagerChatAction("rotate", { ok: true });
+
+  assert.ok(harness.posts.some((post) => post.type === "managerLoopStatus"));
+  assert.deepEqual(plain(harness.posts.at(-1)), { type: "managerLoopEvents", sessionId, afterSeq: 7 });
+});
+
+test("Close posts managerLoopClose only when enabled with a session; confirmation is host-side", () => {
+  const harness = loadWebviewSlice();
+  const { elements } = harness;
+  harness.state.managerChatSession = "mls-" + "f".repeat(32);
+  elements.managerChatClose.disabled = false;
+
+  harness.window.confirm = () => { throw new Error("webview confirm must not be used"); };
+  trigger(elements.managerChatClose, "click");
+  assert.deepEqual(plain(harness.posts.at(-1)), { type: "managerLoopClose" });
+
+  harness.posts.length = 0;
+  elements.managerChatClose.disabled = true;
+  trigger(elements.managerChatClose, "click");
+  assert.deepEqual(plain(harness.posts), []);
+
+  harness.posts.length = 0;
+  elements.managerChatClose.disabled = false;
+  harness.state.managerChatSession = null;
+  trigger(elements.managerChatClose, "click");
+  assert.deepEqual(plain(harness.posts), []);
+});
+
+test("a close reply returns the panel to the no-session state and refreshes status once", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-" + "a".repeat(32);
+  harness.state.managerChatRunning = true;
+  harness.state.managerChatEvents = [{ seq: 1, turn: 1, type: "user_message", payload: { text: "hi" } }];
+  harness.state.managerChatLastSeq = 1;
+  harness.posts.length = 0;
+
+  harness.api.renderManagerChatAction("close", { ok: true });
+
+  assert.equal(harness.state.managerChatSession, null);
+  assert.equal(harness.state.managerChatRunning, false);
+  assert.equal(harness.state.managerChatEvents.length, 0);
+  assert.equal(harness.state.managerChatLastSeq, 0);
+  assert.deepEqual(plain(harness.posts), [{ type: "managerLoopStatus" }]);
+});
+
+test("applyManagerChatSessionUi enables Close under the same rule as Rotate", () => {
+  const harness = loadWebviewSlice();
+  const { elements, state } = harness;
+
+  state.managerChatSession = null;
+  state.managerChatRunning = false;
+  harness.api.applyManagerChatSessionUi();
+  assert.equal(elements.managerChatClose.disabled, true);
+
+  state.managerChatSession = "mls-" + "b".repeat(32);
+  state.managerChatRunning = true;
+  harness.api.applyManagerChatSessionUi();
+  assert.equal(elements.managerChatClose.disabled, true);
+
+  state.managerChatRunning = false;
+  harness.api.applyManagerChatSessionUi();
+  assert.equal(elements.managerChatClose.disabled, false);
 });

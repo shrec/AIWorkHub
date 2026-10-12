@@ -11451,7 +11451,9 @@ function handleInboundMessage(view, message) {
     case "managerLoopDelete": {
       const deleteId = String(message.sessionId || "");
       if (!MANAGER_SESSION_ID_RE.test(deleteId)) return;
-      runManagerLoopAction(view, "discard", { session_id: deleteId });
+      vscode.window.showWarningMessage("Delete this manager session?", { modal: true }, "Delete").then((choice) => {
+        if (choice === "Delete") runManagerLoopAction(view, "discard", { session_id: deleteId });
+      });
       break;
     }
     case "managerLoopContinue": {
@@ -11519,7 +11521,9 @@ function handleInboundMessage(view, message) {
       runManagerLoopAction(view, "rotate", { reason: String(message.reason || "").slice(0, 1000) });
       break;
     case "managerLoopClose":
-      runManagerLoopAction(view, "close", {});
+      vscode.window.showWarningMessage("Close this manager session?", { modal: true }, "Close").then((choice) => {
+        if (choice === "Close") runManagerLoopAction(view, "close", {});
+      });
       break;
     case "managerLoopStatus":
       pushManagerLoopStatus(view);
@@ -13318,6 +13322,7 @@ function getHtmlForWebview(webview, extensionUri) {
             <option value="max">Max</option>
           </select>
           <button type="button" id="manager-chat-rotate" disabled>Rotate</button>
+          <button type="button" id="manager-chat-close" disabled>Close</button>
           <span class="connection-state" id="manager-chat-status" role="status" aria-live="polite">
             <span class="connection-dot" aria-hidden="true"></span>
             <span id="manager-chat-status-label">Idle</span>

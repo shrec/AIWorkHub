@@ -7530,6 +7530,9 @@ function applyManagerChatSessionUi() {
   if (elements.managerChatRotate) {
     elements.managerChatRotate.disabled = !hasSession || state.managerChatRunning;
   }
+  if (elements.managerChatClose) {
+    elements.managerChatClose.disabled = !hasSession || state.managerChatRunning;
+  }
   if (elements.managerChatNewSession) {
     elements.managerChatNewSession.disabled = state.managerChatRunning;
   }
@@ -7796,6 +7799,16 @@ function renderManagerChatAction(action, payload) {
     );
     return;
   }
+  if (action === "close") {
+    resetManagerChatSession();
+    vscode.postMessage({ type: "managerLoopStatus" });
+    return;
+  }
+  if (action === "restore") {
+    vscode.postMessage({ type: "managerLoopStatus" });
+    showManagerChatNotice(null);
+    return;
+  }
   const sessionId = String(payload && payload.session_id || "");
   if (/^mls-[0-9a-f]{32}$/i.test(sessionId)) {
     if (state.managerChatSession !== sessionId) {
@@ -7809,6 +7822,10 @@ function renderManagerChatAction(action, payload) {
     applyManagerChatSessionUi();
     requestManagerChatEvents();
     scheduleManagerChatPoll();
+  }
+  if (action === "rotate") {
+    vscode.postMessage({ type: "managerLoopStatus" });
+    requestManagerChatEvents();
   }
   showManagerChatNotice(null);
 }
@@ -8361,16 +8378,7 @@ function toggleManagerChatSidebar() {
   applyManagerChatCollapsed(!state.managerChatCollapsed);
 }
 
-function startManagerChatSidebar() {
-  applyManagerChatCollapsed(Boolean(state.managerChatCollapsed));
-  if (typeof populateManagerChatModelOptions === "function") populateManagerChatModelOptions();
-  if (!state.featureSettings && !state.featureSettingsRequested) {
-    state.featureSettingsRequested = true;
-    vscode.postMessage({ type: "requestSettings" });
-  }
-  // Opening the chat does not attach a saved session and does not create one.
-  // Status fills the list. The owner continues one, or the first message on
-  // the selected model opens the first session.
+function resetManagerChatSession() {
   state.managerChatSession = null;
   state.managerChatEvents = [];
   managerConsoleReset();
@@ -8378,7 +8386,20 @@ function startManagerChatSidebar() {
   state.managerChatRunning = false;
   renderManagerChatEvents();
   applyManagerChatSessionUi();
+}
+
+function startManagerChatSidebar() {
+  applyManagerChatCollapsed(Boolean(state.managerChatCollapsed));
+  if (typeof populateManagerChatModelOptions === "function") populateManagerChatModelOptions();
+  if (!state.featureSettings && !state.featureSettingsRequested) {
+    state.featureSettingsRequested = true;
+    vscode.postMessage({ type: "requestSettings" });
+  }
+  // Opening the chat starts with no session attached. A restore reply
+  // attaches the last saved conversation when one exists; it never creates one.
+  resetManagerChatSession();
   vscode.postMessage({ type: "managerLoopStatus" });
+  vscode.postMessage({ type: "managerLoopRestore" });
   renderManagerChatTaskBoard();
 }
 
@@ -8438,7 +8459,6 @@ if (elements.managerChatDeleteSession && typeof elements.managerChatDeleteSessio
     const selected = String(elements.managerChatSessionSelect && elements.managerChatSessionSelect.value || "");
     const sessionId = selected || state.managerChatSession || "";
     if (!sessionId) return;
-    if (!window.confirm("Delete this session?")) return;
     vscode.postMessage({ type: "managerLoopDelete", sessionId });
   });
 }
@@ -8447,6 +8467,20 @@ if (elements.managerChatNewSession && typeof elements.managerChatNewSession.addE
   elements.managerChatNewSession.addEventListener("click", () => {
     if (elements.managerChatNewSession.disabled) return;
     vscode.postMessage({ type: "managerLoopNew" });
+  });
+}
+
+if (elements.managerChatRotate && typeof elements.managerChatRotate.addEventListener === "function") {
+  elements.managerChatRotate.addEventListener("click", () => {
+    if (elements.managerChatRotate.disabled || !state.managerChatSession) return;
+    vscode.postMessage({ type: "managerLoopRotate", reason: "owner_requested" });
+  });
+}
+
+if (elements.managerChatClose && typeof elements.managerChatClose.addEventListener === "function") {
+  elements.managerChatClose.addEventListener("click", () => {
+    if (elements.managerChatClose.disabled || !state.managerChatSession) return;
+    vscode.postMessage({ type: "managerLoopClose" });
   });
 }
 if (elements.managerChatTaskFilter && typeof elements.managerChatTaskFilter.addEventListener === "function") {
