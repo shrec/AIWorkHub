@@ -1422,6 +1422,9 @@ def test_opencode_launch_refuses_a_command_the_bubblewrap_mount_cannot_show(
     assert harness.manager.popen_calls == []
 
 
+@pytest.mark.skipif(
+    os.name != "nt", reason="the real AppContainer pipe shim lives in the Windows directory"
+)
 def test_opencode_appcontainer_launch_uses_real_provisioning_and_sandbox_argv(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
