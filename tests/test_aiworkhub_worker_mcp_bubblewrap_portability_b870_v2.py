@@ -79,10 +79,12 @@ _PACKAGE_FILES = (
     "_platform_process.py",
     "sqlite_readonly.py",
     # The runtime adapter owns TOML quoting (NF-2026-01022) and imports
-    # reasoning policy plus the qualified executable registry.
+    # reasoning policy, the qualified executable registry and the CLI model
+    # discovery the Claude family aliases resolve through.
     "runtime_adapters.py",
     "reasoning_policy.py",
     "runtime_executable_registry.py",
+    "cli_model_discovery.py",
 )
 
 
