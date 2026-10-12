@@ -3027,6 +3027,29 @@ def derive_launch_identity(
                 circuit_skips.append(skip)
                 adapter_rejections.append(skip)
                 continue
+            if candidate in _VSCODE_LM_IN_PROCESS_ADAPTERS:
+                # NF-2026-01482: a derived candidate from the vscode_lm bridge
+                # family (vscode_lm, glm_vscode_lm, deepseek_vscode_lm) needs a
+                # launchable bridge host; policy/circuit approval alone can
+                # still point at an editor session nothing ever started.
+                try:
+                    readiness = vscode_lm_bridge.bridge_readiness(
+                        repo,
+                        model=(
+                            str(pinned_route["model"])
+                            if pinned_route is not None
+                            else None
+                        ),
+                        adapter_id=candidate,
+                    )
+                except Exception:  # noqa: BLE001 - unreadable bridge state blocks, not launches
+                    blocker = "bridge_readiness_error"
+                    adapter_rejections.append(f"{candidate}:vscode_lm_unavailable:{blocker}")
+                    continue
+                if not readiness.get("launchable"):
+                    blocker = str(readiness.get("blocker_reason") or "") or "not_launchable"
+                    adapter_rejections.append(f"{candidate}:vscode_lm_unavailable:{blocker}")
+                    continue
             resolved_adapter = candidate
             break
         if not resolved_adapter:

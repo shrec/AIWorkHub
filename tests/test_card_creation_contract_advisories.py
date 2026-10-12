@@ -381,6 +381,20 @@ def _launchable_card(**overrides):
     return card
 
 
+@pytest.fixture(autouse=True)
+def _vscode_lm_bridge_launchable(monkeypatch):
+    def fake_bridge_readiness(repo, **kwargs):
+        return {
+            "launchable": True,
+            "blocker_reason": "",
+            "resolved_model": kwargs.get("model") or "",
+        }
+
+    monkeypatch.setattr(
+        process_launcher.vscode_lm_bridge, "bridge_readiness", fake_bridge_readiness
+    )
+
+
 def test_runner_and_topic_are_derived_from_the_card(tmp_path):
     derived = process_launcher.derive_launch_identity(tmp_path, _launchable_card())
     assert derived["runner"] == "claude_opus-5"
