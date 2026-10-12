@@ -825,16 +825,18 @@ def test_index_file_rejects_oversized_fstat_before_read(tmp_path, monkeypatch):
     monkeypatch.setattr(sg, "SOURCE_GRAPH_AUTHENTICATED_FILE_BYTE_LIMIT", 4)
     read_calls = []
     real_read = sg.os.read
-    # sg.os IS the os module, so this patch is process-wide. Only reads of THIS
-    # file are the subject: a background thread's os.read, or the POSIX
-    # subprocess pipe reads of a git probe on this thread, would otherwise be
-    # counted as the code under test reading the oversized file.
+    # sg.os IS the os module, so this patch is process-wide. Only this thread's
+    # reads of THIS file are the subject: a background thread's os.read, or the
+    # POSIX subprocess pipe reads of a git probe on this very thread, would
+    # otherwise be counted as the code under test reading the oversized file.
+    caller = threading.get_ident()
     target = os.stat(repo / "too_big.py")
 
     def record_read(fd: int, size: int) -> bytes:
-        status = os.fstat(fd)
-        if (status.st_dev, status.st_ino) == (target.st_dev, target.st_ino):
-            read_calls.append((fd, size))
+        if threading.get_ident() == caller:
+            status = os.fstat(fd)
+            if (status.st_dev, status.st_ino) == (target.st_dev, target.st_ino):
+                read_calls.append((fd, size))
         return real_read(fd, size)
 
     monkeypatch.setattr(sg.os, "read", record_read)
@@ -1229,15 +1231,20 @@ def test_index_file_read_error_fails_closed_without_partial_mutation(
     _write(target, updated)
     real_read = sg.os.read
     read_calls = 0
-    # Count and fail only for the calling thread: this patch replaces os.read
-    # for the whole process, and under the full suite a background thread
-    # consumed call #1, so the synthetic failure landed on a read this test was
-    # not exercising and index_file completed normally -- DID NOT RAISE.
+    # Count and fail only this thread's reads of THIS file: the patch replaces
+    # os.read for the whole process, and a background thread's read -- or, on
+    # POSIX, the subprocess pipe reads of a git probe on this very thread --
+    # would otherwise take call #1, so the synthetic failure landed on a read
+    # this test was not exercising and index_file completed -- DID NOT RAISE.
     caller = threading.get_ident()
+    target_status = os.stat(target)
 
     def failing_read(fd: int, length: int) -> bytes:
         nonlocal read_calls
         if threading.get_ident() != caller:
+            return real_read(fd, length)
+        status = os.fstat(fd)
+        if (status.st_dev, status.st_ino) != (target_status.st_dev, target_status.st_ino):
             return real_read(fd, length)
         read_calls += 1
         if read_calls == fail_on_read_call:
