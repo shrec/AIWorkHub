@@ -14,6 +14,10 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.48
+
+- First published build with the 0.12.47 changes (Restart, Stop, Copy, Manager Chat no longer self-starts, OpenCode key and model fixes); fixes the CI blocker that held 0.12.47 back (NF-2026-01492).
+
 ## What's new in 0.12.47
 
 - Restart any pending, blocked or processing task from the dashboard; the server picks the right recovery path (NF-2026-01481, NF-2026-01483).

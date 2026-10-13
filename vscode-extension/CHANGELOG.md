@@ -1,5 +1,11 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.48 — 2026-10-13
+
+### Fixed
+
+- Bundled runtime 0.12.48: the CI blocker that stopped 0.12.47 from publishing is fixed (NF-2026-01492). This is the first published build with the 0.12.47 changes below.
+
 ## 0.12.47 — 2026-10-13
 
 ### Added

@@ -6,6 +6,12 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.48] - 2026-10-13
+
+### Fixed
+
+- Launcher: `process_launcher.py` is back under the module-size ratchet; two helpers moved to `windows_appcontainer` and `vscode_lm_bridge` with no behaviour change (NF-2026-01492). This CI failure stopped 0.12.47 from publishing, so 0.12.48 is the first published build that carries every 0.12.47 change below.
+
 ## [0.12.47] - 2026-10-13
 
 ### Added

@@ -62,6 +62,10 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.48
+
+- First published build with the 0.12.47 changes (Restart, Stop, Copy, Manager Chat no longer self-starts, OpenCode key and model fixes); fixes the CI blocker that held 0.12.47 back (NF-2026-01492).
+
 ## What's new in 0.12.47
 
 - Restart any pending, blocked or processing task from the dashboard; the server picks the right recovery path (NF-2026-01481, NF-2026-01483).
