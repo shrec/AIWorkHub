@@ -6178,7 +6178,11 @@ def _repair_removal_permissions(target: str) -> None:
 
 
 def _rmtree_workspace_owned(root: Path) -> None:
-    """Remove one already-authorized workspace/admin tree, repairing mode only."""
+    """Remove one already-authorized workspace/admin tree, repairing mode only.
+
+    A failed removal is retried once with the extended-length prefix, on
+    Windows only, so every caller shares one retry.
+    """
     if not root.exists():
         return
     if root.is_symlink() or not root.is_dir():
@@ -6194,11 +6198,27 @@ def _rmtree_workspace_owned(root: Path) -> None:
                 f"{type(exc).__name__}"
             ) from exc
 
+    def remove(target: Path) -> None:
+        try:
+            shutil.rmtree(target, onexc=repair_and_retry)
+        except TypeError:  # pragma: no cover - Python <3.12 compatibility
+            shutil.rmtree(target, onerror=repair_and_retry)
+
+    text = os.path.abspath(root)
+    long_path_retryable = os.name == "nt" and not text.startswith("\\\\?\\")
     try:
-        shutil.rmtree(root, onexc=repair_and_retry)
-    except TypeError:  # pragma: no cover - Python <3.12 compatibility
-        shutil.rmtree(root, onerror=repair_and_retry)
-    except OSError as exc:
+        remove(root)
+    except (OSError, WorkspaceError) as exc:
+        if long_path_retryable:
+            try:
+                remove(Path(f"\\\\?\\{text}"))
+            except OSError as retry_exc:
+                raise WorkspaceError(
+                    f"workspace_cleanup_remove_failed:{root.name}:{type(retry_exc).__name__}"
+                ) from retry_exc
+            return
+        if isinstance(exc, WorkspaceError):
+            raise
         raise WorkspaceError(
             f"workspace_cleanup_remove_failed:{root.name}:{type(exc).__name__}"
         ) from exc

@@ -2657,12 +2657,134 @@ def _file_worktree_failure_needfix(root: Path, result: dict[str, Any]) -> None:
             )
 
 
+# Immediate children of these containers are disposable scratch output that
+# no other janitor step ever looks at (NF-2026-01449).
+_SCRATCH_CONTAINER_RELATIVE_PATHS = (
+    Path(".aiworkhub/temp/test"),
+    Path(".aiworkhub/temp/validation"),
+    CANONICAL_RUNTIME_RELATIVE_PATH / "node-test-scratch",
+)
+# One-off dirs directly under .aiworkhub/runtime that are disposable as a
+# whole, matched by name.  Deliberately excludes ``tmp*``: a long-lived
+# process may still own an mkdtemp dir there.
+_SCRATCH_RUNTIME_NAME_PATTERNS = (
+    "breakglass-*",
+    "nf[0-9]*-*",
+    "release[0-9]*-build*",
+    "snapshot-diag-*",
+    "manager-verification",
+    "hostval",
+)
+_SCRATCH_MAX_AGE_SECONDS = 48 * 60 * 60
+
+
+def _janitor_scratch(root: Path, now: float) -> dict[str, Any]:
+    """Delete aged disposable scratch output the other six steps never see.
+
+    Three containers are swept child-by-child; a fixed set of one-off
+    ``runtime/`` dirs is removed whole, matched by name.  A candidate is
+    skipped when younger than 48h, a symlink/junction, outside the
+    repository's ``.aiworkhub`` dir once resolved, or still held by a live
+    runtime_temp owner.  A directory goes through the single shared
+    workspace-removal helper and any other entry is unlinked; both repair a
+    read-only leftover instead of leaving it behind.  A candidate that fails
+    the pre-deletion re-check is kept and not counted as removed.
+    """
+    import fnmatch
+
+    from . import runtime_temp, worker_workspace  # local import: cycle-safe
+
+    aiworkhub_dir = (root / ".aiworkhub").resolve(strict=False)
+    candidates: list[tuple[Path, Path]] = []
+    for relative in _SCRATCH_CONTAINER_RELATIVE_PATHS:
+        container = root / relative
+        expected_container = aiworkhub_dir / relative.relative_to(".aiworkhub")
+        if container.is_symlink() or container.is_junction() or not container.is_dir():
+            continue
+        if container.resolve(strict=False) != expected_container:
+            continue
+        with contextlib.suppress(OSError):
+            candidates.extend((entry, expected_container) for entry in container.iterdir())
+
+    runtime_dir = root / CANONICAL_RUNTIME_RELATIVE_PATH
+    expected_runtime_dir = aiworkhub_dir / "runtime"
+    if (
+        not runtime_dir.is_symlink()
+        and not runtime_dir.is_junction()
+        and runtime_dir.is_dir()
+        and runtime_dir.resolve(strict=False) == expected_runtime_dir
+    ):
+        with contextlib.suppress(OSError):
+            for entry in runtime_dir.iterdir():
+                if any(
+                    fnmatch.fnmatch(entry.name, pattern)
+                    for pattern in _SCRATCH_RUNTIME_NAME_PATTERNS
+                ):
+                    candidates.append((entry, expected_runtime_dir))
+
+    selected: list[tuple[Path, Path]] = []
+    for candidate, expected_parent in candidates:
+        if candidate.is_symlink() or candidate.is_junction():
+            continue
+        try:
+            if candidate.resolve(strict=False).parent != expected_parent:
+                continue
+        except OSError:
+            continue
+        try:
+            if now - _janitor_mtime(candidate) <= _SCRATCH_MAX_AGE_SECONDS:
+                continue
+        except OSError:
+            # Gone since iterdir (a concurrent sweep or test run removed it).
+            continue
+        manifest = runtime_temp.read_owner_manifest(candidate)
+        if manifest is not None and runtime_temp.owner_alive(manifest):
+            continue
+        selected.append((candidate, expected_parent))
+
+    expected_parent_by_candidate = dict(selected)
+    skipped: list[Path] = []
+
+    def _remove_verified_scratch_candidate(candidate: Path) -> None:
+        expected_parent = expected_parent_by_candidate[candidate]
+        try:
+            verified = (
+                not candidate.is_symlink()
+                and not candidate.is_junction()
+                and candidate.resolve(strict=False).parent == expected_parent
+            )
+        except OSError:
+            verified = False
+        if not verified:
+            skipped.append(candidate)  # list.append is atomic across pool threads
+            return
+        if candidate.is_dir():
+            worker_workspace._rmtree_workspace_owned(candidate)
+            return
+        try:
+            candidate.unlink(missing_ok=True)
+        except PermissionError:
+            worker_workspace._repair_removal_permissions(str(candidate))
+            candidate.unlink(missing_ok=True)
+
+    failures = _janitor_parallel(
+        [candidate for candidate, _ in selected], _remove_verified_scratch_candidate
+    )
+    errors = [error for _path, error in failures]
+    return {
+        "ok": not errors,
+        "removed": len(selected) - len(failures) - len(skipped),
+        "bytes": 0,
+        "errors": errors,
+    }
+
+
 def _run_repository_cleanup(
     repo_root: Path | str, *, base: Path | None = None, now: float
 ) -> dict[str, Any]:
     """One janitor sweep over this repository; ``now`` is not a public input.
 
-    The six steps run in order and each is isolated: a step that raises is
+    The seven steps run in order and each is isolated: a step that raises is
     recorded as ``{"ok": False, "error"}`` and filed as one NeedFix titled
     ``janitor:<step>:<ExcClass>``, and the remaining steps still run. Deletion is
     direct; the janitor quarantines nothing. While it runs, ``_JANITOR_ACTIVE``
@@ -2678,6 +2800,7 @@ def _run_repository_cleanup(
         ("unattributed", lambda: _janitor_unattributed(root, worktree_base, now)),
         ("registrations", lambda: _janitor_registrations(root, worktree_base)),
         ("records", lambda: _janitor_records(root)),
+        ("scratch", lambda: _janitor_scratch(root, now)),
     )
     was_active = getattr(_JANITOR_ACTIVE, "active", False)
     _JANITOR_ACTIVE.active = True

@@ -1834,20 +1834,26 @@ def enforce_process_log_bounds(repo_root: Path | str, *, confirm: bool = True) -
     }
 
 
-def _dead_owner_temp_gc(root: Path) -> tuple[int, int]:
+def _dead_owner_temp_gc(root: Path) -> tuple[int, int, list[str]]:
     """Remove only exact dead-owner request dirs under ``<repo>/.aiworkhub/temp``.
 
     Identification (PID/start-time owner identity) is delegated to the
     repository-local temp authority; this module performs the deletion as the
-    sole cleanup authority.  A live or unknown owner, a symlink, or any path
-    that escapes the temp root fails closed and is never touched.
+    sole cleanup authority, through the one shared removal helper so a
+    read-only or over-length leftover is retried instead of left behind.  A
+    live or unknown owner, a symlink, or any path that escapes the temp root
+    fails closed and is never touched.  A removal failure is reported, not
+    swallowed.
     """
+    from . import worker_workspace  # local import: cycle-safe
+
     count = 0
     released = 0
+    failures: list[str] = []
     try:
         temp_root = runtime_temp.temp_root(root).resolve(strict=False)
     except RuntimeError:
-        return 0, 0
+        return 0, 0, []
     for entry in runtime_temp.identify_dead_owner_dirs(root):
         path = Path(entry.get("path") or "")
         if not path.is_absolute():
@@ -1860,12 +1866,13 @@ def _dead_owner_temp_gc(root: Path) -> tuple[int, int]:
         except (OSError, ValueError):
             continue
         try:
-            shutil.rmtree(resolved)
-        except OSError:
+            worker_workspace._rmtree_workspace_owned(resolved)
+        except Exception as exc:
+            failures.append(f"{resolved.name}: {type(exc).__name__}: {exc}"[:300])
             continue
         count += 1
         released += int(entry.get("bytes") or 0)
-    return count, released
+    return count, released, failures
 
 
 def _delete_worker_count() -> int:
@@ -1973,7 +1980,7 @@ def enforce(repo_root: Path | str) -> dict[str, Any]:
         current = _candidate_payload(root)
         deletion = _delete_candidates(root, list(current.get("candidates") or []))
 
-        temp_gc_count, temp_gc_bytes = _dead_owner_temp_gc(root)
+        temp_gc_count, temp_gc_bytes, temp_gc_errors = _dead_owner_temp_gc(root)
         # The per-file worker-log bound and the attempt-artifacts bound: an
         # oversized terminal-run log is tail-capped (head released, diagnostic
         # tail kept) and an aged terminal-run bundle is deleted.  A live or
@@ -1993,6 +2000,7 @@ def enforce(repo_root: Path | str) -> dict[str, Any]:
             "purged_bytes": purged_bytes,
             "temp_gc_count": temp_gc_count,
             "temp_gc_bytes": temp_gc_bytes,
+            "temp_gc_errors": len(temp_gc_errors),
             "logs_capped": int(process_bounds.get("logs_capped") or 0),
             "bundles_deleted": int(process_bounds.get("bundles_deleted") or 0),
             "spill_removed": int(spill.get("removed") or 0),
@@ -2011,6 +2019,7 @@ def enforce(repo_root: Path | str) -> dict[str, Any]:
             "purged_bytes": purged_bytes,
             "temp_gc_count": temp_gc_count,
             "temp_gc_bytes": temp_gc_bytes,
+            "temp_gc_errors": temp_gc_errors,
             "logs_capped": int(process_bounds.get("logs_capped") or 0),
             "log_bytes_freed": int(process_bounds.get("log_bytes_freed") or 0),
             "bundles_deleted": int(process_bounds.get("bundles_deleted") or 0),

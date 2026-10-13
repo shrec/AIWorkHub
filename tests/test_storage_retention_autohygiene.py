@@ -162,6 +162,7 @@ def test_cleanup_result_reports_every_janitor_step(monkeypatch, tmp_path: Path) 
         "unattributed",
         "registrations",
         "records",
+        "scratch",
     ]
     assert result["ok"] is True
     assert result["needfix"] == []
