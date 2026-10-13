@@ -593,10 +593,19 @@ class AppContainerLaunch:
     api: "Win32Api" = field(repr=False)
     job: Any = field(repr=False)
     creation: "_ProcessCreation" = field(repr=False)
+    # Per-logon-session drive letter mapped to this launch's sandbox root by
+    # Win32Api.sandbox_drive, or "" when the request had no sandbox anchor.
+    # Released exactly once by close().
+    sandbox_drive: str = field(default="", repr=False)
+    sandbox_root: str = field(default="", repr=False)
     # Revocable filesystem grants still in force, in the order applied.
     grants: list["_PathGrant"] = field(default_factory=list, repr=False)
     # Grants whose DACL restore failed on close: (path, win_error).
     grant_revoke_failures: list[tuple[str, int]] = field(
+        default_factory=list, repr=False
+    )
+    # win_error codes from a failed sandbox-drive release on close.
+    sandbox_drive_release_failures: list[int] = field(
         default_factory=list, repr=False
     )
     # Persistent grants as applied: (path, satisfied_by or "granted").
@@ -721,6 +730,21 @@ class AppContainerLaunch:
                 except Exception as exc:
                     if first_error is None:
                         first_error = exc
+            # Released only once the job handle is actually closed: if
+            # close_job failed, _job_handle_owned is still True, the
+            # kill-on-close job never fired, and a still-running tree must
+            # not lose the drive out from under it.  A retried close() after
+            # a later successful close_job then releases exactly once.
+            if not self._job_handle_owned and self.sandbox_drive:
+                drive, root = self.sandbox_drive, self.sandbox_root
+                try:
+                    self.api.release_sandbox_drive(drive, root)
+                except _Win32Failure as exc:
+                    self.sandbox_drive_release_failures.append(exc.win_error)
+                except Exception:
+                    pass  # the boundary contract is never to raise; belt and braces
+                finally:
+                    self.sandbox_drive = self.sandbox_root = ""
             # Revoked even when a handle close failed: narrowing a possibly live
             # tree's access is always the safer direction.  Popping in reverse
             # order restores nested paths LIFO and makes a second close a no-op.
@@ -759,6 +783,7 @@ class AppContainerLaunch:
             "persistent_grants": [
                 {"path": path, "satisfied_by": how} for path, how in self.persistent_grants
             ],
+            "sandbox_drive_release_failures": list(self.sandbox_drive_release_failures),
         }
 
 
@@ -865,6 +890,8 @@ class Win32Api(Protocol):
 
     def sandbox_drive(self, real_root: str) -> str: ...
 
+    def release_sandbox_drive(self, drive: str, real_root: str) -> None: ...
+
     def build_security_capabilities(
         self, identity: _Identity, capability_sids: Sequence[str]
     ) -> _SecurityCapabilities: ...
@@ -944,6 +971,8 @@ _WAIT_ABANDONED = 0x80
 _SANDBOX_DRIVE_MUTEX = "Local\\AIWorkHub.SandboxDrive"
 _SANDBOX_DRIVE_WAIT_MS = 10_000
 _DDD_NO_BROADCAST_SYSTEM = 0x8
+_DDD_REMOVE_DEFINITION = 0x2
+_DDD_EXACT_MATCH_ON_REMOVE = 0x4
 _SANDBOX_DRIVE_LETTERS = "ZYXWVUTSRQPONMLKJIHGFE"
 
 
@@ -2072,29 +2101,36 @@ def _launch_prepared_appcontainer(
     # child must never open or realpath() a component above it. It sees the
     # root as a drive letter instead; the grants above keep their real paths.
     sandbox = _request_traversal_anchor(request.working_directory or "")
-    if sandbox:
-        drive = _step("sandbox_drive", partial(api.sandbox_drive, sandbox))
-        request = _on_sandbox_drive(request, sandbox, drive)
-
-    name, display_name, description = derive_container_identity(
-        request.repo_id, request.worker_kind
-    )
-    command_line = build_command_line(request.argv)
-    executable = request.executable or str(request.argv[0])
-    std_handles = _std_handle_list(request)
-    creation_flags = _creation_flags(request)
-    environment_text = _environment_block_text(request.environment)
-    launch_context = _LaunchErrorContext(
-        executable=executable,
-        command_line_length=len(command_line),
-        argument_count=len(request.argv),
-        environment_length=0 if environment_text is None else len(environment_text),
-        working_directory=request.working_directory,
-    )
-
     cleanup = _CleanupStack()
+    drive = ""
     creation: _ProcessCreation | None = None
     try:
+        if sandbox:
+            drive = _step("sandbox_drive", partial(api.sandbox_drive, sandbox))
+            # Pushed as soon as the OS has the definition: a failure in any step
+            # below -- still inside this same launch, including a ValueError
+            # raised by request/command-line/environment derivation before
+            # CreateProcess is ever reached -- must pop it again. On success
+            # it is popped once instead by AppContainerLaunch.close().
+            cleanup.push_on_failure(partial(api.release_sandbox_drive, drive, sandbox))
+            request = _on_sandbox_drive(request, sandbox, drive)
+
+        name, display_name, description = derive_container_identity(
+            request.repo_id, request.worker_kind
+        )
+        command_line = build_command_line(request.argv)
+        executable = request.executable or str(request.argv[0])
+        std_handles = _std_handle_list(request)
+        creation_flags = _creation_flags(request)
+        environment_text = _environment_block_text(request.environment)
+        launch_context = _LaunchErrorContext(
+            executable=executable,
+            command_line_length=len(command_line),
+            argument_count=len(request.argv),
+            environment_length=0 if environment_text is None else len(environment_text),
+            working_directory=request.working_directory,
+        )
+
         identity = _step(
             "derive_appcontainer_sid",
             lambda: api.derive_identity(name, display_name, description),
@@ -2233,7 +2269,13 @@ def _launch_prepared_appcontainer(
             lambda: api.resume_thread(launched),
             context=launch_context,
         )
-    except AppContainerError:
+    except BaseException:
+        # Catches AppContainerError from any _step above AND a ValueError
+        # raised before the try's own inner body established its job (e.g.
+        # build_command_line / _environment_block_text / derive_container_
+        # identity on a hostile argv/env), so the pushed sandbox-drive release
+        # still runs on every failure path and the original exception type
+        # still propagates unchanged.
         cleanup.run_failure()
         raise
 
@@ -2254,6 +2296,8 @@ def _launch_prepared_appcontainer(
         api=api,
         job=job,
         creation=creation,
+        sandbox_drive=drive,
+        sandbox_root=sandbox,
         grants=grants,
         persistent_grants=persistent_grants,
         disposable_temp=helper_temp,
@@ -3188,8 +3232,10 @@ class _CtypesWin32Api:
         DefineDosDeviceW(DDD_NO_BROADCAST_SYSTEM) is per logon session, and an
         AppContainer child of this process sees the letter too (measured).
         A session-local mutex serializes choose-and-define across launchers;
-        a letter already naming ``real_root`` is reused. The mapping is never
-        removed: a running sibling may still be using it.
+        a letter already naming ``real_root`` is reused, but every call still
+        pushes one definition for this launch -- the OS reference-counts
+        concurrent launches on that letter. The matching pop is
+        :meth:`release_sandbox_drive`, called when the launch closes.
         """
         k = self._kernel32
 
@@ -3205,16 +3251,20 @@ class _CtypesWin32Api:
                 error = _last_win_error() if waited == _WAIT_FAILED else int(waited)
                 raise fail(error, f"mutex wait returned {waited:#x}")
             try:
-                drive, needs_define = _choose_sandbox_drive(
+                drive, _needs_define = _choose_sandbox_drive(
                     real_root, int(k.GetLogicalDrives()), self._query_dos_device
                 )
                 if not drive:
                     raise fail(0, f"no free drive letter for {real_root!r}")
-                if needs_define and not k.DefineDosDeviceW(
-                    _DDD_NO_BROADCAST_SYSTEM, drive, real_root
-                ):
+                if not k.DefineDosDeviceW(_DDD_NO_BROADCAST_SYSTEM, drive, real_root):
                     raise fail(_last_win_error(), f"DefineDosDeviceW {drive} {real_root!r}")
                 if self._query_dos_device(drive).lower() != _dos_device_target(real_root):
+                    pop_flags = (
+                        _DDD_NO_BROADCAST_SYSTEM
+                        | _DDD_REMOVE_DEFINITION
+                        | _DDD_EXACT_MATCH_ON_REMOVE
+                    )
+                    k.DefineDosDeviceW(pop_flags, drive, real_root)
                     raise fail(0, f"{drive} does not name {real_root!r}")
                 return drive
             finally:
@@ -3222,12 +3272,61 @@ class _CtypesWin32Api:
         finally:
             k.CloseHandle(mutex)
 
+    def release_sandbox_drive(self, drive: str, real_root: str) -> None:
+        """Pop this launch's push of ``drive`` from :meth:`sandbox_drive`.
+
+        The OS reference-counts DefineDosDeviceW per letter; this removes
+        exactly one definition. A still-running sibling's definition (or a
+        reused letter's other pushes) survives until its own release.
+        """
+        # ponytail: a supervisor that dies without calling close() leaks one
+        # stacked definition until sign-out; there is no stale-sweep for it.
+        k = self._kernel32
+        mutex = k.CreateMutexW(None, False, _SANDBOX_DRIVE_MUTEX)
+        if not mutex:
+            raise _Win32Failure(_last_win_error(), "release_sandbox_drive", "CreateMutexW")
+        try:
+            waited = k.WaitForSingleObject(mutex, _SANDBOX_DRIVE_WAIT_MS)
+            if waited not in (_WAIT_OBJECT_0, _WAIT_ABANDONED):
+                error = _last_win_error() if waited == _WAIT_FAILED else int(waited)
+                raise _Win32Failure(
+                    error, "release_sandbox_drive", f"mutex wait returned {waited:#x}"
+                )
+            try:
+                flags = (
+                    _DDD_NO_BROADCAST_SYSTEM
+                    | _DDD_REMOVE_DEFINITION
+                    | _DDD_EXACT_MATCH_ON_REMOVE
+                )
+                if not k.DefineDosDeviceW(flags, drive, real_root):
+                    raise _Win32Failure(
+                        _last_win_error(),
+                        "release_sandbox_drive",
+                        f"DefineDosDeviceW remove {drive} {real_root!r}",
+                    )
+            finally:
+                k.ReleaseMutex(mutex)
+        finally:
+            k.CloseHandle(mutex)
+
     def _query_dos_device(self, drive: str) -> str:
-        """QueryDosDeviceW's first target for ``drive``, or "" when there is none."""
-        buffer = ctypes.create_unicode_buffer(1024)
-        if not self._kernel32.QueryDosDeviceW(drive, buffer, len(buffer)):
-            return ""
-        return buffer.value
+        """QueryDosDeviceW's first target for ``drive``, or "" when there is none.
+
+        A letter with several stacked DefineDosDeviceW definitions reports
+        all of them to QueryDosDeviceW as one multi-sz, so the buffer must
+        hold the whole stack, not just the one target this caller wants.
+        Grow and retry on ERROR_INSUFFICIENT_BUFFER (122) instead of reading
+        that as "no match" and leaking the definition just pushed.
+        """
+        size = 1024
+        while size <= 65536:
+            buffer = ctypes.create_unicode_buffer(size)
+            if self._kernel32.QueryDosDeviceW(drive, buffer, len(buffer)):
+                return buffer.value
+            if _last_win_error() != 122:
+                return ""
+            size *= 2
+        return ""
 
     def _set_sid_entry(
         self, path: str, sid: bytes, mode: int, mask: int, inherit: int, operation: str,

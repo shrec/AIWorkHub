@@ -154,6 +154,15 @@ class FakeWin32Api:
             )
         return self.sandbox_letter
 
+    def release_sandbox_drive(self, drive, real_root):
+        self.events.append(f"release_sandbox_drive:{drive}:{real_root}")
+        if self.fail_at == "release_sandbox_drive":
+            raise _Win32Failure(
+                self.fail_error,
+                "release_sandbox_drive",
+                "sandbox_drive_unavailable: forced",
+            )
+
     def build_security_capabilities(self, identity, capability_sids):
         self._maybe_fail("build_security_capabilities")
         self.security = _SecurityCapabilities(
@@ -2515,7 +2524,11 @@ def test_temp_and_profile_paths_are_refused_when_explicit_and_omitted_when_ambie
     worktree.mkdir()
     outside = tmp_path / "Dev" / "AIWorkHub"
     outside.mkdir(parents=True)
-    temp = tempfile.gettempdir()
+    # Use a real OS temp path rather than tempfile.gettempdir(): the hub
+    # validation lane sets TEMP/TMP to a path under the sandbox root itself
+    # (NF-2026-01504), which would make the explicit-refusal loop below
+    # fail to raise.
+    temp = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "Temp")
     profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
 
     # The sandbox root itself is not a request leaf either.
@@ -2720,6 +2733,7 @@ def test_a_launch_outside_any_sandbox_is_not_translated(tmp_path):
         api=fake,
     ).close()
     assert not any(event.startswith("sandbox_drive:") for event in fake.events)
+    assert not any(event.startswith("release_sandbox_drive:") for event in fake.events)
     assert fake.spec.working_directory == str(tmp_path)
     assert fake.spec.environment["HOME"] == str(tmp_path)
 
@@ -2747,6 +2761,121 @@ def test_a_sandbox_drive_failure_fails_closed_before_any_grant(tmp_path):
     assert "create_process" not in fake.events
 
 
+def test_launch_close_releases_the_sandbox_drive_exactly_once(tmp_path):
+    root, request = _sandbox(tmp_path)
+    worktree = request / "worktree"
+    worktree.mkdir()
+    fake = FakeWin32Api()
+
+    launch = launch_appcontainer(
+        make_request(
+            working_directory=str(worktree),
+            filesystem_grants=request_scoped_grants({}, str(worktree)),
+        ),
+        api=fake,
+    )
+    assert fake.events[0] == f"sandbox_drive:{_key(root)}"
+    assert not any(event.startswith("release_sandbox_drive:") for event in fake.events)
+
+    launch.close()
+    release_events = [e for e in fake.events if e.startswith("release_sandbox_drive:")]
+    assert release_events == [f"release_sandbox_drive:{fake.sandbox_letter}:{_key(root)}"]
+
+    launch.close()
+    assert [e for e in fake.events if e.startswith("release_sandbox_drive:")] == release_events
+
+
+def test_a_launch_failure_after_sandbox_drive_releases_it(tmp_path):
+    root, request = _sandbox(tmp_path)
+    worktree = request / "worktree"
+    worktree.mkdir()
+    fake = FakeWin32Api(fail_at="create_job_object", fail_error=5)
+
+    with pytest.raises(AppContainerError):
+        launch_appcontainer(
+            make_request(
+                working_directory=str(worktree),
+                filesystem_grants=request_scoped_grants({}, str(worktree)),
+            ),
+            api=fake,
+        )
+
+    assert fake.events[0] == f"sandbox_drive:{_key(root)}"
+    assert f"release_sandbox_drive:{fake.sandbox_letter}:{_key(root)}" in fake.events
+
+
+def test_launch_close_survives_a_release_sandbox_drive_failure(tmp_path):
+    root, request = _sandbox(tmp_path)
+    worktree = request / "worktree"
+    worktree.mkdir()
+    fake = FakeWin32Api(fail_at="release_sandbox_drive", fail_error=5)
+
+    launch = launch_appcontainer(
+        make_request(
+            working_directory=str(worktree),
+            filesystem_grants=request_scoped_grants({}, str(worktree)),
+        ),
+        api=fake,
+    )
+
+    launch.close()
+
+    assert launch.closed
+    assert launch.cleanup_evidence()["sandbox_drive_release_failures"] == [5]
+
+
+def test_a_pre_launch_value_error_after_sandbox_drive_releases_it(tmp_path, monkeypatch):
+    root, request = _sandbox(tmp_path)
+    worktree = request / "worktree"
+    worktree.mkdir()
+    fake = FakeWin32Api()
+
+    def _boom(argv):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(wac, "build_command_line", _boom)
+
+    with pytest.raises(ValueError):
+        launch_appcontainer(
+            make_request(
+                working_directory=str(worktree),
+                filesystem_grants=request_scoped_grants({}, str(worktree)),
+            ),
+            api=fake,
+        )
+
+    assert fake.events[0] == f"sandbox_drive:{_key(root)}"
+    assert fake.events.count(
+        f"release_sandbox_drive:{fake.sandbox_letter}:{_key(root)}"
+    ) == 1
+
+
+def test_close_keeps_the_drive_while_the_job_close_fails_then_releases_once(tmp_path):
+    root, request = _sandbox(tmp_path)
+    worktree = request / "worktree"
+    worktree.mkdir()
+    fake = FakeWin32Api(fail_at="close_job", fail_error=5)
+
+    launch = launch_appcontainer(
+        make_request(
+            working_directory=str(worktree),
+            filesystem_grants=request_scoped_grants({}, str(worktree)),
+        ),
+        api=fake,
+    )
+
+    with pytest.raises(Exception):
+        launch.close()
+    assert not any(event.startswith("release_sandbox_drive:") for event in fake.events)
+
+    fake.fail_at = None
+    launch.close()
+    assert (
+        sum(1 for event in fake.events if event.startswith("release_sandbox_drive:"))
+        == 1
+    )
+
+
 _ROOT = r"d:\repo\.aiworkhub\runtime\worktrees"
 
 
@@ -2768,11 +2897,20 @@ def test_sandbox_drive_picks_the_highest_letter_nobody_uses():
 
 
 class _FakeDosKernel:
-    """kernel32's mutex and DOS-device calls, recorded."""
+    """kernel32's mutex and DOS-device calls, recorded.
+
+    Models DefineDosDeviceW as a per-letter stack, like the real OS: a plain
+    define (no removal flag) pushes, and a define carrying
+    DDD_REMOVE_DEFINITION (0x2) pops the exact target. QueryDosDeviceW models
+    the real multi-sz contract -- it reports the whole stack, top first, and
+    honours the caller's buffer size, failing with ERROR_INSUFFICIENT_BUFFER
+    (122) when the stack does not fit.
+    """
 
     def __init__(self, define_ok=True):
         self.devices = {}
         self.define_ok = define_ok
+        self.last_error = 0
         self.calls = []
 
     def CreateMutexW(self, _attributes, _owner, name):
@@ -2794,32 +2932,56 @@ class _FakeDosKernel:
     def GetLogicalDrives(self):
         return 0
 
-    def QueryDosDeviceW(self, name, buffer, _size):
-        target = self.devices.get(name, "")
-        if not target:
+    def QueryDosDeviceW(self, name, buffer, size):
+        stack = self.devices.get(name) or []
+        if not stack:
             return 0
-        buffer.value = target
-        return len(target) + 2
+        blob = "\0".join(reversed(stack)) + "\0\0"
+        if len(blob) > size:
+            self.last_error = 122
+            return 0
+        buffer[: len(blob)] = blob
+        return len(blob)
 
     def DefineDosDeviceW(self, flags, name, target):
         self.calls.append(("define", flags, name, target))
-        if self.define_ok:
-            self.devices[name] = "\\??\\" + target
+        if not self.define_ok:
+            return False
+        wanted = "\\??\\" + target
+        if flags & 0x2:
+            stack = self.devices.get(name) or []
+            if wanted in stack:
+                stack.remove(wanted)
+            self.devices[name] = stack
+        else:
+            self.devices.setdefault(name, []).append(wanted)
         return self.define_ok
 
 
-def test_ctypes_sandbox_drive_defines_verifies_and_never_removes():
+def test_ctypes_sandbox_drive_pushes_and_release_pops():
     kernel = _FakeDosKernel()
     api = make_ctypes_api(kernel)
 
     assert api.sandbox_drive(_ROOT) == "Z:"
     assert api.sandbox_drive(_ROOT) == "Z:"
+    assert len(kernel.devices["Z:"]) == 2
 
     defines = [call for call in kernel.calls if call[0] == "define"]
-    assert defines == [("define", 0x8, "Z:", _ROOT)]
+    assert defines == [("define", 0x8, "Z:", _ROOT), ("define", 0x8, "Z:", _ROOT)]
     assert kernel.calls[0] == ("mutex", "Local\\AIWorkHub.SandboxDrive")
-    assert kernel.calls.count(("release", 77)) == 2
-    assert kernel.calls.count(("close", 77)) == 2
+
+    api.release_sandbox_drive("Z:", _ROOT)
+    assert len(kernel.devices["Z:"]) == 1
+    api.release_sandbox_drive("Z:", _ROOT)
+    assert kernel.devices["Z:"] == []
+
+    removes = [call for call in kernel.calls if call[0] == "define" and call[1] & 0x2]
+    assert removes == [
+        ("define", 0x8 | 0x2 | 0x4, "Z:", _ROOT),
+        ("define", 0x8 | 0x2 | 0x4, "Z:", _ROOT),
+    ]
+    assert kernel.calls.count(("release", 77)) == 4
+    assert kernel.calls.count(("close", 77)) == 4
 
 
 def test_ctypes_sandbox_drive_failure_is_structured():
@@ -2831,6 +2993,41 @@ def test_ctypes_sandbox_drive_failure_is_structured():
     assert excinfo.value.detail.startswith("sandbox_drive_unavailable:")
     assert ("release", 77) in kernel.calls
     assert ("close", 77) in kernel.calls
+
+
+def test_ctypes_sandbox_drive_survives_a_deep_stack_on_one_letter(monkeypatch):
+    long_root = _ROOT + "\\" + "x" * 200
+    kernel = _FakeDosKernel()
+    api = make_ctypes_api(kernel)
+    monkeypatch.setattr(wac.ctypes, "get_last_error", lambda: kernel.last_error, raising=False)
+
+    drives = [api.sandbox_drive(long_root) for _ in range(25)]
+    assert drives == ["Z:"] * 25
+    assert len(kernel.devices["Z:"]) == 25
+
+    for _ in range(25):
+        api.release_sandbox_drive("Z:", long_root)
+    assert kernel.devices["Z:"] == []
+
+
+def test_ctypes_sandbox_drive_verify_mismatch_pops_its_own_push():
+    class _MismatchKernel(_FakeDosKernel):
+        def QueryDosDeviceW(self, name, buffer, size):
+            result = super().QueryDosDeviceW(name, buffer, size)
+            if result:
+                buffer.value = "\\??\\z:\\not-the-real-root"
+            return result
+
+    kernel = _MismatchKernel()
+    api = make_ctypes_api(kernel)
+
+    with pytest.raises(_Win32Failure) as excinfo:
+        api.sandbox_drive(_ROOT)
+
+    assert excinfo.value.operation == "sandbox_drive"
+    assert kernel.devices["Z:"] == []
+    removes = [call for call in kernel.calls if call[0] == "define" and call[1] & 0x2]
+    assert removes == [("define", 0x8 | 0x2 | 0x4, "Z:", _ROOT)]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="C:\\Users DACL grant is a Windows failure")
@@ -4354,7 +4551,12 @@ def test_validation_helper_temp_grant_plan_spawns_under_the_winerror_267_limit()
 
     # A short sandbox root: pytest's tmp_path alone would leave no room under
     # the 258-character limit for the nested helper cwd.
-    base = Path(tempfile.gettempdir()) / f"s{os.getpid()}"
+    # The hub validation lane's TEMP is longer than LOCALAPPDATA\Temp and leaves no room for the nested helper cwd (NF-2026-01504), so pick whichever root is shorter.
+    short_root = min(
+        (tempfile.gettempdir(), os.path.join(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(), "Temp")),
+        key=len,
+    )
+    base = Path(short_root) / f"s{os.getpid()}"
     anchor = base / ".aiworkhub" / "runtime" / "worktrees"
 
     user = getpass.getuser() or "unknown"

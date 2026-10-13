@@ -211,3 +211,48 @@ def test_python_git_and_node_run_under_the_sandbox_drive(tmp_path):
     assert sid not in leaf_acl
     assert after_acl == before_acl
     assert _letters_naming(root_key) == before_letters
+
+
+def test_closing_the_only_launch_removes_the_sandbox_drive_letter(tmp_path):
+    """No sibling sharing the root: close() must pop the letter to nothing."""
+    root = (REPO / ".aiworkhub" / "runtime" / "worktrees").resolve()
+    live = root / f"live-{uuid.uuid4().hex[:8]}"
+    worktree = live / "worktree"
+    home = live / "home"
+    (home / "tmp").mkdir(parents=True)
+    worktree.mkdir()
+    root_key = os.path.normcase(str(root))
+    before_letters = _letters_naming(root_key)
+    assert before_letters == set(), "a concurrent launch already holds this root's letter"
+    env = {
+        "SystemRoot": os.environ["SystemRoot"],
+        "PATH": os.environ["SystemRoot"] + r"\System32",
+        "HOME": str(home),
+        "USERPROFILE": str(home),
+        "TEMP": str(home / "tmp"),
+        "TMP": str(home / "tmp"),
+    }
+    grants = request_scoped_grants(env, str(worktree)) + python_read_grants(
+        PYTHON, "", covered=[str(worktree)]
+    )
+    launch = launch_appcontainer(
+        AppContainerRequest(
+            argv=[PYTHON, "-I", "-c", "pass"],
+            repo_id=REPO_ID,
+            worker_kind=KIND,
+            executable=PYTHON,
+            working_directory=str(worktree),
+            environment=env,
+            filesystem_grants=grants,
+        )
+    )
+    try:
+        assert _letters_naming(root_key), "sandbox_drive must define the letter before launch"
+        launch.wait(60_000, terminate_on_timeout=True)
+    finally:
+        launch.close()
+        assert launch.grant_revoke_failures == []
+        if live.exists():
+            _remove_tree(live)
+
+    assert _letters_naming(root_key) == set()
