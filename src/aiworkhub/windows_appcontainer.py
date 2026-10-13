@@ -1364,6 +1364,25 @@ def resolve_roaming_appdata() -> str:
         return ""
 
 
+def supervisor_appdata_env(launch_env: dict[str, str]) -> None:
+    """Hand the supervisor's own LOCALAPPDATA/APPDATA to an AppContainer child.
+
+    NF-2026-01484: with USERPROFILE isolated to the request HOME, the
+    known-folder fallback inside the child expands under that HOME and
+    resolves to "" on first launch, or to a root inside HOME once a prior
+    attempt created it -- which ``_sensitive_roots`` then refuses to grant.
+    Hand over the supervisor's own values unconditionally so first launch and
+    the Claude auth retry agree; an unresolvable value is simply omitted and
+    this never raises.
+    """
+    local_appdata = resolve_local_appdata()
+    if local_appdata:
+        launch_env["LOCALAPPDATA"] = local_appdata
+    roaming_appdata = resolve_roaming_appdata()
+    if roaming_appdata:
+        launch_env["APPDATA"] = roaming_appdata
+
+
 def _token_profile_directory() -> str:
     """The REAL user's profile root, from the process token.
 

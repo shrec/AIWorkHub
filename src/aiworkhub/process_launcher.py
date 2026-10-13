@@ -626,25 +626,6 @@ def worker_launch_env(
     return env
 
 
-def _appcontainer_supervisor_env(launch_env: dict[str, str]) -> None:
-    """Hand the supervisor's own LOCALAPPDATA/APPDATA to an AppContainer child.
-
-    NF-2026-01484: with USERPROFILE isolated to the request HOME, the
-    known-folder fallback inside the child expands under that HOME and
-    resolves to "" on first launch, or to a root inside HOME once a prior
-    attempt created it -- which ``_sensitive_roots`` then refuses to grant.
-    Hand over the supervisor's own values unconditionally so first launch and
-    the Claude auth retry agree; an unresolvable value is simply omitted and
-    this never raises.
-    """
-    local_appdata = windows_appcontainer.resolve_local_appdata()
-    if local_appdata:
-        launch_env["LOCALAPPDATA"] = local_appdata
-    roaming_appdata = windows_appcontainer.resolve_roaming_appdata()
-    if roaming_appdata:
-        launch_env["APPDATA"] = roaming_appdata
-
-
 def _worker_supervisor_script() -> Path:
     sibling = Path(__file__).with_name("worker_supervisor.py")
     if sibling.is_file() and sibling.name == "worker_supervisor.py":
@@ -680,27 +661,9 @@ def _worker_supervisor_script() -> Path:
     raise LaunchRejected("worker_supervisor_script_missing")
 
 
-def _vscode_lm_worker_env(
-    provider_env: dict[str, str] | None,
-    package_import_root: Path,
-) -> dict[str, str]:
-    """Return the minimal environment needed by a packaged VS Code LM worker.
-
-    The worker runs as ``python -m aiworkhub.vscode_lm_worker`` from an
-    isolated repository worktree, so the repository cwd cannot make the
-    installed/bundled ``aiworkhub`` package importable.  Reuse the exact
-    package root already resolved and sandbox-rewritten for the worker MCP
-    runtime instead of depending on a developer checkout or global install.
-    """
-    env = dict(provider_env or {})
-    env[worker_ai_tools_mcp.ENV_PYTHONPATH] = str(package_import_root)
-    return env
-
-
-# Backwards-compatible private alias retained for installed integrations and
-# tests that predate the generic VS Code Auth Model Broker.
+from .vscode_lm_bridge import worker_env as _vscode_lm_worker_env
+_appcontainer_supervisor_env = windows_appcontainer.supervisor_appdata_env
 _glm_vscode_worker_env = _vscode_lm_worker_env
-
 _VSCODE_LM_IN_PROCESS_ADAPTERS = frozenset(
     {
         runtime_adapters.VSCODE_LM_ADAPTER,
@@ -3048,26 +3011,13 @@ def derive_launch_identity(
                 adapter_rejections.append(skip)
                 continue
             if candidate in _VSCODE_LM_IN_PROCESS_ADAPTERS:
-                # NF-2026-01482: a derived candidate from the vscode_lm bridge
-                # family (vscode_lm, glm_vscode_lm, deepseek_vscode_lm) needs a
-                # launchable bridge host; policy/circuit approval alone can
-                # still point at an editor session nothing ever started.
-                try:
-                    readiness = vscode_lm_bridge.bridge_readiness(
-                        repo,
-                        model=(
-                            str(pinned_route["model"])
-                            if pinned_route is not None
-                            else None
-                        ),
-                        adapter_id=candidate,
-                    )
-                except Exception:  # noqa: BLE001 - unreadable bridge state blocks, not launches
-                    blocker = "bridge_readiness_error"
-                    adapter_rejections.append(f"{candidate}:vscode_lm_unavailable:{blocker}")
-                    continue
-                if not readiness.get("launchable"):
-                    blocker = str(readiness.get("blocker_reason") or "") or "not_launchable"
+                # NF-2026-01482: a derived vscode_lm-family candidate also
+                # needs a launchable bridge host -- policy/circuit approval
+                # alone can still point at an editor session nothing started.
+                blocker = vscode_lm_bridge.derived_candidate_blocker(
+                    repo, candidate,
+                    str(pinned_route["model"]) if pinned_route is not None else None)
+                if blocker:
                     adapter_rejections.append(f"{candidate}:vscode_lm_unavailable:{blocker}")
                     continue
             resolved_adapter = candidate
@@ -9973,7 +9923,7 @@ class ProcessManager:
                 sandbox_backend=sandbox_backend,
             )
             if sandbox_backend == "windows_appcontainer":
-                _appcontainer_supervisor_env(launch_env)
+                windows_appcontainer.supervisor_appdata_env(launch_env)
             try:
                 process = _spawn_with_stdin_payload(
                     self._popen,

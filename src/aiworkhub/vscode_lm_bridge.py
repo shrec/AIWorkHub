@@ -440,6 +440,25 @@ def _atomic_json_once(
             pass
 
 
+def worker_env(
+    provider_env: dict[str, str] | None,
+    package_import_root: Path,
+) -> dict[str, str]:
+    """Return the minimal environment needed by a packaged VS Code LM worker.
+
+    The worker runs as ``python -m aiworkhub.vscode_lm_worker`` from an
+    isolated repository worktree, so the repository cwd cannot make the
+    installed/bundled ``aiworkhub`` package importable.  Reuse the exact
+    package root already resolved and sandbox-rewritten for the worker MCP
+    runtime instead of depending on a developer checkout or global install.
+    """
+    from . import worker_ai_tools_mcp
+
+    env = dict(provider_env or {})
+    env[worker_ai_tools_mcp.ENV_PYTHONPATH] = str(package_import_root)
+    return env
+
+
 def bridge_readiness(
     repo: Path,
     *,
@@ -570,6 +589,27 @@ def bridge_readiness(
         ),
         "credential_required": False,
     }
+
+
+def derived_candidate_blocker(
+    repo: Path,
+    adapter_id: str,
+    model: str | None,
+) -> str:
+    """Return "" if `adapter_id` is launchable for `repo`, else the blocker.
+
+    NF-2026-01482: a derived candidate from the vscode_lm bridge family
+    (vscode_lm, glm_vscode_lm, deepseek_vscode_lm) needs a launchable bridge
+    host; policy/circuit approval alone can still point at an editor session
+    nothing ever started.
+    """
+    try:
+        readiness = bridge_readiness(repo, model=model, adapter_id=adapter_id)
+    except Exception:  # noqa: BLE001 - unreadable bridge state blocks, not launches
+        return "bridge_readiness_error"
+    if not readiness.get("launchable"):
+        return str(readiness.get("blocker_reason") or "") or "not_launchable"
+    return ""
 
 
 def _normalize_required_output_path(value: object) -> str:

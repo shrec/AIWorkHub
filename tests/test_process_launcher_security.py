@@ -1912,9 +1912,9 @@ def test_claude_auth_retry_appcontainer_env_matches_the_single_helper(
     tmp_path: Path,
 ) -> None:
     """First launch (``launch_isolated``) and the auth retry both bind the
-    exact same ``_appcontainer_supervisor_env`` free variable from
-    ``process_launcher``, so the retry's env can never diverge from what a
-    direct call to that one helper produces.
+    exact same ``windows_appcontainer.supervisor_appdata_env`` helper, so
+    the retry's env can never diverge from what a direct call to that one
+    helper produces.
     """
     popen_calls, _event = _run_windows_appcontainer_auth_retry(
         monkeypatch,
@@ -1923,7 +1923,7 @@ def test_claude_auth_retry_appcontainer_env_matches_the_single_helper(
         roaming_appdata=r"C:\Real\Roaming",
     )
     direct_env: dict[str, str] = {}
-    process_launcher._appcontainer_supervisor_env(direct_env)
+    process_launcher.windows_appcontainer.supervisor_appdata_env(direct_env)
     env = popen_calls[0]["env"]
     assert env["LOCALAPPDATA"] == direct_env["LOCALAPPDATA"]
     assert env["APPDATA"] == direct_env["APPDATA"]
