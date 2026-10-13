@@ -14,6 +14,10 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.49
+
+- OpenCode runs that recover from a provider error are no longer failed; sandbox Y:/Z: drives are cleaned up after each run; a recovered task no longer relaunches by itself and now receives the manager's recovery instruction; accepting a review with a manager correction can no longer lose the workspace to background cleanup.
+
 ## What's new in 0.12.48
 
 - First published build with the 0.12.47 changes (Restart, Stop, Copy, Manager Chat no longer self-starts, OpenCode key and model fixes); fixes the CI blocker that held 0.12.47 back (NF-2026-01492).

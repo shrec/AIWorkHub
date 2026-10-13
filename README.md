@@ -62,6 +62,10 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.49
+
+- OpenCode runs that recover from a provider error are no longer failed; sandbox Y:/Z: drives are cleaned up after each run; a recovered task no longer relaunches by itself and now receives the manager's recovery instruction; accepting a review with a manager correction can no longer lose the workspace to background cleanup.
+
 ## What's new in 0.12.48
 
 - First published build with the 0.12.47 changes (Restart, Stop, Copy, Manager Chat no longer self-starts, OpenCode key and model fixes); fixes the CI blocker that held 0.12.47 back (NF-2026-01492).

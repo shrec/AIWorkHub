@@ -6,6 +6,17 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.49] - 2026-10-13
+
+### Fixed
+
+- OpenCode: a run that hit a provider error, recovered and finished its session is no longer failed because OpenCode exited 1 (NF-2026-01493).
+- AppContainer: every Y:/Z: sandbox drive mapping is now removed with an exact pop, so the drive letters no longer pile up across worker runs (NF-2026-01498, NF-2026-01504).
+- Task lifecycle: a card recovered from blocked no longer keeps a stale transient-retry schedule that relaunched it on its own, and the manager's recovery instruction now reaches the worker prompt (NF-2026-01512, NF-2026-01513).
+- Task lifecycle: a reject that sends a card back to pending drops the earlier recovery instruction, so the relaunched worker sees only the new review feedback (NF-2026-01514).
+- Acceptance: accepting a review with a manager correction now also holds the per-request lock, so retention GC can no longer quarantine the workspace while the correction is being revalidated (NF-2026-01515).
+- Tests: the registry key-minting tests skip inside the AppContainer validation lane, where WRITE_DAC is refused (NF-2026-01496).
+
 ## [0.12.48] - 2026-10-13
 
 ### Fixed

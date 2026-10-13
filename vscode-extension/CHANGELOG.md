@@ -1,5 +1,11 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.49 — 2026-10-13
+
+### Fixed
+
+- Bundled runtime 0.12.49: OpenCode runs that recover from a provider error finish as review-ready; sandbox Y:/Z: drives no longer accumulate; a recovered card no longer auto-relaunches from a stale retry, and the recovery instruction reaches the worker; a reject to pending drops the stale recovery instruction; accept with a manager correction can no longer lose its workspace to retention GC (NF-2026-01493, NF-2026-01498, NF-2026-01504, NF-2026-01512, NF-2026-01513, NF-2026-01514, NF-2026-01515).
+
 ## 0.12.48 — 2026-10-13
 
 ### Fixed
