@@ -12,6 +12,7 @@ this function no longer calls -- silently, with the tests still green.
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import hashlib
 import re
@@ -1618,6 +1619,7 @@ ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
     "_sealed_receipt_sha256",
     "_target_candidate_sha256",
     "bound_finding_dispositions",
+    "contextlib",
     "create_supplemental_inspection_rounds",
     "effective_requested_risk_tier",
     "fold_accept_blockers",
@@ -1791,7 +1793,14 @@ def accept_review(
         if readonly_lock_path
         else self._promotion_lock()
     )
-    with acceptance_lock:
+    # NF-2026-01515: the writable path must also hold the per-request lock so
+    # retention GC (_gc_finalized_workspace) cannot quarantine this workspace
+    # mid-correction; the read-only path already holds that lock alone.
+    with acceptance_lock, (
+        contextlib.nullcontext()
+        if readonly_lock_path
+        else self._request_lock(request_id)
+    ):
         if reviewer_reports:
             return {
                 "ok": False,

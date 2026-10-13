@@ -286,6 +286,9 @@ def test_accept_review_uses_terminal_identity_before_later_orchestrator_event():
         def _promotion_lock(self):
             return contextlib.nullcontext()
 
+        def _request_lock(self, request_id: str):
+            return contextlib.nullcontext()
+
     result = process_launcher_accept_review.accept_review(_Manager(), "R-1", "T-1")
 
     assert result["error"] == "task_lookup_failed:stop-after-identity"
