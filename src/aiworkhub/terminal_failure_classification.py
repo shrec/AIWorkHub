@@ -13,6 +13,7 @@ SCHEMA_ID = "aiworkhub.task_mcp.terminal_failure_classification.v1"
 
 MAX_DIAGNOSTIC_CHARS = 400
 MAX_TAIL_READ_BYTES = 4096
+MAX_OPENCODE_SCAN_LINE_BYTES = 4 * 1024 * 1024
 
 _TIMEOUT_STALL_STATES = {"timed_out", "stalled", "liveness_lost"}
 _CANCELLED_STATES = {"cancelled", "canceled"}
@@ -785,6 +786,23 @@ def _assemble_diagnostic(
     return ":".join(parts)[:MAX_DIAGNOSTIC_CHARS]
 
 
+def _open_nofollow_fd(path: str | Path | None) -> int | None:
+    """Return an O_NOFOLLOW-guarded fd for ``path``, or None if missing, symlinked, or unopenable."""
+    if not path:
+        return None
+    target = Path(path)
+    if target.is_symlink() or not target.is_file():
+        return None
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        return os.open(target, flags)
+    except OSError:
+        return None
+
+
 def _read_log_tail(path: str | Path | None, *, max_bytes: int = MAX_TAIL_READ_BYTES) -> str:
     """Read up to ``max_bytes`` of whole lines from the end of ``path``, exactly once, transiently.
 
@@ -799,17 +817,8 @@ def _read_log_tail(path: str | Path | None, *, max_bytes: int = MAX_TAIL_READ_BY
     path can be replaced by a symlink to an arbitrary host file between
     process exit and terminal finalization reading it.
     """
-    if not path:
-        return ""
-    target = Path(path)
-    if target.is_symlink() or not target.is_file():
-        return ""
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        fd = os.open(target, flags)
-    except OSError:
+    fd = _open_nofollow_fd(path)
+    if fd is None:
         return ""
     try:
         with os.fdopen(fd, "rb") as handle:
@@ -2190,6 +2199,60 @@ def provider_terminal_signal(text: str | None) -> dict[str, Any]:
         "code": found["code"],
         "envelope": found["envelope"],
     }
+
+
+def opencode_recovered_exit(adapter_id: str | None, stdout_path: str | Path | None) -> bool:
+    """True iff an opencode_cli stream contains an error event that is not the final event.
+
+    Scans the WHOLE stdout stream, one line at a time: a mid-session provider
+    error the model recovered from can sit far past any bounded tail. Each
+    line is capped at MAX_OPENCODE_SCAN_LINE_BYTES and the scan never reads
+    past the file's size at open time, so a newline-free or still-growing log
+    cannot be pulled into memory unbounded.
+    """
+    if adapter_id != "opencode_cli":
+        return False
+    fd = _open_nofollow_fd(stdout_path)
+    if fd is None:
+        return False
+    saw_error = False
+    ended_in_error = False
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            remaining = os.fstat(handle.fileno()).st_size
+            while remaining > 0:
+                raw_line = handle.readline(min(MAX_OPENCODE_SCAN_LINE_BYTES + 1, remaining))
+                if not raw_line:
+                    break
+                remaining -= len(raw_line)
+                if len(raw_line) > MAX_OPENCODE_SCAN_LINE_BYTES:
+                    return False
+                line = _frame_payload(raw_line.decode("utf-8", errors="replace"))
+                if not line.startswith("{"):
+                    continue
+                try:
+                    event = json.loads(line)
+                except (TypeError, ValueError, RecursionError):
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                event_type = str(event.get("type") or "").strip().lower()
+                ended_in_error = event_type in {"error", "session.error", "session_error"}
+                saw_error = saw_error or ended_in_error
+    except OSError:
+        return False
+    return saw_error and not ended_in_error
+
+
+def recovered_exit_code(adapter_id: str | None, stdout_path: str | Path | None, exit_code: int | None) -> int | None:
+    """Return 0 when ``exit_code`` is 1 and the opencode stream recovered, else ``exit_code`` unchanged.
+
+    Only the provider's own error exit (1) may be promoted; crash/signal codes
+    (-9, 137, ...) are never masked.
+    """
+    if exit_code == 1 and opencode_recovered_exit(adapter_id, stdout_path):
+        return 0
+    return exit_code
 
 
 def disposition_for_reason(reason: str | None) -> str:

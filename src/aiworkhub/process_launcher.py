@@ -11084,7 +11084,11 @@ class ProcessManager:
             ):
                 _terminate_process_group(verified_child_pid, grace_seconds=5.0)
 
-            exit_code = terminal_failure_classification.normalize_exit_code(supervisor_status.get("exit_code"))
+            exit_code = terminal_failure_classification.recovered_exit_code(
+                metadata.get("adapter_id"),
+                metadata.get("stdout_path"),
+                terminal_failure_classification.normalize_exit_code(supervisor_status.get("exit_code")),
+            )
             error = stall_error or str(supervisor_status.get("error") or "")[:500]
             # SPOOFING SURFACE, NAMED AND DELIBERATELY LEFT OPEN FOR STEP 2.
             # This is the one control-plane candidate that comes from OUTSIDE
@@ -12219,6 +12223,7 @@ class ProcessManager:
                 "pid_start_ticks": latest.get("pid_start_ticks"),
                 "child_pid": supervisor_status.get("child_pid"),
                 "exit_code": exit_code,
+                "provider_exit_code": supervisor_status.get("exit_code"),
                 "finished_at": _utcnow(),
                 "stdout_path": metadata["stdout_path"],
                 "stderr_path": metadata["stderr_path"],
@@ -13457,7 +13462,9 @@ class ProcessManager:
             supervisor_status = self._read_supervisor_status(status_path)
             if (
                 str(supervisor_status.get("state") or "") != "exited"
-                or supervisor_status.get("exit_code") != 0
+                or terminal_failure_classification.recovered_exit_code(
+                    metadata.get("adapter_id"), metadata.get("stdout_path"), supervisor_status.get("exit_code")
+                ) != 0
             ):
                 return {
                     "ok": False,
