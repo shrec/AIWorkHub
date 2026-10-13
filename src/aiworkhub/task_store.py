@@ -4997,12 +4997,20 @@ def _terminal_failure_supersedes_predecessor(
     newer delta must replace the stale predecessor instead of being shadowed
     by it (NF-2026-00515).  A predecessor without a trustworthy claim epoch
     (for example a reviewer-pinned workspace) is never superseded by failure
-    history.
+    history.  A later failure with no candidate (for example a cancel before
+    any output) never supersedes a sealed predecessor (NF-2026-01516).
     """
     predecessor_epoch = retained_predecessor.get("claim_epoch")
     failure_epoch = terminal_failure.get("claim_epoch")
+    evidence = terminal_failure.get("evidence")
+    has_candidate_evidence = isinstance(evidence, dict) and (
+        bool(evidence.get("changed_paths"))
+        or bool(evidence.get("changed_path_hashes"))
+        or bool(evidence.get("python_candidate_authority"))
+    )
     return (
-        type(failure_epoch) is int
+        has_candidate_evidence
+        and type(failure_epoch) is int
         and failure_epoch > 0
         and type(predecessor_epoch) is int
         and predecessor_epoch > 0
@@ -6018,6 +6026,28 @@ def recover_blocked_rework(
         ):
             terminal_event = "terminal_failure"
             terminal_row = newest_terminal_failure
+        elif (
+            terminal_row is None
+            and retained_predecessor.get("request_id")
+            and not validation_only_replay
+        ):
+            # NF-2026-01516: a predecessor synthesized from an earlier
+            # terminal_failure binds that failure, not a later no-candidate one.
+            for failure_row in conn.execute(
+                "SELECT runner, payload_json, created_at FROM task_events "
+                "WHERE task_id=? AND event='terminal_failure' ORDER BY rowid DESC",
+                (task_id,),
+            ).fetchall():
+                try:
+                    failure_payload = json.loads(str(failure_row["payload_json"] or "{}"))
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(failure_payload, dict) and failure_payload.get(
+                    "request_id"
+                ) == retained_predecessor.get("request_id"):
+                    terminal_event = "terminal_failure"
+                    terminal_row = failure_row
+                    break
 
         if scope_rejection_resolved:
             # NF-2026-01169: an explicit scope-rejection resolution binds the

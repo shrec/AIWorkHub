@@ -2660,6 +2660,104 @@ def test_timed_out_sealed_delta_supersedes_earlier_predecessor(
         assert (late_workspace / path).read_bytes() == original
 
 
+def test_cancelled_no_candidate_failure_keeps_sealed_predecessor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NF-2026-01516: a cancelled episode with no candidate evidence (a
+    cancel before any output) never supersedes a sealed seven-path
+    predecessor delta retained from an earlier, successfully recovered
+    episode."""
+    repo, task_id, sealed, descriptor = _nf919_timed_out_gc_fixture(
+        tmp_path, monkeypatch,
+    )
+
+    assert task_store.recover_blocked_rework(
+        repo,
+        task_id,
+        actor="coordinator",
+        feedback_reason=_NF919_FEEDBACK,
+    ) == (True, "recovered")
+
+    sealed_card = _get_card(repo, task_id)
+
+    cancelled_request_id = "7" * 32
+    cancelled_terminal = {
+        "substatus": "cancelled",
+        "claim_epoch": 7,
+        "request_id": cancelled_request_id,
+        "evidence": {
+            "adapter_id": "claude_cli",
+            "error": "worker_cancelled:no_output",
+            "request_id": cancelled_request_id,
+            "changed_paths": None,
+            "required_outputs": [
+                {
+                    "path": _NF919_PATHS[0],
+                    "missing": True,
+                    "bytes": None,
+                    "sha256": "",
+                    "reason": "worker_terminal_before_output_validation",
+                }
+            ],
+        },
+    }
+    card = dict(sealed_card)
+    card["status"] = "blocked"
+    card["worker_status"] = "cancelled"
+    card["terminal_substatus"] = "cancelled"
+    card["terminal_failure"] = cancelled_terminal
+    card["launch_request_id"] = cancelled_request_id
+    card["blocker_reason"] = "cancelled: worker cancelled with no candidate"
+
+    runner = "codex_worker_test"
+    now = "2026-09-20T00:05:00+00:00"
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json = ?, status = 'blocked', "
+            "worker_status = 'cancelled', updated_at = ? WHERE task_id = ?",
+            (json.dumps(card), now, task_id),
+        )
+        conn.execute(
+            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+            "VALUES (?, 'terminal_failure', ?, ?, ?)",
+            (task_id, runner, json.dumps(cancelled_terminal), now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert task_store.recover_blocked_rework(
+        repo,
+        task_id,
+        actor="coordinator",
+        feedback_reason="NeedFix: retry after cancelled no-candidate run",
+    ) == (True, "recovered")
+
+    recovered = _get_card(repo, task_id)
+    pred = recovered["rework_predecessor"]
+    # The cancelled no-candidate failure never supersedes the sealed
+    # seven-path predecessor delta: same request, same claim epoch.
+    assert pred["request_id"] == descriptor["request_id"]
+    assert pred["claim_epoch"] == 6
+    assert pred["rework_delta"] == descriptor
+    assert pred["delta_artifact"] == {
+        "path": descriptor["artifact_path"],
+        "digest": descriptor["artifact_sha256"],
+    }
+    assert len(pred["changed_path_hashes"]) == 7
+    # No clean-root fallback was taken for this retained, sealed predecessor.
+    assert "clean_root_recovery_authorization" not in recovered
+
+    # NF-2026-00515 unchanged: a later failure that DOES carry candidate
+    # evidence still supersedes an earlier-epoch predecessor.
+    assert task_store._terminal_failure_supersedes_predecessor(
+        {"claim_epoch": 7, "evidence": {"changed_paths": [_NF919_PATHS[0]]}},
+        {"claim_epoch": 6},
+    )
+
+
 def test_later_timed_out_delta_supersedes_predecessor_that_has_workspace(
     tmp_path: Path,
 ) -> None:
