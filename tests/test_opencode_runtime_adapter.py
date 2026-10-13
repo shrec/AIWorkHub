@@ -780,3 +780,101 @@ def test_the_package_has_one_toml_string_quoter_and_one_array_writer() -> None:
     assert worker_ai_tools_mcp.toml_string_array is runtime_adapters.toml_string_array
     assert runtime_adapters.toml_basic_string('a"b\\c') == '"a\\"b\\\\c"'
     assert runtime_adapters.toml_string_array(("a", 'b"c')) == '["a", "b\\"c"]'
+
+
+def _worker_config_with_provider(block: dict[str, object]) -> dict[str, object]:
+    return runtime_adapters.build_opencode_worker_mcp_config(
+        ("/usr/bin/python3", "-m", "aiworkhub.worker_ai_tools_mcp"),
+        environment=_worker_env(),
+        provider=block,
+    )
+
+
+def test_opencode_worker_mcp_config_projects_a_bounded_custom_provider() -> None:
+    block = {"omniroute": {"name": "OmniRoute", "models": {"router-model": {}}}}
+    config = _worker_config_with_provider(block)
+    assert config["provider"] == block
+    assert runtime_adapters.validate_opencode_worker_config(config) is config
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        {
+            "omniroute": {"models": {"router-model": {}}},
+            "other": {"models": {"x": {}}},
+        },
+        {"omniroute": {"models": {"a": {}, "b": {}}}},
+        {"omniroute": {"models": {"router-model": {}}, "unknown": "x"}},
+        {
+            "omniroute": {
+                "options": {"baseURL": "x", "unknown": "y"},
+                "models": {"router-model": {}},
+            }
+        },
+        {"omniroute": {"models": "not-a-mapping"}},
+        {"omniroute": ["not", "a", "mapping"]},
+        {"opencode-go": {"models": {"muse-spark": {}}}},
+        {"opencode": {"models": {"muse-spark": {}}}},
+        {"omniroute": {"name": 5, "models": {"router-model": {}}}},
+        {
+            "omniroute": {
+                "options": {"apiKey": "{env:OMNIROUTE_KEY}"},
+                "models": {"router-model": {}},
+            }
+        },
+        {
+            "omniroute": {
+                "options": {"headers": {"x-key": "{file:/etc/omniroute-key}"}},
+                "models": {"router-model": {}},
+            }
+        },
+        {
+            "omniroute": {
+                "options": {"headers": ["x-key"]},
+                "models": {"router-model": {}},
+            }
+        },
+        {"omniroute": {"models": {"router-model": {"name": "Router Model"}}}},
+        {"omniroute": {"models": {"router-model": {"limit": {"context": "big"}}}}},
+    ],
+    ids=[
+        "two_providers",
+        "two_models",
+        "unknown_provider_key",
+        "unknown_option_key",
+        "models_not_a_mapping",
+        "provider_entry_not_a_mapping",
+        "builtin_opencode_go",
+        "builtin_opencode",
+        "non_string_value",
+        "template_api_key",
+        "template_header",
+        "headers_not_a_mapping",
+        "unknown_model_key",
+        "bad_limit_type",
+    ],
+)
+def test_opencode_worker_config_validator_rejects_malshaped_custom_providers(
+    block: dict[str, object],
+) -> None:
+    config = _worker_config_with_provider(block)
+    with pytest.raises(runtime_adapters.OpenCodeWorkerConfigError) as excinfo:
+        runtime_adapters.validate_opencode_worker_config(config)
+    assert excinfo.value.cause == "malformed"
+
+
+def test_opencode_worker_config_validator_accepts_a_bounded_model_entry() -> None:
+    block = {
+        "omniroute": {
+            "models": {
+                "router-model": {
+                    "id": "upstream-router-model",
+                    "limit": {"context": 128000, "output": 8192},
+                    "tool_call": True,
+                }
+            }
+        }
+    }
+    config = _worker_config_with_provider(block)
+    assert runtime_adapters.validate_opencode_worker_config(config) is config

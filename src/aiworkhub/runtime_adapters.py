@@ -1895,16 +1895,24 @@ def _serialize_opencode_config(config: Any, *, role: str) -> str:
 
 
 def build_opencode_worker_mcp_config(
-    mcp_command: Sequence[str], *, environment: Mapping[str, str] | None = None
+    mcp_command: Sequence[str],
+    *,
+    environment: Mapping[str, str] | None = None,
+    provider: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Inert OpenCode config data: the ``awh`` server and the worker permissions.
 
     ``environment`` is the MCP server's own request binding inside the config,
-    never the launcher's process environment.
+    never the launcher's process environment.  ``provider`` is the bounded,
+    single-provider/single-model custom-provider block ``opencode_auth``
+    projects for an owner-configured model, or ``None`` for a built-in one.
     """
-    return _build_opencode_mcp_config(
+    config = _build_opencode_mcp_config(
         mcp_command, environment=environment, role=OPENCODE_WORKER_ROLE
     )
+    if provider is not None:
+        config["provider"] = dict(provider)
+    return config
 
 
 def validate_opencode_worker_config(config: Any) -> Any:
@@ -2114,11 +2122,71 @@ def _opencode_manager_provider_block(target: tuple[str, str]) -> dict[str, Any]:
     }
 
 
+_OPENCODE_CUSTOM_PROVIDER_KEYS = frozenset({"npm", "name", "options", "models"})
+_OPENCODE_CUSTOM_PROVIDER_OPTION_KEYS = frozenset({"baseURL", "apiKey", "headers"})
+
+
+def _check_opencode_worker_provider(block: Any) -> None:
+    """Accept exactly one custom provider with exactly one model and bounded keys.
+
+    A built-in provider id is refused; every projected string is a ``str`` with
+    no ``{env:``/``{file:`` left (the projection already resolved them),
+    ``headers`` is a mapping, and the model entry keeps only ``id`` (str),
+    ``limit`` (positive ``context``/``output`` ints) and the boolean flags.
+    """
+    from . import opencode_auth
+
+    try:
+        ((provider, entry),) = block.items()
+    except (AttributeError, ValueError):
+        raise OpenCodeWorkerConfigError("malformed", "provider") from None
+    if (
+        provider in opencode_auth._OPENCODE_BUILTIN_PROVIDERS
+        or not isinstance(entry, dict)
+        or not set(entry) <= _OPENCODE_CUSTOM_PROVIDER_KEYS
+    ):
+        raise OpenCodeWorkerConfigError("malformed", "provider")
+    options = entry.get("options", {})
+    headers = options.get("headers", {}) if isinstance(options, dict) else None
+    if (
+        not isinstance(headers, dict)
+        or not set(options) <= _OPENCODE_CUSTOM_PROVIDER_OPTION_KEYS
+    ):
+        raise OpenCodeWorkerConfigError("malformed", "provider")
+    texts = [entry[key] for key in ("npm", "name") if key in entry]
+    texts += [options[key] for key in ("baseURL", "apiKey") if key in options]
+    if not all(
+        isinstance(text, str) and "{env:" not in text and "{file:" not in text
+        for text in (*texts, *headers, *headers.values())
+    ):
+        raise OpenCodeWorkerConfigError("malformed", "provider")
+    try:
+        ((_name, model_entry),) = entry.get("models", {}).items()
+    except (AttributeError, ValueError):
+        raise OpenCodeWorkerConfigError("malformed", "provider") from None
+    flags = opencode_auth._OPENCODE_MODEL_FLAGS
+    limit = model_entry.get("limit", {}) if isinstance(model_entry, dict) else None
+    if (
+        not isinstance(limit, dict)
+        or not set(model_entry) <= {"id", "limit", *flags}
+        or not isinstance(model_entry.get("id", ""), str)
+        or "{env:" in model_entry.get("id", "")
+        or "{file:" in model_entry.get("id", "")
+        or not set(limit) <= set(opencode_auth._OPENCODE_MODEL_LIMIT_KEYS)
+        or not all(type(value) is int and value > 0 for value in limit.values())
+        or not all(isinstance(model_entry[flag], bool) for flag in flags if flag in model_entry)
+    ):
+        raise OpenCodeWorkerConfigError("malformed", "provider")
+
+
 def _check_opencode_manager_provider(config: Any, role: str) -> Any:
-    """Accept exactly the manager provider block, or no provider at all."""
+    """Accept exactly the manager/worker provider block, or no provider at all."""
     if "provider" not in config:
         return config
     block = config["provider"]
+    if role == OPENCODE_WORKER_ROLE:
+        _check_opencode_worker_provider(block)
+        return config
     try:
         ((provider, entry),) = block.items()
         ((name, _),) = entry["models"].items()

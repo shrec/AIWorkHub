@@ -17,6 +17,7 @@ if str(_SRC) not in sys.path:
 
 from aiworkhub import (  # noqa: E402
     model_settings,
+    opencode_auth,
     repo_policy,
     runtime_adapters,
     task_store,
@@ -1247,3 +1248,84 @@ def test_vetted_opencode_seed_rows_sit_beside_the_discovered_inventory(
     rows = [row for row in snapshot["workers"] if row["adapter_id"] == "opencode_cli"]
     assert {str(row["model"]) for row in rows} == seeds | {_FREE}
     assert [row["model"] for row in _opencode_rows(snapshot)] == [_FREE]
+
+
+def test_opencode_custom_provider_key_never_persists_to_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sentinel = "sentinel-key-9c21af06"
+    config_home = tmp_path / "xdg-config"
+    opencode_dir = config_home / "opencode"
+    opencode_dir.mkdir(parents=True)
+    (opencode_dir / "opencode.json").write_text(
+        json.dumps(
+            {
+                "provider": {
+                    "omniroute": {
+                        "options": {
+                            "baseURL": "https://api.example.com/v1",
+                            "apiKey": "{env:AIWORKHUB_TEST_OMNIROUTE_KEY}",
+                        },
+                        "models": {"router-model": {}},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    monkeypatch.setenv("AIWORKHUB_TEST_OMNIROUTE_KEY", sentinel)
+
+    workspace, runtime, authority = _opencode_request(tmp_path / "request")
+    delivered = worker_workspace.provision_opencode_worker_config(
+        workspace,
+        runtime,
+        backend="landlock",
+        authority_repo=authority,
+        model="omniroute/router-model",
+    )
+
+    assert sentinel in delivered[_OC_ENV]
+    for path in tmp_path.rglob("*"):
+        if path.is_file():
+            assert sentinel not in path.read_text(encoding="utf-8", errors="ignore")
+
+
+def test_provision_opencode_worker_config_refuses_loopback_provider_under_appcontainer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_home = tmp_path / "xdg-config"
+    opencode_dir = config_home / "opencode"
+    opencode_dir.mkdir(parents=True)
+    (opencode_dir / "opencode.json").write_text(
+        json.dumps(
+            {
+                "provider": {
+                    "omniroute": {
+                        "options": {
+                            "baseURL": "http://localhost:20128/v1",
+                            "apiKey": "literal",
+                        },
+                        "models": {"router-model": {}},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    workspace, runtime, authority = _opencode_request(
+        tmp_path / "request", "windows_appcontainer"
+    )
+
+    with pytest.raises(
+        opencode_auth.OpenCodeAuthError,
+        match="^opencode_provider_loopback_unreachable_in_appcontainer$",
+    ):
+        worker_workspace.provision_opencode_worker_config(
+            workspace,
+            runtime,
+            backend="windows_appcontainer",
+            authority_repo=authority,
+            model="omniroute/router-model",
+        )

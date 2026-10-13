@@ -8,14 +8,19 @@ session state are never traversed.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
+import re
+import socket
 import stat
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from os import PathLike
 from pathlib import Path
 from typing import Union
+from urllib.parse import urlsplit
 
 from .platform_io import (
     chmod_fd,
@@ -34,6 +39,7 @@ __all__ = [
     "OpenCodeAuthSourceError",
     "opencode_go_api_key_env",
     "project_opencode_auth",
+    "project_opencode_custom_provider",
 ]
 
 OPENCODE_AUTH_RELATIVE_PATH = (
@@ -44,6 +50,22 @@ OPENCODE_AUTH_RELATIVE_PATH = (
 OPENCODE_API_KEY_ENV = "OPENCODE_API_KEY"
 MAX_SOURCE_BYTES = 1 << 20
 _READ_CHUNK_BYTES = 64 * 1024
+_OPENCODE_BUILTIN_PROVIDERS = ("opencode", "opencode-go")
+# The only owner model-entry keys a projected custom provider keeps; the worker
+# config validator in ``runtime_adapters`` imports these same names.
+_OPENCODE_MODEL_FLAGS = ("tool_call", "reasoning", "attachment", "temperature")
+_OPENCODE_MODEL_LIMIT_KEYS = ("context", "output")
+# OpenCode's ``{env:NAME}`` config substitution, and any other ``{...}`` token.
+_OPENCODE_ENV_TEMPLATE = re.compile(r"\{env:([^{}]*)\}")
+_OPENCODE_ANY_TEMPLATE = re.compile(r"\{[^{}]*\}")
+# Owner-config read failures that leave the file unread, whatever the cause.
+_OPENCODE_CONFIG_UNREADABLE_REASONS = (
+    "opencode_auth_source_path_invalid",
+    "opencode_auth_source_unavailable",
+    "opencode_auth_source_not_regular",
+    "opencode_auth_source_size_invalid",
+    "opencode_auth_source_identity_changed",
+)
 
 StrPath = Union[str, PathLike[str]]
 
@@ -85,7 +107,9 @@ def _identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
     )
 
 
-def _read_verified_source(source: Path) -> bytes:
+def _read_verified_source(
+    source: Path, *, encoding: str = "utf-8", allow_empty: bool = False
+) -> bytes:
     if not source.is_absolute() or ".." in source.parts:
         raise OpenCodeAuthSourceError("opencode_auth_source_path_invalid")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
@@ -130,10 +154,10 @@ def _read_verified_source(source: Path) -> bytes:
             raise OpenCodeAuthSourceError("opencode_auth_source_identity_changed")
         raw = b"".join(chunks)
         try:
-            payload = json.loads(raw.decode("utf-8"))
+            payload = json.loads(raw.decode(encoding))
         except (UnicodeDecodeError, ValueError):
             raise OpenCodeAuthSourceError("opencode_auth_source_json_invalid") from None
-        if not isinstance(payload, dict) or not payload:
+        if not isinstance(payload, dict) or not (payload or allow_empty):
             raise OpenCodeAuthSourceError("opencode_auth_source_json_invalid")
         return raw
     finally:
@@ -290,3 +314,189 @@ def opencode_go_api_key_env(isolated_home: StrPath) -> dict[str, str]:
     if not key:
         return {}
     return {OPENCODE_API_KEY_ENV: key}
+
+
+def _owner_opencode_global_config_path() -> Path:
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    if config_home:
+        return Path(config_home) / "opencode" / "opencode.json"
+    return Path.home() / ".config" / "opencode" / "opencode.json"
+
+
+def _read_bounded_json(path: Path) -> object | None:
+    # The owner config decides which host secret is released and where it is
+    # sent, so it gets auth.json's bounded, owner- and mode-checked read.  Only
+    # an absent file or an empty {} is "not configured"; an unparseable one (strict
+    # JSON, so a JSONC comment too) is opencode_provider_config_json_invalid; a
+    # symlinked, non-regular, oversized or otherwise unreadable one is
+    # opencode_provider_config_unreadable and an unsafe one keeps its own
+    # opencode_provider_config_* reason.
+    try:
+        if stat.S_ISLNK(path.lstat().st_mode):
+            raise OpenCodeAuthError("opencode_provider_config_unreadable")
+        raw = _read_verified_source(path, encoding="utf-8-sig", allow_empty=True)
+        return json.loads(raw.decode("utf-8-sig"))
+    except FileNotFoundError:
+        return None
+    except OpenCodeAuthSourceError as exc:
+        if exc.reason in _OPENCODE_CONFIG_UNREADABLE_REASONS:
+            raise OpenCodeAuthError("opencode_provider_config_unreadable") from None
+        raise OpenCodeAuthError(
+            exc.reason.replace("opencode_auth_source_", "opencode_provider_config_", 1)
+        ) from None
+    except OSError:
+        raise OpenCodeAuthError("opencode_provider_config_unreadable") from None
+    except RecursionError:
+        raise OpenCodeAuthError("opencode_provider_config_json_invalid") from None
+
+
+def _resolve_opencode_env_templates(
+    text: object, host_env: Mapping[str, str], *, credential: bool = False
+) -> str:
+    """One owner-config string with every ``{env:NAME}`` resolved from ``host_env``.
+
+    A whole or partial (``sk-{env:NAME}``) reference resolves; an unset or empty
+    ``NAME`` is opencode_provider_env_unresolved.  A non-string value or any
+    ``{file:`` reference is opencode_provider_credential_unsupported, and in a
+    credential (apiKey) any other {...} token is
+    opencode_provider_credential_unsupported.  Other literal braces (a
+    JSON-valued header, a display name) pass through verbatim.
+    """
+    if not isinstance(text, str):
+        raise OpenCodeAuthError("opencode_provider_credential_unsupported")
+    if "{file:" in text or (
+        credential and _OPENCODE_ANY_TEMPLATE.search(_OPENCODE_ENV_TEMPLATE.sub("", text))
+    ):
+        raise OpenCodeAuthError("opencode_provider_credential_unsupported")
+
+    def resolve(match: re.Match[str]) -> str:
+        value = host_env.get(match.group(1))
+        if not value:
+            raise OpenCodeAuthError("opencode_provider_env_unresolved")
+        return value
+
+    return _OPENCODE_ENV_TEMPLATE.sub(resolve, text)
+
+
+def _project_opencode_model_entry(
+    entry: Mapping[str, object], env: Mapping[str, str]
+) -> dict[str, object]:
+    """Only the owner model entry's ``id`` (``{env:NAME}`` resolved), ``limit``
+    and boolean capability flags."""
+    projected: dict[str, object] = {}
+    if isinstance(entry.get("id"), str):
+        projected["id"] = _resolve_opencode_env_templates(entry["id"], env)
+    limit = entry.get("limit")
+    if isinstance(limit, dict):
+        bounded = {key: limit.get(key) for key in _OPENCODE_MODEL_LIMIT_KEYS}
+        # Projected only whole: both limits, each a positive integer.
+        if all(type(value) is int and value > 0 for value in bounded.values()):
+            projected["limit"] = bounded
+    for flag in _OPENCODE_MODEL_FLAGS:
+        if isinstance(entry.get(flag), bool):
+            projected[flag] = entry[flag]
+    return projected
+
+
+def _opencode_provider_base_url_is_loopback(base_url: str) -> bool:
+    """Whether a resolved ``options.baseURL`` host is loopback-only or unspecified.
+
+    ``localhost`` and ``*.localhost`` (case and a trailing dot ignored), every
+    IPv4 spelling ``inet_aton`` accepts (``127.1``, ``2130706433``,
+    ``0x7f000001``), IPv4-mapped IPv6 (``::ffff:127.0.0.1``) and the unspecified
+    ``0.0.0.0``/``::`` all count.
+    """
+    try:
+        hostname = urlsplit(base_url).hostname
+    except ValueError:
+        return False
+    if not hostname:
+        return False
+    hostname = hostname.rstrip(".").lower()
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        try:
+            address = ipaddress.IPv4Address(socket.inet_aton(hostname))
+        except (OSError, ValueError):
+            return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return address.is_loopback or address.is_unspecified
+
+
+def project_opencode_custom_provider(
+    model: str,
+    *,
+    host_env: dict[str, str] | None = None,
+    appcontainer: bool = False,
+) -> dict[str, object] | None:
+    """Project the owner's exact custom-provider block for one model, or None.
+
+    Returns ``None`` for a built-in provider (``opencode``/``opencode-go``) or
+    a model with no provider prefix: nothing to project, not a refusal.  Every
+    other fact -- a missing owner config, provider block or model, an
+    unreadable, unparseable or unsafe owner config file (symlinked, not
+    regular, foreign-owned, group/other-writable or over ``MAX_SOURCE_BYTES``),
+    an unsupported credential substitution, an unset ``{env:NAME}``, or (with
+    ``appcontainer=True``) a resolved loopback-only ``baseURL``
+    an AppContainer child cannot reach -- raises :class:`OpenCodeAuthError`
+    with a named reason before any claim.  The returned mapping holds exactly
+    one provider with exactly one model and only the bounded keys ``npm``,
+    ``name``, ``options`` (``baseURL``, ``apiKey``, ``headers``), ``models``;
+    every ``{env:NAME}`` there is resolved from ``host_env`` (default
+    ``os.environ``) and the model entry keeps only ``id``, ``limit`` and the
+    boolean capability flags.
+    """
+    if "/" not in model:
+        return None
+    provider, _, name = model.partition("/")
+    if not provider or not name or provider in _OPENCODE_BUILTIN_PROVIDERS:
+        return None
+    # os.environ itself, not a dict copy: on Windows only it keeps the
+    # case-insensitive lookup OpenCode's process.env uses for {env:VAR}.
+    env = host_env if host_env is not None else os.environ
+    config_path = _owner_opencode_global_config_path()
+    document = _read_bounded_json(config_path)
+    if not isinstance(document, dict):
+        raise OpenCodeAuthError("opencode_provider_not_configured")
+    providers = document.get("provider")
+    block = providers.get(provider) if isinstance(providers, dict) else None
+    if not isinstance(block, dict):
+        raise OpenCodeAuthError("opencode_provider_not_configured")
+    models = block.get("models")
+    model_entry = models.get(name) if isinstance(models, dict) else None
+    if not isinstance(model_entry, dict):
+        raise OpenCodeAuthError("opencode_provider_not_configured")
+    options = block.get("options") if isinstance(block.get("options"), dict) else {}
+
+    projected_options: dict[str, object] = {}
+    for key_name in ("baseURL", "apiKey"):
+        if key_name in options:
+            projected_options[key_name] = _resolve_opencode_env_templates(
+                options[key_name], env, credential=key_name == "apiKey"
+            )
+    if "headers" in options:
+        headers = options["headers"]
+        if not isinstance(headers, dict):
+            raise OpenCodeAuthError("opencode_provider_credential_unsupported")
+        projected_options["headers"] = {
+            header: _resolve_opencode_env_templates(value, env)
+            for header, value in headers.items()
+        }
+
+    if appcontainer:
+        base_url = projected_options.get("baseURL")
+        if isinstance(base_url, str) and _opencode_provider_base_url_is_loopback(base_url):
+            raise OpenCodeAuthError("opencode_provider_loopback_unreachable_in_appcontainer")
+
+    projected_block: dict[str, object] = {}
+    for key_name in ("npm", "name"):
+        if key_name in block:
+            projected_block[key_name] = _resolve_opencode_env_templates(block[key_name], env)
+    if projected_options:
+        projected_block["options"] = projected_options
+    projected_block["models"] = {name: _project_opencode_model_entry(model_entry, env)}
+    return {provider: projected_block}

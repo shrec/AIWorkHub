@@ -4073,6 +4073,7 @@ def provision_opencode_worker_config(
     backend: str,
     authority_repo: Path,
     bridge_shim_argv: Sequence[str] | None = None,
+    model: str | None = None,
 ) -> dict[str, str]:
     """The request-local OpenCode environment for one exact launch, or a typed refusal.
 
@@ -4084,7 +4085,8 @@ def provision_opencode_worker_config(
     environment only -- nothing is written to disk and no global OpenCode
     config is touched -- and project-level OpenCode config is switched off, so
     nothing inherited can widen the exact worker allowlist.  Every refusal
-    raises ``OpenCodeWorkerConfigError`` before a provider spawns.
+    raises ``OpenCodeWorkerConfigError`` before a provider spawns; a custom
+    provider ``model`` refusal raises ``opencode_auth.OpenCodeAuthError`` there too.
     """
     from . import opencode_auth
     from . import runtime_adapters
@@ -4176,6 +4178,12 @@ def provision_opencode_worker_config(
     elif not os.access(command, os.X_OK):
         raise error("command_not_executable", command)
 
+    custom_provider: dict[str, Any] | None = None
+    if model is not None:
+        custom_provider = opencode_auth.project_opencode_custom_provider(
+            model, appcontainer=backend == WINDOWS_APPCONTAINER_BACKEND
+        )
+
     if bridge_shim_argv is not None and backend != WINDOWS_APPCONTAINER_BACKEND:
         raise error("bridge_backend_unsupported", str(backend))
     try:
@@ -4183,11 +4191,11 @@ def provision_opencode_worker_config(
             # NF-2026-00034 bridge: the server runs on the host with the bindings
             # validated above; the contained CLI only starts the stdio<->pipe shim.
             config = runtime_adapters.build_opencode_worker_mcp_config(
-                list(bridge_shim_argv), environment=None
+                list(bridge_shim_argv), environment=None, provider=custom_provider
             )
         else:
             config = runtime_adapters.build_opencode_worker_mcp_config(
-                [command, *args], environment=projected
+                [command, *args], environment=projected, provider=custom_provider
             )
     except ValueError as exc:
         raise error("malformed", str(exc)) from exc

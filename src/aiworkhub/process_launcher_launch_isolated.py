@@ -971,6 +971,7 @@ def launch_isolated(
                     worker_mcp_runtime,
                     backend=sandbox_backend,
                     authority_repo=authority_repo,
+                    model=model,
                 )
                 if sandbox_backend == "windows_appcontainer":
                     # NF-2026-00034 for OpenCode: the contained CLI cannot read the
@@ -990,6 +991,7 @@ def launch_isolated(
                         backend=sandbox_backend,
                         authority_repo=authority_repo,
                         bridge_shim_argv=worker_mcp_bridge["shim_argv"],
+                        model=model,
                     )
                 provider_env = {
                     **(provider_env or {}),
