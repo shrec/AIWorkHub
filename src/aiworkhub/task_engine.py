@@ -791,6 +791,7 @@ def retry_finalize_failed(
     request_id: str,
     *,
     actor: str = "codex",
+    host_lane: bool = False,
 ) -> dict[str, Any]:
     """Authorize deterministic finalization retry for one retained request."""
     command = ["retry-finalization", task_id, "--request-id", request_id]
@@ -801,6 +802,7 @@ def retry_finalize_failed(
             runner=runner,
             request_id=request_id,
             actor=actor,
+            host_lane=host_lane,
         )
     except task_store.TaskStoreError as exc:
         return {

@@ -25,6 +25,7 @@ from __future__ import annotations
 import inspect
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -38,6 +39,7 @@ from aiworkhub import (  # noqa: E402
     process_launcher,
     process_launcher_accept_review,
     process_launcher_validation as plv,
+    task_store,
     worker_workspace,
 )
 
@@ -506,6 +508,7 @@ def test_a_sealed_validation_failure_reaches_review_ready_in_the_host_lane(
         _RUNNER,
         _REQUEST_ID,
     )
+    assert harness.transitions[0][1]["host_lane"] is True
     expected = {
         "validation_lane": "manager_host",
         "prior_validation_lane": _PRIOR_BACKEND,
@@ -560,6 +563,19 @@ def test_a_finalize_failed_request_is_retryable_in_the_host_lane(monkeypatch, tm
     assert result["ok"] is True, result
     assert harness.finalized[0]["metadata"]["validation_lane"] == "manager_host"
 
+
+def test_a_finalize_failed_retry_without_the_lane_forwards_host_lane_false(
+    monkeypatch, tmp_path
+):
+    """The non-lane path still calls through -- and still forwards the flag."""
+    harness = _harness(
+        monkeypatch, tmp_path, terminal_state="finalize_failed", terminal_error="x"
+    )
+
+    result = harness.manager.retry_finalization(_REQUEST_ID, _TASK_ID)
+
+    assert result["ok"] is True, result
+    assert harness.transitions[0][1]["host_lane"] is False
 
 # --------------------------------------------------------------------------- #
 # the seal is the authority for re-measuring these exact bytes
@@ -717,3 +733,63 @@ def test_only_two_lanes_exist_and_the_stamp_is_empty_outside_the_host_lane():
     assert plv.host_lane_receipt_stamp({}) == {}
     assert plv.host_lane_receipt_stamp({"validation_lane": ""}) == {}
     assert plv.HOST_LANE_RETRYABLE_STATES == {"validation_failed", "finalize_failed"}
+
+
+# --------------------------------------------------------------------------- #
+# the task_store guard itself, exercised for real (NF-2026-01486)
+# --------------------------------------------------------------------------- #
+
+
+def _seed_real_blocked_task(
+    tmp_path: Path,
+    *,
+    substatus: str = "validation_failed",
+    error: str = "validation_failed:python -m pytest:rc=1",
+) -> Path:
+    """A real, on-disk blocked task row with a ``terminal_failure`` record.
+
+    No monkeypatch of ``task_store.retry_finalize_failed``: the eligibility
+    guard under test runs for real against this row.
+    """
+    root = tmp_path / "store_repo"
+    root.mkdir()
+    task_store.initialize_repository(root)
+    now = datetime.now(timezone.utc).isoformat()
+    card = {
+        "launch_request_id": _REQUEST_ID,
+        "terminal_failure": {
+            "substatus": substatus,
+            "evidence": {"error": error, "request_id": _REQUEST_ID},
+        },
+    }
+    _readiness, db_path = task_store._require_ready(root)
+    with task_store._write_connection(db_path) as conn:
+        task_store._begin_immediate(conn)
+        conn.execute(
+            "INSERT INTO tasks "
+            "(task_id, runner, status, worker_status, claimed_by, card_json, "
+            "created_at, updated_at) VALUES (?, ?, 'blocked', 'blocked', ?, ?, ?, ?)",
+            (_TASK_ID, _RUNNER, _RUNNER, json.dumps(card), now, now),
+        )
+        conn.commit()
+    return root
+
+
+def test_task_store_refuses_a_validation_failed_card_without_the_host_lane(tmp_path):
+    root = _seed_real_blocked_task(tmp_path)
+
+    result = task_store.retry_finalize_failed(
+        root, _TASK_ID, runner=_RUNNER, request_id=_REQUEST_ID
+    )
+
+    assert result == (False, "terminal_substatus_not_retryable_finalization_failure")
+
+
+def test_task_store_admits_a_validation_failed_card_with_the_host_lane(tmp_path):
+    root = _seed_real_blocked_task(tmp_path)
+
+    result = task_store.retry_finalize_failed(
+        root, _TASK_ID, runner=_RUNNER, request_id=_REQUEST_ID, host_lane=True
+    )
+
+    assert result == (True, "processing")

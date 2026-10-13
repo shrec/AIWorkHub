@@ -13553,6 +13553,7 @@ class ProcessManager:
                         _calling_manager_identity(core).get("provider")
                         or core._current_chat_provider()
                     ),
+                    host_lane=host_lane,
                 )
                 if not transition.get("ok"):
                     return {

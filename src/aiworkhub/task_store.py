@@ -4796,6 +4796,12 @@ def _clean_root_no_candidate_failure_authority(
     return True, "authenticated", authority
 
 
+# Mirrors HOST_LANE_RETRYABLE_STATES in process_launcher_validation.py (not
+# imported directly: task_store is a lower layer and must not depend on the
+# launcher's validation-gate module).
+_HOST_LANE_RETRYABLE_SUBSTATUSES = frozenset({"validation_failed", "finalize_failed"})
+
+
 def retry_finalize_failed(
     root: str | Path,
     task_id: str,
@@ -4803,6 +4809,7 @@ def retry_finalize_failed(
     runner: str,
     request_id: str,
     actor: str = "codex",
+    host_lane: bool = False,
 ) -> tuple[bool, str]:
     """Re-enter processing for the same retained finalization attempt only.
 
@@ -4816,6 +4823,9 @@ def retry_finalize_failed(
     ``scope_rejected`` is eligible too: the re-run repeats the scope check on
     the same retained workspace, so it passes only when the delta is now in
     scope and otherwise ends ``scope_rejected`` again (NF-2026-01345).
+    When ``host_lane`` is true, ``validation_failed`` and ``finalize_failed``
+    are additionally eligible outright, matching the launcher's host-lane
+    retry gate (NF-2026-01486).
     """
     _readiness, db_path = _require_ready(root)
     # Serialized on the same lease as the terminal transitions it reverses: it
@@ -4871,6 +4881,9 @@ def retry_finalize_failed(
         if (
             terminal_substatus not in {"finalize_failed", "scope_rejected"}
             and not retryable_validation_failure
+            and not (
+                host_lane and terminal_substatus in _HOST_LANE_RETRYABLE_SUBSTATUSES
+            )
         ):
             return False, "terminal_substatus_not_retryable_finalization_failure"
         evidence_request_id = str(
