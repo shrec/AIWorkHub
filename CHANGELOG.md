@@ -6,6 +6,33 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.47] - 2026-10-13
+
+### Added
+
+- Dashboard: a confirmed Restart button on pending, blocked and processing tasks. `aiworkhub_dashboard_task_restart` picks the canonical recovery path from the measured card state, settles a dead processing claim first and refuses a live one (NF-2026-01481, NF-2026-01483).
+- Manager Chat: a Stop button and `aiworkhub_manager_loop_stop` end the running turn, record it as stopped by the owner, drop queued sends and park the wake, so the owner can switch model mid-run (NF-2026-01479).
+- Manager Chat: a Copy button on every chat bubble and task block (NF-2026-01478).
+
+### Changed
+
+- Dashboard: the low-signal Coordinator routing / Known repos strip is gone; the snapshot fields stay.
+
+### Fixed
+
+- Manager Chat: reopening the panel no longer starts manager turns by itself; only an owner action arms the callback wake, and the model picker no longer defaults to the first model (NF-2026-01475).
+- OpenCode: workers receive `OPENCODE_API_KEY` from the stored auth file (NF-2026-01474), and discovery lists only route-eligible models, not free-tier ones (NF-2026-01477).
+- Reconciler: a transient-retry relaunch spawns a real worker instead of leaving a bare claim (NF-2026-01480).
+- Launcher: launch-identity derivation skips a VS Code LM-family adapter whose bridge host is not launchable (NF-2026-01482).
+- Launcher: the AppContainer Claude auth retry sees the real Roaming AppData, and the real Roaming folder stays protected (NF-2026-01484).
+- Finalization: a host-lane retry of a `validation_failed` card reaches the task-store transition instead of being refused (NF-2026-01486).
+- Accept: a failed accept restores the manager-corrected bytes it wrote (NF-2026-01469).
+- Tests: Linux CI and the AppContainer validation lane are green again (NF-2026-01473, NF-2026-01489).
+
+### Qualification
+
+- Each change has regressions that fail before and pass after; the touched Python suites and the extension suite (`npm test`) pass. Installation and live replay are separate evidence.
+
 ## [0.12.46] - 2026-10-12
 
 ### Added

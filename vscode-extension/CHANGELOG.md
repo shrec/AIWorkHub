@@ -1,5 +1,20 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.47 — 2026-10-13
+
+### Added
+
+- Restart button on pending, blocked and processing tasks in the task detail, behind a confirmation (NF-2026-01483).
+- Manager Chat: Stop button, enabled only while a turn runs (NF-2026-01479), and a Copy button on each bubble and task block (NF-2026-01478).
+
+### Changed
+
+- The Coordinator routing / Known repos strip is removed from the dashboard.
+
+### Fixed
+
+- Bundled runtime 0.12.47: reopening Manager Chat never starts turns by itself (NF-2026-01475); OpenCode worker key and model discovery (NF-2026-01474, NF-2026-01477); real worker on transient relaunch (NF-2026-01480); AppContainer Claude auth retry (NF-2026-01484); host-lane retry of validation_failed (NF-2026-01486).
+
 ## 0.12.46 — 2026-10-12
 
 ### Added

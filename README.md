@@ -62,6 +62,12 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.47
+
+- Restart any pending, blocked or processing task from the dashboard; the server picks the right recovery path (NF-2026-01481, NF-2026-01483).
+- Manager Chat gains Stop (switch model mid-run, NF-2026-01479) and Copy (NF-2026-01478), and never starts turns on its own after reopening (NF-2026-01475).
+- OpenCode workers get their API key and only route-eligible models (NF-2026-01474, NF-2026-01477); the AppContainer Claude auth retry works (NF-2026-01484).
+
 ## What's new in 0.12.46
 
 - OpenCode models join the workforce chain and the Manager Chat picker (NF-2026-01454).
