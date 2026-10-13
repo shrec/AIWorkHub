@@ -36,6 +36,7 @@ def accepted_outcome_receipt(
     changed_path_hashes: dict[str, str | None],
     attempt_artifact_manifest: dict[str, Any],
     manager_correction: dict[str, Any] | None = None,
+    promotion_merge: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the sole canonical, post-promotion acceptance identity.
 
@@ -47,6 +48,14 @@ def accepted_outcome_receipt(
     canonical tree holds and what ``repository_revision`` is derived from, so a
     reader can recover both the bytes a reviewer judged and the bytes that
     landed. The optional object is covered by ``receipt_id``.
+
+    ``promotion_merge`` -- ``None`` unless promotion three-way merged a changed
+    path whose canonical parent changed after launch (NF-2026-01518) -- adds a
+    second optional object naming those paths, the candidate digest each merge
+    consumed (its ``changed_path_hashes`` entry) and the merged digest it
+    wrote. Canonical then holds the MERGED bytes, so those are what the
+    post-promotion check expects and what the receipt's
+    ``changed_path_hashes`` carry for those paths; ``receipt_id`` covers it too.
     """
     if not base_oid or not isinstance(attempt_artifact_manifest, dict):
         raise WorkspaceError("accepted_outcome_identity_incomplete")
@@ -59,7 +68,19 @@ def accepted_outcome_receipt(
             if path.is_file() and not path.is_symlink()
             else None
         )
-    if paths != sorted(changed_path_hashes) or canonical_hashes != changed_path_hashes:
+    merge = (
+        None
+        if promotion_merge is None
+        else _merge_identity(promotion_merge, paths, changed_path_hashes)
+    )
+    # A merged path landed as MERGED bytes. Without a merge this IS
+    # ``changed_path_hashes``, so the check is exactly the one it always was.
+    landed = (
+        changed_path_hashes
+        if merge is None
+        else {**changed_path_hashes, **merge["merged_path_hashes"]}
+    )
+    if paths != sorted(changed_path_hashes) or canonical_hashes != landed:
         raise WorkspaceError("post_promotion_candidate_mismatch")
     digest = lambda value: hashlib.sha256(  # noqa: E731
         json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
@@ -78,14 +99,20 @@ def accepted_outcome_receipt(
     }
     if manager_correction is not None:
         receipt["manager_correction"] = _correction_identity(
-            manager_correction, canonical_hashes
+            manager_correction,
+            canonical_hashes,
+            None if merge is None else merge["candidate_path_hashes"],
         )
+    if merge is not None:
+        receipt["promotion_merge"] = merge
     receipt["receipt_id"] = "sha256:" + digest(receipt)
     return receipt
 
 
 def _correction_identity(
-    manager_correction: dict[str, Any], canonical_hashes: dict[str, str | None]
+    manager_correction: dict[str, Any],
+    canonical_hashes: dict[str, str | None],
+    merge_candidates: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """The six receipt fields of one applied manager correction.
 
@@ -96,6 +123,10 @@ def _correction_identity(
     differ from the candidate digest it replaced. A wiring mistake fails closed
     here, before the card is finalized, rather than sealing a receipt that
     describes bytes nobody promoted.
+
+    A corrected path that promotion also three-way merged holds MERGED bytes,
+    so its corrected digest is compared with ``merge_candidates`` -- the digest
+    that merge consumed -- instead of canonical (NF-2026-01518).
     """
     paths = sorted({str(value) for value in (manager_correction.get("paths") or ())})
     candidate = {
@@ -110,6 +141,7 @@ def _correction_identity(
         {str(value) for value in (manager_correction.get("finding_ids") or ())}
     )
     patch_sha256 = str(manager_correction.get("patch_sha256") or "")
+    landed = {**canonical_hashes, **(merge_candidates or {})}
     if (
         not paths
         or not finding_ids
@@ -117,7 +149,7 @@ def _correction_identity(
         or paths != sorted(candidate)
         or paths != sorted(corrected)
         or any(
-            corrected[relative] != canonical_hashes.get(relative)
+            corrected[relative] != landed.get(relative)
             or candidate[relative] == corrected[relative]
             for relative in paths
         )
@@ -130,6 +162,47 @@ def _correction_identity(
         "candidate_path_hashes": candidate,
         "corrected_path_hashes": corrected,
         "reason": str(manager_correction.get("reason") or ""),
+    }
+
+
+def _merge_identity(
+    promotion_merge: dict[str, Any],
+    promoted_paths: list[str],
+    changed_path_hashes: dict[str, str | None],
+) -> dict[str, Any]:
+    """The three receipt fields of one three-way promotion merge.
+
+    Projected from the combined tree's ``merged_paths`` (NF-2026-01518): the
+    merged paths, the candidate digest each merge consumed and the merged
+    digest it wrote. Every merged path must be a promoted path whose candidate
+    digest is its ``changed_path_hashes`` entry -- the sealed digest, or the
+    corrected one after a manager correction -- so a wiring mistake fails
+    closed here, before the card is finalized, exactly like a correction.
+    """
+    paths = sorted({str(value) for value in (promotion_merge.get("paths") or ())})
+    candidate = {
+        str(key): str(value)
+        for key, value in (promotion_merge.get("candidate_path_hashes") or {}).items()
+    }
+    merged = {
+        str(key): str(value)
+        for key, value in (promotion_merge.get("merged_path_hashes") or {}).items()
+    }
+    if (
+        not paths
+        or paths != sorted(candidate)
+        or paths != sorted(merged)
+        or any(
+            relative not in promoted_paths
+            or candidate[relative] != changed_path_hashes.get(relative)
+            for relative in paths
+        )
+    ):
+        raise WorkspaceError("promotion_merge_receipt_mismatch")
+    return {
+        "paths": paths,
+        "candidate_path_hashes": candidate,
+        "merged_path_hashes": merged,
     }
 
 

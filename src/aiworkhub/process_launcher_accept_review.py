@@ -3162,6 +3162,9 @@ def accept_review(
                 _restore_correction_originals(workspace, correction_originals)
             raise
 
+        # NF-2026-01518: the paths promotion three-way merged, exactly as the
+        # combined tree validated them; canonical now holds their MERGED bytes.
+        merged_paths = combined_tree.get("merged_paths") or {}
         try:
             accepted_outcome_receipt = _accepted_outcome_receipt(
                 self.repo,
@@ -3179,11 +3182,37 @@ def accept_review(
                     if correction_record is not None
                     else {}
                 ),
+                # Likewise named only when a merge landed: each merge consumed
+                # its path's accepted (sealed or corrected) bytes.
+                **(
+                    {
+                        "promotion_merge": {
+                            "paths": sorted(merged_paths),
+                            "candidate_path_hashes": {
+                                relative: accepted_path_hashes.get(relative)
+                                for relative in merged_paths
+                            },
+                            "merged_path_hashes": dict(merged_paths),
+                        }
+                    }
+                    if merged_paths
+                    else {}
+                ),
             )
         except (OSError, TypeError, ValueError, WorkspaceError) as exc:
+            # Canonical keeps the promoted bytes (no rollback), but the retained
+            # worktree must not keep CORRECTED bytes, or the next review trips
+            # review_workspace_hash_mismatch (NF-2026-01518).
+            error_message = f"accepted_outcome_receipt_failed:{exc}"
+            if correction_originals:
+                failed_restores = _restore_correction_originals(workspace, correction_originals)
+                if failed_restores:
+                    error_message += (
+                        ":correction_restore_failed:" + ",".join(failed_restores)[:200]
+                    )
             return {
                 "ok": False,
-                "error": f"accepted_outcome_receipt_failed:{exc}",
+                "error": error_message,
                 "request_id": request_id,
                 "task_id": task_id,
                 "promoted_paths": promoted,

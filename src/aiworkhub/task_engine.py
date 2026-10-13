@@ -885,6 +885,47 @@ def _manager_correction_shape(
     return {relative: str(corrected[relative]) for relative in paths}, ""
 
 
+def _promotion_merge_shape(
+    merge: Any, sealed_paths: list[str], accepted_hashes: dict[str, Any]
+) -> tuple[dict[str, str] | None, str]:
+    """The merged digests one receipt's ``promotion_merge`` declares.
+
+    Returns ``({path: merged_digest}, "")`` when the optional object is
+    well-formed and consistent with the candidate the promotion merged, and
+    ``(None, reason)`` otherwise. Each merged path must be one the candidate
+    changed, and its declared candidate digest must be the digest accept
+    promoted from -- ``accepted_hashes``, the sealed digests with any manager
+    correction applied -- because the three-way merge consumed exactly those
+    bytes and canonical holds what it wrote (NF-2026-01518).
+    """
+    if not isinstance(merge, dict):
+        return None, "accepted_outcome_receipt_promotion_merge_malformed"
+    if set(merge) != {"paths", "candidate_path_hashes", "merged_path_hashes"}:
+        return None, "accepted_outcome_receipt_promotion_merge_malformed"
+    paths = merge.get("paths")
+    candidate = merge.get("candidate_path_hashes")
+    merged = merge.get("merged_path_hashes")
+    if (
+        not isinstance(paths, list)
+        or not paths
+        or any(not isinstance(value, str) or not value for value in paths)
+        or paths != sorted(set(paths))
+        or not isinstance(candidate, dict)
+        or not isinstance(merged, dict)
+        or paths != sorted(candidate)
+        or paths != sorted(merged)
+        or any(
+            not _is_hex_digest(candidate[relative])
+            or not _is_hex_digest(merged[relative])
+            or relative not in sealed_paths
+            or candidate[relative] != accepted_hashes.get(relative)
+            for relative in paths
+        )
+    ):
+        return None, "accepted_outcome_receipt_promotion_merge_malformed"
+    return {relative: str(merged[relative]) for relative in paths}, ""
+
+
 def _is_hex_digest(value: Any) -> bool:
     """True when ``value`` is one bare or ``sha256:``-prefixed sha256 digest."""
     if not isinstance(value, str):
@@ -907,10 +948,11 @@ def _validate_accepted_outcome_receipt(
         "base_oid", "promoted_paths", "changed_path_hashes",
         "attempt_artifact_manifest_id", "repository_revision",
     }
-    # ``manager_correction`` is the one OPTIONAL field (NF-2026-01436). A
-    # receipt without it is validated exactly as before, down to the error
-    # string; a receipt with it must also carry a well-formed one.
-    optional = {"manager_correction"} & set(receipt)
+    # ``manager_correction`` (NF-2026-01436) and ``promotion_merge``
+    # (NF-2026-01518) are the two OPTIONAL fields. A receipt without them is
+    # validated exactly as before, down to the error string; a receipt with
+    # either must also carry a well-formed one.
+    optional = {"manager_correction", "promotion_merge"} & set(receipt)
     if (
         set(receipt) != required | optional
         or receipt.get("schema_id") != ACCEPTED_OUTCOME_RECEIPT_SCHEMA
@@ -952,16 +994,26 @@ def _validate_accepted_outcome_receipt(
     workspace = sealed.get("workspace") or {}
     if not isinstance(hashes, dict) or not isinstance(manifest, dict):
         return None, "accepted_outcome_receipt_sealed_evidence_missing"
-    # Without a correction this IS the sealed candidate map, so every
-    # comparison below is byte-identical to the pre-NF-2026-01436 behaviour.
+    # Without a correction or a merge this IS the sealed candidate map, so
+    # every comparison below is byte-identical to the pre-NF-2026-01436
+    # behaviour.
     expected_hashes: dict[str, Any] = hashes
-    if optional:
+    if "manager_correction" in optional:
         corrected, correction_error = _manager_correction_shape(
             receipt.get("manager_correction"), paths, hashes
         )
         if corrected is None:
             return None, correction_error
         expected_hashes = {**hashes, **corrected}
+    if "promotion_merge" in optional:
+        # Each merge consumed the sealed-or-corrected bytes and canonical holds
+        # what it wrote: sealed + corrected + merged (NF-2026-01518).
+        merged, merge_error = _promotion_merge_shape(
+            receipt.get("promotion_merge"), paths, expected_hashes
+        )
+        if merged is None:
+            return None, merge_error
+        expected_hashes = {**expected_hashes, **merged}
     expected = {
         "schema_id": ACCEPTED_OUTCOME_RECEIPT_SCHEMA,
         "task_id": task_id,
