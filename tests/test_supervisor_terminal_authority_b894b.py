@@ -70,7 +70,16 @@ def _ensure_deepseek_credentials_stub() -> None:
 
 _ensure_deepseek_credentials_stub()
 
-from aiworkhub import process_launcher, worker_workspace  # noqa: E402
+from aiworkhub import process_launcher, windows_appcontainer, worker_workspace  # noqa: E402
+
+# The grants these tests mint need an owner-only key DACL, and the Windows
+# AppContainer validation lane is refused WRITE_DAC on the key it creates
+# (create_file_write_dac_failed:5, the NF-2026-01109 cause). The canonical host
+# run decides this file: current_process_is_appcontainer() is False there.
+pytestmark = pytest.mark.skipif(
+    windows_appcontainer.current_process_is_appcontainer(),
+    reason="AppContainer lane cannot harden the terminal-authority key DACL",
+)
 
 
 def _chmod_blocked_by_sandbox() -> bool:
