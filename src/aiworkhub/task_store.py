@@ -113,6 +113,8 @@ CURRENT_EPISODE_CARD_FIELDS: tuple[str, ...] = (
     "accepted_by",
     "accepted_at",
     "accept_evidence",
+    "transient_retry",
+    "retry_not_before",
 )
 
 # ``card_json`` is the durable semantic task payload.  ``get_task`` also
@@ -3601,16 +3603,19 @@ _is_bool_safe_int = is_bool_safe_int
 TASK_CONTRACT_KEYS = (
     "task_id", "runner", "topic", "mode", "objective", "read_first",
     "run_before_writing", "allowed_writes", "acceptance", "validation",
-    "forbidden", "review_feedback", "commit_contract",
+    "forbidden", "review_feedback", "recovery_feedback", "commit_contract",
     "project_context", "required_outputs", "allow_empty_required_outputs",
     "allow_unchanged_required_outputs", "external_readonly_sources",
     "read_only",
 )
 # ``review_feedback`` carries the rework reason and is authenticated on its own
-# axis (``review_feedback_identity``), so it is excluded here: the two
-# relaunch-guard inputs stay independent instead of collapsing into one hash.
+# axis (``review_feedback_identity``). ``recovery_feedback`` carries the
+# manager's blocked-recovery instruction and needs no axis of its own: the
+# relaunch guard already releases a recovered card by
+# ``recovered_from_blocked_at``. Both stay out of the content digest so it is
+# stable across a rework or recovery round.
 CARD_CONTENT_IDENTITY_KEYS = tuple(
-    key for key in TASK_CONTRACT_KEYS if key != "review_feedback"
+    key for key in TASK_CONTRACT_KEYS if key not in ("review_feedback", "recovery_feedback")
 )
 TERMINAL_ERROR_HASH_HEX_CHARS = 16
 
