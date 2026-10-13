@@ -7018,6 +7018,8 @@ def reject_review(
             )[:256],
             "residual_identities": normalized_residuals,
         }
+        # The review feedback is now the latest instruction.
+        card.pop("recovery_feedback", None)
     # begin_claim_episode() clears terminal_review/terminal_substatus from the
     # card in this same transition, and a learning commit runs long after it.
     # Re-deriving the failure taxonomy from the card at learning time therefore
