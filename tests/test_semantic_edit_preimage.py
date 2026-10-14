@@ -231,3 +231,55 @@ def test_too_many_ranges_still_raises() -> None:
     ]
     with pytest.raises(semantic_edit.SemanticEditError, match="semantic_edit_ranges_invalid"):
         semantic_edit.apply_line_ranges("x\n" * len(ranges), ranges)
+
+
+def test_trailing_blank_lines_dropped_is_reported() -> None:
+    new_text, metrics = semantic_edit.apply_line_ranges(
+        "a = 1\n\n\n",
+        [{"start_line": 1, "end_line": 3, "new": "a = 2\n"}],
+    )
+    assert new_text == "a = 2\n"
+    assert metrics["trailing_blank_lines_dropped"] == [
+        {
+            "range_index": 0,
+            "start_line": 1,
+            "end_line": 3,
+            "old_trailing_blank_lines": 2,
+            "new_trailing_blank_lines": 0,
+        }
+    ]
+
+
+def test_equal_trailing_blank_lines_report_empty() -> None:
+    new_text, metrics = semantic_edit.apply_line_ranges(
+        "a = 1\n\n",
+        [{"start_line": 1, "end_line": 2, "new": "a = 2\n\n"}],
+    )
+    assert new_text == "a = 2\n\n"
+    assert metrics["trailing_blank_lines_dropped"] == []
+
+
+def test_terminator_completion_is_not_a_drop() -> None:
+    new_text, metrics = semantic_edit.apply_line_ranges(
+        "a = 1\n",
+        [{"start_line": 1, "end_line": 1, "new": "a = 2"}],
+    )
+    assert new_text == "a = 2\n"
+    assert metrics["trailing_blank_lines_dropped"] == []
+
+
+def test_crlf_trailing_blank_line_drop_is_reported() -> None:
+    new_text, metrics = semantic_edit.apply_line_ranges(
+        "a = 1\r\n\r\n",
+        [{"start_line": 1, "end_line": 2, "new": "a = 2\r\n"}],
+    )
+    assert new_text == "a = 2\r\n"
+    assert metrics["trailing_blank_lines_dropped"] == [
+        {
+            "range_index": 0,
+            "start_line": 1,
+            "end_line": 2,
+            "old_trailing_blank_lines": 1,
+            "new_trailing_blank_lines": 0,
+        }
+    ]

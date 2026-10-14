@@ -309,6 +309,22 @@ def _line_terminator(fragment: str) -> str:
     return "\n" if fragment.endswith("\n") else ""
 
 
+def _trailing_blank_line_count(text: str) -> int:
+    """Count consecutive trailing lines that are only a terminator.
+
+    ``_split_lines`` numbers lines on ``\\n`` only, so a blank line is exactly
+    ``"\\n"`` or ``"\\r\\n"``.  Whitespace-only lines carry content and end
+    nothing on their own, so they are not counted here.
+    """
+    count = 0
+    for line in reversed(_split_lines(text)):
+        if line in ("\n", "\r\n"):
+            count += 1
+        else:
+            break
+    return count
+
+
 def apply_line_ranges(
     current_text: str,
     ranges: list[dict[str, Any]],
@@ -317,6 +333,7 @@ def apply_line_ranges(
         raise SemanticEditError("semantic_edit_ranges_invalid")
     lines = _split_lines(current_text)
     normalized: list[tuple[int, int, str, int, int, bool]] = []
+    trailing_blank_lines_dropped: list[dict[str, Any]] = []
     for index, item in enumerate(ranges):
         if not isinstance(item, dict):
             raise SemanticEditError(f"semantic_edit_range_invalid:{index}")
@@ -357,6 +374,18 @@ def apply_line_ranges(
         # nothing, so ``B\r`` over an LF line becomes ``B\r\n``.
         if preserve and replacement and not replacement.endswith("\n"):
             replacement += _line_terminator(old)
+        old_blank = _trailing_blank_line_count(old)
+        new_blank = _trailing_blank_line_count(replacement)
+        if new_blank < old_blank:
+            trailing_blank_lines_dropped.append(
+                {
+                    "range_index": index,
+                    "start_line": start,
+                    "end_line": end,
+                    "old_trailing_blank_lines": old_blank,
+                    "new_trailing_blank_lines": new_blank,
+                }
+            )
         normalized.append(
             (
                 start,
@@ -394,6 +423,7 @@ def apply_line_ranges(
         "preimage_verified_range_count": len(normalized) - unverified_range_count,
         "preimage_unverified_range_count": unverified_range_count,
         "preimage_verified": unverified_range_count == 0,
+        "trailing_blank_lines_dropped": trailing_blank_lines_dropped,
     }
 
 
