@@ -939,6 +939,13 @@ def _v3_planned_outputs(
                 create=True,
             )
             create_contents[relative] = next_text
+        regression = semantic_edit.syntax_regression(relative, current_text, next_text)
+        if regression:
+            first_idx = group["first_idx"]
+            raise RuntimeError(
+                f"vscode_lm_semantic_edit_rejected:{relative}:"
+                f"entry_index1={first_idx}:{regression}"
+            )
         planned.append((relative, next_text))
         metric = {
             "path": relative,

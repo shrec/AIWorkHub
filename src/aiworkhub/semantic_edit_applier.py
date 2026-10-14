@@ -87,6 +87,9 @@ def replace_prepared_range(
                 "fragment_sha256": target.fragment_sha256,
             }],
         )
+        regression = semantic_edit.syntax_regression(relative, current_text, next_text)
+        if regression:
+            raise semantic_edit.SemanticEditError(regression)
         fd, temp_name = tempfile.mkstemp(
             prefix=f".{file_path.name}.aiworkhub-", dir=file_path.parent
         )

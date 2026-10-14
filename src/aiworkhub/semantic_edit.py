@@ -20,6 +20,9 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import re
+import shutil
+import subprocess
+import tempfile
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -392,3 +395,96 @@ def apply_line_ranges(
         "preimage_unverified_range_count": unverified_range_count,
         "preimage_verified": unverified_range_count == 0,
     }
+
+
+def syntax_regression(path: str, before: str, after: str) -> str:
+    """Regression-only guard: refuse a replacement that breaks parsing.
+
+    Returns ``""`` when there is no regression, otherwise
+    ``"semantic_edit_syntax_regression:<path>:<lineno>:<msg> -- ..."``.
+    ``msg`` is bounded to 200 chars and never carries file content.
+    """
+    suffix = Path(path).suffix.lower()
+    if suffix == ".py":
+        try:
+            compile(before, path, "exec", dont_inherit=True)
+        except (SyntaxError, ValueError):
+            return ""
+        try:
+            compile(after, path, "exec", dont_inherit=True)
+        except SyntaxError as exc:
+            lineno = exc.lineno or 0
+            msg = str(exc.msg or exc)[:200].replace("\n", " ").replace("\r", " ")
+            return (
+                f"semantic_edit_syntax_regression:{path}:{lineno}:{msg}"
+                " -- a replacement must re-emit every line of the prepared"
+                " range it keeps; omitted lines are deleted"
+            )
+        except ValueError as exc:
+            msg = str(exc)[:200].replace("\n", " ").replace("\r", " ")
+            return (
+                f"semantic_edit_syntax_regression:{path}:0:{msg}"
+                " -- a replacement must re-emit every line of the prepared"
+                " range it keeps; omitted lines are deleted"
+            )
+        return ""
+    if suffix in (".js", ".cjs", ".mjs"):
+        node = shutil.which("node")
+        if not node:
+            return ""
+        try:
+            with tempfile.TemporaryDirectory(prefix="aiworkhub-syntax-") as tmp:
+                before_file = Path(tmp) / f"before{suffix}"
+                after_file = Path(tmp) / f"after{suffix}"
+                before_file.write_text(before, encoding="utf-8")
+                after_file.write_text(after, encoding="utf-8")
+                before_proc = subprocess.run(
+                    [node, "--check", str(before_file)],
+                    capture_output=True,
+                    timeout=10,
+                    shell=False,
+                )
+                if before_proc.returncode != 0:
+                    return ""
+                after_proc = subprocess.run(
+                    [node, "--check", str(after_file)],
+                    capture_output=True,
+                    timeout=10,
+                    shell=False,
+                )
+                if after_proc.returncode == 0:
+                    return ""
+                stderr = after_proc.stderr
+                if isinstance(stderr, bytes):
+                    stderr_text = stderr.decode("utf-8", errors="replace")
+                else:
+                    stderr_text = str(stderr)
+                lineno = 0
+                marker = str(after_file)
+                idx = stderr_text.find(marker)
+                haystack = stderr_text[idx + len(marker):] if idx >= 0 else ""
+                match = re.search(r":(\d+)", haystack)
+                if match:
+                    try:
+                        lineno = int(match.group(1))
+                    except ValueError:
+                        lineno = 0
+                first_line = ""
+                for line in _split_lines(stderr_text):
+                    if line.strip():
+                        first_line = line.strip()
+                        break
+                if marker in first_line:
+                    first_line = first_line.replace(marker, "").strip()
+                    first_line = first_line.lstrip(": ").strip()
+                msg = first_line[:200].replace("\r", " ")
+                if not msg:
+                    msg = "node --check failed"
+                return (
+                    f"semantic_edit_syntax_regression:{path}:{lineno}:{msg}"
+                    " -- a replacement must re-emit every line of the prepared"
+                    " range it keeps; omitted lines are deleted"
+                )
+        except (subprocess.TimeoutExpired, OSError):
+            return ""
+    return ""
