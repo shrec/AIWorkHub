@@ -6,6 +6,22 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.50] - 2026-10-14
+
+### Changed
+
+- Claude: every Claude CLI seat now pins an explicit 5.5-family model (`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`) instead of a bare alias that Claude Code resolved to older models; legacy claude_cli pins upgrade to their family's pinned id, vscode_lm routes keep their Copilot ids, and the workforce catalog attributes the 5.5 usage rows to its Claude CLI workers (NF-2026-01517, NF-2026-01522).
+
+### Added
+
+- OpenCode: a worker launched with an owner provider model such as `omniroute/<model>` receives exactly that provider block and model, with the apiKey from a literal, a host `{env:}` value or the owner's auth.json; an AppContainer worker still refuses a loopback baseURL until the port-scoped relay lands (NF-2026-01502).
+
+### Fixed
+
+- Storage: the janitor sweeps aged `.aiworkhub/temp` scratch and one-off runtime directories it never reached, skipping links, junction escapes and live owners (NF-2026-01449).
+- Task lifecycle: a cancelled episode with no candidate keeps its sealed rework predecessor, and an emptied superseding worktree recovers from its sealed delta (NF-2026-01516, NF-2026-01519).
+- Acceptance: the outcome receipt expects the bytes a three-way merge promoted instead of failing after canonical was written (NF-2026-01518).
+
 ## [0.12.49] - 2026-10-13
 
 ### Fixed

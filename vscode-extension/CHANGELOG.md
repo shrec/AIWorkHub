@@ -1,5 +1,11 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.50 — 2026-10-14
+
+### Changed
+
+- Bundled runtime 0.12.50: every Claude CLI seat pins the 5.5 family (claude-opus-5-5, claude-sonnet-5-5, claude-haiku-5-5) and the workforce catalog counts their usage; OpenCode workers receive an owner-configured custom provider such as OmniRoute; aged scratch storage is swept; task-recovery and accept-receipt fixes (NF-2026-01517, NF-2026-01522, NF-2026-01502, NF-2026-01449, NF-2026-01516, NF-2026-01518, NF-2026-01519).
+
 ## 0.12.49 — 2026-10-13
 
 ### Fixed

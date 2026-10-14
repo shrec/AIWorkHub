@@ -14,6 +14,10 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.50
+
+- Every Claude seat now runs the 5.5 family (Opus 5.5, Sonnet 5.5, Haiku 5.5) instead of older models behind the bare aliases; OpenCode workers can use an owner-configured custom provider such as OmniRoute; aged scratch storage is cleaned up; several task-recovery and accept-receipt fixes.
+
 ## What's new in 0.12.49
 
 - OpenCode runs that recover from a provider error are no longer failed; sandbox Y:/Z: drives are cleaned up after each run; a recovered task no longer relaunches by itself and now receives the manager's recovery instruction; accepting a review with a manager correction can no longer lose the workspace to background cleanup.
