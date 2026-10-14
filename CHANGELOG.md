@@ -6,6 +6,17 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.52] - 2026-10-15
+
+### Fixed
+
+- Manager MCP: the initialize handshake has its own 120s cold-start budget, so the first start of a fresh runtime generation no longer fails with `mcp_initialize_failed:mcp_request_timeout`; the manifest reader no longer reports `manifest-unreadable` when the Windows sandbox denies the native realpath (NF-2026-01525, NF-2026-01528).
+- OpenCode on Linux: OpenCode 2.x keeps provider credentials in the `credential` table of `opencode.db` instead of `auth.json`; the isolated worker HOME now projects them read-only from there, with `auth.json` as the fallback (NF-2026-01526).
+- Semantic edit refuses a range replacement that turns a parseable Python/JS file into one that no longer parses (NF-2026-01527).
+- A contained OpenCode worker whose loopback relay or bridge failed now reports that error in its status instead of a generic exit (NF-2026-01523).
+- The manager-host validation-lane refusal is classified as `validation_lane_forbidden` instead of `auth_forbidden` (NF-2026-01529).
+- Rework recovery keeps the authenticated sealed delta when the predecessor worktree is retained, so inherited required outputs are credited (NF-2026-01530).
+
 ## [0.12.51] - 2026-10-14
 
 ### Added

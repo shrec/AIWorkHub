@@ -1,5 +1,11 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.52 — 2026-10-15
+
+### Fixed
+
+- Bundled runtime 0.12.52: the Manager chat no longer fails on a cold start with `mcp_initialize_failed:mcp_request_timeout` (NF-2026-01525, NF-2026-01528); OpenCode 2.x workers on Linux find their credentials in `opencode.db` (NF-2026-01526); semantic edit refuses syntax-breaking replacements (NF-2026-01527); sandbox relay errors, validation-lane refusals and rework recovery are reported and handled correctly (NF-2026-01523, NF-2026-01529, NF-2026-01530).
+
 ## 0.12.51 — 2026-10-14
 
 ### Added

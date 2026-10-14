@@ -14,6 +14,10 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.52
+
+- The Manager chat no longer fails with `mcp_initialize_failed:mcp_request_timeout` on the first start after an update; OpenCode 2.x workers on Linux find their Go/OmniRoute credentials in `opencode.db`; semantic edit refuses replacements that break a file's syntax; sandbox relay errors and validation-lane refusals are reported under their real cause.
+
 ## What's new in 0.12.51
 
 - OpenCode workers in the Windows sandbox can now use OmniRoute, or any owner-configured provider on 127.0.0.1, through a per-worker relay that serves only that worker and dials only the configured address.
