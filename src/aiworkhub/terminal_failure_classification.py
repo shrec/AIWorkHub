@@ -297,6 +297,10 @@ _SANDBOX_CODES: tuple[str, ...] = (
     _SANDBOX_FILESYSTEM_GRANT_FAILED,
     _SANDBOX_FILESYSTEM_DENIED,
 )
+# The validation-lane refusal is minted by this repository (worker_workspace)
+# about its own refusal, so it is a whole-token assertion, not prose, and it
+# sits ahead of auth_forbidden.
+_VALIDATION_LANE_FORBIDDEN = "validation_lane_forbidden"
 
 # ``windows_appcontainer.AppContainerReason.FILESYSTEM_GRANT_FAILED``, reached
 # here inside the launcher-minted ``AppContainerError:<reason>: <detail>``.
@@ -315,6 +319,7 @@ _SIGNATURES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
 ) + (
     (_whole_token_pattern(_FILESYSTEM_GRANT_FAILED_REASON), _SANDBOX_FILESYSTEM_GRANT_FAILED),
     (_OS_FILESYSTEM_DENIAL, _SANDBOX_FILESYSTEM_DENIED),
+    (_whole_token_pattern("vscode_lm_in_process_validation_adapter_forbidden"), _VALIDATION_LANE_FORBIDDEN),
     (re.compile(r"invalid credential|re-?authenticat", re.I), "auth_invalid_credential"),
     (re.compile(r"cause_not_distinguished", re.I), "auth_cause_not_distinguished"),
     (re.compile(r"unauthoriz", re.I), "auth_unauthorized"),

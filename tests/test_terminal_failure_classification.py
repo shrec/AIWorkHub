@@ -1379,6 +1379,18 @@ def test_ordinary_permission_denied_stays_auth_forbidden() -> None:
     assert _ALLOWLISTED_DIAGNOSTIC.match(result["diagnostic"])
 
 
+def test_validation_lane_forbidden_beats_auth_forbidden() -> None:
+    result = classify_terminal_failure(
+        state="validation_failed",
+        exit_code=1,
+        error="worker failed",
+        stderr_tail="finalize_failed: vscode_lm_in_process_validation_adapter_forbidden:opencode_cli",
+    )
+    assert result["failure_kind"] == "validation_failed"
+    assert result["diagnostic"].startswith("validation_failed:validation_lane_forbidden")
+    assert _ALLOWLISTED_DIAGNOSTIC.match(result["diagnostic"])
+
+
 # provider_timeout needs timeout evidence, never a field name that merely contains "timeout".
 _BRIDGE_TIMEOUT_ENVELOPE = json.dumps(
     {
