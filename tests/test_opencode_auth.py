@@ -179,3 +179,218 @@ def test_opencode_go_key_env_is_empty_without_a_usable_key(
 
 def test_opencode_go_key_env_is_empty_without_a_projected_file(tmp_path: Path) -> None:
     assert opencode_auth.opencode_go_api_key_env(tmp_path / "isolated") == {}
+
+
+def _credential_db(db_path: Path, rows: list[tuple[str, str, int, int]]) -> Path:
+    import sqlite3 as _sqlite_module
+
+    db_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    connection = _sqlite_module.connect(db_path.as_posix())
+    try:
+        connection.execute(
+            "CREATE TABLE credential (id TEXT, integration_id TEXT, label TEXT, "
+            "value TEXT, connector_id TEXT, method_id TEXT, active INTEGER, "
+            "time_created INTEGER, time_updated INTEGER)"
+        )
+        for index, (integration_id, value, active, updated) in enumerate(rows):
+            connection.execute(
+                "INSERT INTO credential (id, integration_id, label, value, "
+                "connector_id, method_id, active, time_created, time_updated) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    f"id-{index}",
+                    integration_id,
+                    f"label-{index}",
+                    value,
+                    "connector",
+                    "method",
+                    active,
+                    updated,
+                    updated,
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+    if os.name != "nt":
+        db_path.chmod(0o600)
+    return db_path
+
+
+def test_credential_store_active_newest_wins_without_auth_json(tmp_path: Path) -> None:
+    import json
+
+    source = tmp_path / "source-home" / ".local" / "share" / "opencode" / "auth.json"
+    db_path = source.parent / "opencode.db"
+    inactive_value = json.dumps(
+        {"key": "credential-value-inactive-3d9b1f04", "type": "key"}, sort_keys=True
+    )
+    active_value = json.dumps(
+        {"key": _CREDENTIAL_SENTINEL, "type": "key"}, sort_keys=True
+    )
+    _credential_db(
+        db_path,
+        [
+            ("opencode-go", inactive_value, 0, 3000),
+            ("opencode-go", active_value, 1, 2000),
+        ],
+    )
+    assert not source.exists()
+    isolated = tmp_path / "isolated"
+
+    receipt = opencode_auth.project_opencode_auth(source, isolated)
+
+    destination = isolated / opencode_auth.OPENCODE_AUTH_RELATIVE_PATH
+    assert json.loads(destination.read_bytes()) == {
+        "opencode-go": {"key": _CREDENTIAL_SENTINEL, "type": "api"}
+    }
+    assert opencode_auth.opencode_go_api_key_env(isolated) == {
+        "OPENCODE_API_KEY": _CREDENTIAL_SENTINEL
+    }
+    assert _CREDENTIAL_SENTINEL not in repr(receipt)
+
+
+def test_credential_store_wins_over_auth_json(tmp_path: Path) -> None:
+    import json
+
+    auth_document = (
+        b'{"opencode-go": {"type": "api", '
+        b'"key": "credential-value-auth-json-6e2a8c10"}}\n'
+    )
+    source = _source(tmp_path, auth_document)
+    active_value = json.dumps(
+        {"key": _CREDENTIAL_SENTINEL, "type": "key"}, sort_keys=True
+    )
+    oauth_value = json.dumps(
+        {"type": "oauth", "access": "a", "refresh": "r", "expires": 1, "methodID": "m"},
+        sort_keys=True,
+    )
+    _credential_db(
+        source.parent / "opencode.db",
+        [
+            ("opencode-go", active_value, 1, 2000),
+            ("openai", oauth_value, 1, 2000),
+        ],
+    )
+    isolated = tmp_path / "isolated"
+
+    opencode_auth.project_opencode_auth(source, isolated)
+
+    destination = isolated / opencode_auth.OPENCODE_AUTH_RELATIVE_PATH
+    assert json.loads(destination.read_bytes()) == {
+        "opencode-go": {"key": _CREDENTIAL_SENTINEL, "type": "api"},
+        "openai": {
+            "type": "oauth",
+            "access": "a",
+            "refresh": "r",
+            "expires": 1,
+            "methodID": "m",
+        },
+    }
+    assert opencode_auth.opencode_go_api_key_env(isolated) == {
+        "OPENCODE_API_KEY": _CREDENTIAL_SENTINEL
+    }
+
+
+def test_credential_store_without_table_falls_back_to_missing_source(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+
+    source = tmp_path / "source-home" / ".local" / "share" / "opencode" / "auth.json"
+    source.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    db_path = source.parent / "opencode.db"
+    connection = sqlite3.connect(db_path.as_posix())
+    try:
+        connection.execute("CREATE TABLE other (id INTEGER)")
+        connection.commit()
+    finally:
+        connection.close()
+    if os.name != "nt":
+        db_path.chmod(0o600)
+    assert not source.exists()
+    with pytest.raises(
+        opencode_auth.OpenCodeAuthSourceError,
+        match="^opencode_auth_source_unavailable$",
+    ):
+        opencode_auth.project_opencode_auth(source, tmp_path / "isolated")
+
+
+def _store_row() -> tuple[str, str, int, int]:
+    import json
+
+    return ("opencode-go", json.dumps({"key": _CREDENTIAL_SENTINEL, "type": "key"}), 1, 1)
+
+
+def test_relative_or_dotdot_source_is_refused_before_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _credential_db(tmp_path / "rel" / "opencode.db", [_store_row()])
+    monkeypatch.chdir(tmp_path)
+    for source in (
+        Path("rel") / "auth.json",
+        tmp_path / "x" / ".." / "rel" / "auth.json",
+    ):
+        with pytest.raises(
+            opencode_auth.OpenCodeAuthSourceError,
+            match="^opencode_auth_source_path_invalid$",
+        ):
+            opencode_auth.project_opencode_auth(source, tmp_path / "isolated")
+    assert not (tmp_path / "isolated").exists()
+
+
+def test_credential_store_without_rows_projects_auth_json(tmp_path: Path) -> None:
+    source = _source(tmp_path)
+    _credential_db(source.parent / "opencode.db", [])
+    opencode_auth.project_opencode_auth(source, tmp_path / "isolated")
+    destination = (tmp_path / "isolated") / opencode_auth.OPENCODE_AUTH_RELATIVE_PATH
+    assert destination.read_bytes() == source.read_bytes()
+
+
+def test_oversize_credential_store_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(tmp_path)
+    _credential_db(source.parent / "opencode.db", [_store_row()])
+    monkeypatch.setattr(opencode_auth, "MAX_SOURCE_BYTES", 16)
+    with pytest.raises(
+        opencode_auth.OpenCodeAuthSourceError,
+        match="^opencode_auth_source_size_invalid$",
+    ) as excinfo:
+        opencode_auth.project_opencode_auth(source, tmp_path / "isolated")
+    assert _CREDENTIAL_SENTINEL not in str(excinfo.value)
+
+
+@pytest.mark.skipif(
+    not opencode_auth.posix_path_modes_supported(), reason="POSIX modes unavailable"
+)
+def test_credential_store_writable_by_others_is_refused(tmp_path: Path) -> None:
+    source = _source(tmp_path)
+    db_path = _credential_db(source.parent / "opencode.db", [_store_row()])
+    for mode in (0o620, 0o602):
+        db_path.chmod(mode)
+        with pytest.raises(
+            opencode_auth.OpenCodeAuthSourceError,
+            match="^opencode_auth_source_writable_by_others$",
+        ) as excinfo:
+            opencode_auth.project_opencode_auth(source, tmp_path / "isolated")
+        assert _CREDENTIAL_SENTINEL not in str(excinfo.value)
+    destination = (tmp_path / "isolated") / opencode_auth.OPENCODE_AUTH_RELATIVE_PATH
+    assert not destination.exists()
+
+
+@pytest.mark.skipif(
+    not opencode_auth.posix_path_modes_supported(), reason="POSIX modes unavailable"
+)
+def test_symlinked_credential_store_is_refused(tmp_path: Path) -> None:
+    source = _source(tmp_path)
+    real = _credential_db(tmp_path / "elsewhere" / "real.db", [_store_row()])
+    (source.parent / "opencode.db").symlink_to(real)
+    with pytest.raises(
+        opencode_auth.OpenCodeAuthSourceError,
+        match="^opencode_auth_source_not_regular$",
+    ) as excinfo:
+        opencode_auth.project_opencode_auth(source, tmp_path / "isolated")
+    assert _CREDENTIAL_SENTINEL not in str(excinfo.value)
+    destination = (tmp_path / "isolated") / opencode_auth.OPENCODE_AUTH_RELATIVE_PATH
+    assert not destination.exists()

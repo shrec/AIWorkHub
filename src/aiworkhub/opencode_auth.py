@@ -1,9 +1,12 @@
 """Fail-closed OpenCode credential projection for isolated worker homes.
 
-Only OpenCode's exact ``auth.json`` is copied.  The source is read through one
-verified descriptor and the destination is materialized atomically below the
-request-private HOME; provider databases, configuration, logs, caches, and
-session state are never traversed.
+Only OpenCode's exact ``auth.json`` or OpenCode 2.x's credential table are
+the sources.  ``auth.json`` is read through one verified descriptor; the
+credential database is lstat-checked, opened read-only by path by SQLite
+(its -wal/-shm sidecars included) and re-checked for the same identity
+after the read.  The destination is materialized atomically below the
+request-private HOME; no other table, configuration, log, cache, or session
+state is read.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ import json
 import os
 import re
 import socket
+import sqlite3
 import stat
 import tempfile
 from collections.abc import Callable, Mapping
@@ -164,6 +168,64 @@ def _read_verified_source(
         os.close(fd)
 
 
+def _read_credential_store(database: Path) -> bytes | None:
+    try:
+        metadata = os.lstat(database)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise OpenCodeAuthSourceError("opencode_auth_source_unavailable") from None
+    if not stat.S_ISREG(metadata.st_mode):
+        raise OpenCodeAuthSourceError("opencode_auth_source_not_regular")
+    if not stat_owned_by_current_user(metadata):
+        raise OpenCodeAuthSourceError("opencode_auth_source_wrong_owner")
+    if posix_path_modes_supported() and stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise OpenCodeAuthSourceError("opencode_auth_source_writable_by_others")
+    try:
+        connection = sqlite3.connect(
+            f"{database.absolute().as_uri()}?mode=ro", uri=True, timeout=5
+        )
+        try:
+            rows = connection.execute(
+                "SELECT integration_id, value FROM credential "
+                "ORDER BY (active = 1), time_updated"
+            ).fetchall()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return None
+    try:
+        current = os.lstat(database)
+    except OSError:
+        raise OpenCodeAuthSourceError("opencode_auth_source_identity_changed") from None
+    if (current.st_dev, current.st_ino, current.st_mode) != (
+        metadata.st_dev, metadata.st_ino, metadata.st_mode
+    ):
+        raise OpenCodeAuthSourceError("opencode_auth_source_identity_changed")
+    document: dict[str, dict[str, object]] = {}
+    for integration_id, value in rows:
+        if not isinstance(integration_id, str) or not integration_id:
+            continue
+        if not isinstance(value, (str, bytes, bytearray)):
+            continue
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            continue
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("type"), str):
+            continue
+        if parsed["type"] == "key":
+            # OpenCode 2.x stores an API key as type "key"; auth.json says "api".
+            parsed = {**parsed, "type": "api"}
+        document[integration_id] = parsed
+    if not document:
+        return None
+    raw = json.dumps(document, sort_keys=True).encode("utf-8")
+    if len(raw) > MAX_SOURCE_BYTES:
+        raise OpenCodeAuthSourceError("opencode_auth_source_size_invalid")
+    return raw
+
+
 def _private_directory(path: Path, *, create_parents: bool = False) -> None:
     try:
         if create_parents:
@@ -264,11 +326,15 @@ def _write_atomic(directory: Path, destination: Path, raw: bytes) -> None:
 def project_opencode_auth(
     source: StrPath, isolated_home: StrPath
 ) -> OpenCodeAuthProjection:
-    """Copy only one verified OpenCode auth file into an isolated HOME."""
+    """Copy one verified OpenCode credential source into an isolated HOME."""
 
     source_path = Path(os.fspath(source))
     home = Path(os.fspath(isolated_home))
-    raw = _read_verified_source(source_path)
+    if not source_path.is_absolute() or ".." in source_path.parts:
+        raise OpenCodeAuthSourceError("opencode_auth_source_path_invalid")
+    raw = _read_credential_store(source_path.parent / "opencode.db")
+    if raw is None:
+        raw = _read_verified_source(source_path)
     directory = _destination_directory(home)
     destination = home / OPENCODE_AUTH_RELATIVE_PATH
     _write_atomic(directory, destination, raw)
