@@ -1,5 +1,11 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.51 — 2026-10-14
+
+### Added
+
+- Bundled runtime 0.12.51: AppContainer OpenCode workers reach an owner-configured loopback provider such as OmniRoute through a job-scoped port relay, with no loopback exemption (NF-2026-01503).
+
 ## 0.12.50 — 2026-10-14
 
 ### Changed

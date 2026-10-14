@@ -14,6 +14,10 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.51
+
+- OpenCode workers in the Windows sandbox can now use OmniRoute, or any owner-configured provider on 127.0.0.1, through a per-worker relay that serves only that worker and dials only the configured address.
+
 ## What's new in 0.12.50
 
 - Every Claude seat now runs the 5.5 family (Opus 5.5, Sonnet 5.5, Haiku 5.5) instead of older models behind the bare aliases; OpenCode workers can use an owner-configured custom provider such as OmniRoute; aged scratch storage is cleaned up; several task-recovery and accept-receipt fixes.

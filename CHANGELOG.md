@@ -6,6 +6,12 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.51] - 2026-10-14
+
+### Added
+
+- OpenCode: an AppContainer worker reaches an owner-configured loopback provider such as OmniRoute on 127.0.0.1 through a port-scoped relay. The projected baseURL points at a per-worker port that the worker's pipe shim serves, and the host dials only the provider address from the owner's config. Only connections owned by a process in the worker's own job are carried, the container cannot add relay pipe instances, sources other than 127.0.0.1 are dropped, and a foreign listener on the relay port ends the worker; no LoopbackExempt and no new capability (NF-2026-01503).
+
 ## [0.12.50] - 2026-10-14
 
 ### Changed
