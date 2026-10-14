@@ -172,6 +172,15 @@ function loadExtensionHost(repoRoot, pythonPath) {
   }
 }
 
+// Mirrors extension.js canonicalRepositoryRoot: an AppContainer sandbox denies realpath.native (EPERM), so fall back to the raw path.
+function canonicalRepositoryRoot(root) {
+  try {
+    return fs.realpathSync.native(root);
+  } catch (_err) {
+    return root;
+  }
+}
+
 function installSpawnFake(generationsByRoot) {
   const spawns = [];
   const original = childProcess.spawn;
@@ -183,7 +192,7 @@ function installSpawnFake(generationsByRoot) {
   // generation on non-Linux runners.
   const canonicalGenerations = new Map(
     [...generationsByRoot.entries()].map(([root, generations]) => [
-      path.normalize(fs.realpathSync.native(root)),
+      path.normalize(canonicalRepositoryRoot(root)),
       generations,
     ]),
   );
@@ -201,7 +210,7 @@ function installSpawnFake(generationsByRoot) {
       requests: [],
     };
     spawns.push(spawnRecord);
-    const canonicalRoot = path.normalize(fs.realpathSync.native(spawnRecord.repoRoot));
+    const canonicalRoot = path.normalize(canonicalRepositoryRoot(spawnRecord.repoRoot));
     const queue = canonicalGenerations.get(canonicalRoot) || [];
     const generation = queue.shift() || { version: EXPECTED_VERSION, missingTools: [], dieBeforeInitialize: false };
     return new FakeChild(spawnRecord, generation);
@@ -483,8 +492,13 @@ async function testHandshakeFailuresExposeExactPhase(tmp) {
     { repoId: "repo_phasediagnostics000000000000000008" },
     "claim-phase",
   );
-  client.request = async () => { throw new Error("mcp_request_timeout"); };
+  const handshakeRequests = [];
+  client.request = async (method, params, timeoutMs) => { handshakeRequests.push({ method, timeoutMs }); throw new Error("mcp_request_timeout"); };
   await assert.rejects(client._handshake(), /mcp_initialize_failed:mcp_request_timeout/);
+  const initializeCall = handshakeRequests.find((entry) => entry.method === "initialize");
+  assert.ok(initializeCall, "expected initialize request to be recorded");
+  assert.ok(initializeCall.timeoutMs >= 60000, `expected initialize timeout >= 60000, got ${initializeCall.timeoutMs}`);
+  assert.ok(initializeCall.timeoutMs > 20000, `expected initialize timeout greater than ordinary 20000, got ${initializeCall.timeoutMs}`);
 
   client.request = async (method) => {
     if (method === "tools/list") return { tools: [] };
@@ -575,7 +589,7 @@ async function testFailedRestartDegradesWithoutCrossRepoFallback(tmp) {
     // Never silently attaches another repo: the bound client is still keyed
     // to this exact repository root/id after the failed repair.
     const client = host.extension.__testInternals.getMcpClient(host.context);
-    assert.strictEqual(client.repositoryRoot, fs.realpathSync.native(repoRoot));
+    assert.strictEqual(client.repositoryRoot, canonicalRepositoryRoot(repoRoot));
     assert.strictEqual(client.repositoryIdentity.repoId, "repo_restartfail0000000000000000003");
 
     await host.extension.deactivate();
@@ -636,8 +650,8 @@ async function testTwoWorkspacesRepairInIsolation(tmp) {
     await hostA.extension.__testInternals.pushRuntimeInfo(a.view);
     await hostB.extension.__testInternals.pushRuntimeInfo(b.view);
 
-    const spawnsForA = fake.spawns.filter((s) => s.repoRoot === fs.realpathSync.native(repoA));
-    const spawnsForB = fake.spawns.filter((s) => s.repoRoot === fs.realpathSync.native(repoB));
+    const spawnsForA = fake.spawns.filter((s) => s.repoRoot === canonicalRepositoryRoot(repoA));
+    const spawnsForB = fake.spawns.filter((s) => s.repoRoot === canonicalRepositoryRoot(repoB));
     assert.strictEqual(spawnsForA.length, 2, "repo A's mismatch must trigger its own bounded repair");
     assert.strictEqual(spawnsForB.length, 1, "repo B was already healthy and must never be restarted by A's repair");
     assert.notStrictEqual(spawnsForA[0].repoId, spawnsForB[0].repoId);

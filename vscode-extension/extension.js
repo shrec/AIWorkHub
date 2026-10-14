@@ -649,6 +649,8 @@ const REAL_REPO_ID_RE = /^repo_[a-f0-9]{32}$/;
 // ── One bounded repo-local Task MCP stdio child + one JSON-RPC session ─────
 const MCP_PROTOCOL_VERSION = "2024-11-05";
 const MCP_REQUEST_TIMEOUT_MS = 20000;
+// Initialize waits for the first import of a fresh runtime generation (no __pycache__, measured 19.6s cold vs 3s warm), while a crashed server is still rejected immediately by _onExit.
+const MCP_INITIALIZE_TIMEOUT_MS = 120000;
 // A full dashboard snapshot aggregates several repository-local data sources
 // and is materially heavier than ordinary control-plane RPCs.  Give it its
 // own bounded budget without changing worker/provider liveness semantics.
@@ -733,9 +735,9 @@ function readRepositoryManifestInfo(root, label) {
 
   let rawManifest;
   try {
-    const realRoot = fs.realpathSync.native(root);
-    const realHub = fs.realpathSync.native(hubPath);
-    const realManifest = fs.realpathSync.native(manifestPath);
+    const realRoot = canonicalRepositoryRoot(root);
+    const realHub = canonicalRepositoryRoot(hubPath);
+    const realManifest = canonicalRepositoryRoot(manifestPath);
     const hubRelative = path.relative(realRoot, realHub);
     const manifestRelative = path.relative(realRoot, realManifest);
     const escapesRoot = (relative) => (
@@ -2348,7 +2350,7 @@ class McpStdioClient {
         protocolVersion: MCP_PROTOCOL_VERSION,
         capabilities: {},
         clientInfo: { name: "aiworkhub-vscode", version: installedExtensionVersion() },
-      });
+      }, MCP_INITIALIZE_TIMEOUT_MS);
     } catch (err) {
       throw new Error(`mcp_initialize_failed:${sanitizeErrorMessage(err)}`);
     }
@@ -14333,6 +14335,7 @@ module.exports = {
     clearVscodeLmInFlightCalls: () => vscodeLmInFlightCalls.clear(),
     constants: {
       MCP_REQUEST_TIMEOUT_MS,
+      MCP_INITIALIZE_TIMEOUT_MS,
       MCP_DASHBOARD_SNAPSHOT_TIMEOUT_MS,
       VSCODE_LM_WORKER_TOOL_TIMEOUT_MS,
       VSCODE_LM_WORKER_SOURCE_GRAPH_READY_TIMEOUT_MS,
