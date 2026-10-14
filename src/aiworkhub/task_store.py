@@ -4998,7 +4998,8 @@ def _terminal_failure_supersedes_predecessor(
     by it (NF-2026-00515).  A predecessor without a trustworthy claim epoch
     (for example a reviewer-pinned workspace) is never superseded by failure
     history.  A later failure with no candidate (for example a cancel before
-    any output) never supersedes a sealed predecessor (NF-2026-01516).
+    any output) never supersedes a sealed predecessor (NF-2026-01516).  The
+    same rule decides when a later terminal_review does (NF-2026-01519).
     """
     predecessor_epoch = retained_predecessor.get("claim_epoch")
     failure_epoch = terminal_failure.get("claim_epoch")
@@ -6337,17 +6338,17 @@ def recover_blocked_rework(
         # manager recovery, authenticate the newest terminal event
         # and synthesize the predecessor from its mechanically collected
         # evidence. Replay authorization remains a separate explicit grant.
-        if terminal_event == "terminal_failure" and (
-            not retained_predecessor
-            or (
-                not validation_only_replay
-                and _terminal_failure_supersedes_predecessor(
-                    terminal_review, retained_predecessor
-                )
+        # NF-2026-01519: a terminal_review from a strictly later claim epoch
+        # (a review_ready candidate whose accept failed) supersedes the pinned
+        # predecessor through this same path; failing it refuses recovery.
+        if (terminal_event == "terminal_failure" and not retained_predecessor) or (
+            terminal_event in {"terminal_failure", "terminal_review"}
+            and not validation_only_replay
+            and _terminal_failure_supersedes_predecessor(
+                terminal_review, retained_predecessor
             )
         ):
-            recorded_failure = card.get("terminal_failure")
-            if recorded_failure != terminal_review:
+            if card.get(terminal_event) != terminal_review:
                 return False, "retained_terminal_candidate_event_mismatch"
             terminal_claim_epoch = terminal_review.get("claim_epoch")
             if (
@@ -6467,9 +6468,24 @@ def recover_blocked_rework(
                 # timed-out candidate once its bytes are sealed.  Only a truly
                 # absent worktree lets the claimed delta, authenticated below,
                 # stand in for it; a present, dangling or foreign path keeps
-                # every retained-worktree check.
-                collected = evidence.get("rework_delta") is not None and not (
-                    os.path.lexists(workspace_path)
+                # every retained-worktree check.  NF-2026-01519: a superseding
+                # review's worktree that a failed accept emptied of every
+                # candidate path is collected too; one surviving path, or a
+                # symlink or junction on any component above one, is not.
+                collected = evidence.get("rework_delta") is not None and (
+                    not os.path.lexists(workspace_path)
+                    or (
+                        terminal_event == "terminal_review"
+                        and workspace_path.is_dir()
+                        and not any(
+                            os.path.lexists(candidate)
+                            or _workspace_has_link_component(expected_repo, candidate)
+                            for candidate in (
+                                workspace_path.joinpath(*path.split("/"))
+                                for path in changed_paths
+                            )
+                        )
+                    )
                 )
                 resolved_workspace = (
                     workspace_path if collected else workspace_path.resolve(strict=True)

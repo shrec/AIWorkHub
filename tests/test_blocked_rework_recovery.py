@@ -2908,16 +2908,18 @@ _NF919_FEEDBACK = "NeedFix: finish NF919 from its sealed epoch-6 candidate"
 
 def _seal_nf919_delta(
     repo: Path, task_id: str, request_id: str, entries: dict[str, bytes], artifact_dir: Path,
+    claim_epoch: int = 6,
 ) -> dict[str, str]:
     """Write the byte-identical packet ``seal_rework_delta_artifact`` seals for
-    this epoch-6 candidate, minus its 0700/0600 mode hardening, which is not
-    under test and which chmod-denying validation sandboxes refuse."""
+    this epoch-6 (or ``claim_epoch``) candidate, minus its 0700/0600 mode
+    hardening, which is not under test and which chmod-denying validation
+    sandboxes refuse."""
     payload = {
         "schema_id": worker_workspace.REWORK_DELTA_ARTIFACT_SCHEMA_ID,
         "authority_repo": str(repo.resolve(strict=False)),
         "task_id": task_id,
         "request_id": request_id,
-        "claim_epoch": 6,
+        "claim_epoch": claim_epoch,
         "files": [
             {
                 "path": path,
@@ -3299,6 +3301,305 @@ def test_nf594_clean_root_never_discards_authenticated_sealed_delta(
     ) == (False, "clean_root_rework_sealed_delta_available")
 
     assert _nf919_state(repo, task_id) == before
+
+
+_NF1519_REQUEST = "8" * 32
+_NF1519_PINNED_AT = "2026-09-20T00:01:00+00:00"
+_NF1519_REVIEWED_AT = "2026-09-20T00:05:00+00:00"
+_NF1519_FEEDBACK = "NeedFix: finish NF1519 from its sealed reviewed candidate"
+
+
+def _nf1519_blocked_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    review_epoch: int,
+    worktree: str = "removed",
+    delta: bool = True,
+) -> tuple[Path, str, dict[str, object], dict[str, str], dict[str, object]]:
+    """NF-2026-01519: NF919's sealed epoch-6 candidate is the rejection-pinned
+    predecessor; a later request reached review_ready and sealed its delta at
+    ``review_epoch``, its accept failed and retention blocked the card
+    (review_workspace_hash_mismatch) with that worktree removed or emptied."""
+    repo, task_id, _sealed, _descriptor = _nf919_timed_out_gc_fixture(tmp_path, monkeypatch)
+    assert task_store.recover_blocked_rework(
+        repo, task_id, actor="coordinator", feedback_reason=_NF919_FEEDBACK,
+    ) == (True, "recovered")
+    request_root = repo / ".aiworkhub" / "runtime" / "worktrees" / _NF1519_REQUEST
+    reviewed = {
+        path: f"epoch {review_epoch} reviewed fix {path}\n".encode() for path in _NF919_PATHS
+    }
+    hashes = {path: hashlib.sha256(data).hexdigest() for path, data in reviewed.items()}
+    artifact = _seal_nf919_delta(
+        repo,
+        task_id,
+        _NF1519_REQUEST,
+        reviewed,
+        worker_workspace.configured_runtime_root(repo) / "rework_deltas",
+        claim_epoch=review_epoch,
+    )
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        card = json.loads(
+            conn.execute(
+                "SELECT card_json FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()[0]
+        )
+        pinned = {**card["rework_predecessor"], "pinned_at": _NF1519_PINNED_AT}
+        authority = {
+            **pinned["workspace"]["python_candidate_authority"],
+            "sources": [
+                {**source, "bytes_sha256": hashes[source["path"]]}
+                for source in pinned["workspace"]["python_candidate_authority"]["sources"]
+            ],
+        }
+        workspace = {
+            **pinned["workspace"],
+            "request_id": _NF1519_REQUEST,
+            "path": str(request_root / "worktree"),
+            "home": str(request_root / "home"),
+            "python_candidate_authority": authority,
+        }
+        descriptor = {
+            **pinned["rework_delta"],
+            "request_id": _NF1519_REQUEST,
+            "claim_epoch": review_epoch,
+            "artifact_path": artifact["path"],
+            "artifact_sha256": artifact["digest"],
+        }
+        evidence = {
+            "request_id": _NF1519_REQUEST,
+            "changed_paths": list(_NF919_PATHS),
+            "changed_path_hashes": hashes,
+            "python_candidate_authority": authority,
+            "workspace": workspace,
+            "request_identity": {
+                "request_id": _NF1519_REQUEST,
+                "task_id": task_id,
+                "runner": card["runner"],
+                "topic": card["topic"],
+                "repo": str(repo),
+                "claim_epoch": review_epoch,
+                "allowed_writes": workspace["allowed_writes"],
+                "base_oid": workspace["base_oid"],
+                "parent_baseline": workspace["parent_baseline"],
+            },
+        }
+        if delta:
+            evidence["rework_delta"] = descriptor
+        review = {
+            "substatus": "review_ready",
+            "claim_epoch": review_epoch,
+            "request_id": _NF1519_REQUEST,
+            "runner": card["runner"],
+            "recorded_at": _NF1519_REVIEWED_AT,
+            "evidence": evidence,
+        }
+        card.update(
+            status="blocked",
+            worker_status="finalize_failed",
+            terminal_substatus="finalize_failed",
+            blocker_reason="review_workspace_hash_mismatch",
+            workspace_retention_failure={
+                "request_id": _NF1519_REQUEST,
+                "reason": "review_workspace_hash_mismatch",
+                "detected_at": _NF1519_REVIEWED_AT,
+            },
+            claim_epoch=review_epoch,
+            launch_request_id=_NF1519_REQUEST,
+            terminal_review=review,
+            rework_predecessor=pinned,
+            rejection_disposition={
+                "schema_id": "aiworkhub.rejection_disposition.v1",
+                "request_id": pinned["request_id"],
+                "pinned_at": _NF1519_PINNED_AT,
+            },
+        )
+        conn.execute(
+            "UPDATE tasks SET status='blocked', worker_status='finalize_failed', "
+            "card_json=? WHERE task_id=?",
+            (json.dumps(card), task_id),
+        )
+        conn.execute(
+            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+            "VALUES (?, 'terminal_review', ?, ?, ?)",
+            (task_id, card["runner"], json.dumps(review), _NF1519_REVIEWED_AT),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    if worktree == "emptied":
+        # The failed accept left the directory skeleton but no candidate file.
+        (request_root / "worktree" / "src" / "aiworkhub").mkdir(parents=True)
+    elif worktree == "survivor":
+        # One candidate path survived, so the retained-worktree checks still run.
+        survivor = request_root / "worktree" / _NF919_PATHS[0]
+        survivor.parent.mkdir(parents=True)
+        survivor.write_bytes(b"unverified survivor bytes\n")
+    return repo, task_id, pinned, hashes, descriptor
+
+
+@pytest.mark.parametrize("worktree", ["removed", "emptied"])
+def test_nf1519_later_sealed_review_supersedes_rejected_predecessor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, worktree: str,
+) -> None:
+    """NF-2026-01519: recovery reseeds from the review_ready candidate sealed at
+    epoch 7 rather than the older rejection-pinned epoch-6 delta, and every
+    published predecessor field names that one request."""
+    repo, task_id, pinned, hashes, descriptor = _nf1519_blocked_review(
+        tmp_path, monkeypatch, review_epoch=7, worktree=worktree,
+    )
+
+    assert task_store.recover_blocked_rework(
+        repo, task_id, actor="coordinator", feedback_reason=_NF1519_FEEDBACK,
+    ) == (True, "recovered")
+
+    recovered = _get_card(repo, task_id)
+    assert recovered["claim_epoch"] == 8
+    predecessor = recovered["rework_predecessor"]
+    assert pinned["request_id"] != _NF1519_REQUEST
+    assert predecessor["request_id"] == _NF1519_REQUEST
+    assert predecessor["claim_epoch"] == 7
+    assert predecessor["changed_path_hashes"] == hashes
+    assert predecessor["rework_delta"] == descriptor
+    assert predecessor["delta_artifact"] == {
+        "path": descriptor["artifact_path"],
+        "digest": descriptor["artifact_sha256"],
+    }
+    published = recovered["recovery_predecessor"]
+    assert {
+        key: published[key]
+        for key in (
+            "request_id",
+            "changed_path_hashes",
+            "terminal_claim_epoch",
+            "terminal_substatus",
+            "terminal_recorded_at",
+        )
+    } == {
+        "request_id": _NF1519_REQUEST,
+        "changed_path_hashes": hashes,
+        "terminal_claim_epoch": 7,
+        "terminal_substatus": "review_ready",
+        "terminal_recorded_at": _NF1519_REVIEWED_AT,
+    }
+    # The stale epoch-6 rejection no longer describes the pinned bytes.
+    assert "blocked_recovery_rejection_rebind" not in recovered
+    assert "clean_root_recovery_authorization" not in recovered
+
+
+@pytest.mark.parametrize("worktree", ["removed", "emptied"])
+@pytest.mark.parametrize(
+    ("tamper", "reason"),
+    [
+        ("artifact_bytes", "retained_terminal_candidate_delta_unverified"),
+        ("artifact_missing", "retained_terminal_candidate_delta_unverified"),
+        ("descriptor_missing", "retained_terminal_candidate_workspace_invalid"),
+    ],
+)
+def test_nf1519_unauthenticated_later_review_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+    reason: str,
+    worktree: str,
+) -> None:
+    """NF-2026-01519: a later review whose sealed delta does not authenticate
+    refuses recovery instead of republishing the epoch-6 predecessor under the
+    epoch-7 review's claim epoch and substatus."""
+    repo, task_id, _pinned, _hashes, descriptor = _nf1519_blocked_review(
+        tmp_path,
+        monkeypatch,
+        review_epoch=7,
+        worktree=worktree,
+        delta=tamper != "descriptor_missing",
+    )
+    if worktree == "emptied" and tamper == "descriptor_missing":
+        # Without a sealed delta the emptied directory is checked as retained.
+        reason = "retained_terminal_candidate_bytes_invalid"
+    artifact = Path(str(descriptor["artifact_path"]))
+    if tamper == "artifact_bytes":
+        artifact.write_bytes(artifact.read_bytes() + b"\n")
+    elif tamper == "artifact_missing":
+        artifact.unlink()
+    before = _nf919_state(repo, task_id)
+
+    assert task_store.recover_blocked_rework(
+        repo, task_id, actor="coordinator", feedback_reason=_NF1519_FEEDBACK,
+    ) == (False, reason)
+
+    assert _nf919_state(repo, task_id) == before
+
+
+def test_nf1519_surviving_candidate_path_keeps_worktree_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NF-2026-01519: a worktree still holding one candidate path is not
+    collected; the retained-worktree checks refuse its unverified bytes rather
+    than letting the sealed delta stand in for them."""
+    repo, task_id, _pinned, _hashes, _descriptor = _nf1519_blocked_review(
+        tmp_path, monkeypatch, review_epoch=7, worktree="survivor",
+    )
+    before = _nf919_state(repo, task_id)
+
+    assert task_store.recover_blocked_rework(
+        repo, task_id, actor="coordinator", feedback_reason=_NF1519_FEEDBACK,
+    ) == (False, "retained_terminal_candidate_hash_mismatch")
+
+    assert _nf919_state(repo, task_id) == before
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="NTFS junctions are Windows-only")
+@pytest.mark.parametrize(
+    ("link_at", "reason"),
+    [
+        ("worktree", "retained_terminal_candidate_workspace_invalid"),
+        ("worktree/src", "retained_terminal_candidate_bytes_invalid"),
+    ],
+    ids=["root", "intermediate"],
+)
+def test_nf1519_junction_backed_emptied_worktree_is_not_collected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, link_at: str, reason: str,
+) -> None:
+    """NF-2026-01519: a junction on the worktree root or above a candidate path
+    is not an emptied worktree; recovery keeps the retained-worktree checks and
+    refuses instead of recording a foreign-backed workspace."""
+    import _winapi
+
+    repo, task_id, _pinned, _hashes, _descriptor = _nf1519_blocked_review(
+        tmp_path, monkeypatch, review_epoch=7,
+    )
+    request_root = repo / ".aiworkhub" / "runtime" / "worktrees" / _NF1519_REQUEST
+    link = request_root.joinpath(*link_at.split("/"))
+    link.parent.mkdir(parents=True, exist_ok=True)
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    _winapi.CreateJunction(str(foreign), str(link))
+    before = _nf919_state(repo, task_id)
+
+    assert task_store.recover_blocked_rework(
+        repo, task_id, actor="coordinator", feedback_reason=_NF1519_FEEDBACK,
+    ) == (False, reason)
+
+    assert _nf919_state(repo, task_id) == before
+
+
+def test_nf1519_same_epoch_review_keeps_pinned_predecessor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NF-2026-01519: only a strictly later review supersedes; one at the pinned
+    predecessor's own claim epoch leaves that predecessor untouched."""
+    repo, task_id, pinned, _hashes, _descriptor = _nf1519_blocked_review(
+        tmp_path, monkeypatch, review_epoch=6,
+    )
+    assert pinned["claim_epoch"] == 6
+
+    assert task_store.recover_blocked_rework(
+        repo, task_id, actor="coordinator", feedback_reason=_NF1519_FEEDBACK,
+    ) == (True, "recovered")
+
+    assert _get_card(repo, task_id)["rework_predecessor"] == pinned
 
 
 # ---------------------------------------------------------------------------
