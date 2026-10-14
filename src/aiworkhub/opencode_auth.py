@@ -15,12 +15,12 @@ import re
 import socket
 import stat
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from os import PathLike
 from pathlib import Path
 from typing import Union
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from .platform_io import (
     chmod_fd,
@@ -398,33 +398,60 @@ def _project_opencode_model_entry(
     return projected
 
 
-def _opencode_provider_base_url_is_loopback(base_url: str) -> bool:
-    """Whether a resolved ``options.baseURL`` host is loopback-only or unspecified.
+def _opencode_loopback_host(hostname: str | None) -> str | None:
+    """The canonical spelling of a loopback-only or unspecified host, else None.
 
-    ``localhost`` and ``*.localhost`` (case and a trailing dot ignored), every
-    IPv4 spelling ``inet_aton`` accepts (``127.1``, ``2130706433``,
-    ``0x7f000001``), IPv4-mapped IPv6 (``::ffff:127.0.0.1``) and the unspecified
-    ``0.0.0.0``/``::`` all count.
+    ``localhost`` and ``*.localhost`` (case and a trailing dot ignored) stay
+    names; every IPv4 spelling ``inet_aton`` accepts (``127.1``,
+    ``2130706433``, ``0x7f000001``) and IPv4-mapped IPv6 (``::ffff:127.0.0.1``)
+    become the address they spell, as do the unspecified ``0.0.0.0``/``::``.
     """
-    try:
-        hostname = urlsplit(base_url).hostname
-    except ValueError:
-        return False
     if not hostname:
-        return False
+        return None
     hostname = hostname.rstrip(".").lower()
     if hostname == "localhost" or hostname.endswith(".localhost"):
-        return True
+        return hostname
     try:
         address = ipaddress.ip_address(hostname)
     except ValueError:
         try:
             address = ipaddress.IPv4Address(socket.inet_aton(hostname))
         except (OSError, ValueError):
-            return False
+            return None
     if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
         address = address.ipv4_mapped
-    return address.is_loopback or address.is_unspecified
+    return str(address) if address.is_loopback or address.is_unspecified else None
+
+
+def _opencode_provider_base_url_is_loopback(base_url: str) -> bool:
+    """Whether a resolved ``options.baseURL`` host is loopback-only or
+    unspecified, in any spelling :func:`_opencode_loopback_host` knows."""
+    try:
+        return _opencode_loopback_host(urlsplit(base_url).hostname) is not None
+    except ValueError:
+        return False
+
+
+def _relayed_base_url(base_url: str, relay: Callable[[str, int], int] | None) -> str:
+    """A loopback ``base_url`` with only its host:port moved to the relay's
+    ``127.0.0.1:P`` (NF-2026-01503).
+
+    The relay is told the original target -- the canonical host, and the port
+    (80 when none is written) -- and answers P.  No relay, any scheme but plain
+    ``http``, an unparsable URL or a target the relay refuses (ValueError)
+    keeps opencode_provider_loopback_unreachable_in_appcontainer.
+    """
+    try:
+        parts = urlsplit(base_url)
+        port = parts.port
+        host = _opencode_loopback_host(parts.hostname)
+        if relay is None or parts.scheme != "http" or host is None:
+            raise ValueError(base_url)
+        relayed = relay(host, 80 if port is None else port)
+    except ValueError:
+        raise OpenCodeAuthError("opencode_provider_loopback_unreachable_in_appcontainer") from None
+    userinfo, at, _ = parts.netloc.rpartition("@")
+    return urlunsplit(parts._replace(netloc=f"{userinfo}{at}127.0.0.1:{relayed}"))
 
 
 def project_opencode_custom_provider(
@@ -432,6 +459,7 @@ def project_opencode_custom_provider(
     *,
     host_env: dict[str, str] | None = None,
     appcontainer: bool = False,
+    loopback_relay: Callable[[str, int], int] | None = None,
 ) -> dict[str, object] | None:
     """Project the owner's exact custom-provider block for one model, or None.
 
@@ -443,12 +471,15 @@ def project_opencode_custom_provider(
     an unsupported credential substitution, an unset ``{env:NAME}``, or (with
     ``appcontainer=True``) a resolved loopback-only ``baseURL``
     an AppContainer child cannot reach -- raises :class:`OpenCodeAuthError`
-    with a named reason before any claim.  The returned mapping holds exactly
-    one provider with exactly one model and only the bounded keys ``npm``,
-    ``name``, ``options`` (``baseURL``, ``apiKey``, ``headers``), ``models``;
-    every ``{env:NAME}`` there is resolved from ``host_env`` (default
-    ``os.environ``) and the model entry keeps only ``id``, ``limit`` and the
-    boolean capability flags.
+    with a named reason before any claim.  Given the launcher's
+    ``loopback_relay`` (NF-2026-01503), a plain-http loopback ``baseURL`` is
+    rewritten to that relay instead (:func:`_relayed_base_url`), and the
+    relay records the original target from this host-side read.  The
+    returned mapping holds exactly one provider with exactly one model and
+    only the bounded keys ``npm``, ``name``, ``options`` (``baseURL``,
+    ``apiKey``, ``headers``), ``models``; every ``{env:NAME}`` there is
+    resolved from ``host_env`` (default ``os.environ``) and the model entry
+    keeps only ``id``, ``limit`` and the boolean capability flags.
     """
     if "/" not in model:
         return None
@@ -490,7 +521,7 @@ def project_opencode_custom_provider(
     if appcontainer:
         base_url = projected_options.get("baseURL")
         if isinstance(base_url, str) and _opencode_provider_base_url_is_loopback(base_url):
-            raise OpenCodeAuthError("opencode_provider_loopback_unreachable_in_appcontainer")
+            projected_options["baseURL"] = _relayed_base_url(base_url, loopback_relay)
 
     projected_block: dict[str, object] = {}
     for key_name in ("npm", "name"):

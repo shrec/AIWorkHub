@@ -966,14 +966,25 @@ def launch_isolated(
                 # The generated request-local ``awh`` MCP config reaches the
                 # worker only through its own environment.  Any refusal is
                 # raised here, before the claim and before a supervisor spawns.
+                # NF-2026-01503: an owner loopback provider is reachable only
+                # through the MCP bridge's shim, so only the AppContainer launch
+                # -- the one with a bridge -- gets a relay; others keep the refusal.
+                from .appcontainer_loopback_relay import LoopbackRelayPlan
+
+                loopback_relay = (
+                    LoopbackRelayPlan(request_id)
+                    if sandbox_backend == "windows_appcontainer"
+                    else None
+                )
                 opencode_env = provision_opencode_worker_config(
                     workspace,
                     worker_mcp_runtime,
                     backend=sandbox_backend,
                     authority_repo=authority_repo,
                     model=model,
+                    loopback_relay=loopback_relay,
                 )
-                if sandbox_backend == "windows_appcontainer":
+                if loopback_relay is not None:  # sandbox_backend == "windows_appcontainer"
                     # NF-2026-00034 for OpenCode: the contained CLI cannot read the
                     # venv or package root, so the validated server runs on the host.
                     _bridge_config, worker_mcp_bridge = (
@@ -983,6 +994,7 @@ def launch_isolated(
                             home=workspace.home,
                             stderr_path=self.process_dir / f"{request_id}.worker-mcp.stderr.log",
                             adapter_id=adapter_id,
+                            loopback_relay=loopback_relay.seal(),
                         )
                     )
                     opencode_env = provision_opencode_worker_config(
@@ -992,6 +1004,7 @@ def launch_isolated(
                         authority_repo=authority_repo,
                         bridge_shim_argv=worker_mcp_bridge["shim_argv"],
                         model=model,
+                        loopback_relay=loopback_relay,
                     )
                 provider_env = {
                     **(provider_env or {}),

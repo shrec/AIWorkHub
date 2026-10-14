@@ -3773,6 +3773,56 @@ def test_worker_pipe_sddl_names_the_owner_and_one_container_only():
             wac.worker_pipe_sddl(_OWNER, bad)
 
 
+def test_worker_pipe_sddl_grants_the_container_one_of_two_masks_only():
+    """NF-2026-01503: the MCP pipe keeps GRGW; the loopback relay's pipe gets
+    0x12008b -- FILE_GENERIC_READ | FILE_WRITE_DATA, never GW, whose
+    FILE_APPEND_DATA is a pipe's FILE_CREATE_PIPE_INSTANCE."""
+    assert wac.worker_pipe_sddl(_OWNER, _CONTAINER, "GRGW") == wac.worker_pipe_sddl(
+        _OWNER, _CONTAINER
+    )
+    relay = wac.worker_pipe_sddl(_OWNER, _CONTAINER, "0x12008b")
+    assert relay == f"D:P(A;;GA;;;{_OWNER})(A;;0x12008b;;;{_CONTAINER})"
+    assert "GW" not in relay
+    for bad in ("GA", "GW", "GRGWGX", "0x12019f", "0x12008B", "", "GRGW;;;WD)(A;;GA"):
+        with pytest.raises(ValueError):
+            wac.worker_pipe_sddl(_OWNER, _CONTAINER, bad)
+
+
+class _JobKernel:
+    """The kernel32 calls process_in_job makes."""
+
+    def __init__(self, *, opens: bool, inside: bool) -> None:
+        self._opens, self._inside = opens, inside
+        self.opened: list[tuple[int, bool, int]] = []
+        self.closed: list[int] = []
+
+    def OpenProcess(self, access, inherit, pid):
+        self.opened.append((access, inherit, pid))
+        return 77 if self._opens else 0
+
+    def IsProcessInJob(self, process, job, inside):
+        assert (process, job) == (77, "the-job")
+        inside._obj.value = self._inside
+        return True
+
+    def CloseHandle(self, handle):
+        self.closed.append(handle)
+        return True
+
+
+@pytest.mark.parametrize(
+    ("opens", "inside", "expected"),
+    [(True, True, True), (True, False, False), (False, True, False)],
+    ids=["in-the-job", "outside-it", "gone"],
+)
+def test_process_in_job_asks_the_job_about_exactly_that_pid(opens, inside, expected):
+    kernel = _JobKernel(opens=opens, inside=inside)
+    assert wac.process_in_job(4242, "the-job", kernel32=kernel) is expected
+    # PROCESS_QUERY_LIMITED_INFORMATION, not inheritable; the handle never leaks.
+    assert kernel.opened == [(0x1000, False, 4242)]
+    assert kernel.closed == ([77] if opens else [])
+
+
 def test_worker_pipe_names_are_per_request_unguessable_and_quote_safe():
     first = wac.new_worker_pipe_name("3a2b" * 8)
     second = wac.new_worker_pipe_name("3a2b" * 8)
@@ -3797,6 +3847,99 @@ def test_worker_pipe_shim_is_system32_powershell_with_the_name_encoded():
     assert f"NamedPipeClientStream]::new('.','{name[9:]}'," in script
     with pytest.raises(ValueError):
         wac.worker_pipe_shim_argv("\\\\.\\pipe\\someone-else")
+
+
+# NF-2026-01503: the relay-free shim, fingerprinted as it was before the
+# loopback relay existed -- the script constant, and the argv after the
+# machine's own powershell.exe path for one fixed pipe name.
+_RELAY_FREE_SHIM_SHA256 = "40514652433bc4674833b92db083672b7767ba0b71ee209ce85ef35849e99e4d"
+_RELAY_FREE_ARGV_SHA256 = "dd4f5076299a3bc96efd5af9d866fa34c4d71a37071cf3c50e332ae06a5e4ec2"
+_FIXED_PIPE = "\\\\.\\pipe\\aiworkhub-worker-req-" + "0" * 32
+_RELAY_PIPE = "\\\\.\\pipe\\aiworkhub-worker-req-" + "1" * 32
+
+
+def test_the_relay_free_shim_script_is_unchanged():
+    import hashlib
+
+    digest = hashlib.sha256(wac._PIPE_SHIM_SCRIPT.encode("utf-8")).hexdigest()
+    assert digest == _RELAY_FREE_SHIM_SHA256
+
+
+@pytest.mark.skipif(os.name != "nt", reason="resolves the real Windows directory")
+def test_worker_pipe_shim_without_a_relay_is_byte_identical():
+    import hashlib
+
+    argv = wac.worker_pipe_shim_argv(_FIXED_PIPE)
+    assert wac.worker_pipe_shim_argv(_FIXED_PIPE, None) == argv
+    assert hashlib.sha256("\x00".join(argv[1:]).encode()).hexdigest() == _RELAY_FREE_ARGV_SHA256
+
+
+@pytest.mark.skipif(os.name != "nt", reason="resolves the real Windows directory")
+def test_worker_pipe_shim_with_a_relay_listens_before_it_connects_the_mcp_pipe():
+    import base64
+    import re
+
+    argv = wac.worker_pipe_shim_argv(_FIXED_PIPE, (_RELAY_PIPE, 54321))
+    assert argv[:5] == wac.worker_pipe_shim_argv(_FIXED_PIPE)[:5]  # same PowerShell, flags
+    script = base64.b64decode(argv[5]).decode("utf-16-le")
+    assert "$l=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,54321);" in script
+    assert f"NamedPipeClientStream]::new('.','{_FIXED_PIPE[9:]}'," in script
+    assert f"NamedPipeClientStream]::new('.','{_RELAY_PIPE[9:]}'," in script
+    # The listener is up before the MCP pipe is connected, so before OpenCode's
+    # first model request; every placeholder is filled and no cmdlet is used.
+    assert script.index("$l.Start()") < script.index("$p.Connect(30000)")
+    assert not any(token in script for token in ("{name}", "{relay}", "{port}"))
+    assert not re.search(r"\b[A-Z][a-z]+-[A-Z][A-Za-z]+\b", script)
+
+
+@pytest.mark.parametrize(
+    "relay",
+    [
+        (_FIXED_PIPE, 54321),  # the MCP pipe itself
+        ("\\\\.\\pipe\\someone-else", 54321),
+        (None, 54321),
+        (_RELAY_PIPE, 0),
+        (_RELAY_PIPE, 65536),
+        (_RELAY_PIPE, True),
+        (_RELAY_PIPE, "54321"),
+    ],
+)
+def test_worker_pipe_shim_refuses_a_relay_it_cannot_embed(relay):
+    with pytest.raises(ValueError):
+        wac.worker_pipe_shim_argv(_FIXED_PIPE, relay)
+
+
+def test_the_relay_shim_asks_read_write_data_only_and_names_its_tcp_client_first():
+    """NF-2026-01503: the relay pipe client asks for exactly what the relay
+    pipe's DACL grants a container, and writes the TCP client's port -- two
+    bytes, big endian -- before either copy starts."""
+    script = wac._PIPE_SHIM_RELAY_SCRIPT
+    relay_client = (
+        "[IO.Pipes.NamedPipeClientStream]::new('.','{relay}',"
+        "[IO.Pipes.PipeAccessRights]'ReadData,WriteData',"
+    )
+    header = (
+        "$e=$t.Client.RemoteEndPoint.Port;"
+        "$r.Write([byte[]]@(($e -shr 8),($e -band 255)),0,2);"
+    )
+    assert script.count("{relay}") == 1 and script.count(header) == 1
+    assert script.index(relay_client) < script.index("$r.Connect(5000);")
+    assert script.index("$r.Connect(5000);") < script.index(header)
+    assert script.index(header) < script.index("$s.CopyToAsync($r)")
+
+
+def test_the_relay_shim_closes_a_tcp_client_not_from_127_0_0_1_before_the_relay_pipe():
+    """NF-2026-01503: the host finds a connection by 127.0.0.1 and the port
+    the shim names, so the shim carries no client from elsewhere in
+    127.0.0.0/8 -- a sibling's 127.0.0.2:X would borrow the worker's live
+    127.0.0.1:X.  The check throws inside the try whose catch closes it."""
+    script = wac._PIPE_SHIM_RELAY_SCRIPT
+    check = (
+        "try{if(-not $t.Client.RemoteEndPoint.Address.Equals([Net.IPAddress]::Loopback)){"
+        "throw 'source'};"
+    )
+    assert script.count(check) == 1
+    assert script.index(check) < script.index("'{relay}'")
 
 
 _PIPE_CLIENT = (
@@ -3898,6 +4041,111 @@ def test_worker_pipe_shutdown_releases_a_waiting_accept():
     with pytest.raises(BrokenPipeError):
         pipe.write(b"x")
     assert pipe.close() and pipe.close()
+
+
+@requires_host_win32_privileges
+@pytest.mark.skipif(os.name != "nt", reason="real named pipe")
+def test_relay_pipe_instances_share_a_name_only_the_first_claims():
+    """NF-2026-01503: the loopback relay's pipe has more than one instance,
+    but its name stays as unsquattable as the MCP pipe's."""
+    name = wac.new_worker_pipe_name("pytest")
+    first = wac.WorkerPipe(name, _CONTAINER, max_instances=3)
+    try:
+        second = wac.WorkerPipe(name, _CONTAINER, max_instances=3, first=False)
+        try:
+            with pytest.raises(wac._Win32Failure):
+                wac.WorkerPipe(name, _CONTAINER, max_instances=3)  # the name is held
+        finally:
+            assert second.close()
+    finally:
+        assert first.close()
+
+
+# NF-2026-01503: a contained process tries to add an instance to an existing
+# pipe, then joins it as a client asking for ReadData and WriteData only -- the
+# relay shim's own request -- writes "ping" and prints what comes back.
+_PIPE_INSTANCE_PROBE = (
+    "$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';"
+    "try{$x=[IO.Pipes.NamedPipeServerStream]::new('{name}',[IO.Pipes.PipeDirection]::InOut,"
+    "{instances},[IO.Pipes.PipeTransmissionMode]::Byte,[IO.Pipes.PipeOptions]::Asynchronous);"
+    "$x.Dispose();$made='created'}"
+    "catch{$made='refused:'+$_.Exception.GetBaseException().GetType().Name};"
+    "$c=[IO.Pipes.NamedPipeClientStream]::new('.','{name}',"
+    "[IO.Pipes.PipeAccessRights]'ReadData,WriteData',[IO.Pipes.PipeOptions]::Asynchronous,"
+    "[Security.Principal.TokenImpersonationLevel]::None,[IO.HandleInheritability]::None);"
+    "$c.Connect(30000);$c.Write([byte[]](112,105,110,103),0,4);"
+    "$b=[byte[]]::new(2);$n=$c.Read($b,0,2);"
+    "[Console]::Out.Write($made+';connected:'+[Text.Encoding]::ASCII.GetString($b,0,$n))"
+)
+
+
+@requires_host_win32_privileges
+@pytest.mark.skipif(os.name != "nt", reason="real named pipe and AppContainer")
+def test_a_contained_process_cannot_add_an_instance_to_a_relay_pipe(tmp_path):
+    """NF-2026-01503: the relay pipe's container ACE, 0x12008b, withholds
+    FILE_CREATE_PIPE_INSTANCE, so a same-SID sibling cannot add an instance
+    the worker's shim might reach instead of the host's -- yet a contained
+    client asking for ReadData and WriteData, as the shim does, still
+    connects and relays.  Measured 2026-10-14 in a container's own LOCAL pipe
+    namespace: under GRGW the same probe prints "created"."""
+    import base64
+    import msvcrt
+
+    from aiworkhub import worker_workspace
+
+    probe = wac.probe()
+    if not probe.available:
+        pytest.skip(f"AppContainer unavailable: {probe.detail}")
+    repo_id, worker_kind = "aiworkhub-probe", "probe"
+    sid = wac.container_sid(repo_id, worker_kind)
+    name = wac.new_worker_pipe_name("pytest")
+    system32 = os.path.join(os.environ["SystemRoot"], "System32")
+    script = _PIPE_INSTANCE_PROBE.replace("{name}", name[9:]).replace("{instances}", "3")
+    env = dict(os.environ)
+    env.pop(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, None)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
+    out, err = tmp_path / "probe.out", tmp_path / "probe.err"
+    fds = [os.open(os.devnull, os.O_RDONLY), os.open(out, flags), os.open(err, flags)]
+    for fd in fds:
+        os.set_inheritable(fd, True)
+    pipe = wac.WorkerPipe(name, sid, max_instances=3, container_access="0x12008b")
+    launch = None
+    try:
+        launch = wac.launch_appcontainer(
+            AppContainerRequest(
+                argv=[
+                    os.path.join(system32, "WindowsPowerShell", "v1.0", "powershell.exe"),
+                    "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                    base64.b64encode(script.encode("utf-16-le")).decode("ascii"),
+                ],
+                repo_id=repo_id,
+                worker_kind=worker_kind,
+                working_directory=system32,
+                environment=env,
+                stdin_handle=msvcrt.get_osfhandle(fds[0]),
+                stdout_handle=msvcrt.get_osfhandle(fds[1]),
+                stderr_handle=msvcrt.get_osfhandle(fds[2]),
+                agent_shell=False,
+            )
+        )
+        assert pipe.accept(launch.job, timeout=60), err.read_text(errors="replace")
+        received = b""
+        while len(received) < 4 and (chunk := pipe.read()):
+            received += chunk
+        assert received == b"ping"
+        pipe.write(b"ok")
+        result = launch.wait(60_000, terminate_on_timeout=True)
+        assert result.exit_code == 0, err.read_text(errors="replace")
+        assert out.read_text(errors="replace") == (
+            "refused:UnauthorizedAccessException;connected:ok"
+        )
+    finally:
+        if launch is not None:
+            launch.wait(10_000, terminate_on_timeout=True)
+            launch.close()
+        assert pipe.close()
+        for fd in fds:
+            os.close(fd)
 
 
 @pytest.mark.parametrize("protected", [False, True])
@@ -4367,6 +4615,10 @@ _PRIVILEGED_LANE_SKIP_TEST_NAMES = {
     "test_the_shim_final_path_keeps_the_sandbox_drive_spelling",
     # NF-2026-01484: the real token profile and known folders.
     "test_sensitive_roots_roaming_never_resolves_inside_an_isolated_home",
+    # NF-2026-01503: a real multi-instance named pipe for the loopback relay,
+    # and a real AppContainer process that cannot add an instance to one.
+    "test_relay_pipe_instances_share_a_name_only_the_first_claims",
+    "test_a_contained_process_cannot_add_an_instance_to_a_relay_pipe",
 }
 
 

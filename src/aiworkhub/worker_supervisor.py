@@ -18,9 +18,10 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable, cast
 
 try:
-    from . import windows_appcontainer
+    from . import appcontainer_loopback_relay, windows_appcontainer
     from .windows_job_structures import JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 except ImportError:  # direct-script entrypoint
+    import appcontainer_loopback_relay  # type: ignore[no-redef]
     import windows_appcontainer  # type: ignore[no-redef]
     from windows_job_structures import JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 
@@ -267,6 +268,9 @@ class _WorkerMcpBridge:
         self._server_job: Any = None
         self.sys_path: list[str] = []
         self.error = ""
+        # NF-2026-01503: the worker's loopback relay, if its spec asks for one.
+        # Started with this bridge and closed wherever this bridge is closed.
+        self.relay: Any = None
 
     def host_sys_path(self) -> list[str]:
         """The import path the server would run with; raises if any entry is
@@ -283,9 +287,12 @@ class _WorkerMcpBridge:
         return entries
 
     def start(self, job: Any) -> None:
-        """Serve the first client of ``job``, the worker's own job object."""
+        """Serve the first client of ``job``, the worker's own job object, and
+        the relay's clients of that same job."""
         self._job = job
         self._thread(self._serve)
+        if self.relay is not None:
+            self.relay.start(job)
 
     def _thread(self, target: Callable[..., None], *args: Any) -> None:
         thread = threading.Thread(target=target, args=args, daemon=True)
@@ -338,13 +345,18 @@ class _WorkerMcpBridge:
             self._pipe.close()  # server gone: the client sees the pipe close
 
     def close(self, grace: float = KILL_GRACE_SECONDS) -> None:
-        """Stop serving, let the server exit on EOF, kill whatever is left
-        with its job, and remove the pipe.  Idempotent."""
+        """Stop serving, close the loopback relay, let the server exit on EOF,
+        kill whatever is left with its job, and remove the pipe.  Idempotent."""
         with self._lock:
             if self._closed:
                 return
             self._closed = True
         self._pipe.shutdown()
+        if self.relay is not None:
+            try:
+                self.relay.close()
+            except Exception as exc:
+                self.error = self.error or f"loopback_relay_close_failed:{exc}"[:500]
         server = self.server
         if server is not None:
             try:
@@ -635,16 +647,17 @@ def _launch_appcontainer_process(
         environment = os.environ.copy()
         grants = _worker_filesystem_grants(argv, cwd, environment)
         if bridge_spec is not None:
+            sid = windows_appcontainer.container_sid(repo_id, worker_kind)
             # The pipe exists before the worker does, so its MCP shim finds it.
-            pipe = windows_appcontainer.WorkerPipe(
-                str(bridge_spec["pipe"]),
-                windows_appcontainer.container_sid(repo_id, worker_kind),
-            )
+            pipe = windows_appcontainer.WorkerPipe(str(bridge_spec["pipe"]), sid)
             # Checked before the worker exists: every input the host server
             # starts from must lie outside what the container can write.
             bridge = _WorkerMcpBridge(
                 pipe, bridge_spec, [g.path for g in grants if g.access == "modify"]
             )
+            # NF-2026-01503: the loopback relay too -- loopback target, ports
+            # 1-65535 -- and its pipe exists before the worker does.
+            bridge.relay = appcontainer_loopback_relay.relay_for_bridge(bridge_spec, sid)
         request = windows_appcontainer.AppContainerRequest(
             argv=_native_worker_argv(argv),
             repo_id=repo_id,

@@ -16,6 +16,7 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from aiworkhub import (  # noqa: E402
+    appcontainer_loopback_relay,
     model_settings,
     opencode_auth,
     repo_policy,
@@ -1329,3 +1330,104 @@ def test_provision_opencode_worker_config_refuses_loopback_provider_under_appcon
             authority_repo=authority,
             model="omniroute/router-model",
         )
+
+
+def _loopback_owner_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    opencode_dir = tmp_path / "xdg-config" / "opencode"
+    opencode_dir.mkdir(parents=True)
+    (opencode_dir / "opencode.json").write_text(
+        json.dumps(
+            {
+                "provider": {
+                    "omniroute": {
+                        "options": {"baseURL": "http://localhost:20128/v1", "apiKey": "literal"},
+                        "models": {"router-model": {}},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
+
+
+def test_provision_opencode_worker_config_relays_a_loopback_provider_under_appcontainer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NF-2026-01503: with the launch's relay the same owner config projects
+    instead of refusing -- only the baseURL's host:port moves."""
+    _loopback_owner_config(tmp_path, monkeypatch)
+    workspace, runtime, authority = _opencode_request(
+        tmp_path / "request", "windows_appcontainer"
+    )
+    plan = appcontainer_loopback_relay.LoopbackRelayPlan(
+        workspace.request_id, pick_port=lambda: 54321
+    )
+
+    delivered = worker_workspace.provision_opencode_worker_config(
+        workspace,
+        runtime,
+        backend="windows_appcontainer",
+        authority_repo=authority,
+        model="omniroute/router-model",
+        loopback_relay=plan,
+    )
+
+    provider = json.loads(delivered[_OC_ENV])["provider"]["omniroute"]
+    assert provider["options"] == {"baseURL": "http://127.0.0.1:54321/v1", "apiKey": "literal"}
+    spec = plan.seal()
+    assert spec is not None
+    assert (spec.port, spec.target_host, spec.target_port) == (54321, "localhost", 20128)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the bridge shim resolves the real Windows directory")
+def test_the_appcontainer_bridge_carries_the_relay_its_shim_serves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The launcher's own sequence: project, build the bridge from the sealed
+    plan, project again with the bridge's shim.  The worker config, the shim
+    and the supervisor's bridge spec name one relay."""
+    import base64
+
+    # The bridge writes its shim config 0600; this contract is the relay, not
+    # the mode, and the sandbox denies chmod (as in the launch tests' seams).
+    monkeypatch.setattr(worker_ai_tools_mcp.os, "chmod", lambda *_a, **_k: None)
+    monkeypatch.setattr(worker_ai_tools_mcp, "chmod_fd", lambda *_a, **_k: None)
+    _loopback_owner_config(tmp_path, monkeypatch)
+    workspace, runtime, authority = _opencode_request(
+        tmp_path / "request", "windows_appcontainer"
+    )
+    plan = appcontainer_loopback_relay.LoopbackRelayPlan(
+        workspace.request_id, pick_port=lambda: 54321
+    )
+    provision = {
+        "backend": "windows_appcontainer",
+        "authority_repo": authority,
+        "model": "omniroute/router-model",
+        "loopback_relay": plan,
+    }
+    worker_workspace.provision_opencode_worker_config(workspace, runtime, **provision)
+    _config, bridge = worker_ai_tools_mcp.appcontainer_mcp_bridge(
+        runtime,
+        request_id=workspace.request_id,
+        home=workspace.home,
+        stderr_path=tmp_path / "worker-mcp.stderr.log",
+        adapter_id="opencode_cli",
+        loopback_relay=plan.seal(),
+    )
+    delivered = worker_workspace.provision_opencode_worker_config(
+        workspace, runtime, bridge_shim_argv=bridge["shim_argv"], **provision
+    )
+
+    config = json.loads(delivered[_OC_ENV])
+    assert config["mcp"]["servers"]["awh"]["command"] == bridge["shim_argv"]
+    assert config["provider"]["omniroute"]["options"]["baseURL"] == "http://127.0.0.1:54321/v1"
+    relay = bridge[appcontainer_loopback_relay.BRIDGE_SPEC_KEY]
+    assert {key: relay[key] for key in ("port", "target_host", "target_port")} == {
+        "port": 54321, "target_host": "localhost", "target_port": 20128,
+    }
+    assert relay["pipe"] != bridge["pipe"]
+    assert appcontainer_loopback_relay.validated_relay_spec(bridge) == plan.seal()
+    script = base64.b64decode(bridge["shim_argv"][5]).decode("utf-16-le")
+    assert "[Net.IPAddress]::Loopback,54321);" in script
+    assert f"'{relay['pipe'][9:]}'" in script

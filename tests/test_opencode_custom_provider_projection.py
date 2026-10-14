@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from aiworkhub import opencode_auth, runtime_adapters
+from aiworkhub import appcontainer_loopback_relay, opencode_auth, runtime_adapters
 
 _SENTINEL = "sentinel-key-7f32b98a"
 
@@ -383,6 +383,156 @@ def test_appcontainer_loopback_check_runs_on_the_resolved_base_url(
             host_env={"OMNIROUTE_URL": "http://localhost:20128/v1"},
             appcontainer=True,
         )
+
+
+# -- NF-2026-01503: the port-scoped loopback relay ------------------------------
+
+
+def _relay_plan() -> appcontainer_loopback_relay.LoopbackRelayPlan:
+    return appcontainer_loopback_relay.LoopbackRelayPlan("req", pick_port=lambda: 54321)
+
+
+@pytest.mark.parametrize(
+    ("base_url", "target", "relayed"),
+    [
+        ("http://localhost:20128/v1", ("localhost", 20128), "http://127.0.0.1:54321/v1"),
+        ("http://127.0.0.1:20128/v1", ("127.0.0.1", 20128), "http://127.0.0.1:54321/v1"),
+        ("http://[::1]:20128/v1?x=1", ("::1", 20128), "http://127.0.0.1:54321/v1?x=1"),
+        ("http://127.1:20128/v1", ("127.0.0.1", 20128), "http://127.0.0.1:54321/v1"),
+        ("http://LocalHost.:20128/v1", ("localhost", 20128), "http://127.0.0.1:54321/v1"),
+        (
+            "http://[::ffff:127.0.0.1]:20128/v1",
+            ("127.0.0.1", 20128),
+            "http://127.0.0.1:54321/v1",
+        ),
+        ("http://localhost/v1/", ("localhost", 80), "http://127.0.0.1:54321/v1/"),
+        (
+            "http://user:pw@localhost:20128/v1",
+            ("localhost", 20128),
+            "http://user:pw@127.0.0.1:54321/v1",
+        ),
+    ],
+)
+def test_appcontainer_loopback_with_a_relay_is_rewritten_and_the_target_recorded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    base_url: str,
+    target: tuple[str, int],
+    relayed: str,
+) -> None:
+    _owner_config(
+        tmp_path, monkeypatch, provider=_provider_block(apiKey="literal", baseURL=base_url)
+    )
+    plan = _relay_plan()
+
+    projected = opencode_auth.project_opencode_custom_provider(
+        "omniroute/router-model", host_env={}, appcontainer=True, loopback_relay=plan
+    )
+
+    # Only the baseURL's host:port moved; the original is the recorded target.
+    assert projected["omniroute"]["options"] == {"baseURL": relayed, "apiKey": "literal"}
+    spec = plan.seal()
+    assert spec is not None
+    assert (spec.port, spec.target_host, spec.target_port) == (54321, *target)
+    runtime_adapters._check_opencode_worker_provider(projected)
+
+
+def test_the_relay_target_is_the_owner_config_resolved_on_the_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _owner_config(
+        tmp_path,
+        monkeypatch,
+        provider=_provider_block(apiKey="literal", baseURL="{env:OMNIROUTE_URL}"),
+    )
+    plan = _relay_plan()
+    projected = opencode_auth.project_opencode_custom_provider(
+        "omniroute/router-model",
+        host_env={"OMNIROUTE_URL": "http://127.0.0.1:20999/api/v1"},
+        appcontainer=True,
+        loopback_relay=plan,
+    )
+    assert projected["omniroute"]["options"]["baseURL"] == "http://127.0.0.1:54321/api/v1"
+    spec = plan.seal()
+    assert spec is not None and (spec.target_host, spec.target_port) == ("127.0.0.1", 20999)
+
+
+@pytest.mark.parametrize(
+    "base_url", ["http://localhost:20128/v1", "http://127.0.0.1:20128/v1"]
+)
+def test_appcontainer_loopback_without_a_relay_is_still_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, base_url: str
+) -> None:
+    _owner_config(
+        tmp_path, monkeypatch, provider=_provider_block(apiKey="literal", baseURL=base_url)
+    )
+    with pytest.raises(
+        opencode_auth.OpenCodeAuthError,
+        match="^opencode_provider_loopback_unreachable_in_appcontainer$",
+    ):
+        opencode_auth.project_opencode_custom_provider(
+            "omniroute/router-model", host_env={}, appcontainer=True, loopback_relay=None
+        )
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://localhost:20128/v1",
+        "http://localhost:99999/v1",
+        "http://localhost:port/v1",
+        "http://localhost:0/v1",
+        "http://foo.localhost:20128/v1",
+        "http://0.0.0.0:20128/v1",
+        "http://[::]:20128/v1",
+    ],
+    ids=["https", "port-out-of-range", "port-not-a-number", "port-zero", "subdomain",
+         "unspecified-v4", "unspecified-v6"],
+)
+def test_appcontainer_loopback_the_relay_cannot_carry_is_still_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, base_url: str
+) -> None:
+    _owner_config(
+        tmp_path, monkeypatch, provider=_provider_block(apiKey="literal", baseURL=base_url)
+    )
+    plan = _relay_plan()
+    with pytest.raises(
+        opencode_auth.OpenCodeAuthError,
+        match="^opencode_provider_loopback_unreachable_in_appcontainer$",
+    ):
+        opencode_auth.project_opencode_custom_provider(
+            "omniroute/router-model", host_env={}, appcontainer=True, loopback_relay=plan
+        )
+    assert plan.seal() is None  # nothing was recorded for the bridge
+
+
+@pytest.mark.parametrize("appcontainer", [True, False])
+def test_a_non_loopback_base_url_is_unchanged_and_the_relay_never_asked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, appcontainer: bool
+) -> None:
+    _owner_config(
+        tmp_path,
+        monkeypatch,
+        provider=_provider_block(apiKey="literal", baseURL="https://api.example.com/v1"),
+    )
+    plan = _relay_plan()
+    projected = opencode_auth.project_opencode_custom_provider(
+        "omniroute/router-model", host_env={}, appcontainer=appcontainer, loopback_relay=plan
+    )
+    assert projected["omniroute"]["options"]["baseURL"] == "https://api.example.com/v1"
+    assert plan.seal() is None
+
+
+def test_outside_the_appcontainer_a_loopback_base_url_is_not_relayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _owner_config(tmp_path, monkeypatch, provider=_provider_block(apiKey="literal"))
+    plan = _relay_plan()
+    projected = opencode_auth.project_opencode_custom_provider(
+        "omniroute/router-model", host_env={}, appcontainer=False, loopback_relay=plan
+    )
+    assert projected["omniroute"]["options"]["baseURL"] == "http://localhost:20128/v1"
+    assert plan.seal() is None
 
 
 def test_header_env_template_resolves_from_host_env(

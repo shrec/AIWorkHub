@@ -4208,11 +4208,67 @@ _PIPE_SHIM_SCRIPT = (
     "[void][Threading.Tasks.Task]::WaitAny(@($up,$down));$o.Flush()"
 )
 
+# With a loopback relay (NF-2026-01503) the shim also listens on 127.0.0.1:P --
+# a .NET TcpListener, again no cmdlet -- BEFORE it connects the MCP pipe, and
+# joins each accepted connection to a new client of the relay pipe, copying
+# bytes both ways until either side closes.  That is in time: OpenCode starts
+# its MCP servers, this shim among them, before its first model request, and
+# that request is the first thing to reach P.  The relay client asks for
+# ReadData and WriteData only, all the relay pipe's DACL grants a container
+# (worker_pipe_sddl), and before any byte is copied it names the connection's
+# TCP client port in two bytes, big endian: the host relays the connection
+# only when a process of the worker's own job owns it.  The host finds that
+# connection by 127.0.0.1 and the port alone, so a TCP client from anywhere
+# else in 127.0.0.0/8 is closed before the relay pipe is opened: a sibling's
+# 127.0.0.2:X would otherwise borrow the worker's live 127.0.0.1:X.  Every
+# task is awaited from this one thread, so no script block ever runs on a pool
+# thread, and a connection the relay pipe does not take is dropped without
+# ending the shim.
+_PIPE_SHIM_RELAY_SCRIPT = (
+    "$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';"
+    "$l=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,{port});"
+    "$l.ExclusiveAddressUse=$true;$l.Start();"
+    "$p=[IO.Pipes.NamedPipeClientStream]::new('.','{name}',"
+    "[IO.Pipes.PipeDirection]::InOut,[IO.Pipes.PipeOptions]::Asynchronous);"
+    "$p.Connect(30000);"
+    "$i=[Console]::OpenStandardInput();$o=[Console]::OpenStandardOutput();"
+    "$up=$i.CopyToAsync($p);$down=$p.CopyToAsync($o);"
+    "$a=$l.AcceptTcpClientAsync();$c=[Collections.Generic.List[object]]::new();"
+    "while(-not($up.IsCompleted -or $down.IsCompleted)){"
+    "$w=[Collections.Generic.List[Threading.Tasks.Task]]::new();$w.Add($up);$w.Add($down);"
+    "if($a){$w.Add($a)};foreach($x in $c){$w.Add($x[2]);$w.Add($x[3])};"
+    "[void][Threading.Tasks.Task]::WaitAny($w.ToArray());"
+    "if($a -and $a.IsCompleted){if($a.IsFaulted -or $a.IsCanceled){$a=$null}else{"
+    "$t=$a.Result;$a=$l.AcceptTcpClientAsync();$r=$null;"
+    "try{if(-not $t.Client.RemoteEndPoint.Address.Equals([Net.IPAddress]::Loopback)){"
+    "throw 'source'};$r=[IO.Pipes.NamedPipeClientStream]::new('.','{relay}',"
+    "[IO.Pipes.PipeAccessRights]'ReadData,WriteData',[IO.Pipes.PipeOptions]::Asynchronous,"
+    "[Security.Principal.TokenImpersonationLevel]::None,[IO.HandleInheritability]::None);"
+    "$r.Connect(5000);"
+    "$e=$t.Client.RemoteEndPoint.Port;$r.Write([byte[]]@(($e -shr 8),($e -band 255)),0,2);"
+    "$s=$t.GetStream();"
+    "$c.Add(@($t,$r,$s.CopyToAsync($r),$r.CopyToAsync($s)))"
+    "}catch{$t.Close();if($r){$r.Dispose()}}}};"
+    "foreach($x in $c.ToArray()){if($x[2].IsCompleted -or $x[3].IsCompleted){"
+    "$x[0].Close();$x[1].Dispose();[void]$c.Remove($x)}}};"
+    "$l.Stop();$o.Flush()"
+)
 
-def worker_pipe_shim_argv(pipe_name: str) -> list[str]:
-    """The contained stdio<->pipe shim for ``pipe_name`` (see above)."""
+
+def worker_pipe_shim_argv(pipe_name: str, relay: tuple[str, int] | None = None) -> list[str]:
+    """The contained stdio<->pipe shim for ``pipe_name`` (see above).  Given a
+    loopback ``relay`` -- its pipe name and P -- it also serves 127.0.0.1:P;
+    without one its script is exactly the relay-free one."""
     if not _WORKER_PIPE_NAME.match(pipe_name):
         raise ValueError(f"not a worker pipe name: {pipe_name!r}")
+    if relay is not None and (
+        not isinstance(relay[0], str)
+        or not _WORKER_PIPE_NAME.match(relay[0])
+        or relay[0] == pipe_name
+        or type(relay[1]) is not int
+        or not 0 < relay[1] < 65536
+    ):
+        raise ValueError(f"not a loopback relay: {relay!r}")
     windows = _system_windows_directory() if os.name == "nt" else ""
     if not windows:
         raise AppContainerError(
@@ -4220,6 +4276,12 @@ def worker_pipe_shim_argv(pipe_name: str) -> list[str]:
             detail="the worker MCP pipe shim needs the Windows directory.",
         )
     script = _PIPE_SHIM_SCRIPT.replace("{name}", pipe_name[len("\\\\.\\pipe\\"):])
+    if relay is not None:
+        script = (
+            _PIPE_SHIM_RELAY_SCRIPT.replace("{name}", pipe_name[len("\\\\.\\pipe\\"):])
+            .replace("{relay}", relay[0][len("\\\\.\\pipe\\"):])
+            .replace("{port}", str(relay[1]))
+        )
     return [
         os.path.join(windows, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
         "-NoLogo", "-NoProfile", "-NonInteractive",
@@ -4227,14 +4289,26 @@ def worker_pipe_shim_argv(pipe_name: str) -> list[str]:
     ]
 
 
-def worker_pipe_sddl(owner_sid: str, container_sid: str) -> str:
+# The container ACE's rights.  GRGW for the MCP pipe, which has one instance
+# and so nothing to add one to.  0x12008b -- FILE_GENERIC_READ |
+# FILE_WRITE_DATA -- for the loopback relay's pipe (NF-2026-01503): a
+# contained client may read and write it, but GW would also grant
+# FILE_APPEND_DATA, which on a pipe is FILE_CREATE_PIPE_INSTANCE, letting a
+# same-SID sibling add an instance the worker's shim might connect to instead.
+_CONTAINER_PIPE_ACCESS = frozenset(("GRGW", "0x12008b"))
+
+
+def worker_pipe_sddl(owner_sid: str, container_sid: str, container_access: str = "GRGW") -> str:
     """The pipe's security descriptor: a protected DACL allowing the owner
-    user everything and exactly one container SID read/write -- nothing for
-    ALL APPLICATION PACKAGES, Everyone, or anyone else."""
+    user everything and exactly one container SID ``container_access``, one
+    of _CONTAINER_PIPE_ACCESS -- nothing for ALL APPLICATION PACKAGES,
+    Everyone, or anyone else."""
     for sid in (owner_sid, container_sid):
         if not _SID_STRING.match(sid):
             raise ValueError(f"not a SID string: {sid!r}")
-    return f"D:P(A;;GA;;;{owner_sid})(A;;GRGW;;;{container_sid})"
+    if container_access not in _CONTAINER_PIPE_ACCESS:
+        raise ValueError(f"not a worker pipe access: {container_access!r}")
+    return f"D:P(A;;GA;;;{owner_sid})(A;;{container_access};;;{container_sid})"
 
 
 def container_sid(repo_id: str, worker_kind: str, *, api: Win32Api | None = None) -> str:
@@ -4348,6 +4422,22 @@ def _token_user_sid(k: Any, a: Any) -> str:
         k.CloseHandle(token)
 
 
+def process_in_job(pid: int, job: Any, *, kernel32: Any = None) -> bool:
+    """Whether process ``pid`` runs inside ``job``; False when it cannot be
+    opened -- gone, or not this user's to query.  The one job check both of
+    :meth:`WorkerPipe.accept` and of the loopback relay (NF-2026-01503), which
+    asks it about the pids it reads from the host's TCP table."""
+    k = kernel32 if kernel32 is not None else _pipe_libraries()[0]
+    process = k.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not process:
+        return False
+    try:
+        inside = wintypes.BOOL()
+        return bool(k.IsProcessInJob(process, job, ctypes.byref(inside))) and bool(inside.value)
+    finally:
+        k.CloseHandle(process)
+
+
 class WorkerPipe:
     """Host end of one request's worker MCP pipe.
 
@@ -4358,15 +4448,27 @@ class WorkerPipe:
     else.  :meth:`shutdown` cancels every pending operation and makes later
     ones fail fast; :meth:`close` then releases the handle, which removes the
     pipe.  Reads return ``b""`` and writes raise ``BrokenPipeError`` once the
-    pipe is gone or shut down.
+    pipe is gone or shut down.  The loopback relay (NF-2026-01503) opens one
+    pipe of up to ``max_instances``: only its ``first`` instance claims the
+    name, and each further one is another instance of that same pipe.  It
+    passes ``container_access="0x12008b"``, so no contained process can add
+    an instance of its own (see :func:`worker_pipe_sddl`).
     """
 
-    def __init__(self, name: str, container_sid: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        container_sid: str,
+        *,
+        max_instances: int = 1,
+        first: bool = True,
+        container_access: str = "GRGW",
+    ) -> None:
         if not _WORKER_PIPE_NAME.match(name):
             raise ValueError(f"not a worker pipe name: {name!r}")
         self.name = name
         self._k, a = _pipe_libraries()
-        sddl = worker_pipe_sddl(_token_user_sid(self._k, a), container_sid)
+        sddl = worker_pipe_sddl(_token_user_sid(self._k, a), container_sid, container_access)
         descriptor = wintypes.LPVOID()
         if not a.ConvertStringSecurityDescriptorToSecurityDescriptorW(
             sddl, 1, ctypes.byref(descriptor), None
@@ -4378,9 +4480,10 @@ class WorkerPipe:
             )
             handle = self._k.CreateNamedPipeW(
                 name,
-                _PIPE_ACCESS_DUPLEX | _FILE_FLAG_FIRST_PIPE_INSTANCE | _FILE_FLAG_OVERLAPPED,
+                _PIPE_ACCESS_DUPLEX | _FILE_FLAG_OVERLAPPED
+                | (_FILE_FLAG_FIRST_PIPE_INSTANCE if first else 0),
                 _PIPE_REJECT_REMOTE_CLIENTS,  # byte type, byte read mode, blocking
-                1,
+                max_instances,
                 _PIPE_BUFFER_BYTES,
                 _PIPE_BUFFER_BYTES,
                 0,
@@ -4472,16 +4575,7 @@ class WorkerPipe:
         pid = wintypes.ULONG()
         if not self._k.GetNamedPipeClientProcessId(self._handle, ctypes.byref(pid)):
             return False
-        process = self._k.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
-        if not process:
-            return False
-        try:
-            inside = wintypes.BOOL()
-            return bool(self._k.IsProcessInJob(process, job, ctypes.byref(inside))) and bool(
-                inside.value
-            )
-        finally:
-            self._k.CloseHandle(process)
+        return process_in_job(pid.value, job, kernel32=self._k)
 
     def read(self) -> bytes:
         buffer = ctypes.create_string_buffer(_PIPE_BUFFER_BYTES)

@@ -4074,6 +4074,7 @@ def provision_opencode_worker_config(
     authority_repo: Path,
     bridge_shim_argv: Sequence[str] | None = None,
     model: str | None = None,
+    loopback_relay: Callable[[str, int], int] | None = None,
 ) -> dict[str, str]:
     """The request-local OpenCode environment for one exact launch, or a typed refusal.
 
@@ -4087,6 +4088,7 @@ def provision_opencode_worker_config(
     nothing inherited can widen the exact worker allowlist.  Every refusal
     raises ``OpenCodeWorkerConfigError`` before a provider spawns; a custom
     provider ``model`` refusal raises ``opencode_auth.OpenCodeAuthError`` there too.
+    ``loopback_relay`` is the AppContainer launch's port-scoped relay (NF-2026-01503).
     """
     from . import opencode_auth
     from . import runtime_adapters
@@ -4178,11 +4180,9 @@ def provision_opencode_worker_config(
     elif not os.access(command, os.X_OK):
         raise error("command_not_executable", command)
 
-    custom_provider: dict[str, Any] | None = None
-    if model is not None:
-        custom_provider = opencode_auth.project_opencode_custom_provider(
-            model, appcontainer=backend == WINDOWS_APPCONTAINER_BACKEND
-        )
+    custom_provider = None if model is None else opencode_auth.project_opencode_custom_provider(
+        model, appcontainer=backend == WINDOWS_APPCONTAINER_BACKEND, loopback_relay=loopback_relay
+    )
 
     if bridge_shim_argv is not None and backend != WINDOWS_APPCONTAINER_BACKEND:
         raise error("bridge_backend_unsupported", str(backend))

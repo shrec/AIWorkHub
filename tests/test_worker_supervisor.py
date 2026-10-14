@@ -954,6 +954,54 @@ def test_a_bridge_closed_before_it_starts_removes_its_pipe(tmp_path: Path) -> No
     assert pipe.closed == 1 and pipe.accepted == []
 
 
+class _FakeRelay:
+    """Stands in for appcontainer_loopback_relay.AppContainerLoopbackRelay."""
+
+    def __init__(self, *, fail_close: bool = False) -> None:
+        self.started: list[object] = []
+        self.closed = 0
+        self._fail_close = fail_close
+
+    def start(self, job: object) -> None:
+        self.started.append(job)
+
+    def close(self) -> None:
+        self.closed += 1
+        if self._fail_close:
+            raise OSError("relay close failed")
+
+
+def test_the_bridge_starts_its_loopback_relay_with_the_job_and_closes_it(
+    tmp_path: Path,
+) -> None:
+    """NF-2026-01503: the relay serves clients of the worker's own job and
+    lives exactly as long as the bridge."""
+    bridge = _bridge(tmp_path, _FakePipe(accept=False), [])
+    relay = bridge.relay = _FakeRelay()
+    bridge.start("launch-job")
+    assert relay.started == ["launch-job"]
+    bridge.close()
+    bridge.close()
+    assert relay.closed == 1
+
+
+def test_a_bridge_closed_before_it_starts_closes_its_relay_too(tmp_path: Path) -> None:
+    # The launch-failure path: the worker never existed, the relay pipe did.
+    bridge = _bridge(tmp_path, _FakePipe(), [])
+    relay = bridge.relay = _FakeRelay()
+    bridge.close()
+    assert relay.started == [] and relay.closed == 1
+
+
+def test_a_relay_that_fails_to_close_still_lets_the_bridge_close(tmp_path: Path) -> None:
+    pipe = _FakePipe()
+    bridge = _bridge(tmp_path, pipe, [])
+    bridge.relay = _FakeRelay(fail_close=True)
+    bridge.close()
+    assert pipe.closed == 1
+    assert bridge.error.startswith("loopback_relay_close_failed:")
+
+
 def test_bridge_server_that_cannot_start_leaves_nothing_behind(tmp_path: Path) -> None:
     pipe, jobs = _FakePipe(), []
     bridge = _bridge(tmp_path, pipe, jobs, command=str(tmp_path / "missing.exe"))

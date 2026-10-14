@@ -1070,6 +1070,8 @@ def _patch_bridge_seams(monkeypatch):
 
         def close(self) -> None:
             self.record["events"].append("close")
+            # NF-2026-01503: the loopback relay the supervisor handed this bridge.
+            self.record["relay"] = getattr(self, "relay", None)
 
     monkeypatch.setattr(worker_supervisor.windows_appcontainer, "WorkerPipe", _RecordingPipe)
     monkeypatch.setattr(
@@ -1175,6 +1177,102 @@ def test_supervisor_without_a_bridge_spec_opens_no_pipe(monkeypatch, tmp_path) -
     ) == 0
     assert _RecordingPipe.instances == [] and bridges == []
     assert tuple(requests[0].withheld_directories) == ()
+
+
+# -- NF-2026-01503: the worker's loopback relay -----------------------------------
+
+_RELAY = {
+    "pipe": "\\\\.\\pipe\\aiworkhub-worker-r-" + "b" * 32,
+    "port": 50123,
+    "target_host": "127.0.0.1",
+    "target_port": 20128,
+}
+
+
+class _RecordingRelay:
+    instances: list["_RecordingRelay"] = []
+
+    def __init__(self, spec, sid) -> None:
+        self.spec, self.sid = spec, sid
+        _RecordingRelay.instances.append(self)
+
+
+def test_supervisor_creates_the_loopback_relay_before_the_worker_and_hands_it_to_the_bridge(
+    monkeypatch, tmp_path
+) -> None:
+    bridges = _patch_bridge_seams(monkeypatch)
+    _RecordingRelay.instances = []
+    monkeypatch.setattr(
+        worker_supervisor.appcontainer_loopback_relay,
+        "AppContainerLoopbackRelay",
+        _RecordingRelay,
+    )
+    launch = _FakeAppContainerLaunch(exit_code=0)
+    launch.job = "the-launch-job"
+
+    def _fake_launch(_request):
+        # The relay pipe, like the MCP pipe, exists before the worker starts.
+        assert len(_RecordingRelay.instances) == 1
+        return launch
+
+    _patch_supervisor_seams(monkeypatch)
+    monkeypatch.setattr(worker_supervisor.windows_appcontainer, "launch_appcontainer", _fake_launch)
+    code = worker_supervisor.supervise(
+        _supervisor_spec(
+            tmp_path,
+            execution_backend="windows_appcontainer",
+            repo_id=CANONICAL_REPO_ID,
+            worker_kind="opencode_cli",
+            worker_mcp_bridge={**_BRIDGE_SPEC, "loopback_relay": _RELAY},
+        )
+    )
+
+    assert code == 0
+    (relay,) = _RecordingRelay.instances
+    assert (relay.spec.pipe, relay.spec.port) == (_RELAY["pipe"], 50123)
+    assert (relay.spec.target_host, relay.spec.target_port) == ("127.0.0.1", 20128)
+    # One container SID for both pipes, and the bridge owns the relay's lifetime.
+    assert relay.sid == _RecordingPipe.instances[0].sid
+    (bridge,) = bridges
+    assert bridge["events"] == ["start", "close"] and bridge["relay"] is relay
+
+
+@pytest.mark.parametrize(
+    "relay",
+    [
+        {**_RELAY, "target_host": "10.0.0.5"},
+        {**_RELAY, "target_host": "api.example.com"},
+        {**_RELAY, "target_port": 65536},
+        {**_RELAY, "port": 0},
+        {**_RELAY, "pipe": _BRIDGE_SPEC["pipe"]},
+        {"pipe": _RELAY["pipe"]},
+    ],
+    ids=["private-host", "public-name", "target-port", "relay-port", "mcp-pipe", "partial"],
+)
+def test_supervisor_refuses_a_loopback_relay_spec_before_the_worker_launches(
+    monkeypatch, tmp_path, relay
+) -> None:
+    bridges = _patch_bridge_seams(monkeypatch)
+    launches: list = []
+    statuses, _ = _patch_supervisor_seams(monkeypatch)
+    monkeypatch.setattr(
+        worker_supervisor.windows_appcontainer, "launch_appcontainer", launches.append
+    )
+    code = worker_supervisor.supervise(
+        _supervisor_spec(
+            tmp_path,
+            execution_backend="windows_appcontainer",
+            repo_id=CANONICAL_REPO_ID,
+            worker_kind="opencode_cli",
+            worker_mcp_bridge={**_BRIDGE_SPEC, "loopback_relay": relay},
+        )
+    )
+    assert code == 126 and launches == []
+    assert statuses[-1]["state"] == "spawn_failed"
+    assert statuses[-1]["error"].startswith("ValueError:")
+    # The MCP pipe already existed: it is removed, never served.
+    (bridge,) = bridges
+    assert bridge["events"] == ["close"] and bridge["relay"] is None
 
 
 @pytest.mark.parametrize(

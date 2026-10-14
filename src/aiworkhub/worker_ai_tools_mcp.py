@@ -8839,6 +8839,7 @@ def appcontainer_mcp_bridge(
     home: Path,
     stderr_path: Path,
     adapter_id: str = APPCONTAINER_BRIDGE_ADAPTER_ID,
+    loopback_relay: Any = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Split one Windows AppContainer worker's MCP runtime across the
     container boundary (NF-2026-00034).
@@ -8851,7 +8852,10 @@ def appcontainer_mcp_bridge(
     runtime directory, which holds the audit key and ledger the worker never
     needs once the server lives outside, is withheld from the container.
     The spec also carries ``shim_argv`` for a CLI (OpenCode) whose MCP config
-    is not the Claude file shape.
+    is not the Claude file shape.  Given a ``loopback_relay`` (a sealed
+    ``appcontainer_loopback_relay.LoopbackRelaySpec``, NF-2026-01503) the shim
+    also serves its port, and the spec carries the relay pipe, that port and
+    the owner's original target for the supervisor to validate and relay.
 
     Every file the host server reads for authority must be one the container
     cannot alter, so each lives in that withheld directory: the audit key and
@@ -8884,12 +8888,14 @@ def appcontainer_mcp_bridge(
         if value and Path(value).resolve().parent != runtime_dir:
             raise WorkerToolError(f"appcontainer_bridge_authority_file_not_private:{key}")
     pipe = windows_appcontainer.new_worker_pipe_name(request_id)
-    shim = windows_appcontainer.worker_pipe_shim_argv(pipe)
+    shim = windows_appcontainer.worker_pipe_shim_argv(
+        pipe, None if loopback_relay is None else (loopback_relay.pipe, loopback_relay.port)
+    )
     config_path = home / APPCONTAINER_BRIDGE_CONFIG_NAME
     _write_json_0600(
         config_path, {"mcpServers": {SERVER_NAME: {"command": shim[0], "args": shim[1:]}}}
     )
-    return config_path, {
+    bridge: dict[str, Any] = {
         "pipe": pipe,
         "command": str(server["command"]),
         "args": [str(arg) for arg in server["args"]],
@@ -8899,6 +8905,11 @@ def appcontainer_mcp_bridge(
         "withheld_directories": [str(runtime_dir)],
         "shim_argv": [str(part) for part in shim],
     }
+    if loopback_relay is not None:
+        from . import appcontainer_loopback_relay
+
+        bridge[appcontainer_loopback_relay.BRIDGE_SPEC_KEY] = loopback_relay.as_bridge()
+    return config_path, bridge
 
 
 # ---------------------------------------------------------------------------
