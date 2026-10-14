@@ -21,6 +21,7 @@ from threading import Lock
 from typing import Any, Iterable, Mapping
 
 from . import (
+    cli_model_discovery,
     core,
     cost_ledger,
     learning_commit,
@@ -1358,13 +1359,21 @@ def route_model_identities(model: str) -> frozenset[str]:
     retained ledgers record what was actually requested (``claude-sonnet-5``).
     That translation already exists exactly once, in ``_EDITOR_MODEL_ALIASES``,
     and is reused here rather than respelled: a second alias table is how the
-    two vocabularies drifted apart in the first place.
+    two vocabularies drifted apart in the first place.  ``claude_cli`` also
+    pins each alias to one explicit id (NF-2026-01517); that id is read from
+    its own single owner, ``cli_model_discovery.CLAUDE_CLI_PINNED_MODELS``,
+    rather than grafted onto ``_EDITOR_MODEL_ALIASES``, whose vscode_lm
+    acceptance check must keep seeing Copilot ids only.
     """
 
     name = str(model or "").strip()
     if not name:
         return frozenset()
-    return frozenset({name, *_EDITOR_MODEL_ALIASES.get(name, ())})
+    identities = {name, *_EDITOR_MODEL_ALIASES.get(name, ())}
+    pinned = cli_model_discovery.CLAUDE_CLI_PINNED_MODELS.get(name)
+    if pinned:
+        identities.add(pinned)
+    return frozenset(identities)
 
 
 def route_evidence_identity(

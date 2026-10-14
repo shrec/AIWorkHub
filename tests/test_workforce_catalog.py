@@ -2632,6 +2632,44 @@ def test_claude_cli_alias_is_translated_by_the_one_existing_alias_table(
     assert sonnet["route_observation"]["prior_observation_count"] == 2
 
 
+def test_route_model_identities_includes_the_claude_cli_pinned_id(tmp_path: Path) -> None:
+    """NF-2026-01517 pins ``claude_cli`` aliases to an explicit 5.5 id.
+
+    ``route_model_identities`` must surface that pinned id alongside the
+    legacy ids already carried by ``_EDITOR_MODEL_ALIASES``, without folding
+    it into that table (its vscode_lm acceptance check must keep seeing
+    Copilot ids only).
+    """
+    pinned_opus = workforce_catalog.cli_model_discovery.CLAUDE_CLI_PINNED_MODELS["opus"]
+    assert pinned_opus == "claude-opus-5-5"
+    identities = workforce_catalog.route_model_identities("opus")
+    assert identities >= {
+        "opus", pinned_opus, *workforce_catalog._EDITOR_MODEL_ALIASES["opus"]
+    }
+
+    root = _root(tmp_path)
+    pinned_sonnet = workforce_catalog.cli_model_discovery.CLAUDE_CLI_PINNED_MODELS["sonnet"]
+    assert workforce_catalog.catalog_declares_route(root, "claude_cli", pinned_sonnet)
+
+
+def test_route_model_identities_does_not_pin_a_vscode_lm_copilot_id() -> None:
+    """A Copilot-reported id such as ``claude-sonnet-5`` is not a CLI alias.
+
+    ``CLAUDE_CLI_PINNED_MODELS`` is keyed by the CLI alias (``sonnet``), not
+    by the ledger id it resolves to, so looking a ledger id up in that map
+    must miss -- otherwise a vscode_lm row would gain a 5.5 id it never
+    reported.
+    """
+    identities = workforce_catalog.route_model_identities("claude-sonnet-5")
+    assert identities == {"claude-sonnet-5"}
+    assert not any(identity.endswith("-5-5") for identity in identities)
+    assert workforce_catalog._EDITOR_MODEL_ALIASES == {
+        "haiku": ("claude-haiku-4.5",),
+        "sonnet": ("claude-sonnet-5", "claude-sonnet-4.6", "claude-sonnet-4.5"),
+        "opus": ("claude-opus-5", "claude-opus-4.8-fast", "claude-opus-4.8"),
+    }
+
+
 def test_route_observation_verdict_reports_where_its_count_came_from() -> None:
     verdict = repo_policy.route_observation_verdict(
         observed_in_window=False,
