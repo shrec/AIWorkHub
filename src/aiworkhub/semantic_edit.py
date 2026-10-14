@@ -35,6 +35,7 @@ MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_FRAGMENT_BYTES = 256 * 1024
 MAX_REPLACEMENT_BYTES = 2 * 1024 * 1024
 MAX_RANGES_PER_FILE = 256
+_BACKSLASH = "\\"
 
 
 class SemanticEditError(RuntimeError):
@@ -325,6 +326,38 @@ def _trailing_blank_line_count(text: str) -> int:
     return count
 
 
+def _escape_level_changes(old: str, new: str) -> list[tuple[int, str]]:
+    def _strip(line: str) -> str:
+        if line.endswith(chr(13) + chr(10)):
+            return line[:-2]
+        if line.endswith(chr(10)):
+            return line[:-1]
+        return line
+    old_lines = [_strip(line) for line in _split_lines(old)]
+    new_lines = [_strip(line) for line in _split_lines(new)]
+    exact = set(old_lines)
+    lost: dict[str, int] = {}
+    for i, o in enumerate(old_lines):
+        key = o.replace(_BACKSLASH * 2, _BACKSLASH)
+        if key not in lost:
+            lost[key] = i
+    by_text: dict[str, int] = {}
+    for i, o in enumerate(old_lines):
+        if o not in by_text:
+            by_text[o] = i
+    changes: list[tuple[int, str]] = []
+    for n in new_lines:
+        if n in exact:
+            continue
+        if n in lost:
+            changes.append((lost[n], "lost"))
+            continue
+        collapsed = n.replace(_BACKSLASH * 2, _BACKSLASH)
+        if collapsed in by_text:
+            changes.append((by_text[collapsed], "gained"))
+    return changes
+
+
 def apply_line_ranges(
     current_text: str,
     ranges: list[dict[str, Any]],
@@ -334,6 +367,7 @@ def apply_line_ranges(
     lines = _split_lines(current_text)
     normalized: list[tuple[int, int, str, int, int, bool]] = []
     trailing_blank_lines_dropped: list[dict[str, Any]] = []
+    escape_level_changed_lines: list[dict[str, Any]] = []
     for index, item in enumerate(ranges):
         if not isinstance(item, dict):
             raise SemanticEditError(f"semantic_edit_range_invalid:{index}")
@@ -386,6 +420,10 @@ def apply_line_ranges(
                     "new_trailing_blank_lines": new_blank,
                 }
             )
+        for _offset, _direction in _escape_level_changes(old, replacement):
+            escape_level_changed_lines.append(
+                {"range_index": index, "old_line": start + _offset, "direction": _direction}
+            )
         normalized.append(
             (
                 start,
@@ -424,6 +462,7 @@ def apply_line_ranges(
         "preimage_unverified_range_count": unverified_range_count,
         "preimage_verified": unverified_range_count == 0,
         "trailing_blank_lines_dropped": trailing_blank_lines_dropped,
+        "escape_level_changed_lines": escape_level_changed_lines,
     }
 
 

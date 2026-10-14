@@ -283,3 +283,50 @@ def test_crlf_trailing_blank_line_drop_is_reported() -> None:
             "new_trailing_blank_lines": 0,
         }
     ]
+
+
+def test_escape_level_lost_is_reported() -> None:
+    old = r'x = "\\n"' + "\n"
+    new = r'x = "\n"' + "\n"
+    new_text, metrics = semantic_edit.apply_line_ranges(
+        old,
+        [{"start_line": 1, "end_line": 1, "new": new}],
+    )
+    assert new_text == new
+    assert metrics["escape_level_changed_lines"] == [
+        {"range_index": 0, "old_line": 1, "direction": "lost"}
+    ]
+
+
+def test_escape_level_gained_is_reported() -> None:
+    old = r'x = "\n"' + "\n"
+    new = r'x = "\\n"' + "\n"
+    new_text, metrics = semantic_edit.apply_line_ranges(
+        old,
+        [{"start_line": 1, "end_line": 1, "new": new}],
+    )
+    assert new_text == new
+    assert metrics["escape_level_changed_lines"] == [
+        {"range_index": 0, "old_line": 1, "direction": "gained"}
+    ]
+
+
+def test_escape_level_identical_line_reports_empty() -> None:
+    old = r'x = "\\n"' + "\n"
+    new_text, metrics = semantic_edit.apply_line_ranges(
+        old,
+        [{"start_line": 1, "end_line": 1, "new": old}],
+    )
+    assert new_text == old
+    assert metrics["escape_level_changed_lines"] == []
+
+
+def test_escape_level_different_line_reports_empty() -> None:
+    old = r'x = "\\n"' + "\n"
+    new = r'y = 2' + "\n"
+    new_text, metrics = semantic_edit.apply_line_ranges(
+        old,
+        [{"start_line": 1, "end_line": 1, "new": new}],
+    )
+    assert new_text == new
+    assert metrics["escape_level_changed_lines"] == []
