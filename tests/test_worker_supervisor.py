@@ -18,6 +18,7 @@ if str(_SRC) not in sys.path:
 
 from aiworkhub import worker_supervisor  # noqa: E402
 from aiworkhub import platform_io  # noqa: E402
+from aiworkhub import appcontainer_loopback_relay  # noqa: E402
 from aiworkhub.worker_workspace import write_json_0600  # noqa: E402
 
 
@@ -957,10 +958,20 @@ def test_a_bridge_closed_before_it_starts_removes_its_pipe(tmp_path: Path) -> No
 class _FakeRelay:
     """Stands in for appcontainer_loopback_relay.AppContainerLoopbackRelay."""
 
-    def __init__(self, *, fail_close: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_close: bool = False,
+        error: str = "",
+        served: int = 0,
+        refused: int = 0,
+    ) -> None:
         self.started: list[object] = []
         self.closed = 0
         self._fail_close = fail_close
+        self.error = error
+        self.served = served
+        self.refused = refused
 
     def start(self, job: object) -> None:
         self.started.append(job)
@@ -1000,6 +1011,153 @@ def test_a_relay_that_fails_to_close_still_lets_the_bridge_close(tmp_path: Path)
     bridge.close()
     assert pipe.closed == 1
     assert bridge.error.startswith("loopback_relay_close_failed:")
+
+
+def test_a_relay_error_is_folded_into_the_bridge_error_at_close(tmp_path: Path) -> None:
+    """NF-2026-01523: a non-empty relay.error survives bridge close."""
+    pipe = _FakePipe()
+    bridge = _bridge(tmp_path, pipe, [])
+    bridge.relay = _FakeRelay(error="OSError:relay pipe gone", served=3, refused=1)
+    bridge.close()
+    assert pipe.closed == 1
+    assert bridge.error == "OSError:relay pipe gone"
+
+
+def test_an_earlier_bridge_error_survives_a_relay_error_at_close(tmp_path: Path) -> None:
+    """NF-2026-01523: the fold never overwrites an earlier bridge error."""
+    bridge = _bridge(tmp_path, _FakePipe(), [])
+    bridge.relay = _FakeRelay(error="OSError:relay pipe gone")
+    bridge.error = "worker_pipe_still_in_use_at_close"
+    bridge.close()
+    assert bridge.error == "worker_pipe_still_in_use_at_close"
+
+
+def test_appcontainer_close_snapshots_bridge_and_relay_diagnostics(tmp_path: Path) -> None:
+    """NF-2026-01523: close records bridge.error/served/refused, gated by nothing."""
+
+    class FakeLaunch:
+        pid = 41
+        command_line = "worker.exe"
+
+        def close(self) -> None:
+            pass
+
+    bridge = _bridge(tmp_path, _FakePipe(), [])
+    bridge.relay = _FakeRelay(error="OSError:relay pipe gone", served=3, refused=1)
+    stdout = (tmp_path / "stdout").open("w+b")
+    stderr = (tmp_path / "stderr").open("w+b")
+    process = worker_supervisor._AppContainerProcess(
+        FakeLaunch(), stdout, stderr, (), bridge
+    )
+    process.close()
+    assert process.bridge_diagnostics == {
+        "worker_mcp_bridge_error": "OSError:relay pipe gone",
+        "loopback_relay_served": 3,
+        "loopback_relay_refused": 1,
+    }
+
+
+def test_a_dead_relay_accept_loop_reaches_the_supervisor_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NF-2026-01523: a real relay whose accept loop dies still names its
+    reason in the supervisor status -- as diagnostics only, never as the
+    worker's success or failure."""
+    relay_mod = appcontainer_loopback_relay
+
+    class _DyingPipe:
+        def accept(self, job, timeout=None):
+            raise OSError("relay pipe gone")
+
+        def shutdown(self) -> None:
+            pass
+
+        def close(self, timeout: float = 5.0) -> bool:
+            return True
+
+    terminated: list[object] = []
+    relay = relay_mod.AppContainerLoopbackRelay(
+        relay_mod.LoopbackRelaySpec(
+            pipe="aiworkhub-test-relay",
+            port=54321,
+            target_host="127.0.0.1",
+            target_port=54322,
+        ),
+        "S-1-15-2-test",
+        pipe_instance=lambda name, sid, first: _DyingPipe(),
+        in_job=lambda pid, job: True,
+        listener_pids=lambda port: [],
+        terminate_job=terminated.append,
+    )
+    bridge = _bridge(tmp_path, _FakePipe(accept=False), [])
+    bridge.relay = relay
+    bridge.start("launch-job")
+
+    exited = worker_supervisor.windows_appcontainer.AppContainerLifecycleState.EXITED
+
+    class _Result:
+        state = exited
+        exit_code = 0
+        operation = None
+        win_error = None
+
+    class _FakeLaunch:
+        pid = os.getpid()
+        command_line = "worker.exe"
+
+        def wait(self, timeout_ms: int):
+            return _Result()
+
+        def terminate(self, code: int):
+            return _Result()
+
+        def close(self) -> None:
+            pass
+
+    stdout_read, stdout_write = os.pipe()
+    stderr_read, stderr_write = os.pipe()
+    os.close(stdout_write)
+    os.close(stderr_write)
+    process = worker_supervisor._AppContainerProcess(
+        _FakeLaunch(),
+        os.fdopen(stdout_read, "rb", buffering=0),
+        os.fdopen(stderr_read, "rb", buffering=0),
+        (),
+        bridge,
+    )
+    monkeypatch.setattr(
+        worker_supervisor, "_launch_appcontainer_process", lambda *args, **kwargs: process
+    )
+    process_dir = tmp_path / "processes"
+    process_dir.mkdir(mode=0o700, exist_ok=True)
+    payload = {
+        "argv": [sys.executable, "-c", "pass"],
+        "cwd": str(tmp_path),
+        "timeout_seconds": 10,
+        "status_path": str(process_dir / "status.json"),
+        "cancel_path": str(process_dir / "cancel.json"),
+        "stdout_path": str(process_dir / "stdout.log"),
+        "stderr_path": str(process_dir / "stderr.log"),
+        "execution_backend": "windows_appcontainer",
+    }
+    old_term = signal.getsignal(signal.SIGTERM)
+    old_int = signal.getsignal(signal.SIGINT)
+    try:
+        assert worker_supervisor.supervise(payload) == 0
+    finally:
+        signal.signal(signal.SIGTERM, old_term)
+        signal.signal(signal.SIGINT, old_int)
+    status = json.loads(Path(payload["status_path"]).read_text(encoding="utf-8"))
+    # The worker itself exited cleanly: the relay failure is diagnostics,
+    # not the verdict.
+    assert status["state"] == "exited"
+    assert status["exit_code"] == 0
+    assert status["error"] == ""
+    assert "relay pipe gone" in status["worker_mcp_bridge_error"]
+    assert status["loopback_relay_served"] == 0
+    assert status["loopback_relay_refused"] == 0
+    assert "relay pipe gone" in process.bridge_diagnostics["worker_mcp_bridge_error"]
+    assert terminated == []
 
 
 def test_bridge_server_that_cannot_start_leaves_nothing_behind(tmp_path: Path) -> None:

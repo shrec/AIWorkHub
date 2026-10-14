@@ -357,6 +357,13 @@ class _WorkerMcpBridge:
                 self.relay.close()
             except Exception as exc:
                 self.error = self.error or f"loopback_relay_close_failed:{exc}"[:500]
+            # NF-2026-01523: the relay records its own serve/dial/pipe-leak
+            # failures only in relay.error, which nothing reads. Fold a
+            # non-empty relay error into bridge.error -- without overwriting
+            # an earlier bridge error -- so the cause survives bridge close.
+            relay_error = getattr(self.relay, "error", "") or ""
+            if relay_error:
+                self.error = self.error or str(relay_error)[:500]
         server = self.server
         if server is not None:
             try:
@@ -381,6 +388,34 @@ class _WorkerMcpBridge:
             self.error = self.error or "worker_pipe_still_in_use_at_close"
 
 
+def _bridge_status_diagnostics(process: Any) -> dict[str, Any]:
+    """Diagnostics-only bridge/relay snapshot for the supervisor status.
+
+    Reads the bridge -- whose error already folds the relay's at bridge
+    close -- and the relay's served/refused counters. Never raises and
+    never decides success or failure: the worker's own exit code alone
+    does that. These keys only tell the operator why a sandboxed worker's
+    provider calls may have failed at the relay pipe. Empty when there is
+    no bridge, so bridgeless statuses keep their exact shape.
+    """
+    bridge = getattr(process, "_bridge", process)
+    if bridge is None:
+        return {}
+    relay = getattr(bridge, "relay", None)
+    try:
+        return {
+            "worker_mcp_bridge_error": str(getattr(bridge, "error", "") or "")[:500],
+            "loopback_relay_served": int(getattr(relay, "served", 0) or 0),
+            "loopback_relay_refused": int(getattr(relay, "refused", 0) or 0),
+        }
+    except Exception:
+        return {
+            "worker_mcp_bridge_error": "",
+            "loopback_relay_served": 0,
+            "loopback_relay_refused": 0,
+        }
+
+
 class _AppContainerProcess:
     """Popen-shaped owner for one authenticated AppContainer launch."""
 
@@ -399,6 +434,7 @@ class _AppContainerProcess:
         self.returncode: int | None = None
         self._owned_fds = owned_fds
         self._bridge = bridge
+        self.bridge_diagnostics: dict[str, Any] = {}
         self._closed = False
 
     def _observe(self, timeout_ms: int) -> int | None:
@@ -458,6 +494,10 @@ class _AppContainerProcess:
                 self._bridge.close()
             except Exception as exc:
                 first_error = exc
+            # NF-2026-01523: keep the folded bridge/relay outcome for the
+            # supervisor status. Diagnostics only: recording it here never
+            # raises and never changes success or failure.
+            self.bridge_diagnostics = _bridge_status_diagnostics(self._bridge)
         try:
             self._launch.close()
         except Exception as exc:
@@ -1468,6 +1508,15 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
             )
             token_state = final_decision.state
             token_decisions.append(final_decision)
+        # NF-2026-01523: surface a dead loopback relay / failed worker MCP
+        # bridge in the status as diagnostics only. These keys never decide
+        # success or failure: the worker's own exit code alone does that.
+        bridge_diagnostics: dict[str, Any] = {}
+        if isinstance(child, _AppContainerProcess):
+            bridge_diagnostics = (
+                getattr(child, "bridge_diagnostics", None)
+                or _bridge_status_diagnostics(child)
+            )
         _write_json_0600(status_path, {
             "state": final_state,
             "supervisor_pid": supervisor_pid,
@@ -1507,6 +1556,7 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
                 "stderr_received_bytes": stderr_capture.received_bytes,
                 "byte_labels_are_token_truth": False,
             },
+            **bridge_diagnostics,
             "error": "",
         })
     except Exception as exc:
