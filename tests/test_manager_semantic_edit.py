@@ -154,11 +154,11 @@ def _run_cli_bytes(root: Path, payload: bytes) -> subprocess.CompletedProcess:
 
 def test_the_cli_writes_utf8_stdin_byte_exact(tmp_path):
     root = _repo(tmp_path)
-    result = _run_cli_bytes(root, "TWO —σ\n".encode("utf-8"))
+    result = _run_cli_bytes(root, "TWO = '—σ'\n".encode("utf-8"))
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["ok"] is True
     assert (root / "x.py").read_bytes() == (
-        b"one\nTWO \xe2\x80\x94\xcf\x83\nthree\nfour\nfive\n"
+        b"one\nTWO = '\xe2\x80\x94\xcf\x83'\nthree\nfour\nfive\n"
     )
 
 
