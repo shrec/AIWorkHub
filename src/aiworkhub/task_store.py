@@ -6508,6 +6508,7 @@ def recover_blocked_rework(
             ):
                 return False, "retained_terminal_candidate_workspace_invalid"
             sealed_delta: dict[str, Any] | None = None
+            retained_delta: dict[str, Any] | None = None
             if collected:
                 sealed_delta, delta_error = _collected_terminal_rework_delta(
                     expected_repo,
@@ -6524,6 +6525,21 @@ def recover_blocked_rework(
                     # The candidate is not missing: its authenticated bytes are
                     # sealed, and a clean root would silently discard them.
                     return False, "clean_root_rework_sealed_delta_available"
+            elif evidence.get("rework_delta") is not None:
+                # NF-2026-01530: a retained worktree keeps every byte check
+                # below, but the successor's strict required-output gate can
+                # only credit inherited paths through a pinned sealed delta.
+                # An authenticated one rides along; an unverifiable one is
+                # left off exactly as before.
+                retained_delta, _delta_error = _collected_terminal_rework_delta(
+                    expected_repo,
+                    task_id,
+                    request_id,
+                    terminal_claim_epoch,
+                    evidence["rework_delta"],
+                    changed_hashes,
+                    allowed_writes,
+                )
             for path in changed_paths:
                 baseline_candidate = expected_repo.joinpath(*path.split("/"))
                 # An authenticated delta already bound every sealed path to its
@@ -6589,9 +6605,9 @@ def recover_blocked_rework(
                 "changed_paths": list(changed_paths),
                 "changed_path_hashes": dict(changed_hashes),
                 "workspace": dict(workspace),
-                # The successor materializes a collected candidate from this
-                # exact descriptor, as it would a reviewer-pinned delta.
-                **(sealed_delta or {}),
+                # The successor materializes from this exact descriptor
+                # whether the worktree was collected or retained.
+                **(sealed_delta or retained_delta or {}),
             }
             card["rework_predecessor"] = retained_predecessor
 

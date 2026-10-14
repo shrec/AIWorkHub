@@ -2942,7 +2942,7 @@ def _seal_nf919_delta(
 
 
 def _nf919_timed_out_gc_fixture(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, retain_worktree: bool = False,
 ) -> tuple[Path, str, dict[str, bytes], dict[str, object]]:
     """NF-2026-00594: NF919 timed out at claim epoch 6 after sealing its
     seven-path candidate over an epoch-5 predecessor, then retention collected
@@ -3092,7 +3092,8 @@ def _nf919_timed_out_gc_fixture(
         request_id=request_id,
         claim_epoch=6,
     ) == (True, "blocked")
-    shutil.rmtree(request_root)  # retention collected both worktree and home
+    if not retain_worktree:
+        shutil.rmtree(request_root)  # retention collected both worktree and home
     return repo, task_id, sealed, descriptor
 
 
@@ -3301,6 +3302,47 @@ def test_nf594_clean_root_never_discards_authenticated_sealed_delta(
     ) == (False, "clean_root_rework_sealed_delta_available")
 
     assert _nf919_state(repo, task_id) == before
+
+
+def test_nf1530_retained_worktree_still_pins_authenticated_sealed_delta(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, task_id, _sealed, descriptor = _nf919_timed_out_gc_fixture(
+        tmp_path, monkeypatch, retain_worktree=True
+    )
+    assert task_store.recover_blocked_rework(
+        repo, task_id, actor="coordinator", feedback_reason=_NF919_FEEDBACK,
+    ) == (True, "recovered")
+    predecessor = _get_card(repo, task_id)["rework_predecessor"]
+    assert predecessor["rework_delta"] == descriptor
+    assert predecessor["delta_artifact"] == {
+        "path": descriptor["artifact_path"],
+        "digest": descriptor["artifact_sha256"],
+    }
+    worktree = (
+        repo
+        / ".aiworkhub"
+        / "runtime"
+        / "worktrees"
+        / str(descriptor["request_id"])
+        / "worktree"
+    )
+    assert worktree.is_dir()
+
+
+def test_nf1530_retained_worktree_unverifiable_delta_recovers_without_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, task_id, _sealed, descriptor = _nf919_timed_out_gc_fixture(
+        tmp_path, monkeypatch, retain_worktree=True
+    )
+    Path(str(descriptor["artifact_path"])).write_bytes(b"corrupted\n")
+    assert task_store.recover_blocked_rework(
+        repo, task_id, actor="coordinator", feedback_reason=_NF919_FEEDBACK,
+    ) == (True, "recovered")
+    predecessor = _get_card(repo, task_id)["rework_predecessor"]
+    assert "rework_delta" not in predecessor
+    assert "delta_artifact" not in predecessor
 
 
 _NF1519_REQUEST = "8" * 32
