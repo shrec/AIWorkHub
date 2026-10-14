@@ -3062,25 +3062,30 @@ _ROUTE_EFFORT_KEYS: Mapping[str, tuple[str, ...]] = MappingProxyType(
 # cap and is never conflated with them.  An unknown model yields ``None``.
 _VERIFIED_CONTEXT_CAPACITY: Mapping[str, int] = MappingProxyType(
     {
-        "claude-opus-5": 1_000_000,
-        "claude-sonnet-5": 1_000_000,
-        "claude-haiku-4.5": 200_000,
+        "claude-opus-5-5": 1_000_000,
+        "claude-sonnet-5-5": 1_000_000,
+        "claude-haiku-5-5": 200_000,
         "gpt-5.5": 921_000,
     }
 )
 
 
-# Canonical workforce model aliases.  The workforce catalog names Claude-5
-# models by their short ``model`` field (``opus``/``sonnet``/``haiku``) while the
-# canonical workforce table and every CLI ``--model`` spelling use the full id.
-# These are the SAME documented aliases ``process_launcher._WORKFORCE_MODEL_ALIASES``
-# normalizes, mirrored here so an adapter-facing resolver is robust to whichever
-# verified spelling reaches it -- and still fails closed on anything else.
+# Canonical workforce model aliases.  The workforce catalog names Claude models
+# by their short ``model`` field (``opus``/``sonnet``/``haiku``/``fable``) while
+# the canonical workforce table and every CLI ``--model`` spelling use the full
+# id.  A Claude Code alias is not guaranteed to resolve to the newest model of
+# its family, so the hub pins: each alias maps to the explicit id
+# ``cli_model_discovery.CLAUDE_CLI_PINNED_MODELS`` owns, and each legacy
+# canonical id an older card or catalog row may still carry upgrades to its
+# family's pinned id.  ``process_launcher`` normalizes a claude_cli pin through
+# this map too; this resolver is robust to whichever verified spelling
+# reaches it -- and still fails closed on anything else.
 _WORKFORCE_MODEL_ALIASES: Mapping[str, str] = MappingProxyType(
     {
-        "opus": "claude-opus-5",
-        "sonnet": "claude-sonnet-5",
-        "haiku": "claude-haiku-4.5",
+        **cli_model_discovery.CLAUDE_CLI_PINNED_MODELS,
+        "claude-opus-5": cli_model_discovery.CLAUDE_CLI_PINNED_MODELS["opus"],
+        "claude-sonnet-5": cli_model_discovery.CLAUDE_CLI_PINNED_MODELS["sonnet"],
+        "claude-haiku-4.5": cli_model_discovery.CLAUDE_CLI_PINNED_MODELS["haiku"],
     }
 )
 
@@ -3092,53 +3097,42 @@ def _canonical_model_id(model: str | None) -> str:
     return _WORKFORCE_MODEL_ALIASES.get(stripped, stripped)
 
 
-# Claude Code's own ``--model`` help says an alias (``opus``, ``sonnet``,
-# ``haiku``) always means the latest model of that family, so every canonical
-# Claude workforce id maps back to its bare alias here; any other, explicit
-# id (an owner-pinned spelling) passes through unchanged.
-_CLAUDE_CLI_FAMILY_ALIASES: Mapping[str, str] = MappingProxyType(
-    {
-        canonical: alias
-        for alias, canonical in _WORKFORCE_MODEL_ALIASES.items()
-        if alias in cli_model_discovery.CLAUDE_CLI_ALIASES
-    }
-)
-
-
 def _claude_cli_model_id(model: str | None) -> str:
     """Map a verified workforce model spelling to Claude Code's CLI ``--model``.
 
-    A bare alias or a canonical Claude workforce id both resolve to the
-    family alias, which Claude Code's CLI always expands to its latest
-    model; anything else passes through unchanged.
+    A Claude Code alias is not guaranteed to be the newest model of its
+    family, so the hub never passes one: a bare alias or a legacy canonical
+    Claude id both resolve to the explicit id the hub pins for that family;
+    any other explicit id passes through unchanged.
     """
 
-    canonical = _canonical_model_id(model)
-    return _CLAUDE_CLI_FAMILY_ALIASES.get(canonical, canonical)
+    return _canonical_model_id(model)
 
 
-# Claude CLI's documented ``--effort`` ladder.  Claude-5-class models attest
-# the full rungs up to ``max``, so a MAXIMUM profile maps to ``max`` instead of
-# silently downgrading to ``high``.  Standard-tier models attest only
-# ``low``/``medium``/``high``, and any unverified model attests nothing (fail
-# closed) so no effort flag is ever emitted without model-specific evidence.
+# Claude CLI's documented ``--effort`` ladder.  The pinned Opus and Sonnet 5.5
+# models attest the full rungs up to ``max``, so a MAXIMUM profile maps to
+# ``max`` instead of silently downgrading to ``high``.  The pinned Haiku 5.5
+# attests only ``low``/``medium``/``high``, and any unverified model (Fable
+# included) attests nothing (fail closed) so no effort flag is ever emitted
+# without model-specific evidence.
 _CLAUDE_EFFORT_FULL: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 _CLAUDE_MAX_EFFORT_MODELS: frozenset[str] = frozenset(
-    ("claude-opus-5", "claude-sonnet-5")
+    ("claude-opus-5-5", "claude-sonnet-5-5")
 )
 
 
 def _claude_effort_keys(model: str | None) -> tuple[str, ...]:
     """Verified Claude ``--effort`` ladder for one canonical model id.
 
-    Accepts either the canonical id (``claude-opus-5``) or a verified workforce
-    alias (``opus``) and resolves it through ``_canonical_model_id``.
+    Accepts the canonical id (``claude-opus-5-5``), a verified workforce alias
+    (``opus``) or a legacy id (``claude-opus-5``) and resolves it through
+    ``_canonical_model_id``.
     """
 
     canonical = _canonical_model_id(model)
     if canonical in _CLAUDE_MAX_EFFORT_MODELS:
         return _CLAUDE_EFFORT_FULL
-    if canonical == "claude-haiku-4.5":
+    if canonical == "claude-haiku-5-5":
         return ("low", "medium", "high")
     return ()
 

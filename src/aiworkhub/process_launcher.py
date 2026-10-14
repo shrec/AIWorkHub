@@ -2760,10 +2760,8 @@ def _validate_adapter_identity(runner: str, adapter_id: str) -> None:
 # this table's ``model`` (after normalizing only a documented alias below)
 # exactly, or the launch is rejected before any provider credential is
 # touched and before core.claim_start_exact runs.
-_WORKFORCE_MODEL_ALIASES: dict[str, str] = {
-    "opus": "claude-opus-5",
-    "sonnet": "claude-sonnet-5",
-    "haiku": "claude-haiku-4.5",
+_WORKFORCE_MODEL_ALIASES: dict[str, str] = {  # non-claude_cli adapters (NF-2026-01517)
+    "opus": "claude-opus-5", "sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4.5",
 }
 
 _CANONICAL_WORKFORCE: dict[tuple[str, str], dict[str, Any]] = {
@@ -2772,19 +2770,19 @@ _CANONICAL_WORKFORCE: dict[tuple[str, str], dict[str, Any]] = {
     # this table dies at launch with workforce_route_absent (measured live on
     # claude_opus-5 and claude_haiku, 2026-09-01).
     ("claude_opus-5", "claude_cli"): {
-        "model": "claude-opus-5",
+        "model": cli_model_discovery.CLAUDE_CLI_PINNED_MODELS["opus"],
         "enabled": True,
         "available": True,
         "risk_tiers": frozenset({"low", "medium", "high", "critical"}),
     },
     ("claude_haiku", "claude_cli"): {
-        "model": "claude-haiku-4.5",
+        "model": cli_model_discovery.CLAUDE_CLI_PINNED_MODELS["haiku"],
         "enabled": True,
         "available": True,
         "risk_tiers": frozenset({"low", "medium"}),
     },
     ("claude_sonnet-5", "claude_cli"): {
-        "model": "claude-sonnet-5",
+        "model": cli_model_discovery.CLAUDE_CLI_PINNED_MODELS["sonnet"],
         "enabled": True,
         "available": True,
         "risk_tiers": frozenset({"low", "medium", "high", "critical"}),
@@ -2796,7 +2794,7 @@ _CANONICAL_WORKFORCE: dict[tuple[str, str], dict[str, Any]] = {
         "risk_tiers": frozenset({"low", "medium", "high", "critical"}),
     },
     ("claude_haiku-4.5", "claude_cli"): {
-        "model": "claude-haiku-4.5",
+        "model": cli_model_discovery.CLAUDE_CLI_PINNED_MODELS["haiku"],
         "enabled": True,
         "available": True,
         "risk_tiers": frozenset({"low", "medium"}),
@@ -2816,8 +2814,10 @@ _CANONICAL_WORKFORCE: dict[tuple[str, str], dict[str, Any]] = {
 }
 
 
-def _normalize_workforce_model(model: str | None) -> str:
+def _normalize_workforce_model(model: str | None, adapter_id: str) -> str:
     stripped = str(model or "").strip()
+    if adapter_id == "claude_cli":  # NF-2026-01517: a legacy Claude pin upgrades to its pinned id
+        return runtime_adapters._WORKFORCE_MODEL_ALIASES.get(stripped, stripped)
     return _WORKFORCE_MODEL_ALIASES.get(stripped, stripped)
 
 
@@ -2850,8 +2850,8 @@ def validate_workforce_identity(
     existing, unchanged identity handling. A launch that does not pin a
     specific model is likewise unaffected: this only guards an explicit, exact
     model pin, never one inferred from a display name or editor inventory.
-    Normalizes only a documented workforce alias
-    (``_WORKFORCE_MODEL_ALIASES``). Returns the canonical model name (or the
+    Normalizes only a documented alias (claude_cli via ``runtime_adapters``,
+    else ``_WORKFORCE_MODEL_ALIASES``). Returns the canonical model name (or the
     original ``model`` when this validation does not apply). Raises
     ``LaunchRejected`` with a typed reason for any pinned runner/adapter/model
     combination that does not resolve to exactly one canonical workforce row,
@@ -2878,7 +2878,7 @@ def validate_workforce_identity(
         raise LaunchRejected(
             f"workforce_route_absent:runner={runner}:adapter={adapter_id}"
         )
-    canonical_model = _normalize_workforce_model(model)
+    canonical_model = _normalize_workforce_model(model, adapter_id)
     if not canonical_model or canonical_model != route["model"]:
         raise LaunchRejected(
             "workforce_model_mismatch:"
@@ -9264,9 +9264,9 @@ class ProcessManager:
         if adapter_id == "claude_cli":
             try:
                 resolved = cli_model_discovery.claude_init_model(stdout_path)
-                if resolved:
-                    alias = runtime_adapters._claude_cli_model_id(model)
-                    cli_model_discovery.record_claude_resolution(self.repo, alias, resolved)
+                pins = {p: a for a, p in cli_model_discovery.CLAUDE_CLI_PINNED_MODELS.items()}
+                alias = pins.get(runtime_adapters._claude_cli_model_id(model), "")
+                cli_model_discovery.record_claude_resolution(self.repo, alias, resolved)
             except Exception:  # noqa: BLE001 -- recording is observability, never a turn failure
                 pass
         usage["requested_model"] = model

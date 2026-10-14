@@ -169,13 +169,13 @@ def test_claude_cli_argv_uses_claude_code_haiku_spelling_haiku_unchanged_elsewhe
 ) -> None:
     """NF-2026-01019: only the Claude CLI ``--model`` argv site is respelled.
 
-    The canonical workforce id ``claude-haiku-4.5`` keeps driving effort and
-    context-capacity resolution unchanged; only the argv token Claude Code's
-    CLI receives is translated to the spelling it accepts.
+    The legacy workforce id ``claude-haiku-4.5`` resolves to the pinned
+    ``claude-haiku-5-5`` (NF-2026-01517), which drives effort and
+    context-capacity resolution; the VS Code LM route keeps its own id.
     """
 
-    assert runtime_adapters._canonical_model_id("claude-haiku-4.5") == "claude-haiku-4.5"
-    assert runtime_adapters._canonical_model_id("haiku") == "claude-haiku-4.5"
+    assert runtime_adapters._canonical_model_id("claude-haiku-4.5") == "claude-haiku-5-5"
+    assert runtime_adapters._canonical_model_id("haiku") == "claude-haiku-5-5"
     assert "max" not in runtime_adapters._claude_effort_keys("claude-haiku-4.5")
     assert "high" in runtime_adapters._claude_effort_keys("claude-haiku-4.5")
     assert runtime_adapters.resolve_context_capacity("claude_cli", "claude-haiku-4.5") == 200_000
@@ -881,8 +881,8 @@ def test_launch_isolated_card_difficulty_selects_the_claude_effort(
 @pytest.mark.parametrize(
     ("runner", "model", "expected_model"),
     [
-        ("claude_opus-5", "opus", "claude-opus-5"),
-        ("claude_sonnet-5", "sonnet", "claude-sonnet-5"),
+        ("claude_opus-5", "opus", "claude-opus-5-5"),
+        ("claude_sonnet-5", "sonnet", "claude-sonnet-5-5"),
     ],
 )
 def test_launch_isolated_real_workforce_alias_emits_max_effort(

@@ -69,8 +69,8 @@ def test_claude_argv_is_current_noninteractive_shape(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("model", ["claude-haiku-4.5", "haiku"])
-def test_claude_cli_argv_uses_the_haiku_family_alias(monkeypatch, tmp_path, model):
-    """Claude Code's --model always resolves a family alias to its latest model."""
+def test_claude_cli_argv_uses_the_pinned_haiku_id(monkeypatch, tmp_path, model):
+    """A Claude Code alias is not guaranteed to be the newest model, so the hub pins."""
     repo = tmp_path / "repo"
     repo.mkdir()
     executable = _executable(tmp_path, "claude")
@@ -84,11 +84,14 @@ def test_claude_cli_argv_uses_the_haiku_family_alias(monkeypatch, tmp_path, mode
     )
 
     model_index = plan.argv.index("--model")
-    assert plan.argv[model_index + 1] == "haiku"
+    assert plan.argv[model_index + 1] == "claude-haiku-5-5"
 
 
-@pytest.mark.parametrize(("model", "alias"), [("claude-opus-5", "opus"), ("claude-sonnet-5", "sonnet")])
-def test_claude_cli_argv_uses_the_opus_and_sonnet_family_alias(monkeypatch, tmp_path, model, alias):
+@pytest.mark.parametrize(
+    ("model", "pinned"),
+    [("claude-opus-5", "claude-opus-5-5"), ("claude-sonnet-5", "claude-sonnet-5-5")],
+)
+def test_claude_cli_argv_uses_the_pinned_opus_and_sonnet_ids(monkeypatch, tmp_path, model, pinned):
     repo = tmp_path / "repo"
     repo.mkdir()
     executable = _executable(tmp_path, "claude")
@@ -102,7 +105,7 @@ def test_claude_cli_argv_uses_the_opus_and_sonnet_family_alias(monkeypatch, tmp_
     )
 
     model_index = plan.argv.index("--model")
-    assert plan.argv[model_index + 1] == alias
+    assert plan.argv[model_index + 1] == pinned
 
 
 def _claude_tool_lists(argv: list[str]) -> tuple[list[str], list[str]]:

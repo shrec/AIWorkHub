@@ -67,37 +67,48 @@ def test_codex_models_honours_codex_home_from_the_environment(tmp_path: Path, mo
     assert [entry["model"] for entry in models] == ["gpt-6-luna"]
 
 
-def test_record_claude_resolution_round_trips_into_claude_models(tmp_path: Path):
+_PINNED_CLAUDE_MODELS = [
+    {"model": "opus", "label": "claude-opus-5-5 (opus)"},
+    {"model": "sonnet", "label": "claude-sonnet-5-5 (sonnet)"},
+    {"model": "haiku", "label": "claude-haiku-5-5 (haiku)"},
+    {"model": "fable", "label": "claude-fable-5-1 (fable)"},
+]
+
+
+def test_record_claude_resolution_is_recorded_but_never_relabels_claude_models(tmp_path: Path):
     cli_model_discovery.record_claude_resolution(tmp_path, "opus", "claude-opus-5")
 
     models = cli_model_discovery.claude_models(tmp_path)
 
-    resolved = {entry["model"]: entry["label"] for entry in models}
-    assert resolved["opus"] == "claude-opus-5 (opus)"
-    assert resolved["sonnet"] == "sonnet", "an alias never observed resolving falls back to its bare name"
+    assert cli_model_discovery._read_resolutions(tmp_path)["opus"]["resolved"] == "claude-opus-5"
+    assert models == _PINNED_CLAUDE_MODELS, "the label names the pinned id, never an observed one"
     assert [entry["model"] for entry in models] == list(cli_model_discovery.CLAUDE_CLI_ALIASES)
 
 
 def test_record_claude_resolution_ignores_a_non_alias_model(tmp_path: Path):
     cli_model_discovery.record_claude_resolution(tmp_path, "claude-opus-5-pinned", "claude-opus-5")
 
-    assert not (tmp_path / ".aiworkhub" / "config" / "claude_model_resolutions.json").exists()
+    assert not cli_model_discovery._resolutions_path(tmp_path).exists()
 
 
-def test_claude_models_is_the_bare_alias_list_for_a_missing_resolutions_file(tmp_path: Path):
+def test_claude_models_labels_the_pinned_ids_for_a_missing_resolutions_file(tmp_path: Path):
     models = cli_model_discovery.claude_models(tmp_path / "does-not-exist")
 
-    assert models == [{"model": alias, "label": alias} for alias in cli_model_discovery.CLAUDE_CLI_ALIASES]
+    assert models == _PINNED_CLAUDE_MODELS
 
 
-def test_claude_models_is_the_bare_alias_list_for_a_corrupt_resolutions_file(tmp_path: Path):
-    config_dir = tmp_path / ".aiworkhub" / "config"
-    config_dir.mkdir(parents=True, exist_ok=True)
-    (config_dir / "claude_model_resolutions.json").write_text("not json", encoding="utf-8")
+def test_claude_models_labels_the_pinned_ids_for_a_corrupt_resolutions_file(tmp_path: Path):
+    path = cli_model_discovery._resolutions_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("not json", encoding="utf-8")
 
-    models = cli_model_discovery.claude_models(tmp_path)
+    assert cli_model_discovery._read_resolutions(tmp_path) == {}
+    assert cli_model_discovery.claude_models(tmp_path) == _PINNED_CLAUDE_MODELS
 
-    assert models == [{"model": alias, "label": alias} for alias in cli_model_discovery.CLAUDE_CLI_ALIASES]
+    # The next real resolution replaces the corrupt file with a valid one.
+    cli_model_discovery.record_claude_resolution(tmp_path, "opus", "claude-opus-5-5")
+    assert cli_model_discovery._read_resolutions(tmp_path)["opus"]["resolved"] == "claude-opus-5-5"
+    assert cli_model_discovery.claude_models(tmp_path) == _PINNED_CLAUDE_MODELS
 
 
 def _symlink_or_skip(link: Path, target: Path) -> None:
@@ -135,7 +146,7 @@ def test_codex_models_is_empty_for_a_symlinked_cache(tmp_path: Path):
     assert cli_model_discovery.codex_models(home=linked_home) == []
 
 
-def test_claude_models_is_the_bare_alias_list_for_a_symlinked_resolutions_file(tmp_path: Path):
+def test_claude_resolutions_are_never_read_through_a_symlinked_resolutions_file(tmp_path: Path):
     real_repo = tmp_path / "real-repo"
     cli_model_discovery.record_claude_resolution(real_repo, "opus", "claude-opus-5")
     linked_repo = tmp_path / "linked-repo"
@@ -145,10 +156,7 @@ def test_claude_models_is_the_bare_alias_list_for_a_symlinked_resolutions_file(t
     link.parent.mkdir(parents=True)
     _symlink_or_skip(link, cli_model_discovery._resolutions_path(real_repo))
 
-    # The target is a real resolutions file, so the bare aliases below can only
+    # The target is a real resolutions file, so the empty read below can only
     # be the guard refusing the link.
-    resolved = {entry["model"]: entry["label"] for entry in cli_model_discovery.claude_models(real_repo)}
-    assert resolved["opus"] == "claude-opus-5 (opus)"
-    assert cli_model_discovery.claude_models(linked_repo) == [
-        {"model": alias, "label": alias} for alias in cli_model_discovery.CLAUDE_CLI_ALIASES
-    ]
+    assert cli_model_discovery._read_resolutions(real_repo)["opus"]["resolved"] == "claude-opus-5"
+    assert cli_model_discovery._read_resolutions(linked_repo) == {}

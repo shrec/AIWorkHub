@@ -501,7 +501,7 @@ def test_reroute_launch_identity_repairs_invalid_pinned_runner(
     )
 
     assert result["ok"] is True, result
-    assert result["to_model"] == "claude-sonnet-5"
+    assert result["to_model"] == "claude-sonnet-5-5"
     row = _row(coordinator_repo, task_id)
     assert row["runner"] == "claude_sonnet-5"
     assert row["status"] == "pending"
@@ -514,7 +514,7 @@ def test_reroute_launch_identity_repairs_invalid_pinned_runner(
     assert receipt["schema_id"] == "aiworkhub.identity_reroute.v1"
     assert receipt["from_runner"] == "claude_sonnet-4.6"
     assert receipt["to_runner"] == "claude_sonnet-5"
-    assert receipt["to_model"] == "claude-sonnet-5"
+    assert receipt["to_model"] == "claude-sonnet-5-5"
 
 
 def test_terminal_retry_spark_card_requires_explicit_native_codex_reroute(

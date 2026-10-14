@@ -458,14 +458,14 @@ def test_model_is_pinned_from_the_canonical_workforce_table(tmp_path):
     derived = process_launcher.derive_launch_identity(
         tmp_path, _launchable_card(), adapter_id="claude_cli"
     )
-    assert derived["model"] == "claude-opus-5"
+    assert derived["model"] == "claude-opus-5-5"
     assert derived["derived_from"]["model"] == "canonical_workforce"
     # And the derived tuple still passes the unchanged identity validation.
     assert (
         process_launcher.validate_workforce_identity(
             derived["runner"], derived["adapter_id"], derived["model"]
         )
-        == "claude-opus-5"
+        == "claude-opus-5-5"
     )
 
 
@@ -540,7 +540,7 @@ def test_launch_derives_the_whole_tuple_when_the_caller_omits_it(tmp_path, monke
     assert seen["runner"] == "claude_opus-5"
     assert seen["topic"] == "coding"
     assert seen["adapter_id"] == "claude_cli"
-    assert seen["model"] == "claude-opus-5"
+    assert seen["model"] == "claude-opus-5-5"
     # The receipt records HOW the identity was decided.
     assert result["launch_identity_derivation"]["derived_from"] == {
         "runner": "card",
@@ -589,7 +589,7 @@ def test_an_explicit_tuple_without_a_model_pins_the_canonical_model(tmp_path, mo
         task_id="T_EXPLICIT", runner="claude_opus-5", topic="coding", adapter_id="claude_cli"
     )
     assert result["ok"] is True
-    assert seen["model"] == "claude-opus-5"
+    assert seen["model"] == "claude-opus-5-5"
     assert result["launch_identity_derivation"]["derived_from"] == {"model": "canonical_workforce"}
     seen.clear()
     # An underivable explicit tuple keeps the prior unpinned launch, never a raw raise.
@@ -741,7 +741,7 @@ def test_derivation_skips_an_open_route_circuit_and_says_why(tmp_path, monkeypat
     derived = process_launcher.derive_launch_identity(tmp_path, card)
 
     assert derived["adapter_id"] == "claude_cli"
-    assert derived["model"] == "claude-sonnet-5"
+    assert derived["model"] == "claude-sonnet-5-5"
     assert (
         derived["derived_from"]["adapter_id"]
         == "first_pinnable_launchable_in_tuple_order"

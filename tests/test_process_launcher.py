@@ -3075,7 +3075,7 @@ def test_workforce_identity_accepts_valid_alias_for_high_risk_task() -> None:
     canonical = process_launcher.validate_workforce_identity(
         "claude_sonnet-5", "claude_cli", "sonnet", risk_tier="high"
     )
-    assert canonical == "claude-sonnet-5"
+    assert canonical == "claude-sonnet-5-5"
 
 
 def test_workforce_identity_rejects_risk_incapable_route() -> None:

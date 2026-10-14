@@ -5,15 +5,17 @@ Codex CLI keeps its own list of currently-offered models in
 only source of truth for which Codex model slugs exist right now, so a
 hardcoded catalog row silently drifts from what the provider actually offers
 the moment the provider changes its lineup. Claude Code resolves its own
-aliases (``opus``, ``sonnet``, ...) to a concrete model id internally, and
-that id is only ever knowable from the first line of a real ``stream-json``
-run the manager loop already made (see
-:mod:`aiworkhub.manager_loop_backends`); it is recorded here rather than
-re-derived.
+aliases (``opus``, ``sonnet``, ...) to a concrete model id internally, but an
+alias is not guaranteed to be the newest model of its family, so the hub pins
+each alias to an explicit id (``CLAUDE_CLI_PINNED_MODELS``) instead of passing
+the alias on ``--model``. The id a real run actually reported is only ever
+knowable from the first line of its ``stream-json`` output (see
+:mod:`aiworkhub.manager_loop_backends`); it is recorded here as observed
+evidence rather than re-derived.
 
 Nothing in this module spawns a process, opens a socket, or otherwise asks a
-provider anything -- every function reads a file this repository or a CLI
-already wrote, and a missing or unreadable file is a normal, silent state
+provider anything -- every function reads at most a file this repository or a
+CLI already wrote, and a missing or unreadable file is a normal, silent state
 rather than an error.
 """
 
@@ -22,13 +24,27 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from . import platform_io
 
-CLAUDE_CLI_ALIASES: tuple[str, ...] = ("opus", "sonnet", "haiku", "fable")
+# Measured on Claude Code 2.1.280: ``opus`` resolved to claude-opus-5-5, but
+# ``sonnet`` to claude-sonnet-5 and ``haiku`` to a 4.5 model, so a family alias
+# does not deliver the newest family. Every alias is pinned to an explicit id
+# verified live on that CLI; the alias itself stays the stored and picker value.
+CLAUDE_CLI_PINNED_MODELS: Mapping[str, str] = MappingProxyType(
+    {
+        "opus": "claude-opus-5-5",
+        "sonnet": "claude-sonnet-5-5",
+        "haiku": "claude-haiku-5-5",
+        "fable": "claude-fable-5-1",
+    }
+)
+CLAUDE_CLI_ALIASES: tuple[str, ...] = tuple(CLAUDE_CLI_PINNED_MODELS)
 
 _CODEX_MODELS_CACHE_NAME = "models_cache.json"
 _CLAUDE_RESOLUTIONS_RELATIVE_PATH = Path(".aiworkhub/runtime/claude_model_resolutions.json")
@@ -131,21 +147,18 @@ def record_claude_resolution(repo_root: Path | str, alias: str, resolved: str) -
 
 
 def claude_models(repo_root: Path | str) -> list[dict[str, Any]]:
-    """Every Claude CLI alias, labelled with the version it last resolved to.
+    """Every Claude CLI alias, labelled with the explicit id the hub pins it to.
 
-    Always returns all of ``CLAUDE_CLI_ALIASES``: an alias never observed
-    resolving carries its own bare name as the label, the same value the
-    Manager picker launches.
+    Always returns all of ``CLAUDE_CLI_ALIASES``. ``model`` stays the bare
+    alias -- the value the Manager picker stores and launches -- while the
+    label names the pinned id that launch runs. ``repo_root`` is kept for
+    callers only: a recorded resolution is observed evidence, never the label.
     """
 
-    resolutions = _read_resolutions(repo_root)
-    models: list[dict[str, Any]] = []
-    for alias in CLAUDE_CLI_ALIASES:
-        entry = resolutions.get(alias)
-        resolved = str(entry.get("resolved") or "").strip() if isinstance(entry, dict) else ""
-        label = f"{resolved} ({alias})" if resolved else alias
-        models.append({"model": alias, "label": label})
-    return models
+    return [
+        {"model": alias, "label": f"{pinned} ({alias})"}
+        for alias, pinned in CLAUDE_CLI_PINNED_MODELS.items()
+    ]
 
 
 def claude_init_model(stdout_path: Path) -> str:
