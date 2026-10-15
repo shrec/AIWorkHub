@@ -558,6 +558,11 @@ class WorkerWorkspace:
     # predates the pin, in which case the symbolic ``HEAD`` fallback is used.
     base_oid: str | None = None
     parent_baseline_blob: dict[str, str] = field(default_factory=dict)
+    # Raw SHA-256 of each inherited rework path whose base-drift rebase made its
+    # materialized bytes differ from the pinned predecessor digest.  Only these
+    # exact materializer-produced bytes may stand in for that digest
+    # (NF-2026-01552); legacy metadata without the record loads as empty.
+    inherited_rebased_hashes: dict[str, str] = field(default_factory=dict)
 
     def as_metadata(self) -> dict[str, Any]:
         return {
@@ -573,6 +578,7 @@ class WorkerWorkspace:
             "inherited_rework_paths": list(self.inherited_rework_paths),
             "base_oid": self.base_oid,
             "parent_baseline_blob": dict(self.parent_baseline_blob),
+            "inherited_rebased_hashes": dict(self.inherited_rebased_hashes),
         }
 
     @classmethod
@@ -609,6 +615,10 @@ class WorkerWorkspace:
                 else None
             ),
             parent_baseline_blob=dict(payload.get("parent_baseline_blob") or {}),
+            inherited_rebased_hashes={
+                _relative_repo_path(str(k)): str(v)
+                for k, v in dict(payload.get("inherited_rebased_hashes") or {}).items()
+            },
         )
 
 
@@ -2763,11 +2773,15 @@ def _materialize_rework_predecessor(
     worktree: Path,
     card: dict[str, Any],
     allowed_writes: tuple[str, ...],
+    *,
+    rebased_hashes: dict[str, str] | None = None,
 ) -> list[str]:
     """Overlay one hash-pinned predecessor into a successor worktree.
 
     The recorded delta artifact is preferred when present; otherwise the retained
     worktree is used, since a retention sweep can leave it emptied but present.
+    ``rebased_hashes``, when given, receives the raw SHA-256 of every path whose
+    base-drift rebase wrote bytes other than the pinned predecessor bytes.
     """
     predecessor = card.get("rework_predecessor")
     if predecessor is None:
@@ -2797,6 +2811,8 @@ def _materialize_rework_predecessor(
     from .promotion_merge import rework_base_drift_rebase
 
     rebase = rework_base_drift_rebase(repo, worktree, source_workspace)
+    if rebase is not None and rebased_hashes is not None:
+        rebase = _recording_rebase(rebase, rebased_hashes)
     if predecessor.get("delta_artifact") is not None:
         return materialize_rework_delta_artifact(
             artifact=predecessor.get("delta_artifact"),
@@ -2814,6 +2830,26 @@ def _materialize_rework_predecessor(
             worktree, source_workspace, hashes, allowed_writes, rebase=rebase
         )
     raise WorkspaceError("rework_predecessor_workspace_missing")
+
+
+def _recording_rebase(rebase: ReworkRebase, rebased_hashes: dict[str, str]) -> ReworkRebase:
+    """Wrap ``rebase`` to record the raw SHA-256 of each path it rewrote.
+
+    Both materializers verify every planned predecessor blob against its pinned
+    digest before rebasing, so merged bytes that differ from the planned bytes
+    are exactly the paths whose materialization no longer matches that digest
+    (NF-2026-01552).  A merged deletion writes no bytes and records nothing.
+    """
+
+    def recording(planned: list[tuple[str, bytes | None]]) -> dict[str, bytes | None]:
+        merged = rebase(planned)
+        pinned = dict(planned)
+        for relative, content in merged.items():
+            if content is not None and content != pinned.get(relative):
+                rebased_hashes[relative] = hashlib.sha256(content).hexdigest()
+        return merged
+
+    return recording
 
 
 def _write_rework_path(destination: Path, relative: str, content: bytes | None) -> None:
@@ -5993,10 +6029,13 @@ def create_workspace(
             for relative in allowed:
                 if not any(ch in relative for ch in "*?["):
                     _touch_placeholder(path, relative)
+        rework_rebased: dict[str, str] = {}
         rework_seeded = (
             ()
             if pinned_base_oid is not None
-            else _materialize_rework_predecessor(repo, path, card, allowed)
+            else _materialize_rework_predecessor(
+                repo, path, card, allowed, rebased_hashes=rework_rebased
+            )
         )
         seeded = sorted(set(seeded) | set(rework_seeded))
         provisioning_timings_ms["declared_seed"] = round(
@@ -6070,6 +6109,7 @@ def create_workspace(
         inherited_rework_paths=tuple(sorted(set(rework_seeded))),
         base_oid=base_oid,
         parent_baseline_blob=record_base_blobs(baseline_root, baseline),
+        inherited_rebased_hashes=dict(sorted(rework_rebased.items())),
     )
     # Seal the exit-contract inputs the worker MCP server needs for
     # ``aiworkhub_worker_exit_preflight``.  Advisory only; never fails a launch.
@@ -7140,6 +7180,12 @@ def validate_required_outputs(
     sealed predecessor authority is claimed, so strict coordinator finalization
     fails closed instead.
 
+    A sealed path the materializer rebased onto a newer canonical parent no
+    longer matches its sealed digest, so it counts only through the exact
+    digest recorded in ``workspace.inherited_rebased_hashes`` (NF-2026-01552).
+    An inherited path byte-equal to its parent baseline is never a change, even
+    when the worker reverted it away from its launch bytes.
+
     ``validation_only_replay`` marks a coordinator validation-only-replay
     finalization. When set and no sealed delta is claimed, the
     inherited-change evidence comes from ``rework_predecessor``'s own
@@ -7243,10 +7289,16 @@ def validate_required_outputs(
             )
             differs_from_parent = current_hash != workspace.parent_baseline.get(relative)
             if sealed_inherited_hashes is not None:
+                # A sealed delta rebased onto a newer parent no longer carries its
+                # sealed digest; only the digest its materializer recorded for
+                # that same sealed path stands in for it (NF-2026-01552).
+                sealed_hash = sealed_inherited_hashes.get(relative)
+                rebased_hash = workspace.inherited_rebased_hashes.get(relative)
                 inherited_change = (
                     matches_retry_baseline
                     and differs_from_parent
-                    and sealed_inherited_hashes.get(relative) == raw_sha256
+                    and sealed_hash is not None
+                    and raw_sha256 in (sealed_hash, rebased_hash)
                 )
             else:
                 inherited_change = (
@@ -7254,7 +7306,11 @@ def validate_required_outputs(
                     and matches_retry_baseline
                     and differs_from_parent
                 )
-            is_unchanged = matches_retry_baseline and not inherited_change
+            # An inherited path launches with predecessor bytes, not parent bytes,
+            # so reverting it to its parent baseline is no change either.
+            is_unchanged = (matches_retry_baseline and not inherited_change) or (
+                relative in workspace.inherited_rework_paths and not differs_from_parent
+            )
             replay_evidence: dict[str, Any] | None = None
             if is_unchanged:
                 if relative not in unchanged_allowed:

@@ -2463,8 +2463,14 @@ def _seed_rebased_rework(
     sealed: bool,
     base_oid: str | None = None,
     canonical_mode: str = "100644",
+    artifact_dir: Path | None = None,
+    rework_sink: dict[str, object] | None = None,
 ) -> worker_workspace.WorkerWorkspace:
-    """Seed a successor from a predecessor made before an optional canonical commit."""
+    """Seed a successor from a predecessor made before an optional canonical commit.
+
+    ``artifact_dir`` overrides where a sealed delta is written, and
+    ``rework_sink`` receives the successor card's ``rework_predecessor``.
+    """
     _commit_rebase_result(repo, _rebase_bytes(), "rebase base")
     predecessor = worker_workspace.create_workspace(
         repo, "rebase-predecessor", {"allowed_writes": ["out/result.txt"]}, "validation"
@@ -2488,9 +2494,11 @@ def _seed_rebased_rework(
             "rebase-predecessor",
             1,
             [("out/result.txt", candidate)],
-            tmp_path / "artifacts",
+            artifact_dir or tmp_path / "artifacts",
         )
         worker_workspace.cleanup_workspace(repo, predecessor.path, predecessor.home)
+    if rework_sink is not None:
+        rework_sink.update(rework)
     try:
         if canonical is not None:
             _commit_rebase_result(repo, canonical, "canonical drift", canonical_mode)
