@@ -494,6 +494,242 @@ def test_registered_executable_symlink_escape_fails_closed(
     assert plan.validation_reason == "registration_executable_escapes_repo"
 
 
+def _host_executable(host_root: Path) -> Path:
+    """A regular executable file inside the host root (test fixture only)."""
+
+    target = host_root / "host-executables" / "opencode"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.exists():
+        shutil.copy2(sys.executable, target)
+    return target
+
+
+def _write_host_registration(host_root: Path, **overrides: object) -> Path:
+    executable = _host_executable(host_root)
+    entry: dict[str, object] = {
+        "platform": "linux",
+        "artifact_version": ARTIFACT_VERSION,
+        "source_tag": SOURCE_TAG,
+        "source_commit": SOURCE_COMMIT,
+        "executable_relative": "host-executables/opencode",
+        "sha256": _sha256(executable),
+        "fixture_kind": "host_tested_only",
+    }
+    entry.update(overrides)
+    manifest_path = host_root / runtime_executable_registry.REGISTRY_FILENAME
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema": runtime_executable_registry.MANIFEST_SCHEMA_ID,
+                "registrations": {"opencode_cli": entry},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return executable
+
+
+def test_host_fallback_when_repo_manifest_absent(
+    tmp_path: Path, linux_platform: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    host_root = tmp_path / "host"
+    host_root.mkdir()
+    hosted = _write_host_registration(host_root)
+    monkeypatch.setattr(
+        runtime_executable_registry, "_host_registration_root", lambda: host_root
+    )
+    _host_not_windows(monkeypatch)
+
+    overrides, error = runtime_executable_registry.select_executable_overrides(
+        "opencode_cli", repo, None
+    )
+
+    assert error is None
+    assert overrides == {"opencode_cli": str(hosted)}
+
+    plan = runtime_adapters.build_manager_command(
+        OPENCODE_CLI_ADAPTER, PROMPT, repo, model=MODEL
+    )
+    assert plan.launchable
+    assert plan.executable == str(hosted)
+
+
+def test_host_fallback_when_repo_manifest_lacks_adapter(
+    tmp_path: Path, linux_platform: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sibling_exe = _registered_executable(repo)
+    sibling_entry = {
+        "platform": "linux",
+        "artifact_version": ARTIFACT_VERSION,
+        "source_tag": SOURCE_TAG,
+        "source_commit": SOURCE_COMMIT,
+        "executable_relative": "artifacts/opencode-2.0.16-winfix.1/bin/opencode",
+        "sha256": _sha256(sibling_exe),
+        "fixture_kind": "host_tested_only",
+    }
+    manifest_path = _manifest_path(repo)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema": runtime_executable_registry.MANIFEST_SCHEMA_ID,
+                "registrations": {"sibling_adapter": sibling_entry},
+            }
+        ),
+        encoding="utf-8",
+    )
+    host_root = tmp_path / "host"
+    host_root.mkdir()
+    hosted = _write_host_registration(host_root)
+    monkeypatch.setattr(
+        runtime_executable_registry, "_host_registration_root", lambda: host_root
+    )
+
+    overrides, error = runtime_executable_registry.select_executable_overrides(
+        "opencode_cli", repo, None
+    )
+
+    assert error is None
+    assert overrides == {"opencode_cli": str(hosted)}
+
+
+def test_repo_registration_wins_when_both_register(
+    tmp_path: Path, linux_platform: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    repo_exe = _write_registration(repo)
+    host_root = tmp_path / "host"
+    host_root.mkdir()
+    _write_host_registration(host_root)
+    monkeypatch.setattr(
+        runtime_executable_registry, "_host_registration_root", lambda: host_root
+    )
+
+    overrides, error = runtime_executable_registry.select_executable_overrides(
+        "opencode_cli", repo, None
+    )
+
+    assert error is None
+    assert overrides == {"opencode_cli": str(repo_exe)}
+
+
+def test_malformed_repo_manifest_does_not_fall_back(
+    tmp_path: Path, linux_platform: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    manifest_path = _manifest_path(repo)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text("{not valid json", encoding="utf-8")
+    host_root = tmp_path / "host"
+    host_root.mkdir()
+    _write_host_registration(host_root)
+    monkeypatch.setattr(
+        runtime_executable_registry, "_host_registration_root", lambda: host_root
+    )
+
+    overrides, error = runtime_executable_registry.select_executable_overrides(
+        "opencode_cli", repo, None
+    )
+
+    assert overrides is None
+    assert error == "manifest_json_malformed"
+
+
+def test_host_executable_parent_traversal_refused(
+    tmp_path: Path, linux_platform: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    host_root = tmp_path / "host"
+    host_root.mkdir()
+    _write_host_registration(host_root, executable_relative="../escape/opencode")
+    monkeypatch.setattr(
+        runtime_executable_registry, "_host_registration_root", lambda: host_root
+    )
+
+    overrides, error = runtime_executable_registry.select_executable_overrides(
+        "opencode_cli", repo, None
+    )
+
+    assert overrides is None
+    assert error == "host_registration_executable_unsafe"
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="symlink creation requires privilege on Windows"
+)
+def test_host_executable_symlink_escape_refused(
+    tmp_path: Path, linux_platform: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    host_root = tmp_path / "host"
+    link_dir = host_root / "host-executables"
+    link_dir.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path.parent / f"outside_{tmp_path.name}"
+    outside.mkdir(exist_ok=True)
+    (outside / "opencode").write_bytes(b"escape")
+    (link_dir / "opencode").symlink_to(outside / "opencode")
+    _write_host_registration(host_root)
+    monkeypatch.setattr(
+        runtime_executable_registry, "_host_registration_root", lambda: host_root
+    )
+
+    overrides, error = runtime_executable_registry.select_executable_overrides(
+        "opencode_cli", repo, None
+    )
+
+    assert overrides is None
+    assert error == "host_registration_executable_escapes_root"
+
+
+def test_host_sha_mismatch_refused_with_host_reason(
+    tmp_path: Path, linux_platform: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    host_root = tmp_path / "host"
+    host_root.mkdir()
+    _write_host_registration(
+        host_root, sha256=hashlib.sha256(b"tampered bytes").hexdigest()
+    )
+    monkeypatch.setattr(
+        runtime_executable_registry, "_host_registration_root", lambda: host_root
+    )
+
+    overrides, error = runtime_executable_registry.select_executable_overrides(
+        "opencode_cli", repo, None
+    )
+
+    assert overrides is None
+    assert error == "host_registration_sha256_mismatch"
+    assert error.startswith("host_")
+
+
+def test_no_host_root_keeps_today_behaviour(
+    tmp_path: Path, linux_platform: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(
+        runtime_executable_registry, "_host_registration_root", lambda: None
+    )
+
+    overrides, error = runtime_executable_registry.select_executable_overrides(
+        "opencode_cli", repo, None
+    )
+
+    assert overrides is None
+    assert error is None
+
+
 def test_select_helper_no_manifest_returns_unregistered_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
