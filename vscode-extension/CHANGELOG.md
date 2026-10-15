@@ -1,5 +1,11 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.53 — 2026-10-15
+
+### Fixed
+
+- Bundled runtime 0.12.53: semantic edit binds ranges by their first and last line and relocates shifted ranges (NF-2026-01533), refuses edge-dropping or escape-changing replacements (NF-2026-01538) and reports dropped trailing blank lines and escape drift (NF-2026-01531, NF-2026-01532); `models.json`-enabled routes such as GLM 5.3 and OmniRoute launch without a catalog row (NF-2026-01536); reviewer autolaunch no longer spins (NF-2026-01537); NeedFix card fields share one vocabulary (NF-2026-01400).
+
 ## 0.12.52 — 2026-10-15
 
 ### Fixed

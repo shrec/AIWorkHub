@@ -62,6 +62,10 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.53
+
+- Semantic edit can bind a range by its exact first and last line and relocates a slightly shifted range instead of editing the wrong lines; it refuses replacements that drop a range edge or silently change backslash escaping. Routes enabled in `models.json` (GLM 5.3 through VS Code LM, OmniRoute through OpenCode) are launchable without a catalog row.
+
 ## What's new in 0.12.52
 
 - The Manager chat no longer fails with `mcp_initialize_failed:mcp_request_timeout` on the first start after an update; OpenCode 2.x workers on Linux find their Go/OmniRoute credentials in `opencode.db`; semantic edit refuses replacements that break a file's syntax; sandbox relay errors and validation-lane refusals are reported under their real cause.

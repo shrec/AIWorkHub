@@ -6,6 +6,21 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.53] - 2026-10-15
+
+### Added
+
+- Semantic edit binds a range by its expected first and last line: a prepare that names `expected_first_line`/`expected_last_line` relocates a unique same-span match within 16 lines, or refuses `semantic_edit_anchor_mismatch` with the real lines, a numbered context and the matching candidates (NF-2026-01533, Python side).
+- Semantic edit reports trailing blank lines a range replacement drops and re-emitted lines that lost or gained a backslash level (NF-2026-01531, NF-2026-01532).
+- A repository without its own executable registration falls back to the host-scope registration (NF-2026-01250).
+
+### Fixed
+
+- Semantic edit refuses a replacement that drops the first or last line of its range (`semantic_edit_range_edge_dropped`) or changes a backslash escape level (`semantic_edit_escape_level_changed`); `allow_escape_level_change` opts in to an intended escape change (NF-2026-01538).
+- Model routes enabled in `.aiworkhub/config/models.json`, such as `vscode_lm` GLM 5.3 or an OmniRoute OpenCode route, are published as launch identities even without a workforce catalog row (NF-2026-01536).
+- Dependency autolaunch no longer relaunches reviewer cards in a spin (NF-2026-01537).
+- NeedFix card priority, risk and difficulty are validated against one vocabulary (NF-2026-01400).
+
 ## [0.12.52] - 2026-10-15
 
 ### Fixed
