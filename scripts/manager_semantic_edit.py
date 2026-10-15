@@ -48,6 +48,22 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="file holding the replacement text (default: read stdin)",
     )
+    parser.add_argument(
+        "--allow-escape-level-change",
+        action="store_true",
+        default=False,
+        help="allow an intended backslash escape-level change in the replacement",
+    )
+    parser.add_argument(
+        "--expected-first-line",
+        default=None,
+        help="anchor: expected content of the first line of the range",
+    )
+    parser.add_argument(
+        "--expected-last-line",
+        default=None,
+        help="anchor: expected content of the last line of the range",
+    )
     args = parser.parse_args(argv)
 
     root = Path(args.repo).resolve() if args.repo else Path.cwd().resolve()
@@ -70,21 +86,24 @@ def main(argv: list[str] | None = None) -> int:
         new = raw.replace("\r\n", "\n").replace("\r", "\n")
 
     try:
-        target = semantic_edit.prepare_line_target(
-            root,
-            path=args.path,
-            start_line=args.start,
-            end_line=args.end,
-            allowed_writes=[args.path],
-        )
-        next_text, metrics = semantic_edit_applier.replace_prepared_range(
-            root, target, new, allowed_writes=[args.path]
-        )
+        with semantic_edit.escape_level_change_allowed(args.allow_escape_level_change):
+            target = semantic_edit.prepare_line_target(
+                root,
+                path=args.path,
+                start_line=args.start,
+                end_line=args.end,
+                allowed_writes=[args.path],
+                expected_first_line=args.expected_first_line,
+                expected_last_line=args.expected_last_line,
+            )
+            next_text, metrics = semantic_edit_applier.replace_prepared_range(
+                root, target, new, allowed_writes=[args.path]
+            )
     except (OSError, semantic_edit.SemanticEditError) as exc:
-        print(json.dumps({"ok": False, "reason": str(exc)}), file=sys.stderr)
+        print(json.dumps({"ok": False, "reason": str(exc), **getattr(exc, "detail", {})}), file=sys.stderr)
         return 1
 
-    print(json.dumps({
+    receipt = {
         "ok": True,
         "schema_id": "aiworkhub.manager_semantic_edit_receipt.v1",
         "path": target.path,
@@ -95,7 +114,13 @@ def main(argv: list[str] | None = None) -> int:
         "replacement_bytes": len(new.encode("utf-8")),
         "file_bytes": len(next_text.encode("utf-8")),
         **{k: v for k, v in metrics.items() if isinstance(v, (int, float, bool, str))},
-    }, sort_keys=True))
+    }
+    if target.anchor_relocated_from is not None:
+        receipt["anchor_relocated_from"] = {
+            "start_line": target.anchor_relocated_from[0],
+            "end_line": target.anchor_relocated_from[1],
+        }
+    print(json.dumps(receipt, sort_keys=True))
     return 0
 
 

@@ -817,3 +817,70 @@ def test_a_junction_is_refused_before_resolve_can_traverse_it(tmp_path, monkeypa
             allowed_writes=["src/pkg/mod.py"],
         )
     assert str(prepared.value) == expected
+
+
+# -- NF-2026-01541: refusals carry their detail; escape opt-in; anchors -----
+
+
+def _run_manager_cli(root: Path, *cli_args: str, new_text: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(CLI), "--repo", str(root), "--path", "x.py", *cli_args],
+        input=new_text, capture_output=True, text=True,
+    )
+
+
+def test_cli_edge_drop_refusal_prints_detail_and_leaves_the_file(tmp_path):
+    root = _repo(tmp_path)
+    before = (root / "x.py").read_bytes()
+    result = _run_manager_cli(root, "--start", "2", "--end", "3", new_text="three\n")
+    assert result.returncode == 1
+    payload = json.loads(result.stderr)
+    assert payload["ok"] is False
+    assert payload["reason"].startswith("semantic_edit_range_edge_dropped:0")
+    assert payload["dropped_lines"]
+    assert (root / "x.py").read_bytes() == before
+
+
+def test_cli_escape_change_refused_without_flag_and_applied_with_flag(tmp_path):
+    root = _repo(tmp_path, 'one\nx = "a\\b"\nthree\nfour\nfive\n')
+    before = (root / "x.py").read_bytes()
+    refused = _run_manager_cli(root, "--start", "2", "--end", "2", new_text='x = "a\\\\b"\n')
+    assert refused.returncode == 1
+    assert json.loads(refused.stderr)["reason"].startswith("semantic_edit_escape_level_changed")
+    assert (root / "x.py").read_bytes() == before
+
+    applied = _run_manager_cli(
+        root, "--start", "2", "--end", "2", "--allow-escape-level-change",
+        new_text='x = "a\\\\b"\n',
+    )
+    assert applied.returncode == 0, applied.stderr
+    assert json.loads(applied.stdout)["ok"] is True
+    assert (root / "x.py").read_bytes() == b'one\nx = "a\\\\b"\nthree\nfour\nfive\n'
+
+
+def test_cli_anchors_relocate_a_shifted_range(tmp_path):
+    root = _repo(tmp_path, "zero\none\ntwo\nthree\nfour\nfive\nsix\n")
+    result = _run_manager_cli(
+        root, "--start", "1", "--end", "2",
+        "--expected-first-line", "two", "--expected-last-line", "three",
+        new_text="TWO\nTHREE\n",
+    )
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads(result.stdout)
+    assert receipt["ok"] is True
+    assert (receipt["start_line"], receipt["end_line"]) == (3, 4)
+    assert receipt["anchor_relocated_from"] == {"start_line": 1, "end_line": 2}
+    assert (root / "x.py").read_text(encoding="utf-8") == "zero\none\nTWO\nTHREE\nfour\nfive\nsix\n"
+
+
+def test_cli_mismatching_anchor_is_refused_and_leaves_the_file(tmp_path):
+    root = _repo(tmp_path)
+    before = (root / "x.py").read_bytes()
+    result = _run_manager_cli(
+        root, "--start", "2", "--end", "3",
+        "--expected-first-line", "nope", "--expected-last-line", "nope",
+        new_text="TWO\nTHREE\n",
+    )
+    assert result.returncode == 1
+    assert json.loads(result.stderr)["reason"].startswith("semantic_edit_anchor_mismatch")
+    assert (root / "x.py").read_bytes() == before
