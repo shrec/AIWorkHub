@@ -4546,6 +4546,108 @@ def _fit_response_payload(
     return payload, dropped_now
 
 
+_BODYGREP_FALLBACK_CURSOR_KINDS: tuple[str, ...] = ("token_and_line", "token_and_file")
+_BODYGREP_LITERAL_WALK_MAX_PAGES = 8
+_BODYGREP_LITERAL_WALK_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _bodygrep_resume_page(
+    sg_module: Any,
+    query_repo: Path,
+    query: str,
+    budget: int,
+    scope: str | None,
+    cursor: str | None,
+) -> tuple[dict[str, Any], str]:
+    """One bodygrep page; a token-fallback cursor resumes under its own kind.
+
+    The cursor digest binds the match kind that minted it, so a cursor the
+    literal decoder refuses is retried against each fallback kind.  A cursor
+    no kind accepts keeps the engine's ``invalid_cursor``.  Returns the page
+    and the fallback step label (``""`` for a literal page).
+    """
+
+    engine_error = sg_module.SourceGraphError
+    try:
+        return (
+            sg_module.bodygrep_query(
+                query_repo, query, budget, target=scope, cursor=cursor,
+            ),
+            "",
+        )
+    except engine_error as exc:
+        if not cursor or str(exc) != "invalid_cursor":
+            raise
+    for kind in _BODYGREP_FALLBACK_CURSOR_KINDS:
+        try:
+            page = sg_module.bodygrep_query(
+                query_repo, query, budget, target=scope, cursor=cursor,
+                match_kind=kind,
+            )
+        except engine_error:
+            continue
+        step = f"bodygrep_{kind}"
+        if isinstance(page, dict):
+            page["retrieval_reason"] = f"{SOURCE_GRAPH_FALLBACK_REASON_PREFIX}{step}"
+        return page, step
+    raise engine_error("invalid_cursor")
+
+
+def _bodygrep_literal_walk(
+    sg_module: Any,
+    query_repo: Path,
+    query: str,
+    budget: int,
+    scope: str | None,
+    first_page: Any,
+) -> tuple[Any, str]:
+    """Follow a literal zero page's cursor until a page has hits or the walk ends.
+
+    A page capped by the scan byte budget is not proof of absence, so a zero
+    page that still carries ``next_cursor`` keeps scanning server-side (same
+    term, target and budget) up to ``_BODYGREP_LITERAL_WALK_MAX_PAGES`` pages or
+    ``_BODYGREP_LITERAL_WALK_MAX_BYTES`` scanned.  Pages are never merged: the
+    first page with hits is returned with its own ``next_cursor``.  Returns
+    ``(payload, state)`` where state is ``"resumed"`` (hits found on a later
+    page), ``"incomplete"`` (bound reached; the last zero page and its cursor
+    are returned) or ``""`` (nothing to walk, or the walk completed with zero
+    hits so the token fallback may run).
+
+    The walk stays sequential: the measured full scan is ~1.1 s per 16 MiB
+    page, each page's cursor depends on the previous page, and the bound keeps
+    the worst case near 5 s.
+    """
+
+    page = first_page
+    if (
+        not isinstance(page, dict)
+        or page.get("match_kind")
+        or _json_hit_count(page) > 0
+        or not page.get("next_cursor")
+    ):
+        return page, ""
+    pages = 1
+    scanned = int(page.get("bytes_scanned") or 0)
+    while not _json_hit_count(page) and page.get("next_cursor"):
+        if (
+            pages >= _BODYGREP_LITERAL_WALK_MAX_PAGES
+            or scanned >= _BODYGREP_LITERAL_WALK_MAX_BYTES
+        ):
+            page["retrieval_reason"] = "bodygrep_literal_scan_incomplete"
+            return page, "incomplete"
+        page = sg_module.bodygrep_query(
+            query_repo, query, budget, target=scope, cursor=str(page["next_cursor"]),
+        )
+        pages += 1
+        scanned += int(page.get("bytes_scanned") or 0) if isinstance(page, dict) else 0
+        if not isinstance(page, dict):
+            return page, ""
+    if _json_hit_count(page) > 0:
+        page["retrieval_reason"] = f"bodygrep_literal_resumed:{pages}"
+        return page, "resumed"
+    return page, ""
+
+
 def _source_graph_zero_hit_fallback(
     ctx: WorkerToolContext,
     sg_module: Any,
@@ -5111,6 +5213,8 @@ def source_graph_query(
             "provider_token_savings_measured": False,
         }
 
+    literal_walk_state = ""
+    resumed_fallback_step = ""
     try:
         with _with_source_graph_db(_source_graph_mod, binding.db_path):
             if mode == "bundle":
@@ -5145,8 +5249,11 @@ def source_graph_query(
                     _source_graph_mod.body_query, query_repo, scope, bounded_query, budget,
                 )
             elif mode == "bodygrep":
-                payload = _source_graph_mod.bodygrep_query(
-                    query_repo, bounded_query, budget, target=scope, cursor=cursor,
+                payload, resumed_fallback_step = _bodygrep_resume_page(
+                    _source_graph_mod, query_repo, bounded_query, budget, scope, cursor,
+                )
+                payload, literal_walk_state = _bodygrep_literal_walk(
+                    _source_graph_mod, query_repo, bounded_query, budget, scope, payload,
                 )
             elif mode == "impact":
                 payload = _source_graph_mod.impact(query_repo, bounded_query, budget)
@@ -5276,7 +5383,7 @@ def source_graph_query(
     # Server-side, single-turn zero-hit cascade (source_graph-4/5): the next
     # expression is deterministic, so the server runs it instead of handing
     # back a bare zero and waiting for the model to retype the query.
-    fallback_step = ""
+    fallback_step = resumed_fallback_step
     if (
         mode in SOURCE_GRAPH_FALLBACK_MODES
         and not overlay_applied
@@ -5286,6 +5393,9 @@ def source_graph_query(
         # zero-hit page with a from-scratch fallback would restart at the
         # alphabetical beginning and drop the files this page has not reached.
         and not (mode == "bodygrep" and cursor)
+        # A bounded literal walk that stopped early has NOT proven absence; the
+        # token fallback runs only once the literal walk completed with zero hits.
+        and literal_walk_state != "incomplete"
     ):
         fallback = _source_graph_zero_hit_fallback(
             ctx, _source_graph_mod, query_repo,
