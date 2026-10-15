@@ -51,10 +51,16 @@ class ModelSettingsError(RuntimeError):
 def opencode_identity_default_enabled(model: str) -> bool:
     """Return whether an OpenCode identity is launch-eligible by default."""
 
-    identity = str(model or "").strip()
+    identity = str(model or "")
+    # A padded identity is not the one an exact override names, so it never
+    # inherits a default that would bypass that override.
+    if identity != identity.strip():
+        return False
     provider, sep, remainder = identity.partition("/")
     if not sep or not provider or not remainder or "/" in remainder:
         return False
+    if provider == "opencode-go":
+        return True
     return provider == "opencode" and remainder.endswith("-free") and remainder != "-free"
 
 

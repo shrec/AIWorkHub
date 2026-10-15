@@ -13,6 +13,7 @@ import os
 import re
 import stat
 import subprocess
+import threading
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -716,11 +717,32 @@ def _vouched_sandbox_block(block: dict[str, Any]) -> dict[str, Any]:
     return block
 
 
-def _list_opencode_models(executable: str | None) -> list[str]:
-    """Bound ``opencode models`` discovery; listing is not round-trip evidence."""
+_OPENCODE_PROBE_TIMEOUT_SECONDS = 5
+_OPENCODE_PROBE_RETRY_TIMEOUT_SECONDS = 15
+_OPENCODE_PROBE_MAX_PAYLOAD_BYTES = 64 * 1024
+_OPENCODE_PROBE_LOCK = threading.Lock()
+_OPENCODE_LAST_GOOD_MODELS: dict[str, list[str]] = {}
+_OPENCODE_LAST_PROBE: dict[str, dict[str, Any]] = {}
+# Per-thread copy of the record the calling thread's own probe produced, so
+# _provider_status never reports a concurrent probe of the same executable.
+_OPENCODE_PROBE_LOCAL = threading.local()
 
-    if not isinstance(executable, str) or not executable.strip():
-        return []
+
+def _opencode_probe_record(executable: str | None) -> dict[str, Any] | None:
+    """Return a copy of the last ``opencode models`` probe outcome, if any."""
+
+    if not isinstance(executable, str):
+        return None
+    with _OPENCODE_PROBE_LOCK:
+        record = _OPENCODE_LAST_PROBE.get(executable)
+        return dict(record) if record is not None else None
+
+
+def _opencode_models_probe_once(
+    executable: str, timeout: int
+) -> tuple[list[str], str | None]:
+    """Run ``opencode models`` once; return (rows, failure_reason)."""
+
     from . import workforce_catalog
 
     try:
@@ -728,16 +750,59 @@ def _list_opencode_models(executable: str | None) -> list[str]:
             [executable, "models"],
             check=False,
             capture_output=True,
-            timeout=5,
+            timeout=timeout,
         )
-    except (OSError, subprocess.TimeoutExpired, ValueError):
-        return []
+    except subprocess.TimeoutExpired:
+        return [], "timeout"
+    except OSError:
+        return [], "oserror"
+    except ValueError:
+        return [], "invalid"
     payload = completed.stdout or b""
     if not payload:
         payload = completed.stderr or b""
-    if len(payload) > 64 * 1024:
+    if len(payload) > _OPENCODE_PROBE_MAX_PAYLOAD_BYTES:
+        return [], "oversized"
+    rows = workforce_catalog.parse_opencode_models_output(payload)
+    if not rows:
+        returncode = getattr(completed, "returncode", 0)
+        if returncode:
+            return [], f"exit_{returncode}"
+        return [], "empty"
+    return rows, None
+
+
+def _list_opencode_models(executable: str | None) -> list[str]:
+    """Bound ``opencode models`` discovery; listing is not round-trip evidence.
+
+    A timed-out probe retries once with a longer timeout; any failed probe serves
+    the last-known-good list for the executable and records a named reason.
+    """
+
+    if not isinstance(executable, str) or not executable.strip():
         return []
-    return workforce_catalog.parse_opencode_models_output(payload)
+    rows, reason = _opencode_models_probe_once(
+        executable, _OPENCODE_PROBE_TIMEOUT_SECONDS
+    )
+    if reason == "timeout":
+        rows, reason = _opencode_models_probe_once(
+            executable, _OPENCODE_PROBE_RETRY_TIMEOUT_SECONDS
+        )
+    with _OPENCODE_PROBE_LOCK:
+        if reason is None:
+            _OPENCODE_LAST_GOOD_MODELS[executable] = list(rows)
+            record: dict[str, Any] = {"state": "ok", "count": len(rows)}
+            served = list(rows)
+        else:
+            served = list(_OPENCODE_LAST_GOOD_MODELS.get(executable, []))
+            record = {
+                "state": "failed",
+                "reason": reason,
+                "served_last_known_good": bool(served),
+            }
+        _OPENCODE_LAST_PROBE[executable] = record
+    _OPENCODE_PROBE_LOCAL.record = dict(record)
+    return served
 
 
 def _provider_status(
@@ -937,7 +1002,12 @@ def _provider_status(
         and result["installed"]
         and "observed_models" not in result
     ):
+        _OPENCODE_PROBE_LOCAL.record = None
         listed = _list_opencode_models(resolution.executable)
+        # The record this thread's own call published, never a concurrent one.
+        probe_record = getattr(_OPENCODE_PROBE_LOCAL, "record", None)
+        if probe_record is not None:
+            result["opencode_models_probe"] = dict(probe_record)
         provider_observed_models = listed[:128]
         eligible_observed_models = [
             value
