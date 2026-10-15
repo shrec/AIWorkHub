@@ -290,7 +290,10 @@ def test_escape_level_lost_is_reported() -> None:
     new = r'x = "\n"' + "\n"
     new_text, metrics = semantic_edit.apply_line_ranges(
         old,
-        [{"start_line": 1, "end_line": 1, "new": new}],
+        [{
+            "start_line": 1, "end_line": 1, "new": new,
+            "allow_escape_level_change": True,
+        }],
     )
     assert new_text == new
     assert metrics["escape_level_changed_lines"] == [
@@ -303,7 +306,10 @@ def test_escape_level_gained_is_reported() -> None:
     new = r'x = "\\n"' + "\n"
     new_text, metrics = semantic_edit.apply_line_ranges(
         old,
-        [{"start_line": 1, "end_line": 1, "new": new}],
+        [{
+            "start_line": 1, "end_line": 1, "new": new,
+            "allow_escape_level_change": True,
+        }],
     )
     assert new_text == new
     assert metrics["escape_level_changed_lines"] == [

@@ -1234,13 +1234,19 @@ def aiworkhub_manager_semantic_edit_apply(
     target_id: str,
     new: str,
     idempotency_key: str,
+    allow_escape_level_change: bool = False,
 ) -> dict[str, Any]:
-    """MANAGER EDIT: replace exactly one prepared, hash-bound range."""
+    """MANAGER EDIT: replace exactly one prepared, hash-bound range.
+
+    `new` replaces the WHOLE prepared range; re-emit every line you keep.
+    allow_escape_level_change: true only for an intentional regex/escape fix.
+    """
 
     return manager_ai_tools.semantic_edit_apply(
         target_id=target_id,
         new=new,
         idempotency_key=idempotency_key,
+        allow_escape_level_change=allow_escape_level_change,
     )
 
 

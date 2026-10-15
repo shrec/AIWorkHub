@@ -12748,7 +12748,12 @@ class ProcessManager:
             target_id, new = tool_input.get("target_id", ""), tool_input.get("new")
             key = tool_input.get("idempotency_key") or "derived:" + hashlib.sha256(
                 f"{target_id}\0{new}".encode("utf-8")).hexdigest()
-            return session.apply(target_id=target_id, new=new, idempotency_key=key)
+            return session.apply(
+                target_id=target_id, new=new, idempotency_key=key,
+                allow_escape_level_change=tool_input.get(
+                    "allow_escape_level_change", False
+                ),
+            )
         if tool_name == "aiworkhub_manager_source_graph_query":
             identity = replace(ctx, provider_call_id="", provenance="")
             cached = self._vscode_lm_semantic_sessions.get(request_id)

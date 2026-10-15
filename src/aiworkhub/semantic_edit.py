@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import tempfile
 from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Iterator
@@ -36,6 +37,23 @@ MAX_FRAGMENT_BYTES = 256 * 1024
 MAX_REPLACEMENT_BYTES = 2 * 1024 * 1024
 MAX_RANGES_PER_FILE = 256
 _BACKSLASH = "\\"
+_ESCAPE_LEVEL_CHANGE_DEFAULT: ContextVar[bool] = ContextVar(
+    "aiworkhub_semantic_edit_allow_escape_level_change", default=False
+)
+
+
+@contextmanager
+def escape_level_change_allowed(allowed: bool) -> Iterator[None]:
+    """Default ``allow_escape_level_change`` for ranges that do not set it.
+
+    The applier layer builds the range item itself, so an apply surface that
+    received the caller's flag scopes it here instead of widening that layer.
+    """
+    token = _ESCAPE_LEVEL_CHANGE_DEFAULT.set(allowed)
+    try:
+        yield
+    finally:
+        _ESCAPE_LEVEL_CHANGE_DEFAULT.reset(token)
 
 
 class SemanticEditError(RuntimeError):
@@ -54,6 +72,49 @@ class SemanticEditAnchorMismatch(SemanticEditError):
     def __init__(self, path: str, detail: dict[str, Any]) -> None:
         super().__init__(f"semantic_edit_anchor_mismatch:{path}")
         self.detail = detail
+
+
+class SemanticEditEdgeDropped(SemanticEditError):
+    """``new`` skipped the head or tail of the prepared range it replaces.
+
+    ``new`` replaces the WHOLE prepared range, so an old line above (head) or
+    below (tail) the first/last line the model re-emitted is deleted.
+    ``str()`` is ``semantic_edit_range_edge_dropped:<index>:<head|tail>``;
+    ``detail`` carries the numbered dropped lines and the next call.
+    """
+
+    def __init__(
+        self, index: int, edge: str, dropped_lines: list[str], dropped_count: int
+    ) -> None:
+        super().__init__(f"semantic_edit_range_edge_dropped:{index}:{edge}")
+        self.detail = {
+            "range_index": index,
+            "edge": edge,
+            "dropped_lines": dropped_lines,
+            "dropped_line_count": dropped_count,
+            "next_call": (
+                "`new` replaces the whole prepared range, so re-emit the"
+                " dropped lines in `new`, or prepare only the lines you mean"
+                " to delete and apply new=''. To insert, prepare the line you"
+                " insert after and emit it first."
+            ),
+        }
+
+
+class SemanticEditEscapeLevelChanged(SemanticEditError):
+    """A re-emitted line came back with a different backslash level."""
+
+    def __init__(self, index: int, lines: list[dict[str, Any]]) -> None:
+        super().__init__(f"semantic_edit_escape_level_changed:{index}")
+        self.detail = {
+            "range_index": index,
+            "lines": lines,
+            "next_call": (
+                "Re-emit those lines with the original backslashes. For an"
+                " intentional regex/escape fix, pass allow_escape_level_change"
+                "=true on apply."
+            ),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -509,6 +570,55 @@ def _escape_level_changes(old: str, new: str) -> list[tuple[int, str]]:
     return changes
 
 
+_EDGE_DROP_LISTED_MAX = 50
+_EDGE_DROP_LINE_CHARS = 200
+
+
+def _edge_dropped_indexes(old_c: list[str], new_c: list[str]) -> list[int]:
+    """Old indexes the head of ``new`` skipped over, or ``[]``.
+
+    ``new`` skips the head when its first non-blank line is not the first
+    non-blank old line but equals a later old line ``k``: the model started
+    inside the range, so every old line above ``k`` is deleted.  Only lines
+    whose text appears nowhere in ``new`` count as dropped.
+    """
+    first_new = next((text for text in new_c if text), None)
+    first_old = next((i for i, text in enumerate(old_c) if text), None)
+    if first_new is None or first_old is None or first_new == old_c[first_old]:
+        return []
+    k = next(
+        (i for i in range(first_old + 1, len(old_c)) if old_c[i] == first_new), None
+    )
+    if k is None:
+        return []
+    kept = set(new_c)
+    return [i for i in range(k) if old_c[i] and old_c[i] not in kept]
+
+
+def _raise_if_edge_dropped(index: int, start: int, old: str, new: str) -> None:
+    old_raw = [_line_content(line) for line in _split_lines(old)]
+    old_c = [line.strip() for line in old_raw]
+    new_c = [_line_content(line).strip() for line in _split_lines(new)]
+    last = len(old_c) - 1
+    for edge in ("head", "tail"):
+        if edge == "head":
+            dropped = _edge_dropped_indexes(old_c, new_c)
+        else:
+            dropped = sorted(
+                last - i for i in _edge_dropped_indexes(old_c[::-1], new_c[::-1])
+            )
+        if dropped:
+            raise SemanticEditEdgeDropped(
+                index,
+                edge,
+                [
+                    f"{start + i}\t{old_raw[i][:_EDGE_DROP_LINE_CHARS]}"
+                    for i in dropped[:_EDGE_DROP_LISTED_MAX]
+                ],
+                len(dropped),
+            )
+
+
 def apply_line_ranges(
     current_text: str,
     ranges: list[dict[str, Any]],
@@ -571,7 +681,22 @@ def apply_line_ranges(
                     "new_trailing_blank_lines": new_blank,
                 }
             )
-        for _offset, _direction in _escape_level_changes(old, replacement):
+        _raise_if_edge_dropped(index, start, old, replacement)
+        range_escape_changes = _escape_level_changes(old, replacement)
+        allow_escape_level_change = item.get(
+            "allow_escape_level_change", _ESCAPE_LEVEL_CHANGE_DEFAULT.get()
+        )
+        if not isinstance(allow_escape_level_change, bool):
+            raise SemanticEditError(f"semantic_edit_escape_policy_invalid:{index}")
+        if range_escape_changes and not allow_escape_level_change:
+            raise SemanticEditEscapeLevelChanged(
+                index,
+                [
+                    {"old_line": start + _offset, "direction": _direction}
+                    for _offset, _direction in range_escape_changes
+                ],
+            )
+        for _offset, _direction in range_escape_changes:
             escape_level_changed_lines.append(
                 {"range_index": index, "old_line": start + _offset, "direction": _direction}
             )

@@ -7283,7 +7283,8 @@ class WorkerSemanticEditSession:
         return {"ok": True, "tool": tool, **receipt}
 
     def apply(
-        self, *, target_id: str, new: str, idempotency_key: str
+        self, *, target_id: str, new: str, idempotency_key: str,
+        allow_escape_level_change: bool = False,
     ) -> dict[str, Any]:
         tool = "semantic_edit_apply"
         # NF-2026-01373: name every bad field and the exact valid call, or an
@@ -7310,8 +7311,17 @@ class WorkerSemanticEditSession:
                     "Call aiworkhub_worker_semantic_edit_apply with exactly "
                     "{target_id: <target_id returned by prepare>, new: "
                     "<replacement text>, idempotency_key: <non-empty string of "
-                    "at most 256 UTF-8 bytes, unique to this edit>} and no "
-                    "other fields."
+                    "at most 256 UTF-8 bytes, unique to this edit>} and, only "
+                    "for an intentional escape fix, allow_escape_level_change: "
+                    "true."
+                ),
+            )
+        if not isinstance(allow_escape_level_change, bool):
+            return _violation(
+                self.ctx, tool, "semantic_edit_escape_policy_invalid:0",
+                next_call=(
+                    "allow_escape_level_change must be the boolean true or "
+                    "false; omit it unless the backslash change is intended."
                 ),
             )
         new_sha256 = hashlib.sha256(new.encode("utf-8")).hexdigest()
@@ -7336,14 +7346,19 @@ class WorkerSemanticEditSession:
         if target is None:
             return _violation(self.ctx, tool, "semantic_edit_target_unknown")
         try:
-            next_text, metrics = semantic_edit_applier.replace_prepared_range(
-                self.ctx.repo,
-                target,
-                new,
-                allowed_writes=self.ctx.allowed_writes,
-            )
+            with semantic_edit.escape_level_change_allowed(allow_escape_level_change):
+                next_text, metrics = semantic_edit_applier.replace_prepared_range(
+                    self.ctx.repo,
+                    target,
+                    new,
+                    allowed_writes=self.ctx.allowed_writes,
+                )
         except (OSError, semantic_edit.SemanticEditError) as exc:
-            return _violation(self.ctx, tool, str(exc))
+            # The edge-drop and escape-level refusals name the offending lines
+            # and the next call; the file was not written.
+            return _violation(
+                self.ctx, tool, str(exc), **getattr(exc, "detail", {})
+            )
         next_bytes = next_text.encode("utf-8")
         receipt = {
             "ok": True,
@@ -9006,6 +9021,7 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
         and ``delivered_by``, which is all apply needs. Pass
         include_fragment=true to force the text.
         expected_first_line/expected_last_line: the exact text of the first/last line to replace.
+        apply's `new` replaces the WHOLE prepared range: prepare only lines you change or delete.
         """
         return semantic_edits.prepare(
             file_path=file_path, start_line=start_line, end_line=end_line,
@@ -9017,10 +9033,18 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
     @mcp.tool(name="aiworkhub_worker_semantic_edit_apply")
     def _semantic_edit_apply(
         target_id: str, new: str, idempotency_key: str,
+        allow_escape_level_change: bool = False,
     ) -> dict[str, Any]:
-        """Apply replacement-only code to an immutable prepared target."""
+        """Apply replacement-only code to an immutable prepared target.
+
+        `new` replaces the WHOLE prepared range; re-emit every line you keep;
+        to insert, prepare the line you insert after and emit it first.
+        allow_escape_level_change: true only for an intentional regex/escape
+        fix; otherwise a re-emitted line whose backslash level changed is refused.
+        """
         return semantic_edits.apply(
-            target_id=target_id, new=new, idempotency_key=idempotency_key
+            target_id=target_id, new=new, idempotency_key=idempotency_key,
+            allow_escape_level_change=allow_escape_level_change,
         )
 
     @mcp.tool(name="aiworkhub_worker_semantic_edit_exception_declare")

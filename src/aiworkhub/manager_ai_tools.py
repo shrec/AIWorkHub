@@ -856,7 +856,8 @@ def semantic_edit_prepare(
 
 
 def semantic_edit_apply(
-    *, target_id: str, new: str, idempotency_key: str
+    *, target_id: str, new: str, idempotency_key: str,
+    allow_escape_level_change: bool = False,
 ) -> dict[str, Any]:
     """MANAGER: replace exactly the prepared range, refusing a moved file."""
 
@@ -877,6 +878,7 @@ def semantic_edit_apply(
     return _manager_edit_result(
         session.apply(
             target_id=target_id, new=new, idempotency_key=idempotency_key,
+            allow_escape_level_change=allow_escape_level_change,
         ),
         manager,
     )
