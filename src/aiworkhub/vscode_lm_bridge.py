@@ -61,6 +61,7 @@ TERMINAL_DECISION_READ_RETRY_SECONDS = 0.01
 BRIDGE_ROOT_ENV = "AIWORKHUB_VSCODE_LM_BRIDGE_ROOT"
 DEFAULT_ROOT_REL = Path(".aiworkhub") / "vscode_lm_bridge"
 HOST_TTL_SECONDS = 45
+HOST_PRUNE_SECONDS = 24 * 3600
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
 MAX_PROMPT_BYTES = 6 * 1024 * 1024
 ATOMIC_JSON_MAX_ATTEMPTS = 2
@@ -486,13 +487,29 @@ def bridge_readiness(
     hosts_dir = bridge_root() / "hosts" / repo_id
     now = time.time() if now is None else float(now)
     candidates: list[dict[str, Any]] = []
+    # Freshest heartbeats first: dead-window files must not crowd a live one out of the cap.
+    measured: list[tuple[Path, os.stat_result]] = []
     try:
-        paths = list(hosts_dir.glob("*.json"))
+        for path in hosts_dir.glob("*.json"):
+            try:
+                measured.append((path, path.stat()))
+            except OSError:
+                continue
     except OSError:
-        paths = []
-    for path in paths[:32]:
+        pass
+    measured.sort(key=lambda pair: pair[1].st_mtime, reverse=True)
+    live_pairs: list[tuple[Path, os.stat_result]] = []
+    for path, stat_result in measured:
+        if now - stat_result.st_mtime > HOST_PRUNE_SECONDS:
+            try:
+                if stat_owned_by_current_user(stat_result):
+                    path.unlink()
+            except OSError:
+                pass
+            continue
+        live_pairs.append((path, stat_result))
+    for path, stat_result in live_pairs[:32]:
         try:
-            stat_result = path.stat()
             if (
                 not stat_owned_by_current_user(stat_result)
                 or stat_result.st_size > 256 * 1024
