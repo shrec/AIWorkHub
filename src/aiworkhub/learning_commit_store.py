@@ -184,7 +184,12 @@ def _commit_payload(commit: LearningCommit) -> dict[str, Any]:
 
 
 def _canonical_acceptance_reference(card: dict[str, Any], request_id: str) -> str:
-    if task_store.canonical_status(card) != "finished":
+    status = task_store.canonical_status(card)
+    if status != "finished" and not (
+        status == "archived"
+        and str(card.get("accepted_request_id") or "")
+        and isinstance(card.get("accept_evidence"), dict)
+    ):
         raise LearningCommitStoreError("learning_commit_task_not_manager_accepted")
     if str(card.get("accepted_request_id") or "") != request_id:
         raise LearningCommitStoreError("learning_commit_request_identity_mismatch")

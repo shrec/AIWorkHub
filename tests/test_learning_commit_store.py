@@ -1749,3 +1749,73 @@ def test_the_reason_vocabulary_is_matched_exactly_while_the_kind_is_folded(
             disposition="no_new_lesson",
             reason="MECHANICAL_CHANGE_ONLY",
         )
+
+def _archive_card(root: Path, task_id: str) -> None:
+    ok, state = task_store.archive_task(root, task_id)
+    assert ok, state
+
+
+def _archived_accepted_commit(
+    task_id: str, request_id: str, idempotency_key: str
+) -> dict:
+    return manager_ai_tools.learning_commit(
+        task_id=task_id,
+        request_id=request_id,
+        repo_area="src/aiworkhub",
+        outcome="accepted",
+        evidence_ids=["file:tests/test_learning_commit_store.py"],
+        idempotency_key=idempotency_key,
+        provenance="archived acceptance regression test",
+        root_cause_candidate="a stale result bypassed canonical identity",
+        invariant_candidate="only exact manager-accepted evidence may become durable knowledge",
+        lesson_candidate="gate learning promotion on the accepted request receipt",
+        edge_candidates=[{
+            "source": "stale result",
+            "target": "canonical acceptance gate",
+            "relation": "PREVENTED_BY",
+        }],
+        promote_ai_memory=True,
+        promote_context_graph=True,
+        promote_kb=True,
+    )
+
+
+def test_archived_accepted_card_still_commits(tmp_path, monkeypatch):
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+    _archive_card(root, task_id)
+    assert task_store.canonical_status(task_store.get_task(root, task_id)) == "archived"
+
+    result = _archived_accepted_commit(
+        task_id, request_id, "learning-manager-archived-accepted-0001"
+    )
+    assert result["ok"] is True, result
+    assert result["state"] == "completed"
+
+
+def test_archived_never_accepted_card_is_refused(tmp_path, monkeypatch):
+    root = _setup_repo(tmp_path, monkeypatch)
+    task_id = "TASK-LEARNING-ARCHIVED-NEVER"
+    request_id = "request-learning-archived-never-0001"
+    _review_card(
+        root, task_id=task_id, request_id=request_id, substatus="validation_failed"
+    )
+    _archive_card(root, task_id)
+    assert task_store.canonical_status(task_store.get_task(root, task_id)) == "archived"
+
+    result = _archived_accepted_commit(
+        task_id, request_id, "learning-manager-archived-never-0001"
+    )
+    assert result["ok"] is False
+    assert result["error"] == "learning_commit_task_not_manager_accepted"
+
+
+def test_archived_accepted_card_rejects_mismatched_request(tmp_path, monkeypatch):
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+    _archive_card(root, task_id)
+    assert task_store.canonical_status(task_store.get_task(root, task_id)) == "archived"
+
+    result = _archived_accepted_commit(
+        task_id, request_id + "-wrong", "learning-manager-archived-mismatch-0001"
+    )
+    assert result["ok"] is False
+    assert result["error"] == "learning_commit_request_identity_mismatch"
