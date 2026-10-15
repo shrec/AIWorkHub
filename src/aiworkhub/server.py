@@ -5061,12 +5061,16 @@ def aiworkhub_source_graph_stop() -> dict[str, Any]:
 
 
 @mcp.tool()
-def aiworkhub_claude_callback_wait(timeout_seconds: int = 240) -> dict[str, Any]:
+def aiworkhub_claude_callback_wait(
+    timeout_seconds: int = 240, ack_batch_id: str = "", ack_lease_id: str = ""
+) -> dict[str, Any]:
     """BLOCKING READ/CLAIM: wait for a callback for this verified Claude
-    Code manager session.  Call ``aiworkhub_claude_callback_ack`` immediately
-    after receipt; an unacknowledged lease is retried, never lost."""
+    Code manager session.  Acknowledge the previous batch by passing its
+    ``batch_id``/``lease_id`` as ``ack_batch_id``/``ack_lease_id`` here, or
+    call ``aiworkhub_claude_callback_ack``; an unacknowledged lease is
+    retried, never lost."""
 
-    return core.claude_callback_wait(timeout_seconds)
+    return core.claude_callback_wait(timeout_seconds, ack_batch_id, ack_lease_id)
 
 
 @mcp.tool()
