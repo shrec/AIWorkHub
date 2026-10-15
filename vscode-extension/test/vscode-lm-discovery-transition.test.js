@@ -38,6 +38,7 @@ async function main() {
         staged = true;
         next = { name: "aiworkhub_manager_semantic_edit_stage", input: {
           operation: "replace_range", file_path: "src/app.js", start_line: 1, end_line: 1,
+          expected_first_line: "const broken = false;", expected_last_line: "const broken = false;",
           new: "const fixed = true;\n",
         } };
       } else {
@@ -62,7 +63,8 @@ async function main() {
   }, undefined, async (call) => {
     if (call.name === "aiworkhub_worker_semantic_edit_prepare") {
       semanticCalls.push(call);
-      assert.deepEqual(call.input, { file_path: "src/app.js", start_line: 1, end_line: 1 });
+      assert.deepEqual(call.input, { file_path: "src/app.js", start_line: 1, end_line: 1,
+        expected_first_line: "const broken = false;", expected_last_line: "const broken = false;" });
       return { ok: true, target_id: "discovery-fixture-target", path: "src/app.js",
         start_line: 1, end_line: 1, current_sha256: "a".repeat(64), fragment_sha256: "f".repeat(64) };
     }

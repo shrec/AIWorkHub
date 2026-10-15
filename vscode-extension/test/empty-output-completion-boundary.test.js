@@ -39,7 +39,8 @@ const request = (requiredOutputs = []) => ({
 });
 const create = { operation: "create", file_path: "tests/new.py", content: "def test_wiring():\n    assert True\n" };
 
-const edit = { operation: "replace_range", file_path: "src/app.py", start_line: 2, end_line: 2, new: "run_feature()" };
+const edit = { operation: "replace_range", file_path: "src/app.py", start_line: 2, end_line: 2,
+  expected_first_line: "    return 1", expected_last_line: "    return 1", new: "run_feature()" };
 // Request-local transport fixture only: typed receipts exercise bridge wiring,
 // not a real worker actor or production HMAC acceptance.
 function authenticatedEditor(req, sourceGraph = async () => ({ ok: true })) {

@@ -207,16 +207,26 @@ const schemaMatches = (schema, value) => {
 assert.strictEqual(schemaMatches(stageTool.inputSchema, {
   operation: "create", file_path: "new.js", content: "export {};\n",
 }), true);
-assert.strictEqual(schemaMatches(stageTool.inputSchema, {
-  operation: "replace_range", file_path: "old.js", start_line: 1, end_line: 1, new: "export {};",
-}), true);
-for (const invalidStageInput of [
-  { operation: "create", file_path: "new.js" },
-  { operation: "replace_range", file_path: "old.js", start_line: 1, end_line: 1 },
-  { operation: "move", file_path: "old.js", start_line: 1, end_line: 1, new: "x" },
-  { operation: "create", file_path: "new.js", content: "x", start_line: 1 },
-  { operation: "replace_range", file_path: "old.js", start_line: 1, end_line: 1, new: "x", content: "y" },
-]) assert.strictEqual(schemaMatches(stageTool.inputSchema, invalidStageInput), false);
+{
+  const anchoredStage = {
+    operation: "replace_range", file_path: "old.js", start_line: 1, end_line: 1,
+    expected_first_line: "export const a = 1;", expected_last_line: "export const a = 1;", new: "export {};",
+  };
+  const stageWithout = (omitted) => Object.fromEntries(Object.entries(anchoredStage).filter(([key]) => key !== omitted));
+  assert.strictEqual(schemaMatches(stageTool.inputSchema, anchoredStage), true);
+  for (const invalidStageInput of [
+    { operation: "create", file_path: "new.js" },
+    stageWithout("new"),
+    stageWithout("expected_first_line"),
+    stageWithout("expected_last_line"),
+    { ...anchoredStage, expected_first_line: 1 },
+    { ...anchoredStage, expected_last_line: null },
+    { operation: "move", file_path: "old.js", start_line: 1, end_line: 1, new: "x" },
+    { operation: "create", file_path: "new.js", content: "x", start_line: 1 },
+    { operation: "create", file_path: "new.js", content: "x", expected_first_line: "x" },
+    { ...anchoredStage, content: "y" },
+  ]) assert.strictEqual(schemaMatches(stageTool.inputSchema, invalidStageInput), false);
+}
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_worker_session_current_state"));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_worker_ai_memory_search"));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_worker_kb_search"));
@@ -927,6 +937,7 @@ async function textProtocolChecks() {
   const editContract = {
     "src/app.py": { action: "edit", current_sha256: "a".repeat(64), line_count: 2, parent_existed: true },
   };
+  const appAnchors = { expected_first_line: "return 1", expected_last_line: "return 1" };
   const staleV3 = JSON.stringify({
     schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
     summary: "stale v3",
@@ -973,6 +984,7 @@ async function textProtocolChecks() {
         file_path: "src/app.py",
         start_line: 2,
         end_line: 2,
+        ...appAnchors,
         new: "return 2",
       },
     }),
@@ -1048,6 +1060,7 @@ async function textProtocolChecks() {
     file_path: "src/app.py",
     start_line: 2,
     end_line: 2,
+    ...appAnchors,
     new: "return 4",
   })).ok, true);
   const rejectedOverlap = await atomicCollector.stage({
@@ -1055,6 +1068,8 @@ async function textProtocolChecks() {
     file_path: "src/app.py",
     start_line: 1,
     end_line: 2,
+    expected_first_line: "def app():",
+    expected_last_line: "return 1",
     new: "corrupt overlap",
   });
   assert.strictEqual(rejectedOverlap.ok, false);
@@ -1084,6 +1099,7 @@ async function textProtocolChecks() {
     file_path: "src/app.py",
     start_line: 2,
     end_line: 2,
+    ...appAnchors,
     new: "return 10",
   })).ok, true);
   const stringLineCollector = internals.createVscodeLmStagedEditCollector({
@@ -1095,6 +1111,7 @@ async function textProtocolChecks() {
     path: "src/app.py",
     start_line: "2",
     end_line: "2",
+    ...appAnchors,
     new: "return 10",
   });
   assert.strictEqual(stringLine.ok, true);
@@ -1103,6 +1120,7 @@ async function textProtocolChecks() {
     file_path: "src/app.py",
     start_line: "2.5",
     end_line: "2",
+    ...appAnchors,
     new: "no",
   });
   assert.strictEqual(fractionalLine.ok, false);
@@ -1114,12 +1132,13 @@ async function textProtocolChecks() {
   })).ok, true);
   const mixedReplaceMissingNew = await mixedCollector.stage({
     operation: "replace_range", file_path: "src/app.py", start_line: 1, end_line: 1,
+    expected_first_line: "def app():", expected_last_line: "def app():",
   });
   assert.strictEqual(mixedReplaceMissingNew.ok, false);
   assert.match(mixedReplaceMissingNew.reason, /range_invalid/);
   const mixedReplaceExtra = await mixedCollector.stage({
     operation: "replace_range", file_path: "src/app.py", start_line: 2, end_line: 2,
-    new: "replace_extra", content: "forbidden",
+    ...appAnchors, new: "replace_extra", content: "forbidden",
   });
   assert.strictEqual(mixedReplaceExtra.ok, false);
   assert.match(mixedReplaceExtra.reason, /stage_payload_extra_fields/);
@@ -1159,6 +1178,7 @@ async function textProtocolChecks() {
     file_path: "src/app.py",
     start_line: 2,
     end_line: 2,
+    ...appAnchors,
     new: "return 10",
   });
   assert.strictEqual(requiredStage1.ok, true);
@@ -1204,6 +1224,7 @@ async function textProtocolChecks() {
     file_path: "src/app.py",
     start_line: 2,
     end_line: 2,
+    ...appAnchors,
     new: "return 11",
   })).ok, true);
   const extraPathConflict = await extraPathCollector.stage({
@@ -1218,6 +1239,7 @@ async function textProtocolChecks() {
     file_path: "src/app.py",
     start_line: 2,
     end_line: 2,
+    ...appAnchors,
     new: "return 12",
   });
   assert.strictEqual(extraReplay.ok, false);
@@ -1250,6 +1272,7 @@ async function textProtocolChecks() {
     file_path: "src/app.py",
     start_line: 2,
     end_line: 2,
+    ...appAnchors,
     new: "return 13",
   })).ok, true);
   const firstIncomplete = boundedCorrectionCollector.finalize("first incomplete");
@@ -1579,6 +1602,8 @@ async function nativeProtocolChecks() {
         file_path: "src/app.py",
         start_line: 2,
         end_line: 2,
+        expected_first_line: "return 2",
+        expected_last_line: "return 2",
         new: "return 3",
       },
     }],
@@ -4183,6 +4208,7 @@ async function nf179ForcedStageRecoveryChecks() {
 async function nf723StagedFinalizationCompletenessChecks() {
   const editPath = "src/existing.js";
   const createPath = "src/created.js";
+  const editAnchors = { expected_first_line: "const existing = false;", expected_last_line: "const existing = false;" };
   const request = {
     requestId: "a".repeat(32),
     request_kind: "worker",
@@ -4221,6 +4247,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
     file_path: editPath,
     start_line: 1,
     end_line: 1,
+    ...editAnchors,
     new: "const edited = true;\n",
   });
   assert.strictEqual(partial.ok, true);
@@ -4265,6 +4292,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
           file_path: editPath,
           start_line: 1,
           end_line: 1,
+          ...editAnchors,
           new: "const edited = true;\n",
         });
       } else {
@@ -4304,7 +4332,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
         forcedEditStaged = true;
         value = toolRequest(stageName, {
           operation: "replace_range", file_path: editPath,
-          start_line: 1, end_line: 1, new: "const edited = true;\n",
+          start_line: 1, end_line: 1, ...editAnchors, new: "const edited = true;\n",
         });
       } else if (forcedEditStaged) {
         forcedCreateInput = instruction;
@@ -4345,6 +4373,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
           file_path: editPath,
           start_line: 1,
           end_line: 1,
+          ...editAnchors,
           new: "const edited = true;\n",
         });
       } else {
@@ -4392,6 +4421,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
                 file_path: editPath,
                 start_line: 1,
                 end_line: 1,
+                ...editAnchors,
                 new: "const edited = true;\n",
               },
             };
@@ -4447,6 +4477,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
               file_path: editPath,
               start_line: 1,
               end_line: 1,
+              ...editAnchors,
               new: "const edited = true;\n",
             },
           };
@@ -4495,6 +4526,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
           file_path: editPath,
           start_line: 1,
           end_line: 1,
+          ...editAnchors,
           new: "const edited = true;\n",
         });
       } else {
@@ -4527,6 +4559,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
               file_path: editPath,
               start_line: 1,
               end_line: 1,
+              ...editAnchors,
               new: "const edited = true;\n",
             },
           };
@@ -4564,6 +4597,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
           file_path: editPath,
           start_line: 1,
           end_line: 1,
+          ...editAnchors,
           new: "const edited = true;\n",
         });
       } else if (textProgressEdit && !textProgressRefusedCreate) {
@@ -4644,6 +4678,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
               file_path: editPath,
               start_line: 1,
               end_line: 1,
+              ...editAnchors,
               new: "const edited = true;\n",
             },
           };
@@ -4702,6 +4737,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
     file_path: editPath,
     start_line: 1,
     end_line: 1,
+    ...editAnchors,
     new: "const edited = true;\n",
   });
   const rejectedCreate = () => toolRequest(stageName, { operation: "create", file_path: createPath });
@@ -4778,6 +4814,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
               file_path: editPath,
               start_line: 1,
               end_line: 1,
+              ...editAnchors,
               new: "const edited = true;\n",
             },
           };
@@ -4806,6 +4843,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
               file_path: editPath,
               start_line: 1,
               end_line: 1,
+              ...editAnchors,
               new: "const edited = true;\n",
             },
           };
@@ -4895,6 +4933,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
               file_path: editPath,
               start_line: 1,
               end_line: 1,
+              ...editAnchors,
               new: "const edited = true;\n",
             },
           };
@@ -5805,6 +5844,8 @@ async function nf988DiscoveryDoesNotImplicitlyEnterSemanticStage() {
           file_path: file,
           start_line: 1,
           end_line: 1,
+          expected_first_line: "const fixed = false;",
+          expected_last_line: "const fixed = false;",
           new: "const fixed = true;\n",
         });
       return { stream: (async function* stream() { yield { value }; }()) };
@@ -5859,7 +5900,9 @@ async function nf651StageContextReadForNextRequiredFile() {
       if (!stagedFirst && modelTurns >= 13) {
         stagedFirst = true;
         value = toolRequest("aiworkhub_manager_semantic_edit_stage", {
-          operation: "replace_range", file_path: first, start_line: 1, end_line: 1, new: "const first = 1;\n",
+          operation: "replace_range", file_path: first, start_line: 1, end_line: 1,
+          expected_first_line: "const first = 0;", expected_last_line: "const first = 0;",
+          new: "const first = 1;\n",
         });
       } else if (stagedFirst && exactReads === 0) {
         value = toolRequest("aiworkhub_worker_source_graph_query", {
@@ -5867,7 +5910,9 @@ async function nf651StageContextReadForNextRequiredFile() {
         });
       } else if (stagedFirst) {
         value = toolRequest("aiworkhub_manager_semantic_edit_stage", {
-          operation: "replace_range", file_path: second, start_line: 1, end_line: 1, new: "const second = 2;\n",
+          operation: "replace_range", file_path: second, start_line: 1, end_line: 1,
+          expected_first_line: "const second = 0;", expected_last_line: "const second = 0;",
+          new: "const second = 2;\n",
         });
       } else {
         value = toolRequest("aiworkhub_worker_source_graph_query", {
@@ -5899,7 +5944,9 @@ async function nf651StageContextReadForNextRequiredFile() {
       if (!repeatedStage && repeatedTurns >= 13) {
         repeatedStage = true;
         value = toolRequest("aiworkhub_manager_semantic_edit_stage", {
-          operation: "replace_range", file_path: first, start_line: 1, end_line: 1, new: "const first = 1;\n",
+          operation: "replace_range", file_path: first, start_line: 1, end_line: 1,
+          expected_first_line: "const first = 0;", expected_last_line: "const first = 0;",
+          new: "const first = 1;\n",
         });
       } else if (repeatedStage) {
         value = toolRequest("aiworkhub_worker_source_graph_query", {
@@ -5957,7 +6004,8 @@ async function nf202600023DeclaredDependencyReadDuringForcedStaging() {
     mode: "body", query: symbol, target: path, workflow_stage: "implementation",
   });
   const stage = (path, text) => toolRequest("aiworkhub_manager_semantic_edit_stage", {
-    operation: "replace_range", file_path: path, start_line: 1, end_line: 1, new: text,
+    operation: "replace_range", file_path: path, start_line: 1, end_line: 1,
+    expected_first_line: "const before = 0;", expected_last_line: "const before = 0;", new: text,
   });
   let discoveryNumber = 0;
   const discover = () => toolRequest("aiworkhub_worker_source_graph_query", {
@@ -6075,7 +6123,8 @@ async function nf988TwoBoundedCorrectionsDuringForcedStaging() {
     mode: "focus", query: `orientation-${index}`, workflow_stage: "implementation",
   });
   const stage = (path, value) => toolRequest("aiworkhub_manager_semantic_edit_stage", {
-    operation: "replace_range", file_path: path, start_line: 1, end_line: 1, new: value,
+    operation: "replace_range", file_path: path, start_line: 1, end_line: 1,
+    expected_first_line: "const before = 0;", expected_last_line: "const before = 0;", new: value,
   });
   const rejected = toolRequest("aiworkhub_manager_source_graph_query", {
     mode: "file", query: second, target: second, workflow_stage: "implementation",
@@ -6335,6 +6384,7 @@ async function nf998SourceGraphBoundaryAndStageReset() {
     focus("alpha"), focus("alpha"),
     toolRequest("aiworkhub_manager_semantic_edit_stage", {
       operation: "replace_range", file_path: "src/app.js", start_line: 1, end_line: 1,
+      expected_first_line: "const fixed = false;", expected_last_line: "const fixed = false;",
       new: "const fixed = true;\n",
     }),
     focus("alpha"),
@@ -6412,6 +6462,7 @@ async function nf998ForcedStageDuplicateAfterReadCap() {
     })),
     toolRequest("aiworkhub_manager_semantic_edit_stage", {
       operation: "replace_range", file_path: first, start_line: 1, end_line: 1,
+      expected_first_line: "const first = 0;", expected_last_line: "const first = 0;",
       new: "const first = 1;\n",
     }),
     toolRequest(graph, {
@@ -6573,6 +6624,7 @@ async function nf1179EarlyStagedPlainTextStaysBounded() {
       name: "aiworkhub_manager_semantic_edit_stage",
       input: {
         operation: "replace_range", file_path: first, start_line: 1, end_line: 1,
+        expected_first_line: "const first = 0;", expected_last_line: "const first = 0;",
         new: "const first = 1;\n",
       },
     }),
@@ -7021,7 +7073,8 @@ async function nf1290ProgressingProviderLoopsContinue() {
           assert.strictEqual(n, reads + 2, "validated staging must complete the required output");
           call = { name: "aiworkhub_manager_semantic_edit_stage",
             input: { operation: "replace_range", file_path: file,
-              start_line: 2, end_line: 2, new: "return fixed" } };
+              start_line: 2, end_line: 2, expected_first_line: "return before_1",
+              expected_last_line: "return before_1", new: "return fixed" } };
         }
         const part = native ? { ...call, callId: `nf1290-${n}` } :
           { value: JSON.stringify({ schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA, ...call }) };
@@ -7158,12 +7211,16 @@ async function nf1291AuthenticatedStageHandoff() {
   const staged = await internals.invokeVscodeLmProtocolTool({
     name: "aiworkhub_manager_semantic_edit_stage",
     input: { operation: "replace_range", file_path: "src/app.py",
-      start_line: 2, end_line: 2, new: "return fixed" },
+      start_line: 2, end_line: 2, expected_first_line: "return broken",
+      expected_last_line: "return broken", new: "return fixed" },
   }, request.requestId, invoke, collector, "nf1291.stage");
   assert.strictEqual(staged.ok, true);
   assert.deepStrictEqual(calls.map(call => call.name), [
     "aiworkhub_worker_semantic_edit_prepare", "aiworkhub_worker_semantic_edit_apply",
   ], "existing stage must execute the actual authenticated worker pair");
+  assert.deepStrictEqual(calls[0].input, { file_path: "src/app.py", start_line: 2, end_line: 2,
+    expected_first_line: "return broken", expected_last_line: "return broken" },
+  "the staged content anchors must reach the authenticated prepare");
   assert(calls.every(call => call.requestId === request.requestId && call.providerCallId));
   assert.strictEqual(staged.mcp_receipt.after_sha256, "b".repeat(64));
   const final = collector.finalize("already applied");
@@ -7174,7 +7231,8 @@ async function nf1291AuthenticatedStageHandoff() {
   const failed = await internals.invokeVscodeLmProtocolTool({
     name: "aiworkhub_manager_semantic_edit_stage",
     input: { operation: "replace_range", file_path: "src/app.py",
-      start_line: 2, end_line: 2, new: "return fixed" },
+      start_line: 2, end_line: 2, expected_first_line: "return broken",
+      expected_last_line: "return broken", new: "return fixed" },
   }, request.requestId, async call => call.name.endsWith("_prepare")
     ? { ok: true, target_id: "target", path: "src/app.py", current_sha256: "a".repeat(64),
         start_line: 2, end_line: 2, fragment_sha256: "c".repeat(64) }
@@ -7241,14 +7299,16 @@ async function nf1291ShiftedStageRecovery() {
     }
     return result;
   };
-  const bad = { operation: "replace_range", file_path: file, start_line: 4, end_line: 4, new: "WRONG" };
+  const bad = { operation: "replace_range", file_path: file, start_line: 4, end_line: 4,
+    expected_first_line: "four", expected_last_line: "four", new: "WRONG" };
   assert.equal((await repairCollector.stage(bad, repairInvoke)).ok, true);
   const beforeRepair = repaired.calls.length;
   const unsupported = await repairCollector.stage({ ...bad, new: "FOUR",
     preserve_trailing_newline: false }, repairInvoke);
   assert.match(unsupported.reason, /range_conflict/);
   assert.deepEqual(repairCollector.recoveryToolNames(), []);
-  const overlap = await repairCollector.stage({ ...bad, start_line: 3, new: "three\nFOUR" }, repairInvoke);
+  const overlap = await repairCollector.stage({ ...bad, start_line: 3, expected_first_line: "three",
+    new: "three\nFOUR" }, repairInvoke);
   assert.match(overlap.reason, /range_overlap/);
   assert.deepEqual(repairCollector.recoveryToolNames(), []);
   const conflictingBatch = await repairCollector.ingestFinalEnvelope({
@@ -7283,7 +7343,8 @@ async function nf1291ShiftedStageRecovery() {
   assert.equal((await repairCollector.stage({ operation: "create", file_path: created,
     content: "assert True\n" })).ok, true);
   assert.equal(repairCollector.finalize("same-line repaired").ok, true);
-  const grow = { operation: "replace_range", file_path: file, start_line: 1, end_line: 1, new: "inserted\none" };
+  const grow = { operation: "replace_range", file_path: file, start_line: 1, end_line: 1,
+    expected_first_line: "one", expected_last_line: "one", new: "inserted\none" };
   // Match the actual fresh body schema, never a source_hash-only mock.
   for (const [label, corrupt] of [
     ["missing freshness", row => { delete row.freshness; }],
@@ -7298,7 +7359,8 @@ async function nf1291ShiftedStageRecovery() {
     const f = fixture();
     const collector = internals.createVscodeLmStagedEditCollector(f.req);
     assert.equal((await collector.stage(grow, f.invoke)).ok, true);
-    assert.equal((await collector.stage({ ...grow, start_line: 4, end_line: 4, new: "WRONG" }, f.invoke)).ok, false);
+    assert.equal((await collector.stage({ ...grow, start_line: 4, end_line: 4,
+      expected_first_line: "four", expected_last_line: "four", new: "WRONG" }, f.invoke)).ok, false);
     const source = { name: "aiworkhub_worker_source_graph_query",
       input: { mode: "body", query: "app.four", target: file } };
     const delivered = await f.invoke(source);
@@ -7318,7 +7380,8 @@ async function nf1291ShiftedStageRecovery() {
     assert.equal((await collector.stage(grow, f.invoke)).ok, true);
     const beforeCalls = f.calls.length;
     const rejected = await collector.stage({ operation: "replace_range", file_path: file,
-      start_line: staleCoordinate, end_line: staleCoordinate, new: "FOUR" }, f.invoke);
+      start_line: staleCoordinate, end_line: staleCoordinate, expected_first_line: "four",
+      expected_last_line: "four", new: "FOUR" }, f.invoke);
     assert.equal(rejected.ok, false, "later stage must never mix launch and current coordinates");
     assert.match(rejected.reason, /coordinates_shifted_requires_fresh_worker_pair/);
     assert.equal(f.calls.length, beforeCalls, "shifted stage is refused before prepare/mutation");
@@ -7330,12 +7393,15 @@ async function nf1291ShiftedStageRecovery() {
     const f = fixture();
     const collector = internals.createVscodeLmStagedEditCollector(f.req);
     assert.equal((await collector.stage({ operation: "replace_range", file_path: file,
-      start_line: 4, end_line: 4, new: "four\nfive" }, f.invoke)).ok, true);
+      start_line: 4, end_line: 4, expected_first_line: "four", expected_last_line: "four",
+      new: "four\nfive" }, f.invoke)).ok, true);
     assert.equal((await collector.stage({ operation: "replace_range", file_path: file,
-      start_line: 2, end_line: 2, new: "TWO" }, f.invoke)).ok, true, "range above the growth is current");
+      start_line: 2, end_line: 2, expected_first_line: "two", expected_last_line: "two",
+      new: "TWO" }, f.invoke)).ok, true, "range above the growth is current");
     assert.deepEqual(f.lines(), ["one", "TWO", "three", "four", "five"]);
     const shifted = await collector.stage({ operation: "replace_range", file_path: file,
-      start_line: 4, end_line: 4, new: "FOUR" }, f.invoke);
+      start_line: 4, end_line: 4, expected_first_line: "four", expected_last_line: "four",
+      new: "FOUR" }, f.invoke);
     assert.match(shifted.reason, /coordinates_shifted_requires_fresh_worker_pair/);
     // The recovery counts toward the bounded escape: it never blocks finalize forever.
     const finals = [1, 2, 3].map(() => collector.finalize("recovery outstanding"));
@@ -7351,9 +7417,11 @@ async function nf1291ShiftedStageRecovery() {
     const f = fixture();
     const collector = internals.createVscodeLmStagedEditCollector(f.req);
     assert.equal((await collector.stage({ operation: "replace_range", file_path: file,
-      start_line: 4, end_line: 4, new: "four\nfive" }, f.invoke)).ok, true);
+      start_line: 4, end_line: 4, expected_first_line: "four", expected_last_line: "four",
+      new: "four\nfive" }, f.invoke)).ok, true);
     const shifted = await collector.stage({ operation: "replace_range", file_path: file,
-      start_line: 5, end_line: 5, new: "FIVE" }, f.invoke);
+      start_line: 5, end_line: 5, expected_first_line: "five", expected_last_line: "five",
+      new: "FIVE" }, f.invoke);
     assert.match(shifted.reason, /coordinates_shifted_requires_fresh_worker_pair/);
     assert.match(collector.finalize("recovery outstanding").reason, /semantic_edit_recovery_outstanding/);
     const dispatch = call => internals.invokeVscodeLmProtocolTool(call, f.req.requestId, f.invoke, collector);
@@ -7378,7 +7446,8 @@ async function nf1291ShiftedStageRecovery() {
       await dispatch({ name: "aiworkhub_worker_semantic_edit_apply",
         input: { target_id: "shift-target-1", new: grow.new, idempotency_key: "direct-growth" } });
     } else await collector.stage(grow, f.invoke);
-    assert.equal((await collector.stage({ ...grow, start_line: 4, end_line: 4, new: "WRONG" }, f.invoke)).ok, false);
+    assert.equal((await collector.stage({ ...grow, start_line: 4, end_line: 4,
+      expected_first_line: "four", expected_last_line: "four", new: "WRONG" }, f.invoke)).ok, false);
     const prepare = { name: "aiworkhub_worker_semantic_edit_prepare",
       input: { file_path: file, start_line: 5, end_line: 5 } };
     assert.equal(collector.allowsRecoveryCall(prepare), false, "no prepare before fresh current SG body");
@@ -7448,9 +7517,10 @@ async function nf1291ShiftedStageRecovery() {
   assert.deepEqual(batch.lines(), ["inserted", "one", "two", "three", "FOUR"]);
   const unchanged = fixture();
   const sameCollector = internals.createVscodeLmStagedEditCollector(unchanged.req);
-  for (const [line, value] of [[1, "ONE"], [4, "FOUR"]]) {
+  for (const [line, anchor, value] of [[1, "one", "ONE"], [4, "four", "FOUR"]]) {
     assert.equal((await sameCollector.stage({ operation: "replace_range", file_path: file,
-      start_line: line, end_line: line, new: value }, unchanged.invoke)).ok, true);
+      start_line: line, end_line: line, expected_first_line: anchor, expected_last_line: anchor,
+      new: value }, unchanged.invoke)).ok, true);
   }
   assert.deepEqual(unchanged.lines(), ["ONE", "two", "three", "FOUR"]);
   for (const native of [false, true]) {
@@ -7508,7 +7578,8 @@ async function nf1291ShiftedStageRecovery() {
         input: { mode: "focus", query: "orientation-" + i } })),
       { name: "aiworkhub_manager_semantic_edit_stage", input: grow },
       { name: "aiworkhub_manager_semantic_edit_stage", input: { operation: "replace_range",
-        file_path: file, start_line: 4, end_line: 4, new: "WRONG" } },
+        file_path: file, start_line: 4, end_line: 4, expected_first_line: "four",
+        expected_last_line: "four", new: "WRONG" } },
       { name: "aiworkhub_worker_source_graph_query", input: { mode: "body", query: "app.four", target: file } },
       { name: "aiworkhub_worker_semantic_edit_prepare", input: { file_path: file, start_line: 5, end_line: 5 } },
       { name: "aiworkhub_worker_semantic_edit_apply", input: {
@@ -7544,11 +7615,13 @@ async function nf1291ShiftedStageRecovery() {
     const plan = [
       { name: "aiworkhub_worker_source_graph_query", input: { mode: "focus", query: "multi-edit-orientation" } },
       { name: "aiworkhub_manager_semantic_edit_stage", input: { operation: "replace_range",
-        file_path: file, start_line: 1, end_line: 1, new: "ONE" } },
+        file_path: file, start_line: 1, end_line: 1, expected_first_line: "one",
+        expected_last_line: "one", new: "ONE" } },
       { name: "aiworkhub_manager_semantic_edit_stage", input: {
         operation: "create", file_path: created, content: "assert True\n" } },
       { name: "aiworkhub_manager_semantic_edit_stage", input: { operation: "replace_range",
-        file_path: file, start_line: 4, end_line: 4, new: "FOUR" } },
+        file_path: file, start_line: 4, end_line: 4, expected_first_line: "four",
+        expected_last_line: "four", new: "FOUR" } },
       { name: "aiworkhub_manager_semantic_edit_finalize", input: { summary: "two edits, one output" } },
     ];
     let turn = 0;

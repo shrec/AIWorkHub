@@ -3613,12 +3613,14 @@ const VSCODE_LM_PRIVATE_TOOLS = Object.freeze([
         {
           type: "object",
           additionalProperties: false,
-          required: ["operation", "file_path", "start_line", "end_line", "new"],
+          required: ["operation", "file_path", "start_line", "end_line", "expected_first_line", "expected_last_line", "new"],
           properties: {
             operation: { const: "replace_range" },
             file_path: { type: "string", minLength: 1, maxLength: 512 },
             start_line: { type: "integer", minimum: 1 },
             end_line: { type: "integer", minimum: 1 },
+            expected_first_line: { type: "string" },
+            expected_last_line: { type: "string" },
             new: { type: "string" },
             preserve_trailing_newline: { type: "boolean" },
           },
@@ -4124,8 +4126,8 @@ function glmAgentProtocolPrompt(prompt, allowedWrites, pathContracts = {}) {
     `- Preferred delivery: after body discovery call ${VSCODE_LM_STAGE_EDIT_TOOL} once per smallest replacement or complete new file. For an existing file the bridge executes authenticated worker prepare/apply and retains the durable receipt.\n` +
     `- After every intended fragment is staged, call ${VSCODE_LM_FINALIZE_EDIT_TOOL} with only a short truthful summary. Do not resend already-applied code; final edits are empty for authenticated applies, while new-file creates remain pending.\n` +
     `- Canonical offline create stage request: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_STAGE_EDIT_TOOL}","input":{"operation":"create","file_path":"<allowed-path>","content":"<full file content>"}}\n` +
-    `- Canonical authenticated replace-range stage request uses the exact Source Graph range. A one-line pin of line 1 is not a complete replacement: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_STAGE_EDIT_TOOL}","input":{"operation":"replace_range","file_path":"<allowed-path>","start_line":"<source-graph-start>","end_line":"<source-graph-end>","new":"<complete replacement for that range>"}}\n` +
-    `- Edit an existing file by calling ${VSCODE_LM_STAGE_EDIT_TOOL} replace_range directly with the exact start_line/end_line and the complete replacement; it needs no prior prepare; one turn may carry several stage calls. Do not call manager semantic-edit prepare/apply.\n` +
+    `- Canonical authenticated replace-range stage request uses the exact Source Graph range plus the exact text of that range's first and last line. A one-line pin of line 1 is not a complete replacement: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_STAGE_EDIT_TOOL}","input":{"operation":"replace_range","file_path":"<allowed-path>","start_line":"<source-graph-start>","end_line":"<source-graph-end>","expected_first_line":"<exact text of the first line of that range>","expected_last_line":"<exact text of the last line of that range>","new":"<complete replacement for that range>"}}\n` +
+    `- Edit an existing file by calling ${VSCODE_LM_STAGE_EDIT_TOOL} replace_range directly with the exact start_line/end_line, the exact text of that range's first and last line as expected_first_line/expected_last_line, and the complete replacement; it needs no prior prepare; one turn may carry several stage calls. If a stage is refused with semantic_edit_anchor_mismatch, restage using start_line/end_line from the returned candidates or numbered_context. Do not call manager semantic-edit prepare/apply.\n` +
     `- Canonical offline finalize request: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_FINALIZE_EDIT_TOOL}","input":{"summary":"<short applied summary>"}}\n` +
     `- Canonical final response: {"schema_id":"${VSCODE_LM_EDIT_RESPONSE_SCHEMA}","summary":"<truthful summary>","edits":[{"path":"<allowed-path>","current_sha256":"<path-contract-sha256>","ranges":[{"start_line":"<source-graph-start>","end_line":"<source-graph-end>","new":"<complete replacement>","preserve_trailing_newline":true}]}],"creates":[{"path":"<new-allowed-path>","content":"<complete new file>"}]}. Use empty edits/creates arrays when that operation is not needed. Stage input operation/file_path fields are not final-response path/ranges fields.\n` +
     `- Worker semantic-edit prepare/apply are provider-callable, but each pair costs two turns; prefer one stage call per range, which executes the same authenticated pair. Never submit an offline existing-file replacement.\n` +
@@ -4563,6 +4565,21 @@ function createVscodeLmStagedEditCollector(request) {
     }
     return value;
   };
+  // The range a worker prepare bound: the requested one, or the same-span range the
+  // worker relocated an anchored request to. null means the reply is not for this stage.
+  const preparedRange = (prepared, input) => {
+    const from = prepared.anchor_relocated_from;
+    if (from === undefined || from === null) {
+      return prepared.start_line === input.start_line && prepared.end_line === input.end_line
+        ? { start_line: input.start_line, end_line: input.end_line } : null;
+    }
+    if (typeof input.expected_first_line !== "string" || typeof input.expected_last_line !== "string" ||
+        from.start_line !== input.start_line || from.end_line !== input.end_line ||
+        !Number.isSafeInteger(prepared.start_line) || prepared.start_line < 1 || !Number.isSafeInteger(prepared.end_line) ||
+        prepared.end_line - prepared.start_line !== input.end_line - input.start_line) return null;
+    return { start_line: prepared.start_line, end_line: prepared.end_line,
+      relocated_from: { start_line: from.start_line, end_line: from.end_line } };
+  };
   const stage = async (rawInput, authenticate, originalCoordinateBatch = false) => {
     if (!rawInput || typeof rawInput !== "object" || Array.isArray(rawInput)) return reject("input_invalid");
     const input = { ...rawInput };
@@ -4595,7 +4612,7 @@ function createVscodeLmStagedEditCollector(request) {
       if (candidate === "create") {
         return Object.keys(input).filter((key) => !all.concat(["content"]).includes(key));
       }
-      return Object.keys(input).filter((key) => !all.concat(["start_line", "end_line", "new", "preserve_trailing_newline"]).includes(key));
+      return Object.keys(input).filter((key) => !all.concat(["start_line", "end_line", "expected_first_line", "expected_last_line", "new", "preserve_trailing_newline"]).includes(key));
     };
     if (operation === "create") {
       if (!contract || contract.action !== "create") return reject(`action_mismatch:${filePath}:create`);
@@ -4639,6 +4656,11 @@ function createVscodeLmStagedEditCollector(request) {
     // worker apply receipts complete an existing-file output.
     const currentSha256 = String(contract.current_sha256 || "");
     if (!/^[0-9a-f]{64}$/.test(currentSha256)) return reject(`contract_hash_invalid:${filePath}`);
+    // A final-envelope range carries no anchor fields; only a stage tool call must anchor its range.
+    if (!originalCoordinateBatch &&
+        (typeof input.expected_first_line !== "string" || typeof input.expected_last_line !== "string")) {
+      return reject("anchor_required");
+    }
     const entry = edits.get(filePath) || { path: filePath, current_sha256: currentSha256, ranges: [] };
     const exact = entry.ranges.find(range =>
       range.start_line === input.start_line && range.end_line === input.end_line);
@@ -4665,18 +4687,38 @@ function createVscodeLmStagedEditCollector(request) {
       return reject(`range_overlap:${filePath}:${input.start_line}:${input.end_line}`);
     }
     let mcpReceipt;
+    let rangeStart = input.start_line;
+    let rangeEnd = input.end_line;
+    let relocatedFrom;
     if (typeof authenticate === "function") {
       // The native worker editor has fixed trailing-newline semantics. Never
       // silently reinterpret an explicit unsupported deletion of that newline.
       if (input.preserve_trailing_newline === false) return reject("preserve_trailing_newline_unsupported");
+      const anchors = {};
+      if (input.expected_first_line !== undefined) anchors.expected_first_line = input.expected_first_line;
+      if (input.expected_last_line !== undefined) anchors.expected_last_line = input.expected_last_line;
       const prepared = await authenticate({ name: "aiworkhub_worker_semantic_edit_prepare",
-        input: { file_path: filePath, start_line: input.start_line, end_line: input.end_line } });
+        input: { file_path: filePath, start_line: input.start_line, end_line: input.end_line, ...anchors } });
       const expectedHash = entry.last_sha256 || currentSha256;
-      if (!prepared || prepared.ok !== true) return reject(prepared?.reason || "prepare_failed");
-      if (prepared.path !== filePath || prepared.start_line !== input.start_line ||
-          prepared.end_line !== input.end_line || prepared.current_sha256 !== expectedHash ||
+      if (!prepared || prepared.ok !== true) {
+        const refusal = reject(prepared?.reason || "prepare_failed");
+        if (!String(prepared?.reason || "").startsWith("semantic_edit_anchor_mismatch:")) return refusal;
+        return { ...refusal, actual_first_line: prepared.actual_first_line,
+          actual_last_line: prepared.actual_last_line, numbered_context: prepared.numbered_context,
+          candidates: prepared.candidates, corrective: true,
+          instruction: "Restage replace_range with start_line/end_line from candidates or numbered_context and set expected_first_line/expected_last_line to the exact text of that range's first and last line." };
+      }
+      const bound = preparedRange(prepared, input);
+      if (prepared.path !== filePath || !bound || prepared.current_sha256 !== expectedHash ||
           !/^[0-9a-f]{64}$/.test(String(prepared.fragment_sha256 || "")) || !prepared.target_id) {
         return reject(`prepare_identity_mismatch:${filePath}`);
+      }
+      rangeStart = bound.start_line;
+      rangeEnd = bound.end_line;
+      relocatedFrom = bound.relocated_from;
+      // The overlap check above ran on the requested range; a relocated range needs its own.
+      if (relocatedFrom && entry.ranges.some(range => rangeStart <= range.end_line && rangeEnd >= range.start_line)) {
+        return reject(`range_overlap:${filePath}:${rangeStart}:${rangeEnd}`);
       }
       const key = crypto.createHash("sha256").update(JSON.stringify([
         String(request.requestId || ""), filePath, prepared.target_id, input.new,
@@ -4693,20 +4735,21 @@ function createVscodeLmStagedEditCollector(request) {
       }
       entry.applied = true;
       // NF-2026-01404: only lines below the first line-count change move.
-      if (replacementLineCount(input.new) !== input.end_line - input.start_line + 1) {
-        entry.shiftedFrom = Math.min(entry.shiftedFrom ?? input.start_line, input.start_line);
+      if (replacementLineCount(input.new) !== rangeEnd - rangeStart + 1) {
+        entry.shiftedFrom = Math.min(entry.shiftedFrom ?? rangeStart, rangeStart);
       }
       entry.coordinatesShifted = Number.isSafeInteger(entry.shiftedFrom);
       entry.last_sha256 = mcpReceipt.after_sha256;
     }
-    entry.ranges.push({ start_line: input.start_line, end_line: input.end_line,
+    entry.ranges.push({ start_line: rangeStart, end_line: rangeEnd,
       new: input.new, preserve_trailing_newline: input.preserve_trailing_newline !== false,
       ...(mcpReceipt ? { mcp_receipt: mcpReceipt } : {}) });
     entry.ranges.sort((left, right) => left.start_line - right.start_line || left.end_line - right.end_line);
     edits.set(filePath, entry);
     return boundedReceipt(operation, filePath, input.new, {
-      current_sha256: currentSha256, start_line: input.start_line, end_line: input.end_line,
-      idempotent_replay: false, ...(mcpReceipt ? { mcp_receipt: mcpReceipt } : {}),
+      current_sha256: currentSha256, start_line: rangeStart, end_line: rangeEnd,
+      idempotent_replay: false, ...(relocatedFrom ? { anchor_relocated_from: relocatedFrom } : {}),
+      ...(mcpReceipt ? { mcp_receipt: mcpReceipt } : {}),
     });
   };
 
@@ -5286,8 +5329,8 @@ function glmTextToolProtocolPrompt(prompt, allowedWrites, sourceGraphPrefetched 
     (qualityReview
       ? `- The only successful terminal action is an authenticated aiworkhub_worker_quality_review_submit request.\n`
       : `- After each tool result, either request another allowlisted tool or output the final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} object.\n` +
-        `- Canonical stage request (replace_range) uses the exact Source Graph range. A one-line pin of line 1 is not a complete replacement: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${editStageName}","input":{"operation":"replace_range","file_path":"<allowed-path>","start_line":"<source-graph-start>","end_line":"<source-graph-end>","new":"<complete replacement for that range>"}}\n` +
-        `- Edit an existing file by calling ${editStageName} replace_range directly with the exact start_line/end_line and the complete replacement; it needs no prior prepare; one stage per turn. Do not call manager semantic-edit prepare/apply.\n` +
+        `- Canonical stage request (replace_range) uses the exact Source Graph range plus the exact text of that range's first and last line. A one-line pin of line 1 is not a complete replacement: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${editStageName}","input":{"operation":"replace_range","file_path":"<allowed-path>","start_line":"<source-graph-start>","end_line":"<source-graph-end>","expected_first_line":"<exact text of the first line of that range>","expected_last_line":"<exact text of the last line of that range>","new":"<complete replacement for that range>"}}\n` +
+        `- Edit an existing file by calling ${editStageName} replace_range directly with the exact start_line/end_line, the exact text of that range's first and last line as expected_first_line/expected_last_line, and the complete replacement; it needs no prior prepare; one stage per turn. If the stage is refused with semantic_edit_anchor_mismatch, restage using start_line/end_line from the returned candidates or numbered_context. Do not call manager semantic-edit prepare/apply.\n` +
         `- Canonical stage request (create): {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${editStageName}","input":{"operation":"create","file_path":"<allowed-path>","content":"<full file content>"}}\n` +
         `- Canonical finalize request: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${editFinalizeName}","input":{"summary":"<short applied summary>"}}\n`) +
     `- Allowed tool names: ${JSON.stringify(toolNames)}.\n` +
