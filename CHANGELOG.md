@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.54] - 2026-10-15
+
+### Added
+
+- VS Code LM (GLM) workers carry semantic-edit anchors through the bridge and bind relocated ranges (NF-2026-01533, extension side).
+- The manager edit CLI `scripts/manager_semantic_edit.py` takes `--expected-first-line`/`--expected-last-line` anchors and `--allow-escape-level-change`, and prints the refusal detail (NF-2026-01541).
+- Every OpenCode Go model (`opencode-go/*`) is enabled by default; an exact `models.json` override still wins (NF-2026-01545).
+
+### Fixed
+
+- Source Graph `bodygrep` no longer stops after the first indexed files (NF-2026-01540).
+- OpenCode model discovery retries a timed-out `opencode models` probe with a longer budget, keeps the last good list and names the failure in provider status (NF-2026-01545).
+- An OmniRoute provider declared only in the OpenCode v2 `providers` block is projected into the worker (NF-2026-01511).
+- VS Code LM workers never finalize while a shifted-coordinate edit recovery is outstanding (NF-2026-01539).
+- `aiworkhub_claude_callback_ack` accepts the ids the callback wait hint tells the manager to pass (NF-2026-01547).
+- A new manager session no longer receives wakes already delivered to an earlier session (NF-2026-01548).
+
 ## [0.12.53] - 2026-10-15
 
 ### Added

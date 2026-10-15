@@ -62,6 +62,10 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.54
+
+- GLM through VS Code LM edits by first/last-line anchors and no longer finishes a task while an edit recovery is pending; every OpenCode Go model (for example Gemini Argon 4) is available and a slow `opencode models` probe no longer hides them; Source Graph `bodygrep` searches every indexed file; a new manager chat no longer receives a flood of old task wakes.
+
 ## What's new in 0.12.53
 
 - Semantic edit can bind a range by its exact first and last line and relocates a slightly shifted range instead of editing the wrong lines; it refuses replacements that drop a range edge or silently change backslash escaping. Routes enabled in `models.json` (GLM 5.3 through VS Code LM, OmniRoute through OpenCode) are launchable without a catalog row.

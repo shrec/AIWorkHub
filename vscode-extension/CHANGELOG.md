@@ -1,5 +1,11 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.54 — 2026-10-15
+
+### Fixed
+
+- Bundled runtime 0.12.54: GLM (VS Code LM) workers bind semantic edits by their first and last line and never finalize mid-recovery (NF-2026-01533, NF-2026-01539); every OpenCode Go model is available and discovery survives a slow `opencode models` probe (NF-2026-01545); an OmniRoute provider declared in the v2 `providers` block works (NF-2026-01511); Source Graph `bodygrep` searches every indexed file (NF-2026-01540); manager callbacks accept the hinted ack ids and no longer flood a new session with old wakes (NF-2026-01547, NF-2026-01548); the manager edit CLI takes line anchors (NF-2026-01541).
+
 ## 0.12.53 — 2026-10-15
 
 ### Fixed
