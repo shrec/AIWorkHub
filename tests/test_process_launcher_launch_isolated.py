@@ -1235,6 +1235,48 @@ def _supervisor_spec(harness: SimpleNamespace) -> dict[str, object] | None:
     )
 
 
+def _request_metadata(harness: SimpleNamespace) -> dict[str, object]:
+    return next(
+        payload
+        for path, payload in harness.writes
+        if path.name == f"{_OPENCODE_REQUEST_ID}.request.json"
+    )
+
+
+_REJECTION_DISPOSITION = {
+    "schema_id": "aiworkhub.rejection_disposition.v1",
+    "failure_category": "provider_runtime",
+    "failure_category_source": "manager",
+    "request_id": "predecessor-request",
+    "to": "blocked",
+}
+
+
+@pytest.mark.parametrize("disposition", [_REJECTION_DISPOSITION, None])
+def test_launch_request_packet_carries_the_cards_rejection_disposition(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, disposition: dict | None
+) -> None:
+    harness = _prepare_opencode_launch(monkeypatch, tmp_path, "landlock")
+    card: dict[str, object] = {
+        "request_id": _OPENCODE_REQUEST_ID,
+        "claim_epoch": 1,
+        "allowed_writes": ["src/a.py"],
+    }
+    if disposition is not None:
+        card["rejection_disposition"] = disposition
+    monkeypatch.setattr(
+        process_launcher, "_committed_claim_card", lambda _claim, **_k: dict(card)
+    )
+
+    result = _launch_opencode(harness)
+
+    assert result["ok"] is True, result
+    packet = _request_metadata(harness)
+    assert packet["rejection_disposition"] == disposition
+    if disposition is not None:
+        assert packet["rejection_disposition"] is not disposition
+
+
 @pytest.mark.parametrize("backend", _OPENCODE_BACKENDS)
 def test_opencode_launch_hands_the_supervisor_the_request_local_awh_config(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, backend: str
@@ -1511,7 +1553,9 @@ def test_opencode_appcontainer_launch_refuses_without_measured_confinement(
     # host before the confinement gate under test is reached; it is not this
     # test's subject, so the gate is what refuses on every host.
     monkeypatch.setattr(
-        windows_appcontainer, "worker_pipe_shim_argv", lambda pipe: ["shim.exe", pipe]
+        windows_appcontainer,
+        "worker_pipe_shim_argv",
+        lambda pipe, relay=None: ["shim.exe", pipe],
     )
 
     result = _launch_opencode(harness)

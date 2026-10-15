@@ -144,6 +144,43 @@ MAX_REWORK_NO_DELTA_REASON_PATH_CHARS = 400
 # unknown is never an exemption.
 REWORK_NO_DELTA_EXEMPT_PREDECESSOR_TERMINAL = "validation_failed"
 
+# NF-2026-01555. The manager-attributed ``failure_category`` values for which
+# the predecessor's bytes were never at fault, so reproducing them is the
+# recovery. ``candidate_code`` is deliberately absent, and so is every unknown
+# value: unknown is never an exemption.
+REWORK_NO_DELTA_EXEMPT_FAILURE_CATEGORIES = frozenset({
+    "validation_environment",
+    "provider_runtime",
+    "dependency_or_route",
+    "cancellation_or_timeout",
+})
+
+REJECTION_DISPOSITION_SCHEMA_ID = "aiworkhub.rejection_disposition.v1"
+
+
+def _operational_disposition_exempts(
+    metadata: Mapping[str, Any], predecessor: Mapping[str, Any]
+) -> bool:
+    disposition = metadata.get("rejection_disposition")
+    if not isinstance(disposition, dict):
+        return False
+    if disposition.get("schema_id") != REJECTION_DISPOSITION_SCHEMA_ID:
+        return False
+    request_id = predecessor.get("request_id")
+    if not isinstance(request_id, str) or not request_id.strip():
+        return False
+    disposition_request_id = disposition.get("request_id")
+    if (
+        not isinstance(disposition_request_id, str)
+        or disposition_request_id != request_id.strip()
+    ):
+        return False
+    category = disposition.get("failure_category")
+    return (
+        isinstance(category, str)
+        and category in REWORK_NO_DELTA_EXEMPT_FAILURE_CATEGORIES
+    )
+
 
 def rework_no_delta_refusal(
     workspace: WorkerWorkspace,
@@ -181,6 +218,19 @@ def rework_no_delta_refusal(
     today. The substatus is read from the same ``rework_predecessor`` record
     that publishes the sealed identity, so the exemption and the bytes it
     exempts can never describe two different predecessors.
+
+    NF-2026-01555. A predecessor can also fail for an operational reason with
+    correct bytes (a broken validation environment, a provider runtime fault,
+    a dependency or route outage, a cancellation or timeout); the manager's
+    reject then records ``rejection_disposition`` on the card, and the launch
+    packet projects it as ``metadata["rejection_disposition"]``. When that
+    disposition carries the ``aiworkhub.rejection_disposition.v1`` schema, its
+    ``request_id`` is the very predecessor request the sealed identity pins and
+    its ``failure_category`` is a ``str`` in
+    ``REWORK_NO_DELTA_EXEMPT_FAILURE_CATEGORIES``, reproducing the bytes IS the
+    recovery and nothing is minted. ``candidate_code``, a mismatched or empty
+    request_id, a missing, non-dict or wrong-schema disposition and an unknown
+    or non-str category keep the refusal: unknown is never an exemption.
     """
     if validation_only_replay or not is_rework_attempt(metadata):
         return ""
@@ -189,6 +239,8 @@ def rework_no_delta_refusal(
         predecessor.get("terminal_substatus")
         == REWORK_NO_DELTA_EXEMPT_PREDECESSOR_TERMINAL
     ):
+        return ""
+    if _operational_disposition_exempts(metadata, predecessor):
         return ""
     sealed = predecessor.get("changed_path_hashes")
     if not isinstance(sealed, dict) or not sealed:

@@ -1122,6 +1122,11 @@ def launch_isolated(
                     if isinstance(card.get("rework_predecessor"), dict)
                     else None
                 ),
+                "rejection_disposition": (
+                    dict(card["rejection_disposition"])
+                    if isinstance(card.get("rejection_disposition"), dict)
+                    else None
+                ),
                 "validation_only_replay_authorization": (
                     dict(card["validation_only_replay_authorization"])
                     if isinstance(
