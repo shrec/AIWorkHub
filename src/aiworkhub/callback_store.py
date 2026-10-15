@@ -1973,7 +1973,8 @@ def seed_missing_review_callbacks(
     - With no explicit verified route, never duplicates or resurrects a task
       that already has any callback row for the same provider/claim episode.
       An explicit verified route remains route-scoped so reload retargeting can
-      seed the new origin exactly once.
+      seed the new origin exactly once, but a task+transition+episode already
+      delivered to any manager origin is never re-seeded to a new origin.
     - A verified route may recover one matching dead-letter row or one row
       incorrectly superseded by an older eligibility bug, but only while the
       task is still in that exact terminal episode. ``recovery_count`` prevents
@@ -2134,6 +2135,16 @@ def seed_missing_review_callbacks(
                 _recover_terminal_row(existing)
                 seeded += 1
             continue
+        if route_origin:
+            # NF-2026-01548: an episode+transition already delivered to ANY
+            # manager origin is never seeded again for a new verified route.
+            delivered_elsewhere = conn.execute(
+                "SELECT 1 FROM callback_outbox WHERE task_id=? AND provider IN (?, ?) "
+                "AND transition=? AND episode_id=? AND state='delivered' LIMIT 1",
+                (task_id, lookup_provider, provider, transition, episode_id),
+            ).fetchone()
+            if delivered_elsewhere is not None:
+                continue
         # No wake exists for the transition the task is in right now. On a
         # verified route, prefer recovering a dead-letter/superseded row this
         # task stranded under a DIFFERENT transition in the SAME episode and
