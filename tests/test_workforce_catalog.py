@@ -3162,3 +3162,293 @@ def test_rank_task_never_returns_a_sandbox_dead_route_as_launch_contract(
     assert decision["selected_worker_id"] != "glm-5.2"
     if decision["launch_contract"] is not None:
         assert decision["launch_contract"]["adapter_id"] != "glm_vscode_lm"
+
+
+# The catalog names an enabled editor GLM route glm_*; copilot_* is its vscode_lm alias.
+_GLM_CATALOG_RUNNER = "glm_5.3"
+_GLM_ROUTE_RUNNER = "copilot_glm-5.3"
+_OMNIROUTE_MODEL = "omniroute/opencode-go/muse-spark-1.3-contributor"
+_OMNIROUTE_ROUTE_RUNNER = "opencode_omniroute_opencode-go_muse-spark-1.3-contributor"
+
+
+def _write_model_settings(
+    root: Path,
+    *,
+    providers: dict | None = None,
+    adapters: dict | None = None,
+    models: dict | None = None,
+) -> None:
+    model_settings.settings_path(root).write_text(
+        json.dumps(
+            {
+                "schema_id": model_settings.SCHEMA_ID,
+                "revision": 1,
+                "providers": providers or {},
+                "adapters": adapters or {},
+                "models": models or {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _enabled_route_models() -> dict:
+    return {
+        "copilot": {"vscode_lm": {"glm-5.3": True}},
+        "omniroute": {"opencode_cli": {_OMNIROUTE_MODEL: True}},
+    }
+
+
+def test_catalog_launch_identities_publish_every_enabled_models_json_route(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    _write_model_settings(root, models=_enabled_route_models())
+
+    identities = workforce_catalog.catalog_launch_identities(root)
+
+    for runner, route_adapter in (
+        (_GLM_CATALOG_RUNNER, "glm_vscode_lm"),
+        (_GLM_ROUTE_RUNNER, "vscode_lm"),
+    ):
+        assert identities[runner] == {
+            "worker_id": "glm-5.3",
+            "adapter_id": "glm_vscode_lm",
+            "route_adapter_id": route_adapter,
+            "model": "glm-5.3",
+            "provider": "copilot",
+            "identity_source": "model_settings",
+        }, runner
+    assert identities[_OMNIROUTE_ROUTE_RUNNER] == {
+        "worker_id": "omniroute_opencode-go_muse-spark-1.3-contributor",
+        "adapter_id": "opencode_cli",
+        "route_adapter_id": "opencode_cli",
+        "model": _OMNIROUTE_MODEL,
+        "provider": "omniroute",
+        "identity_source": "model_settings",
+    }
+    for runner in (_GLM_CATALOG_RUNNER, _GLM_ROUTE_RUNNER, _OMNIROUTE_ROUTE_RUNNER):
+        row = identities[runner]
+        assert runner == workforce_catalog.execution_runner(
+            row["worker_id"], row["route_adapter_id"]
+        )
+    assert "claude_opus-5" in identities
+
+
+def test_catalog_launch_identities_follow_the_model_settings_writer(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    model_settings.update(
+        root,
+        provider="copilot",
+        adapter="vscode_lm",
+        model="glm-5.3",
+        enabled=True,
+        expected_revision=0,
+    )
+    model_settings.update(
+        root,
+        provider="opencode",
+        adapter="opencode_cli",
+        model=_OMNIROUTE_MODEL,
+        enabled=True,
+        expected_revision=1,
+    )
+
+    identities = workforce_catalog.catalog_launch_identities(root)
+
+    assert identities[_GLM_CATALOG_RUNNER]["model"] == "glm-5.3"
+    assert identities[_GLM_ROUTE_RUNNER]["model"] == "glm-5.3"
+    assert identities[_OMNIROUTE_ROUTE_RUNNER]["model"] == _OMNIROUTE_MODEL
+    assert identities[_OMNIROUTE_ROUTE_RUNNER]["adapter_id"] == "opencode_cli"
+
+
+def test_catalog_launch_identities_omit_a_disabled_models_json_leaf(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    _write_model_settings(
+        root,
+        models={
+            "copilot": {"vscode_lm": {"glm-5.3": False, "glm-5.4": True}},
+            "omniroute": {"opencode_cli": {_OMNIROUTE_MODEL: False}},
+        },
+    )
+
+    identities = workforce_catalog.catalog_launch_identities(root)
+
+    assert _GLM_CATALOG_RUNNER not in identities
+    assert _GLM_ROUTE_RUNNER not in identities
+    assert _OMNIROUTE_ROUTE_RUNNER not in identities
+    assert identities["glm_5.4"]["model"] == "glm-5.4"
+    assert identities["copilot_glm-5.4"]["model"] == "glm-5.4"
+
+
+def test_catalog_launch_identities_omit_models_json_routes_under_a_disabled_parent(
+    tmp_path: Path,
+) -> None:
+    glm_runners = (_GLM_CATALOG_RUNNER, _GLM_ROUTE_RUNNER)
+    scenarios = (
+        (
+            "provider",
+            {"providers": {"copilot": False}},
+            glm_runners,
+            (_OMNIROUTE_ROUTE_RUNNER,),
+        ),
+        (
+            "adapter",
+            {"adapters": {"omniroute": {"opencode_cli": False}}},
+            (_OMNIROUTE_ROUTE_RUNNER,),
+            glm_runners,
+        ),
+    )
+    for name, switches, gated, untouched in scenarios:
+        root = _root(tmp_path / name)
+        _write_model_settings(root, models=_enabled_route_models(), **switches)
+
+        identities = workforce_catalog.catalog_launch_identities(root)
+
+        for runner in gated:
+            assert runner not in identities, (name, runner)
+        for runner in untouched:
+            assert runner in identities, (name, runner)
+
+
+def test_catalog_launch_identities_skip_unsafe_models_json_identities(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    _write_model_settings(
+        root,
+        models={
+            "copilot": {
+                "vscode_lm": {"glm 5.3": True, "-glm": True, "glm-5.4": True}
+            }
+        },
+    )
+
+    published = {
+        runner: row["model"]
+        for runner, row in workforce_catalog.catalog_launch_identities(root).items()
+        if row.get("identity_source") == "model_settings"
+    }
+
+    assert published == {"glm_5.4": "glm-5.4", "copilot_glm-5.4": "glm-5.4"}
+
+
+def test_catalog_row_wins_a_models_json_runner_collision(tmp_path: Path) -> None:
+    for adapter_id, runner in (
+        ("vscode_lm", _GLM_ROUTE_RUNNER),
+        ("glm_vscode_lm", _GLM_CATALOG_RUNNER),
+    ):
+        root = _root(tmp_path / adapter_id)
+        path, _ = workforce_catalog.ensure_catalog(root)
+        catalog = json.loads(path.read_text(encoding="utf-8"))
+        catalog["workers"].append(
+            {
+                "worker_id": "glm-5.3",
+                "adapter_id": adapter_id,
+                "model": "glm-5.3-catalog",
+                "provider": "copilot",
+                "supports": ["code"],
+            }
+        )
+        path.write_text(json.dumps(catalog), encoding="utf-8")
+        _write_model_settings(root, models=_enabled_route_models())
+
+        identities = workforce_catalog.catalog_launch_identities(root)
+
+        assert identities[runner]["model"] == "glm-5.3-catalog", adapter_id
+        assert "identity_source" not in identities[runner], adapter_id
+        assert (
+            identities[_OMNIROUTE_ROUTE_RUNNER]["identity_source"] == "model_settings"
+        ), adapter_id
+
+
+def test_catalog_launch_identities_ignore_unreadable_models_json(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    baseline = workforce_catalog.catalog_launch_identities(root)
+
+    for payload in ("{not json", json.dumps({"schema_id": "other", "models": {}})):
+        model_settings.settings_path(root).write_text(payload, encoding="utf-8")
+
+        assert workforce_catalog.catalog_launch_identities(root) == baseline
+
+
+def test_launch_derivation_pins_the_model_of_an_enabled_models_json_route(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    _write_model_settings(root, models=_enabled_route_models())
+
+    for runner, adapter_id, model in (
+        (_GLM_CATALOG_RUNNER, "glm_vscode_lm", "glm-5.3"),
+        (_GLM_ROUTE_RUNNER, "vscode_lm", "glm-5.3"),
+        (_OMNIROUTE_ROUTE_RUNNER, "opencode_cli", _OMNIROUTE_MODEL),
+    ):
+        derived = process_launcher.derive_launch_identity(
+            root, {"runner": runner, "topic": "aiworkhub"}, adapter_id=adapter_id
+        )
+
+        assert derived["model"] == model, runner
+        assert derived["derived_from"]["model"] == "catalog_launch_identities", runner
+
+
+def test_launch_derivation_without_an_adapter_pins_an_enabled_opencode_route(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    _write_model_settings(root, models=_enabled_route_models())
+    card = {
+        "task_id": "T_OMNIROUTE",
+        "runner": _OMNIROUTE_ROUTE_RUNNER,
+        "topic": "coding",
+        "task_type": "code",
+        "allowed_writes": ["src/a.py"],
+    }
+
+    derived = process_launcher.derive_launch_identity(root, card)
+
+    assert derived["adapter_id"] == "opencode_cli"
+    assert derived["model"] == _OMNIROUTE_MODEL
+    assert derived["derived_from"]["model"] == "catalog_launch_identities"
+
+
+def test_launch_derivation_without_an_adapter_pins_an_enabled_glm_route(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = _root(tmp_path)
+    _write_model_settings(root, models={"copilot": {"vscode_lm": {"glm-5.3": True}}})
+    monkeypatch.setattr(
+        process_launcher.vscode_lm_bridge,
+        "derived_candidate_blocker",
+        lambda *_args, **_kwargs: None,
+    )
+
+    derived = process_launcher.derive_launch_identity(
+        root, {"runner": _GLM_CATALOG_RUNNER, "topic": "aiworkhub"}
+    )
+
+    assert derived["model"] == "glm-5.3"
+    assert derived["derived_from"]["model"] == "catalog_launch_identities"
+
+
+def test_launch_derivation_pins_no_model_for_a_disabled_models_json_route(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    _write_model_settings(root, models={"copilot": {"vscode_lm": {"glm-5.3": False}}})
+
+    for runner, adapter_id in (
+        (_GLM_CATALOG_RUNNER, "glm_vscode_lm"),
+        (_GLM_ROUTE_RUNNER, "vscode_lm"),
+    ):
+        derived = process_launcher.derive_launch_identity(
+            root, {"runner": runner, "topic": "aiworkhub"}, adapter_id=adapter_id
+        )
+
+        assert derived["model"] is None, runner
+        assert "model" not in derived["derived_from"], runner

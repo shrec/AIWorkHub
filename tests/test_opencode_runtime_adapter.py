@@ -219,6 +219,46 @@ def test_opencode_model_without_provider_identity_fails_closed(
     )
 
 
+@pytest.mark.parametrize("model", [None, "", "   "], ids=["none", "empty", "blank"])
+def test_opencode_absent_model_is_labelled_model_required(model: str | None) -> None:
+    assert runtime_adapters.resolve_opencode_model(model) == (
+        None,
+        "unsupported_opencode_model:model_required",
+    )
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["openai /gpt-4", "openai/gpt\x004", "\x00"],
+    ids=["inner_space", "embedded_nul", "bare_nul"],
+)
+def test_opencode_present_malformed_model_stays_malformed(model: str) -> None:
+    assert runtime_adapters.resolve_opencode_model(model) == (
+        None,
+        "unsupported_opencode_model:malformed",
+    )
+
+
+def test_opencode_launch_plan_without_a_model_names_model_required(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    plan = runtime_adapters.build_runtime_command(
+        runtime_adapters.OPENCODE_CLI_ADAPTER,
+        "Prompt",
+        repo,
+        model=None,
+        executable_overrides={
+            runtime_adapters.OPENCODE_CLI_ADAPTER: _executable(tmp_path, "opencode")
+        },
+    )
+
+    assert plan.launchable is False
+    assert plan.argv == []
+    assert plan.validation_reason == "unsupported_opencode_model:model_required"
+
+
 def test_opencode_windows_resolves_through_the_same_path_as_every_adapter(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

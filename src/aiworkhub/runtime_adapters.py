@@ -1241,7 +1241,9 @@ def resolve_grok_kilo_model(model: str | None) -> tuple[str | None, str | None]:
 def resolve_opencode_model(model: str | None) -> tuple[str | None, str | None]:
     """Preserve an exact OpenCode ``provider/model`` identity; no inventory."""
 
-    if not isinstance(model, str) or not model.strip() or "\x00" in model:
+    if model is None or (isinstance(model, str) and not model.strip()):
+        return None, "unsupported_opencode_model:model_required"
+    if not isinstance(model, str) or "\x00" in model:
         return None, "unsupported_opencode_model:malformed"
     candidate = model.strip()
     if any(ch.isspace() for ch in candidate):

@@ -836,29 +836,112 @@ def _route_circuit(
 LAUNCH_ROUTE_SCHEMA_ID = "aiworkhub.launch_route_identity.v1"
 
 
+def _family_stem(model: Any) -> str:
+    """The provider-family stem of a model id: its leading letters (``glm`` for ``glm-5.2``)."""
+
+    stem_match = re.match(r"[a-z]+", str(model or "").lower())
+    return stem_match.group(0) if stem_match else ""
+
+
+def _in_family(stem: str, name: str) -> bool:
+    """Whether the model ``name`` belongs to the provider family ``stem``."""
+
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-").startswith(stem)
+
+
+def _is_discovery_seed_for(worker: Mapping[str, Any], model: str) -> bool:
+    """Whether ``worker`` seeds editor discovery for the family ``model`` belongs to."""
+
+    if str(worker.get("adapter_id") or "") not in _DISCOVERY_ADAPTERS:
+        return False
+    stem = _family_stem(worker.get("model"))
+    return bool(stem) and _in_family(stem, model)
+
+
+def _model_settings_route_adapters(
+    workers: list[dict[str, Any]], provider: str, adapter: str, model: str
+) -> tuple[str, tuple[str, ...]]:
+    """The declared adapter, and every adapter, an enabled ``models.json`` leaf publishes under."""
+
+    if model_settings.policy_route_identity(provider, adapter) == ("copilot", "vscode_lm"):
+        for worker in workers:
+            if _is_discovery_seed_for(worker, model):
+                declared = str(worker.get("adapter_id") or "")
+                return declared, (declared, *_WORKER_ADAPTER_FALLBACKS.get(declared, ()))
+    return adapter, (adapter,)
+
+
+def _model_settings_launch_identities(
+    repo_root: Path | str,
+    workers: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Owner-enabled ``models.json`` leaves as launch identities; none if unreadable."""
+
+    try:
+        state = model_settings.load(repo_root)
+        routes: dict[str, dict[str, Any]] = {}
+        for provider, adapters in sorted(state["models"].items()):
+            for adapter, leaves in sorted(adapters.items()):
+                for model in sorted(leaves):
+                    if not model_identity_valid(model) or not model_settings.evaluate_state(
+                        state, provider=provider, adapter=adapter, model=model
+                    ):
+                        continue
+                    worker_id = (
+                        _opencode_worker_id(model) if adapter == "opencode_cli" else model
+                    )
+                    declared, route_adapters = _model_settings_route_adapters(
+                        workers, provider, adapter, model
+                    )
+                    for route_adapter in route_adapters:
+                        routes.setdefault(
+                            execution_runner(worker_id, route_adapter),
+                            {
+                                "worker_id": worker_id,
+                                "adapter_id": declared,
+                                "route_adapter_id": route_adapter,
+                                "model": model,
+                                "provider": provider,
+                                "identity_source": "model_settings",
+                            },
+                        )
+        return routes
+    except model_settings.ModelSettingsError:
+        return {}
+
+
 def catalog_launch_identities(
     repo_root: Path | str,
 ) -> dict[str, dict[str, Any]]:
-    """Return every runner identity this repository's catalog can construct.
+    """Return every runner identity this repository's configuration can construct.
 
-    Read from ``load_catalog`` (configuration plus the built-in defaults), NOT
-    from ``build_catalog``: configuration is a fact about the repository, while
-    a built catalog is a fact about the host that happens to be running -- its
-    rows appear and disappear with an editor window, and its
-    ``launch_eligible`` reads false for every ``claude_cli`` route on a machine
-    where the MCP server cannot see that CLI.  An identity vocabulary that
-    changes when a window closes is not an identity vocabulary.
+    Read from ``load_catalog`` (configuration plus the built-in defaults) and the
+    routes the owner enabled in ``models.json``, NOT from ``build_catalog``: both
+    are facts about the repository, while a built catalog is a fact about the
+    host that happens to be running -- its rows appear and disappear with an
+    editor window, and its ``launch_eligible`` reads false for every
+    ``claude_cli`` route on a machine where the MCP server cannot see that CLI.
+    An identity vocabulary that changes when a window closes is not an identity
+    vocabulary.
 
     Both the declared adapter and each documented transport fallback are
-    published, because a worker legitimately launches under either one.
+    published, because a worker legitimately launches under either one.  A
+    ``models.json`` leaf in a family the catalog seeds for editor discovery
+    (``glm-5.3`` under the ``glm-5.2`` seed) is published exactly as the
+    discovered row is, so the runner the catalog names for that route is the
+    runner that pins its model; any other leaf is published under its own
+    adapter only.  A catalog row wins any runner collision.
     """
 
+    workers = load_catalog(repo_root)["workers"]
     identities: dict[str, dict[str, Any]] = {}
-    for worker in load_catalog(repo_root)["workers"]:
+    for worker in workers:
         declared = str(worker.get("adapter_id") or "")
         for adapter in (declared, *_WORKER_ADAPTER_FALLBACKS.get(declared, ())):
             runner = execution_runner(str(worker.get("worker_id") or ""), adapter)
             identities.setdefault(runner, {**dict(worker), "route_adapter_id": adapter})
+    for runner, route in _model_settings_launch_identities(repo_root, workers).items():
+        identities.setdefault(runner, route)
     return identities
 
 
@@ -878,20 +961,15 @@ def catalog_declares_route(repo_root: Path | str, adapter_id: str, model: str) -
     name = str(model or "").strip()
     if not adapter or not name:
         return False
-    stem_match = re.match(r"[a-z]+", name.lower())
-    stem = stem_match.group(0) if stem_match else ""
     for worker in load_catalog(repo_root)["workers"]:
         declared = str(worker.get("adapter_id") or "")
         adapters = (declared, *_WORKER_ADAPTER_FALLBACKS.get(declared, ()))
         if adapter not in adapters:
             continue
-        worker_model = str(worker.get("model") or "")
-        if name in route_model_identities(worker_model):
+        if name in route_model_identities(str(worker.get("model") or "")):
             return True
-        if declared in _DISCOVERY_ADAPTERS and stem:
-            seed_stem = re.match(r"[a-z]+", worker_model.lower())
-            if seed_stem is not None and seed_stem.group(0) == stem:
-                return True
+        if _is_discovery_seed_for(worker, name):
+            return True
     return False
 
 
@@ -1146,15 +1224,13 @@ def _discovered_family_models(
     observed = readiness.get("observed_models")
     if not isinstance(observed, list):
         return []
-    stem_match = re.match(r"[a-z]+", str(worker.get("model") or "").lower())
-    stem = stem_match.group(0) if stem_match else ""
+    stem = _family_stem(worker.get("model"))
     discovered: list[str] = []
     for value in observed:
         name = str(value).strip()
         if not name or not runtime_adapters.editor_requested_name_ok(name):
             continue
-        normalized = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-        if stem and not normalized.startswith(stem):
+        if not _in_family(stem, name):
             continue
         if name not in discovered:
             discovered.append(name)
