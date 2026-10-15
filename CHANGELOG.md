@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.55] - 2026-10-16
+
+### Fixed
+
+- VS Code LM (GLM) routing reads the freshest host heartbeats first and prunes dead-window heartbeat files, so a live VS Code window is no longer rejected as `host_stale` (NF-2026-01550).
+- OpenCode model discovery retries an `opencode models` probe that exits cleanly with no rows, the same as a timeout, before serving the last good list (NF-2026-01551).
+- A rework whose sealed predecessor delta is rebased onto a newer canonical parent no longer fails `required_output_unchanged` on the untouched inherited output; the materializer records the digest of the bytes it wrote (NF-2026-01552).
+- A rework that reproduces a predecessor rejected for an operational reason (validation environment, provider runtime, dependency or route, cancellation or timeout) is no longer refused as `rework_no_delta`; `candidate_code` and unknown categories still refuse (NF-2026-01555).
+
 ## [0.12.54] - 2026-10-15
 
 ### Added

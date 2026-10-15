@@ -1,5 +1,11 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.55 — 2026-10-16
+
+### Fixed
+
+- Bundled runtime 0.12.55: VS Code LM (GLM) routing no longer reports a live window as `host_stale` (NF-2026-01550); OpenCode model discovery retries an empty probe (NF-2026-01551); a rework rebased onto newer canonical code keeps its inherited required outputs (NF-2026-01552); a rework that reproduces an operationally-failed predecessor is no longer refused as `rework_no_delta` (NF-2026-01555).
+
 ## 0.12.54 — 2026-10-15
 
 ### Fixed
