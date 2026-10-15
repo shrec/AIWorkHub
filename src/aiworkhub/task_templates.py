@@ -70,6 +70,9 @@ __all__ = [
     "MAX_PATH_LENGTH",
     "MAX_PATHS_PER_FIELD",
     "MAX_TITLE_LENGTH",
+    "ALLOWED_PRIORITIES",
+    "ALLOWED_RISK_TIERS",
+    "ALLOWED_DIFFICULTIES",
     "build_contract_patch",
     "canonical_validation_command",
     "contract_patch_digest",
@@ -118,6 +121,12 @@ MAX_PATH_LENGTH = 500
 # accepted and stored today.
 MAX_TITLE_LENGTH = 300
 MAX_OBJECTIVE_LENGTH = 4000
+
+# Single owner for the create_task allowed-value vocabularies (moved from
+# core.py so needfix preview and create_task refuse the same values).
+ALLOWED_PRIORITIES: tuple[str, ...] = ("low", "normal", "high", "critical")
+ALLOWED_RISK_TIERS: tuple[str, ...] = ("low", "medium", "high", "critical")
+ALLOWED_DIFFICULTIES: tuple[str, ...] = ("bounded", "standard", "complex")
 
 # The canonical interpreter head for every generated validation command.
 #

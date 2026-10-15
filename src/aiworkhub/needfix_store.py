@@ -3093,6 +3093,18 @@ def validate_task_plan(task_plan: Mapping[str, Any] | None) -> dict[str, Any]:
         if not isinstance(value, str) or not value.strip() or len(value) > 4000:
             raise NeedFixValidationError(f"task_plan.{field} must be a non-empty bounded string")
         validated[field] = value
+    from . import task_templates
+
+    _allowed_by_field = {
+        "priority": task_templates.ALLOWED_PRIORITIES,
+        "risk_tier": task_templates.ALLOWED_RISK_TIERS,
+        "difficulty": task_templates.ALLOWED_DIFFICULTIES,
+    }
+    for field, allowed in _allowed_by_field.items():
+        if field in validated and validated[field] not in allowed:
+            raise NeedFixValidationError(
+                f"task_plan.{field} {validated[field]!r} invalid; allowed: {list(allowed)}"
+            )
     for field in _TASK_PLAN_BOOL_FIELDS:
         if field not in task_plan:
             continue

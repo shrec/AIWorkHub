@@ -4305,9 +4305,9 @@ def create_task(
 
     title_limit = task_templates.MAX_TITLE_LENGTH
     objective_limit = task_templates.MAX_OBJECTIVE_LENGTH
-    allowed_priorities = ("low", "normal", "high", "critical")
-    allowed_risk_tiers = ("low", "medium", "high", "critical")
-    allowed_difficulties = ("bounded", "standard", "complex")
+    allowed_priorities = task_templates.ALLOWED_PRIORITIES
+    allowed_risk_tiers = task_templates.ALLOWED_RISK_TIERS
+    allowed_difficulties = task_templates.ALLOWED_DIFFICULTIES
     allowed_task_types = ("code", "data_classification", "research")
     violations: list[dict[str, Any]] = []
     violation_extra: dict[str, Any] = {}

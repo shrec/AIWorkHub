@@ -792,3 +792,20 @@ def test_verify_integrated_commit_rejects_non_hex_without_running_git(
 
     assert core._verify_integrated_commit(repo_root, "--output=x") is None
     assert core._verify_integrated_commit(repo_root, "HEAD~1") is None
+
+
+def test_validate_task_plan_refuses_invalid_priority():
+    with pytest.raises(needfix_store.NeedFixValidationError, match="priority.*medium.*allowed"):
+        needfix_store.validate_task_plan({"priority": "medium"})
+
+
+def test_validate_task_plan_refuses_invalid_difficulty():
+    with pytest.raises(needfix_store.NeedFixValidationError, match="difficulty.*simple.*allowed"):
+        needfix_store.validate_task_plan({"difficulty": "simple"})
+
+
+def test_validate_task_plan_accepts_valid_values():
+    validated = needfix_store.validate_task_plan(
+        {"priority": "high", "risk_tier": "medium", "difficulty": "bounded"}
+    )
+    assert validated == {"priority": "high", "risk_tier": "medium", "difficulty": "bounded"}
