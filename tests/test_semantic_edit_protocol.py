@@ -100,14 +100,20 @@ def test_worker_semantic_edit_is_hash_bound_atomic_and_idempotent(tmp_path: Path
     )
     session = worker_tools.WorkerSemanticEditSession(ctx)
 
-    prepared = session.prepare(file_path="src/module.py", start_line=2, end_line=3)
+    # NF-2026-01533: the anchors name the first and last line being replaced.
+    prepared = session.prepare(
+        file_path="src/module.py", start_line=2, end_line=3,
+        expected_first_line="def target():", expected_last_line="return 1",
+    )
     assert prepared["ok"] is True
+    assert "anchor_relocated_from" not in prepared
     result = session.apply(
         target_id=prepared["target_id"],
         new="def target():\n    return 2",
         idempotency_key="edit-1",
     )
     assert result["ok"] is True
+    assert (result["start_line"], result["end_line"]) == (2, 3)
     assert result["model_reemitted_old_bytes"] == 0
     assert result["file_bytes"] == len("before\ndef target():\n    return 1\nafter\n".encode())
     assert target.read_text(encoding="utf-8") == "before\ndef target():\n    return 2\nafter\n"
@@ -281,7 +287,10 @@ def test_verified_audit_exposes_only_semantic_edit_byte_receipt(
         allowed_writes=("src/*.py",),
     )
     session = worker_tools.WorkerSemanticEditSession(ctx)
-    prepared = session.prepare(file_path="src/module.py", start_line=2, end_line=3)
+    prepared = session.prepare(
+        file_path="src/module.py", start_line=2, end_line=3,
+        expected_first_line="def target():", expected_last_line="return 1",
+    )
     applied = session.apply(
         target_id=prepared["target_id"],
         new="def target():\n    return 2",

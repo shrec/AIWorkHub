@@ -1214,6 +1214,8 @@ def aiworkhub_manager_semantic_edit_prepare(
     start_line: int,
     end_line: int,
     include_fragment: bool = False,
+    expected_first_line: str | None = None,
+    expected_last_line: str | None = None,
 ) -> dict[str, Any]:
     """MANAGER EDIT: bind one verified file range before changing it."""
 
@@ -1222,6 +1224,8 @@ def aiworkhub_manager_semantic_edit_prepare(
         start_line=start_line,
         end_line=end_line,
         include_fragment=include_fragment,
+        expected_first_line=expected_first_line,
+        expected_last_line=expected_last_line,
     )
 
 

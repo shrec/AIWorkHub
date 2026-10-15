@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from aiworkhub import process_launcher, task_store, vscode_lm_bridge, vscode_lm_worker, worker_ai_tools_mcp
+from aiworkhub import semantic_edit
 
 
 def _request(
@@ -114,18 +115,26 @@ def _authenticated_handoff(
              "state": "running", "metadata_path": str(metadata_path)}
     monkeypatch.setattr(manager, "_request_events", lambda rid: [event] if rid == request_id else [])
     monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
+    # NF-2026-01533: anchor the range on the text of its first and last line,
+    # numbered by the editor's own line model (an empty file's virtual line is "").
+    lines = semantic_edit._split_lines(
+        (workspace / relative).read_bytes().decode("utf-8")
+    ) or [""]
     prepared = manager.invoke_vscode_lm_worker_tool(
         request_id, "aiworkhub_worker_semantic_edit_prepare",
         {"file_path": relative, "start_line": start, "end_line": end,
+         "expected_first_line": lines[start - 1], "expected_last_line": lines[end - 1],
          "provider_call_id": "nf1298.prepare"},
     )
     assert prepared["ok"] is True, prepared
+    assert "anchor_relocated_from" not in prepared
     applied = manager.invoke_vscode_lm_worker_tool(
         request_id, "aiworkhub_worker_semantic_edit_apply",
         {"target_id": prepared["target_id"], "new": new,
          "idempotency_key": "nf1298.apply", "provider_call_id": "nf1298.apply"},
     )
     assert applied["ok"] is True, applied
+    assert (applied["start_line"], applied["end_line"]) == (start, end)
     assert applied["preimage_verified"] is True
     assert applied["before_sha256"] == prepared["current_sha256"]
     assert applied["after_sha256"] == hashlib.sha256((workspace / relative).read_bytes()).hexdigest()

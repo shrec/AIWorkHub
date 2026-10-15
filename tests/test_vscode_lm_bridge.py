@@ -1431,6 +1431,8 @@ def _nf1291_prepare(manager, request_id, **overrides):
     return manager.invoke_vscode_lm_worker_tool(
         request_id, "aiworkhub_worker_semantic_edit_prepare",
         {"file_path": "src/app.py", "start_line": 1, "end_line": 1,
+         # NF-2026-01533: the bridge forwards the content anchors.
+         "expected_first_line": "before", "expected_last_line": "before",
          "provider_call_id": "nf1291.prepare", **overrides},
     )
 
@@ -1696,10 +1698,12 @@ def test_glm_bridge_tool_runs_with_exact_worker_audit_context(
     prepared = manager.invoke_vscode_lm_worker_tool(
         request_id,
         "aiworkhub_manager_semantic_edit_prepare",
-        {"file_path": "src/app.py", "start_line": 2, "end_line": 3},
+        {"file_path": "src/app.py", "start_line": 2, "end_line": 3,
+         "expected_first_line": "def target():", "expected_last_line": "return 1"},
     )
     assert prepared["ok"] is True
     assert prepared["fragment"] == "def target():\n    return 1\n"
+    assert "anchor_relocated_from" not in prepared
     assert prepared["file_bytes"] > prepared["fragment_bytes"]
     assert prepared["token_savings_claimed"] is False
 
@@ -1712,15 +1716,32 @@ def test_glm_bridge_tool_runs_with_exact_worker_audit_context(
     assert text_provider_alias["path"] == "src/app.py"
     assert text_provider_alias["fragment"] == prepared["fragment"]
 
+    # NF-2026-01533: anchors that match nowhere near are refused with the real
+    # lines rather than bound to whatever the numbers point at.
+    refused = manager.invoke_vscode_lm_worker_tool(
+        request_id,
+        "aiworkhub_manager_semantic_edit_prepare",
+        {"path": "src/app.py", "start_line": 2, "end_line": 3,
+         "expected_first_line": "def other():", "expected_last_line": "return 1"},
+    )
+    assert refused["ok"] is False
+    assert refused["reason"] == "semantic_edit_anchor_mismatch:src/app.py"
+    assert refused["actual_first_line"] == "def target():"
+    assert refused["candidates"] == []
+
     # NF1291: use the advertised worker pair, not the legacy manager alias.
     monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
+    # A range one line short of its anchors is moved onto them by the bridge.
     worker_prepared = manager.invoke_vscode_lm_worker_tool(
         request_id,
         "aiworkhub_worker_semantic_edit_prepare",
-        {"file_path": "src/app.py", "start_line": 2, "end_line": 3,
+        {"file_path": "src/app.py", "start_line": 1, "end_line": 2,
+         "expected_first_line": "def target():", "expected_last_line": "return 1",
          "provider_call_id": "nf1291.prepare"},
     )
     assert worker_prepared["ok"] is True, worker_prepared
+    assert (worker_prepared["start_line"], worker_prepared["end_line"]) == (2, 3)
+    assert worker_prepared["anchor_relocated_from"] == {"start_line": 1, "end_line": 2}
     replacement = "def target():\n    return 2\n"
     apply_input = {
         "target_id": worker_prepared["target_id"], "new": replacement,
@@ -1730,6 +1751,7 @@ def test_glm_bridge_tool_runs_with_exact_worker_audit_context(
         request_id, "aiworkhub_worker_semantic_edit_apply", dict(apply_input),
     )
     assert applied["ok"] is True, applied
+    assert (applied["start_line"], applied["end_line"]) == (2, 3)
     assert source_file.read_bytes() == b"before\ndef target():\n    return 2\nafter\n"
     assert applied["before_sha256"] == worker_prepared["current_sha256"]
     assert applied["preimage_verified"] is True

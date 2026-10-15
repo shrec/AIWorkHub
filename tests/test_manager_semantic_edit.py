@@ -15,6 +15,7 @@ Run: python3 -m pytest -q tests/test_manager_semantic_edit.py
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import subprocess
@@ -41,15 +42,28 @@ def _repo(tmp_path: Path, text: str = "one\ntwo\nthree\nfour\nfive\n") -> Path:
     return tmp_path
 
 
-def _prepare(root: Path, start: int, end: int):
+def _prepare(root: Path, start: int, end: int, **anchors: str):
     return semantic_edit.prepare_line_target(
-        root, path="x.py", start_line=start, end_line=end, allowed_writes=["x.py"]
+        root, path="x.py", start_line=start, end_line=end, allowed_writes=["x.py"],
+        **anchors,
     )
 
 
 def test_only_the_named_range_changes(tmp_path):
     root = _repo(tmp_path)
-    target = _prepare(root, 2, 3)
+    target = _prepare(root, 2, 3, expected_first_line="two", expected_last_line="three")
+    semantic_edit_applier.replace_prepared_range(
+        root, target, "TWO\nTHREE\n", allowed_writes=["x.py"]
+    )
+    assert (root / "x.py").read_text(encoding="utf-8") == "one\nTWO\nTHREE\nfour\nfive\n"
+
+
+def test_a_relocated_target_replaces_the_lines_its_anchors_name(tmp_path):
+    """NF-2026-01533: a range one line short is bound, and replaced, where its
+    anchors are; the applier re-verifies the relocated range, not the request."""
+    root = _repo(tmp_path)
+    target = _prepare(root, 1, 2, expected_first_line="two", expected_last_line="three")
+    assert (target.start_line, target.end_line, target.anchor_relocated_from) == (2, 3, (1, 2))
     semantic_edit_applier.replace_prepared_range(
         root, target, "TWO\nTHREE\n", allowed_writes=["x.py"]
     )
@@ -237,6 +251,7 @@ def test_manager_prepare_and_apply_round_trip(tmp_path, monkeypatch):
 
     prepared = manager_ai_tools.semantic_edit_prepare(
         file_path="x.py", start_line=2, end_line=3,
+        expected_first_line="two", expected_last_line="three",
     )
     assert prepared["ok"] is True, prepared
     assert prepared["fragment"] == "two\nthree\n"
@@ -260,6 +275,64 @@ def test_manager_prepare_and_apply_round_trip(tmp_path, monkeypatch):
     assert applied["token_savings_claimed"] is False
     assert applied["preimage_verified"] is True
     assert applied["schema_id"] == "aiworkhub.semantic_edit_apply_receipt.v1"
+    assert (applied["start_line"], applied["end_line"]) == (2, 3)
+
+
+def test_manager_prepare_relocates_by_anchor_and_refuses_a_mismatch(tmp_path, monkeypatch):
+    """NF-2026-01533: the manager surface passes the content anchors through."""
+    root = _repo(tmp_path)
+    _seat(monkeypatch, root)
+
+    moved = manager_ai_tools.semantic_edit_prepare(
+        file_path="x.py", start_line=1, end_line=2,
+        expected_first_line="two", expected_last_line="three",
+    )
+    assert moved["ok"] is True, moved
+    assert (moved["start_line"], moved["end_line"]) == (2, 3)
+    assert moved["anchor_relocated_from"] == {"start_line": 1, "end_line": 2}
+    applied = manager_ai_tools.semantic_edit_apply(
+        target_id=moved["target_id"], new="TWO\nTHREE\n",
+        idempotency_key="manager-anchor-1",
+    )
+    assert applied["ok"] is True, applied
+    assert (applied["start_line"], applied["end_line"]) == (2, 3)
+    assert (root / "x.py").read_text(encoding="utf-8") == "one\nTWO\nTHREE\nfour\nfive\n"
+
+    refused = manager_ai_tools.semantic_edit_prepare(
+        file_path="x.py", start_line=4, end_line=4,
+        expected_first_line="absent", expected_last_line="absent",
+    )
+    assert refused["ok"] is False
+    assert refused["reason"] == "semantic_edit_anchor_mismatch:x.py"
+    assert refused["actual_first_line"] == "four"
+    assert refused["numbered_context"][:2] == ["1\tone", "2\tTWO"]
+    assert refused["candidates"] == []
+    assert refused["surface"] == "manager_mcp"
+
+
+def test_the_manager_mcp_tool_forwards_both_anchors():
+    """``server.py`` is the manager's MCP edge: both anchors are parameters
+    that default to absent and are handed on to ``manager_ai_tools``."""
+    tree = ast.parse((_ROOT / "src" / "aiworkhub" / "server.py").read_text(encoding="utf-8"))
+    tool = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "aiworkhub_manager_semantic_edit_prepare"
+    )
+    defaults = dict(zip(
+        [arg.arg for arg in tool.args.args][-len(tool.args.defaults):],
+        [ast.literal_eval(default) for default in tool.args.defaults],
+    ))
+    call = next(
+        node for node in ast.walk(tool)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "semantic_edit_prepare"
+    )
+    forwarded = {keyword.arg: keyword.value for keyword in call.keywords}
+    for name in ("expected_first_line", "expected_last_line"):
+        assert defaults[name] is None
+        assert isinstance(forwarded[name], ast.Name) and forwarded[name].id == name
 
 
 def test_the_manager_apply_reaches_the_authenticated_ledger(tmp_path, monkeypatch):

@@ -12738,6 +12738,10 @@ class ProcessManager:
                     start_line=tool_input.get("start_line", 0),
                     end_line=tool_input.get("end_line", 0),
                     include_fragment=tool_input.get("include_fragment") is True,
+                    # NF-2026-01533: absent anchors stay None, so a bridge that
+                    # sends none keeps the unanchored contract.
+                    expected_first_line=tool_input.get("expected_first_line"),
+                    expected_last_line=tool_input.get("expected_last_line"),
                 )
             # NF-2026-01373: emulated models omit idempotency_key even when named;
             # it only dedupes an identical replay, so derive it from that pair.
@@ -12770,6 +12774,8 @@ class ProcessManager:
                 file_path=tool_input.get("file_path") or tool_input.get("path", ""),
                 start_line=tool_input.get("start_line", 0),
                 end_line=tool_input.get("end_line", 0),
+                expected_first_line=tool_input.get("expected_first_line"),
+                expected_last_line=tool_input.get("expected_last_line"),
             )
         if tool_name == "aiworkhub_manager_session_current_state":
             return worker_ai_tools_mcp.session_current_state(ctx, limit=tool_input.get("limit", 12))

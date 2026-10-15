@@ -7219,6 +7219,8 @@ class WorkerSemanticEditSession:
         start_line: int,
         end_line: int,
         include_fragment: bool = False,
+        expected_first_line: str | None = None,
+        expected_last_line: str | None = None,
     ) -> dict[str, Any]:
         tool = "semantic_edit_prepare"
         try:
@@ -7228,14 +7230,28 @@ class WorkerSemanticEditSession:
                 start_line=start_line,
                 end_line=end_line,
                 allowed_writes=self.ctx.allowed_writes,
+                expected_first_line=expected_first_line,
+                expected_last_line=expected_last_line,
             )
+        except semantic_edit.SemanticEditAnchorMismatch as exc:
+            # The real lines and where the anchors do match ride on the reply
+            # so the next prepare can name the intended range.  Unlike other
+            # refusals this one carries file content, so the ledger records
+            # the bytes it returns.
+            shown = len(json.dumps(exc.detail, ensure_ascii=False).encode("utf-8"))
+            _append_audit(
+                self.ctx, tool=tool, ok=False, cache_hit=False, hit_count=0,
+                bytes_returned=shown, violation=str(exc),
+            )
+            return {"ok": False, "tool": tool, "reason": str(exc), **exc.detail}
         except semantic_edit.SemanticEditError as exc:
             return _violation(self.ctx, tool, str(exc))
         target_id = secrets.token_hex(16)
+        # The bound range, not the request: content anchors may have moved it.
         delivered_by = (
             None if include_fragment
             else self._delivered_by(
-                target.path, target.current_sha256, start_line, end_line,
+                target.path, target.current_sha256, target.start_line, target.end_line,
             )
         )
         with self._lock:
@@ -7245,7 +7261,8 @@ class WorkerSemanticEditSession:
         )
         if delivered_by is None:
             self._note_delivery(
-                target.path, target.current_sha256, start_line, end_line, target_id,
+                target.path, target.current_sha256, target.start_line, target.end_line,
+                target_id,
             )
             bytes_returned = target.fragment_bytes
         else:
@@ -7334,6 +7351,10 @@ class WorkerSemanticEditSession:
             "schema_id": "aiworkhub.semantic_edit_apply_receipt.v1",
             "target_id": target_id,
             "path": target.path,
+            # The range actually replaced: content anchors may have moved it
+            # off the one the caller first asked prepare for.
+            "start_line": target.start_line,
+            "end_line": target.end_line,
             "before_sha256": target.current_sha256,
             "after_sha256": hashlib.sha256(next_bytes).hexdigest(),
             "idempotency_key": idempotency_key,
@@ -8974,6 +8995,8 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
     def _semantic_edit_prepare(
         file_path: str, start_line: int, end_line: int,
         include_fragment: bool = False,
+        expected_first_line: str | None = None,
+        expected_last_line: str | None = None,
     ) -> dict[str, Any]:
         """Bind one Source Graph-selected line range's hashes for apply.
 
@@ -8982,10 +9005,13 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
         Source Graph reply) comes back hash-only with ``fragment_omitted``
         and ``delivered_by``, which is all apply needs. Pass
         include_fragment=true to force the text.
+        expected_first_line/expected_last_line: the exact text of the first/last line to replace.
         """
         return semantic_edits.prepare(
             file_path=file_path, start_line=start_line, end_line=end_line,
             include_fragment=include_fragment,
+            expected_first_line=expected_first_line,
+            expected_last_line=expected_last_line,
         )
 
     @mcp.tool(name="aiworkhub_worker_semantic_edit_apply")

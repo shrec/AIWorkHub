@@ -42,6 +42,20 @@ class SemanticEditError(RuntimeError):
     """Fail-closed semantic edit contract violation."""
 
 
+class SemanticEditAnchorMismatch(SemanticEditError):
+    """Content anchors matched neither the requested range nor one unique shift.
+
+    ``str()`` is the stable ``semantic_edit_anchor_mismatch:<path>`` reason;
+    ``detail`` holds what the caller needs to name the intended range: the
+    requested range's actual first and last line, its numbered surroundings,
+    the ranges where both anchors do match and the next call to make.
+    """
+
+    def __init__(self, path: str, detail: dict[str, Any]) -> None:
+        super().__init__(f"semantic_edit_anchor_mismatch:{path}")
+        self.detail = detail
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedLineTarget:
     path: str
@@ -52,6 +66,9 @@ class PreparedLineTarget:
     fragment: str
     file_bytes: int
     fragment_bytes: int
+    # The ``(start_line, end_line)`` the caller asked for when its content
+    # anchors moved the range; ``None`` when it was bound where it was asked.
+    anchor_relocated_from: tuple[int, int] | None = None
 
     def receipt(
         self, *, target_id: str = "", include_fragment: bool = True,
@@ -81,6 +98,11 @@ class PreparedLineTarget:
             payload["fragment"] = self.fragment
         else:
             payload["fragment_omitted"] = True
+        if self.anchor_relocated_from is not None:
+            payload["anchor_relocated_from"] = {
+                "start_line": self.anchor_relocated_from[0],
+                "end_line": self.anchor_relocated_from[1],
+            }
         if target_id:
             payload["target_id"] = target_id
         return payload
@@ -264,6 +286,118 @@ def _line_slice(text: str, start_line: object, end_line: object) -> tuple[list[s
     return lines, "".join(lines[start_line - 1 : end_line])
 
 
+# NF-2026-01533: a model derives line numbers by counting un-numbered Source
+# Graph text, so a range a few lines off was bound and applied silently (GLM 5.3
+# in EntryLink: shifts 0/-2/-1/-1 with the right replacement text).  Content
+# anchors -- the text of the first and last line the caller means to replace --
+# verify the range, move it by one nearby unique shift, or refuse it.
+_ANCHOR_SHIFT_LIMIT = 16
+_ANCHOR_CONTEXT_LINES = 3
+_ANCHOR_CONTEXT_MAX_ROWS = 60
+_ANCHOR_MAX_CANDIDATES = 5
+# A refusal shows at most this many characters of any one line, so a minified
+# or generated file cannot turn the 60-row window into megabytes of reply.
+_ANCHOR_SHOWN_CHARS = 240
+
+
+def _anchor_text(line: str) -> str:
+    """``line`` as anchors compare it: stripped, without a UTF-8 BOM on line 1."""
+    return line.lstrip("\ufeff").strip()
+
+
+def _anchor_shown(line: str) -> str:
+    """``line`` as a refusal displays it: no BOM, bounded length."""
+    text = _line_content(line).lstrip("\ufeff")
+    if len(text) <= _ANCHOR_SHOWN_CHARS:
+        return text
+    return text[:_ANCHOR_SHOWN_CHARS] + f"...[truncated {len(text)} chars]"
+
+
+def _validated_anchors(
+    relative: str, expected_first_line: object, expected_last_line: object,
+) -> tuple[str, str] | None:
+    """Return both stripped anchors, or ``None`` when neither was given.
+
+    One anchor alone cannot tell a shifted range from a resized one, so it is
+    refused rather than half-checked.
+    """
+    if expected_first_line is None and expected_last_line is None:
+        return None
+    if expected_first_line is None or expected_last_line is None:
+        raise SemanticEditError(f"semantic_edit_anchor_incomplete:{relative}")
+    if not isinstance(expected_first_line, str) or not isinstance(expected_last_line, str):
+        raise SemanticEditError(f"semantic_edit_anchor_invalid:{relative}")
+    return _anchor_text(expected_first_line), _anchor_text(expected_last_line)
+
+
+def _anchored_range(
+    relative: str,
+    lines: list[str],
+    start_line: int,
+    end_line: int,
+    first: str,
+    last: str,
+) -> tuple[int, int]:
+    """Return the range whose first and last line strip to ``first`` and ``last``.
+
+    The requested range wins when it matches.  Otherwise the same span is tried
+    1..``_ANCHOR_SHIFT_LIMIT`` lines away, nearest first (``-d`` then ``+d``),
+    and the range moves only when exactly one shift matches and the anchors are
+    not both empty: blank lines identify nothing.  Anything else raises
+    :class:`SemanticEditAnchorMismatch` and binds nothing.
+    """
+    lines = lines or [""]  # the empty file's one virtual line (``_line_slice``)
+    span = end_line - start_line
+
+    def anchored(start: int) -> bool:
+        end = start + span
+        return (
+            start >= 1
+            and end <= len(lines)
+            and _anchor_text(lines[start - 1]) == first
+            and _anchor_text(lines[end - 1]) == last
+        )
+
+    if anchored(start_line):
+        return start_line, end_line
+    if first or last:
+        shifted = [
+            start_line + offset
+            for distance in range(1, _ANCHOR_SHIFT_LIMIT + 1)
+            for offset in (-distance, distance)
+            if anchored(start_line + offset)
+        ]
+        if len(shifted) == 1:
+            return shifted[0], shifted[0] + span
+    candidates = sorted(
+        (start for start in range(1, len(lines) - span + 1) if anchored(start)),
+        key=lambda start: (abs(start - start_line), start),
+    )[:_ANCHOR_MAX_CANDIDATES]
+    first_row = max(1, start_line - _ANCHOR_CONTEXT_LINES)
+    last_row = min(
+        len(lines),
+        end_line + _ANCHOR_CONTEXT_LINES,
+        first_row + _ANCHOR_CONTEXT_MAX_ROWS - 1,
+    )
+    raise SemanticEditAnchorMismatch(relative, {
+        "actual_first_line": _anchor_shown(lines[start_line - 1]),
+        "actual_last_line": _anchor_shown(lines[end_line - 1]),
+        "numbered_context": [
+            f"{number}\t{_anchor_shown(lines[number - 1])}"
+            for number in range(first_row, last_row + 1)
+        ],
+        "candidates": [
+            {"start_line": start, "end_line": start + span} for start in candidates
+        ],
+        "next_call": (
+            "Choose the intended range from candidates or numbered_context and"
+            " call semantic_edit_prepare again with its start_line and end_line"
+            " and with expected_first_line and expected_last_line set to the"
+            " exact text of its first and last line."
+        ),
+    })
+
+
 def prepare_line_target(
     root: Path,
     *,
@@ -271,16 +405,33 @@ def prepare_line_target(
     start_line: int,
     end_line: int,
     allowed_writes: Iterable[str],
+    expected_first_line: str | None = None,
+    expected_last_line: str | None = None,
 ) -> PreparedLineTarget:
+    """Bind one line range by its whole-file and fragment sha256.
+
+    Without anchors the range is bound exactly as requested.  With both, it is
+    first checked against them and kept, relocated or refused
+    (:func:`_anchored_range`); a relocated target records the requested range
+    in ``anchor_relocated_from``.
+    """
     relative = normalize_relative_path(path)
     if not path_is_allowed(relative, allowed_writes):
         raise SemanticEditError(f"semantic_edit_path_not_allowed:{relative}")
     start_line, end_line = _validated_line_bounds(start_line, end_line)
+    anchors = _validated_anchors(relative, expected_first_line, expected_last_line)
     resolve_existing_file(root, relative)
     with held_path(root, relative):
         target = resolve_existing_file(root, relative)
         data, text = read_utf8_file(target, relative)
-    _lines, fragment = _line_slice(text, start_line, end_line)
+    lines, fragment = _line_slice(text, start_line, end_line)
+    relocated_from: tuple[int, int] | None = None
+    if anchors is not None:
+        located = _anchored_range(relative, lines, start_line, end_line, *anchors)
+        if located != (start_line, end_line):
+            relocated_from = (start_line, end_line)
+            start_line, end_line = located
+            _lines, fragment = _line_slice(text, start_line, end_line)
     fragment_data = fragment.encode("utf-8")
     if len(fragment_data) > MAX_FRAGMENT_BYTES:
         raise SemanticEditError(f"semantic_edit_fragment_too_large:{relative}")
@@ -293,6 +444,7 @@ def prepare_line_target(
         fragment=fragment,
         file_bytes=len(data),
         fragment_bytes=len(fragment_data),
+        anchor_relocated_from=relocated_from,
     )
 
 
@@ -326,15 +478,14 @@ def _trailing_blank_line_count(text: str) -> int:
     return count
 
 
+def _line_content(line: str) -> str:
+    """``line`` without the terminator :func:`_line_terminator` finds."""
+    return line[: len(line) - len(_line_terminator(line))]
+
+
 def _escape_level_changes(old: str, new: str) -> list[tuple[int, str]]:
-    def _strip(line: str) -> str:
-        if line.endswith(chr(13) + chr(10)):
-            return line[:-2]
-        if line.endswith(chr(10)):
-            return line[:-1]
-        return line
-    old_lines = [_strip(line) for line in _split_lines(old)]
-    new_lines = [_strip(line) for line in _split_lines(new)]
+    old_lines = [_line_content(line) for line in _split_lines(old)]
+    new_lines = [_line_content(line) for line in _split_lines(new)]
     exact = set(old_lines)
     lost: dict[str, int] = {}
     for i, o in enumerate(old_lines):

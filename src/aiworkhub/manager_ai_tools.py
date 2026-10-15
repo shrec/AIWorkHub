@@ -822,6 +822,8 @@ def _manager_edit_result(
 def semantic_edit_prepare(
     *, file_path: str, start_line: int, end_line: int,
     include_fragment: bool = False,
+    expected_first_line: str | None = None,
+    expected_last_line: str | None = None,
 ) -> dict[str, Any]:
     """MANAGER: bind one line range's whole-file and fragment sha256."""
 
@@ -846,6 +848,8 @@ def semantic_edit_prepare(
             start_line=start_line,
             end_line=end_line,
             include_fragment=include_fragment,
+            expected_first_line=expected_first_line,
+            expected_last_line=expected_last_line,
         ),
         manager,
     )
