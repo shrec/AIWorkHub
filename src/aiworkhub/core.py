@@ -6988,6 +6988,20 @@ def reject_review(
                 ),
                 "pinned_at": now,
             }
+            # NF-2026-01556: mirror task_store.recover_blocked_rework by pinning
+            # terminal_substatus when the review's request matches pred_request_id.
+            review_request_id = (
+                str(identity.get("request_id") or "").strip()
+                if isinstance(identity, dict)
+                else ""
+            )
+            review_substatus = (
+                str(terminal_review.get("substatus") or "").strip()
+                if isinstance(terminal_review, dict)
+                else ""
+            )
+            if review_substatus and review_request_id == pred_request_id:
+                card["rework_predecessor"]["terminal_substatus"] = review_substatus
             if pred_rework_delta is not None:
                 # Keep the authenticated descriptor for audit while projecting
                 # the exact compact shape consumed by worker_workspace after
