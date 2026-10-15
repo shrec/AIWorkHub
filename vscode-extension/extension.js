@@ -4630,7 +4630,14 @@ function createVscodeLmStagedEditCollector(request) {
     if (!contract || contract.action !== "edit") return reject(`action_mismatch:${filePath}:replace_range`);
     // NF-2026-01404: a range ending above the first line-count change keeps its coordinates.
     const shiftedFrom = edits.get(filePath)?.shiftedFrom;
-    if (Number.isSafeInteger(shiftedFrom) && !(input.end_line < shiftedFrom) && !originalCoordinateBatch) {
+    // NF-2026-01539: a stage inside a fresh body read of the current staged content completes the recovery.
+    const recoveryEntry = edits.get(filePath);
+    const freshRecovery = recoveryPath === filePath && !originalCoordinateBatch &&
+      typeof authenticate === "function" && Boolean(recoveryEntry && recoveryEntry.last_sha256) &&
+      Number.isSafeInteger(input.start_line) && Number.isSafeInteger(input.end_line) &&
+      recoveryEvidence.some(row => row.source_hash === recoveryEntry.last_sha256 &&
+        row.line_start <= input.start_line && row.line_end >= input.end_line);
+    if (Number.isSafeInteger(shiftedFrom) && !(input.end_line < shiftedFrom) && !originalCoordinateBatch && !freshRecovery) {
       recoveryPath = filePath;
       recoveryTarget = "";
       recoveryEvidence = [];
@@ -4645,7 +4652,7 @@ function createVscodeLmStagedEditCollector(request) {
         (input.preserve_trailing_newline !== undefined && typeof input.preserve_trailing_newline !== "boolean")) {
       return reject(`range_invalid:${filePath}`);
     }
-    if (Number.isSafeInteger(contract.line_count) && input.end_line > contract.line_count) {
+    if (!freshRecovery && Number.isSafeInteger(contract.line_count) && input.end_line > contract.line_count) {
       return reject(`range_out_of_bounds:${filePath}:start=${input.start_line}:end=${input.end_line}:lines=${contract.line_count}`);
     }
     const fidelity = vscodeLmFidelityError(input.new, filePath, "staged_range");
@@ -4662,7 +4669,8 @@ function createVscodeLmStagedEditCollector(request) {
       return reject("anchor_required");
     }
     const entry = edits.get(filePath) || { path: filePath, current_sha256: currentSha256, ranges: [] };
-    const exact = entry.ranges.find(range =>
+    // Stored ranges of a shifted file are in older coordinates, so a fresh-read recovery stage skips range matching.
+    const exact = freshRecovery ? undefined : entry.ranges.find(range =>
       range.start_line === input.start_line && range.end_line === input.end_line);
     if (exact) {
       if (exact.new !== input.new || exact.preserve_trailing_newline !== (input.preserve_trailing_newline !== false)) {
@@ -4683,7 +4691,7 @@ function createVscodeLmStagedEditCollector(request) {
         idempotent_replay: true, ...(exact.mcp_receipt ? { mcp_receipt: exact.mcp_receipt } : {}),
       });
     }
-    if (entry.ranges.some(range => input.start_line <= range.end_line && input.end_line >= range.start_line)) {
+    if (!freshRecovery && entry.ranges.some(range => input.start_line <= range.end_line && input.end_line >= range.start_line)) {
       return reject(`range_overlap:${filePath}:${input.start_line}:${input.end_line}`);
     }
     let mcpReceipt;
@@ -4717,7 +4725,7 @@ function createVscodeLmStagedEditCollector(request) {
       rangeEnd = bound.end_line;
       relocatedFrom = bound.relocated_from;
       // The overlap check above ran on the requested range; a relocated range needs its own.
-      if (relocatedFrom && entry.ranges.some(range => rangeStart <= range.end_line && rangeEnd >= range.start_line)) {
+      if (!freshRecovery && relocatedFrom && entry.ranges.some(range => rangeStart <= range.end_line && rangeEnd >= range.start_line)) {
         return reject(`range_overlap:${filePath}:${rangeStart}:${rangeEnd}`);
       }
       const key = crypto.createHash("sha256").update(JSON.stringify([
@@ -4746,6 +4754,7 @@ function createVscodeLmStagedEditCollector(request) {
       ...(mcpReceipt ? { mcp_receipt: mcpReceipt } : {}) });
     entry.ranges.sort((left, right) => left.start_line - right.start_line || left.end_line - right.end_line);
     edits.set(filePath, entry);
+    if (freshRecovery) { recoveryPath = ""; recoveryTarget = ""; recoveryEvidence = []; }
     return boundedReceipt(operation, filePath, input.new, {
       current_sha256: currentSha256, start_line: rangeStart, end_line: rangeEnd,
       idempotent_replay: false, ...(relocatedFrom ? { anchor_relocated_from: relocatedFrom } : {}),
@@ -4907,7 +4916,7 @@ function createVscodeLmStagedEditCollector(request) {
     recoveryToolNames,
     allowsRecoveryCall,
     noteRecoverySourceGraph,
-    recoveryRequiredOutput: () => recoveryPath ? { path: recoveryPath, action: "replace_range" } : null,
+    recoveryRequiredOutput: () => recoveryPath ? { path: recoveryPath, action: "replace_range", recovery: true } : null,
     hasChanges: () => edits.size > 0 || creates.size > 0,
     nextMissingRequired,
   };
@@ -4919,8 +4928,19 @@ function vscodeLmNextMissingRequiredOutput(stagedEdits) {
     : null;
 }
 
+function vscodeLmPendingRecoveryOutput(stagedEdits) {
+  return stagedEdits && typeof stagedEdits.recoveryRequiredOutput === "function"
+    ? stagedEdits.recoveryRequiredOutput()
+    : null;
+}
+
+function vscodeLmNextStageOutput(stagedEdits) {
+  return vscodeLmNextMissingRequiredOutput(stagedEdits) || vscodeLmPendingRecoveryOutput(stagedEdits);
+}
+
 function vscodeLmStagedOutputsReady(stagedEdits) {
-  return Boolean(stagedEdits && stagedEdits.hasChanges()) && !vscodeLmNextMissingRequiredOutput(stagedEdits);
+  return Boolean(stagedEdits && stagedEdits.hasChanges()) && !vscodeLmNextMissingRequiredOutput(stagedEdits) &&
+    !vscodeLmPendingRecoveryOutput(stagedEdits);
 }
 
 function vscodeLmShouldKeepStagedEdit(writableTask, stagedEdits) {
@@ -4947,6 +4967,12 @@ function vscodeLmMissingRequiredStageInstruction(nextMissing, native = false) {
     ? `Call ${VSCODE_LM_STAGE_EDIT_TOOL} now`
     : `Output ONLY one ${VSCODE_LM_TOOL_REQUEST_SCHEMA} request for ${VSCODE_LM_STAGE_EDIT_TOOL}`;
   const readHint = native ? "" : VSCODE_LM_FORCED_STAGE_READ_HINT;
+  if (nextMissing && nextMissing.recovery === true && nextMissing.path) {
+    return `Required output ${nextMissing.path} needs recovery because earlier edits shifted its line numbers. ` +
+      `Do not reuse earlier coordinates and do not emit a final edit envelope. First read a fresh bounded Source Graph body ` +
+      `for ${nextMissing.path}, then stage the range again with ${VSCODE_LM_STAGE_EDIT_TOOL} using its CURRENT line numbers ` +
+      `and expected_first_line/expected_last_line anchors taken from that read.` + readHint;
+  }
   if (!nextMissing || !nextMissing.path || !nextMissing.action) {
     return `The bounded discovery phase is complete. Do not regenerate a full file or final edit envelope. ` +
       (native
@@ -6136,7 +6162,7 @@ async function runVscodeLmTextProtocol(
       throw vscodeLmProtocolFailure("vscode_lm_finalization_limit", protocolTrace, lastProtocolPreview);
     }
     if (forceStagedEdit) {
-      const nextMissing = vscodeLmNextMissingRequiredOutput(stagedEdits);
+      const nextMissing = vscodeLmNextStageOutput(stagedEdits);
       const missingKey = vscodeLmForcedStageMissingKey(nextMissing);
       if (missingKey !== stagedEditFailure.key) {
         stagedEditFailure.key = missingKey;
@@ -6227,7 +6253,7 @@ async function runVscodeLmTextProtocol(
       }
       messages.push(vscode.LanguageModelChatMessage.User(
         forceStagedEdit
-          ? vscodeLmMissingRequiredStageInstruction(vscodeLmNextMissingRequiredOutput(stagedEdits), false)
+          ? vscodeLmMissingRequiredStageInstruction(vscodeLmNextStageOutput(stagedEdits), false)
           : forceFinal
           ? `The previous provider turn contained no text. Output ONLY one final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object.`
           : `The previous provider turn contained no text. Retry without prose and output only the next strict ` +
@@ -6243,7 +6269,7 @@ async function runVscodeLmTextProtocol(
       if (forceStagedEdit) {
         vscodeLmNoteForcedStageFailure(
           stagedEditFailure,
-          vscodeLmNextMissingRequiredOutput(stagedEdits),
+          vscodeLmNextStageOutput(stagedEdits),
           protocolTrace,
           lastProtocolPreview,
         );
@@ -6300,12 +6326,12 @@ async function runVscodeLmTextProtocol(
       if (forceStagedEdit) {
         vscodeLmNoteForcedStageFailure(
           stagedEditFailure,
-          vscodeLmNextMissingRequiredOutput(stagedEdits),
+          vscodeLmNextStageOutput(stagedEdits),
           protocolTrace,
           lastProtocolPreview,
         );
         messages.push(vscode.LanguageModelChatMessage.User(
-          vscodeLmMissingRequiredStageInstruction(vscodeLmNextMissingRequiredOutput(stagedEdits), false),
+          vscodeLmMissingRequiredStageInstruction(vscodeLmNextStageOutput(stagedEdits), false),
         ));
         continue;
       }
@@ -6332,13 +6358,13 @@ async function runVscodeLmTextProtocol(
         protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "full_envelope_rejected" });
         vscodeLmNoteForcedStageFailure(
           stagedEditFailure,
-          vscodeLmNextMissingRequiredOutput(stagedEdits),
+          vscodeLmNextStageOutput(stagedEdits),
           protocolTrace,
           lastProtocolPreview,
         );
         messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
         messages.push(vscode.LanguageModelChatMessage.User(
-          vscodeLmMissingRequiredStageInstruction(vscodeLmNextMissingRequiredOutput(stagedEdits), false),
+          vscodeLmMissingRequiredStageInstruction(vscodeLmNextStageOutput(stagedEdits), false),
         ));
         continue;
       }
@@ -6517,7 +6543,7 @@ async function runVscodeLmTextProtocol(
       // an authority violation. Correct it once without invoking MCP; a repeated
       // request fails with one bounded structured error.
       if (forceStagedEdit) {
-        const nextMissing = vscodeLmNextMissingRequiredOutput(stagedEdits);
+        const nextMissing = vscodeLmNextStageOutput(stagedEdits);
         protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "non_stage_tool_rejected" });
         vscodeLmNoteForcedStageFailure(
           stagedEditFailure,
@@ -6759,7 +6785,7 @@ async function runVscodeLmTextProtocol(
       protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "stage_rejected" });
       vscodeLmNoteForcedStageFailure(
         stagedEditFailure,
-        vscodeLmNextMissingRequiredOutput(stagedEdits),
+        vscodeLmNextStageOutput(stagedEdits),
         protocolTrace,
         lastProtocolPreview,
       );
@@ -6810,7 +6836,7 @@ async function runVscodeLmTextProtocol(
     protocolTrace.push({ turn, phase: "work", outcome: `tool:${envelope.name}` });
     const historyText = toolInputTooLarge ? "[oversized tool request omitted]" : text;
     messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(historyText)]));
-    const nextMissing = vscodeLmNextMissingRequiredOutput(stagedEdits);
+    const nextMissing = vscodeLmNextStageOutput(stagedEdits);
     const nextInstruction = nextMissing || forceStagedEdit
       ? vscodeLmMissingRequiredStageInstruction(nextMissing, false)
       : "Output only the next strict tool-request JSON or final edit-response JSON object.";
@@ -6931,7 +6957,7 @@ async function runVscodeLmAgent(
       throw vscodeLmProtocolFailure("vscode_lm_finalization_limit", protocolTrace, lastProtocolPreview);
     }
     if (forceStagedEdit) {
-      const nextMissing = vscodeLmNextMissingRequiredOutput(stagedEdits);
+      const nextMissing = vscodeLmNextStageOutput(stagedEdits);
       const missingKey = vscodeLmForcedStageMissingKey(nextMissing);
       if (missingKey !== stagedEditFailure.key) {
         stagedEditFailure.key = missingKey;
@@ -7035,7 +7061,7 @@ async function runVscodeLmAgent(
     if (startedWithSourceGraph) postSourceTurns += 1;
     if (forceStagedEdit && calls.some(call => call.name !== VSCODE_LM_STAGE_EDIT_TOOL &&
         !stagedEdits.allowsRecoveryCall(call))) {
-      const nextMissing = vscodeLmNextMissingRequiredOutput(stagedEdits);
+      const nextMissing = vscodeLmNextStageOutput(stagedEdits);
       protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "non_stage_tool_rejected" });
       vscodeLmNoteForcedStageFailure(
         stagedEditFailure,
@@ -7074,14 +7100,14 @@ async function runVscodeLmAgent(
         if (forceStagedEdit) {
           vscodeLmNoteForcedStageFailure(
             stagedEditFailure,
-            vscodeLmNextMissingRequiredOutput(stagedEdits),
+            vscodeLmNextStageOutput(stagedEdits),
             protocolTrace,
             lastProtocolPreview,
           );
         }
         messages.push(vscode.LanguageModelChatMessage.User(
           forceStagedEdit
-            ? vscodeLmMissingRequiredStageInstruction(vscodeLmNextMissingRequiredOutput(stagedEdits), true)
+            ? vscodeLmMissingRequiredStageInstruction(vscodeLmNextStageOutput(stagedEdits), true)
             : `The previous provider turn contained neither a tool call nor text. ` +
               `Output ONLY one final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object matching ` +
               `allowed_writes=${JSON.stringify(request.allowedWrites)}.`,
@@ -7092,13 +7118,13 @@ async function runVscodeLmAgent(
         protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "full_envelope_rejected" });
         vscodeLmNoteForcedStageFailure(
           stagedEditFailure,
-          vscodeLmNextMissingRequiredOutput(stagedEdits),
+          vscodeLmNextStageOutput(stagedEdits),
           protocolTrace,
           lastProtocolPreview,
         );
         messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
         messages.push(vscode.LanguageModelChatMessage.User(
-          vscodeLmMissingRequiredStageInstruction(vscodeLmNextMissingRequiredOutput(stagedEdits), true),
+          vscodeLmMissingRequiredStageInstruction(vscodeLmNextStageOutput(stagedEdits), true),
         ));
         continue;
       }
@@ -7397,7 +7423,7 @@ async function runVscodeLmAgent(
         protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "stage_rejected" });
         vscodeLmNoteForcedStageFailure(
           stagedEditFailure,
-          vscodeLmNextMissingRequiredOutput(stagedEdits),
+          vscodeLmNextStageOutput(stagedEdits),
           protocolTrace,
           lastProtocolPreview,
         );
@@ -14193,7 +14219,7 @@ module.exports = {
   deactivate,
   __testInternals: {
     createVscodeLmActivityJournal, vscodeLmThinkingPartText, collectVscodeLmResponseText,
-    vscodeLmRequiredCreateError,
+    vscodeLmRequiredCreateError, vscodeLmStagedOutputsReady,
   vscodeLmActivityRedactText,
     vscodeLmActivityPreview,
     CODING_FOUNDATION_CARD_KEYS,
