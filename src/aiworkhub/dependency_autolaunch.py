@@ -593,6 +593,21 @@ def _record_denial(
         next_attempt_at = (
             datetime.now(timezone.utc) + timedelta(seconds=delay)
         ).isoformat()
+    # NF-2026-01537: re-read the card's CURRENT updated_at from the task
+    # table inside this same write connection (the same table/column
+    # _read_rows reads). The refused launch itself writes an operational
+    # blocker that bumps updated_at after child was read, so storing the
+    # stale child.updated_at would let the next pass mistake the launcher's
+    # own write for an owner edit and release the hold. A later real card
+    # edit still moves updated_at past this stored value and clears it.
+    fresh = conn.execute(
+        "SELECT updated_at FROM tasks WHERE task_id=?",
+        (child.task_id,),
+    ).fetchone()
+    if fresh is None:
+        card_updated_at = child.updated_at
+    else:
+        card_updated_at = str(fresh["updated_at"] or "") or child.updated_at
     conn.execute(
         "INSERT INTO dependency_autolaunch_holds"
         "(task_id, reason, kind, attempts, card_updated_at, next_attempt_at, recorded_at) "
@@ -606,7 +621,7 @@ def _record_denial(
             str(reason or "")[:240],
             kind,
             attempts,
-            child.updated_at,
+            card_updated_at,
             next_attempt_at,
             _now(),
         ),
@@ -932,6 +947,20 @@ def reconcile_transient_due(
                     }
                 )
                 continue
+        # NF-2026-01537: reviewer cards are owned by the review
+        # orchestrator, which launches them through the bound reviewer
+        # path. This scan must never launch them.
+        if (child.topic or "") == "quality_review" or (
+            isinstance(child.card, dict)
+            and child.card.get("topic") == "quality_review"
+        ):
+            outcome["skipped"].append(
+                {
+                    "task_id": child.task_id,
+                    "reason": "quality_review_owned_by_review_orchestrator",
+                }
+            )
+            continue
         conn = _read_connection(db)
         try:
             hold = _hold_for(conn, child.task_id)
