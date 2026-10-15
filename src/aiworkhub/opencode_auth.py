@@ -520,6 +520,63 @@ def _relayed_base_url(base_url: str, relay: Callable[[str, int], int] | None) ->
     return urlunsplit(parts._replace(netloc=f"{userinfo}{at}127.0.0.1:{relayed}"))
 
 
+# ponytail: add a row only after an OpenCode probe reaches transport with it.
+_OPENCODE_V2_PACKAGE_NPM = {"@opencode/ai/providers/openai-compatible": "@ai-sdk/openai-compatible"}
+
+
+def _translate_opencode_v2_provider_block(
+    block: Mapping[str, object], env: Mapping[str, str]
+) -> dict[str, object]:
+    """Translate one OpenCode v2 ``providers`` entry to a v1-shaped block."""
+    package = block.get("package")
+    npm = _OPENCODE_V2_PACKAGE_NPM.get(package) if isinstance(package, str) else None
+    if npm is None:
+        raise OpenCodeAuthError("opencode_provider_package_unsupported")
+    translated: dict[str, object] = {"npm": npm}
+    if "name" in block:
+        translated["name"] = block["name"]
+    options: dict[str, object] = {}
+    settings = block.get("settings")
+    settings_map = settings if isinstance(settings, dict) else {}
+    if "baseURL" in settings_map:
+        options["baseURL"] = settings_map["baseURL"]
+    if "apiKey" in settings_map:
+        options["apiKey"] = settings_map["apiKey"]
+    elif "env" in block:
+        env_names = block["env"]
+        if (
+            not isinstance(env_names, list)
+            or not env_names
+            or not all(isinstance(item, str) and item for item in env_names)
+        ):
+            raise OpenCodeAuthError("opencode_provider_credential_unsupported")
+        for item in env_names:
+            if env.get(item):
+                options["apiKey"] = "{env:" + item + "}"
+                break
+        else:
+            raise OpenCodeAuthError("opencode_provider_env_unresolved")
+    if "headers" in block:
+        options["headers"] = block["headers"]
+    if options:
+        translated["options"] = options
+    models = block.get("models")
+    if isinstance(models, dict):
+        translated_models: dict[str, object] = {}
+        for model_name, entry in models.items():
+            if isinstance(entry, dict):
+                copied = {key: value for key, value in entry.items() if key != "modelID"}
+                if "modelID" in entry:
+                    copied["id"] = entry["modelID"]
+                translated_models[model_name] = copied
+            else:
+                translated_models[model_name] = entry
+        translated["models"] = translated_models
+    elif "models" in block:
+        translated["models"] = block["models"]
+    return translated
+
+
 def project_opencode_custom_provider(
     model: str,
     *,
@@ -546,6 +603,7 @@ def project_opencode_custom_provider(
     ``apiKey``, ``headers``), ``models``; every ``{env:NAME}`` there is
     resolved from ``host_env`` (default ``os.environ``) and the model entry
     keeps only ``id``, ``limit`` and the boolean capability flags.
+    The v2 ``providers`` block is read when no v1 ``provider`` block exists.
     """
     if "/" not in model:
         return None
@@ -562,7 +620,11 @@ def project_opencode_custom_provider(
     providers = document.get("provider")
     block = providers.get(provider) if isinstance(providers, dict) else None
     if not isinstance(block, dict):
-        raise OpenCodeAuthError("opencode_provider_not_configured")
+        providers_v2 = document.get("providers")
+        v2_block = providers_v2.get(provider) if isinstance(providers_v2, dict) else None
+        if not isinstance(v2_block, dict):
+            raise OpenCodeAuthError("opencode_provider_not_configured")
+        block = _translate_opencode_v2_provider_block(v2_block, env)
     models = block.get("models")
     model_entry = models.get(name) if isinstance(models, dict) else None
     if not isinstance(model_entry, dict):

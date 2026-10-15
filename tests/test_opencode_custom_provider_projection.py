@@ -691,3 +691,261 @@ def test_owner_config_read_os_error_is_refused_unreadable(
         opencode_auth.project_opencode_custom_provider(
             "omniroute/router-model", host_env={}
         )
+
+
+def _owner_v2_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    providers: dict,
+) -> Path:
+    config_home = tmp_path / "xdg-config"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    opencode_dir = config_home / "opencode"
+    opencode_dir.mkdir(parents=True)
+    (opencode_dir / "opencode.json").write_text(
+        json.dumps({"providers": providers}), encoding="utf-8"
+    )
+    return opencode_dir
+
+
+def _v2_provider_block(**overrides: object) -> dict:
+    block: dict = {
+        "package": "@opencode/ai/providers/openai-compatible",
+        "name": "OmniRoute",
+        "settings": {"baseURL": "http://localhost:20128/v1", "apiKey": "literal-key"},
+        "models": {"router-model": {"modelID": "upstream-router"}},
+    }
+    block.update(overrides)
+    return {"omniroute": block}
+
+
+def test_v2_openai_compatible_block_projects_v1_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _owner_v2_config(tmp_path, monkeypatch, providers=_v2_provider_block())
+    projected = opencode_auth.project_opencode_custom_provider(
+        "omniroute/router-model", host_env={}
+    )
+    assert projected == {
+        "omniroute": {
+            "npm": "@ai-sdk/openai-compatible",
+            "name": "OmniRoute",
+            "options": {
+                "baseURL": "http://localhost:20128/v1",
+                "apiKey": "literal-key",
+            },
+            "models": {"router-model": {"id": "upstream-router"}},
+        }
+    }
+
+
+def test_v2_env_list_resolves_first_set_var(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    block = _v2_provider_block()
+    block["omniroute"]["settings"] = {"baseURL": "http://localhost:20128/v1"}
+    block["omniroute"]["env"] = ["OMNIROUTE_MISSING_KEY", "OMNIROUTE_KEY"]
+    _owner_v2_config(tmp_path, monkeypatch, providers=block)
+    projected = opencode_auth.project_opencode_custom_provider(
+        "omniroute/router-model", host_env={"OMNIROUTE_KEY": _SENTINEL}
+    )
+    assert projected["omniroute"]["options"]["apiKey"] == _SENTINEL
+
+
+def test_v2_env_list_with_none_set_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    block = _v2_provider_block()
+    block["omniroute"]["settings"] = {"baseURL": "http://localhost:20128/v1"}
+    block["omniroute"]["env"] = ["OMNIROUTE_MISSING_ONE", "OMNIROUTE_MISSING_TWO"]
+    _owner_v2_config(tmp_path, monkeypatch, providers=block)
+    with pytest.raises(
+        opencode_auth.OpenCodeAuthError,
+        match="^opencode_provider_env_unresolved$",
+    ):
+        opencode_auth.project_opencode_custom_provider(
+            "omniroute/router-model", host_env={}
+        )
+
+
+def test_v2_unsupported_package_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    block = _v2_provider_block(package="@opencode/ai/providers/unknown")
+    _owner_v2_config(tmp_path, monkeypatch, providers=block)
+    with pytest.raises(
+        opencode_auth.OpenCodeAuthError,
+        match="^opencode_provider_package_unsupported$",
+    ):
+        opencode_auth.project_opencode_custom_provider(
+            "omniroute/router-model", host_env={}
+        )
+
+
+def test_v1_block_wins_over_v2_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_home = tmp_path / "xdg-config"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    opencode_dir = config_home / "opencode"
+    opencode_dir.mkdir(parents=True)
+    (opencode_dir / "opencode.json").write_text(
+        json.dumps(
+            {
+                "provider": _provider_block(apiKey="v1-key"),
+                "providers": _v2_provider_block(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    projected = opencode_auth.project_opencode_custom_provider(
+        "omniroute/router-model", host_env={}
+    )
+    assert projected["omniroute"]["options"]["apiKey"] == "v1-key"
+    assert projected["omniroute"]["npm"] == "@ai-sdk/openai-compatible"
+
+
+def test_v2_top_level_headers_land_in_options_headers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    block = _v2_provider_block()
+    block["omniroute"]["headers"] = {"Authorization": "Bearer {env:OMNIROUTE_KEY}"}
+    _owner_v2_config(tmp_path, monkeypatch, providers=block)
+    projected = opencode_auth.project_opencode_custom_provider(
+        "omniroute/router-model", host_env={"OMNIROUTE_KEY": _SENTINEL}
+    )
+    assert projected["omniroute"]["options"]["headers"] == {
+        "Authorization": f"Bearer {_SENTINEL}"
+    }
+
+
+def test_v2_loopback_with_a_relay_is_rewritten_like_v1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _owner_v2_config(tmp_path, monkeypatch, providers=_v2_provider_block())
+    plan = _relay_plan()
+    projected = opencode_auth.project_opencode_custom_provider(
+        "omniroute/router-model", host_env={}, appcontainer=True, loopback_relay=plan
+    )
+    assert projected["omniroute"]["options"]["baseURL"] == "http://127.0.0.1:54321/v1"
+    spec = plan.seal()
+    assert spec is not None
+    assert (spec.target_host, spec.target_port) == ("localhost", 20128)
+
+
+def test_v2_projected_block_passes_worker_config_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _owner_v2_config(tmp_path, monkeypatch, providers=_v2_provider_block())
+    projected = opencode_auth.project_opencode_custom_provider(
+        "omniroute/router-model", host_env={}
+    )
+    assert projected is not None
+    config = runtime_adapters.build_opencode_worker_mcp_config(
+        ["awh-mcp"], provider=projected
+    )
+    text = runtime_adapters.serialize_opencode_worker_config(config)
+    assert json.loads(text)["provider"] == projected
+
+
+def test_v2_env_list_prefers_first_set_var_when_both_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    block = _v2_provider_block()
+    block["omniroute"]["settings"] = {"baseURL": "http://localhost:20128/v1"}
+    block["omniroute"]["env"] = ["OMNIROUTE_KEY_A", "OMNIROUTE_KEY_B"]
+    _owner_v2_config(tmp_path, monkeypatch, providers=block)
+    projected = opencode_auth.project_opencode_custom_provider(
+        "omniroute/router-model",
+        host_env={"OMNIROUTE_KEY_A": "first-value", "OMNIROUTE_KEY_B": "second-value"},
+    )
+    assert projected["omniroute"]["options"]["apiKey"] == "first-value"
+
+
+def test_v2_env_list_skips_an_empty_host_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    block = _v2_provider_block()
+    block["omniroute"]["settings"] = {"baseURL": "http://localhost:20128/v1"}
+    block["omniroute"]["env"] = ["OMNIROUTE_KEY_A", "OMNIROUTE_KEY_B"]
+    _owner_v2_config(tmp_path, monkeypatch, providers=block)
+    projected = opencode_auth.project_opencode_custom_provider(
+        "omniroute/router-model",
+        host_env={"OMNIROUTE_KEY_A": "", "OMNIROUTE_KEY_B": "second-value"},
+    )
+    assert projected["omniroute"]["options"]["apiKey"] == "second-value"
+
+
+@pytest.mark.parametrize("host_env", [{}, {"OMNIROUTE_KEY": "env-value"}])
+def test_v2_settings_api_key_wins_over_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_env: dict[str, str]
+) -> None:
+    block = _v2_provider_block()
+    block["omniroute"]["settings"] = {
+        "baseURL": "http://localhost:20128/v1",
+        "apiKey": "literal-key",
+    }
+    block["omniroute"]["env"] = ["OMNIROUTE_KEY"]
+    _owner_v2_config(tmp_path, monkeypatch, providers=block)
+    projected = opencode_auth.project_opencode_custom_provider(
+        "omniroute/router-model", host_env=host_env
+    )
+    assert projected["omniroute"]["options"]["apiKey"] == "literal-key"
+
+
+@pytest.mark.parametrize("env", ["OMNIROUTE_KEY", [], [""], [123]])
+def test_v2_invalid_env_shape_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env: object
+) -> None:
+    block = _v2_provider_block()
+    block["omniroute"]["settings"] = {"baseURL": "http://localhost:20128/v1"}
+    block["omniroute"]["env"] = env
+    _owner_v2_config(tmp_path, monkeypatch, providers=block)
+    with pytest.raises(
+        opencode_auth.OpenCodeAuthError,
+        match="^opencode_provider_credential_unsupported$",
+    ):
+        opencode_auth.project_opencode_custom_provider(
+            "omniroute/router-model", host_env={}
+        )
+
+
+def test_v2_missing_package_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    block = _v2_provider_block()
+    del block["omniroute"]["package"]
+    _owner_v2_config(tmp_path, monkeypatch, providers=block)
+    with pytest.raises(
+        opencode_auth.OpenCodeAuthError,
+        match="^opencode_provider_package_unsupported$",
+    ):
+        opencode_auth.project_opencode_custom_provider(
+            "omniroute/router-model", host_env={}
+        )
+
+
+def test_v2_model_id_projects_to_id_without_model_id_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _owner_v2_config(tmp_path, monkeypatch, providers=_v2_provider_block())
+    projected = opencode_auth.project_opencode_custom_provider(
+        "omniroute/router-model", host_env={}
+    )
+    entry = projected["omniroute"]["models"]["router-model"]
+    assert entry["id"] == "upstream-router"
+    assert "modelID" not in entry
+
+
+def test_v2_missing_named_model_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _owner_v2_config(tmp_path, monkeypatch, providers=_v2_provider_block())
+    with pytest.raises(
+        opencode_auth.OpenCodeAuthError,
+        match="^opencode_provider_not_configured$",
+    ):
+        opencode_auth.project_opencode_custom_provider(
+            "omniroute/other-model", host_env={}
+        )
