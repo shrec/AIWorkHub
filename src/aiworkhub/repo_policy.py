@@ -775,7 +775,7 @@ def _opencode_models_probe_once(
 def _list_opencode_models(executable: str | None) -> list[str]:
     """Bound ``opencode models`` discovery; listing is not round-trip evidence.
 
-    A timed-out probe retries once with a longer timeout; any failed probe serves
+    A timed-out or empty probe retries once with a longer timeout; any failed probe serves
     the last-known-good list for the executable and records a named reason.
     """
 
@@ -784,7 +784,7 @@ def _list_opencode_models(executable: str | None) -> list[str]:
     rows, reason = _opencode_models_probe_once(
         executable, _OPENCODE_PROBE_TIMEOUT_SECONDS
     )
-    if reason == "timeout":
+    if reason in ("timeout", "empty"):
         rows, reason = _opencode_models_probe_once(
             executable, _OPENCODE_PROBE_RETRY_TIMEOUT_SECONDS
         )

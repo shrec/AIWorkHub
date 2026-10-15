@@ -100,7 +100,11 @@ def test_zero_exit_with_no_rows_is_empty_and_oserror_is_named(
 ) -> None:
     _script_run(
         monkeypatch,
-        [SimpleNamespace(returncode=0, stdout=b"", stderr=b""), OSError("gone")],
+        [
+            SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+            SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+            OSError("gone"),
+        ],
     )
 
     assert repo_policy._list_opencode_models(_EXE) == []
@@ -250,3 +254,52 @@ def test_probe_record_is_per_thread_and_per_call(
     )
     assert "opencode_models_probe" not in result
     assert result["provider_observed_models"] == _ROWS
+
+
+def test_empty_then_success_on_retry_uses_longer_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _script_run(
+        monkeypatch,
+        [SimpleNamespace(returncode=0, stdout=b"", stderr=b""), _ok(_ROWS)],
+    )
+
+    assert repo_policy._list_opencode_models(_EXE) == _ROWS
+    assert [call["timeout"] for call in calls] == [5, 15]
+    assert repo_policy._opencode_probe_record(_EXE) == {"state": "ok", "count": 2}
+
+
+def test_double_empty_serves_last_known_good_with_named_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _script_run(
+        monkeypatch,
+        [
+            _ok(_ROWS),
+            SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+            SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+        ],
+    )
+
+    assert repo_policy._list_opencode_models(_EXE) == _ROWS
+    assert repo_policy._list_opencode_models(_EXE) == _ROWS
+    assert repo_policy._opencode_probe_record(_EXE) == {
+        "state": "failed",
+        "reason": "empty",
+        "served_last_known_good": True,
+    }
+    assert [call["timeout"] for call in calls] == [5, 5, 15]
+
+
+def test_exit_1_does_not_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _script_run(
+        monkeypatch, [SimpleNamespace(returncode=1, stdout=b"", stderr=b"")]
+    )
+
+    assert repo_policy._list_opencode_models(_EXE) == []
+    assert len(calls) == 1
+    assert repo_policy._opencode_probe_record(_EXE) == {
+        "state": "failed",
+        "reason": "exit_1",
+        "served_last_known_good": False,
+    }
