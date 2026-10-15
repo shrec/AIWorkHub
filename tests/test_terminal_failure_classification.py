@@ -3132,3 +3132,129 @@ def test_relaunch_prompt_refusal_keeps_its_launcher_minted_reason(refusal: str) 
 ])
 def test_relaunch_prompt_refusal_shape_stays_an_allowlist(error: str) -> None:
     assert tfc.supervisor_spawn_failure_cause("spawn_failed", {"error": error}) is None
+
+
+_CLAUDE_CLI_ENOTFOUND_TAIL = (
+    '{"type":"system","subtype":"api_retry","attempt":10,"max_retries":10,"error_status":null,"error":"unknown"}\n'
+    '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","result":"API Error: Can\'t reach the API server — check your internet or DNS (ENOTFOUND)"}\n'
+)
+
+
+def test_claude_cli_enotfound_api_error_tail_disposes_transient_provider_unreachable() -> None:
+    verdict = failure_disposition(
+        reason="worker_failed",
+        terminal_state="worker_failed",
+        stdout_tail=_CLAUDE_CLI_ENOTFOUND_TAIL,
+    )
+    assert verdict["failure_class"] == FAILURE_CLASS_TRANSIENT
+    assert verdict["provider_code"] == "provider_unreachable"
+    assert verdict["evidence"] == "provider_code=provider_unreachable"
+    assert verdict["cause"] == tfc.CAUSE_PROVIDER_TRANSIENT
+    assert verdict["action"] == tfc.ACTION_ROUTE_RETRY
+    assert verdict["retry_scope"] == tfc.RETRY_SCOPE_DISTINCT_ROUTE
+    assert verdict["retry_scope"] != "none"
+    assert verdict["provider_launched"] is True
+    classified = classify_terminal_failure(
+        state="worker_failed",
+        exit_code=1,
+        error=_WORKER_FAILED_WRAPPER,
+        stdout_tail=_CLAUDE_CLI_ENOTFOUND_TAIL,
+    )
+    assert classified["diagnostic"] == "worker_failed:runtime_error:exit_code=1"
+
+
+@pytest.mark.parametrize("result_text", [
+    "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)",
+    "API Error: request failed with EAI_AGAIN while resolving api.anthropic.com",
+    "API Error: socket hang up (ECONNRESET)",
+    "API Error: connect ECONNREFUSED 127.0.0.1:443",
+    "API Error: connect ETIMEDOUT 10.0.0.1:443",
+    "API Error: Can't reach the API server",
+    "API Error: Unable to connect to API (ConnectionRefused)",
+])
+def test_result_api_error_network_reachability_tokens_classify_transient(
+    result_text: str,
+) -> None:
+    tail = json.dumps({
+        "type": "result",
+        "subtype": "success",
+        "is_error": True,
+        "terminal_reason": "api_error",
+        "result": result_text,
+    }) + "\n"
+    verdict = failure_disposition(
+        reason="worker_failed",
+        terminal_state="worker_failed",
+        stdout_tail=tail,
+    )
+    assert verdict["failure_class"] == FAILURE_CLASS_TRANSIENT
+    assert verdict["provider_code"] == "provider_unreachable"
+    assert verdict["evidence"] == "provider_code=provider_unreachable"
+    assert verdict["action"] == tfc.ACTION_ROUTE_RETRY
+    assert verdict["retry_scope"] != "none"
+
+
+@pytest.mark.parametrize("tail", [
+    json.dumps({
+        "type": "assistant",
+        "message": {
+            "content": [{
+                "type": "text",
+                "text": "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)",
+            }],
+        },
+        "result": "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)",
+    }) + "\n",
+    (
+        json.dumps({
+            "type": "assistant",
+            "message": "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)",
+        })
+        + "\n"
+        + json.dumps({
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "terminal_reason": "api_error",
+            "result": "Execution failed",
+        })
+        + "\n"
+    ),
+])
+def test_assistant_prose_enotfound_sentence_does_not_classify_transient(
+    tail: str,
+) -> None:
+    verdict = failure_disposition(
+        reason="worker_failed",
+        terminal_state="worker_failed",
+        stdout_tail=tail,
+    )
+    assert verdict["failure_class"] == FAILURE_CLASS_UNKNOWN
+    assert verdict["provider_code"] == ""
+    assert verdict["provider_launched"] is False
+
+
+@pytest.mark.parametrize("result_text", [
+    "API Error: 400 invalid_request_error: messages.0.content: Field required",
+    "API Error: 400 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad request\"}}",
+    "API Error: variable ENOTFOUND_COUNT was not defined",
+    "Can't reach the API server — check your internet or DNS (ENOTFOUND)",
+])
+def test_result_api_error_content_error_stays_unknown(
+    result_text: str,
+) -> None:
+    tail = json.dumps({
+        "type": "result",
+        "subtype": "success",
+        "is_error": True,
+        "terminal_reason": "api_error",
+        "result": result_text,
+    }) + "\n"
+    verdict = failure_disposition(
+        reason="worker_failed",
+        terminal_state="worker_failed",
+        stdout_tail=tail,
+    )
+    assert verdict["failure_class"] == FAILURE_CLASS_UNKNOWN
+    assert verdict["provider_code"] == ""
+    assert verdict["retry_scope"] == "none"

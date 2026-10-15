@@ -337,6 +337,8 @@ _SIGNATURES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
     (re.compile(r"traceback|exception|error|fatal", re.I), "runtime_error"),
 )
 
+_PROVIDER_UNREACHABLE_RESULT_RE = re.compile(r"\b(?:ENOTFOUND|EAI_AGAIN|ECONNRESET|ECONNREFUSED|ETIMEDOUT)\b|Can't reach the API server|Unable to connect to API", re.I)
+
 # The VS Code LM block is the leading run of ``_SIGNATURES``; see
 # ``_signature_code`` for why its length is the one number that block needs.
 _VSCODE_LM_SIGNATURE_COUNT = len(_VSCODE_LM_CODES)
@@ -1700,9 +1702,10 @@ PROVIDER_CODE_DISPOSITION: dict[str, str] = {
     # received cannot be served as shaped, same as the route itself being
     # unusable for this account.
     "max_output_tokens": FAILURE_CLASS_TRANSIENT,
-    # provider-side load
+    # provider-side load / reachability
     "overloaded_error": FAILURE_CLASS_TRANSIENT,
     "rate_limit_error": FAILURE_CLASS_TRANSIENT,
+    "provider_unreachable": FAILURE_CLASS_TRANSIENT,
     # credential / account
     "authentication_failed": FAILURE_CLASS_CREDENTIAL,
     "invalid_api_key": FAILURE_CLASS_CREDENTIAL,
@@ -2120,6 +2123,12 @@ def _harvest_provider_event(event: object, found: dict[str, Any], depth: int = 0
             and " output token maximum" in result_text
         ):
             code = "max_output_tokens"
+        elif (
+            isinstance(result_text, str)
+            and result_text.startswith("API Error:")
+            and _PROVIDER_UNREACHABLE_RESULT_RE.search(result_text)
+        ):
+            code = "provider_unreachable"
     if code and not found["code"] and code in PROVIDER_CODE_DISPOSITION:
         # The KEY object is stored, never the parsed argument, so no provider
         # byte can reach a durable field through this path.
@@ -2831,6 +2840,7 @@ _PROVIDER_CODE_CAUSE: dict[str, str] = {
     "model_not_available": CAUSE_PROVIDER_TRANSIENT,
     "unknown_model": CAUSE_PROVIDER_TRANSIENT,
     "max_output_tokens": CAUSE_PROVIDER_TRANSIENT,
+    "provider_unreachable": CAUSE_PROVIDER_TRANSIENT,
     "overloaded_error": CAUSE_PROVIDER_CAPACITY,
     "rate_limit_error": CAUSE_PROVIDER_CAPACITY,
     "authentication_failed": CAUSE_PROVIDER_CREDENTIAL,
