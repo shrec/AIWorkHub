@@ -31,6 +31,7 @@ import copy
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import time
@@ -556,6 +557,312 @@ def test_accept_review_promotes_exactly_once_when_input_unchanged(
     assert result["ok"] is True
     assert promote_calls == [["out/result.txt"]]
     assert len(accept_review_calls) == 1
+    # Nothing drifted, so the accept records exactly what it always recorded.
+    assert "stale_input_rebased" not in result
+    assert "stale_input_rebased" not in accept_review_calls[0]["evidence"]
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-01543: a drift in an unrelated frozen input is rebased in place
+# ---------------------------------------------------------------------------
+
+_REBASE_VALIDATION = "python -m pytest -q tests/test_rebase_probe.py"
+
+
+def _declare_head_revalidation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    manager: process_launcher.ProcessManager,
+    card: dict,
+    request_id: str,
+    repo: Path,
+    *,
+    immutable_inputs: list[str],
+    fail_reason: str = "",
+) -> tuple[list[list[str]], list[dict]]:
+    """Freeze ``immutable_inputs`` at claim time and declare one validation.
+
+    A card that declares a validation must carry TESTED evidence, so the sealed
+    record is re-issued at that level. The snapshot factory keeps
+    ``create_combined_validation_workspace``'s contract -- the CURRENT canonical
+    tree with the exact candidate paths overlaid last -- and the validation
+    records the bytes it actually ran against, failing with ``fail_reason``
+    when one is given. Returns (snapshot factory calls, validation runs).
+    """
+    evidence = card["terminal_review"]["evidence"]
+    card["validation"] = [_REBASE_VALIDATION]
+    evidence["immutable_inputs"] = list(immutable_inputs)
+    evidence["immutable_input_manifest"] = process_launcher._path_manifest(
+        repo, immutable_inputs
+    )
+    evidence["evidence_record"] = manager._canonical_outcome_evidence(
+        request_id,
+        evidence["attempt_artifact_manifest"],
+        level=process_launcher.evidence_levels.EvidenceLevel.TESTED,
+        message="Canonical stale-input rebase test fixture evidence.",
+    )
+
+    snapshot_calls: list[list[str]] = []
+
+    def _snapshot(source: _FakeWorkspace, _card: dict, changed: list[str]) -> tuple:
+        snapshot_calls.append(list(changed))
+        snapshot_dir = tmp_path / f"snapshot-{len(snapshot_calls)}"
+        shutil.copytree(repo, snapshot_dir)
+        for relative in changed:
+            (snapshot_dir / relative).parent.mkdir(parents=True, exist_ok=True)
+            (snapshot_dir / relative).write_bytes((source.path / relative).read_bytes())
+        snapshot = _FakeWorkspace(
+            repo=repo,
+            request_id=f"union2_{request_id}",
+            path=snapshot_dir,
+            home=snapshot_dir,
+            base_oid="current-canonical-head",
+        )
+        return snapshot, {
+            "schema_id": "aiworkhub.combined_tree.v1",
+            "candidate_paths": list(changed),
+            "canonical_delta_paths": [],
+            "observed_candidate_paths": list(changed),
+            "candidate_paths_already_in_canonical": [],
+            "merged_paths": {},
+        }
+
+    validation_runs: list[dict] = []
+
+    def _run(target: _FakeWorkspace, commands: list[str], **_kwargs: object) -> list[dict]:
+        commands = list(commands)
+        validation_runs.append({
+            "workspace": target.request_id,
+            "dependency": (target.path / "dep" / "report.json").read_text(encoding="utf-8"),
+            "candidate": (target.path / "out" / "result.txt").read_bytes(),
+            "commands": commands,
+        })
+        rows = [
+            {
+                "command": command,
+                "declared_command": command,
+                "returncode": 1 if fail_reason else 0,
+                "timed_out": False,
+            }
+            for command in commands
+        ]
+        if fail_reason:
+            raise process_launcher._worker_workspace.ValidationRunError(
+                "validation_failed:" + fail_reason, rows
+            )
+        return rows
+
+    monkeypatch.setattr(process_launcher, "create_combined_validation_workspace", _snapshot)
+    monkeypatch.setattr(process_launcher, "run_validations", _run)
+    # The real launcher resolves the launch-bound sandbox route from the host;
+    # pin it so this synthetic fixture exercises the revalidation, not probing.
+    monkeypatch.setattr(
+        process_launcher,
+        "_validation_route_kwargs",
+        lambda _metadata: {"adapter_id": "claude_cli"},
+    )
+    return snapshot_calls, validation_runs
+
+
+def test_accept_review_rebases_a_drift_in_an_unrelated_frozen_input(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """NF-2026-01543 (a): an unrelated accept moved a frozen input this
+    candidate never changed. Accept no longer refuses: the existing
+    full-snapshot revalidation proves the candidate on the current canonical
+    tree, the candidate is promoted once, and the accept records the input it
+    rebased over."""
+    (
+        manager, card, request_id, task_id, runner, topic, repo,
+        workspace_dir, promote_calls, accept_review_calls,
+    ) = _fixture(monkeypatch, tmp_path)
+    snapshot_calls, validation_runs = _declare_head_revalidation(
+        monkeypatch, tmp_path, manager, card, request_id, repo,
+        immutable_inputs=["dep/report.json"],
+    )
+    (repo / "dep" / "report.json").write_text('{"rows": 3522}\n', encoding="utf-8")
+
+    result = manager.accept_review(request_id, task_id)
+
+    assert result["ok"] is True, result
+    assert result["stale_input_rebased"] == ["dep/report.json"]
+    # The revalidation ran exactly once, against the DRIFTED canonical input
+    # with the exact candidate overlaid -- not against the claim-time tree.
+    assert snapshot_calls == [["out/result.txt"]]
+    assert validation_runs == [{
+        "workspace": f"union2_{request_id}",
+        "dependency": '{"rows": 3522}\n',
+        "candidate": b"worker-result\n",
+        "commands": [_REBASE_VALIDATION],
+    }]
+    assert promote_calls == [["out/result.txt"]]
+    assert (repo / "out" / "result.txt").read_bytes() == b"worker-result\n"
+    assert len(accept_review_calls) == 1
+    recorded = accept_review_calls[0]["evidence"]
+    assert recorded["stale_input_rebased"] == ["dep/report.json"]
+    assert [row["command"] for row in recorded["validation"]] == [_REBASE_VALIDATION]
+    assert (
+        recorded["quality_gate"]["full_validation_snapshot"]["snapshot_base_oid"]
+        == "current-canonical-head"
+    )
+
+
+@pytest.mark.parametrize(
+    ("immutable_inputs", "canonical_writes", "drifted"),
+    [
+        pytest.param(
+            ["dep/report.json", "out/result.txt"],
+            {
+                "dep/report.json": '{"rows": 3522}\n',
+                "out/result.txt": "landed-by-another-accept\n",
+            },
+            ["dep/report.json", "out/result.txt"],
+            id="candidate_path_is_a_drifted_input",
+        ),
+        pytest.param(
+            ["out"],
+            {"out/other.txt": "landed-by-another-accept\n"},
+            ["out"],
+            id="candidate_path_under_a_drifted_directory",
+        ),
+    ],
+)
+def test_accept_review_still_refuses_a_drift_that_covers_a_candidate_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    immutable_inputs: list[str],
+    canonical_writes: dict[str, str],
+    drifted: list[str],
+) -> None:
+    """NF-2026-01543 (b): once any drifted frozen input covers a path the
+    candidate changed, accept refuses exactly as before the rebase path
+    existed -- the same error naming every drifted input, before any
+    revalidation or promotion -- even with a validation declared to run."""
+    (
+        manager, card, request_id, task_id, runner, topic, repo,
+        workspace_dir, promote_calls, accept_review_calls,
+    ) = _fixture(monkeypatch, tmp_path)
+    snapshot_calls, validation_runs = _declare_head_revalidation(
+        monkeypatch, tmp_path, manager, card, request_id, repo,
+        immutable_inputs=immutable_inputs,
+    )
+    for relative, text in canonical_writes.items():
+        (repo / relative).parent.mkdir(parents=True, exist_ok=True)
+        (repo / relative).write_text(text, encoding="utf-8")
+
+    result = manager.accept_review(request_id, task_id)
+
+    assert result == {
+        "ok": False,
+        "error": "stale_input:dependency_changed:" + ",".join(drifted),
+        "request_id": request_id,
+        "task_id": task_id,
+    }
+    assert snapshot_calls == []
+    assert validation_runs == []
+    assert promote_calls == []
+    assert accept_review_calls == []
+    for relative, text in canonical_writes.items():
+        assert (repo / relative).read_text(encoding="utf-8") == text
+    assert card["status"] == "review"
+    assert card["worker_status"] == "review"
+
+
+def test_accept_review_rebase_refuses_when_revalidation_fails_on_current_head(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """NF-2026-01543 (c): the drift is disjoint, so accept rebases -- and it is
+    the revalidation on the current canonical tree that fails. Accept refuses
+    with that revalidation error, not the stale-input one, and nothing is
+    promoted or finished."""
+    (
+        manager, card, request_id, task_id, runner, topic, repo,
+        workspace_dir, promote_calls, accept_review_calls,
+    ) = _fixture(monkeypatch, tmp_path)
+    snapshot_calls, validation_runs = _declare_head_revalidation(
+        monkeypatch, tmp_path, manager, card, request_id, repo,
+        immutable_inputs=["dep/report.json"],
+        fail_reason="candidate_breaks_on_current_dependency",
+    )
+    (repo / "dep" / "report.json").write_text('{"rows": 3522}\n', encoding="utf-8")
+
+    result = manager.accept_review(request_id, task_id)
+
+    assert result["ok"] is False
+    assert result["error"].startswith(
+        "revalidation_failed:validation_failed:candidate_breaks_on_current_dependency"
+    ), result
+    assert "stale_input_rebased" not in result
+    # It failed on the drifted canonical bytes, i.e. on current HEAD.
+    assert snapshot_calls == [["out/result.txt"]]
+    assert [run["dependency"] for run in validation_runs] == ['{"rows": 3522}\n']
+    assert promote_calls == []
+    assert accept_review_calls == []
+    assert not (repo / "out" / "result.txt").exists()
+    assert card["status"] == "review"
+    assert card["worker_status"] == "review"
+
+
+@pytest.mark.parametrize("fail_closed_reason", ["readonly_research", "validation_unreadable"])
+def test_accept_review_rebase_stays_fail_closed_without_a_head_revalidation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fail_closed_reason: str
+) -> None:
+    """NF-2026-01543 (d): a disjoint drift is rebased only when a revalidation
+    on the current canonical tree will actually run. A no-change readonly card
+    revalidates the claim-time worktree, and a card whose declared validations
+    cannot be read has nothing provable to run, so both keep the stale-input
+    refusal with nothing revalidated, promoted or recorded."""
+    (
+        manager, card, request_id, task_id, runner, topic, repo,
+        workspace_dir, promote_calls, accept_review_calls,
+    ) = _fixture(monkeypatch, tmp_path)
+    snapshot_calls, validation_runs = _declare_head_revalidation(
+        monkeypatch, tmp_path, manager, card, request_id, repo,
+        immutable_inputs=["dep/report.json"],
+    )
+    if fail_closed_reason == "readonly_research":
+        monkeypatch.setattr(
+            process_launcher, "_card_is_readonly_research", lambda *_a, **_k: True
+        )
+        card["terminal_review"]["evidence"]["changed_path_hashes"] = {}
+        card["terminal_review"]["evidence"]["changed_paths"] = []
+    else:
+        def _unreadable(*_a: object, **_k: object) -> list[str]:
+            raise process_launcher.WorkspaceError("validation_commands_unreadable")
+
+        monkeypatch.setattr(process_launcher, "_declared_validation_commands", _unreadable)
+    (repo / "dep" / "report.json").write_text('{"rows": 3522}\n', encoding="utf-8")
+
+    result = manager.accept_review(request_id, task_id)
+
+    assert result == {
+        "ok": False,
+        "error": "stale_input:dependency_changed:dep/report.json",
+        "request_id": request_id,
+        "task_id": task_id,
+    }
+    assert snapshot_calls == []
+    assert validation_runs == []
+    assert promote_calls == []
+    assert accept_review_calls == []
+
+
+def test_stale_input_overlap_covers_exact_directory_pattern_and_whole_tree_inputs() -> None:
+    touching = process_launcher_accept_review._stale_inputs_touching_candidate
+    candidate = ["src/pkg/mod.py", "tests/test_mod.py"]
+
+    assert touching(["src/pkg/mod.py", "src/pkg", "src/pkg/"], candidate) == [
+        "src/pkg/mod.py", "src/pkg", "src/pkg/",
+    ]
+    assert touching(["tests/test_*.py"], candidate) == ["tests/test_*.py"]
+    # A Windows-spelled or ./-prefixed declaration still names the same file.
+    assert touching(["./SRC\\pkg\\mod.py"], candidate) == ["./SRC\\pkg\\mod.py"]
+    # An input naming the whole tree covers every candidate path.
+    assert touching(["", ".", "/"], candidate) == ["", ".", "/"]
+    # Siblings, bare name prefixes and other trees are unrelated.
+    assert touching(
+        ["src/pkg/other.py", "src/pk", "docs", "tests/test_mod.pyc"], candidate
+    ) == []
 
 
 def test_process_manager_accept_review_persists_receipt_in_real_task_store(

@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import fnmatch
 import hashlib
+import posixpath
 import re
 from typing import TYPE_CHECKING, Any, Mapping
 
@@ -1598,6 +1599,37 @@ def accept_preview(self, request_id: str, task_id: str, **overrides: Any) -> dic
     }
 
 
+def _stale_inputs_touching_candidate(
+    drifted_inputs: list[str], candidate_paths: list[str]
+) -> list[str]:
+    """The drifted immutable inputs that cover a path the candidate changed.
+
+    A declared input may be a file, a directory whose manifest covers every
+    entry below it, or a dependency's write pattern (``allowed_writes``
+    semantics), so equality alone would call an edit under a drifted directory
+    unrelated. Both sides are compared slash-normalized and case-folded, and an
+    input naming the whole tree covers every path: each of those can only add a
+    refusal, never remove one (NF-2026-01543).
+    """
+
+    def _normalized(value: str) -> str:
+        return posixpath.normpath(str(value).replace("\\", "/")).lstrip("/").casefold()
+
+    candidates = {_normalized(path) for path in candidate_paths}
+    touching: list[str] = []
+    for declared in drifted_inputs:
+        root = _normalized(declared)
+        if root in {"", "."} or any(
+            path == root
+            or path.startswith(root + "/")
+            or root.startswith(path + "/")
+            or fnmatch.fnmatchcase(path, root)
+            for path in candidates
+        ):
+            touching.append(declared)
+    return touching
+
+
 # The seams are runtime names only.  ``Any`` and ``_WorkerWorkspaceT`` appear
 # solely in annotations -- which ``from __future__ import annotations`` leaves
 # as strings -- so they are resolved from this module's own imports and are
@@ -1617,6 +1649,7 @@ ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
     "_restore_correction_originals",
     "_receipt_sha256",
     "_sealed_receipt_sha256",
+    "_stale_inputs_touching_candidate",
     "_target_candidate_sha256",
     "bound_finding_dispositions",
     "contextlib",
@@ -1643,6 +1676,7 @@ ACCEPT_REVIEW_SEAM_NAMES: tuple[str, ...] = (
     "_card_is_readonly_quality_review",
     "_card_is_readonly_research",
     "_changed_path_hashes",
+    "_declared_validation_commands",
     "_enforce_behavioral_gate",
     "_finished_acceptance_result",
     "_parse_card",
@@ -1745,6 +1779,7 @@ def accept_review(
     _card_is_readonly_quality_review = _pl._card_is_readonly_quality_review
     _card_is_readonly_research = _pl._card_is_readonly_research
     _changed_path_hashes = _pl._changed_path_hashes
+    _declared_validation_commands = _pl._declared_validation_commands
     _enforce_behavioral_gate = _pl._enforce_behavioral_gate
     _finished_acceptance_result = _pl._finished_acceptance_result
     _parse_card = _pl._parse_card
@@ -2126,6 +2161,7 @@ def accept_review(
         declared_immutable_inputs = [
             str(p) for p in (evidence.get("immutable_inputs") or [])
         ]
+        stale_input_rebased: list[str] = []
         if declared_immutable_inputs:
             stored_input_manifest = evidence.get("immutable_input_manifest")
             if not isinstance(stored_input_manifest, dict):
@@ -2142,14 +2178,38 @@ def accept_review(
                 if current_input_manifest.get(relative) != stored_input_manifest.get(relative)
             )
             if changed_inputs:
-                return {
-                    "ok": False,
-                    "error": (
-                        "stale_input:dependency_changed:" + ",".join(changed_inputs)
-                    )[:500],
-                    "request_id": request_id,
-                    "task_id": task_id,
-                }
+                # NF-2026-01543: a drift in a frozen input this candidate never
+                # changed is rebased in place instead of forcing a full rework
+                # round. The full-snapshot revalidation below already runs the
+                # card's declared validations on the current canonical tree
+                # (HEAD plus its uncommitted delta) with the candidate overlaid
+                # last, so that run -- not the claim-time one -- proves the
+                # candidate against the drifted bytes, and the accept records
+                # the inputs it rebased over. The refusal is unchanged when a
+                # drifted input covers a candidate path, when the card declares
+                # no validation for that run to execute, and for a no-change
+                # task, whose revalidation reads the claim-time worktree.
+                try:
+                    revalidates_on_head = bool(_declared_validation_commands(card))
+                except WorkspaceError:
+                    revalidates_on_head = False
+                if (
+                    readonly_no_change
+                    or not revalidates_on_head
+                    or _stale_inputs_touching_candidate(
+                        changed_inputs,
+                        [*(evidence.get("changed_paths") or []), *stored_hashes],
+                    )
+                ):
+                    return {
+                        "ok": False,
+                        "error": (
+                            "stale_input:dependency_changed:" + ",".join(changed_inputs)
+                        )[:500],
+                        "request_id": request_id,
+                        "task_id": task_id,
+                    }
+                stale_input_rebased = changed_inputs
 
         if not core.writes_allowed():
             return {
@@ -3245,6 +3305,14 @@ def accept_review(
                 "source_evidence_record": terminal_evidence_record.to_dict(),
                 "acceptance_evidence_record": acceptance_evidence_record,
                 "attempt_artifact_manifest": attempt_artifact_receipt,
+                # Named only when a drift in a frozen input the candidate never
+                # changed was rebased in place, so an accept without one records
+                # exactly what it always recorded (NF-2026-01543).
+                **(
+                    {"stale_input_rebased": stale_input_rebased}
+                    if stale_input_rebased
+                    else {}
+                ),
             },
             accepted_outcome_receipt=accepted_outcome_receipt,
         )
@@ -3380,6 +3448,13 @@ def accept_review(
                 "accept_parameter_provenance", {}
             ),
             "accept_manager_identity": quality_gate.get("accept_manager_identity", {}),
+            # The frozen inputs this accept rebased over, as the event records
+            # them (NF-2026-01543); absent when nothing drifted.
+            **(
+                {"stale_input_rebased": stale_input_rebased}
+                if stale_input_rebased
+                else {}
+            ),
         }
         try:
             cleanup_workspace(workspace.repo, workspace.path, workspace.home)
