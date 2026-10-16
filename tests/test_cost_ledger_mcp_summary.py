@@ -98,12 +98,12 @@ def _grown_ledger_factory(
                 "route-a": {
                     "family-x": {
                         "unknown": {
+                            **_production_route_row(measured=False),
                             "total_tokens": 5,
-                            "state": "UNKNOWN",
                         },
                         "measured": {
+                            **_production_route_row(measured=True),
                             "total_tokens": (index + 1) * 100,
-                            "state": "MEASURED",
                         },
                     },
                 },
@@ -170,6 +170,7 @@ def test_cost_ledger_mcp_summary_bounds_rows_deterministically(monkeypatch):
             "returned_count": 10,
             "truncated": True,
             "ranked_by": "summed_matched_attempt_token_magnitude",
+            "folded": {"levels": ["family", "risk"], "partitions": 20},
         },
     }
     # Top-N by descending token magnitude, key ascending on ties: model-tie
@@ -190,15 +191,22 @@ def test_cost_ledger_mcp_summary_bounds_rows_deterministically(monkeypatch):
     assert list(summary["aggregates"]["by_day"]) == [
         f"2026-01-{day:02d}" for day in range(28, 18, -1)
     ]
-    # Route models rank by summed matched magnitude; route-model-15 is the
-    # largest and survives, its UNKNOWN row intact.
+    # route-model-15 ranks first; its two partitions fold into one row that stays UNKNOWN.
     assert set(summary["cost_per_accepted_outcome"]["routes"]) == {
         f"route-model-{index:02d}" for index in range(6, 16)
     }
     kept = summary["cost_per_accepted_outcome"]["routes"]["route-model-15"]
-    assert kept["route-a"]["family-x"]["unknown"] == {
-        "total_tokens": 5,
-        "state": "UNKNOWN",
+    assert kept == {
+        "route-a": {
+            "matched_decided_tasks": 8,
+            "accepted_outcomes": 6,
+            "rejected_outcomes": 2,
+            "total_cost_usd": 1.5,
+            "cost_coverage": 0.5,
+            "acceptance_rate": 0.75,
+            "cost_per_accepted_outcome_usd": None,
+            "state": "UNKNOWN",
+        }
     }
     # Aggregate totals, cost coverage truth and summary-client keys survive.
     assert summary["counts"] == {"union_rows": 99}
@@ -260,6 +268,261 @@ def test_cost_ledger_mcp_full_returns_every_row_unchanged(monkeypatch):
     assert len(full["cost_per_accepted_outcome"]["routes"]) == 16
     assert "summary_row_bounds" not in full
     assert full["counts"] == {"union_rows": 99}
+    # full keeps today's exact row shapes: nothing folded, nothing trimmed.
+    built = _grown_ledger()
+    assert full["aggregates"]["by_day"] == built["aggregates"]["by_day"]
+    assert full["cost_per_accepted_outcome"] == built["cost_per_accepted_outcome"]
+
+
+def test_cost_ledger_mcp_summary_by_day_rows_are_field_trimmed(monkeypatch):
+    ledger = _production_ledger_factory(
+        models=4, days=12, routes=2, outcome_models=2
+    )
+    monkeypatch.setattr(server.cost_ledger, "build_cost_ledger", ledger)
+
+    summary = server.aiworkhub_task_cost_ledger()
+    full = server.aiworkhub_task_cost_ledger(full=True)
+
+    kept = summary["aggregates"]["by_day"]
+    built = full["aggregates"]["by_day"]
+    # Ten dated buckets plus the undated one, each cut to five fields with the full row's values.
+    assert len(kept) == 11
+    for day, row in kept.items():
+        assert row == {
+            field: built[day][field]
+            for field in (
+                "records",
+                "total_tokens",
+                "cost_usd",
+                "cost_unknown_records",
+                "cache_hit_ratio",
+            )
+        }
+    # full=true is the ledger's rows, every counter intact.
+    assert built == ledger()["aggregates"]["by_day"]
+    assert len(built["unknown"]) == 18
+    # An unpriced day stays visibly unpriced instead of reading as free.
+    assert kept["unknown"]["cost_usd"] == 0.0
+    assert kept["unknown"]["cost_unknown_records"] == 10
+
+
+_FOLDED_ROUTE_FIELDS = (
+    "matched_decided_tasks",
+    "accepted_outcomes",
+    "rejected_outcomes",
+    "total_cost_usd",
+    "cost_coverage",
+    "acceptance_rate",
+    "cost_per_accepted_outcome_usd",
+    "state",
+)
+
+
+def _worker_attempt(task_id, model, adapter, cost, *, known=True):
+    return {
+        "task_id": task_id,
+        "role": "worker",
+        "model": model,
+        "adapter_id": adapter,
+        "total_tokens": 1_000,
+        "cost_known": known,
+        "cost_usd": cost,
+    }
+
+
+def _partitioned_route_inputs():
+    """Raw rows for the real producer, spread over family and risk partitions."""
+
+    attempts = [
+        _worker_attempt("t1", "model-alpha", "claude_cli", 0.40),
+        _worker_attempt("t2", "model-alpha", "claude_cli", 0.60),
+        _worker_attempt("t3", "model-alpha", "claude_cli", 0.10),
+        _worker_attempt("t3", "model-alpha", "claude_cli", 0.20),
+        _worker_attempt("t4", "model-alpha", "claude_cli", 0.90),
+        _worker_attempt("t5", "model-alpha", "claude_cli", 0.30),
+        _worker_attempt("t6", "model-alpha", "codex_cli", 0.50),
+        _worker_attempt("t7", "model-beta", "claude_cli", 0.10),
+        _worker_attempt("t8", "model-beta", "claude_cli", 0.0, known=False),
+    ]
+    verdicts = {
+        "t1": "accepted",
+        "t2": "accepted",
+        "t3": "rejected",
+        "t4": "accepted",
+        "t5": "rejected",
+        "t6": "rejected",
+        "t7": "accepted",
+        "t8": "accepted",
+    }
+    placements = {
+        "t1": ("code", "high"),
+        "t2": ("code", "high"),
+        "t3": ("code", "high"),
+        "t4": ("research", "low"),
+        "t5": ("research", "medium"),
+        "t6": ("code", "high"),
+        "t7": ("code", "low"),
+        "t8": ("code", "medium"),
+    }
+    decisions = {
+        task: {"decision": verdict} for task, verdict in verdicts.items()
+    }
+    cards = [
+        {
+            "task_id": task,
+            "risk_tier": risk,
+            "project_context": {"task_type": family},
+        }
+        for task, (family, risk) in placements.items()
+    ]
+    return attempts, decisions, cards
+
+
+def _routes_only_ledger(view):
+    def _build(**_kwargs):
+        return {
+            "tool": "aiworkhub_task_cost_ledger",
+            "counts": {"union_rows": 9},
+            "aggregates": {"by_model": {}, "by_provider": {}, "by_day": {}},
+            "cost_per_accepted_outcome": view,
+            "tasks": [],
+        }
+
+    return _build
+
+
+def test_cost_ledger_mcp_summary_routes_fold_risk_partitions(monkeypatch):
+    """One row per adapter, re-derived from the real producer's partitions."""
+
+    attempts, decisions, cards = _partitioned_route_inputs()
+    view = server.cost_ledger.cost_per_accepted_outcome_view(
+        attempts, decisions, cards
+    )
+    # cards=[] collapses each route to one partition: the producer's own unfolded total.
+    unpartitioned = server.cost_ledger.cost_per_accepted_outcome_view(
+        attempts, decisions, []
+    )
+    monkeypatch.setattr(
+        server.cost_ledger, "build_cost_ledger", _routes_only_ledger(view)
+    )
+
+    summary = server.aiworkhub_task_cost_ledger()
+    full = server.aiworkhub_task_cost_ledger(full=True)
+    routes = summary["cost_per_accepted_outcome"]["routes"]
+    full_routes = full["cost_per_accepted_outcome"]["routes"]
+
+    assert full["cost_per_accepted_outcome"] == view
+    assert routes == {
+        "model-alpha": {
+            "claude_cli": {
+                "matched_decided_tasks": 5,
+                "accepted_outcomes": 3,
+                "rejected_outcomes": 2,
+                "total_cost_usd": 2.5,
+                "cost_coverage": 1.0,
+                "acceptance_rate": 0.6,
+                "cost_per_accepted_outcome_usd": 0.833333,
+                "state": "MEASURED",
+            },
+            "codex_cli": {
+                "matched_decided_tasks": 1,
+                "accepted_outcomes": 0,
+                "rejected_outcomes": 1,
+                "total_cost_usd": 0.5,
+                "cost_coverage": 1.0,
+                "acceptance_rate": 0.0,
+                "cost_per_accepted_outcome_usd": None,
+                "state": "UNMEASURED",
+            },
+        },
+        "model-beta": {
+            "claude_cli": {
+                "matched_decided_tasks": 2,
+                "accepted_outcomes": 2,
+                "rejected_outcomes": 0,
+                "total_cost_usd": 0.1,
+                "cost_coverage": 0.5,
+                "acceptance_rate": 1.0,
+                "cost_per_accepted_outcome_usd": None,
+                "state": "UNKNOWN",
+            },
+        },
+    }
+    assert summary["summary_row_bounds"][
+        "cost_per_accepted_outcome_routes"
+    ] == {
+        "total_count": 2,
+        "returned_count": 2,
+        "truncated": False,
+        "ranked_by": "summed_matched_attempt_token_magnitude",
+        "folded": {"levels": ["family", "risk"], "partitions": 6},
+    }
+
+    for model, adapters in routes.items():
+        for adapter, row in adapters.items():
+            leaves = [
+                leaf
+                for risks in full_routes[model][adapter].values()
+                for leaf in risks.values()
+            ]
+            assert set(row) == set(_FOLDED_ROUTE_FIELDS)
+            for counter in (
+                "matched_decided_tasks",
+                "accepted_outcomes",
+                "rejected_outcomes",
+            ):
+                assert row[counter] == sum(leaf[counter] for leaf in leaves)
+            assert row["total_cost_usd"] == round(
+                sum(leaf["total_cost_usd"] for leaf in leaves), 6
+            )
+            (whole,) = unpartitioned["routes"][model][adapter][
+                "unknown"
+            ].values()
+            assert row == {
+                field: whole[field] for field in _FOLDED_ROUTE_FIELDS
+            }
+
+    # Summed counters, not averaged rates: the partitions' mean rate would differ.
+    alpha = [
+        leaf
+        for risks in full_routes["model-alpha"]["claude_cli"].values()
+        for leaf in risks.values()
+    ]
+    assert len(alpha) == 3
+    mean_rate = sum(leaf["acceptance_rate"] for leaf in alpha) / len(alpha)
+    assert mean_rate != routes["model-alpha"]["claude_cli"]["acceptance_rate"]
+
+
+def test_cost_ledger_route_fold_keeps_incomplete_partitions_unknown():
+    """A missing counter or state is never read as measured or free."""
+
+    complete = _production_route_row(measured=True)
+    row, folded = server._fold_route_partitions({"code": {"high": complete}})
+    assert folded == 1
+    assert row["state"] == "MEASURED"
+    assert row["cost_per_accepted_outcome_usd"] == 0.5
+
+    incomplete = {
+        "leaf without counters": {"code": {"high": {"total_tokens": 9_000}}},
+        "unrecognised state": {
+            "code": {"high": {**complete, "state": "SURPRISE"}}
+        },
+        "measured state beside unpriced attempts": {
+            "code": {"high": {**complete, "cost_unknown_attempts": 1}}
+        },
+        "measured leaf missing one counter": {
+            "code": {
+                "high": {k: v for k, v in complete.items() if k != "rejected_outcomes"}
+            }
+        },
+        "partition that is not a row": {
+            "code": {"high": complete, "low": "n/a"}
+        },
+    }
+    for label, families in incomplete.items():
+        row, _folded = server._fold_route_partitions(families)
+        assert row["state"] == "UNKNOWN", label
+        assert row["cost_per_accepted_outcome_usd"] is None, label
 
 
 def test_cost_ledger_mcp_forwards_filters_before_bounding(monkeypatch):
@@ -792,7 +1055,8 @@ def test_cost_ledger_mcp_production_shaped_default_stays_byte_bounded(
         full=True
     )))
 
-    assert large_bytes < 40_000
+    # The ceiling sits below the untrimmed weight: dropping either trim fails here.
+    assert large_bytes < 20_000
     # Quadrupling every history dimension changes the default response only
     # by the digits of the totals it declares; the row payload itself is
     # pinned at the bound.
@@ -819,15 +1083,50 @@ def test_cost_ledger_mcp_production_shaped_default_stays_byte_bounded(
         "retry_economics"
     ]
     kept_route = large_summary["cost_per_accepted_outcome"]["routes"]
-    leaf = kept_route["route-model-000"]["route-a"]["code"]
-    assert leaf["unknown"]["state"] == "UNKNOWN"
-    assert leaf["unknown"]["cost_per_accepted_outcome_usd"] is None
+    folded = kept_route["route-model-000"]["route-a"]
+    assert folded["state"] == "UNKNOWN"
+    assert folded["cost_per_accepted_outcome_usd"] is None
+    assert folded["cost_coverage"] == 0.5
+    assert folded["total_cost_usd"] == 1.5
+    fold_receipt = bounds["cost_per_accepted_outcome_routes"]["folded"]
+    assert fold_receipt == {"levels": ["family", "risk"], "partitions": 20}
+    assert fold_receipt == small_summary["summary_row_bounds"][
+        "cost_per_accepted_outcome_routes"
+    ]["folded"]
     assert large_summary["cost_per_accepted_outcome"]["unknown_model_tasks"] == 3
     assert large_summary["omitted_dimensions"] == [
         "by_role",
         "by_runner",
         "by_topic",
     ]
+
+
+def test_cost_ledger_mcp_summary_rows_are_narrower_than_full_rows(monkeypatch):
+    """The kept rows shrink, not only the number of rows kept."""
+
+    import json
+
+    monkeypatch.setattr(
+        server.cost_ledger,
+        "build_cost_ledger",
+        _production_ledger_factory(
+            models=32, days=40, routes=24, outcome_models=32
+        ),
+    )
+
+    summary = server.aiworkhub_task_cost_ledger()
+    full = server.aiworkhub_task_cost_ledger(full=True)
+
+    kept_days = summary["aggregates"]["by_day"]
+    kept_routes = summary["cost_per_accepted_outcome"]["routes"]
+    full_days = {day: full["aggregates"]["by_day"][day] for day in kept_days}
+    full_routes = {
+        model: full["cost_per_accepted_outcome"]["routes"][model]
+        for model in kept_routes
+    }
+
+    assert len(json.dumps(kept_days)) * 3 < len(json.dumps(full_days))
+    assert len(json.dumps(kept_routes)) * 3 < len(json.dumps(full_routes))
 
 
 def _partial_coverage_ledger(*, priced_records: int):

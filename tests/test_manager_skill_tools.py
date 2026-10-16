@@ -11,6 +11,7 @@ record unchanged.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import sqlite3
@@ -21,6 +22,8 @@ import aiworkhub.core as core
 import aiworkhub.skill_registry as sr
 from aiworkhub import learning_commit_store
 from aiworkhub import manager_skill_tools as mst
+from aiworkhub import server
+from aiworkhub import skill_miner
 from aiworkhub import skill_registry_store as store
 from aiworkhub import task_store
 
@@ -1304,3 +1307,134 @@ def test_learning_skill_coverage_requires_a_verified_manager(tmp_path, monkeypat
     result = mst.learning_skill_coverage()
     assert result["ok"] is False
     assert result["error"] == "verified_manager_identity_required"
+
+
+def _store_anchored_skill(root, identity, anchors):
+    record = sr.SkillRecord.from_mapping({
+        **BASE,
+        "identity": identity,
+        "evidence": [
+            {
+                "source": anchor,
+                "outcome": "accepted",
+                "authority": "worker",
+                "actor_id": f"worker.w{index}",
+            }
+            for index, anchor in enumerate(anchors)
+        ],
+        "accepted_count": len(anchors),
+    })
+    store.put_record(root, record)
+
+
+def _anchor_digest(anchors):
+    canonical = json.dumps(
+        anchors, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _without_anchors(skill):
+    return {k: v for k, v in skill.items() if k != "evidence_anchors"}
+
+
+def test_retirement_report_tool_defaults_to_summary_mode():
+    parameters = inspect.signature(
+        server.aiworkhub_manager_skill_retirement_report
+    ).parameters
+
+    assert parameters["full"].default is False
+    assert parameters["min_anchors"].default == skill_miner.MIN_RETIREMENT_ANCHORS
+
+
+def test_retirement_report_summary_folds_anchors_and_nothing_else(manager):
+    anchors = ["anchor0", "anchor1", "anchor2"]
+    for index, anchor in enumerate(anchors):
+        _seed_learning_commit(manager, anchor, f"r{index}", outcome="rejected")
+    _store_anchored_skill(manager, "anchored-rule", anchors)
+
+    summary = server.aiworkhub_manager_skill_retirement_report()
+    full = server.aiworkhub_manager_skill_retirement_report(full=True)
+
+    (folded,) = summary["skills"]
+    (unfolded,) = full["skills"]
+    assert unfolded["evidence_anchors"] == anchors
+    assert folded["evidence_anchors"] == {
+        "count": 3,
+        "sha256": _anchor_digest(anchors),
+    }
+    # Everything the manager reads a verdict from is identical in both modes.
+    assert folded["anchor_outcomes"] == {"rejected": 3}
+    assert folded["resolvable_anchor_cards"] == 3
+    assert _without_anchors(folded) == _without_anchors(unfolded)
+    assert {k: v for k, v in summary.items() if k != "skills"} == {
+        k: v for k, v in full.items() if k != "skills"
+    }
+
+
+def test_retirement_report_full_returns_the_manager_report_unchanged(manager):
+    anchors = ["anchor0", "anchor1"]
+    _store_anchored_skill(manager, "anchored-rule", anchors)
+
+    assert (
+        server.aiworkhub_manager_skill_retirement_report(full=True)
+        == mst.retirement_report()
+    )
+    # The producer is untouched: the fold happens at the tool, not in the miner.
+    measured = skill_miner.measure_retirement(manager)
+    assert measured["skills"][0]["evidence_anchors"] == anchors
+
+
+def test_retirement_report_summary_still_forwards_min_anchors(manager):
+    anchors = ["anchor0", "anchor1"]
+    for index, anchor in enumerate(anchors):
+        _seed_learning_commit(manager, anchor, f"r{index}", outcome="rejected")
+    _store_anchored_skill(manager, "anchored-rule", anchors)
+
+    low = server.aiworkhub_manager_skill_retirement_report(min_anchors=2)
+    high = server.aiworkhub_manager_skill_retirement_report(min_anchors=5)
+
+    assert low["skills"][0]["verdict"] == "review_for_retirement"
+    assert high["skills"][0]["verdict"] == "insufficient_evidence"
+
+
+def test_retirement_report_digest_tracks_the_anchor_set_not_its_order(manager):
+    _store_anchored_skill(manager, "rule-a", ["a0", "a1", "a2"])
+    _store_anchored_skill(manager, "rule-b", ["a2", "a0", "a1"])
+    _store_anchored_skill(manager, "rule-c", ["a0", "a1", "a3"])
+    _store_anchored_skill(manager, "rule-d", [])
+
+    folded = {
+        skill["identity"]: skill["evidence_anchors"]
+        for skill in server.aiworkhub_manager_skill_retirement_report()["skills"]
+    }
+
+    assert folded["rule-a"] == folded["rule-b"]
+    assert folded["rule-a"]["count"] == folded["rule-c"]["count"] == 3
+    assert folded["rule-a"]["sha256"] != folded["rule-c"]["sha256"]
+    # An empty anchor set folds to the same shape rather than a bare list.
+    assert folded["rule-d"] == {"count": 0, "sha256": _anchor_digest([])}
+
+
+def test_retirement_report_summary_stays_flat_as_anchors_grow(manager):
+    anchors = [f"anchor-{index:03d}" for index in range(60)]
+    _store_anchored_skill(manager, "anchored-rule", anchors)
+
+    summary = server.aiworkhub_manager_skill_retirement_report()
+    full = server.aiworkhub_manager_skill_retirement_report(full=True)
+
+    folded = summary["skills"][0]["evidence_anchors"]
+    assert folded["count"] == 60
+    assert len(json.dumps(folded)) < 100
+    assert len(json.dumps(full)) - len(json.dumps(summary)) > 600
+
+
+def test_retirement_report_summary_passes_a_refusal_through(monkeypatch):
+    monkeypatch.setattr(core, "manager_bootstrap", lambda: {"role": "worker"})
+
+    summary = server.aiworkhub_manager_skill_retirement_report()
+
+    assert summary["ok"] is False
+    assert summary["error"] == "verified_manager_identity_required"
+    assert "skills" not in summary
+    assert summary == server.aiworkhub_manager_skill_retirement_report(full=True)

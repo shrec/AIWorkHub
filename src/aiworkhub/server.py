@@ -1918,6 +1918,7 @@ def aiworkhub_manager_skill_mine(
 @mcp.tool()
 def aiworkhub_manager_skill_retirement_report(
     min_anchors: int = skill_miner.MIN_RETIREMENT_ANCHORS,
+    full: bool = False,
 ) -> dict[str, Any]:
     """MANAGER READ: measure every stored skill against its own failure class.
 
@@ -1927,9 +1928,37 @@ def aiworkhub_manager_skill_retirement_report(
     does not, says so with both counts instead of computing a rate against a
     zero denominator. Verdicts are recommendations; retirement stays
     manager-gated and this never writes.
+
+    Summary mode (default) folds each skill's ``evidence_anchors`` list to
+    ``{count, sha256}`` (digest of its canonical JSON); ``full=true`` returns
+    the anchor-card lists unchanged.
     """
 
-    return manager_skill_tools.retirement_report(min_anchors=min_anchors)
+    report = manager_skill_tools.retirement_report(min_anchors=min_anchors)
+    if full:
+        return report
+    skills = report.get("skills")
+    if not isinstance(skills, list):
+        return report
+    folded_skills = []
+    for skill in skills:
+        if not isinstance(skill, Mapping):
+            folded_skills.append(skill)
+            continue
+        anchors = skill.get("evidence_anchors")
+        if not isinstance(anchors, list):
+            folded_skills.append(skill)
+            continue
+        folded = dict(skill)
+        payload = json.dumps(
+            anchors, sort_keys=True, separators=(",", ":"), default=str
+        ).encode("utf-8")
+        folded["evidence_anchors"] = {
+            "count": len(anchors),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        folded_skills.append(folded)
+    return {**report, "skills": folded_skills}
 
 
 @mcp.tool()
@@ -3788,6 +3817,23 @@ def aiworkhub_task_stale_recovery_recommend(
 
 
 _COST_LEDGER_SUMMARY_TOP_N = 10
+# cost_unknown_records stays beside records so an unpriced day never reads as free.
+_COST_LEDGER_DAY_ROW_FIELDS = (
+    "records",
+    "total_tokens",
+    "cost_usd",
+    "cost_unknown_records",
+    "cache_hit_ratio",
+)
+_COST_LEDGER_ROUTE_COUNTERS = (
+    "matched_decided_tasks",
+    "accepted_outcomes",
+    "rejected_outcomes",
+    "attempt_records",
+    "cost_known_attempts",
+    "cost_unknown_attempts",
+    "total_cost_usd",
+)
 
 
 def _ledger_row_number(
@@ -4032,6 +4078,86 @@ def _bounded_outcome_routes(
     )
 
 
+def _summary_day_row(row: Any) -> Any:
+    """Keep only ``_COST_LEDGER_DAY_ROW_FIELDS`` of one ``by_day`` bucket."""
+    if not isinstance(row, Mapping):
+        return row
+    return {
+        field: row[field]
+        for field in _COST_LEDGER_DAY_ROW_FIELDS
+        if field in row
+    }
+
+
+def _fold_route_partitions(families: Any) -> tuple[dict[str, Any], int]:
+    """Sum one adapter's family/risk leaves into a row; an incomplete leaf keeps it UNKNOWN."""
+    leaves: list[Any] = []
+    if isinstance(families, Mapping):
+        for risks in families.values():
+            leaves.extend(
+                risks.values() if isinstance(risks, Mapping) else [risks]
+            )
+    else:
+        leaves.append(families)
+    totals = dict.fromkeys(_COST_LEDGER_ROUTE_COUNTERS, 0.0)
+    unknown = False
+    for leaf in leaves:
+        leaf_row = leaf if isinstance(leaf, Mapping) else {}
+        if leaf_row.get("state") not in ("MEASURED", "UNMEASURED"):
+            unknown = True
+        for field in _COST_LEDGER_ROUTE_COUNTERS:
+            value = _ledger_row_number(leaf_row, (field,))
+            if value is None:
+                unknown = True
+            else:
+                totals[field] += value
+    matched = int(totals["matched_decided_tasks"])
+    accepted = int(totals["accepted_outcomes"])
+    attempts = totals["attempt_records"]
+    cost = round(totals["total_cost_usd"], 6)
+    if unknown or totals["cost_unknown_attempts"] > 0:
+        state = "UNKNOWN"
+    elif accepted == 0:
+        state = "UNMEASURED"
+    else:
+        state = "MEASURED"
+    row = {
+        "matched_decided_tasks": matched,
+        "accepted_outcomes": accepted,
+        "rejected_outcomes": int(totals["rejected_outcomes"]),
+        "total_cost_usd": cost,
+        "cost_coverage": (
+            round(totals["cost_known_attempts"] / attempts, 6)
+            if attempts
+            else None
+        ),
+        "acceptance_rate": round(accepted / matched, 6) if matched else None,
+        "cost_per_accepted_outcome_usd": (
+            round(cost / accepted, 6) if state == "MEASURED" else None
+        ),
+        "state": state,
+    }
+    return row, len(leaves)
+
+
+def _fold_outcome_routes(
+    routes: Mapping[str, Any],
+) -> tuple[dict[str, Any], int]:
+    """Fold each kept model's adapters to one row; count the leaves folded."""
+    folded: dict[str, Any] = {}
+    partitions = 0
+    for model, adapters in routes.items():
+        if not isinstance(adapters, Mapping):
+            folded[model] = adapters
+            continue
+        folded[model] = {}
+        for adapter, families in adapters.items():
+            row, count = _fold_route_partitions(families)
+            folded[model][adapter] = row
+            partitions += count
+    return folded, partitions
+
+
 @mcp.tool()
 def aiworkhub_task_cost_ledger(
     runner: str | None = None,
@@ -4061,6 +4187,14 @@ def aiworkhub_task_cost_ledger(
     magnitude whose dollars are still unknown.  Per-runner and per-topic
     maps are available with ``full=true``; task rows remain independently
     opt-in through ``include_tasks``.
+
+    Kept rows are also narrower than ``full=true``.  Each kept model's
+    ``cost_per_accepted_outcome.routes`` adapter folds its family/risk
+    partitions into one total row, re-derived from summed counters so an
+    UNKNOWN partition keeps it UNKNOWN; the fold is receipted under
+    ``summary_row_bounds``.  ``by_day`` rows keep ``records``,
+    ``total_tokens``, ``cost_usd``, ``cost_unknown_records`` and
+    ``cache_hit_ratio``.  ``full=true`` returns both exactly as built.
 
     The repository binding is what makes those aggregates answerable.
     ``build_cost_ledger`` reads canonical usage events only when it is given a
@@ -4100,17 +4234,24 @@ def aiworkhub_task_cost_ledger(
     result["aggregates"] = {
         "by_model": by_model,
         "by_provider": aggregate_map.get("by_provider", {}),
-        "by_day": by_day,
+        "by_day": {day: _summary_day_row(row) for day, row in by_day.items()},
     }
     row_bounds = {"by_model": model_bound, "by_day": day_bound}
     outcome = result.get("cost_per_accepted_outcome")
     routes_map = outcome.get("routes") if isinstance(outcome, Mapping) else None
     if isinstance(routes_map, Mapping):
         bounded_routes, routes_bound = _bounded_outcome_routes(routes_map)
+        folded_routes, folded_partitions = _fold_outcome_routes(bounded_routes)
         bounded_outcome = dict(outcome)
-        bounded_outcome["routes"] = bounded_routes
+        bounded_outcome["routes"] = folded_routes
         result["cost_per_accepted_outcome"] = bounded_outcome
-        row_bounds["cost_per_accepted_outcome_routes"] = routes_bound
+        row_bounds["cost_per_accepted_outcome_routes"] = {
+            **routes_bound,
+            "folded": {
+                "levels": ["family", "risk"],
+                "partitions": folded_partitions,
+            },
+        }
     # build_cost_ledger also emits one row per model it ever saw under
     # model_outcomes.models.  That dimension grows with usage history
     # exactly like by_model, and passing it through untouched kept the
