@@ -2736,6 +2736,9 @@ def adapter_identity_tuple(runner: str) -> tuple[str, ...]:
         # OpenCode model identities are executed only through the repository-
         # bound OpenCode CLI adapter; their provider/model suffix is opaque.
         return ("opencode_cli",)
+    if runner.startswith("omniroute_"):
+        # NF-2026-01554: a bare omniroute_ runner is the same OpenCode-hosted route family.
+        return ("opencode_cli",)
     return ()
 
 
@@ -3049,6 +3052,12 @@ def derive_launch_identity(
             except Exception:  # noqa: BLE001 - an unreadable catalog pins no model
                 identities = {}
             worker = identities.get(resolved_runner)
+            if (
+                resolved_runner.startswith("omniroute_")
+                and (worker is None or not str(worker.get("model") or "").strip())
+            ):
+                # NF-2026-01554: the catalog keys an omniroute_ runner under its opencode_ row.
+                worker = identities.get("opencode_" + resolved_runner)
             if worker is not None and str(worker.get("model") or "").strip():
                 resolved_model = str(worker["model"]).strip()
                 derived_from["model"] = "catalog_launch_identities"

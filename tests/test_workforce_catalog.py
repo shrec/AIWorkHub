@@ -2962,6 +2962,245 @@ def test_worker_prose_credit_limit_sentence_cannot_open_the_circuit(tmp_path):
         assert circuit["failure_kind"] == ""
 
 
+def _harness_row(offset_seconds, state="worker_failed", error="", adapter_id="vscode_lm"):
+    when = _epoch(_BALANCE_FAILED_AT) + offset_seconds
+    return {
+        "adapter_id": adapter_id,
+        "state": state,
+        "error": error,
+        "finished_at": datetime.fromtimestamp(when, tz=timezone.utc).isoformat(),
+    }
+
+
+_HARNESS_ERROR = "vscode_lm_semantic_edit_stage_required"
+
+
+def test_two_harness_behaviour_failures_open_a_lookback_length_circuit(tmp_path):
+    rows = [
+        _harness_row(0, error=_HARNESS_ERROR),
+        _harness_row(30, error=f"worker_failed:{_HARNESS_ERROR}:detail"),
+    ]
+    now = _epoch(_BALANCE_FAILED_AT) + 60
+    circuit = workforce_catalog.route_circuit_for(
+        tmp_path, "vscode_lm", "m", now_epoch=now, observations=rows,
+    )
+    assert circuit["state"] == "open"
+    assert circuit["failure_kind"] == "harness_behaviour"
+    assert circuit["threshold"] == workforce_catalog.ROUTE_CIRCUIT_TRANSIENT_THRESHOLD
+    assert circuit["cooldown_seconds"] == workforce_catalog.ROUTE_CIRCUIT_LOOKBACK_SECONDS
+
+    one = workforce_catalog.route_circuit_for(
+        tmp_path, "vscode_lm", "m", now_epoch=now, observations=rows[:1],
+    )
+    assert one["state"] != "open"
+
+    closed = workforce_catalog.route_circuit_for(
+        tmp_path, "vscode_lm", "m", now_epoch=now + 60,
+        observations=rows + [_harness_row(90, state="accepted")],
+    )
+    assert closed["state"] == "closed"
+
+
+def test_uncoded_worker_failed_and_validation_failed_are_not_counted(tmp_path):
+    rows = [
+        _harness_row(0, error="some_other_worker_error"),
+        _harness_row(10, error=""),
+        _harness_row(20, state="validation_failed", error=_HARNESS_ERROR),
+        _harness_row(30, state="validation_failed", error=_HARNESS_ERROR),
+    ]
+    circuit = workforce_catalog.route_circuit_for(
+        tmp_path, "vscode_lm", "m",
+        now_epoch=_epoch(_BALANCE_FAILED_AT) + 60, observations=rows,
+    )
+    assert circuit["state"] == "closed"
+    assert circuit["failure_kind"] == ""
+
+
+def test_launch_refusal_ignores_harness_behaviour_but_keeps_transient(
+    tmp_path, monkeypatch,
+):
+    now = _epoch(_BALANCE_FAILED_AT) + 60
+    harness = [
+        _harness_row(0, error=_HARNESS_ERROR),
+        _harness_row(30, error=_HARNESS_ERROR),
+    ]
+    transient = [
+        _harness_row(0, state="launch_failed"),
+        _harness_row(30, state="launch_failed"),
+    ]
+    current = {"rows": harness}
+    monkeypatch.setattr(
+        workforce_catalog.task_store,
+        "route_terminal_observations",
+        lambda _root, **_kw: current["rows"],
+    )
+    real = workforce_catalog.route_circuit_for
+    monkeypatch.setattr(
+        workforce_catalog,
+        "route_circuit_for",
+        lambda root, adapter, model: real(root, adapter, model, now_epoch=now),
+    )
+    assert workforce_catalog.launch_route_refusal_reason(
+        tmp_path, "claude_sonnet-5", "vscode_lm", "m"
+    ) == ""
+    current["rows"] = transient
+    assert workforce_catalog.launch_route_refusal_reason(
+        tmp_path, "claude_sonnet-5", "vscode_lm", "m"
+    ).startswith("route_failure_circuit_open:")
+
+
+def _harness_circuit_and_refusal(tmp_path, monkeypatch, rows):
+    now = _epoch(_BALANCE_FAILED_AT) + 120
+    monkeypatch.setattr(
+        workforce_catalog.task_store,
+        "route_terminal_observations",
+        lambda _root, **_kw: rows,
+    )
+    circuit = workforce_catalog.route_circuit_for(
+        tmp_path, "vscode_lm", "m", now_epoch=now, observations=rows,
+    )
+    real = workforce_catalog.route_circuit_for
+    monkeypatch.setattr(
+        workforce_catalog,
+        "route_circuit_for",
+        lambda root, adapter, model: real(root, adapter, model, now_epoch=now),
+    )
+    refusal = workforce_catalog.launch_route_refusal_reason(
+        tmp_path, "claude_sonnet-5", "vscode_lm", "m"
+    )
+    return circuit, refusal
+
+
+def test_older_transient_does_not_combine_with_newer_harness_failure(
+    tmp_path, monkeypatch,
+):
+    rows = [
+        _harness_row(0, state="timed_out"),
+        _harness_row(30, error=_HARNESS_ERROR),
+    ]
+    circuit, _refusal = _harness_circuit_and_refusal(tmp_path, monkeypatch, rows)
+    assert circuit["state"] != "open"
+
+
+def test_older_harness_failure_does_not_combine_with_newer_transient(
+    tmp_path, monkeypatch,
+):
+    rows = [
+        _harness_row(0, error=_HARNESS_ERROR),
+        _harness_row(30, state="timed_out"),
+    ]
+    circuit, refusal = _harness_circuit_and_refusal(tmp_path, monkeypatch, rows)
+    assert circuit["state"] != "open"
+    assert refusal == ""
+
+
+def test_newer_harness_failure_does_not_mask_an_older_sealed_failure(
+    tmp_path, monkeypatch,
+):
+    sealed = _harness_row(0)
+    sealed["provider_error"] = {
+        "owner": "provider", "sealed": True, "code": "insufficient_balance",
+    }
+    rows = [sealed, _harness_row(30, error=_HARNESS_ERROR)]
+    circuit, refusal = _harness_circuit_and_refusal(tmp_path, monkeypatch, rows)
+    assert circuit["state"] == "open"
+    assert circuit["failure_kind"] == "quota"
+    assert refusal.startswith("route_failure_circuit_open:")
+
+
+def test_newer_harness_failure_does_not_mask_an_older_transient_run(
+    tmp_path, monkeypatch,
+):
+    rows = [
+        _harness_row(0, state="launch_failed"),
+        _harness_row(10, state="launch_failed"),
+        _harness_row(30, error=_HARNESS_ERROR),
+    ]
+    circuit, refusal = _harness_circuit_and_refusal(tmp_path, monkeypatch, rows)
+    assert circuit["state"] == "open"
+    assert circuit["failure_kind"] == "transient"
+    assert refusal.startswith("route_failure_circuit_open:")
+
+
+def _expired_run_then_harness(tmp_path, monkeypatch, older):
+    """``older`` rows tripped once but their cooldown has passed (half_open);
+    two newer harness failures after them must still open the circuit."""
+    cooldown = workforce_catalog.ROUTE_CIRCUIT_COOLDOWN_SECONDS
+    newest = 10 + cooldown + 90
+    rows = older + [
+        _harness_row(10 + cooldown + 60, error=_HARNESS_ERROR),
+        _harness_row(newest, error=_HARNESS_ERROR),
+    ]
+    now = _epoch(_BALANCE_FAILED_AT) + newest + 30
+    monkeypatch.setattr(
+        workforce_catalog.task_store,
+        "route_terminal_observations",
+        lambda _root, **_kw: rows,
+    )
+    circuit = workforce_catalog.route_circuit_for(
+        tmp_path, "vscode_lm", "m", now_epoch=now, observations=rows,
+    )
+    real = workforce_catalog.route_circuit_for
+    monkeypatch.setattr(
+        workforce_catalog,
+        "route_circuit_for",
+        lambda root, adapter, model: real(root, adapter, model, now_epoch=now),
+    )
+    refusal = workforce_catalog.launch_route_refusal_reason(
+        tmp_path, "claude_sonnet-5", "vscode_lm", "m"
+    )
+    return circuit, refusal
+
+
+def test_expired_transient_run_does_not_hide_newer_harness_failures(
+    tmp_path, monkeypatch,
+):
+    older = [
+        _harness_row(0, state="launch_failed"),
+        _harness_row(10, state="launch_failed"),
+    ]
+    circuit, refusal = _expired_run_then_harness(tmp_path, monkeypatch, older)
+    assert circuit["state"] == "open"
+    assert circuit["failure_kind"] == "harness_behaviour"
+    assert refusal == ""
+
+
+def test_expired_sealed_failure_does_not_hide_newer_harness_failures(
+    tmp_path, monkeypatch,
+):
+    sealed = _harness_row(10)
+    sealed["provider_error"] = {
+        "owner": "provider", "sealed": True, "code": "insufficient_balance",
+    }
+    circuit, refusal = _expired_run_then_harness(tmp_path, monkeypatch, [sealed])
+    assert circuit["state"] == "open"
+    assert circuit["failure_kind"] == "harness_behaviour"
+    assert "reset_at" not in circuit
+    assert refusal == ""
+
+
+def test_harness_behaviour_is_only_counted_for_the_vscode_lm_adapter(tmp_path):
+    rows = [
+        _harness_row(0, error=_HARNESS_ERROR, adapter_id="claude_cli"),
+        _harness_row(30, error=_HARNESS_ERROR, adapter_id="claude_cli"),
+    ]
+    circuit = workforce_catalog.route_circuit_for(
+        tmp_path, "claude_cli", "m",
+        now_epoch=_epoch(_BALANCE_FAILED_AT) + 60, observations=rows,
+    )
+    assert circuit["state"] != "open"
+
+
+def test_harness_behaviour_code_must_match_as_a_whole_token(tmp_path):
+    error = f"{_HARNESS_ERROR}_extra"
+    rows = [_harness_row(0, error=error), _harness_row(30, error=error)]
+    circuit = workforce_catalog.route_circuit_for(
+        tmp_path, "vscode_lm", "m",
+        now_epoch=_epoch(_BALANCE_FAILED_AT) + 60, observations=rows,
+    )
+    assert circuit["state"] != "open"
+
+
 def test_build_routing_catalog_excludes_a_route_whose_every_measured_launch_died_in_the_sandbox(
     tmp_path: Path,
 ) -> None:

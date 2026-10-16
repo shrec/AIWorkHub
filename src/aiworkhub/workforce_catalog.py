@@ -681,6 +681,17 @@ def _route_failure_kind(process: Mapping[str, Any]) -> str:
         marker in error for marker in _ROUTE_TRANSIENT_MARKERS
     ):
         return "transient"
+    if (
+        state == "worker_failed"
+        and error
+        and str(process.get("adapter_id") or "").strip() == "vscode_lm"
+    ):
+        # Lazy: terminal_failure_classification is a heavy module.
+        from .terminal_failure_classification import _VSCODE_LM_BEHAVIOUR_CODES
+
+        tokens = set(re.split(r"[^a-z0-9_]+", error))
+        if tokens & set(_VSCODE_LM_BEHAVIOUR_CODES):
+            return "harness_behaviour"
     return ""
 
 
@@ -759,9 +770,15 @@ def _route_circuit(
     latest_kind = ""
     latest_failure_epoch: float | None = None
     latest_reset_epoch: float | None = None
+    harness_count = 0
+    harness_epoch: float | None = None
     for epoch, process in observed:
         kind = _route_failure_kind(process)
         state = str(process.get("state") or "").strip().casefold()
+        if kind == "harness_behaviour":
+            harness_count += 1
+            harness_epoch = epoch if harness_epoch is None else harness_epoch
+            continue
         if kind:
             consecutive += 1
             latest_kind = latest_kind or kind
@@ -783,6 +800,31 @@ def _route_circuit(
         1 if latest_kind in _ROUTE_SINGLE_FAILURE_KINDS
         else ROUTE_CIRCUIT_TRANSIENT_THRESHOLD
     )
+    # Harness-behaviour failures are counted apart from the shared run so they
+    # can neither extend nor mask another kind's verdict; they open the circuit
+    # only when no other kind's circuit is open right now.  A run of another
+    # kind that tripped but whose cooldown has passed (half_open) must not hide
+    # newer harness failures, so its open state is measured here the same way
+    # ``open_now`` measures it below.
+    shared_cooldown = (
+        ROUTE_CIRCUIT_LOOKBACK_SECONDS
+        if latest_kind == "model_not_found"
+        else ROUTE_CIRCUIT_COOLDOWN_SECONDS
+    )
+    if latest_reset_epoch is not None and latest_failure_epoch is not None:
+        shared_cooldown = max(shared_cooldown, latest_reset_epoch - latest_failure_epoch)
+    shared_open = bool(
+        latest_kind
+        and consecutive >= threshold
+        and latest_failure_epoch is not None
+        and max(0.0, now_epoch - latest_failure_epoch) < shared_cooldown
+    )
+    if not shared_open and harness_count >= ROUTE_CIRCUIT_TRANSIENT_THRESHOLD:
+        latest_kind = "harness_behaviour"
+        consecutive = harness_count
+        latest_failure_epoch = harness_epoch
+        latest_reset_epoch = None
+        threshold = ROUTE_CIRCUIT_TRANSIENT_THRESHOLD
     # The cooldown asks "how long until this is worth trying again?", and the
     # honest answer differs by kind.  A credential or a balance can be fixed in
     # minutes, so the transient cooldown is right for them.  A model the
@@ -794,7 +836,7 @@ def _route_circuit(
     # immediately, because a success ends the consecutive run above.
     cooldown = (
         ROUTE_CIRCUIT_LOOKBACK_SECONDS
-        if latest_kind == "model_not_found"
+        if latest_kind in {"model_not_found", "harness_behaviour"}
         else ROUTE_CIRCUIT_COOLDOWN_SECONDS
     )
     failure_age = (
@@ -1095,6 +1137,10 @@ def launch_route_refusal_reason(
 
     circuit = route_circuit_for(repo_root, adapter_id, model)
     if circuit.get("state") != "open":
+        return ""
+    # An open harness-behaviour circuit never refuses an explicit pin;
+    # derivation skips it like any other open circuit.
+    if circuit.get("failure_kind") == "harness_behaviour":
         return ""
     identity = resolve_launch_route(repo_root, runner, adapter_id, model)
     resolved = identity["resolved_runner"] or "nothing_in_this_repository_catalog"

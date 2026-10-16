@@ -495,6 +495,7 @@ def test_adapter_identity_tuple_is_the_validator_table(tmp_path):
         "glm_5",
         "copilot_x",
         "opencode_openai_gpt-5.6-sol",
+        "omniroute_opencode-go_muse-spark-1.3-contributor",
     ):
         allowed = process_launcher.adapter_identity_tuple(runner)
         assert allowed
@@ -502,6 +503,57 @@ def test_adapter_identity_tuple_is_the_validator_table(tmp_path):
             process_launcher._validate_adapter_identity(runner, adapter)
         with pytest.raises(process_launcher.LaunchRejected):
             process_launcher._validate_adapter_identity(runner, "not_an_adapter")
+    assert process_launcher.adapter_identity_tuple("omniroute_x") == ("opencode_cli",)
+
+
+def test_bare_omniroute_runner_derives_opencode_adapter_and_catalog_model(
+    tmp_path, monkeypatch,
+):
+    from aiworkhub import workforce_catalog
+
+    runner = "omniroute_opencode-go_muse-spark-1.3-contributor"
+    monkeypatch.setattr(
+        workforce_catalog,
+        "catalog_launch_identities",
+        lambda _repo: {
+            "opencode_" + runner: {
+                "model": "omniroute/opencode-go/muse-spark-1.3-contributor",
+                "adapter_id": "opencode_cli",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        process_launcher.repo_policy,
+        "validate_launch",
+        lambda _repo, _card, _adapter: {"ok": True},
+    )
+    derived = process_launcher.derive_launch_identity(
+        tmp_path, _launchable_card(runner=runner)
+    )
+    assert derived["adapter_id"] == "opencode_cli"
+    assert derived["model"] == "omniroute/opencode-go/muse-spark-1.3-contributor"
+    assert derived["derived_from"]["model"] == "catalog_launch_identities"
+
+
+def test_opencode_alias_model_lookup_is_limited_to_omniroute_runners(
+    tmp_path, monkeypatch,
+):
+    from aiworkhub import workforce_catalog
+
+    monkeypatch.setattr(
+        workforce_catalog,
+        "catalog_launch_identities",
+        lambda _repo: {"opencode_foo": {"model": "x"}},
+    )
+    monkeypatch.setattr(
+        process_launcher.repo_policy,
+        "validate_launch",
+        lambda _repo, _card, _adapter: {"ok": True},
+    )
+    derived = process_launcher.derive_launch_identity(
+        tmp_path, _launchable_card(runner="foo"), adapter_id="opencode_cli"
+    )
+    assert derived["model"] is None
 
 
 def _derivation_manager(tmp_path, card):
@@ -751,6 +803,42 @@ def test_derivation_skips_an_open_route_circuit_and_says_why(tmp_path, monkeypat
     assert any(
         rejection.startswith("vscode_lm:route_circuit_open")
         for rejection in derived["adapter_rejections"]
+    )
+
+
+def test_derivation_skips_a_route_whose_harness_keeps_failing(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from aiworkhub import workforce_catalog
+
+    _sealed_balance_observations(monkeypatch, open_adapter="nobody")
+    now = datetime.now(timezone.utc)
+
+    def observations(_root, *, adapter_id, model, since_iso):
+        if adapter_id != "vscode_lm":
+            return []
+        return [
+            {
+                "adapter_id": adapter_id,
+                "model": model,
+                "state": "worker_failed",
+                "error": "vscode_lm_semantic_edit_stage_required",
+                "finished_at": (now - timedelta(minutes=age)).isoformat(),
+            }
+            for age in (10, 20)
+        ]
+
+    monkeypatch.setattr(
+        workforce_catalog.task_store, "route_terminal_observations", observations
+    )
+    derived = process_launcher.derive_launch_identity(
+        tmp_path, _launchable_card(runner="claude_sonnet-5")
+    )
+
+    assert derived["adapter_id"] == "claude_cli"
+    assert (
+        "vscode_lm:route_circuit_open:harness_behaviour"
+        in derived["derived_from"]["adapter_circuit_skipped"]
     )
 
 
