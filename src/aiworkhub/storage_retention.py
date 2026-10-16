@@ -2663,6 +2663,7 @@ _SCRATCH_CONTAINER_RELATIVE_PATHS = (
     Path(".aiworkhub/temp/test"),
     Path(".aiworkhub/temp/validation"),
     CANONICAL_RUNTIME_RELATIVE_PATH / "node-test-scratch",
+    CANONICAL_RUNTIME_RELATIVE_PATH / "worktrees" / "awh-helper",  # NF-2026-01576
 )
 # One-off dirs directly under .aiworkhub/runtime that are disposable as a
 # whole, matched by name.  Deliberately excludes ``tmp*``: a long-lived

@@ -1916,7 +1916,12 @@ def _discard_helper_temp(path: str) -> None:
         return
     if os.path.normcase(Path(path).parent.name) != os.path.normcase(_HELPER_TEMP_PARENT):
         return
-    shutil.rmtree(path, ignore_errors=True)
+    try:
+        from . import worker_workspace  # local import: cycle-safe
+
+        worker_workspace._rmtree_workspace_owned(Path(path))
+    except Exception:
+        pass
 
 
 def _create_short_helper_temp(anchor: str, username: str) -> Path | None:
