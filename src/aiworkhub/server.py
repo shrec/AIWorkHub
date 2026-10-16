@@ -1377,10 +1377,66 @@ def aiworkhub_manager_context_graph_rebuild() -> dict[str, Any]:
 
 
 @mcp.tool()
-def aiworkhub_manager_workforce_catalog() -> dict[str, Any]:
-    """MANAGER READ: configured models joined to observed canonical outcomes."""
+def aiworkhub_manager_workforce_catalog(full: bool = False) -> dict[str, Any]:
+    """MANAGER READ: configured models joined to observed canonical outcomes.
 
-    return manager_ai_tools.workforce_catalog_read()
+    ``full=True`` returns the complete payload exactly as before: every worker
+    field plus outcome history.  The default keeps every top-level key that is
+    not the worker list verbatim (summary, revision, manager envelope, ...)
+    and folds the per-worker list to one compact row per worker -- worker_id,
+    adapter_id, model, enabled, ``launch_eligible`` (build_routing_catalog's
+    launchability key) and the row's ``outcomes`` ``sample_count`` and
+    ``accepted_rate`` (read only from ``worker["outcomes"]``, omitted when
+    absent, never invented) -- beside ``detail_omitted`` (bytes/sha256 of the canonical
+    JSON of the full worker list) and a ``detail_request`` naming the full
+    call (NF-2026-01566).  An error result passes through untouched.
+    """
+
+    result = manager_ai_tools.workforce_catalog_read()
+    if full or not isinstance(result, dict) or not result.get("ok"):
+        return result
+    workers = result.get("workers")
+    if not isinstance(workers, list):
+        return result
+    folded = {key: value for key, value in result.items() if key != "workers"}
+    folded["workers"] = [
+        _compact_workforce_worker(item) if isinstance(item, dict) else item
+        for item in workers
+    ]
+    canonical = json.dumps(workers, sort_keys=True, separators=(",", ":"), default=str)
+    folded["detail_omitted"] = _serialized_fingerprint(canonical)
+    folded["detail_request"] = {
+        "tool": "aiworkhub_manager_workforce_catalog",
+        "full": True,
+    }
+    return folded
+
+
+_COMPACT_WORKER_FIELDS = ("worker_id", "adapter_id", "model", "enabled", "launch_eligible")
+_COMPACT_WORKER_OUTCOME_COUNTS = ("sample_count", "accepted_rate")
+
+
+def _serialized_fingerprint(text: str) -> dict[str, Any]:
+    """Size and digest of one exact serialized payload, UTF-8 bytes throughout."""
+    payload = text.encode("utf-8")
+    return {"bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+
+
+def _compact_workforce_worker(worker: dict[str, Any]) -> dict[str, Any]:
+    """One bounded worker row: identity, effective enablement, launchability, counts.
+
+    Fields the row does not carry are omitted, never invented.
+    """
+    row: dict[str, Any] = {}
+    for key in _COMPACT_WORKER_FIELDS:
+        if key in worker:
+            row[key] = worker[key]
+    outcomes = worker.get("outcomes")
+    if isinstance(outcomes, dict):
+        for key in _COMPACT_WORKER_OUTCOME_COUNTS:
+            if key in outcomes:
+                row[key] = outcomes[key]
+    return row
 
 
 @mcp.tool()
@@ -3229,6 +3285,18 @@ def aiworkhub_task_recover_blocked_rework(
     resolution of a ``scope_rejected`` card; it requires ``feedback_reason``.
     A ``feedback_reason`` over 8000 UTF-8 bytes is refused with
     ``feedback_reason_too_large:<bytes>><cap>``; it is never truncated.
+
+    When the core result's ``stdout`` parses to a card dict the reply is the
+    shared ``_lifecycle_receipt`` projection
+    (``aiworkhub.recover_blocked_rework_receipt.v1``, ``include_card="none"``):
+    task_id/status/worker_status plus ``card_sha256``/``card_bytes`` from the
+    canonical ``_card_identity`` (the same basis as ``aiworkhub_task_show``),
+    the card's runner/recovery_epoch/recovery_predecessor when present, a
+    ``detail_request`` for ``aiworkhub_task_show``, and every extra top-level
+    key the core call attached -- never the whole recovered card
+    (NF-2026-01566).  ``command`` is never echoed: its argv carries
+    ``feedback_reason`` (up to 8000 bytes).  A not-ok or card-less result is
+    returned unchanged minus the argv echo, so error text is never hidden.
     """
 
     kwargs: dict[str, Any] = {
@@ -3242,7 +3310,25 @@ def aiworkhub_task_recover_blocked_rework(
         kwargs["scope_rejection_resolved"] = True
     if validation_amendment is not None:
         kwargs["validation_amendment"] = validation_amendment
-    return core.recover_blocked_rework(task_id, **kwargs)
+    result = core.recover_blocked_rework(task_id, **kwargs)
+    card = _envelope_card(result)
+    extra: dict[str, Any] = {
+        key: card[key]
+        for key in ("runner", "recovery_epoch", "recovery_predecessor")
+        if card and key in card
+    }
+    extra["detail_request"] = {
+        "tool": "aiworkhub_task_show",
+        "task_id": task_id,
+        "detail": "full",
+    }
+    return _lifecycle_receipt(
+        result,
+        schema_id="aiworkhub.recover_blocked_rework_receipt.v1",
+        task_id=task_id,
+        include_card="none",
+        extra=extra,
+    )
 
 @mcp.tool()
 @_serialize_task_lifecycle_write
