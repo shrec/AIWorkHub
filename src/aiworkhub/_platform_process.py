@@ -78,6 +78,35 @@ def process_is_alive(pid: int) -> bool:
     return _backend(os.name).process_is_alive(pid)
 
 
+def _windows_pid_listed(kernel32: Any, pid: int) -> bool:
+    # Fail closed: when the PID list cannot be enumerated, treat the PID as
+    # listed so ACCESS_DENIED still reads as alive.
+    try:
+        enum_processes = kernel32.K32EnumProcesses
+        enum_processes.argtypes = (
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+        )
+        enum_processes.restype = ctypes.c_int
+        size = 4096
+        cap = 1 << 20
+        while True:
+            array = (ctypes.c_uint32 * size)()
+            sizeof_array = size * ctypes.sizeof(ctypes.c_uint32)
+            bytes_returned = ctypes.c_uint32()
+            if not enum_processes(array, sizeof_array, ctypes.byref(bytes_returned)):
+                return True
+            if bytes_returned.value == sizeof_array:
+                if size >= cap:
+                    return True
+                size *= 2
+                continue
+            return pid in array[: bytes_returned.value // 4]
+    except Exception:
+        return True
+
+
 def windows_process_is_alive(pid: int) -> bool:
     if not _valid_pid(pid):
         return False
@@ -97,7 +126,10 @@ def windows_process_is_alive(pid: int) -> bool:
 
     handle = open_process(0x1000, False, pid)
     if not handle:
-        return bool(get_last_error() == 5)
+        error = get_last_error()
+        if error != 5:
+            return False
+        return _windows_pid_listed(kernel32, pid)
     exit_code = ctypes.c_uint32()
     try:
         if not get_exit_code(handle, ctypes.byref(exit_code)):
