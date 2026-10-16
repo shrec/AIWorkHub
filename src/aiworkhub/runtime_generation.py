@@ -17,10 +17,12 @@ import json
 import os
 import re
 import stat
+import sys
 from pathlib import Path
 
 CURRENT_SCHEMA_ID = "aiworkhub.stable_runtime.v1"
 MAX_CURRENT_BYTES = 64 * 1024
+_STABLE_LAUNCHER_NAME = "aiworkhub-mcp-server.py"
 _GENERATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
@@ -92,21 +94,49 @@ def superseded(own_path: Path | str | None = None) -> bool:
     return own is not None and current is not None and own != current
 
 
+def _stale_reason() -> str:
+    """Why a stale server is stale, and so what the operator should do."""
+
+    if os.environ.get("AIWORKHUB_MCP_SUPERVISED") == str(os.getpid()):
+        return "hot_swap_pending"
+    if Path(sys.argv[0]).name == _STABLE_LAUNCHER_NAME:
+        return "restart_required"
+    return "reregister_required"
+
+
 def status(own_path: Path | str | None = None) -> dict[str, object]:
     """``{serving, current, stale}`` for bootstrap/repo_current (NF-2026-01357).
 
     A client entry pinned to one generation's path keeps serving that code
     after upgrades; ``stale`` names it, with the fix, instead of failing.
+    When stale, ``reason`` is ``hot_swap_pending`` (the supervising launcher
+    swaps on the next request), ``restart_required`` (a pre-supervisor
+    launcher: restart the client once) or ``reregister_required``.
     """
 
     own, current = generation_pair(own_path)
     stale = own is not None and current is not None and own != current
     report: dict[str, object] = {"serving": own or "", "current": current or "", "stale": stale}
     if stale:
-        launcher = _generation_root(own_path)[1].parent / "bin" / "aiworkhub-mcp-server.py"
-        report["warning"] = (
-            f"stale_runtime_generation: this MCP server runs generation {own} but "
-            f"runtime/current.json names {current}; re-register the MCP entry to the "
-            f"stable launcher: python {launcher}"
-        )
+        launcher = _generation_root(own_path)[1].parent / "bin" / _STABLE_LAUNCHER_NAME
+        reason = _stale_reason()
+        report["reason"] = reason
+        if reason == "hot_swap_pending":
+            report["warning"] = (
+                f"stale_runtime_generation: this MCP server runs generation {own} but "
+                f"runtime/current.json names {current}; the stable launcher swaps to it "
+                f"on the next request, no action needed"
+            )
+        elif reason == "restart_required":
+            report["warning"] = (
+                f"stale_runtime_generation: this MCP server runs generation {own} but "
+                f"runtime/current.json names {current}; this launcher predates hot-swap, "
+                f"restart the MCP client once and later installs swap without a restart"
+            )
+        else:
+            report["warning"] = (
+                f"stale_runtime_generation: this MCP server runs generation {own} but "
+                f"runtime/current.json names {current}; re-register the MCP entry to the "
+                f"stable launcher: python {launcher}"
+            )
     return report

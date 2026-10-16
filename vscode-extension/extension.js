@@ -8547,22 +8547,293 @@ function materializeStableMcpLauncher(context) {
     );
   const binDir = path.join(storageRoot, "bin");
   const launcher = path.join(binDir, "aiworkhub-mcp-server.py");
-  const script = `#!/usr/bin/env python3
+  // NF-2026-01546: the launcher is a stdio supervisor. It serves the generation
+  // current.json names, and swaps to a newer one between requests, so a running
+  // client picks up an upgrade without a restart. `--serve-runtime <dir>` is the
+  // child mode: the in-process boot for one runtime directory.
+  const script = String.raw`#!/usr/bin/env python3
 import json
 import os
+import subprocess
 import sys
+import threading
 from pathlib import Path
 
 os.environ["AIWORKHUB_MCP_STDIO_BACKEND"] = "stdlib"
-root = Path(__file__).resolve().parents[1]
-current = json.loads((root / "runtime" / "current.json").read_text(encoding="utf-8"))
-runtime = Path(current["runtime_dir"])
-server = runtime / "aiworkhub" / "server.py"
-if not server.is_file():
-    raise SystemExit("AIWorkHub stable MCP runtime is missing")
-sys.path.insert(0, str(runtime))
-from aiworkhub.server import main
-raise SystemExit(main())
+INIT_TIMEOUT = 60.0
+STOP_TIMEOUT = 10.0
+OUT_LOCK = threading.Lock()
+LIST_CHANGED = b'{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}\n'
+
+
+def log(text):
+    try:
+        sys.stderr.write("aiworkhub-mcp-supervisor: " + text + "\n")
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
+
+
+def emit(line):
+    if not line.endswith(b"\n"):
+        line += b"\n"
+    with OUT_LOCK:
+        try:
+            sys.stdout.buffer.write(line)
+            sys.stdout.buffer.flush()
+        except (OSError, ValueError):
+            pass
+
+
+def error_line(request_id, message):
+    body = {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32603, "message": message}}
+    return (json.dumps(body, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def current_runtime_dir(root):
+    record = json.loads((root / "runtime" / "current.json").read_text(encoding="utf-8"))
+    return str(Path(record["runtime_dir"]))
+
+
+def serve_runtime(runtime_dir):
+    runtime = Path(runtime_dir)
+    if not (runtime / "aiworkhub" / "server.py").is_file():
+        raise SystemExit("AIWorkHub stable MCP runtime is missing")
+    sys.argv = sys.argv[:1]
+    sys.path.insert(0, str(runtime))
+    os.environ["AIWORKHUB_MCP_SUPERVISED"] = str(os.getpid())
+    from aiworkhub.server import main
+    return main()
+
+
+class Child:
+    def __init__(self, runtime_dir, private_id):
+        env = dict(os.environ)
+        self.runtime_dir = runtime_dir
+        self.private_key = json.dumps(private_id) if private_id else None
+        self.lock = threading.Lock()
+        self.inflight = {}
+        self.dead = False
+        self.retiring = False
+        self.init_ok = False
+        self.init_event = threading.Event()
+        self.proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--serve-runtime", runtime_dir],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            env=env,
+        )
+        self.pump = threading.Thread(target=self._pump, daemon=True)
+        self.pump.start()
+
+    def write(self, line):
+        if not line.endswith(b"\n"):
+            line += b"\n"
+        self.proc.stdin.write(line)
+        self.proc.stdin.flush()
+
+    def close_stdin(self):
+        try:
+            self.proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+
+    def stop(self):
+        self.retiring = True
+        self.close_stdin()
+        try:
+            code = self.proc.wait(timeout=STOP_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            code = self.proc.wait()
+        self.pump.join(5)
+        return code
+
+    def kill(self):
+        self.retiring = True
+        self.proc.kill()
+        self.proc.wait()
+        self.close_stdin()
+        self.pump.join(5)
+
+    def _route(self, line):
+        msg = None
+        text = line.strip()
+        if text.startswith(b"{"):
+            try:
+                msg = json.loads(text)
+            except ValueError:
+                msg = None
+        if isinstance(msg, dict) and "method" not in msg and "id" in msg:
+            key = json.dumps(msg["id"])
+            if key == self.private_key:
+                self.init_ok = "error" not in msg
+                self.init_event.set()
+                return
+            with self.lock:
+                entry = self.inflight.pop(key, None)
+            if entry is not None and entry[1] == "initialize" and isinstance(msg.get("result"), dict):
+                capabilities = msg["result"].setdefault("capabilities", {})
+                if isinstance(capabilities, dict):
+                    tools = capabilities.get("tools")
+                    if not isinstance(tools, dict):
+                        tools = capabilities["tools"] = {}
+                    tools["listChanged"] = True
+                    line = (json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8")
+        emit(line)
+
+    def _pump(self):
+        for line in iter(self.proc.stdout.readline, b""):
+            self._route(line)
+        code = self.proc.wait()
+        with self.lock:
+            self.dead = True
+            pending = list(self.inflight.values())
+            self.inflight.clear()
+        self.init_event.set()
+        if not self.retiring:
+            log("aiworkhub_mcp_child_exited runtime=%s code=%s" % (self.runtime_dir, code))
+        for request_id, _method in pending:
+            emit(error_line(request_id, "aiworkhub_mcp_child_exited"))
+
+
+class Supervisor:
+    def __init__(self, root):
+        self.root = root
+        self.init_msg = None
+        self.initialized_line = None
+        self.counter = 0
+        self.current = None
+
+    def spawn(self, runtime_dir, replay):
+        replay = replay and self.init_msg is not None
+        private_id = None
+        if replay:
+            self.counter += 1
+            private_id = "aiworkhub-supervisor-init-%d" % self.counter
+        child = Child(runtime_dir, private_id)
+        if not replay:
+            return child
+        try:
+            init = dict(self.init_msg)
+            init["id"] = private_id
+            child.write(json.dumps(init, separators=(",", ":")).encode("utf-8"))
+            if not child.init_event.wait(INIT_TIMEOUT) or not child.init_ok:
+                raise RuntimeError("initialize replay was not answered")
+            if self.initialized_line is not None:
+                child.write(self.initialized_line)
+        except (OSError, RuntimeError) as exc:
+            child.kill()
+            raise RuntimeError("new runtime did not initialize: %s" % exc)
+        return child
+
+    def install(self, new):
+        old = self.current
+        self.current = new
+        if old is not None:
+            old.stop()
+            if old.runtime_dir != new.runtime_dir:
+                emit(LIST_CHANGED)
+
+    def ensure_child(self):
+        child = self.current
+        if not child.dead:
+            return child
+        self.install(self.spawn(current_runtime_dir(self.root), True))
+        return self.current
+
+    def maybe_swap(self):
+        child = self.current
+        if child.dead:
+            return
+        try:
+            target = current_runtime_dir(self.root)
+        except Exception:
+            return
+        if target == child.runtime_dir:
+            return
+        with child.lock:
+            if child.inflight:
+                return
+        try:
+            new = self.spawn(target, True)
+        except Exception as exc:
+            log("runtime %s not adopted, still serving %s: %s" % (target, child.runtime_dir, exc))
+            return
+        self.install(new)
+
+    def send(self, line, request_id, method, has_id):
+        key = json.dumps(request_id) if has_id else None
+        for _attempt in range(2):
+            try:
+                child = self.ensure_child()
+            except Exception as exc:
+                log("cannot start the MCP child: %s" % exc)
+                break
+            with child.lock:
+                if child.dead:
+                    continue
+                if key is not None:
+                    child.inflight[key] = (request_id, method)
+            try:
+                child.write(line)
+                return
+            except (OSError, ValueError):
+                child.pump.join(5)
+                with child.lock:
+                    mine = child.inflight.pop(key, None) if key is not None else None
+                if key is not None and mine is None:
+                    return
+        if key is not None:
+            emit(error_line(request_id, "aiworkhub_mcp_child_exited"))
+
+    def handle(self, line):
+        msg = None
+        text = line.strip()
+        if text.startswith(b"{"):
+            try:
+                msg = json.loads(text)
+            except ValueError:
+                msg = None
+        if not isinstance(msg, dict):
+            self.send(line, None, None, False)
+            return
+        method = msg.get("method")
+        has_id = "id" in msg and method is not None
+        if method == "initialize":
+            self.init_msg = None
+        elif method == "notifications/initialized":
+            self.initialized_line = line
+        elif has_id:
+            self.maybe_swap()
+        elif method == "notifications/cancelled":
+            params = msg.get("params")
+            cancelled = params.get("requestId") if isinstance(params, dict) else None
+            with self.current.lock:
+                self.current.inflight.pop(json.dumps(cancelled), None)
+        self.send(line, msg.get("id"), method, has_id)
+        if method == "initialize":
+            self.init_msg = msg
+
+    def run(self):
+        try:
+            runtime_dir = current_runtime_dir(self.root)
+        except Exception as exc:
+            raise SystemExit("AIWorkHub stable MCP runtime is missing: %s" % exc)
+        self.current = self.spawn(runtime_dir, False)
+        for line in iter(sys.stdin.buffer.readline, b""):
+            self.handle(line)
+        return self.current.stop()
+
+
+def main():
+    if len(sys.argv) >= 3 and sys.argv[1] == "--serve-runtime":
+        return serve_runtime(sys.argv[2])
+    return Supervisor(Path(__file__).resolve().parents[1]).run()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 `;
   fs.mkdirSync(binDir, { recursive: true });
   let existing = "";
@@ -9664,15 +9935,17 @@ function repairClaudeMcpConfigObject(document, runtimeDir, repoRoot, python) {
 function ensureWorkspaceMcpConfigsRepaired(context) {
   const folders = vscode.workspace.workspaceFolders || [];
   const runtimeDir = extensionRuntimeDir || resolveExtensionRuntimeDir(context.extensionUri.fsPath);
-  // NF-2026-01357: Claude Code keeps an .mcp.json entry across upgrades, so
-  // point it at the host-stable launcher whenever that layout is live.
-  let claudeLauncher = "";
+  // NF-2026-01357 / NF-2026-01546: every client (Claude Code .mcp.json and
+  // VS Code .vscode/mcp.json) keeps its entry across upgrades, so point both at
+  // the host-stable launcher whenever that layout is live. The launcher is a
+  // stdio supervisor that hot-swaps to the generation current.json names.
+  let stableLauncher = "";
   if (folders.length && context.globalStorageUri && context.globalStorageUri.fsPath) {
     try {
       const launcher = materializeStableMcpLauncher(context);
-      if (stableMcpLauncherLayoutOk(launcher)) claudeLauncher = launcher;
+      if (stableMcpLauncherLayoutOk(launcher)) stableLauncher = launcher;
     } catch (err) {
-      if (outputChannel) outputChannel.appendLine(`[mcp] stable launcher unavailable; Claude Code MCP pins this generation: ${sanitizeErrorMessage(err)}`);
+      if (outputChannel) outputChannel.appendLine(`[mcp] stable launcher unavailable; Claude Code and VS Code MCP pin this generation: ${sanitizeErrorMessage(err)}`);
     }
   }
   let repaired = 0;
@@ -9680,8 +9953,8 @@ function ensureWorkspaceMcpConfigsRepaired(context) {
     const repoRoot = canonicalRepositoryRoot(folder.uri.fsPath);
     const python = findPythonCommand(repoRoot, { preflight: false });
     for (const spec of [
-      { configPath: path.join(repoRoot, ".vscode", "mcp.json"), container: "servers", label: "VS Code/Copilot", vscodeVariables: true },
-      { configPath: path.join(repoRoot, ".mcp.json"), container: "mcpServers", label: "Claude Code", vscodeVariables: false, launcherPath: claudeLauncher },
+      { configPath: path.join(repoRoot, ".vscode", "mcp.json"), container: "servers", label: "VS Code/Copilot", vscodeVariables: true, launcherPath: stableLauncher },
+      { configPath: path.join(repoRoot, ".mcp.json"), container: "mcpServers", label: "Claude Code", vscodeVariables: false, launcherPath: stableLauncher },
     ]) {
       let document = {};
       let corrupt = false;

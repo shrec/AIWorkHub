@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -206,8 +207,10 @@ def test_an_unsuperseded_service_reports_its_own_generation(tmp_path, monkeypatc
     assert health["own_runtime_generation"] == "G1"
 
 
-def test_status_reports_serving_current_and_stale(tmp_path):
+def test_status_reports_serving_current_and_stale(tmp_path, monkeypatch):
     """NF-2026-01357: a pinned old generation is reported, never silently served."""
+    monkeypatch.delenv("AIWORKHUB_MCP_SUPERVISED", raising=False)
+    monkeypatch.setattr(sys, "argv", ["pytest"])
     storage = tmp_path / "gs"
     module = _install(storage, "0.9.69-old")
     dev = tmp_path / "checkout" / "src" / "aiworkhub" / "runtime_generation.py"
@@ -225,6 +228,40 @@ def test_status_reports_serving_current_and_stale(tmp_path):
     assert report["stale"] is True
     assert "0.9.69-old" in report["warning"] and "0.12.24-new" in report["warning"]
     assert str(storage / "bin" / "aiworkhub-mcp-server.py") in report["warning"]
+    assert report["reason"] == "reregister_required"
+
+
+def test_status_names_hot_swap_pending_restart_required_and_reregister(tmp_path, monkeypatch):
+    """NF-2026-01546: a stale server says whether anything is left to do."""
+    storage = tmp_path / "gs"
+    module = _install(storage, "0.12.52")
+    _point(storage, "0.12.53")
+    launcher = str(storage / "bin" / "aiworkhub-mcp-server.py")
+
+    monkeypatch.delenv("AIWORKHUB_MCP_SUPERVISED", raising=False)
+    monkeypatch.setattr(sys, "argv", ["pytest"])
+    assert runtime_generation.status(module)["reason"] == "reregister_required"
+
+    monkeypatch.setattr(sys, "argv", [launcher])
+    restart = runtime_generation.status(module)
+    assert restart["reason"] == "restart_required"
+    assert "restart" in restart["warning"]
+
+    monkeypatch.setenv("AIWORKHUB_MCP_SUPERVISED", str(os.getpid()))
+    pending = runtime_generation.status(module)
+    assert pending["reason"] == "hot_swap_pending"
+    assert "no action needed" in pending["warning"]
+    assert {k: pending[k] for k in ("serving", "current", "stale")} == {
+        "serving": "0.12.52", "current": "0.12.53", "stale": True,
+    }
+
+    # A descendant inherits a pid that is not its own: it is not supervised.
+    monkeypatch.setenv("AIWORKHUB_MCP_SUPERVISED", str(os.getpid() + 1))
+    monkeypatch.setattr(sys, "argv", ["x/aiworkhub/server.py"])
+    assert runtime_generation.status(module)["reason"] == "reregister_required"
+
+    _point(storage, "0.12.52")
+    assert "reason" not in runtime_generation.status(module)
 
 
 def test_bootstrap_and_repo_current_report_runtime_generation(tmp_path, monkeypatch):
