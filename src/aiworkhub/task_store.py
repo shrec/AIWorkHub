@@ -5227,6 +5227,63 @@ def apply_validation_amendment(card: dict[str, Any], commands: list[str]) -> lis
     return applied
 
 
+def _committed_base_drift(
+    repo: Path, base_oid: object, path: str, canonical_hash: str | None
+) -> bool:
+    """Return True only when ``path`` drifted solely via committed history since ``base_oid``."""
+    from . import worker_workspace as _ww
+
+    if (
+        not isinstance(base_oid, str)
+        or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", base_oid) is None
+    ):
+        return False
+    if canonical_hash is None:
+        return False
+    git_prefix = [
+        "git",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=" + os.devnull,
+        "--literal-pathspecs",
+    ]
+    phase = "nf01558_committed_drift"
+    try:
+        for args, expected_rc in (
+            (["merge-base", "--is-ancestor", base_oid, "HEAD"], 0),
+            (["diff", "--quiet", base_oid, "HEAD", "--", path], 1),
+        ):
+            res = _ww._run(
+                [*git_prefix, *args],
+                cwd=repo,
+                timeout=60,
+                phase=phase,
+            )
+            if res.returncode != expected_rc:
+                return False
+        res = _ww._run(
+            [*git_prefix, "cat-file", "--filters", f"HEAD:{path}"],
+            cwd=repo,
+            timeout=60,
+            phase=phase,
+            text=False,
+        )
+        return (
+            res.returncode == 0
+            and hashlib.sha256(res.stdout).hexdigest() == canonical_hash
+        )
+    except (
+        _ww.WorkspaceError,
+        _ww.GitCommandTimeout,
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+    ):
+        return False
+
+
 @_os_failure_names_its_operation
 def recover_blocked_rework(
     root: str | Path,
@@ -6593,7 +6650,12 @@ def recover_blocked_rework(
                     recorded_baseline_hash = baseline_parts[2]
                 else:
                     return False, "retained_terminal_candidate_baseline_invalid"
-                if recorded_baseline_hash != baseline_hash:
+                # NF-2026-01558: only committed canonical base drift is waived
+                # because the materializer three-way rebases committed history
+                # only and owns conflict refusal (rework_base_drift).
+                if recorded_baseline_hash != baseline_hash and not _committed_base_drift(
+                    expected_repo, workspace.get("base_oid"), path, baseline_hash
+                ):
                     return False, "retained_terminal_candidate_baseline_mismatch"
             retained_predecessor = {
                 "schema_id": "aiworkhub.rework_predecessor.v1",

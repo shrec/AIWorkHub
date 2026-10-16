@@ -602,6 +602,8 @@ def test_normal_rework_terminal_failure_fallback_fails_closed(
     elif mutation == "repo":
         evidence["request_identity"]["repo"] = str(tmp_path)
     elif mutation == "baseline":
+        evidence["request_identity"]["base_oid"] = "unknown"
+        evidence["workspace"]["base_oid"] = "unknown"
         (repo / "src/aiworkhub/task_store.py").write_bytes(b"new baseline\n")
     elif mutation == "live_pid":
         evidence["pid"] = os.getpid()
@@ -654,6 +656,175 @@ def test_normal_rework_terminal_failure_fallback_fails_closed(
         assert conn.execute(
             "SELECT * FROM task_events WHERE task_id=? ORDER BY rowid", (task_id,),
         ).fetchall() == before_events
+
+
+def _git_commit_fixture_baseline(repo: Path) -> str:
+    for argv in (
+        ["git", "init", "-q"],
+        ["git", "config", "core.autocrlf", "false"],
+        [
+            "git",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "add",
+            "src/aiworkhub/task_store.py",
+            "tests/test_retained_candidate.py",
+        ],
+        [
+            "git",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "baseline",
+        ],
+    ):
+        subprocess.run(argv, cwd=repo, check=True, capture_output=True, text=True)
+    base_oid = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    task_id = "BLOCKED_RETAINED_EMPTY_OUTPUTS"
+    card = _get_card(repo, task_id)
+    failure = card["terminal_failure"]
+    evidence = failure["evidence"]
+    evidence["workspace"]["base_oid"] = base_oid
+    evidence["request_identity"]["base_oid"] = base_oid
+    _ready, db_path = task_store._require_ready(repo)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (json.dumps(card), task_id),
+        )
+        conn.execute(
+            "UPDATE task_events SET payload_json=? "
+            "WHERE task_id=? AND event='terminal_failure'",
+            (json.dumps(failure), task_id),
+        )
+    return base_oid
+
+
+def test_retained_candidate_committed_drift_recovers(tmp_path: Path) -> None:
+    repo, _candidate, hashes = _retained_terminal_failure_fixture(
+        tmp_path, required_outputs=True,
+    )
+    _git_commit_fixture_baseline(repo)
+    (repo / "src/aiworkhub/task_store.py").write_bytes(b"new baseline\n")
+    for argv in (
+        ["git", "add", "src/aiworkhub/task_store.py"],
+        [
+            "git",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "drift",
+        ],
+    ):
+        subprocess.run(argv, cwd=repo, check=True, capture_output=True, text=True)
+    assert task_store.recover_blocked_rework(
+        repo,
+        "BLOCKED_RETAINED_EMPTY_OUTPUTS",
+        actor="coordinator",
+        feedback_reason="NeedFix: recover retained candidate across canonical drift",
+    ) == (True, "recovered")
+    card = _get_card(repo, "BLOCKED_RETAINED_EMPTY_OUTPUTS")
+    assert card["rework_predecessor"]["request_id"] == "a" * 32
+    assert card["rework_predecessor"]["changed_path_hashes"] == hashes
+
+
+def test_retained_candidate_uncommitted_drift_refuses(tmp_path: Path) -> None:
+    repo, _candidate, _hashes = _retained_terminal_failure_fixture(
+        tmp_path, required_outputs=True,
+    )
+    _git_commit_fixture_baseline(repo)
+    (repo / "src/aiworkhub/task_store.py").write_bytes(b"new baseline\n")
+    assert task_store.recover_blocked_rework(
+        repo,
+        "BLOCKED_RETAINED_EMPTY_OUTPUTS",
+        actor="coordinator",
+        feedback_reason="NeedFix: refuse uncommitted canonical drift",
+    ) == (False, "retained_terminal_candidate_baseline_mismatch")
+
+
+def test_retained_candidate_assume_unchanged_drift_refuses(tmp_path: Path) -> None:
+    repo, _candidate, _hashes = _retained_terminal_failure_fixture(
+        tmp_path, required_outputs=True,
+    )
+    _git_commit_fixture_baseline(repo)
+    (repo / "src/aiworkhub/task_store.py").write_bytes(b"new baseline\n")
+    for argv in (
+        ["git", "add", "src/aiworkhub/task_store.py"],
+        [
+            "git",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "drift",
+        ],
+        ["git", "update-index", "--assume-unchanged", "src/aiworkhub/task_store.py"],
+    ):
+        subprocess.run(argv, cwd=repo, check=True, capture_output=True, text=True)
+    (repo / "src/aiworkhub/task_store.py").write_bytes(b"uncommitted local edit\n")
+    assert task_store.recover_blocked_rework(
+        repo,
+        "BLOCKED_RETAINED_EMPTY_OUTPUTS",
+        actor="coordinator",
+        feedback_reason="NeedFix: refuse assume-unchanged canonical drift",
+    ) == (False, "retained_terminal_candidate_baseline_mismatch")
+
+
+def test_retained_candidate_untracked_recreation_refuses(tmp_path: Path) -> None:
+    repo, _candidate, _hashes = _retained_terminal_failure_fixture(
+        tmp_path, required_outputs=True,
+    )
+    _git_commit_fixture_baseline(repo)
+    for argv in (
+        ["git", "rm", "-q", "src/aiworkhub/task_store.py"],
+        [
+            "git",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "delete",
+        ],
+    ):
+        subprocess.run(argv, cwd=repo, check=True, capture_output=True, text=True)
+    (repo / "src/aiworkhub").mkdir(parents=True, exist_ok=True)
+    (repo / "src/aiworkhub/task_store.py").write_bytes(b"recreated\n")
+    assert task_store.recover_blocked_rework(
+        repo,
+        "BLOCKED_RETAINED_EMPTY_OUTPUTS",
+        actor="coordinator",
+        feedback_reason="NeedFix: refuse untracked recreation after committed deletion",
+    ) == (False, "retained_terminal_candidate_baseline_mismatch")
 
 
 def _setup_repo(tmp_path: Path) -> Path:
