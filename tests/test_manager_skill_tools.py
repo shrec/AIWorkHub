@@ -1347,6 +1347,120 @@ def test_retirement_report_tool_defaults_to_summary_mode():
     assert parameters["min_anchors"].default == skill_miner.MIN_RETIREMENT_ANCHORS
 
 
+def _propose_with_unresolved_negative():
+    _propose()
+    assert _accept("actor-a")["ok"] is True
+    assert _accept("actor-b")["ok"] is True
+    assert _accept("actor-c", source="stale-neg", outcome="negative", note="old")["ok"] is True
+
+
+def _resolve(**overrides):
+    args = {
+        "identity": BASE["identity"],
+        "version": BASE["version"],
+        "source": "stale-neg",
+        "reason": "fixed in 1.0.1",
+        "actor_id": "actor-m",
+    }
+    args.update(overrides)
+    return mst.resolve_negative_evidence(**args)
+
+
+def test_resolve_negative_evidence_persists_and_unblocks_activation(manager):
+    _propose_with_unresolved_negative()
+    blocked = mst.activate(identity=BASE["identity"], version=BASE["version"])
+    assert blocked["ok"] is False
+
+    result = _resolve()
+    assert result["ok"] is True
+
+    stored = store.get_record(manager, BASE["identity"], BASE["version"])
+    row = next(item for item in stored.evidence if item.source == "stale-neg")
+    assert row.resolved is True
+    assert row.note == "old; resolved_by=actor-m: fixed in 1.0.1"
+    assert [item.source for item in stored.evidence][-1] == "stale-neg"
+    assert mst.activate(identity=BASE["identity"], version=BASE["version"])["ok"] is True
+
+
+def test_resolve_negative_evidence_uses_the_state_digest_compare_and_swap(manager, monkeypatch):
+    _propose_with_unresolved_negative()
+    digest_before = store.stored_state_digest(manager, BASE["identity"], BASE["version"])
+    seen = {}
+    real_advance = store.advance_record
+
+    def spy(root, record, **kwargs):
+        seen.update(kwargs)
+        return real_advance(root, record, **kwargs)
+
+    monkeypatch.setattr(store, "advance_record", spy)
+    assert _resolve()["ok"] is True
+    assert seen["expected_state_digest"] == digest_before
+
+
+def test_resolve_negative_evidence_refuses_a_stale_state_digest(manager, monkeypatch):
+    _propose_with_unresolved_negative()
+    monkeypatch.setattr(store, "stored_state_digest", lambda *a, **k: "0" * 64)
+    result = _resolve()
+    assert result["ok"] is False
+    stored = store.get_record(manager, BASE["identity"], BASE["version"])
+    assert all(
+        not item.resolved
+        for item in stored.evidence
+        if item.outcome is sr.EvidenceOutcome.NEGATIVE
+    )
+
+
+def test_resolve_negative_evidence_refuses_a_blank_reason_and_unknown_source(manager):
+    _propose_with_unresolved_negative()
+    assert _resolve(reason="  ")["ok"] is False
+    assert _resolve(source="nope")["ok"] is False
+    stored = store.get_record(manager, BASE["identity"], BASE["version"])
+    assert any(
+        not item.resolved
+        for item in stored.evidence
+        if item.outcome is sr.EvidenceOutcome.NEGATIVE
+    )
+
+
+def test_server_add_evidence_tool_resolves_when_resolve_negative_source_is_set(manager):
+    _propose_with_unresolved_negative()
+    count_before = len(
+        store.get_record(manager, BASE["identity"], BASE["version"]).evidence
+    )
+
+    result = server.aiworkhub_manager_skill_add_evidence(
+        identity=BASE["identity"],
+        version=BASE["version"],
+        source="ignored",
+        outcome="accepted",
+        actor_id="actor-m",
+        note="stale, superseded",
+        resolve_negative_source="stale-neg",
+    )
+
+    assert result["ok"] is True
+    stored = store.get_record(manager, BASE["identity"], BASE["version"])
+    assert len(stored.evidence) == count_before
+    row = next(item for item in stored.evidence if item.source == "stale-neg")
+    assert row.resolved is True
+    assert row.note.endswith("resolved_by=actor-m: stale, superseded")
+
+
+def test_server_add_evidence_tool_still_appends_without_resolve_negative_source(manager):
+    _propose()
+    result = server.aiworkhub_manager_skill_add_evidence(
+        identity=BASE["identity"],
+        version=BASE["version"],
+        source="plain",
+        outcome="negative",
+        actor_id="actor-m",
+        note="n",
+    )
+    assert result["ok"] is True
+    stored = store.get_record(manager, BASE["identity"], BASE["version"])
+    assert [(item.source, item.resolved) for item in stored.evidence] == [("plain", False)]
+
+
 def test_retirement_report_summary_folds_anchors_and_nothing_else(manager):
     anchors = ["anchor0", "anchor1", "anchor2"]
     for index, anchor in enumerate(anchors):

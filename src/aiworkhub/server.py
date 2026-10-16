@@ -1823,6 +1823,7 @@ def aiworkhub_manager_skill_add_evidence(
     outcome: str,
     actor_id: str,
     note: str = "",
+    resolve_negative_source: str = "",
 ) -> dict[str, Any]:
     """MANAGER WRITE: append one MANAGER evidence entry to a skill version.
 
@@ -1839,8 +1840,20 @@ def aiworkhub_manager_skill_add_evidence(
     card: it is appended automatically when a decision is recorded on a card the
     skill was injected into, and can be filed for one card at a time through the
     task-derived path.
+
+    When ``resolve_negative_source`` is set, no row is appended: the one
+    unresolved negative row with that source is marked resolved instead, with
+    ``note`` as the REQUIRED reason (``source`` and ``outcome`` are ignored).
     """
 
+    if resolve_negative_source:
+        return manager_skill_tools.resolve_negative_evidence(
+            identity=identity,
+            version=version,
+            source=resolve_negative_source,
+            reason=note,
+            actor_id=actor_id,
+        )
     return manager_skill_tools.add_evidence(
         identity=identity,
         version=version,

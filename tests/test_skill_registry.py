@@ -2208,6 +2208,126 @@ def test_unknown_actor_ids_stay_distinct_and_fail_closed():
     assert sr.independent_accepted_evidence_count(record) == 2
 
 
+def _registry_with_unresolved_negative():
+    registry = sr.SkillRegistry()
+    propose_with_accepted_evidence(registry)
+    negative_actor = sr.Authority(sr.AuthorityRole.WORKER, actor_id="actor-c", token="tok-c")
+    registry.add_evidence(
+        "commit-msg-check",
+        "1.0.0",
+        {"source": "stale-neg", "outcome": "negative", "note": "old failure"},
+        negative_actor,
+    )
+    registry.add_evidence(
+        "commit-msg-check",
+        "1.0.0",
+        {"source": "later-accept", "outcome": "accepted"},
+        negative_actor,
+    )
+    return registry
+
+
+def test_resolve_negative_evidence_unblocks_activation_and_keeps_the_row():
+    registry = _registry_with_unresolved_negative()
+    before = registry.get("commit-msg-check", "1.0.0")
+    assert sr.independent_accepted_evidence_count(before) >= 2
+    assert not sr.can_activate(before, 2).allowed
+
+    updated = registry.resolve_negative_evidence(
+        "commit-msg-check", "1.0.0", "stale-neg", "fixed in 1.0.1", MANAGER
+    )
+
+    assert sr.can_activate(updated, 2).allowed
+    assert tuple(item.source for item in updated.evidence) == tuple(
+        item.source for item in before.evidence
+    )
+    row = next(item for item in updated.evidence if item.source == "stale-neg")
+    assert row.resolved is True
+    assert row.outcome is sr.EvidenceOutcome.NEGATIVE
+    assert row.note == "old failure; resolved_by=manager-1: fixed in 1.0.1"
+    assert updated.negative_count == before.negative_count
+    assert registry.get("commit-msg-check", "1.0.0") == updated
+    assert registry.activate("commit-msg-check", "1.0.0", MANAGER).lifecycle_state is (
+        sr.LifecycleState.ACTIVE
+    )
+
+
+def test_resolve_negative_evidence_with_empty_note_has_no_separator():
+    registry = sr.SkillRegistry()
+    registry.propose(base_record(), WORKER)
+    registry.add_evidence(
+        "commit-msg-check", "1.0.0", {"source": "neg", "outcome": "negative"}, WORKER
+    )
+    updated = registry.resolve_negative_evidence(
+        "commit-msg-check", "1.0.0", "neg", "  superseded  ", MANAGER
+    )
+    assert updated.evidence[0].note == "resolved_by=manager-1: superseded"
+
+
+def test_resolve_negative_evidence_is_refused_without_manager_authority():
+    registry = _registry_with_unresolved_negative()
+    for authority in (WORKER, MANAGER_NO_TOKEN):
+        assert_fails(
+            "skill_registry.unauthorized",
+            lambda authority=authority: registry.resolve_negative_evidence(
+                "commit-msg-check", "1.0.0", "stale-neg", "why", authority
+            ),
+        )
+    assert not sr.can_activate(registry.get("commit-msg-check", "1.0.0"), 2).allowed
+
+
+@pytest.mark.parametrize("reason", ["", "   ", None, 5])
+def test_resolve_negative_evidence_requires_a_non_blank_reason(reason):
+    registry = _registry_with_unresolved_negative()
+    assert_fails(
+        "skill_registry.invalid_evidence",
+        lambda: registry.resolve_negative_evidence(
+            "commit-msg-check", "1.0.0", "stale-neg", reason, MANAGER
+        ),
+    )
+    assert any(
+        not item.resolved and item.outcome is sr.EvidenceOutcome.NEGATIVE
+        for item in registry.get("commit-msg-check", "1.0.0").evidence
+    )
+
+
+def test_resolve_negative_evidence_refuses_unknown_or_non_negative_sources():
+    registry = _registry_with_unresolved_negative()
+    for source in ("missing", "later-accept", "src-actor-a"):
+        assert_fails(
+            "skill_registry.invalid_evidence",
+            lambda source=source: registry.resolve_negative_evidence(
+                "commit-msg-check", "1.0.0", source, "why", MANAGER
+            ),
+        )
+
+
+def test_resolve_negative_evidence_refuses_an_ambiguous_source():
+    registry = _registry_with_unresolved_negative()
+    other = sr.Authority(sr.AuthorityRole.WORKER, actor_id="actor-d", token="tok-d")
+    registry.add_evidence(
+        "commit-msg-check", "1.0.0", {"source": "stale-neg", "outcome": "negative"}, other
+    )
+    assert_fails(
+        "skill_registry.invalid_evidence",
+        lambda: registry.resolve_negative_evidence(
+            "commit-msg-check", "1.0.0", "stale-neg", "why", MANAGER
+        ),
+    )
+    assert len(sr.unresolved_negative_evidence(registry.get("commit-msg-check", "1.0.0"))) == 2
+
+
+def test_resolving_an_already_resolved_negative_is_refused():
+    registry = _registry_with_unresolved_negative()
+    registry.resolve_negative_evidence("commit-msg-check", "1.0.0", "stale-neg", "why", MANAGER)
+    assert_fails(
+        "skill_registry.invalid_evidence",
+        lambda: registry.resolve_negative_evidence(
+            "commit-msg-check", "1.0.0", "stale-neg", "again", MANAGER
+        ),
+    )
+
+
 def test_canonical_actor_id_preserves_subject_token_order():
     # Only the role and provider tokens are positionally meaningless. Reordering
     # the subject would merge two different subjects that happen to be anagrams

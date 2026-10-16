@@ -494,8 +494,9 @@ def _bind_evidence(value: Any, authority: Authority) -> EvidenceRecord:
     evidence by choosing multiple free-text source labels.
 
     ``resolved`` is always forced to ``False`` for a newly appended evidence
-    record, for both outcomes. Resolution is exclusively the manager-only
-    :meth:`SkillRegistry.mark_negative_resolved` transition, so neither a worker
+    record, for both outcomes. Resolution is exclusively a manager-only
+    transition (:meth:`SkillRegistry.mark_negative_resolved` or
+    :meth:`SkillRegistry.resolve_negative_evidence`), so neither a worker
     nor a manager ``add_evidence`` append may pre-resolve a negative (or any
     other) evidence entry.
     """
@@ -2409,6 +2410,60 @@ class SkillRegistry:
             for item in entry.evidence
         )
         updated = replace(entry, evidence=updated_evidence)
+        self._entries[key] = updated
+        return updated
+
+    def resolve_negative_evidence(
+        self,
+        identity: str,
+        version: str,
+        source: str,
+        reason: str,
+        authority: Authority,
+    ) -> SkillRecord:
+        """Resolve exactly one unresolved negative evidence row (manager only).
+
+        The row is selected by its evidence ``source``; the row is kept in place
+        (never deleted, order unchanged), marked resolved, and its note records
+        who resolved it and why.
+        """
+        manager = _require_manager(authority)
+        if isinstance(reason, bool) or not isinstance(reason, str) or not reason.strip():
+            _fail(
+                "skill_registry.invalid_evidence",
+                "resolving negative evidence requires a non-empty reason",
+            )
+        if isinstance(source, bool) or not isinstance(source, str) or not source.strip():
+            _fail("skill_registry.invalid_evidence", "evidence source must be a non-empty string")
+        wanted = source.strip()
+        key, entry = self._require_entry(identity, version)
+        matches = [
+            index
+            for index, item in enumerate(entry.evidence)
+            if item.outcome is EvidenceOutcome.NEGATIVE
+            and not item.resolved
+            and item.source == wanted
+        ]
+        if not matches:
+            _fail(
+                "skill_registry.invalid_evidence",
+                f"no unresolved negative evidence with source {wanted!r}",
+            )
+        if len(matches) > 1:
+            _fail(
+                "skill_registry.invalid_evidence",
+                f"{len(matches)} unresolved negative evidence rows share source "
+                f"{wanted!r}; resolution is ambiguous",
+            )
+        target = entry.evidence[matches[0]]
+        marker = f"resolved_by={manager.actor_id}: {reason.strip()}"
+        note = f"{target.note}; {marker}" if target.note else marker
+        resolved_row = _validate_evidence_record(replace(target, resolved=True, note=note))
+        evidence = tuple(
+            resolved_row if index == matches[0] else item
+            for index, item in enumerate(entry.evidence)
+        )
+        updated = replace(entry, evidence=evidence)
         self._entries[key] = updated
         return updated
 

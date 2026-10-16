@@ -384,6 +384,35 @@ def add_evidence(
     return _invoke_write(operation)
 
 
+def resolve_negative_evidence(
+    *,
+    identity: str,
+    version: str,
+    source: str,
+    reason: str,
+    actor_id: str,
+) -> dict[str, Any]:
+    """MANAGER WRITE: resolve one unresolved negative evidence row with a reason.
+
+    The row named by ``source`` is kept in place and marked resolved; its note
+    records the resolving actor and ``reason``. Persisted through the same
+    stored-state-digest compare-and-swap as :func:`add_evidence`.
+    """
+    def operation(root: Path, token: str) -> sr.SkillRecord:
+        authority = sr.Authority(
+            sr.AuthorityRole.MANAGER, actor_id=_caller_actor(actor_id), token=token
+        )
+        registry = store.load_registry(root)
+        expected = store.stored_state_digest(root, identity, version)
+        updated = registry.resolve_negative_evidence(
+            identity, version, source, reason, authority
+        )
+        store.advance_record(root, updated, expected_state_digest=expected)
+        return updated
+
+    return _invoke_write(operation)
+
+
 def add_task_evidence(
     *,
     identity: str,
