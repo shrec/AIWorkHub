@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, NamedTuple
 
-from . import repo_policy, task_store
+from . import repo_policy, roadmap_store, task_store
 from .sqlite_readonly import connect_readonly
 
 
@@ -268,6 +268,25 @@ def quarantine(
         payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         if len(payload_json.encode("utf-8")) > MAX_PAYLOAD_BYTES:
             raise TaskRetentionError("task_retention_batch_too_large")
+        # The roadmap must learn each task's final status before its row is
+        # deleted; losing that evidence is the defect, so a roadmap write
+        # failure aborts the whole quarantine (task transaction rolls back).
+        # The roadmap commits first, so a later task-DB failure can only leave
+        # extra events, which are harmless because a live row always wins.
+        # Quarantine only sees archived rows, so the archive overlay is dropped
+        # to record the task's outcome instead of the constant "archived".
+        try:
+            roadmap_store.record_tasks_retired(
+                root,
+                {
+                    str(row["task_id"]): task_store.canonical_status(
+                        {**dict(row), "archived_at": ""}
+                    )
+                    for row in tasks
+                },
+            )
+        except Exception as exc:
+            raise TaskRetentionError("task_retention_roadmap_record_failed") from exc
         connection.execute(
             "INSERT INTO task_retention_batches("
             "batch_id,task_count,payload_json,quarantined_at,restore_deadline"

@@ -13029,9 +13029,11 @@ def roadmap_snapshot(
         for card in task_cards_snapshot or ()
         if card.get("task_id")
     }
-    rows: list[dict[str, Any]] = []
+    # (task_id, displayed status, outcome status); both None when no live card.
+    # The display keeps the archive overlay; acceptance reads the outcome under it.
+    live_statuses: list[list[tuple[str, str | None, str | None]]] = []
     for item in items:
-        tasks: list[dict[str, str]] = []
+        linked: list[tuple[str, str | None, str | None]] = []
         for task_id in item["task_ids"]:
             if task_id in task_cards_by_id:
                 card = task_cards_by_id[task_id]
@@ -13039,14 +13041,39 @@ def roadmap_snapshot(
                 card = None
             else:
                 card = task_store.get_task(repo_root(), task_id)
-            tasks.append(
-                {
-                    "task_id": task_id,
-                    "status": task_store.canonical_status(card)
-                    if card is not None
-                    else "missing",
-                }
-            )
+            if card is None:
+                linked.append((task_id, None, None))
+            else:
+                linked.append(
+                    (
+                        task_id,
+                        task_store.canonical_status(card),
+                        task_store.canonical_status({**card, "archived_at": ""}),
+                    )
+                )
+        live_statuses.append(linked)
+    # One query for every task with no live card; a live card always wins.
+    unresolved_ids = {
+        task_id
+        for linked in live_statuses
+        for task_id, status, _outcome in linked
+        if status is None
+    }
+    retired = (
+        _roadmap_store_module().retired_task_statuses(repo_root(), sorted(unresolved_ids))
+        if unresolved_ids
+        else {}
+    )
+    rows: list[dict[str, Any]] = []
+    for item, linked in zip(items, live_statuses):
+        tasks: list[dict[str, str]] = []
+        accepted = 0
+        for task_id, status, outcome in linked:
+            if status is None:
+                outcome = retired.get(task_id)
+                status = f"purged:{outcome}" if outcome else "missing"
+            accepted += 1 if outcome == "finished" else 0
+            tasks.append({"task_id": task_id, "status": status})
         dependency_blockers = [
             dependency
             for dependency in item["depends_on"]
@@ -13057,6 +13084,9 @@ def roadmap_snapshot(
             {
                 **item,
                 "tasks": tasks,
+                "linked_total": len(tasks),
+                "accepted": accepted,
+                "unresolved": len(tasks) - accepted,
                 "dependency_blockers": dependency_blockers,
                 "dependency_ready": not dependency_blockers,
             }

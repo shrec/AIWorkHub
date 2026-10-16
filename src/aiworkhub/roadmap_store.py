@@ -480,6 +480,112 @@ def link_task(
         conn.close()
 
 
+# --- Retired-task outcomes ---------------------------------------------------
+#
+# Retention deletes task rows, so a linked task's final status would otherwise
+# vanish. The outcome is kept as ``task_retired`` events in the existing events
+# table (no schema change: the Roadmap DB is synced by row union). A live task
+# row always wins over a recorded event when the snapshot resolves a status.
+
+TASK_RETIRED_EVENT = "task_retired"
+_RETIRED_STATUS_MAX_BYTES = 64
+_RETIRED_LOOKUP_CHUNK = 500
+
+
+def record_tasks_retired(
+    repo_root: str | Path, statuses: Mapping[str, str]
+) -> int:
+    """Append ``task_retired`` to every item linking a task; return items touched.
+
+    A repository with no Roadmap DB (or no items) is a no-op returning 0.
+    All events are written in one transaction.
+    """
+    clean: dict[str, str] = {}
+    for task_id, status in statuses.items():
+        task_id, status = str(task_id), str(status or "").strip()
+        if not TASK_ID_RE.fullmatch(task_id):
+            continue  # link_task rejects such ids, so nothing can link them
+        if not status or len(status.encode()) > _RETIRED_STATUS_MAX_BYTES:
+            raise RoadmapValidationError("malformed retired task status")
+        clean[task_id] = status
+    if not clean or not _db_path(repo_root).exists():
+        return 0
+
+    def linking_items(conn: sqlite3.Connection) -> list[tuple[str, list[str]]]:
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='roadmap_items'"
+        ).fetchone():
+            return []
+        found: list[tuple[str, list[str]]] = []
+        for row in conn.execute("SELECT id,task_ids_json FROM roadmap_items").fetchall():
+            linked = [t for t in _json_list(row["task_ids_json"]) if t in clean]
+            if linked:
+                found.append((row["id"], linked))
+        return found
+
+    conn = _connect(repo_root)
+    try:
+        # A plain read decides first: a batch no item links must not contend
+        # for the Roadmap write lock. The linking set is re-read under the lock.
+        if not linking_items(conn):
+            return 0
+        conn.execute("BEGIN IMMEDIATE")
+        touched = 0
+        for roadmap_id, linked in linking_items(conn):
+            for task_id in linked:
+                _event(
+                    conn,
+                    roadmap_id,
+                    TASK_RETIRED_EVENT,
+                    {"task_id": task_id, "status": clean[task_id]},
+                )
+            touched += 1
+        conn.commit()
+        return touched
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def record_task_retired(repo_root: str | Path, task_id: str, status: str) -> int:
+    return record_tasks_retired(repo_root, {task_id: status})
+
+
+def retired_task_statuses(
+    repo_root: str | Path, task_ids: Sequence[str]
+) -> dict[str, str]:
+    """Return ``{task_id: latest recorded retired status}`` for the given ids.
+
+    A repository with no Roadmap DB yields ``{}`` without creating one.
+    """
+    ids = sorted({str(task_id) for task_id in task_ids if task_id})
+    if not ids or not _db_path(repo_root).exists():
+        return {}
+    conn = _connect(repo_root)
+    try:
+        found: dict[str, str] = {}
+        for start in range(0, len(ids), _RETIRED_LOOKUP_CHUNK):
+            chunk = ids[start : start + _RETIRED_LOOKUP_CHUNK]
+            marks = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                "SELECT json_extract(detail_json,'$.task_id') AS task_id,"
+                "json_extract(detail_json,'$.status') AS status,MAX(seq) AS seq "
+                "FROM roadmap_events WHERE event=? "
+                f"AND json_extract(detail_json,'$.task_id') IN ({marks}) "
+                "GROUP BY task_id",
+                (TASK_RETIRED_EVENT, *chunk),
+            ).fetchall()
+            found.update(
+                {str(row["task_id"]): str(row["status"]) for row in rows if row["status"]}
+            )
+        return found
+    finally:
+        conn.close()
+
+
 # --- Exact wave-goal successor binding ---------------------------------------
 #
 # A wave outcome's ``provenance.wave_goals[{id,label,task_ids}]`` names each
