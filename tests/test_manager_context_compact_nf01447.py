@@ -914,3 +914,36 @@ def test_preview_receipt_does_not_echo_the_objective(needfix_store_double) -> No
     verbose = server.needfix_preview_convert("NF-2026-01447", include_plan=True)
     assert verbose["task_plan"] == _BUGFIX_PLAN
     assert _size(verbose) > 6 * 1024
+
+
+@pytest.mark.parametrize(("kind", "family"), [("bug", "bugfix"), ("other", None)])
+def test_convert_stamps_the_bugfix_skill_family_only_for_bug_needfixes(
+    monkeypatch, tmp_path, kind, family
+) -> None:
+    core.previewed_plan_cache_invalidate()
+    monkeypatch.setattr(core, "repo_root", lambda: str(tmp_path))
+    needfix_store.initialize_repository(tmp_path)
+    row = needfix_store.add_needfix(
+        tmp_path, title="Skill family", description="d", status="accepted", kind=kind
+    )
+    created: list[dict] = []
+
+    def _fake_create_task(**kwargs) -> dict:
+        created.append(kwargs)
+        return {"ok": True, "task_id": kwargs["task_id"]}
+
+    monkeypatch.setattr(core, "create_task", _fake_create_task)
+    plan = {
+        "runner": "claude_sonnet-5",
+        "topic": "aiworkhub",
+        "allowed_writes": ["src/x.py"],
+        "required_outputs": ["src/x.py"],
+    }
+
+    preview = core.needfix_preview_convert(row["id"], task_plan=plan)
+    assert preview["convertible"] is True
+    committed = core.needfix_convert(row["id"], plan_digest=preview["plan_digest"])
+
+    assert committed["converted_task_id"] == created[0]["task_id"]
+    assert created[0]["skill_task_family"] == family
+    core.previewed_plan_cache_invalidate()

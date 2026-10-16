@@ -12743,6 +12743,7 @@ def needfix_convert(
             immutable_inputs=card.get("immutable_inputs"),
             read_only=card.get("read_only", False),
             max_live_tokens=card.get("max_live_tokens"),
+            skill_task_family=card.get("skill_task_family"),
             custom_template_escape=task_templates.AUDITED_CUSTOM_ESCAPE,
         )
 

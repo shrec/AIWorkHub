@@ -809,3 +809,92 @@ def test_validate_task_plan_accepts_valid_values():
         {"priority": "high", "risk_tier": "medium", "difficulty": "bounded"}
     )
     assert validated == {"priority": "high", "risk_tier": "medium", "difficulty": "bounded"}
+
+
+# --- conversion refusal / preview / bug skill family ------------------------
+
+_CONVERT_PLAN: dict[str, Any] = {
+    "runner": "claude",
+    "topic": "needfix",
+    "allowed_writes": ["src/x.py"],
+    "required_outputs": ["src/x.py"],
+}
+_TRANSITION = "aiworkhub_dashboard_needfix_transition"
+
+
+@pytest.mark.parametrize(
+    ("status", "action"), [("triaged", "accept"), ("captured", "triage")]
+)
+def test_preview_of_unconvertible_item_names_rule_and_next_action(
+    init: Path, status: str, action: str
+):
+    rec = needfix_store.add_needfix(init, title="t", description="d", status=status)
+    preview = needfix_store.preview_convert(init, rec["id"], _CONVERT_PLAN)
+    assert preview["convertible"] is False
+    assert preview["claimable"] is False
+    assert "accepted" in preview["refusal_reason"]
+    assert preview["next_action"] == {"tool": _TRANSITION, "action": action}
+
+
+def test_preview_of_accepted_item_is_convertible_without_next_action(init: Path):
+    rec = needfix_store.add_needfix(init, title="t", description="d", status="accepted")
+    preview = needfix_store.preview_convert(init, rec["id"], _CONVERT_PLAN)
+    assert preview["convertible"] is True
+    assert "next_action" not in preview
+    assert "refusal_reason" not in preview
+
+
+def test_preview_of_other_unclaimable_status_names_status_without_next_action(init: Path):
+    rec = needfix_store.add_needfix(init, title="t", description="d", status="accepted")
+    conn = needfix_store._connect(init)
+    try:
+        conn.execute("UPDATE needfix SET status = 'converting' WHERE id = ?", (rec["id"],))
+        conn.commit()
+    finally:
+        conn.close()
+    preview = needfix_store.preview_convert(init, rec["id"], _CONVERT_PLAN)
+    assert preview["convertible"] is False
+    assert "'converting'" in preview["refusal_reason"]
+    assert "next_action" not in preview
+
+
+@pytest.mark.parametrize("status", ["triaged", "captured"])
+def test_convert_refusal_names_the_rule_and_the_transition_call(init: Path, status: str):
+    rec = needfix_store.add_needfix(init, title="t", description="d", status=status)
+    with pytest.raises(needfix_store.NeedFixConflictError) as excinfo:
+        needfix_store.convert_needfix(init, rec["id"], _reopen_create_task_fn)
+    text = str(excinfo.value)
+    assert "only status 'accepted'" in text
+    assert _TRANSITION in text
+    assert f"is '{status}'" in text
+    if status == "captured":
+        assert "action=triage" in text
+    assert "action=accept" in text
+    assert text == needfix_store._conversion_refusal_reason(rec["id"], status)
+
+
+def test_normalize_task_plan_stamps_bugfix_family_for_bug_kind(init: Path):
+    rec = needfix_store.add_needfix(
+        init, title="t", description="d", status="accepted", kind="bug"
+    )
+    row = needfix_store.get_needfix(init, rec["id"])
+    card = needfix_store.normalize_task_plan(row, _CONVERT_PLAN)
+    assert card["skill_task_family"] == "bugfix"
+    preview = needfix_store.preview_convert(init, rec["id"], _CONVERT_PLAN)
+    assert "skill_task_family" not in preview["task_plan"]
+    assert preview["plan_digest"] == needfix_store.plan_digest(card)
+    replay = needfix_store.normalize_task_plan(row, preview["task_plan"])
+    assert needfix_store.plan_digest(replay) == preview["plan_digest"]
+
+
+def test_normalize_task_plan_leaves_other_kinds_without_family(init: Path):
+    rec = needfix_store.add_needfix(
+        init, title="t", description="d", status="accepted", kind="other"
+    )
+    row = needfix_store.get_needfix(init, rec["id"])
+    assert "skill_task_family" not in needfix_store.normalize_task_plan(row, _CONVERT_PLAN)
+
+
+def test_task_plan_schema_does_not_accept_a_caller_skill_family():
+    with pytest.raises(needfix_store.NeedFixValidationError, match="unsupported fields"):
+        needfix_store.validate_task_plan({"skill_task_family": "feature"})

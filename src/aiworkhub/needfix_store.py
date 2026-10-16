@@ -2944,6 +2944,22 @@ def _signed_task_plan(card: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+_TRANSITION_TOOL = "aiworkhub_dashboard_needfix_transition"
+
+
+def _conversion_refusal_reason(needfix_id: str, status: str) -> str:
+    """Single source of the conversion refusal text shared by preview and convert."""
+    rule = f"needfix {needfix_id} is {status!r} -- only status 'accepted' (or 'task_planned') converts"
+    if status == "captured":
+        return (
+            f"{rule}; call {_TRANSITION_TOOL} action=triage first, "
+            f"then {_TRANSITION_TOOL} action=accept"
+        )
+    if status == "triaged":
+        return f"{rule}; call {_TRANSITION_TOOL} action=accept"
+    return rule
+
+
 def preview_convert(
     repo_root: str | Path, needfix_id: str, task_plan: Mapping[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -2977,12 +2993,20 @@ def preview_convert(
         "needfix_id": needfix_id,
         "already_converted": False,
         "claimable": claimable,
+        "convertible": claimable,
         "current_status": row["status"],
         "unverified": row["status"] in ("captured",),
         "triaged": row["status"] == "triaged",
         "task_plan": signed,
         "plan_digest": plan_digest(card),
     }
+    if not claimable:
+        preview["refusal_reason"] = _conversion_refusal_reason(needfix_id, row["status"])
+        if row["status"] in ("captured", "triaged"):
+            preview["next_action"] = {
+                "tool": _TRANSITION_TOOL,
+                "action": "triage" if row["status"] == "captured" else "accept",
+            }
     minted_task_id = card.get("task_id")
     if isinstance(minted_task_id, str) and minted_task_id.strip():
         preview["task_id"] = minted_task_id
@@ -3157,6 +3181,8 @@ def normalize_task_plan(
     card = default_task_card(needfix_snapshot)
     for field, value in validated.items():
         card[field] = value
+    if needfix_snapshot.get("kind") == "bug":
+        card.setdefault("skill_task_family", "bugfix")
 
     # When the default card is read-only but the caller supplies
     # write-bearing fields without explicitly overriding read_only,
@@ -3224,11 +3250,7 @@ def _validate_and_claim(
     Returns ``(prior_status, needfix_snapshot)`` on success.
     """
     if row["status"] in ("captured", "triaged"):
-        raise NeedFixConflictError(
-            f"needfix {needfix_id} is {row['status']!r} -- "
-            f"captured/unverified NeedFixes cannot be converted. "
-            f"A manager must first accept this NeedFix."
-        )
+        raise NeedFixConflictError(_conversion_refusal_reason(needfix_id, row["status"]))
 
     prior_status: str = row["status"]
     generation = _authoritative_reopen_generation(conn, needfix_id)
