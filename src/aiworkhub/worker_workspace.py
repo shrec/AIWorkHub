@@ -7178,7 +7178,13 @@ def validate_required_outputs(
     digest fails closed. ``strict_rework_inheritance`` disables the legacy
     direct-call fallback onto workspace-derived inherited rework paths when no
     sealed predecessor authority is claimed, so strict coordinator finalization
-    fails closed instead.
+    fails closed instead, with one exception (NF-2026-01553): a predecessor
+    with no claimed sealed delta whose ``changed_path_hashes`` are all sha256
+    digests credits those digests, for ``workspace.inherited_rework_paths``
+    only, still gated by ``differs_from_parent``. That credit is not re-bound
+    to request, task or claim epoch here, so the caller must pass the exact
+    snapshotted predecessor record that provisioning verified. A claimed delta
+    that fails verification yields ``{}``, never this pinned credit.
 
     A sealed path the materializer rebased onto a newer canonical parent no
     longer matches its sealed digest, so it counts only through the exact
@@ -7223,8 +7229,27 @@ def validate_required_outputs(
         # Strict coordinator finalization: absent or unauthenticated
         # predecessor authority never falls back to workspace-derived
         # inherited rework paths, so an inherited mandatory output that the
-        # current attempt did not change fails closed.
+        # current attempt did not change fails closed. The one exception is
+        # the pinned-no-delta predecessor: provisioning hash-pinned and
+        # verified its ``changed_path_hashes`` while writing exactly the paths
+        # in ``workspace.inherited_rework_paths``, so only those paths may be
+        # credited with their pinned digest (NF-2026-01553).
+        pinned_hashes = (
+            rework_predecessor.get("changed_path_hashes")
+            if isinstance(rework_predecessor, dict)
+            else None
+        )
         sealed_inherited_hashes = {}
+        # Any entry that is not a sha256 digest voids the whole pin, exactly
+        # as verified_rework_delta_file_hashes voids a malformed sealed delta.
+        if isinstance(pinned_hashes, dict) and all(
+            isinstance(v, str) and re.fullmatch(r"[0-9a-f]{64}", v)
+            for v in pinned_hashes.values()
+        ):
+            inherited_paths = set(workspace.inherited_rework_paths)
+            sealed_inherited_hashes = {
+                str(k): v for k, v in pinned_hashes.items() if str(k) in inherited_paths
+            }
     unchanged_allowed: set[str] = set()
     for raw in allow_unchanged or ():
         path = _relative_repo_path(raw)
