@@ -1,5 +1,11 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.59 — 2026-10-17
+
+### Fixed
+
+- Bundled runtime 0.12.59: a dead VS Code LM request whose bridge-cancel home is gone closes as `finalize_abandoned` instead of looping in `reconcile_pending` (NF-2026-01574, NF-2026-01579); an ACCESS_DENIED PID counts as alive only while `EnumProcesses` lists it (NF-2026-01584); storage GC removes read-only hardlinked files and AppContainer helper temp leftovers (NF-2026-01583, NF-2026-01576).
+
 ## 0.12.58 — 2026-10-17
 
 ### Fixed

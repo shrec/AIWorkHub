@@ -14,6 +14,10 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.59
+
+- A dead VS Code LM worker whose bridge folder is already gone no longer stays "pending reconcile" forever, a process the OS refuses to inspect is no longer mistaken for alive after it exits, and storage cleanup now removes read-only hardlinked files and leftover sandbox helper temp folders.
+
 ## What's new in 0.12.58
 
 - The dashboard loads quickly again after a VS Code reload (the Claude Code usage scan is cached on disk and the snapshot reads its task cards in one pass). A rework after a "no change" attempt keeps credit for the files it inherited, and extension tests run even when the repository scratch folder cannot be created.

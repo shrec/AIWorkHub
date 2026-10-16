@@ -6,6 +6,14 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.59] - 2026-10-17
+
+### Fixed
+
+- A dead VS Code LM request whose bridge-cancel home is already gone is closed as a terminal `finalize_abandoned` instead of looping in `reconcile_pending` forever, `cancel()` reports that terminal state, and the finalize event normalizes the provider exit code (NF-2026-01574, NF-2026-01579).
+- A process whose PID answers ACCESS_DENIED counts as alive only while `EnumProcesses` still lists it, so a recycled or vanished PID no longer pins a request as live (NF-2026-01584).
+- Storage garbage collection removes a read-only hardlinked file inside an owned tree without touching the link outside it (NF-2026-01583), and removes AppContainer helper temp leaves through the owned rmtree while sweeping aged `awh-helper` leftovers (NF-2026-01576).
+
 ## [0.12.58] - 2026-10-17
 
 ### Fixed
