@@ -18,6 +18,8 @@ function managerChatEventNode(event) {
   if (type === "assistant_text" || type === "user_message") {
     const bubble = createElement("div", `manager-chat-bubble role-${type === "user_message" ? "user" : "assistant"}`);
     bubble.appendChild(createElement("span", "manager-chat-bubble-label sr-only", type === "user_message" ? "You" : "Manager"));
+    const clock = managerChatClockText(event);
+    if (clock) bubble.appendChild(createElement("span", "mc-time", clock));
     bubble.appendChild(type === "assistant_text" ? managerConsoleMarkdown(payload.text) : document.createTextNode(String(payload.text || "")));
     // The log records only how many images the owner attached, never the image.
     const images = type === "user_message" ? numberValue(payload.images) : 0;
@@ -70,7 +72,15 @@ function managerChatEventNode(event) {
     return managerConsoleBlock(type, createElement("div", "manager-chat-error", String(payload.error || payload.message || "Manager error")));
   }
   if (type === "session_start") {
-    return managerConsoleBlock(type, createElement("div", "manager-chat-marker", "Session started"));
+    const continuation = managerConsoleContinuation(payload);
+    if (!continuation) return managerConsoleBlock(type, createElement("div", "manager-chat-marker", "Session started"));
+    if (!continuation.summary) return managerConsoleBlock(type, createElement("div", "manager-chat-marker", "Continued from previous session"));
+    const row = createElement("details", "manager-chat-tool-row is-continuation");
+    row.appendChild(createElement("summary", "", "Continued from previous session"));
+    const body = createElement("div", "manager-chat-tool-row-body");
+    body.appendChild(document.createTextNode(continuation.summary));
+    row.appendChild(body);
+    return managerConsoleBlock(type, row);
   }
   if (type === "handoff_request") {
     return managerConsoleBlock(type, createElement("div", "manager-chat-marker", `Handoff requested${payload.reason ? `: ${limitText(payload.reason, 120)}` : ""}`));
@@ -78,10 +88,20 @@ function managerChatEventNode(event) {
   if (type === "session_close") {
     return managerConsoleBlock(type, createElement("div", "manager-chat-marker", `Session closed${payload.reason ? `: ${limitText(payload.reason, 120)}` : ""}`));
   }
+  if (type === "turn_stopped") {
+    return managerConsoleBlock(type, createElement("div", "manager-chat-marker mc-stopped", "Stopped"));
+  }
+  if (type === "queue_dropped") {
+    const count = Math.max(0, numberValue([payload.dropped_queued, payload.count, payload.dropped, payload.n].find((value) => value !== undefined && value !== null)));
+    return managerConsoleBlock(type, createElement("div", "manager-chat-marker", `${count} queued message${count === 1 ? "" : "s"} dropped`));
+  }
   if (type === "reasoning") {
     const row = createElement("details", "manager-chat-thinking-block");
     row.open = true;
-    row.appendChild(createElement("summary", "", managerChatThoughtSummary(event)));
+    const label = managerChatThoughtSummary(event);
+    const summary = createElement("summary", "", label);
+    if (managerConsoleActiveIndex && label.startsWith("Thinking ·")) managerConsoleLiveSummaries.push({ summary, event });
+    row.appendChild(summary);
     const body = createElement("div", "manager-chat-tool-row-body");
     body.appendChild(document.createTextNode(String(payload.text || "")));
     row.appendChild(body);
@@ -93,30 +113,46 @@ function managerChatEventNode(event) {
   return null;
 }
 
+// A session_start that names a predecessor or carries a handoff is a continuation, not a fresh start.
+function managerConsoleContinuation(payload) {
+  const predecessor = payload.predecessor || payload.predecessor_id || payload.predecessor_session_id || payload.previous_session_id
+    || payload.continued_from || payload.handoff_from;
+  const handoff = payload.handoff;
+  const summary = [payload.handoff_summary, payload.summary, typeof handoff === "string" ? handoff : handoff && handoff.summary]
+    .find((value) => typeof value === "string" && value.trim());
+  if (!predecessor && !handoff && !summary) return null;
+  return { summary: summary ? summary.trim() : "" };
+}
+
 function managerChatFormatDuration(ms) {
   const seconds = Math.max(0, Math.round(Number(ms) / 1000));
   if (seconds < 60) return seconds + "s";
   return Math.floor(seconds / 60) + "m " + (seconds % 60) + "s";
 }
 
+// An event may carry its time as ISO text (`at`, `created_at`) or epoch seconds/ms (`ts`); 0 when absent or unparseable.
 function managerChatEventTime(event) {
-  const parsed = Date.parse(event && event.at || "");
-  return Number.isFinite(parsed) ? parsed : 0;
+  if (!event) return 0;
+  for (const key of ["at", "ts", "created_at"]) {
+    const value = event[key];
+    let parsed = NaN;
+    if (typeof value === "string" && value) parsed = Date.parse(value);
+    else if (typeof value === "number" && value > 0) parsed = value < 1e12 ? value * 1000 : value;
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return 0;
+}
+
+function managerChatClockText(event) {
+  const time = managerChatEventTime(event);
+  if (!time) return "";
+  const date = new Date(time);
+  return String(date.getHours()).padStart(2, "0") + ":" + String(date.getMinutes()).padStart(2, "0");
 }
 
 function managerChatThoughtSummary(event) {
-  const events = Array.isArray(state.managerChatEvents) ? state.managerChatEvents : [];
   const start = managerChatEventTime(event);
-  let end = 0;
-  const index = events.indexOf(event);
-  if (index >= 0) {
-    for (let cursor = index + 1; cursor < events.length; cursor += 1) {
-      if (events[cursor] && events[cursor].type !== "reasoning") {
-        end = managerChatEventTime(events[cursor]);
-        break;
-      }
-    }
-  }
+  const end = managerConsoleCurrentIndex().reasoningEnd.get(event) || 0;
   if (start && end >= start && end) return "Thought for " + managerChatFormatDuration(end - start);
   if (state.managerChatRunning && start) return "Thinking · " + managerChatFormatDuration(Date.now() - start);
   if (state.managerChatLastThoughtMs) return "Thought for " + managerChatFormatDuration(state.managerChatLastThoughtMs);
@@ -165,6 +201,7 @@ function managerChatLiveThinkingNode() {
   row.appendChild(dots);
   const label = createElement("span", "manager-chat-thinking-label", "Thinking · " + managerChatFormatDuration(elapsed));
   label.id = "manager-chat-thinking-elapsed";
+  managerConsoleLiveLabel = label;
   row.appendChild(label);
   return row;
 }
@@ -180,7 +217,7 @@ function managerChatThinkingKey() {
       turn = item.turn;
       finished = false;
     }
-    if (item.type === "turn_end" || item.type === "error" || item.type === "session_close") finished = true;
+    if (item.type === "turn_end" || item.type === "turn_stopped" || item.type === "error" || item.type === "session_close") finished = true;
   }
   return String(state.managerChatSession || "") + ":" + (finished ? turn + 1 : turn);
 }
@@ -188,7 +225,7 @@ function managerChatThinkingKey() {
 // Glyph per block kind; the gutter is fixed-width so blocks never shift.
 const MANAGER_CONSOLE_GLYPHS = Object.freeze({
   user_message: "›", assistant_text: "●", reasoning: "∴", command: "$", file_change: "±",
-  tool_call: "⚙", tool_result: "⚙", task: "▣", callback: "↯", goal: "◎", error: "!",
+  tool_call: "⚙", tool_result: "⚙", task: "▣", callback: "↯", goal: "◎", error: "!", turn_stopped: "■",
 });
 const MANAGER_CONSOLE_COMMAND_LINES = 20;
 const MANAGER_CONSOLE_DIFF_LINES = 40;
@@ -386,25 +423,45 @@ function managerConsoleUsage(usage) {
   return { input: input || 0, cache, output: output || 0 };
 }
 
-function managerConsoleTurnTools(turn) {
-  if (!Number.isInteger(turn)) return 0;
-  const ids = new Set();
-  for (const item of state.managerChatEvents || []) {
-    if (!item || item.turn !== turn || !["tool_call", "command", "file_change"].includes(item.type)) continue;
-    ids.add((item.payload && item.payload.call_id) || "seq:" + item.seq);
+// One pass over the raw events: per-turn first event and tool ids, and the end time of each reasoning
+// event (the next non-reasoning event). A render builds it once so no row rescans the whole log.
+function managerConsoleBuildIndex(events) {
+  const turns = new Map();
+  const reasoningEnd = new Map();
+  let nextEnd = 0;
+  for (let cursor = events.length - 1; cursor >= 0; cursor -= 1) {
+    const item = events[cursor];
+    if (!item) continue;
+    if (item.type === "reasoning") reasoningEnd.set(item, nextEnd);
+    else nextEnd = managerChatEventTime(item);
   }
-  return ids.size;
+  for (const item of events) {
+    if (!item || !Number.isInteger(item.turn)) continue;
+    let info = turns.get(item.turn);
+    if (!info) {
+      info = { first: item, tools: new Set() };
+      turns.set(item.turn, info);
+    }
+    if (item.type === "tool_call" || item.type === "command" || item.type === "file_change") {
+      info.tools.add((item.payload && item.payload.call_id) || "seq:" + item.seq);
+    }
+  }
+  return { turns, reasoningEnd };
+}
+
+function managerConsoleCurrentIndex() {
+  return managerConsoleActiveIndex || managerConsoleBuildIndex(Array.isArray(state.managerChatEvents) ? state.managerChatEvents : []);
 }
 
 function managerConsoleFooterText(event) {
   const turn = event && event.turn;
-  const tools = managerConsoleTurnTools(turn);
+  const info = Number.isInteger(turn) ? managerConsoleCurrentIndex().turns.get(turn) : null;
+  const tools = info ? info.tools.size : 0;
   const parts = [Number.isInteger(turn) ? `turn ${turn}` : "turn", `${tools} tool${tools === 1 ? "" : "s"}`];
   const usage = managerConsoleUsage(event && event.payload && event.payload.usage);
   if (usage) parts.push(`in ${managerConsoleCompact(usage.input)}`, `cache ${managerConsoleCompact(usage.cache)}`, `out ${managerConsoleCompact(usage.output)}`);
-  const first = Number.isInteger(turn) ? (state.managerChatEvents || []).find((item) => item && item.turn === turn) : null;
-  // managerChatEventTime is 0 without an `at`; no duration is better than a made-up one.
-  const start = first ? managerChatEventTime(first) : 0;
+  // managerChatEventTime is 0 without a timestamp; no duration is better than a made-up one.
+  const start = info ? managerChatEventTime(info.first) : 0;
   const end = managerChatEventTime(event);
   if (start > 0 && end > 0 && end >= start) parts.push(managerChatFormatDuration(end - start));
   return parts.join(" · ");
@@ -443,13 +500,80 @@ function managerConsoleApplyHairline() {
   line.classList.toggle("is-blocked", fill >= 0.75);
 }
 
+let managerConsoleLastSignature = null;
+let managerConsoleRenderedLimit = null;
+let managerConsoleActiveIndex = null;
+let managerConsoleLiveLabel = null;
+let managerConsoleLiveSummaries = [];
+
+// Cheap stand-in for "the transcript would come out the same": a poll that
+// brings nothing new must not rebuild the DOM (selection, open <details>, Copied).
+function managerConsoleRenderSignature(events, limit) {
+  const first = events.length ? events[0] : null;
+  const last = events.length ? events[events.length - 1] : null;
+  const lastText = last && last.payload && typeof last.payload.text === "string" ? last.payload.text.length : 0;
+  const partial = state.managerChatPartial;
+  const partialKey = partial
+    ? [partial.turn, partial.session_id || "", String(partial.text || "").length, String(partial.reasoning || "").length].join(":")
+    : "-";
+  return [
+    state.managerChatSession || "", events.length, first ? first.seq : "", last ? last.seq : "", last ? last.type : "", lastText,
+    partialKey, state.managerChatRunning ? 1 : 0, state.managerChatThinkingSince ? 1 : 0, state.managerChatLastThoughtMs || 0, limit,
+  ].join("|");
+}
+
+// Only the live Thinking labels change between identical renders; touch just those nodes.
+function managerConsoleTickThinking() {
+  if (managerConsoleLiveLabel && state.managerChatThinkingSince) {
+    managerConsoleLiveLabel.textContent = "Thinking · " + managerChatFormatDuration(Date.now() - state.managerChatThinkingSince);
+  }
+  for (const entry of managerConsoleLiveSummaries) {
+    const start = managerChatEventTime(entry.event);
+    if (start) entry.summary.textContent = "Thinking · " + managerChatFormatDuration(Date.now() - start);
+  }
+}
+
+function managerConsoleExtraRows() {
+  const partialRows = managerConsolePartialNodes(state.managerChatPartial);
+  if (partialRows.length > 0) return partialRows;
+  if (state.managerChatRunning) {
+    // The timer belongs to one session and turn: a start left over from an
+    // earlier turn or session restarts instead of counting on (the 64m timer).
+    const key = managerChatThinkingKey();
+    if (!state.managerChatThinkingSince || state.managerChatThinkingKey !== key) {
+      state.managerChatThinkingSince = Date.now();
+      state.managerChatThinkingKey = key;
+    }
+    return [managerChatLiveThinkingNode()];
+  }
+  if (state.managerChatLastThoughtMs && !state.managerChatEvents.some((item) => item && item.type === "reasoning")) {
+    return [createElement("div", "manager-chat-thinking", "Thought for " + managerChatFormatDuration(state.managerChatLastThoughtMs))];
+  }
+  return [];
+}
+
 function renderManagerChatEvents() {
   if (!elements.managerChatTranscript) return;
   managerConsoleApplyHairline();
+  const events = Array.isArray(state.managerChatEvents) ? state.managerChatEvents : [];
+  const limit = state.managerChatRenderLimit || MANAGER_CONSOLE_BLOCK_LIMIT;
+  if (managerConsoleRenderSignature(events, limit) === managerConsoleLastSignature) {
+    managerConsoleTickThinking();
+    return;
+  }
   const box = elements.managerChatTranscript;
   const scrollTop = box.scrollTop;
-  const atBottom = box.scrollHeight - scrollTop - (box.clientHeight || 0) < 24;
-  let rows = [];
+  const scrollHeight = box.scrollHeight;
+  const atBottom = scrollHeight - scrollTop - (box.clientHeight || 0) < 24;
+  const prepending = managerConsoleRenderedLimit !== null && limit > managerConsoleRenderedLimit;
+  managerConsoleLiveLabel = null;
+  managerConsoleLiveSummaries = [];
+  const extras = managerConsoleExtraRows();
+  const merged = managerConsoleMergeTools(managerConsoleMergeCommands(events));
+  const eventLimit = Math.max(0, limit - extras.length);
+  const hasEarlier = merged.length > eventLimit;
+  const visible = hasEarlier ? merged.slice(merged.length - eventLimit) : merged;
+  const rows = [];
   let lastTurnEndTurn = null;
   const pending = [];
   const flushPendingTurnEnd = () => {
@@ -460,39 +584,28 @@ function renderManagerChatEvents() {
     }
     lastTurnEndTurn = null;
   };
-  for (const event of managerConsoleMergeTools(managerConsoleMergeCommands(state.managerChatEvents))) {
-    // Opencode closes every agent step with step_finish, which the backend
-    // records as turn_end: collapse consecutive same-turn markers so one
-    // turn renders one completion row (the last, with final usage).
-    if (event && event.type === "turn_end") {
-      if (lastTurnEndTurn !== null && lastTurnEndTurn !== event.turn) flushPendingTurnEnd();
-      lastTurnEndTurn = event.turn;
-      pending.push(event);
-      continue;
+  managerConsoleActiveIndex = managerConsoleBuildIndex(events);
+  try {
+    for (const event of visible) {
+      // Opencode closes every agent step with step_finish, which the backend
+      // records as turn_end: collapse consecutive same-turn markers so one
+      // turn renders one completion row (the last, with final usage).
+      if (event && event.type === "turn_end") {
+        if (lastTurnEndTurn !== null && lastTurnEndTurn !== event.turn) flushPendingTurnEnd();
+        lastTurnEndTurn = event.turn;
+        pending.push(event);
+        continue;
+      }
+      flushPendingTurnEnd();
+      const node = managerChatEventNode(event);
+      if (node) rows.push(node);
     }
     flushPendingTurnEnd();
-    const node = managerChatEventNode(event);
-    if (node) rows.push(node);
+  } finally {
+    managerConsoleActiveIndex = null;
   }
-  flushPendingTurnEnd();
-  const partialRows = managerConsolePartialNodes(state.managerChatPartial);
-  if (partialRows.length > 0) {
-    rows.push(...partialRows);
-  } else if (state.managerChatRunning) {
-    // The timer belongs to one session and turn: a start left over from an
-    // earlier turn or session restarts instead of counting on (the 64m timer).
-    const key = managerChatThinkingKey();
-    if (!state.managerChatThinkingSince || state.managerChatThinkingKey !== key) {
-      state.managerChatThinkingSince = Date.now();
-      state.managerChatThinkingKey = key;
-    }
-    rows.push(managerChatLiveThinkingNode());
-  } else if (state.managerChatLastThoughtMs && !state.managerChatEvents.some((item) => item && item.type === "reasoning")) {
-    rows.push(createElement("div", "manager-chat-thinking", "Thought for " + managerChatFormatDuration(state.managerChatLastThoughtMs)));
-  }
-  const limit = state.managerChatRenderLimit || MANAGER_CONSOLE_BLOCK_LIMIT;
-  if (rows.length > limit) {
-    rows = rows.slice(-limit);
+  rows.push(...extras);
+  if (hasEarlier) {
     const earlier = createElement("button", "mc-show-all", "load earlier");
     earlier.type = "button";
     earlier.addEventListener("click", () => {
@@ -501,6 +614,8 @@ function renderManagerChatEvents() {
     });
     rows.unshift(earlier);
   }
+  managerConsoleRenderedLimit = limit;
+  managerConsoleLastSignature = managerConsoleRenderSignature(events, limit);
   if (rows.length === 0) {
     elements.managerChatTranscript.replaceChildren(
       createElement("div", "panel-list-empty compact", state.managerChatSession ? "No events yet" : "No open session"),
@@ -511,25 +626,40 @@ function renderManagerChatEvents() {
   const fragment = document.createDocumentFragment();
   for (const row of rows) fragment.appendChild(row);
   elements.managerChatTranscript.replaceChildren(fragment);
-  box.scrollTop = atBottom ? box.scrollHeight : scrollTop;
+  if (atBottom) box.scrollTop = box.scrollHeight;
+  else box.scrollTop = prepending ? scrollTop + (box.scrollHeight - scrollHeight) : scrollTop;
   if (elements.managerChatLatest) elements.managerChatLatest.hidden = atBottom;
-  managerConsoleAnnounce(state.managerChatEvents);
+  managerConsoleAnnounce(events);
 }
 
 const MANAGER_CONSOLE_BLOCK_LIMIT = 400;
-const MANAGER_CONSOLE_INLINE = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|_[^_]+_|\[[^\]]+\]\([^)\s]+\))/;
+// Emphasis needs non-space just inside the delimiters and no word or delimiter character just outside
+// them, so snake_case_name, "a * b * c" and 2**10 stay verbatim.
+const MANAGER_CONSOLE_INLINE = /`([^`]+)`|(?<![\w*])\*\*(?=[^\s*])([^*]*[^\s*])\*\*(?![\w*])|(?<![\w*])\*(?=[^\s*])([^*]*[^\s*])\*(?![\w*])|(?<![\w])_(?=[^\s_])([^_]*[^\s_])_(?!\w)|\[([^\]]+)\]\(([^)\s]+)\)/g;
 
 function managerConsoleInline(parent, text) {
-  for (const part of String(text).split(MANAGER_CONSOLE_INLINE)) {
-    if (!part) continue;
-    if (part.startsWith("`") && part.endsWith("`") && part.length > 1) parent.appendChild(createElement("code", "mc-mono", part.slice(1, -1)));
-    else if (part.startsWith("**") && part.endsWith("**") && part.length > 4) parent.appendChild(createElement("strong", "", part.slice(2, -2)));
-    else if (/^(\*[^*]+\*|_[^_]+_)$/.test(part)) parent.appendChild(createElement("em", "", part.slice(1, -1)));
-    else if (/^\[[^\]]+\]\([^)\s]+\)$/.test(part)) {
-      const cut = part.indexOf("](");
-      parent.appendChild(document.createTextNode(`${part.slice(1, cut)} (${part.slice(cut + 2, -1)})`));
-    } else parent.appendChild(document.createTextNode(part));
+  const source = String(text);
+  let cursor = 0;
+  for (const match of source.matchAll(MANAGER_CONSOLE_INLINE)) {
+    if (match.index > cursor) parent.appendChild(document.createTextNode(source.slice(cursor, match.index)));
+    cursor = match.index + match[0].length;
+    if (match[1] !== undefined) parent.appendChild(createElement("code", "mc-mono", match[1]));
+    else if (match[2] !== undefined) parent.appendChild(createElement("strong", "", match[2]));
+    else if (match[3] !== undefined || match[4] !== undefined) parent.appendChild(createElement("em", "", match[3] !== undefined ? match[3] : match[4]));
+    else parent.appendChild(document.createTextNode(`${match[5]} (${match[6]})`));
   }
+  if (cursor < source.length) parent.appendChild(document.createTextNode(source.slice(cursor)));
+}
+
+function managerConsoleCodeNode(code) {
+  const full = code.join("\n");
+  const folded = code.length > MANAGER_CONSOLE_DIFF_LINES;
+  const wrap = createElement("div", "mc-code-block");
+  wrap.appendChild(managerConsoleCopyButton(() => full));
+  const pre = createElement("pre", "mc-code", folded ? code.slice(0, MANAGER_CONSOLE_DIFF_LINES).join("\n") : full);
+  if (folded) wrap.appendChild(managerConsoleShowAll(`show all (${code.length} lines)`, () => { pre.textContent = full; }));
+  wrap.appendChild(pre);
+  return wrap;
 }
 
 function managerConsoleMarkdown(text) {
@@ -543,7 +673,7 @@ function managerConsoleMarkdown(text) {
       index += 1;
       while (index < lines.length && !lines[index].startsWith("```")) code.push(lines[index++]);
       index += 1;
-      fragment.appendChild(createElement("pre", "mc-code", code.join("\n")));
+      fragment.appendChild(managerConsoleCodeNode(code));
       continue;
     }
     const bullet = /^\s*([-*]|\d+\.)\s+/;
@@ -569,8 +699,8 @@ function managerConsoleMarkdown(text) {
 }
 
 function managerConsoleTurnFinished(turn) {
-  // NF-2026-01230: only turn_end ends a turn; a mid-turn assistant_text already settled its streamed text server side.
-  return (state.managerChatEvents || []).some((item) => item && item.turn === turn && item.type === "turn_end");
+  // NF-2026-01230: only turn_end (or an owner stop) ends a turn; a mid-turn assistant_text already settled its streamed text server side.
+  return (state.managerChatEvents || []).some((item) => item && item.turn === turn && (item.type === "turn_end" || item.type === "turn_stopped"));
 }
 
 function managerConsolePartialIsCurrent(partial) {
@@ -627,6 +757,8 @@ function managerConsoleAnnounce(events) {
 
 function managerConsoleReset() {
   state.managerChatPartial = null;
+  managerConsoleLastSignature = null;
+  managerConsoleRenderedLimit = null;
   state.managerChatRenderLimit = MANAGER_CONSOLE_BLOCK_LIMIT;
   state.managerChatAnnouncedSeq = 0;
   state.managerChatThinkingSince = 0;

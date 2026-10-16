@@ -64,7 +64,7 @@ function load(events = []) {
     slice(appSource, "function limitText(value, maxLength = 120) {", "return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}...`;\n}"),
   ].join("\n");
   vm.runInContext(`${utilities}\n${consoleSource}\nthis.api = { managerChatEventNode, renderManagerChatEvents, managerConsoleMergeCommands, managerConsoleMergeTools, managerConsoleCompact, managerConsoleFooterText, managerConsoleTaskOf, managerConsoleApplyHairline, managerConsoleMarkdown, managerConsolePartialNodes, managerConsoleScheduleRender };`, context);
-  return { api: context.api, elements, opened, frames, posted, state: context.state };
+  return { api: context.api, document: context.document, elements, opened, frames, posted, state: context.state };
 }
 
 function flat(node, out = []) {
@@ -429,4 +429,166 @@ test("extension.js allowlists copyText and its handler refuses a non-string", ()
   const handler = slice(extensionSource, "case \"copyText\": {", "break;\n    }");
   assert.ok(handler.includes("typeof text !== \"string\""));
   assert.ok(handler.includes("copy_text_invalid"));
+});
+
+function countWrites(elements) {
+  const box = elements.managerChatTranscript;
+  const original = box.replaceChildren;
+  const counter = { writes: 0 };
+  box.replaceChildren = function (...nodes) { counter.writes += 1; return original.apply(this, nodes); };
+  return counter;
+}
+
+test("a poll that changes nothing does not rebuild the transcript, and a new event does", () => {
+  const events = [
+    { seq: 1, turn: 1, type: "user_message", payload: { text: "go" } },
+    { seq: 2, turn: 1, type: "assistant_text", payload: { text: "done" } },
+  ];
+  const { api, elements, state } = load(events);
+  const counter = countWrites(elements);
+  api.renderManagerChatEvents();
+  assert.equal(counter.writes, 1);
+  api.renderManagerChatEvents();
+  api.renderManagerChatEvents();
+  assert.equal(counter.writes, 1);
+  state.managerChatEvents = events.concat([{ seq: 3, turn: 2, type: "assistant_text", payload: { text: "more" } }]);
+  api.renderManagerChatEvents();
+  assert.equal(counter.writes, 2);
+});
+
+test("an unchanged poll while running only ticks the live Thinking label", () => {
+  const { api, elements, state } = load([{ seq: 1, turn: 1, type: "user_message", payload: { text: "go" } }]);
+  state.managerChatRunning = true;
+  const counter = countWrites(elements);
+  api.renderManagerChatEvents();
+  assert.equal(counter.writes, 1);
+  const label = flat(elements.managerChatTranscript).find((n) => n.className === "manager-chat-thinking-label");
+  assert.ok(label);
+  state.managerChatThinkingSince -= 5000;
+  api.renderManagerChatEvents();
+  assert.equal(counter.writes, 1);
+  assert.equal(label.textContent, "Thinking · 5s");
+});
+
+test("1500 events build and attach at most limit + 2 transcript rows", () => {
+  const events = Array.from({ length: 1500 }, (_, i) => ({ seq: i + 1, turn: i + 1, type: "assistant_text", payload: { text: `m${i}` } }));
+  // Count every element built, so building all 1500 rows and slicing afterwards fails.
+  const counted = (harness) => {
+    const create = harness.document.createElement;
+    harness.created = 0;
+    harness.document.createElement = (tag) => { harness.created += 1; return create(tag); };
+    return harness;
+  };
+  const one = counted(load(events.slice(0, 1)));
+  one.api.renderManagerChatEvents();
+  const perRow = one.created;
+  const all = counted(load(events));
+  all.api.renderManagerChatEvents();
+  assert.ok(all.elements.managerChatTranscript.children.length <= 400 + 2);
+  assert.ok(all.created <= (400 + 2) * perRow, `${all.created} elements built for 400 rows`);
+  all.created = 0;
+  all.state.managerChatRenderLimit = 50;
+  all.state.managerChatRunning = true;
+  all.api.renderManagerChatEvents();
+  assert.ok(all.elements.managerChatTranscript.children.length <= 50 + 2);
+  assert.ok(all.created <= (50 + 2) * perRow, `${all.created} elements built for 50 rows`);
+  assert.equal(all.elements.managerChatTranscript.children[0].tag, "button");
+});
+
+test("a changed Thought-for duration re-renders the transcript", () => {
+  const { api, elements, state } = load([
+    { seq: 1, turn: 1, type: "user_message", payload: { text: "go" } },
+    { seq: 2, turn: 1, type: "turn_end", payload: {} },
+  ]);
+  state.managerChatLastThoughtMs = 5000;
+  api.renderManagerChatEvents();
+  assert.ok(text(elements.managerChatTranscript).includes("Thought for 5s"));
+  state.managerChatLastThoughtMs = 12000;
+  api.renderManagerChatEvents();
+  assert.ok(text(elements.managerChatTranscript).includes("Thought for 12s"));
+});
+
+test("load earlier keeps the previously first visible row where it was", () => {
+  const events = Array.from({ length: 450 }, (_, i) => ({ seq: i + 1, turn: i + 1, type: "assistant_text", payload: { text: `m${i}` } }));
+  const { api, elements } = load(events);
+  const box = elements.managerChatTranscript;
+  box.scrollHeight = 1000;
+  box.clientHeight = 100;
+  box.scrollTop = 0;
+  const original = box.replaceChildren;
+  box.replaceChildren = function (...nodes) { original.apply(this, nodes); this.scrollHeight += 600; this.scrollTop = 0; };
+  api.renderManagerChatEvents();
+  assert.ok(text(box.children[1]).includes("m50"));
+  box.scrollTop = 0;
+  box.children[0].listeners.click[0]();
+  api.renderManagerChatEvents();
+  assert.equal(box.children.length, 450);
+  assert.ok(text(box.children[50]).includes("m50"));
+  assert.equal(box.scrollTop, 600);
+});
+
+test("turn_stopped renders a Stopped row and finishes its turn", () => {
+  const { api, state } = load([{ seq: 1, turn: 3, type: "user_message", payload: { text: "go" } }]);
+  assert.ok(text(api.managerChatEventNode({ type: "turn_stopped", turn: 3, payload: {} })).includes("Stopped"));
+  assert.ok(api.managerConsolePartialNodes({ turn: 3, text: "Hel" }).length > 0);
+  state.managerChatEvents.push({ seq: 2, turn: 3, type: "turn_stopped", payload: {} });
+  assert.equal(api.managerConsolePartialNodes({ turn: 3, text: "Hel" }).length, 0);
+  state.managerChatRunning = true;
+  api.renderManagerChatEvents();
+  assert.equal(state.managerChatThinkingKey, "mls-fixture:4");
+});
+
+test("queue_dropped and a continuation session_start render their rows", () => {
+  const { api } = load();
+  assert.ok(text(api.managerChatEventNode({ type: "queue_dropped", payload: { dropped_queued: 2 } })).includes("2 queued messages dropped"));
+  assert.ok(text(api.managerChatEventNode({ type: "queue_dropped", payload: { dropped_queued: 1 } })).includes("1 queued message dropped"));
+  assert.ok(text(api.managerChatEventNode({ type: "session_start", payload: {} })).includes("Session started"));
+  const plain = api.managerChatEventNode({ type: "session_start", payload: { predecessor: "mls-old" } });
+  assert.ok(text(plain).includes("Continued from previous session"));
+  const node = api.managerChatEventNode({ type: "session_start", payload: { predecessor: "mls-old", handoff_summary: "Carry on with T-1" } });
+  assert.ok(flat(node).some((n) => n.tag === "details"));
+  assert.ok(text(node).includes("Continued from previous session"));
+  assert.ok(text(node).includes("Carry on with T-1"));
+});
+
+test("snake_case_name and a * b * c render verbatim while real emphasis still works", () => {
+  const { api } = load();
+  for (const source of ["use snake_case_name here", "a * b * c", "2 * 3 * 4 = 24", "__init__ and my_var_name", "2**10 and 2**20", "x**2 + y**2"]) {
+    const fragment = api.managerConsoleMarkdown(source);
+    assert.ok(!flat(fragment).some((n) => n.tag === "em" || n.tag === "strong"), source);
+    assert.equal(text(fragment), source);
+  }
+  const emphasis = flat(api.managerConsoleMarkdown("*one* and _two_ and **three**"));
+  assert.deepEqual(emphasis.filter((n) => n.tag === "em").map(text), ["one", "two"]);
+  assert.deepEqual(emphasis.filter((n) => n.tag === "strong").map(text), ["three"]);
+});
+
+test("a code block has a Copy button that posts the block text and folds past 40 lines", () => {
+  const { api, posted } = load();
+  const fragment = api.managerConsoleMarkdown("```\nline 1\nline 2\n```");
+  const copy = flat(fragment).find((n) => n.tag === "button" && n.className === "mc-copy");
+  assert.ok(copy);
+  copy.listeners.click[0]();
+  assert.deepEqual(JSON.parse(JSON.stringify(posted)), [{ type: "copyText", text: "line 1\nline 2" }]);
+  const long = Array.from({ length: 50 }, (_, i) => `row ${i + 1}`);
+  const folded = flat(api.managerConsoleMarkdown("```\n" + long.join("\n") + "\n```"));
+  const pre = folded.find((n) => n.tag === "pre");
+  assert.equal(pre.textContent.split("\n").length, 40);
+  const showAll = folded.find((n) => n.tag === "button" && n.className === "mc-show-all");
+  assert.equal(showAll.textContent, "show all (50 lines)");
+  folded.find((n) => n.tag === "button" && n.className === "mc-copy").listeners.click[0]();
+  assert.equal(JSON.parse(JSON.stringify(posted)).at(-1).text, long.join("\n"));
+});
+
+test("a timestamped event shows HH:MM and an untimestamped one shows none", () => {
+  const { api } = load();
+  const at = "2026-09-27T10:05:00Z";
+  const date = new Date(at);
+  const expected = String(date.getHours()).padStart(2, "0") + ":" + String(date.getMinutes()).padStart(2, "0");
+  const stamped = flat(api.managerChatEventNode({ type: "assistant_text", at, payload: { text: "hi" } })).filter((n) => n.className === "mc-time");
+  assert.deepEqual(stamped.map((n) => n.textContent), [expected]);
+  const epoch = flat(api.managerChatEventNode({ type: "user_message", ts: date.getTime() / 1000, payload: { text: "hi" } })).filter((n) => n.className === "mc-time");
+  assert.deepEqual(epoch.map((n) => n.textContent), [expected]);
+  const bare = flat(api.managerChatEventNode({ type: "assistant_text", payload: { text: "hi" } }));
+  assert.ok(!bare.some((n) => n.className === "mc-time"));
 });
