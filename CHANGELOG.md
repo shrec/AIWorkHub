@@ -6,6 +6,30 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.57] - 2026-10-16
+
+### Added
+
+- The MCP runtime runs behind one stable launcher and is hot-swapped on install, so after this release a VSIX update no longer needs a VS Code window reload (NF-2026-01546).
+- The manager console renders the chat transcript bounded, escaped and only when it changed.
+- A manager can resolve one stale negative skill-evidence row by its source (NF-2026-01561).
+
+### Fixed
+
+- Directory-scoped skills match their cards, and NeedFix bug cards derive the bugfix family (NF-2026-01560).
+- Source Graph `bodygrep` scores `token_and_file` lines by distinctive tokens instead of padding with common words (NF-2026-01563).
+- `task_cost_ledger` folds summary route partitions and trims day rows; skill retirement anchors are summarized (NF-2026-01562).
+- The task store proves committed drift before taking the write lease and retries the atomic JSON replace (NF-2026-01559, NF-2026-01557).
+- Source Graph reports the writer's loop phase and hands a queued refresh to the next writer (NF-2026-01565).
+- `accept_review` rebases a drift in an unrelated frozen input onto a revalidation on the current tree (NF-2026-01543).
+- A refused `needfix_convert` names the transition that unblocks it; bug NeedFixes are stamped `bugfix` (NF-2026-01567).
+- A finding disposition accepts a bare reviewer row id and stores it under the full name (NF-2026-01569).
+- Routing opens a harness-behaviour circuit for `vscode_lm` and derives `opencode` for bare OmniRoute runners (NF-2026-01568, NF-2026-01554).
+- The manager loop ends a stopped turn cleanly and gives pollers a resumable event page.
+- A retired task keeps its outcome, so a purged finished task still counts as accepted on the roadmap (NF-2026-01564).
+- A reviewer can finish after the orchestrator archives its own review card, and zero-change candidates skip the review chain (NF-2026-01544, NF-2026-01571).
+- `manager_workforce_catalog` and `task_recover_blocked_rework` return compact default projections (NF-2026-01566).
+
 ## [0.12.56] - 2026-10-16
 
 ### Fixed

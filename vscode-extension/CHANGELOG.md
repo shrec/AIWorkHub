@@ -1,5 +1,15 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.57 — 2026-10-16
+
+### Added
+
+- Bundled runtime 0.12.57: the MCP runtime runs behind one stable launcher and is hot-swapped on install, so later VSIX updates need no window reload (NF-2026-01546); the manager console renders the chat transcript bounded, escaped and only when it changed.
+
+### Fixed
+
+- Bundled runtime 0.12.57: compact default projections for `task_cost_ledger`, `manager_workforce_catalog` and `task_recover_blocked_rework` (NF-2026-01562, NF-2026-01566); zero-change candidates skip the review chain and a reviewer survives the orchestrator archiving its own card (NF-2026-01571, NF-2026-01544); skill matching, `bodygrep` scoring, Source Graph refresh hand-off, roadmap outcome retention, task-store drift and routing circuits fixed (NF-2026-01560, NF-2026-01561, NF-2026-01563, NF-2026-01565, NF-2026-01564, NF-2026-01559, NF-2026-01557, NF-2026-01568, NF-2026-01554).
+
 ## 0.12.56 — 2026-10-16
 
 ### Fixed

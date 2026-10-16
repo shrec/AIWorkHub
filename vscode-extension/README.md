@@ -14,6 +14,10 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.57
+
+- After this update, installing a new version switches the running runtime without a VS Code window reload. Manager tools answer much smaller by default (cost ledger, workforce catalog, blocked-rework recovery), review chains are skipped when a worker changed nothing, skill matching, Source Graph text search and roadmap counting are more accurate, and the manager chat panel renders long transcripts safely.
+
 ## What's new in 0.12.56
 
 - A rejected or blocked rework whose correct code was stranded (a false "no change" refusal after a failed validation, or a release bump landing in between) can now be relaunched or recovered; a provider API outage is treated as a temporary failure, not bad code.
