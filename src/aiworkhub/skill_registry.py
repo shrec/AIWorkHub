@@ -1509,6 +1509,9 @@ def _path_match(pattern: str, value: str) -> str | None:
         prefix = pattern[:-2]
         if prefix and (value == prefix or value.startswith(prefix + "/")):
             return "wildcard"
+    elif pattern and value.startswith(pattern + "/"):
+        # The closed reason vocabulary has no directory kind; this is the "/*" case.
+        return "wildcard"
     return None
 
 

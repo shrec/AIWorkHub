@@ -1121,6 +1121,7 @@ def test_an_empty_receipt_records_why_rather_than_only_that(
         "empty_reason": (
             skill_registry.SELECTION_EMPTY_ACTIVE_VOCABULARY_UNSELECTABLE
         ),
+        "receipt_failure_reason": "",
         "failure_reason": "",
         "excluded": (),
     }
@@ -1772,3 +1773,136 @@ def test_a_rejected_vocabulary_still_reports_that_selection_was_attempted(
     assert "skill_selection" not in (
         project_context.collect_project_context(repo, bare).metadata
     )
+
+
+def test_directory_scoped_skill_matches_a_file_under_it(tmp_path: Path) -> None:
+    """A directory pattern like 'src/aiworkhub' matches a file under it."""
+    assert skill_registry._path_match("src/aiworkhub", "src/aiworkhub/task_store.py") == (
+        "wildcard"
+    )
+
+
+def test_directory_scoped_skill_does_not_match_a_sibling_prefix() -> None:
+    """'src/aiworkhub' must not match 'src/aiworkhub_extra/x.py'."""
+    assert skill_registry._path_match("src/aiworkhub", "src/aiworkhub_extra/x.py") is None
+
+
+def test_needfix_bug_card_derives_bugfix_family() -> None:
+    """A NeedFix-backed bug card derives family 'bugfix' without declaring it."""
+    card = {
+        "task_id": "needfix-NF-2026-01560",
+        "kind": "bug",
+        "allowed_writes": ["src/aiworkhub/skill_registry.py"],
+        "validation": ["python -m pytest -q tests/test_skill_registry.py"],
+    }
+
+    def family(**overrides: object) -> object:
+        context = project_context._skill_selection_context(dict(card, **overrides))
+        assert context is not None
+        return context.get("task_family")
+
+    assert family() == "bugfix"
+    assert family(task_id="T1", needfix_id="NF-2026-01560") == "bugfix"
+    assert family(task_id="needfix-sweep-3") == "implementation"
+    assert family(kind="feature") == "implementation"
+
+
+def test_needfix_bug_card_selects_the_bugfix_record_end_to_end(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A NeedFix bug card that declares no skill vocabulary reaches a bugfix record."""
+    record = skill_registry.validate_record(
+        skill_registry.replace(
+            _vocabulary_record(),
+            path_or_symbol="src/aiworkhub",
+            stage="implementation",
+            triggers=("code_change",),
+            applicability=("quality_gate",),
+        )
+    )
+    repo = _skills_repo(tmp_path, record)
+    _stub_context_tools(monkeypatch)
+    card = _vocabulary_card(
+        task_id="needfix-NF-2026-01560",
+        kind="bug",
+        allowed_writes=["src/aiworkhub/task_store.py"],
+        validation=["python -m pytest -q tests/test_skill_registry.py"],
+    )
+    for key in ("skill_task_family", "skill_stage", "skill_triggers", "skill_applicability"):
+        card.pop(key)
+
+    block = project_context.collect_project_context(repo, card).metadata[
+        "skill_selection"
+    ]
+
+    assert block["measured"] is True
+    assert block["selected_count"] == 1
+    receipt = skill_registry_store.get_selection(repo, "needfix-NF-2026-01560")
+    assert receipt is not None
+    assert receipt["selected_count"] == 1
+    assert receipt["empty_reason"] == ""
+
+
+def test_card_with_directory_scope_selects_ponytail_skill_in_implementation_stage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A card whose allowed_writes is scoped under src/aiworkhub selects the
+    directory-declared skill once _path_match honors a directory boundary."""
+    record = skill_registry.validate_record(
+        skill_registry.replace(
+            _vocabulary_record(),
+            path_or_symbol="src/aiworkhub",
+            stage="implementation",
+        )
+    )
+    repo = _skills_repo(tmp_path, record)
+    _stub_context_tools(monkeypatch)
+
+    card = _vocabulary_card(
+        skill_stage="implementation",
+        allowed_writes=["src/aiworkhub/task_store.py"],
+    )
+    block = project_context.collect_project_context(repo, card).metadata[
+        "skill_selection"
+    ]
+    assert block["measured"] is True
+    assert block["selected_count"] and block["selected_count"] > 0
+    receipt = skill_registry_store.get_selection(repo, str(card["task_id"]))
+    assert receipt is not None
+    assert receipt["selected_count"] > 0
+    assert receipt["empty_reason"] == ""
+
+
+def test_a_refused_receipt_write_is_surfaced_in_the_selection_metadata(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """record_selection_reported reports its refusal; the bundle must not drop it."""
+    repo = _skills_repo(tmp_path, _vocabulary_record())
+    _stub_context_tools(monkeypatch)
+    monkeypatch.setattr(
+        skill_registry_store,
+        "record_selection_reported",
+        lambda *args, **kwargs: {"ok": False, "reason": "x"},
+    )
+
+    block = project_context.collect_project_context(
+        repo, _vocabulary_card()
+    ).metadata["skill_selection"]
+
+    assert block["measured"] is True
+    assert block["selected_count"] == 1
+    assert block["receipt_failure_reason"] == "x"
+
+
+def test_a_card_that_edits_files_derives_the_code_change_trigger() -> None:
+    """A write set without a source suffix still triggers the code_change skills."""
+    card = {
+        "allowed_writes": ["docs/notes.md"],
+        "validation": ["python -m pytest -q tests/test_skill_registry.py"],
+    }
+    ctx = project_context._skill_selection_context(card)
+    assert ctx is not None
+    assert tuple(ctx["triggers"]) == ("code_change",)
+    assert tuple(ctx["applicability"]) == ("quality_gate",)
+
+    assert project_context._skill_selection_context(dict(card, read_only=True)) is None

@@ -1245,6 +1245,8 @@ def _skill_selection_context(card: dict[str, Any]) -> dict[str, Any] | None:
     resolved = dict(card)
     if not str(resolved.get("skill_task_family") or "").strip():
         family = _template_skill_task_family(card)
+        if not family and _is_needfix_bug_card(card):
+            family = "bugfix"
         if not family:
             fallback = (
                 "analysis" if card.get("read_only") is True else "implementation"
@@ -1278,6 +1280,9 @@ def _skill_selection_context(card: dict[str, Any]) -> dict[str, Any] | None:
         signals = quality_evidence.derive_risk_signals(
             card, card.get("allowed_writes") or []
         )
+        # A card that writes files is a code change even when no path suffix says so.
+        if card.get("read_only") is not True and card.get("allowed_writes"):
+            signals = sorted({*signals, "code_change"})
         if not resolved.get("skill_triggers") and signals:
             resolved["skill_triggers"] = signals
         if not resolved.get("skill_applicability"):
@@ -1291,6 +1296,22 @@ def _skill_selection_context(card: dict[str, Any]) -> dict[str, Any] | None:
             if applicability:
                 resolved["skill_applicability"] = applicability
     return skill_registry.card_selection_context(resolved)
+
+
+def _is_needfix_bug_card(card: dict[str, Any]) -> bool:
+    """Return True when ``card`` is NeedFix-backed and declares kind ``bug``.
+
+    Uses only existing linkage fields already carried on the card (its
+    ``needfix_id`` or a ``needfix-NF...`` task id prefix) alongside the
+    card's declared ``kind``; no new store lookup is introduced.
+    """
+    kind = str(card.get("kind") or "").strip().lower()
+    if kind != "bug":
+        return False
+    if str(card.get("needfix_id") or "").strip():
+        return True
+    task_id = str(card.get("task_id") or "")
+    return task_id.startswith("needfix-NF")
 
 
 def _skill_selection_metadata(section: dict[str, Any]) -> dict[str, Any]:
@@ -1308,6 +1329,9 @@ def _skill_selection_metadata(section: dict[str, Any]) -> dict[str, Any]:
     nothing -- the same conflation of "unavailable" with "measured zero" this
     block exists to prevent. The failure path is detected by the ABSENCE of
     ``empty_reason``, which only the completed path attaches.
+
+    ``receipt_failure_reason`` is the store's own reason when the per-card
+    receipt write was refused, and empty when it was recorded or never ran.
     """
     if "empty_reason" not in section:
         return {
@@ -1317,6 +1341,7 @@ def _skill_selection_metadata(section: dict[str, Any]) -> dict[str, Any]:
             "evidence_backed_count": None,
             "empty_reason": "",
             "excluded": None,
+            "receipt_failure_reason": "",
             "failure_reason": section["degraded_reason"],
         }
     return {
@@ -1326,6 +1351,7 @@ def _skill_selection_metadata(section: dict[str, Any]) -> dict[str, Any]:
         "evidence_backed_count": section["evidence_backed_count"],
         "empty_reason": section["empty_reason"],
         "excluded": section["excluded"],
+        "receipt_failure_reason": section["receipt_failure_reason"],
         "failure_reason": "",
     }
 
@@ -1482,7 +1508,7 @@ def _skills_section(repo: Path, card: dict[str, Any]) -> dict[str, Any] | None:
         # selected_count is the SELECTION, len(packet.skills) the INJECTION:
         # build_runtime_packet bounds the packet, so the two can differ and
         # recording only one of them hides a truncation as a miss.
-        skill_registry_store.record_selection_reported(
+        recorded = skill_registry_store.record_selection_reported(
             repo,
             task_id=str(card.get("task_id") or ""),
             request_id="",
@@ -1490,6 +1516,12 @@ def _skills_section(repo: Path, card: dict[str, Any]) -> dict[str, Any] | None:
             context=context,
             selected_count=len(receipt.selected),
             empty_reason=empty_reason,
+        )
+        # A refused receipt write is surfaced in the metadata, never dropped.
+        receipt_failure_reason = (
+            ""
+            if recorded.get("ok") is True
+            else str(recorded.get("reason") or "skill_selection_receipt_not_recorded")
         )
     except (
         skill_registry.SkillRegistryError,
@@ -1522,6 +1554,7 @@ def _skills_section(repo: Path, card: dict[str, Any]) -> dict[str, Any] | None:
         injected_count=len(packet.skills),
         evidence_backed_count=evidence_backed_count,
         empty_reason=empty_reason,
+        receipt_failure_reason=receipt_failure_reason,
         # A record excluded for breaching a packet bound, named here rather
         # than hidden behind a shorter skills list (NF-2026-01416).
         excluded=packet.excluded,
