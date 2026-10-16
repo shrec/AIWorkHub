@@ -758,3 +758,73 @@ def test_target_identity_unresolved_shares_the_identity_derivation() -> None:
             "terminal_evidence"
         ]
         assert review_orchestrator.target_identity_from_card(unreadable) == {}
+
+
+def test_a_bare_row_id_is_accepted_and_stored_under_the_full_form(tmp_path: Path) -> None:
+    driver = _driver(tmp_path)
+    receipt = _receipt(_finding("finding-1"))
+
+    stored = _dispose(driver, receipt, finding_id="finding-1")
+    assert stored["ok"] is True and stored["idempotent"] is False
+    assert stored["finding_id"] == FINDING_1
+
+    rows = driver.review_finding_dispositions(task_id="TARGET", request_id="target-request")
+    assert [row["finding_id"] for row in rows] == [FINDING_1]
+
+    # The full form names that same stored receipt, so both spellings are one
+    # disposition, never two.
+    replay = _dispose(driver, receipt, finding_id=FINDING_1)
+    assert replay["ok"] is True and replay["idempotent"] is True
+    assert replay["receipt_sha256"] == stored["receipt_sha256"]
+
+
+def test_a_bare_row_id_matching_no_row_is_refused(tmp_path: Path) -> None:
+    receipt = _receipt(_finding("finding-1"))
+
+    assert _dispose(_driver(tmp_path), receipt, finding_id="finding-2") == {
+        "ok": False,
+        "error": "review_finding_disposition_finding_unknown",
+    }
+
+
+def test_a_bare_row_id_matching_two_rows_is_refused_as_ambiguous(tmp_path: Path) -> None:
+    receipt = _receipt(_finding("finding-1"), _finding("finding-1"))
+
+    assert _dispose(_driver(tmp_path), receipt, finding_id="finding-1") == {
+        "ok": False,
+        "error": "review_finding_disposition_ambiguous",
+    }
+
+
+def test_a_bare_id_disposition_lifts_the_same_blocker_as_the_full_id(
+    tmp_path: Path,
+) -> None:
+    receipt = _receipt(_finding("finding-1"))
+    digest = accept_review._receipt_sha256(receipt)
+    reports = [_report(_finding("finding-1"))]
+
+    def verdict_after(row: dict) -> dict:
+        bound = accept_review.bound_finding_dispositions(
+            _DispositionStore([row]),
+            "TARGET",
+            "target-request",
+            candidate_sha256=CANDIDATE,
+            receipt_sha256_by_reviewer={"review-req-1": digest},
+        )
+        assert [item["finding_id"] for item in bound] == [FINDING_1]
+        return _fold(reports, finding_dispositions=bound)
+
+    assert (
+        f"refinement_required:{FINDING_1}"
+        in _fold(reports, finding_dispositions=[])["blocking_evidence"]
+    )
+
+    (tmp_path / "bare").mkdir()
+    (tmp_path / "full").mkdir()
+    bare = _stored(tmp_path / "bare", receipt, finding_id="finding-1")
+    full = _stored(tmp_path / "full", receipt, finding_id=FINDING_1)
+
+    bare_verdict = verdict_after(bare)
+    full_verdict = verdict_after(full)
+    assert bare_verdict["blocking_evidence"] == full_verdict["blocking_evidence"] == []
+    assert bare_verdict["passed"] is True and full_verdict["passed"] is True

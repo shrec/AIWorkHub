@@ -2711,11 +2711,16 @@ class ReviewOrchestrator:
             }
         lens = str(report.get("lens") or "")
         findings = report.get("findings")
+        is_bare_finding_id = not str(finding_id).startswith("reviewer:")
         matches = [
             row
             for row in (findings if isinstance(findings, list) else [])
             if isinstance(row, Mapping)
-            and f"reviewer:{lens}:{str(row.get('id') or '')}" == str(finding_id)
+            and (
+                str(row.get("id") or "") == str(finding_id)
+                if is_bare_finding_id
+                else f"reviewer:{lens}:{str(row.get('id') or '')}" == str(finding_id)
+            )
         ]
         if not matches:
             return {"ok": False, "error": "review_finding_disposition_finding_unknown"}
@@ -2724,6 +2729,11 @@ class ReviewOrchestrator:
             # naming one would bind to an arbitrary finding and lift nothing.
             return {"ok": False, "error": "review_finding_disposition_ambiguous"}
         finding = matches[0]
+        if is_bare_finding_id:
+            # The fold names each blocker reviewer:<lens>:<row id> and accept
+            # lifts it by that name, so a disposition recorded from the bare
+            # row id must store that same full form.
+            finding_id = f"reviewer:{lens}:{str(finding.get('id') or '')}"
         severity = str(finding.get("severity") or "")
         if severity in quality_evidence.BLOCKING_SEVERITIES:
             return {
