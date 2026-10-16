@@ -170,7 +170,13 @@ def test_snapshot_joins_tasks_and_dependency_blockers(
     parent = _add(repo, "Parent")
     child = _add(repo, "Child", depends_on=[parent["id"]])
     roadmap_store.link_task(repo, child["id"], "task-child")
-    monkeypatch.setattr(core.task_store, "get_task", lambda *_args: {"status": "pending"})
+    monkeypatch.setattr(
+        core.task_store,
+        "get_tasks",
+        lambda _root, task_ids, **_kw: {
+            task_id: {"status": "pending"} for task_id in task_ids
+        },
+    )
     monkeypatch.setattr(
         core.task_store, "canonical_status", lambda card: str(card["status"])
     )
@@ -211,13 +217,14 @@ def test_snapshot_partial_caller_cards_keep_point_lookup(
     monkeypatch.setattr(core, "repo_root", lambda: repo)
     item = _add(repo, "Outcome")
     roadmap_store.link_task(repo, item["id"], "task-child")
-    calls = {"get": 0}
+    calls = {"get_tasks": 0, "ids": []}
 
-    def counted_get(*_args, **_kwargs):
-        calls["get"] += 1
-        return {"status": "finished"}
+    def counted_get_tasks(_root, task_ids, **_kwargs):
+        calls["get_tasks"] += 1
+        calls["ids"] = list(task_ids)
+        return {task_id: {"status": "finished"} for task_id in task_ids}
 
-    monkeypatch.setattr(core.task_store, "get_task", counted_get)
+    monkeypatch.setattr(core.task_store, "get_tasks", counted_get_tasks)
     snapshot = core.roadmap_snapshot(
         task_cards_snapshot=(),
         task_cards_snapshot_complete=False,
@@ -226,7 +233,7 @@ def test_snapshot_partial_caller_cards_keep_point_lookup(
     assert snapshot["items"][0]["tasks"] == [
         {"task_id": "task-child", "status": "finished"}
     ]
-    assert calls == {"get": 1}
+    assert calls == {"get_tasks": 1, "ids": ["task-child"]}
 
 
 def test_snapshot_aggregates_are_not_limited_to_visible_rows(

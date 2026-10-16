@@ -606,14 +606,18 @@ def _resolve_active_state_hooks(
             return _cache_point_lookup_card(requested, task_by_id[requested])
         if task_cards_complete:
             return None
-        found = _cache_point_lookup_card(requested, task_store.get_task(repo, requested))
+        found = _cache_point_lookup_card(
+            requested, task_store.get_task(repo, requested, readiness=readiness)
+        )
         if found is None:
             return None
         task_by_id[requested] = found
         _prefetch_successor_chain(
             found,
             task_by_id,
-            lambda successor_id: task_store.get_task(repo, successor_id),
+            lambda successor_id: task_store.get_task(
+                repo, successor_id, readiness=readiness
+            ),
         )
         return found
 

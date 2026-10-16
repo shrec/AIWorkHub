@@ -13019,9 +13019,16 @@ def roadmap_snapshot(
     task_cards_snapshot_complete: bool = False,
 ) -> dict[str, Any]:
     """Return bounded roadmap truth joined to canonical task lifecycle."""
-    items = roadmap_list(include_archived=include_archived, limit=limit)
+    root = repo_root()
+    items = _roadmap_store_module().list_items(
+        root,
+        status=None,
+        include_archived=include_archived,
+        limit=limit,
+        offset=0,
+    )
     status_counts = _roadmap_store_module().count_items_by_status(
-        repo_root(), include_archived=include_archived
+        root, include_archived=include_archived
     )
     total = sum(status_counts.values())
     task_cards_by_id = {
@@ -13029,6 +13036,16 @@ def roadmap_snapshot(
         for card in task_cards_snapshot or ()
         if card.get("task_id")
     }
+    fetched_cards: dict[str, Mapping[str, Any]] = {}
+    if not task_cards_snapshot_complete:
+        missing_ids = [
+            task_id
+            for item in items
+            for task_id in item["task_ids"]
+            if task_id not in task_cards_by_id
+        ]
+        if missing_ids:
+            fetched_cards = task_store.get_tasks(root, missing_ids)
     # (task_id, displayed status, outcome status); both None when no live card.
     # The display keeps the archive overlay; acceptance reads the outcome under it.
     live_statuses: list[list[tuple[str, str | None, str | None]]] = []
@@ -13040,7 +13057,7 @@ def roadmap_snapshot(
             elif task_cards_snapshot_complete:
                 card = None
             else:
-                card = task_store.get_task(repo_root(), task_id)
+                card = fetched_cards.get(task_id)
             if card is None:
                 linked.append((task_id, None, None))
             else:
@@ -13060,7 +13077,7 @@ def roadmap_snapshot(
         if status is None
     }
     retired = (
-        _roadmap_store_module().retired_task_statuses(repo_root(), sorted(unresolved_ids))
+        _roadmap_store_module().retired_task_statuses(root, sorted(unresolved_ids))
         if unresolved_ids
         else {}
     )
@@ -13077,7 +13094,7 @@ def roadmap_snapshot(
         dependency_blockers = [
             dependency
             for dependency in item["depends_on"]
-            if _roadmap_store_module().get_item(repo_root(), dependency)["status"]
+            if _roadmap_store_module().get_item(root, dependency)["status"]
             != "completed"
         ]
         rows.append(

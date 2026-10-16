@@ -39,7 +39,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from .repository_state import (
     HUB_DIRNAME,
@@ -1185,6 +1185,24 @@ def _decode_task_card(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
     return card
 
 
+_LIST_TASK_CARDS_SQL = (
+    "SELECT t.* FROM (SELECT rowid AS rid, updated_at AS u FROM tasks "
+    "ORDER BY updated_at DESC LIMIT ?) s JOIN tasks t ON t.rowid = s.rid "
+    "ORDER BY s.u DESC"
+)
+
+_GET_TASKS_CHUNK = 500
+
+
+def _db_path_for(root: str | Path, readiness: StorageReadiness | None) -> Path:
+    """The canonical db path, verifying readiness only when the caller has none."""
+    if readiness is None:
+        return _require_ready(root)[1]
+    if not readiness.ready:
+        raise StorageNotReadyError(readiness.reason)
+    return Path(readiness.canonical_db)
+
+
 def list_task_cards(root: str | Path, *, limit: int = 500) -> list[dict[str, Any]]:
     """Return bounded canonical task cards with one readiness check/query.
 
@@ -1198,10 +1216,7 @@ def list_task_cards(root: str | Path, *, limit: int = 500) -> list[dict[str, Any
     bounded_limit = max(1, min(int(limit), 5000))
     conn = _connect(db_path, readonly=True)
     try:
-        rows = conn.execute(
-            "SELECT * FROM tasks ORDER BY updated_at DESC LIMIT ?",
-            (bounded_limit,),
-        ).fetchall()
+        rows = conn.execute(_LIST_TASK_CARDS_SQL, (bounded_limit,)).fetchall()
     finally:
         conn.close()
     return [_decode_task_card(row) for row in rows]
@@ -1418,9 +1433,18 @@ def route_terminal_observations(
     return rows
 
 
-def get_task(root: str | Path, task_id: str) -> dict[str, Any] | None:
-    """Canonical detail for exactly one bounded task_id, or None if unknown."""
-    _readiness, db_path = _require_ready(root)
+def get_task(
+    root: str | Path,
+    task_id: str,
+    *,
+    readiness: StorageReadiness | None = None,
+) -> dict[str, Any] | None:
+    """Canonical detail for exactly one bounded task_id, or None if unknown.
+
+    A caller that already verified ``readiness`` for ``root`` passes it to skip
+    the per-call ``storage_readiness`` check; a not-ready value still raises.
+    """
+    db_path = _db_path_for(root, readiness)
     conn = _connect(db_path, readonly=True)
     try:
         row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
@@ -1429,6 +1453,34 @@ def get_task(root: str | Path, task_id: str) -> dict[str, Any] | None:
     if row is None:
         return None
     return _decode_task_card(row)
+
+
+def get_tasks(
+    root: str | Path,
+    task_ids: Iterable[str],
+    *,
+    readiness: StorageReadiness | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Canonical cards for many task_ids over one connection; unknown ids absent."""
+    ordered = list(dict.fromkeys(task_ids))
+    if not ordered:
+        return {}
+    db_path = _db_path_for(root, readiness)
+    found: dict[str, dict[str, Any]] = {}
+    conn = _connect(db_path, readonly=True)
+    try:
+        for start in range(0, len(ordered), _GET_TASKS_CHUNK):
+            chunk = ordered[start : start + _GET_TASKS_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT * FROM tasks WHERE task_id IN ({placeholders})", chunk
+            ).fetchall()
+            for row in rows:
+                card = _decode_task_card(row)
+                found[str(row["task_id"])] = card
+    finally:
+        conn.close()
+    return found
 
 
 def is_task_queue_lock_error(exc: BaseException) -> bool:
