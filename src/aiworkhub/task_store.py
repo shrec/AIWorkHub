@@ -60,6 +60,7 @@ from .storage_registry import (
 )
 from .provider_tool_guards import ProviderGuardError, apply_repository_guards
 from .platform_io import is_windows, process_is_alive
+from .promotion_write import PromotionWriteError, run_promotion_write_retrying
 from . import db_writer
 from . import review_lifecycle
 from . import task_fsm
@@ -634,7 +635,13 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
             descriptor_open = False
             json.dump(dict(payload), fh, ensure_ascii=False, indent=2, sort_keys=True)
             fh.write("\n")
-        os.replace(tmp_name, path)
+        try:
+            run_promotion_write_retrying(path.name, "replace", os.replace, tmp_name, path)
+        except PromotionWriteError as exc:
+            # Callers catch the original OSError, not the retry helper's wrapper.
+            if isinstance(exc.__cause__, OSError):
+                raise exc.__cause__ from None
+            raise
     finally:
         if descriptor_open:
             try:
@@ -5227,52 +5234,158 @@ def apply_validation_amendment(card: dict[str, Any], commands: list[str]) -> lis
     return applied
 
 
-def _committed_base_drift(
-    repo: Path, base_oid: object, path: str, canonical_hash: str | None
+def _candidate_path_in_scope(path: object, allowed_writes: Sequence[object]) -> bool:
+    return (
+        isinstance(path, str)
+        and bool(path)
+        and not path.startswith("/")
+        and "\\" not in path
+        and not any(part in {"", ".", ".."} for part in path.split("/"))
+        and path in allowed_writes
+    )
+
+
+def _recorded_baseline_hash(recorded_baseline: object) -> str | None:
+    """sha256 of a ``file:<size>:<sha256>`` parent_baseline token; None when recorded absent."""
+    if recorded_baseline is None:
+        return None
+    if isinstance(recorded_baseline, str):
+        parts = recorded_baseline.split(":", 2)
+        if (
+            len(parts) == 3
+            and parts[0] == "file"
+            and parts[1].isdigit()
+            and len(parts[2]) == 64
+        ):
+            return parts[2]
+    raise ValueError("retained_terminal_candidate_baseline_invalid")
+
+
+def _canonical_baseline_hash(repo: Path, path: str) -> str | None:
+    """sha256 of the canonical repo file at ``path``; None when absent or a symlink."""
+    candidate = repo.joinpath(*path.split("/"))
+    if candidate.is_file() and not candidate.is_symlink():
+        return hashlib.sha256(candidate.read_bytes()).hexdigest()
+    return None
+
+
+def _committed_drift_proven(
+    proof: Mapping[tuple[str, str], str],
+    base_oid: object,
+    path: str,
+    baseline_hash: str | None,
 ) -> bool:
-    """Return True only when ``path`` drifted solely via committed history since ``base_oid``."""
+    """True only when the baseline measured now is the canonical hash git proved."""
+    return (
+        isinstance(base_oid, str)
+        and baseline_hash is not None
+        and proof.get((base_oid, path)) == baseline_hash
+    )
+
+
+def _committed_drift_git(repo: Path, *args: str, text: bool = True) -> Any:
+    """One bounded git probe of the committed-drift proof; never run it under the write lease."""
     from . import worker_workspace as _ww
 
-    if (
-        not isinstance(base_oid, str)
-        or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", base_oid) is None
-    ):
+    return _ww._run(
+        [
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=" + os.devnull,
+            "--literal-pathspecs",
+            *args,
+        ],
+        cwd=repo,
+        timeout=60,
+        phase="nf01558_committed_drift",
+        text=text,
+    )
+
+
+def _head_holds_committed_drift(
+    repo: Path, base_oid: str, path: str, canonical_hash: str
+) -> bool:
+    """``path`` changed between ``base_oid`` and HEAD, and HEAD's filtered bytes are canonical."""
+    diff = _committed_drift_git(repo, "diff", "--quiet", base_oid, "HEAD", "--", path)
+    if diff.returncode != 1:
         return False
-    if canonical_hash is None:
-        return False
-    git_prefix = [
-        "git",
-        "-c",
-        "core.fsmonitor=false",
-        "-c",
-        "core.hooksPath=" + os.devnull,
-        "--literal-pathspecs",
-    ]
-    phase = "nf01558_committed_drift"
+    blob = _committed_drift_git(repo, "cat-file", "--filters", f"HEAD:{path}", text=False)
+    return (
+        blob.returncode == 0
+        and hashlib.sha256(blob.stdout).hexdigest() == canonical_hash
+    )
+
+
+def _pre_lease_committed_drift_proof(
+    root: str | Path, db_path: Path, task_id: str
+) -> dict[tuple[str, str], str]:
+    """Prove NF-2026-01558 committed base drift with git, before the write lease.
+
+    Maps ``(base_oid, path)`` to the canonical sha256 of each retained-candidate
+    path of a blocked task that differs from its recorded ``parent_baseline``
+    only through committed history: ``base_oid`` is an ancestor of HEAD (asked
+    once per base), the path changed since, and HEAD holds the canonical bytes.
+    The lease compares its re-measured hash to this and refuses an absent path.
+    """
+    from . import worker_workspace as _ww
+
+    proof: dict[tuple[str, str], str] = {}
     try:
-        for args, expected_rc in (
-            (["merge-base", "--is-ancestor", base_oid, "HEAD"], 0),
-            (["diff", "--quiet", base_oid, "HEAD", "--", path], 1),
-        ):
-            res = _ww._run(
-                [*git_prefix, *args],
-                cwd=repo,
-                timeout=60,
-                phase=phase,
-            )
-            if res.returncode != expected_rc:
-                return False
-        res = _ww._run(
-            [*git_prefix, "cat-file", "--filters", f"HEAD:{path}"],
-            cwd=repo,
-            timeout=60,
-            phase=phase,
-            text=False,
-        )
-        return (
-            res.returncode == 0
-            and hashlib.sha256(res.stdout).hexdigest() == canonical_hash
-        )
+        conn = _connect(db_path, readonly=True)
+        try:
+            row = conn.execute(
+                "SELECT status, worker_status, card_json FROM tasks WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None or canonical_status(dict(row)) != "blocked":
+            return proof
+        card = json.loads(str(row["card_json"] or "{}"))
+        repo = Path(root).resolve(strict=True)
+    except (sqlite3.Error, OSError, RuntimeError, ValueError):
+        return proof
+    allowed_writes = card.get("allowed_writes") if isinstance(card, dict) else None
+    if not isinstance(allowed_writes, list):
+        return proof
+    descends_from: dict[str, bool] = {}
+    try:
+        for event_name in ("terminal_failure", "terminal_review"):
+            event = card.get(event_name)
+            evidence = event.get("evidence") if isinstance(event, dict) else None
+            workspace = evidence.get("workspace") if isinstance(evidence, dict) else None
+            changed_paths = evidence.get("changed_paths") if isinstance(evidence, dict) else None
+            if not isinstance(workspace, dict) or not isinstance(changed_paths, list):
+                continue
+            base_oid = workspace.get("base_oid")
+            parent_baseline = workspace.get("parent_baseline")
+            if (
+                not isinstance(parent_baseline, dict)
+                or not isinstance(base_oid, str)
+                or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", base_oid) is None
+            ):
+                continue
+            for path in dict.fromkeys(
+                p for p in changed_paths if _candidate_path_in_scope(p, allowed_writes)
+            ):
+                try:
+                    recorded_hash = _recorded_baseline_hash(parent_baseline.get(path))
+                    canonical_hash = _canonical_baseline_hash(repo, path)
+                except (OSError, ValueError):
+                    continue
+                if canonical_hash is None or canonical_hash == recorded_hash:
+                    continue
+                if base_oid not in descends_from:
+                    ancestry = _committed_drift_git(
+                        repo, "merge-base", "--is-ancestor", base_oid, "HEAD"
+                    )
+                    descends_from[base_oid] = ancestry.returncode == 0
+                if descends_from[base_oid] and _head_holds_committed_drift(
+                    repo, base_oid, path, canonical_hash
+                ):
+                    proof[(base_oid, path)] = canonical_hash
     except (
         _ww.WorkspaceError,
         _ww.GitCommandTimeout,
@@ -5281,7 +5394,8 @@ def _committed_base_drift(
         KeyError,
         TypeError,
     ):
-        return False
+        pass
+    return proof
 
 
 @_os_failure_names_its_operation
@@ -5405,6 +5519,12 @@ def recover_blocked_rework(
         and not validation_only_replay
         and not scope_rejection_resolved
         else None
+    )
+    # NF-2026-01559: the committed-drift git proof also runs before the lease.
+    committed_drift_proof = (
+        {}
+        if scope_rejection_resolved
+        else _pre_lease_committed_drift_proof(root, db_path, task_id)
     )
     # Serialized on the same lease as the terminal transitions. Its four
     # ``conn.commit()`` calls are MUTUALLY EXCLUSIVE branch exits, not four
@@ -6499,12 +6619,7 @@ def recover_blocked_rework(
                 if check_failed():
                     return False, f"retained_terminal_candidate_identity_invalid:{check_name}"
             if any(
-                not isinstance(path, str)
-                or not path
-                or path.startswith("/")
-                or "\\" in path
-                or any(part in {"", ".", ".."} for part in path.split("/"))
-                or path not in allowed_writes
+                not _candidate_path_in_scope(path, allowed_writes)
                 for path in changed_paths
             ):
                 return False, "retained_terminal_candidate_scope_invalid"
@@ -6598,7 +6713,6 @@ def recover_blocked_rework(
                     allowed_writes,
                 )
             for path in changed_paths:
-                baseline_candidate = expected_repo.joinpath(*path.split("/"))
                 # An authenticated delta already bound every sealed path to its
                 # exact hash; only a retained worktree is read here.
                 if sealed_delta is None:
@@ -6628,33 +6742,21 @@ def recover_blocked_rework(
                     ):
                         return False, "retained_terminal_candidate_hash_mismatch"
                 try:
-                    baseline_hash = (
-                        hashlib.sha256(baseline_candidate.read_bytes()).hexdigest()
-                        if baseline_candidate.is_file() and not baseline_candidate.is_symlink()
-                        else None
-                    )
+                    baseline_hash = _canonical_baseline_hash(expected_repo, path)
                 except OSError:
                     return False, "retained_terminal_candidate_baseline_invalid"
-                recorded_baseline = parent_baseline.get(path)
-                if recorded_baseline is None:
-                    recorded_baseline_hash = None
-                elif isinstance(recorded_baseline, str):
-                    baseline_parts = recorded_baseline.split(":", 2)
-                    if (
-                        len(baseline_parts) != 3
-                        or baseline_parts[0] != "file"
-                        or not baseline_parts[1].isdigit()
-                        or len(baseline_parts[2]) != 64
-                    ):
-                        return False, "retained_terminal_candidate_baseline_invalid"
-                    recorded_baseline_hash = baseline_parts[2]
-                else:
+                try:
+                    recorded_baseline_hash = _recorded_baseline_hash(
+                        parent_baseline.get(path)
+                    )
+                except ValueError:
                     return False, "retained_terminal_candidate_baseline_invalid"
                 # NF-2026-01558: only committed canonical base drift is waived
                 # because the materializer three-way rebases committed history
                 # only and owns conflict refusal (rework_base_drift).
-                if recorded_baseline_hash != baseline_hash and not _committed_base_drift(
-                    expected_repo, workspace.get("base_oid"), path, baseline_hash
+                # NF-2026-01559: git proved it before the lease; only the hash is compared.
+                if recorded_baseline_hash != baseline_hash and not _committed_drift_proven(
+                    committed_drift_proof, base_oid, path, baseline_hash
                 ):
                     return False, "retained_terminal_candidate_baseline_mismatch"
             retained_predecessor = {

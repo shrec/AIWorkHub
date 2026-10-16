@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import sqlite3
 import sys
+import types
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,7 @@ if str(_SRC) not in sys.path:
 from aiworkhub import callback_store  # noqa: E402
 from aiworkhub import task_store  # noqa: E402
 from aiworkhub import review_lifecycle  # noqa: E402
+from aiworkhub import promotion_write  # noqa: E402
 
 
 def _insert_task(repo: Path, task_id: str, *, status: str) -> None:
@@ -132,6 +135,89 @@ def test_atomic_json_closes_descriptor_when_fdopen_fails(
         task_store._atomic_write_json(target, {"ok": True})
     with pytest.raises(OSError):
         os.fstat(descriptor)
+
+
+def _winerror_permission_error(winerror: int) -> PermissionError:
+    error = PermissionError(errno.EACCES, "Access is denied")
+    error.winerror = winerror  # type: ignore[attr-defined]
+    return error
+
+
+def _script_atomic_replace(
+    monkeypatch: pytest.MonkeyPatch, failures: list[OSError],
+) -> tuple[list[tuple[str, str]], list[float]]:
+    """Make os.replace raise ``failures`` in order, then really replace; no real sleeping."""
+    pending = list(failures)
+    real_replace = os.replace
+    calls: list[tuple[str, str]] = []
+    sleeps: list[float] = []
+
+    def scripted_replace(src: Any, dst: Any) -> None:
+        calls.append((os.fspath(src), os.fspath(dst)))
+        if pending:
+            raise pending.pop(0)
+        real_replace(src, dst)
+
+    monkeypatch.setattr(task_store.os, "replace", scripted_replace)
+    monkeypatch.setattr(promotion_write, "time", types.SimpleNamespace(sleep=sleeps.append))
+    return calls, sleeps
+
+
+@pytest.mark.parametrize("winerror", [5, 32], ids=["access_denied", "sharing_violation"])
+def test_atomic_json_retries_transient_replace_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, winerror: int,
+) -> None:
+    target = tmp_path / "registry.json"
+    calls, sleeps = _script_atomic_replace(
+        monkeypatch,
+        [_winerror_permission_error(winerror), _winerror_permission_error(winerror)],
+    )
+
+    task_store._atomic_write_json(target, {"ok": True})
+
+    assert json.loads(target.read_text(encoding="utf-8")) == {"ok": True}
+    assert [dst for _src, dst in calls] == [str(target)] * 3
+    assert len({src for src, _dst in calls}) == 1
+    assert sleeps == [promotion_write.PROMOTION_WRITE_RETRY_DELAY_SECONDS] * 2
+    assert [entry.name for entry in tmp_path.iterdir()] == ["registry.json"]
+
+
+def test_atomic_json_raises_original_error_when_replace_retries_are_exhausted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "registry.json"
+    attempts = promotion_write.PROMOTION_WRITE_RETRY_ATTEMPTS
+    error = _winerror_permission_error(5)
+    calls, sleeps = _script_atomic_replace(monkeypatch, [error] * (attempts + 2))
+
+    with pytest.raises(PermissionError) as raised:
+        task_store._atomic_write_json(target, {"ok": True})
+
+    assert raised.value is error
+    assert len(calls) == attempts
+    assert len(sleeps) == attempts - 1
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("error_class", "code"),
+    [(PermissionError, errno.EACCES), (OSError, errno.ENOSPC)],
+    ids=["permission_without_winerror", "disk_full"],
+)
+def test_atomic_json_raises_non_transient_replace_failure_immediately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_class: type[OSError], code: int,
+) -> None:
+    target = tmp_path / "registry.json"
+    error = error_class(code, "replace failed")
+    calls, sleeps = _script_atomic_replace(monkeypatch, [error])
+
+    with pytest.raises(OSError) as raised:
+        task_store._atomic_write_json(target, {"ok": True})
+
+    assert raised.value is error
+    assert len(calls) == 1
+    assert sleeps == []
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_archive_removes_pending_card_from_active_lists_and_preserves_events(tmp_path: Path) -> None:

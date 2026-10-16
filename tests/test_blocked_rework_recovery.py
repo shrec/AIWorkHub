@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import copy
 import errno
 import gc
@@ -15,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from aiworkhub import promotion_merge, task_store, worker_workspace
+from aiworkhub import db_writer, promotion_merge, task_store, worker_workspace
 
 
 def _symlink_or_skip(link: Path, target: Path, *, directory: bool = False) -> None:
@@ -825,6 +826,123 @@ def test_retained_candidate_untracked_recreation_refuses(tmp_path: Path) -> None
         actor="coordinator",
         feedback_reason="NeedFix: refuse untracked recreation after committed deletion",
     ) == (False, "retained_terminal_candidate_baseline_mismatch")
+
+
+def _git_commit_canonical_drift(repo: Path, *paths: str, amend: bool = False) -> None:
+    for path in paths:
+        (repo / path).write_bytes(f"drifted {path}\n".encode())
+    commit = [
+        "git", "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+        "commit", "-q",
+    ]
+    if amend:
+        commit.append("--amend")
+    commit += ["-m", "drift"]
+    for argv in (["git", "add", *paths], commit):
+        subprocess.run(argv, cwd=repo, check=True, capture_output=True, text=True)
+
+
+def test_retained_candidate_committed_drift_git_runs_outside_write_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, _candidate, _hashes = _retained_terminal_failure_fixture(
+        tmp_path, required_outputs=True,
+    )
+    _git_commit_fixture_baseline(repo)
+    _git_commit_canonical_drift(
+        repo, "src/aiworkhub/task_store.py", "tests/test_retained_candidate.py",
+    )
+    _ready, db_path = task_store._require_ready(repo)
+    leases_open = 0
+    git_runs: list[tuple[list[str], int]] = []
+    real_write_lease = db_writer.write_lease
+    real_run = worker_workspace._run
+
+    @contextlib.contextmanager
+    def counting_write_lease(*args, **kwargs):
+        nonlocal leases_open
+        with real_write_lease(*args, **kwargs) as receipt:
+            leases_open += 1
+            try:
+                yield receipt
+            finally:
+                leases_open -= 1
+
+    def recording_run(argv, **kwargs):
+        git_runs.append((list(argv), leases_open))
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(db_writer, "write_lease", counting_write_lease)
+    monkeypatch.setattr(worker_workspace, "_run", recording_run)
+
+    with task_store._write_connection(db_path):
+        worker_workspace._run(["git", "--version"], cwd=repo, phase="lease_probe")
+    _argv, open_during_probe = git_runs.pop()
+    assert open_during_probe > 0
+
+    assert task_store.recover_blocked_rework(
+        repo,
+        "BLOCKED_RETAINED_EMPTY_OUTPUTS",
+        actor="coordinator",
+        feedback_reason="NeedFix: prove committed drift before taking the write lease",
+    ) == (True, "recovered")
+    probes = [
+        verb for argv, _open in git_runs for verb in ("merge-base", "cat-file") if verb in argv
+    ]
+    assert probes == ["merge-base", "cat-file", "cat-file"]
+    assert [argv for argv, open_leases in git_runs if open_leases] == []
+
+
+def test_retained_candidate_committed_drift_refuses_head_not_descending_from_base(
+    tmp_path: Path,
+) -> None:
+    repo, _candidate, _hashes = _retained_terminal_failure_fixture(
+        tmp_path, required_outputs=True,
+    )
+    base_oid = _git_commit_fixture_baseline(repo)
+    _git_commit_canonical_drift(repo, "src/aiworkhub/task_store.py", amend=True)
+    head_blob = subprocess.run(
+        ["git", "cat-file", "blob", "HEAD:src/aiworkhub/task_store.py"],
+        cwd=repo, check=True, capture_output=True,
+    ).stdout
+    assert head_blob == (repo / "src/aiworkhub/task_store.py").read_bytes()
+    assert subprocess.run(
+        ["git", "merge-base", "--is-ancestor", base_oid, "HEAD"],
+        cwd=repo, capture_output=True,
+    ).returncode == 1
+    assert task_store.recover_blocked_rework(
+        repo,
+        "BLOCKED_RETAINED_EMPTY_OUTPUTS",
+        actor="coordinator",
+        feedback_reason="NeedFix: refuse committed drift when HEAD does not descend from base",
+    ) == (False, "retained_terminal_candidate_baseline_mismatch")
+
+
+def test_retained_candidate_committed_drift_refuses_canonical_change_after_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, _candidate, _hashes = _retained_terminal_failure_fixture(
+        tmp_path, required_outputs=True,
+    )
+    _git_commit_fixture_baseline(repo)
+    _git_commit_canonical_drift(repo, "src/aiworkhub/task_store.py")
+    real_probe = task_store._pre_lease_committed_drift_proof
+    proofs: list[dict[tuple[str, str], str]] = []
+
+    def probe_then_edit(*args, **kwargs):
+        proofs.append(real_probe(*args, **kwargs))
+        (repo / "src/aiworkhub/task_store.py").write_bytes(b"edited after the probe\n")
+        return proofs[-1]
+
+    monkeypatch.setattr(task_store, "_pre_lease_committed_drift_proof", probe_then_edit)
+    refusal = task_store.recover_blocked_rework(
+        repo,
+        "BLOCKED_RETAINED_EMPTY_OUTPUTS",
+        actor="coordinator",
+        feedback_reason="NeedFix: refuse canonical change between the probe and the lease",
+    )
+    assert [bool(proof) for proof in proofs] == [True]
+    assert refusal == (False, "retained_terminal_candidate_baseline_mismatch")
 
 
 def _setup_repo(tmp_path: Path) -> Path:
