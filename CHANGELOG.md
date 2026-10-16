@@ -6,6 +6,16 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.56] - 2026-10-16
+
+### Fixed
+
+- `reject_review` pins the predecessor's `terminal_substatus`, so a relaunch after a `validation_failed` attempt is no longer refused as `rework_no_delta` (NF-2026-01556).
+- `recover_blocked_rework` recovers a retained candidate across canonical drift that comes only from committed history descending from the attempt's base; uncommitted, assume-unchanged/skip-worktree and untracked re-creation drift still refuse (NF-2026-01558).
+- A CLI worker result that reports an unreachable provider API is classified as a transient failure instead of a candidate failure (NF-2026-01470).
+- Learning commits are accepted for archived cards that a manager accepted (NF-2026-01463).
+- `claude_callback_wait` NeedFix closure recorded via a proper `Resolves:` trailer (NF-2026-01547, fixed in 0.12.54).
+
 ## [0.12.55] - 2026-10-16
 
 ### Fixed

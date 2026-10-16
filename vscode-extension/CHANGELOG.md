@@ -1,5 +1,11 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.56 — 2026-10-16
+
+### Fixed
+
+- Bundled runtime 0.12.56: `reject_review` pins the predecessor's `terminal_substatus`, so a relaunch after `validation_failed` is no longer refused as `rework_no_delta` (NF-2026-01556); `recover_blocked_rework` recovers a retained candidate across committed canonical drift while uncommitted drift still refuses (NF-2026-01558); an unreachable provider API is classified as transient (NF-2026-01470); learning commits are accepted for archived manager-accepted cards (NF-2026-01463).
+
 ## 0.12.55 — 2026-10-16
 
 ### Fixed

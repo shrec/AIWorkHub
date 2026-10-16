@@ -62,6 +62,10 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.56
+
+- A rejected or blocked rework whose correct code was stranded (a false "no change" refusal after a failed validation, or a release bump landing in between) can now be relaunched or recovered; a provider API outage is treated as a temporary failure, not bad code.
+
 ## What's new in 0.12.55
 
 - GLM through VS Code LM is no longer rejected as a stale host while VS Code is open; OpenCode recovers its model list when a probe briefly returns nothing; a rework blocked only by an environment or provider failure can be relaunched with the same correct code, and a rework rebased onto newer canonical code no longer fails as "unchanged".
