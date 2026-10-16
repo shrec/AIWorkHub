@@ -13,6 +13,7 @@ rule) -- no test shares a canonical DB or daemon-registry key with another.
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import sqlite3
@@ -2721,3 +2722,409 @@ def test_terminated_on_procfs_host_reports_missing_pid_entry_as_gone(monkeypatch
 def test_procfs_available_matches_this_host():
     """The procfs probe agrees with the host it actually runs on."""
     assert _procfs_available() is os.path.isdir("/proc/self")
+
+
+# ---------------------------------------------------------------------------
+# 12. NF-2026-01565: the writer keeps ticking after a successful build. A build
+#     child that had answered -- exited, result record written -- while an
+#     outliving descendant held its output pipes parked the loop in an
+#     unbounded ``communicate()``: no later tick, every queued refresh job left
+#     queued, and the refresh reply blanked the committed generation.
+# ---------------------------------------------------------------------------
+
+
+_HELD_OUTPUT_REPORT = {
+    "files_seen": 3,
+    "files_changed": 1,
+    "files_removed": 0,
+    "build_revision": "held-output",
+    "finished_at": "2026-10-16T09:09:21+00:00",
+}
+
+
+def _answered() -> threading.Event:
+    event = threading.Event()
+    event.set()
+    return event
+
+
+class _AnsweredChildHoldingOutput:
+    """A build child that answers -- writes its result record and exits --
+    while an outliving descendant keeps the inherited output pipes open, so
+    ``communicate`` never reaches EOF."""
+
+    def __init__(self, pid: int, env: dict, answer: threading.Event, *, records: bool) -> None:
+        self.pid = pid
+        self.returncode: int | None = None
+        self.stdout = None
+        self.stderr = None
+        self._answer = answer
+        self._record = env[source_graph_daemon.BUILD_RESULT_ENV] if records else ""
+
+    def poll(self):
+        if self.returncode is None and self._answer.is_set():
+            if self._record:
+                Path(self._record).write_text(
+                    json.dumps({"kind": "success", "report": dict(_HELD_OUTPUT_REPORT)}),
+                    encoding="utf-8",
+                )
+            self.returncode = 0
+        return self.returncode
+
+    def communicate(self, timeout=None):
+        self.poll()
+        raise subprocess.TimeoutExpired("source-graph-build", timeout)
+
+    def wait(self, timeout=None):
+        if self.poll() is None:
+            raise subprocess.TimeoutExpired("source-graph-build", timeout)
+        return self.returncode
+
+    def terminate(self):
+        if self.returncode is None:
+            self.returncode = -15
+
+    def kill(self):
+        if self.returncode is None:
+            self.returncode = -9
+
+
+class _ElapsingRefreshEvent(threading.Event):
+    """The loop's refresh event: records every wait and lets the first
+    ``elapse`` waits run out at once, as if a refresh interval had passed."""
+
+    def __init__(self, *, elapse: int) -> None:
+        super().__init__()
+        self.timeouts: list[float | None] = []
+        self._elapse = elapse
+
+    def wait(self, timeout=None):
+        self.timeouts.append(timeout)
+        if len(self.timeouts) <= self._elapse:
+            return self.is_set()
+        return super().wait(timeout)
+
+
+def _held_output_daemon(tmp_path, monkeypatch, name, *, answers=(), records=True):
+    """A subprocess-mode daemon whose build children answer while holding
+    their output; ``answers`` gates the first spawns, later ones answer at once."""
+    root = _init_repo(tmp_path, name)
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    daemon._build_execution = source_graph_daemon.BUILD_EXECUTION_SUBPROCESS
+    spawned: list[_AnsweredChildHoldingOutput] = []
+
+    def spawn(_args, **kwargs):
+        index = len(spawned)
+        answer = answers[index] if index < len(answers) else _answered()
+        child = _AnsweredChildHoldingOutput(4100 + index, kwargs["env"], answer, records=records)
+        spawned.append(child)
+        return child
+
+    monkeypatch.setattr(source_graph_daemon.subprocess, "Popen", spawn)
+    monkeypatch.setattr(source_graph_daemon, "_cross_instance_identity_supported", lambda: False)
+    monkeypatch.setattr(source_graph_daemon, "_proc_identity", lambda _pid: None)
+    monkeypatch.setattr(
+        source_graph_daemon, "_publish_build_identity_if_unowned", lambda *_args: True
+    )
+    monkeypatch.setattr(source_graph_daemon, "_clear_build_identity_if_dead", lambda *_args: True)
+    monkeypatch.setattr(source_graph_daemon, "_BUILD_OUTPUT_DRAIN_SECONDS", 0.0)
+    monkeypatch.setattr(daemon, "_new_process_group_popen_kwargs", lambda: {})
+    monkeypatch.setattr(daemon, "_has_prior_build", lambda: True)
+    # Fake children only: no tree signal may ever reach a real process.
+    monkeypatch.setattr(
+        daemon,
+        "_signal_process_tree",
+        lambda process, _pgid, *, graceful: process.terminate() if graceful else process.kill(),
+    )
+    monkeypatch.setattr(
+        worker_ai_tools_mcp,
+        "source_graph_recommendation_roundtrip_gate",
+        lambda _context: {"ok": True, "status": "ready"},
+    )
+    monkeypatch.setattr(source_graph, "record_recommendation_roundtrip", lambda *_args: None)
+    return root, daemon, spawned
+
+
+def test_successful_build_with_held_output_schedules_the_next_tick(tmp_path, monkeypatch):
+    root, daemon, spawned = _held_output_daemon(tmp_path, monkeypatch, "held_output_ticks")
+    waits = _ElapsingRefreshEvent(elapse=2)
+    daemon._refresh_event = waits
+    daemon.start()
+    try:
+        deadline = time.monotonic() + 10
+        while len(waits.timeouts) < 3:
+            assert time.monotonic() < deadline, (
+                f"writer stopped ticking: spawns={len(spawned)} waits={waits.timeouts}"
+            )
+            time.sleep(0.01)
+        health = daemon.health()
+    finally:
+        daemon.stop()
+
+    # The initial build and two interval ticks each built successfully, and
+    # after every one the loop scheduled the next tick a refresh interval out.
+    assert len(spawned) == 3
+    assert waits.timeouts == [daemon.refresh_interval_seconds] * 3
+    assert health["last_success_at"]
+    assert health["build_revision"] == "held-output"
+    consumer = health["refresh_consumer"]
+    assert consumer["loop_phase"] == "waiting"
+    remaining = (
+        datetime.fromisoformat(consumer["next_tick_at"]) - datetime.now(timezone.utc)
+    ).total_seconds()
+    assert 0 < remaining <= daemon.refresh_interval_seconds
+    record_dir = source_graph_daemon._build_identity_path(root).parent
+    assert not list(record_dir.glob(".build-result.*"))
+
+
+def test_queued_refresh_is_consumed_by_the_active_writer_after_held_output_build(
+    tmp_path, monkeypatch,
+):
+    first_answer = threading.Event()
+    _root, daemon, spawned = _held_output_daemon(
+        tmp_path, monkeypatch, "held_output_queue", answers=(first_answer,)
+    )
+    daemon.start()
+    try:
+        deadline = time.monotonic() + 5
+        while daemon._build_process is None:
+            assert time.monotonic() < deadline, "initial build child never spawned"
+            time.sleep(0.01)
+        queued = daemon.request_refresh()
+        # The live writer is mid-build: the job waits behind that build, and
+        # the reply names its consumer instead of leaving it silently queued.
+        assert queued["ok"] is True
+        assert queued["reason"] == "refresh_queued"
+        assert queued["refresh_job"]["state"] == "queued"
+        consumer = queued["refresh_consumer"]
+        assert consumer["live"] is True
+        assert consumer["reason"] == "queued_behind_running_build"
+        assert consumer["owner_pid"] == os.getpid()
+        assert consumer["build_pid"] == spawned[0].pid
+
+        first_answer.set()  # the child answers and exits; its output stays held
+        deadline = time.monotonic() + 10
+        while True:
+            job = daemon.health()["refresh_job"] or {}
+            if job.get("job_id") == queued["job_id"] and job.get("state") == "succeeded":
+                break
+            assert time.monotonic() < deadline, f"queued refresh never consumed: {job}"
+            time.sleep(0.01)
+    finally:
+        daemon.stop()
+
+    assert job["started_at"]
+    assert job["error"] == ""
+    assert len(spawned) == 2
+
+
+def test_answered_child_without_result_record_fails_closed_without_waiting_on_output(
+    tmp_path, monkeypatch,
+):
+    _root, daemon, spawned = _held_output_daemon(
+        tmp_path, monkeypatch, "held_output_no_record", records=False
+    )
+    outcome: list[dict] = []
+    runner = threading.Thread(
+        target=lambda: outcome.append(daemon._run_build_subprocess(incremental=True)),
+        daemon=True,
+    )
+    runner.start()
+    runner.join(timeout=5)
+    if runner.is_alive():
+        daemon._stop_event.set()  # free the wait so the failure is reported, not hung
+        runner.join(timeout=5)
+        pytest.fail("the build wait never returned after its child exited")
+
+    # An exit without the child's own outcome is never mistaken for success.
+    assert outcome == [
+        {"kind": "error", "error": "index_subprocess:output_held_after_exit:exit_0"}
+    ]
+    assert len(spawned) == 1
+    assert daemon._build_process is None
+
+
+def test_build_once_child_records_its_outcome_for_the_parent(tmp_path, monkeypatch, capsys):
+    record = tmp_path / "build-result.json"
+    payload = {"kind": "success", "report": {"files_seen": 2, "build_revision": "child"}}
+    monkeypatch.setattr(
+        source_graph_daemon, "_build_once_payload", lambda *_args, **_kwargs: payload
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["source_graph_daemon", "--build-once", str(tmp_path), "--incremental"]
+    )
+    monkeypatch.setenv(source_graph_daemon.BUILD_RESULT_ENV, str(record))
+
+    assert source_graph_daemon._main() == 0
+
+    assert json.loads(record.read_text(encoding="utf-8")) == payload
+    assert json.loads(capsys.readouterr().out) == payload
+
+
+def test_refresh_reply_projects_the_committed_generation_like_health(
+    tmp_path, monkeypatch, cleanup_daemons,
+):
+    root = _init_repo(tmp_path, "refresh_projection")
+    (root / "projected.py").write_text("def projected():\n    return 1\n", encoding="utf-8")
+    # Committed by another builder: this process has built nothing yet.
+    report = source_graph.build_index(root, incremental=False)
+    cleanup_daemons.append(root)
+    monkeypatch.setenv("AIWORKHUB_REPO_ROOT", str(root))
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    build_started = threading.Event()
+    release_build = threading.Event()
+
+    def lease_held_elsewhere(repo_root, *, incremental=True, db_path=None):
+        build_started.set()
+        release_build.wait(timeout=10)
+        raise source_graph.SourceGraphBuildInProgressError("locked_by_other_process")
+
+    monkeypatch.setattr(source_graph, "build_index", lease_held_elsewhere)
+    daemon = source_graph_daemon.ensure_started(root)
+    try:
+        assert build_started.wait(timeout=5)
+        reply = core.source_graph_refresh_now()
+        health = core.source_graph_health()
+        local = daemon.health()
+    finally:
+        release_build.set()
+
+    assert reply["queued"] is True
+    assert local["last_success_at"] == ""
+    assert reply["last_success_at"] == report.finished_at
+    assert reply["last_success_at"] == health["last_success_at"]
+    assert reply["build_revision"] == report.build_revision == health["build_revision"]
+    assert reply["files_seen"] == report.files_seen == health["files_seen"]
+    assert reply["readable_generation"] is True
+
+
+def test_queued_refresh_without_a_live_writer_names_reason_and_owner_pid(
+    tmp_path, monkeypatch,
+):
+    root = _init_repo(tmp_path, "unconsumed_refresh")
+    build_started = threading.Event()
+    release_build = threading.Event()
+    builds: list[bool] = []
+
+    def held_build(repo_root, *, incremental=True, db_path=None):
+        builds.append(incremental)
+        build_started.set()
+        release_build.wait(timeout=10)
+        return source_graph.BuildReport(
+            repo_root=str(repo_root), db_path="fake.sqlite", incremental=incremental,
+            files_seen=1, files_changed=1, files_unchanged=0, files_removed=0,
+            entities_written=1, edges_written=0, errors=[],
+            build_revision="unconsumed", finished_at="2026-10-16T09:35:08+00:00",
+        )
+
+    monkeypatch.setattr(source_graph, "build_index", held_build)
+    monkeypatch.setattr(
+        worker_ai_tools_mcp,
+        "source_graph_recommendation_roundtrip_gate",
+        lambda _context: {"ok": True, "status": "ready"},
+    )
+    monkeypatch.setattr(source_graph, "record_recommendation_roundtrip", lambda *_args: None)
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    daemon.start()
+    thread = daemon._thread
+    try:
+        assert build_started.wait(timeout=5)
+        # A stop() that cannot join the busy loop leaves its thread alive, but
+        # that thread exits after this build instead of consuming jobs.
+        daemon.stop(timeout=0.05)
+        assert daemon.is_running()
+        reply = daemon.request_refresh()
+    finally:
+        release_build.set()
+
+    assert reply["queued"] is True
+    assert reply["ok"] is False
+    assert reply["triggered"] is False
+    assert reply["reason"] == "refresh_queued_without_live_writer"
+    assert reply["refreshable"] is False
+    consumer = reply["refresh_consumer"]
+    assert consumer["live"] is False
+    assert consumer["reason"] == "no_live_writer:daemon_stopping"
+    assert consumer["owner_pid"] == os.getpid()
+
+    assert thread is not None
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    health = daemon.health()
+    assert health["refresh_job"]["job_id"] == reply["job_id"]
+    assert health["refresh_job"]["state"] == "queued"
+    assert health["refresh_consumer"]["reason"] == "no_live_writer:daemon_thread_not_running"
+    assert len(builds) == 1
+
+    # The next writer of this daemon takes that job at its first wake-up,
+    # not a whole refresh interval later.
+    daemon.start()
+    try:
+        deadline = time.monotonic() + 5
+        while True:
+            job = daemon.health()["refresh_job"] or {}
+            if job.get("job_id") == reply["job_id"] and job.get("state") == "succeeded":
+                break
+            assert time.monotonic() < deadline, f"restarted writer left the job queued: {job}"
+            time.sleep(0.01)
+        assert len(builds) == 3
+    finally:
+        daemon.stop()
+
+
+def test_failed_loop_tick_is_contained_and_the_writer_keeps_ticking(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path, "contained_tick")
+
+    def quick_build(repo_root, *, incremental=True, db_path=None):
+        return source_graph.BuildReport(
+            repo_root=str(repo_root), db_path="fake.sqlite", incremental=incremental,
+            files_seen=1, files_changed=1, files_unchanged=0, files_removed=0,
+            entities_written=1, edges_written=0, errors=[],
+            build_revision="contained", finished_at="2026-10-16T09:06:22+00:00",
+        )
+
+    monkeypatch.setattr(source_graph, "build_index", quick_build)
+    monkeypatch.setattr(
+        worker_ai_tools_mcp,
+        "source_graph_recommendation_roundtrip_gate",
+        lambda _context: {"ok": True, "status": "ready"},
+    )
+    monkeypatch.setattr(source_graph, "record_recommendation_roundtrip", lambda *_args: None)
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    gate_calls: list[int] = []
+
+    def faulting_gate():
+        gate_calls.append(len(gate_calls))
+        if len(gate_calls) == 1:
+            return None  # the initial tick builds normally
+        raise RuntimeError("tick fault")
+
+    monkeypatch.setattr(daemon, "_recovery_gate", faulting_gate)
+    waits = _ElapsingRefreshEvent(elapse=3)
+    daemon._refresh_event = waits
+    daemon.start()
+    try:
+        deadline = time.monotonic() + 5
+        while len(waits.timeouts) < 4:
+            assert time.monotonic() < deadline, (
+                f"writer thread ended at a failed tick: waits={waits.timeouts}"
+            )
+            time.sleep(0.01)
+        assert daemon.is_running()
+        health = daemon.health()
+        assert health["status"] == source_graph_daemon.STATUS_DEGRADED
+        assert health["last_error"] == "daemon_tick:RuntimeError:tick fault"
+        # A job queued now is finished by the next tick, never left queued.
+        queued = daemon.request_refresh()
+        deadline = time.monotonic() + 5
+        while True:
+            job = daemon.health()["refresh_job"] or {}
+            if job.get("job_id") == queued["job_id"] and job.get("state") == "failed":
+                break
+            assert time.monotonic() < deadline, f"queued job left unfinished: {job}"
+            time.sleep(0.01)
+    finally:
+        daemon.stop()
+
+    assert job["error"] == "daemon_tick:RuntimeError:tick fault"
+    assert waits.timeouts[:4] == [daemon.refresh_interval_seconds] * 4

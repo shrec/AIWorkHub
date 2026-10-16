@@ -41,7 +41,7 @@ import threading
 import time
 import uuid
 from contextlib import ExitStack, contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +56,7 @@ BUILD_EXECUTION_ENV = "AIWORKHUB_SOURCE_GRAPH_BUILD_EXECUTION"
 BUILD_EXECUTION_SUBPROCESS = "subprocess"
 BUILD_EXECUTION_THREAD = "thread"
 BUILD_OWNER_ENV = "AIWORKHUB_SOURCE_GRAPH_BUILD_OWNER"
+BUILD_RESULT_ENV = "AIWORKHUB_SOURCE_GRAPH_BUILD_RESULT"
 BUILD_IDENTITY_FILE = "build-process.json"
 BUILD_IDENTITY_LOCK_FILE = "build-process.lock"
 
@@ -82,6 +83,17 @@ _RECOVERY_PHASE_COMMIT = "commit"
 _RECOVERY_RETRY_BASE_SECONDS = 2.0
 _RECOVERY_RETRY_MAX_SECONDS = 60.0
 _RECOVERY_RETRY_JOB_ATTEMPTS = 6
+
+# A build child that exited or wrote its result record has answered. Output
+# pipes an outliving descendant still holds are drained for at most this long
+# afterwards, never waited on while the loop -- and every refresh job queued
+# behind it -- stalls (NF-2026-01565). A child still working is never timed out.
+_BUILD_OUTPUT_DRAIN_SECONDS = 5.0
+
+# Writer-loop phases that explain who consumes a queued refresh job.
+_LOOP_PHASE_WAITING = "waiting"
+_LOOP_PHASE_BUILDING = "building"
+_LOOP_PHASE_STOPPED = "stopped"
 
 
 def _is_transient_recovery(result: dict[str, Any]) -> bool:
@@ -124,6 +136,31 @@ def _registry_key(repo_root: Path | str) -> str:
 
 def _build_identity_path(repo_root: Path | str) -> Path:
     return source_graph.resolve_db_path(Path(repo_root).resolve()).parent / BUILD_IDENTITY_FILE
+
+
+def _build_result_path(repo_root: Path | str, owner_token: str) -> Path:
+    """Private per-build result record beside the durable build identity."""
+    return _build_identity_path(repo_root).with_name(f".build-result.{owner_token}.json")
+
+
+def _discard_build_result(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _parse_build_outcome(text: str | None) -> dict[str, Any]:
+    """Validate one build child's JSON outcome, from stdout or its record."""
+    try:
+        payload = json.loads(text if text is not None else "")
+    except json.JSONDecodeError:
+        return {"kind": "error", "error": "index_subprocess:invalid_result"}
+    if not isinstance(payload, dict) or payload.get("kind") not in {
+        "success", "standby", "error"
+    }:
+        return {"kind": "error", "error": "index_subprocess:invalid_contract"}
+    return payload
 
 
 def _windows_taskkill_path() -> str | None:
@@ -776,6 +813,11 @@ class SourceGraphDaemon:
         self._pending_refresh_job: dict[str, Any] | None = None
         self._active_refresh_job: dict[str, Any] | None = None
         self._last_refresh_job: dict[str, Any] | None = None
+        # What the loop thread is doing and when it next ticks, so a queued
+        # refresh job always names who will consume it (NF-2026-01565).
+        self._loop_phase: str = ""
+        self._loop_phase_since: str = ""
+        self._next_tick_at: str = ""
 
     def _refresh_job_path(self) -> Path:
         return source_graph.resolve_db_path(self.repo_root).parent / "refresh-job.json"
@@ -1466,6 +1508,9 @@ class SourceGraphDaemon:
         )
         owner_token = uuid.uuid4().hex
         child_env[BUILD_OWNER_ENV] = owner_token
+        result_path = _build_result_path(self.repo_root, owner_token)
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        child_env[BUILD_RESULT_ENV] = str(result_path)
         launch_command = command
         popen_kwargs = self._new_process_group_popen_kwargs()
         gate_read: int | None = None
@@ -1544,6 +1589,7 @@ class SourceGraphDaemon:
                     self._build_process = None
                     self._build_pgid = None
                     self._build_owner_token = None
+            _discard_build_result(result_path)
             return {"kind": "error", "error": f"index_subprocess:identity_persist:{exc}"[:500]}
         if not published_identity:
             if gate_write is not None:
@@ -1555,6 +1601,7 @@ class SourceGraphDaemon:
                     self._build_process = None
                     self._build_pgid = None
                 self._build_owner_token = None
+            _discard_build_result(result_path)
             retained = _read_build_identity(self.repo_root)
             # A creation-stamped Windows writer may be observed as standby;
             # termination still requires the owning Popen, never this evidence.
@@ -1594,6 +1641,7 @@ class SourceGraphDaemon:
             finally:
                 os.close(gate_write)
         try:
+            responded_at: float | None = None
             while True:
                 try:
                     stdout, stderr = process.communicate(timeout=0.25)
@@ -1607,18 +1655,18 @@ class SourceGraphDaemon:
                         self._terminate_build_process()
                         self._drain_after_stop(process, pgid)
                         return {"kind": "stopped"}
+                    if responded_at is None:
+                        # A working child is never timed out: only its exit or
+                        # its result record starts the bounded output drain.
+                        if process.poll() is None and not result_path.exists():
+                            continue
+                        responded_at = time.monotonic()
+                    if time.monotonic() - responded_at >= _BUILD_OUTPUT_DRAIN_SECONDS:
+                        return self._collect_held_build_outcome(process, result_path)
             if process.returncode != 0:
                 detail = (stderr or stdout or f"exit_{process.returncode}").strip()
                 return {"kind": "error", "error": f"index_subprocess:{detail}"[:500]}
-            try:
-                payload = json.loads(stdout)
-            except (TypeError, json.JSONDecodeError):
-                return {"kind": "error", "error": "index_subprocess:invalid_result"}
-            if not isinstance(payload, dict) or payload.get("kind") not in {
-                "success", "standby", "error"
-            }:
-                return {"kind": "error", "error": "index_subprocess:invalid_contract"}
-            return payload
+            return _parse_build_outcome(stdout)
         finally:
             if published_identity:
                 _clear_build_identity_if_dead(self.repo_root, owner_token)
@@ -1626,6 +1674,36 @@ class SourceGraphDaemon:
                 if self._build_process is process:
                     self._build_process = None
                     self._build_pgid = None
+            _discard_build_result(result_path)
+
+    def _collect_held_build_outcome(
+        self, process: subprocess.Popen[str], result_path: Path
+    ) -> dict[str, Any]:
+        """Finish a build whose child answered but never closed its output.
+
+        NF-2026-01565: a child that exited or wrote its result record has
+        answered, yet an outliving descendant -- or a teardown that never
+        ends -- can hold its stdout/stderr open for good. Waiting on that EOF
+        held the daemon loop, and every refresh job queued behind it,
+        indefinitely. Reap the owned tree with ``stop()``'s bounded waits, then
+        take the outcome from the result record instead of the pipes.
+        """
+        self._terminate_build_process()
+        try:
+            process.communicate(timeout=0.25)
+        except subprocess.TimeoutExpired:
+            # A holder outside the owned tree keeps the pipes open. Closing
+            # them here could block behind the reader awaiting their EOF, so
+            # they stay with that holder -- the daemon loop does not.
+            pass
+        try:
+            record = result_path.read_text(encoding="utf-8")
+        except OSError:
+            return {
+                "kind": "error",
+                "error": f"index_subprocess:output_held_after_exit:exit_{process.returncode}",
+            }
+        return _parse_build_outcome(record)
 
     def _execute_build(self, *, incremental: bool) -> dict[str, Any]:
         if self._build_execution == BUILD_EXECUTION_THREAD:
@@ -1884,91 +1962,136 @@ class SourceGraphDaemon:
                     self._pending_refresh_job = None
             self._finish_refresh_job(queued, state="failed", error=error)
 
+    def _enter_loop_phase(self, phase: str, wait_seconds: float | None = None) -> None:
+        """Publish what the loop thread does now and, when waiting, its next tick."""
+        now = datetime.now(timezone.utc)
+        with self._state_lock:
+            self._loop_phase = phase
+            self._loop_phase_since = now.isoformat()
+            self._next_tick_at = (
+                (now + timedelta(seconds=wait_seconds)).isoformat()
+                if wait_seconds is not None
+                else ""
+            )
+
+    def _record_tick_failure(
+        self, exc: Exception, refresh_job: dict[str, Any] | None
+    ) -> None:
+        """Contain one failed loop tick: degraded, named, its job finished.
+
+        An exception escaping ``_loop`` used to end the writer thread, after
+        which nothing ticked and no queued refresh job was ever consumed
+        (NF-2026-01565). The loop records the cause and keeps its interval.
+        """
+        error = _recovery_error_text("daemon_tick", exc, limit=500)
+        with self._state_lock:
+            self._status = STATUS_DEGRADED
+            self._last_error = error
+            self._last_run_at = _utcnow()
+        if refresh_job is not None:
+            self._finish_refresh_job(refresh_job, state="failed", error=error)
+
     def _loop(self) -> None:
         # Power-loss recovery: writable single-flight recovery must precede
         # any readonly probe when a non-empty journal/WAL exists.
         wait_timeout = self.refresh_interval_seconds
         transient_attempts = 0
-        result = self._recovery_gate()
-        if result is not None:
-            # Recovery failed or is still in-progress under another owner.
-            # Retain diagnostics and last-known-good generation; retry
-            # recovery on the next cycle before any readonly probe.
-            if _is_transient_recovery(result):
-                # Contention: retry on a short bounded backoff, not degraded.
-                transient_attempts = 1
-                wait_timeout = _recovery_retry_timeout(
-                    self.refresh_interval_seconds, transient_attempts
-                )
+        try:
+            result = self._recovery_gate()
+            if result is not None:
+                # Recovery failed or is still in-progress under another owner.
+                # Retain diagnostics and last-known-good generation; retry
+                # recovery on the next cycle before any readonly probe.
+                if _is_transient_recovery(result):
+                    # Contention: retry on a short bounded backoff, not degraded.
+                    transient_attempts = 1
+                    wait_timeout = _recovery_retry_timeout(
+                        self.refresh_interval_seconds, transient_attempts
+                    )
+                else:
+                    # Explicit failure: ensure degraded.
+                    with self._state_lock:
+                        if self._status == STATUS_RECOVERY:
+                            self._status = STATUS_DEGRADED
+                        if not self._recovery_error:
+                            self._recovery_error = (
+                                result.get("error") or "recovery_failed"
+                            )[:300]
+                            self._recovery_error_retryable = False
+                # Signal lifecycle completion so callers do not block
+                # indefinitely.  build_count stays at zero (health is degraded
+                # on explicit failure); callers MUST inspect health after the
+                # wait.
+                self._build_completed.set()
             else:
-                # Explicit failure: ensure degraded.
-                with self._state_lock:
-                    if self._status == STATUS_RECOVERY:
-                        self._status = STATUS_DEGRADED
-                    if not self._recovery_error:
-                        self._recovery_error = (
-                            result.get("error") or "recovery_failed"
-                        )[:300]
-                        self._recovery_error_retryable = False
-            # Signal lifecycle completion so callers do not block
-            # indefinitely.  build_count stays at zero (health is degraded on
-            # explicit failure); callers MUST inspect health after the wait.
+                self._run_one_build()
+        except Exception as exc:  # noqa: BLE001 -- a failed tick must never end the writer
+            self._record_tick_failure(exc, None)
             self._build_completed.set()
-        else:
-            self._run_one_build()
         held_job: dict[str, Any] | None = None
         job_attempts = 0
         job_attempts_id = ""
         while not self._stop_event.is_set():
+            # Every finished tick -- a successful build included -- schedules
+            # the next one and publishes what a queued job waits on.
+            self._enter_loop_phase(_LOOP_PHASE_WAITING, wait_timeout)
             self._refresh_event.wait(wait_timeout)
             self._refresh_event.clear()
             if self._stop_event.is_set():
                 break
-            # A job kept running across transient recovery ticks is reused.
-            refresh_job = held_job if held_job is not None else self._begin_refresh_job()
-            held_job = None
-            # Retry recovery before any probe when journal/WAL persists.
-            result = self._recovery_gate()
-            if result is not None:
-                error = str(result.get("error") or "recovery_failed")
-                if _is_transient_recovery(result):
-                    transient_attempts += 1
-                    wait_timeout = _recovery_retry_timeout(
-                        self.refresh_interval_seconds, transient_attempts
-                    )
+            self._enter_loop_phase(_LOOP_PHASE_BUILDING)
+            refresh_job: dict[str, Any] | None = None
+            try:
+                # A job kept running across transient recovery ticks is reused.
+                refresh_job = held_job if held_job is not None else self._begin_refresh_job()
+                held_job = None
+                # Retry recovery before any probe when journal/WAL persists.
+                result = self._recovery_gate()
+                if result is not None:
+                    error = str(result.get("error") or "recovery_failed")
+                    if _is_transient_recovery(result):
+                        transient_attempts += 1
+                        wait_timeout = _recovery_retry_timeout(
+                            self.refresh_interval_seconds, transient_attempts
+                        )
+                        if refresh_job is not None:
+                            # Job budget is per job_id; backoff stays per episode.
+                            if refresh_job.get("job_id") != job_attempts_id:
+                                job_attempts_id = str(refresh_job.get("job_id") or "")
+                                job_attempts = 0
+                            job_attempts += 1
+                            if job_attempts >= _RECOVERY_RETRY_JOB_ATTEMPTS:
+                                self._finish_refresh_job(
+                                    refresh_job, state="failed", error=error
+                                )
+                            else:
+                                held_job = refresh_job
+                        continue
+                    transient_attempts = 0
+                    wait_timeout = self.refresh_interval_seconds
                     if refresh_job is not None:
-                        # Job budget is per job_id; backoff stays per episode.
-                        if refresh_job.get("job_id") != job_attempts_id:
-                            job_attempts_id = str(refresh_job.get("job_id") or "")
-                            job_attempts = 0
-                        job_attempts += 1
-                        if job_attempts >= _RECOVERY_RETRY_JOB_ATTEMPTS:
-                            self._finish_refresh_job(
-                                refresh_job, state="failed", error=error
-                            )
-                        else:
-                            held_job = refresh_job
+                        self._finish_refresh_job(refresh_job, state="failed", error=error)
                     continue
                 transient_attempts = 0
                 wait_timeout = self.refresh_interval_seconds
-                if refresh_job is not None:
-                    self._finish_refresh_job(refresh_job, state="failed", error=error)
-                continue
-            transient_attempts = 0
-            wait_timeout = self.refresh_interval_seconds
-            triggered = self._run_one_build()
-            if refresh_job is None:
-                continue
-            if not triggered:
-                self._finish_refresh_job(
-                    refresh_job, state="failed", error="build_in_progress"
-                )
-                continue
-            with self._state_lock:
-                status = self._status
-                error = self._last_error
-            state, terminal_error = self._refresh_terminal_state(status, error)
-            self._finish_refresh_job(refresh_job, state=state, error=terminal_error)
+                triggered = self._run_one_build()
+                if refresh_job is None:
+                    continue
+                if not triggered:
+                    self._finish_refresh_job(
+                        refresh_job, state="failed", error="build_in_progress"
+                    )
+                    continue
+                with self._state_lock:
+                    status = self._status
+                    error = self._last_error
+                state, terminal_error = self._refresh_terminal_state(status, error)
+                self._finish_refresh_job(refresh_job, state=state, error=terminal_error)
+            except Exception as exc:  # noqa: BLE001 -- a failed tick must never end the writer
+                held_job = None
+                self._record_tick_failure(exc, refresh_job)
+                transient_attempts = 0
+                wait_timeout = self.refresh_interval_seconds
 
     def start(self) -> None:
         """Idempotent: a second call while already running is a no-op.
@@ -1987,6 +2110,14 @@ class SourceGraphDaemon:
             # while the scheduler has accepted a new indexing lifecycle.
             self._status = STATUS_INDEXING
             self._last_error = ""
+            # The first tick (recovery gate, then the initial build) runs at once.
+            self._loop_phase = _LOOP_PHASE_BUILDING
+            self._loop_phase_since = self._started_at
+            self._next_tick_at = ""
+            if self._pending_refresh_job is not None:
+                # A job queued before this lifecycle is taken at the loop's
+                # first wake-up, not after a whole interval (NF-2026-01565).
+                self._refresh_event.set()
             thread = threading.Thread(
                 target=self._loop,
                 name=f"aiworkhub-source-graph-daemon:{self.repo_root.name}",
@@ -2059,7 +2190,7 @@ class SourceGraphDaemon:
                         "error": persist_error,
                     }
                 return {
-                    **self.health(),
+                    **self._projected_health(),
                     "ok": False,
                     "triggered": False,
                     "job_id": job["job_id"],
@@ -2083,7 +2214,7 @@ class SourceGraphDaemon:
             if transient:
                 self._refresh_event.set()
             return {
-                **self.health(),
+                **self._projected_health(),
                 "ok": False,
                 "triggered": False,
                 "reason": "recovery_pending",
@@ -2095,7 +2226,7 @@ class SourceGraphDaemon:
                 self._finish_refresh_job(
                     active_job, state="failed", error="build_in_progress"
                 )
-            health = self.health()
+            health = self._projected_health()
             return {**health, "ok": True, "triggered": False, "reason": "build_in_progress"}
         if active_job is not None:
             with self._state_lock:
@@ -2103,7 +2234,7 @@ class SourceGraphDaemon:
                 error = self._last_error
             state, terminal_error = self._refresh_terminal_state(status, error)
             self._finish_refresh_job(active_job, state=state, error=terminal_error)
-        return {**self.health(), "triggered": True}
+        return {**self._projected_health(), "triggered": True}
 
     def request_refresh(self) -> dict[str, Any]:
         """Queue an immediate refresh without running indexing on the caller.
@@ -2129,7 +2260,7 @@ class SourceGraphDaemon:
                         "error": persist_error,
                     }
                 return {
-                    **self.health(),
+                    **self._projected_health(),
                     "ok": False,
                     "triggered": False,
                     "queued": False,
@@ -2139,16 +2270,19 @@ class SourceGraphDaemon:
                     "reason": "refresh_job_persist_failed",
                 }
         self._refresh_event.set()
-        health = self.health()
+        health = self._projected_health()
+        # A job no live writer will consume is refused by name, its owner pid
+        # in ``refresh_consumer``, never reported as accepted (NF-2026-01565).
+        live = bool((health.get("refresh_consumer") or {}).get("live"))
         return {
             **health,
-            "ok": True,
-            "triggered": True,
+            "ok": live,
+            "triggered": live,
             "queued": True,
             "coalesced": coalesced,
             "job_id": job["job_id"],
             "refresh_job": job,
-            "reason": "refresh_queued",
+            "reason": "refresh_queued" if live else "refresh_queued_without_live_writer",
         }
 
     def wait_for_first_build(self, *, timeout: float = 10.0) -> bool:
@@ -2161,6 +2295,44 @@ class SourceGraphDaemon:
         """
 
         return self._build_completed.wait(timeout=max(0.0, float(timeout)))
+
+    def _refresh_consumer_locked(self, running: bool, job_state: str) -> dict[str, Any]:
+        """Describe the writer loop that consumes this daemon's refresh jobs.
+
+        Caller holds ``_state_lock``. A queued job always names why it is
+        still queued -- behind the build in progress, or until the live loop
+        wakes -- or that no live writer of ``owner_pid`` will take it, instead
+        of staying queued silently (NF-2026-01565).
+        """
+        live = running and not self._stop_event.is_set()
+        reason = ""
+        if job_state == "queued":
+            if not running:
+                reason = "no_live_writer:daemon_thread_not_running"
+            elif not live:
+                reason = "no_live_writer:daemon_stopping"
+            elif self._loop_phase == _LOOP_PHASE_BUILDING:
+                reason = "queued_behind_running_build"
+            else:
+                reason = "queued_until_loop_wakes"
+        return {
+            "owner_pid": os.getpid(),
+            "live": live,
+            "reason": reason,
+            "loop_phase": self._loop_phase if running else _LOOP_PHASE_STOPPED,
+            "loop_phase_since": self._loop_phase_since,
+            "next_tick_at": self._next_tick_at if live else "",
+            "build_pid": getattr(self._build_process, "pid", None),
+        }
+
+    def _projected_health(self) -> dict[str, Any]:
+        """``health()`` as ``daemon_health`` projects it, for refresh replies."""
+        return _project_canonical_generation(
+            self.health(),
+            self,
+            self.repo_root,
+            registered=get_daemon(self.repo_root) is self,
+        )
 
     def health(self) -> dict[str, Any]:
         with self._state_lock:
@@ -2208,8 +2380,11 @@ class SourceGraphDaemon:
                 or self._last_refresh_job
                 or {}
             )
+            consumer = self._refresh_consumer_locked(
+                running, str(refresh_job.get("state") or "")
+            )
             refreshable = bool(
-                running
+                consumer["live"]
                 and reported_status
                 not in {STATUS_STOPPED, STATUS_DEGRADED, STATUS_STALE, STATUS_RECOVERY}
                 and self._last_error != "build_start_fenced"
@@ -2256,6 +2431,7 @@ class SourceGraphDaemon:
                 "last_known_good_generation": lkg,
                 "refresh_job_id": str(refresh_job.get("job_id") or ""),
                 "refresh_job": refresh_job or None,
+                "refresh_consumer": consumer,
             }
 
 
@@ -2407,6 +2583,22 @@ def daemon_health(repo_root: Path | str) -> dict[str, Any]:
             )
     else:
         out = daemon.health()
+    return _project_canonical_generation(out, daemon, repo_root, registered=registered)
+
+
+def _project_canonical_generation(
+    out: dict[str, Any],
+    daemon: SourceGraphDaemon | None,
+    repo_root: Path | str,
+    *,
+    registered: bool,
+) -> dict[str, Any]:
+    """Reconcile one process health payload with the canonical generation.
+
+    ``daemon_health`` and every refresh reply share this projection, so a
+    refresh reply can never blank a committed generation that health reports
+    merely because this process did not build it (NF-2026-01565).
+    """
     # Writable single-flight recovery MUST precede every readonly probe
     # when the daemon is actively recovering or a non-empty journal/WAL
     # sidecar still exists.  During recovery, return the bounded process
@@ -2415,7 +2607,7 @@ def daemon_health(repo_root: Path | str) -> dict[str, Any]:
     if daemon is not None and (
         out.get("status") == STATUS_RECOVERY or daemon._has_pending_journal()
     ):
-        out["registered"] = True
+        out["registered"] = registered
         # Corruption is recorded in a sidecar, so reporting it needs no
         # database connection and stays available in this branch too.
         _apply_index_integrity(out, repo_root)
@@ -2558,6 +2750,14 @@ def _main() -> int:
     payload = _build_once_payload(
         Path(sys.argv[2]), incremental=sys.argv[3] == "--incremental"
     )
+    result_path = os.environ.get(BUILD_RESULT_ENV, "")
+    if result_path:
+        # Recorded before stdout: the parent reads this record when an
+        # outliving descendant keeps the output pipes open (NF-2026-01565).
+        try:
+            _replace_build_identity_file(Path(result_path), payload)
+        except OSError as exc:
+            sys.stderr.write(f"build_result_record:{type(exc).__name__}:{exc}\n")
     sys.stdout.write(json.dumps(payload, sort_keys=True, separators=(",", ":")))
     sys.stdout.write("\n")
     return 0
