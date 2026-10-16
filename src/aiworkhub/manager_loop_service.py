@@ -94,6 +94,7 @@ class _Entry:
     queue_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
     send_queue: collections.deque["_QueuedSend"] = dataclasses.field(default_factory=collections.deque)
     turn_running: bool = False
+    running_turn: tuple[str, int] | None = None
     thread: threading.Thread | None = None
     last_turn: dict[str, Any] | None = None
     wake: manager_loop_wake.WakeConsumer | None = None
@@ -367,6 +368,9 @@ def _run_turn(
 
     session = entry.orchestrator.session
     turn = session.turn_count + 1 if session is not None else 0
+    if session is not None:
+        with entry.queue_lock:
+            entry.running_turn = (session.session_id, turn)
     try:
         raw = action(entry.orchestrator)
     except Exception as exc:  # noqa: BLE001 - a dead thread must still record the turn's outcome
@@ -431,6 +435,8 @@ def _dispatch_turn(
                 # lock, so no wake member slips in between; only an empty queue
                 # frees the lock.
                 with entry.queue_lock:
+                    # A stop armed for this turn dies with it, never reaching the next one.
+                    entry.orchestrator.disarm_stop()
                     following = entry.send_queue.popleft() if entry.send_queue else None
                     if following is None:
                         entry.turn_running = False
@@ -468,6 +474,7 @@ def _dispatch_turn(
     entry.thread = thread
     with entry.queue_lock:
         entry.turn_running = True
+        entry.running_turn = (session_id, turn)
     thread.start()
     return {"ok": True, "session_id": session_id, "turn": turn, "state": "running"}
 
@@ -835,7 +842,13 @@ def events(
 ) -> dict[str, Any]:
     """Events for ``session_id`` with ``seq`` greater than ``after_seq``, bounded to ``limit``.
 
-    Lets a caller poll a running session incrementally.
+    Lets a caller poll a running session incrementally. ``first_seq`` and
+    ``last_seq`` bound the whole log (0 when it holds none). A reset is
+    ``after_seq < first_seq - 1``: records the cursor wanted are gone. ``gap``
+    says the page starts after records that were not returned (a reset, or a
+    cursor so far behind that the store's tail read skipped records past it).
+    ``has_more`` says events past the returned page remain; ``session_not_found``
+    marks an id no record or log exists for.
     """
 
     entry, err = _entry_or_error(repo)
@@ -843,14 +856,29 @@ def events(
         return err
     floor = int(after_seq)
     bound = max(0, int(limit))
-    try:
-        # NF-2026-01233: the store reads only the tail past ``floor``, not the whole log.
-        filtered = entry.orchestrator.store.events(session_id, after_seq=floor)[:bound]
-    except ManagerLoopError as exc:
-        return _error(exc)
+    store = entry.orchestrator.store
+    # The partial is read before the log: the writer logs the final assistant event and
+    # then clears the partial, so this order sees the event, the partial, or both.
     partial = entry.orchestrator.partial
     mine = partial if partial and partial.get("session_id") == session_id else None
-    return {"ok": True, "events": filtered, "partial": mine}
+    try:
+        # NF-2026-01233: the store reads only the tail past ``floor``, not the whole log.
+        filtered = store.events(session_id, after_seq=floor)[:bound]
+        first_seq, last_seq = store.seq_range(session_id)
+        found = bool(last_seq) or store.has_session(session_id)
+    except ManagerLoopError as exc:
+        return _error(exc)
+    reached = int(filtered[-1]["seq"]) if filtered else floor
+    return {
+        "ok": True,
+        "events": filtered,
+        "partial": mine,
+        "first_seq": first_seq,
+        "last_seq": last_seq,
+        "has_more": last_seq > reached,
+        "gap": bool(filtered) and int(filtered[0]["seq"]) > max(floor, first_seq - 1) + 1,
+        "session_not_found": not found,
+    }
 
 
 def close(repo: str | Path) -> dict[str, Any]:
@@ -881,9 +909,14 @@ def stop(repo: str | Path) -> dict[str, Any]:
     """End a running turn's backend now, without waiting for it; a no-op while idle.
 
     The queued owner sends waiting behind the running turn are dropped and
-    counted (``dropped_queued``); the wake consumer is retired and the entry
-    stays suspended until ``start``, ``send`` or ``continue_session`` clears
-    it, so a callback cannot restart the turn that was just stopped.
+    counted (``dropped_queued``) and logged as one ``queue_dropped`` event on the
+    turn that was running; the wake consumer is retired and the entry stays
+    suspended until ``start``, ``send`` or ``continue_session`` clears it, so a
+    callback cannot restart the turn that was just stopped. ``stopped`` is true
+    when the turn held the orchestrator's slot and its backend was ended. A stop
+    that lands before the turn has taken the slot is armed instead (``armed``,
+    ``stopped`` false): that turn ends as ``turn_stopped`` when its exchange
+    begins, which is the outcome to read from the event log.
     """
 
     entry, err = _entry_or_error(repo)
@@ -891,18 +924,25 @@ def stop(repo: str | Path) -> dict[str, Any]:
         return err
     with entry.queue_lock:
         if not entry.turn_running:
-            return {"ok": True, "stopped": False, "dropped_queued": 0}
+            return {"ok": True, "stopped": False, "armed": False, "dropped_queued": 0}
         dropped = len(entry.send_queue)
         entry.send_queue.clear()
+        entry.orchestrator.arm_stop()
+        running = entry.running_turn
     entry.suspended = True
     _stop_wake(entry)
     try:
-        stopped = entry.orchestrator.interrupt()
+        if running is not None:
+            try:
+                entry.orchestrator.record_queue_dropped(running[0], running[1], dropped)
+            except Exception:  # noqa: BLE001 - display-only event; its failed write must not fail a completed stop
+                pass
+        interrupted = entry.orchestrator.interrupt()
     except ManagerLoopError as exc:
         return _error(exc)
     except Exception as exc:  # noqa: BLE001 - stop must never cross the MCP boundary
         return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
-    return {"ok": True, "stopped": stopped, "dropped_queued": dropped}
+    return {"ok": True, "stopped": interrupted, "armed": not interrupted, "dropped_queued": dropped}
 
 
 def wait_for_idle(repo: str | Path, timeout: float | None = None) -> bool:

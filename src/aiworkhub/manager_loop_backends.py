@@ -58,7 +58,7 @@ from types import MappingProxyType
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from . import cli_model_discovery, context_capture, platform_io, runtime_adapters, workforce_catalog
-from .manager_loop import ManagerLoopError, keep_tail
+from .manager_loop import TURN_TERMINAL_TYPES, ManagerLoopError, keep_tail
 
 MANAGER_BACKEND_IDS: tuple[str, ...] = ("claude_cli", "codex_cli", "opencode_cli")
 # The worker lane's own launch ceiling, reused as the manager turn default: a
@@ -877,7 +877,8 @@ class CliManagerBackend:
         watchdog = threading.Timer(self.timeout_seconds, cut_off)
         watchdog.start()
         context = TurnContext()
-        saw_error = False
+        ended = False
+        held: dict[str, Any] | None = None
         streamed = False
         try:
             for raw in process.stdout or ():
@@ -887,12 +888,18 @@ class CliManagerBackend:
                 self._conversation_id = self._conversation_id or conversation_id_of(event)
                 _maybe_record_claude_resolution(self.backend_id, self.model, self.repo, event)
                 for translated in translate(self.backend_id, event, context):
-                    if translated["type"] == "error":
-                        # NF-2026-01232: one failed turn is one error event; the
-                        # provider's first report (Codex: error, then turn.failed) wins.
-                        if saw_error:
+                    if translated["type"] in TURN_TERMINAL_TYPES:
+                        # NF-2026-01232: one turn is one terminal event; the provider's
+                        # first report (Codex: error, then turn.failed) wins.
+                        if ended:
                             continue
-                        saw_error = True
+                        ended = True
+                        streamed = True
+                        if translated["type"] == "turn_end":
+                            # A clean end is only final once the process exits clean: a
+                            # non-zero exit or a timeout after it replaces it, never follows it.
+                            held = translated
+                            continue
                     streamed = True
                     yield translated
         finally:
@@ -902,7 +909,7 @@ class CliManagerBackend:
             with self._slot:
                 if self._process is process:
                     self._process = None
-        if saw_error:
+        if ended and held is None:
             return
         if (
             code != 0 and not streamed and not expired.is_set()
@@ -926,8 +933,11 @@ class CliManagerBackend:
                 str(outcome.get("outcome") or "worker_failed"),
                 f"{reason}: {said[-room:]}" if said and room > 0 else reason,
             )
+        elif held is not None:
+            yield held
         else:
-            yield from flush(self.backend_id, context)
+            # A clean exit that never reported its end still closes the turn once.
+            yield from flush(self.backend_id, context) or [_turn_end(None)]
 
 
 # NF-2026-01454: one process-wide cache of the successful ``opencode models``

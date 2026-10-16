@@ -558,6 +558,76 @@ def test_a_turn_timeout_kills_the_process_and_reports_exactly_one_error(tmp_path
     cli.close()
 
 
+_TERMINAL_KINDS = {"turn_end", "error", "turn_stopped"}
+
+
+def _terminals(events: list[dict[str, Any]]) -> list[str]:
+    return [kind for kind in kinds(events) if kind in _TERMINAL_KINDS]
+
+
+def test_a_result_followed_by_a_non_zero_exit_is_one_terminal_error_not_two(tmp_path: Path):
+    fake = FakeCli(
+        tmp_path,
+        [[
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+            {"type": "result", "usage": {}},
+        ]],
+        exit_code=3,
+    )
+    cli = backend(fake)
+    cli.start("brief")
+
+    events = drain(cli.send("go"))
+
+    assert _terminals(events) == ["error"]
+    assert kinds(events) == ["assistant_text", "error"]
+    assert events[-1]["payload"]["source"] == runtime_adapters.OUTCOME_WORKER_FAILED
+    cli.close()
+
+
+def test_a_result_followed_by_a_stall_is_one_terminal_timeout_error(tmp_path: Path):
+    fake = FakeCli(
+        tmp_path,
+        [[
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+            {"type": "result", "usage": {}},
+            "@hang",
+        ]],
+    )
+    cli = backend(fake, timeout_seconds=0.5)
+    cli.start("brief")
+
+    events = drain(cli.send("go"))
+
+    assert _terminals(events) == ["error"]
+    assert events[-1]["payload"]["source"] == "timeout"
+    assert not cli.is_running()
+    cli.close()
+
+
+def test_a_clean_result_and_a_clean_exit_are_one_turn_end(tmp_path: Path):
+    fake = FakeCli(tmp_path, [[{"type": "result", "usage": {}}, {"type": "result", "usage": {}}]])
+    cli = backend(fake)
+    cli.start("brief")
+
+    assert _terminals(drain(cli.send("go"))) == ["turn_end"]
+    cli.close()
+
+
+def test_a_stream_that_never_reports_its_end_still_closes_with_one_terminal(tmp_path: Path):
+    fake = FakeCli(
+        tmp_path,
+        [[{"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}}]],
+    )
+    cli = backend(fake)
+    cli.start("brief")
+
+    events = drain(cli.send("go"))
+
+    assert kinds(events) == ["assistant_text", "turn_end"]
+    cli.close()
+
+
 def test_close_kills_a_live_process_and_is_idempotent(tmp_path: Path):
     fake = FakeCli(
         tmp_path,

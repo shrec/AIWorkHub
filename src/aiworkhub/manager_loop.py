@@ -73,6 +73,8 @@ KEEP_CLOSED_SESSIONS = 20
 SESSION_TOPIC = "management"
 CONTEXT_QUERY = "manager_loop"
 TURN_EVENT_TYPE = "manager_loop_turn"
+TURN_TERMINAL_TYPES = frozenset({"turn_end", "error", "turn_stopped"})
+TURN_STOPPED_ERROR = "turn_stopped"
 NO_HANDOFF = "(none: this is the first session)"
 HANDOFF_PROMPT = (
     "Session rotation ({reason}). Write the handoff your successor session starts from, "
@@ -454,6 +456,26 @@ class SessionStore:
         )
         return [item for item in records[-self.max_events:] if past(item)]
 
+    def seq_range(self, session_id: str) -> tuple[int, int]:
+        """The first and last ``seq`` still in the whole log; ``(0, 0)`` when it holds none."""
+        path = self._path("events", session_id)
+        last = _last_seq(path)
+        if not last:
+            return 0, 0
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                found = _parsed([line])
+                if found:
+                    return int(found[0]["seq"]), last
+        return 0, 0
+
+    def has_session(self, session_id: str) -> bool:
+        """Whether a record or an event log exists for ``session_id``."""
+        return (
+            self._path("sessions", session_id).is_file()
+            or self._path("events", session_id).is_file()
+        )
+
     def append_event(self, session_id: str, event: Mapping[str, Any]) -> dict[str, Any]:
         """Append ``event`` with the next ``seq`` and a bounded payload; return it.
 
@@ -732,6 +754,8 @@ class ManagerOrchestrator:
         self._backend: ManagerBackend | None = None
         self._partial: dict[str, Any] | None = None
         self._stop_requested: bool = False
+        self._stop_armed: bool = False
+        self._log_lock = threading.Lock()
 
     @property
     def partial(self) -> dict[str, Any] | None:
@@ -897,6 +921,23 @@ class ManagerOrchestrator:
             if backend is not None:
                 backend.close()
         return running
+
+    def arm_stop(self) -> None:
+        """Stop the turn that is about to take the slot, for a stop that lands before its exchange.
+
+        The next exchange consumes it and ends as ``turn_stopped`` without a backend call;
+        the exchange in progress, or its caller via :meth:`disarm_stop`, drops it otherwise.
+        """
+        self._stop_armed = True
+
+    def disarm_stop(self) -> None:
+        self._stop_armed = False
+
+    def record_queue_dropped(self, session_id: str, turn: int, count: int) -> dict[str, Any] | None:
+        """Log that ``count`` queued owner sends were dropped by a stop, on the turn that was running."""
+        if not session_id or count <= 0:
+            return None
+        return self._record_to(session_id, turn, "queue_dropped", {"count": count})
 
     def attach(self, session_id: str, backend_id: str = "", model: str = "") -> ManagerSession:
         """Continue one saved conversation. No provider call and no Start.
@@ -1202,8 +1243,14 @@ class ManagerOrchestrator:
     def _record(
         self, session: ManagerSession, turn: int, kind: str, payload: Mapping[str, Any]
     ) -> dict[str, Any]:
+        return self._record_to(session.session_id, turn, kind, payload)
+
+    def _record_to(
+        self, session_id: str, turn: int, kind: str, payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
         event = {"at": self._clock(), "turn": turn, "type": kind, "v": 3, "payload": payload}
-        return self.store.append_event(session.session_id, event)
+        with self._log_lock:  # the stop thread logs too; two appenders must not share one seq
+            return self.store.append_event(session_id, event)
 
     @staticmethod
     def _call(writer: Writer, **fields: Any) -> dict[str, Any]:
@@ -1326,6 +1373,8 @@ class ManagerOrchestrator:
         self._record(session, turn, inbound, asked)
         events, grown, reply = self._exchange(session, turn, message)
         errors = [event["payload"] for event in events if event["type"] == "error"]
+        if any(event["type"] == "turn_stopped" for event in events):
+            errors.append({"source": "loop", "error": TURN_STOPPED_ERROR})
         written = self._call(
             self._event_writer,
             role="manager",
@@ -1374,7 +1423,7 @@ class ManagerOrchestrator:
         return result
 
     def _exchange(
-        self, session: ManagerSession, turn: int, message: str
+        self, session: ManagerSession, turn: int, message: str, *, owner_turn: bool = True
     ) -> tuple[list[dict[str, Any]], int, str]:
         """Run one backend turn, logging every event as it arrives.
 
@@ -1384,12 +1433,26 @@ class ManagerOrchestrator:
         reports itself, and the session stays usable either way. A stop
         requested through :meth:`interrupt` while this turn is running turns
         that error into ``turn_stopped`` instead, and the session stays usable.
+        Only the owner's turn consumes an armed stop; the handoff exchange of a
+        rotation (``owner_turn=False``) leaves it for the dispatcher to drop.
         """
         _, backend = self._active()
         events: list[dict[str, Any]] = []
         texts: list[str] = []
         grown = 0
+        # A stop belongs to the turn it was asked for: one left over from an earlier
+        # turn is dropped here, one armed before this exchange began stops it at once.
+        stopping = False
+        if owner_turn:
+            stopping, self._stop_armed = self._stop_armed, False
+        self._stop_requested = stopping
         try:
+            if stopping:
+                # send() handed this turn's images to the backend, which clears them
+                # only when it runs a turn; drop them so a later handoff cannot carry them.
+                backend.images = ()
+                events.append(self._record(session, turn, "turn_stopped", {"by": "owner"}))
+                return events, grown, ""
             for raw in backend.send(message):
                 if isinstance(raw, Mapping) and raw.get("type") == "delta":
                     self._grow_partial(session, turn, raw.get("payload"))
@@ -1401,11 +1464,13 @@ class ManagerOrchestrator:
                 kind, payload = _normalize(raw)
                 if kind == "error" and self._stop_requested:
                     kind, payload = "turn_stopped", {"by": "owner"}
-                self._settle_partial(kind)
                 grown += len(_json(payload).encode("utf-8"))
                 if kind == "assistant_text":
                     texts.append(str(payload.get("text", "")))
                 events.append(self._record(session, turn, kind, payload))
+                # The final event is logged before its streamed partial is cleared, so a
+                # poll between the two sees one of them, never neither.
+                self._settle_partial(kind)
         except Exception as exc:  # noqa: BLE001 - a failed turn is an error event, not a dead session
             if self._stop_requested:
                 broke: dict[str, Any] = {"by": "owner"}
@@ -1415,7 +1480,8 @@ class ManagerOrchestrator:
                 events.append(self._record(session, turn, "error", broke))
         finally:
             self._partial = None
-            self._stop_requested = False
+            if owner_turn:
+                self._stop_armed = False
         return events, grown, "".join(texts)
 
     def _rotate(self, reason: str, *, successor: bool) -> dict[str, Any]:
@@ -1423,7 +1489,9 @@ class ManagerOrchestrator:
         reason = " ".join(str(reason).split())[:200] or "unspecified"
         turn = session.turn_count + 1
         self._record(session, turn, "handoff_request", {"reason": reason})
-        events, _, reply = self._exchange(session, turn, HANDOFF_PROMPT.format(reason=reason))
+        events, _, reply = self._exchange(
+            session, turn, HANDOFF_PROMPT.format(reason=reason), owner_turn=False
+        )
         failures = [
             str(event["payload"].get("error") or event["payload"])
             for event in events if event["type"] == "error"
@@ -1501,7 +1569,7 @@ class ManagerOrchestrator:
         must never read as possibly-run to the successor. Only a mechanical
         retire writes this; a normally finished turn already has its marker.
         """
-        terminal = {"turn_end", "error"}
+        terminal = TURN_TERMINAL_TYPES
         inbound = {"user_message", "callback"}
         orphaned: list[int] = []
         for event in self.store.events(session.session_id):

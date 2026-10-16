@@ -315,13 +315,18 @@ def test_stop_ends_the_running_turn_and_the_session_stays_usable(
     assert backend.entered.wait(timeout=5)
 
     result = manager_loop_service.stop(tmp_path)
-    assert result == {"ok": True, "stopped": True, "dropped_queued": 0}
+    assert result == {"ok": True, "stopped": True, "armed": False, "dropped_queued": 0}
     assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
     assert backend.closed is True
 
     settled = manager_loop_service.status(tmp_path)
     assert settled["running"] is False
-    assert settled["last_turn"] == {"turn": 1, "ok": True, "errors": [], "reply": ""}
+    assert settled["last_turn"] == {
+        "turn": 1,
+        "ok": False,
+        "errors": [{"source": "loop", "error": "turn_stopped"}],
+        "reply": "",
+    }
     events = manager_loop_service.events(tmp_path, first["session_id"])
     assert [event["type"] for event in events["events"]] == [
         "session_start", "user_message", "turn_stopped",
@@ -345,7 +350,7 @@ def test_stop_drops_and_counts_the_queued_sends(monkeypatch: Any, tmp_path: Path
     assert queued["queued"] is True
 
     result = manager_loop_service.stop(tmp_path)
-    assert result == {"ok": True, "stopped": True, "dropped_queued": 1}
+    assert result == {"ok": True, "stopped": True, "armed": False, "dropped_queued": 1}
     assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
     assert manager_loop_service.status(tmp_path)["send_queue"] == []
     assert backend.messages == ["one"]
@@ -387,10 +392,240 @@ def test_stop_when_idle_is_a_no_op(monkeypatch: Any, tmp_path: Path) -> None:
 
     result = manager_loop_service.stop(tmp_path)
 
-    assert result == {"ok": True, "stopped": False, "dropped_queued": 0}
+    assert result == {"ok": True, "stopped": False, "armed": False, "dropped_queued": 0}
     assert entry.suspended is False
     assert entry.wake is wake_before
     assert manager_loop_service.close(tmp_path) == {"ok": True}
+
+
+def test_a_stopped_turn_is_not_a_delivered_turn() -> None:
+    stopped = {"ok": False, "errors": [{"source": "loop", "error": "turn_stopped"}]}
+    assert manager_loop_service._turn_delivered(stopped) is False
+    assert manager_loop_service._turn_delivered(
+        {"ok": False, "errors": [*stopped["errors"], {"source": "context_graph_event_write"}]}
+    ) is False
+
+
+def test_stop_drops_the_queued_sends_as_one_queue_dropped_event(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    backends = _install_fakes(monkeypatch)
+    manager_loop_service.start(tmp_path, "fake", "model-a")
+    backend = backends[0]
+    backend.gate = threading.Event()
+
+    first = manager_loop_service.send(tmp_path, "one")
+    assert backend.entered.wait(timeout=5)
+    assert manager_loop_service.send(tmp_path, "two")["queued"] is True
+    assert manager_loop_service.send(tmp_path, "three")["queued"] is True
+
+    assert manager_loop_service.stop(tmp_path)["dropped_queued"] == 2
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+
+    events = manager_loop_service.events(tmp_path, first["session_id"])["events"]
+    dropped = [event for event in events if event["type"] == "queue_dropped"]
+    assert len(dropped) == 1
+    assert dropped[0]["payload"] == {"count": 2}
+    assert [event["seq"] for event in events] == list(range(1, len(events) + 1))
+
+
+def test_stop_with_nothing_queued_records_no_queue_dropped_event(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    backends = _install_fakes(monkeypatch)
+    manager_loop_service.start(tmp_path, "fake", "model-a")
+    backend = backends[0]
+    backend.gate = threading.Event()
+
+    first = manager_loop_service.send(tmp_path, "one")
+    assert backend.entered.wait(timeout=5)
+    assert manager_loop_service.stop(tmp_path)["dropped_queued"] == 0
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+
+    events = manager_loop_service.events(tmp_path, first["session_id"])["events"]
+    assert "queue_dropped" not in [event["type"] for event in events]
+
+
+def test_a_stop_flag_left_by_a_stopped_turn_does_not_stop_the_next_turn(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    backends = _install_fakes(monkeypatch)
+    manager_loop_service.start(tmp_path, "fake", "model-a")
+    backend = backends[0]
+    backend.gate = threading.Event()
+
+    first = manager_loop_service.send(tmp_path, "one")
+    assert backend.entered.wait(timeout=5)
+    assert manager_loop_service.stop(tmp_path)["stopped"] is True
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+
+    # The next turn fails on its own: a leftover stop flag would relabel that failure
+    # as turn_stopped, which a succeeding turn could never show.
+    backend.gate = None
+    backend.process_ended_early = True
+    assert manager_loop_service.send(tmp_path, "two")["ok"] is True
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+
+    last = manager_loop_service.status(tmp_path)["last_turn"]
+    failure = {"source": "backend", "error": "worker_failed"}
+    assert last["turn"] == 2 and last["ok"] is False and last["errors"] == [failure]
+    types = [
+        event["type"]
+        for event in manager_loop_service.events(tmp_path, first["session_id"])["events"]
+        if event["turn"] == 2
+    ]
+    assert "turn_stopped" not in types and types[-1] == "error"
+
+
+def test_events_reports_the_log_bounds_and_whether_more_remain(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    _install_fakes(monkeypatch)
+    manager_loop_service.start(tmp_path, "fake", "model-a")
+    first = manager_loop_service.send(tmp_path, "one")
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+    session_id = first["session_id"]
+
+    full = manager_loop_service.events(tmp_path, session_id)
+    total = len(full["events"])
+    assert total >= 3
+    assert full["first_seq"] == 1 and full["last_seq"] == total
+    assert full["has_more"] is False and full["session_not_found"] is False
+    assert {"ok", "events", "partial"} <= set(full)
+
+    page = manager_loop_service.events(tmp_path, session_id, after_seq=0, limit=2)
+    assert [event["seq"] for event in page["events"]] == [1, 2]
+    assert page["has_more"] is True and page["last_seq"] == total
+
+    tail = manager_loop_service.events(tmp_path, session_id, after_seq=total)
+    assert tail["events"] == [] and tail["has_more"] is False
+    assert tail["first_seq"] == 1 and tail["last_seq"] == total
+
+
+def test_events_flags_an_unknown_session_and_keeps_the_existing_keys(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    _install_fakes(monkeypatch)
+    manager_loop_service.start(tmp_path, "fake", "model-a")
+
+    unknown = manager_loop_service.events(tmp_path, f"mls-{4242:032x}")
+
+    assert unknown["ok"] is True
+    assert unknown["events"] == [] and unknown["partial"] is None
+    assert unknown["session_not_found"] is True
+    assert unknown["first_seq"] == 0 and unknown["last_seq"] == 0
+    assert unknown["has_more"] is False
+
+
+def test_events_poll_sees_the_final_event_or_its_partial_never_neither(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    _install_fakes(monkeypatch)
+    session_id = manager_loop_service.start(tmp_path, "fake", "model-a")["session"]["session_id"]
+    orchestrator = manager_loop_service._entry_for(tmp_path).orchestrator
+    session = orchestrator.session
+    orchestrator._partial = {"session_id": session_id, "turn": 1, "text": "final"}
+    original = orchestrator.store.events
+
+    def writer_after_the_log_read(*args: Any, **kwargs: Any) -> Any:
+        stale = original(*args, **kwargs)
+        orchestrator._record(session, 1, "assistant_text", {"text": "final"})
+        orchestrator._partial = None
+        return stale
+
+    monkeypatch.setattr(orchestrator.store, "events", writer_after_the_log_read)
+
+    polled = manager_loop_service.events(tmp_path, session_id)
+
+    in_log = any(event["type"] == "assistant_text" for event in polled["events"])
+    in_partial = polled["partial"] is not None and polled["partial"]["text"] == "final"
+    assert in_log or in_partial
+
+
+def test_events_flags_a_gap_when_the_page_starts_after_unreturned_records(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    _install_fakes(monkeypatch)
+    session_id = manager_loop_service.start(tmp_path, "fake", "model-a")["session"]["session_id"]
+    manager_loop_service.send(tmp_path, "one")
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+    store = manager_loop_service._entry_for(tmp_path).orchestrator.store
+
+    whole = manager_loop_service.events(tmp_path, session_id)
+    total = len(whole["events"])
+    assert total >= 4 and whole["gap"] is False
+
+    store.max_events = 2
+    behind = manager_loop_service.events(tmp_path, session_id, after_seq=0)
+    assert behind["first_seq"] == 1 and behind["last_seq"] == total
+    assert [event["seq"] for event in behind["events"]] == [total - 1, total]
+    assert behind["gap"] is True
+
+    caught_up = manager_loop_service.events(tmp_path, session_id, after_seq=total - 2)
+    assert [event["seq"] for event in caught_up["events"]] == [total - 1, total]
+    assert caught_up["gap"] is False
+
+
+def test_a_failing_queue_dropped_write_does_not_fail_the_stop(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    backends = _install_fakes(monkeypatch)
+    manager_loop_service.start(tmp_path, "fake", "model-a")
+    backend = backends[0]
+    backend.gate = threading.Event()
+    store = manager_loop_service._entry_for(tmp_path).orchestrator.store
+    original = store.append_event
+
+    def failing(session_id: str, event: dict[str, Any]) -> Any:
+        if event["type"] == "queue_dropped":
+            raise OSError("disk full")
+        return original(session_id, event)
+
+    monkeypatch.setattr(store, "append_event", failing)
+
+    first = manager_loop_service.send(tmp_path, "one")
+    assert backend.entered.wait(timeout=5)
+    assert manager_loop_service.send(tmp_path, "two")["queued"] is True
+
+    result = manager_loop_service.stop(tmp_path)
+
+    assert result["ok"] is True and result["dropped_queued"] == 1
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+    types = [e["type"] for e in manager_loop_service.events(tmp_path, first["session_id"])["events"]]
+    assert "queue_dropped" not in types and types[-1] == "turn_stopped"
+
+
+def test_a_stop_after_the_exchange_finished_logs_queue_dropped_on_the_turn_that_ran(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    _install_fakes(monkeypatch)
+    manager_loop_service.start(tmp_path, "fake", "model-a")
+    orchestrator = manager_loop_service._entry_for(tmp_path).orchestrator
+    finished, hold = threading.Event(), threading.Event()
+    real_send = orchestrator.send
+
+    def send_then_hold(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        result = real_send(*args, **kwargs)
+        finished.set()
+        assert hold.wait(timeout=10)
+        return result
+
+    monkeypatch.setattr(orchestrator, "send", send_then_hold)
+
+    first = manager_loop_service.send(tmp_path, "one")
+    assert finished.wait(timeout=5)
+    assert manager_loop_service.send(tmp_path, "two")["queued"] is True
+
+    # The turn is over but still held by the dispatcher: the slot is free, so the stop
+    # is armed rather than delivered.
+    result = manager_loop_service.stop(tmp_path)
+    hold.set()
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+
+    assert result == {"ok": True, "stopped": False, "armed": True, "dropped_queued": 1}
+    events = manager_loop_service.events(tmp_path, first["session_id"])["events"]
+    dropped = [event for event in events if event["type"] == "queue_dropped"]
+    assert [(event["turn"], event["payload"]) for event in dropped] == [(1, {"count": 1})]
 
 
 _PNG = b"\x89PNG\r\n\x1a\n" + b"pixels"

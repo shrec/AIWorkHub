@@ -915,6 +915,206 @@ def test_mechanical_retire_marks_the_turn_its_dead_owner_never_closed(make) -> N
     assert "turn_end" not in [event["type"] for event in events]
     assert kinds[-1] == (0, "session_close")
 
+
+_TERMINAL = {"turn_end", "error", "turn_stopped"}
+
+
+def _stop_mid_turn(harness: Harness, message: str = "work") -> dict[str, Any]:
+    """Hold a turn open, stop it from outside, and return the turn's result."""
+    backend = harness.backends[-1]
+    backend.gate = threading.Event()
+    backend.entered.clear()
+    backend.script.append([{"type": "error", "payload": {"source": "backend", "error": "killed"}}])
+    done: list[dict[str, Any]] = []
+    runner = threading.Thread(target=lambda: done.append(harness.orch.send(message)), daemon=True)
+    runner.start()
+    try:
+        assert backend.entered.wait(timeout=10)
+        assert harness.orch.interrupt() is True
+    finally:
+        backend.gate.set()
+        runner.join(timeout=10)
+    backend.gate = None
+    assert not runner.is_alive() and len(done) == 1
+    return done[0]
+
+
+def _terminals(harness: Harness, session_id: str, turn: int) -> list[str]:
+    return [
+        event["type"] for event in harness.store.events(session_id)
+        if event["turn"] == turn and event["type"] in _TERMINAL
+    ]
+
+
+def test_a_stopped_turn_reports_not_ok_with_a_turn_stopped_loop_error(make) -> None:
+    harness = make()
+    session = harness.orch.start("fake", "model-a")
+
+    result = _stop_mid_turn(harness)
+
+    assert result["ok"] is False
+    assert result["errors"] == [{"source": "loop", "error": "turn_stopped"}]
+    assert _terminals(harness, session.session_id, 1) == ["turn_stopped"]
+    assert harness.orch.send("again")["ok"] is True
+
+
+def test_stop_then_begin_new_writes_no_interrupted_error(make) -> None:
+    harness = make()
+    session = harness.orch.start("fake", "model-a")
+    _stop_mid_turn(harness)
+
+    harness.orch.begin_new()
+
+    events = harness.store.events(session.session_id)
+    assert not [
+        event for event in events
+        if event["type"] == "error" and event["payload"].get("source") == "manager_turn_interrupted"
+    ]
+    assert [event["type"] for event in events][-1] == "session_close"
+
+
+def test_a_dead_owner_after_a_stopped_turn_leaves_no_interrupted_marker(make) -> None:
+    first = make(prefix="a")
+    session = first.orch.start("fake", "model-a")
+    _stop_mid_turn(first)
+    first.orch.close()
+
+    make(prefix="b").orch.ensure()
+
+    kinds = [event["type"] for event in first.store.events(session.session_id)]
+    assert kinds.count("error") == 0 and kinds.count("turn_stopped") == 1
+
+
+def test_a_stop_flag_from_a_finished_turn_does_not_stop_the_next_turn(make) -> None:
+    harness = make()
+    session = harness.orch.start("fake", "model-a")
+    _stop_mid_turn(harness)
+    failure = {"source": "backend", "error": "worker_failed"}
+    harness.backends[-1].script.append([{"type": "error", "payload": failure}])
+
+    result = harness.orch.send("next")
+
+    assert result["ok"] is False and result["errors"] == [failure]
+    assert _terminals(harness, session.session_id, 2) == ["error"]
+
+
+def test_an_armed_stop_stops_the_turn_that_takes_the_slot_next(make) -> None:
+    harness = make()
+    session = harness.orch.start("fake", "model-a")
+    backend = harness.backends[0]
+
+    harness.orch.arm_stop()
+    result = harness.orch.send("never reaches the model")
+
+    assert result["ok"] is False
+    assert result["errors"] == [{"source": "loop", "error": "turn_stopped"}]
+    assert backend.messages == []
+    assert _terminals(harness, session.session_id, 1) == ["turn_stopped"]
+    assert harness.orch.send("after")["ok"] is True
+    assert backend.messages == ["after"]
+
+
+def test_an_armed_stop_drops_the_stopped_turns_images_from_the_backend(make) -> None:
+    harness = make()
+    harness.orch.start("fake", "model-a")
+    backend = harness.backends[0]
+
+    harness.orch.arm_stop()
+    result = harness.orch.send("with a picture", images=("a.png",))
+
+    assert result["errors"] == [{"source": "loop", "error": "turn_stopped"}]
+    assert backend.images == ()
+
+
+def test_a_disarmed_stop_does_not_stop_the_next_turn(make) -> None:
+    harness = make()
+    harness.orch.start("fake", "model-a")
+
+    harness.orch.arm_stop()
+    harness.orch.disarm_stop()
+
+    assert harness.orch.send("go")["ok"] is True
+
+
+def test_record_queue_dropped_logs_the_count_on_the_given_turn_and_skips_zero(make) -> None:
+    harness = make()
+    session = harness.orch.start("fake", "model-a")
+    harness.orch.send("one")
+
+    assert harness.orch.record_queue_dropped(session.session_id, 1, 0) is None
+    logged = harness.orch.record_queue_dropped(session.session_id, 1, 3)
+
+    assert logged is not None and logged["payload"] == {"count": 3}
+    dropped = [e for e in harness.store.events(session.session_id) if e["type"] == "queue_dropped"]
+    assert len(dropped) == 1 and dropped[0]["turn"] == 1
+
+
+def test_a_backend_raise_mid_stream_yields_exactly_one_terminal_event(make) -> None:
+    harness = make()
+    session = harness.orch.start("fake", "model-a")
+    harness.backends[0].script.append(
+        [{"type": "assistant_text", "payload": {"text": "half"}}, RuntimeError("boom")]
+    )
+
+    result = harness.orch.send("go")
+
+    assert result["ok"] is False
+    assert _terminals(harness, session.session_id, 1) == ["error"]
+
+
+def test_the_final_assistant_event_is_stored_before_the_partial_is_cleared(make) -> None:
+    harness = make()
+    session = harness.orch.start("fake", "model-a")
+    harness.backends[0].script.append([
+        {"type": "delta", "payload": {"kind": "text", "text": "par"}},
+        {"type": "delta", "payload": {"kind": "text", "text": "tial"}},
+        {"type": "assistant_text", "payload": {"text": "partial"}},
+        {"type": "turn_end", "payload": {}},
+    ])
+    seen: list[tuple[bool, dict[str, Any] | None]] = []
+    original = harness.orch._record
+
+    def spy(target: Any, turn: int, kind: str, payload: Any) -> Any:
+        stored = original(target, turn, kind, payload)
+        if kind == "assistant_text":
+            seen.append((True, harness.orch.partial))
+        return stored
+
+    harness.orch._record = spy  # type: ignore[method-assign]
+    result = harness.orch.send("go")
+
+    assert result["reply"] == "partial"
+    assert len(seen) == 1 and seen[0][1] is not None and seen[0][1]["text"] == "partial"
+    assert harness.orch.partial is None
+    kinds = [event["type"] for event in harness.store.events(session.session_id)]
+    assert "assistant_text" in kinds
+
+
+def test_a_stop_landing_before_a_rotation_keeps_the_models_handoff(make) -> None:
+    harness = make(brief_bytes=1024, context_window_bytes=2200, rotate_fraction=0.5)
+    harness.orch.start("fake", "model-a")
+    harness.backends[0].script.extend([
+        _measured(0.5),
+        [
+            {"type": "assistant_text", "payload": {"text": "model handoff"}},
+            {"type": "turn_end", "payload": {}},
+        ],
+    ])
+    original = harness.orch._rotate
+
+    def stop_then_rotate(reason: str, *, successor: bool) -> Any:
+        harness.orch.arm_stop()
+        return original(reason, successor=successor)
+
+    harness.orch._rotate = stop_then_rotate  # type: ignore[method-assign]
+    result = harness.orch.send("go")
+    harness.orch.disarm_stop()
+
+    rotation = result["rotation"]
+    assert result["ok"] is True
+    assert rotation["mechanical"] is False
+    assert "model handoff" in rotation["handoff"] and "empty_handoff" not in rotation["handoff"]
+
 @pytest.mark.parametrize("shared", [False, True], ids=["two_orchestrators", "one_orchestrator"])
 def test_concurrent_ensure_calls_share_one_conversation(make, shared: bool) -> None:
     ticker = Ticker()
