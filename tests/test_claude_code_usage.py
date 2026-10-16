@@ -287,3 +287,221 @@ def test_growing_file_keeps_exactly_one_cache_entry(monkeypatch, tmp_path) -> No
 
     assert list(claude_code_usage._FILE_CACHE).count(key) == 1
     assert claude_code_usage._FILE_CACHE[key].usage.api_calls == 5
+
+
+def _parse_recorder(monkeypatch) -> list[Path]:
+    parsed: list[Path] = []
+    real_parser = claude_code_usage._parse_transcript_file
+
+    def _recording_parser(path):
+        parsed.append(Path(path))
+        return real_parser(path)
+
+    monkeypatch.setattr(claude_code_usage, "_parse_transcript_file", _recording_parser)
+    return parsed
+
+
+def _write_transcripts(project_dir: Path, count: int) -> None:
+    for index in range(count):
+        (project_dir / f"session-{index:04d}.jsonl").write_text(
+            _usage_line(f"msg_{index}", input_tokens=index + 1, output_tokens=1) + "\n",
+            encoding="utf-8",
+        )
+
+
+def _fresh_totals(repo_root: Path) -> dict:
+    claude_code_usage._FILE_CACHE.clear()
+    claude_code_usage._persistent_cache_path(repo_root).unlink(missing_ok=True)
+    return claude_code_usage.collect_claude_code_usage(repo_root)
+
+
+def test_scan_larger_than_cache_bound_is_not_reparsed_in_process(monkeypatch, tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    file_count = claude_code_usage._FILE_CACHE_MAX_ENTRIES + 50
+    _write_transcripts(project_dir, file_count)
+    claude_code_usage._FILE_CACHE.clear()
+    parsed = _parse_recorder(monkeypatch)
+
+    first = claude_code_usage.collect_claude_code_usage(repo_root)
+    assert len(parsed) == file_count
+
+    # Drop the persisted copy so only the in-process cache can avoid a parse.
+    claude_code_usage._persistent_cache_path(repo_root).unlink()
+    parsed.clear()
+    second = claude_code_usage.collect_claude_code_usage(repo_root)
+
+    assert parsed == []
+    assert second == first
+
+
+def test_persistent_cache_survives_in_process_cache_loss(monkeypatch, tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    _write_transcripts(project_dir, 5)
+    sub_dir = project_dir / "session-0000" / "subagents"
+    sub_dir.mkdir(parents=True)
+    (sub_dir / "sub.jsonl").write_text(_usage_line("sub_1") + "\n", encoding="utf-8")
+    claude_code_usage._FILE_CACHE.clear()
+    first = claude_code_usage.collect_claude_code_usage(repo_root)
+    assert claude_code_usage._persistent_cache_path(repo_root).is_file()
+
+    claude_code_usage._FILE_CACHE.clear()
+    parsed = _parse_recorder(monkeypatch)
+    second = claude_code_usage.collect_claude_code_usage(repo_root)
+
+    assert parsed == []
+    assert second == first
+    assert _fresh_totals(repo_root) == second
+    assert len(parsed) == 6
+
+
+def test_appending_to_one_transcript_reparses_only_that_file(monkeypatch, tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    _write_transcripts(project_dir, 6)
+    claude_code_usage._FILE_CACHE.clear()
+    claude_code_usage.collect_claude_code_usage(repo_root)
+    parsed = _parse_recorder(monkeypatch)
+
+    target = project_dir / "session-0003.jsonl"
+    with target.open("a", encoding="utf-8") as handle:
+        handle.write(_usage_line("msg_extra", input_tokens=500, output_tokens=1) + "\n")
+
+    for clear_in_process in (False, True):
+        if clear_in_process:
+            claude_code_usage._FILE_CACHE.clear()
+            with target.open("a", encoding="utf-8") as handle:
+                handle.write(_usage_line("msg_extra_2", input_tokens=7, output_tokens=1) + "\n")
+        parsed.clear()
+        result = claude_code_usage.collect_claude_code_usage(repo_root)
+        assert parsed == [target]
+        parsed.clear()
+        assert result == _fresh_totals(repo_root)
+
+
+def test_corrupt_or_wrong_version_cache_falls_back_to_full_parse(monkeypatch, tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    _write_transcripts(project_dir, 4)
+    expected = _fresh_totals(repo_root)
+    cache_path = claude_code_usage._persistent_cache_path(repo_root)
+    good = json.loads(cache_path.read_text(encoding="utf-8"))
+    some_key = next(iter(good["entries"]))
+
+    bad_entry = json.loads(json.dumps(good))
+    bad_entry["entries"][some_key]["api_calls"] = "many"
+    wrong_version = json.loads(json.dumps(good))
+    wrong_version["version"] = claude_code_usage._CACHE_VERSION + 1
+    for entry in wrong_version["entries"].values():
+        entry["api_calls"] = 999
+
+    variants = [
+        b"{not json at all",
+        b"",
+        b"\xff\xfe\x00garbage",
+        json.dumps([1, 2, 3]).encode(),
+        json.dumps(wrong_version).encode(),
+        json.dumps(bad_entry).encode(),
+    ]
+    parsed = _parse_recorder(monkeypatch)
+    for payload in variants:
+        cache_path.write_bytes(payload)
+        claude_code_usage._FILE_CACHE.clear()
+        parsed.clear()
+        result = claude_code_usage.collect_claude_code_usage(repo_root)
+        assert len(parsed) == 4
+        assert result == expected
+        assert json.loads(cache_path.read_text(encoding="utf-8")) == good
+
+    cache_path.unlink()
+    claude_code_usage._FILE_CACHE.clear()
+    assert claude_code_usage.collect_claude_code_usage(repo_root) == expected
+
+
+def test_unwritable_cache_location_never_fails_the_call(monkeypatch, tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    _write_transcripts(project_dir, 2)
+    # A regular file where the cache directory belongs makes every write fail.
+    (repo_root / ".aiworkhub").write_text("not a directory", encoding="utf-8")
+    claude_code_usage._FILE_CACHE.clear()
+
+    result = claude_code_usage.collect_claude_code_usage(repo_root)
+
+    assert result["totals"]["main"]["api_calls"] == 2
+
+
+def test_deleted_transcript_is_dropped_from_persisted_cache(monkeypatch, tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    _write_transcripts(project_dir, 3)
+    claude_code_usage._FILE_CACHE.clear()
+    claude_code_usage.collect_claude_code_usage(repo_root)
+    cache_path = claude_code_usage._persistent_cache_path(repo_root)
+    removed = project_dir / "session-0001.jsonl"
+    assert str(removed) in json.loads(cache_path.read_text(encoding="utf-8"))["entries"]
+
+    removed.unlink()
+    result = claude_code_usage.collect_claude_code_usage(repo_root)
+
+    entries = json.loads(cache_path.read_text(encoding="utf-8"))["entries"]
+    assert str(removed) not in entries
+    assert len(entries) == 2
+    assert result["totals"]["sessions"] == 2
+
+
+def test_unreadable_transcript_is_neither_cached_nor_persisted(monkeypatch, tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    _write_transcripts(project_dir, 3)
+    locked = project_dir / "session-0001.jsonl"
+    claude_code_usage._FILE_CACHE.clear()
+    real_parser = claude_code_usage._parse_transcript_file
+
+    def _locked_parser(path):
+        if Path(path) == locked:
+            return claude_code_usage._EMPTY_FILE_USAGE
+        return real_parser(path)
+
+    monkeypatch.setattr(claude_code_usage, "_parse_transcript_file", _locked_parser)
+
+    result = claude_code_usage.collect_claude_code_usage(repo_root)
+
+    assert result["totals"]["sessions"] == 3
+    assert result["totals"]["main"]["api_calls"] == 2
+    cache_path = claude_code_usage._persistent_cache_path(repo_root)
+    entries = json.loads(cache_path.read_text(encoding="utf-8"))["entries"]
+    assert str(locked) not in entries
+    assert len(entries) == 2
+    assert str(locked) not in claude_code_usage._FILE_CACHE
+
+    # Once the file is readable again it is parsed and counted.
+    monkeypatch.setattr(claude_code_usage, "_parse_transcript_file", real_parser)
+    assert claude_code_usage.collect_claude_code_usage(repo_root)["totals"]["main"]["api_calls"] == 3
+
+
+def test_deeply_nested_cache_file_is_ignored_and_rebuilt(monkeypatch, tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    _write_transcripts(project_dir, 3)
+    expected = _fresh_totals(repo_root)
+    cache_path = claude_code_usage._persistent_cache_path(repo_root)
+    good = json.loads(cache_path.read_text(encoding="utf-8"))
+
+    cache_path.write_text("[" * 100000, encoding="utf-8")
+    claude_code_usage._FILE_CACHE.clear()
+    parsed = _parse_recorder(monkeypatch)
+    result = claude_code_usage.collect_claude_code_usage(repo_root)
+
+    assert len(parsed) == 3
+    assert result == expected
+    assert json.loads(cache_path.read_text(encoding="utf-8")) == good

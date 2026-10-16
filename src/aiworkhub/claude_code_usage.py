@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,9 +28,26 @@ _SCHEMA_ID = "aiworkhub.cost_ledger.claude_code_sessions.v1"
 # a transcript that is still being written gets its ONE entry replaced rather
 # than accumulating a new key per write -- keying by (path, size, mtime_ns)
 # instead let a growing transcript leak one entry per call for the life of a
-# long-running MCP server. Bounded and LRU-evicted via _FILE_CACHE.popitem.
+# long-running MCP server. Bounded by max(_FILE_CACHE_MAX_ENTRIES, files in the
+# current call) and LRU-evicted only among paths outside the current file set:
+# a plain LRU smaller than a sequential scan evicts every entry before reuse.
 _FILE_CACHE_MAX_ENTRIES = 512
 _FILE_CACHE: OrderedDict[str, _CacheEntry] = OrderedDict()
+
+# Bump whenever _parse_transcript_file's output changes: a persisted cache with
+# any other version is ignored and rebuilt by a full parse.
+_CACHE_VERSION = 1
+_USAGE_INT_FIELDS = (
+    "api_calls",
+    "input_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "output_tokens",
+    "context_tokens",
+    "max_context",
+    "malformed_lines",
+)
+_USAGE_STR_FIELDS = ("first_at", "last_at")
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,37 +209,132 @@ def _parse_transcript_file(path: Path) -> _FileUsage:
     )
 
 
-def _parse_transcript_file_cached(path: Path) -> _FileUsage:
+def _persistent_cache_path(repo_root: Path) -> Path:
+    return repo_root / ".aiworkhub" / "runtime" / "cache" / "claude_code_usage_v1.json"
+
+
+def _entry_to_json(entry: _CacheEntry) -> dict[str, Any]:
+    payload: dict[str, Any] = {"size": entry.size, "mtime_ns": entry.mtime_ns}
+    for name in _USAGE_INT_FIELDS:
+        payload[name] = getattr(entry.usage, name)
+    payload["models"] = list(entry.usage.models)
+    for name in _USAGE_STR_FIELDS:
+        payload[name] = getattr(entry.usage, name)
+    return payload
+
+
+def _entry_from_json(raw: Any) -> _CacheEntry | None:
+    if not isinstance(raw, dict):
+        return None
+    ints = {name: raw.get(name) for name in ("size", "mtime_ns", *_USAGE_INT_FIELDS)}
+    strs = {name: raw.get(name) for name in _USAGE_STR_FIELDS}
+    models = raw.get("models")
+    if not all(type(value) is int for value in ints.values()):
+        return None
+    if not all(isinstance(value, str) for value in strs.values()):
+        return None
+    if not isinstance(models, list) or not all(isinstance(model, str) for model in models):
+        return None
+    usage = _FileUsage(
+        **{name: ints[name] for name in _USAGE_INT_FIELDS},
+        models=tuple(models),
+        **strs,
+    )
+    return _CacheEntry(ints["size"], ints["mtime_ns"], usage)
+
+
+def _load_persistent_cache(cache_path: Path) -> dict[str, _CacheEntry]:
+    """Return the persisted entries, or {} for any missing/corrupt/stale-version file."""
+
     try:
-        stat_result = path.stat()
+        document = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return {}
+    if not isinstance(document, dict) or document.get("version") != _CACHE_VERSION:
+        return {}
+    raw_entries = document.get("entries")
+    if not isinstance(raw_entries, dict):
+        return {}
+    entries: dict[str, _CacheEntry] = {}
+    for key, raw in raw_entries.items():
+        entry = _entry_from_json(raw)
+        if not isinstance(key, str) or entry is None:
+            return {}
+        entries[key] = entry
+    return entries
+
+
+def _store_persistent_cache(cache_path: Path, entries: dict[str, _CacheEntry]) -> None:
+    """Atomically write the cache; a failed write is dropped, never raised."""
+
+    document = {
+        "version": _CACHE_VERSION,
+        "entries": {key: _entry_to_json(entry) for key, entry in entries.items()},
+    }
+    temp_name = ""
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        handle, temp_name = tempfile.mkstemp(
+            dir=cache_path.parent, prefix=cache_path.name + ".", suffix=".tmp"
+        )
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(document, stream, separators=(",", ":"), sort_keys=True)
+        os.replace(temp_name, cache_path)
     except OSError:
-        return _EMPTY_FILE_USAGE
-    key = str(path)
-    cached = _FILE_CACHE.get(key)
-    if (
-        cached is not None
-        and cached.size == stat_result.st_size
-        and cached.mtime_ns == stat_result.st_mtime_ns
-    ):
+        if temp_name:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+
+
+def _parse_files(paths: list[Path], cache_path: Path | None = None) -> dict[Path, _FileUsage]:
+    # Cold-parse parallelism, measured 2026-10-16 on the manager host (real
+    # corpus, 714 files / 1588.4 MB, 16 cores): sequential 23.01 s vs
+    # ProcessPoolExecutor(14) 11.10 s (2.07x, cold parse only). Decision: stay
+    # sequential -- the persistent cache makes the cold parse a one-time cost per
+    # changed file, and a 14-process pool inside the MCP server would starve
+    # interactive calls.
+    # ponytail: sequential cold parse ~23 s once; ProcessPool if first-run latency matters
+    persisted = _load_persistent_cache(cache_path) if cache_path is not None else {}
+    current: dict[str, _CacheEntry] = {}
+    result: dict[Path, _FileUsage] = {}
+    for path in paths:
+        try:
+            stat_result = path.stat()
+        except OSError:
+            result[path] = _EMPTY_FILE_USAGE
+            continue
+        key = str(path)
+        entry = _FILE_CACHE.get(key)
+        if entry is None or not _entry_matches(entry, stat_result):
+            entry = persisted.get(key)
+            if entry is None or not _entry_matches(entry, stat_result):
+                usage = _parse_transcript_file(path)
+                if usage is _EMPTY_FILE_USAGE:
+                    # Open failed (e.g. transiently locked): report zero for
+                    # this call but never cache it under this size/mtime.
+                    result[path] = usage
+                    continue
+                entry = _CacheEntry(stat_result.st_size, stat_result.st_mtime_ns, usage)
+        _FILE_CACHE[key] = entry
         _FILE_CACHE.move_to_end(key)
-        return cached.usage
-    usage = _parse_transcript_file(path)
-    _FILE_CACHE[key] = _CacheEntry(stat_result.st_size, stat_result.st_mtime_ns, usage)
-    _FILE_CACHE.move_to_end(key)
-    while len(_FILE_CACHE) > _FILE_CACHE_MAX_ENTRIES:
+        current[key] = entry
+        result[path] = entry.usage
+
+    # Only paths outside this call's file set may be evicted: a sequential scan
+    # larger than the bound must not push out entries before the next call.
+    bound = max(_FILE_CACHE_MAX_ENTRIES, len(current))
+    while len(_FILE_CACHE) > bound:
         _FILE_CACHE.popitem(last=False)
-    return usage
+
+    if cache_path is not None and current != persisted and cache_path.parents[3].is_dir():
+        _store_persistent_cache(cache_path, current)
+    return result
 
 
-def _parse_files(paths: list[Path]) -> dict[Path, _FileUsage]:
-    # Measured on this repository's real transcript set, 46 files / 101.8 MB:
-    #   sequential        0.71 s
-    #   ThreadPool(2)     0.64 s
-    #   ThreadPool(4)     0.66 s
-    #   ThreadPool(8)     0.74 s
-    # No meaningful gain: json decoding holds the GIL, so a thread pool only
-    # adds scheduling contention to work that never releases it. Sequential.
-    return {path: _parse_transcript_file_cached(path) for path in paths}
+def _entry_matches(entry: _CacheEntry, stat_result: os.stat_result) -> bool:
+    return entry.size == stat_result.st_size and entry.mtime_ns == stat_result.st_mtime_ns
 
 
 def _zero_bucket() -> dict[str, int]:
@@ -281,7 +394,9 @@ def _empty_section(status: str, project_dirs: list[Path]) -> dict[str, Any]:
 def collect_claude_code_usage(repo_root: Path | str) -> dict[str, Any]:
     """Sum Claude Code's own transcript usage for the given repository root.
 
-    Read-only and best-effort: a missing project directory yields
+    Best-effort: it reads transcripts and writes only its own derived cache at
+    ``.aiworkhub/runtime/cache/claude_code_usage_v1.json``; a failed cache
+    write is dropped and never raised. A missing project directory yields
     ``status: "not_found"``, never an exception. There is no price table, so
     cost stays unknown -- this never reports a dollar figure.
     """
@@ -301,7 +416,7 @@ def collect_claude_code_usage(repo_root: Path | str) -> dict[str, Any]:
         all_files.append(main_file)
         all_files.extend(subagent_files)
 
-    parsed = _parse_files(all_files)
+    parsed = _parse_files(all_files, _persistent_cache_path(root))
 
     main_bucket = _zero_bucket()
     subagent_bucket = _zero_bucket()
