@@ -1,5 +1,5 @@
 {
-  "revision": 30,
+  "revision": 31,
   "schema_id": "aiworkhub.workforce_catalog.v1",
   "workers": [
     {
@@ -491,6 +491,82 @@
         "semantic-edit"
       ],
       "worker_id": "gpt-6.1-sol"
+    },
+    {
+      "adapter_id": "opencode_cli",
+      "enabled": true,
+      "implementation_worker": true,
+      "manager": true,
+      "manager_score_adjustment": 0.0,
+      "max_context_tokens": 256000,
+      "max_risk": "high",
+      "model": "opencode-go/grok-4.6",
+      "provider": "opencode",
+      "quality_ceiling": 0.97,
+      "reviewer": true,
+      "supports": [
+        "mechanical",
+        "code",
+        "research",
+        "review"
+      ],
+      "tools": [
+        "filesystem",
+        "source-graph",
+        "session-manager",
+        "ai-memory",
+        "kb",
+        "semantic-edit"
+      ],
+      "worker_id": "opencode-grok-4.6"
+    },
+    {
+      "adapter_id": "opencode_cli",
+      "enabled": true,
+      "implementation_worker": true,
+      "manager": true,
+      "manager_score_adjustment": 0.0,
+      "max_context_tokens": 256000,
+      "max_risk": "high",
+      "model": "opencode-go/muse-spark-1.3-contributor",
+      "provider": "opencode",
+      "quality_ceiling": 0.96,
+      "reviewer": false,
+      "supports": [
+        "mechanical",
+        "code",
+        "research",
+        "linguistic",
+        "review"
+      ],
+      "tools": [
+        "filesystem",
+        "source-graph",
+        "session-manager",
+        "ai-memory",
+        "kb",
+        "semantic-edit"
+      ],
+      "worker_id": "opencode-muse-spark-1.3"
+    },
+    {
+      "adapter_id": "opencode_cli",
+      "enabled": true,
+      "implementation_worker": true,
+      "manager": true,
+      "manager_score_adjustment": 0.0,
+      "max_context_tokens": 0,
+      "max_risk": "medium",
+      "model": "opencode-go/mimo-v2.6-pro",
+      "provider": "opencode-go",
+      "quality_ceiling": 1.0,
+      "reviewer": false,
+      "supports": [
+        "mechanical",
+        "code"
+      ],
+      "tools": [],
+      "worker_id": "opencode-go_mimo-v2.6-pro"
     }
   ]
 }
