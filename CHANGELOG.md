@@ -6,6 +6,14 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.58] - 2026-10-17
+
+### Fixed
+
+- The dashboard opens fast after a reload: the Claude Code transcript usage cache persists across restarts and no longer thrashes its LRU past 512 files (NF-2026-01578), and the snapshot loads linked task cards in one query and reuses the storage readiness probe (NF-2026-01577).
+- A rework whose predecessor changed nothing is credited for its hash-pinned inherited outputs under strict finalization, instead of failing as missing outputs (NF-2026-01553).
+- Extension tests fall back to an owned OS-temp scratch root when the repository scratch base cannot be created, and a declared root equal to the repository is refused (NF-2026-01573).
+
 ## [0.12.57] - 2026-10-16
 
 ### Added

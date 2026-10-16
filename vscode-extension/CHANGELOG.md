@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.58 — 2026-10-17
+
+### Fixed
+
+- Bundled runtime 0.12.58: the dashboard snapshot loads linked task cards in one query and reuses storage readiness (NF-2026-01577); the Claude Code transcript usage cache persists and stops LRU thrash past 512 files (NF-2026-01578); hash-pinned inherited outputs of a no-delta predecessor are credited under strict finalization (NF-2026-01553).
+- Extension tests fall back to an owned OS-temp scratch root when the repository scratch base cannot be created (NF-2026-01573).
+
 ## 0.12.57 — 2026-10-16
 
 ### Added

@@ -62,6 +62,10 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.58
+
+- The dashboard loads quickly again after a VS Code reload (the Claude Code usage scan is cached on disk and the snapshot reads its task cards in one pass). A rework after a "no change" attempt keeps credit for the files it inherited, and extension tests run even when the repository scratch folder cannot be created.
+
 ## What's new in 0.12.57
 
 - After this update, installing a new version switches the running runtime without a VS Code window reload. Manager tools answer much smaller by default (cost ledger, workforce catalog, blocked-rework recovery), review chains are skipped when a worker changed nothing, skill matching, Source Graph text search and roadmap counting are more accurate, and the manager chat panel renders long transcripts safely.
