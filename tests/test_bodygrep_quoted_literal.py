@@ -156,3 +156,167 @@ def test_token_fallback_uses_the_unquoted_phrases_tokens(repo_with_quoted_phrase
         match_kind="token_and_line",
     )
     assert result["query_tokens"] == ["without", "a", "landed", "successor"]
+
+
+# NF-2026-01563: with zero direct hits the token_and_file fallback returned
+# every line of a file holding ANY query token, so a phrase of common words
+# ("was rejected by the manager", "def get_archived") came back as kilobytes of
+# lines matching only "was" / "by" / "the" / "def" (a substring test, so "def"
+# also lands inside DEFAULT). A line now scores by the distinct non-stopword
+# query tokens it holds and needs min(2, distinctive) of them; when none does
+# the page is empty and says why instead of being padded to the budget.
+
+_NOISE_FILE = "src/noise/changelog.py"
+_BUILTINS_FILE = "src/noise/builtins.py"
+_COMMON_PHRASE = "was rejected by the manager"
+_RANK_PHRASE = "archived card lookup"
+_NOISE_LINES = (
+    "# the cache was warmed by the loader",
+    "# the lease was renewed by the scheduler",
+    "# a request was dropped by the router",
+    "# the manager approved the change",
+    "# a draft was rejected earlier",
+)
+
+
+@pytest.fixture(scope="module")
+def repo_with_common_words(tmp_path_factory) -> Path:
+    """A tmp repo indexed in-test; each file is a different fallback shape."""
+
+    repo = tmp_path_factory.mktemp("bodygrep_common_words") / "repo"
+    repo.mkdir()
+    bootstrap_repository(repo, repo_name="bodygrep_common_words")
+    _write(repo / _NOISE_FILE, "X = 1\n" + "".join(f"{line}\n" for line in _NOISE_LINES))
+    _write(
+        repo / _BUILTINS_FILE,
+        "DEFAULT_LIMIT = 10\n"
+        "def get_value(key):\n"
+        "    return key\n"
+        "# archived rows are skipped here\n",
+    )
+    # Both files hold every rank-phrase token; only b_together has them on one line.
+    _write(
+        repo / "src/rank/a_partial.py",
+        "# archived cards live elsewhere\n# lookup helper\n# card lookup\nX = 1\n",
+    )
+    _write(repo / "src/rank/b_together.py", "X = 1\n# lookup of the archived card by id\n")
+    # Sixteen two-token lines fill the budget before the one three-token line.
+    _write(
+        repo / "src/crowd/crowded.py",
+        "".join(f"# archived card {n}\n" for n in range(1, 17)) + "# lookup archived card\n",
+    )
+    sg.build_index(repo, incremental=False)
+    return repo
+
+
+def test_common_word_phrase_yields_no_fallback_lines(repo_with_common_words):
+    repo = repo_with_common_words
+    # Premise: no line holds the phrase, nor even all five of its tokens, so
+    # only the file-level fallback is left to answer it.
+    assert sg.bodygrep_query(
+        repo, _COMMON_PHRASE, budget=8, target=_NOISE_FILE,
+    )["matches"] == []
+    assert sg.bodygrep_query(
+        repo, _COMMON_PHRASE, budget=8, target=_NOISE_FILE,
+        match_kind="token_and_line",
+    )["matches"] == []
+
+    result = sg.bodygrep_query(
+        repo, _COMMON_PHRASE, budget=8, target=_NOISE_FILE,
+        match_kind="token_and_file",
+    )
+
+    # The file holds every token, but only "rejected" and "manager" are
+    # distinctive and no single line holds both, so no line is padded in.
+    assert result["match_kind"] == "token_and_file"
+    assert result["matches"] == []
+    assert result["candidate_files"] == []
+    assert result["next_cursor"] is None
+
+
+def test_empty_fallback_page_explains_itself_in_one_line(repo_with_common_words):
+    result = sg.bodygrep_query(
+        repo_with_common_words, _COMMON_PHRASE, budget=8,
+        target=_NOISE_FILE, match_kind="token_and_file",
+    )
+    assert "\n" not in result["hint"]
+    assert "2+ distinctive query tokens" in result["hint"]
+    assert "ignored as common: was, by, the" in result["hint"]
+
+
+def test_query_of_only_common_words_matches_nothing(repo_with_common_words):
+    result = sg.bodygrep_query(
+        repo_with_common_words, "was by the", budget=8,
+        match_kind="token_and_file", target=_NOISE_FILE,
+    )
+    assert result["matches"] == []
+    assert "ignored as common: was, by, the" in result["hint"]
+
+
+def test_single_distinctive_token_still_scores_its_line(repo_with_common_words):
+    # "def" (also inside DEFAULT) and "get" are common, so only the line holding
+    # "archived" qualifies: min(2, one distinctive token) is one.
+    result = sg.bodygrep_query(
+        repo_with_common_words, "def get_archived", budget=8,
+        match_kind="token_and_file", target=_BUILTINS_FILE,
+    )
+    assert [(row["line_start"], row["token_hits"]) for row in result["matches"]] == [(4, 1)]
+    assert "hint" not in result
+
+
+def test_co_occurring_tokens_return_that_line_first(repo_with_common_words):
+    result = sg.bodygrep_query(
+        repo_with_common_words, _RANK_PHRASE, budget=8,
+        match_kind="token_and_file", target="src/rank",
+    )
+    # a_partial.py sorts first but only pairs the tokens; the single-token line
+    # "# lookup helper" is dropped, and the line holding all three leads the page.
+    assert [
+        (row["file_path"], row["line_start"], row["token_hits"])
+        for row in result["matches"]
+    ] == [
+        ("src/rank/b_together.py", 2, 3),
+        ("src/rank/a_partial.py", 1, 2),
+        ("src/rank/a_partial.py", 3, 2),
+    ]
+    assert {row["match_kind"] for row in result["matches"]} == {"token_and_file"}
+    assert "hint" not in result
+
+
+def test_best_line_survives_a_crowded_file_within_budget(repo_with_common_words):
+    result = sg.bodygrep_query(
+        repo_with_common_words, _RANK_PHRASE, budget=8,
+        match_kind="token_and_file", target="src/crowd/crowded.py",
+    )
+    # Eight two-token lines arrive before the three-token line on line 17; it
+    # must still lead the page, evicting the latest of the equal-score lines.
+    assert [(row["line_start"], row["token_hits"]) for row in result["matches"]] == (
+        [(17, 3)] + [(line, 2) for line in range(1, 8)]
+    )
+
+
+def test_file_missing_a_token_is_not_reported_as_common_words(repo_with_common_words):
+    result = sg.bodygrep_query(
+        repo_with_common_words, "archived zebra", budget=8,
+        match_kind="token_and_file", target="src/rank",
+    )
+    assert result["matches"] == []
+    assert "hint" not in result
+
+
+def test_literal_and_token_and_line_hits_ignore_the_common_word_rule(
+    repo_with_common_words,
+):
+    literal = sg.bodygrep_query(
+        repo_with_common_words, "the manager approved", budget=8, target=_NOISE_FILE,
+    )
+    assert [row["line_start"] for row in literal["matches"]] == [5]
+    assert "match_kind" not in literal["matches"][0]
+    assert "token_hits" not in literal["matches"][0]
+
+    by_line = sg.bodygrep_query(
+        repo_with_common_words, "was by the", budget=8,
+        match_kind="token_and_line", target=_NOISE_FILE,
+    )
+    assert [row["line_start"] for row in by_line["matches"]] == [2, 3, 4]
+    assert all("token_hits" not in row for row in by_line["matches"])

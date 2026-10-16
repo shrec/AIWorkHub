@@ -34,6 +34,7 @@ import concurrent.futures
 import errno
 import fnmatch
 import hashlib
+import heapq
 import io
 import json
 import multiprocessing
@@ -5231,6 +5232,25 @@ def _bodygrep_bytes_proves_no_match(needle: str, raw: bytes) -> bool:
 
 BODYGREP_MATCH_KINDS: tuple[str, ...] = ("literal", "token_and_line", "token_and_file")
 
+# Query words too common to evidence a line on their own. Matching is a
+# substring test, so "def" also lands inside DEFAULT and "the" inside "other":
+# a line holding only such words says nothing about the query. Short ASCII
+# tokens fail for the same reason and are caught by length, not listed.
+_BODYGREP_NOISE_TOKENS: frozenset[str] = frozenset({
+    "all", "also", "and", "any", "are", "been", "but", "can", "class", "def",
+    "did", "does", "false", "for", "from", "get", "had", "has", "have", "how",
+    "import", "into", "its", "none", "not", "return", "self", "set", "task",
+    "than", "that", "the", "their", "then", "there", "these", "they", "this",
+    "those", "true", "was", "were", "what", "when", "where", "which", "who",
+    "why", "will", "with", "would", "you",
+})
+
+
+def _bodygrep_noise_token(token: str) -> bool:
+    """True when a query token is too common to count toward a line's score."""
+
+    return token in _BODYGREP_NOISE_TOKENS or (token.isascii() and len(token) < 3)
+
 
 def _bodygrep_unquote(term: str) -> tuple[str, bool]:
     """Strip one outer pair of matching quotes wrapping the whole term.
@@ -5269,9 +5289,14 @@ def bodygrep_query(
 
     ``match_kind`` is the server-side fallback for whitespace phrases that do
     not occur verbatim (source_graph-5): ``token_and_line`` matches a line
-    holding every query token, ``token_and_file`` a file holding every token
-    (rows are the lines holding at least one).  Both are labelled on every row
-    and on the payload so they can never be mistaken for literal evidence.
+    holding every query token, ``token_and_file`` a file holding every token.
+    The rows of ``token_and_file`` are the lines holding at least
+    max(1, min(2, distinctive)) distinctive tokens (common words and short
+    tokens never count), ranked by ``token_hits`` within the page; when files
+    proved every token yet no line qualified, the empty page carries a
+    ``hint`` instead of lines padded to the budget.  Both kinds are labelled on
+    every row and on the payload so they can never be mistaken for literal
+    evidence.
     """
 
     term = (term or "").strip()
@@ -5289,6 +5314,13 @@ def bodygrep_query(
     tokens = _query_tokens(search_term) if match_kind != "literal" else []
     if match_kind != "literal" and not tokens:
         raise SourceGraphError("bodygrep_token_query_empty")
+    # token_and_file scores a line by the distinctive tokens it holds and keeps
+    # it only at min(2, distinctive) of them (never fewer than one), so a query
+    # of common words matches nothing instead of every line holding "the".
+    signal_tokens = frozenset(
+        token for token in tokens if not _bodygrep_noise_token(token)
+    )
+    min_hits = max(1, min(2, len(signal_tokens)))
     # A token-mode cursor is bound to the kind as well as the term, so a page
     # minted by one kind can never resume a scan of another.
     cursor_term = search_term if match_kind == "literal" else f"{match_kind}:{search_term}"
@@ -5385,6 +5417,8 @@ def bodygrep_query(
     matches: list[dict[str, Any]] = []
     files_scanned = 0
     bytes_scanned = 0
+    # token_and_file files that held every token yet no line scored high enough.
+    noise_only_files = 0
     # Files skipped because a single one exceeds the whole byte cap. Reported
     # rather than silently dropped: a caller must be able to tell "not present"
     # from "not looked at".
@@ -5467,7 +5501,9 @@ def bodygrep_query(
         start_after = resume_line if file_path == resume_file else 0
         hit_budget = False
 
-        def match_row(line_number: int, line: str) -> dict[str, Any]:
+        def match_row(
+            line_number: int, line: str, token_hits: int | None = None,
+        ) -> dict[str, Any]:
             row = {
                 "file_path": file_path,
                 "kind": "body_match",
@@ -5481,11 +5517,14 @@ def bodygrep_query(
             }
             if match_kind != "literal":
                 row["match_kind"] = match_kind
+            if token_hits is not None:
+                row["token_hits"] = token_hits
             return row
 
-        # token_and_file holds candidate rows (lines with at least one token)
-        # until the whole file has proven it holds every token.
-        held_rows: list[dict[str, Any]] = []
+        # token_and_file holds this file's best-scoring lines (a min-heap of
+        # (score, -line, row), at most `budget` long) until the whole file has
+        # proven it holds every token.
+        held: list[tuple[int, int, dict[str, Any]]] = []
         seen_tokens: set[str] = set()
         for line_number, line in enumerate(_iter_splitlines(text), start=1):
             if line_number <= start_after:
@@ -5501,9 +5540,21 @@ def bodygrep_query(
                 present = [token for token in tokens if token in folded]
                 if not present:
                     continue
+                # The file-level proof counts every token, common or not.
                 seen_tokens.update(present)
-                if len(held_rows) < budget:
-                    held_rows.append(match_row(line_number, line))
+                # Only distinctive tokens score a line: one holding just "was",
+                # "by" or "def" is never evidence, however much budget remains.
+                score = sum(1 for token in present if token in signal_tokens)
+                if score < min_hits:
+                    continue
+                if len(held) == budget and score <= held[0][0]:
+                    # A tie keeps the earlier line already held; this one is later.
+                    continue
+                entry = (score, -line_number, match_row(line_number, line, score))
+                if len(held) < budget:
+                    heapq.heappush(held, entry)
+                else:
+                    heapq.heapreplace(held, entry)
                 continue
             matches.append(match_row(line_number, line))
             if len(matches) >= budget:
@@ -5517,7 +5568,10 @@ def bodygrep_query(
                 )
                 break
         if match_kind == "token_and_file" and seen_tokens >= set(tokens):
-            for row in held_rows:
+            if not held:
+                noise_only_files += 1
+            # Best score first, then earliest line: entry[:2] is (score, -line).
+            for _, _, row in sorted(held, key=lambda entry: entry[:2], reverse=True):
                 matches.append(row)
                 if len(matches) >= budget:
                     scan_truncated = True
@@ -5544,6 +5598,10 @@ def bodygrep_query(
             last_scanned_file, _BODYGREP_SKIP_ALL_LINES,
             term=cursor_term, target=normalized_target, budget=budget,
         )
+    if match_kind == "token_and_file":
+        # Best-scoring lines lead the page, so byte trimming drops the weakest
+        # first. The sort is stable: equal scores keep file, then line order.
+        matches.sort(key=lambda row: -row["token_hits"])
     rows, output_truncated = _bounded_rows(matches, budget, byte_cap)
     payload = {
         "mode": "bodygrep", "query": term, "budget": budget,
@@ -5569,6 +5627,16 @@ def bodygrep_query(
     if query_unquoted:
         payload["query_unquoted"] = True
         payload["query_literal"] = search_term
+    if noise_only_files and not matches:
+        # Name why a page whose files proved every token is still empty, rather
+        # than padding it with lines that hold only common words.
+        ignored = [token for token in tokens if token not in signal_tokens][:8]
+        payload["hint"] = (
+            f"no line held {min_hits}+ distinctive query tokens in the "
+            f"{noise_only_files} file(s) that hold every token"
+            + (f" (ignored as common: {', '.join(ignored)})" if ignored else "")
+            + "; name an exact identifier or add a rarer word"
+        )
     return _fit_payload_bytes(payload, byte_cap)
 
 
