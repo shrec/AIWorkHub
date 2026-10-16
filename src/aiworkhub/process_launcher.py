@@ -9640,6 +9640,14 @@ class ProcessManager:
             return state
         if state == "review" and card.get("review_requested_by") == runner:
             return state
+        # NF-2026-01544: the orchestrator may archive this request's own
+        # review_ready card mid-finalize; only the exact runner+request keeps it.
+        if state in {"finished", "archived"} and card.get("review_requested_by") == runner:
+            terminal = card.get("terminal_review") or {}
+            ident = (terminal.get("evidence") or {}).get("request_identity") or {}
+            bound = {str(v) for v in (terminal.get("request_id"), ident.get("request_id")) if v}
+            if bound and bound == {str(metadata.get("request_id") or "")}:
+                return state
         raise WorkspaceError(f"claim_ownership_lost:state={state}")
 
     def _release_exact(self, metadata: dict[str, Any], reason: str) -> dict[str, Any]:
@@ -11893,6 +11901,9 @@ class ProcessManager:
                                 or release_result.get("stdout")
                                 or ""
                             )[:300]
+                        elif not changed_path_hashes:
+                            review_automation = dict(
+                                state="skipped", reason="no_repository_change")
                         else:
                             registration: dict[str, str] = {}
                             try:
