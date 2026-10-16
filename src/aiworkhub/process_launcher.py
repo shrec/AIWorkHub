@@ -9107,6 +9107,63 @@ class ProcessManager:
             expected_request_id=request_id,
         )
 
+    def _bridge_cancel_moot_home_removed(
+        self,
+        request_id: str,
+        events: list[dict[str, Any]],
+        latest: dict[str, Any],
+        live: _LiveProcess | None,
+        status: dict[str, Any],
+    ) -> str | None:
+        """Return the moot reason when a bridge cancellation cannot matter.
+
+        Returns ``"bridge_cancel_moot_home_removed"`` only when ALL hold,
+        and ``None`` otherwise (fail closed):
+
+        1. ``_liveness_snapshot`` produced evidence and neither the
+           supervisor nor its child process is alive.
+        2. The merged request history proves the supervisor PID identity
+           is ``PidIdentityVerdict.MISMATCH``.
+        3. The persisted bridge receipt resolves to a request whose home
+           (``worker_spec_path.parent``) no longer exists.
+        4. The bound task card parses and is already ``finished`` or
+           ``archived``, or it is bound to a different request than
+           ``request_id``.
+
+        Any probe failure (unreadable metadata, unresolvable bridge
+        receipt, unparseable task card) returns ``None``.
+        """
+        try:
+            liveness = self._liveness_snapshot(latest)
+            if not liveness:
+                return None
+            if liveness.get("supervisor_alive") or liveness.get("child_alive"):
+                return None
+            if (
+                self._request_pid_identity(events).verdict
+                is not PidIdentityVerdict.MISMATCH
+            ):
+                return None
+            request = self._bridge_request_for_cancellation(
+                request_id, live, status
+            )
+            if request is None or request.worker_spec_path.parent.exists():
+                return None
+            task_id = str(latest.get("task_id") or "")
+            if not task_id:
+                return None
+            card = _parse_card(self._show_task(task_id), task_id)
+            if core._lifecycle_state(card) in {"finished", "archived"}:
+                return "bridge_cancel_moot_home_removed"
+            bound = str(
+                card.get("launch_request_id") or card.get("request_id") or ""
+            )
+            if bound and bound != request_id:
+                return "bridge_cancel_moot_home_removed"
+        except Exception:  # noqa: BLE001 - any probe failure fails closed
+            return None
+        return None
+
     def _publish_bridge_cancellation_before_finalization(
         self,
         request_id: str,
@@ -9168,6 +9225,31 @@ class ProcessManager:
                 )
 
         error = "bridge_cancel_publication_failed:" + "|".join(errors)
+        moot_reason = self._bridge_cancel_moot_home_removed(
+            request_id, events, latest, live, status
+        )
+        if moot_reason is not None:
+            self._retention_event({
+                **lineage,
+                "request_id": request_id,
+                "state": "finalize_abandoned",
+                "pid": latest.get("pid"),
+                "pid_start_ticks": latest.get("pid_start_ticks"),
+                "metadata_path": latest.get("metadata_path"),
+                "supervisor_status_path": latest.get("supervisor_status_path"),
+                "bridge_provider_may_be_active": False,
+                "bridge_cancel_moot": moot_reason,
+                "finalizer_abandoned": True,
+                "worker_terminal_state": "finalize_abandoned",
+                "finished_at": _utcnow(),
+                "error": error[:500],
+                **terminal_failure_classification.terminal_event_authority(
+                    state="finalize_abandoned",
+                    exit_code=None,
+                    error=error[:500],
+                ),
+            }, disposition="retained_in_place")
+            raise _BridgeCancellationDeferred(error[:500])
         self._retention_event({
             **lineage,
             "request_id": request_id,
@@ -12243,7 +12325,9 @@ class ProcessManager:
                 "pid_start_ticks": latest.get("pid_start_ticks"),
                 "child_pid": supervisor_status.get("child_pid"),
                 "exit_code": exit_code,
-                "provider_exit_code": supervisor_status.get("exit_code"),
+                "provider_exit_code": terminal_failure_classification.normalize_exit_code(
+                    supervisor_status.get("exit_code")
+                ),
                 "finished_at": _utcnow(),
                 "stdout_path": metadata["stdout_path"],
                 "stderr_path": metadata["stderr_path"],
@@ -13169,6 +13253,20 @@ class ProcessManager:
                 )
             )
         except _BridgeCancellationDeferred as exc:
+            # The moot-home branch saves a terminal finalize_abandoned row
+            # before raising; report that row, not reconcile_pending.
+            deferred_events = self._request_events(request_id)
+            deferred_state = (
+                split_lifecycle_tail(deferred_events)[0].get("state")
+                if deferred_events
+                else None
+            )
+            if deferred_state in TERMINAL_PROCESS_STATES:
+                return {
+                    "ok": True,
+                    "request_id": request_id,
+                    "state": deferred_state,
+                }
             return {
                 "ok": False,
                 "request_id": request_id,
