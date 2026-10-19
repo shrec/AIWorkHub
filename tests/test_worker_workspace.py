@@ -634,6 +634,7 @@ def _commit_validation_worker_package(repo: Path) -> None:
         # ``__import__``, so the seed closure must carry it and this fixture
         # repository must therefore track it too.
         "opencode_auth.py",
+        "sqlite_readonly.py",  # opencode_auth opens its credential store through this sibling
         "runtime_temp.py",
         "windows_file_structures.py",
         "toolchain_authority.py",
