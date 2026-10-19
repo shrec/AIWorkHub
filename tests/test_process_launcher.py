@@ -4359,7 +4359,17 @@ def test_finalize_isolated_request_validation_only_replay_authorization(
 
     monkeypatch.setattr(manager, "_review_terminal_exact", fake_review_terminal_exact)
 
-    def _run(request_id: str, authorization: dict | None):
+    failure_calls = []
+
+    def fake_terminal_failure_exact(_metadata, substatus, *, request_id, **_kwargs):
+        failure_calls.append({"request_id": request_id, "substatus": substatus})
+        return {"ok": True, "returncode": 0, "stdout": "{}", "stderr": ""}
+
+    monkeypatch.setattr(manager, "_terminal_failure_exact", fake_terminal_failure_exact)
+
+    def _run(
+        request_id: str, authorization: dict | None, execution_mode: str | None = None
+    ):
         stdout_path = tmp_path / f"{request_id}.stdout.log"
         stderr_path = tmp_path / f"{request_id}.stderr.log"
         stdout_path.write_text("worker complete\n", encoding="utf-8")
@@ -4398,6 +4408,7 @@ def test_finalize_isolated_request_validation_only_replay_authorization(
                 "changed_path_hashes": {"out/result.json": raw_sha256},
             },
             "validation_only_replay_authorization": authorization,
+            "execution_mode": execution_mode,
         }
         metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
         manager._append_event({
@@ -4417,13 +4428,13 @@ def test_finalize_isolated_request_validation_only_replay_authorization(
         })
         return manager._finalize_isolated_request(request_id, supervisor_returncode=0)
 
-    # Missing authorization: the ordinary required_output_unchanged failure
-    # still applies (this must never silently pass).
+    # Missing authorization: an episode that changed nothing is a no-effect
+    # worker failure (NF-2026-01596) and never reaches review.
     unauthorized_event = _run("req-replay-unauthorized", None)
-    assert unauthorized_event["state"] == "validation_failed"
-    assert '"unchanged_mandatory_outputs":["out/result.json"]' in unauthorized_event[
-        "error"
-    ]
+    assert unauthorized_event["state"] == "worker_failed"
+    assert "provider_no_effect" in unauthorized_event["error"]
+    assert [c["substatus"] for c in failure_calls] == ["worker_failed"]
+    assert review_calls == []
     assert unauthorized_event["attempt_artifact_manifest"]["verified"] is True
     assert process_launcher.attempt_artifacts.verify_json_bundle(
         Path(unauthorized_event["attempt_artifact_manifest"]["manifest_path"]).parent
@@ -4440,13 +4451,17 @@ def test_finalize_isolated_request_validation_only_replay_authorization(
         "one_episode_binding": True,
     }
     stale_event = _run("req-replay-stale-epoch", stale_authorization)
-    assert stale_event["state"] == "validation_failed"
-    assert '"unchanged_mandatory_outputs":["out/result.json"]' in stale_event["error"]
+    assert stale_event["state"] == "worker_failed"
+    assert "provider_no_effect" in stale_event["error"]
 
     # Exact matching authorization: reaches review with structured replay
     # evidence attached, and manager acceptance/promotion gates untouched.
+    # Launch routes a valid grant to the provider-less replay, so the
+    # authorized episode carries that execution mode.
     authorization = {**stale_authorization, "next_claim_epoch": 3}
-    authorized_event = _run("req-replay-authorized", authorization)
+    authorized_event = _run(
+        "req-replay-authorized", authorization, execution_mode="validation_only_replay"
+    )
     assert authorized_event["state"] == "review_ready"
     assert authorized_event["changed_paths"] == []
 
