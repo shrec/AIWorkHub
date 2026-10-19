@@ -2113,6 +2113,13 @@ def test_real_finalizer_derives_fresh_authority_after_worker_candidate_review_tr
         pl.ProcessManager, "_persist_attempt_artifacts",
         lambda self, *_a, **_k: None,
     )
+    # Hermetic: candidate sealing does real filesystem I/O and has its own tests.
+    monkeypatch.setattr(
+        "aiworkhub.successful_rework_recovery.successful_candidate_evidence",
+        lambda _workspace, _metadata, _request_id, changed: (
+            sorted(changed), {path: "0" * 64 for path in changed}, {},
+        ),
+    )
 
     event = manager._finalize_isolated_request(request_id)  # noqa: SLF001
 
@@ -2164,7 +2171,7 @@ def test_real_finalizer_settles_authority_after_a_validation_failure_from_a_clea
     monkeypatch.setattr(pl, "_requires_bridge_cancellation", lambda _metadata: False)
     monkeypatch.setattr(pl.ProcessManager, "_exact_claim_state", lambda self, *_a, **_k: "processing")
     monkeypatch.setattr(pl.core, "writes_allowed", lambda: True)
-    monkeypatch.setattr(pl, "enforce_scope", lambda *_a, **_k: [])
+    monkeypatch.setattr(pl, "enforce_scope", lambda *_a, **_k: ["required.txt"])
     monkeypatch.setattr(pl, "validate_residual_contract", lambda *_a, **_k: [])
     monkeypatch.setattr(
         pl, "validate_required_outputs",
