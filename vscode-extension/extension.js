@@ -520,6 +520,13 @@ const VSCODE_LM_MAX_FINALIZATION_TURNS = 4;
 // turns allow an optional Source Graph lookup and one transient submit retry
 // without paying for the generic 24-turn coding-agent loop.
 const VSCODE_LM_MAX_QUALITY_REVIEW_TURNS = 3;
+// GeoAI 2026-10-19 (NF-2026-01598): a reviewer whose packet omits hunks must
+// read them. Each provider turn that yields distinct new source evidence
+// extends the submit budget by one turn (never per row), at most this many
+// times. 3 + 7 forces submit at post-source turn 10, which leaves turn 11 for
+// the corrective or transient-submit retry before the 12-turn post-source
+// finalization gate, so the loop stays bounded and the retry stays reachable.
+const VSCODE_LM_MAX_QUALITY_REVIEW_READ_TURNS = 7;
 const VSCODE_LM_MAX_EMULATED_RESPONSE_BYTES = 256 * 1024;
 const VSCODE_LM_MAX_EMULATED_TOOL_INPUT_BYTES = 16 * 1024;
 const VSCODE_LM_REQUEST_ID_RE = /^[a-f0-9]{32}$/;
@@ -6127,6 +6134,7 @@ async function runVscodeLmTextProtocol(
   const writableTask = request.request_kind !== "quality_review" &&
     Array.isArray(request.allowedWrites) && request.allowedWrites.length > 0;
   let creditedTurns = 0;
+  let reviewEvidenceTurns = 0;
   let lastTurnProgress = -1;
   // NF1290: 24 bounds uncredited turns; verified discovery/edit progress earns
   // continuation, without weakening duplicate/no-progress/finalization gates.
@@ -6137,7 +6145,9 @@ async function runVscodeLmTextProtocol(
     const sourceBeforeTurn = sourceGraphGuard.sourceEvidenceRevision(); const stagesBeforeTurn = sourceGraphGuard.stageRevision();
     assertRequestActive();
     if (request.request_kind === "quality_review" &&
-        postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS && !reviewSubmitForced) {
+        postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS +
+        Math.min(VSCODE_LM_MAX_QUALITY_REVIEW_READ_TURNS, reviewEvidenceTurns) &&
+        !reviewSubmitForced) {
       reviewSubmitForced = true;
     }
     if (request.request_kind !== "quality_review" &&
@@ -6830,6 +6840,10 @@ async function runVscodeLmTextProtocol(
     if (writableTask && sourceGraphGuard.progressRevision() !== progressBeforeTurn) {
       creditedTurns += 1; // One credit per provider turn, never per returned row/page.
     }
+    if (request.request_kind === "quality_review" &&
+        sourceGraphGuard.sourceEvidenceRevision() !== sourceBeforeTurn) {
+      reviewEvidenceTurns += 1; // One credit per provider turn, never per returned row.
+    }
     if (writableTask && (sourceGraphGuard.sourceEvidenceRevision() !== sourceBeforeTurn || (!forceStagedEdit && sourceGraphGuard.stageRevision() !== stagesBeforeTurn))) { // a free-phase stage turn is progress (NF-2026-01385)
       postSourceTurns = Math.max(0, postSourceTurns - 1);
     }
@@ -6922,6 +6936,7 @@ async function runVscodeLmAgent(
     request.allowedWrites.length > 0;
   let wrongToolViolations = 0;
   let creditedTurns = 0;
+  let reviewEvidenceTurns = 0;
   let lastTurnProgress = -1;
   for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS + creditedTurns; turn += 1) {
     const progressBeforeTurn = sourceGraphGuard.progressRevision();
@@ -6929,7 +6944,10 @@ async function runVscodeLmAgent(
     lastTurnProgress = progressBeforeTurn;
     const sourceBeforeTurn = sourceGraphGuard.sourceEvidenceRevision(); const stagesBeforeTurn = sourceGraphGuard.stageRevision();
     assertRequestActive();
-    if (qualityReview && postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS && !reviewSubmitForced) {
+    if (qualityReview &&
+        postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS +
+        Math.min(VSCODE_LM_MAX_QUALITY_REVIEW_READ_TURNS, reviewEvidenceTurns) &&
+        !reviewSubmitForced) {
       reviewSubmitForced = true;
     }
     if (sourceGraphAcknowledged &&
@@ -7432,6 +7450,9 @@ async function runVscodeLmAgent(
     }
     if (writableTask && sourceGraphGuard.progressRevision() !== progressBeforeTurn) {
       creditedTurns += 1; // A multi-tool batch earns at most one continuation turn.
+    }
+    if (qualityReview && sourceGraphGuard.sourceEvidenceRevision() !== sourceBeforeTurn) {
+      reviewEvidenceTurns += 1; // One credit per provider turn, never per returned row.
     }
     if (writableTask && (sourceGraphGuard.sourceEvidenceRevision() !== sourceBeforeTurn || (!forceStagedEdit && sourceGraphGuard.stageRevision() !== stagesBeforeTurn))) { // a free-phase stage turn is progress (NF-2026-01385)
       postSourceTurns = Math.max(0, postSourceTurns - 1);
