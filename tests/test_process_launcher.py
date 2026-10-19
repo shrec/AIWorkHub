@@ -6243,6 +6243,8 @@ def test_direct_launch_duplicate_pid_identity_admission_matrix(
     )
     before = manager._request_events(request_id)
     monkeypatch.setattr(manager, "_active_count", lambda: 0)
+    real_pid_identity_evidence = process_launcher._pid_identity_evidence
+    real_pid_matches = process_launcher._pid_matches
     monkeypatch.setattr(
         process_launcher,
         "_pid_identity_evidence",
@@ -6266,6 +6268,9 @@ def test_direct_launch_duplicate_pid_identity_admission_matrix(
         adapter_id="claude_cli",
         timeout_seconds=30,
     )
+    # The stubs model admission only; the launched worker reports with the real probes.
+    monkeypatch.setattr(process_launcher, "_pid_identity_evidence", real_pid_identity_evidence)
+    monkeypatch.setattr(process_launcher, "_pid_matches", real_pid_matches)
 
     assert result["ok"] is not expected_blocked
     if expected_blocked:
