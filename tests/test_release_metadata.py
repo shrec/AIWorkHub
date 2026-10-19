@@ -209,6 +209,30 @@ def test_root_readme_release_projection_is_gated(tmp_path: Path) -> None:
     assert "What's new in 1.2.3" in result["mismatches"]["README.md"]
 
 
+def test_readme_may_carry_only_the_current_whats_new_section(tmp_path: Path) -> None:
+    """Each release prepended a section; the extension README grew to 116 of them."""
+    _fixture(tmp_path, canonical="1.2.3", projected="1.2.3")
+    # History lives in the changelog, so several release sections are fine there.
+    (tmp_path / "vscode-extension" / "CHANGELOG.md").write_text(
+        "# Changelog\n\n## 1.2.3 — 2026-01-01\n\n## 1.2.2 — 2025-12-01\n",
+        encoding="utf-8",
+    )
+    current = "## What's new in 1.2.3 — 2026-01-01\n\n- current\n"
+    older = "## What's new in 1.2.2 — 2025-12-01\n\n- older\n"
+
+    for relative in ("vscode-extension/README.md", "README.md"):
+        readme = tmp_path / relative
+        readme.write_text(f"# AIWorkHub\n\n{current}\n{older}", encoding="utf-8")
+        gaps = release_metadata.narrative_mismatches(tmp_path, "1.2.3")
+        assert set(gaps) == {relative}
+        assert "more than one" in gaps[relative]
+        assert release_metadata.check(tmp_path)["ok"] is False
+
+        readme.write_text(f"# AIWorkHub\n\n{current}", encoding="utf-8")
+        assert release_metadata.narrative_mismatches(tmp_path, "1.2.3") == {}
+        assert release_metadata.check(tmp_path)["ok"] is True
+
+
 def test_release_vsix_smoke_checks_packaged_assets_not_false_dist_prefix() -> None:
     release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
     packaged = (

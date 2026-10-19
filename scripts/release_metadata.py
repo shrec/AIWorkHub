@@ -41,6 +41,10 @@ NARRATIVE_PROJECTIONS: tuple[tuple[str, str], ...] = (
     ("README.md", "What's new in {version}"),
 )
 
+# Each release prepended a "What's new" section, so the extension README grew to 116.
+SINGLE_WHATS_NEW_READMES: tuple[str, ...] = ("README.md", "vscode-extension/README.md")
+WHATS_NEW_HEADING = re.compile(r"^## What's new in ", re.MULTILINE)
+
 
 def narrative_mismatches(root: Path, version: str) -> dict[str, str]:
     """Report every release document that does not yet name this version."""
@@ -55,6 +59,14 @@ def narrative_mismatches(root: Path, version: str) -> dict[str, str]:
             continue
         if needle not in text:
             missing[relative] = f"missing {needle!r}"
+        elif (
+            relative in SINGLE_WHATS_NEW_READMES
+            and len(WHATS_NEW_HEADING.findall(text)) > 1
+        ):
+            missing[relative] = (
+                "more than one '## What's new in' section; keep only the current "
+                "release, history lives in the CHANGELOG"
+            )
     return missing
 
 
