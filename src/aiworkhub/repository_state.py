@@ -172,11 +172,34 @@ def _assert_relative_child(root: Path, relative: str | Path) -> Path:
     candidate = root / rel
     if _has_symlink_component(candidate):
         raise PathEscapeError(f"path_symlink_component:{relative}")
-    try:
-        resolved = candidate.resolve(strict=False)
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise PathEscapeError(f"path_unresolvable:{relative}") from exc
-    if resolved != root and root not in resolved.parents:
+
+    def mapped(path: Path) -> Path:
+        # resolve() remaps an existing subst path and leaves a missing tail
+        # on the unresolved drive. Map the deepest existing ancestor, then
+        # append the missing tail, so a not-yet-created child uses the same
+        # root as an existing one.
+        missing: list[str] = []
+        current = path
+        while current != current.parent:
+            try:
+                exists = current.exists()
+            except OSError as exc:
+                raise PathEscapeError(f"path_unresolvable:{relative}") from exc
+            if exists:
+                break
+            missing.append(current.name)
+            current = current.parent
+        try:
+            resolved = current.resolve(strict=False)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise PathEscapeError(f"path_unresolvable:{relative}") from exc
+        for name in reversed(missing):
+            resolved = resolved / name
+        return resolved
+
+    resolved_root = mapped(root)
+    resolved = mapped(candidate)
+    if resolved != resolved_root and resolved_root not in resolved.parents:
         raise PathEscapeError(f"path_outside_repository:{relative}")
     return resolved
 
