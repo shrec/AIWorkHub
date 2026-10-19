@@ -862,6 +862,9 @@ def _validate_resolve_task(value: object, *, path: str = "task") -> str | None:
     return _validate_identifier(value, path=path)
 
 
+_RESOLVE_PATH_SEGMENT_RE = re.compile(r"[A-Za-z0-9_.-]+")
+
+
 def _validate_resolve_path(value: object) -> str | None:
     if value is None:
         return None
@@ -873,7 +876,10 @@ def _validate_resolve_path(value: object) -> str | None:
         raise ManifestValidationError(ReasonCode.UNSAFE_PATH_SELECTOR, f"path: unsafe path {value!r}")
     if any(ch in value for ch in "*?[]"):
         raise ManifestValidationError(ReasonCode.UNSAFE_PATH_SELECTOR, f"path: unsafe path {value!r}")
-    if not _PATH_SELECTOR_RE.match(value):
+    # Concrete paths may be dot-prefixed (selectors may not); a leading "-", empty and "." segments stay rejected.
+    if value.startswith("-") or any(
+        segment == "." or not _RESOLVE_PATH_SEGMENT_RE.fullmatch(segment) for segment in value.split("/")
+    ):
         raise ManifestValidationError(ReasonCode.UNSAFE_PATH_SELECTOR, f"path: unsafe path {value!r}")
     return value
 

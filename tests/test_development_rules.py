@@ -255,6 +255,103 @@ def test_resolve_rejects_glob_metacharacters_in_concrete_path(bad_path):
     assert excinfo.value.reason is dr.ReasonCode.UNSAFE_PATH_SELECTOR
 
 
+_DOT_PREFIXED_PATHS = (
+    ".github/workflows/ci.yml",
+    ".dockerignore",
+    ".gitignore",
+    ".aiworkhub/config/workforce.json",
+)
+
+
+@pytest.mark.parametrize("dot_path", _DOT_PREFIXED_PATHS)
+def test_resolve_accepts_dot_prefixed_concrete_path(dot_path):
+    manifest = dr.parse_manifest(_manifest_mapping())
+
+    resolved = dr.resolve(manifest, path=dot_path)
+
+    assert resolved.path == dot_path
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        ".",
+        "./x",
+        "a/./b",
+        "a/.",
+        "a//b",
+        ".github//ci.yml",
+        "a/",
+        ".github/",
+        "../x",
+        ".../x",
+        "/abs",
+        "/.dockerignore",
+        ".github\\ci.yml",
+        ".docker\x00ignore",
+        ".dockerignore\n",
+        "-x",
+        ".github/**",
+        ".git*",
+        ".env?",
+        ".github/[ab].yml",
+        pytest.param("." + "a" * 256, id="over_max_length"),
+    ],
+)
+def test_resolve_rejects_dot_segments_and_non_canonical_paths(bad_path):
+    manifest = dr.parse_manifest(_manifest_mapping())
+    with pytest.raises(dr.ManifestValidationError) as excinfo:
+        dr.resolve(manifest, path=bad_path)
+    assert excinfo.value.reason is dr.ReasonCode.UNSAFE_PATH_SELECTOR
+
+
+def test_resolve_rejects_empty_path():
+    manifest = dr.parse_manifest(_manifest_mapping())
+    with pytest.raises(dr.ManifestValidationError) as excinfo:
+        dr.resolve(manifest, path="")
+    assert excinfo.value.reason is dr.ReasonCode.WRONG_TYPE
+
+
+def test_applies_and_specificity_handle_dot_prefixed_paths():
+    mapping = _manifest_mapping()
+    mapping["rules"][5]["applicability"]["paths"] = ["src/*.py"]
+    manifest = dr.parse_manifest(mapping)
+    scoped = _rule_by_id(manifest, "coding_convention_rule").applicability
+    unscoped = _rule_by_id(manifest, "perf_generic").applicability
+
+    assert dr._applies(scoped, language=None, path="src/core.py", task=None, risk=None)
+    assert not dr._applies(scoped, language=None, path=".github/x.yml", task=None, risk=None)
+    assert dr._applies(unscoped, language=None, path=".github/x.yml", task=None, risk=None)
+    assert dr._specificity(scoped, path="src/core.py") == 1
+    assert dr._specificity(scoped, path=".github/x.yml") == 0
+    assert dr._specificity(unscoped, path=".github/x.yml") == 0
+
+
+def test_resolve_dot_prefixed_path_keeps_only_rules_without_path_applicability():
+    mapping = _manifest_mapping()
+    mapping["rules"][5]["applicability"]["paths"] = ["src/*.py"]
+    manifest = dr.parse_manifest(mapping)
+
+    src_ids = {rule.id for rule in dr.resolve(manifest, path="src/core.py").rules}
+    dot_ids = {rule.id for rule in dr.resolve(manifest, path=".github/x.yml").rules}
+    pathless_ids = {rule.id for rule in dr.resolve(manifest).rules}
+
+    assert "coding_convention_rule" in src_ids
+    assert "coding_convention_rule" not in dot_ids
+    assert "perf_generic" in dot_ids
+    assert dot_ids == pathless_ids
+
+
+@pytest.mark.parametrize("path", [*_DOT_PREFIXED_PATHS, "src/aiworkhub/server.py"])
+def test_resolve_repository_manifest_accepts_dot_prefixed_and_regular_paths(path):
+    manifest_path = Path(__file__).resolve().parents[1] / ".aiworkhub/config/development_rules.json"
+    manifest = dr.parse_manifest_bytes(manifest_path.read_bytes())
+
+    resolved = dr.resolve(manifest, path=path, risk="medium")
+
+    assert resolved.path == path
+
+
 def test_resolve_rejects_malformed_language_identifier():
     manifest = dr.parse_manifest(_manifest_mapping())
     with pytest.raises(dr.ManifestValidationError) as excinfo:
