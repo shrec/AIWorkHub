@@ -520,7 +520,7 @@ const VSCODE_LM_MAX_FINALIZATION_TURNS = 4;
 // turns allow an optional Source Graph lookup and one transient submit retry
 // without paying for the generic 24-turn coding-agent loop.
 const VSCODE_LM_MAX_QUALITY_REVIEW_TURNS = 3;
-// GeoAI 2026-10-19 (NF-2026-01598): a reviewer whose packet omits hunks must
+// NF-2026-01598: a reviewer whose packet omits hunks must
 // read them. Each provider turn that yields distinct new source evidence
 // extends the submit budget by one turn (never per row), at most this many
 // times. 3 + 7 forces submit at post-source turn 10, which leaves turn 11 for

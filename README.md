@@ -304,10 +304,10 @@ synthetic savings multiplier.
 | Authenticated edit shape | 531 replacement bytes for 31,998 existing-file bytes (1.66%; 60.26× structural ratio), with zero old bytes re-emitted | Verified reduction in emitted code payload when a full-file baseline applies; not a 60.26× claim for the complete provider bill |
 | Current Source Graph gate | 7/7 gated tasks used live graph evidence; 13 calls, 0 failures; p50 15.024 ms | Verified runtime snapshot |
 | Callback durability | 271 events, zero dead letters and zero backlog | Verified runtime snapshot |
+| Context Bundle v2 encoding | One same-evidence representative fixture shrank from 849 to 600 bytes (29.329%) | Verified structural fix; live fleet remeasurement pending |
 
-See [Benchmarks](docs/BENCHMARKS.md) for the full evidence matrix, denominators,
-adjacent-tool capability boundaries, raw ledgers and the promotion gate required
-before publishing any universal savings claim.
+See [Benchmarks](docs/BENCHMARKS.md) for the full evidence matrix, denominators, adjacent-tool capability
+boundaries, raw ledgers and the promotion gate required before publishing any universal savings claim.
 
 ### Supported models
 
