@@ -138,23 +138,34 @@ def test_validation_only_replay_still_rejects_bytes_that_equal_the_base(
         _cleanup(repo, successor, predecessor)
 
 
-def test_normal_launch_keeps_todays_behavior_and_failure_code(
+def test_normal_launch_credits_pinned_output_and_fails_closed_without_pin(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
 ) -> None:
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
     predecessor = successor = None
     try:
         # Same genuinely-changed bytes as the first test above, but without
-        # ``validation_only_replay``: an ordinary strict finalization must
-        # keep failing closed exactly as it did before that flag existed.
+        # ``validation_only_replay``: strict finalization credits the pinned
+        # sha256 of a no-delta predecessor's inherited path (NF-2026-01553),
+        # and a pin that is not a digest voids that credit and fails closed.
         predecessor, successor, rework_predecessor = _seeded_successor(
             repo, "nf966-pred-normal", "nf966-succ-normal", b"predecessor-changed\n"
+        )
+        records = worker_workspace.validate_required_outputs(
+            successor,
+            [REQUIRED_OUTPUT],
+            rework_predecessor=rework_predecessor,
+            strict_rework_inheritance=True,
+        )
+        assert [rec["path"] for rec in records] == [REQUIRED_OUTPUT]
+        voided = dict(
+            rework_predecessor, changed_path_hashes={REQUIRED_OUTPUT: "not-a-digest"}
         )
         with pytest.raises(worker_workspace.WorkspaceError) as excinfo:
             worker_workspace.validate_required_outputs(
                 successor,
                 [REQUIRED_OUTPUT],
-                rework_predecessor=rework_predecessor,
+                rework_predecessor=voided,
                 strict_rework_inheritance=True,
             )
         _assert_unchanged_mismatch(excinfo)

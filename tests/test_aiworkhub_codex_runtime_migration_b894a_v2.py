@@ -344,7 +344,11 @@ def test_no_process_kill_or_shell_true_in_migration_feature():
     text = EXTENSION_JS.read_text(encoding="utf8")
     feature_block_start = text.index("Codex config.toml PYTHONPATH runtime migration (B894a)")
     end = text.index("function installedExtensionVersion")
-    feature_block = text[feature_block_start:end]
+    # The stable-launcher hot-swap shares this section but is its own feature:
+    # its embedded Python launcher supervises (and kills) its own MCP child.
+    launcher_start = text.index("function materializeStableMcpLauncher", feature_block_start)
+    launcher_end = text.index("function stableMcpLauncherLayoutOk", launcher_start)
+    feature_block = text[feature_block_start:launcher_start] + text[launcher_end:end]
     assert "shell: true" not in feature_block
     assert "shell:true" not in feature_block
     assert ".kill(" not in feature_block

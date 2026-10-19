@@ -84,6 +84,9 @@ _PACKAGE_FILES = (
     "runtime_adapters.py",
     "reasoning_policy.py",
     "runtime_executable_registry.py",
+    # The executable registry resolves the installed runtime root, its only
+    # accepted non-repo scope, through runtime_generation.
+    "runtime_generation.py",
     "cli_model_discovery.py",
 )
 

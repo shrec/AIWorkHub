@@ -318,6 +318,7 @@ def test_stdlib_fallback_exposes_manager_semantic_edit_pair(
         "target_id": "target-1",
         "new": "replacement",
         "idempotency_key": "manager-edit-1",
+        "allow_escape_level_change": False,
     }
 
 

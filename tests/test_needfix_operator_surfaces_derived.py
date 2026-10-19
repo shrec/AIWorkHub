@@ -873,7 +873,7 @@ class TestNeedFixTerminalArtifactProjection:
             },
         ]
 
-        def _miss(_repo, _task_id):
+        def _miss(_repo, _task_id, **_kwargs):
             return None
 
         monkeypatch.setattr(task_store, "get_task", _miss)
@@ -918,7 +918,7 @@ class TestNeedFixTerminalArtifactProjection:
         ]
         calls = {"n": 0}
 
-        def _counting_get(_repo, _task_id):
+        def _counting_get(_repo, _task_id, **_kwargs):
             calls["n"] += 1
             return None
 

@@ -3367,6 +3367,12 @@ def _wave_repo(tmp_path, monkeypatch, cards=None):
     monkeypatch.setattr(
         dashboard_mcp_app.task_store, "get_task", lambda _root, task_id: known.get(task_id)
     )
+    # roadmap_snapshot reads linked cards in one batched get_tasks call.
+    monkeypatch.setattr(
+        dashboard_mcp_app.task_store,
+        "get_tasks",
+        lambda _root, task_ids: {i: known[i] for i in task_ids if i in known},
+    )
     return repo
 
 
