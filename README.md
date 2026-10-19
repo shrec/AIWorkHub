@@ -367,9 +367,9 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.59
+## What's new in 0.12.60
 
-- A dead VS Code LM worker whose bridge folder is already gone no longer stays "pending reconcile" forever, a process the OS refuses to inspect is no longer mistaken for alive after it exits, and storage cleanup now removes read-only hardlinked files and leftover sandbox helper temp folders.
+- A worker that changed nothing now ends as a failed attempt instead of reaching review, a card rejected for an infrastructure fault is rerouted in place, xAI through OpenCode works with just its saved login, OpenCode Go runs one worker at a time, cards that write `.github/` or `.dockerignore` launch again, and a VS Code LM reviewer gets more reads while it is finding evidence.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Continuous Audit as a Service (CAAS)

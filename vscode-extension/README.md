@@ -14,9 +14,9 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.12.59
+## What's new in 0.12.60
 
-- A dead VS Code LM worker whose bridge folder is already gone no longer stays "pending reconcile" forever, a process the OS refuses to inspect is no longer mistaken for alive after it exits, and storage cleanup now removes read-only hardlinked files and leftover sandbox helper temp folders.
+- A worker that changed nothing now ends as a failed attempt instead of reaching review, a card rejected for an infrastructure fault is rerouted in place, xAI through OpenCode works with just its saved login, OpenCode Go runs one worker at a time, cards that write `.github/` or `.dockerignore` launch again, and a VS Code LM reviewer gets more reads while it is finding evidence.
 
 ## Review automation
 

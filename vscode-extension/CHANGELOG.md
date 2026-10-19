@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.60 — 2026-10-20
+
+### Fixed
+
+- Bundled runtime 0.12.60: a worker attempt that changed nothing ends as `worker_failed` instead of reaching review (NF-2026-01596); an infrastructure rejection reroutes the card in place (NF-2026-01597, NF-2026-01600); sparse validation checkouts include `scripts/` siblings (NF-2026-01599); native OpenCode providers such as xAI launch without a custom provider block (NF-2026-01603); `opencode-go` runs one launch at a time and VS Code LM readiness refusals name the stale hosts (NF-2026-01604); cards naming dot-prefixed paths such as `.dockerignore` launch again (NF-2026-01608).
+- The VS Code LM quality reviewer's read budget grows with each distinct evidence-bearing read, up to seven more, before submit is forced (NF-2026-01598).
+
+### Changed
+
+- The Marketplace page keeps a single "What's new" section; the release history lives in this changelog, and the release check fails when an older section is left in the README.
+
 ## 0.12.59 — 2026-10-17
 
 ### Fixed

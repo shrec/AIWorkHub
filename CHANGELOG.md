@@ -6,6 +6,24 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.60] - 2026-10-20
+
+### Fixed
+
+- A writable worker attempt that changed nothing finalizes as `worker_failed` (`provider_no_effect`) instead of reaching review (NF-2026-01596).
+- `reject_review` accepts an infrastructure `failure_category` for `to=pending`, and a zero-change infrastructure rejection reroutes the card in place with an audit receipt (NF-2026-01597, NF-2026-01600).
+- The sparse validation checkout follows absolute imports into depth-1 repository directories, so `scripts/` siblings are present (NF-2026-01599).
+- Native OpenCode providers such as xAI launch from the owner's credential store without a custom provider block; a sibling `opencode.jsonc` or `config.json` refuses that fallback, and the store opens through the shared read-only SQLite helper (NF-2026-01603).
+- `opencode-go` runs one launch at a time (`AIWORKHUB_PROVIDER_LAUNCH_LIMITS` overrides it), and a refused VS Code LM readiness names the stale hosts it saw (NF-2026-01604).
+- A VS Code LM quality reviewer gets one more read per distinct evidence-bearing read, up to seven, before submit is forced (NF-2026-01598).
+- Cards whose `allowed_writes` name concrete dot-prefixed paths such as `.dockerignore` or `.github/workflows/ci.yml` launch again (NF-2026-01608).
+- CI on `main` is green again: stale tests follow the current contracts, the finalizer tests are hermetic inside the AppContainer (NF-2026-01610), the duplicate-PID admission test no longer leaks its PID stubs into the launched worker (NF-2026-01611), and `process_launcher`/`worker_workspace` are back under the module-size ratchet.
+
+### Changed
+
+- The README front page is restructured for first-time readers, and a 1280x640 social preview card ships in `docs/assets/`.
+- Each README keeps a single "What's new" section; `release_metadata.py check` fails CI when an older one is left behind, and the extension README drops 115 stale sections (64 KB to 13 KB).
+
 ## [0.12.59] - 2026-10-17
 
 ### Fixed
