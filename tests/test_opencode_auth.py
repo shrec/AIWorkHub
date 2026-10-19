@@ -250,6 +250,38 @@ def test_credential_store_active_newest_wins_without_auth_json(tmp_path: Path) -
     assert _CREDENTIAL_SENTINEL not in repr(receipt)
 
 
+def test_credential_store_is_opened_through_connect_readonly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import json
+
+    source = tmp_path / "source-home" / ".local" / "share" / "opencode" / "auth.json"
+    db_path = source.parent / "opencode.db"
+    active_value = json.dumps(
+        {"key": _CREDENTIAL_SENTINEL, "type": "key"}, sort_keys=True
+    )
+    _credential_db(db_path, [("opencode-go", active_value, 1, 2000)])
+    real_connect_readonly = opencode_auth.sqlite_readonly.connect_readonly
+    calls: list[Path] = []
+
+    def recording_connect_readonly(path: Path, **kwargs: object):
+        calls.append(Path(path))
+        return real_connect_readonly(path, **kwargs)
+
+    monkeypatch.setattr(
+        opencode_auth.sqlite_readonly, "connect_readonly", recording_connect_readonly
+    )
+    isolated = tmp_path / "isolated"
+
+    opencode_auth.project_opencode_auth(source, isolated)
+
+    assert calls == [db_path.absolute()]
+    destination = isolated / opencode_auth.OPENCODE_AUTH_RELATIVE_PATH
+    assert json.loads(destination.read_bytes()) == {
+        "opencode-go": {"key": _CREDENTIAL_SENTINEL, "type": "api"}
+    }
+
+
 def test_credential_store_wins_over_auth_json(tmp_path: Path) -> None:
     import json
 

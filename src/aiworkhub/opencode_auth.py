@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Union
 from urllib.parse import urlsplit, urlunsplit
 
+from . import sqlite_readonly
 from .platform_io import (
     chmod_fd,
     chmod_path,
@@ -182,9 +183,7 @@ def _read_credential_store(database: Path) -> bytes | None:
     if posix_path_modes_supported() and stat.S_IMODE(metadata.st_mode) & 0o022:
         raise OpenCodeAuthSourceError("opencode_auth_source_writable_by_others")
     try:
-        connection = sqlite3.connect(
-            f"{database.absolute().as_uri()}?mode=ro", uri=True, timeout=5
-        )
+        connection = sqlite_readonly.connect_readonly(database.absolute(), timeout=5)
         try:
             rows = connection.execute(
                 "SELECT integration_id, value FROM credential "
