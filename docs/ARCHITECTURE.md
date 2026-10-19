@@ -34,6 +34,25 @@ repository is a fully independent instance.
   .sqlite)                                                outbox + lease)
 ```
 
+## The whole system
+
+<div align="center">
+  <a href="../site/assets/aiworkhub-system-architecture.png"><img src="../site/assets/aiworkhub-system-architecture.svg" alt="AIWorkHub system block diagram: seats and MCP surface over a five-pillar control plane, a durable runtime and repository-local .aiworkhub storage" width="100%"></a>
+</div>
+
+AIWorkHub follows one durable loop: **Observe → Decide → Delegate → Verify →
+Promote → Learn**. The map separates live foundations from the current
+hardening wave and planned capabilities. Live foundations include NeedFix and
+Roadmap intake, the Task DAG, Source Graph and durable context authorities,
+outcome-aware workforce routing, isolated worktrees, semantic edits, validation,
+sealed review receipts, provider-free replay and manager-controlled promotion.
+The active closure wave covers reviewer MCP delivery, exact liveness, finalizer
+leases, validation isolation, cross-platform parity, Source Graph refresh truth,
+storage retention and NeedFix lifecycle reconciliation. Planned capabilities
+include automatic NeedFix closure and TTL cleanup, provider controls, CPU-aware
+parallelism, richer evidence visualization and quality-calibrated release
+automation.
+
 ## Concurrency: multiple cores by default
 
 AIWorkHub is written for multiple cores wherever the work allows it. Work that

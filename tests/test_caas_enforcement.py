@@ -134,7 +134,7 @@ BAD = "Continuous Automated Assurance System"
 
 def test_allowlist_entries_are_exact_reviewable_occurrences():
     assert [(site.path, site.line, site.column) for site in ALLOWED_CORRECTION_SITES] == [
-        ("README.md", 60, 41),
+        ("README.md", 386, 41),
         ("docs/CAAS_PROTOCOL.md", 4, 42),
         ("docs/CAAS_PROTOCOL.md", 50, 39),
     ]
@@ -147,7 +147,7 @@ def test_allowlisted_path_reports_additional_occurrence(tmp_path, monkeypatch):
     readme = repo / "README.md"
     declared_line = "x" * 40 + BAD
     readme.write_text(
-        "\n" * 59 + declared_line + "\nAdditional misuse: " + BAD,
+        "\n" * 385 + declared_line + "\nAdditional misuse: " + BAD,
         encoding="utf-8",
     )
     monkeypatch.setattr(caas_enforcement, "_REPO_ROOT", repo)

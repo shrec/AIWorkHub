@@ -1014,6 +1014,7 @@ noted by package/extension version and release tag.
   invalid JSON reply, fails closed. Worker semantic edit prepare/apply stays
   on the worker editor and is not rewritten onto the manager tools.
 
+## [0.11.73] - 2026-09-25
 
 ### Fixed
 
