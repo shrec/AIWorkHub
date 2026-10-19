@@ -343,6 +343,9 @@ _PROVIDER_UNREACHABLE_RESULT_RE = re.compile(r"\b(?:ENOTFOUND|EAI_AGAIN|ECONNRES
 # ``_signature_code`` for why its length is the one number that block needs.
 _VSCODE_LM_SIGNATURE_COUNT = len(_VSCODE_LM_CODES)
 
+# Launcher-minted prefix: a writable attempt finalized with nothing changed.
+PROVIDER_NO_EFFECT = "provider_no_effect"
+
 # The closed vocabulary of DETERMINISTIC CONTROL-PLANE REASONS: reason tokens
 # minted by AIWorkHub's own code to state why the control plane refused or
 # could not complete a state transition. They are not provider output and not
@@ -512,6 +515,7 @@ _CONTROL_PLANE_REASONS: tuple[str, ...] = (
     # this cause when the recorded sandbox backend drifted; naming it here
     # keeps the refusal out of ``unclassified`` (NF-2026-01346).
     "validation_route_backend_mismatch",
+    PROVIDER_NO_EFFECT,
     # ------------------------------------------------------------------ #
     # WRAPPERS ONLY BELOW THIS LINE -- see the ordering note above.
     #
@@ -1457,9 +1461,9 @@ def required_output_reason(
 # Only a DETERMINISTIC CONTROL-PLANE REASON may be typed out of a workspace
 # error at all -- a terminal-state name or a provider signature code appearing
 # at the head of an exception message is not evidence that the message IS that
-# reason -- and, within those, only the two the ALLOWLISTED DIAGNOSTIC SHAPE
-# PROVABLY CANNOT CARRY. That restriction is deliberate and is the whole of
-# Step 1's blast radius:
+# reason -- and, within those, only the three whose typed form the ALLOWLISTED
+# DIAGNOSTIC SHAPE CANNOT REPRODUCE. That restriction is deliberate and is the
+# whole of Step 1's blast radius:
 #
 # ``claim_ownership_lost`` -- the terminal state the launcher pairs it with is
 #   the generic ``finalize_failed``, so the diagnostic ``finalize_failed:
@@ -1470,6 +1474,9 @@ def required_output_reason(
 # ``required_output_mismatch`` -- the only reason carrying structured evidence
 #   (which declared outputs went unchanged) that the fixed shape has no slot
 #   for. See ``required_output_reason``.
+# ``provider_no_effect`` -- the diagnostic leads with the terminal-state label
+#   (``worker_failed:provider_no_effect``), but ``failure_disposition_from_substatus``
+#   keys on a reason's FIRST ``:`` segment, so only the bare typed reason places it.
 #
 # Every other control-plane reason is already named correctly by the
 # diagnostic, whose ``<failure_kind>:<code>[:exit_code=N]`` form states both
@@ -1480,6 +1487,7 @@ def required_output_reason(
 _WORKSPACE_ERROR_REASONS: frozenset[str] = frozenset({
     "claim_ownership_lost",
     "required_output_mismatch",
+    PROVIDER_NO_EFFECT,
 })
 
 
@@ -2879,6 +2887,8 @@ _REASON_CAUSE: dict[str, str] = {
     # replay the identical bytes forever, nor validation_environment, which
     # blames the sandbox for work that was never done.
     "rework_no_delta": CAUSE_CANDIDATE_CODE,
+    # A writable attempt that changed nothing: a provider fault, not candidate code or the sandbox.
+    PROVIDER_NO_EFFECT: CAUSE_PROVIDER_RUNTIME_UNCLASSIFIED,
     "claude_subscription_session_refresh_required": CAUSE_PROVIDER_CREDENTIAL,
     "validation_unsupported_in_sandbox": CAUSE_SANDBOX_UNSUPPORTED,
     # Every control-plane reason that says the CARD ROW moved or that this

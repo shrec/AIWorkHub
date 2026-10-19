@@ -579,10 +579,38 @@ def test_reject_to_blocked_can_pin_verified_infrastructure_failure(coord):
     )
 
 
+def test_reject_to_pending_can_pin_provider_runtime_failure(coord):
+    _insert(
+        coord,
+        "T_PENDING_PROVIDER",
+        card={
+            "claim_epoch": 4,
+            "terminal_review": {"substatus": "review_ready"},
+            "deterministic_verification": {"pass": True, "claim_epoch": 4},
+        },
+    )
+
+    res = core.reject_review(
+        "T_PENDING_PROVIDER",
+        "automatic security reviewer was never materialized",
+        to="pending",
+        failure_category="provider_runtime",
+    )
+
+    assert res["ok"] is True, res
+    card = json.loads(_row(coord, "T_PENDING_PROVIDER")["card_json"])
+    assert card["rejection_disposition"]["failure_category"] == "provider_runtime"
+    assert (
+        card["rejection_disposition"]["failure_category_source"]
+        == "manager_explicit_infrastructure"
+    )
+    assert _row(coord, "T_PENDING_PROVIDER")["status"] == "pending"
+
+
 @pytest.mark.parametrize(
     ("to", "failure_category", "expected_error"),
     [
-        ("pending", "provider_runtime", "failure_category_requires_blocked_disposition"),
+        ("archived", "provider_runtime", "failure_category_requires_blocked_disposition"),
         ("blocked", "candidate_code", "rejection_failure_category_not_infrastructure"),
         ("blocked", "made_up", "invalid_rejection_failure_category"),
     ],

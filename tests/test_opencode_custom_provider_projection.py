@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,16 @@ import pytest
 from aiworkhub import appcontainer_loopback_relay, opencode_auth, runtime_adapters
 
 _SENTINEL = "sentinel-key-7f32b98a"
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_owner_credential_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    missing = tmp_path / "no-owner-opencode-data" / "auth.json"
+    monkeypatch.setattr(
+        opencode_auth, "_owner_opencode_auth_source_path", lambda: missing
+    )
 
 
 def _owner_config(
@@ -146,6 +157,202 @@ def test_missing_provider_block_is_refused(
         opencode_auth.project_opencode_custom_provider(
             "omniroute/router-model", host_env={}
         )
+
+
+def _owner_auth_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str
+) -> Path:
+    source = tmp_path / "auth.json"
+    source.write_text(raw, encoding="utf-8")
+    monkeypatch.setattr(
+        opencode_auth, "_owner_opencode_auth_source_path", lambda: source
+    )
+    return source
+
+
+def test_native_credential_without_provider_block_projects_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _owner_config(tmp_path, monkeypatch, provider={})
+    _owner_auth_json(
+        tmp_path,
+        monkeypatch,
+        '{"xai": {"type": "oauth", "refresh": "refresh-value"}}',
+    )
+    assert (
+        opencode_auth.project_opencode_custom_provider(
+            "xai/grok-4.7", host_env={}
+        )
+        is None
+    )
+
+
+def test_missing_provider_block_and_credential_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _owner_config(tmp_path, monkeypatch, provider={})
+    _owner_auth_json(tmp_path, monkeypatch, '{"openai": {"type": "oauth"}}')
+    with pytest.raises(
+        opencode_auth.OpenCodeAuthError,
+        match="^opencode_provider_not_configured$",
+    ):
+        opencode_auth.project_opencode_custom_provider(
+            "xai/grok-4.7", host_env={}
+        )
+
+
+def test_configured_block_without_model_is_refused_despite_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _owner_config(
+        tmp_path,
+        monkeypatch,
+        provider={"xai": {"models": {"other-model": {"name": "Other"}}}},
+    )
+    _owner_auth_json(tmp_path, monkeypatch, '{"xai": {"type": "oauth"}}')
+    with pytest.raises(
+        opencode_auth.OpenCodeAuthError,
+        match="^opencode_provider_not_configured$",
+    ):
+        opencode_auth.project_opencode_custom_provider(
+            "xai/grok-4.7", host_env={}
+        )
+
+
+def test_native_credential_entry_that_is_not_a_dict_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _owner_config(tmp_path, monkeypatch, provider={})
+    _owner_auth_json(tmp_path, monkeypatch, '{"xai": "not-a-mapping"}')
+    with pytest.raises(
+        opencode_auth.OpenCodeAuthError,
+        match="^opencode_provider_not_configured$",
+    ):
+        opencode_auth.project_opencode_custom_provider(
+            "xai/grok-4.7", host_env={}
+        )
+
+
+_XAI_CREDENTIAL = '{"xai": {"type": "oauth", "refresh": "refresh-value"}}'
+
+
+def _assert_not_configured() -> None:
+    with pytest.raises(
+        opencode_auth.OpenCodeAuthError,
+        match="^opencode_provider_not_configured$",
+    ):
+        opencode_auth.project_opencode_custom_provider(
+            "xai/grok-4.7", host_env={}
+        )
+
+
+def test_native_credential_with_absent_owner_config_projects_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _owner_config(tmp_path, monkeypatch)
+    _owner_auth_json(tmp_path, monkeypatch, _XAI_CREDENTIAL)
+    assert (
+        opencode_auth.project_opencode_custom_provider(
+            "xai/grok-4.7", host_env={}
+        )
+        is None
+    )
+
+
+def test_unparseable_owner_config_is_refused_despite_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opencode_dir = _owner_config(tmp_path, monkeypatch)
+    (opencode_dir / "opencode.json").write_text(
+        '{/* xai */ "provider": {}}', encoding="utf-8"
+    )
+    _owner_auth_json(tmp_path, monkeypatch, _XAI_CREDENTIAL)
+    with pytest.raises(
+        opencode_auth.OpenCodeAuthError,
+        match="^opencode_provider_config_json_invalid$",
+    ):
+        opencode_auth.project_opencode_custom_provider(
+            "xai/grok-4.7", host_env={}
+        )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits only")
+def test_unsafe_owner_config_is_refused_despite_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opencode_dir = _owner_config(tmp_path, monkeypatch, provider={})
+    (opencode_dir / "opencode.json").chmod(0o666)
+    _owner_auth_json(tmp_path, monkeypatch, _XAI_CREDENTIAL)
+    with pytest.raises(
+        opencode_auth.OpenCodeAuthError,
+        match="^opencode_provider_config_writable_by_others$",
+    ):
+        opencode_auth.project_opencode_custom_provider(
+            "xai/grok-4.7", host_env={}
+        )
+
+
+@pytest.mark.parametrize(
+    "document",
+    [{"disabled_providers": ["xai"]}, {"enabled_providers": ["openai"]}],
+    ids=["disabled", "not-enabled"],
+)
+def test_native_credential_is_refused_when_config_excludes_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, document: dict
+) -> None:
+    opencode_dir = _owner_config(tmp_path, monkeypatch)
+    (opencode_dir / "opencode.json").write_text(
+        json.dumps(document), encoding="utf-8"
+    )
+    _owner_auth_json(tmp_path, monkeypatch, _XAI_CREDENTIAL)
+    _assert_not_configured()
+
+
+@pytest.mark.parametrize("sibling", ["opencode.jsonc", "config.json"])
+@pytest.mark.parametrize("with_opencode_json", [False, True], ids=["alone", "beside"])
+def test_native_credential_is_refused_when_sibling_config_policy_is_unread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sibling: str,
+    with_opencode_json: bool,
+) -> None:
+    opencode_dir = _owner_config(
+        tmp_path, monkeypatch, provider={} if with_opencode_json else None
+    )
+    (opencode_dir / sibling).write_text(
+        '{"disabled_providers": ["xai"]}', encoding="utf-8"
+    )
+    _owner_auth_json(tmp_path, monkeypatch, _XAI_CREDENTIAL)
+    _assert_not_configured()
+
+
+def test_native_credential_store_database_wins_over_auth_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _owner_config(tmp_path, monkeypatch, provider={})
+    source = _owner_auth_json(tmp_path, monkeypatch, _XAI_CREDENTIAL)
+    connection = sqlite3.connect(source.parent / "opencode.db")
+    try:
+        connection.execute(
+            "CREATE TABLE credential (integration_id TEXT, value TEXT, "
+            "active INTEGER, time_updated INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO credential VALUES (?, ?, 1, 1)",
+            ("openai", '{"type": "oauth"}'),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    _assert_not_configured()
+
+
+def test_deeply_nested_credential_source_is_refused_not_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _owner_config(tmp_path, monkeypatch, provider={})
+    _owner_auth_json(tmp_path, monkeypatch, "[" * 100_000)
+    _assert_not_configured()
 
 
 def test_missing_owner_config_file_is_refused(

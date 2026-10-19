@@ -389,6 +389,55 @@ def _owner_opencode_global_config_path() -> Path:
     return Path.home() / ".config" / "opencode" / "opencode.json"
 
 
+def _owner_opencode_auth_source_path() -> Path:
+    """The owner's OpenCode credential source; worker_workspace projects it."""
+    return Path.home() / ".local" / "share" / "opencode" / "auth.json"
+
+
+def _owner_opencode_credential_has_provider(provider: str) -> bool:
+    """True when the owner's credential source names ``provider`` usable.
+
+    Reads exactly the order :func:`project_opencode_auth` uses -- the
+    ``opencode.db`` store beside ``auth.json`` first, then the verified
+    ``auth.json`` -- and reports presence only: never a credential value.
+    """
+    source = _owner_opencode_auth_source_path()
+    try:
+        raw = _read_credential_store(source.parent / "opencode.db")
+        if raw is None:
+            raw = _read_verified_source(source)
+    except (OpenCodeAuthError, OSError, ValueError, RecursionError):
+        return False
+    if not raw or len(raw) > MAX_SOURCE_BYTES:
+        return False
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(document, dict):
+        return False
+    entry = document.get(provider)
+    if not isinstance(entry, dict):
+        return False
+    kind = entry.get("type")
+    return isinstance(kind, str) and bool(kind)
+
+
+def _owner_opencode_native_provider(provider: str) -> bool:
+    """A native credential entry, with no sibling config whose policy is unread.
+
+    OpenCode also merges ``opencode.jsonc`` and ``config.json`` beside
+    ``opencode.json``; their ``disabled_providers``/``enabled_providers`` are
+    not read here, so either one refuses the native fallback rather than
+    ignoring an exclusion kept there.
+    """
+    config_dir = _owner_opencode_global_config_path().parent
+    siblings = ("opencode.jsonc", "config.json")
+    if any(os.path.lexists(config_dir / name) for name in siblings):
+        return False
+    return _owner_opencode_credential_has_provider(provider)
+
+
 def _read_bounded_json(path: Path) -> object | None:
     # The owner config decides which host secret is released and where it is
     # sent, so it gets auth.json's bounded, owner- and mode-checked read.  Only
@@ -604,6 +653,10 @@ def project_opencode_custom_provider(
     resolved from ``host_env`` (default ``os.environ``) and the model entry
     keeps only ``id``, ``limit`` and the boolean capability flags.
     The v2 ``providers`` block is read when no v1 ``provider`` block exists.
+    ``None`` is also returned for a provider with no custom block when the
+    owner's OpenCode credential source has an entry for it (a native
+    provider, NF-2026-01603) and the config does not disable it; an unsafe or
+    unparseable owner config still refuses with its named reason.
     """
     if "/" not in model:
         return None
@@ -614,8 +667,12 @@ def project_opencode_custom_provider(
     # case-insensitive lookup OpenCode's process.env uses for {env:VAR}.
     env = host_env if host_env is not None else os.environ
     config_path = _owner_opencode_global_config_path()
+    # NF-2026-01603: a native credential entry is enough without a provider block;
+    # an unsafe or unparseable owner config still refuses with its named reason.
     document = _read_bounded_json(config_path)
     if not isinstance(document, dict):
+        if _owner_opencode_native_provider(provider):
+            return None
         raise OpenCodeAuthError("opencode_provider_not_configured")
     providers = document.get("provider")
     block = providers.get(provider) if isinstance(providers, dict) else None
@@ -623,6 +680,13 @@ def project_opencode_custom_provider(
         providers_v2 = document.get("providers")
         v2_block = providers_v2.get(provider) if isinstance(providers_v2, dict) else None
         if not isinstance(v2_block, dict):
+            disabled = document.get("disabled_providers")
+            enabled = document.get("enabled_providers")
+            excluded = (isinstance(disabled, list) and provider in disabled) or (
+                isinstance(enabled, list) and provider not in enabled
+            )
+            if not excluded and _owner_opencode_native_provider(provider):
+                return None
             raise OpenCodeAuthError("opencode_provider_not_configured")
         block = _translate_opencode_v2_provider_block(v2_block, env)
     models = block.get("models")

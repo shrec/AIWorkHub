@@ -1530,13 +1530,35 @@ def _resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[st
                     return root, candidate
         return None
 
+    _fallback_cache: list[list[Path]] = []
+    # ponytail: depth-1 directories only; deeper layouts need an explicit package root
+    def fallback_dirs() -> list[Path]:
+        if not _fallback_cache:
+            _fallback_cache.append(sorted(
+                (p for p in repo.iterdir()
+                 if p.is_dir() and not p.is_symlink() and not p.name.startswith('.')
+                 and p.name not in {'__pycache__', 'node_modules'} and p not in roots),
+                key=lambda v: v.as_posix()))
+        return _fallback_cache[0]
+
     def add_module(
         parts: tuple[str, ...],
         pending: list[str],
         rows: set[str],
         preferred_root: Path | None = None,
+        *,
+        allow_fallback: bool = False,
     ) -> bool:
         resolved = module_file(parts, preferred_root)
+        if resolved is None and allow_fallback and parts and parts[0] not in sys.stdlib_module_names:
+            for directory in fallback_dirs():
+                try:
+                    resolved = module_file(parts, directory)
+                except WorkspaceError:
+                    resolved = None
+                    continue
+                if resolved is not None:
+                    break
         if resolved is None:
             return False
         root, candidate = resolved
@@ -1764,7 +1786,13 @@ def _resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[st
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    add_module(tuple(alias.name.split(".")), pending, rows, source_root)
+                    add_module(
+                        tuple(alias.name.split(".")),
+                        pending,
+                        rows,
+                        source_root,
+                        allow_fallback=True,
+                    )
             elif isinstance(node, ast.ImportFrom):
                 module_parts = tuple((node.module or "").split(".")) if node.module else ()
                 if node.level:
@@ -1774,9 +1802,17 @@ def _resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[st
                     if module_parts and not add_module(base, pending, rows, source_root):
                         raise WorkspaceError(f"validation_python_relative_import_unresolved:{relative}:" + ".".join(base))
                 else:
-                    base = module_parts; add_module(base, pending, rows, source_root)
+                    base = module_parts
+                    add_module(base, pending, rows, source_root, allow_fallback=True)
                 for alias in node.names:
-                    if alias.name != "*": add_module(base + tuple(alias.name.split(".")), pending, rows, source_root)
+                    if alias.name != "*":
+                        add_module(
+                            base + tuple(alias.name.split(".")),
+                            pending,
+                            rows,
+                            source_root,
+                            allow_fallback=node.level == 0,
+                        )
 
         # Dynamic imports are intentionally limited to direct canonical calls in
         # module-level statements, evaluated after an unaliased importlib import.

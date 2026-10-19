@@ -408,6 +408,7 @@ else:
 ALLOW_LAUNCH_ENV = "AIWORKHUB_ALLOW_LAUNCH"
 ALLOW_WRITES_ENV = "AIWORKHUB_ALLOW_WRITES"
 MAX_PROCESSES_ENV = "AIWORKHUB_MAX_PROCESSES"
+PROVIDER_LAUNCH_LIMITS_ENV = "AIWORKHUB_PROVIDER_LAUNCH_LIMITS"
 EXTERNAL_READONLY_ROOTS: tuple[Path, ...] = (
     Path("/mnt/ssd/aiworkhub_data"),
     Path("/mnt/ssd/corpus"),
@@ -865,6 +866,9 @@ def _terminal_state_for_workspace_error(exc: WorkspaceError) -> str:
         # and is in DELTA_RETAINING_TERMINAL_STATES, so the sealed predecessor
         # delta survives for the next rework.
         return "worker_failed"
+    if error.startswith(terminal_failure_classification.PROVIDER_NO_EFFECT):
+        # A provider that did no work is a worker fault; finalize_failed would blame the sandbox.
+        return "worker_failed"
     return _launcher_validation.terminal_state_for_workspace_error(exc)
 
 # Failure workspaces remain available through coordinator review.  Once a
@@ -1176,6 +1180,10 @@ def _memory_launch_admission() -> dict[str, Any]:
 
 class LaunchRejected(RuntimeError):
     """A bounded, user-visible preflight rejection."""
+
+    def __init__(self, reason: str, *, diagnostic: Mapping[str, Any] | None = None):
+        super().__init__(reason)
+        self.diagnostic = dict(diagnostic or {})
 
 
 class _QualityReviewFinalized(RuntimeError):
@@ -1551,6 +1559,57 @@ def launch_gates_open() -> bool:
 def _configured_limit() -> int:
     # NF-2026-01359: one resolver; bootstrap and list_processes report its source and reason.
     return int(repo_policy.resolve_workforce_cap()["effective_cap"])
+
+
+_PROVIDER_LAUNCH_LIMITS_DEFAULT: dict[str, int] = {"opencode-go": 1}
+_PROVIDER_LAUNCH_LIMITS_MAX_ENTRIES = 32
+
+
+def _provider_launch_limits() -> dict[str, int]:
+    """Per-provider launch limits: the defaults, overridden entry by entry.
+
+    ``AIWORKHUB_PROVIDER_LAUNCH_LIMITS="opencode-go=1,xai=2"``.  A malformed or
+    non-positive entry is ignored, so a bad value can leave a default in force
+    but never removes one.
+    """
+
+    limits = dict(_PROVIDER_LAUNCH_LIMITS_DEFAULT)
+    raw = os.environ.get(PROVIDER_LAUNCH_LIMITS_ENV, "")
+    for entry in raw.split(",")[:_PROVIDER_LAUNCH_LIMITS_MAX_ENTRIES]:
+        name, separator, value = entry.partition("=")
+        name, value = name.strip().lower(), value.strip()
+        if not separator or not name or len(name) > 64 or "/" in name:
+            continue
+        if len(value) > 4 or not (value.isascii() and value.isdigit()):
+            continue
+        if int(value) >= 1:
+            limits[name] = int(value)
+    return limits
+
+
+def _provider_launch_key(model: object) -> str | None:
+    """The lowercase provider prefix of ``provider/model``; None when slash-less."""
+
+    if not isinstance(model, str):
+        return None
+    prefix, separator, _rest = model.partition("/")
+    key = prefix.strip().lower()
+    return key if separator and key else None
+
+
+def _vscode_lm_readiness_diagnostic(readiness: Mapping[str, Any]) -> dict[str, Any]:
+    """Bounded bridge evidence attached to a refused vscode_lm readiness."""
+
+    return {
+        "blocker_reason": str(readiness.get("blocker_reason") or "not_launchable"),
+        "stale_hosts": list(readiness.get("stale_hosts") or [])[:8],
+        "live_host_count": readiness.get("live_host_count"),
+        "observed_models": [
+            str(name)[:128]
+            for name in list(readiness.get("observed_models") or [])[:16]
+        ],
+        "freshest_age_seconds": readiness.get("freshest_age_seconds"),
+    }
 
 
 def _safe_tail(path: Path, max_bytes: int = MAX_LOG_TAIL_BYTES) -> str:
@@ -4532,6 +4591,14 @@ class ProcessManager:
                 )
                 if self._active_count(latest) >= _configured_limit():
                     raise LaunchRejected("concurrency_limit_reached")
+                # A validation-only replay spawns no provider, so it takes no
+                # provider slot.
+                if event.get("provider_launched") is not False:
+                    provider_refusal = self._provider_launch_refusal(
+                        event.get("model"), latest
+                    )
+                    if provider_refusal:
+                        raise LaunchRejected(provider_refusal)
                 self._assert_no_duplicate_task(
                     str(event.get("task_id") or ""), latest
                 )
@@ -5375,7 +5442,8 @@ class ProcessManager:
             if not readiness.get("launchable"):
                 raise LaunchRejected(
                     "vscode_lm_unavailable:"
-                    + str(readiness.get("blocker_reason") or "not_launchable")
+                    + str(readiness.get("blocker_reason") or "not_launchable"),
+                    diagnostic=_vscode_lm_readiness_diagnostic(readiness),
                 )
             return (
                 None,
@@ -5394,7 +5462,8 @@ class ProcessManager:
             if not readiness.get("launchable"):
                 raise LaunchRejected(
                     "deepseek_vscode_lm_unavailable:"
-                    + str(readiness.get("blocker_reason") or "not_launchable")
+                    + str(readiness.get("blocker_reason") or "not_launchable"),
+                    diagnostic=_vscode_lm_readiness_diagnostic(readiness),
                 )
             return (
                 None,
@@ -5425,7 +5494,8 @@ class ProcessManager:
             if not readiness.get("launchable"):
                 raise LaunchRejected(
                     "glm_vscode_lm_unavailable:"
-                    + str(readiness.get("blocker_reason") or "not_launchable")
+                    + str(readiness.get("blocker_reason") or "not_launchable"),
+                    diagnostic=_vscode_lm_readiness_diagnostic(readiness),
                 )
             return (
                 None,
@@ -5611,6 +5681,52 @@ class ProcessManager:
         self, latest: Mapping[str, Mapping[str, Any]] | None = None
     ) -> int:
         return len(self._active_request_ids(latest))
+
+    def _provider_active_count(
+        self, key: str, latest: Mapping[str, Mapping[str, Any]] | None = None
+    ) -> int:
+        """Active requests whose latest event names provider ``key``.
+
+        A validation-only replay (``provider_launched`` False) spawns no
+        provider, so it never fills a provider slot.
+        """
+
+        if latest is None:
+            latest = self._latest_by_request()
+        active = self._active_request_ids(latest)
+        # Lifecycle rows are sparse -- cancel()'s cancel_requested row carries
+        # no model -- so a row without one folds model/provider_launched from
+        # its request's lineage, as _event_identity does.
+        sparse = [rid for rid in active if "model" not in (latest.get(rid) or {})]
+        lineage = self._request_events_batch(sparse) if sparse else {}
+        count = 0
+        for request_id in active:
+            folded: dict[str, Any] = {}
+            for row in lineage.get(request_id, ()):
+                folded.update(
+                    {k: row[k] for k in ("model", "provider_launched") if k in row}
+                )
+            event = {**folded, **(latest.get(request_id) or {})}
+            if event.get("provider_launched") is False:
+                continue
+            if _provider_launch_key(event.get("model")) == key:
+                count += 1
+        return count
+
+    def _provider_launch_refusal(
+        self,
+        model: object,
+        latest: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> str:
+        """The ``provider_launch_limit_reached`` reason, or "" when admitted."""
+
+        key = _provider_launch_key(model)
+        if key is None:
+            return ""
+        limit = _provider_launch_limits().get(key)
+        if limit is None or self._provider_active_count(key, latest) < limit:
+            return ""
+        return f"provider_launch_limit_reached:{key}:{limit}"
 
     def _validation_replay_predecessor_mcp_receipt(
         self,
@@ -6177,6 +6293,7 @@ class ProcessManager:
                 request_id=request_id,
                 state="launch_failed" if claimed else "blocked",
                 diagnostic={
+                    **(getattr(exc, "diagnostic", None) or {}),
                     "execution_mode": "validation_only_replay",
                     "provider_launched": "false",
                 },
@@ -7578,6 +7695,9 @@ class ProcessManager:
                     }
                 if self._active_count(latest) >= _configured_limit():
                     return {"ok": False, "error": "concurrency_limit_reached"}
+                provider_refusal = self._provider_launch_refusal(model, latest)
+                if provider_refusal:
+                    return {"ok": False, "error": provider_refusal}
                 request_id = uuid.uuid4().hex
                 sealed_attempt = {
                     "target_request_id": target_request_id,
@@ -8750,6 +8870,9 @@ class ProcessManager:
             with self._lock, self._registry_lock():
                 if self._active_count() >= _configured_limit():
                     raise LaunchRejected("concurrency_limit_reached")
+                provider_refusal = self._provider_launch_refusal(model)
+                if provider_refusal:
+                    raise LaunchRejected(provider_refusal)
                 for live in self._live.values():
                     if live.task_id == task_id and live.process.poll() is None:
                         raise LaunchRejected(f"duplicate_live_task:{live.request_id}")
@@ -8910,7 +9033,8 @@ class ProcessManager:
             if request_id is not None:
                 dispose_worker_temp(self.repo, request_id)
             return self._blocked(
-                task_id, runner, topic, adapter_id, str(exc), request_id=request_id
+                task_id, runner, topic, adapter_id, str(exc), request_id=request_id,
+                diagnostic=getattr(exc, "diagnostic", None) or None,
             )
 
     def _blocked(
@@ -11735,6 +11859,15 @@ class ProcessManager:
                         validation_only_replay = (
                             metadata.get("execution_mode") == "validation_only_replay"
                         )
+                        # Must precede the output/validation gates: their failures route to review.
+                        if (
+                            not changed
+                            and not validation_only_replay
+                            and not _metadata_is_readonly_research(metadata, workspace)
+                        ):
+                            raise WorkspaceError(
+                                terminal_failure_classification.PROVIDER_NO_EFFECT
+                            )
                         required_output_records = validate_required_outputs(
                             workspace,
                             metadata.get("required_outputs") or [],

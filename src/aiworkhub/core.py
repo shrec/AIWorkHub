@@ -6487,14 +6487,14 @@ def reject_review(
     if failure_category is not None:
         # A verified manager may park a candidate because the review machinery
         # itself failed. Keep that signal out of candidate-code learning, but
-        # expose no general-purpose taxonomy override: only blocked tasks and
+        # expose no general-purpose taxonomy override: only blocked or pending tasks and
         # only the closed infrastructure vocabulary are accepted here.
         #
         # NF-2026-00847: that vocabulary is a PROJECTION of the canonical typed
         # disposition's manager-intent causes, not a second hand-maintained
         # list. An authenticated manager intent is one of the four evidence
         # authorities allowed to select an action, and this is where it enters.
-        if disposition != "blocked":
+        if disposition not in ("blocked", "pending"):
             return _lifecycle_error("failure_category_requires_blocked_disposition")
         try:
             requested_category = FailureCategory(str(failure_category).strip())
@@ -9221,9 +9221,42 @@ def _is_review_rejection_reroute(card: Mapping[str, Any]) -> bool:
         or rejection.get("schema_id") != "aiworkhub.rejection_disposition.v1"
     ):
         return False
+    # NF-2026-01600: a reject-to-pending pinned to an infrastructure category
+    # with no retained candidate is an operational provider reroute.
+    if _infrastructure_rejection_without_candidate(card):
+        return False
     if rejection.get("to") == "pending":
         return True
     return rejection.get("failure_category") == "candidate_code"
+
+
+def _infrastructure_rejection_without_candidate(
+    card: Mapping[str, Any],
+) -> bool:
+    """True only for a manager reject-to-pending pinned to infrastructure.
+
+    A zero-change candidate has no retained delta, so the review-rejection
+    receipt can never be satisfied. Such a rejection reroutes in place as an
+    operational provider reroute with its rejection disposition recorded as
+    the audit receipt.
+    """
+    rejection = card.get("rejection_disposition")
+    if (
+        not isinstance(rejection, dict)
+        or rejection.get("schema_id") != "aiworkhub.rejection_disposition.v1"
+        or rejection.get("to") != "pending"
+        or rejection.get("failure_category_source")
+        != "manager_explicit_infrastructure"
+    ):
+        return False
+    failure_category = rejection.get("failure_category")
+    if failure_category not in (
+        terminal_failure_classification.MANAGER_REJECTION_INTENT_CAUSES
+    ):
+        return False
+    if _has_retained_candidate_delta(card):
+        return False
+    return True
 
 
 def _manager_recovery_reroute_episode(card: Mapping[str, Any]) -> bool:
@@ -9293,14 +9326,17 @@ def _operational_provider_reroute_authorization(
         return None
     recovery = _manager_recovery_reroute_episode(card)
     retry = _provider_runtime_or_cancellation_retry(card)
-    if not recovery and not retry:
+    infrastructure_rejection = _infrastructure_rejection_without_candidate(card)
+    if not recovery and not retry and not infrastructure_rejection:
         return None
     if recovery and retry:
         authority = "manager_recovery_and_operational_retry"
     elif recovery:
         authority = "manager_recovery"
-    else:
+    elif retry:
         authority = "provider_runtime_or_cancellation"
+    else:
+        authority = "manager_infrastructure_rejection"
     receipt: dict[str, Any] = {
         "schema_id": "aiworkhub.operational_provider_reroute.v1",
         "authority": authority,
@@ -9321,6 +9357,15 @@ def _operational_provider_reroute_authorization(
             ).strip()
             receipt["retry_request_id"] = str(
                 terminal_retry.get("request_id") or ""
+            ).strip()
+    if infrastructure_rejection:
+        rejection_disposition = card.get("rejection_disposition")
+        if isinstance(rejection_disposition, dict):
+            receipt["rejection_request_id"] = str(
+                rejection_disposition.get("request_id") or ""
+            ).strip()
+            receipt["failure_category"] = str(
+                rejection_disposition.get("failure_category") or ""
             ).strip()
     return receipt
 

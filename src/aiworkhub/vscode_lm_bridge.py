@@ -583,6 +583,19 @@ def bridge_readiness(
         blocker_reason = "vscode_lm_model_not_visible"
     else:
         blocker_reason = "vscode_lm_model_catalog_empty"
+    stale_hosts = [
+        {
+            "window_id": str(item.get("window_id") or "")[:128],
+            "age_seconds": item["age_seconds"],
+            "models": [
+                str(name)[:128]
+                for name in item.get("models", [])
+                if isinstance(name, str) and name
+            ][:16],
+        }
+        for item in candidates
+        if item["age_seconds"] > HOST_TTL_SECONDS
+    ][:8]
     return {
         "adapter_id": adapter_id,
         "kind": "vscode_language_model_api",
@@ -598,6 +611,7 @@ def bridge_readiness(
         "host_count": len(matching_hosts),
         "live_host_count": len(live_hosts),
         "stale_host_count": max(0, len(candidates) - len(live_hosts)),
+        "stale_hosts": stale_hosts,
         "observed_models": observed_models,
         "selected_model_entry": selected_model_entry,
         "freshest_age_seconds": min(
