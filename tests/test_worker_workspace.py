@@ -668,6 +668,8 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "worker_workspace_appcontainer_dotnet_restore.py",
         # ...and its AppContainer C/C++ build environment (NF-2026-01337).
         "windows_build_env.py",
+        # ...and the import-closure resolver, imported lazily by _resolve_local_python_imports.
+        "python_import_closure.py",
     ):
         shutil.copyfile(source_package / name, destination_package / name)
     # write_bytes, not write_text: several tests compare a raw on-disk byte

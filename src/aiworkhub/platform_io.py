@@ -2220,6 +2220,57 @@ def chmod_path(
         os.chmod(path, mode)
 
 
+def delete_ignoring_readonly(target: str) -> bool:
+    """Delete one regular file on Windows without touching its attributes (NF-2026-01583).
+
+    A chmod would clear FILE_ATTRIBUTE_READONLY on the shared inode, so a
+    hardlink outside the tree would lose it.  FileDispositionInfoEx with
+    IGNORE_READONLY_ATTRIBUTE unlinks only this name.  Never raises.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.SetFileInformationByHandle.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.CreateFileW(
+            target, 0x00010000, 0x7, None, 3, 0x00200000, None
+        )
+        if handle is None or handle == ctypes.c_void_p(-1).value:
+            return False
+        try:
+            flags = ctypes.c_ulong(0x1 | 0x2 | 0x10)
+            return bool(
+                kernel32.SetFileInformationByHandle(
+                    handle, 21, ctypes.byref(flags), ctypes.sizeof(flags)
+                )
+            )
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return False
+
+
 def _retry_windows_sharing_denial(
     operation: str, path: str | os.PathLike[str], action: Callable[[], Any]
 ) -> Any:
