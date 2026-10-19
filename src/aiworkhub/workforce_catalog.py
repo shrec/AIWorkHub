@@ -40,12 +40,11 @@ from .platform_io import posix_path_modes_supported
 # live editor host reports a catalog, that seed expands to one row per
 # discovered model.  Only these adapters read their model set from VS Code.
 # NF-2026-01454 note: opencode_cli deliberately stays OUT of this set.  Its
-# seed rows are concrete (exact models), and every OTHER hosted model is
-# authorized through the CLI-discovery fallback in
-# ``manager_loop_service.authorize_selected_route`` (bounded, cached probe),
-# not through family-stem expansion: the stem rule would project the seed's
-# manager capabilities onto every ``opencode/*`` free-tier row and break the
-# low-risk inventory contract discovered opencode rows keep.
+# seed rows are concrete (exact models). Every other hosted model is a manager
+# seat through the CLI list, not through family-stem expansion: the stem rule
+# would copy a seed's review and high-risk supports onto every free-tier row.
+# Discovered rows stay low-risk mechanical implementation workers, and they
+# are also manager seats, including when repository policy disables them.
 _DISCOVERY_ADAPTERS: frozenset[str] = frozenset({"glm_vscode_lm"})
 
 # These adapters all execute through the VS Code Language Model API.  The
@@ -1464,7 +1463,7 @@ def _attach_opencode_discovered_workers(
             "max_risk": "low",
             "quality_ceiling": 0.95,
             "manager_score_adjustment": 0.0,
-            "manager": False,
+            "manager": True,
             "implementation_worker": True,
             "reviewer": False,
             "discovered_from_opencode": True,

@@ -123,6 +123,9 @@ def _install_fakes(monkeypatch: Any) -> list[FakeManagerBackend]:
     monkeypatch.setattr(manager_loop_service, "default_callback_source", no_wake_source)
     monkeypatch.setattr(manager_loop_service, "WAKE_IDLE_POLL_SECONDS", 0.05)
     monkeypatch.setattr(manager_loop_service, "WAKE_RETRY_POLL_SECONDS", 0.05)
+    # OpenCode CLI seats are manager routes even when policy disables them.
+    # Keep service tests off the live probe unless a case lists models itself.
+    monkeypatch.setattr(manager_loop_service, "_opencode_discovered_models", lambda: [])
     return backends
 
 
@@ -1578,6 +1581,51 @@ def test_cli_discovery_does_not_reauthorize_a_policy_disabled_catalog_route(
         )
         is None
     )
+
+
+def test_every_cli_listed_opencode_model_is_a_manager_seat_even_when_policy_disables_it(
+    monkeypatch: Any,
+) -> None:
+    listed = "xai/grok-4.7"
+    paid = "openai/gpt-4o"
+    monkeypatch.setattr(
+        manager_loop_service, "_opencode_discovered_models", lambda: [listed, paid]
+    )
+    rows = [
+        {
+            "worker_id": "claude-opus-5",
+            "adapter_id": "claude_cli",
+            "model": "opus",
+            "provider": "anthropic",
+            "enabled": True,
+            "manager": True,
+            "quality_ceiling": 1.0,
+        }
+    ]
+    policy = {
+        "providers": {"opencode": False, "xai": False, "openai": False},
+        "adapters": {},
+        "models": {},
+    }
+
+    def load_catalog(_repo: Any) -> dict[str, Any]:
+        return {"workers": rows}
+
+    def load_policy(_repo: Any) -> dict[str, Any]:
+        return policy
+
+    assert manager_loop_service.authorize_selected_route(
+        "repo", "opencode_cli", listed, load_catalog=load_catalog, load_policy=load_policy
+    ) == ("opencode_cli", listed)
+    assert manager_loop_service.authorize_selected_route(
+        "repo", "opencode_cli", paid, load_catalog=load_catalog, load_policy=load_policy
+    ) == ("opencode_cli", paid)
+    assert manager_loop_service.authorize_selected_route(
+        "repo", "opencode_cli", "not-listed", load_catalog=load_catalog, load_policy=load_policy
+    ) is None
+    assert manager_loop_service.resolve_manager_route(
+        "repo", load_catalog=load_catalog, load_policy=load_policy
+    ) == ("claude_cli", "opus")
 
 
 def test_non_numeric_wake_cap_returns_unavailable_and_leaves_the_turn_lock_unlocked(

@@ -2751,7 +2751,7 @@ def test_access_observation_names_which_evidence_made_it_true(tmp_path: Path) ->
     assert row["historical_route_observation"]["in_current_window"] is False
 
 
-def test_discovered_opencode_rows_are_low_risk_inventory_not_managers(
+def test_discovered_opencode_rows_are_low_risk_manager_seats(
     tmp_path: Path,
 ) -> None:
     root = _root(tmp_path)
@@ -2780,7 +2780,7 @@ def test_discovered_opencode_rows_are_low_risk_inventory_not_managers(
     assert models == {"opencode/glm-4.5-free", "openai/gpt-4o"}
     for item in rows:
         assert item["adapter_id"] == "opencode_cli"
-        assert item["manager"] is False
+        assert item["manager"] is True
         assert item["reviewer"] is False
         assert item["max_risk"] == "low"
         assert item["supports"] == ["mechanical"]

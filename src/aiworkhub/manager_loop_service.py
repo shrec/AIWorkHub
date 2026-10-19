@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from .manager_loop import ManagerLoopError, ManagerOrchestrator, ManagerSession
-from .manager_loop_backends import MANAGER_BACKEND_IDS, cli_discovers_model, manager_backend_factory
+from .manager_loop_backends import MANAGER_BACKEND_IDS, _opencode_discovered_models, cli_discovers_model, manager_backend_factory
 from . import callback_store, manager_loop_wake, model_settings, platform_io, workforce_catalog
 
 _REGISTRY_LOCK = threading.Lock()
@@ -167,7 +167,12 @@ def _eligible_manager_routes(
     load_catalog: Callable[[str | Path], Mapping[str, Any]] = workforce_catalog.load_catalog,
     load_policy: Callable[[str | Path], Mapping[str, Any]] = model_settings.load,
 ) -> list[dict[str, Any]]:
-    """Every enabled, policy-authorized manager route, catalog order kept."""
+    """Every enabled, policy-authorized manager route, catalog order kept.
+
+    CLI-listed OpenCode models are manager seats too, but only when the owner
+    picks one. They are not injected here: a live probe must not steal the
+    automatic route from a policy-authorized catalog manager.
+    """
 
     policy = load_policy(repo)
     return [
@@ -203,14 +208,20 @@ def authorize_selected_route(
     load_catalog: Callable[[str | Path], Mapping[str, Any]] = workforce_catalog.load_catalog,
     load_policy: Callable[[str | Path], Mapping[str, Any]] = model_settings.load,
 ) -> tuple[str, str] | None:
-    """The exact picker route when this repository may run it, else ``None``.
+    """The exact picker route when this repository may run it, else None.
 
     A catalog-declared, policy-authorized route is accepted. A route the
     catalog does not declare is accepted only when the CLI itself lists it
     and repository model policy still enables that identity. A declared
-    route that policy disabled is never re-authorized through CLI discovery.
+    route that policy disabled is never re-authorized through CLI discovery,
+    except an OpenCode model the CLI itself lists: every such identity is a
+    manager seat, including when policy disables it.
     """
 
+    if backend_id == "opencode_cli" and model in {
+        str(item).strip() for item in _opencode_discovered_models() if str(item or "").strip()
+    }:
+        return backend_id, model
     for worker in _eligible_manager_routes(repo, load_catalog=load_catalog, load_policy=load_policy):
         if worker["adapter_id"] == backend_id and worker["model"] == model:
             return backend_id, model

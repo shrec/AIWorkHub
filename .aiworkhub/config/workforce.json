@@ -1,5 +1,5 @@
 {
-  "revision": 31,
+  "revision": 32,
   "schema_id": "aiworkhub.workforce_catalog.v1",
   "workers": [
     {
@@ -567,6 +567,32 @@
       ],
       "tools": [],
       "worker_id": "opencode-go_mimo-v2.6-pro"
+    },
+    {
+      "adapter_id": "opencode_cli",
+      "enabled": true,
+      "implementation_worker": true,
+      "manager": true,
+      "manager_score_adjustment": 0.0,
+      "max_context_tokens": 256000,
+      "max_risk": "high",
+      "model": "xai/grok-4.7",
+      "provider": "xai",
+      "quality_ceiling": 0.95,
+      "reviewer": false,
+      "supports": [
+        "mechanical",
+        "code"
+      ],
+      "tools": [
+        "filesystem",
+        "source-graph",
+        "session-manager",
+        "ai-memory",
+        "kb",
+        "semantic-edit"
+      ],
+      "worker_id": "xai_grok-4.7"
     }
   ]
 }
