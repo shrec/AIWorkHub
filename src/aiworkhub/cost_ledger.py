@@ -123,13 +123,18 @@ def _request_identity(entry: dict[str, Any]) -> str:
     )
 
 
-def _repository_identity(entry: dict[str, Any], repo_root: Path | str) -> str:
+def _repository_identity(
+    entry: dict[str, Any],
+    repo_root: Path | str,
+    *,
+    resolved_root: str | None = None,
+) -> str:
     return str(
         entry.get("repository_id")
         or entry.get("repo_id")
         or entry.get("repository")
         or entry.get("repo_root")
-        or Path(repo_root).resolve()
+        or (resolved_root if resolved_root is not None else Path(repo_root).resolve())
     )
 
 
@@ -171,7 +176,9 @@ def _merge_process_events(
     return merged
 
 
-def _process_event_index(repo_root: Path | str) -> dict[tuple[str, str, str], dict[str, Any]]:
+def _process_event_index(
+    repo_root: Path | str, *, resolved_root: str | None = None
+) -> dict[tuple[str, str, str], dict[str, Any]]:
     """Read the bounded repository-local process ledger, ignoring bad records."""
 
     path = Path(repo_root) / _PROCESS_EVENTS_PATH
@@ -191,7 +198,9 @@ def _process_event_index(repo_root: Path | str) -> dict[tuple[str, str, str], di
                     continue
                 task_id = str(event.get("task_id") or "")
                 request_id = _request_identity(event)
-                repository = _repository_identity(event, repo_root)
+                repository = _repository_identity(
+                    event, repo_root, resolved_root=resolved_root
+                )
                 if task_id and request_id and repository:
                     identity = (repository, task_id, request_id)
                     previous = events.get(identity)
@@ -209,10 +218,12 @@ def _matching_process_event(
     entry: dict[str, Any],
     repo_root: Path | str,
     process_events: dict[tuple[str, str, str], dict[str, Any]] | None = None,
+    *,
+    resolved_root: str | None = None,
 ) -> dict[str, Any] | None:
     task_id = str(entry.get("task_id") or "")
     request_id = _request_identity(entry)
-    repository = _repository_identity(entry, repo_root)
+    repository = _repository_identity(entry, repo_root, resolved_root=resolved_root)
     if not task_id or not request_id:
         return None
     candidates: list[dict[str, Any]] = []
@@ -229,7 +240,8 @@ def _matching_process_event(
         if (
             str(event.get("task_id") or "") != task_id
             or _request_identity(event) != request_id
-            or _repository_identity(event, repo_root) != repository
+            or _repository_identity(event, repo_root, resolved_root=resolved_root)
+            != repository
         ):
             continue
         usage = event.get("usage")
@@ -243,10 +255,14 @@ def _fill_process_usage(
     entry: dict[str, Any],
     repo_root: Path | str,
     process_events: dict[tuple[str, str, str], dict[str, Any]] | None = None,
+    *,
+    resolved_root: str | None = None,
 ) -> dict[str, Any]:
     """Fill unobserved placeholders only from an exactly matched process event."""
 
-    event = _matching_process_event(entry, repo_root, process_events)
+    event = _matching_process_event(
+        entry, repo_root, process_events, resolved_root=resolved_root
+    )
     if event is None:
         return entry
     merged = dict(entry)
@@ -327,10 +343,15 @@ def _attempt_time(row: dict[str, Any]) -> str:
 
 def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    process_events = _process_event_index(repo_root)
+    # Resolve the repository root once per build instead of once per row that
+    # lacks an explicit repository id.
+    resolved_root = str(Path(repo_root).resolve())
+    process_events = _process_event_index(repo_root, resolved_root=resolved_root)
     topic_index: dict[str, str] | None = None
     for raw_entry in task_store.list_usage_events(repo_root, limit=10_000):
-        entry = _fill_process_usage(raw_entry, repo_root, process_events)
+        entry = _fill_process_usage(
+            raw_entry, repo_root, process_events, resolved_root=resolved_root
+        )
         created_at = str(entry.get("created_at") or "")
         attempt_recorded_at = str(entry.get("attempt_recorded_at") or "")
         attempt_at = attempt_recorded_at or created_at
@@ -343,7 +364,9 @@ def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
             # process ledger row for the same task/request), then from the
             # task itself. Provenance stays visible: tokens are unchanged,
             # only the attribution key is joined.
-            event = _matching_process_event(entry, repo_root, process_events)
+            event = _matching_process_event(
+                entry, repo_root, process_events, resolved_root=resolved_root
+            )
             joined = str(event.get("topic") or "") if event is not None else ""
             if joined:
                 topic, topic_source = joined, "process_event_join"
