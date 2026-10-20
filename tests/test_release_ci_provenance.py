@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -125,6 +126,18 @@ def test_release_workflow_binds_manual_input_to_tag_commit_and_keeps_smoke_gates
         "platform-qualification",
     ):
         assert forbidden not in text
+
+
+def test_release_build_job_rejects_empty_notes_before_publish():
+    text = WORKFLOW.read_text(encoding="utf-8")
+    _, header, tail = text.partition("\n  build:\n")
+    assert header, "release.yml has no top-level build job"
+    build_job = re.split(r"\n  [\w-]+:\n", tail, maxsplit=1)[0]
+    notes_gate = build_job.find("release_metadata.py notes --tag")
+    first_build = build_job.find("python -m build")
+    assert first_build != -1, "build job no longer builds the Python distributions"
+    assert notes_gate != -1, "build job must reject an empty CHANGELOG section"
+    assert notes_gate < first_build, "empty-notes gate must run before the first build"
 
 
 class FakeClock:

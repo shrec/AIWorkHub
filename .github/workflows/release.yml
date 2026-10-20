@@ -85,6 +85,11 @@ jobs:
           RELEASE_TAG: ${{ needs.provenance.outputs.release_tag }}
         run: python scripts/release_metadata.py check --tag "$RELEASE_TAG"
 
+      - name: Verify release notes section is not empty
+        env:
+          RELEASE_TAG: ${{ needs.provenance.outputs.release_tag }}
+        run: python scripts/release_metadata.py notes --tag "$RELEASE_TAG" --output "$RUNNER_TEMP/release-notes-check.md"
+
       - name: Verify release assurance manifest
         run: python scripts/check_release_assurance.py
 
