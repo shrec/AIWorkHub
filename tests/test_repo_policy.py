@@ -50,6 +50,18 @@ def test_ensure_policy_is_owner_only_idempotent_and_valid(tmp_path: Path) -> Non
     assert created_again is False
 
 
+def test_core_derived_default_max_processes_is_exported_not_a_literal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert not hasattr(repo_policy, "DEFAULT_MAX_PROCESSES")
+    assert "default_max_processes" in repo_policy.__all__
+    monkeypatch.setattr(repo_policy.os, "cpu_count", lambda: 16)
+    assert repo_policy.default_max_processes() == 14
+    resolved = repo_policy.resolve_workforce_cap({})
+    assert resolved["effective_cap"] == 14
+    assert resolved["reason"] == "max_processes_unset_core_derived:16"
+
+
 def _policy_with(deploy: object = None) -> dict:
     policy = json.loads(json.dumps(repo_policy.DEFAULT_POLICY))
     policy.pop("deploy")

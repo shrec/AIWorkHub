@@ -1712,9 +1712,21 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
 # ---------------------------------------------------------------------------
 WORKFORCE_SCHEMA_ID = "aiworkhub.workforce_capacity.v1"
 MAX_PROCESSES_ENV = "AIWORKHUB_MAX_PROCESSES"
-DEFAULT_MAX_PROCESSES = 4
+# Cores left free for the interactive MCP server when deriving the default cap.
+_CORE_HEADROOM = 2
 # The launcher admission ceiling; process_launcher enforces exactly this value.
 MAX_PROCESSES_CEILING = 32
+
+
+def default_max_processes(cores: int | None = None) -> int:
+    """Core-derived worker cap used when ``AIWORKHUB_MAX_PROCESSES`` is not set.
+
+    ``cores`` is one observed core count, so a caller that also reports the
+    count states the one the cap came from; ``None`` samples ``os.cpu_count()``.
+    """
+
+    observed = (os.cpu_count() if cores is None else cores) or 1
+    return min(MAX_PROCESSES_CEILING, max(1, observed - _CORE_HEADROOM))
 
 
 def resolve_workforce_cap(env: Mapping[str, str] | None = None) -> dict[str, Any]:
@@ -1722,28 +1734,30 @@ def resolve_workforce_cap(env: Mapping[str, str] | None = None) -> dict[str, Any
 
     ``AIWORKHUB_MAX_PROCESSES`` decides the cap; the returned ``effective_cap``
     is what actually applies.  A missing or malformed value falls back to
-    ``DEFAULT_MAX_PROCESSES`` with a named reason, a below-minimum value is
-    clamped up to 1, and an above-ceiling value is clamped down to
-    ``MAX_PROCESSES_CEILING`` -- each stated in ``reason`` rather than silently.
+    ``default_max_processes()`` (derived from the observed core count) with a
+    named reason, a below-minimum value is clamped up to 1, and an
+    above-ceiling value is clamped down to ``MAX_PROCESSES_CEILING`` -- each
+    stated in ``reason`` rather than silently.
     """
 
     source = os.environ if env is None else env
     raw = source.get(MAX_PROCESSES_ENV)
     if raw is None or str(raw).strip() == "":
+        cores = os.cpu_count() or 1
         return {
             "schema_id": WORKFORCE_SCHEMA_ID,
-            "effective_cap": DEFAULT_MAX_PROCESSES,
+            "effective_cap": default_max_processes(cores),
             "configured": False,
             "source": "default",
             "raw_value": None,
-            "reason": "max_processes_unset_default_applied",
+            "reason": f"max_processes_unset_core_derived:{cores}",
         }
     try:
         value = int(str(raw).strip())
     except (TypeError, ValueError):
         return {
             "schema_id": WORKFORCE_SCHEMA_ID,
-            "effective_cap": DEFAULT_MAX_PROCESSES,
+            "effective_cap": default_max_processes(),
             "configured": False,
             "source": "default_invalid",
             "raw_value": str(raw)[:64],
@@ -2093,7 +2107,7 @@ __all__ = [
     "SCHEMA_ID",
     "WORKFORCE_SCHEMA_ID",
     "MAX_PROCESSES_ENV",
-    "DEFAULT_MAX_PROCESSES",
+    "default_max_processes",
     "MAX_PROCESSES_CEILING",
     "PROVIDER_OBSERVABILITY_SCHEMA_ID",
     "PROVIDER_ROUTE_CONTRACT_SCHEMA_ID",

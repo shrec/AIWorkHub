@@ -97,11 +97,58 @@ def test_workforce_admission_rejects_only_at_the_configured_cap() -> None:
     assert verdict["reason"].startswith("workforce_cap_reached")
 
 
-def test_unset_max_processes_falls_back_with_named_reason() -> None:
+def test_unset_max_processes_falls_back_with_named_reason(monkeypatch) -> None:
+    monkeypatch.setattr(repo_policy.os, "cpu_count", lambda: 8)
     resolved = repo_policy.resolve_workforce_cap({})
-    assert resolved["effective_cap"] == repo_policy.DEFAULT_MAX_PROCESSES
+    assert resolved["effective_cap"] == repo_policy.default_max_processes() == 6
     assert resolved["configured"] is False
-    assert resolved["reason"] == "max_processes_unset_default_applied"
+    assert resolved["reason"] == "max_processes_unset_core_derived:8"
+
+
+def test_unset_branch_reports_the_core_count_its_cap_came_from(monkeypatch) -> None:
+    samples = iter((8, 16))
+    monkeypatch.setattr(repo_policy.os, "cpu_count", lambda: next(samples))
+    resolved = repo_policy.resolve_workforce_cap({})
+    assert resolved["effective_cap"] == 6
+    assert resolved["reason"] == "max_processes_unset_core_derived:8"
+
+
+def test_core_derived_default_tracks_observed_core_count(monkeypatch) -> None:
+    cases = {
+        16: 14,
+        2: 1,
+        1: 1,
+        None: 1,
+        1000: repo_policy.MAX_PROCESSES_CEILING,
+    }
+    for cores, expected in cases.items():
+        monkeypatch.setattr(repo_policy.os, "cpu_count", lambda cores=cores: cores)
+        assert repo_policy.default_max_processes() == expected
+        resolved = repo_policy.resolve_workforce_cap({})
+        assert resolved["effective_cap"] == expected
+        assert resolved["reason"] == f"max_processes_unset_core_derived:{cores or 1}"
+
+
+def test_core_derived_default_never_reaches_zero(monkeypatch) -> None:
+    monkeypatch.setattr(repo_policy.os, "cpu_count", lambda: 0)
+    assert repo_policy.default_max_processes() == 1
+
+
+def test_core_derived_default_applies_to_invalid_value(monkeypatch) -> None:
+    monkeypatch.setattr(repo_policy.os, "cpu_count", lambda: 16)
+    resolved = repo_policy.resolve_workforce_cap({"AIWORKHUB_MAX_PROCESSES": "many"})
+    assert resolved["effective_cap"] == 14
+    assert resolved["configured"] is False
+    assert resolved["reason"].startswith("max_processes_invalid_default_applied:")
+
+
+def test_core_derived_default_is_overridden_by_explicit_env(monkeypatch) -> None:
+    for cores in (2, 16, None, 1000):
+        monkeypatch.setattr(repo_policy.os, "cpu_count", lambda cores=cores: cores)
+        resolved = repo_policy.resolve_workforce_cap({"AIWORKHUB_MAX_PROCESSES": "8"})
+        assert resolved["effective_cap"] == 8
+        assert resolved["configured"] is True
+        assert resolved["reason"] == "max_processes_configured"
 
 
 def test_launcher_admits_by_the_reported_workforce_cap(monkeypatch) -> None:
@@ -111,7 +158,7 @@ def test_launcher_admits_by_the_reported_workforce_cap(monkeypatch) -> None:
     assert process_launcher._configured_limit() == resolved["effective_cap"] == 32
     assert resolved["reason"] == "max_processes_above_ceiling_clamped:64->32"
     monkeypatch.delenv("AIWORKHUB_MAX_PROCESSES")
-    assert process_launcher._configured_limit() == repo_policy.DEFAULT_MAX_PROCESSES
+    assert process_launcher._configured_limit() == repo_policy.default_max_processes()
 
 
 # --------------------------------------------------------------------------
