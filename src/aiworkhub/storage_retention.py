@@ -2845,7 +2845,7 @@ def _janitor_scratch(root: Path, now: float) -> dict[str, Any]:
             # Gone since iterdir (a concurrent sweep or test run removed it).
             continue
         manifest = runtime_temp.read_owner_manifest(candidate)
-        if manifest is not None and runtime_temp.owner_alive(manifest):
+        if manifest is not None and runtime_temp.request_alive(root, manifest):
             continue
         selected.append((candidate, expected_parent))
 

@@ -794,7 +794,9 @@ def read_owner_manifest(directory: Path) -> dict[str, Any] | None:
         if raw is None:
             return None
         value = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError):
+        # ValueError also covers JSONDecodeError and the int-digit limit; crafted
+        # deep nesting raises RecursionError.  Both mean an invalid owner.
         return None
     if not isinstance(value, dict) or value.get("schema_id") != OWNER_SCHEMA_ID:
         return None
@@ -824,7 +826,7 @@ def owner_alive(manifest: Mapping[str, Any]) -> bool:
     try:
         pid = int(manifest.get("pid") or 0)
         starttime = int(manifest.get("starttime") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return True
     if pid <= 0:
         return True  # no identifiable owner -> fail closed, never delete
@@ -839,6 +841,92 @@ def owner_alive(manifest: Mapping[str, Any]) -> bool:
     if current is not None and current != starttime:
         return True
     return False
+
+
+# Mirrors process_launcher.py:3875 (PROCESS_DIR_ENV / PROCESS_DIR_DEFAULT_REL);
+# process_launcher is not importable from here without an import cycle.
+_PROCESS_DIR_ENV = "AIWORKHUB_PROCESS_DIR"
+_PROCESS_DIR_DEFAULT_REL = Path(".aiworkhub/runtime/process_logs/processes")
+_MAX_SUPERVISOR_STATUS_BYTES = 1024 * 1024
+
+
+def _recorded_process_alive(pid_value: Any, ticks_value: Any) -> bool:
+    """True unless a recorded pid is absent or provably dead / recycled."""
+    if pid_value is None:
+        return False
+    try:
+        pid = int(pid_value)
+    except (TypeError, ValueError, OverflowError):
+        return True
+    if pid <= 0:
+        return False
+    if _pid_alive(pid) is False:
+        return False
+    try:
+        recorded = int(ticks_value or 0)
+    except (TypeError, ValueError, OverflowError):
+        recorded = 0
+    if recorded > 0:
+        current = process_start_ticks(pid)
+        if current is not None and current != recorded:
+            return False
+    return True
+
+
+def request_alive(repo: Path, manifest: Mapping[str, Any]) -> bool:
+    """True when the owner, or the request's supervisor/child, is not provably dead.
+
+    The owner stamp can name a short-lived process (an auth-retry relaunch
+    re-provisions from the finalizing process), so the request's own
+    ``<request_id>.supervisor.json`` is consulted too.  A missing status file
+    gives no protection; an unreadable or malformed one fails closed to alive.
+    """
+    if owner_alive(manifest):
+        return True
+    request_id = manifest.get("request_id")
+    if not isinstance(request_id, str) or not _REQUEST_ID_RE.fullmatch(request_id):
+        return False
+    process_dir = Path(
+        os.environ.get(
+            _PROCESS_DIR_ENV, str(Path(repo) / _PROCESS_DIR_DEFAULT_REL)
+        )
+    )
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        fd = os.open(process_dir / f"{request_id}.supervisor.json", flags)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return True
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return True
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            raw = handle.read(_MAX_SUPERVISOR_STATUS_BYTES + 1)
+    except OSError:
+        return True
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(raw) > _MAX_SUPERVISOR_STATUS_BYTES:
+        return True
+    try:
+        status = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return True
+    if not isinstance(status, dict):
+        return True
+    return _recorded_process_alive(
+        status.get("supervisor_pid"), status.get("supervisor_pid_start_ticks")
+    ) or _recorded_process_alive(
+        status.get("child_pid"), status.get("child_pid_start_ticks")
+    )
 
 
 def _iter_request_dirs(root: Path) -> list[Path]:
@@ -882,7 +970,7 @@ def identify_dead_owner_dirs(
         manifest = read_owner_manifest(request_dir)
         if manifest is None:
             continue
-        if owner_alive(manifest):
+        if request_alive(repo, manifest):
             continue
         result.append({
             "path": request_dir,
@@ -991,7 +1079,9 @@ def provision_request_temp(
         except OSError:
             pass
         paths[sub] = sub_path
-    write_owner_manifest(resolved, request_id, repo)
+    existing_owner = read_owner_manifest(resolved)
+    if existing_owner is None or not owner_alive(existing_owner):
+        write_owner_manifest(resolved, request_id, repo)
     return RequestTemp(
         root=resolved,
         home=paths.get(HOME_SUBDIR, resolved),
@@ -1420,6 +1510,7 @@ __all__ = [
     "provision_request_temp",
     "quota",
     "read_owner_manifest",
+    "request_alive",
     "request_dir",
     "temp_root",
     "write_owner_manifest",
