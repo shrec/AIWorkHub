@@ -7523,6 +7523,45 @@ def _bool_safe_positive_int(value: Any) -> bool:
     return type(value) is int and value >= 1
 
 
+def archived_after_accepting(
+    card: Mapping[str, Any], *, request_id: str, claim_epoch: Any
+) -> bool:
+    """Whether ``card`` was archived after accepting exactly this attempt.
+
+    Automatic review accepts a read-only reviewer and archives it moments
+    later, so the archive can land before that reviewer's own supervisor has
+    finalized the same attempt (NF-2026-01625). Such an archive closes an
+    accepted attempt rather than disposing of one -- but only when the card's
+    acceptance seal and the accepted-outcome receipt stored with it both name
+    this request and this claim epoch. A card archived without that receipt,
+    a superseded card and every other attempt answer ``False``.
+    """
+
+    if not request_id or not _bool_safe_positive_int(claim_epoch):
+        return False
+    if canonical_status(card) != "archived":
+        return False
+    if str(card.get("archive_operation") or "").strip().lower() == "superseded":
+        return False
+    if str(card.get("accepted_request_id") or "") != request_id:
+        return False
+    accept_evidence = card.get("accept_evidence")
+    receipt = (
+        accept_evidence.get("accepted_outcome_receipt")
+        if isinstance(accept_evidence, Mapping)
+        else None
+    )
+    if not isinstance(receipt, Mapping):
+        return False
+    return (
+        str(receipt.get("request_id") or "") == request_id
+        and _bool_safe_positive_int(receipt.get("claim_epoch"))
+        and receipt.get("claim_epoch") == claim_epoch
+        and _bool_safe_positive_int(card.get("claim_epoch"))
+        and card.get("claim_epoch") == claim_epoch
+    )
+
+
 def append_live_usage_event(
     root: str | Path,
     task_id: str,
@@ -7592,7 +7631,17 @@ def append_live_usage_event(
         # "unknown". Identity is what prevents forgery here: launch_request_id
         # and claim_epoch below name this exact attempt, a re-claim increments
         # the epoch, and the note uniqueness check makes the write idempotent.
-        if status not in task_fsm.CLAIM_ATTEMPT_ACCOUNTABLE_STATUSES:
+        # NF-2026-01625: automatic review archives a reviewer moments after
+        # accepting it, so an archived card still owes the spend of the one
+        # attempt it accepted -- and of no other.
+        if status not in task_fsm.CLAIM_ATTEMPT_ACCOUNTABLE_STATUSES and not (
+            status == "archived"
+            and archived_after_accepting(
+                _row_card(row["card_json"]),
+                request_id=request_id,
+                claim_epoch=claim_epoch,
+            )
+        ):
             conn.rollback()
             return False, f"lifecycle_mismatch:{status}"
         try:

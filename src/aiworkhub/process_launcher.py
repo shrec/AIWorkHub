@@ -9305,6 +9305,34 @@ class ProcessManager:
                 return state
         raise WorkspaceError(f"claim_ownership_lost:state={state}")
 
+    def _accepted_attempt_archived(
+        self,
+        latest: Mapping[str, Any],
+        metadata: Mapping[str, Any],
+        request_id: str,
+    ) -> bool:
+        """Whether automatic review accepted, then archived, this very attempt.
+
+        NF-2026-01625: the status-artifact finalization can make a read-only
+        reviewer review_ready while its supervisor is still exiting. Automatic
+        review then accepts it -- releasing its worktree and appending the
+        ``accepted`` row -- and archives the card before that supervisor's own
+        finalization arrives. ``accepted`` is not a launcher terminal state,
+        so the late call re-ran every step against the released worktree.
+        The row alone proves nothing: only the card's acceptance seal and
+        receipt for this request and claim epoch do (``task_store``).
+        """
+        if latest.get("state") != "accepted" or latest.get("accepted") is not True:
+            return False
+        task_id = str(metadata.get("task_id") or "")
+        try:
+            card = _parse_card(self._show_task(task_id), task_id)
+        except LaunchRejected:
+            return False
+        return task_store.archived_after_accepting(
+            card, request_id=request_id, claim_epoch=metadata.get("claim_epoch")
+        )
+
     def _release_exact(self, metadata: dict[str, Any], reason: str) -> dict[str, Any]:
         task_id = str(metadata["task_id"])
         runner = str(metadata["runner"])
@@ -10668,6 +10696,13 @@ class ProcessManager:
                     # Same split: ``metadata_invalid`` is a named reason now, the ``{exc}`` tail is not and is never copied.
                     **terminal_failure_classification.terminal_event_authority(state="finalize_failed", exit_code=None, error=f"metadata_invalid:{exc}"[:500]),
                 })
+
+            # NF-2026-01625: an attempt automatic review already accepted and
+            # archived is final. Finalizing it again could only fail on the
+            # worktree acceptance released and bury the accepted row under
+            # ``finalize_failed``, so its own ``accepted`` row is the answer.
+            if self._accepted_attempt_archived(latest, metadata, request_id):
+                return latest
 
             status_path = Path(str(metadata["supervisor_status_path"]))
             supervisor_status = self._read_supervisor_status(status_path)
