@@ -1182,12 +1182,12 @@ def _manifest_changed_paths(workspace: WorkerWorkspace, *, git_phase: str) -> li
         # Shell residue absent at creation is not candidate delta (NF-2026-01345).
         and not (relative not in baseline and _is_shell_residue(workspace, relative))
     }
-    # Rework predecessor bytes are intentionally present at workspace creation
-    # yet still form part of the candidate delta against the canonical parent.
+    # Inherited rework bytes are judged against the canonical parent alone (NF-2026-01618).
     for relative in workspace.inherited_rework_paths:
-        current_hash = current.get(relative)
-        if current_hash != workspace.parent_baseline.get(relative):
+        if current.get(relative) != workspace.parent_baseline.get(relative):
             rows.add(_relative_repo_path(relative))
+        else:
+            rows.discard(_relative_repo_path(relative))
     return sorted(rows)
 
 
@@ -6581,12 +6581,12 @@ def changed_paths(
     }
     for relative, initial_hash in workspace.workspace_baseline.items():
         current_hash = _hash_path(workspace.path / relative)
-        inherited_change = (
-            relative in workspace.inherited_rework_paths
-            and current_hash == initial_hash
-            and current_hash != workspace.parent_baseline.get(relative)
-        )
-        if current_hash != initial_hash or inherited_change:
+        if relative in workspace.inherited_rework_paths:
+            # Judged against canonical: restoring canonical bytes is a revert (NF-2026-01618).
+            changed = current_hash != workspace.parent_baseline.get(relative)
+        else:
+            changed = current_hash != initial_hash
+        if changed:
             rows.add(_relative_repo_path(relative))
         else:
             rows.discard(_relative_repo_path(relative))
