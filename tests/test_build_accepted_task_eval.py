@@ -5,11 +5,13 @@ import ast
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
 from functools import partial
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -25,7 +27,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 FAMILIES = ("task_mcp", "review_pipeline", "quality_evidence")
 RISK_TIERS = ("low", "medium", "high")
-COMPLEXITY_PROMOTED_COUNTS = {"trivial": 1, "small": 4, "moderate": 12}
+# The fewest promoted paths that still land in each ``complexity_tier``.
+COMPLEXITY_PROMOTED_COUNTS = {"trivial": 1, "small": 2, "moderate": 6}
+# One scenario above the corpus floor, so a rebuild that excludes one still
+# clears it. Every historical provenance pass runs two git calls per promoted
+# path, so all but one ``small`` and one ``moderate`` scenario are trivial.
+SEEDED_COMPLEXITIES = ("small", "moderate") + ("trivial",) * (builder.MIN_ROWS - 1)
 
 
 def _digest(payload) -> str:
@@ -71,13 +78,14 @@ def _git_commit_paths(repo: Path, message: str, *paths: str) -> str:
     return _git(repo, "rev-parse", "HEAD")
 
 
-def _scenario_id(family: str, risk_tier: str, complexity: str) -> str:
-    return f"{family}_{risk_tier}_{complexity}".upper()
+def _scenario_id(family: str, risk_tier: str, complexity: str, ordinal: int | None = None) -> str:
+    stem = f"{family}_{risk_tier}_{complexity}"
+    return (stem if ordinal is None else f"{stem}_{ordinal:02d}").upper()
 
 
 def _seed_accepted_scenario(
     repo: Path, *, family: str, risk_tier: str, complexity: str, promoted_count: int,
-    base_oid: str | None = None,
+    base_oid: str | None = None, ordinal: int | None = None,
 ) -> tuple[str, str]:
     """Seed one genuinely-authenticatable accepted task episode.
 
@@ -86,7 +94,7 @@ def _seed_accepted_scenario(
     re-verify against ``task_engine``'s canonical authority -- never a
     fabricated JSON blob.
     """
-    scenario = _scenario_id(family, risk_tier, complexity)
+    scenario = _scenario_id(family, risk_tier, complexity, ordinal)
     task_id = f"ACCEPTED_EVAL_FIXTURE_{scenario}_TASK"
     request_id = f"req-fixture-{scenario.lower()}"
     runner = f"fixture_runner_{family}"
@@ -156,11 +164,12 @@ def _seed_accepted_scenario(
 
 
 def seed_fixture_repository(repo: Path) -> list[tuple[str, str]]:
-    """Seed 27 accepted scenarios across 3 families x 3 risk tiers x 3 complexities.
+    """Seed one accepted scenario per ``SEEDED_COMPLEXITIES`` entry.
 
-    Promoted bytes are committed after a real ``base_oid`` so every scenario
-    also passes the historical default of ``verify_provenance`` that rebuild
-    now filters candidates by.
+    Families and risk tiers rotate through every value, so the store spans
+    every family, risk tier and complexity tier. Promoted bytes are committed
+    after a real ``base_oid`` so every scenario also passes the historical
+    default of ``verify_provenance`` that rebuild now filters candidates by.
     """
     return seed_historical_fixture_repository(repo)
 
@@ -169,16 +178,79 @@ def seed_historical_fixture_repository(repo: Path) -> list[tuple[str, str]]:
     task_store.initialize_repository(repo)
     base_oid = _init_git_base(repo)
     seeded = []
-    for family in FAMILIES:
-        for risk_tier in RISK_TIERS:
-            for complexity, promoted_count in COMPLEXITY_PROMOTED_COUNTS.items():
-                seeded.append(_seed_accepted_scenario(
-                    repo, family=family, risk_tier=risk_tier,
-                    complexity=complexity, promoted_count=promoted_count,
-                    base_oid=base_oid,
-                ))
+    for ordinal, complexity in enumerate(SEEDED_COMPLEXITIES):
+        seeded.append(_seed_accepted_scenario(
+            repo, family=FAMILIES[ordinal % len(FAMILIES)],
+            risk_tier=RISK_TIERS[ordinal // len(FAMILIES) % len(RISK_TIERS)],
+            complexity=complexity, promoted_count=COMPLEXITY_PROMOTED_COUNTS[complexity],
+            base_oid=base_oid, ordinal=ordinal,
+        ))
     _git_commit_paths(repo, "promote fixtures", "src")
     return seeded
+
+
+# --------------------------------------------------------------------------
+# shared stores: seeding and above all rebuilding (two historical git passes
+# per rebuild) dominated this module while every test did both itself, so the
+# store is seeded and its corpus rebuilt once per module. A test that only
+# reads takes the shared store or corpus; a test that writes takes a private
+# copy, never the shared one.
+# --------------------------------------------------------------------------
+
+class SeededStore(NamedTuple):
+    repo: Path
+    scenarios: list[tuple[str, str]]
+
+
+class BuiltCorpus(NamedTuple):
+    repo: Path
+    summary: dict
+    rows: list[dict]
+
+
+def _copy_repository(source: Path, destination: Path) -> Path:
+    """Copy a fixture repository's bytes: task store, git history and corpus.
+
+    Not ``shutil.copytree``, which ``copystat``s every directory: sandboxed
+    validation denies ``utime``/``chmod``, and a copy needs the bytes only.
+    """
+    for directory, _subdirectories, files in os.walk(source):
+        target = destination / Path(directory).relative_to(source)
+        target.mkdir(parents=True, exist_ok=True)
+        for name in files:
+            shutil.copyfile(Path(directory, name), target / name)
+    return destination
+
+
+@pytest.fixture(scope="module")
+def seeded_store(tmp_path_factory: pytest.TempPathFactory) -> SeededStore:
+    repo = tmp_path_factory.mktemp("seeded") / "repo"
+    repo.mkdir()
+    return SeededStore(repo, seed_fixture_repository(repo))
+
+
+@pytest.fixture(scope="module")
+def seeded_candidates(seeded_store: SeededStore) -> list[dict]:
+    return builder.discover_candidates(seeded_store.repo)
+
+
+@pytest.fixture
+def seeded_copy(seeded_store: SeededStore, tmp_path: Path) -> Path:
+    return _copy_repository(seeded_store.repo, tmp_path / "repo")
+
+
+@pytest.fixture(scope="module")
+def built_corpus(
+    seeded_store: SeededStore, tmp_path_factory: pytest.TempPathFactory,
+) -> BuiltCorpus:
+    repo = _copy_repository(seeded_store.repo, tmp_path_factory.mktemp("built") / "repo")
+    summary, rows = builder.rebuild(repo)
+    return BuiltCorpus(repo, summary, rows)
+
+
+@pytest.fixture
+def built_copy(built_corpus: BuiltCorpus, tmp_path: Path) -> Path:
+    return _copy_repository(built_corpus.repo, tmp_path / "repo")
 
 
 # --------------------------------------------------------------------------
@@ -293,12 +365,11 @@ def test_discover_candidates_excludes_tampered_receipt_but_keeps_genuine(tmp_pat
 # build_rows / build_summary: redaction, digest-binding, schema
 # --------------------------------------------------------------------------
 
-def test_rows_carry_no_absolute_paths_or_secrets(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    seed_fixture_repository(repo)
-    candidates = builder.discover_candidates(repo)
-    rows = builder.build_rows(candidates)
+def test_rows_carry_no_absolute_paths_or_secrets(
+    seeded_store: SeededStore, seeded_candidates: list[dict],
+) -> None:
+    repo = seeded_store.repo
+    rows = builder.build_rows(seeded_candidates)
     canonical = "\n".join(json.dumps(row, sort_keys=True) for row in rows)
     assert str(repo.resolve()) not in canonical
     assert "src/fixture" not in canonical
@@ -307,12 +378,8 @@ def test_rows_carry_no_absolute_paths_or_secrets(tmp_path: Path) -> None:
         assert set(builder._REQUIRED_ROW_FIELDS) <= set(row.keys())
 
 
-def test_row_sha256_is_self_consistent_digest_binding(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    seed_fixture_repository(repo)
-    candidates = builder.discover_candidates(repo)
-    rows = builder.build_rows(candidates)
+def test_row_sha256_is_self_consistent_digest_binding(seeded_candidates: list[dict]) -> None:
+    rows = builder.build_rows(seeded_candidates)
     for row in rows:
         recomputed = builder._digest({k: v for k, v in row.items() if k != "row_sha256"})
         assert row["row_sha256"] == recomputed
@@ -359,12 +426,8 @@ def test_rebuild_fails_closed_on_empty_task_store(tmp_path: Path) -> None:
     assert not (repo / builder.SUMMARY_RELATIVE_PATH).exists()
 
 
-def test_rebuild_end_to_end_registers_with_eval_artifact_gate(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    seed_fixture_repository(repo)
-
-    summary, rows = builder.rebuild(repo)
+def test_rebuild_end_to_end_registers_with_eval_artifact_gate(built_corpus: BuiltCorpus) -> None:
+    repo, summary, rows = built_corpus
 
     assert builder.MIN_ROWS <= len(rows) <= builder.MAX_ROWS
     assert summary["verdict"] == "PASS"
@@ -378,37 +441,36 @@ def test_rebuild_end_to_end_registers_with_eval_artifact_gate(tmp_path: Path) ->
     assert entry["eligible_row_count"] == len(rows)
 
 
-def test_rebuild_covers_multiple_families_risk_tiers_and_complexities(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    seed_fixture_repository(repo)
-
-    _summary, rows = builder.rebuild(repo)
+def test_rebuild_covers_multiple_families_risk_tiers_and_complexities(
+    built_corpus: BuiltCorpus,
+) -> None:
+    rows = built_corpus.rows
 
     assert len({row["task_family"] for row in rows}) >= 3
     assert len({row["risk_tier"] for row in rows}) >= 3
     assert len({row["outcome_complexity"] for row in rows}) >= 3
 
 
-def test_rebuild_is_deterministic(tmp_path: Path) -> None:
-    repo_a = tmp_path / "repo_a"
-    repo_a.mkdir()
-    seed_fixture_repository(repo_a)
+def test_rebuild_is_deterministic(built_corpus: BuiltCorpus, tmp_path: Path) -> None:
+    """Two independently seeded stores rebuild to the same corpus, byte for byte.
+
+    Corpus A is the module's shared rebuild; corpus B is seeded and rebuilt here.
+    """
     repo_b = tmp_path / "repo_b"
     repo_b.mkdir()
     seed_fixture_repository(repo_b)
 
-    summary_a, rows_a = builder.rebuild(repo_a)
+    summary_a, rows_a = built_corpus.summary, built_corpus.rows
     summary_b, rows_b = builder.rebuild(repo_b)
 
     assert summary_a == summary_b
     assert rows_a == rows_b
+    for written in (builder.SUMMARY_RELATIVE_PATH, builder.ROWS_RELATIVE_PATH):
+        assert (built_corpus.repo / written).read_bytes() == (repo_b / written).read_bytes()
 
 
-def test_registry_preserves_other_registered_artifacts(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    seed_fixture_repository(repo)
+def test_registry_preserves_other_registered_artifacts(seeded_copy: Path) -> None:
+    repo = seeded_copy
     registry_path = repo / builder.REGISTRY_RELATIVE_PATH
     registry_path.parent.mkdir(parents=True, exist_ok=True)
     registry_path.write_text(
@@ -437,11 +499,8 @@ def test_check_reports_missing_artifact(tmp_path: Path) -> None:
     assert "artifact_missing" in report["reasons"]
 
 
-def test_check_passes_on_freshly_built_corpus(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    seed_fixture_repository(repo)
-    builder.rebuild(repo)
+def test_check_passes_on_freshly_built_corpus(built_corpus: BuiltCorpus) -> None:
+    repo = built_corpus.repo
 
     report = builder.check(repo)
 
@@ -449,11 +508,8 @@ def test_check_passes_on_freshly_built_corpus(tmp_path: Path) -> None:
     assert report["reasons"] == []
 
 
-def test_check_detects_row_digest_drift(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    seed_fixture_repository(repo)
-    builder.rebuild(repo)
+def test_check_detects_row_digest_drift(built_copy: Path) -> None:
+    repo = built_copy
     rows_path = repo / builder.ROWS_RELATIVE_PATH
     lines = rows_path.read_text(encoding="utf-8").splitlines()
     first_row = json.loads(lines[0])
@@ -467,11 +523,8 @@ def test_check_detects_row_digest_drift(tmp_path: Path) -> None:
     assert any(reason.startswith("row_digest_drift:") for reason in report["reasons"])
 
 
-def test_check_detects_duplicate_trajectory_identity(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    seed_fixture_repository(repo)
-    builder.rebuild(repo)
+def test_check_detects_duplicate_trajectory_identity(built_copy: Path) -> None:
+    repo = built_copy
     rows_path = repo / builder.ROWS_RELATIVE_PATH
     lines = rows_path.read_text(encoding="utf-8").splitlines()
     lines.append(lines[0])
@@ -483,11 +536,10 @@ def test_check_detects_duplicate_trajectory_identity(tmp_path: Path) -> None:
     assert any(reason.startswith("duplicate_trajectory_identity:") for reason in report["reasons"])
 
 
-def test_check_never_touches_task_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    seed_fixture_repository(repo)
-    builder.rebuild(repo)
+def test_check_never_touches_task_store(
+    built_corpus: BuiltCorpus, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = built_corpus.repo
 
     def _boom(*_args, **_kwargs):
         raise AssertionError("check() must never query the live task store")
@@ -561,24 +613,22 @@ def _live_authority(repo: Path):
     return partial(task_engine._validate_accepted_outcome_receipt, repo)
 
 
-def test_verify_provenance_accepts_rows_matching_live_store(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    seed_fixture_repository(repo)
-    candidates = builder.discover_candidates(repo)
-    rows = builder.build_rows(candidates)
+def test_verify_provenance_accepts_rows_matching_live_store(
+    seeded_store: SeededStore, seeded_candidates: list[dict],
+) -> None:
+    repo = seeded_store.repo
+    rows = builder.build_rows(seeded_candidates)
 
     builder.verify_provenance(
         repo, rows, accepted_outcome_authority=_live_authority(repo),
     )
 
 
-def test_verify_provenance_rejects_row_absent_from_live_store(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    seed_fixture_repository(repo)
-    candidates = builder.discover_candidates(repo)
-    rows = builder.build_rows(candidates)
+def test_verify_provenance_rejects_row_absent_from_live_store(
+    seeded_store: SeededStore, seeded_candidates: list[dict],
+) -> None:
+    repo = seeded_store.repo
+    rows = builder.build_rows(seeded_candidates)
     forged_row = dict(rows[0])
     forged_row["task_id"] = "ACCEPTED_TASK_EVAL_CORPUS_DOES_NOT_EXIST"
     forged_row["request_id"] = "req-corpus-does-not-exist"
@@ -592,12 +642,11 @@ def test_verify_provenance_rejects_row_absent_from_live_store(tmp_path: Path) ->
         )
 
 
-def test_verify_provenance_rejects_receipt_mismatch(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    seed_fixture_repository(repo)
-    candidates = builder.discover_candidates(repo)
-    rows = builder.build_rows(candidates)
+def test_verify_provenance_rejects_receipt_mismatch(
+    seeded_store: SeededStore, seeded_candidates: list[dict],
+) -> None:
+    repo = seeded_store.repo
+    rows = builder.build_rows(seeded_candidates)
     tampered_row = dict(rows[0])
     tampered_row["accepted_outcome_receipt_id"] = "sha256:" + "0" * 64
 
@@ -607,11 +656,9 @@ def test_verify_provenance_rejects_receipt_mismatch(tmp_path: Path) -> None:
         )
 
 def test_rebuild_fails_closed_and_writes_nothing_when_a_row_is_forged(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    seeded_copy: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    seed_fixture_repository(repo)
+    repo = seeded_copy
     real_build_rows = builder.build_rows
 
     def _forged_build_rows(candidates):
@@ -647,12 +694,11 @@ def _fail_historical_authority_for(
 
 
 def test_rebuild_excludes_and_reports_candidate_failing_historical_authority(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    seeded_store: SeededStore, seeded_copy: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """NF-2026-01129: rebuild never writes a row its own default check rejects."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    seeded = seed_historical_fixture_repository(repo)
+    repo = seeded_copy
+    seeded = seeded_store.scenarios
     failing = seeded[0]
     _fail_historical_authority_for(monkeypatch, {failing[0]})
 
@@ -677,11 +723,10 @@ def test_rebuild_excludes_and_reports_candidate_failing_historical_authority(
 
 
 def test_rebuild_enforces_minimum_rows_after_historical_exclusion(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    seeded_store: SeededStore, seeded_copy: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    seeded = seed_historical_fixture_repository(repo)
+    repo = seeded_copy
+    seeded = seeded_store.scenarios
     keep = builder.MIN_ROWS - 1
     _fail_historical_authority_for(monkeypatch, {task_id for task_id, _ in seeded[keep:]})
 
@@ -691,11 +736,8 @@ def test_rebuild_enforces_minimum_rows_after_historical_exclusion(
     assert not (repo / builder.ROWS_RELATIVE_PATH).exists()
 
 
-def test_verify_provenance_cli_flag_rejects_forged_committed_row(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    seed_historical_fixture_repository(repo)
-    builder.rebuild(repo)
+def test_verify_provenance_cli_flag_rejects_forged_committed_row(built_copy: Path) -> None:
+    repo = built_copy
     rows_path = repo / builder.ROWS_RELATIVE_PATH
     lines = rows_path.read_text(encoding="utf-8").splitlines()
     forged = json.loads(lines[0])
@@ -711,11 +753,10 @@ def test_verify_provenance_cli_flag_rejects_forged_committed_row(tmp_path: Path)
     assert exit_code == 1
 
 
-def test_verify_provenance_cli_flag_passes_genuine_committed_rows(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    seed_historical_fixture_repository(repo)
-    builder.rebuild(repo)
+def test_verify_provenance_cli_flag_passes_genuine_committed_rows(
+    built_corpus: BuiltCorpus,
+) -> None:
+    repo = built_corpus.repo
 
     exit_code = builder.main(["--repo-root", str(repo), "--verify-provenance"])
 
@@ -955,14 +996,17 @@ def test_verify_provenance_rejects_matching_commit_not_after_base(tmp_path: Path
 # whole-store query count regardless of candidate count (the O(N^2) rework)
 # --------------------------------------------------------------------------
 
-def _seed_noise_cards(repo: Path, *, count: int) -> None:
-    """Insert ``count`` cards with an accepted_request_id but no receipt.
+def _seed_noise_cards(repo: Path, *, count: int, accepted: int) -> None:
+    """Insert ``count`` cards without a receipt; the first ``accepted`` of them
+    carry an accepted_request_id.
 
-    Cheap by design: no promoted files, no receipt computation. Each still
-    carries enough shape for ``discover_candidates`` to attempt (and fail)
-    authentication, exercising the same per-card store-touching path a real
-    multi-thousand-card store would -- without the cost of making every one
-    of them a genuinely authenticatable accepted outcome.
+    Cheap by design: no promoted files, no receipt computation. Each card with
+    an accepted_request_id still carries enough shape for
+    ``discover_candidates`` to attempt (and fail) authentication, exercising
+    the same per-card store-touching path a real multi-thousand-card store
+    would -- without the cost of making every one of them a genuinely
+    authenticatable accepted outcome. The rest were never accepted, so
+    discovery skips them before that path, as it skips most of a real store.
     """
     now = "2026-09-01T00:00:00+00:00"
     _readiness, db_path = task_store._require_ready(repo)
@@ -977,7 +1021,8 @@ def _seed_noise_cards(repo: Path, *, count: int) -> None:
                     f"NOISE_TASK_{i:06d}", "noise_runner", "noise", "finished", "finished",
                     json.dumps({
                         "runner": "noise_runner", "topic": "noise", "risk_tier": "low",
-                        "status": "finished", "accepted_request_id": f"req-noise-{i:06d}",
+                        "status": "finished",
+                        **({"accepted_request_id": f"req-noise-{i:06d}"} if i < accepted else {}),
                     }),
                     now, now, "noise_runner", now, now, f"thread-noise-{i:06d}",
                 )
@@ -997,7 +1042,8 @@ def test_discover_candidates_bounds_whole_store_lookups_on_multi_thousand_card_s
     scans -- once per candidate card, turning an N-card rebuild into N
     whole-store rescans (O(N^2) total). This seeds a multi-thousand-card
     store and asserts each whole-store query runs a small constant number of
-    times, independent of N.
+    times, independent of N, while every candidate card still took the
+    per-card export that used to repeat them.
     """
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -1005,11 +1051,13 @@ def test_discover_candidates_bounds_whole_store_lookups_on_multi_thousand_card_s
     genuine_task_id, _genuine_request_id = _seed_accepted_scenario(
         repo, family="task_mcp", risk_tier="low", complexity="trivial", promoted_count=1,
     )
-    _seed_noise_cards(repo, count=3000)
+    accepted = 50
+    _seed_noise_cards(repo, count=3000, accepted=accepted)
 
-    call_counts = {"decisions": 0, "usage": 0}
+    call_counts = {"decisions": 0, "usage": 0, "exports": 0}
     real_decisions = task_store.latest_manager_decisions
     real_usage = task_store.list_usage_events
+    real_export = builder.trajectory_export.export_attempt_trajectory
 
     def _counted_decisions(*args, **kwargs):
         call_counts["decisions"] += 1
@@ -1019,11 +1067,17 @@ def test_discover_candidates_bounds_whole_store_lookups_on_multi_thousand_card_s
         call_counts["usage"] += 1
         return real_usage(*args, **kwargs)
 
+    def _counted_export(*args, **kwargs):
+        call_counts["exports"] += 1
+        return real_export(*args, **kwargs)
+
     monkeypatch.setattr(task_store, "latest_manager_decisions", _counted_decisions)
     monkeypatch.setattr(task_store, "list_usage_events", _counted_usage)
+    monkeypatch.setattr(builder.trajectory_export, "export_attempt_trajectory", _counted_export)
 
     candidates = builder.discover_candidates(repo)
 
+    assert call_counts["exports"] == accepted + 1
     assert call_counts["decisions"] == 1
     assert call_counts["usage"] == 1
     assert {candidate["task_id"] for candidate in candidates} == {genuine_task_id}
