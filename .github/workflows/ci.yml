@@ -383,3 +383,24 @@ jobs:
           name: aiworkhub-vsix
           path: vscode-extension/dist/aiworkhub-*.vsix
           if-no-files-found: error
+
+  docker-smoke:
+    name: Docker image MCP smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build MCP server image
+        run: docker build -t aiworkhub-mcp:ci .
+
+      - name: Smoke the image over stdio
+        run: python3 scripts/mcp_stdio_smoke.py -- docker run -i --rm aiworkhub-mcp:ci

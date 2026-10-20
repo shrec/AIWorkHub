@@ -1,0 +1,51 @@
+# Keep the build context small. The Dockerfile COPYs only pyproject.toml, README.md,
+# LICENSE, MANIFEST.in, src/ and the two tests/support files MANIFEST.in includes;
+# none of those may ever be excluded here.
+
+# Version control and local tooling
+.git
+.gitattributes
+.gitignore
+.github
+.claude
+.codex
+.vscode
+.idea
+.aiworkhub
+
+# Python environments, caches and build output
+.venv
+venv
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+dist
+build
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.egg-info
+
+# Large directories the image does not need
+**/node_modules
+vscode-extension
+site
+docs
+archive
+AIWorkhubCli
+eval
+benchmarks
+data
+scripts
+
+# Tests, except the two shared helpers MANIFEST.in includes
+tests
+!tests/support/__init__.py
+!tests/support/retention.py
+
+# Local secrets and logs
+**/.env
+**/.env.*
+**/*.log
