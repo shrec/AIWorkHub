@@ -63,7 +63,16 @@ def test_repository_guards_preserve_owner_content_and_are_idempotent(tmp_path: P
     assert settings["permissions"]["allow"] == ["Read"]
     assert tuple(settings["permissions"]["deny"]) == _build_worker_deny()
     assert set(CLAUDE_RAW_DISCOVERY_DENIES) <= set(settings["permissions"]["deny"])
-    assert "hooks" not in settings
+    # The legacy AITools hook is gone; only the managed tool guard remains.
+    commands = {
+        event: [hook["command"] for row in rows for hook in row["hooks"]]
+        for event, rows in settings["hooks"].items()
+    }
+    assert commands == {
+        "PreToolUse": [provider_tool_guards.CLAUDE_TOOL_GUARD_COMMAND],
+        "SessionStart": [provider_tool_guards.CLAUDE_TOOL_GUARD_REMINDER_COMMAND],
+    }
+    assert ".claude/hooks/aiworkhub_tool_guard.py" in first["changed"]
 
 
 def test_corrupt_claude_settings_fail_closed(tmp_path: Path) -> None:
@@ -105,12 +114,15 @@ def _deny(root: Path) -> list[str]:
 
 
 def _worktree_checkout_of_the_repository_settings(root: Path, tmp_path: Path) -> Path:
-    """A worktree whose settings file is the repository's tracked bytes."""
+    """A worktree whose settings file and tool-guard hook are the repository's tracked bytes."""
     worktree = tmp_path / "worktree"
     (worktree / ".claude").mkdir(parents=True)
     (worktree / ".claude" / "settings.json").write_text(
         (root / ".claude" / "settings.json").read_text(encoding="utf-8"), encoding="utf-8"
     )
+    hook = provider_tool_guards.CLAUDE_TOOL_GUARD_HOOK_REL
+    (worktree / hook).parent.mkdir(parents=True)
+    (worktree / hook).write_bytes((root / hook).read_bytes())
     return worktree
 
 
@@ -280,8 +292,10 @@ def test_the_reviewer_rewrite_is_idempotent_and_names_its_baseline_path(
 
     assert first["changed"] == [".claude/settings.json"]
     assert second["changed"] == []
-    assert first["baseline_paths"] == [".claude/settings.json"]
-    assert second["baseline_paths"] == [".claude/settings.json"]
+    # The tool-guard hook is a path the rewrite may write, so it is a baseline path too.
+    baseline = [".claude/settings.json", ".claude/hooks/aiworkhub_tool_guard.py"]
+    assert first["baseline_paths"] == baseline
+    assert second["baseline_paths"] == baseline
 
 
 def test_an_owner_deny_is_never_dropped_by_the_role_rewrite(tmp_path: Path) -> None:

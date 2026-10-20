@@ -19,6 +19,24 @@ from .runtime_adapters import (
 
 
 CLAUDE_SETTINGS_REL = Path(".claude/settings.json")
+CLAUDE_TOOL_GUARD_HOOK_REL = Path(".claude/hooks/aiworkhub_tool_guard.py")
+_TOOL_GUARD_SOURCE = Path(__file__).with_name("tool_guard_hook.py")
+_TOOL_GUARD_MARKER = "aiworkhub_tool_guard.py"
+_TOOL_GUARD_MATCHER = "Bash|PowerShell|Read|Edit|Write"
+# The hook runs the tree's copy of the script with whatever ``python`` the
+# session resolves. ``python <missing file>`` exits 2, and 2 is the exit code
+# that BLOCKS a PreToolUse call, so the command looks the script up itself and
+# runs it only when it exists: a tree without it loses the guard, not its tools.
+_TOOL_GUARD_LOCATE = (
+    "import os,runpy,sys;"
+    "p=os.path.join(os.environ.get('CLAUDE_PROJECT_DIR') or os.getcwd(),"
+    "'.claude','hooks','aiworkhub_tool_guard.py');"
+)
+_TOOL_GUARD_RUN = "os.path.isfile(p) and runpy.run_path(p,run_name='__main__')"
+CLAUDE_TOOL_GUARD_COMMAND = 'python -c "' + _TOOL_GUARD_LOCATE + _TOOL_GUARD_RUN + '"'
+CLAUDE_TOOL_GUARD_REMINDER_COMMAND = (
+    'python -c "' + _TOOL_GUARD_LOCATE + "sys.argv=[p,'--reminder'];" + _TOOL_GUARD_RUN + '"'
+)
 
 
 class ProviderGuardError(RuntimeError):
@@ -114,18 +132,99 @@ def _remove_legacy_pretool_hooks(payload: dict[str, Any]) -> bool:
     return changed
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
         os.replace(temporary, path)
     finally:
         try:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    # The newline translation a text-mode handle performs, made explicit.
+    _atomic_write_bytes(path, text.replace("\n", os.linesep).encode("utf-8"))
+
+
+def _tool_guard_hook_rows() -> tuple[tuple[str, dict[str, Any]], ...]:
+    """The managed ``(event, row)`` pairs, built fresh on every call."""
+
+    def row(matcher: str, command: str) -> dict[str, Any]:
+        return {
+            "matcher": matcher,
+            "hooks": [{"type": "command", "command": command, "timeout": 10}],
+        }
+
+    return (
+        ("PreToolUse", row(_TOOL_GUARD_MATCHER, CLAUDE_TOOL_GUARD_COMMAND)),
+        ("SessionStart", row("compact", CLAUDE_TOOL_GUARD_REMINDER_COMMAND)),
+    )
+
+
+def _is_tool_guard_hook(item: Any) -> bool:
+    return isinstance(item, dict) and _TOOL_GUARD_MARKER in str(item.get("command") or "")
+
+
+def _install_tool_guard_hooks(payload: dict[str, Any]) -> bool:
+    """Idempotently install the managed tool-guard hook rows; owner hooks are kept.
+
+    A hook is managed when its command names ``aiworkhub_tool_guard.py``. Every
+    managed hook is dropped and ONE canonical row goes back where the first of
+    them was (appended when there was none), so a re-apply replaces in place and
+    never duplicates. A row an owner wrote around a managed hook keeps the rest.
+    """
+
+    hooks = payload.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise ProviderGuardError("claude_hooks_object_required")
+    changed = False
+    for event, managed in _tool_guard_hook_rows():
+        rows = hooks.get(event)
+        if rows is None:
+            rows = []
+        if not isinstance(rows, list):
+            raise ProviderGuardError(f"claude_hooks_list_required:{event}")
+        merged: list[Any] = []
+        slot: int | None = None
+        for row in rows:
+            nested = row.get("hooks") if isinstance(row, dict) else None
+            if not isinstance(nested, list) or not any(map(_is_tool_guard_hook, nested)):
+                merged.append(row)
+                continue
+            if slot is None:
+                slot = len(merged)
+            owned = [item for item in nested if not _is_tool_guard_hook(item)]
+            if owned:
+                merged.append({**row, "hooks": owned})
+        merged.insert(len(merged) if slot is None else slot, managed)
+        if merged != rows:
+            hooks[event] = merged
+            changed = True
+    return changed
+
+
+def _install_tool_guard_script(root: Path) -> bool:
+    """Write the hook script the settings run when it is absent or not this module."""
+
+    path = (root / CLAUDE_TOOL_GUARD_HOOK_REL).resolve()
+    if not path.is_relative_to(root):
+        raise ProviderGuardError("claude_tool_guard_path_escape")
+    try:
+        source = _TOOL_GUARD_SOURCE.read_bytes()
+    except OSError as exc:
+        raise ProviderGuardError(f"claude_tool_guard_source_unreadable:{exc}") from exc
+    try:
+        if path.is_file() and path.read_bytes() == source:
+            return False
+    except OSError:
+        pass
+    _atomic_write_bytes(path, source)
+    return True
 
 
 def _merge_claude_settings(
@@ -144,6 +243,8 @@ def _merge_claude_settings(
     if not isinstance(permissions, dict):
         raise ProviderGuardError("claude_permissions_object_required")
     changed = _remove_legacy_pretool_hooks(payload)
+    if _install_tool_guard_hooks(payload):
+        changed = True
     allow = permissions.get("allow")
     if allow is not None:
         if not isinstance(allow, list) or any(not isinstance(item, str) for item in allow):
@@ -179,7 +280,7 @@ def _merge_claude_settings(
 
 
 def apply_repository_guards(repo_root: Path, *, read_only: bool = False) -> dict[str, Any]:
-    """Idempotently install all provider instructions plus Claude hard denies.
+    """Idempotently install all provider instructions, Claude hard denies and the tool guard.
 
     ``read_only`` names the ROLE the tree is being provisioned for and defaults
     to the writing one, so a caller that does not think about roles provisions a
@@ -210,6 +311,8 @@ def apply_repository_guards(repo_root: Path, *, read_only: bool = False) -> dict
             json.dumps(settings, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         )
         changed.append(CLAUDE_SETTINGS_REL.as_posix())
+    if _install_tool_guard_script(root):
+        changed.append(CLAUDE_TOOL_GUARD_HOOK_REL.as_posix())
 
     return {
         "ok": True,
@@ -221,7 +324,7 @@ def apply_repository_guards(repo_root: Path, *, read_only: bool = False) -> dict
 
 
 def apply_workspace_guards(workspace_root: Path, *, read_only: bool) -> dict[str, Any]:
-    """Rewrite ONE provisioned worktree's ``.claude/settings.json`` for its role.
+    """Rewrite ONE provisioned worktree's Claude settings and tool-guard hook for its role.
 
     :func:`apply_repository_guards` provisions the canonical repository at init.
     A worker or reviewer, though, does not run there: it runs in a git worktree
@@ -229,13 +332,15 @@ def apply_workspace_guards(workspace_root: Path, *, read_only: bool) -> dict[str
     canonical tracked settings file verbatim. That inheritance is what made the
     reviewer's native-search grant inert.
 
-    This touches the settings file ONLY -- never a provider instruction file --
-    because those are already correct in the checkout and rewriting them would
-    put unrelated paths into the candidate delta a reviewer must not carry.
+    This touches the settings file and the tool-guard hook script ONLY -- never
+    a provider instruction file -- because those are already correct in the
+    checkout and rewriting them would put unrelated paths into the candidate
+    delta a reviewer must not carry. The settings hooks run the script from the
+    tree, so a checkout whose copy is missing or stale gets this module's bytes.
 
-    ``baseline_paths`` names the exact repository-relative path this wrote. A
-    caller provisioning a workspace must fold it into the workspace baseline it
-    snapshots, or the rewrite reads back as a candidate edit the reviewer made.
+    ``baseline_paths`` names the exact repository-relative paths this may write.
+    A caller provisioning a workspace must fold them into the workspace baseline
+    it snapshots, or the rewrite reads back as a candidate edit the reviewer made.
     """
 
     root = Path(workspace_root).resolve()
@@ -243,23 +348,32 @@ def apply_workspace_guards(workspace_root: Path, *, read_only: bool) -> dict[str
     if not claude_path.is_relative_to(root):
         raise ProviderGuardError("claude_settings_path_escape")
     settings, settings_changed = _merge_claude_settings(claude_path, read_only=read_only)
-    wrote = settings_changed or not claude_path.exists()
-    if wrote:
+    changed: list[str] = []
+    if settings_changed or not claude_path.exists():
         _atomic_write_text(
             claude_path,
             json.dumps(settings, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         )
+        changed.append(CLAUDE_SETTINGS_REL.as_posix())
+    if _install_tool_guard_script(root):
+        changed.append(CLAUDE_TOOL_GUARD_HOOK_REL.as_posix())
     return {
         "ok": True,
         "read_only": bool(read_only),
-        "changed": [CLAUDE_SETTINGS_REL.as_posix()] if wrote else [],
-        "baseline_paths": [CLAUDE_SETTINGS_REL.as_posix()],
+        "changed": changed,
+        "baseline_paths": [
+            CLAUDE_SETTINGS_REL.as_posix(),
+            CLAUDE_TOOL_GUARD_HOOK_REL.as_posix(),
+        ],
         "deny": list(claude_settings_deny(read_only=read_only)),
     }
 
 
 __all__ = [
     "CLAUDE_SETTINGS_REL",
+    "CLAUDE_TOOL_GUARD_COMMAND",
+    "CLAUDE_TOOL_GUARD_HOOK_REL",
+    "CLAUDE_TOOL_GUARD_REMINDER_COMMAND",
     "ProviderGuardError",
     "apply_repository_guards",
     "apply_workspace_guards",
