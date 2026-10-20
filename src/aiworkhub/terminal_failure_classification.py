@@ -515,6 +515,10 @@ _CONTROL_PLANE_REASONS: tuple[str, ...] = (
     # this cause when the recorded sandbox backend drifted; naming it here
     # keeps the refusal out of ``unclassified`` (NF-2026-01346).
     "validation_route_backend_mismatch",
+    # worker_workspace.py ``_isolated_worktree_base_oid`` /
+    # ``_verified_worktree_admin_dir`` (NF-2026-01621): finalize refused because
+    # the review worktree marker was gone; previously filed as ``unclassified``.
+    "worktree_is_not_detached_and_isolated",
     PROVIDER_NO_EFFECT,
     # ------------------------------------------------------------------ #
     # WRAPPERS ONLY BELOW THIS LINE -- see the ordering note above.

@@ -628,3 +628,44 @@ def test_a_transport_or_wrapper_code_is_recognised_but_places_no_card(code: str)
     Each is recognised so the diagnosis survives, and each stays unplaced."""
     assert disposition_for_reason(code) == FAILURE_CLASS_UNKNOWN
     assert code in tfc._DISCLAIMED_REASONS
+
+
+_WORKTREE_NOT_ISOLATED = "worktree_is_not_detached_and_isolated"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _WORKTREE_NOT_ISOLATED,
+        f"{_WORKTREE_NOT_ISOLATED}:AKIAIOSFODNN7EXAMPLE",
+        f"{_WORKTREE_NOT_ISOLATED}:Z:/synthetic/worktree/.git",
+    ],
+)
+def test_a_missing_review_worktree_is_named_not_unclassified(error: str) -> None:
+    """NF-2026-01621: ``worker_workspace`` raises this ``WorkspaceError`` when
+    the review worktree marker is gone. Finalize filed it as
+    ``finalize_failed:unclassified:exit_code=0`` with the reason visible only
+    in review.json; bare or with a ``:<tail>`` it now names the refusal and
+    copies not one byte of the tail."""
+    result = tfc.terminal_event_authority(
+        state="finalize_failed", exit_code=0, error=error,
+    )
+    assert result["diagnostic"] == f"finalize_failed:{_WORKTREE_NOT_ISOLATED}:exit_code=0"
+    assert result["error"] == result["diagnostic"]
+    assert "unclassified" not in result["diagnostic"]
+    assert "AKIA" not in result["diagnostic"]
+    assert "synthetic" not in result["diagnostic"]
+    assert _ALLOWLISTED_DIAGNOSTIC.match(result["diagnostic"]), result["diagnostic"]
+    assert tfc._control_plane_code(error) is not None
+    assert tfc._control_plane_code(error) == _WORKTREE_NOT_ISOLATED
+
+
+def test_the_missing_worktree_reason_stays_out_of_the_workspace_error_set() -> None:
+    """The workspace-error reason set is deliberately narrow; this reason is
+    recognised through the control-plane vocabulary only."""
+    assert _WORKTREE_NOT_ISOLATED in tfc._CONTROL_PLANE_REASONS
+    assert _WORKTREE_NOT_ISOLATED not in tfc._WORKSPACE_ERROR_REASONS
+    assert tfc._CONTROL_PLANE_REASONS.index(_WORKTREE_NOT_ISOLATED) < tfc._CONTROL_PLANE_REASONS.index(
+        "finalizer_retries_exhausted"
+    )
+    assert tfc._CONTROL_PLANE_REASONS[-1] == "finalizer_retries_exhausted"
