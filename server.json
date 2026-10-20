@@ -1,0 +1,43 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.shrec/aiworkhub",
+  "description": "Local-first, repository-native AI engineering control plane for VS Code and MCP",
+  "repository": {
+    "url": "https://github.com/shrec/AIWorkHub",
+    "source": "github"
+  },
+  "version": "0.12.60",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "aiworkhub",
+      "version": "0.12.60",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "AIWORKHUB_REPO_ROOT",
+          "description": "Absolute path of the git repository to manage",
+          "isRequired": true,
+          "format": "string"
+        },
+        {
+          "name": "AIWORKHUB_ALLOW_WRITES",
+          "description": "Write gate. Only the exact value 1 enables write operations such as queue mutations; any other value, including unset, keeps the server read-only.",
+          "isRequired": false,
+          "format": "string",
+          "default": "0"
+        },
+        {
+          "name": "AIWORKHUB_ALLOW_LAUNCH",
+          "description": "Launch gate. Only the exact value 1 enables worker launches, and launches also need AIWORKHUB_ALLOW_WRITES=1; any other value, including unset, disables them.",
+          "isRequired": false,
+          "format": "string",
+          "default": "0"
+        }
+      ]
+    }
+  ]
+}

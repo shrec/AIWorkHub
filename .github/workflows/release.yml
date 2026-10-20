@@ -210,15 +210,16 @@ jobs:
           python scripts/release_metadata.py checksums
           --output release-assets/SHA256SUMS
           release-assets/python/* release-assets/vscode/*
+      - name: Generate release notes from CHANGELOG
+        env:
+          RELEASE_TAG: ${{ needs.provenance.outputs.release_tag }}
+        run: python scripts/release_metadata.py notes --tag "$RELEASE_TAG" --output release-assets/RELEASE_NOTES.md
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.provenance.outputs.release_tag }}
           name: AIWorkHub ${{ needs.provenance.outputs.release_tag }}
-          body: |
-            ## AIWorkHub Release
-            See the repository commit history for details.
-            Verify downloaded artifacts against the attached `SHA256SUMS`.
+          body_path: release-assets/RELEASE_NOTES.md
           draft: false
           prerelease: ${{ contains(needs.provenance.outputs.release_tag, '-') }}
           fail_on_unmatched_files: true
@@ -288,3 +289,56 @@ jobs:
           name: aiworkhub-python-dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-mcp-registry:
+    name: Publish to MCP Registry
+    if: ${{ !cancelled() && vars.MCP_REGISTRY_PUBLISH_ENABLED == 'true' }}
+    needs: [provenance, publish-pypi]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Require a successful PyPI publication
+        run: |
+          if [ "${{ needs.publish-pypi.result }}" != "success" ] || [ "${{ needs.provenance.result }}" != "success" ]; then
+            echo "::error::MCP Registry publishing is enabled but PyPI publication did not succeed"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.provenance.outputs.release_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install mcp-publisher v1.8.1 with verified checksum
+        run: |
+          set -euo pipefail
+          archive=mcp-publisher_linux_amd64.tar.gz
+          curl --fail --silent --show-error --location --retry 3 --output "$archive" \
+            https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher_linux_amd64.tar.gz
+          echo "a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc  $archive" | sha256sum --check --strict -
+          tar -xzf "$archive" mcp-publisher
+
+      - name: Log in to the MCP Registry with GitHub OIDC
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server.json to the MCP Registry
+        run: |
+          set -euo pipefail
+          attempts=10
+          delay_seconds=30
+          for (( attempt = 1; attempt <= attempts; attempt++ )); do
+            if ./mcp-publisher publish; then
+              exit 0
+            fi
+            if (( attempt < attempts )); then
+              echo "::warning::publish attempt $attempt of $attempts failed; retrying in $delay_seconds seconds while PyPI propagates"
+              sleep "$delay_seconds"
+              ./mcp-publisher login github-oidc || echo "::warning::re-login failed; retrying"
+            fi
+          done
+          echo "::error::mcp-publisher publish failed after $attempts attempts"
+          exit 1

@@ -27,6 +27,34 @@ def changelog_versions(root: Path) -> set[str]:
     return set(re.findall(r"^## \[([^]]+)\]", text, re.MULTILINE))
 
 
+def tag_version(tag: str) -> str:
+    return tag[1:] if tag.startswith("v") else tag
+
+
+def changelog_section(root: Path, tag: str) -> str:
+    """Return the CHANGELOG.md text under the tag's own ``## [version]`` heading, or raise."""
+    version = tag_version(tag)
+    if VALID_VERSION.fullmatch(version) is None:
+        raise ValueError(f"release tag is not release-safe: {tag!r}")
+    heading = f"## [{version}]"
+    lines = (root / "CHANGELOG.md").read_text(encoding="utf-8").split("\n")
+    start = next((index for index, line in enumerate(lines) if line.startswith(heading)), None)
+    if start is None:
+        raise ValueError(f"CHANGELOG.md has no {heading!r} section for release tag {tag!r}")
+    section: list[str] = []
+    for line in lines[start + 1 :]:
+        if line.startswith("## ["):
+            break
+        section.append(line)
+    while section and not section[0].strip():
+        section.pop(0)
+    while section and not section[-1].strip():
+        section.pop()
+    if not section:
+        raise ValueError(f"CHANGELOG.md section {heading!r} is empty; a release needs notes")
+    return "\n".join(section)
+
+
 # Release-gating documents the extension's own static test asserts, and this
 # check did not. v0.10.78 was tagged with `check` reporting ok and CI then
 # failed extension-static.test.js on all four platforms, twice over: the
@@ -86,6 +114,7 @@ def projected_versions(root: Path) -> dict[str, str]:
     lock = json.loads((root / "vscode-extension" / "package-lock.json").read_text(encoding="utf-8"))
     extension_source = (root / "vscode-extension" / "extension.js").read_text(encoding="utf-8")
     runtime_match = RUNTIME_LITERAL.search(extension_source)
+    server = json.loads((root / "server.json").read_text(encoding="utf-8"))
     return {
         "vscode-extension/package.json": str(package.get("version") or "missing"),
         "vscode-extension/package-lock.json": str(lock.get("version") or "missing"),
@@ -93,6 +122,10 @@ def projected_versions(root: Path) -> dict[str, str]:
             ((lock.get("packages") or {}).get("") or {}).get("version") or "missing"
         ),
         "vscode-extension/extension.js": runtime_match.group(2) if runtime_match else "missing",
+        "server.json": str(server.get("version") or "missing"),
+        "server.json#packages-0": str(
+            ((server.get("packages") or [{}])[0] or {}).get("version") or "missing"
+        ),
     }
 
 
@@ -102,7 +135,7 @@ def check(root: Path, *, tag: str = "") -> dict[str, object]:
     mismatches = {
         path: version for path, version in projections.items() if version != canonical
     }
-    normalized_tag = tag[1:] if tag.startswith("v") else tag
+    normalized_tag = tag_version(tag)
     if tag and normalized_tag != canonical:
         mismatches["release-tag"] = normalized_tag
     if canonical not in changelog_versions(root):
@@ -162,6 +195,15 @@ def sync(root: Path) -> dict[str, object]:
     if count != 1:
         raise ValueError("extension runtime version projection is missing or ambiguous")
     _write_text_preserving_newlines(extension_path, rewritten)
+
+    server_path = root / "server.json"
+    server = json.loads(server_path.read_text(encoding="utf-8"))
+    packages = server.get("packages")
+    if not isinstance(packages, list) or not packages or not isinstance(packages[0], dict):
+        raise ValueError("server.json packages[0] is missing")
+    server["version"] = version
+    packages[0]["version"] = version
+    _write_json(server_path, server)
     return check(root)
 
 
@@ -186,6 +228,15 @@ def sha256sums(paths: Iterable[Path], output: Path) -> dict[str, str]:
     return digests
 
 
+CHECKSUM_NOTE = "Verify downloaded artifacts against the attached `SHA256SUMS`."
+
+
+def write_release_notes(root: Path, tag: str, output: Path) -> None:
+    notes = f"{changelog_section(root, tag)}\n\n{CHECKSUM_NOTE}\n"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    _write_text_preserving_newlines(output, notes)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
@@ -196,6 +247,9 @@ def _parser() -> argparse.ArgumentParser:
     sums_parser = subparsers.add_parser("checksums")
     sums_parser.add_argument("--output", type=Path, required=True)
     sums_parser.add_argument("artifacts", type=Path, nargs="+")
+    notes_parser = subparsers.add_parser("notes")
+    notes_parser.add_argument("--tag", required=True)
+    notes_parser.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -207,6 +261,9 @@ def main(argv: list[str] | None = None) -> int:
             result = check(root, tag=args.tag)
         elif args.command == "sync":
             result = sync(root)
+        elif args.command == "notes":
+            write_release_notes(root, args.tag, args.output)
+            result = {"ok": True, "output": str(args.output), "release_tag": args.tag}
         else:
             result = {
                 "ok": True,
