@@ -30,7 +30,7 @@
     <circle cx="214" cy="197" r="12"/>
   </g>
   <text x="365" y="145" fill="#f8fafc" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="72" font-weight="750" letter-spacing="-2">AIWorkHub</text>
-  <text x="370" y="202" fill="#a5f3fc" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="25" font-weight="600" letter-spacing="2">REPOSITORY-NATIVE AI ORCHESTRATION</text>
-  <text x="370" y="254" fill="#cbd5e1" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="24">Plan. Delegate. Verify. Remember.</text>
+  <text x="370" y="202" fill="#a5f3fc" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="25" font-weight="600" letter-spacing="2">AI MANAGER FOR CODING AGENTS</text>
+  <text x="370" y="254" fill="#cbd5e1" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="24">Plan. Delegate. Review. Land.</text>
   <rect x="370" y="284" width="430" height="4" rx="2" fill="url(#brand)"/>
 </svg>

@@ -1,14 +1,26 @@
 # AIWorkHub
 
 <div align="center">
-  <img src="docs/assets/aiworkhub-hero.svg" alt="AIWorkHub — repository-native AI orchestration" width="100%">
+  <img src="docs/assets/aiworkhub-hero.svg" alt="AIWorkHub — an AI manager for coding agents" width="100%">
 </div>
 
 <p align="center">
-  <strong>The open-source control plane for multi-model AI coding agents.</strong><br>
-  Plan work, delegate it to coding models, preserve project context and accept
-  changes only when the evidence passes.
+  <strong>An AI manager that runs Claude Code, Codex and Copilot as its workers.</strong><br>
+  It splits a large project into work cards, sends each card to the cheapest model that can do it, reviews every change against tests before it lands in your tree — and it is building AIWorkHub itself.
 </p>
+
+**Proof, from this repository's own history:**
+
+- 1,984 commits since 2026-07-20, written through its own task loop
+- 347 work cards accepted into its own tree
+- 651 times a worker's change was sent back with code-level findings
+- 621 independent reviewer passes
+- 620 test files, about 262k lines of Python
+
+**What makes it different:**
+
+- Semantic edit: workers change hash-verified line ranges, never rewrite whole files.
+- Review loop: mechanical gates and tests run first, then an independent reviewer reads the code; the manager accepts, returns with findings, or blocks — the same turn.
 
 <p align="center">
   <a href="https://github.com/shrec/AIWorkHub/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/shrec/AIWorkHub/actions/workflows/ci.yml/badge.svg"></a>
@@ -20,14 +32,6 @@
 </p>
 
 <!-- mcp-name: io.github.shrec/aiworkhub -->
-
-AIWorkHub is an open-source, local-first multi-model AI coding agent
-orchestrator for VS Code and MCP. It coordinates Codex, Claude, Copilot,
-DeepSeek and GLM workers through dependency-aware task graphs, durable project
-memory, source-code intelligence and evidence-based review. Each Git repository
-remains an isolated AI engineering workspace; no AIWorkHub cloud account or
-HTTP service is required. Visit the [AIWorkHub product site](https://shrec.github.io/AIWorkHub/)
-or follow the [getting-started guide](docs/GETTING_STARTED.md).
 
 ![AIWorkHub task and review loop](docs/assets/demo/aiworkhub-task-review-loop.gif)
 
@@ -168,22 +172,18 @@ launches off. See [Configuration](#configuration) to change either.
 - **Use models as a portfolio.** Keep frontier models for difficult judgment,
   route bounded throughput to lower-cost capable models, and use deterministic
   tools where no model is needed.
-- **Reduce avoidable model work.** Agents query a structural Source Graph,
-  read bounded regions and emit focused replacements instead of repeatedly
-  scanning or regenerating whole files.
 - **Delegate safely.** Dependency-aware tasks run in bounded workspaces with
   explicit write scopes, timeouts and cancellation.
 - **Review evidence, not claims.** Diffs, tests, tool-use receipts, artifacts
   and approval history travel with every task.
 - **Keep repositories isolated.** Every repository owns its `.aiworkhub/`
   state, callbacks, indexes, memories and audit trail.
-- **Use multiple models.** Route work by capability, readiness, cost and
-  observed quality without moving project authority into a hosted service.
 
-Codex, Claude, Copilot, DeepSeek and GLM are not products AIWorkHub tries to
-replace. They are execution routes in its workforce. AIWorkHub supplies the
-repository-scoped planning, context, isolation, evidence, review and economics
-layer that lets expensive and economical models work together as one system.
+AIWorkHub is an open-source control plane for multi-model AI coding agents.
+Codex, Claude, Copilot, DeepSeek and GLM are not products it tries to replace;
+they are execution routes in its workforce. It supplies the repository-scoped
+planning, context, isolation, evidence, review and economics layer that lets
+expensive and economical models work together as one system.
 
 | Area | Current capability |
 | --- | --- |

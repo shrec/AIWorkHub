@@ -4,11 +4,20 @@
 
 # AIWorkHub for VS Code
 
-**Plan. Delegate. Verify. Remember.**
+**An AI manager that runs Claude Code, Codex and Copilot as its workers.**
 
-AIWorkHub is a repository-native control plane for multi-model software
-development. It gives every repository an isolated task system, Source Graph,
-durable project context, worker runtime and evidence-first review loop.
+It splits a large project into work cards, sends each card to the cheapest model that can do it, reviews every change against tests before it lands in your tree — and it is building AIWorkHub itself.
+
+**Proof, from this repository's own history:** 1,984 commits since 2026-07-20, written through its own task loop · 347 work cards accepted into its own tree · 651 times a worker's change was sent back with code-level findings · 621 independent reviewer passes · 620 test files, about 262k lines of Python.
+
+- Semantic edit: workers change hash-verified line ranges, never rewrite whole files.
+- Review loop: mechanical gates and tests run first, then an independent reviewer reads the code; the manager accepts, returns with findings, or blocks — the same turn.
+
+<div align="center">
+  <img src="https://raw.githubusercontent.com/shrec/AIWorkHub/main/docs/assets/demo/aiworkhub-task-review-loop.gif" alt="AIWorkHub task, worker, evidence and review loop" width="100%">
+  <br>
+  <em>Create a bounded task, launch a model worker, inspect its evidence and accept or rework it.</em>
+</div>
 
 The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
@@ -44,12 +53,6 @@ Detailed older history stays in the
   <img src="https://raw.githubusercontent.com/shrec/AIWorkHub/main/docs/assets/aiworkhub-source-graph-architecture.png" alt="AIWorkHub Source Graph architecture" width="100%">
   <br>
   <em>Incremental Source Graph refresh, index, query, semantic-edit and review-overlay paths.</em>
-</div>
-
-<div align="center">
-  <img src="https://raw.githubusercontent.com/shrec/AIWorkHub/main/docs/assets/demo/aiworkhub-task-review-loop.gif" alt="AIWorkHub task, worker, evidence and review loop" width="100%">
-  <br>
-  <em>Create a bounded task, launch a model worker, inspect its evidence and accept or rework it.</em>
 </div>
 
 ## Highlights

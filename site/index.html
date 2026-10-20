@@ -3,19 +3,19 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>AIWorkHub — Open-Source Multi-Model AI Coding Agent Orchestrator</title>
-  <meta name="description" content="AIWorkHub is an open-source, local-first multi-model AI coding agent orchestrator for VS Code and MCP, with task graphs, durable context, source intelligence and evidence-based review.">
+  <title>AIWorkHub — An AI manager that runs Claude Code, Codex and Copilot as workers</title>
+  <meta name="description" content="An AI manager that runs Claude Code, Codex and Copilot as its workers. It splits a large project into work cards, sends each card to the cheapest model that can do it and reviews every change against tests before it lands.">
   <link rel="canonical" href="https://shrec.github.io/AIWorkHub/">
   <meta name="robots" content="index,follow,max-image-preview:large">
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="AIWorkHub">
-  <meta property="og:title" content="AIWorkHub — Multi-Model AI Coding Agent Orchestration">
-  <meta property="og:description" content="Coordinate Codex, Claude, Copilot, DeepSeek and GLM workers from a repository-native VS Code control plane.">
+  <meta property="og:title" content="AIWorkHub — An AI manager that runs Claude Code, Codex and Copilot as workers">
+  <meta property="og:description" content="It splits a large project into work cards, sends each card to the cheapest model that can do it and reviews every change against tests before it lands — and it is building AIWorkHub itself.">
   <meta property="og:url" content="https://shrec.github.io/AIWorkHub/">
   <meta property="og:image" content="https://raw.githubusercontent.com/shrec/AIWorkHub/main/docs/assets/product-hunt/01-control-plane.png">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="AIWorkHub — Multi-Model AI Coding Agent Orchestrator">
-  <meta name="twitter:description" content="Local-first task orchestration, source intelligence, durable context and evidence-based review for coding agents.">
+  <meta name="twitter:title" content="AIWorkHub — An AI manager that runs Claude Code, Codex and Copilot as workers">
+  <meta name="twitter:description" content="Workers change hash-verified line ranges; gates and tests run before an independent reviewer reads the code. 347 work cards accepted into its own tree.">
   <meta name="twitter:image" content="https://raw.githubusercontent.com/shrec/AIWorkHub/main/docs/assets/product-hunt/01-control-plane.png">
   <!-- Add Google and Bing site-verification meta tags here after ownership setup. -->
   <link rel="stylesheet" href="/AIWorkHub/assets/site.css">
@@ -28,7 +28,7 @@
         "name": "AIWorkHub",
         "applicationCategory": "DeveloperApplication",
         "operatingSystem": "Windows, macOS, Linux",
-        "description": "Open-source, local-first multi-model AI coding agent orchestrator for VS Code and MCP.",
+        "description": "An AI manager that runs Claude Code, Codex and Copilot as its workers. It splits a large project into work cards, sends each card to the cheapest model that can do it and reviews every change against tests before it lands. Open source, for VS Code and MCP.",
         "url": "https://shrec.github.io/AIWorkHub/",
         "downloadUrl": "https://marketplace.visualstudio.com/items?itemName=IvaneChkheidze.aiworkhub",
         "softwareRequirements": "Visual Studio Code 1.93 or later",
@@ -38,6 +38,7 @@
       {
         "@type": "SoftwareSourceCode",
         "name": "AIWorkHub",
+        "description": "The source of AIWorkHub, an AI manager that runs Claude Code, Codex and Copilot as its workers and is built through its own task and review loop.",
         "codeRepository": "https://github.com/shrec/AIWorkHub",
         "programmingLanguage": ["Python", "JavaScript", "Go"],
         "runtimePlatform": "Visual Studio Code and Model Context Protocol",
@@ -61,16 +62,30 @@
     <section class="hero"><div class="container hero-grid">
       <div>
         <span class="eyebrow">Open source · Local first · Repository native</span>
-        <h1>One control plane for your coding models.</h1>
-        <p class="hero-copy">AIWorkHub is an open-source multi-model AI coding agent control plane for VS Code and MCP. It does not replace Codex, Claude, Copilot, DeepSeek or GLM—it turns them into one repository-scoped workforce with dependency-aware tasks, durable context, source intelligence and evidence-based review.</p>
+        <h1 style="max-width:none;font-size:clamp(2.1rem,4.6vw,3.5rem)">An AI manager that runs Claude Code, Codex and Copilot as its workers.</h1>
+        <p class="hero-copy">It splits a large project into work cards, sends each card to the cheapest model that can do it, reviews every change against tests before it lands in your tree — and it is building AIWorkHub itself.</p>
         <div class="actions">
           <a class="button primary" href="https://marketplace.visualstudio.com/items?itemName=IvaneChkheidze.aiworkhub">Install from VS Code Marketplace</a>
           <a class="button" href="/AIWorkHub/docs/">Read the documentation</a>
         </div>
       </div>
       <div class="hero-panel">
-        <p class="panel-label">AIWorkHub managing its own repository</p>
-        <a href="/AIWorkHub/assets/screenshots/aiworkhub-self-hosted-dashboard.png" aria-label="Open the full AIWorkHub dashboard screenshot"><img src="/AIWorkHub/assets/screenshots/aiworkhub-self-hosted-dashboard.png" alt="AIWorkHub dashboard showing repository tasks, source graph, context stores, preflight and callback health" width="1432" height="1098"></a>
+        <p class="panel-label">Create a bounded task, launch a model worker, inspect its evidence and accept or rework it.</p>
+        <img src="/AIWorkHub/assets/demo/aiworkhub-task-review-loop.gif" alt="AIWorkHub task, worker, evidence and review loop" width="960" height="736">
+      </div>
+    </div>
+    <div class="container" style="margin-top:3rem">
+      <p class="panel-label">Proof, from this repository's own history</p>
+      <div class="pilot-metrics" style="grid-template-columns:repeat(auto-fit,minmax(11rem,1fr))" role="group" aria-label="AIWorkHub proof from its own repository history">
+        <div><strong>1,984</strong><span>commits since 2026-07-20, written through its own task loop</span></div>
+        <div><strong>347</strong><span>work cards accepted into its own tree</span></div>
+        <div><strong>651</strong><span>times a worker's change was sent back with code-level findings</span></div>
+        <div><strong>621</strong><span>independent reviewer passes</span></div>
+        <div><strong>620</strong><span>test files, about 262k lines of Python</span></div>
+      </div>
+      <div class="grid-2">
+        <article class="card"><p>Semantic edit: workers change hash-verified line ranges, never rewrite whole files.</p></article>
+        <article class="card"><p>Review loop: mechanical gates and tests run first, then an independent reviewer reads the code; the manager accepts, returns with findings, or blocks — the same turn.</p></article>
       </div>
     </div></section>
 
@@ -102,6 +117,10 @@
     <section class="section"><div class="container">
       <div class="section-heading"><span class="eyebrow">The engineering loop</span><h2>Delegate work without giving up authority.</h2><p>Every repository owns its task state, indexes, memories, callbacks and audit trail. Models work in bounded scopes; the manager accepts changes only after evidence is checked.</p></div>
       <div class="flow"><div>Plan a dependency-aware task</div><div>Choose an available model route</div><div>Work in an isolated scope</div><div>Collect diff, tests and receipts</div><div>Accept, reject or rework</div></div>
+      <div class="hero-panel" style="margin-top:2rem">
+        <p class="panel-label">AIWorkHub managing its own repository</p>
+        <a href="/AIWorkHub/assets/screenshots/aiworkhub-self-hosted-dashboard.png" aria-label="Open the full AIWorkHub dashboard screenshot"><img src="/AIWorkHub/assets/screenshots/aiworkhub-self-hosted-dashboard.png" alt="AIWorkHub dashboard showing repository tasks, source graph, context stores, preflight and callback health" width="1432" height="1098" loading="lazy"></a>
+      </div>
     </div></section>
 
     <section class="section"><div class="container callout">
