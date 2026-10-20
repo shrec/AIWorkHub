@@ -1185,11 +1185,13 @@ def _decode_task_card(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
     return card
 
 
-_LIST_TASK_CARDS_SQL = (
-    "SELECT t.* FROM (SELECT rowid AS rid, updated_at AS u FROM tasks "
+_TASK_CARDS_NEWEST_FIRST_SQL = (
+    "FROM (SELECT rowid AS rid, updated_at AS u FROM tasks "
     "ORDER BY updated_at DESC LIMIT ?) s JOIN tasks t ON t.rowid = s.rid "
     "ORDER BY s.u DESC"
 )
+
+_LIST_TASK_CARDS_SQL = "SELECT t.* " + _TASK_CARDS_NEWEST_FIRST_SQL
 
 _GET_TASKS_CHUNK = 500
 
@@ -1220,6 +1222,37 @@ def list_task_cards(root: str | Path, *, limit: int = 500) -> list[dict[str, Any
     finally:
         conn.close()
     return [_decode_task_card(row) for row in rows]
+
+
+_LIST_TASK_ROUTING_FACTS_SQL = (
+    "SELECT t.task_id AS task_id, t.topic AS topic, "
+    "CASE WHEN json_valid(t.card_json) THEN json_extract(t.card_json, "
+    "'$.topic', '$.project_context.task_type', '$.risk_tier') END AS card_facts "
+    + _TASK_CARDS_NEWEST_FIRST_SQL
+)
+
+
+def list_task_routing_facts(root: str | Path, *, limit: int = 500) -> list[dict[str, Any]]:
+    """Return topic, task type and risk tier of the newest tasks without decoding their cards."""
+    _readiness, db_path = _require_ready(root)
+    bounded_limit = max(1, min(int(limit), 5000))
+    conn = _connect(db_path, readonly=True)
+    try:
+        rows = conn.execute(_LIST_TASK_ROUTING_FACTS_SQL, (bounded_limit,)).fetchall()
+    finally:
+        conn.close()
+    facts: list[dict[str, Any]] = []
+    for row in rows:
+        card_topic, task_type, risk_tier = (
+            json.loads(row["card_facts"]) if row["card_facts"] else (None, None, None)
+        )
+        facts.append({
+            "task_id": row["task_id"],
+            "topic": row["topic"] or card_topic or "",
+            "project_context": {"task_type": task_type},
+            "risk_tier": risk_tier,
+        })
+    return facts
 
 
 _REVIEW_STATUS_VALUES: tuple[str, ...] = ("review", "ready_for_review", "codex_review", "awaiting_review")
@@ -7709,7 +7742,12 @@ def latest_manager_decisions(root: str | Path, *, limit: int = 50_000) -> dict[s
     conn = _connect(db_path, readonly=True)
     try:
         rows = conn.execute(
-            "SELECT task_id, event, payload_json, created_at FROM task_events "
+            "SELECT task_id, event, "
+            # The prefix test runs in SQL so only an integer reaches Python: an
+            # unpaired surrogate escape in a reason does not decode as UTF-8 text.
+            "CASE WHEN event IN ('archived','superseded') AND json_valid(payload_json) "
+            "THEN substr(json_extract(payload_json, '$.reason'), 1, 14) = 'reject_review:' "
+            "END AS is_reject_reason, created_at FROM task_events "
             "WHERE event IN ('accept_review','reject_review','archived','superseded') "
             "ORDER BY event_id DESC LIMIT ?",
             (max(1, min(int(limit), 50_000)),),
@@ -7727,11 +7765,7 @@ def latest_manager_decisions(root: str | Path, *, limit: int = 50_000) -> dict[s
         elif event == "reject_review":
             decision = "rejected"
         else:
-            try:
-                payload = json.loads(str(row["payload_json"] or "{}"))
-            except json.JSONDecodeError:
-                continue
-            if not str(payload.get("reason") or "").startswith("reject_review:"):
+            if not row["is_reject_reason"]:
                 continue
             decision = "rejected"
         decisions[task_id] = {

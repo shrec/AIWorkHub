@@ -915,7 +915,7 @@ def build_cost_ledger(
 
     try:
         cards = (
-            task_store.list_task_cards(repo_root, limit=5000)
+            task_store.list_task_routing_facts(repo_root, limit=5000)
             if repo_root is not None
             else []
         )
