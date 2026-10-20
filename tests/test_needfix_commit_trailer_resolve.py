@@ -129,6 +129,58 @@ def test_body_mention_without_trailer_is_unchanged(git_repo: Path):
     assert row["resolved_at"] is None
 
 
+def test_resolves_line_before_co_authored_by_paragraph_resolves(git_repo: Path):
+    nfid = _accepted(git_repo, "non-final-paragraph")
+    sha = _commit(
+        git_repo, "fix.txt",
+        f"Fix the thing\n\nExplains the change.\n\nResolves: {nfid}\n\n"
+        "Co-Authored-By: A <a@b>\n",
+    )
+
+    needfix_ingest._reconcile_commit_trailers_on_read(git_repo)
+
+    row = needfix_store.get_needfix(git_repo, nfid)
+    assert row["status"] == "resolved"
+    assert f"git:{sha}" in row["evidence_refs"]
+
+
+def test_two_resolves_lines_in_non_final_paragraph_resolve_both(git_repo: Path):
+    first = _accepted(git_repo, "non-final-first")
+    second = _accepted(git_repo, "non-final-second")
+    _commit(
+        git_repo, "fix.txt",
+        f"Fix both\n\nResolves: {first}\nResolves: {second}\n\n"
+        "Co-Authored-By: A <a@b>\n",
+    )
+
+    needfix_ingest._reconcile_commit_trailers_on_read(git_repo)
+
+    assert needfix_store.get_needfix(git_repo, first)["status"] == "resolved"
+    assert needfix_store.get_needfix(git_repo, second)["status"] == "resolved"
+
+
+def test_quoted_and_indented_resolves_lines_are_unchanged(git_repo: Path):
+    quoted = _accepted(git_repo, "quoted-resolves")
+    indented = _accepted(git_repo, "indented-resolves")
+    # Positive control in the same commit: proves the reconcile scanned this
+    # commit, so the two unchanged rows mean the line rule rejected them.
+    control = _accepted(git_repo, "quoted-resolves-control")
+    _commit(
+        git_repo, "fix.txt",
+        f"Discuss\n\n> Resolves: {quoted}\n\n  Resolves: {indented}\n\n"
+        f"Resolves: {control}\n\n"
+        "Co-Authored-By: A <a@b>\n",
+    )
+
+    needfix_ingest._reconcile_commit_trailers_on_read(git_repo)
+
+    assert needfix_store.get_needfix(git_repo, control)["status"] == "resolved"
+    for nfid in (quoted, indented):
+        row = needfix_store.get_needfix(git_repo, nfid)
+        assert row["status"] == "accepted"
+        assert row["resolved_at"] is None
+
+
 def test_unknown_nf_id_in_trailer_is_a_noop(git_repo: Path):
     _commit(git_repo, "fix.txt", "Fix\n\nResolves: NF-2099-99999\n")
 

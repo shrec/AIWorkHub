@@ -805,17 +805,24 @@ def _git_rev_list_newest_window(repo: Path, head: str) -> list[str] | None:
     return list(reversed(newest_first))
 
 
+_COMMIT_RESOLVES_LINE_RE = re.compile(
+    r"Resolves:[ \t]*(NF-\d{4}-\d{5}(?:[ \t]*,[ \t]*NF-\d{4}-\d{5})*)[ \t]*"
+)
+
+
 def _git_resolves_trailer_log(repo: Path, shas: list[str]) -> list[tuple[str, str]] | None:
-    """Return ``(sha, trailer_value)`` pairs for exactly the commits ``shas``
-    (no history walk), reading ONLY the structured ``Resolves`` git trailer --
-    never the free-text commit body -- via git's own trailer parser. ``None``
-    on any git failure.
+    """Return ``(sha, resolves_value)`` pairs for exactly the commits ``shas``
+    (no history walk); ``None`` on any git failure. The value is git's own
+    ``Resolves`` trailer value (final paragraph only) plus the value of every
+    message line, in ANY paragraph, that is wholly ``Resolves: NF-...`` (ids
+    comma-separated, nothing else on the line). A line with prose after the
+    id, an indented line or a quoted ``> Resolves:`` line never matches.
     """
     try:
         result = subprocess.run(
             [
                 "git", "-C", str(repo), "log", "--no-walk=unsorted", "--stdin",
-                "--format=%x1e%H%x1f%(trailers:key=Resolves,valueonly,unfold)",
+                "--format=%x1e%H%x1f%(trailers:key=Resolves,valueonly,unfold)%x1f%B",
             ],
             input="".join(f"{sha}\n" for sha in shas),
             cwd=str(repo),
@@ -834,10 +841,24 @@ def _git_resolves_trailer_log(repo: Path, shas: list[str]) -> list[tuple[str, st
     for record in result.stdout.split("\x1e"):
         if not record:
             continue
-        sha, _, trailer_value = record.partition("\x1f")
+        sha, _, rest = record.partition("\x1f")
         sha = sha.strip()
-        if sha:
-            entries.append((sha, trailer_value))
+        if not sha:
+            continue
+        trailer_value, _, message = rest.partition("\x1f")
+        seen = set(_COMMIT_TRAILER_NF_ID_RE.findall(trailer_value))
+        extra: list[str] = []
+        for line in message.split("\n"):
+            matched = _COMMIT_RESOLVES_LINE_RE.fullmatch(line.rstrip("\r"))
+            if matched is None:
+                continue
+            for nfid in _COMMIT_TRAILER_NF_ID_RE.findall(matched.group(1)):
+                if nfid not in seen:
+                    seen.add(nfid)
+                    extra.append(nfid)
+        if extra:
+            trailer_value = trailer_value.rstrip("\n") + "\n" + ", ".join(extra) + "\n"
+        entries.append((sha, trailer_value))
     return entries
 
 
