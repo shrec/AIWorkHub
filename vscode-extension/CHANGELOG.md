@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.61 — 2026-10-20
+
+### Fixed
+
+- Bundled runtime 0.12.61: storage GC sweeps aged worker scratch roots and the dashboard flags an over-cap store (NF-2026-01614); GC keeps a live request's worker temp directory after an auth-retry relaunch (NF-2026-01619); a rework that reverts an inherited path to canonical bytes is not candidate delta (NF-2026-01618); `subst` drive roots are mapped before the repository containment check (NF-2026-01594).
+- The dashboard's cost ledger loads in 1.7 s instead of 5.7 s on the measured queue (NF-2026-01615, NF-2026-01616).
+
+### Added
+
+- Every model the OpenCode CLI lists can hold the manager seat, including `xai/grok-4.7`.
+
 ## 0.12.60 — 2026-10-20
 
 ### Fixed

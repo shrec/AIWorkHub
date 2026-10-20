@@ -6,6 +6,26 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.61] - 2026-10-20
+
+### Added
+
+- A `Dockerfile` for the stdio MCP server, gated in CI by `scripts/mcp_stdio_smoke.py`.
+- `server.json` for the MCP Registry; GitHub release notes are generated from this changelog, and the release build fails before publishing when that section is empty (NF-2026-01622).
+- Every model the OpenCode CLI lists can hold the manager seat, including `xai/grok-4.7`.
+
+### Fixed
+
+- Storage GC sweeps aged worker scratch roots (about 27 GB on the measured store), and the dashboard flags a store over its size cap (NF-2026-01614).
+- Storage GC keeps a live request's worker temp directory after an auth-retry relaunch (NF-2026-01619).
+- A rework that reverts an inherited path to its canonical bytes no longer counts that path as candidate delta (NF-2026-01618).
+- Repository-state containment checks map `subst` drive roots first (NF-2026-01594).
+- The dashboard's cost ledger resolves the repository root once per build and reads routing facts and manager decisions without card or payload blobs: 5.7 s to 1.7 s on the measured queue (NF-2026-01615, NF-2026-01616).
+
+### Changed
+
+- The READMEs and landing page lead with the AI-manager story.
+
 ## [0.12.60] - 2026-10-20
 
 ### Fixed

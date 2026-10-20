@@ -23,9 +23,9 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.12.60
+## What's new in 0.12.61
 
-- A worker that changed nothing now ends as a failed attempt instead of reaching review, a card rejected for an infrastructure fault is rerouted in place, xAI through OpenCode works with just its saved login, OpenCode Go runs one worker at a time, cards that write `.github/` or `.dockerignore` launch again, and a VS Code LM reviewer gets more reads while it is finding evidence.
+- The dashboard opens faster (its cost ledger went from 5.7 s to 1.7 s), storage cleanup reclaims old worker scratch space without touching a running worker's temp files, a rework that undoes an inherited change no longer shows it as new work, any OpenCode model can hold the manager seat, and the stdio MCP server ships a Dockerfile and an MCP Registry `server.json`.
 
 ## Review automation
 
