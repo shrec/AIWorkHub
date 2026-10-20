@@ -393,3 +393,54 @@ def test_repeated_breach_upgrades_severity_without_duplicate_row(repo):
     row_after = needfix_store.get_needfix(repo, needfix_id)
     assert row_after["severity"] == "high"
     assert row_after["evidence"]["z"] == pytest.approx(-3.0, abs=1e-6)
+
+
+def _single_band_report(**overrides) -> sdlc_control_bands.BandReport:
+    """A one-metric report: a 2-sigma first-pass breach unless ``overrides`` say otherwise."""
+
+    band = {
+        "metric_id": "first_pass_acceptance", "direction": "lower_is_bad", "status": "ok",
+        "tier": "needfix", "severity": "medium", "value": 0.72, "baseline": 0.82,
+        "n": 25, "baseline_n": 100, "z": -2.0, "window_task_ids": ("WIN-0000",),
+    }
+    band.update(overrides)
+    return sdlc_control_bands.BandReport(
+        schema_id=sdlc_control_bands.SCHEMA_ID, repository_id=_REPO,
+        config_sha256="a" * 64, metrics=(sdlc_control_bands.MetricBand(**band),),
+    )
+
+
+@pytest.mark.parametrize("tier", [None, "log"])
+def test_a_band_back_in_control_resolves_its_needfix_and_a_new_breach_reopens_it(repo, tier):
+    filed = sdlc_control_bands.file_breaches(repo, _REPO, _single_band_report())
+    assert len(filed) == 1
+
+    healthy = _single_band_report(tier=tier, severity=None, value=0.8, z=-0.5)
+    assert sdlc_control_bands.file_breaches(repo, _REPO, healthy) == []
+
+    row = needfix_store.get_needfix(repo, filed[0])
+    assert row["status"] == "resolved"
+    event = needfix_store.list_events(repo, filed[0], limit=1)[0]
+    assert event["event"] == "signal_cleared"
+    assert event["detail"]["prior_status"] == "captured"
+    assert event["detail"]["evidence"]["tier"] == tier
+    assert event["detail"]["evidence"]["z"] == pytest.approx(-0.5)
+
+    # The breach coming back reopens that same row instead of filing a second.
+    assert sdlc_control_bands.file_breaches(repo, _REPO, _single_band_report()) == filed
+    assert needfix_store.get_needfix(repo, filed[0])["status"] == "captured"
+    assert needfix_store.count_needfix(repo) == 1
+
+
+def test_an_insufficient_population_band_leaves_its_needfix_open(repo):
+    filed = sdlc_control_bands.file_breaches(repo, _REPO, _single_band_report())
+    insufficient = _single_band_report(
+        status="insufficient_population", tier=None, severity=None,
+        value=None, baseline=None, n=0, z=None,
+    )
+
+    assert sdlc_control_bands.file_breaches(repo, _REPO, insufficient) == []
+
+    assert needfix_store.get_needfix(repo, filed[0])["status"] == "captured"
+    events = [event["event"] for event in needfix_store.list_events(repo, filed[0])]
+    assert "signal_cleared" not in events

@@ -466,14 +466,20 @@ REOPEN_EVENT_LEGACY_ALIAS = "archived_task_link_reopened"
 # A task_created link whose task this host once held but no longer has (the
 # records janitor retired it) is reopened under its own event name.
 REOPEN_EVENT_MISSING_TASK = "missing_task_link_reopened"
-# One compatible durable reopen vocabulary shared by the reopen writer and
+# A signal filed again after its NeedFix was resolved reopens that same row
+# (see ``_reopen_recurred``) instead of being swallowed as a dedupe hit.
+REOPEN_EVENT_RECURRED = "recurred_after_resolve"
+# One compatible durable reopen vocabulary shared by the reopen writers and
 # the authoritative read validator: the canonical superseded reopen event
-# plus its authenticated legacy ordinary-archive alias and the missing-task
-# reopen. Each name counts as exactly one durable reopen for generation
-# authority, so authenticated legacy ``archived_task_link_reopened`` rows stay
-# readable without any direct database edit.
+# plus its authenticated legacy ordinary-archive alias, the missing-task
+# reopen and the recurrence reopen. Each name counts as exactly one durable
+# reopen for generation authority, so authenticated legacy
+# ``archived_task_link_reopened`` rows stay readable without any direct
+# database edit, and a recurred row converts to a fresh ``-rN`` task_id
+# instead of the one that resolved it.
 REOPEN_EVENT_ALIASES: tuple[str, ...] = (
     REOPEN_EVENT, REOPEN_EVENT_LEGACY_ALIAS, REOPEN_EVENT_MISSING_TASK,
+    REOPEN_EVENT_RECURRED,
 )
 _REOPEN_EVENT_MARKS = ", ".join("?" for _ in REOPEN_EVENT_ALIASES)
 
@@ -494,7 +500,8 @@ def _backfill_legacy_reopen_generation(conn: sqlite3.Connection) -> None:
     Only rows still carrying the migration default of 0 and with at least one
     durable reopen event in the compatible vocabulary (canonical
     ``superseded_task_link_reopened``, the legacy
-    ``archived_task_link_reopened`` alias or ``missing_task_link_reopened``)
+    ``archived_task_link_reopened`` alias, ``missing_task_link_reopened`` or
+    ``recurred_after_resolve``)
     are rewritten; nonzero values are never silently repaired here (they fail
     closed elsewhere).
     """
@@ -1111,6 +1118,7 @@ def _insert(
     caused_by: Mapping[str, Any] | None = None,
     repository_id: str = "",
     verify_accepted_outcome: Callable[[Mapping[str, Any]], Mapping[str, Any] | None] | None = None,
+    reopen_resolved: bool = False,
 ) -> dict[str, Any]:
     _validate_payload(
         title,
@@ -1136,59 +1144,124 @@ def _insert(
     conn = _connect(repo_root)
     try:
         _ensure_schema(conn)
-        existing = conn.execute(
-            "SELECT * FROM needfix WHERE dedupe_key = ? AND status != 'archived' LIMIT 1",
-            (dedupe_key,),
-        ).fetchone()
-        if existing is not None:
-            existing_cause = (
-                json.loads(existing["caused_by_json"])
-                if existing["caused_by_json"] else None
+        # The dedupe read and the one write it decides commit together, so two
+        # callers filing one key at once cannot both miss the match and insert.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # UNIQUE(dedupe_key, status) keeps one row per status, so a key can
+            # still hold a few: a live row wins over a closed twin, and a
+            # resolved row is chosen only when it is the key's sole match.
+            matches = conn.execute(
+                "SELECT * FROM needfix WHERE dedupe_key = ? AND status != 'archived' "
+                "ORDER BY created_at, id",
+                (dedupe_key,),
+            ).fetchall()
+            existing = min(
+                matches,
+                key=lambda match: (
+                    match["status"] in NEEDFIX_TERMINAL_STATUSES, match["status"] == "resolved"
+                ),
+                default=None,
             )
-            if verified_cause is not None and existing_cause != verified_cause:
-                raise NeedFixConflictError(
-                    "dedupe match has a different caused_by identity; refusing to rewrite causality"
+            if existing is not None:
+                existing_cause = (
+                    json.loads(existing["caused_by_json"])
+                    if existing["caused_by_json"] else None
                 )
-            _record_event(conn, existing["id"], "dedupe_hit", {"dedupe_key": dedupe_key})
-            return _row_to_dict(existing)
-
-        needfix_id = _generate_nf_id(conn)
-        now = _utcnow_iso()
-        conn.execute(
-            """INSERT INTO needfix
-            (id, dedupe_key, title, description, kind, severity,
-             tags_json, scope, scope_files_json, scope_symbols_json,
-             provenance_json, evidence_json, evidence_refs_json,
-             readiness_score, status, duplicate_parent_id,
-             converted_task_id, caused_by_json, created_at, updated_at,
-             task_planned_at, resolved_at, archived_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, NULL, NULL, NULL)""",
-            (
-                needfix_id,
-                dedupe_key,
-                title,
-                description,
-                kind,
-                severity,
-                json.dumps(list(tags or [])),
-                scope,
-                json.dumps(list(scope_files or [])),
-                json.dumps(list(scope_symbols or [])),
-                json.dumps(dict(provenance or {})),
-                json.dumps(dict(evidence or {})),
-                json.dumps(list(evidence_refs or [])),
-                readiness_score,
-                status,
-                json.dumps(verified_cause, sort_keys=True) if verified_cause else None,
-                now,
-                now,
-            ),
-        )
-        _record_event(conn, needfix_id, "created", {"status": status})
-        row = conn.execute("SELECT * FROM needfix WHERE id = ?", (needfix_id,)).fetchone()
+                if verified_cause is not None and existing_cause != verified_cause:
+                    raise NeedFixConflictError(
+                        "dedupe match has a different caused_by identity; "
+                        "refusing to rewrite causality"
+                    )
+                needfix_id = existing["id"]
+                if reopen_resolved and existing["status"] == "resolved":
+                    _reopen_recurred(conn, existing, evidence)
+                else:
+                    _record_event(conn, needfix_id, "dedupe_hit", {"dedupe_key": dedupe_key})
+            else:
+                needfix_id = _generate_nf_id(conn)
+                now = _utcnow_iso()
+                cur = conn.execute(
+                    """INSERT INTO needfix
+                    (id, dedupe_key, title, description, kind, severity,
+                     tags_json, scope, scope_files_json, scope_symbols_json,
+                     provenance_json, evidence_json, evidence_refs_json,
+                     readiness_score, status, duplicate_parent_id,
+                     converted_task_id, caused_by_json, created_at, updated_at,
+                     task_planned_at, resolved_at, archived_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, NULL, NULL, NULL)""",
+                    (
+                        needfix_id,
+                        dedupe_key,
+                        title,
+                        description,
+                        kind,
+                        severity,
+                        json.dumps(list(tags or [])),
+                        scope,
+                        json.dumps(list(scope_files or [])),
+                        json.dumps(list(scope_symbols or [])),
+                        json.dumps(dict(provenance or {})),
+                        json.dumps(dict(evidence or {})),
+                        json.dumps(list(evidence_refs or [])),
+                        readiness_score,
+                        status,
+                        json.dumps(verified_cause, sort_keys=True) if verified_cause else None,
+                        now,
+                        now,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise NeedFixConflictError(
+                        f"needfix insert was ignored: UNIQUE(dedupe_key, status) already "
+                        f"holds a {status!r} row for dedupe key {dedupe_key}"
+                    )
+                _record_event(conn, needfix_id, "created", {"status": status})
+            row = conn.execute("SELECT * FROM needfix WHERE id = ?", (needfix_id,)).fetchone()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         return _row_to_dict(row)
     finally:
         conn.close()
+
+
+def _reopen_recurred(
+    conn: sqlite3.Connection, row: sqlite3.Row, evidence: Mapping[str, Any] | None
+) -> None:
+    """Reopen the resolved row a recurring signal deduplicates onto, in place.
+
+    Runs inside the caller's write transaction. The same row -- never a second
+    one for the key -- returns to ``captured`` with ``resolved_at`` cleared and
+    the recurrence's evidence. Like :func:`reopen_superseded_task_link` it
+    clears the old task link (kept in the event; a finished card would
+    otherwise derive the live row CLOSED) and advances ``reopen_generation``:
+    ``recurred_after_resolve`` is a durable reopen, so the next conversion mints
+    ``needfix-{NF-ID}-rN`` rather than the task id that resolved it. A direct
+    writer like :func:`resolve_from_commit_trailer`, not a new
+    ``VALID_TRANSITIONS`` edge.
+    """
+    needfix_id = row["id"]
+    generation = _authoritative_reopen_generation(conn, needfix_id) + 1
+    cur = conn.execute(
+        "UPDATE needfix SET status = 'captured', resolved_at = NULL, converted_task_id = NULL, "
+        "task_planned_at = NULL, evidence_json = ?, reopen_generation = ?, updated_at = ? "
+        "WHERE id = ? AND status = 'resolved'",
+        (json.dumps(dict(evidence or {})), generation, _utcnow_iso(), needfix_id),
+    )
+    if cur.rowcount != 1:
+        raise NeedFixConflictError(
+            f"needfix {needfix_id} could not reopen: UNIQUE(dedupe_key, status) already "
+            "holds a captured row for its dedupe key"
+        )
+    _record_event(conn, needfix_id, REOPEN_EVENT_RECURRED, {
+        "dedupe_key": row["dedupe_key"],
+        "prior_status": "resolved",
+        "prior_resolved_at": row["resolved_at"],
+        "prior_converted_task_id": row["converted_task_id"],
+        "reopen_generation": generation,
+    })
 
 
 def capture_proposal(
@@ -1267,6 +1340,12 @@ def add_needfix(
     Unlike ``capture_proposal`` this may set an initial status beyond
     ``captured`` because it represents an already manager-mediated call,
     not raw unverified worker input. Provenance is stamped as manager_add.
+
+    A repeat of an open, rejected, duplicate or deferred NeedFix is a
+    ``dedupe_hit`` on that row. A repeat whose only non-archived match is
+    ``resolved`` is a recurrence: that same row is reopened to ``captured``
+    with this call's evidence and a ``recurred_after_resolve`` event, so a
+    signal that comes back after its fix is never silently swallowed.
     """
 
     if status not in STATUSES:
@@ -1294,6 +1373,7 @@ def add_needfix(
         caused_by=caused_by,
         repository_id=repository_id,
         verify_accepted_outcome=verify_accepted_outcome,
+        reopen_resolved=True,
     )
 
 
@@ -2141,6 +2221,129 @@ def resolve_from_commit_trailer(
             conn.rollback()
             raise
         return _row_to_dict(updated)
+    finally:
+        conn.close()
+
+
+SIGNAL_CLEARED_EVENT = "signal_cleared"
+# What a cleared detector signal may resolve: every card-derived status except
+# the in-flight ``converting`` claim, so a terminal row, a claim and a status
+# nobody thought about are all left exactly as they are.
+_SIGNAL_CLEARABLE_STATUSES: tuple[str, ...] = tuple(
+    sorted(NEEDFIX_CARD_DERIVED_STATUSES - {"converting"})
+)
+
+
+def _cleared_signal_rows(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    title_prefix: str,
+    description: str,
+    scope: str | None,
+) -> list[sqlite3.Row]:
+    """Clearable rows filed for one signal, lowest id first.
+
+    A row whose dedupe key already holds a ``resolved`` twin is never selected:
+    ``UNIQUE(dedupe_key, status) ON CONFLICT IGNORE`` would drop its resolve
+    without an error, so it stays open instead of being reported resolved.
+    """
+    marks = ", ".join("?" for _ in _SIGNAL_CLEARABLE_STATUSES)
+    clearable = (
+        f"n.status IN ({marks}) AND NOT EXISTS (SELECT 1 FROM needfix twin "
+        "WHERE twin.dedupe_key = n.dedupe_key AND twin.status = 'resolved')"
+    )
+    if title:
+        return conn.execute(
+            "SELECT n.id, n.status, n.dedupe_key FROM needfix n "
+            f"WHERE n.dedupe_key = ? AND {clearable} ORDER BY n.id",
+            (_dedupe_key(title, description, scope), *_SIGNAL_CLEARABLE_STATUSES),
+        ).fetchall()
+    rows = conn.execute(
+        "SELECT n.id, n.status, n.dedupe_key, n.title FROM needfix n "
+        "WHERE n.description = ? AND COALESCE(n.scope, '') = ? "
+        f"AND {clearable} ORDER BY n.id",
+        (description, scope or "", *_SIGNAL_CLEARABLE_STATUSES),
+    ).fetchall()
+    return [row for row in rows if str(row["title"]).startswith(title_prefix)]
+
+
+def resolve_cleared_signal(
+    repo_root: str | Path,
+    *,
+    description: str,
+    title: str = "",
+    title_prefix: str = "",
+    scope: str | None = None,
+    evidence: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Resolve the open NeedFix a detector filed for a signal that has cleared.
+
+    The inverse of the detector's ``add_needfix``. ``title`` matches the exact
+    ``_dedupe_key(title, description, scope)`` the signal is filed under;
+    ``title_prefix`` matches a family filed as one title per exception class,
+    by exact title prefix plus the same fixed ``description`` and ``scope``.
+    Each matching row in a clearable status goes straight to ``resolved`` with
+    ``resolved_at`` set and one ``signal_cleared`` event carrying
+    ``prior_status`` and ``evidence``, all in one ``BEGIN IMMEDIATE``
+    transaction. A second, independently-gated direct writer shaped like
+    :func:`resolve_from_commit_trailer`, not a new edge in the guarded state
+    machine (``VALID_TRANSITIONS`` is unchanged).
+
+    Idempotent: no match -- including no store at all -- writes nothing and
+    takes no write lock. Of two open rows sharing one dedupe key only the first
+    can resolve and the other stays open; a resolve that still does not land
+    raises rather than being reported. Returns the resolved ids in id order.
+    """
+    if bool(title) == bool(title_prefix):
+        raise NeedFixValidationError("exactly one of title or title_prefix is required")
+    if not description:
+        raise NeedFixValidationError("description is required")
+    detail = dict(evidence or {})
+    if len(json.dumps(detail).encode("utf-8")) > MAX_EVIDENCE_BYTES:
+        raise NeedFixValidationError("evidence payload exceeds bounded size")
+    if not _db_path(repo_root).is_file():
+        return []
+    signal = {
+        "title": title, "title_prefix": title_prefix,
+        "description": description, "scope": scope,
+    }
+    conn = _connect(repo_root)
+    try:
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'needfix'"
+        ).fetchone()
+        # Read before locking: a healthy signal, the common case, matches nothing.
+        if has_table is None or not _cleared_signal_rows(conn, **signal):
+            return []
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            resolved: list[str] = []
+            resolved_keys: set[str] = set()
+            now = _utcnow_iso()
+            for row in _cleared_signal_rows(conn, **signal):
+                if row["dedupe_key"] in resolved_keys:
+                    continue
+                cur = conn.execute(
+                    "UPDATE needfix SET status = 'resolved', updated_at = ?, resolved_at = ? "
+                    "WHERE id = ? AND status = ?",
+                    (now, now, row["id"], row["status"]),
+                )
+                if cur.rowcount != 1:
+                    raise NeedFixConflictError(
+                        f"needfix {row['id']} resolve from {row['status']!r} did not land; "
+                        "refusing to report it resolved"
+                    )
+                _record_event(conn, row["id"], SIGNAL_CLEARED_EVENT, {
+                    "prior_status": row["status"], "evidence": detail,
+                })
+                resolved_keys.add(row["dedupe_key"])
+                resolved.append(row["id"])
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return resolved
     finally:
         conn.close()
 

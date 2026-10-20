@@ -2584,6 +2584,15 @@ def _janitor_records(root: Path) -> dict[str, Any]:
     return task_retention.run_records_janitor(root)
 
 
+# One NeedFix identity per janitor signal, shared by the side that files it and
+# the side that resolves it once the signal clears. With an empty ``signal``
+# the title is the prefix every title of that step shares.
+_JANITOR_TITLE = "janitor:{step}:{signal}"
+_JANITOR_STEP_FAILED = "Automatic cleanup step '{step}' failed."
+_JANITOR_DELETE_FAILED = "Automatic cleanup step '{step}' could not delete some items."
+_JANITOR_WORKTREES_KEPT = "Automatic cleanup kept worktrees it could not release ({kind})."
+
+
 def _file_janitor_needfix(
     root: Path,
     result: dict[str, Any],
@@ -2609,10 +2618,63 @@ def _file_janitor_needfix(
         result["needfix"].append(needfix_id)
 
 
+def _clear_janitor_needfix(
+    root: Path,
+    result: dict[str, Any],
+    *,
+    description: str,
+    evidence: Mapping[str, Any],
+    title: str = "",
+    title_prefix: str = "",
+) -> None:
+    """Resolve what a cleared janitor signal filed; a failure is recorded, never raised."""
+    from . import needfix_store  # local import: cycle-safe
+
+    try:
+        cleared = needfix_store.resolve_cleared_signal(
+            root,
+            title=title,
+            title_prefix=title_prefix,
+            description=description,
+            evidence=dict(evidence),
+        )
+    except Exception as exc:
+        result.setdefault("needfix_errors", []).append(
+            f"{title or title_prefix + '*'}: {type(exc).__name__}: {exc}"[:300]
+        )
+        return
+    for needfix_id in cleared:
+        resolved = result.setdefault("needfix_resolved", [])
+        if needfix_id not in resolved:
+            resolved.append(needfix_id)
+
+
+def _clear_janitor_step_needfix(root: Path, name: str, result: dict[str, Any]) -> None:
+    """A step that ended ok resolves what its raised or partial runs filed."""
+    evidence = {"step": name}
+    _clear_janitor_needfix(
+        root,
+        result,
+        title_prefix=_JANITOR_TITLE.format(step=name, signal=""),
+        description=_JANITOR_STEP_FAILED.format(step=name),
+        evidence=evidence,
+    )
+    _clear_janitor_needfix(
+        root,
+        result,
+        title=_JANITOR_TITLE.format(step=name, signal="delete_failed"),
+        description=_JANITOR_DELETE_FAILED.format(step=name),
+        evidence=evidence,
+    )
+
+
 def _janitor_step(
     root: Path, name: str, fn: Callable[[], Any], result: dict[str, Any]
-) -> None:
-    """Run one step; a failure is recorded and filed, never propagated."""
+) -> bool:
+    """Run one step; a failure is recorded and filed, never propagated.
+
+    Returns whether the step completed without raising.
+    """
     try:
         result[name] = fn()
     except Exception as exc:
@@ -2621,18 +2683,33 @@ def _janitor_step(
         _file_janitor_needfix(
             root,
             result,
-            title=f"janitor:{name}:{error_class}",
-            description=f"Automatic cleanup step '{name}' failed.",
+            title=_JANITOR_TITLE.format(step=name, signal=error_class),
+            description=_JANITOR_STEP_FAILED.format(step=name),
             evidence=result[name],
         )
+        return False
+    return True
 
 
-def _file_worktree_failure_needfix(root: Path, result: dict[str, Any]) -> None:
-    """A worktree the GC could not release is kept, so it must be visible."""
+def _file_worktree_failure_needfix(
+    root: Path, result: dict[str, Any], *, completed: bool
+) -> None:
+    """A worktree the GC could not release is kept, so it must be visible.
+
+    A sweep that completed also resolves the NeedFix of each kind it no longer
+    reports (the GC omits ``failures`` when there are none). A sweep that raised
+    proves nothing, and neither does a report at the GC's cap, which may have
+    cut off a kind that is still failing.
+    """
     worktrees = result.get("worktrees")
-    failures = worktrees.get("failures") if isinstance(worktrees, dict) else None
+    failures = (
+        worktrees.get("failures", []) if completed and isinstance(worktrees, dict) else None
+    )
     if not isinstance(failures, list):
         return
+    from . import process_launcher  # local import: cycle-safe
+
+    capped = len(failures) >= process_launcher._GC_FAILURE_REPORT_LIMIT
     known = ("rework_seal_failed:", "cleanup_failed:")
     unclassified = [
         dict(item) if isinstance(item, Mapping) else {"value": str(item)[:200]}
@@ -2647,13 +2724,23 @@ def _file_worktree_failure_needfix(root: Path, result: dict[str, Any]) -> None:
             for item in failures
             if isinstance(item, Mapping) and str(item.get("reason") or "").startswith(f"{kind}:")
         ]
+        title = _JANITOR_TITLE.format(step="worktrees", signal=kind)
+        description = _JANITOR_WORKTREES_KEPT.format(kind=kind)
         if matching:
             _file_janitor_needfix(
                 root,
                 result,
-                title=f"janitor:worktrees:{kind}",
-                description=f"Automatic cleanup kept worktrees it could not release ({kind}).",
+                title=title,
+                description=description,
                 evidence={"failures": matching[:50]},
+            )
+        elif not capped:
+            _clear_janitor_needfix(
+                root,
+                result,
+                title=title,
+                description=description,
+                evidence={"kind": kind, "failures_reported": len(failures)},
             )
 
 
@@ -2893,9 +2980,12 @@ def _run_repository_cleanup(
 
     The seven steps run in order and each is isolated: a step that raises is
     recorded as ``{"ok": False, "error"}`` and filed as one NeedFix titled
-    ``janitor:<step>:<ExcClass>``, and the remaining steps still run. Deletion is
-    direct; the janitor quarantines nothing. While it runs, ``_JANITOR_ACTIVE``
-    stops retention hints raised inside a step from scheduling another sweep.
+    ``janitor:<step>:<ExcClass>``, and the remaining steps still run. A step
+    that ends ok resolves the ``janitor:<step>:*`` NeedFix its earlier failures
+    filed; like ``needfix_errors``, ``needfix_resolved`` appears only once it
+    has an id. Deletion is direct; the janitor quarantines nothing. While it
+    runs, ``_JANITOR_ACTIVE`` stops retention hints raised inside a step from
+    scheduling another sweep.
     """
     root = Path(repo_root).resolve()
     worktree_base = (base or configured_worktree_root(root)).resolve()
@@ -2913,19 +3003,21 @@ def _run_repository_cleanup(
     _JANITOR_ACTIVE.active = True
     try:
         for name, step in steps:
-            _janitor_step(root, name, step, result)
+            completed = _janitor_step(root, name, step, result)
             outcome = result.get(name)
             partial = isinstance(outcome, dict) and outcome.get("ok") is False
             if name == "worktrees":
-                _file_worktree_failure_needfix(root, result)
+                _file_worktree_failure_needfix(root, result, completed=completed)
             elif partial and "error" not in outcome:  # a raised step already filed
                 _file_janitor_needfix(
                     root,
                     result,
-                    title=f"janitor:{name}:delete_failed",
-                    description=f"Automatic cleanup step '{name}' could not delete some items.",
+                    title=_JANITOR_TITLE.format(step=name, signal="delete_failed"),
+                    description=_JANITOR_DELETE_FAILED.format(step=name),
                     evidence={"errors": list(outcome.get("errors") or [])[:5]},
                 )
+            if completed and isinstance(outcome, dict) and not partial:
+                _clear_janitor_step_needfix(root, name, result)
     finally:
         _JANITOR_ACTIVE.active = was_active
     result["ok"] = not any(

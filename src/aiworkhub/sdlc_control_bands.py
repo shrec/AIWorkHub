@@ -325,19 +325,28 @@ def evaluate(repo_root: str | Path, repository_id: str) -> BandReport:
     )
 
 
+def _band_needfix_identity(band: MetricBand) -> tuple[str, str, str]:
+    """The (title, description, scope) a band's NeedFix is filed and cleared under."""
+
+    return (
+        f"SDLC control band breach: {band.metric_id}",
+        f"Deterministic SDLC control-band detector: {band.metric_id} "
+        f"({band.direction}) breached its rolling baseline control band.",
+        f"sdlc_band:{band.metric_id}:{band.direction}",
+    )
+
+
 def file_breaches(repo_root: str | Path, repository_id: str, report: BandReport) -> list[str]:
-    """File or refresh a NeedFix per breaching metric; idempotent via the store's dedupe key."""
+    """File or refresh a NeedFix per breaching metric; idempotent via the store's dedupe key.
+
+    A band back in control (status ``ok``, tier not ``needfix``) resolves the
+    NeedFix it would file; an ``insufficient_population`` band proves nothing
+    and leaves it open. Only the filed ids are returned.
+    """
 
     filed: list[str] = []
     for band in report.metrics:
-        if band.tier != "needfix":
-            continue
-        scope = f"sdlc_band:{band.metric_id}:{band.direction}"
-        title = f"SDLC control band breach: {band.metric_id}"
-        description = (
-            f"Deterministic SDLC control-band detector: {band.metric_id} "
-            f"({band.direction}) breached its rolling baseline control band."
-        )
+        title, description, scope = _band_needfix_identity(band)
         evidence = {
             "metric_id": band.metric_id,
             "direction": band.direction,
@@ -350,6 +359,13 @@ def file_breaches(repo_root: str | Path, repository_id: str, report: BandReport)
             "window_task_ids": list(band.window_task_ids),
             "config_sha256": report.config_sha256,
         }
+        if band.tier != "needfix":
+            if band.status == "ok":
+                needfix_store.resolve_cleared_signal(
+                    repo_root, title=title, description=description, scope=scope,
+                    evidence=evidence,
+                )
+            continue
         row = needfix_store.add_needfix(
             repo_root,
             title=title,

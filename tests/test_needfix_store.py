@@ -898,3 +898,217 @@ def test_normalize_task_plan_leaves_other_kinds_without_family(init: Path):
 def test_task_plan_schema_does_not_accept_a_caller_skill_family():
     with pytest.raises(needfix_store.NeedFixValidationError, match="unsupported fields"):
         needfix_store.validate_task_plan({"skill_task_family": "feature"})
+
+
+# --- detector signals: a cleared signal resolves, a recurrence reopens -------
+
+
+def _events(init: Path, needfix_id: str) -> list[str]:
+    """Event names for one NeedFix, newest first."""
+    return [event["event"] for event in needfix_store.list_events(init, needfix_id, limit=50)]
+
+
+def _set_status(init: Path, needfix_id: str, status: str) -> None:
+    conn = needfix_store._connect(init)
+    try:
+        conn.execute("UPDATE needfix SET status = ? WHERE id = ?", (status, needfix_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_cleared_signal_resolves_its_exact_key_once_then_writes_nothing(init: Path):
+    filed = needfix_store.add_needfix(init, title="sig", description="d", scope="s")
+    other_scope = needfix_store.add_needfix(init, title="sig", description="d", scope="t")
+
+    cleared = needfix_store.resolve_cleared_signal(
+        init, title="sig", description="d", scope="s", evidence={"z": 0.5}
+    )
+
+    assert cleared == [filed["id"]]
+    row = needfix_store.get_needfix(init, filed["id"])
+    assert row["status"] == "resolved"
+    assert row["resolved_at"]
+    event = needfix_store.list_events(init, filed["id"], limit=1)[0]
+    assert event["event"] == needfix_store.SIGNAL_CLEARED_EVENT == "signal_cleared"
+    assert event["detail"] == {"prior_status": "captured", "evidence": {"z": 0.5}}
+    assert needfix_store.get_needfix(init, other_scope["id"])["status"] == "captured"
+
+    events_before = _events(init, filed["id"])
+    again = needfix_store.resolve_cleared_signal(
+        init, title="sig", description="d", scope="s", evidence={"z": 0.5}
+    )
+    assert again == []
+    assert _events(init, filed["id"]) == events_before
+
+
+def test_cleared_signal_without_a_store_creates_nothing(repo_root: Path):
+    assert needfix_store.resolve_cleared_signal(repo_root, title="sig", description="d") == []
+    assert not needfix_store._db_path(repo_root).exists()
+
+
+def test_cleared_signal_by_prefix_needs_the_fixed_description_and_an_open_row(init: Path):
+    family = "Automatic check 'x' failed."
+    open_row = needfix_store.add_needfix(init, title="det:x:OSError", description=family)
+    deferred = needfix_store.add_needfix(init, title="det:x:ValueError", description=family)
+    rejected = needfix_store.add_needfix(init, title="det:x:KeyError", description=family)
+    claimed = needfix_store.add_needfix(init, title="det:x:TypeError", description=family)
+    other_text = needfix_store.add_needfix(init, title="det:x:delete_failed", description="other")
+    other_step = needfix_store.add_needfix(init, title="det:xy:OSError", description=family)
+    needfix_store.triage_needfix(init, deferred["id"])
+    needfix_store.defer_needfix(init, deferred["id"])
+    needfix_store.reject_needfix(init, rejected["id"], reason="noise")
+    _set_status(init, claimed["id"], "converting")
+
+    cleared = needfix_store.resolve_cleared_signal(
+        init, title_prefix="det:x:", description=family, evidence={"step": "x"}
+    )
+
+    assert cleared == sorted([open_row["id"], deferred["id"]])
+    assert {
+        row_id: needfix_store.get_needfix(init, row_id)["status"]
+        for row_id in (
+            open_row["id"], deferred["id"], rejected["id"], claimed["id"],
+            other_text["id"], other_step["id"],
+        )
+    } == {
+        open_row["id"]: "resolved",
+        deferred["id"]: "resolved",
+        rejected["id"]: "rejected",
+        claimed["id"]: "converting",
+        other_text["id"]: "captured",
+        other_step["id"]: "captured",
+    }
+    assert needfix_store.list_events(init, deferred["id"], limit=1)[0]["detail"] == {
+        "prior_status": "deferred", "evidence": {"step": "x"},
+    }
+
+
+def test_cleared_signal_refuses_an_ambiguous_match():
+    for kwargs in ({}, {"title": "sig", "title_prefix": "sig"}):
+        with pytest.raises(needfix_store.NeedFixValidationError, match="exactly one"):
+            needfix_store.resolve_cleared_signal(Path("unused"), description="d", **kwargs)
+
+
+def _live_row_with_a_resolved_twin(init: Path) -> tuple[str, str]:
+    """A restored row whose dedupe key already holds a resolved row: the legacy shape
+    UNIQUE(dedupe_key, status) allows, one row per status."""
+    live = needfix_store.add_needfix(init, title="sig", description="d")
+    needfix_store.archive_needfix(init, live["id"], reason="test")
+    twin = needfix_store.add_needfix(init, title="sig", description="d")
+    assert twin["id"] != live["id"]
+    assert needfix_store.resolve_cleared_signal(init, title="sig", description="d") == [twin["id"]]
+    needfix_store.restore_needfix(init, live["id"])
+    return live["id"], twin["id"]
+
+
+def test_cleared_signal_leaves_open_a_row_whose_key_holds_a_resolved_twin(init: Path):
+    live_id, twin_id = _live_row_with_a_resolved_twin(init)
+    events_before = _events(init, live_id)
+
+    # UNIQUE(dedupe_key, status) ON CONFLICT IGNORE would silently drop this
+    # resolve, so the row must stay open and must not be reported resolved.
+    assert needfix_store.resolve_cleared_signal(init, title="sig", description="d") == []
+
+    assert needfix_store.get_needfix(init, live_id)["status"] == "captured"
+    assert _events(init, live_id) == events_before
+    assert needfix_store.get_needfix(init, twin_id)["status"] == "resolved"
+
+
+def test_a_live_match_wins_over_a_resolved_twin(init: Path):
+    live_id, twin_id = _live_row_with_a_resolved_twin(init)
+
+    again = needfix_store.add_needfix(init, title="sig", description="d")
+
+    assert again["id"] == live_id
+    assert again["status"] == "captured"
+    assert _events(init, live_id)[0] == "dedupe_hit"
+    assert needfix_store.get_needfix(init, twin_id)["status"] == "resolved"
+
+
+def test_a_signal_filed_again_after_resolve_reopens_the_same_row(init: Path):
+    first = needfix_store.add_needfix(init, title="sig", description="d", evidence={"run": 1})
+    needfix_store.resolve_cleared_signal(init, title="sig", description="d")
+
+    again = needfix_store.add_needfix(init, title="sig", description="d", evidence={"run": 2})
+
+    assert again["id"] == first["id"]
+    assert again["status"] == "captured"
+    assert again["resolved_at"] is None
+    assert again["evidence"] == {"run": 2}
+    assert needfix_store.count_needfix(init, include_archived=True) == 1
+    event = needfix_store.list_events(init, first["id"], limit=1)[0]
+    assert event["event"] == "recurred_after_resolve"
+    assert event["detail"]["prior_status"] == "resolved"
+    assert event["detail"]["reopen_generation"] == 1
+
+
+@pytest.mark.parametrize("status", ["rejected", "duplicate", "deferred"])
+def test_a_rejected_duplicate_or_deferred_match_still_dedupes_unchanged(
+    init: Path, status: str
+):
+    row = needfix_store.add_needfix(init, title="sig", description="d", evidence={"run": 1})
+    if status == "rejected":
+        needfix_store.reject_needfix(init, row["id"], reason="noise")
+    elif status == "duplicate":
+        parent = needfix_store.add_needfix(init, title="parent", description="d")
+        needfix_store.mark_duplicate(init, row["id"], parent["id"])
+    else:
+        needfix_store.triage_needfix(init, row["id"])
+        needfix_store.defer_needfix(init, row["id"])
+
+    again = needfix_store.add_needfix(init, title="sig", description="d", evidence={"run": 2})
+
+    assert again["id"] == row["id"]
+    assert again["status"] == status
+    assert again["evidence"] == {"run": 1}
+    assert _events(init, row["id"])[0] == "dedupe_hit"
+
+
+def test_a_worker_proposal_never_reopens_a_resolved_row(init: Path):
+    row = needfix_store.add_needfix(init, title="sig", description="d")
+    needfix_store.resolve_cleared_signal(init, title="sig", description="d")
+
+    proposal = needfix_store.capture_proposal(init, title="sig", description="d")
+
+    assert proposal["id"] == row["id"]
+    assert proposal["status"] == "resolved"
+    assert _events(init, row["id"])[0] == "dedupe_hit"
+
+
+def test_a_reopened_row_converts_again_without_colliding_with_its_previous_task(init: Path):
+    created: list[str] = []
+
+    def create_task(card: dict[str, Any]) -> dict[str, Any]:
+        assert card["task_id"] not in created, f"task id {card['task_id']!r} reused"
+        created.append(card["task_id"])
+        return {"ok": True, "task_id": card["task_id"]}
+
+    rec = needfix_store.add_needfix(init, title="sig", description="d", status="accepted")
+    first = needfix_store.convert_needfix(init, rec["id"], create_task)
+    needfix_store.resolve_needfix(init, rec["id"])
+    assert needfix_store.get_needfix(init, rec["id"])["converted_task_id"] == first[
+        "converted_task_id"
+    ]
+
+    reopened = needfix_store.add_needfix(init, title="sig", description="d")
+    assert reopened["id"] == rec["id"]
+    assert reopened["status"] == "captured"
+    assert reopened["converted_task_id"] is None
+    needfix_store.triage_needfix(init, rec["id"])
+    needfix_store.accept_needfix(init, rec["id"])
+    second = needfix_store.convert_needfix(init, rec["id"], create_task)
+
+    assert first["converted_task_id"] == f"needfix-{rec['id']}"
+    assert second["converted_task_id"] == f"needfix-{rec['id']}-r1"
+    assert created == [first["converted_task_id"], second["converted_task_id"]]
+    row = needfix_store.get_needfix(init, rec["id"])
+    assert row["status"] == "task_created"
+    assert row["reopen_generation"] == 1
+    recurred = [
+        event for event in needfix_store.list_events(init, rec["id"], limit=50)
+        if event["event"] == "recurred_after_resolve"
+    ]
+    assert [event["detail"]["prior_converted_task_id"] for event in recurred] == [
+        first["converted_task_id"]
+    ]

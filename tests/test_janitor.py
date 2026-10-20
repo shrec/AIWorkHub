@@ -647,3 +647,142 @@ def test_a_thread_that_fails_to_start_releases_the_running_marker(
 
     assert refused == ["aiworkhub-storage-retention"]
     assert swept == [tmp_path.resolve()]
+
+
+def _raising(message: str):
+    def step(*_args) -> dict:
+        raise OSError(message)
+
+    return step
+
+
+def _janitor_status(repo: Path) -> dict[str, str]:
+    return {row["title"]: row["status"] for row in _janitor_needfix(repo)}
+
+
+# (i) a step that runs ok again resolves what it filed; one still failing stays open
+def test_a_step_that_runs_ok_again_resolves_its_needfix_and_a_failing_one_stays_open(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _stub_steps(
+        monkeypatch, [], _janitor_logs=_raising("disk"), _janitor_records=_raising("disk")
+    )
+    first = storage_retention._run_repository_cleanup(tmp_path, base=tmp_path, now=_NOW)
+    filed = {row["title"]: row["id"] for row in _janitor_needfix(tmp_path)}
+    assert set(filed) == {"janitor:logs:OSError", "janitor:records:OSError"}
+    logs_id, records_id = filed["janitor:logs:OSError"], filed["janitor:records:OSError"]
+    assert "needfix_resolved" not in first
+
+    _stub_steps(monkeypatch, [], _janitor_records=_raising("disk"))
+    second = storage_retention._run_repository_cleanup(tmp_path, base=tmp_path, now=_NOW)
+
+    assert second["needfix_resolved"] == [logs_id]
+    assert second["needfix"] == [records_id]
+    assert _janitor_status(tmp_path) == {
+        "janitor:logs:OSError": "resolved", "janitor:records:OSError": "captured",
+    }
+    event = needfix_store.list_events(tmp_path, logs_id, limit=1)[0]
+    assert event["event"] == "signal_cleared"
+    assert event["detail"] == {"prior_status": "captured", "evidence": {"step": "logs"}}
+
+    # The failure coming back reopens that same NeedFix instead of being swallowed.
+    _stub_steps(monkeypatch, [], _janitor_logs=_raising("disk again"))
+    third = storage_retention._run_repository_cleanup(tmp_path, base=tmp_path, now=_NOW)
+
+    assert third["needfix"] == [logs_id]
+    assert third["needfix_resolved"] == [records_id]
+    assert _janitor_status(tmp_path) == {
+        "janitor:logs:OSError": "captured", "janitor:records:OSError": "resolved",
+    }
+
+
+def test_a_step_that_deletes_everything_again_resolves_its_delete_failed_needfix(
+    monkeypatch, tmp_path: Path
+) -> None:
+    outcomes = iter([
+        {"ok": False, "removed": 0, "bytes": 0, "errors": ["PermissionError: denied"]},
+        {"ok": True, "removed": 1, "bytes": 0, "errors": []},
+    ])
+    _stub_steps(monkeypatch, [], _janitor_scratch=lambda root, now: next(outcomes))
+
+    first = storage_retention._run_repository_cleanup(tmp_path, base=tmp_path, now=_NOW)
+    second = storage_retention._run_repository_cleanup(tmp_path, base=tmp_path, now=_NOW)
+
+    rows = _janitor_needfix(tmp_path)
+    assert [row["title"] for row in rows] == ["janitor:scratch:delete_failed"]
+    assert first["needfix"] == [rows[0]["id"]]
+    assert second["needfix_resolved"] == [rows[0]["id"]]
+    assert rows[0]["status"] == "resolved"
+
+
+def test_a_worktree_failure_kind_absent_from_a_later_sweep_resolves(
+    monkeypatch, tmp_path: Path
+) -> None:
+    seal = {"request_id": "req-1", "task_id": "T1", "reason": "rework_seal_failed:mismatch"}
+    cleanup = {"request_id": "req-2", "task_id": "T2", "reason": "cleanup_failed:busy"}
+    sweeps = iter([[seal, cleanup], [seal]])
+    _stub_steps(
+        monkeypatch,
+        [],
+        _janitor_worktrees=lambda root: {"gc_scanned": 2, "failures": next(sweeps)},
+    )
+
+    storage_retention._run_repository_cleanup(tmp_path, base=tmp_path, now=_NOW)
+    filed = {row["title"]: row["id"] for row in _janitor_needfix(tmp_path)}
+    second = storage_retention._run_repository_cleanup(tmp_path, base=tmp_path, now=_NOW)
+
+    cleanup_id = filed["janitor:worktrees:cleanup_failed"]
+    assert second["needfix_resolved"] == [cleanup_id]
+    assert _janitor_status(tmp_path) == {
+        "janitor:worktrees:rework_seal_failed": "captured",
+        "janitor:worktrees:cleanup_failed": "resolved",
+    }
+    event = needfix_store.list_events(tmp_path, cleanup_id, limit=1)[0]
+    assert event["detail"]["evidence"] == {"kind": "cleanup_failed", "failures_reported": 1}
+
+    # A sweep that raised proves nothing: the kind still failing stays open.
+    _stub_steps(monkeypatch, [], _janitor_worktrees=_raising("gc down"))
+    third = storage_retention._run_repository_cleanup(tmp_path, base=tmp_path, now=_NOW)
+
+    assert "needfix_resolved" not in third
+    assert _janitor_status(tmp_path)["janitor:worktrees:rework_seal_failed"] == "captured"
+
+
+def test_a_worktree_failure_report_at_the_gc_cap_resolves_nothing(
+    monkeypatch, tmp_path: Path
+) -> None:
+    cleanup = {"request_id": "req-0", "task_id": "T0", "reason": "cleanup_failed:busy"}
+    capped = [
+        {"request_id": f"req-{index}", "task_id": f"T{index}", "reason": "rework_seal_failed:x"}
+        for index in range(1, process_launcher._GC_FAILURE_REPORT_LIMIT + 1)
+    ]
+    sweeps = iter([[cleanup], capped])
+    _stub_steps(monkeypatch, [], _janitor_worktrees=lambda root: {"failures": next(sweeps)})
+
+    storage_retention._run_repository_cleanup(tmp_path, base=tmp_path, now=_NOW)
+    second = storage_retention._run_repository_cleanup(tmp_path, base=tmp_path, now=_NOW)
+
+    # The capped report may have cut cleanup_failed off, so it is not evidence.
+    assert "needfix_resolved" not in second
+    assert _janitor_status(tmp_path) == {
+        "janitor:worktrees:cleanup_failed": "captured",
+        "janitor:worktrees:rework_seal_failed": "captured",
+    }
+
+
+def test_a_failure_to_resolve_is_recorded_and_never_raised(monkeypatch, tmp_path: Path) -> None:
+    def locked(*_args, **_kwargs) -> list[str]:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(needfix_store, "resolve_cleared_signal", locked)
+    _stub_steps(monkeypatch, [])
+
+    result = storage_retention._run_repository_cleanup(tmp_path, base=tmp_path, now=_NOW)
+
+    assert result["ok"] is True
+    assert "needfix_resolved" not in result
+    assert "janitor:logs:*: RuntimeError: database is locked" in result["needfix_errors"]
+    assert all(
+        error.endswith(": RuntimeError: database is locked")
+        for error in result["needfix_errors"]
+    )
