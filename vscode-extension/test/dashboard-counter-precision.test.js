@@ -141,7 +141,7 @@ test("formatCount resolves the browser locale when no locale is passed", () => {
 });
 
 function makeFakeElement() {
-  return { textContent: "", title: "" };
+  return { textContent: "", title: "", removeAttribute(name) { if (name === "title") this.title = ""; } };
 }
 
 function renderSummaryWith(statusCounts, totals) {

@@ -12,6 +12,7 @@ canonical validation instead.
 
 from __future__ import annotations
 
+import json
 import os
 import pytest
 import stat
@@ -392,3 +393,149 @@ def test_short_path_removal_failure_retries_with_extended_length_prefix(
 
     assert len(calls) == 2
     assert str(calls[1]).startswith("\\\\?\\")
+
+
+_COMPAT = "opencode-compat-2016-v1"
+_REGISTERED_RELATIVE = f".aiworkhub/runtime/{_COMPAT}/artifact-win-x64-v4/opencode.exe"
+_BACKUP_RELATIVE = f"{_COMPAT}/artifact-win-x64-v3/opencode.exe"
+
+
+def _registration_document(*relatives: str) -> str:
+    return json.dumps(
+        {
+            "schema": "aiworkhub.executable_registration.v1",
+            "registrations": {
+                f"adapter_{index}": {"executable_relative": relative}
+                for index, relative in enumerate(relatives)
+            },
+        }
+    )
+
+
+def _compat_workspace(repo: Path, *, registered: bool = True) -> dict[str, Path]:
+    runtime = repo / ".aiworkhub" / "runtime"
+    compat = runtime / _COMPAT
+    paths = {
+        "compat": compat,
+        "bun_cache": compat / "tools" / "bun-cache",
+        "node_modules": compat / "source" / "node_modules",
+        "manifest": compat / "compat-build-manifest.json",
+        "source_file": compat / "source" / "package.json",
+        "registered": compat / "artifact-win-x64-v4",
+        "backup": compat / "artifact-win-x64-v3",
+        "unregistered": compat / "artifact-win-x64-v1",
+    }
+    for key in ("bun_cache", "node_modules", "registered", "backup", "unregistered"):
+        paths[key].mkdir(parents=True)
+        (paths[key] / "opencode.exe").write_text("x")
+    paths["manifest"].write_text("{}")
+    paths["source_file"].write_text("{}")
+    if registered:
+        (runtime / "executable_registration.json").write_text(
+            _registration_document(_REGISTERED_RELATIVE)
+        )
+        (runtime / "executable_registration.20261019.backup.json").write_text(
+            _registration_document(_BACKUP_RELATIVE)
+        )
+    return paths
+
+
+def _age_all(monkeypatch, fresh: tuple[Path, ...] = ()) -> None:
+    monkeypatch.setattr(
+        storage_retention,
+        "_janitor_mtime",
+        lambda path: _NOW - (47 * _HOUR if path in fresh else 49 * _HOUR),
+    )
+
+
+def test_compat_aged_caches_and_unregistered_artifact_removed_registered_kept(
+    monkeypatch, tmp_path: Path
+) -> None:
+    paths = _compat_workspace(tmp_path.resolve())
+    _age_all(monkeypatch)
+
+    result = storage_retention._janitor_scratch(tmp_path.resolve(), _NOW)
+
+    assert result == {"ok": True, "removed": 3, "bytes": 0, "errors": []}
+    assert not paths["bun_cache"].exists()
+    assert not paths["node_modules"].exists()
+    assert not paths["unregistered"].exists()
+    assert paths["registered"].joinpath("opencode.exe").exists()
+    assert paths["backup"].joinpath("opencode.exe").exists()
+    assert paths["compat"].is_dir()
+    assert paths["manifest"].exists()
+    assert paths["source_file"].exists()
+    assert paths["source_file"].parent.is_dir()
+
+
+def test_compat_fresh_caches_and_artifact_are_kept(monkeypatch, tmp_path: Path) -> None:
+    paths = _compat_workspace(tmp_path.resolve())
+    _age_all(
+        monkeypatch,
+        fresh=(paths["bun_cache"], paths["node_modules"], paths["unregistered"]),
+    )
+
+    result = storage_retention._janitor_scratch(tmp_path.resolve(), _NOW)
+
+    assert result == {"ok": True, "removed": 0, "bytes": 0, "errors": []}
+    for key in ("bun_cache", "node_modules", "unregistered", "registered", "backup"):
+        assert paths[key].exists()
+
+
+def test_compat_missing_registration_keeps_every_artifact(
+    monkeypatch, tmp_path: Path
+) -> None:
+    paths = _compat_workspace(tmp_path.resolve(), registered=False)
+    _age_all(monkeypatch)
+
+    result = storage_retention._janitor_scratch(tmp_path.resolve(), _NOW)
+
+    assert result == {"ok": True, "removed": 2, "bytes": 0, "errors": []}
+    assert not paths["bun_cache"].exists()
+    assert not paths["node_modules"].exists()
+    for key in ("registered", "backup", "unregistered"):
+        assert paths[key].exists()
+    assert paths["manifest"].exists()
+    assert paths["source_file"].exists()
+
+
+@pytest.mark.parametrize(
+    "registration_text",
+    [
+        "{not json",
+        json.dumps({"schema": "aiworkhub.executable_registration.v1", "registrations": {}}),
+        json.dumps({"schema": "aiworkhub.executable_registration.v1", "registrations": []}),
+        json.dumps({"registrations": {"a": {"executable_relative": 7}}}),
+    ],
+)
+def test_compat_unreadable_or_empty_registration_keeps_every_artifact(
+    monkeypatch, tmp_path: Path, registration_text: str
+) -> None:
+    paths = _compat_workspace(tmp_path.resolve())
+    (tmp_path / ".aiworkhub" / "runtime" / "executable_registration.json").write_text(
+        registration_text
+    )
+    _age_all(monkeypatch)
+
+    result = storage_retention._janitor_scratch(tmp_path.resolve(), _NOW)
+
+    assert result["ok"] is True
+    assert result["removed"] == 2
+    for key in ("registered", "backup", "unregistered"):
+        assert paths[key].exists()
+
+
+def test_compat_unreadable_backup_registration_keeps_every_artifact(
+    monkeypatch, tmp_path: Path
+) -> None:
+    paths = _compat_workspace(tmp_path.resolve())
+    (
+        tmp_path / ".aiworkhub" / "runtime" / "executable_registration.20261019.backup.json"
+    ).write_text("{not json")
+    _age_all(monkeypatch)
+
+    result = storage_retention._janitor_scratch(tmp_path.resolve(), _NOW)
+
+    assert result["removed"] == 2
+    for key in ("registered", "backup", "unregistered"):
+        assert paths[key].exists()

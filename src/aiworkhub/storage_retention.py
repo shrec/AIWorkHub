@@ -2677,6 +2677,111 @@ _SCRATCH_RUNTIME_NAME_PATTERNS = (
     "hostval",
 )
 _SCRATCH_MAX_AGE_SECONDS = 48 * 60 * 60
+# Re-creatable build output inside an opencode-compat-* workspace
+# (``bun install --frozen-lockfile``; NF-2026-01614) and its build artifacts.
+_COMPAT_RUNTIME_NAME_PATTERN = "opencode-compat-*"
+_COMPAT_ARTIFACT_NAME_PATTERN = "artifact-*"
+_COMPAT_CACHE_RELATIVE_PATHS = (
+    Path("tools") / "bun-cache",
+    Path("source") / "node_modules",
+)
+
+
+def _registered_executable_relatives(runtime_dir: Path) -> list[str] | None:
+    """Every registered ``executable_relative``, or None when that is unknowable.
+
+    The live registration must exist and register something; each
+    ``executable_registration*.backup.json`` must parse.  Anything else is
+    None so the caller removes no artifact (fail closed).
+    """
+    from .runtime_executable_registry import REGISTRY_FILENAME
+
+    try:
+        backups = sorted(runtime_dir.glob(f"{Path(REGISTRY_FILENAME).stem}*.backup.json"))
+    except OSError:
+        return None
+    relatives: list[str] = []
+    for index, path in enumerate([runtime_dir / REGISTRY_FILENAME, *backups]):
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+            entries = [
+                entry["executable_relative"] for entry in document["registrations"].values()
+            ]
+        except (OSError, UnicodeError, ValueError, KeyError, TypeError, AttributeError):
+            return None
+        if not all(isinstance(entry, str) and entry for entry in entries):
+            return None
+        if index == 0 and not entries:
+            return None
+        relatives.extend(entries)
+    return relatives
+
+
+def _artifact_holds_registered_executable(
+    artifact: Path, bases: list[Path], relatives: list[str]
+) -> bool:
+    prefix = os.path.normcase(os.path.abspath(artifact))
+    for base in bases:
+        for relative in relatives:
+            target = os.path.normcase(os.path.abspath(os.path.join(base, relative)))
+            if target == prefix or target.startswith(prefix + os.sep):
+                return True
+    return False
+
+
+def _compat_workspace_candidates(
+    runtime_dir: Path, expected_runtime_dir: Path
+) -> list[tuple[Path, Path]]:
+    """Aged-eligible removal candidates inside direct ``opencode-compat-*`` children.
+
+    Yields ``tools/bun-cache``, ``source/node_modules`` and unregistered
+    ``artifact-*`` dirs; the compat dir itself, its manifest and the rest of
+    ``source/`` are never candidates.  Age, link and owner checks stay with the
+    caller's shared selection.
+    """
+    import fnmatch
+
+    candidates: list[tuple[Path, Path]] = []
+    relatives: list[str] | None = None
+    relatives_loaded = False
+    try:
+        compat_dirs = list(runtime_dir.iterdir())
+    except OSError:
+        return candidates
+    for compat in compat_dirs:
+        if not fnmatch.fnmatch(compat.name, _COMPAT_RUNTIME_NAME_PATTERN):
+            continue
+        try:
+            if compat.is_symlink() or compat.is_junction() or not compat.is_dir():
+                continue
+            resolved_compat = compat.resolve(strict=False)
+            if resolved_compat.parent != expected_runtime_dir:
+                continue
+            for relative in _COMPAT_CACHE_RELATIVE_PATHS:
+                if (compat / relative).is_dir():
+                    candidates.append(
+                        (compat / relative, resolved_compat / relative.parent)
+                    )
+            artifacts = [
+                child
+                for child in compat.iterdir()
+                if fnmatch.fnmatch(child.name, _COMPAT_ARTIFACT_NAME_PATTERN)
+                and child.is_dir()
+            ]
+        except OSError:
+            continue
+        if artifacts and not relatives_loaded:
+            relatives = _registered_executable_relatives(runtime_dir)
+            relatives_loaded = True
+        if relatives is None:
+            continue
+        bases = [runtime_dir.parent.parent, runtime_dir, compat]
+        candidates.extend(
+            (artifact, resolved_compat)
+            for artifact in artifacts
+            if not _artifact_holds_registered_executable(artifact, bases, relatives)
+        )
+    return candidates
 
 
 def _janitor_scratch(root: Path, now: float) -> dict[str, Any]:
@@ -2722,6 +2827,7 @@ def _janitor_scratch(root: Path, now: float) -> dict[str, Any]:
                     for pattern in _SCRATCH_RUNTIME_NAME_PATTERNS
                 ):
                     candidates.append((entry, expected_runtime_dir))
+        candidates.extend(_compat_workspace_candidates(runtime_dir, expected_runtime_dir))
 
     selected: list[tuple[Path, Path]] = []
     for candidate, expected_parent in candidates:

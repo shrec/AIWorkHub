@@ -96,14 +96,14 @@ for (const relative of ['media/app.js', '../src/aiworkhub/dashboard_static/dashb
     formatRelativeTime: () => '',
     formatBytes: value => String(value || 0),
     setTileHealth() {},
-    elements: { lastSync: {}, headerStorageManaged: {}, headerStorageFree: {} },
+    elements: { lastSync: {}, headerStorageManaged: { removeAttribute() {} }, headerStorageFree: {} },
     document: { querySelector(id) {
       if (!nodes.has(id)) nodes.set(id, { textContent: '', title: '' });
       return nodes.get(id);
     } },
   };
   vm.createContext(context);
-  vm.runInContext(extract('formatMoney') + '\n' + extract('renderSummary'), context);
+  vm.runInContext(extract('formatMoney') + '\n' + (source.includes('function applyStorageOverCap(') ? extract('applyStorageOverCap') + '\n' : '') + extract('renderSummary'), context);
   const complete = { available: true, records: 1, cost_known_records: 1, cost_unknown_records: 0, cost_complete: true, cost_usd: 0 };
   const partial = { ...complete, records: 3, cost_unknown_records: 2, cost_complete: false, cost_usd: 6.5 };
   const renderHeader = totals => {

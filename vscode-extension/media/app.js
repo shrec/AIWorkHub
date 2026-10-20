@@ -594,6 +594,24 @@ function setTileHealth(card, health) {
   if (card && card.dataset) card.dataset.health = health;
 }
 
+// Over-cap Storage tile: flip an ok dot to warn so the existing warn rules paint
+// dot, rule and ink together, name the state in text, and put the exact overage
+// in the title; the title is cleared otherwise.
+function applyStorageOverCap(card, storage) {
+  if (!card) return;
+  const retention = storage && storage.retention_preview && typeof storage.retention_preview === "object"
+    ? storage.retention_preview
+    : null;
+  const over = retention ? numberValue(retention.over_limit_bytes) : 0;
+  if (over > 0) {
+    if (card.dataset && card.dataset.health === "ok") setTileHealth(card, "warn");
+    elements.headerStorageFree.textContent += ` · over cap by ${formatBytes(over)}`;
+    card.title = `Over the ${formatBytes(retention.max_bytes)} cap by ${formatBytes(over)}`;
+  } else {
+    card.removeAttribute("title");
+  }
+}
+
 function renderSummary(snapshot) {
   const counts = snapshot.status_counts || {};
   for (const metric of ["active", "pending", "processing", "review", "blocked", "stale"]) {
@@ -637,6 +655,7 @@ function renderSummary(snapshot) {
     ? `Free ${formatBytes(storage.disk_free_bytes)}`
     : "Free —";
   setTileHealth(elements.headerStorage, !storage ? "neutral" : storage.scan_status === "scanning" ? "loading" : "ok");
+  applyStorageOverCap(elements.headerStorage, storage);
   const sourceGraph = snapshot && snapshot.source_graph_telemetry
     && typeof snapshot.source_graph_telemetry === "object"
     ? snapshot.source_graph_telemetry
@@ -813,6 +832,7 @@ function renderSummaryProjection(snapshot) {
       : formatBytes(storage.managed_total_bytes);
     elements.headerStorageFree.textContent = `Free ${formatBytes(storage.disk_free_bytes)}`;
     setTileHealth(elements.headerStorage, storage.scan_status === "scanning" ? "loading" : "ok");
+    applyStorageOverCap(elements.headerStorage, storage);
   }
   // The summary deliberately omits history_series. Telling the History page
   // so is what keeps it saying "loading" instead of asserting an

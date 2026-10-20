@@ -312,6 +312,16 @@ function renderSummary(snapshot) {
   elements.headerStorageFree.textContent = storage
     ? `Free ${formatBytes(storage.disk_free_bytes)}`
     : "Free —";
+  const retention = storage && storage.retention_preview && typeof storage.retention_preview === "object"
+    ? storage.retention_preview
+    : null;
+  const overLimitBytes = retention ? numberValue(retention.over_limit_bytes) : 0;
+  if (overLimitBytes > 0) {
+    elements.headerStorageFree.textContent = `Free ${formatBytes(storage.disk_free_bytes)} · over cap by ${formatBytes(overLimitBytes)}`;
+    elements.headerStorageManaged.title = `Over the ${formatBytes(retention.max_bytes)} cap by ${formatBytes(overLimitBytes)}`;
+  } else {
+    elements.headerStorageManaged.removeAttribute("title");
+  }
 }
 
 function renderSourceHealth(snapshot) {

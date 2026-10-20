@@ -86,6 +86,35 @@ assert.ok(
   extension.includes('await pushRuntimeInfo(view);') && extension.includes('await pushSnapshot(view);'),
   "dashboard Retry must advance runtime repair and refresh the snapshot",
 );
+const dashboardStatic = fs.readFileSync(
+  path.join(root, "..", "src", "aiworkhub", "dashboard_static", "dashboard.js"),
+  "utf8",
+);
+for (const [name, source] of [["app.js", app], ["dashboard.js", dashboardStatic]]) {
+  for (const token of [
+    "retention_preview",
+    "over_limit_bytes",
+    "Over the ${formatBytes(retention.max_bytes)} cap by ${formatBytes(",
+    " · over cap by ${formatBytes(",
+    'removeAttribute("title")',
+  ]) {
+    assert.ok(source.includes(token), `${name} is missing the storage over-cap wiring: ${token}`);
+  }
+}
+assert.ok(
+  /function applyStorageOverCap[\s\S]*?setTileHealth\(card, "warn"\)/.test(app),
+  "app.js applyStorageOverCap must call setTileHealth(card, \"warn\")",
+);
+assert.ok(
+  app.includes("applyStorageOverCap(elements.headerStorage, storage);"),
+  "app.js must apply the over-cap state on both header storage render paths",
+);
+assert.strictEqual(
+  app.split("applyStorageOverCap(elements.headerStorage, storage);").length - 1,
+  2,
+  "app.js must apply the over-cap state in the full and summary header renders",
+);
+assert.ok(!css.includes("storage-over-cap"), "dead storage-over-cap styling must not return");
 assert.ok(css.includes(".storage-row"), "storage dashboard styling is missing");
 assert.ok(css.includes(".storage-section-title"), "storage section styling is missing");
 assert.ok(css.includes(".storage-batch-row"), "storage quarantine styling is missing");
