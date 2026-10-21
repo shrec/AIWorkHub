@@ -6,6 +6,13 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.63] - 2026-10-21
+
+### Fixed
+
+- A reviewer packet accepts any number of changed files: `changed_paths` is bounded at 4096 instead of the 64-row collection cap, so a large card no longer blocks its reviewer with `review_scope_changed_paths_overflow`; other scope collections stay capped at 64 and record a `scope-rows-truncated-<collection>` unknown with the exact dropped count (NF-2026-01633).
+- A NeedFix left in `converting` with no conversion claim is released back to `accepted` by `recover_conversion_claim`, so it can be converted again or resolved (NF-2026-00522).
+
 ## [0.12.62] - 2026-10-21
 
 ### Added

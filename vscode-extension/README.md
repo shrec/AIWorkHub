@@ -23,9 +23,9 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.12.62
+## What's new in 0.12.63
 
-- A reviewer that automatic review already accepted no longer ends as `finalize_failed` when its own process finishes later, a NeedFix closes itself from a `Resolves:` line anywhere in a commit message or when the detector that filed it sees the signal clear (and reopens if it comes back), Claude Code gets a hook that steers raw grep, whole-file reads and raw edits of indexed source to Source Graph and semantic edit, a failed validation now shows the worker its reason code and paths instead of redacting every long word, and the default worker cap follows the machine's core count.
+- A card that touches more than 64 files can be reviewed again (the reviewer packet used to refuse it outright), and a NeedFix stuck half-way through conversion can be released and finished.
 
 ## Review automation
 

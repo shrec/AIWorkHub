@@ -1,5 +1,11 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.63 — 2026-10-21
+
+### Fixed
+
+- Bundled runtime 0.12.63: the reviewer packet accepts more than 64 changed files and records any truncated context collection explicitly (NF-2026-01633); a NeedFix stuck in `converting` without a claim can be recovered (NF-2026-00522).
+
 ## 0.12.62 — 2026-10-21
 
 ### Fixed
