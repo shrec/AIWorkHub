@@ -6,6 +6,21 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.62] - 2026-10-21
+
+### Added
+
+- A Claude Code `PreToolUse` hook (`.claude/hooks/aiworkhub_tool_guard.py`) denies grep/rg/find/cat-style discovery of indexed source, a Read without a bounded range, an Edit of an existing repository file and a Write that keeps most of an existing file, and names the Source Graph or semantic-edit tool to use instead; `provider_tool_guards` installs it idempotently and denials are logged under `.aiworkhub/runtime/tool_guard/`.
+
+### Fixed
+
+- A read-only reviewer that automatic review already accepted and archived stays accepted when its own supervisor finalizes afterwards; the late finalization no longer buries the accepted row under `finalize_failed`, and spend for that attempt is still recorded (NF-2026-01625).
+- A vanished review worktree is named `worktree_is_not_detached_and_isolated` in the terminal diagnostic instead of `finalize_failed:unclassified` (NF-2026-01621).
+- A `Resolves: NF-...` line resolves its NeedFix from any commit paragraph, not only from git's final trailer block (NF-2026-01613).
+- A detector-filed NeedFix resolves when its signal clears (an SDLC control band back at ok, a clean janitor step or worktree sweep) and the same row reopens with a new generation when the signal recurs, instead of being swallowed as a dedupe hit.
+- The default worker cap is the observed core count minus two, clamped to 1..32, instead of a literal 4 (NF-2026-01080).
+- Tool-policy tests skip sandbox-only failures only on measured capability (NF-2026-01627); the accepted-eval corpus tests seed and rebuild once per module, about 14 min to 77 s (NF-2026-01624).
+
 ## [0.12.61] - 2026-10-20
 
 ### Added

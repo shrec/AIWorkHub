@@ -372,9 +372,9 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.61
+## What's new in 0.12.62
 
-- The dashboard opens faster (its cost ledger went from 5.7 s to 1.7 s), storage cleanup reclaims old worker scratch space without touching a running worker's temp files, a rework that undoes an inherited change no longer shows it as new work, any OpenCode model can hold the manager seat, and the stdio MCP server ships a Dockerfile and an MCP Registry `server.json`.
+- A reviewer that automatic review already accepted no longer ends as `finalize_failed` when its own process finishes later, a NeedFix closes itself from a `Resolves:` line anywhere in a commit message or when the detector that filed it sees the signal clear (and reopens if it comes back), Claude Code gets a hook that steers raw grep, whole-file reads and raw edits of indexed source to Source Graph and semantic edit, and the default worker cap follows the machine's core count.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Continuous Audit as a Service (CAAS)
