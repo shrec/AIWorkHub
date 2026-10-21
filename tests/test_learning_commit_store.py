@@ -1153,6 +1153,25 @@ def test_adjudicated_decision_answers_unknown_rather_than_guessing():
     ) == ""
 
 
+def test_adjudicated_decision_accepts_archived_card_that_records_acceptance():
+    archived = {
+        "accepted_request_id": "r",
+        "status": "finished",
+        "worker_status": "done",
+        "archived_at": "2026-10-21T00:00:00+00:00",
+        "accept_evidence": {"acceptance_evidence_record": {}},
+    }
+    assert learning_commit_store.adjudicated_decision(archived, "r") == "accepted"
+    assert learning_commit_store.adjudicated_decision(archived, "other") == ""
+    no_evidence = {k: v for k, v in archived.items() if k != "accept_evidence"}
+    assert learning_commit_store.adjudicated_decision(no_evidence, "r") == ""
+    no_request = {**archived, "accepted_request_id": ""}
+    assert learning_commit_store.adjudicated_decision(no_request, "") == ""
+    assert learning_commit_store._card_records_acceptance(archived)
+    assert not learning_commit_store._card_records_acceptance(no_evidence)
+    assert not learning_commit_store._card_records_acceptance(no_request)
+
+
 def test_the_short_form_tool_writes_a_commit_from_task_request_and_lesson(
     tmp_path, monkeypatch
 ):
@@ -1176,6 +1195,40 @@ def test_the_short_form_tool_writes_a_commit_from_task_request_and_lesson(
     assert result["ok"] is True, result
     assert result["outcome"] == "accepted"
     assert result["task_id"] == "TASK-SHORT-4"
+
+
+def test_the_short_form_tool_accepts_an_accepted_then_archived_card(
+    tmp_path, monkeypatch
+):
+    from aiworkhub import server
+
+    root = _setup_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+    _accepted_card_with_promotion(
+        root, task_id="TASK-SHORT-5", request_id="request-short-0005",
+        promoted=["src/aiworkhub/skill_registry_store.py"],
+    )
+    con = sqlite3.connect(str(task_store.canonical_db_path(root)))
+    try:
+        con.execute(
+            "UPDATE tasks SET archived_at=? WHERE task_id=?",
+            ("2026-10-21T00:00:00+00:00", "TASK-SHORT-5"),
+        )
+        con.commit()
+    finally:
+        con.close()
+    assert task_store.canonical_status(task_store.get_task(root, "TASK-SHORT-5")) == "archived"
+
+    result = server.aiworkhub_manager_learning_commit(
+        task_id="TASK-SHORT-5",
+        request_id="request-short-0005",
+        lesson_candidate="an accepted card that hygiene archived is still accepted",
+        promote_ai_memory=True,
+    )
+
+    assert result.get("reason") != "learning_commit_request_identity_mismatch", result
+    assert result["ok"] is True, result
+    assert result["outcome"] == "accepted"
 
 
 def test_extra_evidence_ids_are_merged_with_the_resolved_one(tmp_path, monkeypatch):

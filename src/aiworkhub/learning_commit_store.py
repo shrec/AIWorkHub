@@ -183,13 +183,19 @@ def _commit_payload(commit: LearningCommit) -> dict[str, Any]:
     }
 
 
-def _canonical_acceptance_reference(card: dict[str, Any], request_id: str) -> str:
+def _card_records_acceptance(card: dict[str, Any]) -> bool:
     status = task_store.canonical_status(card)
-    if status != "finished" and not (
+    if status == "finished":
+        return True
+    return (
         status == "archived"
-        and str(card.get("accepted_request_id") or "")
+        and bool(str(card.get("accepted_request_id") or ""))
         and isinstance(card.get("accept_evidence"), dict)
-    ):
+    )
+
+
+def _canonical_acceptance_reference(card: dict[str, Any], request_id: str) -> str:
+    if not _card_records_acceptance(card):
         raise LearningCommitStoreError("learning_commit_task_not_manager_accepted")
     if str(card.get("accepted_request_id") or "") != request_id:
         raise LearningCommitStoreError("learning_commit_request_identity_mismatch")
@@ -1278,10 +1284,7 @@ def adjudicated_decision(card: dict[str, Any], request_id: str) -> str:
     request = str(request_id or "").strip()
     if not request:
         return ""
-    if (
-        task_store.canonical_status(card) == "finished"
-        and str(card.get("accepted_request_id") or "") == request
-    ):
+    if _card_records_acceptance(card) and str(card.get("accepted_request_id") or "") == request:
         return "accepted"
     if _landed_manager_rejection(card, request):
         return "rejected"

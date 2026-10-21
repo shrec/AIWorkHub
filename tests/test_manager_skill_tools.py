@@ -1137,6 +1137,27 @@ def test_add_learning_commit_evidence_records_for_an_undeclared_implementation_c
     assert [row["identity"] for row in result["recorded"]] == ["learning-derived-skill"]
 
 
+def test_decision_contradiction_sees_an_accepted_then_archived_card_as_accepted(manager):
+    _seed_card(manager, "T_ARCHIVED")
+    _seed_learning_commit(manager, "T_ARCHIVED", "req-a", outcome="accepted")
+    conn = sqlite3.connect(str(manager / ".aiworkhub" / "tasking" / "task_queue.sqlite"))
+    try:
+        conn.execute(
+            "UPDATE tasks SET archived_at=? WHERE task_id=?",
+            ("2026-10-21T00:00:00+00:00", "T_ARCHIVED"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert task_store.canonical_status(task_store.get_task(manager, "T_ARCHIVED")) == "archived"
+
+    assert (
+        mst._decision_contradiction(manager, "T_ARCHIVED", "req-a", "rejected")
+        == "card_adjudicated_accepted_not_rejected"
+    )
+    assert mst._decision_contradiction(manager, "T_ARCHIVED", "req-a", "accepted") == ""
+
+
 def test_add_learning_commit_evidence_uses_the_runtime_selection_derivation(manager):
     """A template-created card with mixed src/tests writes and no explicit
     ``skill_task_family``/``skill_path_scope`` must resolve through the exact
