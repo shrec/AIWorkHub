@@ -19,6 +19,8 @@ from aiworkhub.scoped_audit import (
     ALLOWED_REVIEW_LENSES,
     BLOCKER_MIN_EVIDENCE_LEVEL,
     MAX_AUDIT_FINDING_COUNT,
+    MAX_CHANGED_PATHS,
+    MAX_COLLECTION_SIZE,
     AuditCoverageRecord,
     AuditCoverageReport,
     AuditModuleCoverage,
@@ -235,7 +237,14 @@ class TestSecurity:
         with pytest.raises(ScopedAuditValidationError):
             _make_packet(
                 changed_paths=tuple(
-                    _change(path=f"src/file_{i}.py") for i in range(100)
+                    _change(path=f"src/file_{i}.py")
+                    for i in range(MAX_CHANGED_PATHS + 1)
+                )
+            )
+        with pytest.raises(ScopedAuditValidationError):
+            _make_packet(
+                unknowns=tuple(
+                    _unknown(f"unk-{i:03d}") for i in range(MAX_COLLECTION_SIZE + 1)
                 )
             )
 

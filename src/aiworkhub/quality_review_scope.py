@@ -19,12 +19,13 @@ import sqlite3
 from bisect import bisect_left, bisect_right
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any, NamedTuple, cast
+from typing import Any, NamedTuple, TypeVar, cast
 
 from . import source_graph
 from . import source_graph_ast as sgast
 from .evidence_levels import EvidenceLevel
 from .scoped_audit import (
+    MAX_COLLECTION_SIZE,
     ChangedPath,
     EvidenceReference,
     KnownUnknown,
@@ -36,7 +37,8 @@ from .scoped_audit import (
 )
 
 
-MAX_SCOPE_ROWS = 64
+MAX_SCOPE_ROWS = MAX_COLLECTION_SIZE
+_Row = TypeVar("_Row")
 
 _LENS_RATIONALE = {
     "correctness": "Verify behavior, invariants, contracts and validation evidence.",
@@ -295,6 +297,49 @@ def _path_list(paths: Iterable[str]) -> str:
     return text if len(text) <= 600 else f"{text[:597]}..."
 
 
+def _cap(rows: list[_Row], collection: str, drops: dict[str, int]) -> list[_Row]:
+    """Keep MAX_SCOPE_ROWS rows and record how many were dropped."""
+    if len(rows) > MAX_SCOPE_ROWS:
+        drops[collection] = drops.get(collection, 0) + len(rows) - MAX_SCOPE_ROWS
+    return rows[:MAX_SCOPE_ROWS]
+
+
+def _capped_strings(
+    values: Iterable[object], collection: str, drops: dict[str, int]
+) -> tuple[str, ...]:
+    items = list(values)
+    return tuple(_cap(list(_strings(items, limit=len(items))), collection, drops))
+
+
+def _truncation_unknown(collection: str, dropped: int) -> KnownUnknown:
+    return KnownUnknown(
+        identity=f"scope-rows-truncated-{collection}",
+        question=f"What is in the {dropped} {collection} rows omitted from this packet?",
+        why_relevant=(
+            f"reason=scope_rows_truncated; collection={collection}; dropped={dropped}; "
+            f"the packet keeps at most {MAX_SCOPE_ROWS} rows per collection, so read "
+            "the remaining rows through your Source Graph tool."
+        ),
+    )
+
+
+def _finalize_unknowns(
+    unknowns: Mapping[str, KnownUnknown], drops: Mapping[str, int]
+) -> tuple[KnownUnknown, ...]:
+    """Fit the unknowns plus one truncation record per truncated collection."""
+    records = {
+        collection: _truncation_unknown(collection, dropped)
+        for collection, dropped in drops.items()
+    }
+    rows = list(unknowns.values())
+    room = MAX_SCOPE_ROWS - len(records)
+    if len(rows) > room:
+        keep = max(0, room - 1)
+        records["unknowns"] = _truncation_unknown("unknowns", len(rows) - keep)
+        rows = rows[:keep]
+    return tuple(rows) + tuple(records[name] for name in sorted(records))
+
+
 def build_scoped_audits(
     *,
     authority_repo: Path,
@@ -330,8 +375,6 @@ def build_scoped_audits(
     candidate_repo = candidate_repo.resolve()
     if not changed_path_hashes:
         raise ReviewScopeBuildError("review_scope_changed_paths_missing")
-    if len(changed_path_hashes) > MAX_SCOPE_ROWS:
-        raise ReviewScopeBuildError("review_scope_changed_paths_overflow")
     if set(source_evidence) != set(changed_path_hashes):
         raise ReviewScopeBuildError("review_scope_source_evidence_mismatch")
 
@@ -354,6 +397,7 @@ def build_scoped_audits(
         tests: dict[str, EvidenceReference] = {}
         contracts: dict[str, EvidenceReference] = {}
         unknowns: dict[str, KnownUnknown] = {}
+        drops: dict[str, int] = {}
         required_output_paths = {str(value) for value in required_outputs}
 
         target_names: set[str] = set()
@@ -421,7 +465,7 @@ def build_scoped_audits(
             if entity_rows and (uncovered or not (selected or deleted)):
                 selected.append(entity_rows[0])
             selected += deleted + replaced
-            for entity in selected[:MAX_SCOPE_ROWS]:
+            for entity in _cap(selected, "target_symbols", drops):
                 kind = _SYMBOL_KIND_MAP.get(str(_row_value(entity, "kind", "")))
                 if kind is None:
                     continue
@@ -438,7 +482,7 @@ def build_scoped_audits(
                 if _within(candidate_spans, _edge_line(edge))
                 or (edge.src_qualname in targets and edge.src_qualname != path)
             ]
-            for edge in scoped_edges[:MAX_SCOPE_ROWS]:
+            for edge in _cap(scoped_edges, "edges", drops):
                 edge_line = _edge_line(edge)
                 description = (
                     f"Candidate Source Graph {edge.kind}: {edge.src_qualname} -> "
@@ -522,8 +566,19 @@ def build_scoped_audits(
                 "evidence_label,confidence FROM edges WHERE dst_name IN ("
                 + placeholders
                 + ") ORDER BY file_path,line,src_qualname LIMIT ?",
-                (*sorted(target_names), MAX_SCOPE_ROWS),
+                (*sorted(target_names), MAX_SCOPE_ROWS + 1),
             ).fetchall()
+            if len(rows) > MAX_SCOPE_ROWS:
+                total_callers = conn.execute(
+                    "SELECT COUNT(*) FROM edges WHERE dst_name IN ("
+                    + placeholders
+                    + ")",
+                    sorted(target_names),
+                ).fetchone()[0]
+                drops["caller_edges"] = drops.get("caller_edges", 0) + (
+                    int(total_callers) - MAX_SCOPE_ROWS
+                )
+                rows = rows[:MAX_SCOPE_ROWS]
             for row in rows:
                 path = str(row["file_path"])
                 line = max(1, int(row["line"] or 1))
@@ -566,10 +621,8 @@ def build_scoped_audits(
                     line_end=max(1, int(row["line_end"] or row["line_start"] or 1)),
                     description="Canonical Source Graph related-test target.",
                 )
-                if len(tests) >= MAX_SCOPE_ROWS:
-                    break
 
-        terminal_rows = list(terminal_validation)[:MAX_SCOPE_ROWS]
+        terminal_rows = _cap(list(terminal_validation), "terminal_validation", drops)
         for index, row in enumerate(terminal_rows):
             if not isinstance(row, Mapping):
                 continue
@@ -618,7 +671,8 @@ def build_scoped_audits(
             )
 
         expectations: list[ValidationExpectation] = []
-        for index, declared in enumerate(list(validation)[:MAX_SCOPE_ROWS]):
+        declared_validation = _cap(list(validation), "validation_expectations", drops)
+        for index, declared in enumerate(declared_validation):
             command = _command_text(declared)
             if not command:
                 continue
@@ -640,6 +694,16 @@ def build_scoped_audits(
                 )
             )
 
+        target_rows = tuple(_cap(list(targets.values()), "target_symbols", drops))
+        impact_rows = tuple(_cap(list(impact.values()), "impact_evidence", drops))
+        test_rows_kept = tuple(_cap(list(tests.values()), "test_evidence", drops))
+        contract_rows = tuple(
+            _cap(list(contracts.values()), "contract_evidence", drops)
+        )
+        forbidden_rows = _capped_strings(forbidden_changes, "forbidden_changes", drops)
+        invariant_rows = _capped_strings(acceptance, "invariants", drops)
+        unknown_rows = _finalize_unknowns(unknowns, drops)
+
         scoped: dict[str, dict[str, Any]] = {}
         for lens in sorted(dict.fromkeys(str(value) for value in lenses)):
             rationale = _LENS_RATIONALE.get(lens)
@@ -649,21 +713,21 @@ def build_scoped_audits(
                 packet_id=_stable_id("scope", packet_seed, lens),
                 task_id=task_id,
                 created_at=created_at or "unknown",
-                target_symbols=tuple(list(targets.values())[:MAX_SCOPE_ROWS]),
-                changed_paths=tuple(changed_paths[:MAX_SCOPE_ROWS]),
-                forbidden_changes=_strings(forbidden_changes),
-                invariants=_strings(acceptance),
-                impact_evidence=tuple(list(impact.values())[:MAX_SCOPE_ROWS]),
-                test_evidence=tuple(list(tests.values())[:MAX_SCOPE_ROWS]),
-                contract_evidence=tuple(list(contracts.values())[:MAX_SCOPE_ROWS]),
+                target_symbols=target_rows,
+                changed_paths=tuple(changed_paths),
+                forbidden_changes=forbidden_rows,
+                invariants=invariant_rows,
+                impact_evidence=impact_rows,
+                test_evidence=test_rows_kept,
+                contract_evidence=contract_rows,
                 prior_lessons=(),
                 review_lens=ReviewLens(
                     lens_kind=lens,
                     rationale=rationale,
                     required_evidence_level=EvidenceLevel.STATIC_EVIDENCE,
                 ),
-                unknowns=tuple(list(unknowns.values())[:MAX_SCOPE_ROWS]),
-                validation_expectations=tuple(expectations[:MAX_SCOPE_ROWS]),
+                unknowns=unknown_rows,
+                validation_expectations=tuple(expectations),
             )
             scoped[lens] = {
                 "schema_id": "aiworkhub.scoped_audit.v1",

@@ -45,6 +45,7 @@ __all__ = [
     "MAX_IDENTITY_LENGTH",
     "MAX_PATH_LENGTH",
     "MAX_RATIONALE_LENGTH",
+    "MAX_CHANGED_PATHS",
     "MAX_TEXT_LENGTH",
     "MalformedPathError",
     "PriorLesson",
@@ -110,6 +111,7 @@ AUDIT_COVERAGE_STATUSES: frozenset[str] = frozenset({"AUDITED", "UNKNOWN"})
 MAX_PATH_LENGTH = 512
 MAX_TEXT_LENGTH = 1024
 MAX_COLLECTION_SIZE = 64
+MAX_CHANGED_PATHS = 4096
 MAX_AUDIT_FINDING_COUNT = 1_000_000
 MAX_RATIONALE_LENGTH = 256
 MAX_IDENTITY_LENGTH = 200
@@ -519,7 +521,15 @@ class ScopedAuditPacket:
             "unknowns",
             "validation_expectations",
         ):
-            _ensure_tuple(getattr(self, header), name=header)
+            _ensure_tuple(
+                getattr(self, header),
+                name=header,
+                max_size=(
+                    MAX_CHANGED_PATHS
+                    if header == "changed_paths"
+                    else MAX_COLLECTION_SIZE
+                ),
+            )
 
         for fc in self.forbidden_changes:
             _ensure_text(fc, "forbidden_change")

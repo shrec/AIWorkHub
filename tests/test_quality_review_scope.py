@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from aiworkhub import quality_review_scope, source_graph
+from aiworkhub import quality_review_scope, scoped_audit, source_graph
 
 
 def _digest(path: Path) -> str:
@@ -129,6 +129,136 @@ def test_graph_scope_records_truthful_unknowns_without_canonical_graph(
     assert scopes["security"]["packet"]["validation_expectations"][0][
         "identity"
     ] == "expect-candidate-integrity"
+
+
+def _many_path_scope(
+    tmp_path: Path, count: int, *, prefix: str = "notes", **kwargs: Any
+) -> dict[str, dict[str, Any]]:
+    authority = tmp_path / "authority"
+    candidate = tmp_path / "candidate"
+    authority.mkdir()
+    candidate.mkdir()
+    hashes: dict[str, str | None] = {}
+    for index in range(count):
+        name = f"{prefix}_{index:03d}.md"
+        (candidate / name).write_text(f"changed {index}\n", encoding="utf-8")
+        hashes[name] = _digest(candidate / name)
+    return quality_review_scope.build_scoped_audits(
+        authority_repo=authority,
+        candidate_repo=candidate,
+        task_id="TASK_MANY",
+        packet_seed="request-many",
+        created_at="2026-08-09T00:00:00Z",
+        changed_path_hashes=hashes,
+        source_evidence={name: {"segments": []} for name in hashes},
+        **kwargs,
+    )
+
+
+def test_scope_accepts_more_than_64_changed_paths(tmp_path: Path) -> None:
+    scopes = _many_path_scope(
+        tmp_path, 67, lenses=["correctness", "security", "code_quality"]
+    )
+
+    assert sorted(scopes) == ["code_quality", "correctness", "security"]
+    for wrapped in scopes.values():
+        paths = [row["path"] for row in wrapped["packet"]["changed_paths"]]
+        assert len(paths) == 67
+        assert len(set(paths)) == 67
+        assert len(wrapped["packet"]["unknowns"]) <= scoped_audit.MAX_COLLECTION_SIZE
+
+
+def test_scope_records_truncated_collection_with_exact_dropped_count(
+    tmp_path: Path,
+) -> None:
+    scopes = _many_path_scope(
+        tmp_path, 67, prefix="tests_test_x", lenses=["correctness"]
+    )
+
+    packet = scopes["correctness"]["packet"]
+    assert len(packet["test_evidence"]) == scoped_audit.MAX_COLLECTION_SIZE
+    rows = [
+        row
+        for row in packet["unknowns"]
+        if row["identity"] == "scope-rows-truncated-test_evidence"
+    ]
+    assert len(rows) == 1
+    assert "scope_rows_truncated" in rows[0]["why_relevant"]
+    assert "dropped=3" in rows[0]["why_relevant"]
+    assert "collection=test_evidence" in rows[0]["why_relevant"]
+    assert len(packet["unknowns"]) <= scoped_audit.MAX_COLLECTION_SIZE
+    assert scopes["correctness"]["fingerprint"] == (
+        _many_path_scope_again(tmp_path)["correctness"]["fingerprint"]
+    )
+
+
+def _many_path_scope_again(tmp_path: Path) -> dict[str, dict[str, Any]]:
+    rebuilt = tmp_path / "again"
+    rebuilt.mkdir()
+    return _many_path_scope(
+        rebuilt, 67, prefix="tests_test_x", lenses=["correctness"]
+    )
+
+
+def test_scope_truncation_records_always_fit_in_unknowns(tmp_path: Path) -> None:
+    validation = [["python", f"check_{index}.py"] for index in range(70)]
+    scopes = _many_path_scope(
+        tmp_path,
+        70,
+        prefix="tests_test_y",
+        validation=validation,
+        acceptance=[f"invariant {index}" for index in range(70)],
+        lenses=["security"],
+    )
+
+    packet = scopes["security"]["packet"]
+    identities = {row["identity"] for row in packet["unknowns"]}
+    assert len(packet["unknowns"]) <= scoped_audit.MAX_COLLECTION_SIZE
+    assert len(packet["validation_expectations"]) == scoped_audit.MAX_COLLECTION_SIZE
+    assert "scope-rows-truncated-test_evidence" in identities
+    assert "scope-rows-truncated-validation_expectations" in identities
+    assert "scope-rows-truncated-invariants" in identities
+    dropped = {
+        row["identity"]: row["why_relevant"] for row in packet["unknowns"]
+    }
+    assert "dropped=6" in dropped["scope-rows-truncated-validation_expectations"]
+    assert "dropped=6" in dropped["scope-rows-truncated-invariants"]
+
+
+def test_packet_bounds_changed_paths_and_other_collections() -> None:
+    def packet(changed: int, unknowns: int = 0) -> scoped_audit.ScopedAuditPacket:
+        return scoped_audit.ScopedAuditPacket(
+            packet_id="p1",
+            task_id="T1",
+            created_at="2026-08-09T00:00:00Z",
+            target_symbols=(scoped_audit.TargetSymbol("a.b", "function"),),
+            changed_paths=tuple(
+                scoped_audit.ChangedPath(f"f{index}.py", "modified")
+                for index in range(changed)
+            ),
+            forbidden_changes=(),
+            invariants=(),
+            impact_evidence=(),
+            test_evidence=(),
+            contract_evidence=(),
+            prior_lessons=(),
+            review_lens=scoped_audit.ReviewLens("correctness", "r"),
+            unknowns=tuple(
+                scoped_audit.KnownUnknown(f"u{index}", "q", "w")
+                for index in range(unknowns)
+            ),
+            validation_expectations=(
+                scoped_audit.ValidationExpectation("v1", "manual", "c", "o"),
+            ),
+        )
+
+    assert len(packet(scoped_audit.MAX_CHANGED_PATHS).changed_paths) == (
+        scoped_audit.MAX_CHANGED_PATHS
+    )
+    with pytest.raises(scoped_audit.ScopedAuditValidationError):
+        packet(scoped_audit.MAX_CHANGED_PATHS + 1)
+    with pytest.raises(scoped_audit.ScopedAuditValidationError):
+        packet(1, unknowns=scoped_audit.MAX_COLLECTION_SIZE + 1)
 
 
 def test_executed_validation_evidence_names_the_last_line_it_printed(
