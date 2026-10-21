@@ -29,6 +29,11 @@
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2dd4bf.svg"></a>
   <img alt="Python 3.12+" src="https://img.shields.io/badge/Python-3.12%2B-38bdf8.svg">
   <img alt="VS Code 1.93+" src="https://img.shields.io/badge/VS%20Code-1.93%2B-0ea5e9.svg">
+  <a href="https://glama.ai/mcp/servers/shrec/AIWorkHub"><img alt="AIWorkhub MCP server – quality and maintenance score on Glama" src="https://glama.ai/mcp/servers/shrec/AIWorkHub/badges/score.svg"></a>
+</p>
+
+<p align="center">
+  <a href="https://glama.ai/mcp/servers/shrec/AIWorkHub"><img alt="AIWorkhub MCP server – quality and maintenance score on Glama" src="https://glama.ai/mcp/servers/shrec/AIWorkHub/badges/card.svg"></a>
 </p>
 
 <!-- mcp-name: io.github.shrec/aiworkhub -->
