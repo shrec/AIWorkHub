@@ -3616,6 +3616,8 @@ def needfix_transition_view(
         response = {"ok": False, "error": "invalid_promote_to", "allowed": ["accepted"]}
     elif promote and selected != "triage":
         response = {"ok": False, "error": "promote_to_requires_triage_action"}
+    elif selected == "recover_conversion_claim" and not str(reason or "").strip():
+        response = {"ok": False, "error": "needfix_recovery_reason_required"}
     else:
         try:
             if selected == "triage":
@@ -3654,6 +3656,23 @@ def needfix_transition_view(
                 row = core.needfix_resolve_verified(
                     candidate, resolution_note=str(reason)[:1000]
                 )
+            elif selected == "recover_conversion_claim":
+                before = core.needfix_show(candidate)
+                recovery = core.needfix_recover_conversion_claim(
+                    candidate,
+                    expected_updated_at=str(before.get("updated_at") or ""),
+                    expected_conversion_claim_id=(
+                        before.get("conversion_claim_id") or needfix_store.LEGACY_NULL_CLAIM_ID
+                    ),
+                    reason=str(reason).strip()[:1000],
+                )
+                row = {**core.needfix_show(candidate), "status": recovery["status"]}
+                row["transition"] = {
+                    "event": "conversion_claim_recovered",
+                    "event_id": None,
+                    "status_before": before.get("status"),
+                    "status_after": recovery["status"],
+                }
             else:
                 return _needfix_response(
                     {"ok": False, "error": "invalid_needfix_transition"},

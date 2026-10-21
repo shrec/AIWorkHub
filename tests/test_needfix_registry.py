@@ -2736,8 +2736,8 @@ class TestActiveListingProductionWiring:
 
 
 class TestInterruptedConversionClaimRecovery:
-    def _accepted(self, repo: Path) -> dict:
-        row = needfix_store.capture_proposal(repo, title="stale", description="claim")
+    def _accepted(self, repo: Path, title: str = "stale") -> dict:
+        row = needfix_store.capture_proposal(repo, title=title, description="claim")
         needfix_store.triage_needfix(repo, row["id"])
         return needfix_store.accept_needfix(repo, row["id"])
 
@@ -2981,6 +2981,128 @@ class TestInterruptedConversionClaimRecovery:
                 init_store, needfix_id, expected_updated_at=stale,
                 expected_conversion_claim_id=self._claim_id(init_store, needfix_id),
                 reason="bad provenance"
+            )
+
+    LEGACY_STALE = "2026-01-01T00:00:00+00:00"
+    NF_00469_EVENTS = (
+        ("existing_task_link_claimed", {"prior_status": "accepted", "existing_task_id": "T-gone"}),
+        ("conversion_compensated", {"restored_status": "accepted"}),
+        ("existing_task_link_claimed", {"prior_status": "converting", "existing_task_id": "T-gone"}),
+        ("conversion_compensated", {"restored_status": "converting"}),
+    )
+
+    def _legacy_converting(
+        self, repo: Path, events: tuple, updated_at: str | None = None
+    ) -> str:
+        needfix_id = self._accepted(repo, title="legacy")["id"]
+        stamp = updated_at or self.LEGACY_STALE
+        conn = sqlite3.connect(str(needfix_store._db_path(repo)))
+        try:
+            conn.execute("DELETE FROM needfix_events WHERE event LIKE '%claim%'")
+            for event, detail in events:
+                conn.execute(
+                    "INSERT INTO needfix_events (needfix_id, event, detail_json, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (needfix_id, event, json.dumps(detail), stamp),
+                )
+            conn.execute(
+                "UPDATE needfix SET status = 'converting', conversion_claim_id = NULL, "
+                "updated_at = ? WHERE id = ?",
+                (stamp, needfix_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return needfix_id
+
+    def test_legacy_null_claim_recovers_with_nf_00469_event_shape_and_replays(
+        self, init_store: Path
+    ):
+        needfix_id = self._legacy_converting(init_store, self.NF_00469_EVENTS)
+        claim_seq = next(
+            event["seq"]
+            for event in reversed(needfix_store.list_events(init_store, needfix_id))
+            if event["event"] == "existing_task_link_claimed"
+        )
+        kwargs = dict(
+            expected_updated_at=self.LEGACY_STALE,
+            expected_conversion_claim_id="legacy-null-claim",
+            reason="legacy stuck converting",
+        )
+        result = needfix_store.recover_interrupted_conversion_claim(
+            init_store, needfix_id, **kwargs
+        )
+        assert result["status"] == "accepted"
+        assert result["recovered"] is True
+        row = needfix_store.get_needfix(init_store, needfix_id)
+        assert row["status"] == "accepted"
+        assert row["conversion_claim_id"] is None
+        events = needfix_store.list_events(init_store, needfix_id)
+        recovered = [e for e in events if e["event"] == "conversion_claim_recovered"]
+        assert len(recovered) == 1
+        detail = recovered[0]["detail"]
+        assert detail["legacy"] is True
+        assert detail["prior_status"] == "accepted"
+        assert detail["claim_identity"]["event_seq"] == claim_seq
+        assert detail["postimage"]["event_seq"] == recovered[0]["seq"]
+
+        retry = needfix_store.recover_interrupted_conversion_claim(
+            init_store, needfix_id, **kwargs
+        )
+        assert retry["idempotent"] is True
+        assert retry["recovered"] is False
+        assert len(needfix_store.list_events(init_store, needfix_id)) == len(events)
+
+    def test_legacy_null_claim_without_claimable_claim_event_fails_closed(
+        self, init_store: Path
+    ):
+        needfix_id = self._legacy_converting(
+            init_store,
+            (
+                ("existing_task_link_claimed", {"prior_status": "converting"}),
+                ("conversion_compensated", {"restored_status": "converting"}),
+            ),
+        )
+        with pytest.raises(needfix_store.NeedFixConflictError, match="legacy conversion claim"):
+            needfix_store.recover_interrupted_conversion_claim(
+                init_store, needfix_id, expected_updated_at=self.LEGACY_STALE,
+                expected_conversion_claim_id="legacy-null-claim", reason="no provenance",
+            )
+        assert needfix_store.get_needfix(init_store, needfix_id)["status"] == "converting"
+
+    def test_legacy_null_claim_without_any_claim_event_fails_closed(self, init_store: Path):
+        needfix_id = self._legacy_converting(init_store, ())
+        with pytest.raises(needfix_store.NeedFixConflictError, match="legacy conversion claim"):
+            needfix_store.recover_interrupted_conversion_claim(
+                init_store, needfix_id, expected_updated_at=self.LEGACY_STALE,
+                expected_conversion_claim_id="legacy-null-claim", reason="no events",
+            )
+        assert needfix_store.get_needfix(init_store, needfix_id)["status"] == "converting"
+
+    def test_legacy_null_claim_younger_than_minimum_age_fails_closed(self, init_store: Path):
+        now = needfix_store._utcnow_iso()
+        needfix_id = self._legacy_converting(init_store, self.NF_00469_EVENTS, updated_at=now)
+        with pytest.raises(needfix_store.NeedFixConflictError, match="in flight"):
+            needfix_store.recover_interrupted_conversion_claim(
+                init_store, needfix_id, expected_updated_at=now,
+                expected_conversion_claim_id="legacy-null-claim", reason="too fresh",
+            )
+        assert needfix_store.get_needfix(init_store, needfix_id)["status"] == "converting"
+
+    def test_legacy_null_claim_requires_sentinel_and_sentinel_cannot_hit_real_claim(
+        self, init_store: Path, monkeypatch
+    ):
+        needfix_id = self._legacy_converting(init_store, self.NF_00469_EVENTS)
+        with pytest.raises(needfix_store.NeedFixConflictError, match="CAS mismatch"):
+            needfix_store.recover_interrupted_conversion_claim(
+                init_store, needfix_id, expected_updated_at=self.LEGACY_STALE,
+                expected_conversion_claim_id="some-other-claim", reason="wrong id",
+            )
+        real_id, stale = self._interrupt_claim(init_store, monkeypatch)
+        with pytest.raises(needfix_store.NeedFixConflictError, match="CAS mismatch"):
+            needfix_store.recover_interrupted_conversion_claim(
+                init_store, real_id, expected_updated_at=stale,
+                expected_conversion_claim_id="legacy-null-claim", reason="sentinel on real",
             )
 
     def test_unlinkable_candidate_is_rejected_before_claim(

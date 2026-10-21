@@ -30,6 +30,10 @@ def test_dashboard_needfix_registered_closed_and_open_gate_contracts(tmp_path):
     from pathlib import Path
 
     script = """
+try:
+    import sitecustomize  # noqa: F401 - -S skips site; the AppContainer lane shim must still load
+except ImportError:
+    pass
 import asyncio
 import importlib.util
 import json
@@ -116,17 +120,28 @@ print("registered gate contracts passed")
         temporary = root / "tmp"
         home.mkdir()
         temporary.mkdir()
+        # NF-2026-01176/NF-2026-01489: keep the lane's inherited PYTHONPATH (path-resolution shim)
+        # instead of replacing it with src alone; the stdlib backend must not see mcp or pydantic
+        # because the child asserts they are absent.
+        inherited = [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p]
+        if backend == "stdlib":
+            inherited = [
+                p for p in inherited
+                if not (Path(p, "mcp").is_dir() or Path(p, "pydantic").is_dir())
+            ]
+        src = str(Path(__file__).resolve().parents[1] / "src")
         env = dict(
             os.environ, AIWORKHUB_ALLOW_WRITES="0", AIWORKHUB_REPO=str(root),
             AIWORKHUB_MCP_STDIO_BACKEND=backend,
-            PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"),
+            PYTHONPATH=os.pathsep.join([src, *inherited]),
             HOME=str(home), USERPROFILE=str(home), APPDATA=str(home), LOCALAPPDATA=str(home),
             TEMP=str(temporary), TMP=str(temporary),
         )
         argv = [sys.executable] + (["-S"] if backend == "stdlib" else [])
+        # The AppContainer validation lane cold-imports the server through its shim; measured >30s for the sdk child.
         result = subprocess.run(
             argv + ["-c", script, str(root)], env=env, capture_output=True,
-            text=True, timeout=30,
+            text=True, timeout=180,
         )
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == "registered gate contracts passed"
@@ -244,6 +259,71 @@ def test_needfix_transition_receipt_carries_store_transition_and_detail_item(mon
     assert result["updated_at"] == "2026-09-08T10:00:00+00:00"
     assert result["item"]["description"] == "long body the manager wrote"
     assert result["item"]["evidence"] == {"measured": 1}
+
+
+def _patch_legacy_recovery(monkeypatch):
+    calls: list[dict] = []
+    stuck = {
+        "id": "NF-2026-00469", "status": "converting", "readiness_score": 80,
+        "updated_at": "2026-01-01T00:00:00+00:00", "conversion_claim_id": None,
+    }
+
+    def fake_show(needfix_id):
+        return dict(stuck) if not calls else {**stuck, "status": "accepted"}
+
+    def fake_recover(needfix_id, **kwargs):
+        calls.append(kwargs)
+        return {"needfix_id": needfix_id, "status": "accepted", "recovered": True}
+
+    monkeypatch.setattr(dashboard_mcp_app.core, "needfix_show", fake_show)
+    monkeypatch.setattr(dashboard_mcp_app.core, "needfix_recover_conversion_claim", fake_recover)
+    return calls
+
+
+def test_needfix_transition_recover_conversion_claim_recovers_legacy_row(monkeypatch):
+    calls = _patch_legacy_recovery(monkeypatch)
+    result = dashboard_mcp_app.needfix_transition_view(
+        "NF-2026-00469", "recover_conversion_claim",
+        reason="legacy stuck converting", confirm=True,
+    )
+    assert calls == [{
+        "expected_updated_at": "2026-01-01T00:00:00+00:00",
+        "expected_conversion_claim_id": "legacy-null-claim",
+        "reason": "legacy stuck converting",
+    }]
+    assert result["ok"] is True
+    assert result["schema_id"] == "aiworkhub.needfix_transition_receipt.v1"
+    assert result["action"] == "recover_conversion_claim"
+    assert result["status_before"] == "converting"
+    assert result["status_after"] == "accepted"
+
+
+def test_needfix_transition_recover_conversion_claim_requires_confirm_and_reason(monkeypatch):
+    calls = _patch_legacy_recovery(monkeypatch)
+    unconfirmed = dashboard_mcp_app.needfix_transition_view(
+        "NF-2026-00469", "recover_conversion_claim", reason="why", confirm=False
+    )
+    assert unconfirmed["error"] == "needfix_transition_confirmation_required"
+    no_reason = dashboard_mcp_app.needfix_transition_view(
+        "NF-2026-00469", "recover_conversion_claim", reason="  ", confirm=True
+    )
+    assert no_reason["ok"] is False
+    assert no_reason["error"] == "needfix_recovery_reason_required"
+    assert calls == []
+
+
+def test_needfix_transition_recover_conversion_claim_maps_refusal(monkeypatch):
+    _patch_legacy_recovery(monkeypatch)
+
+    def refuse(needfix_id, **kwargs):
+        raise dashboard_mcp_app.needfix_store.NeedFixConflictError("still in flight")
+
+    monkeypatch.setattr(dashboard_mcp_app.core, "needfix_recover_conversion_claim", refuse)
+    result = dashboard_mcp_app.needfix_transition_view(
+        "NF-2026-00469", "recover_conversion_claim", reason="why", confirm=True
+    )
+    assert result["ok"] is False
+    assert result["error"] == "still in flight"
 
 
 def test_needfix_transition_promote_to_accepted_records_both_steps(monkeypatch):

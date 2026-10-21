@@ -95,6 +95,8 @@ STATUSES: tuple[str, ...] = (
 )
 
 CLAIMABLE_STATUSES: tuple[str, ...] = ("accepted", "task_planned")
+LEGACY_NULL_CLAIM_ID = "legacy-null-claim"
+MAX_LEGACY_CLAIM_PROVENANCE_EVENTS = 64
 
 TERMINAL_STATUSES: tuple[str, ...] = ("duplicate", "rejected", "resolved")
 
@@ -3638,7 +3640,12 @@ def recover_interrupted_conversion_claim(
             raise NeedFixConflictError(
                 f"needfix {needfix_id} claim identity changed (updated_at CAS mismatch)"
             )
-        if row["conversion_claim_id"] != expected_conversion_claim_id:
+        legacy = row["conversion_claim_id"] is None
+        if legacy:
+            claim_id_matches = expected_conversion_claim_id == LEGACY_NULL_CLAIM_ID
+        else:
+            claim_id_matches = row["conversion_claim_id"] == expected_conversion_claim_id
+        if not claim_id_matches:
             raise NeedFixConflictError(
                 f"needfix {needfix_id} claim identity changed (claim id CAS mismatch)"
             )
@@ -3654,21 +3661,52 @@ def recover_interrupted_conversion_claim(
                 f"needfix {needfix_id} conversion claim is still in flight"
             )
 
-        lifecycle = conn.execute(
+        lifecycle_rows = conn.execute(
             "SELECT seq, event, detail_json FROM needfix_events WHERE needfix_id = ? "
             "AND event IN ('conversion_claimed', 'existing_task_link_claimed', "
             "'conversion_compensated', 'conversion_committed', "
-            "'conversion_claim_recovered') ORDER BY seq DESC LIMIT 1",
-            (needfix_id,),
-        ).fetchone()
-        if lifecycle is None or lifecycle["event"] not in (
-            "conversion_claimed", "existing_task_link_claimed"
-        ):
-            raise NeedFixConflictError("missing or ambiguous conversion claim provenance")
-        claim_detail = json.loads(lifecycle["detail_json"] or "{}")
-        prior_status = claim_detail.get("prior_status")
-        if prior_status not in CLAIMABLE_STATUSES:
-            raise NeedFixConflictError("conversion claim records an invalid prior status")
+            "'conversion_claim_recovered') ORDER BY seq DESC LIMIT ?",
+            (needfix_id, MAX_LEGACY_CLAIM_PROVENANCE_EVENTS if legacy else 1),
+        ).fetchall()
+        lifecycle = None
+        claim_detail: dict[str, Any] = {}
+        prior_status = None
+        if legacy:
+            # A NULL-claim converting row was stranded by a compensation that
+            # restored 'converting'; the newest claim recording a claimable
+            # prior status (before any commit/recovery boundary) is the truth.
+            for candidate_event in lifecycle_rows:
+                if candidate_event["event"] in (
+                    "conversion_committed", "conversion_claim_recovered"
+                ):
+                    break
+                if candidate_event["event"] not in (
+                    "conversion_claimed", "existing_task_link_claimed"
+                ):
+                    continue
+                candidate_detail = json.loads(candidate_event["detail_json"] or "{}")
+                if candidate_detail.get("prior_status") in CLAIMABLE_STATUSES:
+                    lifecycle = candidate_event
+                    claim_detail = {
+                        **candidate_detail,
+                        "conversion_claim_id": LEGACY_NULL_CLAIM_ID,
+                    }
+                    prior_status = candidate_detail["prior_status"]
+                    break
+            if lifecycle is None:
+                raise NeedFixConflictError(
+                    "missing legacy conversion claim provenance with a claimable prior status"
+                )
+        else:
+            lifecycle = lifecycle_rows[0] if lifecycle_rows else None
+            if lifecycle is None or lifecycle["event"] not in (
+                "conversion_claimed", "existing_task_link_claimed"
+            ):
+                raise NeedFixConflictError("missing or ambiguous conversion claim provenance")
+            claim_detail = json.loads(lifecycle["detail_json"] or "{}")
+            prior_status = claim_detail.get("prior_status")
+            if prior_status not in CLAIMABLE_STATUSES:
+                raise NeedFixConflictError("conversion claim records an invalid prior status")
         durable_claim_id = claim_detail.get("conversion_claim_id") or f"legacy-event-{lifecycle['seq']}"
         if durable_claim_id != expected_conversion_claim_id:
             raise NeedFixConflictError("conversion claim identity does not match durable provenance")
@@ -3679,13 +3717,18 @@ def recover_interrupted_conversion_claim(
             "existing_task_id": claim_detail.get("existing_task_id"),
             "conversion_claim_id": expected_conversion_claim_id,
         }
+        if legacy:
+            claim_identity["legacy"] = True
         recovered_at = _utcnow_iso()
+        claim_predicate = "conversion_claim_id IS NULL" if legacy else "conversion_claim_id = ?"
+        update_params: tuple[Any, ...] = (prior_status, recovered_at, needfix_id, expected_updated_at)
+        if not legacy:
+            update_params += (expected_conversion_claim_id,)
         cur = conn.execute(
             "UPDATE needfix SET status = ?, updated_at = ?, conversion_claim_id = NULL "
             "WHERE id = ? AND status = 'converting' AND updated_at = ? "
-            "AND conversion_claim_id = ?",
-            (prior_status, recovered_at, needfix_id, expected_updated_at,
-             expected_conversion_claim_id),
+            f"AND {claim_predicate}",
+            update_params,
         )
         if cur.rowcount != 1:
             raise NeedFixConflictError("conversion claim changed during recovery")
@@ -3702,6 +3745,8 @@ def recover_interrupted_conversion_claim(
                 "conversion_claim_id": None,
             },
         }
+        if legacy:
+            recovery_detail["legacy"] = True
         recovery_event_seq = _record_event(
             conn,
             needfix_id,
