@@ -39,6 +39,7 @@ from aiworkhub import (  # noqa: E402
     process_launcher,
     process_launcher_accept_review,
     process_launcher_validation as plv,
+    runtime_adapters,
     task_store,
     worker_workspace,
 )
@@ -118,6 +119,9 @@ def _harness(
     finalized_error: str = "",
     # Declared in scope but NOT sealed: the test writes it after the seal.
     extra_allowed_writes: tuple[str, ...] = (),
+    # The host lane is VS Code LM only (NF-2026-01645), so the shared request
+    # is an editor-hosted one; a native CLI request is asked for by name.
+    adapter_id: str = runtime_adapters.VSCODE_LM_ADAPTER,
 ) -> _Harness:
     monkeypatch.setenv(process_launcher.ALLOW_LAUNCH_ENV, "1")
     monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
@@ -183,7 +187,7 @@ def _harness(
         "task_id": _TASK_ID,
         "runner": _RUNNER,
         "topic": _TOPIC,
-        "adapter_id": "claude_cli",
+        "adapter_id": adapter_id,
         "sandbox_backend": _PRIOR_BACKEND,
         "supervisor_status_path": str(status_path),
         "workspace": workspace.as_metadata(),
@@ -215,7 +219,7 @@ def _harness(
             "task_id": _TASK_ID,
             "runner": _RUNNER,
             "topic": _TOPIC,
-            "adapter_id": "claude_cli",
+            "adapter_id": adapter_id,
             "sandbox_backend": _PRIOR_BACKEND,
             "state": terminal_state,
             "error": terminal_error,
@@ -576,6 +580,88 @@ def test_a_finalize_failed_retry_without_the_lane_forwards_host_lane_false(
 
     assert result["ok"] is True, result
     assert harness.transitions[0][1]["host_lane"] is False
+
+
+# --------------------------------------------------------------------------- #
+# the host lane is VS Code LM only (NF-2026-01645)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("state", sorted(plv.HOST_LANE_RETRYABLE_STATES))
+@pytest.mark.parametrize(
+    "adapter_id", ["claude_cli", pytest.param("", id="no_adapter")]
+)
+def test_a_cli_request_is_refused_the_host_lane_before_anything_moves(
+    monkeypatch, tmp_path, adapter_id, state
+):
+    """The boundary ``run_validations`` enforces is asked before the retry.
+
+    The lane forces the editor-hosted backend, which ``run_validations``
+    refuses for every adapter outside its allowlist so a native CLI route never
+    sheds its OS sandbox. Met only there, the retry had already been authorized
+    and the card had moved from review/validation_failed to
+    blocked/finalize_failed; met here, the request and the card stay exactly as
+    they were. A request naming no adapter is refused the same way: unknown is
+    never admitted.
+    """
+    harness = _harness(
+        monkeypatch, tmp_path, adapter_id=adapter_id, terminal_state=state
+    )
+    events_before = harness.manager._request_events(_REQUEST_ID)
+    metadata_before = harness.metadata_path.read_bytes()
+
+    result = harness.manager.retry_finalization(
+        _REQUEST_ID, _TASK_ID, validation_lane="manager_host"
+    )
+
+    assert result == {
+        "ok": False,
+        "request_id": _REQUEST_ID,
+        "task_id": _TASK_ID,
+        "error": f"validation_lane_forbidden_for_adapter:{adapter_id}",
+    }
+    assert harness.transitions == [] and harness.finalized == []
+    events_after = harness.manager._request_events(_REQUEST_ID)
+    assert len(events_after) == len(events_before)
+    assert events_after == events_before
+    assert harness.latest_event["state"] == state
+    assert harness.metadata_path.read_bytes() == metadata_before
+    assert harness.card["status"] == "review"
+
+
+def test_a_cli_request_keeps_the_default_lane_retry(monkeypatch, tmp_path):
+    """Only the opt-in lane is VS Code LM only; today's retry is untouched."""
+    harness = _harness(
+        monkeypatch,
+        tmp_path,
+        adapter_id="claude_cli",
+        terminal_state="finalize_failed",
+        terminal_error="x",
+    )
+
+    result = harness.manager.retry_finalization(_REQUEST_ID, _TASK_ID)
+
+    assert result["ok"] is True, result
+    assert harness.transitions[0][1]["host_lane"] is False
+
+
+@pytest.mark.parametrize(
+    "adapter_id", sorted(worker_workspace._VSCODE_LM_IN_PROCESS_ADAPTERS)
+)
+def test_every_adapter_run_validations_admits_keeps_the_host_lane(
+    monkeypatch, tmp_path, adapter_id
+):
+    """The up-front check reads the very allowlist ``run_validations`` enforces."""
+    harness = _harness(monkeypatch, tmp_path, adapter_id=adapter_id)
+
+    result = harness.manager.retry_finalization(
+        _REQUEST_ID, _TASK_ID, validation_lane="manager_host"
+    )
+
+    assert result["ok"] is True, result
+    assert harness.transitions[0][1]["host_lane"] is True
+    assert harness.finalized[0]["metadata"]["validation_lane"] == "manager_host"
+
 
 # --------------------------------------------------------------------------- #
 # the seal is the authority for re-measuring these exact bytes

@@ -13061,6 +13061,11 @@ class ProcessManager:
         candidate seal retryable and forces the declared validations into the
         host lane, so an environment-only sandbox failure is settled by
         measurement rather than by reading candidate output (NF-2026-01030).
+        The host lane is VS Code LM only: its backend is the editor-hosted one,
+        which ``run_validations`` never lends to a native CLI adapter, so a
+        request whose adapter is outside that allowlist is refused up front
+        with ``validation_lane_forbidden_for_adapter:<adapter>`` before any
+        event write or card transition (NF-2026-01645).
         """
         if not core.writes_allowed():
             return {
@@ -13095,6 +13100,23 @@ class ProcessManager:
                     "request_id": request_id,
                     "task_id": task_id,
                     "error": "request_task_identity_mismatch",
+                }
+            # NF-2026-01645: the host lane forces the editor-hosted backend,
+            # which ``run_validations`` refuses for every adapter outside its own
+            # allowlist so a native CLI route never sheds its OS sandbox. That
+            # same allowlist is asked here, before the retry is authorized, so a
+            # CLI request is refused with its request and card unchanged rather
+            # than after the card already moved to blocked/finalize_failed.
+            adapter_id = str(latest.get("adapter_id") or "").strip()
+            if (
+                host_lane
+                and adapter_id not in _worker_workspace._VSCODE_LM_IN_PROCESS_ADAPTERS
+            ):
+                return {
+                    "ok": False,
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "error": f"validation_lane_forbidden_for_adapter:{adapter_id}"[:200],
                 }
             latest_state = str(latest.get("state") or "")
             latest_error = str(latest.get("error") or "")

@@ -4878,6 +4878,12 @@ def aiworkhub_agent_retry_finalization(
     the validation route forced to the host backend. All pass -> the normal
     finalize path to review_ready; any failure -> ``validation_failed`` again,
     now with host receipts. The lane is never derived from candidate output.
+    ``manager_host`` applies only to VS Code LM adapters: its forced backend is
+    the editor-hosted one, which never runs a native CLI route outside its OS
+    sandbox, so a request from a CLI adapter (e.g. ``claude_cli``) is refused up
+    front with ``validation_lane_forbidden_for_adapter:<adapter>`` before any
+    event write or card transition, leaving the request and card unchanged
+    (NF-2026-01645).
     """
 
     return process_launcher.default_manager().retry_finalization(

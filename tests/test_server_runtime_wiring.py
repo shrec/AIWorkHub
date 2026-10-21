@@ -156,6 +156,17 @@ def test_server_retry_finalization_passes_the_manager_host_lane_through(monkeypa
     ]
 
 
+def test_server_retry_finalization_documents_the_host_lane_as_vscode_lm_only():
+    """NF-2026-01645: the tool description names the up-front CLI refusal."""
+    doc = " ".join((server.aiworkhub_agent_retry_finalization.__doc__ or "").split())
+
+    assert "applies only to VS Code LM adapters" in doc
+    assert (
+        "refused up front with ``validation_lane_forbidden_for_adapter:<adapter>``"
+        in doc
+    )
+
+
 def test_read_only_mcp_does_not_take_task_reconciler_ownership(
     tmp_path, monkeypatch
 ):
