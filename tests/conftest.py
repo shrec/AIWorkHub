@@ -88,6 +88,15 @@ def pinned_toolchain_authority_secret(monkeypatch):
     monkeypatch.setenv("AIWORKHUB_TOOLCHAIN_AUTHORITY_HMAC_KEY", "hex:" + "11" * 32)
 
 
+@pytest.fixture(autouse=True, scope="session")
+def pinned_workforce_cap():
+    # Core-derived cap made tests host-dependent (3-core CI: concurrency_limit_reached).
+    # Session scope: a test's monkeypatch.undo() restores this pin instead of dropping it.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("AIWORKHUB_MAX_PROCESSES", "8")
+        yield
+
+
 def is_beneath(path: os.PathLike[str] | str, root: os.PathLike[str] | str) -> bool:
     try:
         Path(path).resolve().relative_to(Path(root).resolve())
