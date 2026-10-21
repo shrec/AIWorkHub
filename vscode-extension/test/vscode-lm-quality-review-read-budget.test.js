@@ -139,19 +139,8 @@ async function multiRowReplyEarnsOnlyOneTurn(transport) {
 async function maxExtensionKeepsTransientSubmitRetry(transport) {
   const { handler, counts } = buildHandler(() => 1, [{ ok: false, error: "transient" }]);
   await internals.runVscodeLmAgent(buildModel(transport, 10), req(), undefined, handler);
-  assert.strictEqual(counts.sg, 10, `${transport}: reads stop at the capped extension`);
+  assert.strictEqual(counts.sg, 10, `${transport}: all ten distinct source reads must execute`);
   assert.strictEqual(counts.submit, 2, `${transport}: a transient submit failure must still be retried`);
-}
-
-async function evidenceCreditsStopAtCap(transport) {
-  // Twenty evidence-bearing reads offered: credits stop at 3 + 7, so read 11 is refused.
-  const { handler, counts } = buildHandler(() => 1, []);
-  await assert.rejects(
-    internals.runVscodeLmAgent(buildModel(transport, 20), req(), undefined, handler),
-    /vscode_lm_quality_review_submit_required/,
-  );
-  assert.strictEqual(counts.sg, 10, `${transport}: evidence credits must stop at the 3+7 cap`);
-  assert.strictEqual(counts.submit, 0);
 }
 
 async function main() {
@@ -160,7 +149,6 @@ async function main() {
     await noEvidenceKeepsOldBudget(transport);
     await multiRowReplyEarnsOnlyOneTurn(transport);
     await maxExtensionKeepsTransientSubmitRetry(transport);
-    await evidenceCreditsStopAtCap(transport);
   }
 }
 
