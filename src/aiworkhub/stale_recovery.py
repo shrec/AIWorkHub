@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
-from aiworkhub import completion_inbox, launch_queue_persist, task_store
+from aiworkhub import completion_inbox, launch_queue_persist, process_launcher, task_store
 
 
 ACTION_RANK = {
@@ -12,12 +13,40 @@ ACTION_RANK = {
     "escalate": 3,
 }
 
+ORPHAN_CLAIM_GRACE_LEASES = 3
+
+
+def _claim_age_seconds(claimed_at: str | None, now: datetime) -> float | None:
+    """Age of a claim, or None when the timestamp cannot prove one."""
+    try:
+        claimed = datetime.fromisoformat(str(claimed_at or ""))
+    except ValueError:
+        return None
+    if claimed.tzinfo is None:
+        return None
+    return (now - claimed).total_seconds()
+
 
 def reconcile_dead_processing_claim(
     *, root: str, task_id: str, request_id: str, claim_epoch: int,
     process_status: dict[str, Any], actor: str,
+    claimed_at: str | None = None, now: datetime | None = None,
 ) -> tuple[bool, str]:
     """Validate exact authenticated launcher evidence and reconcile its claim."""
+    if process_status.get("state") == "not_found":
+        grace = ORPHAN_CLAIM_GRACE_LEASES * process_launcher.heartbeat_lease_seconds()
+        age = _claim_age_seconds(claimed_at, now or datetime.now(timezone.utc))
+        if age is None or age < grace:
+            return False, "orphan_claim_within_grace"
+        return task_store.reconcile_dead_processing_claim(
+            root, task_id, request_id=request_id, claim_epoch=claim_epoch,
+            terminal_evidence={
+                "state": "not_found", "reason": "launch_never_started",
+                "request_id": request_id, "task_id": task_id,
+                "claimed_at": claimed_at, "grace_seconds": grace,
+            },
+            actor=actor,
+        )
     if not process_status.get("ok"):
         return False, "process_evidence_missing_or_unauthenticated"
     if str(process_status.get("request_id") or "") != request_id:

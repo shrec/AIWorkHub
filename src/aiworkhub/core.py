@@ -9969,7 +9969,7 @@ def reconcile_dead_processing_task(
     ok, state = stale_recovery.reconcile_dead_processing_claim(
         root=str(repo_root()), task_id=task_id, request_id=request_id,
         claim_epoch=claim_epoch, process_status=status,
-        actor=_verified_manager_actor(),
+        actor=_verified_manager_actor(), claimed_at=str(card.get("claimed_at") or ""),
     )
     if not ok:
         return _canonical_result(ok=False, returncode=1, stderr=f"reconcile_failed:{state}", command=command)

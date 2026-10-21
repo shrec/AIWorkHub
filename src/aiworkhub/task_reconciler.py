@@ -53,6 +53,8 @@ from . import repository_state
 from . import roadmap_store
 from . import runtime_generation
 from . import sdlc_sync
+from . import stale_recovery
+from . import task_store
 from ._version import __version__ as SERVER_VERSION
 from .platform_io import (
     DIRECTORY_DESCRIPTOR_BACKEND_NONE,
@@ -549,6 +551,8 @@ def run_scan(
     # mgr.launch, which performs the same claim_start_exact compare-and-update
     # internally before spawning the worker.
     transient_retry_relaunch = _scan_transient_retry_relaunch(mgr)
+    # Releases only claims whose launch left no process record at all, after their grace.
+    orphan_claim_release = _scan_orphan_claims(mgr)
     # Sequential by design, not fanned out across cores: the SDLC case store is
     # a single-writer SQLite file and the pass is bounded per scan, so parallel
     # writers would only contend for the same write lock.
@@ -570,6 +574,7 @@ def run_scan(
         "wave_goal_bindings": wave_goal_bindings,
         "wave_completion": wave_completion,
         "transient_retry_relaunch": transient_retry_relaunch,
+        "orphan_claim_release": orphan_claim_release,
         "sdlc_sync": sdlc,
     }
 
@@ -892,6 +897,48 @@ def _scan_transient_retry_relaunch(mgr: process_launcher.ProcessManager) -> dict
         return dependency_autolaunch.reconcile_transient_due(
             Path(mgr.repo).resolve(), launch=_launch, capacity=TRANSIENT_RETRY_RELAUNCH_CAPACITY,
         )
+    except Exception as exc:  # noqa: BLE001 -- never block worker reconcile
+        return {"ok": False, "state": "skipped", "reason": f"{type(exc).__name__}"[:80]}
+
+
+def _scan_orphan_claims(mgr: process_launcher.ProcessManager) -> dict[str, Any]:
+    """Release processing claims whose launch never produced a process record.
+
+    Only a request the launcher reports ``not_found`` is offered to
+    ``stale_recovery``, which refuses a claim still inside its grace window and
+    otherwise releases it through the claim_epoch/launch_request_id
+    compare-and-swap in ``task_store``. A card with a live or terminal process
+    record is never touched. A failure here is isolated like every other pass:
+    recorded, and never blocking worker finalization.
+    """
+    try:
+        root = Path(mgr.repo).resolve()
+        claimed = [
+            row["task_id"]
+            for row in task_store.list_tasks(root, status="processing")
+            if row.get("worker_status") == "claimed"
+        ]
+        cards = task_store.get_tasks(root, claimed)
+        released: list[str] = []
+        within_grace: list[str] = []
+        for task_id in sorted(cards):
+            card = cards[task_id]
+            request_id = str(card.get("launch_request_id") or "")
+            if not request_id:
+                continue
+            status = mgr.status(request_id)
+            if status.get("state") != "not_found":
+                continue
+            ok, state = stale_recovery.reconcile_dead_processing_claim(
+                root=str(root), task_id=task_id, request_id=request_id,
+                claim_epoch=card.get("claim_epoch"), process_status=status,
+                actor="task_reconciler", claimed_at=str(card.get("claimed_at") or ""),
+            )
+            if ok:
+                released.append(task_id)
+            elif state == "orphan_claim_within_grace":
+                within_grace.append(task_id)
+        return {"released": released, "within_grace": within_grace}
     except Exception as exc:  # noqa: BLE001 -- never block worker reconcile
         return {"ok": False, "state": "skipped", "reason": f"{type(exc).__name__}"[:80]}
 
