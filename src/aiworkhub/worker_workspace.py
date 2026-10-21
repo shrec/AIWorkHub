@@ -12135,7 +12135,43 @@ def _validation_pythonpath_readonly_dirs(components: tuple[str, ...]) -> tuple[P
     return tuple(rows)
 
 
-_VALIDATION_LONG_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9_./+=-]{32,}")
+_VALIDATION_SECRET_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:sk-[A-Za-z0-9_-]{16,}"
+    r"|gh[pousr]_[A-Za-z0-9]{20,}"
+    r"|github_pat_[A-Za-z0-9_]{20,}"
+    r"|xox[abprs]-[A-Za-z0-9-]{10,}"
+    r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*)"
+    # An AKIA key is fixed-length and below the 32-char fallback, so a glued
+    # preceding character must not shield it: it stays outside the lookbehind.
+    r"|AKIA[0-9A-Z]{16}"
+    r"|(?i:\b(?:bearer|basic)\s+[^\s'\"]+)"
+    r"|(?<![A-Za-z0-9])[0-9a-fA-F]{32,}(?![A-Za-z0-9])"
+    r"|(?<![A-Za-z0-9])([A-Za-z0-9])\1{31,}(?![A-Za-z0-9])"
+)
+_VALIDATION_SECRET_CASED_RE = re.compile(
+    r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{32,}={0,2}(?![A-Za-z0-9+/_-])"
+)
+_VALIDATION_PATH_SEGMENT_RE = re.compile(r"[a-z][a-z0-9_-]{2,}")
+
+
+def _redact_validation_secrets(text: str) -> str:
+    def _mixed_class(match: re.Match[str]) -> str:
+        token = match.group(0)
+        segments = token.split("/")
+        if len(segments) > 1 and sum(
+            1 for s in segments if _VALIDATION_PATH_SEGMENT_RE.fullmatch(s)
+        ) >= 2:
+            return token
+        if (
+            any(c.isupper() for c in token)
+            and any(c.islower() for c in token)
+            and any(c.isdigit() for c in token)
+        ):
+            return "<redacted>"
+        return token
+
+    text = _VALIDATION_SECRET_RE.sub("<redacted>", text)
+    return _VALIDATION_SECRET_CASED_RE.sub(_mixed_class, text)
 
 
 def _validation_failure_class(record: Mapping[str, Any]) -> str:
@@ -12198,7 +12234,7 @@ def _validation_failure_receipt(record: Mapping[str, Any]) -> dict[str, Any] | N
         character for character in raw_diagnostic
         if character in "\n\r\t" or ord(character) >= 0x20
     )
-    diagnostic = _VALIDATION_LONG_TOKEN_RE.sub("<redacted>", diagnostic)[-2048:]
+    diagnostic = _redact_validation_secrets(diagnostic)[-2048:]
     identity = {
         "failure_class": failure_class,
         "argv": exact_argv,
