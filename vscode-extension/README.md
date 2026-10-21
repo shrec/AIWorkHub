@@ -25,7 +25,7 @@ port, expose a LAN service or require an AIWorkHub cloud account.
 
 ## What's new in 0.12.62
 
-- A reviewer that automatic review already accepted no longer ends as `finalize_failed` when its own process finishes later, a NeedFix closes itself from a `Resolves:` line anywhere in a commit message or when the detector that filed it sees the signal clear (and reopens if it comes back), Claude Code gets a hook that steers raw grep, whole-file reads and raw edits of indexed source to Source Graph and semantic edit, and the default worker cap follows the machine's core count.
+- A reviewer that automatic review already accepted no longer ends as `finalize_failed` when its own process finishes later, a NeedFix closes itself from a `Resolves:` line anywhere in a commit message or when the detector that filed it sees the signal clear (and reopens if it comes back), Claude Code gets a hook that steers raw grep, whole-file reads and raw edits of indexed source to Source Graph and semantic edit, a failed validation now shows the worker its reason code and paths instead of redacting every long word, and the default worker cap follows the machine's core count.
 
 ## Review automation
 

@@ -20,6 +20,7 @@ noted by package/extension version and release tag.
 - A detector-filed NeedFix resolves when its signal clears (an SDLC control band back at ok, a clean janitor step or worktree sweep) and the same row reopens with a new generation when the signal recurs, instead of being swallowed as a dedupe hit.
 - The default worker cap is the observed core count minus two, clamped to 1..32, instead of a literal 4 (NF-2026-01080).
 - Tool-policy tests skip sandbox-only failures only on measured capability (NF-2026-01627); the accepted-eval corpus tests seed and rebuild once per module, about 14 min to 77 s (NF-2026-01624).
+- The validation failure receipt redacts only secret-shaped tokens (sk-, gh*_/github_pat_, xox*-, AKIA, JWT, Bearer/Basic, long hex and mixed-class base64), so reason codes, pytest node ids and paths in `diagnostic_tail` reach the reworking worker (NF-2026-01075).
 
 ## [0.12.61] - 2026-10-20
 

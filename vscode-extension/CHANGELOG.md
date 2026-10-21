@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Bundled runtime 0.12.62: a reviewer that automatic review already accepted stays accepted when its supervisor finalizes late (NF-2026-01625); a vanished review worktree is named in the terminal diagnostic (NF-2026-01621); `Resolves:` lines in any commit paragraph resolve their NeedFix (NF-2026-01613); detector-filed NeedFixes resolve when their signal clears and reopen when it recurs; the default worker cap follows the core count (NF-2026-01080).
+- Bundled runtime 0.12.62: a reviewer that automatic review already accepted stays accepted when its supervisor finalizes late (NF-2026-01625); a vanished review worktree is named in the terminal diagnostic (NF-2026-01621); `Resolves:` lines in any commit paragraph resolve their NeedFix (NF-2026-01613); detector-filed NeedFixes resolve when their signal clears and reopen when it recurs; the default worker cap follows the core count (NF-2026-01080); validation failure receipts redact only secret-shaped tokens and keep reason codes and paths (NF-2026-01075).
 
 ### Added
 
