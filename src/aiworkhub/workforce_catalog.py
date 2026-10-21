@@ -971,16 +971,24 @@ def catalog_launch_identities(
     (``glm-5.3`` under the ``glm-5.2`` seed) is published exactly as the
     discovered row is, so the runner the catalog names for that route is the
     runner that pins its model; any other leaf is published under its own
-    adapter only.  A catalog row wins any runner collision.
+    adapter only.  A catalog row wins any runner collision with a
+    ``models.json`` route.  Between two catalog rows that build the same runner
+    an enabled row beats a disabled one (a row without an ``enabled`` flag counts
+    as enabled, as ``validate_catalog`` defaults it); rows of equal eligibility
+    keep the first-row rule.
     """
 
     workers = load_catalog(repo_root)["workers"]
     identities: dict[str, dict[str, Any]] = {}
     for worker in workers:
         declared = str(worker.get("adapter_id") or "")
+        enabled = bool(worker.get("enabled", True))
         for adapter in (declared, *_WORKER_ADAPTER_FALLBACKS.get(declared, ())):
             runner = execution_runner(str(worker.get("worker_id") or ""), adapter)
-            identities.setdefault(runner, {**dict(worker), "route_adapter_id": adapter})
+            held = identities.get(runner)
+            if held is not None and (bool(held.get("enabled", True)) or not enabled):
+                continue
+            identities[runner] = {**dict(worker), "route_adapter_id": adapter}
     for runner, route in _model_settings_launch_identities(repo_root, workers).items():
         identities.setdefault(runner, route)
     return identities
@@ -1034,6 +1042,18 @@ def resolve_launch_route(
     entry = identities.get(resolved or "", {})
     pinned = str(model or "").strip()
     declared = bool(pinned) and catalog_declares_route(repo_root, adapter_id, pinned)
+    route_adapter = str(adapter_id or "").strip()
+    model_matching_runners = (
+        sorted(
+            name
+            for name, row in identities.items()
+            if name != resolved
+            and str(row.get("route_adapter_id") or row.get("adapter_id") or "") == route_adapter
+            and str(row.get("model") or "") == pinned
+        )
+        if pinned and str(entry.get("model") or "") != pinned
+        else []
+    )
     if resolved is None:
         identity_state = "unknown_runner"
     elif resolved != str(runner or "").strip():
@@ -1051,6 +1071,7 @@ def resolve_launch_route(
         "identity_state": identity_state,
         "model_declared_by_catalog": declared,
         "catalog_runners": sorted(identities),
+        "model_matching_runners": model_matching_runners,
     }
 
 

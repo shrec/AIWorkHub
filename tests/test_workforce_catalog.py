@@ -3617,6 +3617,113 @@ def test_catalog_launch_identities_ignore_unreadable_models_json(
         assert workforce_catalog.catalog_launch_identities(root) == baseline
 
 
+_COLLIDING_RUNNER = "opencode_muse-spark-1.3"
+
+
+def _colliding_rows(*, first_enabled: bool, second_enabled: bool) -> list[dict]:
+    return [
+        {
+            "worker_id": "opencode-muse-spark-1.3",
+            "adapter_id": "opencode_cli",
+            "model": "opencode-go/muse-spark-1.3-contributor",
+            "enabled": first_enabled,
+        },
+        {
+            "worker_id": "opencode_muse-spark-1.3",
+            "adapter_id": "opencode_cli",
+            "model": "opencode/muse-spark-1.3",
+            "enabled": second_enabled,
+        },
+    ]
+
+
+def _patch_catalog_rows(monkeypatch, rows: list[dict]) -> None:
+    monkeypatch.setattr(
+        workforce_catalog, "load_catalog", lambda _root: {"workers": rows}
+    )
+
+
+def test_catalog_launch_identities_enabled_row_beats_a_disabled_row_listed_first(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = _root(tmp_path)
+    rows = _colliding_rows(first_enabled=False, second_enabled=True)
+    assert {
+        workforce_catalog.execution_runner(row["worker_id"], row["adapter_id"])
+        for row in rows
+    } == {_COLLIDING_RUNNER}
+    _patch_catalog_rows(monkeypatch, rows)
+
+    published = workforce_catalog.catalog_launch_identities(root)[_COLLIDING_RUNNER]
+
+    assert published["worker_id"] == "opencode_muse-spark-1.3"
+    assert published["model"] == "opencode/muse-spark-1.3"
+
+
+def test_catalog_launch_identities_enabled_row_listed_first_still_wins(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = _root(tmp_path)
+    _patch_catalog_rows(
+        monkeypatch, _colliding_rows(first_enabled=True, second_enabled=False)
+    )
+
+    published = workforce_catalog.catalog_launch_identities(root)[_COLLIDING_RUNNER]
+
+    assert published["worker_id"] == "opencode-muse-spark-1.3"
+
+
+def test_catalog_launch_identities_equal_eligibility_keeps_the_first_row(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = _root(tmp_path)
+    for enabled in (True, False):
+        _patch_catalog_rows(
+            monkeypatch, _colliding_rows(first_enabled=enabled, second_enabled=enabled)
+        )
+
+        published = workforce_catalog.catalog_launch_identities(root)[
+            _COLLIDING_RUNNER
+        ]
+
+        assert published["worker_id"] == "opencode-muse-spark-1.3", enabled
+
+
+def test_resolve_launch_route_lists_runners_whose_row_has_the_pinned_model(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = _root(tmp_path)
+    rows = [
+        {
+            "worker_id": "opencode-alpha",
+            "adapter_id": "opencode_cli",
+            "model": "opencode-go/alpha",
+            "enabled": True,
+        },
+        {
+            "worker_id": "opencode-beta",
+            "adapter_id": "opencode_cli",
+            "model": "opencode/beta",
+            "enabled": True,
+        },
+    ]
+    _patch_catalog_rows(monkeypatch, rows)
+
+    route = workforce_catalog.resolve_launch_route(
+        root, "opencode_alpha", "opencode_cli", "opencode/beta"
+    )
+
+    assert route["resolved_runner"] == "opencode_alpha"
+    assert route["identity_state"] == "resolved"
+    assert route["model_matching_runners"] == ["opencode_beta"]
+
+    for pinned in ("opencode-go/alpha", "", "opencode/unknown"):
+        other = workforce_catalog.resolve_launch_route(
+            root, "opencode_alpha", "opencode_cli", pinned
+        )
+        assert other["model_matching_runners"] == [], pinned
+
+
 def test_launch_derivation_pins_the_model_of_an_enabled_models_json_route(
     tmp_path: Path,
 ) -> None:
