@@ -132,7 +132,10 @@ def _remove_legacy_pretool_hooks(payload: dict[str, Any]) -> bool:
     return changed
 
 
-def _atomic_write_bytes(path: Path, data: bytes) -> None:
+def _atomic_write(path: Path, data: bytes | str) -> None:
+    if isinstance(data, str):
+        # The newline translation a text-mode handle performs, made explicit.
+        data = data.replace("\n", os.linesep).encode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
@@ -144,11 +147,6 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    # The newline translation a text-mode handle performs, made explicit.
-    _atomic_write_bytes(path, text.replace("\n", os.linesep).encode("utf-8"))
 
 
 def _tool_guard_hook_rows() -> tuple[tuple[str, dict[str, Any]], ...]:
@@ -223,7 +221,7 @@ def _install_tool_guard_script(root: Path) -> bool:
             return False
     except OSError:
         pass
-    _atomic_write_bytes(path, source)
+    _atomic_write(path, source)
     return True
 
 
@@ -298,7 +296,7 @@ def apply_repository_guards(repo_root: Path, *, read_only: bool = False) -> dict
         if not plan["ok"]:
             raise ProviderGuardError(f"provider_policy_invalid:{provider}:{plan['reason']}")
         if plan["planned_text"] != owner:
-            _atomic_write_text(path, str(plan["planned_text"]))
+            _atomic_write(path, str(plan["planned_text"]))
             changed.append(provider)
 
     claude_path = (root / CLAUDE_SETTINGS_REL).resolve()
@@ -306,7 +304,7 @@ def apply_repository_guards(repo_root: Path, *, read_only: bool = False) -> dict
         raise ProviderGuardError("claude_settings_path_escape")
     settings, settings_changed = _merge_claude_settings(claude_path, read_only=read_only)
     if settings_changed or not claude_path.exists():
-        _atomic_write_text(
+        _atomic_write(
             claude_path,
             json.dumps(settings, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         )
@@ -350,7 +348,7 @@ def apply_workspace_guards(workspace_root: Path, *, read_only: bool) -> dict[str
     settings, settings_changed = _merge_claude_settings(claude_path, read_only=read_only)
     changed: list[str] = []
     if settings_changed or not claude_path.exists():
-        _atomic_write_text(
+        _atomic_write(
             claude_path,
             json.dumps(settings, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         )
