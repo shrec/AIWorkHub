@@ -2577,6 +2577,46 @@ def test_create_request_rejects_required_outputs_before_publication(
     assert not (home / ".aiworkhub_vscode_lm_worker.json").exists()
     assert not (root / "requests" / repo_id / f"{request_id}.json").exists()
 
+
+def test_normalize_required_outputs_accepts_glob_covered_output() -> None:
+    assert vscode_lm_bridge._normalize_required_outputs(
+        ["tests/test_x.py", "./src/app.py", "docs/guide/a.md"],
+        ["src/app.py", "tests/test_*.py", "docs/**/*.md"],
+    ) == ["docs/guide/a.md", "src/app.py", "tests/test_x.py"]
+
+
+@pytest.mark.parametrize(
+    "required_outputs",
+    [
+        ["tests/helper.py"],
+        ["tests/sub/test_x.py"],
+        ["src/other.py"],
+        ["tests/test_*.py"],
+        ["tests/../secret.py"],
+    ],
+    ids=["no-glob-match", "glob-single-segment", "no-exact-no-glob", "glob-literal", "traversal"],
+)
+def test_normalize_required_outputs_refuses_uncovered_with_glob_allowed(
+    required_outputs: list[str],
+) -> None:
+    with pytest.raises(
+        vscode_lm_bridge.BridgeError,
+        match="bridge_required_outputs_invalid",
+    ):
+        vscode_lm_bridge._normalize_required_outputs(
+            required_outputs, ["src/app.py", "tests/test_*.py"]
+        )
+
+
+def test_normalize_required_outputs_refuses_duplicate_glob_covered_output() -> None:
+    with pytest.raises(
+        vscode_lm_bridge.BridgeError,
+        match="bridge_required_outputs_invalid",
+    ):
+        vscode_lm_bridge._normalize_required_outputs(
+            ["tests/test_x.py", "./tests/test_x.py"], ["tests/test_*.py"]
+        )
+
 def test_read_only_review_allows_explicit_empty_required_outputs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

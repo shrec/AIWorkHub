@@ -673,19 +673,33 @@ def _normalize_required_outputs(
         raise BridgeError("bridge_required_outputs_invalid")
     if not required_outputs:
         return []
+    from .worker_workspace import WorkspaceError, _matches as allowed_writes_match
+
     allowed_exact: set[str] = set()
+    allowed_globs: list[str] = []
     for item in allowed:
         if any(marker in item for marker in ("*", "?", "[")):
+            allowed_globs.append(item)
             continue
         try:
             allowed_exact.add(_normalize_required_output_path(item))
         except BridgeError:
             continue
+
+    def covered_by_glob(path: str) -> bool:
+        for pattern in allowed_globs:
+            try:
+                if allowed_writes_match(path, [pattern]):
+                    return True
+            except WorkspaceError:
+                continue
+        return False
+
     seen: set[str] = set()
     normalized: list[str] = []
     for item in required_outputs:
         path = _normalize_required_output_path(item)
-        if path in seen or path not in allowed_exact:
+        if path in seen or not (path in allowed_exact or covered_by_glob(path)):
             raise BridgeError("bridge_required_outputs_invalid")
         seen.add(path)
         normalized.append(path)
