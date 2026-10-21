@@ -77,6 +77,8 @@ node_modules/
 /docs/LIVE_BUG_BACKLOG_2026-08-03.md
 /docs/*_2026-*.md
 /docs/research/*_2026-*.md
+/docs/research/TDQS _ *
+/docs/research/tdqs_*
 /docs/PONYTAIL_CAPABILITY_REVIEW.md
 /docs/reviews/*
 !/docs/reviews/README.md
