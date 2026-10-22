@@ -276,7 +276,11 @@ _REQUEST_SCOPED_ENV_KEYS = (
     "TMP",
     "TEMP",
     "TMPDIR",
+    "XDG_DATA_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
     "XDG_STATE_HOME",
+    "BUN_TMPDIR",
     "CODEX_HOME",
 )
 

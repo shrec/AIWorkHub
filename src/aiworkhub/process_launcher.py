@@ -593,14 +593,23 @@ def worker_launch_env(
         # on the repository volume before the worker can even start.
         home_root = Path(home).resolve()
         if adapter_id == runtime_adapters.GROK_KILO_ADAPTER:
-            state_home = home_root / ".local" / "state"
-            if Path(home).absolute() != home_root or state_home.resolve() != state_home:
+            if Path(home).absolute() != home_root:
                 raise WorkspaceError("appcontainer_xdg_state_escaped_isolated_home")
-            state_home.mkdir(mode=0o700, parents=True, exist_ok=True)
-            resolved_state_home = state_home.resolve(strict=True)
-            if resolved_state_home != state_home:
-                raise WorkspaceError("appcontainer_xdg_state_escaped_isolated_home")
-            env["XDG_STATE_HOME"] = str(resolved_state_home)
+            xdg_homes = (
+                ("XDG_DATA_HOME", home_root / ".local" / "share"),
+                ("XDG_CONFIG_HOME", home_root / ".config"),
+                ("XDG_CACHE_HOME", home_root / ".cache"),
+                ("XDG_STATE_HOME", home_root / ".local" / "state"),
+            )
+            for _key, xdg_home in xdg_homes:
+                if xdg_home.resolve() != xdg_home:
+                    raise WorkspaceError("appcontainer_xdg_state_escaped_isolated_home")
+            for key, xdg_home in xdg_homes:
+                xdg_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+                resolved_xdg_home = xdg_home.resolve(strict=True)
+                if resolved_xdg_home != xdg_home:
+                    raise WorkspaceError("appcontainer_xdg_state_escaped_isolated_home")
+                env[key] = str(resolved_xdg_home)
         appcontainer_tmp = home_root / "tmp"
         appcontainer_tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
         resolved_tmp = appcontainer_tmp.resolve(strict=True)
@@ -609,7 +618,10 @@ def worker_launch_env(
         temp_env = dict.fromkeys(runtime_adapters.WORKER_TEMP_ENV_VARS, str(resolved_tmp))
     for key in runtime_adapters.WORKER_TEMP_ENV_VARS:
         env[key] = temp_env[key]
-    if adapter_id == runtime_adapters.OPENCODE_CLI_ADAPTER and sandbox_backend == "windows_appcontainer":
+    if adapter_id in (
+        runtime_adapters.OPENCODE_CLI_ADAPTER,
+        runtime_adapters.GROK_KILO_ADAPTER,
+    ) and sandbox_backend == "windows_appcontainer":
         env["BUN_TMPDIR"] = env["TMPDIR"]
     env.update(
         worker_validation_affordance_env(
