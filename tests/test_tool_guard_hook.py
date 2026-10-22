@@ -486,3 +486,111 @@ def test_repository_guards_install_the_hook_once(tmp_path: Path) -> None:
     assert HOOK_REL.as_posix() in first["changed"]
     assert second["changed"] == []
     assert (tmp_path / HOOK_REL).read_bytes() == HOOK_SOURCE.read_bytes()
+
+
+_MIRROR_A = "a" * 32
+_MIRROR_B = "b" * 32
+_CANONICAL = "src/aiworkhub/core.py"
+
+
+def _mirror_rel(request_id: str, rest: str = _CANONICAL) -> str:
+    return f".aiworkhub/runtime/worktrees/{request_id}/worktree/{rest}"
+
+
+def _worktree_of(request_id: str) -> str:
+    return f".aiworkhub/runtime/worktrees/{request_id}/worktree"
+
+
+def _plant_mirror(repo: Path, request_id: str, rest: str = _CANONICAL) -> None:
+    path = repo / _mirror_rel(request_id, rest)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes((repo / rest).read_bytes())
+
+
+def test_a_worktree_mirror_of_indexed_source_matches_the_canonical_decision(
+    repo: Path,
+) -> None:
+    mirror = _mirror_rel(_MIRROR_A)
+    _plant_mirror(repo, _MIRROR_A)
+    cases: list[tuple[str, Any, str, Any]] = [
+        ("Bash", f"cat {mirror}", "Bash", f"cat {_CANONICAL}"),
+        ("Bash", f"grep foo {mirror}", "Bash", f"grep foo {_CANONICAL}"),
+        ("Bash", f"sed -n '1,50p' {mirror}", "Bash", f"sed -n '1,50p' {_CANONICAL}"),
+        (
+            "Bash",
+            f"python -c \"open('{mirror}').read()\"",
+            "Bash",
+            f"python -c \"open('{_CANONICAL}').read()\"",
+        ),
+        ("Read", {"file_path": mirror}, "Read", {"file_path": _CANONICAL}),
+        (
+            "Read",
+            {"file_path": mirror, "limit": 2000},
+            "Read",
+            {"file_path": _CANONICAL, "limit": 2000},
+        ),
+        (
+            "Read",
+            {"file_path": mirror, "offset": 1, "limit": 400},
+            "Read",
+            {"file_path": _CANONICAL, "offset": 1, "limit": 400},
+        ),
+        (
+            "Read",
+            {"file_path": _mirror_rel(_MIRROR_A, "notes.txt")},
+            "Read",
+            {"file_path": "notes.txt"},
+        ),
+    ]
+    for tool, spec, canon_tool, canon_spec in cases:
+        mirrored = tool_guard_hook.decide(tool, _tool_input(repo, spec), repo)
+        canonical = tool_guard_hook.decide(canon_tool, _tool_input(repo, canon_spec), repo)
+        mirrored_rule = None if mirrored is None else mirrored[0]
+        canonical_rule = None if canonical is None else canonical[0]
+        assert mirrored_rule == canonical_rule, (spec, mirrored, canonical)
+
+
+def test_a_non_mirror_runtime_path_and_a_non_hex_id_stay_unindexed(repo: Path) -> None:
+    commands = [
+        "cat .aiworkhub/runtime/process_logs/x.json",
+        f"grep foo .aiworkhub/runtime/worktrees/{'g' * 32}/worktree/{_CANONICAL}",
+        f"cat .aiworkhub/runtime/worktrees/{'a' * 31}/worktree/{_CANONICAL}",
+        f"cat .aiworkhub/runtime/worktrees/{'A' * 32}/worktree/{_CANONICAL}",
+        f"sed -n '1,20p' .aiworkhub/runtime/worktrees/{_MIRROR_A}/checkout/{_CANONICAL}",
+    ]
+    for command in commands:
+        assert tool_guard_hook.decide("Bash", {"command": command}, repo) is None, command
+
+
+def test_git_diff_of_a_worktree_stays_allowed(repo: Path) -> None:
+    command = f"git --no-optional-locks -C {_worktree_of(_MIRROR_A)} diff"
+    assert tool_guard_hook.decide("Bash", {"command": command}, repo) is None
+
+
+def test_a_mirror_deny_names_the_worktree_of_the_path_actually_denied(repo: Path) -> None:
+    left = _mirror_rel(_MIRROR_A)
+    right = _mirror_rel(_MIRROR_B)
+    left_worktree = _worktree_of(_MIRROR_A)
+    right_worktree = _worktree_of(_MIRROR_B)
+    _plant_mirror(repo, _MIRROR_A)
+    _plant_mirror(repo, _MIRROR_B)
+    # A prior deny of the other mirror must not leak into this reason.
+    other = tool_guard_hook.decide("Bash", {"command": f"cat {right}"}, repo)
+    assert other is not None and right_worktree in other[1] and left_worktree not in other[1]
+
+    for command in (f"cat {left} {right}", f"bash -c \"cat {left} {right}\""):
+        verdict = tool_guard_hook.decide("Bash", {"command": command}, repo)
+        assert verdict is not None, command
+        rule, reason = verdict
+        assert rule == "R3", command
+        assert f"git --no-optional-locks -C {left_worktree} diff" in reason
+        assert f"Source Graph body/slice on {_CANONICAL}" in reason
+        assert "offset+limit<=400" in reason
+        assert right_worktree not in reason, command
+        assert len(reason) <= tool_guard_hook.REASON_MAX_CHARS
+        assert reason.startswith("AIWorkHub tool guard R3:")
+
+    read = tool_guard_hook.decide("Read", _tool_input(repo, {"file_path": left}), repo)
+    assert read is not None and read[0] == "R5"
+    assert f"git --no-optional-locks -C {left_worktree} diff" in read[1]
+    assert right_worktree not in read[1]

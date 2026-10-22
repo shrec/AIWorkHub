@@ -44,6 +44,8 @@ REMINDER_MAX_BYTES = 800
 EXCLUDED_DIRS = frozenset(
     {".git", ".aiworkhub", ".venv", "node_modules", "third_party", "dist", "build"}
 )
+_WORKTREE_MIRROR_HEAD = (".aiworkhub", "runtime", "worktrees")
+_WORKTREE_ID = re.compile(r"[0-9a-f]{32}")
 INDEXED_SUFFIXES = frozenset(
     {
         ".py", ".pyi", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".md", ".toml",
@@ -589,6 +591,23 @@ def _expand(text: str) -> str:
     return _VARIABLE.sub(lambda match: os.environ.get(match.group(1), match.group(0)), text)
 
 
+def _worktree_mirror(parts: tuple[str, ...]) -> tuple[tuple[str, ...], str] | None:
+    """HEAD + 32 lowercase hex + ``worktree`` + rest, else None.
+
+    ``rest`` is classified like the canonical path. The worktree path is taken
+    from these parts so a deny reason never reads a shared cell.
+    """
+    head = _WORKTREE_MIRROR_HEAD
+    if (
+        len(parts) < len(head) + 2
+        or parts[: len(head)] != head
+        or parts[len(head) + 1] != "worktree"
+        or _WORKTREE_ID.fullmatch(parts[len(head)]) is None
+    ):
+        return None
+    return parts[len(head) + 2 :], "/".join(parts[: len(head) + 2])
+
+
 class _Context:
     """Resolve operands against the repository root and the current directory."""
 
@@ -640,8 +659,13 @@ class _Context:
 
     def indexed_rel(self, path: Path | None) -> str | None:
         parts = self.inside(path)
-        if parts is None or any(part.lower() in EXCLUDED_DIRS for part in parts):
+        if parts is None:
             return None
+        mirror = _worktree_mirror(parts)
+        classified = mirror[0] if mirror is not None else parts
+        if any(part.lower() in EXCLUDED_DIRS for part in classified):
+            return None
+        # Keep the denied path so the reason derives this worktree, not a cell.
         return "/".join(parts) or "."
 
     def indexed_file(self, operand: str, glob: bool = True) -> str | None:
@@ -1326,7 +1350,27 @@ def _quoted(value: str, limit: int) -> str:
     return '"' + _clip(body, max(3, limit - 2)) + '"'
 
 
+def _mirror_reason(rule: str, rest: str, worktree: str) -> str:
+    route = "git --no-optional-locks -C " + worktree + " diff"
+    template = (
+        "AIWorkHub tool guard "
+        + rule
+        + ": worktree mirror of indexed source {target} is denied. Use "
+        + route
+        + " and Source Graph body/slice on {target}, then Read offset+limit<=400."
+        + _UNINDEXED
+    )
+    slots = template.count("{target}")
+    share = max(16, (REASON_MAX_CHARS - len(template.format(target=""))) // max(1, slots))
+    text = template.format(target=_clip(_CONTROL.sub(" ", rest).strip() or ".", share))
+    return _clip(text, REASON_MAX_CHARS)
+
+
 def _reason(rule: str, target: str, detail: str) -> str:
+    mirror = _worktree_mirror(tuple(target.split("/")))
+    if mirror is not None:
+        rest, worktree = mirror
+        return _mirror_reason(rule, "/".join(rest) or ".", worktree)
     template = _REASONS[rule] + _UNINDEXED
     ratio = detail if rule == "R7" else ""
     pattern = _CONTROL.sub(" ", detail).strip() if rule == "R1" else ""
