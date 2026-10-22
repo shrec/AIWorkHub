@@ -6,7 +6,14 @@ const os = require("os");
 const path = require("path");
 const { spawnSync } = require("child_process");
 
-const sideEffectProbe = spawnSync(process.execPath, ["-e", `
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-vsix-gate-"));
+const file = path.join(dir, "stderr.txt");
+let sideEffectProbe;
+let sideEffectStderr = "";
+try {
+  const fd = fs.openSync(file, "w");
+  try {
+    sideEffectProbe = spawnSync(process.execPath, ["-e", `
   const fs = require("fs");
   const path = require("path");
   const originalRead = fs.readFileSync;
@@ -30,14 +37,21 @@ const sideEffectProbe = spawnSync(process.execPath, ["-e", `
   };
   require("./package-vsix");
 `], {
-  cwd: __dirname,
-  encoding: "utf8",
-  shell: false,
-});
+      cwd: __dirname,
+      stdio: ["ignore", "ignore", fd],
+      shell: false,
+    });
+  } finally {
+    fs.closeSync(fd);
+  }
+  sideEffectStderr = fs.readFileSync(file, "utf8");
+} finally {
+  fs.rmSync(dir, { recursive: true, force: true });
+}
 assert.strictEqual(
   sideEffectProbe.status,
   0,
-  `requiring the packager must not read package.json or build artifacts: ${sideEffectProbe.stderr}`,
+  `requiring the packager must not read package.json or build artifacts: ${sideEffectStderr}`,
 );
 
 const {

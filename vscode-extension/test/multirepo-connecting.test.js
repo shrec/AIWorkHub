@@ -222,6 +222,11 @@ async function snapshotFor(host) {
     const queue = behaviors.get(spawnRecord.repoRoot) || [];
     return new FakeChild(spawnRecord, queue.shift() || "live");
   };
+  // NF-2026-01648: a real pipe-stdio child livelocks libuv inside the AppContainer sandbox.
+  const originalExecFile = childProcess.execFile;
+  childProcess.execFile = (_cmd, _args, _options, callback) => { setImmediate(() => callback(null, "", "")); };
+  const originalSpawnSync = childProcess.spawnSync;
+  childProcess.spawnSync = () => ({ status: 0, stdout: "", stderr: "", signal: null });
 
   const hostA = loadExtensionHost(repoA);
   const hostB = loadExtensionHost(repoB);
@@ -301,6 +306,8 @@ async function snapshotFor(host) {
     await hostB.extension.deactivate();
   } finally {
     childProcess.spawn = originalSpawn;
+    childProcess.execFile = originalExecFile;
+    childProcess.spawnSync = originalSpawnSync;
   }
   console.log("AIWorkHub two-repo Connecting regression passed");
 })().catch((err) => {
