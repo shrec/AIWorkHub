@@ -163,13 +163,7 @@ def test_explicit_field_description_beats_args():
 # --- (d) live server.mcp contract --------------------------------------------
 
 
-_DOCSTRING_PENDING = frozenset(
-    {
-        "aiworkhub_dashboard_needfix_archive",
-        "aiworkhub_dashboard_needfix_purge",
-        "aiworkhub_dashboard_needfix_restore",
-    }
-)  # owned by TDQS_DASHBOARD_TOOL_DOCSTRINGS; shrink only
+_DOCSTRING_PENDING: frozenset[str] = frozenset()  # shrink only; every published tool documents itself
 
 
 def test_server_tools_publish_args_free_descriptions_and_match_sdk():

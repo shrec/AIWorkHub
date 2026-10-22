@@ -2101,7 +2101,10 @@ def _model_policy_view(
 
 
 def settings_view() -> dict[str, Any]:
-    """READ-ONLY: repository-local feature switches and capabilities."""
+    """READ-ONLY: return repository feature switches, Source Graph policy, retention policy, and model routing policy.
+
+    Use this to inspect current settings and their revision numbers before calling aiworkhub_dashboard_settings_update, aiworkhub_dashboard_model_settings_update, or aiworkhub_dashboard_source_graph_settings_update. For queue state or task counts use aiworkhub_dashboard_snapshot instead. Reads repository configuration files and status views without mutating durable state or starting background services.
+    """
     try:
         root = core.repo_root()
         result = feature_settings.load(root)
@@ -2131,7 +2134,14 @@ def settings_view() -> dict[str, Any]:
 def source_graph_settings_update_view(
     language_changes: dict[str, bool], expected_revision: int,
 ) -> dict[str, Any]:
-    """USER WRITE: atomically update repository Source Graph languages."""
+    """USER WRITE: atomically update per-language Source Graph indexing switches for the active repository.
+
+    Use this to enable or disable individual languages in the Source Graph ignore policy; use aiworkhub_dashboard_settings to read the current policy and revision first, or aiworkhub_dashboard_settings_update to toggle the top-level source_graph feature switch. Enforces optimistic locking against expected_revision, atomically rewrites the ignore policy file, and triggers an immediate Source Graph refresh when the feature is enabled.
+
+    Args:
+        language_changes: non-empty dict[str, bool] mapping registered language IDs to True (enabled) or False (disabled).
+        expected_revision: int revision from the current Source Graph policy view; mismatches fail closed.
+    """
 
     root = core.repo_root()
     try:
@@ -2156,7 +2166,14 @@ def source_graph_settings_update_view(
 
 
 def settings_update_view(changes: dict[str, bool], expected_revision: int) -> dict[str, Any]:
-    """USER WRITE: atomically update bounded repository feature switches."""
+    """USER WRITE: atomically update repository-local feature switches with optimistic revision locking.
+
+    Use this to toggle top-level repository features such as source_graph or context_graph; use aiworkhub_dashboard_settings to inspect current switches and revision first, or aiworkhub_dashboard_source_graph_settings_update and aiworkhub_dashboard_model_settings_update for language or model routing switches. Atomically persists feature settings when expected_revision matches, starts or stops Source Graph when toggled, and initializes the context graph schema when enabled.
+
+    Args:
+        changes: non-empty dict[str, bool] mapping valid feature keys to their desired boolean enabled state.
+        expected_revision: int current feature settings revision required for optimistic concurrency; mismatches fail closed.
+    """
     root = core.repo_root()
     try:
         result = feature_settings.update(
@@ -2193,7 +2210,17 @@ def model_settings_update_view(
     adapter: str | None = None,
     model: str | None = None,
 ) -> dict[str, Any]:
-    """USER WRITE: update one repository-local model routing switch."""
+    """USER WRITE: update one provider, adapter, or model routing switch for the active repository.
+
+    Use this to enable or disable a provider, transport adapter, or specific model leaf; call aiworkhub_dashboard_settings first to read model_policy and its current revision, or use aiworkhub_dashboard_settings_update for repository feature flags. Acquires the model-settings lock, verifies expected_revision, and atomically persists the updated routing configuration.
+
+    Args:
+        provider: str non-empty provider identifier to configure.
+        enabled: bool True to enable or False to disable the selected provider, adapter, or model route.
+        expected_revision: int current model_settings revision; mismatches fail closed and report current_revision.
+        adapter: optional str transport adapter identifier (default None); required when model is specified.
+        model: optional str model identifier under adapter (default None); omit to toggle the provider or adapter switch.
+    """
     root = core.repo_root()
     try:
         result = model_settings.update(
@@ -2367,22 +2394,15 @@ def snapshot_view(
     previous_snapshot: Mapping[str, Any] | None = None,
     known_contract_sha256: str = "",
 ) -> dict[str, Any]:
-    """READ-ONLY: canonical dashboard snapshot for the native Webview.
+    """READ-ONLY: build the canonical dashboard queue, health, and storage snapshot for the active repository.
 
-    Calls ``dashboard.build_snapshot()`` -- the SAME builder the HTTP
-    dashboard's ``/api/snapshot`` route uses -- and returns the identical
-    ``status_counts``, ``tasks``, ``row_counts``, ``summaries``,
-    ``cost_usage``, ``agent_processes``, and ``warnings`` shape the existing
-    dashboard.js already renders when ``full=true``. The default manager call
-    is a bounded operational summary; the native Webview requests full mode
-    explicitly. Adds no second SQLite/taskctl read.
+    Use the default compact mode for manager queue summaries and status counts, or full=True for the native Webview payload; use aiworkhub_dashboard_health for a cheap connection check or aiworkhub_dashboard_task_detail for one task card. Reads canonical SQLite state and cached storage telemetry without mutating tasks or launching processes.
 
-    The summary keeps the newest rows of each ``storage_usage`` quarantine
-    array, each with its ``total_count``/``returned_count``/``truncated``;
-    ``full=true`` returns every row. Pass the ``contract_sha256`` of the
-    ``manager_identity`` you already hold as ``known_contract_sha256`` to leave
-    the unchanged contract prose out of the summary: a stale digest gets the
-    prose back and no digest keeps it. ``full=true`` ignores the digest.
+    Args:
+        full: bool (default False); True returns full task, process, and ledger collections, False returns the compact summary.
+        previous: optional Mapping[str, Any] (default None) prior snapshot dict reused for incremental diffing.
+        previous_snapshot: optional Mapping[str, Any] (default None) alias for previous when previous is omitted.
+        known_contract_sha256: str (default "") manager contract SHA-256 digest; omits unchanged contract prose in compact mode.
     """
     started = time.perf_counter()
     _debug_trace("snapshot.begin")
@@ -2531,14 +2551,12 @@ def snapshot_view(
 
 
 def task_detail_view(task_id: str) -> dict[str, Any]:
-    """READ-ONLY: canonical detail for exactly one bounded task_id.
+    """READ-ONLY: return the canonical detail, events, and validation evidence for one task card.
 
-    Validates ``task_id`` with the identical pattern the HTTP dashboard's
-    ``/api/task`` route enforces (``dashboard._TASK_ID_RE``) BEFORE ever
-    calling the provider, then calls ``dashboard.build_task_detail()`` -- the
-    same canonical builder ``/api/task`` uses. An invalid or unknown task_id
-    returns a bounded ``ok: false`` object; this never raises and never
-    reaches a write path.
+    Use this to inspect a specific task's contract, history, and attempt receipts; use aiworkhub_dashboard_snapshot for queue-wide status counts or aiworkhub_dashboard_task_live_output for live process stdout and stderr. Validates task_id format before querying read-only task storage and never mutates state.
+
+    Args:
+        task_id: str canonical task identifier matching the repository task ID pattern.
     """
     candidate = str(task_id or "").strip()
     if not dashboard._TASK_ID_RE.fullmatch(candidate):
@@ -2565,10 +2583,12 @@ def task_detail_view(task_id: str) -> dict[str, Any]:
 
 
 def memory_view(limit: int = 100) -> dict[str, Any]:
-    """READ-ONLY: newest canonical AI Memory rows for this repository.
+    """READ-ONLY: list the newest canonical AI Memory entries for the active repository.
 
-    The database path is resolved exclusively through the repo-bound storage
-    registry and opened read-only. Browsing never mutates access counters.
+    Use this to browse stored AI Memory rows and lifecycle statuses in the dashboard; use aiworkhub_dashboard_sessions or aiworkhub_dashboard_kb to browse session transcripts or Knowledge Base entries. Opens the repository memory SQLite database in read-only mode and never increments access counters or mutates rows.
+
+    Args:
+        limit: int (default 100, clamped to 1..500) maximum number of newest memory entries to return.
     """
 
     try:
@@ -2645,11 +2665,12 @@ def memory_view(limit: int = 100) -> dict[str, Any]:
 
 
 def session_view(limit: int = 100) -> dict[str, Any]:
-    """READ-ONLY: newest canonical Session Manager transcript evidence.
+    """READ-ONLY: list the newest Session Manager transcript documents for the active repository.
 
-    Session continuity is represented by the canonical transcript graph's
-    bounded ``documents`` rows. The dashboard never opens a legacy session
-    file and never mutates access/checkpoint state while browsing.
+    Use this to inspect recent session continuity documents in the dashboard; use aiworkhub_dashboard_memory for durable AI Memory keys or aiworkhub_dashboard_kb for Knowledge Base articles. Opens the canonical transcript SQLite database read-only and never modifies session checkpoints or access state.
+
+    Args:
+        limit: int (default 100, clamped to 1..500) maximum number of newest transcript documents to return.
     """
 
     try:
@@ -2701,7 +2722,13 @@ def session_view(limit: int = 100) -> dict[str, Any]:
 
 
 def kb_view(limit: int = 100) -> dict[str, Any]:
-    """READ-ONLY: newest canonical repository KB entries."""
+    """READ-ONLY: list the newest canonical Knowledge Base entries for the active repository.
+
+    Use this to browse repository Knowledge Base articles, categories, and tags in the dashboard; use aiworkhub_dashboard_memory for key-value AI Memory rows or aiworkhub_dashboard_sessions for session transcripts. Opens the KB SQLite store in read-only mode without mutating entries or usage counters.
+
+    Args:
+        limit: int (default 100, clamped to 1..500) maximum number of newest KB entries to return.
+    """
 
     try:
         safe_limit = max(1, min(int(limit), MAX_KB_ROWS))
@@ -2765,24 +2792,9 @@ def kb_view(limit: int = 100) -> dict[str, Any]:
 
 
 def skills_view() -> dict[str, Any]:
-    """READ-ONLY: measured skill selection and injection coverage.
+    """READ-ONLY: return measured skill lifecycle counts and selection or injection coverage for the active repository.
 
-    Counts only, never rows: skill totals by lifecycle, how many ACTIVE records
-    a card context could actually reach, how many recorded receipts selected and
-    how many injected, and the consecutive run of newest receipts that injected
-    nothing. The streak is the point. A skill system whose every selection comes
-    back empty is indistinguishable from a quiet one until something counts the
-    run, and this repository measured 24 empty selections in a row while every
-    surface reported a well-formed, bounded, entirely healthy-looking packet.
-
-    An absent or unreadable store reports ``measured: False`` with a reason. It
-    does NOT report zeros -- "no skills were injected" and "nobody looked" are
-    different facts and a panel that renders them identically is the defect.
-
-    A failure ABOVE the projection answers in that identical shape. Dropping
-    ``schema_id``/``unavailable_reason``/``skills``/``selection`` here would
-    make a renderer branch on WHICH layer failed before it could tell whether
-    the surface was measured, and a missing block reads as an absent one.
+    Use this to audit active skill reachability, selection receipts, and consecutive empty-injection streaks; use aiworkhub_dashboard_settings for feature switches or aiworkhub_dashboard_snapshot for task queue state. Reads the skill registry and receipt store without mutating state, and reports measured=False with an explicit reason when the store is absent or unreadable.
     """
     try:
         root = core.repo_root()
@@ -2864,12 +2876,12 @@ def _storage_preview_items_folded(response: Mapping[str, Any]) -> dict[str, Any]
 
 
 def storage_retention_preview_view(include_items: bool = False) -> dict[str, Any]:
-    """READ-ONLY: repository-scoped cleanup counts, bytes and top candidates.
+    """READ-ONLY: preview reclaimable worker worktrees, stale Git registrations, and storage quarantine batches.
 
-    Counts, byte lines and ``preview_digest`` are always exact; the candidate
-    list is the ten largest by ``size_bytes`` and the protected, pinned,
-    registration and quarantine-batch lists fold to their counts.
-    ``include_items=true`` returns the fresh preview and batch list in full.
+    Use this first to obtain a fresh preview_digest before calling aiworkhub_dashboard_storage_quarantine or aiworkhub_dashboard_storage_registration_prune; use aiworkhub_dashboard_terminal_log_retention_preview or aiworkhub_dashboard_task_retention_preview for terminal logs or archived tasks. Scans worktree storage read-only without moving or deleting files.
+
+    Args:
+        include_items: bool (default False); False folds lists to counts and top-ten candidates, True returns full candidate and batch lists.
     """
     try:
         root = core.repo_root()
@@ -2886,7 +2898,14 @@ def storage_retention_preview_view(include_items: bool = False) -> dict[str, Any
 
 
 def storage_quarantine_view(preview_digest: str, confirm: bool = False) -> dict[str, Any]:
-    """USER WRITE: quarantine one still-current preview after explicit consent."""
+    """USER WRITE: move reclaimable worker worktrees matching a current preview into a reversible quarantine batch.
+
+    Call aiworkhub_dashboard_storage_retention_preview first to obtain preview_digest; use aiworkhub_dashboard_storage_restore to undo a batch or aiworkhub_dashboard_storage_purge to delete an expired batch. Requires confirm=True and an unchanged preview_digest, moves eligible worktree directories into a signed quarantine batch with an undo deadline, writes an audit entry, and invalidates cached storage telemetry.
+
+    Args:
+        preview_digest: str SHA-256 digest from aiworkhub_dashboard_storage_retention_preview; stale digests fail closed.
+        confirm: bool (default False); must be True to execute the quarantine move.
+    """
     try:
         root = core.repo_root()
         response = storage_retention.quarantine(
@@ -2906,7 +2925,14 @@ def storage_registration_prune_view(
     preview_digest: str,
     confirm: bool = False,
 ) -> dict[str, Any]:
-    """USER WRITE: prune exact stale AIWorkHub Git registrations."""
+    """USER WRITE: prune stale AIWorkHub Git worktree registrations verified against a current preview digest.
+
+    Call aiworkhub_dashboard_storage_retention_preview first to obtain the registration preview_digest; use aiworkhub_dashboard_storage_quarantine to move physical worktree directories instead. Requires confirm=True, refuses when foreign stale registrations exist or the digest drifted, runs git worktree prune, records an audit entry, and invalidates storage telemetry.
+
+    Args:
+        preview_digest: str registration preview digest from aiworkhub_dashboard_storage_retention_preview; stale digests fail closed.
+        confirm: bool (default False); must be True to prune stale Git worktree registrations.
+    """
     try:
         root = core.repo_root()
         response = storage_retention.prune_stale_registrations(
@@ -2923,7 +2949,14 @@ def storage_registration_prune_view(
 
 
 def storage_restore_view(batch_id: str, confirm: bool = False) -> dict[str, Any]:
-    """USER WRITE: restore one repository-owned quarantine batch."""
+    """USER WRITE: restore a quarantined worker-worktree batch back to the repository worktree root.
+
+    Use this to roll back a quarantine batch listed by aiworkhub_dashboard_storage_retention_preview; use aiworkhub_dashboard_storage_purge to permanently delete an expired batch instead. Requires confirm=True, moves quarantined directories back without overwriting existing paths, reinstates Git worktree registrations when applicable, updates the batch manifest and audit log, and invalidates storage telemetry.
+
+    Args:
+        batch_id: str identifier of the storage quarantine batch to restore.
+        confirm: bool (default False); must be True to execute the restore.
+    """
     try:
         root = core.repo_root()
         response = storage_retention.restore(
@@ -2940,7 +2973,14 @@ def storage_restore_view(batch_id: str, confirm: bool = False) -> dict[str, Any]
 
 
 def storage_purge_view(batch_id: str, confirm: bool = False) -> dict[str, Any]:
-    """USER WRITE: permanently purge one expired quarantine batch."""
+    """DESTRUCTIVE: permanently delete one expired worker-worktree quarantine batch from disk.
+
+    Inspect batches with aiworkhub_dashboard_storage_retention_preview first, or use aiworkhub_dashboard_storage_restore to recover a batch while its undo window is still active. Requires confirm=True and an authenticated batch whose restore deadline has passed, permanently removes the batch directory, records an audit event, and invalidates storage telemetry.
+
+    Args:
+        batch_id: str identifier of the expired storage quarantine batch to permanently remove.
+        confirm: bool (default False); must be True to permanently purge the batch.
+    """
     try:
         root = core.repo_root()
         response = storage_retention.purge(
@@ -2960,7 +3000,14 @@ def terminal_log_retention_preview_view(
     cursor: int = 0,
     limit: int = terminal_log_retention.DEFAULT_PREVIEW_LIMIT,
 ) -> dict[str, Any]:
-    """READ-ONLY: terminal-run log preview; the canonical ledger is excluded."""
+    """READ-ONLY: preview reclaimable terminal process log files, protected logs, and terminal-log quarantine batches.
+
+    Call this before aiworkhub_dashboard_terminal_log_quarantine to inspect candidates and obtain preview_digest, or call aiworkhub_dashboard_terminal_log_usage_backfill when runs lack usage receipts; use aiworkhub_dashboard_storage_retention_preview for worktrees. Scans process logs read-only while excluding the canonical request ledger.
+
+    Args:
+        cursor: int (default 0, clamped to >=0) zero-based pagination offset into candidate and protected log lists.
+        limit: int (default 50, clamped to 1..200) maximum number of candidate and protected entries returned per page.
+    """
     try:
         root = core.repo_root()
         response = terminal_log_retention.preview(root, cursor=cursor, limit=limit)
@@ -2973,7 +3020,14 @@ def terminal_log_retention_preview_view(
 
 
 def terminal_log_quarantine_view(preview_digest: str, confirm: bool = False) -> dict[str, Any]:
-    """USER WRITE: move one exact set of terminal files to repo-local quarantine."""
+    """USER WRITE: move eligible terminal process log files matching a current preview into repo-local quarantine.
+
+    Call aiworkhub_dashboard_terminal_log_retention_preview first to obtain preview_digest, and run aiworkhub_dashboard_terminal_log_usage_backfill first if uncaptured usage receipts protect logs; use aiworkhub_dashboard_terminal_log_restore to undo. Requires confirm=True and a matching preview_digest, moves eligible log files into a quarantine batch with an undo window, records an audit event, and invalidates storage telemetry.
+
+    Args:
+        preview_digest: str SHA-256 digest from aiworkhub_dashboard_terminal_log_retention_preview; stale digests fail closed.
+        confirm: bool (default False); must be True to move terminal log files to quarantine.
+    """
     try:
         root = core.repo_root()
         response = terminal_log_retention.quarantine(
@@ -2988,7 +3042,13 @@ def terminal_log_quarantine_view(preview_digest: str, confirm: bool = False) -> 
 
 
 def terminal_log_usage_backfill_view(confirm: bool = False) -> dict[str, Any]:
-    """USER WRITE: recover canonical usage receipts before log retention."""
+    """USER WRITE: idempotently backfill missing provider usage receipts from retained terminal stdout logs.
+
+    Use this before aiworkhub_dashboard_terminal_log_quarantine when terminal runs remain protected due to missing usage capture receipts; use aiworkhub_dashboard_terminal_log_retention_preview to inspect protected runs first. Requires confirm=True, parses retained worker stdout logs without estimating tokens or cost, appends canonical usage capture events to the task store, and leaves already-captured runs unchanged.
+
+    Args:
+        confirm: bool (default False); must be True to scan terminal logs and append usage capture events.
+    """
 
     try:
         root = core.repo_root()
@@ -3003,7 +3063,14 @@ def terminal_log_usage_backfill_view(confirm: bool = False) -> dict[str, Any]:
 
 
 def terminal_log_restore_view(batch_id: str, confirm: bool = False) -> dict[str, Any]:
-    """USER WRITE: restore one terminal-log quarantine batch without overwrite."""
+    """USER WRITE: restore one terminal-log quarantine batch back into the repository process log directory.
+
+    Use this to recover quarantined log files from a batch listed in aiworkhub_dashboard_terminal_log_retention_preview; use aiworkhub_dashboard_terminal_log_purge to permanently delete an expired batch instead. Requires confirm=True, moves quarantined files back without overwriting existing files, updates the batch manifest and audit trail, and invalidates storage telemetry.
+
+    Args:
+        batch_id: str identifier of the terminal-log quarantine batch to restore.
+        confirm: bool (default False); must be True to restore the quarantined log files.
+    """
     try:
         root = core.repo_root()
         response = terminal_log_retention.restore(
@@ -3018,7 +3085,14 @@ def terminal_log_restore_view(batch_id: str, confirm: bool = False) -> dict[str,
 
 
 def terminal_log_purge_view(batch_id: str, confirm: bool = False) -> dict[str, Any]:
-    """USER WRITE: permanently purge one expired terminal-log batch."""
+    """DESTRUCTIVE: permanently delete one expired terminal-log quarantine batch from disk.
+
+    Inspect quarantine batches with aiworkhub_dashboard_terminal_log_retention_preview first, or use aiworkhub_dashboard_terminal_log_restore to recover files while the undo window is active. Requires confirm=True and an expired restore deadline on manual batches, permanently removes the batch directory, appends an audit record, and invalidates storage telemetry.
+
+    Args:
+        batch_id: str identifier of the expired terminal-log quarantine batch to permanently delete.
+        confirm: bool (default False); must be True to permanently purge the batch.
+    """
     try:
         root = core.repo_root()
         response = terminal_log_retention.purge(
@@ -3033,7 +3107,13 @@ def terminal_log_purge_view(batch_id: str, confirm: bool = False) -> dict[str, A
 
 
 def task_retention_preview_view(older_than_days: int | None = None) -> dict[str, Any]:
-    """READ-ONLY: old archived-task cleanup preview and undo batches."""
+    """READ-ONLY: preview archived task rows eligible for retention quarantine and list existing undo batches.
+
+    Call this before aiworkhub_dashboard_task_quarantine to inspect candidate counts and obtain preview_digest; use aiworkhub_dashboard_task_archive to archive a single live task first. Opens the task database read-only, excludes archived tasks with pending or inflight callbacks, and never mutates task rows.
+
+    Args:
+        older_than_days: optional int age cutoff in days (default None uses repository retention policy, valid range 7..3650).
+    """
     try:
         root = core.repo_root()
         response = task_retention.preview(root, older_than_days=older_than_days)
@@ -3046,7 +3126,15 @@ def task_retention_preview_view(older_than_days: int | None = None) -> dict[str,
 
 
 def task_archive_view(task_id: str, reason: str = "", confirm: bool = False) -> dict[str, Any]:
-    """USER WRITE: archive one non-active task without deleting its evidence."""
+    """USER WRITE: archive one non-active task card in the canonical task store without deleting its evidence.
+
+    Use this to hide a finished, blocked, pending, or superseded task from the active queue; use aiworkhub_dashboard_task_restore to unarchive it or aiworkhub_dashboard_task_quarantine to move aged archived tasks into a retention batch. Requires confirm=True, refuses processing or review tasks, sets archived_at with an audit event, and invalidates storage telemetry.
+
+    Args:
+        task_id: str canonical task identifier to archive.
+        reason: str optional audit note (default "", truncated to 200 chars) recorded on the archive event.
+        confirm: bool (default False); must be True to archive the task.
+    """
     candidate = str(task_id or "")
     if confirm is not True:
         response = {"ok": False, "error": "task_archive_confirmation_required"}
@@ -3077,7 +3165,15 @@ def task_archive_view(task_id: str, reason: str = "", confirm: bool = False) -> 
 
 
 def task_restore_view(task_id: str, reason: str = "", confirm: bool = False) -> dict[str, Any]:
-    """USER WRITE: restore one still-live archived task to its prior state."""
+    """USER WRITE: restore one archived task card in the canonical task store back to its prior status.
+
+    Use this to unarchive a single task archived via aiworkhub_dashboard_task_archive; use aiworkhub_dashboard_task_quarantine_restore instead if the task was already moved into a task-retention quarantine batch. Requires confirm=True, clears the archived overlay on the task row, records an audit event, and invalidates storage telemetry.
+
+    Args:
+        task_id: str canonical task identifier of the archived task to restore.
+        reason: str optional audit note (default "", truncated to 200 chars) recorded on the restore event.
+        confirm: bool (default False); must be True to restore the archived task.
+    """
     candidate = str(task_id or "")
     if confirm is not True:
         response = {"ok": False, "error": "task_restore_confirmation_required"}
@@ -3104,19 +3200,14 @@ def task_restore_view(task_id: str, reason: str = "", confirm: bool = False) -> 
 def task_restart_view(
     task_id: str, reason: str = "", confirm: bool = False
 ) -> dict[str, Any]:
-    """USER WRITE: restart one task through its existing canonical recovery path, then launch.
+    """USER WRITE: recover one restartable task through its canonical state transition path and launch a worker.
 
-    Dispatches on the card's measured ``task_store.canonical_status``: pending
-    launches directly; blocked recovers through ``core.retry_terminal_task``
-    (operational terminal substatus) or ``core.recover_blocked_rework``
-    (anything else); processing measures the claimed launch's liveness the
-    same way ``aiworkhub_agent_task_status`` does and either refuses
-    (still alive) or settles the dead claim through
-    ``core.reconcile_dead_processing_task`` and recovers the resulting blocked
-    card the same way before launching. review/finished/archived/
-    superseded refuse as ``not_restartable:<status>``. Every write stays
-    inside the core SQLite transaction each reused call already owns; this
-    module takes no lock of its own.
+    Use this for operator-initiated retry and launch of a pending, blocked, or dead-processing task; use aiworkhub_dashboard_task_detail to inspect the card first. Requires confirm=True, refuses live processing or review/finished/archived/superseded tasks, reconciles dead claims or blocked state in the task store, spawns a worker via process_launcher, and invalidates storage telemetry.
+
+    Args:
+        task_id: str canonical task identifier to recover and launch.
+        reason: str optional recovery note (default "" uses "owner manual restart", truncated to 200 chars).
+        confirm: bool (default False); must be True to recover and launch the task.
     """
     candidate = str(task_id or "")
     bounded_reason = str(reason or "").strip()[:200] or "owner manual restart"
@@ -3316,7 +3407,18 @@ def needfix_list_view(
     limit: int = 100,
     offset: int = 0,
 ) -> dict[str, Any]:
-    """READ-ONLY: bounded canonical NeedFix inbox for the native Webview."""
+    """READ-ONLY: list bounded NeedFix inbox items with optional status, kind, severity, and archive filters.
+
+    Use this to browse or page through NeedFix summaries; use aiworkhub_dashboard_needfix_detail to fetch full description, scope, provenance, and audit events for one item, or aiworkhub_dashboard_roadmap_list for Roadmap items. Reads the NeedFix SQLite store without mutating state.
+
+    Args:
+        status: optional str lifecycle status filter (default None returns all active statuses).
+        kind: optional str classification kind filter (default None).
+        severity: optional str severity filter such as critical, high, medium, low, or info (default None).
+        include_archived: bool (default False); True includes archived NeedFix rows.
+        limit: int (default 100, clamped to 1..200) maximum rows to return.
+        offset: int (default 0, clamped to >=0) zero-based pagination offset.
+    """
     bounded_limit = max(1, min(int(limit or 100), 200))
     bounded_offset = max(0, int(offset or 0))
     try:
@@ -3342,7 +3444,14 @@ def needfix_list_view(
 
 
 def needfix_detail_view(needfix_id: str, event_limit: int = 50) -> dict[str, Any]:
-    """READ-ONLY: one bounded NeedFix row plus its audit events."""
+    """READ-ONLY: return one NeedFix item with full detail fields and its bounded audit event history.
+
+    Use this to inspect a single NeedFix item's description, scope, evidence, and lifecycle events; use aiworkhub_dashboard_needfix_list to browse summary rows or aiworkhub_dashboard_needfix_convert_preview to preview task conversion. Validates needfix_id format and reads the NeedFix store without mutating state.
+
+    Args:
+        needfix_id: str canonical NeedFix identifier (for example NF-2026-00001).
+        event_limit: int (default 50, clamped to 1..100) maximum number of audit events to return.
+    """
     candidate = str(needfix_id or "")
     if not needfix_store.NF_ID_RE.fullmatch(candidate):
         return _needfix_response(
@@ -3406,7 +3515,16 @@ def roadmap_list_view(
     limit: int = 100,
     offset: int = 0,
 ) -> dict[str, Any]:
-    """READ-ONLY: bounded Roadmap outcomes joined to Task-DAG truth."""
+    """READ-ONLY: list bounded Roadmap outcomes joined with task-DAG progress and wave projection.
+
+    Use this to browse Roadmap items, status counts, and wave readiness; use aiworkhub_dashboard_roadmap_detail for one Roadmap item's full detail and audit events, or aiworkhub_dashboard_needfix_list for NeedFix items. Reads the Roadmap and task stores without mutating state.
+
+    Args:
+        status: optional str status filter (default None returns all non-archived statuses).
+        include_archived: bool (default False); True includes archived Roadmap items.
+        limit: int (default 100, clamped to 1..200) maximum number of items to return.
+        offset: int (default 0, clamped to >=0) zero-based pagination offset applied to the filtered list.
+    """
     try:
         snapshot = core.roadmap_snapshot(
             limit=max(1, min(int(limit or 100), 200)),
@@ -3435,7 +3553,14 @@ def roadmap_list_view(
 
 
 def roadmap_detail_view(roadmap_id: str, event_limit: int = 50) -> dict[str, Any]:
-    """READ-ONLY: one Roadmap outcome with task/dependency and audit truth."""
+    """READ-ONLY: return one Roadmap outcome with linked task progress, wave projection, and audit events.
+
+    Use this to inspect a specific Roadmap item's dependencies, linked tasks, and event log; use aiworkhub_dashboard_roadmap_list to browse all Roadmap items. Validates roadmap_id format and reads the Roadmap and task stores without mutating state.
+
+    Args:
+        roadmap_id: str canonical Roadmap identifier (for example RM-2026-00001).
+        event_limit: int (default 50, clamped to 1..100) maximum number of audit events to return.
+    """
     candidate = str(roadmap_id or "")
     if not roadmap_store.ROADMAP_ID_RE.fullmatch(candidate):
         return _needfix_response(
@@ -3475,17 +3600,18 @@ def needfix_capture_view(
     tags: list[str] | None = None,
     include_item: bool = False,
 ) -> dict[str, Any]:
-    """USER WRITE: explicitly capture one dashboard-authored proposal.
+    """USER WRITE: capture a new NeedFix item or deduplicate against an existing live row.
 
-    ``kind`` vocabulary: bug, feature, improvement, idea, technical_debt,
-    optimization, benchmark_gap, documentation_drift, security_risk,
-    investigation, roadmap_candidate, refactor, security, docs, other
-    (synonyms gap/defect/performance/design/dead_code/test_coverage are
-    normalised and reported as ``kind_normalized``). ``severity``: critical,
-    high, medium, low, info. Replies with a capture receipt: id, dedupe_key,
-    status, created_at, provenance.origin, ``deduped``/``existing_id`` when
-    the dedupe key matched a live row, plus the compact item
-    (``include_item=True`` adds description/scope/provenance/evidence).
+    Use this to record a new bug or proposal in the NeedFix inbox; use aiworkhub_dashboard_needfix_update to edit an existing item or aiworkhub_dashboard_needfix_transition to change status. Requires an open write gate, normalizes kind synonyms, persists the new or deduplicated row in the NeedFix store, and returns a capture receipt.
+
+    Args:
+        title: str summary title (truncated to 240 chars).
+        description: str problem details (truncated to 8000 chars).
+        kind: str classification kind (default "other"; synonyms are normalized).
+        severity: str level: critical, high, medium, low, or info (default "medium").
+        scope: optional str affected scope text (default None, up to 4000 chars).
+        tags: optional list[str] labels (default None, up to 24 tags).
+        include_item: bool (default False); True adds full detail fields to item.
     """
     if not core.writes_allowed():
         return _needfix_response(
@@ -3537,11 +3663,20 @@ def needfix_update_view(
     readiness_score: int | None = None,
     include_item: bool = False,
 ) -> dict[str, Any]:
-    """USER WRITE: update bounded mutable NeedFix fields.
+    """USER WRITE: update mutable content and classification fields on an existing NeedFix item.
 
-    Replies with a delta receipt: id, status, fields_changed, updated_at,
-    evidence_keys_after, event_id, kind_normalized, plus the compact item
-    (``include_item=True`` adds description/scope/provenance/evidence).
+    Use this to edit title, description, scope, kind, severity, tags, or readiness_score; use aiworkhub_dashboard_needfix_transition to change lifecycle status or aiworkhub_dashboard_needfix_capture to create a new item. Requires an open write gate, persists field changes and an audit event in the NeedFix store, and returns a delta receipt.
+
+    Args:
+        needfix_id: str canonical NeedFix identifier to update.
+        title: optional str replacement title (default None leaves unchanged, up to 240 chars).
+        description: optional str replacement description (default None, up to 8000 chars).
+        scope: optional str replacement scope text (default None, up to 4000 chars).
+        kind: optional str replacement kind (default None; synonyms normalized).
+        severity: optional str replacement severity (default None).
+        tags: optional list[str] replacement tag list (default None, up to 24 tags).
+        readiness_score: optional int readiness score (default None, clamped to 0..100).
+        include_item: bool (default False); True adds full detail fields to item.
     """
     if not core.writes_allowed():
         return _needfix_response(
@@ -3595,16 +3730,19 @@ def needfix_transition_view(
     include_item: bool = False,
     promote_to: str = "",
 ) -> dict[str, Any]:
-    """USER WRITE: one explicit, confirmed NeedFix lifecycle transition.
+    """USER WRITE: apply one confirmed lifecycle status transition to a NeedFix item.
 
-    Replies with a delta receipt (``aiworkhub.needfix_transition_receipt.v1``):
-    id, action, status_before, status_after, updated_at, readiness_score,
-    converted_task_id, event_id, the recorded ``events``, and the compact
-    item (``include_item=True`` adds description/scope/provenance/evidence).
-    ``promote_to="accepted"`` with ``action="triage"`` records the triage and
-    the accept as two audit events in one call, with one reason; the
-    confirm gate and the state machine are unchanged (92 of 113 triages in
-    27 sessions were followed by an accept within six calls).
+    Use this to triage, accept, reject, defer, mark duplicate, mark task_planned, resolve, or recover a conversion claim; use aiworkhub_dashboard_needfix_archive, aiworkhub_dashboard_needfix_restore, or aiworkhub_dashboard_needfix_convert_commit for archive, restore, or task creation. Requires confirm=True, persists the state transition and audit event in the NeedFix store, and returns a transition receipt.
+
+    Args:
+        needfix_id: str canonical NeedFix identifier to transition.
+        action: str transition action: triage, accept, reject, duplicate, defer, task_planned, resolve, resolve_verified, or recover_conversion_claim.
+        reason: str note or rationale (default "", up to 1000 chars; required for recover_conversion_claim).
+        readiness_score: optional int score for triage or accept (default None).
+        duplicate_parent_id: str parent NeedFix ID when action is duplicate (default "").
+        confirm: bool (default False); must be True to execute the transition.
+        include_item: bool (default False); True adds full detail fields to item.
+        promote_to: str optional chained target (default ""; only "accepted" with action="triage" is allowed).
     """
     candidate = str(needfix_id or "")
     selected = str(action or "").strip().lower()
@@ -3691,6 +3829,15 @@ def needfix_transition_view(
 
 
 def needfix_archive_view(needfix_id: str, reason: str = "", confirm: bool = False) -> dict[str, Any]:
+    """USER WRITE: archive one non-converting NeedFix item without deleting its stored record.
+
+    Use this to move an inactive or obsolete NeedFix row out of the active inbox; use aiworkhub_dashboard_needfix_restore to return an archived row to an active status, or aiworkhub_dashboard_needfix_purge to permanently delete an archived row. Requires confirm=True, refuses rows currently in converting status, sets status to archived with an audit event in the NeedFix store, and returns the updated item.
+
+    Args:
+        needfix_id: str canonical NeedFix identifier to archive.
+        reason: str optional archive rationale (default "", truncated to 1000 chars) recorded in the audit event.
+        confirm: bool (default False); must be True to archive the NeedFix item.
+    """
     if confirm is not True:
         response = {"ok": False, "error": "needfix_archive_confirmation_required"}
     else:
@@ -3703,6 +3850,15 @@ def needfix_archive_view(needfix_id: str, reason: str = "", confirm: bool = Fals
 
 
 def needfix_restore_view(needfix_id: str, target_status: str = "captured", confirm: bool = False) -> dict[str, Any]:
+    """USER WRITE: restore an archived NeedFix item to an active non-terminal lifecycle status.
+
+    Use this to unarchive a NeedFix row previously archived with aiworkhub_dashboard_needfix_archive; use aiworkhub_dashboard_needfix_transition to advance the lifecycle of an already-active item. Requires confirm=True and a row currently in archived status, clears archived_at, sets status to target_status, records a restored audit event, and returns the updated item.
+
+    Args:
+        needfix_id: str canonical NeedFix identifier of the archived row to restore.
+        target_status: str active status to restore into: captured, triaged, accepted, or deferred (default "captured").
+        confirm: bool (default False); must be True to restore the NeedFix item.
+    """
     if confirm is not True:
         response = {"ok": False, "error": "needfix_restore_confirmation_required"}
     else:
@@ -3715,6 +3871,15 @@ def needfix_restore_view(needfix_id: str, target_status: str = "captured", confi
 
 
 def needfix_purge_view(needfix_id: str, audit_reason: str, confirm: bool = False) -> dict[str, Any]:
+    """DESTRUCTIVE: permanently delete one archived NeedFix row from the NeedFix table while retaining an audit snapshot.
+
+    Use aiworkhub_dashboard_needfix_archive first to archive the item safely, or aiworkhub_dashboard_needfix_restore to recover an archived item instead of deleting it. Requires confirm=True, a non-empty audit_reason, and an already-archived row; records a purged audit event with the row snapshot and permanently deletes the row from the needfix table.
+
+    Args:
+        needfix_id: str canonical NeedFix identifier of the archived row to permanently delete.
+        audit_reason: str non-empty mandatory justification (truncated to 1000 chars) persisted in the purge audit event.
+        confirm: bool (default False); must be True to permanently purge the NeedFix row.
+    """
     if confirm is not True:
         response = {"ok": False, "error": "needfix_purge_confirmation_required"}
     else:
@@ -3729,7 +3894,14 @@ def needfix_purge_view(needfix_id: str, audit_reason: str, confirm: bool = False
 def needfix_convert_preview_view(
     needfix_id: str, task_plan: Mapping[str, Any] | None = None
 ) -> dict[str, Any]:
-    """READ-ONLY: normalized executable conversion card plus its plan_digest."""
+    """READ-ONLY: preview the normalized task card and plan_digest for converting a NeedFix item into a task.
+
+    Call this before aiworkhub_dashboard_needfix_convert_commit to inspect the normalized card, validation role requirements, and the plan_digest required to commit; use aiworkhub_dashboard_needfix_detail to inspect the NeedFix item itself. Normalizes the task plan and caches the signed preview in memory without creating a task or mutating durable store state.
+
+    Args:
+        needfix_id: str canonical NeedFix identifier to preview for task conversion.
+        task_plan: optional Mapping[str, Any] (default None) explicit task card overrides such as runner, topic, allowed_writes, and validation.
+    """
     try:
         response = dict(
             core.needfix_preview_convert(str(needfix_id or ""), task_plan=task_plan)
@@ -3746,17 +3918,15 @@ def needfix_convert_commit_view(
     task_plan: Mapping[str, Any] | None = None,
     plan_digest: str | None = None,
 ) -> dict[str, Any]:
-    """USER WRITE: explicitly create a task card; never launch a worker.
+    """USER WRITE: convert an accepted NeedFix item into a canonical task card without launching a worker.
 
-    Every confirmed conversion must carry the exact ``plan_digest`` the
-    matching preview returned, binding the commit to what the manager
-    actually inspected. The rule is identical for an explicit
-    ``task_plan`` and for the default scope-derived card: a missing
-    digest, or a digest that no longer matches the freshly normalized
-    card, fails closed instead of silently converting a plan nobody
-    confirmed. Core's digest check runs only on the create path, so
-    already-task_created retries keep short-circuiting without forcing a
-    new create.
+    Call aiworkhub_dashboard_needfix_convert_preview first to obtain the required plan_digest; use aiworkhub_dashboard_needfix_link_existing_task instead when a finished accepted task already resolves the item. Requires confirm=True and a matching plan_digest, creates the task card in the task store, transitions the NeedFix item to task_created, and never spawns a worker process.
+
+    Args:
+        needfix_id: str canonical NeedFix identifier to convert into a task.
+        confirm: bool (default False); must be True to commit the conversion and create the task.
+        task_plan: optional Mapping[str, Any] (default None reuses the plan cached under plan_digest) explicit task card fields.
+        plan_digest: optional str (default None, required at runtime) SHA-256 digest returned by aiworkhub_dashboard_needfix_convert_preview.
     """
     if confirm is not True:
         response = {"ok": False, "error": "needfix_conversion_confirmation_required"}
@@ -3780,7 +3950,16 @@ def needfix_convert_commit_view(
 def needfix_link_existing_task_view(
     needfix_id: str, existing_task_id: str, confirm: bool = False, integrated_commit: str = ""
 ) -> dict[str, Any]:
-    """USER WRITE: manager-only, explicitly link a NeedFix to an existing, finished, accepted task."""
+    """USER WRITE: link a NeedFix item to an existing finished, manager-accepted task in the same repository.
+
+    Use this when an already-completed canonical task resolves the NeedFix item; use aiworkhub_dashboard_needfix_convert_commit instead to create a new task card from the NeedFix. Requires confirm=True, verifies the target task exists and is finished and accepted (plus integrated_commit when supplied), and persists the task link and audit event in the NeedFix store.
+
+    Args:
+        needfix_id: str canonical NeedFix identifier to link.
+        existing_task_id: str identifier of the finished, manager-accepted task in this repository.
+        confirm: bool (default False); must be True to persist the task link.
+        integrated_commit: str optional Git commit SHA (default "") verified against the repository when provided.
+    """
     if confirm is not True:
         response = {"ok": False, "error": "needfix_link_existing_task_confirmation_required"}
     else:
@@ -3799,7 +3978,15 @@ def needfix_link_existing_task_view(
 def needfix_reopen_superseded_task_link_view(
     needfix_id: str, reason: str, confirm: bool = False
 ) -> dict[str, Any]:
-    """USER WRITE: reopen only an exact archived/superseded converted-task link."""
+    """USER WRITE: reopen a NeedFix item whose linked converted task was archived or superseded.
+
+    Use this when a converted task was superseded or archived without resolving the NeedFix so a new conversion can mint a successor -rN task; use aiworkhub_dashboard_needfix_transition for normal lifecycle changes. Requires confirm=True and a verified archived or superseded linked task, increments reopen_generation, restores the NeedFix to accepted status, and records an audit event.
+
+    Args:
+        needfix_id: str canonical NeedFix identifier whose superseded task link should be reopened.
+        reason: str mandatory audit explanation for reopening the superseded task link.
+        confirm: bool (default False); must be True to execute the reopen.
+    """
     if confirm is not True:
         response = {
             "ok": False,
@@ -3827,7 +4014,15 @@ def task_quarantine_view(
     older_than_days: int | None = None,
     confirm: bool = False,
 ) -> dict[str, Any]:
-    """USER WRITE: quarantine a still-current old archived-task preview."""
+    """USER WRITE: move aged archived task rows matching a current preview into a reversible retention batch.
+
+    Call aiworkhub_dashboard_task_retention_preview first with the same older_than_days cutoff to obtain preview_digest; use aiworkhub_dashboard_task_quarantine_restore to undo a batch or aiworkhub_dashboard_task_archive to archive one live task. Requires confirm=True and a matching preview_digest, records retired task outcomes in the roadmap store, moves task and event rows into task_retention_batches, and invalidates storage telemetry.
+
+    Args:
+        preview_digest: str SHA-256 digest from aiworkhub_dashboard_task_retention_preview; mismatches fail closed.
+        older_than_days: optional int age cutoff in days (default None uses repository retention policy, valid range 7..3650).
+        confirm: bool (default False); must be True to quarantine the archived tasks.
+    """
     try:
         root = core.repo_root()
         response = task_retention.quarantine(
@@ -3845,7 +4040,14 @@ def task_quarantine_view(
 
 
 def task_quarantine_restore_view(batch_id: str, confirm: bool = False) -> dict[str, Any]:
-    """USER WRITE: restore one archived-task quarantine batch."""
+    """USER WRITE: restore one archived-task retention batch back into the canonical task tables.
+
+    Use this to roll back a task retention batch listed by aiworkhub_dashboard_task_retention_preview; use aiworkhub_dashboard_task_restore instead to unarchive a single task that is still in the live tasks table. Requires confirm=True, checks for task_id collisions, reinserts tasks, task_events, and callback rows in one transaction, marks the batch restored, and invalidates storage telemetry.
+
+    Args:
+        batch_id: str identifier of the task retention quarantine batch to restore.
+        confirm: bool (default False); must be True to restore the batch.
+    """
     try:
         root = core.repo_root()
         response = task_retention.restore(
@@ -3860,7 +4062,14 @@ def task_quarantine_restore_view(batch_id: str, confirm: bool = False) -> dict[s
 
 
 def task_quarantine_purge_view(batch_id: str, confirm: bool = False) -> dict[str, Any]:
-    """USER WRITE: permanently purge one expired archived-task batch."""
+    """DESTRUCTIVE: permanently delete one expired or already-restored archived-task quarantine batch.
+
+    Inspect batches with aiworkhub_dashboard_task_retention_preview first, or use aiworkhub_dashboard_task_quarantine_restore to recover tasks while the undo deadline is active. Requires confirm=True and an expired restore_deadline (unless already restored), deletes the batch payload from task_retention_batches, records a purged audit row, and invalidates storage telemetry.
+
+    Args:
+        batch_id: str identifier of the task retention batch to permanently delete.
+        confirm: bool (default False); must be True to permanently purge the batch.
+    """
     try:
         root = core.repo_root()
         response = task_retention.purge(
@@ -3875,12 +4084,9 @@ def task_quarantine_purge_view(batch_id: str, confirm: bool = False) -> dict[str
 
 
 def health_view() -> dict[str, Any]:
-    """READ-ONLY: cheap liveness check for the Webview's connection banner.
+    """READ-ONLY: perform a fast storage readiness, manager identity, and dispatcher health check for the active repository.
 
-    Reads canonical repo-local storage directly.  The native dashboard must
-    not depend on a repository shipping ``AITools/taskctl.py`` merely to
-    render its connection banner.  Never calls ``dashboard.build_snapshot``:
-    polling stays cheap and cannot pull the queue/cost/process payload.
+    Use this for lightweight connection-banner polling or pre-initialization checks; use aiworkhub_dashboard_snapshot when you need task queue counts, process rows, or cost summaries, or aiworkhub_dashboard_initialize when storage reports not_initialized. Probes storage readiness and cached observability without building the full queue snapshot or mutating repository state.
     """
     # Use the same canonical resolver as every manager/task tool.  The VS Code
     # dashboard child carries explicit AIWORKHUB_REPO* bindings, while the
@@ -3964,18 +4170,12 @@ _REAL_REPO_ID_RE = re.compile(r"^repo_[a-f0-9]{32}$")
 
 
 def initialize_view(repo_id: str = "") -> dict[str, Any]:
-    """WRITE (bootstrap-only): the one bounded, idempotent, fail-closed
-    initialization action the Webview's "Initialize AIWorkHub" button
-    invokes.
+    """USER WRITE: initialize or repair the active repository's canonical .aiworkhub stores and Source Graph directory.
 
-    Bound to the active repository via ``AIWORKHUB_REPO_ROOT`` (the same env
-    var the extension host spawns this child process with -- never a fixed
-    path relative to this package's own install location) and, when the
-    caller supplies one, an expected ``repo_id`` that must match any existing
-    manifest exactly. Creates/repairs the repository-local canonical stores.
-    Fresh repositories receive empty compatible databases; an older registry
-    may migrate only its explicitly declared repo-local legacy SQLite files
-    with a consistent backup. Legacy files are never deleted.
+    Use this when aiworkhub_dashboard_health reports storage not_initialized; use aiworkhub_dashboard_health or aiworkhub_dashboard_snapshot for read-only status checks. Bound to AIWORKHUB_REPO_ROOT, verifies repo_id against any existing manifest, idempotently provisions the project manifest, storage registry, SQLite stores, and Source Graph directory without deleting legacy files, and invalidates storage telemetry.
+
+    Args:
+        repo_id: str optional expected repository ID (default ""); when valid, must match any existing manifest or initialization fails closed.
     """
     root = str(
         os.environ.get("AIWORKHUB_REPO_ROOT")
@@ -4024,16 +4224,13 @@ def initialize_view(repo_id: str = "") -> dict[str, Any]:
 
 
 def task_live_output_view(task_id: str, cursor: int = 0) -> dict[str, Any]:
-    """READ-ONLY: bounded, single-task Live Output read for the dashboard's
-    selected-task panel.
+    """READ-ONLY: read a bounded page of live stdout and stderr output for one task's active or latest worker run.
 
-    Validates ``task_id`` with the same pattern every other task-scoped tool
-    enforces (``dashboard._TASK_ID_RE``) BEFORE calling
-    ``process_launcher.read_live_output_for_task`` -- the ONLY task this call
-    ever reads process-log/stdout/stderr evidence for; there is no
-    dashboard-wide fan-out across other tasks. An invalid task_id, or any
-    unexpected failure resolving the active repository, returns a bounded
-    ``ok: false`` object; this never raises.
+    Use this to stream or page incremental worker process output from a byte cursor; use aiworkhub_dashboard_task_detail for the task contract and attempt history, or aiworkhub_dashboard_snapshot for queue-wide status. Validates task_id format and reads only that task's log files without mutating state.
+
+    Args:
+        task_id: str canonical task identifier whose worker output should be read.
+        cursor: int (default 0, clamped to >=0) byte offset from which to read the next output chunk.
     """
     candidate = str(task_id or "").strip()
     if not dashboard._TASK_ID_RE.fullmatch(candidate):
