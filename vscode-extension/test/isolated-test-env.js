@@ -165,18 +165,31 @@ function verifyChildEnvironment(env = process.env) {
 }
 
 function runIsolatedTest(args, options = {}) {
+  const { timeoutMs } = options;
+  // Bounded runs: once timeoutMs elapses spawnSync kills the child and reports error.code ETIMEDOUT.
+  if (timeoutMs !== undefined && !(Number.isSafeInteger(timeoutMs) && timeoutMs > 0)) {
+    throw new Error(`test_timeout_ms_invalid:${timeoutMs}`);
+  }
   const scratch = createScratch();
+  let result;
   try {
-    const result = spawnSync(process.execPath, args, {
+    result = spawnSync(process.execPath, args, {
       cwd: path.resolve(__dirname, ".."),
       env: childEnvironment(scratch, options.env || process.env),
       stdio: options.stdio || "inherit", encoding: "utf8", shell: false,
-      windowsHide: true,
+      windowsHide: true, timeout: timeoutMs,
     });
-    return { ...result, scratchRoot: scratch };
   } finally {
-    cleanupScratch(scratch);
+    try {
+      cleanupScratch(scratch);
+    } catch (error) {
+      // A descendant that outlived a killed child can keep the scratch busy (EBUSY/EPERM). The spawn
+      // result rides on the error so the caller still reports the child's own outcome, e.g. ETIMEDOUT.
+      if (result) error.result = { ...result, scratchRoot: scratch };
+      throw error;
+    }
   }
+  return { ...result, scratchRoot: scratch };
 }
 
 function enterIsolatedTest() {

@@ -2,6 +2,7 @@ const assert = require("assert");
 const fs = require("fs");
 const path = require("path");
 const Module = require("module");
+const childProcess = require("child_process");
 const { EventEmitter } = require("events");
 
 const extensionPath = path.resolve(__dirname, "..", "extension.js");
@@ -71,18 +72,44 @@ client.child = owned;
 client.lifecycleChild = owned;
 client.lifecyclePid = 41;
 
-const foreignDifferentPid = child(42);
-assert.strictEqual(client._terminateOwnedChild(foreignDifferentPid), false);
-assert.strictEqual(foreignDifferentPid.killCount, 0);
+// NF-2026-01644: on Windows the owned-child kill below used to run a real
+// `taskkill /PID 41 /T /F` with pipe stdio against this fake child. Inside the
+// AppContainer validation sandbox libuv's named-pipe creation is denied and
+// retried forever, so that spawnSync never returned (its timeout never fires)
+// and this file hung until the 1800 s validation timeout. The tree-kill
+// boundary is recorded here, never executed.
+const treeKills = [];
+const originalSpawnSync = childProcess.spawnSync;
+childProcess.spawnSync = (command, args, options) => {
+  treeKills.push({ command, args, options });
+  return { status: 128, signal: null }; // "not found": fall through to the exact-child kill
+};
+try {
+  const foreignDifferentPid = child(42);
+  assert.strictEqual(client._terminateOwnedChild(foreignDifferentPid), false);
+  assert.strictEqual(foreignDifferentPid.killCount, 0);
 
-const foreignSamePid = child(41);
-assert.strictEqual(client._terminateOwnedChild(foreignSamePid), false);
-assert.strictEqual(foreignSamePid.killCount, 0);
-assert.strictEqual(client._terminateOwnedChild(owned), true);
-assert.strictEqual(owned.killCount, 1);
-assert.strictEqual(client.lifecycleChild, null);
-assert.strictEqual(client.lifecyclePid, null);
-assert.strictEqual(client._terminateOwnedChild(owned), false, "stale ownership must not authorize a second kill");
+  const foreignSamePid = child(41);
+  assert.strictEqual(client._terminateOwnedChild(foreignSamePid), false);
+  assert.strictEqual(foreignSamePid.killCount, 0);
+  assert.strictEqual(client._terminateOwnedChild(owned), true);
+  assert.strictEqual(owned.killCount, 1);
+  assert.strictEqual(client.lifecycleChild, null);
+  assert.strictEqual(client.lifecyclePid, null);
+  assert.strictEqual(client._terminateOwnedChild(owned), false, "stale ownership must not authorize a second kill");
+} finally {
+  childProcess.spawnSync = originalSpawnSync;
+}
+if (process.platform === "win32") {
+  assert.deepStrictEqual(
+    treeKills.map(({ command, args }) => [command, ...args]),
+    [["taskkill", "/PID", "41", "/T", "/F"]],
+    "only the owned pid is tree-killed, exactly once",
+  );
+  assert.strictEqual(treeKills[0].options.stdio, "ignore", "the tree kill must not open stdio pipes");
+} else {
+  assert.deepStrictEqual(treeKills, [], "Linux/macOS keep the exact-child kill path");
+}
 
 client.beginExplicitRecovery();
 assert.deepStrictEqual(client.recoveryStatus(), {

@@ -1093,11 +1093,20 @@ function _preflightPythonCandidate(command, extraArgs, runtimeDir = extensionRun
   if (runtimeDir) {
     preflightEnv.PYTHONPATH = [runtimeDir, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter);
   }
+  // NF-2026-01644: stderr goes to a file, not a pipe: AppContainer livelocks libuv's named-pipe creation.
+  const stderrPath = path.join(os.tmpdir(), `aiworkhub-preflight-${process.pid}-${crypto.randomBytes(8).toString("hex")}.stderr`);
+  let stderrFd;
+  try {
+    stderrFd = fs.openSync(stderrPath, "wx+", 0o600);
+  } catch (_err) {
+    // The verdict depends only on the interpreter, so a missing capture file just drops stderr.
+    // The open error is never reported: its message names the host temp path.
+    stderrFd = "ignore";
+  }
   try {
     const result = childProcess.spawnSync(command, args, {
       timeout: 15000,
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: ["ignore", "ignore", stderrFd],
       shell: false,
       cwd: runtimeDir || undefined,
       env: preflightEnv,
@@ -1113,11 +1122,18 @@ function _preflightPythonCandidate(command, extraArgs, runtimeDir = extensionRun
     if (result.status === 0) {
       return { ok: true, candidate: command };
     }
+    // Sanitising keeps a 500-char head, so a bounded prefix of the capture is enough.
+    let stderrTail = _sanitisePreflightStderr("");
+    if (typeof stderrFd === "number") {
+      const head = Buffer.alloc(4096);
+      const headBytes = fs.readSync(stderrFd, head, 0, head.length, 0);
+      stderrTail = _sanitisePreflightStderr(head.toString("utf8", 0, headBytes));
+    }
     return {
       ok: false,
       candidate: command,
       exitCode: result.status,
-      stderrTail: _sanitisePreflightStderr(result.stderr),
+      stderrTail,
       signal: result.signal || null,
     };
   } catch (err) {
@@ -1126,6 +1142,15 @@ function _preflightPythonCandidate(command, extraArgs, runtimeDir = extensionRun
       candidate: command,
       error: String((err && err.message) || "spawn_failed").slice(0, 200),
     };
+  } finally {
+    if (typeof stderrFd === "number") {
+      try {
+        fs.closeSync(stderrFd);
+        fs.unlinkSync(stderrPath);
+      } catch (_err) {
+        // Best effort: capture cleanup must never turn a preflight verdict into a throw.
+      }
+    }
   }
 }
 
@@ -2100,10 +2125,13 @@ class McpStdioClient {
       && ownedPid > 1
     ) {
       try {
+        // NF-2026-01644: only the exit status is read, so no stdio pipes. Inside
+        // a Windows AppContainer libuv's named-pipe creation is denied and retried
+        // forever, so a pipe-stdio spawnSync never returns and its timeout never fires.
         const result = childProcess.spawnSync(
           "taskkill",
           ["/PID", String(ownedPid), "/T", "/F"],
-          { windowsHide: true, encoding: "utf8", timeout: 5000 },
+          { windowsHide: true, stdio: "ignore", timeout: 5000 },
         );
         if (!result.error && result.status === 0) return true;
       } catch (_err) {
@@ -14481,6 +14509,19 @@ async function activate(context) {
   debugTrace("activation.end");
 }
 
+// NF-2026-01644: one failed shutdown step must never skip the ones after it. A
+// rejected dispatcher stop used to leave the editor-worker MCP child running,
+// both logs unflushed and this window's route record behind.
+async function runDeactivateStep(name, step) {
+  try {
+    await step();
+  } catch (err) {
+    const line = `[shutdown] ${name} failed: ${sanitizeErrorMessage(err)}`;
+    if (outputChannel) outputChannel.appendLine(line);
+    else recordSystemLog(line);
+  }
+}
+
 async function deactivate() {
   stopStableRuntimeLease();
   stopDispatcherWatchdog();
@@ -14494,16 +14535,17 @@ async function deactivate() {
     const oldClient = mcpClient;
     mcpClient = null;
     // Stop dispatcher before child termination to prevent reload orphans.
-    await oldClient.stopDispatcherThenTerminate({ restart: false });
+    await runDeactivateStep("dispatcher stop", () => oldClient.stopDispatcherThenTerminate({ restart: false }));
   }
-  await disposeManagerLoopMcpClient();
-  disposeVscodeLmWorkerMcpClient();
-  flushSystemLogs();
+  // Call syntax, not bare references: source guards count each teardown call site.
+  await runDeactivateStep("manager-loop client dispose", () => disposeManagerLoopMcpClient());
+  await runDeactivateStep("worker client dispose", () => disposeVscodeLmWorkerMcpClient());
+  await runDeactivateStep("system log flush", () => flushSystemLogs());
   // The trace writer buffers; a reload cycle must not lose the tail that
   // explains why this window was reloaded.
-  flushDebugTrace(true);
+  await runDeactivateStep("debug trace flush", () => flushDebugTrace(true));
   // Remove ONLY this window's own route record -- never another window's.
-  removeWindowRouteRecord(activeRepoIdentity);
+  await runDeactivateStep("route record removal", () => removeWindowRouteRecord(activeRepoIdentity));
   activeRepoIdentity = null;
   extensionContext = null;
 }

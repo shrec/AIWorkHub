@@ -7009,13 +7009,28 @@ async function nf1275VisibleActivityEndToEnd() {
         // CI checks out no .venv; the runner's own interpreter then runs the relay.
         const venv=path.join(root,".venv",process.platform==="win32"?"Scripts/python.exe":"bin/python");
         const python=fs.existsSync(venv)?venv:(process.platform==="win32"?"python":"python3");
-        const child=require("child_process").spawnSync(python,["-m","aiworkhub.vscode_lm_worker","--spec",spec],{
-          cwd:root,encoding:"utf8",timeout:20000,
-          env:{...process.env,AIWORKHUB_ALLOW_WRITES:"1",PYTHONPATH:[path.join(root,"src"),root].join(path.delimiter)},
-        });
-        assert.strictEqual(child.status,0,child.stderr || child.stdout);
-        assert(!child.stdout.includes("short-secret"),"relay must re-redact");
-        const events=child.stdout.trim().split("\n").map(JSON.parse);
+        // NF-2026-01644: the relay writes to files, never stdio pipes. Inside the Windows
+        // AppContainer validation sandbox libuv's named-pipe creation is denied and retried
+        // forever, so a piped spawnSync never returns and its timeout never arms.
+        const outPath=path.join(home,"relay.stdout"), errPath=path.join(home,"relay.stderr");
+        const outFd=fs.openSync(outPath,"w");
+        let errFd=null, child;
+        try {
+          errFd=fs.openSync(errPath,"w");
+          child=require("child_process").spawnSync(python,["-m","aiworkhub.vscode_lm_worker","--spec",spec],{
+            cwd:root,stdio:["ignore",outFd,errFd],timeout:20000,
+            // Keep the inherited PYTHONPATH so the AppContainer sitecustomize shim still loads (NF-2026-01644).
+            env:{...process.env,AIWORKHUB_ALLOW_WRITES:"1",PYTHONPATH:[path.join(root,"src"),root,process.env.PYTHONPATH].filter(Boolean).join(path.delimiter)},
+          });
+        } finally {
+          fs.closeSync(outFd);
+          if(errFd!==null) fs.closeSync(errFd);
+        }
+        const stdout=fs.readFileSync(outPath,"utf8"), stderr=fs.readFileSync(errPath,"utf8");
+        assert.strictEqual(child.error,undefined,`relay did not run to exit: ${child.error&&(child.error.code||child.error.message)}`);
+        assert.strictEqual(child.status,0,stderr || stdout);
+        assert(!stdout.includes("short-secret"),"relay must re-redact");
+        const events=stdout.trim().split("\n").map(JSON.parse);
         const activity=events.filter(item=>item.type==="aiworkhub_tool_activity"&&item.kind==="tool");
         assert.strictEqual(activity.length,2);
         assert.strictEqual(activity[0].tool_state,"started");
@@ -7023,9 +7038,9 @@ async function nf1275VisibleActivityEndToEnd() {
         assert.strictEqual(activity[0].call_id,activity[1].call_id);
         assert.strictEqual(activity[1].tool_transport,native?"native":"emulated");
         assert(activity.every(item=>item.request_id===requestId&&item.repo_id==="repo_test"));
-        const timeline=fixture.api.timelineEventsFromText(child.stdout).filter(item=>item.title==="Tool activity");
+        const timeline=fixture.api.timelineEventsFromText(stdout).filter(item=>item.title==="Tool activity");
         assert(timeline.some(item=>item.activityInput.includes("input marker")));
-        fixture.api.renderFormattedLiveOutput(child.stdout);
+        fixture.api.renderFormattedLiveOutput(stdout);
         const rendered=fixture.document.querySelector("#detail-live-output-container");
         assert(rendered.textContent.includes(toolError?"fixture tool failure":"ქართული 😀 visible"));
         assert(!rendered.innerHTML.includes("<script>"));
@@ -7720,7 +7735,13 @@ async function nf1300PrivateWorkerTransport() {
       await invoke("aiworkhub_worker_source_graph_query");
       const replacement = calls.at(-1).client;
       assert.notStrictEqual(replacement, privateClient, "switched cache is never reused");
+      // NF-2026-01644: stub the bound dashboard client's dispatcher stop so this
+      // assertion measures only worker-client disposal; a rejected dispatcher
+      // stop is covered by extension-teardown-nf1644.test.js.
+      let dispatcherStops = 0;
+      dashboard.stopDispatcherThenTerminate = async () => { dispatcherStops += 1; };
       await require(extensionPath).deactivate();
+      assert.strictEqual(dispatcherStops, 1, "extension shutdown stops the bound dashboard client");
       assert.strictEqual(replacement.intentionalStop, true, "extension shutdown disposes worker client");
     } finally {
       fakeVscode.workspace.workspaceFolders = previousFolders;
