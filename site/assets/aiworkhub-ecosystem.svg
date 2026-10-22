@@ -1,0 +1,392 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1200" viewBox="0 0 1920 1200" role="img" aria-labelledby="t d">
+  <title id="t">AIWorkHub ecosystem</title>
+  <desc id="d">Poster of the AIWorkHub ecosystem: a Task MCP control plane spine that carries work from owner to learning commit, surrounded by six panels for the manager seat, the multi-model workforce, the memory layer, Source Graph, quality gates and the NeedFix loop.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#040812"/>
+      <stop offset="0.55" stop-color="#071025"/>
+      <stop offset="1" stop-color="#03060f"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#1fb8ff" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#1fb8ff" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#16305a" stroke-width="1" stroke-opacity="0.45"/>
+    </pattern>
+    <pattern id="gridMajor" width="200" height="200" patternUnits="userSpaceOnUse">
+      <path d="M200 0H0V200" fill="none" stroke="#1d4580" stroke-width="1" stroke-opacity="0.35"/>
+      <circle cx="0" cy="0" r="2.5" fill="#22e5ff" fill-opacity="0.25"/>
+    </pattern>
+    <linearGradient id="titleGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#22e5ff"/>
+      <stop offset="0.5" stop-color="#e8f7ff"/>
+      <stop offset="1" stop-color="#ff3df2"/>
+    </linearGradient>
+    <linearGradient id="fadeL" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#22e5ff" stop-opacity="0"/>
+      <stop offset="1" stop-color="#22e5ff"/>
+    </linearGradient>
+    <linearGradient id="fadeR" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ff3df2"/>
+      <stop offset="1" stop-color="#ff3df2" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="spineGrad" gradientUnits="userSpaceOnUse" x1="0" y1="214" x2="0" y2="976">
+      <stop offset="0" stop-color="#e8f7ff"/>
+      <stop offset="0.2" stop-color="#22e5ff"/>
+      <stop offset="0.4" stop-color="#ff3df2"/>
+      <stop offset="0.6" stop-color="#ffc23d"/>
+      <stop offset="0.8" stop-color="#39ff88"/>
+      <stop offset="1" stop-color="#a066ff"/>
+    </linearGradient>
+    <linearGradient id="panelFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0c1a3a" stop-opacity="0.94"/>
+      <stop offset="1" stop-color="#060c1f" stop-opacity="0.94"/>
+    </linearGradient>
+    <filter id="glow" filterUnits="userSpaceOnUse" x="0" y="0" width="1920" height="1200">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="glowSoft" filterUnits="userSpaceOnUse" x="0" y="0" width="1920" height="1200">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="2" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="glowBig" filterUnits="userSpaceOnUse" x="0" y="0" width="1920" height="1200">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="9" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#bff6ff"/>
+    </marker>
+  </defs>
+
+  <!-- background: near-black navy, circuit grid, central halo -->
+  <rect width="1920" height="1200" fill="url(#bg)"/>
+  <rect width="1920" height="1200" fill="url(#grid)"/>
+  <rect width="1920" height="1200" fill="url(#gridMajor)"/>
+  <ellipse cx="960" cy="600" rx="520" ry="560" fill="url(#halo)"/>
+  <g fill="none" stroke="#22e5ff" stroke-width="1.5" stroke-opacity="0.2">
+    <path d="M0 40H140L170 70H250"/>
+    <path d="M0 110H90L120 140H200"/>
+    <path d="M1920 80H1790L1760 110H1680"/>
+    <path d="M0 1120H120L150 1150H300"/>
+    <path d="M1920 1120H1800L1770 1150H1620"/>
+  </g>
+  <g fill="#22e5ff" fill-opacity="0.35">
+    <circle cx="250" cy="70" r="4"/>
+    <circle cx="200" cy="140" r="4"/>
+    <circle cx="1680" cy="110" r="4"/>
+    <circle cx="300" cy="1150" r="4"/>
+    <circle cx="1620" cy="1150" r="4"/>
+  </g>
+
+  <g font-family="Segoe UI, Inter, Helvetica, Arial, sans-serif">
+    <!-- header -->
+    <rect x="300" y="65" width="380" height="2" fill="url(#fadeL)" filter="url(#glowSoft)"/>
+    <rect x="1240" y="65" width="380" height="2" fill="url(#fadeR)" filter="url(#glowSoft)"/>
+    <text x="960" y="92" text-anchor="middle" font-size="72" font-weight="800" letter-spacing="14" fill="url(#titleGrad)" filter="url(#glowBig)">AIWORKHUB</text>
+    <text x="960" y="134" text-anchor="middle" font-size="22" fill="#9fb4d9">A self-hosting coding factory — one manager seat, many models, acceptance by measurement</text>
+    <text x="1880" y="40" text-anchor="end" font-family="Consolas, Menlo, monospace" font-size="14" fill="#5f7bb0" letter-spacing="2">MEASURED 2026-10-22</text>
+
+    <!-- L1 manager seat -->
+    <g id="panel-manager-seat">
+      <rect x="40" y="168" width="660" height="270" rx="14" fill="url(#panelFill)"/>
+      <rect x="40" y="168" width="660" height="270" rx="14" fill="none" stroke="#22e5ff" stroke-width="2" filter="url(#glow)"/>
+      <path d="M40 206V182Q40 168 54 168H78M700 400V424Q700 438 686 438H662" fill="none" stroke="#22e5ff" stroke-width="5" stroke-linecap="round" filter="url(#glowSoft)"/>
+      <g fill="none" stroke="#22e5ff" stroke-width="2.2" filter="url(#glowSoft)">
+        <circle cx="92" cy="216" r="26"/>
+        <circle cx="92" cy="208" r="7"/>
+        <path d="M78 230a14 12 0 0 1 28 0"/>
+      </g>
+      <text x="132" y="212" font-size="24" font-weight="700" letter-spacing="2" fill="#22e5ff" filter="url(#glowSoft)">MANAGER SEAT</text>
+      <text x="132" y="240" font-size="17" font-style="italic" fill="#9fefff">Supervisor and independent reviewer</text>
+      <rect x="64" y="255" width="612" height="1.5" fill="#22e5ff" fill-opacity="0.35"/>
+      <g fill="#22e5ff">
+        <circle cx="72" cy="281" r="3.5"/>
+        <circle cx="72" cy="313" r="3.5"/>
+        <circle cx="72" cy="345" r="3.5"/>
+        <circle cx="72" cy="377" r="3.5"/>
+      </g>
+      <g font-size="16" fill="#d7e3ff">
+        <text x="84" y="286">Bootstrap verifies repository identity before any file access</text>
+        <text x="84" y="318">Routes cards by difficulty and cost</text>
+        <text x="84" y="350">Accepts by measurement, never by asking</text>
+        <text x="84" y="382">Rejects with exact ranges and the fix shape</text>
+      </g>
+    </g>
+
+    <!-- L2 multi-model workforce -->
+    <g id="panel-workforce">
+      <rect x="40" y="453" width="660" height="270" rx="14" fill="url(#panelFill)"/>
+      <rect x="40" y="453" width="660" height="270" rx="14" fill="none" stroke="#ff3df2" stroke-width="2" filter="url(#glow)"/>
+      <path d="M40 491V467Q40 453 54 453H78M700 685V709Q700 723 686 723H662" fill="none" stroke="#ff3df2" stroke-width="5" stroke-linecap="round" filter="url(#glowSoft)"/>
+      <g fill="none" stroke="#ff3df2" stroke-width="2.2" filter="url(#glowSoft)">
+        <circle cx="92" cy="501" r="26"/>
+        <path d="M92 489L81 509H103Z"/>
+      </g>
+      <g fill="#ff3df2">
+        <circle cx="92" cy="489" r="4.5"/>
+        <circle cx="81" cy="509" r="4.5"/>
+        <circle cx="103" cy="509" r="4.5"/>
+      </g>
+      <text x="132" y="497" font-size="24" font-weight="700" letter-spacing="2" fill="#ff3df2" filter="url(#glowSoft)">MULTI-MODEL WORKFORCE</text>
+      <text x="132" y="525" font-size="17" font-style="italic" fill="#ffa8f8">84 configured workers · 45 startable</text>
+      <rect x="64" y="540" width="612" height="1.5" fill="#ff3df2" fill-opacity="0.35"/>
+      <g fill="#ff3df2">
+        <circle cx="72" cy="566" r="3.5"/>
+        <circle cx="72" cy="615" r="3.5"/>
+        <circle cx="72" cy="664" r="3.5"/>
+        <circle cx="72" cy="690" r="3.5"/>
+      </g>
+      <g font-size="16" fill="#d7e3ff">
+        <text x="84" y="571">Claude Haiku / Sonnet / Opus · Codex · DeepSeek ·</text>
+        <text x="84" y="594">Gemini Argon · Muse · GLM · Grok · Kimi · Qwen</text>
+        <text x="84" y="620">Adapters: claude_cli · codex_cli · opencode_cli ·</text>
+        <text x="84" y="643">vscode_lm · kilo</text>
+        <text x="84" y="669">Parallel only when allowed_writes do not overlap</text>
+        <text x="84" y="695">The same runner relaunches its own rework</text>
+      </g>
+    </g>
+
+    <!-- L3 memory layer -->
+    <g id="panel-memory">
+      <rect x="40" y="738" width="660" height="270" rx="14" fill="url(#panelFill)"/>
+      <rect x="40" y="738" width="660" height="270" rx="14" fill="none" stroke="#a066ff" stroke-width="2" filter="url(#glow)"/>
+      <path d="M40 776V752Q40 738 54 738H78M700 970V994Q700 1008 686 1008H662" fill="none" stroke="#a066ff" stroke-width="5" stroke-linecap="round" filter="url(#glowSoft)"/>
+      <g fill="none" stroke="#a066ff" stroke-width="2.2" filter="url(#glowSoft)">
+        <circle cx="92" cy="786" r="26"/>
+        <ellipse cx="92" cy="775" rx="12" ry="5"/>
+        <path d="M80 775V797a12 5 0 0 0 24 0V775M80 786a12 5 0 0 0 24 0"/>
+      </g>
+      <text x="132" y="782" font-size="24" font-weight="700" letter-spacing="2" fill="#a066ff" filter="url(#glowSoft)">MEMORY LAYER</text>
+      <text x="132" y="810" font-size="17" font-style="italic" fill="#cdb3ff">Context that survives sessions</text>
+      <rect x="64" y="825" width="612" height="1.5" fill="#a066ff" fill-opacity="0.35"/>
+      <g fill="#a066ff">
+        <circle cx="72" cy="851" r="3.5"/>
+        <circle cx="72" cy="883" r="3.5"/>
+        <circle cx="72" cy="915" r="3.5"/>
+        <circle cx="72" cy="947" r="3.5"/>
+      </g>
+      <g font-size="16" fill="#d7e3ff">
+        <text x="84" y="856">Session Manager · AI Memory · Knowledge Base</text>
+        <text x="84" y="888">Context Graph for the manager seat</text>
+        <text x="84" y="920">Workers propose write intents, the manager approves</text>
+        <text x="84" y="952">A learning commit after every accept or reject</text>
+      </g>
+    </g>
+
+    <!-- R1 source graph -->
+    <g id="panel-source-graph">
+      <rect x="1220" y="168" width="660" height="270" rx="14" fill="url(#panelFill)"/>
+      <rect x="1220" y="168" width="660" height="270" rx="14" fill="none" stroke="#39ff88" stroke-width="2" filter="url(#glow)"/>
+      <path d="M1220 206V182Q1220 168 1234 168H1258M1880 400V424Q1880 438 1866 438H1842" fill="none" stroke="#39ff88" stroke-width="5" stroke-linecap="round" filter="url(#glowSoft)"/>
+      <g fill="none" stroke="#39ff88" stroke-width="2.2" filter="url(#glowSoft)">
+        <circle cx="1272" cy="216" r="26"/>
+        <path d="M1261 206L1284 203L1285 226L1265 229ZM1261 206L1285 226"/>
+      </g>
+      <g fill="#39ff88">
+        <circle cx="1261" cy="206" r="3.5"/>
+        <circle cx="1284" cy="203" r="3.5"/>
+        <circle cx="1285" cy="226" r="3.5"/>
+        <circle cx="1265" cy="229" r="3.5"/>
+      </g>
+      <text x="1312" y="212" font-size="24" font-weight="700" letter-spacing="2" fill="#39ff88" filter="url(#glowSoft)">SOURCE GRAPH</text>
+      <text x="1312" y="240" font-size="17" font-style="italic" fill="#a8ffc9">Code intelligence, graph first</text>
+      <rect x="1244" y="255" width="612" height="1.5" fill="#39ff88" fill-opacity="0.35"/>
+      <g fill="#39ff88">
+        <circle cx="1252" cy="281" r="3.5"/>
+        <circle cx="1252" cy="315" r="3.5"/>
+        <circle cx="1252" cy="349" r="3.5"/>
+      </g>
+      <g font-size="16" fill="#d7e3ff">
+        <text x="1264" y="286">1,474 files · 106,314 entities · 747,102 edges · 11 languages</text>
+        <text x="1264" y="320">focus · slice · body · bodygrep · calls · impact · testmap</text>
+        <text x="1264" y="354">PreToolUse guard: grep and raw reads are recorded fallbacks</text>
+      </g>
+    </g>
+
+    <!-- R2 quality gates -->
+    <g id="panel-quality-gates">
+      <rect x="1220" y="453" width="660" height="270" rx="14" fill="url(#panelFill)"/>
+      <rect x="1220" y="453" width="660" height="270" rx="14" fill="none" stroke="#ffc23d" stroke-width="2" filter="url(#glow)"/>
+      <path d="M1220 491V467Q1220 453 1234 453H1258M1880 685V709Q1880 723 1866 723H1842" fill="none" stroke="#ffc23d" stroke-width="5" stroke-linecap="round" filter="url(#glowSoft)"/>
+      <g fill="none" stroke="#ffc23d" stroke-width="2.2" filter="url(#glowSoft)">
+        <circle cx="1272" cy="501" r="26"/>
+        <path d="M1272 485L1286 491V502Q1286 513 1272 519Q1258 513 1258 502V491Z"/>
+        <path d="M1265 502L1270 508L1280 496"/>
+      </g>
+      <text x="1312" y="497" font-size="24" font-weight="700" letter-spacing="2" fill="#ffc23d" filter="url(#glowSoft)">QUALITY GATES</text>
+      <text x="1312" y="525" font-size="17" font-style="italic" fill="#ffe0a3">Mechanical gates before any opinion</text>
+      <rect x="1244" y="540" width="612" height="1.5" fill="#ffc23d" fill-opacity="0.35"/>
+      <g fill="#ffc23d">
+        <circle cx="1252" cy="566" r="3.5"/>
+        <circle cx="1252" cy="594" r="3.5"/>
+        <circle cx="1252" cy="622" r="3.5"/>
+        <circle cx="1252" cy="650" r="3.5"/>
+        <circle cx="1252" cy="678" r="3.5"/>
+      </g>
+      <g font-size="16" fill="#d7e3ff">
+        <text x="1264" y="571">Syntax · known-bug patterns · destructive diff · required outputs</text>
+        <text x="1264" y="599">Validation inside a Windows AppContainer sandbox</text>
+        <text x="1264" y="627">Worktrees sealed by hash</text>
+        <text x="1264" y="655">6 reviewer lenses, high-risk work needs a reviewer pair</text>
+        <text x="1264" y="683">HMAC-authenticated audit ledger</text>
+      </g>
+    </g>
+
+    <!-- R3 needfix loop -->
+    <g id="panel-needfix-loop">
+      <rect x="1220" y="738" width="660" height="270" rx="14" fill="url(#panelFill)"/>
+      <rect x="1220" y="738" width="660" height="270" rx="14" fill="none" stroke="#ff5a36" stroke-width="2" filter="url(#glow)"/>
+      <path d="M1220 776V752Q1220 738 1234 738H1258M1880 970V994Q1880 1008 1866 1008H1842" fill="none" stroke="#ff5a36" stroke-width="5" stroke-linecap="round" filter="url(#glowSoft)"/>
+      <g fill="none" stroke="#ff5a36" stroke-width="2.2" filter="url(#glowSoft)">
+        <circle cx="1272" cy="786" r="26"/>
+        <path d="M1282.4 780A12 12 0 1 0 1282.4 792"/>
+      </g>
+      <path d="M1284.9 787.7L1284.9 795.7L1277.9 791.7Z" fill="#ff5a36"/>
+      <text x="1312" y="782" font-size="24" font-weight="700" letter-spacing="2" fill="#ff5a36" filter="url(#glowSoft)">NEEDFIX LOOP</text>
+      <text x="1312" y="810" font-size="17" font-style="italic" fill="#ffb19e">Every obstacle becomes a card</text>
+      <rect x="1244" y="825" width="612" height="1.5" fill="#ff5a36" fill-opacity="0.35"/>
+      <g fill="#ff5a36">
+        <circle cx="1252" cy="851" r="3.5"/>
+        <circle cx="1252" cy="885" r="3.5"/>
+        <circle cx="1252" cy="919" r="3.5"/>
+      </g>
+      <g font-size="16" fill="#d7e3ff">
+        <text x="1264" y="856">capture → triage → accept → preview → convert</text>
+        <text x="1264" y="890">The card runs, is reviewed, then accepted</text>
+        <text x="1264" y="924">A "Resolves: NF-…" commit trailer closes it automatically</text>
+      </g>
+    </g>
+
+    <!-- center spine: task MCP control plane -->
+    <rect x="770" y="168" width="380" height="840" rx="20" fill="#050c1f" fill-opacity="0.85" stroke="#22e5ff" stroke-opacity="0.55" stroke-width="1.5" filter="url(#glowSoft)"/>
+    <text x="960" y="199" text-anchor="middle" font-size="17" font-weight="700" letter-spacing="4" fill="#22e5ff" filter="url(#glowSoft)">TASK MCP CONTROL PLANE</text>
+    <rect x="956" y="214" width="8" height="762" rx="4" fill="url(#spineGrad)" opacity="0.7" filter="url(#glowBig)"/>
+
+    <!-- connectors from panels to the spine -->
+    <g fill="none" stroke-width="2" filter="url(#glow)">
+      <path d="M700 303H735V331H800" stroke="#22e5ff"/>
+      <path d="M700 588H735V507H800" stroke="#ff3df2"/>
+      <path d="M700 873H735V947H800" stroke="#a066ff"/>
+      <path d="M1220 303H1185V419H1120" stroke="#39ff88"/>
+      <path d="M1220 588H1185V595H1120" stroke="#ffc23d"/>
+      <path d="M1220 873H1185V771H1120" stroke="#ff5a36"/>
+    </g>
+    <g>
+      <circle cx="700" cy="303" r="4" fill="#22e5ff"/>
+      <circle cx="700" cy="588" r="4" fill="#ff3df2"/>
+      <circle cx="700" cy="873" r="4" fill="#a066ff"/>
+      <circle cx="1220" cy="303" r="4" fill="#39ff88"/>
+      <circle cx="1220" cy="588" r="4" fill="#ffc23d"/>
+      <circle cx="1220" cy="873" r="4" fill="#ff5a36"/>
+    </g>
+
+    <!-- spine arrows -->
+    <g fill="none" stroke="#bff6ff" stroke-width="2" marker-end="url(#arrow)" filter="url(#glowSoft)">
+      <path d="M960 274V299"/>
+      <path d="M960 362V387"/>
+      <path d="M960 450V475"/>
+      <path d="M960 538V563"/>
+      <path d="M960 626V651"/>
+      <path d="M960 714V739"/>
+      <path d="M960 802V827"/>
+      <path d="M960 890V915"/>
+    </g>
+
+    <!-- spine flow nodes -->
+    <g stroke-width="1.8" filter="url(#glowSoft)" fill="#081530">
+      <rect x="800" y="214" width="320" height="58" rx="12" stroke="#e8f7ff"/>
+      <rect x="800" y="302" width="320" height="58" rx="12" stroke="#22e5ff"/>
+      <rect x="800" y="390" width="320" height="58" rx="12" stroke="#22e5ff"/>
+      <rect x="800" y="478" width="320" height="58" rx="12" stroke="#ff3df2"/>
+      <rect x="800" y="566" width="320" height="58" rx="12" stroke="#ffc23d"/>
+      <rect x="800" y="654" width="320" height="58" rx="12" stroke="#ffc23d"/>
+      <rect x="800" y="742" width="320" height="58" rx="12" stroke="#39ff88"/>
+      <rect x="800" y="830" width="320" height="58" rx="12" stroke="#39ff88"/>
+      <rect x="800" y="918" width="320" height="58" rx="12" stroke="#a066ff"/>
+    </g>
+    <g font-family="Consolas, Menlo, monospace" font-size="14">
+      <text x="818" y="248" fill="#e8f7ff">01</text>
+      <text x="818" y="336" fill="#22e5ff">02</text>
+      <text x="818" y="424" fill="#22e5ff">03</text>
+      <text x="818" y="512" fill="#ff3df2">04</text>
+      <text x="818" y="600" fill="#ffc23d">05</text>
+      <text x="818" y="688" fill="#ffc23d">06</text>
+      <text x="818" y="776" fill="#39ff88">07</text>
+      <text x="818" y="864" fill="#39ff88">08</text>
+      <text x="818" y="952" fill="#a066ff">09</text>
+    </g>
+    <g text-anchor="middle" font-size="18" font-weight="700" letter-spacing="1.5" fill="#f2f8ff">
+      <text x="960" y="249">OWNER</text>
+      <text x="960" y="337">MANAGER SEAT</text>
+      <text x="960" y="425">CARD</text>
+      <text x="960" y="513">WORKER<tspan font-size="15" font-weight="400" letter-spacing="0" fill="#ffa8f8"> (isolated worktree)</tspan></text>
+      <text x="960" y="601">GATES</text>
+      <text x="960" y="689">REVIEW</text>
+      <text x="960" y="777">ACCEPT</text>
+      <text x="960" y="865">CANONICAL TREE</text>
+      <text x="960" y="953">LEARNING COMMIT</text>
+    </g>
+
+    <!-- bottom strip: phase rail -->
+    <rect x="40" y="1051" width="1840" height="2" fill="#22e5ff" fill-opacity="0.25"/>
+    <g fill="#081530" stroke-width="1.6" filter="url(#glowSoft)">
+      <rect x="40" y="1032" width="160" height="40" rx="20" stroke="#22e5ff"/>
+      <rect x="250" y="1032" width="160" height="40" rx="20" stroke="#39ff88"/>
+      <rect x="460" y="1032" width="160" height="40" rx="20" stroke="#22e5ff"/>
+      <rect x="670" y="1032" width="160" height="40" rx="20" stroke="#22e5ff"/>
+      <rect x="880" y="1032" width="160" height="40" rx="20" stroke="#ff3df2"/>
+      <rect x="1090" y="1032" width="160" height="40" rx="20" stroke="#ffc23d"/>
+      <rect x="1300" y="1032" width="160" height="40" rx="20" stroke="#ffc23d"/>
+      <rect x="1510" y="1032" width="160" height="40" rx="20" stroke="#39ff88"/>
+      <rect x="1720" y="1032" width="160" height="40" rx="20" stroke="#a066ff"/>
+    </g>
+    <g fill="none" stroke="#bff6ff" stroke-width="2" marker-end="url(#arrow)">
+      <path d="M206 1052H244"/>
+      <path d="M416 1052H454"/>
+      <path d="M626 1052H664"/>
+      <path d="M836 1052H874"/>
+      <path d="M1046 1052H1084"/>
+      <path d="M1256 1052H1294"/>
+      <path d="M1466 1052H1504"/>
+      <path d="M1676 1052H1714"/>
+    </g>
+    <g font-family="Consolas, Menlo, monospace" font-size="16" font-weight="700" letter-spacing="1" text-anchor="middle" fill="#eaf6ff">
+      <text x="120" y="1058">BOOTSTRAP</text>
+      <text x="330" y="1058">GRAPH</text>
+      <text x="540" y="1058">PLAN</text>
+      <text x="750" y="1058">CARD</text>
+      <text x="960" y="1058">WORK</text>
+      <text x="1170" y="1058">GATES</text>
+      <text x="1380" y="1058">REVIEW</text>
+      <text x="1590" y="1058">ACCEPT</text>
+      <text x="1800" y="1058">LEARN</text>
+    </g>
+
+    <!-- bottom strip: stat chips -->
+    <g fill="#081530" stroke-width="1.6" filter="url(#glowSoft)">
+      <rect x="340" y="1098" width="200" height="44" rx="8" stroke="#22e5ff"/>
+      <rect x="570" y="1098" width="240" height="44" rx="8" stroke="#ffc23d"/>
+      <rect x="840" y="1098" width="170" height="44" rx="8" stroke="#ff3df2"/>
+      <rect x="1040" y="1098" width="540" height="44" rx="8" stroke="#a066ff"/>
+    </g>
+    <g font-family="Consolas, Menlo, monospace" font-size="18" text-anchor="middle" fill="#eaf6ff">
+      <text x="440" y="1126">213 MCP tools</text>
+      <text x="690" y="1126">6 reviewer lenses</text>
+      <text x="925" y="1126">84 workers</text>
+      <text x="1310" y="1126">VS Code extension · dashboard · manager console</text>
+    </g>
+  </g>
+</svg>
