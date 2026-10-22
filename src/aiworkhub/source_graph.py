@@ -6524,8 +6524,160 @@ def slice_(
     )
 
 
+_LINE_TARGET_PATTERN = re.compile(r"^(?P<path>.+):(?P<line>[0-9]{1,9})$")
+_LINE_TARGET_SNIPPET_LINES = 40
+
+
+def _parse_line_target(conn: sqlite3.Connection, query: str) -> tuple[str, int] | None:
+    """Split ``<indexed file>:<line>`` into ``(file_path, line)``; ``None`` otherwise.
+
+    The path must be exactly an indexed ``files`` row, so a symbol query that
+    merely contains a colon, or a path nobody indexed, keeps the behaviour it
+    always had.
+    """
+
+    match = _LINE_TARGET_PATTERN.match(str(query or "").strip())
+    if match is None:
+        return None
+    line = int(match["line"])
+    file_path = match["path"].replace("\\", "/")
+    indexed = conn.execute("SELECT 1 FROM files WHERE file_path = ?", (file_path,)).fetchone()
+    return (file_path, line) if line >= 1 and indexed else None
+
+
+def _entity_at_line(
+    conn: sqlite3.Connection, file_path: str, line: int, *, preceding: bool = False,
+) -> dict[str, Any] | None:
+    """The innermost function/method/class/struct whose lines cover ``line``.
+
+    The smallest span wins, so a nested function beats the function around it
+    and a method beats its class. ``preceding=True`` instead takes the
+    definition ending nearest before ``line``, for a line no definition covers.
+    """
+
+    params: tuple[int, ...]
+    if preceding:
+        condition, params = "line_end < ?", (line,)
+        order_by = "line_end DESC, line_start, qualname"
+    else:
+        condition, params = "line_start <= ? AND line_end >= ?", (line, line)
+        order_by = "line_end - line_start, line_start DESC, LENGTH(qualname) DESC, qualname"
+    kinds = sorted(_CALLS_DEFINITION_KINDS)
+    placeholders = ",".join("?" for _ in kinds)
+    row = conn.execute(
+        "SELECT file_path, kind, name, qualname, line_start, line_end, signature, "
+        "evidence_label, confidence FROM entities "
+        f"WHERE file_path = ? AND kind IN ({placeholders}) AND {condition} "
+        f"ORDER BY {order_by} LIMIT 1",
+        (file_path, *kinds, *params),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _line_target_window(target: dict[str, Any], line: int) -> tuple[int, int]:
+    """Lines of ``target`` worth showing: a short symbol whole, else those around ``line``."""
+
+    start = int(target["line_start"])
+    end = max(start, int(target["line_end"]))
+    span = _LINE_TARGET_SNIPPET_LINES
+    if end - start + 1 <= span:
+        return start, end
+    anchor = min(max(line, start), end)
+    first = min(max(start, anchor - span // 2), end - span + 1)
+    return first, first + span - 1
+
+
+def _line_target_context(
+    conn: sqlite3.Connection, repo_root: Path, query: str, budget: int,
+    file_path: str, line: int,
+) -> dict[str, Any] | None:
+    """Context for ``<indexed file>:<line>``, led by the symbol around that line.
+
+    ``context()`` lists a file's first entities by position, so a line inside a
+    function answered with the module's imports and a line deep in a large file
+    was out of reach. Here the innermost function/method/class enclosing
+    ``line`` comes first with its source (``line_resolution`` ``enclosing``); a
+    module-level line gets the nearest definition before it
+    (``nearest_preceding``). The entities and edges that follow lie inside that
+    symbol, nearest the line first. ``None`` means no definition sits at or
+    before ``line``.
+    """
+
+    resolution = "enclosing"
+    target = _entity_at_line(conn, file_path, line)
+    if target is None:
+        resolution = "nearest_preceding"
+        target = _entity_at_line(conn, file_path, line, preceding=True)
+    if target is None:
+        return None
+    per_file = max(1, min(8, budget))
+    start, end = int(target["line_start"]), int(target["line_end"])
+    neighbours = [
+        {**dict(row), "file_path": file_path} for row in conn.execute(
+            "SELECT kind, name, qualname, line_start, line_end, signature, evidence_label, "
+            "confidence FROM entities WHERE file_path = ? AND line_start BETWEEN ? AND ? "
+            "AND NOT (kind = ? AND qualname = ? AND line_start = ?) "
+            "ORDER BY ABS(line_start - ?), line_start, qualname LIMIT ?",
+            (file_path, start, end, target["kind"], target["qualname"], start, line, per_file),
+        )
+    ]
+    edges = [
+        {**dict(row), "file_path": file_path} for row in conn.execute(
+            "SELECT kind, src_qualname, dst_name, dst_qualname, line, evidence_label, "
+            "confidence FROM edges WHERE file_path = ? AND line BETWEEN ? AND ? "
+            "ORDER BY ABS(line - ?), line LIMIT ?",
+            (file_path, start, end, line, per_file + 1),
+        )
+    ]
+    fresh = _file_freshness_state(conn, repo_root, file_path)
+    is_fresh = fresh["state"] == "fresh"
+    marked = {**target, "line_resolution": resolution}
+    first_line, last_line = _line_target_window(target, line)
+    source = _source_snippet(
+        repo_root, {**target, "line_start": first_line, "line_end": last_line},
+        max_chars=4000, fresh=is_fresh,
+    )
+    lead = {**marked, "source": source}
+    entities = [lead, *neighbours[: per_file - 1]]
+    for entity in entities[1:4]:
+        if entity.get("kind") in _CALLS_DEFINITION_KINDS:
+            entity["source"] = _source_snippet(repo_root, entity, max_chars=800, fresh=is_fresh)
+    # ``context()`` supplies only the file header; its position-ordered rows are replaced.
+    item = context(conn, file_path)
+    item.update({
+        "freshness": fresh, "line_resolution": resolution,
+        "entities": entities, "edges": edges[:per_file],
+    })
+    insights = sginsights.slice_insights(conn, repo_root, [marked], budget=min(budget, 32))
+    payload = _fit_payload_bytes({
+        "mode": "context", "query": query, "budget": budget,
+        "matches": [marked], "contexts": [item], "candidate_files": [file_path],
+        "insights": insights,
+        "freshness": _overall_freshness({file_path: fresh}),
+        "truncated": len(neighbours) >= per_file or len(edges) > per_file,
+        "line_target": {"file_path": file_path, "line": line},
+        "line_resolution": resolution,
+    }, max(4096, budget * 768))
+    # Fitting may shorten ``source``. The line range has to describe the
+    # snippet that remains, not the one that existed before the cut.
+    contexts = payload.get("contexts")
+    if isinstance(contexts, list) and contexts and isinstance(contexts[0], dict):
+        fitted = contexts[0].get("entities")
+        if isinstance(fitted, list) and fitted and isinstance(fitted[0], dict):
+            fitted_source = fitted[0].get("source")
+            if isinstance(fitted_source, str) and fitted_source:
+                fitted[0]["source_lines"] = [
+                    first_line, first_line + fitted_source.count("\n"),
+                ]
+    return payload
+
+
 def context_query(repo_root: Path, query: str, budget: int = 64) -> dict[str, Any]:
-    """Return exact file context, resolving a semantic term to its top file."""
+    """Return exact file context, resolving a semantic term to its top file.
+
+    ``<indexed file>:<line>`` answers with the symbol around that line first (see
+    ``_line_target_context``) instead of the file's first entities.
+    """
 
     budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
     db_path = resolve_db_path(repo_root)
@@ -6533,8 +6685,18 @@ def context_query(repo_root: Path, query: str, budget: int = 64) -> dict[str, An
     file_freshness: dict[str, dict[str, Any]] = {}
     try:
         exact = conn.execute("SELECT 1 FROM files WHERE file_path=?", (query,)).fetchone()
-        matches = find(conn, query, limit=budget)
-        files = [query] if exact else _candidate_files(matches, limit=min(8, budget))
+        line_target = None if exact else _parse_line_target(conn, query)
+        if line_target is not None:
+            focused = _line_target_context(conn, repo_root, query, budget, *line_target)
+            if focused is not None:
+                return focused
+        # With no definition at or before the line, the file itself answers.
+        lookup = line_target[0] if line_target is not None else query
+        matches = find(conn, lookup, limit=budget)
+        files = (
+            [lookup] if exact or line_target is not None
+            else _candidate_files(matches, limit=min(8, budget))
+        )
         contexts: list[dict[str, Any]] = []
         remaining = budget
         for path in files[:4]:
@@ -6559,14 +6721,19 @@ def context_query(repo_root: Path, query: str, budget: int = 64) -> dict[str, An
         insights = sginsights.slice_insights(
             conn, repo_root, matches, budget=min(budget, 32),
         ) if matches else {}
-        return _fit_payload_bytes({
+        payload: dict[str, Any] = {
             "mode": "context", "query": query, "budget": budget,
             "matches": matches[: min(budget, 8)], "contexts": rows,
             "candidate_files": files[:4],
             "insights": insights,
             "freshness": _overall_freshness(file_freshness),
             "truncated": truncated,
-        }, max(4096, budget * 768))
+        }
+        if line_target is not None:
+            # No definition sits at or before the line, so the file itself answered.
+            payload["line_target"] = {"file_path": lookup, "line": line_target[1]}
+            payload["line_resolution"] = "none"
+        return _fit_payload_bytes(payload, max(4096, budget * 768))
     finally:
         conn.close()
 
@@ -7259,8 +7426,13 @@ def _resolve_calls_query_symbol(
 
 def _calls_edges_for_symbol(
     conn: sqlite3.Connection, symbol: dict[str, Any], *, limit: int,
+    include_incoming: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Call edges whose caller or callee IS ``symbol``, not merely its file."""
+    """Call edges whose caller or callee IS ``symbol``, not merely its file.
+
+    ``include_incoming=False`` returns only the calls ``symbol`` itself makes:
+    its callers are recorded against other symbols, often in other files.
+    """
 
     cap = max(1, int(limit))
     qualname = str(symbol.get("qualname") or "")
@@ -7271,6 +7443,8 @@ def _calls_edges_for_symbol(
         "ORDER BY e.confidence DESC, e.file_path, e.line LIMIT ?",
         (qualname, cap),
     )]
+    if not include_incoming:
+        return outgoing[:cap], []
     incoming = [dict(row) for row in conn.execute(
         _CALLS_EDGE_SELECT
         + "WHERE e.kind='calls' AND e.dst_qualname = ? "
@@ -7355,6 +7529,103 @@ def _bind_calls_to_query_symbol(
     return payload
 
 
+def _resolve_calls_line_target(
+    conn: sqlite3.Connection, query: str, scope: str, repo_root: Path,
+) -> tuple[tuple[str, int] | None, dict[str, Any] | None, str, dict[str, Any] | None]:
+    """Resolve a ``<indexed file>:<line>`` query to the symbol enclosing that line.
+
+    The first item is ``None`` when ``query`` is not a line target at all, which
+    leaves every other query on the symbol-name resolution above. An explicit
+    ``scope`` is never widened: a line in a file outside it names no symbol.
+    The fourth item is that file's freshness (``_file_freshness_state``). A
+    stale file's stored line numbers no longer describe it, so the binding is
+    returned with that fact attached rather than silently trusted.
+    """
+
+    line_target = _parse_line_target(conn, query)
+    if line_target is None:
+        return None, None, "", None
+    file_path, line = line_target
+    fresh = _file_freshness_state(conn, repo_root, file_path)
+    if scope and not _path_in_analytics_scope(file_path, scope):
+        return line_target, None, "line_target_outside_target_scope", fresh
+    symbol = _entity_at_line(conn, file_path, line)
+    if symbol is None:
+        return line_target, None, "no_enclosing_symbol_at_line", fresh
+    return line_target, symbol, "enclosing_symbol_at_line", fresh
+
+
+def _bind_calls_to_line_target(
+    payload: dict[str, Any], conn: sqlite3.Connection, *,
+    query: str, limit: int, line_target: tuple[str, int],
+    symbol: dict[str, Any] | None, resolution: str,
+    freshness: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Make ``calls`` answer about the symbol enclosing a ``path:line`` target.
+
+    A line target used to be matched token by token against the whole
+    repository, so ``vscode-extension/extension.js:1097`` came back with call
+    edges recorded in unrelated C++ files. It names exactly one symbol, so
+    the edges returned are that symbol's own calls and the calls that name
+    it. Callers live in other symbols, often in other files; omitting them
+    published a false "no callers" claim. An empty list is a valid answer:
+    the symbol may call nothing and nothing may call it, and a line outside
+    every definition names no symbol. A file edited since indexing still
+    binds, but ``freshness`` and ``line_binding_unreliable`` say the stored
+    line numbers can no longer be trusted.
+    """
+
+    file_path, line = line_target
+    query_symbol: dict[str, Any] = {
+        "requested": str(query or "").strip(),
+        "resolved": None,
+        "resolution": resolution,
+        "file_path": file_path,
+        "line": line,
+        "edges_truncated": False,
+    }
+    if freshness is not None:
+        state = str(freshness.get("state") or "unknown")
+        query_symbol["freshness"] = state
+        # Indexed line numbers describe a different generation of a stale,
+        # missing, or unverifiable file. Keep the bind so the caller can see
+        # what the index claims, but do not let it look certain.
+        unreliable = state != "fresh"
+        query_symbol["line_binding_unreliable"] = unreliable
+        payload["freshness"] = state
+        payload["line_binding_unreliable"] = unreliable
+    outgoing: list[dict[str, Any]] = []
+    incoming: list[dict[str, Any]] = []
+    files = [file_path]
+    if symbol is None:
+        payload["scope"] = "line_target_unresolved"
+        if resolution == "line_target_outside_target_scope":
+            files = []
+    else:
+        # One row past ``limit`` shows the list was cut without a second query.
+        # Both directions count: a budget that fits the calls this symbol makes
+        # can still cut the calls that name it.
+        outgoing, incoming = _calls_edges_for_symbol(
+            conn, symbol, limit=limit + 1, include_incoming=True,
+        )
+        query_symbol["edges_truncated"] = (
+            len(outgoing) > limit or len(incoming) > limit
+        )
+        outgoing = outgoing[:limit]
+        incoming = incoming[:limit]
+        payload["scope"] = "line_target_symbol"
+        query_symbol.update({
+            "resolved": str(symbol.get("qualname") or ""),
+            "line_start": symbol.get("line_start"),
+            "line_end": symbol.get("line_end"),
+        })
+    payload["outgoing_calls"] = outgoing
+    payload["incoming_calls"] = incoming
+    payload["files"] = files
+    payload["query_symbol"] = query_symbol
+    return payload
+
+
 def analytics_query(
     repo_root: Path,
     mode: str,
@@ -7417,6 +7688,21 @@ def analytics_query(
             # stale. Guarding on ``offset`` alone silently accepted a
             # zero-offset cursor for coverage/testmap (NF-2026-00554).
             raise SourceGraphError("invalid_cursor")
+        line_target: tuple[str, int] | None = None
+        line_symbol: dict[str, Any] | None = None
+        line_resolution = ""
+        line_edges_truncated = False
+        line_freshness: dict[str, Any] | None = None
+        if mode == "calls":
+            line_target, line_symbol, line_resolution, line_freshness = _resolve_calls_line_target(
+                conn, query, normalized_target, repo_root,
+            )
+        if line_target is not None:
+            # ``calls`` for ``path:line`` is about the one symbol around that line,
+            # so the corpus is that symbol -- never the rows the query's tokens
+            # happen to match, which belong to unrelated files.
+            corpus = [line_symbol] if line_symbol is not None else []
+            corpus_cap = MAX_ANALYTICS_CORPUS_ROWS
         # An explicit target is a SCOPE, not a filter. The corpus was previously
         # built the other way round -- ``find(query)`` decided membership and the
         # target then filtered what that query happened to match -- so a lens saw
@@ -7439,7 +7725,7 @@ def analytics_query(
         # The query is not discarded: it still reaches every per-mode analytic as
         # ``query_text``, so a mode that ranks by relevance still can. What it no
         # longer does is decide who is in scope.
-        if normalized_target:
+        elif normalized_target:
             corpus = _scoped_entity_rows(
                 conn, normalized_target, limit=MAX_ANALYTICS_CORPUS_ROWS,
             )
@@ -7482,11 +7768,21 @@ def analytics_query(
         analytic_budget = offset + budget if is_pageable_mode else budget
         page_len = max(0, min(budget, total_eligible - offset))
         pending_next_offset = offset + page_len
-        if normalized_target and not corpus:
+        if line_target is not None and line_symbol is None:
+            # No definition encloses the line, or its file lies outside the explicit
+            # scope. Nothing is left to analyse, and the per-mode analytic's own
+            # no-match fallback is a repository-wide default -- the one answer a
+            # line target must never get -- so no analytic runs at all.
+            payload: dict[str, Any] = _bind_calls_to_line_target(
+                {"mode": mode, "query": query, "budget": budget}, conn, query=query,
+                limit=analytic_budget, line_target=line_target, symbol=None,
+                resolution=line_resolution, freshness=line_freshness,
+            )
+        elif normalized_target and not corpus:
             # An explicit scope with zero eligible rows must stay empty --
             # never let the per-mode analytic's own no-match fallback widen
             # the response back out to a repository-wide default.
-            payload: dict[str, Any] = {
+            payload = {
                 "mode": mode, "query": query, "budget": budget,
                 "scope": "target_scope_empty",
             }
@@ -7506,10 +7802,18 @@ def analytics_query(
                 # paging and before scope re-assertion so a page is a page of
                 # that symbol's own edges, and so the engine still gets the last
                 # word on scope afterwards.
-                payload = _bind_calls_to_query_symbol(
-                    payload, conn, query=query, scope=normalized_target,
-                    limit=analytic_budget,
-                )
+                if line_target is not None:
+                    payload = _bind_calls_to_line_target(
+                        payload, conn, query=query, limit=analytic_budget,
+                        line_target=line_target, symbol=line_symbol,
+                        resolution=line_resolution, freshness=line_freshness,
+                    )
+                    line_edges_truncated = bool(payload["query_symbol"]["edges_truncated"])
+                else:
+                    payload = _bind_calls_to_query_symbol(
+                        payload, conn, query=query, scope=normalized_target,
+                        limit=analytic_budget,
+                    )
             if offset:
                 payload = _drop_analytics_result_prefix(payload, mode, offset)
             payload = _enforce_analytics_target_scope(payload, mode, corpus, normalized_target, conn)
@@ -7599,6 +7903,7 @@ def analytics_query(
         }
         payload["truncated"] = (
             next_cursor is not None or byte_trimmed or related_evidence_truncated
+            or line_edges_truncated
         )
         payload = _fit_payload_bytes(payload, byte_cap)
         return payload
