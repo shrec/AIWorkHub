@@ -6,6 +6,24 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.64] - 2026-10-23
+
+### Added
+
+- Every MCP tool publishes its parameter descriptions and tool annotations from its docstring, and every dashboard tool carries a TDQS-complete docstring.
+- The AIWorkHub ecosystem poster is in the docs as SVG and 4K PNG.
+
+### Fixed
+
+- A `vscode_lm` worker is never ended by a fixed turn count: twelve consecutive turns without novel Source Graph evidence or a new validated stage force its endgame, a reviewer is forced to submit after three stalled turns, and a reviewer or worker that keeps finding new evidence is bounded only by cancellation, the deadline and the supervisor's wall clock (NF-2026-01632); the extension test teardown stops the exact module instance it bound (NF-2026-01657).
+- `agent_launch_task` derives the adapter from the workforce catalog for a runner family with no adapter tuple, so `xai_grok-4.6` launches without an explicit `adapter_id` (NF-2026-01660).
+- `needfix_preview_convert` and `needfix_convert` refuse a card whose `read_first` or `immutable_inputs` path does not exist, with the launcher's own reason, instead of creating a card that can never launch (NF-2026-01659).
+- Kilo under the Windows AppContainer sandbox gets pre-created, granted XDG homes and `BUN_TMPDIR` (NF-2026-01649).
+- `retry_finalization` refuses the host lane for CLI adapters before it authorizes the retry (NF-2026-01645), and a worker that is still finalizing is reported live, not dead (NF-2026-01647).
+- Source Graph answers a `path:line` target with the enclosing symbol (NF-2026-01646), and the Claude Code tool guard treats review worktree mirrors as indexed source (NF-2026-01653).
+- Worktree GC accepts the repository-owned worktree root (NF-2026-01651); the reconciler releases processing claims whose launch never started (NF-2026-01634); an orphan-returned NeedFix conversion counts as a durable reopen (NF-2026-01629); an enabled workforce row wins the runner over a disabled twin (NF-2026-01638); a glob in `allowed_writes` covers `required_outputs` on the `vscode_lm` bridge (NF-2026-01636); a learning commit accepts an auto-archived accepted card (NF-2026-01631).
+- Sandboxed extension test runs and extension shutdown no longer hang (NF-2026-01644, NF-2026-01648, NF-2026-01650, NF-2026-01654), and launcher tests pin the workforce cap instead of reading host cores (NF-2026-01640).
+
 ## [0.12.63] - 2026-10-21
 
 ### Fixed

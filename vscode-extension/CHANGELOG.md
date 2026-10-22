@@ -1,5 +1,11 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.64 — 2026-10-23
+
+### Fixed
+
+- Bundled runtime 0.12.64: VS Code LM worker and reviewer loops stop on stalled progress instead of a fixed turn count (NF-2026-01632); runner families without an adapter mapping derive the adapter from the workforce catalog (NF-2026-01660); NeedFix conversion refuses a card whose read_first input is missing (NF-2026-01659); MCP tools publish parameter descriptions and annotations.
+
 ## 0.12.63 — 2026-10-21
 
 ### Fixed

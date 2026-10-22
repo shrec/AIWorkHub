@@ -23,9 +23,9 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.12.63
+## What's new in 0.12.64
 
-- A card that touches more than 64 files can be reviewed again (the reviewer packet used to refuse it outright), and a NeedFix stuck half-way through conversion can be released and finished.
+- A model working on a card is now stopped when it stops making progress, not after a fixed number of turns, so long but productive work finishes; Grok launches without naming an adapter; a NeedFix whose card would miss a required input is refused before conversion; and every MCP tool now describes its parameters.
 
 ## Review automation
 
