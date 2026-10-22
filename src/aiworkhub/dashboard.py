@@ -1637,6 +1637,23 @@ def _process_liveness_fields(row: Mapping[str, Any], status_path_raw: str) -> di
     return {key: value for key, value in result.items() if value is not None}
 
 
+def _finalizing_liveness_fields(row: Mapping[str, Any], status_path_raw: str) -> dict[str, Any]:
+    """Finalizer-owned liveness for a FINALIZATION_PENDING row; ``{}`` unless that finalizer is provably alive."""
+    finalizing = process_launcher.finalizer_liveness(
+        row, process_launcher.read_supervisor_status(Path(status_path_raw))
+    )
+    if not finalizing:
+        return {}
+    fields = {
+        "liveness_state": finalizing["liveness_state"],
+        "heartbeat_age_seconds": finalizing["heartbeat_age_seconds"],
+    }
+    progress = process_launcher.format_finalization_progress(finalizing.get("finalization_progress"))
+    if progress:
+        fields["validation_progress"] = progress
+    return fields
+
+
 def _merge_process_liveness_into_tasks(
     task_groups: Mapping[str, list[dict[str, Any]]],
     process_report: Mapping[str, Any],
@@ -1679,6 +1696,7 @@ def _merge_process_liveness_into_tasks(
             "supervisor_alive",
             "child_alive",
             "runtime_seconds",
+            "validation_progress",
         ):
             value = process_row.get(key)
             if value is not None:
@@ -1855,13 +1873,19 @@ def read_process_runs(
     )
     active_observed = 0
     for row in rows:
+        status_path_raw = status_paths.get(str(row.get("request_id") or ""))
+        if row.get("state") in process_launcher.FINALIZATION_PENDING_STATES:
+            # The supervisor exited by design; only the finalizer's own
+            # heartbeat can show this request is still being worked on.
+            if status_path_raw:
+                row.update(_finalizing_liveness_fields(row, status_path_raw))
+            continue
         # Liveness describes an active process lease.  A clean terminal row
         # (for example ``review_ready``) is expected to have no live PID or
         # heartbeat owner; deriving liveness for it mislabeled successful
         # completion as ``lost`` in the dashboard/workforce telemetry.
         if row.get("state") not in process_launcher.ACTIVE_PROCESS_STATES:
             continue
-        status_path_raw = status_paths.get(str(row.get("request_id") or ""))
         if status_path_raw:
             liveness_fields = _process_liveness_fields(row, status_path_raw)
             if liveness_fields:

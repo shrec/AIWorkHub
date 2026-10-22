@@ -75,6 +75,7 @@ def _install_sparse_worktree_stub_modules() -> None:
     process_launcher.PROCESS_LOG_ENV = "AIWORKHUB_TEST_PROCESS_LOG_STUB"
     process_launcher.LAUNCH_IMPLEMENTED = False
     process_launcher.ACTIVE_PROCESS_STATES = ()
+    process_launcher.FINALIZATION_PENDING_STATES = ()
     process_launcher.launch_gates_open = lambda: False
     process_launcher.read_supervisor_status = lambda _path: {}
     process_launcher._pid_matches = lambda *_args, **_kwargs: False

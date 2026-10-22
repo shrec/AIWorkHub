@@ -1090,6 +1090,17 @@ def read_supervisor_status(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+_SUPERVISOR_STATUS_WRITE_LOCK = threading.Lock()
+FINALIZER_STATUS_SECTION = "finalizer"
+FINALIZING_LIVENESS_STATE = "finalizing"
+FINALIZER_HEARTBEAT_INTERVAL_SECONDS = 5.0
+FINALIZER_COMMAND_MAX_CHARS = 200
+FINALIZER_CLOCK_SKEW_SECONDS = 30.0
+FINALIZER_VALIDATING_PHASE = "validating"
+FINALIZER_PROGRESS_MAX_TOTAL = 10_000
+FINALIZER_PROGRESS_MAX_SECONDS = 10_000_000.0
+
+
 def finalize_supervisor_record(
     path: Path, supervisor_status: dict[str, Any], terminal_state: str, error: str
 ) -> bool:
@@ -1105,20 +1116,188 @@ def finalize_supervisor_record(
         return False
     # Re-read immediately before writing: the supervisor may have published
     # its own terminal record after the caller's snapshot was taken.
-    on_disk = read_supervisor_status(path)
-    if str(on_disk.get("state") or "") not in {"starting", "running"}:
-        return False
-    try:
-        write_json_0600(path, {
-            **on_disk,
-            "state": terminal_state,
-            "error": str(on_disk.get("error") or error)[:500],
-            "finalized_by": "launcher",
-            "finalized_at_epoch": time.time(),
-        })
-    except OSError:
-        return False
+    with _SUPERVISOR_STATUS_WRITE_LOCK:
+        on_disk = read_supervisor_status(path)
+        if str(on_disk.get("state") or "") not in {"starting", "running"}:
+            return False
+        try:
+            write_json_0600(path, {
+                **on_disk,
+                "state": terminal_state,
+                "error": str(on_disk.get("error") or error)[:500],
+                "finalized_by": "launcher",
+                "finalized_at_epoch": time.time(),
+            })
+        except OSError:
+            return False
     return True
+
+
+def write_finalizer_heartbeat(path: Path, section: dict[str, Any] | None) -> bool:
+    """Set (``None`` clears) the finalizer section of an existing status record."""
+    with _SUPERVISOR_STATUS_WRITE_LOCK:
+        on_disk = read_supervisor_status(path)
+        if not on_disk:
+            return False  # absent or untrusted evidence is never rewritten
+        if section is None and FINALIZER_STATUS_SECTION not in on_disk:
+            return True
+        merged = {k: v for k, v in on_disk.items() if k != FINALIZER_STATUS_SECTION}
+        if section is not None:
+            merged[FINALIZER_STATUS_SECTION] = section
+        try:
+            write_json_0600(path, merged)
+        except OSError:
+            return False
+    return True
+
+
+def _bounded_finalization_progress(raw: Any) -> dict[str, Any]:
+    """Whitelisted, size-bounded copy of a finalizer progress record, else ``{}``."""
+    if not isinstance(raw, dict):
+        return {}
+    phase, total, elapsed = (raw.get(key) for key in ("phase", "total", "elapsed_seconds"))
+    if (
+        not isinstance(phase, str)
+        or type(total) is not int or not 0 <= total <= FINALIZER_PROGRESS_MAX_TOTAL
+        or type(elapsed) not in (int, float)
+        or not 0 <= elapsed <= FINALIZER_PROGRESS_MAX_SECONDS
+    ):
+        return {}
+    kept: list[str] = []
+    for char in phase:
+        if char.isprintable():
+            kept.append(char)
+            if len(kept) == FINALIZER_COMMAND_MAX_CHARS:
+                break
+    if not kept:
+        return {}
+    return {
+        "phase": "".join(kept),
+        "total": total,
+        "elapsed_seconds": round(elapsed, 1) + 0,
+    }
+
+
+def finalizer_liveness(
+    latest: dict[str, Any],
+    supervisor_status: dict[str, Any],
+    *,
+    now_epoch: float | None = None,
+) -> dict[str, Any]:
+    """``finalizing`` overlay when the exact finalizer of a pending request is alive, else ``{}``."""
+    section = supervisor_status.get(FINALIZER_STATUS_SECTION)
+    if latest.get("state") not in FINALIZATION_PENDING_STATES or not isinstance(section, dict):
+        return {}
+    now = time.time() if now_epoch is None else now_epoch
+    pid, ticks, beat = (
+        section.get(key) for key in ("pid", "pid_start_ticks", "heartbeat_at_epoch")
+    )
+    if (
+        type(pid) is not int or pid <= 0 or type(ticks) is not int
+        or type(beat) not in (int, float)
+        or not 0 <= beat <= now + FINALIZER_CLOCK_SKEW_SECONDS
+        or not _pid_matches(pid, ticks)
+    ):
+        return {}
+    age = derive_liveness_state(
+        now_epoch=now,
+        supervisor_alive=True,
+        heartbeat_at_epoch=beat,
+        last_output_change_epoch=None,
+    )
+    if age["liveness_state"] == "lost":
+        return {}
+    return {
+        "liveness_state": FINALIZING_LIVENESS_STATE,
+        "heartbeat_age_seconds": age["heartbeat_age_seconds"],
+        "finalization_progress": _bounded_finalization_progress(section),
+    }
+
+
+def format_finalization_progress(progress: Any) -> str:
+    """``validating N command(s), Ts`` for a finalization progress record, else ``""``."""
+    bounded = _bounded_finalization_progress(progress)
+    if not bounded:
+        return ""
+    return f"{bounded['phase']} {bounded['total']} command(s), {bounded['elapsed_seconds']}s"
+
+
+class _FinalizerHeartbeat:
+    """The finalizer's own heartbeat, published in the supervisor status record."""
+
+    _active = threading.local()
+
+    def __init__(self, request_id: str = "") -> None:
+        self._request_id = request_id
+        self._guard = threading.Lock()
+        self._path: Path | None = None
+        self._identity: dict[str, Any] = {}
+        self._phase = ""
+        self._total = 0
+        self._phase_started = time.monotonic()
+        self._stopped = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._enclosing: "_FinalizerHeartbeat | None" = None
+
+    def __enter__(self) -> "_FinalizerHeartbeat":
+        enclosing = getattr(self._active, "heartbeat", None)
+        if enclosing is not None and self._request_id and enclosing._request_id == self._request_id:
+            return enclosing  # a nested finalization of the same request shares one writer
+        self._enclosing = enclosing
+        self._active.heartbeat = self
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        if getattr(self._active, "heartbeat", None) is self:
+            self._active.heartbeat = self._enclosing
+            self.stop()
+
+    def start(self, path: Path) -> None:
+        if self._thread is not None or self._stopped.is_set():
+            return
+        pid = os.getpid()
+        ticks = _pid_start_ticks(pid)
+        if ticks is None:  # no exact identity to fence on: publish nothing
+            return
+        self._identity = {"pid": pid, "pid_start_ticks": ticks}
+        self._path = path
+        self.beat()
+        self._thread = threading.Thread(
+            target=self._run, name="aiworkhub-finalizer-heartbeat", daemon=True
+        )
+        self._thread.start()
+
+    def beat(self) -> None:
+        with self._guard:
+            if self._path is None:
+                return
+            write_finalizer_heartbeat(self._path, {
+                **self._identity,
+                "heartbeat_at_epoch": time.time(),
+                "phase": self._phase,
+                "total": self._total,
+                "elapsed_seconds": round(time.monotonic() - self._phase_started, 1),
+            })
+
+    def note(self, phase: str = "", total: int = 0) -> None:
+        with self._guard:
+            self._phase = phase
+            self._total = total
+            self._phase_started = time.monotonic()
+        self.beat()
+
+    def _run(self) -> None:
+        while not self._stopped.wait(FINALIZER_HEARTBEAT_INTERVAL_SECONDS):
+            self.beat()
+
+    def stop(self) -> None:
+        self._stopped.set()
+        with self._guard:
+            path, self._path = self._path, None
+            if path is not None:
+                write_finalizer_heartbeat(path, None)
+        if self._thread is not None:
+            self._thread.join(timeout=FINALIZER_HEARTBEAT_INTERVAL_SECONDS)
 
 
 def supervisor_pids_dead(latest: dict[str, Any]) -> bool:
@@ -10648,7 +10827,7 @@ class ProcessManager:
         lock_blocking: bool = True,
     ) -> dict[str, Any] | None:
         finalization_started = time.monotonic()
-        with self._request_lock(request_id, blocking=lock_blocking):
+        with self._request_lock(request_id, blocking=lock_blocking), _FinalizerHeartbeat(request_id) as heartbeat:
             events = self._request_events(request_id)
             if not events:
                 return None
@@ -10755,6 +10934,10 @@ class ProcessManager:
                     raise _PidIdentityUnknownDeferred("pid_identity_unknown")
                 terminate_supervisor = recheck.verdict is PidIdentityVerdict.MATCH
                 supervisor_alive = False
+
+            # Published before the first append/terminate: reconcile treats a
+            # pending request without a live finalizer heartbeat as dead.
+            heartbeat.start(status_path)
 
             if _requires_bridge_cancellation(metadata):
                 self._publish_bridge_cancellation_before_finalization(
@@ -11041,6 +11224,9 @@ class ProcessManager:
                 nonlocal validation_wall_duration_ms, full_validation_snapshot
                 phase_started = time.monotonic()
                 try:
+                    commands = _declared_validation_commands(metadata)
+                    if commands:
+                        heartbeat.note(FINALIZER_VALIDATING_PHASE, len(commands))
                     if not candidate_changed_paths:
                         return _run_declared_validations(workspace, metadata, metadata)
                     validations, full_validation_snapshot = (
@@ -11053,6 +11239,7 @@ class ProcessManager:
                     validation_wall_duration_ms += (
                         time.monotonic() - phase_started
                     ) * 1000.0
+                    heartbeat.note()
 
             # Read on finalize_failed: never mask a non-exited root cause (NF-2026-01069).
             claim_state = ""
@@ -12077,6 +12264,7 @@ class ProcessManager:
             heartbeat_at_epoch=supervisor_status.get("heartbeat_at_epoch"),
             last_output_change_epoch=supervisor_status.get("last_output_change_epoch"),
         )
+        liveness = {**liveness, **finalizer_liveness(latest, supervisor_status)}
         started_epoch = supervisor_status.get("started_at_epoch")
         runtime_seconds = (
             max(0.0, time.time() - float(started_epoch))
@@ -13067,6 +13255,16 @@ class ProcessManager:
         with ``validation_lane_forbidden_for_adapter:<adapter>`` before any
         event write or card transition (NF-2026-01645).
         """
+        with _FinalizerHeartbeat(request_id) as heartbeat:
+            return self._retry_finalization(request_id, task_id, validation_lane, heartbeat)
+
+    def _retry_finalization(
+        self,
+        request_id: str,
+        task_id: str,
+        validation_lane: str,
+        heartbeat: _FinalizerHeartbeat,
+    ) -> dict[str, Any]:
         if not core.writes_allowed():
             return {
                 "ok": False,
@@ -13302,6 +13500,9 @@ class ProcessManager:
                 metadata[_toolchain_authority.RECEIPT_CARD_KEY] = refreshed_receipt
             if refreshed_receipt is not None or host_lane:
                 write_json_0600(metadata_path, metadata)
+            # The retry owns the finalizer heartbeat from the moment the request
+            # reads as finalizing; the nested finalize shares it.
+            heartbeat.start(status_path)
             self._append_event({
                 **self._event_identity(events),
                 **_launcher_validation.host_lane_receipt_stamp(metadata),

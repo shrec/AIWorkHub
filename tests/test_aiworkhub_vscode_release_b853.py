@@ -120,6 +120,7 @@ def _ensure_aiworkhub_sibling_stubs() -> None:
     def _build_process_launcher(module: types.ModuleType) -> None:
         module.PROCESS_LOG_ENV = "AIWORKHUB_PROCESS_LOG"
         module.ACTIVE_PROCESS_STATES = ("started", "running")
+        module.FINALIZATION_PENDING_STATES = ()
         module.LAUNCH_IMPLEMENTED = False
 
         def launch_gates_open():

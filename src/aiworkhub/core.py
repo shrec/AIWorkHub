@@ -9966,6 +9966,9 @@ def reconcile_dead_processing_task(
     status = process_launcher.ProcessManager(
         repo=repo_root(), isolation_enabled=False
     ).status(request_id)
+    liveness = status.get("liveness")
+    if isinstance(liveness, dict) and liveness.get("liveness_state") == process_launcher.FINALIZING_LIVENESS_STATE:
+        return _canonical_result(ok=False, returncode=1, stderr="reconcile_failed:process_finalizing", command=command)
     ok, state = stale_recovery.reconcile_dead_processing_claim(
         root=str(repo_root()), task_id=task_id, request_id=request_id,
         claim_epoch=claim_epoch, process_status=status,
@@ -11571,7 +11574,7 @@ def _claude_session_liveness_snapshot(
             activity_age = liveness.get("activity_age_seconds")
             if isinstance(activity_age, (int, float)) and not isinstance(activity_age, bool):
                 last_artifact = _epoch_to_iso(now_epoch - float(activity_age))
-        snapshot["requests"].append({
+        entry = {
             "request_id": str(row.get("request_id") or ""),
             "task_id": str(row.get("task_id") or ""),
             "state": str(row.get("state") or ""),
@@ -11581,7 +11584,11 @@ def _claude_session_liveness_snapshot(
             "last_artifact_ts": last_artifact,
             "liveness_state": liveness.get("liveness_state"),
             "reconciliation_deferred": row.get("reconciliation_deferred"),
-        })
+        }
+        progress = process_launcher.format_finalization_progress(liveness.get("finalization_progress"))
+        if progress:
+            entry["validation_progress"] = progress
+        snapshot["requests"].append(entry)
     if truncated:
         snapshot["requests_truncated"] = truncated
     try:
