@@ -3108,6 +3108,19 @@ def derive_launch_identity(
     resolved_adapter = str(adapter_id or "").strip()
     adapter_candidates = adapter_identity_tuple(resolved_runner)
     adapter_rejections: list[str] = []
+    catalog_adapter_fallback = False
+    if not resolved_adapter and not adapter_candidates:
+        try:
+            from . import workforce_catalog
+
+            identities = workforce_catalog.catalog_launch_identities(repo)
+        except Exception:  # noqa: BLE001 - an unreadable catalog pins no adapter
+            identities = {}
+        worker = identities.get(resolved_runner)
+        route_adapter = str((worker or {}).get("route_adapter_id") or "").strip() if worker is not None else ""
+        if route_adapter:
+            adapter_candidates = (route_adapter,)
+            catalog_adapter_fallback = True
     if not resolved_adapter:
         if not adapter_candidates:
             raise LaunchRejected(
@@ -3173,7 +3186,9 @@ def derive_launch_identity(
                 f"{resolved_runner}:{';'.join(adapter_rejections)[:280]}"
             )
         derived_from["adapter_id"] = (
-            "first_pinnable_launchable_in_tuple_order"
+            "catalog_launch_identities"
+            if catalog_adapter_fallback
+            else "first_pinnable_launchable_in_tuple_order"
             if pinnable
             else "first_launchable_in_tuple_order"
         )
