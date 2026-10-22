@@ -3231,12 +3231,13 @@ def preview_convert(
         }
     claimable = row["status"] in CLAIMABLE_STATUSES
     card = normalize_task_plan(row, task_plan)
+    input_refusal = _card_input_refusal_reason(repo_root, card)
     signed = _signed_task_plan(card)
     preview: dict[str, Any] = {
         "needfix_id": needfix_id,
         "already_converted": False,
         "claimable": claimable,
-        "convertible": claimable,
+        "convertible": claimable and input_refusal is None,
         "current_status": row["status"],
         "unverified": row["status"] in ("captured",),
         "triaged": row["status"] == "triaged",
@@ -3244,16 +3245,41 @@ def preview_convert(
         "plan_digest": plan_digest(card),
     }
     if not claimable:
-        preview["refusal_reason"] = _conversion_refusal_reason(needfix_id, row["status"])
+        status_refusal = _conversion_refusal_reason(needfix_id, row["status"])
+        preview["refusal_reason"] = (
+            f"{status_refusal}; {input_refusal}"
+            if input_refusal is not None
+            else status_refusal
+        )
         if row["status"] in ("captured", "triaged"):
             preview["next_action"] = {
                 "tool": _TRANSITION_TOOL,
                 "action": "triage" if row["status"] == "captured" else "accept",
             }
+    elif input_refusal is not None:
+        preview["refusal_reason"] = input_refusal
     minted_task_id = card.get("task_id")
     if isinstance(minted_task_id, str) and minted_task_id.strip():
         preview["task_id"] = minted_task_id
     return preview
+
+
+def _card_input_refusal_reason(
+    repo_root: str | Path, card: Mapping[str, Any]
+) -> str | None:
+    """Return the worker_workspace missing-input refusal reason, or None."""
+    from . import worker_workspace
+
+    repo = Path(repo_root).resolve()
+    try:
+        allowed = tuple(
+            worker_workspace._relative_repo_path(value)
+            for value in (card.get("allowed_writes") or [])
+        )
+        worker_workspace._exact_required_card_inputs(repo, card, allowed)
+    except worker_workspace.WorkspaceError as exc:
+        return str(exc)
+    return None
 
 
 def default_task_card(needfix_snapshot: Mapping[str, Any]) -> dict[str, Any]:
@@ -3944,6 +3970,9 @@ def convert_needfix(
     # -- Phase 3: build card, invoke create_task_fn, normalize receipt --
     try:
         card = _resolve_conversion_card(needfix_snapshot, task_card_builder)
+        input_refusal = _card_input_refusal_reason(repo_root, card)
+        if input_refusal is not None:
+            raise NeedFixValidationError(input_refusal)
         result = create_task_fn(card)
         task_id = _normalize_create_task_receipt(result, needfix_id)
     except Exception:
