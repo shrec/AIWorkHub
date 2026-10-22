@@ -471,17 +471,18 @@ REOPEN_EVENT_MISSING_TASK = "missing_task_link_reopened"
 # A signal filed again after its NeedFix was resolved reopens that same row
 # (see ``_reopen_recurred``) instead of being swallowed as a dedupe hit.
 REOPEN_EVENT_RECURRED = "recurred_after_resolve"
+REOPEN_EVENT_ORPHAN_RETURN = "orphaned_conversion_returned_to_accepted"
 # One compatible durable reopen vocabulary shared by the reopen writers and
 # the authoritative read validator: the canonical superseded reopen event
 # plus its authenticated legacy ordinary-archive alias, the missing-task
-# reopen and the recurrence reopen. Each name counts as exactly one durable
-# reopen for generation authority, so authenticated legacy
-# ``archived_task_link_reopened`` rows stay readable without any direct
-# database edit, and a recurred row converts to a fresh ``-rN`` task_id
-# instead of the one that resolved it.
+# reopen, the recurrence reopen, and an orphan-returned conversion. Each
+# name counts as exactly one durable reopen for generation authority, so
+# authenticated legacy ``archived_task_link_reopened`` rows stay readable
+# without any direct database edit, and a recurred or orphan-returned row
+# converts to a fresh ``-rN`` task_id instead of the archived card's.
 REOPEN_EVENT_ALIASES: tuple[str, ...] = (
     REOPEN_EVENT, REOPEN_EVENT_LEGACY_ALIAS, REOPEN_EVENT_MISSING_TASK,
-    REOPEN_EVENT_RECURRED,
+    REOPEN_EVENT_RECURRED, REOPEN_EVENT_ORPHAN_RETURN,
 )
 _REOPEN_EVENT_MARKS = ", ".join("?" for _ in REOPEN_EVENT_ALIASES)
 
@@ -499,13 +500,11 @@ def _durable_reopen_count(conn: sqlite3.Connection, needfix_id: str) -> int:
 def _backfill_legacy_reopen_generation(conn: sqlite3.Connection) -> None:
     """Derive ``reopen_generation`` for legacy rows from durable reopen events.
 
-    Only rows still carrying the migration default of 0 and with at least one
-    durable reopen event in the compatible vocabulary (canonical
-    ``superseded_task_link_reopened``, the legacy
-    ``archived_task_link_reopened`` alias, ``missing_task_link_reopened`` or
-    ``recurred_after_resolve``)
-    are rewritten; nonzero values are never silently repaired here (they fail
-    closed elsewhere).
+    Rows still carrying the migration default of 0 and with at least one
+    durable reopen event are rewritten to that exact count. A nonzero stored
+    generation is not recounted: the only allowed delta is the newly counted
+    orphan-return events, and only when adding that count makes the stored
+    value equal the durable total. Any other divergence is left untouched.
     """
     conn.execute(
         "UPDATE needfix SET reopen_generation = ("
@@ -516,6 +515,27 @@ def _backfill_legacy_reopen_generation(conn: sqlite3.Connection) -> None:
         f"    WHERE e.needfix_id = needfix.id AND e.event IN ({_REOPEN_EVENT_MARKS})"
         ") > 0",
         (*REOPEN_EVENT_ALIASES, *REOPEN_EVENT_ALIASES),
+    )
+    conn.execute(
+        "UPDATE needfix SET reopen_generation = reopen_generation + ("
+        "    SELECT COUNT(*) FROM needfix_events e "
+        "    WHERE e.needfix_id = needfix.id AND e.event = ?"
+        ") WHERE reopen_generation > 0 AND ("
+        "    SELECT COUNT(*) FROM needfix_events e "
+        "    WHERE e.needfix_id = needfix.id AND e.event = ?"
+        ") > 0 AND reopen_generation + ("
+        "    SELECT COUNT(*) FROM needfix_events e "
+        "    WHERE e.needfix_id = needfix.id AND e.event = ?"
+        ") = ("
+        "    SELECT COUNT(*) FROM needfix_events e "
+        f"    WHERE e.needfix_id = needfix.id AND e.event IN ({_REOPEN_EVENT_MARKS})"
+        ")",
+        (
+            REOPEN_EVENT_ORPHAN_RETURN,
+            REOPEN_EVENT_ORPHAN_RETURN,
+            REOPEN_EVENT_ORPHAN_RETURN,
+            *REOPEN_EVENT_ALIASES,
+        ),
     )
 
 
@@ -610,13 +630,23 @@ def _validate_reopen_generation_value(stored: Any, needfix_id: str) -> int:
     return stored
 
 
+def _orphan_return_event_count(conn: sqlite3.Connection, needfix_id: str) -> int:
+    """Count orphan-return events newly admitted to the reopen vocabulary."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM needfix_events "
+        "WHERE needfix_id = ? AND event = ?",
+        (needfix_id, REOPEN_EVENT_ORPHAN_RETURN),
+    ).fetchone()
+    return int(row["n"])
+
+
 def _authoritative_reopen_generation(conn: sqlite3.Connection, needfix_id: str) -> int:
     """Return the authoritative reopen generation, failing closed on divergence.
 
     A legacy stored value of 0 derives solely from the exact durable reopen
-    event count. Any nonzero stored value must exactly equal that count;
-    stored<events, stored>events, bool, negative, and non-integer values all
-    fail closed before any claim or mutation.
+    event count. A nonzero stored value must equal that count, or differ from
+    it by exactly the newly counted orphan-return events. Any other divergence
+    fails closed before any claim or mutation.
     """
     row = conn.execute(
         "SELECT reopen_generation FROM needfix WHERE id = ?", (needfix_id,)
@@ -627,12 +657,15 @@ def _authoritative_reopen_generation(conn: sqlite3.Connection, needfix_id: str) 
     events = _durable_reopen_count(conn, needfix_id)
     if stored == 0:
         return events
-    if stored != events:
-        raise NeedFixConflictError(
-            f"needfix {needfix_id} reopen_generation {stored} diverges from "
-            f"{events} durable {REOPEN_EVENT} events"
-        )
-    return stored
+    if stored == events:
+        return stored
+    orphan_returns = _orphan_return_event_count(conn, needfix_id)
+    if orphan_returns and stored + orphan_returns == events:
+        return events
+    raise NeedFixConflictError(
+        f"needfix {needfix_id} reopen_generation {stored} diverges from "
+        f"{events} durable {REOPEN_EVENT} events"
+    )
 
 
 def successor_task_id(needfix_id: str, generation: int) -> str:
@@ -2493,16 +2526,21 @@ def _return_orphaned_conversion_to_accepted(
                 conn.rollback()
                 return None
             now = _utcnow_iso()
+            stored_generation = _validate_reopen_generation_value(
+                row["reopen_generation"], needfix_id
+            )
+            new_generation = _authoritative_reopen_generation(conn, needfix_id) + 1
             cur = conn.execute(
                 "UPDATE needfix SET status = 'accepted', updated_at = ?, "
-                "converted_task_id = NULL WHERE id = ? AND status = ?",
-                (now, needfix_id, prior_status),
+                "converted_task_id = NULL, reopen_generation = ? "
+                "WHERE id = ? AND status = ? AND reopen_generation = ?",
+                (now, new_generation, needfix_id, prior_status, stored_generation),
             )
             if cur.rowcount != 1:
                 conn.rollback()
                 return None
             _record_event(
-                conn, needfix_id, "orphaned_conversion_returned_to_accepted",
+                conn, needfix_id, REOPEN_EVENT_ORPHAN_RETURN,
                 {"prior_status": prior_status, "reason": reason},
             )
             updated = conn.execute(
