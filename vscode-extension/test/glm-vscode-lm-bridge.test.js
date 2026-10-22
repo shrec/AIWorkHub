@@ -116,9 +116,11 @@ Module._load = function patchedLoad(request, parent, isMain) {
   return originalLoad.call(this, request, parent, isMain);
 };
 let internals;
+let extensionModule;
 try {
   delete require.cache[extensionPath];
-  internals = require(extensionPath).__testInternals;
+  extensionModule = require(extensionPath);
+  internals = extensionModule.__testInternals;
 } finally {
   Module._load = originalLoad;
 }
@@ -4041,10 +4043,18 @@ async function nf179ForcedStageRecoveryChecks() {
     sendRequest: async () => {
       textTurns += 1;
       let value;
-      if (!textFirstStaged && textTurns >= 13) {
+      // NF-2026-01632: the first stage is progress, so forced staging begins only
+      // after the stalled discovery window that follows it.
+      if (!textFirstStaged && textTurns >= 2) {
         textFirstStaged = true;
         value = toolRequest("aiworkhub_manager_semantic_edit_stage", {
           operation: "create", file_path: "out/first.json", content: "{}\n",
+        });
+      } else if (textFirstStaged && textTurns <= internals.constants.VSCODE_LM_STALL_TURNS + 2) {
+        value = toolRequest("aiworkhub_worker_source_graph_query", {
+          mode: "focus",
+          query: `work-${textTurns}`,
+          workflow_stage: "implementation",
         });
       } else if (textFirstStaged && !textNonStageSent) {
         textNonStageSent = true;
@@ -4099,16 +4109,17 @@ async function nf179ForcedStageRecoveryChecks() {
   // that stages nothing is never forced into a phase change, so before the
   // without-edit budget existed the only thing that could stop it was the agent
   // turn limit, which named the wrong cause. The scenario is unchanged and still
-  // fails closed; the expected typed outcome is tightened to the truthful one and
-  // now lands strictly inside the turn budget.
+  // fails closed with the truthful outcome. NF-2026-01632: the acknowledging read
+  // counts against the 16-call without-edit budget, which refuses the 17th read one
+  // turn before the no-endgame stall watchdog would end the spin.
   await assert.rejects(
     internals.runVscodeLmTextProtocol(
       repeatedModel, request, undefined, async () => ({ ok: true, content: "graph" }),
     ),
     /vscode_lm_source_graph_no_progress/,
   );
-  assert.ok(repeatedTurns < internals.constants.VSCODE_LM_MAX_AGENT_TURNS,
-    `the repeated-discovery spin must stop before the turn limit (stopped at turn ${repeatedTurns})`);
+  assert.strictEqual(repeatedTurns, internals.constants.VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT + 1,
+    `the repeated-discovery spin must stop at the without-edit budget (stopped at turn ${repeatedTurns})`);
 
   let nativeWrongNonStageSent = false;
   let nativeWrongTurn = 0;
@@ -4320,19 +4331,29 @@ async function nf723StagedFinalizationCompletenessChecks() {
   assert.ok(!/Output ONLY one final /.test(textAfterEdit));
   assert.ok(!textTurns.some((instruction) => instruction.includes("The bounded tool/reasoning phase is complete")));
 
+  // NF-2026-01632: the edit is progress, so forced staging begins only after the
+  // stalled window that follows it. The edit receipt must still name the next
+  // missing output, and forced staging must not mask the latest tool result with
+  // a second bare instruction when it begins.
   let forcedTurn = 0;
   let forcedEditStaged = false;
+  let forcedEditReceipt = "";
   let forcedCreateInput = "";
   const forcedTextModel = {
     capabilities: { toolCalling: false },
     sendRequest: async (messages) => {
       const instruction = lastUserText(messages);
       let value;
-      if (!forcedEditStaged && forcedTurn >= 12) {
+      if (!forcedEditStaged && forcedTurn >= 1) {
         forcedEditStaged = true;
         value = toolRequest(stageName, {
           operation: "replace_range", file_path: editPath,
           start_line: 1, end_line: 1, ...editAnchors, new: "const edited = true;\n",
+        });
+      } else if (forcedEditStaged && forcedTurn <= internals.constants.VSCODE_LM_STALL_TURNS) {
+        if (!forcedEditReceipt) forcedEditReceipt = instruction;
+        value = toolRequest("aiworkhub_worker_source_graph_query", {
+          mode: "focus", query: `forced-${forcedTurn++}`, workflow_stage: "implementation",
         });
       } else if (forcedEditStaged) {
         forcedCreateInput = instruction;
@@ -4350,9 +4371,14 @@ async function nf723StagedFinalizationCompletenessChecks() {
   const forcedResult = JSON.parse(await runText(forcedTextModel));
   assert.deepStrictEqual(forcedResult.edits, []);
   assert.strictEqual(forcedResult.creates[0].path, createPath);
-  const forcedReceipt = JSON.parse(forcedCreateInput);
+  const forcedReceipt = JSON.parse(forcedEditReceipt);
   assert.strictEqual(forcedReceipt.schema_id, "aiworkhub.vscode_lm.tool_result.v1");
   assert.strictEqual(forcedReceipt.result.next_missing_path, createPath);
+  const forcedCreateReceipt = JSON.parse(forcedCreateInput);
+  assert.strictEqual(forcedCreateReceipt.schema_id, "aiworkhub.vscode_lm.tool_result.v1",
+    "forced staging must not mask the latest tool result with a bare instruction");
+  assert.ok(forcedCreateReceipt.instruction.includes(`Required output ${createPath} is still missing`));
+  assert.ok(forcedCreateReceipt.instruction.includes("operation create"));
 
   let textRefuseTurns = 0;
   let textRefuseEditStaged = false;
@@ -4590,7 +4616,9 @@ async function nf723StagedFinalizationCompletenessChecks() {
       textProgressTurns += 1;
       const instruction = lastUserText(messages);
       let value;
-      if (!textProgressEdit && textProgressTurns >= 13) {
+      // NF-2026-01632: the edit is progress, so forced staging begins only after
+      // the stalled window that follows it.
+      if (!textProgressEdit && textProgressTurns >= 2) {
         textProgressEdit = true;
         value = toolRequest(stageName, {
           operation: "replace_range",
@@ -4599,6 +4627,10 @@ async function nf723StagedFinalizationCompletenessChecks() {
           end_line: 1,
           ...editAnchors,
           new: "const edited = true;\n",
+        });
+      } else if (textProgressEdit && textProgressTurns <= internals.constants.VSCODE_LM_STALL_TURNS + 2) {
+        value = toolRequest("aiworkhub_worker_source_graph_query", {
+          mode: "focus", query: `progress-${textProgressTurns}`, workflow_stage: "implementation",
         });
       } else if (textProgressEdit && !textProgressRefusedCreate) {
         textProgressRefusedCreate = true;
@@ -5859,14 +5891,22 @@ async function nf988DiscoveryDoesNotImplicitlyEnterSemanticStage() {
     nf1291MockEditor(request, async (call) => {
       assert.strictEqual(call.name, "aiworkhub_worker_source_graph_query");
       sourceGraphCalls += 1;
-      return { ok: true, content: "bounded graph" };
+      // NF-2026-01632: valid discovery returns source the worker has not seen yet,
+      // which is progress, so it is never cut off by the stall window either.
+      return { ok: true, tool: "source_graph", mode: call.input.mode, authority_source: "canonical",
+        authority_repo: "D:/Dev/AIWorkHub", hit_count: 1, content: JSON.stringify({ matches: [{
+          file_path: file, source_hash: "a".repeat(64), line_start: sourceGraphCalls,
+          line_end: sourceGraphCalls, source: `discovery ${sourceGraphCalls}`, qualname: `target.d${sourceGraphCalls}`,
+        }] }) };
     }),
   ));
 
   assert.strictEqual(sourceGraphCalls, 15,
     "valid discovery calls remain available until the first authenticated staged edit");
   assert.deepStrictEqual(final.edits, []);
-  assert.strictEqual(modelTurns, 16);
+  // The staging turn is progress; the replayed stage after it is the stalled turn
+  // that finalizes offline (NF-2026-01378).
+  assert.strictEqual(modelTurns, 17);
 }
 
 async function nf651StageContextReadForNextRequiredFile() {
@@ -5887,6 +5927,9 @@ async function nf651StageContextReadForNextRequiredFile() {
   let stagedFirst = false;
   let exactReads = 0;
   let modelTurns = 0;
+  // NF-2026-01632: forced staging starts after VSCODE_LM_STALL_TURNS turns without
+  // progress, and the first stage is progress, so the stalled orientation follows it.
+  const stall = internals.constants.VSCODE_LM_STALL_TURNS;
   const toolRequest = (name, input) => JSON.stringify({
     schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA, name, input,
   });
@@ -5897,18 +5940,18 @@ async function nf651StageContextReadForNextRequiredFile() {
       const last = messages[messages.length - 1];
       const instruction = last && last.role === "user" ? String(last.content) : "";
       let value;
-      if (!stagedFirst && modelTurns >= 13) {
+      if (!stagedFirst && modelTurns >= 2) {
         stagedFirst = true;
         value = toolRequest("aiworkhub_manager_semantic_edit_stage", {
           operation: "replace_range", file_path: first, start_line: 1, end_line: 1,
           expected_first_line: "const first = 0;", expected_last_line: "const first = 0;",
           new: "const first = 1;\n",
         });
-      } else if (stagedFirst && exactReads === 0) {
+      } else if (stagedFirst && modelTurns > stall + 2 && exactReads === 0) {
         value = toolRequest("aiworkhub_worker_source_graph_query", {
           mode: "file", query: second, target: second, workflow_stage: "implementation",
         });
-      } else if (stagedFirst) {
+      } else if (stagedFirst && modelTurns > stall + 2) {
         value = toolRequest("aiworkhub_manager_semantic_edit_stage", {
           operation: "replace_range", file_path: second, start_line: 1, end_line: 1,
           expected_first_line: "const second = 0;", expected_last_line: "const second = 0;",
@@ -5930,7 +5973,8 @@ async function nf651StageContextReadForNextRequiredFile() {
   ));
   assert.deepStrictEqual(final.edits, []);
   assert.strictEqual(exactReads, 1, "one exact next-output read must execute after a staged edit");
-  assert.ok(modelTurns < 24);
+  // Acknowledging read, first stage, the stalled window, the forced read, the last stage.
+  assert.strictEqual(modelTurns, stall + 4, "forced staging ends right after the read it allowed");
   let repeatedTurns = 0;
   let repeatedStage = false;
   let repeatedExactReads = 0;
@@ -5941,14 +5985,14 @@ async function nf651StageContextReadForNextRequiredFile() {
       const last = messages[messages.length - 1];
       const instruction = last && last.role === "user" ? String(last.content) : "";
       let value;
-      if (!repeatedStage && repeatedTurns >= 13) {
+      if (!repeatedStage && repeatedTurns >= 2) {
         repeatedStage = true;
         value = toolRequest("aiworkhub_manager_semantic_edit_stage", {
           operation: "replace_range", file_path: first, start_line: 1, end_line: 1,
           expected_first_line: "const first = 0;", expected_last_line: "const first = 0;",
           new: "const first = 1;\n",
         });
-      } else if (repeatedStage) {
+      } else if (repeatedStage && repeatedTurns > stall + 2) {
         value = toolRequest("aiworkhub_worker_source_graph_query", {
           mode: "file", query: second, target: second, workflow_stage: "implementation",
         });
@@ -6011,9 +6055,15 @@ async function nf202600023DeclaredDependencyReadDuringForcedStaging() {
   const discover = () => toolRequest("aiworkhub_worker_source_graph_query", {
     mode: "focus", query: `orientation-${++discoveryNumber}`, workflow_stage: "implementation",
   });
+  // NF-2026-01632: forced staging starts after VSCODE_LM_STALL_TURNS turns without
+  // progress, and the first edit is progress. Its stalled window idles on a tool
+  // that is not Source Graph, so the without-edit budget stays whole for the
+  // forced-stage reads under test.
+  const stall = internals.constants.VSCODE_LM_STALL_TURNS;
+  const idle = () => toolRequest("aiworkhub_worker_session_current_state", { limit: 1 });
 
-  // Scenario 1: an explicit first edit enters forced staging; undeclared reads
-  // are refused while a declared dependency read still executes.
+  // Scenario 1: an explicit first edit, once the worker stalls, enters forced
+  // staging; undeclared reads are refused while a declared dependency read still executes.
   const executed = [];
   const stageInstructions = [];
   let discoveryTurns = 0;
@@ -6030,14 +6080,14 @@ async function nf202600023DeclaredDependencyReadDuringForcedStaging() {
         instruction.includes("Required output " + second);
       if (forcedStage || nextStageInstruction) stageInstructions.push(instruction);
       let value;
-      if (!stagedFirst && discoveryTurns >= 13) {
+      if (!stagedFirst && discoveryTurns >= 2) {
         stagedFirst = true;
         value = stage(first, "const first = dep();\n");
       } else {
-        if (!plan && nextStageInstruction) {
+        if (!plan && nextStageInstruction && discoveryTurns > stall + 2) {
           plan = [readFile(dep), readFile(outside), stage(second, "const second = 2;\n")];
         }
-        value = plan && plan.length ? plan.shift() : discover();
+        value = plan && plan.length ? plan.shift() : stagedFirst ? idle() : discover();
       }
       return { stream: (async function* stream() { yield { value }; }()) };
     },
@@ -6069,16 +6119,17 @@ async function nf202600023DeclaredDependencyReadDuringForcedStaging() {
       const last = messages[messages.length - 1];
       const instruction = last && last.role === "user" ? String(last.content) : "";
       let value;
-      if (!cappedFirst && cappedTurns >= 13) {
+      if (!cappedFirst && cappedTurns >= 2) {
         cappedFirst = true;
         value = stage(first, "const first = 1;\n");
       } else {
-        if (!cappedPlan && cappedFirst && instruction.includes("Required output " + second)) {
+        if (!cappedPlan && cappedFirst && cappedTurns > stall + 2 &&
+            instruction.includes("Required output " + second)) {
           cappedPlan = [readFile(dep), readFile(dep), readBody(dep, "depSymbol"),
             readFile(second), readBody(second, "secondSymbol"),
             readFile(first), stage(second, "const second = 2;\n")];
         }
-        value = cappedPlan && cappedPlan.length ? cappedPlan.shift() : discover();
+        value = cappedPlan && cappedPlan.length ? cappedPlan.shift() : cappedFirst ? idle() : discover();
       }
       return { stream: (async function* stream() { yield { value }; }()) };
     },
@@ -6138,11 +6189,14 @@ async function nf988TwoBoundedCorrectionsDuringForcedStaging() {
   });
 
   const invoked = [];
-  const discovery = Array.from({ length: 12 }, (_, index) => discover(index));
+  // NF-2026-01632: forced staging starts after VSCODE_LM_STALL_TURNS turns without
+  // progress, and the first stage is progress, so the stalled discovery follows it.
+  const discoveryReads = internals.constants.VSCODE_LM_STALL_TURNS + 1;
+  const discovery = [discover(0), stage(first, "const first = 1;\n"),
+    ...Array.from({ length: discoveryReads - 1 }, (_, index) => discover(index + 1))];
   const recovered = JSON.parse(await internals.runVscodeLmTextProtocol(
     scripted([
       ...discovery,
-      stage(first, "const first = 1;\n"),
       rejected,
       "I understand the correction and will stage the required output next.",
       stage(second, "const second = 2;\n"),
@@ -6155,14 +6209,13 @@ async function nf988TwoBoundedCorrectionsDuringForcedStaging() {
     }),
   ));
   assert.deepStrictEqual(recovered.edits, []);
-  assert.deepStrictEqual(invoked, Array.from({ length: 12 }, () => "aiworkhub_worker_source_graph_query"),
+  assert.deepStrictEqual(invoked, Array.from({ length: discoveryReads }, () => "aiworkhub_worker_source_graph_query"),
     "the rejected non-stage request must not execute while two corrective turns remain bounded");
 
   let failureInvocations = 0;
   const failure = await internals.runVscodeLmTextProtocol(
     scripted([
       ...discovery,
-      stage(first, "const first = 1;\n"),
       rejected,
       "First explanatory response.",
       "Second explanatory response.",
@@ -6176,7 +6229,7 @@ async function nf988TwoBoundedCorrectionsDuringForcedStaging() {
       return { ok: true, content: "bounded graph" };
     }),
   ).then(() => assert.fail("a third forced-stage violation must fail"), (err) => err);
-  assert.strictEqual(failureInvocations, 12);
+  assert.strictEqual(failureInvocations, discoveryReads);
   assert.match(String(failure.message), /vscode_lm_semantic_edit_stage_required/);
   assert.deepStrictEqual(
     failure.protocolTrace.slice(-3).map((entry) => entry.outcome),
@@ -6442,7 +6495,7 @@ async function nf998NativeSourceGraphDuplicateStopsLiveLoop() {
   assert.deepStrictEqual(pairedResults[0].result, { ok: true, content: "graph" });
   assert.strictEqual(pairedResults[1].result.schema_id, "aiworkhub.vscode_lm.source_graph_duplicate.v1");
   assert.strictEqual(failure.message, "vscode_lm_source_graph_no_progress");
-  assert.ok(turn < 24, "the guard fails before the general agent turn limit");
+  assert.ok(turn < internals.constants.VSCODE_LM_STALL_TURNS, "the duplicate guard fails before the stall watchdog");
 }
 
 async function nf998ForcedStageDuplicateAfterReadCap() {
@@ -6456,15 +6509,18 @@ async function nf998ForcedStageDuplicateAfterReadCap() {
   const bodyRead = toolRequest(graph, {
     mode: "body", query: "depSymbol", target: dependency, workflow_stage: "implementation",
   });
+  // NF-2026-01632: forced staging starts after VSCODE_LM_STALL_TURNS turns without
+  // progress, and the first stage is progress, so the stalled reads follow it.
   const outputs = [
-    ...Array.from({ length: 12 }, (_, index) => toolRequest(graph, {
-      mode: "focus", query: `orientation-${index}`, workflow_stage: "implementation",
-    })),
+    toolRequest(graph, { mode: "focus", query: "orientation-0", workflow_stage: "implementation" }),
     toolRequest("aiworkhub_manager_semantic_edit_stage", {
       operation: "replace_range", file_path: first, start_line: 1, end_line: 1,
       expected_first_line: "const first = 0;", expected_last_line: "const first = 0;",
       new: "const first = 1;\n",
     }),
+    ...Array.from({ length: internals.constants.VSCODE_LM_STALL_TURNS }, (_, index) => toolRequest(graph, {
+      mode: "focus", query: `orientation-${index + 1}`, workflow_stage: "implementation",
+    })),
     toolRequest(graph, {
       mode: "file", query: dependency, target: dependency, workflow_stage: "implementation",
     }),
@@ -6502,11 +6558,12 @@ async function nf998ForcedStageDuplicateAfterReadCap() {
   } }, async (call) => {
     if (call.name === graph && call.input.target === dependency) liveDependencyReads.push(call.input.mode);
     return { ok: true, content: "bounded graph" };
-  })).then(() => assert.fail("a capped duplicate must stop before the general turn limit"), (error) => error);
+  })).then(() => assert.fail("a capped duplicate must stop the run"), (error) => error);
   assert.deepStrictEqual(liveDependencyReads, ["file", "body"]);
-  assert.strictEqual(receipts[15].result.error, "vscode_lm_semantic_edit_stage_required",
+  // The last two receipts the model saw before the second duplicate ended the run.
+  assert.strictEqual(receipts.at(-2).result.error, "vscode_lm_semantic_edit_stage_required",
     "a new query remains subject to the two-read cap");
-  assert.strictEqual(receipts[16].result.schema_id, "aiworkhub.vscode_lm.source_graph_duplicate.v1",
+  assert.strictEqual(receipts.at(-1).result.schema_id, "aiworkhub.vscode_lm.source_graph_duplicate.v1",
     "the first duplicate after the read cap gets the typed receipt");
   assert.strictEqual(failure.message, "vscode_lm_source_graph_no_progress");
 }
@@ -6514,14 +6571,14 @@ async function nf998ForcedStageDuplicateAfterReadCap() {
 // NF-2026-01179: the measured production spin was a GLM worker that issued 23
 // consecutive Source Graph turns and nothing else, then died as the untruthful
 // vscode_lm_agent_turn_limit. Every query is distinct, so the repeated-identity
-// half of the guard can never see it and only the without-edit budget can stop
-// it. It must fail closed as vscode_lm_source_graph_no_progress strictly inside
-// the agent turn budget, after executing exactly the calls that budget allows --
-// and the budget itself may never shrink below the discovery the protocol grants,
-// which is what made this guard preempt the typed forced-stage receipts. The
-// spin below owes a declared required output the whole time; the second half of
-// this test pins the identical budget for a writable request that owes nothing,
-// because the budget counts every request.
+// half of the guard can never see it. NF-2026-01632: no turn limit exists any
+// more; the spin fails closed as vscode_lm_source_graph_no_progress after
+// executing every call inside the 16-call without-edit budget. Nothing is staged,
+// so no endgame can be armed, and the no-endgame stall window equals that budget:
+// the budget may never shrink below that window, which is what made it preempt the
+// typed forced-stage receipts. The spin below owes a declared required output the
+// whole time; the second half of this test pins the identical bound for a
+// writable request that owes nothing, because the budget counts every request.
 async function nf1179PureSourceGraphSpinFailsClosedBeforeTurnLimit() {
   const file = "src/spin.js";
   let modelTurns = 0;
@@ -6552,24 +6609,28 @@ async function nf1179PureSourceGraphSpinFailsClosedBeforeTurnLimit() {
     return { ok: true, content: "bounded graph" };
   }).then(() => assert.fail("a pure Source Graph spin must never finalize"), (error) => error);
   assert.strictEqual(failure.message, "vscode_lm_source_graph_no_progress");
-  assert.strictEqual(liveCalls, internals.constants.VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT,
-    "every call inside the without-edit budget executes; the next one fails closed unexecuted");
-  assert.ok(modelTurns < internals.constants.VSCODE_LM_MAX_AGENT_TURNS,
-    `the spin must stop before the agent turn limit (stopped at turn ${modelTurns})`);
+  // The acknowledging read opens a fresh stall window but counts against the budget,
+  // so the budget refuses the 17th read one turn before the no-endgame watchdog would.
+  const budget = internals.constants.VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT;
+  assert.strictEqual(liveCalls, budget,
+    "every call inside the without-edit budget executes; the next one is refused");
+  assert.strictEqual(modelTurns, budget + 1,
+    `the spin must stop at the without-edit budget (stopped at turn ${modelTurns})`);
+  assert.deepStrictEqual(failure.protocolTrace.at(-1),
+    { turn: budget, phase: "source_graph", outcome: "duplicate_no_progress" });
   assert.ok(
     internals.constants.VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT >=
-      internals.constants.VSCODE_LM_MAX_POST_SOURCE_TURNS,
-    "the without-edit budget may never be smaller than the discovery phase the protocol grants",
+      internals.constants.VSCODE_LM_NO_ENDGAME_STALL_TURNS,
+    "the without-edit budget may never be smaller than the stall window the protocol grants",
   );
 
   // The other half of the accounting, pinned here so the two directions stay
   // together: the identical spin that owes no declared required output is the
   // shape the protocol protects least, not most, so the budget must count it as
   // well. While nothing is staged a writable request is never forced into a
-  // phase change, so without this guard its only bound is
-  // VSCODE_LM_MAX_AGENT_TURNS and it reports the untruthful
-  // vscode_lm_agent_turn_limit for what is provably a discovery spin. It fails
-  // closed on exactly the same budget as the spin above.
+  // phase change, so the no-progress bound itself ends it, as the truthful
+  // vscode_lm_source_graph_no_progress rather than a turn limit. It fails
+  // closed on exactly the same bound as the spin above.
   let openTurns = 0;
   let openCalls = 0;
   const openModel = {
@@ -6597,16 +6658,16 @@ async function nf1179PureSourceGraphSpinFailsClosedBeforeTurnLimit() {
     return { ok: true, content: "bounded graph" };
   }).then(() => assert.fail("an unbounded discovery loop must still fail"), (error) => error);
   assert.match(String(openFailure.message), /vscode_lm_source_graph_no_progress/);
-  assert.strictEqual(openCalls, internals.constants.VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT,
+  assert.strictEqual(openCalls, budget,
     "a writable request with no required_outputs is counted on the same budget");
-  assert.ok(openTurns < internals.constants.VSCODE_LM_MAX_AGENT_TURNS,
-    `a spin with nothing owed must stop before the agent turn limit (stopped at turn ${openTurns})`);
+  assert.strictEqual(openTurns, budget + 1,
+    `a spin with nothing owed must stop at the without-edit budget (stopped at turn ${openTurns})`);
 }
 
 // NF-2026-01179: the per-missing-output correction budget is only armed once
 // forced staging begins, so the two-strike invalid-JSON budget has to stay armed
 // until exactly that point. This run stages a required output on its second turn
-// -- far inside VSCODE_LM_MAX_POST_SOURCE_TURNS -- and then answers in plain
+// -- far inside VSCODE_LM_STALL_TURNS -- and then answers in plain
 // prose. Keying the invalid-JSON budget off "nothing is staged yet" left it with
 // no bound at all for the rest of the discovery phase; it must stop on the second
 // prose reply instead.
@@ -6671,8 +6732,8 @@ async function nf1179EarlyStagedPlainTextStaysBounded() {
   assert.strictEqual(failure.missingRequiredAction, "replace_range");
   assert.strictEqual(modelTurns, 4,
     "the two-strike invalid-JSON budget stays armed until forced staging arms the other one");
-  assert.ok(modelTurns < internals.constants.VSCODE_LM_MAX_POST_SOURCE_TURNS,
-    "an early-staged prose run must not drift through the whole discovery phase unbounded");
+  assert.ok(modelTurns < internals.constants.VSCODE_LM_STALL_TURNS,
+    "an early-staged prose run must not drift through the whole stall window unbounded");
   assert.strictEqual(sourceGraphCalls, 1, "the staged edit is offline and only the read executes");
 }
 
@@ -7058,7 +7119,8 @@ async function nf1275VisibleActivityEndToEnd() {
 async function nf1290ProgressingProviderLoopsContinue() {
   const file = "src/app.py";
   for (const [native, paged] of [[false, false], [true, false], [false, true], [true, true]]) {
-    const reads = internals.constants.VSCODE_LM_MAX_AGENT_TURNS + 2;
+    // More provider turns than the deleted 24-turn ceiling ever allowed.
+    const reads = 2 * internals.constants.VSCODE_LM_STALL_TURNS + 2;
     const hashBytes = (bytes) => require("node:crypto").createHash("sha256").update(bytes).digest("hex");
     const bodyBytes = Buffer.from(JSON.stringify({ matches: Array.from({ length: reads }, (_, n) => ({
       file_path: file, line_start: n + 1, line_end: n + 1, source: `return before_${n}`,
@@ -7166,9 +7228,14 @@ async function nf1290ProgressingProviderLoopsContinue() {
           authority_source: kind === "untrusted" ? "legacy" : "canonical",
           authority_repo: "D:/Dev/AIWorkHub", content: JSON.stringify({ matches: [] }) };
       }), /vscode_lm_source_graph_no_progress/);
-      assert.ok(turns < internals.constants.VSCODE_LM_MAX_AGENT_TURNS);
-      assert.strictEqual(calls, kind === "duplicate" ? 1 :
-        internals.constants.VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT);
+      // NF-2026-01632: a spin that never progresses still fails closed as no progress.
+      // The acknowledging read opens a fresh stall window but counts against the
+      // 16-call Source Graph budget, so the budget refuses the 17th read one turn
+      // before the no-endgame watchdog would end the run. The duplicate guard still
+      // ends a repeated query first.
+      const budget = internals.constants.VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT;
+      assert.strictEqual(turns, kind === "duplicate" ? 3 : budget + 1);
+      assert.strictEqual(calls, kind === "duplicate" ? 1 : budget);
     }
   }
 }
@@ -7588,10 +7655,14 @@ async function nf1291ShiftedStageRecovery() {
   for (const native of [false, true]) {
     const f = fixture();
     f.req.required_outputs = [file, created]; // Keep forced staging genuinely active through recovery.
+    // NF-2026-01632: forced staging starts only after VSCODE_LM_STALL_TURNS turns
+    // without progress, so the growth is staged before the orientation reads; the
+    // first read after it still sees new source, the stalled window follows.
     const plan = [
-      ...Array.from({ length: 12 }, (_, i) => ({ name: "aiworkhub_worker_source_graph_query",
-        input: { mode: "focus", query: "orientation-" + i } })),
+      { name: "aiworkhub_worker_source_graph_query", input: { mode: "focus", query: "orientation-0" } },
       { name: "aiworkhub_manager_semantic_edit_stage", input: grow },
+      ...Array.from({ length: internals.constants.VSCODE_LM_STALL_TURNS + 1 }, (_, i) => ({
+        name: "aiworkhub_worker_source_graph_query", input: { mode: "focus", query: "orientation-" + (i + 1) } })),
       { name: "aiworkhub_manager_semantic_edit_stage", input: { operation: "replace_range",
         file_path: file, start_line: 4, end_line: 4, expected_first_line: "four",
         expected_last_line: "four", new: "WRONG" } },
@@ -7602,12 +7673,13 @@ async function nf1291ShiftedStageRecovery() {
       { name: "aiworkhub_manager_semantic_edit_stage", input: {
         operation: "create", file_path: created, content: "assert True\n" } },
     ];
+    const prepareTurn = plan.findIndex((call) => call.name === "aiworkhub_worker_semantic_edit_prepare") + 1;
     let turn = 0;
     const model = { capabilities: { toolCalling: native },
       sendRequest: async (_messages, options) => {
         const call = plan[turn++];
         assert.ok(call, "bounded corrective reaches actual pair instead of another stage-only dead end");
-        if (native && turn === 16) {
+        if (native && turn === prepareTurn) {
           assert.ok(options.tools.some(tool => tool.name === "aiworkhub_worker_semantic_edit_prepare"));
           assert.ok(options.tools.some(tool => tool.name === "aiworkhub_worker_semantic_edit_apply"));
         }
@@ -7735,12 +7807,18 @@ async function nf1300PrivateWorkerTransport() {
       await invoke("aiworkhub_worker_source_graph_query");
       const replacement = calls.at(-1).client;
       assert.notStrictEqual(replacement, privateClient, "switched cache is never reused");
+      // NF-2026-01657: rebind the exact clients with no await before shutdown and
+      // stop the module instance `internals` came from, so neither an async step
+      // nor a module reload can swap the client deactivate() stops.
+      internals.bindVscodeLmProviderBridgeForTest({
+        mcpClient: dashboard, workerMcpClient: replacement, activeRepoIdentity: identity,
+      });
       // NF-2026-01644: stub the bound dashboard client's dispatcher stop so this
       // assertion measures only worker-client disposal; a rejected dispatcher
       // stop is covered by extension-teardown-nf1644.test.js.
       let dispatcherStops = 0;
       dashboard.stopDispatcherThenTerminate = async () => { dispatcherStops += 1; };
-      await require(extensionPath).deactivate();
+      await extensionModule.deactivate();
       assert.strictEqual(dispatcherStops, 1, "extension shutdown stops the bound dashboard client");
       assert.strictEqual(replacement.intentionalStop, true, "extension shutdown disposes worker client");
     } finally {

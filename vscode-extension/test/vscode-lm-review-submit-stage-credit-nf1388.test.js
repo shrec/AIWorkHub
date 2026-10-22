@@ -121,7 +121,9 @@ function stagedEditIsProgress() {
 }
 
 async function secondStageRefundsATurn(toolCalling) {
-  const MAX = internals.constants.VSCODE_LM_MAX_POST_SOURCE_TURNS;
+  // NF-2026-01632: each new validated stage is progress, so the stall window
+  // restarts after the second stage and only the stalled reads after it count.
+  const MAX = internals.constants.VSCODE_LM_STALL_TURNS;
   const stageCalls = [
     { name: 'aiworkhub_manager_semantic_edit_stage', input: { operation: 'create', file_path: 'tests/a.py', content: 'x = 1\n' } },
     { name: 'aiworkhub_manager_semantic_edit_stage', input: { operation: 'create', file_path: 'tests/b.py', content: 'x = 1\n' } },
@@ -171,7 +173,9 @@ async function secondStageRefundsATurn(toolCalling) {
   const run = toolCalling ? internals.runVscodeLmAgent : internals.runVscodeLmTextProtocol;
   const finalPayload = await run(model, request, undefined, transport);
   const result = JSON.parse(finalPayload);
-  assert.strictEqual(turns, MAX + 1);
+  // Forced finalization lands after MAX stalled reads that follow BOTH stages; had
+  // the second stage not counted as progress it would land one turn earlier.
+  assert.strictEqual(turns, MAX + 2);
   assert.strictEqual(result.creates.length, 2);
 }
 

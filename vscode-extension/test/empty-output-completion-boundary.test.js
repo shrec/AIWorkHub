@@ -92,7 +92,8 @@ for (const toolCalling of [false, true]) {
   const run = toolCalling ? bridge.runVscodeLmAgent : bridge.runVscodeLmTextProtocol;
   for (const lateFirstStage of [false, true]) {
     test(`${label}: empty outputs do not complete a tests-only ${lateFirstStage ? "late" : "early"} stage`, async () => {
-      const calls = Array.from({ length: bridge.constants.VSCODE_LM_MAX_POST_SOURCE_TURNS }, (_, index) => ({
+      // The longest stalled discovery the watchdog allows still reaches production staging.
+      const calls = Array.from({ length: bridge.constants.VSCODE_LM_STALL_TURNS - 1 }, (_, index) => ({
         name: "aiworkhub_worker_source_graph_query",
         input: { mode: "body", query: `src/app.py.symbol_${index}`, target: "src/app.py" },
       }));
@@ -108,6 +109,19 @@ for (const toolCalling of [false, true]) {
       assert.equal(result.creates.length, 1);
     });
   }
+  test(`${label}: empty outputs never force-complete a tests-only stage when the worker stalls`, async () => {
+    // Nothing is owed, so no endgame can be armed: the stall ends the run only after
+    // the no-endgame window, every stalled read inside it executed.
+    const calls = [{ name: stageName, input: create }, ...Array.from({
+      length: bridge.constants.VSCODE_LM_NO_ENDGAME_STALL_TURNS,
+    }, (_, index) => ({ name: "aiworkhub_worker_source_graph_query",
+      input: { mode: "body", query: `src/app.py.symbol_${index}`, target: "src/app.py" } }))];
+    const model = modelFor(toolCalling, calls);
+    const transport = authenticatedEditor(request());
+    await assert.rejects(run(model, request(), undefined, transport), /vscode_lm_source_graph_no_progress/);
+    assert.equal(model.turns, calls.length, "the stall ends the run instead of completing the tests-only stage");
+    assert.equal(transport.semanticCalls.length, 0);
+  });
   test(`${label}: explicit required outputs complete once the worker stops staging`, async () => {
     // NF-2026-01378: readiness is not completion; the replayed stage is the stall that finalizes offline.
     const model = modelFor(toolCalling, [{ name: stageName, input: create }, { name: stageName, input: create }]);
@@ -115,23 +129,25 @@ for (const toolCalling of [false, true]) {
     assert.equal(model.turns, 2);
     assert.equal(result.creates[0].path, "tests/new.py");
   });
-  test(`${label}: unspecified legacy outputs retain the phase-count boundary`, async () => {
+  test(`${label}: unspecified legacy outputs finalize at the stall boundary`, async () => {
     const calls = [{ name: stageName, input: create }, ...Array.from({
-      length: bridge.constants.VSCODE_LM_MAX_POST_SOURCE_TURNS,
+      length: bridge.constants.VSCODE_LM_STALL_TURNS,
     }, (_, index) => ({ name: "aiworkhub_worker_source_graph_query",
       input: { mode: "body", query: `legacy_${index}`, target: "src/app.py" } }))];
     const model = modelFor(toolCalling, calls);
     const legacy = request();
     delete legacy.required_outputs;
     const result = JSON.parse(await run(model, legacy, undefined, async () => ({ ok: true })));
-    assert.equal(model.turns, bridge.constants.VSCODE_LM_MAX_POST_SOURCE_TURNS);
+    // The stage is progress; the boundary is the stalled window that follows it.
+    assert.equal(model.turns, bridge.constants.VSCODE_LM_STALL_TURNS + 1);
     assert.equal(result.creates[0].path, "tests/new.py");
     assert.equal(result.edits.length, 0);
   });
 }
 
-test("the existing global provider-turn safety bound is unchanged", () => {
-  assert.equal(bridge.constants.VSCODE_LM_MAX_AGENT_TURNS, 24);
+test("the stall watchdog replaced the global provider-turn ceiling", () => {
+  assert.equal(bridge.constants.VSCODE_LM_STALL_TURNS, 12);
+  assert.equal(bridge.constants.VSCODE_LM_MAX_AGENT_TURNS, undefined);
 });
 
 for (const toolCalling of [false, true]) {

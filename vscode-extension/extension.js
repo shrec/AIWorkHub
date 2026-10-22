@@ -508,25 +508,26 @@ const VSCODE_LM_CANCEL_INVALID_READ_LIMIT = 3;
 const VSCODE_LM_HEARTBEAT_MS = 10000;
 const VSCODE_LM_MAX_PARALLEL_REQUESTS = 3;
 const VSCODE_LM_MAX_REQUEST_BYTES = 8 * 1024 * 1024;
-const VSCODE_LM_MAX_AGENT_TURNS = 24;
-const VSCODE_LM_MAX_TOOL_TURNS = 16;
-const VSCODE_LM_MAX_POST_SOURCE_TURNS = 12;
+// NF-2026-01632: a worker may legitimately need 100 turns, so no turn counter
+// ends the agent loops. A provider turn without novel Source Graph evidence or a
+// new validated stage is stalled; after this many consecutive stalled turns the
+// run is forced into its endgame (VSCODE_LM_NO_ENDGAME_STALL_TURNS ends it when
+// nothing can be forced). The value is the old post-source allowance.
+const VSCODE_LM_STALL_TURNS = 12;
 // Once forced staging starts, a worker may still read declared files, but at
-// most this many times in total -- two per target -- so the 24-turn loop guard
-// still bounds the whole request (NF-2026-00023).
+// most this many times in total -- two per target -- so those reads stay
+// bounded inside the forced stall window (NF-2026-00023).
 const VSCODE_LM_MAX_FORCED_STAGE_READS = 4;
+// A stall that can arm no endgame (nothing to stage or finalize) ends the run only
+// once it also outlasts the forced-stage read allowance, so it never preempts the
+// 16-call Source Graph discovery allowance (VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT).
+const VSCODE_LM_NO_ENDGAME_STALL_TURNS = VSCODE_LM_STALL_TURNS + VSCODE_LM_MAX_FORCED_STAGE_READS;
 const VSCODE_LM_MAX_FINALIZATION_TURNS = 4;
-// A reviewer has one bounded job: submit one authenticated receipt. Three
-// turns allow an optional Source Graph lookup and one transient submit retry
-// without paying for the generic 24-turn coding-agent loop.
-const VSCODE_LM_MAX_QUALITY_REVIEW_TURNS = 3;
-// NF-2026-01598: a reviewer whose packet omits hunks must
-// read them. Each provider turn that yields distinct new source evidence
-// extends the submit budget by one turn (never per row), at most this many
-// times. 3 + 7 forces submit at post-source turn 10, which leaves turn 11 for
-// the corrective or transient-submit retry before the 12-turn post-source
-// finalization gate, so the loop stays bounded and the retry stays reachable.
-const VSCODE_LM_MAX_QUALITY_REVIEW_READ_TURNS = 7;
+// A reviewer has one bounded job: submit one authenticated receipt. It is forced
+// to submit after this many consecutive turns without novel source evidence; a
+// reviewer that keeps reading new evidence is never cut off (it replaces the
+// NF-2026-01598 capped read extension).
+const VSCODE_LM_QUALITY_REVIEW_STALL_TURNS = 3;
 const VSCODE_LM_MAX_EMULATED_RESPONSE_BYTES = 256 * 1024;
 const VSCODE_LM_MAX_EMULATED_TOOL_INPUT_BYTES = 16 * 1024;
 const VSCODE_LM_REQUEST_ID_RE = /^[a-f0-9]{32}$/;
@@ -5181,12 +5182,11 @@ async function awaitVscodeLmWorkerSourceGraphReadinessOnce() {
   throw new Error("vscode_lm_mcp_unavailable");
 }
 
-// Keep the NF1179 12+4 allowance for requests without novel source evidence
-// or a staged edit (NF1260). NF1290 also applies verified progress to the
-// 24-uncredited-turn allowance; successful discovery can continue while
-// duplicate, no-progress and forced-stage limits remain unchanged.
-const VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT =
-  VSCODE_LM_MAX_POST_SOURCE_TURNS + VSCODE_LM_MAX_FORCED_STAGE_READS;
+// A no-progress streak of Source Graph calls: novel source evidence or a staged
+// edit resets it (NF1260/NF1290), while duplicate and forced-stage limits stay.
+// It keeps the NF1179 12+4 value as a literal now that the post-source turn
+// allowance it was derived from is gone (NF-2026-01632).
+const VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT = 16;
 
 // Validate the backend's byte-page contract, not a partially decoded JSON page.
 function vscodeLmSourceGraphPageBytes(result) {
@@ -5322,6 +5322,36 @@ function createVscodeLmSourceGraphGuard() {
     },
     progressRevision() { return progressRevision; },
     sourceEvidenceRevision() { return seenEvidence.size; }, stageRevision() { return Math.max(0, seenStages.size - 1); }, // ranges after the first (NF-2026-01385)
+  };
+}
+
+// NF-2026-01632: the one progress watchdog both agent loops share. A provider
+// turn is stalled unless it moved the guard's progress, source-evidence or stage
+// revision; any movement resets the streak. The first Source Graph
+// acknowledgement also starts a fresh window, because the work phase (and the
+// post-source allowance this replaces) begins there.
+function createVscodeLmProgressWatchdog(sourceGraphGuard, sourceGraphAcknowledged) {
+  const mark = () => JSON.stringify([
+    sourceGraphGuard.progressRevision(),
+    sourceGraphGuard.sourceEvidenceRevision(),
+    sourceGraphGuard.stageRevision(),
+    Boolean(sourceGraphAcknowledged()),
+  ]);
+  let lastMark = null;
+  let turnsWithoutProgress = 0;
+  return {
+    // Called once at the top of every turn: the turn before it either moved a
+    // revision or it extends the stalled streak.
+    beginTurn() {
+      const current = mark();
+      turnsWithoutProgress = lastMark !== null && current === lastMark ? turnsWithoutProgress + 1 : 0;
+      lastMark = current;
+      return turnsWithoutProgress;
+    },
+    // Forced staging is not bounded by protocol limits alone (an idempotent
+    // restage is not progress), so it gets a fresh stall window, not none.
+    restart() { turnsWithoutProgress = 0; },
+    turnsWithoutProgress() { return turnsWithoutProgress; },
   };
 }
 
@@ -6137,7 +6167,6 @@ async function runVscodeLmTextProtocol(
         ? `\nINITIAL_SOURCE_GRAPH_RESULT:${JSON.stringify(initialSourceGraphResult)}`
         : ""),
   )];
-  let postSourceTurns = 0;
   let finalizationTurns = 0;
   let forceFinal = false;
   let forceFinalViolations = 0;
@@ -6161,29 +6190,33 @@ async function runVscodeLmTextProtocol(
   const sourceGraphGuard = createVscodeLmSourceGraphGuard();
   const writableTask = request.request_kind !== "quality_review" &&
     Array.isArray(request.allowedWrites) && request.allowedWrites.length > 0;
-  let creditedTurns = 0;
-  let reviewEvidenceTurns = 0;
   let lastTurnProgress = -1;
-  // NF1290: 24 bounds uncredited turns; verified discovery/edit progress earns
-  // continuation, without weakening duplicate/no-progress/finalization gates.
-  for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS + creditedTurns; turn += 1) {
+  const progressWatchdog = createVscodeLmProgressWatchdog(sourceGraphGuard, () => sourceGraphAcknowledged);
+  // NF-2026-01632: no turn counter ends this loop. VSCODE_LM_STALL_TURNS turns in a
+  // row without progress force the endgame below; when none can be forced, the run
+  // ends at VSCODE_LM_NO_ENDGAME_STALL_TURNS. Termination stays guaranteed by four
+  // things: the stall watchdog, assertRequestActive (cancellation and deadline), the
+  // finite set of novel evidence rows and stage identities that can reset the
+  // watchdog, and the supervisor's wall-clock timeout.
+  for (let turn = 0; ; turn += 1) {
     const progressBeforeTurn = sourceGraphGuard.progressRevision();
     const stalledLastTurn = progressBeforeTurn === lastTurnProgress;
     lastTurnProgress = progressBeforeTurn;
-    const sourceBeforeTurn = sourceGraphGuard.sourceEvidenceRevision(); const stagesBeforeTurn = sourceGraphGuard.stageRevision();
+    const turnsWithoutProgress = progressWatchdog.beginTurn();
     assertRequestActive();
     if (request.request_kind === "quality_review" &&
-        postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS +
-        Math.min(VSCODE_LM_MAX_QUALITY_REVIEW_READ_TURNS, reviewEvidenceTurns) &&
+        turnsWithoutProgress >= VSCODE_LM_QUALITY_REVIEW_STALL_TURNS &&
         !reviewSubmitForced) {
       reviewSubmitForced = true;
     }
     if (request.request_kind !== "quality_review" &&
         sourceGraphAcknowledged &&
         (!writableTask || !Array.isArray(request.required_outputs) || request.required_outputs.length > 0) &&
-        postSourceTurns >= VSCODE_LM_MAX_POST_SOURCE_TURNS) {
+        turnsWithoutProgress >= VSCODE_LM_STALL_TURNS) {
+      const wasStaging = forceStagedEdit;
       if (stagedEdits.hasChanges() && vscodeLmShouldKeepStagedEdit(writableTask, stagedEdits)) forceStagedEdit = true;
       else if (!writableTask || (stagedEdits && stagedEdits.hasChanges())) forceFinal = true;
+      if (forceStagedEdit && !wasStaging) progressWatchdog.restart();
     }
     // NF-2026-01378: one staged edit per required output is readiness, not completion;
     // finalize offline once the model stops progressing, so later edits to an output land.
@@ -6198,6 +6231,13 @@ async function runVscodeLmTextProtocol(
     if ((forceFinal || finalizationTurns > 0) &&
         finalizationTurns >= VSCODE_LM_MAX_FINALIZATION_TURNS) {
       throw vscodeLmProtocolFailure("vscode_lm_finalization_limit", protocolTrace, lastProtocolPreview);
+    }
+    // A stall that armed no endgame above ends the run before another provider
+    // turn once it reaches VSCODE_LM_NO_ENDGAME_STALL_TURNS; forced finalization is
+    // bounded by VSCODE_LM_MAX_FINALIZATION_TURNS.
+    if (!forceFinal && progressWatchdog.turnsWithoutProgress() >= VSCODE_LM_NO_ENDGAME_STALL_TURNS) {
+      protocolTrace.push({ turn, phase: "progress_watchdog", outcome: "stalled" });
+      break;
     }
     if (forceStagedEdit) {
       const nextMissing = vscodeLmNextStageOutput(stagedEdits);
@@ -6297,7 +6337,6 @@ async function runVscodeLmTextProtocol(
           : `The previous provider turn contained no text. Retry without prose and output only the next strict ` +
             `${VSCODE_LM_TOOL_REQUEST_SCHEMA} tool request or final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object.`,
       ));
-      if (sourceGraphAcknowledged) postSourceTurns += 1;
       protocolTrace.push({
         turn,
         phase: forceFinal ? "final" : "work",
@@ -6314,7 +6353,6 @@ async function runVscodeLmTextProtocol(
       }
       continue;
     }
-    if (sourceGraphAcknowledged) postSourceTurns += 1;
     let envelope;
     try {
       envelope = parseVscodeLmJsonEnvelope(text, { preferFinal: sourceGraphAcknowledged });
@@ -6343,7 +6381,7 @@ async function runVscodeLmTextProtocol(
         // armed once forced staging begins, so this two-strike budget has to stay
         // armed until exactly that point -- keying it off "nothing is staged yet"
         // instead left a run that staged one output early and then answered in
-        // prose with no bound at all until VSCODE_LM_MAX_POST_SOURCE_TURNS.
+        // prose with no bound at all short of the post-source turn allowance.
         //
         // Which identity that bound reports is a narrower question than when it
         // fires. Naming a still-missing output is only truthful once the protocol
@@ -6865,16 +6903,6 @@ async function runVscodeLmTextProtocol(
       }
       oversizedStageFailure.count += 1;
     }
-    if (writableTask && sourceGraphGuard.progressRevision() !== progressBeforeTurn) {
-      creditedTurns += 1; // One credit per provider turn, never per returned row/page.
-    }
-    if (request.request_kind === "quality_review" &&
-        sourceGraphGuard.sourceEvidenceRevision() !== sourceBeforeTurn) {
-      reviewEvidenceTurns += 1; // One credit per provider turn, never per returned row.
-    }
-    if (writableTask && (sourceGraphGuard.sourceEvidenceRevision() !== sourceBeforeTurn || (!forceStagedEdit && sourceGraphGuard.stageRevision() !== stagesBeforeTurn))) { // a free-phase stage turn is progress (NF-2026-01385)
-      postSourceTurns = Math.max(0, postSourceTurns - 1);
-    }
     protocolTrace.push({ turn, phase: "work", outcome: `tool:${envelope.name}` });
     const historyText = toolInputTooLarge ? "[oversized tool request omitted]" : text;
     messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(historyText)]));
@@ -6900,7 +6928,7 @@ async function runVscodeLmTextProtocol(
   throw vscodeLmProtocolFailure(
     request.request_kind === "quality_review"
       ? "vscode_lm_quality_review_submit_required"
-      : "vscode_lm_agent_turn_limit",
+      : "vscode_lm_source_graph_no_progress",
     protocolTrace,
     lastProtocolPreview,
   );
@@ -6943,8 +6971,6 @@ async function runVscodeLmAgent(
       : ""),
   )];
   let sourceGraphAcknowledged = request.request_kind === "quality_review" || Boolean(initialSourceGraphResult);
-  let toolTurns = 0;
-  let postSourceTurns = 0;
   let finalizationTurns = 0;
   let forceFinal = false;
   let forceFinalViolations = 0;
@@ -6963,30 +6989,32 @@ async function runVscodeLmAgent(
   const writableTask = !qualityReview && Array.isArray(request.allowedWrites) &&
     request.allowedWrites.length > 0;
   let wrongToolViolations = 0;
-  let creditedTurns = 0;
-  let reviewEvidenceTurns = 0;
   let lastTurnProgress = -1;
-  for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS + creditedTurns; turn += 1) {
+  // NF-2026-01632: the same progress watchdog and termination argument as
+  // runVscodeLmTextProtocol; no turn counter ends this loop either.
+  const progressWatchdog = createVscodeLmProgressWatchdog(sourceGraphGuard, () => sourceGraphAcknowledged);
+  for (let turn = 0; ; turn += 1) {
     const progressBeforeTurn = sourceGraphGuard.progressRevision();
     const stalledLastTurn = progressBeforeTurn === lastTurnProgress;
     lastTurnProgress = progressBeforeTurn;
-    const sourceBeforeTurn = sourceGraphGuard.sourceEvidenceRevision(); const stagesBeforeTurn = sourceGraphGuard.stageRevision();
+    const turnsWithoutProgress = progressWatchdog.beginTurn();
     assertRequestActive();
     if (qualityReview &&
-        postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS +
-        Math.min(VSCODE_LM_MAX_QUALITY_REVIEW_READ_TURNS, reviewEvidenceTurns) &&
+        turnsWithoutProgress >= VSCODE_LM_QUALITY_REVIEW_STALL_TURNS &&
         !reviewSubmitForced) {
       reviewSubmitForced = true;
     }
     if (sourceGraphAcknowledged &&
         (!writableTask || !Array.isArray(request.required_outputs) || request.required_outputs.length > 0) &&
-        (toolTurns >= VSCODE_LM_MAX_TOOL_TURNS || postSourceTurns >= VSCODE_LM_MAX_POST_SOURCE_TURNS) &&
+        turnsWithoutProgress >= VSCODE_LM_STALL_TURNS &&
         !forceFinal) {
+      const wasStaging = forceStagedEdit;
       if (vscodeLmShouldKeepStagedEdit(writableTask, stagedEdits)) {
         forceStagedEdit = true;
       } else if (!writableTask || (stagedEdits && stagedEdits.hasChanges())) {
         forceFinal = true;
       }
+      if (forceStagedEdit && !wasStaging) progressWatchdog.restart();
     }
     // NF-2026-01378: one staged edit per required output is readiness, not completion;
     // finalize offline once the model stops progressing, so later edits to an output land.
@@ -7001,6 +7029,13 @@ async function runVscodeLmAgent(
     if ((forceFinal || finalizationTurns > 0) &&
         finalizationTurns >= VSCODE_LM_MAX_FINALIZATION_TURNS) {
       throw vscodeLmProtocolFailure("vscode_lm_finalization_limit", protocolTrace, lastProtocolPreview);
+    }
+    // A stall that armed no endgame above ends the run before another provider
+    // turn once it reaches VSCODE_LM_NO_ENDGAME_STALL_TURNS; forced finalization is
+    // bounded by VSCODE_LM_MAX_FINALIZATION_TURNS.
+    if (!forceFinal && progressWatchdog.turnsWithoutProgress() >= VSCODE_LM_NO_ENDGAME_STALL_TURNS) {
+      protocolTrace.push({ turn, phase: "progress_watchdog", outcome: "stalled" });
+      break;
     }
     if (forceStagedEdit) {
       const nextMissing = vscodeLmNextStageOutput(stagedEdits);
@@ -7052,7 +7087,6 @@ async function runVscodeLmAgent(
       }
       finalizationTurns += 1;
     }
-    const startedWithSourceGraph = sourceGraphAcknowledged;
     const availableTools = vscodeLmToolsForRequest(
       request, sourceGraphAcknowledged, forceStagedEdit, stagedEdits.recoveryToolNames(),
     );
@@ -7104,7 +7138,6 @@ async function runVscodeLmAgent(
         if (responseText) textParts.push(responseText);
       }
     }
-    if (startedWithSourceGraph) postSourceTurns += 1;
     if (forceStagedEdit && calls.some(call => call.name !== VSCODE_LM_STAGE_EDIT_TOOL &&
         !stagedEdits.allowsRecoveryCall(call))) {
       const nextMissing = vscodeLmNextStageOutput(stagedEdits);
@@ -7476,17 +7509,6 @@ async function runVscodeLmAgent(
       }
       results.push(languageModelToolResultPart(call.callId, result));
     }
-    if (writableTask && sourceGraphGuard.progressRevision() !== progressBeforeTurn) {
-      creditedTurns += 1; // A multi-tool batch earns at most one continuation turn.
-    }
-    if (qualityReview && sourceGraphGuard.sourceEvidenceRevision() !== sourceBeforeTurn) {
-      reviewEvidenceTurns += 1; // One credit per provider turn, never per returned row.
-    }
-    if (writableTask && (sourceGraphGuard.sourceEvidenceRevision() !== sourceBeforeTurn || (!forceStagedEdit && sourceGraphGuard.stageRevision() !== stagesBeforeTurn))) { // a free-phase stage turn is progress (NF-2026-01385)
-      postSourceTurns = Math.max(0, postSourceTurns - 1);
-    } else {
-      toolTurns += 1;
-    }
     protocolTrace.push({ turn, phase: "work", outcome: `tools:${calls.length}` });
     messages.push(vscode.LanguageModelChatMessage.User(results));
     if (submitIncompleteThisTurn) {
@@ -7503,7 +7525,7 @@ async function runVscodeLmAgent(
   throw vscodeLmProtocolFailure(
     qualityReview
       ? "vscode_lm_quality_review_submit_required"
-      : "vscode_lm_agent_turn_limit",
+      : "vscode_lm_source_graph_no_progress",
     protocolTrace,
     lastProtocolPreview,
   );
@@ -14686,6 +14708,7 @@ module.exports = {
     createVscodeLmStagedEditCollector,
     invokeVscodeLmProtocolTool,
     createVscodeLmSourceGraphGuard,
+    createVscodeLmProgressWatchdog,
     invokeVscodeLmPrivateTool,
     vscodeLmIsLineOnePin,
     vscodeLmNoteLineOnePin,
@@ -14779,8 +14802,9 @@ module.exports = {
       DEBUG_TRACE_MAX_TOTAL_BYTES,
       DEBUG_TRACE_ACTIVE_MS,
       DEBUG_TRACE_DURABLE_EVENTS,
-      VSCODE_LM_MAX_AGENT_TURNS,
-      VSCODE_LM_MAX_POST_SOURCE_TURNS,
+      VSCODE_LM_STALL_TURNS,
+      VSCODE_LM_NO_ENDGAME_STALL_TURNS,
+      VSCODE_LM_QUALITY_REVIEW_STALL_TURNS,
       VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT,
     },
   },
