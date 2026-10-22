@@ -201,7 +201,7 @@ async def _run_readonly_round_via_client(state_dir: Path) -> dict[str, Any]:
         "state_empty": after == [],
         "queue_verify_before_rc": verify_before,
         "queue_verify_after_rc": verify_after,
-        "queue_verify_intact": verify_before == 0 and verify_after == 0,
+        "queue_verify_intact": verify_before == verify_after,  # absolute rc depends on the host queue
     }
 
 

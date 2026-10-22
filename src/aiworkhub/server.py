@@ -525,6 +525,8 @@ if _lowlevel_server is not None:
 
 
 if _MCP_SDK_AVAILABLE:
+    from .mcp_tool_metadata import prepare_registration
+
     _sdk_tool_decorator = mcp.tool
 
     def _nonblocking_mcp_tool(*decorator_args: Any, **decorator_kwargs: Any):
@@ -538,17 +540,29 @@ if _MCP_SDK_AVAILABLE:
         preserve direct Python callers and tests.
         """
 
-        register = _sdk_tool_decorator(*decorator_args, **decorator_kwargs)
-
         def decorate(function: Any) -> Any:
+            tool_args, tool_kwargs, signature = prepare_registration(
+                function, decorator_args, decorator_kwargs
+            )
+            register = _sdk_tool_decorator(*tool_args, **tool_kwargs)
+
             if inspect.iscoroutinefunction(function):
-                register(function)
+
+                @wraps(function)
+                async def async_adapter(*args: Any, **kwargs: Any) -> Any:
+                    return await function(*args, **kwargs)
+
+                if signature is not None:
+                    async_adapter.__signature__ = signature
+                register(async_adapter)
                 return function
 
             @wraps(function)
             async def run_in_worker_thread(*args: Any, **kwargs: Any) -> Any:
                 return await asyncio.to_thread(function, *args, **kwargs)
 
+            if signature is not None:
+                run_in_worker_thread.__signature__ = signature
             register(run_in_worker_thread)
             return function
 
