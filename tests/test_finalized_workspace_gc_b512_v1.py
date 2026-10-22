@@ -1032,6 +1032,74 @@ def test_assert_gc_safe_workspace_shape_rejects_legacy_namespaced_root_for_anoth
         )
 
 
+def test_assert_gc_safe_workspace_shape_accepts_repo_owned_root_despite_runtime_env(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(worker_workspace.RUNTIME_ROOT_ENV, str(tmp_path / "elsewhere-runtime"))
+    monkeypatch.delenv(worker_workspace.WORKTREE_ROOT_ENV, raising=False)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    root = repo / ".aiworkhub" / "runtime" / "worktrees"
+    request_id = "req-repo-owned-root"
+    path = root / request_id / "worktree"
+    home = root / request_id / "home"
+
+    accepted = worker_workspace.assert_gc_safe_workspace_shape(
+        request_id, path, home, repo=repo
+    )
+    assert accepted == root.resolve(strict=False)
+
+
+def test_assert_gc_safe_workspace_shape_repo_owned_root_still_requires_repo(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(worker_workspace.RUNTIME_ROOT_ENV, str(tmp_path / "elsewhere-runtime"))
+    monkeypatch.delenv(worker_workspace.WORKTREE_ROOT_ENV, raising=False)
+    monkeypatch.setattr(worker_workspace.tempfile, "gettempdir", lambda: str(tmp_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    root = repo / ".aiworkhub" / "runtime" / "worktrees"
+    request_id = "req-repo-owned-root"
+    path = root / request_id / "worktree"
+    home = root / request_id / "home"
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="gc_workspace_shape_mismatch"
+    ):
+        worker_workspace.assert_gc_safe_workspace_shape(request_id, path, home)
+
+
+def test_assert_gc_safe_workspace_shape_repo_owned_root_rejects_swap_and_foreign_request(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(worker_workspace.RUNTIME_ROOT_ENV, str(tmp_path / "elsewhere-runtime"))
+    monkeypatch.delenv(worker_workspace.WORKTREE_ROOT_ENV, raising=False)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    root = repo / ".aiworkhub" / "runtime" / "worktrees"
+    request_id = "req-repo-owned-root"
+    path = root / request_id / "worktree"
+    home = root / request_id / "home"
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="gc_workspace_shape_mismatch"
+    ):
+        # home/worktree swapped -- exact-shape mismatch under the repo root too.
+        worker_workspace.assert_gc_safe_workspace_shape(
+            request_id, home, path, repo=repo
+        )
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="gc_workspace_shape_mismatch"
+    ):
+        # a foreign request id under the repo-owned root is still rejected.
+        worker_workspace.assert_gc_safe_workspace_shape(
+            request_id,
+            root / "some-other-request" / "worktree",
+            root / "some-other-request" / "home",
+            repo=repo,
+        )
+
+
 def test_assert_gc_safe_workspace_shape_rejects_legacy_namespaced_root_request_id_mismatch(
     tmp_path, monkeypatch
 ):

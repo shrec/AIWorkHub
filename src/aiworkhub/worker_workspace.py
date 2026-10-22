@@ -6477,7 +6477,21 @@ def assert_gc_safe_workspace_shape(
     """Fail closed unless this is the request's exact configured workspace."""
     if not _REQUEST_ID_RE.fullmatch(request_id):
         raise WorkspaceError(f"gc_invalid_request_id:{request_id}")
-    candidates = (configured_worktree_root(repo), *_legacy_worktree_roots(repo))
+    candidates = [configured_worktree_root(repo), *_legacy_worktree_roots(repo)]
+    if repo is not None:
+        # The finalizing process may hold the repository-owned default root
+        # even when AIWORKHUB_RUNTIME_ROOT / AIWORKHUB_WORKTREE_ROOT resolve
+        # elsewhere, so that root is also a candidate here.  A symlinked
+        # ``<repo>/.aiworkhub`` or ``<repo>/.aiworkhub/runtime`` is refused
+        # (not added), mirroring ``configured_runtime_root``'s
+        # repo_runtime_symlink_forbidden rule.
+        selected_repo = Path(repo).resolve()
+        hub = selected_repo / ".aiworkhub"
+        runtime = hub / "runtime"
+        if not (hub.is_symlink() or runtime.is_symlink()):
+            candidates.append(
+                (runtime / "worktrees").resolve(strict=False)
+            )
     for root in dict.fromkeys(candidates):
         expected_path = (root / request_id / "worktree").resolve(strict=False)
         expected_home = (root / request_id / "home").resolve(strict=False)
