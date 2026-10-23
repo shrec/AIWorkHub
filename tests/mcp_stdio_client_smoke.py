@@ -148,6 +148,8 @@ WRITE_GATED_TOOLS: tuple[str, ...] = (
 # optional ``validation_amendment`` parameter (156ec39) -- additive, default
 # None, every earlier call shape still valid. The pin sat red from that commit
 # until the 0.12.13 release pre-check, because no card's validation ran it.
+#
+# RE-FROZEN 2026-10-24, one tool: task_stale_recovery_recommend gained optional scope and sample.
 FROZEN_SCHEMA_FINGERPRINTS: dict[str, str] = {
     "aiworkhub_agent_cancel_task": "f1d9792f94307639105434caa381c54857d7c292dab122b4cd4e9333dd0552f3",
     "aiworkhub_agent_collect_result": "c291cac06bc81689a1b0df1357facb97c5806fefd0a447ef3245e38976077a3f",
@@ -180,7 +182,7 @@ FROZEN_SCHEMA_FINGERPRINTS: dict[str, str] = {
     "aiworkhub_task_review_queue": "b5728f6f46c22488977fe80e794f420203cf6725367eb9271cfdad1c6538b878",
     "aiworkhub_task_review_summarize": "e535208ce91e843357bb2efb237b656c50ad1a0b4e1be4111c9ae2356c647e01",
     "aiworkhub_task_show": "987a6779aea9974dc849205292e41e5fab2443e04e97f3c2528059a6b60c4ad3",
-    "aiworkhub_task_stale_recovery_recommend": "29e87fad5d966f1e6159991a6ddeba3f77be49d7d8ee11951dd8c858556881fc",
+    "aiworkhub_task_stale_recovery_recommend": "2491f64e91873239bd9085912516f2da57da5a1ad58f9745cbca82a8fcccfcd1",
     "aiworkhub_task_usage_report": "84fe64116d44bde99ea6a1d850e94a3164e32c12b7a4479ecb4dc10bcc0fe7e3",
 }
 

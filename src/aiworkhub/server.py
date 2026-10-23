@@ -3955,14 +3955,25 @@ def aiworkhub_task_queue_request(
 def aiworkhub_task_stale_recovery_recommend(
     topic: str | None = None,
     limit: int = 200,
+    scope: str = "processing",
+    sample: int = 10,
 ) -> dict[str, Any]:
-    """READ-ONLY: recommend recovery actions for stale processing tasks.
+    """READ-ONLY: recommend recovery actions for stale processing tasks or blocked cards.
 
+    scope="processing" (default) covers stale processing tasks. scope="blocked"
+    triages the blocked-card queue: one recommendation per card, `limit` bounds the
+    cards read (see bounds.truncated) and `sample` the rows listed per group.
     Produces recommendations only. It never calls taskctl write commands and
     never kills a process.
     """
 
-    return stale_recovery.build_recovery_actions(topic=topic, limit=limit)
+    if scope == "processing":
+        return stale_recovery.build_recovery_actions(topic=topic, limit=limit)
+    if scope == "blocked":
+        return stale_recovery.build_blocked_triage(
+            root=core.repo_root(), topic=topic, limit=limit, sample=sample,
+        )
+    return {"ok": False, "error": "unknown_scope", "allowed": list(stale_recovery.SCOPES)}
 
 
 _COST_LEDGER_SUMMARY_TOP_N = 10
