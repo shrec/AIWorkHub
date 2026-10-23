@@ -204,9 +204,26 @@ def _blocked_terminal_candidate_request_ids(
     return frozenset(rid for rid in implicated if rid)
 
 
+def _is_unfinished_card_attempt(
+    worktree: Mapping[str, Any], unfinished_cards: frozenset[str] | set[str]
+) -> bool:
+    """True when the request ledger ties ``worktree`` to a card still open.
+
+    A relaunch moves the card's ``launch_request_id`` on, so an older attempt is
+    named by no card field; only its ledger owner links it back. That attempt's
+    worktree lives until the card is finished, archived, superseded or closed by
+    a terminal NeedFix. The one predicate shared by the planner, the partial
+    preview sink and the quarantine commit-time recheck, so they cannot disagree.
+    """
+    return (
+        worktree.get("ownership_source") == "request_ledger"
+        and str(worktree.get("owner_task_id") or "") in unfinished_cards
+    )
+
+
 def _protected_attempt_ids(
     repo_root: Path,
-) -> tuple[dict[str, str], bool, dict[str, list[str]], set[str]]:
+) -> tuple[dict[str, str], bool, dict[str, list[str]], set[str], set[str]]:
     """Worktree ids a live attempt or in-flight rework lineage still holds.
 
     A worktree is protected -- and therefore never a quarantine candidate --
@@ -258,19 +275,24 @@ def _protected_attempt_ids(
     single query whose bound is the exact size of the ``tasks`` table, which
     can never itself exclude a live card.
 
-    Returns ``(protected, verified, pinned_by, terminal_tasks)``. ``protected``
-    maps each protected request id to its reason. ``pinned_by`` maps each
-    ``rework_predecessor_retained`` worktree id to the sorted list of card ids
-    still pinning it, so the preview can report how much storage is held by
-    in-flight rework lineage AND which cards hold it -- an operator can then see
-    a bounded, named standoff (see :func:`plan_worktree_reclaim`) rather than a
-    silent one. ``verified`` is False when task lineage could not be read at
-    all, so the caller fails closed rather than guessing that an unreadable
-    attempt is safe to reclaim.
+    Returns ``(protected, verified, pinned_by, terminal_tasks, unfinished_cards)``.
+    ``protected`` maps each protected request id to its reason. ``pinned_by``
+    maps each ``rework_predecessor_retained`` worktree id to the sorted list of
+    card ids still pinning it, so the preview can report how much storage is held
+    by in-flight rework lineage AND which cards hold it -- an operator can then
+    see a bounded, named standoff (see :func:`plan_worktree_reclaim`) rather than
+    a silent one. ``unfinished_cards`` is the id of every card that is neither
+    finished/archived/superseded nor closed by a terminal NeedFix: a worker that
+    dies leaves its card pending or blocked, so the attempts the request ledger
+    ties to such a card keep their worktrees (see
+    :func:`_is_unfinished_card_attempt`). ``verified`` is False when task lineage
+    could not be read at all, so the caller fails closed rather than guessing
+    that an unreadable attempt is safe to reclaim.
     """
     protected: dict[str, str] = {}
     pinned_by: dict[str, list[str]] = {}
     terminal_tasks: set[str] = set()
+    unfinished_cards: set[str] = set()
     terminal_needfix_tasks, needfix_lineage_verified = _terminal_needfix_task_ids(repo_root)
     try:
         db_path = task_store.canonical_db_path(repo_root)
@@ -288,18 +310,22 @@ def _protected_attempt_ids(
             conn.close()
         for row in rows:
             status = task_store.canonical_status(dict(row))
+            card_id = str(row["task_id"] or "").strip()
+            closed_by_needfix = (
+                needfix_lineage_verified and card_id in terminal_needfix_tasks
+            )
+            card_unfinished = status not in _FINISHED_STATUSES and not closed_by_needfix
+            # Before the card_json parse: a corrupt record must not drop an open card.
+            if card_id and card_unfinished:
+                unfinished_cards.add(card_id)
             try:
                 card_json = json.loads(row["card_json"] or "{}")
             except json.JSONDecodeError:
                 card_json = {}
             if not isinstance(card_json, dict):
                 continue
-            card_id = str(row["task_id"] or "").strip()
             if card_id and status in _FINISHED_STATUSES:
                 terminal_tasks.add(card_id)
-            closed_by_needfix = (
-                needfix_lineage_verified and card_id in terminal_needfix_tasks
-            )
             if status in ("processing", "review"):
                 request_id = str(card_json.get("launch_request_id") or "").strip()
                 if request_id and not closed_by_needfix:
@@ -309,7 +335,7 @@ def _protected_attempt_ids(
                     protected.setdefault(
                         blocked_request_id, "blocked_terminal_candidate_retained"
                     )
-            if status not in _FINISHED_STATUSES and not closed_by_needfix:
+            if card_unfinished:
                 predecessor = card_json.get("rework_predecessor")
                 if isinstance(predecessor, dict):
                     predecessor_id = str(predecessor.get("request_id") or "").strip()
@@ -322,10 +348,10 @@ def _protected_attempt_ids(
                             if card_id not in holders:
                                 holders.append(card_id)
     except (task_store.TaskStoreError, sqlite3.Error, OSError):
-        return {}, False, {}, set()
+        return {}, False, {}, set(), set()
     for holders in pinned_by.values():
         holders.sort()
-    return protected, True, pinned_by, terminal_tasks
+    return protected, True, pinned_by, terminal_tasks, unfinished_cards
 
 
 def _is_live_combined_validation(
@@ -390,6 +416,13 @@ def plan_worktree_reclaim(
     until the projection clears the cap or the pool is exhausted, so a policy
     breach is never reported as nothing to reclaim.
 
+    A request-ledger-owned worktree whose card is not finished, archived or
+    superseded (and not closed by a terminal NeedFix) is kept as
+    ``unfinished_card_attempt`` whatever its age: a worker that dies leaves its
+    card pending or blocked, and every attempt of that card -- older attempts of
+    a relaunched card included -- must survive until the card is closed. It is
+    never reclaimable, so the over-cap pass cannot pull it forward either.
+
     ``now`` is an explicit as-of Unix timestamp used to compute each
     worktree's age from its ``modified_at_epoch``. It defaults to the real
     current time; callers (tests included) may inject a synthetic value so
@@ -397,7 +430,7 @@ def plan_worktree_reclaim(
     mtimes.
     """
     root = Path(repo_root).resolve()
-    protected_ids, lineage_verified, pinned_by, terminal_tasks = (
+    protected_ids, lineage_verified, pinned_by, terminal_tasks, unfinished_cards = (
         _protected_attempt_ids(root)
     )
     terminal_needfix_tasks, needfix_lineage_verified = _terminal_needfix_task_ids(root)
@@ -439,6 +472,12 @@ def plan_worktree_reclaim(
         if wt_id in protected_ids:
             would_keep.append(wt)
             protection_reasons[wt_id] = protected_ids[wt_id]
+            continue
+        # Kept before the reclaimable list, so neither age nor the over-cap pass
+        # can ever reach an attempt of a card that is still open.
+        if _is_unfinished_card_attempt(wt, unfinished_cards):
+            would_keep.append(wt)
+            protection_reasons[wt_id] = "unfinished_card_attempt"
             continue
         if (
             wt.get("class") == worktree_storage.CLASS_REMOVABLE_SAFE
@@ -730,7 +769,7 @@ def _preview_payload(
         # (_protected_attempt_ids) and the git common dir, never from a name or an
         # age alone. If the deadline is hit mid-walk the preview surfaces exactly
         # these instead of an empty list that reads as a clean repository.
-        protected_ids, lineage_verified, _pinned_by, _terminal_tasks = (
+        protected_ids, lineage_verified, _pinned_by, _terminal_tasks, unfinished_cards = (
             _protected_attempt_ids(repo_root)
         )
         progress.configure(
@@ -739,6 +778,7 @@ def _preview_payload(
             lineage_verified=lineage_verified,
             min_age_days=policy_days,
             now=now,
+            unfinished_card_ids=unfinished_cards,
         )
     footprint = repo_storage_footprint(repo_root, base=base, progress=progress)
     scan = footprint["scan"]
@@ -903,7 +943,8 @@ class _PreviewProgress:
     reads a SNAPSHOT of the reclaim candidates the walk has ALREADY fully
     established -- each worktree whose size and git state are both measured and
     which is provably eligible: repository-scoped, aged past policy, not protected,
-    and either removable-safe or on verified lineage. Reporting those, explicitly
+    not an attempt of a still-open card, and either removable-safe or on verified
+    lineage. Reporting those, explicitly
     marked partial with the worktrees not yet covered, is what stops a
     deadline-limited preview from reading as a clean repository (the same class of
     lie as a build that indexed nothing reporting success).
@@ -919,8 +960,8 @@ class _PreviewProgress:
 
     __slots__ = (
         "_lock", "_configured", "_repo_common_dir", "_protected_ids",
-        "_lineage_verified", "_min_age_seconds", "_now", "_all_ids", "_covered",
-        "_candidates",
+        "_unfinished_card_ids", "_lineage_verified", "_min_age_seconds", "_now",
+        "_all_ids", "_covered", "_candidates",
     )
 
     def __init__(self) -> None:
@@ -928,6 +969,7 @@ class _PreviewProgress:
         self._configured = False
         self._repo_common_dir = ""
         self._protected_ids: dict[str, str] = {}
+        self._unfinished_card_ids: frozenset[str] = frozenset()
         self._lineage_verified = False
         self._min_age_seconds = 0
         self._now: float | None = None
@@ -943,10 +985,12 @@ class _PreviewProgress:
         lineage_verified: bool,
         min_age_days: int,
         now: float | None,
+        unfinished_card_ids: frozenset[str] | set[str] = frozenset(),
     ) -> None:
         with self._lock:
             self._repo_common_dir = repo_common_dir or ""
             self._protected_ids = dict(protected_ids or {})
+            self._unfinished_card_ids = frozenset(unfinished_card_ids)
             self._lineage_verified = bool(lineage_verified)
             self._min_age_seconds = max(0, min(int(min_age_days), 3650)) * 86400
             self._now = time.time() if now is None else float(now)
@@ -980,6 +1024,8 @@ class _PreviewProgress:
             if wt_id in self._protected_ids or _is_live_combined_validation(
                 wt_id, self._protected_ids
             ):
+                return
+            if _is_unfinished_card_attempt(worktree, self._unfinished_card_ids):
                 return
             eligible_class = worktree.get("class") == worktree_storage.CLASS_REMOVABLE_SAFE
             if not (eligible_class or self._lineage_verified):
@@ -1458,16 +1504,18 @@ def _authenticated_manifest(repo_root: Path, manifest: Mapping[str, Any]) -> boo
 
 
 # The states a worktree quarantine item ends in when nothing was moved into the
-# batch for it: its on-disk identity changed between the digest snapshot and the
-# move, so no worktree directory sits under the batch. A batch whose every item
-# is one of these -- and which physically holds no files -- has nothing to
-# restore. This mirrors the terminal-log retention empty-batch definition so both
-# quarantine subsystems agree on "holds nothing to restore".
+# batch for it: its on-disk identity, git state or card lifecycle changed between
+# the digest snapshot and the move, so no worktree directory sits under the
+# batch. A batch whose every item is one of these -- and which physically holds
+# no files -- has nothing to restore. This mirrors the terminal-log retention
+# empty-batch definition so both quarantine subsystems agree on "holds nothing
+# to restore".
 _EMPTY_BATCH_ITEM_STATES = frozenset({
     "skipped_invalid_id",
     "skipped_identity_changed",
     "skipped_missing",
     "skipped_git_state_changed",
+    "skipped_card_unfinished",
 })
 
 
@@ -1584,12 +1632,14 @@ def quarantine(
         if "terminal_needfix_request_ledger" in authorities
         else (set(), False)
     )
-    if "terminal_task_request_ledger" in authorities:
-        _protected, task_lineage_verified, _pinned, terminal_tasks = (
+    if any(
+        item.get("ownership_source") == "request_ledger" for item in manifest["items"]
+    ):
+        _protected, task_lineage_verified, _pinned, terminal_tasks, unfinished_cards = (
             _protected_attempt_ids(root)
         )
     else:
-        task_lineage_verified, terminal_tasks = False, set()
+        task_lineage_verified, terminal_tasks, unfinished_cards = False, set(), set()
     for item in manifest["items"]:
         item_id = item["id"]
         if not _ID_RE.fullmatch(item_id):
@@ -1612,6 +1662,12 @@ def quarantine(
             continue
         if not stat.S_ISDIR(source_info.st_mode) or int(source_info.st_mtime) != item["modified_at_epoch"]:
             item["state"] = "skipped_identity_changed"
+            _atomic_json(manifest_path, manifest)
+            continue
+        # The card may have been relaunched or reopened since the digest snapshot:
+        # the move asks the same predicate the preview used, against fresh lineage.
+        if _is_unfinished_card_attempt(item, unfinished_cards):
+            item["state"] = "skipped_card_unfinished"
             _atomic_json(manifest_path, manifest)
             continue
         # A candidate need not be CLASS_REMOVABLE_SAFE: plan_worktree_reclaim()
@@ -1931,7 +1987,7 @@ def restore(
         else (set(), False)
     )
     if "terminal_task_request_ledger" in authorities:
-        _protected, task_lineage_verified, _pinned, terminal_tasks = (
+        _protected, task_lineage_verified, _pinned, terminal_tasks, _unfinished = (
             _protected_attempt_ids(root)
         )
     else:

@@ -18,9 +18,11 @@ already drives on every interval) and
 of (a) the process event is a genuine terminal, non-blocked state with
 ``workspace_retained`` still true, (b) the exact PID/start-tick identity is
 PROVEN dead (never inferred from "alive with unknown ticks"), (c) the
-canonical task has disposed the exact attempt or a review card names a newer
-request id (never the current review request and never processing), and (d)
-the workspace path/home are exactly
+canonical task is finished, archived or superseded, or a review card names a
+newer request id (never the current review request, and never a pending,
+blocked or processing card: its worktree lives until the card closes; the one
+exception is a pinned rework predecessor whose delta is sealed or whose card
+can no longer recover it), and (d) the workspace path/home are exactly
 ``<configured_root>/<request_id>/{worktree,home}``. Every other case is
 skipped and reported, never deleted.
 """
@@ -388,24 +390,40 @@ def test_active_task_status_preserves_the_workspace(tmp_path, monkeypatch, statu
     "status,worker_status",
     [("pending", "unclaimed"), ("blocked", "blocked")],
 )
-def test_coordinator_disposed_attempt_is_gc_cleaned(tmp_path, monkeypatch, status, worker_status):
+def test_unfinished_card_attempt_survives_gc_until_the_card_is_closed(
+    tmp_path, monkeypatch, status, worker_status
+):
+    """A worker that died leaves its card pending or blocked; the worktree must live.
+
+    A worktree is deleted only once its card is finished, archived or superseded,
+    and the same attempt is collected the moment the card closes.
+    """
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
+    request_id = f"req-unfinished-{status}"
     card = _card()
     card.update({"status": status, "worker_status": worker_status})
     manager = _build_manager(tmp_path, card)
     path, home, _ = _seed_gc_candidate(
         manager, tmp_path, card,
-        request_id=f"req-disposed-{status}",
+        request_id=request_id,
         pid=2_147_483_071, pid_start_ticks=999_999_921,
         state="worker_failed",
     )
 
     result = manager._gc_finalized_workspaces()
 
+    assert result == {"gc_scanned": 1, "gc_cleaned": 0, "gc_skipped": 1}
+    assert path.exists() and home.exists()
+    assert "workspace_gc" not in manager._request_events(request_id)[-1]
+
+    card.update({"status": "finished", "worker_status": "done", "claimed_by": ""})
+    result = manager._gc_finalized_workspaces()
+
     assert result == {"gc_scanned": 1, "gc_cleaned": 1, "gc_skipped": 0}
     assert not path.exists() and not home.exists()
-    latest = manager._request_events(f"req-disposed-{status}")[-1]
-    assert latest["workspace_gc_reason"] == f"disposed_task_status:{status}"
+    assert manager._request_events(request_id)[-1]["workspace_gc_reason"] == (
+        "disposed_task_status:finished"
+    )
 
 
 # --- B512+: finalize_failed is retryable, its workspace outlives the card ------
@@ -414,16 +432,16 @@ def test_coordinator_disposed_attempt_is_gc_cleaned(tmp_path, monkeypatch, statu
 # card moved to blocked, and nine seconds later the sweep purged the retained
 # workspace with reason disposed_task_status:blocked.  retry_finalization then
 # refused with finalization_retry_workspace_missing even though the reviewer's
-# report was on disk and parseable.  ``blocked`` IS a disposed canonical status
-# and a ``finalize_failed`` process state IS retained for diagnosis: both rules
-# are individually correct, and together they destroy the only recovery path.
+# report was on disk and parseable.  ``blocked`` was a disposed canonical status
+# then; a worktree now lives until its card is finished, archived or superseded,
+# so the card state and the ``finalize_failed`` rule each retain that workspace.
 
 
 def test_finalize_failed_last_state_survives_sweep_and_retry_finds_it(tmp_path, monkeypatch):
     """Reproduction: a blocked card whose LAST process state is finalize_failed
     must survive a full sweep, and retry_finalization must still find its
-    workspace.  On the pre-fix code the sweep collects it (blocked is a disposed
-    status) and retry_finalization then fails with workspace_missing."""
+    workspace.  On the pre-fix code the sweep collects it (blocked was then a
+    disposed status) and retry_finalization then fails with workspace_missing."""
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
     # retry_finalization refuses up front when the write gate is closed; open it
     # so the reproduction reaches the workspace-existence check it is about.
@@ -497,12 +515,12 @@ def test_finalize_failed_retention_ends_when_the_card_is_already_finished(
 
 
 def test_finalize_failed_retention_survives_a_pending_card(tmp_path, monkeypatch):
-    """``pending`` is a disposed status too, and a retry can still recover it.
+    """``pending`` is not a disposed status, and a retry can still recover it.
 
-    Narrowing the rule to exempt finished/archived must not narrow it past the
-    cards a retry can actually serve. ``pending`` is in
-    GC_DISPOSED_CANONICAL_STATUSES exactly like ``blocked``, so without the
-    process-state check its workspace would be swept.
+    A worktree lives until its card is finished, archived or superseded, so a
+    pending card keeps the workspace whatever the last process state was. This
+    pins the ``finalize_failed`` case a retry actually serves: ``pending`` is
+    not in GC_DISPOSED_CANONICAL_STATUSES, so the sweep never reaches it.
     """
 
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
@@ -522,10 +540,16 @@ def test_finalize_failed_retention_survives_a_pending_card(tmp_path, monkeypatch
     assert result == {"gc_scanned": 1, "gc_cleaned": 0, "gc_skipped": 1}
     assert path.exists() and home.exists()
 
-def test_blocked_card_with_successful_terminal_last_state_is_still_collected(tmp_path, monkeypatch):
-    """The fix is scoped to finalize_failed only: a blocked card whose
-    finalization SUCCEEDED (a non-finalize_failed terminal state) is still the
-    common, collectable case -- disposed_task_status:blocked is unchanged."""
+
+def test_blocked_card_with_successful_terminal_last_state_keeps_its_worktree_until_archived(
+    tmp_path, monkeypatch
+):
+    """A blocked card keeps its worktree whatever the last process state was.
+
+    ``finalize_failed`` is not special here: ``review_ready`` is a successful
+    terminal state, yet the card is blocked, not closed, so its next attempt
+    may still need the worktree. Archiving the card is what releases it.
+    """
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
     request_id = "req-blocked-success-terminal"
     card = _card()
@@ -540,10 +564,17 @@ def test_blocked_card_with_successful_terminal_last_state_is_still_collected(tmp
 
     result = manager._gc_finalized_workspaces()
 
+    assert result == {"gc_scanned": 1, "gc_cleaned": 0, "gc_skipped": 1}
+    assert path.exists() and home.exists()
+    assert "workspace_gc" not in manager._request_events(request_id)[-1]
+
+    card["archived_at"] = "2026-07-16T00:00:00Z"
+    result = manager._gc_finalized_workspaces()
+
     assert result == {"gc_scanned": 1, "gc_cleaned": 1, "gc_skipped": 0}
     assert not path.exists() and not home.exists()
     assert manager._request_events(request_id)[-1]["workspace_gc_reason"] == (
-        "disposed_task_status:blocked"
+        "disposed_task_status:archived"
     )
 
 

@@ -810,13 +810,14 @@ def test_ro_lineage_connection_encodes_hash_and_creates_no_file(
     truncated = tmp_path / "db"  # what the buggy fragment-dropping URI created
     monkeypatch.setattr(task_store, "canonical_db_path", lambda _root: hashed)
 
-    protected, verified, pinned_by, terminal_tasks = (
+    protected, verified, pinned_by, terminal_tasks, unfinished_cards = (
         storage_retention._protected_attempt_ids(tmp_path)
     )
 
     assert protected == {}
     assert pinned_by == {}
     assert terminal_tasks == set()
+    assert unfinished_cards == set()
     assert verified is False  # unreadable lineage fails closed
     assert not truncated.exists()  # no read-write create at the truncated path
     assert not hashed.exists()  # mode=ro on a missing file creates nothing

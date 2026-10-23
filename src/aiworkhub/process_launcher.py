@@ -883,16 +883,19 @@ def _terminal_state_for_workspace_error(exc: WorkspaceError) -> str:
         return "worker_failed"
     return _launcher_validation.terminal_state_for_workspace_error(exc)
 
-# Failure workspaces remain available through coordinator review.  Once a
-# coordinator has disposed that exact attempt (finished/archived/superseded,
-# returned it to pending, or moved it to blocked), the retained workspace is no
-# longer the authoritative review surface and is safe to collect.  While a card
-# is in review, only the request_id named by terminal_review remains
-# authoritative; older retained attempts for the same card are superseded and
-# collectable.  Every terminal process state is a candidate: a state without a
-# retained workspace is filtered by ``workspace_retained`` itself.
+# A worker worktree is deleted only when its card is finished, archived or
+# superseded (or its NeedFix is terminal).  A worker that dies (restart, power
+# loss, network drop, token expiry, rate limit, transient_retry, dead-process
+# reconcile) leaves the card pending or blocked, and that worktree must survive
+# for the next attempt.  The one exception is a pinned rework predecessor: it
+# is collected once its delta is sealed or its card can no longer recover it
+# (see ``ProcessManager._gc_disposition``).  While a card is in review, only
+# the request_id named by terminal_review remains authoritative; older retained
+# attempts for the same card are superseded and collectable.  Every terminal
+# process state is a candidate: a state without a retained workspace is
+# filtered by ``workspace_retained`` itself.
 GC_CANDIDATE_PROCESS_STATES = TERMINAL_PROCESS_STATES
-GC_DISPOSED_CANONICAL_STATUSES = {"finished", "archived", "superseded", "pending", "blocked"}
+GC_DISPOSED_CANONICAL_STATUSES = {"finished", "archived", "superseded"}
 _GC_FAILURE_REPORT_LIMIT = 50
 
 
@@ -10367,10 +10370,14 @@ class ProcessManager:
     ) -> tuple[bool, str]:
         """Return whether ``request_id`` is no longer a live review surface.
 
-        This deliberately fails closed for processing cards and malformed
-        review authority.  A review card may have many historical retained
-        worker attempts, but its canonical ``terminal_review`` names exactly
-        one current request; only older, different request ids are collected.
+        This deliberately fails closed for pending, blocked and processing
+        cards, whose worktrees must survive until the card is closed, and for
+        malformed review authority.  The one exception is a pinned rework
+        predecessor: it is collected once its delta is sealed, or once the
+        card's status can no longer recover it.  A review card may have many
+        historical retained worker attempts, but its canonical
+        ``terminal_review`` names exactly one current request; only older,
+        different request ids are collected.
         """
         canonical_status = _canonical_task_status(card)
         predecessor = card.get("rework_predecessor")
