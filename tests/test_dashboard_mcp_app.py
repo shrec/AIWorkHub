@@ -501,13 +501,19 @@ def test_snapshot_target_keeps_the_window_route_without_a_seat(monkeypatch):
 
 
 @pytest.mark.parametrize("digest", [None, "", "   "])
-def test_snapshot_default_without_a_digest_keeps_the_whole_contract(monkeypatch, digest):
+def test_snapshot_default_without_a_digest_returns_the_identity_only(monkeypatch, digest):
     manager = _manager_reply()
     _stub_snapshot_sources(monkeypatch, manager=manager)
 
-    assert dashboard_mcp_app.snapshot_view()["manager_identity"] == manager
-    result = dashboard_mcp_app.snapshot_view(known_contract_sha256=digest)
-    assert result["manager_identity"] == manager
+    for result in (
+        dashboard_mcp_app.snapshot_view(),
+        dashboard_mcp_app.snapshot_view(known_contract_sha256=digest),
+    ):
+        identity = result["manager_identity"]
+        assert not set(core.MANAGER_CONTRACT) & set(identity)
+        assert identity["contract_sha256"] == core.MANAGER_CONTRACT_SHA256
+        assert identity["contract_delivered"] is False
+        assert identity["contract_delivery_reason"] == "dashboard_identity_only"
 
 
 @pytest.mark.parametrize(
@@ -573,7 +579,6 @@ def test_snapshot_default_payload_is_materially_smaller_on_a_mature_repository(m
     _stub_snapshot_sources(monkeypatch, storage_usage=usage, manager=manager)
 
     bounded = dashboard_mcp_app.snapshot_view()
-    known = dashboard_mcp_app.snapshot_view(known_contract_sha256=core.MANAGER_CONTRACT_SHA256)
     # The same default response before the bound: raw provider arrays, whole reply.
     legacy = {**bounded, "storage_usage": usage, "manager_identity": manager}
     legacy_bytes = dashboard_mcp_app._byte_len(legacy)
@@ -583,7 +588,8 @@ def test_snapshot_default_payload_is_materially_smaller_on_a_mature_repository(m
     assert legacy_bytes > 70_000
     assert bounded_bytes < legacy_bytes * 0.25
     assert bounded_bytes < 20_000
-    assert bounded_bytes - dashboard_mcp_app._byte_len(known) > contract_bytes * 0.8
+    with_contract = {**bounded, "manager_identity": manager}
+    assert dashboard_mcp_app._byte_len(with_contract) - bounded_bytes > contract_bytes * 0.8
 
 
 def test_snapshot_tool_signature_gains_only_the_optional_contract_digest():

@@ -103,9 +103,11 @@ _SNAPSHOT_QUARANTINE_ARRAYS: tuple[str, ...] = (
     "task_retention_batches",
 )
 _CONTRACT_RECALL = (
-    "aiworkhub_dashboard_snapshot without known_contract_sha256 (or "
-    "aiworkhub_manager_bootstrap(include_contract=true)) re-delivers the "
-    "contract prose; it is unchanged while contract_sha256 is unchanged."
+    "aiworkhub_manager_bootstrap(include_contract=true) re-delivers the "
+    "contract prose; it is unchanged while contract_sha256 is unchanged. "
+    "Compact aiworkhub_dashboard_snapshot re-sends it only when "
+    "known_contract_sha256 differs from the current contract_sha256; "
+    "full=True always includes it."
 )
 
 # Detail fields trimmed, largest first, only if the single-task payload is
@@ -2314,17 +2316,17 @@ def _bounded_storage_usage(usage: Any) -> Any:
     return bounded
 
 
-def _known_contract_identity(identity: Any, known_contract_sha256: Any) -> Any:
-    """Drop the contract prose from ``identity`` when the caller proves it holds it."""
+def _known_contract_identity(identity: Any, known_contract_sha256: Any = "") -> Any:
+    """Drop the contract prose from ``identity`` unless the caller's digest differs from the current one."""
     known = str(known_contract_sha256 or "").strip().lower()
     current = (
         str(identity.get("contract_sha256") or "").strip().lower()
         if isinstance(identity, Mapping)
         else ""
     )
-    if not known or not current:
+    if not current:
         return identity
-    if known != current:
+    if known and known != current:
         return {**identity, "contract_delivery_reason": "contract_sha_changed"}
     omitted = sorted(key for key in core.MANAGER_CONTRACT if key in identity)
     if not omitted:
@@ -2332,7 +2334,9 @@ def _known_contract_identity(identity: Any, known_contract_sha256: Any) -> Any:
     return {
         **{key: value for key, value in identity.items() if key not in omitted},
         "contract_delivered": False,
-        "contract_delivery_reason": "caller_holds_current_contract",
+        "contract_delivery_reason": (
+            "caller_holds_current_contract" if known else "dashboard_identity_only"
+        ),
         "contract_omitted_fields": omitted,
         "contract_recall": _CONTRACT_RECALL,
     }
@@ -2402,7 +2406,7 @@ def snapshot_view(
         full: bool (default False); True returns full task, process, and ledger collections, False returns the compact summary.
         previous: optional Mapping[str, Any] (default None) prior snapshot dict reused for incremental diffing.
         previous_snapshot: optional Mapping[str, Any] (default None) alias for previous when previous is omitted.
-        known_contract_sha256: str (default "") manager contract SHA-256 digest; omits unchanged contract prose in compact mode.
+        known_contract_sha256: str (default "") contract SHA-256 digest the caller already holds; compact mode omits the contract prose by default and re-sends it only when this digest differs from the current contract_sha256.
     """
     started = time.perf_counter()
     _debug_trace("snapshot.begin")
@@ -4129,7 +4133,7 @@ def health_view() -> dict[str, Any]:
     result["server_tool"] = "aiworkhub_dashboard_health"
     result["authority_flags"] = _readonly_authority_flags()
     try:
-        result["manager_identity"] = core.manager_bootstrap()
+        result["manager_identity"] = _known_contract_identity(core.manager_bootstrap())
     except Exception as exc:  # noqa: BLE001 -- health surface must never raise
         result["manager_identity"] = {
             "ok": False,
