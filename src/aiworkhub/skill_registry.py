@@ -24,8 +24,10 @@ Design invariants
   ``code``.
 * One success never activates: activation requires a configurable minimum of
   independent accepted evidence (always >= 2) from distinct non-secret
-  provenance identities and no unresolved negative safety evidence, plus
-  explicit manager authority. Workers can only propose.
+  provenance identities and no blocking negative safety evidence (an
+  unresolved negative blocks unless overwhelmingly outvoted, see
+  :func:`blocking_negative_evidence`), plus explicit manager authority.
+  Workers can only propose.
 * Proposals are evidence-free: provenance evidence is appended exclusively
   through ``add_evidence``, bound to a single authenticated authority, so a
   worker can never forge independent acceptance by pre-populating records.
@@ -782,6 +784,41 @@ def unresolved_negative_evidence(record: SkillRecord) -> tuple[EvidenceRecord, .
     )
 
 
+# Floors for tolerating an outvoted negative: accepted rows, accepted share, distinct actors.
+NEGATIVE_TOLERANCE_MIN_ACCEPTED = 10
+NEGATIVE_TOLERANCE_MIN_SHARE = 0.9
+NEGATIVE_TOLERANCE_MIN_ACTORS = 2
+
+
+def blocking_negative_evidence(record: SkillRecord) -> tuple[EvidenceRecord, ...]:
+    """Return the unresolved negative evidence that still BLOCKS ``record``.
+
+    A lone negative must not veto a skill that overwhelming independent
+    acceptance supports, so it is tolerated (``()`` is returned) only when ALL
+    hold: at least ``NEGATIVE_TOLERANCE_MIN_ACCEPTED`` accepted rows; an
+    accepted share of at least ``NEGATIVE_TOLERANCE_MIN_SHARE`` of accepted
+    rows plus unresolved negatives; at least ``NEGATIVE_TOLERANCE_MIN_ACTORS``
+    independent accepted actors; and a newest evidence row that is not itself
+    an unresolved negative. Otherwise this is exactly
+    :func:`unresolved_negative_evidence`, so a refusal names the same rows.
+    """
+    record = validate_record(record)
+    negative = unresolved_negative_evidence(record)
+    if not negative:
+        return ()
+    accepted = record.accepted_count
+    # Evidence is append-only and never reordered, so the last row is the newest.
+    newest = record.evidence[-1]
+    if (
+        accepted >= NEGATIVE_TOLERANCE_MIN_ACCEPTED
+        and accepted / (accepted + len(negative)) >= NEGATIVE_TOLERANCE_MIN_SHARE
+        and independent_accepted_evidence_count(record) >= NEGATIVE_TOLERANCE_MIN_ACTORS
+        and (newest.outcome is not EvidenceOutcome.NEGATIVE or newest.resolved)
+    ):
+        return ()
+    return negative
+
+
 def transition_allowed(current: LifecycleState, target: LifecycleState) -> bool:
     """Return whether a raw lifecycle transition is legal."""
     current_state = _coerce_enum(
@@ -823,7 +860,7 @@ def can_activate(record: SkillRecord, min_accepted_evidence: int) -> TransitionD
             "skill_registry.insufficient_evidence",
             "insufficient independent accepted evidence",
         )
-    negative = unresolved_negative_evidence(record)
+    negative = blocking_negative_evidence(record)
     if negative:
         sources = sorted({item.actor_id for item in negative})
         return _deny(
@@ -2561,6 +2598,9 @@ __all__ = [
     "MAX_PACKET_STRING_BYTES",
     "MAX_RANK_LIMIT",
     "MAX_SELECT_LIMIT",
+    "NEGATIVE_TOLERANCE_MIN_ACCEPTED",
+    "NEGATIVE_TOLERANCE_MIN_ACTORS",
+    "NEGATIVE_TOLERANCE_MIN_SHARE",
     "RUNTIME_PACKET_VERSION",
     "RiskLevel",
     "SELECT_WILDCARD",
@@ -2578,6 +2618,7 @@ __all__ = [
     "SELECTION_EMPTY_REASONS",
     "SkillSelectionReceipt",
     "TransitionDecision",
+    "blocking_negative_evidence",
     "build_runtime_packet",
     "can_activate",
     "can_promote",

@@ -3489,7 +3489,7 @@ def _skill_injectability(api: Any, record: Any) -> tuple[bool, str]:
     lifecycle = getattr(getattr(record, "lifecycle_state", None), "value", "")
     if lifecycle == "retired":
         return False, "lifecycle_state_is_retired"
-    if api.unresolved_negative_evidence(record):
+    if api.blocking_negative_evidence(record):
         return False, "unresolved_negative_evidence"
     actors = api.independent_accepted_evidence_count(record)
     if actors < 2:

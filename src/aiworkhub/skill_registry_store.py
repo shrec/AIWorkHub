@@ -599,7 +599,7 @@ def activation_supported(record: SkillRecord, min_accepted_evidence: int = 2) ->
     """
     if record.lifecycle_state is not skill_registry.LifecycleState.ACTIVE:
         return True
-    if skill_registry.unresolved_negative_evidence(record):
+    if skill_registry.blocking_negative_evidence(record):
         return False
     count = skill_registry.independent_accepted_evidence_count(record)
     return count >= min_accepted_evidence
