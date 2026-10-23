@@ -2193,23 +2193,6 @@ def _ledger_output_tokens(usage: dict[str, Any]) -> int:
     )
 
 
-def _project_context_delivery(
-    context_result: project_context.ProjectContextResult | None,
-    prompt_hash: str,
-) -> dict[str, Any]:
-    if context_result is None:
-        return {"injected": False, "bundle_sha256": "", "prompt_sha256": prompt_hash}
-    metadata = context_result.metadata
-    return {
-        "injected": True,
-        "schema_id": metadata.get("schema_id"),
-        "bundle_sha256": metadata.get("bundle_sha256"),
-        "bundle_bytes": metadata.get("bundle_bytes"),
-        "prompt_sha256": prompt_hash,
-        "section_count": metadata.get("section_count"),
-    }
-
-
 def _launch_project_context(
     repo: Path,
     card: dict[str, Any],
@@ -2219,7 +2202,9 @@ def _launch_project_context(
 
     if quality_review_binding is not None:
         return None
-    return project_context.collect_project_context(repo, card)
+    result = project_context.collect_project_context(repo, card)
+    _remember_launch_context(card, result)
+    return result
 
 
 def _launch_source_graph_request(
@@ -2548,11 +2533,14 @@ def _research_result_text_is_meaningful(value: str) -> bool:
 # re-exported so ``process_launcher.<name>`` readers and patches resolve.
 from .process_launcher_live_call_gate import (
     _GATEABLE_CONTEXT_SECTIONS as _GATEABLE_CONTEXT_SECTIONS,
+    _apply_launch_expectation as _apply_launch_expectation,
     _coordinator_bound_context_sections as _coordinator_bound_context_sections,
     _coordinator_measured_zero_hit_sections as _coordinator_measured_zero_hit_sections,
     _decode_ledger_int as _decode_ledger_int,
     _executed_context_sections as _executed_context_sections,
     _injected_context_satisfaction as _injected_context_satisfaction,
+    _project_context_delivery as _project_context_delivery,
+    _remember_launch_context as _remember_launch_context,
     _worker_mcp_live_call_gate as _worker_mcp_live_call_gate,
 )
 
@@ -3598,6 +3586,7 @@ def _provision_worker_mcp_runtime_for_authority(
     quality_review_packet_path: Path | None = None,
     rework_overlay_path: Path | None = None,
 ) -> worker_ai_tools_mcp.WorkerMcpRuntime:
+    _apply_launch_expectation(workspace, request_id, authority_repo)
     kwargs: dict[str, Any] = {
         "request_id": request_id,
         "task_id": task_id,

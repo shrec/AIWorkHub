@@ -536,7 +536,9 @@ MANDATORY_AIWORKHUB_TOOLS:
   re-runs the coordinator's own required-output, residual-contract and live
   MCP-call checks read-only and names each failure it would otherwise produce
   after you exit. It never marks anything satisfied, so repair what it lists
-  rather than reporting it.
+  rather than reporting it. A separate call is unnecessary when
+  validation_run(index='all') already returned an exit_preflight with
+  finding_count 0.
 
 Your final message must be at most 12 lines: what changed and why, plus any
 blocked or missing validator. The coordinator computes changed paths and reruns

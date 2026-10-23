@@ -1,25 +1,29 @@
 """Worker-MCP live-call completion gate, relocated from ``process_launcher``.
 
-Moved verbatim under the module size ratchet; ``process_launcher`` re-exports
-every name so ``process_launcher._worker_mcp_live_call_gate`` and the
-context-section helpers resolve to these same objects.  This module must never
-import ``process_launcher``.
+Moved under the module size ratchet; ``process_launcher`` re-exports every name
+so ``process_launcher._worker_mcp_live_call_gate`` and the context-section
+helpers resolve to these same objects.  ``_gate_requirement`` and
+``_CoordinatorCredit`` also feed the launch-time exit expectation.  This module
+must never import ``process_launcher``.
 """
 
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
+from . import project_context
 from . import repo_policy
 from . import worker_ai_tools_mcp
+from . import worker_workspace
 from .process_launcher_evidence import (
     SOURCE_GRAPH_LIVE_CALLS_ALL_FAILED as _SOURCE_GRAPH_LIVE_CALLS_ALL_FAILED,
     is_rework_attempt as _is_rework_attempt,
     source_graph_orientation_voided as _source_graph_orientation_voided,
 )
 from .process_launcher_provider_failures import _project_context_receipt_from_output
-
 
 
 # Sections the launcher can inject and that the worker MCP gate also accepts as
@@ -177,6 +181,143 @@ def _decode_ledger_int(value: Any) -> int | None:
     return None
 
 
+class _GateRequirement(NamedTuple):
+    """What the post-exit gate demands of one request, from launch facts."""
+
+    task_type: str
+    context_required: bool
+    tools_policy: dict[str, Any]
+    policy_error: str
+    coordinator_zero_hit: set[str]
+    required_tools: list[str]
+    exempted_tools: dict[str, str]
+    gated: bool
+
+    @property
+    def evaluated_tools(self) -> list[str]:
+        """Source Graph (judged on every gated request), then the other required tools."""
+        if not self.gated:
+            return []
+        return ["source_graph"] + [
+            tool for tool in self.required_tools if tool != "source_graph"
+        ]
+
+
+def _gate_requirement(metadata: dict[str, Any]) -> _GateRequirement:
+    """The gate's tool requirement from the launch record; the launch hand-off shares it."""
+    context_metadata = metadata.get("project_context") or {}
+    task_type = str(
+        (context_metadata.get("task_context_policy") or {}).get("task_type") or ""
+    )
+    context_required = context_metadata.get("required") is True
+    worker_mcp_meta = metadata.get("worker_mcp") or {}
+    sections = context_metadata.get("sections") or []
+    tools_policy = dict(repo_policy.DEFAULT_POLICY["tools"])
+    policy_error = ""
+    authority_repo = worker_mcp_meta.get("authority_repo")
+    if isinstance(authority_repo, str) and authority_repo.strip():
+        try:
+            tools_policy = dict(
+                repo_policy.load_policy(Path(authority_repo))["tools"]
+            )
+        except repo_policy.RepoPolicyError as exc:
+            policy_error = f"repo_policy_invalid:{exc}"
+    # Sections the coordinator executed for this request and measured at zero
+    # rows: a fact taken before the worker started, independent of any model
+    # text or live re-call.  Degraded sections are never in this set.
+    coordinator_zero_hit = (
+        _coordinator_measured_zero_hit_sections(context_metadata)
+        if isinstance(context_metadata, dict)
+        else set()
+    )
+    gate_required_tools: list[str] = []
+    exempted_tools: dict[str, str] = {}
+    if task_type == "code" and tools_policy.get("source_graph_required_for_code"):
+        gate_required_tools.append("source_graph")
+    if (
+        task_type == "code"
+        and tools_policy.get("session_memory_kb_required_for_nontrivial")
+    ):
+        for section in sections:
+            if not isinstance(section, dict) or not section.get("requested", True):
+                continue
+            name = str(section.get("name") or "")
+            if (
+                name in {"session_current_state", "ai_memory", "kb"}
+                and name not in gate_required_tools
+            ):
+                if name == "session_current_state" and name in coordinator_zero_hit:
+                    # The canonical session query IS the topic-scoped store:
+                    # zero rows at launch means the store holds no document
+                    # for this card's topic, so no live call can return
+                    # anything and requiring one is ceremony.  Record why the
+                    # tool is not required; a degraded section never reaches
+                    # this branch and stays required.
+                    exempted_tools[name] = "session_store_empty_for_topic_at_launch"
+                    continue
+                gate_required_tools.append(name)
+    # An explicit required project-context contract is stronger than the
+    # repository's generic code-task defaults.  Research/read-only cards use
+    # this path too, so derive their blocking tools from the exact requested
+    # sections instead of silently classifying them as observation-only.
+    if context_required:
+        for section in sections:
+            if not isinstance(section, dict) or not section.get("requested", True):
+                continue
+            name = str(section.get("name") or "")
+            if name in _GATEABLE_CONTEXT_SECTIONS and name not in gate_required_tools:
+                gate_required_tools.append(name)
+    gated = bool(gate_required_tools) and (task_type == "code" or context_required)
+    return _GateRequirement(
+        task_type,
+        context_required,
+        tools_policy,
+        policy_error,
+        coordinator_zero_hit,
+        gate_required_tools,
+        exempted_tools,
+        gated,
+    )
+
+
+class _CoordinatorCredit(NamedTuple):
+    """How far the coordinator's own launch facts satisfy a required tool."""
+
+    injected_acknowledged: bool
+    injected_tools: set[str]
+    source_graph_acknowledged: bool
+    acknowledgement_source: str
+    zero_hit: set[str]
+    rework: bool
+
+    def label(self, tool: str) -> str:
+        """The label crediting ``tool`` from launch facts, or an empty string for none."""
+        if tool == "source_graph":
+            if self.source_graph_acknowledged and tool in self.injected_tools:
+                return "supervisor_injected_orientation"
+            return ""
+        if self.injected_acknowledged and tool in self.injected_tools:
+            return (
+                "coordinator_prompt_binding"
+                if self.acknowledgement_source == "coordinator_prompt_binding"
+                else "injected_receipt"
+            )
+        if tool in self.zero_hit:
+            # The coordinator ran the canonical query for this request and
+            # measured zero rows; that measurement is the answer, independent
+            # of a model-typed receipt or a live re-call of the same query.
+            return "coordinator_zero_hit_measurement"
+        if self.rework:
+            # A rework is a validation-only replay of an already-green
+            # predecessor delta; it structurally does not re-issue the context
+            # tool calls the predecessor already made.  Honor the predecessor's
+            # receipts here instead of discarding green work over a context
+            # call this rework path never makes.  Source Graph freshness is
+            # still enforced per attempt.
+            return "rework_predecessor_receipt"
+        return ""
+
+
 def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dict[str, Any]:
     """Bounded, redacted B833 completion-gate summary.
 
@@ -274,69 +415,16 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
         })
         return result
 
-    context_metadata = metadata.get("project_context") or {}
-    task_type = str(
-        (context_metadata.get("task_context_policy") or {}).get("task_type") or ""
-    )
-    context_required = context_metadata.get("required") is True
     worker_mcp_meta = metadata.get("worker_mcp") or {}
-    sections = context_metadata.get("sections") or []
-    tools_policy = dict(repo_policy.DEFAULT_POLICY["tools"])
-    policy_error = ""
-    authority_repo = worker_mcp_meta.get("authority_repo")
-    if isinstance(authority_repo, str) and authority_repo.strip():
-        try:
-            tools_policy = dict(
-                repo_policy.load_policy(Path(authority_repo))["tools"]
-            )
-        except repo_policy.RepoPolicyError as exc:
-            policy_error = f"repo_policy_invalid:{exc}"
-    # Sections the coordinator executed for this request and measured at zero
-    # rows: a fact taken before the worker started, independent of any model
-    # text or live re-call.  Degraded sections are never in this set.
-    coordinator_zero_hit = (
-        _coordinator_measured_zero_hit_sections(context_metadata)
-        if isinstance(context_metadata, dict)
-        else set()
-    )
-    gate_required_tools: list[str] = []
-    exempted_tools: dict[str, str] = {}
-    if task_type == "code" and tools_policy.get("source_graph_required_for_code"):
-        gate_required_tools.append("source_graph")
-    if (
-        task_type == "code"
-        and tools_policy.get("session_memory_kb_required_for_nontrivial")
-    ):
-        for section in sections:
-            if not isinstance(section, dict) or not section.get("requested", True):
-                continue
-            name = str(section.get("name") or "")
-            if (
-                name in {"session_current_state", "ai_memory", "kb"}
-                and name not in gate_required_tools
-            ):
-                if name == "session_current_state" and name in coordinator_zero_hit:
-                    # The canonical session query IS the topic-scoped store:
-                    # zero rows at launch means the store holds no document
-                    # for this card's topic, so no live call can return
-                    # anything and requiring one is ceremony.  Record why the
-                    # tool is not required; a degraded section never reaches
-                    # this branch and stays required.
-                    exempted_tools[name] = "session_store_empty_for_topic_at_launch"
-                    continue
-                gate_required_tools.append(name)
-    # An explicit required project-context contract is stronger than the
-    # repository's generic code-task defaults.  Research/read-only cards use
-    # this path too, so derive their blocking tools from the exact requested
-    # sections instead of silently classifying them as observation-only.
-    if context_required:
-        for section in sections:
-            if not isinstance(section, dict) or not section.get("requested", True):
-                continue
-            name = str(section.get("name") or "")
-            if name in _GATEABLE_CONTEXT_SECTIONS and name not in gate_required_tools:
-                gate_required_tools.append(name)
-    gated = bool(gate_required_tools) and (task_type == "code" or context_required)
+    requirement = _gate_requirement(metadata)
+    task_type = requirement.task_type
+    context_required = requirement.context_required
+    tools_policy = requirement.tools_policy
+    policy_error = requirement.policy_error
+    coordinator_zero_hit = requirement.coordinator_zero_hit
+    gate_required_tools = requirement.required_tools
+    exempted_tools = requirement.exempted_tools
+    gated = requirement.gated
     gate_result: dict[str, Any] = {
         "gated": gated,
         "task_type": task_type,
@@ -516,6 +604,14 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
         if isinstance(failed_counts, dict)
         else _decode_ledger_int(None) if failed_counts is None else None
     )
+    credit = _CoordinatorCredit(
+        injected_acknowledged=injected_acknowledged,
+        injected_tools=injected_tools,
+        source_graph_acknowledged=source_graph_injected_acknowledged,
+        acknowledgement_source=acknowledgement_source,
+        zero_hit=coordinator_zero_hit,
+        rework=_is_rework_attempt(metadata),
+    )
     if live_source_graph_calls > 0:
         satisfaction_by_tool["source_graph"] = "live_worker_call"
     elif _source_graph_orientation_voided(
@@ -529,42 +625,22 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
         # marker records why.
         satisfaction_by_tool["source_graph"] = _SOURCE_GRAPH_LIVE_CALLS_ALL_FAILED
         missing.append("source_graph")
-    elif (
-        verification.get("ok") is True
-        and source_graph_injected_acknowledged
-        and "source_graph" in injected_tools
+    elif verification.get("ok") is True and (
+        orientation := credit.label("source_graph")
     ):
-        satisfaction_by_tool["source_graph"] = "supervisor_injected_orientation"
+        satisfaction_by_tool["source_graph"] = orientation
     elif successful_source_graph > 0:
         satisfaction_by_tool["source_graph"] = "stale_or_cached"
         stale.append("source_graph")
     else:
         missing.append("source_graph")
-    rework_attempt = _is_rework_attempt(metadata)
-    for tool in gate_required_tools:
+    for tool in requirement.evaluated_tools:
         if tool == "source_graph":
             continue
         if int(successful.get(tool) or 0) > 0:
             satisfaction_by_tool[tool] = "live_worker_call"
-        elif injected_acknowledged and tool in injected_tools:
-            satisfaction_by_tool[tool] = (
-                "coordinator_prompt_binding"
-                if acknowledgement_source == "coordinator_prompt_binding"
-                else "injected_receipt"
-            )
-        elif tool in coordinator_zero_hit:
-            # The coordinator ran the canonical query for this request and
-            # measured zero rows; that measurement is the answer, independent
-            # of a model-typed receipt or a live re-call of the same query.
-            satisfaction_by_tool[tool] = "coordinator_zero_hit_measurement"
-        elif rework_attempt:
-            # A rework is a validation-only replay of an already-green
-            # predecessor delta; it structurally does not re-issue the context
-            # tool calls the predecessor already made.  Honor the predecessor's
-            # receipts here instead of discarding green work over a context
-            # call this rework path never makes.  Source Graph freshness above
-            # is still enforced per attempt.
-            satisfaction_by_tool[tool] = "rework_predecessor_receipt"
+        elif tool_credit := credit.label(tool):
+            satisfaction_by_tool[tool] = tool_credit
         else:
             missing.append(tool)
     gate_result["missing_tools"] = missing
@@ -584,3 +660,91 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
             reasons.append("source_graph_stale_or_cached:" + ",".join(stale))
         gate_result["reason"] = verification.get("reason") or "; ".join(reasons)
     return gate_result
+
+
+def _project_context_delivery(
+    context_result: project_context.ProjectContextResult | None,
+    prompt_hash: str,
+) -> dict[str, Any]:
+    if context_result is None:
+        return {"injected": False, "bundle_sha256": "", "prompt_sha256": prompt_hash}
+    metadata = context_result.metadata
+    return {
+        "injected": True,
+        "schema_id": metadata.get("schema_id"),
+        "bundle_sha256": metadata.get("bundle_sha256"),
+        "bundle_bytes": metadata.get("bundle_bytes"),
+        "prompt_sha256": prompt_hash,
+        "section_count": metadata.get("section_count"),
+    }
+
+
+# Launch context parked per request id until the packet is sealed (capped; orphans evicted).
+_LAUNCH_CONTEXT_CAP = 32
+_LAUNCH_CONTEXTS: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_LAUNCH_CONTEXTS_LOCK = threading.Lock()
+
+
+def _launch_gate_expectation(
+    launch: dict[str, Any], authority_repo: Path | str
+) -> dict[str, list[str]] | None:
+    """The packet's required and coordinator-satisfied tool lists via the gate's helpers."""
+    metadata = {**launch, "worker_mcp": {"authority_repo": str(authority_repo)}}
+    requirement = _gate_requirement(metadata)
+    if requirement.policy_error:
+        # The gate refuses an invalid policy whatever the worker calls; seal nothing.
+        return None
+    bound = _coordinator_bound_context_sections(metadata)
+    # Launch facts only: a worker-typed receipt can only add credit at exit.
+    credit = _CoordinatorCredit(
+        injected_acknowledged=bound is not None,
+        injected_tools=bound or set(),
+        source_graph_acknowledged=bound is not None,
+        acknowledgement_source="coordinator_prompt_binding",
+        zero_hit=requirement.coordinator_zero_hit,
+        rework=_is_rework_attempt(metadata),
+    )
+    required = requirement.evaluated_tools
+    return {
+        worker_ai_tools_mcp.PACKET_REQUIRED_MCP_TOOLS_KEY: required,
+        worker_ai_tools_mcp.PACKET_COORDINATOR_SATISFIED_KEY: [
+            tool for tool in required if credit.label(tool)
+        ],
+    }
+
+
+def _remember_launch_context(card: Any, context_result: Any) -> None:
+    """Park a launch's context for the packet seal; a non-launch parks nothing."""
+    try:
+        request_id = str(card.get("request_id") or "")
+        context = context_result.metadata
+        predecessor = card.get("rework_predecessor")
+        launch = {
+            "project_context": context,
+            "project_context_delivery": _project_context_delivery(context_result, ""),
+            "rework_predecessor": (
+                dict(predecessor) if isinstance(predecessor, dict) else None
+            ),
+        }
+    except (AttributeError, TypeError, ValueError):
+        return
+    if not request_id or not isinstance(context, dict):
+        return
+    with _LAUNCH_CONTEXTS_LOCK:
+        _LAUNCH_CONTEXTS[request_id] = launch
+        _LAUNCH_CONTEXTS.move_to_end(request_id)
+        while len(_LAUNCH_CONTEXTS) > _LAUNCH_CONTEXT_CAP:
+            _LAUNCH_CONTEXTS.popitem(last=False)
+
+
+def _apply_launch_expectation(
+    workspace: Any, request_id: str, authority_repo: Path | str
+) -> None:
+    """Seal the expectation parked for this request into the contract packet; no-op if none."""
+    with _LAUNCH_CONTEXTS_LOCK:
+        launch = _LAUNCH_CONTEXTS.pop(str(request_id), None)
+    if launch is None:
+        return
+    expectation = _launch_gate_expectation(launch, authority_repo)
+    if expectation is not None:
+        worker_workspace._update_worker_contract_packet(workspace.home, **expectation)

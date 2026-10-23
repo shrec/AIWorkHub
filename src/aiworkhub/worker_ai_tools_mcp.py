@@ -8511,6 +8511,18 @@ EXIT_PREFLIGHT_FAILURE_CLASSES: tuple[str, ...] = (
 _GATEABLE_MCP_TOOLS: tuple[str, ...] = (
     "source_graph", "session_current_state", "ai_memory", "kb",
 )
+# Tool lists the coordinator seals into the packet at launch, using the post-exit gate's helpers.
+PACKET_REQUIRED_MCP_TOOLS_KEY = "required_live_mcp_tools"
+PACKET_COORDINATOR_SATISFIED_KEY = "coordinator_satisfied_tools"
+
+
+def _packet_tool_set(packet: Any, key: str) -> frozenset[str] | None:
+    """One packet tool list, or ``None`` when absent or not a list of strings."""
+
+    value = packet.get(key) if isinstance(packet, dict) else None
+    if not isinstance(value, list) or not all(isinstance(t, str) for t in value):
+        return None
+    return frozenset(t for t in value if t in _GATEABLE_MCP_TOOLS)
 
 
 def _required_output_findings(
@@ -8629,7 +8641,9 @@ def _residual_findings(
     return findings, {"checked": True, "raised": ""}
 
 
-def _mcp_gate_findings(ctx: WorkerToolContext) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _mcp_gate_findings(
+    ctx: WorkerToolContext, packet: dict[str, Any] | None = None
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Report which gateable MCP tools have NO authenticated live call yet.
 
     This never says a gate is satisfied.  Whether a tool is actually REQUIRED is
@@ -8639,6 +8653,8 @@ def _mcp_gate_findings(ctx: WorkerToolContext) -> tuple[list[dict[str, Any]], di
     authenticated successful call exists -- and names the terminal class that
     fact produces when the coordinator did require it.  172 attempts died on
     exactly this, 165 of them with every declared validation row already green.
+
+    With the packet's launch lists, only a required tool no launch fact satisfies is reported.
     """
 
     if ctx.audit_ledger_path is None or ctx.audit_hmac_key_path is None:
@@ -8656,12 +8672,35 @@ def _mcp_gate_findings(ctx: WorkerToolContext) -> tuple[list[dict[str, Any]], di
     )
     successful = verification.get("successful_call_count_by_tool") or {}
     live_source_graph = int(verification.get("live_source_graph_calls") or 0)
+    required = _packet_tool_set(packet, PACKET_REQUIRED_MCP_TOOLS_KEY)
+    satisfied = _packet_tool_set(packet, PACKET_COORDINATOR_SATISFIED_KEY)
+    # The gate grants its prompt-binding credit only on a verified ledger, and only
+    # against a sealed required list: a satisfied list alone never narrows findings.
+    credited = (
+        satisfied
+        if required is not None and satisfied and verification.get("ok") is True
+        else frozenset()
+    )
+    # Never more lenient than the gate's source_graph_orientation_voided (not importable here).
+    failed_counts = verification.get("failed_call_count_by_tool")
+    if isinstance(failed_counts, dict):
+        failed_source_graph = failed_counts.get("source_graph")
+        failure_recorded = failed_source_graph is not None and (
+            type(failed_source_graph) is not int or failed_source_graph != 0
+        )
+    else:
+        failure_recorded = failed_counts is not None
+    source_graph_failed = failure_recorded and int(successful.get("source_graph") or 0) == 0
     findings: list[dict[str, Any]] = []
     for tool in _GATEABLE_MCP_TOOLS:
         if tool == "source_graph":
             if live_source_graph > 0:
                 continue
         elif int(successful.get(tool) or 0) > 0:
+            continue
+        if required is not None and tool not in required:
+            continue
+        if tool in credited and not (tool == "source_graph" and source_graph_failed):
             continue
         findings.append({
             "failure_class": "validation_required_aiworkhub_mcp_call_missing",
@@ -8675,6 +8714,12 @@ def _mcp_gate_findings(ctx: WorkerToolContext) -> tuple[list[dict[str, Any]], di
                 "validation row is green"
             ),
         })
+    packet_detail: dict[str, list[str]] = {}
+    if required is not None or satisfied is not None:
+        packet_detail = {
+            PACKET_REQUIRED_MCP_TOOLS_KEY: sorted(required or ()),
+            PACKET_COORDINATOR_SATISFIED_KEY: sorted(satisfied or ()),
+        }
     return findings, {
         "checked": True,
         "ledger_ok": bool(verification.get("ok")),
@@ -8683,6 +8728,7 @@ def _mcp_gate_findings(ctx: WorkerToolContext) -> tuple[list[dict[str, Any]], di
         "successful_call_count_by_tool": {
             str(k): int(v or 0) for k, v in dict(successful).items()
         },
+        **packet_detail,
     }
 
 
@@ -8724,7 +8770,7 @@ def exit_preflight(ctx: WorkerToolContext) -> dict[str, Any]:
     findings.extend(required_findings)
     residual_findings, residual_detail = _residual_findings(workspace, packet)
     findings.extend(residual_findings)
-    gate_findings, gate_detail = _mcp_gate_findings(ctx)
+    gate_findings, gate_detail = _mcp_gate_findings(ctx, packet)
     findings.extend(gate_findings)
     result = {
         "ok": True,
