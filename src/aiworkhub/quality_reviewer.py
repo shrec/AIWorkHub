@@ -247,7 +247,10 @@ HUNK_REVIEW_SURFACE_INSTRUCTION = (
     "contract; judge it from candidate.caller_context and the scoped audit, "
     "not by opening files. Do not read whole files and do not search the "
     "repository. Open the workspace only for hunks the packet marks omitted "
-    "(diff_complete false), and only those line ranges.\n"
+    "(diff_complete false), and only those line ranges."
+    " To read an omitted hunk, call source_graph_query with mode='file', "
+    "target='<path>' and query='<start>-<end>' from the packet's hunk header; "
+    "the result includes a 20-line margin.\n"
 )
 # A rework round whose predecessor's sealed delta authenticated carries the
 # predecessor->candidate diff in candidate.delta, so what the predecessor round

@@ -3674,6 +3674,7 @@ def _merge_rework_overlay_payload(
     query: str,
     target: str | None,
     budget: int,
+    file_line_range: tuple[int, int] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Compose a canonical query result with a small in-memory worktree delta."""
 
@@ -3724,7 +3725,7 @@ def _merge_rework_overlay_payload(
                 "provenance": "request_scoped_worktree",
             }
             overlay_matches.append(file_row)
-            overlay_contexts.append({
+            context_base = {
                 "found": True,
                 "file": file_row,
                 "entities": [
@@ -3732,10 +3733,24 @@ def _merge_rework_overlay_payload(
                     for entity in extraction.entities[:max(1, min(16, budget // 2))]
                 ],
                 "edges": [],
-                "source_preview": text[:4096],
-                "source_preview_bytes": len(text[:4096].encode("utf-8")),
-                "source_preview_truncated": len(text.encode("utf-8")) > 4096,
-            })
+            }
+            if file_line_range is None:
+                source_preview = text[:4096]
+                overlay_contexts.append({
+                    **context_base,
+                    "source_preview": source_preview,
+                    "source_preview_bytes": len(source_preview.encode("utf-8")),
+                    "source_preview_truncated": len(text.encode("utf-8")) > 4096,
+                })
+            else:
+                from . import source_graph as _source_graph_mod
+
+                overlay_contexts.append({
+                    **context_base,
+                    **_source_graph_mod.ranged_text_preview(
+                        text, file_line_range,
+                    ),
+                })
             continue
         if mode == "bodygrep":
             if target is not None and target != relative:
@@ -3884,9 +3899,16 @@ def _apply_rework_overlay_query(
     """Production overlay seam; the legacy direct probe remains test-compatible."""
 
     if canonical_payload is not None:
+        from . import source_graph as _source_graph_mod
+
         return _merge_rework_overlay_payload(
             ctx, canonical_payload, view,
             mode=mode, query=query, target=target, budget=budget,
+            file_line_range=(
+                _source_graph_mod.parse_file_line_range(query)
+                if mode == "file" and target
+                else None
+            ),
         )
     if not ctx.rework_overlay_packet or target is None:
         return None
@@ -4987,7 +5009,9 @@ def source_graph_query(
     ``target`` constrains the RETURNED scope: matching file-path-bearing entries
     are kept, everything else is dropped. In ``file`` mode an indexed exact
     target is also the requested file authority; directory targets fall back to
-    the query path. Omitting ``target`` returns the unscoped query result.
+    the query path. A ``file`` query of ``<start>-<end>`` (1-based, inclusive)
+    with an exact file target returns those lines plus a 20-line margin instead
+    of the file head. Omitting ``target`` returns the unscoped query result.
 
     For analytic modes (``sganalytics.ANALYTIC_MODES``), ``target`` and
     ``cursor`` are instead applied INSIDE the engine (``analytics_query``):
@@ -5231,13 +5255,21 @@ def source_graph_query(
                 # when it is indexed, while retaining the semantic-query
                 # path as a fallback for directory-scoped calls.
                 file_query_path = scope or bounded_query
-                payload = _source_graph_mod.file_query(query_repo, file_query_path, budget)
-                if (
-                    scope is not None
-                    and file_query_path != bounded_query
-                    and _json_hit_count(payload) == 0
-                ):
-                    payload = _source_graph_mod.file_query(query_repo, bounded_query, budget)
+                file_range = (
+                    _source_graph_mod.parse_file_line_range(bounded_query) if scope else None
+                )
+                if file_range is not None:
+                    payload = _source_graph_mod.file_query(
+                        query_repo, file_query_path, budget, line_range=file_range,
+                    )
+                else:
+                    payload = _source_graph_mod.file_query(query_repo, file_query_path, budget)
+                    if (
+                        scope is not None
+                        and file_query_path != bounded_query
+                        and _json_hit_count(payload) == 0
+                    ):
+                        payload = _source_graph_mod.file_query(query_repo, bounded_query, budget)
             elif mode == "function":
                 payload, selector_resolved = _selector_scoped_payload(
                     _source_graph_mod.function_query, query_repo, scope, bounded_query, budget,

@@ -5662,6 +5662,26 @@ def body_query(repo_root: Path, name: str, budget: int = 64) -> dict[str, Any]:
     }, max(512, budget * 512))
 
 
+_FILE_LINE_RANGE_PATTERN = re.compile(r"^(?:L(\d+)-L(\d+)|(\d+)-(\d+)|(\d+):(\d+))$")
+FILE_LINE_RANGE_MARGIN = 20
+FILE_LINE_RANGE_PREVIEW_BYTES = 48 * 1024
+
+
+def parse_file_line_range(text: str) -> tuple[int, int] | None:
+    """Parse an exact 1-based inclusive line range (``120-180`` forms)."""
+
+    if not isinstance(text, str):
+        return None
+    match = _FILE_LINE_RANGE_PATTERN.fullmatch(text)
+    if match is None:
+        return None
+    digits = [value for value in match.groups() if value is not None]
+    start, end = int(digits[0]), int(digits[1])
+    if start < 1 or end < start:
+        return None
+    return start, end
+
+
 def _bounded_file_preview(
     repo_root: Path, file_path: str, *, max_bytes: int,
 ) -> dict[str, Any]:
@@ -5684,7 +5704,94 @@ def _bounded_file_preview(
     }
 
 
-def file_query(repo_root: Path, file_path: str, budget: int = 64) -> dict[str, Any]:
+def ranged_text_preview(text: str, line_range: tuple[int, int]) -> dict[str, Any]:
+    """Slice ``text`` to a 1-based line window plus margin within the byte cap."""
+
+    # "\n" alone ends a line (git and AST numbering); "\r" stays so CRLF round-trips.
+    lines = text.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    total_lines = len(lines)
+    if total_lines == 0:
+        return {
+            "source_preview": "",
+            "source_preview_bytes": 0,
+            "source_preview_truncated": False,
+            "source_preview_line_start": 0,
+            "source_preview_line_end": 0,
+            "source_preview_total_lines": total_lines,
+        }
+    start = int(line_range[0])
+    end = int(line_range[1])
+    window_start = min(total_lines, max(1, start - FILE_LINE_RANGE_MARGIN))
+    window_end = min(total_lines, end + FILE_LINE_RANGE_MARGIN)
+    request_start = min(total_lines, max(1, start))
+    request_end = max(request_start, min(total_lines, end))
+    first = request_start
+    last = request_start - 1
+    used = 0
+
+    def serve(numbers: range) -> bool:
+        # Stop at the first line that does not fit; the window stays contiguous.
+        nonlocal first, last, used
+        for number in numbers:
+            cost = len(lines[number - 1].encode("utf-8")) + 1
+            if used + cost > FILE_LINE_RANGE_PREVIEW_BYTES:
+                return False
+            used += cost
+            first = min(first, number)
+            last = max(last, number)
+        return True
+
+    requested_served = serve(range(request_start, request_end + 1))
+    if last < first:
+        return {
+            "source_preview": "",
+            "source_preview_bytes": 0,
+            "source_preview_truncated": True,
+            "source_preview_line_start": 0,
+            "source_preview_line_end": 0,
+            "source_preview_total_lines": total_lines,
+            "source_preview_oversized_line": request_start,
+        }
+    serve(range(request_start - 1, window_start - 1, -1))
+    if requested_served:
+        serve(range(request_end + 1, window_end + 1))
+    preview = "\n".join(lines[first - 1 : last]) + "\n"
+    return {
+        "source_preview": preview,
+        "source_preview_bytes": used,
+        "source_preview_truncated": first > window_start or last < window_end,
+        "source_preview_line_start": first,
+        "source_preview_line_end": last,
+        "source_preview_total_lines": total_lines,
+    }
+
+
+def _ranged_file_preview(
+    repo_root: Path, file_path: str, line_range: tuple[int, int],
+) -> dict[str, Any]:
+    """Read one exact line window (plus margin) from a repository file."""
+
+    try:
+        root = repo_root.resolve()
+        target = (root / file_path).resolve()
+        if not target.is_relative_to(root) or not target.is_file():
+            return {}
+        with target.open("rb") as stream:
+            data = stream.read()
+    except OSError:
+        return {}
+    return ranged_text_preview(data.decode("utf-8", errors="replace"), line_range)
+
+
+def file_query(
+    repo_root: Path,
+    file_path: str,
+    budget: int = 64,
+    *,
+    line_range: tuple[int, int] | None = None,
+) -> dict[str, Any]:
     """Return exact metadata and a bounded preview for one indexed path."""
 
     budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
@@ -5693,15 +5800,20 @@ def file_query(repo_root: Path, file_path: str, budget: int = 64) -> dict[str, A
         payload = context(conn, file_path)
     finally:
         conn.close()
+    ranged_fields: dict[str, Any] = {}
     if payload.get("found"):
         entity_limit = max(1, min(16, budget // 2))
         edge_limit = max(1, min(16, budget // 2))
         payload["entities"] = payload["entities"][:entity_limit]
         payload["edges"] = payload["edges"][:edge_limit]
-        payload.update(_bounded_file_preview(
-            repo_root, file_path,
-            max_bytes=min(4096, max(1024, budget * 128)),
-        ))
+        if line_range is None:
+            payload.update(_bounded_file_preview(
+                repo_root, file_path,
+                max_bytes=min(4096, max(1024, budget * 128)),
+            ))
+        else:
+            ranged_fields = _ranged_file_preview(repo_root, file_path, line_range)
+            payload.update(ranged_fields)
         file_match = {
             **dict(payload.get("file") or {}),
             "kind": "file",
@@ -5712,13 +5824,19 @@ def file_query(repo_root: Path, file_path: str, budget: int = 64) -> dict[str, A
         }
     else:
         file_match = None
+    payload_cap = max(4096, budget * 768)
+    if line_range is not None:
+        # Hold the measured window whole: a fit-halved preview is cut mid-line.
+        payload_cap += len(
+            json.dumps(ranged_fields, ensure_ascii=False).encode("utf-8")
+        ) + 16384
     return _fit_payload_bytes({
         "mode": "file", "query": file_path, "budget": budget,
         "matches": [file_match] if file_match else [],
         "contexts": [payload] if payload.get("found") else [],
         "candidate_files": [file_path] if payload.get("found") else [],
         "truncated": False,
-    }, max(4096, budget * 768))
+    }, payload_cap)
 
 
 def function_query(repo_root: Path, name: str, budget: int = 64) -> dict[str, Any]:
