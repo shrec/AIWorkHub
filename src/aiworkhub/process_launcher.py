@@ -81,6 +81,8 @@ from .process_launcher_accept_review import accept_review as _accept_review_impl
 from .process_launcher_launch_isolated import launch_isolated as _launch_isolated_impl
 from .process_launcher_launch_isolated import relaunch_input_paths as _relaunch_input_paths
 from .process_launcher_launch_isolated import spawn_with_stdin_payload as _spawn_with_stdin_payload
+from .worktree_retention_rule import WORKTREE_RETENTION_RULE_VERSION, superseded_reason
+from .worktree_retention_rule import record_rule_version
 from .launch_replay_guard import (
     CARD_CONTENT_IDENTITY_KEYS,
     IDENTICAL_RELAUNCH_BLOCKED_REASON,
@@ -4067,6 +4069,7 @@ class ProcessManager:
                 str(self.repo / PROCESS_LOG_DEFAULT_REL),
             )
         )
+        record_rule_version(self.process_log_path.parent, WORKTREE_RETENTION_RULE_VERSION)
         self.process_dir = process_dir or Path(
             os.environ.get(
                 PROCESS_DIR_ENV,
@@ -4328,6 +4331,7 @@ class ProcessManager:
         recorded = self._append_event({
             **event, "workspace_disposition": disposition,
             "workspace_retained": retained,
+            "retention_rule_version": WORKTREE_RETENTION_RULE_VERSION,
         })
         if str(event.get("state") or "") in {"accepted", "rejected", "archived"}:
             storage_retention.schedule_repository_cleanup(self.repo)
@@ -10317,6 +10321,10 @@ class ProcessManager:
         that failed) is reported under ``failures`` -- bounded, and only when
         there is one -- so a stuck worktree is visible instead of silently kept.
         """
+        # Re-asserted each sweep: the construction-time write misses a runtime dir created later.
+        recorded = record_rule_version(self.process_log_path.parent, WORKTREE_RETENTION_RULE_VERSION)
+        if refused := superseded_reason(WORKTREE_RETENTION_RULE_VERSION, recorded):
+            return {"gc_scanned": 0, "gc_cleaned": 0, "gc_skipped": 0, "refused": refused}
         scanned = 0
         cleaned = 0
         skipped = 0
@@ -10574,6 +10582,9 @@ class ProcessManager:
                 or not latest.get("workspace_retained") or latest.get("workspace_quarantined")
             ):
                 return None
+            versions = (event.get("retention_rule_version"), latest.get("retention_rule_version"))
+            if refused := superseded_reason(WORKTREE_RETENTION_RULE_VERSION, *versions):
+                return {"request_id": request_id, "gc": False, "reason": refused}
 
             metadata_raw = latest.get("metadata_path")
             if not metadata_raw:
