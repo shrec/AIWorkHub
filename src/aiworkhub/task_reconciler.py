@@ -866,6 +866,38 @@ def _scan_wave_completion(repo: Path) -> dict[str, Any]:
 TRANSIENT_RETRY_RELAUNCH_CAPACITY = 4
 
 
+def _positive_seconds(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _failed_attempt_timeout(
+    mgr: process_launcher.ProcessManager, task_id: str
+) -> tuple[int | None, str]:
+    """(timeout_seconds, "") from the failed request's ProcessManager record, else (None, reason)."""
+    try:
+        card = task_store.get_tasks(Path(mgr.repo).resolve(), [task_id]).get(task_id) or {}
+        transient = card.get("transient_retry")
+        request_id = str(transient.get("request_id") or "") if isinstance(transient, Mapping) else ""
+        if not request_id:
+            return None, "no_failed_request_id"
+        status = mgr.status(request_id)
+        if not status.get("ok"):
+            return None, f"failed_request_{status.get('state') or 'unreadable'}"
+        event = status.get("latest_event")
+        event = event if isinstance(event, Mapping) else {}
+        timeout = _positive_seconds(event.get("timeout_seconds"))
+        if timeout is None and event.get("metadata_path"):
+            metadata_file = Path(str(event["metadata_path"]))
+            if not stat.S_ISREG(metadata_file.lstat().st_mode):
+                return None, "timeout_unreadable:not_a_regular_file"
+            metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
+            if isinstance(metadata, Mapping):
+                timeout = _positive_seconds(metadata.get("timeout_seconds"))
+    except Exception as exc:  # noqa: BLE001 -- an unreadable record must not block the relaunch
+        return None, f"timeout_unreadable:{type(exc).__name__}"
+    return (timeout, "") if timeout is not None else (None, "timeout_not_recorded")
+
+
 def _scan_transient_retry_relaunch(mgr: process_launcher.ProcessManager) -> dict[str, Any]:
     """Relaunch pending/unclaimed cards whose transient-retry backoff elapsed.
 
@@ -879,15 +911,23 @@ def _scan_transient_retry_relaunch(mgr: process_launcher.ProcessManager) -> dict
     real worker process, never before ``retry_not_before`` and never past its
     budget. A failure here is isolated exactly like every other pass:
     recorded, and never blocking worker finalization.
+
+    NF-2026-01663: the relaunch keeps the failed attempt's ``timeout_seconds``
+    instead of the 7200 s launch default, and a due card waits while
+    ``dependency_autolaunch.network_reachable`` finds no provider reachable.
     """
 
     def _launch(task_id: str, runner: str, topic: str, request_id: str) -> dict[str, Any]:
+        timeout_seconds, reason = _failed_attempt_timeout(mgr, task_id)
+        inherited = {} if timeout_seconds is None else {"timeout_seconds": timeout_seconds}
         try:
-            result = mgr.launch(task_id=task_id, runner=runner, topic=topic)
+            result = mgr.launch(task_id=task_id, runner=runner, topic=topic, **inherited)
         except Exception as exc:  # noqa: BLE001 -- one bad spawn must not abort the whole relaunch pass
             return {"ok": False, "stderr": f"launch_raised:{type(exc).__name__}"}
         if result.get("ok"):
-            return {"ok": True}
+            if timeout_seconds is None:
+                return {"ok": True, "timeout_inherited": False, "timeout_inherit_reason": reason}
+            return {"ok": True, "timeout_inherited": True, "timeout_seconds": timeout_seconds}
         return {
             "ok": False,
             "stderr": str(result.get("blocked_reason") or result.get("error") or ""),
@@ -896,6 +936,7 @@ def _scan_transient_retry_relaunch(mgr: process_launcher.ProcessManager) -> dict
     try:
         return dependency_autolaunch.reconcile_transient_due(
             Path(mgr.repo).resolve(), launch=_launch, capacity=TRANSIENT_RETRY_RELAUNCH_CAPACITY,
+            online=dependency_autolaunch.network_reachable,
         )
     except Exception as exc:  # noqa: BLE001 -- never block worker reconcile
         return {"ok": False, "state": "skipped", "reason": f"{type(exc).__name__}"[:80]}

@@ -6,6 +6,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -15,6 +17,11 @@ if str(SRC) not in sys.path:
 autolaunch = importlib.import_module("aiworkhub.dependency_autolaunch")
 task_reconciler = importlib.import_module("aiworkhub.task_reconciler")
 task_store = importlib.import_module("aiworkhub.task_store")
+
+
+@pytest.fixture(autouse=True)
+def _network_is_up(monkeypatch):
+    monkeypatch.setattr(autolaunch, "network_reachable", lambda: True)
 
 
 def _init_repo(tmp_path: Path) -> Path:
@@ -291,7 +298,9 @@ def test_run_scan_includes_the_transient_retry_relaunch_receipt(monkeypatch, tmp
     monkeypatch.setattr(
         task_reconciler.dependency_autolaunch,
         "reconcile_transient_due",
-        lambda repo, *, launch, capacity=None: {"ok": True, "launched": [], "capacity": capacity},
+        lambda repo, *, launch, capacity=None, online=None: {
+            "ok": True, "launched": [], "capacity": capacity,
+        },
     )
 
     result = task_reconciler.run_scan(_Mgr(tmp_path), include_gc=False)
@@ -312,7 +321,7 @@ def test_run_scan_survives_a_transient_retry_relaunch_exception(monkeypatch, tmp
         task_reconciler.review_orchestrator, "canonical_review_db", lambda _mgr: None
     )
 
-    def _boom(repo, *, launch, capacity=None):
+    def _boom(repo, *, launch, capacity=None, online=None):
         raise RuntimeError("provider_unreachable")
 
     monkeypatch.setattr(task_reconciler.dependency_autolaunch, "reconcile_transient_due", _boom)

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import ast
+import concurrent.futures
 import fnmatch
 import json
+import os
 import re
+import socket
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -864,11 +867,60 @@ def _transient_retry_request_id(task_id: str, attempts: int) -> str:
     return f"transient-retry-autolaunch:{task_id}:{attempts}"
 
 
+# NF-2026-01663: a relaunch into a dead network must not burn a retry attempt.
+NETWORK_PROBE_HOSTS = ("api.anthropic.com", "api.openai.com", "api.x.ai")
+NETWORK_PROBE_PORT = 443
+NETWORK_PROBE_ATTEMPT_TIMEOUT_SECONDS = 3.0
+NETWORK_PROBE_TOTAL_TIMEOUT_SECONDS = 4.0
+# Keys a launch result may carry that are copied onto its launched entry.
+_LAUNCH_RECEIPT_KEYS = ("timeout_inherited", "timeout_seconds", "timeout_inherit_reason")
+
+
+def _host_accepts_tcp(host: str) -> bool:
+    try:
+        for family, socktype, proto, _canonname, address in socket.getaddrinfo(
+            host, NETWORK_PROBE_PORT, type=socket.SOCK_STREAM
+        ):
+            try:
+                with socket.socket(family, socktype, proto) as sock:
+                    sock.settimeout(NETWORK_PROBE_ATTEMPT_TIMEOUT_SECONDS)
+                    sock.connect(address)
+                return True
+            except Exception:  # noqa: BLE001 -- this address failed; try the next one
+                continue
+    except Exception:  # noqa: BLE001 -- any resolver failure means the host is unreachable
+        return False
+    return False
+
+
+def network_reachable() -> bool:
+    """True when any provider API host accepts TCP on 443 within the probe bound."""
+    hosts = NETWORK_PROBE_HOSTS
+    workers = min(len(hosts), max(1, (os.cpu_count() or 2) - 1))
+    pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="network-probe"
+    )
+    try:
+        pending = [pool.submit(_host_accepts_tcp, host) for host in hosts]
+        # getaddrinfo ignores socket timeouts, so the overall bound is enforced here.
+        return any(
+            future.result()
+            for future in concurrent.futures.as_completed(
+                pending, timeout=NETWORK_PROBE_TOTAL_TIMEOUT_SECONDS
+            )
+        )
+    except Exception:  # noqa: BLE001 -- a timeout or any probe error means unreachable
+        return False
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
 def reconcile_transient_due(
     repo_root: Path | str,
     *,
     launch: LaunchFn,
     capacity: int | None = None,
+    online: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Relaunch pending/unclaimed cards whose transient-retry backoff elapsed.
 
@@ -888,6 +940,11 @@ def reconcile_transient_due(
     A card whose ``depends_on`` is not yet fully finished is left to
     ``reconcile`` instead, which already understands a missing, failed, or
     still-waiting dependency; this function never guesses at that state.
+
+    ``online`` (NF-2026-01663) is an optional connectivity probe, called at most
+    once per pass and only once a card is due: False delays every due card as
+    ``network_unreachable`` -- no launch, hold or attempt charged -- and sets
+    ``outcome["network"]`` to ``"offline"``. ``None`` means no gate.
     """
     from . import core
 
@@ -915,6 +972,7 @@ def reconcile_transient_due(
 
     now = _now()
     launched_count = 0
+    reachable: bool | None = None
     for child in sorted(rows.values(), key=lambda r: r.task_id):
         state = _transient_retry_state(child.card)
         if state is None:
@@ -989,6 +1047,16 @@ def reconcile_transient_due(
                     }
                 )
                 continue
+        if online is not None:
+            if reachable is None:
+                reachable = bool(online())
+                if not reachable:
+                    outcome["network"] = "offline"
+            if not reachable:
+                outcome["delayed"].append(
+                    {"task_id": child.task_id, "reason": "network_unreachable"}
+                )
+                continue
         if capacity is not None and launched_count >= capacity:
             outcome["delayed"].append({"task_id": child.task_id, "reason": "capacity"})
             continue
@@ -1006,6 +1074,7 @@ def reconcile_transient_due(
                     "runner": child.runner,
                     "topic": child.topic,
                     "attempts": attempts,
+                    **{key: result[key] for key in _LAUNCH_RECEIPT_KEYS if key in result},
                 }
             )
         else:
