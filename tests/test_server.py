@@ -142,7 +142,9 @@ print(json.dumps(schemas))
     assert result.returncode == 0, result.stderr
     for name, schema in json.loads(result.stdout).items():
         for field in (("kind", "severity", "status") if name == "needfix_add" else ("kind", "severity")):
-            assert schema["properties"][field] == {"type": "string"}
+            published = schema["properties"][field]
+            assert published["type"] == "string"
+            assert set(published) <= {"type", "description"}
 
 
 def test_manager_review_hold_tool_forwards_the_exact_identity(monkeypatch) -> None:

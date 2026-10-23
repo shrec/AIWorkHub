@@ -124,6 +124,17 @@ except ModuleNotFoundError:
             }
         return {"type": _stdio_json_type(annotation)}
 
+    from . import mcp_tool_metadata as _stdio_tool_metadata
+
+    def _stdio_hint_description(annotation: Any) -> str:
+        origin = typing.get_origin(annotation)
+        if origin is typing.Annotated:
+            for meta in reversed(typing.get_args(annotation)[1:]):
+                text = getattr(meta, "description", None)
+                if isinstance(text, str) and text:
+                    return text
+        return ""
+
     def _stdio_schema_for(func: Any) -> dict[str, Any]:
         try:
             sig = inspect.signature(func)
@@ -133,6 +144,13 @@ except ModuleNotFoundError:
             resolved_hints = typing.get_type_hints(func)
         except (NameError, TypeError):
             resolved_hints = {}
+        try:
+            annotated_hints = typing.get_type_hints(func, include_extras=True)
+        except (NameError, TypeError):
+            annotated_hints = {}
+        # Same sources as mcp_tool_metadata.prepare_registration: a parameter's
+        # own Field description wins over its docstring Args entry.
+        documented = _stdio_tool_metadata.split_docstring(getattr(func, "__doc__", None))[1]
         properties: dict[str, Any] = {}
         required: list[str] = []
         for pname, param in sig.parameters.items():
@@ -141,6 +159,9 @@ except ModuleNotFoundError:
             properties[pname] = _stdio_json_schema_for_annotation(
                 resolved_hints.get(pname, param.annotation)
             )
+            description = _stdio_hint_description(annotated_hints.get(pname)) or documented.get(pname, "")
+            if description:
+                properties[pname]["description"] = description
             if param.default is inspect.Signature.empty:
                 required.append(pname)
         schema: dict[str, Any] = {"type": "object", "properties": properties, "additionalProperties": False}
@@ -151,12 +172,17 @@ except ModuleNotFoundError:
     def _stdio_tools_list(tools: dict[str, Any]) -> dict[str, Any]:
         entries = []
         for name, func in tools.items():
-            doc = inspect.getdoc(func) or ""
-            entries.append({
+            text, _ = _stdio_tool_metadata.split_docstring(getattr(func, "__doc__", None))
+            description = text.strip()
+            entry: dict[str, Any] = {
                 "name": name,
-                "description": doc.strip().splitlines()[0] if doc.strip() else "",
+                "description": description,
                 "inputSchema": _stdio_schema_for(func),
-            })
+            }
+            annotations = _stdio_tool_metadata.derive_annotations(name, description)
+            if annotations is not None:
+                entry["annotations"] = annotations
+            entries.append(entry)
         return {"tools": entries}
 
     def _stdio_tools_call(tools: dict[str, Any], params: Any) -> dict[str, Any]:
@@ -2488,10 +2514,20 @@ def aiworkhub_repo_switch(repo_id: str) -> dict[str, Any]:
     return core.repository_switch(repo_id)
 
 
+class _StdioFieldHint:
+    """Hashable stand-in for pydantic Field metadata when the SDK is absent."""
+
+    __slots__ = ("description", "examples")
+
+    def __init__(self, description: str, examples: list[Any]) -> None:
+        self.description = description
+        self.examples = examples
+
+
 def _task_create_hint(description: str, examples: list[Any]) -> Any:
-    """Optional SDK metadata only; stdlib get_type_hints strips Annotated extras."""
+    """Field metadata under the SDK; a description carrier for the stdlib tools/list."""
     if not _MCP_SDK_AVAILABLE:
-        return None
+        return _StdioFieldHint(description, examples)
     from pydantic import Field
 
     return Field(description=description, examples=examples)
