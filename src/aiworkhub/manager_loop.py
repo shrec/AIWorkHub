@@ -53,6 +53,9 @@ DEFAULT_BRIEF_BYTES = 12 * 1024
 MIN_BRIEF_BYTES = 256
 DEFAULT_CONTEXT_WINDOW_BYTES = 512 * 1024
 DEFAULT_ROTATE_FRACTION = 0.75
+# A fill fraction alone lets a 1M-token route re-bill 750k tokens every turn, so tokens cap it too.
+DEFAULT_ROTATE_AT_TOKENS = 100_000
+ROTATE_AT_TOKENS_ENV = "AIWORKHUB_MANAGER_ROTATE_AT_TOKENS"
 MAX_EVENT_PAYLOAD_BYTES = 4 * 1024
 # Payload fields bounded on their own, so a long one is cut without losing the rest.
 FIELD_BOUNDS = {"output_tail": 8 * 1024, "output": 16 * 1024, "diff": 64 * 1024, "text": 64 * 1024}
@@ -304,15 +307,42 @@ def _normalize(raw: object) -> tuple[str, dict[str, Any]]:
     return kind, dict(payload) if isinstance(payload, Mapping) else {"value": payload}
 
 
-def _measured_fill(events: Iterable[Mapping[str, Any]]) -> float | None:
-    """The last ``turn_end``'s provider-reported ``usage.context_fill``; ``None`` when unreported or invalid."""
+def _last_turn_usage(events: Iterable[Mapping[str, Any]]) -> Mapping[str, Any] | None:
     ends = [event for event in events if event.get("type") == "turn_end"]
     payload = ends[-1].get("payload") if ends else None
     usage = payload.get("usage") if isinstance(payload, Mapping) else None
-    fill = usage.get("context_fill") if isinstance(usage, Mapping) else None
+    return usage if isinstance(usage, Mapping) else None
+
+
+def _measured_fill(events: Iterable[Mapping[str, Any]]) -> float | None:
+    """The last ``turn_end``'s provider-reported ``usage.context_fill``; ``None`` when unreported or invalid."""
+    usage = _last_turn_usage(events)
+    fill = usage.get("context_fill") if usage is not None else None
     if isinstance(fill, bool) or not isinstance(fill, (int, float)) or not 0 <= fill < float("inf"):
         return None
     return float(fill)
+
+
+def _measured_tokens(events: Iterable[Mapping[str, Any]]) -> int | None:
+    """The last call's context tokens (``context_fill`` x ``context_window``); ``None`` unless both are valid."""
+    usage = _last_turn_usage(events)
+    fill = _measured_fill(events)
+    window = usage.get("context_window") if usage is not None else None
+    if fill is None or isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+        return None
+    try:
+        return round(fill * window)
+    except OverflowError:
+        return None
+
+
+def _rotate_at_tokens_from_env() -> int:
+    """``AIWORKHUB_MANAGER_ROTATE_AT_TOKENS`` as a non-negative int; the default when unset or invalid."""
+    try:
+        value = int(os.environ.get(ROTATE_AT_TOKENS_ENV, ""))
+    except ValueError:
+        return DEFAULT_ROTATE_AT_TOKENS
+    return value if value >= 0 else DEFAULT_ROTATE_AT_TOKENS
 
 
 def _not_ok(source: str, result: Mapping[str, Any]) -> dict[str, str]:
@@ -715,9 +745,11 @@ class ManagerOrchestrator:
     logged as it arrives and every turn is recorded through the Context Graph
     event writer. Once the provider-reported ``context_fill`` reaches ``rotate_fraction``
     (or, while none is reported, ``context_estimate_bytes`` reaches that fraction of
-    ``context_window_bytes``) the session rotates and its successor starts on the
-    same backend and model, rehydrated from the handoff; an explicit ``start``
-    may pick any other backend and model.
+    ``context_window_bytes``), or the last call's context tokens (``context_fill`` x
+    ``context_window``) reach ``rotate_at_tokens`` (``None`` or ``0`` turns that ceiling
+    off), the session rotates and its successor starts on the same backend and model,
+    rehydrated from the handoff; an explicit ``start`` may pick any other backend and
+    model.
     """
 
     def __init__(
@@ -730,12 +762,16 @@ class ManagerOrchestrator:
         session_writer: Writer = _manager_session_write,
         context_window_bytes: int = DEFAULT_CONTEXT_WINDOW_BYTES,
         rotate_fraction: float = DEFAULT_ROTATE_FRACTION,
+        rotate_at_tokens: int | None = DEFAULT_ROTATE_AT_TOKENS,
         clock: Callable[[], str] = _utc_now,
         new_id: Callable[[], str] = _new_session_id,
     ) -> None:
         if not 0 < rotate_fraction <= 1:
             raise ValueError("rotate_fraction must be in (0, 1]")
+        if rotate_at_tokens is not None and rotate_at_tokens < 0:
+            raise ValueError("rotate_at_tokens must not be negative")
         self.rotate_fraction = rotate_fraction
+        self.rotate_at_tokens = rotate_at_tokens
         self.rotate_at_bytes = int(context_window_bytes * rotate_fraction)
         if self.rotate_at_bytes <= brief_builder.max_bytes:
             # Otherwise a session would already be past its own rotation point
@@ -790,6 +826,7 @@ class ManagerOrchestrator:
     ) -> ManagerOrchestrator:
         """Production wiring for ``repo``: its runtime store and the existing tools."""
         state = repository_state.inspect_repository(repo)
+        options.setdefault("rotate_at_tokens", _rotate_at_tokens_from_env())
         return cls(
             SessionStore.for_repository(state),
             backend_factory=backend_factory,
@@ -1408,6 +1445,7 @@ class ManagerOrchestrator:
             "errors": errors,
             "context_estimate_bytes": session.context_estimate_bytes,
             "context_fill": _measured_fill(events),
+            "context_tokens": _measured_tokens(events),
             "rotation_basis": "provider_context_fill",
             "rotation": None,
         }
@@ -1418,6 +1456,10 @@ class ManagerOrchestrator:
         else:
             result["rotation_basis"] = "byte_estimate"
             full = session.context_estimate_bytes >= self.rotate_at_bytes
+        ceiling, tokens = self.rotate_at_tokens, result["context_tokens"]
+        if not full and ceiling and tokens is not None and tokens >= ceiling:
+            result["rotation_basis"] = "absolute_token_ceiling"
+            full = True
         if full:
             result["rotation"] = self._rotate("context_threshold", successor=True)
         return result

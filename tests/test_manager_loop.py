@@ -455,12 +455,15 @@ def test_crossing_the_threshold_rotates_into_a_rehydrated_successor(make) -> Non
     assert (crossed["context_fill"], crossed["rotation_basis"]) == (None, "byte_estimate")
 
 
-def _measured(fill: Any) -> list[dict[str, Any]]:
-    usage = {"input": 1, "cache_read": 0, "cache_write": 0, "output": 1, "context_window": 200000, "context_fill": fill}
+def _used(**usage: Any) -> list[dict[str, Any]]:
     return [
         {"type": "assistant_text", "payload": {"text": "ok"}},
         {"type": "turn_end", "payload": {"usage": usage}},
     ]
+
+
+def _measured(fill: Any) -> list[dict[str, Any]]:
+    return _used(input=1, cache_read=0, cache_write=0, output=1, context_window=200000, context_fill=fill)
 
 
 def test_a_reported_context_fill_decides_rotation_over_the_byte_estimate(make) -> None:
@@ -489,6 +492,145 @@ def test_an_unreported_or_invalid_fill_stays_unknown_and_falls_back_to_the_estim
     result = harness.orch.send("hello")
 
     assert (result["context_fill"], result["rotation_basis"], result["rotation"]) == (None, "byte_estimate", None)
+
+
+def test_the_token_ceiling_defaults_to_one_hundred_thousand(make) -> None:
+    assert ml.DEFAULT_ROTATE_AT_TOKENS == 100_000
+    assert make().orch.rotate_at_tokens == ml.DEFAULT_ROTATE_AT_TOKENS
+
+
+def test_a_negative_token_ceiling_is_refused(make) -> None:
+    with pytest.raises(ValueError, match="rotate_at_tokens"):
+        make(rotate_at_tokens=-1)
+
+
+def test_a_turn_at_the_token_ceiling_rotates_below_the_fraction(make) -> None:
+    harness = make(rotate_at_tokens=1000)
+    first = harness.orch.start("fake", "model-a")
+    harness.backends[0].script.append(_used(context_window=10_000, context_fill=0.1))
+
+    result = harness.orch.send("hello")
+
+    assert (result["context_fill"], result["context_tokens"]) == (0.1, 1000)
+    assert result["rotation_basis"] == "absolute_token_ceiling"
+    rotation = result["rotation"]
+    assert rotation is not None and rotation["session"].session_id == first.session_id
+    assert rotation["successor"] == harness.orch.session
+    assert "context_threshold" in harness.backends[0].messages[-1]
+
+
+def test_a_turn_below_the_fraction_and_the_token_ceiling_does_not_rotate(make) -> None:
+    harness = make(rotate_at_tokens=1000)
+    harness.orch.start("fake", "model-a")
+    harness.backends[0].script.append(_used(context_window=10_000, context_fill=0.0999))
+
+    result = harness.orch.send("hello")
+
+    assert (result["context_tokens"], result["rotation_basis"]) == (999, "provider_context_fill")
+    assert result["rotation"] is None
+
+
+def test_turn_totals_above_the_ceiling_do_not_rotate_when_the_last_call_is_small(make) -> None:
+    # input/cache counts are totals over every call of the turn; only the fill sizes the last call's context
+    harness = make(rotate_at_tokens=100_000)
+    harness.orch.start("fake", "model-a")
+    harness.backends[0].script.append(
+        _used(input=5_000_000, cache_read=5_000_000, cache_write=0, context_window=200_000, context_fill=0.01)
+    )
+
+    result = harness.orch.send("hello")
+
+    assert (result["context_tokens"], result["rotation_basis"]) == (2000, "provider_context_fill")
+    assert result["rotation"] is None
+
+
+@pytest.mark.parametrize("disabled", [0, None])
+def test_a_disabled_token_ceiling_never_rotates_on_tokens(make, disabled: int | None) -> None:
+    harness = make(rotate_at_tokens=disabled)
+    harness.orch.start("fake", "model-a")
+    harness.backends[0].script.append(_used(context_window=50_000_000, context_fill=0.1))
+
+    result = harness.orch.send("hello")
+
+    assert (result["context_tokens"], result["rotation_basis"]) == (5_000_000, "provider_context_fill")
+    assert result["rotation"] is None
+
+
+@pytest.mark.parametrize(
+    "usage, basis",
+    [
+        ({"context_fill": 0.1}, "provider_context_fill"),
+        ({"context_fill": 0.1, "context_window": 0}, "provider_context_fill"),
+        ({"context_fill": 0.1, "context_window": -5}, "provider_context_fill"),
+        ({"context_fill": 0.1, "context_window": "10000"}, "provider_context_fill"),
+        ({"context_fill": 0.1, "context_window": 10_000.0}, "provider_context_fill"),
+        ({"context_fill": 0.1, "context_window": True}, "provider_context_fill"),
+        ({"context_fill": 0.1, "context_window": 10**400}, "provider_context_fill"),
+        ({"context_fill": None, "context_window": 10_000}, "byte_estimate"),
+    ],
+)
+def test_a_missing_or_invalid_fill_or_window_reports_no_tokens(make, usage: dict[str, Any], basis: str) -> None:
+    harness = make(rotate_at_tokens=1000)
+    harness.orch.start("fake", "model-a")
+    harness.backends[0].script.append(_used(**usage))
+
+    result = harness.orch.send("hello")
+
+    assert result["context_tokens"] is None
+    assert (result["rotation_basis"], result["rotation"]) == (basis, None)
+
+
+@pytest.mark.parametrize("fill, basis", [(0.1, "absolute_token_ceiling"), (0.9, "provider_context_fill")])
+def test_the_ceiling_is_the_basis_only_when_it_alone_triggered_the_rotation(make, fill: Any, basis: str) -> None:
+    harness = make(rotate_at_tokens=1000)
+    harness.orch.start("fake", "model-a")
+    harness.backends[0].script.append(_used(context_window=10_000, context_fill=fill))
+
+    result = harness.orch.send("hello")
+
+    assert result["rotation"] is not None
+    assert result["rotation_basis"] == basis
+
+
+def test_without_a_fill_the_byte_estimate_decides_and_no_tokens_are_reported(make) -> None:
+    harness = make(brief_bytes=1024, context_window_bytes=2200, rotate_fraction=0.5, rotate_at_tokens=1000)
+    harness.orch.start("fake", "model-a")
+    harness.backends[0].script.append(_used(input=1000, cache_read=0, cache_write=0, context_window=10_000))
+
+    result = harness.orch.send("x" * 1500)
+
+    assert result["context_estimate_bytes"] >= harness.orch.rotate_at_bytes
+    assert (result["context_fill"], result["context_tokens"]) == (None, None)
+    assert result["rotation_basis"] == "byte_estimate"
+    assert result["rotation"] is not None
+
+
+@pytest.mark.parametrize(
+    "env, options, expected",
+    [
+        (None, {}, 100_000),
+        ("250000", {}, 250_000),
+        ("0", {}, 0),
+        ("", {}, 100_000),
+        ("abc", {}, 100_000),
+        ("-5", {}, 100_000),
+        ("1.5", {}, 100_000),
+        ("250000", {"rotate_at_tokens": 7}, 7),
+    ],
+)
+def test_for_repository_reads_the_token_ceiling_from_the_environment(
+    tmp_path: Path, monkeypatch, env: str | None, options: dict[str, Any], expected: int
+) -> None:
+    from aiworkhub import repository_state
+
+    repository_state.bootstrap_repository(tmp_path)
+    if env is None:
+        monkeypatch.delenv("AIWORKHUB_MANAGER_ROTATE_AT_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("AIWORKHUB_MANAGER_ROTATE_AT_TOKENS", env)
+
+    with ml.ManagerOrchestrator.for_repository(tmp_path, FakeBackend, **options) as orch:
+        assert orch.rotate_at_tokens == expected
 
 
 def test_a_threshold_inside_the_brief_budget_is_refused(make) -> None:
