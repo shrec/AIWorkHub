@@ -1,5 +1,11 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.65 — 2026-10-23
+
+### Fixed
+
+- Bundled runtime 0.12.65: worker worktrees survive restarts, power loss and network drops until their card closes (NF-2026-01661); a transient retry waits for the network and keeps the original timeout (NF-2026-01663); the dashboard stops resending the full manager contract (NF-2026-01664); a well-proven skill tolerates a resolved minority of negative evidence (NF-2026-01665); the stdlib MCP fallback lists tools like FastMCP (NF-2026-01642).
+
 ## 0.12.64 — 2026-10-23
 
 ### Fixed

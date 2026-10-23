@@ -6,6 +6,16 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.65] - 2026-10-23
+
+### Fixed
+
+- A worker worktree is kept by both the finalized-workspace GC and the storage-retention reclaim plan until its card is finished, archived or superseded, or its NeedFix closes, so a worker that dies on restart, power loss, network drop, token expiry or a transient retry no longer loses its attempt (NF-2026-01661, NF-2026-01635).
+- A transient-retry relaunch waits until the network is reachable and inherits the original launch's `timeout_seconds` instead of the 7200 s default (NF-2026-01663).
+- Dashboard health and the compact snapshot send the manager identity block and re-send the contract prose only when `known_contract_sha256` differs (NF-2026-01664).
+- A skill with a large accepted-use record is no longer blocked from activation by a resolved minority of negative evidence (NF-2026-01665).
+- The stdlib MCP fallback's `tools/list` carries full tool descriptions, annotations and parameter descriptions, matching FastMCP (NF-2026-01642).
+
 ## [0.12.64] - 2026-10-23
 
 ### Added

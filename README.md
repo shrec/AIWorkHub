@@ -372,9 +372,9 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.64
+## What's new in 0.12.65
 
-- A model working on a card is now stopped when it stops making progress, not after a fixed number of turns, so long but productive work finishes; Grok launches without naming an adapter; a NeedFix whose card would miss a required input is refused before conversion; and every MCP tool now describes its parameters.
+- A worker's worktree now survives a restart, power loss, network drop or expired token until its card is closed, and a retried launch waits for the network and keeps its original timeout; the dashboard no longer resends the full manager contract on every call, a well-proven skill is no longer blocked by one resolved bad report, and the fallback MCP server lists tools exactly as FastMCP does.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Continuous Audit as a Service (CAAS)
