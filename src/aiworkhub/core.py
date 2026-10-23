@@ -5416,6 +5416,10 @@ def create_task(
     # SUGGESTION: the card was stored with the declared scope and nothing here
     # widened it. The manager decides whether to recreate with a wider scope.
     result.update(card_test_scope_warnings(card))
+    # Advisory Source Graph/ratchet evidence; fails closed per part and never blocks creation.
+    from . import card_contract_advice
+
+    result["contract_advice"] = card_contract_advice.contract_advice(repo_root(), card)
     if validation_normalization:
         result["validation_normalization"] = validation_normalization
     if validation_head_warnings:
@@ -12704,7 +12708,9 @@ def needfix_preview_convert(
     can commit from ``plan_digest`` with no plan body -- and
     ``validation_roles_requirement``, which names the roles this plan's
     ``work_kind`` must declare (``bugfix``: reproduction, regression) and
-    whether the previewed plan already satisfies them.
+    whether the previewed plan already satisfies them. ``contract_advice`` (only
+    with a previewed plan) is the advisory Source Graph and ratchet report; it is
+    added after ``plan_digest`` is fixed and never changes it.
     """
     ns = _needfix_store_module()
     preview = ns.preview_convert(repo_root(), needfix_id, task_plan=task_plan)
@@ -12719,6 +12725,10 @@ def needfix_preview_convert(
     requirement = _validation_roles_requirement(previewed)
     if requirement is not None:
         preview["validation_roles_requirement"] = requirement
+    if isinstance(previewed, Mapping) and previewed:
+        from . import card_contract_advice
+
+        preview["contract_advice"] = card_contract_advice.contract_advice(repo_root(), previewed)
     return preview
 
 
