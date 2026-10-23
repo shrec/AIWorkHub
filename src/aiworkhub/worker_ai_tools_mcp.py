@@ -7204,6 +7204,28 @@ def quality_review_packet_read(
     return result
 
 
+def _input_left_out(value: Any) -> bool:
+    """True when a caller left an optional tool input out: absent, null or blank."""
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _invalid_apply_text_fields(new: Any, idempotency_key: Any) -> list[str]:
+    """Names of the ``new`` / ``idempotency_key`` inputs an apply cannot accept."""
+    return [
+        name
+        for name, bad in (
+            ("new", not isinstance(new, str)),
+            (
+                "idempotency_key",
+                not isinstance(idempotency_key, str)
+                or not idempotency_key.strip()
+                or len(idempotency_key.encode("utf-8")) > 256,
+            ),
+        )
+        if bad
+    ]
+
+
 class WorkerSemanticEditSession:
     """Request-local handles for Source-Graph-sized deterministic edits.
 
@@ -7220,11 +7242,24 @@ class WorkerSemanticEditSession:
     """
 
     _MAX_DELIVERED_RANGES_PER_FILE = 512
+    _ONE_SHOT_NEXT_CALL = (
+        "Call aiworkhub_worker_semantic_edit_apply with EITHER {target_id: "
+        "<target_id returned by prepare>, new: <replacement text>, "
+        "idempotency_key: <non-empty string of at most 256 UTF-8 bytes, unique "
+        "to this edit>} OR, to edit in ONE call without prepare, {file_path, "
+        "start_line, end_line, expected_first_line: <exact text of the first "
+        "line to replace>, expected_last_line: <exact text of the last line to "
+        "replace>, new, idempotency_key}; never both. Both one-call anchors "
+        "must be non-blank lines: choose a range whose first and last lines "
+        "are non-blank, or use prepare. Only for an intentional escape fix, "
+        "add allow_escape_level_change: true."
+    )
 
     def __init__(self, ctx: WorkerToolContext) -> None:
         self.ctx = ctx
         self._targets: dict[str, semantic_edit.PreparedLineTarget] = {}
         self._receipts: dict[str, dict[str, Any]] = {}
+        self._one_shot_calls: dict[str, dict[str, Any]] = {}
         self._delivered: dict[tuple[str, str], list[tuple[int, int, str]]] = {}
         self._lock = threading.Lock()
 
@@ -7399,20 +7434,9 @@ class WorkerSemanticEditSession:
         tool = "semantic_edit_apply"
         # NF-2026-01373: name every bad field and the exact valid call, or an
         # emulated-transport model retries the same incomplete call blind.
-        invalid_fields = [
-            name
-            for name, bad in (
-                ("target_id", not isinstance(target_id, str) or not target_id),
-                ("new", not isinstance(new, str)),
-                (
-                    "idempotency_key",
-                    not isinstance(idempotency_key, str)
-                    or not idempotency_key.strip()
-                    or len(idempotency_key.encode("utf-8")) > 256,
-                ),
-            )
-            if bad
-        ]
+        invalid_fields = _invalid_apply_text_fields(new, idempotency_key)
+        if not isinstance(target_id, str) or not target_id:
+            invalid_fields.insert(0, "target_id")
         if invalid_fields:
             return _violation(
                 self.ctx, tool, "semantic_edit_apply_input_invalid",
@@ -7528,6 +7552,84 @@ class WorkerSemanticEditSession:
                 "new_sha256": new_sha256,
             }
         return receipt
+
+    def apply_or_one_shot(
+        self,
+        *,
+        new: str,
+        idempotency_key: str,
+        target_id: str = "",
+        allow_escape_level_change: bool = False,
+        file_path: str | None = None,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        expected_first_line: str | None = None,
+        expected_last_line: str | None = None,
+    ) -> dict[str, Any]:
+        """``apply`` a prepared ``target_id``, or prepare and apply in one call.
+
+        A ``target_id`` takes the two-call path unchanged.  Without one, all
+        five one-shot inputs are required: ``prepare`` binds the range (its
+        refusal is returned as is) and ``apply`` then writes it, so neither
+        gate is restated here.  A repeat of a one-shot call that already
+        succeeded replays through the target it bound, because preparing again
+        would hold it to anchors its own edit has since changed.
+        """
+        tool = "semantic_edit_apply"
+        one_shot = {
+            "file_path": file_path,
+            "start_line": start_line,
+            "end_line": end_line,
+            "expected_first_line": expected_first_line,
+            "expected_last_line": expected_last_line,
+        }
+        supplied = [
+            name for name, value in one_shot.items() if not _input_left_out(value)
+        ]
+        if target_id not in (None, ""):
+            if supplied:
+                return _violation(
+                    self.ctx, tool, "semantic_edit_apply_input_invalid",
+                    invalid_fields=["target_id", *supplied],
+                    next_call=self._ONE_SHOT_NEXT_CALL,
+                )
+            return self.apply(
+                target_id=target_id, new=new, idempotency_key=idempotency_key,
+                allow_escape_level_change=allow_escape_level_change,
+            )
+        invalid_fields = [
+            *(name for name in one_shot if name not in supplied),
+            *_invalid_apply_text_fields(new, idempotency_key),
+        ]
+        if invalid_fields:
+            return _violation(
+                self.ctx, tool, "semantic_edit_apply_input_invalid",
+                invalid_fields=invalid_fields, next_call=self._ONE_SHOT_NEXT_CALL,
+            )
+        request = (*one_shot.values(), hashlib.sha256(new.encode("utf-8")).hexdigest())
+        with self._lock:
+            recorded = self._one_shot_calls.get(idempotency_key)
+        if recorded is not None and recorded["request"] == request:
+            bound_target_id = recorded["target_id"]
+        else:
+            prepared = self.prepare(
+                file_path=file_path, start_line=start_line, end_line=end_line,
+                expected_first_line=expected_first_line,
+                expected_last_line=expected_last_line,
+            )
+            if prepared.get("ok") is not True:
+                return prepared
+            bound_target_id = prepared["target_id"]
+        applied = self.apply(
+            target_id=bound_target_id, new=new, idempotency_key=idempotency_key,
+            allow_escape_level_change=allow_escape_level_change,
+        )
+        if applied.get("ok") is True and recorded is None:
+            with self._lock:
+                self._one_shot_calls[idempotency_key] = {
+                    "request": request, "target_id": bound_target_id,
+                }
+        return {**applied, "mode": "one_shot"}
 
 
 SEMANTIC_EDIT_EXCEPTION_SCHEMA_ID = "aiworkhub.semantic_edit_exception_declaration.v1"
@@ -9142,19 +9244,29 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
 
     @mcp.tool(name="aiworkhub_worker_semantic_edit_apply")
     def _semantic_edit_apply(
-        target_id: str, new: str, idempotency_key: str,
+        *, target_id: str = "", new: str, idempotency_key: str,
         allow_escape_level_change: bool = False,
+        file_path: str | None = None, start_line: int | None = None,
+        end_line: int | None = None, expected_first_line: str | None = None,
+        expected_last_line: str | None = None,
     ) -> dict[str, Any]:
         """Apply replacement-only code to an immutable prepared target.
 
+        `target_id` may be replaced by `file_path`/`start_line`/`end_line` plus
+        both exact anchor lines (`expected_first_line`/`expected_last_line`) to
+        edit in ONE call without prepare; both anchors must be non-blank lines,
+        so choose a range whose first and last lines are non-blank, or prepare.
         `new` replaces the WHOLE prepared range; re-emit every line you keep;
         to insert, prepare the line you insert after and emit it first.
         allow_escape_level_change: true only for an intentional regex/escape
         fix; otherwise a re-emitted line whose backslash level changed is refused.
         """
-        return semantic_edits.apply(
+        return semantic_edits.apply_or_one_shot(
             target_id=target_id, new=new, idempotency_key=idempotency_key,
             allow_escape_level_change=allow_escape_level_change,
+            file_path=file_path, start_line=start_line, end_line=end_line,
+            expected_first_line=expected_first_line,
+            expected_last_line=expected_last_line,
         )
 
     @mcp.tool(name="aiworkhub_worker_semantic_edit_exception_declare")
