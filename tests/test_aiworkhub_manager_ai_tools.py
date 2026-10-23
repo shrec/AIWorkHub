@@ -1384,7 +1384,11 @@ print(json.dumps(server._stdio_schema_for(server.aiworkhub_task_create)))
         text=True, timeout=30,
     )
     assert result.returncode == 0, result.stderr
-    fields = json.loads(result.stdout)["properties"]
+    # A description is prose parity with FastMCP (9cab0e1d), not a dependency.
+    fields = {
+        name: {k: v for k, v in field.items() if k != "description"}
+        for name, field in json.loads(result.stdout)["properties"].items()
+    }
     for name in ("difficulty", "work_kind", "custom_template_escape"):
         assert fields[name] == {"type": "string"}
     for name in ("validation", "validation_roles"):

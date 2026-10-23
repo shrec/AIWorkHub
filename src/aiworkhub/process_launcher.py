@@ -884,16 +884,13 @@ def _terminal_state_for_workspace_error(exc: WorkspaceError) -> str:
     return _launcher_validation.terminal_state_for_workspace_error(exc)
 
 # A worker worktree is deleted only when its card is finished, archived or
-# superseded (or its NeedFix is terminal).  A worker that dies (restart, power
-# loss, network drop, token expiry, rate limit, transient_retry, dead-process
-# reconcile) leaves the card pending or blocked, and that worktree must survive
-# for the next attempt.  The one exception is a pinned rework predecessor: it
-# is collected once its delta is sealed or its card can no longer recover it
-# (see ``ProcessManager._gc_disposition``).  While a card is in review, only
-# the request_id named by terminal_review remains authoritative; older retained
-# attempts for the same card are superseded and collectable.  Every terminal
-# process state is a candidate: a state without a retained workspace is
-# filtered by ``workspace_retained`` itself.
+# superseded (or its NeedFix is terminal).  A dead worker (restart, power loss,
+# network drop, token expiry, rate limit, transient_retry, dead-process
+# reconcile) leaves the card pending or blocked; its worktree survives.  The
+# one exception, a pinned rework predecessor, is collected once its delta is
+# sealed or unrecoverable (``ProcessManager._gc_disposition``).  In review,
+# only terminal_review's request_id is authoritative; older attempts are
+# collectable.  ``workspace_retained`` filters every terminal-state candidate.
 GC_CANDIDATE_PROCESS_STATES = TERMINAL_PROCESS_STATES
 GC_DISPOSED_CANONICAL_STATUSES = {"finished", "archived", "superseded"}
 _GC_FAILURE_REPORT_LIMIT = 50
