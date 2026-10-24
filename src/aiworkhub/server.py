@@ -3074,7 +3074,13 @@ def aiworkhub_task_template_show(template_id: str) -> dict[str, Any]:
             ),
             "scope": (
                 "production_paths and test_paths expand allowed_writes and "
-                "read_first; they are not mandatory changed outputs."
+                "read_first; by themselves they are not mandatory changed "
+                "outputs. When mandatory_changed_outputs is omitted the "
+                "template default applies: bugfix_with_regression requires "
+                "the whole write set (tests included), test_only the test "
+                "paths, docs_change the production paths, and every other "
+                "template nothing. Pass mandatory_changed_outputs explicitly "
+                "to narrow it."
             ),
             "validation": (
                 "The template deterministically generates validation commands "
