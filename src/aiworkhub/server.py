@@ -1733,6 +1733,99 @@ def aiworkhub_manager_learning_commit(
     return result
 
 
+def _learning_closeout_refusal(
+    *,
+    lesson_candidate: str | None,
+    promote_ai_memory: bool,
+    no_new_lesson_reason: str | None,
+) -> dict[str, Any] | None:
+    """Refuse a contradictory inline learning close-out BEFORE the decision runs.
+
+    A lesson and a no-new-lesson reason are opposite answers for one decision,
+    and refusing after an accept/reject landed would answer ``ok: False`` for a
+    state change that already happened. Blank text counts as not supplied.
+    """
+
+    lesson = str(lesson_candidate or "").strip()
+    reason = str(no_new_lesson_reason or "").strip()
+    if lesson and reason:
+        return {"ok": False, "error": "learning_inline_conflict"}
+    if reason and reason not in learning_commit_store.NO_NEW_LESSON_REASONS:
+        return {
+            "ok": False,
+            "error": "learning_disposition_invalid:unknown_no_new_lesson_reason",
+            "allowed": list(learning_commit_store.NO_NEW_LESSON_REASONS),
+            "received": reason[:40],
+        }
+    if promote_ai_memory and not lesson:
+        return {"ok": False, "error": "learning_commit_memory_promotion_requires_lesson"}
+    return None
+
+
+def _with_learning_closeout(
+    receipt: Any,
+    *,
+    task_id: str,
+    request_id: str | None = None,
+    lesson_candidate: str | None,
+    promote_ai_memory: bool,
+    extra_evidence_ids: list[str] | None,
+    no_new_lesson_reason: str | None,
+) -> Any:
+    """Close a LANDED accept/reject out with the learning the manager supplied.
+
+    With neither ``lesson_candidate`` nor ``no_new_lesson_reason`` the receipt
+    comes back untouched: no disposition is ever defaulted. Otherwise the commit
+    reply lands under ``learning_commit`` and the disposition reply under
+    ``learning_disposition``. The decision has already happened, so a failure
+    here is reported under its own key and never changes ``ok`` or drops
+    ``learning_commit_owed``.
+    """
+
+    lesson = str(lesson_candidate or "").strip()
+    reason = str(no_new_lesson_reason or "").strip()
+    if not isinstance(receipt, dict) or receipt.get("ok") is not True or not (lesson or reason):
+        return receipt
+    owed = receipt.get("learning_commit_owed")
+    decided = str(
+        (owed.get("request_id") if isinstance(owed, Mapping) else None)
+        or receipt.get("request_id")
+        or request_id
+        or ""
+    ).strip()
+    key = "learning_commit" if lesson else "learning_disposition"
+    if not decided:
+        receipt[key] = {"ok": False, "error": "learning_closeout_request_id_unresolved"}
+        return receipt
+    try:
+        if lesson:
+            reply = aiworkhub_manager_learning_commit(
+                task_id=task_id,
+                request_id=decided,
+                lesson_candidate=lesson_candidate,
+                promote_ai_memory=promote_ai_memory,
+                extra_evidence_ids=extra_evidence_ids,
+            )
+        else:
+            # Same verified-manager identity and write gate as aiworkhub_manager_learning_commit.
+            reply = manager_ai_tools._write_invoke(
+                lambda repo, actor: learning_commit_store.record_disposition(
+                    repo,
+                    task_id=task_id,
+                    request_id=decided,
+                    disposition=learning_commit_store.DISPOSITION_NO_NEW_LESSON,
+                    reason=reason,
+                    recorded_by=actor["actor_id"],
+                ),
+                topic="learning_disposition",
+                task_id=task_id,
+            )
+    except Exception as exc:  # noqa: BLE001 -- the decision already landed
+        reply = {"ok": False, "error": f"learning_closeout_failed:{type(exc).__name__}"}
+    receipt[key] = reply
+    return receipt
+
+
 @mcp.tool()
 def aiworkhub_manager_needfix_markdown_preview(
     source_paths: list[str] | None = None,
@@ -3256,6 +3349,10 @@ def aiworkhub_task_reject_review(
     failure_category: InfrastructureFailureCategory | None = None,
     validation_amendment: list[str] | None = None,
     include_card: CardInclude = "none",
+    lesson_candidate: str | None = None,
+    promote_ai_memory: bool = False,
+    extra_evidence_ids: list[str] | None = None,
+    no_new_lesson_reason: str | None = None,
 ) -> dict[str, Any]:
     """Write-gated Codex action: reject a reviewed task with exact feedback and
     an explicit disposition. ``to`` = pending (rework, default) | blocked |
@@ -3279,9 +3376,27 @@ def aiworkhub_task_reject_review(
     and residual counts, rework_delta_recovery, reviewer_finalization,
     learning_commit_owed, card_sha256/card_bytes. The reason and the argv are
     never echoed; ``include_card`` = none (default) | summary | full.
+
+    ``lesson_candidate`` / ``no_new_lesson_reason`` -- both unset by default, and
+    the reply is then exactly as before -- close this decision's learning out in
+    the same call, AFTER the reject landed. ``lesson_candidate`` (with optional
+    ``promote_ai_memory`` and ``extra_evidence_ids``) runs
+    ``aiworkhub_manager_learning_commit`` for the rejected request and returns
+    its reply under ``learning_commit``; ``no_new_lesson_reason`` (one of
+    ``learning_commit_store.NO_NEW_LESSON_REASONS``) records that disposition and
+    returns it under ``learning_disposition``. Both together
+    (``learning_inline_conflict``), an unknown reason, or ``promote_ai_memory``
+    without a lesson are refused before anything changes. A failed close-out
+    never undoes the reject: ``ok`` stays true, the failure is reported under
+    its own key, and ``learning_commit_owed`` stays in the reply. None of these
+    parameters reaches ``core.reject_review``.
     """
 
-    refusal = _include_card_refusal(include_card)
+    refusal = _include_card_refusal(include_card) or _learning_closeout_refusal(
+        lesson_candidate=lesson_candidate,
+        promote_ai_memory=promote_ai_memory,
+        no_new_lesson_reason=no_new_lesson_reason,
+    )
     if refusal is not None:
         return refusal
     kwargs: dict[str, Any] = {"task_id": task_id, "reason": reason, "to": to}
@@ -3310,12 +3425,20 @@ def aiworkhub_task_reject_review(
                 rejected_request_id=str((extra or {}).get("request_id") or ""),
             )
         )
-    return _lifecycle_receipt(
+    receipt = _lifecycle_receipt(
         result,
         schema_id="aiworkhub.reject_review_receipt.v1",
         task_id=task_id,
         include_card=include_card,
         extra=extra,
+    )
+    return _with_learning_closeout(
+        receipt,
+        task_id=task_id,
+        lesson_candidate=lesson_candidate,
+        promote_ai_memory=promote_ai_memory,
+        extra_evidence_ids=extra_evidence_ids,
+        no_new_lesson_reason=no_new_lesson_reason,
     )
 
 
@@ -5072,6 +5195,10 @@ def aiworkhub_agent_accept_review(
     confirm_high_risk: bool = False,
     manager_correction: dict[str, Any] | None = None,
     include_card: CardInclude = "none",
+    lesson_candidate: str | None = None,
+    promote_ai_memory: bool = False,
+    extra_evidence_ids: list[str] | None = None,
+    no_new_lesson_reason: str | None = None,
 ) -> dict[str, Any]:
     """COORDINATOR/WRITE-GATED: accept one ``review_ready`` request, phase 2.
 
@@ -5108,12 +5235,29 @@ def aiworkhub_agent_accept_review(
     accepted_outcome_receipt, needfix_closure, learning_commit_owed, plus the
     finalized card's status and card_sha256/card_bytes. ``include_card`` =
     none (default) | summary | full adds the card view. Errors are unchanged.
+
+    ``lesson_candidate`` / ``no_new_lesson_reason`` -- both unset by default, and
+    the reply is then exactly as before -- close this decision's learning out in
+    the same call, AFTER the accept landed. ``lesson_candidate`` (with optional
+    ``promote_ai_memory`` and ``extra_evidence_ids``) runs
+    ``aiworkhub_manager_learning_commit`` for this request and returns its reply
+    under ``learning_commit``; ``no_new_lesson_reason`` (one of
+    ``learning_commit_store.NO_NEW_LESSON_REASONS``) records that disposition and
+    returns it under ``learning_disposition``. Both together
+    (``learning_inline_conflict``), an unknown reason, or ``promote_ai_memory``
+    without a lesson are refused before anything changes. A failed close-out
+    never undoes the accept: ``ok`` stays true, the failure is reported under
+    its own key, and ``learning_commit_owed`` stays in the reply.
     """
 
-    # Refuse a bad render mode BEFORE the accept runs: checking it afterwards
-    # would answer ``ok: False`` for a promotion that already landed and throw
-    # the receipt away.
-    refusal = _include_card_refusal(include_card)
+    # Refuse a bad render mode or a contradictory learning close-out BEFORE the
+    # accept runs: checking afterwards would answer ``ok: False`` for a promotion
+    # that already landed and throw the receipt away.
+    refusal = _include_card_refusal(include_card) or _learning_closeout_refusal(
+        lesson_candidate=lesson_candidate,
+        promote_ai_memory=promote_ai_memory,
+        no_new_lesson_reason=no_new_lesson_reason,
+    )
     if refusal is not None:
         return refusal
     result = process_launcher.default_manager().accept_review(
@@ -5144,7 +5288,15 @@ def aiworkhub_agent_accept_review(
         if view is not None:
             receipt["card"] = view
     receipt["include_card"] = include_card
-    return receipt
+    return _with_learning_closeout(
+        receipt,
+        task_id=task_id,
+        request_id=request_id,
+        lesson_candidate=lesson_candidate,
+        promote_ai_memory=promote_ai_memory,
+        extra_evidence_ids=extra_evidence_ids,
+        no_new_lesson_reason=no_new_lesson_reason,
+    )
 
 
 @mcp.tool()

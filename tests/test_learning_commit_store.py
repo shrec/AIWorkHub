@@ -1533,6 +1533,7 @@ def test_a_real_commit_is_recorded_as_lesson_committed_without_repeating_it(
 ):
     root, task_id, request_id = _setup(tmp_path, monkeypatch)
     committed = _commit(task_id, request_id)
+    assert committed["disposition"]["state"] == "applied", committed["disposition"]
 
     recorded = learning_commit_store.record_disposition(
         root,
@@ -1544,7 +1545,8 @@ def test_a_real_commit_is_recorded_as_lesson_committed_without_repeating_it(
     )
 
     assert recorded["ok"] is True
-    assert recorded["idempotent"] is False
+    assert recorded["idempotent"] is True, "commit_learning already closed the decision out"
+    assert recorded["recorded_by"] == SESSION_ID
     assert recorded["disposition"] == "lesson_committed"
     assert recorded["commit_id"] == committed["commit_id"]
     assert recorded["reason"] == ""
@@ -1556,6 +1558,80 @@ def test_a_real_commit_is_recorded_as_lesson_committed_without_repeating_it(
     assert "gate learning promotion" not in json.dumps(stored), (
         "the disposition references the ledger row, it never copies the lesson"
     )
+
+
+def test_committing_a_lesson_closes_the_decision_out_and_is_counted(
+    tmp_path, monkeypatch
+):
+    """The commit records its own disposition; nobody has to remember to."""
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+    assert learning_commit_store.coverage(root)["cards_with_disposition"] == 0
+
+    committed = _commit(task_id, request_id)
+
+    assert committed["ok"] is True, committed
+    stored = learning_commit_store.read_disposition(
+        root, task_id=task_id, request_id=request_id
+    )
+    assert stored["disposition"] == "lesson_committed"
+    assert stored["commit_id"] == committed["commit_id"]
+    assert stored["recorded_by"] == SESSION_ID
+    assert committed["disposition"] == {
+        "state": "applied",
+        "disposition_id": stored["disposition_id"],
+    }
+    measured = learning_commit_store.coverage(root)
+    assert measured["cards_with_disposition"] == 1
+    assert measured["cards_with_lesson"] == 1
+    assert measured["disposition_coverage_percent"] == 100.0
+    assert _disposition_count(root) == 1
+
+
+def test_replaying_a_commit_reports_its_disposition_as_idempotent(
+    tmp_path, monkeypatch
+):
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+
+    first = _commit(task_id, request_id)
+    second = _commit(task_id, request_id)
+
+    assert first["disposition"]["state"] == "applied"
+    assert second["idempotent"] is True
+    assert second["disposition"] == {
+        "state": "idempotent",
+        "disposition_id": first["disposition"]["disposition_id"],
+    }
+    assert _disposition_count(root) == 1
+
+
+def test_a_prior_no_new_lesson_is_reported_without_failing_the_commit(
+    tmp_path, monkeypatch
+):
+    """The ledger row is durable, so a conflicting close-out is reported, never raised."""
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+    learning_commit_store.record_disposition(
+        root,
+        task_id=task_id,
+        request_id=request_id,
+        disposition=learning_commit_store.DISPOSITION_NO_NEW_LESSON,
+        reason="mechanical_change_only",
+    )
+
+    committed = _commit(task_id, request_id)
+
+    assert committed["ok"] is True, committed
+    assert committed["failures"] == {}
+    assert committed["disposition"]["state"] == "failed"
+    assert committed["disposition"]["error"].startswith(
+        "learning_disposition_conflict:already_recorded_as_no_new_lesson"
+    )
+    stored = learning_commit_store.read_disposition(
+        root, task_id=task_id, request_id=request_id
+    )
+    assert stored["disposition"] == "no_new_lesson"
+    assert stored["reason"] == "mechanical_change_only"
+    assert _disposition_count(root) == 1
+    assert learning_commit_store.coverage(root)["cards_with_lesson"] == 1
 
 
 def test_lesson_committed_must_name_a_real_ledger_row_for_this_decision(

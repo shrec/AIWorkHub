@@ -667,6 +667,29 @@ def record_disposition(
     )
 
 
+def _record_committed_disposition(
+    repo: Path, *, task_id: str, request_id: str, commit_id: str, recorded_by: str
+) -> dict[str, Any]:
+    """Close a committed decision out as ``lesson_committed``; a failure is reported, not raised."""
+    try:
+        recorded = record_disposition(
+            repo,
+            task_id=task_id,
+            request_id=request_id,
+            disposition=DISPOSITION_LESSON_COMMITTED,
+            commit_id=commit_id,
+            recorded_by=recorded_by,
+        )
+    except LearningCommitStoreError as exc:
+        return {"state": "failed", "error": str(exc)[:240]}
+    except (OSError, sqlite3.Error) as exc:
+        return {"state": "failed", "error": f"learning_disposition_failed:{type(exc).__name__}"}
+    return {
+        "state": "idempotent" if recorded["idempotent"] else "applied",
+        "disposition_id": recorded["disposition_id"],
+    }
+
+
 def read_disposition(
     repo: str | Path, *, task_id: str, request_id: str
 ) -> dict[str, Any] | None:
@@ -984,6 +1007,14 @@ def commit_learning(
         actor=actor,
         provenance=provenance,
     )
+    # The ledger row is durable here, so a failed close-out is reported, never raised.
+    disposition = _record_committed_disposition(
+        repo,
+        task_id=commit.task_id,
+        request_id=request_id,
+        commit_id=commit_id,
+        recorded_by=actor["actor_id"],
+    )
     summary = _summary(commit_id, request_id, commit)
     source_ref = str(summary["primary_evidence"] or f"file:learning-commits/{commit_id}")
     projection_calls: dict[str, Callable[[], dict[str, Any]]] = {
@@ -1081,6 +1112,7 @@ def commit_learning(
         "idempotent": idempotent,
         "projections": projections,
         "failures": failures,
+        "disposition": disposition,
     }
 
 
