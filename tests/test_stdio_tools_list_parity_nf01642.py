@@ -288,6 +288,8 @@ def test_reject_review_schema_keeps_its_names_types_and_required_list(fallback_t
     assert set(schema["properties"]) == {
         "task_id", "reason", "to", "residual_identities", "predecessor_request_id",
         "failure_category", "validation_amendment", "include_card",
+        "allowed_writes_amendment", "lesson_candidate", "no_new_lesson_reason",
+        "promote_ai_memory", "extra_evidence_ids",
     }
     assert schema["properties"]["task_id"] == {"type": "string"}
     assert schema["properties"]["residual_identities"]["type"] == "array"
