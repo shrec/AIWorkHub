@@ -16,11 +16,15 @@ import re
 import shutil
 import stat
 import sys
+import time
+import zoneinfo
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import cli_model_discovery, platform_io, reasoning_policy, runtime_executable_registry
 
@@ -2864,6 +2868,10 @@ _RESET_IN_RE = re.compile(
 _RESET_AT_RE = re.compile(
     r"resets?(?:\s+at)?\s+(\d{4}-\d{2}-\d{2}T[0-9:.+Z-]+)", re.IGNORECASE
 )
+_RESET_WALL_CLOCK_RE = re.compile(
+    r"resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(([A-Za-z0-9_+/-]{1,64})\)",
+    re.IGNORECASE,
+)
 
 
 def _provider_status_code(text: str) -> int | None:
@@ -2876,7 +2884,69 @@ def _provider_status_code(text: str) -> int | None:
     return None
 
 
-def _reset_window(text: str) -> tuple[int | None, str | None]:
+def _host_local_reset_at(current: datetime, hour24: int, minute: int) -> str:
+    """The next ``hour24:minute`` on the host's own clock, never before ``current``, as UTC."""
+
+    now_stamp = current.timestamp()
+    today = time.localtime(now_stamp)
+    day = datetime(today.tm_year, today.tm_mon, today.tm_mday)
+    stamp = now_stamp
+    for target in (day, day + timedelta(days=1)):
+        stamp = time.mktime(
+            (target.year, target.month, target.day, hour24, minute, 0, 0, 0, -1)
+        )
+        if stamp >= now_stamp:
+            break
+    return datetime.fromtimestamp(stamp, timezone.utc).isoformat()
+
+
+def _wall_clock_reset_at(text: str, now: datetime | None) -> str | None:
+    """Resolve ``resets 2:40am (Asia/Tbilisi)`` to its next UTC instant, else ``None``.
+
+    The next occurrence of that local time, never before ``now``.  An unknown
+    zone or an hour/minute outside the 12-hour clock names no instant, so the
+    window stays unreported rather than guessed.  Only a host with no tz
+    database at all (Windows without tzdata) cannot check the name, and reads
+    the time in its own zone instead.
+    """
+
+    match = _RESET_WALL_CLOCK_RE.search(text)
+    if match is None:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2) or 0)
+    if not 1 <= hour <= 12 or minute > 59:
+        return None
+    current = now if now is not None else datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+    hour24 = hour % 12 + (12 if match.group(3).lower() == "pm" else 0)
+    try:
+        zone = ZoneInfo(match.group(4))
+    except ZoneInfoNotFoundError:
+        if zoneinfo.available_timezones():
+            return None
+        # The Claude CLI is launched on this host and prints the reset in this host's zone.
+        return _host_local_reset_at(current, hour24, minute)
+    except (ValueError, OSError):
+        return None
+    # fold=0 pins an ambiguous (DST fall-back) local time to its first occurrence.
+    candidate = current.astimezone(zone).replace(
+        hour=hour24, minute=minute, second=0, microsecond=0, fold=0
+    )
+    if candidate.astimezone(timezone.utc) < current:
+        # A fall-back repeats the hour, and its second pass may still lie ahead of now.
+        repeated = candidate.replace(fold=1)
+        if repeated.astimezone(timezone.utc) >= current:
+            candidate = repeated
+        else:
+            candidate += timedelta(days=1)
+    return candidate.astimezone(timezone.utc).isoformat()
+
+
+def _reset_window(
+    text: str, now: datetime | None = None
+) -> tuple[int | None, str | None]:
     """Extract a reported reset window: ``(retry_after_seconds, reset_at)``."""
 
     retry_after: int | None = None
@@ -2891,6 +2961,8 @@ def _reset_window(text: str) -> tuple[int | None, str | None]:
     reset = _RESET_AT_RE.search(text)
     if reset:
         reset_at = reset.group(1)
+    else:
+        reset_at = _wall_clock_reset_at(text, now)
     return retry_after, reset_at
 
 
@@ -2940,6 +3012,7 @@ def classify_provider_outcome(
     message: str = "",
     stderr: str = "",
     machine_code: str = "",
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Classify a worker exit as provider refusal, worker crash, or clean exit.
 
@@ -2951,6 +3024,8 @@ def classify_provider_outcome(
     refusal is ``recoverable`` and carries the reset window it reported
     (``retry_after_seconds`` / ``reset_at``); ``reset_reported`` is False when
     the provider named no window, so a caller must not retry without a bound.
+    A wall-clock ``resets 2:40am (Asia/Tbilisi)`` window resolves, against
+    ``now`` (default: the current UTC time), to the next such instant.
     """
 
     parts = [part for part in (str(message or ""), str(stderr or "")) if part]
@@ -3009,7 +3084,7 @@ def classify_provider_outcome(
         kind in _RECOVERABLE_REFUSALS
         and status_code not in _NEVER_RECOVERABLE_STATUSES
     )
-    retry_after, reset_at = _reset_window(text) if recoverable else (None, None)
+    retry_after, reset_at = _reset_window(text, now) if recoverable else (None, None)
     reset_reported = recoverable and (retry_after is not None or reset_at is not None)
     if kind == REFUSAL_CAUSE_NOT_DISTINGUISHED:
         # A bare 401/403: name the status and say explicitly that the response

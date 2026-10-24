@@ -19,6 +19,7 @@ from . import (
     needfix_store,
     quality_evidence,
     review_lifecycle,
+    runtime_adapters,
     sqlite_readonly,
     task_engine,
     task_store,
@@ -305,7 +306,20 @@ _REVIEWER_MECHANICAL_TERMINAL_STATES = frozenset({
     "output_budget_exceeded", "blocked", "timed_out", "cancelled", "canceled",
 })
 
+# Account limits bar every model on the adapter; the route-scoped provider_quota class does not.
+_ACCOUNT_LIMIT_FAILURE_CLASS = "provider_account_limit"
+_ACCOUNT_LIMIT_REFUSAL_STEMS = tuple(
+    f"{runtime_adapters.OUTCOME_PROVIDER_REFUSED}_{kind}"
+    for kind in (
+        runtime_adapters.REFUSAL_SESSION_LIMIT,
+        runtime_adapters.REFUSAL_QUOTA_EXHAUSTED,
+        runtime_adapters.REFUSAL_RATE_LIMITED,
+    )
+)
+
+# First-match wins: the account-limit class must precede provider_quota and provider_refusal.
 _REVIEWER_FAILURE_CLASS_MARKERS = (
+    (_ACCOUNT_LIMIT_FAILURE_CLASS, _ACCOUNT_LIMIT_REFUSAL_STEMS),
     ("provider_credit", ("monthly_credit_limit", "credit_limit", "insufficient_credit")),
     ("provider_quota", ("quota", "rate_limit")),
     ("provider_refusal", ("refusal", "refused", "rejected_by_provider")),
@@ -514,6 +528,12 @@ def route_attempt_hold(failure_reason: Any) -> str:
 def _route_attempt_was_pre_provider_hold(failure_reason: Any) -> bool:
     """Whether a typed launch receipt proved no provider process was started."""
     return _PRE_PROVIDER_HOLD_MARKER in str(failure_reason or "")
+
+
+def reviewer_route_account_limited(failure_reason: Any) -> bool:
+    """Whether a retired attempt's persisted reason carries the account-limit failure class."""
+    tokens = [token.strip() for token in str(failure_reason or "").split(":")]
+    return _ACCOUNT_LIMIT_FAILURE_CLASS in tokens
 
 
 def reviewer_recovery_dispatch(
@@ -3108,12 +3128,16 @@ class ReviewOrchestrator:
         # turn-protocol code indicts the ADAPTER, not just the one model that
         # happened to be ranked, so the next attempt excludes every route on
         # that adapter -- not only the exact (runner, adapter_id, model) tried.
+        # A rate, quota or session limit indicts the whole provider account the same way.
         excluded_adapters = frozenset(
             str(row["adapter_id"])
             for row in attempts
             if row["state"] == "retired"
-            and terminal_failure_classification.reviewer_route_behaviour_code(
-                row["failure_reason"]
+            and (
+                terminal_failure_classification.reviewer_route_behaviour_code(
+                    row["failure_reason"]
+                )
+                or reviewer_route_account_limited(row["failure_reason"])
             )
         )
         route = self._select_attempt_route(
