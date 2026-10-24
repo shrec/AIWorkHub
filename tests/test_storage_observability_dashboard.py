@@ -423,18 +423,22 @@ def test_stale_persisted_storage_snapshot_is_visible_during_refresh(tmp_path, mo
         encoding="utf-8",
     )
     release = threading.Event()
+    refresh_finished = threading.Event()
 
     def slow_refresh(_root: Path) -> dict:
-        release.wait(1.0)
+        # Blocked until the test releases it; the timeout only avoids a hang.
+        release.wait(10.0)
+        refresh_finished.set()
         return {**payload, "managed_total_bytes": 777777}
 
     monkeypatch.setattr(storage_observability, "_measure", slow_refresh)
     storage_observability._reset_cache_for_tests()
     try:
-        started = time.monotonic()
         result = storage_observability.snapshot(repo)
 
-        assert time.monotonic() - started < 0.1
+        # Ordering, not wall-clock: the refresh only finishes after the test
+        # sets ``release``, so the read returned without waiting for it.
+        assert not refresh_finished.is_set()
         assert result["scan_status"] == "refreshing"
         assert result["managed_total_bytes"] == 654321
     finally:
