@@ -38,8 +38,8 @@ def _host_executable(path: Path) -> Path:
 
 
 def _clear_secret_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("AIWORKHUB_TOOLCHAIN_AUTHORITY_HMAC_KEY", raising=False)
-    monkeypatch.delenv("AIWORKHUB_TOOLCHAIN_AUTHORITY_SECRET", raising=False)
+    for name in toolchain_authority._SECRET_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
 
 
 def test_authority_secret_prefers_environment_secret(
@@ -434,3 +434,89 @@ def test_git_index_change_drops_stale_tracked_path_decision(tmp_path: Path) -> N
         item.kind == "worker_workspace" and "tests/new_case.py" in item.value
         for item in second.missing
     )
+
+
+def test_authority_secret_with_reason_key_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_secret_env(monkeypatch)
+
+    secret, why = toolchain_authority._authority_secret_with_reason(
+        tmp_path, create=False
+    )
+    assert secret == b""
+    assert why == "key_absent"
+
+
+def test_authority_secret_with_reason_runtime_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_secret_env(monkeypatch)
+
+    def raise_runtime_error(key_path: Path) -> bytes:
+        raise RuntimeError("terminal_authority_key_dacl_hardening_failed:acl_write")
+
+    monkeypatch.setattr(
+        toolchain_authority.terminal_authority,
+        "load_or_create_key",
+        raise_runtime_error,
+    )
+
+    secret, why = toolchain_authority._authority_secret_with_reason(
+        tmp_path, create=True
+    )
+    assert secret == b""
+    assert why == "terminal_authority_key_dacl_hardening_failed:acl_write"
+    assert toolchain_authority._authority_secret(tmp_path, create=True) == b""
+
+
+def test_authority_secret_with_reason_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_secret_env(monkeypatch)
+
+    def raise_permission_error(key_path: Path) -> bytes:
+        raise PermissionError(13, "denied", str(tmp_path / "k"))
+
+    monkeypatch.setattr(
+        toolchain_authority.terminal_authority,
+        "load_or_create_key",
+        raise_permission_error,
+    )
+
+    secret, why = toolchain_authority._authority_secret_with_reason(
+        tmp_path, create=True
+    )
+    assert secret == b""
+    assert why.startswith("PermissionError:errno=13")
+    assert str(tmp_path) not in why
+
+
+def test_authority_receipt_reports_secret_unavailable_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_secret_env(monkeypatch)
+
+    def raise_runtime_error(key_path: Path) -> bytes:
+        raise RuntimeError("terminal_authority_key_dacl_hardening_failed:acl_write")
+
+    monkeypatch.setattr(
+        toolchain_authority.terminal_authority,
+        "load_or_create_key",
+        raise_runtime_error,
+    )
+
+    card = {
+        **_card(),
+        "task_id": "TASK_SECRET_UNAVAILABLE",
+        "request_id": "secret-unavailable-request",
+    }
+    snapshot = _authority(tmp_path).evaluate(card)
+    with pytest.raises(
+        ValueError,
+        match=(
+            "^validation_toolchain_authority_secret_unavailable:"
+            "terminal_authority_key_dacl_hardening_failed"
+        ),
+    ):
+        toolchain_authority.authority_receipt(snapshot, card)

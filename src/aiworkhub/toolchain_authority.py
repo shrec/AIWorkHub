@@ -422,18 +422,29 @@ def _decode_secret(value: str) -> bytes:
     return raw.encode("utf-8", errors="surrogateescape")
 
 
-def _authority_secret(repo: Path, *, create: bool) -> bytes:
+def _authority_secret_with_reason(
+    repo: Path, *, create: bool
+) -> tuple[bytes, str]:
     for name in _SECRET_ENV_VARS:
         secret = _decode_secret(os.environ.get(name, ""))
         if len(secret) >= 16:
-            return secret
+            return secret, ""
     key_path = repo / _SECRET_RELATIVE
     if not create and not key_path.exists():
-        return b""
+        return b"", "key_absent"
     try:
-        return terminal_authority.load_or_create_key(key_path)
-    except (OSError, RuntimeError):
-        return b""
+        return terminal_authority.load_or_create_key(key_path), ""
+    except RuntimeError as exc:
+        return b"", str(exc)
+    except OSError as exc:
+        return (
+            b"",
+            f"{type(exc).__name__}:errno={exc.errno}:winerror={getattr(exc, 'winerror', None)}",
+        )
+
+
+def _authority_secret(repo: Path, *, create: bool) -> bytes:
+    return _authority_secret_with_reason(repo, create=create)[0]
 
 
 def _receipt_card_identity(card: Mapping[str, Any]) -> str:
@@ -1176,9 +1187,9 @@ def authority_receipt(
         "missing": [fact.as_dict() for fact in snapshot.missing],
         "executables": [fact.as_dict() for fact in snapshot.executables],
     }
-    secret = _authority_secret(Path(snapshot.repository), create=True)
+    secret, why = _authority_secret_with_reason(Path(snapshot.repository), create=True)
     if not secret:
-        raise ValueError("validation_toolchain_authority_secret_unavailable")
+        raise ValueError(f"validation_toolchain_authority_secret_unavailable:{why}")
     receipt[_RECEIPT_MAC_KEY] = _receipt_mac(
         secret, receipt, str(receipt["card_identity"])
     )
@@ -1254,9 +1265,9 @@ def _receipt_tamper_code(receipt: Mapping[str, Any], repo: Path, card: Mapping[s
     )
     if str(receipt.get("request_id") or "") != request_id:
         return "validation_toolchain_authority_receipt_request_id_mismatch"
-    secret = _authority_secret(repo.resolve(), create=False)
+    secret, why = _authority_secret_with_reason(repo.resolve(), create=False)
     if not secret:
-        return "validation_toolchain_authority_secret_unavailable"
+        return f"validation_toolchain_authority_secret_unavailable:{why}"
     expected = _receipt_mac(secret, receipt, str(receipt.get("card_identity") or ""))
     if not hmac.compare_digest(str(receipt.get(_RECEIPT_MAC_KEY) or ""), expected):
         return "validation_toolchain_authority_receipt_mac_mismatch"
@@ -1328,9 +1339,9 @@ def _verified_receipt_snapshot(
     for key, expected in expected_scalars.items():
         if str(receipt.get(key) or "") != expected:
             raise ValueError(f"validation_toolchain_authority_receipt_{key}_mismatch")
-    secret = _authority_secret(authority.repo, create=False)
+    secret, why = _authority_secret_with_reason(authority.repo, create=False)
     if not secret:
-        raise ValueError("validation_toolchain_authority_secret_unavailable")
+        raise ValueError(f"validation_toolchain_authority_secret_unavailable:{why}")
     expected_mac = _receipt_mac(secret, receipt, str(expected_scalars["card_identity"]))
     if not hmac.compare_digest(str(receipt.get(_RECEIPT_MAC_KEY) or ""), expected_mac):
         raise ValueError("validation_toolchain_authority_receipt_mac_mismatch")
