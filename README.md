@@ -372,9 +372,9 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.65
+## What's new in 0.12.66
 
-- A worker's worktree now survives a restart, power loss, network drop or expired token until its card is closed, and a retried launch waits for the network and keeps its original timeout; the dashboard no longer resends the full manager contract on every call, a well-proven skill is no longer blocked by one resolved bad report, and the fallback MCP server lists tools exactly as FastMCP does.
+- A worker edits a line range in one call and is told up front which validation tests its card is missing and which preflight calls are still required; a Source Graph file query returns an exact line range, blocked cards get a read-only triage, the manager loop starts a fresh session at 100k context tokens, and an older build can no longer delete a worktree a newer build decided to keep.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Continuous Audit as a Service (CAAS)

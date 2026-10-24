@@ -1,5 +1,15 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.66 — 2026-10-24
+
+### Added
+
+- Bundled runtime 0.12.66: one-call semantic edit by anchored line range (NF-2026-01667); advisory contract advice for missing validation tests and ratchet headroom (NF-2026-01669); exit_preflight asks only for still-required MCP calls (NF-2026-01666); read-only triage of blocked cards (NF-2026-01673); manager-loop rotation at 100k context tokens (NF-2026-01677); exact line ranges from Source Graph file queries (NF-2026-01595).
+
+### Fixed
+
+- A superseded build never removes a worktree a newer build retained, and a read-only server writes no retention marker (NF-2026-01675).
+
 ## 0.12.65 — 2026-10-23
 
 ### Fixed

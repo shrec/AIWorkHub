@@ -6,6 +6,22 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.66] - 2026-10-24
+
+### Added
+
+- `aiworkhub_worker_semantic_edit_apply` edits in one call: `file_path`, `start_line`, `end_line` and both exact anchor lines take the place of a prepared `target_id`, and a repeated call replays through the target it bound (NF-2026-01667).
+- `needfix_preview_convert` and task creation return an advisory `contract_advice` report: the tests Source Graph relates to the card's production paths that no validation command names, which of them the card cannot write, and the `src/aiworkhub` files within 30 lines of the module-size ratchet (NF-2026-01669).
+- `exit_preflight` asks only for the MCP calls the post-exit launch gate will still require; the coordinator seals the required and launch-credited tools into the worker contract packet at launch (NF-2026-01666).
+- `task_stale_recovery_recommend` accepts `scope="blocked"`: one read-only recommendation per blocked card (archive, supersede, replay, relaunch or keep) with a one-sentence reason naming its evidence (NF-2026-01673).
+- The manager loop also rotates once the last call's context reaches `rotate_at_tokens` (default 100k, `AIWORKHUB_MANAGER_ROTATE_AT_TOKENS`), so a 1M-token route no longer re-bills ~750k tokens every turn (NF-2026-01677).
+- A Source Graph `file` query of `<start>-<end>` with an exact file target returns those lines plus a 20-line margin instead of the file head; reviewers read omitted hunks this way (NF-2026-01595).
+
+### Fixed
+
+- A build whose worktree retention rule a newer build has superseded never removes a worktree: the rule version lives in a max-only runtime marker raised on ledger writes and on sweeps over an existing ledger, and a read-only server writes none (NF-2026-01675).
+- The canonical tree is back under its own development-rule and module-size ratchets.
+
 ## [0.12.65] - 2026-10-23
 
 ### Fixed
