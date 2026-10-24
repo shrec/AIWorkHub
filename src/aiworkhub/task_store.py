@@ -5319,6 +5319,45 @@ def apply_validation_amendment(card: dict[str, Any], commands: list[str]) -> lis
     return applied
 
 
+def apply_allowed_writes_amendment(
+    card: dict[str, Any],
+    paths: list[str],
+    *,
+    actor: str,
+    request_id: str,
+) -> list[str]:
+    """Add-only, deduped append to allowed_writes; records actor and request_id."""
+    if not paths:
+        return []
+    allowed = card.get("allowed_writes")
+    writes_list = list(allowed) if isinstance(allowed, list) else []
+    seen = {_normalize_write_path(entry) for entry in writes_list}
+    applied: list[str] = []
+    for raw in paths:
+        path = str(raw or "").strip()
+        key = _normalize_write_path(path)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        writes_list.append(path)
+        applied.append(path)
+    from . import task_templates
+    if len(writes_list) > task_templates.MAX_PATHS_PER_FIELD:
+        raise ValueError("allowed_writes_amendment_exceeds_limit")
+    if applied:
+        amendments = card.get("allowed_writes_amendments")
+        amendment_list = list(amendments) if isinstance(amendments, list) else []
+        amendment_list.append({
+            "paths": list(applied),
+            "actor": actor,
+            "request_id": request_id,
+            "at": datetime.now(timezone.utc).isoformat(),
+        })
+        card["allowed_writes"] = writes_list
+        card["allowed_writes_amendments"] = amendment_list
+    return applied
+
+
 def _candidate_path_in_scope(path: object, allowed_writes: Sequence[object]) -> bool:
     return (
         isinstance(path, str)

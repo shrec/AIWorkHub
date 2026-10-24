@@ -3354,6 +3354,7 @@ def aiworkhub_task_reject_review(
     predecessor_request_id: str | None = None,
     failure_category: InfrastructureFailureCategory | None = None,
     validation_amendment: list[str] | None = None,
+    allowed_writes_amendment: list[str] | None = None,
     include_card: CardInclude = "none",
     lesson_candidate: str | None = None,
     promote_ai_memory: bool = False,
@@ -3372,6 +3373,9 @@ def aiworkhub_task_reject_review(
     ``failure_category`` is a verified-manager escape hatch for a mechanical
     review failure. It is accepted only with ``to=blocked`` and only from the
     closed infrastructure taxonomy, so it cannot relabel candidate code.
+
+    ``allowed_writes_amendment`` (a list of repo-relative paths) widens the
+    card's ``allowed_writes`` add-only and is accepted only with ``to=pending``.
 
     ``reason`` is capped at 8000 UTF-8 bytes after strip; over it the call is
     refused with ``reject_reason_too_large:<bytes>><cap>`` and nothing changes.
@@ -3417,6 +3421,8 @@ def aiworkhub_task_reject_review(
         kwargs["failure_category"] = failure_category
     if validation_amendment is not None:
         kwargs["validation_amendment"] = validation_amendment
+    if allowed_writes_amendment:
+        kwargs["allowed_writes_amendment"] = allowed_writes_amendment
     result = core.reject_review(**kwargs)
     card = _envelope_card(result)
     extra = (

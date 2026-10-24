@@ -18,7 +18,7 @@ from collections import OrderedDict, defaultdict
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Mapping, Sequence
 
 
@@ -3814,6 +3814,33 @@ def task_card_path_conflicts(card: dict[str, Any]) -> list[dict[str, str]]:
     return conflicts
 
 
+def bounded_strings(value: list[str] | None, name: str, *, required: bool = False) -> list[str]:
+    if not isinstance(value, list) or (required and not value) or len(value) > 128:
+        raise ValueError(f"invalid_{name}")
+    result: list[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if not text or len(text) > 1000:
+            raise ValueError(f"invalid_{name}")
+        result.append(text)
+    return result
+
+
+def _allowed_write_path_error(item: str) -> dict[str, Any] | None:
+    path = Path(item)
+    if path.is_absolute() or ".." in path.parts:
+        return _lifecycle_error("invalid_allowed_write_path", 2)
+    # NF-2026-00266: a directory in allowed_writes passes creation but cannot
+    # be promoted -- promotion materializes exact declared files, so a
+    # directory scope silently discards the worker's work at the end. Reject
+    # it at creation with the reason instead of carrying it to promotion.
+    if item.endswith("/") or (repo_root() / path).is_dir():
+        result = _lifecycle_error("allowed_write_is_directory", 2)
+        result["allowed_write"] = item[:240]
+        return result
+    return None
+
+
 _OBJECTIVE_PATH_TOKEN_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9_]+")
 # A ``scheme://host/a/b.py`` link in objective prose is never an in-repo path,
 # yet its host+path tail (``host/a/b.py``) matches the path-token regex above and
@@ -4392,17 +4419,6 @@ def create_task(
         result["limits"] = {"title": title_limit, "objective": objective_limit}
         return result
 
-    def bounded_strings(value: list[str] | None, name: str, *, required: bool = False) -> list[str]:
-        if not isinstance(value, list) or (required and not value) or len(value) > 128:
-            raise ValueError(f"invalid_{name}")
-        result: list[str] = []
-        for item in value:
-            text = str(item or "").strip()
-            if not text or len(text) > 1000:
-                raise ValueError(f"invalid_{name}")
-            result.append(text)
-        return result
-
     from . import task_templates
 
     if (
@@ -4766,17 +4782,9 @@ def create_task(
             task_templates.validation_command_head_warnings(validation_command)
         )
     for item in writes2:
-        path = Path(item)
-        if path.is_absolute() or ".." in path.parts:
-            return _lifecycle_error("invalid_allowed_write_path", 2)
-        # NF-2026-00266: a directory in allowed_writes passes creation but cannot
-        # be promoted -- promotion materializes exact declared files, so a
-        # directory scope silently discards the worker's work at the end. Reject
-        # it at creation with the reason instead of carrying it to promotion.
-        if item.endswith("/") or (repo_root() / path).is_dir():
-            result = _lifecycle_error("allowed_write_is_directory", 2)
-            result["allowed_write"] = item[:240]
-            return result
+        path_error = _allowed_write_path_error(item)
+        if path_error is not None:
+            return path_error
     conflicts = task_card_path_conflicts({
         "objective": objective,
         "validation": validation2,
@@ -6442,6 +6450,52 @@ def _validate_validation_amendment_commands(commands: list[str]) -> dict[str, An
     return None
 
 
+_AMENDMENT_RESERVED_WRITE_ROOTS = (".git", ".aiworkhub/runtime")
+
+
+def _validate_allowed_writes_amendment_paths(
+    card: dict[str, Any], paths: list[str]
+) -> dict[str, Any] | None:
+    """Refuse what task_create refuses, plus reserved roots and the card's forbidden matches."""
+    try:
+        writes = bounded_strings(paths, "allowed_writes", required=True)
+    except ValueError as exc:
+        return _lifecycle_error(str(exc), 2)
+    for item in writes:
+        # Path.is_absolute() depends on the host OS; the card outlives the host.
+        portable = PurePosixPath(item.replace("\\", "/"))
+        if (
+            "\x00" in item
+            or portable.is_absolute()
+            or PureWindowsPath(item).drive
+            or ".." in portable.parts
+        ):
+            return _lifecycle_error("invalid_allowed_write_path", 2)
+        probe = portable.as_posix().lower()
+        # fnmatch's * crosses "/", so a glob whose literal prefix still leads
+        # into a reserved root (".gi*/config") can match paths under it.
+        cut = min((probe.find(ch) for ch in "*?[" if ch in probe), default=len(probe))
+        for reserved in _AMENDMENT_RESERVED_WRITE_ROOTS:
+            if _paths_overlap(probe, reserved, glob_aware=True) or (
+                cut < len(probe) and f"{reserved}/".startswith(probe[:cut])
+            ):
+                result = _lifecycle_error("allowed_write_reserved_path", 2)
+                result["allowed_write"] = item[:240]
+                result["reserved_root"] = reserved
+                return result
+        path_error = _allowed_write_path_error(item)
+        if path_error is not None:
+            return path_error
+    conflicts = task_card_path_conflicts(
+        {"forbidden": card.get("forbidden"), "allowed_writes": writes}
+    )
+    if conflicts:
+        result = _lifecycle_error("contradictory_task_path_contract", 2)
+        result["conflicts"] = conflicts
+        return result
+    return None
+
+
 def reject_review(
     task_id: str,
     reason: str,
@@ -6451,6 +6505,7 @@ def reject_review(
     predecessor_request_id: str | None = None,
     failure_category: str | None = None,
     validation_amendment: list[str] | None = None,
+    allowed_writes_amendment: list[str] | None = None,
 ) -> dict[str, Any]:
     card, error = _live_card(task_id)
     if error:
@@ -6481,6 +6536,15 @@ def reject_review(
         amendment_error = _validate_validation_amendment_commands(amendment_commands)
         if amendment_error is not None:
             return amendment_error
+    amendment_paths = allowed_writes_amendment or []
+    if amendment_paths:
+        if disposition != "pending":
+            return _lifecycle_error("allowed_writes_amendment_requires_pending")
+        amendment_paths_error = _validate_allowed_writes_amendment_paths(
+            card, amendment_paths
+        )
+        if amendment_paths_error is not None:
+            return amendment_paths_error
     actor = _verified_manager_actor()
     blocked = _canonical_write_gate(
         "reject-review", runner=CODEX_RUNNER, topic=str(live_topic), coordinator_capability=True
@@ -7120,6 +7184,21 @@ def reject_review(
             command=command,
         )
     try:
+        applied_allowed_writes_amendment = (
+            task_store.apply_allowed_writes_amendment(
+                card, amendment_paths, actor=actor, request_id=rejected_request_id
+            )
+            if amendment_paths
+            else []
+        )
+    except ValueError as exc:
+        return _canonical_result(
+            ok=False,
+            returncode=1,
+            stderr=f"invalid_allowed_writes_amendment:{exc}",
+            command=command,
+        )
+    try:
         conn = _canonical_connect()
     except task_store.TaskStoreError as exc:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
@@ -7179,6 +7258,8 @@ def reject_review(
     )
     if amendment_commands:
         result["validation_amendment_applied"] = applied_validation_amendment
+    if amendment_paths:
+        result["allowed_writes_amendment_applied"] = applied_allowed_writes_amendment
     if rework_delta_reuse_error is not None:
         result["rework_delta_recovery"] = {
             "schema_id": "aiworkhub.rework_delta_recovery.v1",
