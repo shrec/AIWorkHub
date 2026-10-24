@@ -270,12 +270,19 @@ def test_process_manager_records_its_rule_version_and_never_lowers_a_newer_one(
     tmp_path, monkeypatch
 ):
     manager = _rig(tmp_path, monkeypatch)
+    # Construction and a sweep over no ledger write nothing (the stdio smoke no-write gate, whose
+    # startup reconciler sweeps); the first ledger write records it.
+    manager._gc_finalized_workspaces()
+    assert not (tmp_path / RULE_MARKER_NAME).exists()
+    manager._append_event({"request_id": "req-nf01675-first", "state": "running"})
     assert json.loads((tmp_path / RULE_MARKER_NAME).read_text(encoding="utf-8")) == {
         "schema_id": RULE_MARKER_SCHEMA_ID, "version": MINE,
     }
 
     record_rule_version(tmp_path, MINE + 3)
-    _manager(manager.repo, tmp_path)
+    _manager(manager.repo, tmp_path)._append_event(
+        {"request_id": "req-nf01675-second", "state": "running"},
+    )
 
     assert read_recorded_rule_version(tmp_path) == MINE + 3
 
@@ -295,7 +302,7 @@ def test_sweep_removes_nothing_once_a_newer_rule_is_recorded(tmp_path, monkeypat
     (tmp_path / RULE_MARKER_NAME).unlink()
     assert manager._gc_finalized_workspaces()["gc_cleaned"] == 1
     assert not path.exists() and not home.exists()
-    # The sweep re-records its own version, so a lost construction-time marker is restored.
+    # The sweep re-records its own version, so a lost marker is restored.
     assert read_recorded_rule_version(tmp_path) == MINE
 
 
