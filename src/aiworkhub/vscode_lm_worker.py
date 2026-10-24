@@ -1564,7 +1564,14 @@ def run(spec_path: Path) -> dict[str, Any]:
                 "protocol_preview": str(diagnostics.get("protocol_preview") or "")[:768],
                 "turn_trace": list(diagnostics.get("turn_trace") or [])[-16:],
             }
-            detail = f":diagnostics={json.dumps(bounded, ensure_ascii=True, separators=(',', ':'))[:2048]}"
+            text = json.dumps(bounded, ensure_ascii=True, separators=(",", ":"))
+            while len(text) > 2048 and bounded["turn_trace"]:
+                bounded["turn_trace"].pop(0)
+                text = json.dumps(bounded, ensure_ascii=True, separators=(",", ":"))
+            while len(text) > 2048 and bounded["protocol_preview"]:
+                bounded["protocol_preview"] = bounded["protocol_preview"][:-1]
+                text = json.dumps(bounded, ensure_ascii=True, separators=(",", ":"))
+            detail = f":diagnostics={text}"
         raise RuntimeError(f"vscode_lm_request_failed:{response.get('error')}{detail}")
     raw_text = str(response.get("text") or "")
     try:
