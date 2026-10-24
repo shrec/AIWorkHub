@@ -6100,7 +6100,7 @@ def finalization_preflight_probe_nonblocking(
 def _canonical_worktree_delta_paths(repo: Path) -> list[str]:
     """Return the bounded tracked/untracked delta of the live canonical tree."""
 
-    tracked = _run(["git", "diff", "--name-only", "-z", "HEAD"], cwd=repo)
+    tracked = _run(["git", "diff", "--name-only", "--no-renames", "-z", "HEAD"], cwd=repo)
     if tracked.returncode != 0:
         raise WorkspaceError(f"combined_tree_git_diff_failed:{tracked.stderr[:300]}")
     untracked = _run(
