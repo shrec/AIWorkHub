@@ -4309,6 +4309,67 @@ def test_the_shim_patches_nothing_unless_it_is_sitecustomize():
     assert ntpath._getfinalpathname is final
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="named pipes are a Windows namespace")
+def test_appcontainer_site_rewrites_pipe_addresses_into_local_namespace():
+    """NF-2026-01689: asyncio and multiprocessing name pipes with mktemp; an
+    AppContainer may create them only under the pipe LOCAL namespace."""
+    import warnings
+
+    path = os.path.join(wac.APPCONTAINER_PYTHON_SITE, "sitecustomize.py")
+    with open(path, encoding="utf-8") as handle:
+        source = handle.read()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        compile(source, path, "exec")
+
+    pipe = "\\\\.\\pipe\\"
+    code = (
+        "import asyncio.windows_utils, tempfile\n"
+        f"print(asyncio.windows_utils.tempfile.mktemp(prefix=r'{pipe}x-'))\n"
+        "print(tempfile.mktemp(prefix='plain-'))\n"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = wac.APPCONTAINER_PYTHON_SITE
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    first, second = completed.stdout.splitlines()[:2]
+    assert first.startswith(pipe + "LOCAL\\x-")
+    assert "pipe" not in second
+    assert completed.stderr == ""
+
+    # The string check never creates a pipe; asyncio's subprocess transport
+    # does (duplex stdin plus stdout/stderr), which is what the container denies.
+    real = (
+        "import asyncio, sys\n"
+        "async def main():\n"
+        "    proc = await asyncio.create_subprocess_exec(\n"
+        "        sys.executable, '-c', 'print(1)',\n"
+        "        stdin=asyncio.subprocess.PIPE,\n"
+        "        stdout=asyncio.subprocess.PIPE,\n"
+        "        stderr=asyncio.subprocess.PIPE,\n"
+        "    )\n"
+        "    out, _ = await proc.communicate()\n"
+        "    sys.stdout.write(out.decode().strip())\n"
+        "asyncio.run(main())\n"
+    )
+    spawned = subprocess.run(
+        [sys.executable, "-c", real],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert spawned.returncode == 0, spawned.stderr[-2000:]
+    assert spawned.stdout == "1"
+
+
 @requires_host_win32_privileges
 @windows_only
 def test_the_shim_mkdir_0o700_inherits_the_parent_dacl(tmp_path):

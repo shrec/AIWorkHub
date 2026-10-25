@@ -158,3 +158,19 @@ if __name__ == "sitecustomize":
     os.lstat = _brokered(_lstat, _facts)
     if os.environ.get(_SCRATCH_ENV) and os.environ.get("TMPDIR"):
         os.environ["TEMP"] = os.environ["TMP"] = os.environ["TMPDIR"]
+
+    import tempfile
+
+    # NF-2026-01689: an AppContainer may create named pipes only under the pipe
+    # LOCAL namespace; asyncio and multiprocessing build theirs with mktemp.
+    _pipe = r"\\.\pipe" + os.sep
+    _pipe_local = _pipe + "LOCAL" + os.sep
+    _mktemp = tempfile.mktemp
+
+    def _mktemp_local_pipe(suffix="", prefix=tempfile.template, dir=None):
+        if isinstance(prefix, str) and prefix.startswith(_pipe):
+            if not prefix.startswith(_pipe_local):
+                prefix = _pipe_local + prefix[len(_pipe):]
+        return _mktemp(suffix, prefix, dir)
+
+    tempfile.mktemp = _mktemp_local_pipe
