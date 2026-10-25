@@ -1478,9 +1478,11 @@ def _reviewer_lens_coverage(
 
 
 # A reviewer in any of these states can never report for its lens, so it is
-# never reused: the lens it was launched for still needs a reviewer.
+# never reused: the lens it was launched for still needs a reviewer. An
+# archived reviewer was rejected by the manager, live or sealed, so its report
+# must not be handed back as the lens's reviewer either.
 _REVIEWER_REUSE_EXCLUDED_STATES = _REVIEWER_FAILED_STATES | frozenset({
-    "superseded", "retired", "rejected",
+    "superseded", "retired", "rejected", "archived",
 })
 # Ledger states of a finished reviewer whose sealed report may be reused. The
 # chain auto-accepts a clean reviewer's own card, moving its ledger state from
