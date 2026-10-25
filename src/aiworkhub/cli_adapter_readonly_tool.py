@@ -496,6 +496,15 @@ def plan_command_readonly(
     the write gate. Also runs the B107 collision preflight (``would_collide`` /
     ``collision_preflight``): a plain read of the task-card JSONL, no lock, no
     claim, no mutation.
+
+    Args:
+        task_id: Task id the plan is for; echoed in the plan and checked by the collision preflight, which reports would_collide when an active held claim already exists for this id.
+        runner: Runner name the plan is for; the collision preflight reports would_collide when this runner already holds a claim on a different active task.
+        topic: Task topic, echoed in the plan; it plays no part in the collision preflight.
+        adapter_id: Id of the CLI adapter the command belongs to; echoed in the plan unchanged.
+        argv: Command argument vector to validate against the static allowlist, binary first; an empty, manual-only or non-allowlisted vector is reported as blocked. Nothing is run.
+        env: Optional environment as a name-to-value object; echoed only as redacted_env, where every value is redacted. Omit for none.
+        repo: Optional repository to scope the read to; omit to use the server's bound repository.
     """
     plan = dryrun.plan_dryrun(
         task_id=task_id,
@@ -525,6 +534,10 @@ def audit_summary_readonly(max_entries: int = 100, *, repo: Any = None) -> dict[
     writes, never launches). Adds the read-only authority flags for a
     consistent contract shape. Env values are absent from audit entries by
     construction, so this output is safe to log.
+
+    Args:
+        max_entries: Number of newest audit-log entries to list in last_entries; default 100, zero or less lists none. Counts always cover the whole log.
+        repo: Optional repository to scope the read to; omit to use the server's bound repository.
     """
     summary = core.read_audit_log(max_entries=max_entries, repo=repo)
     summary["readonly"] = True
@@ -543,7 +556,18 @@ def readonly_tool_report(
     max_audit_entries: int = 20,
     repo: Any = None,
 ) -> dict[str, Any]:
-    """One read-only call returning BOTH a validated plan and an audit summary."""
+    """One read-only call returning BOTH a validated plan and an audit summary.
+
+    Args:
+        task_id: Task id the plan is for; echoed in the plan and checked by the collision preflight, which reports would_collide when an active held claim already exists for this id.
+        runner: Runner name the plan is for; the collision preflight reports would_collide when this runner already holds a claim on a different active task.
+        topic: Task topic, echoed in the plan; it plays no part in the collision preflight.
+        adapter_id: Id of the CLI adapter the command belongs to; echoed in the plan unchanged.
+        argv: Command argument vector to validate against the static allowlist, binary first; an empty, manual-only or non-allowlisted vector is reported as blocked. Nothing is run.
+        env: Optional environment as a name-to-value object; echoed only as redacted_env, where every value is redacted. Omit for none.
+        max_audit_entries: Number of newest audit-log entries to list in the audit summary; default 20, zero or less lists none. Counts always cover the whole log.
+        repo: Optional repository to scope the read to; omit to use the server's bound repository.
+    """
     return {
         "ok": True,
         "mode": "mcp_readonly_cli_plan_tool_no_process_launch",

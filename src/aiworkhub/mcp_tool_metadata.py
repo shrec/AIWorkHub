@@ -112,7 +112,7 @@ def split_docstring(doc: str | None) -> tuple[str, dict[str, str]]:
             continue
         kept.append(line)
         i += 1
-    return "\n".join(kept), params
+    return "\n".join(kept).rstrip(), params
 
 
 def derive_annotations(tool_name: str, description: str) -> dict[str, Any] | None:

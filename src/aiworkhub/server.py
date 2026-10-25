@@ -1222,6 +1222,11 @@ def aiworkhub_manager_bootstrap(
     ``task_hygiene``/``task_health`` and replaced by the names omitted plus the
     block's sha256/bytes, so nothing silently disappears; the verdicts and
     counts beside them stay exact. ``include_diagnostics=true`` keeps them.
+
+    Args:
+        include_contract: true re-delivers the full contract prose even when it was already delivered this session; default false.
+        known_contract_sha256: contract_sha256 from an earlier reply, proving you already hold that contract so its prose stays suppressed; omit if you do not hold it.
+        include_diagnostics: true keeps the full task_hygiene and task_health diagnostic bodies on a reply that suppresses the contract; default false folds them to the omitted names plus sha256 and bytes.
     """
 
     reply = core.manager_bootstrap(
@@ -1257,7 +1262,16 @@ def aiworkhub_manager_semantic_edit_prepare(
     expected_first_line: str | None = None,
     expected_last_line: str | None = None,
 ) -> dict[str, Any]:
-    """MANAGER EDIT: bind one verified file range before changing it."""
+    """MANAGER EDIT: bind one verified file range before changing it.
+
+    Args:
+        file_path: Repo-relative path of an existing UTF-8 file; absolute paths, parent-directory escapes, .git and .aiworkhub are refused.
+        start_line: First line of the range to bind, 1-based and inclusive.
+        end_line: Last line of the range to bind, 1-based and inclusive.
+        include_fragment: true forces the range text into the reply even if an earlier prepare already delivered the same unchanged range; default false.
+        expected_first_line: Exact text of the range's first line; a mismatch refuses the prepare and reports the real line. Omit to skip the check.
+        expected_last_line: Exact text of the range's last line; a mismatch refuses the prepare and reports the real line. Omit to skip the check.
+    """
 
     return manager_ai_tools.semantic_edit_prepare(
         file_path=file_path,
@@ -1280,6 +1294,12 @@ def aiworkhub_manager_semantic_edit_apply(
 
     `new` replaces the WHOLE prepared range; re-emit every line you keep.
     allow_escape_level_change: true only for an intentional regex/escape fix.
+
+    Args:
+        target_id: Target id returned by aiworkhub_manager_semantic_edit_prepare for the range being replaced.
+        new: Replacement text for the WHOLE prepared range; re-emit every line you keep.
+        idempotency_key: Caller-chosen key; replaying the same key with the same content is a no-op.
+        allow_escape_level_change: true only for an intentional regex/escape fix; otherwise a re-emitted line whose backslash level changed is refused.
     """
 
     return manager_ai_tools.semantic_edit_apply(
@@ -1301,7 +1321,18 @@ def aiworkhub_manager_source_graph_query(
     bundle_type: worker_ai_tools_mcp.SourceGraphBundleType = "explore",
     workflow_stage: worker_ai_tools_mcp.WorkflowStage = "unspecified",
 ) -> dict[str, Any]:
-    """MANAGER CODE DISCOVERY: use first and continuously before built-in file search."""
+    """MANAGER CODE DISCOVERY: use first and continuously before built-in file search.
+
+    Args:
+        mode: Lookup to run: focus, slice, context, file, function, class, body, bodygrep, impact, trace, deps, bundle, or an analytic report (hotspots, churn, testmap, calls, ...).
+        query: What to look up, non-blank, at most 512 bytes; its meaning depends on mode. In file mode with an exact file target, a 1-based start-end line range returns those lines plus a 20-line margin.
+        budget: Size budget for the reply; default 64, clamped to 8-160.
+        target: Optional scope, at most 256 bytes: an exact symbol (bare name or file.symbol) for slice, body and function modes, otherwise a path prefix; omit for unscoped.
+        cursor: Page token for analytic modes and bodygrep only (at most 64 bytes, 4096 for bodygrep): pass the previous next_cursor back unchanged; other modes refuse it.
+        continuation_cursor: Signed token, at most 1024 bytes, from a previous page of the same query whose response exceeded the output cap; not a bodygrep cursor.
+        bundle_type: Used only by bundle mode: bugfix, feature, refactor, audit, optimize or explore (default).
+        workflow_stage: Stage of the work this query supports: orientation, implementation, validation, review, rework or unspecified (default; the server infers the stage).
+    """
 
     return manager_ai_tools.source_graph_query(
         mode=mode, query=query, budget=budget, target=target,
@@ -1314,56 +1345,92 @@ def aiworkhub_manager_source_graph_query(
 def aiworkhub_manager_session_current_state(
     topic: str = "management", limit: int = 12
 ) -> dict[str, Any]:
-    """MANAGER READ: bounded canonical Session Manager current state."""
+    """MANAGER READ: bounded canonical Session Manager current state.
+
+    Args:
+        topic: Session topic to read, cut at 128 characters; default management. Falls back to the manager's own thread, then to documents that mention the topic.
+        limit: Maximum session documents to return, newest first; default 12, clamped to 1-20.
+    """
 
     return manager_ai_tools.session_current_state(topic=topic, limit=limit)
 
 
 @mcp.tool()
 def aiworkhub_manager_ai_memory_search(query: str, limit: int = 8) -> dict[str, Any]:
-    """MANAGER READ: bounded canonical AI Memory search."""
+    """MANAGER READ: bounded canonical AI Memory search.
+
+    Args:
+        query: Words to search active AI Memories for, non-blank, at most 512 bytes; any word may match and results are ranked by how many do.
+        limit: Maximum memories to return; default 8, clamped to 1-10.
+    """
 
     return manager_ai_tools.ai_memory_search(query=query, limit=limit)
 
 
 @mcp.tool()
 def aiworkhub_manager_ai_memory_get(key: str) -> dict[str, Any]:
-    """MANAGER READ: exact active canonical AI Memory lookup."""
+    """MANAGER READ: exact active canonical AI Memory lookup.
+
+    Args:
+        key: Exact AI Memory key, at most 256 bytes; returns the newest active memory stored under it.
+    """
 
     return manager_ai_tools.ai_memory_get(key=key)
 
 
 @mcp.tool()
 def aiworkhub_manager_ai_memory_related(key: str) -> dict[str, Any]:
-    """MANAGER READ: bounded related canonical AI Memory lookup."""
+    """MANAGER READ: bounded related canonical AI Memory lookup.
+
+    Args:
+        key: Exact key of the AI Memory to find related memories for, non-blank, at most 256 bytes; returns up to 8 other active memories sharing a tag.
+    """
 
     return manager_ai_tools.ai_memory_related(key=key)
 
 
 @mcp.tool()
 def aiworkhub_manager_kb_search(query: str, limit: int = 8) -> dict[str, Any]:
-    """MANAGER READ: bounded canonical KB search."""
+    """MANAGER READ: bounded canonical KB search.
+
+    Args:
+        query: Words to search active KB entries for, non-blank, at most 512 bytes; any word may match and results are ranked by how many do.
+        limit: Accepted for signature stability but ignored; a search always returns at most 8 entries.
+    """
 
     return manager_ai_tools.kb_search(query=query, limit=limit)
 
 
 @mcp.tool()
 def aiworkhub_manager_kb_get(key: str) -> dict[str, Any]:
-    """MANAGER READ: exact canonical KB entry lookup."""
+    """MANAGER READ: exact canonical KB entry lookup.
+
+    Args:
+        key: Exact KB entry key, non-blank, at most 256 bytes; only an active entry is returned.
+    """
 
     return manager_ai_tools.kb_get(key=key)
 
 
 @mcp.tool()
 def aiworkhub_manager_kb_related(key: str) -> dict[str, Any]:
-    """MANAGER READ: bounded canonical KB relation lookup."""
+    """MANAGER READ: bounded canonical KB relation lookup.
+
+    Args:
+        key: Exact key of the KB entry to find related entries for, non-blank, at most 256 bytes; related means a shared tag or a recorded link.
+    """
 
     return manager_ai_tools.kb_related(key=key)
 
 
 @mcp.tool()
 def aiworkhub_manager_context_graph_search(query: str, limit: int = 12) -> dict[str, Any]:
-    """MANAGER READ: search exact transcript-backed Context Graph evidence."""
+    """MANAGER READ: search exact transcript-backed Context Graph evidence.
+
+    Args:
+        query: Words to find in recorded conversation events, non-blank, at most 2048 bytes; all terms (up to 12) must match, with a substring fallback on content and source_ref.
+        limit: Maximum matching events to return; default 12, clamped to 1-50.
+    """
 
     return manager_ai_tools.context_graph_search(query=query, limit=limit)
 
@@ -1372,7 +1439,14 @@ def aiworkhub_manager_context_graph_search(query: str, limit: int = 12) -> dict[
 def aiworkhub_manager_context_graph_range(
     thread_id: str, around_event_id: int, before: int = 5, after: int = 5,
 ) -> dict[str, Any]:
-    """MANAGER READ: retrieve an exact bounded transcript range around one event."""
+    """MANAGER READ: retrieve an exact bounded transcript range around one event.
+
+    Args:
+        thread_id: Conversation thread the event belongs to: letters, digits and _ . : -, starting with a letter or digit, at most 256 characters.
+        around_event_id: Positive integer id of the center event within thread_id.
+        before: Events to include before the center; default 5, clamped to 0-50.
+        after: Events to include after the center; default 5, clamped to 0-50.
+    """
 
     return manager_ai_tools.context_graph_range(
         thread_id=thread_id, around_event_id=around_event_id, before=before, after=after,
@@ -1381,7 +1455,12 @@ def aiworkhub_manager_context_graph_range(
 
 @mcp.tool()
 def aiworkhub_manager_context_graph_related(node_id: str, limit: int = 20) -> dict[str, Any]:
-    """MANAGER READ: retrieve bounded deterministic relations for one graph node."""
+    """MANAGER READ: retrieve bounded deterministic relations for one graph node.
+
+    Args:
+        node_id: Context Graph node id to list relations for, non-blank, at most 512 bytes.
+        limit: Maximum relations to return, newest source event first; default 20, clamped to 1-50.
+    """
 
     return manager_ai_tools.context_graph_related(node_id=node_id, limit=limit)
 
@@ -1396,7 +1475,17 @@ def aiworkhub_manager_context_graph_event_write(
     task_id: str = "",
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """MANAGER WRITE: append one exact current-thread conversation event."""
+    """MANAGER WRITE: append one exact current-thread conversation event.
+
+    Args:
+        role: Speaker role: user, assistant, tool, system, manager or worker.
+        event_type: Event kind label, 1-256 characters: letters, digits and _ . : -, starting with a letter or digit.
+        content: Event text, at most 64 KiB; may be empty.
+        source_ref: Where the event came from, non-blank, at most 2048 bytes.
+        idempotency_key: 8-192 characters matching ^[A-Za-z0-9][A-Za-z0-9_.:-]{7,191}$; replaying a key returns the stored event instead of appending again.
+        task_id: Task the event relates to, same character rule as event_type; default empty for none.
+        metadata: JSON object with extra fields, at most 16 KiB once serialized; default none.
+    """
 
     return manager_ai_tools.context_graph_event_write(
         role=role,
@@ -1430,6 +1519,9 @@ def aiworkhub_manager_workforce_catalog(full: bool = False) -> dict[str, Any]:
     absent, never invented) -- beside ``detail_omitted`` (bytes/sha256 of the canonical
     JSON of the full worker list) and a ``detail_request`` naming the full
     call (NF-2026-01566).  An error result passes through untouched.
+
+    Args:
+        full: True returns every worker field plus outcome history; default False folds each worker to one compact row.
     """
 
     result = manager_ai_tools.workforce_catalog_read()
@@ -1498,6 +1590,15 @@ def aiworkhub_manager_workforce_rank(
     candidates are reduced to a count per exclusion reason plus the first
     10 as worker_id/adapter_id/model. ``detail="evidence"`` behaves like
     ``"full"``: both return today's payload exactly.
+
+    Args:
+        task_id: Id of the task the ranking is for; must be non-blank.
+        kinds: Work kinds the task needs, from mechanical, code, research, linguistic and review; at least one, and a worker must support every kind listed.
+        risk: Task risk: low, medium (default), high or critical; workers whose max_risk is lower are excluded.
+        context_tokens: Estimated context the task needs in tokens, default 0 for no requirement; workers with a smaller max_context_tokens are excluded.
+        tool_needs: Tools or capabilities the task needs, default none; workers lacking one are excluded.
+        quality_floor: Minimum quality from 0.0 to 1.0 (clamped), default 0.0; workers whose quality_ceiling is below it are excluded.
+        detail: summary (default) shrinks non-selected candidates to short rows; evidence and full both return the complete payload.
     """
 
     refusal = _detail_refusal(detail)
@@ -1532,6 +1633,12 @@ def aiworkhub_manager_task_decomposition_preview(
 
     This operation never creates or launches tasks. The returned digest is an
     advisory proposal that requires a separate explicit manager decision.
+
+    Args:
+        parent_task_id: Id of the task being decomposed: letters, digits and _ . : -, starting with a letter or digit, at most 256 characters.
+        objective: What the decomposition should achieve, non-blank, at most 4000 characters.
+        source_graph_receipt: A successful aiworkhub_manager_source_graph_query result in impact or deps mode for this repository, passed back unchanged; the children's evidence_refs must come from it.
+        children: 2 to 16 objects, each with task_id, title, objective, allowed_writes, required_outputs, evidence_refs and optional depends_on; write scopes must not overlap.
     """
 
     return manager_ai_tools.task_decomposition_preview(
@@ -1561,6 +1668,14 @@ def aiworkhub_manager_session_write(
     FTS row and its graph mirror (audit keeps the fact of the redaction,
     never the content).  Both require ``document_id`` and leave the document
     count/id audit trail truthful.
+
+    Args:
+        action: start, event, checkpoint, state, handoff or close appends a new document; amend rewrites one existing document and redact deletes it.
+        topic: Session topic the document belongs to, non-blank, at most 256 bytes.
+        content: Document text, non-blank, at most 32 KiB; optional for redact.
+        idempotency_key: 8-192 characters matching ^[A-Za-z0-9][A-Za-z0-9_.:-]{7,191}$; replaying a key returns the stored result instead of writing again.
+        provenance: Non-blank provenance text recorded in the audit row, at most 2048 bytes.
+        document_id: Positive id of the existing document to amend or redact; required for those two actions and refused for the append actions.
     """
 
     return manager_ai_tools.session_write(
@@ -1580,7 +1695,17 @@ def aiworkhub_manager_ai_memory_write(
     tags: str = "",
     scope: str = "project",
 ) -> dict[str, Any]:
-    """MANAGER WRITE: remember, update, supersede, or archive canonical memory."""
+    """MANAGER WRITE: remember, update, supersede, or archive canonical memory.
+
+    Args:
+        action: remember adds a memory for a key with no active one, update changes the active one, supersede stores a new row and marks the old one superseded, archive retires it.
+        key: Memory key, non-blank, at most 256 bytes; update, supersede and archive need an active memory under it.
+        idempotency_key: 8-192 characters matching ^[A-Za-z0-9][A-Za-z0-9_.:-]{7,191}$; replaying a key returns the first result instead of writing again.
+        provenance: Non-blank provenance text recorded in the audit row, at most 2048 bytes.
+        value: Memory text, at most 32 KiB; required except for archive.
+        tags: Tag string, at most 1024 bytes; default empty.
+        scope: Memory scope, non-blank, at most 64 bytes; default project.
+    """
 
     return manager_ai_tools.ai_memory_write(
         action=action, key=key, value=value, tags=tags, scope=scope,
@@ -1601,7 +1726,20 @@ def aiworkhub_manager_kb_write(
     source_refs: str = "",
     replacement_key: str = "",
 ) -> dict[str, Any]:
-    """MANAGER WRITE: upsert, ingest, supersede, or archive canonical KB data."""
+    """MANAGER WRITE: upsert, ingest, supersede, or archive canonical KB data.
+
+    Args:
+        action: upsert or ingest creates or updates the entry for key, supersede stores a new entry under replacement_key and marks the old one superseded, archive retires the entry.
+        key: KB entry key, non-blank, at most 256 bytes.
+        idempotency_key: 8-192 characters matching ^[A-Za-z0-9][A-Za-z0-9_.:-]{7,191}$; replaying a key returns the first result instead of writing again.
+        provenance: Non-blank provenance text recorded in the audit row, at most 2048 bytes.
+        title: Entry title, at most 1024 bytes; required except for archive.
+        body: Entry text, at most 32 KiB; required except for archive.
+        category: Category label, at most 128 bytes; default empty.
+        tags: Tag string, at most 1024 bytes; default empty.
+        source_refs: Source references for the entry, at most 2048 bytes; default empty.
+        replacement_key: Key of the new entry that supersedes key, at most 256 bytes and not already in use; required for supersede.
+    """
 
     return manager_ai_tools.kb_write(
         action=action, key=key, title=title, body=body, category=category,
@@ -1656,6 +1794,23 @@ def aiworkhub_manager_learning_commit(
     LONG FORM (compatibility): supply repo_area, outcome, evidence_ids,
     idempotency_key and provenance yourself and nothing is resolved. The lesson
     text is always the caller's; nothing is written without this call.
+
+    Args:
+        task_id: Id of the card whose accepted or rejected decision this learning commit records.
+        request_id: Id of the judged worker request, as carried by the learning_commit_owed payload of the accept/reject reply.
+        repo_area: Repository-relative area the lesson concerns, at most 256 bytes with no absolute path, .., backslash or colon; omit to derive it from the decision's paths.
+        outcome: accepted, rejected or inconclusive; omit to read it from the card's own adjudication. Only accepted and rejected may promote.
+        evidence_ids: Evidence ids, each starting with file:, http: or https: (a sha256: receipt id is refused); omit to resolve them from the card's sealed acceptance reference.
+        idempotency_key: 8-192 characters matching ^[A-Za-z0-9][A-Za-z0-9_.:-]{7,191}$; omit to use the deterministic key from the learning_commit_owed payload.
+        provenance: Non-blank provenance text recorded with the commit, at most 2048 bytes; omit to use the deterministic string from the learning_commit_owed payload.
+        root_cause_candidate: Candidate root cause to record with the commit; default empty.
+        invariant_candidate: Candidate invariant to record with the commit; promote_kb needs it. Default empty.
+        lesson_candidate: Lesson text to record with the commit; promote_ai_memory needs it. Default empty.
+        edge_candidates: Context Graph edges to propose, each an object with string keys source, target (different, at most 256 each) and relation (at most 64); promote_context_graph needs one.
+        promote_ai_memory: True also promotes the lesson to AI Memory; needs outcome accepted or rejected, a lesson_candidate and an evidence id. Default false.
+        promote_context_graph: True also promotes edge_candidates to the Context Graph; needs outcome accepted and an evidence id. Default false.
+        promote_kb: True also promotes the invariant to the KB; needs outcome accepted or rejected, an invariant_candidate and an evidence id. Default false.
+        extra_evidence_ids: Further evidence ids merged into the resolved or supplied evidence_ids, with the same allowed schemes; default none.
     """
 
     resolution: dict[str, Any] = {}
@@ -1831,7 +1986,12 @@ def aiworkhub_manager_needfix_markdown_preview(
     source_paths: list[str] | None = None,
     follow_links: bool = True,
 ) -> dict[str, Any]:
-    """MANAGER READ: preview bounded captured NeedFix candidates from Markdown."""
+    """MANAGER READ: preview bounded captured NeedFix candidates from Markdown.
+
+    Args:
+        source_paths: Repository-relative Markdown files to read; omit to use the built-in default sources. The count must stay within the intake limit.
+        follow_links: True (default) also reads Markdown files linked from the sources, within the intake's source limits; false reads only the sources.
+    """
 
     return manager_ai_tools.needfix_markdown_preview(
         source_paths=source_paths,
@@ -1845,7 +2005,13 @@ def aiworkhub_manager_needfix_markdown_commit(
     source_paths: list[str] | None = None,
     follow_links: bool = True,
 ) -> dict[str, Any]:
-    """MANAGER WRITE: commit an exact Markdown preview as captured items only."""
+    """MANAGER WRITE: commit an exact Markdown preview as captured items only.
+
+    Args:
+        preview_id: preview_id returned by aiworkhub_manager_needfix_markdown_preview for the same source_paths and follow_links; any other value is refused as preview_identity_mismatch.
+        source_paths: Repository-relative Markdown files, exactly as given to the preview; omit when the preview used the built-in default sources.
+        follow_links: Whether Markdown files linked from the sources are read too; it must match the preview, default true.
+    """
 
     return manager_ai_tools.needfix_markdown_commit(
         source_paths=source_paths,
@@ -1868,7 +2034,21 @@ def aiworkhub_manager_workforce_upsert(
     quality_ceiling: float = 1.0,
     manager_score_adjustment: float = 0.0,
 ) -> dict[str, Any]:
-    """MANAGER WRITE: audited bounded upsert of one repository worker model."""
+    """MANAGER WRITE: audited bounded upsert of one repository worker model.
+
+    Args:
+        worker_id: Id of the worker to create or update, ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$; an existing id is updated in place, at most 64 workers exist.
+        adapter_id: Adapter that runs the worker; it must be one that repository policy allows.
+        model: Model name, ^[A-Za-z0-9][A-Za-z0-9_.:/+-]{0,127}$.
+        provider: Provider name in the same format as worker_id; stored lowercased.
+        supports: Non-empty list of task kinds the worker can take: mechanical, code, research, linguistic, review.
+        tools: Tool names the worker has, matched against a task's tool needs; default none.
+        enabled: False keeps the worker in the catalog but disabled; default true.
+        max_context_tokens: Largest context in tokens the worker can take, 0-10,000,000; tasks needing more exclude it; default 0.
+        max_risk: Highest task risk tier the worker may take: low, medium, high or critical; default medium.
+        quality_ceiling: Highest quality floor the worker can meet, a float in [0, 1]; tasks demanding more exclude it; default 1.0.
+        manager_score_adjustment: Manager adjustment added to the worker's routing success score, in percentage points from -20 to 20; default 0.0.
+    """
 
     return manager_ai_tools.workforce_upsert(worker={
         "worker_id": worker_id,
@@ -1895,7 +2075,17 @@ def aiworkhub_manager_context_import(
     provenance: str = "",
     limit: int = 10_000,
 ) -> dict[str, Any]:
-    """MANAGER: dry-run, apply or rollback one explicit repo-local legacy context store."""
+    """MANAGER: dry-run, apply or rollback one explicit repo-local legacy context store.
+
+    Args:
+        component: Legacy store to import: session (transcript documents), memory (AI memory) or kb (KB entries).
+        operation: dry_run only plans the import, apply inserts only new rows, rollback removes only the rows the named import run created.
+        source_path: Repository-relative path of an existing SQLite file; no absolute path, .., symlink or .aiworkhub hub path; required for dry_run and apply.
+        idempotency_key: Required for apply, 8-192 characters matching ^[A-Za-z0-9][A-Za-z0-9_.:-]{7,191}$; replaying a key returns the stored report.
+        import_id: Id of the import run to roll back, as returned by its apply, in the same format as idempotency_key; required for rollback.
+        provenance: Non-blank provenance text recorded with the import, cut to 2048 characters; required for apply and rollback.
+        limit: Maximum source rows allowed, default 10000, clamped to 1-100000; a source with more rows is refused.
+    """
 
     return manager_ai_tools.context_import(
         component=component,
@@ -1910,7 +2100,11 @@ def aiworkhub_manager_context_import(
 
 @mcp.tool()
 def aiworkhub_manager_context_write_intents(request_id: str) -> dict[str, Any]:
-    """MANAGER READ: inspect authenticated worker context-write proposals."""
+    """MANAGER READ: inspect authenticated worker context-write proposals.
+
+    Args:
+        request_id: Id of the worker request whose authenticated context-write proposals to list.
+    """
 
     return process_launcher.default_manager().context_write_intents(request_id)
 
@@ -1922,7 +2116,14 @@ def aiworkhub_manager_context_write_intent_dispose(
     decision: Literal["accepted", "rejected"],
     reason: str,
 ) -> dict[str, Any]:
-    """MANAGER WRITE: explicitly accept or reject one worker proposal."""
+    """MANAGER WRITE: explicitly accept or reject one worker proposal.
+
+    Args:
+        request_id: Id of the worker request whose context-write proposal is being decided; its task must be in review state.
+        intent_id: 64-character lowercase hex id of one proposal, as returned by aiworkhub_manager_context_write_intents.
+        decision: accepted applies the proposed write, rejected does not; repeating the same decision is idempotent, the opposite one is refused.
+        reason: Non-blank justification recorded with the decision, at most 2048 UTF-8 bytes.
+    """
 
     return process_launcher.default_manager().dispose_context_write_intent(
         request_id, intent_id, decision=decision, reason=reason,
@@ -1984,6 +2185,22 @@ def aiworkhub_manager_skill_propose(
     without overwriting the stored record. It is never ACTIVE on creation:
     activation needs accepted evidence from two DISTINCT actor identities and
     stays a separate manager decision.
+
+    Args:
+        identity: Skill identity, ^[a-z][a-z0-9_.-]{0,127}$; required unless candidate_id supplies it.
+        version: Skill version, semver MAJOR.MINOR.PATCH with optional -prerelease/+build; required unless candidate_id supplies it.
+        scope: Where the skill applies, repository or global; required unless candidate_id supplies it.
+        task_family: Kind of work the skill covers: analysis, bugfix, data_ml, docs, implementation, performance, refactor, replay, security or test; always caller-supplied.
+        path_or_symbol: Repository-relative path or symbol the skill concerns; absolute paths and .. are refused; required unless candidate_id supplies it.
+        risk: Risk level, low, medium, high or critical; required unless candidate_id supplies it.
+        stage: Workflow stage, orientation, implementation, validation, review or rework; required unless candidate_id supplies it.
+        triggers: Conditions that select the skill, from the trigger vocabulary under CLOSED VOCABULARIES in this tool's description; other values are refused.
+        confidence: Your confidence in the skill, a finite float in [0, 1]; default 0.0.
+        applicability: Surfaces the skill applies to, from the applicability vocabulary under CLOSED VOCABULARIES in this tool's description; default none.
+        procedure_steps: Steps the skill prescribes, as a list of strings; default none.
+        avoid_rules: Things the skill says to avoid, as a list of strings; default none.
+        preferred_tools: Tools the skill prefers, as a list of strings; default none.
+        candidate_id: Candidate id from aiworkhub_manager_skill_mine; identity, version, scope, path_or_symbol, risk and stage are then copied from it and a conflicting value is refused; default empty.
     """
 
     return manager_skill_tools.propose(
@@ -2033,6 +2250,15 @@ def aiworkhub_manager_skill_add_evidence(
     When ``resolve_negative_source`` is set, no row is appended: the one
     unresolved negative row with that source is marked resolved instead, with
     ``note`` as the REQUIRED reason (``source`` and ``outcome`` are ignored).
+
+    Args:
+        identity: Identity of the skill to add evidence to, as shown by aiworkhub_manager_skill_usage.
+        version: Version of that skill identity the evidence applies to.
+        source: Non-blank evidence anchor the entry rests on, for example a task card id; ignored when resolve_negative_source is set.
+        outcome: Result the entry records, accepted or negative; ignored when resolve_negative_source is set.
+        actor_id: Manager identity filing the entry, ^[a-z][a-z0-9_.-]{0,127}$ without the reserved tokens worker, reviewer, coordinator, agent or owner.
+        note: Free-text note stored with the entry; default empty. It is the required reason when resolve_negative_source is set.
+        resolve_negative_source: Source of the unresolved negative row to mark resolved, with note as the required reason, instead of appending a row; default empty appends.
     """
 
     if resolve_negative_source:
@@ -2070,6 +2296,9 @@ def aiworkhub_manager_skill_usage(min_accepted_evidence: int = 2) -> dict[str, A
       lifecycle_state_is_proposed_not_active
 
     Read-only. It never activates, retires or evidences anything.
+
+    Args:
+        min_accepted_evidence: Accepted-evidence threshold, default 2; it is only echoed back in the report and does not change any per-skill figure.
     """
 
     return manager_skill_tools.usage(min_accepted_evidence=min_accepted_evidence)
@@ -2081,6 +2310,10 @@ def aiworkhub_manager_skill_activate(identity: str, version: str) -> dict[str, A
 
     The registry's activation threshold is enforced unchanged; when it is unmet
     the registry's own reason is returned and the stored record is left as it was.
+
+    Args:
+        identity: Identity of the skill to activate, as shown by aiworkhub_manager_skill_usage.
+        version: Version of that skill identity to activate; it must still be in the proposed state.
     """
 
     return manager_skill_tools.activate(identity=identity, version=version)
@@ -2107,6 +2340,12 @@ def aiworkhub_manager_skill_mine(
     reaches the store only if a manager passes it to
     ``aiworkhub_manager_skill_propose``, and activation remains gated on
     evidence from two distinct actor identities.
+
+    Args:
+        threshold: Similarity threshold for grouping correction statements into rule families; default 0.22. Higher values yield fewer, tighter families.
+        min_cards: Minimum distinct cards a family must recur across to become a candidate; default 3.
+        min_files: Minimum distinct files a family must recur across to become a candidate; default 3.
+        include_sensitivity: True (default) also returns how the family count changes across the 0.18-0.30 thresholds; false omits that curve.
     """
 
     return manager_skill_tools.mine(
@@ -2134,6 +2373,10 @@ def aiworkhub_manager_skill_retirement_report(
     Summary mode (default) folds each skill's ``evidence_anchors`` list to
     ``{count, sha256}`` (digest of its canonical JSON); ``full=true`` returns
     the anchor-card lists unchanged.
+
+    Args:
+        min_anchors: Minimum resolvable evidence-anchor cards a skill needs before it can get a verdict other than insufficient_evidence; default 3.
+        full: True returns each skill's complete evidence_anchors card list; default false folds it to a count and sha256.
     """
 
     report = manager_skill_tools.retirement_report(min_anchors=min_anchors)
@@ -2177,6 +2420,10 @@ def aiworkhub_manager_skill_evidence_sweep(
     identity/version this window's evidence pushed across the registry's own
     two-actor activation gate). A second sweep over an unchanged window
     records nothing new and activates nothing twice.
+
+    Args:
+        limit: Maximum learning commits processed in this call; the default is also the ceiling, and larger values are clamped to it.
+        cursor: The next_cursor returned by a previous sweep, to continue after the last commit it processed; blank starts from the first commit.
     """
 
     return manager_skill_tools.sweep_learning_commit_evidence(limit=limit, cursor=cursor)
@@ -2220,7 +2467,12 @@ def _manager_loop_repo_root(
 
 @mcp.tool()
 def aiworkhub_manager_loop_start(backend_id: str, model: str) -> dict[str, Any]:
-    """MANAGER WRITE: open the repository's one manager agent loop session."""
+    """MANAGER WRITE: open the repository's one manager agent loop session.
+
+    Args:
+        backend_id: Id of the manager backend route to run the session on; required, non-blank.
+        model: Model id on that backend; required, non-blank.
+    """
 
     root, refusal = _manager_loop_repo_root(launching=True)
     if refusal is not None:
@@ -2260,7 +2512,12 @@ def aiworkhub_manager_loop_restore() -> dict[str, Any]:
 
 @mcp.tool()
 def aiworkhub_manager_loop_rename(session_id: str, title: str) -> dict[str, Any]:
-    """MANAGER WRITE: rename one saved manager conversation."""
+    """MANAGER WRITE: rename one saved manager conversation.
+
+    Args:
+        session_id: Id of the saved manager conversation to rename; a malformed id is refused as session_id_invalid.
+        title: New display name; whitespace is collapsed and the text is cut to 80 characters.
+    """
 
     root, refusal = _manager_loop_repo_root(launching=True)
     if refusal is not None:
@@ -2270,7 +2527,11 @@ def aiworkhub_manager_loop_rename(session_id: str, title: str) -> dict[str, Any]
 
 @mcp.tool()
 def aiworkhub_manager_loop_discard(session_id: str) -> dict[str, Any]:
-    """MANAGER WRITE: delete one saved manager conversation."""
+    """MANAGER WRITE: delete one saved manager conversation.
+
+    Args:
+        session_id: Id of the saved manager conversation to delete; refused while a turn is running.
+    """
 
     root, refusal = _manager_loop_repo_root(launching=True)
     if refusal is not None:
@@ -2288,6 +2549,11 @@ def aiworkhub_manager_loop_continue(
     session and the persisted selection. A picked backend_id/model is
     authorized and pinned on it without starting it; the pick renews the
     manager seat. Refused while a turn is running.
+
+    Args:
+        session_id: Id of the saved manager conversation to continue; a malformed id is refused as session_id_invalid.
+        backend_id: Backend route id picked in the panel; give it together with model to pin that route on the conversation, or leave both blank to pin no route.
+        model: Model id picked for backend_id; give both or neither.
     """
 
     root, refusal = _manager_loop_repo_root(launching=True)
@@ -2333,6 +2599,13 @@ def aiworkhub_manager_loop_send(
     ``images`` attaches up to 4 png/jpeg/gif/webp images, each
     ``{"name": ..., "data": <base64>}`` within 5 MiB; claude_cli and
     codex_cli read them, other backends refuse them as the turn's error.
+
+    Args:
+        text: The owner's message for this turn; it must be non-blank when images are attached.
+        backend_id: Backend route id chosen in the panel picker; give it together with model, or leave both blank to keep the policy-default route.
+        model: Model id chosen in the panel picker for backend_id; give both or neither.
+        reasoning: The owner's reasoning-depth choice for this turn; blank keeps the provider default.
+        images: Up to 4 png, jpeg, gif or webp images, each an object with name (file name) and data (base64 content), at most 5 MiB each; only claude_cli and codex_cli read them.
     """
 
     root, refusal = _manager_loop_repo_root(launching=True)
@@ -2352,6 +2625,9 @@ def aiworkhub_manager_loop_rotate(reason: str) -> dict[str, Any]:
     running is refused with ``manager_turn_in_progress`` and nothing is
     queued. The next ``aiworkhub_manager_loop_start`` opens a successor
     rehydrated from the handoff.
+
+    Args:
+        reason: Free-text reason recorded with the handoff request; whitespace is normalized, the text is cut to 200 characters, and a blank value is recorded as unspecified.
     """
 
     root, refusal = _manager_loop_repo_root(launching=True)
@@ -2379,6 +2655,11 @@ def aiworkhub_manager_loop_events(
     Events with seq greater than after_seq, bounded to limit, and ``partial``:
     the running turn's streamed, unfinished text for this session, or null.
     The partial is display only; it is never persisted or sent to a model.
+
+    Args:
+        session_id: Id of the manager loop session to read, as returned by aiworkhub_manager_loop_status.
+        after_seq: Return only events whose seq is greater than this value; default 0 starts from the first event. Pass the last seq already seen to poll incrementally.
+        limit: Maximum events to return; default 200.
     """
 
     root, refusal = _manager_loop_repo_root()
@@ -2419,6 +2700,9 @@ def aiworkhub_manager_recipe_register(manifest: dict[str, Any]) -> dict[str, Any
     is immutable.
 
     This registers a DESCRIPTION of an invocation. It never runs one.
+
+    Args:
+        manifest: The complete recipe payload as a JSON object, in the exact shape aiworkhub_manager_recipe_show returns; no field is inferred or defaulted.
     """
 
     return manager_recipe_tools.register(manifest=manifest)
@@ -2467,6 +2751,10 @@ def aiworkhub_manager_recipe_list(limit: int = 100, offset: int = 0) -> dict[str
     Returns each manifest's identity, digest, purpose, risk, capabilities and
     parameter signature -- never its argv template. An empty store is a
     legitimate repository state and returns ``registry_count`` zero.
+
+    Args:
+        limit: Maximum recipes to return; default 100, clamped to 1-1000.
+        offset: Number of recipes to skip before the first one returned, for paging; default 0.
     """
 
     return manager_recipe_tools.list_registered(limit=limit, offset=offset)
@@ -2493,6 +2781,10 @@ def aiworkhub_manager_recipe_usage(
     ``since`` is an ISO-8601 UTC timestamp bounding the evidence window;
     ``registered_count`` still covers every stored manifest, and ``window_only``
     marks the asymmetry.
+
+    Args:
+        limit: Maximum recipes to return; default 100, clamped to 1-1000.
+        since: ISO-8601 UTC timestamp bounding the run evidence to runs from that time onward; registered_count still covers every stored recipe. Omit to count runs of all time.
     """
 
     return manager_recipe_tools.usage(limit=limit, since=since)
@@ -2507,6 +2799,10 @@ def aiworkhub_manager_recipe_show(
     With ``version`` omitted the highest stored version wins, ordered by the
     registry's own version key. The returned ``manifest`` is exactly the payload
     the recipe digest hashes, so the reported digest is independently checkable.
+
+    Args:
+        recipe_id: Id of a persisted recipe, as listed by aiworkhub_manager_recipe_list.
+        version: Recipe version to show, as listed by aiworkhub_manager_recipe_list; omit for the highest stored version.
     """
 
     return manager_recipe_tools.show(recipe_id=recipe_id, version=version)
@@ -2534,6 +2830,12 @@ def aiworkhub_manager_recipe_run(
     explicit truncation flags, and the path plus SHA-256 of the full output
     file, so the whole stream stays retrievable without being carried here.
     Every run persists a ``tool_recipes`` invocation receipt.
+
+    Args:
+        recipe_id: Id of a persisted recipe, as listed by aiworkhub_manager_recipe_list.
+        version: Recipe version to run, as listed by aiworkhub_manager_recipe_list; omit to run the highest stored version.
+        params: Values for the recipe's typed argument slots, keyed by the slot names its manifest declares; omit when the recipe takes none.
+        grant_capabilities: Capabilities granted to this run; it must name every capability the recipe declares. Omit for a read-only recipe; a write or network recipe also needs the repository write gate open.
     """
 
     return manager_recipe_tools.run(
@@ -2550,7 +2852,13 @@ def aiworkhub_vscode_lm_worker_tool(
     tool_name: str,
     tool_input: dict[str, Any],
 ) -> dict[str, Any]:
-    """PRIVATE BRIDGE: execute one active GLM call with worker-scoped audit authority."""
+    """PRIVATE BRIDGE: execute one active GLM call with worker-scoped audit authority.
+
+    Args:
+        request_id: Id of the active worker request this call belongs to, 32 lowercase hex characters; any other value is refused with worker_bridge_request_id_invalid.
+        tool_name: Name of the tool the worker is calling.
+        tool_input: Arguments for that tool, as a JSON object.
+    """
 
     return process_launcher.default_manager().invoke_vscode_lm_worker_tool(
         request_id=request_id,
@@ -2581,6 +2889,10 @@ def aiworkhub_router_known_repositories(limit: int = 64, include_inactive: bool 
 
     This is discovery only.  Task storage and task mutation remain scoped to
     the current repository's own ``.aiworkhub`` MCP child.
+
+    Args:
+        limit: Maximum registry records to read, newest first; default 64, clamped to 1-256.
+        include_inactive: True also lists routes whose extension host is not alive or is stale; default false keeps only live routes and the current repository (the rest are summarized under inactive).
     """
 
     return _known_repositories(limit, include_inactive)
@@ -2588,7 +2900,12 @@ def aiworkhub_router_known_repositories(limit: int = 64, include_inactive: bool 
 
 @mcp.tool()
 def aiworkhub_repo_list(limit: int = 64, include_inactive: bool = False) -> dict[str, Any]:
-    """READ-ONLY: bounded live repository identities available to this manager."""
+    """READ-ONLY: bounded live repository identities available to this manager.
+
+    Args:
+        limit: Maximum registry records to read, newest first; default 64, clamped to 1-256.
+        include_inactive: True also lists routes whose extension host is not alive or is stale; default false keeps only live routes and the current repository (the rest are summarized under inactive).
+    """
 
     return _known_repositories(limit, include_inactive)
 
@@ -2602,7 +2919,11 @@ def aiworkhub_repo_current() -> dict[str, Any]:
 
 @mcp.tool()
 def aiworkhub_repo_switch(repo_id: str) -> dict[str, Any]:
-    """MANAGER OPERATION: atomically switch to one live manager-owned repo_id."""
+    """MANAGER OPERATION: atomically switch to one live manager-owned repo_id.
+
+    Args:
+        repo_id: Repository id of a live repository route (repo_ followed by 32 lowercase hex characters), taken from the repo_id field of aiworkhub_repo_list. A path is not accepted.
+    """
 
     return core.repository_switch(repo_id)
 
@@ -2623,35 +2944,109 @@ def _task_create_hint(description: str, examples: list[Any]) -> Any:
         return _StdioFieldHint(description, examples)
     from pydantic import Field
 
-    return Field(description=description, examples=examples)
+    return Field(description=description, examples=examples or None)
 
 
 @mcp.tool()
 @_serialize_task_lifecycle_write
 def aiworkhub_task_create(
-    task_id: str,
-    title: str,
-    runner: str,
-    topic: str,
-    objective: str,
-    acceptance: list[str],
-    allowed_writes: list[str],
-    forbidden: list[str] | None = None,
-    required_outputs: list[str] | None = None,
-    allow_empty_required_outputs: list[str] | None = None,
-    allow_unchanged_required_outputs: list[str] | None = None,
+    task_id: typing.Annotated[str, _task_create_hint(
+        "Unique card id: up to 256 characters of letters, digits, '_', '.', ':' or '-', "
+        "starting with a letter or digit. An existing id is never overwritten.",
+        ["EXPORT_RETRY_1"],
+    )],
+    title: typing.Annotated[str, _task_create_hint(
+        "Short card title, 1-300 characters.",
+        ["Add retry to the export job"],
+    )],
+    runner: typing.Annotated[str, _task_create_hint(
+        "Worker execution identity from aiworkhub_manager_workforce_rank "
+        "launch_contract.runner; up to 128 characters, same character set as task_id. "
+        "The value codex is reserved for the manager and rejected for worker cards.",
+        [],
+    )],
+    topic: typing.Annotated[str, _task_create_hint(
+        "Topic that groups related cards: up to 128 characters, same character set as task_id.",
+        ["export-reliability"],
+    )],
+    objective: typing.Annotated[str, _task_create_hint(
+        "What the worker must achieve, 1-4000 characters. Naming a forbidden path here is "
+        "refused as a contradiction.",
+        ["Retry transient storage errors in the export job up to three times."],
+    )],
+    acceptance: typing.Annotated[list[str], _task_create_hint(
+        "Acceptance criteria the finished work is reviewed against: 1-128 entries of up to "
+        "1000 characters each. Required.",
+        [["Export retries a transient storage error up to three times"]],
+    )],
+    allowed_writes: typing.Annotated[list[str], _task_create_hint(
+        "Repo-relative file paths or glob patterns the worker may write: up to 128 entries of up "
+        "to 1000 characters each; absolute paths, '..' and directories are refused. Empty only "
+        "together with read_only=true.",
+        [["src/app/export.py", "tests/test_export.py"]],
+    )],
+    forbidden: typing.Annotated[list[str] | None, _task_create_hint(
+        "Repo-relative paths or globs the worker must not touch, up to 128. A card whose "
+        "writes, outputs, inputs, objective or validation overlap one is refused. Omit for none.",
+        [["src/app/auth.py"]],
+    )] = None,
+    required_outputs: typing.Annotated[list[str] | None, _task_create_hint(
+        "Repo-relative file paths or glob patterns the finished work must change, each covered "
+        "by allowed_writes; up to 128. Put prose outcomes in acceptance, not here. Empty is "
+        "accepted only for read_only cards or where the matched template contract defaults it "
+        "empty.",
+        [["src/app/export.py"]],
+    )] = None,
+    allow_empty_required_outputs: typing.Annotated[list[str] | None, _task_create_hint(
+        "Exact repo-relative paths (no globs) of required outputs that may deliberately end up "
+        "zero bytes, each covered by required_outputs and allowed_writes. Never inferred.",
+        [["tests/fixtures/empty.txt"]],
+    )] = None,
+    allow_unchanged_required_outputs: typing.Annotated[list[str] | None, _task_create_hint(
+        "Exact repo-relative paths (no globs) of required outputs that may stay byte-identical "
+        "to both launch baselines, each listed exactly in required_outputs and allowed_writes. "
+        "Never inferred; use apply_contract_patch instead to name them by digest, never both.",
+        [["docs/export_contract.md"]],
+    )] = None,
     validation: typing.Annotated[list[str] | None, _task_create_hint(
         "shell-free executable commands, one per entry; no environment assignments, "
         "pipes, redirects, or command chaining. Set environment outside validation argv.",
         [["python -m pytest -q tests/test_example.py"]],
     )] = None,
-    priority: str = "normal",
-    task_type: str = "code",
-    depends_on: list[str] | None = None,
-    read_first: list[str] | None = None,
-    immutable_inputs: list[str] | None = None,
-    read_only: bool = False,
-    max_live_tokens: int | None = None,
+    priority: typing.Annotated[str, _task_create_hint(
+        "Scheduling priority: low, normal (default), high or critical. Case and surrounding "
+        "space are normalized.",
+        ["normal", "high"],
+    )] = "normal",
+    task_type: typing.Annotated[str, _task_create_hint(
+        "Card type: code (default; a writable code card must declare validation), "
+        "data_classification or research. Case and surrounding space are normalized.",
+        ["code", "research"],
+    )] = "code",
+    depends_on: typing.Annotated[list[str] | None, _task_create_hint(
+        "Other task_ids in this repo that must finish before this card is Plan-DAG ready. "
+        "Omit for no dependencies.",
+        [["EXPORT_RETRY_0"]],
+    )] = None,
+    read_first: typing.Annotated[list[str] | None, _task_create_hint(
+        "Repo-relative files the worker should read first, up to 128 entries of up to 1000 "
+        "characters each. Omit for none.",
+        [["src/app/export.py"]],
+    )] = None,
+    immutable_inputs: typing.Annotated[list[str] | None, _task_create_hint(
+        "Existing repo-relative files the worker may read but must not change. Omit for none.",
+        [["docs/export_contract.md"]],
+    )] = None,
+    read_only: typing.Annotated[bool, _task_create_hint(
+        "True for a card that deliberately writes nothing: allowed_writes and required_outputs "
+        "must then both be empty. Never inferred; default false.",
+        [False],
+    )] = False,
+    max_live_tokens: typing.Annotated[int | None, _task_create_hint(
+        "Exact live-token cap (1-100000000), only when the owner explicitly requests one. Omit "
+        "for uncapped; never estimate or infer a cap.",
+        [50000],
+    )] = None,
     work_kind: typing.Annotated[str, _task_create_hint(
         "Accepted work_kind values: " + ", ".join(quality_evidence.WORK_KINDS)
         + ". Case and surrounding space are normalized by core; never infer from prose.",
@@ -2664,26 +3059,68 @@ def aiworkhub_task_create(
         "data_ml=schema+distribution. Case and surrounding space are normalized by core.",
         [["reproduction", "regression"], ["generic"]],
     )] = None,
-    risk_tier: str | None = None,
+    risk_tier: typing.Annotated[str | None, _task_create_hint(
+        "Optional risk-tier floor: low, medium, high or critical. The observed write scope may "
+        "raise it but never lower it. Omit to derive it from the scope.",
+        ["high"],
+    )] = None,
     difficulty: typing.Annotated[str | None, _task_create_hint(
         "Accepted difficulty values: bounded, standard, complex. Optional; omitted remains "
         "undeclared, never inferred. Case and surrounding space are normalized by core.",
         ["standard", "bounded"],
     )] = None,
-    skill_task_family: str | None = None,
-    skill_stage: str | None = None,
-    skill_triggers: list[str] | None = None,
-    skill_applicability: list[str] | None = None,
-    skill_path_scope: str | None = None,
+    skill_task_family: typing.Annotated[str | None, _task_create_hint(
+        "Skill family: analysis, bugfix, data_ml, docs, implementation, performance, refactor, "
+        "replay, security or test; an unknown token is refused. Derivable from the template and "
+        "the write set, so it may be omitted.",
+        ["implementation"],
+    )] = None,
+    skill_stage: typing.Annotated[str | None, _task_create_hint(
+        "Worker workflow stage to select skills for: orientation, implementation, validation, "
+        "review or rework (not the card status); an unknown token is refused. Not derivable: "
+        "omitting skill_stage, skill_triggers and skill_applicability selects no skill.",
+        ["implementation"],
+    )] = None,
+    skill_triggers: typing.Annotated[list[str] | None, _task_create_hint(
+        "Observable conditions that make a skill relevant, from a closed vocabulary (e.g. "
+        "code_change, public_api, security_sensitive, concurrency); at most 16, an unknown token "
+        "is refused. Not derivable.",
+        [["code_change", "public_api"]],
+    )] = None,
+    skill_applicability: typing.Annotated[list[str] | None, _task_create_hint(
+        "Surface kinds a skill applies to, from a closed vocabulary (e.g. quality_gate, "
+        "public_api_surface, security_surface, storage_schema_surface); at most 16, an unknown "
+        "token is refused. Not derivable.",
+        [["public_api_surface"]],
+    )] = None,
+    skill_path_scope: typing.Annotated[str | None, _task_create_hint(
+        "Repo-relative path or symbol that scopes skill selection; absolute paths and '..' are "
+        "refused. Derivable from the write set, so it may be omitted.",
+        ["src/app/export.py"],
+    )] = None,
     custom_template_escape: typing.Annotated[str | None, _task_create_hint(
         "Explicit audited escape token: " + task_templates.AUDITED_CUSTOM_ESCAPE
         + ". Only for deliberately audited unclassified cards, not an automatic bypass. "
         "Writable escaped cards require non-empty required_outputs covered by allowed_writes.",
         [task_templates.AUDITED_CUSTOM_ESCAPE],
     )] = None,
-    apply_contract_patch: str | None = None,
-    echo_card: bool = False,
-    wave_goal_binding: dict[str, Any] | None = None,
+    apply_contract_patch: typing.Annotated[str | None, _task_create_hint(
+        "sha256 digest of a contract patch a finalizer already published; it supplies "
+        "allow_unchanged_required_outputs by reference and is never applied automatically. "
+        "Naming both the digest and allow_unchanged_required_outputs is refused. Omit for none.",
+        [],
+    )] = None,
+    echo_card: typing.Annotated[bool, _task_create_hint(
+        "Set true to return the full CLI envelope with the persisted card in stdout instead of "
+        "the compact creation receipt. Default false.",
+        [False],
+    )] = False,
+    wave_goal_binding: typing.Annotated[dict[str, Any] | None, _task_create_hint(
+        "Exactly {roadmap_id, goal_id, predecessor_task_id}: makes this card the active wave "
+        "goal's current task in place of the predecessor. Never inferred; a malformed binding is "
+        "refused. Omit for none.",
+        [{"roadmap_id": "RM-2026-00001", "goal_id": "G1", "predecessor_task_id": "EXPORT_RETRY_0"}],
+    )] = None,
 ) -> dict[str, Any]:
     """MANAGER WRITE: create one new canonical repo-local task card.
 
@@ -2880,6 +3317,36 @@ def aiworkhub_task_create_from_template(
     is forwarded to ``core.create_task`` unchanged; core alone validates it.
     It only selects the worker's reasoning effort and is never inferred from
     the template, title or prose: omitted means undeclared.
+
+    Args:
+        task_id: Unique card id: up to 256 characters of letters, digits, '_', '.', ':' or '-', starting with a letter or digit. An existing id is never overwritten.
+        title: Short card title, 1-300 characters.
+        runner: Worker execution identity from aiworkhub_manager_workforce_rank launch_contract.runner; up to 128 characters, same character set as task_id. The value codex is reserved for the manager and rejected for worker cards.
+        topic: Topic that groups related cards: up to 128 characters, same character set as task_id.
+        objective: What the worker must achieve, 1-4000 characters. Naming a forbidden path here is refused as a contradiction.
+        acceptance: Acceptance criteria the finished work is reviewed against: 1-128 entries of up to 1000 characters each. Required.
+        template_id: Template id from aiworkhub_task_template_list: the short name or the full id ending in the definition digest. Malformed, stale or forged ids are refused.
+        production_paths: Exact repo-relative production file paths the card may write, up to 128, no globs or duplicates. Whether they are required or refused depends on the template; expanded into allowed_writes.
+        test_paths: Exact repo-relative test file paths the card may write, up to 128, no globs or duplicates and none shared with production_paths. Whether they are required or refused depends on the template.
+        mandatory_changed_outputs: Exact paths from production_paths and test_paths that must change. An explicit list, even an empty one, replaces the template default; a path outside that scope is refused.
+        forbidden: Repo-relative paths or globs the worker must not touch, up to 128. A card whose writes, outputs, inputs, objective or validation overlap one is refused. Omit for none.
+        allow_empty_required_outputs: Exact repo-relative paths (no globs) of required outputs that may deliberately end up zero bytes, each covered by required_outputs and allowed_writes. Never inferred.
+        allow_unchanged_required_outputs: Exact repo-relative paths (no globs) of required outputs that may stay byte-identical to both launch baselines, each listed exactly in required_outputs and allowed_writes. Never inferred.
+        priority: Scheduling priority: low, normal (default), high or critical. Case and surrounding space are normalized.
+        depends_on: Other task_ids in this repo that must finish before this card is Plan-DAG ready. Omit for no dependencies.
+        immutable_inputs: Existing repo-relative files the worker may read but must not change. Omit for none.
+        max_live_tokens: Exact live-token cap (1-100000000), only when the owner explicitly requests one. Omit for uncapped; never estimate or infer a cap.
+        risk_tier: Optional risk-tier floor: low, medium, high or critical. The observed write scope may raise it but never lower it. Omit to derive it from the scope.
+        difficulty: Accepted difficulty values: bounded, standard, complex. Optional; omitted remains undeclared, never inferred. Case and surrounding space are normalized by core.
+        validation: Shell-free executable commands, one per entry; no environment assignments, pipes, redirects, or command chaining. Give together with validation_roles; omit both to keep the template's generated commands.
+        validation_roles: Accepted validation_roles: generic, reproduction, regression, parity, baseline, delta, negative_fixture, schema, distribution. One role per validation command, given together with validation; omit both to keep the generated roles.
+        skill_task_family: Skill family: analysis, bugfix, data_ml, docs, implementation, performance, refactor, replay, security or test; an unknown token is refused. Defaults to the family the template declares; an explicit value overrides it.
+        skill_stage: Worker workflow stage to select skills for: orientation, implementation, validation, review or rework (not the card status); an unknown token is refused. Not derivable: omitting skill_stage, skill_triggers and skill_applicability selects no skill.
+        skill_triggers: Observable conditions that make a skill relevant, from a closed vocabulary (e.g. code_change, public_api, security_sensitive, concurrency); at most 16, an unknown token is refused. Not derivable.
+        skill_applicability: Surface kinds a skill applies to, from a closed vocabulary (e.g. quality_gate, public_api_surface, security_surface, storage_schema_surface); at most 16, an unknown token is refused. Not derivable.
+        skill_path_scope: Repo-relative path or symbol that scopes skill selection; absolute paths and '..' are refused. Derivable from the write set, so it may be omitted.
+        echo_card: Set true to return the full CLI envelope with the persisted card in stdout instead of the compact creation receipt. Default false.
+        wave_goal_binding: Exactly {roadmap_id, goal_id, predecessor_task_id}: makes this card the active wave goal's current task in place of the predecessor. Never inferred; a malformed binding is refused. Omit for none.
     """
     try:
         card = task_templates.expand_template(
@@ -3045,7 +3512,11 @@ def aiworkhub_task_template_list() -> dict[str, Any]:
 
 @mcp.tool()
 def aiworkhub_task_template_show(template_id: str) -> dict[str, Any]:
-    """MANAGER READ: show one exact short or full template ID, fail closed."""
+    """MANAGER READ: show one exact short or full template ID, fail closed.
+
+    Args:
+        template_id: Exact short template name, or the current full id (ending in the definition digest), as listed by aiworkhub_task_template_list; anything else is refused.
+    """
 
     repository = core.repository_current()
     try:
@@ -3132,6 +3603,9 @@ def aiworkhub_task_plan_snapshot(full: bool = False) -> dict[str, Any]:
     repeating every finished card's dependency history.  Use ``full=true``
     for exact historical dependency/layer inspection.  This tool never claims
     work; ``aiworkhub_task_auto_pickup``/``_dryrun`` remain the claim surfaces.
+
+    Args:
+        full: Set true to return the complete Plan-DAG for exact historical dependency and layer inspection; default false returns the bounded summary.
     """
 
     snapshot = core.task_plan_snapshot()
@@ -3184,7 +3658,13 @@ def aiworkhub_task_review_queue() -> dict[str, Any]:
 
 @mcp.tool()
 def aiworkhub_task_list(status: str = "pending", topic: str | None = None, limit: int = 80) -> dict[str, Any]:
-    """List task cards by status and optional topic."""
+    """List task cards by status and optional topic.
+
+    Args:
+        status: Status to list, e.g. pending, processing, blocked, done or all for every status; default pending.
+        topic: Only list cards with exactly this topic; omit for all topics.
+        limit: Maximum number of cards to list, most recently updated first; default 80, values below 1 are treated as 1.
+    """
 
     return core.list_tasks(status=status, topic=topic, limit=limit)
 
@@ -3214,6 +3694,11 @@ def aiworkhub_task_show(
     every summary/evidence reply carries ``card_sha256``/``card_bytes`` plus
     ``review_findings_count`` when the card records reviewer reports: measured
     avg 11.5 KB/call over 31 calls (NF-2026-01447).
+
+    Args:
+        task_id: Id of the task card to show.
+        full: Set true to return the exact stored card, the same as detail=full; default false.
+        detail: How much of the card to return: summary (default, baselines and evidence folded), evidence (evidence kept exact, baselines still folded) or full (the exact stored card).
     """
 
     refusal = _detail_refusal(detail)
@@ -3246,7 +3731,12 @@ def aiworkhub_task_show(
 
 @mcp.tool()
 def aiworkhub_task_pending_for_runner(runner: str, topic: str | None = None) -> dict[str, Any]:
-    """Return pending cards for a specific runner as raw output plus parsed JSONL rows."""
+    """Return pending cards for a specific runner as raw output plus parsed JSONL rows.
+
+    Args:
+        runner: Runner whose pending cards are returned, e.g. claude or codex.
+        topic: Only return cards with this topic; omit for all topics.
+    """
 
     return core.pending_for_runner(runner=runner, topic=topic)
 
@@ -3272,6 +3762,10 @@ def aiworkhub_task_auto_pickup(runner: str, topic: str | None = None) -> dict[st
     guard, or write gate is loosened: an ineligible identity still gets
     ``card_scoped_task_id_required`` (now with zero eligible candidates) or
     whatever card-scoped denial claim-start already returns.
+
+    Args:
+        runner: Runner that claims the task, e.g. claude or codex.
+        topic: Topic to restrict the claim to; omit for no topic filter.
     """
 
     result = core.auto_pickup(runner=runner, topic=topic)
@@ -3296,6 +3790,10 @@ def aiworkhub_task_auto_pickup_dryrun(runner: str, topic: str | None = None) -> 
     `export` path. The real claim path (aiworkhub_task_auto_pickup) stays behind
     AIWORKHUB_ALLOW_WRITES; this preview provides no alternate write path
     and cannot bypass that gate.
+
+    Args:
+        runner: Runner the preview is for, e.g. claude or codex.
+        topic: Topic to restrict the preview to; omit for no topic filter.
     """
 
     return core.auto_pickup_dryrun(runner=runner, topic=topic)
@@ -3304,7 +3802,11 @@ def aiworkhub_task_auto_pickup_dryrun(runner: str, topic: str | None = None) -> 
 @_write_gated_tool()
 @_serialize_task_lifecycle_write
 def aiworkhub_task_mark_review(task_id: str) -> dict[str, Any]:
-    """Write-gated: mark a worker task as ready for Codex review."""
+    """Write-gated: mark a worker task as ready for Codex review.
+
+    Args:
+        task_id: Id of the worker task card to mark as ready for review.
+    """
 
     return core.mark_review(task_id=task_id)
 
@@ -3319,6 +3821,10 @@ def aiworkhub_task_mark_done(task_id: str, include_card: CardInclude = "none") -
     source_graph_refresh, dependency_autolaunch and workspace_retention
     facts. ``include_card`` = none (default) | summary (baselines and
     evidence folded) | full (the exact post-transition card).
+
+    Args:
+        task_id: Id of the reviewed task card to finalize as done.
+        include_card: Card view to attach to the receipt: none (default), summary (baselines and evidence folded) or full (the exact post-transition card).
     """
 
     refusal = _include_card_refusal(include_card)
@@ -3335,7 +3841,11 @@ def aiworkhub_task_mark_done(task_id: str, include_card: CardInclude = "none") -
 @mcp.tool()
 @_serialize_task_lifecycle_write
 def aiworkhub_task_dependency_autolaunch_reconcile(capacity: int | None = None) -> dict[str, Any]:
-    """MANAGER WRITE: bounded startup reconciliation for dependency-ready children."""
+    """MANAGER WRITE: bounded startup reconciliation for dependency-ready children.
+
+    Args:
+        capacity: Maximum number of dependency-ready children to launch in this pass; the rest are delayed with reason capacity. Omit for no limit.
+    """
 
     if not core.writes_allowed():
         return {"ok": False, "error": "write_gate_closed"}
@@ -3400,6 +3910,21 @@ def aiworkhub_task_reject_review(
     never undoes the reject: ``ok`` stays true, the failure is reported under
     its own key, and ``learning_commit_owed`` stays in the reply. None of these
     parameters reaches ``core.reject_review``.
+
+    Args:
+        task_id: Id of the reviewed task card to reject.
+        reason: Exact feedback for the rework, at most 8000 UTF-8 bytes after trimming (longer is refused with reject_reason_too_large); it is never echoed back.
+        to: Disposition after the reject: pending (rework, default), blocked, archived or superseded; anything else is refused as an invalid reject-review disposition.
+        residual_identities: Residual artifact items that remain in scope for the rework, 1-256 objects like {"path": "data/residual.json", "pointer": "/rows/7"} (path = repo-relative file inside the card's allowed_writes, pointer = JSON pointer starting with /); only with to=pending.
+        predecessor_request_id: Exact retained review request to use as the rework workspace authority; omit to use the current review request. An empty string fails closed.
+        failure_category: Infrastructure cause when the review machinery failed rather than the candidate code (validation_environment, provider_runtime, dependency_or_route or cancellation_or_timeout); used with to=blocked, and to=pending is also accepted.
+        validation_amendment: Validation commands to amend the reworked card with, checked by the same rules as validation on aiworkhub_task_create, e.g. pytest -q tests/test_target.py; omit for no amendment.
+        allowed_writes_amendment: Repo-relative paths to add to the card's allowed_writes (add-only); only with to=pending, otherwise refused with allowed_writes_amendment_requires_pending.
+        include_card: Card view to attach to the receipt: none (default), summary (baselines and evidence folded) or full (the exact post-transition card).
+        lesson_candidate: Lesson text to commit for this decision in the same call, after the reject lands; omit to commit the lesson separately.
+        promote_ai_memory: Set true together with lesson_candidate to also promote the lesson to AI memory; refused without a lesson. Default false.
+        extra_evidence_ids: Additional evidence ids to cite with the lesson; only used together with lesson_candidate.
+        no_new_lesson_reason: Instead of a lesson, record why none is owed: duplicate_of_recorded_lesson, no_generalizable_cause, mechanical_change_only, evidence_insufficient or decision_not_about_code; refused together with lesson_candidate.
     """
 
     refusal = _include_card_refusal(include_card) or _learning_closeout_refusal(
@@ -3482,6 +4007,14 @@ def aiworkhub_task_recover_blocked_rework(
     (NF-2026-01566).  ``command`` is never echoed: its argv carries
     ``feedback_reason`` (up to 8000 bytes).  A not-ok or card-less result is
     returned unchanged minus the argv echo, so error text is never hidden.
+
+    Args:
+        task_id: Id of the blocked card to recover.
+        feedback_reason: Manager feedback for the rework, at most 8000 UTF-8 bytes (longer is refused, never truncated); required with scope_rejection_resolved. Default empty.
+        validation_only_replay: Set true to authorize a validation-only replay of the retained candidate; refused unless the retained predecessor has a request id and changed-path hashes. Default false.
+        clean_root_if_predecessor_missing: Set true to recover from a clean root when the hash-pinned predecessor workspace was removed; not combinable with validation_only_replay. Default false.
+        validation_amendment: Validation commands to amend the recovered card with, checked by the same rules as validation on aiworkhub_task_create, e.g. pytest -q tests/test_target.py; omit for no amendment.
+        scope_rejection_resolved: Set true to record the manager's audited clean-root resolution of a scope_rejected card; requires feedback_reason and is not combinable with validation_only_replay. Default false.
     """
 
     kwargs: dict[str, Any] = {
@@ -3539,6 +4072,13 @@ def aiworkhub_task_retry_terminal(
     ``idempotent``. One measured call echoed the whole requeued card at 67,395
     chars, review_feedback and rework_predecessor included (NF-2026-01447);
     ``include_card`` = none (default) | summary | full brings it back.
+
+    Args:
+        task_id: Id of the blocked card to requeue.
+        request_id: Exact launch request id of the blocked episode being retried, at most 120 characters.
+        terminal_substatus: The card's current terminal substatus; one of cancelled, timed_out, output_budget_exceeded, launch_failed, worker_failed, finalize_failed, process_lost or liveness_lost.
+        reason: Why the episode is retried, cut to 500 characters; default empty.
+        include_card: Card view to attach to the receipt: none (default), summary (baselines and evidence folded) or full (the exact post-transition card).
     """
 
     refusal = _include_card_refusal(include_card)
@@ -3568,7 +4108,17 @@ def aiworkhub_task_reroute_launch_identity(
     reason: str = "",
     topic: str | None = None,
 ) -> dict[str, Any]:
-    """COORDINATOR WRITE: explicitly reroute one pending retry launch identity."""
+    """COORDINATOR WRITE: explicitly reroute one pending retry launch identity.
+
+    Args:
+        task_id: Id of the pending, unclaimed card whose launch identity is rerouted; any other state is refused with reroute_not_pending_unclaimed.
+        from_runner: Runner the card is pinned to now; a different value is refused with reroute_from_identity_mismatch.
+        to_runner: Runner to route the card to; with to_adapter_id and to_model it must name one enabled, available workforce route whose risk limit covers the card's risk tier.
+        to_adapter_id: Adapter id of the replacement route, paired with to_runner.
+        to_model: Model of the replacement route; it must equal the model the workforce catalog lists for that runner and adapter.
+        reason: Why the reroute is needed, recorded in the audit receipt and cut to 500 characters; some reroute paths are refused without one. Default empty.
+        topic: Topic the card is expected to be in; a different live topic is refused. Omit to skip the check.
+    """
 
     return core.reroute_launch_identity(
         task_id=task_id,
@@ -3603,6 +4153,16 @@ def aiworkhub_task_archive(
     ``dry_run=True`` previews the exact ids (and the processing cards that
     would be refused) without writing. Replies with per-id receipts
     ``{task_id, ok, status_after, error?}``; one refusal never hides the rest.
+
+    Args:
+        task_id: Id of a single card to archive; omit when passing task_ids or a selector.
+        reason: Why the cards are archived, recorded with each audit event; default empty.
+        task_ids: Explicit list of card ids to archive, at most 200; merged with task_id and de-duplicated, and not combinable with a selector.
+        status: Selector: only archive cards whose status equals this value; all selectors given must match.
+        topic: Selector: only archive cards with exactly this topic.
+        older_than_hours: Selector: only archive cards last updated at least this many hours ago.
+        task_id_prefix: Selector: only archive cards whose id starts with this prefix.
+        dry_run: Set true to list the exact ids that would be archived, and the processing cards that would be refused, without writing; default false.
     """
 
     return _archive_many(
@@ -3625,7 +4185,13 @@ def aiworkhub_manager_reconcile_dead_processing(
     request_id: str,
     claim_epoch: int,
 ) -> dict[str, Any]:
-    """MANAGER WRITE: reconcile one exact authenticated dead blocked claim."""
+    """MANAGER WRITE: reconcile one exact authenticated dead blocked claim.
+
+    Args:
+        task_id: Id of the blocked card whose worker claim is dead.
+        request_id: Launch request id of the worker that held the dead claim; blank is refused with reconcile_identity_invalid, and a request still finalizing with reconcile_failed:process_finalizing.
+        claim_epoch: Epoch of the dead claim, a positive integer; anything else is refused with reconcile_identity_invalid.
+    """
 
     return core.reconcile_dead_processing_task(
         task_id=task_id, request_id=request_id, claim_epoch=claim_epoch
@@ -3650,6 +4216,12 @@ def aiworkhub_task_supersede(
     status, card_sha256/card_bytes plus any server-derived keys the core call
     attached. ``include_card`` = none (default) | summary (baselines and
     evidence folded) | full (the exact post-transition card).
+
+    Args:
+        task_id: Id of the stale or active card to supersede; allowed even while it is processing.
+        reason: Why the card is being superseded, recorded with the audit event; default empty.
+        by: Id of the replacement task, recorded as superseded_by; it must be an existing task other than task_id and must not create a dependency cycle. Omit for none.
+        include_card: Card view to attach to the receipt: none (default), summary (baselines and evidence folded) or full (the exact post-transition card).
     """
 
     refusal = _include_card_refusal(include_card)
@@ -3683,6 +4255,16 @@ def aiworkhub_manager_task_archive(
     would be refused) without writing. Same write gate and verified manager
     actor per item, one audit event per task, per-id receipts
     ``{task_id, ok, status_after, error?}``.
+
+    Args:
+        task_id: Id of a single card to archive; omit when passing task_ids or a selector.
+        reason: Why the cards are archived, recorded with each audit event; default empty.
+        task_ids: Explicit list of card ids to archive, at most 200; merged with task_id and de-duplicated, and not combinable with a selector.
+        status: Selector: only archive cards whose status equals this value; all selectors given must match.
+        topic: Selector: only archive cards with exactly this topic.
+        older_than_hours: Selector: only archive cards last updated at least this many hours ago.
+        task_id_prefix: Selector: only archive cards whose id starts with this prefix.
+        dry_run: Set true to list the exact ids that would be archived, and the processing cards that would be refused, without writing; default false.
     """
 
     if not core.writes_allowed():
@@ -3715,7 +4297,12 @@ def aiworkhub_manager_task_supersede(
     task_id: str,
     reason: str = "",
 ) -> dict[str, Any]:
-    """MANAGER WRITE: supersede an orphaned active card while preserving audit history."""
+    """MANAGER WRITE: supersede an orphaned active card while preserving audit history.
+
+    Args:
+        task_id: Id of the orphaned active card to supersede; allowed even while it is processing.
+        reason: Why the card is being superseded, recorded with the audit event; default empty.
+    """
 
     if not core.writes_allowed():
         return {"ok": False, "error": "write_gate_closed", "task_id": task_id}
@@ -3730,7 +4317,11 @@ def aiworkhub_manager_task_supersede(
 
 @mcp.tool()
 def aiworkhub_task_collision_guard(print_json: bool = True) -> dict[str, Any]:
-    """Run the task collision guard for active cards."""
+    """Run the task collision guard for active cards.
+
+    Args:
+        print_json: Append the full collision scan result as JSON after the summary lines; default true.
+    """
 
     return core.collision_guard(print_json=print_json)
 
@@ -3741,7 +4332,13 @@ def aiworkhub_task_usage_report(
     topic: str | None = None,
     status: str | None = None,
 ) -> dict[str, Any]:
-    """Return task usage report, optionally filtered."""
+    """Return task usage report, optionally filtered.
+
+    Args:
+        runner: Only report usage by this runner; omit for all runners.
+        topic: Only report usage for this topic; omit for all topics.
+        status: Only report usage recorded with this task status; omit for all statuses.
+    """
 
     return core.usage_report(runner=runner, topic=topic, status=status)
 
@@ -3760,6 +4357,9 @@ def aiworkhub_task_audit_log_read(max_entries: int = 100) -> dict[str, Any]:
     Returns counts by tool/action and the last N audit entries.
     Never writes, never enables writes, never launches processes.
     All authority flags are preserved false.
+
+    Args:
+        max_entries: Number of most recent log entries to return in last_entries; default 100, 0 or less returns none. Counts always cover the whole log.
     """
 
     return core.read_audit_log(max_entries=max_entries)
@@ -3781,6 +4381,10 @@ def aiworkhub_task_review_summarize(
     Never mutates queue or audit state.
     Never launches agents or model processes.
     Writes remain default-off regardless of input values.
+
+    Args:
+        task_ids: Only keep these task ids in codex_review_checklist; omit to keep every task waiting in the review queue.
+        batch_label: Free-text label echoed back as batch_label in the reply; it does not filter anything.
     """
 
     result = review_summarizer.summarize_review_queue()
@@ -3815,6 +4419,10 @@ def aiworkhub_task_codex_handoff(
     Never calls taskctl done/review/start/auto-pickup/add-card.
     Never mutates queue or audit state. Never launches agents or processes.
     Writes remain default-off regardless of input values.
+
+    Args:
+        task_ids: Only report these task ids; omit for every task waiting in the review queue.
+        batch_label: Free-text label echoed back as batch_label in the reply; it does not filter anything.
     """
 
     result = review_summarizer.build_codex_handoff_report(
@@ -3841,6 +4449,10 @@ def aiworkhub_task_codex_handoff_markdown(
     Never calls taskctl done/review/start/auto-pickup/add-card.
     Never mutates queue or audit state. Never launches agents or processes.
     Writes remain default-off regardless of input values.
+
+    Args:
+        task_ids: Only report these task ids; omit for every task waiting in the review queue.
+        batch_label: Free-text label echoed back as batch_label in the reply; it does not filter anything.
     """
 
     result = review_summarizer.build_codex_handoff_markdown_report(
@@ -3872,6 +4484,14 @@ def aiworkhub_supervisor_loop_status(
     parameters. Never calls taskctl done/review/start/auto-pickup/add-card.
     Never mutates queue or audit state. Never launches agents or processes.
     Writes remain default-off regardless of input values.
+
+    Args:
+        task_id: Id of the task card to derive the supervisor state for; an unknown id returns state not_found.
+        runner: Runner to check against the runner/topic allowlist for review; the check runs when runner or topic is given, and a mismatch blocks the reply.
+        topic: Topic to check against the runner/topic allowlist for review; omit both runner and topic to skip the check.
+        supervisor_request_id: Caller correlation id echoed back in the reply; omit if you have none.
+        previous_snapshot: Earlier card snapshot as {status, worker_status}; if the live card differs the reply is blocked as stale_task. Omit to skip the check.
+        reported_validation_verdict: Validation verdict you observed elsewhere; only failed matters and blocks the reply as failed_validation. This tool never runs validation.
     """
 
     return core.supervisor_loop_status(
@@ -3970,6 +4590,14 @@ def aiworkhub_launch_queue_describe_readonly(
 
     FROZEN READ-ONLY CONTRACT -- no write-gate toggle, no audit parameter.
     Never mutates queue or audit state. Never launches agents or processes.
+
+    Args:
+        task_id: Id of the task card the launch intent is for.
+        runner: Runner the launch intent is for, e.g. claude or codex.
+        topic: Topic of the task card the launch intent is for.
+        adapter_id: Launch adapter to describe, one of claude_cli, codex_cli or deepseek_manual; any other value is reported as unknown_adapter in blocked_reason.
+        argv_template: Argument template recorded on the intent as data only; nothing is executed. Omit for none.
+        priority: Priority label recorded on the intent; default normal.
     """
 
     request = launch_queue_contract.enqueue_intent(
@@ -4006,6 +4634,14 @@ def aiworkhub_launch_queue_evaluate_readonly(
 
     FROZEN READ-ONLY CONTRACT -- no write-gate toggle, no mutation parameters.
     Never mutates queue or audit state. Never launches agents or processes.
+
+    Args:
+        task_id: Id of the task card the launch request is for.
+        runner: Runner the launch request is for, e.g. claude or codex.
+        topic: Topic of the task card the launch request is for.
+        adapter_id: Launch adapter to evaluate, one of claude_cli, codex_cli or deepseek_manual; any other value is reported as unknown_adapter in blocked_reason.
+        argv_template: Argument template recorded on the request as data only; nothing is executed. Omit for none.
+        priority: Priority label recorded on the request; default normal.
     """
 
     request = launch_queue_contract.enqueue_intent(
@@ -4038,6 +4674,9 @@ def aiworkhub_launch_queue_audit_summary_readonly(max_entries: int = 100) -> dic
 
     FROZEN READ-ONLY CONTRACT -- no write-gate toggle, no mutation parameters.
     Never mutates queue or audit state. Never launches agents or processes.
+
+    Args:
+        max_entries: Number of most recent log entries to return in last_entries; default 100, 0 or less returns none. Counts always cover the whole log.
     """
 
     result = launch_queue_persist.read_persisted_log(max_entries=max_entries)
@@ -4069,6 +4708,19 @@ def aiworkhub_task_queue_request(
     gate open, it appends one existing launch-queue audit record unless the
     request is idempotent or a different runner already owns an open request
     for the same task_id.
+
+    Args:
+        task_id: Id of the task card the request is for.
+        runner: Runner the request is for, e.g. claude or codex; a malformed token is refused with malformed_runner.
+        topic: Topic of the task card; a malformed token is refused with malformed_topic.
+        adapter_id: Launch adapter, one of claude_cli, codex_cli or deepseek_manual; any other value is refused with unknown_adapter.
+        model: Model name to record on the request; omit to leave it unset.
+        owner_prompt: Owner prompt text to record on the request; default empty.
+        argv_template: Argument template recorded on the request as data only; nothing is executed. Omit for none.
+        priority: Priority label recorded on the request; default normal.
+        stale_timeout_seconds: Stale timeout in seconds recorded on the request; default 7200.
+        requested_at: ISO-8601 request timestamp; omit to use the current UTC time.
+        request_id: Idempotency id; omit to derive one from task_id, runner and requested_at. Repeating an id that is already open appends nothing.
     """
 
     return core.queue_request(
@@ -4100,6 +4752,12 @@ def aiworkhub_task_stale_recovery_recommend(
     cards read (see bounds.truncated) and `sample` the rows listed per group.
     Produces recommendations only. It never calls taskctl write commands and
     never kills a process.
+
+    Args:
+        topic: Only consider cards with this topic; omit for all topics.
+        limit: Maximum cards to read, default 200; with scope=blocked it is clamped to at least 1 and bounds.truncated reports when more cards matched.
+        scope: processing (default) recommends actions for stale processing tasks; blocked triages blocked cards; anything else is refused with unknown_scope.
+        sample: Rows listed per recommendation group when scope=blocked, default 10; unused for scope=processing.
     """
 
     if scope == "processing":
@@ -4503,6 +5161,13 @@ def aiworkhub_task_cost_ledger(
     passed a root; this tool -- the manager's own cost surface -- did not, so
     routing by cost and difficulty had no measurement to steer by
     (NF-2026-00542).
+
+    Args:
+        runner: Only count usage by this runner; omit for all runners.
+        topic: Only count usage for this topic; omit for all topics.
+        status: Only count usage recorded with this task status; omit for all statuses.
+        include_tasks: Include one row per task as well as the aggregates; default false.
+        full: Return the full snapshot exactly as built, including the per-runner and per-topic maps, instead of the bounded summary; default false.
     """
 
     result = cost_ledger.build_cost_ledger(
@@ -4662,6 +5327,11 @@ def aiworkhub_completion_inbox(
     Never calls taskctl done/review/start/auto-pickup/add-card/export-jsonl.
     Never mutates queue or audit state. Never launches agents or processes
     beyond the existing `taskctl.py` read-only child-process calls.
+
+    Args:
+        topic: Only include tasks with this topic; omit to include every topic.
+        limit: Maximum cards read per queue status (pending, processing, review, blocked); default 200, clamped to 1-500.
+        stale_processing_hours: Hours without recorded activity after which a processing task is listed under stale_processing, oldest first; default 24.
     """
 
     result = completion_inbox.build_completion_inbox(
@@ -4810,6 +5480,11 @@ def aiworkhub_review_packet(
     The one live computation is ``accept_preview`` -- itself read-only -- which
     ``completion_inbox`` cannot call because it holds no launch authority, so
     it is computed here and passed in.
+
+    Args:
+        request_id: Id of the review_ready worker request to build the packet for.
+        task_id: Id of the task card that request belongs to; omit to resolve it from the request's status (the reply's task_id_source says which).
+        max_bytes: Byte bound for the packet, default 90000; lowest-priority sections are dropped until it fits and listed under truncation.dropped_sections.
     """
 
     manager = process_launcher.default_manager()
@@ -4878,6 +5553,15 @@ def aiworkhub_agent_launch_task(
     reply's ``launch_identity_derivation`` records exactly what was derived;
     pass them and the explicit value wins and is validated as before. The
     manager identity ``codex`` is never a worker runner.
+
+    Args:
+        task_id: Id of the pending task card to launch a worker for.
+        runner: Runner that works the card; omit to use the card's runner (a differing value is refused). The manager identity codex is never a worker runner.
+        topic: Topic of the card; omit to use the card's topic (a differing value is refused).
+        adapter_id: Adapter that runs the worker; omit to derive it from the runner (first pinnable, policy-allowed adapter). An explicit value wins and is validated.
+        model: Optional model override for the worker; omit to use the adapter default.
+        owner_prompt: Optional extra instructions from the launching owner for the worker; default empty.
+        timeout_seconds: Compatibility metadata only, default 7200; no provider wall-clock deadline is enforced and the value is echoed in the reply.
     """
 
     core.scrub_coordinator_capability_from_environment()
@@ -4938,6 +5622,16 @@ def aiworkhub_quality_reviewer_launch(
 
     ``timeout_seconds`` is retained only as non-enforcing compatibility
     metadata; this API never installs a reviewer wall-clock deadline.
+
+    Args:
+        target_request_id: Id of the worker request whose candidate is reviewed.
+        target_task_id: Id of the task card that target request belongs to.
+        reviewer_task_id: Id of the reviewer task card that carries this review.
+        runner: Runner name that executes the reviewer.
+        adapter_id: Adapter that launches the reviewer process, e.g. claude_cli.
+        lens: Review lens: correctness, security or code_quality; only one live reviewer per target request and lens is allowed.
+        model: Optional model override for the reviewer; omit to use the adapter default.
+        timeout_seconds: Compatibility metadata only, default 1800; no wall-clock deadline is enforced and the value is echoed in the reply.
     """
 
     result = process_launcher.default_manager().launch_quality_reviewer(
@@ -4987,6 +5681,10 @@ def aiworkhub_agent_task_status(
     (NF-2026-01447).
     ``"evidence"`` keeps all of the above exact (baselines still folded);
     ``"full"`` returns the raw status payload.
+
+    Args:
+        request_id: Id of the launched worker request to inspect.
+        detail: summary (default) folds bulky card and event bodies to size and sha256 digests while identity and lifecycle fields stay exact; evidence keeps the evidence exact too; full returns the raw status payload.
     """
 
     refusal = _detail_refusal(detail)
@@ -5032,7 +5730,12 @@ def aiworkhub_agent_collect_result(
     request_id: str,
     max_log_bytes: int = process_launcher.MAX_LOG_TAIL_BYTES,
 ) -> dict[str, Any]:
-    """READ-ONLY: collect bounded worker output and review-readiness evidence."""
+    """READ-ONLY: collect bounded worker output and review-readiness evidence.
+
+    Args:
+        request_id: Id of the launched worker request to collect output for.
+        max_log_bytes: Maximum bytes of worker log tail to return; defaults to the server's log-tail limit.
+    """
 
     return process_launcher.default_manager().collect(request_id, max_log_bytes=max_log_bytes)
 
@@ -5043,7 +5746,12 @@ def aiworkhub_agent_cancel_task(
     request_id: str,
     reason: str = "owner_cancelled",
 ) -> dict[str, Any]:
-    """DUAL-GATED: terminate one exact process group recorded by this server."""
+    """DUAL-GATED: terminate one exact process group recorded by this server.
+
+    Args:
+        request_id: Id of the launched worker request whose recorded process group is terminated.
+        reason: Reason recorded for the cancellation; default owner_cancelled.
+    """
 
     return process_launcher.default_manager().cancel(request_id, reason=reason)
 
@@ -5080,6 +5788,11 @@ def aiworkhub_agent_retry_finalization(
     front with ``validation_lane_forbidden_for_adapter:<adapter>`` before any
     event write or card transition, leaving the request and card unchanged
     (NF-2026-01645).
+
+    Args:
+        request_id: Id of the retained worker request whose finalization is retried.
+        task_id: Id of the task card that request belongs to.
+        validation_lane: Empty (default) re-runs finalization normally; manager_host re-runs the declared validations on the host backend, for VS Code LM adapter requests only (other adapters are refused).
     """
 
     return process_launcher.default_manager().retry_finalization(
@@ -5113,6 +5826,17 @@ def aiworkhub_manager_review_hold_resolve(
     bounded distinct-route successor, or re-arm the exact pre-provider
     reviewer attempt after its operational blocker was repaired.  It never
     accepts the target and never relaunches its implementation worker.
+
+    Args:
+        target_task_id: Id of the implementation task under review whose reviewer route is held.
+        target_request_id: Id of the implementation worker request under review.
+        claim_epoch: Claim epoch identifying the held reviewer chain; it must match the recorded chain exactly.
+        candidate_sha256: SHA-256 of the sealed candidate that reviewer chain examined; it must match the recorded value.
+        lens: Review lens of the held chain: correctness, security or code_quality.
+        attempt_index: Index of the retired reviewer attempt being resolved; it must match the recorded attempt.
+        reviewer_task_id: Id of the reviewer task card of that retired attempt.
+        reviewer_request_id: Id of the reviewer request of that retired attempt.
+        decision: authorize_distinct_route_successor allows the one bounded successor on a distinct route; callback_reconcile exposes the already-recorded callback; retry_existing_attempt re-arms the exact pre-provider attempt once its operational blocker is repaired.
     """
 
     return process_launcher.default_manager().resolve_review_route_hold(
@@ -5146,6 +5870,15 @@ def aiworkhub_manager_review_finding_dispose(
     high/critical finding cannot be disposed. The receipt is append-only and
     bound server-side to the verified reviewer receipt and the candidate
     digest. It never edits the reviewer report and never accepts the target.
+
+    Args:
+        task_id: Id of the target task card whose reviewer finding is being disposed.
+        request_id: Id of the target worker request the reviewer examined.
+        reviewer_request_id: Id of the verified reviewer request that reported the finding; it must be bound to the target request.
+        finding_id: Id of the reviewer finding to dispose, e.g. reviewer:<lens>:<id>.
+        disposition: confirmed keeps the finding as a real defect; dismissed rejects it, needs counter_evidence, and lifts only a LOW/MEDIUM finding's refinement_required blocker at accept.
+        counter_evidence: Evidence that the finding is wrong; must be non-empty when disposition is dismissed.
+        reason: Optional free-text reason recorded with the audited disposition.
     """
 
     return process_launcher.default_manager().dispose_review_finding(
@@ -5182,6 +5915,14 @@ def aiworkhub_agent_accept_preview(
     and can still refuse. ``blocked`` False means only that nothing cheap is
     refusing yet. Leave ``requested_risk_tier`` unset to read the tier the
     finalizer measured; an explicit value can only raise it.
+
+    Args:
+        request_id: Id of the worker request to accept; it must be in review_ready state.
+        task_id: Id of the task card that request belongs to.
+        requested_risk_tier: Risk tier to review at; omit to use the tier the finalizer measured for this candidate. An explicit value can only raise the tier, never lower it.
+        reviewer_request_ids: Reviewer request ids to verify; omit to use every verified reviewer bound to this request and task, and pass [] to exclude all reviewers.
+        confirm_high_risk: Set true to give the explicit human approval that high or critical risk tiers require; default false.
+        confirm_destructive_change: Set true to accept a candidate whose diff failed a destructive-change check; otherwise accept is refused with destructive_diff_requires_manager_confirmation. Default false.
     """
 
     return process_launcher.default_manager().accept_preview(
@@ -5260,6 +6001,22 @@ def aiworkhub_agent_accept_review(
     without a lesson are refused before anything changes. A failed close-out
     never undoes the accept: ``ok`` stays true, the failure is reported under
     its own key, and ``learning_commit_owed`` stays in the reply.
+
+    Args:
+        request_id: Id of the worker request to accept; it must be in review_ready state.
+        task_id: Id of the task card that request belongs to.
+        confirm_destructive_change: Set true to accept a candidate whose diff failed a destructive-change check; otherwise accept is refused with destructive_diff_requires_manager_confirmation. Default false.
+        requested_risk_tier: Risk tier to review at; omit to use the tier the finalizer measured for this candidate. An explicit value can only raise the tier, never lower it.
+        risk_signals: Extra risk signals to add to those derived from the candidate diff; they can only tighten review.
+        reviewer_reports: Optional reviewer report objects; normally omitted because acceptance verifies reviewer receipts by request id (see reviewer_request_ids).
+        reviewer_request_ids: Reviewer request ids to verify; omit to use every verified reviewer bound to this request and task, and pass [] to exclude all reviewers.
+        confirm_high_risk: Set true to give the explicit human approval that high or critical risk tiers require; default false.
+        manager_correction: Accept the sealed candidate plus a manager patch: {"patch": <unified diff>, "finding_ids": ["reviewer:<lens>:<id>", ...], "reason": str}; omit for a plain accept.
+        include_card: none (default), summary or full; adds that view of the finalized card to the reply.
+        lesson_candidate: Lesson text to commit for this decision in the same call, after the accept lands; omit to commit the lesson separately.
+        promote_ai_memory: Set true together with lesson_candidate to also promote the lesson to AI memory; refused without a lesson. Default false.
+        extra_evidence_ids: Additional evidence ids to cite with the lesson; only used together with lesson_candidate.
+        no_new_lesson_reason: Instead of a lesson, record why none is owed: duplicate_of_recorded_lesson, no_generalizable_cause, mechanical_change_only, evidence_insufficient or decision_not_about_code; refused together with lesson_candidate.
     """
 
     # Refuse a bad render mode or a contradictory learning close-out BEFORE the
@@ -5316,7 +6073,12 @@ def aiworkhub_agent_list_processes(
     limit: int = 100,
     detail: Literal["summary", "full"] = "summary",
 ) -> dict[str, Any]:
-    """READ-ONLY: summarize latest processes; use detail='full' for legacy records."""
+    """READ-ONLY: summarize latest processes; use detail='full' for legacy records.
+
+    Args:
+        limit: Number of latest processes to read, integer 1-1000; default 100, any other value is refused with invalid_limit.
+        detail: summary (default) returns counts by state and terminal substatus plus newest/oldest timestamps; full returns the complete legacy process records.
+    """
 
     if detail not in {"summary", "full"}:
         raise ValueError("invalid_detail: detail must be 'summary' or 'full'")
@@ -5539,7 +6301,13 @@ def aiworkhub_claude_callback_wait(
     Code manager session.  Acknowledge the previous batch by passing its
     ``batch_id``/``lease_id`` as ``ack_batch_id``/``ack_lease_id`` here, or
     call ``aiworkhub_claude_callback_ack``; an unacknowledged lease is
-    retried, never lost."""
+    retried, never lost.
+
+    Args:
+        timeout_seconds: Seconds to wait for a callback; default 240, clamped to a server maximum (at least 1) that the reply reports.
+        ack_batch_id: batch_id from the previous callback_ready reply, acknowledged while the next batch is claimed; leave empty on the first wait.
+        ack_lease_id: lease_id from that same callback_ready reply; pass it together with ack_batch_id.
+    """
 
     return core.claude_callback_wait(timeout_seconds, ack_batch_id, ack_lease_id)
 
@@ -5547,7 +6315,12 @@ def aiworkhub_claude_callback_wait(
 @mcp.tool()
 def aiworkhub_claude_callback_ack(batch_id: str, lease_id: str) -> dict[str, Any]:
     """WRITE: acknowledge one exact callback batch returned to this same
-    verified Claude manager session."""
+    verified Claude manager session.
+
+    Args:
+        batch_id: batch_id of the callback_ready reply being acknowledged.
+        lease_id: lease_id from that same callback_ready reply.
+    """
 
     return core.claude_callback_ack(batch_id, lease_id)
 
@@ -5576,6 +6349,10 @@ def aiworkhub_known_bug_scan(
 
     Native and SARIF outputs preserve the same truth boundary: a static
     candidate is not reported as runtime-reproduced evidence.
+
+    Args:
+        changed_paths: Repository-relative paths of the changed files to scan, duplicates ignored; files skipped for size are listed under skipped_paths rather than counted clean.
+        output_format: native (default) returns the scanner report; sarif returns the same findings as a SARIF document.
     """
 
     report = known_bug_scanner.scan_changed_paths(core.repo_root(), changed_paths)
@@ -5590,6 +6367,9 @@ def aiworkhub_eval_artifact_gate(
 
     A PASS over zero eligible rows or a summary/count/aggregate divergence is
     returned as blocking evidence. The tool never rewrites an artifact.
+
+    Args:
+        changed_paths: Repository-relative paths changed by the task; only registered eval artifacts whose summary or rows file is listed are evaluated, the rest report not_applicable. Omit to evaluate every registered artifact.
     """
 
     return quality_evidence.eval_artifact_gate.evaluate(
@@ -5643,7 +6423,11 @@ def aiworkhub_source_graph_retrieval_eval() -> dict[str, Any]:
 
 @mcp.tool()
 def aiworkhub_session_token_profile(task_id: str | None = None) -> dict[str, Any]:
-    """READ-ONLY: observed provider tokens plus separately-labelled prompt bytes."""
+    """READ-ONLY: observed provider tokens plus separately-labelled prompt bytes.
+
+    Args:
+        task_id: Optional task id to restrict the profile to that task's usage records and prompt-budget events; omit to profile every task.
+    """
 
     return evidence_instruments.session_token_profile(core.repo_root(), task_id=task_id)
 
@@ -5659,7 +6443,11 @@ def aiworkhub_risk_mode_precision_bench() -> dict[str, Any]:
 def aiworkhub_quality_gate_ratchet(
     violations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """READ-ONLY: report new quality identities and no-net-growth overflow."""
+    """READ-ONLY: report new quality identities and no-net-growth overflow.
+
+    Args:
+        violations: Currently observed violations, each an object with an id string; ids missing from the .aiworkhub/quality-ratchet.json baseline are reported as new. Omit to pass none.
+    """
 
     return evidence_instruments.quality_gate_ratchet(
         core.repo_root(), violations=violations or []
@@ -5678,7 +6466,12 @@ def aiworkhub_suite_profile(
     check_id: str,
     repeats: int = 2,
 ) -> dict[str, Any]:
-    """Execute one repo-declared quality check repeatedly; shell is never used."""
+    """Execute one repo-declared quality check repeatedly; shell is never used.
+
+    Args:
+        check_id: Id of a check declared in the repository's .aiworkhub/quality.json; an unknown id returns declared_check_not_found.
+        repeats: How many times to run the check; default 2, clamped to 1-5.
+    """
 
     descriptors = quality_evidence.declared_check_descriptors(core.repo_root())
     selected = next((row for row in descriptors if row.check_id == check_id), None)
@@ -5692,7 +6485,11 @@ def aiworkhub_suite_profile(
 
 @mcp.tool()
 def aiworkhub_runtime_coverage_preview(artifact_path: str) -> dict[str, Any]:
-    """READ-ONLY: parse a repo-local coverage.py JSON artifact."""
+    """READ-ONLY: parse a repo-local coverage.py JSON artifact.
+
+    Args:
+        artifact_path: Repository-relative path of a coverage.py JSON report (coverage json output); a path outside the repository or a file that is not a regular file is refused.
+    """
 
     try:
         return evidence_instruments.coverage_import_preview(
@@ -5704,7 +6501,11 @@ def aiworkhub_runtime_coverage_preview(artifact_path: str) -> dict[str, Any]:
 
 @mcp.tool()
 def aiworkhub_runtime_coverage_import(artifact_path: str) -> dict[str, Any]:
-    """WRITE-GATED: atomically project repo-local coverage into Source Graph."""
+    """WRITE-GATED: atomically project repo-local coverage into Source Graph.
+
+    Args:
+        artifact_path: Repository-relative path of a coverage.py JSON report (coverage json output); a path outside the repository or a file that is not a regular file is refused.
+    """
 
     if not core.writes_allowed():
         return {"ok": False, "error": "write_gate_closed"}
@@ -5720,7 +6521,11 @@ def aiworkhub_runtime_coverage_import(artifact_path: str) -> dict[str, Any]:
 def aiworkhub_quality_run_checks(changed_paths: list[str] | None = None) -> dict[str, Any]:
     """Run repo-declared .aiworkhub/quality.json build/test/lint/typecheck
     commands (argv arrays only, shell=False). Fails closed on malformed
-    config. Diff/new-code-first: pass ``changed_paths`` to scope evidence."""
+    config. Diff/new-code-first: pass ``changed_paths`` to scope evidence.
+
+    Args:
+        changed_paths: Repository-relative paths changed by the task; scopes which declared checks apply and is recorded as each check's affected_paths. Omit to run the checks unscoped.
+    """
 
     root = core.repo_root()
     try:
@@ -5750,7 +6555,11 @@ def aiworkhub_quality_run_checks(changed_paths: list[str] | None = None) -> dict
 def aiworkhub_quality_evidence_packet(changed_paths: list[str] | None = None) -> dict[str, Any]:
     """READ-ONLY: full canonical evidence packet -- profile, declared
     checks, risk-based optional-gate policy metadata (not_available !=
-    passed), and the cross-provider read-only quality_reviewer contract."""
+    passed), and the cross-provider read-only quality_reviewer contract.
+
+    Args:
+        changed_paths: Repository-relative paths changed by the task, recorded as affected_paths on each declared check; omit to leave the checks unscoped.
+    """
 
     return quality_evidence.build_evidence_packet(core.repo_root(), changed_paths=changed_paths)
 
@@ -5783,6 +6592,10 @@ def aiworkhub_environment_preflight(
     ``provider_observability.adapters``/``providers`` are filtered to that
     adapter. ``detail="evidence"`` behaves like ``"full"``: both return
     ``repo_policy.build_preflight`` exactly.
+
+    Args:
+        adapter_id: Optional provider adapter id to check and to narrow the provider report to; an unsupported id adds selected_adapter_unsupported to errors. Omit to report every adapter.
+        detail: summary (default) folds the report to counts and short previews; evidence and full both return the complete report.
     """
 
     refusal = _detail_refusal(detail)
@@ -5818,6 +6631,10 @@ def aiworkhub_storage_recover_stranded_worktrees(
     reclaimable, mutating nothing. ``confirm=True`` requires a non-empty
     ``reason``, reinstates the provably-owned registrations, and records the
     reason in the audit log.
+
+    Args:
+        confirm: false (default) only reports what would be recovered and changes nothing; true performs the recovery and requires a non-empty reason.
+        reason: Why the recovery is being run; required and non-empty when confirm is true, recorded in the audit log. Leave empty for the report.
     """
 
     from . import storage_retention
@@ -6023,7 +6840,18 @@ def needfix_list(
     order_by: str = "created_at",
     order_dir: str = "DESC",
 ) -> list[dict]:
-    """List repo-scoped NeedFix entries (bounded)."""
+    """List repo-scoped NeedFix entries (bounded).
+
+    Args:
+        status: Only rows with exactly this status, e.g. captured, accepted or archived. Any status, kind or severity filter returns raw rows; omit all three for the derived active listing.
+        kind: Only rows of exactly this kind, e.g. bug or improvement; omit for all kinds. Any filter returns raw rows.
+        severity: Only rows of exactly this severity: critical, high, medium, low or info; omit for all. Any filter returns raw rows.
+        include_archived: Also list archived rows; default false.
+        limit: Maximum rows to return; default 100, clamped to 1-500.
+        offset: Rows to skip before the first one returned, for paging; default 0.
+        order_by: Sort column, created_at (default) or updated_at; any other value falls back to created_at.
+        order_dir: Sort direction, DESC (default, newest first) or ASC; any other value falls back to DESC.
+    """
     return core.needfix_list(
         status=status,
         kind=kind,
@@ -6046,6 +6874,10 @@ def needfix_show(needfix_id: str, full: bool = False) -> dict:
     replaced by ``{summarized, bytes, length, sha256}`` so it stays
     addressable; a smaller body is returned verbatim and ``full=true`` returns
     every byte.
+
+    Args:
+        needfix_id: NeedFix id, e.g. NF-2026-01447.
+        full: Return every body byte verbatim instead of folding bodies over 1 KB to their identity; default false.
     """
     return core.needfix_bodies_bounded(
         core.needfix_show(needfix_id), full=bool(full)
@@ -6083,6 +6915,11 @@ def aiworkhub_manager_needfix_draft(
     file a candidate with ``needfix_add`` once you have written that
     description. ``finding_id`` / ``check_id`` narrow the draft to exactly one
     finding or one failing check.
+
+    Args:
+        request_id: Id of the launched request whose own review evidence to draft from; an unknown request returns request_not_found.
+        finding_id: Optional id of one reviewer finding; narrows the draft to exactly that finding. Leave empty to draft every finding.
+        check_id: Optional id of one failing check; narrows the draft to exactly that check. Leave empty to draft every failing check.
     """
 
     status = process_launcher.default_manager().status(request_id)
@@ -6154,6 +6991,19 @@ def needfix_add(
     ``deduped`` with ``existing_id`` when the dedupe key matched a live row
     (the existing row is returned, nothing new is written), kind_normalized.
     The row itself is one ``needfix_show`` away.
+
+    Args:
+        title: Short title of the NeedFix; required, non-empty.
+        description: Full description of the finding; required, non-empty, at most 200000 bytes.
+        scope: Optional free-text scope label. With title and description it forms the dedupe key, so the same text under another scope is a separate row.
+        provenance: Optional object describing where the finding came from; the server sets origin to manager_add when it is absent and marks the row verified.
+        evidence: Optional evidence object, at most 500000 bytes serialized; omit when there is none.
+        tags: Optional list of free-text tags.
+        scope_files: Optional list of repository file paths this NeedFix concerns.
+        scope_symbols: Optional list of code symbols this NeedFix concerns.
+        evidence_refs: Optional list of evidence reference strings.
+        readiness_score: Readiness score, an integer from 0 to 100; default 0.
+        caused_by: Optional object naming the accepted outcome that introduced the defect: schema_id aiworkhub.accepted_outcome_identity.v1, repository_id, task_id, request_id and accepted_outcome_receipt. Verified against the canonical task store and write-once; omit if unknown.
     """
     if not core.writes_allowed():
         return {"ok": False, "error": "write_gate_closed"}
@@ -6252,6 +7102,26 @@ def needfix_update(
     id, status, fields_changed, updated_at, evidence_keys_after, event_id,
     kind_normalized. The ``updated`` audit event records the same
     fields_changed plus the evidence sha256 before and after.
+
+    Args:
+        needfix_id: Id of the NeedFix to update, e.g. NF-2026-01447; a NeedFix that is converting cannot be updated.
+        title: New title; omit to keep the current one.
+        description: New description; omit to keep the current one.
+        scope: New free-text scope label; omit to keep the current one.
+        tags: Full replacement tag list; omit to keep the current tags.
+        scope_files: Full replacement list of repository file paths this NeedFix concerns; omit to keep the current list.
+        scope_symbols: Full replacement list of code symbols this NeedFix concerns; omit to keep the current list.
+        evidence: Full replacement evidence object, at most 500000 bytes serialized; refused together with evidence_patch. Omit to keep the stored evidence.
+        evidence_refs: Full replacement list of evidence reference strings; omit to keep the current list.
+        readiness_score: New readiness score, an integer from 0 to 100; omit to keep the current one.
+        evidence_patch: JSON merge patch applied to the stored evidence: keys merge, nested objects merge, null deletes a key. Refused together with evidence.
+        evidence_refs_add: Evidence reference strings to append when not already present.
+        evidence_refs_remove: Evidence reference strings to remove when present.
+        tags_add: Tags to append when not already present.
+        tags_remove: Tags to remove when present.
+        scope_files_add: Repository file paths to append to scope_files when not already present.
+        scope_symbols_add: Code symbols to append to scope_symbols when not already present.
+        expected_updated_at: Optimistic concurrency guard: the updated_at timestamp you last read; the update is refused as needfix_update_stale when the stored value differs.
     """
     if not core.writes_allowed():
         return {"ok": False, "error": "write_gate_closed"}
@@ -6290,37 +7160,67 @@ def needfix_update(
 
 @mcp.tool()
 def needfix_archive(needfix_id: str, reason: str | None = None) -> dict:
-    """Explicitly archive (soft, audited, restorable) a NeedFix."""
+    """Explicitly archive (soft, audited, restorable) a NeedFix.
+
+    Args:
+        needfix_id: NeedFix id, e.g. NF-2026-01447. A NeedFix that is converting cannot be archived; an already archived one is returned unchanged.
+        reason: Optional free-text reason recorded in the archived audit event; omit if there is none.
+    """
     return core.needfix_archive(needfix_id, reason=reason)
 
 
 @mcp.tool()
 def needfix_restore(needfix_id: str, target_status: str = "captured") -> dict:
-    """Explicitly restore an archived NeedFix."""
+    """Explicitly restore an archived NeedFix.
+
+    Args:
+        needfix_id: Id of an archived NeedFix, e.g. NF-2026-01447; a NeedFix in any other status is refused.
+        target_status: Status to restore into: captured, triaged, accepted or deferred; default captured.
+    """
     return core.needfix_restore(needfix_id, target_status=target_status)
 
 
 @mcp.tool()
 def needfix_purge(needfix_id: str, audit_reason: str) -> dict:
-    """Audited hard delete of an already-archived NeedFix."""
+    """Audited hard delete of an already-archived NeedFix.
+
+    Args:
+        needfix_id: Id of an archived NeedFix, e.g. NF-2026-01447; only archived rows can be purged.
+        audit_reason: Required non-blank reason, recorded in the purged audit event together with a snapshot of the deleted row.
+    """
     return core.needfix_purge(needfix_id, audit_reason)
 
 
 @mcp.tool()
 def needfix_count(status: str | None = None, kind: str | None = None, severity: str | None = None) -> int:
-    """Bounded count of NeedFix entries."""
+    """Bounded count of NeedFix entries.
+
+    Args:
+        status: Count only rows with this exact status, e.g. captured or accepted; archived rows are counted only when asked for here. Omit all three filters for the derived active count.
+        kind: Count only rows of this exact kind, e.g. bug or improvement; any filter returns the raw row count instead of the derived active count.
+        severity: Count only rows of this exact severity: critical, high, medium, low or info; any filter returns the raw row count.
+    """
     return core.needfix_count(status=status, kind=kind, severity=severity)
 
 
 @mcp.tool()
 def needfix_events(needfix_id: str, limit: int = 100) -> list[dict]:
-    """List events for a NeedFix entry."""
+    """List events for a NeedFix entry.
+
+    Args:
+        needfix_id: NeedFix id, e.g. NF-2026-01447.
+        limit: Maximum events to return, newest first; default 100, clamped to 1-500.
+    """
     return core.needfix_events(needfix_id, limit=limit)
 
 
 @mcp.tool()
 def aiworkhub_manager_sdlc_outcome_metrics(limit: int = 500) -> dict[str, Any]:
-    """READ-ONLY: bounded outcome metrics from canonical task/review events."""
+    """READ-ONLY: bounded outcome metrics from canonical task/review events.
+
+    Args:
+        limit: Maximum task-event rows read, newest accepted tasks first; default 500, clamped to 1-2000.
+    """
 
     root = core.repo_root()
     readiness = task_store.storage_readiness(root)
@@ -6341,7 +7241,13 @@ def aiworkhub_manager_sdlc_outcome_metrics(limit: int = 500) -> dict[str, Any]:
 def aiworkhub_manager_sdlc_case_create(
     case_id: str, request_id: str, links: dict[str, str] | None = None
 ) -> dict[str, Any]:
-    """Create one repository-bound SDLC case under verified manager authority."""
+    """Create one repository-bound SDLC case under verified manager authority.
+
+    Args:
+        case_id: Id for the new case; required, non-blank. Replaying the same case_id, request_id and links is a no-op; the same case_id with other values conflicts.
+        request_id: Caller-chosen id for this request; required, non-blank.
+        links: Optional map of up to 16 string keys to string values, each at most 256 characters. The task_id key binds the case to that existing task, and a task can be bound to one case only.
+    """
     return core.sdlc_case_create(case_id=case_id, request_id=request_id, links=links or {})
 
 
@@ -6353,7 +7259,15 @@ def aiworkhub_manager_sdlc_stage_record(
     payload: dict[str, Any],
     request_id: str,
 ) -> dict[str, Any]:
-    """Append one bounded stage receipt under verified manager authority."""
+    """Append one bounded stage receipt under verified manager authority.
+
+    Args:
+        case_id: Id of an existing SDLC case in this repository.
+        stage: Stage to record: plan, design, build, test, deploy or maintain.
+        state: ready, blocked or unknown. ready is recorded only when the server proves this and every earlier stage from canonical receipts; not_applicable is refused.
+        payload: JSON object of at most 16384 bytes. A ready stage accepts only its own evidence fields plus evidence_refs (build and test: task_id, request_id, claim_epoch); verdict keys such as passed are refused.
+        request_id: Caller-chosen id for this receipt; required, non-blank. An exact replay returns the stored receipt; changed content under the same request_id conflicts.
+    """
     return core.sdlc_stage_record(
         case_id=case_id,
         stage=stage,
@@ -6365,13 +7279,29 @@ def aiworkhub_manager_sdlc_stage_record(
 
 @mcp.tool()
 def aiworkhub_manager_sdlc_case_get(case_id: str) -> dict[str, Any]:
-    """READ-ONLY: bounded repository-bound case packet."""
+    """READ-ONLY: bounded repository-bound case packet.
+
+    Args:
+        case_id: Id of an existing SDLC case in this repository; an unknown id is refused.
+    """
     return core.sdlc_case_get(case_id=case_id)
 
 
 @mcp.tool()
 def aiworkhub_manager_sdlc_stage_packet(case_id: str, stage: str) -> dict[str, Any]:
-    """READ-ONLY: one bounded repository-bound stage packet."""
+    """READ-ONLY: return the current packet for one stage of an SDLC case.
+
+    The packet carries the stage ``state`` (ready, blocked or unknown), ``source_refs``,
+    the receipt hash and, once ready, the evidence the server proved from canonical
+    receipts. Use it to check one stage; ``aiworkhub_manager_sdlc_case_get`` returns all
+    six stages with the cycle verdict and ``aiworkhub_manager_sdlc_case_for_task`` finds
+    the case bound to a task. An unknown case, a stage with no receipt, or a ready receipt
+    that no longer re-proves reads as ``unknown`` with a ``reason``.
+
+    Args:
+        case_id: Id of an existing SDLC case in this repository; an unknown case reads as state unknown with reason case_not_found.
+        stage: Stage to read: plan, design, build, test, deploy or maintain.
+    """
     return core.sdlc_stage_packet(case_id=case_id, stage=stage)
 
 
@@ -6379,13 +7309,22 @@ def aiworkhub_manager_sdlc_stage_packet(case_id: str, stage: str) -> dict[str, A
 def aiworkhub_manager_sdlc_case_create_for_task(
     task_id: str, request_id: str
 ) -> dict[str, Any]:
-    """Create the SDLC case bound to one canonical task under verified manager authority."""
+    """Create the SDLC case bound to one canonical task under verified manager authority.
+
+    Args:
+        task_id: Id of an existing canonical task in this repository; the case id is derived from it, and a task can be bound to one case only.
+        request_id: Caller-chosen id for this request; required, non-blank. Replaying the same task_id and request_id is a no-op.
+    """
     return core.sdlc_case_create_for_task(task_id=task_id, request_id=request_id)
 
 
 @mcp.tool()
 def aiworkhub_manager_sdlc_case_for_task(task_id: str) -> dict[str, Any]:
-    """READ-ONLY: bounded case packet bound to one canonical task, or a typed unknown."""
+    """READ-ONLY: bounded case packet bound to one canonical task, or a typed unknown.
+
+    Args:
+        task_id: Id of a canonical task in this repository; a task with no bound case returns state unknown.
+    """
     return core.sdlc_case_for_task(task_id=task_id)
 
 
@@ -6405,6 +7344,11 @@ def needfix_preview_convert(
     2026-10-09 on NF-2026-01452: ~6 KB of plan echoed three times, because
     convert then refused ``plan_digest`` alone (NF-2026-01447). It no longer
     does, so the previewed plan never has to be resent.
+
+    Args:
+        needfix_id: NeedFix id, e.g. NF-2026-01447.
+        task_plan: Task card fields that override the scope-derived default; must name runner and topic, and a writable card needs required_outputs. Unknown fields are refused.
+        include_plan: Return the signed plan body verbatim instead of a summary of its identity and counts; default false.
     """
     return _needfix_plan_receipt(
         core.needfix_preview_convert(needfix_id, task_plan=task_plan),
@@ -6427,6 +7371,12 @@ def needfix_convert(
     resent. The digest re-check is unchanged, so NeedFix drift between preview
     and commit still fails closed, and a digest this server no longer holds is
     refused with ``previewed_plan_unavailable`` rather than reconstructed.
+
+    Args:
+        needfix_id: NeedFix id, e.g. NF-2026-01447.
+        task_plan: Task card fields as in needfix_preview_convert; omit to commit the exact plan remembered under plan_digest.
+        plan_digest: plan_digest from the matching needfix_preview_convert; required to commit a new conversion. A digest this server no longer holds is refused.
+        include_plan: Return the plan body verbatim instead of a summary of its identity and counts; default false.
     """
     return _needfix_plan_receipt(
         core.needfix_convert(
@@ -6441,13 +7391,24 @@ def needfix_convert(
 def needfix_link_existing_task(
     needfix_id: str, existing_task_id: str, integrated_commit: str = ""
 ) -> dict:
-    """Manager-only: atomically link a NeedFix to an existing, finished, accepted task."""
+    """Manager-only: atomically link a NeedFix to an existing, finished, accepted task.
+
+    Args:
+        needfix_id: NeedFix id, e.g. NF-2026-01447.
+        existing_task_id: Id of an existing task in this repository; the NeedFix must be accepted or task_planned. Re-linking the same task is a no-op; a different task conflicts.
+        integrated_commit: Optional commit sha (7-40 hex characters) that must be reachable from HEAD; required to link an archived superseded task, and a verified commit resolves the NeedFix. Default empty.
+    """
     return core.needfix_link_existing_task(needfix_id, existing_task_id, integrated_commit)
 
 
 @mcp.tool()
 def needfix_reopen_superseded_task_link(needfix_id: str, reason: str) -> dict:
-    """Manager-only: reopen a NeedFix whose exact linked task was superseded."""
+    """Manager-only: reopen a NeedFix whose exact linked task was superseded.
+
+    Args:
+        needfix_id: NeedFix id, e.g. NF-2026-01447.
+        reason: Required non-blank explanation, at most 4096 bytes, recorded in the audit event.
+    """
     return core.needfix_reopen_superseded_task_link(needfix_id, reason)
 
 
@@ -6461,7 +7422,14 @@ def roadmap_list(
     limit: int = 100,
     offset: int = 0,
 ) -> list[dict]:
-    """List bounded repository Roadmap outcomes."""
+    """List bounded repository Roadmap outcomes.
+
+    Args:
+        status: Only outcomes in this status: proposed, approved, in_progress, blocked, deferred, completed or archived. Omit to list every non-archived outcome.
+        include_archived: With no status filter, also return archived outcomes; default false.
+        limit: Maximum outcomes to return; default 100, clamped to 1-500.
+        offset: Number of outcomes to skip, for paging; default 0.
+    """
     return core.roadmap_list(
         status=status,
         include_archived=include_archived,
@@ -6472,19 +7440,44 @@ def roadmap_list(
 
 @mcp.tool()
 def roadmap_show(roadmap_id: str) -> dict:
-    """Show one Roadmap outcome."""
+    """Show one Roadmap outcome.
+
+    Args:
+        roadmap_id: Roadmap outcome id in the form RM-YYYY-NNNNN, e.g. RM-2026-00001.
+    """
     return core.roadmap_show(roadmap_id)
 
 
 @mcp.tool()
 def roadmap_events(roadmap_id: str, limit: int = 100) -> list[dict]:
-    """List bounded audit events for one Roadmap outcome."""
+    """List bounded audit events for one Roadmap outcome.
+
+    Args:
+        roadmap_id: Roadmap outcome id in the form RM-YYYY-NNNNN, e.g. RM-2026-00001.
+        limit: Maximum events to return, newest first; default 100, clamped to 1-500.
+    """
     return core.roadmap_events(roadmap_id, limit=limit)
 
 
 @mcp.tool()
 def roadmap_snapshot(limit: int = 200, include_archived: bool = False) -> dict:
-    """Join bounded Roadmap outcomes to canonical Task-DAG lifecycle."""
+    """Return the Roadmap with each outcome joined to the live status of its linked tasks.
+
+    Use this to see what is done, blocked or ready across the roadmap in one call. The
+    other roadmap tools return stored fields only: ``roadmap_list`` the outcome rows,
+    ``roadmap_show`` one outcome and ``roadmap_events`` its audit trail. Read-only.
+
+    The reply is ``aiworkhub.roadmap_snapshot.v1``: ``total`` and ``active`` outcome
+    counts, ``status_counts``, ``items`` (up to ``limit`` outcome rows) and ``truncated``.
+    Each row is the stored outcome plus ``tasks`` (task id and live status, or ``missing``
+    / ``purged:<status>`` once the task record is gone), ``linked_total``, ``accepted``
+    (finished tasks), ``unresolved`` (the rest), ``dependency_blockers`` and
+    ``dependency_ready``.
+
+    Args:
+        limit: Maximum outcome rows to return; default 200, clamped to 1-500. The reply's truncated flag says whether rows were left out.
+        include_archived: Also include archived outcomes in the rows and counts; default false.
+    """
     return core.roadmap_snapshot(limit=limit, include_archived=include_archived)
 
 
@@ -6500,7 +7493,19 @@ def roadmap_add(
     provenance: dict | None = None,
     evidence_refs: list[str] | None = None,
 ) -> dict:
-    """Manager-only Roadmap proposal; does not create or launch a task."""
+    """Manager-only Roadmap proposal; does not create or launch a task.
+
+    Args:
+        title: Short outcome title; required, at most 1000 bytes.
+        outcome: What the roadmap item should achieve; required, at most 100000 bytes.
+        priority: critical, high, medium or low; default medium.
+        milestone: Free-text milestone label, truncated to 500 characters; default empty.
+        acceptance: Acceptance criteria, up to 100 non-blank strings; completing the outcome later requires at least one.
+        needfix_ids: NeedFix ids (NF-YYYY-NNNNN) behind this outcome; each NeedFix must already be accepted, task_planned, task_created or resolved.
+        depends_on: Roadmap ids (RM-YYYY-NNNNN) that must exist and be completed before this outcome can be approved, started or completed.
+        provenance: Free-form JSON object recording where the proposal came from; the server adds origin and verified=true.
+        evidence_refs: Evidence reference strings, up to 200; completing an outcome that has no linked task needs at least one.
+    """
     return core.roadmap_add(
         title,
         outcome,
@@ -6516,13 +7521,24 @@ def roadmap_add(
 
 @mcp.tool()
 def roadmap_transition(roadmap_id: str, target_status: str, reason: str) -> dict:
-    """Manager-only guarded Roadmap lifecycle transition."""
+    """Manager-only guarded Roadmap lifecycle transition.
+
+    Args:
+        roadmap_id: Roadmap outcome id in the form RM-YYYY-NNNNN, e.g. RM-2026-00001.
+        target_status: Status to move to: approved, in_progress, blocked, deferred, completed or archived; a move the current status does not allow is refused.
+        reason: Required non-blank explanation, at most 4000 bytes, recorded in the audit event.
+    """
     return core.roadmap_transition(roadmap_id, target_status, reason=reason)
 
 
 @mcp.tool()
 def roadmap_link_task(roadmap_id: str, task_id: str) -> dict:
-    """Link one existing canonical task to a Roadmap outcome."""
+    """Link one existing canonical task to a Roadmap outcome.
+
+    Args:
+        roadmap_id: Roadmap outcome id in the form RM-YYYY-NNNNN, e.g. RM-2026-00001.
+        task_id: Id of an existing canonical task in this repository; an already-linked task is not duplicated.
+    """
     return core.roadmap_link_task(roadmap_id, task_id)
 
 

@@ -22,7 +22,13 @@ _REJECT_REVIEW = "aiworkhub_task_reject_review"
 _REJECT_REVIEW_TRUNCATED = "Write-gated Codex action: reject a reviewed task with exact feedback and"
 _HINTED_PARAMS = {
     "aiworkhub_task_create": (
-        "validation", "work_kind", "validation_roles", "difficulty", "custom_template_escape",
+        "task_id", "title", "runner", "topic", "objective", "acceptance", "allowed_writes",
+        "forbidden", "required_outputs", "allow_empty_required_outputs",
+        "allow_unchanged_required_outputs", "validation", "priority", "task_type", "depends_on",
+        "read_first", "immutable_inputs", "read_only", "max_live_tokens", "work_kind",
+        "validation_roles", "risk_tier", "difficulty", "skill_task_family", "skill_stage",
+        "skill_triggers", "skill_applicability", "skill_path_scope", "custom_template_escape",
+        "apply_contract_patch", "echo_card", "wave_goal_binding",
     ),
     "needfix_add": ("status", "kind", "severity"),
     "needfix_update": ("kind", "severity"),
@@ -188,7 +194,7 @@ def test_reject_review_description_is_not_truncated_to_its_first_line(
     stdlib_payload: dict, fallback_tools: dict
 ) -> None:
     description = fallback_tools[_REJECT_REVIEW]["description"]
-    assert description == stdlib_payload["docs"][_REJECT_REVIEW].strip()
+    assert description == _expected_description(stdlib_payload["docs"][_REJECT_REVIEW])
     assert description != _REJECT_REVIEW_TRUNCATED
     assert description.startswith(_REJECT_REVIEW_TRUNCATED)
     assert "reject_reason_too_large" in description
@@ -209,7 +215,7 @@ def test_no_description_is_a_truncated_prefix_of_its_docstring(
         if entry["description"] != full and full.startswith(entry["description"]):
             truncated.append(name)
     assert not truncated, truncated[:10]
-    assert _REJECT_REVIEW in multi_line
+    assert multi_line
 
 
 def test_annotations_come_from_the_shared_derivation_and_are_omitted_when_empty(
@@ -291,9 +297,9 @@ def test_reject_review_schema_keeps_its_names_types_and_required_list(fallback_t
         "allowed_writes_amendment", "lesson_candidate", "no_new_lesson_reason",
         "promote_ai_memory", "extra_evidence_ids",
     }
-    assert schema["properties"]["task_id"] == {"type": "string"}
+    assert schema["properties"]["task_id"]["type"] == "string"
     assert schema["properties"]["residual_identities"]["type"] == "array"
-    assert not [pname for pname, spec in schema["properties"].items() if "description" in spec]
+    assert all(str(spec.get("description", "")).strip() for spec in schema["properties"].values())
 
 
 def test_parameter_description_sources_and_precedence(stdlib_payload: dict) -> None:
@@ -334,3 +340,13 @@ def test_fallback_matches_the_fastmcp_tools_list(fallback_tools: dict) -> None:
                 (name, "parameter descriptions", _parameter_descriptions(entry), _parameter_descriptions(expected))
             )
     assert not differences, differences[:5]
+
+
+def test_no_parameter_publishes_empty_examples(fallback_tools: dict) -> None:
+    empty = sorted(
+        f"{name}.{pname}"
+        for name, entry in fallback_tools.items()
+        for pname, spec in entry["inputSchema"].get("properties", {}).items()
+        if isinstance(spec, dict) and spec.get("examples") == []
+    )
+    assert not empty, empty[:10]

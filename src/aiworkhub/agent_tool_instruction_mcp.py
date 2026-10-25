@@ -237,17 +237,29 @@ def _mcp_preview(provider: InstructionTarget | None = None) -> dict[str, Any]:
     repository via ``--repo``, but the MCP surface is pinned to the
     server's active repository. ``provider`` is an instruction-file target,
     not a model provider; its schema enumerates all valid filenames.
+
+    Args:
+        provider: Instruction file to preview: AGENTS.md, CLAUDE.md or .github/copilot-instructions.md; omit to preview all three.
     """
     return preview(repo_root=str(core.repo_root()), provider=provider)
 
 
 def _mcp_inspect(provider: InstructionTarget) -> dict[str, Any]:
-    """MCP-bound: inspect using the server's active repository root."""
+    """MCP-bound: inspect using the server's active repository root.
+
+    Args:
+        provider: Instruction file to inspect for managed-block markers: AGENTS.md, CLAUDE.md or .github/copilot-instructions.md.
+    """
     return inspect_document(repo_root=str(core.repo_root()), provider=provider)
 
 
 def _mcp_apply(provider: InstructionTarget, write: bool = False) -> dict[str, Any]:
-    """MCP-bound: apply using the server's active repository root."""
+    """MCP-bound: apply using the server's active repository root.
+
+    Args:
+        provider: Instruction file to activate the managed policy block in: AGENTS.md, CLAUDE.md or .github/copilot-instructions.md.
+        write: true writes the block, and is refused with write_gate_disabled unless the server's write gate is open; default false is a dry run that returns the diff.
+    """
     return apply(repo_root=str(core.repo_root()), provider=provider, write=write)
 
 
