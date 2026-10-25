@@ -26,6 +26,7 @@ from . import reasoning_policy, repository_state
 from .runtime_adapters import (  # the ONE editor model vocabulary declaration
     EDITOR_REQUESTED_MODEL_RE,
     GLM_COLD_START_FALLBACK_MODEL,
+    _derive_reasoning_request,
     discover_callable_model_names,
 )
 from .source_graph import SOURCE_GRAPH_MODES
@@ -720,27 +721,6 @@ def _enum_member(enum_cls: Any, value: object, default: Any) -> Any:
     raise BridgeError(f"bridge_reasoning_{enum_cls.__name__.lower()}_invalid")
 
 
-def _coerce_card_work_kind(value: object, *, review: bool) -> Any:
-    default = (
-        reasoning_policy.WorkKind.CORRECTNESS_REVIEW
-        if review
-        else reasoning_policy.WorkKind.REPOSITORY_CODING
-    )
-    if isinstance(value, reasoning_policy.WorkKind):
-        return value
-    if value is None:
-        return default
-    text = str(value).strip().lower().replace("-", "_")
-    if not text:
-        return default
-    for member in reasoning_policy.WorkKind:
-        if member.value == text or member.name.lower() == text:
-            return member
-    if str(value).strip().lower() == "security":
-        return reasoning_policy.WorkKind.SECURITY
-    return default
-
-
 def _host_model_entry(host_readiness: dict[str, Any] | None) -> dict[str, Any]:
     entry = (host_readiness or {}).get("selected_model_entry")
     return entry if isinstance(entry, dict) else {}
@@ -766,9 +746,20 @@ def vscode_lm_effort_request(
     card: dict[str, Any] | None = None,
     model: str = "",
     provider_family: object = None,
+    target_card: dict[str, Any] | None = None,
+    lens: str | None = None,
 ) -> reasoning_policy.EffortRequest:
     fields = card if isinstance(card, dict) else {}
     review = request_kind == "quality_review"
+    # Risk, difficulty and work kind come from the CLI route's own derivation,
+    # so both routes shape a review by the card under review, apply the same
+    # rework rule, and fail closed to a high-risk target when it is unknown.
+    shared = _derive_reasoning_request(
+        "vscode_lm",
+        fields,
+        is_reviewer=review,
+        target_card=target_card if isinstance(target_card, dict) else None,
+    )
     family_value = provider_family if provider_family is not None else fields.get("provider_family")
     if family_value is None or str(family_value).strip() == "":
         family = reasoning_policy.provider_family_for_route(
@@ -792,18 +783,11 @@ def vscode_lm_effort_request(
             fields.get("role"),
             reasoning_policy.TaskRole.REVIEWER if review else reasoning_policy.TaskRole.IMPLEMENTER,
         ),
-        risk_tier=_enum_member(
-            reasoning_policy.RiskTier,
-            fields.get("risk_tier") or fields.get("risk"),
-            reasoning_policy.RiskTier.HIGH if review else reasoning_policy.RiskTier.MEDIUM,
-        ),
-        work_kind=_coerce_card_work_kind(fields.get("work_kind"), review=review),
-        difficulty=_enum_member(
-            reasoning_policy.Difficulty,
-            fields.get("difficulty"),
-            reasoning_policy.Difficulty.STANDARD,
-        ),
+        risk_tier=shared.risk_tier,
+        work_kind=shared.work_kind,
+        difficulty=shared.difficulty,
         provider_family=family,
+        review_lens=(str(lens).strip().lower() or None) if review and lens else None,
     )
 
 
@@ -862,8 +846,16 @@ def resolve_vscode_lm_reasoning(
     card: dict[str, Any] | None = None,
     host_readiness: dict[str, Any] | None = None,
     token_budget: object = None,
+    target_card: dict[str, Any] | None = None,
+    lens: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    request = vscode_lm_effort_request(request_kind=request_kind, card=card, model=model)
+    request = vscode_lm_effort_request(
+        request_kind=request_kind,
+        card=card,
+        model=model,
+        target_card=target_card,
+        lens=lens,
+    )
     route = vscode_lm_route_capability(model, host_readiness)
     decision = reasoning_policy.resolve_reasoning_effort(request, route)
     payload = decision.as_dict()
@@ -900,6 +892,8 @@ def create_request(
     required_outputs: list[str] | None = None,
     card: dict[str, Any] | None = None,
     token_budget: dict[str, Any] | None = None,
+    target_card: dict[str, Any] | None = None,
+    lens: str | None = None,
 ) -> BridgeRequest:
     """Publish one repo-scoped request and private worker-side contract."""
     if not _REQUEST_ID_RE.fullmatch(request_id):
@@ -925,6 +919,8 @@ def create_request(
         card=card,
         host_readiness=host_readiness,
         token_budget=token_budget,
+        target_card=target_card,
+        lens=lens,
     )
     target_window_id = str(host_readiness.get("window_id") or "").strip()
     response_path = workspace_home / ".aiworkhub_vscode_lm_response.json"

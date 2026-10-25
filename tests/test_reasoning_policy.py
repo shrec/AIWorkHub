@@ -59,10 +59,20 @@ def _is_mandatory_maximum(request: EffortRequest) -> bool:
     return (
         request.risk_tier is RiskTier.CRITICAL
         or request.difficulty is Difficulty.COMPLEX
-        or request.work_kind
-        in {WorkKind.SECURITY, WorkKind.ARCHITECTURE, WorkKind.CORRECTNESS_REVIEW}
-        or request.role
-        in {TaskRole.SECURITY_AUDITOR, TaskRole.ARCHITECT, TaskRole.REVIEWER}
+        or request.work_kind in {WorkKind.SECURITY, WorkKind.ARCHITECTURE}
+        or request.role in {TaskRole.SECURITY_AUDITOR, TaskRole.ARCHITECT}
+        or (
+            request.role is TaskRole.REVIEWER
+            and request.risk_tier in {RiskTier.HIGH, RiskTier.CRITICAL}
+        )
+    )
+
+
+def _is_bounded_medium_implementer(request: EffortRequest) -> bool:
+    return (
+        request.role is TaskRole.IMPLEMENTER
+        and request.difficulty is Difficulty.BOUNDED
+        and request.risk_tier in {RiskTier.LOW, RiskTier.MEDIUM}
     )
 
 
@@ -80,16 +90,23 @@ def _is_explicit_mechanical(request: EffortRequest) -> bool:
 
 def test_the_canonical_ladder_has_no_low_or_minimal_rung():
     names = {profile.name for profile in ReasoningProfile}
-    assert names == {"MEDIUM_HIGH", "HIGH", "MAXIMUM"}
+    assert names == {"MEDIUM", "MEDIUM_HIGH", "HIGH", "MAXIMUM"}
     values = " ".join(profile.value for profile in ReasoningProfile)
     assert "low" not in values and "minimal" not in values
-    assert ABSOLUTE_FLOOR is ReasoningProfile.MEDIUM_HIGH
+    assert ReasoningProfile.MEDIUM.value == "canonical_medium"
+    assert ABSOLUTE_FLOOR is ReasoningProfile.MEDIUM
 
 
 def test_profiles_order_by_reasoning_quality():
-    assert ReasoningProfile.MEDIUM_HIGH < ReasoningProfile.HIGH < ReasoningProfile.MAXIMUM
+    assert (
+        ReasoningProfile.MEDIUM
+        < ReasoningProfile.MEDIUM_HIGH
+        < ReasoningProfile.HIGH
+        < ReasoningProfile.MAXIMUM
+    )
     assert max(ReasoningProfile) is ReasoningProfile.MAXIMUM
     assert sorted(ReasoningProfile) == [
+        ReasoningProfile.MEDIUM,
         ReasoningProfile.MEDIUM_HIGH,
         ReasoningProfile.HIGH,
         ReasoningProfile.MAXIMUM,
@@ -110,18 +127,29 @@ def test_every_matrix_cell_selects_at_or_above_the_absolute_floor():
         assert selected >= ABSOLUTE_FLOOR, request
 
 
-def test_only_explicitly_mechanical_bounded_low_risk_work_may_drop_below_maximum_floor():
+def test_only_bounded_low_or_medium_risk_implementer_work_may_select_below_high():
     for request in ALL_REQUESTS:
         selected = select_reasoning_profile(request).selected
         if selected < ReasoningProfile.HIGH:
-            assert _is_explicit_mechanical(request), request
-            assert request.provider_family is not ProviderFamily.CLAUDE, request
+            assert selected is ReasoningProfile.MEDIUM, request
+            assert _is_bounded_medium_implementer(request) or _is_explicit_mechanical(
+                request
+            ), request
 
 
 def test_mandatory_escalations_reach_canonical_maximum_for_every_provider_family():
     for request in ALL_REQUESTS:
         if _is_mandatory_maximum(request):
             assert select_reasoning_profile(request).selected is ReasoningProfile.MAXIMUM, request
+
+
+def test_maximum_is_reached_only_through_a_named_escalation():
+    for request in ALL_REQUESTS:
+        rationale = select_reasoning_profile(request)
+        assert rationale.baseline is not ReasoningProfile.MAXIMUM, request
+        if rationale.selected is ReasoningProfile.MAXIMUM:
+            assert rationale.escalations, request
+            assert rationale.decisive_reason in rationale.reason_codes, request
 
 
 def test_selection_is_a_pure_deterministic_function_of_the_declared_inputs():
@@ -132,32 +160,37 @@ def test_selection_is_a_pure_deterministic_function_of_the_declared_inputs():
         assert first.selected is second.selected
 
 
-@pytest.mark.parametrize("risk", [RiskTier.LOW, RiskTier.MEDIUM, RiskTier.HIGH])
-@pytest.mark.parametrize("kind", [WorkKind.REPOSITORY_CODING, WorkKind.REWORK])
-def test_claude_repository_coding_defaults_to_canonical_maximum(risk, kind):
-    rationale = select_reasoning_profile(
-        _request(risk_tier=risk, work_kind=kind, provider_family=ProviderFamily.CLAUDE)
-    )
-    assert rationale.selected is ReasoningProfile.MAXIMUM
-    assert rationale.baseline is ReasoningProfile.MAXIMUM
+# --- implementer baseline ---------------------------------------------------
+
+ALL_FAMILIES = tuple(ProviderFamily)
+_CODING_KINDS = (WorkKind.REPOSITORY_CODING, WorkKind.MECHANICAL_EDIT, WorkKind.REWORK)
 
 
-def test_claude_explicit_mechanical_bounded_low_risk_work_never_falls_below_high():
+@pytest.mark.parametrize("family", ALL_FAMILIES)
+@pytest.mark.parametrize("risk", [RiskTier.LOW, RiskTier.MEDIUM])
+@pytest.mark.parametrize("kind", _CODING_KINDS)
+def test_bounded_low_or_medium_risk_implementer_selects_medium_on_every_family(
+    family, risk, kind
+):
     rationale = select_reasoning_profile(
         _request(
-            role=TaskRole.MECHANICAL_OPERATOR,
-            risk_tier=RiskTier.LOW,
-            work_kind=WorkKind.MECHANICAL_EDIT,
+            risk_tier=risk,
+            work_kind=kind,
             difficulty=Difficulty.BOUNDED,
-            provider_family=ProviderFamily.CLAUDE,
+            provider_family=family,
         )
     )
-    assert rationale.selected is ReasoningProfile.HIGH
-    assert rationale.baseline_reason == "claude_explicit_mechanical_floor_high"
+    assert rationale.selected is ReasoningProfile.MEDIUM
+    assert rationale.baseline is ReasoningProfile.MEDIUM
+    assert rationale.escalations == ()
+    if kind is WorkKind.MECHANICAL_EDIT and risk is RiskTier.LOW:
+        assert rationale.decisive_reason == "explicit_mechanical_bounded_low_risk"
+    else:
+        assert rationale.decisive_reason == "bounded_implementer_medium"
 
 
-@pytest.mark.parametrize("family", NON_CLAUDE_FAMILIES)
-def test_non_claude_explicit_mechanical_work_may_select_medium_high(family):
+@pytest.mark.parametrize("family", ALL_FAMILIES)
+def test_explicit_mechanical_bounded_low_risk_work_selects_medium(family):
     rationale = select_reasoning_profile(
         _request(
             role=TaskRole.MECHANICAL_OPERATOR,
@@ -167,153 +200,129 @@ def test_non_claude_explicit_mechanical_work_may_select_medium_high(family):
             provider_family=family,
         )
     )
-    assert rationale.selected is ReasoningProfile.MEDIUM_HIGH
+    assert rationale.selected is ReasoningProfile.MEDIUM
     assert rationale.baseline_reason == "explicit_mechanical_bounded_low_risk"
 
 
-@pytest.mark.parametrize("family", NON_CLAUDE_FAMILIES)
-def test_ordinary_repository_coding_never_resolves_below_high(family):
-    rationale = select_reasoning_profile(_request(provider_family=family))
-    assert rationale.selected is ReasoningProfile.HIGH
-
-
-def test_a_mechanical_edit_that_is_not_bounded_and_low_risk_keeps_the_coding_default():
-    claude = select_reasoning_profile(
+@pytest.mark.parametrize("family", ALL_FAMILIES)
+def test_bounded_high_risk_implementer_selects_high(family):
+    rationale = select_reasoning_profile(
         _request(
-            work_kind=WorkKind.MECHANICAL_EDIT,
             risk_tier=RiskTier.HIGH,
-            # A bounded Claude implementer is lowered to HIGH by the declared
-            # difficulty itself, not by this shape; that case has its own tests.
-            difficulty=Difficulty.STANDARD,
-            provider_family=ProviderFamily.CLAUDE,
+            difficulty=Difficulty.BOUNDED,
+            provider_family=family,
         )
     )
-    assert claude.selected is ReasoningProfile.MAXIMUM
-    other = select_reasoning_profile(
-        _request(
-            work_kind=WorkKind.MECHANICAL_EDIT,
-            risk_tier=RiskTier.LOW,
-            difficulty=Difficulty.STANDARD,
-            provider_family=ProviderFamily.CODEX,
-        )
-    )
-    assert other.selected is ReasoningProfile.HIGH
+    assert rationale.selected is ReasoningProfile.HIGH
+    assert rationale.escalations == ()
+    assert rationale.decisive_reason == "bounded_high_risk_implementer_high"
 
 
-# --- declared-bounded Claude implementer ------------------------------------
-
-_CODING_KINDS = (WorkKind.REPOSITORY_CODING, WorkKind.MECHANICAL_EDIT, WorkKind.REWORK)
-
-
-def _is_bounded_claude_implementer_coding(request: EffortRequest) -> bool:
-    return (
-        request.provider_family is ProviderFamily.CLAUDE
-        and request.role is TaskRole.IMPLEMENTER
-        and request.difficulty is Difficulty.BOUNDED
-        and request.work_kind in _CODING_KINDS
-    )
-
-
+@pytest.mark.parametrize("family", ALL_FAMILIES)
 @pytest.mark.parametrize("risk", [RiskTier.LOW, RiskTier.MEDIUM, RiskTier.HIGH])
-@pytest.mark.parametrize("kind", _CODING_KINDS)
-def test_claude_bounded_implementer_coding_selects_high_not_maximum(risk, kind):
+@pytest.mark.parametrize("kind", [WorkKind.REPOSITORY_CODING, WorkKind.REWORK])
+def test_standard_implementer_selects_high_never_the_old_claude_maximum(family, risk, kind):
     rationale = select_reasoning_profile(
         _request(
             risk_tier=risk,
             work_kind=kind,
-            difficulty=Difficulty.BOUNDED,
-            provider_family=ProviderFamily.CLAUDE,
+            difficulty=Difficulty.STANDARD,
+            provider_family=family,
         )
     )
     assert rationale.selected is ReasoningProfile.HIGH
     assert rationale.baseline is ReasoningProfile.HIGH
     assert rationale.escalations == ()
-    if kind is WorkKind.MECHANICAL_EDIT and risk is RiskTier.LOW:
-        # The explicit mechanical floor is decided first and keeps its reason.
-        assert rationale.decisive_reason == "claude_explicit_mechanical_floor_high"
-    else:
-        assert rationale.decisive_reason == "claude_bounded_implementer_high"
+    assert rationale.decisive_reason == "standard_implementer_high"
 
 
-@pytest.mark.parametrize("difficulty", [Difficulty.STANDARD, Difficulty.COMPLEX])
-def test_claude_coding_not_declared_bounded_keeps_the_maximum_default(difficulty):
+@pytest.mark.parametrize("family", ALL_FAMILIES)
+def test_complex_difficulty_is_the_only_way_a_coding_implementer_reaches_maximum(family):
     rationale = select_reasoning_profile(
-        _request(difficulty=difficulty, provider_family=ProviderFamily.CLAUDE)
+        _request(difficulty=Difficulty.COMPLEX, provider_family=family)
     )
     assert rationale.selected is ReasoningProfile.MAXIMUM
-    assert rationale.baseline_reason == "claude_repository_coding_default_maximum"
+    assert rationale.baseline is ReasoningProfile.HIGH
+    assert rationale.decisive_reason == "complex_difficulty"
 
 
-@pytest.mark.parametrize(
-    ("overrides", "reason"),
-    [
-        ({"risk_tier": RiskTier.CRITICAL}, "critical_risk_tier"),
-        ({"work_kind": WorkKind.SECURITY}, "security_work"),
-        ({"work_kind": WorkKind.ARCHITECTURE}, "architecture_work"),
-        ({"work_kind": WorkKind.CORRECTNESS_REVIEW}, "correctness_review_work"),
-        ({"role": TaskRole.REVIEWER}, "correctness_review_work"),
-        ({"role": TaskRole.SECURITY_AUDITOR}, "security_work"),
-        ({"role": TaskRole.ARCHITECT}, "architecture_work"),
-    ],
-)
-def test_a_bounded_claude_implementer_still_escalates_to_maximum(overrides, reason):
-    shape = {
-        "risk_tier": RiskTier.LOW,
-        "difficulty": Difficulty.BOUNDED,
-        "provider_family": ProviderFamily.CLAUDE,
-    }
-    shape.update(overrides)
-    rationale = select_reasoning_profile(_request(**shape))
-    assert rationale.selected is ReasoningProfile.MAXIMUM
-    assert reason in rationale.reason_codes
-
-
-@pytest.mark.parametrize("role", [TaskRole.PLANNER, TaskRole.MECHANICAL_OPERATOR])
-def test_the_bounded_lowering_needs_the_implementer_role(role):
+@pytest.mark.parametrize("family", ALL_FAMILIES)
+def test_a_planner_keeps_the_high_quality_floor(family):
     rationale = select_reasoning_profile(
         _request(
-            role=role,
+            role=TaskRole.PLANNER,
             difficulty=Difficulty.BOUNDED,
-            provider_family=ProviderFamily.CLAUDE,
+            provider_family=family,
         )
-    )
-    assert rationale.selected is ReasoningProfile.MAXIMUM
-    assert rationale.baseline_reason == "claude_repository_coding_default_maximum"
-
-
-@pytest.mark.parametrize("family", NON_CLAUDE_FAMILIES)
-def test_the_bounded_lowering_is_claude_only(family):
-    rationale = select_reasoning_profile(
-        _request(difficulty=Difficulty.BOUNDED, provider_family=family)
     )
     assert rationale.selected is ReasoningProfile.HIGH
     assert rationale.baseline_reason == "repository_coding_quality_floor_high"
 
 
-def test_claude_lands_below_maximum_only_for_declared_cheap_shapes():
-    for request in ALL_REQUESTS:
-        if request.provider_family is not ProviderFamily.CLAUDE:
-            continue
-        if select_reasoning_profile(request).selected is ReasoningProfile.MAXIMUM:
-            continue
-        assert not _is_mandatory_maximum(request), request
-        assert (
-            _is_bounded_claude_implementer_coding(request)
-            or _is_explicit_mechanical(request)
-            or request.work_kind not in _CODING_KINDS
-        ), request
+# --- reviewer ---------------------------------------------------------------
 
 
-def test_every_unescalated_bounded_claude_implementer_cell_selects_exactly_high():
-    cells = [
-        request
-        for request in ALL_REQUESTS
-        if _is_bounded_claude_implementer_coding(request)
-        and not _is_mandatory_maximum(request)
-    ]
-    assert cells
-    for request in cells:
-        assert select_reasoning_profile(request).selected is ReasoningProfile.HIGH, request
+@pytest.mark.parametrize("family", ALL_FAMILIES)
+@pytest.mark.parametrize("risk", [RiskTier.LOW, RiskTier.MEDIUM])
+@pytest.mark.parametrize("difficulty", [Difficulty.BOUNDED, Difficulty.STANDARD])
+@pytest.mark.parametrize("lens", [None, "correctness", "code_quality"])
+def test_a_reviewer_of_a_low_or_medium_risk_non_complex_target_selects_high(
+    family, risk, difficulty, lens
+):
+    rationale = select_reasoning_profile(
+        _request(
+            role=TaskRole.REVIEWER,
+            work_kind=WorkKind.CORRECTNESS_REVIEW,
+            risk_tier=risk,
+            difficulty=difficulty,
+            provider_family=family,
+            review_lens=lens,
+        )
+    )
+    assert rationale.selected is ReasoningProfile.HIGH
+    assert rationale.escalations == ()
+    assert rationale.decisive_reason == "reviewer_baseline_high"
+
+
+@pytest.mark.parametrize("family", ALL_FAMILIES)
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"review_lens": "security"}, "security_lens_review"),
+        ({"review_lens": " Security "}, "security_lens_review"),
+        ({"risk_tier": RiskTier.HIGH}, "high_risk_target_review"),
+        ({"risk_tier": RiskTier.CRITICAL}, "high_risk_target_review"),
+        ({"risk_tier": RiskTier.CRITICAL}, "critical_risk_tier"),
+        ({"difficulty": Difficulty.COMPLEX}, "complex_difficulty"),
+    ],
+)
+def test_a_reviewer_is_lifted_to_maximum_only_by_lens_target_risk_or_complexity(
+    family, overrides, reason
+):
+    shape = {
+        "role": TaskRole.REVIEWER,
+        "work_kind": WorkKind.CORRECTNESS_REVIEW,
+        "risk_tier": RiskTier.LOW,
+        "difficulty": Difficulty.BOUNDED,
+        "provider_family": family,
+    }
+    shape.update(overrides)
+    rationale = select_reasoning_profile(_request(**shape))
+    assert rationale.selected is ReasoningProfile.MAXIMUM
+    assert rationale.baseline is ReasoningProfile.HIGH
+    assert reason in rationale.reason_codes
+
+
+def test_correctness_review_work_kind_alone_no_longer_lifts_an_implementer():
+    rationale = select_reasoning_profile(
+        _request(
+            work_kind=WorkKind.CORRECTNESS_REVIEW,
+            risk_tier=RiskTier.LOW,
+            difficulty=Difficulty.STANDARD,
+        )
+    )
+    assert rationale.selected is ReasoningProfile.HIGH
+    assert rationale.escalations == ()
 
 
 @pytest.mark.parametrize("family", list(ProviderFamily))
@@ -325,11 +334,17 @@ def test_every_unescalated_bounded_claude_implementer_cell_selects_exactly_high(
         ({"role": TaskRole.SECURITY_AUDITOR}, "security_work"),
         ({"work_kind": WorkKind.ARCHITECTURE}, "architecture_work"),
         ({"role": TaskRole.ARCHITECT}, "architecture_work"),
-        ({"work_kind": WorkKind.CORRECTNESS_REVIEW}, "correctness_review_work"),
-        ({"role": TaskRole.REVIEWER}, "correctness_review_work"),
         (
             {"work_kind": WorkKind.REWORK, "difficulty": Difficulty.COMPLEX},
             "complex_difficulty",
+        ),
+        (
+            {"role": TaskRole.REVIEWER, "review_lens": "security"},
+            "security_lens_review",
+        ),
+        (
+            {"role": TaskRole.REVIEWER, "risk_tier": RiskTier.HIGH},
+            "high_risk_target_review",
         ),
     ],
 )
@@ -364,7 +379,7 @@ def test_the_rationale_is_machine_readable_and_json_serializable():
     assert json.loads(json.dumps(payload)) == payload
     assert payload["selected"] == "canonical_maximum"
     assert payload["decisive_reason"] == "critical_risk_tier"
-    assert payload["never_below"] == "canonical_medium_high"
+    assert payload["never_below"] == "canonical_medium"
     assert "no_cost_based_downgrade" in payload["invariants"]
     assert payload["escalations"][0]["profile"] == "canonical_maximum"
 
@@ -372,7 +387,7 @@ def test_the_rationale_is_machine_readable_and_json_serializable():
 def test_the_decisive_reason_is_the_baseline_when_nothing_escalates():
     rationale = select_reasoning_profile(_request(provider_family=ProviderFamily.GLM))
     assert rationale.escalations == ()
-    assert rationale.decisive_reason == "repository_coding_quality_floor_high"
+    assert rationale.decisive_reason == "standard_implementer_high"
 
 
 def test_policy_inputs_and_rationales_are_immutable():
@@ -501,6 +516,9 @@ def test_recognized_keys_still_honor_a_request_alongside_an_unrecognized_one():
 
 
 def test_lower_rungs_pick_the_cheapest_key_that_still_honors_them():
+    medium = normalize_for_route(ReasoningProfile.MEDIUM, CLAUDE_ROUTE)
+    assert medium.applied_key == "medium"
+    assert medium.applied is True
     high = normalize_for_route(ReasoningProfile.HIGH, CLAUDE_ROUTE)
     assert high.applied_key == "high"
     assert high.applied is True
@@ -536,6 +554,7 @@ def test_normalization_never_selects_a_key_below_the_canonical_request():
         "max": 70,
     }
     required = {
+        ReasoningProfile.MEDIUM: 30,
         ReasoningProfile.MEDIUM_HIGH: 40,
         ReasoningProfile.HIGH: 50,
         ReasoningProfile.MAXIMUM: 50,
@@ -728,7 +747,8 @@ def test_malformed_route_capabilities_are_rejected(kwargs):
 
 def test_resolution_pairs_the_canonical_profile_with_the_route_key():
     decision = resolve_reasoning_effort(
-        _request(provider_family=ProviderFamily.CLAUDE), CLAUDE_ROUTE
+        _request(provider_family=ProviderFamily.CLAUDE, risk_tier=RiskTier.CRITICAL),
+        CLAUDE_ROUTE,
     )
     assert decision.profile is ReasoningProfile.MAXIMUM
     assert decision.route_effort is not None
@@ -741,8 +761,37 @@ def test_resolution_pairs_the_canonical_profile_with_the_route_key():
 def test_an_unstated_provider_family_adopts_the_routes_family():
     decision = resolve_reasoning_effort(_request(), CLAUDE_ROUTE)
     assert decision.request.provider_family is ProviderFamily.CLAUDE
+    assert decision.profile is ReasoningProfile.HIGH
+    assert decision.route_effort is not None
+    assert decision.route_effort.applied_key == "high"
+    assert decision.rationale.baseline_reason == "standard_implementer_high"
+
+
+def test_the_review_lens_survives_family_adoption_and_is_serialized():
+    decision = resolve_reasoning_effort(
+        _request(role=TaskRole.REVIEWER, review_lens="security"), CLAUDE_ROUTE
+    )
+    assert decision.request.review_lens == "security"
+    assert decision.request.as_dict()["review_lens"] == "security"
     assert decision.profile is ReasoningProfile.MAXIMUM
-    assert decision.rationale.baseline_reason == "claude_repository_coding_default_maximum"
+
+
+def test_every_rung_resolves_to_an_applied_key_on_the_codex_ladder():
+    codex = RouteCapability(
+        "codex_cli",
+        ProviderFamily.CODEX,
+        effort_keys=("minimal", "low", "medium", "high", "xhigh"),
+    )
+    expected = {
+        ReasoningProfile.MEDIUM: "medium",
+        ReasoningProfile.MEDIUM_HIGH: "high",
+        ReasoningProfile.HIGH: "high",
+        ReasoningProfile.MAXIMUM: "xhigh",
+    }
+    for profile in ReasoningProfile:
+        effort = normalize_for_route(profile, codex)
+        assert effort.applied is True, profile
+        assert effort.applied_key == expected[profile], profile
 
 
 def test_a_stated_family_that_contradicts_the_route_is_an_error():

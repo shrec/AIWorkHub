@@ -857,11 +857,29 @@ def launch_isolated(
             # plan.  The decision is None for any route with no verified effort
             # control (or an unverified model), and only an APPLIED decision ever
             # contributes argv tokens (see runtime_adapters).
+            # NF-2026-01697.  A reviewer's effort follows the card under review
+            # and the lens, not the reviewer card; an unreadable target card
+            # stays None and the policy then fails closed to a high-risk target.
+            review_target_card: dict[str, Any] | None = None
+            if quality_review_binding is not None:
+                _review_target_id = str(quality_review_binding["target_task_id"])
+                try:
+                    review_target_card = _pl._parse_card(
+                        self._show_task(_review_target_id), _review_target_id
+                    )
+                except LaunchRejected:
+                    review_target_card = None
             reasoning_decision = runtime_adapters.resolve_adapter_reasoning(
                 adapter_id,
                 card,
                 is_reviewer=quality_review_binding is not None,
                 model=model,
+                target_card=review_target_card,
+                lens=(
+                    str(quality_review_binding["lens"])
+                    if quality_review_binding is not None
+                    else None
+                ),
             )
             context_capacity = runtime_adapters.resolve_context_capacity(
                 adapter_id,
@@ -891,6 +909,14 @@ def launch_isolated(
                         dict(card["token_budget"])
                         if isinstance(card.get("token_budget"), dict)
                         else None
+                    ),
+                    **(
+                        {
+                            "target_card": review_target_card,
+                            "lens": str(quality_review_binding["lens"]),
+                        }
+                        if quality_review_binding is not None
+                        else {}
                     ),
                 )
                 plan = runtime_adapters.RuntimeAdapterPlan(

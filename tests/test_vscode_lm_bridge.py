@@ -3308,3 +3308,57 @@ def test_vscode_lm_effort_request_maps_card_vocabulary_without_bridge_error() ->
     assert data_ml.work_kind.value == "repository_coding"
     assert security.work_kind.value == "security"
     assert review.work_kind.value == "correctness_review"
+
+
+def test_resolve_vscode_lm_reasoning_review_effort_follows_the_target_card_and_lens() -> None:
+    host = {
+        "selected_model_entry": {
+            "id": "glm-5.2",
+            "maxInputTokens": 64000,
+            "effortOptionKey": "reasoningEffort",
+            "effortKeys": ["low", "medium", "high", "xhigh"],
+        }
+    }
+    reviewer_card = {"role": "reviewer", "risk_tier": "critical", "difficulty": "complex"}
+    benign = {"risk_tier": "low", "difficulty": "bounded"}
+
+    baseline, _ctx = vscode_lm_bridge.resolve_vscode_lm_reasoning(
+        request_kind="quality_review",
+        model="glm-5.2",
+        card=reviewer_card,
+        host_readiness=host,
+        target_card=benign,
+        lens="correctness",
+    )
+    assert baseline["profile"] == "canonical_high"
+    assert baseline["route_effort"]["applied_key"] == "high"
+
+    security_lens, _ctx = vscode_lm_bridge.resolve_vscode_lm_reasoning(
+        request_kind="quality_review",
+        model="glm-5.2",
+        card=reviewer_card,
+        host_readiness=host,
+        target_card=benign,
+        lens="security",
+    )
+    assert security_lens["profile"] == "canonical_maximum"
+    assert security_lens["request"]["review_lens"] == "security"
+    assert security_lens["route_effort"]["applied_key"] == "xhigh"
+
+    risky_target, _ctx = vscode_lm_bridge.resolve_vscode_lm_reasoning(
+        request_kind="quality_review",
+        model="glm-5.2",
+        card={"role": "reviewer", "risk_tier": "low"},
+        host_readiness=host,
+        target_card={"risk_tier": "high"},
+        lens="correctness",
+    )
+    assert risky_target["profile"] == "canonical_maximum"
+
+    unknown_target, _ctx = vscode_lm_bridge.resolve_vscode_lm_reasoning(
+        request_kind="quality_review",
+        model="glm-5.2",
+        card={"role": "reviewer", "risk_tier": "low"},
+        host_readiness=host,
+    )
+    assert unknown_target["profile"] == "canonical_maximum"

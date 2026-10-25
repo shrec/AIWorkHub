@@ -66,8 +66,10 @@ class ReasoningProfile(Enum):
 
     There is deliberately no ``LOW`` or ``MINIMAL`` member: this policy core
     never trades reasoning quality for cost, so those rungs cannot be named.
+    ``MEDIUM`` is the lowest rung and is reached only by bounded work.
     """
 
+    MEDIUM = "canonical_medium"
     MEDIUM_HIGH = "canonical_medium_high"
     HIGH = "canonical_high"
     MAXIMUM = "canonical_maximum"
@@ -84,13 +86,14 @@ class ReasoningProfile(Enum):
 
 
 _PROFILE_RANK: dict[ReasoningProfile, int] = {
-    ReasoningProfile.MEDIUM_HIGH: 1,
-    ReasoningProfile.HIGH: 2,
-    ReasoningProfile.MAXIMUM: 3,
+    ReasoningProfile.MEDIUM: 1,
+    ReasoningProfile.MEDIUM_HIGH: 2,
+    ReasoningProfile.HIGH: 3,
+    ReasoningProfile.MAXIMUM: 4,
 }
 
 #: The lowest rung any branch of this policy may ever select.
-ABSOLUTE_FLOOR = ReasoningProfile.MEDIUM_HIGH
+ABSOLUTE_FLOOR = ReasoningProfile.MEDIUM
 
 
 # --- declared inputs --------------------------------------------------------
@@ -179,22 +182,30 @@ def provider_family_for_route(route_id: str) -> ProviderFamily:
 
 @dataclass(frozen=True)
 class EffortRequest:
-    """The four declared policy inputs plus the provider family they run on."""
+    """The four declared policy inputs plus the provider family they run on.
+
+    For a reviewer, ``risk_tier`` and ``difficulty`` are those of the reviewed
+    target card and ``review_lens`` names the lens being reviewed.
+    """
 
     role: TaskRole
     risk_tier: RiskTier
     work_kind: WorkKind
     difficulty: Difficulty
     provider_family: ProviderFamily = ProviderFamily.OTHER
+    review_lens: str | None = None
 
     def as_dict(self) -> dict[str, str]:
-        return {
+        payload = {
             "role": self.role.value,
             "risk_tier": self.risk_tier.value,
             "work_kind": self.work_kind.value,
             "difficulty": self.difficulty.value,
             "provider_family": self.provider_family.value,
         }
+        if self.review_lens:
+            payload["review_lens"] = self.review_lens
+        return payload
 
 
 # --- rationale --------------------------------------------------------------
@@ -202,11 +213,13 @@ class EffortRequest:
 REASON_CRITICAL_RISK = "critical_risk_tier"
 REASON_SECURITY_WORK = "security_work"
 REASON_ARCHITECTURE_WORK = "architecture_work"
-REASON_CORRECTNESS_REVIEW_WORK = "correctness_review_work"
+REASON_SECURITY_LENS_REVIEW = "security_lens_review"
+REASON_HIGH_RISK_TARGET_REVIEW = "high_risk_target_review"
 REASON_COMPLEX_DIFFICULTY = "complex_difficulty"
-REASON_CLAUDE_REPOSITORY_DEFAULT = "claude_repository_coding_default_maximum"
-REASON_CLAUDE_MECHANICAL_FLOOR = "claude_explicit_mechanical_floor_high"
-REASON_CLAUDE_BOUNDED_IMPLEMENTER = "claude_bounded_implementer_high"
+REASON_REVIEWER_BASELINE_HIGH = "reviewer_baseline_high"
+REASON_BOUNDED_IMPLEMENTER_MEDIUM = "bounded_implementer_medium"
+REASON_BOUNDED_HIGH_RISK_IMPLEMENTER_HIGH = "bounded_high_risk_implementer_high"
+REASON_STANDARD_IMPLEMENTER_HIGH = "standard_implementer_high"
 REASON_EXPLICIT_MECHANICAL = "explicit_mechanical_bounded_low_risk"
 REASON_REPOSITORY_QUALITY_FLOOR = "repository_coding_quality_floor_high"
 REASON_GENERAL_QUALITY_FLOOR = "general_quality_floor_high"
@@ -264,6 +277,9 @@ _REPOSITORY_CODING_KINDS = frozenset(
     {WorkKind.REPOSITORY_CODING, WorkKind.MECHANICAL_EDIT, WorkKind.REWORK}
 )
 _MECHANICAL_ROLES = frozenset({TaskRole.IMPLEMENTER, TaskRole.MECHANICAL_OPERATOR})
+_SECURITY_LENS = "security"
+_HIGH_RISK_TIERS = frozenset({RiskTier.HIGH, RiskTier.CRITICAL})
+_BOUNDED_MEDIUM_RISK_TIERS = frozenset({RiskTier.LOW, RiskTier.MEDIUM})
 
 
 def _is_explicitly_mechanical(request: EffortRequest) -> bool:
@@ -276,8 +292,17 @@ def _is_explicitly_mechanical(request: EffortRequest) -> bool:
     )
 
 
+def _is_security_lens(request: EffortRequest) -> bool:
+    return (request.review_lens or "").strip().lower() == _SECURITY_LENS
+
+
 def _escalations(request: EffortRequest) -> tuple[Escalation, ...]:
-    """Mandatory lifts to canonical maximum, applied for every provider family."""
+    """Mandatory lifts to canonical maximum, applied for every provider family.
+
+    For a reviewer, ``risk_tier`` and ``difficulty`` describe the reviewed
+    TARGET card (the caller derives them from it), so a high-risk or complex
+    target lifts its review while a low/medium bounded target does not.
+    """
     lifts: list[Escalation] = []
     if request.risk_tier is RiskTier.CRITICAL:
         lifts.append(Escalation(REASON_CRITICAL_RISK, ReasoningProfile.MAXIMUM))
@@ -285,34 +310,36 @@ def _escalations(request: EffortRequest) -> tuple[Escalation, ...]:
         lifts.append(Escalation(REASON_SECURITY_WORK, ReasoningProfile.MAXIMUM))
     if request.work_kind is WorkKind.ARCHITECTURE or request.role is TaskRole.ARCHITECT:
         lifts.append(Escalation(REASON_ARCHITECTURE_WORK, ReasoningProfile.MAXIMUM))
-    if request.work_kind is WorkKind.CORRECTNESS_REVIEW or request.role is TaskRole.REVIEWER:
-        lifts.append(Escalation(REASON_CORRECTNESS_REVIEW_WORK, ReasoningProfile.MAXIMUM))
+    if request.role is TaskRole.REVIEWER:
+        if _is_security_lens(request):
+            lifts.append(Escalation(REASON_SECURITY_LENS_REVIEW, ReasoningProfile.MAXIMUM))
+        if request.risk_tier in _HIGH_RISK_TIERS:
+            lifts.append(Escalation(REASON_HIGH_RISK_TARGET_REVIEW, ReasoningProfile.MAXIMUM))
     if request.difficulty is Difficulty.COMPLEX:
         lifts.append(Escalation(REASON_COMPLEX_DIFFICULTY, ReasoningProfile.MAXIMUM))
     return tuple(lifts)
 
 
 def _baseline(request: EffortRequest) -> tuple[ReasoningProfile, str]:
-    """The profile before mandatory escalations, never below :data:`ABSOLUTE_FLOOR`."""
-    is_claude = request.provider_family is ProviderFamily.CLAUDE
+    """The profile before mandatory escalations, never below :data:`ABSOLUTE_FLOOR`.
+
+    Effort follows the declared work shape on every provider family: a bounded
+    low/medium-risk implementer starts at MEDIUM, a standard (or bounded
+    high-risk) one at HIGH, a reviewer at HIGH. MAXIMUM is reachable only
+    through :func:`_escalations`.
+    """
+    if request.role is TaskRole.REVIEWER:
+        return ReasoningProfile.HIGH, REASON_REVIEWER_BASELINE_HIGH
     if _is_explicitly_mechanical(request):
-        if is_claude:
-            return ReasoningProfile.HIGH, REASON_CLAUDE_MECHANICAL_FLOOR
-        return ReasoningProfile.MEDIUM_HIGH, REASON_EXPLICIT_MECHANICAL
-    # A declared-bounded task already has its problem pinned down, so a Claude
-    # implementer starts at HIGH rather than the repository default. Only the
-    # baseline moves: ``_escalations`` still lifts critical risk, security,
-    # architecture, review and complex work to MAXIMUM.
-    if (
-        is_claude
-        and request.role is TaskRole.IMPLEMENTER
-        and request.difficulty is Difficulty.BOUNDED
-        and request.work_kind in _REPOSITORY_CODING_KINDS
-    ):
-        return ReasoningProfile.HIGH, REASON_CLAUDE_BOUNDED_IMPLEMENTER
+        return ReasoningProfile.MEDIUM, REASON_EXPLICIT_MECHANICAL
+    if request.role is TaskRole.IMPLEMENTER:
+        if request.difficulty is Difficulty.BOUNDED:
+            if request.risk_tier in _BOUNDED_MEDIUM_RISK_TIERS:
+                return ReasoningProfile.MEDIUM, REASON_BOUNDED_IMPLEMENTER_MEDIUM
+            return ReasoningProfile.HIGH, REASON_BOUNDED_HIGH_RISK_IMPLEMENTER_HIGH
+        if request.difficulty is Difficulty.STANDARD:
+            return ReasoningProfile.HIGH, REASON_STANDARD_IMPLEMENTER_HIGH
     if request.work_kind in _REPOSITORY_CODING_KINDS:
-        if is_claude:
-            return ReasoningProfile.MAXIMUM, REASON_CLAUDE_REPOSITORY_DEFAULT
         return ReasoningProfile.HIGH, REASON_REPOSITORY_QUALITY_FLOOR
     return ReasoningProfile.HIGH, REASON_GENERAL_QUALITY_FLOOR
 
@@ -414,6 +441,7 @@ _KEY_ALIAS_RANK: dict[str, int] = {
 #: Canonical maximum needs a ceiling that is at least a real ``high``; a ladder
 #: topping out at ``medium`` cannot carry it and must not report ``applied``.
 _REQUIRED_KEY_RANK: dict[ReasoningProfile, int] = {
+    ReasoningProfile.MEDIUM: 30,
     ReasoningProfile.MEDIUM_HIGH: 40,
     ReasoningProfile.HIGH: 50,
     ReasoningProfile.MAXIMUM: 50,
@@ -425,6 +453,7 @@ _POSITIONAL_OFFSET: dict[ReasoningProfile, int] = {
     ReasoningProfile.MAXIMUM: 0,
     ReasoningProfile.HIGH: 1,
     ReasoningProfile.MEDIUM_HIGH: 2,
+    ReasoningProfile.MEDIUM: 3,
 }
 
 
@@ -664,6 +693,7 @@ def resolve_reasoning_effort(
                 work_kind=request.work_kind,
                 difficulty=request.difficulty,
                 provider_family=route.provider_family,
+                review_lens=request.review_lens,
             )
         elif request.provider_family is not route.provider_family:
             raise ValueError(

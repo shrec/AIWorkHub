@@ -3300,8 +3300,11 @@ def _coerce_difficulty(value: Any) -> reasoning_policy.Difficulty | None:
 
 
 def _coerce_work_kind(value: Any, *, is_reviewer: bool) -> reasoning_policy.WorkKind:
-    if isinstance(value, str) and value.strip().lower() == "security":
+    normalized = value.strip().lower() if isinstance(value, str) else ""
+    if normalized == "security":
         return reasoning_policy.WorkKind.SECURITY
+    if normalized == "architecture":
+        return reasoning_policy.WorkKind.ARCHITECTURE
     if is_reviewer:
         return reasoning_policy.WorkKind.CORRECTNESS_REVIEW
     return reasoning_policy.WorkKind.REPOSITORY_CODING
@@ -3312,35 +3315,55 @@ def _derive_reasoning_request(
     card: Mapping[str, Any],
     *,
     is_reviewer: bool,
+    target_card: Mapping[str, Any] | None = None,
+    lens: str | None = None,
 ) -> reasoning_policy.EffortRequest:
     """Derive the canonical effort request from a real task card.
 
     The card vocabulary differs from the policy vocabulary: a card carries
     ``risk_tier``, ``work_kind`` and an optional declared ``difficulty`` but no
     ``role``.  Role is derived from whether this is a quality-review launch, and
-    the provider family is the route's own family so a Claude route still
-    receives the Claude repository default.  A declared, valid card difficulty
-    wins, also on a rework card; only an undeclared card keeps the older rule of
-    COMPLEX when it declares a rework predecessor and STANDARD otherwise.
+    the provider family is the route's own family.  A declared, valid card
+    difficulty wins, also on a rework card; only an undeclared card keeps the
+    older rule of COMPLEX when it declares a rework predecessor and STANDARD
+    otherwise.
+
+    A reviewer launch is shaped by the card under review, never by the
+    reviewer card (whose risk tier is derived low and whose difficulty is
+    undeclared): risk tier and difficulty come from ``target_card`` and the
+    lens is passed through.  A reviewer launch whose target card is unknown
+    fails closed to a high-risk target.
     """
 
-    difficulty = _coerce_difficulty(card.get("difficulty"))
+    source: Mapping[str, Any] = card
+    if is_reviewer:
+        source = target_card if isinstance(target_card, Mapping) else {}
+    difficulty = _coerce_difficulty(source.get("difficulty"))
     if difficulty is None:
         difficulty = (
             reasoning_policy.Difficulty.COMPLEX
-            if isinstance(card.get("rework_predecessor"), Mapping)
+            if isinstance(source.get("rework_predecessor"), Mapping)
             else reasoning_policy.Difficulty.STANDARD
         )
+    if is_reviewer and not isinstance(target_card, Mapping):
+        risk_tier = reasoning_policy.RiskTier.HIGH
+    else:
+        risk_tier = _coerce_risk_tier(source.get("risk_tier"))
+    if is_reviewer:
+        work_kind = reasoning_policy.WorkKind.CORRECTNESS_REVIEW
+    else:
+        work_kind = _coerce_work_kind(card.get("work_kind"), is_reviewer=False)
     return reasoning_policy.EffortRequest(
         role=(
             reasoning_policy.TaskRole.REVIEWER
             if is_reviewer
             else reasoning_policy.TaskRole.IMPLEMENTER
         ),
-        risk_tier=_coerce_risk_tier(card.get("risk_tier")),
-        work_kind=_coerce_work_kind(card.get("work_kind"), is_reviewer=is_reviewer),
+        risk_tier=risk_tier,
+        work_kind=work_kind,
         difficulty=difficulty,
         provider_family=reasoning_policy.provider_family_for_route(adapter_id),
+        review_lens=(str(lens).strip().lower() or None) if is_reviewer and lens else None,
     )
 
 
@@ -3350,6 +3373,8 @@ def resolve_adapter_reasoning(
     *,
     is_reviewer: bool = False,
     model: str | None = None,
+    target_card: Mapping[str, Any] | None = None,
+    lens: str | None = None,
 ) -> reasoning_policy.ReasoningDecision | None:
     """Derive the canonical effort decision for one adapter launch.
 
@@ -3358,13 +3383,20 @@ def resolve_adapter_reasoning(
     model id) selects the verified ladder; an unverified model fails closed to
     ``None``.  Otherwise the decision is the pure
     :func:`reasoning_policy.resolve_reasoning_effort` result for the request
-    derived from ``card`` against the route's declared capability.
+    derived from ``card`` (or, for a reviewer, ``target_card`` and ``lens``)
+    against the route's declared capability.
     """
 
     capability = route_reasoning_capability(adapter_id, model)
     if capability is None:
         return None
-    request = _derive_reasoning_request(adapter_id, card, is_reviewer=is_reviewer)
+    request = _derive_reasoning_request(
+        adapter_id,
+        card,
+        is_reviewer=is_reviewer,
+        target_card=target_card,
+        lens=lens,
+    )
     return reasoning_policy.resolve_reasoning_effort(request, capability)
 
 
