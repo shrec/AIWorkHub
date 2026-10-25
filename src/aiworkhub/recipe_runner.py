@@ -192,6 +192,13 @@ def resolve_executable(repo_root: Path, program: str) -> Path:
     return Path(found)
 
 
+def _is_aiworkhub_module_launch(argv: tuple[str, ...]) -> bool:
+    """True for ``python -m aiworkhub`` and ``python -m aiworkhub.<module>``."""
+    if len(argv) < 3 or argv[0] != "python" or argv[1] != "-m":
+        return False
+    return argv[2] == "aiworkhub" or argv[2].startswith("aiworkhub.")
+
+
 def build_environment(repo_root: Path) -> dict[str, str]:
     """Return the restricted environment a recipe run executes under.
 
@@ -365,6 +372,10 @@ def run_recipe(
 
     executable = resolve_executable(root, validated.argv[0])
     env = build_environment(root)
+    # NF-2026-01693: ``python -m aiworkhub.*`` runs this package, not the target repo's code.
+    if _is_aiworkhub_module_launch(validated.argv):
+        executable = Path(sys.executable)
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
     timeout_seconds, timeout_source = _timeout_for(recipe)
     identifier = str(run_id or uuid.uuid4().hex)
 
