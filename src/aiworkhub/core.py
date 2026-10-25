@@ -7773,6 +7773,13 @@ def retry_terminal_task(
     if gate is not None:
         return gate
 
+    # NF-2026-01662: the retry resumes from the failed attempt's retained,
+    # in-scope, hash-verified changes instead of HEAD.  An attempt that left
+    # none, or none that verify, keeps the card's predecessor exactly as it
+    # was; the receipt names which of the two happened and why.
+    carried_predecessor, predecessor_carry = task_store.terminal_retry_rework_carry(
+        repo_root(), task_id, card
+    )
     now = datetime.now(timezone.utc).isoformat()
     semantic_card = task_store.persistable_card_payload(card)
     prior_episode = task_store.begin_claim_episode(semantic_card)
@@ -7786,6 +7793,8 @@ def retry_terminal_task(
         "started_at",
     ):
         semantic_card.pop(key, None)
+    if carried_predecessor is not None:
+        semantic_card["rework_predecessor"] = carried_predecessor
     semantic_card.update(
         status="pending",
         worker_status="unclaimed",
@@ -7804,6 +7813,7 @@ def retry_terminal_task(
             # authenticated against a named id, and the receipt has to say
             # which of the two this was (NF-2026-01192).
             **({"request_linkage": request_linkage} if request_linkage else {}),
+            **predecessor_carry,
         },
     )
     encoded_card = json.dumps(semantic_card, ensure_ascii=False, sort_keys=True)
@@ -7865,6 +7875,7 @@ def retry_terminal_task(
                         "reason": bounded_reason,
                         "transition": "blocked->pending",
                         "prior_episode": prior_episode,
+                        **predecessor_carry,
                     },
                     ensure_ascii=False,
                     sort_keys=True,

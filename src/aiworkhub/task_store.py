@@ -3550,6 +3550,12 @@ def mark_transient_retry(
     diagnostic; this function never sees provider text.
     """
     _readiness, db_path = _require_ready(root)
+    # NF-2026-01662: the requeued attempt resumes from its own retained,
+    # in-scope, hash-verified changes instead of HEAD.  Derived before the
+    # lease because it reads git and seals bytes; bound under it below.
+    carried_predecessor, predecessor_carry = _transient_retry_rework_carry(
+        root, db_path, task_id, request_id=request_id, budget=budget
+    )
     with _write_connection(db_path) as conn:
         _begin_immediate(conn)
         row = conn.execute(
@@ -3592,6 +3598,14 @@ def mark_transient_retry(
         bounded_reason = blocker_reason_or_named_gap(
             reason, path="mark_transient_retry"
         )
+        if carried_predecessor is not None and (
+            carried_predecessor.get("claim_epoch") != card.get("claim_epoch")
+            or carried_predecessor.get("request_id") != request_id
+        ):
+            carried_predecessor = None
+            predecessor_carry = {"predecessor_carry": "attempt_claim_changed"}
+        if carried_predecessor is not None:
+            card["rework_predecessor"] = carried_predecessor
         attempts += 1
         card.update(
             status="pending",
@@ -3605,6 +3619,7 @@ def mark_transient_retry(
                 "reason": bounded_reason,
                 "request_id": request_id[:120],
                 "recorded_at": now,
+                **predecessor_carry,
             },
             retry_not_before=transient_retry_not_before(attempts),
         )
@@ -3647,6 +3662,7 @@ def mark_transient_retry(
                         "transition": "processing->pending",
                         "recorded_at": now,
                         "runner": runner,
+                        **predecessor_carry,
                     },
                     ensure_ascii=False,
                     sort_keys=True,
@@ -5522,6 +5538,599 @@ def _pre_lease_committed_drift_proof(
     return proof
 
 
+def retained_terminal_rework_predecessor(
+    root: str | Path,
+    task_id: str,
+    card: Mapping[str, Any],
+    *,
+    terminal_event: str,
+    terminal_review: Mapping[str, Any],
+    terminal_runner: str,
+    committed_drift_proof: Mapping[tuple[str, str], str],
+    refuse_sealed_delta: bool = False,
+) -> tuple[dict[str, Any] | None, str]:
+    """Authenticate one terminal attempt's retained candidate as a predecessor.
+
+    The single owner of the ``aiworkhub.rework_predecessor.v1`` descriptor a
+    successor materializes from a retained terminal candidate, shared by
+    ``recover_blocked_rework`` and both retry paths (``core.retry_terminal_task``
+    and ``mark_transient_retry``, NF-2026-01662).  ``terminal_review`` is the
+    attempt's terminal record, already bound to the card by the caller, and
+    ``terminal_runner`` the runner that recorded it.  Returns the descriptor,
+    or ``(None, reason)`` naming the first check that failed; the card is never
+    mutated here.  ``refuse_sealed_delta`` refuses a collected candidate whose
+    sealed bytes authenticate, which a clean-root recovery would discard.
+    """
+    terminal_claim_epoch = terminal_review.get("claim_epoch")
+    if (
+        type(terminal_claim_epoch) is not int
+        or terminal_claim_epoch < 1
+        or type(card.get("claim_epoch")) is not int
+        or terminal_claim_epoch != card.get("claim_epoch")
+    ):
+        return None, "retained_terminal_candidate_claim_epoch_invalid"
+    evidence = terminal_review.get("evidence")
+    for pid_key in ("pid", "provider_pid", "supervisor_pid", "stall_supervisor_pid"):
+        raw_pid = evidence.get(pid_key) if isinstance(evidence, dict) else None
+        if type(raw_pid) is int and raw_pid > 0 and process_is_alive(raw_pid):
+            return None, "retained_terminal_candidate_process_live"
+    identity = evidence.get("request_identity") if isinstance(evidence, dict) else None
+    workspace = evidence.get("workspace") if isinstance(evidence, dict) else None
+    changed_paths = evidence.get("changed_paths") if isinstance(evidence, dict) else None
+    changed_hashes = evidence.get("changed_path_hashes") if isinstance(evidence, dict) else None
+    authority = evidence.get("python_candidate_authority") if isinstance(evidence, dict) else None
+    workspace_authority = workspace.get("python_candidate_authority") if isinstance(workspace, dict) else None
+    authority_hashes: dict[str, str] = {}
+    authority_sources = (
+        authority.get("sources") if isinstance(authority, dict) else None
+    )
+    if isinstance(authority_sources, dict):
+        if all(
+            isinstance(path, str) and isinstance(digest, str)
+            for path, digest in authority_sources.items()
+        ):
+            authority_hashes = dict(authority_sources)
+    elif isinstance(authority_sources, list):
+        for source in authority_sources:
+            if not isinstance(source, dict):
+                authority_hashes = {}
+                break
+            path = source.get("path")
+            state = source.get("state")
+            digest = source.get("bytes_sha256")
+            if (
+                not isinstance(path, str)
+                or not path
+                or state not in {"added", "modified"}
+                or not isinstance(digest, str)
+                or path in authority_hashes
+            ):
+                authority_hashes = {}
+                break
+            authority_hashes[path] = digest
+    request_id = (
+        str(identity.get("request_id") or "").strip()
+        if isinstance(identity, dict)
+        else ""
+    )
+    allowed_writes = card.get("allowed_writes")
+    # Lazy, in order: each check may dereference what an earlier one
+    # proved to be a dict, so a malformed card is refused, never raised.
+    identity_checks = (
+        lambda: not isinstance(evidence, dict),
+        lambda: not changed_paths,
+        lambda: not isinstance(identity, dict),
+        lambda: not isinstance(workspace, dict),
+        lambda: not isinstance(changed_paths, list),
+        lambda: not isinstance(changed_hashes, dict),
+        lambda: set(changed_hashes) != set(changed_paths),
+        lambda: not isinstance(allowed_writes, list),
+        lambda: not allowed_writes,
+        lambda: not isinstance(authority, dict),
+        lambda: authority != workspace_authority,
+        lambda: authority.get("schema_id") != "aiworkhub.python_candidate_authority.v1",
+        lambda: authority_hashes != changed_hashes,
+        lambda: evidence.get("request_id") not in {None, "", request_id},
+        lambda: terminal_review.get("request_id") != request_id,
+        lambda: card.get("launch_request_id") != request_id,
+        lambda: identity.get("task_id") != task_id,
+        lambda: identity.get("runner") != card.get("runner"),
+        lambda: terminal_runner != card.get("runner"),
+        lambda: identity.get("topic") != card.get("topic"),
+        lambda: identity.get("repo") != workspace.get("repo"),
+        lambda: type(identity.get("claim_epoch")) is not int,
+        lambda: identity.get("claim_epoch") != terminal_claim_epoch,
+        lambda: identity.get("allowed_writes") != workspace.get("allowed_writes"),
+        lambda: identity.get("base_oid") != workspace.get("base_oid"),
+        lambda: identity.get("parent_baseline") != workspace.get("parent_baseline"),
+        lambda: workspace.get("request_id") != request_id,
+        lambda: set(workspace.get("allowed_writes") or ()) != set(allowed_writes),
+        lambda: not request_id,
+    )
+    for check_name, check_failed in zip(
+        RETAINED_TERMINAL_IDENTITY_CHECKS, identity_checks, strict=True
+    ):
+        if check_failed():
+            return None, f"retained_terminal_candidate_identity_invalid:{check_name}"
+    if any(
+        not _candidate_path_in_scope(path, allowed_writes)
+        for path in changed_paths
+    ):
+        return None, "retained_terminal_candidate_scope_invalid"
+    parent_baseline = workspace.get("parent_baseline")
+    base_oid = workspace.get("base_oid")
+    if (
+        not isinstance(parent_baseline, dict)
+        or not isinstance(base_oid, str)
+        or not base_oid
+        or set(changed_paths) - set(parent_baseline)
+    ):
+        return None, "retained_terminal_candidate_baseline_invalid"
+    try:
+        authority_repo = Path(str(workspace.get("repo") or "")).resolve(strict=True)
+        expected_repo = Path(root).resolve(strict=True)
+        workspace_path = Path(str(workspace.get("path") or ""))
+        # NF-2026-00594: retention may collect the exact worktree of a
+        # timed-out candidate once its bytes are sealed.  Only a truly
+        # absent worktree lets the claimed delta, authenticated below,
+        # stand in for it; a present, dangling or foreign path keeps
+        # every retained-worktree check.  NF-2026-01519: a superseding
+        # review's worktree that a failed accept emptied of every
+        # candidate path is collected too; one surviving path, or a
+        # symlink or junction on any component above one, is not.
+        collected = evidence.get("rework_delta") is not None and (
+            not os.path.lexists(workspace_path)
+            or (
+                terminal_event == "terminal_review"
+                and workspace_path.is_dir()
+                and not any(
+                    os.path.lexists(candidate)
+                    or _workspace_has_link_component(expected_repo, candidate)
+                    for candidate in (
+                        workspace_path.joinpath(*path.split("/"))
+                        for path in changed_paths
+                    )
+                )
+            )
+        )
+        resolved_workspace = (
+            workspace_path if collected else workspace_path.resolve(strict=True)
+        )
+    except (OSError, RuntimeError, ValueError):
+        return None, "retained_terminal_candidate_workspace_invalid"
+    if not _pinned_runtime_worktree(
+        authority_repo,
+        expected_repo,
+        workspace_path,
+        resolved_workspace,
+        request_id,
+        collected=collected,
+    ):
+        return None, "retained_terminal_candidate_workspace_invalid"
+    sealed_delta: dict[str, Any] | None = None
+    retained_delta: dict[str, Any] | None = None
+    if collected:
+        sealed_delta, delta_error = _collected_terminal_rework_delta(
+            expected_repo,
+            task_id,
+            request_id,
+            terminal_claim_epoch,
+            evidence["rework_delta"],
+            changed_hashes,
+            allowed_writes,
+        )
+        if sealed_delta is None:
+            return None, delta_error
+        if refuse_sealed_delta:
+            # The candidate is not missing: its authenticated bytes are
+            # sealed, and a clean root would silently discard them.
+            return None, "clean_root_rework_sealed_delta_available"
+    elif evidence.get("rework_delta") is not None:
+        # NF-2026-01530: a retained worktree keeps every byte check
+        # below, but the successor's strict required-output gate can
+        # only credit inherited paths through a pinned sealed delta.
+        # An authenticated one rides along; an unverifiable one is
+        # left off exactly as before.
+        retained_delta, _delta_error = _collected_terminal_rework_delta(
+            expected_repo,
+            task_id,
+            request_id,
+            terminal_claim_epoch,
+            evidence["rework_delta"],
+            changed_hashes,
+            allowed_writes,
+        )
+    for path in changed_paths:
+        # An authenticated delta already bound every sealed path to its
+        # exact hash; only a retained worktree is read here.
+        if sealed_delta is None:
+            candidate = resolved_workspace.joinpath(*path.split("/"))
+            expected_hash = changed_hashes.get(path)
+            try:
+                candidate_stat = candidate.lstat()
+                resolved_candidate = candidate.resolve(strict=True)
+            except OSError:
+                return None, "retained_terminal_candidate_bytes_invalid"
+            if (
+                candidate.is_symlink()
+                or expected_hash is None
+                or not candidate.is_file()
+                or candidate_stat.st_nlink != 1
+                or not resolved_candidate.is_relative_to(resolved_workspace)
+                or any(
+                    resolved_workspace.joinpath(*path.split("/")[:index]).is_symlink()
+                    for index in range(1, len(path.split("/")))
+                )
+            ):
+                return None, "retained_terminal_candidate_bytes_invalid"
+            if (
+                not isinstance(expected_hash, str)
+                or len(expected_hash) != 64
+                or hashlib.sha256(candidate.read_bytes()).hexdigest() != expected_hash
+            ):
+                return None, "retained_terminal_candidate_hash_mismatch"
+        try:
+            baseline_hash = _canonical_baseline_hash(expected_repo, path)
+        except OSError:
+            return None, "retained_terminal_candidate_baseline_invalid"
+        try:
+            recorded_baseline_hash = _recorded_baseline_hash(
+                parent_baseline.get(path)
+            )
+        except ValueError:
+            return None, "retained_terminal_candidate_baseline_invalid"
+        # NF-2026-01558: only committed canonical base drift is waived
+        # because the materializer three-way rebases committed history
+        # only and owns conflict refusal (rework_base_drift).
+        # NF-2026-01559: git proved it before the lease; only the hash is compared.
+        if recorded_baseline_hash != baseline_hash and not _committed_drift_proven(
+            committed_drift_proof, base_oid, path, baseline_hash
+        ):
+            return None, "retained_terminal_candidate_baseline_mismatch"
+    return {
+        "schema_id": "aiworkhub.rework_predecessor.v1",
+        "request_id": request_id,
+        "task_id": task_id,
+        "repo": str(expected_repo),
+        "claim_epoch": terminal_claim_epoch,
+        "allowed_writes": list(allowed_writes),
+        "changed_paths": list(changed_paths),
+        "changed_path_hashes": dict(changed_hashes),
+        "workspace": dict(workspace),
+        # The successor materializes from this exact descriptor
+        # whether the worktree was collected or retained.
+        **(sealed_delta or retained_delta or {}),
+    }, ""
+
+
+def _pinned_runtime_worktree(
+    authority_repo: Path,
+    expected_repo: Path,
+    workspace_path: Path,
+    resolved_workspace: Path,
+    request_id: str,
+    *,
+    collected: bool,
+) -> bool:
+    """Whether ``workspace_path`` is ``request_id``'s own runtime worktree.
+
+    The pin a retained candidate passes before any of its bytes is trusted:
+    the workspace names this repository, and its worktree sits, through no
+    link, at the repository-owned default for that exact request.
+    ``collected`` waives only that the directory still exists.
+    """
+    runtime_parts = (".aiworkhub", "runtime", "worktrees", request_id, "worktree")
+    return not (
+        authority_repo != expected_repo
+        or not workspace_path.is_absolute()
+        or workspace_path.is_symlink()
+        or not (collected or resolved_workspace.is_dir())
+        or tuple(resolved_workspace.parts[-5:]) != runtime_parts
+        or resolved_workspace
+        != expected_repo / ".aiworkhub" / "runtime" / "worktrees" / request_id / "worktree"
+        or any(
+            (expected_repo.joinpath(*runtime_parts[:index])).is_symlink()
+            for index in range(1, len(runtime_parts) + 1)
+        )
+    )
+
+
+# A carry receipt names paths; bound it like every other receipt field.
+_RETRY_CARRY_RECEIPT_MAX_PATHS = 64
+
+
+def _in_scope_terminal_record(
+    record: Mapping[str, Any], keep: Sequence[str]
+) -> dict[str, Any]:
+    """``record`` narrowed to the ``keep`` paths: hashes and both authorities.
+
+    A sealed delta stays attached; it binds the full set it was sealed from,
+    so it authenticates only when nothing was dropped, and an unverifiable one
+    is left off by ``retained_terminal_rework_predecessor`` as for any retained
+    worktree.
+    """
+    kept = set(keep)
+
+    def narrowed(authority: object) -> object:
+        if not isinstance(authority, dict):
+            return authority
+        sources = authority.get("sources")
+        if isinstance(sources, dict):
+            sources = {path: digest for path, digest in sources.items() if path in kept}
+        elif isinstance(sources, list):
+            sources = [
+                source for source in sources
+                if not isinstance(source, dict) or source.get("path") in kept
+            ]
+        return {**authority, "sources": sources}
+
+    evidence = dict(record["evidence"])
+    evidence["changed_paths"] = list(keep)
+    hashes = evidence.get("changed_path_hashes")
+    if isinstance(hashes, dict):
+        evidence["changed_path_hashes"] = {
+            path: digest for path, digest in hashes.items() if path in kept
+        }
+    if "python_candidate_authority" in evidence:
+        evidence["python_candidate_authority"] = narrowed(
+            evidence["python_candidate_authority"]
+        )
+    workspace = evidence.get("workspace")
+    if isinstance(workspace, dict) and "python_candidate_authority" in workspace:
+        evidence["workspace"] = {
+            **workspace,
+            "python_candidate_authority": narrowed(
+                workspace["python_candidate_authority"]
+            ),
+        }
+    return {**record, "evidence": evidence}
+
+
+def _attempt_rework_carry(
+    root: str | Path,
+    db_path: Path,
+    task_id: str,
+    card: Mapping[str, Any],
+    terminal_record: Mapping[str, Any],
+    terminal_runner: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Pin a failed attempt's in-scope, hash-verified changes for its retry.
+
+    NF-2026-01662: a retry relaunched from HEAD while the attempt's changed
+    files sat in its retained worktree.  Only paths inside the card's
+    ``allowed_writes`` are carried, through the same authentication
+    ``recover_blocked_rework`` applies; an out-of-scope path is recorded in the
+    receipt and never carried.  Returns the descriptor, or ``None`` when
+    nothing is carried, plus the ``predecessor_carry`` receipt naming why.
+    """
+    evidence = terminal_record.get("evidence")
+    changed = evidence.get("changed_paths") if isinstance(evidence, dict) else None
+    if not isinstance(changed, list) or not changed:
+        return None, {"predecessor_carry": "no_changes"}
+    allowed_writes = card.get("allowed_writes")
+    allowed = allowed_writes if isinstance(allowed_writes, list) else []
+    carried = [path for path in changed if _candidate_path_in_scope(path, allowed)]
+    out_of_scope = sorted(
+        {str(path)[:300] for path in changed if path not in carried}
+    )[:_RETRY_CARRY_RECEIPT_MAX_PATHS]
+    receipt: dict[str, Any] = {"predecessor_carry": "carried"}
+    if out_of_scope:
+        receipt["out_of_scope_paths"] = out_of_scope
+    if not carried:
+        receipt["predecessor_carry"] = "no_in_scope_changes"
+        return None, receipt
+    if len(carried) != len(changed):
+        terminal_record = _in_scope_terminal_record(terminal_record, carried)
+    try:
+        predecessor, refusal = retained_terminal_rework_predecessor(
+            root,
+            task_id,
+            card,
+            terminal_event="terminal_failure",
+            terminal_review=terminal_record,
+            terminal_runner=terminal_runner,
+            committed_drift_proof=_pre_lease_committed_drift_proof(
+                root, db_path, task_id
+            ),
+        )
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
+        predecessor, refusal = None, f"predecessor_carry_failed:{type(exc).__name__}"
+    if predecessor is None:
+        receipt["predecessor_carry"] = refusal
+        return None, receipt
+    receipt["carried_paths"] = sorted(predecessor["changed_paths"])[
+        :_RETRY_CARRY_RECEIPT_MAX_PATHS
+    ]
+    return predecessor, receipt
+
+
+def terminal_retry_rework_carry(
+    root: str | Path, task_id: str, card: Mapping[str, Any]
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """The predecessor ``core.retry_terminal_task`` pins for a blocked attempt.
+
+    The card's ``terminal_failure`` is an attestation: it must equal the
+    newest ``terminal_failure`` event, exactly as ``recover_blocked_rework``
+    requires before it reads a retained candidate.  Read-only; a failure is
+    the receipt's named reason, never an exception.
+    """
+    terminal = card.get("terminal_failure")
+    evidence = terminal.get("evidence") if isinstance(terminal, dict) else None
+    if not isinstance(evidence, dict) or not evidence.get("changed_paths"):
+        return None, {"predecessor_carry": "no_changes"}
+    try:
+        _readiness, db_path = _require_ready(root)
+        conn = _connect(db_path, readonly=True)
+        try:
+            row = conn.execute(
+                "SELECT runner, payload_json FROM task_events "
+                "WHERE task_id=? AND event='terminal_failure' "
+                "ORDER BY rowid DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None, {"predecessor_carry": "terminal_failure_event_missing"}
+        payload = json.loads(str(row["payload_json"] or "{}"))
+    except (TaskStoreError, sqlite3.Error, OSError, RuntimeError, ValueError):
+        return None, {"predecessor_carry": "terminal_failure_event_unreadable"}
+    if payload != terminal:
+        return None, {
+            "predecessor_carry": "retained_terminal_candidate_event_mismatch"
+        }
+    return _attempt_rework_carry(
+        root, db_path, task_id, card, payload, str(row["runner"] or "")
+    )
+
+
+def _transient_retry_rework_carry(
+    root: str | Path,
+    db_path: Path,
+    task_id: str,
+    *,
+    request_id: str,
+    budget: int,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """The predecessor ``mark_transient_retry`` pins for the attempt it requeues.
+
+    A transient attempt records no terminal evidence, so the evidence the
+    terminal path would have recorded is derived here, before the writer
+    lease: the launch's own metadata (located through the process event
+    ledger), the attempt's changed paths, and one capture of its retained
+    worktree by the launcher's own evidence builder.  The result then passes
+    the same authentication as a blocked attempt's.  Never raises.
+    """
+    from . import (
+        process_event_ledger,
+        process_launcher,
+        process_launcher_evidence,
+        task_retention,
+        worker_workspace,
+    )
+
+    if not request_id:
+        return None, {"predecessor_carry": "no_request_identity"}
+    try:
+        conn = _connect(db_path, readonly=True)
+        try:
+            row = conn.execute(
+                "SELECT runner, card_json FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        card = json.loads(str(row["card_json"] or "{}")) if row is not None else None
+        if not isinstance(card, dict) or card.get("launch_request_id") != request_id:
+            return None, {"predecessor_carry": "attempt_identity_mismatch"}
+        if int(card.get("transient_retry_attempts") or 0) >= max(0, int(budget)):
+            # The store refuses this retry; the terminal path records the delta.
+            return None, {"predecessor_carry": "transient_retry_budget_exhausted"}
+        events = process_event_ledger.events_for_requests(
+            task_retention._process_event_log_path(root), [request_id]
+        ).get(request_id, [])
+        metadata_path = next(
+            (
+                str(event["metadata_path"])
+                for event in reversed(events)
+                if event.get("metadata_path")
+            ),
+            "",
+        )
+        if metadata_path:
+            # Only the launcher's own metadata file for this request names the
+            # attempt's workspace; a ledger row pointing anywhere else is not
+            # read (the construction crash_retry_packet uses).
+            launch_metadata = Path(
+                os.environ.get(
+                    process_launcher.PROCESS_DIR_ENV,
+                    str(Path(root) / process_launcher.PROCESS_DIR_DEFAULT_REL),
+                )
+            ) / f"{request_id}.request.json"
+            try:
+                authenticated = (
+                    not launch_metadata.is_symlink()
+                    and Path(metadata_path).resolve(strict=True)
+                    == launch_metadata.resolve(strict=True)
+                )
+            except (OSError, RuntimeError):
+                authenticated = False
+            if not authenticated:
+                return None, {
+                    "predecessor_carry": "attempt_launch_metadata_unauthenticated"
+                }
+        metadata = (
+            # Read the verified launcher file itself, never the ledger-named
+            # path again: a link could be retargeted between check and use.
+            task_retention._read_request_metadata(launch_metadata)
+            if metadata_path
+            else None
+        )
+        if (
+            metadata is None
+            or metadata.get("task_id") != task_id
+            or not isinstance(metadata.get("workspace"), dict)
+        ):
+            return None, {"predecessor_carry": "attempt_launch_metadata_unavailable"}
+        workspace = worker_workspace.WorkerWorkspace.from_metadata(
+            dict(metadata["workspace"])
+        )
+        if workspace.request_id != request_id:
+            return None, {"predecessor_carry": "attempt_launch_metadata_unavailable"}
+        # Nothing in the workspace is read until it is proven to be this
+        # request's own runtime worktree of this repository.
+        workspace_path = Path(str(metadata["workspace"].get("path") or ""))
+        try:
+            pinned = _pinned_runtime_worktree(
+                Path(str(metadata["workspace"].get("repo") or "")).resolve(strict=True),
+                Path(root).resolve(strict=True),
+                workspace_path,
+                workspace_path.resolve(strict=True),
+                request_id,
+                collected=False,
+            )
+        except (OSError, RuntimeError):
+            pinned = False
+        if not pinned:
+            return None, {"predecessor_carry": "attempt_workspace_unpinned"}
+        changed = worker_workspace.changed_paths(workspace)
+        allowed_writes = card.get("allowed_writes")
+        in_scope = [
+            path
+            for path in changed
+            if isinstance(allowed_writes, list)
+            and _candidate_path_in_scope(path, allowed_writes)
+        ]
+        # Only in-scope bytes are captured and sealed; the rest is recorded.
+        evidence = (
+            process_launcher_evidence.retained_candidate_seal_evidence(
+                workspace, dict(metadata), request_id, in_scope, "processing"
+            )
+            if in_scope
+            else {}
+        )
+    except (
+        sqlite3.Error,
+        OSError,
+        RuntimeError,
+        ValueError,
+        TypeError,
+        KeyError,
+        worker_workspace.WorkspaceError,
+        worker_workspace.GitCommandTimeout,
+    ) as exc:
+        return None, {
+            "predecessor_carry": f"attempt_changes_unreadable:{type(exc).__name__}"
+        }
+    record = {
+        "request_id": request_id,
+        "claim_epoch": card.get("claim_epoch"),
+        "evidence": {**evidence, "request_id": request_id, "changed_paths": changed},
+    }
+    return _attempt_rework_carry(
+        root, db_path, task_id, card, record, str(row["runner"] or "")
+    )
+
+
 @_os_failure_names_its_operation
 def recover_blocked_rework(
     root: str | Path,
@@ -6651,252 +7260,19 @@ def recover_blocked_rework(
         ):
             if card.get(terminal_event) != terminal_review:
                 return False, "retained_terminal_candidate_event_mismatch"
-            terminal_claim_epoch = terminal_review.get("claim_epoch")
-            if (
-                type(terminal_claim_epoch) is not int
-                or terminal_claim_epoch < 1
-                or type(card.get("claim_epoch")) is not int
-                or terminal_claim_epoch != card.get("claim_epoch")
-            ):
-                return False, "retained_terminal_candidate_claim_epoch_invalid"
-            evidence = terminal_review.get("evidence")
-            for pid_key in ("pid", "provider_pid", "supervisor_pid", "stall_supervisor_pid"):
-                raw_pid = evidence.get(pid_key) if isinstance(evidence, dict) else None
-                if type(raw_pid) is int and raw_pid > 0 and process_is_alive(raw_pid):
-                    return False, "retained_terminal_candidate_process_live"
-            identity = evidence.get("request_identity") if isinstance(evidence, dict) else None
-            workspace = evidence.get("workspace") if isinstance(evidence, dict) else None
-            changed_paths = evidence.get("changed_paths") if isinstance(evidence, dict) else None
-            changed_hashes = evidence.get("changed_path_hashes") if isinstance(evidence, dict) else None
-            authority = evidence.get("python_candidate_authority") if isinstance(evidence, dict) else None
-            workspace_authority = workspace.get("python_candidate_authority") if isinstance(workspace, dict) else None
-            authority_hashes: dict[str, str] = {}
-            authority_sources = (
-                authority.get("sources") if isinstance(authority, dict) else None
+            superseding_predecessor, refusal = retained_terminal_rework_predecessor(
+                root,
+                task_id,
+                card,
+                terminal_event=terminal_event,
+                terminal_review=terminal_review,
+                terminal_runner=str(terminal_row["runner"] or ""),
+                committed_drift_proof=committed_drift_proof,
+                refuse_sealed_delta=clean_root_if_predecessor_missing,
             )
-            if isinstance(authority_sources, dict):
-                if all(
-                    isinstance(path, str) and isinstance(digest, str)
-                    for path, digest in authority_sources.items()
-                ):
-                    authority_hashes = dict(authority_sources)
-            elif isinstance(authority_sources, list):
-                for source in authority_sources:
-                    if not isinstance(source, dict):
-                        authority_hashes = {}
-                        break
-                    path = source.get("path")
-                    state = source.get("state")
-                    digest = source.get("bytes_sha256")
-                    if (
-                        not isinstance(path, str)
-                        or not path
-                        or state not in {"added", "modified"}
-                        or not isinstance(digest, str)
-                        or path in authority_hashes
-                    ):
-                        authority_hashes = {}
-                        break
-                    authority_hashes[path] = digest
-            request_id = (
-                str(identity.get("request_id") or "").strip()
-                if isinstance(identity, dict)
-                else ""
-            )
-            allowed_writes = card.get("allowed_writes")
-            # Lazy, in order: each check may dereference what an earlier one
-            # proved to be a dict, so a malformed card is refused, never raised.
-            identity_checks = (
-                lambda: not isinstance(evidence, dict),
-                lambda: not changed_paths,
-                lambda: not isinstance(identity, dict),
-                lambda: not isinstance(workspace, dict),
-                lambda: not isinstance(changed_paths, list),
-                lambda: not isinstance(changed_hashes, dict),
-                lambda: set(changed_hashes) != set(changed_paths),
-                lambda: not isinstance(allowed_writes, list),
-                lambda: not allowed_writes,
-                lambda: not isinstance(authority, dict),
-                lambda: authority != workspace_authority,
-                lambda: authority.get("schema_id") != "aiworkhub.python_candidate_authority.v1",
-                lambda: authority_hashes != changed_hashes,
-                lambda: evidence.get("request_id") not in {None, "", request_id},
-                lambda: terminal_review.get("request_id") != request_id,
-                lambda: card.get("launch_request_id") != request_id,
-                lambda: identity.get("task_id") != task_id,
-                lambda: identity.get("runner") != card.get("runner"),
-                lambda: str(terminal_row["runner"] or "") != card.get("runner"),
-                lambda: identity.get("topic") != card.get("topic"),
-                lambda: identity.get("repo") != workspace.get("repo"),
-                lambda: type(identity.get("claim_epoch")) is not int,
-                lambda: identity.get("claim_epoch") != terminal_claim_epoch,
-                lambda: identity.get("allowed_writes") != workspace.get("allowed_writes"),
-                lambda: identity.get("base_oid") != workspace.get("base_oid"),
-                lambda: identity.get("parent_baseline") != workspace.get("parent_baseline"),
-                lambda: workspace.get("request_id") != request_id,
-                lambda: set(workspace.get("allowed_writes") or ()) != set(allowed_writes),
-                lambda: not request_id,
-            )
-            for check_name, check_failed in zip(
-                RETAINED_TERMINAL_IDENTITY_CHECKS, identity_checks, strict=True
-            ):
-                if check_failed():
-                    return False, f"retained_terminal_candidate_identity_invalid:{check_name}"
-            if any(
-                not _candidate_path_in_scope(path, allowed_writes)
-                for path in changed_paths
-            ):
-                return False, "retained_terminal_candidate_scope_invalid"
-            parent_baseline = workspace.get("parent_baseline")
-            base_oid = workspace.get("base_oid")
-            if (
-                not isinstance(parent_baseline, dict)
-                or not isinstance(base_oid, str)
-                or not base_oid
-                or set(changed_paths) - set(parent_baseline)
-            ):
-                return False, "retained_terminal_candidate_baseline_invalid"
-            try:
-                authority_repo = Path(str(workspace.get("repo") or "")).resolve(strict=True)
-                expected_repo = Path(root).resolve(strict=True)
-                workspace_path = Path(str(workspace.get("path") or ""))
-                # NF-2026-00594: retention may collect the exact worktree of a
-                # timed-out candidate once its bytes are sealed.  Only a truly
-                # absent worktree lets the claimed delta, authenticated below,
-                # stand in for it; a present, dangling or foreign path keeps
-                # every retained-worktree check.  NF-2026-01519: a superseding
-                # review's worktree that a failed accept emptied of every
-                # candidate path is collected too; one surviving path, or a
-                # symlink or junction on any component above one, is not.
-                collected = evidence.get("rework_delta") is not None and (
-                    not os.path.lexists(workspace_path)
-                    or (
-                        terminal_event == "terminal_review"
-                        and workspace_path.is_dir()
-                        and not any(
-                            os.path.lexists(candidate)
-                            or _workspace_has_link_component(expected_repo, candidate)
-                            for candidate in (
-                                workspace_path.joinpath(*path.split("/"))
-                                for path in changed_paths
-                            )
-                        )
-                    )
-                )
-                resolved_workspace = (
-                    workspace_path if collected else workspace_path.resolve(strict=True)
-                )
-            except (OSError, RuntimeError, ValueError):
-                return False, "retained_terminal_candidate_workspace_invalid"
-            runtime_parts = (".aiworkhub", "runtime", "worktrees", request_id, "worktree")
-            if (
-                authority_repo != expected_repo
-                or not workspace_path.is_absolute()
-                or workspace_path.is_symlink()
-                or not (collected or resolved_workspace.is_dir())
-                or tuple(resolved_workspace.parts[-5:]) != runtime_parts
-                or resolved_workspace
-                != expected_repo / ".aiworkhub" / "runtime" / "worktrees" / request_id / "worktree"
-                or any(
-                    (expected_repo.joinpath(*runtime_parts[:index])).is_symlink()
-                    for index in range(1, len(runtime_parts) + 1)
-                )
-            ):
-                return False, "retained_terminal_candidate_workspace_invalid"
-            sealed_delta: dict[str, Any] | None = None
-            retained_delta: dict[str, Any] | None = None
-            if collected:
-                sealed_delta, delta_error = _collected_terminal_rework_delta(
-                    expected_repo,
-                    task_id,
-                    request_id,
-                    terminal_claim_epoch,
-                    evidence["rework_delta"],
-                    changed_hashes,
-                    allowed_writes,
-                )
-                if sealed_delta is None:
-                    return False, delta_error
-                if clean_root_if_predecessor_missing:
-                    # The candidate is not missing: its authenticated bytes are
-                    # sealed, and a clean root would silently discard them.
-                    return False, "clean_root_rework_sealed_delta_available"
-            elif evidence.get("rework_delta") is not None:
-                # NF-2026-01530: a retained worktree keeps every byte check
-                # below, but the successor's strict required-output gate can
-                # only credit inherited paths through a pinned sealed delta.
-                # An authenticated one rides along; an unverifiable one is
-                # left off exactly as before.
-                retained_delta, _delta_error = _collected_terminal_rework_delta(
-                    expected_repo,
-                    task_id,
-                    request_id,
-                    terminal_claim_epoch,
-                    evidence["rework_delta"],
-                    changed_hashes,
-                    allowed_writes,
-                )
-            for path in changed_paths:
-                # An authenticated delta already bound every sealed path to its
-                # exact hash; only a retained worktree is read here.
-                if sealed_delta is None:
-                    candidate = resolved_workspace.joinpath(*path.split("/"))
-                    expected_hash = changed_hashes.get(path)
-                    try:
-                        candidate_stat = candidate.lstat()
-                        resolved_candidate = candidate.resolve(strict=True)
-                    except OSError:
-                        return False, "retained_terminal_candidate_bytes_invalid"
-                    if (
-                        candidate.is_symlink()
-                        or expected_hash is None
-                        or not candidate.is_file()
-                        or candidate_stat.st_nlink != 1
-                        or not resolved_candidate.is_relative_to(resolved_workspace)
-                        or any(
-                            resolved_workspace.joinpath(*path.split("/")[:index]).is_symlink()
-                            for index in range(1, len(path.split("/")))
-                        )
-                    ):
-                        return False, "retained_terminal_candidate_bytes_invalid"
-                    if (
-                        not isinstance(expected_hash, str)
-                        or len(expected_hash) != 64
-                        or hashlib.sha256(candidate.read_bytes()).hexdigest() != expected_hash
-                    ):
-                        return False, "retained_terminal_candidate_hash_mismatch"
-                try:
-                    baseline_hash = _canonical_baseline_hash(expected_repo, path)
-                except OSError:
-                    return False, "retained_terminal_candidate_baseline_invalid"
-                try:
-                    recorded_baseline_hash = _recorded_baseline_hash(
-                        parent_baseline.get(path)
-                    )
-                except ValueError:
-                    return False, "retained_terminal_candidate_baseline_invalid"
-                # NF-2026-01558: only committed canonical base drift is waived
-                # because the materializer three-way rebases committed history
-                # only and owns conflict refusal (rework_base_drift).
-                # NF-2026-01559: git proved it before the lease; only the hash is compared.
-                if recorded_baseline_hash != baseline_hash and not _committed_drift_proven(
-                    committed_drift_proof, base_oid, path, baseline_hash
-                ):
-                    return False, "retained_terminal_candidate_baseline_mismatch"
-            retained_predecessor = {
-                "schema_id": "aiworkhub.rework_predecessor.v1",
-                "request_id": request_id,
-                "task_id": task_id,
-                "repo": str(expected_repo),
-                "claim_epoch": terminal_claim_epoch,
-                "allowed_writes": list(allowed_writes),
-                "changed_paths": list(changed_paths),
-                "changed_path_hashes": dict(changed_hashes),
-                "workspace": dict(workspace),
-                # The successor materializes from this exact descriptor
-                # whether the worktree was collected or retained.
-                **(sealed_delta or retained_delta or {}),
-            }
+            if superseding_predecessor is None:
+                return False, refusal
+            retained_predecessor = superseding_predecessor
             card["rework_predecessor"] = retained_predecessor
 
         predecessor_request_id = str(
