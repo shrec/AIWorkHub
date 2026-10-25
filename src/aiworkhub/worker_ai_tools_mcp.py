@@ -2143,6 +2143,7 @@ def verify_audit_ledger(
         "entries_verified": 0,
         "entries_tampered": 0,
         "entries_invalid_identity": 0,
+        "entries_malformed": 0,
         "call_count_by_tool": {},
         "successful_call_count_by_tool": {},
         "failed_call_count_by_tool": {},
@@ -2251,13 +2252,17 @@ def verify_audit_ledger(
         try:
             entry = json.loads(raw_line)
         except json.JSONDecodeError:
+            result["entries_malformed"] += 1
             continue
         if not isinstance(entry, dict):
+            result["entries_malformed"] += 1
             continue
         if entry.get("schema_id") != AUDIT_ENTRY_SCHEMA_ID:
+            result["entries_malformed"] += 1
             continue
         digest = entry.pop("hmac_sha256", None)
         if not isinstance(digest, str):
+            result["entries_malformed"] += 1
             continue
         expected = _hmac_entry(entry, key)
         result["entries_total"] += 1
@@ -2691,6 +2696,9 @@ def verify_audit_ledger(
             "authenticated_ledger_identity_violation:"
             + ",".join(invalid_identity_codes)
         )
+    elif result["entries_malformed"]:
+        result["ok"] = False
+        result["reason"] = f"audit_ledger_malformed_lines:{result['entries_malformed']}"
     else:
         result["ok"] = True
     result["receipt_conformance"] = receipt_conformance_report(result)
