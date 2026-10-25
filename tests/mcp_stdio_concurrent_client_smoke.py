@@ -173,9 +173,21 @@ REQUEST_TIMEOUT = timedelta(seconds=120)
 CONCURRENT_TIMEOUT = 180.0  # wall-clock guard for the two-session barrier round
 
 
+# Descriptions are documentation, not shape: the fingerprint hashes the schema with them removed.
 def _canon_fp(schema: Any) -> str:
+    def strip(node: Any) -> Any:
+        if isinstance(node, dict):
+            return {
+                k: strip(v)
+                for k, v in node.items()
+                if not (k == "description" and isinstance(v, str))
+            }
+        if isinstance(node, list):
+            return [strip(v) for v in node]
+        return node
+
     return hashlib.sha256(
-        json.dumps(schema, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        json.dumps(strip(schema), sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
 
 
