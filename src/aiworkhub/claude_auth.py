@@ -62,7 +62,9 @@ def _classify_runtime_auth_failure(
 ) -> tuple[int, str] | None:
     if type(http_status) is not int:
         return None
-    if http_status != 401:
+    # Status 0 is "the provider reported no HTTP status": a mid-run OAuth expiry
+    # arrives as a structured authentication_failed with api_error_status null.
+    if http_status not in (0, 401):
         return None
     if error_code != "authentication_failed":
         return None

@@ -215,7 +215,19 @@ def _provider_auth_failure_from_output(path: Path) -> dict[str, Any] | None:
             and subtype == "api_retry"
             and (status_refusal or code_refusal)
         )
-        if not (structured_result_error or structured_retry_error):
+        # NF-2026-01685: a mid-run OAuth expiry surfaces the structured code only
+        # on the provider-owned assistant API-error event; the terminal result
+        # carries prose and a null status.  Only structured fields qualify.
+        structured_assistant_error = (
+            event.get("type") == "assistant"
+            and event.get("is_api_error_message") is True
+            and structured_auth_error
+        )
+        if not (
+            structured_result_error
+            or structured_retry_error
+            or structured_assistant_error
+        ):
             continue
         # Hand the provider's OWN status and machine error code to the classifier
         # -- never the ``result``/message prose, which an agent could author.
@@ -243,7 +255,7 @@ def _provider_auth_failure_from_output(path: Path) -> dict[str, Any] | None:
             # it as an auth signal; the classifier excludes it because it names
             # nothing); this branch reconciles that disagreement honestly instead
             # of letting a matched refusal fall through to ``worker_failed``.
-            return {
+            undistinguished: dict[str, Any] = {
                 "schema_id": "aiworkhub.provider_launch_failure.v1",
                 "reason": (
                     f"provider_refused:http_status={status}"
@@ -253,6 +265,17 @@ def _provider_auth_failure_from_output(path: Path) -> dict[str, Any] | None:
                 "recoverable": False,
                 "http_status": status,
             }
+            if structured_assistant_error:
+                # NF-2026-01685: keep the structured code and session so the
+                # single bounded auth retry can classify this status-less shape.
+                undistinguished["error_code"] = error_code
+                undistinguished["session_id"] = str(
+                    event.get("session_id")
+                    or event.get("sessionId")
+                    or event.get("provider_session_id")
+                    or ""
+                )
+            return undistinguished
         return {
             "schema_id": "aiworkhub.provider_launch_failure.v1",
             "reason": str(outcome.get("reason") or "provider_refused"),
