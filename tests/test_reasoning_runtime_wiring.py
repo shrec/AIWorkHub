@@ -964,6 +964,7 @@ def _run_claude_launch(
     metadata["_worker_stdin_text"] = (
         b"".join(stdin_writes).decode("utf-8") if stdin_writes else None
     )
+    metadata["_process_events"] = list(manager.events)
     return result, metadata, probe_calls
 
 
@@ -999,6 +1000,31 @@ def test_launch_isolated_claude5_security_card_emits_max_effort(
 
     assert metadata["claude_cli_release"] == "1.2.3"
     assert probe_calls == [str(Path(sys.executable).resolve())]
+
+
+def test_launch_isolated_running_event_carries_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    card: dict[str, object] = {"work_kind": "security", "risk_tier": "critical"}
+    result, metadata, _probe_calls = _run_claude_launch(
+        monkeypatch,
+        tmp_path,
+        model="claude-opus-5",
+        preflight_card=card,
+        committed_card={**card, "token_budget": {"cap_tokens": 200_000}},
+    )
+    assert result["state"] == "running"
+
+    receipt = dict(metadata["reasoning_effort"])
+    assert receipt["applied_key"] == "max"
+    assert receipt["profile"] == "canonical_maximum"
+
+    running = [
+        event for event in metadata["_process_events"]
+        if event.get("state") == "running"
+    ]
+    assert len(running) == 1
+    assert running[0]["reasoning_effort"] == metadata["reasoning_effort"]
 
 
 @pytest.mark.parametrize(

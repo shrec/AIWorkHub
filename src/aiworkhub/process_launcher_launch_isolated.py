@@ -1498,6 +1498,7 @@ def launch_isolated(
                 "topic": topic,
                 "adapter_id": adapter_id,
                 "model": model,
+                "reasoning_effort": metadata.get("reasoning_effort"),
                 "state": "running",
                 "pid": process.pid,
                 "pid_start_ticks": start_ticks,
