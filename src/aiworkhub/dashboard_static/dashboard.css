@@ -544,7 +544,7 @@ main {
 
 table {
   width: 100%;
-  min-width: 790px;
+  min-width: 870px;
   border-collapse: collapse;
   table-layout: fixed;
 }
@@ -588,10 +588,14 @@ th:nth-child(5) {
 }
 
 th:nth-child(6) {
-  width: 105px;
+  width: 80px;
 }
 
 th:nth-child(7) {
+  width: 105px;
+}
+
+th:nth-child(8) {
   width: 92px;
 }
 

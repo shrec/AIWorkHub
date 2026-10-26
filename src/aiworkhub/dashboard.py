@@ -475,6 +475,31 @@ def _read_bound_metadata(
     }
 
 
+_EFFORT_TEXT_LIMIT = 64
+
+
+def _effort_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return " ".join(value.split())[:_EFFORT_TEXT_LIMIT] or None
+
+
+def _compact_reasoning_effort(event: Mapping[str, Any]) -> dict[str, str]:
+    """Bounded effort scalars from a launch receipt; absent or malformed yields none."""
+    receipt = event.get("reasoning_effort")
+    if not isinstance(receipt, Mapping) or not isinstance(receipt.get("applied"), bool):
+        return {}
+    effort = _effort_text(receipt.get("applied_key")) if receipt["applied"] else "default"
+    if effort is None:
+        return {}
+    compact = {"effort": effort}
+    for source, key in (("profile", "effort_profile"), ("status", "effort_status")):
+        text = _effort_text(receipt.get(source))
+        if text is not None:
+            compact[key] = text
+    return compact
+
+
 def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
     context = event.get("project_context")
     delivery = event.get("project_context_delivery")
@@ -1697,6 +1722,9 @@ def _merge_process_liveness_into_tasks(
             "child_alive",
             "runtime_seconds",
             "validation_progress",
+            "effort",
+            "effort_profile",
+            "effort_status",
         ):
             value = process_row.get(key)
             if value is not None:
@@ -1846,6 +1874,7 @@ def read_process_runs(
                 compact[key] = value[:500]
             elif isinstance(value, (bool, int, float)):
                 compact[key] = value
+        compact.update(_compact_reasoning_effort(event))
         existing = latest.get(request_id) or {}
         ai_infra = _compact_ai_infra(event)
         merged_ai_infra = None

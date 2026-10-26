@@ -57,7 +57,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any
+from typing import Any, Callable
 
 from . import parallelism
 from . import platform_io
@@ -5682,6 +5682,51 @@ def parse_file_line_range(text: str) -> tuple[int, int] | None:
     return start, end
 
 
+FILE_NEXT_WINDOW_LINES = 200
+_FILE_QUERY_PATH_SEPARATORS = re.compile(r"[\s,]+")
+_FILE_QUERY_LINE_SUFFIX = re.compile(r":\d+(?:-\d+)?$")
+# A directory part and an extension: ``pkg/new.py`` counts by shape alone,
+# a dotted identifier (``os.path``) or a slash word (``I/O``) never does.
+_FILE_QUERY_PATH_SHAPE = re.compile(r"[/\x5c][^/\x5c]*\.[A-Za-z][A-Za-z0-9]*$")
+
+
+def file_query_paths(
+    text: str, is_file: Callable[[str], bool] = lambda _path: False,
+) -> list[str]:
+    """Distinct paths a ``file`` query names (whitespace or comma separated).
+
+    A token counts when it is path-shaped or ``is_file`` resolves it (an
+    extensionless ``Makefile``, a bare ``setup.py``); quotes, brackets, a
+    ``:line`` suffix and trailing punctuation are stripped first.
+    """
+
+    tokens = (
+        _FILE_QUERY_LINE_SUFFIX.sub("", token.rstrip(".,;:").strip("\"'`()[]{}<>")).rstrip(".,;:")
+        for token in _FILE_QUERY_PATH_SEPARATORS.split(text)
+    )
+    return list(dict.fromkeys(
+        token for token in tokens
+        if token and (_FILE_QUERY_PATH_SHAPE.search(token) or is_file(token))
+    ))
+
+
+def next_file_window_fields(file_path: str, context: dict[str, Any]) -> dict[str, Any]:
+    """Name the line window that continues a truncated, unranged file preview."""
+
+    preview = context.get("source_preview")
+    if (
+        context.get("source_preview_truncated") is not True
+        or "source_preview_line_start" in context
+        or not isinstance(preview, str)
+    ):
+        return {}
+    start = preview.count("\n") + 1
+    return {"source_preview_next_window": {
+        "mode": "file", "target": file_path,
+        "query": f"{start}-{start + FILE_NEXT_WINDOW_LINES - 1}",
+    }}
+
+
 def _bounded_file_preview(
     repo_root: Path, file_path: str, *, max_bytes: int,
 ) -> dict[str, Any]:
@@ -5785,12 +5830,33 @@ def _ranged_file_preview(
     return ranged_text_preview(data.decode("utf-8", errors="replace"), line_range)
 
 
+_TRIVIAL_ANNOTATION_TARGETS = sganalytics._PYTHON_BUILTIN_NAMES | frozenset({
+    "Any", "Callable", "ClassVar", "Dict", "Final", "FrozenSet", "List", "Literal",
+    "LiteralString", "Never", "NoReturn", "Optional", "Self", "Set", "Tuple", "Type",
+    "Union",
+})
+
+
+def _is_trivial_edge(edge: dict[str, Any], language: str) -> bool:
+    """Whether an unresolved Python edge only names a builtin/typing type or a stdlib module."""
+
+    if language != "python" or edge.get("dst_qualname"):
+        return False
+    target = str(edge.get("dst_name") or "")
+    if edge.get("kind") == "annotates":
+        return target in _TRIVIAL_ANNOTATION_TARGETS
+    if edge.get("kind") == "imports":
+        return target.partition(".")[0] in sys.stdlib_module_names
+    return False
+
+
 def file_query(
     repo_root: Path,
     file_path: str,
     budget: int = 64,
     *,
     line_range: tuple[int, int] | None = None,
+    include_trivial_edges: bool = False,
 ) -> dict[str, Any]:
     """Return exact metadata and a bounded preview for one indexed path."""
 
@@ -5805,12 +5871,20 @@ def file_query(
         entity_limit = max(1, min(16, budget // 2))
         edge_limit = max(1, min(16, budget // 2))
         payload["entities"] = payload["entities"][:entity_limit]
-        payload["edges"] = payload["edges"][:edge_limit]
+        # Filter before slicing: trivial edges must not fill the window.
+        edges = payload["edges"]
+        if not include_trivial_edges:
+            language = str((payload.get("file") or {}).get("language") or "")
+            kept = [edge for edge in edges if not _is_trivial_edge(edge, language)]
+            payload["trivial_edges_dropped"] = len(edges) - len(kept)
+            edges = kept
+        payload["edges"] = edges[:edge_limit]
         if line_range is None:
             payload.update(_bounded_file_preview(
                 repo_root, file_path,
                 max_bytes=min(4096, max(1024, budget * 128)),
             ))
+            payload.update(next_file_window_fields(file_path, payload))
         else:
             ranged_fields = _ranged_file_preview(repo_root, file_path, line_range)
             payload.update(ranged_fields)

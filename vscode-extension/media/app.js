@@ -1464,6 +1464,19 @@ function renderTaskTable() {
     modelCell.appendChild(model);
     row.appendChild(modelCell);
 
+    const effortCell = document.createElement("td");
+    const effortName = typeof task.effort === "string" ? task.effort.trim() : "";
+    const effort = createElement("span", effortName ? "cell-primary" : "cell-secondary", effortName || "—");
+    const effortDetail = [
+      task.effort_profile ? `profile ${task.effort_profile}` : "",
+      task.effort_status ? `status ${task.effort_status}` : "",
+    ].filter(Boolean).join(", ");
+    effort.title = effortName
+      ? effortDetail || effortName
+      : "No reasoning effort recorded (editor bridge or older run)";
+    effortCell.appendChild(effort);
+    row.appendChild(effortCell);
+
     const activityCell = createElement("td", "activity-cell", formatRelativeTime(task.updated_at || task.last_activity_at));
     activityCell.title = String(task.updated_at || task.last_activity_at || "Unknown");
     row.appendChild(activityCell);

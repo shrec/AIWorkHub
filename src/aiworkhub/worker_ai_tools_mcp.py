@@ -3742,17 +3742,23 @@ def _merge_rework_overlay_payload(
                 ],
                 "edges": [],
             }
+            from . import source_graph as _source_graph_mod
+
             if file_line_range is None:
                 source_preview = text[:4096]
-                overlay_contexts.append({
-                    **context_base,
+                preview_fields = {
                     "source_preview": source_preview,
                     "source_preview_bytes": len(source_preview.encode("utf-8")),
-                    "source_preview_truncated": len(text.encode("utf-8")) > 4096,
+                    # Cut by characters, so judged by characters: a short
+                    # multibyte file is whole and earns no next window.
+                    "source_preview_truncated": len(source_preview) < len(text),
+                }
+                overlay_contexts.append({
+                    **context_base,
+                    **preview_fields,
+                    **_source_graph_mod.next_file_window_fields(relative, preview_fields),
                 })
             else:
-                from . import source_graph as _source_graph_mod
-
                 overlay_contexts.append({
                     **context_base,
                     **_source_graph_mod.ranged_text_preview(
@@ -5263,6 +5269,38 @@ def source_graph_query(
                 # when it is indexed, while retaining the semantic-query
                 # path as a fallback for directory-scoped calls.
                 file_query_path = scope or bounded_query
+
+                def _indexed(path: str) -> bool:
+                    return _json_hit_count(
+                        _source_graph_mod.file_query(query_repo, path, budget)
+                    ) > 0
+
+                # The declared target is one path even when it contains a
+                # space, so only the rest of the query can name further paths.
+                target_path = (
+                    scope
+                    if scope is not None and scope != bounded_query
+                    and scope in bounded_query and _indexed(scope)
+                    else None
+                )
+                rest = bounded_query.replace(target_path, " ") if target_path else bounded_query
+                requested_paths = list(dict.fromkeys(
+                    ([target_path] if target_path else [])
+                    + _source_graph_mod.file_query_paths(rest, _indexed)
+                ))
+                if (
+                    len(requested_paths) > 1
+                    and bounded_query != scope
+                    and not _indexed(bounded_query)
+                ):
+                    return _violation(
+                        ctx, tool, "file_mode_one_path_per_call",
+                        requested_paths=requested_paths,
+                        valid_next_call=(
+                            "mode=file reads one path per call: issue a separate "
+                            "mode=file call for each path in requested_paths."
+                        ),
+                    )
                 file_range = (
                     _source_graph_mod.parse_file_line_range(bounded_query) if scope else None
                 )

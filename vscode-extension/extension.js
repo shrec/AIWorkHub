@@ -5204,6 +5204,27 @@ function vscodeLmSourceGraphPageBytes(result) {
   return bytes;
 }
 
+// A `file` reply has no per-row source: its evidence is one window of one file version.
+function vscodeLmSourceGraphFileEvidenceKey(payload) {
+  const context = Array.isArray(payload.contexts) ? payload.contexts[0] : null;
+  if (!context || typeof context !== "object") return "";
+  const text = (value) => (typeof value === "string" ? value.trim() : "");
+  const file = context.file && typeof context.file === "object" ? context.file : {};
+  const filePath = text(context.file_path) || text(file.file_path);
+  const sourceHash = text(file.source_hash).toLowerCase();
+  const preview = context.source_preview;
+  if (!filePath || !/^[a-f0-9]{64}$/.test(sourceHash) ||
+      typeof preview !== "string" || !preview.trim()) return "";
+  const first = context.source_preview_line_start;
+  const last = context.source_preview_line_end;
+  const ranged = first !== undefined || last !== undefined;
+  if (ranged && !(Number.isInteger(first) && first >= 1 &&
+      Number.isInteger(last) && last >= first)) return "";
+  const returnedWindow = ranged ? first + "-" + last
+    : crypto.createHash("sha256").update(preview, "utf8").digest("hex");
+  return JSON.stringify(["file", filePath, sourceHash, returnedWindow]);
+}
+
 // Distinct requests alone are not progress. Novel backend source evidence
 // resets the bounded no-progress streak; duplicates and all protocol limits remain.
 function createVscodeLmSourceGraphGuard() {
@@ -5301,6 +5322,10 @@ function createVscodeLmSourceGraphGuard() {
           if (!(source && /^[a-f0-9]{64}$/i.test(sourceHash)) && !indexed) continue;
           keys.push(JSON.stringify([row.file_path, sourceHash, row.line_start,
             row.line_end, row.qualname || "", source || row.signature]));
+        }
+        if (normalize(result.mode) === "file") {
+          const fileKey = vscodeLmSourceGraphFileEvidenceKey(payload);
+          if (fileKey) keys.push(fileKey);
         }
       }
       let progressed = false;
@@ -13633,6 +13658,7 @@ function getHtmlForWebview(webview, extensionUri) {
                 <th scope="col">Topic</th>
                 <th scope="col">Runner</th>
                 <th scope="col">Model</th>
+                <th scope="col">Effort</th>
                 <th scope="col">Activity</th>
                 <th scope="col">Signal</th>
               </tr>

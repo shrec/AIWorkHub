@@ -1659,7 +1659,7 @@ main {
 
 table {
   width: 100%;
-  min-width: 640px;
+  min-width: 712px;
   border-collapse: collapse;
   table-layout: fixed;
 }
@@ -1686,8 +1686,9 @@ th:nth-child(2) { width: 30%; }
 th:nth-child(3) { width: 16%; }
 th:nth-child(4) { width: 15%; }
 th:nth-child(5) { width: 12%; }
-th:nth-child(6) { width: 96px; }
-th:nth-child(7) { width: 86px; }
+th:nth-child(6) { width: 72px; }
+th:nth-child(7) { width: 96px; }
+th:nth-child(8) { width: 86px; }
 
 td {
   height: 40px;
