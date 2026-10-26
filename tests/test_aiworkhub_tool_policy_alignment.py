@@ -13,7 +13,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import sync_aiworkhub_tool_policy as policy_sync  # noqa: E402
-from conftest import can_create_symlink  # noqa: E402
 
 
 def copy_policy_tree(tmp_path: Path) -> None:
@@ -637,13 +636,25 @@ def test_sync_requires_write_gate_before_mutating_valid_drift(tmp_path: Path, mo
     assert drifted_path.read_bytes() == drifted
 
 
-# In the AppContainer lane sync() raises WinError 1314 here although nothing creates a symlink; the raising call is
-# unmeasured (NF-2026-01628), so the symlink probe stands in for that privilege-restricted sandbox.
-@pytest.mark.skipif(
-    not can_create_symlink(),
-    reason="privilege-restricted sandbox: sync() raises WinError 1314 in this test (NF-2026-01628)",
+# AppContainer, measured: link_windows_relative_child -> NtSetInformationFile(FileLinkInformationEx)
+# fails with errno 5 (ERROR_ACCESS_DENIED); the 1314 in NF-2026-01628 is os.symlink's, not this call's.
+@pytest.mark.parametrize(
+    "deny_hard_link",
+    [
+        pytest.param(False, id="hard_link_as_available"),
+        pytest.param(
+            True,
+            id="hard_link_denied_1314",
+            marks=pytest.mark.skipif(
+                os.link in os.supports_dir_fd,
+                reason="os.link(dir_fd) restores here; the rename fallback is the Windows HANDLE link's",
+            ),
+        ),
+    ],
 )
-def test_sync_rolls_back_all_hosts_after_second_staged_write_failure(tmp_path: Path, monkeypatch) -> None:
+def test_sync_rolls_back_all_hosts_after_second_staged_write_failure(
+    tmp_path: Path, monkeypatch, deny_hard_link: bool
+) -> None:
     copy_policy_tree(tmp_path)
     monkeypatch.setenv(policy_sync.WRITE_GATE_ENV, "1")
 
@@ -669,6 +680,12 @@ def test_sync_rolls_back_all_hosts_after_second_staged_write_failure(tmp_path: P
         real_replace(src, dst, *args, **kwargs)
 
     monkeypatch.setattr(policy_sync.os, "replace", fail_second_staged_write)
+    if deny_hard_link:
+
+        def deny_link(*args, **kwargs) -> None:
+            raise OSError(1314, "A required privilege is not held by the client")
+
+        monkeypatch.setattr(policy_sync.platform_io, "link_windows_relative_child", deny_link)
 
     try:
         policy_sync.sync(tmp_path)
@@ -680,6 +697,54 @@ def test_sync_rolls_back_all_hosts_after_second_staged_write_failure(tmp_path: P
     assert staged_write_count == 2
     assert {relative_path: (tmp_path / relative_path).read_bytes() for relative_path in policy_sync.HOST_FILES} == originals
     assert staged_policy_artifacts(tmp_path) == []
+
+
+@pytest.mark.skipif(
+    os.link in os.supports_dir_fd,
+    reason="os.link(dir_fd) restores here; the rename fallback is the Windows HANDLE link's",
+)
+def test_sync_rollback_rename_fallback_never_clobbers_a_recreated_host(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The hard link was no-clobber by construction; the rename fallback is only
+    # by replace_if_exists=False, so a host recreated mid-restore must survive.
+    copy_policy_tree(tmp_path)
+    monkeypatch.setenv(policy_sync.WRITE_GATE_ENV, "1")
+    for relative_path in policy_sync.HOST_FILES:
+        path = tmp_path / relative_path
+        path.write_bytes(path.read_bytes().replace(b"Stop at Codex review.", b"Stop at manager review."))
+
+    real_replace = policy_sync.os.replace
+    host_names = {relative_path.name for relative_path in policy_sync.HOST_FILES}
+    staged_write_count = 0
+
+    def fail_second_staged_write(src: Path, dst: Path, *args, **kwargs) -> None:
+        nonlocal staged_write_count
+        if ".aiworkhub-policy-sync." in Path(src).name and Path(src).name.endswith(".tmp") and Path(dst).name in host_names:
+            staged_write_count += 1
+            if staged_write_count == 2:
+                raise OSError("injected second write failure")
+        real_replace(src, dst, *args, **kwargs)
+
+    recreated: list[Path] = []
+    concurrent = b"recreated by a concurrent writer"
+
+    def recreate_host_then_deny_link(_src_handle, _src_leaf, _dst_handle, dst_leaf, *args, **kwargs) -> None:
+        (relative_path,) = [path for path in policy_sync.HOST_FILES if path.name == dst_leaf]
+        (tmp_path / relative_path).write_bytes(concurrent)
+        recreated.append(relative_path)
+        raise OSError(1314, "A required privilege is not held by the client")
+
+    monkeypatch.setattr(policy_sync.os, "replace", fail_second_staged_write)
+    monkeypatch.setattr(policy_sync.platform_io, "link_windows_relative_child", recreate_host_then_deny_link)
+
+    with pytest.raises(policy_sync.PolicySyncError) as raised:
+        policy_sync.sync(tmp_path)
+
+    (relative_path,) = recreated
+    assert f"{relative_path}: rollback conflict; destination appeared after sync failure" in str(raised.value)
+    assert (tmp_path / relative_path).read_bytes() == concurrent
+    assert staged_policy_artifacts(tmp_path) != []  # the backup is kept, not renamed over it
 
 
 def test_sync_rollback_preserves_concurrent_edit_after_applied_host_changes(

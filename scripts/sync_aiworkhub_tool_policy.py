@@ -1027,6 +1027,40 @@ def _check_windows_rollback_target_missing(
     )
 
 
+def _link_or_rename_backup_onto_host_windows(
+    backup: AuthenticatedPath, host: AuthenticatedPath, relative_path: Path
+) -> bool:
+    """Link the backup onto the missing host, else rename it there without clobbering; True if renamed."""
+
+    backup_handle = backup.windows_parent_handle.value
+    host_handle = host.windows_parent_handle.value
+    try:
+        platform_io.link_windows_relative_child(
+            backup_handle, backup.leaf_name, host_handle, host.leaf_name
+        )
+        return False
+    except FileExistsError:
+        raise
+    except OSError as link_exc:
+        # AppContainer: link_windows_relative_child (FileLinkInformationEx) -> errno 5; rename works.
+        try:
+            platform_io.rename_windows_relative_child(
+                backup_handle,
+                backup.leaf_name,
+                host_handle,
+                host.leaf_name,
+                replace_if_exists=False,
+            )
+        except FileExistsError:
+            raise
+        except OSError as rename_exc:
+            raise PolicySyncError(
+                f"{relative_path}: hard link restore failed ({link_exc.strerror or link_exc}); "
+                f"rename restore failed ({rename_exc.strerror or rename_exc})"
+            ) from rename_exc
+        return True
+
+
 def restore_missing_host_from_backup(staged: StagedUpdate) -> None:
     with authenticated_path(staged.update.root, staged.update.relative_path, staged.update.relative_path) as host:
         try:
@@ -1059,6 +1093,7 @@ def restore_missing_host_from_backup(staged: StagedUpdate) -> None:
         raise PolicySyncError(f"{staged.update.relative_path}: backup changed before rollback")
     if not backup_identity.is_regular:
         raise PolicySyncError(f"{staged.update.relative_path}: backup is not a regular file")
+    backup_renamed = False
     try:
         with authenticated_path(staged.update.root, staged.backup_relative_path, staged.backup_path, "staged") as backup:
             with authenticated_path(staged.update.root, staged.update.relative_path, staged.update.relative_path) as host:
@@ -1070,13 +1105,11 @@ def restore_missing_host_from_backup(staged: StagedUpdate) -> None:
                         dst_dir_fd=host.parent_fd,
                     )
                 except NotImplementedError:
-                    platform_io.link_windows_relative_child(
-                        backup.windows_parent_handle.value,
-                        backup.leaf_name,
-                        host.windows_parent_handle.value,
-                        host.leaf_name,
+                    backup_renamed = _link_or_rename_backup_onto_host_windows(
+                        backup, host, staged.update.relative_path
                     )
-        authenticated_unlink(staged.backup_path, staged.update.root, staged.backup_relative_path)
+        if not backup_renamed:
+            authenticated_unlink(staged.backup_path, staged.update.root, staged.backup_relative_path)
     except FileExistsError as exc:
         raise PolicySyncError(
             f"{staged.update.relative_path}: rollback conflict; destination appeared after sync failure"
