@@ -157,11 +157,14 @@ preserving owner-authored text outside the markers. Open a new Claude chat
 afterward because an existing chat may retain its old instructions and tool
 schema.
 
-Claude may use built-in `Read` only for an exact bounded path/range returned
-by Source Graph or after Source Graph explicitly reports that target
-unsupported/unindexed. If required MCP tools are unavailable, it must report
-the connection problem rather than silently falling back to broad
-`Grep`/`Glob`/shell discovery.
+Built-in `Read` and `Write` are denied on indexed files for every seat,
+including the manager. Claude reads through Source Graph instead: `body` for a
+symbol, or `file` with an exact `target` and a `START-END` line window
+(`bodygrep` returns line numbers). It edits with semantic edit, and `Write`
+only creates new files. A bounded `Read` is allowed only after Source Graph
+reports that target unsupported/unindexed. If required MCP tools are
+unavailable, it must report the connection problem rather than silently
+falling back to broad `Grep`/`Glob`/shell discovery.
 
 ## 6. Run the first task
 

@@ -105,7 +105,7 @@ def test_no_existing_protocol_rule_was_removed_or_weakened() -> None:
         "Re-query whenever the active symbol",
         "one preflight query is not continuous use",
         "Exact validation/build/test commands named by the card are allowed.",
-        "use a bounded read and never reread an unchanged range",
+        "never a built-in Read, and never reread an unchanged range",
         "Never store secrets or fabricate session evidence.",
         "issue one bounded task-specific query",
         "Do not query legacy memory files directly.",
@@ -409,7 +409,7 @@ def test_the_semantic_edit_rule_is_stated_once() -> None:
     assert "For edits prefer aiworkhub_worker_semantic_edit_prepare/apply" not in canonical
     assert "After Source Graph finds an exact target" not in canonical
     assert canonical.count("aiworkhub_worker_semantic_edit_prepare") == 1
-    assert canonical.count("a bounded read and never reread an unchanged range") == 1
+    assert canonical.count("never a built-in Read, and never reread an unchanged range") == 1
     assert instr.CANONICAL_MAX_BYTES == 7300
     assert instr.PROJECTION_MAX_BYTES == 9200
     assert len(canonical.encode("utf-8")) <= instr.CANONICAL_MAX_BYTES

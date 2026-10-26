@@ -48,10 +48,10 @@ Source Graph gate:
 Semantic edit (mandatory):
 - Every seat changes an existing file with aiworkhub_worker_semantic_edit_prepare then _apply, or the manager pair, on the smallest verified range; a whole-file rewrite is not an editing strategy.
 - Exceptions: a new file, a change spanning most of a file, or an adapter without these tools; record which one applies, never a silent raw edit.
-- prepare is an edit step, not a reader: read with body/file preview, otherwise use a bounded read and never reread an unchanged range.
+- prepare is an edit step, not a reader: read with body/file preview, never a built-in Read, and never reread an unchanged range.
 Exact-command exception:
 - Exact validation/build/test commands named by the card are allowed.
-- Exact known-path reads from the card or Source Graph are allowed; they are not broad discovery.
+- Exact known-path reads from the card or Source Graph are allowed through Source Graph mode="file" with an exact START-END window; they are not broad discovery.
 Session Manager:
 - Recover current state before non-trivial assumptions and preserve the returned session identity in the handoff.
 - Never store secrets or fabricate session evidence.

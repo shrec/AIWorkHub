@@ -91,7 +91,9 @@ def test_exact_validation_exception_is_not_discovery_escape_hatch() -> None:
     text = instr.render_canonical()
     assert "Exact validation/build/test commands named by the card are allowed." in text
     assert "Exact known-path reads from the card or Source Graph are allowed" in text
-    assert "use a bounded read and never reread an unchanged range" in text
+    assert 'through Source Graph mode="file" with an exact START-END window' in text
+    assert "never a built-in Read, and never reread an unchanged range" in text
+    assert "use a bounded read" not in text
     assert "they are not broad discovery" in text
 
 
@@ -147,6 +149,8 @@ def test_claude_projection_starts_with_manager_graph_loop() -> None:
         "Direct Claude chats use manager tools",
     ):
         assert required in text
+    assert 'mode="file"' in text
+    assert "exact bounded path/range" not in text
 
 
 def test_unsupported_provider_fails_closed() -> None:

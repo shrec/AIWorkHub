@@ -144,7 +144,7 @@ Claude Code manager startup (mandatory when AIWorkHub MCP is available):
 - Continue only when repository identity and manager route are verified.
 - The verified bootstrap/repository_current repository outranks host cwd, workspace_roots and environment_context; on mismatch stop before filesystem access, switch/reload the route and never inspect the hinted repository.
 - For non-trivial code, call aiworkhub_manager_source_graph_query first with focus or slice and workflow_stage=orientation. Re-query when the symbol, boundary, hypothesis or stage changes.
-- Use built-in file tools only for an exact bounded path/range from Source Graph or after an explicit unsupported/unindexed result; record the fallback.
+- Built-in Read and Write are denied on indexed files for every seat, the manager included: read with Source Graph mode="body" for a symbol or mode="file" target=<exact path> query="START-END" for a line window (bodygrep gives line numbers); edit with semantic edit; Write only creates new files. A bounded Read is allowed only after Source Graph reports the target unsupported or unindexed; record that reason.
 - Make the seat's small corrections with scripts/manager_semantic_edit.py --path --start --end (replacement on stdin): it replaces one hash-verified line range and never rewrites a file. The manager does not correct by whole-string rewrite.
 - If bootstrap or required Source Graph is unavailable, report the MCP problem instead of silently bypassing AIWorkHub.
 - Direct Claude chats use manager tools; launched task workers use worker tools.
@@ -237,18 +237,18 @@ POLICY = ToolPolicy(
     # so the mandate is stated here, once, and named exceptions replace taste.
     # Nothing was dropped to fit it: this section absorbs the two Source Graph
     # lines it supersedes ("After Source Graph finds an exact target, prefer
-    # body/file preview; otherwise use a bounded read and never reread an
+    # body/file preview; never a built-in Read, and never reread an
     # unchanged range." and "For edits prefer
     # aiworkhub_worker_semantic_edit_prepare/apply with the smallest verified
     # range."), so CANONICAL_MAX_BYTES did not move.
     semantic_edit=(
         "Every seat changes an existing file with aiworkhub_worker_semantic_edit_prepare then _apply, or the manager pair, on the smallest verified range; a whole-file rewrite is not an editing strategy.",
         "Exceptions: a new file, a change spanning most of a file, or an adapter without these tools; record which one applies, never a silent raw edit.",
-        "prepare is an edit step, not a reader: read with body/file preview, otherwise use a bounded read and never reread an unchanged range.",
+        "prepare is an edit step, not a reader: read with body/file preview, never a built-in Read, and never reread an unchanged range.",
     ),
     validation=(
         "Exact validation/build/test commands named by the card are allowed.",
-        "Exact known-path reads from the card or Source Graph are allowed; they are not broad discovery.",
+        "Exact known-path reads from the card or Source Graph are allowed through Source Graph mode=\"file\" with an exact START-END window; they are not broad discovery.",
     ),
     session=(
         "Recover current state before non-trivial assumptions and preserve the returned session identity in the handoff.",
