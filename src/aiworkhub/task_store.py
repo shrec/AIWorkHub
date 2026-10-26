@@ -542,6 +542,7 @@ def _connect(
         conn = connect_readonly(path, timeout=5.0)
         conn.execute(f"PRAGMA busy_timeout={bounded_busy}")
         conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA temp_store=MEMORY")
         conn.row_factory = sqlite3.Row
         return conn
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -558,6 +559,7 @@ def _connect(
         leased.execute(f"PRAGMA busy_timeout={bounded_busy}")
         _set_journal_mode_wal(leased)
         leased.execute("PRAGMA synchronous=NORMAL")
+        leased.execute("PRAGMA temp_store=MEMORY")
         leased.row_factory = sqlite3.Row
         leased._lease_stack = stack  # type: ignore[attr-defined]
         return leased
