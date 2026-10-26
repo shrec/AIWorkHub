@@ -104,14 +104,24 @@ def _getfinalpathname(path):
     try:
         return _getfinalpathname_host(path)
     except PermissionError:
-        drive = ntpath.splitdrive(path)[0] if isinstance(path, str) else ""
-        relative = _volume_relative_name(path) if len(drive) == 2 else ""
+        # NF-2026-01702: a root that already carries the extended-length
+        # prefix has a 6-character "drive"; rebuild from the unprefixed spelling
+        # (never a \\?\UNC\ path) and still compare against the original input.
+        plain = path
+        if (
+            isinstance(path, str)
+            and path.startswith("\\\\?\\")
+            and path[4:8].upper() != "UNC\\"
+        ):
+            plain = path[4:]
+        drive = ntpath.splitdrive(plain)[0] if isinstance(plain, str) else ""
+        relative = _volume_relative_name(plain) if len(drive) == 2 else ""
         candidates = ["\\\\?\\" + drive.upper() + relative] if relative else []
         # NF-2026-01027: a sandbox root is a per-session drive letter of its
         # own, and its real directories lead the volume-relative name. The
         # container may not query that mapping (QueryDosDeviceW: WinError 5),
         # so keep only the input's own length of the name's tail.
-        tail = ntpath.splitdrive(ntpath.abspath(path))[1].rstrip("\\") if relative else ""
+        tail = ntpath.splitdrive(ntpath.abspath(plain))[1].rstrip("\\") if relative else ""
         if relative and relative.lower().endswith(tail.lower()):
             kept = relative[len(relative) - len(tail):] or "\\"
             candidates.append("\\\\?\\" + drive.upper() + kept)
