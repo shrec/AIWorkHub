@@ -9875,7 +9875,9 @@ def reroute_launch_identity(
             route for route in catalog.get("workers", [])
             if route.get("execution_runner") == to_runner
             and route.get("effective_adapter_id") == to_adapter_id
-            and route.get("model") == canonical_model
+            and process_launcher._normalize_workforce_model(
+                str(route.get("model") or ""), to_adapter_id
+            ) == canonical_model
         ]
         if len(routes) != 1 or routes[0].get("implementation_worker") is not True:
             return _lifecycle_error("reroute_target_rejected:implementation_worker_role_required")
