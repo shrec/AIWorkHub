@@ -18,9 +18,9 @@ Rules, first match wins:
 * R3 raw read (cat, head, sed, Get-Content, ...) of an indexed file.
 * R4 inline python/node code that reads an indexed file or lists an indexed
   directory.
-* R5 Read of an indexed file without a limit or with a limit above 400.
+* R5 Read of an indexed file, whatever its limit or offset.
 * R6 Edit of an existing repository file.
-* R7 Write over an existing repository file that keeps most of its lines.
+* R7 Write over an existing repository file; Write only creates new files.
 
 R6 and R7 leave ``.git`` and ``.aiworkhub`` alone: VCS and runtime state is not
 source the semantic editor can take over.
@@ -29,7 +29,6 @@ source the semantic editor can take over.
 from __future__ import annotations
 
 import base64
-import difflib
 import json
 import os
 import re
@@ -37,8 +36,6 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-READ_LIMIT_MAX = 400
-WRITE_SIMILARITY_DENY = 0.5
 REASON_MAX_CHARS = 400
 REMINDER_MAX_BYTES = 800
 EXCLUDED_DIRS = frozenset(
@@ -59,15 +56,14 @@ _DENIALS_PARTS = (".aiworkhub", "runtime", "tool_guard", "denials.jsonl")
 _DENIALS_ROTATE_BYTES = 4 * 1024 * 1024
 _STDIN_MAX_BYTES = 32 * 1024 * 1024
 _COMMAND_MAX_CHARS = 1024 * 1024
-_COMPARE_MAX_CHARS = 4 * 1024 * 1024
 _LITERALS_MAX = 256
 _NESTING_MAX = 3
 
 _SOURCE_GRAPH = "aiworkhub_manager_source_graph_query / aiworkhub_worker_source_graph_query"
 _UNINDEXED = " A bounded Read is allowed when Source Graph reports the target unindexed."
 _READ_INSTEAD = (
-    "Use " + _SOURCE_GRAPH + ' mode="body" or mode="slice", then Read offset+limit<=400'
-    " from the returned range."
+    "Use " + _SOURCE_GRAPH + ' mode="body" for a symbol or mode="file" target=<exact path>'
+    ' query="START-END" for an exact line window; bodygrep gives exact line numbers.'
 )
 _EDIT_INSTEAD = (
     "Use aiworkhub_worker_semantic_edit_prepare then aiworkhub_worker_semantic_edit_apply"
@@ -92,17 +88,14 @@ _REASONS = {
         "AIWorkHub tool guard R4: inline code over indexed source {target} is denied. "
         + _READ_INSTEAD
     ),
-    "R5": (
-        "AIWorkHub tool guard R5: Read of indexed file {target} needs a limit<=400. "
-        + _READ_INSTEAD
-    ),
+    "R5": "AIWorkHub tool guard R5: Read of indexed file {target} is denied. " + _READ_INSTEAD,
     "R6": (
         "AIWorkHub tool guard R6: raw edit of an existing repository file is denied. "
         + _EDIT_INSTEAD
     ),
     "R7": (
-        "AIWorkHub tool guard R7: this Write keeps {ratio} of an existing file; Write is"
-        " for new or mostly rewritten files. " + _EDIT_INSTEAD
+        "AIWorkHub tool guard R7: Write over existing repository file {target} is denied;"
+        " Write only creates new files. " + _EDIT_INSTEAD
     ),
 }
 REMINDER = (
@@ -110,11 +103,12 @@ REMINDER = (
     "- Search: aiworkhub_manager_source_graph_query or aiworkhub_worker_source_graph_query"
     ' mode="bodygrep", not grep/rg/findstr/Select-String/git grep.\n'
     '- Listing: mode="slice", not find/fd/tree/ls -R/Get-ChildItem -Recurse/dir /s.\n'
-    '- Reading: mode="body" or "slice", then Read offset+limit<=400 from the returned'
-    " range; not cat/head/sed/Get-Content or python/node file reads.\n"
+    '- Reading: mode="body" for a symbol or mode="file" query="START-END" for a line'
+    " window; built-in Read is denied on indexed files; not cat/head/sed/Get-Content or"
+    " python/node file reads.\n"
     "- Editing an existing file: aiworkhub_worker_semantic_edit_prepare then"
     " aiworkhub_worker_semantic_edit_apply (worker) or scripts/manager_semantic_edit.py"
-    " --path --start --end (manager); Write only new or mostly rewritten files.\n"
+    " --path --start --end (manager); Write only creates new files.\n"
     "- A bounded Read is allowed when Source Graph reports the target unindexed."
 )
 
@@ -1277,45 +1271,9 @@ def _shell_verdict(ctx: _Context, command: str, depth: int = 0) -> tuple[str, st
     return None
 
 
-def _integer(value: object) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
-    return None
-
-
-def _similarity(previous: str, content: str) -> float:
-    matcher = difflib.SequenceMatcher(None, previous.splitlines(), content.splitlines())
-    # Both quick ratios bound ratio() from above, so a low one already decides.
-    for bound in (matcher.real_quick_ratio, matcher.quick_ratio):
-        ceiling = bound()
-        if ceiling < WRITE_SIMILARITY_DENY:
-            return ceiling
-    return matcher.ratio()
-
-
-def _write_verdict(ctx: _Context, file_path: str, content: object) -> tuple[str, str, str] | None:
-    if not isinstance(content, str) or len(content) > _COMPARE_MAX_CHARS:
-        return None
-    path = ctx.path(file_path)
-    target = ctx.editable(path)
-    if path is None or target is None:
-        return None
-    try:
-        if path.stat().st_size > _COMPARE_MAX_CHARS:
-            return None
-        previous = path.read_bytes().decode("utf-8", "replace")
-    except OSError:
-        return None
-    ratio = _similarity(previous, content)
-    if ratio < WRITE_SIMILARITY_DENY:
-        return None
-    return ("R7", target, "%.2f" % ratio)
+def _write_verdict(ctx: _Context, file_path: str) -> tuple[str, str, str] | None:
+    target = ctx.editable(ctx.path(file_path))
+    return None if target is None else ("R7", target, "")
 
 
 def _tool_verdict(
@@ -1329,15 +1287,12 @@ def _tool_verdict(
         return None
     if tool_name == "Read":
         target = ctx.indexed_file(file_path, glob=False)
-        limit = _integer(tool_input.get("limit"))
-        if target is None or (limit is not None and 0 < limit <= READ_LIMIT_MAX):
-            return None
-        return ("R5", target, "")
+        return None if target is None else ("R5", target, "")
     if tool_name in ("Edit", "MultiEdit"):
         target = ctx.editable(ctx.path(file_path))
         return None if target is None else ("R6", target, "")
     if tool_name == "Write":
-        return _write_verdict(ctx, file_path, tool_input.get("content"))
+        return _write_verdict(ctx, file_path)
     return None
 
 
@@ -1357,7 +1312,7 @@ def _mirror_reason(rule: str, rest: str, worktree: str) -> str:
         + rule
         + ": worktree mirror of indexed source {target} is denied. Use "
         + route
-        + " and Source Graph body/slice on {target}, then Read offset+limit<=400."
+        + " and Source Graph mode=\"body\" or mode=\"file\" query=\"START-END\" on {target}."
         + _UNINDEXED
     )
     slots = template.count("{target}")
@@ -1372,15 +1327,13 @@ def _reason(rule: str, target: str, detail: str) -> str:
         rest, worktree = mirror
         return _mirror_reason(rule, "/".join(rest) or ".", worktree)
     template = _REASONS[rule] + _UNINDEXED
-    ratio = detail if rule == "R7" else ""
     pattern = _CONTROL.sub(" ", detail).strip() if rule == "R1" else ""
-    fixed = len(template.format(target="", pattern='""', ratio=ratio))
+    fixed = len(template.format(target="", pattern='""'))
     slots = template.count("{target}") + template.count("{pattern}")
     share = max(16, (REASON_MAX_CHARS - fixed) // max(1, slots))
     text = template.format(
         target=_clip(_CONTROL.sub(" ", target).strip() or ".", share),
         pattern=_quoted(pattern, share),
-        ratio=ratio,
     )
     return _clip(text, REASON_MAX_CHARS)
 
@@ -1488,11 +1441,9 @@ def main(argv: list[str] | None = None) -> int:
 __all__ = [
     "EXCLUDED_DIRS",
     "INDEXED_SUFFIXES",
-    "READ_LIMIT_MAX",
     "REASON_MAX_CHARS",
     "REMINDER",
     "REMINDER_MAX_BYTES",
-    "WRITE_SIMILARITY_DENY",
     "decide",
     "main",
 ]

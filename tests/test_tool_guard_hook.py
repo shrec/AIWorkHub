@@ -73,8 +73,12 @@ DENIED: list[tuple[str, Any, str]] = [
     ("Bash", "python -c \"import glob; print(glob.glob('src/**/*.py'))\"", "R4"),
     ("Read", {"file_path": "src/aiworkhub/core.py"}, "R5"),
     ("Read", {"file_path": "src/aiworkhub/core.py", "limit": 2000}, "R5"),
+    ("Read", {"file_path": "src/aiworkhub/core.py", "offset": 20, "limit": 40}, "R5"),
+    ("Read", {"file_path": "src/aiworkhub/core.py", "offset": 1, "limit": 400}, "R5"),
     ("Edit", {"file_path": "src/x.py", "old_string": "foo = 1", "new_string": "foo = 2"}, "R6"),
     ("Write", {"file_path": "src/aiworkhub/core.py", "content": _NEAR_COPY}, "R7"),
+    ("Write", {"file_path": "src/aiworkhub/core.py", "content": "rewritten = True\n"}, "R7"),
+    ("Write", {"file_path": "src/x.py", "content": "foo = 2\n"}, "R7"),
 ]
 
 ALLOWED: list[tuple[str, Any]] = [
@@ -87,17 +91,14 @@ ALLOWED: list[tuple[str, Any]] = [
     ("Bash", "python -m pytest tests/x.py -q"),
     ("Bash", "ls src"),
     ("PowerShell", "Get-ChildItem src"),
-    ("Read", {"file_path": "src/aiworkhub/core.py", "offset": 20, "limit": 40}),
-    ("Read", {"file_path": "src/aiworkhub/core.py", "offset": 1, "limit": 400}),
     ("Read", {"file_path": "notes.txt"}),
     ("Edit", {"file_path": "../outside.py", "old_string": "a = 1", "new_string": "a = 2"}),
     ("Edit", {"file_path": ".aiworkhub/runtime/x.json", "old_string": "{}", "new_string": "[]"}),
     ("Write", {"file_path": "src/new_module.py", "content": "x = 1\n"}),
-    ("Write", {"file_path": "src/aiworkhub/core.py", "content": "rewritten = True\n"}),
 ]
 
 _SOURCE_GRAPH = ("aiworkhub_manager_source_graph_query", "aiworkhub_worker_source_graph_query")
-_READ_INSTEAD = (*_SOURCE_GRAPH, 'mode="body"', "offset+limit<=400")
+_READ_INSTEAD = (*_SOURCE_GRAPH, 'mode="body"', 'mode="file"')
 _EDIT_INSTEAD = (
     "aiworkhub_worker_semantic_edit_prepare",
     "aiworkhub_worker_semantic_edit_apply",
@@ -192,6 +193,20 @@ def test_bounded_unindexed_and_new_file_access_is_allowed(
     repo: Path, tool: str, spec: Any
 ) -> None:
     assert tool_guard_hook.decide(tool, _tool_input(repo, spec), repo) is None
+
+
+def test_a_write_over_an_existing_file_is_denied_whatever_its_size(repo: Path) -> None:
+    content = "x = 1\n" * ((4 * 1024 * 1024) // 6 + 1)
+    assert len(content) > 4 * 1024 * 1024
+
+    for rel in ("src/aiworkhub/core.py", "src/x.py"):
+        spec = {"file_path": rel, "content": content}
+        verdict = tool_guard_hook.decide("Write", _tool_input(repo, spec), repo)
+
+        assert verdict is not None, rel
+        assert verdict[0] == "R7"
+        assert f"Write over existing repository file {rel} is denied" in verdict[1]
+        assert "Write only creates new files." in verdict[1]
 
 
 def test_a_root_without_aiworkhub_state_allows_everything(tmp_path: Path) -> None:
@@ -584,8 +599,8 @@ def test_a_mirror_deny_names_the_worktree_of_the_path_actually_denied(repo: Path
         rule, reason = verdict
         assert rule == "R3", command
         assert f"git --no-optional-locks -C {left_worktree} diff" in reason
-        assert f"Source Graph body/slice on {_CANONICAL}" in reason
-        assert "offset+limit<=400" in reason
+        assert f'Source Graph mode="body" or mode="file" query="START-END" on {_CANONICAL}' in reason
+        assert 'mode="file"' in reason
         assert right_worktree not in reason, command
         assert len(reason) <= tool_guard_hook.REASON_MAX_CHARS
         assert reason.startswith("AIWorkHub tool guard R3:")
