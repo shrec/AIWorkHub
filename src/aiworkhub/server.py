@@ -26,6 +26,40 @@ from . import (
 )
 from .tool_recovery import unknown_tool_message
 
+MCP_SURFACE_ENV = "AIWORKHUB_MCP_SURFACE"
+MCP_SURFACE_ALL = "all"
+MCP_SURFACE_MANAGER = "manager"
+MCP_DASHBOARD_TOOL_PREFIX = "aiworkhub_dashboard_"
+
+# Dashboard tools that stay visible on the manager surface; the rest serve the webview only.
+MANAGER_SURFACE_DASHBOARD_KEEP_REASONS: dict[str, str] = {
+    "aiworkhub_dashboard_needfix_transition": (
+        "the only NeedFix triage/accept transition, and needfix_store refusals name it"
+    ),
+    "aiworkhub_dashboard_snapshot": (
+        "the one-call queue summary its description addresses to managers"
+    ),
+}
+MANAGER_SURFACE_DASHBOARD_KEEP = frozenset(MANAGER_SURFACE_DASHBOARD_KEEP_REASONS)
+
+
+def mcp_surface() -> str:
+    """Return "manager" only for that exact value (case/space-insensitive), else "all"."""
+    value = os.environ.get(MCP_SURFACE_ENV, "").strip().lower()
+    return MCP_SURFACE_MANAGER if value == MCP_SURFACE_MANAGER else MCP_SURFACE_ALL
+
+
+def mcp_tool_visible(name: Any, surface: str | None = None) -> bool:
+    """False only on the manager surface, for a webview-only dashboard tool name."""
+    if (mcp_surface() if surface is None else surface) != MCP_SURFACE_MANAGER:
+        return True
+    return not (
+        isinstance(name, str)
+        and name.startswith(MCP_DASHBOARD_TOOL_PREFIX)
+        and name not in MANAGER_SURFACE_DASHBOARD_KEEP
+    )
+
+
 _MCP_SDK_AVAILABLE = True
 try:
     if os.environ.get("AIWORKHUB_MCP_STDIO_BACKEND", "").strip().lower() == "stdlib":
@@ -170,8 +204,11 @@ except ModuleNotFoundError:
         return schema
 
     def _stdio_tools_list(tools: dict[str, Any]) -> dict[str, Any]:
+        surface = mcp_surface()
         entries = []
         for name, func in tools.items():
+            if not mcp_tool_visible(name, surface):
+                continue
             text, _ = _stdio_tool_metadata.split_docstring(getattr(func, "__doc__", None))
             description = text.strip()
             entry: dict[str, Any] = {
@@ -189,8 +226,10 @@ except ModuleNotFoundError:
         if not isinstance(params, dict):
             raise _StdioProtocolError(-32602, "invalid_params")
         name = params.get("name")
-        if not isinstance(name, str) or name not in tools:
-            raise _StdioProtocolError(-32602, unknown_tool_message(name, tools))
+        surface = mcp_surface()
+        if not isinstance(name, str) or name not in tools or not mcp_tool_visible(name, surface):
+            visible = [candidate for candidate in tools if mcp_tool_visible(candidate, surface)]
+            raise _StdioProtocolError(-32602, unknown_tool_message(name, visible))
         arguments = params.get("arguments")
         if arguments is None:
             arguments = {}
@@ -208,8 +247,10 @@ except ModuleNotFoundError:
             result = func(**arguments)
         except Exception as exc:  # tool-level failure -> MCP error content, not a crash
             return {"content": [{"type": "text", "text": str(exc)[:2000]}], "isError": True}
-        structured = result if isinstance(result, dict) else {"value": result}
         text = json.dumps(result, ensure_ascii=False, default=str)
+        if surface == MCP_SURFACE_MANAGER:
+            return {"content": [{"type": "text", "text": text}]}
+        structured = result if isinstance(result, dict) else {"value": result}
         return {"content": [{"type": "text", "text": text}], "structuredContent": structured}
 
     _PROTOCOL_ALERT_RELATIVE_PARTS = (".aiworkhub", "runtime", "mcp_protocol_alerts.json")
@@ -478,6 +519,8 @@ except ModuleNotFoundError:
         def tool(self, *args: Any, **kwargs: Any):
             def decorate(func: Any) -> Any:
                 tool_name = str(kwargs.get("name") or func.__name__)
+                if not mcp_tool_visible(tool_name):
+                    return func
                 self._tools[tool_name] = func
                 return func
 
@@ -625,6 +668,13 @@ if _MCP_SDK_AVAILABLE:
         report_progress = bool(decorator_kwargs.pop("report_progress", False))
 
         def decorate(function: Any) -> Any:
+            tool_name = (
+                decorator_kwargs.get("name")
+                or (decorator_args[0] if decorator_args else None)
+                or getattr(function, "__name__", "")
+            )
+            if not mcp_tool_visible(tool_name):
+                return function
             tool_args, tool_kwargs, signature = prepare_registration(
                 function, decorator_args, decorator_kwargs
             )

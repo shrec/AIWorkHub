@@ -2302,6 +2302,8 @@ class McpStdioClient {
     } else {
       delete env.AIWORKHUB_ALLOW_LAUNCH;
     }
+    // The webview needs the dashboard tools the manager surface hides.
+    delete env.AIWORKHUB_MCP_SURFACE;
     // Never inherit a stale coordinator secret from the extension host.
     // Load the current owner-only file into this private child environment;
     // package init scrubs it before any submodule can copy the environment.
@@ -8543,6 +8545,7 @@ function ensureCodexMcpRegistrationTomlText(text, runtimeDir, python) {
     "[mcp_servers.aiworkhub.env]",
     `PYTHONPATH = ${tomlQuoted(runtimeDir)}`,
     'AIWORKHUB_MCP_STDIO_BACKEND = "stdlib"',
+    'AIWORKHUB_MCP_SURFACE = "manager"',
     'AIWORKHUB_ALLOW_WRITES = "1"',
     'AIWORKHUB_ALLOW_LAUNCH = "1"',
     "",
@@ -8656,6 +8659,7 @@ import threading
 from pathlib import Path
 
 os.environ["AIWORKHUB_MCP_STDIO_BACKEND"] = "stdlib"
+os.environ.setdefault("AIWORKHUB_MCP_SURFACE", "manager")
 INIT_TIMEOUT = 60.0
 STOP_TIMEOUT = 10.0
 OUT_LOCK = threading.Lock()
@@ -9992,6 +9996,9 @@ function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, pyt
     if (!Object.prototype.hasOwnProperty.call(nextEnv, "AIWORKHUB_ALLOW_LAUNCH")) {
       nextEnv.AIWORKHUB_ALLOW_LAUNCH = "1";
     }
+    if (!Object.prototype.hasOwnProperty.call(nextEnv, "AIWORKHUB_MCP_SURFACE")) {
+      nextEnv.AIWORKHUB_MCP_SURFACE = "manager";
+    }
     if (launcherPath) delete nextEnv.PYTHONPATH;
     const next = { ...value, command: portableCommand, args: nextArgs, env: nextEnv, type: "stdio" };
     if (JSON.stringify(next) !== JSON.stringify(value)) {
@@ -10008,6 +10015,7 @@ function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, pyt
         AIWORKHUB_REPO: repoRoot,
         AIWORKHUB_REPO_ROOT: repoRoot,
         AIWORKHUB_MCP_STDIO_BACKEND: "stdlib",
+        AIWORKHUB_MCP_SURFACE: "manager",
         AIWORKHUB_ALLOW_WRITES: "1",
         AIWORKHUB_ALLOW_LAUNCH: "1",
       },

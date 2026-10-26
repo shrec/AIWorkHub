@@ -264,6 +264,7 @@ const {
           AIWORKHUB_ALLOW_WRITES: "1",
           AIWORKHUB_ALLOW_LAUNCH: "1",
           AIWORKHUB_MCP_STDIO_BACKEND: "stdlib",
+          AIWORKHUB_MCP_SURFACE: "manager",
         },
         type: "stdio",
       },

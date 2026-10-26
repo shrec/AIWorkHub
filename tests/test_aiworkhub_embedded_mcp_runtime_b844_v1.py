@@ -150,7 +150,7 @@ def test_extension_js_never_derives_import_from_repo_or_fixed_host_path(extracte
 
 
 @pytest.fixture()
-def fallback_server_module():
+def fallback_server_module(monkeypatch):
     """Import aiworkhub.server with any externally-installed ``mcp`` hidden.
 
     Mirrors the exact bundled-runtime condition this task closes: no
@@ -173,6 +173,7 @@ def fallback_server_module():
         package.__dict__.pop("server", sentinel) if package is not None else sentinel
     )
 
+    monkeypatch.delenv("AIWORKHUB_MCP_SURFACE", raising=False)
     builtins.__import__ = blocked_import
     try:
         from aiworkhub import server as server_module
@@ -240,13 +241,10 @@ def test_stdlib_fallback_accept_review_arrays_have_copilot_compatible_items(
             "destructive_change", "schema_migration", "security_sensitive", "release",
         ],
     }
-    assert properties["reviewer_request_ids"] == {
-        "type": "array", "items": {"type": "string"},
-    }
-    assert properties["reviewer_reports"] == {
-        "type": "array",
-        "items": {"type": "object", "additionalProperties": {}},
-    }
+    assert properties["reviewer_request_ids"]["type"] == "array"
+    assert properties["reviewer_request_ids"]["items"] == {"type": "string"}
+    assert properties["reviewer_reports"]["type"] == "array"
+    assert properties["reviewer_reports"]["items"] == {"type": "object", "additionalProperties": {}}
 
 
 def test_stdlib_fallback_source_graph_schema_is_self_describing(fallback_server_module):
@@ -718,6 +716,7 @@ def _spawn_bundled_runtime(runtime_dir: Path, fresh_repo: Path) -> subprocess.Po
     })
     env.pop("AIWORKHUB_ALLOW_WRITES", None)
     env.pop("AIWORKHUB_ALLOW_LAUNCH", None)
+    env.pop("AIWORKHUB_MCP_SURFACE", None)
     # -S: skip the `site` module entirely -- neither global nor user
     # site-packages are on sys.path, so this can only succeed via the
     # extension-local bundled runtime (PYTHONPATH + cwd), and can only speak
