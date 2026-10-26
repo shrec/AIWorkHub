@@ -543,6 +543,7 @@ from . import cost_ledger
 from . import core
 from . import dashboard_mcp_app
 from . import deepseek_credentials
+from . import doctor
 from . import evidence_instruments
 from . import external_qualification
 from . import launch_queue_contract
@@ -6410,6 +6411,21 @@ def aiworkhub_dispatcher_health() -> dict[str, Any]:
     repository identity, pending callback count, and last delivery/error."""
 
     return core.dispatcher_health()
+
+
+@mcp.tool()
+def aiworkhub_doctor_diagnose() -> dict[str, Any]:
+    """READ-ONLY: what is wrong right now. Runs the task, dispatcher and
+    source-graph health probes concurrently and returns one verdict
+    (ok/problem/unavailable) with the non-ok probes and the tool to call next."""
+
+    return doctor.diagnose(
+        {
+            "aiworkhub_task_health": aiworkhub_task_health,
+            "aiworkhub_dispatcher_health": core.dispatcher_health,
+            "aiworkhub_source_graph_health": core.source_graph_health,
+        }
+    )
 
 
 @mcp.tool()
