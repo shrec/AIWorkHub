@@ -8263,23 +8263,18 @@ def _bool_safe_positive_int(value: Any) -> bool:
     return type(value) is int and value >= 1
 
 
-def archived_after_accepting(
+def accepted_this_attempt(
     card: Mapping[str, Any], *, request_id: str, claim_epoch: Any
 ) -> bool:
-    """Whether ``card`` was archived after accepting exactly this attempt.
+    """Whether ``card`` carries the acceptance seal of exactly this attempt.
 
-    Automatic review accepts a read-only reviewer and archives it moments
-    later, so the archive can land before that reviewer's own supervisor has
-    finalized the same attempt (NF-2026-01625). Such an archive closes an
-    accepted attempt rather than disposing of one -- but only when the card's
-    acceptance seal and the accepted-outcome receipt stored with it both name
-    this request and this claim epoch. A card archived without that receipt,
-    a superseded card and every other attempt answer ``False``.
+    The card's ``accepted_request_id`` and the stored accepted-outcome receipt
+    must both name this request and this claim epoch (NF-2026-01706). Archived
+    or not yet: automatic review accepts first and archives moments later. A
+    superseded card and every other attempt answer ``False``.
     """
 
     if not request_id or not _bool_safe_positive_int(claim_epoch):
-        return False
-    if canonical_status(card) != "archived":
         return False
     if str(card.get("archive_operation") or "").strip().lower() == "superseded":
         return False
@@ -8299,6 +8294,21 @@ def archived_after_accepting(
         and receipt.get("claim_epoch") == claim_epoch
         and _bool_safe_positive_int(card.get("claim_epoch"))
         and card.get("claim_epoch") == claim_epoch
+    )
+
+
+def archived_after_accepting(
+    card: Mapping[str, Any], *, request_id: str, claim_epoch: Any
+) -> bool:
+    """Whether ``card`` was archived after accepting exactly this attempt.
+
+    Automatic review accepts a read-only reviewer and archives it moments
+    later (NF-2026-01625); such an archive closes an accepted attempt rather
+    than disposing of one, but only with this attempt's seal and receipt.
+    """
+
+    return canonical_status(card) == "archived" and accepted_this_attempt(
+        card, request_id=request_id, claim_epoch=claim_epoch
     )
 
 

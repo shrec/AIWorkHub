@@ -5577,13 +5577,9 @@ class ProcessManager:
         if not (runner and topic and adapter_id):
             try:
                 card = _parse_card(self._show_task(task_id), task_id)
-                # NF-2026-01572: a catalog worker_id such as opencode-go_mimo-v2.6-pro
-                # names the same identity as the card's stored opencode_go_mimo-v2.6-pro;
-                # fold it with the normalizer task creation used (core.py:1864-1867).
-                if runner:
-                    stored_runner = card.get("runner")
-                    if isinstance(stored_runner, str):
-                        runner = core.canonical_runner_id(runner, (stored_runner,)) or runner
+                # NF-2026-01572: fold a catalog worker_id onto the card's stored runner (core.py:1864-1867).
+                if runner and isinstance(card.get("runner"), str):
+                    runner = core.canonical_runner_id(runner, (card["runner"],)) or runner
                 identity_derivation = derive_launch_identity(
                     self.repo,
                     card,
@@ -9512,33 +9508,27 @@ class ProcessManager:
                 return state
         raise WorkspaceError(f"claim_ownership_lost:state={state}")
 
-    def _accepted_attempt_archived(
+    def _accepted_attempt_row(
         self,
-        latest: Mapping[str, Any],
+        events: list[Mapping[str, Any]],
         metadata: Mapping[str, Any],
         request_id: str,
-    ) -> bool:
-        """Whether automatic review accepted, then archived, this very attempt.
-
-        NF-2026-01625: the status-artifact finalization can make a read-only
-        reviewer review_ready while its supervisor is still exiting. Automatic
-        review then accepts it -- releasing its worktree and appending the
-        ``accepted`` row -- and archives the card before that supervisor's own
-        finalization arrives. ``accepted`` is not a launcher terminal state,
-        so the late call re-ran every step against the released worktree.
-        The row alone proves nothing: only the card's acceptance seal and
-        receipt for this request and claim epoch do (``task_store``).
-        """
-        if latest.get("state") != "accepted" or latest.get("accepted") is not True:
-            return False
+    ) -> Mapping[str, Any] | None:
+        """NF-2026-01625/01706: this attempt's ``accepted`` row, only if the card's
+        seal and receipt for this request and epoch confirm it (archived or not)."""
+        accepted = next((r for r in reversed(events) if r.get("state") == "accepted"
+                         and r.get("accepted") is True), None)
+        if accepted is None:
+            return None
         task_id = str(metadata.get("task_id") or "")
         try:
             card = _parse_card(self._show_task(task_id), task_id)
         except LaunchRejected:
-            return False
-        return task_store.archived_after_accepting(
+            return None
+        sealed = task_store.accepted_this_attempt(
             card, request_id=request_id, claim_epoch=metadata.get("claim_epoch")
         )
+        return accepted if sealed else None
 
     def _release_exact(self, metadata: dict[str, Any], reason: str) -> dict[str, Any]:
         task_id = str(metadata["task_id"])
@@ -10916,12 +10906,10 @@ class ProcessManager:
                     **terminal_failure_classification.terminal_event_authority(state="finalize_failed", exit_code=None, error=f"metadata_invalid:{exc}"[:500]),
                 })
 
-            # NF-2026-01625: an attempt automatic review already accepted and
-            # archived is final. Finalizing it again could only fail on the
-            # worktree acceptance released and bury the accepted row under
-            # ``finalize_failed``, so its own ``accepted`` row is the answer.
-            if self._accepted_attempt_archived(latest, metadata, request_id):
-                return latest
+            # NF-2026-01625/01706: an attempt automatic review accepted is final.
+            accepted = self._accepted_attempt_row(events, metadata, request_id)
+            if accepted is not None:
+                return accepted
 
             status_path = Path(str(metadata["supervisor_status_path"]))
             supervisor_status = self._read_supervisor_status(status_path)
