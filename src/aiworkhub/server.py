@@ -511,6 +511,7 @@ from . import manager_loop_service
 from . import manager_recipe_tools
 from . import manager_skill_tools
 from . import process_launcher
+from . import process_launcher_accept_review
 from . import review_summarizer
 from . import skill_miner
 from . import stale_recovery
@@ -550,10 +551,61 @@ if _lowlevel_server is not None:
     _lowlevel_server.version = __version__
 
 
+# NF-2026-01626: a 15-minute accept outlived the client's 1800 s timeout with
+# no sign of life, and the manager took the silence for a cancellation. A
+# progress notification resets an MCP client's idle timer, so a tool registered
+# with ``report_progress=True`` sends one this often while it runs -- and only
+# to a caller that asked for progress with a progressToken.
+_MCP_PROGRESS_INTERVAL_SECONDS = 15.0
+
+
 if _MCP_SDK_AVAILABLE:
     from .mcp_tool_metadata import prepare_registration
 
     _sdk_tool_decorator = mcp.tool
+
+    def _progress_reporter() -> Any:
+        """The current request's progress sender, or None without a progressToken.
+
+        None as well outside a request context, so such a call takes exactly
+        the path it always took.
+        """
+
+        try:
+            context = mcp.get_context()
+            meta = context.request_context.meta
+        except (LookupError, ValueError, AttributeError):
+            return None
+        if meta is None or getattr(meta, "progressToken", None) is None:
+            return None
+        return context.report_progress
+
+    async def _await_reporting_progress(work: Any, report: Any) -> Any:
+        """Await ``work`` and return exactly its result, reporting progress meanwhile.
+
+        The value reported is the elapsed seconds, which only grows, as the
+        protocol requires. A notification that cannot be sent ends the
+        heartbeat, never the call.
+        """
+
+        task = asyncio.ensure_future(work)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        try:
+            while report is not None:
+                done, _pending = await asyncio.wait(
+                    {task}, timeout=_MCP_PROGRESS_INTERVAL_SECONDS
+                )
+                if done:
+                    break
+                try:
+                    await report(round(loop.time() - started, 3))
+                except Exception:  # noqa: BLE001 -- a lost heartbeat never fails the call
+                    report = None
+            return await task
+        finally:
+            if not task.done():
+                task.cancel()
 
     def _nonblocking_mcp_tool(*decorator_args: Any, **decorator_kwargs: Any):
         """Register sync MCP tools without blocking the SDK event loop.
@@ -564,7 +616,13 @@ if _MCP_SDK_AVAILABLE:
         unrelated status, dashboard and bootstrap requests time out behind it.
         Register an async adapter while returning the original function to
         preserve direct Python callers and tests.
+
+        ``report_progress=True`` (NF-2026-01626) also heartbeats
+        ``notifications/progress`` while the worker thread runs. A call without
+        a progressToken is untouched: no notification, same path, same result.
         """
+
+        report_progress = bool(decorator_kwargs.pop("report_progress", False))
 
         def decorate(function: Any) -> Any:
             tool_args, tool_kwargs, signature = prepare_registration(
@@ -585,6 +643,11 @@ if _MCP_SDK_AVAILABLE:
 
             @wraps(function)
             async def run_in_worker_thread(*args: Any, **kwargs: Any) -> Any:
+                report = _progress_reporter() if report_progress else None
+                if report is not None:
+                    return await _await_reporting_progress(
+                        asyncio.to_thread(function, *args, **kwargs), report
+                    )
                 return await asyncio.to_thread(function, *args, **kwargs)
 
             if signature is not None:
@@ -5935,8 +5998,10 @@ def aiworkhub_agent_accept_preview(
     )
 
 
-@mcp.tool()
-@_serialize_task_lifecycle_write
+# NF-2026-01626: heartbeats ``notifications/progress`` to a caller that sent a
+# progressToken, and takes the lifecycle lock inside -- after the in-flight
+# probe -- instead of around the whole call.
+@mcp.tool(report_progress=True)
 def aiworkhub_agent_accept_review(
     request_id: str,
     task_id: str,
@@ -6029,43 +6094,72 @@ def aiworkhub_agent_accept_review(
     )
     if refusal is not None:
         return refusal
-    result = process_launcher.default_manager().accept_review(
-        request_id,
-        task_id,
-        confirm_destructive_change=confirm_destructive_change,
-        requested_risk_tier=requested_risk_tier,
-        risk_signals=risk_signals,
-        reviewer_reports=reviewer_reports,
-        reviewer_request_ids=reviewer_request_ids,
-        confirm_high_risk=confirm_high_risk,
-        manager_correction=manager_correction,
-    )
-    if not isinstance(result, dict) or not result.get("ok"):
-        return result
-    receipt: dict[str, Any] = {"schema_id": "aiworkhub.accept_review_receipt.v1", **result}
-    # The accept reply never carried the card; its identity is one bounded
-    # read, best-effort so a read failure cannot fail an accept that landed.
+    manager = process_launcher.default_manager()
+    # NF-2026-01626: the lifecycle lock below is held for the whole of an
+    # accept -- measured at 15 minutes of validation -- so a duplicate queued on
+    # it would learn what the in-flight marker already says only once the first
+    # accept had ended. It is answered here, before that lock. This read is an
+    # early answer, never the authority: ``accept_review`` claims the marker
+    # itself, so a manager whose marker cannot be read here still reaches it.
+    in_flight = _accept_in_flight_refusal(manager, request_id, task_id)
+    if in_flight is not None:
+        return in_flight
+    with _TASK_LIFECYCLE_WRITE_LOCK:
+        result = manager.accept_review(
+            request_id,
+            task_id,
+            confirm_destructive_change=confirm_destructive_change,
+            requested_risk_tier=requested_risk_tier,
+            risk_signals=risk_signals,
+            reviewer_reports=reviewer_reports,
+            reviewer_request_ids=reviewer_request_ids,
+            confirm_high_risk=confirm_high_risk,
+            manager_correction=manager_correction,
+        )
+        if not isinstance(result, dict) or not result.get("ok"):
+            return result
+        receipt: dict[str, Any] = {"schema_id": "aiworkhub.accept_review_receipt.v1", **result}
+        # The accept reply never carried the card; its identity is one bounded
+        # read, best-effort so a read failure cannot fail an accept that landed.
+        try:
+            card = task_store.get_task(core.repo_root(), task_id)
+        except (task_store.TaskStoreError, OSError, ValueError, TypeError):
+            card = None
+        if isinstance(card, dict):
+            receipt["status"] = card.get("status")
+            receipt["worker_status"] = card.get("worker_status")
+            receipt.update(_card_identity(card))
+            view = _card_view(card, include_card)
+            if view is not None:
+                receipt["card"] = view
+        receipt["include_card"] = include_card
+        return _with_learning_closeout(
+            receipt,
+            task_id=task_id,
+            request_id=request_id,
+            lesson_candidate=lesson_candidate,
+            promote_ai_memory=promote_ai_memory,
+            extra_evidence_ids=extra_evidence_ids,
+            no_new_lesson_reason=no_new_lesson_reason,
+        )
+
+
+def _accept_in_flight_refusal(
+    manager: Any, request_id: str, task_id: str
+) -> dict[str, Any] | None:
+    """``accept_in_progress`` for a duplicate accept, read without any lock.
+
+    None when nothing is in flight -- and when this manager cannot answer at
+    all (it has no process dir to read): the call then reaches
+    ``accept_review``, whose own claim on the marker decides.
+    """
+
     try:
-        card = task_store.get_task(core.repo_root(), task_id)
-    except (task_store.TaskStoreError, OSError, ValueError, TypeError):
-        card = None
-    if isinstance(card, dict):
-        receipt["status"] = card.get("status")
-        receipt["worker_status"] = card.get("worker_status")
-        receipt.update(_card_identity(card))
-        view = _card_view(card, include_card)
-        if view is not None:
-            receipt["card"] = view
-    receipt["include_card"] = include_card
-    return _with_learning_closeout(
-        receipt,
-        task_id=task_id,
-        request_id=request_id,
-        lesson_candidate=lesson_candidate,
-        promote_ai_memory=promote_ai_memory,
-        extra_evidence_ids=extra_evidence_ids,
-        no_new_lesson_reason=no_new_lesson_reason,
-    )
+        return process_launcher_accept_review.accept_in_flight(
+            manager, task_id, request_id
+        )
+    except (AttributeError, OSError, TypeError):
+        return None
 
 
 @mcp.tool()

@@ -13,24 +13,42 @@ this function no longer calls -- silently, with the tests still green.
 from __future__ import annotations
 
 import contextlib
+import errno
 import fnmatch
 import hashlib
+import json
+import os
 import posixpath
 import re
+import threading
+import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
+from . import __version__
 from . import manager_skill_tools
 from . import quality_evidence
+from .platform_io import lock_fd, process_is_alive, unlock_fd
+from .process_identity import (
+    PidIdentityVerdict,
+    _pid_identity_evidence,
+    _pid_start_ticks,
+)
 
 if TYPE_CHECKING:  # names used only in annotations, which are never evaluated
+    from collections.abc import Iterator
+
     from .worker_workspace import WorkerWorkspace as _WorkerWorkspaceT
 
 __all__ = [
     "ACCEPT_BLOCKER_KINDS",
+    "ACCEPT_IN_FLIGHT_EVENT_SCHEMA_ID",
+    "ACCEPT_IN_FLIGHT_SCHEMA_ID",
     "ACCEPT_PREVIEW_SCHEMA_ID",
     "MANAGER_CORRECTION_SCHEMA_ID",
     "SUPPLEMENTAL_REVIEW_SCHEMA_ID",
     "ManagerCorrectionError",
+    "accept_in_flight",
     "accept_preview",
     "accept_review",
     "bound_reviewer_request_ids",
@@ -78,6 +96,12 @@ ACCEPT_BLOCKER_KINDS = (
     # it (NF-2026-01158) -- a caller branching on this closed set has to be able
     # to see it without matching prose.
     "reviewer_could_not_inspect",
+    # An accept of this exact request is running right now, in this or another
+    # server process: wait for it, never start a second one (NF-2026-01626).
+    "accept_in_progress",
+    # Its in-flight marker exists but cannot be read, so whether it still runs
+    # is unknown -- and unknown is never "not running".
+    "accept_in_flight_marker_unreadable",
 )
 
 
@@ -1501,6 +1525,414 @@ def fold_accept_blockers(
     }
 
 
+# ---------------------------------------------------------------------------
+# NF-2026-01626: one in-flight accept per (task_id, request_id).
+#
+# Measured 2026-10-20 on needfix-NF-2026-01616: the accept-lane validation ran
+# for 15 minutes, the MCP client gave up at 1800 s with no progress, and the
+# server recorded the accept about a minute later -- while the manager, holding
+# only the timeout, took it for cancelled and nearly started a second accept.
+# ``accept_review`` now claims a marker before either acceptance lock, so a
+# duplicate answers ``accept_in_progress`` at once instead of queueing behind
+# the first one's validation, and ``accept_preview`` says the same to a
+# manager whose call timed out.
+#
+# The marker has two witnesses. A small JSON file, created O_CREAT|O_EXCL in
+# the process dir beside the request locks, is what another server process
+# sees and judges by its holder's pid identity. An in-process entry is the only
+# witness that can tell a thread of THIS process still running the accept from
+# a file this process failed to remove: this pid is alive by definition.
+# ---------------------------------------------------------------------------
+
+ACCEPT_IN_FLIGHT_SCHEMA_ID = "aiworkhub.accept_in_flight.v1"
+ACCEPT_IN_FLIGHT_EVENT_SCHEMA_ID = "aiworkhub.accept_in_flight_event.v1"
+_ACCEPT_IN_FLIGHT_DIRNAME = ".accept-in-flight"
+_ACCEPT_IN_FLIGHT_LOCK_NAME = ".lock"
+# Operator-visible evidence: every stale marker cleared, every failed release.
+_ACCEPT_IN_FLIGHT_EVENTS_NAME = "events.jsonl"
+_ACCEPT_IN_FLIGHT_MAX_BYTES = 4096
+# A marker is created empty and filled by the very next write, so a lock-free
+# reader landing between the two reads again before calling it unreadable.
+_ACCEPT_IN_FLIGHT_READ_ATTEMPTS = 5
+# Windows refuses to unlink a file another process holds open -- a preview
+# reading the marker at that instant -- so a removal retries, boundedly.
+_ACCEPT_IN_FLIGHT_UNLINK_ATTEMPTS = 20
+_ACCEPT_IN_FLIGHT_RETRY_SECONDS = 0.01
+_ACCEPT_IN_FLIGHT_CREATE_FLAGS = (
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+)
+_ACCEPT_IN_FLIGHT_GUARD = threading.Lock()
+# Marker key -> the payload this process holds. An entry lives exactly as long
+# as one accept_review call, so the map is bounded by concurrent accepts.
+_ACCEPT_IN_FLIGHT_HELD: dict[str, dict[str, Any]] = {}
+
+
+def _accept_in_flight_key(task_id: str, request_id: str) -> str:
+    # The marker key: one file per exact task/request pair.
+    return hashlib.sha256("\x00".join((task_id, request_id)).encode("utf-8")).hexdigest()
+
+
+def _accept_in_flight_path(self: Any, task_id: str, request_id: str) -> Path:
+    """The marker for one exact (task_id, request_id), beside the request locks."""
+    return (
+        Path(self.process_dir)
+        / _ACCEPT_IN_FLIGHT_DIRNAME
+        / f"{_accept_in_flight_key(task_id, request_id)}.json"
+    )
+
+
+def _forget_accept_in_flight(key: str) -> None:
+    with _ACCEPT_IN_FLIGHT_GUARD:
+        _ACCEPT_IN_FLIGHT_HELD.pop(key, None)
+
+
+def _read_accept_marker(path: Path) -> tuple[str, dict[str, Any]]:
+    """``("absent" | "present" | "unreadable", marker)`` for one marker file."""
+    for attempt in range(_ACCEPT_IN_FLIGHT_READ_ATTEMPTS):
+        if attempt:
+            time.sleep(_ACCEPT_IN_FLIGHT_RETRY_SECONDS)
+        try:
+            with path.open("rb") as handle:
+                raw = handle.read(_ACCEPT_IN_FLIGHT_MAX_BYTES + 1)
+        except (FileNotFoundError, NotADirectoryError):
+            # No marker can exist where its directory does not: the claim's
+            # own mkdir then names the cause, identically on every platform.
+            return "absent", {}
+        except OSError:
+            continue
+        try:
+            marker = json.loads(raw.decode("utf-8"))
+        except (ValueError, RecursionError):
+            # A deeply nested marker exhausts the decoder's recursion limit:
+            # it is unreadable like any other bytes that do not parse.
+            continue
+        pid = marker.get("pid") if isinstance(marker, dict) else None
+        if (
+            len(raw) <= _ACCEPT_IN_FLIGHT_MAX_BYTES
+            and isinstance(pid, int)
+            and not isinstance(pid, bool)
+            and pid > 0
+        ):
+            return "present", marker
+    return "unreadable", {}
+
+
+def _accept_marker_holder(marker: Mapping[str, Any], *, held_here: bool) -> str:
+    """``live``, ``dead`` or ``unknown`` for the process that wrote ``marker``.
+
+    Fail-closed like every verdict in ``process_identity``: only a holder
+    PROVEN gone -- not alive, or a different process now wearing its pid -- is
+    ``dead``, and a pid whose identity cannot be read is ``unknown``. A marker
+    naming this very process is judged by ``held_here`` alone.
+    """
+    pid = int(marker["pid"])
+    ticks = marker.get("pid_start_ticks")
+    if pid == os.getpid() and ticks == _pid_start_ticks(pid):
+        return "live" if held_here else "dead"
+    if not process_is_alive(pid):
+        return "dead"
+    verdict = _pid_identity_evidence(pid, ticks).verdict
+    if verdict is PidIdentityVerdict.MATCH:
+        return "live"
+    if verdict is PidIdentityVerdict.MISMATCH:
+        return "dead"
+    return "unknown"
+
+
+def _accept_in_progress(
+    task_id: str, request_id: str, marker: Mapping[str, Any], *, verified: bool
+) -> dict[str, Any]:
+    """The one refusal shape for an accept that is still running."""
+    return {
+        "ok": False,
+        "error": "accept_in_progress",
+        "request_id": request_id,
+        "task_id": task_id,
+        "started_at": marker.get("started_at"),
+        "holder_pid": marker.get("pid"),
+        "holder_server_version": marker.get("server_version"),
+        "holder_identity": "verified" if verified else "unverified",
+    }
+
+
+def _accept_in_flight_answer(
+    task_id: str,
+    request_id: str,
+    state: str,
+    marker: Mapping[str, Any],
+    *,
+    held_here: bool,
+) -> dict[str, Any] | None:
+    """The refusal one marker forces, or None when it is absent or stale."""
+    if state == "absent":
+        return None
+    if state != "present":
+        return {
+            "ok": False,
+            "error": "accept_in_flight_marker_unreadable",
+            "request_id": request_id,
+            "task_id": task_id,
+            "marker": (
+                f"{_ACCEPT_IN_FLIGHT_DIRNAME}/"
+                f"{_accept_in_flight_key(task_id, request_id)}.json"
+            ),
+        }
+    holder = _accept_marker_holder(marker, held_here=held_here)
+    if holder == "dead":
+        return None
+    return _accept_in_progress(task_id, request_id, marker, verified=holder == "live")
+
+
+def accept_in_flight(self: Any, task_id: str, request_id: str) -> dict[str, Any] | None:
+    """READ-ONLY: the refusal an accept of this exact request gets right now.
+
+    ``accept_in_progress`` -- with the holder's ``started_at`` and
+    ``holder_pid`` -- while an accept of the same (task_id, request_id) runs in
+    this or any other server process; ``accept_in_flight_marker_unreadable``
+    when its marker cannot be read; otherwise None. Takes no lock and writes
+    nothing, so a stale marker reads as None here: only ``accept_review``
+    clears one.
+    """
+    state, marker = _read_accept_marker(_accept_in_flight_path(self, task_id, request_id))
+    # Consulted AFTER the file, so a thread here that claimed or released in
+    # between is judged by what it holds now, not by what it held a moment ago.
+    with _ACCEPT_IN_FLIGHT_GUARD:
+        held = _ACCEPT_IN_FLIGHT_HELD.get(_accept_in_flight_key(task_id, request_id))
+    if held is not None:
+        return _accept_in_progress(task_id, request_id, held, verified=True)
+    return _accept_in_flight_answer(task_id, request_id, state, marker, held_here=False)
+
+
+@contextlib.contextmanager
+def _accept_marker_dir_lock(directory: Path) -> Iterator[None]:
+    """Serialize every marker check-and-create and every removal in one dir.
+
+    Held for one read, one liveness probe and one create or unlink -- never
+    across an accept -- so a stale marker two server processes judge at once is
+    replaced by exactly one of them.
+    """
+    fd = os.open(
+        directory / _ACCEPT_IN_FLIGHT_LOCK_NAME,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0),
+        0o600,
+    )
+    try:
+        lock_fd(fd, blocking=True)
+        try:
+            yield
+        finally:
+            unlock_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def _append_accept_in_flight_event(directory: Path, record: Mapping[str, Any]) -> None:
+    """Append one operator-visible line; raises ``OSError`` when it did not land."""
+    from . import process_launcher as _pl
+
+    line = json.dumps(
+        {
+            "schema_id": ACCEPT_IN_FLIGHT_EVENT_SCHEMA_ID,
+            "recorded_at": _pl._utcnow(),
+            **record,
+        },
+        sort_keys=True,
+        default=str,
+    )
+    with (directory / _ACCEPT_IN_FLIGHT_EVENTS_NAME).open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+
+
+def _unlink_accept_marker(path: Path) -> None:
+    """Remove one marker, waiting out the sharing violation a Windows reader causes."""
+    for attempt in range(_ACCEPT_IN_FLIGHT_UNLINK_ATTEMPTS):
+        try:
+            path.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            if attempt + 1 == _ACCEPT_IN_FLIGHT_UNLINK_ATTEMPTS:
+                raise
+            time.sleep(_ACCEPT_IN_FLIGHT_RETRY_SECONDS)
+
+
+def _create_accept_marker(
+    path: Path, payload: Mapping[str, Any], *, task_id: str, request_id: str
+) -> tuple[dict[str, Any] | None, bytes]:
+    """Create ``path`` holding ``payload``: ``(refusal, bytes_written)``.
+
+    Judged twice. First lock-free, so a duplicate of a live accept is refused
+    without writing anything -- not even the lock file. Then under the
+    directory lock, where a marker whose holder is proven gone is recorded,
+    removed and replaced; a stale marker that cannot be recorded stays put.
+    """
+    state, marker = _read_accept_marker(path)
+    refusal = _accept_in_flight_answer(task_id, request_id, state, marker, held_here=False)
+    if refusal is not None:
+        return refusal, b""
+    data = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with _accept_marker_dir_lock(path.parent):
+        state, marker = _read_accept_marker(path)
+        refusal = _accept_in_flight_answer(
+            task_id, request_id, state, marker, held_here=False
+        )
+        if refusal is not None:
+            return refusal, b""
+        if state == "present":
+            _append_accept_in_flight_event(
+                path.parent,
+                {
+                    "event": "stale_marker_cleared",
+                    "task_id": task_id,
+                    "request_id": request_id,
+                    "stale_marker": dict(marker),
+                    "cleared_by_pid": payload.get("pid"),
+                },
+            )
+            try:
+                _unlink_accept_marker(path)
+            except OSError as exc:
+                # The cleared line above records the intent; when the removal
+                # then fails, the log says so instead of claiming a clear.
+                with contextlib.suppress(OSError):
+                    _append_accept_in_flight_event(
+                        path.parent,
+                        {
+                            "event": "stale_marker_clear_failed",
+                            "task_id": task_id,
+                            "request_id": request_id,
+                            "error": type(exc).__name__,
+                        },
+                    )
+                raise
+        fd = os.open(path, _ACCEPT_IN_FLIGHT_CREATE_FLAGS, 0o600)
+        try:
+            try:
+                if os.write(fd, data) != len(data):
+                    raise OSError(errno.EIO, "short write to the accept in-flight marker")
+            finally:
+                os.close(fd)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                path.unlink()
+            raise
+    return None, data
+
+
+def _release_accept_marker(path: Path, data: bytes) -> None:
+    """Remove this accept's own marker; never raises past the accept it ends.
+
+    The accept's outcome -- its receipt above all -- is already decided, so a
+    failed removal is recorded instead of raised. The marker left behind names
+    this pid and its creation ticks: the next accept here clears it as this
+    process's own leftover, and any other process does once this one exits.
+    A marker holding other bytes belongs to whoever wrote them and stays.
+    """
+    try:
+        with _accept_marker_dir_lock(path.parent):
+            try:
+                current: bytes | None = path.read_bytes()
+            except FileNotFoundError:
+                current = None
+            if current == data:
+                _unlink_accept_marker(path)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            _append_accept_in_flight_event(
+                path.parent,
+                {
+                    "event": "release_failed",
+                    "marker": path.name,
+                    "error": type(exc).__name__,
+                },
+            )
+
+
+class _AcceptInFlight:
+    """One ``accept_review`` call's claim on its in-flight marker.
+
+    A refused claim holds nothing and carries the ``refusal`` to return.
+    Otherwise this is the context manager that releases the marker -- file and
+    in-process entry both -- on every exit, success and exception alike.
+    """
+
+    def __init__(
+        self,
+        *,
+        refusal: dict[str, Any] | None = None,
+        key: str = "",
+        path: Path | None = None,
+        data: bytes = b"",
+    ) -> None:
+        self.refusal = refusal
+        self._key = key
+        self._path = path
+        self._data = data
+
+    def __enter__(self) -> _AcceptInFlight:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        key, path = self._key, self._path
+        self._key, self._path = "", None
+        if not key:
+            return
+        try:
+            if path is not None:
+                _release_accept_marker(path, self._data)
+        finally:
+            _forget_accept_in_flight(key)
+
+
+def _accept_in_flight_marker(self: Any, task_id: str, request_id: str) -> _AcceptInFlight:
+    """Claim the in-flight marker for one ``accept_review`` call.
+
+    The in-process entry is reserved first, so a second thread of this server
+    is refused without touching the disk; the file follows. A duplicate of a
+    live accept is refused without writing anything, and every refusal names
+    its own cause.
+    """
+    from . import process_launcher as _pl
+
+    key = _accept_in_flight_key(task_id, request_id)
+    payload: dict[str, Any] = {
+        "schema_id": ACCEPT_IN_FLIGHT_SCHEMA_ID,
+        "task_id": task_id,
+        "request_id": request_id,
+        "pid": os.getpid(),
+        "pid_start_ticks": _pid_start_ticks(os.getpid()),
+        "started_at": _pl._utcnow(),
+        "server_version": __version__,
+    }
+    with _ACCEPT_IN_FLIGHT_GUARD:
+        held = _ACCEPT_IN_FLIGHT_HELD.setdefault(key, payload)
+    if held is not payload:
+        return _AcceptInFlight(
+            refusal=_accept_in_progress(task_id, request_id, held, verified=True)
+        )
+    try:
+        path = _accept_in_flight_path(self, task_id, request_id)
+        refusal, data = _create_accept_marker(
+            path, payload, task_id=task_id, request_id=request_id
+        )
+    except OSError as exc:
+        refusal = {
+            "ok": False,
+            "error": f"accept_in_flight_marker_unavailable:{type(exc).__name__}",
+            "request_id": request_id,
+            "task_id": task_id,
+        }
+    except BaseException:
+        _forget_accept_in_flight(key)
+        raise
+    if refusal is not None:
+        _forget_accept_in_flight(key)
+        return _AcceptInFlight(refusal=refusal)
+    return _AcceptInFlight(key=key, path=path, data=data)
+
+
 def accept_preview(self, request_id: str, task_id: str, **overrides: Any) -> dict[str, Any]:
     """Read-only: exactly what would block ``accept_review`` right now.
 
@@ -1530,6 +1962,32 @@ def accept_preview(self, request_id: str, task_id: str, **overrides: Any) -> dic
         card = _pl._parse_card(self._show_task(task_id), task_id)
     except Exception as exc:  # noqa: BLE001 -- a preview never raises at a manager
         return {**result, "ok": False, "error": f"task_lookup_failed:{exc}"[:300]}
+    # NF-2026-01626: a manager whose accept call timed out asks here instead of
+    # retrying it. While that accept still runs, that is the whole answer -- its
+    # holder and start time, under the same closed blocker set as the rest.
+    try:
+        in_flight = accept_in_flight(self, task_id, request_id)
+    except Exception as exc:  # noqa: BLE001 -- a preview never raises at a manager
+        return {
+            **result,
+            "ok": False,
+            "error": f"accept_in_flight_unknown:{type(exc).__name__}",
+        }
+    if in_flight is not None:
+        facts = {
+            key: value
+            for key, value in in_flight.items()
+            if key not in {"ok", "error", "request_id", "task_id"}
+        }
+        answer = {
+            **result,
+            "blocked": True,
+            "canonical_status": _pl._canonical_task_status(card),
+            "blockers": [_blocker(str(in_flight["error"]), **facts)],
+        }
+        if in_flight["error"] == "accept_in_progress":
+            answer["accept_in_progress"] = facts
+        return answer
     terminal_review = card.get("terminal_review")
     terminal_review = terminal_review if isinstance(terminal_review, Mapping) else {}
     evidence = terminal_review.get("evidence")
@@ -1645,6 +2103,7 @@ def _stale_inputs_touching_candidate(
 # global enters this body unannounced" -- and a name that belongs to neither
 # list is exactly the drift it exists to catch.
 ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
+    "_accept_in_flight_marker",
     "_accept_manager_identity",
     "_restore_correction_originals",
     "_receipt_sha256",
@@ -1828,10 +2287,18 @@ def accept_review(
         if readonly_lock_path
         else self._promotion_lock()
     )
+    # NF-2026-01626: claimed before either lock, so a duplicate of an accept
+    # that is still validating answers ``accept_in_progress`` at once instead
+    # of queueing on those locks for the length of that validation. A refused
+    # claim ran nothing and wrote nothing; a granted one is released by the
+    # ``with`` below on every exit, success and exception alike.
+    in_flight = _accept_in_flight_marker(self, task_id, request_id)
+    if in_flight.refusal is not None:
+        return in_flight.refusal
     # NF-2026-01515: the writable path must also hold the per-request lock so
     # retention GC (_gc_finalized_workspace) cannot quarantine this workspace
     # mid-correction; the read-only path already holds that lock alone.
-    with acceptance_lock, (
+    with in_flight, acceptance_lock, (
         contextlib.nullcontext()
         if readonly_lock_path
         else self._request_lock(request_id)

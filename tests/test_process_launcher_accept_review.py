@@ -257,11 +257,16 @@ def test_patching_process_launcher_still_reaches_the_moved_body(monkeypatch, sea
     assert str(excinfo.value) == seam
 
 
-def test_accept_review_uses_terminal_identity_before_later_orchestrator_event():
+def test_accept_review_uses_terminal_identity_before_later_orchestrator_event(
+    tmp_path: Path,
+):
     """Bookkeeping appended after review_ready cannot hide execution identity."""
 
     class _Manager:
         repo = Path("/nonexistent")
+        # Where the in-flight marker lives, beside the request locks
+        # (NF-2026-01626); the identity checks under test come after it.
+        process_dir = tmp_path
 
         def _request_events(self, request_id: str) -> list[dict[str, object]]:
             return [
@@ -395,6 +400,8 @@ class _ReviewerManager:
         # ``_live_lens_reviewers`` reads it; a fake without it raises into the
         # accept path's ``except Exception``, which reports ``state_unknown``.
         self.process_log_path = repo / process_launcher.PROCESS_LOG_DEFAULT_REL
+        # Same default again: ``accept_preview`` reads the in-flight marker there.
+        self.process_dir = repo / process_launcher.PROCESS_DIR_DEFAULT_REL
         self._events = events or {}
 
     def _latest_by_request(self) -> dict[str, dict]:
