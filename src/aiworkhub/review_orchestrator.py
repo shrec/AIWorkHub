@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from . import (
     db_writer,
+    model_settings,
     needfix_store,
     quality_evidence,
     review_lifecycle,
@@ -240,6 +241,27 @@ def _manager_reserved_codex_route(route: Mapping[str, Any]) -> bool:
     )
 
 
+def _review_route_policy_enabled(
+    model_policy: Mapping[str, Any], route: Mapping[str, str]
+) -> bool:
+    """Whether the owner's model settings enable one reviewer route.
+
+    The adapter resolves to its policy identity and the route is evaluated with
+    ``model_settings.evaluate_state``, exactly as ``repo_policy`` readiness and
+    ``manager_loop_service.authorize_selected_route`` do. An identity the policy
+    cannot evaluate is unknown, and unknown is never enabled.
+    """
+    try:
+        provider, adapter = model_settings.policy_identity_for_adapter(
+            route["adapter_id"]
+        )
+        return model_settings.evaluate_state(
+            model_policy, provider=provider, adapter=adapter, model=route["model"]
+        )
+    except model_settings.ModelSettingsError:
+        return False
+
+
 def select_reviewer_route(
     repo: Path,
     reviewer_task_id: str,
@@ -252,6 +274,14 @@ def select_reviewer_route(
     readiness = task_store.storage_readiness(repo)
     if not readiness.ready:
         raise RuntimeError("review_route_storage_not_ready:" + readiness.reason)
+    # M4.1: the owner's model settings are the canonical enable switch, loaded
+    # once per selection the way repo_policy readiness loads them. Unreadable
+    # settings name their cause and defer like every other route refusal; they
+    # never read as "everything enabled".
+    try:
+        model_policy = model_settings.load(repo)
+    except model_settings.ModelSettingsError as exc:
+        raise RuntimeError("review_route_model_settings_invalid:" + str(exc)) from exc
     task = workforce_router.TaskRequirements.build(
         task_id=reviewer_task_id,
         repo_id=readiness.repo_id,
@@ -292,6 +322,7 @@ def select_reviewer_route(
             identity in excluded_routes
             or route["adapter_id"] in excluded_adapters
             or _manager_reserved_codex_route(route)
+            or not _review_route_policy_enabled(model_policy, route)
         ):
             continue
         return route
@@ -534,6 +565,52 @@ def reviewer_route_account_limited(failure_reason: Any) -> bool:
     """Whether a retired attempt's persisted reason carries the account-limit failure class."""
     tokens = [token.strip() for token in str(failure_reason or "").split(":")]
     return _ACCOUNT_LIMIT_FAILURE_CLASS in tokens
+
+
+# NF-2026-01620: the reason an attempt is retired with when its reviewer sealed a
+# report saying it could not inspect the candidate. ``review_ready`` is the state
+# that reviewer really ended in; the class is the accept fold's own status name.
+_COULD_NOT_INSPECT_RETIREMENT = (
+    "review_ready:" + quality_evidence.STATUS_REVIEWER_COULD_NOT_INSPECT
+)
+
+
+def reviewer_route_could_not_inspect(failure_reason: Any) -> bool:
+    """Whether a retired attempt's persisted reason says its reviewer could not inspect."""
+    tokens = [token.strip() for token in str(failure_reason or "").split(":")]
+    return quality_evidence.STATUS_REVIEWER_COULD_NOT_INSPECT in tokens
+
+
+def _route_attempt_exclusions(
+    attempts: Iterable[Mapping[str, Any]],
+) -> tuple[frozenset[tuple[str, str, str]], frozenset[str]]:
+    """The exact routes, and the whole adapters, a lens's retired attempts exclude.
+
+    ONE derivation, shared by the planner and by the could-not-inspect successor
+    check that has to agree with it before a retirement commits.
+    """
+    retired = [row for row in attempts if row["state"] == "retired"]
+    excluded = frozenset(
+        (str(row["runner"]), str(row["adapter_id"]), str(row["model"]))
+        for row in retired
+    )
+    # NF-2026-01409: a retired attempt whose OWN reason names a vscode_lm
+    # turn-protocol code indicts the ADAPTER, not just the one model that
+    # happened to be ranked, so the next attempt excludes every route on
+    # that adapter -- not only the exact (runner, adapter_id, model) tried.
+    # A rate, quota or session limit indicts the whole provider account the same way.
+    # NF-2026-01620: so does a reviewer that could not inspect the candidate --
+    # that adapter could not read these bytes, so the retry leaves it.
+    excluded_adapters = frozenset(
+        str(row["adapter_id"])
+        for row in retired
+        if terminal_failure_classification.reviewer_route_behaviour_code(
+            row["failure_reason"]
+        )
+        or reviewer_route_account_limited(row["failure_reason"])
+        or reviewer_route_could_not_inspect(row["failure_reason"])
+    )
+    return excluded, excluded_adapters
 
 
 def reviewer_recovery_dispatch(
@@ -3121,27 +3198,7 @@ class ReviewOrchestrator:
         reviewer_task_id = self._reviewer_task_id(
             identity, action.lens, attempt_index=attempt_index
         )
-        excluded = frozenset(
-            (str(row["runner"]), str(row["adapter_id"]), str(row["model"]))
-            for row in attempts
-            if row["state"] == "retired"
-        )
-        # NF-2026-01409: a retired attempt whose OWN reason names a vscode_lm
-        # turn-protocol code indicts the ADAPTER, not just the one model that
-        # happened to be ranked, so the next attempt excludes every route on
-        # that adapter -- not only the exact (runner, adapter_id, model) tried.
-        # A rate, quota or session limit indicts the whole provider account the same way.
-        excluded_adapters = frozenset(
-            str(row["adapter_id"])
-            for row in attempts
-            if row["state"] == "retired"
-            and (
-                terminal_failure_classification.reviewer_route_behaviour_code(
-                    row["failure_reason"]
-                )
-                or reviewer_route_account_limited(row["failure_reason"])
-            )
-        )
+        excluded, excluded_adapters = _route_attempt_exclusions(attempts)
         route = self._select_attempt_route(
             reviewer_task_id, action.lens, excluded,
             excluded_adapters=excluded_adapters,
@@ -3195,6 +3252,45 @@ class ReviewOrchestrator:
                     str(exc), {"outcome": "deferred", "reason": str(exc)},
                 ) from exc
             raise
+
+    def _successor_route_selectable(
+        self, action: review_lifecycle.ReviewAction, attempt: Mapping[str, Any]
+    ) -> bool:
+        """Whether a route is left once ``attempt`` retires as could-not-inspect.
+
+        NF-2026-01620: answered BEFORE that retirement commits, and with no side
+        effect -- the exclusions ``_plan_route_attempt`` derives from the retired
+        row, put to the same selector, nothing written. Only
+        ``review_route_unavailable`` means no route is left. Any other typed
+        refusal (storage, model settings) is a state this pass cannot settle, so
+        the lens waits on it with the attempt unretired and asks again.
+        """
+        retiring = {
+            **attempt, "state": "retired",
+            "failure_reason": _COULD_NOT_INSPECT_RETIREMENT,
+        }
+        attempts = [
+            row for row in self._route_attempts(action.chain_id, action.lens)
+            if int(row["attempt_index"]) != int(attempt["attempt_index"])
+        ] + [retiring]
+        excluded, excluded_adapters = _route_attempt_exclusions(attempts)
+        try:
+            self._select_attempt_route(
+                self._reviewer_task_id(
+                    action.descriptor["chain_identity"], action.lens,
+                    attempt_index=len(attempts) + 1,
+                ),
+                action.lens, excluded, excluded_adapters=excluded_adapters,
+            )
+        except RuntimeError as exc:
+            if str(exc).startswith("review_route_unavailable:"):
+                return False
+            if str(exc).startswith("review_route_"):
+                raise _DeferredLaunch(
+                    str(exc), {"outcome": "deferred", "reason": str(exc)},
+                ) from exc
+            raise
+        return True
 
     def _bind_route_attempt_request(
         self, action: review_lifecycle.ReviewAction, attempt: Mapping[str, Any], request_id: str
@@ -3756,9 +3852,38 @@ class ReviewOrchestrator:
                     actionable_findings=actionable_findings,
                     result={"ok": True, "state": "replayed", "task_id": reviewer_task},
                 )
+            # Verified FIRST, on every path: nothing below -- the could-not-
+            # inspect retirement included -- acts on a report this verifier has
+            # not bound to this attempt, this target and this sealed packet.
             receipt = self._review_receipt(
                 action, status, reviewer_request, reviewer_task
             )
+            if (
+                int(attempt["attempt_index"]) < _MAX_ROUTE_ATTEMPTS
+                and action.lens
+                in quality_evidence.blind_reviewer_lenses((receipt["report"],))
+                and self._attempt_route_binding_matches(status, attempt)
+                and self._successor_route_selectable(action, attempt)
+            ):
+                # NF-2026-01620: a reviewer whose OWN verified report says it
+                # could not inspect the candidate is no verdict on this lens --
+                # the accept fold would only refuse it as
+                # reviewer_could_not_inspect -- and its adapter could not read
+                # these bytes. While the NF847 ceiling still has a slot AND a
+                # route off that adapter is selectable, the attempt is retired
+                # as exactly that, so the successor planned from it leaves the
+                # whole adapter for a route that can read them. Otherwise the
+                # blind report is accepted as before and the fold names the
+                # lens: a retirement nothing can succeed would only lose the
+                # report and park the lens on review_route_unavailable.
+                if not self._retire_route_attempt(
+                    action, attempt, _COULD_NOT_INSPECT_RETIREMENT
+                ):
+                    return None
+                self._launch_with_successor(
+                    action, self._plan_deferrable_route_attempt(action)
+                )
+                return None
             findings = receipt["report"]["findings"]
             actionable_findings = any(
                 finding.get("actionable") is True
