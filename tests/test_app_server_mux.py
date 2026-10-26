@@ -1237,9 +1237,30 @@ def test_sideband_defers_when_child_has_exited(tmp_path):
         h.do_handshake()
         h.mux._child.terminate()
         h.mux._child.wait(timeout=5)
-        result = h.sideband_call("thread/resume", {"threadId": "t"})
+        # The child-pump sets _stop_event once it observes the exit, which also
+        # retires the accept loop; wait on that state rather than a socket
+        # timeout, then drive the real connection handler over a socketpair.
+        assert h.mux._stop_event.wait(10)
+        client, server = socket.socketpair()
+        try:
+            request = {"cap": h.mux.capability_token, "method": "thread/resume", "params": {"threadId": "t"}}
+            client.settimeout(10)
+            client.sendall((json.dumps(request) + "\n").encode("utf-8"))
+            client.shutdown(socket.SHUT_WR)
+            h.mux._handle_sideband_conn(server)
+            raw = b""
+            while not raw.endswith(b"\n"):
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                raw += chunk
+        finally:
+            client.close()
+            server.close()
+        result = json.loads(raw.decode("utf-8"))
         assert result["ok"] is False
         assert result["error"] == "not_ready"
+        assert result["detail"] == "child_app_server_not_running"
     finally:
         h.close()
 
