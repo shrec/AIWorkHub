@@ -37,11 +37,14 @@ Contract every module in this package keeps:
 
 from __future__ import annotations
 
+import argparse
+import importlib
 import json
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable
+
 
 def resolve_repo_root(start: Path | None = None) -> Path:
     """The repository these scripts answer about: the working directory's own.
@@ -226,3 +229,189 @@ def pid_is_alive(pid: Any) -> bool | None:
         return bool(process_is_alive(pid))
     except Exception:  # noqa: BLE001 - a script must work without the package
         return None
+
+
+class OwnerUnavailable(RuntimeError):
+    """An owner module, or a name borrowed from it, could not be loaded."""
+
+
+def owner_attr(module: str, name: str) -> Any:
+    """``aiworkhub.<module>.<name>``, imported on first use and never restated.
+
+    Lazy, so the stdlib-only fast path stays import-safe; loud, so a recipe that
+    borrows an owner's vocabulary refuses (exit 2) when the owner cannot be read
+    rather than falling back to a private copy that would drift from it.
+    """
+    try:
+        return getattr(importlib.import_module(f"aiworkhub.{module}"), name)
+    except Exception as exc:  # noqa: BLE001 - any load failure means "unavailable"
+        raise OwnerUnavailable(f"{module}.{name}:{type(exc).__name__}") from exc
+
+
+# Rows come back WITHOUT ``card_json``: a live queue holds thousands of cards and
+# most questions are decided by the lifecycle columns alone, so a card is decoded
+# (``load_card``) only for the few rows an answer actually names.
+TASK_SELECT = (
+    "SELECT task_id, runner, topic, mode, status, worker_status, archived_at, "
+    "updated_at FROM tasks"
+)
+
+
+def canonical_status(row: Any) -> str:
+    """The owner's lifecycle verdict for one ``tasks`` row; never re-derived here."""
+    return str(owner_attr("task_store", "canonical_status")(dict(row)))
+
+
+def fetch_task(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row | None:
+    """One ``tasks`` row by id (``conn.row_factory`` must be ``sqlite3.Row``)."""
+    return conn.execute(TASK_SELECT + " WHERE task_id = ?", (task_id,)).fetchone()
+
+
+def run_for_task(
+    argv: list[str] | None,
+    doc: str,
+    schema_id: str,
+    task_help: str,
+    report: Callable[[sqlite3.Connection, sqlite3.Row], dict[str, Any]],
+) -> int:
+    """The one ``--task-id`` CLI: open the queue read-only, report one row, emit."""
+    parser = argparse.ArgumentParser(description=doc.splitlines()[0])
+    parser.add_argument("--task-id", required=True, help=task_help)
+    args = parser.parse_args(argv)
+
+    task_id = str(args.task_id).strip()
+    if not task_id:
+        return fail(schema_id, "invalid_task_id", "task id must be non-empty")
+
+    try:
+        conn = task_queue_readonly()
+    except (FileNotFoundError, sqlite3.Error) as exc:
+        return fail(schema_id, "task_queue_unavailable", str(exc))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = fetch_task(conn, task_id)
+        if row is None:
+            return fail(schema_id, "task_not_found", task_id)
+        payload = report(conn, row)
+    except OwnerUnavailable as exc:
+        return fail(schema_id, "owner_unavailable", str(exc))
+    except sqlite3.Error as exc:
+        return fail(schema_id, "query_failed", str(exc))
+    finally:
+        conn.close()
+
+    return emit(payload)
+
+
+def select_tasks(
+    conn: sqlite3.Connection,
+    *,
+    topic: str = NO_FILTER,
+    statuses: Iterable[str] | None = None,
+    contains: str = "",
+) -> list[sqlite3.Row]:
+    """``tasks`` rows, newest first, narrowed by topic, card text and lifecycle.
+
+    ``statuses`` is matched against the owner's ``canonical_status`` of each row,
+    not the raw ``status`` column, so "blocked" or "review" means here what it
+    means everywhere else. ``contains`` is only a prefilter on ``card_json`` (a
+    row that cannot mention the text is never loaded); callers still verify the
+    decoded card.
+    """
+    clauses: list[str] = []
+    params: list[str] = []
+    if topic != NO_FILTER:
+        clauses.append("topic = ?")
+        params.append(topic)
+    if contains:
+        clauses.append("instr(card_json, ?) > 0")
+        params.append(contains)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = conn.execute(
+        TASK_SELECT + where + " ORDER BY updated_at DESC, task_id", params
+    ).fetchall()
+    if statuses is None:
+        return rows
+    wanted = frozenset(statuses)
+    return [row for row in rows if canonical_status(row) in wanted]
+
+
+def parse_card(raw: Any) -> dict[str, Any] | None:
+    """The card a ``card_json`` value holds, or ``None`` when it is not an object."""
+    try:
+        card = json.loads(raw)
+    except (TypeError, ValueError, RecursionError):
+        return None
+    return card if isinstance(card, dict) else None
+
+
+def load_card(conn: sqlite3.Connection, task_id: str) -> dict[str, Any] | None:
+    """The decoded card of one task; ``None`` when the row or its JSON is unusable."""
+    row = conn.execute(
+        "SELECT card_json FROM tasks WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    return parse_card(row[0]) if row else None
+
+
+def string_list(value: Any) -> tuple[list[str], bool]:
+    """``(entries, well_formed)`` for a card field that should list strings.
+
+    Absent is well-formed and empty. A value that is not a list of strings is
+    reported malformed instead of being read as empty, because an empty write
+    scope or output list would otherwise look like a pass.
+    """
+    if value is None:
+        return [], True
+    if not isinstance(value, list):
+        return [], False
+    entries = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+    return entries, all(isinstance(item, str) for item in value)
+
+
+def split_write_scope(entries: Iterable[str]) -> tuple[list[str], list[str]]:
+    """``(valid, invalid)`` entries under the owner's repo-relative path rule.
+
+    Valid entries come back normalised (``/`` separators); an invalid entry
+    (absolute, ``..``, empty, NUL) is returned as written so it can be named.
+    """
+    normalise = owner_attr("worker_workspace", "_relative_repo_path")
+    workspace_error = owner_attr("worker_workspace", "WorkspaceError")
+    valid: list[str] = []
+    invalid: list[str] = []
+    for entry in entries:
+        try:
+            valid.append(normalise(entry))
+        except workspace_error:
+            invalid.append(entry)
+    return valid, invalid
+
+
+def path_in_scope(path: str, patterns: list[str]) -> bool | None:
+    """Whether ``patterns`` cover ``path`` under ``worker_workspace``'s own rule.
+
+    ``None`` means ``path`` is not a valid repo-relative path at all, which a
+    caller must treat as not covered. ``patterns`` come from
+    :func:`split_write_scope`. A directory entry covers nothing beneath it; only
+    a glob does, exactly as the worker's scope check treats it.
+    """
+    matches = owner_attr("worker_workspace", "_matches")
+    workspace_error = owner_attr("worker_workspace", "WorkspaceError")
+    try:
+        return bool(matches(path, patterns))
+    except workspace_error:
+        return None
+
+
+def uncovered_paths(paths: Iterable[str], scope: list[str]) -> list[str]:
+    """Each of ``paths`` that ``scope`` does not cover, in order.
+
+    A path that is not a valid repo-relative path is uncovered (named as it was
+    written): the worker's scope check could never accept a write to it.
+    """
+    uncovered: list[str] = []
+    for entry in paths:
+        valid, _invalid = split_write_scope([entry])
+        path = valid[0] if valid else entry
+        if not valid or path_in_scope(path, scope) is not True:
+            uncovered.append(path)
+    return uncovered

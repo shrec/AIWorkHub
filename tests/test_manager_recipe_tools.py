@@ -342,7 +342,10 @@ def test_read_only_catalogue_entries_declare_no_write_capability():
         # queue with ``mode=ro&immutable=1`` and read runtime artifacts; only
         # ``repo_test_subset`` executes repository code, and it is the one
         # entry of that family that declares ``write``.
+        "aiworkhub.operator.accept_readiness_bundle",
         "aiworkhub.operator.attempt_validation",
+        "aiworkhub.operator.blocked_queue_triage",
+        "aiworkhub.operator.preflight_card_winnability",
         "aiworkhub.operator.process_liveness",
         "aiworkhub.operator.request_log_tail",
         "aiworkhub.operator.task_events",

@@ -1302,6 +1302,96 @@ CANONICAL_RECIPES: tuple[tr.Recipe, ...] = (
             tr.slot("scan"),
         ),
     ),
+    # ---- Read-only pre-checks over the task queue ----------------------
+    #
+    # Added after the module-path migration above, so they begin at 1.0.0: no
+    # ``scripts/recipes/<name>.py`` vector ever existed for them. Each answers
+    # from the queue (the accept bundle also from the attempt artifacts)
+    # through ``mode=ro&immutable=1`` and declares no capability.
+    tr.Recipe(
+        id="aiworkhub.operator.preflight_card_winnability",
+        version="1.0.0",
+        purpose=(
+            "Whether one pending card can be won before a worker is spent on "
+            "it: required_outputs outside allowed_writes, validation inputs "
+            "that are neither on disk nor writable, a behavioural work_kind "
+            "without its validation roles, and allowed_writes overlap with "
+            "every processing or review card. Reports winnable plus the "
+            "concrete blockers. Runs "
+            "src/aiworkhub/recipes/preflight_card_winnability.py as a package "
+            "module; read-only. Catalogue: src/aiworkhub/manager_recipe_tools.py."
+        ),
+        task_kind=tr.TaskKind.SCAN,
+        parameters=(tr.ParamSpec(name="task_id", type=tr.ParamType.STR, required=True),),
+        outputs=(_STDOUT_JSON,),
+        risk_class=tr.RiskClass.NONE,
+        resource_bounds=tr.ResourceBounds(max_runtime_seconds=120),
+        cache_policy=tr.CachePolicy.NEVER,
+        argv=(
+            tr.lit("python"),
+            tr.lit("-m"),
+            tr.lit("aiworkhub.recipes.preflight_card_winnability"),
+            tr.lit("--task-id"),
+            tr.slot("task_id"),
+        ),
+    ),
+    tr.Recipe(
+        id="aiworkhub.operator.accept_readiness_bundle",
+        version="1.0.0",
+        purpose=(
+            "Whether one review card has the evidence an accept needs: its "
+            "latest attempt's validation receipts (command and exit code), the "
+            "quality_review lens reviewers bound to that attempt with their "
+            "status, and the changed paths against allowed_writes. Reports "
+            "ready plus every blocker; absent evidence is never a pass. Runs "
+            "src/aiworkhub/recipes/accept_readiness_bundle.py as a package "
+            "module; read-only. Catalogue: src/aiworkhub/manager_recipe_tools.py."
+        ),
+        task_kind=tr.TaskKind.SCAN,
+        parameters=(tr.ParamSpec(name="task_id", type=tr.ParamType.STR, required=True),),
+        outputs=(_STDOUT_JSON,),
+        risk_class=tr.RiskClass.NONE,
+        resource_bounds=tr.ResourceBounds(max_runtime_seconds=120),
+        cache_policy=tr.CachePolicy.NEVER,
+        argv=(
+            tr.lit("python"),
+            tr.lit("-m"),
+            tr.lit("aiworkhub.recipes.accept_readiness_bundle"),
+            tr.lit("--task-id"),
+            tr.slot("task_id"),
+        ),
+    ),
+    tr.Recipe(
+        id="aiworkhub.operator.blocked_queue_triage",
+        version="1.0.0",
+        purpose=(
+            "Every blocked card with its last failure or blocked reason "
+            "classified as route_unavailable, validation_failed, "
+            "scope_violation, quota, sandbox or unknown, and one recommended "
+            "next action per class. Replaces reading blocked reasons off the "
+            "queue by hand. Runs src/aiworkhub/recipes/blocked_queue_triage.py "
+            "as a package module; read-only. "
+            "Catalogue: src/aiworkhub/manager_recipe_tools.py."
+        ),
+        task_kind=tr.TaskKind.SCAN,
+        parameters=(
+            _limit(default=50, maximum=200),
+            _optional_filter("topic"),
+        ),
+        outputs=(_STDOUT_JSON,),
+        risk_class=tr.RiskClass.NONE,
+        resource_bounds=tr.ResourceBounds(max_runtime_seconds=120),
+        cache_policy=tr.CachePolicy.NEVER,
+        argv=(
+            tr.lit("python"),
+            tr.lit("-m"),
+            tr.lit("aiworkhub.recipes.blocked_queue_triage"),
+            tr.lit("--limit"),
+            tr.slot("limit"),
+            tr.lit("--topic"),
+            tr.slot("topic"),
+        ),
+    ),
     tr.Recipe(
         id="aiworkhub.operator.repo_test_subset",
         version="2.0.0",
