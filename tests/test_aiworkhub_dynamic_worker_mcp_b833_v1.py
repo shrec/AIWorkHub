@@ -469,7 +469,7 @@ def test_source_graph_query_runs_bounded_and_second_call_is_cached(monkeypatch: 
     assert second["cache_receipt"] is True
     assert second["content_sha256"] == first["content_sha256"]
     assert second["content"] != first["content"]
-    receipt = json.loads(second["content"])
+    receipt = _content_json(second["content"])
     assert receipt["reuse_previous_result"] is True
     assert receipt["content_sha256"] == first["content_sha256"]
     assert second["bytes"] < first["bytes"]
@@ -714,7 +714,7 @@ def test_worker_source_graph_query_analytics_target_is_engine_authoritative(
         budget=10, target="pkg/in_scope",
     )
     assert result["ok"] is True
-    payload = json.loads(result["content"])
+    payload = _content_json(result["content"])
     names = {row["name"] for row in payload["symbols"]}
     assert names == {"alpha_symbol", "beta_symbol"}
     assert "gamma_symbol" not in names
@@ -739,7 +739,7 @@ def test_worker_source_graph_query_analytics_scope_empty_stays_empty(
         budget=10, target="pkg/does_not_exist",
     )
     assert result["ok"] is True
-    payload = json.loads(result["content"])
+    payload = _content_json(result["content"])
     assert payload.get("symbols") is None
     assert payload["scope"] == "target_scope_empty"
 
@@ -769,7 +769,7 @@ def test_worker_source_graph_query_analytics_cursor_roundtrip(tmp_path: Path) ->
         budget=8, target="pkg/many",
     )
     assert first["ok"] is True
-    first_payload = json.loads(first["content"])
+    first_payload = _content_json(first["content"])
     assert len(first_payload["symbols"]) == 8
     next_cursor = first_payload["next_cursor"]
     assert next_cursor is not None
@@ -779,7 +779,7 @@ def test_worker_source_graph_query_analytics_cursor_roundtrip(tmp_path: Path) ->
         budget=8, target="pkg/many", cursor=next_cursor,
     )
     assert second["ok"] is True
-    second_payload = json.loads(second["content"])
+    second_payload = _content_json(second["content"])
     assert len(second_payload["symbols"]) == 1
     first_names = {row["name"] for row in first_payload["symbols"]}
     assert second_payload["symbols"][0]["name"] not in first_names
@@ -870,7 +870,7 @@ def test_source_graph_orientation_fits_one_plain_json_page(
     assert w._serialized_response_bytes(page) <= 8 * 1024
 
     # One page, directly readable, with its first match intact.
-    fitted = json.loads(page["content"])
+    fitted = _content_json(page["content"])
     assert fitted["mode"] == "focus"
     assert fitted["matches"][0]["file_path"] == "src/module_0.py"
     assert 0 < len(fitted["matches"]) < len(large_payload["matches"])
@@ -878,9 +878,14 @@ def test_source_graph_orientation_fits_one_plain_json_page(
     assert "ranked_symbols" not in fitted
     assert "ranked_symbols" in fitted["fit_dropped"]
     assert fitted["truncated"] is True
-    assert page["content_sha256"] == hashlib.sha256(
-        page["content"].encode("utf-8")
-    ).hexdigest()
+    assert len(
+        json.dumps(page["content"], separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ) <= 8 * 1024
+    canonical = json.dumps(
+        w._source_graph_payload(page),
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    assert hashlib.sha256(canonical).hexdigest() == page["content_sha256"]
 
     # The counts describe the whole engine result, not the trimmed bytes:
     # hit_count counts the ``matches`` rows only (the parallel
@@ -2317,3 +2322,9 @@ def test_context_stores_report_their_size_and_any_token_match_semantics(
     assert session["store_rows"] > 0
     # A worker's topic is injected by the coordinator, so it never broadens.
     assert session["match_kind"] in {"", "exact_source"}
+
+
+def _content_json(content):
+    """Compatibility shim: NF-2026-01448 made a single-page source_graph
+    reply's ``content`` a dict; accept either shape."""
+    return content if isinstance(content, dict) else json.loads(content)

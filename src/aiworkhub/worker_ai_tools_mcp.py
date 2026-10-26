@@ -87,6 +87,7 @@ just a bare ok/fail bit.
 from __future__ import annotations
 
 import base64
+import collections
 import hashlib
 import hmac
 import json
@@ -4181,6 +4182,114 @@ def _canonical_json_bytes(name: str, text: str) -> bytes:
     ).encode("utf-8")
 
 
+_ELIDED_MARKER = "_elided"
+_ELIDED_DEFAULT_KEY = "_elided_default"
+
+
+def _elide_default_row_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """Drop per-row fields that equal their universal default so a manager
+    reply stops paying wire bytes for data the schema already implies; any
+    value that differs from the default is always kept verbatim. The dropped
+    fields are recorded as letter codes under ``_ELIDED_MARKER`` so
+    ``_reapply_elided_row_defaults`` restores exactly them and nothing else
+    (``_reapply(_elide(row)) == row`` for every row)."""
+    elided = dict(row)
+    code = ""
+    confidence = elided.get("confidence")
+    if type(confidence) is float and confidence == 1.0:
+        del elided["confidence"]
+        code += "c"
+    if elided.get("evidence_label") == "EXTRACTED":
+        del elided["evidence_label"]
+        code += "e"
+    if elided.get("kind") == "body_match":
+        del elided["kind"]
+        code += "k"
+    file_path = row.get("file_path")
+    qualname = row.get("qualname")
+    line_start = row.get("line_start")
+    name = row.get("name")
+    if isinstance(file_path, str) and isinstance(qualname, str):
+        if type(line_start) is int and qualname == f"{file_path}:{line_start}":
+            del elided["qualname"]
+            code += "q"
+        elif isinstance(name, str) and qualname == f"{file_path}.{name}":
+            del elided["qualname"]
+            code += "n"
+    line_end = row.get("line_end")
+    if type(line_start) is int and type(line_end) is int and line_end == line_start:
+        del elided["line_end"]
+        code += "l"
+    freshness = row.get("freshness")
+    source_hash = row.get("source_hash")
+    if (
+        isinstance(freshness, dict)
+        and freshness.get("state") == "fresh"
+        and isinstance(source_hash, str)
+        and freshness.get("disk_source_hash") == source_hash
+        and freshness.get("indexed_source_hash") == source_hash
+    ):
+        elided["freshness"] = {
+            key: value for key, value in freshness.items()
+            if key not in ("disk_source_hash", "indexed_source_hash")
+        }
+        code += "h"
+    if code:
+        elided[_ELIDED_MARKER] = code
+    return elided
+
+
+def _elide_default_fields_in_rows(rows: object) -> object:
+    """Apply ``_elide_default_row_fields`` to each dict in a match/symbol list."""
+    if not isinstance(rows, list):
+        return rows
+    return [
+        _elide_default_row_fields(row) if isinstance(row, dict) else row
+        for row in rows
+    ]
+
+
+def _compact_source_graph_content(payload: Any) -> Any:
+    """Presentation view of one canonical single-page payload: the same
+    object with per-row default fields elided. ``canonical_bytes`` and
+    ``content_sha256`` are always computed from the full, unelided payload
+    and never from this view. The most common non-empty elision code is
+    stored once under ``_ELIDED_DEFAULT_KEY``; a row carries its own marker
+    only when its code differs (``""`` when nothing was elided)."""
+    if not isinstance(payload, dict):
+        return payload
+    compact = dict(payload)
+    row_lists: list[list[Any]] = []
+    for key in ("matches", "symbols"):
+        if key in compact:
+            compact[key] = _elide_default_fields_in_rows(compact[key])
+            if isinstance(compact[key], list):
+                row_lists.append(compact[key])
+    contexts = compact.get("contexts")
+    if isinstance(contexts, list):
+        compact_contexts = []
+        for context in contexts:
+            if isinstance(context, dict) and isinstance(context.get("entities"), list):
+                entities = _elide_default_fields_in_rows(context["entities"])
+                row_lists.append(entities)
+                context = {**context, "entities": entities}
+            compact_contexts.append(context)
+        compact["contexts"] = compact_contexts
+    rows = [row for rows in row_lists for row in rows if isinstance(row, dict)]
+    counts = collections.Counter(
+        row[_ELIDED_MARKER] for row in rows if row.get(_ELIDED_MARKER)
+    )
+    if counts:
+        default_code = counts.most_common(1)[0][0]
+        compact[_ELIDED_DEFAULT_KEY] = default_code
+        for row in rows:
+            if row.get(_ELIDED_MARKER) == default_code:
+                del row[_ELIDED_MARKER]
+            elif _ELIDED_MARKER not in row:
+                row[_ELIDED_MARKER] = ""
+    return compact
+
+
 def _continuation_page_result(
     *,
     store_id: str,
@@ -4232,6 +4341,105 @@ def _serialized_response_bytes(result: Mapping[str, Any]) -> int:
             result, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
     )
+
+
+def _source_graph_payload(result: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Decode a ``source_graph_query`` reply's ``content`` back to a dict.
+
+    ``content`` is a structured object (with per-row defaults elided for
+    wire size) on a single-page reply, or a base64 string on a paged one.
+    Returns the payload with every elided default re-applied, so a caller
+    sees the same canonical row shape the engine produced; returns
+    ``None`` for a paged reply (``content_encoding`` set) or content that
+    fails to decode to a dict.
+    """
+    if not isinstance(result, Mapping) or result.get("content_encoding"):
+        return None
+    content = result.get("content")
+    if isinstance(content, dict):
+        payload = content
+    elif isinstance(content, str):
+        try:
+            payload = json.loads(content)
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return _reapply_elided_defaults_in_payload(payload)
+
+
+def _reapply_elided_row_defaults(
+    row: dict[str, Any], default_code: str = ""
+) -> dict[str, Any]:
+    """Exact inverse of ``_elide_default_row_fields``: restore only the
+    fields the row's ``_ELIDED_MARKER`` code says were dropped (or the
+    payload-level ``default_code`` when the row carries no marker), then
+    remove the marker."""
+    code = row.get(_ELIDED_MARKER)
+    if not isinstance(code, str):
+        code = default_code
+        if not code:
+            return dict(row)
+    full = {key: value for key, value in row.items() if key != _ELIDED_MARKER}
+    if "c" in code:
+        full["confidence"] = 1.0
+    if "e" in code:
+        full["evidence_label"] = "EXTRACTED"
+    if "k" in code:
+        full["kind"] = "body_match"
+    if "q" in code:
+        full["qualname"] = f"{full.get('file_path')}:{full.get('line_start')}"
+    elif "n" in code:
+        full["qualname"] = f"{full.get('file_path')}.{full.get('name')}"
+    if "l" in code:
+        full["line_end"] = full.get("line_start")
+    if "h" in code:
+        freshness = full.get("freshness")
+        if isinstance(freshness, dict):
+            full["freshness"] = {
+                **freshness,
+                "disk_source_hash": full.get("source_hash"),
+                "indexed_source_hash": full.get("source_hash"),
+            }
+    return full
+
+
+def _reapply_elided_defaults_in_rows(rows: object, default_code: str = "") -> object:
+    """Apply ``_reapply_elided_row_defaults`` to each dict in a match/symbol list."""
+    if not isinstance(rows, list):
+        return rows
+    return [
+        _reapply_elided_row_defaults(row, default_code) if isinstance(row, dict) else row
+        for row in rows
+    ]
+
+
+def _reapply_elided_defaults_in_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Invert the single-page elision for every row-bearing key, so a
+    decoded payload matches the engine's unelided canonical shape."""
+    restored = dict(payload)
+    default_code = restored.pop(_ELIDED_DEFAULT_KEY, "")
+    if not isinstance(default_code, str):
+        default_code = ""
+    for key in ("matches", "symbols"):
+        if key in restored:
+            restored[key] = _reapply_elided_defaults_in_rows(restored[key], default_code)
+    contexts = restored.get("contexts")
+    if isinstance(contexts, list):
+        restored["contexts"] = [
+            {
+                **context,
+                "entities": _reapply_elided_defaults_in_rows(
+                    context["entities"], default_code
+                ),
+            }
+            if isinstance(context, dict) and isinstance(context.get("entities"), list)
+            else context
+            for context in contexts
+        ]
+    return restored
 
 
 def _continuation_chunk_size_for_cap(
@@ -5189,20 +5397,22 @@ def source_graph_query(
 
     if cached is not None:
         cached_result = cached["result"]
-        receipt_content = json.dumps(
-            {
-                "schema_id": "aiworkhub.source_graph.cache_receipt.v1",
-                "reuse_previous_result": True,
-                "content_sha256": cached["content_sha256"],
-                "original_content_bytes": cached["bytes"],
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        receipt_bytes = len(receipt_content.encode("utf-8"))
+        receipt_payload = {
+            "schema_id": "aiworkhub.source_graph.cache_receipt.v1",
+            "reuse_previous_result": True,
+            "content_sha256": cached["content_sha256"],
+            "original_content_bytes": cached["bytes"],
+        }
+        receipt_bytes = len(json.dumps(
+            receipt_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8"))
         use_receipt = compact_replay and receipt_bytes < int(cached["bytes"])
-        returned_content = receipt_content if use_receipt else str(cached_result["content"])
+        if use_receipt:
+            returned_content = receipt_payload
+        elif isinstance(cached_result["content"], dict):
+            returned_content = json.loads(json.dumps(cached_result["content"]))
+        else:
+            returned_content = cached_result["content"]
         returned_bytes = receipt_bytes if use_receipt else int(cached["bytes"])
         replay_bytes_avoided = max(0, int(cached["bytes"]) - returned_bytes)
         _append_audit(
@@ -5626,14 +5836,13 @@ def source_graph_query(
     }
 
     cacheable = generation_is_definite
-    text = canonical_bytes.decode("utf-8")
     bytes_returned = len(canonical_bytes)
     result = {
         **meta,
         "truncated": internal_truncated,
         "outer_truncated": False,
         "bytes": bytes_returned,
-        "content": text,
+        "content": payload,
         "content_sha256": full_content_sha256,
     }
     page_sha256 = ""
@@ -5696,6 +5905,8 @@ def source_graph_query(
         page_sha256 = str(result["page_sha256"])
         # A paginated page is a partial view of the response; never cache it.
         cacheable = False
+    else:
+        result["content"] = _compact_source_graph_content(payload)
 
     if cacheable:
         _source_graph_cache_store(cache_key, {
@@ -5811,9 +6022,8 @@ def source_graph_recommendation_roundtrip_gate(
                 "reason": str(focus_result.get("error") or "zero_hits")[:160],
             })
             continue
-        try:
-            payload = json.loads(str(focus_result.get("content") or "{}"))
-        except json.JSONDecodeError:
+        payload = _source_graph_payload(focus_result)
+        if payload is None:
             seed_failures.append({
                 "kind": "focus_seed",
                 "value": seed,
@@ -7376,13 +7586,8 @@ class WorkerSemanticEditSession:
 
         if not isinstance(result, Mapping) or result.get("ok") is not True:
             return 0
-        if result.get("content_encoding"):
-            return 0
-        try:
-            payload = json.loads(str(result.get("content") or ""))
-        except (TypeError, ValueError):
-            return 0
-        if not isinstance(payload, dict):
+        payload = _source_graph_payload(result)
+        if payload is None:
             return 0
         delivered_by = "source_graph:" + str(
             result.get("receipt_id") or str(result.get("content_sha256") or "")[:12]

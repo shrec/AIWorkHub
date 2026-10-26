@@ -333,7 +333,7 @@ def test_omitting_target_never_replaces_query_with_declared_target(
     assert result["ok"] is True
     assert result["target"] is None
     assert calls == [("focus", "a very specific semantic query", 64)]
-    payload = json.loads(result["content"])
+    payload = _content_json(result["content"])
     assert payload["target"] == "a very specific semantic query"
 
 
@@ -350,7 +350,7 @@ def test_declared_target_scopes_returned_files_without_touching_the_query(
     result = w.source_graph_query(ctx, mode="focus", query="real query text", target="AITools")
     assert result["ok"] is True
     assert result["target"] == "AITools"
-    payload = json.loads(result["content"])
+    payload = _content_json(result["content"])
     assert payload["target"] == "real query text"
     assert payload["relevant_files"] == ["AITools/source_graph.py"]
     assert payload["scope"] == "target"
@@ -376,7 +376,7 @@ def test_scoped_focus_zero_hit_preserves_query_tokens_and_truthful_reason(
 
     assert result["ok"] is True
     assert result["hit_count"] == 0
-    payload = json.loads(result["content"])
+    payload = _content_json(result["content"])
     assert payload["query_tokens"] == [
         "architecture", "and", "recent", "features",
     ]
@@ -413,7 +413,7 @@ def test_scoped_focus_global_zero_hit_preserves_query_tokens_and_reason(
     )
 
     assert result["hit_count"] == 0
-    payload = json.loads(result["content"])
+    payload = _content_json(result["content"])
     assert payload["query_tokens"] == ["missing", "symbol"]
     assert payload["query_tokens_source"] == "query"
     assert payload["retrieval_reason"] == "no_ranked_semantic_match"
@@ -482,7 +482,7 @@ def test_bodygrep_passes_target_into_bounded_engine_scan(
 
     assert result["ok"] is True
     assert calls == [("exact documentation text", "docs/README.md")]
-    assert json.loads(result["content"])["candidate_files"] == ["docs/README.md"]
+    assert _content_json(result["content"])["candidate_files"] == ["docs/README.md"]
 
 
 def test_target_scope_is_applied_before_large_payload_truncation(
@@ -533,7 +533,7 @@ def test_target_scope_is_applied_before_large_payload_truncation(
     assert result["truncated"] is False
     assert observed["target"] == "eval"
     assert observed["cursor"] is None
-    payload = json.loads(result["content"])
+    payload = _content_json(result["content"])
     assert payload["scope"] == "target"
     assert payload["rows"] == [
         {"file": "eval/in_scope.json", "evidence": "kept"},
@@ -581,7 +581,7 @@ def test_exact_declared_jsonl_falls_back_to_bounded_workspace_file(
     )
 
     assert result["ok"] is True
-    payload = json.loads(result["content"])
+    payload = _content_json(result["content"])
     row = payload["matches"][0]
     assert row["authority"] == "worker_workspace_declared_input"
     assert row["fallback_reason"] == "declared_input_unindexed"
@@ -623,7 +623,7 @@ def test_file_mode_prefers_exact_target_over_semantic_query(
 
     assert result["ok"] is True
     assert calls == ["src/pkg/_version.py"]
-    payload = json.loads(result["content"])
+    payload = _content_json(result["content"])
     assert payload["candidate_files"] == ["src/pkg/_version.py"]
     assert payload["scope"] == "target"
 
@@ -659,7 +659,7 @@ def test_declared_input_fallback_rejects_symlink(
     )
 
     assert result["ok"] is True
-    assert json.loads(result["content"])["matches"] == []
+    assert _content_json(result["content"])["matches"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -1235,3 +1235,9 @@ def test_hash_only_canonical_exact_digest_remains_canonical(
     assert view.authorized_digests == {}
     assert relative not in view.changed
     assert view.digest_refs[relative] == digest
+
+
+def _content_json(content):
+    """Compatibility shim: NF-2026-01448 made a single-page source_graph
+    reply's ``content`` a dict; accept either shape."""
+    return content if isinstance(content, dict) else json.loads(content)

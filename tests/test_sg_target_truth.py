@@ -96,7 +96,7 @@ def test_qualname_target_resolves_symbol_with_source(tmp_path, mode):
     assert result["ok"] is True, result
     assert result["hit_count"] >= 1
     assert result["target"] == qualname
-    payload = json.loads(result["content"])
+    payload = _content_json(result["content"])
     # The path-prefix filter is no longer applied to a selector mode.
     assert payload.get("scope") == "target_selector"
     match = payload["matches"][0]
@@ -159,7 +159,7 @@ def test_file_path_target_is_still_a_path_scope(tmp_path):
         ctx, mode="body", query="DBAccountStatus", target="pkg/status.py", budget=16,
     )
     assert result["ok"] is True
-    payload = json.loads(result["content"])
+    payload = _content_json(result["content"])
     # A path-scoped call is marked "target", never "target_selector".
     assert payload.get("scope") == "target"
     assert any(m["file_path"] == "pkg/status.py" for m in payload["matches"])
@@ -184,7 +184,7 @@ def test_file_path_target_recovers_symbol_from_a_second_declared_file(tmp_path):
         ctx, mode="body", query="DBAccountStatus", target="pkg/orientation.py", budget=16,
     )
     assert result["ok"] is True
-    payload = json.loads(result["content"])
+    payload = _content_json(result["content"])
     assert payload["scope"] == "declared_target_fallback"
     assert payload["requested_target"] == "pkg/orientation.py"
     assert any(m["file_path"] == "pkg/status.py" for m in payload["matches"])
@@ -286,6 +286,12 @@ def test_declared_target_fallback_stays_fail_closed_on_unattributable_match(tmp_
     # test would match the query we sent -- not a leaked row.  Decode and assert
     # no match survived.
     assert result["hit_count"] == 0
-    payload = json.loads(result["content"])
+    payload = _content_json(result["content"])
     assert payload["matches"] == []
     assert all(m.get("qualname") != "ghost" for m in payload["matches"])
+
+
+def _content_json(content):
+    """Compatibility shim: NF-2026-01448 made a single-page source_graph
+    reply's ``content`` a dict; accept either shape."""
+    return content if isinstance(content, dict) else json.loads(content)

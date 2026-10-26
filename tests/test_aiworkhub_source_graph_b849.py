@@ -2377,7 +2377,7 @@ def test_worker_mcp_exposes_dedicated_source_graph_analytics(tmp_path):
         ctx, mode="complexity", query="analytics_probe", budget=12,
     )
     assert result["ok"] is True
-    payload = json.loads(result["content"])
+    payload = _content_json(result["content"])
     assert payload["mode"] == "complexity"
     assert payload["ranked_symbols"][0]["name"] == "analytics_probe"
 
@@ -3098,7 +3098,7 @@ def test_worker_mcp_source_graph_query_is_canonical_and_repo_bound(tmp_path):
     result = w.source_graph_query(ctx, mode="focus", query="worker_probe", budget=10)
     assert result["ok"] is True
     assert result["authority_source"] == "canonical"
-    assert "worker_probe" in result["content"]
+    assert "worker_probe" in json.dumps(result["content"])
 
 
 def test_worker_exact_body_can_recover_within_declared_target_set(tmp_path):
@@ -3124,7 +3124,7 @@ def test_worker_exact_body_can_recover_within_declared_target_set(tmp_path):
 
     assert result["ok"] is True
     assert result["workflow_stage"] == "review"
-    payload = json.loads(result["content"])
+    payload = _content_json(result["content"])
     assert payload["scope"] == "declared_target_fallback"
     assert payload["requested_target"] == "pkg/orientation.py"
     assert any(row["file_path"] == "pkg/status.py" for row in payload["matches"])
@@ -3158,8 +3158,8 @@ def test_worker_cpp_body_matches_manager_exact_symbol_query(tmp_path):
 
     assert manager["matches"]
     assert worker["ok"] is True
-    payload = json.loads(worker["content"])
-    assert payload["matches"] == manager["matches"]
+    assert isinstance(worker["content"], dict)
+    assert w._source_graph_payload(worker)["matches"] == manager["matches"]
 
 
 def test_worker_mcp_source_graph_query_fails_closed_when_unindexed(tmp_path):
@@ -3454,7 +3454,7 @@ def test_rework_overlay_is_wired_into_production_source_graph_query(tmp_path):
     assert first["ok"] is True
     assert first["hit_count"] >= 1
     assert first["authority_source"] == "rework_overlay"
-    assert "retained_rework_symbol" in first["content"]
+    assert "retained_rework_symbol" in json.dumps(first["content"])
 
     # A later worker edit of the packet-bound path invalidates the private
     # overlay cache and is visible on the next query without touching the
@@ -3470,7 +3470,7 @@ def test_rework_overlay_is_wired_into_production_source_graph_query(tmp_path):
     )
     assert second["ok"] is True
     assert second["hit_count"] >= 1
-    assert "later_rework_symbol" in second["content"]
+    assert "later_rework_symbol" in json.dumps(second["content"])
 
     canonical = sg.body_query(authority, "later_rework_symbol", 16)
     assert canonical["matches"] == []
@@ -6930,7 +6930,7 @@ def test_zero_hit_cascade_returns_evidence_without_counting_as_a_first_class_hit
     assert result["hit_count"] == 0
     assert result["fallback_hit_count"] > 0
 
-    payload = json.loads(result["content"])
+    payload = _content_json(result["content"])
     assert payload["matches"]
     assert payload["retrieval_reason"] == result["retrieval_reason"]
     # The gate reads the same counter the ledger row records.
@@ -6956,7 +6956,7 @@ def test_zero_hit_cascade_broadens_to_the_declared_targets(tmp_path):
     assert result["retrieval_reason"] == "fallback:declared_targets"
     assert result["hit_count"] == 0
     assert result["fallback_hit_count"] > 0
-    payload = json.loads(result["content"])
+    payload = _content_json(result["content"])
     assert payload["requested_target"] == "pkg/service.py"
     assert payload["scope"] == "declared_target_fallback"
     assert {row["file_path"] for row in payload["matches"]} == {"other/far.py"}
@@ -7008,7 +7008,7 @@ def test_stale_rows_are_answered_from_an_inline_re_extraction(tmp_path):
     assert result["refresh"] == "inline"
     assert result["freshness"] == "fresh"
 
-    payload = json.loads(result["content"])
+    payload = _content_json(result["content"])
     row = payload["matches"][0]
     assert row["refresh"] == "inline"
     assert row["freshness"]["state"] == "fresh"
@@ -7183,3 +7183,9 @@ def test_impact_keeps_recorded_symbol_callers_when_the_file_sample_is_full(tmp_p
         if row["file_path"] == "pkg/target.py"
     )
     assert int(scoped_affected["score"]) > 0
+
+
+def _content_json(content):
+    """Compatibility shim: NF-2026-01448 made a single-page source_graph
+    reply's ``content`` a dict; accept either shape."""
+    return content if isinstance(content, dict) else json.loads(content)
