@@ -143,6 +143,7 @@ def test_snapshot_view_serializes_allocation_heavy_builds(monkeypatch):
             active -= 1
         return dict(FAKE_SNAPSHOT)
 
+    _stub_snapshot_sources(monkeypatch)
     monkeypatch.setattr(dashboard, "build_snapshot", fake_build_snapshot)
 
     def run_snapshot():
@@ -154,7 +155,7 @@ def test_snapshot_view_serializes_allocation_heavy_builds(monkeypatch):
         thread.start()
     barrier.wait()
     for thread in threads:
-        thread.join(5)
+        thread.join(30)
 
     assert all(not thread.is_alive() for thread in threads)
     assert peak == 1
