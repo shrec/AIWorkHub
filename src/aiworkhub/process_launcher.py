@@ -5172,8 +5172,10 @@ class ProcessManager:
             if reason:
                 raise LaunchRejected(f"malformed_{label}:{reason}")
         card = _parse_card(self._show_task(task_id), task_id)
-        if card.get("runner") != runner:
-            raise LaunchRejected(f"runner_mismatch:{card.get('runner')}")
+        card_runner = card.get("runner")
+        if not isinstance(card_runner, str) or core.canonical_runner_id(runner, (card_runner,)) != card_runner:
+            raise LaunchRejected(f"runner_mismatch:{card_runner}")
+        runner = card_runner
         if card.get("topic") != topic:
             raise LaunchRejected(f"topic_mismatch:{card.get('topic')}")
         lifecycle = core._lifecycle_state(card)
@@ -5575,6 +5577,13 @@ class ProcessManager:
         if not (runner and topic and adapter_id):
             try:
                 card = _parse_card(self._show_task(task_id), task_id)
+                # NF-2026-01572: a catalog worker_id such as opencode-go_mimo-v2.6-pro
+                # names the same identity as the card's stored opencode_go_mimo-v2.6-pro;
+                # fold it with the normalizer task creation used (core.py:1864-1867).
+                if runner:
+                    stored_runner = card.get("runner")
+                    if isinstance(stored_runner, str):
+                        runner = core.canonical_runner_id(runner, (stored_runner,)) or runner
                 identity_derivation = derive_launch_identity(
                     self.repo,
                     card,
