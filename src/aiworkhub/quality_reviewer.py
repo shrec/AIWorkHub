@@ -28,6 +28,8 @@ MAX_PACKET_PATHS = 200
 MAX_PACKET_CHECKS = 200
 MAX_PACKET_COMMANDS = 100
 MAX_TEXT_CHARS = 2_000
+# Mirrors process_launcher.MAX_TASK_CONTRACT_BYTES (cycle: not importable); test-pinned.
+MAX_CONTRACT_TEXT_CHARS = 96 * 1024
 # The finalizer retains the last 4 KiB of stdout and stderr on every executed
 # validation row (worker_workspace: ``stdout_tail``/``stderr_tail``).  The
 # packet carries exactly that bound, never more, so the prompt's promise of
@@ -288,8 +290,34 @@ def _identity(value: object, field: str) -> str:
     return normalized
 
 
-def _bounded_strings(values: Iterable[object], *, limit: int) -> list[str]:
-    rows = [str(value)[:MAX_TEXT_CHARS] for value in values]
+def _contract_text(value: object, field: str, truncations: list[dict[str, Any]]) -> str:
+    """Carry card-contract text whole; a cut past the cap is recorded, never silent."""
+
+    text = str(value)
+    if len(text) <= MAX_CONTRACT_TEXT_CHARS:
+        return text
+    truncations.append(
+        {
+            "field": field,
+            "original_chars": len(text),
+            "kept_chars": MAX_CONTRACT_TEXT_CHARS,
+            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        }
+    )
+    return text[:MAX_CONTRACT_TEXT_CHARS]
+
+
+def _bounded_strings(
+    values: Iterable[object],
+    *,
+    limit: int,
+    field: str,
+    truncations: list[dict[str, Any]],
+) -> list[str]:
+    rows = [
+        _contract_text(value, f"{field}[{index}]", truncations)
+        for index, value in enumerate(values)
+    ]
     if len(rows) > limit:
         raise ReviewerEvidenceError("review_packet_overflow")
     return rows
@@ -354,6 +382,8 @@ def build_review_packet(
     level beside ``contract`` and ``packet_sha256`` covers it.  A first attempt
     has none: the key is then absent and the packet is byte-identical to one
     built without the argument.  See ``_manager_amendment_section``.
+
+    ``contract_truncation`` appears only if a contract field was cut at the cap.
     """
 
     if not isinstance(claim_epoch, int) or claim_epoch < 1:
@@ -461,6 +491,7 @@ def build_review_packet(
         candidate["delta"] = _candidate_delta_rows(
             candidate_delta, changed_paths={row["path"] for row in path_rows}
         )
+    contract_truncations: list[dict[str, Any]] = []
     body = {
         "schema_id": PACKET_SCHEMA_ID,
         "target": {
@@ -470,10 +501,25 @@ def build_review_packet(
             "worker_provider": _identity(worker_provider, "worker_provider"),
         },
         "contract": {
-            "objective": str(objective)[:MAX_TEXT_CHARS],
-            "acceptance": _bounded_strings(acceptance, limit=MAX_PACKET_COMMANDS),
-            "required_outputs": _bounded_strings(required_outputs, limit=MAX_PACKET_COMMANDS),
-            "validation": _bounded_strings(validation, limit=MAX_PACKET_COMMANDS),
+            "objective": _contract_text(objective, "objective", contract_truncations),
+            "acceptance": _bounded_strings(
+                acceptance,
+                limit=MAX_PACKET_COMMANDS,
+                field="acceptance",
+                truncations=contract_truncations,
+            ),
+            "required_outputs": _bounded_strings(
+                required_outputs,
+                limit=MAX_PACKET_COMMANDS,
+                field="required_outputs",
+                truncations=contract_truncations,
+            ),
+            "validation": _bounded_strings(
+                validation,
+                limit=MAX_PACKET_COMMANDS,
+                field="validation",
+                truncations=contract_truncations,
+            ),
         },
         "terminal_validation": terminal_validations(terminal_validation),
         "candidate": candidate,
@@ -487,6 +533,8 @@ def build_review_packet(
     amendment = _manager_amendment_section(manager_amendment)
     if amendment is not None:
         body["manager_amendment"] = amendment
+    if contract_truncations:
+        body["contract_truncation"] = contract_truncations
     return {**body, "packet_sha256": _canonical_digest(body)}
 
 
