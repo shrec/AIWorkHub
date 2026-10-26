@@ -1504,6 +1504,18 @@ def aiworkhub_manager_ai_memory_related(key: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+def aiworkhub_manager_ai_memory_review(limit: int = 20, stale_days: int = 90) -> dict[str, Any]:
+    """MANAGER READ: bounded read-only report of AI Memory supersede candidates; it proposes only and never writes, supersedes or archives.
+
+    Args:
+        limit: Maximum supersede candidates to return; default 20, clamped to 1-50.
+        stale_days: Active memories whose updated_at (or created_at) is older than this many days are reported as stale; default 90. Memories with no timestamp are only counted as unknown_age, never dated.
+    """
+
+    return manager_ai_tools.memory_review_report(limit=limit, stale_days=stale_days)
+
+
+@mcp.tool()
 def aiworkhub_manager_kb_search(query: str, limit: int = 8) -> dict[str, Any]:
     """MANAGER READ: bounded canonical KB search.
 

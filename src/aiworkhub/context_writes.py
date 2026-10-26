@@ -277,13 +277,16 @@ def _migrate_memories_schema(con: sqlite3.Connection) -> None:
             step = "rename_memories_to_legacy"
             con.execute("ALTER TABLE memories RENAME TO memories_legacy_unique")
             step = "create_memories"
+            legacy_ts = _legacy_timestamp_columns(con, "memories_legacy_unique")
             con.execute(
-                "CREATE TABLE memories(id INTEGER PRIMARY KEY,key TEXT,value TEXT,tags TEXT,scope TEXT)"
+                "CREATE TABLE memories(id INTEGER PRIMARY KEY,key TEXT,value TEXT,tags TEXT,scope TEXT,"
+                "created_at TEXT,updated_at TEXT)"
             )
             step = "copy_rows"
+            ts_select = ",".join(c if c in legacy_ts else "NULL" for c in ("created_at", "updated_at"))
             con.execute(
-                "INSERT INTO memories(id,key,value,tags,scope) "
-                "SELECT id,key,value,tags,scope FROM memories_legacy_unique"
+                "INSERT INTO memories(id,key,value,tags,scope,created_at,updated_at) "
+                f"SELECT id,key,value,tags,scope,{ts_select} FROM memories_legacy_unique"
             )
             step = "verify_row_count"
             copied_count = con.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
@@ -344,6 +347,26 @@ def _normalize_memory_schema(con: sqlite3.Connection) -> None:
     result = _ensure_memories_fts(con)
     if not result.get("ok"):
         raise ContextWriteError(f"fts_normalization_failed:{result.get('error', 'unknown')}")
+    _ensure_memories_timestamp_columns(con)
+
+
+def _ensure_memories_timestamp_columns(con: sqlite3.Connection) -> None:
+    """Add nullable created_at/updated_at to ``memories``; existing rows stay NULL."""
+    for column in ("created_at", "updated_at"):
+        if column in _legacy_timestamp_columns(con, "memories"):
+            continue
+        try:
+            con.execute(f"ALTER TABLE memories ADD COLUMN {column} TEXT")
+            con.commit()
+        except sqlite3.OperationalError as exc:
+            try:
+                con.rollback()
+            except sqlite3.Error:
+                pass
+            if column not in _legacy_timestamp_columns(con, "memories"):
+                raise ContextWriteError(
+                    f"memories_timestamp_column_failed:{column}:{str(exc)[:120]}"
+                ) from exc
 
 
 def _kb_fts_needs_rebuild(con: sqlite3.Connection) -> list[str] | None:

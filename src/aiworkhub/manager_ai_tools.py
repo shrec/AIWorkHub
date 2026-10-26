@@ -9,11 +9,14 @@ repository or manufacture a manager identity.
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
+import re
 import secrets
 import sqlite3
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
@@ -195,6 +198,224 @@ def ai_memory_get(*, key: str) -> dict[str, Any]:
 
 def ai_memory_related(*, key: str) -> dict[str, Any]:
     return _invoke(lambda ctx: worker_tools.ai_memory_related(ctx, key=key))
+
+
+MEMORY_REVIEW_SCHEMA_ID = "aiworkhub.memory_review.v1"
+_MEMORY_REVIEW_SCAN_CAP = 5000
+_MEMORY_REVIEW_MAX_BYTES = 16 * 1024
+_MEMORY_REVIEW_VALUE_CHARS = 200
+_MEMORY_REVIEW_UNKNOWN_EXAMPLES = 5
+_MEMORY_REVIEW_JACCARD = 0.8
+_MEMORY_REVIEW_COMPARISON_CAP = 200_000
+_MEMORY_REVIEW_TOKEN_RE = re.compile(r"[a-z0-9_]+")
+
+
+def _clamp_int(raw: Any, *, default: int, low: int, high: int) -> int:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(high, value))
+
+
+def _review_text(raw: Any) -> tuple[str, bool]:
+    text = str(raw or "")
+    if len(text) > _MEMORY_REVIEW_VALUE_CHARS:
+        return text[:_MEMORY_REVIEW_VALUE_CHARS], True
+    return text, False
+
+
+def _parse_memory_timestamp(raw: Any) -> datetime | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def memory_review_from_connection(
+    con: sqlite3.Connection, *, limit: int = 20, stale_days: int = 90,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Propose supersede candidates from active memories; never writes."""
+    limit = _clamp_int(limit, default=20, low=1, high=50)
+    stale_days = _clamp_int(stale_days, default=90, low=1, high=36500)
+    now = now or datetime.now(timezone.utc)
+    report: dict[str, Any] = {
+        "ok": True, "schema_id": MEMORY_REVIEW_SCHEMA_ID, "limit": limit,
+        "stale_days": stale_days, "timestamps_available": False, "scanned": 0,
+        "scan_cap": _MEMORY_REVIEW_SCAN_CAP, "scan_truncated": False,
+        "unknown_age": {"count": 0, "example_keys": []},
+        "unparseable_timestamps": 0,
+        "candidate_counts": {"stale": 0, "key_collision": 0, "near_duplicate": 0},
+        "candidates": [], "candidates_omitted": 0, "truncated": False,
+    }
+    tables = {
+        str(row[0]) for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    if "memories" not in tables:
+        return report
+    columns = {str(row[1]) for row in con.execute("PRAGMA table_info(memories)")}
+    ts_columns = [c for c in ("updated_at", "created_at") if c in columns]
+    report["timestamps_available"] = bool(ts_columns)
+    updated_sql = "m.updated_at" if "updated_at" in columns else "NULL"
+    created_sql = "m.created_at" if "created_at" in columns else "NULL"
+    if "context_entity_state" in tables:
+        state_join = (
+            "LEFT JOIN context_entity_state s ON s.entity_type='memory' AND s.entity_id=m.id "
+            "WHERE COALESCE(s.status,'active')='active' "
+        )
+    else:
+        state_join = ""
+    rows = con.execute(
+        f"SELECT m.id,m.key,m.value,m.tags,{updated_sql},{created_sql} FROM memories m "
+        f"{state_join}ORDER BY m.id DESC LIMIT ?",
+        (_MEMORY_REVIEW_SCAN_CAP + 1,),
+    ).fetchall()
+    if len(rows) > _MEMORY_REVIEW_SCAN_CAP:
+        rows = rows[:_MEMORY_REVIEW_SCAN_CAP]
+        report["scan_truncated"] = True
+    report["scanned"] = len(rows)
+    value_truncated = False
+
+    def clip(raw: Any) -> str:
+        nonlocal value_truncated
+        text, cut = _review_text(raw)
+        value_truncated = value_truncated or cut
+        return text
+
+    stale: list[tuple[float, dict[str, Any]]] = []
+    unknown_keys: list[str] = []
+    unknown_count = 0
+    unparseable = 0
+    by_key: dict[str, list[Any]] = {}
+    by_tag: dict[str, list[tuple[Any, frozenset[str]]]] = {}
+    cutoff_days = float(stale_days)
+    for row in rows:
+        memory_id, key, value, tags, updated_at, created_at = row
+        key = str(key or "")
+        by_key.setdefault(key, []).append(row)
+        tokens = frozenset(_MEMORY_REVIEW_TOKEN_RE.findall(str(value or "").lower()))
+        if tokens:
+            for tag in {t.strip().lower() for t in str(tags or "").split(",") if t.strip()}:
+                by_tag.setdefault(tag, []).append((row, tokens))
+        stamp_column, stamp = next(
+            ((name, raw) for name, raw in (("updated_at", updated_at), ("created_at", created_at)) if raw),
+            ("", None),
+        )
+        if stamp is None:
+            unknown_count += 1
+            if len(unknown_keys) < _MEMORY_REVIEW_UNKNOWN_EXAMPLES and key not in unknown_keys:
+                unknown_keys.append(key)
+            continue
+        parsed = _parse_memory_timestamp(stamp)
+        if parsed is None:
+            unparseable += 1
+            continue
+        age_days = (now - parsed).total_seconds() / 86400.0
+        if age_days > cutoff_days:
+            stale.append((age_days, {
+                "reason": "stale", "keys": [key],
+                "evidence": {
+                    "memory_id": int(memory_id), "timestamp_column": stamp_column,
+                    "timestamp": str(stamp), "age_days": round(age_days, 1),
+                    "stale_days": stale_days, "value": clip(value),
+                },
+            }))
+    report["unknown_age"] = {
+        "count": unknown_count, "example_keys": [clip(k) for k in unknown_keys],
+    }
+    report["unparseable_timestamps"] = unparseable
+
+    candidates: list[dict[str, Any]] = [
+        item for _age, item in sorted(stale, key=lambda pair: (-pair[0], pair[1]["keys"][0]))
+    ]
+    counts = report["candidate_counts"]
+    counts["stale"] = len(candidates)
+
+    collisions = []
+    for key in sorted(k for k, group in by_key.items() if len(group) > 1):
+        group = by_key[key]
+        collisions.append({
+            "reason": "key_collision", "keys": [clip(key)],
+            "evidence": {
+                "active_rows": len(group),
+                "memories": [
+                    {"memory_id": int(r[0]), "value": clip(r[2])} for r in group[:5]
+                ],
+            },
+        })
+    counts["key_collision"] = len(collisions)
+    candidates.extend(collisions)
+
+    duplicates: dict[tuple[int, int], dict[str, Any]] = {}
+    comparisons = 0
+    for tag in sorted(by_tag):
+        group = by_tag[tag]
+        for i, (row_a, tokens_a) in enumerate(group):
+            for row_b, tokens_b in group[i + 1:]:
+                if comparisons >= _MEMORY_REVIEW_COMPARISON_CAP:
+                    report["truncated"] = True
+                    break
+                comparisons += 1
+                if str(row_a[1]) == str(row_b[1]):
+                    continue
+                smaller, larger = sorted((len(tokens_a), len(tokens_b)))
+                if smaller / larger < _MEMORY_REVIEW_JACCARD:
+                    continue
+                jaccard = len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
+                if jaccard < _MEMORY_REVIEW_JACCARD:
+                    continue
+                pair = tuple(sorted((int(row_a[0]), int(row_b[0]))))
+                entry = duplicates.get(pair)
+                if entry is None:
+                    first, second = (row_a, row_b) if int(row_a[0]) < int(row_b[0]) else (row_b, row_a)
+                    duplicates[pair] = {
+                        "reason": "near_duplicate", "keys": [clip(first[1]), clip(second[1])],
+                        "evidence": {
+                            "jaccard": round(jaccard, 3), "shared_tags": [tag],
+                            "memory_ids": [int(first[0]), int(second[0])],
+                            "values": [clip(first[2]), clip(second[2])],
+                        },
+                    }
+                else:
+                    entry["evidence"]["shared_tags"].append(tag)
+    ordered_duplicates = [duplicates[pair] for pair in sorted(duplicates)]
+    counts["near_duplicate"] = len(ordered_duplicates)
+    candidates.extend(ordered_duplicates)
+
+    report["candidates"] = candidates[:limit]
+    report["candidates_omitted"] = max(0, len(candidates) - limit)
+    report["truncated"] = report["truncated"] or value_truncated
+    while report["candidates"] and len(
+        json.dumps(report, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ) > _MEMORY_REVIEW_MAX_BYTES:
+        report["candidates"].pop()
+        report["candidates_omitted"] += 1
+        report["truncated"] = True
+    return report
+
+
+def memory_review_report(*, limit: int = 20, stale_days: int = 90) -> dict[str, Any]:
+    def _review(ctx: worker_tools.WorkerToolContext) -> dict[str, Any]:
+        if not feature_settings.enabled(ctx.authority_repo, "ai_memory"):
+            return feature_settings.disabled_result("ai_memory")
+        try:
+            binding = worker_tools._resolve_authority_db(ctx, component="memory", db_id="memory")
+            con = worker_tools._open_readonly_db(binding.db_path, tool="ai_memory_review")
+        except worker_tools.WorkerToolError as exc:
+            return {"ok": False, "error": str(exc)[:160]}
+        try:
+            return memory_review_from_connection(con, limit=limit, stale_days=stale_days)
+        except sqlite3.Error as exc:
+            return {"ok": False, "error": f"memory_review_query_failed:{exc}"[:160]}
+        finally:
+            con.close()
+
+    return _invoke(_review)
 
 
 def kb_search(*, query: str, limit: int = 8) -> dict[str, Any]:

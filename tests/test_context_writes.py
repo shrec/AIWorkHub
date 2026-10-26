@@ -585,3 +585,141 @@ def test_memory_write_legacy_not_null_timestamps_other_column_error(tmp_path: Pa
         "context_write_integrity_error:component=memory:action=remember:column=memories.owner_id"
         in str(excinfo.value)
     )
+
+
+def _memory_columns(db: Path) -> list[str]:
+    con = sqlite3.connect(db)
+    try:
+        return [row[1] for row in con.execute("PRAGMA table_info(memories)")]
+    finally:
+        con.close()
+
+
+def _normalize(db: Path) -> None:
+    con = sqlite3.connect(db)
+    try:
+        context_writes._normalize_memory_schema(con)
+    finally:
+        con.close()
+
+
+def _memory_ts_rows(db: Path) -> list[tuple]:
+    con = sqlite3.connect(db)
+    try:
+        return con.execute("SELECT key,created_at,updated_at FROM memories ORDER BY id").fetchall()
+    finally:
+        con.close()
+
+
+def test_normalize_adds_nullable_timestamp_columns_and_keeps_legacy_rows_null(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    db = _replace_memories_table(
+        repo,
+        "CREATE TABLE memories(id INTEGER PRIMARY KEY,key TEXT,value TEXT,tags TEXT,scope TEXT);"
+        "INSERT INTO memories(key,value,tags,scope) VALUES('legacy.k','old','t','project');",
+    )
+    assert "created_at" not in _memory_columns(db)
+
+    _normalize(db)
+
+    assert {"created_at", "updated_at"} <= set(_memory_columns(db))
+    assert _memory_ts_rows(db) == [("legacy.k", None, None)]
+
+
+def test_normalize_timestamp_columns_twice_is_a_no_op(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    db = _replace_memories_table(
+        repo,
+        "CREATE TABLE memories(id INTEGER PRIMARY KEY,key TEXT,value TEXT,tags TEXT,scope TEXT);"
+        "INSERT INTO memories(key,value,tags,scope) VALUES('legacy.k','old','t','project');",
+    )
+    _normalize(db)
+    first = (_memory_columns(db), _memory_ts_rows(db))
+
+    _normalize(db)
+
+    assert (_memory_columns(db), _memory_ts_rows(db)) == first
+
+
+def test_memory_write_sets_timestamps_on_a_normalized_legacy_store(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    db = _replace_memories_table(
+        repo,
+        "CREATE TABLE memories(id INTEGER PRIMARY KEY,key TEXT,value TEXT,tags TEXT,scope TEXT);",
+    )
+    base = dict(actor=_actor(), provenance="timestamp regression")
+
+    context_writes.memory_write(repo, **base, action="remember", key="a", value="one",
+                                idempotency_key="memory:ts:0001")
+    created = _memory_ts_rows(db)[0]
+    assert created[1] and created[2] and created[1] == created[2]
+
+    context_writes.memory_write(repo, **base, action="update", key="a", value="two",
+                                idempotency_key="memory:ts:0002")
+    updated = _memory_ts_rows(db)[0]
+    assert updated[1] == created[1]
+    assert updated[2] >= created[2]
+
+    context_writes.memory_write(repo, **base, action="supersede", key="a", value="three",
+                                idempotency_key="memory:ts:0003")
+    rows = _memory_ts_rows(db)
+    assert len(rows) == 2
+    assert rows[1][1] and rows[1][2]
+
+
+def test_memory_update_bumps_only_updated_at(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    db = _replace_memories_table(
+        repo,
+        "CREATE TABLE memories(id INTEGER PRIMARY KEY,key TEXT,value TEXT,tags TEXT,scope TEXT);",
+    )
+    base = dict(actor=_actor(), provenance="timestamp regression")
+    context_writes.memory_write(repo, **base, action="remember", key="a", value="one",
+                                idempotency_key="memory:ts:0011")
+    con = sqlite3.connect(db)
+    try:
+        con.execute("UPDATE memories SET created_at='2020-01-01T00:00:00+00:00',"
+                    "updated_at='2020-01-01T00:00:00+00:00'")
+        con.commit()
+    finally:
+        con.close()
+
+    context_writes.memory_write(repo, **base, action="update", key="a", value="two",
+                                idempotency_key="memory:ts:0012")
+
+    (_key, created_at, updated_at), = _memory_ts_rows(db)
+    assert created_at == "2020-01-01T00:00:00+00:00"
+    assert updated_at > created_at
+
+
+def test_unique_key_store_migration_preserves_existing_timestamps(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    db = _replace_memories_table(
+        repo,
+        "CREATE TABLE memories(id INTEGER PRIMARY KEY,key TEXT UNIQUE,value TEXT,tags TEXT,"
+        "scope TEXT,created_at TEXT,updated_at TEXT);"
+        "INSERT INTO memories(key,value,tags,scope,created_at,updated_at) "
+        "VALUES('k1','v','t','project','2024-01-01T00:00:00+00:00','2024-02-02T00:00:00+00:00');"
+        "INSERT INTO memories(key,value,tags,scope) VALUES('k2','v','t','project');",
+    )
+
+    _normalize(db)
+
+    assert _memory_ts_rows(db) == [
+        ("k1", "2024-01-01T00:00:00+00:00", "2024-02-02T00:00:00+00:00"),
+        ("k2", None, None),
+    ]
+
+
+def test_unique_key_store_without_timestamps_migrates_to_null_columns(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    db = _replace_memories_table(
+        repo,
+        "CREATE TABLE memories(id INTEGER PRIMARY KEY,key TEXT UNIQUE,value TEXT,tags TEXT,scope TEXT);"
+        "INSERT INTO memories(key,value,tags,scope) VALUES('k1','v','t','project');",
+    )
+
+    _normalize(db)
+
+    assert {"created_at", "updated_at"} <= set(_memory_columns(db))
+    assert _memory_ts_rows(db) == [("k1", None, None)]
