@@ -13,14 +13,20 @@ import tempfile
 import textwrap
 import time
 import unicodedata
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
 from . import semantic_edit
 from .platform_io import current_user_uid
 from .vscode_lm_activity import ActivityCaptureError, ActivityReader
-from .runtime_adapters import EDITOR_REQUESTED_MODEL_RE
+from .runtime_adapters import (
+    EDITOR_REQUESTED_MODEL_RE,
+    NAIVE_RESET_ASSUMED_UTC_OFFSET,
+    OUTCOME_PROVIDER_REFUSED,
+    REFUSAL_QUOTA_EXHAUSTED,
+    classify_provider_outcome,
+)
 from .semantic_edit import coerce_protocol_line
 from .vscode_lm_bridge import (
     EDIT_RESPONSE_SCHEMA_ID,
@@ -74,14 +80,18 @@ _CREDIT_RESET_RE = re.compile(
 # conservative reading is the LATEST instant that wall time can denote, i.e.
 # the westernmost civil offset UTC-12:00: the route is then never re-admitted
 # before the provider could actually have reset, only (at most ~26 h) after.
-_RESET_ASSUMED_UTC_OFFSET = timedelta(hours=-12)
+_RESET_ASSUMED_UTC_OFFSET = NAIVE_RESET_ASSUMED_UTC_OFFSET
 
 
 class VscodeLmProviderRefusal(RuntimeError):
     """A structured provider refusal read from the host-owned response field."""
 
-    def __init__(self, provider_error: dict[str, Any]) -> None:
-        super().__init__(VSCODE_LM_PROVIDER_BALANCE_EXHAUSTED)
+    def __init__(
+        self,
+        provider_error: dict[str, Any],
+        message: str = VSCODE_LM_PROVIDER_BALANCE_EXHAUSTED,
+    ) -> None:
+        super().__init__(message)
         self.provider_error = provider_error
 
 
@@ -121,6 +131,54 @@ def provider_balance_error(response_error: Any) -> dict[str, Any] | None:
         "detail": text[:300],
     }
     if reset_at:
+        sealed["reset_at"] = reset_at
+        sealed["reset_timezone_assumed"] = "UTC-12:00"
+    return sealed
+
+
+def provider_quota_error(response_error: Any) -> dict[str, Any] | None:
+    """Return the structured provider error for a GLM code-1308 usage limit, or None.
+
+    ``response_error`` must be the extension host's own ``response["error"]``
+    value, shaped ``<prose> <json object>`` where the object's ``code`` is the
+    provider's ``1308``.  Free prose without that provider code selects nothing.
+    The refusal kind and the reset instant come from the shared
+    ``runtime_adapters.classify_provider_outcome`` so there is one vocabulary and
+    one reset parser; a reset naming no parseable instant leaves ``reset_at``
+    absent rather than guessed.
+    """
+
+    if not isinstance(response_error, str):
+        return None
+    text = response_error.strip()
+    brace = text.find("{")
+    if brace <= 0:
+        return None
+    try:
+        body = json.loads(text[brace:])
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        return None
+    if not isinstance(body, dict) or str(body.get("code") or "").strip() != "1308":
+        return None
+    outcome = classify_provider_outcome(exit_code=1, message=text)
+    if (
+        outcome.get("outcome") != OUTCOME_PROVIDER_REFUSED
+        or outcome.get("refusal_kind") != REFUSAL_QUOTA_EXHAUSTED
+        or not outcome.get("recoverable")
+    ):
+        return None
+    sealed: dict[str, Any] = {
+        "schema_id": PROVIDER_ROUTE_ERROR_SCHEMA_ID,
+        "owner": "provider",
+        "sealed": True,
+        "source": PROVIDER_ERROR_SOURCE,
+        "code": "quota_exhausted",
+        "provider_code": "1308",
+        "http_status": 429,
+        "detail": text[:300],
+    }
+    reset_at = outcome.get("reset_at")
+    if isinstance(reset_at, str) and reset_at:
         sealed["reset_at"] = reset_at
         sealed["reset_timezone_assumed"] = "UTC-12:00"
     return sealed
@@ -1557,6 +1615,11 @@ def run(spec_path: Path) -> dict[str, Any]:
         balance_error = provider_balance_error(response.get("error"))
         if balance_error is not None:
             raise VscodeLmProviderRefusal(balance_error)
+        quota_error = provider_quota_error(response.get("error"))
+        if quota_error is not None:
+            raise VscodeLmProviderRefusal(
+                quota_error, f"vscode_lm_request_failed:{response.get('error')}"
+            )
         diagnostics = response.get("diagnostics")
         detail = ""
         if isinstance(diagnostics, dict):

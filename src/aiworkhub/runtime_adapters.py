@@ -2860,6 +2860,7 @@ _QUOTA_TOKENS: tuple[str, ...] = (
     "insufficient quota",
     "quota exceeded",
     "quota exhausted",
+    "usage limit reached",
 )
 _RATE_TOKENS: tuple[str, ...] = (
     "rate limit",
@@ -2931,7 +2932,9 @@ def provider_body_names_cause(text: str) -> bool:
     """
 
     normalized = _normalize_cause_text(text)
-    return any(token in normalized for token in _LAUNCH_REFUSAL_BODY_TOKENS)
+    return _names_quota(normalized) or any(
+        token in normalized for token in _LAUNCH_REFUSAL_BODY_TOKENS
+    )
 
 _RETRY_AFTER_RE = re.compile(
     r"retry[\s_-]*after[\s:=]*([0-9]+)\s*(?:s|sec|secs|seconds)?", re.IGNORECASE
@@ -3019,6 +3022,45 @@ def _wall_clock_reset_at(text: str, now: datetime | None) -> str | None:
     return candidate.astimezone(timezone.utc).isoformat()
 
 
+# A provider that prints ``reset at 2026-10-17 06:35:11`` names a wall-clock
+# time and NO zone (NF-2026-01586, GLM code 1308).  ASSUMPTION: the westernmost
+# civil offset, UTC-12:00, which is the LATEST instant that wall time can
+# denote, so a route circuit opened until that reset is never re-admitted
+# before the provider could really have reset -- only (at most ~26 h) after.
+# A stamp that is not a real calendar time names no instant and stays ``None``.
+NAIVE_RESET_ASSUMED_UTC_OFFSET = timedelta(hours=-12)
+_RESET_AT_NAIVE_RE = re.compile(
+    r"resets?(?:\s+at)?\s+(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})(?![0-9TZ:.+-])",
+    re.IGNORECASE,
+)
+# Provider machine code 1308 is GLM's "Usage limit reached for <window>" quota.
+_USAGE_LIMIT_CODE_RE = re.compile(r'"code"\s*:\s*"?1308"?(?![0-9])')
+
+
+def _names_quota(normalized: str) -> bool:
+    """True when normalised provider text names a usage-quota exhaustion."""
+
+    return any(token in normalized for token in _QUOTA_TOKENS) or bool(
+        _USAGE_LIMIT_CODE_RE.search(normalized)
+    )
+
+
+def _naive_reset_at(text: str) -> str | None:
+    """Resolve a zone-less ``reset at YYYY-MM-DD HH:MM:SS`` to UTC, else ``None``."""
+
+    match = _RESET_AT_NAIVE_RE.search(text)
+    if match is None:
+        return None
+    try:
+        wall = datetime.strptime(
+            f"{match.group(1)} {match.group(2)}", "%Y-%m-%d %H:%M:%S"
+        )
+    except ValueError:
+        return None
+    local = wall.replace(tzinfo=timezone(NAIVE_RESET_ASSUMED_UTC_OFFSET))
+    return local.astimezone(timezone.utc).isoformat()
+
+
 def _reset_window(
     text: str, now: datetime | None = None
 ) -> tuple[int | None, str | None]:
@@ -3037,7 +3079,7 @@ def _reset_window(
     if reset:
         reset_at = reset.group(1)
     else:
-        reset_at = _wall_clock_reset_at(text, now)
+        reset_at = _naive_reset_at(text) or _wall_clock_reset_at(text, now)
     return retry_after, reset_at
 
 
@@ -3063,7 +3105,7 @@ def _refusal_kind(lowered: str, status_code: int | None) -> str | None:
         return REFUSAL_SESSION_LIMIT
     if any(token in normalized for token in _BALANCE_TOKENS):
         return REFUSAL_BALANCE_EXHAUSTED
-    if any(token in normalized for token in _QUOTA_TOKENS):
+    if _names_quota(normalized):
         return REFUSAL_QUOTA_EXHAUSTED
     if any(token in normalized for token in _RATE_TOKENS):
         return REFUSAL_RATE_LIMITED

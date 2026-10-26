@@ -554,6 +554,7 @@ def _provider_timeout_failure_from_output(path: Path) -> dict[str, Any] | None:
 # ``vscode_lm_worker``'s own structured provider refusal (NF-2026-01036), named
 # rather than imported so this module keeps its import graph unchanged.
 _VSCODE_LM_BALANCE_EXHAUSTED = "vscode_lm_provider_balance_exhausted"
+_VSCODE_LM_REQUEST_FAILED_PREFIX = "vscode_lm_request_failed:"
 _VSCODE_LM_PROVIDER_ERROR_SOURCE = "vscode_lm_extension_response"
 _VSCODE_LM_BALANCE_CODES: frozenset[str] = frozenset({
     "insufficient_balance", "quota_exhausted",
@@ -593,11 +594,17 @@ def _vscode_lm_balance_failure_from_output(path: Path) -> dict[str, Any] | None:
             continue
         if not isinstance(event, dict):
             continue
+        error_text = str(event.get("error") or "").strip()
+        # NF-2026-01586: GLM code 1308 reaches the launcher as the worker's own
+        # ``vscode_lm_request_failed:<host body>`` wrapper PLUS a sealed
+        # provider_error whose provider_code is exactly 1308.  The wrapper alone
+        # (or any prose) is not enough; the sealed object is what is trusted.
+        quota_wrapper = error_text.startswith(_VSCODE_LM_REQUEST_FAILED_PREFIX)
         if not (
             event.get("type") == "result"
             and event.get("is_error") is True
             and str(event.get("subtype") or "").strip().lower() == "error"
-            and str(event.get("error") or "").strip() == _VSCODE_LM_BALANCE_EXHAUSTED
+            and (error_text == _VSCODE_LM_BALANCE_EXHAUSTED or quota_wrapper)
         ):
             continue
         body = event.get("provider_error")
@@ -611,6 +618,11 @@ def _vscode_lm_balance_failure_from_output(path: Path) -> dict[str, Any] | None:
             continue
         code = str(body.get("code") or "").strip().lower()
         if code not in _VSCODE_LM_BALANCE_CODES:
+            continue
+        if quota_wrapper and (
+            code != "quota_exhausted"
+            or str(body.get("provider_code") or "").strip() != "1308"
+        ):
             continue
         reset_at = ""
         raw_reset = body.get("reset_at")
@@ -627,13 +639,30 @@ def _vscode_lm_balance_failure_from_output(path: Path) -> dict[str, Any] | None:
             "sealed": True,
             "source": _VSCODE_LM_PROVIDER_ERROR_SOURCE,
             "code": next(item for item in _VSCODE_LM_BALANCE_CODES if item == code),
-            "http_status": 402,
+            "http_status": 429 if quota_wrapper else 402,
             "detail": str(body.get("detail") or "")[:300],
         }
+        if quota_wrapper:
+            sealed["provider_code"] = "1308"
         if reset_at:
             sealed["reset_at"] = reset_at
             if body.get("reset_timezone_assumed") == "UTC-12:00":
                 sealed["reset_timezone_assumed"] = "UTC-12:00"
+        if quota_wrapper:
+            return {
+                "schema_id": "aiworkhub.provider_launch_failure.v1",
+                "reason": (
+                    "provider_refused_quota_exhausted_recoverable_after_reported_window"
+                    if reset_at
+                    else "provider_refused_quota_exhausted_recoverable_but_reset_window_unreported"
+                ),
+                "refusal_kind": runtime_adapters.REFUSAL_QUOTA_EXHAUSTED,
+                "recoverable": True,
+                "http_status": 429,
+                "error_code": str(sealed["code"]),
+                "session_id": "",
+                "provider_error": sealed,
+            }
         return {
             "schema_id": "aiworkhub.provider_launch_failure.v1",
             "reason": (
