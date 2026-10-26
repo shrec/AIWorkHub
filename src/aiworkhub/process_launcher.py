@@ -78,6 +78,7 @@ from .process_launcher_acceptance import finished_acceptance_result as _finished
 from .process_launcher_accept_review import _accept_manager_identity as _calling_manager_identity
 from .process_launcher_accept_review import accept_preview as _accept_preview_impl
 from .process_launcher_accept_review import accept_review as _accept_review_impl
+from .process_launcher_husk_gc import gc_husk_without_metadata
 from .process_launcher_launch_isolated import launch_isolated as _launch_isolated_impl
 from .process_launcher_launch_isolated import relaunch_input_paths as _relaunch_input_paths
 from .process_launcher_launch_isolated import spawn_with_stdin_payload as _spawn_with_stdin_payload
@@ -10587,10 +10588,10 @@ class ProcessManager:
 
             metadata_raw = latest.get("metadata_path")
             if not metadata_raw:
-                return {"request_id": request_id, "gc": False, "reason": "metadata_path_missing"}
+                return gc_husk_without_metadata(self, request_id, latest, "metadata_path_missing")
             metadata_path = Path(str(metadata_raw))
             if not metadata_path.is_file():
-                return {"request_id": request_id, "gc": False, "reason": "metadata_missing"}
+                return gc_husk_without_metadata(self, request_id, latest, "metadata_missing")
             try:
                 metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
                 workspace_meta = metadata["workspace"]

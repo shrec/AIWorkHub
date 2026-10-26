@@ -6618,6 +6618,60 @@ def create_quality_review_workspace(
         raise
 
 
+def is_workspace_husk(path: Path, home: Path | None = None) -> bool:
+    """True only for a worktree directory that holds nothing but crash dumps.
+
+    A husk is a real directory with no ``.git`` whose entries are all regular
+    ``*.stackdump`` files (what a crashed MSYS process leaves behind).  When
+    ``home`` is given it must also be absent or an empty real directory.
+    Symlinks and reparse points, subdirectories, any other entry, a missing
+    ``path`` and an unreadable or oversized listing all fail closed to False.
+    """
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    limit = 64
+
+    def listing(directory: Path) -> list[os.DirEntry[str]] | None:
+        entries: list[os.DirEntry[str]] = []
+        try:
+            info = os.lstat(directory)
+            if not stat.S_ISDIR(info.st_mode) or (
+                getattr(info, "st_file_attributes", 0) & reparse
+            ):
+                return None
+            with os.scandir(directory) as scan:
+                for entry in scan:
+                    entries.append(entry)
+                    if len(entries) > limit:
+                        return None
+        except OSError:
+            return None
+        return entries
+
+    entries = listing(path)
+    if entries is None:
+        return False
+    for entry in entries:
+        try:
+            info = entry.stat(follow_symlinks=False)
+        except OSError:
+            return False
+        if (
+            not entry.name.endswith(".stackdump")
+            or not stat.S_ISREG(info.st_mode)
+            or getattr(info, "st_file_attributes", 0) & reparse
+        ):
+            return False
+    if home is None:
+        return True
+    try:
+        os.lstat(home)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return listing(home) == []
+
+
 def assert_gc_safe_workspace_shape(
     request_id: str,
     path: Path,

@@ -9277,7 +9277,9 @@ def _verified_retained_predecessor_receipt(
 
     if workspace.path.is_symlink():
         return None, "reroute_retained_candidate_workspace_invalid"
-    if workspace.path.is_dir():
+    # A husk holds no candidate bytes: treat it as absent so the sealed delta stands in.
+    husk = worker_workspace.is_workspace_husk(workspace.path)
+    if workspace.path.is_dir() and not husk:
         try:
             observed_paths = worker_workspace.changed_paths(
                 workspace, git_phase="reroute_retained_candidate"
@@ -9290,7 +9292,7 @@ def _verified_retained_predecessor_receipt(
         ):
             return None, "reroute_retained_candidate_workspace_unverifiable"
         verification_error = verify_candidate(workspace.path, observed_paths)
-    elif workspace.path.exists():
+    elif workspace.path.exists() and not husk:
         return None, "reroute_retained_candidate_workspace_invalid"
     elif sealed_delta:
         try:
