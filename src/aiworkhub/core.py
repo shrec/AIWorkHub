@@ -6496,6 +6496,61 @@ def _validate_allowed_writes_amendment_paths(
     return None
 
 
+_READ_FIRST_ENTRY = re.compile(r"^(?P<path>.+?)(?::\d+(?:-\d+)?)?$")
+
+
+def _under_reserved_write_root(rel_posix_lower: str) -> bool:
+    return any(
+        rel_posix_lower == reserved or rel_posix_lower.startswith(f"{reserved}/")
+        for reserved in _AMENDMENT_RESERVED_WRITE_ROOTS
+    )
+
+
+def _validate_read_first_amendment_paths(
+    paths: list[str],
+) -> tuple[list[str], dict[str, Any] | None]:
+    """Validate read_first entries (existing repo file, optional ``:N`` / ``:N-M`` suffix).
+
+    Returns ``(validated_entries, None)`` or ``([], refusal)``; callers must store the returned entries.
+    """
+
+    def refuse(entry: str) -> tuple[list[str], dict[str, Any] | None]:
+        result = _lifecycle_error("read_first_amendment_invalid", 2)
+        result["read_first_entry"] = entry[:240]
+        return [], result
+
+    try:
+        entries = bounded_strings(paths, "read_first_amendment", required=True)
+    except ValueError:
+        return [], _lifecycle_error("read_first_amendment_invalid", 2)
+    root = repo_root()
+    for item in entries:
+        match = _READ_FIRST_ENTRY.match(item)
+        rel = match.group("path") if match else ""
+        # Path.is_absolute() depends on the host OS; the card outlives the host.
+        portable = PurePosixPath(rel.replace("\\", "/"))
+        if (
+            not rel
+            or "\x00" in item
+            or portable.is_absolute()
+            or PureWindowsPath(rel).is_absolute()
+            or PureWindowsPath(rel).drive
+            or ".." in portable.parts
+        ):
+            return refuse(item)
+        if _under_reserved_write_root(portable.as_posix().lower()):
+            return refuse(item)
+        try:
+            target = (root / portable).resolve()
+            resolved_rel = target.relative_to(root.resolve()).as_posix().lower()
+            exists = target.is_file()
+        except (OSError, ValueError):
+            return refuse(item)
+        if _under_reserved_write_root(resolved_rel) or not exists:
+            return refuse(item)
+    return list(entries), None
+
+
 def reject_review(
     task_id: str,
     reason: str,
@@ -6506,6 +6561,7 @@ def reject_review(
     failure_category: str | None = None,
     validation_amendment: list[str] | None = None,
     allowed_writes_amendment: list[str] | None = None,
+    read_first_amendment: list[str] | None = None,
 ) -> dict[str, Any]:
     card, error = _live_card(task_id)
     if error:
@@ -6545,6 +6601,16 @@ def reject_review(
         )
         if amendment_paths_error is not None:
             return amendment_paths_error
+    read_first_paths = read_first_amendment or []
+    validated_read_first: list[str] = []
+    if read_first_paths:
+        if disposition != "pending":
+            return _lifecycle_error("read_first_amendment_requires_pending")
+        validated_read_first, read_first_error = _validate_read_first_amendment_paths(
+            read_first_paths
+        )
+        if read_first_error is not None:
+            return read_first_error
     actor = _verified_manager_actor()
     blocked = _canonical_write_gate(
         "reject-review", runner=CODEX_RUNNER, topic=str(live_topic), coordinator_capability=True
@@ -7158,6 +7224,21 @@ def reject_review(
             command=command,
         )
     try:
+        applied_read_first_amendment = (
+            task_store.apply_read_first_amendment(
+                card, validated_read_first, actor=actor, request_id=rejected_request_id
+            )
+            if read_first_paths
+            else []
+        )
+    except ValueError as exc:
+        return _canonical_result(
+            ok=False,
+            returncode=1,
+            stderr=f"invalid_read_first_amendment:{exc}",
+            command=command,
+        )
+    try:
         conn = _canonical_connect()
     except task_store.TaskStoreError as exc:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
@@ -7219,6 +7300,8 @@ def reject_review(
         result["validation_amendment_applied"] = applied_validation_amendment
     if amendment_paths:
         result["allowed_writes_amendment_applied"] = applied_allowed_writes_amendment
+    if applied_read_first_amendment:
+        result["read_first_amendment_applied"] = applied_read_first_amendment
     if rework_delta_reuse_error is not None:
         result["rework_delta_recovery"] = {
             "schema_id": "aiworkhub.rework_delta_recovery.v1",

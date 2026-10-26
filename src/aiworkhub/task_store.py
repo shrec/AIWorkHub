@@ -5363,18 +5363,65 @@ def apply_allowed_writes_amendment(
     from . import task_templates
     if len(writes_list) > task_templates.MAX_PATHS_PER_FIELD:
         raise ValueError("allowed_writes_amendment_exceeds_limit")
-    if applied:
-        amendments = card.get("allowed_writes_amendments")
-        amendment_list = list(amendments) if isinstance(amendments, list) else []
-        amendment_list.append({
-            "paths": list(applied),
-            "actor": actor,
-            "request_id": request_id,
-            "at": datetime.now(timezone.utc).isoformat(),
-        })
-        card["allowed_writes"] = writes_list
-        card["allowed_writes_amendments"] = amendment_list
+    _commit_path_amendment(
+        card, "allowed_writes", writes_list, applied, actor=actor, request_id=request_id
+    )
     return applied
+
+
+def apply_read_first_amendment(
+    card: dict[str, Any],
+    paths: list[str],
+    *,
+    actor: str,
+    request_id: str,
+) -> list[str]:
+    """Add-only append to read_first, deduped by exact string; records actor and request_id."""
+    if not paths:
+        return []
+    existing = card.get("read_first")
+    read_first_list = list(existing) if isinstance(existing, list) else []
+    seen = set(read_first_list)
+    applied: list[str] = []
+    for raw in paths:
+        path = str(raw or "").strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        read_first_list.append(path)
+        applied.append(path)
+    from . import task_templates
+    if len(read_first_list) > task_templates.MAX_PATHS_PER_FIELD:
+        raise ValueError("read_first_amendment_exceeds_limit")
+    _commit_path_amendment(
+        card, "read_first", read_first_list, applied, actor=actor, request_id=request_id
+    )
+    return applied
+
+
+def _commit_path_amendment(
+    card: dict[str, Any],
+    field: str,
+    merged: list[str],
+    applied: list[str],
+    *,
+    actor: str,
+    request_id: str,
+) -> None:
+    """Store ``merged`` under ``field`` and append a ``<field>_amendments`` history entry."""
+    if not applied:
+        return
+    history_key = f"{field}_amendments"
+    history = card.get(history_key)
+    history_list = list(history) if isinstance(history, list) else []
+    history_list.append({
+        "paths": list(applied),
+        "actor": actor,
+        "request_id": request_id,
+        "at": datetime.now(timezone.utc).isoformat(),
+    })
+    card[field] = merged
+    card[history_key] = history_list
 
 
 def _candidate_path_in_scope(path: object, allowed_writes: Sequence[object]) -> bool:

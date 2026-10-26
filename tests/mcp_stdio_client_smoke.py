@@ -156,6 +156,9 @@ WRITE_GATED_TOOLS: tuple[str, ...] = (
 # close-out ``lesson_candidate`` / ``no_new_lesson_reason`` /
 # ``promote_ai_memory`` / ``extra_evidence_ids`` (0aa1c18d) -- all additive with
 # defaults; caught by the 0.12.67 release pre-check.
+#
+# RE-FROZEN again, one tool: ``aiworkhub_task_reject_review`` gained the optional
+# ``read_first_amendment`` (NF-2026-01440) -- additive, default None.
 FROZEN_SCHEMA_FINGERPRINTS: dict[str, str] = {
     "aiworkhub_agent_cancel_task": "f1d9792f94307639105434caa381c54857d7c292dab122b4cd4e9333dd0552f3",
     "aiworkhub_agent_collect_result": "c291cac06bc81689a1b0df1357facb97c5806fefd0a447ef3245e38976077a3f",
@@ -184,7 +187,7 @@ FROZEN_SCHEMA_FINGERPRINTS: dict[str, str] = {
     "aiworkhub_task_mark_review": "1722a2665425d2ebd8573c3425ee2d04b8c71ae3db24ace3c97e5a82d7e92bd4",
     "aiworkhub_task_pending_for_runner": "864d85c9f3a5a7020e270ddd71f9aeea2ab65ca35932aaf869afaa837950b16d",
     "aiworkhub_task_queue_request": "2c43bb4347d3806b3f373390c95cfc7c4f398b4404860ff4a1722269edeb7fa5",
-    "aiworkhub_task_reject_review": "c22e300c2fae0cf7ed91ce8ab79178f863619256117af2eae21165c5d43579c6",
+    "aiworkhub_task_reject_review": "4cf83686cb3dd370b2ac67e9198de0361ca060ce80274ff47de7e773400597f8",
     "aiworkhub_task_review_queue": "b5728f6f46c22488977fe80e794f420203cf6725367eb9271cfdad1c6538b878",
     "aiworkhub_task_review_summarize": "e535208ce91e843357bb2efb237b656c50ad1a0b4e1be4111c9ae2356c647e01",
     "aiworkhub_task_show": "987a6779aea9974dc849205292e41e5fab2443e04e97f3c2528059a6b60c4ad3",

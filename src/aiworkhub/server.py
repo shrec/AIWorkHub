@@ -3978,6 +3978,7 @@ def aiworkhub_task_reject_review(
     failure_category: InfrastructureFailureCategory | None = None,
     validation_amendment: list[str] | None = None,
     allowed_writes_amendment: list[str] | None = None,
+    read_first_amendment: list[str] | None = None,
     include_card: CardInclude = "none",
     lesson_candidate: str | None = None,
     promote_ai_memory: bool = False,
@@ -3999,6 +4000,10 @@ def aiworkhub_task_reject_review(
 
     ``allowed_writes_amendment`` (a list of repo-relative paths) widens the
     card's ``allowed_writes`` add-only and is accepted only with ``to=pending``.
+
+    ``read_first_amendment`` (a list of existing repo files, each optionally
+    suffixed ``:N`` or ``:N-M``) appends to the card's ``read_first`` add-only
+    and is accepted only with ``to=pending``.
 
     ``reason`` is capped at 8000 UTF-8 bytes after strip; over it the call is
     refused with ``reject_reason_too_large:<bytes>><cap>`` and nothing changes.
@@ -4033,6 +4038,7 @@ def aiworkhub_task_reject_review(
         failure_category: Infrastructure cause when the review machinery failed rather than the candidate code (validation_environment, provider_runtime, dependency_or_route or cancellation_or_timeout); used with to=blocked, and to=pending is also accepted.
         validation_amendment: Validation commands to amend the reworked card with, checked by the same rules as validation on aiworkhub_task_create, e.g. pytest -q tests/test_target.py; omit for no amendment.
         allowed_writes_amendment: Repo-relative paths to add to the card's allowed_writes (add-only); only with to=pending, otherwise refused with allowed_writes_amendment_requires_pending.
+        read_first_amendment: Existing repo files, each optionally suffixed :N or :N-M, to add to the card's read_first (add-only, deduplicated); only with to=pending, otherwise refused with read_first_amendment_requires_pending; an absolute, .., .git, .aiworkhub/runtime or missing path is refused with read_first_amendment_invalid.
         include_card: Card view to attach to the receipt: none (default), summary (baselines and evidence folded) or full (the exact post-transition card).
         lesson_candidate: Lesson text to commit for this decision in the same call, after the reject lands; omit to commit the lesson separately.
         promote_ai_memory: Set true together with lesson_candidate to also promote the lesson to AI memory; refused without a lesson. Default false.
@@ -4061,6 +4067,8 @@ def aiworkhub_task_reject_review(
         kwargs["validation_amendment"] = validation_amendment
     if allowed_writes_amendment:
         kwargs["allowed_writes_amendment"] = allowed_writes_amendment
+    if read_first_amendment:
+        kwargs["read_first_amendment"] = read_first_amendment
     result = core.reject_review(**kwargs)
     card = _envelope_card(result)
     extra = (
