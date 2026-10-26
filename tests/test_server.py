@@ -101,9 +101,11 @@ print("closed startup unchanged")
         env = dict(os.environ, AIWORKHUB_ALLOW_WRITES="0", PYTHONPATH=child_path)
         env["AIWORKHUB_MCP_STDIO_BACKEND"] = backend
         argv = [sys.executable] + (["-S"] if backend == "stdlib" else [])
+        # Child startup slows with xdist load, so the budget scales with core count (NF-2026-01710).
+        child_timeout_s = 30 * max(1, min(os.cpu_count() or 1, 16))
         result = subprocess.run(
             argv + ["-c", script, str(tmp_path / backend)], env=env,
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=child_timeout_s,
         )
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == "closed startup unchanged"

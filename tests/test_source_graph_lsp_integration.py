@@ -1599,6 +1599,12 @@ def test_server_failure_is_not_cached_and_recovers_on_the_next_run(
     _assert_classified(health)
 
     fixture.fail(CALL_KEY, None)
+    # The failing run needs the short timeout to classify a hang; the recovery run
+    # is a healthy server, so under xdist load it gets a budget scaled by core count
+    # (NF-2026-01710). A healthy reply returns at once, so the larger budget costs nothing.
+    recovery_request_s = 5.0 * max(1, min(os.cpu_count() or 1, 32))
+    monkeypatch.setattr(sg, "LSP_REQUEST_TIMEOUT_S", recovery_request_s)
+    monkeypatch.setattr(sg, "LSP_BATCH_TIMEOUT_S", recovery_request_s * 10)
     asked_before = len(fixture.asked())
     recovered = fixture.index("a.py")
 
