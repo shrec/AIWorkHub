@@ -7360,8 +7360,15 @@ def recover_blocked_rework(
     clean_root_if_predecessor_missing: bool = False,
     validation_amendment: list[str] | None = None,
     scope_rejection_resolved: bool = False,
+    allowed_writes_amendment: list[str] | None = None,
 ) -> dict[str, Any]:
     """Recover one exact blocked task through the canonical task-store transaction."""
+    amendment_paths = allowed_writes_amendment or []
+    if amendment_paths and validation_only_replay:
+        # NF-2026-01701: a replay keeps the exact sealed scope.
+        return _lifecycle_error(
+            "allowed_writes_amendment_conflicts_with_validation_only_replay"
+        )
     card, error = _live_card(task_id)
     if error:
         return error
@@ -7378,6 +7385,13 @@ def recover_blocked_rework(
         if amendment_error is not None:
             return amendment_error
     applied: list[str] = []
+    if amendment_paths:
+        amendment_paths_error = _validate_allowed_writes_amendment_paths(
+            card, amendment_paths
+        )
+        if amendment_paths_error is not None:
+            return amendment_paths_error
+    applied_allowed_writes: list[str] = []
 
     # NF-2026-01352: refused whole, never truncated, before the write gate.
     bounded_feedback = str(feedback_reason or "").strip()
@@ -7437,6 +7451,9 @@ def recover_blocked_rework(
         if amendment_commands:
             task_store_kwargs["validation_amendment"] = amendment_commands
             task_store_kwargs["applied_out"] = applied
+        if amendment_paths:
+            task_store_kwargs["allowed_writes_amendment"] = amendment_paths
+            task_store_kwargs["allowed_writes_applied_out"] = applied_allowed_writes
         ok, state = task_store.recover_blocked_rework(
             repo_root(), task_id, **task_store_kwargs
         )
@@ -7459,6 +7476,8 @@ def recover_blocked_rework(
         # so an idempotent already-recovered success reports [] rather than
         # commands the stored card never received (NF-2026-01151).
         result["validation_amendment_applied"] = applied
+    if amendment_paths:
+        result["allowed_writes_amendment_applied"] = applied_allowed_writes
     return result
 
 
@@ -9775,12 +9794,28 @@ def reroute_launch_identity(
                 "reroute_target_rejected:workforce_catalog_unreadable:"
                 f"{type(exc).__name__}"
             )
-        route_matches = [
+        runner_routes = [
             route
             for route in catalog.get("workers") or []
             if str(route.get("execution_runner") or "") == to_runner
-            and str(route.get("effective_adapter_id") or "") == to_adapter_id
         ]
+        route_matches = [
+            route
+            for route in runner_routes
+            if str(route.get("effective_adapter_id") or "") == to_adapter_id
+        ]
+        identity_tuple = process_launcher.adapter_identity_tuple(to_runner)
+        if (
+            not route_matches
+            and len(runner_routes) == 1
+            and to_adapter_id in identity_tuple
+            and str(runner_routes[0].get("effective_adapter_id") or "") in identity_tuple
+        ):
+            # NF-2026-01602: the launch derives any member of the runner's
+            # identity tuple (glm_5.3 -> vscode_lm), while the catalog row
+            # names the canonical adapter (glm_vscode_lm).  The alias selects
+            # the runner's single row; the canonical adapter is what is recorded.
+            route_matches = runner_routes
         if len(route_matches) != 1:
             reason = "workforce_route_absent" if not route_matches else "workforce_route_ambiguous"
             return _lifecycle_error(
@@ -9788,6 +9823,7 @@ def reroute_launch_identity(
                 f"runner={to_runner}:adapter={to_adapter_id}"
             )
         catalog_route = route_matches[0]
+        to_adapter_id = str(catalog_route.get("effective_adapter_id") or "")
         expected_model = str(catalog_route.get("model") or "").strip()
         if not expected_model or to_model != expected_model:
             return _lifecycle_error(

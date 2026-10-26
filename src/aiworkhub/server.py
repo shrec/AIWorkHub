@@ -4101,6 +4101,7 @@ def aiworkhub_task_recover_blocked_rework(
     clean_root_if_predecessor_missing: bool = False,
     validation_amendment: list[str] | None = None,
     scope_rejection_resolved: bool = False,
+    allowed_writes_amendment: list[str] | None = None,
 ) -> dict[str, Any]:
     """Recover one exact blocked task through the canonical transaction.
 
@@ -4128,6 +4129,7 @@ def aiworkhub_task_recover_blocked_rework(
         clean_root_if_predecessor_missing: Set true to recover from a clean root when the hash-pinned predecessor workspace was removed; not combinable with validation_only_replay. Default false.
         validation_amendment: Validation commands to amend the recovered card with, checked by the same rules as validation on aiworkhub_task_create, e.g. pytest -q tests/test_target.py; omit for no amendment.
         scope_rejection_resolved: Set true to record the manager's audited clean-root resolution of a scope_rejected card; requires feedback_reason and is not combinable with validation_only_replay. Default false.
+        allowed_writes_amendment: Repo-relative paths to add to the card's allowed_writes (add-only, reject_review's path rules), e.g. tests/test_target.py; refused with validation_only_replay; omit for no amendment.
     """
 
     kwargs: dict[str, Any] = {
@@ -4141,6 +4143,8 @@ def aiworkhub_task_recover_blocked_rework(
         kwargs["scope_rejection_resolved"] = True
     if validation_amendment is not None:
         kwargs["validation_amendment"] = validation_amendment
+    if allowed_writes_amendment:
+        kwargs["allowed_writes_amendment"] = allowed_writes_amendment
     result = core.recover_blocked_rework(task_id, **kwargs)
     card = _envelope_card(result)
     extra: dict[str, Any] = {

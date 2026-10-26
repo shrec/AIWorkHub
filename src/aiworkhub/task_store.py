@@ -6361,6 +6361,8 @@ def recover_blocked_rework(
     validation_amendment: list[str] | None = None,
     applied_out: list[str] | None = None,
     scope_rejection_resolved: bool = False,
+    allowed_writes_amendment: list[str] | None = None,
+    allowed_writes_applied_out: list[str] | None = None,
 ) -> tuple[bool, str]:
     """Recover the same blocked task ID for rework when retained predecessor
     evidence and actionable residual feedback are present.
@@ -6449,7 +6451,17 @@ def recover_blocked_rework(
     ``invalid_validation_amendment:validation_amendment_exceeds_limit`` even
     when the task is already recovered; an idempotent success never silently
     drops a caller's amendment.
+
+    ``allowed_writes_amendment`` (NF-2026-01701) widens ``allowed_writes``
+    add-only through ``apply_allowed_writes_amendment`` -- the same history
+    entry reject_review records, bound to the card's ``launch_request_id`` --
+    inside this same transaction, and ``allowed_writes_applied_out`` follows
+    the ``applied_out`` rule.  It is refused with ``validation_only_replay``
+    (``allowed_writes_amendment_conflicts_with_validation_only_replay``)
+    before anything is read, because a replay keeps the exact sealed scope.
     """
+    if allowed_writes_amendment and validation_only_replay:
+        return False, "allowed_writes_amendment_conflicts_with_validation_only_replay"
     # NF-2026-01352: an explicit feedback over the cap is refused before any
     # read or write; the stored recovery_feedback used to be cut at 2000 chars.
     explicit_feedback_bytes = len(str(feedback_reason or "").strip().encode("utf-8"))
@@ -6544,10 +6556,23 @@ def recover_blocked_rework(
                 )
             except ValueError as exc:
                 return False, f"invalid_validation_amendment:{exc}"
+        pending_allowed_writes: list[str] = []
+        if allowed_writes_amendment:
+            try:
+                pending_allowed_writes = apply_allowed_writes_amendment(
+                    card,
+                    allowed_writes_amendment,
+                    actor=actor,
+                    request_id=str(card.get("launch_request_id") or ""),
+                )
+            except ValueError as exc:
+                return False, f"invalid_allowed_writes_amendment:{exc}"
 
         def report_applied_amendment() -> None:
             if applied_out is not None and pending_amendment:
                 applied_out.extend(pending_amendment)
+            if allowed_writes_applied_out is not None and pending_allowed_writes:
+                allowed_writes_applied_out.extend(pending_allowed_writes)
 
         if str(card.get("topic") or row["topic"] or "") == "quality_review":
             return False, "quality_review_recovery_requires_bound_relaunch"
