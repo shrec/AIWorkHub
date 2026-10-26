@@ -39,6 +39,8 @@ TOOL_CAPS: dict[str, dict[str, int]] = {
     # skill_registry already bounds a runtime packet to MAX_PACKET_BYTES (8 KiB)
     # and MAX_PACKET_SELECTED rows; this is the section's own independent cap.
     "skills": {"bytes": 8 * 1024, "rows": 32},
+    # Measured worst case: 8521 bytes for a 19-path Python+JS card (NF-2026-01535).
+    "development_rules": {"bytes": 16 * 1024, "rows": 64},
 }
 SKILL_PACKET_SCHEMA_ID = "aiworkhub.task_mcp.skill_runtime_packet.v1"
 SKILL_SELECT_LIMIT = 4
@@ -1426,10 +1428,34 @@ def _development_rules_section(
             "task": task, "risk": risk,
             "contexts": list(contexts.values()), "rules": [definitions[key] for key in sorted(definitions)],
         }
-        content = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        if len(content.encode("utf-8")) > _tool_cap("development_rules", "bytes", 8192):
-            raise ProjectContextError("development_rules_section_budget_overflow")
-        return _section(name="development_rules", content=content, truncated=False,
+        def encode() -> str:
+            return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+        cap = _tool_cap("development_rules", "bytes", 8192)
+        content = encode()
+        truncated = False
+        if len(content.encode("utf-8")) > cap:
+            by_body_size = sorted(
+                (rule for rule in payload["rules"] if rule["requirements"] is not None),
+                key=lambda rule: (
+                    -len(json.dumps(rule["requirements"], ensure_ascii=False, sort_keys=True,
+                                    separators=(",", ":")).encode("utf-8")),
+                    rule["id"],
+                ),
+            )
+            omitted: list[str] = []
+            for rule in by_body_size:
+                rule["requirements"] = None
+                omitted.append(rule["id"])
+                payload["degraded"] = True
+                payload["omitted_requirement_rule_ids"] = sorted(omitted)
+                content = encode()
+                if len(content.encode("utf-8")) <= cap:
+                    break
+            if len(content.encode("utf-8")) > cap:
+                raise ProjectContextError("development_rules_section_budget_overflow")
+            truncated = True
+        return _section(name="development_rules", content=content, truncated=truncated,
                         hit_count=len(definitions))
     except (rules.ManifestValidationError, TypeError, ValueError) as exc:
         raise ProjectContextError(f"development_rules_invalid:{exc}") from exc

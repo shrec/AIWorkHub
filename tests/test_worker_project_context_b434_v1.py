@@ -370,7 +370,7 @@ def test_development_rules_keep_path_precedence_and_positive_task_risk_scopes(tm
 
 def test_development_rules_refuse_manifest_and_path_population_over_budget(tmp_path, monkeypatch):
     repo, card, _manifest, path = _development_rules_case(tmp_path, monkeypatch)
-    card["allowed_writes"] = [f"src/a_{index}.py" for index in range(1000)]
+    card["allowed_writes"] = [f"src/a_{index}.py" for index in range(2000)]
     with pytest.raises(project_context.ProjectContextError, match="paths_budget_overflow"):
         project_context.collect_project_context(repo, card)
     card["allowed_writes"] = ["src/a.py"]
