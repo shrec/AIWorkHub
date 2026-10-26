@@ -6,6 +6,51 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.67] - 2026-10-26
+
+### Added
+
+- `reject_review(to="pending", allowed_writes_amendment=[...])` widens a rework card's `allowed_writes` add-only, so a scope gap found at review (a test that asserts the changed contract, a call site the card must wire) no longer makes every rework unwinnable. Paths go through `task_create`'s own rules and are refused when they contain `..`, are absolute, match `forbidden`, or lead into a reserved root (`.git`, `.aiworkhub/runtime`), including through a glob. Each amendment is recorded on the card (NF-2026-01641).
+- `accept_review` and `reject_review` take an inline `lesson_candidate` or a `no_new_lesson_reason` token, so the decision closes its learning out in the same call. Contradictory input is refused before the decision runs, and a failed close-out never undoes a decision that already landed (NF-2026-01672).
+- Every published MCP tool parameter carries a description from its docstring `Args` entry or `Field` hint, tool descriptions carry no trailing whitespace, and no property publishes an empty `examples` list. The invariants are locked on the in-process, write-gated and stdlib `tools/list` listings.
+- A failed validation that matches a measured sandbox signature (`[WinError 1314]` in the Windows AppContainer lane, a filename-less SemLock `PermissionError` under landlock) is stamped on its row, and the finalizer attaches a one-call replay plan for the manager. Each failure must prove the signature in its own pytest block, the closing summary must list every failure it counts, and a signature counts only on the backend it was measured on. Nothing is ever run on the host automatically (NF-2026-01671).
+- Read-only operator recipes `preflight_card_winnability`, `accept_readiness_bundle` and `blocked_queue_triage` (NF-2026-01700).
+- The dashboard task list, in the browser and in VS Code, has an Effort column with the reasoning effort each worker actually runs at, or `—` when none was recorded (NF-2026-01698).
+- LLM clients get a manager tool surface. The extension writes `AIWORKHUB_MCP_SURFACE=manager` into every LLM client config it registers. That surface hides the `aiworkhub_dashboard_*` tools only the dashboard webview calls, except `aiworkhub_dashboard_needfix_transition` and `aiworkhub_dashboard_snapshot`, which have no manager counterpart, and sends each tool result once as text instead of text plus `structuredContent`. Measured on the stdlib backend: `tools/list` drops from 217 tools and 249,979 bytes to 175 tools and 209,085 bytes, and a large call from 11,838 to 6,181 bytes. A hidden tool answers with the ordinary unknown-tool error; the webview's own MCP child and an unset value keep the full surface (NF-2026-01676).
+- A dependency-ready pending card whose bound route has an open quota or auth circuit is moved through `reroute_launch_identity`, with every gate of a manual reroute, to the best-ranked available worker those gates accept, and then launched by the normal path. It moves at most once per circuit episode and never on a transient, `model_not_found`, half-open or closed circuit; with no capable route it stays pending with one `no_capable_route` blocker (NF-2026-01674).
+- `recover_blocked_rework` takes `allowed_writes_amendment` with the same add-only path rules and refusal codes as `reject_review`; it is refused together with `validation_only_replay`, which keeps the exact sealed scope (NF-2026-01701).
+
+### Changed
+
+- Reasoning effort is tiered by difficulty and risk instead of always max. MAX is kept for a card the manager declares critical; bounded low/medium work runs at medium and standard work at high. A reviewer follows the card under review: MEDIUM by default, HIGH for the security lens, a high-risk target, or complex, security or architecture work. The Claude CLI and VS Code LM routes derive effort the same way (NF-2026-01697, NF-2026-01703).
+
+### Fixed
+
+- A rate, quota or session-limit refusal is recorded as `provider_account_limit`, so the reviewer successor skips every model on the exhausted adapter. A wall-clock reset such as "resets 2:40am (Asia/Tbilisi)" resolves to its next UTC instant (NF-2026-01684).
+- `verify_audit_ledger` fails closed on malformed ledger lines. A line that is bad JSON, is not an object, has a foreign `schema_id` or lacks its hmac counts in `entries_malformed` and returns `audit_ledger_malformed_lines:<n>`; such lines are no longer skipped silently (NF-2026-00500).
+- `validation_toolchain_authority_secret_unavailable` now names its cause: the key loader's reason, the OSError type/errno/winerror, or `key_absent` (NF-2026-01082).
+- VS Code LM failure diagnostics stay within their 2048-character budget. The oldest turns are dropped first, so the newest evidence survives and the JSON stays parseable (NF-2026-01309).
+- The combined-tree delta lists both the source and the destination of a staged rename (NF-2026-00499).
+- `task_template_show` states the default mandatory changed outputs of `bugfix_with_regression`, `test_only` and `docs_change` and how to narrow them (NF-2026-01059).
+- The stale storage snapshot test proves the read is non-blocking by event ordering instead of a 0.1 s timing bound that failed under full-suite load (NF-2026-01362).
+- A `python -m aiworkhub.<module>` recipe such as `aiworkhub.operator.worktree_diff` now runs under the server's own interpreter, with this package on `PYTHONPATH`. It no longer dies with `ModuleNotFoundError` in a repository that does not install AIWorkHub. Every other recipe keeps the repository's interpreter (NF-2026-01693).
+- `quality_reviewer_launch` no longer hands back a reviewer the manager archived. The next launch for that lens starts a fresh reviewer, so a wrong high finding no longer forces a rework of the whole card (NF-2026-01692).
+- A retried attempt carries the failed attempt's retained in-scope changes instead of starting again from HEAD; an out-of-scope change is recorded and never carried (NF-2026-01662).
+- Validation-only replay rebuilds a predecessor worktree that retention collected from its sealed rework delta, instead of refusing with `validation_only_replay_workspace_invalid` and paying for a worker relaunch (NF-2026-01655).
+- `accept_review` runs once per request: a second call joins the running accept, status queries see it in flight, and MCP progress keeps the client from losing the receipt (NF-2026-01626).
+- The reviewer packet carries the card's whole objective and acceptance instead of cutting them at 2000 characters (NF-2026-01593).
+- Reviewer routing honors model disables and moves a lens off an adapter that could not inspect the candidate (NF-2026-01620).
+- The AppContainer site shim names `asyncio` and `multiprocessing` pipes in the `\\.\pipe\LOCAL\` namespace, so an asyncio subprocess in the sandbox no longer fails with WinError 5 (NF-2026-01689), and its PermissionError fallback resolves a path that already carries the `\\?\` prefix (NF-2026-01702).
+- A sandbox drive letter (`DefineDosDevice`) left behind by a crashed launcher is leased and reclaimed instead of leaking until sign-out; reclaim waits when the ownership scan is incomplete (NF-2026-01695).
+- Source Graph `file` mode drops primitive-annotation and stdlib-import edges before the bounded edge slice (NF-2026-01699) and never silently drops a requested path: a path with spaces stays one path and truncation is judged by characters. VS Code LM reviewer file-mode reads count as progress (NF-2026-01704).
+- The tool-policy sync rollback restores a missing host file by a no-clobber rename when the AppContainer denies the hard link, and its test now runs in that lane instead of being skipped (NF-2026-01628).
+- The stdio schema freeze pins cover the new optional `reject_review` parameters. The concurrent stdio smoke now fingerprints schema shape without descriptions, like its two sibling freeze scripts.
+- `reroute_launch_identity` accepts any adapter in the target runner's identity tuple, such as `vscode_lm` for a GLM runner, and records the catalog adapter on the card; an adapter outside the tuple is still refused (NF-2026-01602).
+- `reroute_launch_identity` onto a Claude CLI route compares the catalog model through the launch's own model normalizer, so a catalog alias such as `sonnet` no longer refuses the reroute and the quota-circuit auto reroute can pick a Claude worker (NF-2026-01709).
+- The Effort column shows the effort a worker actually runs at: the isolated launcher writes `reasoning_effort` into the running process event as well as the launch receipt (NF-2026-01711).
+- `reroute_launch_identity` returns a lifecycle receipt (`card_sha256`/`card_bytes`, optional `include_card`) instead of the full card, which was about 55 KB (NF-2026-01688).
+- A mid-run OAuth expiry that the Claude CLI reports as a status-less `authentication_failed` stream takes the single bounded auth retry instead of failing the attempt (NF-2026-01685).
+
 ## [0.12.66] - 2026-10-24
 
 ### Added

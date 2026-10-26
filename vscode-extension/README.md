@@ -23,9 +23,9 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.12.66
+## What's new in 0.12.67
 
-- A worker edits a line range in one call and is told up front which validation tests its card is missing and which preflight calls are still required; a Source Graph file query returns an exact line range, blocked cards get a read-only triage, the manager loop starts a fresh session at 100k context tokens, and an older build can no longer delete a worktree a newer build decided to keep.
+- The dashboard shows the reasoning effort each worker actually runs at, and effort follows difficulty and risk instead of always max; LLM clients get a smaller manager tool surface, a card whose worker hit a quota or login circuit moves to the next capable worker, a mid-run Claude login expiry takes one bounded retry, and rework or blocked-card recovery can widen a card's allowed writes.
 
 ## Review automation
 

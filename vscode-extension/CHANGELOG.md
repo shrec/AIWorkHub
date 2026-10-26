@@ -1,5 +1,20 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.67 — 2026-10-26
+
+### Added
+
+- Bundled runtime 0.12.67: Effort column on the task list (NF-2026-01698); a manager tool surface for LLM clients that hides webview-only dashboard tools and sends each result once (NF-2026-01676); automatic reroute of a card whose route has an open quota or auth circuit (NF-2026-01674); `allowed_writes_amendment` on `reject_review` (NF-2026-01641) and `recover_blocked_rework` (NF-2026-01701); inline learning close-out on accept/reject (NF-2026-01672); classified one-call replay plan for sandbox-signature validation failures (NF-2026-01671); read-only operator recipes (NF-2026-01700).
+- The extension writes `AIWORKHUB_MCP_SURFACE=manager` into the LLM client configs it registers. Its own dashboard MCP child never inherits it.
+
+### Changed
+
+- Reasoning effort follows difficulty and risk instead of always max; reviewers run at MEDIUM, or HIGH for security, high-risk or complex work (NF-2026-01697, NF-2026-01703).
+
+### Fixed
+
+- Bundled runtime 0.12.67: provider account limits skip the exhausted adapter (NF-2026-01684); the AppContainer shim names asyncio/multiprocessing pipes correctly (NF-2026-01689, NF-2026-01702); leaked sandbox drive letters are reclaimed (NF-2026-01695); Source Graph file mode keeps every requested path (NF-2026-01699, NF-2026-01704); validation-only replay rebuilds a collected predecessor (NF-2026-01655); `accept_review` runs once per request (NF-2026-01626); GLM reroute through `vscode_lm` (NF-2026-01602); Claude reroute through a catalog alias (NF-2026-01709); the Effort column shows the running effort (NF-2026-01711); a small reroute receipt instead of the full card (NF-2026-01688); mid-run OAuth expiry takes the single auth retry (NF-2026-01685).
+
 ## 0.12.66 — 2026-10-24
 
 ### Added
