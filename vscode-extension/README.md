@@ -23,9 +23,9 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.12.67
+## What's new in 0.12.68
 
-- The dashboard shows the reasoning effort each worker actually runs at, and effort follows difficulty and risk instead of always max; LLM clients get a smaller manager tool surface, a card whose worker hit a quota or login circuit moves to the next capable worker, a mid-run Claude login expiry takes one bounded retry, and rework or blocked-card recovery can widen a card's allowed writes.
+- No seat, the manager included, may Read or Write an indexed file directly any more. `aiworkhub_doctor_diagnose` gives one health verdict, AI Memory entries carry timestamps with a read-only review report, and accept reuses an exactly matching combined-tree validation instead of rerunning the suite. Quota refusals from opencode (HTTP 402) and GLM (code 1308) open the right route circuit, GLM, DeepSeek and OpenCode workers fill the Effort column, and `review_packet` shows the reviewers' sealed findings.
 
 ## Review automation
 

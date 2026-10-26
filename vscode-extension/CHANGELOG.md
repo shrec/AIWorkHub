@@ -1,5 +1,19 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.68 — 2026-10-27
+
+### Added
+
+- Bundled runtime 0.12.68: one-call `aiworkhub_doctor_diagnose` health verdict (NF-2026-00881); AI Memory timestamps and a read-only review report (NF-2026-00882); `read_first_amendment` on `reject_review` (NF-2026-01440); each adapter records how it enforces the indexed-file Read/Write ban (NF-2026-01721).
+
+### Changed
+
+- Bundled runtime 0.12.68: no seat, the manager included, may Read an indexed file or Write over an existing one (NF-2026-01719, NF-2026-01720); accept reuses exactly matching combined-tree validations (NF-2026-01670); smaller single-page Source Graph replies (NF-2026-01448); SQLite temp B-trees stay in memory (NF-2026-00634); `needfix_list` folds report bodies to their size and hash unless `full=true` (NF-2026-01722).
+
+### Fixed
+
+- Bundled runtime 0.12.68: an opencode 402 balance refusal opens a provider-prefix circuit (NF-2026-01601); a GLM code 1308 usage limit is a recoverable quota refusal with its reset window (NF-2026-01586); GLM, DeepSeek and OpenCode workers fill the Effort column (NF-2026-01718); `agent_launch_task` accepts hyphenated provider prefixes (NF-2026-01572); `review_packet` shows the sealed reviewer findings (NF-2026-01716); a late supervisor finalization keeps an auto-accepted reviewer accepted (NF-2026-01706); reroute passes a stackdump-only husk worktree (NF-2026-01606); an oversized development-rules section is trimmed instead of refusing the launch (NF-2026-01535); a read-only card names no denied validation tool (NF-2026-01570); storage paths on a subst or linked drive (NF-2026-01714); the trusted-tool version probe retries once (NF-2026-01713); three flaky tests (NF-2026-01707, NF-2026-01712, NF-2026-01710).
+
 ## 0.12.67 — 2026-10-26
 
 ### Added

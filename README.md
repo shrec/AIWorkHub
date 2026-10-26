@@ -372,9 +372,9 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.67
+## What's new in 0.12.68
 
-- The dashboard shows the reasoning effort each worker actually runs at, and effort follows difficulty and risk instead of always max; LLM clients get a smaller manager tool surface, a card whose worker hit a quota or login circuit moves to the next capable worker, a mid-run Claude login expiry takes one bounded retry, and rework or blocked-card recovery can widen a card's allowed writes.
+- No seat, the manager included, may Read or Write an indexed file directly any more. `aiworkhub_doctor_diagnose` gives one health verdict, AI Memory entries carry timestamps with a read-only review report, and accept reuses an exactly matching combined-tree validation instead of rerunning the suite. Quota refusals from opencode (HTTP 402) and GLM (code 1308) open the right route circuit, GLM, DeepSeek and OpenCode workers fill the Effort column, and `review_packet` shows the reviewers' sealed findings.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Continuous Audit as a Service (CAAS)

@@ -6,6 +6,38 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.68] - 2026-10-27
+
+### Added
+
+- `aiworkhub_doctor_diagnose` runs the task, dispatcher and Source Graph health probes concurrently and returns one read-only `ok`/`problem`/`unavailable` verdict. The verdict lists each non-ok probe with a bounded excerpt and names the tool to call next. A probe still queued behind a hung one at the deadline is reported as `not_started`, not `timeout` (NF-2026-00881).
+- AI Memory rows carry `created_at`/`updated_at`; older stores are migrated in place. The read-only `aiworkhub_manager_ai_memory_review` lists stale entries, key collisions and near-duplicates within a shared tag, with bounded scan size, compare count and output (NF-2026-00882).
+- `reject_review(to="pending")` takes `read_first_amendment`: existing repo files, each with an optional `:N` or `:N-M` line suffix, appended with exact-string dedupe and an audited history entry. Reserved roots (`.git`, `.aiworkhub/runtime`) are refused on both the lexical and the resolved path (NF-2026-01440).
+- Every supported adapter records whether it enforces the indexed-file Read/Write ban and how, or names the gap, and each launch record states it (NF-2026-01721).
+
+### Changed
+
+- No seat, the manager included, may use a built-in Read on an indexed file or a Write over an existing file. The tool guard no longer exempts a Read of up to 400 lines or a dissimilar or large Write. The generated policy text, CLAUDE.md, AGENTS.md, the Copilot instructions and GETTING_STARTED state the same rule: read through Source Graph `body`, a `file` START-END window or `bodygrep`, and edit through semantic edit (NF-2026-01719, NF-2026-01720).
+- When the finalizer's combined-tree validation inputs match exactly, accept reuses those rows instead of rerunning the suite. Any doubt, and every manager correction, reruns the validations (NF-2026-01670).
+- A single-page `source_graph_query` reply carries its payload as structured content and elides per-row fields equal to their universal default. `canonical_bytes` and `content_sha256` still cover the full payload (NF-2026-01448).
+- SQLite temp B-trees stay in memory on every task-store connection. Disk spills were measured at about 1.9 TB/day of writes (NF-2026-00634).
+- `needfix_list` folds each non-empty `description`, `evidence`, `scope` and `provenance` body to `{summarized, bytes, length, sha256}`, and `needfix_show` still returns it in full. A 60-row listing measured 175 KB, 74% of it bodies. `full=true` returns raw rows (NF-2026-01722).
+
+### Fixed
+
+- An opencode HTTP 402 `provider.quota` error is sealed as `provider_refused_balance_exhausted`, and the workforce catalog opens a circuit scoped to adapter and provider prefix. Sibling models on the same exhausted account are no longer routed to (NF-2026-01601).
+- A vscode_lm GLM `code 1308` usage-limit refusal is classified as a recoverable quota refusal and its reset time is parsed. A stamp without a zone is read as UTC-12:00, the latest instant it can mean, so the route circuit stays open until the window has surely passed (NF-2026-01586).
+- GLM, DeepSeek and OpenCode workers record a reasoning-effort receipt, so the Effort column fills for them too (NF-2026-01718).
+- `agent_launch_task` accepts a workforce `worker_id` whose provider prefix has a hyphen, folding it with the same normalizer task creation uses (NF-2026-01572).
+- `review_packet` shows the reviewers' sealed findings, each with its exact dispose id, and live per-lens state. Previously it read a verdict recorded before the reviewers ran and showed 0 findings while accept was blocked on them (NF-2026-01716).
+- An auto-accepted reviewer attempt stays accepted when a supervisor finalization arrives before its card is archived (NF-2026-01706).
+- Reroute treats a worktree that holds only crash `*.stackdump` files as absent and takes the sealed delta. GC reclaims such a husk once its card is disposed and its process is proven dead (NF-2026-01606).
+- An oversized development-rules section is trimmed instead of failing the launch: it has a 16 KiB cap, and rule bodies are dropped largest-first. Only an ids-only overflow still refuses the launch (NF-2026-01535).
+- A read-only card's runtime policy says it holds no validation tool instead of naming one its tool list denies (NF-2026-01570).
+- A storage path is compared against the resolved repo root, so a subst or linked drive no longer refuses every path as `storage_registry_outside_repo` (NF-2026-01714).
+- A timed-out trusted-tool `--version` probe is retried once with a 20 s timeout, so a cold first launch on a hosted Windows runner no longer records the tool as version-less (NF-2026-01713).
+- Three flaky tests are fixed. The `msvcrt.locking` fakes count only the test's own fd (NF-2026-01707). The mux sideband deferral test waits on the observed child exit instead of a socket timeout, which cut its runtime from 79 s to about 8 s (NF-2026-01712). The child and LSP recovery timeouts scale with the core count (NF-2026-01710).
+
 ## [0.12.67] - 2026-10-26
 
 ### Added
