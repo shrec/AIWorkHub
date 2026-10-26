@@ -169,6 +169,8 @@ def _ensure_relative_safe(repo_root: Path, rel_value: str, field: str) -> Path:
     rel = Path(rel_value)
     if rel.is_absolute() or "\x00" in rel.as_posix() or ".." in rel.parts:
         raise PathEscapeError(f"storage_registry_path_escape:{field}:{rel_value}")
+    if repo_root.is_symlink():
+        raise PathEscapeError(f"storage_registry_symlink:{field}:{rel_value}")
     candidate = repo_root / rel
     cursor = repo_root
     for part in rel.parts:
@@ -176,10 +178,11 @@ def _ensure_relative_safe(repo_root: Path, rel_value: str, field: str) -> Path:
         if cursor.is_symlink():
             raise PathEscapeError(f"storage_registry_symlink:{field}:{rel_value}")
     try:
+        base = repo_root.resolve(strict=False)
         resolved = candidate.resolve(strict=False)
     except (OSError, RuntimeError, ValueError) as exc:
         raise PathEscapeError(f"storage_registry_unresolvable:{field}:{rel_value}") from exc
-    if resolved != repo_root and repo_root not in resolved.parents:
+    if resolved != base and base not in resolved.parents:
         raise PathEscapeError(f"storage_registry_outside_repo:{field}:{rel_value}")
     return resolved
 
