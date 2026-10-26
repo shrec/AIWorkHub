@@ -128,6 +128,44 @@ def _opencode_provider_refusal_from_event(
     }
 
 
+def _opencode_balance_refusal_from_event(
+    event: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Seal OpenCode's top-level ``provider.quota`` / HTTP 402 error envelope.
+
+    Only the provider-owned ``type=error`` line with ``error.type`` exactly
+    ``provider.quota`` and an integer ``error.status`` of 402 qualifies; the
+    message is retained as bounded detail but never used to decide anything, so
+    model prose cannot mint the seal (NF-2026-01601).
+    """
+
+    if event.get("type") != "error":
+        return None
+    error = event.get("error")
+    if not isinstance(error, dict) or error.get("type") != "provider.quota":
+        return None
+    status = error.get("status")
+    if not isinstance(status, int) or isinstance(status, bool) or status != 402:
+        return None
+    return {
+        "schema_id": "aiworkhub.provider_launch_failure.v1",
+        "reason": "provider_refused_balance_exhausted",
+        "refusal_kind": runtime_adapters.REFUSAL_BALANCE_EXHAUSTED,
+        "recoverable": False,
+        "http_status": 402,
+        "error_code": "insufficient_balance",
+        "session_id": "",
+        "provider_error": {
+            "schema_id": "aiworkhub.provider_route_error.v1",
+            "owner": "provider",
+            "sealed": True,
+            "code": "insufficient_balance",
+            "http_status": 402,
+            "detail": str(error.get("message") or "")[:300],
+        },
+    }
+
+
 def _provider_auth_failure_from_output(path: Path) -> dict[str, Any] | None:
     """Return a bounded, body-classified provider-refusal record, no secret text.
 
@@ -180,6 +218,9 @@ def _provider_auth_failure_from_output(path: Path) -> dict[str, Any] | None:
         opencode_refusal = _opencode_provider_refusal_from_event(event)
         if opencode_refusal is not None:
             return opencode_refusal
+        opencode_balance = _opencode_balance_refusal_from_event(event)
+        if opencode_balance is not None:
+            return opencode_balance
         raw_status = event.get("error_status", event.get("api_error_status"))
         status = raw_status if isinstance(raw_status, int) and not isinstance(raw_status, bool) else 0
         raw_error = event.get("error")

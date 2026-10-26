@@ -2119,6 +2119,16 @@ def _harvest_provider_event(event: object, found: dict[str, Any], depth: int = 0
         code = body.strip().lower()
     elif isinstance(body, dict):
         code = str(body.get("code") or body.get("type") or "").strip().lower()
+        # OpenCode nests its HTTP status in error.status; only an account-balance status is read.
+        nested_status = body.get("status")
+        if (
+            kind in _PROVIDER_OWNED_MESSAGE_TYPES
+            and found["status"] is None
+            and isinstance(nested_status, int)
+            and not isinstance(nested_status, bool)
+            and PROVIDER_STATUS_DISPOSITION.get(nested_status) == FAILURE_CLASS_CREDENTIAL
+        ):
+            found["status"] = nested_status
         if not message and isinstance(body.get("message"), str):
             message = body["message"]
         data = body.get("data")

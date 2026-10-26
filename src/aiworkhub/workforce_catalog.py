@@ -883,6 +883,54 @@ def _route_circuit(
     return circuit
 
 
+def _model_provider_prefix(model: Any) -> str:
+    prefix, separator, remainder = str(model or "").partition("/")
+    return prefix.strip().casefold() if separator and remainder.strip() else ""
+
+
+_ACCOUNT_BALANCE_ERROR_CODES = frozenset({"insufficient_balance", "balance_exhausted"})
+
+
+def _is_account_balance_seal(process: Mapping[str, Any]) -> bool:
+    sealed = _sealed_provider_error(process)
+    if sealed is None:
+        return False
+    status = sealed.get("http_status")
+    if status == 402 and not isinstance(status, bool):
+        return True
+    return str(sealed.get("code") or "").strip().casefold() in _ACCOUNT_BALANCE_ERROR_CODES
+
+
+def _provider_quota_circuit(
+    processes: Iterable[Mapping[str, Any]],
+    *,
+    adapter_ids: set[str],
+    model: Any,
+    now_epoch: float,
+) -> dict[str, Any] | None:
+    """A sealed 402 belongs to the account, so it holds every route sharing the provider prefix."""
+
+    prefix = _model_provider_prefix(model)
+    if not prefix:
+        return None
+    evidence: list[Mapping[str, Any]] = []
+    for process in processes:
+        if str(process.get("adapter_id") or "") not in adapter_ids:
+            continue
+        if _model_provider_prefix(process.get("model")) != prefix:
+            continue
+        kind = _route_failure_kind(process)
+        state = str(process.get("state") or "").strip().casefold()
+        if not kind and state in _ROUTE_SUCCESS_STATES:
+            evidence.append(process)
+        elif kind == "quota" and _is_account_balance_seal(process):
+            evidence.append(process)
+    circuit = _route_circuit(evidence, now_epoch=now_epoch)
+    if circuit["state"] != "open":
+        return None
+    return {**circuit, "scope": "adapter_and_provider_prefix", "provider_prefix": prefix}
+
+
 LAUNCH_ROUTE_SCHEMA_ID = "aiworkhub.launch_route_identity.v1"
 
 
@@ -1109,6 +1157,8 @@ def route_circuit_for(
         if now_epoch is not None
         else datetime.now(timezone.utc).timestamp()
     )
+    provider_observations_loaded_from_store = observations is None
+    since = ""
     if observations is None:
         # The reset horizon, not the lookback: ``_route_circuit`` itself keeps
         # only the rows that still matter past the lookback.
@@ -1137,7 +1187,41 @@ def route_circuit_for(
                 "mcp_control_plane_affected": False,
                 "reason": f"route_evidence_unavailable:{type(exc).__name__}",
             }
-    circuit = _route_circuit(observations, now_epoch=observed_now)
+    all_observations = list(observations)
+    wanted_model = str(model or "").strip()
+    exact_observations = (
+        all_observations
+        if provider_observations_loaded_from_store
+        else [
+            row
+            for row in all_observations
+            if str(row.get("model") or "").strip() in {"", wanted_model}
+        ]
+    )
+    circuit = _route_circuit(exact_observations, now_epoch=observed_now)
+    if circuit["state"] != "open":
+        prefix = _model_provider_prefix(model)
+        if prefix:
+            provider_observations = all_observations
+            if provider_observations_loaded_from_store:
+                try:
+                    provider_observations = task_store.route_terminal_observations(
+                        Path(repo_root).resolve(),
+                        adapter_id=str(adapter_id or ""),
+                        model="",
+                        since_iso=since,
+                        provider_prefix=prefix,
+                    )
+                except Exception:  # noqa: BLE001 - unmeasured provider evidence never refuses a launch
+                    provider_observations = ()
+            provider_circuit = _provider_quota_circuit(
+                provider_observations,
+                adapter_ids={str(adapter_id or "").strip()},
+                model=model,
+                now_epoch=observed_now,
+            )
+            if provider_circuit is not None:
+                circuit = provider_circuit
     circuit["adapter_id"] = str(adapter_id or "").strip()
     circuit["model"] = str(model or "").strip()
     return circuit
@@ -1815,6 +1899,16 @@ def build_catalog(
         effective_score = max(0.0, min(100.0, (observed_score if observed_score is not None else 50.0) + worker["manager_score_adjustment"]))
         access_observed = bool(adapter_ready.get("access_observed"))
         route_health = _route_circuit(matched, now_epoch=observed_now_epoch)
+        if route_health["state"] != "open":
+            route_health = (
+                _provider_quota_circuit(
+                    processes,
+                    adapter_ids=adapter_ids_to_match,
+                    model=worker["model"],
+                    now_epoch=observed_now_epoch,
+                )
+                or route_health
+            )
         route_available = route_health["state"] != "open"
         sandbox_start_failure_streak = _sandbox_start_failure_streak(matched)
         policy_provider, policy_adapter = policy_route_identity(

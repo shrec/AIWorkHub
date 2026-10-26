@@ -1390,6 +1390,7 @@ def route_terminal_observations(
     model: str,
     since_iso: str,
     limit_per_event: int = 200,
+    provider_prefix: str = "",
 ) -> list[dict[str, Any]]:
     """Return retained terminal observations for one exact provider route.
 
@@ -1412,7 +1413,8 @@ def route_terminal_observations(
     _readiness, db_path = _require_ready(root)
     wanted_adapter = str(adapter_id or "").strip()
     wanted_model = str(model or "").strip()
-    if not wanted_adapter or not wanted_model:
+    wanted_prefix = str(provider_prefix or "").strip().casefold()
+    if not wanted_adapter or not (wanted_model or wanted_prefix):
         return []
     bounded = max(1, min(int(limit_per_event), 1000))
     window_start = str(since_iso or "")
@@ -1441,7 +1443,11 @@ def route_terminal_observations(
                     continue
                 if str(evidence.get("adapter_id") or "").strip() != wanted_adapter:
                     continue
-                if str(evidence.get("model") or "").strip() != wanted_model:
+                observed_model = str(evidence.get("model") or "").strip()
+                if wanted_prefix:
+                    if observed_model.split("/", 1)[0].strip().casefold() != wanted_prefix:
+                        continue
+                elif observed_model != wanted_model:
                     continue
                 verification = payload.get("deterministic_verification")
                 substatus = ""
@@ -1455,7 +1461,7 @@ def route_terminal_observations(
                     "task_id": str(record["task_id"] or ""),
                     "runner": str(record["runner"] or ""),
                     "adapter_id": wanted_adapter,
-                    "model": wanted_model,
+                    "model": observed_model,
                     "state": substatus,
                     "error": str(evidence.get("error") or ""),
                     "finished_at": created_at,
