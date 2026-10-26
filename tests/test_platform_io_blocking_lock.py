@@ -32,10 +32,14 @@ windows_only = pytest.mark.skipif(os.name != "nt", reason="Windows locking seman
 def test_blocking_lock_retries_instead_of_using_lk_lock(monkeypatch):
     import msvcrt
 
+    real_locking = msvcrt.locking
     calls: list[int] = []
     attempts = {"n": 0}
+    own_fd: list[int] = []
 
     def fake_locking(fd, mode, nbytes):
+        if not own_fd or fd != own_fd[0]:
+            return real_locking(fd, mode, nbytes)
         calls.append(mode)
         attempts["n"] += 1
         if attempts["n"] < 4:
@@ -46,6 +50,7 @@ def test_blocking_lock_retries_instead_of_using_lk_lock(monkeypatch):
 
     with tempfile.TemporaryDirectory() as tmp:
         fd = os.open(Path(tmp) / "a.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        own_fd.append(fd)
         try:
             platform_io.lock_fd(fd, blocking=True)
         finally:
@@ -105,10 +110,19 @@ def test_blocking_lock_propagates_a_real_error(monkeypatch):
 def test_non_blocking_lock_makes_exactly_one_attempt(monkeypatch):
     import msvcrt
 
+    real_locking = msvcrt.locking
     calls: list[int] = []
-    monkeypatch.setattr(msvcrt, "locking", lambda fd, mode, n: calls.append(mode))
+    own_fd: list[int] = []
+
+    def fake_locking(fd, mode, nbytes):
+        if not own_fd or fd != own_fd[0]:
+            return real_locking(fd, mode, nbytes)
+        calls.append(mode)
+
+    monkeypatch.setattr(msvcrt, "locking", fake_locking)
     with tempfile.TemporaryDirectory() as tmp:
         fd = os.open(Path(tmp) / "c.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        own_fd.append(fd)
         try:
             platform_io.lock_fd(fd, blocking=False)
         finally:
