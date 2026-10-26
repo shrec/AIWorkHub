@@ -498,6 +498,81 @@ def raw_discovery_enforcement_fact(adapter_id: str) -> dict[str, Any]:
             adapter_id, RAW_DISCOVERY_ENFORCEMENT_UNVERIFIED
         ),
         "denied_commands": list(RAW_DISCOVERY_DENIED_COMMANDS),
+        "indexed_file_rw": indexed_file_rw_enforcement_fact(adapter_id),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Indexed-file Read/Write ban capability (NF-2026-01721).
+#
+# Owner rule 2026-10-26: no seat uses a built-in Read on an indexed file or a
+# built-in Write over an existing file; reads go through Source Graph, edits
+# through semantic_edit, and Write only creates a new file.  Same polarity as
+# the raw-discovery table: an unlisted adapter is NOT enforced.  A row is
+# ``enforced`` only where a mechanism was measured in code; every other adapter
+# carries a named ``gap:`` so nobody reads an unenforced seat as enforced.
+#
+#   claude_cli    PreToolUse hook (tool_guard_hook.py, NF-2026-01719).
+#   opencode_cli  ``opencode_worker_permission_contract``: deny-by-default, and
+#                 read/edit/write/patch/multiedit are listed denies.
+#   *_vscode_lm   closed dispatch surface; no native Read/Write is ever offered.
+#   *_copilot_cli Copilot's ``write`` permission kind covers create AND modify
+#                 and the worker MCP surface has no create-file tool, so
+#                 excluding the native file tools would delete new-file
+#                 creation.  Nothing is excluded; the gap is recorded.
+#   codex_cli/kilo  no tool-deny flag; codex accepts unknown -c keys silently.
+# ---------------------------------------------------------------------------
+_COPILOT_INDEXED_FILE_RW_GAP = (
+    "gap:copilot write permission kind covers create and modify and the awh "
+    "worker tools have no new-file tool; native file tools are not excluded"
+)
+_VSCODE_LM_INDEXED_FILE_RW_MECHANISM = (
+    "closed dispatch surface: native Read/Write are never offered"
+)
+_INDEXED_FILE_RW_ENFORCEMENT_REASONS: Mapping[str, str] = MappingProxyType(
+    {
+        "claude_cli": "PreToolUse hook tool_guard_hook.py (NF-2026-01719)",
+        OPENCODE_CLI_ADAPTER: (
+            "OPENCODE_CONFIG_CONTENT permission deny-by-default with "
+            "read/edit/write/patch/multiedit denied"
+        ),
+        VSCODE_LM_ADAPTER: _VSCODE_LM_INDEXED_FILE_RW_MECHANISM,
+        GLM_VSCODE_LM_ADAPTER: _VSCODE_LM_INDEXED_FILE_RW_MECHANISM,
+        DEEPSEEK_VSCODE_LM_ADAPTER: _VSCODE_LM_INDEXED_FILE_RW_MECHANISM,
+        DEEPSEEK_COPILOT_ADAPTER: _COPILOT_INDEXED_FILE_RW_GAP,
+        GLM_COPILOT_ADAPTER: _COPILOT_INDEXED_FILE_RW_GAP,
+        "codex_cli": "gap:codex exec exposes no tool-deny flag",
+        GROK_KILO_ADAPTER: "gap:kilo run exposes no tool-deny flag",
+        "deepseek_manual": "gap:no launch of ours; a human drives this adapter",
+    }
+)
+INDEXED_FILE_RW_ENFORCING_ADAPTERS: frozenset[str] = frozenset(
+    adapter_id
+    for adapter_id, reason in _INDEXED_FILE_RW_ENFORCEMENT_REASONS.items()
+    if not reason.startswith("gap:")
+)
+INDEXED_FILE_RW_ENFORCEMENT_UNVERIFIED = (
+    "gap:adapter not verified for an indexed-file read/write ban"
+)
+
+
+def indexed_file_rw_enforcement_fact(adapter_id: str) -> dict[str, Any]:
+    """Return ``{enforced, mechanism, gap}`` for the indexed-file Read/Write ban.
+
+    ``mechanism`` is set only when enforced and ``gap`` only when not, so a
+    reader cannot mistake a named gap for a control.  Unknown adapters are not
+    enforced.  Inert: starts no process.
+    """
+
+    enforced = adapter_id in INDEXED_FILE_RW_ENFORCING_ADAPTERS
+    detail = _INDEXED_FILE_RW_ENFORCEMENT_REASONS.get(
+        adapter_id, INDEXED_FILE_RW_ENFORCEMENT_UNVERIFIED
+    )
+    return {
+        "adapter_id": adapter_id,
+        "enforced": enforced,
+        "mechanism": detail if enforced else "",
+        "gap": "" if enforced else detail,
     }
 
 
