@@ -5647,14 +5647,29 @@ def aiworkhub_review_packet(
         if resolved_task_id:
             task_id_source = "request_status"
     preview = manager.accept_preview(request_id, resolved_task_id)
+    # The review-ready verdict was recorded before the reviewers ran, so the
+    # reviewers' sealed reports are read live for the selected reviewers.
+    reviewer_ids = preview.get("reviewer_request_ids") if isinstance(preview, dict) else None
+    reports = (
+        process_launcher_accept_review.preview_reviewer_reports(
+            manager, resolved_task_id, request_id, reviewer_ids
+        )
+        if isinstance(reviewer_ids, list) and reviewer_ids
+        else []
+    )
     packet = completion_inbox.review_packet(
         request_id,
         task_id=resolved_task_id,
         accept_preview=preview if isinstance(preview, dict) else None,
         max_bytes=max_bytes,
+        **({"reviewer_reports": reports} if reports else {}),
     )
     if isinstance(packet, dict):
         packet["task_id_source"] = task_id_source or "unresolved"
+        if isinstance(reviewer_ids, list) and reviewer_ids and not reports:
+            # Selected reviewers, but no sealed report was read: the lens
+            # counts fall back to the pre-review verdict and are not live.
+            packet["reviewer_reports_unavailable"] = True
     return packet
 
 

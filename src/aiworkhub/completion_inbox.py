@@ -968,7 +968,8 @@ def _packet_reviewer_sections(
         if not isinstance(report, dict):
             continue
         lens = _packet_text(report.get("lens"), 40)
-        for finding in report.get("findings") or []:
+        raw_findings = report.get("findings")
+        for finding in raw_findings if isinstance(raw_findings, list) else []:
             if not isinstance(finding, dict):
                 continue
             key = _packet_finding_key(lens, finding)
@@ -982,8 +983,10 @@ def _packet_reviewer_sections(
                 if lens not in bucket[key]["lenses"]:
                     bucket[key]["lenses"].append(lens)
                 continue
+            reviewer_request_id = _packet_text(report.get("reviewer_request_id"), 100)
+            finding_id = _packet_text(finding.get("id"), 200)
             bucket[key] = {
-                "id": _packet_text(finding.get("id"), 200),
+                "id": finding_id,
                 "lenses": [lens],
                 "severity": _packet_text(finding.get("severity"), 30),
                 "disposition": _packet_text(finding.get("disposition"), 40),
@@ -992,6 +995,14 @@ def _packet_reviewer_sections(
                 "line": key[1],
                 "summary": _packet_text(finding.get("summary")),
                 "evidence": _packet_text(finding.get("evidence")),
+                **(
+                    {
+                        "reviewer_request_id": reviewer_request_id,
+                        "dispose_finding_id": f"reviewer:{lens}:{finding_id}",
+                    }
+                    if reviewer_request_id
+                    else {}
+                ),
             }
     return (
         list(findings.values())[:_PACKET_MAX_ROWS],
@@ -1051,6 +1062,42 @@ def _packet_drop(packet: dict[str, Any], section: str) -> bool:
         review["findings"] = []
         return had
     return False
+
+
+def _packet_preview_lenses(per_lens: Any, reviewer_reports: Any) -> list[dict[str, Any]] | None:
+    """Lens rows from accept_preview's live ``per_lens``, or None to keep the verdict's.
+
+    The review-ready verdict predates the reviewers, so it reports every lens
+    as skipped with no findings; the preview's per-lens state and the reviewers'
+    own reports are the later, truer reading.
+    """
+    if not isinstance(per_lens, list) or not per_lens:
+        return None
+    counts: dict[str, list[int]] = {}
+    for report in reviewer_reports if isinstance(reviewer_reports, list) else []:
+        if not isinstance(report, dict):
+            continue
+        row = counts.setdefault(str(report.get("lens") or ""), [0, 0])
+        raw_findings = report.get("findings")
+        for finding in raw_findings if isinstance(raw_findings, list) else []:
+            if isinstance(finding, dict):
+                row[0 if finding.get("disposition") == "defect" else 1] += 1
+    rows: list[dict[str, Any]] = []
+    for entry in _packet_rows(per_lens):
+        lens = str(entry.get("lens") or "")
+        found, observed = counts.get(lens, [0, 0])
+        rows.append(
+            {
+                "lens": _packet_text(lens, 40),
+                "state": _packet_text(entry.get("state"), 60),
+                "usable": bool(entry.get("usable")),
+                "required": bool(entry.get("required")),
+                "selected": bool(entry.get("selected")),
+                "finding_count": found,
+                "observation_count": observed,
+            }
+        )
+    return rows
 
 
 def review_packet(
@@ -1136,6 +1183,7 @@ def review_packet(
         reviewer_reports = verdict.get("reviewer_reports")
     findings, observations, duplicate_count = _packet_reviewer_sections(reviewer_reports)
     preview = accept_preview if isinstance(accept_preview, dict) else {}
+    preview_lenses = _packet_preview_lenses(preview.get("per_lens"), reviewer_reports)
     validation_rows = _packet_validation_rows(evidence)
     validation_skipped_total = sum(
         int(row["pytest_outcomes"].get("skipped", 0))
@@ -1207,7 +1255,9 @@ def review_packet(
             },
             "validation_skipped_total": validation_skipped_total,
             "review": {
-                "lenses": [
+                "lenses": preview_lenses
+                if preview_lenses is not None
+                else [
                     {
                         "lens": _packet_text(row.get("lens"), 40),
                         "status": _packet_text(row.get("status"), 60),

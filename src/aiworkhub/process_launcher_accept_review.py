@@ -2084,6 +2084,40 @@ def accept_preview(self, request_id: str, task_id: str, **overrides: Any) -> dic
     }
 
 
+def preview_reviewer_reports(
+    self: Any,
+    task_id: str,
+    request_id: str,
+    reviewer_request_ids: Any,
+) -> list[dict[str, Any]]:
+    """Read-only: the sealed reports of the selected usable reviewers.
+
+    The same selection the accept verification loop reads, so a manager's
+    packet shows the findings it will be asked to dispose. Never raises: an
+    unreadable reviewer ledger yields no reports.
+    """
+    try:
+        selected = {str(value) for value in (reviewer_request_ids or ())}
+        reports: list[dict[str, Any]] = []
+        for row in reviewer_evidence(self, task_id, request_id):
+            reviewer_request_id = str(row.get("request_id") or "")
+            receipt = row.get("receipt")
+            if (
+                not row.get("usable")
+                or not reviewer_request_id
+                or reviewer_request_id not in selected
+                or not isinstance(receipt, Mapping)
+                or not isinstance(receipt.get("report"), Mapping)
+            ):
+                continue
+            reports.append(
+                {**dict(receipt["report"]), "reviewer_request_id": reviewer_request_id}
+            )
+        return reports
+    except Exception:  # noqa: BLE001 -- a packet read never raises at a manager
+        return []
+
+
 def _stale_inputs_touching_candidate(
     drifted_inputs: list[str], candidate_paths: list[str]
 ) -> list[str]:
