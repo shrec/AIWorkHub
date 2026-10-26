@@ -12711,7 +12711,10 @@ _NEEDFIX_BODY_KEYS = ("description", "evidence", "scope", "provenance")
 
 
 def needfix_bodies_bounded(
-    row: Mapping[str, Any], *, full: bool = False
+    row: Mapping[str, Any],
+    *,
+    full: bool = False,
+    max_bytes: int = NEEDFIX_BODY_MAX_BYTES,
 ) -> dict[str, Any]:
     """Return ``row`` with each oversized filer-authored body folded.
 
@@ -12730,7 +12733,7 @@ def needfix_bodies_bounded(
         if not isinstance(value, (str, list, dict)) or not value:
             continue
         size, digest = _evidence_identity(value)
-        if size <= NEEDFIX_BODY_MAX_BYTES:
+        if size <= max_bytes:
             continue
         result[key] = {
             "summarized": True,

@@ -7055,8 +7055,14 @@ def needfix_list(
     offset: int = 0,
     order_by: str = "created_at",
     order_dir: str = "DESC",
+    full: bool = False,
 ) -> list[dict]:
-    """List repo-scoped NeedFix entries (bounded).
+    """List repo-scoped NeedFix entries (bounded); bodies fold to their identity.
+
+    Measured: ``limit=60`` replied 175 KB, 74% of it the description and
+    evidence bodies the filer wrote (NF-2026-01722). By default every
+    non-empty body is replaced by ``{summarized, bytes, length, sha256}`` so
+    it stays addressable via needfix_show; ``full=true`` returns raw rows.
 
     Args:
         status: Only rows with exactly this status, e.g. captured, accepted or archived. Any status, kind or severity filter returns raw rows; omit all three for the derived active listing.
@@ -7067,8 +7073,9 @@ def needfix_list(
         offset: Rows to skip before the first one returned, for paging; default 0.
         order_by: Sort column, created_at (default) or updated_at; any other value falls back to created_at.
         order_dir: Sort direction, DESC (default, newest first) or ASC; any other value falls back to DESC.
+        full: Return every description and evidence body verbatim instead of folding each to its identity; default false.
     """
-    return core.needfix_list(
+    listing = core.needfix_list(
         status=status,
         kind=kind,
         severity=severity,
@@ -7077,6 +7084,13 @@ def needfix_list(
         offset=offset,
         order_by=order_by,
         order_dir=order_dir,
+    )
+    if full:
+        return listing
+    return core.NeedfixListing(
+        [core.needfix_bodies_bounded(row, max_bytes=0) for row in listing],
+        derived=listing.derived,
+        underived_reason=listing.underived_reason,
     )
 
 
