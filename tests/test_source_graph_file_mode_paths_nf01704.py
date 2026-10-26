@@ -1,6 +1,5 @@
 """NF-2026-01704: Source Graph file mode reads one path per call and names the next window."""
 
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +7,7 @@ import pytest
 from aiworkhub import source_graph as sg
 from aiworkhub import worker_ai_tools_mcp as wtm
 from aiworkhub.repository_state import bootstrap_repository
+from source_graph_content_helpers import content_payload
 
 ALPHA = "pkg/alpha.py"
 BETA = "pkg/beta.py"
@@ -70,7 +70,7 @@ def _file_call(repo, query, target=None):
 
 def _served_context(reply):
     assert reply["ok"] is True
-    return json.loads(reply["content"])["contexts"][0]
+    return content_payload(reply)["contexts"][0]
 
 
 def _preview_fields(context):

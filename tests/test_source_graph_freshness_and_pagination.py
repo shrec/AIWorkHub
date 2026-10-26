@@ -37,6 +37,7 @@ from aiworkhub import source_graph as sg
 from aiworkhub import worker_ai_tools_mcp as worker_tools
 from aiworkhub.source_graph import _analytics_result_row_count
 from aiworkhub.repository_state import bootstrap_repository
+from source_graph_content_helpers import content_payload
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +485,7 @@ def test_truncated_unscoped_bodygrep_cursor_resumes_past_the_cap(tmp_path, monke
     assert first["surface"] == "manager_mcp"
     assert first["truncated"] is True
     assert first["scan_truncated"] is True
-    payload = json.loads(first["content"])
+    payload = content_payload(first)
     assert payload["truncated"] is True
     assert payload["scan_truncated"] is True
     cursor = payload["next_cursor"]
@@ -525,7 +526,7 @@ def test_truncated_unscoped_bodygrep_cursor_resumes_past_the_cap(tmp_path, monke
     for _page in range(8):
         page = ask(cursor=page_cursor)
         assert page["ok"] is True, page
-        page_payload = json.loads(page["content"])
+        page_payload = content_payload(page)
         assert page_payload.get("cursor") == page_cursor
         page_resume = bytes.fromhex(page_cursor.split("-", 1)[0]).decode("utf-8")
         for row in page_payload["matches"]:

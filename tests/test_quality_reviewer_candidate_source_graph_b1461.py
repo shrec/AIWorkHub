@@ -17,6 +17,7 @@ from aiworkhub import repository_state
 from aiworkhub import source_graph
 from aiworkhub import storage_registry
 from aiworkhub import worker_ai_tools_mcp as worker_tools
+from source_graph_content_helpers import content_text
 
 
 def _ctx(
@@ -236,7 +237,7 @@ def test_quality_reviewer_source_graph_uses_packet_bound_candidate_overlay(
 
     assert result["ok"] is True
     assert result["hit_count"] > 0
-    assert "candidate_only_symbol" in result["content"]
+    assert "candidate_only_symbol" in content_text(result)
     assert result["authority_source"] == "candidate_overlay"
     # Deliberate (source_graph-3): ``authority_state`` left the model-facing
     # envelope for the HMAC-authenticated ledger row; the pair is asserted
@@ -1006,7 +1007,7 @@ def test_quality_review_prewarm_skips_non_indexable_changed_path_without_abortin
     )
     assert result["ok"] is True
     assert result["hit_count"] > 0
-    assert "candidate_only_symbol" in result["content"]
+    assert "candidate_only_symbol" in content_text(result)
 
 
 def test_quality_review_prewarm_all_concurrent_callers_observe_wrapped_data_failure(
@@ -1160,7 +1161,7 @@ def test_candidate_overlay_survives_canonical_atomic_publication_nf946(
     changed = query("candidate_only_symbol")
     assert changed["ok"] is True, changed
     assert changed["hit_count"] > 0
-    assert "candidate_only_symbol" in changed["content"]
+    assert "candidate_only_symbol" in content_text(changed)
     assert changed["authority_source"] == "candidate_overlay"
     assert changed["packet_sha256"] == packet["packet_sha256"]
     assert changed["target_request_id"] == "target-request-946"
@@ -1169,7 +1170,7 @@ def test_candidate_overlay_survives_canonical_atomic_publication_nf946(
     unchanged = query("base_unchanged_symbol")
     assert unchanged["ok"] is True, unchanged
     assert unchanged["hit_count"] > 0
-    assert "stable.py" in unchanged["content"]
+    assert "stable.py" in content_text(unchanged)
     assert unchanged["authority_source"] == "candidate_overlay"
     assert unchanged["packet_sha256"] == packet["packet_sha256"]
 

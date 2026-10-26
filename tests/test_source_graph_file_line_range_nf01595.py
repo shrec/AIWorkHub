@@ -8,6 +8,7 @@ import pytest
 from aiworkhub import source_graph as sg
 from aiworkhub import worker_ai_tools_mcp as wtm
 from aiworkhub.repository_state import bootstrap_repository
+from source_graph_content_helpers import content_payload
 
 
 def test_parse_file_line_range_valid_forms():
@@ -295,7 +296,7 @@ def test_file_query_and_worker_serve_the_same_ranged_window(tmp_path):
         workflow_stage="implementation", compact_replay=False,
     )
     assert reply["ok"] is True
-    served = json.loads(reply["content"])["contexts"][0]
+    served = content_payload(reply)["contexts"][0]
     assert {key: served[key] for key in RANGED_KEYS} == {
         key: context[key] for key in RANGED_KEYS
     }

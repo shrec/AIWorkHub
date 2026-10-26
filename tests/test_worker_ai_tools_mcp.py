@@ -24,6 +24,7 @@ from aiworkhub import platform_io
 from aiworkhub import repository_state
 from aiworkhub import source_graph
 from aiworkhub import worker_ai_tools_mcp as worker_tools
+from source_graph_content_helpers import content_text
 
 
 def test_worker_tools_uses_canonical_platform_chmod_fd() -> None:
@@ -265,7 +266,7 @@ def test_quality_review_prewarm_accepts_policy_excluded_and_zero_row_partitions(
         mixed_ctx, mode="function", query="devrules_candidate_symbol", budget=16
     )
     assert query["ok"] is True
-    assert "devrules_candidate_symbol" in query["content"]
+    assert "devrules_candidate_symbol" in content_text(query)
 
     empty, _, _ = prewarm_packet(
         "candidate-zero-row",
@@ -383,7 +384,7 @@ def test_quality_review_source_graph_query_is_query_only_and_fails_closed(
     )
     assert result["ok"] is True
     assert result["authority_source"] == "candidate_overlay"
-    assert "candidate_only_symbol_0" in result["content"]
+    assert "candidate_only_symbol_0" in content_text(result)
     assert build_calls == []
 
 
@@ -482,16 +483,16 @@ def test_three_reviewer_overlays_plus_coordinator_query_no_leakage_or_starvation
     for (ctx, symbol), result in zip(overlays, results[:3]):
         assert result["ok"] is True
         assert result["authority_source"] == "candidate_overlay"
-        assert symbol in result["content"]
+        assert symbol in content_text(result)
         # No cross-overlay leakage: each overlay only sees its own symbol.
         for _, other_symbol in overlays:
             if other_symbol != symbol:
-                assert other_symbol not in result["content"]
+                assert other_symbol not in content_text(result)
 
     coordinator_result = results[3]
     assert coordinator_result["ok"] is True
     assert coordinator_result["authority_source"] == "canonical"
-    assert "coordinator_symbol" in coordinator_result["content"]
+    assert "coordinator_symbol" in content_text(coordinator_result)
 
 
 def _mutate_overlay(db_path: Path, sql: str, params: tuple = ()) -> None:

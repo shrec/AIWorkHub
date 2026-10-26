@@ -29,6 +29,7 @@ if str(_SRC) not in sys.path:
 from aiworkhub import process_launcher as pl  # noqa: E402
 from aiworkhub import project_context  # noqa: E402
 from aiworkhub import worker_ai_tools_mcp as wm  # noqa: E402
+from source_graph_content_helpers import content_payload, content_text  # noqa: E402
 
 
 def _sha(text: str = "bundle-b954") -> str:
@@ -773,7 +774,7 @@ def test_source_graph_query_caches_under_the_named_production_key(tmp_path, monk
     assert second["content_sha256"] == first["content_sha256"]
     assert second["replay_original_bytes"] == first["bytes"]
     assert second["hit_count"] == first["hit_count"]
-    assert json.loads(second["content"])["content_sha256"] == first["content_sha256"]
+    assert content_payload(second)["content_sha256"] == first["content_sha256"]
     assert live == ["q"], "a current-generation exact-key hit must not re-query"
 
 
@@ -794,7 +795,7 @@ def test_a_degraded_index_identity_is_never_cached_or_replayed(tmp_path, monkeyp
     second = wm.source_graph_query(_ctx(tmp_path), mode="focus", query="q", budget=48)
     assert second["cache_hit"] is False
     assert live == ["q", "q"], "an ambiguous generation must fall back to a live query"
-    assert "after.py" in second["content"]
+    assert "after.py" in content_text(second)
     assert second["content_sha256"] != first["content_sha256"]
     assert wm._CACHE == {}
 

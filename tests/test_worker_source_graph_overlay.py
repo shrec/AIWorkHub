@@ -11,6 +11,7 @@ import pytest
 from aiworkhub import source_graph
 from aiworkhub.repository_state import bootstrap_repository
 from aiworkhub.worker_ai_tools_mcp import WorkerToolContext, source_graph_query
+from source_graph_content_helpers import content_payload, content_text
 
 
 def _write(path: Path, text: str | bytes) -> None:
@@ -117,9 +118,9 @@ def test_overlay_query_shadows_changed_and_tombstones_deleted(
     # redundant on the reply: ``authority_source`` alone tells a rework worker
     # which tree answered, and it stays for exactly that reason.
     assert "authority_state" not in body
-    assert "worktree_symbol" in body["content"]
-    assert "canonical_symbol" not in body["content"]
-    parsed = json.loads(body["content"])
+    assert "worktree_symbol" in content_text(body)
+    assert "canonical_symbol" not in content_text(body)
+    parsed = content_payload(body)
     assert parsed["matches"][0]["provenance"] == "request_scoped_worktree"
     assert parsed["matches"][0]["source_hash"] == hashlib.sha256(
         (workspace / "src/changed.py").read_bytes()
@@ -129,7 +130,7 @@ def test_overlay_query_shadows_changed_and_tombstones_deleted(
         ctx, mode="focus", query="deleted_symbol",
         workflow_stage="rework", compact_replay=False,
     )
-    deleted_payload = json.loads(deleted["content"])
+    deleted_payload = content_payload(deleted)
     assert deleted["hit_count"] == 0
     assert "src/deleted.py" not in deleted_payload.get("candidate_files", [])
 
@@ -149,7 +150,7 @@ def test_overlay_query_merges_unscoped_focus_deterministically(
     )
     assert first["hit_count"] >= 1
     assert first["content"] == second["content"]
-    payload = json.loads(first["content"])
+    payload = content_payload(first)
     assert payload["matches"][0]["file_path"] == "src/changed.py"
     assert payload["overlay"]["deleted_paths"] == ["src/deleted.py"]
 
@@ -213,7 +214,7 @@ def test_parse_broken_overlay_shadows_canonical_symbols_with_repair_evidence(
     )
     assert canonical["ok"] is True
     assert canonical["hit_count"] == 0
-    canonical_payload = json.loads(canonical["content"])
+    canonical_payload = content_payload(canonical)
     assert canonical_payload["matches"] == []
 
     repaired = source_graph_query(
@@ -222,7 +223,7 @@ def test_parse_broken_overlay_shadows_canonical_symbols_with_repair_evidence(
     )
     assert repaired["ok"] is True
     assert repaired["authority_source"] == "rework_overlay"
-    payload = json.loads(repaired["content"])
+    payload = content_payload(repaired)
     assert payload["matches"] == [{
         "file_path": "src/changed.py",
         "kind": "file",
@@ -332,7 +333,7 @@ def test_overlay_unsupported_fail_closed_is_digest_only_evidence_nf1369(
         workflow_stage="rework", compact_replay=False,
     )
     assert focus["ok"] is True
-    focus_payload = json.loads(focus["content"])
+    focus_payload = content_payload(focus)
     cmake_rows = [
         row for row in focus_payload["matches"]
         if row.get("file_path") == "CMakeLists.txt"

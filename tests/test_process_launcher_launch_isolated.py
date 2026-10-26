@@ -44,6 +44,7 @@ from aiworkhub import runtime_adapters
 from aiworkhub import worker_ai_tools_mcp
 from aiworkhub import windows_appcontainer
 from aiworkhub import worker_workspace
+from source_graph_content_helpers import content_payload, content_text
 
 
 SOURCE = Path(process_launcher_launch_isolated.__file__)
@@ -648,7 +649,7 @@ def test_vscode_launch_prefetch_accepts_parse_broken_rework_overlay(
     source_graph_result = dict(bridge_kwargs["source_graph_result"])
     assert source_graph_result["ok"] is True
     assert source_graph_result["authority_source"] == "rework_overlay"
-    payload = json.loads(str(source_graph_result["content"]))
+    payload = content_payload(source_graph_result)
     assert payload["matches"] == [
         {
             "file_path": "src/changed.py",
@@ -666,7 +667,7 @@ def test_vscode_launch_prefetch_accepts_parse_broken_rework_overlay(
         }
     ]
     assert payload["overlay"]["repair_evidence_paths"] == ["src/changed.py"]
-    assert "canonical_symbol" not in str(source_graph_result["content"])
+    assert "canonical_symbol" not in content_text(source_graph_result)
     blocked_reasons = [str(event.get("blocked_reason") or "") for event in manager.events]
     assert not any(
         reason.startswith("vscode_lm_initial_source_graph_prefetch_failed")

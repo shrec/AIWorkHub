@@ -8,6 +8,7 @@ from aiworkhub import source_graph as sg
 from aiworkhub import worker_ai_tools_mcp as wtm
 from aiworkhub.repository_state import bootstrap_repository
 from aiworkhub.source_graph_ast import EDGE_KINDS
+from source_graph_content_helpers import content_payload
 
 EDGE_WINDOW = 16
 TRIVIAL_CANDIDATE_KINDS = ("imports", "annotates")
@@ -208,7 +209,7 @@ def test_mcp_file_mode_serves_the_filtered_window(repo):
         workflow_stage="implementation", compact_replay=False,
     )
     assert reply["ok"] is True
-    served = json.loads(reply["content"])["contexts"][0]
+    served = content_payload(reply)["contexts"][0]
     assert served["trivial_edges_dropped"] > 0
     assert served["edges"]
     assert not any(_trivial_in_fixture(edge) for edge in served["edges"])

@@ -10,7 +10,6 @@ walk completed, and resumes a fallback cursor under the kind that minted it.
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 from pathlib import Path
@@ -24,6 +23,7 @@ if str(_SRC) not in sys.path:
 from aiworkhub import source_graph as sg  # noqa: E402
 from aiworkhub import worker_ai_tools_mcp as w  # noqa: E402
 from aiworkhub.repository_state import bootstrap_repository  # noqa: E402
+from source_graph_content_helpers import content_payload  # noqa: E402
 
 _NEEDLE = "nf01540_far_literal_marker"
 _PHRASE = "gamma delta"
@@ -101,7 +101,7 @@ def test_literal_beyond_first_page_is_returned_as_a_literal_hit(ctx) -> None:
     assert result["hit_count"] == 1
     assert result["retrieval_reason"].startswith("bodygrep_literal_resumed:")
     assert int(result["retrieval_reason"].rsplit(":", 1)[1]) >= 2
-    rows = json.loads(result["content"])["matches"]
+    rows = content_payload(result)["matches"]
     assert [row["file_path"] for row in rows] == [_HIT_FILE]
     assert "match_kind" not in rows[0]
 
@@ -116,7 +116,7 @@ def test_incomplete_bounded_walk_returns_resumable_scan_incomplete(
     assert result["ok"] is True
     assert result["hit_count"] == 0
     assert result["retrieval_reason"] == "bodygrep_literal_scan_incomplete"
-    body = json.loads(result["content"])
+    body = content_payload(result)
     assert body["matches"] == []
     assert "match_kind" not in body
     cursor = result["next_cursor"]
@@ -125,7 +125,7 @@ def test_incomplete_bounded_walk_returns_resumable_scan_incomplete(
     for _ in range(10):
         page = _query(ctx, _NEEDLE, cursor=cursor)
         assert page["ok"] is True
-        rows = json.loads(page["content"])["matches"]
+        rows = content_payload(page)["matches"]
         if rows:
             assert [row["file_path"] for row in rows] == [_HIT_FILE]
             assert "match_kind" not in rows[0]
@@ -141,7 +141,7 @@ def test_completed_literal_zero_still_runs_the_token_fallback(ctx) -> None:
 
     assert result["ok"] is True
     assert result["retrieval_reason"] == "fallback:bodygrep_token_and_line"
-    rows = json.loads(result["content"])["matches"]
+    rows = content_payload(result)["matches"]
     assert rows
     assert {row["match_kind"] for row in rows} == {"token_and_line"}
     assert rows[0]["file_path"] == "pkg/fill_00.py"
@@ -156,7 +156,7 @@ def test_token_fallback_cursor_resumes_through_the_tool(ctx) -> None:
 
     assert resumed["ok"] is True
     assert resumed["retrieval_reason"] == "fallback:bodygrep_token_and_line"
-    rows = json.loads(resumed["content"])["matches"]
+    rows = content_payload(resumed)["matches"]
     assert [row["file_path"] for row in rows] == ["pkg/fill_07.py"]
     assert rows[0]["match_kind"] == "token_and_line"
 
