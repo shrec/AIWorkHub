@@ -1142,7 +1142,12 @@ def test_launch_isolated_unverified_claude_model_fails_closed(
     assert result["ok"] is True
     argv = list(metadata["worker_argv"])
     assert "--effort" not in argv
-    assert metadata["reasoning_effort"] is None
+    receipt = dict(metadata["reasoning_effort"])
+    assert receipt["applied"] is False
+    assert receipt["flag_emitted"] is False
+    assert receipt["status"] == "unsupported"
+    assert receipt["profile"] == "canonical_maximum"
+    assert receipt["applied_key"] is None
     assert "--model" in argv and "claude-unverified-model" in argv
     assert metadata["claude_cli_release"] == "1.2.3"
     assert len(probe_calls) == 1

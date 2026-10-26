@@ -3302,6 +3302,39 @@ def test_create_request_security_stays_security_and_review_stays_review(
     assert review_payload["request_kind"] == "quality_review"
 
 
+def test_create_request_reasoning_receipt_matches_request_json_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "bridge"
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(root))
+    repo = _repo(tmp_path)
+    repo_id = repository_state.inspect_repository(repo).manifest.repo_id
+    _host(root, repo_id, models=["glm-5.2"], access_state="granted_remembered")
+    request_id = "b" * 32
+    workspace, home = _effort_workspace(tmp_path, request_id)
+    request = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=request_id,
+        workspace_path=workspace,
+        workspace_home=home,
+        prompt="Receipt card.",
+        model="glm-5.2",
+        allowed_writes=[],
+        timeout_seconds=30,
+        card={"work_kind": "security"},
+    )
+    decision = json.loads(request.request_path.read_text(encoding="utf-8"))[
+        "reasoning_decision"
+    ]
+    receipt = request.reasoning_receipt
+    assert receipt is not None
+    assert receipt["profile"] == decision["profile"]
+    assert receipt["status"] == decision["route_effort"]["status"]
+    assert receipt["applied"] is bool(decision["route_effort"]["applied"])
+    assert receipt["provider_family"] == decision["request"]["provider_family"]
+    assert receipt["difficulty"] == decision["request"]["difficulty"]
+
+
 def test_vscode_lm_effort_request_maps_card_vocabulary_without_bridge_error() -> None:
     generic = vscode_lm_bridge.vscode_lm_effort_request(
         request_kind="worker", card={"work_kind": "generic"},

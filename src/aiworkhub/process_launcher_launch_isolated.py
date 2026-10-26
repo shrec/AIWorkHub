@@ -1137,6 +1137,29 @@ def launch_isolated(
             # exactly these bytes and nothing else.
             stdin_payload = runtime_adapters.plan_stdin_payload(plan)
             context_delivery = _project_context_delivery(context_result, prompt_hash)
+            effort_receipt = (
+                plan.reasoning_receipt
+                if isinstance(plan, runtime_adapters.RuntimeAdapterPlan)
+                else None
+            )
+            if effort_receipt is None:
+                effort_receipt = getattr(bridge_request, "reasoning_receipt", None)
+            if effort_receipt is None:
+                try:
+                    effort_receipt = runtime_adapters.unsupported_reasoning_receipt(
+                        adapter_id,
+                        card,
+                        is_reviewer=quality_review_binding is not None,
+                        target_card=review_target_card,
+                        lens=(
+                            str(quality_review_binding["lens"])
+                            if quality_review_binding is not None
+                            else None
+                        ),
+                        context_capacity=context_capacity,
+                    )
+                except Exception:
+                    effort_receipt = None
             metadata = {
                 "schema_id": "aiworkhub.task_mcp.isolated_request.v1",
                 "request_id": request_id,
@@ -1170,11 +1193,7 @@ def launch_isolated(
                     if include_partial_messages
                     else "terminal_events"
                 ),
-                "reasoning_effort": (
-                    plan.reasoning_receipt
-                    if isinstance(plan, runtime_adapters.RuntimeAdapterPlan)
-                    else None
-                ),
+                "reasoning_effort": effort_receipt,
                 **_legacy_timeout_fields(timeout_seconds),
                 "token_budget": (
                     dict(token_budget_value)

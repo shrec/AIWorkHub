@@ -3398,6 +3398,41 @@ def resolve_adapter_reasoning(
     return reasoning_policy.resolve_reasoning_effort(request, capability)
 
 
+def unsupported_reasoning_receipt(
+    adapter_id: str,
+    card: Mapping[str, Any],
+    *,
+    is_reviewer: bool = False,
+    target_card: Mapping[str, Any] | None = None,
+    lens: str | None = None,
+    context_capacity: int | None = None,
+) -> dict[str, Any]:
+    """Informational receipt for a route that has no verified effort control.
+
+    Display-only: it reports the canonical profile the task deserves while
+    stating truthfully that no control was applied or emitted.
+    """
+
+    request = _derive_reasoning_request(
+        adapter_id,
+        card,
+        is_reviewer=is_reviewer,
+        target_card=target_card,
+        lens=lens,
+    )
+    decision = reasoning_policy.resolve_reasoning_effort(request, None)
+    return {
+        "applied": False,
+        "flag_emitted": False,
+        "status": reasoning_policy.ControlStatus.UNSUPPORTED.value,
+        "profile": decision.profile.value,
+        "applied_key": None,
+        "provider_family": decision.request.provider_family.value,
+        "difficulty": decision.request.difficulty.value,
+        "context_capacity": context_capacity,
+    }
+
+
 def resolve_context_capacity(
     adapter_id: str,
     model: str | None = None,

@@ -17,7 +17,7 @@ import secrets
 import stat
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -174,6 +174,8 @@ class BridgeRequest:
     worker_spec_path: Path
     cancel_path: Path
     cancel_token: str
+    # Launch-time effort receipt, not part of persisted bridge metadata.
+    reasoning_receipt: dict[str, Any] | None = field(default=None, compare=False)
 
 
 def bridge_request_metadata(request: BridgeRequest) -> dict[str, str]:
@@ -875,6 +877,40 @@ def resolve_vscode_lm_reasoning(
     return payload, vscode_lm_model_context(host_readiness, token_budget)
 
 
+def bridge_reasoning_receipt(
+    reasoning_decision: object,
+    model_context: object,
+) -> dict[str, Any] | None:
+    """Bounded effort receipt for dashboards, from the bridge decision payload."""
+    try:
+        if not isinstance(reasoning_decision, dict):
+            return None
+        request = reasoning_decision["request"]
+        route_effort = reasoning_decision.get("route_effort")
+        if route_effort is not None and not isinstance(route_effort, dict):
+            return None
+        applied = bool(route_effort is not None and route_effort.get("applied"))
+        if route_effort is None:
+            status = reasoning_policy.ControlStatus.UNSUPPORTED.value
+        else:
+            status = route_effort.get("status") or reasoning_policy.ControlStatus.UNSUPPORTED.value
+        capacity = None
+        if isinstance(model_context, dict):
+            capacity = _positive_int(model_context.get("capacity_tokens"))
+        return {
+            "applied": applied,
+            "flag_emitted": applied,
+            "status": str(status),
+            "profile": str(reasoning_decision["profile"]),
+            "applied_key": route_effort.get("applied_key") if applied and route_effort is not None else None,
+            "provider_family": str(request["provider_family"]),
+            "difficulty": str(request["difficulty"]),
+            "context_capacity": capacity,
+        }
+    except (KeyError, TypeError, AttributeError, ValueError):
+        return None
+
+
 def create_request(
     *,
     repo: Path,
@@ -1124,6 +1160,7 @@ def create_request(
         worker_spec_path,
         cancel_path,
         cancel_token,
+        bridge_reasoning_receipt(reasoning_decision, model_context),
     )
 
 
