@@ -4224,8 +4224,16 @@ def aiworkhub_task_reroute_launch_identity(
     to_model: str,
     reason: str = "",
     topic: str | None = None,
+    include_card: CardInclude = "none",
 ) -> dict[str, Any]:
     """COORDINATOR WRITE: explicitly reroute one pending retry launch identity.
+
+    Replies with a receipt (``aiworkhub.reroute_launch_identity_receipt.v1``):
+    task_id, status, worker_status, card_sha256/card_bytes, and every
+    server-derived key the reroute attached (from_runner, to_runner, to_model,
+    refusal and authorization receipts). The whole post-reroute card measured
+    55,156 chars (NF-2026-00500); ``include_card`` = none (default) | summary |
+    full brings it back.
 
     Args:
         task_id: Id of the pending, unclaimed card whose launch identity is rerouted; any other state is refused with reroute_not_pending_unclaimed.
@@ -4235,16 +4243,25 @@ def aiworkhub_task_reroute_launch_identity(
         to_model: Model of the replacement route; it must equal the model the workforce catalog lists for that runner and adapter.
         reason: Why the reroute is needed, recorded in the audit receipt and cut to 500 characters; some reroute paths are refused without one. Default empty.
         topic: Topic the card is expected to be in; a different live topic is refused. Omit to skip the check.
+        include_card: Card view to attach to the receipt: none (default), summary (baselines and evidence folded) or full (the exact post-transition card).
     """
 
-    return core.reroute_launch_identity(
+    refusal = _include_card_refusal(include_card)
+    if refusal is not None:
+        return refusal
+    return _lifecycle_receipt(
+        core.reroute_launch_identity(
+            task_id=task_id,
+            from_runner=from_runner,
+            to_runner=to_runner,
+            to_adapter_id=to_adapter_id,
+            to_model=to_model,
+            reason=reason,
+            topic=topic,
+        ),
+        schema_id="aiworkhub.reroute_launch_identity_receipt.v1",
         task_id=task_id,
-        from_runner=from_runner,
-        to_runner=to_runner,
-        to_adapter_id=to_adapter_id,
-        to_model=to_model,
-        reason=reason,
-        topic=topic,
+        include_card=include_card,
     )
 
 
