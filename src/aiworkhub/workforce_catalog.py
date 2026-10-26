@@ -94,6 +94,15 @@ _ROUTE_SUCCESS_STATES = frozenset(
 # launches on one such route (``codex_cli``/``gpt-5.4``) returning 0 accepts
 # and 0 rejects -- NF-2026-00655.
 _ROUTE_SINGLE_FAILURE_KINDS = frozenset({"auth", "quota", "model_not_found"})
+# NF-2026-01674: the kinds an AUTOMATIC reroute may act on -- a named subset of
+# ``_ROUTE_SINGLE_FAILURE_KINDS``.  A refused balance or a dead credential
+# belongs to the route, so moving the card to another route is the repair.
+# ``model_not_found`` stays out on purpose: it names an identity this account
+# does not have, a card-creation defect the manager must see rather than one a
+# silent reroute papers over.  Every multi-failure kind (transient,
+# harness_behaviour) can clear without touching the card.
+QUOTA_REROUTE_FAILURE_KINDS = frozenset({"auth", "quota"})
+QUOTA_CIRCUIT_REROUTE_SCHEMA_ID = "aiworkhub.quota_circuit_reroute.v1"
 # Sealed, provider-owned structured terminal error codes.  These are honoured
 # only from an error object the transport sealed itself; the free-form ``error``
 # string and any assistant/model prose are never scanned for them, so a model

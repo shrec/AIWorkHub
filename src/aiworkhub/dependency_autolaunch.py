@@ -287,6 +287,22 @@ FAILED_WORKER_STATUSES = frozenset(
 )
 ACTIVE_STATUSES = frozenset({"pending"})
 ACTIVE_WORKER_STATUSES = frozenset({"", "unclaimed"})
+# NF-2026-01674: a pending card whose bound route tripped a quota/auth failure
+# circuit sat until a manager rerouted it by hand.  ``reconcile`` now moves it
+# through ``core.reroute_launch_identity`` -- every gate of a manual reroute
+# still applies -- at most once per circuit episode, and records one blocker on
+# the card when nothing capable can take it.  The card schema carries no
+# manager pin distinct from ``runner``, so there is no pinned card to exempt.
+QUOTA_CIRCUIT_BLOCKER_KIND = "quota_circuit_reroute"
+NO_CAPABLE_ROUTE = "no_capable_route"
+QUOTA_CIRCUIT_REROUTE_EXHAUSTED = "quota_circuit_reroute_exhausted"
+# ``project_context.task_type`` -> the ranking kinds a manager asks for.  A task
+# type without an entry is never guessed onto a route: it is held as
+# ``no_capable_route`` with that reason.
+_RANK_KINDS_BY_TASK_TYPE: Mapping[str, tuple[str, ...]] = {
+    "code": ("code",),
+    "research": ("research",),
+}
 
 
 LaunchFn = Callable[[str, str, str, str], Mapping[str, Any]]
@@ -365,23 +381,27 @@ def _read_connection(db: Path) -> sqlite3.Connection:
     return conn
 
 
+def _task_row(row: sqlite3.Row) -> _TaskRow:
+    card = _load_card(row["card_json"])
+    return _TaskRow(
+        task_id=str(row["task_id"]),
+        runner=str(row["runner"] or card.get("runner") or ""),
+        topic=str(row["topic"] or card.get("topic") or ""),
+        status=str(row["status"] or card.get("status") or ""),
+        worker_status=str(row["worker_status"] or card.get("worker_status") or ""),
+        card=card,
+        updated_at=str(row["updated_at"] or ""),
+    )
+
+
 def _read_rows(conn: sqlite3.Connection) -> dict[str, _TaskRow]:
     rows: dict[str, _TaskRow] = {}
     for row in conn.execute(
         "SELECT task_id, runner, topic, status, worker_status, card_json, updated_at "
         "FROM tasks WHERE COALESCE(archived_at, '') = ''"
     ):
-        card = _load_card(row["card_json"])
-        task_id = str(row["task_id"])
-        rows[task_id] = _TaskRow(
-            task_id=task_id,
-            runner=str(row["runner"] or card.get("runner") or ""),
-            topic=str(row["topic"] or card.get("topic") or ""),
-            status=str(row["status"] or card.get("status") or ""),
-            worker_status=str(row["worker_status"] or card.get("worker_status") or ""),
-            card=card,
-            updated_at=str(row["updated_at"] or ""),
-        )
+        task = _task_row(row)
+        rows[task.task_id] = task
     return rows
 
 
@@ -698,6 +718,270 @@ def _mark_dependency_blocked(
     return True
 
 
+def _reread_row(db: Path, task_id: str) -> _TaskRow | None:
+    conn = _read_connection(db)
+    try:
+        row = conn.execute(
+            "SELECT task_id, runner, topic, status, worker_status, card_json, updated_at "
+            "FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return _task_row(row) if row is not None else None
+
+
+def _ranked_alternative(
+    root: Path, card: Mapping[str, Any], circuit: Mapping[str, Any]
+) -> tuple[list[dict[str, str]], str]:
+    """Every available worker for ``card`` other than its tripped route, best first.
+
+    The ranking is ``aiworkhub_manager_workforce_rank``'s own -- ``rank_task``
+    over the fully evidenced ``build_routing_catalog`` -- asked for the card's
+    task kind and risk tier.  The caller tries the routes in this order.
+    Returns the routes, or an empty list and why not.
+    """
+    from . import task_store, workforce_catalog, workforce_router
+
+    context = card.get("project_context")
+    task_type = (
+        str(context.get("task_type") or "code") if isinstance(context, Mapping) else "code"
+    ).strip().lower()
+    kinds = _RANK_KINDS_BY_TASK_TYPE.get(task_type)
+    if kinds is None:
+        return [], f"task_type_not_rankable:{task_type[:40]}"
+    try:
+        task = workforce_router.TaskRequirements.build(
+            task_id=str(card.get("task_id") or ""),
+            repo_id=task_store.storage_readiness(root).repo_id or "unknown",
+            kinds=kinds,
+            risk=str(card.get("risk_tier") or "medium"),
+        )
+        ranked = workforce_catalog.rank_task(
+            root, task, catalog=workforce_catalog.build_routing_catalog(root)
+        )
+    except Exception as exc:  # noqa: BLE001 - an unreadable ranking claims nothing
+        return [], f"workforce_rank_unavailable:{type(exc).__name__}"
+    tripped = (str(circuit.get("adapter_id") or ""), str(circuit.get("model") or ""))
+    targets: list[dict[str, str]] = []
+    for candidate in ranked.get("candidates") or []:
+        if not isinstance(candidate, Mapping) or candidate.get("excluded") is not False:
+            continue
+        runner = str(candidate.get("execution_runner") or "")
+        route = (str(candidate.get("adapter_id") or ""), str(candidate.get("model") or ""))
+        if not runner or not all(route) or runner == card.get("runner") or route == tripped:
+            continue
+        # Catalog availability reads the short-horizon process ledger while the
+        # launch gate reads the canonical event log: ask the gate's question.
+        if workforce_catalog.route_circuit_for(root, *route).get("state") == "open":
+            continue
+        targets.append({"runner": runner, "adapter_id": route[0], "model": route[1]})
+    return targets, ("" if targets else "no_compatible_available_worker")
+
+
+def _quota_circuit_entry(child: _TaskRow, circuit: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "task_id": child.task_id,
+        "runner": child.runner,
+        "route": f"{circuit.get('adapter_id') or ''}/{circuit.get('model') or ''}",
+        "failure_kind": str(circuit.get("failure_kind") or ""),
+        "reset_at": str(circuit.get("reset_at") or ""),
+        "open_until": str(circuit.get("open_until") or ""),
+    }
+
+
+def _record_route_blocker(
+    conn: sqlite3.Connection, task_id: str, blocker: Mapping[str, Any]
+) -> bool:
+    """Record ``blocker`` on a pending card once per circuit episode.
+
+    The same blocker for the same route is not rewritten while the episode it
+    names is still open, so a reconcile tick that learns nothing new leaves the
+    card row -- and every hold keyed on its ``updated_at`` -- untouched.
+    """
+    row = conn.execute(
+        "SELECT status, worker_status, card_json FROM tasks WHERE task_id=?",
+        (task_id,),
+    ).fetchone()
+    if row is None or (str(row["status"] or ""), str(row["worker_status"] or "")) != (
+        "pending",
+        "unclaimed",
+    ):
+        return False
+    card = _load_card(row["card_json"])
+    now = _now()
+    prior = card.get("operational_blocker")
+    if (
+        isinstance(prior, Mapping)
+        and all(
+            prior.get(key) == blocker.get(key)
+            for key in ("kind", "reason", "adapter_id", "model")
+        )
+        and str(prior.get("open_until") or "") > now
+    ):
+        return False
+    card["operational_blocker"] = dict(blocker)
+    cur = conn.execute(
+        "UPDATE tasks SET card_json=?, updated_at=? "
+        "WHERE task_id=? AND status='pending' AND worker_status='unclaimed' AND card_json=?",
+        (json.dumps(card, ensure_ascii=False, sort_keys=True), now, task_id, row["card_json"]),
+    )
+    if cur.rowcount != 1:
+        return False
+    conn.execute(
+        "INSERT INTO task_events(task_id,event,runner,payload_json,created_at) VALUES(?,?,?,?,?)",
+        (
+            task_id,
+            "quota_circuit_reroute_blocked",
+            "codex",
+            json.dumps({**blocker, "schema_id": SCHEMA_ID}, ensure_ascii=False, sort_keys=True),
+            now,
+        ),
+    )
+    return True
+
+
+def _quota_circuit_hold(
+    root: Path, child: _TaskRow, circuit: Mapping[str, Any], reason: str, detail: str
+) -> dict[str, Any]:
+    """Keep the card pending with ``reason`` recorded on it once; never launch it."""
+    blocker = {
+        "kind": QUOTA_CIRCUIT_BLOCKER_KIND,
+        "reason": reason,
+        "adapter_id": str(circuit.get("adapter_id") or "")[:128],
+        "model": str(circuit.get("model") or "")[:128],
+        "failure_kind": str(circuit.get("failure_kind") or ""),
+        "reset_at": str(circuit.get("reset_at") or ""),
+        "open_until": str(circuit.get("open_until") or ""),
+        "detail": str(detail or "")[:240],
+        "observed_at": _now(),
+    }
+    with _write_connection(_repo_db(root)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        recorded = _record_route_blocker(conn, child.task_id, blocker)
+        conn.commit()
+    return {
+        "action": "blocked",
+        "entry": {
+            **_quota_circuit_entry(child, circuit),
+            "reason": reason,
+            "detail": blocker["detail"],
+            "blocker_recorded": recorded,
+        },
+    }
+
+
+def _quota_circuit_reroute(root: Path, child: _TaskRow) -> dict[str, Any]:
+    """Move a pending card off an open quota/auth route circuit (NF-2026-01674).
+
+    ``{"action": "none"}`` when no such circuit pins the card, and the ordinary
+    launch path runs unchanged; ``{"action": "rerouted"}`` with the re-read row
+    once ``core.reroute_launch_identity`` moved it -- every gate of a manual
+    reroute applied; ``{"action": "blocked"}`` when the card must stay pending
+    this pass.  It never launches anything itself.
+    """
+    if "quality_review" in (child.topic, str(child.card.get("topic") or "")):
+        return {"action": "none"}  # reviewer routing belongs to the review orchestrator
+    card = {
+        **child.card,
+        "task_id": child.task_id,
+        "runner": child.runner,
+        "topic": child.topic,
+        "status": child.status or "pending",
+        "worker_status": child.worker_status or "unclaimed",
+    }
+    try:
+        from . import core
+
+        # reroute_launch_identity acts on core's bound repository only.
+        if core.repo_root().resolve() != root.resolve():
+            return {"action": "none"}
+        verdict = core.quota_circuit_reroute_verdict(root, card)
+    except Exception:  # noqa: BLE001 - no verdict is never a reason to move a card
+        return {"action": "none"}
+    reason = str(verdict.get("reason") or "")
+    if reason not in {"eligible", "already_rerouted_this_episode"}:
+        return {"action": "none"}
+    circuit = dict(verdict.get("circuit") or {})
+    if reason == "already_rerouted_this_episode":
+        # No ping-pong: a second open circuit inside the episode stays put.
+        return _quota_circuit_hold(
+            root,
+            child,
+            circuit,
+            QUOTA_CIRCUIT_REROUTE_EXHAUSTED,
+            "automatic reroute already used in this circuit episode",
+        )
+    targets, detail = _ranked_alternative(root, card, circuit)
+    if not targets:
+        if detail.startswith("workforce_rank_unavailable"):
+            # Not a measured absence of capacity: nothing is recorded.
+            return {
+                "action": "blocked",
+                "entry": {
+                    **_quota_circuit_entry(child, circuit),
+                    "reason": "quota_circuit_rank_unavailable",
+                    "detail": detail,
+                },
+            }
+        return _quota_circuit_hold(root, child, circuit, NO_CAPABLE_ROUTE, detail)
+    refusals: list[str] = []
+    for target in targets:
+        try:
+            result = core.reroute_launch_identity(
+                child.task_id,
+                from_runner=child.runner,
+                to_runner=target["runner"],
+                to_adapter_id=target["adapter_id"],
+                to_model=target["model"],
+                reason=(
+                    "operational_provider_reroute:quota_circuit:"
+                    f"failure_kind={circuit.get('failure_kind')}:"
+                    f"route={circuit.get('adapter_id')}/{circuit.get('model')}:"
+                    f"reset_at={circuit.get('reset_at') or 'unreported'}"
+                ),
+                topic=child.topic,
+                quota_circuit=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - one refused move must not abort the pass
+            result = {"ok": False, "stderr": f"reroute_raised:{type(exc).__name__}"}
+        if result.get("ok"):
+            break
+        # core's own gates read a different catalog than the ranking, so a route
+        # they refuse falls through to the next ranked one instead of pinning
+        # the card behind the open circuit for the whole episode.
+        refusals.append(
+            f"{target['runner']}:{str(result.get('stderr') or result.get('error') or '')[:120]}"
+        )
+    rerouted = _reread_row(_repo_db(root), child.task_id) if result.get("ok") else None
+    if rerouted is None:
+        return {
+            "action": "blocked",
+            "entry": {
+                **_quota_circuit_entry(child, circuit),
+                "reason": "quota_circuit_reroute_refused",
+                "detail": "; ".join(refusals)[:240],
+            },
+        }
+    return {
+        "action": "rerouted",
+        "child": rerouted,
+        "receipt": {
+            "task_id": child.task_id,
+            "authority": "quota_circuit",
+            "from_runner": child.runner,
+            "from_adapter_id": circuit.get("adapter_id"),
+            "from_model": circuit.get("model"),
+            "to_runner": rerouted.runner,
+            "to_adapter_id": target["adapter_id"],
+            "to_model": str(result.get("to_model") or target["model"]),
+            "failure_kind": circuit.get("failure_kind"),
+            "reset_at": circuit.get("reset_at"),
+            "open_until": circuit.get("open_until"),
+        },
+    }
+
+
 def reconcile(
     repo_root: Path | str,
     *,
@@ -721,6 +1005,7 @@ def reconcile(
         "repo_root": str(root),
         "trigger_task_id": trigger_task_id,
         "launched": [],
+        "rerouted": [],
         "blocked": [],
         "delayed": [],
         "skipped": [],
@@ -770,6 +1055,17 @@ def reconcile(
         if waiting:
             outcome["delayed"].append({"task_id": child.task_id, "reason": "waiting_dependencies", "dependencies": waiting})
             continue
+        # NF-2026-01674: a launchable card whose bound route tripped a
+        # quota/auth circuit moves to the ranked alternative first, so the
+        # launch below is the ordinary one, on the new runner.  The reroute
+        # changes the card row, which releases any hold kept for the old one.
+        reroute = _quota_circuit_reroute(root, child)
+        if reroute["action"] == "blocked":
+            outcome["delayed"].append(reroute["entry"])
+            continue
+        if reroute["action"] == "rerouted":
+            outcome["rerouted"].append(reroute["receipt"])
+            child = reroute["child"]
         conn = _read_connection(db)
         try:
             hold = _hold_for(conn, child.task_id)

@@ -9349,6 +9349,124 @@ def _provider_runtime_or_cancellation_retry(card: Mapping[str, Any]) -> bool:
     )
 
 
+def _quota_reroute_bound_circuits(
+    repo: Path, card: Mapping[str, Any], *, now_epoch: float | None,
+) -> tuple[list[dict[str, Any]], str]:
+    """Circuits of the routes the launch path binds ``card`` to, or why none.
+
+    Derivation is the launch path's own answer.  When it succeeds on a sibling
+    adapter because the preferred one's circuit is open, the card is not
+    stranded.  When it refuses outright, the candidates are the runner's
+    canonical pinnable routes -- the set derivation walked -- and the caller
+    decides whether every one of them is open.  No circuit is never "fine".
+    """
+    from . import process_launcher  # local import: cycle-safe (see _reconcile_retained_workspaces)
+    from . import workforce_catalog  # local import: cycle-safe (it imports core)
+
+    try:
+        identity: Mapping[str, Any] | None = process_launcher.derive_launch_identity(repo, card)
+    except process_launcher.LaunchRejected:
+        identity = None
+    if identity is not None:
+        derived_from = identity.get("derived_from")
+        if isinstance(derived_from, Mapping) and derived_from.get("adapter_circuit_skipped"):
+            return [], "sibling_adapter_launchable"
+        routes = [(str(identity.get("adapter_id") or ""), str(identity.get("model") or ""))]
+    else:
+        runner = str(card.get("runner") or "").strip()
+        routes = []
+        for adapter in process_launcher.adapter_identity_tuple(runner):
+            pinned = process_launcher._CANONICAL_WORKFORCE.get((runner, adapter))
+            if pinned is not None:
+                routes.append((adapter, str(pinned["model"])))
+    circuits = [
+        workforce_catalog.route_circuit_for(repo, adapter, model)
+        if now_epoch is None
+        else workforce_catalog.route_circuit_for(repo, adapter, model, now_epoch=now_epoch)
+        for adapter, model in routes
+        if adapter and model
+    ]
+    return circuits, ("" if circuits else "route_unresolved")
+
+
+def quota_circuit_reroute_verdict(
+    repo: Path | str,
+    card: Mapping[str, Any],
+    *,
+    now_epoch: float | None = None,
+) -> dict[str, Any]:
+    """May this pending card be moved off its route by an open failure circuit?
+
+    NF-2026-01674.  One predicate, read by the dependency reconciler that
+    proposes the move and re-derived by ``reroute_launch_identity`` that
+    authorizes it, so the two cannot disagree.  Eligible only when every route
+    the launch path would bind the card to is open with a
+    ``workforce_catalog.QUOTA_REROUTE_FAILURE_KINDS`` failure and the card
+    holds no automatic reroute whose episode is still open.  ``circuit``
+    carries the bound route's evidence -- when the episode opened and when it
+    ends -- whenever the circuit itself qualifies.
+    """
+    from . import workforce_catalog  # local import: cycle-safe (it imports core)
+
+    observed_now = (
+        float(now_epoch) if now_epoch is not None else datetime.now(timezone.utc).timestamp()
+    )
+    verdict: dict[str, Any] = {
+        "schema_id": workforce_catalog.QUOTA_CIRCUIT_REROUTE_SCHEMA_ID,
+        "eligible": False,
+        "reason": "",
+        "circuit": {},
+    }
+    try:
+        circuits, unresolved = _quota_reroute_bound_circuits(
+            Path(repo), card, now_epoch=observed_now
+        )
+    except Exception as exc:  # noqa: BLE001 - an unresolvable route is not a verdict
+        verdict["reason"] = f"route_unresolved:{type(exc).__name__}"
+        return verdict
+    if not circuits:
+        verdict["reason"] = unresolved
+        return verdict
+    states = sorted({str(circuit.get("state") or "") for circuit in circuits})
+    if states != ["open"]:
+        verdict["reason"] = "circuit_not_open:" + ",".join(states)
+        return verdict
+    kinds = sorted({str(circuit.get("failure_kind") or "") for circuit in circuits})
+    if not set(kinds) <= workforce_catalog.QUOTA_REROUTE_FAILURE_KINDS:
+        verdict["reason"] = "failure_kind_not_reroutable:" + ",".join(kinds)
+        return verdict
+    bound = circuits[0]
+    opened = observed_now - float(bound.get("latest_failure_age_seconds") or 0.0)
+    until = opened + float(bound.get("cooldown_seconds") or 0.0)
+    # Whole seconds, rounded rather than floored: ``until`` lands on a
+    # provider-named ``reset_at`` exactly despite the age arithmetic.
+    verdict["circuit"] = {
+        "adapter_id": str(bound.get("adapter_id") or ""),
+        "model": str(bound.get("model") or ""),
+        "state": "open",
+        "failure_kind": str(bound.get("failure_kind") or ""),
+        "consecutive_failures": bound.get("consecutive_failures"),
+        "reset_at": str(bound.get("reset_at") or ""),
+        "opened_at": datetime.fromtimestamp(round(opened), tz=timezone.utc).isoformat(),
+        "open_until": datetime.fromtimestamp(round(until), tz=timezone.utc).isoformat(),
+    }
+    prior = card.get("quota_circuit_reroute")
+    if prior is not None:
+        # The episode an earlier automatic move ran in.  A record whose end
+        # cannot be read still counts: a second move is never granted on unknown.
+        prior_until = (
+            workforce_catalog._process_event_epoch({"timestamp": prior.get("open_until")})
+            if isinstance(prior, Mapping)
+            else None
+        )
+        if prior_until is None or prior_until > observed_now:
+            verdict["reason"] = "already_rerouted_this_episode"
+            return verdict
+    verdict["eligible"] = True
+    verdict["reason"] = "eligible"
+    return verdict
+
+
 def _operational_provider_reroute_authorization(
     card: Mapping[str, Any],
     *,
@@ -9357,13 +9475,15 @@ def _operational_provider_reroute_authorization(
     to_adapter_id: str,
     to_model: str,
     reason: str,
+    quota_circuit: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Authorize a manager reroute that is not a review rejection.
 
     Consumed only by ``reroute_launch_identity``, which still requires the
     coordinator write gate. A worker cannot reroute itself through this
     receipt: the gate refuses the write, and a review rejection never reaches
-    here.
+    here. ``quota_circuit`` is circuit evidence that caller has already
+    re-derived and verified; it is never read from the card.
     """
     if not all(
         str(value or "").strip()
@@ -9379,6 +9499,24 @@ def _operational_provider_reroute_authorization(
         or card.get("validation_only_replay_authorization") is not None
     ):
         return None
+    if quota_circuit is not None:
+        # NF-2026-01674: the automatic move names the open circuit as its whole
+        # authority; it never borrows a manager recovery, retry or rejection
+        # receipt the card may also carry.
+        return {
+            "schema_id": "aiworkhub.operational_provider_reroute.v1",
+            "authority": "quota_circuit",
+            "reason": str(reason).strip()[:500],
+            "from_runner": str(from_runner).strip(),
+            "from_adapter_id": str(quota_circuit.get("adapter_id") or ""),
+            "from_model": str(quota_circuit.get("model") or ""),
+            "to_runner": str(to_runner).strip(),
+            "to_adapter_id": str(to_adapter_id).strip(),
+            "to_model": str(to_model).strip(),
+            "failure_kind": str(quota_circuit.get("failure_kind") or ""),
+            "reset_at": str(quota_circuit.get("reset_at") or ""),
+            "circuit": dict(quota_circuit),
+        }
     recovery = _manager_recovery_reroute_episode(card)
     retry = _provider_runtime_or_cancellation_retry(card)
     infrastructure_rejection = _infrastructure_rejection_without_candidate(card)
@@ -9434,6 +9572,7 @@ def reroute_launch_identity(
     to_model: str,
     reason: str = "",
     topic: str | None = None,
+    quota_circuit: bool = False,
 ) -> dict[str, Any]:
     """Atomically reroute one pending/unclaimed card's invalid pinned runner
     to an enabled, available, risk-capable canonical workforce tuple.
@@ -9454,6 +9593,11 @@ def reroute_launch_identity(
     non-pending task, an arbitrary/ambiguous target identity, a disabled,
     unavailable or risk-incapable canonical route, and a compare-and-swap
     race against a concurrent claim or mutation.
+
+    ``quota_circuit`` is the dependency reconciler's automatic move
+    (NF-2026-01674): it is authorized only by an open quota/auth failure
+    circuit on the card's bound route, re-derived here, at most once per
+    circuit episode, and never by any other receipt the card carries.
     """
     from . import process_launcher  # local import: cycle-safe (see _reconcile_retained_workspaces)
     from . import launch_replay_guard  # local import: cycle-safe (it imports core)
@@ -9480,6 +9624,29 @@ def reroute_launch_identity(
         or card.get("claimed_by")
     ):
         return _lifecycle_error("reroute_not_pending_unclaimed")
+
+    quota_circuit_evidence: dict[str, Any] | None = None
+    if quota_circuit:
+        # NF-2026-01674: the reconciler asks, this re-derives.  The circuit is
+        # read from the canonical evidence here, never taken from the caller,
+        # and the once-per-episode bound is enforced here as well.
+        from . import workforce_catalog
+
+        verdict = quota_circuit_reroute_verdict(repo_root(), card)
+        if not verdict.get("eligible"):
+            return _lifecycle_error(
+                f"reroute_quota_circuit_unverified:{verdict.get('reason') or 'unknown'}"
+            )
+        target_circuit = workforce_catalog.route_circuit_for(
+            repo_root(), to_adapter_id, str(to_model or "").strip()
+        )
+        if target_circuit.get("state") == "open":
+            return _lifecycle_error(
+                "reroute_quota_circuit_target_open:"
+                f"adapter={to_adapter_id}:model={to_model}:"
+                f"failure_kind={target_circuit.get('failure_kind') or 'unknown'}"
+            )
+        quota_circuit_evidence = dict(verdict["circuit"])
 
     terminal_retry = card.get("terminal_retry")
     retry_request_id = (
@@ -9514,8 +9681,13 @@ def reroute_launch_identity(
             to_adapter_id=to_adapter_id,
             to_model=to_model,
             reason=bounded_reason,
+            quota_circuit=quota_circuit_evidence,
         )
     )
+    if quota_circuit and (operational_authorization or {}).get("authority") != "quota_circuit":
+        # The automatic move has no other authority to fall back on: a review
+        # rejection or a validation-only replay still needs its own receipt.
+        return _lifecycle_error("reroute_quota_circuit_unauthorized")
     pristine_authorization = bool(
         bounded_reason and from_runner and task_store.is_pristine_pending_card(card)
     )
@@ -9725,6 +9897,23 @@ def reroute_launch_identity(
         semantic_card["identity_reroute"]["operational_provider_authorization"] = (
             operational_authorization
         )
+    if quota_circuit_evidence is not None:
+        # Kept beside, not inside, ``identity_reroute``: a later manual reroute
+        # replaces that receipt, and this record must still bound the episode.
+        semantic_card["quota_circuit_reroute"] = {
+            "schema_id": workforce_catalog.QUOTA_CIRCUIT_REROUTE_SCHEMA_ID,
+            "from_runner": card_runner,
+            "from_adapter_id": quota_circuit_evidence["adapter_id"],
+            "from_model": quota_circuit_evidence["model"],
+            "to_runner": to_runner,
+            "to_adapter_id": to_adapter_id,
+            "to_model": canonical_model,
+            "failure_kind": quota_circuit_evidence["failure_kind"],
+            "reset_at": quota_circuit_evidence["reset_at"],
+            "opened_at": quota_circuit_evidence["opened_at"],
+            "open_until": quota_circuit_evidence["open_until"],
+            "rerouted_at": now,
+        }
     if validation_replay_receipt:
         semantic_card["identity_reroute"]["validation_replay_authorization"] = (
             validation_replay_receipt
