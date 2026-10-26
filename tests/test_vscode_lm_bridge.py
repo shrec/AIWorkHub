@@ -3075,7 +3075,7 @@ def test_create_request_worker_ordinary_code_selects_high_without_claiming_appli
     assert context["token_spend_cap_tokens"] is None
 
 
-def test_create_request_reviewer_and_high_risk_select_maximum_and_apply_verified_keys(
+def test_create_request_critical_target_review_selects_maximum_and_applies_verified_keys(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "bridge"
@@ -3136,6 +3136,7 @@ def test_create_request_reviewer_and_high_risk_select_maximum_and_apply_verified
             "work_kind": "correctness_review",
             "difficulty": "complex",
         },
+        target_card={"risk_tier": "critical", "difficulty": "complex"},
         token_budget={"cap_tokens": 99},
     )
     review_payload = json.loads(review.request_path.read_text(encoding="utf-8"))
@@ -3145,6 +3146,27 @@ def test_create_request_reviewer_and_high_risk_select_maximum_and_apply_verified
     assert review_effort["applied_key"] == "xhigh"
     assert review_payload["model_context"]["capacity_tokens"] == 128000
     assert review_payload["model_context"]["token_spend_cap_tokens"] is None
+
+    undeclared_id = "e" * 32
+    undeclared_workspace, undeclared_home = _effort_workspace(tmp_path, undeclared_id)
+    undeclared = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=undeclared_id,
+        workspace_path=undeclared_workspace,
+        workspace_home=undeclared_home,
+        prompt="Quality review of an undeclared target.",
+        model="glm-5.2",
+        allowed_writes=[],
+        timeout_seconds=30,
+        request_kind="quality_review",
+        card={"role": "reviewer", "risk_tier": "critical"},
+        token_budget={"cap_tokens": 99},
+    )
+    undeclared_payload = json.loads(undeclared.request_path.read_text(encoding="utf-8"))
+    undeclared_effort = undeclared_payload["reasoning_decision"]["route_effort"]
+    assert undeclared_payload["reasoning_decision"]["profile"] == "canonical_high"
+    assert undeclared_effort["applied"] is True
+    assert undeclared_effort["applied_key"] == "high"
 
 
 def test_resolve_vscode_lm_reasoning_uses_card_and_never_applies_without_keys() -> None:
@@ -3160,7 +3182,7 @@ def test_resolve_vscode_lm_reasoning_uses_card_and_never_applies_without_keys() 
         host_readiness={},
         token_budget={"cap_tokens": 32},
     )
-    assert decision["profile"] == "canonical_maximum"
+    assert decision["profile"] == "canonical_high"
     assert decision["request"]["risk_tier"] == "high"
     assert decision["request"]["work_kind"] == "architecture"
     assert decision["request"]["difficulty"] == "complex"
@@ -3205,6 +3227,7 @@ def test_resolve_vscode_lm_reasoning_applies_only_declared_selectable_keys() -> 
             "difficulty": "complex",
         },
         host_readiness=host,
+        target_card={"risk_tier": "critical", "difficulty": "complex"},
     )
     assert review["profile"] == "canonical_maximum"
     assert review["request"]["role"] == "reviewer"
@@ -3330,8 +3353,8 @@ def test_resolve_vscode_lm_reasoning_review_effort_follows_the_target_card_and_l
         target_card=benign,
         lens="correctness",
     )
-    assert baseline["profile"] == "canonical_high"
-    assert baseline["route_effort"]["applied_key"] == "high"
+    assert baseline["profile"] == "canonical_medium"
+    assert baseline["route_effort"]["applied_key"] == "medium"
 
     security_lens, _ctx = vscode_lm_bridge.resolve_vscode_lm_reasoning(
         request_kind="quality_review",
@@ -3341,9 +3364,9 @@ def test_resolve_vscode_lm_reasoning_review_effort_follows_the_target_card_and_l
         target_card=benign,
         lens="security",
     )
-    assert security_lens["profile"] == "canonical_maximum"
+    assert security_lens["profile"] == "canonical_high"
     assert security_lens["request"]["review_lens"] == "security"
-    assert security_lens["route_effort"]["applied_key"] == "xhigh"
+    assert security_lens["route_effort"]["applied_key"] == "high"
 
     risky_target, _ctx = vscode_lm_bridge.resolve_vscode_lm_reasoning(
         request_kind="quality_review",
@@ -3353,7 +3376,30 @@ def test_resolve_vscode_lm_reasoning_review_effort_follows_the_target_card_and_l
         target_card={"risk_tier": "high"},
         lens="correctness",
     )
-    assert risky_target["profile"] == "canonical_maximum"
+    assert risky_target["profile"] == "canonical_high"
+    assert risky_target["route_effort"]["applied_key"] == "high"
+
+    critical_target, _ctx = vscode_lm_bridge.resolve_vscode_lm_reasoning(
+        request_kind="quality_review",
+        model="glm-5.2",
+        card={"role": "reviewer", "risk_tier": "low"},
+        host_readiness=host,
+        target_card={"risk_tier": "critical"},
+        lens="correctness",
+    )
+    assert critical_target["profile"] == "canonical_maximum"
+    assert critical_target["route_effort"]["applied_key"] == "xhigh"
+
+    security_target, _ctx = vscode_lm_bridge.resolve_vscode_lm_reasoning(
+        request_kind="quality_review",
+        model="glm-5.2",
+        card={"role": "reviewer", "risk_tier": "low"},
+        host_readiness=host,
+        target_card={"risk_tier": "medium", "work_kind": "security"},
+        lens="correctness",
+    )
+    assert security_target["profile"] == "canonical_high"
+    assert security_target["request"]["work_kind"] == "security"
 
     unknown_target, _ctx = vscode_lm_bridge.resolve_vscode_lm_reasoning(
         request_kind="quality_review",
@@ -3361,4 +3407,5 @@ def test_resolve_vscode_lm_reasoning_review_effort_follows_the_target_card_and_l
         card={"role": "reviewer", "risk_tier": "low"},
         host_readiness=host,
     )
-    assert unknown_target["profile"] == "canonical_maximum"
+    assert unknown_target["profile"] == "canonical_high"
+    assert unknown_target["route_effort"]["applied_key"] == "high"

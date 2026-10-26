@@ -56,15 +56,24 @@ def _request(**overrides) -> EffortRequest:
 
 
 def _is_mandatory_maximum(request: EffortRequest) -> bool:
+    return request.risk_tier is RiskTier.CRITICAL
+
+
+def _is_mandatory_high(request: EffortRequest) -> bool:
     return (
-        request.risk_tier is RiskTier.CRITICAL
-        or request.difficulty is Difficulty.COMPLEX
+        request.difficulty is Difficulty.COMPLEX
         or request.work_kind in {WorkKind.SECURITY, WorkKind.ARCHITECTURE}
         or request.role in {TaskRole.SECURITY_AUDITOR, TaskRole.ARCHITECT}
-        or (
-            request.role is TaskRole.REVIEWER
-            and request.risk_tier in {RiskTier.HIGH, RiskTier.CRITICAL}
-        )
+        or (request.role is TaskRole.REVIEWER and request.risk_tier is RiskTier.HIGH)
+    )
+
+
+def _is_unlifted_review(request: EffortRequest) -> bool:
+    return (
+        request.role is TaskRole.REVIEWER
+        and request.risk_tier in {RiskTier.LOW, RiskTier.MEDIUM}
+        and request.work_kind not in {WorkKind.SECURITY, WorkKind.ARCHITECTURE}
+        and request.difficulty is not Difficulty.COMPLEX
     )
 
 
@@ -127,29 +136,48 @@ def test_every_matrix_cell_selects_at_or_above_the_absolute_floor():
         assert selected >= ABSOLUTE_FLOOR, request
 
 
-def test_only_bounded_low_or_medium_risk_implementer_work_may_select_below_high():
+def test_only_bounded_implementer_work_and_unlifted_reviews_may_select_below_high():
     for request in ALL_REQUESTS:
         selected = select_reasoning_profile(request).selected
         if selected < ReasoningProfile.HIGH:
             assert selected is ReasoningProfile.MEDIUM, request
-            assert _is_bounded_medium_implementer(request) or _is_explicit_mechanical(
-                request
+            assert (
+                _is_bounded_medium_implementer(request)
+                or _is_explicit_mechanical(request)
+                or _is_unlifted_review(request)
             ), request
 
 
-def test_mandatory_escalations_reach_canonical_maximum_for_every_provider_family():
+def test_a_reviewer_selects_medium_only_when_nothing_lifts_it():
     for request in ALL_REQUESTS:
+        if request.role is not TaskRole.REVIEWER:
+            continue
+        selected = select_reasoning_profile(request).selected
+        if _is_unlifted_review(request):
+            assert selected is ReasoningProfile.MEDIUM, request
+        else:
+            assert selected >= ReasoningProfile.HIGH, request
+
+
+def test_mandatory_escalations_reach_high_and_only_critical_reaches_maximum():
+    for request in ALL_REQUESTS:
+        selected = select_reasoning_profile(request).selected
         if _is_mandatory_maximum(request):
-            assert select_reasoning_profile(request).selected is ReasoningProfile.MAXIMUM, request
+            assert selected is ReasoningProfile.MAXIMUM, request
+        elif _is_mandatory_high(request):
+            assert selected is ReasoningProfile.HIGH, request
 
 
-def test_maximum_is_reached_only_through_a_named_escalation():
+def test_maximum_is_reached_only_through_the_critical_risk_escalation():
     for request in ALL_REQUESTS:
         rationale = select_reasoning_profile(request)
         assert rationale.baseline is not ReasoningProfile.MAXIMUM, request
         if rationale.selected is ReasoningProfile.MAXIMUM:
+            assert request.risk_tier is RiskTier.CRITICAL, request
             assert rationale.escalations, request
-            assert rationale.decisive_reason in rationale.reason_codes, request
+            assert rationale.decisive_reason == "critical_risk_tier", request
+        else:
+            assert request.risk_tier is not RiskTier.CRITICAL, request
 
 
 def test_selection_is_a_pure_deterministic_function_of_the_declared_inputs():
@@ -237,13 +265,14 @@ def test_standard_implementer_selects_high_never_the_old_claude_maximum(family, 
 
 
 @pytest.mark.parametrize("family", ALL_FAMILIES)
-def test_complex_difficulty_is_the_only_way_a_coding_implementer_reaches_maximum(family):
+def test_complex_difficulty_lifts_a_coding_implementer_to_high_never_to_maximum(family):
     rationale = select_reasoning_profile(
         _request(difficulty=Difficulty.COMPLEX, provider_family=family)
     )
-    assert rationale.selected is ReasoningProfile.MAXIMUM
+    assert rationale.selected is ReasoningProfile.HIGH
     assert rationale.baseline is ReasoningProfile.HIGH
-    assert rationale.decisive_reason == "complex_difficulty"
+    assert "complex_difficulty" in rationale.reason_codes
+    assert rationale.decisive_reason == "repository_coding_quality_floor_high"
 
 
 @pytest.mark.parametrize("family", ALL_FAMILIES)
@@ -266,7 +295,7 @@ def test_a_planner_keeps_the_high_quality_floor(family):
 @pytest.mark.parametrize("risk", [RiskTier.LOW, RiskTier.MEDIUM])
 @pytest.mark.parametrize("difficulty", [Difficulty.BOUNDED, Difficulty.STANDARD])
 @pytest.mark.parametrize("lens", [None, "correctness", "code_quality"])
-def test_a_reviewer_of_a_low_or_medium_risk_non_complex_target_selects_high(
+def test_a_reviewer_of_a_low_or_medium_risk_non_complex_target_selects_medium(
     family, risk, difficulty, lens
 ):
     rationale = select_reasoning_profile(
@@ -279,25 +308,32 @@ def test_a_reviewer_of_a_low_or_medium_risk_non_complex_target_selects_high(
             review_lens=lens,
         )
     )
-    assert rationale.selected is ReasoningProfile.HIGH
+    assert rationale.selected is ReasoningProfile.MEDIUM
+    assert rationale.baseline is ReasoningProfile.MEDIUM
     assert rationale.escalations == ()
-    assert rationale.decisive_reason == "reviewer_baseline_high"
+    assert rationale.decisive_reason == "reviewer_baseline_medium"
 
 
 @pytest.mark.parametrize("family", ALL_FAMILIES)
 @pytest.mark.parametrize(
-    ("overrides", "reason"),
+    ("overrides", "reason", "expected"),
     [
-        ({"review_lens": "security"}, "security_lens_review"),
-        ({"review_lens": " Security "}, "security_lens_review"),
-        ({"risk_tier": RiskTier.HIGH}, "high_risk_target_review"),
-        ({"risk_tier": RiskTier.CRITICAL}, "high_risk_target_review"),
-        ({"risk_tier": RiskTier.CRITICAL}, "critical_risk_tier"),
-        ({"difficulty": Difficulty.COMPLEX}, "complex_difficulty"),
+        ({"review_lens": "security"}, "security_lens_review", ReasoningProfile.HIGH),
+        ({"review_lens": " Security "}, "security_lens_review", ReasoningProfile.HIGH),
+        ({"risk_tier": RiskTier.HIGH}, "high_risk_target_review", ReasoningProfile.HIGH),
+        ({"work_kind": WorkKind.SECURITY}, "security_work", ReasoningProfile.HIGH),
+        ({"work_kind": WorkKind.ARCHITECTURE}, "architecture_work", ReasoningProfile.HIGH),
+        ({"difficulty": Difficulty.COMPLEX}, "complex_difficulty", ReasoningProfile.HIGH),
+        (
+            {"risk_tier": RiskTier.CRITICAL},
+            "high_risk_target_review",
+            ReasoningProfile.MAXIMUM,
+        ),
+        ({"risk_tier": RiskTier.CRITICAL}, "critical_risk_tier", ReasoningProfile.MAXIMUM),
     ],
 )
-def test_a_reviewer_is_lifted_to_maximum_only_by_lens_target_risk_or_complexity(
-    family, overrides, reason
+def test_a_reviewer_lifts_to_high_and_only_a_critical_target_reaches_maximum(
+    family, overrides, reason, expected
 ):
     shape = {
         "role": TaskRole.REVIEWER,
@@ -308,8 +344,8 @@ def test_a_reviewer_is_lifted_to_maximum_only_by_lens_target_risk_or_complexity(
     }
     shape.update(overrides)
     rationale = select_reasoning_profile(_request(**shape))
-    assert rationale.selected is ReasoningProfile.MAXIMUM
-    assert rationale.baseline is ReasoningProfile.HIGH
+    assert rationale.selected is expected
+    assert rationale.baseline is ReasoningProfile.MEDIUM
     assert reason in rationale.reason_codes
 
 
@@ -327,33 +363,36 @@ def test_correctness_review_work_kind_alone_no_longer_lifts_an_implementer():
 
 @pytest.mark.parametrize("family", list(ProviderFamily))
 @pytest.mark.parametrize(
-    ("overrides", "reason"),
+    ("overrides", "reason", "expected"),
     [
-        ({"risk_tier": RiskTier.CRITICAL}, "critical_risk_tier"),
-        ({"work_kind": WorkKind.SECURITY}, "security_work"),
-        ({"role": TaskRole.SECURITY_AUDITOR}, "security_work"),
-        ({"work_kind": WorkKind.ARCHITECTURE}, "architecture_work"),
-        ({"role": TaskRole.ARCHITECT}, "architecture_work"),
+        ({"risk_tier": RiskTier.CRITICAL}, "critical_risk_tier", ReasoningProfile.MAXIMUM),
+        ({"work_kind": WorkKind.SECURITY}, "security_work", ReasoningProfile.HIGH),
+        ({"role": TaskRole.SECURITY_AUDITOR}, "security_work", ReasoningProfile.HIGH),
+        ({"work_kind": WorkKind.ARCHITECTURE}, "architecture_work", ReasoningProfile.HIGH),
+        ({"role": TaskRole.ARCHITECT}, "architecture_work", ReasoningProfile.HIGH),
         (
             {"work_kind": WorkKind.REWORK, "difficulty": Difficulty.COMPLEX},
             "complex_difficulty",
+            ReasoningProfile.HIGH,
         ),
         (
             {"role": TaskRole.REVIEWER, "review_lens": "security"},
             "security_lens_review",
+            ReasoningProfile.HIGH,
         ),
         (
             {"role": TaskRole.REVIEWER, "risk_tier": RiskTier.HIGH},
             "high_risk_target_review",
+            ReasoningProfile.HIGH,
         ),
     ],
 )
-def test_critical_security_architecture_review_and_complex_rework_reach_maximum(
-    family, overrides, reason
+def test_only_critical_reaches_maximum_while_the_other_escalations_reach_high(
+    family, overrides, reason, expected
 ):
     # Start from the cheapest shape the policy can ever produce -- explicitly
-    # mechanical, bounded, low risk -- so the escalation is the only thing that
-    # can carry the selection to canonical maximum.
+    # mechanical, bounded, low risk -- so only the override under test can raise
+    # the selection.
     shape = {
         "role": TaskRole.MECHANICAL_OPERATOR,
         "risk_tier": RiskTier.LOW,
@@ -363,9 +402,11 @@ def test_critical_security_architecture_review_and_complex_rework_reach_maximum(
     }
     shape.update(overrides)
     rationale = select_reasoning_profile(_request(**shape))
-    assert rationale.selected is ReasoningProfile.MAXIMUM
+    assert rationale.selected is expected
     assert reason in rationale.reason_codes
     assert rationale.decisive_reason in rationale.reason_codes
+    if expected is ReasoningProfile.MAXIMUM:
+        assert rationale.decisive_reason == "critical_risk_tier"
 
 
 # --- rationale --------------------------------------------------------------
@@ -650,20 +691,20 @@ def test_a_single_key_route_reports_the_clamped_offset_without_claiming_applied(
 
 
 @pytest.mark.parametrize(
-    "overrides",
+    ("overrides", "profile"),
     [
-        {"risk_tier": RiskTier.CRITICAL},
-        {"work_kind": WorkKind.SECURITY},
-        {"role": TaskRole.SECURITY_AUDITOR},
+        ({"risk_tier": RiskTier.CRITICAL}, ReasoningProfile.MAXIMUM),
+        ({"work_kind": WorkKind.SECURITY}, ReasoningProfile.HIGH),
+        ({"role": TaskRole.SECURITY_AUDITOR}, ReasoningProfile.HIGH),
     ],
 )
-def test_a_security_or_critical_maximum_is_not_attested_on_an_unrankable_route(overrides):
+def test_an_escalated_request_is_not_attested_on_an_unrankable_route(overrides, profile):
     # The escalated request is exactly the one a false APPLIED would hurt most.
     decision = resolve_reasoning_effort(_request(**overrides), UNRANKABLE_ROUTE)
-    assert decision.profile is ReasoningProfile.MAXIMUM
+    assert decision.profile is profile
     effort = decision.route_effort
     assert effort is not None
-    assert effort.requested is ReasoningProfile.MAXIMUM
+    assert effort.requested is profile
     assert effort.status is ControlStatus.UNVERIFIABLE
     assert effort.applied is False
     assert effort.applied_key is None
@@ -773,7 +814,11 @@ def test_the_review_lens_survives_family_adoption_and_is_serialized():
     )
     assert decision.request.review_lens == "security"
     assert decision.request.as_dict()["review_lens"] == "security"
-    assert decision.profile is ReasoningProfile.MAXIMUM
+    assert decision.profile is ReasoningProfile.HIGH
+    assert decision.rationale.baseline is ReasoningProfile.MEDIUM
+    assert decision.rationale.decisive_reason == "security_lens_review"
+    assert decision.route_effort is not None
+    assert decision.route_effort.applied_key == "high"
 
 
 def test_every_rung_resolves_to_an_applied_key_on_the_codex_ladder():

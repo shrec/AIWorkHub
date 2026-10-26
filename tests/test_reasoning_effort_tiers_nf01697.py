@@ -1,10 +1,11 @@
 """NF-2026-01697: tiered Claude effort for implementers and reviewers.
 
-Bounded low/medium-risk implementer work resolves to ``medium``, standard work
-to ``high``, and only complex difficulty, critical risk, security work and
-architecture work reach ``max``. A reviewer baselines at ``high`` and lifts to
-``max`` from the *target* card (high/critical risk or complex) or a security
-lens, never from the reviewer card's own derived fields.
+Bounded low/medium-risk implementer work resolves to ``medium`` and standard
+work to ``high``. Complex difficulty, security work and architecture work lift
+to ``high``; only critical risk reaches ``max`` (NF-2026-01703). A reviewer
+baselines at ``medium``, lifts to ``high`` from the *target* card (high risk,
+security or architecture work, complex) or a security lens, and reaches ``max``
+only for a critical target, never from the reviewer card's own derived fields.
 """
 
 from __future__ import annotations
@@ -103,26 +104,44 @@ def test_bounded_high_risk_implementer_resolves_to_high(model: str) -> None:
 
 @pytest.mark.parametrize("model", CLAUDE_MODELS)
 @pytest.mark.parametrize(
-    ("card", "reason"),
+    ("card", "reason", "expected", "key"),
     [
-        ({"risk_tier": "low", "difficulty": "complex"}, "complex_difficulty"),
-        ({"risk_tier": "critical", "difficulty": "bounded"}, "critical_risk_tier"),
+        (
+            {"risk_tier": "low", "difficulty": "complex"},
+            "complex_difficulty",
+            reasoning_policy.ReasoningProfile.HIGH,
+            "high",
+        ),
+        (
+            {"risk_tier": "critical", "difficulty": "bounded"},
+            "critical_risk_tier",
+            reasoning_policy.ReasoningProfile.MAXIMUM,
+            "max",
+        ),
         (
             {"work_kind": "security", "risk_tier": "low", "difficulty": "bounded"},
             "security_work",
+            reasoning_policy.ReasoningProfile.HIGH,
+            "high",
         ),
         (
             {"work_kind": "architecture", "risk_tier": "low", "difficulty": "bounded"},
             "architecture_work",
+            reasoning_policy.ReasoningProfile.HIGH,
+            "high",
         ),
     ],
 )
-def test_complex_critical_security_and_architecture_resolve_to_max(
-    model: str, card: dict[str, object], reason: str
+def test_only_critical_risk_resolves_to_max_and_the_other_lifts_resolve_to_high(
+    model: str,
+    card: dict[str, object],
+    reason: str,
+    expected: reasoning_policy.ReasoningProfile,
+    key: str,
 ) -> None:
     decision = _implementer(card, model)
-    assert decision.profile is reasoning_policy.ReasoningProfile.MAXIMUM
-    assert _applied_key(decision) == "max"
+    assert decision.profile is expected
+    assert _applied_key(decision) == key
     assert reason in _reasons(decision)
 
 
@@ -141,32 +160,32 @@ def test_the_claude_maximum_default_is_gone() -> None:
 @pytest.mark.parametrize("model", CLAUDE_MODELS)
 @pytest.mark.parametrize("target_risk", ["low", "medium"])
 @pytest.mark.parametrize("target_difficulty", ["bounded", "standard"])
-def test_reviewer_of_a_low_or_medium_non_complex_target_resolves_to_high(
+def test_reviewer_of_a_low_or_medium_non_complex_target_resolves_to_medium(
     model: str, target_risk: str, target_difficulty: str
 ) -> None:
     decision = _reviewer(
         {"risk_tier": target_risk, "difficulty": target_difficulty}, model=model
     )
-    assert decision.profile is reasoning_policy.ReasoningProfile.HIGH
-    assert _applied_key(decision) == "high"
-    assert "reviewer_baseline_high" in _reasons(decision)
+    assert decision.profile is reasoning_policy.ReasoningProfile.MEDIUM
+    assert _applied_key(decision) == "medium"
+    assert "reviewer_baseline_medium" in _reasons(decision)
 
 
 @pytest.mark.parametrize("model", CLAUDE_MODELS)
-def test_security_lens_reviewer_resolves_to_max_on_a_benign_target(
+def test_security_lens_reviewer_resolves_to_high_on_a_benign_target(
     model: str,
 ) -> None:
     decision = _reviewer(
         {"risk_tier": "low", "difficulty": "bounded"}, lens="security", model=model
     )
-    assert decision.profile is reasoning_policy.ReasoningProfile.MAXIMUM
-    assert _applied_key(decision) == "max"
+    assert decision.profile is reasoning_policy.ReasoningProfile.HIGH
+    assert _applied_key(decision) == "high"
     assert "security_lens_review" in _reasons(decision)
 
 
 def test_the_security_lens_is_matched_case_insensitively() -> None:
     decision = _reviewer({"risk_tier": "low"}, lens=" Security ")
-    assert decision.profile is reasoning_policy.ReasoningProfile.MAXIMUM
+    assert decision.profile is reasoning_policy.ReasoningProfile.HIGH
 
 
 @pytest.mark.parametrize("model", CLAUDE_MODELS)
@@ -174,22 +193,37 @@ def test_the_security_lens_is_matched_case_insensitively() -> None:
     ("target_card", "reason"),
     [
         ({"risk_tier": "high", "difficulty": "bounded"}, "high_risk_target_review"),
-        ({"risk_tier": "critical", "difficulty": "bounded"}, "critical_risk_tier"),
         ({"risk_tier": "low", "difficulty": "complex"}, "complex_difficulty"),
         (
             {"risk_tier": "low", "rework_predecessor": {"request_id": "R-prev"}},
             "complex_difficulty",
         ),
+        (
+            {"work_kind": "security", "risk_tier": "low", "difficulty": "bounded"},
+            "security_work",
+        ),
+        (
+            {"work_kind": "architecture", "risk_tier": "low", "difficulty": "bounded"},
+            "architecture_work",
+        ),
         (None, "high_risk_target_review"),
     ],
 )
-def test_high_critical_complex_or_unknown_target_lifts_the_reviewer_to_max(
+def test_high_risk_complex_security_or_unknown_target_lifts_the_reviewer_to_high(
     model: str, target_card: dict[str, object] | None, reason: str
 ) -> None:
     decision = _reviewer(target_card, model=model)
+    assert decision.profile is reasoning_policy.ReasoningProfile.HIGH
+    assert _applied_key(decision) == "high"
+    assert reason in _reasons(decision)
+
+
+@pytest.mark.parametrize("model", CLAUDE_MODELS)
+def test_only_a_critical_target_lifts_the_reviewer_to_max(model: str) -> None:
+    decision = _reviewer({"risk_tier": "critical", "difficulty": "bounded"}, model=model)
     assert decision.profile is reasoning_policy.ReasoningProfile.MAXIMUM
     assert _applied_key(decision) == "max"
-    assert reason in _reasons(decision)
+    assert "critical_risk_tier" in _reasons(decision)
 
 
 def test_reviewer_effort_comes_from_the_target_card_not_the_reviewer_card() -> None:
@@ -200,8 +234,8 @@ def test_reviewer_effort_comes_from_the_target_card_not_the_reviewer_card() -> N
         "work_kind": "security",
     }
     decision = _reviewer(benign_target, reviewer_card=loud_reviewer_card)
-    assert decision.profile is reasoning_policy.ReasoningProfile.HIGH
-    assert _applied_key(decision) == "high"
+    assert decision.profile is reasoning_policy.ReasoningProfile.MEDIUM
+    assert _applied_key(decision) == "medium"
 
     quiet_reviewer_card = {"risk_tier": "low", "difficulty": "bounded"}
     lifted = _reviewer(
@@ -246,33 +280,49 @@ def _vscode_profile(
     return reasoning_policy.resolve_reasoning_effort(request, capability).profile
 
 
-def test_vscode_lm_review_baselines_at_high_for_a_benign_target() -> None:
+def test_vscode_lm_review_baselines_at_medium_for_a_benign_target() -> None:
     profile = _vscode_profile(
         "quality_review",
         {"risk_tier": "critical"},
         target_card={"risk_tier": "low", "difficulty": "bounded"},
         lens="correctness",
     )
-    assert profile is reasoning_policy.ReasoningProfile.HIGH
+    assert profile is reasoning_policy.ReasoningProfile.MEDIUM
 
 
 @pytest.mark.parametrize(
-    ("target_card", "lens"),
+    ("target_card", "lens", "expected"),
     [
-        ({"risk_tier": "low"}, "security"),
-        ({"risk_tier": "high"}, "correctness"),
-        ({"risk_tier": "critical"}, "correctness"),
-        ({"risk_tier": "low", "difficulty": "complex"}, "correctness"),
-        (None, "correctness"),
+        ({"risk_tier": "low"}, "security", reasoning_policy.ReasoningProfile.HIGH),
+        ({"risk_tier": "high"}, "correctness", reasoning_policy.ReasoningProfile.HIGH),
+        (
+            {"risk_tier": "critical"},
+            "correctness",
+            reasoning_policy.ReasoningProfile.MAXIMUM,
+        ),
+        (
+            {"risk_tier": "low", "difficulty": "complex"},
+            "correctness",
+            reasoning_policy.ReasoningProfile.HIGH,
+        ),
+        (
+            {"work_kind": "security", "risk_tier": "low"},
+            "correctness",
+            reasoning_policy.ReasoningProfile.HIGH,
+        ),
+        (None, "correctness", reasoning_policy.ReasoningProfile.HIGH),
     ],
 )
-def test_vscode_lm_review_lifts_to_max_like_the_cli_route(
-    target_card: dict[str, object] | None, lens: str
+def test_vscode_lm_review_lifts_like_the_cli_route(
+    target_card: dict[str, object] | None,
+    lens: str,
+    expected: reasoning_policy.ReasoningProfile,
 ) -> None:
     profile = _vscode_profile(
         "quality_review", {}, target_card=target_card, lens=lens
     )
-    assert profile is reasoning_policy.ReasoningProfile.MAXIMUM
+    assert profile is expected
+    assert _reviewer(target_card, lens=lens).profile is expected
 
 
 @pytest.mark.parametrize(
@@ -282,6 +332,9 @@ def test_vscode_lm_review_lifts_to_max_like_the_cli_route(
         {"difficulty": "bounded"},
         {"risk": "high", "difficulty": "bounded"},
         {"risk_tier": "low", "difficulty": "bounded"},
+        {"work_kind": "security", "risk_tier": "low", "difficulty": "bounded"},
+        {"work_kind": "architecture", "risk_tier": "low", "difficulty": "bounded"},
+        {"risk_tier": "critical", "difficulty": "bounded"},
         None,
     ],
 )
@@ -346,6 +399,10 @@ def test_vscode_lm_review_lens_is_carried_on_the_request_only_for_reviews() -> N
         ),
         (
             {"risk_tier": "low", "difficulty": "complex"},
+            reasoning_policy.ReasoningProfile.HIGH,
+        ),
+        (
+            {"risk_tier": "critical", "difficulty": "bounded"},
             reasoning_policy.ReasoningProfile.MAXIMUM,
         ),
     ],
@@ -409,4 +466,5 @@ def test_every_implementer_decision_carries_a_reason_code(
     assert decision.rationale.baseline_reason
     assert decision.rationale.baseline_reason in _reasons(decision)
     if decision.profile is reasoning_policy.ReasoningProfile.MAXIMUM:
+        assert decision.rationale.decisive_reason == "critical_risk_tier"
         assert decision.rationale.reason_codes

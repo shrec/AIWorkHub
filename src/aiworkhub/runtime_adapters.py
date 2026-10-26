@@ -3330,9 +3330,10 @@ def _derive_reasoning_request(
 
     A reviewer launch is shaped by the card under review, never by the
     reviewer card (whose risk tier is derived low and whose difficulty is
-    undeclared): risk tier and difficulty come from ``target_card`` and the
-    lens is passed through.  A reviewer launch whose target card is unknown
-    fails closed to a high-risk target.
+    undeclared): risk tier, work kind and difficulty come from ``target_card``
+    and the lens is passed through.  A reviewer launch whose target card is
+    unknown fails closed to a high-risk target, which selects HIGH and never
+    MAXIMUM.
     """
 
     source: Mapping[str, Any] = card
@@ -3349,10 +3350,7 @@ def _derive_reasoning_request(
         risk_tier = reasoning_policy.RiskTier.HIGH
     else:
         risk_tier = _coerce_risk_tier(source.get("risk_tier"))
-    if is_reviewer:
-        work_kind = reasoning_policy.WorkKind.CORRECTNESS_REVIEW
-    else:
-        work_kind = _coerce_work_kind(card.get("work_kind"), is_reviewer=False)
+    work_kind = _coerce_work_kind(source.get("work_kind"), is_reviewer=is_reviewer)
     return reasoning_policy.EffortRequest(
         role=(
             reasoning_policy.TaskRole.REVIEWER

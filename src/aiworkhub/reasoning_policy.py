@@ -216,7 +216,7 @@ REASON_ARCHITECTURE_WORK = "architecture_work"
 REASON_SECURITY_LENS_REVIEW = "security_lens_review"
 REASON_HIGH_RISK_TARGET_REVIEW = "high_risk_target_review"
 REASON_COMPLEX_DIFFICULTY = "complex_difficulty"
-REASON_REVIEWER_BASELINE_HIGH = "reviewer_baseline_high"
+REASON_REVIEWER_BASELINE_MEDIUM = "reviewer_baseline_medium"
 REASON_BOUNDED_IMPLEMENTER_MEDIUM = "bounded_implementer_medium"
 REASON_BOUNDED_HIGH_RISK_IMPLEMENTER_HIGH = "bounded_high_risk_implementer_high"
 REASON_STANDARD_IMPLEMENTER_HIGH = "standard_implementer_high"
@@ -297,26 +297,33 @@ def _is_security_lens(request: EffortRequest) -> bool:
 
 
 def _escalations(request: EffortRequest) -> tuple[Escalation, ...]:
-    """Mandatory lifts to canonical maximum, applied for every provider family.
+    """Mandatory lifts, applied for every provider family.
 
-    For a reviewer, ``risk_tier`` and ``difficulty`` describe the reviewed
-    TARGET card (the caller derives them from it), so a high-risk or complex
-    target lifts its review while a low/medium bounded target does not.
+    Only a critical risk tier lifts to MAXIMUM, which is very rare and an
+    explicit manager decision. Every other lift (security, architecture, the
+    reviewer security lens, a high-risk target, complex difficulty) keeps its
+    reason code but lifts to HIGH, so the rationale still records why HIGH was
+    chosen.
+
+    For a reviewer, ``risk_tier``, ``work_kind`` and ``difficulty`` describe the
+    reviewed TARGET card (the caller derives them from it), so a critical target
+    gives MAXIMUM; a high-risk, complex, security or architecture one HIGH; and
+    a low/medium, non-complex, non-security, non-architecture target neither.
     """
     lifts: list[Escalation] = []
     if request.risk_tier is RiskTier.CRITICAL:
         lifts.append(Escalation(REASON_CRITICAL_RISK, ReasoningProfile.MAXIMUM))
     if request.work_kind is WorkKind.SECURITY or request.role is TaskRole.SECURITY_AUDITOR:
-        lifts.append(Escalation(REASON_SECURITY_WORK, ReasoningProfile.MAXIMUM))
+        lifts.append(Escalation(REASON_SECURITY_WORK, ReasoningProfile.HIGH))
     if request.work_kind is WorkKind.ARCHITECTURE or request.role is TaskRole.ARCHITECT:
-        lifts.append(Escalation(REASON_ARCHITECTURE_WORK, ReasoningProfile.MAXIMUM))
+        lifts.append(Escalation(REASON_ARCHITECTURE_WORK, ReasoningProfile.HIGH))
     if request.role is TaskRole.REVIEWER:
         if _is_security_lens(request):
-            lifts.append(Escalation(REASON_SECURITY_LENS_REVIEW, ReasoningProfile.MAXIMUM))
+            lifts.append(Escalation(REASON_SECURITY_LENS_REVIEW, ReasoningProfile.HIGH))
         if request.risk_tier in _HIGH_RISK_TIERS:
-            lifts.append(Escalation(REASON_HIGH_RISK_TARGET_REVIEW, ReasoningProfile.MAXIMUM))
+            lifts.append(Escalation(REASON_HIGH_RISK_TARGET_REVIEW, ReasoningProfile.HIGH))
     if request.difficulty is Difficulty.COMPLEX:
-        lifts.append(Escalation(REASON_COMPLEX_DIFFICULTY, ReasoningProfile.MAXIMUM))
+        lifts.append(Escalation(REASON_COMPLEX_DIFFICULTY, ReasoningProfile.HIGH))
     return tuple(lifts)
 
 
@@ -325,11 +332,11 @@ def _baseline(request: EffortRequest) -> tuple[ReasoningProfile, str]:
 
     Effort follows the declared work shape on every provider family: a bounded
     low/medium-risk implementer starts at MEDIUM, a standard (or bounded
-    high-risk) one at HIGH, a reviewer at HIGH. MAXIMUM is reachable only
-    through :func:`_escalations`.
+    high-risk) one at HIGH, a reviewer at MEDIUM. MAXIMUM is never a baseline:
+    only the critical lift in :func:`_escalations` reaches it.
     """
     if request.role is TaskRole.REVIEWER:
-        return ReasoningProfile.HIGH, REASON_REVIEWER_BASELINE_HIGH
+        return ReasoningProfile.MEDIUM, REASON_REVIEWER_BASELINE_MEDIUM
     if _is_explicitly_mechanical(request):
         return ReasoningProfile.MEDIUM, REASON_EXPLICIT_MECHANICAL
     if request.role is TaskRole.IMPLEMENTER:
@@ -348,7 +355,9 @@ def select_reasoning_profile(request: EffortRequest) -> Rationale:
     """Select the canonical profile for ``request`` and explain the selection.
 
     The result is a pure function of the declared inputs: the baseline is lifted
-    by any mandatory escalation, and nothing ever lowers it.
+    by any mandatory escalation, and nothing ever lowers it. MAXIMUM is very rare
+    and an explicit manager decision: only a critical risk tier selects it, every
+    other escalation lifts to HIGH at most.
     """
     baseline, baseline_reason = _baseline(request)
     lifts = _escalations(request)

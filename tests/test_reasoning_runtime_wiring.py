@@ -34,7 +34,7 @@ from aiworkhub import process_launcher, reasoning_policy, runtime_adapters
 
 def test_claude5_maximum_maps_to_max_effort_flag() -> None:
     decision = runtime_adapters.resolve_adapter_reasoning(
-        "claude_cli", {"work_kind": "security"}, model="claude-opus-5"
+        "claude_cli", {"risk_tier": "critical"}, model="claude-opus-5"
     )
     assert decision is not None
     route = decision.route_effort
@@ -67,7 +67,7 @@ def test_claude5_high_maps_to_high_never_downgraded() -> None:
 
 def test_claude_standard_tier_uses_high_ceiling() -> None:
     decision = runtime_adapters.resolve_adapter_reasoning(
-        "claude_cli", {"work_kind": "security"}, model="claude-haiku-4.5"
+        "claude_cli", {"risk_tier": "critical"}, model="claude-haiku-4.5"
     )
     assert decision is not None
     route = decision.route_effort
@@ -98,7 +98,7 @@ def test_claude_workforce_alias_resolves_to_max_effort_ladder() -> None:
         keys = runtime_adapters._claude_effort_keys(alias)
         assert "max" in keys
         decision = runtime_adapters.resolve_adapter_reasoning(
-            "claude_cli", {"work_kind": "security"}, model=alias
+            "claude_cli", {"risk_tier": "critical"}, model=alias
         )
         assert decision is not None
         route = decision.route_effort
@@ -112,7 +112,7 @@ def test_claude_workforce_alias_resolves_to_max_effort_ladder() -> None:
 
 def test_codex_maximum_maps_to_xhigh_effort_flag() -> None:
     decision = runtime_adapters.resolve_adapter_reasoning(
-        "codex_cli", {"work_kind": "security"}, model="gpt-5.5"
+        "codex_cli", {"risk_tier": "critical"}, model="gpt-5.5"
     )
     assert decision is not None
     route = decision.route_effort
@@ -240,7 +240,7 @@ def test_build_runtime_command_places_claude_max_effort_and_capacity(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     decision = runtime_adapters.resolve_adapter_reasoning(
-        "claude_cli", {"work_kind": "security"}, model="claude-opus-5"
+        "claude_cli", {"risk_tier": "critical"}, model="claude-opus-5"
     )
     monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: False)
     monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _name: sys.executable)
@@ -274,7 +274,7 @@ def test_build_runtime_command_places_claude_max_effort_and_capacity(
         (
             {"risk_tier": "low", "rework_predecessor": {"request_id": "R-prev"}},
             "complex",
-            "max",
+            "high",
         ),
         (
             {
@@ -318,7 +318,7 @@ def test_build_runtime_command_places_codex_xhigh_effort(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     decision = runtime_adapters.resolve_adapter_reasoning(
-        "codex_cli", {"work_kind": "security"}, model="gpt-5.5"
+        "codex_cli", {"risk_tier": "critical"}, model="gpt-5.5"
     )
     monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: False)
     monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _name: sys.executable)
@@ -417,23 +417,38 @@ def test_bounded_medium_and_standard_high_on_both_claude_5_5_models(
 @pytest.mark.parametrize(
     "card",
     [
-        {"risk_tier": "critical", "difficulty": "bounded"},
         {"work_kind": "security", "risk_tier": "low", "difficulty": "bounded"},
         {"work_kind": "architecture", "risk_tier": "low", "difficulty": "bounded"},
         {"risk_tier": "low", "difficulty": "complex"},
+        {"risk_tier": "high", "difficulty": "complex"},
     ],
 )
-def test_critical_security_architecture_and_complex_implementers_stay_maximum(
+def test_security_architecture_and_complex_implementers_lift_to_high_not_maximum(
     card: dict[str, object],
 ) -> None:
     decision = _claude_decision(card)
+    assert decision.profile is reasoning_policy.ReasoningProfile.HIGH
+    assert decision.route_effort is not None
+    assert decision.route_effort.applied_key == "high"
+
+
+@pytest.mark.parametrize(
+    "card",
+    [
+        {"risk_tier": "critical", "difficulty": "bounded"},
+        {"work_kind": "security", "risk_tier": "critical", "difficulty": "complex"},
+    ],
+)
+def test_only_a_critical_implementer_stays_maximum(card: dict[str, object]) -> None:
+    decision = _claude_decision(card)
     assert decision.profile is reasoning_policy.ReasoningProfile.MAXIMUM
+    assert decision.rationale.decisive_reason == "critical_risk_tier"
     assert decision.route_effort is not None
     assert decision.route_effort.applied_key == "max"
 
 
 @pytest.mark.parametrize("target_risk", ["low", "medium"])
-def test_reviewer_of_a_low_or_medium_risk_target_resolves_to_high(
+def test_reviewer_of_a_low_or_medium_risk_target_resolves_to_medium(
     target_risk: str,
 ) -> None:
     decision = _claude_decision(
@@ -442,33 +457,86 @@ def test_reviewer_of_a_low_or_medium_risk_target_resolves_to_high(
         target_card={"risk_tier": target_risk, "difficulty": "standard"},
         lens="correctness",
     )
-    assert decision.profile is reasoning_policy.ReasoningProfile.HIGH
-    assert decision.rationale.baseline_reason == "reviewer_baseline_high"
+    assert decision.profile is reasoning_policy.ReasoningProfile.MEDIUM
+    assert decision.rationale.baseline_reason == "reviewer_baseline_medium"
     assert decision.route_effort is not None
-    assert decision.route_effort.applied_key == "high"
+    assert decision.route_effort.applied_key == "medium"
 
 
 @pytest.mark.parametrize(
-    ("target_card", "lens", "reason"),
+    ("target_card", "lens", "reason", "expected", "expected_key"),
     [
-        ({"risk_tier": "low"}, "security", "security_lens_review"),
-        ({"risk_tier": "high"}, "correctness", "high_risk_target_review"),
-        ({"risk_tier": "critical"}, "correctness", "critical_risk_tier"),
+        (
+            {"risk_tier": "low"},
+            "security",
+            "security_lens_review",
+            reasoning_policy.ReasoningProfile.HIGH,
+            "high",
+        ),
+        (
+            {"risk_tier": "high"},
+            "correctness",
+            "high_risk_target_review",
+            reasoning_policy.ReasoningProfile.HIGH,
+            "high",
+        ),
+        (
+            {"risk_tier": "high"},
+            "security",
+            "high_risk_target_review",
+            reasoning_policy.ReasoningProfile.HIGH,
+            "high",
+        ),
+        (
+            {"risk_tier": "critical"},
+            "correctness",
+            "critical_risk_tier",
+            reasoning_policy.ReasoningProfile.MAXIMUM,
+            "max",
+        ),
         (
             {"risk_tier": "low", "difficulty": "complex"},
             "correctness",
             "complex_difficulty",
+            reasoning_policy.ReasoningProfile.HIGH,
+            "high",
         ),
         (
             {"risk_tier": "low", "rework_predecessor": {"request_id": "R-prev"}},
             "correctness",
             "complex_difficulty",
+            reasoning_policy.ReasoningProfile.HIGH,
+            "high",
         ),
-        (None, "correctness", "high_risk_target_review"),
+        (
+            {"work_kind": "security", "risk_tier": "low"},
+            "correctness",
+            "security_work",
+            reasoning_policy.ReasoningProfile.HIGH,
+            "high",
+        ),
+        (
+            {"work_kind": "architecture", "risk_tier": "low"},
+            "correctness",
+            "architecture_work",
+            reasoning_policy.ReasoningProfile.HIGH,
+            "high",
+        ),
+        (
+            None,
+            "correctness",
+            "high_risk_target_review",
+            reasoning_policy.ReasoningProfile.HIGH,
+            "high",
+        ),
     ],
 )
-def test_reviewer_lifts_to_max_from_the_target_card_not_the_reviewer_card(
-    target_card: dict[str, object] | None, lens: str, reason: str
+def test_reviewer_lifts_from_the_target_card_not_the_reviewer_card(
+    target_card: dict[str, object] | None,
+    lens: str,
+    reason: str,
+    expected: reasoning_policy.ReasoningProfile,
+    expected_key: str,
 ) -> None:
     decision = _claude_decision(
         {"risk_tier": "low", "difficulty": "bounded"},
@@ -476,10 +544,10 @@ def test_reviewer_lifts_to_max_from_the_target_card_not_the_reviewer_card(
         target_card=target_card,
         lens=lens,
     )
-    assert decision.profile is reasoning_policy.ReasoningProfile.MAXIMUM
+    assert decision.profile is expected
     assert reason in decision.rationale.reason_codes
     assert decision.route_effort is not None
-    assert decision.route_effort.applied_key == "max"
+    assert decision.route_effort.applied_key == expected_key
 
 
 def test_reviewer_card_own_high_risk_does_not_lift_a_benign_target() -> None:
@@ -489,9 +557,10 @@ def test_reviewer_card_own_high_risk_does_not_lift_a_benign_target() -> None:
         target_card={"risk_tier": "low", "difficulty": "bounded"},
         lens="correctness",
     )
-    assert decision.profile is reasoning_policy.ReasoningProfile.HIGH
+    assert decision.profile is reasoning_policy.ReasoningProfile.MEDIUM
+    assert decision.request.work_kind is reasoning_policy.WorkKind.CORRECTNESS_REVIEW
     assert decision.route_effort is not None
-    assert decision.route_effort.applied_key == "high"
+    assert decision.route_effort.applied_key == "medium"
 
 
 def test_undeclared_claude_card_resolves_to_the_standard_high_rule() -> None:
@@ -501,13 +570,15 @@ def test_undeclared_claude_card_resolves_to_the_standard_high_rule() -> None:
     assert decision.rationale.baseline_reason == "standard_implementer_high"
 
 
-def test_undeclared_rework_card_is_complex_and_maximum() -> None:
+def test_undeclared_rework_card_is_complex_and_high_never_maximum() -> None:
     decision = _claude_decision(
         {"risk_tier": "low", "rework_predecessor": {"request_id": "R-prev"}}
     )
     assert decision.request.difficulty is reasoning_policy.Difficulty.COMPLEX
-    assert decision.profile is reasoning_policy.ReasoningProfile.MAXIMUM
+    assert decision.profile is reasoning_policy.ReasoningProfile.HIGH
     assert "complex_difficulty" in decision.rationale.reason_codes
+    assert decision.route_effort is not None
+    assert decision.route_effort.applied_key == "high"
 
 
 def test_declared_difficulty_wins_on_a_rework_card() -> None:
@@ -945,7 +1016,9 @@ def test_launch_isolated_claude5_security_card_emits_max_effort(
         ("bounded", "critical", "max", "canonical_maximum", "bounded"),
         (None, "medium", "high", "canonical_high", "standard"),
         ("standard", "medium", "high", "canonical_high", "standard"),
-        ("complex", "low", "max", "canonical_maximum", "complex"),
+        ("complex", "low", "high", "canonical_high", "complex"),
+        ("complex", "high", "high", "canonical_high", "complex"),
+        ("complex", "critical", "max", "canonical_maximum", "complex"),
     ],
 )
 def test_launch_isolated_card_difficulty_selects_the_claude_effort(
