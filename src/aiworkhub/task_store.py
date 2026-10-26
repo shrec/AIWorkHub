@@ -27,6 +27,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -5538,6 +5539,223 @@ def _pre_lease_committed_drift_proof(
     return proof
 
 
+# NF-2026-01655: yielded by ``_collected_replay_predecessor_rebuild`` when a
+# rebuild failed, or a hub-built one survives its cleanup at the recorded path.
+_REPLAY_REBUILD_REFUSED = object()
+
+
+def _replay_rebuild_marker(recorded: str) -> Path:
+    """Where a replay rebuild of the worktree recorded at ``recorded`` is noted.
+
+    Beside the request directory, never inside it: ``create_workspace`` needs
+    that directory absent and ``cleanup_workspace`` removes all of it, so a
+    cleanup that fails part-way can never take the marker with it.
+    """
+    return Path(f"{Path(recorded).parent}.aiworkhub-replay-rebuild")
+
+
+def _replay_rebuild_authority(
+    repo: Path, task_id: str, predecessor: Mapping[str, Any]
+) -> tuple[dict[str, Any] | None, str | None]:
+    """The exact values that authorize rebuilding a collected replay predecessor.
+
+    NF-2026-01655: ``(snapshot, None)`` only when ``rework_delta`` passes
+    ``validated_rework_delta`` -- the check reject_review pins it with -- and
+    ``delta_artifact`` projects that descriptor; otherwise ``(None, reason)``.
+    It only reads and hashes the artifact and spawns nothing, so the writer
+    lease evaluates it again on the locked card.
+    """
+    from . import worker_workspace as _ww
+
+    request_id = str(predecessor.get("request_id") or "").strip()
+    claim_epoch = predecessor.get("claim_epoch")
+    descriptor, refusal = _ww.validated_rework_delta(
+        predecessor.get("rework_delta"),
+        authority_repo=repo,
+        task_id=task_id,
+        expected_request_id=request_id,
+        expected_claim_epoch=claim_epoch if type(claim_epoch) is int else None,
+    )
+    if descriptor is None:
+        return None, refusal or "rework_delta_absent"
+    if predecessor.get("delta_artifact") != {
+        "path": descriptor["artifact_path"],
+        "digest": descriptor["artifact_sha256"],
+    }:
+        return None, "delta_artifact_mismatch"
+    workspace = predecessor.get("workspace")
+    return {
+        "request_id": request_id,
+        "workspace_path": (
+            str(workspace.get("path") or "") if isinstance(workspace, dict) else ""
+        ),
+        "rework_delta": predecessor.get("rework_delta"),
+        "delta_artifact": predecessor.get("delta_artifact"),
+        "descriptor": descriptor,
+    }, None
+
+
+def _replay_rebuild_holds(
+    state: object, root: str | Path, task_id: str, predecessor: Mapping[str, Any]
+) -> bool:
+    """Whether the locked replay predecessor is still what a rebuild came from.
+
+    NF-2026-01655: ``None`` -- nothing was rebuilt -- leaves the existing
+    checks as the only authority; a refused rebuild never holds; a snapshot
+    holds only while the locked card names the identical predecessor,
+    workspace path and pinned delta and its artifact authenticates to the
+    identical descriptor.  Anything else means the bytes on disk are not the
+    ones the lease would be authorizing.
+    """
+    if state is None:
+        return True
+    if state is _REPLAY_REBUILD_REFUSED:
+        return False
+    try:
+        current, _refusal = _replay_rebuild_authority(
+            Path(root).resolve(strict=True), task_id, predecessor
+        )
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError):
+        return False
+    return current is not None and current == state
+
+
+def _release_replay_rebuild(
+    task_id: str, repo: Path, worktree: Path, marker: Path
+) -> None:
+    """Remove a replay rebuild; its marker stays while any of it survives.
+
+    NF-2026-01655: a cleanup that raised or left bytes behind keeps the marker
+    and says so, and the next replay of ``task_id`` removes the leftover
+    before anything else and refuses while it persists.
+    """
+    from . import worker_workspace as _ww
+
+    home = worktree.parent / "home"
+    failure = ""
+    try:
+        _ww.cleanup_workspace(repo, worktree, home)
+    except (OSError, RuntimeError) as exc:
+        failure = str(exc) or type(exc).__name__
+    leftover = next((path for path in (worktree, home) if os.path.lexists(path)), None)
+    if leftover is not None:
+        logging.getLogger(__name__).warning(
+            "validation-only replay rebuild for %s left %s behind (%s); keeping %s",
+            task_id,
+            leftover,
+            failure or "cleanup_incomplete",
+            marker,
+        )
+        return
+    try:
+        marker.unlink(missing_ok=True)
+    except OSError as exc:
+        logging.getLogger(__name__).warning(
+            "validation-only replay rebuild marker %s for %s not removed: %s",
+            marker,
+            task_id,
+            exc,
+        )
+
+
+@contextmanager
+def _collected_replay_predecessor_rebuild(
+    root: str | Path, db_path: Path, task_id: str, *, enabled: bool
+) -> Iterator[object]:
+    """Rebuild a retention-collected replay predecessor around the lease.
+
+    NF-2026-01655: a validation-only replay authenticates its predecessor's
+    bytes on disk, but retention collects that worktree once its rework delta
+    is sealed (``workspace_gc_reason=sealed_rework_delta``).  When the recorded
+    worktree is absent and ``_replay_rebuild_authority`` authenticates the
+    predecessor's ``rework_delta``, the worktree is rebuilt from exactly that
+    delta on entry, before the writer lease since provisioning spawns git, and
+    the gate then runs every existing check unchanged on the rebuilt bytes.
+    The rebuild is evidence only -- the replay launch materializes the same
+    sealed delta into its own worktree -- so it is removed again on exit,
+    after the lease.
+
+    Yields the decision the lease enforces through ``_replay_rebuild_holds``:
+    ``None`` when nothing was rebuilt, so the existing checks and refusal codes
+    stand alone; the snapshot that authorized the rebuild, which the locked
+    card must still match; or ``_REPLAY_REBUILD_REFUSED`` when the rebuild
+    failed or a hub-built leftover survives at the recorded path.  A rebuild
+    is attempted only while the predecessor's whole request directory is
+    absent, so the ``_replay_rebuild_marker`` written before it covers the
+    hub's own bytes alone; it outlives every rebuild whose removal is not
+    confirmed, and the next replay removes that leftover first: a hub-built
+    leftover is never trusted as a retained predecessor.
+    """
+    from . import worker_workspace as _ww
+
+    state: object = None
+    rebuild: tuple[Path, Path, Path] | None = None
+    if enabled:
+        try:
+            conn = _connect(db_path, readonly=True)
+            try:
+                row = conn.execute(
+                    "SELECT status, worker_status, card_json FROM tasks WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            card = json.loads(str(row["card_json"] or "{}")) if row is not None else {}
+            predecessor = card.get("rework_predecessor") if isinstance(card, dict) else None
+            workspace = (
+                predecessor.get("workspace") if isinstance(predecessor, dict) else None
+            )
+            recorded = (
+                str(workspace.get("path") or "") if isinstance(workspace, dict) else ""
+            )
+            marker = _replay_rebuild_marker(recorded) if recorded else None
+            if (
+                row is not None
+                and isinstance(predecessor, dict)
+                and canonical_status(dict(row)) in {"blocked", "pending"}
+                and marker is not None
+                and (not os.path.lexists(recorded) or os.path.lexists(marker))
+            ):
+                repo = Path(root).resolve(strict=True)
+                if os.path.lexists(marker):
+                    _release_replay_rebuild(task_id, repo, Path(recorded), marker)
+                    if os.path.lexists(recorded):
+                        state = _REPLAY_REBUILD_REFUSED
+                if state is None:
+                    snapshot, refusal = _replay_rebuild_authority(
+                        repo, task_id, predecessor
+                    )
+                    if snapshot is not None and os.path.lexists(Path(recorded).parent):
+                        # ``create_workspace`` needs the request directory
+                        # absent, and a release never touches bytes the hub
+                        # did not rebuild itself.
+                        snapshot, refusal = None, "request_directory_present"
+                    if snapshot is None:
+                        logging.getLogger(__name__).warning(
+                            "validation-only replay predecessor of %s not rebuilt: %s",
+                            task_id,
+                            refusal,
+                        )
+                    else:
+                        marker.write_text(f"{task_id}\n", encoding="utf-8")
+                        rebuild = (repo, Path(recorded), marker)
+                        _ww.rebuild_collected_rework_predecessor(repo, card)
+                        state = snapshot
+        except (sqlite3.Error, OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
+            logging.getLogger(__name__).warning(
+                "validation-only replay predecessor of %s not rebuilt: %s",
+                task_id,
+                str(exc) or type(exc).__name__,
+            )
+            if rebuild is not None:
+                state = _REPLAY_REBUILD_REFUSED
+    try:
+        yield state
+    finally:
+        if rebuild is not None:
+            _release_replay_rebuild(task_id, *rebuild)
+
+
 def retained_terminal_rework_predecessor(
     root: str | Path,
     task_id: str,
@@ -6204,6 +6422,16 @@ def recover_blocked_rework(
     ordinary recovery pins that exact delta for the successor to materialize,
     and the clean-root escape fails closed rather than discard its bytes.
 
+    Nor is a validation-only replay predecessor whose worktree retention
+    collected after sealing its ``rework_delta`` (NF-2026-01655): when that
+    descriptor authenticates, the worktree is rebuilt from it at the
+    predecessor's ``base_oid`` before the lease, the lease re-authenticates
+    the same delta on the locked card, every replay check then runs unchanged
+    on the rebuilt bytes, and the rebuild is removed afterwards.  An absent,
+    invalid, tampered or since-changed delta, a rebuilt path whose hash
+    differs, or an earlier rebuild that could not be removed keeps
+    ``validation_only_replay_workspace_invalid``.
+
     Idempotent: returns ``(True, "already_recovered")`` when a prior recovery
     already re-queued the same task, without duplicating audit history.  A
     pending recovered task may still receive the explicit clean-root
@@ -6259,6 +6487,21 @@ def recover_blocked_rework(
         if scope_rejection_resolved
         else _pre_lease_committed_drift_proof(root, db_path, task_id)
     )
+    # NF-2026-01655: a replay predecessor whose worktree retention collected
+    # after sealing its rework delta is rebuilt from that delta on entry --
+    # before the lease, since provisioning spawns git -- and removed after it.
+    # The lease re-authenticates that delta on the locked card before the
+    # rebuilt bytes may count (``_replay_rebuild_holds``).
+    replay_rebuild = _collected_replay_predecessor_rebuild(
+        root,
+        db_path,
+        task_id,
+        enabled=(
+            validation_only_replay
+            and not clean_root_if_predecessor_missing
+            and not scope_rejection_resolved
+        ),
+    )
     # Serialized on the same lease as the terminal transitions. Its four
     # ``conn.commit()`` calls are MUTUALLY EXCLUSIVE branch exits, not four
     # sequential transactions -- every one is immediately followed by a
@@ -6266,7 +6509,7 @@ def recover_blocked_rework(
     # branch's one-transaction semantics exactly. The only filesystem work
     # done under it is path resolution and ``exists()`` stats; nothing spawns
     # a subprocess, so the hold stays on the order of the SQLite work.
-    with _write_connection(db_path) as conn:
+    with replay_rebuild as rebuild_state, _write_connection(db_path) as conn:
         _begin_immediate(conn)
         row = conn.execute(
             "SELECT task_id, runner, topic, status, worker_status, claimed_by, "
@@ -6525,6 +6768,10 @@ def recover_blocked_rework(
                         return False, "validation_only_replay_lineage_invalid"
                     predecessor_workspace = predecessor.get("workspace")
                     if not isinstance(predecessor_workspace, dict):
+                        return False, "validation_only_replay_workspace_invalid"
+                    if not _replay_rebuild_holds(
+                        rebuild_state, root, task_id, predecessor
+                    ):
                         return False, "validation_only_replay_workspace_invalid"
                     if isinstance(predecessor_workspace, dict):
                         carried_hashes = sealed_lineage.get(
@@ -6993,6 +7240,10 @@ def recover_blocked_rework(
                 return False, "validation_only_replay_predecessor_invalid"
             if str(predecessor_workspace.get("request_id") or "").strip() != predecessor_request_id:
                 return False, "validation_only_replay_predecessor_identity_mismatch"
+            if not _replay_rebuild_holds(
+                rebuild_state, root, task_id, retained_predecessor
+            ):
+                return False, "validation_only_replay_workspace_invalid"
             try:
                 expected_repo = Path(root).resolve(strict=True)
                 authority_repo = Path(

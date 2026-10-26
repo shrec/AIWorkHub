@@ -6678,58 +6678,17 @@ def reject_review(
         expected_request_id: str,
         expected_claim_epoch: int | None,
     ) -> tuple[dict[str, Any] | None, str | None]:
-        if raw is None:
-            return None, None
-        if not isinstance(raw, dict) or set(raw) != {
-            "schema_id",
-            "sealed",
-            "authority_repo",
-            "task_id",
-            "request_id",
-            "claim_epoch",
-            "artifact_path",
-            "artifact_sha256",
-        }:
-            return None, "rework_delta_descriptor_invalid"
-        claim_epoch = raw.get("claim_epoch")
-        digest = raw.get("artifact_sha256")
-        if (
-            raw.get("schema_id") != "aiworkhub.rework_delta_descriptor.v1"
-            or raw.get("sealed") is not True
-            or str(raw.get("authority_repo") or "")
-            != str(repo_root().resolve(strict=False))
-            or str(raw.get("task_id") or "") != task_id
-            or str(raw.get("request_id") or "") != expected_request_id
-            or type(claim_epoch) is not int
-            or claim_epoch < 1
-            or (
-                expected_claim_epoch is not None
-                and claim_epoch != expected_claim_epoch
-            )
-            or not isinstance(digest, str)
-            or len(digest) != 64
-            or any(ch not in "0123456789abcdef" for ch in digest)
-        ):
-            return None, "rework_delta_descriptor_identity_mismatch"
+        # NF-2026-01655: one descriptor policy, shared with the validation-only
+        # replay recovery of a predecessor whose worktree retention collected.
         from . import worker_workspace
 
-        artifact_path = Path(str(raw.get("artifact_path") or ""))
-        artifact_root = (
-            worker_workspace.configured_runtime_root(repo_root())
-            / "rework_deltas"
-        ).resolve(strict=False)
-        resolved_artifact = artifact_path.resolve(strict=False)
-        if resolved_artifact.parent != artifact_root or not resolved_artifact.is_file():
-            return None, "rework_delta_descriptor_path_invalid"
-        try:
-            if resolved_artifact.stat().st_size > 64 * 1024 * 1024:
-                return None, "rework_delta_descriptor_too_large"
-            observed_digest = hashlib.sha256(resolved_artifact.read_bytes()).hexdigest()
-        except OSError:
-            return None, "rework_delta_descriptor_unreadable"
-        if observed_digest != digest:
-            return None, "rework_delta_descriptor_tampered"
-        return dict(raw), None
+        return worker_workspace.validated_rework_delta(
+            raw,
+            authority_repo=repo_root(),
+            task_id=task_id,
+            expected_request_id=expected_request_id,
+            expected_claim_epoch=expected_claim_epoch,
+        )
 
     def _resolve_predecessor(
         explicit: str | None,

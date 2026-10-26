@@ -2568,6 +2568,74 @@ def seal_rework_delta_artifact(
     return {"path": str(artifact_path), "digest": artifact_digest}
 
 
+def validated_rework_delta(
+    raw: Any,
+    *,
+    authority_repo: Path,
+    task_id: str,
+    expected_request_id: str,
+    expected_claim_epoch: int | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Authenticate one ``rework_delta`` descriptor: ``(descriptor, None)``.
+
+    ``reject_review`` pins a predecessor's sealed delta only through this
+    check, and validation-only replay recovery rebuilds a collected
+    predecessor only behind it (NF-2026-01655).  ``(None, None)`` means no
+    delta is claimed; a malformed, misidentified, misplaced, oversized,
+    unreadable or tampered descriptor returns its typed
+    ``rework_delta_descriptor_*`` reason.
+    """
+    if raw is None:
+        return None, None
+    if not isinstance(raw, dict) or set(raw) != {
+        "schema_id",
+        "sealed",
+        "authority_repo",
+        "task_id",
+        "request_id",
+        "claim_epoch",
+        "artifact_path",
+        "artifact_sha256",
+    }:
+        return None, "rework_delta_descriptor_invalid"
+    claim_epoch = raw.get("claim_epoch")
+    digest = raw.get("artifact_sha256")
+    if (
+        raw.get("schema_id") != "aiworkhub.rework_delta_descriptor.v1"
+        or raw.get("sealed") is not True
+        or str(raw.get("authority_repo") or "")
+        != str(Path(authority_repo).resolve(strict=False))
+        or str(raw.get("task_id") or "") != task_id
+        or str(raw.get("request_id") or "") != expected_request_id
+        or type(claim_epoch) is not int
+        or claim_epoch < 1
+        or (
+            expected_claim_epoch is not None
+            and claim_epoch != expected_claim_epoch
+        )
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or any(ch not in "0123456789abcdef" for ch in digest)
+    ):
+        return None, "rework_delta_descriptor_identity_mismatch"
+    artifact_path = Path(str(raw.get("artifact_path") or ""))
+    artifact_root = (configured_runtime_root(authority_repo) / "rework_deltas").resolve(
+        strict=False
+    )
+    resolved_artifact = artifact_path.resolve(strict=False)
+    if resolved_artifact.parent != artifact_root or not resolved_artifact.is_file():
+        return None, "rework_delta_descriptor_path_invalid"
+    try:
+        if resolved_artifact.stat().st_size > 64 * 1024 * 1024:
+            return None, "rework_delta_descriptor_too_large"
+        observed_digest = hashlib.sha256(resolved_artifact.read_bytes()).hexdigest()
+    except OSError:
+        return None, "rework_delta_descriptor_unreadable"
+    if observed_digest != digest:
+        return None, "rework_delta_descriptor_tampered"
+    return dict(raw), None
+
+
 def has_verified_rework_delta(
     predecessor: Any,
     *,
@@ -5645,6 +5713,70 @@ def create_workspace(
     # Seal the exit-contract inputs the worker MCP server needs for
     # ``aiworkhub_worker_exit_preflight``.  Advisory only; never fails a launch.
     seal_worker_contract_packet(workspace, card)
+    return workspace
+
+
+def rebuild_collected_rework_predecessor(
+    repo: Path, card: dict[str, Any]
+) -> WorkerWorkspace:
+    """Re-provision a retention-collected predecessor from its sealed delta.
+
+    NF-2026-01655: retention releases a pinned predecessor's worktree once its
+    rework delta is sealed, but validation-only replay recovery authenticates
+    the predecessor's candidate on disk.  This provisions the predecessor's own
+    configured workspace at its recorded ``base_oid`` -- so no base-drift
+    rebase applies -- materializes the pinned delta through the ordinary rework
+    materializer, and re-hashes every changed path against
+    ``changed_path_hashes``.  The caller authenticates the delta descriptor
+    first and owns cleanup of the returned workspace; any failure here removes
+    the new workspace and raises.
+    """
+    repo = repo.resolve()
+    predecessor = card.get("rework_predecessor")
+    if not isinstance(predecessor, dict) or not isinstance(
+        predecessor.get("workspace"), dict
+    ):
+        raise WorkspaceError("rework_predecessor_invalid")
+    request_id = str(predecessor.get("request_id") or "").strip()
+    hashes = predecessor.get("changed_path_hashes")
+    try:
+        source = WorkerWorkspace.from_metadata(predecessor["workspace"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise WorkspaceError(f"rework_predecessor_workspace_invalid:{exc}") from exc
+    if source.repo != repo or source.request_id != request_id:
+        raise WorkspaceError("rework_predecessor_identity_mismatch")
+    if not isinstance(hashes, dict) or not hashes or not source.base_oid:
+        raise WorkspaceError("rework_predecessor_invalid")
+    request_root = configured_worktree_root(repo) / request_id
+    if (
+        source.path != (request_root / "worktree").resolve(strict=False)
+        or source.home != (request_root / "home").resolve(strict=False)
+    ):
+        raise WorkspaceError("rework_predecessor_rebuild_root_mismatch")
+    # Only the predecessor's scope is provisioned: the sealed delta is the sole
+    # content source, and the provider-free adapter projects no credential.
+    workspace = create_workspace(
+        repo,
+        request_id,
+        {"allowed_writes": card.get("allowed_writes")},
+        "deterministic_validation",
+        pinned_base_oid=source.base_oid,
+    )
+    try:
+        _materialize_rework_predecessor(
+            repo, workspace.path, card, workspace.allowed_writes
+        )
+        for raw_relative, expected in sorted(hashes.items()):
+            relative = _relative_repo_path(str(raw_relative))
+            candidate = _require_beneath(workspace.path, workspace.path / relative)
+            regular = candidate.is_file() and not candidate.is_symlink()
+            content = candidate.read_bytes() if regular else None
+            observed = None if content is None else hashlib.sha256(content).hexdigest()
+            if observed != expected:
+                raise _rework_hash_mismatch(relative, "worktree", expected, content)
+    except BaseException:
+        cleanup_workspace(repo, workspace.path, workspace.home)
+        raise
     return workspace
 
 
