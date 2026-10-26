@@ -3878,7 +3878,7 @@ def build_worker_prompt(
     # the rule behind it is the audit ledger rather than a provider refusal.
     # This keeps the prefix stable: it varies per adapter, and a provider prefix
     # cache is per provider already, so no cache is split by task.
-    stable_prefix = agent_tool_instructions.render_worker_runtime_policy(adapter_id)
+    stable_prefix = agent_tool_instructions.render_worker_runtime_policy(adapter_id, card=card)
     prompt = (
         stable_prefix
         + "\n\nTASK_CONTRACT_JSON:\n"

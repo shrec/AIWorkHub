@@ -452,6 +452,36 @@ PARALLEL_TOOL_CALLS_INSTRUCTION = (
 )
 
 
+# NF-2026-01570: the validation sentence block is a named constant so the
+# read-only seat can swap exactly that sentence for one matching its tool list
+# while every other render stays byte-identical. The block is interpolated back
+# at the same place it used to sit inline.
+_WORKER_VALIDATION_RULE = (
+    "run validation ONLY through aiworkhub_worker_validation_run: it resolves the\n"
+    "card's own declared command for you, executes it in this sandbox and returns the\n"
+    "returncode, failure class, pytest short-summary lines and a bounded tail with\n"
+    "the full log addressable by sha256. Never retype a validation command and never\n"
+    "type pytest, ruff or mypy into Bash. On some transports Bash refuses those\n"
+    "outright; on the rest nothing stops you, and typing one anyway produces an\n"
+    "unreceipted run the supervisor cannot read -- so the result does not count\n"
+    "either way. Re-running the tool on unchanged bytes returns the cached receipt;\n"
+    "pass force=true to re-execute."
+)
+
+_READ_ONLY_VALIDATION_RULE = (
+    "stop: this card is read-only, so you hold no validation tool and never run\n"
+    "validation yourself; the coordinator runs the card's declared validation after\n"
+    "you exit. Never type pytest, ruff or mypy into Bash."
+)
+
+# A read-only seat holds no validation tool in the substitution table or the
+# Claude schema preload either, so those two rendered names go with the sentence.
+_READ_ONLY_VALIDATION_TARGET = "nothing: this seat holds no validation tool"
+_VALIDATION_TOOL_SCHEMA_SELECT = (
+    f"mcp__{WORKER_MCP_SERVER_NAME}__{_WORKER_TOOL['validation_run']},"
+)
+
+
 WORKER_RUNTIME_POLICY = f"""You are the sole worker for one exact AIWorkHub task in an isolated worktree.
 
 The coordinator already claimed the task. Do not run taskctl lifecycle commands,
@@ -460,15 +490,7 @@ coordinator will independently enforce allowed_writes, rerun validation, promote
 accepted files, and request review after your process exits successfully.
 
 Read every read_first path before editing. Create the required evidence, then
-run validation ONLY through aiworkhub_worker_validation_run: it resolves the
-card's own declared command for you, executes it in this sandbox and returns the
-returncode, failure class, pytest short-summary lines and a bounded tail with
-the full log addressable by sha256. Never retype a validation command and never
-type pytest, ruff or mypy into Bash. On some transports Bash refuses those
-outright; on the rest nothing stops you, and typing one anyway produces an
-unreceipted run the supervisor cannot read -- so the result does not count
-either way. Re-running the tool on unchanged bytes returns the cached receipt;
-pass force=true to re-execute.
+{_WORKER_VALIDATION_RULE}
 Never install, download, unpack, vendor, or bootstrap validation dependencies
 inside the worker sandbox. When a declared validator is unavailable the tool
 reports failure_class tool_unavailable: name it in the final message and
@@ -578,7 +600,12 @@ def raw_discovery_enforcement(adapter_id: str | None) -> dict[str, Any]:
     }
 
 
-def render_worker_runtime_policy(adapter_id: str | None = None) -> str:
+def render_worker_runtime_policy(
+    adapter_id: str | None = None,
+    *,
+    read_only: bool = False,
+    card: dict[str, Any] | None = None,
+) -> str:
     """Return the canonical stable worker prefix from the policy module.
 
     With ``adapter_id`` the prefix also tells that seat the truth about its own
@@ -590,11 +617,20 @@ def render_worker_runtime_policy(adapter_id: str | None = None) -> str:
 
     The parameter is optional so every existing caller keeps working unchanged;
     a caller that knows the adapter should pass it.
+    ``read_only`` (or a ``card`` carrying ``read_only: true``) swaps the
+    validation rule for the read-only seat's stop sentence and drops that absent
+    tool from the substitution table and the Claude schema preload.
     """
 
     policy = WORKER_RUNTIME_POLICY
     if adapter_id == "claude_cli":
         policy = f"{policy}\n\n{_CLAUDE_TOOL_SCHEMA_BLOCK}"
+    if read_only or (card is not None and card.get("read_only")):
+        policy = policy.replace(_WORKER_VALIDATION_RULE, _READ_ONLY_VALIDATION_RULE)
+        policy = policy.replace(_VALIDATION_TOOL_SCHEMA_SELECT, "")
+        policy = policy.replace(
+            _WORKER_TOOL["validation_run"], _READ_ONLY_VALIDATION_TARGET
+        )
     if adapter_id is None:
         return policy
     enforcement = raw_discovery_enforcement(adapter_id)
