@@ -5108,6 +5108,27 @@ def validation_toolchain_authority(
     return snapshot
 
 
+_VERSION_PROBE_TIMEOUT_SECONDS = 5
+_VERSION_PROBE_RETRY_TIMEOUT_SECONDS = 20
+
+
+def _run_version_probe(argv: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    """Run a ``--version`` probe, retrying once with a longer timeout.
+
+    NF-2026-01713: a cold first launch (for example a Defender first scan of
+    ``ctest.exe`` on a hosted Windows runner) can exceed the short timeout and
+    was recorded as a version-less tool. Only ``TimeoutExpired`` is retried,
+    once; a second timeout or any other error propagates to the caller's
+    fail-closed handling.
+    """
+    try:
+        return subprocess.run(argv, timeout=_VERSION_PROBE_TIMEOUT_SECONDS, **kwargs)
+    except subprocess.TimeoutExpired:
+        return subprocess.run(
+            argv, timeout=_VERSION_PROBE_RETRY_TIMEOUT_SECONDS, **kwargs
+        )
+
+
 def _direct_trusted_version_fact(argv: tuple[str, ...]) -> str:
     """Probe an already-resolved trusted executable without a sandbox lane.
 
@@ -5149,13 +5170,12 @@ def _direct_trusted_version_fact(argv: tuple[str, ...]) -> str:
             env["TMPDIR"] = scratch
             env["TMP"] = scratch
             env["TEMP"] = scratch
-            result = subprocess.run(
+            result = _run_version_probe(
                 [str(executable), *argv[1:]],
                 cwd=scratch,
                 env=env,
                 capture_output=True,
                 text=True,
-                timeout=5,
                 check=False,
                 shell=False,
             )
@@ -5276,13 +5296,12 @@ def trusted_validation_executable_version(
             env["TMPDIR"] = str(scratch)
             env["TMP"] = str(scratch)
             env["TEMP"] = str(scratch)
-            result = subprocess.run(
+            result = _run_version_probe(
                 wrapped,
                 cwd="/",
                 env=env,
                 capture_output=True,
                 text=True,
-                timeout=5,
                 check=False,
                 shell=False,
             )

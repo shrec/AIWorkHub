@@ -1405,6 +1405,70 @@ def test_direct_version_probe_is_shell_free_path_bound_and_time_limited(
     assert kwargs["cwd"] != str(tmp_path)
 
 
+def _inject_probe_run(monkeypatch: pytest.MonkeyPatch, outcomes: list[object]):
+    timeouts: list[float] = []
+
+    def fake_run(argv, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(worker_workspace.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        worker_workspace,
+        "sanitized_env",
+        lambda *args, **kwargs: {"PATH": "/usr/bin:/bin"},
+    )
+    return timeouts
+
+
+def test_direct_version_probe_retries_once_with_longer_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = _executable(tmp_path / "bin" / "ctest")
+    argv = (str(executable), "--version")
+    timeouts = _inject_probe_run(
+        monkeypatch,
+        [
+            subprocess.TimeoutExpired(argv, 5),
+            subprocess.CompletedProcess(argv, 0, "ctest version 3.31.0\n", ""),
+        ],
+    )
+
+    assert (
+        worker_workspace._direct_trusted_version_fact(argv)
+        == "ctest version 3.31.0"
+    )
+    assert timeouts == [5, 20]
+
+
+def test_direct_version_probe_second_timeout_stays_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = _executable(tmp_path / "bin" / "ctest")
+    argv = (str(executable), "--version")
+    timeouts = _inject_probe_run(
+        monkeypatch,
+        [subprocess.TimeoutExpired(argv, 5), subprocess.TimeoutExpired(argv, 20)],
+    )
+
+    assert worker_workspace._direct_trusted_version_fact(argv) == ""
+    assert timeouts == [5, 20]
+
+
+def test_direct_version_probe_does_not_retry_other_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = _executable(tmp_path / "bin" / "ctest")
+    argv = (str(executable), "--version")
+    timeouts = _inject_probe_run(monkeypatch, [OSError("launch failed")])
+
+    assert worker_workspace._direct_trusted_version_fact(argv) == ""
+    assert timeouts == [5]
+
+
 def test_direct_version_probe_stays_fail_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
