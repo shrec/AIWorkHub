@@ -5277,16 +5277,21 @@ def source_graph_query(
 
                 # The declared target is one path even when it contains a
                 # space, so only the rest of the query can name further paths.
+                # A declared target the query does not name, or that is the
+                # whole query, leaves the query nothing to list: it is never
+                # probed, so the exact target is the only file read (B834).
+                lists_paths = scope is None or (
+                    scope != bounded_query and scope in bounded_query
+                )
                 target_path = (
                     scope
-                    if scope is not None and scope != bounded_query
-                    and scope in bounded_query and _indexed(scope)
+                    if scope is not None and lists_paths and _indexed(scope)
                     else None
                 )
                 rest = bounded_query.replace(target_path, " ") if target_path else bounded_query
                 requested_paths = list(dict.fromkeys(
                     ([target_path] if target_path else [])
-                    + _source_graph_mod.file_query_paths(rest, _indexed)
+                    + (_source_graph_mod.file_query_paths(rest, _indexed) if lists_paths else [])
                 ))
                 if (
                     len(requested_paths) > 1
