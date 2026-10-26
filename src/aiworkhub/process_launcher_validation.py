@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sys
 import uuid
 from collections import Counter
 from pathlib import Path, PurePosixPath
@@ -12,6 +13,7 @@ from threading import Lock
 from typing import Any, Callable, Iterable, Mapping
 
 from . import quality_evidence, terminal_failure_classification, validation_runner
+from . import toolchain_authority as _toolchain_authority
 from . import worker_workspace as _worker_workspace
 from .worker_workspace import (
     ValidationEnvironmentBlocked,
@@ -608,6 +610,108 @@ def run_declared_validations(
     return with_roles(results)
 
 
+def _file_sha256_or_deleted(path: Path) -> str:
+    if not path.is_symlink() and not path.exists():
+        return "deleted"
+    if path.is_symlink() or not path.is_file():
+        raise WorkspaceError(f"tree_identity_not_regular_file:{path.name}")
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def combined_tree_identity(
+    workspace: WorkerWorkspace,
+    authority: Mapping[str, Any],
+    route_metadata: Mapping[str, Any],
+    candidate_changed_paths: Iterable[str],
+    *,
+    route_resolver: RouteResolver,
+) -> str | None:
+    """Digest every input of the combined-tree validation without building it.
+
+    ``None`` on any failure, so a caller always falls toward running.
+    """
+
+    try:
+        from .promotion_merge import plan_merges
+
+        repo = workspace.repo
+        candidate = sorted(
+            {_worker_workspace._relative_repo_path(value) for value in candidate_changed_paths}
+        )
+        candidate_set = set(candidate)
+        head = _worker_workspace._run(["git", "rev-parse", "HEAD"], cwd=repo)
+        if head.returncode != 0:
+            return None
+        canonical_delta = {
+            relative: _file_sha256_or_deleted(repo / relative)
+            for relative in _worker_workspace._canonical_worktree_delta_paths(repo)
+            if relative not in candidate_set
+        }
+        merges = plan_merges(workspace, candidate)
+        candidate_hashes = {
+            relative: (
+                hashlib.sha256(merges[relative]).hexdigest()
+                if relative in merges
+                else _file_sha256_or_deleted(workspace.path / relative)
+            )
+            for relative in candidate
+        }
+        payload = {
+            "head_oid": head.stdout.strip(),
+            "canonical_delta": canonical_delta,
+            "candidate": candidate_hashes,
+            "commands": declared_validation_commands(authority),
+            "toolchain_receipt": authority.get(
+                _toolchain_authority.RECEIPT_CARD_KEY
+            ),
+            "route": route_resolver(route_metadata),
+            "python_executable": sys.executable,
+            "python_version": sys.version,
+        }
+        blob = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), default=str
+        )
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+    except Exception:  # noqa: BLE001 -- any doubt means "run the validations"
+        return None
+
+
+def _reusable_finalizer_rows(
+    reuse: Mapping[str, Any] | None,
+    *,
+    identity: str | None,
+    workspace: WorkerWorkspace,
+    command_count: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    if identity is None or not isinstance(reuse, Mapping):
+        return None
+    recorded = reuse.get("full_validation_snapshot")
+    rows = reuse.get("validations")
+    if not isinstance(recorded, Mapping) or not isinstance(rows, (list, tuple)):
+        return None
+    if (
+        recorded.get("tree_identity_sha256") != identity
+        or recorded.get("request_id") != workspace.request_id
+        or recorded.get("source_base_oid") != workspace.base_oid
+        or recorded.get("validations_all_passed") is not True
+    ):
+        return None
+    if not rows or len(rows) != command_count:
+        return None
+    for row in rows:
+        if (
+            not isinstance(row, Mapping)
+            or isinstance(row.get("returncode"), bool)
+            or validation_runner._is_failing_row(row)
+        ):
+            return None
+    return [dict(row) for row in rows], {
+        **recorded,
+        "reused": True,
+        "reused_from": "finalization",
+    }
+
+
 def run_full_snapshot_validations(
     workspace: WorkerWorkspace,
     authority: Mapping[str, Any],
@@ -619,13 +723,15 @@ def run_full_snapshot_validations(
     run_validations: ValidationRunner,
     route_resolver: RouteResolver,
     baseline_comparer: Callable[..., list[dict[str, Any]]],
+    reuse: Mapping[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Run validation against the complete canonical-plus-candidate snapshot."""
 
     candidate = sorted({str(value) for value in candidate_changed_paths})
     if not candidate:
         raise WorkspaceError("full_snapshot_candidate_empty")
-    if not declared_validation_commands(authority):
+    commands = declared_validation_commands(authority)
+    if not commands:
         return [], {
             "schema_id": "aiworkhub.full_validation_snapshot.v1",
             "applicable": False,
@@ -635,6 +741,18 @@ def run_full_snapshot_validations(
             "source_base_oid": workspace.base_oid,
             "candidate_changed_paths": candidate,
         }
+    identity = combined_tree_identity(
+        workspace,
+        authority,
+        route_metadata,
+        candidate,
+        route_resolver=route_resolver,
+    )
+    reused = _reusable_finalizer_rows(
+        reuse, identity=identity, workspace=workspace, command_count=len(commands)
+    )
+    if reused is not None:
+        return reused
     snapshot, combined_tree = create_snapshot(workspace, authority, candidate)
     try:
         validations = run_declared_validations(
@@ -652,6 +770,10 @@ def run_full_snapshot_validations(
             "source_base_oid": workspace.base_oid,
             "snapshot_base_oid": snapshot.base_oid,
             "combined_tree": combined_tree,
+            "tree_identity_sha256": identity,
+            "validations_all_passed": not any(
+                validation_runner._is_failing_row(row) for row in validations
+            ),
         }
     finally:
         cleanup_workspace(snapshot.repo, snapshot.path, snapshot.home)

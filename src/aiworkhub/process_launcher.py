@@ -844,8 +844,8 @@ def _run_validations_with_toolchain_receipt(
 
 
 def _run_full_snapshot_validations(
-    workspace: WorkerWorkspace, authority: Mapping[str, Any],
-    route_metadata: Mapping[str, Any], candidate_changed_paths: Iterable[str],
+    workspace: WorkerWorkspace, authority: Mapping[str, Any], route_metadata: Mapping[str, Any],
+    candidate_changed_paths: Iterable[str], *, reuse: Mapping[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     return _launcher_validation.run_full_snapshot_validations(
         workspace, authority, route_metadata, candidate_changed_paths,
@@ -854,7 +854,7 @@ def _run_full_snapshot_validations(
         run_validations=partial(
             _run_validations_with_toolchain_receipt, authority=authority),
         route_resolver=_validation_route_kwargs,
-        baseline_comparer=_compare_schema_mypy_baseline,
+        baseline_comparer=_compare_schema_mypy_baseline, reuse=reuse,
     )
 
 

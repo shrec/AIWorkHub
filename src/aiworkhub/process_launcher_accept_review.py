@@ -1099,6 +1099,33 @@ def _restore_correction_originals(
     return failed
 
 
+def _finalizer_validation_reuse(
+    terminal_review: Mapping[str, Any],
+    *,
+    correction_record: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """The finalizer's recorded combined-tree run, or ``None`` when unusable.
+
+    A manager correction changes the validated bytes, so it never reuses.
+    """
+    if correction_record is not None:
+        return None
+    evidence = terminal_review.get("evidence")
+    if not isinstance(evidence, Mapping):
+        return None
+    rows = evidence.get("validation")
+    gate = evidence.get("quality_gate")
+    snapshot = gate.get("full_validation_snapshot") if isinstance(gate, Mapping) else None
+    if (
+        not isinstance(rows, (list, tuple))
+        or not rows
+        or not isinstance(snapshot, Mapping)
+        or not isinstance(snapshot.get("tree_identity_sha256"), str)
+    ):
+        return None
+    return {"full_validation_snapshot": snapshot, "validations": rows}
+
+
 def _blind_reviewer_lenses(reviewers: list[dict[str, Any]]) -> set[str]:
     """Lenses whose ALREADY-SEALED reports show that nothing inspected them.
 
@@ -2104,6 +2131,7 @@ def _stale_inputs_touching_candidate(
 # list is exactly the drift it exists to catch.
 ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
     "_accept_in_flight_marker",
+    "_finalizer_validation_reuse",
     "_accept_manager_identity",
     "_restore_correction_originals",
     "_receipt_sha256",
@@ -3623,8 +3651,14 @@ def accept_review(
             quality_gate["destructive_change_confirmed"] = bool(
                 confirm_destructive_change and destructive_blockers
             )
+            validation_reuse = _finalizer_validation_reuse(
+                terminal_review, correction_record=correction_record
+            )
             validations, full_validation_snapshot = (
-                _run_full_snapshot_validations(workspace, card, latest, changed)
+                _run_full_snapshot_validations(
+                    workspace, card, latest, changed,
+                    **({"reuse": validation_reuse} if validation_reuse else {}),
+                )
             )
             quality_gate["full_validation_snapshot"] = full_validation_snapshot
             _enforce_behavioral_gate(card, validations, quality_gate)
