@@ -66,6 +66,7 @@ LAUNCH_ISOLATED_SEAM_NAMES: tuple[str, ...] = (
     "_materialize_crash_retry_packet",
     "_materialize_worker_rework_overlay",
     "_memory_launch_admission",
+    "_parse_card",
     "_path_manifest",
     "_pid_start_ticks",
     "_project_context_delivery",
@@ -292,6 +293,7 @@ def launch_isolated(
     _materialize_crash_retry_packet = _pl._materialize_crash_retry_packet
     _materialize_worker_rework_overlay = _pl._materialize_worker_rework_overlay
     _memory_launch_admission = _pl._memory_launch_admission
+    _parse_card = _pl._parse_card
     _path_manifest = _pl._path_manifest
     _pid_start_ticks = _pl._pid_start_ticks
     _project_context_delivery = _pl._project_context_delivery
@@ -864,7 +866,7 @@ def launch_isolated(
             if quality_review_binding is not None:
                 _review_target_id = str(quality_review_binding["target_task_id"])
                 try:
-                    review_target_card = _pl._parse_card(
+                    review_target_card = _parse_card(
                         self._show_task(_review_target_id), _review_target_id
                     )
                 except LaunchRejected:
