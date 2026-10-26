@@ -788,6 +788,10 @@ class AppContainerLaunch:
                 {"path": path, "satisfied_by": how} for path, how in self.persistent_grants
             ],
             "sandbox_drive_release_failures": list(self.sandbox_drive_release_failures),
+            # NF-2026-01695: what the sandbox-drive leases could not do.
+            "sandbox_drive_lease_issues": list(
+                getattr(self.api, "sandbox_drive_lease_issues", ())
+            ),
         }
 
 
@@ -971,13 +975,18 @@ _WAIT_TIMEOUT = 258
 _WAIT_FAILED = 0xFFFFFFFF
 _MAX_BOUNDED_WAIT_MS = 0xFFFFFFFE
 _WAIT_ABANDONED = 0x80
-# One session-local mutex serializes choosing and defining a sandbox drive.
+# One session-local mutex serializes choosing and defining a sandbox drive,
+# and reclaiming the ones dead launchers leased (_SandboxDriveLeases).
 _SANDBOX_DRIVE_MUTEX = "Local\\AIWorkHub.SandboxDrive"
 _SANDBOX_DRIVE_WAIT_MS = 10_000
 _DDD_NO_BROADCAST_SYSTEM = 0x8
 _DDD_REMOVE_DEFINITION = 0x2
 _DDD_EXACT_MATCH_ON_REMOVE = 0x4
 _SANDBOX_DRIVE_LETTERS = "ZYXWVUTSRQPONMLKJIHGFE"
+# Removes exactly one stacked definition, and only one naming that root.
+_SANDBOX_DRIVE_POP_FLAGS = (
+    _DDD_NO_BROADCAST_SYSTEM | _DDD_REMOVE_DEFINITION | _DDD_EXACT_MATCH_ON_REMOVE
+)
 
 
 def _dos_device_target(real_root: str) -> str:
@@ -1005,6 +1014,332 @@ def _choose_sandbox_drive(
         if not free and not target and not taken:
             free = drive
     return free, True
+
+
+# NF-2026-01695: a launcher that dies without close() used to leave its push
+# stacked until sign-out. Every push is now leased, and the next sandbox_drive
+# reclaims each push whose launcher is gone (_SandboxDriveLeases).
+_DRIVE_LEASE_SCHEMA = "aiworkhub.sandbox_drive_lease.v1"
+_DRIVE_LEASE_FIELDS = frozenset(("schema", "drive", "real_root", "pid", "start_ticks"))
+_DRIVE_LEASE_NAME = re.compile(r"[0-9a-f]{32}\.lease\Z")
+_DRIVE_LEASE_MAX_BYTES = 4096
+# Store entries one reconcile reads, and issues one store keeps.
+_DRIVE_LEASE_LIMIT = 256
+_DRIVE_LEASE_ISSUE_LIMIT = 32
+
+
+def _runtime_temp() -> Any:
+    """``runtime_temp``: the process start identity and liveness every launcher
+    shares.  Not ``process_identity``, which is built on the same two: the
+    supervisor imports this module as a direct script, and only
+    ``runtime_temp`` imports that way too."""
+    try:
+        from . import runtime_temp
+    except ImportError:  # direct-script entrypoint
+        import runtime_temp  # type: ignore[no-redef]
+    return runtime_temp
+
+
+def _owner_only(path: str, flags: int) -> int:
+    """``open`` opener: create the file 0o600.  On Windows it inherits the
+    per-user LocalAppData DACL instead: this user, SYSTEM and Administrators."""
+    return os.open(path, flags, 0o600)
+
+
+def _drive_lease_valid(
+    drive: object, real_root: object, pid: object, start_ticks: object
+) -> bool:
+    """These name only what sandbox_drive defines -- a letter of
+    :data:`_SANDBOX_DRIVE_LETTERS` and a drive-letter sandbox root, read as
+    Windows reads it on any host -- and an owner whose identity can be
+    checked: a real pid and the start it had."""
+    if not isinstance(drive, str) or not isinstance(real_root, str):
+        return False
+    root = PureWindowsPath(real_root)
+    return (
+        len(drive) == 2
+        and drive[0] in _SANDBOX_DRIVE_LETTERS
+        and drive[1] == ":"
+        and "\x00" not in real_root
+        and "/" not in real_root
+        and len(root.drive) == 2
+        and root.root == "\\"
+        and ".." not in root.parts
+        and tuple(part.lower() for part in root.parts[-3:]) == _SANDBOX_TAIL
+        and isinstance(pid, int)
+        and not isinstance(pid, bool)
+        and 0 < pid <= 0xFFFFFFFF
+        and isinstance(start_ticks, int)
+        and not isinstance(start_ticks, bool)
+        and start_ticks > 0
+    )
+
+
+@dataclass(frozen=True)
+class _DriveLease:
+    """One sandbox-drive push still owed its pop, and the process owing it."""
+
+    drive: str
+    real_root: str
+    pid: int
+    start_ticks: int
+
+    @property
+    def key(self) -> tuple[str, str]:
+        """The definition this names, as QueryDosDeviceW reports it."""
+        return self.drive, _dos_device_target(self.real_root)
+
+    def encode(self) -> bytes:
+        return json.dumps(
+            {
+                "schema": _DRIVE_LEASE_SCHEMA,
+                "drive": self.drive,
+                "real_root": self.real_root,
+                "pid": self.pid,
+                "start_ticks": self.start_ticks,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+
+    @classmethod
+    def decode(cls, data: bytes) -> _DriveLease | None:
+        """The lease ``data`` spells, or ``None`` when it is malformed or foreign."""
+        try:
+            fields = json.loads(data.decode("utf-8"))
+        except (ValueError, RecursionError):
+            return None
+        if (
+            not isinstance(fields, dict)
+            or set(fields) != _DRIVE_LEASE_FIELDS
+            or fields["schema"] != _DRIVE_LEASE_SCHEMA
+            or not _drive_lease_valid(
+                fields["drive"], fields["real_root"], fields["pid"], fields["start_ticks"]
+            )
+        ):
+            return None
+        return cls(fields["drive"], fields["real_root"], fields["pid"], fields["start_ticks"])
+
+
+class _SandboxDriveLeases:
+    """NF-2026-01695: per-user leases of the sandbox-drive pushes still owed a pop.
+
+    :meth:`_CtypesWin32Api.sandbox_drive` leases each push it makes and
+    :meth:`_CtypesWin32Api.release_sandbox_drive` deletes that lease after its
+    pop, so a lease outliving its owner names a definition a dead launcher
+    leaked.  :meth:`reconcile` runs first in every sandbox_drive, under the
+    same session mutex, and reclaims those.  A malformed or foreign entry is
+    never trusted: never popped, never deleted.
+
+    The definitions are per logon session, not per repo, so the store is per
+    user and host-local -- ``%LOCALAPPDATA%\\AIWorkHub\\sandbox-drive-leases``
+    -- and never inside a sandbox root, where the request directories a
+    container may write live.  Nothing here raises: a failure lands in
+    :attr:`issues` (bounded) and the launch goes on, at worst with one push
+    unleased.
+    """
+
+    def __init__(self, directory: Path | None, unavailable: str = "") -> None:
+        self.directory = directory
+        self.issues: list[str] = []
+        # This store's own leases per (drive, real_root), for release().
+        self._mine: dict[tuple[str, str], list[Path]] = {}
+        if unavailable:
+            self._note(unavailable)
+
+    @classmethod
+    def for_current_user(cls) -> _SandboxDriveLeases:
+        """The store under this user's LocalAppData, or one that leases nothing."""
+        try:
+            local = resolve_local_appdata()
+            if not local or not os.path.isabs(local):
+                return cls(None, "sandbox drives are not leased: no per-user LocalAppData")
+            directory = Path(local) / "AIWorkHub" / "sandbox-drive-leases"
+            if _sandbox_root_of(str(directory)):
+                return cls(None, f"sandbox drives are not leased: {directory} is in a sandbox root")
+            return cls(directory)
+        except Exception as exc:  # a store it cannot place never fails a launch
+            return cls(None, f"sandbox drives are not leased: {exc!r}")
+
+    def record(self, drive: str, real_root: str) -> None:
+        """Lease this process's push of ``drive`` naming ``real_root``."""
+        try:
+            self._record(drive, real_root)
+        except Exception as exc:  # never fails the launch it leases
+            self._note(f"{drive} {real_root!r} not leased: {exc!r}")
+
+    def release(self, drive: str, real_root: str) -> None:
+        """Delete one of this store's leases of ``drive`` naming ``real_root``,
+        whose definition the caller has just popped."""
+        mine = self._mine.get((drive, real_root))
+        if mine:
+            self._unlink(mine.pop())
+
+    def reconcile(
+        self, held: Callable[[str, str], int], pop: Callable[[str, str], int]
+    ) -> None:
+        """Pop the definition of every lease whose owner is gone, and delete it.
+
+        Gone is :func:`runtime_temp._recorded_process_alive`'s verdict: dead,
+        or its pid reused by a process that started later; a probe that cannot
+        answer keeps the owner alive.  Deleting the lease is the claim, so one
+        is reclaimed at most once, even by a launcher outside this session's
+        mutex.  ``pop`` (0, or the Win32 error) then runs only while ``held``
+        -- this session's definitions of that letter naming that root --
+        exceeds the live leases naming it: a definition already gone (sign-out,
+        reboot, another logon session, a crash just after a release's pop) is
+        never taken from a live owner.  A scan that misses a lease -- entries
+        past _DRIVE_LEASE_LIMIT, or one it cannot read -- reclaims nothing that
+        round.  A push left unleased (see :meth:`record`) is not counted, so it
+        is not protected.
+        """
+        try:
+            self._reconcile(held, pop)
+        except Exception as exc:  # never fails the launch it runs in
+            self._note(f"reconcile stopped: {exc!r}")
+
+    def _record(self, drive: str, real_root: str) -> None:
+        directory = self.directory
+        if directory is None:
+            return
+        pid = os.getpid()
+        start_ticks = _runtime_temp().process_start_ticks(pid)
+        if not _drive_lease_valid(drive, real_root, pid, start_ticks):
+            self._note(
+                f"{drive} {real_root!r} not leased: no start identity, or not a sandbox drive"
+            )
+            return
+        lease = _DriveLease(drive, real_root, pid, start_ticks)
+        path = directory / f"{secrets.token_hex(16)}.lease"
+        try:
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            self._require_plain_directory(directory)
+            handle = open(path, "xb", opener=_owner_only)
+        except OSError as exc:
+            self._note(f"{drive} {real_root!r} not leased: {exc}")
+            return
+        try:
+            with handle:
+                handle.write(lease.encode())
+        except OSError as exc:
+            self._note(f"{drive} {real_root!r} not leased: {exc}")
+            self._unlink(path)
+            return
+        self._mine.setdefault((drive, real_root), []).append(path)
+
+    def _reconcile(
+        self, held: Callable[[str, str], int], pop: Callable[[str, str], int]
+    ) -> None:
+        directory = self.directory
+        if directory is None:
+            return
+        try:
+            leases, complete = self._load(directory)
+        except FileNotFoundError:
+            return  # nothing was ever leased here
+        except OSError as exc:
+            self._note(f"reconcile skipped: {exc}")
+            return
+        if not complete:
+            # A live lease the scan missed would let a dead one pop its owner's
+            # definition: reclaim nothing this round, keep every lease for later.
+            self._note("reconcile deferred: not every lease was read")
+            return
+        alive = [self._owner_alive(lease) for _path, lease in leases]
+        live: dict[tuple[str, str], int] = {}
+        for (_path, lease), owner_alive in zip(leases, alive):
+            if owner_alive:
+                live[lease.key] = live.get(lease.key, 0) + 1
+        for (path, lease), owner_alive in zip(leases, alive):
+            if owner_alive or not self._unlink(path):
+                continue
+            if held(lease.drive, lease.real_root) <= live.get(lease.key, 0):
+                continue  # nothing of this lease's is left here to reclaim
+            error = pop(lease.drive, lease.real_root)
+            if error:
+                self._note(
+                    f"lease {path.name} reclaimed, but its pop {lease.drive} "
+                    f"{lease.real_root!r} failed: win_error {error}"
+                )
+
+    def _load(self, directory: Path) -> tuple[list[tuple[Path, _DriveLease]], bool]:
+        """The leases in ``directory`` by name, reading at most
+        _DRIVE_LEASE_LIMIT entries; a malformed or foreign one is skipped.
+
+        Also whether the scan saw every lease: not when entries past the limit
+        went unread or a lease-named entry could not be read, since either may
+        be a live owner's."""
+        self._require_plain_directory(directory)
+        with os.scandir(directory) as entries:
+            names = [entry.name for _, entry in zip(range(_DRIVE_LEASE_LIMIT + 1), entries)]
+        complete = len(names) <= _DRIVE_LEASE_LIMIT
+        if not complete:
+            self._note(f"{directory} holds over {_DRIVE_LEASE_LIMIT} entries")
+            del names[_DRIVE_LEASE_LIMIT:]
+        leases: list[tuple[Path, _DriveLease]] = []
+        skipped = 0
+        for name in sorted(names):
+            try:
+                lease = self._read(directory / name)
+            except OSError as exc:
+                self._note(f"lease {name} unreadable: {exc}")
+                complete = False
+                continue
+            if lease is None:
+                skipped += 1
+            else:
+                leases.append((directory / name, lease))
+        if skipped:
+            self._note(f"skipped {skipped} malformed or foreign lease(s) in {directory}")
+        return leases, complete
+
+    @staticmethod
+    def _read(path: Path) -> _DriveLease | None:
+        """The lease ``path`` holds; ``None`` for anything else.  A lease-named
+        entry that cannot be read raises ``OSError``: it may be a live owner's."""
+        if not _DRIVE_LEASE_NAME.match(path.name):
+            return None
+        info = os.lstat(path)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            or info.st_size > _DRIVE_LEASE_MAX_BYTES
+        ):
+            return None
+        with open(path, "rb") as handle:
+            data = handle.read(_DRIVE_LEASE_MAX_BYTES + 1)
+        return _DriveLease.decode(data) if len(data) <= _DRIVE_LEASE_MAX_BYTES else None
+
+    @staticmethod
+    def _require_plain_directory(directory: Path) -> None:
+        """Raise ``OSError`` unless ``directory`` is a real directory, not a link out."""
+        info = os.lstat(directory)
+        if not stat.S_ISDIR(info.st_mode) or (
+            getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            raise OSError(f"lease store {directory} is not a plain directory")
+
+    def _owner_alive(self, lease: _DriveLease) -> bool:
+        """A probe that cannot answer is no proof of death: the owner stays alive."""
+        try:
+            return bool(_runtime_temp()._recorded_process_alive(lease.pid, lease.start_ticks))
+        except Exception as exc:
+            self._note(f"lease of pid {lease.pid} kept, liveness unknown: {exc}")
+            return True
+
+    def _unlink(self, path: Path) -> bool:
+        """Delete ``path``; True only when this call deleted it."""
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            self._note(f"lease {path.name} not deleted: {exc}")
+            return False
+        return True
+
+    def _note(self, issue: str) -> None:
+        if len(self.issues) < _DRIVE_LEASE_ISSUE_LIMIT:
+            self.issues.append(issue)
 
 
 # ---------------------------------------------------------------------------
@@ -2864,6 +3199,10 @@ class _NativeSecurityCapabilities:
 class _CtypesWin32Api:
     """Real Windows boundary using exact, bounded ctypes signatures."""
 
+    # Where sandbox_drive leases its pushes (NF-2026-01695). A boundary built
+    # without __init__, as the mocked-kernel tests build it, keeps none.
+    _sandbox_drive_leases: _SandboxDriveLeases | None = None
+
     def __init__(self) -> None:
         # Resolved lazily via the platform shim; WinDLL is absent on non-Windows
         # typeshed, and this boundary is only ever constructed on Windows.
@@ -2887,6 +3226,7 @@ class _CtypesWin32Api:
             )
         self._security_base, self._security_base_library = resolved
         self._configure_signatures()
+        self._sandbox_drive_leases = _SandboxDriveLeases.for_current_user()
 
     def _configure_signatures(self) -> None:
         k = self._kernel32
@@ -3245,8 +3585,15 @@ class _CtypesWin32Api:
         pushes one definition for this launch -- the OS reference-counts
         concurrent launches on that letter. The matching pop is
         :meth:`release_sandbox_drive`, called when the launch closes.
+
+        NF-2026-01695: under that same mutex, the pushes of launchers that
+        died before their pop are reclaimed first, and this push is then
+        leased in turn (:class:`_SandboxDriveLeases`), so a launcher that dies
+        without close() leaks its definition only until the next
+        sandbox_drive. Neither step can fail the launch.
         """
         k = self._kernel32
+        leases = self._sandbox_drive_leases
 
         def fail(error: int, what: str) -> _Win32Failure:
             return _Win32Failure(error, "sandbox_drive", f"sandbox_drive_unavailable: {what}")
@@ -3260,6 +3607,8 @@ class _CtypesWin32Api:
                 error = _last_win_error() if waited == _WAIT_FAILED else int(waited)
                 raise fail(error, f"mutex wait returned {waited:#x}")
             try:
+                if leases is not None:
+                    leases.reconcile(self._held_sandbox_drive, self._pop_sandbox_drive)
                 drive, _needs_define = _choose_sandbox_drive(
                     real_root, int(k.GetLogicalDrives()), self._query_dos_device
                 )
@@ -3268,13 +3617,10 @@ class _CtypesWin32Api:
                 if not k.DefineDosDeviceW(_DDD_NO_BROADCAST_SYSTEM, drive, real_root):
                     raise fail(_last_win_error(), f"DefineDosDeviceW {drive} {real_root!r}")
                 if self._query_dos_device(drive).lower() != _dos_device_target(real_root):
-                    pop_flags = (
-                        _DDD_NO_BROADCAST_SYSTEM
-                        | _DDD_REMOVE_DEFINITION
-                        | _DDD_EXACT_MATCH_ON_REMOVE
-                    )
-                    k.DefineDosDeviceW(pop_flags, drive, real_root)
+                    k.DefineDosDeviceW(_SANDBOX_DRIVE_POP_FLAGS, drive, real_root)
                     raise fail(0, f"{drive} does not name {real_root!r}")
+                if leases is not None:
+                    leases.record(drive, real_root)
                 return drive
             finally:
                 k.ReleaseMutex(mutex)
@@ -3286,10 +3632,11 @@ class _CtypesWin32Api:
 
         The OS reference-counts DefineDosDeviceW per letter; this removes
         exactly one definition. A still-running sibling's definition (or a
-        reused letter's other pushes) survives until its own release.
+        reused letter's other pushes) survives until its own release. The
+        push's lease is deleted only after its pop: a push whose pop fails,
+        or never runs because this process died, stays leased until a later
+        sandbox_drive finds this process gone and reclaims it.
         """
-        # ponytail: a supervisor that dies without calling close() leaks one
-        # stacked definition until sign-out; there is no stale-sweep for it.
         k = self._kernel32
         mutex = k.CreateMutexW(None, False, _SANDBOX_DRIVE_MUTEX)
         if not mutex:
@@ -3302,40 +3649,61 @@ class _CtypesWin32Api:
                     error, "release_sandbox_drive", f"mutex wait returned {waited:#x}"
                 )
             try:
-                flags = (
-                    _DDD_NO_BROADCAST_SYSTEM
-                    | _DDD_REMOVE_DEFINITION
-                    | _DDD_EXACT_MATCH_ON_REMOVE
-                )
-                if not k.DefineDosDeviceW(flags, drive, real_root):
+                if not k.DefineDosDeviceW(_SANDBOX_DRIVE_POP_FLAGS, drive, real_root):
                     raise _Win32Failure(
                         _last_win_error(),
                         "release_sandbox_drive",
                         f"DefineDosDeviceW remove {drive} {real_root!r}",
                     )
+                if self._sandbox_drive_leases is not None:
+                    self._sandbox_drive_leases.release(drive, real_root)
             finally:
                 k.ReleaseMutex(mutex)
         finally:
             k.CloseHandle(mutex)
 
+    @property
+    def sandbox_drive_lease_issues(self) -> list[str]:
+        """What this boundary's sandbox-drive leases could not do; none failed a launch."""
+        leases = self._sandbox_drive_leases
+        return list(leases.issues) if leases is not None else []
+
+    def _held_sandbox_drive(self, drive: str, real_root: str) -> int:
+        """How many of the definitions stacked on ``drive`` name ``real_root``."""
+        wanted = _dos_device_target(real_root)
+        return sum(1 for target in self._dos_device_targets(drive) if target.lower() == wanted)
+
+    def _pop_sandbox_drive(self, drive: str, real_root: str) -> int:
+        """Pop one definition of ``drive`` naming ``real_root``: 0, or the Win32 error."""
+        if self._kernel32.DefineDosDeviceW(_SANDBOX_DRIVE_POP_FLAGS, drive, real_root):
+            return 0
+        return _last_win_error() or -1
+
     def _query_dos_device(self, drive: str) -> str:
-        """QueryDosDeviceW's first target for ``drive``, or "" when there is none.
+        """QueryDosDeviceW's first target for ``drive``, or "" when there is none."""
+        targets = self._dos_device_targets(drive)
+        return targets[0] if targets else ""
+
+    def _dos_device_targets(self, drive: str) -> list[str]:
+        """Every definition stacked on ``drive``, top first; [] when there is none.
 
         A letter with several stacked DefineDosDeviceW definitions reports
         all of them to QueryDosDeviceW as one multi-sz, so the buffer must
-        hold the whole stack, not just the one target this caller wants.
+        hold the whole stack, not just the one target a caller wants.
         Grow and retry on ERROR_INSUFFICIENT_BUFFER (122) instead of reading
         that as "no match" and leaking the definition just pushed.
         """
         size = 1024
         while size <= 65536:
             buffer = ctypes.create_unicode_buffer(size)
-            if self._kernel32.QueryDosDeviceW(drive, buffer, len(buffer)):
-                return buffer.value
+            length = self._kernel32.QueryDosDeviceW(drive, buffer, len(buffer))
+            if length:
+                stack = ctypes.wstring_at(buffer, min(int(length), len(buffer)))
+                return [target for target in stack.split("\0") if target]
             if _last_win_error() != 122:
-                return ""
+                return []
             size *= 2
-        return ""
+        return []
 
     def _set_sid_entry(
         self, path: str, sid: bytes, mode: int, mask: int, inherit: int, operation: str,
