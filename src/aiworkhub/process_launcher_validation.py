@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 from threading import Lock
 from typing import Any, Callable, Iterable, Mapping
 
-from . import quality_evidence, validation_runner
+from . import quality_evidence, terminal_failure_classification, validation_runner
 from . import worker_workspace as _worker_workspace
 from .worker_workspace import (
     ValidationEnvironmentBlocked,
@@ -460,6 +460,20 @@ def compare_schema_mypy_baseline(
             )
 
 
+def _stamp_signatures(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # NF-2026-01671: every failed row carries its sandbox-signature evidence
+    # (``{}`` for none) before any ValidationRunError leaves; the verdict and
+    # every other key are untouched.  A classifier fault stamps ``{}`` on its
+    # own row, so it can never replace the measured ValidationRunError.
+    for row in rows:
+        try:
+            evidence = validation_runner.validation_environment_signature_evidence(row)
+        except Exception:  # noqa: BLE001 -- evidence must never change a terminal
+            evidence = {}
+        row.update(evidence)
+    return rows
+
+
 def run_declared_validations(
     workspace: WorkerWorkspace,
     authority: Mapping[str, Any],
@@ -497,7 +511,7 @@ def run_declared_validations(
     try:
         results = run_validations(workspace, commands, **route)
     except ValidationRunError as exc:
-        rows = with_roles(exc.results)
+        rows = _stamp_signatures(with_roles(exc.results))
         if isinstance(exc, ValidationEnvironmentBlocked):
             decision = validation_runner.plan_validation_capability_replay(
                 commands,
@@ -549,7 +563,7 @@ def run_declared_validations(
                 try:
                     replayed = run_validations(workspace, commands, **replay_route)
                 except ValidationRunError as replay_exc:
-                    replay_rows = with_roles(replay_exc.results)
+                    replay_rows = _stamp_signatures(with_roles(replay_exc.results))
                     for row in replay_rows:
                         row["validation_capability_replay"] = {
                             "attempt": 1,
@@ -720,3 +734,38 @@ def replay_terminal_state(
     if not declared or list(validations):
         return terminal_state
     return "finalize_failed"
+
+
+def validation_environment_evidence(
+    terminal_state: str,
+    metadata: Mapping[str, Any],
+    validations: Iterable[Mapping[str, Any]],
+    required_output_records: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """NF-2026-01671: the finalizer's two terminal-evidence keys for a
+    sandbox-signature ``validation_failed``, or ``{}``.
+
+    Classification only: the recovery plan is a manager's to execute, and
+    nothing here launches a provider or runs the candidate. It can never move
+    the terminal either -- any exception yields ``{}``, exactly what a
+    non-matching failure carries -- so state, routing, error and cleanup stay
+    the finalizer's own.
+    """
+    try:
+        disposition = terminal_failure_classification.validation_environment_disposition(
+            terminal_state=terminal_state,
+            validations=list(validations),
+            required_outputs=metadata.get("required_outputs") or [],
+            required_output_records=list(required_output_records),
+            task_id=str(metadata.get("task_id") or ""),
+        )
+        if disposition is None:
+            return {}
+        return {
+            "validation_environment_recovery": disposition.pop(
+                "validation_environment_recovery"
+            ),
+            "validation_environment_disposition": disposition,
+        }
+    except Exception:  # noqa: BLE001 -- evidence must never change a terminal
+        return {}

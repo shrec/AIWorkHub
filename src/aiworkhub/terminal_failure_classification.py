@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import validation_runner
+
 SCHEMA_ID = "aiworkhub.task_mcp.terminal_failure_classification.v1"
 
 MAX_DIAGNOSTIC_CHARS = 400
@@ -3166,6 +3168,93 @@ def reviewer_route_retry_disposition(
         evidence=f"reviewer_route_behaviour={code}",
         terminal_state=terminal_state,
     )
+
+
+VALIDATION_ENVIRONMENT_RECOVERY_SCHEMA_ID = "aiworkhub.validation_environment_recovery.v1"
+
+
+def validation_environment_disposition(
+    *,
+    terminal_state: str | None,
+    validations: Any,
+    required_outputs: Any,
+    required_output_records: Any,
+    task_id: str,
+) -> dict[str, Any] | None:
+    """The typed ``validation_environment`` disposition of a ``validation_failed``
+    whose every failing row carries one measured sandbox signature, else ``None``
+    (NF-2026-01671).
+
+    Only that case is placed -- the signatures are
+    ``validation_runner.VALIDATION_ENVIRONMENT_SIGNATURES`` and every declared
+    required output must be hash-recorded -- so every other terminal keeps its
+    classification and routing exactly.
+
+    CLASSIFICATION, NEVER EXECUTION. The signature is read from the candidate's
+    own validation output, so it is labelled ``candidate_forgeable`` and names
+    no trusted authority: ``_typed_disposition`` therefore resolves the action
+    to ``manager_judgment_unknown`` and nothing launches. The recovery plan is
+    the two manager calls that park the card and replay its retained bytes in
+    the validation lane; it never runs the candidate on the host.
+    """
+    if str(terminal_state or "").strip().lower() != "validation_failed":
+        return None
+    match = validation_runner.match_validation_environment_signature(
+        validations,
+        required_outputs=required_outputs,
+        required_output_records=required_output_records,
+    )
+    if match is None:
+        return None
+    entry = next(
+        (
+            signature
+            for signature in validation_runner.VALIDATION_ENVIRONMENT_SIGNATURES
+            if signature.name == match.signature
+        ),
+        None,
+    )
+    if entry is None:
+        return None
+    provenance = {
+        "evidence_source": validation_runner.VALIDATION_ENVIRONMENT_EVIDENCE_SOURCE,
+        "candidate_forgeable": True,
+    }
+    return {
+        **_typed_disposition(
+            cause=CAUSE_VALIDATION_ENVIRONMENT,
+            evidence_authority=EVIDENCE_AUTHORITY_NONE,
+            evidence=f"validation_environment_signature={entry.name}",
+            terminal_state="validation_failed",
+        ),
+        **provenance,
+        "validation_environment_recovery": {
+            "schema_id": VALIDATION_ENVIRONMENT_RECOVERY_SCHEMA_ID,
+            "signature": entry.name,
+            "signature_version": validation_runner.VALIDATION_ENVIRONMENT_SIGNATURES_VERSION,
+            "command": match.command,
+            "sandbox_backend": match.sandbox_backend,
+            **provenance,
+            "host_execution": False,
+            "lane_change_available": False,
+            "lane_change_reason": entry.lane_change_reason,
+            "plan": [
+                {
+                    "tool": "aiworkhub_task_reject_review",
+                    "arguments": {
+                        "task_id": task_id,
+                        "reason": f"validation_environment_signature={entry.name}",
+                        "to": "blocked",
+                        "failure_category": FAILURE_CATEGORY_VALIDATION_ENVIRONMENT,
+                    },
+                },
+                {
+                    "tool": "aiworkhub_task_recover_blocked_rework",
+                    "arguments": {"task_id": task_id, "validation_only_replay": True},
+                },
+            ],
+        },
+    }
 
 
 def failure_category_projection(disposition: Any) -> str:

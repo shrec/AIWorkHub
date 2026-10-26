@@ -1295,6 +1295,352 @@ def pytest_validation_evidence(stdout: str, returncode: int | None) -> dict[str,
     return evidence
 
 
+# ---- validation-environment signatures (NF-2026-01671) -----------------------
+# A declared command that RAN in the worker sandbox and failed only because the
+# lane cannot do one measured thing still reads as a plain ``validation_failed``:
+# ``row_restriction`` rightly refuses candidate output as terminal evidence. This
+# section names those measured failures so the finalizer can attach a recovery
+# plan for a MANAGER to execute. SURFACE ONLY, like the section above: it never
+# feeds ``classify_validation_results``/``row_restriction``, never changes a
+# verdict and never runs anything. Every literal is read from the candidate's
+# own output, so a match is candidate-forgeable by construction and is labelled
+# so wherever it travels.
+VALIDATION_ENVIRONMENT_SIGNATURES_VERSION = "aiworkhub.validation_environment_signatures.v1"
+VALIDATION_ENVIRONMENT_EVIDENCE_SOURCE = "candidate_validation_output"
+
+
+@dataclass(frozen=True)
+class ValidationEnvironmentSignature:
+    """One closed, measured signature.
+
+    Every pytest ``E   <Exc>:`` line and every untrimmed ``FAILED``/``ERROR``
+    short-summary line of a row must carry one of ``literals`` (as the line's
+    END when ``literal_ends_line``); every ``anchors`` entry must be in each
+    failure's own block. The row must come from one of ``backends``, the lanes
+    it was measured on: anywhere else the literal is only the candidate's print.
+    """
+
+    name: str
+    literals: tuple[str, ...]
+    lane_change_reason: str
+    backends: tuple[str, ...]
+    anchors: tuple[str, ...] = ()
+    literal_ends_line: bool = False
+
+    def carried_by(self, line: str) -> bool:
+        text = line.rstrip()
+        if self.literal_ends_line:
+            return text.endswith(self.literals)
+        return any(literal in text for literal in self.literals)
+
+
+VALIDATION_ENVIRONMENT_SIGNATURES: tuple[ValidationEnvironmentSignature, ...] = (
+    # NF-2026-01628: ``os.symlink`` in the Windows AppContainer validation lane
+    # raises OSError winerror 1314 (ERROR_PRIVILEGE_NOT_HELD): the container
+    # token holds no SeCreateSymbolicLinkPrivilege, while the same test passes
+    # on the host. tests/conftest.py ``symlink_or_skip`` keys on the same code.
+    ValidationEnvironmentSignature(
+        name="windows_symlink_privilege_not_held",
+        literals=("[WinError 1314]",),
+        backends=("windows_appcontainer",),
+        lane_change_reason=(
+            "compatible_validation_lane_unavailable:backend=windows_appcontainer:"
+            "privilege=SeCreateSymbolicLinkPrivilege"
+        ),
+    ),
+    # NF690 / NF-2026-00720: creating a ``_multiprocessing.SemLock`` is denied in
+    # the landlock lane (the /dev/shm authority denial that
+    # ``sandbox_can_grant_semlock`` encodes; P2 request
+    # 341b113456074ef8ac59b77b6677f6cd measured 146 passed + 2 such
+    # PermissionError [Errno 13] failures, 148 passed on the host). That denial
+    # is a FILENAME-LESS PermissionError, unlike a file-permission failure, so
+    # the literal must end the line and the SemLock frame must be in view.
+    ValidationEnvironmentSignature(
+        name="multiprocessing_semlock_denied",
+        literals=("PermissionError: [Errno 13] Permission denied",),
+        backends=("landlock",),
+        lane_change_reason=(
+            "compatible_validation_lane_unavailable:primitive=multiprocessing.SemLock"
+        ),
+        anchors=("_multiprocessing.SemLock(",),
+        literal_ends_line=True,
+    ),
+    # An unresolved ``{python}`` is deliberately absent. As a declared argv[0]
+    # it never reaches a test -- the spawn fails and ``row_restriction`` names
+    # it from the structural ``launch_error`` -- and inside a test on Windows
+    # the FileNotFoundError names no file, so no in-test literal is measured.
+)
+
+_SIGNATURE_SUMMARY_LINE_RE = re.compile(r"^(?:FAILED|ERROR) \S")
+_SIGNATURE_EXCEPTION_LINE_RE = re.compile(r"^E\s+[A-Za-z_][\w.]*:")
+# An assertion is the candidate's own gate speaking, whatever else it mentions.
+_SIGNATURE_ASSERTION_LINE_RE = re.compile(
+    r"^(?:E\s+|(?:FAILED|ERROR) .*? - )(?:assert\b|Failed:)"
+)
+_SIGNATURE_ASSERTION_MARKERS = ("AssertionError", "DID NOT RAISE")
+_PYTEST_SHORT_SUMMARY_HEADER_RE = re.compile(r"^=+ short test summary info =+$")
+_PYTEST_FAILURE_BLOCK_HEADER_RE = re.compile(r"^_+ (.+?) _+$")
+_RECORD_DIGEST_RE = re.compile(r"[0-9a-f]{64}$")
+
+
+def _stream_cut(row: Mapping[str, Any], stream: str) -> bool:
+    """Whether a stream's head/tail windows are cuts of a longer output."""
+    head = str(row.get(f"{stream}_head") or "")
+    tail = str(row.get(f"{stream}_tail") or "")
+    return bool(row.get(f"{stream}_truncated")) or (bool(head) and head != tail)
+
+
+def _whole_lines(text: str, *, cut_start: bool, cut_end: bool) -> list[str]:
+    lines = text.splitlines()
+    if cut_start and lines:
+        lines = lines[1:]
+    if cut_end and lines and not text.endswith(("\n", "\r")):
+        lines = lines[:-1]
+    return lines
+
+
+def _signature_scan(row: Mapping[str, Any]) -> tuple[str, list[str]]:
+    """Every scanned window of one row, as one raw text and as whole lines.
+
+    stdout/stderr tail and head plus ``pytest_first_failure``. A window cut out
+    of a longer stream may begin or end mid-line; that fragment is no line, so
+    it stays out of the line scan -- never out of the raw text. A failure lost
+    to a cut is still counted: the closing summary block, which lists every
+    failure, must be whole in the stdout tail.
+    """
+    texts: list[str] = []
+    lines: list[str] = []
+    for stream in ("stdout", "stderr"):
+        head = str(row.get(f"{stream}_head") or "")
+        tail = str(row.get(f"{stream}_tail") or "")
+        cut = _stream_cut(row, stream)
+        texts += [tail, head]
+        lines += _whole_lines(tail, cut_start=cut, cut_end=False)
+        if head != tail:
+            lines += _whole_lines(head, cut_start=False, cut_end=cut)
+    first, marker, rest = str(row.get("pytest_first_failure") or "").partition(
+        _PYTEST_FIRST_FAILURE_TRUNCATION_MARKER
+    )
+    texts += [first, rest]
+    lines += _whole_lines(first, cut_start=False, cut_end=bool(marker))
+    lines += _whole_lines(rest, cut_start=True, cut_end=False)
+    return "\n".join(texts), lines
+
+
+def _short_summary_block_in_view(stdout_tail: str) -> bool:
+    """True when the stdout tail -- the whole stdout when uncut -- holds
+    pytest's whole closing block.
+
+    The short-summary header, one ``FAILED``/``ERROR`` line per failure the
+    final ``N failed`` line counts, and that final line -- so no failure of
+    the run can hide in the unscanned middle or off a narrowed ``-r`` summary.
+    """
+    lines = stdout_tail.splitlines()
+    headers = [
+        index for index, line in enumerate(lines)
+        if _PYTEST_SHORT_SUMMARY_HEADER_RE.match(line.strip())
+    ]
+    if not headers:
+        return False
+    block = lines[headers[-1] + 1:]
+    finals = [
+        index for index, line in enumerate(block)
+        if _parse_pytest_summary_line(line) is not None
+    ]
+    if not finals:
+        return False
+    outcomes = _parse_pytest_summary_line(block[finals[-1]]) or {}
+    listed = sum(
+        1 for line in block[: finals[-1]] if _SIGNATURE_SUMMARY_LINE_RE.match(line)
+    )
+    counted = outcomes.get("failed", 0) + outcomes.get("errors", 0)
+    return counted > 0 and listed == counted
+
+
+def _failure_blocks_in_view(row: Mapping[str, Any]) -> list[list[str]] | None:
+    """One line list per pytest FAILURES/ERRORS block, else ``None``.
+
+    Read from the stdout tail alone -- the whole stdout when it is not cut --
+    and returned only when the blocks number exactly the failures and errors
+    the final summary line counts, so a block lost to the cut fails closed.
+    """
+    tail = str(row.get("stdout_tail") or "")
+    blocks: list[list[str]] = []
+    block: list[str] | None = None
+    counted = 0
+    for line in _whole_lines(tail, cut_start=_stream_cut(row, "stdout"), cut_end=False):
+        header = _PYTEST_FAILURE_BLOCK_HEADER_RE.match(line)
+        # ``_ _ _ _`` separates traceback entries inside one block.
+        if header and set(header.group(1)) - {"_", " "}:
+            block = []
+            blocks.append(block)
+        elif line.startswith("="):
+            block = None
+        elif block is not None:
+            block.append(line)
+        outcomes = _parse_pytest_summary_line(line)
+        if outcomes is not None:
+            counted = outcomes.get("failed", 0) + outcomes.get("errors", 0)
+    return blocks if counted and len(blocks) == counted else None
+
+
+def _summary_message_whole(line: str) -> bool:
+    """A short-summary line that names its exception untrimmed.
+
+    pytest trims the message to the terminal width with ``...`` and drops it
+    altogether when the node id leaves no room.
+    """
+    return " - " in line and not line.rstrip().endswith("...")
+
+
+def validation_environment_signature(row: Mapping[str, Any]) -> str | None:
+    """The one measured signature a FAILED row carries, by name, else ``None``.
+
+    Fails closed on everything else: a timed-out or never-started row, a row
+    from a lane the signature was not measured on, an assertion marker
+    anywhere in the scanned output, a row with no pytest short-summary line,
+    a closing summary block that is not wholly in the stdout tail or lists
+    fewer failures than its final line counts, or any ``E`` line or untrimmed
+    summary line that does not carry the signature's literal (one row runs
+    many tests, and one other failure must never be masked). A trimmed
+    summary line, and every signature with anchors, also needs every
+    failure's block in view, each raising the literal and holding every
+    anchor itself: one failure's frame never vouches for another's.
+    """
+    returncode = row.get("returncode")
+    if (
+        isinstance(returncode, bool)
+        or not isinstance(returncode, int)
+        or returncode == 0
+        or row.get("timed_out")
+        or row.get("launch_error")
+    ):
+        return None
+    text, lines = _signature_scan(row)
+    if any(marker in text for marker in _SIGNATURE_ASSERTION_MARKERS) or any(
+        _SIGNATURE_ASSERTION_LINE_RE.match(line) for line in text.splitlines()
+    ):
+        return None
+    summary = [line for line in lines if _SIGNATURE_SUMMARY_LINE_RE.match(line)]
+    if not summary:
+        return None
+    # pytest's ``-r`` selection can leave a failure off the summary, so the
+    # listed lines must number what the final line counts on every row.
+    if not _short_summary_block_in_view(str(row.get("stdout_tail") or "")):
+        return None
+    raised = [line for line in lines if _SIGNATURE_EXCEPTION_LINE_RE.match(line)]
+    blocks = _failure_blocks_in_view(row)
+    backend = str(row.get("sandbox_backend") or "")
+    for signature in VALIDATION_ENVIRONMENT_SIGNATURES:
+        unproven = [line for line in summary if not signature.carried_by(line)]
+        if (
+            backend not in signature.backends
+            or not all(signature.carried_by(line) for line in raised)
+            or any(_summary_message_whole(line) for line in unproven)
+        ):
+            continue
+        if (unproven or signature.anchors) and (
+            blocks is None
+            or not all(
+                any(
+                    _SIGNATURE_EXCEPTION_LINE_RE.match(line) and signature.carried_by(line)
+                    for line in block
+                )
+                and all(anchor in "\n".join(block) for anchor in signature.anchors)
+                for block in blocks
+            )
+        ):
+            continue
+        return signature.name
+    return None
+
+
+def validation_environment_signature_evidence(row: Mapping[str, Any]) -> dict[str, Any]:
+    """The row's signature stamp, or ``{}`` -- SURFACE ONLY, never a verdict.
+
+    Read from the candidate's own output, so the stamp names that source and
+    says it is forgeable.
+    """
+    signature = validation_environment_signature(row)
+    if signature is None:
+        return {}
+    return {
+        "validation_environment_signature": {
+            "schema_id": VALIDATION_ENVIRONMENT_SIGNATURES_VERSION,
+            "signature": signature,
+            "evidence_source": VALIDATION_ENVIRONMENT_EVIDENCE_SOURCE,
+            "candidate_forgeable": True,
+        }
+    }
+
+
+@dataclass(frozen=True)
+class ValidationEnvironmentSignatureMatch:
+    signature: str
+    command: str
+    sandbox_backend: str
+
+
+def _posix_relative(value: str) -> str:
+    text = value.strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text
+
+
+def _required_outputs_recorded(required_outputs: Any, records: Any) -> bool:
+    """Every declared required output is named by a hash-bearing record."""
+    if isinstance(required_outputs, (str, bytes)) or isinstance(records, (str, bytes)):
+        return False
+    named: set[str] = set()
+    for record in records or ():
+        if not isinstance(record, Mapping):
+            return False
+        digest = record.get("sha256")
+        if not (isinstance(digest, str) and _RECORD_DIGEST_RE.search(digest)):
+            continue
+        for key in ("pattern", "path"):
+            value = record.get(key)
+            if isinstance(value, str) and value:
+                named.add(_posix_relative(value))
+    return all(
+        isinstance(declared, str) and _posix_relative(declared) in named
+        for declared in required_outputs or ()
+    )
+
+
+def match_validation_environment_signature(
+    results: Iterable[Mapping[str, Any]],
+    *,
+    required_outputs: Any,
+    required_output_records: Any,
+) -> ValidationEnvironmentSignatureMatch | None:
+    """The batch's one sandbox signature, or ``None``.
+
+    Every failing row must carry the SAME signature -- a row that failed any
+    other way keeps the whole batch a plain ``validation_failed`` -- and every
+    declared required output must be named by a hash-bearing record, so a
+    candidate that did not produce its declared work is never offered a replay.
+    """
+    rows = list(results)
+    if not all(isinstance(row, Mapping) for row in rows):
+        return None
+    failing = [row for row in rows if _is_failing_row(row)]
+    if not failing or not _required_outputs_recorded(
+        required_outputs, required_output_records
+    ):
+        return None
+    names = {validation_environment_signature(row) for row in failing}
+    if len(names) != 1 or None in names:
+        return None
+    first = failing[0]
+    return ValidationEnvironmentSignatureMatch(
+        signature=str(names.pop()),
+        command=str(first.get("declared_command") or first.get("command") or ""),
+        sandbox_backend=str(first.get("sandbox_backend") or ""),
+    )
+
+
 __all__ = [
     "CREATEPROCESS_CWD_MAX_CHARS",
     "LSP_PRIVATE_CWD_SUFFIX",
@@ -1310,9 +1656,14 @@ __all__ = [
     "SemlockPreflight",
     "TerminalState",
     "VALIDATION_ENVIRONMENT_BLOCKED",
+    "VALIDATION_ENVIRONMENT_EVIDENCE_SOURCE",
+    "VALIDATION_ENVIRONMENT_SIGNATURES",
+    "VALIDATION_ENVIRONMENT_SIGNATURES_VERSION",
     "VALIDATION_FAILED",
     "VALIDATION_PASSED",
     "VALIDATION_UNSUPPORTED_IN_SANDBOX",
+    "ValidationEnvironmentSignature",
+    "ValidationEnvironmentSignatureMatch",
     "assert_card_validation_sandbox_runnable",
     "attributed_semlock_capability_row",
     "classify_validation_results",
@@ -1322,6 +1673,7 @@ __all__ = [
     "dash_m_validator_modules",
     "decode_trusted_semlock_exit",
     "exec_scratch_denied_restriction",
+    "match_validation_environment_signature",
     "nested_lsp_helper_cwd_overhead",
     "preflight_semlock_capability",
     "probe_multiprocessing_semlock",
@@ -1332,4 +1684,6 @@ __all__ = [
     "sandbox_unrunnable_reason",
     "temp_root_blocks_nested_lsp_helper",
     "trusted_semlock_probe_argv",
+    "validation_environment_signature",
+    "validation_environment_signature_evidence",
 ]

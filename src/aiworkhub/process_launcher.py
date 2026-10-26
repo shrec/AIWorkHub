@@ -11899,9 +11899,9 @@ class ProcessManager:
                             "topic": str(metadata["topic"]),
                         },
                         **retained_candidate,
+                        **_launcher_validation.validation_environment_evidence(terminal_state, metadata, validations, required_output_records),
                     }
-                    # ``worker_failed``: an attempt that produced no new work
-                    # is blocked, never sent to review (NF-2026-01370).
+                    # ``worker_failed``: an attempt that produced no new work is blocked, never sent to review (NF-2026-01370).
                     if terminal_state in {"finalize_failed", "worker_failed"} or (
                         _is_operational_validation_failure(terminal_state, error)
                     ):
