@@ -13,12 +13,14 @@ launch a process.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import sqlite3
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from threading import Lock
 from typing import Any, Mapping
 
@@ -140,6 +142,44 @@ MAX_CONTEXT_VALUE_CHARS = 4000
 # server concurrently, so serialize that allocation-heavy phase process-wide;
 # per-view polling already coalesces its own requests.
 _SNAPSHOT_BUILD_LOCK = Lock()
+
+# NF-2026-01731: an idle dashboard tick re-ran the ~2.8 s build even when no
+# input had changed. One build per mode is memoized under _SNAPSHOT_BUILD_LOCK
+# and reused while the cheap generation key below is unchanged. A changed key,
+# an unreadable key, a degraded build, a caller-supplied ``previous`` or the
+# TTL backstop (state that moves without a file write: a process exit, a
+# stale-processing age threshold) always rebuilds. Bounded: one entry per mode.
+SNAPSHOT_BUILD_CACHE_TTL_SECONDS = 60.0
+_SNAPSHOT_BUILD_CACHE: dict[bool, tuple[Any, tuple[Any, ...], float, dict[str, Any]]] = {}
+_SNAPSHOT_BUILD_CACHE_STATS: dict[str, int] = {"hit": 0, "miss": 0, "key_error": 0}
+_TASK_QUEUE_DB_REL: tuple[str, ...] = (".aiworkhub", "tasking", "task_queue.sqlite")
+# Directory mtimes move when a process run's status/log files are created or removed.
+_SNAPSHOT_KEY_DIRS_REL: tuple[tuple[str, ...], ...] = (
+    (".aiworkhub", "runtime", "process_logs"),
+    (".aiworkhub", "runtime", "process_logs", "processes"),
+)
+# The other stores and config a full build projects from (stat identity only).
+_SNAPSHOT_KEY_FILES_REL: tuple[tuple[str, ...], ...] = (
+    tuple(needfix_store.NEEDFIX_DB_REL),
+    tuple(roadmap_store.ROADMAP_DB_REL),
+    tuple(skill_registry_store.SKILLS_DB_REL),
+    (".aiworkhub", "config", "development_rules.json"),
+)
+# SQLite wal-index header (mxFrame, iChange, salts, checksums): it changes on
+# every WAL commit, so it stands in for ``PRAGMA data_version`` without holding
+# a connection open -- on Windows a held handle blocks a replace/delete of the
+# database file by retention or re-initialization.
+_WAL_INDEX_HEADER_BYTES = 48
+
+# Delta channel (NF-2026-01731): a full-mode caller that passes
+# ``previous={"section_digests": {...}}`` -- one sha256 per top-level section
+# of the full snapshot it already holds -- receives only the sections whose
+# digest changed plus the current digest map. Any digest miss returns the
+# plain full snapshot instead.
+SNAPSHOT_SECTION_DIGESTS_FIELD = "section_digests"
+SNAPSHOT_DELTA_SCHEMA = "aiworkhub.dashboard_snapshot_delta.v1"
+MAX_SNAPSHOT_SECTION_DIGESTS = 256
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # The ONE genuine "repository has never been initialized" reason prefix
 # ``task_store.storage_readiness`` can produce: ``inspect_repository`` raised
@@ -2392,6 +2432,179 @@ def _bound_task_detail(detail: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _stat_identity(path: Path) -> tuple[int, int, int] | None:
+    """(inode, size, mtime_ns) of ``path``; None when absent. Other errors raise."""
+    try:
+        stat = os.stat(path)
+    except FileNotFoundError:
+        return None
+    return (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def _wal_index_header(path: Path) -> bytes | None:
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(_WAL_INDEX_HEADER_BYTES)
+    except FileNotFoundError:
+        return None
+
+
+def _snapshot_generation_key(root: Path) -> tuple[Any, ...] | None:
+    """Cheap identity of every store a snapshot build reads.
+
+    None when the canonical queue does not exist: an uninitialized build is
+    cheap and is never cached. Any other read failure raises, and the caller
+    rebuilds rather than serve a cache it cannot prove current.
+    """
+    db = root.joinpath(*_TASK_QUEUE_DB_REL)
+    db_identity = _stat_identity(db)
+    if db_identity is None:
+        return None
+    return (
+        str(root),
+        db_identity,
+        _stat_identity(Path(f"{db}-wal")),
+        _wal_index_header(Path(f"{db}-shm")),
+        tuple(_stat_identity(root.joinpath(*rel)) for rel in _SNAPSHOT_KEY_DIRS_REL),
+        tuple(_stat_identity(root.joinpath(*rel)) for rel in _SNAPSHOT_KEY_FILES_REL),
+        tuple(
+            _stat_identity(Path(f"{root.joinpath(*rel)}-wal"))
+            for rel in _SNAPSHOT_KEY_FILES_REL
+        ),
+    )
+
+
+def _cacheable_build(snapshot: Mapping[str, Any]) -> bool:
+    """Only a ready, error-free build is reused; a degraded one is re-checked."""
+    storage = snapshot.get("storage")
+    if isinstance(storage, Mapping) and not storage.get("ready", True):
+        return False
+    return not snapshot.get("errors")
+
+
+def _snapshot_build_cache_stats() -> dict[str, int]:
+    """Measured hit/miss/key-error counts of the memoized snapshot build."""
+    with _SNAPSHOT_BUILD_LOCK:
+        return dict(_SNAPSHOT_BUILD_CACHE_STATS)
+
+
+def _memoized_build_snapshot(build_kwargs: Mapping[str, Any], *, cacheable: bool) -> dict[str, Any]:
+    """Return ``dashboard.build_snapshot(**build_kwargs)``, reusing an unchanged build.
+
+    The caller holds ``_SNAPSHOT_BUILD_LOCK``. The key is read BEFORE the
+    build, so a write that lands during a build changes the next key. The
+    builder itself is part of the entry, so a replaced builder never serves
+    another builder's result. Callers get a shallow copy and must copy any
+    nested section before mutating it.
+    """
+    builder = dashboard.build_snapshot
+    summary_only = bool(build_kwargs.get("summary_only"))
+    key: tuple[Any, ...] | None = None
+    if cacheable:
+        try:
+            key = _snapshot_generation_key(Path(core.repo_root()).resolve())
+        except Exception as exc:  # noqa: BLE001 -- an unreadable key rebuilds, never serves the cache
+            _SNAPSHOT_BUILD_CACHE_STATS["key_error"] += 1
+            _debug_trace("snapshot.build_cache.key_error", error=type(exc).__name__)
+    now = time.monotonic()
+    cached = _SNAPSHOT_BUILD_CACHE.get(summary_only)
+    if (
+        key is not None
+        and cached is not None
+        and cached[0] is builder
+        and cached[1] == key
+        and now - cached[2] < SNAPSHOT_BUILD_CACHE_TTL_SECONDS
+    ):
+        _SNAPSHOT_BUILD_CACHE_STATS["hit"] += 1
+        _debug_trace("snapshot.build_cache.hit", summary_only=summary_only)
+        return dict(cached[3])
+    _SNAPSHOT_BUILD_CACHE.pop(summary_only, None)
+    _SNAPSHOT_BUILD_CACHE_STATS["miss"] += 1
+    snapshot = dict(
+        _debug_stage("dashboard.build_snapshot", lambda: builder(**build_kwargs))
+    )
+    if key is not None and _cacheable_build(snapshot):
+        _SNAPSHOT_BUILD_CACHE[summary_only] = (builder, key, now, snapshot)
+    return dict(snapshot)
+
+
+def _canonical_section_value(value: Any) -> Any:
+    """The value as a JSON consumer re-reads it: integral floats become ints.
+
+    The extension digests the parsed payload, where ``1.0`` arrives as ``1``;
+    normalizing here keeps both digests equal for the common numeric case. A
+    value the two encoders still spell differently only makes its section
+    resend -- the merge never trusts a digest it did not verify.
+    """
+    if isinstance(value, float):
+        if value.is_integer() and abs(value) < 2**53:
+            return int(value)
+        return value
+    if isinstance(value, Mapping):
+        return {
+            key if isinstance(key, str) else json.dumps(key, default=str).strip('"'):
+            _canonical_section_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_section_value(item) for item in value]
+    return value
+
+
+def _snapshot_section_digest(value: Any) -> str:
+    """sha256 of one top-level snapshot section in canonical JSON.
+
+    Canonical form: sorted keys, ``(",", ":")`` separators, non-ASCII kept
+    verbatim, UTF-8 bytes. vscode-extension/extension.js
+    ``snapshotSectionDigest`` computes the identical form.
+    """
+    encoded = json.dumps(
+        _canonical_section_value(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(encoded.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _split_section_digests(
+    prior: Mapping[str, Any] | None,
+) -> tuple[Mapping[str, Any] | None, Mapping[str, Any] | None]:
+    """Separate a delta request's digest map from a genuine prior snapshot."""
+    if not isinstance(prior, Mapping) or SNAPSHOT_SECTION_DIGESTS_FIELD not in prior:
+        return None, prior
+    digests = prior.get(SNAPSHOT_SECTION_DIGESTS_FIELD)
+    rest = {key: value for key, value in prior.items() if key != SNAPSHOT_SECTION_DIGESTS_FIELD}
+    # A malformed map is still a delta request; it simply misses (full reply).
+    return (digests if isinstance(digests, Mapping) else {}), (rest or None)
+
+
+def _snapshot_delta(result: Mapping[str, Any], known: Mapping[str, Any]) -> dict[str, Any]:
+    """Only the sections whose digest changed, or ``result`` itself on a miss.
+
+    A miss is a digest map that is oversized, is not ``str -> sha256 hex``,
+    or matches no current section; the caller then gets the plain full
+    snapshot and rebuilds its own digests from it.
+    """
+    if len(known) > MAX_SNAPSHOT_SECTION_DIGESTS or not all(
+        isinstance(key, str) and isinstance(digest, str) and _SHA256_HEX_RE.match(digest)
+        for key, digest in known.items()
+    ):
+        return dict(result)
+    digests = {key: _snapshot_section_digest(value) for key, value in result.items()}
+    if not any(known.get(key) == digest for key, digest in digests.items()):
+        return dict(result)
+    return {
+        "snapshot_mode": "delta",
+        "delta_schema": SNAPSHOT_DELTA_SCHEMA,
+        SNAPSHOT_SECTION_DIGESTS_FIELD: digests,
+        "changed_sections": {
+            key: value for key, value in result.items() if known.get(key) != digests[key]
+        },
+    }
+
+
 def snapshot_view(
     full: bool = False,
     previous: Mapping[str, Any] | None = None,
@@ -2412,15 +2625,12 @@ def snapshot_view(
     _debug_trace("snapshot.begin")
     build_kwargs: dict[str, Any] = {"summary_only": not full}
     prior_snapshot = previous if previous is not None else previous_snapshot
+    # ``{"section_digests": {...}}`` is a delta request, not a snapshot to merge.
+    known_section_digests, prior_snapshot = _split_section_digests(prior_snapshot)
     if prior_snapshot is not None:
         build_kwargs["previous"] = prior_snapshot
     with _SNAPSHOT_BUILD_LOCK:
-        snapshot = dict(
-            _debug_stage(
-                "dashboard.build_snapshot",
-                lambda: dashboard.build_snapshot(**build_kwargs),
-            )
-        )
+        snapshot = _memoized_build_snapshot(build_kwargs, cacheable=prior_snapshot is None)
     storage = snapshot.get("storage")
     if isinstance(storage, dict) and not storage.get("ready", True):
         storage = dict(storage)
@@ -2508,6 +2718,9 @@ def snapshot_view(
         current_storage = snapshot.get("storage_usage")
         latest_storage = storage_observability.snapshot(core.repo_root())
         if isinstance(current_storage, dict) and isinstance(latest_storage, dict):
+            # Copy first: the built section may be the memoized build's own.
+            current_storage = dict(current_storage)
+            snapshot["storage_usage"] = current_storage
             # Only refresh the header/overview scalars here.  The bounded full
             # storage detail built at the start remains authoritative and this
             # late cache sample cannot inflate the response with a second copy
@@ -2531,6 +2744,9 @@ def snapshot_view(
     if full:
         snapshot["snapshot_mode"] = "full"
         result = _debug_stage("bound_snapshot", lambda: _bound_snapshot(snapshot))
+        if known_section_digests is not None:
+            known = known_section_digests
+            result = _debug_stage("snapshot_delta", lambda: _snapshot_delta(result, known))
     else:
         result = _debug_stage(
             "compact_snapshot",

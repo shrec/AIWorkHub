@@ -10433,6 +10433,9 @@ class ViewState {
     // Once this view holds a full snapshot for its repository, building the
     // summary again on every refresh is pure overhead (NF-2026-00633).
     this.fullSnapshotPainted = false;
+    // Last full payload plus its per-section digests, bound to one client: the
+    // base a delta refresh merges into (NF-2026-01731). One entry per view.
+    this.snapshotDeltaCache = null;
   }
 
   bindClient(client) {
@@ -10441,6 +10444,7 @@ class ViewState {
       this.repoId !== client.repositoryIdentity.repoId
     ) {
       this.fullSnapshotPainted = false;
+      this.snapshotDeltaCache = null;
     }
     this.repoUriStr = client.repositoryIdentity.uriStr;
     this.repoId = client.repositoryIdentity.repoId;
@@ -10521,6 +10525,114 @@ function refreshCoordinatorRouteBeforeSnapshot() {
   }
 }
 
+// ── Dashboard snapshot delta channel (NF-2026-01731). An idle refresh used to
+// ship the whole ~479 KB full snapshot over the one serialized stdio pipe that
+// every manager/worker MCP call queues behind. A view holding a full payload
+// sends one sha256 per top-level section as `previous: { section_digests }`;
+// the server answers with only the changed sections plus its digest map, and
+// any digest miss or merge error falls back to one plain full request. Only a
+// version-converged runtime (runtimePreflight.matches) -- the server this
+// extension ships with -- is asked for a delta.
+const SNAPSHOT_SECTION_DIGESTS_FIELD = "section_digests";
+const SNAPSHOT_DELTA_MODE = "delta";
+
+function isPlainSnapshotObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+// Canonical JSON identical to dashboard_mcp_app._snapshot_section_digest:
+// sorted keys, no whitespace, non-ASCII verbatim, hashed as UTF-8.
+function canonicalSnapshotJson(value) {
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalSnapshotJson(item)).join(",")}]`;
+  if (isPlainSnapshotObject(value)) {
+    const fields = Object.keys(value).sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalSnapshotJson(value[key])}`);
+    return `{${fields.join(",")}}`;
+  }
+  const encoded = JSON.stringify(value);
+  return encoded === undefined ? "null" : encoded;
+}
+
+function snapshotSectionDigest(value) {
+  return crypto.createHash("sha256").update(canonicalSnapshotJson(value), "utf8").digest("hex");
+}
+
+function snapshotSectionDigests(payload) {
+  const digests = {};
+  for (const key of Object.keys(payload)) digests[key] = snapshotSectionDigest(payload[key]);
+  return digests;
+}
+
+function clientSpeaksSnapshotDelta(client) {
+  return Boolean(client && client.runtimePreflight && client.runtimePreflight.matches === true);
+}
+
+function rememberFullSnapshot(view, client, payload, digests) {
+  view.snapshotDeltaCache = clientSpeaksSnapshotDelta(client)
+    && isPlainSnapshotObject(payload) && payload.snapshot_mode === "full"
+    ? { client, claimEpisode: client.claimEpisode, payload, digests: digests || snapshotSectionDigests(payload) }
+    : null;
+}
+
+// Rebuild the full payload from a delta reply; throws on any digest miss.
+function mergeSnapshotDelta(cache, delta) {
+  const serverDigests = delta[SNAPSHOT_SECTION_DIGESTS_FIELD];
+  const changed = delta.changed_sections;
+  if (!isPlainSnapshotObject(serverDigests) || !isPlainSnapshotObject(changed)) {
+    throw new Error("snapshot_delta_malformed");
+  }
+  const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
+  const payload = {};
+  const digests = {};
+  for (const [key, digest] of Object.entries(serverDigests)) {
+    if (hasOwn(changed, key)) {
+      payload[key] = changed[key];
+      digests[key] = snapshotSectionDigest(changed[key]);
+    } else if (hasOwn(cache.payload, key) && cache.digests[key] === digest) {
+      payload[key] = cache.payload[key];
+      digests[key] = digest;
+    } else {
+      throw new Error("snapshot_delta_digest_miss");
+    }
+  }
+  if (Object.keys(changed).some((key) => !hasOwn(serverDigests, key)) || payload.snapshot_mode !== "full") {
+    throw new Error("snapshot_delta_malformed");
+  }
+  return { payload, digests };
+}
+
+// One full-shape snapshot read: a delta against this view's last full payload
+// when the runtime speaks it, else -- and after any delta miss -- a plain full call.
+async function callFullSnapshot(view, client, timeoutMs) {
+  const cache = view.snapshotDeltaCache;
+  if (
+    cache && cache.client === client && cache.claimEpisode === client.claimEpisode
+    && clientSpeaksSnapshotDelta(client)
+  ) {
+    const reply = await client.callTool(
+      DASHBOARD_TOOLS.snapshot,
+      { full: true, previous: { [SNAPSHOT_SECTION_DIGESTS_FIELD]: cache.digests } },
+      timeoutMs,
+    );
+    if (!isPlainSnapshotObject(reply) || reply.snapshot_mode !== SNAPSHOT_DELTA_MODE) {
+      rememberFullSnapshot(view, client, reply);
+      return reply;
+    }
+    try {
+      const merged = mergeSnapshotDelta(cache, reply);
+      rememberFullSnapshot(view, client, merged.payload, merged.digests);
+      debugTrace("snapshot.delta.merged", { changed_sections: Object.keys(reply.changed_sections).length });
+      return merged.payload;
+    } catch (err) {
+      view.snapshotDeltaCache = null;
+      debugTrace("snapshot.delta.fallback", { reason: sanitizeErrorMessage(err) });
+    }
+  }
+  const payload = await client.callTool(DASHBOARD_TOOLS.snapshot, { full: true }, timeoutMs);
+  rememberFullSnapshot(view, client, payload);
+  return payload;
+}
+
 async function pushSnapshotOnce(view) {
   // The optional second argument is test-only dependency injection. Keep the
   // public host call shape stable: production always resolves the repo-bound
@@ -10579,11 +10691,7 @@ async function pushSnapshotOnce(view) {
     try {
       debugTrace("snapshot.attempt.begin", { request_seq: requestSeq, attempt: attempt + 1 });
       refreshCoordinatorRouteBeforeSnapshot();
-      const payload = await client.callTool(
-        DASHBOARD_TOOLS.snapshot,
-        { full: true },
-        MCP_DASHBOARD_SNAPSHOT_TIMEOUT_MS,
-      );
+      const payload = await callFullSnapshot(view, client, MCP_DASHBOARD_SNAPSHOT_TIMEOUT_MS);
       debugTrace("snapshot.payload.received", {
         request_seq: requestSeq,
         attempt: attempt + 1,
@@ -10649,11 +10757,7 @@ async function pushSnapshotNoRetry(view, options = {}) {
     const client = options.client || getMcpClient();
     view.bindClient(client);
     refreshCoordinatorRouteBeforeSnapshot();
-    const payload = await client.callTool(
-      DASHBOARD_TOOLS.snapshot,
-      { full: true },
-      MCP_DASHBOARD_SNAPSHOT_TIMEOUT_MS,
-    );
+    const payload = await callFullSnapshot(view, client, MCP_DASHBOARD_SNAPSHOT_TIMEOUT_MS);
     if (payload && view.stillBoundTo(client) && (authoritative || requestSeq === view.snapshotRequestSeq)) {
       view.postMessage({
         type: OUTBOUND_TYPES.snapshot,
@@ -14704,6 +14808,10 @@ module.exports = {
     pushSnapshot,
     pushSnapshotOnce,
     pushSnapshotNoRetry,
+    canonicalSnapshotJson,
+    snapshotSectionDigest,
+    mergeSnapshotDelta,
+    callFullSnapshot,
     pushSettings,
     pushRuntimeInfo,
     readRepositoryManifestInfo,
