@@ -7552,16 +7552,47 @@ def _calls_edge_key(row: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def _calls_definition_files(conn: sqlite3.Connection, name: str) -> dict[str, str]:
+    """Every *definition* owning ``name``, as ``{qualname: file_path}``."""
+
+    placeholders = ",".join("?" for _ in _CALLS_DEFINITION_KINDS)
+    return {
+        str(qualname or ""): str(file_path or "")
+        for qualname, file_path in conn.execute(
+            "SELECT DISTINCT qualname, file_path FROM entities "
+            f"WHERE name = ? AND kind IN ({placeholders}) ORDER BY qualname",
+            (name, *sorted(_CALLS_DEFINITION_KINDS)),
+        )
+    }
+
+
 def _definition_name_is_unique(conn: sqlite3.Connection, name: str) -> bool:
     """True when exactly one *definition* in the repository owns ``name``."""
 
-    placeholders = ",".join("?" for _ in _CALLS_DEFINITION_KINDS)
-    (count,) = conn.execute(
-        "SELECT COUNT(DISTINCT qualname) FROM entities "
-        f"WHERE name = ? AND kind IN ({placeholders})",
-        (name, *sorted(_CALLS_DEFINITION_KINDS)),
-    ).fetchone()
-    return int(count) == 1
+    return len(_calls_definition_files(conn, name)) == 1
+
+
+_TEST_SOURCE_DIR_SEGMENTS: frozenset[str] = frozenset({"tests", "test"})
+_TEST_SOURCE_FILE_SUFFIXES: tuple[str, ...] = ("_test.py", ".test.js", ".spec.js")
+
+
+def _is_test_source_path(path: str) -> bool:
+    """True for a repository path that holds test code rather than production code.
+
+    A ``tests/`` or ``test/`` directory segment, ``test_*.py``, ``*_test.py``,
+    ``*.test.js`` or ``*.spec.js``.
+    """
+
+    parts = [part for part in str(path or "").replace("\\", "/").split("/") if part]
+    if not parts:
+        return False
+    if any(part in _TEST_SOURCE_DIR_SEGMENTS for part in parts[:-1]):
+        return True
+    filename = parts[-1]
+    return (
+        (filename.startswith("test_") and filename.endswith(".py"))
+        or filename.endswith(_TEST_SOURCE_FILE_SUFFIXES)
+    )
 
 
 def _resolve_calls_query_symbol(
@@ -7626,6 +7657,24 @@ def _calls_edges_for_symbol(
     its callers are recorded against other symbols, often in other files.
     """
 
+    outgoing, incoming, _unattributed = _calls_edges_and_unattributed_count(
+        conn, symbol, limit=limit, include_incoming=include_incoming,
+    )
+    return outgoing, incoming
+
+
+def _calls_edges_and_unattributed_count(
+    conn: sqlite3.Connection, symbol: dict[str, Any], *, limit: int,
+    include_incoming: bool = True,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    """``_calls_edges_for_symbol`` plus the unresolved same-name callers it withheld.
+
+    The third item counts unresolved call edges naming ``symbol``'s name that
+    were NOT attributed to it because the name does not identify it. Without
+    that count an empty ``incoming`` list could not be told apart from a
+    symbol nobody calls.
+    """
+
     cap = max(1, int(limit))
     qualname = str(symbol.get("qualname") or "")
     name = str(symbol.get("name") or "")
@@ -7636,33 +7685,72 @@ def _calls_edges_for_symbol(
         (qualname, cap),
     )]
     if not include_incoming:
-        return outgoing[:cap], []
+        return outgoing[:cap], [], 0
     incoming = [dict(row) for row in conn.execute(
         _CALLS_EDGE_SELECT
         + "WHERE e.kind='calls' AND e.dst_qualname = ? "
         "ORDER BY e.confidence DESC, e.file_path, e.line LIMIT ?",
         (qualname, cap),
     )]
-    if name and len(incoming) < cap and _definition_name_is_unique(conn, name):
-        # An unresolved call edge records its callee's NAME but not the owner
-        # that name refers to. Attributing such an edge to this symbol is only
-        # safe when the repository defines exactly one definition with that
-        # name; otherwise a same-named function in another module would be
-        # published as a caller of this one -- the false confidence being fixed.
+    if not name:
+        return outgoing[:cap], incoming[:cap], 0
+    # An unresolved call edge records its callee's NAME but not the owner that
+    # name refers to, so it is attributed to this symbol only when the name
+    # identifies it. Production code never calls into test files: a caller
+    # outside the tests judges that among NON-test definitions, so a test
+    # double sharing the name cannot hide a production caller. A test caller
+    # keeps the whole-repository rule, since it may call either definition.
+    definitions = _calls_definition_files(conn, name)
+    whole_repo_unique = len(definitions) == 1
+    production_owner = {
+        owner for owner, path in definitions.items()
+        if not _is_test_source_path(path)
+    } == {qualname}
+    attributable_files: set[str] = set()
+    unattributed = 0
+    for caller_file, count in conn.execute(
+        "SELECT file_path, COUNT(*) FROM (SELECT DISTINCT src_qualname, "
+        "file_path, line FROM edges WHERE kind='calls' AND dst_qualname IS NULL "
+        "AND dst_name = ?) GROUP BY file_path ORDER BY file_path",
+        (name,),
+    ):
+        path = str(caller_file or "")
+        attributable = (
+            whole_repo_unique if _is_test_source_path(path) else production_owner
+        )
+        if attributable:
+            attributable_files.add(path)
+        else:
+            unattributed += int(count)
+    if attributable_files and len(incoming) < cap:
         seen = {_calls_edge_key(row) for row in incoming}
         for row in conn.execute(
             _CALLS_EDGE_SELECT
             + "WHERE e.kind='calls' AND e.dst_qualname IS NULL AND e.dst_name = ? "
-            "ORDER BY e.confidence DESC, e.file_path, e.line LIMIT ?",
-            (name, cap),
+            "ORDER BY e.confidence DESC, e.file_path, e.line",
+            (name,),
         ):
             edge = dict(row)
+            if str(edge.get("caller_file") or "") not in attributable_files:
+                continue
             if _calls_edge_key(edge) in seen:
                 continue
             incoming.append(edge)
             if len(incoming) >= cap:
                 break
-    return outgoing[:cap], incoming[:cap]
+    return outgoing[:cap], incoming[:cap], unattributed
+
+
+def _calls_incoming_completeness(unattributed: int) -> dict[str, Any]:
+    """Say whether ``incoming_calls`` is every caller the index could attribute."""
+
+    return {
+        "incoming_completeness": (
+            "complete" if unattributed <= 0
+            else "unresolved_same_name_edges_not_attributed"
+        ),
+        "unresolved_same_name_incoming_count": max(0, int(unattributed)),
+    }
 
 
 def _bind_calls_to_query_symbol(
@@ -7693,10 +7781,13 @@ def _bind_calls_to_query_symbol(
     }
     if resolution == "exact_symbol_match":
         symbol = candidates[0]
-        outgoing, incoming = _calls_edges_for_symbol(conn, symbol, limit=limit)
+        outgoing, incoming, unattributed = _calls_edges_and_unattributed_count(
+            conn, symbol, limit=limit,
+        )
         payload["scope"] = "query_symbol_matches"
         payload["outgoing_calls"] = outgoing
         payload["incoming_calls"] = incoming
+        payload.update(_calls_incoming_completeness(unattributed))
         payload["files"] = [str(symbol.get("file_path") or "")]
         query_symbol.update({
             "resolved": str(symbol.get("qualname") or ""),
@@ -7797,7 +7888,7 @@ def _bind_calls_to_line_target(
         # One row past ``limit`` shows the list was cut without a second query.
         # Both directions count: a budget that fits the calls this symbol makes
         # can still cut the calls that name it.
-        outgoing, incoming = _calls_edges_for_symbol(
+        outgoing, incoming, unattributed = _calls_edges_and_unattributed_count(
             conn, symbol, limit=limit + 1, include_incoming=True,
         )
         query_symbol["edges_truncated"] = (
@@ -7806,6 +7897,7 @@ def _bind_calls_to_line_target(
         outgoing = outgoing[:limit]
         incoming = incoming[:limit]
         payload["scope"] = "line_target_symbol"
+        payload.update(_calls_incoming_completeness(unattributed))
         query_symbol.update({
             "resolved": str(symbol.get("qualname") or ""),
             "line_start": symbol.get("line_start"),
