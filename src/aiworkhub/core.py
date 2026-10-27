@@ -10466,9 +10466,46 @@ def supersede_task(
         return _canonical_result(ok=False, returncode=1, stderr=f"supersede_failed:{state}", command=command)
     card2 = task_store.get_task(repo_root(), task_id)
     stdout = json.dumps(card2, ensure_ascii=False, default=str) if card2 else ""
-    return _reconcile_retained_workspaces(
+    result = _reconcile_retained_workspaces(
         _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
     )
+    result["needfix_rebind"] = _rebind_superseded_needfix(
+        task_id, by, actor=actor, reason=full_reason
+    )
+    return result
+
+
+def _rebind_superseded_needfix(
+    task_id: str, by: str, *, actor: str, reason: str
+) -> dict[str, Any]:
+    """Move the NeedFix linked to a superseded card onto its declared successor.
+
+    Runs only after the supersede archive committed. The successor is the
+    authenticated ``by`` and the join is the exact ``converted_task_id``; a
+    failure is reported in the outcome and never undoes the supersede
+    (NF-2026-00871).
+    """
+    if not by:
+        return {"ok": True, "state": "skipped", "reason": "no_successor_declared"}
+    try:
+        return _needfix_store_module().rebind_superseded_task_link(
+            repo_root(),
+            task_id,
+            by,
+            actor=actor,
+            reason=reason,
+            get_task_fn=_canonical_task,
+            canonical_status_fn=task_store.canonical_status,
+        )
+    # A post-commit rebind must never fail the committed supersede.
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "state": "error",
+            "from_task_id": task_id,
+            "to_task_id": by,
+            "error": f"{type(exc).__name__}: {exc}"[:500],
+        }
 
 
 def release_launch(

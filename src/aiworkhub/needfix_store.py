@@ -197,6 +197,10 @@ MAX_ID_SEQUENCE = 99999
 # link is recorded once; its exact count drives reopen_generation derivation.
 REOPEN_EVENT = "superseded_task_link_reopened"
 
+# Audit event for a NeedFix link moved from a superseded task onto the
+# successor the coordinator declared with ``supersede --by``.
+SUPERSEDED_REBIND_EVENT = "superseded_task_rebound"
+
 # ---------------------------------------------------------------------------
 # Derived ACTIVE state (read-time, never persisted).
 #
@@ -4443,6 +4447,170 @@ def reopen_superseded_task_link(
         raise
     finally:
         conn.close()
+
+
+def _has_superseded_rebind_event(
+    conn: sqlite3.Connection, needfix_id: str, from_task_id: str, to_task_id: str
+) -> bool:
+    """True when ``needfix_id`` already records the exact from -> to rebind."""
+    for event_row in conn.execute(
+        "SELECT detail_json FROM needfix_events WHERE needfix_id = ? AND event = ?",
+        (needfix_id, SUPERSEDED_REBIND_EVENT),
+    ).fetchall():
+        try:
+            detail = json.loads(event_row["detail_json"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if (
+            isinstance(detail, dict)
+            and detail.get("from_task_id") == from_task_id
+            and detail.get("to_task_id") == to_task_id
+        ):
+            return True
+    return False
+
+
+def rebind_superseded_task_link(
+    repo_root: str | Path,
+    from_task_id: str,
+    to_task_id: str,
+    *,
+    actor: str,
+    reason: str = "",
+    get_task_fn: Callable[[str], Mapping[str, Any] | None] | None = None,
+    canonical_status_fn: Callable[[Mapping[str, Any]], str] | None = None,
+) -> dict[str, Any]:
+    """Move the NeedFix linked to a superseded task onto its declared successor.
+
+    Called only after the coordinator archived ``from_task_id`` as superseded
+    by the authenticated ``to_task_id``. The join is the exact
+    ``converted_task_id``; nothing is inferred from titles, ids or prose.
+    A successor that already carries a different NeedFix is refused so one
+    NeedFix keeps one lineage. A repeated call for the same pair is
+    idempotent. When the successor card is already accepted (canonical
+    ``finished`` with an ``accepted_request_id``), the NeedFix is resolved in
+    the same call through :func:`close_for_accepted_task`.
+    """
+    old_id = str(from_task_id or "").strip()
+    new_id = str(to_task_id or "").strip()
+    if not old_id or not new_id:
+        raise NeedFixValidationError("from_task_id and to_task_id are required")
+    if old_id == new_id:
+        raise NeedFixValidationError("from_task_id and to_task_id must differ")
+    audit_actor = str(actor or "").strip()
+    if not audit_actor:
+        raise NeedFixValidationError("rebind actor is required")
+    if len(audit_actor.encode("utf-8")) > 256:
+        raise NeedFixValidationError("rebind actor exceeds 256 bytes")
+    note = str(reason or "").strip()
+    if len(note.encode("utf-8")) > MAX_RECOVERY_REASON_BYTES:
+        raise NeedFixValidationError(
+            f"rebind reason exceeds {MAX_RECOVERY_REASON_BYTES} bytes"
+        )
+    result: dict[str, Any] = {
+        "ok": True,
+        "state": "not_linked",
+        "from_task_id": old_id,
+        "to_task_id": new_id,
+        "needfix_id": None,
+    }
+    # No store means no NeedFix can be linked; never create one as a side effect.
+    if not _db_path(repo_root).is_file():
+        return result
+
+    terminal = sorted(NEEDFIX_TERMINAL_STATUSES)
+    marks = ", ".join("?" for _ in terminal)
+    conn = _connect(repo_root)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        successor_rows = conn.execute(
+            "SELECT * FROM needfix WHERE converted_task_id = ? ORDER BY id", (new_id,)
+        ).fetchall()
+        linked_rows = conn.execute(
+            f"SELECT * FROM needfix WHERE converted_task_id = ? AND status NOT IN ({marks}) "
+            "ORDER BY id",
+            (old_id, *terminal),
+        ).fetchall()
+        if not linked_rows:
+            rebound = [
+                row for row in successor_rows
+                if _has_superseded_rebind_event(conn, str(row["id"]), old_id, new_id)
+            ]
+            conn.commit()
+            if len(successor_rows) == 1 and rebound:
+                result.update(state="idempotent", needfix_id=str(rebound[0]["id"]))
+            else:
+                return result
+        elif successor_rows:
+            conn.rollback()
+            result.update(
+                ok=False,
+                state="refused",
+                needfix_id=str(linked_rows[0]["id"]),
+                reason="successor_already_linked_to_needfix:"
+                + ",".join(str(row["id"]) for row in successor_rows),
+            )
+            return result
+        elif len(linked_rows) != 1:
+            conn.rollback()
+            result.update(
+                ok=False,
+                state="refused",
+                reason="superseded_task_linked_to_multiple_needfix:"
+                + ",".join(str(row["id"]) for row in linked_rows),
+            )
+            return result
+        else:
+            row = linked_rows[0]
+            needfix_id = str(row["id"])
+            cur = conn.execute(
+                "UPDATE needfix SET converted_task_id = ?, updated_at = ? "
+                "WHERE id = ? AND converted_task_id = ? AND status = ?",
+                (new_id, _utcnow_iso(), needfix_id, old_id, row["status"]),
+            )
+            if cur.rowcount != 1:
+                raise NeedFixConflictError(
+                    f"needfix {needfix_id} changed during superseded-task rebind"
+                )
+            _record_event(
+                conn,
+                needfix_id,
+                SUPERSEDED_REBIND_EVENT,
+                {
+                    "from_task_id": old_id,
+                    "to_task_id": new_id,
+                    "actor": audit_actor,
+                    "reason": note,
+                },
+            )
+            conn.commit()
+            result.update(state="rebound", needfix_id=needfix_id)
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    if get_task_fn is None or canonical_status_fn is None:
+        return result
+    card = get_task_fn(new_id)
+    accepted_request_id = str((card or {}).get("accepted_request_id") or "").strip()
+    if card is None or canonical_status_fn(card) != "finished" or not accepted_request_id:
+        return result
+    # The rebind is already durable; a closure refusal is reported, not raised,
+    # so the caller still sees which NeedFix moved.
+    try:
+        result["closure"] = close_for_accepted_task(
+            repo_root, new_id, accepted_request_id=accepted_request_id
+        )
+    except NeedFixError as exc:
+        result["closure"] = {
+            "state": "error",
+            "task_id": new_id,
+            "error": f"{type(exc).__name__}: {exc}"[:500],
+        }
+    return result
 
 
 def janitor_bookkeeping(
