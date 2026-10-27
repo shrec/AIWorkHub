@@ -681,6 +681,24 @@ def successor_task_id(needfix_id: str, generation: int) -> str:
     return f"needfix-{needfix_id}-r{generation}"
 
 
+# Upper bound on successor ids convert_needfix probes past existing terminal cards.
+_MAX_SUCCESSOR_ID_PROBES = 64
+
+
+def _is_terminal_id_collision(result: Any, card: Mapping[str, Any], minted_id: str) -> bool:
+    """True when create_task refused the store-minted id an existing terminal card holds.
+
+    NF-2026-01727: a builder-supplied custom id is never re-minted.
+    """
+    return (
+        isinstance(result, Mapping)
+        and result.get("ok") is False
+        and result.get("receipt_state") == "existing_terminal"
+        and result.get("task_id") == card.get("task_id")
+        and card.get("task_id") == minted_id
+    )
+
+
 def initialize_repository(repo_root: str | Path) -> dict[str, Any]:
     """Idempotently ensure the NeedFix store exists for ``repo_root``.
 
@@ -3973,7 +3991,15 @@ def convert_needfix(
         input_refusal = _card_input_refusal_reason(repo_root, card)
         if input_refusal is not None:
             raise NeedFixValidationError(input_refusal)
-        result = create_task_fn(card)
+        generation = int(needfix_snapshot.get("reopen_generation") or 0)
+        for _probe in range(_MAX_SUCCESSOR_ID_PROBES):
+            result = create_task_fn(card)
+            if not _is_terminal_id_collision(
+                result, card, successor_task_id(needfix_id, generation)
+            ):
+                break
+            generation += 1
+            card["task_id"] = successor_task_id(needfix_id, generation)
         task_id = _normalize_create_task_receipt(result, needfix_id)
     except Exception:
         _compensate_conversion_claim(

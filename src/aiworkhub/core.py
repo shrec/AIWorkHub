@@ -13123,10 +13123,11 @@ def needfix_convert(
     Idempotent already-task_created retries short-circuit before this
     enforcement, preserving reconciliation without a new create.
 
-    The store mints a deterministic, collision-free ``task_id`` from the
-    NeedFix's current ``reopen_generation``: ``needfix-{NF-ID}`` for the
-    original conversion and ``needfix-{NF-ID}-rN`` after the Nth verified
-    reopen of an archived superseded task link.
+    The store mints a deterministic ``task_id`` from the NeedFix's current
+    ``reopen_generation``: ``needfix-{NF-ID}`` for the original conversion
+    and ``needfix-{NF-ID}-rN`` after the Nth verified reopen of an archived
+    superseded task link. When an existing terminal card already holds that
+    generation's id, the store skips it and takes the next free ``-rN``.
     """
     from . import task_templates
 

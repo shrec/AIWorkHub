@@ -1112,3 +1112,66 @@ def test_a_reopened_row_converts_again_without_colliding_with_its_previous_task(
     assert [event["detail"]["prior_converted_task_id"] for event in recurred] == [
         first["converted_task_id"]
     ]
+
+
+def _existing_terminal_receipt(task_id: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "receipt_state": "existing_terminal",
+        "terminal_state": "archived",
+        "task_id": task_id,
+        "stderr": f"task_terminal:archived:{task_id}",
+    }
+
+
+def test_convert_skips_a_successor_id_held_by_an_archived_card(init: Path):
+    rec = needfix_store.add_needfix(init, title="sig", description="d", status="accepted")
+    archived_id = f"needfix-{rec['id']}"
+    seen: list[str] = []
+
+    def create_task(card: dict[str, Any]) -> dict[str, Any]:
+        seen.append(card["task_id"])
+        if card["task_id"] == archived_id:
+            return _existing_terminal_receipt(card["task_id"])
+        return {"ok": True, "task_id": card["task_id"]}
+
+    result = needfix_store.convert_needfix(init, rec["id"], create_task)
+
+    assert result["converted_task_id"] == f"needfix-{rec['id']}-r1"
+    assert seen == [archived_id, f"needfix-{rec['id']}-r1"]
+    row = needfix_store.get_needfix(init, rec["id"])
+    assert row["status"] == "task_created"
+    assert row["converted_task_id"] == f"needfix-{rec['id']}-r1"
+
+
+def test_convert_does_not_probe_past_a_non_collision_failure(init: Path):
+    rec = needfix_store.add_needfix(init, title="sig", description="d", status="accepted")
+    seen: list[str] = []
+
+    def create_task(card: dict[str, Any]) -> dict[str, Any]:
+        seen.append(card["task_id"])
+        return {"ok": False, "stderr": "boom"}
+
+    with pytest.raises(needfix_store.NeedFixError, match="boom"):
+        needfix_store.convert_needfix(init, rec["id"], create_task)
+
+    assert seen == [f"needfix-{rec['id']}"]
+    assert needfix_store.get_needfix(init, rec["id"])["status"] == "accepted"
+
+
+def test_convert_gives_up_after_the_probe_bound(init: Path):
+    rec = needfix_store.add_needfix(init, title="sig", description="d", status="accepted")
+    seen: list[str] = []
+
+    def create_task(card: dict[str, Any]) -> dict[str, Any]:
+        seen.append(card["task_id"])
+        return _existing_terminal_receipt(card["task_id"])
+
+    with pytest.raises(needfix_store.NeedFixError, match="task_terminal:archived"):
+        needfix_store.convert_needfix(init, rec["id"], create_task)
+
+    assert len(seen) == needfix_store._MAX_SUCCESSOR_ID_PROBES
+    assert len(set(seen)) == len(seen)
+    row = needfix_store.get_needfix(init, rec["id"])
+    assert row["status"] == "accepted"
+    assert row["converted_task_id"] is None
