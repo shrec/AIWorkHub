@@ -7370,6 +7370,10 @@ def _verify_owner_private_directory(path: Path, label: str) -> Path:
     return path.resolve(strict=True)
 
 
+# claude CLI MCP connect timeout in ms: its 30 s default lost the worker MCP under host load (NF-2026-01717); 120 s is the NF-2026-01525 cold-start budget.
+CLAUDE_CLI_MCP_TIMEOUT_MS = "120000"
+
+
 def sanitized_env(
     adapter_id: str,
     *,
@@ -7464,7 +7468,8 @@ def sanitized_env(
         "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
     }
     if adapter_id == "claude_cli":
-        passthrough.update({"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"})
+        passthrough.update({"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "MCP_TIMEOUT"})
+        safe["MCP_TIMEOUT"] = CLAUDE_CLI_MCP_TIMEOUT_MS
     elif adapter_id == "codex_cli":
         passthrough.add("OPENAI_API_KEY")
     for key in passthrough:

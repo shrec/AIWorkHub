@@ -1720,6 +1720,7 @@ PROVIDER_CODE_DISPOSITION: dict[str, str] = {
     "overloaded_error": FAILURE_CLASS_TRANSIENT,
     "rate_limit_error": FAILURE_CLASS_TRANSIENT,
     "provider_unreachable": FAILURE_CLASS_TRANSIENT,
+    "worker_mcp_connect_failed": FAILURE_CLASS_TRANSIENT,
     # credential / account
     "authentication_failed": FAILURE_CLASS_CREDENTIAL,
     "invalid_api_key": FAILURE_CLASS_CREDENTIAL,
@@ -1744,8 +1745,16 @@ PROVIDER_CODE_DISPOSITION: dict[str, str] = {
 # status or code is allowed to place a card.
 _PROVIDER_TERMINAL_ENVELOPES: tuple[str, ...] = (
     "result_api_error", "api_retry", "provider_error", "turn_failed",
-    "session_idle", "session_terminal",
+    "session_idle", "session_terminal", "worker_mcp_init_failed",
 )
+
+# NF-2026-01717: the claude CLI's stream-json init event reported an
+# ``aiworkhub_worker*`` MCP server as ``failed`` (connect timeout under host
+# load) and the attempt made no edit. Infrastructure, never candidate work.
+WORKER_MCP_CONNECT_FAILED = "worker_mcp_connect_failed"
+_WORKER_MCP_SERVER_PREFIX = "aiworkhub_worker"
+_EDIT_TOOL_NAMES = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit", "apply_patch"})
+_EDIT_TOOL_SUFFIX = "semantic_edit_apply"
 
 # The two stream events a CLI writes ABOUT A FAILED REQUEST rather than about
 # model output. Only these may have a nested provider body read out of their
@@ -2092,6 +2101,32 @@ def _record_opencode_terminal(event: dict[str, Any], found: dict[str, Any]) -> N
                     children.add(part_session)
 
 
+def _record_worker_mcp_stream(
+    event: dict[str, Any], kind: str, subtype: str, found: dict[str, Any],
+) -> None:
+    """Note a failed AIWorkHub worker MCP server in the CLI's init event, and any edit tool call."""
+    if kind == "system" and subtype == "init":
+        servers = event.get("mcp_servers")
+        for server in servers[:64] if isinstance(servers, list) else ():
+            if (
+                isinstance(server, dict)
+                and str(server.get("name") or "").startswith(_WORKER_MCP_SERVER_PREFIX)
+                and str(server.get("status") or "").strip().lower() == "failed"
+            ):
+                found["_mcp_failed"] = True
+        return
+    if kind != "assistant":
+        return
+    message = event.get("message")
+    blocks = message.get("content") if isinstance(message, dict) else None
+    for block in blocks[:256] if isinstance(blocks, list) else ():
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        name = str(block.get("name") or "")
+        if name in _EDIT_TOOL_NAMES or name.endswith(_EDIT_TOOL_SUFFIX):
+            found["_edited"] = True
+
+
 def _harvest_provider_event(event: object, found: dict[str, Any], depth: int = 0) -> None:
     """Fold one typed provider event into the accumulating signal.
 
@@ -2159,6 +2194,7 @@ def _harvest_provider_event(event: object, found: dict[str, Any], depth: int = 0
         found["code"] = next(key for key in PROVIDER_CODE_DISPOSITION if key == code)
 
     _record_opencode_terminal(event, found)
+    _record_worker_mcp_stream(event, kind, subtype, found)
 
     if not found["envelope"]:
         if (
@@ -2207,6 +2243,8 @@ def provider_terminal_signal(text: str | None) -> dict[str, Any]:
         "status": None,
         "code": "",
         "envelope": "",
+        "_mcp_failed": False,
+        "_edited": False,
         "_oc_steps": set(),
         "_oc_idle": set(),
         "_oc_completed": set(),
@@ -2232,6 +2270,15 @@ def provider_terminal_signal(text: str | None) -> dict[str, Any]:
             found["envelope"] = _PROVIDER_TERMINAL_ENVELOPES[4]
         elif found["_oc_completed"] & steps:
             found["envelope"] = _PROVIDER_TERMINAL_ENVELOPES[5]
+    if (
+        found["_mcp_failed"]
+        and not found["_edited"]
+        and not found["code"]
+        and not found["envelope"]
+        and found["status"] is None
+    ):
+        found["code"] = WORKER_MCP_CONNECT_FAILED
+        found["envelope"] = _PROVIDER_TERMINAL_ENVELOPES[6]
     return {
         "status": found["status"],
         "code": found["code"],
@@ -2865,6 +2912,7 @@ _PROVIDER_CODE_CAUSE: dict[str, str] = {
     "unknown_model": CAUSE_PROVIDER_TRANSIENT,
     "max_output_tokens": CAUSE_PROVIDER_TRANSIENT,
     "provider_unreachable": CAUSE_PROVIDER_TRANSIENT,
+    WORKER_MCP_CONNECT_FAILED: CAUSE_PROVIDER_TRANSIENT,
     "overloaded_error": CAUSE_PROVIDER_CAPACITY,
     "rate_limit_error": CAUSE_PROVIDER_CAPACITY,
     "authentication_failed": CAUSE_PROVIDER_CREDENTIAL,
