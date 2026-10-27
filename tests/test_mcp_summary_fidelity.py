@@ -264,4 +264,5 @@ def test_stdio_idless_tools_call_does_not_start_a_worker(monkeypatch):
     assert set(by_id) == {None, 7}
 
     # The id-carrying control call succeeded.
-    assert by_id[7]["result"]["structuredContent"] == {"ok": True, "started": True}
+    assert "structuredContent" not in by_id[7]["result"]
+    assert json.loads(by_id[7]["result"]["content"][0]["text"]) == {"ok": True, "started": True}

@@ -155,11 +155,9 @@ def _tool_result(tools: dict[str, Any], params: Any) -> dict[str, Any]:
         value = function(**arguments)
     except Exception as exc:  # one tool failure must not terminate the server
         return {"content": [{"type": "text", "text": str(exc)[:2000]}], "isError": True}
-    structured = value if isinstance(value, dict) else {"value": value}
-    return {
-        "content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False, default=str)}],
-        "structuredContent": structured,
-    }
+    # NF-2026-00715: the JSON crosses the pipe once; no outputSchema is declared,
+    # so structuredContent is optional and would only duplicate the text block.
+    return {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False, default=str)}]}
 
 
 _PROTOCOL_ALERT_RELATIVE_PARTS = (".aiworkhub", "runtime", "mcp_protocol_alerts.json")

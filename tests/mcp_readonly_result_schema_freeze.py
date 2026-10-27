@@ -303,10 +303,13 @@ async def _capture_via_client() -> dict[str, Any]:
         out_schemas = {t.name: t.outputSchema for t in listed.tools}
         for name in READONLY_TOOLS:
             r = await client.call_tool(name, READONLY_CALL_ARGS[name])
-            if r.isError or r.structuredContent is None:
+            # NF-2026-00715: the stdio fallback sends one text copy and no
+            # structuredContent, so freeze the skeleton of the parsed text.
+            text = getattr(r.content[0], "text", None) if r.content else None
+            if r.isError or not text:
                 errors.append(name)
                 continue
-            skeletons[name] = _skeleton(r.structuredContent)
+            skeletons[name] = _skeleton(json.loads(text))
     return {"output_schemas": out_schemas, "skeletons": skeletons, "errors": errors}
 
 

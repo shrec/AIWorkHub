@@ -25,7 +25,6 @@ _DASHBOARD = "aiworkhub_dashboard_"
 _KEEP = {"aiworkhub_dashboard_needfix_transition", "aiworkhub_dashboard_snapshot"}
 _TEMPLATE_LIST = "aiworkhub_task_template_list"
 _PROBE_ERROR = "unexpected_arguments:['__nf01676_probe__']"
-_STRUCTURED_FIELD = ', "structuredContent": '
 
 _SYNTHETIC_HIDDEN = "aiworkhub_dashboard_synthetic_hidden"
 _SYNTHETIC_ALL = [
@@ -367,11 +366,6 @@ def _expected_text(name: str) -> str:
     return json.dumps(_SYNTHETIC_RESULTS[name], ensure_ascii=False)
 
 
-def _expected_structured(name: str):
-    value = _SYNTHETIC_RESULTS[name]
-    return value if isinstance(value, dict) else {"value": value}
-
-
 @pytest.fixture(scope="module")
 def repo_root(tmp_path_factory) -> Path:
     root = tmp_path_factory.mktemp("nf01676_repo")
@@ -457,20 +451,18 @@ def test_unset_surface_is_the_all_surface(unset_run: dict) -> None:
         assert unset[key] == explicit[key], key
 
 
-def test_all_surface_results_carry_text_and_structured_content(unset_run: dict) -> None:
+def test_all_surface_results_carry_one_text_copy_and_no_structured_content(unset_run: dict) -> None:
     for label in ("unset", "explicit_all"):
         snap = unset_run["snapshots"][label]
         for name in _SYNTHETIC_RESULTS:
             assert _result(snap["synthetic"]["calls"][name]["message"]) == {
                 "content": [{"type": "text", "text": _expected_text(name)}],
-                "structuredContent": _expected_structured(name),
             }, (label, name)
         real = _result(snap["calls"][_TEMPLATE_LIST]["message"])
-        assert set(real) == {"content", "structuredContent"}
+        assert set(real) == {"content"}
         [item] = real["content"]
         assert item["type"] == "text"
-        assert real["structuredContent"] == json.loads(item["text"])
-        assert real["structuredContent"]["schema_id"] == "aiworkhub.task_template_list.v1"
+        assert json.loads(item["text"])["schema_id"] == "aiworkhub.task_template_list.v1"
 
 
 def test_manager_list_drops_only_the_webview_dashboard_tools(unset_run: dict, manager_run: dict) -> None:
@@ -551,7 +543,7 @@ def test_manager_results_carry_one_text_copy_and_no_structured_content(unset_run
         real = _result(snap["calls"][_TEMPLATE_LIST]["message"])
         assert list(real) == ["content"], label
         assert real["content"] == reference["content"], label
-        assert json.loads(real["content"][0]["text"]) == reference["structuredContent"], label
+        assert json.loads(real["content"][0]["text"]) == json.loads(reference["content"][0]["text"]), label
         echoed = _result(snap["synthetic"]["echo_with_text"]["message"])
         assert list(echoed) == ["content"]
         assert json.loads(echoed["content"][0]["text"])["echo"] == "given"
@@ -588,7 +580,8 @@ def test_synthetic_registry_filters_listing_and_calls_by_prefix_and_keep_set(
         assert _names(synthetic["list"]) == _SYNTHETIC_ALL
         assert _error(synthetic["hidden_with_bad_arguments"]["message"])["message"] == "arguments_must_be_object"
         hidden_call = _result(synthetic["calls"][_SYNTHETIC_HIDDEN]["message"])
-        assert hidden_call["structuredContent"] == {"tool": "hidden"}
+        assert list(hidden_call) == ["content"]
+        assert json.loads(hidden_call["content"][0]["text"]) == {"tool": "hidden"}
     expected = unknown_tool_message(_SYNTHETIC_HIDDEN, _SYNTHETIC_MANAGER)
     for snap in on_manager:
         synthetic = snap["synthetic"]
@@ -636,7 +629,7 @@ def test_real_stdio_loop_serves_the_same_surface(unset_run: dict, manager_run: d
         assert _result(loop["1"]["message"])["serverInfo"]["name"] == "AIWorkHub MCP"
         assert loop["2"] == {key: snap["list"][key] for key in ("names", "wire_bytes", "entries_sha256")}
         template = _result(loop["3"]["message"])
-        assert ("structuredContent" in template) is (not is_manager)
+        assert list(template) == ["content"]
         assert loop["3"]["wire_bytes"] == snap["calls"][_TEMPLATE_LIST]["wire_bytes"]
         assert _error(loop["5"]["message"])["message"] == _PROBE_ERROR
         expected_hidden = unknown_tool_message(hidden_name, snap["list"]["names"]) if is_manager else _PROBE_ERROR
@@ -658,10 +651,9 @@ def test_measured_manager_surface_is_smaller(unset_run: dict, manager_run: dict,
     assert all_bytes - manager_bytes == sum(_wire_len(entry) for entry in hidden_entries) + 2 * len(hidden_entries)
 
     all_call, manager_call = full["calls"][_TEMPLATE_LIST], trimmed["calls"][_TEMPLATE_LIST]
-    assert manager_call["wire_bytes"] < all_call["wire_bytes"]
-    assert manager_call["wire_bytes"] / all_call["wire_bytes"] < 0.65
-    structured = _result(all_call["message"])["structuredContent"]
-    assert all_call["wire_bytes"] - manager_call["wire_bytes"] == len(_STRUCTURED_FIELD) + _wire_len(structured)
+    # NF-2026-00715: every surface now carries the single text copy, so a call costs the same.
+    assert manager_call["wire_bytes"] == all_call["wire_bytes"]
+    assert _result(all_call["message"]) == _result(manager_call["message"])
     with capsys.disabled():
         print(
             f"\nNF-2026-01676 measured: tools/list all={all_count} tools/{all_bytes} B, "

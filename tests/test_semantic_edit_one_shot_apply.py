@@ -65,7 +65,7 @@ class _Client:
     def call(self, tool: str, **arguments: Any) -> dict[str, Any]:
         reply = self.rpc("tools/call", {"name": tool, "arguments": arguments})
         assert "isError" not in reply, reply
-        return reply["structuredContent"]
+        return json.loads(reply["content"][0]["text"])
 
     def prepare(self, **arguments: Any) -> dict[str, Any]:
         return self.call(_PREPARE, **arguments)

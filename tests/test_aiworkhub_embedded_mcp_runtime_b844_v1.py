@@ -291,8 +291,8 @@ def test_stdlib_fallback_exposes_manager_semantic_edit_pair(
                 "include_fragment": False,
             },
         },
-    )["structuredContent"]
-    assert prepared["arguments"]["file_path"] == "src/aiworkhub/core.py"
+    )["content"][0]["text"]
+    assert json.loads(prepared)["arguments"]["file_path"] == "src/aiworkhub/core.py"
 
     monkeypatch.setattr(
         server_module.manager_ai_tools,
@@ -311,7 +311,8 @@ def test_stdlib_fallback_exposes_manager_semantic_edit_pair(
                 "idempotency_key": "manager-edit-1",
             },
         },
-    )["structuredContent"]
+    )["content"][0]["text"]
+    applied = json.loads(applied)
     assert applied["arguments"] == {
         "target_id": "target-1",
         "new": "replacement",
@@ -377,7 +378,8 @@ def test_stdlib_fallback_initialize_and_tools_call_shape(fallback_server_module)
         {"name": "aiworkhub_dashboard_health", "arguments": {}},
     )
     assert result.get("isError") is not True
-    assert result["structuredContent"]["server_tool"] == "aiworkhub_dashboard_health"
+    assert list(result) == ["content"]
+    assert json.loads(result["content"][0]["text"])["server_tool"] == "aiworkhub_dashboard_health"
 
 
 def test_stdlib_fallback_broken_stdout_exits_cleanly_with_stderr_event(
@@ -495,8 +497,8 @@ def test_stdlib_fallback_task_create_then_show_uses_binary_utf8_for_georgian(
     ]
     responses_by_id = {response["id"]: response for response in responses}
     assert sorted(responses_by_id) == [1, 2]
-    assert responses_by_id[1]["result"]["structuredContent"]["title"] == title
-    shown = responses_by_id[2]["result"]["structuredContent"]
+    assert json.loads(responses_by_id[1]["result"]["content"][0]["text"])["title"] == title
+    shown = json.loads(responses_by_id[2]["result"]["content"][0]["text"])
     assert shown["card"]["objective"] == objective
 
 
@@ -788,7 +790,8 @@ def test_isolated_vsix_runtime_smoke_no_site_packages_fresh_repo(extracted_vsix,
         assert "error" not in snapshot, snapshot.get("error")
         result = snapshot["result"]
         assert result.get("isError") is not True
-        structured = result["structuredContent"]
+        assert "structuredContent" not in result
+        structured = json.loads(result["content"][0]["text"])
         assert structured["server_tool"] == "aiworkhub_dashboard_snapshot"
         assert "status_counts" in structured
         assert "row_counts" in structured

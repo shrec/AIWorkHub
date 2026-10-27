@@ -247,11 +247,10 @@ except ModuleNotFoundError:
             result = func(**arguments)
         except Exception as exc:  # tool-level failure -> MCP error content, not a crash
             return {"content": [{"type": "text", "text": str(exc)[:2000]}], "isError": True}
+        # NF-2026-00715: one copy per result on every surface. No outputSchema is
+        # declared, so structuredContent is optional and would only repeat the text.
         text = json.dumps(result, ensure_ascii=False, default=str)
-        if surface == MCP_SURFACE_MANAGER:
-            return {"content": [{"type": "text", "text": text}]}
-        structured = result if isinstance(result, dict) else {"value": result}
-        return {"content": [{"type": "text", "text": text}], "structuredContent": structured}
+        return {"content": [{"type": "text", "text": text}]}
 
     _PROTOCOL_ALERT_RELATIVE_PARTS = (".aiworkhub", "runtime", "mcp_protocol_alerts.json")
     _PROTOCOL_ALERT_SCHEMA_ID = "aiworkhub.mcp_control_plane.protocol_alert.v1"

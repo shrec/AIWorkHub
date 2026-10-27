@@ -621,7 +621,8 @@ def test_the_stdio_fallback_still_lists_and_calls_the_accept_tool():
 
     assert "aiworkhub_agent_accept_review" in payload["listed"]
     assert "isError" not in payload["called"]
-    assert payload["called"]["structuredContent"] == {
+    assert list(payload["called"]) == ["content"]
+    assert json.loads(payload["called"]["content"][0]["text"]) == {
         "ok": False,
         "error": "accept_refused_for_test",
         "request_id": "R-1",
