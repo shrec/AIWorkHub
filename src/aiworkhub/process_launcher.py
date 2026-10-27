@@ -769,11 +769,7 @@ def _run_validations_with_toolchain_receipt(
     from . import validation_runner as _validation_runner
 
     def _source_text(relative: str) -> str | None:
-        path = target.path / relative
-        try:
-            return path.read_text(encoding="utf-8")
-        except OSError:
-            return None
+        return _validation_runner.read_candidate_source(target.path, relative)
 
     needed = any(
         _validation_runner.command_needs_multiprocessing_semlock(
@@ -788,19 +784,42 @@ def _run_validations_with_toolchain_receipt(
         inner = _validation_runner.trusted_semlock_probe_argv(sys.executable)
         backend = kwargs.get("backend")
         selected = backend if isinstance(backend, str) and backend else None
+        # NF-2026-01740: a landlock SemLock grant is measured under the SAME
+        # ruleset the validation gets -- its exec scratch plus the /dev/shm
+        # rule -- so a denial measured with the rule still refuses.
+        probe_scratch: Path | None = None
         try:
-            argv = sandbox_argv(
-                target, str(kwargs.get("adapter_id") or ""), inner, backend=selected
-            )
-            sandbox_measured = True
-        except WorkspaceError:
-            argv = inner
-        try:
-            completed = subprocess.run(
-                argv, capture_output=True, text=True, timeout=30, check=False
-            )
-        except OSError:
-            completed = None
+            try:
+                ruled: dict[str, Any] = {}
+                if (
+                    selected == "landlock"
+                    and _validation_runner.landlock_semlock_dev_shm_root() is not None
+                ):
+                    probe_scratch = _worker_workspace.provision_validation_exec_scratch(
+                        target, backend=selected
+                    )
+                    ruled = {
+                        "validation_exec_scratch": probe_scratch,
+                        "validation_semlock_dev_shm": True,
+                    }
+                argv = sandbox_argv(
+                    target,
+                    str(kwargs.get("adapter_id") or ""),
+                    inner,
+                    backend=selected,
+                    **ruled,
+                )
+                sandbox_measured = True
+            except WorkspaceError:
+                argv = inner
+            try:
+                completed = subprocess.run(
+                    argv, capture_output=True, text=True, timeout=30, check=False
+                )
+            except OSError:
+                completed = None
+        finally:
+            _worker_workspace.cleanup_validation_exec_scratch(probe_scratch)
         if completed is not None:
             probe = _validation_runner.decode_trusted_semlock_exit(completed.returncode)
         if probe is None:

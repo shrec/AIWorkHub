@@ -1490,11 +1490,15 @@ class TestSemLockCapability:
         assert probe["supported"] is False
         assert probe["primitive"] == validation_runner.SEMLOCK_PRIMITIVE
         assert probe["backend"] == "posix_shm"
+        # The probe ran under the provider/worker ruleset, which never gains
+        # /dev/shm (NF-2026-01740), so it stays denied; without the
+        # validation-only /dev/shm rule that denial is still unsupported.
         decision = validation_runner.preflight_semlock_capability(
             ["python -m pytest tests/test_x.py"],
             backend="landlock",
             probe=probe,
             source_text=lambda rel: "import multiprocessing as mp\nmp.get_context().Lock()\n",
+            dev_shm_rule=False,
         )
         assert decision.action == "unsupported"
         assert decision.evidence == (
@@ -1516,6 +1520,9 @@ class TestSemLockCapability:
             raise AssertionError("unsupported capability must not run the command")
 
         monkeypatch.setattr(process_launcher, "run_validations", fake_run_validations)
+        monkeypatch.setattr(
+            validation_runner, "landlock_semlock_dev_shm_root", lambda *a: None
+        )
         with pytest.raises(ValidationEnvironmentBlocked) as caught:
             process_launcher._run_validations_with_toolchain_receipt(
                 workspace,
@@ -1631,6 +1638,7 @@ class TestSemLockCapability:
                 ['python -c "import multiprocessing as mp; mp.get_context().Lock()"'],
                 backend="landlock",
                 probe=probe,
+                dev_shm_rule=False,
             )
             assert decision.action == "unsupported"
             assert decision.evidence.endswith(f":{expected_backend}")
@@ -1734,6 +1742,7 @@ class TestSemLockCapability:
             backend="landlock",
             probe=probe,
             source_text=lambda rel: "import multiprocessing as mp\nmp.get_context().Lock()\n",
+            dev_shm_rule=False,
         )
         assert denied.action == "unsupported"
         granted = validation_runner.preflight_semlock_capability(
@@ -1779,6 +1788,9 @@ class TestSemLockCapability:
         monkeypatch.setattr(process_launcher, "sandbox_argv", fake_sandbox_argv)
         monkeypatch.setattr(process_launcher, "run_validations", fake_run_validations)
         monkeypatch.setattr(validation_runner, "construct_multiprocessing_semlock", boom)
+        monkeypatch.setattr(
+            validation_runner, "landlock_semlock_dev_shm_root", lambda *a: None
+        )
         with pytest.raises(ValidationEnvironmentBlocked) as caught:
             process_launcher._run_validations_with_toolchain_receipt(
                 workspace,
@@ -1834,6 +1846,11 @@ class TestSemLockCapability:
         monkeypatch.setattr(
             process_launcher, "_sandbox_backend_for_adapter", lambda adapter_id: "landlock"
         )
+        # No /dev/shm on this host, so the validation ruleset gets no SemLock
+        # rule and the probe's posix_shm denial stays unsupported.
+        monkeypatch.setattr(
+            validation_runner, "landlock_semlock_dev_shm_root", lambda *a: None
+        )
         authority = {
             "adapter_id": "grok_kilo_cli",
             "sandbox_backend": "landlock",
@@ -1880,6 +1897,21 @@ class TestSemLockCapability:
 
         monkeypatch.setattr(process_launcher, "sandbox_argv", fake_sandbox_argv)
         monkeypatch.setattr(process_launcher, "run_validations", fake_run_validations)
+        # NF-2026-01740: the landlock probe runs under the validation's own
+        # /dev/shm-ruled ruleset; keep its exec scratch hermetic on every host.
+        probe_scratch = tmp_path / "probe-scratch"
+        probe_scratch.mkdir()
+        monkeypatch.setattr(
+            validation_runner, "landlock_semlock_dev_shm_root", lambda *a: "/dev/shm"
+        )
+        monkeypatch.setattr(
+            worker_workspace,
+            "provision_validation_exec_scratch",
+            lambda target, *, backend: probe_scratch,
+        )
+        monkeypatch.setattr(
+            worker_workspace, "cleanup_validation_exec_scratch", lambda path: None
+        )
         rows = process_launcher._run_validations_with_toolchain_receipt(
             workspace,
             ["python -m pytest tests/test_x.py"],

@@ -22,10 +22,13 @@ this), so classification stays reusable and unit-testable without a sandbox.
 from __future__ import annotations
 
 import ast
+import os
 import re
 import shlex
+import stat
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 # ---- terminal states --------------------------------------------------------
@@ -344,6 +347,8 @@ def _source_needs_semlock(text: str) -> bool:
         "Queue",
         "JoinableQueue",
         "SimpleQueue",
+        # NF-2026-01740: a Pool builds SimpleQueue locks, i.e. SemLocks, at once.
+        "Pool",
     }
     mp_names: set[str] = set()
     ctx_names: set[str] = set()
@@ -437,9 +442,83 @@ def command_needs_multiprocessing_semlock(
     return False
 
 
-def sandbox_can_grant_semlock(backend: str, probe_backend: str) -> bool:
+# NF-2026-01740: the one POSIX shared-memory root a Linux ``_multiprocessing.SemLock``
+# (glibc ``sem_open``) creates, links and unlinks its semaphore file beneath.
+LANDLOCK_SEMLOCK_DEV_SHM = "/dev/shm"
+
+
+def landlock_semlock_dev_shm_root(root: str = LANDLOCK_SEMLOCK_DEV_SHM) -> str | None:
+    """Return ``root`` iff it exists as a real (non-symlink) directory.
+
+    This is the single gate for the landlock VALIDATION ruleset's /dev/shm rule
+    and for the preflight that grants SemLock because that rule is present, so
+    the two can never disagree. Absent (Windows, macOS, a container without
+    /dev/shm), a symlink, or any other file type yields ``None``: no rule.
+    """
+    try:
+        status = os.lstat(root)
+    except OSError:
+        return None
+    return root if stat.S_ISDIR(status.st_mode) else None
+
+
+# NF-2026-01740: bound on one candidate source file the SemLock need predicate reads.
+CANDIDATE_SOURCE_MAX_BYTES = 1024 * 1024
+
+
+def read_candidate_source(root: Path, relative: str) -> str | None:
+    """Return one candidate file's UTF-8 text beneath ``root``, or ``None``.
+
+    The single reader behind both the batch SemLock preflight and the
+    per-command landlock /dev/shm rule, so the grant and the rule judge
+    identical bytes. ``None`` unless ``relative`` is a relative POSIX path
+    without ``..`` that resolves beneath ``root`` and names a regular file --
+    opened without following a final symlink or blocking on a FIFO -- of at most
+    ``CANDIDATE_SOURCE_MAX_BYTES`` that decodes as UTF-8.
+    """
+    if not isinstance(relative, str) or not relative or "\\" in relative or "\x00" in relative:
+        return None
+    posix = PurePosixPath(relative)
+    if posix.is_absolute() or ".." in posix.parts:
+        return None
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    try:
+        base = Path(root).resolve()
+        candidate = base.joinpath(*posix.parts)
+        if not candidate.resolve().is_relative_to(base):
+            return None
+        fd = os.open(candidate, flags)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            chunks: list[bytes] = []
+            remaining = CANDIDATE_SOURCE_MAX_BYTES + 1
+            while remaining > 0:
+                chunk = os.read(fd, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        finally:
+            os.close(fd)
+        data = b"".join(chunks)
+        if len(data) > CANDIDATE_SOURCE_MAX_BYTES:
+            return None
+        return data.decode("utf-8")
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+
+
+def sandbox_can_grant_semlock(
+    backend: str, probe_backend: str, *, dev_shm_rule: bool = False
+) -> bool:
     if backend == "landlock" and probe_backend == "posix_shm":
-        return False
+        return dev_shm_rule
     return True
 
 
@@ -459,6 +538,7 @@ def preflight_semlock_capability(
     source_text: Callable[[str], str | None] | None = None,
     construct: Callable[[], str] | None = None,
     sandbox_measured: bool = False,
+    dev_shm_rule: bool | None = None,
 ) -> SemlockPreflight:
     needed = any(
         command_needs_multiprocessing_semlock(command, source_text=source_text)
@@ -472,9 +552,19 @@ def preflight_semlock_capability(
     )
     primitive = str(measured.get("primitive") or SEMLOCK_PRIMITIVE)
     probe_backend = str(measured.get("backend") or "named_semaphore")
-    if measured.get("supported") is True and (
-        sandbox_measured or sandbox_can_grant_semlock(backend, probe_backend)
-    ):
+    if dev_shm_rule is None:
+        # A SemLock-needing landlock validation gets the /dev/shm beneath-rule
+        # exactly when this same root check passes (``run_validations``).
+        dev_shm_rule = (
+            backend == "landlock" and landlock_semlock_dev_shm_root() is not None
+        )
+    grantable = sandbox_can_grant_semlock(
+        backend, probe_backend, dev_shm_rule=dev_shm_rule
+    )
+    # A landlock posix_shm grant is measured, never inferred: the probe runs
+    # under the same /dev/shm-ruled validation ruleset, so only its measured
+    # success grants and any denial measured with the rule still refuses.
+    if measured.get("supported") is True and (sandbox_measured or grantable):
         return SemlockPreflight("grant", primitive=primitive, backend=probe_backend)
     return SemlockPreflight(
         "unsupported",
@@ -1642,7 +1732,9 @@ def match_validation_environment_signature(
 
 
 __all__ = [
+    "CANDIDATE_SOURCE_MAX_BYTES",
     "CREATEPROCESS_CWD_MAX_CHARS",
+    "LANDLOCK_SEMLOCK_DEV_SHM",
     "LSP_PRIVATE_CWD_SUFFIX",
     "RESTRICTION_ABSENT_INTERPRETER",
     "RESTRICTION_FORBIDDEN_SPAWN",
@@ -1673,12 +1765,14 @@ __all__ = [
     "dash_m_validator_modules",
     "decode_trusted_semlock_exit",
     "exec_scratch_denied_restriction",
+    "landlock_semlock_dev_shm_root",
     "match_validation_environment_signature",
     "nested_lsp_helper_cwd_overhead",
     "preflight_semlock_capability",
     "probe_multiprocessing_semlock",
     "projected_nested_lsp_cwd_length",
     "pytest_validation_evidence",
+    "read_candidate_source",
     "row_restriction",
     "sandbox_can_grant_semlock",
     "sandbox_unrunnable_reason",
