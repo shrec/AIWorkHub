@@ -30,6 +30,7 @@ import json
 import re
 import sqlite3
 import time
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -313,6 +314,55 @@ def _claim_start_exact_once(
 CLAIM_CONTENTION_ATTEMPTS = 3
 _CLAIM_CONTENTION_BACKOFF_S = 0.05
 CLAIM_CONTENTION_SCHEMA = "aiworkhub.task_queue.write_contention.v1"
+# NF-2026-00804: the ``claim_recovery_state`` of a reviewer reservation kept
+# ``starting`` because contention refused its claim before anything committed
+# (distinct from ``claim_commit_ambiguous``, where a commit may exist).
+CLAIM_CONTENTION_RECOVERY_STATE = "claim_write_contention_deferred"
+
+
+def trusted_claim_contention(
+    result: Mapping[str, Any], *, task_id: str, request_id: str
+) -> dict[str, Any] | None:
+    """Return the receipt when ``result`` is a trusted retryable contention.
+
+    NF-2026-00804: the one predicate both launcher claim callers use to tell a
+    bounded pre-provider ``task_queue_contention`` (defer, same identity) from
+    every other claim failure (fail closed). Anything short of the exact
+    receipt shape for this task and request -- absent, wrong schema, not
+    retryable, a provider already launched -- is ``None``.
+    """
+    if not isinstance(result, Mapping) or result.get("ok") is not False:
+        return None
+    receipt = result.get("task_queue_contention")
+    if (
+        not isinstance(receipt, Mapping)
+        or receipt.get("schema_id") != CLAIM_CONTENTION_SCHEMA
+        or receipt.get("retryable") is not True
+        or receipt.get("provider_launched") is not False
+        or receipt.get("task_id") != task_id
+        or receipt.get("request_id") != request_id
+    ):
+        return None
+    return dict(receipt)
+
+
+def contention_deferral(receipt: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """The typed, non-terminal outcome a launch records for a trusted receipt.
+
+    ``None`` for no receipt, so callers can pass the predicate result through.
+    Nothing was claimed or launched, so the card stays pending with its
+    candidate and the next scan retries the same request identity.
+    """
+    if receipt is None:
+        return None
+    return {
+        "outcome": "deferred",
+        "deferred": True,
+        "retryable": True,
+        "terminal": False,
+        "provider_launched": False,
+        "task_queue_contention": dict(receipt),
+    }
 
 
 def _is_write_contention(exc: BaseException) -> bool:

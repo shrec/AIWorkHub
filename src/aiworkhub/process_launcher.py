@@ -5684,6 +5684,7 @@ class ProcessManager:
         receipt = card.get(_toolchain_authority.RECEIPT_CARD_KEY)
         workspace: WorkerWorkspace | None = None
         claimed = False
+        contention: dict[str, Any] | None = None
         try:
             with self._launch_reservation({
                 "request_id": request_id,
@@ -5723,6 +5724,9 @@ class ProcessManager:
                     self.repo, task_id, runner, topic, request_id=request_id
                 )
                 if not claim.get("ok"):
+                    contention = task_engine.trusted_claim_contention(
+                        claim, task_id=task_id, request_id=request_id
+                    )
                     raise LaunchRejected(
                         "claim_start_failed:"
                         + str(claim.get("stderr") or claim.get("stdout") or "")[:300]
@@ -5956,6 +5960,7 @@ class ProcessManager:
                     "execution_mode": "validation_only_replay",
                     "provider_launched": "false",
                 },
+                extra=task_engine.contention_deferral(contention),
             )
 
     _QUALITY_REVIEW_PREP_LOCK = threading.Lock()
@@ -7424,7 +7429,13 @@ class ProcessManager:
             return True
 
     def _retain_ambiguous_reviewer_claim_for_reconciliation(
-        self, request_id: str, reviewer_task_id: str, runner: str
+        self,
+        request_id: str,
+        reviewer_task_id: str,
+        runner: str,
+        *,
+        reason: str = "quality_review_claim_receipt_and_canonical_read_failed",
+        recovery_state: str = "claim_commit_ambiguous",
     ) -> bool:
         """Persist authority to recover a claim whose commit result is unreadable."""
 
@@ -7438,13 +7449,11 @@ class ProcessManager:
                 return False
             if latest.get("reviewer_claim_epoch") is not None:
                 return True
-            if latest.get("claim_recovery_state") == "claim_commit_ambiguous":
+            if latest.get("claim_recovery_state") == recovery_state:
                 return True
             retained = dict(latest)
-            retained["claim_recovery_state"] = "claim_commit_ambiguous"
-            retained["claim_recovery_reason"] = (
-                "quality_review_claim_receipt_and_canonical_read_failed"
-            )
+            retained["claim_recovery_state"] = recovery_state
+            retained["claim_recovery_reason"] = reason
             self._append_event(retained)
             return True
 
@@ -7459,7 +7468,10 @@ class ProcessManager:
             if (
                 event.get("state") != "starting"
                 or event.get("topic") != "quality_review"
-                or event.get("claim_recovery_state") != "claim_commit_ambiguous"
+                or event.get("claim_recovery_state") not in (
+                    "claim_commit_ambiguous",
+                    task_engine.CLAIM_CONTENTION_RECOVERY_STATE,
+                )
                 or event.get("reviewer_claim_epoch") is not None
             ):
                 continue
@@ -8130,7 +8142,29 @@ class ProcessManager:
                 "quality_review_claim_failed:"
                 + str(claim.get("stderr") or claim.get("stdout") or "")[:500]
             )
-            return _fail(reason)
+            contention = task_engine.trusted_claim_contention(
+                claim, task_id=reviewer_task_id, request_id=request_id
+            )
+            if contention is None:
+                return _fail(reason)
+            # NF-2026-00804: contention defers under the same request identity.
+            try:
+                retained = self._retain_ambiguous_reviewer_claim_for_reconciliation(
+                    request_id, reviewer_task_id, runner,
+                    reason="quality_review_claim_write_contention",
+                    recovery_state=task_engine.CLAIM_CONTENTION_RECOVERY_STATE,
+                )
+            except Exception:  # noqa: BLE001 -- an unretained deferral fails closed
+                retained = False
+            if not retained:
+                return _fail(reason)
+            return {
+                "ok": False,
+                "error": reason,
+                "recovery_state": "starting_reservation_retained",
+                "claim_recovery_bound": True,
+                "task_queue_contention": contention,
+            }
         try:
             claimed_card = _committed_claim_card(
                 claim,
@@ -8707,8 +8741,10 @@ class ProcessManager:
         request_id: str | None = None,
         state: str = "blocked",
         diagnostic: dict[str, str] | None = None,
+        extra: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         event = self._append_event({
+            **(extra or {}),
             "request_id": request_id or uuid.uuid4().hex,
             "task_id": task_id,
             "runner": runner,
@@ -8719,6 +8755,7 @@ class ProcessManager:
             **({"diagnostic": diagnostic} if diagnostic else {}),
         })
         return {
+            **(extra or {}),
             "ok": False,
             "launch_implemented": LAUNCH_IMPLEMENTED,
             "launch_enabled": launch_gates_open(),
