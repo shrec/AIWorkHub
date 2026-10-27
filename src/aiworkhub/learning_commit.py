@@ -496,6 +496,10 @@ def _repo_area(paths: Sequence[str]) -> str:
     its regression in tests/ has no common prefix at all, and reporting "" for
     the area of an obviously-located change is worse than useless. Tests are
     kept only when nothing else changed, which is a real and different case.
+
+    When the directories share no prefix at all (src/ and scripts/), the area
+    is the top-level directory holding the most of them, ties broken
+    lexicographically, so a non-empty path list never derives "".
     """
     production = [p for p in paths if p and not _is_test_path(p)]
     directories = [
@@ -513,8 +517,20 @@ def _repo_area(paths: Sequence[str]) -> str:
             keep += 1
         common = common[:keep]
         if not common:
-            return ""
+            return _majority_top_level(directories)
     return "/".join(common)
+
+
+def _majority_top_level(directories: Sequence[str]) -> str:
+    """The top-level directory holding the most entries; ties go to the first by name."""
+    counts: dict[str, int] = {}
+    for directory in directories:
+        top = directory.split("/", 1)[0]
+        if top and top != ".":
+            counts[top] = counts.get(top, 0) + 1
+    if not counts:
+        return ""
+    return min(counts, key=lambda top: (-counts[top], top))
 
 
 def _is_test_path(path: str) -> bool:

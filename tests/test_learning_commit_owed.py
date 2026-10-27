@@ -73,7 +73,7 @@ def test_an_unsafe_file_reference_is_not_offered():
         (["src/aiworkhub/source_graph.py", "tests/test_x.py"], "src/aiworkhub"),
         (["src/aiworkhub/dash/a.py", "src/aiworkhub/dash/b.py"], "src/aiworkhub/dash"),
         (["tests/test_a.py", "tests/test_b.py"], "tests"),
-        (["src/aiworkhub/a.py", "scripts/b.py"], ""),
+        (["src/aiworkhub/a.py", "scripts/b.py"], "scripts"),
         ([], ""),
     ],
 )
