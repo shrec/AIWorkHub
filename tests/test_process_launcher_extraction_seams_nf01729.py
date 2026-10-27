@@ -23,10 +23,11 @@ from typing import Any
 import pytest
 
 from aiworkhub import process_launcher
+from aiworkhub import process_launcher_source_evidence as source_evidence
 from aiworkhub import process_launcher_vscode_lm_tool as vscode_lm_tool
 from aiworkhub import process_launcher_workspace_gc as workspace_gc
 
-PROCESS_LAUNCHER_MAX_LINES = 13600
+PROCESS_LAUNCHER_MAX_LINES = 13529
 
 # (module, function, seam tuple attribute, ProcessManager method)
 EXTRACTIONS: tuple[tuple[ModuleType, str, str, str], ...] = (
@@ -196,6 +197,14 @@ def test_process_manager_method_is_a_thin_delegation_with_the_same_signature(
         if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant))
     ]
     assert len(statements) == 1 and isinstance(statements[0], ast.Return)
+
+
+def test_quality_review_source_evidence_lives_in_its_own_module() -> None:
+    impl = source_evidence.quality_review_source_evidence
+    bound = process_launcher.ProcessManager.__dict__["_quality_review_source_evidence"]
+    assert bound is impl
+    assert process_launcher.ProcessManager._quality_review_source_evidence is impl
+    assert list(inspect.signature(impl).parameters) == ["self", "workspace", "changed_hashes"]
 
 
 class _GcSelf:
