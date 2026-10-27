@@ -6366,6 +6366,7 @@ def create_combined_validation_workspace(
     if len(union_allowed) > MAX_SEED_FILES:
         raise WorkspaceError(f"combined_tree_path_limit_exceeded:{len(union_allowed)}")
     union_card = dict(card)
+    union_card.pop("rework_predecessor", None)  # never re-inherit it (NF-2026-01735)
     union_card["allowed_writes"] = union_allowed
     source_digest = hashlib.sha256(
         source_workspace.request_id.encode("utf-8")

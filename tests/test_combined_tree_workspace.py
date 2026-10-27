@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -269,3 +270,72 @@ def test_combined_tree_skips_untracked_nested_worktree(
             cleanup_workspace(combined.repo, combined.path, combined.home)
     finally:
         cleanup_workspace(candidate.repo, candidate.path, candidate.home)
+
+
+def test_combined_tree_never_rematerializes_rework_predecessor(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    # NF-2026-01735: the predecessor changed P and Q; the rework restored P to
+    # canonical and kept Q.  The combined tree must not re-inherit P.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "AIWorkHub Test")
+    (repo / "P.txt").write_text("canonical p\n", encoding="utf-8")
+    (repo / "Q.txt").write_text("canonical q\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "base")
+
+    monkeypatch.setenv("AIWORKHUB_WORKTREE_ROOT", str(tmp_path / "worktrees"))
+    base_card = {
+        "allowed_writes": ["P.txt", "Q.txt"],
+        "read_first": [],
+        "immutable_inputs": [],
+        "required_outputs": [],
+    }
+    predecessor = create_workspace(repo, "predecessor", base_card, "validation")
+    successor = None
+    try:
+        (predecessor.path / "P.txt").write_text("predecessor p\n", encoding="utf-8")
+        (predecessor.path / "Q.txt").write_text("predecessor q\n", encoding="utf-8")
+        card = {
+            **base_card,
+            "rework_predecessor": {
+                "schema_id": "aiworkhub.rework_predecessor.v1",
+                "request_id": "predecessor",
+                "workspace": predecessor.as_metadata(),
+                "changed_path_hashes": {
+                    relative: hashlib.sha256(
+                        (predecessor.path / relative).read_bytes()
+                    ).hexdigest()
+                    for relative in ("P.txt", "Q.txt")
+                },
+            },
+        }
+        successor = create_workspace(repo, "successor", card, "validation")
+        assert (successor.path / "P.txt").read_text(encoding="utf-8") == (
+            "predecessor p\n"
+        )
+        (successor.path / "P.txt").write_text("canonical p\n", encoding="utf-8")
+
+        combined, evidence = create_combined_validation_workspace(
+            successor,
+            card,
+            ["Q.txt"],
+        )
+        try:
+            assert evidence["observed_candidate_paths"] == ["Q.txt"]
+            assert (combined.path / "P.txt").read_text(encoding="utf-8") == (
+                "canonical p\n"
+            )
+            assert (combined.path / "Q.txt").read_text(encoding="utf-8") == (
+                "predecessor q\n"
+            )
+        finally:
+            cleanup_workspace(combined.repo, combined.path, combined.home)
+    finally:
+        if successor is not None:
+            cleanup_workspace(successor.repo, successor.path, successor.home)
+        cleanup_workspace(predecessor.repo, predecessor.path, predecessor.home)
