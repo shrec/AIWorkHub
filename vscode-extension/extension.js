@@ -10865,6 +10865,32 @@ async function runNeedfixAction(view, action, args) {
   }
 }
 
+const NEEDFIX_REASON_ACTIONS = new Set(["triage", "defer", "reject", "resolve", "resolve_verified", "archive", "purge"]);
+
+// Returns null when the owner cancels, else the host-collected reason and
+// canonical duplicate parent. Only the exact modal label confirms.
+async function confirmNeedfixRequest(action, needfixId) {
+  let reason = "";
+  let duplicateParentId = "";
+  if (NEEDFIX_REASON_ACTIONS.has(action)) {
+    const entered = await vscode.window.showInputBox({ prompt: `${action} reason`, ignoreFocusOut: true });
+    if (entered === undefined) return null;
+    reason = String(entered).trim();
+    if ((action === "reject" || action === "purge") && !reason) return null;
+  }
+  if (action === "duplicate") {
+    const entered = await vscode.window.showInputBox({ prompt: "Canonical NeedFix ID", ignoreFocusOut: true });
+    if (entered === undefined) return null;
+    duplicateParentId = String(entered).trim();
+    if (!NEEDFIX_ID_RE.test(duplicateParentId)) return null;
+  }
+  const commit = action === "convertCommit";
+  const text = commit ? `Create a task from ${needfixId}? This does not launch a worker.` : `Confirm ${action} for ${needfixId}?`;
+  const label = commit ? "Create task" : action.charAt(0).toUpperCase() + action.slice(1).replace(/_/g, " ");
+  const choice = await vscode.window.showWarningMessage(text, { modal: true }, label);
+  return choice === label ? { reason, duplicateParentId } : null;
+}
+
 async function pushManagerLoopStatus(view) {
   try {
     // Read-only: before the owner presses Start there is no loop child and
@@ -11794,17 +11820,26 @@ function handleInboundMessage(view, message) {
       });
       break;
     }
+    // Reason, canonical parent and confirmation are collected here in the
+    // host: VS Code webviews lack allow-modals, so window.confirm/prompt there
+    // silently answer false/null. The Webview never supplies `confirm`.
     case "needfixTransition": {
       const needfixId = String(message.needfixId || "");
       if (!NEEDFIX_ID_RE.test(needfixId)) break;
-      runNeedfixAction(view, "transition", {
-        needfix_id: needfixId,
-        action: String(message.action || "").slice(0, 32),
-        reason: String(message.reason || "").slice(0, 1000),
-        readiness_score: Number.isFinite(Number(message.readinessScore)) ? Math.max(0, Math.min(100, Number(message.readinessScore))) : null,
-        duplicate_parent_id: String(message.duplicateParentId || "").slice(0, 32),
-        confirm: message.confirm === true,
-        include_item: true,
+      const transitionAction = String(message.action || "").slice(0, 32);
+      confirmNeedfixRequest(transitionAction, needfixId).then((confirmed) => {
+        if (!confirmed) return;
+        runNeedfixAction(view, "transition", {
+          needfix_id: needfixId,
+          action: transitionAction,
+          reason: confirmed.reason.slice(0, 1000),
+          readiness_score: Number.isFinite(Number(message.readinessScore)) ? Math.max(0, Math.min(100, Number(message.readinessScore))) : null,
+          duplicate_parent_id: confirmed.duplicateParentId.slice(0, 32),
+          confirm: true,
+          include_item: true,
+        });
+      }).catch((err) => {
+        view.postMessage({ type: OUTBOUND_TYPES.needfixAction, action: "transition", payload: { ok: false, error: sanitizeErrorMessage(err) } });
       });
       break;
     }
@@ -11822,19 +11857,30 @@ function handleInboundMessage(view, message) {
         needfixConvertPreview: "convertPreview",
         needfixConvertCommit: "convertCommit",
       }[message.type];
-      const args = { needfix_id: needfixId };
-      if (action === "archive") Object.assign(args, { reason: String(message.reason || "").slice(0, 1000), confirm: message.confirm === true });
-      if (action === "restore") Object.assign(args, { target_status: String(message.targetStatus || "captured").slice(0, 40), confirm: message.confirm === true });
-      if (action === "purge") Object.assign(args, { audit_reason: String(message.reason || "").slice(0, 1000), confirm: message.confirm === true });
-      if (action === "convertPreview" && message.taskPlan && typeof message.taskPlan === "object" && !Array.isArray(message.taskPlan)) {
-        args.task_plan = message.taskPlan;
+      if (action === "convertPreview") {
+        const previewArgs = { needfix_id: needfixId };
+        if (message.taskPlan && typeof message.taskPlan === "object" && !Array.isArray(message.taskPlan)) {
+          previewArgs.task_plan = message.taskPlan;
+        }
+        runNeedfixAction(view, action, previewArgs);
+        break;
       }
-      if (action === "convertCommit") args.confirm = message.confirm === true;
-      if (action === "convertCommit") {
-        if (message.taskPlan && typeof message.taskPlan === "object" && !Array.isArray(message.taskPlan)) args.task_plan = message.taskPlan;
-        args.plan_digest = String(message.planDigest || "").slice(0, 128);
-      }
-      runNeedfixAction(view, action, args);
+      confirmNeedfixRequest(action, needfixId).then((confirmed) => {
+        if (!confirmed) return;
+        const args = { needfix_id: needfixId };
+        const reason = confirmed.reason.slice(0, 1000);
+        if (action === "archive") Object.assign(args, { reason, confirm: true });
+        if (action === "restore") Object.assign(args, { target_status: "captured", confirm: true });
+        if (action === "purge") Object.assign(args, { audit_reason: reason, confirm: true });
+        if (action === "convertCommit") {
+          args.confirm = true;
+          if (message.taskPlan && typeof message.taskPlan === "object" && !Array.isArray(message.taskPlan)) args.task_plan = message.taskPlan;
+          args.plan_digest = String(message.planDigest || "").slice(0, 128);
+        }
+        runNeedfixAction(view, action, args);
+      }).catch((err) => {
+        view.postMessage({ type: OUTBOUND_TYPES.needfixAction, action, payload: { ok: false, error: sanitizeErrorMessage(err) } });
+      });
       break;
     }
     case "requestSettings":

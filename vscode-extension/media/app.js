@@ -8278,35 +8278,25 @@ elements.needfixDetailPanel.addEventListener("click", (event) => {
     vscode.postMessage({ type: "needfixConvertPreview", needfixId, taskPlan });
     return;
   }
+  // VS Code webviews lack allow-modals, so the reason, canonical parent and
+  // confirmation are all collected by the extension host, never here.
   if (action === "convertCommit") {
-    if (state.needfixConversionPreview && window.confirm(`Create a task from ${needfixId}? This does not launch a worker.`)) {
+    if (state.needfixConversionPreview) {
       vscode.postMessage({
         type: "needfixConvertCommit",
         needfixId,
-        confirm: true,
         taskPlan: state.needfixConversionPreview.task_plan,
         planDigest: state.needfixConversionPreview.plan_digest,
       });
     }
     return;
   }
-  let reason = "";
-  let duplicateParentId = "";
-  if (["triage", "defer", "reject", "resolve", "resolve_verified", "archive", "purge"].includes(action)) {
-    reason = String(window.prompt(`${action} reason`, "") || "").trim();
-    if (["reject", "purge"].includes(action) && !reason) return;
-  }
-  if (action === "duplicate") {
-    duplicateParentId = String(window.prompt("Canonical NeedFix ID", "") || "").trim();
-    if (!duplicateParentId) return;
-  }
-  if (!window.confirm(`Confirm ${action} for ${needfixId}?`)) return;
   if (["archive", "restore", "purge"].includes(action)) {
     const type = { archive: "needfixArchive", restore: "needfixRestore", purge: "needfixPurge" }[action];
-    vscode.postMessage({ type, needfixId, reason, targetStatus: "captured", confirm: true });
+    vscode.postMessage({ type, needfixId, action });
     return;
   }
-  vscode.postMessage({ type: "needfixTransition", needfixId, action, reason, duplicateParentId, confirm: true });
+  vscode.postMessage({ type: "needfixTransition", needfixId, action });
 });
 
 function openRoadmapDialog() {
