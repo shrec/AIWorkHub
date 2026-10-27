@@ -10008,28 +10008,12 @@ def reroute_launch_identity(
                 "reroute_target_rejected:workforce_catalog_unreadable:"
                 f"{type(exc).__name__}"
             )
-        runner_routes = [
-            route
-            for route in catalog.get("workers") or []
-            if str(route.get("execution_runner") or "") == to_runner
-        ]
-        route_matches = [
-            route
-            for route in runner_routes
-            if str(route.get("effective_adapter_id") or "") == to_adapter_id
-        ]
-        identity_tuple = process_launcher.adapter_identity_tuple(to_runner)
-        if (
-            not route_matches
-            and len(runner_routes) == 1
-            and to_adapter_id in identity_tuple
-            and str(runner_routes[0].get("effective_adapter_id") or "") in identity_tuple
-        ):
-            # NF-2026-01602: the launch derives any member of the runner's
-            # identity tuple (glm_5.3 -> vscode_lm), while the catalog row
-            # names the canonical adapter (glm_vscode_lm).  The alias selects
-            # the runner's single row; the canonical adapter is what is recorded.
-            route_matches = runner_routes
+        route_matches, to_runner = workforce_catalog.match_reroute_routes(
+            catalog.get("workers") or [],
+            to_runner,
+            to_adapter_id,
+            process_launcher.adapter_identity_tuple(to_runner),
+        )
         if len(route_matches) != 1:
             reason = "workforce_route_absent" if not route_matches else "workforce_route_ambiguous"
             return _lifecycle_error(

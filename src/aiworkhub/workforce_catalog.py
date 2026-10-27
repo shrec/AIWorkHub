@@ -175,6 +175,51 @@ def execution_runner(worker_id: str, adapter_id: str) -> str:
     return f"{candidate[:115].rstrip('_.:-')}_{digest}"
 
 
+def match_reroute_routes(
+    workers: Iterable[Mapping[str, Any]],
+    to_runner: str,
+    to_adapter_id: str,
+    identity_tuple: tuple[str, ...],
+) -> tuple[list[Mapping[str, Any]], str]:
+    """Select the catalog rows a reroute target names, and the runner to record.
+
+    A row is named by its ``execution_runner``; NF-2026-01602 also lets any
+    member of the runner's identity tuple select that runner's single row.
+    NF-2026-01761: when no row carries ``to_runner`` as its execution runner,
+    the catalog ``worker_id`` (``xai_grok-4.7``) selects rows on the requested
+    adapter and the canonical ``execution_runner`` (never the worker_id) is
+    returned.  Zero or several rows stay the caller's refusal.
+    """
+
+    rows = list(workers)
+    runner_routes = [
+        route for route in rows if str(route.get("execution_runner") or "") == to_runner
+    ]
+    route_matches = [
+        route
+        for route in runner_routes
+        if str(route.get("effective_adapter_id") or "") == to_adapter_id
+    ]
+    if (
+        not route_matches
+        and len(runner_routes) == 1
+        and to_adapter_id in identity_tuple
+        and str(runner_routes[0].get("effective_adapter_id") or "") in identity_tuple
+    ):
+        route_matches = runner_routes
+    if not runner_routes:
+        route_matches = [
+            route
+            for route in rows
+            if str(route.get("worker_id") or "") == to_runner
+            and str(route.get("effective_adapter_id") or "") == to_adapter_id
+            and str(route.get("execution_runner") or "")
+        ]
+    if len(route_matches) != 1:
+        return route_matches, to_runner
+    return route_matches, str(route_matches[0].get("execution_runner") or "") or to_runner
+
+
 _ANSI_ESCAPE_RE = re.compile(
     r"(?:\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_])"
 )
