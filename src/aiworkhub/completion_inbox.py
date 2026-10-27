@@ -275,6 +275,51 @@ def _enrich_artifact_target_cards(
     return read_errors, not complete
 
 
+def _fetch_batched_cards(
+    status: str,
+    topic: str | None,
+    limit: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """READ-ONLY production path of ``_fetch_full_cards`` (NF-2026-00632).
+
+    One repository-bound ``task_store.list_task_cards`` snapshot replaces
+    ``core.list_tasks`` plus one ``core.show_task`` per returned row, with the
+    same status/topic/limit/newest-first selection and the same card dicts.
+    A row whose card cannot be decoded becomes the per-card path's ``show``
+    scoped error while every other card is still returned; a failed batch
+    read is a ``list`` scoped error, never an empty bucket.
+    """
+    decode_errors: list[dict[str, Any]] = []
+    try:
+        cards = task_store.list_task_cards(
+            core.repo_root(),
+            limit=limit,
+            status=status,
+            topic=topic,
+            decode_errors=decode_errors,
+        )
+    except Exception as exc:  # noqa: BLE001 -- bounded degrade, never re-raise
+        return [], [], [{
+            "scope": "list",
+            "status": status,
+            "topic": topic,
+            "error_kind": "exception",
+            "error_message": str(exc)[:200],
+        }]
+    fetch_errors: list[dict[str, Any]] = []
+    read_errors: list[dict[str, Any]] = []
+    for error in decode_errors:
+        message = str(error.get("error_message") or "")[:200]
+        fetch_errors.append({"task_id": error["task_id"], "error": message})
+        read_errors.append({
+            "scope": "show",
+            "task_id": error["task_id"],
+            "error_kind": error["error_kind"],
+            "error_message": message,
+        })
+    return cards, fetch_errors, read_errors
+
+
 def _fetch_full_cards(
     status: str,
     topic: str | None,
@@ -292,7 +337,8 @@ def _fetch_full_cards(
     The ``_list_tasks``/``_show_task`` kwargs exist ONLY for test stubbing;
     they are never used in production and do not weaken the read-only
     invariant (same pattern as ``review_summarizer.summarize_review_queue``'s
-    ``_run_taskctl``/``_show_task`` injection points).
+    ``_run_taskctl``/``_show_task`` injection points). With neither injected,
+    the bucket is read by ``_fetch_batched_cards`` in one snapshot instead.
 
     Bounded read-error handling (B280): both the LIST call and each SHOW call
     are guarded so a read-source failure degrades to a recorded error entry
@@ -310,6 +356,8 @@ def _fetch_full_cards(
     backward compatibility with existing consumers. ``read_errors`` is the new
     additive, scoped (list vs show) facet -- see ``build_completion_inbox``.
     """
+    if _list_tasks is None and _show_task is None:
+        return _fetch_batched_cards(status, topic, limit)
     list_fn = _list_tasks if _list_tasks is not None else core.list_tasks
     show_fn = _show_task if _show_task is not None else core.show_task
 

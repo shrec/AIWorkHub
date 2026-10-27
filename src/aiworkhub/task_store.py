@@ -1168,13 +1168,22 @@ def list_tasks(root: str | Path, *, status: str | None = None, limit: int = 500)
     return result
 
 
-def _decode_task_card(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
+def _decode_task_card(row: sqlite3.Row | Mapping[str, Any], *, strict: bool = False) -> dict[str, Any]:
+    """Decode one ``tasks`` row into its public card.
+
+    ``strict`` callers get the JSON error, or a ``ValueError`` for a non-object
+    ``card_json``, instead of the silently degraded column-only projection.
+    """
     card = dict(row)
     raw_card_json = card.pop("card_json", "{}")
     try:
         card_json = json.loads(raw_card_json or "{}")
     except json.JSONDecodeError:
+        if strict:
+            raise
         card_json = {}
+    if strict and not isinstance(card_json, dict):
+        raise ValueError("card_json is not a JSON object")
     if isinstance(card_json, dict):
         # Repair the public/read projection immediately even before the next
         # explicit initialize runs the durable compaction migration.
@@ -1188,13 +1197,22 @@ def _decode_task_card(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
     return card
 
 
-_TASK_CARDS_NEWEST_FIRST_SQL = (
-    "FROM (SELECT rowid AS rid, updated_at AS u FROM tasks "
+_TASK_CARDS_NEWEST_FIRST_TEMPLATE = (
+    "FROM (SELECT rowid AS rid, updated_at AS u FROM tasks{where} "
     "ORDER BY updated_at DESC LIMIT ?) s JOIN tasks t ON t.rowid = s.rid "
     "ORDER BY s.u DESC"
 )
 
+_TASK_CARDS_NEWEST_FIRST_SQL = _TASK_CARDS_NEWEST_FIRST_TEMPLATE.format(where="")
+
 _LIST_TASK_CARDS_SQL = "SELECT t.* " + _TASK_CARDS_NEWEST_FIRST_SQL
+
+# The topic ``list_tasks`` projects (column, else the card topic), guarded so a
+# malformed card_json cannot fail the whole filtered snapshot.
+_TASK_TOPIC_FILTER_SQL = (
+    "COALESCE(NULLIF(topic, ''), "
+    "CASE WHEN json_valid(card_json) THEN json_extract(card_json, '$.topic') END, '')"
+)
 
 _GET_TASKS_CHUNK = 500
 
@@ -1208,7 +1226,14 @@ def _db_path_for(root: str | Path, readiness: StorageReadiness | None) -> Path:
     return Path(readiness.canonical_db)
 
 
-def list_task_cards(root: str | Path, *, limit: int = 500) -> list[dict[str, Any]]:
+def list_task_cards(
+    root: str | Path,
+    *,
+    limit: int = 500,
+    status: str | None = None,
+    topic: str | None = None,
+    decode_errors: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Return bounded canonical task cards with one readiness check/query.
 
     Dashboard aggregates previously performed ``list_tasks`` followed by one
@@ -1216,15 +1241,49 @@ def list_task_cards(root: str | Path, *, limit: int = 500) -> list[dict[str, Any
     repositories that N+1 pattern made every dashboard refresh take tens of
     seconds. This batch reader preserves the identical canonical card decode
     while keeping the operation to one verified database snapshot.
+
+    ``status`` (canonical, ``"all"`` means unfiltered) and ``topic`` narrow the
+    snapshot with the predicates ``list_tasks``/``core.list_tasks`` apply,
+    newest ``updated_at`` first, before ``limit``. When ``decode_errors`` is a
+    list, a row whose card cannot be decoded is recorded there as
+    ``{"task_id", "error_kind", "error_message"}`` instead of aborting the
+    batch; every other row is still returned.
     """
     _readiness, db_path = _require_ready(root)
     bounded_limit = max(1, min(int(limit), 5000))
+    filters: list[str] = []
+    params: list[Any] = []
+    if status and status != "all":
+        filters.append(f"({_CANONICAL_STATUS_CASE_SQL}) = ?")
+        params.append(status)
+    if topic:
+        filters.append(f"{_TASK_TOPIC_FILTER_SQL} = ?")
+        params.append(topic)
+    query = (
+        "SELECT t.* "
+        + _TASK_CARDS_NEWEST_FIRST_TEMPLATE.format(where=" WHERE " + " AND ".join(filters))
+        if filters
+        else _LIST_TASK_CARDS_SQL
+    )
+    params.append(bounded_limit)
     conn = _connect(db_path, readonly=True)
     try:
-        rows = conn.execute(_LIST_TASK_CARDS_SQL, (bounded_limit,)).fetchall()
+        rows = conn.execute(query, params).fetchall()
     finally:
         conn.close()
-    return [_decode_task_card(row) for row in rows]
+    if decode_errors is None:
+        return [_decode_task_card(row) for row in rows]
+    cards: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            cards.append(_decode_task_card(row, strict=True))
+        except Exception as exc:  # noqa: BLE001 -- one bad row never aborts the batch
+            decode_errors.append({
+                "task_id": str(row["task_id"] or ""),
+                "error_kind": "json_parse_error" if isinstance(exc, json.JSONDecodeError) else "invalid_card",
+                "error_message": f"{type(exc).__name__}: {exc}"[:200],
+            })
+    return cards
 
 
 _LIST_TASK_ROUTING_FACTS_SQL = (
