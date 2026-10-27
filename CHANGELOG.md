@@ -6,6 +6,32 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.70] - 2026-10-27
+
+### Added
+
+- `aiworkhub_manager_source_graph_query` takes an optional `request_id`: queries read that review_ready candidate's sealed changed files composed over the canonical index, read-only; an unknown, not-ready or drifted request fails closed (NF-2026-01745).
+
+### Changed
+
+- The dashboard Semantic Edit dialog opens on the coverage rate with measured and unmeasured run counts, a six-stat grid and a per-runtime table; an all-zero runtime is dimmed and rows past 32 are captioned as truncated (NF-2026-01755).
+- Managed instructions name `scripts/manager_semantic_edit.py` only in a repository that has it; a client repository is pointed at `aiworkhub_manager_semantic_edit_prepare`/`_apply` (NF-2026-01743).
+
+### Fixed
+
+- Semantic edit takes one anchor for both ends of a single-line range, and a refused multi-line anchor names the missing field (NF-2026-01743).
+- Runtime temp GC keeps a deferred launch's directory while its supervisor is still pending; only a provably dead or recycled recorded process reclaims it (NF-2026-01738).
+- Under Landlock, a validation command that needs a multiprocessing `SemLock` gets a rule beneath the real `/dev/shm`, and the SemLock preflight runs under that same ruleset (NF-2026-01740).
+- Python quality-check rows resolve inside the Windows AppContainer lane, where directories above the granted interpreter cannot be inspected; a redirected path and batch wrappers still fail closed (NF-2026-01752).
+- A zero-change operational death of the current claim, newer than an older review rejection, reroutes in place instead of being refused for a missing rejection receipt (NF-2026-01747).
+- A repository root and its child map through one `subst` drive basis, so an in-repository child is no longer refused as `path_outside_repository` (NF-2026-01751).
+- A quality reviewer launch requires the exact target request id of the target task; a prefix, unknown or wrong-task id is refused before any attempt is reserved (NF-2026-01748).
+- `confirm_high_risk` is recorded as a manager confirmation, never as owner approval; a repository policy requiring owner approval is met only by the owner, and an unreadable policy fails closed (NF-2026-01742).
+- Worker MCP tools advertise Gemini-portable `inputSchema`s on both server paths: `$ref` inlined, non-portable keys dropped, null branches collapsed, and two live unions on one node fail closed. Argument validation still uses the unprojected models (NF-2026-01750).
+- Changed hunks past the reviewer segment cap fold into one truncated segment, so a large scattered diff no longer makes the reviewer refuse the whole source evidence row (NF-2026-01746).
+- A successful predecessor whose changed files exceed the 8 MiB inline delta cap carries into rework through content-addressed sidecar blobs, stream-verified on recovery and failing closed on drift (NF-2026-01739).
+- An opencode run that writes its tool calls as plain-text XML, with no structured tool part anywhere in the stream, is classified `provider_text_tool_call_protocol`, a transient route failure that allows a distinct-route retry (NF-2026-01749).
+
 ## [0.12.69] - 2026-10-27
 
 ### Added

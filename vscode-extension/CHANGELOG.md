@@ -1,5 +1,20 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.70 — 2026-10-27
+
+### Added
+
+- Bundled runtime 0.12.70: `aiworkhub_manager_source_graph_query` reads a review_ready candidate's sealed changed files through `request_id`, read-only and fail-closed on drift (NF-2026-01745).
+
+### Changed
+
+- The dashboard Semantic Edit dialog opens on the coverage rate with measured and unmeasured run counts, a six-stat grid and a per-runtime table (NF-2026-01755).
+- Bundled runtime 0.12.70: managed instructions name `scripts/manager_semantic_edit.py` only in a repository that has it (NF-2026-01743).
+
+### Fixed
+
+- Bundled runtime 0.12.70: semantic edit takes one anchor for a single-line range (NF-2026-01743); runtime temp GC keeps a deferred launch's directory (NF-2026-01738); Landlock `SemLock` rule beneath `/dev/shm` (NF-2026-01740); Python quality checks inside the AppContainer lane (NF-2026-01752); a zero-change operational death reroutes in place (NF-2026-01747); one `subst` drive basis for a repository and its child (NF-2026-01751); a quality reviewer launch needs the exact target request id (NF-2026-01748); `confirm_high_risk` is never owner approval (NF-2026-01742); Gemini-portable worker MCP `inputSchema`s (NF-2026-01750); changed hunks past the reviewer segment cap fold (NF-2026-01746); an over-cap successful predecessor carries into rework through sidecar blobs (NF-2026-01739); an opencode run that writes its tool calls as text is retried on another route (NF-2026-01749).
+
 ## 0.12.69 — 2026-10-27
 
 ### Added

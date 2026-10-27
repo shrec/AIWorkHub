@@ -23,9 +23,9 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.12.69
+## What's new in 0.12.70
 
-- MCP tool results carry their payload once, worker launches skip 20-43 s of repeated import parsing, and an idle dashboard redraws only the sections that changed. `review_packet` works for every review-ready card and lists what still blocks accept, the learning commit works for any repository layout, task-queue claim contention defers instead of failing the card, dashboard NeedFix actions work inside VS Code, and the process-tree kill never follows a recycled PID.
+- The manager can read a review candidate's changed files through Source Graph (`request_id`), semantic edit takes a single-line anchor, an opencode run that writes its tool calls as text is retried on another route, large reworks carry their predecessor's output, Gemini workers get portable tool schemas, and a manager high-risk confirmation is never recorded as owner approval. Landlock and AppContainer validation lanes run multiprocessing and Python quality checks, and the dashboard Semantic Edit window is redesigned.
 
 ## Review automation
 
