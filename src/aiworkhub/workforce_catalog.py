@@ -14,11 +14,12 @@ import os
 import re
 import stat
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
 from threading import Lock
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Iterator, Mapping
 
 from . import (
     cli_model_discovery,
@@ -33,7 +34,12 @@ from . import (
     task_store,
     workforce_router,
 )
-from .platform_io import posix_path_modes_supported
+from .platform_io import (
+    AdvisoryLockTimeout,
+    lock_fd,
+    posix_path_modes_supported,
+    unlock_fd,
+)
 
 
 # Editor (vscode_lm) routes seed a single capability row per provider; when the
@@ -479,6 +485,36 @@ def ensure_catalog(repo_root: Path | str) -> tuple[Path, bool]:
     return path, True
 
 
+@contextmanager
+def _catalog_update_lock(root: Path) -> Iterator[None]:
+    """Serialize catalog read-modify-write across threads and processes."""
+
+    path = catalog_path(root)
+    lock_path = path.with_name(f".{path.name}.lock")
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise WorkforceCatalogError(
+            f"workforce_catalog_lock_unavailable:{type(exc).__name__}"
+        ) from exc
+    acquired = False
+    try:
+        try:
+            lock_fd(fd, blocking=True)
+            acquired = True
+        except (AdvisoryLockTimeout, OSError) as exc:
+            raise WorkforceCatalogError("workforce_catalog_update_busy") from exc
+        yield
+    finally:
+        if acquired:
+            unlock_fd(fd)
+        os.close(fd)
+
+
 def _append_audit(root: Path, actor: Mapping[str, str], action: str, worker_id: str, revision: int) -> None:
     path = root / AUDIT_RELATIVE_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -509,6 +545,12 @@ def _append_audit(root: Path, actor: Mapping[str, str], action: str, worker_id: 
 
 
 def upsert_worker(repo_root: Path | str, worker: Mapping[str, Any], *, actor: Mapping[str, str]) -> dict[str, Any]:
+    root = Path(repo_root).resolve()
+    with _catalog_update_lock(root):
+        return _upsert_worker_locked(root, worker, actor=actor)
+
+
+def _upsert_worker_locked(repo_root: Path | str, worker: Mapping[str, Any], *, actor: Mapping[str, str]) -> dict[str, Any]:
     root = Path(repo_root).resolve()
     ensure_catalog(root)
     catalog = load_catalog(root)

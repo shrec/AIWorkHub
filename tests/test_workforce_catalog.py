@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from aiworkhub import (
     core,
@@ -132,6 +135,84 @@ def test_manager_upsert_is_bounded_audited_and_preserves_other_workers(tmp_path:
     audit = (root / workforce_catalog.AUDIT_RELATIVE_PATH).read_text(encoding="utf-8")
     assert "private-thread-1234567890" not in audit
     assert "glm-5.2" in audit
+
+
+def test_concurrent_upserts_of_different_workers_never_lose_an_update(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    root = _root(tmp_path)
+    workforce_catalog.ensure_catalog(root)
+    seeded = workforce_catalog.load_catalog(root)
+    r0 = int(seeded["revision"])
+    worker_a = next(w for w in seeded["workers"] if w["worker_id"] == "glm-5.2")
+    worker_b = next(w for w in seeded["workers"] if w["worker_id"] != "glm-5.2")
+    new_adjustment = float(worker_a["manager_score_adjustment"]) + 1.5
+    new_ceiling = 0.77 if float(worker_b["quality_ceiling"]) != 0.77 else 0.78
+    incoming_a = {**worker_a, "manager_score_adjustment": new_adjustment}
+    incoming_b = {**worker_b, "quality_ceiling": new_ceiling}
+
+    real_load = workforce_catalog.load_catalog
+    stale_snapshot_taken = threading.Event()
+
+    def gated_load(repo_root):
+        result = real_load(repo_root)
+        if sys._getframe(1).f_code.co_name == "ensure_catalog":
+            return result
+        name = threading.current_thread().name
+        if name == "upsert-a":
+            stale_snapshot_taken.wait(timeout=1.0)
+        elif name == "upsert-b":
+            stale_snapshot_taken.set()
+        return result
+
+    monkeypatch.setattr(workforce_catalog, "load_catalog", gated_load)
+    barrier = threading.Barrier(2)
+    results: dict[str, Any] = {}
+    errors: list[BaseException] = []
+
+    def run(name: str, incoming: dict[str, Any]) -> None:
+        try:
+            barrier.wait(timeout=10)
+            results[name] = workforce_catalog.upsert_worker(
+                root, incoming, actor={"role": "manager", "provider": "codex", "actor_id": name},
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=run, name="upsert-a", args=("upsert-a", incoming_a)),
+        threading.Thread(target=run, name="upsert-b", args=("upsert-b", incoming_b)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    monkeypatch.setattr(workforce_catalog, "load_catalog", real_load)
+
+    assert not errors
+    assert {t.is_alive() for t in threads} == {False}
+    revisions = {results["upsert-a"]["revision"], results["upsert-b"]["revision"]}
+    assert revisions == {r0 + 1, r0 + 2}
+    final = workforce_catalog.load_catalog(root)
+    assert final["revision"] == r0 + 2
+    by_id = {w["worker_id"]: w for w in final["workers"]}
+    assert by_id[worker_a["worker_id"]]["manager_score_adjustment"] == new_adjustment
+    assert by_id[worker_b["worker_id"]]["quality_ceiling"] == new_ceiling
+    audit_path = root / workforce_catalog.AUDIT_RELATIVE_PATH
+    records = [
+        json.loads(line)
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(records) == 2
+    assert {rec["revision"] for rec in records} == {r0 + 1, r0 + 2}
+    assert {rec["worker_id"] for rec in records} == {
+        worker_a["worker_id"],
+        worker_b["worker_id"],
+    }
+    for rec in records:
+        by_name = results["upsert-a" if rec["worker_id"] == worker_a["worker_id"] else "upsert-b"]
+        assert rec["revision"] == by_name["revision"]
 
 
 def test_default_claude_reviewer_declares_required_manager_context_tools() -> None:
