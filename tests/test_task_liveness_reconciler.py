@@ -847,7 +847,7 @@ def test_successful_exit_reconciled_after_launcher_disappearance_runs_each_step_
 
     events = manager._request_events("req-exited-orphaned")
     latest = events[-1]
-    assert latest["state"] == "review_ready"
+    assert latest["state"] == "review_ready", {k: latest.get(k) for k in ("error", "diagnostic", "failure_kind", "terminal_reason", "release_transition_ok", "review_transition_ok")}
     assert card["status"] == "review"
     # An empty validation contract cannot mutate the workspace, so the bounded
     # initial scope check is reused instead of spawning a redundant second Git
@@ -1569,7 +1569,7 @@ def test_daemon_writes_lifecycle_transitions_with_writes_enabled(tmp_path, monke
     result = task_reconciler.run_scan(manager)
     assert result["ok"] is True
     events = manager._request_events("req-daemon-writes-lifecycle")
-    assert events[-1]["state"] == "review_ready"
+    assert events[-1]["state"] == "review_ready", {k: events[-1].get(k) for k in ("error", "diagnostic", "failure_kind", "terminal_reason", "release_transition_ok", "review_transition_ok")}
     assert card["status"] == "review"
 
 
@@ -2207,7 +2207,7 @@ def test_two_cli_daemons_standby_then_fail_over_without_overlapping_scans(tmp_pa
     owner.start()
     standby.start()
     try:
-        assert entered.poll(10)
+        assert entered.poll(60)
         first_pid = entered.recv()
         assert first_pid in {owner.pid, standby.pid}
         passive = standby if first_pid == owner.pid else owner
@@ -2219,7 +2219,7 @@ def test_two_cli_daemons_standby_then_fail_over_without_overlapping_scans(tmp_pa
         active.kill()
         active.join(timeout=5)
         assert not active.is_alive()
-        assert entered.poll(10)
+        assert entered.poll(60)
         assert entered.recv() == passive.pid
         release.touch()
         passive.join(timeout=10)

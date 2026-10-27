@@ -4559,6 +4559,11 @@ def test_validation_only_replay_preserves_complete_toolchain_receipt_identity(
         "AIWORKHUB_TOOLCHAIN_AUTHORITY_HMAC_KEY",
         "hex:" + ("ce" * 32),
     )
+    monkeypatch.setattr(
+        process_launcher.ProcessManager,
+        "_terminal_authority_key",
+        lambda self: b"t" * 32,
+    )
     request_id = "validation-replay-receipt-1"
     predecessor_id = "validation-replay-predecessor-1"
     digest = "a" * 64
@@ -5029,6 +5034,11 @@ def test_isolated_validation_only_replay_never_resolves_or_starts_provider(
     monkeypatch, tmp_path
 ):
     _open_gates(monkeypatch)
+    monkeypatch.setattr(
+        process_launcher.ProcessManager,
+        "_terminal_authority_key",
+        lambda self: b"t" * 32,
+    )
     repo = tmp_path / "repo"
     repo.mkdir()
     workspace_dir = tmp_path / "workspace"

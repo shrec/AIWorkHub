@@ -205,14 +205,15 @@ class _GcSelf:
         self._lock = threading.Lock()
         self._latest = latest
 
-    def _active_request_ids(self) -> set[str]:
+    def _active_request_ids(self, latest: dict[str, dict[str, Any]] | None = None) -> set[str]:
         return set()
 
     def _request_lock(self, request_id: str) -> Any:
         return nullcontext()
 
-    def _latest_by_request(self) -> dict[str, dict[str, Any]]:
-        return {"req-1": self._latest}
+    def _request_events(self, request_id: str) -> list[dict[str, Any]]:
+        # NF-2026-01730: a direct call re-checks this one request's own history.
+        return [self._latest] if request_id == "req-1" else []
 
 
 def test_gc_moved_body_observes_a_process_launcher_monkeypatch(

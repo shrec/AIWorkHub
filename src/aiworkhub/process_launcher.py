@@ -85,7 +85,7 @@ from .process_launcher_launch_isolated import spawn_with_stdin_payload as _spawn
 from .process_launcher_vscode_lm_tool import (
     invoke_vscode_lm_worker_tool_bound as _invoke_vscode_lm_worker_tool_bound_impl,
 )
-from .process_launcher_workspace_gc import gc_finalized_workspace as _gc_finalized_workspace_impl
+from .process_launcher_workspace_gc import GcSweepSnapshot, gc_finalized_workspace as _gc_finalized_workspace_impl
 from .worktree_retention_rule import WORKTREE_RETENTION_RULE_VERSION, record_rule_version, superseded_reason
 from .launch_replay_guard import (
     CARD_CONTENT_IDENTITY_KEYS,
@@ -10267,11 +10267,6 @@ class ProcessManager:
         )
         result = self._reconcile_persisted_requests()
         result["ambiguous_claims_recovered"] = ambiguous_claims_recovered
-        gc_result: dict[str, Any] = (
-            self._gc_finalized_workspaces()
-            if include_gc
-            else {"gc_scanned": 0, "gc_cleaned": 0, "gc_skipped": 0}
-        )
         review_result: dict[str, Any] = dict(attempted=0, completed=0, failed=0, pending=0, review_actions={})
         review_db = review_orchestrator.canonical_review_db(self)
         if review_db is None:
@@ -10288,6 +10283,15 @@ class ProcessManager:
             # DEFAULT_DRAIN_MAX_ACTIONS -- this call simply stops asking for one
             # twelfth of it.
             review_result = driver.drain().as_dict()
+        # Reviewers launch BEFORE the housekeeping sweep (NF-2026-01730): behind
+        # a 1321.7 s gc_included sweep no review_ready card's reviewer could
+        # start for ~22 minutes. GC frees only finalized worker worktrees, never
+        # reviewer capacity, so no second drain follows it.
+        gc_result: dict[str, Any] = (
+            self._gc_finalized_workspaces()
+            if include_gc
+            else {"gc_scanned": 0, "gc_cleaned": 0, "gc_skipped": 0}
+        )
         return {
             "ok": True,
             "reservations_retired": reservations_retired,
@@ -10335,8 +10339,13 @@ class ProcessManager:
         cleaned = 0
         skipped = 0
         failures: list[dict[str, str]] = []
+        # ONE full projection read per sweep (NF-2026-01730): each candidate's
+        # under-lock re-check folds only the ledger bytes appended after this
+        # base generation, taken before the read so nothing lands unseen.
+        generation = self._ledger_generation()
+        snapshot = None if generation is None else GcSweepSnapshot(self.process_log_path, generation)
         for request_id, event in list(self._latest_by_request().items()):
-            result = self._gc_finalized_workspace(request_id, event)
+            result = self._gc_finalized_workspace(request_id, event, snapshot=snapshot)
             if result is None:
                 continue
             scanned += 1
@@ -10568,13 +10577,13 @@ class ProcessManager:
         return refreshed, disposition
 
     def _gc_finalized_workspace(
-        self, request_id: str, event: dict[str, Any]
+        self, request_id: str, event: dict[str, Any], *, snapshot: GcSweepSnapshot | None = None
     ) -> dict[str, Any] | None:
         """Delete only a finalized task's retained, proven-dead workspace.
 
         Delegation to :func:`process_launcher_workspace_gc.gc_finalized_workspace`.
         """
-        return _gc_finalized_workspace_impl(self, request_id, event)
+        return _gc_finalized_workspace_impl(self, request_id, event, snapshot=snapshot)
 
     def _finalize_isolated_request(
         self,
