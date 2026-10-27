@@ -5574,6 +5574,12 @@ class ProcessManager:
         card. Passing them keeps the exact prior behavior -- an explicit value is
         never overridden. Identity remains explicitly validated either way.
         """
+        oversized = len(owner_prompt.strip().encode("utf-8")) > MAX_OWNER_PROMPT_BYTES
+        if oversized and reserved_request_id is None:  # NF-2026-01728: pre-claim refusal
+            return self._blocked(
+                task_id, str(runner or ""), str(topic or ""), str(adapter_id or ""),
+                "owner_prompt_too_large", state="refused",
+            )
         identity_derivation: dict[str, Any] | None = None
         if not (runner and topic and adapter_id):
             try:
@@ -5594,11 +5600,7 @@ class ProcessManager:
                 # the card stays pending, never projected as blocked.
                 reason = str(exc)
                 return self._blocked(
-                    task_id,
-                    str(runner or ""),
-                    str(topic or ""),
-                    str(adapter_id or ""),
-                    reason,
+                    task_id, str(runner or ""), str(topic or ""), str(adapter_id or ""), reason,
                     state="refused" if reason.startswith(
                         ("launch_identity_underivable", "launch_adapter_underivable")
                     ) else "blocked",

@@ -694,6 +694,32 @@ def test_launch_refuses_an_underivable_identity_before_the_claim(
     assert shown["claim_epoch"] == 0
 
 
+def test_launch_refuses_an_oversized_owner_prompt_before_the_claim(tmp_path, monkeypatch):
+    card = _launchable_card(
+        task_id="T_OVERSIZED_PROMPT",
+        runner="claude_opus-5",
+        topic="coding",
+        status="pending",
+        worker_status="unclaimed",
+        claim_epoch=0,
+    )
+    before = json.loads(json.dumps(card))
+    manager = _derivation_manager(tmp_path, card)
+    _refuse_any_claim(manager, monkeypatch)
+    result = manager.launch(
+        task_id="T_OVERSIZED_PROMPT",
+        owner_prompt="x" * (process_launcher.MAX_OWNER_PROMPT_BYTES + 1),
+    )
+    assert result["ok"] is False
+    assert "owner_prompt_too_large" in result["blocked_reason"]
+    assert result["state"] == "refused"
+    assert card == before
+    shown = json.loads(manager._show_task("T_OVERSIZED_PROMPT")["stdout"])
+    assert shown["status"] == "pending"
+    assert shown["worker_status"] == "unclaimed"
+    assert shown["claim_epoch"] == 0
+
+
 def test_launch_derives_claude_cli_for_the_bare_claude_runner(tmp_path, monkeypatch):
     """NF-2026-01125: runner ``claude`` with no adapter_id launches on claude_cli."""
     card = _launchable_card(task_id="T_BARE_CLAUDE", runner="claude")
