@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from aiworkhub import attempt_artifacts, task_store, worker_workspace
+from aiworkhub import attempt_artifacts, rework_delta_artifact, task_store, worker_workspace
 from aiworkhub import successful_rework_recovery as recovery
 
 LARGE_BYTES = 40 * 1024 * 1024
@@ -280,6 +280,7 @@ def test_resealing_reuses_the_same_content_addressed_blob(large_episode):
 
 def test_the_carried_cap_fails_closed_with_an_explicit_error(large_episode, monkeypatch):
     monkeypatch.setattr(worker_workspace, "MAX_REWORK_CARRIED_BYTES", LARGE_BYTES - 1)
+    monkeypatch.setattr(rework_delta_artifact, "MAX_REWORK_CARRIED_BYTES", LARGE_BYTES - 1)
     with pytest.raises(recovery.SuccessfulReworkRecoveryError, match="successful_rework_carried_bytes_exceeds_limit"):
         recovery.capture_candidate_paths(large_episode.workspace, [LARGE])
     carried = recovery.DigestCarriedContent(LARGE, large_episode.large_sha, LARGE_BYTES, large_episode.workspace)

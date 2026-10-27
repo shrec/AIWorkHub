@@ -8,7 +8,9 @@ from pathlib import Path
 # a line of explanation had to either shed one elsewhere or take a subject out.
 # 14414 -> 14148 when the provider-output failure classifiers moved out of
 # process_launcher; worker_workspace is now the largest module.
-MAX_AIWORKHUB_MODULE_LINES = 14148
+# 14148 -> 13924 when the rework-delta artifact block moved out of
+# worker_workspace into rework_delta_artifact; core is now the largest module.
+MAX_AIWORKHUB_MODULE_LINES = 13924
 
 
 def test_aiworkhub_python_modules_stay_below_size_ratchet():

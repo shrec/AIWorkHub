@@ -656,6 +656,8 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "windows_mxc.py",
         "rework_overlay_packet.py",
         "worker_workspace.py",
+        # ...and its rework-delta artifact block, re-exported at module end (NF-2026-01757).
+        "rework_delta_artifact.py",
         # worker_workspace imports its C/C++ include-seed helpers from here
         # (NF-2026-01156-RATCHET).
         "worker_workspace_include_seed.py",

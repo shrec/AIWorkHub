@@ -11,7 +11,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from aiworkhub import attempt_artifacts, core, process_launcher, runtime_temp, task_store, worker_workspace
+from aiworkhub import (
+    attempt_artifacts,
+    core,
+    process_launcher,
+    rework_delta_artifact,
+    runtime_temp,
+    task_store,
+    worker_workspace,
+)
 from aiworkhub import successful_rework_recovery as recovery
 
 
@@ -230,6 +238,7 @@ def test_external_runtime_root_is_supported(episode, tmp_path, monkeypatch, requ
     episode.bundle = external / "process_logs" / "processes" / "attempt-artifacts" / episode.request_id
     episode.evidence["workspace"]["path"] = str(episode.workspace)
     monkeypatch.setattr(worker_workspace, "configured_runtime_root", lambda repo: external)
+    monkeypatch.setattr(rework_delta_artifact, "configured_runtime_root", lambda repo: external)
     _republish(episode)
     descriptor = _seal(episode)
     assert Path(descriptor["artifact_path"]).is_relative_to(external)
