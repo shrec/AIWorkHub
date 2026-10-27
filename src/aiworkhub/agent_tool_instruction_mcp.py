@@ -97,7 +97,9 @@ def _read_owner(repo_root: Path, provider: str) -> str:
 def _write_plan(repo_root: Path, provider: str) -> dict[str, Any]:
     """Build and return an inert apply plan."""
     owner = _read_owner(repo_root, provider)
-    return instr.build_apply_plan(provider, owner)
+    return instr.build_apply_plan(
+        provider, owner, manager_edit_script=instr.manager_edit_script_present(repo_root)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +124,9 @@ def preview(
     for p in providers:
         _provider_path(root, p)  # raises on escape / unknown
         plan = _write_plan(root, p)
-        diff = instr.diff_projection(p, _read_owner(root, p))
+        diff = instr.diff_projection(
+            p, _read_owner(root, p), manager_edit_script=instr.manager_edit_script_present(root)
+        )
         plans[p] = {
             "ok": plan["ok"],
             "reason": plan["reason"],
@@ -187,7 +191,8 @@ def apply(
     root = _repo_root(repo_root)
     path = _provider_path(root, provider)
     owner = _read_owner(root, provider)
-    plan = instr.build_apply_plan(provider, owner)
+    script = instr.manager_edit_script_present(root)
+    plan = instr.build_apply_plan(provider, owner, manager_edit_script=script)
 
     result: dict[str, Any] = {
         "ok": plan["ok"],
@@ -207,7 +212,7 @@ def apply(
         return result
 
     if not write:
-        result["diff"] = instr.diff_projection(provider, owner)
+        result["diff"] = instr.diff_projection(provider, owner, manager_edit_script=script)
         result["would_change"] = plan["planned_text"] != plan["current_text"]
         return result
 

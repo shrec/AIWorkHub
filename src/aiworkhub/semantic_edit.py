@@ -376,16 +376,24 @@ def _anchor_shown(line: str) -> str:
 
 def _validated_anchors(
     relative: str, expected_first_line: object, expected_last_line: object,
+    *, single_line: bool,
 ) -> tuple[str, str] | None:
     """Return both stripped anchors, or ``None`` when neither was given.
 
-    One anchor alone cannot tell a shifted range from a resized one, so it is
-    refused rather than half-checked.
+    On a multi-line range one anchor alone cannot tell a shifted range from a
+    resized one, so it is refused, naming the missing field, rather than
+    half-checked.  On a single-line range the first and last line are the same
+    line, so one anchor is complete and stands for both (NF-2026-01743).
     """
     if expected_first_line is None and expected_last_line is None:
         return None
     if expected_first_line is None or expected_last_line is None:
-        raise SemanticEditError(f"semantic_edit_anchor_incomplete:{relative}")
+        if not single_line:
+            missing = "expected_first_line" if expected_first_line is None else "expected_last_line"
+            raise SemanticEditError(f"semantic_edit_anchor_incomplete:{relative}:missing={missing}")
+        expected_first_line = expected_last_line = (
+            expected_last_line if expected_first_line is None else expected_first_line
+        )
     if not isinstance(expected_first_line, str) or not isinstance(expected_last_line, str):
         raise SemanticEditError(f"semantic_edit_anchor_invalid:{relative}")
     return _anchor_text(expected_first_line), _anchor_text(expected_last_line)
@@ -480,7 +488,10 @@ def prepare_line_target(
     if not path_is_allowed(relative, allowed_writes):
         raise SemanticEditError(f"semantic_edit_path_not_allowed:{relative}")
     start_line, end_line = _validated_line_bounds(start_line, end_line)
-    anchors = _validated_anchors(relative, expected_first_line, expected_last_line)
+    anchors = _validated_anchors(
+        relative, expected_first_line, expected_last_line,
+        single_line=start_line == end_line,
+    )
     resolve_existing_file(root, relative)
     with held_path(root, relative):
         target = resolve_existing_file(root, relative)

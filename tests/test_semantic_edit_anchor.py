@@ -281,25 +281,30 @@ def test_both_empty_anchors_never_relocate(tmp_path: Path, blank: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "anchors",
+    ("anchors", "missing"),
     [
-        {"expected_first_line": "line_10 = 10"},
-        {"expected_last_line": "line_10 = 10"},
-        {"expected_first_line": "", "expected_last_line": None},
+        ({"expected_first_line": "line_10 = 10"}, "expected_last_line"),
+        ({"expected_last_line": "line_12 = 12"}, "expected_first_line"),
+        ({"expected_first_line": "", "expected_last_line": None}, "expected_last_line"),
     ],
     ids=["first_only", "last_only", "empty_first_only"],
 )
-def test_a_single_anchor_is_refused(tmp_path: Path, anchors: dict[str, Any]) -> None:
+def test_a_single_anchor_is_refused_on_a_multi_line_range(
+    tmp_path: Path, anchors: dict[str, Any], missing: str,
+) -> None:
+    # A single-line range takes one anchor (NF-2026-01743,
+    # tests/test_semantic_edit_single_line_anchor_nf01743.py).
     _write(tmp_path)
+    reason = f"semantic_edit_anchor_incomplete:src/module.py:missing={missing}"
     with pytest.raises(semantic_edit.SemanticEditError) as excinfo:
-        _prepare(tmp_path, 10, 10, **anchors)
-    assert str(excinfo.value) == "semantic_edit_anchor_incomplete:src/module.py"
+        _prepare(tmp_path, 10, 12, **anchors)
+    assert str(excinfo.value) == reason
 
-    refused = _session(tmp_path).prepare(file_path=_PATH, start_line=10, end_line=10, **anchors)
+    refused = _session(tmp_path).prepare(file_path=_PATH, start_line=10, end_line=12, **anchors)
     assert refused == {
         "ok": False,
         "tool": "semantic_edit_prepare",
-        "reason": "semantic_edit_anchor_incomplete:src/module.py",
+        "reason": reason,
     }
 
 

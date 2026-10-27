@@ -104,7 +104,10 @@ def test_contract_consistency_uses_generated_projections(tmp_path: Path) -> None
     for provider in instructions.PROVIDERS:
         path = tmp_path / provider
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(instructions.render_projection(provider), encoding="utf-8")
+        path.write_text(
+            instructions.render_projection(provider, manager_edit_script=False),
+            encoding="utf-8",
+        )
     report = evidence.contract_consistency_check(tmp_path)
     assert report["status"] == "pass"
     (tmp_path / "CLAUDE.md").write_text("# drift\n", encoding="utf-8")

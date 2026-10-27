@@ -9,6 +9,7 @@ from __future__ import annotations
 import difflib
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 # The enforced raw-discovery vocabulary and the per-adapter enforcement
@@ -138,14 +139,38 @@ RAW_DISCOVERY_NATIVE_TOOLS = ", ".join(
 )
 
 
-CLAUDE_MANAGER_PREAMBLE = """Claude Code manager role (read before the protocol below): every direct Claude chat holds this seat.
+# The manager edit CLI exists only in the AIWorkHub repository itself; a client
+# repository gets the manager MCP edit pair instead (NF-2026-01743).  The CLI
+# line stays the default so this repository's checked-in documents render
+# byte-identically; callers that know the target repository pass
+# ``manager_edit_script=`` whether ``MANAGER_EDIT_SCRIPT`` exists there.
+MANAGER_EDIT_SCRIPT = "scripts/manager_semantic_edit.py"
+
+
+def manager_edit_script_present(root: Path) -> bool:
+    return (Path(root) / MANAGER_EDIT_SCRIPT).is_file()
+
+
+_MANAGER_EDIT_SCRIPT_LINE = (
+    f"- Make the seat's small corrections with {MANAGER_EDIT_SCRIPT} --path --start --end"
+    " (replacement on stdin): it replaces one hash-verified line range and never"
+    " rewrites a file. The manager does not correct by whole-string rewrite."
+)
+_MANAGER_EDIT_MCP_LINE = (
+    "- Make the seat's small corrections with aiworkhub_manager_semantic_edit_prepare"
+    " then aiworkhub_manager_semantic_edit_apply: it replaces one hash-verified line"
+    " range and never rewrites a file. The manager does not correct by whole-string"
+    " rewrite."
+)
+
+CLAUDE_MANAGER_PREAMBLE = f"""Claude Code manager role (read before the protocol below): every direct Claude chat holds this seat.
 Claude Code manager startup (mandatory when AIWorkHub MCP is available):
 - Before Read, Grep, Glob, Bash or filesystem discovery, call aiworkhub_manager_bootstrap.
 - Continue only when repository identity and manager route are verified.
 - The verified bootstrap/repository_current repository outranks host cwd, workspace_roots and environment_context; on mismatch stop before filesystem access, switch/reload the route and never inspect the hinted repository.
 - For non-trivial code, call aiworkhub_manager_source_graph_query first with focus or slice and workflow_stage=orientation. Re-query when the symbol, boundary, hypothesis or stage changes.
 - Built-in Read and Write are denied on indexed files for every seat, the manager included: read with Source Graph mode="body" for a symbol or mode="file" target=<exact path> query="START-END" for a line window (bodygrep gives line numbers); edit with semantic edit; Write only creates new files. A bounded Read is allowed only after Source Graph reports the target unsupported or unindexed; record that reason.
-- Make the seat's small corrections with scripts/manager_semantic_edit.py --path --start --end (replacement on stdin): it replaces one hash-verified line range and never rewrites a file. The manager does not correct by whole-string rewrite.
+{_MANAGER_EDIT_SCRIPT_LINE}
 - If bootstrap or required Source Graph is unavailable, report the MCP problem instead of silently bypassing AIWorkHub.
 - Direct Claude chats use manager tools; launched task workers use worker tools.
 - The seat's duties are the "Manager role:" rules of the policy below; they are stated once, there.
@@ -700,13 +725,30 @@ def render_canonical(policy: ToolPolicy = POLICY) -> str:
     return text
 
 
-def render_projection(provider: Provider, policy: ToolPolicy = POLICY) -> str:
-    """Render one deterministic provider projection from the same policy."""
+def claude_manager_preamble(*, manager_edit_script: bool = True) -> str:
+    """The Claude manager preamble, naming the edit CLI only where it exists."""
+
+    if manager_edit_script:
+        return CLAUDE_MANAGER_PREAMBLE
+    return CLAUDE_MANAGER_PREAMBLE.replace(_MANAGER_EDIT_SCRIPT_LINE, _MANAGER_EDIT_MCP_LINE, 1)
+
+
+def render_projection(
+    provider: Provider, policy: ToolPolicy = POLICY, *, manager_edit_script: bool = True,
+) -> str:
+    """Render one deterministic provider projection from the same policy.
+
+    ``manager_edit_script`` says whether ``MANAGER_EDIT_SCRIPT`` exists in the
+    target repository; without it the manager is pointed at the MCP edit pair.
+    """
 
     if provider not in PROVIDERS:
         raise ValueError(f"unsupported_provider:{provider}")
     body = render_canonical(policy)
-    provider_preamble = CLAUDE_MANAGER_PREAMBLE if provider == "CLAUDE.md" else ""
+    provider_preamble = (
+        claude_manager_preamble(manager_edit_script=manager_edit_script)
+        if provider == "CLAUDE.md" else ""
+    )
     text = f"{START}\nTarget: {provider}\n{provider_preamble}{body}{END}\n"
     _assert_size(f"projection:{provider}", text, PROJECTION_MAX_BYTES)
     return text
@@ -775,7 +817,9 @@ def managed_policy_rule_lines(policy: ToolPolicy = POLICY) -> frozenset[str]:
     return frozenset(
         line
         for provider in PROVIDERS
-        for line in render_projection(provider, policy).splitlines()
+        # Both manager-edit variants: either is a managed rule line wherever parked.
+        for script in (True, False)
+        for line in render_projection(provider, policy, manager_edit_script=script).splitlines()
         if line and line not in (START, END)
     )
 
@@ -905,10 +949,13 @@ def _assemble(before: str, block: str, after: str, *, managed: bool) -> str:
     return before.rstrip() + ("\n\n" if before.strip() else "") + block
 
 
-def build_apply_plan(provider: Provider, owner_text: str, policy: ToolPolicy = POLICY) -> dict[str, Any]:
+def build_apply_plan(
+    provider: Provider, owner_text: str, policy: ToolPolicy = POLICY,
+    *, manager_edit_script: bool = True,
+) -> dict[str, Any]:
     """Return a non-mutating managed-block apply plan."""
 
-    block = render_projection(provider, policy)
+    block = render_projection(provider, policy, manager_edit_script=manager_edit_script)
     inspection = inspect_document(owner_text)
     if inspection["fail_closed"]:
         return {
@@ -948,10 +995,13 @@ def build_apply_plan(provider: Provider, owner_text: str, policy: ToolPolicy = P
     }
 
 
-def diff_projection(provider: Provider, owner_text: str, policy: ToolPolicy = POLICY) -> str:
+def diff_projection(
+    provider: Provider, owner_text: str, policy: ToolPolicy = POLICY,
+    *, manager_edit_script: bool = True,
+) -> str:
     """Return a unified diff for the inert apply plan."""
 
-    plan = build_apply_plan(provider, owner_text, policy)
+    plan = build_apply_plan(provider, owner_text, policy, manager_edit_script=manager_edit_script)
     return "".join(
         difflib.unified_diff(
             owner_text.splitlines(keepends=True),
@@ -967,6 +1017,7 @@ __all__ = [
     "CLAUDE_MANAGER_PREAMBLE",
     "END",
     "MANAGER_CONTEXT_GRAPH_TOOL_NAMES",
+    "MANAGER_EDIT_SCRIPT",
     "OutsideScan",
     "PARALLEL_TOOL_CALLS_INSTRUCTION",
     "POLICY",
@@ -983,6 +1034,7 @@ __all__ = [
     "WORKER_SUBSTITUTION_BLOCK",
     "ToolPolicy",
     "build_apply_plan",
+    "claude_manager_preamble",
     "diff_projection",
     "inspect_document",
     "managed_policy_rule_lines",

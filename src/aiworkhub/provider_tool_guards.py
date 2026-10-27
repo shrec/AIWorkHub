@@ -292,7 +292,9 @@ def apply_repository_guards(repo_root: Path, *, read_only: bool = False) -> dict
         if not path.is_relative_to(root):
             raise ProviderGuardError(f"provider_path_escape:{provider}")
         owner = path.read_text(encoding="utf-8") if path.exists() else ""
-        plan = instructions.build_apply_plan(provider, owner)
+        plan = instructions.build_apply_plan(
+            provider, owner, manager_edit_script=instructions.manager_edit_script_present(root)
+        )
         if not plan["ok"]:
             raise ProviderGuardError(f"provider_policy_invalid:{provider}:{plan['reason']}")
         if plan["planned_text"] != owner:

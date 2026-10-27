@@ -35,6 +35,9 @@ def test_repository_root_regression_fails_on_projection_drift(tmp_path: Path) ->
         destination = tmp_path / provider
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    script = tmp_path / instructions.MANAGER_EDIT_SCRIPT
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("", encoding="utf-8")
 
     clean_report = evidence.contract_consistency_check(tmp_path)
     assert clean_report["status"] == "pass"

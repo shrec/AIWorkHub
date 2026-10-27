@@ -197,7 +197,9 @@ def contract_consistency_check(repo_root: Path | str) -> dict[str, Any]:
     blockers: list[str] = []
     for provider in agent_tool_instructions.PROVIDERS:
         path = root / provider
-        expected = agent_tool_instructions.render_projection(provider)
+        expected = agent_tool_instructions.render_projection(
+            provider, manager_edit_script=agent_tool_instructions.manager_edit_script_present(root)
+        )
         try:
             current = path.read_text(encoding="utf-8")
         except OSError:
