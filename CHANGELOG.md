@@ -16,6 +16,7 @@ noted by package/extension version and release tag.
 
 - The dashboard Semantic Edit dialog opens on the coverage rate with measured and unmeasured run counts, a six-stat grid and a per-runtime table; an all-zero runtime is dimmed and rows past 32 are captioned as truncated (NF-2026-01755).
 - Managed instructions name `scripts/manager_semantic_edit.py` only in a repository that has it; a client repository is pointed at `aiworkhub_manager_semantic_edit_prepare`/`_apply` (NF-2026-01743).
+- The rework-delta artifact block moved out of `worker_workspace.py` into `rework_delta_artifact.py`, and the quality-review source evidence builder moved out of `process_launcher.py` into `process_launcher_source_evidence.py`; the module size ratchet drops to 13924 lines (NF-2026-01757, NF-2026-01758).
 
 ### Fixed
 
