@@ -611,12 +611,13 @@ def _retention_census_modules(primary_tree: ast.AST):
     ``accept_review`` was extracted out of ``process_launcher`` into its own
     module; its two retention constructions went with it.  The guarantee is
     about the code, not about one file, so the census follows the code.  A
-    further extraction adds its module here.
+    further extraction adds its module here: ``workspace_gc`` took the three
+    finalized-workspace GC retention events with it.
     """
-    from aiworkhub import process_launcher_accept_review
+    from aiworkhub import process_launcher_accept_review, process_launcher_workspace_gc
 
     yield "process_launcher", primary_tree, True
-    for module in (process_launcher_accept_review,):
+    for module in (process_launcher_accept_review, process_launcher_workspace_gc):
         yield (
             module.__name__.rsplit(".", 1)[-1],
             ast.parse(Path(module.__file__).read_text(encoding="utf-8")),
