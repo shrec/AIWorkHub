@@ -345,10 +345,13 @@ assert.doesNotMatch(css, /html\s*\{[^}]*overflow:\s*hidden/);
 
   harness.semantic.click();
   assert.strictEqual(harness.title.textContent, "Semantic Edit");
+  // NF-2026-01755: structured window, not the run-on breakdown line.
   assert.match(harness.body.textContent, /46 unmeasured/);
-  assert.match(harness.body.textContent, /codex_cli 9 measured\/12 unmeasured/);
-  assert.match(harness.body.textContent, /gemini_cli 2 measured\/14 unmeasured/);
-  assert.match(harness.body.textContent, /22 paths/);
+  assert.match(harness.body.textContent, /codex_cli/);
+  assert.match(harness.body.textContent, /gemini_cli/);
+  assert.match(harness.body.textContent, /Changed paths/);
+  assert.doesNotMatch(harness.body.textContent, /codex_cli 9 measured\/12 unmeasured/);
+  assert.doesNotMatch(harness.body.textContent, /22 paths/);
 
   const close = { dataset: { closeDialog: "coding-foundation-dialog" } };
   harness.dialog.click(harness.dialog);

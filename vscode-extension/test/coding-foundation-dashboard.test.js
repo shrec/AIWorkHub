@@ -502,3 +502,121 @@ console.log("coding foundation dashboard: ok");
   }, cards);
   assert.strictEqual(cards.development_rules.value.textContent, "20 rules");
 }
+
+// NF-2026-01755: the Semantic Edit dialog is a structured window (headline,
+// stat grid, one row per runtime), never the breakdown joined into one line.
+{
+  function node(tagName) {
+    const self = {
+      tagName: tagName || "", className: "", style: {}, attrs: {}, dataset: {},
+      children: [], ownText: "", listeners: {},
+      setAttribute(name, value) { this.attrs[name] = value; },
+      getAttribute(name) { return this.attrs[name]; },
+      addEventListener(type, fn) { (this.listeners[type] = this.listeners[type] || []).push(fn); },
+      appendChild(child) { this.children.push(child); return child; },
+    };
+    Object.defineProperty(self, "textContent", {
+      get() { return self.ownText + self.children.map((child) => child.textContent).join(""); },
+      set(value) { self.ownText = String(value); self.children = []; },
+    });
+    Object.defineProperty(self, "innerHTML", {
+      set() { throw new Error("innerHTML must never be used for KPI text"); },
+    });
+    return self;
+  }
+  function walk(root, out = []) {
+    for (const child of root.children) { out.push(child); walk(child, out); }
+    return out;
+  }
+  function drive(projection) {
+    const ids = {};
+    for (const kind of internals.CODING_FOUNDATION_CARD_KEYS) {
+      const id = `header-${kind.replace(/_/g, "-")}`;
+      ids[id] = node("button");
+      ids[`${id}-value`] = node("strong");
+      ids[`${id}-detail`] = node("span");
+    }
+    ids["coding-foundation-dialog"] = node("dialog");
+    ids["coding-foundation-dialog-title"] = node("h2");
+    ids["coding-foundation-dialog-summary"] = node("p");
+    ids["coding-foundation-dialog-body"] = node("div");
+    let onMessage = null;
+    const win = {
+      addEventListener(type, listener) { if (type === "message") onMessage = listener; },
+    };
+    vm.runInNewContext(internals.codingFoundationDashboardSource(), {
+      document: { getElementById: (id) => ids[id] || null, createElement: (tag) => node(String(tag).toUpperCase()) },
+      window: win,
+    });
+    onMessage({ data: { type: "snapshot", payload: { snapshot_mode: "full", semantic_edit_coverage: projection } } });
+    win.openCodingFoundationDialog("semantic_edit_coverage");
+    return { body: ids["coding-foundation-dialog-body"], card: ids["header-semantic-edit-coverage"] };
+  }
+  const classOf = (n) => String(n.className || "").split(/\s+/);
+  const textsOf = (nodes) => nodes.map((n) => n.textContent);
+
+  const { body, card } = drive({
+    schema_id: internals.CODING_FOUNDATION_SCHEMAS.semantic_edit_coverage,
+    state: "measured",
+    measured_runs: 15,
+    unmeasured_runs: 46,
+    changed_paths: 22,
+    range_count: 40,
+    bytes_changed: 3460300,
+    paths_raw_only: 7,
+    declared_exceptions: 4,
+    derived_exceptions: 2,
+    byte_coverage_rate: 68.2,
+    adapters: [
+      { name: "codex_cli", measured_attempts: 9, unmeasured_attempts: 12, semantic_only_attempts: 4, raw_only_attempts: 3, mixed_attempts: 2 },
+      { name: "idle_cli", measured_attempts: 0, unmeasured_attempts: 0, semantic_only_attempts: 0, raw_only_attempts: 0, mixed_attempts: 0 },
+      { name: "partial_cli", measured_attempts: 1 },
+    ],
+  });
+  const all = walk(body);
+  const breakdown = card.dataset.foundationBreakdown;
+  assert.match(breakdown, /22 paths/, "the card still carries the breakdown string");
+  assert.strictEqual(body.ownText, "", "the body must not hold a text node of its own");
+  assert.strictEqual(body.children.length, 1, "exactly one structured window");
+  assert.ok(classOf(body.children[0]).includes("coding-foundation-semantic"));
+  assert.ok(all.every((n) => n.textContent !== breakdown && !n.ownText.includes(" · paths")),
+    "no node may carry the run-on breakdown");
+  assert.ok(all.every((n) => !(n.ownText.includes("raw-only") && n.ownText.includes("declared") && n.ownText.includes("derived"))),
+    "no single text node may join the stat labels");
+  assert.doesNotMatch(body.textContent, /codex_cli 9 measured\/12 unmeasured/);
+
+  const rate = all.find((n) => classOf(n).includes("coding-foundation-semantic-rate"));
+  assert.strictEqual(rate.textContent, "68.2%");
+  const runs = all.find((n) => classOf(n).includes("coding-foundation-semantic-runs"));
+  assert.strictEqual(runs.textContent, "15 runs measured · 46 unmeasured");
+  const stats = all.filter((n) => classOf(n).includes("coding-foundation-semantic-stat"));
+  assert.deepStrictEqual(
+    stats.map((n) => n.children.map((c) => c.textContent)),
+    [
+      ["22", "Changed paths"], ["40", "Ranges"], ["3.3 MB", "Bytes changed"],
+      ["7", "Raw-only paths"], ["4", "Declared exceptions"], ["2", "Derived exceptions"],
+    ],
+  );
+  const rows = all.filter((n) => classOf(n).includes("coding-foundation-semantic-row"));
+  assert.strictEqual(rows.length, 3, "one row per runtime");
+  assert.deepStrictEqual(rows[0].children.map((c) => c.textContent), ["codex_cli", "9", "12", "4", "3", "2"]);
+  assert.strictEqual(rows[0].style.opacity, undefined, "an active runtime is not muted");
+  assert.ok(classOf(rows[1]).includes("coding-foundation-semantic-row-idle"), "zero-activity runtime is muted");
+  assert.strictEqual(rows[1].style.opacity, "0.6");
+  assert.deepStrictEqual(rows[2].children.map((c) => c.textContent), ["partial_cli", "1", "—", "—", "—", "—"]);
+  assert.ok(!classOf(rows[2]).includes("coding-foundation-semantic-row-idle"), "unknown counts are not zero activity");
+  assert.deepStrictEqual(textsOf(all.filter((n) => n.tagName === "TH" && n.attrs.scope === "col")),
+    ["Runtime", "Measured", "Unmeasured", "Semantic", "Raw", "Mixed"]);
+  assert.doesNotMatch(body.textContent, /undefined|NaN|null/);
+  assert.ok(internals.codingFoundationDashboardSource().indexOf("innerHTML") === -1);
+
+  const sparse = drive({ state: "measured", measured_runs: 2 });
+  const sparseText = sparse.body.textContent;
+  assert.doesNotMatch(sparseText, /undefined|NaN|null/);
+  assert.strictEqual(
+    walk(sparse.body).find((n) => classOf(n).includes("coding-foundation-semantic-rate")).textContent,
+    "—",
+  );
+  assert.match(sparseText, /2 runs measured · — unmeasured/);
+  assert.match(sparseText, /No runtime has reported yet/);
+}

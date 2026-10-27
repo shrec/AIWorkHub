@@ -12541,6 +12541,8 @@ const CODING_FOUNDATION_SKILL_STYLES = {
   chips: { display: "flex", flexWrap: "wrap", gap: "4px", listStyle: "none", margin: "0", padding: "0" },
   list: { margin: "0", paddingLeft: "1.1em" },
   empty: { margin: "0", color: "var(--vscode-descriptionForeground)" },
+  runtimeTable: { width: "100%", borderCollapse: "collapse", textAlign: "left" },
+  dim: { opacity: "0.6" },
 };
 
 function codingFoundationEl(doc, tag, options) {
@@ -13233,6 +13235,175 @@ function codingFoundationRecipesWindow(doc, host, model) {
   });
 }
 
+// NF-2026-01755. The Semantic Edit WINDOW. This card's dialog used to be one
+// run-on line -- paths, ranges, bytes, raw-only/declared/derived counts, every
+// runtime's measured/unmeasured and semantic/raw/mixed counts, then the byte
+// coverage -- because it fell back to the card's breakdown string. It now
+// renders the same KPI fields as a headline, a stat grid and one row per
+// runtime, under the constraints the Skills window block states: text only via
+// textContent, layout only via the CSSOM. A field the projection did not carry
+// renders a dash, never "undefined" or NaN.
+function codingFoundationSemanticCount(value) {
+  const counted = codingFoundationBoundedCount(value);
+  return counted == null ? "—" : String(counted);
+}
+
+function codingFoundationBytes(value) {
+  const bytes = codingFoundationBoundedCount(value);
+  if (bytes == null) return "—";
+  if (bytes < 1024) return bytes + " B";
+  const units = ["KB", "MB", "GB", "TB"];
+  let scaled = bytes / 1024;
+  let unit = 0;
+  while (scaled >= 1024 && unit < units.length - 1) {
+    scaled /= 1024;
+    unit += 1;
+  }
+  return scaled.toFixed(1) + " " + units[unit];
+}
+
+function codingFoundationSemanticModel(projection) {
+  if (!projection || typeof projection !== "object" || Array.isArray(projection)) return null;
+  if (projection.schema_id != null
+    && projection.schema_id !== CODING_FOUNDATION_SCHEMAS.semantic_edit_coverage) return null;
+  if (projection.state !== "measured") return null;
+  const adapters = Array.isArray(projection.adapters) ? projection.adapters : [];
+  const runtimes = [];
+  for (let i = 0; i < adapters.length && runtimes.length < 32; i += 1) {
+    const adapter = adapters[i];
+    if (!adapter || typeof adapter !== "object" || Array.isArray(adapter)) continue;
+    runtimes.push({
+      name: adapter.name == null ? "" : codingFoundationBoundText(adapter.name, 32),
+      measured: codingFoundationBoundedCount(adapter.measured_attempts),
+      unmeasured: codingFoundationBoundedCount(adapter.unmeasured_attempts),
+      semantic: codingFoundationBoundedCount(adapter.semantic_only_attempts),
+      raw: codingFoundationBoundedCount(adapter.raw_only_attempts),
+      mixed: codingFoundationBoundedCount(adapter.mixed_attempts),
+    });
+  }
+  const rate = projection.byte_coverage_rate;
+  return {
+    rate: typeof rate === "number" && Number.isFinite(rate) && rate >= 0 ? rate : null,
+    measuredRuns: codingFoundationBoundedCount(projection.measured_runs),
+    unmeasuredRuns: codingFoundationBoundedCount(projection.unmeasured_runs),
+    paths: codingFoundationBoundedCount(projection.changed_paths),
+    ranges: codingFoundationBoundedCount(projection.range_count),
+    bytes: codingFoundationBoundedCount(projection.bytes_changed),
+    rawOnly: codingFoundationBoundedCount(projection.paths_raw_only),
+    declared: codingFoundationBoundedCount(projection.declared_exceptions),
+    derived: codingFoundationBoundedCount(projection.derived_exceptions),
+    runtimes: runtimes,
+    runtimesTotal: adapters.length,
+  };
+}
+
+function codingFoundationSemanticStat(doc, parent, value, label) {
+  const styles = CODING_FOUNDATION_SKILL_STYLES;
+  const tile = codingFoundationEl(doc, "div", {
+    className: "coding-foundation-semantic-stat", style: styles.kpi, parent: parent,
+  });
+  codingFoundationEl(doc, "strong", { parent: tile, style: styles.kpiValue, text: value });
+  codingFoundationEl(doc, "span", { parent: tile, style: styles.kpiLabel, text: label });
+  return tile;
+}
+
+function codingFoundationSemanticRuntimeRow(doc, body, runtime) {
+  const styles = CODING_FOUNDATION_SKILL_STYLES;
+  const counts = [runtime.measured, runtime.unmeasured, runtime.semantic, runtime.raw, runtime.mixed];
+  // Only a KNOWN all-zero runtime is idle: an unmeasured field is not a zero.
+  let idle = true;
+  for (let i = 0; i < counts.length; i += 1) {
+    if (counts[i] !== 0) idle = false;
+  }
+  const tr = codingFoundationEl(doc, "tr", {
+    className: "coding-foundation-semantic-row"
+      + (idle ? " coding-foundation-semantic-row-idle" : ""),
+    style: idle ? styles.dim : null,
+    parent: body,
+  });
+  codingFoundationEl(doc, "th", {
+    parent: tr, style: styles.rowHeader, attrs: { scope: "row" },
+    text: runtime.name || "—",
+  });
+  for (let i = 0; i < counts.length; i += 1) {
+    codingFoundationEl(doc, "td", {
+      parent: tr, style: styles.td, text: codingFoundationSemanticCount(counts[i]),
+    });
+  }
+  return tr;
+}
+
+function codingFoundationSemanticWindow(doc, host, model) {
+  const styles = CODING_FOUNDATION_SKILL_STYLES;
+  const prefix = "coding-foundation-semantic";
+  const root = codingFoundationEl(doc, "div", {
+    className: prefix, style: styles.window, parent: host,
+  });
+  const headline = codingFoundationEl(doc, "div", {
+    className: prefix + "-headline", style: styles.kpi, parent: root,
+  });
+  codingFoundationEl(doc, "strong", {
+    className: prefix + "-rate", parent: headline, style: styles.kpiValue,
+    text: model.rate == null ? "—" : model.rate + "%",
+  });
+  codingFoundationEl(doc, "span", {
+    parent: headline, style: styles.kpiLabel,
+    text: "of changed bytes edited through semantic apply",
+  });
+  codingFoundationEl(doc, "span", {
+    className: prefix + "-runs", parent: headline, style: styles.sentence,
+    text: codingFoundationSemanticCount(model.measuredRuns) + " runs measured · "
+      + codingFoundationSemanticCount(model.unmeasuredRuns) + " unmeasured",
+  });
+  const stats = codingFoundationEl(doc, "div", {
+    className: prefix + "-stats", style: styles.kpis, parent: root,
+  });
+  codingFoundationSemanticStat(doc, stats, codingFoundationSemanticCount(model.paths), "Changed paths");
+  codingFoundationSemanticStat(doc, stats, codingFoundationSemanticCount(model.ranges), "Ranges");
+  codingFoundationSemanticStat(doc, stats, codingFoundationBytes(model.bytes), "Bytes changed");
+  codingFoundationSemanticStat(doc, stats, codingFoundationSemanticCount(model.rawOnly), "Raw-only paths");
+  codingFoundationSemanticStat(doc, stats, codingFoundationSemanticCount(model.declared), "Declared exceptions");
+  codingFoundationSemanticStat(doc, stats, codingFoundationSemanticCount(model.derived), "Derived exceptions");
+  codingFoundationEl(doc, "p", {
+    className: prefix + "-runtimes-title", parent: root, style: styles.muted,
+    text: "Runtimes",
+  });
+  if (model.runtimes.length === 0) {
+    codingFoundationEl(doc, "p", {
+      className: prefix + "-empty", parent: root, style: styles.empty,
+      text: "No runtime has reported yet.",
+    });
+    return root;
+  }
+  const scroll = codingFoundationEl(doc, "div", {
+    className: prefix + "-scroll", style: styles.scroll, parent: root,
+  });
+  const table = codingFoundationEl(doc, "table", {
+    className: prefix + "-table", style: styles.runtimeTable, parent: scroll,
+  });
+  if (model.runtimesTotal > model.runtimes.length) {
+    codingFoundationEl(doc, "caption", {
+      parent: table, style: styles.caption,
+      text: "Showing the first " + model.runtimes.length + " of "
+        + model.runtimesTotal + " runtimes.",
+    });
+  }
+  const columns = ["Runtime", "Measured", "Unmeasured", "Semantic", "Raw", "Mixed"];
+  const headRow = codingFoundationEl(doc, "tr", {
+    parent: codingFoundationEl(doc, "thead", { parent: table }),
+  });
+  for (let i = 0; i < columns.length; i += 1) {
+    codingFoundationEl(doc, "th", {
+      parent: headRow, style: styles.th, attrs: { scope: "col" }, text: columns[i],
+    });
+  }
+  const body = codingFoundationEl(doc, "tbody", { parent: table });
+  for (let i = 0; i < model.runtimes.length; i += 1) {
+    codingFoundationSemanticRuntimeRow(doc, body, model.runtimes[i]);
+  }
+  return root;
+}
+
 // NF-2026-00675. A field the summary snapshot deliberately did not send must
 // not read as a field the server could not produce. `snapshot_mode: "summary"`
 // keeps a bounded set and names the rest in `omitted_fields`; the webview then
@@ -13306,6 +13477,7 @@ function bindCodingFoundationDashboard(doc) {
   let selectedKind = "";
   let skillWindow = null;
   let recipeWindow = null;
+  let semanticWindow = null;
   const fillFoundationDialog = function fillFoundationDialog(kind) {
     selectedKind = kind;
     const label = CODING_FOUNDATION_LABELS[kind] || kind;
@@ -13330,14 +13502,19 @@ function bindCodingFoundationDashboard(doc) {
     // rows -- a previously correct answer, never a blank and never an invented
     // zero.
     const isRecipes = kind === "tool_recipes";
-    const record = kind === "skills" ? skillWindow : (isRecipes ? recipeWindow : null);
+    const isSemantic = kind === "semantic_edit_coverage";
+    const record = kind === "skills"
+      ? skillWindow
+      : (isRecipes ? recipeWindow : (isSemantic ? semanticWindow : null));
     if (record && typeof root.createElement === "function") {
       // Built DETACHED and attached last: a renderer that throws part-way then
       // leaves the aggregate line standing instead of an empty dialog, and
       // nothing has to swallow the error to get that.
       const rendered = isRecipes
         ? codingFoundationRecipesWindow(root, null, record)
-        : codingFoundationSkillsWindow(root, null, record);
+        : (isSemantic
+          ? codingFoundationSemanticWindow(root, null, record)
+          : codingFoundationSkillsWindow(root, null, record));
       // Assigning textContent is what removes a previously rendered window, so
       // every refill starts from an empty body rather than stacking a second.
       dialogBody.textContent = "";
@@ -13376,6 +13553,12 @@ function bindCodingFoundationDashboard(doc) {
     if (rows) skillWindow = rows;
     const recipeRows = codingFoundationRecipeRowModel(snap.tool_recipes);
     if (recipeRows) recipeWindow = recipeRows;
+    // A summary refresh omits the projection (undefined) and must not blank the
+    // window; a projection that IS present but not measured clears it so the
+    // dialog never shows numbers the card no longer vouches for.
+    if (snap.semantic_edit_coverage !== undefined) {
+      semanticWindow = codingFoundationSemanticModel(snap.semantic_edit_coverage);
+    }
     if (dialog && dialog.open && selectedKind) fillFoundationDialog(selectedKind);
   };
   if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
@@ -13475,6 +13658,13 @@ function codingFoundationDashboardSource() {
     codingFoundationRecipeDetails.toString(),
     codingFoundationRecipeTableRow.toString(),
     codingFoundationRecipesWindow.toString(),
+    // NF-2026-01755. The Semantic Edit window ships through this same list.
+    codingFoundationSemanticCount.toString(),
+    codingFoundationBytes.toString(),
+    codingFoundationSemanticModel.toString(),
+    codingFoundationSemanticStat.toString(),
+    codingFoundationSemanticRuntimeRow.toString(),
+    codingFoundationSemanticWindow.toString(),
     renderCodingFoundationCards.toString(),
     bindCodingFoundationDashboard.toString(),
     "bindCodingFoundationDashboard();",
