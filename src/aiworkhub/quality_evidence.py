@@ -1980,6 +1980,47 @@ def repo_config_status(repo_root: Path | str) -> dict[str, Any]:
     }
 
 
+def repository_requires_explicit_human_approval(repo_root: Path | str) -> bool:
+    """Whether the repository's own quality policy demands an OWNER approval.
+
+    ``explicit_human_approval_required`` -- the same field a risk profile
+    carries -- may be declared at the top level of ``.aiworkhub/quality.json``.
+    Absent (the default) means a manager's ``confirm_high_risk`` clears a
+    high/critical tier's approval requirement; ``true`` means only an
+    owner-authenticated approval does. Fail closed: an unreadable or malformed
+    policy, or a non-boolean value, requires the owner.
+    """
+
+    try:
+        config = load_repo_config(repo_root)
+    except MalformedConfigError:
+        return True
+    value = config.get("explicit_human_approval_required", False)
+    if not isinstance(value, bool):
+        return True
+    return value
+
+
+def high_risk_approval_satisfied(
+    *,
+    explicit_human_approval: bool,
+    manager_high_risk_confirmed: bool,
+    repository_requires_explicit_human_approval: bool,
+) -> bool:
+    """The one predicate that clears ``explicit_human_approval_missing``.
+
+    An owner-authenticated approval always satisfies it. A manager's
+    high-risk confirmation satisfies it only while the repository policy does
+    not require explicit human approval. Neither is ever recorded as the other.
+    """
+
+    if explicit_human_approval:
+        return True
+    return bool(manager_high_risk_confirmed) and not (
+        repository_requires_explicit_human_approval
+    )
+
+
 def assess_quality_policy_authority(
     canonical_root: Path | str,
     candidate_root: Path | str,

@@ -252,6 +252,10 @@ def _fake_quality_evidence(
             "explicit_human_approval_required": False,
         },
         run_completion_quality_gate=_run_completion_quality_gate,
+        # NF-2026-01742: the default profile does not require explicit human
+        # approval; the high-risk approval predicate itself stays real.
+        repository_requires_explicit_human_approval=lambda _repo: False,
+        high_risk_approval_satisfied=quality_evidence.high_risk_approval_satisfied,
     )
 
 

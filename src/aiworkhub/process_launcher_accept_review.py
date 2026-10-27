@@ -1373,6 +1373,8 @@ def fold_accept_blockers(
     terminal_substatus: str,
     pending_context_write_intents: int = 0,
     confirm_high_risk: bool = False,
+    explicit_human_approval: bool = False,
+    repository_requires_explicit_human_approval: bool = False,
     destructive_blockers: list[str] | None = None,
     confirm_destructive_change: bool = False,
     finding_dispositions: list[Mapping[str, Any]] | None = None,
@@ -1503,7 +1505,17 @@ def fold_accept_blockers(
     if required:
         for lens in sorted(_blind_reviewer_lenses(evidence_rows)):
             blockers.append(_blocker("reviewer_could_not_inspect", lens, lens=lens))
-    if risk_profile.get("explicit_human_approval_required") and not confirm_high_risk:
+    # NF-2026-01742: the manager's ``confirm_high_risk`` and an owner approval
+    # are different facts; the one shared predicate decides which clears this.
+    if risk_profile.get(
+        "explicit_human_approval_required"
+    ) and not quality_evidence.high_risk_approval_satisfied(
+        explicit_human_approval=explicit_human_approval,
+        manager_high_risk_confirmed=confirm_high_risk,
+        repository_requires_explicit_human_approval=(
+            repository_requires_explicit_human_approval
+        ),
+    ):
         blockers.append(_blocker("explicit_human_approval_missing"))
     if not confirm_destructive_change:
         for check_id in destructive_blockers or ():
@@ -2047,6 +2059,14 @@ def accept_preview(self, request_id: str, task_id: str, **overrides: Any) -> dic
         candidate_sha256=_target_candidate_sha256(card),
         receipt_sha256_by_reviewer=_sealed_receipt_sha256(preview_reviewers),
     )
+    # The CANONICAL repository's policy, as accept_review reads it; a repo the
+    # preview cannot read fails closed to requiring the owner.
+    try:
+        owner_approval_required = (
+            quality_evidence.repository_requires_explicit_human_approval(self.repo)
+        )
+    except Exception:  # noqa: BLE001 -- a preview never raises at a manager
+        owner_approval_required = True
     fold = fold_accept_blockers(
         reviewers=preview_reviewers,
         reviewer_request_ids=overrides.get("reviewer_request_ids"),
@@ -2054,6 +2074,7 @@ def accept_preview(self, request_id: str, task_id: str, **overrides: Any) -> dic
         terminal_substatus=str(terminal_review.get("substatus") or ""),
         pending_context_write_intents=intents,
         confirm_high_risk=bool(overrides.get("confirm_high_risk")),
+        repository_requires_explicit_human_approval=owner_approval_required,
         **(
             {"finding_dispositions": preview_dispositions}
             if preview_dispositions
@@ -3197,6 +3218,21 @@ def accept_review(
             policy_authority = quality_evidence.assess_quality_policy_authority(
                 self.repo, workspace.path, changed_paths=changed
             )
+            # NF-2026-01742: ``confirm_high_risk`` is a MANAGER confirmation,
+            # never an owner approval. No owner-authenticated accept path
+            # exists, so a manager call never carries explicit human approval;
+            # the manager confirmation clears the approval requirement unless
+            # the CANONICAL repository policy (never the candidate's own)
+            # declares ``explicit_human_approval_required``.
+            owner_human_approval = False
+            owner_approval_required = (
+                quality_evidence.repository_requires_explicit_human_approval(self.repo)
+            )
+            high_risk_approval = quality_evidence.high_risk_approval_satisfied(
+                explicit_human_approval=owner_human_approval,
+                manager_high_risk_confirmed=bool(confirm_high_risk),
+                repository_requires_explicit_human_approval=owner_approval_required,
+            )
             if policy_authority["weakened"] and policy_authority["escalation_signal"]:
                 effective_risk_signals = sorted(
                     dict.fromkeys(
@@ -3284,6 +3320,8 @@ def accept_review(
                 risk_profile=risk_profile,
                 terminal_substatus=str(terminal_review.get("substatus") or ""),
                 confirm_high_risk=confirm_high_risk,
+                explicit_human_approval=owner_human_approval,
+                repository_requires_explicit_human_approval=owner_approval_required,
                 **(
                     {"finding_dispositions": sealed_finding_dispositions}
                     if sealed_finding_dispositions
@@ -3565,7 +3603,7 @@ def accept_review(
                 reviewer_reports=verified_reviewer_reports,
                 combined_tree_checks=combined_tree_checks,
                 worker_provider=str(latest.get("adapter_id") or runner),
-                human_approval=confirm_high_risk,
+                human_approval=high_risk_approval,
                 reachability_inputs=self._candidate_reachability_inputs(
                     workspace, changed
                 ),
@@ -3633,8 +3671,32 @@ def accept_review(
                 ),
                 "manager_requested_risk_tier": str(requested_risk_tier or ""),
                 "server_derived_risk_tier": server_derived_risk_tier(card),
-                "explicit_human_approval": bool(confirm_high_risk),
+                # True only from an owner-authenticated path; a manager call
+                # never has one (NF-2026-01742).
+                "explicit_human_approval": owner_human_approval,
                 "explicit_human_approval_implied_by_caller": False,
+                "explicit_human_approval_required_by_repository_policy": (
+                    owner_approval_required
+                ),
+                "manager_high_risk_confirmation": {
+                    "confirmed": bool(confirm_high_risk),
+                    "actor": dict(quality_gate["accept_manager_identity"]),
+                    # The reviewer receipts this accept re-verified and binds.
+                    "evidence_ids": [
+                        *(str(value) for value in reviewer_ids),
+                        *(
+                            "quality_review_receipt_sha256:"
+                            + verified_receipt_sha256[str(value)]
+                            for value in reviewer_ids
+                            if verified_receipt_sha256.get(str(value))
+                        ),
+                    ],
+                    "satisfied_explicit_human_approval_requirement": bool(
+                        risk_profile.get("explicit_human_approval_required")
+                        and high_risk_approval
+                        and not owner_human_approval
+                    ),
+                },
                 "destructive_change_confirmed_by_manager": bool(
                     confirm_destructive_change
                 ),

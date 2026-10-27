@@ -1267,21 +1267,14 @@ def test_target_acceptance_consumes_already_accepted_reviewer_receipt(
     }]
 
 
-def test_accept_review_resolves_its_own_reviewer_ids_from_the_bound_children(
+def server_resolved_reviewer_scenario(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The manager stops retyping what the server already knows.
+):
+    """One target request with one server-bound, receipt-verified correctness
+    reviewer, the combined tree and the completion gate stubbed to pass.
 
-    Measured 2026-09-08 over 159 accept attempts: ``reviewer_request_ids`` was
-    typed by hand in 135 of them, copied out of earlier launch results. The
-    binding that answers the question -- ``terminal_review.evidence.
-    quality_review.target_{task,request}_id`` -- is on every reviewer card
-    (2,219 of 2,219 on the live store) and is the same one
-    ``disposition_reviewer_children`` already reads to dispose them.
-
-    Defaulting changes WHO types the ids and nothing else: the resolved id goes
-    through the identical verification loop, so this accept still stands or
-    falls on the reviewer's own sealed receipt.
+    Shared with ``test_high_risk_confirmation_provenance_nf01742.py`` so the
+    accept-record provenance is asserted over this exact real accept path.
     """
     (
         manager, card, request_id, task_id, runner, topic, repo,
@@ -1427,6 +1420,32 @@ def test_accept_review_resolves_its_own_reviewer_ids_from_the_bound_children(
         "disposition_reviewer_children",
         lambda *_args, **_kwargs: {"ok": True, "stdout": json.dumps({"finalized": []})},
     )
+    return (
+        manager, request_id, task_id, reviewer_request_id, repo,
+        promote_calls, accept_review_calls,
+    )
+
+
+def test_accept_review_resolves_its_own_reviewer_ids_from_the_bound_children(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The manager stops retyping what the server already knows.
+
+    Measured 2026-09-08 over 159 accept attempts: ``reviewer_request_ids`` was
+    typed by hand in 135 of them, copied out of earlier launch results. The
+    binding that answers the question -- ``terminal_review.evidence.
+    quality_review.target_{task,request}_id`` -- is on every reviewer card
+    (2,219 of 2,219 on the live store) and is the same one
+    ``disposition_reviewer_children`` already reads to dispose them.
+
+    Defaulting changes WHO types the ids and nothing else: the resolved id goes
+    through the identical verification loop, so this accept still stands or
+    falls on the reviewer's own sealed receipt.
+    """
+    (
+        manager, request_id, task_id, reviewer_request_id, _repo,
+        promote_calls, accept_review_calls,
+    ) = server_resolved_reviewer_scenario(monkeypatch, tmp_path)
 
     # No reviewer_request_ids argument at all.
     result = manager.accept_review(request_id, task_id, requested_risk_tier="medium")
