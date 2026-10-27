@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from . import core, sqlite_readonly, task_store
+from .learning_commit import FailureCategory
 
 
 TASK_CONTRACT_KEYS = task_store.TASK_CONTRACT_KEYS
@@ -65,6 +66,39 @@ IDENTICAL_OUTCOME_REPEAT_THRESHOLD = 3
 _TERMINAL_OUTCOME_EVENTS = ("terminal_review", "terminal_failure")
 # One bounded read per launch: only the rows the threshold can consume.
 _TERMINAL_OUTCOME_SCAN_LIMIT = 8
+
+# --- NF-2026-00638 third axis: the reject DEPTH ---------------------------
+#
+# Neither axis above sees a reject -> rework -> reject loop in which every lap
+# produces a NEW candidate that a manager rejects as wrong: the feedback
+# changes, so the card axis cannot fire, and the candidate bytes change, so the
+# outcome axis cannot either.  Every lap is a full provider run.  This axis
+# counts true candidate-code rejections of ONE unchanged task contract and
+# refuses the launch once the cap is reached; the only legal moves left are to
+# change the contract (an amendment starts a fresh counter) or to decompose or
+# supersede the task (a successor has its own task_id and starts at depth 0).
+#
+# The count is read only from durable ``reject_review`` rows in
+# ``task_events`` (``reject_review`` erases the card's terminal record), and
+# only rows that pin BOTH a classification and the contract identity they
+# judged can count.  Anything else -- an infrastructure category, an
+# inconclusive or missing classification, a legacy row -- fails closed to
+# manager judgment, which here means no automatic block.
+REJECT_DEPTH_CAP = 2
+REJECT_DEPTH_SCHEMA_ID = "aiworkhub.rejection_depth.v1"
+REJECT_DEPTH_CAP_REACHED_REASON = "reject_depth_cap_reached"
+REJECT_DEPTH_NEXT_ACTION = "decompose_or_supersede_required"
+# A positive allowlist, not a deny list: only a candidate-code verdict on a
+# rework (``to=pending``) rejection is a lap of the loop this axis bounds.
+REJECT_DEPTH_COUNTED_CATEGORY = FailureCategory.CANDIDATE_CODE.value
+REJECT_DEPTH_COUNTED_DISPOSITION = "pending"
+_REJECT_EVENT = "reject_review"
+# One bounded read per launch.  A task with more rejections than this is far
+# past the cap already; the newest rows are the ones that decide.
+_REJECT_DEPTH_SCAN_LIMIT = 64
+# The one contract-identity implementation the card axis and the recorder
+# already share; a successor card or an amended contract hashes differently.
+task_contract_identity = card_content_identity
 
 
 def validation_only_replay_authorization(
@@ -483,6 +517,143 @@ def identical_outcome_refusal_receipt(
     }
 
 
+def reject_event_payloads(
+    conn: Any, task_id: str, *, limit: int = _REJECT_DEPTH_SCAN_LIMIT
+) -> list[dict[str, Any]]:
+    """The newest durable ``reject_review`` payloads of one task, oldest first.
+
+    Takes an open connection so ``core.reject_review`` can count inside its own
+    write connection and the launch guard inside a read-only one, with one
+    decoding rule.  An undecodable row is skipped: it pins nothing, so it can
+    never count, and skipping it can only ever lower the depth.
+    """
+
+    bounded = max(1, min(int(limit), _REJECT_DEPTH_SCAN_LIMIT))
+    rows = conn.execute(
+        "SELECT payload_json FROM task_events WHERE task_id=? AND event=? "
+        "ORDER BY event_id DESC LIMIT ?",
+        (str(task_id), _REJECT_EVENT, bounded),
+    ).fetchall()
+    payloads: list[dict[str, Any]] = []
+    for row in reversed(rows):
+        try:
+            payload = json.loads(str(row[0] or "{}"))
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    return payloads
+
+
+def recorded_reject_events(
+    repo: str | Path | None, task_id: str
+) -> list[dict[str, Any]]:
+    """Read-only, bounded reject history; an unreadable store yields none."""
+
+    task_id = str(task_id or "").strip()
+    if not repo or not task_id:
+        return []
+    try:
+        conn = sqlite_readonly.connect_readonly(task_store.canonical_db_path(repo))
+    except Exception:
+        return []
+    try:
+        return reject_event_payloads(conn, task_id)
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+def counted_candidate_code_rejects(
+    events: Sequence[Mapping[str, Any]], contract_identity: str
+) -> list[str]:
+    """Request ids of the rejections that count toward the depth, oldest first.
+
+    A row counts only when it is a rework rejection, pins the candidate-code
+    category AND the source it was derived from, and pins exactly this
+    contract identity.  Every missing field means "not counted".
+    """
+
+    identity = str(contract_identity or "").strip()
+    if not identity:
+        return []
+    counted: list[str] = []
+    for event in events:
+        if not isinstance(event, Mapping):
+            continue
+        if str(event.get("to") or "") != REJECT_DEPTH_COUNTED_DISPOSITION:
+            continue
+        if str(event.get("failure_category") or "") != REJECT_DEPTH_COUNTED_CATEGORY:
+            continue
+        if not str(event.get("failure_category_source") or "").strip():
+            continue
+        if str(event.get("contract_identity") or "").strip() != identity:
+            continue
+        counted.append(str(event.get("request_id") or "").strip())
+    return counted
+
+
+def rejection_depth_record(
+    *,
+    contract_identity: str,
+    rejected_request_ids: Sequence[str],
+    recorded_at: str,
+    actor: str,
+) -> dict[str, Any] | None:
+    """The audited cap record, or ``None`` while the depth is under the cap."""
+
+    depth = len(rejected_request_ids)
+    if depth < REJECT_DEPTH_CAP or not str(contract_identity or "").strip():
+        return None
+    return {
+        "schema_id": REJECT_DEPTH_SCHEMA_ID,
+        "depth": depth,
+        "cap": REJECT_DEPTH_CAP,
+        "contract_identity": str(contract_identity),
+        "next_action": REJECT_DEPTH_NEXT_ACTION,
+        "rejected_request_ids": [str(rid) for rid in rejected_request_ids],
+        "recorded_at": str(recorded_at),
+        "actor": str(actor),
+    }
+
+
+def reject_depth_refusal(
+    card: Mapping[str, Any] | None,
+    *,
+    repo: str | Path | None = None,
+    reject_events: Sequence[Mapping[str, Any]] | None = None,
+) -> str:
+    """Refuse a launch whose unchanged contract was already rejected ``cap`` times.
+
+    Read-only: the refusal names the cause and the limit and leaves the
+    retained workspace, the candidate bytes and the rejection evidence exactly
+    where they are, so the manager can still read them to decompose.
+    """
+
+    if card is None:
+        return ""
+    task_id = str(card.get("task_id") or "").strip()
+    if not task_id:
+        return ""
+    if reject_events is None:
+        reject_events = recorded_reject_events(repo, task_id)
+    counted = counted_candidate_code_rejects(
+        list(reject_events or []), task_contract_identity(card)
+    )
+    depth = len(counted)
+    if depth < REJECT_DEPTH_CAP:
+        return ""
+    return ":".join(
+        (
+            REJECT_DEPTH_CAP_REACHED_REASON,
+            str(depth),
+            str(REJECT_DEPTH_CAP),
+            REJECT_DEPTH_NEXT_ACTION,
+        )
+    )
+
+
 def identical_relaunch_refusal(
     card: Mapping[str, Any] | None,
     *,
@@ -490,14 +661,17 @@ def identical_relaunch_refusal(
     adapter_id: str,
     repo: str | Path | None = None,
     records: Sequence[Mapping[str, Any]] | None = None,
+    reject_events: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
     """Why this exact relaunch must not spend another attempt, else ``""``.
 
-    Two independent axes, checked in order of strength.  The first refuses a
+    Three independent axes, checked in order of strength.  The first refuses a
     byte-identical relaunch of the SAME CARD.  The second refuses a relaunch
     whose recorded OUTCOMES have already repeated ``IDENTICAL_OUTCOME_REPEAT_
     THRESHOLD`` times on this launch identity, regardless of review feedback --
-    the case the first axis structurally cannot see.
+    the case the first axis structurally cannot see.  The third refuses a
+    relaunch of a contract already rejected ``REJECT_DEPTH_CAP`` times as
+    candidate code, the loop neither of the first two can see.
     """
 
     exact = _identical_card_relaunch_refusal(
@@ -505,6 +679,9 @@ def identical_relaunch_refusal(
     )
     if exact:
         return exact
-    return identical_outcome_refusal(
+    outcome = identical_outcome_refusal(
         card, runner=runner, adapter_id=adapter_id, repo=repo, records=records
     )
+    if outcome:
+        return outcome
+    return reject_depth_refusal(card, repo=repo, reject_events=reject_events)

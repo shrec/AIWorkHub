@@ -6956,6 +6956,12 @@ def reject_review(
         if explicit_failure_category is not None
         else "terminal_evidence"
     )
+    # NF-2026-00638: the contract this rejection judged, pinned on the durable
+    # event before any amendment below can change the card.  The reject depth
+    # cap counts only rows whose pinned identity equals the relaunched card's.
+    from . import launch_replay_guard  # local: launch_replay_guard imports core
+
+    judged_contract_identity = launch_replay_guard.task_contract_identity(card)
     command = [
         "reject-review", task_id, "--runner", actor, "--topic", str(live_topic),
         "--reason", bounded_reason, "--to", disposition,
@@ -7243,6 +7249,53 @@ def reject_review(
     except task_store.TaskStoreError as exc:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
     try:
+        reject_payload: dict[str, Any] = {
+            "topic": live_topic,
+            "reason": bounded_reason,
+            "reason_identity": reason_identity,
+            "terminal_disposition": terminal_disposition,
+            # NF-2026-00638: the classification and the judged contract are
+            # pinned on the durable row, because the card's own terminal record
+            # is erased by this transition and the depth cap counts rows only.
+            "failure_category": terminal_disposition,
+            "failure_category_source": failure_category_source,
+            "contract_identity": judged_contract_identity,
+            "request_id": str(pred_request_id or rejected_request_id or ""),
+            "to": disposition,
+            "prior_episode": prior_episode,
+            "rework_delta_reuse_error": rework_delta_reuse_error,
+        }
+        # An amendment applied by this same rejection changes the contract the
+        # next launch carries, so its counter starts fresh: no cap record then.
+        rejection_depth: dict[str, Any] | None = None
+        # Only a counted lap carries the record: a blocked or infrastructure
+        # reject made after the cap must not claim one.
+        current_is_counted = bool(
+            launch_replay_guard.counted_candidate_code_rejects(
+                [reject_payload], judged_contract_identity
+            )
+        )
+        if current_is_counted and (
+            launch_replay_guard.task_contract_identity(card) == judged_contract_identity
+        ):
+            try:
+                prior_rejects = launch_replay_guard.reject_event_payloads(conn, task_id)
+            except sqlite3.Error:
+                # Unreadable history pins nothing: manager judgment, no record.
+                prior_rejects = []
+            rejection_depth = launch_replay_guard.rejection_depth_record(
+                contract_identity=judged_contract_identity,
+                rejected_request_ids=launch_replay_guard.counted_candidate_code_rejects(
+                    [*prior_rejects, reject_payload], judged_contract_identity
+                ),
+                recorded_at=now,
+                actor=actor,
+            )
+        if rejection_depth is None:
+            card.pop("rejection_depth", None)
+        else:
+            card["rejection_depth"] = rejection_depth
+            reject_payload["rejection_depth"] = rejection_depth
         cur = conn.execute(
             f"UPDATE tasks SET {set_clause} WHERE task_id=? AND worker_status='review' "
             "AND runner=? AND topic=? AND status=? AND claimed_by IS ? "
@@ -7271,20 +7324,7 @@ def reject_review(
                 task_id,
                 "reject_review",
                 actor,
-                json.dumps(
-                    {
-                        "topic": live_topic,
-                        "reason": bounded_reason,
-                        "reason_identity": reason_identity,
-                        "terminal_disposition": terminal_disposition,
-                        "failure_category_source": failure_category_source,
-                        "to": disposition,
-                        "prior_episode": prior_episode,
-                        "rework_delta_reuse_error": rework_delta_reuse_error,
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
+                json.dumps(reject_payload, ensure_ascii=False, sort_keys=True),
                 now,
             ),
         )
@@ -7302,6 +7342,10 @@ def reject_review(
         result["allowed_writes_amendment_applied"] = applied_allowed_writes_amendment
     if applied_read_first_amendment:
         result["read_first_amendment_applied"] = applied_read_first_amendment
+    if rejection_depth is not None:
+        # The next launch of this unchanged contract is refused by
+        # launch_replay_guard.reject_depth_refusal; say so on the receipt now.
+        result["rejection_depth"] = rejection_depth
     if rework_delta_reuse_error is not None:
         result["rework_delta_recovery"] = {
             "schema_id": "aiworkhub.rework_delta_recovery.v1",

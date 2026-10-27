@@ -229,6 +229,14 @@ GROUP BY kind
 # Series 5b: rejection depth per DISTINCT card, and whether a card at that
 # depth was ever accepted. This is the eventual-acceptance rate conditioned
 # on how many times a card was sent back.
+#
+# NF-2026-00638: launches avoided by the reject depth cap
+# (``launch_replay_guard.reject_depth_refusal``) are NOT measurable here. A
+# launch refusal is raised as ``LaunchRejected`` before provider start and is
+# recorded only in the process-event log (``ProcessManager._blocked``), never
+# as a ``task_events`` row, and this module reads the task store alone. The
+# cap's own trigger is measurable: each ``reject_review`` row that reached the
+# cap carries ``$.rejection_depth``.
 _Q_REJECTION_DEPTH = f"""
 WITH {_CARD_POPULATION_CTE},
 per_card AS (
