@@ -348,6 +348,10 @@ _VSCODE_LM_SIGNATURE_COUNT = len(_VSCODE_LM_CODES)
 # Launcher-minted prefix: a writable attempt finalized with nothing changed.
 PROVIDER_NO_EFFECT = "provider_no_effect"
 
+# NF-2026-01749: an opencode run whose text parts carry tool calls as plain-text XML
+# and which made no structured tool call, so nothing executed.
+PROVIDER_TEXT_TOOL_CALL_PROTOCOL = "provider_text_tool_call_protocol"
+
 # The closed vocabulary of DETERMINISTIC CONTROL-PLANE REASONS: reason tokens
 # minted by AIWorkHub's own code to state why the control plane refused or
 # could not complete a state transition. They are not provider output and not
@@ -522,6 +526,7 @@ _CONTROL_PLANE_REASONS: tuple[str, ...] = (
     # the review worktree marker was gone; previously filed as ``unclassified``.
     "worktree_is_not_detached_and_isolated",
     PROVIDER_NO_EFFECT,
+    PROVIDER_TEXT_TOOL_CALL_PROTOCOL,
     # ------------------------------------------------------------------ #
     # WRAPPERS ONLY BELOW THIS LINE -- see the ordering note above.
     #
@@ -1721,6 +1726,8 @@ PROVIDER_CODE_DISPOSITION: dict[str, str] = {
     "rate_limit_error": FAILURE_CLASS_TRANSIENT,
     "provider_unreachable": FAILURE_CLASS_TRANSIENT,
     "worker_mcp_connect_failed": FAILURE_CLASS_TRANSIENT,
+    # opencode text part holding a tool call written as XML, with no structured tool part.
+    PROVIDER_TEXT_TOOL_CALL_PROTOCOL: FAILURE_CLASS_TRANSIENT,
     # credential / account
     "authentication_failed": FAILURE_CLASS_CREDENTIAL,
     "invalid_api_key": FAILURE_CLASS_CREDENTIAL,
@@ -1746,6 +1753,7 @@ PROVIDER_CODE_DISPOSITION: dict[str, str] = {
 _PROVIDER_TERMINAL_ENVELOPES: tuple[str, ...] = (
     "result_api_error", "api_retry", "provider_error", "turn_failed",
     "session_idle", "session_terminal", "worker_mcp_init_failed",
+    "text_tool_call_protocol",
 )
 
 # NF-2026-01717: the claude CLI's stream-json init event reported an
@@ -1870,6 +1878,8 @@ REASON_DISPOSITION: dict[str, str] = {
     # fact about the sandbox, never the candidate's work -- same shape as the
     # other launcher-minted sandbox reasons above.
     "sandbox_spawn_failed": FAILURE_CLASS_TRANSIENT,
+    # NF-2026-01749: the route cannot speak the tool protocol; a distinct route can.
+    PROVIDER_TEXT_TOOL_CALL_PROTOCOL: FAILURE_CLASS_TRANSIENT,
 }
 
 # Reasons deliberately left unplaced, and why they cannot be placed:
@@ -2101,6 +2111,114 @@ def _record_opencode_terminal(event: dict[str, Any], found: dict[str, Any]) -> N
                     children.add(part_session)
 
 
+_OPENCODE_TOOL_PART_TYPES = frozenset({"tool", "tool_use", "tool_call", "tool_result"})
+_OPENCODE_TOOL_EVENT_KINDS = frozenset({"tool", "tool_use", "tool_call"})
+_TEXT_TOOL_CALL_TAGS = ("tool_call", "function_call", "function_calls", "tool_use", "invoke")
+_TEXT_TOOL_CALL_SCAN_CHARS = 65536
+
+
+def _opencode_part_type(part: dict[str, Any]) -> str:
+    return str(part.get("type") or "").strip().lower().replace("-", "_")
+
+
+def _opencode_event_parts(event: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
+    """The event's parts, at most 64 per list, and whether any list ran past that cap."""
+    parts: list[dict[str, Any]] = []
+    props = event.get("properties")
+    for candidate in (event.get("part"), props.get("part") if isinstance(props, dict) else None):
+        if isinstance(candidate, dict):
+            parts.append(candidate)
+    messages = event.get("messages")
+    messages = messages if isinstance(messages, list) else []
+    capped = len(messages) > 64
+    for message in messages[:64]:
+        message_parts = message.get("parts") if isinstance(message, dict) else None
+        if not isinstance(message_parts, list):
+            continue
+        capped = capped or len(message_parts) > 64
+        parts.extend(part for part in message_parts[:64] if isinstance(part, dict))
+    return parts, capped
+
+
+def _text_has_tool_call_block(text: str) -> bool:
+    """True iff ``text`` holds an opening and a closing tag of one tool-call element."""
+    lowered = text[:_TEXT_TOOL_CALL_SCAN_CHARS].lower()
+    for tag in _TEXT_TOOL_CALL_TAGS:
+        opener = "<" + tag
+        start = lowered.find(opener)
+        while start != -1:
+            end = start + len(opener)
+            if end < len(lowered) and lowered[end] in " \t\r\n>/":
+                if lowered.find("</" + tag, end) != -1:
+                    return True
+                break
+            start = lowered.find(opener, end)
+    return False
+
+
+def _record_opencode_text_tool_call(event: dict[str, Any], kind: str, found: dict[str, Any]) -> None:
+    """Note an opencode ``text`` part carrying a tool call written as XML, and any structured tool part.
+
+    Only the stream's own ``text`` event with a ``text`` part is read, so a
+    model's tool use, a Claude/Codex message, or a prompt echo is never the source.
+    """
+    if kind in _OPENCODE_TOOL_EVENT_KINDS:
+        found["_oc_tool_part"] = True
+    text_part = event.get("part") if kind == "text" else None
+    parts, capped = _opencode_event_parts(event)
+    if capped:
+        # A capped listing cannot prove the rest holds no tool part: fail closed.
+        found["_oc_tool_part"] = True
+    for part in parts:
+        part_type = _opencode_part_type(part)
+        if part_type in _OPENCODE_TOOL_PART_TYPES:
+            found["_oc_tool_part"] = True
+        elif part is text_part and part_type == "text" and not found["_oc_text_tool_call"]:
+            text = part.get("text")
+            if isinstance(text, str) and _text_has_tool_call_block(text):
+                found["_oc_text_tool_call"] = True
+
+
+def opencode_stream_has_tool_part(stdout_path: str | Path | None) -> bool:
+    """True iff the WHOLE opencode stream may hold a structured tool part.
+
+    Fail-closed: an unreadable file or an over-long line cannot prove the run
+    made zero tool calls, so it answers True. Each line is capped at
+    MAX_OPENCODE_SCAN_LINE_BYTES and the scan never reads past the size at open.
+    """
+    fd = _open_nofollow_fd(stdout_path)
+    if fd is None:
+        return True
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            remaining = os.fstat(handle.fileno()).st_size
+            while remaining > 0:
+                raw_line = handle.readline(min(MAX_OPENCODE_SCAN_LINE_BYTES + 1, remaining))
+                if not raw_line:
+                    break
+                remaining -= len(raw_line)
+                if len(raw_line) > MAX_OPENCODE_SCAN_LINE_BYTES:
+                    return True
+                if b"tool" not in raw_line:
+                    continue
+                line = _frame_payload(raw_line.decode("utf-8", errors="replace"))
+                if not line.startswith("{"):
+                    continue
+                try:
+                    event = json.loads(line)
+                except (TypeError, ValueError, RecursionError):
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                found: dict[str, Any] = {"_oc_tool_part": False, "_oc_text_tool_call": True}
+                _record_opencode_text_tool_call(event, str(event.get("type") or "").strip().lower(), found)
+                if found["_oc_tool_part"]:
+                    return True
+    except OSError:
+        return True
+    return False
+
+
 def _record_worker_mcp_stream(
     event: dict[str, Any], kind: str, subtype: str, found: dict[str, Any],
 ) -> None:
@@ -2194,6 +2312,7 @@ def _harvest_provider_event(event: object, found: dict[str, Any], depth: int = 0
         found["code"] = next(key for key in PROVIDER_CODE_DISPOSITION if key == code)
 
     _record_opencode_terminal(event, found)
+    _record_opencode_text_tool_call(event, kind, found)
     _record_worker_mcp_stream(event, kind, subtype, found)
 
     if not found["envelope"]:
@@ -2222,7 +2341,9 @@ def _harvest_provider_event(event: object, found: dict[str, Any], depth: int = 0
             _harvest_provider_event(nested, found, depth + 1)
 
 
-def provider_terminal_signal(text: str | None) -> dict[str, Any]:
+def provider_terminal_signal(
+    text: str | None, *, structured_tool_seen: bool = False,
+) -> dict[str, Any]:
     """Read the PROVIDER's own typed terminal envelope out of a bounded tail.
 
     Returns ``{"status", "code", "envelope"}`` where ``status`` is a bounded
@@ -2249,6 +2370,8 @@ def provider_terminal_signal(text: str | None) -> dict[str, Any]:
         "_oc_idle": set(),
         "_oc_completed": set(),
         "_oc_children": set(),
+        "_oc_text_tool_call": False,
+        "_oc_tool_part": False,
     }
     for index, raw_line in enumerate(str(text or "").splitlines()):
         if index >= _MAX_SIGNAL_LINES:
@@ -2279,6 +2402,19 @@ def provider_terminal_signal(text: str | None) -> dict[str, Any]:
     ):
         found["code"] = WORKER_MCP_CONNECT_FAILED
         found["envelope"] = _PROVIDER_TERMINAL_ENVELOPES[6]
+    # A clean opencode turn end (idle/step-finish) names no cause; plain-text tool
+    # calls with zero structured tool parts is the cause. Any real provider error,
+    # status or code already decided stays decided.
+    if (
+        found["_oc_text_tool_call"]
+        and not found["_oc_tool_part"]
+        and not structured_tool_seen
+        and not found["code"]
+        and found["status"] is None
+        and found["envelope"] in {"", _PROVIDER_TERMINAL_ENVELOPES[4], _PROVIDER_TERMINAL_ENVELOPES[5]}
+    ):
+        found["code"] = PROVIDER_TEXT_TOOL_CALL_PROTOCOL
+        found["envelope"] = _PROVIDER_TERMINAL_ENVELOPES[7]
     return {
         "status": found["status"],
         "code": found["code"],
@@ -2356,6 +2492,7 @@ def _legacy_failure_disposition(
     reason: str | None = None,
     stdout_tail: str | None = None,
     stderr_tail: str | None = None,
+    structured_tool_seen: bool = False,
 ) -> dict[str, Any]:
     """The R4 three-way class and the evidence string that named it.
 
@@ -2398,7 +2535,7 @@ def _legacy_failure_disposition(
         }
 
     for tail in (stderr_tail, stdout_tail):
-        signal = provider_terminal_signal(tail)
+        signal = provider_terminal_signal(tail, structured_tool_seen=structured_tool_seen)
         if signal["envelope"] not in _PROVIDER_TERMINAL_ENVELOPES:
             continue
         code = str(signal["code"])
@@ -2444,6 +2581,7 @@ def failure_disposition(
     stdout_tail: str | None = None,
     stderr_tail: str | None = None,
     terminal_state: str | None = None,
+    structured_tool_seen: bool = False,
 ) -> dict[str, Any]:
     """Name the class of one terminal failure, the typed action it selects, and
     the evidence that named both.
@@ -2461,6 +2599,7 @@ def failure_disposition(
         reason=reason,
         stdout_tail=stdout_tail,
         stderr_tail=stderr_tail,
+        structured_tool_seen=structured_tool_seen,
     )
     cause, authority = _tail_cause(
         evidence=str(legacy["evidence"]),
@@ -2526,13 +2665,30 @@ def failure_disposition_from_paths(
             "provider_code": "",
             "envelope": "",
         }
-    return failure_disposition(
+    stdout_tail = _read_log_tail(stdout_path)
+    stderr_tail = _read_log_tail(stderr_path)
+    disposition = failure_disposition(
         refusal_kind=refusal_kind,
         reason=error,
-        stdout_tail=_read_log_tail(stdout_path),
-        stderr_tail=_read_log_tail(stderr_path),
+        stdout_tail=stdout_tail,
+        stderr_tail=stderr_tail,
         terminal_state=state,
     )
+    if disposition["provider_code"] != PROVIDER_TEXT_TOOL_CALL_PROTOCOL:
+        return disposition
+    # The tail drops whole lines at its far edge and the signal reader stops after
+    # _MAX_SIGNAL_LINES lines, so a structured tool part elsewhere in the stream is
+    # invisible to it; only the bounded whole-stream check can prove zero tool calls.
+    if opencode_stream_has_tool_part(stdout_path):
+        return failure_disposition(
+            refusal_kind=refusal_kind,
+            reason=error,
+            stdout_tail=stdout_tail,
+            stderr_tail=stderr_tail,
+            terminal_state=state,
+            structured_tool_seen=True,
+        )
+    return disposition
 
 
 def terminal_workspace_cleanup_allowed(
@@ -2913,6 +3069,7 @@ _PROVIDER_CODE_CAUSE: dict[str, str] = {
     "max_output_tokens": CAUSE_PROVIDER_TRANSIENT,
     "provider_unreachable": CAUSE_PROVIDER_TRANSIENT,
     WORKER_MCP_CONNECT_FAILED: CAUSE_PROVIDER_TRANSIENT,
+    PROVIDER_TEXT_TOOL_CALL_PROTOCOL: CAUSE_PROVIDER_TRANSIENT,
     "overloaded_error": CAUSE_PROVIDER_CAPACITY,
     "rate_limit_error": CAUSE_PROVIDER_CAPACITY,
     "authentication_failed": CAUSE_PROVIDER_CREDENTIAL,
@@ -2953,6 +3110,8 @@ _REASON_CAUSE: dict[str, str] = {
     "rework_no_delta": CAUSE_CANDIDATE_CODE,
     # A writable attempt that changed nothing: a provider fault, not candidate code or the sandbox.
     PROVIDER_NO_EFFECT: CAUSE_PROVIDER_RUNTIME_UNCLASSIFIED,
+    # The model wrote its tool calls as text: another route can run the card, this one cannot.
+    PROVIDER_TEXT_TOOL_CALL_PROTOCOL: CAUSE_PROVIDER_TRANSIENT,
     "claude_subscription_session_refresh_required": CAUSE_PROVIDER_CREDENTIAL,
     "validation_unsupported_in_sandbox": CAUSE_SANDBOX_UNSUPPORTED,
     # Every control-plane reason that says the CARD ROW moved or that this
