@@ -559,9 +559,108 @@ class TestProbeRuleset:
 
 _POOL_SOURCE = (
     "import multiprocessing as mp\n"
-    "with mp.Pool(2) as pool:\n"
+    "with mp.get_context('forkserver').Pool(2) as pool:\n"
     "    assert pool.map(abs, [-1, -2]) == [1, 2]\n"
 )
+
+
+class TestLandlockShortTmpdir:
+    def test_short_tmpdir_changes_nothing(self, tmp_path: Path) -> None:
+        assert worker_workspace._landlock_short_tmpdir("/tmp/x", [str(tmp_path)]) is None
+
+    def test_long_tmpdir_gets_a_private_dir_inside_the_candidate(
+        self, tmp_path: Path
+    ) -> None:
+        result = worker_workspace._landlock_short_tmpdir(
+            "t" * 5000,
+            ["", str(tmp_path / "missing"), str(tmp_path)],
+            sun_path_budget=4096,
+        )
+        assert result is not None
+        created = Path(result)
+        try:
+            assert created.is_dir() and created.parent == tmp_path
+            if os.name == "posix":
+                assert created.stat().st_mode & 0o777 == 0o700
+        finally:
+            shutil.rmtree(created, ignore_errors=True)
+
+    def test_no_usable_candidate_keeps_the_old_tmpdir(self, tmp_path: Path) -> None:
+        too_long_root = str(tmp_path)
+        assert (
+            worker_workspace._landlock_short_tmpdir(
+                "t" * 200,
+                [too_long_root, str(tmp_path / "missing")],
+                sun_path_budget=len(too_long_root) + 10,
+            )
+            is None
+        )
+        assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or not os.path.isdir("/tmp"),
+    reason="metadata broker openat2 is Linux-only",
+)
+class TestBrokerSocketChmod:
+    @pytest.fixture
+    def scratch(self):
+        import socket
+        import tempfile
+        from pathlib import PurePosixPath
+
+        root = tempfile.mkdtemp(prefix="awhs", dir="/tmp")
+        dir_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        socks: list[socket.socket] = []
+
+        def bind(name: str, where: str = root) -> str:
+            sock = socket.socket(socket.AF_UNIX)
+            socks.append(sock)
+            path = os.path.join(where, name)
+            sock.bind(path)
+            return path
+
+        try:
+            yield root, [(dir_fd, PurePosixPath(root))], bind
+        finally:
+            for sock in socks:
+                sock.close()
+            os.close(dir_fd)
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_socket_chmod_is_emulated_beneath_the_scratch(self, scratch) -> None:
+        _root, specs, bind = scratch
+        path = bind("listener")
+        os.chmod(path, 0o755)
+        fd, mutate = worker_workspace._metadata_broker_verify_target_any(
+            path, specs, 0o600
+        )
+        try:
+            assert mutate is True
+            worker_workspace._metadata_broker_emulate_fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
+        assert os.stat(path).st_mode & 0o777 == 0o600
+
+    def test_socket_outside_the_scratch_is_refused(self, scratch) -> None:
+        import tempfile
+
+        _root, specs, bind = scratch
+        other = tempfile.mkdtemp(prefix="awho", dir="/tmp")
+        try:
+            path = bind("outside", other)
+            with pytest.raises(WorkspaceError, match="metadata_broker_outside_scratch"):
+                worker_workspace._metadata_broker_verify_target_any(path, specs, 0o600)
+        finally:
+            shutil.rmtree(other, ignore_errors=True)
+
+    def test_symlink_to_a_socket_is_refused(self, scratch) -> None:
+        root, specs, bind = scratch
+        target = bind("listener")
+        link = os.path.join(root, "link")
+        os.symlink(target, link)
+        with pytest.raises(WorkspaceError, match="metadata_broker_openat2_failed"):
+            worker_workspace._metadata_broker_verify_target_any(link, specs, 0o600)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Landlock is Linux-only")
@@ -580,9 +679,11 @@ def test_real_landlock_validation_runs_multiprocessing_pool(tmp_path: Path) -> N
         workspace, backend="landlock"
     )
     try:
+        long_tmp = scratch / ("t" * 90)
+        long_tmp.mkdir(mode=0o700)
         env = os.environ.copy()
         for name in ("TMPDIR", "TMP", "TEMP"):
-            env[name] = str(scratch)
+            env[name] = str(long_tmp)
 
         def run(grant: bool) -> subprocess.CompletedProcess[str]:
             argv = worker_workspace.sandbox_argv(

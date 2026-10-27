@@ -9096,6 +9096,7 @@ def _apply_landlock(
     exec_scratch: Path | None = None,
     worker_temp: Path | None = None,
     semlock_dev_shm: Path | None = None,
+    short_tmp: Path | None = None,
 ) -> None:
     workspace = workspace.resolve()
     home = home.resolve()
@@ -9129,6 +9130,10 @@ def _apply_landlock(
             if worker_temp.is_symlink() or not worker_temp.is_dir():
                 raise WorkspaceError(f"landlock_worker_temp_not_directory:{worker_temp}")
             _landlock_add_path_rule(libc, ruleset_fd, worker_temp, handled)
+        if short_tmp is not None:
+            if short_tmp.is_symlink() or not short_tmp.is_dir():
+                raise WorkspaceError(f"landlock_short_tmp_not_directory:{short_tmp}")
+            _landlock_add_path_rule(libc, ruleset_fd, short_tmp, handled)
         for device in ("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"):
             path = Path(device)
             if path.exists():
@@ -9311,9 +9316,11 @@ def _openat2_beneath(dir_fd: int, relative: str, flags: int) -> int:
     )
     if fd < 0:
         error = ctypes.get_errno()
-        raise WorkspaceError(
+        failure = WorkspaceError(
             f"metadata_broker_openat2_failed:{relative}:{os.strerror(error)}"
         )
+        failure.errno = error  # type: ignore[attr-defined]
+        raise failure
     return int(fd)
 
 
@@ -9501,8 +9508,9 @@ def _metadata_broker_verify_fd(
     already hardlinked config.lock to its own mode). That one verified no-op
     returns False so the caller skips the real fchmod and the shared inode is
     never touched; any missing or different requested mode against a hardlink
-    stays metadata_broker_hardlink_forbidden. Special files (devices,
-    sockets, FIFOs) remain denied.
+    stays metadata_broker_hardlink_forbidden. An owned single-link socket
+    is permitted (forkserver chmods its AF_UNIX listener); devices and
+    FIFOs remain denied.
 
     Returns True only after the descriptor is authenticated for the real
     fchmod syscall branch; False means the verified request is already
@@ -9510,6 +9518,10 @@ def _metadata_broker_verify_fd(
     """
     info = os.fstat(fd)
     if stat.S_ISDIR(info.st_mode):
+        if not stat_owned_by_current_user(info):
+            raise WorkspaceError(f"metadata_broker_foreign_owner:{candidate}")
+        return True
+    if stat.S_ISSOCK(info.st_mode) and info.st_nlink == 1:
         if not stat_owned_by_current_user(info):
             raise WorkspaceError(f"metadata_broker_foreign_owner:{candidate}")
         return True
@@ -9568,7 +9580,23 @@ def _metadata_broker_verify_target(
     rel_str = relative.as_posix()
     if rel_str in ("", "."):
         raise WorkspaceError(f"metadata_broker_scratch_root_target:{candidate}")
-    fd = _openat2_beneath(scratch_fd, rel_str, os.O_RDONLY | os.O_NOCTTY)
+    try:
+        fd = _openat2_beneath(scratch_fd, rel_str, os.O_RDONLY | os.O_NOCTTY)
+    except WorkspaceError as exc:
+        if getattr(exc, "errno", None) != errno.ENXIO:
+            raise
+        # open(2) of a socket (forkserver chmods its AF_UNIX listener) fails
+        # ENXIO: re-acquire the same relative path O_PATH under the identical
+        # kernel resolution flags, and keep the denial unless it is a socket.
+        fd = _openat2_beneath(scratch_fd, rel_str, os.O_PATH)
+        try:
+            is_socket = stat.S_ISSOCK(os.fstat(fd).st_mode)
+        except BaseException:
+            os.close(fd)
+            raise
+        if not is_socket:
+            os.close(fd)
+            raise exc
     try:
         info = os.fstat(fd)
         if stat.S_ISDIR(info.st_mode):
@@ -10216,7 +10244,12 @@ def _metadata_broker_emulate_fchmod(fd: int, mode: int) -> None:
     and never a path, so denial telemetry stays path-free.
     """
     try:
-        os.fchmod(fd, mode)
+        if stat.S_ISSOCK(os.fstat(fd).st_mode):
+            # An O_PATH socket fd cannot be fchmod'd; chmod its magic link,
+            # which resolves to exactly this already-verified inode.
+            os.chmod(f"/proc/self/fd/{fd}", mode)
+        else:
+            os.fchmod(fd, mode)
     except PermissionError as exc:
         raise _MetadataBrokerEmulationRefused(
             "metadata_broker_emulation_refused:fchmod"
@@ -11272,6 +11305,32 @@ def _seccomp_notify_runtime_supported() -> bool:
             os.close(listener_fd)
 
 
+VALIDATION_SHORT_TMP_ROOT_ENV = "AIWORKHUB_VALIDATION_SHORT_TMP_ROOT"
+
+
+def _landlock_short_tmpdir(
+    tmpdir: str, candidates: Iterable[str], *, sun_path_budget: int = 107
+) -> str | None:
+    """Return a private 0700 dir short enough for multiprocessing's AF_UNIX listener.
+
+    ``<TMPDIR>/pymp-XXXXXXXX/listener-XXXXXXXX`` must fit ``sun_path``; None keeps
+    the caller's TMPDIR (already short, or no usable short root).
+    """
+    suffix = 40  # "/pymp-XXXXXXXX/listener-XXXXXXXX" plus slack
+    if len(tmpdir) + suffix <= sun_path_budget:
+        return None
+    for root in candidates:
+        if not root or len(root) + len("/awh-XXXXXXXX") + suffix > sun_path_budget:
+            continue
+        if not os.path.isdir(root) or not os.access(root, os.W_OK | os.X_OK):
+            continue
+        try:
+            return tempfile.mkdtemp(prefix="awh-", dir=root)
+        except OSError:
+            continue
+    return None
+
+
 def _landlock_exec(argv: list[str]) -> int:
     import socket
 
@@ -11311,25 +11370,49 @@ def _landlock_exec(argv: list[str]) -> int:
     semlock_dev_shm = Path(args.semlock_dev_shm) if args.semlock_dev_shm else None
     if args.outer_validation_authority:
         plant_outer_validation_authority(workspace, exec_scratch=exec_scratch)
-    _apply_landlock(
-        workspace,
-        home,
-        args.allow,
-        exec_scratch,
-        worker_temp=worker_temp,
-        semlock_dev_shm=semlock_dev_shm,
-    )
-    if args.cwd is not None:
-        # Re-validate against this exec'd child's own view of the workspace
-        # (fail closed rather than trusting the parent-provided flag) --
-        # traversal/absolute paths are already rejected before this argv is
-        # built, so only symlink-escape/existence can differ here.
-        chdir_target = _require_beneath(workspace, workspace / args.cwd)
-        if chdir_target.is_symlink() or not chdir_target.is_dir():
-            raise WorkspaceError(f"landlock_cwd_not_directory:{args.cwd}")
-    else:
-        chdir_target = workspace
-    os.chdir(chdir_target)
+    short_tmp: Path | None = None
+    tmpdir = os.environ.get("TMPDIR", "")
+    if exec_scratch is not None and tmpdir:
+        try:
+            inside_scratch = Path(tmpdir).resolve().is_relative_to(exec_scratch)
+        except OSError:
+            inside_scratch = False
+        short_root = os.environ.get(VALIDATION_SHORT_TMP_ROOT_ENV, "")
+        short_dir = (
+            _landlock_short_tmpdir(tmpdir, (short_root, "/tmp"))
+            if inside_scratch
+            else None
+        )
+        if short_dir is not None:
+            short_tmp = Path(short_dir).resolve()
+            for name in ("TMPDIR", "TMP", "TEMP"):
+                os.environ[name] = str(short_tmp)
+            os.environ[VALIDATION_SHORT_TMP_ROOT_ENV] = str(short_tmp)
+    try:
+        _apply_landlock(
+            workspace,
+            home,
+            args.allow,
+            exec_scratch,
+            worker_temp=worker_temp,
+            semlock_dev_shm=semlock_dev_shm,
+            short_tmp=short_tmp,
+        )
+        if args.cwd is not None:
+            # Re-validate against this exec'd child's own view of the workspace
+            # (fail closed rather than trusting the parent-provided flag) --
+            # traversal/absolute paths are already rejected before this argv is
+            # built, so only symlink-escape/existence can differ here.
+            chdir_target = _require_beneath(workspace, workspace / args.cwd)
+            if chdir_target.is_symlink() or not chdir_target.is_dir():
+                raise WorkspaceError(f"landlock_cwd_not_directory:{args.cwd}")
+        else:
+            chdir_target = workspace
+        os.chdir(chdir_target)
+    except BaseException:
+        if short_tmp is not None:
+            shutil.rmtree(short_tmp, ignore_errors=True)
+        raise
     if exec_scratch is not None and _seccomp_notify_supported():
         # NF27: the validator child previously received EPERM for the whole
         # chmod family, breaking unmodified tools (git init writing
@@ -11338,67 +11421,78 @@ def _landlock_exec(argv: list[str]) -> int:
         # operations on stable, request-owned regular files and owned
         # directories beneath this exact validation exec scratch from
         # this trusted parent.
-        parent_sock, child_sock = socket.socketpair()
-        broker_parent_pid = os.getpid()
-        helper_argv = [
-            sys.executable,
-            str(Path(__file__).resolve()),
-            "--metadata-broker-child",
-            "--parent-pid",
-            str(broker_parent_pid),
-            "--socket-fd",
-            str(child_sock.fileno()),
-            "--",
-            *command,
-        ]
-        # This branch installs a listener of our own, so the roots that decide
-        # every brokered syscall are exactly this request's: nothing is left to
-        # an outer boundary and nothing is declared beyond them.
-        _publish_metadata_authority_roots(
-            declared_metadata_authority_roots(exec_scratch, worker_temp)
-        )
         try:
-            child_process = subprocess.Popen(
-                helper_argv,
-                close_fds=True,
-                pass_fds=(child_sock.fileno(),),
-                start_new_session=True,
-                env=os.environ.copy(),
+            parent_sock, child_sock = socket.socketpair()
+            broker_parent_pid = os.getpid()
+            helper_argv = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--metadata-broker-child",
+                "--parent-pid",
+                str(broker_parent_pid),
+                "--socket-fd",
+                str(child_sock.fileno()),
+                "--",
+                *command,
+            ]
+            # This branch installs a listener of our own, so the roots that decide
+            # every brokered syscall are exactly this request's: nothing is left to
+            # an outer boundary and nothing is declared beyond them.
+            _publish_metadata_authority_roots(
+                (
+                    *declared_metadata_authority_roots(exec_scratch, worker_temp),
+                    *((str(short_tmp),) if short_tmp is not None else ()),
+                )
             )
-        except OSError as exc:
-            parent_sock.close()
+            try:
+                child_process = subprocess.Popen(
+                    helper_argv,
+                    close_fds=True,
+                    pass_fds=(child_sock.fileno(),),
+                    start_new_session=True,
+                    env=os.environ.copy(),
+                )
+            except OSError as exc:
+                parent_sock.close()
+                child_sock.close()
+                raise WorkspaceError(
+                    f"metadata_broker_child_start_failed:{type(exc).__name__}:{exc}"
+                ) from exc
+            child_pid = child_process.pid
             child_sock.close()
-            raise WorkspaceError(
-                f"metadata_broker_child_start_failed:{type(exc).__name__}:{exc}"
-            ) from exc
-        child_pid = child_process.pid
-        child_sock.close()
-        try:
-            listener_fd, listener_error = _metadata_broker_handshake_receive(
-                parent_sock,
-                time.monotonic() + _METADATA_BROKER_HANDSHAKE_SECONDS,
-            )
+            try:
+                listener_fd, listener_error = _metadata_broker_handshake_receive(
+                    parent_sock,
+                    time.monotonic() + _METADATA_BROKER_HANDSHAKE_SECONDS,
+                )
+            finally:
+                parent_sock.close()
+            if listener_fd < 0:
+                _kill_validator_group(child_pid)
+                _reap_validator(child_pid)
+                suffix = f":{listener_error}" if listener_error else ""
+                raise WorkspaceError(
+                    f"metadata_broker_listener_transfer_failed{suffix}"
+                )
+            try:
+                # NF430: authorize the request-owned worker temp authority as an
+                # additional broker resolution root (identically owner/inode/symlink
+                # verified) so a worker's TMPDIR-rooted Git/pytest ``config.lock``
+                # chmod beneath ``.aiworkhub/temp/worker/<request_id>`` is emulated,
+                # exactly like the exec scratch, without widening any other path.
+                return _run_metadata_broker(
+                    listener_fd,
+                    child_pid,
+                    exec_scratch,
+                    extra_roots=tuple(
+                        root for root in (worker_temp, short_tmp) if root is not None
+                    ),
+                )
+            finally:
+                os.close(listener_fd)
         finally:
-            parent_sock.close()
-        if listener_fd < 0:
-            _kill_validator_group(child_pid)
-            _reap_validator(child_pid)
-            suffix = f":{listener_error}" if listener_error else ""
-            raise WorkspaceError(f"metadata_broker_listener_transfer_failed{suffix}")
-        try:
-            # NF430: authorize the request-owned worker temp authority as an
-            # additional broker resolution root (identically owner/inode/symlink
-            # verified) so a worker's TMPDIR-rooted Git/pytest ``config.lock``
-            # chmod beneath ``.aiworkhub/temp/worker/<request_id>`` is emulated,
-            # exactly like the exec scratch, without widening any other path.
-            return _run_metadata_broker(
-                listener_fd,
-                child_pid,
-                exec_scratch,
-                extra_roots=(worker_temp,) if worker_temp is not None else (),
-            )
-        finally:
-            os.close(listener_fd)
+            if short_tmp is not None:
+                shutil.rmtree(short_tmp, ignore_errors=True)
     if _metadata_broker_evidence_fd is not None:
         os.close(_metadata_broker_evidence_fd)
         _metadata_broker_evidence_fd = None
@@ -11421,8 +11515,11 @@ def _landlock_exec(argv: list[str]) -> int:
     # widening is stated rather than assumed away; the declaration is telemetry
     # and grants the command nothing it did not already have.
     _publish_metadata_authority_roots(
-        declared_metadata_authority_roots(
-            exec_scratch, worker_temp, exempted_chmod_syscalls
+        (
+            *declared_metadata_authority_roots(
+                exec_scratch, worker_temp, exempted_chmod_syscalls
+            ),
+            *((str(short_tmp),) if short_tmp is not None else ()),
         )
     )
     # Only opencode 2.x needs it (it aborts on EPERM chmod of its own DB); other CLIs keep EPERM.
@@ -11430,6 +11527,8 @@ def _landlock_exec(argv: list[str]) -> int:
         brokered_chmod_syscalls=exempted_chmod_syscalls,
         noop_chmod=args.noop_chmod and exec_scratch is None,
     )
+    # ponytail: execvpe replaces this process, so nothing can remove short_tmp afterwards;
+    # ceiling is one 0700 dir under the short root per fallback run, reclaimed by tmp cleaners.
     os.execvpe(command[0], command, os.environ.copy())
     return 126
 
