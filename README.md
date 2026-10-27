@@ -372,9 +372,9 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.68
+## What's new in 0.12.69
 
-- No seat, the manager included, may Read or Write an indexed file directly any more. `aiworkhub_doctor_diagnose` gives one health verdict, AI Memory entries carry timestamps with a read-only review report, and accept reuses an exactly matching combined-tree validation instead of rerunning the suite. Quota refusals from opencode (HTTP 402) and GLM (code 1308) open the right route circuit, GLM, DeepSeek and OpenCode workers fill the Effort column, and `review_packet` shows the reviewers' sealed findings.
+- MCP tool results carry their payload once, worker launches skip 20-43 s of repeated import parsing, and an idle dashboard redraws only the sections that changed. `review_packet` works for every review-ready card and lists what still blocks accept, the learning commit works for any repository layout, task-queue claim contention defers instead of failing the card, dashboard NeedFix actions work inside VS Code, and the process-tree kill never follows a recycled PID.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Continuous Audit as a Service (CAAS)

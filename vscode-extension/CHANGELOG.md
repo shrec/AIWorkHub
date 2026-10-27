@@ -1,5 +1,21 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.69 — 2026-10-27
+
+### Added
+
+- Bundled runtime 0.12.69: `roadmap_list` and `roadmap_snapshot` fold long bodies to their size and hash unless `full=true` (NF-2026-01726).
+
+### Changed
+
+- The dashboard reads each snapshot source once per refresh, and an idle refresh exchanges section digests and redraws only the sections that changed (NF-2026-00633, NF-2026-01731).
+- Bundled runtime 0.12.69: MCP tool results carry their payload once (NF-2026-00715); worker launches memoize the import closure (NF-2026-00993); one batch card read per completion-inbox bucket (NF-2026-00632); seeded reviewers launch before the GC sweep (NF-2026-01730).
+
+### Fixed
+
+- Dashboard NeedFix transitions, archive, purge and convert ask for their reason and confirmation in the extension host, so they no longer do nothing inside the VS Code webview (NF-2026-01467).
+- Bundled runtime 0.12.69: concurrent workforce catalog upserts (NF-2026-00503); Claude CLI worker MCP connect timeout (NF-2026-01717); oversized `owner_prompt` refused before the claim (NF-2026-01728); rework baseline after canonical drift (NF-2026-01452); `needfix_convert` successor id collisions (NF-2026-01727); full Python signatures in Source Graph (NF-2026-01402); a third launch of a twice-rejected contract is refused (NF-2026-00638); `supersede --by` rebinds the NeedFix (NF-2026-00871); production callers behind a same-named test double (NF-2026-00909); typed no-new-lesson dispositions (NF-2026-00899); process-tree kill without `taskkill` and across recycled PIDs (NF-2026-01733, NF-2026-01734, NF-2026-01736); combined-tree validation of a rework (NF-2026-01735); task-queue claim contention defers (NF-2026-00804); learning commit repo area (NF-2026-01744); `review_packet` for every review-ready card (NF-2026-01741).
+
 ## 0.12.68 — 2026-10-27
 
 ### Added

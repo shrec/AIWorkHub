@@ -6,6 +6,40 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.69] - 2026-10-27
+
+### Added
+
+- `roadmap_list` and `roadmap_snapshot` fold outcome and acceptance bodies to their identity (`bytes`, `length`, `sha256`) by default; `full=True` keeps the verbatim reply (NF-2026-01726).
+
+### Changed
+
+- An MCP tool result carries its JSON payload once, in text content, instead of also repeating it as `structuredContent`. Every manager and worker call puts half the bytes into context (NF-2026-00715).
+- `seed_closure` memoizes import resolution and parsed ASTs for one closure walk. Re-resolving and re-parsing the same modules for every seed root cost 20-43 s per worker launch (NF-2026-00993).
+- The dashboard reads each snapshot source once per refresh instead of once per panel. An idle refresh sends the section digests it holds and receives only the sections that changed; a digest miss or a malformed delta falls back to one full request (NF-2026-00633, NF-2026-01731).
+- The completion inbox reads each status and topic bucket with one batch card read instead of one `taskctl show` per card (NF-2026-00632).
+- The reconciler launches seeded reviewers before the finalized-workspace GC sweep, and the sweep parses the process ledger once instead of once per candidate (NF-2026-01730).
+- The finalized-workspace GC sweep and the vscode_lm worker tool bridge moved out of `process_launcher.py` into their own modules (NF-2026-01729).
+
+### Fixed
+
+- Concurrent workforce catalog upserts serialize under an advisory file lock, so a later write no longer drops an earlier row (NF-2026-00503).
+- Claude CLI workers get `MCP_TIMEOUT=120000`. A worker whose AIWorkHub MCP server failed at init and that made no edits is classified `worker_mcp_connect_failed`, a transient failure (NF-2026-01717).
+- Dashboard NeedFix transitions, archive, purge and convert collect their reasons and confirmations in the extension host. VS Code webviews answered `window.confirm` and `window.prompt` with false or null, so every such action was a no-op (NF-2026-01467).
+- An `owner_prompt` over the size cap is refused before the launch claim, so the card stays pending and unclaimed (NF-2026-01728).
+- A rework successor merges against its predecessor's parent baseline when the canonical tree moved between the two launches (NF-2026-01452).
+- `needfix_convert` skips a successor task id that an archived or finished card already holds, instead of failing with `task_terminal` on every retry (NF-2026-01727).
+- Source Graph Python signatures keep defaults, varargs, keyword-only parameters, annotations and class keywords, so optional parameters no longer read as required (NF-2026-01402).
+- A third launch of a contract already rejected twice as candidate code is refused (NF-2026-00638).
+- `supersede --by` rebinds the linked NeedFix to the successor card (NF-2026-00871).
+- A same-named test double no longer hides a symbol's production callers in Source Graph (NF-2026-00909).
+- A typed no-new-lesson disposition closes a decision out for the learning gate (NF-2026-00899).
+- The process-tree kill terminates the root and its descendants natively when the sandbox denies `taskkill`, and a rework delta read stays under the trusted containment root (NF-2026-01733, NF-2026-01734). The native fallback adopts a child only when the child was created no earlier than its recorded parent, so it never follows a recycled PID (NF-2026-01736).
+- Combined-tree validation no longer re-materializes the rework predecessor, which failed accept with `combined_tree_unexpected_delta` (NF-2026-01735).
+- A trusted, retryable task-queue claim contention before launch defers the launch instead of recording a terminal block (NF-2026-00804).
+- The learning commit derives its repo area from the promoted paths for any repository layout, so it no longer fails with `learning_commit_repo_area_not_derivable` (NF-2026-01744).
+- `review_packet` builds the packet for every `review_ready` card. While the manager-ready marker is still pending, the packet reports `manager_readiness="pending"` and lists the outstanding accept blockers instead of refusing with `manager_review_not_ready` (NF-2026-01741).
+
 ## [0.12.68] - 2026-10-27
 
 ### Added
