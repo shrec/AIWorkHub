@@ -13,6 +13,10 @@ Fail closed throughout: a refused send names its reason and writes nothing; an
 inbox file that fails any check is moved to ``quarantine`` with a sidecar reason
 JSON and counted, never silently dropped.  The sender only ever creates files
 in the recipient's spool -- it never lists, edits or deletes anything there.
+
+Phase 2 (``hub_mail_net``) carries the same envelopes between machines: mail
+to or from a paired peer's hub is signed with that peer's secret instead of
+the machine key, and a sender hub no key belongs to is ``unknown_sender``.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ import re
 import secrets
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -48,6 +53,7 @@ DEFAULT_TTL = timedelta(days=30)
 KEY_BYTES = 32
 MAX_LIST_LIMIT = 200
 MAX_SCAN_FILES = 1000
+MAX_LOCAL_HUBS = 256
 _TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 _MESSAGE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _HUB_ID_RE = re.compile(r"^repo_[a-f0-9]{32}$")
@@ -293,15 +299,24 @@ def validate_envelope(envelope: Any) -> str:
 
 
 def check_envelope(
-    envelope: Any, *, key: bytes, local_hub_id: str, now: datetime | None = None,
+    envelope: Any, *, key: bytes | Keyring, local_hub_id: str, now: datetime | None = None,
     check_expiry: bool = True,
 ) -> str:
-    """Every read-side check; ``""`` when the mail is valid for this hub."""
+    """Every read-side check; ``""`` when the mail is valid for this hub.
+
+    With a :class:`Keyring` the signing key is picked by ``from_hub.hub_id``:
+    a local hub signs with the machine key (or the peer's secret when it
+    writes to a peer hub), a peer hub with that peer's secret, and any other
+    sender is ``unknown_sender``.  Raw ``bytes`` check against that one key.
+    """
 
     reason = validate_envelope(envelope)
     if reason:
         return reason
-    if not hmac.compare_digest(str(envelope["signature"]), sign(envelope, key)):
+    signing_key = key.key_for(envelope) if isinstance(key, Keyring) else key
+    if signing_key is None:
+        return "unknown_sender"
+    if not hmac.compare_digest(str(envelope["signature"]), sign(envelope, signing_key)):
         return "bad_signature"
     if envelope["to_hub"]["hub_id"] != local_hub_id:
         return "wrong_to_hub"
@@ -320,15 +335,74 @@ def local_hub(root: Path) -> tuple[dict[str, str] | None, dict[str, Any] | None]
     return {"hub_id": hub_id, "repo_root": str(root), "aiworkhub_version": __version__}, None
 
 
-def _known_hub_ids() -> set[str]:
-    registry = shared_router.list_known_repositories(include_inactive=True, limit=256)
-    if not registry.get("ok"):
-        raise HubMailError(str(registry.get("error") or "router_registry_unavailable"))
-    return {
-        str(record.get("repo_id"))
-        for record in registry.get("repositories", [])
-        if isinstance(record, dict)
-    }
+def local_hubs(home: Path | None = None) -> dict[str, str]:
+    """This machine's hubs, ``hub_id -> repo_name``, from the router registry under ``home``."""
+
+    directory = shared_router.registry_dir(home)
+    try:
+        paths = sorted(directory.glob("*.json")) if directory.is_dir() else []
+    except OSError as exc:
+        raise HubMailError(f"registry_unavailable:{type(exc).__name__}") from exc
+    now = time.time()
+    hubs: dict[str, str] = {}
+    for path in paths[:MAX_LOCAL_HUBS]:
+        record = shared_router._bounded_record(path, now=now)
+        if record.get("ok"):
+            hubs[str(record["repo_id"])] = str(record.get("repo_name") or "")
+    return hubs
+
+
+@dataclass(frozen=True)
+class Keyring:
+    """Which key signs which envelope: the machine key or one peer's secret.
+
+    ``peers`` maps a peer hub id to its single owning peer record (see
+    ``hub_mail_net.peer_hub_index``): a hub id this machine owns, or one two
+    peers claim, is in nobody's map, so no peer passes as a local hub or as
+    another peer.
+    """
+
+    local_key: bytes
+    local_hub_ids: frozenset[str]
+    peers: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def peer_key(self, hub_id: str) -> bytes | None:
+        peer = self.peers.get(hub_id)
+        return bytes.fromhex(peer["secret"]) if peer is not None else None
+
+    def key_for(self, envelope: dict[str, Any]) -> bytes | None:
+        from_id, to_id = envelope["from_hub"]["hub_id"], envelope["to_hub"]["hub_id"]
+        if from_id in self.local_hub_ids:
+            return self.peer_key(to_id) or self.local_key
+        return self.peer_key(from_id)
+
+    def node(self, hub_id: str) -> dict[str, str] | None:
+        peer = self.peers.get(hub_id)
+        if peer is None:
+            return None
+        return {"machine_id": peer["machine_id"], "machine_label": peer["machine_label"]}
+
+
+def load_keyring(home: Path | None = None) -> Keyring:
+    from . import hub_mail_net  # the transport imports this module
+
+    local_ids = frozenset(local_hubs(home))
+    return Keyring(
+        local_key=load_or_create_key(home),
+        local_hub_ids=local_ids,
+        peers=hub_mail_net.peer_hub_index(home, exclude=local_ids),
+    )
+
+
+def _retry_pending(home: Path | None, now: datetime | None) -> None:
+    """Give queued peer mail another chance; never fails the caller's read or send."""
+
+    from . import hub_mail_net
+
+    try:
+        hub_mail_net.retry_pending(home, now=now)
+    except (HubMailError, OSError):
+        pass
 
 
 def _read_bounded(path: Path) -> bytes:
@@ -381,7 +455,9 @@ def _quarantine(path: Path, hub_id: str, reason: str, home: Path | None) -> dict
     return {"file": target.name, "reason": reason}
 
 
-def _project(envelope: dict[str, Any], box: str, *, full: bool) -> dict[str, Any]:
+def _project(
+    envelope: dict[str, Any], box: str, *, full: bool, keyring: Keyring | None = None,
+) -> dict[str, Any]:
     mail = {
         "untrusted_data": True,
         "box": box,
@@ -399,6 +475,10 @@ def _project(envelope: dict[str, Any], box: str, *, full: bool) -> dict[str, Any
         "body_bytes": len(envelope["body"].encode("utf-8")),
         "attachment_count": len(envelope["attachments"]),
     }
+    # Mail from a peer machine names that node; its label is display text only.
+    node = keyring.node(envelope["from_hub"]["hub_id"]) if keyring is not None else None
+    if node is not None:
+        mail["from_node"] = node
     if full:
         mail["body"] = envelope["body"]
         mail["attachments"] = [dict(item) for item in envelope["attachments"]]
@@ -406,7 +486,7 @@ def _project(envelope: dict[str, Any], box: str, *, full: bool) -> dict[str, Any
 
 
 def _scan_box(
-    hub_id: str, box: str, *, key: bytes, home: Path | None, now: datetime | None,
+    hub_id: str, box: str, *, key: bytes | Keyring, home: Path | None, now: datetime | None,
 ) -> tuple[list[tuple[Path, dict[str, Any]]], list[dict[str, Any]], int]:
     """Valid envelopes of one box; every invalid file is quarantined, not skipped.
 
@@ -456,7 +536,7 @@ def _quarantine_total(hub_id: str, home: Path | None) -> int:
 
 
 def _find_local(
-    hub_id: str, message_id: str, boxes: tuple[str, ...], *, key: bytes,
+    hub_id: str, message_id: str, boxes: tuple[str, ...], *, key: bytes | Keyring,
     home: Path | None, now: datetime | None,
 ) -> tuple[str, dict[str, Any]] | None:
     for box in boxes:
@@ -525,8 +605,13 @@ def send(
     home: Path | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Redact, build, validate, sign, then spool one mail; refuse fail-closed."""
+    """Redact, build, validate, sign, then spool one mail; refuse fail-closed.
 
+    A local recipient gets the mail in its spool; a paired peer's hub gets it
+    over the network at once or, when unreachable, ``delivery: queued``.
+    """
+
+    _retry_pending(home, now)
     try:
         return _send(
             local=local, to_hub_id=to_hub_id, kind=kind, subject=subject, body=body,
@@ -587,7 +672,7 @@ def _send(
         redacted_attachments.append(
             {"name": _redact_validation_secrets(name), "text": clean, "sha256": _sha256_text(clean)}
         )
-    key = load_or_create_key(home)
+    keyring = load_keyring(home)
     moment = _now(now)
     message_id = uuid.uuid4().hex
     thread_id = message_id
@@ -596,7 +681,7 @@ def _send(
             raise HubMailError("in_reply_to_invalid")
         parent = _find_local(
             local_id, in_reply_to, ("inbox", "archive", "outbox"),
-            key=key, home=home, now=moment,
+            key=keyring, home=home, now=moment,
         )
         if parent is None:
             raise HubMailError("in_reply_to_unknown")
@@ -626,24 +711,39 @@ def _send(
     reason = validate_envelope(envelope)
     if reason:
         raise HubMailError(reason)
-    if to_hub_id not in _known_hub_ids():
+    peer = keyring.peers.get(to_hub_id)
+    if to_hub_id not in keyring.local_hub_ids and peer is None:
         raise HubMailError("unknown_recipient")
-    envelope["signature"] = sign(envelope, key)
+    envelope["signature"] = sign(envelope, keyring.peer_key(to_hub_id) or keyring.local_key)
     data = envelope_bytes(envelope)
     sent_copy = box_dir(local_id, "outbox", home) / f"{message_id}.json"
     _atomic_write(sent_copy, data)
-    try:
-        delivery = deliver(data, to_hub_id=to_hub_id, message_id=message_id, home=home)
-    except (OSError, HubMailError):
-        # A refused send leaves nothing behind, not even the sender's copy.
-        sent_copy.unlink(missing_ok=True)
-        raise
-    return {
-        "ok": delivery != "duplicate_conflict",
+    outcome: dict[str, str]
+    if peer is not None:
+        from . import hub_mail_net
+
+        # The outbox copy stays whatever happens: queued or failed mail is
+        # tracked by its sidecar, never dropped.
+        outcome = hub_mail_net.forward(
+            data, from_hub_id=local_id, to_hub_id=to_hub_id, message_id=message_id,
+            peer=peer, home=home,
+        )
+    else:
+        try:
+            outcome = {"delivery": deliver(data, to_hub_id=to_hub_id, message_id=message_id, home=home)}
+        except (OSError, HubMailError):
+            # A refused send leaves nothing behind, not even the sender's copy.
+            sent_copy.unlink(missing_ok=True)
+            raise
+    result: dict[str, Any] = {
+        "ok": outcome["delivery"] not in {"duplicate_conflict", "delivery_failed"},
         "schema_id": SCHEMA_ID,
-        "delivery": delivery,
+        **outcome,
         "mail": _project(envelope, "outbox", full=False),
     }
+    if peer is not None:
+        result["to_node"] = keyring.node(to_hub_id)
+    return result
 
 
 def inbox(
@@ -652,17 +752,20 @@ def inbox(
 ) -> dict[str, Any]:
     """Validate and list this hub's mail; invalid files go to quarantine."""
 
+    _retry_pending(home, now)
     try:
-        key = load_or_create_key(home)
+        keyring = load_keyring(home)
         boxes = ("inbox", "archive") if include_archived else ("inbox",)
         mails: list[dict[str, Any]] = []
         quarantined: list[dict[str, Any]] = []
         unscanned = 0
         for box in boxes:
-            valid, moved, skipped = _scan_box(local_hub_id, box, key=key, home=home, now=now)
+            valid, moved, skipped = _scan_box(local_hub_id, box, key=keyring, home=home, now=now)
             quarantined.extend(moved)
             unscanned += skipped
-            mails.extend(_project(envelope, box, full=False) for _, envelope in valid)
+            mails.extend(
+                _project(envelope, box, full=False, keyring=keyring) for _, envelope in valid
+            )
         total = _quarantine_total(local_hub_id, home)
     except HubMailError as exc:
         return {"ok": False, "error": str(exc)}
@@ -696,9 +799,9 @@ def show(
     if not isinstance(message_id, str) or not _MESSAGE_ID_RE.fullmatch(message_id):
         return {"ok": False, "error": "message_id_invalid"}
     try:
-        key = load_or_create_key(home)
+        keyring = load_keyring(home)
         found = _find_local(
-            local_hub_id, message_id, ("inbox", "archive"), key=key, home=home, now=now
+            local_hub_id, message_id, ("inbox", "archive"), key=keyring, home=home, now=now
         )
     except HubMailError as exc:
         return {"ok": False, "error": str(exc)}
@@ -707,7 +810,10 @@ def show(
     if found is None:
         return {"ok": False, "error": "message_not_found", "message_id": message_id}
     box, envelope = found
-    return {"ok": True, "schema_id": SCHEMA_ID, "mail": _project(envelope, box, full=True)}
+    return {
+        "ok": True, "schema_id": SCHEMA_ID,
+        "mail": _project(envelope, box, full=True, keyring=keyring),
+    }
 
 
 def archive(
@@ -719,8 +825,8 @@ def archive(
     if not isinstance(message_id, str) or not _MESSAGE_ID_RE.fullmatch(message_id):
         return {"ok": False, "error": "message_id_invalid"}
     try:
-        key = load_or_create_key(home)
-        found = _find_local(local_hub_id, message_id, ("inbox",), key=key, home=home, now=now)
+        keyring = load_keyring(home)
+        found = _find_local(local_hub_id, message_id, ("inbox",), key=keyring, home=home, now=now)
         if found is None:
             return {"ok": False, "error": "message_not_found", "message_id": message_id}
         source = box_dir(local_hub_id, "inbox", home) / f"{message_id}.json"
@@ -733,4 +839,7 @@ def archive(
         return {"ok": False, "error": str(exc)}
     except OSError as exc:
         return {"ok": False, "error": f"spool_write_failed:{type(exc).__name__}"}
-    return {"ok": True, "schema_id": SCHEMA_ID, "mail": _project(found[1], "archive", full=False)}
+    return {
+        "ok": True, "schema_id": SCHEMA_ID,
+        "mail": _project(found[1], "archive", full=False, keyring=keyring),
+    }

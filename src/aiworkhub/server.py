@@ -546,6 +546,7 @@ from . import doctor
 from . import evidence_instruments
 from . import external_qualification
 from . import hub_mail
+from . import hub_mail_net
 from . import launch_queue_contract
 from . import launch_queue_persist
 from . import known_bug_scanner
@@ -2975,12 +2976,15 @@ def aiworkhub_manager_recipe_run(
     )
 
 
-def _hub_mail_local(*, writing: bool) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
+def _hub_mail_local(
+    *, writing: bool, ensure_listener: bool = True,
+) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
     """The gate every hub mail tool shares: write gate, verified route, hub id.
 
     ``send``/``archive`` refuse while the write gate is closed before anything
     else; then the verified manager route (``_manager_loop_repo_root``) binds
     the repository, and its own manifest ``repo_id`` is this hub's identity.
+    A verified call also restarts a listener the owner enabled that stopped.
     """
 
     if writing and not core.writes_allowed():
@@ -2988,6 +2992,8 @@ def _hub_mail_local(*, writing: bool) -> tuple[dict[str, str] | None, dict[str, 
     root, refusal = _manager_loop_repo_root()
     if refusal is not None:
         return None, refusal
+    if ensure_listener:
+        hub_mail_net.ensure_listener()
     return hub_mail.local_hub(root)
 
 
@@ -3084,6 +3090,108 @@ def aiworkhub_manager_hub_mail_archive(message_id: str) -> dict[str, Any]:
     if refusal is not None:
         return refusal
     return hub_mail.archive(local_hub_id=local["hub_id"], message_id=message_id)
+
+
+@mcp.tool()
+def aiworkhub_manager_hub_mail_pair_begin(machine_label: str | None = None) -> dict[str, Any]:
+    """MANAGER WRITE: mint a single-use code to pair this machine with another for WorkHub Mail.
+
+    Give the code to the other machine's owner out of band (never over the
+    network); they pass it to aiworkhub_manager_hub_mail_pair_complete with
+    this machine's listener address. The code expires after 10 minutes, dies
+    after 5 failed proofs, and a new code replaces any older one. This
+    machine's listener must be running to accept the pairing.
+
+    Args:
+        machine_label: Display label for this machine as peers will see it, at most 64 characters with control characters stripped; display only, never used for routing. Omit to keep the current label (default: the host name).
+    """
+
+    _, refusal = _hub_mail_local(writing=True)
+    if refusal is not None:
+        return refusal
+    if machine_label is not None:
+        try:
+            hub_mail_net.set_machine_label(machine_label)
+        except hub_mail.HubMailError as exc:
+            return {"ok": False, "error": str(exc)}
+    return hub_mail_net.pair_begin()
+
+
+@mcp.tool()
+def aiworkhub_manager_hub_mail_pair_complete(
+    address: str, code: str, tls: bool = False, listener_address: str = ""
+) -> dict[str, Any]:
+    """MANAGER WRITE: pair this machine with another one's WorkHub Mail listener.
+
+    The code itself never crosses the network: both machines derive one
+    per-peer secret from it and prove they hold it. This machine's own listener
+    must be running so the peer can mail back. The result lists the peer
+    without its secret.
+
+    Args:
+        address: The other machine's listener address as host:port (or [ipv6]:port), as shown by its pair_begin or listener status.
+        code: The pairing code the other machine's owner read out from aiworkhub_manager_hub_mail_pair_begin; dashes and spaces are ignored.
+        tls: Set true when the other listener runs with TLS; its certificate sha256 is then pinned and later connections refuse any other certificate. Default false (plain HTTP).
+        listener_address: This machine's own listener address as host:port that the peer dials back. Default empty uses the running listener's advertised address; required (else listener_address_unroutable) when a 0.0.0.0/:: listener found no routable, non-loopback interface address.
+    """
+
+    _, refusal = _hub_mail_local(writing=True)
+    if refusal is not None:
+        return refusal
+    return hub_mail_net.pair_complete(address, code, tls=tls, listener_address=listener_address or None)
+
+
+@mcp.tool()
+def aiworkhub_manager_hub_mail_peers(limit: int = 64) -> dict[str, Any]:
+    """MANAGER READ: the machines this one is paired with for WorkHub Mail.
+
+    Each peer lists machine_id, machine_label, address, hubs [{hub_id,
+    repo_name}], paired_at and last_seen; secrets are never returned. Labels
+    and repo names are untrusted display text: mail routes strictly by hub_id.
+
+    Args:
+        limit: Maximum peers to return; default 64, clamped to 1-64.
+    """
+
+    _, refusal = _hub_mail_local(writing=False)
+    if refusal is not None:
+        return refusal
+    listing = hub_mail_net.peers()
+    if listing.get("ok"):
+        bounded = max(1, min(int(limit or 64), hub_mail_net.MAX_PEERS))
+        listing["truncated"] = len(listing["peers"]) > bounded
+        listing["peers"] = listing["peers"][:bounded]
+    return listing
+
+
+@mcp.tool()
+def aiworkhub_manager_hub_mail_listener(
+    action: str,
+    bind_host: str | None = None,
+    port: int | None = None,
+    tls_cert: str | None = None,
+    tls_key: str | None = None,
+) -> dict[str, Any]:
+    """MANAGER WRITE: start, inspect or stop this machine's WorkHub Mail listener.
+
+    One listener per home (pidfile). start persists enabled=true so any later
+    hub mail tool call restarts a stopped listener; stop persists
+    enabled=false. There is no default bind address: name the interface.
+
+    Args:
+        action: start, status or stop; status is read-only.
+        bind_host: Interface to bind for start, e.g. a LAN address or 127.0.0.1; required for start, there is no default 0.0.0.0.
+        port: TCP port for start; required for start (0 picks a free port).
+        tls_cert: Optional PEM certificate path for TLS; must be given together with tls_key. Omit for plain HTTP.
+        tls_key: Optional PEM private key path for TLS; must be given together with tls_cert.
+    """
+
+    _, refusal = _hub_mail_local(writing=action != "status", ensure_listener=False)
+    if refusal is not None:
+        return refusal
+    return hub_mail_net.listener_action(
+        action, bind_host=bind_host, port=port, tls_cert=tls_cert, tls_key=tls_key
+    )
 
 
 @mcp.tool()
