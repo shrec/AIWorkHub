@@ -9409,6 +9409,10 @@ def _is_review_rejection_reroute(card: Mapping[str, Any]) -> bool:
         and _manager_recovery_reroute_episode(card)
     ):
         return False
+    # NF-2026-01747: an older reject-to-pending outlives the zero-change
+    # operational death that followed it; that later episode decides.
+    if _operational_zero_change_after_rejection(card) is not None:
+        return False
     feedback = card.get("review_feedback")
     predecessor = card.get("rework_predecessor")
     if (
@@ -9460,6 +9464,69 @@ def _infrastructure_rejection_without_candidate(
     if _has_retained_candidate_delta(card):
         return False
     return True
+
+
+def _operational_zero_change_after_rejection(
+    card: Mapping[str, Any],
+) -> dict[str, str] | None:
+    """The terminal identity of a zero-change operational death that followed
+    an older rejection, else ``None``.
+
+    A reject-to-pending pins ``rejection_disposition`` to the request it
+    adjudicated and survives every later claim. When the next run then died
+    operationally and the manager retried that exact terminal, the latest
+    episode is the operational one: it produced no candidate, so no
+    review-rejection receipt can describe it. Every condition fails closed:
+    a retained candidate delta, a semantic latest terminal (``validation_failed``
+    or a recorded ``defect`` class), the rejection's own request, or a retry
+    not provably newer than the rejection keeps the review-rejection path.
+    """
+    rejection = card.get("rejection_disposition")
+    if (
+        not isinstance(rejection, dict)
+        or rejection.get("schema_id") != "aiworkhub.rejection_disposition.v1"
+    ):
+        return None
+    if _has_retained_candidate_delta(card):
+        return None
+    if not _provider_runtime_or_cancellation_retry(card):
+        return None
+    if (
+        recorded_failure_class(card)
+        == terminal_failure_classification.FAILURE_CLASS_DEFECT
+    ):
+        return None
+    for latest in (card.get("terminal_substatus"), card.get("terminal_review")):
+        substatus = latest.get("substatus") if isinstance(latest, dict) else latest
+        if substatus and substatus not in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES:
+            return None
+    retry = card["terminal_retry"]
+    request_id = str(retry.get("request_id") or "").strip()
+    if request_id == str(rejection.get("request_id") or "").strip():
+        return None
+    # The retry must belong to the card's current claim, the way
+    # _manager_recovery_reroute_episode binds recovery_epoch to claim_epoch;
+    # a retry left by an earlier claim cannot describe the latest episode.
+    retry_epoch = retry.get("claim_epoch")
+    claim_epoch = card.get("claim_epoch")
+    if (
+        type(retry_epoch) is not int
+        or type(claim_epoch) is not int
+        or retry_epoch != claim_epoch
+    ):
+        return None
+    try:
+        retried_at = datetime.fromisoformat(str(retry.get("retried_at") or ""))
+        pinned_at = datetime.fromisoformat(str(rejection.get("pinned_at") or ""))
+        if retried_at <= pinned_at:
+            return None
+    except (TypeError, ValueError):
+        # Unparseable or naive/aware-mixed times cannot order the episodes.
+        return None
+    return {
+        "request_id": request_id,
+        "terminal_substatus": str(retry.get("terminal_substatus") or "").strip(),
+    }
 
 
 def _manager_recovery_reroute_episode(card: Mapping[str, Any]) -> bool:
@@ -9707,6 +9774,18 @@ def _operational_provider_reroute_authorization(
             ).strip()
             receipt["failure_category"] = str(
                 rejection_disposition.get("failure_category") or ""
+            ).strip()
+    zero_change = _operational_zero_change_after_rejection(card)
+    if zero_change is not None:
+        # NF-2026-01747: name the operational episode that superseded the
+        # older rejection, so the audit shows why no rejection receipt applied.
+        rejection_disposition = card.get("rejection_disposition")
+        receipt["reroute_basis"] = "operational_zero_change"
+        receipt["terminal_request_id"] = zero_change["request_id"]
+        receipt["terminal_substatus"] = zero_change["terminal_substatus"]
+        if isinstance(rejection_disposition, dict):
+            receipt["superseded_rejection_request_id"] = str(
+                rejection_disposition.get("request_id") or ""
             ).strip()
     return receipt
 
