@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import sys
+from collections import deque
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -13,6 +14,44 @@ from .worker_workspace import (
     _relative_repo_path,
     _require_beneath,
 )
+
+
+class _StatementFacts:
+    """Facts derived from one walk of a module-level statement's subtree."""
+
+    __slots__ = (
+        "complex_store",
+        "has_call",
+        "references_import_module",
+        "references_importlib",
+        "stored_names",
+    )
+
+    def __init__(self) -> None:
+        self.complex_store = False
+        self.has_call = False
+        self.references_import_module = False
+        self.references_importlib = False
+        self.stored_names: set[str] = set()
+
+    def observe(self, node: ast.AST) -> None:
+        if isinstance(node, ast.Call):
+            self.has_call = True
+        elif isinstance(node, ast.Name):
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                self.stored_names.add(node.id)
+            if node.id == "importlib":
+                self.references_importlib = True
+            elif node.id == "import_module":
+                self.references_import_module = True
+        elif isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(
+            node.ctx, (ast.Store, ast.Del)
+        ):
+            self.complex_store = True
+
+
+# The only node types whose subtrees can contain a statement.
+_STATEMENT_HOLDERS = (ast.stmt, ast.excepthandler, ast.match_case)
 
 
 def resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[str, ...]:
@@ -32,10 +71,26 @@ def resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[str
     if src_root.is_dir() and not src_root.is_symlink():
         roots.add(src_root)
 
+    # NF-2026-00993: every filesystem verdict below is memoised in a dict local
+    # to this one call.  The tree changes between launches, so nothing outlives
+    # the return; within the call each path is checked once and a refusal is
+    # replayed with its original message, so fail-closed outcomes and their
+    # precedence are those of the uncached checks.  Keys are exact path
+    # strings, bounded by the distinct candidates this closure probes.
+    init_states: dict[str, tuple[bool, bool]] = {}
+
+    def init_state(package_init: Path) -> tuple[bool, bool]:
+        key = str(package_init)
+        state = init_states.get(key)
+        if state is None:
+            state = (package_init.is_symlink(), package_init.is_file())
+            init_states[key] = state
+        return state
+
     def package_context(relative: str) -> tuple[Path, tuple[str, ...]]:
         current = (repo / relative).parent
         parts: list[str] = []
-        while current != repo and (current / "__init__.py").is_file():
+        while current != repo and init_state(current / "__init__.py")[1]:
             parts.insert(0, current.name)
             current = current.parent
         if parts:
@@ -46,29 +101,66 @@ def resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[str
         if relative.endswith(".py") and (repo / relative).is_file():
             package_context(relative)
 
-    def module_file(
-        parts: tuple[str, ...], preferred_root: Path | None = None
-    ) -> tuple[Path, Path] | None:
-        if not parts:
-            return None
-        ordered_roots = sorted(roots, key=lambda value: value.as_posix())
-        if preferred_root is not None:
-            ordered_roots = [preferred_root] + [
-                root for root in ordered_roots if root != preferred_root
-            ]
-        for root in ordered_roots:
-            module = root.joinpath(*parts).with_suffix(".py")
-            package = root.joinpath(*parts, "__init__.py")
-            for candidate in (module, package):
-                _require_beneath(repo, candidate)
+    candidate_verdicts: dict[str, bool | WorkspaceError] = {}
+
+    def candidate_is_file(candidate: Path) -> bool:
+        key = str(candidate)
+        verdict = candidate_verdicts.get(key)
+        if verdict is None:
+            try:
+                _require_beneath(repo, candidate, root_resolved=True)
                 if candidate.is_symlink():
                     raise WorkspaceError(
                         "validation_python_import_symlink:"
                         + candidate.relative_to(repo).as_posix()
                     )
-                if candidate.is_file():
-                    return root, candidate
-        return None
+            except WorkspaceError as exc:
+                candidate_verdicts[key] = exc
+                raise
+            verdict = candidate.is_file()
+            candidate_verdicts[key] = verdict
+        if isinstance(verdict, WorkspaceError):
+            raise WorkspaceError(*verdict.args) from verdict
+        return verdict
+
+    # ``roots`` only ever grows, so its size identifies its exact contents.
+    module_results: dict[
+        tuple[tuple[str, ...], Path | None, int],
+        tuple[Path, Path] | None | WorkspaceError,
+    ] = {}
+
+    def module_file(
+        parts: tuple[str, ...], preferred_root: Path | None = None
+    ) -> tuple[Path, Path] | None:
+        if not parts:
+            return None
+        key = (parts, preferred_root, len(roots))
+        if key in module_results:
+            recorded = module_results[key]
+            if isinstance(recorded, WorkspaceError):
+                raise WorkspaceError(*recorded.args) from recorded
+            return recorded
+        ordered_roots = sorted(roots, key=lambda value: value.as_posix())
+        if preferred_root is not None:
+            ordered_roots = [preferred_root] + [
+                root for root in ordered_roots if root != preferred_root
+            ]
+        result: tuple[Path, Path] | None = None
+        try:
+            for root in ordered_roots:
+                module = root.joinpath(*parts).with_suffix(".py")
+                package = root.joinpath(*parts, "__init__.py")
+                if candidate_is_file(module):
+                    result = root, module
+                    break
+                if candidate_is_file(package):
+                    result = root, package
+                    break
+        except WorkspaceError as exc:
+            module_results[key] = exc
+            raise
+        module_results[key] = result
+        return result
 
     _fallback_cache: list[list[Path]] = []
     # ponytail: depth-1 directories only; deeper layouts need an explicit package root
@@ -106,12 +198,13 @@ def resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[str
         parent = candidate.parent
         while parent != root:
             package_init = parent / "__init__.py"
-            if package_init.is_symlink():
+            init_is_symlink, init_is_file = init_state(package_init)
+            if init_is_symlink:
                 raise WorkspaceError(
                     "validation_python_import_symlink:"
                     + package_init.relative_to(repo).as_posix()
                 )
-            if not package_init.is_file():
+            if not init_is_file:
                 break
             additions.append(package_init)
             parent = parent.parent
@@ -156,33 +249,6 @@ def resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[str
         package_ok = True
         getattr_ok = True
         stdlib_bindings: set[str] = set()
-
-        dispatcher_cache: dict[int, frozenset[str]] = {}
-
-        def build_dispatcher(node: ast.AST) -> frozenset[str]:
-            stored = frozenset(
-                item.id
-                for item in ast.walk(node)
-                if isinstance(item, ast.Name) and isinstance(item.ctx, (
-                    ast.Store, ast.Del
-                ))
-            )
-            return stored
-
-        def stores_name(node: ast.AST, name: str) -> bool:
-            # Reuse one per-parsed-tree Store/Del descendant index instead of
-            # re-walking a statement for each of the six taint checks.  The
-            # dict is keyed by id(node) for each queried statement and lives
-            # only inside the dispatcher_cache created for one ast.parse call,
-            # so source changes, disjoint AST trees, and re-parses get a fresh
-            # record; nothing path-based or global is cached.  Bounded by the
-            # statement count of that single parsed tree and released with it.
-            key = id(node)
-            recorded = dispatcher_cache.get(key)
-            if recorded is None:
-                recorded = build_dispatcher(node)
-                dispatcher_cache[key] = recorded
-            return name in recorded
 
         def importlib_binding(statement: ast.stmt) -> bool | None:
             canonical = False
@@ -323,8 +389,48 @@ def resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[str
                     raise WorkspaceError(f"validation_python_relative_import_unresolved:{relative}:" + ".".join(parts))
             return True
 
+        # NF-2026-00993: walk the parsed tree at most once.  The queue mirrors
+        # ast.walk(tree) breadth-first order, so ordinary imports are visited in
+        # the same sequence as before (pending order, root growth and error
+        # precedence are unchanged).  Statements only ever nest inside
+        # statements, except handlers and match cases, so dropping every other
+        # subtree keeps that relative order exactly.  The per-statement facts
+        # read by the dynamic-import scan below only matter once a module-level
+        # importlib/import_module binding can set importlib_ok/import_module_ok
+        # (every other use is gated on those flags); only such modules pay for
+        # the full walk, and each of their nodes is still visited once.
+        needs_facts = any(
+            importlib_binding(statement) is not None
+            or import_module_binding(statement) is not None
+            for statement in tree.body
+        )
+        import_nodes: list[ast.Import | ast.ImportFrom] = []
+        statement_facts = [_StatementFacts() for _ in tree.body]
+        queue: deque[tuple[ast.AST, _StatementFacts | None]] = deque(
+            (
+                child,
+                statement_facts[index]
+                if needs_facts and index < len(statement_facts)
+                else None,
+            )
+            for index, child in enumerate(ast.iter_child_nodes(tree))
+        )
+        while queue:
+            node, facts = queue.popleft()
+            if facts is not None:
+                facts.observe(node)
+                queue.extend((child, facts) for child in ast.iter_child_nodes(node))
+            elif isinstance(node, _STATEMENT_HOLDERS):
+                queue.extend(
+                    (child, None)
+                    for child in ast.iter_child_nodes(node)
+                    if isinstance(child, _STATEMENT_HOLDERS)
+                )
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                import_nodes.append(node)
+
         # Ordinary imports retain their existing transitive closure behavior.
-        for node in ast.walk(tree):
+        for node in import_nodes:
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     add_module(
@@ -334,7 +440,7 @@ def resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[str
                         source_root,
                         allow_fallback=True,
                     )
-            elif isinstance(node, ast.ImportFrom):
+            else:
                 module_parts = tuple((node.module or "").split(".")) if node.module else ()
                 if node.level:
                     if not package_parts or node.level > len(package_parts):
@@ -357,7 +463,7 @@ def resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[str
 
         # Dynamic imports are intentionally limited to direct canonical calls in
         # module-level statements, evaluated after an unaliased importlib import.
-        for statement in tree.body:
+        for statement, facts in zip(tree.body, statement_facts):
             if isinstance(statement, ast.ImportFrom) and any(
                 alias.name == "*" for alias in statement.names
             ):
@@ -472,7 +578,7 @@ def resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[str
                 (importlib_ok or import_module_ok)
                 and not permitted_direct_call
                 and not safe_stdlib_getattr
-                and any(isinstance(item, ast.Call) for item in ast.walk(statement))
+                and facts.has_call
             )
             if unrecognized_call:
                 importlib_ok = False
@@ -480,36 +586,27 @@ def resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[str
                 package_ok = False
                 getattr_ok = False
                 stdlib_bindings.clear()
-            references_importlib = any(
-                isinstance(item, ast.Name) and item.id == "importlib"
-                for item in ast.walk(statement)
-            )
-            references_import_module = any(
-                isinstance(item, ast.Name) and item.id == "import_module"
-                for item in ast.walk(statement)
-            )
-            complex_store = any(
-                isinstance(item, (ast.Attribute, ast.Subscript))
-                and isinstance(item.ctx, (ast.Store, ast.Del))
-                for item in ast.walk(statement)
-            )
+            references_importlib = facts.references_importlib
+            references_import_module = facts.references_import_module
+            complex_store = facts.complex_store
+            stored_names = facts.stored_names
             if complex_store:
                 importlib_tainted = True
-            if stores_name(statement, "importlib") or complex_store or (
+            if "importlib" in stored_names or complex_store or (
                 not permitted_direct_call
                 and not harmless_alias
                 and references_importlib
             ):
                 importlib_ok = False
-            if stores_name(statement, "import_module") or complex_store or (
+            if "import_module" in stored_names or complex_store or (
                 not permitted_direct_call and references_import_module
             ):
                 import_module_ok = False
-            if stores_name(statement, "__package__") or complex_store: package_ok = False
-            if stores_name(statement, "getattr") or complex_store:
+            if "__package__" in stored_names or complex_store: package_ok = False
+            if "getattr" in stored_names or complex_store:
                 getattr_ok = False
             for bound_name in tuple(stdlib_bindings):
-                if stores_name(statement, bound_name) or complex_store:
+                if bound_name in stored_names or complex_store:
                     stdlib_bindings.discard(bound_name)
             is_type_checking_guard = (
                 isinstance(statement, ast.If)

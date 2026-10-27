@@ -973,8 +973,13 @@ def _relative_repo_path(raw: str) -> str:
     return str(path)
 
 
-def _require_beneath(root: Path, candidate: Path) -> Path:
-    root = root.resolve()
+def _require_beneath(
+    root: Path, candidate: Path, *, root_resolved: bool = False
+) -> Path:
+    # ``root_resolved``: the caller passes ``root`` already resolved within the
+    # same pass (NF-2026-00993), so it is not re-resolved for every candidate.
+    if not root_resolved:
+        root = root.resolve()
     lexical = Path(os.path.abspath(candidate))
     try:
         relative = lexical.relative_to(root)
