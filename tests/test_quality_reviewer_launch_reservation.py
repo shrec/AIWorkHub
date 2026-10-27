@@ -161,6 +161,13 @@ def _review_ready_target(monkeypatch: pytest.MonkeyPatch) -> None:
         "_default_show_task",
         _show_review_ready_target,
     )
+    # The exact-target gate (NF-2026-01748) sits upstream of the reservation
+    # boundary these tests pin.
+    monkeypatch.setattr(
+        process_launcher.ProcessManager,
+        "_exact_quality_review_target_refusal",
+        lambda self, target_request_id, target_task_id: None,
+    )
 
     # Reservation tests isolate the process-ledger boundary. The production
     # launch now durably creates and claims the reviewer card before returning

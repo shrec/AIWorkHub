@@ -239,6 +239,12 @@ def test_reviewer_contention_retains_reservation_and_starts_nothing(
         lambda **kwargs: launched.append(kwargs),
     )
 
+    # The launch refuses a target that is not one exact ledger request of the
+    # target task before reserving anything (NF-2026-01748).
+    manager._append_event({
+        "request_id": "target-request", "task_id": "target-task",
+        "runner": RUNNER, "state": "review_ready",
+    })
     result = manager.launch_quality_reviewer(
         target_request_id="target-request",
         target_task_id="target-task",

@@ -68,6 +68,12 @@ def test_quality_reviewer_reservation_is_exact_durable_and_replays_before_ack(
     _ensure_deepseek_credentials_stub()
     from aiworkhub import process_launcher
 
+    monkeypatch.setattr(
+        process_launcher.ProcessManager,
+        "_exact_quality_review_target_refusal",
+        lambda self, target_request_id, target_task_id: None,
+    )
+
     target_request_id = "target-req-NF-442"
     target_task_id = "TARGET_TASK_NF442"
     reviewer_task_id = "REVIEWER_TASK_NF442"

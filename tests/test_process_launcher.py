@@ -10779,6 +10779,11 @@ def _quality_reviewer_launch_harness(tmp_path, monkeypatch):
     monkeypatch.setattr(process_launcher.core, "create_task", fake_create)
     monkeypatch.setattr(process_launcher.task_engine, "claim_start_exact", fake_claim)
     monkeypatch.setattr(process_launcher.threading, "Thread", FakeThread)
+    monkeypatch.setattr(
+        process_launcher.ProcessManager,
+        "_exact_quality_review_target_refusal",
+        lambda self, target_request_id, target_task_id: None,
+    )
     return manager, cards, order, started
 
 

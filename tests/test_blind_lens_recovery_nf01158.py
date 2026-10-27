@@ -429,6 +429,14 @@ def _launchable(
 def _launch(
     manager: process_launcher.ProcessManager, reviewer_task_id: str
 ) -> dict[str, object]:
+    # The launch refuses a target that is not one exact ledger request of the
+    # target task before reserving anything (NF-2026-01748).
+    if not manager._request_events("target-req"):
+        manager._append_event({
+            "request_id": "target-req", "task_id": "TARGET_TASK",
+            "runner": RUNNER, "topic": TOPIC, "adapter_id": ADAPTER,
+            "state": "review_ready",
+        })
     return manager.launch_quality_reviewer(
         target_request_id="target-req",
         target_task_id="TARGET_TASK",

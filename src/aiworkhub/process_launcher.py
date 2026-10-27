@@ -447,6 +447,9 @@ ACTIVE_PROCESS_STATES = {"starting", "running", "cancel_requested"}
 # elapsed/quiet-time classification of a live provider.
 QUALITY_REVIEW_ATTEMPT_RESERVATION_SECONDS = 600.0
 REVIEWER_CLAIM_BOUND_STATE = "reviewer_claim_bound"
+# A reviewer target that is only a prefix is refused, never resolved; this many
+# matching request ids are named back so the caller can pick the exact one.
+QUALITY_REVIEW_TARGET_CANDIDATE_LIMIT = 5
 _LAUNCH_RESERVATION_ADMISSION_RECOVERY = object()
 WORKER_BRIDGE_AUTHORIZED_PROCESS_STATES = {"starting", "running"}
 _PERSISTED_WATCH_UNKNOWN_MAX_CONSECUTIVE = 3
@@ -8278,6 +8281,61 @@ class ProcessManager:
             "launch_request_id": request_id,
         }
 
+    def _exact_quality_review_target_refusal(
+        self, target_request_id: str, target_task_id: str
+    ) -> dict[str, Any] | None:
+        """Refuse a reviewer target that is not one exact request of the task.
+
+        ``None`` means ``target_request_id`` names a ledger request whose
+        latest event belongs to ``target_task_id``. Nothing is ever resolved by
+        prefix: a strict prefix of known request ids of the target task is
+        refused as ``not_exact`` with at most
+        ``QUALITY_REVIEW_TARGET_CANDIDATE_LIMIT`` candidates so the caller can
+        name one, and the launch still does not proceed.
+        """
+
+        events = self._request_events(target_request_id) if target_request_id else []
+        if not events:
+            candidates: list[str] = []
+            if target_request_id:
+                candidates = sorted(
+                    request_id
+                    for request_id, event in self._latest_by_request().items()
+                    if request_id != target_request_id
+                    and request_id.startswith(target_request_id)
+                    and str(event.get("task_id") or "") == target_task_id
+                )
+            if candidates:
+                return {
+                    "ok": False,
+                    "error": "quality_review_target_request_not_exact",
+                    "target_request_id": target_request_id,
+                    "target_task_id": target_task_id,
+                    "candidate_request_ids": candidates[
+                        :QUALITY_REVIEW_TARGET_CANDIDATE_LIMIT
+                    ],
+                    "candidate_count": len(candidates),
+                    "fails_at_launch": True,
+                }
+            return {
+                "ok": False,
+                "error": "quality_review_target_request_not_found",
+                "target_request_id": target_request_id,
+                "target_task_id": target_task_id,
+                "fails_at_launch": True,
+            }
+        latest_task_id = str(split_lifecycle_tail(events)[0].get("task_id") or "")
+        if latest_task_id != target_task_id:
+            return {
+                "ok": False,
+                "error": "quality_review_target_request_task_mismatch",
+                "target_request_id": target_request_id,
+                "target_task_id": target_task_id,
+                "request_task_id": latest_task_id,
+                "fails_at_launch": True,
+            }
+        return None
+
     def launch_quality_reviewer(
         self,
         *,
@@ -8352,6 +8410,15 @@ class ProcessManager:
                 "target_substatus": _target_verdict.get("target_substatus"),
                 "fails_at_launch": True,
             }
+        # The named request must be an exact ledger request of the target task
+        # BEFORE anything is reserved: the packet build re-checks it, but only
+        # on the background owner after an attempt already exists, and a
+        # prefix must never reach a reviewer (NF-2026-01748).
+        target_refusal = self._exact_quality_review_target_refusal(
+            target_request_id, target_task_id
+        )
+        if target_refusal is not None:
+            return target_refusal
         # The target claim epoch is sealed into the reservation so reuse of a
         # live reviewer is keyed to this exact claim, not merely its request.
         # The caller's epoch is the one that commissioned this review; the
