@@ -663,6 +663,9 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "worker_workspace_include_seed.py",
         # ...and its AppContainer node argv rewrite (size ratchet).
         "worker_workspace_appcontainer_node.py",
+        # worker_workspace hydrates repository-declared validation inputs from here
+        # (NF-2026-01396).
+        "validation_inputs.py",
         # ...and its AppContainer dotnet argv rewrite (NF-2026-01366).
         "worker_workspace_appcontainer_dotnet.py",
         # ...which imports the candidate-XML pre-restore seed from this sibling,

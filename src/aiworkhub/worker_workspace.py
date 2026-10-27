@@ -2179,6 +2179,7 @@ _INCLUDE_ROOT_CARD_KEYS = (
 # seeding is a package-only preflight.
 if __package__:
     from .worker_workspace_include_seed import _resolve_local_quoted_includes  # noqa: E402
+    from .validation_inputs import repo_validation_input_paths  # noqa: E402
 
 
 def _include_roots_from_card(card: Mapping[str, Any]) -> tuple[str, ...]:
@@ -4051,6 +4052,7 @@ def _declared_workspace_seed_closure(
         + list(required_card_inputs)
         + list(validation_inputs)
     )
+    declared += repo_validation_input_paths(source_root) if __package__ else []
     live_seeded = _expand_declared(source_root, declared)
     live_seeded = _resolve_local_quoted_includes(
         source_root,
