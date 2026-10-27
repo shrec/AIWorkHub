@@ -1198,11 +1198,15 @@ def review_packet(
         )
         or ""
     )
-    if manager_ready is None and card_substatus == "review_ready":
-        return {**packet, "ok": False, "error": "manager_review_not_ready"}
+    # NF-2026-01741: a review_ready card whose manager-ready marker is not yet
+    # derived still gets its packet -- the manager needs it exactly then --
+    # flagged pending with the accept fold's own outstanding blockers.
+    readiness_pending = manager_ready is None and card_substatus == "review_ready"
     packet["manager_ready"] = (
         manager_ready["manager_ready"]
         if manager_ready is not None
+        else None
+        if readiness_pending
         else {"schema_id": "aiworkhub.manager_ready_legacy.v1"}
     )
     terminal = card.get("terminal_review")
@@ -1356,6 +1360,17 @@ def review_packet(
             },
         }
     )
+    if readiness_pending:
+        # The blocker vocabulary is the accept fold's (``accept_preview``),
+        # copied before truncation so a dropped section cannot erase it. An
+        # unevaluated preview is named as such, never read as "no blockers".
+        packet["manager_readiness"] = "pending"
+        packet["outstanding_accept_blockers"] = [
+            dict(row) for row in packet["accept_preview"]["blockers"]
+        ]
+        packet["outstanding_accept_blockers_evaluated"] = packet["accept_preview"][
+            "evaluated"
+        ]
     for section in _PACKET_DROP_ORDER:
         if _packet_encoded_bytes(packet) <= int(max_bytes):
             break
