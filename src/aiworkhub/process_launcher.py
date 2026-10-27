@@ -6046,7 +6046,9 @@ class ProcessManager:
         per-path and total byte budgets allow; a hunk that does not fit is cut
         at a line boundary and counted, and every cut or omitted hunk keeps
         its exact ``segments`` row so ``diff_complete`` is false only when
-        something is missing and never silently.
+        something is missing and never silently.  A path with more hunks than
+        ``quality_reviewer.MAX_SOURCE_EVIDENCE_SEGMENTS`` folds every hunk from
+        the last slot onward into one truncated segment spanning them all.
         """
 
         def decode_utf8(raw: bytes) -> str | None:
@@ -6113,6 +6115,19 @@ class ProcessManager:
             omitted_hunks = 0
             path_remaining = self._QUALITY_REVIEW_SOURCE_MAX_BYTES
             header_path = json.dumps(path, ensure_ascii=True)
+            # The reviewer refuses a row carrying more than
+            # MAX_SOURCE_EVIDENCE_SEGMENTS segments, so every hunk from the
+            # last slot onward folds into ONE truncated segment spanning them.
+            segment_cap = quality_reviewer.MAX_SOURCE_EVIDENCE_SEGMENTS
+            hunk_indexes = [
+                index for index, opcode in enumerate(opcodes) if opcode[0] != "equal"
+            ]
+            fold_from = (
+                hunk_indexes[segment_cap - 1]
+                if len(hunk_indexes) > segment_cap
+                else len(opcodes)
+            )
+            folded: dict[str, Any] | None = None
             for index, (tag, old_start, old_end, new_start, new_end) in enumerate(opcodes):
                 if tag == "equal":
                     continue
@@ -6127,17 +6142,6 @@ class ProcessManager:
                     after = min(context_lines, opcodes[index + 1][4] - opcodes[index + 1][3])
                 start_line = new_start - before + 1
                 end_line = max(start_line, new_end + after)
-                header = (
-                    f"@@ path:{header_path} candidate:{start_line}-{end_line} "
-                    f"change:{new_start + 1}-{max(new_start + 1, new_end)} "
-                    f"baseline:{old_start + 1}-{max(old_start + 1, old_end)} {tag} @@\n"
-                )
-                body_lines = (
-                    [" " + with_newline(line) for line in candidate_lines[new_start - before:new_start]]
-                    + ["-" + with_newline(line) for line in baseline_lines[old_start:old_end]]
-                    + ["+" + with_newline(line) for line in candidate_lines[new_start:new_end]]
-                    + [" " + with_newline(line) for line in candidate_lines[new_end:new_end + after]]
-                )
                 segment = {
                     "kind": tag,
                     "candidate_start_line": start_line,
@@ -6149,6 +6153,27 @@ class ProcessManager:
                     "excerpt_bytes": 0,
                     "truncated": True,
                 }
+                if index >= fold_from:
+                    if folded is None:
+                        folded = segment
+                    else:
+                        if folded["kind"] != tag:
+                            folded["kind"] = "replace"
+                        folded["candidate_end_line"] = segment["candidate_end_line"]
+                        folded["changed_end_line"] = segment["changed_end_line"]
+                        folded["baseline_end_line"] = segment["baseline_end_line"]
+                    continue
+                header = (
+                    f"@@ path:{header_path} candidate:{start_line}-{end_line} "
+                    f"change:{new_start + 1}-{max(new_start + 1, new_end)} "
+                    f"baseline:{old_start + 1}-{max(old_start + 1, old_end)} {tag} @@\n"
+                )
+                body_lines = (
+                    [" " + with_newline(line) for line in candidate_lines[new_start - before:new_start]]
+                    + ["-" + with_newline(line) for line in baseline_lines[old_start:old_end]]
+                    + ["+" + with_newline(line) for line in candidate_lines[new_start:new_end]]
+                    + [" " + with_newline(line) for line in candidate_lines[new_end:new_end + after]]
+                )
                 limit = max(0, min(path_remaining, remaining))
                 header_bytes = len(header.encode("utf-8"))
                 if limit <= header_bytes:
@@ -6176,6 +6201,11 @@ class ProcessManager:
                 chunks.append(header + "".join(emitted))
                 if truncated:
                     omitted_hunks += 1
+            if folded is not None:
+                # Counted once: the folded segment is the one truncated row
+                # that stands for every hunk past the reviewer's bound.
+                omitted_hunks += 1
+                row["segments"].append(folded)
             row["diff_complete"] = omitted_hunks == 0
             row["truncated"] = omitted_hunks > 0
             if omitted_hunks:
