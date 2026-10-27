@@ -37,24 +37,27 @@ def patch_core_list(monkeypatch):
     return install
 
 
-def test_default_folds_short_nonempty_bodies_to_identity(patch_core_list):
-    original = _row()
+def test_default_returns_compact_projection(patch_core_list):
+    original = _row(converted_task_id="needfix-NF-2026-90001", updated_at="2026-10-27")
     patch_core_list([original])
 
     result = server.needfix_list()
 
     assert len(result) == 1
     folded = result[0]
-    for key in ("description", "evidence"):
-        size, digest = core._evidence_identity(original[key])
-        assert folded[key] == {
-            "summarized": True,
-            "bytes": size,
-            "length": len(original[key]),
-            "sha256": digest,
-        }
-    for key in ("id", "title", "kind", "severity", "status", "tags", "scope_files"):
+    assert set(folded) == {
+        "id",
+        "title",
+        "status",
+        "severity",
+        "kind",
+        "converted_task_id",
+        "updated_at",
+    }
+    for key in folded:
         assert folded[key] == original[key]
+    for key in ("description", "evidence", "tags", "scope_files"):
+        assert key not in folded
 
 
 def test_full_returns_core_rows_unchanged(patch_core_list):
@@ -75,13 +78,19 @@ def test_default_result_is_a_needfix_listing_with_same_derivation(patch_core_lis
     assert result.underived_reason == "no ready task store"
 
 
-def test_empty_bodies_are_returned_unchanged(patch_core_list):
+def test_absent_projection_keys_are_omitted_not_invented(patch_core_list):
+    patch_core_list([{"id": "NF-2026-90003", "title": "t", "description": "x"}])
+
+    assert server.needfix_list()[0] == {"id": "NF-2026-90003", "title": "t"}
+
+
+def test_full_keeps_empty_bodies_unchanged(patch_core_list):
     patch_core_list([_row(description="", evidence={})])
 
-    folded = server.needfix_list()[0]
+    row = server.needfix_list(full=True)[0]
 
-    assert folded["description"] == ""
-    assert folded["evidence"] == {}
+    assert row["description"] == ""
+    assert row["evidence"] == {}
 
 
 def test_bodies_bounded_default_keeps_short_body_verbatim():

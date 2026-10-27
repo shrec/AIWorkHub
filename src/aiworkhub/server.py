@@ -7044,6 +7044,16 @@ def main() -> None:
 
 # --- NeedFix MCP manager tools (additive; bounded, repo-scoped) ---
 
+_NEEDFIX_LIST_KEYS = (
+    "id",
+    "title",
+    "status",
+    "severity",
+    "kind",
+    "converted_task_id",
+    "updated_at",
+)
+
 
 @mcp.tool()
 def needfix_list(
@@ -7057,12 +7067,9 @@ def needfix_list(
     order_dir: str = "DESC",
     full: bool = False,
 ) -> list[dict]:
-    """List repo-scoped NeedFix entries (bounded); bodies fold to their identity.
+    """List repo-scoped NeedFix entries (bounded); rows are a compact projection.
 
-    Measured: ``limit=60`` replied 175 KB, 74% of it the description and
-    evidence bodies the filer wrote (NF-2026-01722). By default every
-    non-empty body is replaced by ``{summarized, bytes, length, sha256}`` so
-    it stays addressable via needfix_show; ``full=true`` returns raw rows.
+    Measured: 379 rows were 452 KB, about 1.2 KB each (NF-2026-01722, NF-2026-01726). By default each row keeps only id, title, status, severity, kind, converted_task_id and updated_at; ``full=true`` or needfix_show returns the full row.
 
     Args:
         status: Only rows with exactly this status, e.g. captured, accepted or archived. Any status, kind or severity filter returns raw rows; omit all three for the derived active listing.
@@ -7073,7 +7080,7 @@ def needfix_list(
         offset: Rows to skip before the first one returned, for paging; default 0.
         order_by: Sort column, created_at (default) or updated_at; any other value falls back to created_at.
         order_dir: Sort direction, DESC (default, newest first) or ASC; any other value falls back to DESC.
-        full: Return every description and evidence body verbatim instead of folding each to its identity; default false.
+        full: Return the raw stored rows instead of the compact projection; default false.
     """
     listing = core.needfix_list(
         status=status,
@@ -7088,7 +7095,7 @@ def needfix_list(
     if full:
         return listing
     return core.NeedfixListing(
-        [core.needfix_bodies_bounded(row, max_bytes=0) for row in listing],
+        [{key: row[key] for key in _NEEDFIX_LIST_KEYS if key in row} for row in listing],
         derived=listing.derived,
         underived_reason=listing.underived_reason,
     )
@@ -7651,21 +7658,47 @@ def roadmap_list(
     include_archived: bool = False,
     limit: int = 100,
     offset: int = 0,
+    full: bool = False,
 ) -> list[dict]:
-    """List bounded repository Roadmap outcomes.
+    """List bounded repository Roadmap outcomes; outcome and acceptance bodies fold to their identity.
+
+    Measured: the same rows roadmap_snapshot(limit=60) returned were 174 KB, 61% outcome and acceptance bodies (NF-2026-01726). By default both fold to ``{summarized, bytes, length, sha256}``; ``full=true`` or ``roadmap_show`` gives the full row.
 
     Args:
         status: Only outcomes in this status: proposed, approved, in_progress, blocked, deferred, completed or archived. Omit to list every non-archived outcome.
         include_archived: With no status filter, also return archived outcomes; default false.
         limit: Maximum outcomes to return; default 100, clamped to 1-500.
         offset: Number of outcomes to skip, for paging; default 0.
+        full: Return every outcome and acceptance body verbatim instead of folding each to its identity; default false.
     """
-    return core.roadmap_list(
+    rows = core.roadmap_list(
         status=status,
         include_archived=include_archived,
         limit=limit,
         offset=offset,
     )
+    if full:
+        return rows
+    return [_fold_roadmap_bodies(row) for row in rows]
+
+
+_ROADMAP_FOLD_KEYS = ("outcome", "acceptance")
+
+
+def _fold_roadmap_bodies(row: dict) -> dict:
+    folded = dict(row)
+    for key in _ROADMAP_FOLD_KEYS:
+        value = folded.get(key)
+        if not isinstance(value, (str, list, dict)) or not value:
+            continue
+        size, digest = core._evidence_identity(value)
+        folded[key] = {
+            "summarized": True,
+            "bytes": size,
+            "length": len(value),
+            "sha256": digest,
+        }
+    return folded
 
 
 @mcp.tool()
@@ -7690,8 +7723,12 @@ def roadmap_events(roadmap_id: str, limit: int = 100) -> list[dict]:
 
 
 @mcp.tool()
-def roadmap_snapshot(limit: int = 200, include_archived: bool = False) -> dict:
+def roadmap_snapshot(
+    limit: int = 200, include_archived: bool = False, full: bool = False
+) -> dict:
     """Return the Roadmap with each outcome joined to the live status of its linked tasks.
+
+    Measured: ``limit=60`` replied 174 KB, 61% of it the outcome and acceptance bodies (NF-2026-01726). By default each row's ``outcome`` and ``acceptance`` fold to ``{summarized, bytes, length, sha256}``; ``full=true`` or ``roadmap_show`` gives the full row.
 
     Use this to see what is done, blocked or ready across the roadmap in one call. The
     other roadmap tools return stored fields only: ``roadmap_list`` the outcome rows,
@@ -7707,8 +7744,14 @@ def roadmap_snapshot(limit: int = 200, include_archived: bool = False) -> dict:
     Args:
         limit: Maximum outcome rows to return; default 200, clamped to 1-500. The reply's truncated flag says whether rows were left out.
         include_archived: Also include archived outcomes in the rows and counts; default false.
+        full: Return every outcome and acceptance body verbatim instead of folding each to its identity; default false.
     """
-    return core.roadmap_snapshot(limit=limit, include_archived=include_archived)
+    snapshot = core.roadmap_snapshot(limit=limit, include_archived=include_archived)
+    if full:
+        return snapshot
+    result = dict(snapshot)
+    result["items"] = [_fold_roadmap_bodies(row) for row in snapshot.get("items") or []]
+    return result
 
 
 @mcp.tool()
