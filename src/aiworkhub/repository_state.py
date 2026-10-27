@@ -155,6 +155,26 @@ def _has_symlink_component(path: Path) -> bool:
     return False
 
 
+def _has_reparse_component(root: Path, rel: Path) -> bool:
+    """Whether an existing component of ``root / rel`` is a reparse point.
+
+    Only components below ``root`` are checked; a missing component ends the
+    walk. An unreadable component counts as a reparse point (fail closed).
+    """
+    current = root
+    for part in rel.parts:
+        current = current / part
+        try:
+            attributes = getattr(os.lstat(current), "st_file_attributes", 0)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        if attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            return True
+    return False
+
+
 def _resolve_existing_dir(path: Path) -> Path:
     try:
         resolved = path.expanduser().resolve(strict=True)
@@ -199,9 +219,29 @@ def _assert_relative_child(root: Path, relative: str | Path) -> Path:
 
     resolved_root = mapped(root)
     resolved = mapped(candidate)
-    if resolved != resolved_root and resolved_root not in resolved.parents:
-        raise PathEscapeError(f"path_outside_repository:{relative}")
-    return resolved
+    if resolved == resolved_root or resolved_root in resolved.parents:
+        return resolved
+    # resolve() remaps a subst path only when it can open a handle and
+    # silently keeps the unresolved drive when the open is denied, so root
+    # and child can come back on different bases. Accept that only when no
+    # component of rel is a reparse point (so the child cannot have been
+    # redirected), and return the child on the one mapped basis.
+    lexical_root = Path(os.path.abspath(root))
+    tail = rel.parts
+    if not _has_reparse_component(lexical_root, rel):
+        if resolved == lexical_root.joinpath(*tail):
+            # Root remapped, child resolve stayed on the unresolved drive.
+            return resolved_root.joinpath(*tail)
+        if (
+            resolved_root == lexical_root
+            and tail
+            and len(resolved.parts) > len(tail)
+            and Path(*resolved.parts[-len(tail):]) == Path(*tail)
+        ):
+            # Root resolve stayed on the unresolved drive, child remapped:
+            # the child's own mapping carries the root's backing basis.
+            return resolved
+    raise PathEscapeError(f"path_outside_repository:{relative}")
 
 
 def _find_upward(start: Path, marker: Path, *, boundary: Path | None = None) -> Path | None:
