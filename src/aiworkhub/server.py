@@ -1433,6 +1433,7 @@ def aiworkhub_manager_source_graph_query(
     continuation_cursor: str | None = None,
     bundle_type: worker_ai_tools_mcp.SourceGraphBundleType = "explore",
     workflow_stage: worker_ai_tools_mcp.WorkflowStage = "unspecified",
+    request_id: str | None = None,
 ) -> dict[str, Any]:
     """MANAGER CODE DISCOVERY: use first and continuously before built-in file search.
 
@@ -1445,12 +1446,14 @@ def aiworkhub_manager_source_graph_query(
         continuation_cursor: Signed token, at most 1024 bytes, from a previous page of the same query whose response exceeded the output cap; not a bodygrep cursor.
         bundle_type: Used only by bundle mode: bugfix, feature, refactor, audit, optimize or explore (default).
         workflow_stage: Stage of the work this query supports: orientation, implementation, validation, review, rework or unspecified (default; the server infers the stage).
+        request_id: Optional review_ready worker request id; queries then read that sealed candidate (authority_source=candidate_overlay) composed over canonical, read-only. An unknown, not review_ready or drifted request returns ok=false, never canonical. Omit for canonical.
     """
 
     return manager_ai_tools.source_graph_query(
         mode=mode, query=query, budget=budget, target=target,
         cursor=cursor, continuation_cursor=continuation_cursor,
         bundle_type=bundle_type, workflow_stage=workflow_stage,
+        request_id=request_id,
     )
 
 

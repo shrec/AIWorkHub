@@ -406,6 +406,10 @@ class WorkerToolContext:
     # That worker's adapter (ENV_CONTAINED_WORKER_ADAPTER), which names its own
     # container for validation_run (NF-2026-01120).
     contained_worker_adapter: str = ""
+    # A caller-verified Source Graph binding (the manager's read-only review
+    # candidate overlay).  Only trusted in-process callers can set it; it is
+    # never derived from a packet path or tool argument.
+    source_graph_binding_override: AuthorityBinding | None = None
     _supervisor_owned: bool = False
 
 
@@ -1769,6 +1773,8 @@ def _resolve_source_graph_db(ctx: WorkerToolContext) -> AuthorityBinding:
     falls back to ``AITools/source_graph.db``.
     """
 
+    if ctx.source_graph_binding_override is not None:
+        return ctx.source_graph_binding_override
     candidate = _candidate_source_graph_binding(ctx)
     if candidate is not None:
         return candidate

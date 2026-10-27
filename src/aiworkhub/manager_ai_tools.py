@@ -9,6 +9,7 @@ repository or manufacture a manager identity.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 import re
@@ -123,6 +124,191 @@ def _write_invoke(
     return result
 
 
+class _CandidateOverlayError(Exception):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+@dataclasses.dataclass(frozen=True)
+class _ReviewCandidate:
+    request_id: str
+    task_id: str
+    path: Path
+    hashes: dict[str, str | None]
+
+
+_CANDIDATE_OVERLAY_DIR = (
+    Path(repository_state.HUB_DIRNAME) / "runtime" / "manager_candidate_overlay"
+)
+_CANDIDATE_OVERLAY_SCHEMA = "aiworkhub.manager_candidate_overlay.v1"
+
+
+def _resolve_review_candidate(request_id: str) -> _ReviewCandidate:
+    """Resolve a review_ready request to its verified, sealed candidate worktree.
+
+    Read-only: nothing is written, staged or touched in the worktree, and any
+    identity, state, shape or hash discrepancy raises instead of degrading.
+    """
+
+    from . import process_launcher
+    from .launch_zero_delta import split_lifecycle_tail
+
+    manager = process_launcher.default_manager()
+    events = manager._request_events(request_id)
+    if not events:
+        raise _CandidateOverlayError("candidate_request_not_found")
+    task_id = str(split_lifecycle_tail(events)[0].get("task_id") or "")
+    if not task_id:
+        raise _CandidateOverlayError("candidate_task_missing")
+    if not any(
+        str(event.get("task_id") or "") == task_id
+        and str(event.get("state") or "") == "review_ready"
+        for event in events
+    ):
+        raise _CandidateOverlayError("candidate_not_review_ready")
+    try:
+        card = process_launcher._parse_card(manager._show_task(task_id), task_id)
+    except (process_launcher.LaunchRejected, sqlite3.Error) as exc:
+        raise _CandidateOverlayError("candidate_task_lookup_failed") from exc
+    if not (
+        str(card.get("status") or "") == "review"
+        and str(card.get("worker_status") or "") == "review"
+        and str(card.get("terminal_substatus") or "") == "review_ready"
+    ):
+        raise _CandidateOverlayError("candidate_not_review_ready")
+    evidence = (card.get("terminal_review") or {}).get("evidence") or {}
+    try:
+        workspace = process_launcher.WorkerWorkspace.from_metadata(
+            dict(evidence["workspace"])
+        )
+        if (
+            workspace.repo != Path(manager.repo).resolve()
+            or workspace.request_id != request_id
+        ):
+            raise process_launcher.WorkspaceError("identity_mismatch")
+        process_launcher.assert_gc_safe_workspace_shape(
+            request_id, workspace.path, workspace.home, repo=manager.repo
+        )
+    except (KeyError, TypeError, ValueError, process_launcher.WorkspaceError) as exc:
+        raise _CandidateOverlayError("candidate_workspace_identity_mismatch") from exc
+    if workspace.path.is_symlink() or not workspace.path.is_dir():
+        raise _CandidateOverlayError("candidate_workspace_missing")
+    sealed = evidence.get("changed_path_hashes")
+    if not isinstance(sealed, dict) or not sealed:
+        raise _CandidateOverlayError("candidate_hashes_missing")
+    for relative in sealed:
+        text = str(relative).replace("\\", "/")
+        pure = PurePosixPath(text)
+        if (
+            not pure.parts
+            or pure.is_absolute()
+            or Path(text).is_absolute()
+            or ".." in pure.parts
+        ):
+            raise _CandidateOverlayError("candidate_path_unsafe")
+        current = workspace.path
+        for part in pure.parts:
+            current = current / part
+            if current.is_symlink():
+                raise _CandidateOverlayError("candidate_path_symlink")
+    if process_launcher._changed_path_hashes(workspace, list(sealed)) != sealed:
+        raise _CandidateOverlayError("candidate_hashes_drifted")
+    return _ReviewCandidate(
+        request_id=request_id,
+        task_id=task_id,
+        path=workspace.path,
+        hashes={str(path): digest for path, digest in sealed.items()},
+    )
+
+
+def _candidate_overlay_binding(
+    ctx: worker_tools.WorkerToolContext, request_id: str
+) -> worker_tools.AuthorityBinding:
+    """Composed read-only Source Graph view of a review_ready candidate.
+
+    A partition over the candidate's changed paths alone is composed with the
+    canonical index opened read-only (never copied or written), cached beside
+    the manager runtime state, and rebuilt only when the sealed candidate
+    snapshot changes.
+    """
+
+    from . import source_graph
+    from . import source_graph_partition
+
+    candidate = _resolve_review_candidate(request_id)
+    try:
+        canonical = worker_tools._canonical_source_graph_binding(ctx)
+    except worker_tools.WorkerToolError as exc:
+        raise _CandidateOverlayError("candidate_canonical_index_unavailable") from exc
+    changed_paths = [
+        {"path": path, "sha256": digest or ""}
+        for path, digest in sorted(candidate.hashes.items())
+    ]
+    snapshot_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "schema": _CANDIDATE_OVERLAY_SCHEMA,
+                "request_id": candidate.request_id,
+                "task_id": candidate.task_id,
+                "files": changed_paths,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    root = Path(ctx.authority_repo)
+    cache_dir = root / _CANDIDATE_OVERLAY_DIR / candidate.request_id
+    probe = root
+    for part in cache_dir.relative_to(root).parts:
+        probe = probe / part
+        if probe.is_symlink():
+            raise _CandidateOverlayError("candidate_overlay_cache_symlink")
+    db_path = cache_dir / f"overlay_{snapshot_digest[:16]}.sqlite"
+    try:
+        with worker_tools._SOURCE_GRAPH_DB_OVERRIDE_LOCK:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            if db_path.is_symlink():
+                raise _CandidateOverlayError("candidate_overlay_cache_symlink")
+            ready = (
+                db_path.is_file()
+                and db_path.stat().st_size > 0
+                and worker_tools._rework_overlay_snapshot_digest(db_path)
+                == snapshot_digest
+            )
+            if not ready:
+                temporary = cache_dir / f".{db_path.name}.{secrets.token_hex(8)}.tmp"
+                try:
+                    source_graph_partition.build_partition(
+                        candidate.path,
+                        changed_paths,
+                        temporary,
+                        base_db_path=canonical.db_path,
+                    )
+                    worker_tools._write_rework_overlay_snapshot_digest(
+                        temporary, snapshot_digest
+                    )
+                    os.replace(temporary, db_path)
+                finally:
+                    temporary.unlink(missing_ok=True)
+    except (
+        source_graph_partition.PartitionError,
+        source_graph.SourceGraphError,
+        OSError,
+        sqlite3.Error,
+    ) as exc:
+        raise _CandidateOverlayError("candidate_overlay_build_failed") from exc
+    return worker_tools.AuthorityBinding(
+        db_path=db_path,
+        authority_source="candidate_overlay",
+        authority_state="manager_review_readonly",
+        authority_repo=candidate.path,
+        target_request_id=candidate.request_id,
+        target_task_id=candidate.task_id,
+        packet_sha256=snapshot_digest,
+    )
+
+
 def source_graph_query(
     *,
     mode: worker_tools.SourceGraphMode,
@@ -134,17 +320,32 @@ def source_graph_query(
     bundle_type: worker_tools.SourceGraphBundleType = "explore",
     workflow_stage: worker_tools.WorkflowStage = "unspecified",
     compact_replay: bool = True,
+    request_id: str | None = None,
 ) -> dict[str, Any]:
-    return _invoke(
-        lambda ctx: worker_tools.source_graph_query(
+    def call(ctx: worker_tools.WorkerToolContext) -> dict[str, Any]:
+        if request_id is not None:
+            wanted = str(request_id).strip()
+            try:
+                if not wanted:
+                    raise _CandidateOverlayError("request_id_required")
+                binding = _candidate_overlay_binding(ctx, wanted)
+            except _CandidateOverlayError as exc:
+                return {
+                    "ok": False,
+                    "error": "candidate_overlay_unavailable",
+                    "reason": exc.reason,
+                    "request_id": wanted,
+                }
+            ctx = dataclasses.replace(ctx, source_graph_binding_override=binding)
+        return worker_tools.source_graph_query(
             ctx, mode=mode, query=query, budget=budget,
             target=target, cursor=cursor,
             continuation_cursor=continuation_cursor,
             bundle_type=bundle_type, workflow_stage=workflow_stage,
             compact_replay=compact_replay,
-        ),
-        target=target,
-    )
+        )
+
+    return _invoke(call, target=target)
 
 
 def session_current_state(*, topic: str = "management", limit: int = 12) -> dict[str, Any]:
