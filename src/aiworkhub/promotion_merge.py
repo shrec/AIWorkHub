@@ -10,7 +10,9 @@ conflict error (NF-2026-01381).
 
 It also owns the rework base-drift rebase, which merges one predecessor
 worktree onto a newer successor base and prefers those same recorded blobs as
-its three-way ancestor (NF-2026-01113, NF-2026-01431).
+its three-way ancestor (NF-2026-01113, NF-2026-01431), and the rework parent
+baseline pin that makes a rework candidate's merge ancestor the predecessor's
+OWN recorded parent (NF-2026-01452).
 """
 
 from __future__ import annotations
@@ -34,6 +36,9 @@ from .worker_workspace import (
     _run,
     promote,
 )
+
+# The one Git object-name shape every recorded blob and base OID is checked by.
+_OID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
 
 def _regular_file(path: Path) -> bool:
@@ -355,3 +360,123 @@ def rework_base_drift_rebase(
         return merged
 
     return rebase
+
+
+def _launch_tree_blob(repo: Path, base_oid: str | None, rel: str) -> bytes | None:
+    """The predecessor's launch-time COMMITTED bytes for one path."""
+
+    if not base_oid or _OID_RE.fullmatch(base_oid) is None:
+        return None
+    return _cat_blob(repo, f"{base_oid}:{rel}")
+
+
+def _merge_drifted_seed(
+    repo: Path,
+    worktree: Path,
+    source: WorkerWorkspace,
+    paths: list[str],
+    *,
+    rebased_hashes: dict[str, str] | None = None,
+) -> None:
+    """Merge drifted canonical into seeded bytes that cannot be pinned.
+
+    Without a usable recorded blob the merge cannot be deferred to promotion,
+    so it happens here: ours=current canonical, base=the predecessor's
+    launch-time committed bytes (the empty one when the predecessor was given
+    no file at all), theirs=the seeded bytes, which the merged result replaces.
+    An unobtainable ancestor, an ancestor that does not hash to the recorded
+    parent digest, an irregular file or a conflict refuses provisioning by name
+    instead of handing the successor bytes whose promotion would revert
+    canonical.
+    """
+
+    with tempfile.TemporaryDirectory(prefix="aiworkhub-drift-") as scratch:
+        for rel in paths:
+            parent_path = repo / rel
+            candidate_path = worktree / rel
+            recorded = source.parent_baseline.get(rel)
+            base = (
+                b""
+                if recorded is None
+                else _launch_tree_blob(repo, source.base_oid, rel)
+            )
+            if (
+                base is None
+                or not _regular_file(parent_path)
+                or not _regular_file(candidate_path)
+            ):
+                raise WorkspaceError(f"rework_canonical_drift_conflict:{rel}")
+            # ``base_oid`` is the predecessor's real ancestor only while its
+            # committed blob still hashes to the recorded parent digest: an
+            # uncommitted accept moves canonical without moving ``base_oid``,
+            # so merging on that blob can resurrect a hunk canonical dropped.
+            # This is the identity ``rework_pinned_parent_baseline`` already
+            # demands of a pinned blob, so an unverifiable ancestor refuses.
+            digest = _parent_digest(source, rel)
+            if recorded is not None and (
+                digest is None or hashlib.sha256(base).hexdigest() != digest
+            ):
+                raise WorkspaceError(f"rework_canonical_drift_conflict:{rel}")
+            returncode, merged = _merge_file(
+                Path(scratch), parent_path, base, candidate_path
+            )
+            if returncode != 0:  # ``None`` is merge-file itself failing.
+                raise WorkspaceError(f"rework_canonical_drift_conflict:{rel}")
+            candidate_path.write_bytes(merged)
+            if rebased_hashes is not None:
+                rebased_hashes[rel] = hashlib.sha256(merged).hexdigest()
+
+
+def rework_pinned_parent_baseline(
+    repo: Path,
+    worktree: Path,
+    source: WorkerWorkspace,
+    seeded: Iterable[str],
+    canonical: dict[str, str | None],
+    *,
+    rebased_hashes: dict[str, str] | None = None,
+) -> tuple[dict[str, str | None], dict[str, str]]:
+    """Pin the PREDECESSOR's parent baseline over every rework-seeded path.
+
+    ``create_workspace`` records ``parent_baseline`` from the CURRENT canonical
+    tree, but a rework worktree is seeded with the predecessor's whole-file
+    bytes.  When canonical drifted between the two launches -- an accept that
+    promoted into the working tree without committing, so ``base_oid`` never
+    moved and ``rework_base_drift_rebase`` above saw no drift at all -- the
+    recorded base equals canonical, the candidate diff therefore "removes" the
+    drifted hunk, and the promotion merge faithfully applies that removal
+    (NF-2026-01452).
+
+    The predecessor's own recorded parent digest and blob OID are the real
+    merge ancestor, so returning them makes ``plan_merges`` run base=predecessor
+    parent, ours=current canonical, theirs=candidate and keep BOTH hunks.  A
+    path whose recorded blob is unavailable cannot defer that merge and goes to
+    ``_merge_drifted_seed``; a path canonical never touched is left exactly as
+    ``create_workspace`` recorded it.  ``rebased_hashes``, when given, receives
+    the digest of every seed-time merge so a sealed inherited output is credited.
+    """
+
+    baseline: dict[str, str | None] = {}
+    blobs: dict[str, str] = {}
+    unpinned: list[str] = []
+    for rel in sorted(set(seeded)):
+        recorded = source.parent_baseline.get(rel)
+        if recorded == canonical.get(rel):
+            continue
+        oid = str((source.parent_baseline_blob or {}).get(rel) or "")
+        digest = _parent_digest(source, rel)
+        raw = (
+            _cat_blob(repo, oid)
+            if digest is not None and _OID_RE.fullmatch(oid) is not None
+            else None
+        )
+        if raw is not None and hashlib.sha256(raw).hexdigest() == digest:
+            baseline[rel] = recorded
+            blobs[rel] = oid
+        else:
+            unpinned.append(rel)
+    if unpinned:
+        _merge_drifted_seed(
+            repo, worktree, source, unpinned, rebased_hashes=rebased_hashes
+        )
+    return baseline, blobs

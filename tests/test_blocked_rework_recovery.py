@@ -3482,9 +3482,10 @@ def test_nf594_timed_out_gc_recovers_from_authenticated_sealed_delta(
     monkeypatch.setattr(
         promotion_merge, "_isolated_worktree_base_oid", lambda *_a, **_k: predecessor_base,
     )
-    assert worker_workspace._materialize_rework_predecessor(
+    seeded, _source = worker_workspace._materialize_rework_predecessor(
         repo, successor, recovered, tuple(recovered["allowed_writes"])
-    ) == sorted(_NF919_PATHS)
+    )
+    assert seeded == sorted(_NF919_PATHS)
     for path, data in sealed.items():
         assert (successor / path).read_bytes() == data
     assert not (

@@ -2306,17 +2306,19 @@ def _materialize_rework_predecessor(
     allowed_writes: tuple[str, ...],
     *,
     rebased_hashes: dict[str, str] | None = None,
-) -> list[str]:
+) -> tuple[list[str], WorkerWorkspace | None]:
     """Overlay one hash-pinned predecessor into a successor worktree.
 
     The recorded delta artifact is preferred when present; otherwise the retained
     worktree is used, since a retention sweep can leave it emptied but present.
     ``rebased_hashes``, when given, receives the raw SHA-256 of every path whose
-    base-drift rebase wrote bytes other than the pinned predecessor bytes.
+    base-drift rebase wrote bytes other than the pinned predecessor bytes.  The
+    predecessor's source workspace is returned with the seeded paths because ITS
+    parent baseline is the successor's promotion merge ancestor (NF-2026-01452).
     """
     predecessor = card.get("rework_predecessor")
     if predecessor is None:
-        return []
+        return [], None
     if not isinstance(predecessor, dict):
         raise WorkspaceError("rework_predecessor_invalid")
     request_id = str(predecessor.get("request_id") or "").strip()
@@ -2355,11 +2357,11 @@ def _materialize_rework_predecessor(
             expected_path_hashes=hashes,
             allowed_writes=allowed_writes,
             rebase=rebase,
-        )
+        ), source_workspace
     if not source_workspace.path.is_symlink() and source_workspace.path.is_dir():
         return _materialize_rework_predecessor_from_worktree(
             worktree, source_workspace, hashes, allowed_writes, rebase=rebase
-        )
+        ), source_workspace
     raise WorkspaceError("rework_predecessor_workspace_missing")
 
 
@@ -5648,8 +5650,8 @@ def create_workspace(
                 if not any(ch in relative for ch in "*?["):
                     _touch_placeholder(path, relative)
         rework_rebased: dict[str, str] = {}
-        rework_seeded = (
-            ()
+        rework_seeded, rework_source = (
+            ([], None)
             if pinned_base_oid is not None
             else _materialize_rework_predecessor(
                 repo, path, card, allowed, rebased_hashes=rework_rebased
@@ -5664,6 +5666,24 @@ def create_workspace(
         baseline: dict[str, str | None] = {}
         for relative in _expand_declared(baseline_root, allowed):
             baseline[relative] = _hash_path(baseline_root / relative)
+        rework_baseline_blob: dict[str, str] = {}
+        if rework_source is not None:
+            # Seeded paths merge against the PREDECESSOR's parent baseline,
+            # never the drifted canonical hashed above (NF-2026-01452); before
+            # ``workspace_baseline`` since an unpinnable path merges in place.
+            # A path the committed-drift rebase already merged onto canonical
+            # keeps canonical as its ancestor (NF-2026-01113).
+            from .promotion_merge import rework_pinned_parent_baseline
+
+            rework_baseline, rework_baseline_blob = rework_pinned_parent_baseline(
+                repo,
+                path,
+                rework_source,
+                sorted(set(rework_seeded) - set(rework_rebased)),
+                baseline,
+                rebased_hashes=rework_rebased,
+            )
+            baseline.update(rework_baseline)
         workspace_baseline = {
             relative: _hash_path(path / relative)
             for relative in sorted(set(seeded) | set(_expand_declared(path, allowed)))
@@ -5711,6 +5731,10 @@ def create_workspace(
         raise
     from .promotion_merge import record_base_blobs
 
+    parent_baseline_blob = record_base_blobs(baseline_root, baseline)
+    # A pinned rework ancestor is the predecessor's RECORDED blob, so it
+    # replaces the one just hashed off the live canonical file (NF-2026-01452).
+    parent_baseline_blob.update(rework_baseline_blob)
     workspace = WorkerWorkspace(
         request_id=request_id,
         repo=repo,
@@ -5726,7 +5750,7 @@ def create_workspace(
         },
         inherited_rework_paths=tuple(sorted(set(rework_seeded))),
         base_oid=base_oid,
-        parent_baseline_blob=record_base_blobs(baseline_root, baseline),
+        parent_baseline_blob=parent_baseline_blob,
         inherited_rebased_hashes=dict(sorted(rework_rebased.items())),
     )
     # Seal the exit-contract inputs the worker MCP server needs for
