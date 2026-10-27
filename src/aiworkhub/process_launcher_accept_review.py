@@ -1126,7 +1126,10 @@ def _finalizer_validation_reuse(
     return {"full_validation_snapshot": snapshot, "validations": rows}
 
 
-def _blind_reviewer_lenses(reviewers: list[dict[str, Any]]) -> set[str]:
+def _blind_reviewer_lenses(
+    reviewers: list[dict[str, Any]],
+    finding_dispositions: list[Mapping[str, Any]] | None = None,
+) -> set[str]:
     """Lenses whose ALREADY-SEALED reports show that nothing inspected them.
 
     Literally ``quality_evidence.blind_reviewer_lenses`` -- the classifier
@@ -1134,16 +1137,23 @@ def _blind_reviewer_lenses(reviewers: list[dict[str, Any]]) -> set[str]:
     the very receipts the accept path would read. Sharing the function, rather
     than restating the rule, is the whole point: a second hand-written copy of
     "what counts as blind" is how a preview starts promising an acceptance the
-    gate then refuses.
+    gate then refuses. ``finding_dispositions`` are the ALREADY-bound manager
+    receipts, handed to that same function so a dismissed process_limit finding
+    stops counting here exactly where the fold stops counting it (NF-2026-01762).
 
     Only ``receipt.report`` is consulted, and that receipt was verified and
     sealed by the server: nothing here re-verifies anything, and no report a
     model, worker or manager supplied can reach this function.
     """
     return quality_evidence.blind_reviewer_lenses(
-        reviewer["receipt"].get("report")
-        for reviewer in reviewers
-        if isinstance(reviewer.get("receipt"), Mapping)
+        (
+            reviewer["receipt"].get("report")
+            for reviewer in reviewers
+            if isinstance(reviewer.get("receipt"), Mapping)
+        ),
+        dismissed_by_finding=quality_evidence.dismissed_finding_receipts(
+            finding_dispositions
+        ),
     )
 
 
@@ -1503,7 +1513,11 @@ def fold_accept_blockers(
     # report for any judgment lens, and predicting less would be the same
     # disagreement in the other direction.
     if required:
-        for lens in sorted(_blind_reviewer_lenses(evidence_rows)):
+        for lens in sorted(
+            _blind_reviewer_lenses(
+                evidence_rows, finding_dispositions=finding_dispositions
+            )
+        ):
             blockers.append(_blocker("reviewer_could_not_inspect", lens, lens=lens))
     # NF-2026-01742: the manager's ``confirm_high_risk`` and an owner approval
     # are different facts; the one shared predicate decides which clears this.

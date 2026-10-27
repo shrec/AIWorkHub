@@ -1282,14 +1282,20 @@ def normalize_reviewer_reports(
     return normalized, errors
 
 
-def reviewer_report_could_not_inspect(report: Mapping[str, Any]) -> bool:
+def reviewer_report_could_not_inspect(
+    report: Mapping[str, Any],
+    *,
+    disposed_finding_ids: frozenset[str] = frozenset(),
+) -> bool:
     """Detect a positive signal that a reviewer could not inspect its packet.
 
     Two affirmative signals mark a report as blind rather than merely
     low-signal:
 
     * every finding carries ``disposition: process_limit`` -- the reviewer
-      itself reporting it was prevented from inspecting; or
+      itself reporting it was prevented from inspecting -- and at least one of
+      them is not named in ``disposed_finding_ids`` (a process_limit finding a
+      manager dismissed with bound counter-evidence, NF-2026-01762); or
     * ``usage`` telemetry is present and records zero activity
       (``usage_observed: false`` with ``input_tokens: 0`` and
       ``output_tokens: 0``).
@@ -1302,6 +1308,7 @@ def reviewer_report_could_not_inspect(report: Mapping[str, Any]) -> bool:
     findings = report.get("findings")
     if isinstance(findings, list) and findings:
         all_process_limit = True
+        undisposed = False
         for finding in findings:
             if not isinstance(finding, Mapping):
                 all_process_limit = False
@@ -1309,7 +1316,13 @@ def reviewer_report_could_not_inspect(report: Mapping[str, Any]) -> bool:
             if finding.get("disposition") != FINDING_DISPOSITION_PROCESS_LIMIT:
                 all_process_limit = False
                 break
-        if all_process_limit:
+            raw_id = finding.get("id")
+            if not isinstance(raw_id, str) or (
+                f"reviewer:{report.get('lens')}:{raw_id[:200]}"
+                not in disposed_finding_ids
+            ):
+                undisposed = True
+        if all_process_limit and undisposed:
             return True
     usage = report.get("usage")
     if isinstance(usage, Mapping):
@@ -1322,7 +1335,11 @@ def reviewer_report_could_not_inspect(report: Mapping[str, Any]) -> bool:
     return False
 
 
-def blind_reviewer_lenses(reports: Iterable[Any]) -> set[str]:
+def blind_reviewer_lenses(
+    reports: Iterable[Any],
+    *,
+    dismissed_by_finding: Mapping[str, str] | None = None,
+) -> set[str]:
     """The judgment lenses NOTHING inspected, from raw reviewer reports.
 
     A LENS is blind when every report for it is blind and none is sighted: one
@@ -1337,19 +1354,67 @@ def blind_reviewer_lenses(reports: Iterable[Any]) -> set[str]:
     reviewer it names (NF-2026-01158, via
     :func:`reviewer_card_lens_verdict_is_blind`).
 
-    Performs no I/O, trusts no model-supplied pass/fail field, and cannot
-    satisfy a lens: every return value of it only ever ADDS a refusal.
+    ``dismissed_by_finding`` (:func:`dismissed_finding_receipts` over
+    dispositions the caller already bound to this candidate and reviewer
+    receipt) lets a correctness/security ``process_limit`` finding that a
+    manager dismissed stop counting toward blindness (NF-2026-01762). The
+    lifting condition is :func:`dismissal_lifts_finding`, so the id must be
+    unique across every report given and the severity non-blocking. A report
+    with any ``process_limit`` finding left undisposed stays blind, and with
+    no dispositions this is exactly the rule it was before they existed.
+
+    Performs no I/O and trusts no model-supplied pass/fail field. Every
+    disposition-free return value only ever ADDS a refusal.
     """
 
+    materialized = [
+        report
+        for report in reports
+        if isinstance(report, Mapping)
+        and isinstance(report.get("lens"), str)
+        and report.get("lens") in JUDGMENT_LENSES
+    ]
+    dismissed = dismissed_by_finding or {}
+    finding_id_counts: dict[str, int] = {}
+    if dismissed:
+        for report in materialized:
+            report_findings = report.get("findings")
+            for finding in report_findings if isinstance(report_findings, list) else ():
+                if isinstance(finding, Mapping) and isinstance(finding.get("id"), str):
+                    counted = f"reviewer:{report['lens']}:{finding['id'][:200]}"
+                    finding_id_counts[counted] = finding_id_counts.get(counted, 0) + 1
     blind: set[str] = set()
     sighted: set[str] = set()
-    for report in reports:
-        if not isinstance(report, Mapping):
-            continue
-        lens = report.get("lens")
-        if not isinstance(lens, str) or lens not in JUDGMENT_LENSES:
-            continue
-        (blind if reviewer_report_could_not_inspect(report) else sighted).add(lens)
+    for report in materialized:
+        lens = report["lens"]
+        disposed: frozenset[str] = frozenset()
+        findings = report.get("findings")
+        if dismissed and lens in {LENS_CORRECTNESS, LENS_SECURITY} and isinstance(
+            findings, list
+        ):
+            disposed = frozenset(
+                counted
+                for counted in (
+                    f"reviewer:{lens}:{finding['id'][:200]}"
+                    for finding in findings
+                    if isinstance(finding, Mapping)
+                    and finding.get("disposition") == FINDING_DISPOSITION_PROCESS_LIMIT
+                    and isinstance(finding.get("id"), str)
+                    and isinstance(finding.get("severity"), str)
+                    and finding["severity"] not in BLOCKING_SEVERITIES
+                )
+                if dismissal_lifts_finding(
+                    counted,
+                    severity=SEVERITY_LOW,
+                    finding_id_counts=finding_id_counts,
+                    dismissed_by_finding=dismissed,
+                )
+            )
+        (
+            blind
+            if reviewer_report_could_not_inspect(report, disposed_finding_ids=disposed)
+            else sighted
+        ).add(lens)
     return blind - sighted
 
 
@@ -1632,7 +1697,9 @@ def fold_quality_verdict(
     # and reviewer REUSE is refused with it too (NF-2026-01158), so the preview,
     # the acceptance and the decision to buy a fresh reviewer cannot disagree
     # about which lens nothing inspected.
-    blind_lenses: set[str] = blind_reviewer_lenses(raw_reports)
+    blind_lenses: set[str] = blind_reviewer_lenses(
+        raw_reports, dismissed_by_finding=dismissed_by_finding
+    )
 
     reports_by_lens: dict[str, list[dict[str, Any]]] = {}
     refine_required = False

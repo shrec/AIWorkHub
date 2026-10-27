@@ -2841,12 +2841,16 @@ class ReviewOrchestrator:
             }
         if disposition == "dismissed" and (
             finding.get("disposition", quality_evidence.FINDING_DISPOSITION_DEFECT)
-            != quality_evidence.FINDING_DISPOSITION_DEFECT
+            not in {
+                quality_evidence.FINDING_DISPOSITION_DEFECT,
+                quality_evidence.FINDING_DISPOSITION_PROCESS_LIMIT,
+            }
             or lens
             not in {quality_evidence.LENS_CORRECTNESS, quality_evidence.LENS_SECURITY}
         ):
             # Only an actionable correctness/security finding is a refinement
-            # blocker; dismissing anything else would be a no-op receipt.
+            # blocker, and a process_limit one is the blindness blocker
+            # (NF-2026-01762); dismissing anything else would be a no-op receipt.
             return {"ok": False, "error": "review_finding_disposition_not_a_blocker"}
         receipt = {
             "schema_id": FINDING_DISPOSITION_SCHEMA,
