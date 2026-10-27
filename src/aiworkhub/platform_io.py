@@ -915,9 +915,18 @@ def _windows_terminate_pid(pid: int) -> bool:
 
 
 def _windows_tree_kill_order(
-    root: int, tree: dict[int, tuple[int, str]] | None
+    root: int,
+    tree: dict[int, tuple[int, str]] | None,
+    creation_time: Callable[[int], int | None],
 ) -> list[int]:
-    """Root plus every snapshot descendant, descendants before ancestors."""
+    """Root plus every snapshot descendant, descendants before ancestors.
+
+    Windows recycles PIDs and never rewrites a child's recorded parent PID, so
+    a ParentProcessID link alone may point at an unrelated, older process. A
+    child is adopted only when its creation ``FILETIME`` is not earlier than
+    its parent's; an unreadable time on either side adopts nothing, so missing
+    evidence never widens the kill set. The root itself is always included.
+    """
 
     if not tree:
         return [root]
@@ -925,12 +934,26 @@ def _windows_tree_kill_order(
     for pid, (parent, _image) in tree.items():
         if pid != parent:
             children.setdefault(parent, []).append(pid)
+    created: dict[int, int | None] = {}
+
+    def created_at(pid: int) -> int | None:
+        if pid not in created:
+            stamp = creation_time(pid)
+            created[pid] = stamp if isinstance(stamp, int) and stamp > 0 else None
+        return created[pid]
+
     order = [root]
     seen = {root}
     index = 0
     while index < len(order):
-        for child in sorted(children.get(order[index], ())):
-            if child not in seen:
+        parent = order[index]
+        candidates = sorted(children.get(parent, ()))
+        parent_created = created_at(parent) if candidates else None
+        for child in candidates:
+            if child in seen or parent_created is None:
+                continue
+            child_created = created_at(child)
+            if child_created is not None and child_created >= parent_created:
                 seen.add(child)
                 order.append(child)
         index += 1
@@ -950,12 +973,15 @@ def terminate_process_tree(
     sleep: Callable[[float], None] = time.sleep,
     native_terminate: Callable[[int], bool] | None = None,
     process_tree: Callable[[], dict[int, tuple[int, str]] | None] | None = None,
+    creation_time: Callable[[int], int | None] | None = None,
 ) -> bool:
     """Terminate one process tree, escalating a surviving POSIX group to KILL.
 
     On Windows taskkill is resolved from the system directory only; when it is
     unavailable, fails, or leaves the root alive, the root and every descendant
-    from one process snapshot are terminated natively, descendants first.
+    from one process snapshot are terminated natively, descendants first. A
+    descendant must have been created no earlier than its parent, so a stale
+    parent PID left behind by PID reuse never pulls an unrelated process in.
     """
 
     if (
@@ -999,7 +1025,14 @@ def terminate_process_tree(
                         return True
         snapshot = (process_tree or windows_process_tree)()
         terminate_one = native_terminate or _windows_terminate_pid
-        for pid in _windows_tree_kill_order(identity, snapshot):
+        read_created = creation_time
+        if read_created is None:
+            # OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) + GetProcessTimes,
+            # handle closed in finally; FILETIME is ordered on one host.
+            from .runtime_temp import process_start_ticks
+
+            read_created = process_start_ticks
+        for pid in _windows_tree_kill_order(identity, snapshot, read_created):
             terminate_one(pid)
         return _wait_until_gone(
             identity, alive, timeout, poll_interval, monotonic, sleep

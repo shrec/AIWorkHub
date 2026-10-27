@@ -2081,6 +2081,7 @@ def test_windows_process_tree_native_kill_orders_descendants_before_root(
         sleep=clock.sleep,
         native_terminate=native_terminate,
         process_tree=lambda: tree,
+        creation_time=lambda _pid: 100,
     )
     assert terminated == [44, 43, 42]
     assert commands == [
@@ -2107,6 +2108,7 @@ def test_windows_process_tree_reports_root_that_native_kill_cannot_terminate(
         sleep=clock.sleep,
         native_terminate=lambda pid: terminated.append(pid) or False,
         process_tree=lambda: {42: (7, "supervisor.exe"), 43: (42, "child.exe")},
+        creation_time=lambda _pid: 100,
     )
     assert terminated == [43, 42]
 
@@ -2135,6 +2137,7 @@ def test_windows_process_tree_without_system_taskkill_uses_native_fallback_only(
         sleep=clock.sleep,
         native_terminate=native_terminate,
         process_tree=lambda: {42: (7, "supervisor.exe"), 43: (42, "child.exe")},
+        creation_time=lambda _pid: 100,
     )
     assert terminated == [43, 42]
 
@@ -2147,11 +2150,153 @@ def test_windows_tree_kill_order_guards_cycles_and_skips_self_parented_pids():
         44: (43, "grandchild.exe"),
         45: (42, "second-child.exe"),
     }
-    order = platform_io._windows_tree_kill_order(42, tree)
+    order = platform_io._windows_tree_kill_order(42, tree, lambda _pid: 100)
     assert order[-1] == 42
     assert sorted(order) == [42, 43, 44, 45]
     assert order.index(44) < order.index(43)
-    assert platform_io._windows_tree_kill_order(42, None) == [42]
+    assert platform_io._windows_tree_kill_order(
+        42, None, lambda _pid: pytest.fail("creation_time")
+    ) == [42]
+
+
+def _windows_kill_order_with_times(tree, times):
+    reads = []
+
+    def creation_time(pid):
+        reads.append(pid)
+        return times.get(pid)
+
+    order = platform_io._windows_tree_kill_order(42, tree, creation_time)
+    return order, reads
+
+
+def test_windows_tree_kill_order_skips_child_older_than_reused_parent_pid():
+    # 43 recorded PPID 42 from a long-dead process; our target reused PID 42
+    # later, so 43 (and anything below it) predates the target and is foreign.
+    tree = {
+        42: (7, "supervisor.exe"),
+        43: (42, "unrelated-orphan.exe"),
+        44: (43, "unrelated-grandchild.exe"),
+        45: (42, "child.exe"),
+        46: (45, "grandchild.exe"),
+        47: (46, "older-than-grandchild.exe"),
+    }
+    times = {42: 1_000, 43: 500, 44: 600, 45: 1_000, 46: 1_200, 47: 1_100}
+    order, _reads = _windows_kill_order_with_times(tree, times)
+    assert order == [46, 45, 42]
+
+
+def test_windows_tree_kill_order_keeps_genuine_children_deepest_first():
+    tree = {
+        42: (7, "supervisor.exe"),
+        43: (42, "child.exe"),
+        44: (43, "grandchild.exe"),
+        45: (42, "second-child.exe"),
+        99: (7, "unrelated.exe"),
+    }
+    times = {42: 1_000, 43: 1_000, 44: 1_500, 45: 2_000, 99: 3_000}
+    order, reads = _windows_kill_order_with_times(tree, times)
+    assert order == [44, 45, 43, 42]
+    assert 99 not in reads
+    assert len(reads) == len(set(reads))
+
+
+@pytest.mark.parametrize("unreadable", [None, 0, -1, "1500"])
+def test_windows_tree_kill_order_never_adopts_child_with_unreadable_time(
+    unreadable,
+):
+    tree = {
+        42: (7, "supervisor.exe"),
+        43: (42, "child.exe"),
+        44: (43, "grandchild.exe"),
+        45: (42, "unknown.exe"),
+    }
+    times = {42: 1_000, 43: 1_100, 44: 1_200, 45: unreadable}
+    order, _reads = _windows_kill_order_with_times(tree, times)
+    assert order == [44, 43, 42]
+    # An unreadable root time adopts no child at all; the root still dies.
+    order, _reads = _windows_kill_order_with_times(tree, {**times, 42: unreadable})
+    assert order == [42]
+
+
+def test_windows_process_tree_native_kill_honours_creation_time(monkeypatch):
+    monkeypatch.setattr(platform_io, "windows_system_taskkill_path", lambda: None)
+    terminated = []
+    dead = set()
+    clock = _FakeClock()
+    times = {42: 1_000, 43: 500, 44: 1_100}
+
+    def native_terminate(pid):
+        terminated.append(pid)
+        dead.add(pid)
+        return True
+
+    assert platform_io.terminate_process_tree(
+        42,
+        platform_name="windows",
+        timeout=0.1,
+        poll_interval=0.05,
+        run=lambda *_args, **_kwargs: pytest.fail("run"),
+        probe=lambda pid: pid not in dead,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        native_terminate=native_terminate,
+        process_tree=lambda: {
+            42: (7, "supervisor.exe"),
+            43: (42, "reused-ppid.exe"),
+            44: (42, "child.exe"),
+        },
+        creation_time=times.get,
+    )
+    assert terminated == [44, 42]
+
+
+@pytest.mark.parametrize("outcome", ["ok", "fail", "raise"])
+def test_windows_creation_time_reader_always_closes_process_handle(
+    monkeypatch, outcome
+):
+    import ctypes
+
+    from aiworkhub import runtime_temp
+
+    closed = []
+    opened = []
+
+    class _Function:
+        def __init__(self, body):
+            self.body = body
+
+        def __call__(self, *args):
+            return self.body(*args)
+
+    def open_process(access, inherit, pid):
+        opened.append((access, inherit, pid))
+        return 0xBEEF
+
+    def get_process_times(_handle, creation, *_rest):
+        if outcome == "raise":
+            raise OSError("GetProcessTimes")
+        if outcome == "fail":
+            return 0
+        creation._obj.high = 1
+        creation._obj.low = 2
+        return 1
+
+    kernel32 = SimpleNamespace(
+        OpenProcess=_Function(open_process),
+        GetProcessTimes=_Function(get_process_times),
+        CloseHandle=_Function(lambda handle: closed.append(handle) or 1),
+    )
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_a, **_k: kernel32, raising=False)
+    if outcome == "raise":
+        with pytest.raises(OSError):
+            runtime_temp._windows_start_ticks(43)
+    else:
+        expected = (1 << 32) | 2 if outcome == "ok" else None
+        assert runtime_temp._windows_start_ticks(43) == expected
+    # PROCESS_QUERY_LIMITED_INFORMATION, and the handle is released every time.
+    assert opened == [(0x1000, False, 43)]
+    assert closed == [0xBEEF]
 
 
 def test_path_identity_and_executable_names_are_platform_specific():
