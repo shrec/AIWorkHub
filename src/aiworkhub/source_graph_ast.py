@@ -46,7 +46,7 @@ from pathlib import Path
 
 from . import source_graph_languages as languages
 
-EXTRACTOR_ID = "aiworkhub.source_graph_ast.python_stdlib_ast.v1"
+EXTRACTOR_ID = "aiworkhub.source_graph_ast.python_stdlib_ast.v2"
 FILE_EVIDENCE_EXTRACTOR_ID = "aiworkhub.source_graph_ast.file_evidence.v1"
 PHP_LEXICAL_EXTRACTOR_ID = "aiworkhub.source_graph_ast.php_lexical.v1"
 CPP_LEXICAL_EXTRACTOR_ID = "aiworkhub.source_graph_ast.cpp_lexical.v1"
@@ -1289,14 +1289,20 @@ def _extract_file_evidence(
 
 
 def _sig_of(node: ast.AST) -> str:
+    limit = 500
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        args = [a.arg for a in node.args.args]
         prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
-        return f"{prefix} {node.name}({', '.join(args)})"
-    if isinstance(node, ast.ClassDef):
-        bases = [ast.unparse(b) for b in node.bases]
-        return f"class {node.name}({', '.join(bases)})" if bases else f"class {node.name}"
-    return ""
+        sig = f"{prefix} {node.name}({ast.unparse(node.args)})"
+        if node.returns is not None:
+            sig += f" -> {ast.unparse(node.returns)}"
+    elif isinstance(node, ast.ClassDef):
+        parts = [ast.unparse(b) for b in node.bases]
+        parts.extend(ast.unparse(k) for k in node.keywords)
+        sig = f"class {node.name}({', '.join(parts)})" if parts else f"class {node.name}"
+    else:
+        return ""
+    # A cut signature must look incomplete, never like a complete arity.
+    return sig if len(sig) <= limit else sig[:limit - 3] + "..."
 
 
 def _end_line(node: ast.AST) -> int:
