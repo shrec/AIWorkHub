@@ -1939,7 +1939,29 @@ def test_posix_process_tree_zero_timeout_escalates_without_sleeping():
     assert sleeps == []
 
 
-def test_windows_process_tree_uses_graceful_taskkill_tree_command():
+_SYSTEM_TASKKILL = r"C:\Windows\System32\taskkill.exe"
+
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, delay):
+        self.now += delay
+
+
+@pytest.fixture
+def system_taskkill(monkeypatch):
+    monkeypatch.setattr(
+        platform_io, "windows_system_taskkill_path", lambda: _SYSTEM_TASKKILL
+    )
+    return _SYSTEM_TASKKILL
+
+
+def test_windows_process_tree_uses_graceful_taskkill_tree_command(system_taskkill):
     calls = []
 
     def run(command, **kwargs):
@@ -1955,15 +1977,15 @@ def test_windows_process_tree_uses_graceful_taskkill_tree_command():
     )
     assert calls == [
         (
-            ["taskkill", "/PID", "42", "/T"],
+            [system_taskkill, "/PID", "42", "/T"],
             {"check": False, "shell": False, "timeout": 2.5},
         )
     ]
 
 
-def test_windows_process_tree_forces_survivor_after_grace_period():
+def test_windows_process_tree_forces_survivor_after_grace_period(system_taskkill):
     calls = []
-    probes = iter((True, True))
+    probes = iter((True, False))
     clock = iter((10.0, 10.1, 10.1))
 
     def run(command, **kwargs):
@@ -1979,14 +2001,16 @@ def test_windows_process_tree_forces_survivor_after_grace_period():
         probe=lambda _pid: next(probes),
         monotonic=lambda: next(clock),
         sleep=lambda _delay: None,
+        native_terminate=lambda _pid: pytest.fail("native_terminate"),
+        process_tree=lambda: pytest.fail("process_tree"),
     )
     assert calls == [
         (
-            ["taskkill", "/PID", "42", "/T"],
+            [system_taskkill, "/PID", "42", "/T"],
             {"check": False, "shell": False, "timeout": 0.1},
         ),
         (
-            ["taskkill", "/F", "/PID", "42", "/T"],
+            [system_taskkill, "/F", "/PID", "42", "/T"],
             {"check": False, "shell": False, "timeout": 0.1},
         ),
     ]
@@ -1999,13 +2023,135 @@ def test_windows_process_tree_forces_survivor_after_grace_period():
         OSError(errno.ENOENT, "fake missing taskkill"),
     ],
 )
-def test_windows_process_tree_fails_closed_when_taskkill_cannot_complete(error):
+def test_windows_process_tree_fails_closed_when_taskkill_cannot_complete(
+    error, system_taskkill
+):
+    terminated = []
+    clock = _FakeClock()
+
     def run(*_args, **_kwargs):
         raise error
 
     assert not platform_io.terminate_process_tree(
-        42, platform_name="windows", timeout=2.5, run=run
+        42,
+        platform_name="windows",
+        timeout=2.5,
+        run=run,
+        probe=lambda _pid: True,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        native_terminate=lambda pid: terminated.append(pid) or False,
+        process_tree=lambda: None,
     )
+    assert terminated == [42]
+
+
+@pytest.mark.parametrize("returncode", [1, 0])
+def test_windows_process_tree_native_kill_orders_descendants_before_root(
+    returncode, system_taskkill
+):
+    commands = []
+    terminated = []
+    dead = set()
+    clock = _FakeClock()
+    tree = {
+        42: (7, "supervisor.exe"),
+        43: (42, "child.exe"),
+        44: (43, "grandchild.exe"),
+        99: (7, "unrelated.exe"),
+    }
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=returncode)
+
+    def native_terminate(pid):
+        terminated.append(pid)
+        dead.add(pid)
+        return True
+
+    assert platform_io.terminate_process_tree(
+        42,
+        platform_name="windows",
+        timeout=0.1,
+        poll_interval=0.05,
+        run=run,
+        probe=lambda pid: pid not in dead,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        native_terminate=native_terminate,
+        process_tree=lambda: tree,
+    )
+    assert terminated == [44, 43, 42]
+    assert commands == [
+        [system_taskkill, "/PID", "42", "/T"],
+        [system_taskkill, "/F", "/PID", "42", "/T"],
+    ]
+    assert all(command[0] != "taskkill" for command in commands)
+
+
+def test_windows_process_tree_reports_root_that_native_kill_cannot_terminate(
+    system_taskkill,
+):
+    terminated = []
+    clock = _FakeClock()
+
+    assert not platform_io.terminate_process_tree(
+        42,
+        platform_name="windows",
+        timeout=0.1,
+        poll_interval=0.05,
+        run=lambda *_args, **_kwargs: SimpleNamespace(returncode=1),
+        probe=lambda _pid: True,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        native_terminate=lambda pid: terminated.append(pid) or False,
+        process_tree=lambda: {42: (7, "supervisor.exe"), 43: (42, "child.exe")},
+    )
+    assert terminated == [43, 42]
+
+
+def test_windows_process_tree_without_system_taskkill_uses_native_fallback_only(
+    monkeypatch,
+):
+    monkeypatch.setattr(platform_io, "windows_system_taskkill_path", lambda: None)
+    terminated = []
+    dead = set()
+    clock = _FakeClock()
+
+    def native_terminate(pid):
+        terminated.append(pid)
+        dead.add(pid)
+        return True
+
+    assert platform_io.terminate_process_tree(
+        42,
+        platform_name="windows",
+        timeout=0.1,
+        poll_interval=0.05,
+        run=lambda *_args, **_kwargs: pytest.fail("run"),
+        probe=lambda pid: pid not in dead,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        native_terminate=native_terminate,
+        process_tree=lambda: {42: (7, "supervisor.exe"), 43: (42, "child.exe")},
+    )
+    assert terminated == [43, 42]
+
+
+def test_windows_tree_kill_order_guards_cycles_and_skips_self_parented_pids():
+    tree = {
+        0: (0, "[System Process]"),
+        42: (44, "supervisor.exe"),
+        43: (42, "child.exe"),
+        44: (43, "grandchild.exe"),
+        45: (42, "second-child.exe"),
+    }
+    order = platform_io._windows_tree_kill_order(42, tree)
+    assert order[-1] == 42
+    assert sorted(order) == [42, 43, 44, 45]
+    assert order.index(44) < order.index(43)
+    assert platform_io._windows_tree_kill_order(42, None) == [42]
 
 
 def test_path_identity_and_executable_names_are_platform_specific():
@@ -2027,6 +2173,9 @@ def test_windows_module_import_and_process_branches_do_not_require_killpg(monkey
     monkeypatch.setitem(sys.modules, spec.name, imported)
     monkeypatch.delattr(os, "killpg", raising=False)
     spec.loader.exec_module(imported)
+    monkeypatch.setattr(
+        imported, "windows_system_taskkill_path", lambda: _SYSTEM_TASKKILL
+    )
 
     assert imported.is_windows("win32")
     assert imported.probe_process_group(
@@ -2047,7 +2196,7 @@ def test_windows_module_import_and_process_branches_do_not_require_killpg(monkey
     )
     assert calls == [
         (
-            ["taskkill", "/PID", "42", "/T"],
+            [_SYSTEM_TASKKILL, "/PID", "42", "/T"],
             {"check": False, "shell": False, "timeout": 1.5},
         )
     ]

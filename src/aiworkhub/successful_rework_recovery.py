@@ -36,22 +36,32 @@ def _contained_path(path: Path, root: Path) -> None:
 
 
 @contextmanager
-def _regular_descriptor(path: Path):
-    """Traverse from a pinned filesystem root and retain every parent handle."""
+def _regular_descriptor(path: Path, root: Path):
+    """Traverse from the trusted containment root and retain every parent handle.
+
+    ``root`` is the root ``_contained_path`` already proved link-free, so no
+    directory above it is opened (restricted tokens may not open the drive root).
+    On Windows the root is opened with ``open_windows_root_directory_handle``, not
+    ``WindowsDirectoryAuthority``: the latter's final-path query is denied
+    (winerror=5) under the AppContainer token, so root identity is authenticated
+    by its reparse tag and FILE_ID instead.
+    """
+    names = path.relative_to(root).parts
+    if not names:
+        raise SuccessfulReworkRecoveryError("successful_rework_path_unsafe")
     with ExitStack() as handles:
         if platform_io.is_windows():
-            authority = handles.enter_context(runtime_temp.WindowsDirectoryAuthority(Path(path.anchor)))
-            parent = authority.handle
-            for name in path.parts[1:-1]:
+            parent = handles.enter_context(platform_io.open_windows_root_directory_handle(root)).value
+            for name in names[:-1]:
                 parent = handles.enter_context(
                     platform_io.open_windows_relative_child_directory(parent, name)
                 ).value
             descriptor = platform_io.open_windows_relative_regular_file_descriptor(parent, path.name)
         else:
             flags = platform_io.directory_open_flags()
-            parent = os.open(path.anchor, flags)
+            parent = os.open(root, flags)
             handles.callback(os.close, parent)
-            for name in path.parts[1:-1]:
+            for name in names[:-1]:
                 parent = os.open(name, flags, dir_fd=parent)
                 handles.callback(os.close, parent)
             descriptor = os.open(
@@ -66,7 +76,7 @@ def _read_regular(path: Path, root: Path, limit: int, *, missing_ok: bool = Fals
     """Read once through anchored parents; authenticate the descriptor read."""
     _contained_path(path, root)
     try:
-        with _regular_descriptor(path) as fd, os.fdopen(fd, "rb", closefd=False) as stream:
+        with _regular_descriptor(path, root) as fd, os.fdopen(fd, "rb", closefd=False) as stream:
             before = os.fstat(fd)
             if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
                 raise SuccessfulReworkRecoveryError("successful_rework_path_unsafe")

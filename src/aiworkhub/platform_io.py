@@ -862,6 +862,81 @@ def probe_process_group(
     return True
 
 
+def _wait_until_gone(
+    identity: int,
+    alive: Callable[[int], bool],
+    timeout: float,
+    poll_interval: float,
+    monotonic: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> bool:
+    """Poll ``alive`` until it answers False or ``timeout`` elapses."""
+
+    deadline = monotonic() + timeout
+    while alive(identity):
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return False
+        sleep(min(poll_interval, remaining))
+    return True
+
+
+def _windows_terminate_pid(pid: int) -> bool:
+    """TerminateProcess one Windows PID; a PID that is already gone succeeds."""
+
+    try:
+        from ctypes import wintypes
+
+        kernel32 = _windows_dll_loader()("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        open_process.restype = wintypes.HANDLE
+        terminate_process = kernel32.TerminateProcess
+        terminate_process.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        terminate_process.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+
+        handle = open_process(0x0001, False, pid)  # PROCESS_TERMINATE
+        if not handle:
+            # ERROR_INVALID_PARAMETER: no process with this PID exists.
+            return ctypes.get_last_error() == 87
+        try:
+            if terminate_process(handle, 1):
+                return True
+        finally:
+            close_handle(handle)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+    # TerminateProcess refuses a process that already exited; only a
+    # confirmed-gone PID counts as success.
+    return not windows_pid_is_alive(pid)
+
+
+def _windows_tree_kill_order(
+    root: int, tree: dict[int, tuple[int, str]] | None
+) -> list[int]:
+    """Root plus every snapshot descendant, descendants before ancestors."""
+
+    if not tree:
+        return [root]
+    children: dict[int, list[int]] = {}
+    for pid, (parent, _image) in tree.items():
+        if pid != parent:
+            children.setdefault(parent, []).append(pid)
+    order = [root]
+    seen = {root}
+    index = 0
+    while index < len(order):
+        for child in sorted(children.get(order[index], ())):
+            if child not in seen:
+                seen.add(child)
+                order.append(child)
+        index += 1
+    return order[::-1]
+
+
 def terminate_process_tree(
     identity: int,
     *,
@@ -873,8 +948,15 @@ def terminate_process_tree(
     run: Callable[..., Any] = subprocess.run,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    native_terminate: Callable[[int], bool] | None = None,
+    process_tree: Callable[[], dict[int, tuple[int, str]] | None] | None = None,
 ) -> bool:
-    """Terminate one process tree, escalating a surviving POSIX group to KILL."""
+    """Terminate one process tree, escalating a surviving POSIX group to KILL.
+
+    On Windows taskkill is resolved from the system directory only; when it is
+    unavailable, fails, or leaves the root alive, the root and every descendant
+    from one process snapshot are terminated natively, descendants first.
+    """
 
     if (
         not _valid_process_identity(identity)
@@ -885,34 +967,43 @@ def terminate_process_tree(
     ):
         return False
     if is_windows(platform_name):
-        try:
-            run(
-                ["taskkill", "/PID", str(identity), "/T"],
-                check=False,
-                shell=False,
-                timeout=timeout,
-            )
-        except (subprocess.TimeoutExpired, OSError):
-            return False
         alive = probe or (lambda pid: windows_pid_is_alive(pid))
-        deadline = monotonic() + timeout
-        while alive(identity):
-            remaining = deadline - monotonic()
-            if remaining <= 0:
-                break
-            sleep(min(poll_interval, remaining))
-        else:
-            return True
-        try:
-            completed = run(
-                ["taskkill", "/F", "/PID", str(identity), "/T"],
-                check=False,
-                shell=False,
-                timeout=timeout,
-            )
-        except (subprocess.TimeoutExpired, OSError):
-            return False
-        return int(completed.returncode) == 0
+        taskkill = windows_system_taskkill_path()
+        if taskkill is not None:
+            graceful_ran = True
+            try:
+                run(
+                    [taskkill, "/PID", str(identity), "/T"],
+                    check=False,
+                    shell=False,
+                    timeout=timeout,
+                )
+            except (subprocess.TimeoutExpired, OSError):
+                graceful_ran = False
+            if graceful_ran:
+                if _wait_until_gone(
+                    identity, alive, timeout, poll_interval, monotonic, sleep
+                ):
+                    return True
+                try:
+                    completed = run(
+                        [taskkill, "/F", "/PID", str(identity), "/T"],
+                        check=False,
+                        shell=False,
+                        timeout=timeout,
+                    )
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+                else:
+                    if int(completed.returncode) == 0 and not alive(identity):
+                        return True
+        snapshot = (process_tree or windows_process_tree)()
+        terminate_one = native_terminate or _windows_terminate_pid
+        for pid in _windows_tree_kill_order(identity, snapshot):
+            terminate_one(pid)
+        return _wait_until_gone(
+            identity, alive, timeout, poll_interval, monotonic, sleep
+        )
 
     posix_killpg = _resolve_posix_killpg(killpg)
     if posix_killpg is None:
@@ -924,13 +1015,9 @@ def terminate_process_tree(
     )
 
     def wait_until_gone() -> bool:
-        deadline = monotonic() + timeout
-        while alive(identity):
-            remaining = deadline - monotonic()
-            if remaining <= 0:
-                return False
-            sleep(min(poll_interval, remaining))
-        return True
+        return _wait_until_gone(
+            identity, alive, timeout, poll_interval, monotonic, sleep
+        )
 
     try:
         posix_killpg(identity, signal.SIGTERM)

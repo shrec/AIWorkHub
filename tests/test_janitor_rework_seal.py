@@ -15,7 +15,6 @@ import json
 import os
 import sqlite3
 import sys
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,7 +27,6 @@ if str(_SRC) not in sys.path:
 
 from aiworkhub import (  # noqa: E402
     process_launcher,
-    successful_rework_recovery,
     task_store,
     worker_workspace,
 )
@@ -57,21 +55,6 @@ def _bridge_chmod_sandbox_restriction(monkeypatch: pytest.MonkeyPatch) -> None:
     if _chmod_blocked_by_sandbox():
         monkeypatch.setattr(os, "chmod", lambda *a, **k: None)
         monkeypatch.setattr(os, "fchmod", lambda *a, **k: None)
-
-
-@pytest.fixture(autouse=True)
-def _regular_descriptor(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Open candidates plainly: some sandboxes cannot open the drive root."""
-
-    @contextmanager
-    def _plain_descriptor(path):
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
-        try:
-            yield fd
-        finally:
-            os.close(fd)
-
-    monkeypatch.setattr(successful_rework_recovery, "_regular_descriptor", _plain_descriptor)
 
 
 def _repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:

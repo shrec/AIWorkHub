@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import sys
 from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
@@ -474,11 +475,14 @@ def test_windows_reader_traverses_relative_handles_and_closes_them(episode, monk
         return fd
 
     monkeypatch.setattr(recovery.platform_io, "is_windows", lambda: True)
-    monkeypatch.setattr(recovery.runtime_temp, "WindowsDirectoryAuthority", root_authority)
+    monkeypatch.setattr(recovery.platform_io, "open_windows_root_directory_handle", root_authority)
     monkeypatch.setattr(recovery.platform_io, "open_windows_relative_child_directory", directory)
     monkeypatch.setattr(recovery.platform_io, "open_windows_relative_regular_file_descriptor", file_descriptor)
     assert recovery._read_regular(episode.candidate, episode.workspace, 100) == b"exact candidate\n"
-    assert [item[2] for item in calls if item[0] == "directory"] == list(episode.candidate.parts[1:-1])
+    assert calls[0] == ("root", episode.workspace)
+    assert [item[2] for item in calls if item[0] == "directory"] == list(
+        episode.candidate.relative_to(episode.workspace).parts[:-1]
+    )
     assert calls[-1] == ("file", calls[-2][3], "consumer.py")
     assert closes == list(reversed([100] + [item[3] for item in calls if item[0] == "directory"]))
     with pytest.raises(OSError):
@@ -487,7 +491,7 @@ def test_windows_reader_traverses_relative_handles_and_closes_them(episode, monk
 
 def _anchor_walk_raises(monkeypatch, error):
     @contextmanager
-    def failing_descriptor(path):
+    def failing_descriptor(path, root):
         raise error
         yield  # pragma: no cover
 
@@ -516,6 +520,62 @@ def test_missing_candidate_still_returns_none_when_missing_ok(episode, monkeypat
     assert recovery._read_regular(episode.candidate, episode.workspace, 100, missing_ok=True) is None
     with pytest.raises(recovery.SuccessfulReworkRecoveryError, match="successful_rework_read_failed"):
         recovery._read_regular(episode.candidate, episode.workspace, 100)
+
+
+def test_anchored_read_opens_no_directory_above_trusted_root(episode, monkeypatch):
+    # NF-2026-01733: restricted tokens refuse the drive root, so the anchored
+    # walk must start at the containment root and never open anything above it.
+    root = episode.workspace
+    above = set(root.parents)
+    trusted = set()
+
+    def refuse(path):
+        raise PermissionError(13, "directory above trusted root opened", str(path))
+
+    if recovery.platform_io.is_windows():
+        original_root = recovery.platform_io.open_windows_root_directory_handle
+        original_child = recovery.platform_io.open_windows_relative_child_directory
+
+        def root_handle(path):
+            if Path(path) in above:
+                refuse(path)
+            opened = original_root(path)
+            trusted.add(opened.value)
+            return opened
+
+        def child_directory(parent, name):
+            if parent not in trusted:
+                refuse(name)
+            child = original_child(parent, name)
+            trusted.add(child.value)
+            return child
+
+        monkeypatch.setattr(recovery.platform_io, "open_windows_root_directory_handle", root_handle)
+        monkeypatch.setattr(recovery.platform_io, "open_windows_relative_child_directory", child_directory)
+    else:
+        original_open = recovery.os.open
+
+        def guarded_open(path, flags, *args, dir_fd=None, **kwargs):
+            if dir_fd is None and Path(path) in above:
+                refuse(path)
+            if dir_fd is not None and dir_fd not in trusted:
+                refuse(path)
+            fd = original_open(path, flags, *args, dir_fd=dir_fd, **kwargs)
+            trusted.add(fd)
+            return fd
+
+        monkeypatch.setattr(recovery.os, "open", guarded_open)
+    assert recovery._read_regular(episode.candidate, root, 100) == b"exact candidate\n"
+    assert trusted
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows directory authority final-path query")
+def test_windows_read_survives_denied_final_path_query(episode, monkeypatch):
+    def denied(handle):
+        raise runtime_temp.RuntimeTempError("windows directory final path unavailable: winerror=5")
+
+    monkeypatch.setattr(runtime_temp.WindowsDirectoryAuthority, "_final_path", staticmethod(denied))
+    assert recovery._read_regular(episode.candidate, episode.workspace, 100) == b"exact candidate\n"
 
 
 def test_success_path_derives_hashes_and_artifact_from_one_capture(
