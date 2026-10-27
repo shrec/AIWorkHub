@@ -2353,7 +2353,16 @@ def _windows_noncanonical_path_alias(value: str) -> bool:
 
 
 def _windows_path_component_chain_error(path: Path) -> str:
-    """Reject symlink, junction, or other reparse components in a raw path."""
+    """Reject symlink, junction, or other reparse components in a raw path.
+
+    The Windows AppContainer validation lane cannot ``lstat`` directories
+    above its granted ones (measured NF-2026-01752: WinError 5 on
+    ``D:\\Dev\\AIWorkHub\\.venv`` above the granted ``Scripts`` directory of
+    the trusted interpreter).  A denied component is not trusted: it is
+    accepted only when the strict final path of ``path`` names exactly the
+    raw path, so no link or junction anywhere in the chain redirected it.
+    Every component that can be inspected is still inspected.
+    """
 
     components = list(path.parts)
     if path.anchor and components and components[0] == path.anchor:
@@ -2361,6 +2370,7 @@ def _windows_path_component_chain_error(path: Path) -> str:
         components = components[1:]
     else:
         current = Path()
+    uninspectable = False
     for component in components:
         current = current / component
         try:
@@ -2369,6 +2379,9 @@ def _windows_path_component_chain_error(path: Path) -> str:
             # Descendants cannot exist through a missing ancestor.  Strict
             # resolution below will produce the canonical not-found result.
             break
+        except PermissionError:
+            uninspectable = True
+            continue
         except OSError:
             return "windows_path_component_inspection_failed"
         if stat.S_ISLNK(metadata.st_mode):
@@ -2382,6 +2395,13 @@ def _windows_path_component_chain_error(path: Path) -> str:
         file_attributes = getattr(metadata, "st_file_attributes", 0)
         if file_attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
             return "windows_path_reparse_forbidden"
+    if uninspectable:
+        try:
+            final = path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return "windows_path_component_inspection_failed"
+        if os.path.normcase(str(final)) != os.path.normcase(str(path)):
+            return "windows_path_component_inspection_failed"
     return ""
 
 
