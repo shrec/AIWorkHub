@@ -1311,6 +1311,9 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
         last_stderr_bytes = _file_size(stderr_path)
         last_output_change_epoch = started_epoch
         last_meaningful_progress_epoch = started_epoch
+        # NF-2026-00823: set ONLY by a MEANINGFUL_PROGRESS_PHASES event from a
+        # trusted adapter; output-size and usage growth never move it.
+        last_actionable_progress_epoch: float | None = None
         last_meaningful_phase = "worker_started"
         last_progress_sequence = 0
         last_meaningful_progress_sequence = 0
@@ -1334,6 +1337,7 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
             "stderr_bytes": last_stderr_bytes,
             "last_output_change_epoch": last_output_change_epoch,
             "last_meaningful_progress_epoch": last_meaningful_progress_epoch,
+            "last_actionable_progress_epoch": last_actionable_progress_epoch,
             "last_meaningful_phase": last_meaningful_phase,
             "last_progress_sequence": last_progress_sequence,
             "last_meaningful_progress_sequence": last_meaningful_progress_sequence,
@@ -1380,6 +1384,7 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
                 meaningful_sequence = int(meaningful_progress.get("sequence") or 0)
                 if meaningful_sequence > last_meaningful_progress_sequence:
                     last_meaningful_progress_epoch = time.time()
+                    last_actionable_progress_epoch = last_meaningful_progress_epoch
                     last_output_change_epoch = max(
                         last_output_change_epoch, last_meaningful_progress_epoch
                     )
@@ -1423,6 +1428,7 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
                     "stderr_bytes": last_stderr_bytes,
                     "last_output_change_epoch": last_output_change_epoch,
                     "last_meaningful_progress_epoch": last_meaningful_progress_epoch,
+                    "last_actionable_progress_epoch": last_actionable_progress_epoch,
                     "last_meaningful_phase": last_meaningful_phase,
                     "last_progress_sequence": last_progress_sequence,
                     "last_meaningful_progress_sequence": (
@@ -1481,6 +1487,7 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
         )
         if final_meaningful_sequence > last_meaningful_progress_sequence:
             last_meaningful_progress_epoch = time.time()
+            last_actionable_progress_epoch = last_meaningful_progress_epoch
             # The meaningful event was parsed from the captured stdout, so its
             # observation cannot truthfully post-date the output-change clock.
             # Keep the two clocks monotonic even when the final capture and
@@ -1539,6 +1546,7 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
             "capture_errors": capture_errors,
             "last_output_change_epoch": last_output_change_epoch,
             "last_meaningful_progress_epoch": last_meaningful_progress_epoch,
+            "last_actionable_progress_epoch": last_actionable_progress_epoch,
             "last_meaningful_phase": last_meaningful_phase,
             "last_progress_sequence": last_progress_sequence,
             "last_meaningful_progress_sequence": last_meaningful_progress_sequence,

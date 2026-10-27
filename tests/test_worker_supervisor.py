@@ -304,6 +304,61 @@ def test_provider_response_progress_is_liveness_only(
     assert status["last_output_change_epoch"] >= status["last_meaningful_progress_epoch"]
 
 
+@pytest.mark.parametrize(
+    ("adapter_id", "line", "phase"),
+    [
+        # Untrusted raw output: liveness only, never actionable progress.
+        ("gemini_cli", "print('thinking...', flush=True)", "provider_output"),
+        (
+            "deepseek_vscode_lm",
+            "print(json.dumps({'usage': {'input_tokens': 9, 'output_tokens': 4}}),"
+            " flush=True)",
+            "provider_usage",
+        ),
+    ],
+)
+def test_output_and_usage_growth_never_set_actionable_progress(
+    tmp_path: Path, adapter_id: str, line: str, phase: str,
+) -> None:
+    """NF-2026-00823: only a trusted meaningful phase moves the actionable clock."""
+    assert adapter_id not in worker_supervisor.PROMPT_ON_STDIN_ADAPTERS
+    if phase == "provider_output":
+        assert adapter_id not in worker_supervisor.TRUSTED_PROGRESS_ADAPTERS
+    script = f"import json,time; {line}; time.sleep(.3)"
+    spec_path, spec = _spec(tmp_path, [sys.executable, "-c", script])
+    spec.update(adapter_id=adapter_id, heartbeat_interval_seconds=0.03)
+    write_json_0600(spec_path, spec)
+
+    result = _run_supervisor(spec_path)
+
+    assert result.returncode == 0, result.stderr.decode()
+    status = _read_status(Path(spec["status_path"]))
+    assert status["last_meaningful_phase"] == phase
+    assert status["last_meaningful_progress_epoch"] > status["started_at_epoch"]
+    assert status["last_actionable_progress_epoch"] is None
+
+
+def test_meaningful_progress_phase_event_sets_actionable_progress(tmp_path: Path) -> None:
+    event = {"type": "aiworkhub_progress", "sequence": 1, "phase": "tool_turn"}
+    script = (
+        "import json,time; "
+        f"print(json.dumps({event!r}), flush=True); "
+        "time.sleep(.2)"
+    )
+    spec_path, spec = _spec(tmp_path, [sys.executable, "-c", script])
+    spec.update(adapter_id="deepseek_vscode_lm", heartbeat_interval_seconds=0.03)
+    write_json_0600(spec_path, spec)
+
+    result = _run_supervisor(spec_path)
+
+    assert result.returncode == 0, result.stderr.decode()
+    status = _read_status(Path(spec["status_path"]))
+    actionable = status["last_actionable_progress_epoch"]
+    assert isinstance(actionable, float)
+    assert actionable >= status["started_at_epoch"]
+    assert actionable == status["last_meaningful_progress_epoch"]
+
+
 def test_supervisor_error_status_salvages_bounded_child_outputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

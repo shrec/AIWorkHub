@@ -19,6 +19,7 @@ from . import (
     model_settings,
     needfix_store,
     quality_evidence,
+    review_hedge,
     review_lifecycle,
     runtime_adapters,
     sqlite_readonly,
@@ -3377,7 +3378,8 @@ class ReviewOrchestrator:
         return rows[0]
 
     def _launch_route_attempt(
-        self, action: review_lifecycle.ReviewAction, attempt: Mapping[str, Any]
+        self, action: review_lifecycle.ReviewAction, attempt: Mapping[str, Any],
+        *, hedge_incumbent_request_id: str = "",
     ) -> dict[str, Any] | None:
         """Launch or reconcile one pre-bound attempt without duplicating its provider."""
         identity = action.descriptor["chain_identity"]
@@ -3410,6 +3412,8 @@ class ReviewOrchestrator:
                     "" if identity.get("claim_epoch") is None
                     else str(identity["claim_epoch"])
                 ),
+                **({"hedge_incumbent_request_id": hedge_incumbent_request_id}
+                   if hedge_incumbent_request_id else {}),
             )
         except Exception:  # noqa: BLE001 -- reconcile the pre-bound task on retry
             return None
@@ -3733,6 +3737,9 @@ class ReviewOrchestrator:
             replay = launch.get("replay") if isinstance(launch, Mapping) else None
             replay = replay if isinstance(replay, Mapping) else {}
             attempt = self._attempt_for_accept(action, launch)
+            attempt = review_hedge.arbitrate(self, action, attempt)
+            if attempt is None:
+                return None
             if str(attempt.get("state") or "") == "retired":
                 # A LATER pass over an attempt some earlier pass already
                 # retired. Polling its status again re-reads the same dead
@@ -3760,6 +3767,7 @@ class ReviewOrchestrator:
             reviewer_task = str(attempt["reviewer_task_id"])
             status = self.manager.status(reviewer_request)
             if str(status.get("state") or "") in _REVIEWER_RUNNING_STATES:
+                review_hedge.maybe_launch(self, action, attempt, status)
                 return None
             route_failure = mechanical_reviewer_failure_reason(status)
             if route_failure:
@@ -3863,7 +3871,10 @@ class ReviewOrchestrator:
                 action, status, reviewer_request, reviewer_task
             )
             if (
-                int(attempt["attempt_index"]) < _MAX_ROUTE_ATTEMPTS
+                # Counted over the whole lens, so a hedge race winner at index 1
+                # never buys a third route (NF-2026-00823).
+                len(self._route_attempts(action.chain_id, action.lens))
+                < _MAX_ROUTE_ATTEMPTS
                 and action.lens
                 in quality_evidence.blind_reviewer_lenses((receipt["report"],))
                 and self._attempt_route_binding_matches(status, attempt)

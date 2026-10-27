@@ -7145,6 +7145,7 @@ class ProcessManager:
         timeout_seconds: int,
         refuse_live_lens: bool = False,
         target_claim_epoch: str = "",
+        hedge_incumbent_request_id: str = "",
     ) -> dict[str, Any]:
         """Atomically reserve one exact reviewer attempt before any preparation.
 
@@ -7226,7 +7227,8 @@ class ProcessManager:
                     claim_epoch=target_claim_epoch, lens=lens, latest=latest,
                     exclude_task_id=reviewer_task_id,
                 )
-                if reused is not None:
+                # NF-2026-00823: a hedge is bought BESIDE its live incumbent.
+                if reused is not None and reused["request_id"] != hedge_incumbent_request_id:
                     return {
                         **self._reviewer_receipt(reused["request_id"], latest),
                         "reused_existing_reviewer": True, "lens": lens,
@@ -8201,6 +8203,7 @@ class ProcessManager:
         timeout_seconds: int = 1800,
         refuse_live_lens: bool = False,
         target_claim_epoch: str = "",
+        hedge_incumbent_request_id: str = "",
     ) -> dict[str, Any]:
         """Create and launch one independent packet-bound reviewer task.
 
@@ -8296,6 +8299,8 @@ class ProcessManager:
             timeout_seconds=timeout_seconds,
             refuse_live_lens=refuse_live_lens,
             **({"target_claim_epoch": target_claim_epoch} if target_claim_epoch else {}),
+            **({"hedge_incumbent_request_id": hedge_incumbent_request_id}
+               if hedge_incumbent_request_id else {}),
         )
         if reservation.get("ok") is not True:
             return reservation
@@ -12022,6 +12027,9 @@ class ProcessManager:
                 "last_meaningful_progress_epoch"
             ),
             "last_meaningful_phase": supervisor_status.get("last_meaningful_phase"),
+            "last_actionable_progress_epoch": supervisor_status.get(
+                "last_actionable_progress_epoch"
+            ),
             "last_progress_sequence": supervisor_status.get("last_progress_sequence"),
             "last_meaningful_progress_sequence": _meaningful_progress_sequence(
                 supervisor_status
