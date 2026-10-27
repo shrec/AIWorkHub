@@ -134,6 +134,132 @@ def _schema_for(func: Any) -> dict[str, Any]:
     return schema
 
 
+# NF-2026-01750: Gemini function declarations accept an OpenAPI-style subset.
+# A $ref/$defs pair, an anyOf branch of type null, or additionalProperties
+# ends the turn with MALFORMED_FUNCTION_CALL, so advertised schemas keep only
+# these keys. Server-side argument validation never reads this projection.
+PORTABLE_SCHEMA_KEYS = (
+    "type",
+    "properties",
+    "required",
+    "items",
+    "enum",
+    "description",
+    "title",
+    "default",
+    "anyOf",
+)
+PORTABLE_SCHEMA_MAX_DEPTH = 64
+
+
+def portable_input_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Return a Gemini-portable copy of one advertised ``inputSchema``.
+
+    Every ``$ref`` is inlined from the root ``$defs``/``definitions`` and the
+    definitions are dropped; an ``anyOf``/``oneOf`` (or a ``type`` list) loses
+    its null branches and collapses to the single remaining branch; a null
+    ``default`` is dropped because no null type survives; ``const`` becomes a
+    one-value ``enum``; every key outside :data:`PORTABLE_SCHEMA_KEYS` is
+    dropped. ``required`` is copied unchanged, so an optional field stays
+    optional. The input is never mutated and the output is deterministic. An
+    unresolvable or cyclic ``$ref``, or nesting deeper than
+    :data:`PORTABLE_SCHEMA_MAX_DEPTH`, raises ``ValueError`` naming the cause.
+    """
+
+    if not isinstance(schema, dict):
+        raise ValueError(f"portable_schema_not_object:{type(schema).__name__}")
+    definitions: dict[str, Any] = {}
+    for key in ("definitions", "$defs"):
+        block = schema.get(key)
+        if isinstance(block, dict):
+            definitions.update({f"#/{key}/{name}": value for name, value in block.items()})
+    return _portable_node(schema, definitions, (), 0)
+
+
+def _portable_node(
+    node: Any, definitions: dict[str, Any], ref_stack: tuple[str, ...], depth: int
+) -> dict[str, Any]:
+    if depth > PORTABLE_SCHEMA_MAX_DEPTH:
+        raise ValueError(f"portable_schema_too_deep:limit={PORTABLE_SCHEMA_MAX_DEPTH}")
+    if not isinstance(node, dict):
+        # JSON Schema allows a bare boolean subschema; true/false carry no type.
+        return {}
+    ref = node.get("$ref")
+    if ref is not None:
+        if ref in ref_stack:
+            raise ValueError(f"portable_schema_ref_cycle:{ref}")
+        if ref not in definitions:
+            raise ValueError(f"portable_schema_unresolved_ref:{ref}")
+        siblings = {key: value for key, value in node.items() if key != "$ref"}
+        merged = {**definitions[ref], **siblings}
+        return _portable_node(merged, definitions, (*ref_stack, ref), depth + 1)
+    # Two live unions on one node intersect, and anyOf can carry only one of
+    # them; projecting either would silently widen what the schema accepts.
+    unions = [
+        key
+        for key in ("anyOf", "oneOf")
+        if isinstance(node.get(key), list)
+        and len([branch for branch in node[key] if not _is_null_schema(branch)]) > 1
+    ]
+    type_list = node.get("type")
+    if isinstance(type_list, list) and len([kind for kind in type_list if kind != "null"]) > 1:
+        unions.append("type")
+    if len(unions) > 1:
+        raise ValueError(f"portable_schema_union_conflict:{'+'.join(unions)}")
+    for union_key in ("anyOf", "oneOf"):
+        branches = node.get(union_key)
+        if not isinstance(branches, list):
+            continue
+        kept = [branch for branch in branches if not _is_null_schema(branch)]
+        rest = {key: value for key, value in node.items() if key != union_key}
+        if len(kept) == 1:
+            return _portable_node({**kept[0], **rest}, definitions, ref_stack, depth + 1)
+        if kept:
+            rest["anyOf"] = kept
+        node = rest
+    raw_type = node.get("type")
+    if isinstance(raw_type, list):
+        kinds = [kind for kind in raw_type if kind != "null"]
+        node = {key: value for key, value in node.items() if key != "type"}
+        if len(kinds) == 1:
+            node["type"] = kinds[0]
+        elif kinds:
+            node["anyOf"] = [{"type": kind} for kind in kinds]
+    if "const" in node and "enum" not in node:
+        node = {**node, "enum": [node["const"]]}
+    portable: dict[str, Any] = {}
+    for key in PORTABLE_SCHEMA_KEYS:
+        if key not in node:
+            continue
+        value = node[key]
+        if key == "properties" and isinstance(value, dict):
+            portable[key] = {
+                name: _portable_node(child, definitions, ref_stack, depth + 1)
+                for name, child in value.items()
+            }
+        elif key == "items":
+            portable[key] = _portable_node(value, definitions, ref_stack, depth + 1)
+        elif key == "anyOf" and isinstance(value, list):
+            portable[key] = [
+                _portable_node(branch, definitions, ref_stack, depth + 1) for branch in value
+            ]
+        elif key == "required" and isinstance(value, list):
+            portable[key] = list(value)
+        elif key == "enum" and isinstance(value, list):
+            portable[key] = [item for item in value if item is not None]
+        elif key == "default" and value is None:
+            continue
+        else:
+            portable[key] = value
+    if portable.get("type") == "array" and "items" not in portable:
+        portable["items"] = {}
+    return portable
+
+
+def _is_null_schema(branch: Any) -> bool:
+    return isinstance(branch, dict) and branch.get("type") == "null"
+
+
 def _tool_result(tools: dict[str, Any], params: Any) -> dict[str, Any]:
     if not isinstance(params, dict):
         raise ProtocolError(-32602, "invalid_params")
@@ -227,7 +353,13 @@ def _validate_rpc_params(method: Any, params: Any, *, request_id: Any) -> dict[s
 
 
 def _dispatch(
-    server_name: str, tools: dict[str, Any], method: Any, params: Any, request_id: Any = None
+    server_name: str,
+    tools: dict[str, Any],
+    method: Any,
+    params: Any,
+    request_id: Any = None,
+    *,
+    input_schema_transform: Any = None,
 ) -> Any:
     params = _validate_rpc_params(method, params, request_id=request_id)
     if method == "initialize":
@@ -248,7 +380,9 @@ def _dispatch(
                     "description": (inspect.getdoc(function) or "").strip().splitlines()[0]
                     if (inspect.getdoc(function) or "").strip()
                     else "",
-                    "inputSchema": _schema_for(function),
+                    "inputSchema": _schema_for(function)
+                    if input_schema_transform is None
+                    else input_schema_transform(_schema_for(function)),
                 }
                 for name, function in tools.items()
             ]
@@ -286,7 +420,7 @@ def _write(message: dict[str, Any]) -> None:
         raise TransportClosed(0) from exc
 
 
-def _run(server_name: str, tools: dict[str, Any]) -> None:
+def _run(server_name: str, tools: dict[str, Any], *, input_schema_transform: Any = None) -> None:
     stdin = sys.stdin.buffer
     while True:
         line = stdin.readline(MAX_LINE_BYTES + 1)
@@ -312,7 +446,14 @@ def _run(server_name: str, tools: dict[str, Any]) -> None:
             continue
         request_id = request.get("id")
         try:
-            result = _dispatch(server_name, tools, request.get("method"), request.get("params"), request_id)
+            result = _dispatch(
+                server_name,
+                tools,
+                request.get("method"),
+                request.get("params"),
+                request_id,
+                input_schema_transform=input_schema_transform,
+            )
             _write({"jsonrpc": "2.0", "id": request_id, "result": result})
         except ProtocolError as exc:
             _write({"jsonrpc": "2.0", "id": request_id, "error": {"code": exc.code, "message": exc.message}})
@@ -336,6 +477,8 @@ class FallbackFastMCP:
     def __init__(self, name: str):
         self.name = name
         self._tools: dict[str, Any] = {}
+        # Applied to each advertised inputSchema only; tools/call never reads it.
+        self.input_schema_transform: Any = None
 
     def tool(self, *args: Any, **kwargs: Any):
         del args
@@ -350,8 +493,18 @@ class FallbackFastMCP:
     def registered_tools(self) -> list[str]:
         return list(self._tools)
 
+    def advertised_tools(self) -> list[dict[str, Any]]:
+        """Return exactly the ``tools/list`` entries this server advertises."""
+        return _dispatch(
+            self.name,
+            self._tools,
+            "tools/list",
+            {},
+            input_schema_transform=self.input_schema_transform,
+        )["tools"]
+
     def run(self) -> None:
-        _run(self.name, self._tools)
+        _run(self.name, self._tools, input_schema_transform=self.input_schema_transform)
 
 
-__all__ = ["FallbackFastMCP"]
+__all__ = ["FallbackFastMCP", "PORTABLE_SCHEMA_KEYS", "portable_input_schema"]

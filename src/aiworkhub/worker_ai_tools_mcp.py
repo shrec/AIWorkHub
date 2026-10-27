@@ -9779,6 +9779,28 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
     return MCP_TOOL_NAMES
 
 
+def _advertise_portable_input_schemas(mcp: Any) -> None:
+    """Make every advertised inputSchema Gemini-portable (NF-2026-01750).
+
+    Only the advertised projection changes: FastMCP validates arguments with
+    each tool's pydantic ``fn_metadata`` model and the stdlib fallback with the
+    function signature, and neither reads the schema rewritten here.
+    """
+    from .stdio_fastmcp import FallbackFastMCP, portable_input_schema
+
+    if isinstance(mcp, FallbackFastMCP):
+        mcp.input_schema_transform = portable_input_schema
+        return
+    tool_manager = getattr(mcp, "_tool_manager", None)
+    if tool_manager is None or not callable(getattr(tool_manager, "list_tools", None)):
+        raise RuntimeError(
+            "worker_mcp_portable_schema_unsupported_server:"
+            f"{type(mcp).__module__}.{type(mcp).__qualname__} has no _tool_manager.list_tools"
+        )
+    for tool in tool_manager.list_tools():
+        tool.parameters = portable_input_schema(tool.parameters)
+
+
 def build_server(ctx: WorkerToolContext) -> Any:
     try:
         from mcp.server.fastmcp import FastMCP
@@ -9787,6 +9809,7 @@ def build_server(ctx: WorkerToolContext) -> Any:
 
     mcp = FastMCP("AIWorkHub Worker AI Tools")
     register_tools(mcp, ctx)
+    _advertise_portable_input_schemas(mcp)
     return mcp
 
 
