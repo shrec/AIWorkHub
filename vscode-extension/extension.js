@@ -10429,9 +10429,19 @@ class ViewState {
     // look stale and leaving the Webview on "Connecting" forever.
     this.snapshotInFlight = null;
     this.snapshotRefreshQueued = false;
+    // The bounded summary only exists to paint an empty Webview quickly.
+    // Once this view holds a full snapshot for its repository, building the
+    // summary again on every refresh is pure overhead (NF-2026-00633).
+    this.fullSnapshotPainted = false;
   }
 
   bindClient(client) {
+    if (
+      this.repoUriStr !== client.repositoryIdentity.uriStr ||
+      this.repoId !== client.repositoryIdentity.repoId
+    ) {
+      this.fullSnapshotPainted = false;
+    }
     this.repoUriStr = client.repositoryIdentity.uriStr;
     this.repoId = client.repositoryIdentity.repoId;
     this.claimEpisode = client.claimEpisode;
@@ -10531,31 +10541,35 @@ async function pushSnapshotOnce(view) {
   // Render the bounded summary first. The full snapshot intentionally joins
   // many repository-local observability sources; making the Webview wait for
   // that aggregation left every card blank for 20-30 seconds even though the
-  // summary is normally available in about two seconds.
-  try {
-    const summaryPayload = await client.callTool(
-      DASHBOARD_TOOLS.snapshot,
-      { full: false },
-      MCP_REQUEST_TIMEOUT_MS,
-    );
-    if (summaryPayload && view.stillBoundTo(client) && requestSeq === view.snapshotRequestSeq) {
-      view.postMessage({
-        type: OUTBOUND_TYPES.snapshotSummary,
-        payload: sanitizeWebviewPayload({
-          ...summaryPayload,
-          system_logs: systemLogSnapshot(),
-          extension_runtime_storage: runtimeRetentionSnapshot(),
-        }),
+  // summary is normally available in about two seconds. After the first full
+  // paint the Webview already shows every card, so a refresh asks only for the
+  // full snapshot instead of building both on each poll (NF-2026-00633).
+  if (!view.fullSnapshotPainted) {
+    try {
+      const summaryPayload = await client.callTool(
+        DASHBOARD_TOOLS.snapshot,
+        { full: false },
+        MCP_REQUEST_TIMEOUT_MS,
+      );
+      if (summaryPayload && view.stillBoundTo(client) && requestSeq === view.snapshotRequestSeq) {
+        view.postMessage({
+          type: OUTBOUND_TYPES.snapshotSummary,
+          payload: sanitizeWebviewPayload({
+            ...summaryPayload,
+            system_logs: systemLogSnapshot(),
+            extension_runtime_storage: runtimeRetentionSnapshot(),
+          }),
+        });
+        debugTrace("snapshot.summary.posted", { request_seq: requestSeq });
+      }
+    } catch (err) {
+      // Summary failure does not hide a full snapshot that may still succeed.
+      // Keep the existing bounded full-snapshot recovery classification below.
+      debugTrace("snapshot.summary.error", {
+        request_seq: requestSeq,
+        ...debugErrorFields(err),
       });
-      debugTrace("snapshot.summary.posted", { request_seq: requestSeq });
     }
-  } catch (err) {
-    // Summary failure does not hide a full snapshot that may still succeed.
-    // Keep the existing bounded full-snapshot recovery classification below.
-    debugTrace("snapshot.summary.error", {
-      request_seq: requestSeq,
-      ...debugErrorFields(err),
-    });
   }
   for (let attempt = 0; attempt < MCP_SNAPSHOT_RECOVERY_ATTEMPTS; attempt += 1) {
     if (attempt > 0) {
@@ -10584,6 +10598,7 @@ async function pushSnapshotOnce(view) {
             extension_runtime_storage: runtimeRetentionSnapshot(),
           }),
         });
+        view.fullSnapshotPainted = true;
         // The storage state is now visible. Only now may slower background
         // services use this serialized MCP transport.
         client._convergeBackgroundServices();
@@ -10648,6 +10663,7 @@ async function pushSnapshotNoRetry(view, options = {}) {
           extension_runtime_storage: runtimeRetentionSnapshot(),
         }),
       });
+      view.fullSnapshotPainted = true;
       if (convergeBackgroundServices) client._convergeBackgroundServices();
       return { posted: true, payload };
     } else if (!payload && (authoritative || requestSeq === view.snapshotRequestSeq)) {

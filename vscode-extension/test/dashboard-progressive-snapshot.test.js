@@ -70,6 +70,55 @@ try {
   assert.strictEqual(convergenceCalls, 1);
   assert.deepStrictEqual(messages[0].payload.outcome_counts, { accepted: 3, rejected: 1 });
 
+  // NF-2026-00633: once this view holds a full snapshot, a refresh issues
+  // exactly one full call and never rebuilds the summary.
+  calls.length = 0;
+  messages.length = 0;
+  for (let push = 0; push < 3; push += 1) {
+    await extension.__testInternals.pushSnapshotOnce(view, { client });
+  }
+  assert.deepStrictEqual(calls.map((call) => call.args), [{ full: true }, { full: true }, { full: true }]);
+  assert.deepStrictEqual(
+    messages
+      .filter((message) => message.type === "snapshotSummary" || message.type === "snapshot")
+      .map((message) => message.type),
+    ["snapshot", "snapshot", "snapshot"],
+  );
+
+  // A failed first full snapshot leaves the view summary-first on the retry.
+  {
+    const failingCalls = [];
+    let failFull = true;
+    const failingClient = {
+      ...client,
+      callTool: async (_name, args) => {
+        failingCalls.push(args);
+        if (args.full && failFull) throw new Error("mcp_request_timeout");
+        return args.full ? { snapshot_mode: "full" } : { snapshot_mode: "summary" };
+      },
+    };
+    const failingView = new extension.__testInternals.ViewState(() => {});
+    failingView.bindClient(failingClient);
+    await extension.__testInternals.pushSnapshotOnce(failingView, { client: failingClient });
+    failFull = false;
+    await extension.__testInternals.pushSnapshotOnce(failingView, { client: failingClient });
+    await extension.__testInternals.pushSnapshotOnce(failingView, { client: failingClient });
+    assert.deepStrictEqual(failingCalls, [
+      { full: false }, { full: true },
+      { full: false }, { full: true },
+      { full: true },
+    ]);
+  }
+
+  // Rebinding the view to another repository paints summary-first again.
+  calls.length = 0;
+  const otherRepoClient = {
+    ...client,
+    repositoryIdentity: { uriStr: "file:///work/other", repoId: "repo_other" },
+  };
+  await extension.__testInternals.pushSnapshotOnce(view, { client: otherRepoClient });
+  assert.deepStrictEqual(calls.map((call) => call.args), [{ full: false }, { full: true }]);
+
   console.log("dashboard progressive snapshot: ok");
 
   const OPENCODE_IDENTITIES = ["opencode/glm-4.5-free", "openai/gpt-4o"];

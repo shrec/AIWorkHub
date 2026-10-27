@@ -2500,23 +2500,13 @@ def snapshot_view(
     snapshot["authority_flags"] = _readonly_authority_flags()
     # ``build_snapshot`` starts the non-blocking storage inventory before the
     # heavier full reads. Re-sample its in-memory cache after those reads so a
-    # scan that finished meanwhile is visible in this same response instead of
-    # leaving the Webview on "Calculating" until a later polling interval.
+    # scan that finished meanwhile is visible in this same response. A scan
+    # still running is reported as-is (``scan_status`` scanning/refreshing):
+    # the response never sleeps waiting for it (NF-2026-00633); the next poll
+    # publishes the finished inventory.
     try:
         current_storage = snapshot.get("storage_usage")
         latest_storage = storage_observability.snapshot(core.repo_root())
-        if full and isinstance(current_storage, dict):
-            # The normal inventory is ~3.5 s on the live 19.9 GB store while
-            # the full snapshot now hydrates in ~3 s. Give that already-running
-            # thread one small bounded settle window so the same response can
-            # publish its result. Never wait for an actually slow filesystem.
-            settle_deadline = time.monotonic() + 3.0
-            while (
-                latest_storage.get("scan_status") in {"scanning", "refreshing"}
-                and time.monotonic() < settle_deadline
-            ):
-                time.sleep(0.05)
-                latest_storage = storage_observability.snapshot(core.repo_root())
         if isinstance(current_storage, dict) and isinstance(latest_storage, dict):
             # Only refresh the header/overview scalars here.  The bounded full
             # storage detail built at the start remains authoritative and this

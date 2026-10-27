@@ -274,11 +274,14 @@ async function snapshotFor(host) {
     assert.strictEqual(slowFirst, overlappingRefresh, "overlapping refresh did not reuse the in-flight snapshot");
     await Promise.all([slowFirst, overlappingRefresh]);
     assert.strictEqual(
-      firstMessages.filter(
-        (message) => message.type === "snapshotSummary" || message.type === "snapshot",
-      ).length,
-      4,
+      firstMessages.filter((m) => m.type === "snapshot").length,
+      2,
       "overlapping refresh was not replayed after the in-flight snapshot settled",
+    );
+    assert.strictEqual(
+      firstMessages.filter((m) => m.type === "snapshotSummary").length,
+      1,
+      "replayed refresh repainted summary-first after a full paint (NF-2026-00633)",
     );
     const secondMessages = await snapshotFor(hostB);
 

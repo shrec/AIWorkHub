@@ -21,7 +21,7 @@ from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
-from threading import Lock
+from threading import Lock, local as _thread_local
 from typing import Any, Callable, Mapping
 
 from aiworkhub import (
@@ -259,6 +259,39 @@ def _is_credential_field_name(name: str) -> bool:
     )
 
 
+def _snapshot_read_worker_limit() -> int:
+    """Leave two observed cores for the interactive MCP/control plane."""
+    return max(1, (os.cpu_count() or 1) - 2)
+
+
+# One process-wide read pool. A per-snapshot executor created and joined
+# ``worker_count`` threads on every refresh (~5,148 thread creations/hour for
+# one idle panel, NF-2026-00633); idle pool threads cost nothing.
+_SNAPSHOT_READ_POOL: ThreadPoolExecutor | None = None
+_SNAPSHOT_READ_POOL_LOCK = Lock()
+_SNAPSHOT_READ_THREAD = _thread_local()
+
+
+def _mark_snapshot_read_thread() -> None:
+    _SNAPSHOT_READ_THREAD.in_pool = True
+
+
+def _snapshot_read_pool() -> ThreadPoolExecutor:
+    """Return the shared dashboard read pool, creating it once, thread-safely."""
+    global _SNAPSHOT_READ_POOL
+    pool = _SNAPSHOT_READ_POOL
+    if pool is not None:
+        return pool
+    with _SNAPSHOT_READ_POOL_LOCK:
+        if _SNAPSHOT_READ_POOL is None:
+            _SNAPSHOT_READ_POOL = ThreadPoolExecutor(
+                max_workers=_snapshot_read_worker_limit(),
+                thread_name_prefix="aiworkhub-dashboard-read",
+                initializer=_mark_snapshot_read_thread,
+            )
+        return _SNAPSHOT_READ_POOL
+
+
 def _parallel_snapshot_reads(
     operations: Mapping[str, tuple[str, Callable[[], Any], Any]],
     errors: list[dict[str, str]],
@@ -273,28 +306,26 @@ def _parallel_snapshot_reads(
     if not operations:
         return {}
 
-    available_workers = max(1, (os.cpu_count() or 1) - 2)
-    worker_count = min(len(operations), available_workers)
+    worker_count = min(len(operations), _snapshot_read_worker_limit())
 
     def run_one(spec: tuple[str, Callable[[], Any], Any]) -> tuple[Any, list[dict[str, str]]]:
         source, operation, default = spec
         local_errors: list[dict[str, str]] = []
         return _safe_read(source, operation, local_errors, default), local_errors
 
-    if worker_count == 1:
+    # A read set started from inside a pool thread runs inline: waiting on the
+    # bounded shared pool from one of its own workers could deadlock it.
+    if worker_count == 1 or getattr(_SNAPSHOT_READ_THREAD, "in_pool", False):
         completed = {key: run_one(spec) for key, spec in operations.items()}
     else:
-        with ThreadPoolExecutor(
-            max_workers=worker_count,
-            thread_name_prefix="aiworkhub-dashboard-read",
-        ) as executor:
-            futures = {
-                key: executor.submit(run_one, spec)
-                for key, spec in operations.items()
-            }
-            # Consume in declaration order so the snapshot and its error list
-            # remain deterministic regardless of thread completion order.
-            completed = {key: futures[key].result() for key in operations}
+        executor = _snapshot_read_pool()
+        futures = {
+            key: executor.submit(run_one, spec)
+            for key, spec in operations.items()
+        }
+        # Consume in declaration order so the snapshot and its error list
+        # remain deterministic regardless of thread completion order.
+        completed = {key: futures[key].result() for key in operations}
 
     results: dict[str, Any] = {}
     for key in operations:
@@ -2084,8 +2115,20 @@ class DashboardProvider:
         path below must check this before touching the canonical DB."""
         return task_store.storage_readiness(self.repo_root)
 
+    def _task_rows(self, status: str) -> tuple[dict[str, Any], ...]:
+        # Narrow canonical row columns, never a decoded card. The task
+        # collections, completion inbox and collision report all need the
+        # same active rows: one table scan per status per read set instead of
+        # one per consumer (NF-2026-00633).
+        return self._snapshot_once(
+            f"task_rows:{status}",
+            lambda: tuple(
+                task_store.list_tasks(self.repo_root, status=status, limit=self.task_limit)
+            ),
+        )
+
     def list_tasks(self, status: str) -> list[dict[str, Any]]:
-        return task_store.list_tasks(self.repo_root, status=status, limit=self.task_limit)
+        return [dict(row) for row in self._task_rows(status)]
 
     def get_task(self, task_id: str) -> dict[str, Any] | None:
         return task_store.get_task(self.repo_root, task_id)
@@ -2094,8 +2137,8 @@ class DashboardProvider:
         return task_store.get_task_events(self.repo_root, task_id)
 
     def get_completion_inbox(self) -> dict[str, Any]:
-        review_rows = task_store.list_tasks(self.repo_root, status="review", limit=self.task_limit)
-        processing_rows = task_store.list_tasks(self.repo_root, status="processing", limit=self.task_limit)
+        review_rows = self.list_tasks("review")
+        processing_rows = self.list_tasks("processing")
         stale_rows: list[dict[str, Any]] = []
         stale_after = self.stale_processing_hours * 3600.0
         now = time.time()
@@ -2137,14 +2180,18 @@ class DashboardProvider:
     def get_collision_report(self) -> dict[str, Any]:
         active: list[dict[str, Any]] = []
         for status in ACTIVE_STATUSES:
-            active.extend(task_store.list_tasks(self.repo_root, status=status, limit=self.task_limit))
+            active.extend(self._task_rows(status))
         owners_by_path: dict[str, list[str]] = defaultdict(list)
-        cards_by_id = {
-            str(card.get("task_id") or ""): card for card in self._task_cards()
-        }
+        # Only active cards reserve write scope. Decode exactly those cards in
+        # one batch instead of indexing the full-history card window, whose
+        # archived/superseded rows are never rendered here (NF-2026-00633).
+        cards_by_id = task_store.get_tasks(
+            self.repo_root,
+            [str(row.get("task_id") or "") for row in active if row.get("task_id")],
+        )
         for row in active:
             task_id = str(row.get("task_id") or "")
-            card = cards_by_id.get(task_id) or task_store.get_task(self.repo_root, task_id) or {}
+            card = cards_by_id.get(task_id) or {}
             for path in card.get("allowed_writes") or []:
                 normalized = str(path).strip()
                 if normalized and task_id not in owners_by_path[normalized]:
