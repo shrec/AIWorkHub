@@ -848,6 +848,9 @@ def owner_alive(manifest: Mapping[str, Any]) -> bool:
 _PROCESS_DIR_ENV = "AIWORKHUB_PROCESS_DIR"
 _PROCESS_DIR_DEFAULT_REL = Path(".aiworkhub/runtime/process_logs/processes")
 _MAX_SUPERVISOR_STATUS_BYTES = 1024 * 1024
+# Mirrors the ``spec_path`` name process_launcher_launch_isolated.py writes
+# before spawning the supervisor and unlinks when a launch never goes live.
+_SUPERVISOR_SPEC_SUFFIX = ".supervisor-spec.json"
 
 
 def _recorded_process_alive(pid_value: Any, ticks_value: Any) -> bool:
@@ -873,13 +876,38 @@ def _recorded_process_alive(pid_value: Any, ticks_value: Any) -> bool:
     return True
 
 
+def _recorded_pid_absent(pid_value: Any) -> bool:
+    """True when a status field names no process at all (missing or <= 0)."""
+    if pid_value is None:
+        return True
+    try:
+        return int(pid_value) <= 0
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _supervisor_pending(process_dir: Path, request_id: str) -> bool:
+    """True while the supervisor spec exists but no status file was written yet."""
+    try:
+        os.lstat(process_dir / f"{request_id}{_SUPERVISOR_SPEC_SUFFIX}")
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return True
+    return True
+
+
 def request_alive(repo: Path, manifest: Mapping[str, Any]) -> bool:
     """True when the owner, or the request's supervisor/child, is not provably dead.
 
     The owner stamp can name a short-lived process (an auth-retry relaunch
-    re-provisions from the finalizing process), so the request's own
-    ``<request_id>.supervisor.json`` is consulted too.  A missing status file
-    gives no protection; an unreadable or malformed one fails closed to alive.
+    re-provisions from the finalizing process; a deferred launch provisions
+    from a process that exits before its supervisor reports), so the request's
+    own ``<request_id>.supervisor.json`` is consulted too.  A missing status
+    file protects the dir only while ``<request_id>.supervisor-spec.json`` shows
+    a supervisor is still pending; a status naming no process (pid absent or 0)
+    is not evidence of death.  Only recorded processes that are provably dead or
+    recycled reclaim; an unreadable or malformed status fails closed to alive.
     """
     if owner_alive(manifest):
         return True
@@ -900,7 +928,7 @@ def request_alive(repo: Path, manifest: Mapping[str, Any]) -> bool:
     try:
         fd = os.open(process_dir / f"{request_id}.supervisor.json", flags)
     except (FileNotFoundError, NotADirectoryError):
-        return False
+        return _supervisor_pending(process_dir, request_id)
     except OSError:
         return True
     try:
@@ -922,11 +950,13 @@ def request_alive(repo: Path, manifest: Mapping[str, Any]) -> bool:
         return True
     if not isinstance(status, dict):
         return True
-    return _recorded_process_alive(
-        status.get("supervisor_pid"), status.get("supervisor_pid_start_ticks")
-    ) or _recorded_process_alive(
-        status.get("child_pid"), status.get("child_pid_start_ticks")
+    recorded = (
+        (status.get("supervisor_pid"), status.get("supervisor_pid_start_ticks")),
+        (status.get("child_pid"), status.get("child_pid_start_ticks")),
     )
+    if all(_recorded_pid_absent(pid) for pid, _ in recorded):
+        return True
+    return any(_recorded_process_alive(pid, ticks) for pid, ticks in recorded)
 
 
 def _iter_request_dirs(root: Path) -> list[Path]:
