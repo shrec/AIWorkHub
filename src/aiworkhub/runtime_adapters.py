@@ -2075,6 +2075,10 @@ MANAGER_SEAT_MCP_TOOLS: tuple[str, ...] = (
     "aiworkhub_completion_inbox",
     "aiworkhub_task_cost_ledger",
     "aiworkhub_task_usage_report",
+    # WorkHub Mail reads only: send and archive are outward-facing writes and
+    # stay off the seat.
+    "aiworkhub_manager_hub_mail_inbox",
+    "aiworkhub_manager_hub_mail_show",
 )
 
 # Tools without which a seat cannot stand as manager at all: identity,
