@@ -3283,6 +3283,45 @@ def test_dead_or_terminal_reviewer_never_blocks_its_lens(tmp_path, event):
     assert receipt["already_reserved"] is False
 
 
+def test_future_reservation_with_dead_owner_never_blocks_its_lens(
+    tmp_path, monkeypatch
+):
+    # NF-2026-01763: the lease alone never keeps a lens once the exact
+    # reserving owner of a pid-null reservation is proven dead.
+    manager = _manager(tmp_path, initialize_task_queue=True)
+    dead_owner_pid = 999_999_999
+    manager._append_event({
+        **_starting(
+            request_id="dead-owner", task_id="REVIEWER_DEAD",
+            expires_at=time.time() + 600.0,
+            quality_review_attempt={**_LENS_BINDING, "lens": "security"},
+        ),
+        "owner_pid": dead_owner_pid, "owner_pid_start_ticks": 1,
+    })
+    real_evidence = process_launcher._pid_identity_evidence
+    mismatch = type(
+        "MismatchEvidence",
+        (),
+        {"verdict": process_launcher.PidIdentityVerdict.MISMATCH},
+    )()
+    monkeypatch.setattr(
+        process_launcher,
+        "_pid_identity_evidence",
+        lambda pid, ticks: (
+            mismatch if pid == dead_owner_pid else real_evidence(pid, ticks)
+        ),
+    )
+
+    receipt = _reserve_lens(manager, "REVIEWER_NEW", lens="security")
+
+    assert receipt.get("error") != "quality_review_lens_already_running"
+    assert receipt["ok"] is True
+    assert receipt["already_reserved"] is False
+    retired = _latest(manager, "dead-owner")
+    assert retired["state"] == "blocked"
+    assert retired["blocked_reason"] == "reservation_owner_dead"
+
+
 def test_live_lens_reviewer_blocks_only_its_exact_target_and_lens(tmp_path):
     manager = _manager(tmp_path)
     manager._append_event(

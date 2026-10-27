@@ -7,7 +7,13 @@ import time
 
 import pytest
 
-from aiworkhub import process_launcher, task_engine, task_reconciler, task_store
+from aiworkhub import (
+    process_launcher,
+    reviewer_reservation_recovery,
+    task_engine,
+    task_reconciler,
+    task_store,
+)
 
 
 def _manager_for_periodic_scan(tmp_path, monkeypatch):
@@ -406,6 +412,94 @@ def test_periodic_scan_settles_expired_pid_mismatch_task_store_claim_once(
     assert after_first["worker_status"] == "unclaimed"
     assert task_store.get_task(tmp_path, task_id) == after_first
     assert callbacks == [(task_id, claim_epoch)]
+
+
+def _future_owned_starting(request_id: str) -> dict[str, object]:
+    event = _starting(request_id, deadline=time.time() + 600.0)
+    event.update(owner_pid=999_999_999, owner_pid_start_ticks=1)
+    return event
+
+
+def _identity_evidence(verdict: process_launcher.PidIdentityVerdict) -> object:
+    return type("IdentityEvidence", (), {"verdict": verdict})()
+
+
+def test_periodic_scan_retires_future_pid_null_reservation_with_dead_owner_once(
+    tmp_path, monkeypatch
+):
+    # NF-2026-01763: an exact reserving owner proven dead frees the lens at
+    # once instead of holding it for the rest of the reservation lease.
+    manager = _manager_for_periodic_scan(tmp_path, monkeypatch)
+    manager._append_event(_future_owned_starting("dead-owner"))
+    mismatch = _identity_evidence(process_launcher.PidIdentityVerdict.MISMATCH)
+    monkeypatch.setattr(
+        process_launcher,
+        "_pid_identity_evidence",
+        lambda _pid, _ticks: mismatch,
+    )
+    settled: list[str] = []
+    monkeypatch.setattr(
+        manager,
+        "_settle_reviewer_terminal_intents_contained",
+        lambda: settled.append("settled") or 0,
+    )
+
+    first = task_reconciler.run_scan(manager, repo=tmp_path, include_gc=False)
+    second = task_reconciler.run_scan(manager, repo=tmp_path, include_gc=False)
+
+    latest = manager._latest_by_request()["dead-owner"]
+    assert first["reservations_retired"] == 1
+    assert second["reservations_retired"] == 0
+    assert latest["state"] == "blocked"
+    assert latest["blocked_reason"] == "reservation_owner_dead"
+    assert latest["terminal_intent"] == "recorded"
+
+
+@pytest.mark.parametrize("owner", ["unknown", "match", "live_self"])
+def test_periodic_scan_preserves_future_pid_null_reservation_without_dead_owner(
+    tmp_path, monkeypatch, owner
+):
+    manager = _manager_for_periodic_scan(tmp_path, monkeypatch)
+    event = _future_owned_starting("owned")
+    if owner == "live_self":
+        ticks = process_launcher._pid_start_ticks(os.getpid())
+        event.update(owner_pid=os.getpid(), owner_pid_start_ticks=ticks)
+        live = process_launcher._pid_identity_evidence(os.getpid(), ticks)
+        assert live.verdict is not process_launcher.PidIdentityVerdict.MISMATCH
+    else:
+        verdict = (
+            process_launcher.PidIdentityVerdict.UNKNOWN
+            if owner == "unknown"
+            else process_launcher.PidIdentityVerdict.MATCH
+        )
+        evidence = _identity_evidence(verdict)
+        monkeypatch.setattr(
+            process_launcher,
+            "_pid_identity_evidence",
+            lambda _pid, _ticks: evidence,
+        )
+    manager._append_event(event)
+
+    result = manager.reconcile(include_gc=False)
+
+    assert result["reservations_retired"] == 0
+    assert manager._latest_by_request()["owned"]["state"] == "starting"
+
+
+def test_unbound_claim_resolution_classifies_lease_live_reservation():
+    # NF-2026-01763: reconcile consumes a lease-live row's resolution only
+    # after exact owner MISMATCH proof, so the classifier must not drop it.
+    event = _starting("lease-live", deadline=time.time() + 600.0)
+    event["reviewer_claim_epoch"] = None
+    pending = {"status": "pending", "worker_status": "unclaimed", "claimed_by": ""}
+
+    resolutions = reviewer_reservation_recovery.resolve_unbound_reviewer_claims(
+        {"lease-live": event},
+        load_task=lambda _task_id: pending,
+        is_safe_int=lambda value: isinstance(value, int),
+    )
+
+    assert resolutions == {"lease-live": ("legacy", None)}
 
 
 def test_periodic_scan_requires_valid_expired_lease_before_pid_null_retirement(

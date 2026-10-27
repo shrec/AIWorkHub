@@ -6990,9 +6990,11 @@ class ProcessManager:
         The one per-event rule behind duplicate admission, lens exclusivity and
         accept-preview visibility: a spawn-committed provider or owner pid, or an
         active pid, that is not a proven identity MISMATCH; a pid-null
-        ``starting`` reservation with a live owner, a live prewarm or an
-        unexpired lease.  Ambiguous evidence is live; elapsed or quiet time
-        against a live provider never is evidence of death.
+        ``starting`` reservation with a live owner, a live prewarm or, only
+        when no owner is recorded, an unexpired lease (NF-2026-01763: a
+        proven-dead owner is not kept live by its lease).  Ambiguous evidence
+        is live; elapsed or quiet time against a live provider never is
+        evidence of death.
         """
 
         state = event.get("state")
@@ -7017,6 +7019,10 @@ class ProcessManager:
                 return True
             if self._reviewer_source_graph_prewarm_live_event(event):
                 return True
+            if owner_pid > 0:
+                # NF-2026-01763: reaching here means the recorded owner is a
+                # proven MISMATCH, so its lease alone never keeps the attempt.
+                return False
             try:
                 deadline = float(event.get("reservation_expires_at_epoch") or 0.0)
             except (TypeError, ValueError, OverflowError):

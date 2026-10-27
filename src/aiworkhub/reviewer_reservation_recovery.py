@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 import json
 import sqlite3
 import stat
@@ -100,9 +99,9 @@ def resolve_unbound_reviewer_claims(
     *,
     load_task: Callable[[str], object],
     is_safe_int: Callable[[object], bool],
-    now: float | None = None,
 ) -> dict[str, ClaimResolution]:
-    """Classify expired, unbound reviewer claims using canonical task state.
+    """Classify unbound reviewer claims (expired, or lease-live for the
+    NF-2026-01763 proven-dead-owner path) using canonical task state.
 
     Missing, malformed, mismatched, or unavailable state remains unresolved so
     callers preserve the reservation.  This module classifies authority only;
@@ -110,7 +109,6 @@ def resolve_unbound_reviewer_claims(
     """
 
     resolutions: dict[str, ClaimResolution] = {}
-    resolution_now = time.time() if now is None else now
     for request_id, event in candidate_latest.items():
         if (
             event.get("state") != "starting"
@@ -122,7 +120,7 @@ def resolve_unbound_reviewer_claims(
             deadline = float(event.get("reservation_expires_at_epoch"))
         except (TypeError, ValueError):
             continue
-        if not (0.0 < deadline < float("inf") and deadline < resolution_now):
+        if not (0.0 < deadline < float("inf")):
             continue
         task_id = str(event.get("task_id") or "").strip()
         runner = str(event.get("runner") or "").strip()
@@ -699,7 +697,8 @@ def reconcile_expired_starting_reservations(
     A ``starting`` reservation with no pid belongs to a provisioner that
     never reached supervisor spawn.  Once its bounded reservation epoch
     elapses it is no longer live, so it is terminalized (``blocked`` with
-    ``reservation_expired``) instead of silently expiring.  A reservation
+    ``reservation_expired``) instead of silently expiring.  Its exact owner
+    proven dead retires it at once (``reservation_owner_dead``).  A reservation
     that already carries a real pid is only terminalized when pid identity
     evidence proves a mismatch.  A durable ``provider_spawn_committed``
     phase is exact spawn authority that outlives its owner process, so it
@@ -850,10 +849,25 @@ def reconcile_expired_starting_reservations(
             # Zero, negative, NaN, and infinite deadlines cannot authorize
             # retirement. Fail closed instead of treating them as expired.
             continue
-        if reservation_deadline >= now:
-            # No classification, including a stalled preparation
-            # heartbeat or disproved PID, can bypass the exact lease.
-            continue
+        lease_live = reservation_deadline >= now
+        if lease_live:
+            # Only exact proof that a pid-null row's reserving owner is gone
+            # bypasses the lease; no stalled preparation heartbeat, disproved
+            # provider PID, or UNKNOWN/ambiguous owner identity can.
+            pid, pid_ambiguous = parse_durable_pid(event.get("pid"))
+            owner_pid, owner_pid_ambiguous = parse_durable_pid(
+                event.get("owner_pid")
+            )
+            if pid or pid_ambiguous or owner_pid_ambiguous or not owner_pid:
+                continue
+            try:
+                owner_identity = pid_identity_evidence(
+                    owner_pid, event.get("owner_pid_start_ticks")
+                ).verdict
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if owner_identity is not identity_mismatch:
+                continue
         if (
             event.get("topic") == "quality_review"
             and event.get("reviewer_claim_epoch") is None
@@ -873,6 +887,19 @@ def reconcile_expired_starting_reservations(
                 event = bound
             elif resolution_kind != "legacy":
                 continue
+        if lease_live:
+            # Proven above: no pid, and the exact reserving owner is gone.
+            terminalized, diagnostics_left = (
+                manager._terminalize_committed_reservation(
+                    request_id,
+                    event,
+                    "reservation_owner_dead",
+                    diagnostics_left,
+                )
+            )
+            if terminalized:
+                retired.append(request_id)
+            continue
         pid, pid_ambiguous = parse_durable_pid(event.get("pid"))
         if pid_ambiguous:
             continue
