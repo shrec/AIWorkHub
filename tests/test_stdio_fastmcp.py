@@ -103,7 +103,7 @@ def test_run_passes_raw_params_and_request_id_through_to_dispatch(monkeypatch):
 
     captured = {}
 
-    def fake_dispatch(server_name, tools, method, params, request_id):
+    def fake_dispatch(server_name, tools, method, params, request_id, *, input_schema_transform=None):
         captured["method"] = method
         captured["params"] = params
         captured["request_id"] = request_id
