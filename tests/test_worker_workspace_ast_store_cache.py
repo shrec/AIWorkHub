@@ -118,27 +118,33 @@ def test_ast_walk_reduced_for_repeated_descendant_store_lookups(
     from aiworkhub import worker_workspace
     import ast as _ast
 
-    walk_calls = 0
-    original_walk = _ast.walk
+    # NF-2026-00993 replaced the per-name ``ast.walk`` sweeps with a single
+    # ``ast.iter_child_nodes`` queue, so ``ast.walk`` is no longer called at
+    # all.  Count child expansions instead: ``ast.walk`` expands through the
+    # same function, so the baseline (one walk per queried name per top-level
+    # statement) is still caught, and each parsed node may be expanded once.
+    source = _pathological_source()
+    node_count = sum(1 for _ in _ast.walk(_ast.parse(source)))
+    expand_calls = 0
+    original_iter_child_nodes = _ast.iter_child_nodes
 
-    def counting_walk(node, *args, **kwargs):
-        nonlocal walk_calls
-        walk_calls += 1
-        yield from original_walk(node, *args, **kwargs)
+    def counting_iter_child_nodes(node):
+        nonlocal expand_calls
+        expand_calls += 1
+        return original_iter_child_nodes(node)
 
-    monkeypatch.setattr(worker_workspace.ast, "walk", counting_walk)
+    monkeypatch.setattr(
+        worker_workspace.ast, "iter_child_nodes", counting_iter_child_nodes
+    )
     repo = tmp_path / "walk"
-    _package(repo, _pathological_source())
+    _package(repo, source)
     _write(repo, "src/pkg/abs.py")
     _closure(repo)
-    assert walk_calls > 0
-    # Baseline would have walked once per queried name per top-level
-    # statement (6 queries + complex_store scan).  Candidate indexes once
-    # per statement and only a tiny number of statements should need a
-    # separate initial top-level sweep.
-    expected_worst_case = 7 * 40
-    assert walk_calls < expected_worst_case, (
-        f"walk_calls={walk_calls}"
+    assert expand_calls > 0
+    # Measured: candidate 1147 expansions for 1147 seed nodes, baseline 4502.
+    # The two empty sibling modules may add one Module expansion each.
+    assert expand_calls <= node_count + 2, (
+        f"expand_calls={expand_calls} node_count={node_count}"
     )
 
 

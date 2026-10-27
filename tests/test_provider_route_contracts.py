@@ -47,7 +47,7 @@ def test_editor_family_reviewer_submit_is_measured_supported_from_the_bridge() -
     )
     assert record.state == contracts.CAPABILITY_SUPPORTED
     assert record.evidence_class == contracts.EVIDENCE_DECLARED_FROM_CODE_PATH
-    assert "process_launcher.py" in record.evidence
+    assert "process_launcher_vscode_lm_tool.py" in record.evidence
     assert (
         contracts.route_can_complete(
             _EDITOR_FAMILY, contracts.CAPABILITY_REVIEWER_SUBMIT
@@ -76,7 +76,7 @@ def test_editor_family_packet_read_is_measured_supported_from_the_bridge() -> No
     )
     assert record.state == contracts.CAPABILITY_SUPPORTED
     assert record.evidence_class == contracts.EVIDENCE_DECLARED_FROM_CODE_PATH
-    assert "process_launcher.py" in record.evidence
+    assert "process_launcher_vscode_lm_tool.py" in record.evidence
 
 
 def test_unsupported_and_unknown_are_distinguishable_not_collapsed() -> None:
@@ -396,7 +396,7 @@ def test_observability_carries_capabilities_beside_reachability(
         submit = entry["capabilities"][contracts.CAPABILITY_REVIEWER_SUBMIT]
         assert submit["state"] == contracts.CAPABILITY_SUPPORTED
         assert submit["evidence_class"] == contracts.EVIDENCE_DECLARED_FROM_CODE_PATH
-        assert "process_launcher.py" in submit["evidence"]
+    assert "process_launcher_vscode_lm_tool.py" in submit["evidence"]
 
 
 def _bridge_dispatch_citation() -> tuple[Path, str]:
