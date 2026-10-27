@@ -427,6 +427,8 @@ _LL_MUTATE_ABI1 = (
 # NF-2026-01740: what glibc ``sem_open`` needs beneath /dev/shm to create, write,
 # link and unlink a SemLock file. Reads are never handled by this ruleset.
 _LL_SEMLOCK_DEV_SHM = _LL_WRITE_FILE | _LL_MAKE_REG | _LL_REMOVE_FILE
+# Mirrors validation_runner.LANDLOCK_SEMLOCK_DEV_SHM; the bare-script child cannot import it.
+_LANDLOCK_SEMLOCK_DEV_SHM = "/dev/shm"
 _SCMP_ACT_ALLOW = 0x7FFF0000
 _SCMP_ACT_ERRNO = 0x00050000
 _SECCOMP_DENIED_SYSCALLS = (
@@ -9075,10 +9077,8 @@ def _landlock_semlock_dev_shm_rule(
         return None
     if exec_scratch is None:
         raise WorkspaceError("landlock_semlock_dev_shm_requires_validation")
-    from . import validation_runner
-
     if (
-        str(semlock_dev_shm) != validation_runner.LANDLOCK_SEMLOCK_DEV_SHM
+        str(semlock_dev_shm) != _LANDLOCK_SEMLOCK_DEV_SHM
         or not semlock_dev_shm.is_absolute()
         or semlock_dev_shm.is_symlink()
         or not semlock_dev_shm.is_dir()

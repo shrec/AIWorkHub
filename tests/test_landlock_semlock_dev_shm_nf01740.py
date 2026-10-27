@@ -13,6 +13,7 @@ platform; only the real Landlock ``multiprocessing.Pool(2)`` run needs Linux.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -254,7 +255,7 @@ class TestRulesetComposition:
     ) -> None:
         workspace, scratch, shm = self._dirs(tmp_path)
         # The rule is pinned to LANDLOCK_SEMLOCK_DEV_SHM; point it at the fixture.
-        monkeypatch.setattr(validation_runner, "LANDLOCK_SEMLOCK_DEV_SHM", str(shm))
+        monkeypatch.setattr(worker_workspace, "_LANDLOCK_SEMLOCK_DEV_SHM", str(shm), raising=False)
         granted = _stub_landlock_syscalls(monkeypatch)
         worker_workspace._apply_landlock(
             workspace.path, workspace.home, [], scratch, semlock_dev_shm=shm
@@ -299,10 +300,12 @@ class TestRulesetComposition:
         handled = worker_workspace._landlock_supported_mutations(3)
         rule = worker_workspace._landlock_semlock_dev_shm_rule
         assert rule(None, scratch, handled) is None
-        monkeypatch.setattr(validation_runner, "LANDLOCK_SEMLOCK_DEV_SHM", str(shm))
+        monkeypatch.setattr(worker_workspace, "_LANDLOCK_SEMLOCK_DEV_SHM", str(shm), raising=False)
         assert rule(shm, scratch, handled) == (shm, _SEMLOCK_RIGHTS)
         missing = tmp_path / "missing"
-        monkeypatch.setattr(validation_runner, "LANDLOCK_SEMLOCK_DEV_SHM", str(missing))
+        monkeypatch.setattr(
+            worker_workspace, "_LANDLOCK_SEMLOCK_DEV_SHM", str(missing), raising=False
+        )
         with pytest.raises(WorkspaceError, match="not_directory"):
             rule(missing, scratch, handled)
         link = tmp_path / "shm-link"
@@ -310,7 +313,7 @@ class TestRulesetComposition:
             link.symlink_to(shm, target_is_directory=True)
         except OSError:
             pytest.skip("symlinks unavailable on this host")
-        monkeypatch.setattr(validation_runner, "LANDLOCK_SEMLOCK_DEV_SHM", str(link))
+        monkeypatch.setattr(worker_workspace, "_LANDLOCK_SEMLOCK_DEV_SHM", str(link), raising=False)
         with pytest.raises(WorkspaceError, match="not_directory"):
             rule(link, scratch, handled)
 
@@ -602,3 +605,34 @@ def test_real_landlock_validation_runs_multiprocessing_pool(tmp_path: Path) -> N
         assert "PermissionError" in denied.stderr, denied.stderr[-2000:]
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+class TestBareScriptChild:
+    def test_child_literal_matches_validation_runner(self) -> None:
+        assert (
+            worker_workspace._LANDLOCK_SEMLOCK_DEV_SHM
+            == validation_runner.LANDLOCK_SEMLOCK_DEV_SHM
+        )
+
+    def test_rule_runs_when_module_is_loaded_without_a_package(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The Landlock wrapper executes worker_workspace.py as a bare script, so
+        # the child-side rule may not use a relative or package import.
+        spec = importlib.util.spec_from_file_location(
+            "aiwh_worker_workspace_bare", Path(worker_workspace.__file__)
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, spec.name, module)
+        spec.loader.exec_module(module)
+        assert module.__package__ == ""
+        try:
+            result = module._landlock_semlock_dev_shm_rule(
+                Path(validation_runner.LANDLOCK_SEMLOCK_DEV_SHM),
+                tmp_path,
+                module._LL_SEMLOCK_DEV_SHM,
+            )
+        except module.WorkspaceError:
+            return
+        assert result == (Path("/dev/shm"), module._LL_SEMLOCK_DEV_SHM)
