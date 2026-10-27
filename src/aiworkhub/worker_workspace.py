@@ -40,7 +40,7 @@ from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
-from typing import TYPE_CHECKING, Any, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Protocol
 
 if TYPE_CHECKING:
     from .promotion_merge import ReworkRebase
@@ -309,7 +309,14 @@ _NPM_SUPPORT_EXCLUDED_DIRS = frozenset(
     }
 )
 MAX_REWORK_OVERLAY_FILES = 512
+# NF-2026-01739: the 8 MiB cap bounds only bytes base64-inlined into ONE delta
+# JSON.  A larger file is sealed as a content-addressed sidecar blob under
+# ``<runtime>/rework_deltas/blobs/<sha256>``; those bytes have their own
+# aggregate cap and are always streamed, never held whole in memory.
 MAX_REWORK_OVERLAY_CONTENT_BYTES = 8 * 1024 * 1024
+MAX_REWORK_CARRIED_BYTES = 2 * 1024 * 1024 * 1024
+REWORK_DELTA_BLOB_DIRNAME = "blobs"
+_REWORK_BLOB_CHUNK_BYTES = 1024 * 1024
 MAX_VALIDATION_COMMANDS = 32
 MAX_VALIDATION_SECONDS = 1_800
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -2404,6 +2411,199 @@ def _write_rework_path(destination: Path, relative: str, content: bytes | None) 
         destination.write_bytes(content)
 
 
+def stream_sha256(stream: Any, sink: Any = None) -> tuple[str, int]:
+    """Hash (and optionally copy) a binary stream in bounded chunks."""
+    digest, size = hashlib.sha256(), 0
+    while chunk := stream.read(_REWORK_BLOB_CHUNK_BYTES):
+        digest.update(chunk)
+        size += len(chunk)
+        if sink is not None:
+            sink.write(chunk)
+    return digest.hexdigest(), size
+
+
+class ReworkBlobSource(Protocol):
+    """Over-inline-cap content the sealer streams into a sidecar blob.
+
+    ``copy_into`` writes the exact bytes to ``sink`` and returns the
+    ``(sha256, size)`` it observed while copying; the sealer refuses the blob
+    unless both still equal the recorded ``sha256`` and ``size``.
+    """
+
+    sha256: str
+    size: int
+
+    def copy_into(self, sink: Any) -> tuple[str, int]: ...
+
+
+@dataclass(frozen=True)
+class ReworkDeltaBlob:
+    """One stream-verified sealed sidecar blob: exact bytes at ``path``."""
+
+    path: Path
+    sha256: str
+    size: int
+
+    def copy_into(self, sink: Any) -> tuple[str, int]:
+        with self.path.open("rb") as handle:
+            return stream_sha256(handle, sink)
+
+
+def _rework_blob_source(relative: str, content: Any) -> ReworkBlobSource:
+    sha, size = getattr(content, "sha256", None), getattr(content, "size", None)
+    if (
+        not isinstance(sha, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", sha)
+        or type(size) is not int
+        or size < 0
+        or not callable(getattr(content, "copy_into", None))
+    ):
+        raise WorkspaceError(f"rework_delta_content_invalid:{relative}")
+    return content
+
+
+def _link_like(info: os.stat_result) -> bool:
+    """A symlink, or any Windows reparse point (junction, mount point)."""
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & reparse)
+
+
+def _rework_blob_dir(artifact_dir: Path) -> Path:
+    blob_dir = artifact_dir / REWORK_DELTA_BLOB_DIRNAME
+    info = os.lstat(blob_dir)
+    if _link_like(info) or not stat.S_ISDIR(info.st_mode):
+        raise WorkspaceError("rework_delta_blob_dir_unsafe")
+    return blob_dir
+
+
+def _rework_delta_blob_present(artifact_dir: Path, blob_sha: str, size: int) -> bool:
+    """Cheap retention-fence check: the blob exists, unlinked, at its size."""
+    try:
+        info = os.lstat(_rework_blob_dir(artifact_dir) / blob_sha)
+    except (OSError, WorkspaceError):
+        return False
+    return not _link_like(info) and stat.S_ISREG(info.st_mode) and info.st_size == size
+
+
+def rework_delta_blob_refs(encoded: bytes) -> dict[str, int]:
+    """Name every sidecar blob one sealed delta JSON references (sha256 -> size).
+
+    Raises ``ValueError``/``WorkspaceError`` for an unparsable artifact or a
+    malformed reference, so a caller deciding retention can fail closed.
+    """
+    if b'"blob_sha256"' not in encoded:
+        return {}
+    packet = json.loads(encoded.decode("utf-8"))
+    files = packet.get("files") if isinstance(packet, dict) else None
+    if not isinstance(files, list):
+        raise WorkspaceError("rework_delta_artifact_invalid")
+    refs: dict[str, int] = {}
+    for entry in files:
+        if not isinstance(entry, dict) or "blob_sha256" not in entry:
+            continue
+        blob_sha, size = entry.get("blob_sha256"), entry.get("size")
+        if (
+            not isinstance(blob_sha, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", blob_sha)
+            or type(size) is not int
+            or size < 0
+        ):
+            raise WorkspaceError("rework_delta_blob_invalid")
+        refs[blob_sha] = size
+    return refs
+
+
+def verified_rework_delta_blob(artifact_dir: Path, blob_sha: str, size: int) -> ReworkDeltaBlob:
+    """Stream-verify one sealed blob beside its delta artifact; fail closed.
+
+    The blob must sit directly in the resolved ``blobs`` directory (itself no
+    link or junction), be a regular non-link file of exactly ``size`` bytes,
+    and stream to exactly ``blob_sha``.
+    """
+    if not re.fullmatch(r"[0-9a-f]{64}", str(blob_sha)) or type(size) is not int or size < 0:
+        raise WorkspaceError("rework_delta_blob_invalid")
+    try:
+        blob_dir = _rework_blob_dir(artifact_dir)
+        path = blob_dir / blob_sha
+        info = os.lstat(path)
+        if (
+            _link_like(info)
+            or not stat.S_ISREG(info.st_mode)
+            or path.resolve(strict=True).parent != blob_dir.resolve(strict=True)
+        ):
+            raise WorkspaceError(f"rework_delta_blob_unsafe:{blob_sha}")
+        with path.open("rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened.st_mode) or opened.st_size != size:
+                raise WorkspaceError(f"rework_delta_blob_size_mismatch:{blob_sha}")
+            observed, observed_size = stream_sha256(handle)
+    except OSError as exc:
+        raise WorkspaceError(f"rework_delta_blob_missing:{blob_sha}") from exc
+    if observed_size != size or observed != blob_sha:
+        raise WorkspaceError(f"rework_delta_blob_hash_mismatch:{blob_sha}")
+    return ReworkDeltaBlob(path, blob_sha, size)
+
+
+def _seal_rework_delta_blob(artifact_dir: Path, source: ReworkBlobSource) -> None:
+    """Stream one file into ``blobs/<sha256>``: temp, fsync, verify, rename.
+
+    An intact blob with the same digest is reused (its mtime refreshed so the
+    janitor's age fence restarts); an absent, tampered or unrefreshable one is
+    replaced by a fresh verified copy.
+    """
+    blob_dir = artifact_dir / REWORK_DELTA_BLOB_DIRNAME
+    blob_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _rework_blob_dir(artifact_dir)
+    target = blob_dir / source.sha256
+    try:
+        verified_rework_delta_blob(artifact_dir, source.sha256, source.size)
+        os.utime(target)
+        return
+    except (OSError, WorkspaceError):
+        pass
+    fd, temp_name = tempfile.mkstemp(dir=blob_dir, prefix=".rework-blob-", suffix=".tmp")
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            digest, size = source.copy_into(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if digest != source.sha256 or size != source.size:
+            raise WorkspaceError(f"rework_delta_blob_source_changed:{source.sha256}")
+        chmod_path(temp_path, 0o600)
+        atomic_replace(temp_path, target)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def _write_rework_blob(destination: Path, relative: str, blob: ReworkDeltaBlob) -> None:
+    """Stream-copy one verified blob into place via a sibling temp file."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not destination.is_symlink() and destination.exists() and not destination.is_file():
+        raise WorkspaceError(f"rework_delta_blob_destination_invalid:{relative}")
+    mode = (
+        stat.S_IMODE(destination.stat().st_mode)
+        if destination.is_file() and not destination.is_symlink() else 0o644
+    )
+    fd, temp_name = tempfile.mkstemp(
+        dir=destination.parent, prefix=".rework-blob-", suffix=".tmp"
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            digest, size = blob.copy_into(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if digest != blob.sha256 or size != blob.size:
+            raise WorkspaceError(f"rework_delta_content_hash_mismatch:{relative}")
+        chmod_path(temp_path, mode)
+        atomic_replace(temp_path, destination)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
 def _rework_hash_mismatch(
     relative: str, source: str, expected: Any, content: bytes | None,
 ) -> WorkspaceError:
@@ -2514,10 +2714,16 @@ def seal_rework_delta_artifact(
     task_id: str,
     request_id: str,
     claim_epoch: int,
-    file_entries: Iterable[tuple[str, bytes | None]],
+    file_entries: Iterable[tuple[str, bytes | ReworkBlobSource | None]],
     artifact_dir: Path,
 ) -> dict[str, str]:
-    """Atomically seal exact predecessor bytes as one bounded delta artifact."""
+    """Atomically seal exact predecessor bytes as one bounded delta artifact.
+
+    ``bytes`` are base64-inlined under ``MAX_REWORK_OVERLAY_CONTENT_BYTES``.
+    A ``ReworkBlobSource`` (an over-inline-cap file) is streamed into the
+    sidecar ``blobs/<sha256>`` beside the artifact BEFORE the artifact is
+    published, and its entry carries ``blob_sha256`` + ``size`` instead.
+    """
     if not _REQUEST_ID_RE.fullmatch(request_id):
         raise WorkspaceError(f"rework_delta_invalid_request_id:{request_id!r}")
     if not task_id or type(claim_epoch) is not int or claim_epoch < 1:
@@ -2530,6 +2736,8 @@ def seal_rework_delta_artifact(
     files: list[dict[str, Any]] = []
     seen_paths: set[str] = set()
     total_content_bytes = 0
+    carried_bytes = 0
+    blob_sources: list[ReworkBlobSource] = []
     for raw_path, content in entries:
         relative = _rework_delta_normalize_path(raw_path)
         if relative in seen_paths:
@@ -2538,12 +2746,24 @@ def seal_rework_delta_artifact(
         entry: dict[str, Any] = {"path": relative}
         if content is None:
             entry["deleted"] = True
-        else:
+        elif isinstance(content, (bytes, bytearray)):
             total_content_bytes += len(content)
             if total_content_bytes > MAX_REWORK_OVERLAY_CONTENT_BYTES:
                 raise WorkspaceError("rework_delta_content_exceeds_limit")
             entry["sha256"] = hashlib.sha256(content).hexdigest()
             entry["content_base64"] = base64.b64encode(content).decode("ascii")
+        else:
+            source = _rework_blob_source(relative, content)
+            carried_bytes += source.size
+            if carried_bytes > MAX_REWORK_CARRIED_BYTES:
+                raise WorkspaceError(
+                    f"rework_delta_carried_bytes_exceeds_limit:{carried_bytes}"
+                    f">{MAX_REWORK_CARRIED_BYTES}"
+                )
+            entry.update(
+                {"sha256": source.sha256, "blob_sha256": source.sha256, "size": source.size}
+            )
+            blob_sources.append(source)
         files.append(entry)
     files.sort(key=lambda item: item["path"])
     payload = {
@@ -2560,6 +2780,8 @@ def seal_rework_delta_artifact(
     artifact_dir = artifact_dir.resolve(strict=False)
     artifact_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     chmod_path(artifact_dir, 0o700)
+    for source in blob_sources:
+        _seal_rework_delta_blob(artifact_dir, source)
     artifact_path = artifact_dir / f"{artifact_digest}.json"
     fd, temp_name = tempfile.mkstemp(
         dir=artifact_dir, prefix=".rework-delta-", suffix=".tmp"
@@ -2716,8 +2938,16 @@ def has_verified_rework_delta(
     try:
         if resolved.stat().st_size > 64 * 1024 * 1024:
             return False
-        return hashlib.sha256(resolved.read_bytes()).hexdigest() == digest
-    except OSError:
+        encoded = resolved.read_bytes()
+        if hashlib.sha256(encoded).hexdigest() != digest:
+            return False
+        # The worktree may be released only when every sidecar blob the delta
+        # names is present at its sealed size; materialization re-hashes it.
+        return all(
+            _rework_delta_blob_present(resolved.parent, blob_sha, size)
+            for blob_sha, size in rework_delta_blob_refs(encoded).items()
+        )
+    except (OSError, ValueError, WorkspaceError):
         return False
 
 
@@ -2787,13 +3017,14 @@ def verify_rework_delta_artifact(
     allowed_writes: tuple[str, ...],
     *,
     worktree: Path | None = None,
-) -> list[tuple[str, bytes | None]]:
+) -> list[tuple[str, bytes | ReworkDeltaBlob | None]]:
     """Verify one sealed changed/deleted-file delta and return its exact plan.
 
     Materialization passes its destination ``worktree`` so every planned path
     is also proven beneath it.  Blocked-rework recovery omits it to
     authenticate a collected candidate with this same verifier, writing
-    nothing.
+    nothing.  A blob-carried entry is planned as a ``ReworkDeltaBlob`` whose
+    sidecar was stream-verified (location, link, type, size and sha256).
     """
     if not isinstance(artifact, dict):
         raise WorkspaceError("rework_delta_artifact_invalid")
@@ -2839,9 +3070,12 @@ def verify_rework_delta_artifact(
         _relative_repo_path(str(key)): value
         for key, value in expected_path_hashes.items()
     }
-    planned: list[tuple[str, bytes | None]] = []
+    planned: list[tuple[str, bytes | ReworkDeltaBlob | None]] = []
     seen_paths: set[str] = set()
     total_content_bytes = 0
+    carried_bytes = 0
+    # Sidecar blobs live beside the very artifact whose digest was checked.
+    artifact_dir = artifact_path.resolve(strict=True).parent
     for entry in files:
         if not isinstance(entry, dict):
             raise WorkspaceError("rework_delta_artifact_invalid")
@@ -2866,12 +3100,35 @@ def verify_rework_delta_artifact(
                 raw_expected is not None
                 or entry.get("sha256") is not None
                 or entry.get("content_base64") is not None
+                or entry.get("blob_sha256") is not None
             ):
                 raise WorkspaceError(f"rework_delta_delete_conflict:{relative}")
             planned.append((relative, None))
             continue
         file_sha = str(entry.get("sha256") or "")
         content_base64 = entry.get("content_base64")
+        if "blob_sha256" in entry:
+            size = entry.get("size")
+            if (
+                not re.fullmatch(r"[0-9a-f]{64}", file_sha)
+                or entry.get("blob_sha256") != file_sha
+                or content_base64 is not None
+                or type(size) is not int
+                or size < 0
+            ):
+                raise WorkspaceError(f"rework_delta_artifact_incomplete:{relative}")
+            if file_sha != raw_expected:
+                raise WorkspaceError(
+                    f"rework_predecessor_hash_mismatch:{relative} source=artifact"
+                    f" observed_bytes={size} observed={file_sha}"
+                )
+            carried_bytes += size
+            if carried_bytes > MAX_REWORK_CARRIED_BYTES:
+                raise WorkspaceError("rework_delta_carried_bytes_exceeds_limit")
+            planned.append(
+                (relative, verified_rework_delta_blob(artifact_dir, file_sha, size))
+            )
+            continue
         if not re.fullmatch(r"[0-9a-f]{64}", file_sha) or not isinstance(
             content_base64, str
         ):
@@ -2904,7 +3161,11 @@ def materialize_rework_delta_artifact(
     allowed_writes: tuple[str, ...],
     rebase: ReworkRebase | None = None,
 ) -> list[str]:
-    """Verify and materialize one sealed changed/deleted-file delta."""
+    """Verify and materialize one sealed changed/deleted-file delta.
+
+    Blob-carried paths are stream-copied from their verified sidecar blob and
+    never handed to ``rebase``; base drift on one fails closed instead.
+    """
     planned = verify_rework_delta_artifact(
         artifact,
         authority_repo,
@@ -2915,11 +3176,39 @@ def materialize_rework_delta_artifact(
         allowed_writes,
         worktree=worktree,
     )
-    merged = {} if rebase is None else rebase(planned)
+    blobs = {
+        relative: content for relative, content in planned
+        if isinstance(content, ReworkDeltaBlob)
+    }
+    inline = [(relative, content) for relative, content in planned if relative not in blobs]
+    merged = {} if rebase is None else rebase(inline)
+    if rebase is not None:
+        _refuse_blob_rebase(rebase, sorted(blobs))
     for relative, content in planned:
+        if relative in blobs:
+            _write_rework_blob(worktree / relative, relative, blobs[relative])
+            continue
         content = merged.get(relative, content)
         _write_rework_path(worktree / relative, relative, content)
     return sorted(relative for relative, _ in planned)
+
+
+def _refuse_blob_rebase(rebase: ReworkRebase, blob_paths: list[str]) -> None:
+    """Fail closed when base drift would have to merge a blob-carried path.
+
+    The three-way merge works on whole in-memory bytes, so a sidecar blob is
+    never merged.  Each blob path is probed alone as a byte-free deletion
+    marker: the rebase returns (or conflicts on) exactly the drifted paths.
+    """
+    for relative in blob_paths:
+        try:
+            merged = rebase([(relative, None)])
+        except WorkspaceError as exc:
+            if not str(exc).startswith("rework_base_drift:"):
+                raise
+            merged = {relative: None}
+        if relative in merged:
+            raise WorkspaceError(f"rework_delta_blob_rebase_conflict:{relative}")
 
 
 def _json_pointer_parts(pointer: str) -> tuple[str, ...]:

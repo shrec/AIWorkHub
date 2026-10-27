@@ -190,6 +190,96 @@ def test_rework_delta_prune_parallel_result_equals_sequential(
     assert results[0]["removed"] == 12
 
 
+def _delta_naming_blob(blob_sha: str) -> str:
+    entry = {"path": "data/x.jsonl", "sha256": blob_sha, "blob_sha256": blob_sha, "size": 3}
+    return json.dumps({"files": [entry]}, indent=2)
+
+
+# NF-2026-01739: a sidecar blob is pruned only when no kept delta JSON
+# references it AND it is at least 24 hours old.
+def test_rework_delta_prune_keeps_referenced_blobs_and_prunes_aged_orphans(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = tmp_path.resolve()
+    directory = _rework_delta_dir(monkeypatch, repo)
+    blobs = directory / worker_workspace.REWORK_DELTA_BLOB_DIRNAME
+    blobs.mkdir()
+    kept_json, pruned_json = f"{'1' * 64}.json", f"{'2' * 64}.json"
+    (directory / kept_json).write_text(_delta_naming_blob("a" * 64), encoding="utf-8")
+    (directory / pruned_json).write_text(_delta_naming_blob("d" * 64), encoding="utf-8")
+    ages = {
+        kept_json: 25 * _HOUR,  # referenced by an undecided task -> kept
+        pruned_json: 25 * _HOUR,  # unreferenced, old -> removed with its blob
+        "a" * 64: 25 * _HOUR,  # named by the kept JSON -> kept
+        "b" * 64: 25 * _HOUR,  # orphan, old -> removed
+        "c" * 64: 1 * _HOUR,  # orphan, young (a seal in flight) -> kept
+        "d" * 64: 25 * _HOUR,  # named only by the pruned JSON -> removed
+        ".rework-blob-x.tmp": 25 * _HOUR,  # interrupted blob seal, old -> removed
+    }
+    for name in ages:
+        if not name.endswith(".json"):
+            (blobs / name).write_bytes(b"abc")
+    monkeypatch.setattr(
+        storage_retention, "_janitor_mtime", lambda path: _NOW - ages[path.name]
+    )
+    monkeypatch.setattr(task_store, "referenced_rework_delta_digests", lambda root: {"1" * 64})
+
+    result = storage_retention._prune_decided_rework_deltas(repo, _NOW)
+
+    assert sorted(path.name for path in directory.glob("*.json")) == [kept_json]
+    assert sorted(path.name for path in blobs.iterdir()) == ["a" * 64, "c" * 64]
+    assert result["scanned"] == 7
+    assert result["removed"] == 4
+    assert result["errors"] == [] and result["ok"] is True
+
+
+def test_rework_delta_prune_keeps_every_blob_when_a_kept_delta_is_unreadable(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = tmp_path.resolve()
+    directory = _rework_delta_dir(monkeypatch, repo)
+    blobs = directory / worker_workspace.REWORK_DELTA_BLOB_DIRNAME
+    blobs.mkdir()
+    (directory / f"{'1' * 64}.json").write_text('{"blob_sha256": ', encoding="utf-8")
+    (blobs / ("b" * 64)).write_bytes(b"abc")
+    monkeypatch.setattr(storage_retention, "_janitor_mtime", lambda path: _NOW - 30 * _HOUR)
+    monkeypatch.setattr(task_store, "referenced_rework_delta_digests", lambda root: {"1" * 64})
+
+    result = storage_retention._prune_decided_rework_deltas(repo, _NOW)
+
+    assert [path.name for path in blobs.iterdir()] == ["b" * 64]
+    assert result["ok"] is False
+    assert result["errors"][0].startswith("rework_delta_blob_refs_unreadable:")
+
+
+def test_rework_delta_prune_spares_a_blob_a_seal_refreshed_after_the_scan(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = tmp_path.resolve()
+    directory = _rework_delta_dir(monkeypatch, repo)
+    blobs = directory / worker_workspace.REWORK_DELTA_BLOB_DIRNAME
+    blobs.mkdir()
+    (blobs / ("b" * 64)).write_bytes(b"abc")
+    ages = {"b" * 64: 25 * _HOUR}
+    monkeypatch.setattr(
+        storage_retention, "_janitor_mtime", lambda path: _NOW - ages[path.name]
+    )
+    monkeypatch.setattr(task_store, "referenced_rework_delta_digests", lambda root: set())
+    parallel = storage_retention._janitor_parallel
+
+    def seal_reuses_the_blob_mid_prune(targets, action):
+        if any(path.parent == blobs for path in targets):
+            ages["b" * 64] = 0  # _seal_rework_delta_blob's os.utime lands here
+        return parallel(targets, action)
+
+    monkeypatch.setattr(storage_retention, "_janitor_parallel", seal_reuses_the_blob_mid_prune)
+
+    result = storage_retention._prune_decided_rework_deltas(repo, _NOW)
+
+    assert [path.name for path in blobs.iterdir()] == ["b" * 64]
+    assert result["removed"] == 0 and result["ok"] is True
+
+
 def _unattributed_repo(tmp_path: Path) -> tuple[Path, Path]:
     repo = tmp_path.resolve() / "repo"
     base = repo / ".aiworkhub" / "runtime" / "worktrees"

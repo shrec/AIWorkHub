@@ -7,6 +7,7 @@ import json
 import os
 import stat
 from contextlib import ExitStack, closing, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -72,24 +73,94 @@ def _regular_descriptor(path: Path, root: Path):
         yield descriptor
 
 
-def _read_regular(path: Path, root: Path, limit: int, *, missing_ok: bool = False) -> bytes | None:
-    """Read once through anchored parents; authenticate the descriptor read."""
+# NF-2026-01739. ``MAX_REWORK_OVERLAY_CONTENT_BYTES`` bounds what
+# ``seal_rework_delta_artifact`` base64-inlines into ONE JSON artifact (and so
+# the bytes held in memory for it). It is an inline-capture cap, not a limit on
+# a candidate: a regular file over the remaining inline budget is carried by
+# sha256 + size + repo-relative path, hashed in bounded chunks, and the sealer
+# streams its exact bytes into a sidecar blob beside the delta artifact
+# (re-hashed while copying, so a file changed since capture fails closed).
+
+
+@dataclass(frozen=True)
+class DigestCarriedContent:
+    """A captured regular file too large to inline, identified by digest.
+
+    It is a ``worker_workspace.ReworkBlobSource``: ``copy_into`` re-streams
+    the retained file through the same anchored descriptor walk. ``len`` is
+    refused by name, so an inline-only consumer refuses it instead of
+    dropping or truncating it.
+    """
+
+    path: str
+    sha256: str
+    size: int
+    workspace: Path
+
+    def __bool__(self) -> bool:
+        return True
+
+    def __len__(self) -> int:
+        raise SuccessfulReworkRecoveryError("successful_rework_content_digest_carried")
+
+    def copy_into(self, sink) -> tuple[str, int]:
+        _require_safe_relative(self.path)
+        return _stream_regular(self.workspace / self.path, self.workspace, sink)
+
+
+def _require_unchanged(before: os.stat_result, after: os.stat_result, observed: int) -> None:
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_nlink) != (
+        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_nlink
+    ) or observed != after.st_size:
+        raise SuccessfulReworkRecoveryError("successful_rework_content_changed")
+
+
+def _digest_open_regular(fd: int, stream, before: os.stat_result, sink=None) -> tuple[str, int]:
+    """Hash (and optionally copy) an open regular file in bounded chunks."""
+    digest, size = worker_workspace.stream_sha256(stream, sink)
+    _require_unchanged(before, os.fstat(fd), size)
+    return digest, size
+
+
+def _stream_regular(path: Path, root: Path, sink) -> tuple[str, int]:
+    """Copy one regular file through anchored parents, returning its digest."""
     _contained_path(path, root)
     try:
         with _regular_descriptor(path, root) as fd, os.fdopen(fd, "rb", closefd=False) as stream:
             before = os.fstat(fd)
             if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
                 raise SuccessfulReworkRecoveryError("successful_rework_path_unsafe")
-            if before.st_size > limit or limit < 0:
+            return _digest_open_regular(fd, stream, before, sink)
+    except FileNotFoundError as exc:
+        raise SuccessfulReworkRecoveryError("successful_rework_read_failed") from exc
+    except (OSError, runtime_temp.RuntimeTempError) as exc:
+        raise SuccessfulReworkRecoveryError("successful_rework_read_failed") from exc
+
+
+def _read_regular(
+    path: Path, root: Path, limit: int, *, missing_ok: bool = False, carry_as: str | None = None,
+) -> bytes | DigestCarriedContent | None:
+    """Read once through anchored parents; authenticate the descriptor read.
+
+    With ``carry_as`` a regular file over ``limit`` is streamed through the
+    same descriptor into a ``DigestCarriedContent`` instead of being refused.
+    """
+    _contained_path(path, root)
+    try:
+        with _regular_descriptor(path, root) as fd, os.fdopen(fd, "rb", closefd=False) as stream:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise SuccessfulReworkRecoveryError("successful_rework_path_unsafe")
+            if limit < 0 or (before.st_size > limit and carry_as is None):
                 raise SuccessfulReworkRecoveryError("successful_rework_content_too_large")
+            if before.st_size > limit:
+                digest, size = _digest_open_regular(fd, stream, before)
+                return DigestCarriedContent(carry_as, digest, size, root)
             data = stream.read(limit + 1)
             after = os.fstat(fd)
             if len(data) > limit:
                 raise SuccessfulReworkRecoveryError("successful_rework_content_too_large")
-            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_nlink) != (
-                after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_nlink
-            ) or len(data) != after.st_size:
-                raise SuccessfulReworkRecoveryError("successful_rework_content_changed")
+            _require_unchanged(before, after, len(data))
             return data
     except FileNotFoundError as exc:
         if missing_ok:
@@ -100,6 +171,14 @@ def _read_regular(path: Path, root: Path, limit: int, *, missing_ok: bool = Fals
         # restricted token cannot list); fail closed as a ValueError so no
         # RuntimeError escapes callers that catch OSError/ValueError.
         raise SuccessfulReworkRecoveryError("successful_rework_read_failed") from exc
+
+
+def _require_safe_relative(relative: str) -> None:
+    if (
+        not relative or relative.startswith("/") or "\\" in relative
+        or any(part in {"", ".", ".."} for part in relative.split("/"))
+    ):
+        raise SuccessfulReworkRecoveryError("successful_rework_hashes_invalid")
 
 
 def _verified_payloads(runtime: Path, request_id: str, receipt: Mapping[str, Any]) -> dict[str, Any]:
@@ -149,27 +228,46 @@ def _verified_payloads(runtime: Path, request_id: str, receipt: Mapping[str, Any
         raise SuccessfulReworkRecoveryError("successful_rework_artifacts_invalid") from exc
 
 
-def capture_candidate_paths(workspace: Path, paths) -> list[tuple[str, bytes | None]]:
-    """Capture once, rejecting unsafe paths and bounding aggregate content."""
+CapturedContent = bytes | DigestCarriedContent | None
+
+
+def capture_candidate_paths(workspace: Path, paths) -> list[tuple[str, CapturedContent]]:
+    """Capture once, rejecting unsafe paths and bounding aggregate inline content.
+
+    A regular file over the remaining inline budget is carried by digest
+    (``DigestCarriedContent``); it never consumes inline budget, and all
+    carried bytes together stay under ``MAX_REWORK_CARRIED_BYTES``.
+    """
     if any(not isinstance(path, str) for path in paths):
         raise SuccessfulReworkRecoveryError("successful_rework_hashes_invalid")
     entries = []
     remaining = worker_workspace.MAX_REWORK_OVERLAY_CONTENT_BYTES
+    carried = 0
     for relative in sorted(set(paths)):
-        if (
-            not relative or relative.startswith("/") or "\\" in relative
-            or any(part in {"", ".", ".."} for part in relative.split("/"))
-        ):
-            raise SuccessfulReworkRecoveryError("successful_rework_hashes_invalid")
+        _require_safe_relative(relative)
         source = workspace / relative
-        data = _read_regular(source, workspace, remaining, missing_ok=True)
-        remaining -= len(data) if data is not None else 0
+        data = _read_regular(source, workspace, remaining, missing_ok=True, carry_as=relative)
+        if isinstance(data, DigestCarriedContent):
+            carried += data.size
+            if carried > worker_workspace.MAX_REWORK_CARRIED_BYTES:
+                raise SuccessfulReworkRecoveryError(
+                    f"successful_rework_carried_bytes_exceeds_limit:{carried}"
+                    f">{worker_workspace.MAX_REWORK_CARRIED_BYTES}"
+                )
+        elif data is not None:
+            remaining -= len(data)
         entries.append((relative, data))
     return entries
 
 
+def _captured_digest(data: CapturedContent) -> str | None:
+    if isinstance(data, DigestCarriedContent):
+        return data.sha256
+    return hashlib.sha256(data).hexdigest() if data is not None else None
+
+
 def captured_path_hashes(
-    entries: Sequence[tuple[str, bytes | None]]
+    entries: Sequence[tuple[str, CapturedContent]]
 ) -> dict[str, str | None]:
     """Hash exactly the captured bytes, with ``None`` for a deletion marker.
 
@@ -178,14 +276,12 @@ def captured_path_hashes(
     from the SAME ``capture_candidate_paths`` result.  The success path and
     both terminal failure paths share this helper rather than each re-reading
     the worktree, which is what let a concurrent writer split the pair.
+    A digest-carried file contributes the digest streamed at capture.
     """
-    return {
-        relative: hashlib.sha256(data).hexdigest() if data is not None else None
-        for relative, data in entries
-    }
+    return {relative: _captured_digest(data) for relative, data in entries}
 
 
-def candidate_entries(workspace: Path, hashes: Mapping[str, Any]) -> list[tuple[str, bytes | None]]:
+def candidate_entries(workspace: Path, hashes: Mapping[str, Any]) -> list[tuple[str, CapturedContent]]:
     """Match the complete payload, including authenticated deletion markers."""
     if any(
         value is not None and (
@@ -196,8 +292,7 @@ def candidate_entries(workspace: Path, hashes: Mapping[str, Any]) -> list[tuple[
         raise SuccessfulReworkRecoveryError("successful_rework_hashes_invalid")
     entries = capture_candidate_paths(workspace, hashes)
     for relative, data in entries:
-        observed = hashlib.sha256(data).hexdigest() if data is not None else None
-        if observed != hashes[relative]:
+        if _captured_digest(data) != hashes[relative]:
             raise SuccessfulReworkRecoveryError("successful_rework_hash_mismatch")
     return entries
 
@@ -360,6 +455,7 @@ def successful_candidate_evidence(workspace, metadata, request_id, changed):
     paths = sorted(set(changed) | {path for path in predecessor_hashes if isinstance(path, str) and path})
     entries = capture_candidate_paths(workspace.path, paths)
     hashes = captured_path_hashes(entries)
+    # Over-inline-cap files are sealed as sidecar blobs from the same capture.
     descriptor = process_launcher._terminal_rework_delta_evidence(
         workspace, metadata, request_id, paths, captured_entries=entries
     )

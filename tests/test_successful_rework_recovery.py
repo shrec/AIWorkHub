@@ -256,13 +256,15 @@ def test_verified_artifact_is_parsed_from_same_bytes(episode, monkeypatch, requi
         _seal(episode)
 
 
-def test_oversize_candidate_is_rejected_before_content_read(episode, monkeypatch, require_directory_authority):
+def test_oversize_candidate_is_digest_checked_before_sealing(episode, monkeypatch, require_directory_authority):
+    # NF-2026-01739: an over-cap candidate is carried by digest, not refused;
+    # bytes that no longer match the recorded hash still fail before sealing.
     require_directory_authority(episode.workspace)
     with episode.candidate.open("wb") as stream:
         stream.truncate(worker_workspace.MAX_REWORK_OVERLAY_CONTENT_BYTES + 1)
     calls = []
     monkeypatch.setattr(worker_workspace, "seal_rework_delta_artifact", lambda *args: calls.append(args))
-    with pytest.raises(recovery.SuccessfulReworkRecoveryError, match="content_too_large"):
+    with pytest.raises(recovery.SuccessfulReworkRecoveryError, match="successful_rework_hash_mismatch"):
         _seal(episode)
     assert calls == []
 

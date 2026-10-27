@@ -9288,8 +9288,12 @@ def _verified_retained_predecessor_receipt(
     ) -> str | None:
         if set(observed_paths) != set(normalized_hashes):
             return "reroute_retained_candidate_changed_paths_mismatch"
-        total_content_bytes = 0
-        for relative, expected in normalized_hashes.items():
+        # Mirrors capture: a file that fits the remaining inline budget is an
+        # inline entry, a larger one is blob-carried under its own cap; both
+        # are hashed by streaming, never read whole (NF-2026-01739).
+        inline_remaining = worker_workspace.MAX_REWORK_OVERLAY_CONTENT_BYTES
+        carried_bytes = 0
+        for relative, expected in sorted(normalized_hashes.items()):
             target = candidate_root / relative
             try:
                 worker_workspace._require_beneath(candidate_root, target)
@@ -9301,13 +9305,15 @@ def _verified_retained_predecessor_receipt(
                     continue
                 if not target.is_file():
                     return "reroute_retained_candidate_hash_mismatch"
-                total_content_bytes += target.stat().st_size
-                if (
-                    total_content_bytes
-                    > worker_workspace.MAX_REWORK_OVERLAY_CONTENT_BYTES
-                ):
-                    return "reroute_retained_candidate_too_large"
-                observed = hashlib.sha256(target.read_bytes()).hexdigest()
+                size = target.stat().st_size
+                if size <= inline_remaining:
+                    inline_remaining -= size
+                else:
+                    carried_bytes += size
+                    if carried_bytes > worker_workspace.MAX_REWORK_CARRIED_BYTES:
+                        return "reroute_retained_candidate_too_large"
+                with target.open("rb") as handle:
+                    observed, _size = worker_workspace.stream_sha256(handle)
             except (
                 OSError,
                 RuntimeError,

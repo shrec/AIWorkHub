@@ -39,10 +39,13 @@ from typing import Any, Callable, Iterator, Mapping
 from . import parallelism, repo_policy, task_store, worktree_storage
 from .platform_io import lock_fd, unlock_fd
 from .worker_workspace import (
+    REWORK_DELTA_BLOB_DIRNAME,
+    WorkspaceError,
     cleanup_workspace,
     configured_runtime_root,
     configured_worktree_root,
     has_verified_rework_delta,
+    rework_delta_blob_refs,
 )
 
 
@@ -2424,6 +2427,10 @@ def _prune_decided_rework_deltas(root: Path, now: float) -> dict[str, Any]:
     Covers ``<digest>.json`` artifacts and the ``.rework-delta-*.tmp`` files an
     interrupted seal leaves behind. Both must be 24 hours old: a seal whose card
     update has not landed yet is not referenced so far.
+
+    Sidecar blobs (``blobs/<sha256>``, NF-2026-01739) are pruned afterwards,
+    only when no delta JSON still kept on disk references them AND they are
+    24 hours old; an unreadable kept JSON keeps every blob.
     """
     directory = configured_runtime_root(root) / "rework_deltas"
     result: dict[str, Any] = {"scanned": 0, "removed": 0, "bytes_freed": 0, "errors": []}
@@ -2457,13 +2464,77 @@ def _prune_decided_rework_deltas(root: Path, now: float) -> dict[str, Any]:
         targets.append(entry)
         sizes[entry] = int(entry_info.st_size)
     failures = _janitor_parallel(targets, lambda path: path.unlink())
-    failed = {path for path, _error in failures}
-    removed = [path for path in targets if path not in failed]
+    blob_targets = _rework_blob_prune_targets(directory, now, result, sizes)
+    refreshed: set[Path] = set()
+
+    def unlink_blob(path: Path) -> None:
+        # Re-check the age right before the unlink: a seal that reused this
+        # blob refreshes its mtime BEFORE publishing the delta naming it, so a
+        # refresh after the scan above means a delta may already reference it.
+        if now - _janitor_mtime(path) < JANITOR_MIN_AGE_SECONDS:
+            refreshed.add(path)
+            return
+        path.unlink()
+
+    if blob_targets:
+        failures += _janitor_parallel(blob_targets, unlink_blob)
+    kept = {path for path, _error in failures} | refreshed
+    removed = [path for path in (*targets, *blob_targets) if path not in kept]
     result["removed"] = len(removed)
     result["bytes_freed"] = sum(sizes[path] for path in removed)
-    result["errors"] = [error for _path, error in failures]
-    result["ok"] = not failures
+    result["errors"] += [error for _path, error in failures]
+    result["ok"] = not result["errors"]
     return result
+
+
+def _rework_blob_prune_targets(
+    directory: Path, now: float, result: dict[str, Any], sizes: dict[Path, int],
+) -> list[Path]:
+    """Aged sidecar blobs no delta JSON left in ``directory`` references."""
+    blob_dir = directory / REWORK_DELTA_BLOB_DIRNAME
+    try:
+        info = blob_dir.lstat()
+    except FileNotFoundError:
+        return []
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise StorageRetentionError("rework_delta_blob_root_invalid")
+    kept: set[str] = set()
+    for artifact in sorted(directory.glob("*.json")):
+        try:
+            artifact_info = artifact.lstat()
+            if not stat.S_ISREG(artifact_info.st_mode):
+                continue
+            if artifact_info.st_size > 64 * 1024 * 1024:
+                raise ValueError("rework_delta_artifact_too_large")
+            kept.update(rework_delta_blob_refs(artifact.read_bytes()))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError, WorkspaceError) as exc:
+            # Fail closed: a kept delta we cannot read may name any blob.
+            result["errors"].append(f"rework_delta_blob_refs_unreadable:{artifact.name}:{exc}"[:300])
+            return []
+    targets: list[Path] = []
+    for entry in sorted(blob_dir.iterdir()):
+        temp = entry.name.startswith(".rework-blob-") and entry.name.endswith(".tmp")
+        if not temp and not re.fullmatch(r"[0-9a-f]{64}", entry.name):
+            continue
+        try:
+            entry_info = entry.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISREG(entry_info.st_mode):
+            continue
+        result["scanned"] += 1
+        if not temp and entry.name in kept:
+            continue
+        try:
+            if now - _janitor_mtime(entry) < JANITOR_MIN_AGE_SECONDS:
+                continue
+        except OSError:
+            continue
+        targets.append(entry)
+        sizes[entry] = int(entry_info.st_size)
+    return targets
 
 
 def _janitor_logs(root: Path) -> dict[str, Any]:
