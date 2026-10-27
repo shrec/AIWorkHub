@@ -346,3 +346,117 @@ def test_an_undecided_repository_reports_no_disposition_percentage(tmp_path: Pat
     assert result["cards_with_disposition"] == 0
     assert result["cards_without_disposition"] == 0
     assert result["recent_without_disposition"] == []
+
+
+# --------------------------------------------------------------------------- #
+# the head run closed out neither way
+#
+# A decision is closed out by a lesson OR by a typed no-new-lesson disposition.
+# The run of newest decisions with neither is what the learning gate holds a
+# manager to; the lesson-only run beside it keeps saying how much was learned.
+# --------------------------------------------------------------------------- #
+
+
+def _no_new_lesson(task_id: str) -> tuple[str, str, str]:
+    return (task_id, learning_commit_store.DISPOSITION_NO_NEW_LESSON,
+            "mechanical_change_only")
+
+
+def test_a_disposition_only_decision_ends_the_run_closed_out_neither_way(
+    tmp_path: Path,
+):
+    root = _repo(tmp_path)
+    _seed(
+        root,
+        [_aged("NEW", 1), _aged("ANSWERED", 2), _aged("OLD_1", 3), _aged("OLD_2", 4)],
+        lessons=[],
+        dispositions=[_no_new_lesson("ANSWERED")],
+    )
+
+    result = learning_commit_store.coverage(root)
+
+    assert result["consecutive_recent_without_disposition"] == 1
+    assert result["consecutive_recent_without_disposition_capped"] is False
+    # The disposition is not a lesson: the lesson-only run goes straight past it.
+    assert result["consecutive_recent_without_lesson"] == 4
+
+
+def test_a_decision_with_neither_extends_the_run(tmp_path: Path):
+    root = _repo(tmp_path)
+    _seed(
+        root,
+        [_aged("N_1", 1), _aged("N_2", 2), _aged("N_3", 3),
+         _aged("COMMITTED", 4), _aged("ANSWERED", 5)],
+        lessons=["COMMITTED"],
+        dispositions=[_no_new_lesson("ANSWERED")],
+    )
+
+    result = learning_commit_store.coverage(root)
+
+    assert result["consecutive_recent_without_disposition"] == 3
+    assert result["consecutive_recent_without_lesson"] == 3
+
+
+def test_a_lesson_without_a_disposition_row_still_ends_the_run(tmp_path: Path):
+    """Either close-out counts, and legacy lessons carry no disposition row."""
+    root = _repo(tmp_path)
+    _seed(root, [_aged("NEW", 1), _aged("COMMITTED", 2), _aged("OLD", 3)],
+          lessons=["COMMITTED"])
+
+    result = learning_commit_store.coverage(root)
+
+    assert result["consecutive_recent_without_disposition"] == 1
+
+
+def test_with_no_store_at_all_every_head_decision_is_closed_out_neither_way(
+    tmp_path: Path,
+):
+    root = _repo(tmp_path)
+    _seed(root, [_aged("A", 1), _aged("B", 2)], lessons=[])
+
+    result = learning_commit_store.coverage(root)
+
+    assert result["consecutive_recent_without_disposition"] == 2
+    assert result["consecutive_recent_without_disposition_capped"] is False
+
+
+def test_the_neither_run_at_the_scan_limit_says_it_is_a_floor(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(learning_commit_store, "RECENT_DECISION_SCAN_LIMIT", 3)
+    root = _repo(tmp_path)
+    _seed(
+        root,
+        [_aged(f"T{i}", 1 + i) for i in range(5)],
+        lessons=[],
+        dispositions=[_no_new_lesson("T4")],
+    )
+
+    result = learning_commit_store.coverage(root)
+
+    assert result["consecutive_recent_without_disposition"] == 3
+    assert result["consecutive_recent_without_disposition_capped"] is True
+
+
+def test_the_neither_run_leaves_every_lesson_number_unchanged(tmp_path: Path):
+    """Adding the run must not move a single pre-existing key."""
+    root = _repo(tmp_path)
+    rows = [_aged("NEW", 1), _aged("ANSWERED", 2), _aged("COMMITTED", 3),
+            _aged("OLD", 4)]
+    _seed(root, rows, lessons=["COMMITTED"])
+    before = learning_commit_store.coverage(root)
+
+    _seed(root, rows, lessons=[], dispositions=[_no_new_lesson("ANSWERED")])
+    after = learning_commit_store.coverage(root)
+
+    for key in (
+        "decided_cards", "cards_with_lesson", "cards_without_lesson",
+        "coverage_percent", "recent_without_lesson",
+        "consecutive_recent_without_lesson",
+        "consecutive_recent_without_lesson_capped",
+    ):
+        assert after[key] == before[key], key
+    assert before["consecutive_recent_without_lesson"] == 2
+    assert before["coverage_percent"] == 25.0
+    assert before["consecutive_recent_without_disposition"] == 2
+    assert after["consecutive_recent_without_disposition"] == 1

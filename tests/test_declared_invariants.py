@@ -462,7 +462,13 @@ def test_every_invariant_is_named_in_the_report(name, canonical_report):
 from test_learning_coverage_is_measured import _card, _repo, _seed  # noqa: E402
 
 
-def _decided(root: Path, count: int, *, lessons: list[str]) -> None:
+def _decided(
+    root: Path,
+    count: int,
+    *,
+    lessons: list[str],
+    dispositions: list[tuple[str, str, str]] | None = None,
+) -> None:
     """``count`` decided cards, newest first as ``D0``, ``D1``, ..."""
     _seed(
         root,
@@ -471,6 +477,7 @@ def _decided(root: Path, count: int, *, lessons: list[str]) -> None:
             for i in range(count)
         ],
         lessons=lessons,
+        dispositions=dispositions,
     )
 
 
@@ -497,7 +504,10 @@ def test_a_run_of_decisions_recording_no_lesson_is_a_violation(tmp_path: Path):
     ]
     assert len(breach) == 1
     detail = breach[0]["detail"]
-    assert "3 most recently decided cards recorded no lesson" in detail
+    assert (
+        "3 most recently decided cards recorded no lesson and no disposition"
+        in detail
+    )
     # It names the cards that can clear it, so the manager is not left guessing
     # which decision the gate is about.
     assert "D0" in detail and "aiworkhub_manager_learning_commit" in detail
@@ -524,6 +534,67 @@ def test_a_skip_inside_the_limit_is_not_accused(tmp_path: Path):
     report = di.check(_PACKAGE, repo_root=root)
 
     assert report["passed"], report["violations"]
+
+
+@pytest.mark.usefixtures("cached_package_scan")
+def test_decisions_closed_out_with_no_new_lesson_satisfy_the_gate(tmp_path: Path):
+    """A typed no-new-lesson disposition closes a decision out as a lesson does."""
+    from aiworkhub import learning_commit_store
+
+    root = _repo(tmp_path)
+    count = di.MAX_DECISIONS_WITHOUT_A_LESSON + 4
+    _decided(
+        root,
+        count,
+        lessons=[],
+        dispositions=[
+            (f"D{i}", learning_commit_store.DISPOSITION_NO_NEW_LESSON,
+             "mechanical_change_only")
+            for i in range(count)
+        ],
+    )
+
+    report = di.check(_PACKAGE, repo_root=root)
+
+    assert report["passed"], report["violations"]
+    assert _learning_row(report)["evaluated"] is True
+
+
+@pytest.mark.usefixtures("cached_package_scan")
+def test_decisions_with_neither_a_lesson_nor_a_disposition_still_fail(tmp_path: Path):
+    """Only the head run closed out neither way counts, and it names those cards."""
+    from aiworkhub import learning_commit_store
+
+    root = _repo(tmp_path)
+    limit = di.MAX_DECISIONS_WITHOUT_A_LESSON
+    _decided(
+        root,
+        limit + 4,
+        lessons=[],
+        dispositions=[
+            (f"D{i}", learning_commit_store.DISPOSITION_NO_NEW_LESSON,
+             "mechanical_change_only")
+            for i in range(limit + 1, limit + 4)
+        ],
+    )
+
+    report = di.check(_PACKAGE, repo_root=root)
+
+    assert not report["passed"]
+    breach = [
+        v for v in report["violations"]
+        if v["invariant"] == "recent_decisions_record_a_lesson"
+    ]
+    assert len(breach) == 1
+    detail = breach[0]["detail"]
+    assert f"the {limit + 1} most recently decided cards" in detail
+    assert all(f"D{i}" in detail for i in range(limit + 1))
+    assert f"D{limit + 1}" not in detail
+    # Both close-out paths are named, so neither reads as the only way out.
+    assert "aiworkhub_manager_learning_commit" in detail
+    assert "lesson_candidate" in detail
+    assert "no_new_lesson_reason" in detail
+    assert "accept_review" in detail and "reject_review" in detail
 
 
 @pytest.mark.usefixtures("cached_package_scan")
@@ -632,13 +703,48 @@ def test_an_absent_denominator_wins_over_any_run(tmp_path: Path, monkeypatch):
         lambda *_a, **_k: {
             "decided_cards": 0,
             "consecutive_recent_without_lesson": 99,
+            "consecutive_recent_without_disposition": 99,
             "recent_without_lesson": [],
+            "recent_without_disposition": [],
             "coverage_percent": None,
             "window_days": 14,
         },
     )
 
     assert di.recent_decisions_record_a_lesson(root) == []
+
+
+def test_the_gate_reads_the_run_closed_out_neither_way(tmp_path: Path, monkeypatch):
+    """The lesson-only run is reported; the gate holds the manager to the other.
+
+    A long lesson-only run with every decision dispositioned is a clean gate,
+    and a run with neither past the limit is a violation whatever the lesson-only
+    number says.
+    """
+    root = _repo(tmp_path)
+
+    from aiworkhub import learning_commit_store
+
+    def _measured(lesson_run: int, neither_run: int) -> dict:
+        return {
+            "decided_cards": 10,
+            "consecutive_recent_without_lesson": lesson_run,
+            "consecutive_recent_without_disposition": neither_run,
+            "recent_without_lesson": ["A", "B", "C", "D", "E"],
+            "recent_without_disposition": ["A", "B", "C", "D", "E"],
+            "coverage_percent": 0.0,
+            "window_days": 14,
+        }
+
+    monkeypatch.setattr(
+        learning_commit_store, "coverage", lambda *_a, **_k: _measured(99, 0)
+    )
+    assert di.recent_decisions_record_a_lesson(root) == []
+
+    monkeypatch.setattr(
+        learning_commit_store, "coverage", lambda *_a, **_k: _measured(0, 3)
+    )
+    assert len(di.recent_decisions_record_a_lesson(root)) == 1
 
 
 @pytest.mark.usefixtures("cached_package_scan")

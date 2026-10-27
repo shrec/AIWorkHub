@@ -727,19 +727,31 @@ def recent_decisions_record_a_lesson(repo_root: Path) -> list[Violation]:
         # decided nothing owes nothing, and a gate that fires on day one of
         # every repository is a gate people learn to route around.
         return []
-    streak = int(measured["consecutive_recent_without_lesson"])
+    # A decision is closed out by EITHER a learning commit or a typed
+    # no-new-lesson disposition, so the run that counts is the one with
+    # neither. Gating on the lesson-only run would accuse a decision the
+    # manager already answered for with "nothing new here".
+    streak = int(measured["consecutive_recent_without_disposition"])
     if streak <= MAX_DECISIONS_WITHOUT_A_LESSON:
         return []
-    clearing = measured["recent_without_lesson"][: MAX_DECISIONS_WITHOUT_A_LESSON + 1]
+    # The head run is the newest decided cards, so it leads both bounded
+    # samples; their intersection, newest first, is the cards with neither.
+    without_lesson = set(measured["recent_without_lesson"])
+    clearing = [
+        task_id for task_id in measured["recent_without_disposition"]
+        if task_id in without_lesson
+    ][: MAX_DECISIONS_WITHOUT_A_LESSON + 1]
     return [Violation(
         "recent_decisions_record_a_lesson",
         str(root),
-        f"the {streak} most recently decided cards recorded no lesson "
-        f"(limit {MAX_DECISIONS_WITHOUT_A_LESSON}; "
+        f"the {streak} most recently decided cards recorded no lesson and no "
+        f"disposition (limit {MAX_DECISIONS_WITHOUT_A_LESSON}; "
         f"{measured['window_days']}-day coverage "
-        f"{measured['coverage_percent']}%). Clear it by committing the lesson "
-        f"one of these already owes, through aiworkhub_manager_learning_commit "
-        f"with the learning_commit_owed payload its decision returned: "
+        f"{measured['coverage_percent']}%). Close each out either way: commit "
+        f"the lesson it owes through aiworkhub_manager_learning_commit (the "
+        f"learning_commit_owed payload its decision returned) or a "
+        f"lesson_candidate, or record a typed no_new_lesson_reason on "
+        f"accept_review / reject_review: "
         + ", ".join(clearing),
     )]
 

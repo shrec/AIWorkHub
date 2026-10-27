@@ -865,10 +865,18 @@ def coverage(root: str | Path, *, window_days: int = COVERAGE_WINDOW_DAYS) -> di
         # decided-without-lesson are 6, 15, 1, 2, 14, 6, 38 -- lessons arrive in
         # bursts and then stop, which is what a number nobody is answerable for
         # looks like.
-        if has_store:
+        #
+        # The same scan reads the disposition table when it exists, so the run
+        # of decisions closed out neither way costs no second pass over tasks.
+        if has_store or has_dispositions:
             head = conn.execute(
-                "SELECT EXISTS(SELECT 1 FROM learning_commits l "
-                "WHERE l.task_id = t.task_id) AS has_lesson FROM tasks t "
+                "SELECT "
+                + ("EXISTS(SELECT 1 FROM learning_commits l "
+                   "WHERE l.task_id = t.task_id)" if has_store else "0")
+                + " AS has_lesson, "
+                + ("EXISTS(SELECT 1 FROM learning_dispositions d "
+                   "WHERE d.task_id = t.task_id)" if has_dispositions else "0")
+                + " AS has_disposition FROM tasks t "
                 "WHERE t.updated_at >= ? "
                 "AND t.topic <> 'quality_review' "
                 "AND (t.status='finished' OR t.status LIKE 'blocked%') "
@@ -880,8 +888,16 @@ def coverage(root: str | Path, *, window_days: int = COVERAGE_WINDOW_DAYS) -> di
                 if row["has_lesson"]:
                     break
                 streak += 1
+            disposition_streak = 0
+            for row in head:
+                if row["has_lesson"] or row["has_disposition"]:
+                    break
+                disposition_streak += 1
+            if not has_store:
+                streak = min(int(decided), RECENT_DECISION_SCAN_LIMIT)
         else:
             streak = min(int(decided), RECENT_DECISION_SCAN_LIMIT)
+            disposition_streak = streak
     decided = int(decided)
     with_lesson = int(with_lesson)
     return {
@@ -913,6 +929,14 @@ def coverage(root: str | Path, *, window_days: int = COVERAGE_WINDOW_DAYS) -> di
         "recent_without_disposition": [
             str(row["task_id"]) for row in missing_disposition
         ],
+        # The head run of decisions closed out NEITHER way: no lesson row and no
+        # disposition row. This is the run a manager is answerable for -- a
+        # typed no-new-lesson disposition ends it as surely as a lesson does --
+        # while the lesson-only run above keeps saying how much was learned.
+        "consecutive_recent_without_disposition": disposition_streak,
+        "consecutive_recent_without_disposition_capped": (
+            disposition_streak >= RECENT_DECISION_SCAN_LIMIT
+        ),
     }
 
 
