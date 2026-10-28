@@ -404,3 +404,47 @@ jobs:
 
       - name: Smoke the image over stdio
         run: python3 scripts/mcp_stdio_smoke.py -- docker run -i --rm aiworkhub-mcp:ci
+
+      # TDQS (Tool Definition Quality Score, https://tdqs.dev) grades the tool definitions the
+      # image publishes. Lint is offline, deterministic and free; --fail-on never keeps every
+      # finding advisory until a later ratchet card.
+      - name: Install TDQS
+        run: python3 -m pip install tdqs==0.1.0
+
+      - name: TDQS lint the image's MCP tool definitions
+        run: tdqs lint --command "docker run -i --rm aiworkhub-mcp:ci" --server-name AIWorkHub --format json --fail-on never --output tdqs-lint.json
+
+      - name: Summarize the TDQS lint report
+        run: python3 scripts/tdqs_report_to_needfix.py tdqs-lint.json --markdown >> "$GITHUB_STEP_SUMMARY"
+
+      # !cancelled() rather than the implicit success(): the report is uploaded, and scored,
+      # even when the summary step fails on it, which is when it is needed most.
+      - name: Upload the TDQS report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: tdqs-report
+          path: tdqs-lint.json
+          if-no-files-found: error
+
+      # Hosted scoring needs the TDQS_API_KEY secret, so it runs only where the secret is set
+      # (never for pull requests from forks) and only this step sees it. A hosted failure is
+      # reported on this step without failing the build.
+      - name: TDQS hosted score (only with TDQS_API_KEY)
+        id: tdqs_score
+        if: ${{ !cancelled() && env.TDQS_API_KEY != '' }}
+        continue-on-error: true
+        env:
+          TDQS_API_KEY: ${{ secrets.TDQS_API_KEY }}
+        run: tdqs score --command "docker run -i --rm aiworkhub-mcp:ci" --server-name AIWorkHub --hosted https://tdqs.dev --format json --fail-on never --output tdqs-score.json
+
+      - name: Add the hosted score to the TDQS report
+        if: ${{ !cancelled() && steps.tdqs_score.outcome == 'success' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: tdqs-report
+          path: |
+            tdqs-lint.json
+            tdqs-score.json
+          if-no-files-found: ignore
+          overwrite: true
