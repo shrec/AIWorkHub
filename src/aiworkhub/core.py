@@ -12207,27 +12207,20 @@ def claude_callback_wait(
     snapshot of this session's launched requests instead of nothing, and a
     ``watch_request_ids`` list also wakes the wait when a watched request's
     ledger row changes (a non-terminal milestone), reported as
-    ``watch_changed``.
+    ``watch_changed``.  When another route owns the lane, a non-empty
+    ``watch_request_ids`` runs ``callback_watch.read_only_watch`` instead of
+    refusing: it never claims, leases or acknowledges (NF-2026-01769).
     """
+    from . import callback_watch  # local import: cycle-safe
+
     identity = _claude_manager_identity()
     if identity is None:
-        return {"ok": False, **_claude_lane_refusal()}
-    limits = callback_wait_limits()
-    try:
-        requested = int(timeout_seconds)
-    except (TypeError, ValueError):
-        requested = 240
-    timeout = max(1, min(requested, int(limits["max_timeout_seconds"])))
-    timing = {
-        "requested_timeout_seconds": requested,
-        "effective_timeout_seconds": timeout,
-        "max_timeout_seconds": int(limits["max_timeout_seconds"]),
-        "timeout_clamped": requested > timeout,
-        "timeout_clamp_source": limits["timeout_clamp_source"],
-    }
-    watch = [
-        str(item).strip() for item in (watch_request_ids or []) if str(item or "").strip()
-    ][:CALLBACK_WAIT_WATCH_LIMIT]
+        refusal = _claude_lane_refusal()
+        if watch_request_ids and refusal["reason"] in callback_watch.WATCHABLE_LANE_OWNERS:
+            return callback_watch.read_only_watch(refusal, watch_request_ids, timeout_seconds)
+        return {"ok": False, **refusal}
+    timeout, timing = callback_watch.callback_wait_timing(timeout_seconds)
+    watch = callback_watch.normalize_watch_ids(watch_request_ids)
     ack_pending = bool(str(ack_batch_id or "").strip() or str(ack_lease_id or "").strip())
     ack_result: dict[str, Any] | None = None
     session_id = identity["session_id"]
