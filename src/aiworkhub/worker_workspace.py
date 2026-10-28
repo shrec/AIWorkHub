@@ -8909,6 +8909,7 @@ def sandbox_argv(
     validation_python_runtime_identity_root: Path | None = None,
     outer_validation_authority: bool = False,
     validation_semlock_dev_shm: bool = False,
+    validation_short_tmp: Path | None = None,
 ) -> list[str]:
     if not adapter_argv:
         raise WorkspaceError("adapter_argv_empty")
@@ -8992,6 +8993,15 @@ def sandbox_argv(
         semlock_flags = _landlock_semlock_dev_shm_flags(
             validation_semlock_dev_shm, validation_exec_scratch
         )
+        # NF-2026-01775: the batch-scoped short TMPDIR run_validations minted once;
+        # the child adopts it and never creates or removes it.
+        if validation_short_tmp is not None and validation_exec_scratch is None:
+            raise WorkspaceError("landlock_short_tmp_without_exec_scratch")
+        short_tmp_flags = (
+            ["--short-tmp", str(validation_short_tmp)]
+            if validation_short_tmp is not None
+            else []
+        )
         return [
             sys.executable,
             str(Path(__file__).resolve()),
@@ -9005,6 +9015,7 @@ def sandbox_argv(
             *authority_flags,
             *noop_chmod_flags,
             *semlock_flags,
+            *short_tmp_flags,
             "--",
             *adapter_argv,
         ]
@@ -11386,10 +11397,15 @@ def _seccomp_notify_runtime_supported() -> bool:
 
 
 VALIDATION_SHORT_TMP_ROOT_ENV = "AIWORKHUB_VALIDATION_SHORT_TMP_ROOT"
+# AF_UNIX ``sun_path`` holds 108 bytes including the terminating NUL.
+_LANDLOCK_SUN_PATH_BUDGET = 107
 
 
 def _landlock_short_tmpdir(
-    tmpdir: str, candidates: Iterable[str], *, sun_path_budget: int = 107
+    tmpdir: str,
+    candidates: Iterable[str],
+    *,
+    sun_path_budget: int = _LANDLOCK_SUN_PATH_BUDGET,
 ) -> str | None:
     """Return a private 0700 dir short enough for multiprocessing's AF_UNIX listener.
 
@@ -11409,6 +11425,45 @@ def _landlock_short_tmpdir(
         except OSError:
             continue
     return None
+
+
+def _mint_batch_short_tmpdir(
+    backend: str, tmpdir: str, exec_scratch: Path
+) -> Path | None:
+    """NF-2026-01775: mint one short TMPDIR per run_validations batch, in the parent.
+
+    Every Landlock child of the batch adopts this exact dir (``--short-tmp``), so a
+    tree one command builds under TMPDIR survives for the next; the batch's
+    ``finally`` removes it once. None keeps ``tmpdir`` (not Landlock, outside the
+    exec scratch, already short, or no usable short root).
+    """
+    if backend != "landlock" or not tmpdir:
+        return None
+    try:
+        inside_scratch = Path(tmpdir).resolve().is_relative_to(exec_scratch.resolve())
+    except OSError:
+        return None
+    if not inside_scratch:
+        return None
+    short_dir = _landlock_short_tmpdir(
+        tmpdir,
+        (os.environ.get(VALIDATION_SHORT_TMP_ROOT_ENV, ""), "/tmp"),
+        sun_path_budget=_LANDLOCK_SUN_PATH_BUDGET,
+    )
+    return Path(short_dir).resolve() if short_dir is not None else None
+
+
+def _adopt_batch_short_tmpdir(raw: str) -> Path:
+    """Adopt the parent-minted batch dir as TMPDIR/TMP/TEMP; never create or delete it."""
+    short_tmp = Path(raw)
+    if short_tmp.is_symlink() or not short_tmp.is_dir():
+        raise WorkspaceError(f"landlock_short_tmp_not_directory:{raw}")
+    if os.name == "posix" and short_tmp.stat().st_mode & 0o077:
+        raise WorkspaceError(f"landlock_short_tmp_not_private:{raw}")
+    # A nested run_validations inside this child mints beneath this granted dir.
+    for name in ("TMPDIR", "TMP", "TEMP", VALIDATION_SHORT_TMP_ROOT_ENV):
+        os.environ[name] = str(short_tmp)
+    return short_tmp
 
 
 def _landlock_exec(argv: list[str]) -> int:
@@ -11436,6 +11491,7 @@ def _landlock_exec(argv: list[str]) -> int:
     parser.add_argument("--outer-validation-authority", action="store_true")
     parser.add_argument("--noop-chmod", action="store_true")
     parser.add_argument("--semlock-dev-shm", default=None)
+    parser.add_argument("--short-tmp", default=None)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     command = list(args.command)
@@ -11450,49 +11506,33 @@ def _landlock_exec(argv: list[str]) -> int:
     semlock_dev_shm = Path(args.semlock_dev_shm) if args.semlock_dev_shm else None
     if args.outer_validation_authority:
         plant_outer_validation_authority(workspace, exec_scratch=exec_scratch)
+    # NF-2026-01775: the parent minted the batch's short TMPDIR once; this child
+    # only adopts and grants it, so no command of the batch loses its tree.
     short_tmp: Path | None = None
-    tmpdir = os.environ.get("TMPDIR", "")
-    if exec_scratch is not None and tmpdir:
-        try:
-            inside_scratch = Path(tmpdir).resolve().is_relative_to(exec_scratch)
-        except OSError:
-            inside_scratch = False
-        short_root = os.environ.get(VALIDATION_SHORT_TMP_ROOT_ENV, "")
-        short_dir = (
-            _landlock_short_tmpdir(tmpdir, (short_root, "/tmp"))
-            if inside_scratch
-            else None
-        )
-        if short_dir is not None:
-            short_tmp = Path(short_dir).resolve()
-            for name in ("TMPDIR", "TMP", "TEMP"):
-                os.environ[name] = str(short_tmp)
-            os.environ[VALIDATION_SHORT_TMP_ROOT_ENV] = str(short_tmp)
-    try:
-        _apply_landlock(
-            workspace,
-            home,
-            args.allow,
-            exec_scratch,
-            worker_temp=worker_temp,
-            semlock_dev_shm=semlock_dev_shm,
-            short_tmp=short_tmp,
-        )
-        if args.cwd is not None:
-            # Re-validate against this exec'd child's own view of the workspace
-            # (fail closed rather than trusting the parent-provided flag) --
-            # traversal/absolute paths are already rejected before this argv is
-            # built, so only symlink-escape/existence can differ here.
-            chdir_target = _require_beneath(workspace, workspace / args.cwd)
-            if chdir_target.is_symlink() or not chdir_target.is_dir():
-                raise WorkspaceError(f"landlock_cwd_not_directory:{args.cwd}")
-        else:
-            chdir_target = workspace
-        os.chdir(chdir_target)
-    except BaseException:
-        if short_tmp is not None:
-            shutil.rmtree(short_tmp, ignore_errors=True)
-        raise
+    if args.short_tmp is not None:
+        if exec_scratch is None:
+            raise WorkspaceError("landlock_short_tmp_without_exec_scratch")
+        short_tmp = _adopt_batch_short_tmpdir(args.short_tmp)
+    _apply_landlock(
+        workspace,
+        home,
+        args.allow,
+        exec_scratch,
+        worker_temp=worker_temp,
+        semlock_dev_shm=semlock_dev_shm,
+        short_tmp=short_tmp,
+    )
+    if args.cwd is not None:
+        # Re-validate against this exec'd child's own view of the workspace
+        # (fail closed rather than trusting the parent-provided flag) --
+        # traversal/absolute paths are already rejected before this argv is
+        # built, so only symlink-escape/existence can differ here.
+        chdir_target = _require_beneath(workspace, workspace / args.cwd)
+        if chdir_target.is_symlink() or not chdir_target.is_dir():
+            raise WorkspaceError(f"landlock_cwd_not_directory:{args.cwd}")
+    else:
+        chdir_target = workspace
+    os.chdir(chdir_target)
     if exec_scratch is not None and _seccomp_notify_supported():
         # NF27: the validator child previously received EPERM for the whole
         # chmod family, breaking unmodified tools (git init writing
@@ -11501,78 +11541,74 @@ def _landlock_exec(argv: list[str]) -> int:
         # operations on stable, request-owned regular files and owned
         # directories beneath this exact validation exec scratch from
         # this trusted parent.
-        try:
-            parent_sock, child_sock = socket.socketpair()
-            broker_parent_pid = os.getpid()
-            helper_argv = [
-                sys.executable,
-                str(Path(__file__).resolve()),
-                "--metadata-broker-child",
-                "--parent-pid",
-                str(broker_parent_pid),
-                "--socket-fd",
-                str(child_sock.fileno()),
-                "--",
-                *command,
-            ]
-            # This branch installs a listener of our own, so the roots that decide
-            # every brokered syscall are exactly this request's: nothing is left to
-            # an outer boundary and nothing is declared beyond them.
-            _publish_metadata_authority_roots(
-                (
-                    *declared_metadata_authority_roots(exec_scratch, worker_temp),
-                    *((str(short_tmp),) if short_tmp is not None else ()),
-                )
+        parent_sock, child_sock = socket.socketpair()
+        broker_parent_pid = os.getpid()
+        helper_argv = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--metadata-broker-child",
+            "--parent-pid",
+            str(broker_parent_pid),
+            "--socket-fd",
+            str(child_sock.fileno()),
+            "--",
+            *command,
+        ]
+        # This branch installs a listener of our own, so the roots that decide
+        # every brokered syscall are exactly this request's: nothing is left to
+        # an outer boundary and nothing is declared beyond them.
+        _publish_metadata_authority_roots(
+            (
+                *declared_metadata_authority_roots(exec_scratch, worker_temp),
+                *((str(short_tmp),) if short_tmp is not None else ()),
             )
-            try:
-                child_process = subprocess.Popen(
-                    helper_argv,
-                    close_fds=True,
-                    pass_fds=(child_sock.fileno(),),
-                    start_new_session=True,
-                    env=os.environ.copy(),
-                )
-            except OSError as exc:
-                parent_sock.close()
-                child_sock.close()
-                raise WorkspaceError(
-                    f"metadata_broker_child_start_failed:{type(exc).__name__}:{exc}"
-                ) from exc
-            child_pid = child_process.pid
+        )
+        try:
+            child_process = subprocess.Popen(
+                helper_argv,
+                close_fds=True,
+                pass_fds=(child_sock.fileno(),),
+                start_new_session=True,
+                env=os.environ.copy(),
+            )
+        except OSError as exc:
+            parent_sock.close()
             child_sock.close()
-            try:
-                listener_fd, listener_error = _metadata_broker_handshake_receive(
-                    parent_sock,
-                    time.monotonic() + _METADATA_BROKER_HANDSHAKE_SECONDS,
-                )
-            finally:
-                parent_sock.close()
-            if listener_fd < 0:
-                _kill_validator_group(child_pid)
-                _reap_validator(child_pid)
-                suffix = f":{listener_error}" if listener_error else ""
-                raise WorkspaceError(
-                    f"metadata_broker_listener_transfer_failed{suffix}"
-                )
-            try:
-                # NF430: authorize the request-owned worker temp authority as an
-                # additional broker resolution root (identically owner/inode/symlink
-                # verified) so a worker's TMPDIR-rooted Git/pytest ``config.lock``
-                # chmod beneath ``.aiworkhub/temp/worker/<request_id>`` is emulated,
-                # exactly like the exec scratch, without widening any other path.
-                return _run_metadata_broker(
-                    listener_fd,
-                    child_pid,
-                    exec_scratch,
-                    extra_roots=tuple(
-                        root for root in (worker_temp, short_tmp) if root is not None
-                    ),
-                )
-            finally:
-                os.close(listener_fd)
+            raise WorkspaceError(
+                f"metadata_broker_child_start_failed:{type(exc).__name__}:{exc}"
+            ) from exc
+        child_pid = child_process.pid
+        child_sock.close()
+        try:
+            listener_fd, listener_error = _metadata_broker_handshake_receive(
+                parent_sock,
+                time.monotonic() + _METADATA_BROKER_HANDSHAKE_SECONDS,
+            )
         finally:
-            if short_tmp is not None:
-                shutil.rmtree(short_tmp, ignore_errors=True)
+            parent_sock.close()
+        if listener_fd < 0:
+            _kill_validator_group(child_pid)
+            _reap_validator(child_pid)
+            suffix = f":{listener_error}" if listener_error else ""
+            raise WorkspaceError(
+                f"metadata_broker_listener_transfer_failed{suffix}"
+            )
+        try:
+            # NF430: authorize the request-owned worker temp authority as an
+            # additional broker resolution root (identically owner/inode/symlink
+            # verified) so a worker's TMPDIR-rooted Git/pytest ``config.lock``
+            # chmod beneath ``.aiworkhub/temp/worker/<request_id>`` is emulated,
+            # exactly like the exec scratch, without widening any other path.
+            return _run_metadata_broker(
+                listener_fd,
+                child_pid,
+                exec_scratch,
+                extra_roots=tuple(
+                    root for root in (worker_temp, short_tmp) if root is not None
+                ),
+            )
+        finally:
+            os.close(listener_fd)
     if _metadata_broker_evidence_fd is not None:
         os.close(_metadata_broker_evidence_fd)
         _metadata_broker_evidence_fd = None
@@ -11607,8 +11643,7 @@ def _landlock_exec(argv: list[str]) -> int:
         brokered_chmod_syscalls=exempted_chmod_syscalls,
         noop_chmod=args.noop_chmod and exec_scratch is None,
     )
-    # ponytail: execvpe replaces this process, so nothing can remove short_tmp afterwards;
-    # ceiling is one 0700 dir under the short root per fallback run, reclaimed by tmp cleaners.
+    # short_tmp belongs to the parent's batch, which removes it once in its finally.
     os.execvpe(command[0], command, os.environ.copy())
     return 126
 
@@ -13126,7 +13161,15 @@ def run_validations(
     # (``process_launcher.worker_launch_env``) and its direct sandbox/broker tests;
     # ``cleanup_workspace`` still disposes any such root with the workspace.
     tmp_env_value = scratch_env_value
+    batch_short_tmp: Path | None = None
     try:
+        # NF-2026-01775: one short private TMPDIR for the whole batch, minted
+        # here so every command's Landlock child adopts the same tree.
+        batch_short_tmp = _mint_batch_short_tmpdir(
+            selected_backend, tmp_env_value, scratch_dir
+        )
+        if batch_short_tmp is not None:
+            tmp_env_value = str(batch_short_tmp)
         for command in rows:
             (
                 tokens,
@@ -13277,6 +13320,7 @@ def run_validations(
                     validation_semlock_dev_shm=_validation_needs_semlock_dev_shm(
                         workspace, command, selected_backend
                     ),
+                    validation_short_tmp=batch_short_tmp,
                 )
                 subprocess_cwd = "/"
                 execution_boundary = "os_sandbox"
@@ -13691,6 +13735,8 @@ def run_validations(
             raise ValidationRunError(reason, results)
         return results
     finally:
+        if batch_short_tmp is not None:
+            shutil.rmtree(batch_short_tmp, ignore_errors=True)
         cleanup_validation_exec_scratch(scratch_dir)
 
 
