@@ -1707,8 +1707,7 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
 # run at once.  Capping by runner identity instead means a configured cap is
 # not the cap that applies, and two cards that share a runner serialise even
 # when the machine has spare capacity.  ``resolve_workforce_cap`` reports the
-# effective cap from the configured value; ``workforce_admission`` admits a
-# launch by total running count and never by runner serialisation.
+# effective cap from the configured value.
 # ---------------------------------------------------------------------------
 WORKFORCE_SCHEMA_ID = "aiworkhub.workforce_capacity.v1"
 MAX_PROCESSES_ENV = "AIWORKHUB_MAX_PROCESSES"
@@ -1785,42 +1784,6 @@ def resolve_workforce_cap(env: Mapping[str, str] | None = None) -> dict[str, Any
         "source": "env",
         "raw_value": str(raw)[:64],
         "reason": reason,
-    }
-
-
-def workforce_admission(
-    *,
-    running_total: int,
-    runner: str = "",
-    env: Mapping[str, str] | None = None,
-) -> dict[str, Any]:
-    """Admit a worker launch by configured capacity, never by runner identity.
-
-    Two cards that share a runner are both admissible while the total running
-    worker count is below the authoritative ``AIWORKHUB_MAX_PROCESSES`` cap: a
-    launch is never rejected merely because another worker with the same runner
-    is already running.  ``effective_cap`` is reported so a caller sees the real
-    cap that applied.
-    """
-
-    resolved = resolve_workforce_cap(env)
-    effective = int(resolved["effective_cap"])
-    running = max(0, int(running_total))
-    admit = running < effective
-    return {
-        "schema_id": WORKFORCE_SCHEMA_ID,
-        "admit": bool(admit),
-        "effective_cap": effective,
-        "cap_source": resolved["source"],
-        "cap_reason": resolved["reason"],
-        "running_total": running,
-        "runner": str(runner or ""),
-        "serialised_by_runner": False,
-        "reason": (
-            "workforce_capacity_available"
-            if admit
-            else f"workforce_cap_reached:running={running}>=cap={effective}"
-        ),
     }
 
 
@@ -2120,5 +2083,4 @@ __all__ = [
     "resolve_workforce_cap",
     "route_observation_verdict",
     "validate_policy",
-    "workforce_admission",
 ]

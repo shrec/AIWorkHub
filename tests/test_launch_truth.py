@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from aiworkhub import process_launcher, quality_review, repo_policy, runtime_adapters
 
 
@@ -64,37 +66,76 @@ def test_configured_max_processes_is_the_effective_cap() -> None:
     )
 
 
-def test_two_cards_same_runner_not_serialised_when_capacity_allows() -> None:
-    env = {"AIWORKHUB_MAX_PROCESSES": "4"}
-    first = repo_policy.workforce_admission(
-        running_total=1, runner="claude_opus-5", env=env
+def _launcher(tmp_path: Path) -> process_launcher.ProcessManager:
+    return process_launcher.ProcessManager(
+        repo=tmp_path,
+        process_log_path=tmp_path / "processes.jsonl",
+        process_dir=tmp_path / "processes",
+        isolation_enabled=False,
     )
-    second = repo_policy.workforce_admission(
-        running_total=2, runner="claude_opus-5", env=env
-    )
-    assert first["admit"] is True
-    assert second["admit"] is True
-    # The cap that applied is reported, and it is not a per-runner cap of 1.
-    assert first["effective_cap"] == 4
-    assert first["serialised_by_runner"] is False
-    assert second["serialised_by_runner"] is False
 
 
-def test_configured_cap_admits_beyond_the_default_ceiling() -> None:
-    # Would be rejected under a fixed default of 4; the configured 8 is the cap.
-    verdict = repo_policy.workforce_admission(
-        running_total=5, runner="r", env={"AIWORKHUB_MAX_PROCESSES": "8"}
-    )
-    assert verdict["admit"] is True
-    assert verdict["effective_cap"] == 8
+def _launch(task_id: str, runner: str = "claude_opus-5") -> dict[str, str]:
+    # No ``provider/model`` prefix, so the provider limit never applies and only
+    # the workforce cap can refuse the reservation.
+    return {
+        "request_id": f"req-{task_id}",
+        "task_id": task_id,
+        "runner": runner,
+        "topic": "code",
+        "adapter_id": "deepseek_vscode_lm",
+    }
 
 
-def test_workforce_admission_rejects_only_at_the_configured_cap() -> None:
-    verdict = repo_policy.workforce_admission(
-        running_total=4, runner="r", env={"AIWORKHUB_MAX_PROCESSES": "4"}
-    )
-    assert verdict["admit"] is False
-    assert verdict["reason"].startswith("workforce_cap_reached")
+def _reserve(launcher: process_launcher.ProcessManager, task_id: str, **kw: str) -> None:
+    # The ``starting`` row outlives the block, so the slot stays held after it.
+    with launcher._launch_reservation(_launch(task_id, **kw)):
+        pass
+
+
+def test_two_cards_same_runner_not_serialised_when_capacity_allows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AIWORKHUB_MAX_PROCESSES", "4")
+    launcher = _launcher(tmp_path)
+    with launcher._launch_reservation(_launch("CARD_A")):
+        # The second card shares the first one's runner while it is live.
+        with launcher._launch_reservation(_launch("CARD_B")):
+            assert launcher._active_count() == 2
+    latest = launcher._latest_by_request()
+    for request_id in ("req-CARD_A", "req-CARD_B"):
+        assert latest[request_id]["state"] == "starting"
+        assert latest[request_id]["runner"] == "claude_opus-5"
+    assert process_launcher._configured_limit() == 4
+
+
+def test_configured_cap_admits_beyond_the_default_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The fifth and sixth launches would be refused under a fixed cap of 4.
+    monkeypatch.setenv("AIWORKHUB_MAX_PROCESSES", "8")
+    launcher = _launcher(tmp_path)
+    for index in range(6):
+        _reserve(launcher, f"CARD_{index}")
+    assert launcher._active_count() == 6
+
+
+def test_launcher_refuses_only_at_the_configured_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AIWORKHUB_MAX_PROCESSES", "3")
+    launcher = _launcher(tmp_path)
+    # The third same-runner card is admitted with two running: below the cap.
+    for index in range(3):
+        _reserve(launcher, f"CARD_{index}")
+    assert launcher._active_count() == 3
+    with pytest.raises(process_launcher.LaunchRejected, match="concurrency_limit_reached"):
+        _reserve(launcher, "CARD_OVER")
+    # A different runner is refused the same way: the refusal is the count.
+    with pytest.raises(process_launcher.LaunchRejected, match="concurrency_limit_reached"):
+        _reserve(launcher, "CARD_OTHER", runner="other_runner")
+    assert launcher._active_count() == 3
+    assert "req-CARD_OVER" not in launcher._latest_by_request()
 
 
 def test_unset_max_processes_falls_back_with_named_reason(monkeypatch) -> None:
