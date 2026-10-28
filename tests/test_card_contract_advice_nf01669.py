@@ -163,7 +163,7 @@ def mutable_index(tmp_path: Path) -> Path:
 # --- the module surface ------------------------------------------------------------------
 
 
-def test_module_exposes_exactly_one_public_function() -> None:
+def test_module_exposes_only_the_advice_and_apply_functions() -> None:
     public = [
         name
         for name, value in vars(card_contract_advice).items()
@@ -171,7 +171,7 @@ def test_module_exposes_exactly_one_public_function() -> None:
         and callable(value)
         and getattr(value, "__module__", None) == card_contract_advice.__name__
     ]
-    assert public == ["contract_advice"]
+    assert public == ["contract_advice", "preview_convert_applying_advice"]
 
 
 @pytest.mark.parametrize("plan", [None, [], "src/aiworkhub/x.py", 7])

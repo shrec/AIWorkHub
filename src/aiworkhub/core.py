@@ -13180,10 +13180,15 @@ def needfix_preview_convert(
     ``work_kind`` must declare (``bugfix``: reproduction, regression) and
     whether the previewed plan already satisfies them. ``contract_advice`` (only
     with a previewed plan) is the advisory Source Graph and ratchet report; it is
-    added after ``plan_digest`` is fixed and never changes it.
+    added after ``plan_digest`` is fixed and never changes it. ``apply_contract_advice``
+    in ``task_plan`` opts in to merging high-score tests before signing (NF-2026-01791).
     """
     ns = _needfix_store_module()
-    preview = ns.preview_convert(repo_root(), needfix_id, task_plan=task_plan)
+    from . import card_contract_advice
+
+    preview = card_contract_advice.preview_convert_applying_advice(
+        repo_root(), ns, needfix_id, task_plan
+    )
     if not isinstance(preview, dict):
         return preview
     digest = preview.get("plan_digest")
@@ -13196,8 +13201,6 @@ def needfix_preview_convert(
     if requirement is not None:
         preview["validation_roles_requirement"] = requirement
     if isinstance(previewed, Mapping) and previewed:
-        from . import card_contract_advice
-
         preview["contract_advice"] = card_contract_advice.contract_advice(repo_root(), previewed)
     return preview
 

@@ -12,6 +12,10 @@ result lists, so an unavailable check never reads as an all-clear. Nothing
 here raises. Keys that only matter when non-empty (``unavailable_paths``,
 ``not_expanded``, ``truncated_paths``, ``unreadable_paths``, ``omitted_*``)
 are left out when empty to keep the preview receipt small.
+
+The one exception is opt-in: :func:`preview_convert_applying_advice` merges the
+testmap suggestions scoring at least ``APPLY_ADVICE_SCORE_FLOOR`` into a
+previewed plan when that plan sets ``apply_contract_advice`` (NF-2026-01791).
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from . import source_graph
+from .quality_evidence import VALIDATION_ROLE_GENERIC, VALIDATION_ROLE_REGRESSION
 from .sdlc_attribution import is_test_path
 from .task_templates import split_command_argv
 
@@ -37,6 +42,12 @@ AIWORKHUB_PACKAGE_PREFIX = "src/aiworkhub/"
 TESTMAP_BUDGET = 40
 MAX_PRODUCTION_PATHS = 16
 MAX_SUGGESTED_TESTS = 10
+APPLY_CONTRACT_ADVICE_KEY = "apply_contract_advice"
+APPLY_CONTRACT_ADVICE_MODES = ("allowed_writes", "allowed_writes+validation")
+# Merging writes a card without a manager reading it, so only far stronger
+# evidence than RELATED_TEST_SCORE_FLOOR is applied automatically.
+APPLY_ADVICE_SCORE_FLOOR = 100
+APPLIED_VALIDATION_PREFIX = "python -m pytest -q -p no:cacheprovider"
 
 _FRESHNESS_REASONS = {
     "stale": "index_stale",
@@ -312,3 +323,85 @@ def _ratchet_part(repo_root: Path | str, allowed: Sequence[str]) -> dict[str, An
     }
     part.update({key: value for key, value in extras.items() if value})
     return part
+
+
+def preview_convert_applying_advice(
+    repo_root: Path | str,
+    store: Any,
+    needfix_id: str,
+    task_plan: Mapping[str, Any] | None,
+) -> Any:
+    """``store.preview_convert``, merging high-score testmap tests when the plan opts in.
+
+    Without ``apply_contract_advice`` this is exactly ``store.preview_convert``.
+    With it, the flag is stripped from a copy (the store refuses unknown keys),
+    the plan is previewed, every suggested test scoring at least
+    ``APPLY_ADVICE_SCORE_FLOOR`` is appended to ``allowed_writes`` (add-only,
+    order kept), ``allowed_writes+validation`` also appends one ``regression``
+    command naming them, and the merged plan is previewed again so
+    ``plan_digest`` signs it. An unknown mode is refused before any preview.
+    """
+    if not isinstance(task_plan, Mapping) or APPLY_CONTRACT_ADVICE_KEY not in task_plan:
+        return store.preview_convert(repo_root, needfix_id, task_plan=task_plan)
+    mode = task_plan[APPLY_CONTRACT_ADVICE_KEY]
+    if not isinstance(mode, str) or mode not in APPLY_CONTRACT_ADVICE_MODES:
+        return {
+            "needfix_id": needfix_id,
+            "convertible": False,
+            "refusal_reason": "apply_contract_advice_unknown_mode",
+            "allowed_apply_contract_advice": list(APPLY_CONTRACT_ADVICE_MODES),
+        }
+    plan = {key: value for key, value in task_plan.items() if key != APPLY_CONTRACT_ADVICE_KEY}
+    preview = store.preview_convert(repo_root, needfix_id, task_plan=plan)
+    previewed = preview.get("task_plan") if isinstance(preview, dict) else None
+    if not isinstance(previewed, Mapping) or not previewed:
+        return preview
+    merged, applied = _merged_advice(repo_root, previewed, mode)
+    if applied["added_allowed_writes"] or applied["added_validation"]:
+        preview = store.preview_convert(repo_root, needfix_id, task_plan={**plan, **merged})
+    if isinstance(preview, dict):
+        preview["contract_advice_applied"] = applied
+    return preview
+
+
+def _merged_advice(
+    repo_root: Path | str, previewed: Mapping[str, Any], mode: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Plan fields with the applied suggestions merged in, and the report of what was added."""
+    advice = contract_advice(repo_root, previewed)
+    testmap = advice.get("testmap") if isinstance(advice, Mapping) else None
+    entries: list[Any] = []
+    if isinstance(testmap, Mapping):
+        entries = _items(testmap.get("suggested_validation_tests"))
+    tests: list[str] = []
+    for entry in entries:
+        test = _normalize_path(entry.get("test")) if isinstance(entry, Mapping) else ""
+        score = entry.get("score") if isinstance(entry, Mapping) else None
+        if (
+            test
+            and not any(char.isspace() for char in test)
+            and not isinstance(score, bool)
+            and isinstance(score, (int, float))
+            and score >= APPLY_ADVICE_SCORE_FLOOR
+            and test not in tests
+        ):
+            tests.append(test)
+    allowed = _items(previewed.get("allowed_writes"))
+    covered = [path for path in map(_normalize_path, allowed) if path]
+    added_writes = [test for test in tests if not _covers(covered, test)]
+    merged: dict[str, Any] = {"allowed_writes": allowed + added_writes}
+    added_validation: list[str] = []
+    if mode == APPLY_CONTRACT_ADVICE_MODES[1] and tests:
+        commands = _items(previewed.get("validation"))
+        roles = _items(previewed.get("validation_roles")) or [
+            VALIDATION_ROLE_GENERIC for _ in commands
+        ]
+        added_validation = [f"{APPLIED_VALIDATION_PREFIX} {' '.join(tests)}"]
+        merged["validation"] = commands + added_validation
+        merged["validation_roles"] = roles + [VALIDATION_ROLE_REGRESSION]
+    applied = {
+        "score_floor": APPLY_ADVICE_SCORE_FLOOR,
+        "added_allowed_writes": added_writes,
+        "added_validation": added_validation,
+    }
+    return merged, applied
