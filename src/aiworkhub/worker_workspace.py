@@ -11458,7 +11458,8 @@ def _adopt_batch_short_tmpdir(raw: str) -> Path:
     short_tmp = Path(raw)
     if short_tmp.is_symlink() or not short_tmp.is_dir():
         raise WorkspaceError(f"landlock_short_tmp_not_directory:{raw}")
-    if os.name == "posix" and short_tmp.stat().st_mode & 0o077:
+    info = short_tmp.stat()
+    if not stat_owned_by_current_user(info) or directory_is_private_to_current_user(info) is False:
         raise WorkspaceError(f"landlock_short_tmp_not_private:{raw}")
     # A nested run_validations inside this child mints beneath this granted dir.
     for name in ("TMPDIR", "TMP", "TEMP", VALIDATION_SHORT_TMP_ROOT_ENV):

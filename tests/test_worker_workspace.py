@@ -6151,6 +6151,8 @@ def test_validation_env_isolates_mypy_cache_and_temp_to_request_scratch(
     scratch_dir = tmp_path / "scratch"
     scratch_dir.mkdir(mode=0o700)
     workspace = _landlock_run_harness(monkeypatch, tmp_path, scratch_dir)
+    # The scratch fits the sun_path budget, so no batch short TMPDIR is minted.
+    monkeypatch.setattr(worker_workspace, "_LANDLOCK_SUN_PATH_BUDGET", 4096)
 
     captured_env: dict[str, str] = {}
 

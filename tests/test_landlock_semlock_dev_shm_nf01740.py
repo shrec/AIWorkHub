@@ -678,9 +678,15 @@ def test_real_landlock_validation_runs_multiprocessing_pool(tmp_path: Path) -> N
     scratch = worker_workspace.provision_validation_exec_scratch(
         workspace, backend="landlock"
     )
+    short_tmp: Path | None = None
     try:
         long_tmp = scratch / ("t" * 90)
         long_tmp.mkdir(mode=0o700)
+        # NF-2026-01775: the parent mints the batch short TMPDIR its children adopt.
+        short_tmp = worker_workspace._mint_batch_short_tmpdir(
+            "landlock", str(long_tmp), scratch
+        )
+        assert short_tmp is not None
         env = os.environ.copy()
         for name in ("TMPDIR", "TMP", "TEMP"):
             env[name] = str(long_tmp)
@@ -693,6 +699,7 @@ def test_real_landlock_validation_runs_multiprocessing_pool(tmp_path: Path) -> N
                 backend="landlock",
                 validation_exec_scratch=scratch,
                 validation_semlock_dev_shm=grant,
+                validation_short_tmp=short_tmp,
             )
             assert ("--semlock-dev-shm" in argv) is grant
             return subprocess.run(
@@ -706,6 +713,8 @@ def test_real_landlock_validation_runs_multiprocessing_pool(tmp_path: Path) -> N
         assert "PermissionError" in denied.stderr, denied.stderr[-2000:]
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+        if short_tmp is not None:
+            shutil.rmtree(short_tmp, ignore_errors=True)
 
 
 class TestBareScriptChild:

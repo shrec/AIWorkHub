@@ -600,6 +600,8 @@ def test_run_validations_pins_request_local_scratch_root(
         return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
 
     monkeypatch.setattr(worker_workspace, "select_sandbox_backend", lambda: "landlock")
+    # The scratch fits the sun_path budget, so no batch short TMPDIR is minted.
+    monkeypatch.setattr(worker_workspace, "_LANDLOCK_SUN_PATH_BUDGET", 4096)
     monkeypatch.setattr(
         worker_workspace, "provision_validation_exec_scratch", lambda _ws, **_: scratch_dir
     )
