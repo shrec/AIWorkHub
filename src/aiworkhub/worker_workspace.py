@@ -2163,6 +2163,30 @@ def _npm_validation_support(repo: Path, commands: Iterable[str]) -> tuple[str, .
     return tuple(sorted(rows))
 
 
+def validation_commands_unwinnable_reason(
+    repo: Callable[[], Path], commands: Iterable[str]
+) -> tuple[str, str] | None:
+    """Return ``(command, reason)`` for the first command launch would refuse.
+
+    NF-2026-01786: reject/recover amendments are append-only, so a command the
+    launch contract refuses would brick the card.  This runs the launcher's own
+    ``_npm_validation_support`` check one command at a time so the refusal names
+    the offending command.  ``repo`` is resolved only when an ``npm --prefix``
+    gate is present; other commands never need a repository binding.
+    """
+    root: Path | None = None
+    for command in commands:
+        if not _npm_validation_prefixes((command,)):
+            continue
+        if root is None:
+            root = repo()
+        try:
+            _npm_validation_support(root, (command,))
+        except WorkspaceError as exc:
+            return command, str(exc)
+    return None
+
+
 # ---- local quoted-include dependency preflight (B664) -----------------------
 # The two Pitchfork-layout public-header roots: ``include/`` (separate header
 # placement, CMake's ``target_include_directories(<t> PUBLIC include)``) and

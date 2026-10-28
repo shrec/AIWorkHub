@@ -6457,6 +6457,10 @@ def _validate_validation_amendment_commands(commands: list[str]) -> dict[str, An
                 ],
             })
             return result
+    unwinnable = worker_workspace.validation_commands_unwinnable_reason(repo_root, commands)
+    if unwinnable is not None:  # NF-2026-01786: refuse before the append-only write
+        result = _lifecycle_error(f"validation_amendment_unwinnable:{unwinnable[1]}", 2)
+        return {**result, "validation_command": unwinnable[0][:240]}
     return None
 
 
