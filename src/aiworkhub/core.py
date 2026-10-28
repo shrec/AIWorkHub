@@ -3838,6 +3838,16 @@ def _allowed_write_path_error(item: str) -> dict[str, Any] | None:
         result = _lifecycle_error("allowed_write_is_directory", 2)
         result["allowed_write"] = item[:240]
         return result
+    # NF-2026-01766: launch resolves every allowed_writes entry as a concrete
+    # path against the development rules, so refuse here what it would refuse.
+    if (repo_root() / ".aiworkhub/config/development_rules.json").is_file():
+        from . import development_rules
+
+        reason = development_rules.concrete_path_refusal(item)
+        if reason is not None:
+            result = _lifecycle_error("allowed_write_refused_by_development_rules", 2)
+            result.update(allowed_write=item[:240], reason=reason)
+            return result
     return None
 
 

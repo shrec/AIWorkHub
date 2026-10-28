@@ -884,6 +884,15 @@ def _validate_resolve_path(value: object) -> str | None:
     return value
 
 
+def concrete_path_refusal(value: object) -> str | None:
+    """Stable reason code when ``resolve(path=value)`` would refuse it, else None."""
+    try:
+        _validate_resolve_path(value)
+    except ManifestValidationError as exc:
+        return exc.reason.value
+    return None
+
+
 def _reject_ambiguous_ties(winning_rules: tuple[DevelopmentRule, ...]) -> None:
     by_topic: dict[str, list[DevelopmentRule]] = {}
     for rule in winning_rules:
