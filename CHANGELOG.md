@@ -17,6 +17,8 @@ noted by package/extension version and release tag.
 - Dependency autolaunch never counts a bare claim as a launch: a launch callable that only claims is refused before it claims, a result that proves no worker started has its claim released back to pending, and an episode the dead-process reconciler blocked as `launch_never_started` is retryable through `aiworkhub_task_retry_terminal` (NF-2026-01777).
 - The audit ledger counts a line torn mid UTF-8 character as malformed instead of raising, so one torn line no longer fails the whole read (NF-2026-01691).
 - Windows AppContainer: every sandbox drive push holds a session-local named mutex until its pop, and reconcile keeps a dead lease whose drive another live launch still stands on, so one launcher's cleanup never unmaps a drive another launch is using (NF-2026-01715).
+- Dependency autolaunch launches a dependency-ready child through the real worker launcher the MCP server registers (claim plus spawn, under the card's runner and topic), instead of a bare claim that was always refused; with the launch gate closed nothing is claimed or spawned (NF-2026-01780).
+- The README naming-correction locator follows the correction to its new line, so the CAAS scan no longer flags the README (NF-2026-01781).
 
 ## [0.12.71] - 2026-10-28
 

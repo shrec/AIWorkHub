@@ -6,7 +6,7 @@
 
 ### Fixed
 
-- Bundled runtime 0.12.72: the WorkHub Mail JSON-depth quarantine test passes on Python 3.14 (NF-2026-01779); dependency autolaunch follows a superseded dependency to its live successor (NF-2026-01776) and never counts a bare claim as a launch, and a `launch_never_started` episode is retryable (NF-2026-01777); the audit ledger counts a torn UTF-8 line as malformed instead of raising (NF-2026-01691); a Windows sandbox drive another live launch still stands on is never unmapped by another launcher's cleanup (NF-2026-01715).
+- Bundled runtime 0.12.72: the WorkHub Mail JSON-depth quarantine test passes on Python 3.14 (NF-2026-01779); dependency autolaunch follows a superseded dependency to its live successor (NF-2026-01776) and never counts a bare claim as a launch, and a `launch_never_started` episode is retryable (NF-2026-01777); the audit ledger counts a torn UTF-8 line as malformed instead of raising (NF-2026-01691); a Windows sandbox drive another live launch still stands on is never unmapped by another launcher's cleanup (NF-2026-01715); a dependency-ready child is launched through the real worker launcher instead of a bare claim (NF-2026-01780).
 
 ## 0.12.71 — 2026-10-28
 
