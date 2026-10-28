@@ -2325,7 +2325,7 @@ def test_all_repository_neutral_analytics_are_bounded_and_canonical(tmp_path):
 
     analytic_modes = set(sg.SOURCE_GRAPH_MODES) - {
         "focus", "slice", "context", "file", "function", "class", "body", "bodygrep",
-        "impact", "trace", "deps", "bundle",
+        "impact", "trace", "deps", "bundle", "diff",
     }
     assert analytic_modes == {
         "tags", "hotspots", "coverage", "churn", "reviewqueue", "ownership",

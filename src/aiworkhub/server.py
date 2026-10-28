@@ -666,7 +666,8 @@ _lowlevel_server = getattr(mcp, "_mcp_server", None)
 if _lowlevel_server is not None:
     _lowlevel_server.version = __version__
 
-if _MCP_SDK_AVAILABLE:
+if _MCP_SDK_AVAILABLE and hasattr(mcp, "list_tools"):
+    # A minimal embedder without list_tools lists every tool it registered.
     # RM-2026-00078: registration keeps every tool the active profile can call;
     # tools/list publishes only the ones it lists. Filter both the FastMCP method
     # and the low-level handler FastMCP bound to it at construction.

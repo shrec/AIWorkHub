@@ -253,7 +253,7 @@ def test_stdlib_fallback_source_graph_schema_is_self_describing(fallback_server_
     schema = server_module._stdio_schema_for(func)
     assert schema["properties"]["mode"]["enum"] == [
         "focus", "slice", "context", "file", "function", "class", "body", "bodygrep",
-        "impact", "trace", "deps", "bundle",
+        "impact", "trace", "deps", "bundle", "diff",
         "tags", "hotspots", "coverage", "churn", "reviewqueue", "ownership",
         "testmap", "calls", "symbols", "bottlenecks", "auditmap", "complexity",
         "stats", "summarize", "pipeline",

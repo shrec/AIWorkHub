@@ -8,7 +8,7 @@ EXACT_TARGET_MODES = ("file", "function", "class", "body", "bodygrep", "deps")
 
 
 def test_source_graph_mode_count_is_canonical() -> None:
-    assert len(SOURCE_GRAPH_MODES) == 37
+    assert len(SOURCE_GRAPH_MODES) == 38
 
 
 def test_source_graph_documentation_covers_count_and_exact_target_modes() -> None:

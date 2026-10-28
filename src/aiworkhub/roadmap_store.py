@@ -600,9 +600,8 @@ def linked_task_outcomes(
     record (``purged:<status>``); with neither it is ``missing`` and has no
     outcome. One retired lookup covers every id without a live card.
     """
-    retired = retired_task_statuses(
-        repo_root, [task_id for task_id in task_ids if cards.get(task_id) is None]
-    )
+    missing = [task_id for task_id in task_ids if cards.get(task_id) is None]
+    retired = retired_task_statuses(repo_root, missing) if missing else {}
     resolved: list[tuple[str, str, str | None]] = []
     for task_id in task_ids:
         card = cards.get(task_id)

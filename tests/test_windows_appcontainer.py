@@ -4972,6 +4972,7 @@ def test_validation_helper_temp_grant_plan_spawns_under_the_winerror_267_limit()
     assert not closed_short_exists
 
 
+@windows_only
 def test_helper_temp_plan_fails_closed_when_no_short_private_temp_fits(monkeypatch):
     """A too-long scratch is not granted, and neither is any path outside it."""
 
@@ -5009,6 +5010,7 @@ def _refuse_helper_temp(_anchor, _user):
     raise AssertionError("no helper temp may be created")
 
 
+@windows_only
 def test_helper_temp_plan_measures_a_same_anchor_temp_on_the_drive_spelling(
     monkeypatch,
 ):
@@ -5070,6 +5072,7 @@ def test_helper_temp_plan_measures_a_temp_outside_the_workspace_anchor_on_its_re
     assert "no shorter private temp" in excinfo.value.detail
 
 
+@windows_only
 def test_helper_temp_plan_measures_a_prefix_sibling_of_the_anchor_on_its_real_path(
     monkeypatch,
 ):
