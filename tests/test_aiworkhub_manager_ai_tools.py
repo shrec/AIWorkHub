@@ -21,6 +21,7 @@ from aiworkhub import (  # noqa: E402
     core,
     feature_settings,
     manager_ai_tools,
+    manager_route_probe,
     server,
     shared_router,
     source_graph,
@@ -30,6 +31,14 @@ from aiworkhub import (  # noqa: E402
     worker_ai_tools_mcp as worker_tools,
 )
 from aiworkhub.worker_workspace import materialize_rework_overlay  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _codex_chat_process_ancestry(monkeypatch):
+    # RM-2026-00082: the Codex routes refuse a process whose ancestry contains
+    # Claude. These tests model a Codex chat, so the host's own ancestry (this
+    # suite may itself run under Claude Code) must not leak into them.
+    monkeypatch.setattr(manager_route_probe, "claude_ancestry_present", lambda: False)
 
 
 def test_windows_ancestor_chain_accepts_only_same_owner_bounded_path(monkeypatch):

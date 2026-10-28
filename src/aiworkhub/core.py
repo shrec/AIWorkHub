@@ -4,7 +4,6 @@ import fnmatch
 import hashlib
 import hmac
 import json
-import ntpath
 import os
 import re
 import sqlite3
@@ -28,6 +27,7 @@ from . import (
     coordinator_config,
     refresh_coordinator_config,
 )
+from . import manager_route_probe
 from . import platform_io
 from . import repository_state
 from . import runtime_generation
@@ -179,143 +179,29 @@ def _canonical_result(
     }
 
 
-# How many of THIS interpreter's own re-exec stubs may sit between the MCP
-# server and the Claude process that owns it. A Windows venv contributes exactly
-# one (Scripts\python.exe re-executes the base interpreter); the limit is two so
-# a launcher shim may add one more, and no further, before the chain is refused.
-_CLAUDE_LAUNCHER_HOP_LIMIT = 2
-
-# NF-2026-01005: the official Windows Python launcher. ``"command": "py"`` in a
-# ``.mcp.json`` keeps ``py.exe`` alive as the parent of the interpreter it
-# spawns, so it is a re-exec hop exactly like the venv redirector. Matched by
-# exact image name only, and it still counts against the hop limit.
-_WINDOWS_PYTHON_LAUNCHER_IMAGES = frozenset({"py.exe", "pyw.exe"})
-
-
 def _claude_manager_identity() -> dict[str, str] | None:
     """Verify that this MCP server is the direct child of an interactive
     Claude Code VS Code session bound to the same repository.
 
     The parent process and Claude's per-PID session descriptor are both
-    same-uid local runtime state. No credential is read or exposed.
+    same-uid local runtime state. No credential is read or exposed. The walk,
+    and the reason it refused, live in :mod:`manager_route_probe` (RM-2026-00082).
     """
     if os.name == "nt":
-        # Windows has no /proc: confirm the exact direct parent through a
+        # Windows has no /proc: confirm the owning Claude process through a
         # native Toolhelp snapshot plus process-token SIDs before trusting
         # Claude's per-PID session descriptor.
         return _claude_windows_manager_identity()
-    parent_pid = os.getppid()
-    try:
-        cmdline = Path(f"/proc/{parent_pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8")
-        descriptor_path = Path.home() / ".claude" / "sessions" / f"{parent_pid}.json"
-        descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(descriptor, dict) or "/claude " not in cmdline:
-        return None
-    return _claude_descriptor_identity(parent_pid, descriptor)
+    return manager_route_probe.probe_claude_route().identity
 
 
-def _claude_descriptor_identity(
-    parent_pid: int, descriptor: object
-) -> dict[str, str] | None:
-    """Validate a Claude per-PID session descriptor and bind it to this repo.
-
-    Shared by the POSIX ``/proc`` path and the Windows-native path so both
-    fail closed on the same malformed, foreign or stale descriptor evidence.
-    """
-    if not isinstance(descriptor, dict):
-        return None
-    if int(descriptor.get("pid") or -1) != parent_pid:
-        return None
-    if descriptor.get("kind") != "interactive" or descriptor.get("entrypoint") != "claude-vscode":
-        return None
-    session_id = str(descriptor.get("sessionId") or "").strip()
-    if not _UUID_RE.fullmatch(session_id):
-        return None
-    try:
-        descriptor_cwd = Path(str(descriptor.get("cwd") or "")).resolve()
-    except (OSError, RuntimeError):
-        return None
-    if descriptor_cwd != repo_root():
-        return None
-    return {
-        "provider": "claude",
-        "session_id": session_id,
-        "window_id": f"claude_vscode_{parent_pid}",
-    }
+_claude_descriptor_identity = manager_route_probe.claude_descriptor_identity
 
 
 def _claude_windows_manager_identity() -> dict[str, str] | None:
-    """Windows-native Claude Code VS Code manager verification.
-
-    There is no ``/proc`` on Windows. Confirm the owning Claude process through
-    a native Toolhelp snapshot (same-user SID at every hop and a live ``claude``
-    image name), then validate ``~/.claude/sessions/<pid>.json`` exactly like
-    the POSIX path. Missing, malformed, foreign, stale or unverifiable evidence
-    fails closed.
-
-    The chain is walked rather than read one level deep because a Windows venv
-    ``Scripts\\python.exe`` is a REDIRECTOR: it re-executes the base interpreter
-    as a separate process, so this server's direct parent is that stub and never
-    ``claude.exe``. Measured on this host: pid 2652 (the server) <- pid 38272
-    (the venv stub) <- pid 29612 (claude.exe, whose session descriptor validates
-    cleanly). POSIX has no such hop, because ``.venv/bin/python`` is a symlink
-    the loader follows in place -- which is why the same verification passed on
-    Linux and could never pass here, leaving Claude unable to hold the manager
-    seat on Windows at all.
-
-    The official Windows Python launcher is the other such hop (NF-2026-01005):
-    a ``.mcp.json`` with ``"command": "py", "args": ["-3", "-m", ...]`` makes
-    ``py.exe`` spawn ``python.exe`` as a CHILD and stay alive as its parent, so
-    the chain is claude.exe -> py.exe -> python.exe and the walk met ``py.exe``,
-    refused, and left the Claude chat without the manager seat.
-
-    Only a hop that is THIS interpreter's own image name or exactly ``py.exe``
-    / ``pyw.exe``, owned by the same user, is skipped, and at most
-    ``_CLAUDE_LAUNCHER_HOP_LIMIT`` of them: the evidence that grants the seat
-    is still one exact ``claude`` ancestor with a valid, repository-bound
-    descriptor.
-    """
-
-    parent_pid = os.getppid()
-    if parent_pid <= 1:
-        return None
-    current_sid = _windows_process_owner_sid(os.getpid())
-    if current_sid is None:
-        return None
-    tree = _windows_process_tree()
-    if tree is None:
-        return None
-    interpreter_image = ntpath.basename(sys.executable).lower()
-    candidate = parent_pid
-    owner_pid: int | None = None
-    for _hop in range(_CLAUDE_LAUNCHER_HOP_LIMIT + 1):
-        entry = tree.get(candidate)
-        if entry is None:
-            return None
-        candidate_parent, candidate_image = entry
-        if _windows_process_owner_sid(candidate) != current_sid:
-            return None
-        image = str(candidate_image or "").lower()
-        if not image:
-            return None
-        if "claude" in image:
-            owner_pid = candidate
-            break
-        if image != interpreter_image and image not in _WINDOWS_PYTHON_LAUNCHER_IMAGES:
-            # Not our own re-exec stub or the py launcher: this chain does not
-            # belong to Claude.
-            return None
-        candidate = candidate_parent
-    if owner_pid is None:
-        return None
-    try:
-        descriptor_path = Path.home() / ".claude" / "sessions" / f"{owner_pid}.json"
-        descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    return _claude_descriptor_identity(owner_pid, descriptor)
+    """Windows-native Claude Code VS Code manager verification: the bounded
+    same-user Toolhelp walk of :func:`manager_route_probe.probe_claude_windows_route`."""
+    return manager_route_probe.probe_claude_windows_route().identity
 
 
 def _codex_manager_identity() -> dict[str, str] | None:
@@ -420,6 +306,10 @@ def _codex_shared_repo_route_manager_identity() -> dict[str, str] | None:
     ]
     if len(matches) != 1:
         return None
+    # RM-2026-00082: the registry says which provider the WINDOW selected, not
+    # which chat owns this process. A Claude chat's MCP is never granted Codex.
+    if manager_route_probe.claude_ancestry_present():
+        return None
     record = matches[0]
     targets = record.get("targets", {})
     codex_target = targets.get("codex", {}) if isinstance(targets, dict) else {}
@@ -506,6 +396,8 @@ def _codex_extension_route_manager_identity() -> dict[str, str] | None:
         return None
     if str(route.get("window_id") or window_id).strip() != window_id:
         return None
+    if manager_route_probe.claude_ancestry_present():  # RM-2026-00082: a Claude chat is never Codex
+        return None
     return {
         "provider": "codex",
         "session_id": thread_id if _UUID_RE.fullmatch(thread_id) else session_id,
@@ -560,6 +452,8 @@ def _codex_vscode_env_manager_identity() -> dict[str, str] | None:
     route = codex_target.get("route", {}) if isinstance(codex_target, dict) else {}
     extension_host_pid = int(target.get("extension_host_pid") or 0)
     if extension_host_pid <= 1 or not _pid_in_same_uid_ancestor_chain(extension_host_pid, max_depth=12):
+        return None
+    if manager_route_probe.claude_ancestry_present():  # RM-2026-00082: a Claude chat is never Codex
         return None
     window_id = str(route.get("window_id") or target.get("window_id") or f"codex_vscode_{thread_id[:8]}")
     return {
@@ -3148,18 +3042,35 @@ def _bootstrap_task_health(root: Path, readiness: Any) -> dict[str, Any]:
 
 
 def _bootstrap_dispatcher(identity: Mapping[str, str] | None, provider: str) -> dict[str, Any]:
-    """Ensure the callback inbox on the Claude route from bootstrap itself, so
-    the CLI-route manager no longer types aiworkhub_dispatcher_ensure_started
-    (15 solo turns / 7.0M input tokens in the measured sample).  The codex
-    route is extension-owned and untouched."""
-    if not identity or provider != "claude":
-        return {
-            "ensured": False,
-            "status": "not_applicable",
-            "reason": "claude_route_only:extension_owns_codex_dispatch",
-        }
+    """Ensure the callback inbox for every callback-capable route from bootstrap
+    itself, so no manager types aiworkhub_dispatcher_ensure_started (15 solo
+    turns / 7.0M input tokens in the measured sample).  Claude and Codex run the
+    shared ensure; a verified Manager Chat seat rebinds and seeds its own lane
+    exactly like the Claude inbox does.  RM-2026-00082: the old "extension owns
+    Codex dispatch" skip left every non-Claude route without an inbox."""
+    session_id = str((identity or {}).get("session_id") or "").strip()
+    if not identity or provider not in ("claude", "codex", "manager_chat") or (
+        provider == "manager_chat" and not _MANAGER_CHAT_SESSION_RE.fullmatch(session_id)
+    ):
+        return {"ensured": False, "status": "not_applicable", "reason": "manager_route_unverified"}
     try:
-        result = dispatcher_ensure_started()
+        if provider != "manager_chat":
+            result = dispatcher_ensure_started()
+        else:
+            conn = _canonical_connect()
+            try:
+                result = {
+                    "ok": True, "status": "manager_inbox", "provider": provider,
+                    "dispatcher_started": False,
+                    "rebound_callback_count": callback_store.rebind_pending_callbacks(
+                        conn, provider=provider, origin_thread_id=session_id,
+                    ),
+                    "seeded_review_callback_count": callback_store.seed_missing_review_callbacks(
+                        conn, provider=provider, origin_thread_id=session_id,
+                    ),
+                }
+            finally:
+                conn.close()
     except Exception as exc:  # noqa: BLE001 -- bootstrap must remain available
         return {"ensured": False, "status": "error", "reason": f"{type(exc).__name__}:{exc}"[:200]}
     compact = {
@@ -3454,7 +3365,7 @@ def manager_bootstrap(
         deliver, delivery_reason = _contract_delivery_decision(
             session_id, known_contract_sha256, include_contract
         )
-        dispatcher = _bootstrap_dispatcher(identity, provider)
+        dispatcher: dict[str, Any] = {}  # ensured below, against the resolved route
     else:
         deliver, delivery_reason = True, "route_gate_call"
         dispatcher = {
@@ -3529,7 +3440,16 @@ def manager_bootstrap(
         reply["reason"] = ""
     if reply["runtime_generation"]["stale"]:
         reply["warning"] = reply["runtime_generation"]["warning"]
+    if reply["provider"] != "claude":
+        # RM-2026-00082: name the step that refused the Claude route, so a
+        # Claude chat resolved to another provider is diagnosable from here.
+        try:
+            reply["claude_route_probe"] = manager_route_probe.probe_claude_route().report()
+        except Exception as exc:  # noqa: BLE001 -- bootstrap must remain available
+            reply["claude_route_probe"] = {"reason": f"probe_failed:{type(exc).__name__}", "observations": {}}
     if bootstrap_call:
+        # The inbox follows the RESOLVED route: an open Manager Chat seat owns its wakes.
+        reply["dispatcher"] = _bootstrap_dispatcher(reply["manager_route"], reply["provider"])
         reply["callback_adoption"] = _adopt_callbacks_on_bootstrap(reply["manager_route"])
     return reply
 
