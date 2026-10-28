@@ -68,19 +68,46 @@ def test_split_docstring_missing_and_malformed():
     assert split_docstring(None) == ("", {})
 
 
+_READ = {"readOnlyHint": True, "openWorldHint": False}
+_DESTRUCTIVE = {
+    "readOnlyHint": False,
+    "destructiveHint": True,
+    "idempotentHint": False,
+    "openWorldHint": False,
+}
+_WRITE = {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False}
+
+
 def test_derive_annotations():
-    assert derive_annotations("read_tool", "READ-ONLY: foo") == {"readOnlyHint": True}
-    assert derive_annotations("x", "MANAGER READ: foo") == {"readOnlyHint": True}
-    assert derive_annotations("x", "READ: foo") == {"readOnlyHint": True}
-    assert derive_annotations("do_purge", "Delete.") == {
-        "readOnlyHint": False,
-        "destructiveHint": True,
+    assert derive_annotations("read_tool", "READ-ONLY: foo") == _READ
+    assert derive_annotations("x", "MANAGER READ: foo") == _READ
+    assert derive_annotations("x", "READ: foo") == _READ
+    assert derive_annotations("do_purge", "Delete.") == _DESTRUCTIVE
+    assert derive_annotations("x", "DESTRUCTIVE: foo") == _DESTRUCTIVE
+    assert derive_annotations("plain", "Hello.") == _WRITE
+    assert derive_annotations("", "") == _WRITE
+
+
+def test_derive_annotations_name_rules():
+    assert derive_annotations("needfix_show", "Show one.") == _READ
+    assert derive_annotations("aiworkhub_task_auto_pickup_dryrun", "Preview.") == _READ
+    assert derive_annotations("aiworkhub_cli_adapter_plan_readonly", "Plan.") == _READ
+    assert derive_annotations("aiworkhub_claude_callback_ack", "WRITE: ack.") == _WRITE
+    assert derive_annotations("aiworkhub_task_queue_request", "Append.") == _WRITE
+    assert derive_annotations("needfix_update", "Update.") == {**_WRITE, "idempotentHint": True}
+    assert derive_annotations("aiworkhub_dispatcher_ensure_started", "Start.") == {
+        **_WRITE,
+        "idempotentHint": True,
     }
-    assert derive_annotations("x", "DESTRUCTIVE: foo") == {
-        "readOnlyHint": False,
-        "destructiveHint": True,
+    # A docstring prefix beats the name rule in both directions.
+    assert derive_annotations("x_purge", "READ-ONLY: preview a purge.") == _READ
+    assert derive_annotations("x_list", "DESTRUCTIVE: drop the list.") == _DESTRUCTIVE
+    assert derive_annotations("aiworkhub_manager_hub_mail_send", "Send.") == {
+        **_WRITE,
+        "openWorldHint": True,
     }
-    assert derive_annotations("plain", "Hello.") is None
+    assert derive_annotations("aiworkhub_manager_hub_mail_pair_begin", "Pair.")["openWorldHint"] is True
+    assert derive_annotations("aiworkhub_manager_hub_mail_listener", "Listen.")["openWorldHint"] is True
 
 
 # --- (b) fresh FastMCP publishes descriptions and annotations ----------------
@@ -122,12 +149,11 @@ def test_fresh_fastmcp_publishes_metadata():
     )
     assert "Args:" not in read.description
     assert "search the index" in read.description
-    assert read.annotations.readOnlyHint is True
+    assert read.annotations.model_dump(exclude_none=True) == _READ
 
     purge = tools["do_purge"]
     assert purge.inputSchema["properties"]["target"]["description"] == "what to delete"
-    assert purge.annotations.readOnlyHint is False
-    assert purge.annotations.destructiveHint is True
+    assert purge.annotations.model_dump(exclude_none=True) == _DESTRUCTIVE
 
 
 # --- (c) explicit Field description beats Args text --------------------------
@@ -190,6 +216,32 @@ def test_server_tools_publish_args_free_descriptions_and_match_sdk():
         tools["aiworkhub_task_create"].inputSchema
         == direct_tools["aiworkhub_task_create"].inputSchema
     )
+
+
+def test_every_server_tool_publishes_annotations_with_read_only_hint():
+    pytest.importorskip("mcp")
+    from aiworkhub import server
+
+    tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
+    assert tools, "no tools registered"
+    missing = sorted(
+        name
+        for name, tool in tools.items()
+        if tool.annotations is None or tool.annotations.readOnlyHint is None
+    )
+    assert not missing, missing[:10]
+
+    def hints(name):
+        return tools[name].annotations.model_dump(exclude_none=True)
+
+    assert hints("needfix_show")["readOnlyHint"] is True
+    assert hints("roadmap_list")["readOnlyHint"] is True
+    assert hints("needfix_purge") == _DESTRUCTIVE
+    create = hints("aiworkhub_task_create")
+    assert create["readOnlyHint"] is False and create["destructiveHint"] is False
+    assert hints("aiworkhub_claude_callback_ack")["readOnlyHint"] is False
+    assert hints("aiworkhub_manager_hub_mail_send")["openWorldHint"] is True
+    assert hints("aiworkhub_task_list")["openWorldHint"] is False
 
 
 def test_string_annotation_registers_without_forward_ref_error():

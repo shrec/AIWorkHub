@@ -115,18 +115,61 @@ def split_docstring(doc: str | None) -> tuple[str, dict[str, str]]:
     return "\n".join(kept).rstrip(), params
 
 
-def derive_annotations(tool_name: str, description: str) -> dict[str, Any] | None:
-    """Derive MCP ``ToolAnnotations`` hints from a tool name and description."""
+_READ_ONLY_PREFIXES = ("READ-ONLY", "MANAGER READ", "READ:")
+_DESTRUCTIVE_TOKENS = ("_purge", "_delete", "_discard")
+
+# Last name segment of a tool that only reads state when no docstring prefix decides.
+_READ_VERBS = frozenset({
+    "list", "show", "get", "search", "status", "health", "count", "events", "snapshot",
+    "preview", "readonly", "query", "inspect", "report", "related", "range", "catalog",
+    "rank", "profile", "packet", "summary", "usage", "ledger", "queue", "diagnose", "read",
+    "evaluate", "describe", "dryrun", "check", "bench", "current", "inbox", "peers",
+    "recommend", "metrics", "eval", "gate", "scan", "guard", "wait", "digest",
+})
+
+# Trailing name segment(s) of a state-changing tool that converges on the same state
+# when repeated with the same arguments (create-or-update, start-if-stopped, set-to-value).
+_IDEMPOTENT_SUFFIXES = (
+    "upsert", "ensure", "ensure_started", "stop", "set", "update", "rename", "restore",
+    "archive", "link",
+)
+
+# Only WorkHub Mail reaches another machine (paired LAN peers).
+_OPEN_WORLD_TOKENS = ("hub_mail_send", "hub_mail_pair_", "hub_mail_listener")
+
+
+def derive_annotations(tool_name: str, description: str) -> dict[str, Any]:
+    """Derive MCP ``ToolAnnotations`` hints from a tool name and description.
+
+    Always returns a full hint dict with ``readOnlyHint`` set. A READ-ONLY /
+    MANAGER READ / READ: first line wins over the name; then a DESTRUCTIVE first
+    line or a ``_purge``/``_delete``/``_discard`` name; then a read verb as the
+    last name segment (or ``_readonly`` in the name). Anything else, including
+    an unknown name, is a non-destructive write.
+    """
     name = tool_name if isinstance(tool_name, str) else ""
     desc = description if isinstance(description, str) else ""
     first_line = desc.split("\n", 1)[0].strip() if desc else ""
-    if first_line.startswith(("READ-ONLY", "MANAGER READ", "READ:")):
-        return {"readOnlyHint": True}
-    if first_line.startswith("DESTRUCTIVE") or any(
-        token in name for token in ("_purge", "_delete", "_discard")
-    ):
-        return {"readOnlyHint": False, "destructiveHint": True}
-    return None
+    open_world = any(token in name for token in _OPEN_WORLD_TOKENS)
+    if first_line.startswith(_READ_ONLY_PREFIXES):
+        return {"readOnlyHint": True, "openWorldHint": open_world}
+    if first_line.startswith("DESTRUCTIVE") or any(token in name for token in _DESTRUCTIVE_TOKENS):
+        return {
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": False,
+            "openWorldHint": open_world,
+        }
+    if name and (name.rsplit("_", 1)[-1] in _READ_VERBS or "_readonly" in name):
+        return {"readOnlyHint": True, "openWorldHint": open_world}
+    hints: dict[str, Any] = {
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "openWorldHint": open_world,
+    }
+    if name and any(name == suffix or name.endswith("_" + suffix) for suffix in _IDEMPOTENT_SUFFIXES):
+        hints["idempotentHint"] = True
+    return hints
 
 
 def _has_field_description(annotation: Any) -> bool:

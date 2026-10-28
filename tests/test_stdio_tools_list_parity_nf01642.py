@@ -219,25 +219,32 @@ def test_no_description_is_a_truncated_prefix_of_its_docstring(
     assert multi_line
 
 
-def test_annotations_come_from_the_shared_derivation_and_are_omitted_when_empty(
+def test_every_fallback_tool_publishes_the_shared_derived_annotations(
     fallback_tools: dict,
 ) -> None:
-    mismatched = []
-    for name, entry in fallback_tools.items():
-        expected = derive_annotations(name, entry["description"])
-        if entry.get("annotations") != expected or ("annotations" in entry) != (expected is not None):
-            mismatched.append(name)
+    mismatched = [
+        name for name, entry in fallback_tools.items()
+        if "annotations" not in entry
+        or entry["annotations"] != derive_annotations(name, entry["description"])
+        or not isinstance(entry["annotations"].get("readOnlyHint"), bool)
+    ]
     assert not mismatched, mismatched[:10]
-    assert [name for name, entry in fallback_tools.items() if entry.get("annotations") == {"readOnlyHint": True}]
-    assert [name for name, entry in fallback_tools.items() if "annotations" not in entry]
+    assert [name for name, entry in fallback_tools.items() if entry["annotations"]["readOnlyHint"]]
+    assert [name for name, entry in fallback_tools.items() if not entry["annotations"]["readOnlyHint"]]
 
 
 def test_annotation_shapes_for_read_only_destructive_and_plain_tools(stdlib_payload: dict) -> None:
     synthetic = {entry["name"]: entry for entry in stdlib_payload["synthetic"]}
-    assert synthetic["read_only_sample"]["annotations"] == {"readOnlyHint": True}
-    assert synthetic["sample_purge"]["annotations"] == {"readOnlyHint": False, "destructiveHint": True}
-    assert "annotations" not in synthetic["plain_sample"]
-    assert "annotations" not in synthetic["sample"]
+    write = {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False}
+    assert synthetic["read_only_sample"]["annotations"] == {"readOnlyHint": True, "openWorldHint": False}
+    assert synthetic["sample_purge"]["annotations"] == {
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+    assert synthetic["plain_sample"]["annotations"] == write
+    assert synthetic["sample"]["annotations"] == write
 
 
 def test_docstring_args_entries_become_parameter_descriptions(

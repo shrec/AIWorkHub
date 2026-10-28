@@ -68,9 +68,16 @@ def test_every_published_dashboard_tool_has_tdqs_complete_docstring() -> None:
                 f"purge tool {name} must start with 'DESTRUCTIVE:', got: {first_line!r}"
             )
             annotations = derive_annotations(name, doc)
-            assert annotations == {"readOnlyHint": False, "destructiveHint": True}
+            assert annotations == {
+                "readOnlyHint": False,
+                "destructiveHint": True,
+                "idempotentHint": False,
+                "openWorldHint": False,
+            }
         elif first_line.startswith("READ-ONLY:"):
-            assert derive_annotations(name, doc) == {"readOnlyHint": True}
+            assert derive_annotations(name, doc) == {"readOnlyHint": True, "openWorldHint": False}
+        else:
+            assert derive_annotations(name, doc)["readOnlyHint"] is False
 
         cleaned, parsed_args = split_docstring(doc)
         assert "Args:" not in cleaned, f"{name} cleaned description still contains Args:"
