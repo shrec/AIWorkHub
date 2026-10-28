@@ -318,9 +318,12 @@ def test_replay_is_idempotent_and_a_conflicting_disposition_is_refused(
     assert replay["ok"] is True and replay["idempotent"] is True
     assert replay["receipt_sha256"] == first["receipt_sha256"]
 
-    conflict = _dispose(driver, receipt, disposition="confirmed")
+    # NF-2026-01682: a different second disposition is a re-disposition, and
+    # without a reason it is still refused.
+    conflict = _dispose(driver, receipt, disposition="confirmed", reason="  ")
     assert conflict["ok"] is False
     assert conflict["error"] == "review_finding_disposition_conflict"
+    assert conflict["detail"] == "redisposition_reason_required"
 
     stored = driver.review_finding_dispositions(
         task_id="TARGET", request_id="target-request"

@@ -4154,6 +4154,18 @@ def dispose_review_finding(
         card = _parse_card(self._show_task(task_id), task_id)
     except Exception as exc:  # noqa: BLE001 -- an unreadable target binds nothing
         return {"ok": False, "error": f"task_lookup_failed:{exc}"[:300]}
+    # An accepted target's outcome is sealed in its accepted_outcome_receipt;
+    # a disposition recorded afterwards could only contradict it
+    # (NF-2026-01682). Same finished predicate as the task lifecycle.
+    if isinstance(card, dict) and core._lifecycle_state(card) == "finished":
+        return {
+            "ok": False,
+            "error": "review_finding_disposition_frozen_after_accept",
+            "detail": {
+                "task_status": str(card.get("status") or ""),
+                "worker_status": str(card.get("worker_status") or ""),
+            },
+        }
     bound = next(
         (
             row

@@ -6280,9 +6280,10 @@ def aiworkhub_manager_review_finding_dispose(
 
     ``dismissed`` needs non-empty ``counter_evidence`` and lifts only that
     LOW/MEDIUM finding's ``refinement_required`` blocker at accept; a
-    high/critical finding cannot be disposed. The receipt is append-only and
-    bound server-side to the verified reviewer receipt and the candidate
-    digest. It never edits the reviewer report and never accepts the target.
+    high/critical finding cannot be disposed. A replay is idempotent; changing
+    a disposition needs a ``reason`` and keeps the prior receipt in history.
+    Frozen once the target is accepted. Bound server-side to the reviewer
+    receipt and candidate digest; never edits the report or accepts the target.
 
     Args:
         task_id: Id of the target task card whose reviewer finding is being disposed.
@@ -6291,7 +6292,7 @@ def aiworkhub_manager_review_finding_dispose(
         finding_id: Id of the reviewer finding to dispose, e.g. reviewer:<lens>:<id>.
         disposition: confirmed keeps the finding as a real defect; dismissed rejects it, needs counter_evidence, and lifts only a LOW/MEDIUM finding's refinement_required blocker at accept.
         counter_evidence: Evidence that the finding is wrong; must be non-empty when disposition is dismissed.
-        reason: Optional free-text reason recorded with the audited disposition.
+        reason: Free-text reason recorded with the disposition; required to change an existing disposition.
     """
 
     return process_launcher.default_manager().dispose_review_finding(

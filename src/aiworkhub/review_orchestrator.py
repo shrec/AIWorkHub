@@ -1128,10 +1128,15 @@ MANAGER_HOLD_DECISION_TABLE = (
     "UNIQUE (chain_id,lens,attempt_index))"
 )
 
-# NF-2026-01170: one manager disposition per (request, reviewer request,
-# finding). Append-only: a row is inserted once and never updated, and its
-# receipt is bound to the candidate digest and the verified reviewer receipt
-# digest so a disposition can never travel to other bytes or another report.
+# NF-2026-01170: one CURRENT manager disposition per (request, reviewer
+# request, finding), bound to the candidate digest and the verified reviewer
+# receipt digest so a disposition can never travel to other bytes or another
+# report. NF-2026-01682: a manager may re-dispose it (confirmed <-> dismissed)
+# with a non-empty reason; the row is then updated in place to the new receipt,
+# which names ``prior_disposition`` and ``supersedes_receipt_sha256``, and the
+# superseded row is first copied verbatim into the append-only history table
+# below in the same transaction. Readers of the current table therefore always
+# see exactly one row, the latest, per finding.
 FINDING_DISPOSITION_SCHEMA = "aiworkhub.review_finding_disposition.v1"
 FINDING_DISPOSITION_TABLE = (
     "CREATE TABLE IF NOT EXISTS review_orchestrator_finding_dispositions ("
@@ -1141,6 +1146,35 @@ FINDING_DISPOSITION_TABLE = (
     "candidate_sha256 TEXT NOT NULL, reviewer_receipt_sha256 TEXT NOT NULL, "
     "actor TEXT NOT NULL, decided_at TEXT NOT NULL, receipt_json TEXT NOT NULL, "
     "UNIQUE (target_request_id,reviewer_request_id,finding_id))"
+)
+_FINDING_DISPOSITION_COLUMNS = (
+    "receipt_sha256,target_task_id,target_request_id,reviewer_request_id,"
+    "finding_id,disposition,candidate_sha256,reviewer_receipt_sha256,"
+    "actor,decided_at,receipt_json"
+)
+# Every receipt a re-disposition superseded, copied verbatim with the receipt
+# that superseded it. Append-only: the triggers refuse any UPDATE or DELETE.
+FINDING_DISPOSITION_HISTORY_TABLE = (
+    "CREATE TABLE IF NOT EXISTS review_orchestrator_finding_disposition_history ("
+    "history_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+    "receipt_sha256 TEXT NOT NULL, target_task_id TEXT NOT NULL, "
+    "target_request_id TEXT NOT NULL, reviewer_request_id TEXT NOT NULL, "
+    "finding_id TEXT NOT NULL, disposition TEXT NOT NULL, "
+    "candidate_sha256 TEXT NOT NULL, reviewer_receipt_sha256 TEXT NOT NULL, "
+    "actor TEXT NOT NULL, decided_at TEXT NOT NULL, receipt_json TEXT NOT NULL, "
+    "superseded_by_receipt_sha256 TEXT NOT NULL)"
+)
+FINDING_DISPOSITION_HISTORY_GUARDS = tuple(
+    "CREATE TRIGGER IF NOT EXISTS "
+    f"review_orchestrator_finding_disposition_history_no_{verb.lower()} "
+    f"BEFORE {verb} ON review_orchestrator_finding_disposition_history "
+    "BEGIN SELECT RAISE(ABORT, 'finding disposition history is append-only'); END"
+    for verb in ("UPDATE", "DELETE")
+)
+# A replay differs from its stored receipt only in when it was asked, and a
+# stored re-disposition additionally names what it superseded.
+_FINDING_DISPOSITION_REPLAY_KEYS_IGNORED = frozenset(
+    {"decided_at", "prior_disposition", "supersedes_receipt_sha256"}
 )
 FINDING_DISPOSITIONS = frozenset({"confirmed", "dismissed"})
 MAX_FINDING_DISPOSITION_TEXT = 4000
@@ -2768,9 +2802,14 @@ class ReviewOrchestrator:
 
         ``reviewer_receipt`` and ``candidate_sha256`` are derived server-side by
         the caller from the verified reviewer receipt and the target's sealed
-        terminal evidence -- never from manager arguments. The receipt is
-        append-only: an identical replay returns the stored receipt and a
-        different second disposition for the same finding is refused. Nothing
+        terminal evidence -- never from manager arguments. An identical replay
+        returns the stored receipt. A second disposition whose receipt differs is
+        a re-disposition (NF-2026-01682): it passes every gate above unchanged,
+        additionally needs a non-empty ``reason`` (otherwise
+        ``review_finding_disposition_conflict``), and in one BEGIN IMMEDIATE
+        transaction copies the superseded row verbatim into the append-only
+        history table, then updates the current row to the new receipt, which
+        names ``prior_disposition`` and ``supersedes_receipt_sha256``. Nothing
         here accepts a candidate or edits a reviewer report.
         """
         if disposition not in FINDING_DISPOSITIONS:
@@ -2873,7 +2912,16 @@ class ReviewOrchestrator:
             "decided_at": (now or datetime.now(timezone.utc)).isoformat(),
         }
         receipt_sha256 = canonical_digest(receipt)
-        existing = None
+
+        def _comparable(value: Mapping[str, Any]) -> dict[str, Any]:
+            return {
+                key: item
+                for key, item in value.items()
+                if key not in _FINDING_DISPOSITION_REPLAY_KEYS_IGNORED
+            }
+
+        refusal: dict[str, Any] | None = None
+        replayed: tuple[dict[str, Any], str] | None = None
         try:
             with closing(_side_table_connection(self.db_path)) as conn, conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -2900,29 +2948,77 @@ class ReviewOrchestrator:
                             json.dumps(receipt, ensure_ascii=False, sort_keys=True),
                         ),
                     )
+                else:
+                    prior_sha256 = str(existing[1])
+                    try:
+                        stored = json.loads(str(existing[0]))
+                    except ValueError:
+                        stored = None
+                    if isinstance(stored, dict) and _comparable(stored) == _comparable(
+                        receipt
+                    ):
+                        replayed = (stored, prior_sha256)
+                    elif not isinstance(stored, dict) or not reason.strip():
+                        # Never supersede a receipt nobody can read, and never
+                        # without saying why (NF-2026-01682).
+                        refusal = {
+                            "ok": False,
+                            "error": "review_finding_disposition_conflict",
+                            "receipt_sha256": prior_sha256,
+                            "detail": (
+                                "redisposition_reason_required"
+                                if isinstance(stored, dict)
+                                else "stored_receipt_unreadable"
+                            ),
+                        }
+                    else:
+                        receipt = {
+                            **receipt,
+                            "prior_disposition": str(stored.get("disposition") or ""),
+                            "supersedes_receipt_sha256": prior_sha256,
+                        }
+                        receipt_sha256 = canonical_digest(receipt)
+                        conn.execute(FINDING_DISPOSITION_HISTORY_TABLE)
+                        for guard in FINDING_DISPOSITION_HISTORY_GUARDS:
+                            conn.execute(guard)
+                        copied = conn.execute(
+                            "INSERT INTO review_orchestrator_finding_disposition_history "
+                            f"({_FINDING_DISPOSITION_COLUMNS},superseded_by_receipt_sha256) "
+                            f"SELECT {_FINDING_DISPOSITION_COLUMNS},? "
+                            "FROM review_orchestrator_finding_dispositions "
+                            "WHERE receipt_sha256=?",
+                            (receipt_sha256, prior_sha256),
+                        ).rowcount
+                        updated = conn.execute(
+                            "UPDATE review_orchestrator_finding_dispositions SET "
+                            "receipt_sha256=?,target_task_id=?,disposition=?,"
+                            "candidate_sha256=?,reviewer_receipt_sha256=?,actor=?,"
+                            "decided_at=?,receipt_json=? WHERE receipt_sha256=?",
+                            (
+                                receipt_sha256, str(task_id), disposition,
+                                str(candidate_sha256), receipt["reviewer_receipt_sha256"],
+                                actor, receipt["decided_at"],
+                                json.dumps(receipt, ensure_ascii=False, sort_keys=True),
+                                prior_sha256,
+                            ),
+                        ).rowcount
+                        if copied != 1 or updated != 1:
+                            # Raising rolls both back: a current row never
+                            # changes without its superseded history row.
+                            raise sqlite3.IntegrityError(
+                                "review_finding_disposition_supersede_incomplete"
+                            )
         except sqlite3.Error as exc:
             return {"ok": False, "error": str(exc)[:300]}
-        if existing is not None:
-            try:
-                stored = json.loads(str(existing[0]))
-            except ValueError:
-                stored = None
-
-            def _comparable(value: Mapping[str, Any]) -> dict[str, Any]:
-                return {key: item for key, item in value.items() if key != "decided_at"}
-
-            if not isinstance(stored, dict) or _comparable(stored) != _comparable(receipt):
-                return {
-                    "ok": False,
-                    "error": "review_finding_disposition_conflict",
-                    "receipt_sha256": str(existing[1]),
-                }
+        if refusal is not None:
+            return refusal
+        if replayed is not None:
             return {
                 "ok": True,
                 "idempotent": True,
                 "state": "review_finding_disposition_recorded",
-                **stored,
-                "receipt_sha256": str(existing[1]),
+                **replayed[0],
+                "receipt_sha256": replayed[1],
             }
         return {
             "ok": True,
