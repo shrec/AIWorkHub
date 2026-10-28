@@ -452,6 +452,29 @@ def _structured_field(sources: tuple[Any, ...], key: str) -> str:
     return ""
 
 
+_REVIEWER_CANCELLED_STATES = frozenset({"cancelled", "canceled"})
+
+
+def _reviewer_route_retry_barred(state: str, card: Mapping[str, Any]) -> bool:
+    """Whether a terminal reviewer may NOT take a distinct route (NF-2026-01772).
+
+    A manager/operator cancel is final, and a reviewer whose card carries a
+    ``quality_review_submit`` receipt has already reported: relaunching either
+    buys a second reviewer nobody asked for. Presence of the receipt alone
+    bars it -- the accept fold, not this gate, decides whether it verifies.
+    """
+    states = {
+        state,
+        str(card.get("terminal_substatus") or "").strip().lower(),
+        str(card.get("worker_status") or "").strip().lower(),
+    }
+    if states & _REVIEWER_CANCELLED_STATES:
+        return True
+    terminal = card.get("terminal_review")
+    evidence = terminal.get("evidence") if isinstance(terminal, Mapping) else None
+    return isinstance(evidence, Mapping) and evidence.get("quality_review_receipt") is not None
+
+
 def reviewer_terminal_disposition(status: Any) -> dict[str, Any]:
     """Canonical typed disposition for one terminal reviewer/worker status.
 
@@ -500,13 +523,18 @@ def reviewer_terminal_disposition(status: Any) -> dict[str, Any]:
     # past a wrapper like ``worker_failed:``, names the ADAPTER as the route
     # failure -- not the candidate or the manager -- so it gets route_retry
     # on a distinct route instead of a manager_judgment_unknown hold.
-    behaviour_code = terminal_failure_classification.reviewer_route_behaviour_code(
-        reason
-    )
-    if behaviour_code:
-        return terminal_failure_classification.reviewer_route_retry_disposition(
-            behaviour_code, terminal_state=state,
+    # NF-2026-01772: so does a transport/host code (``vscode_lm_request_cancelled``
+    # and its family) -- unless the manager cancelled the reviewer or it already
+    # submitted, either of which leaves nothing for another route to do.
+    if not _reviewer_route_retry_barred(state, card):
+        behaviour_code = (
+            terminal_failure_classification.reviewer_route_behaviour_code(reason)
+            or terminal_failure_classification.reviewer_route_transport_code(reason)
         )
+        if behaviour_code:
+            return terminal_failure_classification.reviewer_route_retry_disposition(
+                behaviour_code, terminal_state=state,
+            )
     return terminal_failure_classification.failure_disposition_from_substatus(
         terminal_substatus=state,
         sealed_diagnostics=sealed,

@@ -3368,6 +3368,21 @@ def reviewer_route_behaviour_code(reason: Any) -> str:
     return ""
 
 
+def reviewer_route_transport_code(reason: Any) -> str:
+    """The vscode_lm transport/host code owning one reviewer's own reason, or ``""``.
+
+    NF-2026-01772: only the closed ``_VSCODE_LM_TRANSPORT_CODES`` vocabulary can
+    select this. It is read on the REVIEWER path alone -- an implementation
+    worker's transport code keeps its unplaced classification exactly -- and the
+    caller decides whether the attempt may take a distinct route at all.
+    """
+    for token in str(reason or "").strip().split(":"):
+        token = token.strip()
+        if token in _VSCODE_LM_TRANSPORT_CODES:
+            return token
+    return ""
+
+
 def reviewer_route_retry_disposition(
     code: str, *, terminal_state: str | None = None,
 ) -> dict[str, Any]:
