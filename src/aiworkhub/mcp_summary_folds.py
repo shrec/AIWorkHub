@@ -118,6 +118,39 @@ def _fold_blob_generic(value: Any) -> Any:
     return folded
 
 
+# Scalar members a folded Source Graph health block keeps exact, so a manager
+# polling health/refresh_now still reads index_quality.degraded,
+# integrity.status and recommendation_resolvability.status without the body.
+_SOURCE_GRAPH_HEALTH_KEPT_MEMBERS = ("status", "state", "degraded", "ok")
+
+
+def fold_source_graph_health_summary(payload: Any) -> Any:
+    """Project a Source Graph health/refresh_now payload to its top-level facts.
+
+    Top-level scalars stay exact; every other top-level value folds to
+    ``{summarized, bytes, sha256}``, and a folded dict also keeps its own scalar
+    status/state/degraded/ok members and its ``degraded_reasons`` list.
+    """
+
+    if not isinstance(payload, dict):
+        return payload
+    result: dict[str, Any] = {}
+    for key, value in payload.items():
+        if value is None or isinstance(value, (str, int, float, bool)):
+            result[key] = value
+            continue
+        folded = _fold_to_identity(value)
+        if isinstance(value, dict):
+            for member in _SOURCE_GRAPH_HEALTH_KEPT_MEMBERS:
+                kept = value.get(member)
+                if member in value and (kept is None or isinstance(kept, (str, int, float, bool))):
+                    folded[member] = kept
+            if isinstance(value.get("degraded_reasons"), list):
+                folded["degraded_reasons"] = value["degraded_reasons"]
+        result[key] = folded
+    return result
+
+
 def fold_terminal_review_evidence_residual(card: Any) -> Any:
     """Fold every ``terminal_review.evidence`` sub-key CARD_EVIDENCE_PATHS doesn't list."""
 

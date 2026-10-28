@@ -984,6 +984,8 @@ def test_invalid_detail_is_refused_on_all_four_tools(monkeypatch) -> None:
         lambda: server.aiworkhub_agent_task_status("X", detail="bogus"),
         lambda: server.aiworkhub_environment_preflight(detail="bogus"),
         lambda: server.aiworkhub_manager_workforce_rank(task_id="X", kinds=["code"], detail="bogus"),
+        lambda: server.aiworkhub_source_graph_health(detail="bogus"),
+        lambda: server.aiworkhub_source_graph_refresh_now(detail="bogus"),
     ):
         result = call()
         assert result["ok"] is False

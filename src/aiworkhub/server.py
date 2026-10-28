@@ -6911,20 +6911,61 @@ def aiworkhub_source_graph_ensure_started() -> dict[str, Any]:
     return core.source_graph_ensure_started()
 
 
+def _source_graph_detail_reply(result: Any, tool: str, detail: str) -> Any:
+    """Render a Source Graph health-shaped payload for ``detail``.
+
+    Only ``summary`` folds; ``evidence``/``full`` and a non-dict payload pass
+    through unchanged, so in-process callers of core keep the raw dict.
+    """
+
+    if detail != "summary" or not isinstance(result, dict):
+        return result
+    folded = mcp_summary_folds.fold_source_graph_health_summary(result)
+    folded["detail"] = detail
+    folded["detail_request"] = {"full": {"tool": tool, "detail": "full"}}
+    return folded
+
+
 @mcp.tool()
-def aiworkhub_source_graph_health() -> dict[str, Any]:
+def aiworkhub_source_graph_health(detail: StatusDetail = "summary") -> dict[str, Any]:
     """READ-ONLY: Source Graph indexing daemon health for the active
-    repository -- indexing/ready/degraded status, last report/error/time."""
+    repository -- indexing/ready/degraded status, last report/error/time.
 
-    return core.source_graph_health()
+    ``detail="summary"`` (default) keeps every top-level scalar exact and folds
+    each top-level dict/list to ``{summarized, bytes, sha256}`` plus its own
+    status/state/degraded/ok and ``degraded_reasons``; ``detail="full"``
+    (``"evidence"`` behaves the same) returns the daemon payload unchanged.
+
+    Args:
+        detail: summary (default) folds nested blocks to identity plus their status facts; evidence and full both return the complete health payload.
+    """
+
+    refusal = _detail_refusal(detail)
+    if refusal is not None:
+        return refusal
+    return _source_graph_detail_reply(core.source_graph_health(), "aiworkhub_source_graph_health", detail)
 
 
 @mcp.tool()
-def aiworkhub_source_graph_refresh_now() -> dict[str, Any]:
+def aiworkhub_source_graph_refresh_now(detail: StatusDetail = "summary") -> dict[str, Any]:
     """Force one bounded incremental (or first-ever full) Source Graph
-    build now, non-overlapping with the periodic background refresh."""
+    build now, non-overlapping with the periodic background refresh.
 
-    return core.source_graph_refresh_now()
+    The reply is the daemon health payload: ``detail="summary"`` (default)
+    folds it exactly like ``aiworkhub_source_graph_health``; ``detail="full"``
+    (``"evidence"`` behaves the same) returns it unchanged. An unknown
+    ``detail`` is refused before any refresh is requested.
+
+    Args:
+        detail: summary (default) folds nested blocks to identity plus their status facts; evidence and full both return the complete payload.
+    """
+
+    refusal = _detail_refusal(detail)
+    if refusal is not None:
+        return refusal
+    return _source_graph_detail_reply(
+        core.source_graph_refresh_now(), "aiworkhub_source_graph_refresh_now", detail
+    )
 
 
 @mcp.tool()
