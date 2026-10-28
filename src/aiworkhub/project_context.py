@@ -75,7 +75,7 @@ _ECHO_KEYS = frozenset({
 })
 SOURCE_GRAPH_MODES = (
     "focus", "slice", "context", "file", "function", "class", "body", "bodygrep",
-    "impact", "trace", "deps", "bundle",
+    "impact", "trace", "deps", "bundle", "diff",
     "tags", "hotspots", "coverage", "churn", "reviewqueue", "ownership",
     "testmap", "calls", "symbols", "bottlenecks", "auditmap", "complexity",
     "stats", "summarize", "pipeline",
@@ -614,6 +614,10 @@ def _validate_contract(card: dict[str, Any]) -> dict[str, Any] | None:
     mode = source.get("mode")
     if mode not in SOURCE_GRAPH_MODES:
         raise ProjectContextError("project_context.source_graph.mode_invalid")
+    if mode == "diff":
+        # A launch-time prefetch runs before the worker has changed anything;
+        # ``diff`` is served live by the source_graph_query tools only.
+        raise ProjectContextError("project_context.source_graph.mode_diff_not_prefetchable")
     source_query = _bounded_str(
         source.get("query"), field="project_context.source_graph.query", max_bytes=MAX_QUERY_BYTES
     )

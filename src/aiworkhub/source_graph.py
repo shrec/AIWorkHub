@@ -102,6 +102,9 @@ MAX_POLICY_BYTES = 64 * 1024
 SOURCE_GRAPH_MODES: tuple[str, ...] = (
     "focus", "slice", "context", "file", "function", "class", "body", "bodygrep",
     "impact", "trace", "deps", "bundle",
+    # ``diff`` reads one registered worker worktree (``source_graph_diff``),
+    # not this index; the MCP tool layer serves it, never the engine.
+    "diff",
     *sganalytics.ANALYTIC_MODES,
 )
 SOURCE_GRAPH_BUNDLE_TYPES: tuple[str, ...] = (

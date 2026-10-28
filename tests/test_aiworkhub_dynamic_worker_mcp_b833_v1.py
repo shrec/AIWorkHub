@@ -396,7 +396,7 @@ def test_source_graph_query_rejects_invalid_mode_and_bundle_type(monkeypatch: py
     assert invalid_mode["reason"].startswith("invalid_mode")
     assert invalid_mode["allowed_modes"] == [
         "focus", "slice", "context", "file", "function", "class", "body", "bodygrep",
-        "impact", "trace", "deps", "bundle",
+        "impact", "trace", "deps", "bundle", "diff",
         "tags", "hotspots", "coverage", "churn", "reviewqueue", "ownership",
         "testmap", "calls", "symbols", "bottlenecks", "auditmap", "complexity",
         "stats", "summarize", "pipeline",

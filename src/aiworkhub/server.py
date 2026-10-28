@@ -1441,11 +1441,11 @@ def aiworkhub_manager_source_graph_query(
     """MANAGER CODE DISCOVERY: use first and continuously before built-in file search.
 
     Args:
-        mode: Lookup to run: focus, slice, context, file, function, class, body, bodygrep, impact, trace, deps, bundle, or an analytic report (hotspots, churn, testmap, calls, ...).
+        mode: Lookup to run: focus, slice, context, file, function, class, body, bodygrep, impact, trace, deps, bundle, diff (a registered worker worktree's changed files, symbols and paged hunks), or an analytic report (hotspots, churn, testmap, calls, ...).
         query: What to look up, non-blank, at most 512 bytes; its meaning depends on mode. In file mode with an exact file target, a 1-based start-end line range returns those lines plus a 20-line margin.
         budget: Size budget for the reply; default 64, clamped to 8-160.
-        target: Optional scope, at most 256 bytes: an exact symbol (bare name or file.symbol) for slice, body and function modes, otherwise a path prefix; omit for unscoped.
-        cursor: Page token for analytic modes and bodygrep only (at most 64 bytes, 4096 for bodygrep): pass the previous next_cursor back unchanged; other modes refuse it.
+        target: Optional scope, at most 256 bytes: an exact symbol (bare name or file.symbol) for slice, body and function modes, the worker request id for diff, otherwise a path prefix; omit for unscoped.
+        cursor: Page token for analytic modes, bodygrep and diff only (at most 64 bytes, 4096 for bodygrep, 256 for diff): pass the previous next_cursor back unchanged; other modes refuse it.
         continuation_cursor: Signed token, at most 1024 bytes, from a previous page of the same query whose response exceeded the output cap; not a bodygrep cursor.
         bundle_type: Used only by bundle mode: bugfix, feature, refactor, audit, optimize or explore (default).
         workflow_stage: Stage of the work this query supports: orientation, implementation, validation, review, rework or unspecified (default; the server infers the stage).

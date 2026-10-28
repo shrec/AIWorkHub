@@ -236,7 +236,7 @@ STORAGE_REGISTRY_RELATIVE_PATH = Path(".aiworkhub") / "config" / "storage.json"
 
 SOURCE_GRAPH_MODES: tuple[str, ...] = (
     "focus", "slice", "context", "file", "function", "class", "body", "bodygrep",
-    "impact", "trace", "deps", "bundle",
+    "impact", "trace", "deps", "bundle", "diff",
     "tags", "hotspots", "coverage", "churn", "reviewqueue", "ownership",
     "testmap", "calls", "symbols", "bottlenecks", "auditmap", "complexity",
     "stats", "summarize", "pipeline",
@@ -272,12 +272,20 @@ SOURCE_GRAPH_SELECTOR_MODES: frozenset[str] = frozenset({"slice", "body", "funct
 SOURCE_GRAPH_SYMBOL_SELECTOR_MODES: frozenset[str] = (
     SOURCE_GRAPH_SELECTOR_MODES - {"slice"}
 )
+# ``mode=diff`` (RM-2026-00071) is served by ``source_graph_diff`` over one
+# registered worker worktree, never the index: its ledger rows carry this
+# authority, and ``budget`` times the byte factor is the hunk page size, so the
+# default budget 64 pages 8 KiB of hunk text and ``next_cursor`` resumes.
+SOURCE_GRAPH_DIFF_AUTHORITY_SOURCE = "worker_workspace"
+SOURCE_GRAPH_DIFF_AUTHORITY_STATE = "worktree_diff"
+SOURCE_GRAPH_DIFF_BYTES_PER_BUDGET = 128
+SOURCE_GRAPH_DIFF_CURSOR_MAX_BYTES = 256
 SOURCE_GRAPH_BUNDLE_TYPES: tuple[str, ...] = (
     "bugfix", "feature", "refactor", "audit", "optimize", "explore",
 )
 SourceGraphMode = Literal[
     "focus", "slice", "context", "file", "function", "class", "body", "bodygrep",
-    "impact", "trace", "deps", "bundle",
+    "impact", "trace", "deps", "bundle", "diff",
     "tags", "hotspots", "coverage", "churn", "reviewqueue", "ownership",
     "testmap", "calls", "symbols", "bottlenecks", "auditmap", "complexity",
     "stats", "summarize", "pipeline",
@@ -2518,6 +2526,12 @@ def verify_audit_ledger(
             and authority_source == "candidate_packet"
             and authority_state == "quality_review_readonly"
         )
+        # ``mode=diff`` reads one registered worktree, not the canonical index.
+        source_graph_diff_authority = (
+            tool == "source_graph"
+            and authority_source == SOURCE_GRAPH_DIFF_AUTHORITY_SOURCE
+            and authority_state == SOURCE_GRAPH_DIFF_AUTHORITY_STATE
+        )
         if (
             entry.get("ok")
             and not entry.get("violation")
@@ -2528,6 +2542,7 @@ def verify_audit_ledger(
                 )
                 or semantic_edit_authority
                 or review_packet_authority
+                or source_graph_diff_authority
             )
         ):
             successful_call_count[tool] = successful_call_count.get(tool, 0) + 1
@@ -5290,6 +5305,118 @@ def _inline_refresh_stale_rows(
     return sorted(set(refreshed))
 
 
+def _source_graph_diff_query(
+    ctx: WorkerToolContext,
+    *,
+    query: str,
+    query_sha256: str,
+    budget: int,
+    target: str | None,
+    cursor: str | None,
+    workflow_stage: str,
+    started: float,
+) -> dict[str, Any]:
+    """Serve ``mode=diff``: one registered worktree's change, hunks paged.
+
+    A manager names the worktree by ``target`` (its request id); a worker may
+    read only its own (``ctx.request_id``), so a target naming another request
+    is refused. ``cursor`` -- or a ``query`` that is itself a diff cursor --
+    resumes the hunk page; ``source_graph_diff`` binds it to the diff
+    fingerprint. A ``SourceGraphDiffError`` is a structured refusal.
+    """
+    from . import source_graph_diff
+
+    tool = "source_graph"
+    wanted: str | None = None
+    if target is not None:
+        wanted = _bounded_query(target, max_bytes=256)
+        if wanted is None:
+            return _violation(ctx, tool, "invalid_target")
+    if _is_manager_context(ctx):
+        if wanted is None:
+            return _violation(
+                ctx, tool, "diff_request_id_required",
+                valid_next_call="Pass the worker request id as target.",
+            )
+        request_id = wanted
+    else:
+        request_id = ctx.request_id
+        if wanted is not None and wanted != request_id:
+            return _violation(
+                ctx, tool, "diff_foreign_request_refused",
+                requested_target=wanted,
+                valid_next_call="Omit target: a worker diffs only its own worktree.",
+            )
+    if cursor is None and query.startswith(f"{source_graph_diff._CURSOR_PREFIX}:"):
+        cursor = query
+    if cursor is not None:
+        cursor = _bounded_query(cursor, max_bytes=SOURCE_GRAPH_DIFF_CURSOR_MAX_BYTES)
+        if cursor is None:
+            return _violation(ctx, tool, "invalid_cursor")
+    try:
+        payload = source_graph_diff.diff_registered_worktree(
+            ctx.authority_repo, request_id,
+            byte_budget=budget * SOURCE_GRAPH_DIFF_BYTES_PER_BUDGET, cursor=cursor,
+        )
+    except source_graph_diff.SourceGraphDiffError as exc:
+        return _violation(
+            ctx, tool, f"source_graph_diff_refused:{exc}"[:160],
+            error="source_graph_diff_refused", diff_reason=str(exc)[:160],
+            request_id=request_id,
+        )
+    except OSError as exc:
+        return _violation(
+            ctx, tool, f"source_graph_diff_failed:{type(exc).__name__}",
+            error="source_graph_diff_failed", request_id=request_id,
+        )
+    if workflow_stage == "unspecified":
+        effective_stage, stage_source = _infer_workflow_stage(ctx), "inferred"
+    else:
+        effective_stage, stage_source = workflow_stage, "declared"
+    content_bytes = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    hit_count = len(payload.get("files") or ())
+    receipt_id = secrets.token_hex(6)
+    _append_audit(
+        ctx, tool=tool, ok=True, cache_hit=False, hit_count=hit_count,
+        bytes_returned=len(content_bytes),
+        authority_source=SOURCE_GRAPH_DIFF_AUTHORITY_SOURCE,
+        authority_state=SOURCE_GRAPH_DIFF_AUTHORITY_STATE,
+        provenance=ctx.provenance or "live",
+        payload={
+            "mode": "diff",
+            "query_sha256": query_sha256,
+            "workflow_stage": effective_stage,
+            "workflow_stage_source": stage_source,
+            "declared_workflow_stage": workflow_stage,
+            "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            "target_request_id": request_id,
+            "receipt_id": receipt_id,
+        },
+    )
+    return {
+        "ok": True,
+        "tool": tool,
+        "mode": "diff",
+        "workflow_stage": effective_stage,
+        "workflow_stage_source": stage_source,
+        "query": query,
+        "target": request_id,
+        "hit_count": hit_count,
+        "cache_hit": False,
+        "authority_source": SOURCE_GRAPH_DIFF_AUTHORITY_SOURCE,
+        "authority_state": SOURCE_GRAPH_DIFF_AUTHORITY_STATE,
+        "authority_repo": str(ctx.authority_repo),
+        "receipt_id": receipt_id,
+        "truncated": bool(payload.get("truncated")),
+        "next_cursor": payload.get("next_cursor"),
+        "bytes": len(content_bytes),
+        "content": payload,
+        "content_sha256": hashlib.sha256(content_bytes).hexdigest(),
+    }
+
+
 def source_graph_query(
     ctx: WorkerToolContext,
     *,
@@ -5368,6 +5495,17 @@ def source_graph_query(
         budget = max(MIN_BUDGET, min(int(budget), MAX_BUDGET))
     except (TypeError, ValueError):
         return _violation(ctx, tool, "invalid_budget")
+    if mode == "diff":
+        if continuation_cursor is not None:
+            return _violation(
+                ctx, tool, "continuation_cursor_not_supported_for_mode",
+                valid_next_call="Pass a diff page's next_cursor back as cursor.",
+            )
+        return _source_graph_diff_query(
+            ctx, query=bounded_query, query_sha256=query_sha256, budget=budget,
+            target=target, cursor=cursor, workflow_stage=workflow_stage,
+            started=started,
+        )
 
     is_analytic_mode = mode in SOURCE_GRAPH_ANALYTIC_MODES
     # bodygrep's next_cursor is an engine scan cursor (hex path, line, digest),

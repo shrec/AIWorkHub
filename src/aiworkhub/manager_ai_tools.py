@@ -322,6 +322,17 @@ def source_graph_query(
     compact_replay: bool = True,
     request_id: str | None = None,
 ) -> dict[str, Any]:
+    if mode == "diff" and request_id is not None:
+        # ``diff`` reads the registered worktree itself, never a sealed
+        # overlay: ``request_id`` only names it when ``target`` does not.
+        wanted = str(request_id).strip()
+        if target is not None and str(target).strip() != wanted:
+            return _invoke(lambda _ctx: {
+                "ok": False, "error": "diff_target_request_id_mismatch",
+                "request_id": wanted, "target": target,
+            }, target=target)
+        target, request_id = wanted, None
+
     def call(ctx: worker_tools.WorkerToolContext) -> dict[str, Any]:
         if request_id is not None:
             wanted = str(request_id).strip()
