@@ -8816,13 +8816,22 @@ class ProcessManager:
 
         1. ``_liveness_snapshot`` produced evidence and neither the
            supervisor nor its child process is alive.
-        2. The merged request history proves the supervisor PID identity
-           is ``PidIdentityVerdict.MISMATCH``.
-        3. The persisted bridge receipt resolves to a request whose home
+        2. The persisted bridge receipt resolves to a request whose home
            (``worker_spec_path.parent``) no longer exists.
-        4. The bound task card parses and is already ``finished`` or
-           ``archived``, or it is bound to a different request than
-           ``request_id``.
+        3. The bound task card parses and is already ``finished`` or
+           ``archived`` -- whatever the PID verdict: a removed home cannot
+           receive a cancel and the card is already decided -- or it is
+           bound to a different request than ``request_id`` AND the merged
+           history proves the supervisor ``PidIdentityVerdict.MISMATCH``.
+
+        NF-2026-01800: an exited supervisor is not reliably MISMATCH.
+        Measured on Windows, a process that exited while any handle to it is
+        open (the monitoring manager's own ``Popen``) probes MATCH -- its
+        creation time is still readable -- while liveness correctly reports
+        it dead; only after the last handle closes does it probe MISMATCH
+        (winerror 87). On POSIX an unreaped zombie probes MATCH, and missing
+        start ticks give UNKNOWN everywhere. Demanding MISMATCH for a decided
+        card stranded an accepted reviewer in ``reconcile_pending`` forever.
 
         Any probe failure (unreadable metadata, unresolvable bridge
         receipt, unparseable task card) returns ``None``.
@@ -8832,11 +8841,6 @@ class ProcessManager:
             if not liveness:
                 return None
             if liveness.get("supervisor_alive") or liveness.get("child_alive"):
-                return None
-            if (
-                self._request_pid_identity(events).verdict
-                is not PidIdentityVerdict.MISMATCH
-            ):
                 return None
             request = self._bridge_request_for_cancellation(
                 request_id, live, status
@@ -8852,7 +8856,12 @@ class ProcessManager:
             bound = str(
                 card.get("launch_request_id") or card.get("request_id") or ""
             )
-            if bound and bound != request_id:
+            if (
+                bound
+                and bound != request_id
+                and self._request_pid_identity(events).verdict
+                is PidIdentityVerdict.MISMATCH
+            ):
                 return "bridge_cancel_moot_home_removed"
         except Exception:  # noqa: BLE001 - any probe failure fails closed
             return None
@@ -8923,6 +8932,14 @@ class ProcessManager:
             request_id, events, latest, live, status
         )
         if moot_reason is not None:
+            # NF-2026-01800: a request already decided (an accepted reviewer
+            # whose acceptance removed the home) keeps its terminal row; a
+            # moot cancel never buries that decision under another one.
+            tail = split_lifecycle_tail(events)[0]
+            if tail.get("state") in TERMINAL_PROCESS_STATES or (
+                tail.get("state") == "accepted" and tail.get("accepted") is True
+            ):
+                raise _BridgeCancellationDeferred(error[:500])
             self._retention_event({
                 **lineage,
                 "request_id": request_id,
@@ -9447,6 +9464,47 @@ class ProcessManager:
             card, request_id=request_id, claim_epoch=metadata.get("claim_epoch")
         )
         return accepted if sealed else None
+
+    def _restore_buried_accepted_row(
+        self,
+        tail: Mapping[str, Any],
+        accepted: Mapping[str, Any],
+        metadata: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """NF-2026-01800: re-append a sealed ``accepted`` row a later row buried.
+
+        A failed bridge cancel published after acceptance left
+        ``reconcile_pending`` as the tail, so every tail reader -- accept
+        preview included -- saw an unfinished reviewer forever. A reviewer row
+        is restored only while its receipt is the one acceptance verified,
+        identical in the event and both card copies; anything else is returned
+        as recorded, unrestored (fail closed).
+        """
+        disposition = str(accepted.get("workspace_disposition") or "")
+        if tail.get("state") == "accepted" or disposition not in {
+            "retained_in_place", "quarantined", "removed",
+        }:
+            return accepted
+        task_id = str(metadata.get("task_id") or "")
+        if str(accepted.get("topic") or metadata.get("topic") or "") == "quality_review":
+            try:
+                card = _parse_card(self._show_task(task_id), task_id)
+            except Exception:  # noqa: BLE001 - unreadable card keeps the ledger
+                return accepted
+            receipt = accepted.get("quality_review_receipt")
+            terminal = (card.get("terminal_review") or {}).get("evidence") or {}
+            accept_evidence = card.get("accept_evidence") or {}
+            if not isinstance(receipt, dict) or not (
+                receipt == terminal.get("quality_review_receipt")
+                == accept_evidence.get("quality_review_receipt")
+            ):
+                return accepted
+        return self._retention_event({
+            **accepted,
+            "timestamp": _utcnow(),
+            "restored_over_state": str(tail.get("state") or ""),
+            "restored_over_reason": str(tail.get("reconciliation_deferred") or "")[:200],
+        }, disposition=disposition)
 
     def _release_exact(self, metadata: dict[str, Any], reason: str) -> dict[str, Any]:
         task_id = str(metadata["task_id"])
@@ -10556,7 +10614,7 @@ class ProcessManager:
             # NF-2026-01625/01706: an attempt automatic review accepted is final.
             accepted = self._accepted_attempt_row(events, metadata, request_id)
             if accepted is not None:
-                return accepted
+                return self._restore_buried_accepted_row(latest, accepted, metadata)
 
             status_path = Path(str(metadata["supervisor_status_path"]))
             supervisor_status = self._read_supervisor_status(status_path)

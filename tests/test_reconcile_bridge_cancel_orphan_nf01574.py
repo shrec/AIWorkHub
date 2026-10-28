@@ -230,10 +230,16 @@ def test_moot_helper_returns_none_while_identity_still_matches(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    # NF-2026-01800: a decided card is moot whatever the verdict; only the
+    # "bound to a different request" branch still demands MISMATCH.
     manager = _setup(
         monkeypatch,
         tmp_path,
-        card={"task_id": TASK_ID, "status": "finished"},
+        card={
+            "task_id": TASK_ID,
+            "status": "processing",
+            "launch_request_id": "a" * 32,
+        },
         verdict=process_launcher.PidIdentityVerdict.MATCH,
     )
     events = _rows(manager)
