@@ -20,12 +20,13 @@ It splits a large project into work cards, sends each card to the cheapest model
 </div>
 
 The extension opens as a retained editor tab and runs one repository-scoped
-MCP stdio runtime on the workspace host. It does not open a browser, bind a
-port, expose a LAN service or require an AIWorkHub cloud account.
+MCP stdio runtime on the workspace host. It does not open a browser or require
+an AIWorkHub cloud account, and it binds no port and exposes no LAN service
+unless you start the opt-in WorkHub Mail listener on a host and port you name.
 
-## What's new in 0.12.70
+## What's new in 0.12.71
 
-- The manager can read a review candidate's changed files through Source Graph (`request_id`), semantic edit takes a single-line anchor, an opencode run that writes its tool calls as text is retried on another route, large reworks carry their predecessor's output, Gemini workers get portable tool schemas, and a manager high-risk confirmation is never recorded as owner approval. Landlock and AppContainer validation lanes run multiprocessing and Python quality checks, and the dashboard Semantic Edit window is redesigned.
+- WorkHub Mail sends signed mail between AIWorkHub runtimes, on one machine or across a LAN: machines pair with a one-time code, unverified mail is quarantined, and a dashboard popup shows the inbox and connected machines. Accept now commits the promoted paths itself, a POSIX replay recipe runs the suite on Linux through WSL before a tag, a quiet reviewer gets one hedge attempt on another route, and Source Graph pages oversized replies on UTF-8 boundaries.
 
 ## Review automation
 

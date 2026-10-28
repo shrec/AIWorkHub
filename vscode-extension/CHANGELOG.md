@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.71 — 2026-10-28
+
+### Added
+
+- The dashboard WorkHub Mail popup shows the inbox, quarantine, connected machines and listener status.
+- Bundled runtime 0.12.71: signed hub-to-hub WorkHub Mail with quarantine and manager tools, over a LAN transport with one-time pairing, per-peer HMAC-signed requests and store-and-forward (RM-2026-00079); `aiworkhub_agent_accept_review` commits the promoted paths itself; the `aiworkhub.operator.posix_replay` recipe runs the suite on Linux through WSL; a quiet read-only reviewer gets one hedge attempt on a distinct route (NF-2026-00823); `aiworkhub_claude_callback_wait` watches named requests read-only when another route owns the callback lane (NF-2026-01769).
+
+### Fixed
+
+- Bundled runtime 0.12.71: Source Graph pages on UTF-8 boundaries with a signed byte offset (NF-2026-01768); recipe JSON as UTF-8 bytes on a legacy code page (NF-2026-01770); `aiworkhub_task_create` refuses `allowed_writes` the development rules would refuse (NF-2026-01766); Landlock forkserver on Python 3.14 (NF-2026-01767); a pid-null reviewer reservation with a dead owner retires at once (NF-2026-01763); gitignored validation inputs are hydrated into worker trees (NF-2026-01396); a dismissed `process_limit` finding no longer blinds the lens (NF-2026-01762); an opencode `worker_id` folds onto its `execution_runner` on reroute (NF-2026-01761); a worker worktree root another registered repository owns is refused, and a predecessor stranded there relaunches from its sealed delta (NF-2026-01765); WorkHub Mail writes and platform checks go through `platform_io` (NF-2026-01774); the Landlock short private `TMPDIR` is minted once per validation batch (NF-2026-01775).
+
 ## 0.12.70 — 2026-10-27
 
 ### Added

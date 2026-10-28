@@ -6,6 +6,33 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.71] - 2026-10-28
+
+### Added
+
+- WorkHub Mail: signed hub-to-hub mail between AIWorkHub runtimes. A local spool quarantines unsigned, malformed or unknown-sender mail, and the manager reads and sends it with `aiworkhub_manager_hub_mail_send`, `_inbox`, `_show` and `_archive` (RM-2026-00079).
+- WorkHub Mail LAN transport: machines on one network pair with a one-time code, every request is signed with a per-peer HMAC key, and mail for an offline peer is stored and forwarded.
+- The dashboard WorkHub Mail popup shows the inbox, quarantine, connected machines and listener status.
+- `aiworkhub_agent_accept_review` commits exactly the promoted paths itself, with the card's `Resolves:` trailer and the configured `aiworkhub.commitTrailer` lines; unrelated dirty files are never swept in, and a refused commit is reported with a bounded stderr tail without undoing the accept.
+- The `aiworkhub.operator.posix_replay` recipe runs the test suite on Linux through WSL against a committed ref, so POSIX-only tests are checked on Windows before a tag.
+- A read-only reviewer that stays quiet gets one hedge attempt on a distinct route (NF-2026-00823).
+- `aiworkhub_claude_callback_wait` with `watch_request_ids` watches those requests read-only when the Codex route or the Manager Chat seat owns the callback lane, replying with one compact row per request instead of a refusal; delivery stays with the owning route, and an unreadable ledger read never counts as a change (NF-2026-01769).
+
+### Fixed
+
+- Source Graph pages an oversized reply on UTF-8 character boundaries with a signed byte offset, so a page never splits a multi-byte character (NF-2026-01768).
+- Recipe JSON is emitted as UTF-8 bytes, so a legacy console code page no longer breaks recipe output (NF-2026-01770).
+- `aiworkhub_task_create` refuses `allowed_writes` that the launch's development rules would refuse, instead of creating a card that can never launch (NF-2026-01766).
+- Under Landlock, a short private `TMPDIR` and a brokered socket `chmod` let the multiprocessing forkserver start on Python 3.14 (NF-2026-01767).
+- A pid-null reviewer reservation whose recorded owner is proven dead is retired at once instead of waiting out its lease (NF-2026-01763).
+- Repository-declared gitignored validation inputs (`.aiworkhub/validation_inputs.json`) are hydrated into worker and union2 trees; a match that escapes the repository or resolves into private state is refused (NF-2026-01396).
+- A manager-dismissed `process_limit` finding stops counting the reviewer lens as blind (NF-2026-01762).
+- A workforce reroute folds a discovered opencode `worker_id` onto its `execution_runner` (NF-2026-01761).
+- A worker worktree root that another registered repository owns is refused (`worktree_root_foreign_repository`) instead of provisioning there, and a rework predecessor stranded under such a root relaunches from its verified sealed delta without its tree being read (NF-2026-01765).
+- `process_launcher` sheds the reviewer caller-context builder into its own module and its size ratchet drops to 13,468 lines (NF-2026-01773).
+- WorkHub Mail and the `posix_replay` recipe write files and detect the platform through `platform_io`, the single owner for both, instead of their own copies (NF-2026-01774).
+- Under Landlock, the short private `TMPDIR` is minted once per validation batch, so every command of a `run_validations` batch shares one scratch tree and the batch removes it once (NF-2026-01775).
+
 ## [0.12.70] - 2026-10-27
 
 ### Added

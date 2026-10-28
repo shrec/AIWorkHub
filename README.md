@@ -372,9 +372,9 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.70
+## What's new in 0.12.71
 
-- The manager can read a review candidate's changed files through Source Graph (`request_id`), semantic edit takes a single-line anchor, an opencode run that writes its tool calls as text is retried on another route, large reworks carry their predecessor's output, Gemini workers get portable tool schemas, and a manager high-risk confirmation is never recorded as owner approval. Landlock and AppContainer validation lanes run multiprocessing and Python quality checks, and the dashboard Semantic Edit window is redesigned.
+- WorkHub Mail sends signed mail between AIWorkHub runtimes, on one machine or across a LAN: machines pair with a one-time code, unverified mail is quarantined, and a dashboard popup shows the inbox and connected machines. Accept now commits the promoted paths itself, a POSIX replay recipe runs the suite on Linux through WSL before a tag, a quiet reviewer gets one hedge attempt on another route, and Source Graph pages oversized replies on UTF-8 boundaries.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Continuous Audit as a Service (CAAS)
@@ -395,7 +395,8 @@ structured findings into NeedFix with provenance.
 
 ## Security
 
-- stdio transport; no AIWorkHub HTTP listener;
+- stdio transport; no AIWorkHub HTTP listener unless the opt-in WorkHub Mail
+  listener is started on a host and port you name;
 - separate `AIWORKHUB_ALLOW_WRITES` and `AIWORKHUB_ALLOW_LAUNCH` gates, both
   off by default;
 - shell-free exact-task process launch and bounded workspaces;

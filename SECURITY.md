@@ -28,9 +28,13 @@ Security-sensitive areas:
   Read-only by default.
 - **File access**: workers operate in isolated workspaces with landlock
   rules when available.
-- **No network listener**: the MCP server uses stdio only and the native VS
-  Code dashboard communicates with its repository-scoped child process. It
-  does not bind localhost, a LAN address or a public port.
+- **No network listener by default**: the MCP server uses stdio and the native
+  VS Code dashboard communicates with its repository-scoped child process.
+  Nothing binds localhost, a LAN address or a public port unless the owner
+  starts the opt-in WorkHub Mail listener (`aiworkhub_manager_hub_mail_listener`),
+  which binds only the host and port named at start, has no default address,
+  and accepts mail only from peers paired with a one-time code; every request
+  and response is HMAC-signed with the per-peer key.
 - **Repository isolation**: task state, routes, context stores and Source Graph
   data resolve through the selected repository's canonical `.aiworkhub`
   registry. Cross-repository ambiguity fails closed.

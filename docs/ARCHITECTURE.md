@@ -217,8 +217,10 @@ its parent.
 them in a bounded MCP tool surface
 (`aiworkhub_dashboard_snapshot`/`_task_detail`/`_health`/`_task_live_output`/
 `_initialize`) that the VS Code Webview calls over the same repository-local
-stdio session -- there is no in-package HTTP listener, browser launch, or
-fixed listen port anywhere in the runtime.
+stdio session -- there is no in-package HTTP listener for the dashboard, no
+browser launch, and no fixed listen port anywhere in the runtime. The only
+listener is the opt-in WorkHub Mail LAN transport (`hub_mail_net.py`), which
+binds an explicit host and port and has no default address.
 
 ## Process launch and isolation
 
