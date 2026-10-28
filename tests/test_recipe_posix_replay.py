@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -212,6 +213,33 @@ def scratch_root(tmp_path, monkeypatch):
     return root
 
 
+def _fake_wsl(monkeypatch, *, probe=None):
+    """Answer ``wsl`` argv lists with scripted replies; any other argv runs for real.
+
+    ``probe`` answers the interpreter version query (default: CI's newest leg).
+    Returns the list that records every ``wsl`` argv in call order.
+    """
+    real_run = pr.run_argv
+    wsl_calls: list[list[str]] = []
+    version_reply = probe if probe is not None else _done(0, pr.CI_NEWEST_PYTHON + "\n")
+
+    def fake_run(argv, **kwargs):
+        if argv[0] != "wsl":
+            return real_run(argv, **kwargs)
+        wsl_calls.append(list(argv))
+        tail = argv[argv.index("-e") + 1 :]
+        if tail[0] == "mktemp":
+            return _done(0, "/tmp/tmp.replay\n")
+        if tail[1:2] == ["-c"]:
+            return version_reply
+        if tail[0] == "env":
+            return _done(0, "1 passed in 0.01s\n")
+        return _done(0)
+
+    monkeypatch.setattr(pr, "run_argv", fake_run)
+    return wsl_calls
+
+
 @needs_git
 def test_wsl_path_extracts_and_runs_pytest_through_wsl_argv_lists(
     tmp_path, monkeypatch, capsys, scratch_root
@@ -222,21 +250,7 @@ def test_wsl_path_extracts_and_runs_pytest_through_wsl_argv_lists(
     monkeypatch.setattr(pr, "_is_windows", lambda: True)
     monkeypatch.setattr(pr.shutil, "which", lambda name: "wsl.exe" if name == "wsl" else None)
 
-    real_run = pr.run_argv
-    wsl_calls: list[list[str]] = []
-
-    def fake_run(argv, **kwargs):
-        if argv[0] != "wsl":
-            return real_run(argv, **kwargs)
-        wsl_calls.append(list(argv))
-        tail = argv[argv.index("-e") + 1 :]
-        if tail[0] == "mktemp":
-            return _done(0, "/tmp/tmp.replay\n")
-        if tail[0] == "env":
-            return _done(0, "1 passed in 0.01s\n")
-        return _done(0)
-
-    monkeypatch.setattr(pr, "run_argv", fake_run)
+    wsl_calls = _fake_wsl(monkeypatch)
     code, payload = _run_main(
         capsys, "--ref", "HEAD", "--wsl-user", "bob", "--tests", "tests/test_ok.py"
     )
@@ -244,14 +258,23 @@ def test_wsl_path_extracts_and_runs_pytest_through_wsl_argv_lists(
     assert (code, payload["state"], payload["passed"]) == (0, "passed", 1)
     assert payload["commit_sha"] == sha
     assert all(call[:3] == ["wsl", "-u", "bob"] for call in wsl_calls)
-    assert [call[call.index("-e") + 1] for call in wsl_calls] == ["mktemp", "tar", "env", "rm"]
-    pytest_call = wsl_calls[2]
+    assert [call[call.index("-e") + 1] for call in wsl_calls] == [
+        "mktemp", "tar", "python3", "env", "rm",
+    ]
+    probe_call = wsl_calls[2]
+    assert probe_call[probe_call.index("--cd") + 1] == "/tmp/tmp.replay"
+    assert probe_call[probe_call.index("-e") + 1 :] == [
+        "python3", "-c", "import sys;print('%d.%d'%sys.version_info[:2])",
+    ]
+    pytest_call = wsl_calls[3]
     assert pytest_call[pytest_call.index("--cd") + 1] == "/tmp/tmp.replay"
     assert pytest_call[pytest_call.index("-e") + 1 :] == [
         "env", "PYTHONPATH=src", "python3", "-m", "pytest", "-q", "-p", "no:cacheprovider",
         "-o", "pythonpath=", "tests/test_ok.py",
     ]
-    assert wsl_calls[3][-3:] == ["-rf", "--", "/tmp/tmp.replay"]
+    assert wsl_calls[4][-3:] == ["-rf", "--", "/tmp/tmp.replay"]
+    assert payload["wsl_python_version"] == pr.CI_NEWEST_PYTHON
+    assert "python_version_mismatch" not in payload
     assert payload["temp_removed"] is True
     assert list(scratch_root.iterdir()) == []
 
@@ -277,6 +300,64 @@ def test_wsl_failing_before_pytest_is_unavailable(tmp_path, monkeypatch, capsys,
     assert payload["reason"] == "wsl_error"
     assert "no distribution" in payload["tail"]
     assert list(scratch_root.iterdir()) == []
+
+
+def test_the_wsl_gate_reports_a_python_version_off_ci_newest_without_failing(
+    monkeypatch, tmp_path
+):
+    wsl_calls = _fake_wsl(monkeypatch, probe=_done(0, "3.12\n"))
+    verdict = pr._run_in_wsl(tmp_path / "archive.tar", tmp_path, None, "python3.12", [])
+
+    assert verdict["state"] == "passed"
+    assert verdict["wsl_python_version"] == "3.12"
+    assert verdict["python_version_mismatch"] == {"wsl": "3.12", "ci_newest": pr.CI_NEWEST_PYTHON}
+    probe_call, pytest_call = wsl_calls[2], wsl_calls[3]
+    assert probe_call[probe_call.index("-e") + 1 :] == [
+        "python3.12", "-c", "import sys;print('%d.%d'%sys.version_info[:2])",
+    ]
+    inner = pytest_call[pytest_call.index("-e") + 1 :]
+    assert inner[:3] == ["env", "PYTHONPATH=src", "python3.12"]
+    assert set(verdict) - set(pr._verdict(_done(0, "1 passed in 0.01s\n"))) == {
+        "wsl_python_version", "python_version_mismatch",
+    }
+
+
+@pytest.mark.parametrize(
+    "probe",
+    [
+        _done(127, "", "env: 'python3': No such file or directory"),
+        _done(0, "Python 3.14.0\n"),
+        _done(None, "", timed_out=True),
+    ],
+)
+def test_an_unreadable_wsl_python_version_is_a_mismatch_never_a_match(
+    monkeypatch, tmp_path, probe
+):
+    _fake_wsl(monkeypatch, probe=probe)
+    verdict = pr._run_in_wsl(tmp_path / "archive.tar", tmp_path, None, "python3", [])
+    assert verdict["state"] == "passed"
+    assert verdict["wsl_python_version"] is None
+    assert verdict["python_version_mismatch"] == {"wsl": None, "ci_newest": pr.CI_NEWEST_PYTHON}
+
+
+def test_python_version_report_adds_a_mismatch_only_off_ci_newest():
+    assert pr.python_version_report(pr.CI_NEWEST_PYTHON) == {
+        "wsl_python_version": pr.CI_NEWEST_PYTHON
+    }
+    assert pr.python_version_report("3.13")["python_version_mismatch"] == {
+        "wsl": "3.13", "ci_newest": pr.CI_NEWEST_PYTHON,
+    }
+
+
+def test_ci_newest_python_is_the_newest_leg_of_the_ci_test_matrix():
+    ci = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+    if not ci.is_file():
+        pytest.skip("the CI workflow is not in this checkout")
+    matrices = re.findall(r"python-version:\s*\[([^\]]*)\]", ci.read_text(encoding="utf-8"))
+    legs = [(int(a), int(b)) for a, b in re.findall(r"(\d+)\.(\d+)", " ".join(matrices))]
+    assert legs, "no python-version matrix in .github/workflows/ci.yml"
+    major, minor = max(legs)
+    assert f"{major}.{minor}" == pr.CI_NEWEST_PYTHON
 
 
 # ---------------------------------------------------------------------------

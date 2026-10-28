@@ -13,8 +13,11 @@ Every subprocess is an argv list; nothing here uses a shell.
 
 Output: one JSON object with ``state`` (``passed`` | ``failed`` |
 ``unavailable`` | ``error``), the resolved commit, pytest's summary counts, at
-most 50 failing node ids and a 4000-character tail. Exit 0 when the suite was
-run to a verdict (``passed``/``failed``), exit 2 otherwise.
+most 50 failing node ids and a 4000-character tail. A WSL run also reports
+``wsl_python_version`` and, when that is not CI's newest matrix leg
+(``CI_NEWEST_PYTHON``), ``python_version_mismatch``: a report, never a failure.
+Exit 0 when the suite was run to a verdict (``passed``/``failed``), exit 2
+otherwise.
 """
 
 from __future__ import annotations
@@ -44,6 +47,10 @@ SETUP_TIMEOUT_SECONDS = 300.0
 # The recipe framework caps a run at 1800s; leave room to clean up and emit.
 PYTEST_TIMEOUT_SECONDS = 1650.0
 NO_VALUE = "all"
+# Newest python-version leg of the CI test matrix (.github/workflows/ci.yml). The
+# WSL gate reports a distro interpreter that is not this version; it never fails.
+CI_NEWEST_PYTHON = "3.14"
+_VERSION_PROBE = "import sys;print('%d.%d'%sys.version_info[:2])"
 
 _SUMMARY = re.compile(
     r"^(?P<body>no tests ran|\d+ [a-z]+(?:, \d+ [a-z]+)*) in [0-9.]+s(?: \(.*\))?$"
@@ -298,6 +305,26 @@ def _verdict(done: Completed) -> dict[str, Any]:
     return {**payload, "state": "error", "reason": reason}
 
 
+def python_version_report(version: str | None) -> dict[str, Any]:
+    """``wsl_python_version`` plus a mismatch note when it is not CI's newest leg.
+
+    A report, never a failure; an unreadable version (``None``) is a mismatch.
+    """
+    report: dict[str, Any] = {"wsl_python_version": version}
+    if version != CI_NEWEST_PYTHON:
+        report["python_version_mismatch"] = {"wsl": version, "ci_newest": CI_NEWEST_PYTHON}
+    return report
+
+
+def _wsl_python_version(user: str | None, cd: str, interpreter: str) -> str | None:
+    """``major.minor`` of ``interpreter`` run the way the WSL pytest call runs it."""
+    probed = _wsl(user, cd, [interpreter, "-c", _VERSION_PROBE], SETUP_TIMEOUT_SECONDS)
+    lines = [line.strip() for line in probed.out.splitlines() if line.strip()]
+    if probed.rc != 0 or not lines or not re.fullmatch(r"\d+\.\d+", lines[-1]):
+        return None
+    return lines[-1]
+
+
 def _run_in_wsl(
     archive: Path, scratch: Path, user: str | None, interpreter: str, tests: list[str]
 ) -> dict[str, Any]:
@@ -315,11 +342,12 @@ def _run_in_wsl(
         )
         if unpacked.rc != 0:
             raise _wsl_failure(unpacked, "wsl_extract_failed")
+        version = _wsl_python_version(user, directory, interpreter)
         inner = ["env", "PYTHONPATH=src", *pytest_argv(interpreter, tests)]
         done = _wsl(user, directory, inner, PYTEST_TIMEOUT_SECONDS)
         if done.rc in (-1, 0xFFFFFFFF):
             raise _wsl_failure(done, "wsl_error")
-        return _verdict(done)
+        return {**_verdict(done), **python_version_report(version)}
     finally:
         try:
             _wsl(user, "~", ["rm", "-rf", "--", directory], SETUP_TIMEOUT_SECONDS)
