@@ -2235,10 +2235,19 @@ def verify_audit_ledger(
         result["reason"] = "audit_key_unreadable"
         return result
     try:
-        lines = _jsonl_lines(ledger_path.read_text(encoding="utf-8"))
+        ledger_bytes = ledger_path.read_bytes()
     except OSError:
         result["reason"] = "audit_ledger_unreadable"
         return result
+    # Decode per line: a torn multi-byte tail must count as one malformed
+    # line (NUL is never valid JSON) instead of raising for the whole ledger.
+    decoded_lines: list[str] = []
+    for chunk in ledger_bytes.replace(b"\r\n", b"\n").replace(b"\r", b"\n").split(b"\n"):
+        try:
+            decoded_lines.append(chunk.decode("utf-8"))
+        except UnicodeDecodeError:
+            decoded_lines.append("\x00")
+    lines = _jsonl_lines("\n".join(decoded_lines))
 
     call_count: dict[str, int] = {}
     successful_call_count: dict[str, int] = {}
