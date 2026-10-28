@@ -731,3 +731,42 @@ def test_mcp_tools_are_gated_by_the_write_gate_and_the_verified_route(world, mon
         server.aiworkhub_manager_hub_mail_listener(action="status"),
     ):
         assert result["error"] == "verified_manager_identity_required"
+
+
+def test_mcp_startup_hook_ensures_the_listener_and_never_propagates_a_failure(tmp_path, monkeypatch, capsys):
+    class _StartupReached(Exception):
+        pass
+
+    started: list[SimpleNamespace] = []
+
+    def fake_thread(*, target, name, daemon, args=()):
+        thread = SimpleNamespace(target=target, name=name, daemon=daemon, args=args)
+
+        def start():
+            started.append(thread)
+            # Abort main() right after the hook is scheduled: nothing past it runs.
+            raise _StartupReached
+
+        thread.start = start
+        return thread
+
+    monkeypatch.setattr(server, "_detach_inheritable_stdin", lambda: None)
+    monkeypatch.setattr(server.core, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(server.dependency_autolaunch, "register_launcher", lambda _launch: None)
+    monkeypatch.setattr(server, "threading", SimpleNamespace(Thread=fake_thread))
+    with pytest.raises(_StartupReached):
+        server.main()
+    [hook] = started
+    assert hook.target is server._ensure_hub_mail_listener_safely and hook.daemon is True
+
+    calls: list[str] = []
+    monkeypatch.setattr(hub_mail_net, "ensure_listener", lambda: calls.append("ensure"))
+    assert hook.target() is None
+    assert calls == ["ensure"]
+
+    def explode():
+        raise RuntimeError("listener config unreadable")
+
+    monkeypatch.setattr(hub_mail_net, "ensure_listener", explode)
+    assert hook.target() is None
+    assert "hub mail listener autostart failed: RuntimeError" in capsys.readouterr().err

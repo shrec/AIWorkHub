@@ -7134,6 +7134,23 @@ def _enforce_terminal_retention_safely(root: Path) -> None:
         return
 
 
+def _ensure_hub_mail_listener_safely() -> None:
+    """Start the WorkHub Mail listener the owner enabled; never fail MCP startup.
+
+    ``ensure_listener`` acts only on a persisted enabled=true config and the
+    pidfile keeps one listener per home, so every MCP process may call it.
+    """
+
+    try:
+        hub_mail_net.ensure_listener()
+    except Exception as exc:  # noqa: BLE001 - autostart is best effort, MCP must stay up
+        print(
+            f"aiworkhub: hub mail listener autostart failed: {type(exc).__name__}: {str(exc)[:200]}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def _start_task_reconciler_safely(root: Path) -> None:
     """Start the task reconciler without ever making MCP unavailable.
 
@@ -7232,6 +7249,13 @@ def main() -> None:
     # NF-2026-01780: the one registration point -- mark_done's accept hook
     # launches dependency-ready children through this server's real launcher.
     dependency_autolaunch.register_launcher(_dependency_autolaunch_launch)
+    # NF-2026-01783: start the WorkHub Mail listener the owner enabled (a manual
+    # start persists the opt-in, stop clears it) off the stdio thread, once.
+    threading.Thread(
+        target=_ensure_hub_mail_listener_safely,
+        name="aiworkhub-hub-mail-listener-autostart",
+        daemon=True,
+    ).start()
     # Additive schema migration for repositories created before NeedFix was
     # introduced. This runs before any read-only dashboard/list call so those
     # surfaces remain truthful and do not need hidden write side effects.

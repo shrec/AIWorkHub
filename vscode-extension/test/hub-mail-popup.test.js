@@ -10,6 +10,32 @@ const extension = fs.readFileSync(path.join(root, "extension.js"), "utf8");
 const app = fs.readFileSync(path.join(root, "media", "app.js"), "utf8");
 const css = fs.readFileSync(path.join(root, "media", "app.css"), "utf8");
 
+// ---- the extension-static gate, checked inside this card's own validation:
+// no remote-dashboard or hard-coded network literal in the shipped surface.
+const packageJson = fs.readFileSync(path.join(root, "package.json"), "utf8");
+const bannedLiterals = [
+  "127.0.0.1",
+  "0.0.0.0",
+  "192.168.",
+  ":8765",
+  "fetch(",
+  "XMLHttpRequest",
+  "openExternal",
+  "simpleBrowser",
+  "asExternalUri",
+  "dashboardUrl",
+  "primary_sidebar_dashboard",
+];
+for (const [name, text] of [
+  ["package.json", packageJson],
+  ["extension.js", extension],
+  ["media/app.js", app],
+  ["media/app.css", css],
+]) {
+  const hits = bannedLiterals.filter((literal) => text.includes(literal));
+  assert.deepStrictEqual(hits, [], `banned literal in ${name}: ${hits.join(", ")}`);
+}
+
 // ---- static contract: markup, bridge tools, message types, validation
 for (const marker of [
   'id="header-mail"',
@@ -18,17 +44,37 @@ for (const marker of [
   'id="mail-peers-list"',
   'id="mail-detail-panel"',
   'id="mail-refresh"',
+  'id="mail-listener-host" type="text" value="localhost"',
+  'id="mail-listener-port" type="number" min="0" max="65535" step="1" value="0"',
+  'id="mail-listener-start"',
+  'id="mail-listener-stop"',
+  'id="mail-pair-begin"',
+  'id="mail-pair-address"',
+  'id="mail-pair-code"',
+  'id="mail-pair-tls" type="checkbox"',
+  'id="mail-pair-complete"',
 ]) assert.ok(extension.includes(marker), `missing WorkHub Mail UI marker: ${marker}`);
 
 for (const tool of [
   "aiworkhub_dashboard_hub_mail",
   "aiworkhub_dashboard_hub_mail_detail",
+  "aiworkhub_dashboard_hub_mail_listener",
+  "aiworkhub_dashboard_hub_mail_pair_begin",
+  "aiworkhub_dashboard_hub_mail_pair_complete",
 ]) assert.ok(extension.includes(`"${tool}"`), `missing WorkHub Mail bridge tool: ${tool}`);
 
 assert.ok(extension.includes('"requestHubMail"'));
 assert.ok(extension.includes('"requestHubMailDetail"'));
+const inboundAllowlist = extension.slice(
+  extension.indexOf("const ALLOWED_INBOUND_MESSAGE_TYPES"),
+  extension.indexOf("const OUTBOUND_TYPES"),
+);
+for (const inbound of ["hubMailListener", "hubMailPairBegin", "hubMailPairComplete"]) {
+  assert.ok(inboundAllowlist.includes(`"${inbound}",`), `inbound message type not allowlisted: ${inbound}`);
+}
 assert.ok(extension.includes('hubMail: "hubMail"'));
 assert.ok(extension.includes('hubMailDetail: "hubMailDetail"'));
+assert.ok(extension.includes('hubMailAction: "hubMailAction"'));
 assert.ok(extension.includes("const MESSAGE_ID_RE = /^[0-9a-f]{32}$/;"));
 const detailCase = extension.slice(extension.indexOf('case "requestHubMailDetail"'));
 assert.ok(
@@ -122,6 +168,14 @@ const elements = {
   mailInboxList: new MockNode("div"),
   mailPeersList: new MockNode("div"),
   mailDetailPanel: new MockNode("section"),
+  mailListenerHost: Object.assign(new MockNode("input"), { value: "localhost" }),
+  mailListenerPort: Object.assign(new MockNode("input"), { value: "0" }),
+  mailListenerResult: new MockNode("span"),
+  mailPairBeginResult: new MockNode("span"),
+  mailPairAddress: Object.assign(new MockNode("input"), { value: "" }),
+  mailPairCode: Object.assign(new MockNode("input"), { value: "" }),
+  mailPairTls: Object.assign(new MockNode("input"), { checked: false }),
+  mailPairCompleteResult: new MockNode("span"),
 };
 const sandbox = {
   elements,
@@ -139,6 +193,8 @@ vm.runInContext(
     sliceFunction(app, "asArray", "numberValue"),
     block,
     "this.renderHubMail = renderHubMail; this.renderHubMailDetail = renderHubMailDetail; this.requestHubMail = requestHubMail;",
+    "this.requestHubMailListenerAction = requestHubMailListenerAction; this.requestHubMailPairBegin = requestHubMailPairBegin;",
+    "this.requestHubMailPairComplete = requestHubMailPairComplete; this.renderHubMailAction = renderHubMailAction;",
   ].join("\n"),
   sandbox,
 );
@@ -217,5 +273,58 @@ assert.ok(detail.descendants().some((node) => node.tagName === "PRE" && node.tex
 posted.length = 0;
 sandbox.requestHubMail();
 assert.deepStrictEqual(JSON.parse(JSON.stringify(posted)), [{ type: "requestHubMail", includeArchived: false }]);
+
+// ---- listener and pairing controls: validated in the Webview, posted to the host
+posted.length = 0;
+sandbox.requestHubMailListenerAction("start");
+assert.deepStrictEqual(JSON.parse(JSON.stringify(posted)), [{ type: "hubMailListener", action: "start", bindHost: "localhost", port: 0 }]);
+elements.mailListenerPort.value = "70000";
+sandbox.requestHubMailListenerAction("start");
+assert.strictEqual(posted.length, 1, "an out-of-range port is refused before any post");
+assert.ok(elements.mailListenerResult.textContent.includes("port from 0 to 65535"));
+sandbox.requestHubMailListenerAction("stop");
+assert.deepStrictEqual(JSON.parse(JSON.stringify(posted[1])), { type: "hubMailListener", action: "stop" });
+
+posted.length = 0;
+sandbox.requestHubMailPairBegin();
+assert.deepStrictEqual(JSON.parse(JSON.stringify(posted)), [{ type: "hubMailPairBegin" }]);
+sandbox.requestHubMailPairComplete();
+assert.strictEqual(posted.length, 1, "pairing needs an address and a code");
+elements.mailPairAddress.value = " lab.local:4100 ";
+elements.mailPairCode.value = "ABCD-EFGH";
+elements.mailPairTls.checked = true;
+sandbox.requestHubMailPairComplete();
+assert.deepStrictEqual(JSON.parse(JSON.stringify(posted[1])), {
+  type: "hubMailPairComplete", address: "lab.local:4100", code: "ABCD-EFGH", tls: true,
+});
+
+sandbox.renderHubMailAction("listener", {
+  ok: true, action: "start", already_running: false,
+  listener: { state: "running", bind: "localhost:4100", pid: 7, address: "lab.local:4100" },
+});
+assert.strictEqual(elements.mailListenerResult.textContent, "Listener started");
+assert.ok(elements.mailListener.textContent.includes("running on localhost:4100"));
+sandbox.renderHubMailAction("listener", { ok: false, action: "start", error: hostile });
+assert.strictEqual(elements.mailListenerResult.textContent, `Listener start failed: ${hostile}`);
+sandbox.renderHubMailAction("pairBegin", { ok: true, code: "WXYZ-1234", address: "lab.local:4100", expires_at: "2026-10-28T00:10:00Z" });
+assert.ok(elements.mailPairBeginResult.textContent.includes("Code WXYZ-1234"));
+assert.ok(elements.mailPairBeginResult.textContent.includes("lab.local:4100"));
+sandbox.renderHubMailAction("pairBegin", { ok: true, code: "WXYZ-1234", address: "" });
+assert.ok(elements.mailPairBeginResult.textContent.includes("start the listener first"));
+sandbox.renderHubMailAction("pairComplete", { ok: true, peer: { machine_id: peerA, machine_label: hostile } });
+assert.ok(elements.mailPairCompleteResult.textContent.includes(`Paired with ${hostile} · a1b2c3d4`));
+sandbox.renderHubMailAction("pairComplete", { ok: false, error: "peer_refused:pair_code_invalid" });
+assert.strictEqual(elements.mailPairCompleteResult.textContent, "Pairing failed: peer_refused:pair_code_invalid");
+for (const node of [elements.mailListenerResult, elements.mailPairBeginResult, elements.mailPairCompleteResult]) {
+  assert.ok(node.descendants().every((child) => child.tagName !== "IMG"), "action results are text only");
+}
+
+// The host forwards each control only to a confirm=True dashboard write tool.
+const hostControls = extension.slice(extension.indexOf('case "hubMailListener"'), extension.indexOf('case "needfixCapture"'));
+assert.ok(hostControls.includes('runHubMailAction(view, "listener", { action, confirm: true })'));
+assert.ok(hostControls.includes('runHubMailAction(view, "listener", { action, bind_host: bindHost, port, confirm: true })'));
+assert.ok(hostControls.includes('runHubMailAction(view, "pairBegin", { confirm: true })'));
+assert.ok(hostControls.includes('runHubMailAction(view, "pairComplete", { address, code, tls: message.tls === true, confirm: true })'));
+assert.ok(!/confirm: false/.test(hostControls));
 
 console.log("WorkHub Mail popup contract verified");

@@ -502,6 +502,29 @@ summary:focus-visible,
   font-size: var(--fs-xs);
 }
 
+.mail-controls {
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.mail-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+
+.mail-field input[type="number"] {
+  width: 7ch;
+}
+
+.mail-action-result {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: var(--fs-xs);
+}
+
 .mail-peer {
   display: flex;
   flex-direction: column;

@@ -1,5 +1,9 @@
 # AIWorkHub for VS Code — Changelog
 
+## Unreleased
+
+- WorkHub Mail popup: listener status with Start/Stop, "Pair this machine" (shows code and address) and "Pair with another machine" (address, code, TLS); every write goes through a confirm-gated dashboard tool (NF-2026-01783).
+
 ## 0.12.72 — 2026-10-28
 
 0.12.71 was tagged but never published (a WorkHub Mail test failed on Python 3.14); 0.12.72 ships everything under 0.12.71 plus these fixes.

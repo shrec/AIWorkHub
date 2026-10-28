@@ -291,6 +291,18 @@ const elements = {
   mailInboxList: document.querySelector("#mail-inbox-list"),
   mailPeersList: document.querySelector("#mail-peers-list"),
   mailDetailPanel: document.querySelector("#mail-detail-panel"),
+  mailListenerHost: document.querySelector("#mail-listener-host"),
+  mailListenerPort: document.querySelector("#mail-listener-port"),
+  mailListenerStart: document.querySelector("#mail-listener-start"),
+  mailListenerStop: document.querySelector("#mail-listener-stop"),
+  mailListenerResult: document.querySelector("#mail-listener-result"),
+  mailPairBegin: document.querySelector("#mail-pair-begin"),
+  mailPairBeginResult: document.querySelector("#mail-pair-begin-result"),
+  mailPairAddress: document.querySelector("#mail-pair-address"),
+  mailPairCode: document.querySelector("#mail-pair-code"),
+  mailPairTls: document.querySelector("#mail-pair-tls"),
+  mailPairComplete: document.querySelector("#mail-pair-complete"),
+  mailPairCompleteResult: document.querySelector("#mail-pair-complete-result"),
   openSettings: document.querySelector("#open-settings"),
   settingsDialog: document.querySelector("#settings-dialog"),
   settingsSummary: document.querySelector("#settings-summary"),
@@ -3750,6 +3762,80 @@ function renderHubMailDetail(payload) {
     fragment.appendChild(createElement("pre", "mail-body", String(attachment.text || "")));
   }
   elements.mailDetailPanel.replaceChildren(fragment);
+}
+
+// Listener and pairing controls. Each request goes to the host, which calls a
+// confirm=True dashboard tool; results land in textContent only.
+function hubMailPortValue(value) {
+  const text = String(value ?? "").trim();
+  if (!/^\d{1,5}$/.test(text)) return null;
+  const port = Number(text);
+  return port <= 65535 ? port : null;
+}
+
+function requestHubMailListenerAction(action) {
+  const message = { type: "hubMailListener", action };
+  if (action === "start") {
+    const bindHost = String(elements.mailListenerHost.value || "").trim();
+    const port = hubMailPortValue(elements.mailListenerPort.value);
+    if (!bindHost || /\s/.test(bindHost) || port === null) {
+      elements.mailListenerResult.textContent = "Enter a bind host (e.g. localhost or a LAN address) and a port from 0 to 65535";
+      return;
+    }
+    message.bindHost = bindHost;
+    message.port = port;
+  }
+  elements.mailListenerResult.textContent = action === "start" ? "Starting listener" : "Stopping listener";
+  vscode.postMessage(message);
+}
+
+function requestHubMailPairBegin() {
+  elements.mailPairBeginResult.textContent = "Minting a pairing code";
+  vscode.postMessage({ type: "hubMailPairBegin" });
+}
+
+function requestHubMailPairComplete() {
+  const address = String(elements.mailPairAddress.value || "").trim();
+  const code = String(elements.mailPairCode.value || "").trim();
+  if (!address || !code) {
+    elements.mailPairCompleteResult.textContent = "Enter the other machine's listener address and pairing code";
+    return;
+  }
+  elements.mailPairCompleteResult.textContent = "Pairing";
+  vscode.postMessage({ type: "hubMailPairComplete", address, code, tls: Boolean(elements.mailPairTls.checked) });
+}
+
+function hubMailActionError(payload) {
+  return (payload && payload.error) ? String(payload.error) : "unavailable";
+}
+
+function renderHubMailAction(action, payload) {
+  const value = payload && typeof payload === "object" ? payload : {};
+  const ok = Boolean(payload) && value.ok !== false;
+  if (action === "listener") {
+    if (value.listener) renderHubMailListener(value.listener);
+    const verb = String(value.action || "listener");
+    if (!ok) elements.mailListenerResult.textContent = `Listener ${verb} failed: ${hubMailActionError(value)}`;
+    else if (verb === "stop") elements.mailListenerResult.textContent = value.stopped ? "Listener stopped" : "Listener was not running";
+    else if (verb === "start") elements.mailListenerResult.textContent = value.already_running ? "Listener already running" : "Listener started";
+    else elements.mailListenerResult.textContent = "";
+    return;
+  }
+  if (action === "pairBegin") {
+    if (!ok) {
+      elements.mailPairBeginResult.textContent = `Pairing code failed: ${hubMailActionError(value)}`;
+      return;
+    }
+    if (value.listener) renderHubMailListener(value.listener);
+    const address = String(value.address || "") || "none, start the listener first";
+    elements.mailPairBeginResult.textContent = `Code ${String(value.code || "?")} · this machine's address ${address} · expires ${String(value.expires_at || "?")}`;
+    return;
+  }
+  if (action === "pairComplete") {
+    elements.mailPairCompleteResult.textContent = ok && value.peer
+      ? `Paired with ${hubMailNodeLabel(value.peer)} · Refresh to list it`
+      : `Pairing failed: ${hubMailActionError(value)}`;
+  }
 }
 // End WorkHub Mail popup.
 
@@ -8045,6 +8131,9 @@ window.addEventListener("message", (event) => {
     case "hubMailDetail":
       renderHubMailDetail(message.payload);
       break;
+    case "hubMailAction":
+      renderHubMailAction(message.action, message.payload);
+      break;
     case "settings":
       renderSettings(message.payload);
       break;
@@ -8480,6 +8569,10 @@ elements.mailInboxList.addEventListener("click", (event) => {
   const target = event.target.closest("[data-mail-id]");
   if (target) vscode.postMessage({ type: "requestHubMailDetail", messageId: target.dataset.mailId });
 });
+elements.mailListenerStart.addEventListener("click", () => requestHubMailListenerAction("start"));
+elements.mailListenerStop.addEventListener("click", () => requestHubMailListenerAction("stop"));
+elements.mailPairBegin.addEventListener("click", requestHubMailPairBegin);
+elements.mailPairComplete.addEventListener("click", requestHubMailPairComplete);
 
 function applyManagerChatCollapsed(collapsed) {
   state.managerChatCollapsed = Boolean(collapsed);

@@ -6,6 +6,8 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+- WorkHub Mail: MCP startup now restarts a listener the owner enabled, and new confirm-gated dashboard tools (`aiworkhub_dashboard_hub_mail_listener`, `_pair_begin`, `_pair_complete`) start/stop the listener and pair machines (NF-2026-01783).
+
 ## [0.12.72] - 2026-10-28
 
 0.12.71 was tagged but never published: its CI run failed on Python 3.14 in a WorkHub Mail test. 0.12.72 ships everything listed under 0.12.71 plus the fixes below.

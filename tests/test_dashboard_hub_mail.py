@@ -30,6 +30,9 @@ PEER_SECRET = "5ec4e7" + "ab" * 29
 PIDFILE_TOKEN = "70ce4" + "f" * 27
 LIST_TOOL = "aiworkhub_dashboard_hub_mail"
 DETAIL_TOOL = "aiworkhub_dashboard_hub_mail_detail"
+LISTENER_TOOL = "aiworkhub_dashboard_hub_mail_listener"
+PAIR_BEGIN_TOOL = "aiworkhub_dashboard_hub_mail_pair_begin"
+PAIR_COMPLETE_TOOL = "aiworkhub_dashboard_hub_mail_pair_complete"
 
 
 @pytest.fixture
@@ -273,3 +276,156 @@ def test_hub_mail_tools_are_registered_with_documented_args():
     assert "limit:" in dashboard_mcp_app.hub_mail_view.__doc__
     assert "include_archived:" in dashboard_mcp_app.hub_mail_view.__doc__
     assert "message_id:" in dashboard_mcp_app.hub_mail_detail_view.__doc__
+    assert dashboard_mcp_app.HUB_MAIL_WRITE_TOOLS == {
+        LISTENER_TOOL: dashboard_mcp_app.hub_mail_listener_action_view,
+        PAIR_BEGIN_TOOL: dashboard_mcp_app.hub_mail_pair_begin_view,
+        PAIR_COMPLETE_TOOL: dashboard_mcp_app.hub_mail_pair_complete_view,
+    }
+    for tool in (LISTENER_TOOL, PAIR_BEGIN_TOOL, PAIR_COMPLETE_TOOL):
+        assert tool in names and tool in registered
+    for fn, args in (
+        (dashboard_mcp_app.hub_mail_listener_action_view,
+         ("action:", "bind_host:", "port:", "tls_cert:", "tls_key:", "confirm:")),
+        (dashboard_mcp_app.hub_mail_pair_begin_view, ("machine_label:", "confirm:")),
+        (dashboard_mcp_app.hub_mail_pair_complete_view,
+         ("address:", "code:", "tls:", "listener_address:", "confirm:")),
+    ):
+        assert fn.__doc__.startswith("USER WRITE:")
+        for arg in args:
+            assert arg in fn.__doc__, (fn.__name__, arg)
+
+
+@pytest.fixture
+def writable(home, monkeypatch) -> Path:
+    monkeypatch.setattr(dashboard_mcp_app.core, "writes_allowed", lambda: True)
+    return home
+
+
+def test_hub_mail_writes_refuse_without_confirm_and_write_nothing(writable, monkeypatch):
+    def _forbidden(*_args, **_kwargs):
+        raise AssertionError("hub_mail_net reached without confirm=True")
+
+    for name in ("listener_action", "pair_begin", "pair_complete", "set_machine_label"):
+        monkeypatch.setattr(hub_mail_net, name, _forbidden)
+
+    refused = [
+        dashboard_mcp_app.hub_mail_listener_action_view(action="start", bind_host="localhost", port=0),
+        dashboard_mcp_app.hub_mail_listener_action_view(action="stop", confirm=False),
+        dashboard_mcp_app.hub_mail_pair_begin_view(machine_label="desk"),
+        dashboard_mcp_app.hub_mail_pair_complete_view(address="localhost:9", code="ABCD", confirm="yes"),
+    ]
+
+    assert [(r["ok"], r["error"], r["authority"]) for r in refused] == [
+        (False, "confirm_required", "storage_write")
+    ] * 4
+    assert [r["server_tool"] for r in refused] == [
+        LISTENER_TOOL, LISTENER_TOOL, PAIR_BEGIN_TOOL, PAIR_COMPLETE_TOOL,
+    ]
+    assert not hub_mail_net.listener_config_path(writable).exists()
+    assert not hub_mail_net.pairing_path(writable).exists()
+    assert not hub_mail_net.machine_id_path(writable).exists()
+
+
+def test_hub_mail_writes_refuse_while_the_write_gate_is_closed(home, monkeypatch):
+    monkeypatch.setattr(dashboard_mcp_app.core, "writes_allowed", lambda: False)
+
+    closed = [
+        dashboard_mcp_app.hub_mail_listener_action_view(action="start", bind_host="localhost", port=0, confirm=True),
+        dashboard_mcp_app.hub_mail_pair_begin_view(confirm=True),
+        dashboard_mcp_app.hub_mail_pair_complete_view(address="localhost:9", code="ABCD", confirm=True),
+    ]
+
+    assert [r["error"] for r in closed] == ["write_gate_closed"] * 3
+    assert not hub_mail_net.pairing_path(home).exists()
+
+
+def test_listener_status_is_read_only_and_needs_no_confirm(home, monkeypatch):
+    monkeypatch.setattr(dashboard_mcp_app.core, "writes_allowed", lambda: False)
+
+    status = dashboard_mcp_app.hub_mail_listener_action_view()
+
+    assert status["ok"] is True and status["authority"] == "readonly"
+    assert status["server_tool"] == LISTENER_TOOL and status["action"] == "status"
+    assert status["listener"]["state"] == "stopped" and status["listener"]["enabled"] is False
+    assert not hub_mail_net.listener_config_path(home).exists()
+    _seed_pidfile(home)
+    running = dashboard_mcp_app.hub_mail_listener_action_view(action="status")
+    assert running["listener"]["state"] == "running" and running["listener"]["pid"] == os.getpid()
+    assert PIDFILE_TOKEN not in json.dumps(running)
+    invalid = dashboard_mcp_app.hub_mail_listener_action_view(action="restart", confirm=True)
+    assert invalid["ok"] is False and invalid["error"] == "listener_action_invalid"
+
+
+def test_listener_start_stop_round_trip_in_a_tmp_home(writable):
+    started = dashboard_mcp_app.hub_mail_listener_action_view(
+        action="start", bind_host="127.0.0.1", port=0, confirm=True,
+    )
+    try:
+        assert started["ok"] is True, started
+        assert started["authority"] == "storage_write" and started["already_running"] is False
+        listener = started["listener"]
+        assert listener["state"] == "running" and listener["enabled"] is True
+        assert listener["pid"] not in (0, os.getpid()) and listener["address"].startswith("127.0.0.1:")
+        assert "token" not in json.dumps(started)
+        status = dashboard_mcp_app.hub_mail_listener_action_view(action="status")
+        assert status["listener"]["pid"] == listener["pid"]
+        # The persisted opt-in is exactly what MCP startup's ensure_listener reads.
+        assert json.loads(hub_mail_net.listener_config_path(writable).read_text(encoding="utf-8"))["enabled"] is True
+    finally:
+        stopped = dashboard_mcp_app.hub_mail_listener_action_view(action="stop", confirm=True)
+    assert stopped["ok"] is True and stopped["stopped"] is True, stopped
+    assert stopped["listener"]["state"] == "stopped" and stopped["listener"]["enabled"] is False
+    assert hub_mail_net.ensure_listener(writable) is None
+
+
+def test_pair_begin_returns_a_code_and_address_but_never_a_secret(writable):
+    _seed_peer(writable, PEER_ONE, "lab", [{"hub_id": PEER_HUB, "repo_name": "geoai"}])
+    _seed_pidfile(writable)
+
+    begun = dashboard_mcp_app.hub_mail_pair_begin_view(machine_label="desk\x07", confirm=True)
+
+    assert begun["ok"] is True and begun["authority"] == "storage_write"
+    assert begun["server_tool"] == PAIR_BEGIN_TOOL
+    assert len(begun["code"].replace("-", "")) >= 8
+    assert begun["machine_label"] == "desk" and begun["expires_at"]
+    assert begun["listener"]["state"] == "running" and begun["address"] == begun["listener"]["address"]
+    text = json.dumps(begun)
+    assert PEER_SECRET not in text and PIDFILE_TOKEN not in text and "secret" not in text
+    stored = json.loads(hub_mail_net.pairing_path(writable).read_text(encoding="utf-8"))
+    assert stored["code"] == begun["code"].replace("-", "")
+
+
+def test_pair_complete_delegates_and_returns_the_peer_without_its_secret(writable, monkeypatch):
+    seen: dict[str, object] = {}
+
+    def fake_pair_complete(address, code, *, tls=False, listener_address=None, home=None):
+        seen.update(address=address, code=code, tls=tls, listener_address=listener_address)
+        return {
+            "ok": True, "schema_id": hub_mail_net.PEER_SCHEMA_ID,
+            "peer": {
+                "machine_id": PEER_ONE, "machine_label": "lab", "address": "lab.local:4100",
+                "hubs": [{"hub_id": PEER_HUB, "repo_name": "geoai"}], "secret": PEER_SECRET,
+                "paired_at": "2026-10-28T00:00:00Z", "last_seen": "2026-10-28T00:00:00Z",
+                "tls_cert_sha256": "ab" * 32,
+            },
+        }
+
+    monkeypatch.setattr(hub_mail_net, "pair_complete", fake_pair_complete)
+
+    paired = dashboard_mcp_app.hub_mail_pair_complete_view(
+        address="lab.local:4100", code="ABCD-EFGH", tls=True, confirm=True,
+    )
+
+    assert seen == {"address": "lab.local:4100", "code": "ABCD-EFGH", "tls": True, "listener_address": None}
+    assert paired["ok"] is True and paired["server_tool"] == PAIR_COMPLETE_TOOL
+    assert paired["peer"]["machine_id"] == PEER_ONE and paired["peer"]["tls_pinned"] is True
+    assert PEER_SECRET not in json.dumps(paired) and "secret" not in paired["peer"]
+
+    monkeypatch.setattr(
+        hub_mail_net, "pair_complete", lambda *_a, **_k: {"ok": False, "error": "local_listener_not_running"},
+    )
+    failed = dashboard_mcp_app.hub_mail_pair_complete_view(address="lab.local:4100", code="ABCD", confirm=True)
+    assert failed == {
+        "ok": False, "error": "local_listener_not_running",
+        "server_tool": PAIR_COMPLETE_TOOL, "authority": "storage_write",
+    }

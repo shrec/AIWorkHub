@@ -373,6 +373,9 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
   "requestRoadmapDetail",
   "requestHubMail",
   "requestHubMailDetail",
+  "hubMailListener",
+  "hubMailPairBegin",
+  "hubMailPairComplete",
   "needfixCapture",
   "needfixUpdate",
   "needfixTransition",
@@ -442,6 +445,7 @@ const OUTBOUND_TYPES = Object.freeze({
   waveMiniRoadmapDetail: "waveMiniRoadmapDetail",
   hubMail: "hubMail",
   hubMailDetail: "hubMailDetail",
+  hubMailAction: "hubMailAction",
   settings: "settings",
   managerLoopStatus: "managerLoopStatus",
   managerLoopEvents: "managerLoopEvents",
@@ -572,6 +576,9 @@ const ROADMAP_ID_RE = /^RM-\d{4}-\d{5}$/;
 const HUB_MAIL_TOOLS = Object.freeze({
   list: "aiworkhub_dashboard_hub_mail",
   detail: "aiworkhub_dashboard_hub_mail_detail",
+  listener: "aiworkhub_dashboard_hub_mail_listener",
+  pairBegin: "aiworkhub_dashboard_hub_mail_pair_begin",
+  pairComplete: "aiworkhub_dashboard_hub_mail_pair_complete",
 });
 const MESSAGE_ID_RE = /^[0-9a-f]{32}$/;
 const SOURCE_GRAPH_SETTINGS_UPDATE_TOOL = "aiworkhub_dashboard_source_graph_settings_update";
@@ -11004,6 +11011,23 @@ async function pushHubMailDetail(view, messageId) {
   }
 }
 
+function postHubMailAction(view, action, payload) {
+  view.postMessage({ type: OUTBOUND_TYPES.hubMailAction, action, payload });
+}
+
+async function runHubMailAction(view, action, args) {
+  const tool = HUB_MAIL_TOOLS[action];
+  if (!tool) return;
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const payload = await client.callTool(tool, args);
+    if (view.stillBoundTo(client)) postHubMailAction(view, action, sanitizeWebviewPayload(payload));
+  } catch (err) {
+    postHubMailAction(view, action, { ok: false, action: args.action, error: sanitizeErrorMessage(err) });
+  }
+}
+
 async function runNeedfixAction(view, action, args) {
   const tool = NEEDFIX_TOOLS[action];
   if (!tool) return;
@@ -11967,6 +11991,30 @@ function handleInboundMessage(view, message) {
     case "requestHubMailDetail": {
       const messageId = String(message.messageId || "");
       if (MESSAGE_ID_RE.test(messageId)) pushHubMailDetail(view, messageId);
+      break;
+    }
+    // WorkHub Mail listener and pairing: every write reaches a confirm=True
+    // dashboard tool, and only after its fields are shape-checked here.
+    case "hubMailListener": {
+      const action = String(message.action || "");
+      const bindHost = String(message.bindHost || "").trim().slice(0, 255);
+      const port = Number(message.port);
+      if (action === "status") runHubMailAction(view, "listener", { action });
+      else if (action === "stop") runHubMailAction(view, "listener", { action, confirm: true });
+      else if (action === "start" && bindHost && !/\s/.test(bindHost) && Number.isInteger(port) && port >= 0 && port <= 65535) {
+        runHubMailAction(view, "listener", { action, bind_host: bindHost, port, confirm: true });
+      } else postHubMailAction(view, "listener", { ok: false, action, error: "listener_request_invalid" });
+      break;
+    }
+    case "hubMailPairBegin":
+      runHubMailAction(view, "pairBegin", { confirm: true });
+      break;
+    case "hubMailPairComplete": {
+      const address = String(message.address || "").trim().slice(0, 300);
+      const code = String(message.code || "").trim().slice(0, 64);
+      if (address && code) {
+        runHubMailAction(view, "pairComplete", { address, code, tls: message.tls === true, confirm: true });
+      } else postHubMailAction(view, "pairComplete", { ok: false, error: "address_and_code_required" });
       break;
     }
     // The three NeedFix mutation tools now answer with a receipt whose `item`
@@ -14410,6 +14458,25 @@ function getHtmlForWebview(webview, extensionUri) {
       <span class="mail-listener" id="mail-listener">Listener: unknown</span>
       <label class="needfix-archived-toggle"><input id="mail-include-archived" type="checkbox"> Archived</label>
       <button id="mail-refresh" type="button">Refresh</button>
+    </div>
+    <div class="needfix-toolbar mail-controls">
+      <label class="mail-field">Bind host <input id="mail-listener-host" type="text" value="localhost" placeholder="e.g. localhost or a LAN address" spellcheck="false"></label>
+      <label class="mail-field">Port <input id="mail-listener-port" type="number" min="0" max="65535" step="1" value="0" title="0 picks a free port"></label>
+      <button id="mail-listener-start" type="button">Start listener</button>
+      <button id="mail-listener-stop" type="button">Stop listener</button>
+      <span class="mail-action-result" id="mail-listener-result" aria-live="polite"></span>
+    </div>
+    <div class="needfix-toolbar mail-controls">
+      <button id="mail-pair-begin" type="button">Pair this machine</button>
+      <span class="mail-action-result" id="mail-pair-begin-result" aria-live="polite"></span>
+    </div>
+    <div class="needfix-toolbar mail-controls">
+      <span class="mail-column-title">Pair with another machine</span>
+      <label class="mail-field">Address <input id="mail-pair-address" type="text" placeholder="host:port, e.g. localhost or a LAN address" spellcheck="false"></label>
+      <label class="mail-field">Code <input id="mail-pair-code" type="text" autocomplete="off" spellcheck="false"></label>
+      <label class="needfix-archived-toggle"><input id="mail-pair-tls" type="checkbox"> TLS</label>
+      <button id="mail-pair-complete" type="button">Pair</button>
+      <span class="mail-action-result" id="mail-pair-complete-result" aria-live="polite"></span>
     </div>
     <div class="needfix-workspace mail-workspace">
       <div class="mail-column">

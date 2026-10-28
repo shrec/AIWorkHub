@@ -3845,9 +3845,9 @@ def _hub_mail_peer_row(peer: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _hub_mail_listener() -> dict[str, Any]:
+def _hub_mail_listener(status: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """listener_status() reduced to display fields; the pidfile token never leaves."""
-    status = hub_mail_net.listener_status()
+    status = hub_mail_net.listener_status() if status is None else status
     running = bool(status.get("running"))
     host, port = str(status.get("bind_host") or ""), int(status.get("port") or 0)
     return {
@@ -3963,6 +3963,151 @@ def hub_mail_detail_view(message_id: str) -> dict[str, Any]:
     mail = dict(shown["mail"])
     mail["untrusted_data"] = True
     return _needfix_response({"ok": True, "untrusted_data": True, "mail": mail}, tool)
+
+
+def _hub_mail_write_refusal(tool: str, confirm: Any) -> dict[str, Any] | None:
+    """The gate every dashboard hub mail write shares, or None to proceed.
+
+    confirm=True first, then the write gate, then the same verified local hub
+    route as hub_mail_view; nothing is read or written until all three pass.
+    """
+    if confirm is not True:
+        return _needfix_response({"ok": False, "error": "confirm_required"}, tool, write=True)
+    if not core.writes_allowed():
+        return _needfix_response({"ok": False, "error": "write_gate_closed"}, tool, write=True)
+    local, refusal = _hub_mail_local()
+    if refusal is not None or local is None:
+        return _needfix_response(
+            refusal or {"ok": False, "error": "local_hub_identity_unavailable"}, tool, write=True,
+        )
+    return None
+
+
+def hub_mail_listener_action_view(
+    action: str = "status",
+    bind_host: str | None = None,
+    port: int | None = None,
+    tls_cert: str | None = None,
+    tls_key: str | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """USER WRITE: start or stop this machine's WorkHub Mail listener; status is read-only.
+
+    Use this from the dashboard WorkHub Mail panel; aiworkhub_dashboard_hub_mail shows the same listener state with the inbox. start persists enabled=true, so MCP startup restarts the listener, and stop persists enabled=false. One listener runs per home (pidfile) and there is no default bind address. start and stop require confirm=True and an open write gate; status needs neither. Delegates to the same hub_mail_net.listener_action as aiworkhub_manager_hub_mail_listener and never returns the pidfile token.
+
+    Args:
+        action: str start, stop or status (default "status"); status is read-only.
+        bind_host: optional str interface to bind for start, e.g. localhost or a LAN address; required for start.
+        port: optional int TCP port for start; required for start (0 picks a free port).
+        tls_cert: optional str PEM certificate path for TLS; give together with tls_key, omit for plain HTTP.
+        tls_key: optional str PEM private key path for TLS; give together with tls_cert.
+        confirm: bool (default False); must be True to start or stop the listener.
+    """
+    tool = "aiworkhub_dashboard_hub_mail_listener"
+    verb = str(action or "status")
+    if verb == "status":
+        local, refusal = _hub_mail_local()
+        if refusal is not None or local is None:
+            return _needfix_response(refusal or {"ok": False, "error": "local_hub_identity_unavailable"}, tool)
+        status = hub_mail_net.listener_action("status")
+        return _needfix_response({"ok": True, "action": verb, "listener": _hub_mail_listener(status)}, tool)
+    if verb not in ("start", "stop"):
+        return _needfix_response({"ok": False, "error": "listener_action_invalid"}, tool, write=True)
+    refusal = _hub_mail_write_refusal(tool, confirm)
+    if refusal is not None:
+        return refusal
+    try:
+        result = hub_mail_net.listener_action(
+            verb, bind_host=str(bind_host or "") or None, port=port,
+            tls_cert=str(tls_cert or "") or None, tls_key=str(tls_key or "") or None,
+        )
+    except (hub_mail.HubMailError, OSError, TypeError, ValueError) as exc:
+        result = {"ok": False, "error": f"{type(exc).__name__}:{str(exc)[:200]}"}
+    response: dict[str, Any] = {
+        "ok": bool(result.get("ok")),
+        "action": verb,
+        "listener": _hub_mail_listener(result if "running" in result else None),
+    }
+    if not response["ok"]:
+        response["error"] = str(result.get("error") or "")[:240]
+    for key in ("already_running", "stopped"):
+        if key in result:
+            response[key] = bool(result[key])
+    if result.get("log"):
+        response["log"] = str(result["log"])[:500]
+    return _needfix_response(response, tool, write=True)
+
+
+def hub_mail_pair_begin_view(machine_label: str | None = None, confirm: bool = False) -> dict[str, Any]:
+    """USER WRITE: mint a single-use code to pair this machine with another for WorkHub Mail.
+
+    Read the code and this machine's listener address to the other machine's owner out of band; they enter both in aiworkhub_dashboard_hub_mail_pair_complete. The code expires after 10 minutes, dies after 5 failed proofs and replaces any older code; this machine's listener must be running to accept the pairing. Requires confirm=True and an open write gate. Delegates to the same hub_mail_net.set_machine_label and pair_begin as aiworkhub_manager_hub_mail_pair_begin; no peer secret is returned.
+
+    Args:
+        machine_label: optional str display label for this machine as peers see it (at most 64 characters, control characters stripped); omit or leave empty to keep the current label.
+        confirm: bool (default False); must be True to mint the code.
+    """
+    tool = "aiworkhub_dashboard_hub_mail_pair_begin"
+    refusal = _hub_mail_write_refusal(tool, confirm)
+    if refusal is not None:
+        return refusal
+    try:
+        if machine_label:
+            hub_mail_net.set_machine_label(str(machine_label))
+        begun = hub_mail_net.pair_begin()
+    except (hub_mail.HubMailError, OSError, TypeError, ValueError) as exc:
+        begun = {"ok": False, "error": f"{type(exc).__name__}:{str(exc)[:200]}"}
+    if not begun.get("ok"):
+        return _needfix_response({"ok": False, "error": str(begun.get("error") or "")[:240]}, tool, write=True)
+    listener = _hub_mail_listener(begun["listener"] if isinstance(begun.get("listener"), Mapping) else None)
+    response = {
+        "ok": True,
+        "schema_id": "aiworkhub.dashboard.hub_mail_pair_begin.v1",
+        "code": str(begun.get("code") or ""),
+        "expires_at": str(begun.get("expires_at") or ""),
+        "max_failed_proofs": int(begun.get("max_failed_proofs") or 0),
+        "machine_id": str(begun.get("machine_id") or ""),
+        "machine_label": str(begun.get("machine_label") or ""),
+        "address": listener["address"],
+        "listener": listener,
+    }
+    return _needfix_response(response, tool, write=True)
+
+
+def hub_mail_pair_complete_view(
+    address: str,
+    code: str,
+    tls: bool = False,
+    listener_address: str = "",
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """USER WRITE: pair this machine with another one's WorkHub Mail listener.
+
+    Use the address and code the other machine's owner read out from its pair_begin. The code itself never crosses the network: both machines derive one per-peer secret from it and prove they hold it. This machine's own listener must be running so the peer can mail back. Requires confirm=True and an open write gate. Delegates to the same hub_mail_net.pair_complete as aiworkhub_manager_hub_mail_pair_complete; the paired peer is returned as display data without its secret.
+
+    Args:
+        address: str the other machine's listener address as host:port (or [ipv6]:port).
+        code: str the pairing code read out by the other machine's owner; dashes and spaces are ignored.
+        tls: bool (default False); True when the other listener runs with TLS, pinning its certificate sha256.
+        listener_address: str (default empty) this machine's own listener address as host:port that the peer dials back; empty uses the running listener's advertised address.
+        confirm: bool (default False); must be True to pair.
+    """
+    tool = "aiworkhub_dashboard_hub_mail_pair_complete"
+    refusal = _hub_mail_write_refusal(tool, confirm)
+    if refusal is not None:
+        return refusal
+    try:
+        result = hub_mail_net.pair_complete(
+            str(address or ""), str(code or ""), tls=tls is True,
+            listener_address=str(listener_address or "") or None,
+        )
+        if not result.get("ok") or not isinstance(result.get("peer"), Mapping):
+            response = {"ok": False, "error": str(result.get("error") or "pair_response_invalid")[:240]}
+        else:
+            response = {"ok": True, "untrusted_data": True, "peer": _hub_mail_peer_row(result["peer"])}
+    except (hub_mail.HubMailError, OSError, TypeError, ValueError, KeyError) as exc:
+        response = {"ok": False, "error": f"{type(exc).__name__}:{str(exc)[:200]}"}
+    return _needfix_response(response, tool, write=True)
 
 
 def needfix_capture_view(
@@ -4707,6 +4852,11 @@ HUB_MAIL_READ_TOOLS: dict[str, Any] = {
     "aiworkhub_dashboard_hub_mail": hub_mail_view,
     "aiworkhub_dashboard_hub_mail_detail": hub_mail_detail_view,
 }
+HUB_MAIL_WRITE_TOOLS: dict[str, Any] = {
+    "aiworkhub_dashboard_hub_mail_listener": hub_mail_listener_action_view,
+    "aiworkhub_dashboard_hub_mail_pair_begin": hub_mail_pair_begin_view,
+    "aiworkhub_dashboard_hub_mail_pair_complete": hub_mail_pair_complete_view,
+}
 SETTINGS_TOOL_NAME = "aiworkhub_dashboard_settings"
 SETTINGS_TOOLS: dict[str, Any] = {SETTINGS_TOOL_NAME: settings_view}
 SETTINGS_UPDATE_TOOL_NAME = "aiworkhub_dashboard_settings_update"
@@ -4786,6 +4936,8 @@ def register(mcp: Any) -> tuple[str, ...]:
         mcp.tool(name=name)(fn)
     for name, fn in HUB_MAIL_READ_TOOLS.items():
         mcp.tool(name=name)(fn)
+    for name, fn in HUB_MAIL_WRITE_TOOLS.items():
+        mcp.tool(name=name)(fn)
     for name, fn in SETTINGS_TOOLS.items():
         mcp.tool(name=name)(fn)
     for name, fn in SETTINGS_UPDATE_TOOLS.items():
@@ -4826,6 +4978,7 @@ def register(mcp: Any) -> tuple[str, ...]:
         + tuple(NEEDFIX_WRITE_TOOLS)
         + tuple(ROADMAP_READ_TOOLS)
         + tuple(HUB_MAIL_READ_TOOLS)
+        + tuple(HUB_MAIL_WRITE_TOOLS)
         + tuple(SETTINGS_UPDATE_TOOLS)
         + tuple(MODEL_SETTINGS_UPDATE_TOOLS)
         + tuple(SOURCE_GRAPH_SETTINGS_UPDATE_TOOLS)
