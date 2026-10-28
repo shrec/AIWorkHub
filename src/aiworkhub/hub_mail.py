@@ -34,7 +34,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from . import __version__, shared_router
+from . import __version__, platform_io, shared_router
 from .worker_workspace import _redact_validation_secrets
 
 SCHEMA_ID = "aiworkhub.hub_mail.v1"
@@ -175,12 +175,12 @@ def _write_tmp(path: Path, data: bytes) -> Path:
     return temporary
 
 
-def _atomic_write(path: Path, data: bytes) -> None:
-    """Write ``data`` to a tmp file in the same directory, then os.replace it."""
+def _write_over(path: Path, data: bytes) -> None:
+    """Write ``data`` to a tmp file in the same directory, then replace ``path``."""
 
     temporary = _write_tmp(path, data)
     try:
-        os.replace(temporary, path)
+        platform_io.atomic_replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -447,7 +447,7 @@ def _write_reason(target: Path, *, source_box: str, reason: str) -> None:
         "reason": reason,
         "quarantined_at": _format_time(_now(None)),
     }
-    _atomic_write(
+    _write_over(
         target.with_name(f"{target.name}.reason.json"),
         json.dumps(sidecar, sort_keys=True).encode("utf-8"),
     )
@@ -602,7 +602,7 @@ def deliver(data: bytes, *, to_hub_id: str, message_id: str, home: Path | None =
         return "already_delivered"
     conflict_dir = box_dir(to_hub_id, "quarantine", home)
     conflict = conflict_dir / f"{message_id}.{time.time_ns()}.json"
-    _atomic_write(conflict, data)
+    _write_over(conflict, data)
     _write_reason(conflict, source_box="delivery", reason="duplicate_conflict")
     return "duplicate_conflict"
 
@@ -733,7 +733,7 @@ def _send(
     envelope["signature"] = sign(envelope, keyring.peer_key(to_hub_id) or keyring.local_key)
     data = envelope_bytes(envelope)
     sent_copy = box_dir(local_id, "outbox", home) / f"{message_id}.json"
-    _atomic_write(sent_copy, data)
+    _write_over(sent_copy, data)
     outcome: dict[str, str]
     if peer is not None:
         from . import hub_mail_net

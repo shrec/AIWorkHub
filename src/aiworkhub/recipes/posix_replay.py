@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from ..platform_io import is_macos, is_windows
 from ._common import emit
 
 SCHEMA_ID = "aiworkhub.posix_replay.v1"
@@ -333,7 +334,7 @@ def replay(ref: str, tests_raw: str, interpreter: str, wsl_user_raw: str) -> dic
         "state": "error",
         "ref": ref,
         "commit_sha": None,
-        "platform": sys.platform,
+        "platform": "windows" if is_windows() else "macos" if is_macos() else "linux",
         "passed": 0,
         "failed": 0,
         "skipped": 0,

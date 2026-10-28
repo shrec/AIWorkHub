@@ -52,7 +52,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from . import hub_mail, runtime_temp, shared_router
+from . import hub_mail, platform_io, runtime_temp, shared_router
 
 PEER_SCHEMA_ID = "aiworkhub.hub_mail.peer.v1"
 PAIRING_SCHEMA_ID = "aiworkhub.hub_mail.pairing.v1"
@@ -189,7 +189,7 @@ def _read_json(path: Path, limit: int = MAX_STATE_FILE_BYTES) -> dict[str, Any] 
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
-    hub_mail._atomic_write(path, json.dumps(value, sort_keys=True, indent=1).encode("utf-8"))
+    hub_mail._write_over(path, json.dumps(value, sort_keys=True, indent=1).encode("utf-8"))
 
 
 def _iso(seconds: float) -> str:
@@ -1352,7 +1352,7 @@ def start_listener(
     package_parent = str(Path(__file__).resolve().parents[1])
     env["PYTHONPATH"] = os.pathsep.join(p for p in (package_parent, env.get("PYTHONPATH", "")) if p)
     options: dict[str, Any] = {}
-    if os.name == "nt":
+    if platform_io.is_windows():
         options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
     else:
         options["start_new_session"] = True
@@ -1378,7 +1378,7 @@ def start_listener(
     process.terminate()
     if (_read_json(pidfile_path(home)) or {}).get("token") == start_token:
         # The redirector's base-interpreter child may outlive it: ask it to stop.
-        hub_mail._atomic_write(stop_request_path(home), b"stop")
+        hub_mail._write_over(stop_request_path(home), b"stop")
     return {"ok": False, "error": "listener_start_timeout", "log": str(listener_log_path(home))}
 
 
@@ -1399,7 +1399,7 @@ def stop_listener(home: Path | None = None, *, wait_seconds: float = LISTENER_ST
         return {**listener_status(home), "stopped": False}
     pid = status["pid"]
     stop_file = stop_request_path(home)
-    hub_mail._atomic_write(stop_file, b"stop")
+    hub_mail._write_over(stop_file, b"stop")
     deadline = time.monotonic() + wait_seconds
     try:
         while time.monotonic() < deadline and listener_status(home)["running"]:

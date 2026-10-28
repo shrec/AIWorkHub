@@ -517,8 +517,12 @@ def test_a_stale_pidfile_with_a_recycled_pid_is_never_signalled(world, monkeypat
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(stale), encoding="utf-8")
 
-    def forbidden_kill(*args):
-        raise AssertionError(f"os.kill called for a recycled pid: {args}")
+    real_kill = hub_mail_net.os.kill
+
+    def forbidden_kill(pid, sig, *args):
+        if sig == 0:
+            return real_kill(pid, sig, *args)
+        raise AssertionError(f"os.kill signalled a recycled pid: {(pid, sig, *args)}")
 
     monkeypatch.setattr(hub_mail_net.os, "kill", forbidden_kill)
     write_stale()
