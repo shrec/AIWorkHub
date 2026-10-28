@@ -485,9 +485,12 @@ def test_a_deeply_nested_inbox_file_is_quarantined_instead_of_crashing_reads(hom
     listing = hub_mail.inbox(local_hub_id=HUB_B, home=home)
     assert listing["ok"] is True
     assert [m["message_id"] for m in listing["mails"]] == [good_id]
-    assert {item["file"]: item["reason"] for item in listing["quarantined"]} == {
-        f"{listed_id}.json": "envelope_unprocessable",
-    }
+    # Python 3.14 bounds json by C stack, not a fixed depth, and parses this
+    # file into a list; either way it is quarantined, never a crashed read.
+    assert {item["file"]: item["reason"] for item in listing["quarantined"]} in (
+        {f"{listed_id}.json": "envelope_unprocessable"},
+        {f"{listed_id}.json": "envelope_not_object"},
+    )
     (inbox_dir / f"{shown_id}.json").write_bytes(nested)
     shown = hub_mail.show(local_hub_id=HUB_B, message_id=shown_id, home=home)
     assert shown == {"ok": False, "error": "message_not_found", "message_id": shown_id}
