@@ -4096,7 +4096,7 @@ def _continuation_put(
     if chunk_size is None:
         chunk_size = max(1, len(canonical_bytes))
     if page_count is None:
-        page_count = (len(canonical_bytes) + chunk_size - 1) // chunk_size
+        page_count = len(_continuation_page_bounds(canonical_bytes, chunk_size))
     if chunk_size <= 0 or page_count <= 0:
         return None
     with _CONTINUATION_LOCK:
@@ -4296,36 +4296,79 @@ def _compact_source_graph_content(payload: Any) -> Any:
     return compact
 
 
+def _continuation_cut(canonical_bytes: bytes, start: int, chunk_size: int) -> int:
+    """End offset of the page starting at ``start``: at most ``chunk_size``
+    bytes, moved back at most 3 bytes so the next page never begins inside a
+    multi-byte UTF-8 sequence.  Bytes that are not UTF-8 keep the plain cut."""
+    total = len(canonical_bytes)
+    end = min(start + chunk_size, total)
+    if end >= total:
+        return total
+    cut = end
+    back = 0
+    while back < 3 and cut > start + 1 and (canonical_bytes[cut] & 0xC0) == 0x80:
+        cut -= 1
+        back += 1
+    if (canonical_bytes[cut] & 0xC0) == 0x80:
+        return end
+    return cut
+
+
+def _continuation_page_bounds(
+    canonical_bytes: bytes, chunk_size: int
+) -> list[tuple[int, int]]:
+    """Every page's ``(start, end)`` byte offsets, in order, covering the
+    canonical bytes exactly once."""
+    bounds: list[tuple[int, int]] = []
+    start = 0
+    total = len(canonical_bytes)
+    while start < total:
+        end = _continuation_cut(canonical_bytes, start, chunk_size)
+        bounds.append((start, end))
+        start = end
+    return bounds
+
+
 def _continuation_page_result(
     *,
     store_id: str,
     page_index: int,
+    start: int,
     meta: dict[str, Any],
     canonical_bytes: bytes,
     chunk_size: int,
     page_count: int,
     content_sha256: str,
 ) -> tuple[dict[str, Any], int]:
-    """Render one page (base64 chunk) and mint the next cursor when bytes remain."""
-    start = page_index * chunk_size
-    chunk = canonical_bytes[start:start + chunk_size]
-    has_more = start + chunk_size < len(canonical_bytes)
+    """Render the page beginning at byte ``start`` (UTF-8 text when the page
+    bytes are valid UTF-8, else base64) and mint the next cursor, carrying the
+    next page's byte offset, when bytes remain."""
+    end = _continuation_cut(canonical_bytes, start, chunk_size)
+    chunk = canonical_bytes[start:end]
+    has_more = end < len(canonical_bytes)
     if has_more:
         next_cursor = _encode_continuation_cursor({
             "schema_id": CONTINUATION_SCHEMA_ID,
             "store_id": store_id,
             "page_index": page_index + 1,
+            "offset": end,
             "content_sha256": content_sha256,
         })
     else:
         next_cursor = None
+    try:
+        content = chunk.decode("utf-8")
+        content_encoding = "utf-8"
+    except UnicodeDecodeError:
+        content = base64.b64encode(chunk).decode("ascii")
+        content_encoding = "base64"
     result = {
         **meta,
         "truncated": bool(meta.get("internal_truncated")) or has_more,
         "outer_truncated": has_more,
         "bytes": len(chunk),
-        "content": base64.b64encode(chunk).decode("ascii"),
-        "content_encoding": "base64",
+        "content": content,
+        "content_encoding": content_encoding,
         "content_sha256": content_sha256,
         # ``content_sha256`` covers the WHOLE canonical response; on a paged
         # reply the bytes actually returned are this chunk, so it keeps its own
@@ -4349,19 +4392,40 @@ def _serialized_response_bytes(result: Mapping[str, Any]) -> int:
     )
 
 
+def _continuation_page_text(result: Mapping[str, Any]) -> str | None:
+    """The page text of a paged reply, whichever encoding it carries
+    (``utf-8`` text, or ``base64`` for a page that is not valid UTF-8)."""
+    content = result.get("content")
+    encoding = result.get("content_encoding")
+    if not isinstance(content, str):
+        return None
+    if encoding == "utf-8":
+        return content
+    if encoding == "base64":
+        try:
+            return base64.b64decode(content, validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return None
+    return None
+
+
 def _source_graph_payload(result: Mapping[str, Any]) -> dict[str, Any] | None:
     """Decode a ``source_graph_query`` reply's ``content`` back to a dict.
 
     ``content`` is a structured object (with per-row defaults elided for
-    wire size) on a single-page reply, or a base64 string on a paged one.
-    Returns the payload with every elided default re-applied, so a caller
-    sees the same canonical row shape the engine produced; returns
-    ``None`` for a paged reply (``content_encoding`` set) or content that
-    fails to decode to a dict.
+    wire size) on a single-page reply, or a ``utf-8`` / ``base64`` page string
+    on a paged one.  Returns the payload with every elided default re-applied,
+    so a caller sees the same canonical row shape the engine produced;
+    returns ``None`` for a partial page (a continuation is outstanding or this
+    is not the first page) or content that fails to decode to a dict.
     """
-    if not isinstance(result, Mapping) or result.get("content_encoding"):
+    if not isinstance(result, Mapping):
         return None
     content = result.get("content")
+    if result.get("content_encoding"):
+        if result.get("outer_truncated") or result.get("page_count") != 1:
+            return None
+        content = _continuation_page_text(result)
     if isinstance(content, dict):
         payload = content
     elif isinstance(content, str):
@@ -4463,15 +4527,16 @@ def _continuation_chunk_size_for_cap(
         raise WorkerToolError("continuation_output_cap_too_small")
 
     def fits(chunk_size: int) -> bool:
-        page_count = (len(canonical_bytes) + chunk_size - 1) // chunk_size
-        for index in range(page_count):
+        bounds = _continuation_page_bounds(canonical_bytes, chunk_size)
+        for index, (start, _end) in enumerate(bounds):
             page, _bytes_returned = _continuation_page_result(
                 store_id=store_id,
                 page_index=index,
+                start=start,
                 meta=meta,
                 canonical_bytes=canonical_bytes,
                 chunk_size=chunk_size,
-                page_count=page_count,
+                page_count=len(bounds),
                 content_sha256=content_sha256,
             )
             if _serialized_response_bytes(page) > cap:
@@ -4522,6 +4587,9 @@ def _serve_continuation(
     ):
         return _violation(ctx, tool, "invalid_continuation_cursor")
     if not isinstance(content_sha256, str) or len(content_sha256) != 64:
+        return _violation(ctx, tool, "invalid_continuation_cursor")
+    offset = fields.get("offset")
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 1:
         return _violation(ctx, tool, "invalid_continuation_cursor")
 
     from . import source_graph as _source_graph_mod
@@ -4611,9 +4679,15 @@ def _serve_continuation(
             ctx, tool, "continuation_page_out_of_range",
             valid_next_call=_CONTINUATION_CURSOR_NEXT_CALL["continuation_page_out_of_range"],
         )
+    if offset >= len(entry.canonical_bytes):
+        return _violation(
+            ctx, tool, "invalid_continuation_cursor",
+            valid_next_call=_CONTINUATION_CURSOR_NEXT_CALL["invalid_continuation_cursor"],
+        )
     result, bytes_returned = _continuation_page_result(
         store_id=store_id,
         page_index=page_index,
+        start=offset,
         meta=meta,
         canonical_bytes=entry.canonical_bytes,
         chunk_size=entry.chunk_size,
@@ -5886,7 +5960,7 @@ def source_graph_query(
             )
         except WorkerToolError as exc:
             return _violation(ctx, tool, str(exc)[:160])
-        page_count = (len(canonical_bytes) + chunk_size - 1) // chunk_size
+        page_count = len(_continuation_page_bounds(canonical_bytes, chunk_size))
         stored_id = _continuation_put(
             canonical_bytes=canonical_bytes,
             content_sha256=full_content_sha256,
@@ -5902,6 +5976,7 @@ def source_graph_query(
         result, bytes_returned = _continuation_page_result(
             store_id=store_id,
             page_index=0,
+            start=0,
             meta=meta,
             canonical_bytes=canonical_bytes,
             chunk_size=chunk_size,

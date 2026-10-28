@@ -928,7 +928,7 @@ def test_source_graph_exact_content_pages_are_signed_and_reassemble_exactly(
     assert page["internal_truncated"] is False
     assert page["outer_truncated"] is True
     assert page["truncated"] is True
-    assert page["content_encoding"] == "base64"
+    assert page["content_encoding"] == "utf-8"
     assert page["page_index"] == 0
     assert page["page_count"] > 1
 
@@ -969,8 +969,8 @@ def test_source_graph_exact_content_pages_are_signed_and_reassemble_exactly(
     output_cap = w._source_graph_output_cap("body")
     assert all(w._serialized_response_bytes(one) <= output_cap for one in pages)
     assert pages[-1]["continuation_cursor"] is None
-    assert all(one["content_encoding"] == "base64" for one in pages)
-    chunks = [base64.b64decode(one["content"]) for one in pages]
+    assert all(one["content_encoding"] == "utf-8" for one in pages)
+    chunks = [one["content"].encode("utf-8") for one in pages]
     # content_sha256 covers the whole response; page_sha256 covers the bytes
     # this page actually returned, so a swapped or truncated page is provable
     # in the turn it arrives instead of only after full reassembly.

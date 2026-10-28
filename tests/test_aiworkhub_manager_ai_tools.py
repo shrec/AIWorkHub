@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import sqlite3
@@ -2617,15 +2616,16 @@ def test_manager_source_graph_continuation_passthrough(tmp_path, monkeypatch):
     cursor = first["continuation_cursor"]
     assert cursor
 
-    chunks = [base64.b64decode(first["content"])]
+    assert first["content_encoding"] == "utf-8"
+    chunks = [first["content"].encode("utf-8")]
     while cursor:
         page = manager_ai_tools.source_graph_query(
             mode="body", query="big_manager_target", budget=8, continuation_cursor=cursor,
         )
         assert page["ok"] is True
         assert page["surface"] == "manager_mcp"
-        assert page["content_encoding"] == "base64"
-        chunks.append(base64.b64decode(page["content"]))
+        assert page["content_encoding"] == "utf-8"
+        chunks.append(page["content"].encode("utf-8"))
         cursor = page["continuation_cursor"]
 
     reassembled = b"".join(chunks)

@@ -4597,7 +4597,7 @@ def test_source_graph_continuation_reassembles_exact_canonical_bytes(tmp_path, m
     assert first["outer_truncated"] is True
     assert first["internal_truncated"] is False
     assert first["truncated"] is True
-    assert first["content_encoding"] == "base64"
+    assert first["content_encoding"] == "utf-8"
     assert first["page_index"] == 0
     assert first["page_count"] > 1
     assert first["continuation_cursor"]
@@ -4608,7 +4608,7 @@ def test_source_graph_continuation_reassembles_exact_canonical_bytes(tmp_path, m
     assert "output_cap_bytes" not in first
     assert _compact_response_bytes(first) <= output_cap
 
-    chunks = [base64.b64decode(first["content"])]
+    chunks = [first["content"].encode("utf-8")]
     indexes = [first["page_index"]]
     shas = [first["page_sha256"]]
     cursor = first["continuation_cursor"]
@@ -4618,9 +4618,9 @@ def test_source_graph_continuation_reassembles_exact_canonical_bytes(tmp_path, m
             ctx, mode="body", query="big_target", budget=8, continuation_cursor=cursor,
         )
         assert page["ok"] is True
-        assert page["content_encoding"] == "base64"
+        assert page["content_encoding"] == "utf-8"
         assert _compact_response_bytes(page) <= output_cap
-        chunks.append(base64.b64decode(page["content"]))
+        chunks.append(page["content"].encode("utf-8"))
         indexes.append(page["page_index"])
         shas.append(page["page_sha256"])
         cursor = page["continuation_cursor"]
@@ -4695,7 +4695,7 @@ def test_source_graph_continuation_pages_fit_supported_low_caps(
     assert first["outer_truncated"] is True
     assert _compact_response_bytes(first) <= cap
 
-    chunks = [base64.b64decode(first["content"])]
+    chunks = [first["content"].encode("utf-8")]
     pages = [first]
     cursor = first["continuation_cursor"]
     while cursor:
@@ -4706,7 +4706,7 @@ def test_source_graph_continuation_pages_fit_supported_low_caps(
         assert page["ok"] is True
         assert _compact_response_bytes(page) <= cap
         pages.append(page)
-        chunks.append(base64.b64decode(page["content"]))
+        chunks.append(page["content"].encode("utf-8"))
         cursor = page["continuation_cursor"]
 
     assert pages[-1]["continuation_cursor"] is None
@@ -4764,21 +4764,23 @@ def test_source_graph_continuation_chunk_size_measures_max_metadata(cap):
         content_sha256=content_sha256,
         output_cap_bytes=cap,
     )
-    page_count = (len(canonical_bytes) + chunk_size - 1) // chunk_size
+    bounds = w._continuation_page_bounds(canonical_bytes, chunk_size)
     chunks = []
-    for index in range(page_count):
+    for index, (start, _end) in enumerate(bounds):
         page, byte_count = w._continuation_page_result(
             store_id="f" * 32,
             page_index=index,
+            start=start,
             meta=meta,
             canonical_bytes=canonical_bytes,
             chunk_size=chunk_size,
-            page_count=page_count,
+            page_count=len(bounds),
             content_sha256=content_sha256,
         )
-        assert byte_count == len(base64.b64decode(page["content"]))
+        assert page["content_encoding"] == "utf-8"
+        assert byte_count == len(page["content"].encode("utf-8"))
         assert _compact_response_bytes(page) <= cap
-        chunks.append(base64.b64decode(page["content"]))
+        chunks.append(page["content"].encode("utf-8"))
 
     assert b"".join(chunks) == canonical_bytes
 

@@ -86,6 +86,34 @@ test("verified base64 body chunks credit raw bytes across split UTF8 and JSON bo
   }
 });
 
+test("verified utf-8 body pages cut on code points credit progress and reassemble to the canonical bytes", () => {
+  const guard = bridge.createVscodeLmSourceGraphGuard();
+  const bytes = Buffer.from(JSON.stringify(evidence(1)));
+  const chunkSize = 11;
+  const chunks = [];
+  for (let start = 0; start < bytes.length;) {
+    let end = Math.min(start + chunkSize, bytes.length);
+    while (end < bytes.length && (bytes[end] & 0xc0) === 0x80) end -= 1;
+    chunks.push(bytes.subarray(start, end));
+    start = end;
+  }
+  assert.ok(chunks.length > 1);
+  chunks.forEach((chunk, page) => {
+    assert.equal(Buffer.from(chunk.toString("utf8")).equals(chunk), true, "no split code point");
+    const call = { ...sgCall(1), input: { ...sgCall(1).input,
+      continuation_cursor: page ? `signed-${page}` : undefined } };
+    assert.equal(guard.before(call), null);
+    guard.observed(call, trusted(null, {
+      content: chunk.toString("utf8"), content_encoding: "utf-8",
+      content_sha256: digest(bytes), page_sha256: digest(chunk),
+      page_index: page, page_count: chunks.length, full_bytes: bytes.length, bytes: chunk.length,
+      continuation_cursor: page + 1 < chunks.length ? `signed-${page + 1}` : null,
+    }));
+  });
+  assert.equal(Buffer.concat(chunks).equals(bytes), true);
+  assert.equal(guard.progressRevision() > 0, true);
+});
+
 for (const [label, result] of [
   ["zero hit nonce", (n) => trusted({ matches: [], nonce: n }, { hit_count: 0 })],
   ["malformed", () => trusted(null, { content: "not JSON" })],
@@ -95,6 +123,10 @@ for (const [label, result] of [
   ["bad page hash", (n) => trusted(null, { content_encoding: "base64",
     content: Buffer.from(`nonce-${n}`).toString("base64"), page_sha256: "a".repeat(64),
     content_sha256: "b".repeat(64), page_index: n, page_count: 100, bytes: 7, full_bytes: 700 })],
+  ["bad utf-8 page hash", (n) => trusted(null, { content_encoding: "utf-8",
+    content: `ქართული-${n}`, page_sha256: "a".repeat(64),
+    content_sha256: "b".repeat(64), page_index: n, page_count: 100,
+    bytes: Buffer.byteLength(`ქართული-${n}`), full_bytes: 700 })],
 ]) {
   test(`${label} cannot reset the no-progress ceiling`, () => {
     const guard = bridge.createVscodeLmSourceGraphGuard();

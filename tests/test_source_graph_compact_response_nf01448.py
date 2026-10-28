@@ -308,7 +308,7 @@ def test_cache_hit_reply_content_is_also_a_dict_receipt_or_verbatim(tmp_path):
         assert second["content"] == first["content"]
 
 
-def test_paged_continuation_reply_keeps_content_as_a_base64_string(
+def test_paged_continuation_reply_keeps_content_as_a_utf8_string(
     tmp_path, monkeypatch: pytest.MonkeyPatch,
 ):
     repo = _repo(tmp_path, "paged")
@@ -325,9 +325,9 @@ def test_paged_continuation_reply_keeps_content_as_a_base64_string(
 
     assert result["ok"] is True
     assert result["outer_truncated"] is True
-    assert result["content_encoding"] == "base64"
+    assert result["content_encoding"] == "utf-8"
     assert isinstance(result["content"], str)
-    base64.b64decode(result["content"])  # still exactly a base64 chunk
+    assert len(result["content"].encode("utf-8")) == result["bytes"]
 
 
 # ---------------------------------------------------------------------------

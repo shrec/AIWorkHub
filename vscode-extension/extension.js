@@ -4516,7 +4516,7 @@ function createVscodeLmStagedEditCollector(request) {
     // A fresh bounded body is required. Partial pages never authorize a range.
     let payload;
     try {
-      if (result.content_encoding === "base64") {
+      if (vscodeLmIsPagedSourceGraphReply(result)) {
         const bytes = vscodeLmSourceGraphPageBytes(result);
         if (!bytes || result.page_count !== 1) return;
         payload = JSON.parse(bytes.toString("utf8"));
@@ -5199,18 +5199,27 @@ async function awaitVscodeLmWorkerSourceGraphReadinessOnce() {
 // allowance it was derived from is gone (NF-2026-01632).
 const VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT = 16;
 
+// A paged reply carries its bytes as UTF-8 text, or base64 when the page is not valid UTF-8.
+function vscodeLmIsPagedSourceGraphReply(result) {
+  return result.content_encoding === "base64" || result.content_encoding === "utf-8";
+}
+
 // Validate the backend's byte-page contract, not a partially decoded JSON page.
 function vscodeLmSourceGraphPageBytes(result) {
+  const encoding = result.content_encoding;
   if (typeof result.content !== "string" ||
-      !/^[A-Za-z0-9+/]*={0,2}$/.test(result.content) ||
+      (encoding !== "utf-8" && !/^[A-Za-z0-9+/]*={0,2}$/.test(result.content)) ||
       !/^[a-f0-9]{64}$/i.test(result.content_sha256 || "") ||
       !/^[a-f0-9]{64}$/i.test(result.page_sha256 || "") ||
       !Number.isInteger(result.page_index) || result.page_index < 0 ||
       !Number.isInteger(result.page_count) || result.page_index >= result.page_count ||
       !Number.isInteger(result.full_bytes) || result.full_bytes < result.bytes ||
       !Number.isInteger(result.bytes) || result.bytes < 1) return null;
-  const bytes = Buffer.from(result.content, "base64");
-  if (bytes.length !== result.bytes || bytes.toString("base64") !== result.content ||
+  const bytes = Buffer.from(result.content, encoding === "utf-8" ? "utf8" : "base64");
+  const roundTrips = encoding === "utf-8"
+    ? bytes.toString("utf8") === result.content
+    : bytes.toString("base64") === result.content;
+  if (bytes.length !== result.bytes || !roundTrips ||
       crypto.createHash("sha256").update(bytes).digest("hex") !== result.page_sha256) return null;
   return bytes;
 }
@@ -5298,7 +5307,7 @@ function createVscodeLmSourceGraphGuard() {
           !normalize(result.authority_repo) ||
           normalize(result.mode) !== normalize(call.input && call.input.mode)) return;
       const keys = [];
-      if (result.content_encoding === "base64") {
+      if (vscodeLmIsPagedSourceGraphReply(result)) {
         const chunk = vscodeLmSourceGraphPageBytes(result);
         const input = call.input || {};
         const chainIdentity = JSON.stringify([call.name, input.mode, input.query, input.target,
