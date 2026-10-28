@@ -1789,6 +1789,76 @@ def retained_route_observations(
     }
 
 
+# Published-rate basis (RM-2026-00015).  A card whose terminal cause the
+# canonical taxonomy cannot establish (FailureCategory.INCONCLUSIVE) and whose
+# outcome no rate counts -- not accepted, not review-ready, no failed
+# deterministic verification -- is evidence about nobody: keeping it in the
+# denominator penalised a route for outcomes nobody could attribute.  It is
+# excluded from every published rate and reported as its own count, and every
+# rate publishes the classes on both sides so a reader can re-derive it.
+_RATE_SUCCESS_STATUSES = frozenset({"review", "finished"})
+_RATE_DENOMINATOR_CLASSES: tuple[str, ...] = tuple(sorted(
+    "failure_category:" + category.value
+    for category in learning_commit.FailureCategory
+    if category not in learning_commit.INFRASTRUCTURE_FAILURE_CATEGORIES
+    and category is not learning_commit.FailureCategory.INCONCLUSIVE
+)) + ("failure_category:inconclusive:attributed_outcome",)
+_RATE_EXCLUDED_CLASSES: tuple[str, ...] = tuple(sorted(
+    "failure_category:" + category.value
+    for category in learning_commit.INFRASTRUCTURE_FAILURE_CATEGORIES
+)) + ("failure_category:inconclusive:unattributed_outcome",)
+_RATE_NUMERATOR_CLASSES: dict[str, tuple[str, ...]] = {
+    "accepted_rate": ("status:finished",),
+    "review_ready_rate": ("status:finished", "status:review"),
+    "validation_failure_rate": (
+        "deterministic_verification:failed",
+        "failure_category:candidate_code:not_accepted",
+    ),
+}
+PUBLISHED_RATE_KEYS: tuple[str, ...] = (*_RATE_NUMERATOR_CLASSES, "retry_rate")
+
+
+def _deterministic_verification_failed(card: Mapping[str, Any]) -> bool:
+    verification = card.get("deterministic_verification")
+    return isinstance(verification, Mapping) and verification.get("passed") is False
+
+
+def _inconclusive_unattributed(card: Mapping[str, Any]) -> bool:
+    """True when no published rate can attribute this card's outcome."""
+    return (
+        str(card.get("status") or "") not in _RATE_SUCCESS_STATUSES
+        and not _deterministic_verification_failed(card)
+        and core.classify_terminal_disposition(card)
+        == learning_commit.FailureCategory.INCONCLUSIVE
+    )
+
+
+def _rate_basis(
+    numerator: int,
+    denominator: int,
+    *,
+    unit: str,
+    numerator_classes: Iterable[str],
+    denominator_classes: Iterable[str],
+    excluded_classes: Iterable[str],
+    excluded_inconclusive_count: int | None,
+) -> dict[str, Any]:
+    """The machine-readable basis published beside one rate value.
+
+    ``excluded_inconclusive_count`` is ``None`` only when the rate's owner
+    does not measure inconclusive exclusion -- never a silent zero.
+    """
+    return {
+        "unit": unit,
+        "numerator": numerator,
+        "denominator": denominator,
+        "numerator_classes": list(numerator_classes),
+        "denominator_classes": list(denominator_classes),
+        "excluded_classes": list(excluded_classes),
+        "excluded_inconclusive_count": excluded_inconclusive_count,
+    }
+
+
 def build_catalog(
     repo_root: Path | str,
     *,
@@ -1900,8 +1970,15 @@ def build_catalog(
             if core.classify_terminal_disposition(item)
             in learning_commit.INFRASTRUCTURE_FAILURE_CATEGORIES
         ]
+        # Inconclusive, unattributed outcomes leave every rate's denominator
+        # and are published as their own count (see _inconclusive_unattributed).
+        inconclusive_cards = [
+            item for item in matched_cards
+            if item not in infrastructure_cards and _inconclusive_unattributed(item)
+        ]
         quality_cards = [
-            item for item in matched_cards if item not in infrastructure_cards
+            item for item in matched_cards
+            if item not in infrastructure_cards and item not in inconclusive_cards
         ]
         sample_count = len(quality_cards)
         accepted = sum(
@@ -1910,14 +1987,11 @@ def build_catalog(
         )
         review_ready = sum(
             1 for item in quality_cards
-            if str(item.get("status") or "") in {"review", "finished"}
+            if str(item.get("status") or "") in _RATE_SUCCESS_STATUSES
         )
         failed = 0
         for item in quality_cards:
-            verification = item.get("deterministic_verification")
-            verification_failed = (
-                isinstance(verification, Mapping) and verification.get("passed") is False
-            )
+            verification_failed = _deterministic_verification_failed(item)
             # Same single source of truth as infrastructure_cards above: a
             # quality card only counts as a code-quality failure when the
             # canonical taxonomy classifies it CANDIDATE_CODE and it was not
@@ -1958,7 +2032,44 @@ def build_catalog(
         accepted_rate = accepted / sample_count if sample_count else None
         review_rate = review_ready / sample_count if sample_count else None
         failure_rate = failed / sample_count if sample_count else None
-        retry_rate = retries / attempts if attempts else None
+        # Attempts on an inconclusive, unattributed card leave the retry
+        # denominator too; the raw attempt/retry counts above stay unchanged.
+        inconclusive_task_ids = {
+            str(item.get("task_id") or "") for item in inconclusive_cards
+        }
+        rated_attempts = sum(
+            1 for item in matched
+            if str(item.get("task_id") or "") not in inconclusive_task_ids
+        )
+        rated_retries = max(
+            0, rated_attempts - (len(matched_cards) - len(inconclusive_cards))
+        )
+        retry_rate = rated_retries / rated_attempts if rated_attempts else None
+        rate_basis = {
+            key: _rate_basis(
+                numerator,
+                sample_count,
+                unit="task_card",
+                numerator_classes=_RATE_NUMERATOR_CLASSES[key],
+                denominator_classes=_RATE_DENOMINATOR_CLASSES,
+                excluded_classes=_RATE_EXCLUDED_CLASSES,
+                excluded_inconclusive_count=len(inconclusive_cards),
+            )
+            for key, numerator in (
+                ("accepted_rate", accepted),
+                ("review_ready_rate", review_ready),
+                ("validation_failure_rate", failed),
+            )
+        }
+        rate_basis["retry_rate"] = _rate_basis(
+            rated_retries,
+            rated_attempts,
+            unit="process_attempt",
+            numerator_classes=("process_attempt:retry",),
+            denominator_classes=("process_attempt:any",),
+            excluded_classes=("process_attempt:inconclusive_unattributed_card",),
+            excluded_inconclusive_count=attempts - rated_attempts,
+        )
         discipline_scores = []
         for process in matched:
             infra = process.get("ai_infra_context")
@@ -2237,12 +2348,14 @@ def build_catalog(
                 "sample_count": sample_count,
                 "attempted_task_count": len(matched_cards),
                 "infrastructure_failure_count": len(infrastructure_cards),
+                "inconclusive_outcome_count": len(inconclusive_cards),
                 "attempt_count": attempts,
                 "retry_count": retries,
                 "accepted_rate": accepted_rate,
                 "review_ready_rate": review_rate,
                 "validation_failure_rate": failure_rate,
                 "retry_rate": retry_rate,
+                "rate_basis": rate_basis,
                 "p50_latency_seconds": median(latencies) if latencies else None,
                 "p95_latency_seconds": _percentile(latencies, 0.95),
                 "total_tokens": tokens,
@@ -2434,10 +2547,26 @@ def rank_task(repo_root: Path | str, task: workforce_router.TaskRequirements, *,
             reported_accepted_rate: float | None = round(float(measured_acceptance_rate), 6)
             accepted_rate_source = "measured_cost_per_accepted_outcome_partition"
             evidence_sample_count = matched_decided_tasks
+            # The partition's owner (cost_ledger) does not measure inconclusive
+            # exclusion, so its count is published as unmeasured, not zero.
+            accepted_rate_basis: Mapping[str, Any] | None = _rate_basis(
+                accepted_outcomes,
+                matched_decided_tasks,
+                unit="decided_task",
+                numerator_classes=("cost_ledger:accepted_outcome",),
+                denominator_classes=("cost_ledger:matched_decided_task",),
+                excluded_classes=(),
+                excluded_inconclusive_count=None,
+            )
         else:
             reported_accepted_rate = prior_accepted_rate
             accepted_rate_source = "conservative_prior"
             evidence_sample_count = 0
+            prior_basis = outcomes.get("rate_basis")
+            accepted_rate_basis = (
+                prior_basis.get("accepted_rate")
+                if isinstance(prior_basis, Mapping) else None
+            )
         shared_evidence = dict(
             review_ready_rate=outcomes.get("review_ready_rate"),
             validation_failure_rate=outcomes.get("validation_failure_rate"),
@@ -2474,6 +2603,7 @@ def rank_task(repo_root: Path | str, task: workforce_router.TaskRequirements, *,
         outcome_evidence_by_worker[str(item.get("worker_id") or "")] = {
             "accepted_rate": reported_accepted_rate,
             "accepted_rate_source": accepted_rate_source,
+            "accepted_rate_basis": accepted_rate_basis,
             "task_family": requested_family,
             "risk_tier": task.risk,
             "sample_count": evidence_sample_count,
