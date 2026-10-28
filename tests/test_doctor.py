@@ -165,15 +165,17 @@ def test_server_registers_doctor_diagnose_tool() -> None:
     assert (server.aiworkhub_doctor_diagnose.__doc__ or "").lstrip().startswith("READ-ONLY:")
 
 
-def test_server_tool_composes_the_three_health_probes(monkeypatch) -> None:
+def test_server_tool_composes_the_four_health_probes(monkeypatch) -> None:
     monkeypatch.setattr(server, "aiworkhub_task_health", lambda: {"ok": True})
     monkeypatch.setattr(server.core, "dispatcher_health", lambda: {"ok": False, "error": "stopped"})
     monkeypatch.setattr(server.core, "source_graph_health", lambda: {"ok": True})
+    monkeypatch.setattr(server.manager_lane, "route_health", lambda: {"ok": True})
     report = server.aiworkhub_doctor_diagnose()
     assert report["verdict"] == "problem"
     assert [entry["name"] for entry in report["probes"]] == [
         "aiworkhub_task_health",
         "aiworkhub_dispatcher_health",
         "aiworkhub_source_graph_health",
+        "aiworkhub_manager_route_health",
     ]
     assert [entry["name"] for entry in report["problems"]] == ["aiworkhub_dispatcher_health"]

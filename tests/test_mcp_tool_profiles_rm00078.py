@@ -42,10 +42,10 @@ _NEVER_EXISTED = "aiworkhub_no_such_tool_rm00078"
 _WORKER_ONLY = "aiworkhub_worker_source_graph_query"
 _WRITE_PROBE = "aiworkhub_task_mark_done"
 
-# Measured on base 739a7c70: tools/list counts before the profile table existed.
-_PRE_TABLE_ALL_COUNT = 232
-_PRE_TABLE_ALL_READ_ONLY_COUNT = 228
-_LISTED_COUNTS = {"manager": 184, "worker": 19, "dashboard": 69}
+# Measured on base 739a7c70, plus aiworkhub_manager_callback_lane_claim (NF-2026-01802).
+_PRE_TABLE_ALL_COUNT = 233
+_PRE_TABLE_ALL_READ_ONLY_COUNT = 229
+_LISTED_COUNTS = {"manager": 185, "worker": 19, "dashboard": 69}
 # The 47 webview-only dashboard tools the pre-table manager surface hid.
 _PRE_TABLE_MANAGER_HIDDEN = frozenset({
     "aiworkhub_dashboard_task_detail",

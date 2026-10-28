@@ -492,6 +492,7 @@ MCP_TOOL_PROFILES: dict[str, Mapping[str, str]] = {
     "aiworkhub_dispatcher_ensure_started": _MANAGER_DASHBOARD,
     "aiworkhub_dispatcher_health": _MANAGER_DASHBOARD,
     "aiworkhub_doctor_diagnose": _MANAGER,
+    "aiworkhub_manager_callback_lane_claim": _MANAGER,
     "aiworkhub_dispatcher_stop": _MANAGER_DASHBOARD,
     "aiworkhub_dispatcher_watchdog": _MANAGER,
     "aiworkhub_source_graph_ensure_started": _MANAGER_DASHBOARD,

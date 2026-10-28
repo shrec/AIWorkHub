@@ -625,6 +625,7 @@ from . import launch_queue_persist
 from . import known_bug_scanner
 from . import learning_commit_store
 from . import manager_ai_tools
+from . import manager_lane
 from . import manager_loop_service
 from . import manager_recipe_tools
 from . import manager_skill_tools
@@ -6807,17 +6808,35 @@ def aiworkhub_dispatcher_health() -> dict[str, Any]:
 
 @mcp.tool()
 def aiworkhub_doctor_diagnose() -> dict[str, Any]:
-    """READ-ONLY: what is wrong right now. Runs the task, dispatcher and
-    source-graph health probes concurrently and returns one verdict
-    (ok/problem/unavailable) with the non-ok probes and the tool to call next."""
+    """READ-ONLY: what is wrong right now. Runs the task, dispatcher,
+    source-graph and manager-route health probes concurrently and returns one
+    verdict (ok/problem/unavailable) with the non-ok probes and the tool to
+    call next."""
 
     return doctor.diagnose(
         {
             "aiworkhub_task_health": aiworkhub_task_health,
             "aiworkhub_dispatcher_health": core.dispatcher_health,
             "aiworkhub_source_graph_health": core.source_graph_health,
+            "aiworkhub_manager_route_health": manager_lane.route_health,
         }
     )
+
+
+@mcp.tool()
+def aiworkhub_manager_callback_lane_claim() -> dict[str, Any]:
+    """MANAGER WRITE: take the callback lane back for this verified manager.
+
+    Selects the caller's own verified provider and session in the repository's
+    coordinator-target file (atomic replace, unrelated keys kept), so callbacks
+    and task_create route to this manager again. Refuses with a stable reason,
+    leaving the file unchanged, when the caller has no verified route, is Codex
+    without a live route, or another live Manager Chat or Codex route holds the
+    lane. Every claim and refusal appends one audit row."""
+
+    if not core.writes_allowed():
+        return {"ok": False, "error": "write_gate_closed"}
+    return manager_lane.claim_callback_lane()
 
 
 @mcp.tool()
