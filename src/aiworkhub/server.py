@@ -533,6 +533,7 @@ except ModuleNotFoundError:
             _run_stdio_fallback_server(self.name, self._tools, self.instructions)
 
 from . import __version__
+from . import accept_commit
 from . import agent_tool_instruction_mcp
 from . import cli_adapter_readonly_tool
 from . import completion_inbox
@@ -6346,6 +6347,8 @@ def aiworkhub_agent_accept_review(
     promote_ai_memory: bool = False,
     extra_evidence_ids: list[str] | None = None,
     no_new_lesson_reason: str | None = None,
+    auto_commit: bool = True,
+    commit_message: str | None = None,
 ) -> dict[str, Any]:
     """COORDINATOR/WRITE-GATED: accept one ``review_ready`` request, phase 2.
 
@@ -6396,6 +6399,9 @@ def aiworkhub_agent_accept_review(
     never undoes the accept: ``ok`` stays true, the failure is reported under
     its own key, and ``learning_commit_owed`` stays in the reply.
 
+    ``commit`` (``accept_commit``) is ``{state: committed|skipped|failed, sha?,
+    reason?, paths, message_subject}``; a skip or failure never undoes the accept.
+
     Args:
         request_id: Id of the worker request to accept; it must be in review_ready state.
         task_id: Id of the task card that request belongs to.
@@ -6411,6 +6417,8 @@ def aiworkhub_agent_accept_review(
         promote_ai_memory: Set true together with lesson_candidate to also promote the lesson to AI memory; refused without a lesson. Default false.
         extra_evidence_ids: Additional evidence ids to cite with the lesson; only used together with lesson_candidate.
         no_new_lesson_reason: Instead of a lesson, record why none is owed: duplicate_of_recorded_lesson, no_generalizable_cause, mechanical_change_only, evidence_insufficient or decision_not_about_code; refused together with lesson_candidate.
+        auto_commit: Default true: after a successful accept, git-commit exactly the receipt's promoted_paths (hooks run; never amend, push or --no-verify) and report it under commit; false leaves the commit to you.
+        commit_message: Commit message to use instead of the generated "<fix|feat>(<topic>): <title>"; the Resolves/AIWorkHub-Task/AIWorkHub-Request and aiworkhub.commitTrailer trailers are still appended.
     """
 
     # Refuse a bad render mode or a contradictory learning close-out BEFORE the
@@ -6434,6 +6442,7 @@ def aiworkhub_agent_accept_review(
     if in_flight is not None:
         return in_flight
     with _TASK_LIFECYCLE_WRITE_LOCK:
+        pre_accept = accept_commit.snapshot_before_accept(core.repo_root(), auto_commit=auto_commit)
         result = manager.accept_review(
             request_id,
             task_id,
@@ -6462,6 +6471,10 @@ def aiworkhub_agent_accept_review(
             if view is not None:
                 receipt["card"] = view
         receipt["include_card"] = include_card
+        receipt["commit"] = accept_commit.commit_promoted(
+            pre_accept, receipt, card if isinstance(card, dict) else None,
+            task_id=task_id, request_id=request_id, commit_message=commit_message,
+        )
         return _with_learning_closeout(
             receipt,
             task_id=task_id,

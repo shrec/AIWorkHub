@@ -54,7 +54,7 @@ _ACCEPT_PARAMETERS = [
     "request_id", "task_id", "confirm_destructive_change", "requested_risk_tier",
     "risk_signals", "reviewer_reports", "reviewer_request_ids", "confirm_high_risk",
     "manager_correction", "include_card", "lesson_candidate", "promote_ai_memory",
-    "extra_evidence_ids", "no_new_lesson_reason",
+    "extra_evidence_ids", "no_new_lesson_reason", "auto_commit", "commit_message",
 ]
 _PAYLOAD_PREFIX = "NF01626_PAYLOAD="
 _needs_sdk = pytest.mark.skipif(
@@ -594,7 +594,11 @@ called = server._stdio_dispatch(
     "AIWorkHub MCP",
     tools,
     "tools/call",
-    {"name": "aiworkhub_agent_accept_review", "arguments": {"request_id": "R-1", "task_id": "T-1"}},
+    # auto_commit off: this child's repo root is the real checkout, and no test runs git there.
+    {
+        "name": "aiworkhub_agent_accept_review",
+        "arguments": {"request_id": "R-1", "task_id": "T-1", "auto_commit": False},
+    },
     "",
     2,
 )

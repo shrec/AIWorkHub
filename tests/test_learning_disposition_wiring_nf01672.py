@@ -537,6 +537,11 @@ def test_a_plain_accept_reply_is_exactly_what_it_was(decisions):
     receipt = server.aiworkhub_agent_accept_review(request_id=REQUEST_ID, task_id=TASK_ID)
 
     card = task_store.get_task(root, TASK_ID)
+    # The one addition is the auto-commit report; this root is no git work tree.
+    commit = receipt["commit"]
+    assert commit["state"] == "skipped", commit
+    assert commit["reason"] in {"not_a_git_work_tree", "repo_root_not_git_toplevel"}, commit
+    assert commit["paths"] == PROMOTED
     expected = {
         "schema_id": "aiworkhub.accept_review_receipt.v1",
         **decisions.accept_result,
@@ -544,6 +549,7 @@ def test_a_plain_accept_reply_is_exactly_what_it_was(decisions):
         "worker_status": card["worker_status"],
         **server._card_identity(card),
         "include_card": "none",
+        "commit": commit,
     }
     assert json.dumps(receipt, sort_keys=True) == json.dumps(expected, sort_keys=True)
     assert receipt["status"] == "finished"
