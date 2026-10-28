@@ -994,6 +994,23 @@ def _dos_device_target(real_root: str) -> str:
     return ("\\??\\" + real_root.rstrip("\\/")).lower()
 
 
+# NF-2026-01715: every push holds a handle to one session-local named mutex
+# per (drive, root) from its define until its pop; the kernel destroys it with
+# its last holder, crashed or not.  Its existence is the one record of use
+# that every launcher in this logon session shares.  A lease is not: a push
+# whose launcher could not lease it, or leased it in another store, is missing
+# from reconcile's live count, and its definition is indistinguishable from a
+# dead one's on the same letter naming the same root.
+_SANDBOX_DRIVE_USE_PREFIX = "Local\\AIWorkHub.SandboxDriveUse."
+_ERROR_ALREADY_EXISTS = 183
+
+
+def _sandbox_drive_use_name(drive: str, real_root: str) -> str:
+    """The named mutex every live push of ``drive`` naming ``real_root`` holds."""
+    digest = hashlib.sha256(_dos_device_target(real_root).encode("utf-8")).hexdigest()
+    return f"{_SANDBOX_DRIVE_USE_PREFIX}{drive[:1].upper()}.{digest[:32]}"
+
+
 def _choose_sandbox_drive(
     real_root: str, logical_drives: int, query: Callable[[str], str]
 ) -> tuple[str, bool]:
@@ -1175,7 +1192,10 @@ class _SandboxDriveLeases:
             self._unlink(mine.pop())
 
     def reconcile(
-        self, held: Callable[[str, str], int], pop: Callable[[str, str], int]
+        self,
+        held: Callable[[str, str], int],
+        pop: Callable[[str, str], int],
+        in_use: Callable[[str, str], bool] | None = None,
     ) -> None:
         """Pop the definition of every lease whose owner is gone, and delete it.
 
@@ -1189,11 +1209,18 @@ class _SandboxDriveLeases:
         reboot, another logon session, a crash just after a release's pop) is
         never taken from a live owner.  A scan that misses a lease -- entries
         past _DRIVE_LEASE_LIMIT, or one it cannot read -- reclaims nothing that
-        round.  A push left unleased (see :meth:`record`) is not counted, so it
-        is not protected.
+        round.  A push left unleased (see :meth:`record`) is not counted.
+
+        NF-2026-01715: so ``in_use`` -- whether any launch in this logon
+        session still holds that letter naming that root, leased here or not
+        -- vetoes the claim first.  Such a lease is kept, not deleted, and is
+        reclaimed by the first sandbox_drive that finds the pair unused: a pop
+        now could take the definition a live command's children stand on, and
+        the letter would vanish, or name another root, when the last counted
+        owner released it.
         """
         try:
-            self._reconcile(held, pop)
+            self._reconcile(held, pop, in_use)
         except Exception as exc:  # never fails the launch it runs in
             self._note(f"reconcile stopped: {exc!r}")
 
@@ -1227,7 +1254,10 @@ class _SandboxDriveLeases:
         self._mine.setdefault((drive, real_root), []).append(path)
 
     def _reconcile(
-        self, held: Callable[[str, str], int], pop: Callable[[str, str], int]
+        self,
+        held: Callable[[str, str], int],
+        pop: Callable[[str, str], int],
+        in_use: Callable[[str, str], bool] | None = None,
     ) -> None:
         directory = self.directory
         if directory is None:
@@ -1250,7 +1280,11 @@ class _SandboxDriveLeases:
             if owner_alive:
                 live[lease.key] = live.get(lease.key, 0) + 1
         for (path, lease), owner_alive in zip(leases, alive):
-            if owner_alive or not self._unlink(path):
+            if owner_alive:
+                continue
+            if in_use is not None and in_use(lease.drive, lease.real_root):
+                continue  # kept: a live launch may stand on this very definition
+            if not self._unlink(path):
                 continue
             if held(lease.drive, lease.real_root) <= live.get(lease.key, 0):
                 continue  # nothing of this lease's is left here to reclaim
@@ -3202,6 +3236,9 @@ class _CtypesWin32Api:
     # Where sandbox_drive leases its pushes (NF-2026-01695). A boundary built
     # without __init__, as the mocked-kernel tests build it, keeps none.
     _sandbox_drive_leases: _SandboxDriveLeases | None = None
+    # NF-2026-01715: the use-mutex handles each leased push holds until its
+    # pop, per (drive, real_root); created on the first push.
+    _sandbox_drive_uses: dict[tuple[str, str], list[Any]] | None = None
 
     def __init__(self) -> None:
         # Resolved lazily via the platform shim; WinDLL is absent on non-Windows
@@ -3608,7 +3645,11 @@ class _CtypesWin32Api:
                 raise fail(error, f"mutex wait returned {waited:#x}")
             try:
                 if leases is not None:
-                    leases.reconcile(self._held_sandbox_drive, self._pop_sandbox_drive)
+                    leases.reconcile(
+                        self._held_sandbox_drive,
+                        self._pop_sandbox_drive,
+                        self._sandbox_drive_in_use,
+                    )
                 drive, _needs_define = _choose_sandbox_drive(
                     real_root, int(k.GetLogicalDrives()), self._query_dos_device
                 )
@@ -3620,6 +3661,7 @@ class _CtypesWin32Api:
                     k.DefineDosDeviceW(_SANDBOX_DRIVE_POP_FLAGS, drive, real_root)
                     raise fail(0, f"{drive} does not name {real_root!r}")
                 if leases is not None:
+                    self._hold_sandbox_drive_use(drive, real_root)
                     leases.record(drive, real_root)
                 return drive
             finally:
@@ -3656,6 +3698,7 @@ class _CtypesWin32Api:
                         f"DefineDosDeviceW remove {drive} {real_root!r}",
                     )
                 if self._sandbox_drive_leases is not None:
+                    self._drop_sandbox_drive_use(drive, real_root)
                     self._sandbox_drive_leases.release(drive, real_root)
             finally:
                 k.ReleaseMutex(mutex)
@@ -3678,6 +3721,57 @@ class _CtypesWin32Api:
         if self._kernel32.DefineDosDeviceW(_SANDBOX_DRIVE_POP_FLAGS, drive, real_root):
             return 0
         return _last_win_error() or -1
+
+    def _hold_sandbox_drive_use(self, drive: str, real_root: str) -> None:
+        """Hold this push's handle on its use mutex until its pop (NF-2026-01715).
+
+        Never fails the launch: a push it cannot hold is noted, and is then as
+        exposed to another launcher's reconcile as a push nothing leased.
+        """
+        handle = self._kernel32.CreateMutexW(
+            None, False, _sandbox_drive_use_name(drive, real_root)
+        )
+        if not handle:
+            handle = None
+            if self._sandbox_drive_leases is not None:
+                self._sandbox_drive_leases._note(
+                    f"{drive} {real_root!r} use not held: win_error {_last_win_error()}"
+                )
+        if self._sandbox_drive_uses is None:
+            self._sandbox_drive_uses = {}
+        # One slot per push, an unheld one as None, so the pushes' pops stay paired.
+        self._sandbox_drive_uses.setdefault((drive, real_root), []).append(handle)
+
+    def _drop_sandbox_drive_use(self, drive: str, real_root: str) -> None:
+        """Release one push's slot on ``drive`` naming ``real_root``.
+
+        An unheld slot goes first: a real handle closes only once every push
+        still live holds one, so a pop never strips a live push's mutex.
+        """
+        handles = (self._sandbox_drive_uses or {}).get((drive, real_root))
+        if not handles:
+            return
+        if None in handles:
+            handles.remove(None)
+        else:
+            self._kernel32.CloseHandle(handles.pop())
+
+    def _sandbox_drive_in_use(self, drive: str, real_root: str) -> bool:
+        """Whether any launch in this logon session still holds ``drive`` naming
+        ``real_root``: its use mutex already exists.  A probe that cannot
+        answer keeps the pair in use."""
+        reset = getattr(ctypes, "set_last_error", None)
+        if reset is not None:
+            reset(0)
+        handle = self._kernel32.CreateMutexW(
+            None, False, _sandbox_drive_use_name(drive, real_root)
+        )
+        if not handle:
+            return True
+        try:
+            return _last_win_error() == _ERROR_ALREADY_EXISTS
+        finally:
+            self._kernel32.CloseHandle(handle)
 
     def _query_dos_device(self, drive: str) -> str:
         """QueryDosDeviceW's first target for ``drive``, or "" when there is none."""
