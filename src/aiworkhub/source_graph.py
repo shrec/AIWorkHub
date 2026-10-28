@@ -5084,16 +5084,29 @@ def find(
         if rows:
             break
     if not rows:
-        like = f"%{term}%"
-        rows = conn.execute(
-            "SELECT file_path, kind, name, qualname, line_start, line_end, signature, "
-            "evidence_label, confidence FROM entities WHERE name LIKE ? OR qualname LIKE ? "
-            "ORDER BY CASE WHEN lower(qualname)=lower(?) THEN 0 "
-            "WHEN lower(name)=lower(?) THEN 1 ELSE 2 END, "
-            "confidence DESC, file_path, line_start LIMIT ?",
-            (like, like, term, term, limit),
-        ).fetchall()
+        rows = _find_like_rows(conn, term, limit)
     return [dict(row) for row in rows]
+
+
+def _find_like_rows(conn: sqlite3.Connection, term: str, limit: int) -> list[Any]:
+    """The substring pass :func:`find` runs after every FTS expression missed.
+
+    It reads the plain ``entities`` relation -- no FTS id-join -- so the
+    composed finder (:func:`source_graph_partition.composed_find`) runs this
+    SAME pass against its composed ``entities`` view; a fragment of a
+    CamelCase identifier then hits on a reviewer overlay exactly as it does
+    canonically instead of reading as zero there.
+    """
+
+    like = f"%{term}%"
+    return conn.execute(
+        "SELECT file_path, kind, name, qualname, line_start, line_end, signature, "
+        "evidence_label, confidence FROM entities WHERE name LIKE ? OR qualname LIKE ? "
+        "ORDER BY CASE WHEN lower(qualname)=lower(?) THEN 0 "
+        "WHEN lower(name)=lower(?) THEN 1 ELSE 2 END, "
+        "confidence DESC, file_path, line_start LIMIT ?",
+        (like, like, term, term, limit),
+    ).fetchall()
 
 
 # A bodygrep cursor resumes at ``file_path >= after_file`` and skips lines

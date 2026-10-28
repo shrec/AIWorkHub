@@ -1062,55 +1062,52 @@ _CANDIDATE_SOURCE_GRAPH_REQUIRED_TABLES = (
 )
 
 
-def _is_admitted_existing_changed_path(repo: Path, relative: str) -> bool:
-    """Use the partition builder's canonical policy for readiness admission."""
-
-    from . import source_graph as _source_graph_mod
-    from . import source_graph_partition as _source_graph_partition
-
-    candidate = (repo / relative).resolve(strict=False)
-    return candidate.is_file() and _source_graph_partition._admits(
-        _source_graph_mod.load_ignore_policy(repo), relative,
-    )
-
-
-def _candidate_db_is_ready(
+def _candidate_db_readiness_failure(
     db_path: Path,
     repo: Path,
     packet_sha256: str,
     target_request_id: str,
     target_task_id: str,
     changed_paths: Sequence[Mapping[str, str]],
-) -> bool:
-    """True only when the overlay is schema-complete and exactly packet-bound.
+) -> tuple[str, str] | None:
+    """Return ``(path, reason)`` naming why the overlay is not ready, else None.
 
     Marker-only readiness is insufficient: a partial, stale or tampered DB with
     a correct marker must fail closed.  The database is opened read-only and
-    must (1) contain the Source Graph schema and (2) for every existing packet
-    path admitted by the partition builder's canonical policy, contain the
-    exact ``file_path`` and ``source_hash``. Deleted and policy-skipped paths
-    legitimately have no row, including partitions with zero rows. This runs
-    both before ``os.replace`` and again on
-    runtime binding, so publish and query always agree on the same bytes.
+    must (1) contain the Source Graph schema and (2) for every packet path the
+    partition builder admits -- decided by the ONE shared
+    :func:`source_graph_partition.admitted_changed_path` -- contain the exact
+    ``file_path`` and the packet ``sha256``, the same value the builder hands
+    ``index_file`` as its expected hash, so both sides share one hash basis.
+    Deleted and policy-skipped paths legitimately have no row, including
+    partitions with zero rows. This runs both before ``os.replace`` and again
+    on runtime binding, so publish and query always agree on the same bytes.
+    ``reason`` is one of ``marker``, ``schema``, ``missing_row`` or
+    ``hash_mismatch``; DB-level failures name the DB file as ``path``.
     """
 
+    from . import source_graph as _source_graph_mod
+    from . import source_graph_partition as _source_graph_partition
+
+    db_name = db_path.name
     try:
         if not db_path.is_file() or db_path.stat().st_size <= 0:
-            return False
+            return db_name, "schema"
     except OSError:
-        return False
+        return db_name, "schema"
     marker = _read_candidate_db_marker(db_path)
     if marker is None:
-        return False
+        return db_name, "marker"
     if (
         str(marker.get("packet_sha256") or "") != packet_sha256
         or str(marker.get("target_request_id") or "") != target_request_id
         or str(marker.get("target_task_id") or "") != target_task_id
     ):
-        return False
+        return db_name, "marker"
     if not changed_paths:
-        return False
+        return db_name, "marker"
     try:
+        policy = _source_graph_mod.load_ignore_policy(repo)
         conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
         try:
             conn.execute("PRAGMA query_only=ON")
@@ -1121,25 +1118,61 @@ def _candidate_db_is_ready(
                 )
             }
             if not set(_CANDIDATE_SOURCE_GRAPH_REQUIRED_TABLES).issubset(tables):
-                return False
+                return db_name, "schema"
             for changed in changed_paths:
                 relative = str(changed.get("path") or "")
                 expected = str(changed.get("sha256") or "")
-                if not relative or not expected:
-                    return False
-                if not _is_admitted_existing_changed_path(repo, relative):
-                    continue
+                if not relative:
+                    return db_name, "missing_row"
                 found = conn.execute(
                     "SELECT source_hash FROM files WHERE file_path=?",
                     (relative,),
                 ).fetchone()
-                if found is None or str(found[0]) != expected:
-                    return False
+                if not expected:
+                    # A sealed deletion (``sha256: None``): the builder removes
+                    # it via ``remove_file``, so it needs NO row -- and a row or
+                    # a file still present for it is a tampered/stale overlay.
+                    if found is not None or (repo / relative).exists():
+                        return relative, "hash_mismatch"
+                    continue
+                if not _source_graph_partition.admitted_changed_path(
+                    repo, relative, policy,
+                ):
+                    continue
+                if found is None:
+                    return relative, "missing_row"
+                if str(found[0]) != expected:
+                    return relative, "hash_mismatch"
         finally:
             conn.close()
-    except (OSError, sqlite3.Error):
-        return False
-    return True
+    except (OSError, sqlite3.Error, _source_graph_mod.SourceGraphError):
+        return db_name, "schema"
+    return None
+
+
+def _candidate_db_is_ready(
+    db_path: Path,
+    repo: Path,
+    packet_sha256: str,
+    target_request_id: str,
+    target_task_id: str,
+    changed_paths: Sequence[Mapping[str, str]],
+) -> bool:
+    """True only when the overlay is schema-complete and exactly packet-bound."""
+
+    return _candidate_db_readiness_failure(
+        db_path, repo, packet_sha256, target_request_id, target_task_id,
+        changed_paths,
+    ) is None
+
+
+def _candidate_source_graph_empty_error(failure: tuple[str, str]) -> WorkerToolError:
+    """The prewarm refusal, keeping its prefix and naming path and reason."""
+
+    path, reason = failure
+    return WorkerToolError(
+        f"quality_review_candidate_source_graph_empty:path={path}:reason={reason}"
+    )
 
 
 class _CandidatePrewarmFlight:
@@ -1277,11 +1310,12 @@ def prewarm_quality_review_source_graph(
     flight, is_owner = _candidate_prewarm_flight(db_path)
     if not is_owner:
         flight.wait()
-        if not _candidate_db_is_ready(
+        failure = _candidate_db_readiness_failure(
             db_path, repo, packet_sha256, target_request_id, target_task_id,
             changed_paths,
-        ):
-            raise WorkerToolError("quality_review_candidate_source_graph_empty")
+        )
+        if failure is not None:
+            raise _candidate_source_graph_empty_error(failure)
         return _candidate_prewarm_result(
             built=False,
             db_path=db_path,
@@ -1315,21 +1349,21 @@ def prewarm_quality_review_source_graph(
             _write_candidate_db_marker(
                 temporary, packet_sha256, target_request_id, target_task_id,
             )
-            if not _candidate_db_is_ready(
+            failure = _candidate_db_readiness_failure(
                 temporary, repo, packet_sha256, target_request_id, target_task_id,
                 changed_paths,
-            ):
-                raise WorkerToolError(
-                    "quality_review_candidate_source_graph_empty"
-                )
+            )
+            if failure is not None:
+                raise _candidate_source_graph_empty_error(failure)
             os.replace(temporary, db_path)
         finally:
             temporary.unlink(missing_ok=True)
-        if not _candidate_db_is_ready(
+        failure = _candidate_db_readiness_failure(
             db_path, repo, packet_sha256, target_request_id, target_task_id,
             changed_paths,
-        ):
-            raise WorkerToolError("quality_review_candidate_source_graph_empty")
+        )
+        if failure is not None:
+            raise _candidate_source_graph_empty_error(failure)
         result = _candidate_prewarm_result(
             built=True,
             db_path=db_path,
@@ -3704,6 +3738,81 @@ def _overlay_entity_match(extraction: Any, entity: Any, source: str) -> dict[str
     }
 
 
+def _rerank_overlay_focus_rows(
+    canonical_rows: Any,
+    view: _ReworkOverlayView,
+    shadowed: frozenset[str],
+    overlay_matches: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """The canonical focus ranking with the overlay's changed files re-ranked in.
+
+    Every canonical row keeps its rank. A row in an unshadowed file is kept
+    (its nested shadowed rows dropped, as before). A row in a changed file is
+    replaced AT THAT RANK by the same symbol extracted from the worktree bytes
+    -- matched by qualname, else by kind and name -- unless the all-token
+    overlay pass already emitted it. A row whose symbol the overlay no longer
+    has, or whose file is deleted, digest-bound or repair evidence, is dropped:
+    stale canonical bytes are never served for a shadowed file. So a focus
+    query that ranks canonically cannot read as zero merely because the
+    overlay's all-token filter is stricter than the canonical ranking.
+    """
+
+    emitted = {
+        (
+            str(row.get("file_path") or ""),
+            str(row.get("qualname") or ""),
+            str(row.get("line_start") or ""),
+        )
+        for row in overlay_matches
+    }
+    ranked: list[dict[str, Any]] = []
+    for row in canonical_rows if isinstance(canonical_rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        file_path = str(row.get("file_path") or row.get("file") or "")
+        if file_path not in shadowed:
+            filtered = _drop_shadowed_source_graph_rows(row, shadowed)
+            if isinstance(filtered, dict):
+                ranked.append(filtered)
+            continue
+        extraction = view.changed.get(file_path)
+        if extraction is None:
+            continue
+        qualname = str(row.get("qualname") or "")
+        name = str(row.get("name") or "")
+        kind = str(row.get("kind") or "")
+        entity = next(
+            (
+                item for item in extraction.entities
+                if qualname and item.qualname == qualname
+                and (file_path, item.qualname, str(item.line_start)) not in emitted
+            ),
+            None,
+        ) or next(
+            (
+                item for item in extraction.entities
+                if name and item.name == name and item.kind == kind
+                and (file_path, item.qualname, str(item.line_start)) not in emitted
+            ),
+            None,
+        )
+        if entity is None:
+            continue
+        emitted.add((file_path, entity.qualname, str(entity.line_start)))
+        text = view.authorized_sources.get(file_path)
+        if text is None:
+            text = view.sealed_sources.get(file_path)
+        if text is None:
+            raise WorkerToolError(f"rework_overlay_sealed_source_missing:{file_path}")
+        lines = _ast_source_lines(text)
+        start = max(0, int(entity.line_start) - 1)
+        end = max(start, int(entity.line_end))
+        ranked.append(
+            _overlay_entity_match(extraction, entity, "\n".join(lines[start:end]))
+        )
+    return ranked
+
+
 def _merge_rework_overlay_payload(
     ctx: WorkerToolContext,
     payload: dict[str, Any],
@@ -3895,6 +4004,10 @@ def _merge_rework_overlay_payload(
     ))
     existing = merged.get("matches")
     canonical_matches = existing if isinstance(existing, list) else []
+    if mode == "focus":
+        canonical_matches = _rerank_overlay_focus_rows(
+            payload.get("matches"), view, shadowed, overlay_matches,
+        )
     merged["matches"] = (overlay_matches + canonical_matches)[:budget]
     merged["candidate_files"] = sorted({
         str(row.get("file_path") or "")

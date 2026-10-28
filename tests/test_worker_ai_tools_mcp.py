@@ -598,7 +598,10 @@ def test_quality_review_prewarm_fails_before_publish_on_wrong_hash(
     monkeypatch.setattr(source_graph, "index_file", fake_index_file)
     with pytest.raises(
         worker_tools.WorkerToolError,
-        match="quality_review_candidate_source_graph_empty",
+        match=(
+            "^quality_review_candidate_source_graph_empty"
+            ":path=module.py:reason=hash_mismatch$"
+        ),
     ):
         worker_tools.prewarm_quality_review_source_graph(
             packet_path, repo=candidate, authority_repo=canonical

@@ -214,6 +214,9 @@ def test_non_source_graph_candidate_workertoolerror_is_not_tolerated():
         "quality_review_candidate_path_escapes_workspace:eval/x.json",
         "quality_review_candidate_path_symlink:eval/x.json",
         "quality_review_candidate_source_graph_empty",
+        # The refusal now names its path and reason; it still refuses.
+        "quality_review_candidate_source_graph_empty"
+        ":path=eval/x.json:reason=missing_row",
     ):
         assert quality_review.classify_prewarm_error(msg)["tolerated"] is False
 

@@ -195,6 +195,27 @@ def _admits(
     return not sg._glob_ignored(posix, policy.exclude_globs)
 
 
+def admitted_changed_path(
+    repo_root: Path,
+    relative: str,
+    policy: sg.SourceGraphIgnorePolicy,
+) -> bool:
+    """The ONE admit decision for a packet path: will it get a partition row?
+
+    True exactly when ``relative`` names an existing regular file below the
+    resolved ``repo_root`` that :func:`_admits` accepts WITH ``repo_root`` (so a
+    nested linked worktree parent is refused on every side alike).
+    :func:`build_partition` indexes exactly these paths and the reviewer
+    candidate readiness check requires a row for exactly these paths, so the
+    builder and readiness can never disagree about which paths need a row.
+    """
+
+    root = Path(repo_root).resolve()
+    if not (root / relative).resolve(strict=False).is_file():
+        return False
+    return _admits(policy, relative, repo_root=root)
+
+
 def build_partition(
     repo_root: Path,
     changed_paths: Sequence[Mapping[str, str]],
@@ -268,7 +289,7 @@ def build_partition(
                     f"quality_review_candidate_path_symlink:{relative}"
                 )
             if candidate.is_file():
-                if not _admits(policy, relative, repo_root=repo_root):
+                if not admitted_changed_path(repo_root, relative, policy):
                     files_skipped += 1
                     continue
                 result = sg.index_file(repo_root, relative, expected_hash)
@@ -956,9 +977,15 @@ def composed_find(
         return []
     limit = max(1, min(int(limit), sg.MAX_BUDGET_ROWS))
     expressions = [sg._fts_phrase(term)]
-    if len(sg._query_tokens(term)) > 1:
+    tokens = sg._query_tokens(term)
+    if len(tokens) > 1:
         expressions.append(sg._fts_terms(term, operator="AND"))
-        if not sg._looks_like_identifier_query(term):
+        # Same OR gate as the canonical ``find``: a long identifier-like query
+        # still broadens to any-token rather than missing on the overlay.
+        if (
+            not sg._looks_like_identifier_query(term)
+            or len(tokens) > sg._IDENTIFIER_AND_TOKEN_LIMIT
+        ):
             expressions.append(sg._fts_terms(term, operator="OR"))
 
     ordered = [(schema, False) for schema in _partition_schemas(conn)]
@@ -1007,6 +1034,11 @@ def composed_find(
             out.append(data)
             if len(out) >= limit:
                 return out
+    if not out:
+        # The canonical finder's substring pass, run against the composed
+        # ``entities`` view (partition wins, scoped base rows hidden), so a
+        # query that hits canonically never reads as zero on the overlay.
+        out = [dict(row) for row in sg._find_like_rows(conn, term, limit)]
     return out
 
 
