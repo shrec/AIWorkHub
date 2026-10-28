@@ -372,9 +372,9 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.73
+## What's new in 0.12.74
 
-- MCP tool profiles: one table decides which tools the `manager`, `worker` and `dashboard` profiles list, the dashboard runs on its own profile, and a call to a tool the active profile does not serve is refused with a message naming the profiles that do. WorkHub Mail's listener and pairing are controlled from the dashboard, and Source Graph gains `mode=diff`.
+- 0.12.74 ships the unpublished 0.12.73 (its CI failed on Python 3.14). MCP tool profiles: one table decides which tools the `manager`, `worker` and `dashboard` profiles list, the dashboard runs on its own profile, and a call to a tool the active profile does not serve is refused with a message naming the profiles that do. WorkHub Mail's listener and pairing are controlled from the dashboard, and Source Graph gains `mode=diff`.
 - Every MCP tool publishes ToolAnnotations and CI lints the tool surface with TDQS; a reviewer killed by a transport cancellation is retried on another route, and the release watcher follows the exact commit's CI and Release runs after a cut.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 

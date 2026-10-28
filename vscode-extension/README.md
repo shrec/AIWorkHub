@@ -24,9 +24,9 @@ MCP stdio runtime on the workspace host. It does not open a browser or require
 an AIWorkHub cloud account, and it binds no port and exposes no LAN service
 unless you start the opt-in WorkHub Mail listener on a host and port you name.
 
-## What's new in 0.12.73
+## What's new in 0.12.74
 
-- MCP tool profiles: one table decides which tools the `manager`, `worker` and `dashboard` profiles list, the dashboard runs on its own profile, and a call to a tool the active profile does not serve is refused with a message naming the profiles that do. WorkHub Mail's listener and pairing are controlled from the dashboard, and Source Graph gains `mode=diff`.
+- 0.12.74 ships the unpublished 0.12.73 (its CI failed on Python 3.14). MCP tool profiles: one table decides which tools the `manager`, `worker` and `dashboard` profiles list, the dashboard runs on its own profile, and a call to a tool the active profile does not serve is refused with a message naming the profiles that do. WorkHub Mail's listener and pairing are controlled from the dashboard, and Source Graph gains `mode=diff`.
 - Every MCP tool publishes ToolAnnotations and CI lints the tool surface with TDQS; a reviewer killed by a transport cancellation is retried on another route, and the release watcher follows the exact commit's CI and Release runs after a cut.
 
 ## Review automation

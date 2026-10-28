@@ -6,6 +6,14 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.74] - 2026-10-28
+
+0.12.73 was tagged but never published: its CI run failed on Python 3.14 in a Source Graph daemon test. 0.12.74 ships everything listed under 0.12.73 plus the fix below.
+
+### Fixed
+
+- The Source Graph daemon Windows writer-identity test patches the module the lazy `runtime_temp` import actually loads instead of a string target, so it no longer depends on which earlier test re-imported the package (NF-2026-01798).
+
 ## [0.12.73] - 2026-10-28
 
 ### Added

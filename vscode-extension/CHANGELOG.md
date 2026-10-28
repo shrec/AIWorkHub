@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.12.74 — 2026-10-28
+
+0.12.73 was tagged but never published (a Source Graph daemon test failed on Python 3.14); 0.12.74 ships everything under 0.12.73 plus this fix.
+
+### Fixed
+
+- Bundled runtime 0.12.74: the Source Graph daemon Windows writer-identity test no longer depends on test order (NF-2026-01798).
+
 ## 0.12.73 — 2026-10-28
 
 ### Added
