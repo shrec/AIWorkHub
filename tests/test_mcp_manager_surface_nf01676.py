@@ -16,13 +16,14 @@ _SRC = _ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import server, task_store  # noqa: E402
+from aiworkhub import mcp_tool_metadata, server, task_store  # noqa: E402
 from aiworkhub.tool_recovery import unknown_tool_message  # noqa: E402
 
 _EXTENSION_JS = _ROOT / "vscode-extension" / "extension.js"
 _PAYLOAD_PREFIX = "NF01676_PAYLOAD="
 _DASHBOARD = "aiworkhub_dashboard_"
 _KEEP = {"aiworkhub_dashboard_needfix_transition", "aiworkhub_dashboard_snapshot"}
+_ALIASES = frozenset(mcp_tool_metadata.MCP_TOOL_ALIASES)
 _TEMPLATE_LIST = "aiworkhub_task_template_list"
 _PROBE_ERROR = "unexpected_arguments:['__nf01676_probe__']"
 
@@ -479,7 +480,7 @@ def test_manager_list_drops_only_the_webview_dashboard_tools(unset_run: dict, ma
     assert manager_run["snapshots"]["manager"]["surface"] == "manager"
     hidden = _hidden_names(full["names"])
     assert len(hidden) >= 40
-    assert trimmed["names"] == [name for name in full["names"] if name not in set(hidden)]
+    assert trimmed["names"] == [name for name in full["names"] if name not in set(hidden) and name not in _ALIASES]
     assert sorted(name for name in trimmed["names"] if name.startswith(_DASHBOARD)) == sorted(_KEEP)
     by_name = {entry["name"]: entry for entry in full["entries"]}
     assert len(by_name) == len(full["names"])
@@ -492,7 +493,7 @@ def test_manager_registers_only_visible_tools_and_matches_call_time_filtering(
     imported = manager_run["snapshots"]["manager"]["list"]
     flipped = unset_run["snapshots"]["late_manager"]
     assert flipped["surface"] == "manager"
-    assert manager_run["registered"] == imported["names"]
+    assert [name for name in manager_run["registered"] if name not in _ALIASES] == imported["names"]
     assert set(manager_run["registered"]) == set(unset_run["registered"]) - set(_hidden_names(unset_run["registered"]))
     assert flipped["list"]["names"] == imported["names"]
     assert flipped["list"]["wire_bytes"] == imported["wire_bytes"]
@@ -648,15 +649,15 @@ def test_real_stdio_loop_serves_the_same_surface(unset_run: dict, manager_run: d
 def test_measured_manager_surface_is_smaller(unset_run: dict, manager_run: dict, capsys) -> None:
     full = unset_run["snapshots"]["unset"]
     trimmed = manager_run["snapshots"]["manager"]
-    hidden = _hidden_names(full["list"]["names"])
+    dropped = set(_hidden_names(full["list"]["names"])) | _ALIASES
     all_count, manager_count = len(full["list"]["names"]), len(trimmed["list"]["names"])
     assert all_count >= 217
-    assert manager_count == all_count - len(hidden) < all_count
+    assert manager_count == all_count - len(dropped) < all_count
     all_bytes, manager_bytes = full["list"]["wire_bytes"], trimmed["list"]["wire_bytes"]
     assert manager_bytes < all_bytes
     assert (all_bytes - manager_bytes) / all_bytes >= 0.10
-    hidden_entries = [entry for entry in full["list"]["entries"] if entry["name"] in set(hidden)]
-    assert len(hidden_entries) == len(hidden)
+    hidden_entries = [entry for entry in full["list"]["entries"] if entry["name"] in dropped]
+    assert len(hidden_entries) == len(dropped)
     assert all_bytes - manager_bytes == sum(_wire_len(entry) for entry in hidden_entries) + 2 * len(hidden_entries)
 
     all_call, manager_call = full["calls"][_TEMPLATE_LIST], trimmed["calls"][_TEMPLATE_LIST]

@@ -20,7 +20,7 @@ _SRC = _ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import dashboard_mcp_app, mcp_tool_metadata, server, task_store  # noqa: E402
+from aiworkhub import core, dashboard_mcp_app, mcp_tool_metadata, server, task_store  # noqa: E402
 from aiworkhub.tool_recovery import unknown_tool_message  # noqa: E402
 
 _PAYLOAD_PREFIX = "RM00078_PAYLOAD="
@@ -44,7 +44,7 @@ _WORKER_ONLY = "aiworkhub_worker_source_graph_query"
 # Measured on base 739a7c70: tools/list counts before the profile table existed.
 _PRE_TABLE_ALL_COUNT = 232
 _PRE_TABLE_ALL_READ_ONLY_COUNT = 228
-_PRE_TABLE_MANAGER_COUNT = 185
+_LISTED_COUNTS = {"manager": 184, "worker": 19, "dashboard": 69}
 # The 47 webview-only dashboard tools the pre-table manager surface hid.
 _PRE_TABLE_MANAGER_HIDDEN = frozenset({
     "aiworkhub_dashboard_task_detail",
@@ -198,6 +198,14 @@ def _profile_names(profile: str) -> set:
     return {name for name, entry in mcp_tool_metadata.MCP_TOOL_PROFILES.items() if profile in entry}
 
 
+def _listed_names(profile: str) -> set:
+    return {
+        name
+        for name, entry in mcp_tool_metadata.MCP_TOOL_PROFILES.items()
+        if entry.get(profile) == mcp_tool_metadata.MCP_VISIBILITY_LISTED
+    }
+
+
 def _pre_table_manager_rule(name: str) -> bool:
     return not (name.startswith(_DASHBOARD) and name not in _KEEP)
 
@@ -262,7 +270,7 @@ def test_profile_table_is_one_literal_and_the_module_scans_nothing() -> None:
     keys = [key.value for key in table.keys if isinstance(key, ast.Constant) and isinstance(key.value, str)]
     assert len(keys) == len(table.keys) == len(set(keys)) == len(mcp_tool_metadata.MCP_TOOL_PROFILES)
     assert {getattr(value, "id", None) for value in table.values} <= {
-        "_MANAGER", "_DASHBOARD", "_MANAGER_DASHBOARD", "_WORKER",
+        "_MANAGER", "_MANAGER_CALLABLE", "_DASHBOARD", "_MANAGER_DASHBOARD", "_WORKER",
     }
     module_imports = set()
     for node in ast.parse(_METADATA_PY.read_text(encoding="utf-8")).body:
@@ -273,8 +281,7 @@ def test_profile_table_is_one_literal_and_the_module_scans_nothing() -> None:
     assert module_imports == {"__future__", "inspect", "typing", "collections.abc", "types"}
     for name, entry in mcp_tool_metadata.MCP_TOOL_PROFILES.items():
         assert entry and set(entry) <= set(mcp_tool_metadata.MCP_PROFILES), name
-        # Step 1 lists every entry; ``callable`` is infrastructure for a later step.
-        assert set(entry.values()) == {mcp_tool_metadata.MCP_VISIBILITY_LISTED}, name
+        assert set(entry.values()) <= set(mcp_tool_metadata.MCP_VISIBILITIES), name
     assert mcp_tool_metadata.MCP_SURFACES == ("all", "manager", "worker", "dashboard")
     assert server.MCP_SURFACES is mcp_tool_metadata.MCP_SURFACES
     assert server.MCP_DASHBOARD_TOOL_PREFIX == mcp_tool_metadata.MCP_DASHBOARD_TOOL_PREFIX == _DASHBOARD
@@ -292,13 +299,12 @@ def test_unset_and_all_list_exactly_the_pre_table_tools(runs: dict) -> None:
     assert set(unset["registered"]) <= set(mcp_tool_metadata.MCP_TOOL_PROFILES)
 
 
-def test_manager_lists_exactly_the_pre_table_manager_tools(runs: dict) -> None:
+def test_manager_lists_the_pre_table_manager_tools_minus_the_callable_aliases(runs: dict) -> None:
     full, manager = runs["unset"]["listed"], runs["manager"]
     assert manager["surface"] == "manager"
-    assert len(manager["listed"]) == _PRE_TABLE_MANAGER_COUNT
-    assert manager["listed"] == manager["registered"]
-    assert manager["listed"] == [name for name in full if _pre_table_manager_rule(name)]
-    assert manager["listed"] == [name for name in full if name not in _PRE_TABLE_MANAGER_HIDDEN]
+    manager_visible = [name for name in full if _pre_table_manager_rule(name)]
+    assert manager["registered"] == manager_visible
+    assert manager["listed"] == [name for name in manager_visible if name not in mcp_tool_metadata.MCP_TOOL_ALIASES]
     assert {name for name in full if not _pre_table_manager_rule(name)} == _PRE_TABLE_MANAGER_HIDDEN
     assert _profile_names("manager") == set(full) - _PRE_TABLE_MANAGER_HIDDEN
     assert {name for name in _profile_names("manager") if name.startswith(_DASHBOARD)} == set(
@@ -480,3 +486,45 @@ def test_manager_dashboard_keep_set_matches_the_profile_table() -> None:
         for name, entry in mcp_tool_metadata.MCP_TOOL_PROFILES.items()
         if name.startswith(mcp_tool_metadata.MCP_DASHBOARD_TOOL_PREFIX) and "manager" in entry
     } == server.MANAGER_SURFACE_DASHBOARD_KEEP
+
+
+_ALIAS_DESCRIPTION_PREFIX = "Deprecated alias of {canonical}; call {canonical}. "
+
+
+def test_aliases_are_manager_callable_but_unlisted_and_canonicals_stay_listed(runs: dict) -> None:
+    aliases = mcp_tool_metadata.MCP_TOOL_ALIASES
+    assert aliases and not set(aliases) & set(aliases.values())
+    manager = runs["manager"]
+    for alias, canonical in aliases.items():
+        assert server.mcp_tool_callable(alias, "manager") is True
+        assert server.mcp_tool_listed(alias, "manager") is False
+        assert alias in manager["registered"] and alias not in manager["listed"]
+        assert server.mcp_tool_listed(canonical, "manager") is True
+        assert server.mcp_tool_listed(alias, "all") is True
+        assert server.mcp_tool_callable(alias, "worker") is False
+        assert server.mcp_tool_callable(alias, "dashboard") is False
+        assert dict(mcp_tool_metadata.MCP_TOOL_PROFILES[alias]) == {
+            "manager": mcp_tool_metadata.MCP_VISIBILITY_CALLABLE,
+        }
+
+
+def test_alias_description_carries_the_deprecation_prefix() -> None:
+    for alias, canonical in mcp_tool_metadata.MCP_TOOL_ALIASES.items():
+        function = getattr(server, alias)
+        cleaned, _ = mcp_tool_metadata.split_docstring(function.__doc__)
+        _args, kwargs, _signature = mcp_tool_metadata.prepare_registration(function, (alias,), {})
+        assert kwargs["description"] == _ALIAS_DESCRIPTION_PREFIX.format(canonical=canonical) + cleaned
+        annotations = kwargs.get("annotations")
+        assert annotations.readOnlyHint is True
+
+
+def test_every_tool_named_in_the_manager_banner_is_listed_on_manager() -> None:
+    named = set(re.findall(r"aiworkhub_[a-z0-9_]+", core.MCP_MANAGER_CONTRACT_BANNER))
+    assert named
+    assert named <= _listed_names("manager")
+
+
+def test_listed_counts_per_profile_are_pinned(runs: dict) -> None:
+    assert {profile: len(_listed_names(profile)) for profile in _LISTED_COUNTS} == _LISTED_COUNTS
+    assert len(runs["manager"]["listed"]) == _LISTED_COUNTS["manager"]
+    assert len(runs["dashboard"]["listed"]) == _LISTED_COUNTS["dashboard"]

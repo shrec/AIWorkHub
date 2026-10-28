@@ -29,6 +29,8 @@ __all__ = [
     "derive_annotations",
     "prepare_registration",
     "MCP_TOOL_PROFILES",
+    "MCP_TOOL_ALIASES",
+    "alias_description",
     "tool_profile_visibility",
     "exposing_profiles",
 ]
@@ -258,12 +260,13 @@ def prepare_registration(
     doc = getattr(function, "__doc__", None)
     cleaned, params = split_docstring(doc)
 
-    if "description" not in kwargs:
-        kwargs["description"] = cleaned
+    explicit_description = "description" in kwargs
+    if not explicit_description:
+        kwargs["description"] = alias_description(tool_name, cleaned)
     description = kwargs.get("description", cleaned)
 
     if "annotations" not in kwargs:
-        derived = derive_annotations(tool_name, description)
+        derived = derive_annotations(MCP_TOOL_ALIASES.get(tool_name, tool_name), description)
         if derived is not None:
             try:
                 from mcp.types import ToolAnnotations
@@ -294,6 +297,7 @@ MCP_VISIBILITIES = (MCP_VISIBILITY_LISTED, MCP_VISIBILITY_CALLABLE)
 MCP_DASHBOARD_TOOL_PREFIX = "aiworkhub_dashboard_"
 
 _MANAGER = MappingProxyType({MCP_PROFILE_MANAGER: MCP_VISIBILITY_LISTED})
+_MANAGER_CALLABLE = MappingProxyType({MCP_PROFILE_MANAGER: MCP_VISIBILITY_CALLABLE})
 _DASHBOARD = MappingProxyType({MCP_PROFILE_DASHBOARD: MCP_VISIBILITY_LISTED})
 _MANAGER_DASHBOARD = MappingProxyType({
     MCP_PROFILE_MANAGER: MCP_VISIBILITY_LISTED,
@@ -375,7 +379,7 @@ MCP_TOOL_PROFILES: dict[str, Mapping[str, str]] = {
     "aiworkhub_manager_hub_mail_peers": _MANAGER,
     "aiworkhub_manager_hub_mail_listener": _MANAGER,
     "aiworkhub_vscode_lm_worker_tool": _MANAGER_DASHBOARD,
-    "aiworkhub_router_known_repositories": _MANAGER,
+    "aiworkhub_router_known_repositories": _MANAGER_CALLABLE,
     "aiworkhub_repo_list": _MANAGER,
     "aiworkhub_repo_current": _MANAGER,
     "aiworkhub_repo_switch": _MANAGER,
@@ -561,6 +565,19 @@ MCP_TOOL_PROFILES: dict[str, Mapping[str, str]] = {
     "aiworkhub_worker_validation_output_page": _WORKER,
     "aiworkhub_worker_exit_preflight": _WORKER,
 }
+
+# Duplicate tool names: callable by exact name on the manager profile, absent from its tools/list.
+# Each canonical must be listed on every profile that lists the alias. Verified same delegate and parameters.
+MCP_TOOL_ALIASES: Mapping[str, str] = MappingProxyType({
+    "aiworkhub_router_known_repositories": "aiworkhub_repo_list",
+})
+
+
+def alias_description(tool_name: str, cleaned: str) -> str:
+    canonical = MCP_TOOL_ALIASES.get(tool_name)
+    if canonical is None:
+        return cleaned
+    return f"Deprecated alias of {canonical}; call {canonical}. {cleaned}"
 
 
 def tool_profile_visibility(name: Any, profile: str) -> str | None:

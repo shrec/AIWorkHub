@@ -281,13 +281,15 @@ except ModuleNotFoundError:
             if not mcp_tool_listed(name, surface):
                 continue
             text, _ = _stdio_tool_metadata.split_docstring(getattr(func, "__doc__", None))
-            description = text.strip()
+            description = _stdio_tool_metadata.alias_description(name, text.strip())
             entry: dict[str, Any] = {
                 "name": name,
                 "description": description,
                 "inputSchema": _stdio_schema_for(func),
             }
-            annotations = _stdio_tool_metadata.derive_annotations(name, description)
+            annotations = _stdio_tool_metadata.derive_annotations(
+                _stdio_tool_metadata.MCP_TOOL_ALIASES.get(name, name), description
+            )
             if annotations is not None:
                 entry["annotations"] = annotations
             entries.append(entry)

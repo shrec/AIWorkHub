@@ -15,7 +15,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub.mcp_tool_metadata import derive_annotations, split_docstring  # noqa: E402
+from aiworkhub.mcp_tool_metadata import MCP_TOOL_ALIASES, derive_annotations, split_docstring  # noqa: E402
 
 _PAYLOAD_PREFIX = "NF01642_PAYLOAD="
 _REJECT_REVIEW = "aiworkhub_task_reject_review"
@@ -147,9 +147,13 @@ def _has_args_block(doc: str) -> bool:
     return any(line.strip() in ("Args:", "Parameters:") for line in doc.splitlines())
 
 
-def _expected_description(doc: str) -> str:
+def _expected_description(doc: str, name: str) -> str:
     # FastMCP moves an Args block into per-parameter descriptions (split_docstring).
-    return split_docstring(doc)[0].strip() if _has_args_block(doc) else doc.strip()
+    text = split_docstring(doc)[0].strip() if _has_args_block(doc) else doc.strip()
+    canonical = MCP_TOOL_ALIASES.get(name)
+    if canonical is None:
+        return text
+    return f"Deprecated alias of {canonical}; call {canonical}. {text}"
 
 
 def _parameter_descriptions(entry: dict) -> dict:
@@ -185,7 +189,7 @@ def test_every_description_is_the_full_docstring(stdlib_payload: dict, fallback_
     docs = stdlib_payload["docs"]
     mismatched = [
         name for name, entry in fallback_tools.items()
-        if entry["description"] != _expected_description(docs[name])
+        if entry["description"] != _expected_description(docs[name], name)
     ]
     assert not mismatched, mismatched[:10]
     assert [name for name, doc in docs.items() if not _has_args_block(doc)]
@@ -195,7 +199,7 @@ def test_reject_review_description_is_not_truncated_to_its_first_line(
     stdlib_payload: dict, fallback_tools: dict
 ) -> None:
     description = fallback_tools[_REJECT_REVIEW]["description"]
-    assert description == _expected_description(stdlib_payload["docs"][_REJECT_REVIEW])
+    assert description == _expected_description(stdlib_payload["docs"][_REJECT_REVIEW], _REJECT_REVIEW)
     assert description != _REJECT_REVIEW_TRUNCATED
     assert description.startswith(_REJECT_REVIEW_TRUNCATED)
     assert "reject_reason_too_large" in description
@@ -225,7 +229,7 @@ def test_every_fallback_tool_publishes_the_shared_derived_annotations(
     mismatched = [
         name for name, entry in fallback_tools.items()
         if "annotations" not in entry
-        or entry["annotations"] != derive_annotations(name, entry["description"])
+        or entry["annotations"] != derive_annotations(MCP_TOOL_ALIASES.get(name, name), entry["description"])
         or not isinstance(entry["annotations"].get("readOnlyHint"), bool)
     ]
     assert not mismatched, mismatched[:10]
