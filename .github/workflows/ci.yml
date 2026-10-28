@@ -407,12 +407,14 @@ jobs:
 
       # TDQS (Tool Definition Quality Score, https://tdqs.dev) grades the tool definitions the
       # image publishes. Lint is offline, deterministic and free; --fail-on never keeps every
-      # finding advisory until a later ratchet card.
+      # finding advisory until a later ratchet card. An unset AIWORKHUB_MCP_SURFACE serves the
+      # manager profile (RM-2026-00078), so both TDQS runs pin it to all and grade every tool
+      # definition the server has.
       - name: Install TDQS
         run: python3 -m pip install tdqs==0.1.0
 
       - name: TDQS lint the image's MCP tool definitions
-        run: tdqs lint --command "docker run -i --rm aiworkhub-mcp:ci" --server-name AIWorkHub --format json --fail-on never --output tdqs-lint.json
+        run: tdqs lint --command "docker run -i --rm -e AIWORKHUB_MCP_SURFACE=all aiworkhub-mcp:ci" --server-name AIWorkHub --format json --fail-on never --output tdqs-lint.json
 
       - name: Summarize the TDQS lint report
         run: python3 scripts/tdqs_report_to_needfix.py tdqs-lint.json --markdown >> "$GITHUB_STEP_SUMMARY"
@@ -436,7 +438,7 @@ jobs:
         continue-on-error: true
         env:
           TDQS_API_KEY: ${{ secrets.TDQS_API_KEY }}
-        run: tdqs score --command "docker run -i --rm aiworkhub-mcp:ci" --server-name AIWorkHub --hosted https://tdqs.dev --format json --fail-on never --output tdqs-score.json
+        run: tdqs score --command "docker run -i --rm -e AIWORKHUB_MCP_SURFACE=all aiworkhub-mcp:ci" --server-name AIWorkHub --hosted https://tdqs.dev --format json --fail-on never --output tdqs-score.json
 
       - name: Add the hosted score to the TDQS report
         if: ${{ !cancelled() && steps.tdqs_score.outcome == 'success' }}

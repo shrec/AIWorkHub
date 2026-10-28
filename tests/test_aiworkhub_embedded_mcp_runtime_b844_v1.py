@@ -173,7 +173,8 @@ def fallback_server_module(monkeypatch):
         package.__dict__.pop("server", sentinel) if package is not None else sentinel
     )
 
-    monkeypatch.delenv("AIWORKHUB_MCP_SURFACE", raising=False)
+    # These tests read the full registry; an unset surface registers manager's tools only.
+    monkeypatch.setenv("AIWORKHUB_MCP_SURFACE", "all")
     builtins.__import__ = blocked_import
     try:
         from aiworkhub import server as server_module
@@ -718,6 +719,7 @@ def _spawn_bundled_runtime(runtime_dir: Path, fresh_repo: Path) -> subprocess.Po
     })
     env.pop("AIWORKHUB_ALLOW_WRITES", None)
     env.pop("AIWORKHUB_ALLOW_LAUNCH", None)
+    # Unset on purpose: the bundled runtime serves its own default, the manager surface.
     env.pop("AIWORKHUB_MCP_SURFACE", None)
     # -S: skip the `site` module entirely -- neither global nor user
     # site-packages are on sys.path, so this can only succeed via the
@@ -781,6 +783,8 @@ def test_isolated_vsix_runtime_smoke_no_site_packages_fresh_repo(extracted_vsix,
         assert "error" not in tools_list, tools_list.get("error")
         names = {t["name"] for t in tools_list["result"]["tools"]}
         assert "aiworkhub_dashboard_snapshot" in names
+        # RM-2026-00078: the unset default is the manager surface, which hides the webview-only tools.
+        assert "aiworkhub_dashboard_health" not in names
 
         session.send({
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",

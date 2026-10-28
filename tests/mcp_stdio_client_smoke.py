@@ -296,12 +296,15 @@ def _server_params(audit_log: Path, allow_writes: bool | None) -> StdioServerPar
     command = this python interpreter, args = ``-m aiworkhub.server``.
     stdio_client spawns it directly over OS pipes (never a shell). The child
     env is a minimal default env plus the paths the server needs and isolated
-    audit/process state paths. ``AIWORKHUB_ALLOW_WRITES`` is set/unset per
-    round, while ``AIWORKHUB_ALLOW_LAUNCH`` is always forced closed.
+    audit/process state paths. ``AIWORKHUB_MCP_SURFACE`` is pinned to ``all``,
+    the surface the contract was frozen on (an unset one serves manager since
+    RM-2026-00078). ``AIWORKHUB_ALLOW_WRITES`` is set/unset per round, while
+    ``AIWORKHUB_ALLOW_LAUNCH`` is always forced closed.
     """
     env = get_default_environment()
     env["PYTHONPATH"] = SRC
     env["AIWORKHUB_REPO"] = str(core.repo_root())
+    env["AIWORKHUB_MCP_SURFACE"] = "all"
     env["AIWORKHUB_AUDIT_LOG_PATH"] = str(audit_log)
     env[process_launcher.PROCESS_LOG_ENV] = str(audit_log.parent / "process_events.jsonl")
     env[process_launcher.PROCESS_DIR_ENV] = str(audit_log.parent / "processes")

@@ -27,6 +27,9 @@ trap 'rm -rf "$TMPDIR_STATE"' EXIT
 
 export PYTHONPATH="$MCPROOT/src"
 export AIWORKHUB_REPO="$ROOT"
+# RM-2026-00078: an unset surface serves manager, but the contract was frozen on the full
+# surface. The smoke pins it for the server child it spawns as well.
+export AIWORKHUB_MCP_SURFACE=all
 unset AIWORKHUB_ALLOW_WRITES AIWORKHUB_ALLOW_LAUNCH
 
 echo "=== MCP STDIO Subprocess Client Smoke Test B109 v1 ==="

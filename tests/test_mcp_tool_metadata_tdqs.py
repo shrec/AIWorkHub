@@ -3,12 +3,14 @@
 Covers (a) split_docstring, (b) a fresh FastMCP publishing per-parameter
 descriptions, Args-free descriptions and derived ToolAnnotations through the
 same wrapper shape as server._nonblocking_mcp_tool, (c) an explicit Field
-description beating Args text, and (d) the live server.mcp contract
-(non-empty, Args-free descriptions and aiworkhub_task_create's inputSchema
-matching a direct SDK registration).
+description beating Args text, and (d) the live server.mcp contract for every
+tool the all surface registers, read from a child that pins the surface before
+importing server (non-empty, Args-free descriptions, annotations, and
+aiworkhub_task_create's inputSchema matching a direct SDK registration).
 """
 
 import asyncio
+import json
 import typing
 from functools import wraps
 
@@ -191,48 +193,62 @@ def test_explicit_field_description_beats_args():
 
 _DOCSTRING_PENDING: frozenset[str] = frozenset()  # shrink only; every published tool documents itself
 
+# Registration keeps only the tools the surface active at import can call, so setting
+# AIWORKHUB_MCP_SURFACE after ``from aiworkhub import server`` cannot widen this process's
+# registry. nf01642's SDK child pins all before that import; sharing it keeps one
+# definition of the child.
+from test_stdio_tools_list_parity_nf01642 import _SDK_BODY, _run_child  # noqa: E402
 
-def test_server_tools_publish_args_free_descriptions_and_match_sdk():
+
+@pytest.fixture(scope="module")
+def all_surface_tools() -> dict:
+    """Name -> description, inputSchema and annotations of every tool the all surface registers."""
     pytest.importorskip("mcp")
     from aiworkhub import server
 
-    tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
-    assert tools, "no tools registered"
+    tools = {entry["name"]: entry for entry in _run_child("sdk", _SDK_BODY)}
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delenv(server.MCP_SURFACE_ENV, raising=False)
+        manager = {tool.name for tool in asyncio.run(server.mcp.list_tools())}
+    # all lists every tool the child registered: more than this process's default manager surface.
+    assert len(tools) > len(manager), (len(tools), len(manager))
+    return tools
 
+
+def test_server_tools_publish_args_free_descriptions_and_match_sdk(all_surface_tools):
+    from mcp.server.fastmcp import FastMCP
+
+    from aiworkhub import server
+
+    tools = all_surface_tools
     assert {
-        name for name, tool in tools.items() if not (tool.description or "").strip()
+        name for name, tool in tools.items() if not tool["description"].strip()
     } <= _DOCSTRING_PENDING
 
     for name, tool in tools.items():
-        for line in tool.description.splitlines():
+        for line in tool["description"].splitlines():
             assert line.strip() != "Args:", f"{name}: description keeps an Args: line"
-
-    from mcp.server.fastmcp import FastMCP
 
     direct = FastMCP("direct")
     direct.tool()(server.aiworkhub_task_create)
     direct_tools = {t.name: t for t in asyncio.run(direct.list_tools())}
-    assert (
-        tools["aiworkhub_task_create"].inputSchema
-        == direct_tools["aiworkhub_task_create"].inputSchema
+    # The child's schema crossed JSON; compare the direct one in the same form.
+    assert tools["aiworkhub_task_create"]["inputSchema"] == json.loads(
+        json.dumps(direct_tools["aiworkhub_task_create"].inputSchema)
     )
 
 
-def test_every_server_tool_publishes_annotations_with_read_only_hint():
-    pytest.importorskip("mcp")
-    from aiworkhub import server
-
-    tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
-    assert tools, "no tools registered"
+def test_every_server_tool_publishes_annotations_with_read_only_hint(all_surface_tools):
+    tools = all_surface_tools
     missing = sorted(
         name
         for name, tool in tools.items()
-        if tool.annotations is None or tool.annotations.readOnlyHint is None
+        if tool["annotations"] is None or tool["annotations"].get("readOnlyHint") is None
     )
     assert not missing, missing[:10]
 
     def hints(name):
-        return tools[name].annotations.model_dump(exclude_none=True)
+        return tools[name]["annotations"]
 
     assert hints("needfix_show")["readOnlyHint"] is True
     assert hints("roadmap_list")["readOnlyHint"] is True

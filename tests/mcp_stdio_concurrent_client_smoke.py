@@ -245,11 +245,14 @@ def _server_params(audit_log: Path, allow_writes: bool) -> StdioServerParameters
     command = this python interpreter, args = ``-m aiworkhub.server``.
     stdio_client spawns it directly over OS pipes (never a shell). Each session
     gets its OWN isolated audit-log path; ``AIWORKHUB_ALLOW_WRITES`` is
-    set/unset per round to exercise both no-write branches.
+    set/unset per round to exercise both no-write branches. Every session pins
+    ``AIWORKHUB_MCP_SURFACE`` to ``all``, the surface the contract was frozen on
+    (an unset one serves manager since RM-2026-00078).
     """
     env = get_default_environment()
     env["PYTHONPATH"] = SRC
     env["AIWORKHUB_REPO"] = str(core.repo_root())
+    env["AIWORKHUB_MCP_SURFACE"] = "all"
     env["AIWORKHUB_AUDIT_LOG_PATH"] = str(audit_log)
     env.pop("AIWORKHUB_ALLOW_WRITES", None)
     if allow_writes:

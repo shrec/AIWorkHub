@@ -52,6 +52,11 @@ SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
+# RM-2026-00078: an unset AIWORKHUB_MCP_SURFACE serves the manager profile. This harness
+# drives the server in-process and registration follows the surface at import, so the
+# full surface the contract was frozen on is pinned before that import.
+os.environ["AIWORKHUB_MCP_SURFACE"] = "all"
+
 from mcp.shared.memory import (  # noqa: E402
     create_connected_server_and_client_session as connect_client,
 )

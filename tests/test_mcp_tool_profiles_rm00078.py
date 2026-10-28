@@ -1,4 +1,4 @@
-"""RM-2026-00078 step 1: one declarative MCP tool profile table, a listed/callable split, the default surface unchanged."""
+"""RM-2026-00078: one declarative MCP tool profile table, a listed/callable split, and a manager default surface."""
 
 from __future__ import annotations
 
@@ -40,6 +40,7 @@ _HIDDEN_PROBE = "aiworkhub_dashboard_health"
 _MANAGER_PROBE = "aiworkhub_task_list"
 _NEVER_EXISTED = "aiworkhub_no_such_tool_rm00078"
 _WORKER_ONLY = "aiworkhub_worker_source_graph_query"
+_WRITE_PROBE = "aiworkhub_task_mark_done"
 
 # Measured on base 739a7c70: tools/list counts before the profile table existed.
 _PRE_TABLE_ALL_COUNT = 232
@@ -138,8 +139,10 @@ print(PREFIX + json.dumps(report))
 
 _RUNS = {
     "unset": {"surface": None, "writes": True},
-    "unset_read_only": {"surface": None, "writes": False},
+    "blank": {"surface": "  ", "writes": True},
     "all": {"surface": "all", "writes": True},
+    "all_read_only": {"surface": "all", "writes": False},
+    "unset_read_only": {"surface": None, "writes": False, "args": {"probes": [_WRITE_PROBE]}},
     "manager": {
         "surface": "manager", "writes": True,
         "args": {"probes": [_HIDDEN_PROBE, _NEVER_EXISTED, _WORKER_ONLY], "callable_only": _CALLABLE_ONLY},
@@ -287,20 +290,46 @@ def test_profile_table_is_one_literal_and_the_module_scans_nothing() -> None:
     assert server.MCP_DASHBOARD_TOOL_PREFIX == mcp_tool_metadata.MCP_DASHBOARD_TOOL_PREFIX == _DASHBOARD
 
 
-def test_unset_and_all_list_exactly_the_pre_table_tools(runs: dict) -> None:
-    unset, explicit, read_only = runs["unset"], runs["all"], runs["unset_read_only"]
-    assert unset["surface"] == explicit["surface"] == read_only["surface"] == "all"
-    assert unset["listed"] == unset["registered"] == explicit["listed"] == explicit["registered"]
-    assert len(unset["listed"]) == len(set(unset["listed"])) == _PRE_TABLE_ALL_COUNT
+def test_all_lists_exactly_the_pre_table_tools(runs: dict) -> None:
+    explicit, read_only = runs["all"], runs["all_read_only"]
+    assert explicit["surface"] == read_only["surface"] == "all"
+    assert explicit["listed"] == explicit["registered"]
+    assert len(explicit["listed"]) == len(set(explicit["listed"])) == _PRE_TABLE_ALL_COUNT
     assert read_only["listed"] == read_only["registered"]
     assert len(read_only["listed"]) == _PRE_TABLE_ALL_READ_ONLY_COUNT
-    assert read_only["listed"] == [name for name in unset["listed"] if name not in _WRITE_GATED]
+    assert read_only["listed"] == [name for name in explicit["listed"] if name not in _WRITE_GATED]
     # No real tool relies on the table's fallback rule for unknown names.
-    assert set(unset["registered"]) <= set(mcp_tool_metadata.MCP_TOOL_PROFILES)
+    assert set(explicit["registered"]) <= set(mcp_tool_metadata.MCP_TOOL_PROFILES)
+
+
+def test_unset_and_blank_serve_exactly_the_manager_listed_rows(runs: dict) -> None:
+    # Card 4: a client config that names no surface, or a blank one, gets manager instead of all.
+    manager = runs["manager"]
+    assert len(manager["listed"]) == len(set(manager["listed"]))
+    assert set(manager["listed"]) == _listed_names("manager")
+    for label in ("unset", "blank"):
+        run = runs[label]
+        assert run["surface"] == "manager", label
+        assert run["registered"] == manager["registered"], label
+        assert run["listed"] == manager["listed"], label
+        assert run["stderr_surface_lines"] == [], label
+
+
+def test_default_surface_still_refuses_write_tools_without_allow_writes(runs: dict) -> None:
+    # The manager default picks the profile; AIWORKHUB_ALLOW_WRITES still decides whether its write tools exist.
+    writable, gated = runs["unset"], runs["unset_read_only"]
+    assert gated["surface"] == "manager" and gated["stderr_surface_lines"] == []
+    assert _WRITE_GATED <= set(writable["registered"]) and _WRITE_PROBE in writable["listed"]
+    assert gated["registered"] == [name for name in writable["registered"] if name not in _WRITE_GATED]
+    assert gated["listed"] == [name for name in writable["listed"] if name not in _WRITE_GATED]
+    assert _error(gated["probes"][_WRITE_PROBE]) == {
+        "code": -32602,
+        "message": unknown_tool_message(_WRITE_PROBE, gated["listed"]),
+    }
 
 
 def test_manager_lists_the_pre_table_manager_tools_minus_the_callable_aliases(runs: dict) -> None:
-    full, manager = runs["unset"]["listed"], runs["manager"]
+    full, manager = runs["all"]["listed"], runs["manager"]
     assert manager["surface"] == "manager"
     manager_visible = [name for name in full if _pre_table_manager_rule(name)]
     assert manager["registered"] == manager_visible
@@ -332,13 +361,32 @@ def test_unknown_surface_value_writes_exactly_one_stderr_line_in_process(monkeyp
         "aiworkhub.mcp_surface: unknown AIWORKHUB_MCP_SURFACE='bogus-profile'; using 'manager' "
         "(accepted: all, dashboard, manager, worker)"
     ]
-    for value, expected in ((None, "all"), ("", "all"), ("ALL", "all"), ("worker", "worker"), ("dashboard", "dashboard")):
+    for value, expected in (
+        (None, "manager"), ("", "manager"), ("ALL", "all"), ("worker", "worker"), ("dashboard", "dashboard"),
+    ):
         if value is None:
             monkeypatch.delenv(server.MCP_SURFACE_ENV, raising=False)
         else:
             monkeypatch.setenv(server.MCP_SURFACE_ENV, value)
         assert server.mcp_surface() == expected
     assert capsys.readouterr() == ("", "")
+
+
+def test_unset_and_blank_default_to_manager_and_explicit_all_stays_all(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(server, "_unknown_surfaces_reported", set())
+    monkeypatch.delenv(server.MCP_SURFACE_ENV, raising=False)
+    assert server.mcp_surface() == server.MCP_SURFACE_MANAGER == "manager"
+    assert server.mcp_tool_callable(_HIDDEN_PROBE) is False
+    for blank in ("", " ", "   "):
+        monkeypatch.setenv(server.MCP_SURFACE_ENV, blank)
+        assert server.mcp_surface() == "manager", repr(blank)
+    for explicit in ("all", "ALL", " All "):
+        monkeypatch.setenv(server.MCP_SURFACE_ENV, explicit)
+        assert server.mcp_surface() == server.MCP_SURFACE_ALL == "all", repr(explicit)
+    assert server.mcp_tool_callable(_HIDDEN_PROBE) is True
+    # A blank value is the default, not an unknown one: no stderr line, nothing remembered.
+    assert capsys.readouterr() == ("", "")
+    assert server._unknown_surfaces_reported == set()
 
 
 def test_worker_profile_is_exactly_the_worker_tools(runs: dict) -> None:
@@ -349,7 +397,7 @@ def test_worker_profile_is_exactly_the_worker_tools(runs: dict) -> None:
     assert all(set(mcp_tool_metadata.MCP_TOOL_PROFILES[name]) == {"worker"} for name in worker_names)
     worker = runs["worker"]
     assert worker["surface"] == "worker"
-    full = runs["unset"]["listed"]
+    full = runs["all"]["listed"]
     assert worker["listed"] == worker["registered"] == [name for name in full if name.startswith("aiworkhub_worker_")]
 
 
@@ -365,7 +413,7 @@ def test_dashboard_profile_is_the_dashboard_app_plus_every_extension_called_tool
     assert dashboard == app_names | extension_names
     run = runs["dashboard"]
     assert run["surface"] == "dashboard"
-    full = runs["unset"]["listed"]
+    full = runs["all"]["listed"]
     assert run["listed"] == run["registered"] == [name for name in full if name in dashboard]
 
 
@@ -394,7 +442,8 @@ def test_sdk_tools_list_paths_publish_only_listed_tools(monkeypatch) -> None:
         reply = asyncio.run(server._lowlevel_server.request_handlers[types.ListToolsRequest](None))
         return [tool.name for tool in reply.root.tools]
 
-    monkeypatch.delenv(server.MCP_SURFACE_ENV, raising=False)
+    # all lists every tool this process registered; an unset surface lists manager's only.
+    monkeypatch.setenv(server.MCP_SURFACE_ENV, "all")
     everything = [tool.name for tool in asyncio.run(server.mcp.list_tools())]
     assert everything == via_handler() == [tool.name for tool in server.mcp._tool_manager.list_tools()]
     monkeypatch.setitem(
@@ -402,7 +451,8 @@ def test_sdk_tools_list_paths_publish_only_listed_tools(monkeypatch) -> None:
     )
     monkeypatch.setenv(server.MCP_SURFACE_ENV, "manager")
     expected = [name for name in everything if server.mcp_tool_listed(name, "manager")]
-    assert _CALLABLE_ONLY not in expected and _HIDDEN_PROBE not in expected
+    # _HIDDEN_PROBE is never registered under the manager default, so check the table, not `everything`.
+    assert _CALLABLE_ONLY not in expected and not server.mcp_tool_listed(_HIDDEN_PROBE, "manager")
     assert [tool.name for tool in asyncio.run(server.mcp.list_tools())] == expected
     assert via_handler() == expected
     assert server.mcp._tool_manager.get_tool(_CALLABLE_ONLY) is not None
@@ -447,7 +497,7 @@ def test_unknown_tool_message_helper_distinguishes_known_and_unknown_names() -> 
 
 def test_write_gate_skipped_tool_gets_the_generic_refusal(monkeypatch) -> None:
     # Skipped while writes are off, the tool is served by no profile: a surface switch cannot help.
-    name = "aiworkhub_task_mark_done"
+    name = _WRITE_PROBE
     assert name in mcp_tool_metadata.MCP_TOOL_PROFILES
     tools = {"aiworkhub_dashboard_health": object(), "aiworkhub_task_list": object()}
     monkeypatch.setattr(server, "_WRITE_GATE_SKIPPED", {name})

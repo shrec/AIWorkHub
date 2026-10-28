@@ -133,7 +133,8 @@ def _run_child(backend: str, body: str):
         AIWORKHUB_MCP_STDIO_BACKEND=backend,
         PYTHONPATH=os.pathsep.join([str(_SRC), *inherited]),
     )
-    env.pop("AIWORKHUB_MCP_SURFACE", None)
+    # Parity covers every tool: an unset surface serves manager, whose list omits its aliases.
+    env["AIWORKHUB_MCP_SURFACE"] = "all"
     script = f"PREFIX = {_PAYLOAD_PREFIX!r}\n{_CHILD_PREAMBLE}{body}"
     argv = [sys.executable, *(["-S"] if backend == "stdlib" else []), "-c", script]
     completed = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=120)

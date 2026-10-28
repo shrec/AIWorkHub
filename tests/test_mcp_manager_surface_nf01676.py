@@ -293,8 +293,8 @@ def snapshot(full):
 
 snapshots = {ARGS["label"]: snapshot(True)}
 if ARGS.get("flip"):
-    os.environ["AIWORKHUB_MCP_SURFACE"] = "all"
-    snapshots["explicit_all"] = snapshot(False)
+    os.environ.pop("AIWORKHUB_MCP_SURFACE", None)
+    snapshots["late_unset"] = snapshot(False)
     os.environ["AIWORKHUB_MCP_SURFACE"] = "manager"
     snapshots["late_manager"] = snapshot(False)
 print(PREFIX + json.dumps({"registered": list(real), "hidden_example": hidden_example, "snapshots": snapshots}))
@@ -380,26 +380,29 @@ def repo_root(tmp_path_factory) -> Path:
 
 
 @pytest.fixture(scope="module")
-def unset_run(repo_root: Path) -> dict:
+def all_run(repo_root: Path) -> dict:
+    # Pinned: an unset surface serves manager (RM-2026-00078), so the full registry needs all.
     return _run_child(
-        "stdlib", _STDLIB_BODY, surface=None, repo_root=repo_root, args={"label": "unset", "flip": True}
+        "stdlib", _STDLIB_BODY, surface="all", repo_root=repo_root, args={"label": "all", "flip": True}
     )
 
 
 @pytest.fixture(scope="module")
-def manager_run(repo_root: Path, unset_run: dict) -> dict:
-    probe_names = [name for name in unset_run["registered"] if name.startswith(_DASHBOARD)]
+def manager_run(repo_root: Path, all_run: dict) -> dict:
+    probe_names = [name for name in all_run["registered"] if name.startswith(_DASHBOARD)]
     return _run_child(
         "stdlib", _STDLIB_BODY, surface="manager", repo_root=repo_root,
-        args={"label": "manager", "probe_names": probe_names, "hidden_example": unset_run["hidden_example"]},
+        args={"label": "manager", "probe_names": probe_names, "hidden_example": all_run["hidden_example"]},
     )
 
 
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
-        (None, "all"),
-        ("", "all"),
+        # RM-2026-00078: an unset or blank value serves manager.
+        (None, "manager"),
+        ("", "manager"),
+        ("   ", "manager"),
         ("all", "all"),
         ("ALL", "all"),
         ("manager", "manager"),
@@ -424,58 +427,62 @@ def test_surface_value_parsing(monkeypatch, value, expected) -> None:
 
 
 def test_visibility_predicate_hides_only_webview_dashboard_tools(monkeypatch) -> None:
-    monkeypatch.delenv(server.MCP_SURFACE_ENV, raising=False)
+    monkeypatch.setenv(server.MCP_SURFACE_ENV, "all")
     assert all(server.mcp_tool_callable(name) for name in _MANAGER_VISIBILITY)
     monkeypatch.setenv(server.MCP_SURFACE_ENV, "manager")
     assert {name: server.mcp_tool_callable(name) for name in _MANAGER_VISIBILITY} == _MANAGER_VISIBILITY
     assert {name: server.mcp_tool_listed(name) for name in _MANAGER_VISIBILITY} == _MANAGER_VISIBILITY
     assert server.mcp_tool_callable("aiworkhub_dashboard_health", "all") is True
     monkeypatch.delenv(server.MCP_SURFACE_ENV)
+    # RM-2026-00078: the unset default is the manager rule.
+    assert {name: server.mcp_tool_listed(name) for name in _MANAGER_VISIBILITY} == _MANAGER_VISIBILITY
     assert server.mcp_tool_callable("aiworkhub_dashboard_health", "manager") is False
     assert server.mcp_tool_callable("aiworkhub_dashboard_snapshot", "manager") is True
     assert server.mcp_tool_callable(None, "manager") is True
     assert server.mcp_tool_callable(5, "manager") is True
 
 
-def test_documented_keep_set_is_the_two_manager_dashboard_tools(unset_run: dict, manager_run: dict) -> None:
+def test_documented_keep_set_is_the_two_manager_dashboard_tools(all_run: dict, manager_run: dict) -> None:
     assert set(server.MANAGER_SURFACE_DASHBOARD_KEEP) == _KEEP
     assert set(server.MANAGER_SURFACE_DASHBOARD_KEEP_REASONS) == _KEEP
     assert all(reason.strip() for reason in server.MANAGER_SURFACE_DASHBOARD_KEEP_REASONS.values())
-    assert _KEEP <= set(unset_run["registered"])
+    assert _KEEP <= set(all_run["registered"])
     assert _KEEP <= set(manager_run["registered"])
 
 
-def test_unset_surface_is_the_all_surface(unset_run: dict) -> None:
-    unset = unset_run["snapshots"]["unset"]
-    explicit = unset_run["snapshots"]["explicit_all"]
-    assert unset["surface"] == explicit["surface"] == "all"
-    assert unset["env"] is None and explicit["env"] == "all"
-    registered = unset_run["registered"]
-    assert unset["list"]["names"] == explicit["list"]["names"] == registered
+def test_explicit_all_surface_lists_the_full_registry(all_run: dict) -> None:
+    explicit = all_run["snapshots"]["all"]
+    assert explicit["surface"] == "all" and explicit["env"] == "all"
+    registered = all_run["registered"]
+    assert explicit["list"]["names"] == registered
     assert len(registered) == len(set(registered)) >= 217
     assert len([name for name in registered if name.startswith(_DASHBOARD)]) >= 40
-    assert unset["list"]["wire_bytes"] == explicit["list"]["wire_bytes"]
-    assert unset["list"]["entries_sha256"] == explicit["list"]["entries_sha256"]
-    for key in ("calls", "probes", "synthetic", "decorator", "loop"):
-        assert unset[key] == explicit[key], key
 
 
-def test_all_surface_results_carry_one_text_copy_and_no_structured_content(unset_run: dict) -> None:
-    for label in ("unset", "explicit_all"):
-        snap = unset_run["snapshots"][label]
-        for name in _SYNTHETIC_RESULTS:
-            assert _result(snap["synthetic"]["calls"][name]["message"]) == {
-                "content": [{"type": "text", "text": _expected_text(name)}],
-            }, (label, name)
-        real = _result(snap["calls"][_TEMPLATE_LIST]["message"])
-        assert set(real) == {"content"}
-        [item] = real["content"]
-        assert item["type"] == "text"
-        assert json.loads(item["text"])["schema_id"] == "aiworkhub.task_template_list.v1"
+def test_unset_surface_is_the_manager_surface(all_run: dict) -> None:
+    # RM-2026-00078: clearing the variable on the full registry serves exactly what manager does.
+    unset, manager = all_run["snapshots"]["late_unset"], all_run["snapshots"]["late_manager"]
+    assert unset["surface"] == manager["surface"] == "manager"
+    assert unset["env"] is None and manager["env"] == "manager"
+    for key in ("list", "calls", "probes", "synthetic", "decorator", "loop"):
+        assert unset[key] == manager[key], key
 
 
-def test_manager_list_drops_only_the_webview_dashboard_tools(unset_run: dict, manager_run: dict) -> None:
-    full = unset_run["snapshots"]["unset"]["list"]
+def test_all_surface_results_carry_one_text_copy_and_no_structured_content(all_run: dict) -> None:
+    snap = all_run["snapshots"]["all"]
+    for name in _SYNTHETIC_RESULTS:
+        assert _result(snap["synthetic"]["calls"][name]["message"]) == {
+            "content": [{"type": "text", "text": _expected_text(name)}],
+        }, name
+    real = _result(snap["calls"][_TEMPLATE_LIST]["message"])
+    assert set(real) == {"content"}
+    [item] = real["content"]
+    assert item["type"] == "text"
+    assert json.loads(item["text"])["schema_id"] == "aiworkhub.task_template_list.v1"
+
+
+def test_manager_list_drops_only_the_webview_dashboard_tools(all_run: dict, manager_run: dict) -> None:
+    full = all_run["snapshots"]["all"]["list"]
     trimmed = manager_run["snapshots"]["manager"]["list"]
     assert manager_run["snapshots"]["manager"]["surface"] == "manager"
     hidden = _hidden_names(full["names"])
@@ -488,26 +495,26 @@ def test_manager_list_drops_only_the_webview_dashboard_tools(unset_run: dict, ma
 
 
 def test_manager_registers_only_visible_tools_and_matches_call_time_filtering(
-    unset_run: dict, manager_run: dict
+    all_run: dict, manager_run: dict
 ) -> None:
     imported = manager_run["snapshots"]["manager"]["list"]
-    flipped = unset_run["snapshots"]["late_manager"]
+    flipped = all_run["snapshots"]["late_manager"]
     assert flipped["surface"] == "manager"
     assert [name for name in manager_run["registered"] if name not in _ALIASES] == imported["names"]
-    assert set(manager_run["registered"]) == set(unset_run["registered"]) - set(_hidden_names(unset_run["registered"]))
+    assert set(manager_run["registered"]) == set(all_run["registered"]) - set(_hidden_names(all_run["registered"]))
     assert flipped["list"]["names"] == imported["names"]
     assert flipped["list"]["wire_bytes"] == imported["wire_bytes"]
     assert flipped["list"]["entries_sha256"] == imported["entries_sha256"]
 
 
 def test_hidden_dashboard_tools_are_unknown_tools_on_manager_and_callable_on_all(
-    unset_run: dict, manager_run: dict
+    all_run: dict, manager_run: dict
 ) -> None:
-    hidden = _hidden_names(unset_run["registered"])
+    hidden = _hidden_names(all_run["registered"])
     assert hidden
     for label, snap in (
         ("import_time", manager_run["snapshots"]["manager"]),
-        ("late_flip", unset_run["snapshots"]["late_manager"]),
+        ("late_flip", all_run["snapshots"]["late_manager"]),
     ):
         visible = snap["list"]["names"]
         for name in hidden:
@@ -519,17 +526,16 @@ def test_hidden_dashboard_tools_are_unknown_tools_on_manager_and_callable_on_all
             assert not set(payload["suggestions"]) & set(hidden)
         for name in _KEEP:
             assert _error(snap["probes"][name])["message"] == _PROBE_ERROR, (label, name)
-    for label in ("unset", "explicit_all"):
-        snap = unset_run["snapshots"][label]
-        for name in hidden:
-            assert _error(snap["probes"][name]) == {"code": -32602, "message": _PROBE_ERROR}, (label, name)
+    snap = all_run["snapshots"]["all"]
+    for name in hidden:
+        assert _error(snap["probes"][name]) == {"code": -32602, "message": _PROBE_ERROR}, name
 
 
-def test_unknown_tool_error_is_unchanged_for_names_that_never_existed(unset_run: dict, manager_run: dict) -> None:
+def test_unknown_tool_error_is_unchanged_for_names_that_never_existed(all_run: dict, manager_run: dict) -> None:
     for snap in (
-        unset_run["snapshots"]["unset"],
-        unset_run["snapshots"]["explicit_all"],
-        unset_run["snapshots"]["late_manager"],
+        all_run["snapshots"]["all"],
+        all_run["snapshots"]["late_unset"],
+        all_run["snapshots"]["late_manager"],
         manager_run["snapshots"]["manager"],
     ):
         error = _error(snap["calls"]["unknown"]["message"])
@@ -537,11 +543,11 @@ def test_unknown_tool_error_is_unchanged_for_names_that_never_existed(unset_run:
         assert error["message"] == unknown_tool_message("aiworkhub_no_such_tool_nf01676", snap["list"]["names"])
 
 
-def test_manager_results_carry_one_text_copy_and_no_structured_content(unset_run: dict, manager_run: dict) -> None:
-    reference = _result(unset_run["snapshots"]["unset"]["calls"][_TEMPLATE_LIST]["message"])
+def test_manager_results_carry_one_text_copy_and_no_structured_content(all_run: dict, manager_run: dict) -> None:
+    reference = _result(all_run["snapshots"]["all"]["calls"][_TEMPLATE_LIST]["message"])
     for label, snap in (
         ("import_time", manager_run["snapshots"]["manager"]),
-        ("late_flip", unset_run["snapshots"]["late_manager"]),
+        ("late_flip", all_run["snapshots"]["late_manager"]),
     ):
         for name in _SYNTHETIC_RESULTS:
             if name == _SYNTHETIC_HIDDEN:
@@ -560,11 +566,11 @@ def test_manager_results_carry_one_text_copy_and_no_structured_content(unset_run
         assert nothing == {"content": [{"type": "text", "text": "null"}]}
 
 
-def test_tool_failures_are_identical_on_every_surface(unset_run: dict, manager_run: dict) -> None:
+def test_tool_failures_are_identical_on_every_surface(all_run: dict, manager_run: dict) -> None:
     snaps = [
-        unset_run["snapshots"]["unset"],
-        unset_run["snapshots"]["explicit_all"],
-        unset_run["snapshots"]["late_manager"],
+        all_run["snapshots"]["all"],
+        all_run["snapshots"]["late_unset"],
+        all_run["snapshots"]["late_manager"],
         manager_run["snapshots"]["manager"],
     ]
     for snap in snaps:
@@ -580,10 +586,10 @@ def test_tool_failures_are_identical_on_every_surface(unset_run: dict, manager_r
 
 
 def test_synthetic_registry_filters_listing_and_calls_by_prefix_and_keep_set(
-    unset_run: dict, manager_run: dict
+    all_run: dict, manager_run: dict
 ) -> None:
-    on_all = [unset_run["snapshots"]["unset"], unset_run["snapshots"]["explicit_all"]]
-    on_manager = [unset_run["snapshots"]["late_manager"], manager_run["snapshots"]["manager"]]
+    on_all = [all_run["snapshots"]["all"]]
+    on_manager = [all_run["snapshots"]["late_manager"], manager_run["snapshots"]["manager"]]
     for snap in on_all:
         synthetic = snap["synthetic"]
         assert _names(synthetic["list"]) == _SYNTHETIC_ALL
@@ -607,14 +613,13 @@ def test_synthetic_registry_filters_listing_and_calls_by_prefix_and_keep_set(
 
 
 def test_decorator_skips_hidden_tools_yet_returns_the_function_unchanged(
-    unset_run: dict, manager_run: dict
+    all_run: dict, manager_run: dict
 ) -> None:
     hidden_on_manager = {"aiworkhub_dashboard_decorated", "renamed_plain"}
-    for label in ("unset", "explicit_all"):
-        for name, report in unset_run["snapshots"][label]["decorator"].items():
-            assert report["same_object"] and report["registered"], (label, name)
+    for name, report in all_run["snapshots"]["all"]["decorator"].items():
+        assert report["same_object"] and report["registered"], name
     for decorated in (
-        unset_run["snapshots"]["late_manager"]["decorator"],
+        all_run["snapshots"]["late_manager"]["decorator"],
         manager_run["snapshots"]["manager"]["decorator"],
     ):
         assert {name for name, report in decorated.items() if not report["registered"]} == hidden_on_manager
@@ -627,12 +632,12 @@ def test_decorator_skips_hidden_tools_yet_returns_the_function_unchanged(
         }
 
 
-def test_real_stdio_loop_serves_the_same_surface(unset_run: dict, manager_run: dict) -> None:
-    hidden_name = unset_run["hidden_example"]
+def test_real_stdio_loop_serves_the_same_surface(all_run: dict, manager_run: dict) -> None:
+    hidden_name = all_run["hidden_example"]
     assert manager_run["hidden_example"] == hidden_name
     for snap, is_manager in (
-        (unset_run["snapshots"]["unset"], False),
-        (unset_run["snapshots"]["late_manager"], True),
+        (all_run["snapshots"]["all"], False),
+        (all_run["snapshots"]["late_manager"], True),
         (manager_run["snapshots"]["manager"], True),
     ):
         loop = snap["loop"]
@@ -646,8 +651,8 @@ def test_real_stdio_loop_serves_the_same_surface(unset_run: dict, manager_run: d
         assert _error(loop["4"]["message"])["message"] == expected_hidden
 
 
-def test_measured_manager_surface_is_smaller(unset_run: dict, manager_run: dict, capsys) -> None:
-    full = unset_run["snapshots"]["unset"]
+def test_measured_manager_surface_is_smaller(all_run: dict, manager_run: dict, capsys) -> None:
+    full = all_run["snapshots"]["all"]
     trimmed = manager_run["snapshots"]["manager"]
     dropped = set(_hidden_names(full["list"]["names"])) | _ALIASES
     all_count, manager_count = len(full["list"]["names"]), len(trimmed["list"]["names"])
@@ -676,8 +681,8 @@ def test_measured_manager_surface_is_smaller(unset_run: dict, manager_run: dict,
     importlib.util.find_spec("mcp") is None,
     reason="mcp SDK is not importable, so the FastMCP registry cannot be compared",
 )
-def test_sdk_backend_registers_the_same_manager_surface(unset_run: dict, manager_run: dict, repo_root: Path) -> None:
-    probe_names = [name for name in unset_run["registered"] if name.startswith(_DASHBOARD)]
+def test_sdk_backend_registers_the_same_manager_surface(all_run: dict, manager_run: dict, repo_root: Path) -> None:
+    probe_names = [name for name in all_run["registered"] if name.startswith(_DASHBOARD)]
     sdk = _run_child("sdk", _SDK_BODY, surface="manager", repo_root=repo_root, args={"probe_names": probe_names})
     assert sdk["surface"] == "manager"
     assert sorted(sdk["names"]) == sorted(manager_run["snapshots"]["manager"]["list"]["names"])

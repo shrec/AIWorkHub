@@ -54,15 +54,15 @@ _unknown_surfaces_reported: set[str] = set()
 def mcp_surface() -> str:
     """Return the active MCP profile named by AIWORKHUB_MCP_SURFACE (case/space-insensitive).
 
-    Unset or blank is "all", as it always was; manager, worker, dashboard and all
-    name themselves. Any other value falls back to "manager", the smaller
-    surface, and says so in one stderr line per distinct value (for the first
-    _UNKNOWN_SURFACE_REPORT_LIMIT values) -- never stdout, which is the stdio
-    protocol channel.
+    Unset or blank is "manager" (RM-2026-00078): a client config that names no
+    surface gets the LLM-facing profile, not the webview-only dashboard tools.
+    manager, worker, dashboard and all name themselves. Any other value also falls
+    back to "manager", saying so in one stderr line per distinct value (first
+    _UNKNOWN_SURFACE_REPORT_LIMIT values) -- never stdout, the stdio protocol channel.
     """
     value = os.environ.get(MCP_SURFACE_ENV, "").strip().lower()
     if not value:
-        return MCP_SURFACE_ALL
+        return MCP_SURFACE_MANAGER
     if value in MCP_SURFACES:
         return value
     with _UNKNOWN_SURFACE_LOCK:
