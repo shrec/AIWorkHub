@@ -4332,13 +4332,6 @@ def aiworkhub_task_reject_review(
         if card is not None and isinstance(result, dict) and result.get("ok")
         else None
     )
-    if isinstance(result, dict) and result.get("ok") is True:
-        result["reviewer_process_cancellation"] = (
-            process_launcher.default_manager().cancel_disposed_reviewer_processes(
-                result.get("reviewer_finalization") or [],
-                rejected_request_id=str((extra or {}).get("request_id") or ""),
-            )
-        )
     receipt = _lifecycle_receipt(
         result,
         schema_id="aiworkhub.reject_review_receipt.v1",
@@ -4346,7 +4339,11 @@ def aiworkhub_task_reject_review(
         include_card=include_card,
         extra=extra,
     )
-    return _with_learning_closeout(
+    # NF-2026-01764: the learning close-out runs BEFORE reviewer-process
+    # cleanup, and that cleanup defers any OSError (WinError 5) to the storage
+    # janitor, so a held handle can neither skip the lesson nor fail the
+    # committed reject.
+    receipt = _with_learning_closeout(
         receipt,
         task_id=task_id,
         lesson_candidate=lesson_candidate,
@@ -4354,6 +4351,41 @@ def aiworkhub_task_reject_review(
         extra_evidence_ids=extra_evidence_ids,
         no_new_lesson_reason=no_new_lesson_reason,
     )
+    if isinstance(result, dict) and result.get("ok") is True and isinstance(receipt, dict):
+        _attach_reviewer_process_cancellation(
+            receipt, rejected_request_id=str((extra or {}).get("request_id") or "")
+        )
+    return receipt
+
+
+def _attach_reviewer_process_cancellation(
+    receipt: dict[str, Any], *, rejected_request_id: str
+) -> None:
+    """Cancel a COMMITTED reject's reviewer processes without failing the reply.
+
+    NF-2026-01764: measured on 2026-10-27, ``[WinError 5] Access is denied``
+    escaped this post-commit step as the tool's error while a handle still
+    held the reviewer's files, so the manager could not see that the reject
+    had landed.  Any ``OSError`` -- per request inside
+    ``cancel_disposed_reviewer_processes`` or from the call as a whole -- is
+    reported under ``cleanup_deferred`` with a ``stage``; only
+    ``workspace_cleanup`` is left for the storage GC / stranded-worktree
+    recovery.  It is never retried here and ``ok`` stays.
+    """
+    try:
+        manager = process_launcher.default_manager()
+        cancellation = manager.cancel_disposed_reviewer_processes(
+            receipt.get("reviewer_finalization") or [],
+            rejected_request_id=rejected_request_id,
+        )
+    except OSError as exc:
+        cancellation = process_launcher.deferred_reviewer_process_cancellation(
+            exc, f"rejected_request:{rejected_request_id}"
+        )
+    receipt["reviewer_process_cancellation"] = cancellation
+    deferred = cancellation.get("cleanup_deferred") if isinstance(cancellation, dict) else None
+    if deferred:
+        receipt["cleanup_deferred"] = list(deferred)
 
 
 @mcp.tool()

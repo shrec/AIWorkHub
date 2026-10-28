@@ -13217,16 +13217,18 @@ class ProcessManager:
     ) -> dict[str, Any]:
         """Cancel every live request bound to a rejected review, exact and stable.
 
-        ``core.reject_review`` is the authority that binds reviewer children to
-        the rejected ``(task_id, request_id)`` pair.  Reusing only the task ids
-        in its durable ``reviewer_finalization`` receipt avoids guessing from
-        names, lenses, or timing.  A server-launched auto reviewer is never a
-        reviewer child of the card and so never appears there: when
-        ``rejected_request_id`` is given, every other non-terminal ledger
-        request whose own quality-review binding targets that exact request id
-        is cancelled too.  A stable process-ledger snapshot is required before
-        cancellation so an append racing this read cannot hide a newly
-        launched reviewer request.
+        Only task ids in ``core.reject_review``'s durable ``reviewer_finalization``
+        receipt are matched, plus (given ``rejected_request_id``) every other
+        non-terminal ledger request whose quality-review binding targets that
+        exact request -- a server-launched auto reviewer is never a card child.
+        A stable ledger snapshot is required so a racing append cannot hide a
+        newly launched reviewer.  NF-2026-01764: the parent reject has already
+        committed, so an ``OSError`` from one cancel is never raised or retried;
+        it lands in ``cleanup_deferred`` with a ``stage``.  Only
+        ``workspace_cleanup`` -- a path under that request's own worktree root,
+        e.g. WinError 5 on a held handle -- is left for the storage janitor /
+        stranded-worktree recovery.  Any other failure (termination, ledger
+        append) is ``reviewer_cancel_failed``, which no janitor recovers.
         """
         rows = reviewer_finalization if isinstance(reviewer_finalization, list) else []
         reviewer_task_ids = sorted({
@@ -13268,8 +13270,21 @@ class ProcessManager:
                 candidates.append((str(request_id), event, "target_request"))
 
         cancelled: list[dict[str, Any]] = []
+        deferred: list[dict[str, Any]] = []
         for request_id, event, match in candidates:
-            outcome = self.cancel(request_id, reason=reason)
+            try:
+                outcome = self.cancel(request_id, reason=reason)
+            except OSError as exc:
+                workspace_root = task_store._request_worktree_path(self.repo, request_id).parent
+                if _oserror_within(exc, workspace_root):
+                    stage, outcome = "workspace_cleanup", {
+                        "state": "cleanup_deferred", "blocked_reason": "cleanup_deferred",
+                    }
+                else:
+                    stage, outcome = "reviewer_cancel_failed", {
+                        "state": "cancel_failed", "blocked_reason": "reviewer_cancel_failed",
+                    }
+                deferred.append(cleanup_deferral(exc, f"request:{request_id}", stage=stage))
             cancelled.append({
                 "task_id": str(event.get("task_id") or ""),
                 "request_id": request_id,
@@ -13288,6 +13303,7 @@ class ProcessManager:
             "state": "completed",
             "reviewer_task_ids": reviewer_task_ids,
             "cancelled": cancelled,
+            **({"cleanup_deferred": deferred} if deferred else {}),
         }
 
     @staticmethod
@@ -13332,27 +13348,15 @@ class ProcessManager:
     ) -> dict[str, Any]:
         """Coordinator-gated rejection of one ``review`` card, back to rework.
 
-        The transition itself belongs to :func:`core.reject_review` and none of
-        it is re-implemented here: it re-reads the live card, refuses a
-        disposition it does not know, moves the row atomically and only
-        ``WHERE worker_status='review'``, writes the ``reject_review`` event,
-        finalizes the quality-review children bound to the rejected request,
-        and names the learning duty the rejection incurs.
-
-        Three preconditions are checked before delegating.  ``core`` resolves
-        the card through its *module-global* repository binding, while this
-        manager is bound to ``self.repo`` -- so a manager pointed somewhere
-        else must never reach it: it would reject a same-named card in the
-        wrong tree and destroy a completed review there.  And a rejection with
-        no reason, or no task, is an unexplained state transition, which this
-        repository does not permit.  Every refusal returns without touching
-        any card, exactly as a failed precondition in ``accept_review`` leaves
-        the canonical repository untouched with the reason returned.
-
-        The core result is returned intact -- ``ok``/``returncode``/``stdout``
-        plus ``reviewer_finalization``, ``learning_commit_owed`` and any
-        ``rework_delta_recovery`` -- with ``task_id``/``to`` echoed and, on
-        failure, ``error`` set from ``stderr`` so one field reads either way.
+        The transition belongs to :func:`core.reject_review`.  ``core``
+        resolves the card through its module-global repository binding while
+        this manager is bound to ``self.repo``, so a mismatched manager never
+        reaches it (it would reject a same-named card in the wrong tree); a
+        rejection with no reason or task is an unexplained transition.  Every
+        refusal touches no card.  The core result comes back intact with
+        ``task_id``/``to`` echoed, ``error`` set from ``stderr`` on failure,
+        and a post-commit reviewer cleanup ``OSError`` lifted to
+        ``cleanup_deferred`` (NF-2026-01764).
         """
         refusal: dict[str, Any] = {"ok": False, "task_id": task_id, "to": to}
         target = str(task_id or "").strip()
@@ -13379,12 +13383,20 @@ class ProcessManager:
         if not isinstance(result, dict):
             return {**refusal, "error": "reject_review_result_invalid"}
         if result.get("ok") is True:
-            result["reviewer_process_cancellation"] = (
-                self.cancel_disposed_reviewer_processes(
+            # The reject has committed: the snapshot read and candidate scan
+            # run before the per-request try, so the whole call is guarded too.
+            try:
+                cancellation = self.cancel_disposed_reviewer_processes(
                     result.get("reviewer_finalization") or [],
                     rejected_request_id=self._rejected_request_id_from_result(result),
                 )
-            )
+            except OSError as exc:
+                cancellation = deferred_reviewer_process_cancellation(
+                    exc, "reviewer_process_cancellation"
+                )
+            result["reviewer_process_cancellation"] = cancellation
+            if cancellation.get("cleanup_deferred"):
+                result["cleanup_deferred"] = cancellation["cleanup_deferred"]
         result.setdefault("task_id", target)
         result.setdefault("to", to)
         if result.get("ok") is not True:
@@ -13439,6 +13451,41 @@ def _canonical_task_status(card: dict[str, Any]) -> str:
     if str(card.get("archived_at") or "").strip():
         return "archived"
     return core._lifecycle_state(card)
+
+
+def cleanup_deferral(
+    exc: OSError, fallback_path: str, *, stage: str = "reviewer_process_cancellation"
+) -> dict[str, Any]:
+    """NF-2026-01764: one post-commit cleanup failure, named by ``stage``.
+
+    Only ``workspace_cleanup`` (a path under the request's own worktree root)
+    is a leftover the storage janitor / stranded-worktree recovery removes.
+    """
+    path = exc.filename if exc.filename is not None else fallback_path
+    return {
+        "path": str(path), "errno": exc.errno,
+        "winerror": getattr(exc, "winerror", None), "stage": stage,
+    }
+
+
+def deferred_reviewer_process_cancellation(exc: OSError, fallback_path: str) -> dict[str, Any]:
+    """The cancellation receipt when the whole post-commit cancel call raised."""
+    return {
+        "schema_id": "aiworkhub.reviewer_process_cancellation.v1",
+        "ok": False,
+        "state": "cleanup_deferred",
+        "cancelled": [],
+        "cleanup_deferred": [cleanup_deferral(exc, fallback_path)],
+    }
+
+
+def _oserror_within(exc: OSError, root: Path) -> bool:
+    """True only when ``exc`` names a path at or under ``root``; unknown is False."""
+    try:
+        path = Path(os.fsdecode(exc.filename)).resolve(strict=False)
+        return path.is_relative_to(root.resolve(strict=False))
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 def _process_group_alive(pgid: int) -> bool:
