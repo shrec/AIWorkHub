@@ -1809,8 +1809,10 @@ def test_the_gate_set_excludes_every_test_a_worktree_cannot_run():
     assert "tests/test_os_dependency_boundary.py" not in task_templates_module.PACKAGE_GATE_TESTS
     src = Path(task_templates_module.__file__).resolve().parents[2] / "src"
     for name in task_templates_module.PACKAGE_GATE_TESTS:
-        body = (src.parent / name).read_text(encoding="utf-8")
+        path, _, node = name.partition("::")
+        body = (src.parent / path).read_text(encoding="utf-8")
         assert "scripts" not in body.split('"""')[0], name
+        assert not node or f"def {node}(" in body, name
 
 
 def test_the_gate_is_appended_once_even_for_many_package_paths():

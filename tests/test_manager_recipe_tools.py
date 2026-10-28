@@ -33,6 +33,7 @@ import aiworkhub.core as core
 from aiworkhub import dashboard
 from aiworkhub import manager_recipe_tools as mrt
 from aiworkhub import recipe_runner
+from aiworkhub import task_templates
 from aiworkhub import tool_recipes as tr
 from aiworkhub import tool_recipes_store as store
 
@@ -394,6 +395,25 @@ def test_catalogue_argv_matches_the_declared_validation_commands():
         "-q",
         "tests/test_module_size_ratchet.py",
         "tests/test_declared_invariants.py",
+        "tests/test_aiworkhub_dependency_autolaunch_b905_v7.py"
+        "::test_every_launch_denial_reason_in_the_codebase_is_classified",
+    )
+
+
+def test_package_gate_recipe_argv_is_the_package_gate_tuple_in_order():
+    """The recipe describes the gate task_templates appends, never a copy of it."""
+    by_id = {r.id: r for r in mrt.CANONICAL_RECIPES}
+    argv = tr.build_argv(by_id["aiworkhub.validation.package_gate_pytest"], {})
+
+    assert argv[:4] == ("python", "-m", "pytest", "-q")
+    assert argv[4:] == task_templates.PACKAGE_GATE_TESTS
+    requirement = next(
+        item
+        for item in mrt.CONDITIONAL_REQUIREMENTS
+        if item.recipe_id == "aiworkhub.validation.package_gate_pytest"
+    )
+    assert requirement.probe_command.split()[4:] == list(
+        task_templates.PACKAGE_GATE_TESTS
     )
 
 
@@ -1544,14 +1564,14 @@ def test_the_package_gate_is_withheld_when_the_tests_it_names_are_absent(
     path reasons here and three reasons on the CI Python jobs, where the probe
     left pytest unresolved. What this test is about is the PATHS.
     """
+    gate_paths = next(
+        requirement.paths
+        for requirement in mrt.CONDITIONAL_REQUIREMENTS
+        if requirement.recipe_id == "aiworkhub.validation.package_gate_pytest"
+    )
     absent = _project(tmp_path / "absent", baseline=("python",))
     present = _project(
-        tmp_path / "present",
-        baseline=("python",),
-        tests=(
-            "tests/test_module_size_ratchet.py",
-            "tests/test_declared_invariants.py",
-        ),
+        tmp_path / "present", baseline=("python",), tests=gate_paths
     )
     monkeypatch.setattr(
         mrt,
@@ -1570,6 +1590,7 @@ def test_the_package_gate_is_withheld_when_the_tests_it_names_are_absent(
     assert withheld["aiworkhub.validation.package_gate_pytest"] == [
         "path_absent:tests/test_module_size_ratchet.py",
         "path_absent:tests/test_declared_invariants.py",
+        "path_absent:tests/test_aiworkhub_dependency_autolaunch_b905_v7.py",
     ]
     assert "aiworkhub.validation.package_gate_pytest" in {
         recipe.id for recipe in present_plan["selected"]

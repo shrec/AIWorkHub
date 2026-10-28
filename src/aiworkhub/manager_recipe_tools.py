@@ -47,6 +47,7 @@ from typing import Any
 
 from . import core
 from . import recipe_runner
+from . import task_templates
 from . import tool_recipes as tr
 from . import tool_recipes_store as store
 
@@ -263,7 +264,7 @@ def seed_canonical() -> dict[str, Any]:
     that depend on a toolchain or on paths that must exist in the TARGET project
     are installed only when :func:`seeding_plan` measures them present, so a
     project without Node never receives ``validation.node_test`` and a project
-    that does not have this repository's two gate tests never receives
+    that does not have this repository's package gate tests never receives
     ``validation.package_gate_pytest``. ``withheld`` reports every entry that
     was skipped and the measured reason, so a thin seed is legible rather than
     mysterious.
@@ -752,18 +753,18 @@ CANONICAL_RECIPES: tuple[tr.Recipe, ...] = (
         cache_policy=tr.CachePolicy.NEVER,
         argv=(tr.lit("git"), tr.lit("diff"), tr.lit("--check")),
     ),
-    # `" ".join([COMMAND_PYTHON, "-m", "pytest", "-q", *PACKAGE_GATE_TESTS])`
-    #   -- src/aiworkhub/task_templates.py:595, with PACKAGE_GATE_TESTS fixed at
-    #   task_templates.py:585-588.  The targets are literal, so this recipe has
-    #   no parameters at all and its argv is entirely literal tokens.
+    # `" ".join([COMMAND_PYTHON, "-m", "pytest", "-q", *gate])` for
+    #   gate = PACKAGE_GATE_TESTS -- task_templates._package_gate_commands.  The
+    #   targets are read from that tuple, so this recipe cannot drift from the
+    #   gate; it has no parameters and its argv is entirely literal tokens.
+    #   2.0.0: the gate gained the launch-denial classification node.
     tr.Recipe(
         id="aiworkhub.validation.package_gate_pytest",
-        version="1.0.0",
+        version="2.0.0",
         purpose=(
-            "Run the two repository gates any src/aiworkhub/ change trips. "
-            "task_templates._package_gate_command (src/aiworkhub/"
-            "task_templates.py:595) over PACKAGE_GATE_TESTS "
-            "(task_templates.py:585-588)."
+            "Run the repository gates any src/aiworkhub/ change trips. "
+            "task_templates._package_gate_commands over "
+            "task_templates.PACKAGE_GATE_TESTS."
         ),
         task_kind=tr.TaskKind.TEST,
         outputs=(_STDOUT_REPORT,),
@@ -775,8 +776,7 @@ CANONICAL_RECIPES: tuple[tr.Recipe, ...] = (
             tr.lit("-m"),
             tr.lit("pytest"),
             tr.lit("-q"),
-            tr.lit("tests/test_module_size_ratchet.py"),
-            tr.lit("tests/test_declared_invariants.py"),
+            *(tr.lit(target) for target in task_templates.PACKAGE_GATE_TESTS),
         ),
     ),
     # ---- Worker workspace provisioning --------------------------------
@@ -1501,8 +1501,10 @@ OPERATOR_SCRIPT_PATHS: tuple[tuple[str, str], ...] = tuple(
 #     that never emits it gets a permanently unused recipe -- and an unused
 #     recipe is exactly what the usage surface above exists to expose, so
 #     manufacturing one at seed time would be poisoning the measurement.
-#   * ``validation.package_gate_pytest`` names THIS repository's own two test
-#     files as argv literals. In any other project those paths do not exist.
+#   * ``validation.package_gate_pytest`` names THIS repository's own package
+#     gate tests (``task_templates.PACKAGE_GATE_TESTS``, the targets
+#     ``task_templates._package_gate_commands`` emits) as argv literals. In
+#     any other project those paths do not exist.
 #
 # The question "does this project have that" is already answered by
 # ``toolchain_authority``, which resolves a card's declared validation commands
@@ -1538,6 +1540,14 @@ class RecipeRequirement:
     paths: tuple[str, ...] = ()
 
 
+# The files the package gate's pytest targets live in: a node id
+# ``path::test`` needs only its file to exist.
+_PACKAGE_GATE_PATHS: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        target.split("::", 1)[0] for target in task_templates.PACKAGE_GATE_TESTS
+    )
+)
+
 CONDITIONAL_REQUIREMENTS: tuple[RecipeRequirement, ...] = (
     RecipeRequirement(
         recipe_id="aiworkhub.validation.pytest",
@@ -1554,20 +1564,16 @@ CONDITIONAL_REQUIREMENTS: tuple[RecipeRequirement, ...] = (
         probe_command="node --test",
         executables=("node",),
     ),
-    # The one entry whose argv names files rather than a toolchain. Its two
+    # The one entry whose argv names files rather than a toolchain. Its
     # literals are this repository's own gates; a project that does not have
     # them would register a manifest guaranteed to fail on its first run.
     RecipeRequirement(
         recipe_id="aiworkhub.validation.package_gate_pytest",
-        probe_command=(
-            "python -m pytest -q tests/test_module_size_ratchet.py "
-            "tests/test_declared_invariants.py"
+        probe_command=" ".join(
+            ["python", "-m", "pytest", "-q", *task_templates.PACKAGE_GATE_TESTS]
         ),
         modules=("pytest",),
-        paths=(
-            "tests/test_module_size_ratchet.py",
-            "tests/test_declared_invariants.py",
-        ),
+        paths=_PACKAGE_GATE_PATHS,
     ),
 )
 

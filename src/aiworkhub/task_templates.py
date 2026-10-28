@@ -966,7 +966,7 @@ def _looks_like_test_path(path: str) -> bool:
 
 
 # Repository gates that ANY change under the package trips, appended by the
-# template so a card author never has to remember them. Both read only `src/`
+# template so a card author never has to remember them. Each reads only `src/`
 # and `tests/`, so a worker's sparse-checkout worktree can actually run them.
 #
 # tests/test_os_dependency_boundary.py is deliberately ABSENT: it imports
@@ -975,18 +975,97 @@ def _looks_like_test_path(path: str) -> bool:
 # no matter how correct the work is. That gate belongs to the manager on the
 # canonical tree. Measured: it cost AIWORKHUB_01079 a full rerun after 227 of
 # its own tests had passed.
+#
+# NF-2026-01216: the launch-denial classification gate is one node of
+# test_aiworkhub_dependency_autolaunch_b905_v7.py; it imports only
+# aiworkhub.dependency_autolaunch and scans src/aiworkhub, so a new
+# unclassified denial reason fails the card that adds it, not main.
 PACKAGE_ROOT = "src/aiworkhub/"
 PACKAGE_GATE_TESTS: tuple[str, ...] = (
     "tests/test_module_size_ratchet.py",
     "tests/test_declared_invariants.py",
+    "tests/test_aiworkhub_dependency_autolaunch_b905_v7.py"
+    "::test_every_launch_denial_reason_in_the_codebase_is_classified",
+)
+
+# Modules that register MCP tools (an ``mcp.tool`` decorator or call) or own
+# the metadata every published tool derives from (mcp_tool_metadata). A card
+# writing one of them also trips the MCP tool-surface contract tests, which
+# otherwise only combined-tree revalidation at accept caught (NF-2026-01216: a
+# 168-word dashboard_mcp_app docstring over MAX_DOCSTRING_WORDS, 4630dfa6).
+# manager_ai_tools/manager_recipe_tools/manager_skill_tools are absent: they
+# register nothing; server.py wraps them in its own documented tools.
+# tests/test_package_gate_surface_nf01216.py rescans the package so a new tool
+# module cannot silently skip the gate.
+MCP_SURFACE_MODULES: frozenset[str] = frozenset(
+    {
+        "src/aiworkhub/agent_tool_instruction_mcp.py",
+        "src/aiworkhub/cli_adapter_readonly_tool.py",
+        "src/aiworkhub/dashboard_mcp_app.py",
+        "src/aiworkhub/mcp_tool_metadata.py",
+        "src/aiworkhub/server.py",
+        "src/aiworkhub/worker_ai_tools_mcp.py",
+    }
+)
+MCP_SURFACE_GATE_TESTS: tuple[str, ...] = (
+    "tests/test_dashboard_mcp_tool_descriptions.py",
+    "tests/test_mcp_tool_metadata_tdqs.py",
+    "tests/test_stdio_tools_list_parity_nf01642.py",
 )
 
 
-def _package_gate_command(production: Sequence[str]) -> str | None:
-    """One pytest command for the gates a package change always trips."""
-    if not any(str(path).startswith(PACKAGE_ROOT) for path in production):
-        return None
-    return " ".join([COMMAND_PYTHON, "-m", "pytest", "-q", *PACKAGE_GATE_TESTS])
+# The package gate as cards stored it before NF-2026-01216 added the
+# launch-denial node. A validation still carrying it keeps it byte for byte.
+_LEGACY_PACKAGE_GATE_TESTS: tuple[str, ...] = PACKAGE_GATE_TESTS[:2]
+
+
+def _pytest_gate(tests: Sequence[str]) -> str:
+    return " ".join([COMMAND_PYTHON, "-m", "pytest", "-q", *tests])
+
+
+def _package_gate_commands(paths: Sequence[str]) -> list[str]:
+    """The pytest commands for the gates a package change always trips.
+
+    The package gate for any path under ``PACKAGE_ROOT``, then the MCP surface
+    gate when one of those paths is in ``MCP_SURFACE_MODULES``.
+    """
+    names = [str(path) for path in paths]
+    if not any(name.startswith(PACKAGE_ROOT) for name in names):
+        return []
+    gates = [PACKAGE_GATE_TESTS]
+    if any(name in MCP_SURFACE_MODULES for name in names):
+        gates.append(MCP_SURFACE_GATE_TESTS)
+    return [_pytest_gate(gate) for gate in gates]
+
+
+def _missing_package_gates(
+    commands: Sequence[str], paths: Sequence[str]
+) -> list[str]:
+    """The derived gates ``commands`` does not already run, in derived order.
+
+    Deduped by ``canonical_validation_command``. A validation carrying the
+    legacy package gate gets only the ``PACKAGE_GATE_TESTS`` entries it lacks,
+    so the ratchet and the invariants never run twice.
+    """
+    canonical = {canonical_validation_command(item) for item in commands}
+    package_gate = _pytest_gate(PACKAGE_GATE_TESTS)
+    legacy_present = (
+        canonical_validation_command(_pytest_gate(_LEGACY_PACKAGE_GATE_TESTS))
+        in canonical
+    )
+    missing: list[str] = []
+    for gate in _package_gate_commands(paths):
+        if gate == package_gate and legacy_present:
+            gate = _pytest_gate(
+                [
+                    test
+                    for test in PACKAGE_GATE_TESTS
+                    if test not in _LEGACY_PACKAGE_GATE_TESTS
+                ]
+            )
+        if canonical_validation_command(gate) not in canonical:
+            missing.append(gate)
+    return missing
 
 
 def _validation_commands_for(
@@ -1023,52 +1102,51 @@ def _validation_commands_for(
         validation.append(" ".join([COMMAND_NODE, "--test", *node_tests]))
     if spec.generates_diff_check:
         validation.append(DIFF_CHECK_COMMAND)
-    gate = None if spec.read_only else _package_gate_command(production)
-    if gate is not None and gate not in validation:
-        validation.append(gate)
+    for gate in [] if spec.read_only else _package_gate_commands(production):
+        if gate not in validation:
+            validation.append(gate)
     return validation
 
 
 def with_package_gate(
     card: Mapping[str, Any], validation: Sequence[str], validation_roles: Sequence[str]
 ) -> tuple[list[str], list[str]]:
-    """Keep the derived package gate on a caller's validation override.
+    """Keep the derived package gates on a caller's validation override.
 
     NF-2026-01041: an override used to replace the expanded validation
     wholesale, so the gate ``_validation_commands_for`` derives for a package
     change silently vanished (AIWORKHUB_01198 then broke the size ratchet on
-    main). A non-read-only card whose writes touch ``PACKAGE_ROOT`` gets the
-    gate appended when the override does not already name it, with the role
-    ``_validation_roles_for`` gives any command past the required prefix.
+    main). A non-read-only card whose writes touch ``PACKAGE_ROOT`` gets each
+    derived gate (the MCP surface gate too, NF-2026-01216) appended when the
+    override does not already name it, with the role ``_validation_roles_for``
+    gives any command past the required prefix.
     """
     commands, roles = list(validation), list(validation_roles)
     # A caller's own length mismatch stays theirs for normalization to report.
     if bool(card.get("read_only")) or len(commands) != len(roles):
         return commands, roles
-    gate = _package_gate_command(list(card.get("allowed_writes") or []))
-    canonical = {canonical_validation_command(item) for item in commands}
-    if gate is None or canonical_validation_command(gate) in canonical:
-        return commands, roles
-    return [*commands, gate], [*roles, "generic"]
+    for gate in _missing_package_gates(
+        commands, list(card.get("allowed_writes") or [])
+    ):
+        commands.append(gate)
+        roles.append("generic")
+    return commands, roles
 
 
 def _caller_validation_commands(
     validation: Any, write_set: Sequence[str]
 ) -> list[str]:
-    """The caller's own non-empty commands, plus the package gate if absent.
+    """The caller's own non-empty commands, plus the package gates if absent.
 
     Embedded paths get the same fail-closed checks as any custom validation.
-    The gate is appended exactly as ``with_package_gate`` would, so a card
-    already carrying it expands to its own validation byte for byte.
+    The gates are appended exactly as ``with_package_gate`` would, so a card
+    already carrying them expands to its own validation byte for byte.
     """
     validate_custom_validation_roles(validation, None)
     commands = [] if validation is None else list(validation)
     if not commands or any(not command.strip() for command in commands):
         raise TaskTemplateError("caller_validation_requires_validation")
-    gate = _package_gate_command(write_set)
-    canonical = {canonical_validation_command(item) for item in commands}
-    if gate is not None and canonical_validation_command(gate) not in canonical:
-        commands.append(gate)
+    commands.extend(_missing_package_gates(commands, write_set))
     return commands
 
 
