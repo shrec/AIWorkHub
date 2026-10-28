@@ -1419,6 +1419,7 @@ def _exact_required_card_inputs(
     exempt = set(allowed) | {
         _relative_repo_path(value) for value in (card.get("required_outputs") or [])
     }
+    derived = {_relative_repo_path(v) for v in (card.get("dependency_materialized_inputs") or [])}
     for field in ("immutable_inputs", "read_first"):
         for index, raw in enumerate(card.get(field) or []):
             relative = _relative_repo_path(_READ_FIRST_RANGE.sub("", str(raw)) if field == "read_first" else raw)
@@ -1429,6 +1430,8 @@ def _exact_required_card_inputs(
             candidate = repo / relative
             _require_beneath(repo, candidate)
             if candidate.is_symlink() or not candidate.is_file():
+                if field == "immutable_inputs" and relative in derived:
+                    continue
                 raise _input_missing_error(field, index, relative)
             rows.add(relative)
     return tuple(sorted(rows))
