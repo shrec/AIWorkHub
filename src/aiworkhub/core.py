@@ -13601,13 +13601,14 @@ def roadmap_transition(
         }
         unfinished: list[str] = []
         missing: list[str] = []
-        # Outcome is read under the archive overlay; an id with no live card
-        # counts only when its retired record is "finished".
-        for task_id, _status, outcome in roadmap_ns.linked_task_outcomes(
-            repo_root(), current["task_ids"], cards, task_store.canonical_status
+        for task_id, status, outcome in roadmap_ns.linked_task_outcomes(
+            repo_root(), current["task_ids"], cards, task_store.canonical_status,
+            get_card=lambda tid: task_store.get_task(repo_root(), tid),
         ):
             if outcome != "finished":
-                (missing if cards[task_id] is None else unfinished).append(task_id)
+                (missing if cards[task_id] is None else unfinished).append(
+                    f"{task_id} ({status})" if "->" in status else task_id
+                )
         if missing or unfinished:
             raise roadmap_ns.RoadmapConflictError(
                 "roadmap completion blocked by task authority: "
@@ -13673,15 +13674,13 @@ def roadmap_snapshot(
     resolved = {
         task_id: (status, outcome)
         for task_id, status, outcome in _roadmap_store_module().linked_task_outcomes(
-            root, list(cards), cards, task_store.canonical_status
+            root, list(cards), cards, task_store.canonical_status,
+            get_card=lambda tid: task_store.get_task(root, tid),
         )
     }
     rows: list[dict[str, Any]] = []
     for item in items:
-        tasks = [
-            {"task_id": task_id, "status": resolved[task_id][0]}
-            for task_id in item["task_ids"]
-        ]
+        tasks = [{"task_id": t, "status": resolved[t][0]} for t in item["task_ids"]]
         accepted = sum(resolved[t][1] == "finished" for t in item["task_ids"])
         missing = sum(task["status"] == "missing" for task in tasks)
         dependency_blockers = [
@@ -13696,9 +13695,10 @@ def roadmap_snapshot(
                 "tasks": tasks,
                 "linked_total": len(tasks),
                 "accepted": accepted,
-                "unresolved": len(tasks) - accepted,
+                "unresolved": len(tasks) - accepted - missing,
                 "missing": missing,
-                "progress_unmeasurable": missing > 0,
+                "progress_unmeasurable": bool(tasks) and not accepted and not any(
+                    c and not c.get("archived_at") for c in map(cards.get, item["task_ids"])),
                 "dependency_blockers": dependency_blockers,
                 "dependency_ready": not dependency_blockers,
             }

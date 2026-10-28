@@ -586,11 +586,55 @@ def retired_task_statuses(
         conn.close()
 
 
+_SUPERSEDE_MAX_HOPS = 16
+
+
+def _superseded_successor_outcome(
+    start: Mapping[str, Any],
+    start_id: str,
+    get_card: Callable[[str], Mapping[str, Any] | None],
+    canonical_status: Callable[[Mapping[str, Any]], str],
+    retired: Callable[[str], str | None],
+) -> tuple[str | None, str]:
+    """Follow ``superseded_by`` from ``start``; return ``(outcome, chain_text)``.
+
+    ``outcome`` is ``"finished"`` only when the chain ends at a finished
+    successor; any unfinished, missing, cyclic or over-long chain yields
+    ``None``.  ``chain_text`` names every hop followed and why it stopped.
+    """
+    seen = {start_id}
+    hops: list[str] = []
+    current: Mapping[str, Any] | None = start
+    while current is not None:
+        nxt = str(current.get("superseded_by") or "").strip()
+        if not nxt:
+            break
+        hops.append(nxt)
+        if nxt in seen:
+            return None, "->".join(["superseded", *hops]) + ":cycle"
+        if len(hops) > _SUPERSEDE_MAX_HOPS:
+            return None, "->".join(["superseded", *hops]) + ":too_long"
+        seen.add(nxt)
+        current = get_card(nxt)
+        if current is None:
+            outcome = retired(nxt) or "missing"
+            return (
+                "finished" if outcome == "finished" else None,
+                "->".join(["superseded", *hops]) + f":{outcome}",
+            )
+        outcome = canonical_status({**current, "archived_at": ""})
+        if outcome == "finished":
+            return "finished", "->".join(["superseded", *hops]) + ":finished"
+    last = canonical_status({**current, "archived_at": ""}) if current else "missing"
+    return None, "->".join(["superseded", *hops]) + f":{last}"
+
+
 def linked_task_outcomes(
     repo_root: str | Path,
     task_ids: Sequence[str],
     cards: Mapping[str, Mapping[str, Any] | None],
     canonical_status: Callable[[Mapping[str, Any]], str],
+    get_card: Callable[[str], Mapping[str, Any] | None] | None = None,
 ) -> list[tuple[str, str, str | None]]:
     """Resolve each linked id to ``(task_id, display_status, outcome_status)``.
 
@@ -599,6 +643,12 @@ def linked_task_outcomes(
     ``finished``. An id with no live card falls back to its latest retired
     record (``purged:<status>``); with neither it is ``missing`` and has no
     outcome. One retired lookup covers every id without a live card.
+
+    With ``get_card``, an unfinished live card carrying ``superseded_by`` is
+    followed (cycle-safe, bounded) to its successor; a chain ending at a
+    finished outcome resolves ``finished`` with a display status naming the
+    chain (``superseded->r2:finished``). Any other chain keeps the original
+    outcome and appends the followed chain to the display status.
     """
     missing = [task_id for task_id in task_ids if cards.get(task_id) is None]
     retired = retired_task_statuses(repo_root, missing) if missing else {}
@@ -606,13 +656,25 @@ def linked_task_outcomes(
     for task_id in task_ids:
         card = cards.get(task_id)
         if card is not None:
-            resolved.append(
-                (
+            display = canonical_status(card)
+            outcome = canonical_status({**card, "archived_at": ""})
+            if (
+                get_card is not None
+                and outcome != "finished"
+                and str(card.get("superseded_by") or "").strip()
+            ):
+                chain_outcome, chain = _superseded_successor_outcome(
+                    card,
                     task_id,
-                    canonical_status(card),
-                    canonical_status({**card, "archived_at": ""}),
+                    get_card,
+                    canonical_status,
+                    lambda tid: retired_task_statuses(repo_root, [tid]).get(tid),
                 )
-            )
+                if chain_outcome == "finished":
+                    display, outcome = chain, "finished"
+                else:
+                    display = f"{display} {chain}"
+            resolved.append((task_id, display, outcome))
             continue
         outcome = retired.get(task_id)
         status = f"purged:{outcome}" if outcome else "missing"

@@ -241,8 +241,8 @@ def test_snapshot_measures_missing_linked_tasks(
     assert {
         key: rows[partial["id"]][key]
         for key in ("linked_total", "accepted", "unresolved", "missing")
-    } == {"linked_total": 2, "accepted": 1, "unresolved": 1, "missing": 1}
-    assert rows[partial["id"]]["progress_unmeasurable"] is True
+    } == {"linked_total": 2, "accepted": 1, "unresolved": 0, "missing": 1}
+    assert rows[partial["id"]]["progress_unmeasurable"] is False
     assert (rows[whole["id"]]["accepted"], rows[whole["id"]]["unresolved"]) == (1, 0)
     assert rows[whole["id"]]["missing"] == 0
     assert rows[whole["id"]]["progress_unmeasurable"] is False

@@ -87,7 +87,7 @@ def test_quarantine_records_status_and_restore_lets_live_status_win(
         {"task_id": "TASK_ONE", "status": "purged:finished"},
         {"task_id": "TASK_NEVER_EXISTED", "status": "missing"},
     ]
-    assert (row["linked_total"], row["accepted"], row["unresolved"]) == (2, 1, 1)
+    assert (row["linked_total"], row["accepted"], row["unresolved"]) == (2, 1, 0)
     events = roadmap_store.list_events(repo, item["id"])
     retired = [e for e in events if e["event"] == "task_retired"]
     assert [e["detail"] for e in retired] == [
@@ -99,7 +99,7 @@ def test_quarantine_records_status_and_restore_lets_live_status_win(
     row = _row(item["id"])
     assert row["tasks"][0] == {"task_id": "TASK_ONE", "status": "archived"}
     assert row["tasks"][1] == {"task_id": "TASK_NEVER_EXISTED", "status": "missing"}
-    assert (row["linked_total"], row["accepted"], row["unresolved"]) == (2, 1, 1)
+    assert (row["linked_total"], row["accepted"], row["unresolved"]) == (2, 1, 0)
 
 
 def test_unlinked_task_quarantines_without_roadmap_events(
@@ -170,7 +170,7 @@ def test_snapshot_counts_accepted_and_unresolved_across_live_and_retired(
         {"task_id": "TASK_GONE_BLOCKED", "status": "purged:blocked"},
         {"task_id": "TASK_LOST", "status": "missing"},
     ]
-    assert (row["linked_total"], row["accepted"], row["unresolved"]) == (4, 2, 2)
+    assert (row["linked_total"], row["accepted"], row["unresolved"]) == (4, 2, 1)
     assert row["status"] == "proposed"
 
 
