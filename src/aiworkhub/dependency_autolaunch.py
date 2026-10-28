@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from . import callback_store
 from . import db_writer
+from . import task_plan
 from .sqlite_readonly import connect_readonly
 
 
@@ -403,6 +404,91 @@ def _read_rows(conn: sqlite3.Connection) -> dict[str, _TaskRow]:
         task = _task_row(row)
         rows[task.task_id] = task
     return rows
+
+
+# NF-2026-01776: ``_read_rows`` returns live rows only, so a dependency on a
+# card that was later superseded read as missing forever and its dependents
+# never autolaunched.  An absent dependency is now followed through the
+# successor edge ``task supersede`` records on the archived card -- parsed by
+# its owner ``task_plan.successor_task_id`` -- to the first live successor,
+# whose state then classifies the dependency.  The walk is bounded by
+# ``MAX_SUPERSEDE_CHAIN_HOPS`` and refuses to revisit an id, and a chain that
+# ends anywhere other than a live card stays ``missing_dependencies``.
+MAX_SUPERSEDE_CHAIN_HOPS = 32
+
+
+def _read_archived_card(db: Path, task_id: str) -> dict[str, Any] | None:
+    """Return the card of an archived row, or ``None`` when no archived row exists.
+
+    A store failure raises ``sqlite3.Error``: a read that failed is never an
+    answer that the chain ends here.
+    """
+    conn = _read_connection(db)
+    try:
+        row = conn.execute(
+            "SELECT card_json, archived_at FROM tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None or not str(row["archived_at"] or "").strip():
+        return None
+    return _load_card(row["card_json"])
+
+
+def _resolve_superseded_successor(
+    dependency_id: str,
+    rows: Mapping[str, _TaskRow],
+    archived_card: Callable[[str], dict[str, Any] | None],
+) -> tuple[_TaskRow | None, list[str]]:
+    """Follow the recorded supersede chain from an absent dependency.
+
+    Returns ``(successor_row, chain)`` where ``chain`` lists every superseded
+    id walked, in order.  ``successor_row`` is ``None`` when the chain ends
+    nowhere: an id that is neither live nor archived as superseded with a
+    valid successor, a cycle, or more than ``MAX_SUPERSEDE_CHAIN_HOPS`` hops.
+    """
+    current = dependency_id
+    chain: list[str] = []
+    seen: set[str] = set()
+    while len(chain) < MAX_SUPERSEDE_CHAIN_HOPS:
+        if current in seen:
+            return None, chain
+        seen.add(current)
+        successor = task_plan.successor_task_id(archived_card(current))
+        if not successor:
+            return None, chain
+        chain.append(current)
+        live = rows.get(successor)
+        if live is not None:
+            return live, chain
+        current = successor
+    return None, chain
+
+
+def _dependency_rows(
+    rows: Mapping[str, _TaskRow],
+    deps: Iterable[str],
+    archived_card: Callable[[str], dict[str, Any] | None],
+) -> tuple[list[_TaskRow], dict[str, dict[str, Any]], list[str]]:
+    """Map each dependency to the live row that decides it.
+
+    Returns ``(dep_rows, resolved, missing)``: ``resolved`` records every
+    dependency answered by a supersede successor, ``missing`` every dependency
+    with no live row at the end of its chain.
+    """
+    dep_rows: list[_TaskRow] = []
+    resolved: dict[str, dict[str, Any]] = {}
+    missing: list[str] = []
+    for dep in deps:
+        row = rows.get(dep)
+        if row is None:
+            row, chain = _resolve_superseded_successor(dep, rows, archived_card)
+            if row is None:
+                missing.append(dep)
+                continue
+            resolved[dep] = {"successor": row.task_id, "chain": chain}
+        dep_rows.append(row)
+    return dep_rows, resolved, missing
 
 
 def _ensure_holds_table(conn: sqlite3.Connection) -> None:
@@ -1009,6 +1095,7 @@ def reconcile(
         "blocked": [],
         "delayed": [],
         "skipped": [],
+        "superseded_resolved": [],
     }
     if not db.exists():
         outcome["ok"] = False
@@ -1022,6 +1109,16 @@ def reconcile(
         conn.commit()
         rows = _read_rows(conn)
 
+    # Archived cards walked by the supersede chain, per reconcile and bounded
+    # by the task table.  A failed read raises before it is recorded, so it is
+    # retried rather than remembered as the end of a chain.
+    archived_cards: dict[str, dict[str, Any] | None] = {}
+
+    def archived_card(task_id: str) -> dict[str, Any] | None:
+        if task_id not in archived_cards:
+            archived_cards[task_id] = _read_archived_card(db, task_id)
+        return archived_cards[task_id]
+
     launched_count = 0
     for child in sorted(rows.values(), key=lambda r: r.task_id):
         deps = _depends_on(child.card)
@@ -1031,12 +1128,23 @@ def reconcile(
         if child_state != "pending" or child.worker_status.strip().lower() not in ACTIVE_WORKER_STATUSES:
             outcome["skipped"].append({"task_id": child.task_id, "reason": f"not_pending_unclaimed:{child_state}"})
             continue
-        dep_rows = [rows.get(dep) for dep in deps]
-        missing = [dep for dep, dep_row in zip(deps, dep_rows) if dep_row is None]
+        try:
+            dep_rows, resolved, missing = _dependency_rows(rows, deps, archived_card)
+        except sqlite3.Error as exc:
+            outcome["delayed"].append(
+                {
+                    "task_id": child.task_id,
+                    "reason": "dependency_resolution_unreadable",
+                    "detail": str(exc)[:200],
+                }
+            )
+            continue
         if missing:
             outcome["delayed"].append({"task_id": child.task_id, "reason": "missing_dependencies", "dependencies": missing})
             continue
-        failed = sorted(dep.task_id for dep in dep_rows if dep is not None and _state(dep) == "failed")
+        if resolved:
+            outcome["superseded_resolved"].append({"task_id": child.task_id, "dependencies": resolved})
+        failed = sorted({dep.task_id for dep in dep_rows if _state(dep) == "failed"})
         if failed:
             with _write_connection(db) as conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -1051,7 +1159,7 @@ def reconcile(
             else:
                 outcome["delayed"].append({"task_id": child.task_id, "reason": "dependency_block_race"})
             continue
-        waiting = [dep.task_id for dep in dep_rows if dep is not None and _state(dep) != "success"]
+        waiting = list(dict.fromkeys(dep.task_id for dep in dep_rows if _state(dep) != "success"))
         if waiting:
             outcome["delayed"].append({"task_id": child.task_id, "reason": "waiting_dependencies", "dependencies": waiting})
             continue
