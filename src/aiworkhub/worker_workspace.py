@@ -698,6 +698,13 @@ def _git_environment() -> dict[str, str]:
     }
     env["GIT_OPTIONAL_LOCKS"] = "0"
     env["GIT_TERMINAL_PROMPT"] = "0"
+    # NF-2026-01794: Windows git defaults to ``core.longpaths=false`` and the
+    # nested union validation sandbox pushes worktree paths past MAX_PATH
+    # ("Filename too long"). The scrub above already dropped any inherited
+    # ``GIT_CONFIG_*``, so this single injected entry cannot double-count.
+    env["GIT_CONFIG_COUNT"] = "1"
+    env["GIT_CONFIG_KEY_0"] = "core.longpaths"
+    env["GIT_CONFIG_VALUE_0"] = "true"
     return env
 
 

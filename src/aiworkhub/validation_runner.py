@@ -1645,6 +1645,93 @@ def validation_environment_signature(row: Mapping[str, Any]) -> str | None:
     return None
 
 
+# ---- NF-2026-01794: xdist collection divergence on the worktree mount -------
+# Measured three times on 2026-10-28: on the ``Z:\union2_*`` worktree mount one
+# xdist worker failed to ``lstat`` a tracked, unchanged test file
+# (``FileNotFoundError [WinError 3]``) and the run ended with pytest-xdist's
+# ``Different tests were collected between gwN and gwM``; the same bytes pass
+# in a scratch copy. That is a failure of the PARALLEL COLLECTION, not of the
+# candidate, so the one remedy is a single sequential replay of exactly the
+# affected command. These names are the only vocabulary for it.
+XDIST_COLLECTION_DIVERGENCE = "xdist_collection_divergence"
+XDIST_WORKER_FILE_NOT_FOUND = "xdist_worker_file_not_found"
+# Appended, never substituted: pytest's command line overrides ``addopts``, so
+# ``-n 0`` disables the repository's ``-n auto --dist loadfile`` for this run.
+XDIST_SEQUENTIAL_REPLAY_ARGS: tuple[str, ...] = ("-n", "0")
+_XDIST_COLLECTION_DIVERGENCE_LITERAL = "Different tests were collected between"
+_XDIST_WORKER_ID_RE = re.compile(r"\bgw\d+\b")
+# ``str(OSError)`` ends with the repr of the filename, so a Windows path is
+# printed with doubled backslashes; the caller's lookup sees it un-doubled.
+_XDIST_FILE_NOT_FOUND_RE = re.compile(
+    r"FileNotFoundError: \[(?:WinError|Errno) \d+\][^\n]*?: ['\"]([^'\"\n]+)['\"]"
+)
+
+
+def _pytest_pins_xdist(args: list[str]) -> bool:
+    """True when pytest's own args already decide xdist (``-n``/``-p no:xdist``)."""
+    for kind, name, value in _iter_pytest_args(args):
+        if kind != "option":
+            continue
+        if name == _PYTEST_XDIST_SHORT or name in _PYTEST_XDIST_LONG:
+            return True
+        if name == "-p" and (value or "").strip() == "no:xdist":
+            return True
+    return False
+
+
+def xdist_collection_replay_signature(
+    command: str,
+    row: Mapping[str, Any],
+    *,
+    path_exists: Callable[[str], bool],
+) -> str | None:
+    """Name the xdist collection-divergence signature a FAILED row carries.
+
+    Only a failed, started, not-timed-out row of a single-segment pytest
+    command that does not already pin ``-n`` (or disable xdist) qualifies, and
+    a row that already carries a replay is never named again. The scanned
+    output must then hold pytest-xdist's own ``Different tests were collected
+    between`` literal, or name an xdist worker (``gwN``) together with a
+    ``FileNotFoundError`` whose path ``path_exists`` confirms -- a missing file
+    that is really missing is a candidate failure, never a flake. Everything
+    else, including a ``path_exists`` fault, is ``None``.
+    """
+    returncode = row.get("returncode")
+    if (
+        isinstance(returncode, bool)
+        or not isinstance(returncode, int)
+        or returncode == 0
+        or row.get("timed_out")
+        or row.get("launch_error")
+        or row.get("xdist_collection_replay")
+    ):
+        return None
+    segments = _command_segments(str(command))
+    if len(segments) != 1:
+        return None
+    args = _pytest_args(segments[0])
+    if args is None or _pytest_pins_xdist(args):
+        return None
+    text, _lines = _signature_scan(row)
+    if _XDIST_COLLECTION_DIVERGENCE_LITERAL in text:
+        return XDIST_COLLECTION_DIVERGENCE
+    if not _XDIST_WORKER_ID_RE.search(text):
+        return None
+    for match in _XDIST_FILE_NOT_FOUND_RE.finditer(text):
+        try:
+            exists = bool(path_exists(match.group(1).replace("\\\\", "\\")))
+        except (OSError, ValueError):
+            exists = False
+        if exists:
+            return XDIST_WORKER_FILE_NOT_FOUND
+    return None
+
+
+def xdist_sequential_replay_command(command: str) -> str:
+    """The declared command with xdist disabled for its one replay."""
+    return " ".join((str(command).rstrip(), *XDIST_SEQUENTIAL_REPLAY_ARGS))
+
+
 def validation_environment_signature_evidence(row: Mapping[str, Any]) -> dict[str, Any]:
     """The row's signature stamp, or ``{}`` -- SURFACE ONLY, never a verdict.
 

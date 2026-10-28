@@ -476,6 +476,99 @@ def _stamp_signatures(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
+def _workspace_path_exists(workspace: WorkerWorkspace, recorded: str) -> bool:
+    """Whether ``recorded`` names an existing path inside this worktree."""
+    root = Path(workspace.path)
+    path = Path(recorded)
+    if not path.is_absolute():
+        path = root / path
+    if ".." in path.parts:
+        return False
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return path.exists()
+
+
+def _output_tail_sha256(row: Mapping[str, Any]) -> str:
+    payload = json.dumps(
+        [str(row.get("stdout_tail") or ""), str(row.get("stderr_tail") or "")],
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _xdist_collection_replay(
+    workspace: WorkerWorkspace,
+    commands: list[str],
+    rows: list[dict[str, Any]],
+    route: Mapping[str, Any],
+    *,
+    run_validations: ValidationRunner,
+) -> tuple[list[dict[str, Any]], bool] | None:
+    """NF-2026-01794: re-run once, with ``-n 0``, only the rows whose failure is
+    an xdist collection divergence; ``None`` when no row carries it.
+
+    Returns the merged rows (each replayed row in its declared slot, keeping
+    the card's ``declared_command``) and whether the whole batch now passes.
+    The replayed rows are never examined for another replay.
+    """
+    plan: list[tuple[int, str]] = []
+    for index, (command, row) in enumerate(zip(commands, rows, strict=True)):
+        signature = validation_runner.xdist_collection_replay_signature(
+            command,
+            row,
+            path_exists=lambda recorded: _workspace_path_exists(workspace, recorded),
+        )
+        if signature is not None:
+            plan.append((index, signature))
+    if not plan:
+        return None
+    replay_commands = [
+        validation_runner.xdist_sequential_replay_command(commands[index])
+        for index, _signature in plan
+    ]
+    # Deliberately sequential (``-n 0``), the measured exception to the
+    # parallelism policy: the flake IS the parallel collection, so a parallel
+    # replay would re-measure the flake rather than the candidate.
+    replay_passed = True
+    try:
+        replayed = run_validations(workspace, replay_commands, **route)
+    except ValidationRunError as replay_exc:
+        replay_passed = False
+        replayed = replay_exc.results
+    except WorkspaceError as replay_error:
+        raise ValidationRunError(
+            f"validation_failed:xdist_collection_replay_failed:{replay_error}", rows
+        ) from replay_error
+    replayed = [dict(row) for row in replayed]
+    if len(replayed) != len(plan):
+        raise ValidationRunError(
+            "validation_failed:xdist_collection_replay_receipt_count_mismatch", rows
+        )
+    merged = [dict(row) for row in rows]
+    for (index, signature), replay_command, row in zip(
+        plan, replay_commands, replayed, strict=True
+    ):
+        original = rows[index]
+        row["command"] = commands[index]
+        row["declared_command"] = commands[index]
+        row["xdist_collection_replay"] = {
+            "attempt": 1,
+            "signature": signature,
+            "original_returncode": original.get("returncode"),
+            "original_tail_sha256": _output_tail_sha256(original),
+            "replay_command": replay_command,
+        }
+        merged[index] = row
+    passed = replay_passed and (
+        validation_runner.classify_validation_results(merged).state
+        == validation_runner.VALIDATION_PASSED
+    )
+    return merged, passed
+
+
 def run_declared_validations(
     workspace: WorkerWorkspace,
     authority: Mapping[str, Any],
@@ -601,6 +694,19 @@ def run_declared_validations(
             finally:
                 with _VALIDATION_REPLAY_LOCK:
                     _VALIDATION_REPLAYS_IN_FLIGHT.discard(replay_identity)
+        # NF-2026-01794: a plain failure whose pytest row carries the xdist
+        # collection-divergence signature is re-measured ONCE, only for those
+        # commands; the verdict is the replay's.  Anything else is untouched.
+        replay = _xdist_collection_replay(
+            workspace, commands, rows, route, run_validations=run_validations
+        )
+        if replay is not None:
+            rows, replay_passed = replay
+            rows = with_roles(rows)
+            if replay_passed:
+                return rows
+            rows = _stamp_signatures(rows)
+            exc.results = rows
         try:
             return baseline_comparer(workspace, authority, route_metadata, rows)
         except WorkspaceError as baseline_exc:
