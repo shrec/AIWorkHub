@@ -24,14 +24,17 @@ from . import (
     task_store,
     tool_recipes_store,
 )
+from . import mcp_tool_metadata as _tool_metadata
 from .tool_recovery import unknown_tool_message
 
 MCP_SURFACE_ENV = "AIWORKHUB_MCP_SURFACE"
-MCP_SURFACE_ALL = "all"
-MCP_SURFACE_MANAGER = "manager"
-MCP_DASHBOARD_TOOL_PREFIX = "aiworkhub_dashboard_"
+MCP_SURFACE_ALL = _tool_metadata.MCP_PROFILE_ALL
+MCP_SURFACE_MANAGER = _tool_metadata.MCP_PROFILE_MANAGER
+MCP_SURFACES = _tool_metadata.MCP_SURFACES
+MCP_DASHBOARD_TOOL_PREFIX = _tool_metadata.MCP_DASHBOARD_TOOL_PREFIX
 
-# Dashboard tools that stay visible on the manager surface; the rest serve the webview only.
+# Why the manager profile keeps these dashboard tools; the rest serve the webview only.
+# MCP_TOOL_PROFILES is authoritative; a test pins this set to its manager dashboard entries.
 MANAGER_SURFACE_DASHBOARD_KEEP_REASONS: dict[str, str] = {
     "aiworkhub_dashboard_needfix_transition": (
         "the only NeedFix triage/accept transition, and needfix_store refusals name it"
@@ -42,22 +45,90 @@ MANAGER_SURFACE_DASHBOARD_KEEP_REASONS: dict[str, str] = {
 }
 MANAGER_SURFACE_DASHBOARD_KEEP = frozenset(MANAGER_SURFACE_DASHBOARD_KEEP_REASONS)
 
+_UNKNOWN_SURFACE_LOCK = threading.Lock()
+# Bounds the reported-value set; later distinct bad values fall back silently.
+_UNKNOWN_SURFACE_REPORT_LIMIT = 16
+_unknown_surfaces_reported: set[str] = set()
+
 
 def mcp_surface() -> str:
-    """Return "manager" only for that exact value (case/space-insensitive), else "all"."""
+    """Return the active MCP profile named by AIWORKHUB_MCP_SURFACE (case/space-insensitive).
+
+    Unset or blank is "all", as it always was; manager, worker, dashboard and all
+    name themselves. Any other value falls back to "manager", the smaller
+    surface, and says so in one stderr line per distinct value (for the first
+    _UNKNOWN_SURFACE_REPORT_LIMIT values) -- never stdout, which is the stdio
+    protocol channel.
+    """
     value = os.environ.get(MCP_SURFACE_ENV, "").strip().lower()
-    return MCP_SURFACE_MANAGER if value == MCP_SURFACE_MANAGER else MCP_SURFACE_ALL
+    if not value:
+        return MCP_SURFACE_ALL
+    if value in MCP_SURFACES:
+        return value
+    with _UNKNOWN_SURFACE_LOCK:
+        first_report = (
+            value not in _unknown_surfaces_reported
+            and len(_unknown_surfaces_reported) < _UNKNOWN_SURFACE_REPORT_LIMIT
+        )
+        if first_report:
+            _unknown_surfaces_reported.add(value)
+    if first_report:
+        try:
+            sys.stderr.write(
+                f"aiworkhub.mcp_surface: unknown {MCP_SURFACE_ENV}={value[:64]!r}; using "
+                f"{MCP_SURFACE_MANAGER!r} (accepted: {', '.join(sorted(MCP_SURFACES))})\n"
+            )
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
+    return MCP_SURFACE_MANAGER
 
 
-def mcp_tool_visible(name: Any, surface: str | None = None) -> bool:
-    """False only on the manager surface, for a webview-only dashboard tool name."""
-    if (mcp_surface() if surface is None else surface) != MCP_SURFACE_MANAGER:
-        return True
-    return not (
-        isinstance(name, str)
-        and name.startswith(MCP_DASHBOARD_TOOL_PREFIX)
-        and name not in MANAGER_SURFACE_DASHBOARD_KEEP
+def _surface_visibility(name: Any, surface: str | None) -> str | None:
+    return _tool_metadata.tool_profile_visibility(
+        name, mcp_surface() if surface is None else surface
     )
+
+
+def mcp_tool_callable(name: Any, surface: str | None = None) -> bool:
+    """True when the surface (default: the active one) lets a client call ``name`` by exact name."""
+    return _surface_visibility(name, surface) is not None
+
+
+def mcp_tool_listed(name: Any, surface: str | None = None) -> bool:
+    """True when the surface (default: the active one) publishes ``name`` in tools/list."""
+    return _surface_visibility(name, surface) == _tool_metadata.MCP_VISIBILITY_LISTED
+
+
+def mcp_unknown_tool_message(name: Any, tools: Mapping[str, Any], surface: str) -> str:
+    """Refusal text for a call ``surface`` cannot serve from the ``tools`` registry.
+
+    A tool this server serves under some profile but ``surface`` does not
+    expose names the active profile and the profiles that do. Worker-only names
+    live on the worker MCP server, and a write-gated tool skipped while writes
+    are off is served by no profile, so they, like names no profile knows, get
+    the generic text. Suggestions come from what ``surface`` lists.
+    """
+    listed = [candidate for candidate in tools if mcp_tool_listed(candidate, surface)]
+    served_here = isinstance(name, str) and name not in _WRITE_GATE_SKIPPED and (
+        name in tools
+        or any(
+            profile != _tool_metadata.MCP_PROFILE_WORKER
+            for profile in _tool_metadata.MCP_TOOL_PROFILES.get(name, {})
+        )
+    )
+    if served_here and not mcp_tool_callable(name, surface):
+        return unknown_tool_message(
+            name,
+            listed,
+            active_profile=surface,
+            exposing_profiles=tuple(
+                profile
+                for profile in _tool_metadata.exposing_profiles(name)
+                if profile != _tool_metadata.MCP_PROFILE_WORKER
+            ),
+        )
+    return unknown_tool_message(name, listed)
 
 
 _MCP_SDK_AVAILABLE = True
@@ -207,7 +278,7 @@ except ModuleNotFoundError:
         surface = mcp_surface()
         entries = []
         for name, func in tools.items():
-            if not mcp_tool_visible(name, surface):
+            if not mcp_tool_listed(name, surface):
                 continue
             text, _ = _stdio_tool_metadata.split_docstring(getattr(func, "__doc__", None))
             description = text.strip()
@@ -227,9 +298,8 @@ except ModuleNotFoundError:
             raise _StdioProtocolError(-32602, "invalid_params")
         name = params.get("name")
         surface = mcp_surface()
-        if not isinstance(name, str) or name not in tools or not mcp_tool_visible(name, surface):
-            visible = [candidate for candidate in tools if mcp_tool_visible(candidate, surface)]
-            raise _StdioProtocolError(-32602, unknown_tool_message(name, visible))
+        if not isinstance(name, str) or name not in tools or not mcp_tool_callable(name, surface):
+            raise _StdioProtocolError(-32602, mcp_unknown_tool_message(name, tools, surface))
         arguments = params.get("arguments")
         if arguments is None:
             arguments = {}
@@ -518,7 +588,7 @@ except ModuleNotFoundError:
         def tool(self, *args: Any, **kwargs: Any):
             def decorate(func: Any) -> Any:
                 tool_name = str(kwargs.get("name") or func.__name__)
-                if not mcp_tool_visible(tool_name):
+                if not mcp_tool_callable(tool_name):
                     return func
                 self._tools[tool_name] = func
                 return func
@@ -595,6 +665,20 @@ except TypeError:
 _lowlevel_server = getattr(mcp, "_mcp_server", None)
 if _lowlevel_server is not None:
     _lowlevel_server.version = __version__
+
+if _MCP_SDK_AVAILABLE:
+    # RM-2026-00078: registration keeps every tool the active profile can call;
+    # tools/list publishes only the ones it lists. Filter both the FastMCP method
+    # and the low-level handler FastMCP bound to it at construction.
+    _sdk_list_tools = mcp.list_tools
+
+    async def _listed_sdk_tools() -> list[Any]:
+        surface = mcp_surface()
+        return [tool for tool in await _sdk_list_tools() if mcp_tool_listed(tool.name, surface)]
+
+    mcp.list_tools = _listed_sdk_tools  # type: ignore[method-assign]
+    if _lowlevel_server is not None:
+        _lowlevel_server.list_tools()(_listed_sdk_tools)
 
 
 # NF-2026-01626: a 15-minute accept outlived the client's 1800 s timeout with
@@ -676,7 +760,7 @@ if _MCP_SDK_AVAILABLE:
                 or (decorator_args[0] if decorator_args else None)
                 or getattr(function, "__name__", "")
             )
-            if not mcp_tool_visible(tool_name):
+            if not mcp_tool_callable(tool_name):
                 return function
             tool_args, tool_kwargs, signature = prepare_registration(
                 function, decorator_args, decorator_kwargs
@@ -737,6 +821,9 @@ def _serialize_task_lifecycle_write(function: Any) -> Any:
     return wrapped
 
 
+_WRITE_GATE_SKIPPED: set[str] = set()
+
+
 def _write_gated_tool(*args: Any, **kwargs: Any) -> Any:
     """Register an MCP tool only while ``core.writes_allowed()`` is true.
 
@@ -744,12 +831,14 @@ def _write_gated_tool(*args: Any, **kwargs: Any) -> Any:
     stdio registration entirely instead of registering and refusing at call
     time -- so the tool is absent from ``tools/list`` for read-only sessions.
     The function itself is always returned unwrapped and directly callable
-    by internal Python callers and tests either way.
+    by internal Python callers and tests either way. A skipped name is recorded
+    so an off-profile refusal never points at a profile that cannot serve it.
     """
 
     def decorate(function: Any) -> Any:
         if core.writes_allowed():
             return mcp.tool(*args, **kwargs)(function)
+        _WRITE_GATE_SKIPPED.add(str(kwargs.get("name") or function.__name__))
         return function
 
     return decorate

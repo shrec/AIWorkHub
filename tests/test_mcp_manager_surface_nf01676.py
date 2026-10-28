@@ -366,6 +366,11 @@ def _expected_text(name: str) -> str:
     return json.dumps(_SYNTHETIC_RESULTS[name], ensure_ascii=False)
 
 
+def _off_profile_message(name: str, listed: list, exposed: tuple = ("dashboard", "all")) -> str:
+    # RM-2026-00078: a known tool refused by the manager profile names the profiles serving it.
+    return unknown_tool_message(name, listed, active_profile="manager", exposing_profiles=exposed)
+
+
 @pytest.fixture(scope="module")
 def repo_root(tmp_path_factory) -> Path:
     root = tmp_path_factory.mktemp("nf01676_repo")
@@ -399,11 +404,13 @@ def manager_run(repo_root: Path, unset_run: dict) -> dict:
         ("manager", "manager"),
         ("MANAGER", "manager"),
         ("  Manager  ", "manager"),
-        ("worker", "all"),
-        ("managers", "all"),
-        ("manager,all", "all"),
-        ("1", "all"),
-        ("none", "all"),
+        ("worker", "worker"),
+        (" Dashboard ", "dashboard"),
+        # RM-2026-00078: an unknown value now falls back to the smaller manager surface.
+        ("managers", "manager"),
+        ("manager,all", "manager"),
+        ("1", "manager"),
+        ("none", "manager"),
     ],
 )
 def test_surface_value_parsing(monkeypatch, value, expected) -> None:
@@ -417,15 +424,16 @@ def test_surface_value_parsing(monkeypatch, value, expected) -> None:
 
 def test_visibility_predicate_hides_only_webview_dashboard_tools(monkeypatch) -> None:
     monkeypatch.delenv(server.MCP_SURFACE_ENV, raising=False)
-    assert all(server.mcp_tool_visible(name) for name in _MANAGER_VISIBILITY)
+    assert all(server.mcp_tool_callable(name) for name in _MANAGER_VISIBILITY)
     monkeypatch.setenv(server.MCP_SURFACE_ENV, "manager")
-    assert {name: server.mcp_tool_visible(name) for name in _MANAGER_VISIBILITY} == _MANAGER_VISIBILITY
-    assert server.mcp_tool_visible("aiworkhub_dashboard_health", "all") is True
+    assert {name: server.mcp_tool_callable(name) for name in _MANAGER_VISIBILITY} == _MANAGER_VISIBILITY
+    assert {name: server.mcp_tool_listed(name) for name in _MANAGER_VISIBILITY} == _MANAGER_VISIBILITY
+    assert server.mcp_tool_callable("aiworkhub_dashboard_health", "all") is True
     monkeypatch.delenv(server.MCP_SURFACE_ENV)
-    assert server.mcp_tool_visible("aiworkhub_dashboard_health", "manager") is False
-    assert server.mcp_tool_visible("aiworkhub_dashboard_snapshot", "manager") is True
-    assert server.mcp_tool_visible(None, "manager") is True
-    assert server.mcp_tool_visible(5, "manager") is True
+    assert server.mcp_tool_callable("aiworkhub_dashboard_health", "manager") is False
+    assert server.mcp_tool_callable("aiworkhub_dashboard_snapshot", "manager") is True
+    assert server.mcp_tool_callable(None, "manager") is True
+    assert server.mcp_tool_callable(5, "manager") is True
 
 
 def test_documented_keep_set_is_the_two_manager_dashboard_tools(unset_run: dict, manager_run: dict) -> None:
@@ -504,7 +512,7 @@ def test_hidden_dashboard_tools_are_unknown_tools_on_manager_and_callable_on_all
         for name in hidden:
             error = _error(snap["probes"][name])
             assert error["code"] == -32602, (label, name)
-            assert error["message"] == unknown_tool_message(name, visible), (label, name)
+            assert error["message"] == _off_profile_message(name, visible), (label, name)
             payload = json.loads(error["message"])
             assert payload["error"] == "unknown_tool" and payload["requested"] == name
             assert not set(payload["suggestions"]) & set(hidden)
@@ -582,7 +590,8 @@ def test_synthetic_registry_filters_listing_and_calls_by_prefix_and_keep_set(
         hidden_call = _result(synthetic["calls"][_SYNTHETIC_HIDDEN]["message"])
         assert list(hidden_call) == ["content"]
         assert json.loads(hidden_call["content"][0]["text"]) == {"tool": "hidden"}
-    expected = unknown_tool_message(_SYNTHETIC_HIDDEN, _SYNTHETIC_MANAGER)
+    # The synthetic hidden name has no profile table entry, so only ``all`` exposes it.
+    expected = _off_profile_message(_SYNTHETIC_HIDDEN, _SYNTHETIC_MANAGER, exposed=("all",))
     for snap in on_manager:
         synthetic = snap["synthetic"]
         assert _names(synthetic["list"]) == _SYNTHETIC_MANAGER
@@ -632,7 +641,7 @@ def test_real_stdio_loop_serves_the_same_surface(unset_run: dict, manager_run: d
         assert list(template) == ["content"]
         assert loop["3"]["wire_bytes"] == snap["calls"][_TEMPLATE_LIST]["wire_bytes"]
         assert _error(loop["5"]["message"])["message"] == _PROBE_ERROR
-        expected_hidden = unknown_tool_message(hidden_name, snap["list"]["names"]) if is_manager else _PROBE_ERROR
+        expected_hidden = _off_profile_message(hidden_name, snap["list"]["names"]) if is_manager else _PROBE_ERROR
         assert _error(loop["4"]["message"])["message"] == expected_hidden
 
 
