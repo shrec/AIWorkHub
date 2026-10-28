@@ -2318,8 +2318,10 @@ class McpStdioClient {
     } else {
       delete env.AIWORKHUB_ALLOW_LAUNCH;
     }
-    // The webview needs the dashboard tools the manager surface hides.
-    delete env.AIWORKHUB_MCP_SURFACE;
+    // The webview needs the dashboard tools the manager surface hides, so its
+    // child pins the `dashboard` profile instead of relying on the server
+    // default or inheriting an ambient value.
+    env.AIWORKHUB_MCP_SURFACE = "dashboard";
     // Never inherit a stale coordinator secret from the extension host.
     // Load the current owner-only file into this private child environment;
     // package init scrubs it before any submodule can copy the environment.
@@ -10021,7 +10023,11 @@ function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, pyt
     if (!Object.prototype.hasOwnProperty.call(nextEnv, "AIWORKHUB_ALLOW_LAUNCH")) {
       nextEnv.AIWORKHUB_ALLOW_LAUNCH = "1";
     }
-    if (!Object.prototype.hasOwnProperty.call(nextEnv, "AIWORKHUB_MCP_SURFACE")) {
+    // LLM clients run the manager surface; an operator may pin `all`. Any
+    // other value -- missing, unknown, or the dashboard child's private
+    // `dashboard` profile -- is drift and is repaired to `manager`.
+    const surface = nextEnv.AIWORKHUB_MCP_SURFACE;
+    if (surface !== "manager" && surface !== "all") {
       nextEnv.AIWORKHUB_MCP_SURFACE = "manager";
     }
     if (launcherPath) delete nextEnv.PYTHONPATH;

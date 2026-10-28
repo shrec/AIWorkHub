@@ -122,6 +122,24 @@ const {
 }
 
 {
+  // RM-2026-00078: LLM client configs are repaired to the manager surface;
+  // the dashboard child's private `dashboard` profile is drift there.
+  const python = { command: "python3", argsPrefix: [] };
+  const entry = (surface) => {
+    const env = { AIWORKHUB_MCP_STDIO_BACKEND: "stdlib", AIWORKHUB_ALLOW_WRITES: "1", AIWORKHUB_ALLOW_LAUNCH: "1" };
+    if (surface !== undefined) env.AIWORKHUB_MCP_SURFACE = surface;
+    return { command: "python3", args: ["-m", "aiworkhub.server"], env, type: "stdio" };
+  };
+  for (const [repair, container] of [[repairWorkspaceMcpConfigObject, "servers"], [repairClaudeMcpConfigObject, "mcpServers"]]) {
+    for (const surface of [undefined, "dashboard", "bogus"]) {
+      const result = repair({ [container]: { AIWorkHub: entry(surface) } }, "/runtime", "/repo/fresh", python);
+      assert.strictEqual(result.changed, true, `${container}: ${surface}`);
+      assert.strictEqual(result.document[container].AIWorkHub.env.AIWORKHUB_MCP_SURFACE, "manager", `${container}: ${surface}`);
+    }
+  }
+}
+
+{
   const result = repairClaudeMcpConfigObject(
     {}, "/extensions/shrec.aiworkhub/runtime", "/repo/fresh",
     { command: "python3", argsPrefix: [] },
@@ -367,4 +385,42 @@ const {
   }
 }
 
-console.log("workspace-mcp-runtime-repair: PASS");
+async function testDashboardChildSurfaceLeftAlone() {
+  // RM-2026-00078: the dashboard child pins `dashboard`; neither repair nor an
+  // ambient LLM-surface value may rewrite it to `manager`.
+  const childProcess = require("child_process");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-mcp-dashboard-child-"));
+  const captured = [];
+  const originalSpawn = childProcess.spawn;
+  const originalExecFile = childProcess.execFile;
+  const originalAmbient = process.env.AIWORKHUB_MCP_SURFACE;
+  childProcess.spawn = (_command, _args, options) => {
+    captured.push(options.env);
+    throw new Error("workspace-mcp-runtime-repair: spawn stopped after capture");
+  };
+  childProcess.execFile = (_command, _args, _options, callback) => { setImmediate(() => callback(null, "", "")); };
+  process.env.AIWORKHUB_MCP_SURFACE = "manager";
+  try {
+    fakeVscode.workspace.workspaceFolders = [{ uri: { fsPath: root } }];
+    ensureWorkspaceMcpConfigsRepaired({ extensionUri: { fsPath: "/extension" } });
+    const client = new McpStdioClient(root, { appendLine: () => {} }, { repoId: "repo_test" }, "episode");
+    try { await client._start(); } catch (_err) { /* spawn is stopped after capture */ }
+  } finally {
+    childProcess.spawn = originalSpawn;
+    childProcess.execFile = originalExecFile;
+    if (originalAmbient === undefined) delete process.env.AIWORKHUB_MCP_SURFACE;
+    else process.env.AIWORKHUB_MCP_SURFACE = originalAmbient;
+    fakeVscode.workspace.workspaceFolders = [];
+    try { fs.rmSync(root, { recursive: true, force: true }); } catch (_err) { /* best-effort cleanup */ }
+  }
+  assert.strictEqual(captured.length, 1, "expected exactly one dashboard child spawn");
+  assert.strictEqual(captured[0].AIWORKHUB_MCP_SURFACE, "dashboard");
+}
+
+testDashboardChildSurfaceLeftAlone().then(
+  () => console.log("workspace-mcp-runtime-repair: PASS"),
+  (err) => {
+    console.error(err);
+    process.exitCode = 1;
+  },
+);

@@ -1,7 +1,7 @@
 "use strict";
 
 // NF-2026-01676: LLM-facing MCP configs carry AIWORKHUB_MCP_SURFACE=manager;
-// the dashboard webview's own MCP children must never receive it.
+// RM-2026-00078: the dashboard webview's own MCP children pin `dashboard`.
 
 const assert = require("assert");
 const childProcess = require("child_process");
@@ -110,6 +110,12 @@ function testRepairedConfigObjects() {
     const pinned = repair({ [container]: { AIWorkHub: completeEntry({ [SURFACE]: "all" }) } }, RUNTIME, REPO, PYTHON);
     assert.strictEqual(pinned.changed, false, `${label}: an operator-chosen surface is not rewritten`);
     assert.strictEqual(pinned.document[container].AIWorkHub.env[SURFACE], "all", label);
+
+    for (const wrong of ["dashboard", "", "bogus"]) {
+      const drifted = repair({ [container]: { AIWorkHub: completeEntry({ [SURFACE]: wrong }) } }, RUNTIME, REPO, PYTHON);
+      assert.strictEqual(drifted.changed, true, `${label}: ${SURFACE}=${wrong} is repaired`);
+      assert.strictEqual(drifted.document[container].AIWorkHub.env[SURFACE], "manager", `${label}: ${wrong}`);
+    }
   }
 }
 
@@ -218,7 +224,7 @@ async function testWebviewChildEnv() {
       const spawned = await captureWebviewChildSpawn(child.options, ambient);
       const env = spawned.options.env;
       assert.strictEqual(spawned.ambientSeen, ambient, `${label}: the ambient value was really present`);
-      assert.ok(!Object.prototype.hasOwnProperty.call(env, SURFACE), `${label}: surface leaked into the webview child`);
+      assert.strictEqual(env[SURFACE], "dashboard", `${label}: the webview child pins the dashboard profile`);
       assert.strictEqual(env.AIWORKHUB_MCP_STDIO_BACKEND, "stdlib", label);
       assert.strictEqual(env.AIWORKHUB_REPO_ROOT, spawned.root, label);
       assert.strictEqual("AIWORKHUB_ALLOW_WRITES" in env, child.writes, label);

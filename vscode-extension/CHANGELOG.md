@@ -3,6 +3,7 @@
 ## Unreleased
 
 - WorkHub Mail popup: listener status with Start/Stop, "Pair this machine" (shows code and address) and "Pair with another machine" (address, code, TLS); every write goes through a confirm-gated dashboard tool (NF-2026-01783).
+- The dashboard's own MCP child now runs with `AIWORKHUB_MCP_SURFACE=dashboard` instead of the server default, so it keeps its tools if that default changes. LLM client configs still get `manager`, and workspace repair now also resets a `dashboard` or unknown value there to `manager` (RM-2026-00078).
 
 ## 0.12.72 — 2026-10-28
 
