@@ -115,20 +115,31 @@ def _blocker(kind: str, detail: str = "", **extra: Any) -> dict[str, Any]:
     }
 
 
+def _codex_route_is_live(core: Any, identity: Mapping[str, Any]) -> bool:
+    """A Codex identity backed by a live route: a UUID thread on a target that
+    is not route-pending and does accept callbacks."""
+    return (
+        bool(core._UUID_RE.fullmatch(str(identity.get("thread_id") or "")))
+        and str(identity.get("callback_supported") or "").strip().lower() != "false"
+        and str(identity.get("route_state") or "available") in ("available", "ready")
+    )
+
+
 def _accept_manager_identity(core: Any) -> dict[str, Any]:
     """Resolve the accepting manager's identity once, best-effort.
 
-    Same expression and exception guard the ``accept_manager_identity``
-    quality-gate block has always used: same-uid local runtime state
+    The identity is the one the manager MCP surface stamps on every reply
+    (``core.stamped_manager_identity``): same-uid local runtime state
     (provider, session, window), never a credential, and never allowed to
-    fail an accept.
+    fail an accept. A Codex identity counts only when its route is live --
+    a stale Codex route file is not the manager and is never a fallback for
+    another provider (RM-2026-00082); unverified is recorded as unverified.
     """
     try:
-        return (  # seat first (NF-2026-01383)
-            core._manager_chat_seat_identity()
-            or core._claude_manager_identity()
-            or core._codex_manager_identity()
-        ) or {}
+        identity = core.stamped_manager_identity()
+        if str(identity.get("provider") or "") == "codex" and not _codex_route_is_live(core, identity):
+            return {}
+        return identity or {}
     except Exception:  # noqa: BLE001 -- describing the caller never fails an accept
         return {}
 

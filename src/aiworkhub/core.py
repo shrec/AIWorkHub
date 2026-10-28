@@ -42,6 +42,7 @@ from . import dependency_autolaunch
 from . import learning_commit
 from . import terminal_failure_classification
 from .learning_commit import FailureCategory, classify_failure_category
+from .route_identity import MANAGER_PROVIDERS
 
 
 DEFAULT_TIMEOUT_SECONDS = int(os.environ.get("AIWORKHUB_TIMEOUT", "60"))
@@ -946,6 +947,29 @@ def _manager_chat_seat_identity() -> dict[str, str] | None:
     }
 
 
+def _live_manager_identity() -> dict[str, str] | None:
+    """This process's own route, seat first (NF-2026-01383): what bootstrap starts from."""
+    return _manager_chat_seat_identity() or _claude_manager_identity() or _codex_manager_identity()
+
+
+def _manager_chat_route(chat: Mapping[str, str], previous: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The ``manager_route`` an open Manager Chat seat stamps on manager replies."""
+    return {"provider": "manager_chat", "session_id": chat["session_id"], "thread_id": "",
+            "window_id": str((previous or {}).get("window_id") or ""), "route_state": "ready",
+            "callback_supported": "true", "model": chat["model"], "backend_id": chat["backend_id"],
+            "manager_chat": dict(chat)}
+
+
+def stamped_manager_identity() -> dict[str, Any]:
+    """The ``manager_route`` every manager MCP reply stamps, ``{}`` when none is verified:
+    ``manager_bootstrap``'s rule, an open seat unless a verified Claude route owns this chat."""
+    identity = _live_manager_identity() or {}
+    chat = _active_manager_chat_record()
+    if chat and str(identity.get("provider") or "") != "claude":
+        return _manager_chat_route(chat, identity)
+    return dict(identity)
+
+
 def _review_target_callback_binding(
     target_task_id: str | None,
 ) -> tuple[str, str, str, str] | None:
@@ -972,7 +996,7 @@ def _review_target_callback_binding(
     if not (_valid_origin_thread_id(origin) or _MANAGER_CHAT_SESSION_RE.fullmatch(origin)):
         return None
     provider = str(card.get("coordinator_provider") or "").strip().lower()
-    if provider not in ("codex", "claude", "copilot"):
+    if provider not in MANAGER_PROVIDERS:
         return None
     chat = str(card.get("manager_chat_session_id") or "").strip()
     return (
@@ -1085,9 +1109,11 @@ def _repo_bound_codex_mux(mux_pid: int) -> tuple[Any, dict[str, Any]] | None:
 
 def _current_chat_provider(card: dict[str, Any] | None = None) -> str:
     """Resolve callback ownership from the task/session, never a dashboard
-    global toggle when a concrete chat identity is available."""
+    global toggle when a concrete chat identity is available. Card, Claude,
+    Codex parent, selected route, Manager Chat seat; else ``""``, never a
+    guessed ``"codex"`` (RM-2026-00082)."""
     explicit = str((card or {}).get("coordinator_provider") or "").strip().lower()
-    if explicit in ("codex", "claude", "copilot"):
+    if explicit in MANAGER_PROVIDERS:
         return explicit
     if _claude_manager_identity() is not None:
         return "claude"
@@ -1101,7 +1127,9 @@ def _current_chat_provider(card: dict[str, Any] | None = None) -> str:
         selected = read_selected_coordinator_target(repo_root()).get("selected_provider")
     except Exception:
         selected = ""
-    return selected if selected in ("codex", "claude", "copilot") else "codex"
+    if selected in MANAGER_PROVIDERS:
+        return selected
+    return callback_store.MANAGER_CHAT_PROVIDER if _active_manager_chat_record() else ""
 
 
 _COORDINATOR_TOKEN_REL = Path(".aiworkhub") / "runtime" / "coordinator.token"
@@ -3406,7 +3434,7 @@ def manager_bootstrap(
     # GC pass picks it up: measured ~470 gate calls against 53 bootstraps in a
     # session, which is where the 2.77s per call was going.
     hygiene = _schedule_task_hygiene(run_when_due=bootstrap_call)
-    identity = _manager_chat_seat_identity() or _claude_manager_identity() or _codex_manager_identity()
+    identity = _live_manager_identity()
     provider = str((identity or {}).get("provider") or _current_chat_provider())
     root = repo_root()
     try:
@@ -3497,17 +3525,7 @@ def manager_bootstrap(
         reply["provider"] = "manager_chat"
         reply["role"] = "manager"
         reply["manager_verified"] = True
-        reply["manager_route"] = {
-            "provider": "manager_chat",
-            "session_id": chat["session_id"],
-            "thread_id": "",
-            "window_id": str(previous.get("window_id") or ""),
-            "route_state": "ready",
-            "callback_supported": "true",
-            "model": chat["model"],
-            "backend_id": chat["backend_id"],
-            "manager_chat": chat,
-        }
+        reply["manager_route"] = _manager_chat_route(chat, previous)
         reply["reason"] = ""
     if reply["runtime_generation"]["stale"]:
         reply["warning"] = reply["runtime_generation"]["warning"]
@@ -11619,12 +11637,12 @@ def _live_mux_active_thread(root: Path, target: dict[str, Any]) -> str:
 
 
 def read_selected_coordinator_target(root: Path | None = None) -> dict[str, Any]:
-    """Read the explicitly selected coordinator provider ("codex"/"claude"/
-    "copilot") from the same file the VS Code extension writes
+    """Read the explicitly selected coordinator provider (one of
+    ``MANAGER_PROVIDERS``) from the same file the VS Code extension writes
     (``.aiworkhub/config/routing/coordinator-targets.json``). Never invokes
-    AITools; missing/corrupt/unrecognized state fails safe to the same
-    "codex" default the extension's own ``defaultCoordinatorTargets()``
-    uses -- never a guess at a different provider.
+    AITools; missing/corrupt/unrecognized state fails safe to ``""`` -- no
+    provider selected (RM-2026-00082): Codex is one provider, not the
+    default, and nothing here guesses a provider.
 
     A verified live Claude manager identity (this process's own confirmed
     route) is stronger, fresher evidence of the active route than this
@@ -11664,7 +11682,7 @@ def read_selected_coordinator_target(root: Path | None = None) -> dict[str, Any]
 
     resolved_root = root or repo_root()
     path = _coordinator_route_state_path(resolved_root)
-    default = {"schema_id": "aiworkhub.coordinator_targets.v1", "selected_provider": "codex"}
+    default = {"schema_id": "aiworkhub.coordinator_targets.v1", "selected_provider": ""}  # nobody (RM-2026-00082)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -11672,7 +11690,7 @@ def read_selected_coordinator_target(root: Path | None = None) -> dict[str, Any]
     if not isinstance(payload, dict):
         return _resolved(default)
     provider = str(payload.get("selected_provider") or "").strip().lower()
-    if provider not in ("codex", "claude", "copilot"):
+    if provider not in MANAGER_PROVIDERS:
         return _resolved(default)
     merged = {**default, **payload, "selected_provider": provider}
     targets = merged.get("targets")

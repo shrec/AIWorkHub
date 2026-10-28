@@ -66,6 +66,7 @@ from . import db_writer
 from . import review_lifecycle
 from . import task_fsm
 from .sqlite_readonly import connect_readonly
+from .route_identity import MANAGER_PROVIDERS
 
 
 SCHEMA_ID = "aiworkhub.task_store.v1"
@@ -2848,7 +2849,7 @@ def _enqueue_terminal_callback_row(
 
     normalized_provider = str(provider or "").strip().lower()
     normalized_origin = str(origin_thread_id or "").strip()
-    if normalized_provider not in {"", "codex", "claude", "copilot"}:
+    if normalized_provider and normalized_provider not in MANAGER_PROVIDERS:
         return False
     if not normalized_origin or transition not in _ATOMIC_CALLBACK_TRANSITIONS:
         return False
@@ -4443,13 +4444,9 @@ def terminal_callback_already_durable(
 # The provider vocabulary ``callback_store.enqueue_callback`` will route.  A
 # card outside it can never produce an outbox row, so a settler holding a
 # durable intent has to be able to see that from here rather than reading a
-# permanent structural refusal as "the store is busy, try again".
-TERMINAL_CALLBACK_ROUTABLE_PROVIDERS: tuple[str, ...] = (
-    "",
-    "codex",
-    "claude",
-    "copilot",
-)
+# permanent structural refusal as "the store is busy, try again".  Derived from
+# the one registry (RM-2026-00082), so a manager_chat card is routable too.
+TERMINAL_CALLBACK_ROUTABLE_PROVIDERS: tuple[str, ...] = tuple(sorted(MANAGER_PROVIDERS | {""}))
 
 
 def terminal_callback_identity_unroutable(

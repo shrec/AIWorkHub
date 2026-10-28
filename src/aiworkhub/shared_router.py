@@ -17,6 +17,7 @@ from typing import Any
 
 from . import repository_state
 from .platform_io import atomic_replace, chmod_path, lock_fd, process_is_alive, unlock_fd
+from .route_identity import MANAGER_PROVIDERS
 
 
 SCHEMA_ID = "aiworkhub.shared_repo_route.v1"
@@ -487,7 +488,7 @@ def resolve_repository_route(
 
     normalized_provider = str(provider or "").strip().lower()
     normalized_thread = str(thread_id or "").strip()
-    if normalized_provider not in {"codex", "claude", "copilot"}:
+    if normalized_provider not in MANAGER_PROVIDERS:
         return {"ok": False, "error": "provider_invalid", "matches": 0}
     if not normalized_thread:
         return {"ok": False, "error": "thread_id_missing", "matches": 0}

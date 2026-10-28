@@ -14,8 +14,8 @@ These tests pin three invariants:
      as its own state.
   2. A verified Codex route (and the unverified/no-identity default) is
      byte-for-byte unchanged -- including exact reason strings.
-  3. No verified route at all still fails closed to the pre-existing default
-     instead of guessing "claude".
+  3. No verified route at all still fails closed to the default -- which
+     selects nobody (RM-2026-00082) -- instead of guessing "claude" or "codex".
 """
 from __future__ import annotations
 
@@ -265,7 +265,8 @@ def test_no_verified_identity_and_no_config_file_stays_on_preexisting_default(tm
 
     target = core.read_selected_coordinator_target(root)
 
-    assert target == {"schema_id": "aiworkhub.coordinator_targets.v1", "selected_provider": "codex"}
+    # RM-2026-00082: the default selects nobody, never a guessed "codex".
+    assert target == {"schema_id": "aiworkhub.coordinator_targets.v1", "selected_provider": ""}
 
 
 def test_no_verified_identity_with_corrupt_config_stays_on_preexisting_default(tmp_path, monkeypatch):
@@ -277,7 +278,7 @@ def test_no_verified_identity_with_corrupt_config_stays_on_preexisting_default(t
 
     target = core.read_selected_coordinator_target(root)
 
-    assert target == {"schema_id": "aiworkhub.coordinator_targets.v1", "selected_provider": "codex"}
+    assert target == {"schema_id": "aiworkhub.coordinator_targets.v1", "selected_provider": ""}
 
 
 def test_dispatcher_health_headless_when_no_verified_identity_and_no_window(tmp_path, monkeypatch):
@@ -294,7 +295,7 @@ def test_dispatcher_health_headless_when_no_verified_identity_and_no_window(tmp_
 
     health = core.dispatcher_health()
 
-    assert health["selected_provider"] == "codex"
+    assert health["selected_provider"] == ""
     assert health["dispatch_expected"] is False
 
 

@@ -31,6 +31,7 @@ from typing import Any
 from . import db_writer
 from . import task_fsm
 from . import task_store
+from .route_identity import MANAGER_PROVIDERS
 
 SCHEMA_ID = "aiworkhub.callback_store.v1"
 
@@ -45,7 +46,11 @@ CALLBACK_ELIGIBLE_TRANSITIONS: frozenset[str] = task_fsm.TERMINAL_CALLBACK_CLASS
 # Codex and Claude keep their own outbox rows. Manager Chat is a second
 # destination, not a replacement, until that mux is removed.
 MANAGER_CHAT_PROVIDER = "manager_chat"
-_CALLBACK_PROVIDERS = frozenset({"", "codex", "claude", "copilot", MANAGER_CHAT_PROVIDER})
+_CALLBACK_PROVIDERS = MANAGER_PROVIDERS | {""}
+# The providers that own their own outbox lane. Manager Chat mirrors them, so
+# it is never a source to mirror from or to adopt away (NF-2026-00843).
+_LANE_PROVIDERS: tuple[str, ...] = tuple(sorted(MANAGER_PROVIDERS - {MANAGER_CHAT_PROVIDER}))
+_LANE_PROVIDER_PLACEHOLDERS = ", ".join("?" for _ in _LANE_PROVIDERS)
 _MANAGER_CHAT_SESSION_RE = re.compile(r"^mls-[0-9a-f]{32}$", re.I)
 
 # A Manager Chat conversation is the seat only while it is in use: an active
@@ -640,7 +645,8 @@ def mirror_pending_to_manager_chat(conn: sqlite3.Connection, session_id: str) ->
     try:
         rows = conn.execute(
             "SELECT task_id, transition, episode_id, event_id, request_id "
-            "FROM callback_outbox WHERE state='pending' AND provider IN ('codex', 'claude', 'copilot')"
+            f"FROM callback_outbox WHERE state='pending' AND provider IN ({_LANE_PROVIDER_PLACEHOLDERS})",
+            _LANE_PROVIDERS,
         ).fetchall()
     except sqlite3.Error:
         return 0
@@ -1653,7 +1659,11 @@ def _supersede_route_duplicates(
     return len(dupes)
 
 
-_ADOPTABLE_PROVIDERS = ("codex", "claude", "copilot")
+# Adoption moves wakes between the providers' own lanes. The Manager Chat
+# seat mirrors every lane already, so it neither adopts nor is adopted from;
+# a card whose coordinator_provider is manager_chat still has its lane rows
+# adopted like any other card.
+_ADOPTABLE_PROVIDERS = _LANE_PROVIDERS
 
 
 def adopt_pending_callbacks(
@@ -1691,7 +1701,8 @@ def adopt_pending_callbacks(
         candidates = conn.execute(
             "SELECT outbox_id, batch_id, task_id, provider, origin_thread_id, transition, "
             "episode_id, event_id, request_id FROM callback_outbox "
-            "WHERE state='pending' AND provider IN (?, ?) ORDER BY created_at ASC, outbox_id ASC",
+            f"WHERE state='pending' AND provider IN ({', '.join('?' for _ in others)}) "
+            "ORDER BY created_at ASC, outbox_id ASC",
             others,
         ).fetchall()
         now = utc_now()
@@ -1984,7 +1995,7 @@ def seed_missing_review_callbacks(
     _ensure_callback_outbox_table(conn)
     provider = str(provider or "").strip().lower()
     route_origin = str(origin_thread_id or "").strip()
-    if provider not in ("codex", "claude", "copilot"):
+    if provider not in MANAGER_PROVIDERS:
         return 0
     rows = conn.execute(
         """

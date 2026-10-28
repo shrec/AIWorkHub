@@ -55,7 +55,10 @@ _MAX_EVENT_ID_LEN = 128
 _MAX_PROVIDER_LEN = 32
 _MAX_WINDOW_ID_LEN = 128
 _MAX_SESSION_ID_LEN = 256
-_SUPPORTED_PROVIDERS = frozenset({"codex", "claude", "copilot"})
+# The one manager-provider registry (RM-2026-00082): any of these can be the
+# manager, Codex is one of them and never the default. Every provider
+# membership check imports this set; none restates it.
+MANAGER_PROVIDERS: frozenset[str] = frozenset({"codex", "claude", "copilot", "manager_chat"})
 
 # Unicode categories that are forbidden in identifiers:
 # Cc = control, Cf = format (zero-width, bidi marks), Cs = surrogate,
@@ -413,7 +416,7 @@ class CoordinatorRouteKey:
     def __post_init__(self) -> None:
         repo_id = _validate_identifier_field(self.repo_id, "repo_id", _MAX_REPO_ID_LEN)
         provider = _validate_identifier_field(self.provider, "provider", _MAX_PROVIDER_LEN).lower()
-        if provider not in _SUPPORTED_PROVIDERS:
+        if provider not in MANAGER_PROVIDERS:
             raise ValueError(f"unsupported callback provider: {provider}")
         window_id = _validate_identifier_field(self.window_id, "window_id", _MAX_WINDOW_ID_LEN)
         task_id = _validate_identifier_field(self.task_id, "task_id", _MAX_TASK_ID_LEN)
@@ -432,6 +435,8 @@ class CoordinatorRouteKey:
             raise ValueError("claude callback route requires session_id")
         if provider == "copilot" and not (thread_id or session_id):
             raise ValueError("copilot callback route requires deferred route identity")
+        if provider == "manager_chat" and not session_id:
+            raise ValueError("manager_chat callback route requires session_id")
 
         object.__setattr__(self, "repo_id", repo_id)
         object.__setattr__(self, "provider", provider)
