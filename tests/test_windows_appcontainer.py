@@ -4995,6 +4995,107 @@ def test_helper_temp_plan_fails_closed_when_no_short_private_temp_fits(monkeypat
     assert tuple(request.filesystem_grants) == ()
 
 
+def _deep_sandbox_scratch() -> tuple[str, str]:
+    """A deep sandbox root and a validation scratch strictly inside it."""
+
+    root = str(Path(os.path.abspath(os.sep)).resolve())
+    anchor = os.path.normcase(
+        os.path.normpath(os.path.join(root, "nf1796", "d" * 180))
+    )
+    return anchor, os.path.join(anchor, "req", "tmp")
+
+
+def _refuse_helper_temp(_anchor, _user):
+    raise AssertionError("no helper temp may be created")
+
+
+def test_helper_temp_plan_measures_a_same_anchor_temp_on_the_drive_spelling(
+    monkeypatch,
+):
+    """NF-2026-01796: the child sees ``<drive>:\\req\\tmp``, which fits."""
+
+    from aiworkhub.validation_runner import temp_root_blocks_nested_lsp_helper
+
+    anchor, scratch = _deep_sandbox_scratch()
+    assert temp_root_blocks_nested_lsp_helper(scratch, "shrek")
+    assert not temp_root_blocks_nested_lsp_helper("Z:\\req\\tmp", "shrek")
+    monkeypatch.setattr(wac.os, "name", "nt")
+    monkeypatch.setattr(wac, "_request_traversal_anchor", lambda _value: anchor)
+    monkeypatch.setattr(wac, "_create_short_helper_temp", _refuse_helper_temp)
+    env = {
+        "TMPDIR": scratch,
+        "TEMP": scratch,
+        "TMP": scratch,
+        wac._VALIDATION_SCRATCH_ENV: scratch,
+    }
+    request = make_request(
+        environment=env,
+        filesystem_grants=(),
+        working_directory=os.path.join(anchor, "worktree"),
+    )
+    rewritten, disposable = wac.bind_validation_helper_temp(request, username="shrek")
+    assert disposable is None
+    assert rewritten.environment["TEMP"] == scratch
+    assert tuple(rewritten.filesystem_grants) == ()
+
+
+def test_helper_temp_plan_measures_a_temp_outside_the_workspace_anchor_on_its_real_path(
+    monkeypatch,
+):
+    """A TEMP under another root is not rewritten to the drive: real length counts."""
+
+    anchor, scratch = _deep_sandbox_scratch()
+    other = os.path.join(os.path.dirname(anchor), "other")
+    monkeypatch.setattr(wac.os, "name", "nt")
+    monkeypatch.setattr(
+        wac,
+        "_request_traversal_anchor",
+        lambda value: anchor if value == scratch else other,
+    )
+    monkeypatch.setattr(wac, "_create_short_helper_temp", lambda _anchor, _user: None)
+    env = {
+        "TMPDIR": scratch,
+        "TEMP": scratch,
+        "TMP": scratch,
+        wac._VALIDATION_SCRATCH_ENV: scratch,
+    }
+    request = make_request(
+        environment=env,
+        filesystem_grants=(),
+        working_directory=os.path.join(other, "worktree"),
+    )
+    with pytest.raises(AppContainerError) as excinfo:
+        wac.bind_validation_helper_temp(request, username="shrek")
+    assert excinfo.value.reason is AppContainerReason.INVALID_REQUEST
+    assert "no shorter private temp" in excinfo.value.detail
+
+
+def test_helper_temp_plan_measures_a_prefix_sibling_of_the_anchor_on_its_real_path(
+    monkeypatch,
+):
+    """``<anchor>x`` shares the anchor's spelling but is not under it."""
+
+    anchor, _scratch = _deep_sandbox_scratch()
+    scratch = os.path.join(anchor + "x", "req", "tmp")
+    monkeypatch.setattr(wac.os, "name", "nt")
+    monkeypatch.setattr(wac, "_request_traversal_anchor", lambda _value: anchor)
+    monkeypatch.setattr(wac, "_create_short_helper_temp", lambda _anchor, _user: None)
+    env = {
+        "TMPDIR": scratch,
+        "TEMP": scratch,
+        "TMP": scratch,
+        wac._VALIDATION_SCRATCH_ENV: scratch,
+    }
+    request = make_request(
+        environment=env,
+        filesystem_grants=(),
+        working_directory=os.path.join(anchor, "worktree"),
+    )
+    with pytest.raises(AppContainerError) as excinfo:
+        wac.bind_validation_helper_temp(request, username="shrek")
+    assert "no shorter private temp" in excinfo.value.detail
+
+
 def test_appcontainer_shell_drops_git_bash_and_uses_powershell(monkeypatch):
     monkeypatch.setattr(wac.os, "name", "nt")
     env = {

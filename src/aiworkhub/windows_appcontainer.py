@@ -2343,8 +2343,10 @@ def bind_validation_helper_temp(
     :func:`request_scoped_grants` emits for it: ``awh-helper`` and the root,
     both persistent. A scratch or workspace outside a sandbox root is not aliased
     and not granted. A launch without the validation scratch env is left
-    unchanged. The length check reads the real path; the child later sees
-    the shorter drive spelling (:func:`_on_sandbox_drive`).
+    unchanged. When the scratch shares the working directory's sandbox root,
+    the length check reads the drive spelling the child sees
+    (:func:`_on_sandbox_drive` maps that root to one drive letter); a scratch
+    under any other root is not rewritten, so its real path is measured.
     """
 
     if os.name != "nt" or request.environment is None:
@@ -2355,9 +2357,23 @@ def bind_validation_helper_temp(
     if not scratch or not _same_path(scratch, effective):
         return request, None
     user = username if username is not None else _pytest_username()
-    if not temp_root_blocks_nested_lsp_helper(effective, user):
-        return request, None
     anchor = _request_traversal_anchor(effective)
+    child_temp = effective
+    if anchor and anchor == _request_traversal_anchor(request.working_directory or ""):
+        try:
+            real = os.path.normcase(os.path.normpath(str(Path(effective).resolve())))
+        except (OSError, ValueError):
+            real = ""
+        prefix = os.path.normcase(os.path.normpath(anchor))
+        # Separator boundary: a sibling such as ``<anchor>x`` is not under it.
+        under = prefix.rstrip("\\/") + os.sep
+        if real == prefix or real.startswith(under):
+            # Every sandbox letter spells the same length.
+            child_temp = (
+                _SANDBOX_DRIVE_LETTERS[0] + ":\\" + real[len(prefix) :].lstrip("\\/")
+            )
+    if not temp_root_blocks_nested_lsp_helper(child_temp, user):
+        return request, None
     if not anchor:
         return request, None
     leaf = _create_short_helper_temp(anchor, user)
