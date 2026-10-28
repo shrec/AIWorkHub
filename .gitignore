@@ -63,6 +63,7 @@ node_modules/
 # Local coordinator handoffs, dated audits, and review scratch reports.
 /AUTONOMOUS_SESSION_SUMMARY.md
 /NEXT_SESSION_HANDOFF.md
+/*_HANDOFF_*.md
 /CODE_REVIEW_*.md
 /PROJECT_EVALUATION_*.md
 /AUDIT_TOKEN_ECONOMY_AND_AGENT_QUALITY_*.md
