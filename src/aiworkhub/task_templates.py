@@ -193,6 +193,12 @@ _PYTEST_NODEID_SELECTOR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Compiler include-root option whose path payload may be joined (``-Idir``) or
 # separated (``-I dir``); only the payload is validated, never the option prefix.
 _INCLUDE_ROOT_OPTION = "-I"
+# MSBuild-style ``/name:value`` switches (``/p:Configuration=Debug``) are option
+# tokens, not absolute paths (NF-2026-01806). They are recognized only after an
+# MSBuild-driving head and only in the colon form with a slash-free value, so a
+# bare ``/etc`` or ``/p:OutDir=/etc`` still gets the fail-closed path check.
+_MSBUILD_SWITCH_HEADS = ("msbuild", "dotnet")
+_MSBUILD_SWITCH_RE = re.compile(r"/[A-Za-z][A-Za-z0-9]*:[A-Za-z0-9._+=,-]*")
 _PYTHON_SUFFIXES = (".py",)
 _NODE_SUFFIXES = (".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx")
 _NODE_TEST_MARKERS = (".test", ".spec")
@@ -1539,6 +1545,10 @@ def validate_custom_validation_roles(
         if not isinstance(item, str):
             raise TaskTemplateError("invalid_validation_not_string")
         tokens = split_command_argv(item)
+        msbuild_switches = bool(tokens) and (
+            tokens[0].rsplit("/", 1)[-1].lower().removesuffix(".exe")
+            in _MSBUILD_SWITCH_HEADS
+        )
         index = 0
         while index < len(tokens):
             token = tokens[index]
@@ -1557,6 +1567,13 @@ def validate_custom_validation_roles(
                 # so it matches the separated ``-I dir`` form exactly.
                 payload = token[len(_INCLUDE_ROOT_OPTION) :]
             elif not token or not _is_path_like_token(token):
+                continue
+            elif (
+                msbuild_switches
+                and index > 1
+                and _MSBUILD_SWITCH_RE.fullmatch(token)
+                and ".." not in token
+            ):
                 continue
             else:
                 payload = token

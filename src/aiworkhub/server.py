@@ -3791,6 +3791,13 @@ def aiworkhub_task_create_from_template(
         wave_goal_binding: Exactly {roadmap_id, goal_id, predecessor_task_id}: makes this card the active wave goal's current task in place of the predecessor. Never inferred; a malformed binding is refused. Omit for none.
     """
     try:
+        # The language-neutral template has no generated validation: its
+        # expansion IS the caller's commands (NF-2026-01806), so they must reach
+        # it rather than only the override below. Built-ins still refuse them.
+        caller_validated = (
+            task_templates.resolve_template(template_id).name
+            == task_templates.CALLER_VALIDATION_TEMPLATE_NAME
+        )
         card = task_templates.expand_template(
             template_id,
             production_paths=production_paths,
@@ -3798,6 +3805,7 @@ def aiworkhub_task_create_from_template(
             mandatory_changed_outputs=mandatory_changed_outputs,
             title=title,
             objective=objective,
+            **({"validation": validation} if caller_validated else {}),
         )
         override_requested = validation is not None or validation_roles is not None
         if override_requested:
@@ -3910,6 +3918,7 @@ def _task_template_discovery_payload(
     """Return the public, deterministic discovery shape for one template."""
 
     full_id = task_templates.template_full_id(spec.name)
+    caller_validated = spec.name == task_templates.CALLER_VALIDATION_TEMPLATE_NAME
     return {
         "name": spec.name,
         "full_id": full_id,
@@ -3931,12 +3940,21 @@ def _task_template_discovery_payload(
         "generates_pytest": spec.generates_pytest,
         "generates_lint": spec.generates_lint,
         "generates_diff_check": spec.generates_diff_check,
+        # Only the caller-validated template is language-neutral; every
+        # built-in derives its own Python/Node validation.
+        "language_neutral": caller_validated,
+        "validation_source": "caller" if caller_validated else "template",
     }
 
 
 @mcp.tool()
 def aiworkhub_task_template_list() -> dict[str, Any]:
-    """MANAGER READ: list the bounded repository-bound template registry."""
+    """MANAGER READ: list the bounded repository-bound template registry.
+
+    The seven built-ins are followed by one extra ``custom_validation`` entry
+    (``language_neutral``, ``validation_source="caller"``) for repositories
+    in any language, e.g. C++ with MSBuild and CTest commands.
+    """
 
     return {
         "ok": True,
@@ -3947,7 +3965,10 @@ def aiworkhub_task_template_list() -> dict[str, Any]:
             _task_template_discovery_payload(
                 task_templates.resolve_template(template_id)
             )
-            for template_id in task_templates.TEMPLATE_IDS
+            for template_id in (
+                *task_templates.TEMPLATE_IDS,
+                task_templates.CALLER_VALIDATION_TEMPLATE_NAME,
+            )
         ],
     }
 
@@ -3991,13 +4012,20 @@ def aiworkhub_task_template_show(template_id: str) -> dict[str, Any]:
                 "outputs. When mandatory_changed_outputs is omitted the "
                 "template default applies: bugfix_with_regression requires "
                 "the whole write set (tests included), test_only the test "
-                "paths, docs_change the production paths, and every other "
-                "template nothing. Pass mandatory_changed_outputs explicitly "
-                "to narrow it."
+                "paths, docs_change the production paths, custom_validation "
+                "the whole write set, and every other template nothing. Pass "
+                "mandatory_changed_outputs explicitly to narrow it."
             ),
             "validation": (
-                "The template deterministically generates validation commands "
-                "and their behavioral roles."
+                "custom_validation is language-neutral and generates no "
+                "validation: pass validation and validation_roles together, "
+                "one generic role per command. C++ example, an MSBuild build "
+                "then a CTest run: validation=[\"msbuild Server.sln "
+                "/p:Configuration=Debug\", \"ctest --test-dir build -C Debug\"], "
+                "validation_roles=[\"generic\", \"generic\"]."
+                if template["language_neutral"]
+                else "The template deterministically generates validation "
+                "commands and their behavioral roles."
             ),
             "token_budget": (
                 "Tasks are uncapped by default; set max_live_tokens only from "

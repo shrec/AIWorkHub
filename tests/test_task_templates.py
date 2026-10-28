@@ -796,6 +796,37 @@ def test_custom_validation_allows_non_path_command_tokens():
     validate_custom_validation_roles(["python -m pytest -q"], ["generic"])
 
 
+def test_nf1806_custom_validation_accepts_msbuild_colon_switches():
+    validate_custom_validation_roles(
+        [
+            "msbuild Server.sln /p:Configuration=Debug /t:Build /m:4",
+            "MSBuild.exe Server.sln /p:Platform=x64",
+            "dotnet build Server.sln /p:Configuration=Release",
+            "ctest --test-dir build -C Debug",
+        ],
+        ["generic"] * 4,
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Only an MSBuild-driving head turns ``/name:value`` into a switch.
+        "cat /p:Configuration=Debug",
+        # A bare ``/name`` stays an absolute path, even after msbuild.
+        "msbuild /etc",
+        # A switch whose value carries a path still gets the path check.
+        "msbuild Server.sln /p:OutDir=/etc",
+        # A parent-directory value leaves the repository too.
+        "msbuild Server.sln /p:OutDir=..",
+        "msbuild ../secret/Server.sln /p:Configuration=Debug",
+    ],
+)
+def test_nf1806_custom_validation_keeps_absolute_paths_fail_closed(command):
+    with pytest.raises(TaskTemplateError, match="invalid_validation_embedded_path"):
+        validate_custom_validation_roles([command], ["generic"])
+
+
 def test_custom_validation_and_validation_argv_accept_pytest_node_id():
     command = "pytest tests/test_x.py::test_foo"
     assert validation_argv(command) == ["pytest", "tests/test_x.py::test_foo"]

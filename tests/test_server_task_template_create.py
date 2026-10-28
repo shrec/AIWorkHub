@@ -588,6 +588,83 @@ def test_from_template_validation_override_outside_package_gets_no_gate(
     assert stored["validation_roles"] == _BUGFIX_ROLES
 
 
+_CPP_VALIDATION = [
+    "msbuild Server.sln /p:Configuration=Debug",
+    "ctest --test-dir build -C Debug",
+]
+
+
+def test_nf1806_custom_validation_creates_cpp_card_from_template(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # NF-2026-01806: a C++/MSBuild repo must be able to create a card through
+    # the language-neutral template with its own build/test commands.
+    repo = _ready_repo(tmp_path, monkeypatch)
+    # The template's own work kind is generic, so its roles are too; launch
+    # re-expands the card and compares roles exactly.
+    roles = ["generic", "generic"]
+    result = server.aiworkhub_task_create_from_template(
+        **_from_template_kwargs(  # type: ignore[arg-type]
+            task_id="TASK_NF1806_CPP",
+            title="C++ session fix",
+            objective="Fix the session handshake",
+            template_id=task_templates.CALLER_VALIDATION_TEMPLATE_NAME,
+            production_paths=["src/net/session.cpp"],
+            test_paths=["tests/net/session_test.cpp"],
+            validation=list(_CPP_VALIDATION),
+            validation_roles=roles,
+        )
+    )
+    assert result["ok"] is True, result
+    assert result["template_provenance"]["template_name"] == "custom_validation"
+    stored = task_store.get_task(repo, "TASK_NF1806_CPP")
+    assert stored is not None
+    assert stored["validation"] == _CPP_VALIDATION
+    assert stored["validation_roles"] == roles
+    assert not any(
+        "pytest" in command or "ruff" in command for command in stored["validation"]
+    )
+    assert stored["allowed_writes"] == [
+        "src/net/session.cpp",
+        "tests/net/session_test.cpp",
+    ]
+
+
+def test_nf1806_template_list_discovers_custom_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _ready_repo(tmp_path, monkeypatch)
+    templates = server.aiworkhub_task_template_list()["templates"]
+    by_name = {item["name"]: item for item in templates}
+    entry = by_name["custom_validation"]
+    assert entry["language_neutral"] is True
+    assert entry["validation_source"] == "caller"
+    assert entry["full_id"] == task_templates.template_full_id("custom_validation")
+    assert entry["generates_pytest"] is False
+    assert entry["generates_lint"] is False
+    # The seven built-ins stay exactly TEMPLATE_IDS and carry no caller flag.
+    assert task_templates.CALLER_VALIDATION_TEMPLATE_NAME not in (
+        task_templates.TEMPLATE_IDS
+    )
+    for name in task_templates.TEMPLATE_IDS:
+        assert by_name[name]["language_neutral"] is False
+        assert by_name[name]["validation_source"] == "template"
+
+
+def test_nf1806_custom_validation_show_names_cpp_example(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _ready_repo(tmp_path, monkeypatch)
+    shown = server.aiworkhub_task_template_show("custom_validation")
+    assert shown["ok"] is True
+    assert shown["template"]["language_neutral"] is True
+    validation_guidance = shown["creation_guidance"]["validation"]
+    assert "MSBuild" in validation_guidance
+    assert "CTest" in validation_guidance
+    for command in _CPP_VALIDATION:
+        assert command in validation_guidance
+
+
 def test_task_template_list_is_deterministic_and_repository_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -602,12 +679,13 @@ def test_task_template_list_is_deterministic_and_repository_bound(
     assert first["repository"] == core.repository_current()
     assert first["repository"]["repo_id"]
     templates = first["templates"]
-    assert [item["name"] for item in templates] == list(
-        task_templates.TEMPLATE_IDS
-    )
+    listed = [
+        *task_templates.TEMPLATE_IDS,
+        task_templates.CALLER_VALIDATION_TEMPLATE_NAME,
+    ]
+    assert [item["name"] for item in templates] == listed
     assert [item["full_id"] for item in templates] == [
-        task_templates.template_full_id(name)
-        for name in task_templates.TEMPLATE_IDS
+        task_templates.template_full_id(name) for name in listed
     ]
 
 
