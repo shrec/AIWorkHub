@@ -658,6 +658,7 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "worker_workspace.py",
         # ...and its rework-delta artifact block, re-exported at module end (NF-2026-01757).
         "rework_delta_artifact.py",
+        "linux_kernel_abi.py",
         # worker_workspace imports its C/C++ include-seed helpers from here
         # (NF-2026-01156-RATCHET).
         "worker_workspace_include_seed.py",
@@ -867,6 +868,7 @@ def test_worker_workspace_binds_platform_helpers_after_runtime_temp_closure(
     destination_package.mkdir()
     for name in (
         "_platform_process.py",
+        "linux_kernel_abi.py",
         "platform_io.py",
         "runtime_temp.py",
         "windows_file_structures.py",
@@ -1131,6 +1133,7 @@ def test_package_runtime_temp_loader_rejects_missing_private_support_without_top
     for name in (
         "__init__.py",
         "_version.py",
+        "linux_kernel_abi.py",
         "platform_io.py",
         "runtime_temp.py",
         "worker_workspace.py",

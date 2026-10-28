@@ -46,6 +46,12 @@ if TYPE_CHECKING:
     from .promotion_merge import ReworkRebase
     from .toolchain_authority import AuthoritySnapshot
 
+if __package__:
+    from .linux_kernel_abi import (
+        _LandlockPathBeneathAttr, _LandlockRulesetAttr, _OpenHow,
+        _SeccompData, _SeccompNotif, _SeccompNotifResp,
+    )
+
 
 # ``VALIDATION_FAILED`` / ``VALIDATION_ENVIRONMENT_BLOCKED`` name the two terminal
 # states this module's ``ValidationRunError`` hierarchy carries at class-definition
@@ -202,6 +208,11 @@ if __package__:
     from . import platform_io as _platform_io
 else:
     _platform_io = sys.modules["aiworkhub.platform_io"]
+    # _load_runtime_temp installed the aiworkhub package over this directory.
+    from aiworkhub.linux_kernel_abi import (
+        _LandlockPathBeneathAttr, _LandlockRulesetAttr, _OpenHow,
+        _SeccompData, _SeccompNotif, _SeccompNotifResp,
+    )
 atomic_replace = _platform_io.atomic_replace
 chmod_fd = _platform_io.chmod_fd
 chmod_path = _platform_io.chmod_path
@@ -638,17 +649,6 @@ class WorkerWorkspace:
 class TrustedValidationExecutable:
     path: Path
     root: Path
-
-
-class _LandlockRulesetAttr(ctypes.Structure):
-    _fields_ = [("handled_access_fs", ctypes.c_uint64)]
-
-
-class _LandlockPathBeneathAttr(ctypes.Structure):
-    _fields_ = [
-        ("allowed_access", ctypes.c_uint64),
-        ("parent_fd", ctypes.c_int32),
-    ]
 
 
 def _terminate_git_process_tree(process: subprocess.Popen[str]) -> bool:
@@ -9406,14 +9406,6 @@ _SECCOMP_NOTIFY_MIN_API = 5
 _SECCOMP_NOTIFY_RUNTIME_SUPPORTED: bool | None = None
 
 
-class _OpenHow(ctypes.Structure):
-    _fields_ = [
-        ("flags", ctypes.c_uint64),
-        ("mode", ctypes.c_uint64),
-        ("resolve", ctypes.c_uint64),
-    ]
-
-
 def _openat2_beneath(dir_fd: int, relative: str, flags: int) -> int:
     """Open ``relative`` strictly beneath ``dir_fd`` with no symlink traversal.
 
@@ -9473,33 +9465,6 @@ def _openat2_available() -> bool:
         return False
     os.close(int(fd))
     return True
-
-
-class _SeccompData(ctypes.Structure):
-    _fields_ = [
-        ("nr", ctypes.c_int32),
-        ("arch", ctypes.c_uint32),
-        ("instruction_pointer", ctypes.c_uint64),
-        ("args", ctypes.c_uint64 * 6),
-    ]
-
-
-class _SeccompNotif(ctypes.Structure):
-    _fields_ = [
-        ("id", ctypes.c_uint64),
-        ("pid", ctypes.c_uint32),
-        ("flags", ctypes.c_uint32),
-        ("data", _SeccompData),
-    ]
-
-
-class _SeccompNotifResp(ctypes.Structure):
-    _fields_ = [
-        ("id", ctypes.c_uint64),
-        ("val", ctypes.c_int64),
-        ("error", ctypes.c_int32),
-        ("flags", ctypes.c_uint32),
-    ]
 
 
 def _seccomp_notify_library() -> Any | None:
