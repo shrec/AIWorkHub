@@ -87,6 +87,9 @@ from .process_launcher_vscode_lm_tool import (
 from .process_launcher_source_evidence import (
     quality_review_source_evidence as _quality_review_source_evidence_impl,
 )
+from .process_launcher_review_context import (
+    quality_review_caller_context as _quality_review_caller_context_impl,
+)
 from .process_launcher_workspace_gc import GcSweepSnapshot, gc_finalized_workspace as _gc_finalized_workspace_impl
 from .worktree_retention_rule import WORKTREE_RETENTION_RULE_VERSION, record_rule_version, superseded_reason
 from .launch_replay_guard import (
@@ -6044,87 +6047,9 @@ class ProcessManager:
     ) -> dict[str, Any]:
         """Read the canonical source around every graph-resolved caller line.
 
-        The rows come from the scoped audit's ``impact_evidence`` of kind
-        ``callers`` -- canonical Source Graph edges into the changed symbols.
-        They are lens-independent, so one lens's rows are read.  A caller that
-        lives in a changed path is skipped: the diff already carries that file
-        in full and the graph line would refer to the canonical bytes anyway.
-        Everything read here is canonical-tree bytes at the graph's line;
-        nothing is model prose.
+        Delegation to :func:`process_launcher_review_context.quality_review_caller_context`.
         """
-
-        def with_newline(line: str) -> str:
-            return line if line.endswith("\n") else line + "\n"
-
-        callers: dict[str, tuple[str, int]] = {}
-        for lens in sorted(scoped_audits):
-            wrapper = scoped_audits[lens]
-            scope = wrapper.get("packet") if isinstance(wrapper, Mapping) else None
-            if not isinstance(scope, Mapping):
-                continue
-            for entry in scope.get("impact_evidence") or []:
-                if not isinstance(entry, Mapping) or entry.get("evidence_kind") != "callers":
-                    continue
-                identity = str(entry.get("identity") or "")
-                path = str(entry.get("path") or "")
-                line = entry.get("line_start")
-                if (
-                    not identity
-                    or not path
-                    or path.startswith("/")
-                    or ".." in path.split("/")
-                    or type(line) is not int
-                    or line < 1
-                    or path in changed_hashes
-                ):
-                    continue
-                callers.setdefault(identity, (path, line))
-            break
-        context = self._QUALITY_REVIEW_CALLER_CONTEXT_LINES
-        rows: list[dict[str, Any]] = []
-        omitted = 0
-        remaining = self._QUALITY_REVIEW_CALLER_CONTEXT_TOTAL_MAX_BYTES
-        cache: dict[str, list[str]] = {}
-        ordered = sorted(callers, key=lambda key: (callers[key][0], callers[key][1], key))
-        for identity in ordered:
-            path, line = callers[identity]
-            if len(rows) >= self._QUALITY_REVIEW_CALLER_CONTEXT_MAX_ROWS:
-                omitted += 1
-                continue
-            lines = cache.get(path)
-            if lines is None:
-                source = Path(self.repo) / path
-                try:
-                    if source.is_symlink() or not source.is_file():
-                        lines = []
-                    else:
-                        lines = source.read_bytes().decode("utf-8").splitlines(keepends=True)
-                except (OSError, UnicodeDecodeError):
-                    lines = []
-                cache[path] = lines
-            if line > len(lines):
-                omitted += 1
-                continue
-            start = max(1, line - context)
-            end = min(len(lines), line + context)
-            text = "".join(with_newline(item) for item in lines[start - 1:end])
-            size = len(text.encode("utf-8"))
-            if size > self._QUALITY_REVIEW_CALLER_CONTEXT_ROW_MAX_BYTES or size > remaining:
-                omitted += 1
-                continue
-            remaining -= size
-            rows.append(
-                {
-                    "identity": identity,
-                    "path": path,
-                    "line": line,
-                    "line_start": start,
-                    "line_end": end,
-                    "source": "canonical",
-                    "text": text,
-                }
-            )
-        return {"rows": rows, "complete": omitted == 0, "omitted": omitted}
+        return _quality_review_caller_context_impl(self, changed_hashes, scoped_audits)
 
     def _quality_review_candidate_delta(
         self,

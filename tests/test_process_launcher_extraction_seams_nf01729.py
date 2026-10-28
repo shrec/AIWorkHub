@@ -26,8 +26,9 @@ from aiworkhub import process_launcher
 from aiworkhub import process_launcher_source_evidence as source_evidence
 from aiworkhub import process_launcher_vscode_lm_tool as vscode_lm_tool
 from aiworkhub import process_launcher_workspace_gc as workspace_gc
+from aiworkhub import process_launcher_review_context as review_context
 
-PROCESS_LAUNCHER_MAX_LINES = 13529
+PROCESS_LAUNCHER_MAX_LINES = 13468
 
 # (module, function, seam tuple attribute, ProcessManager method)
 EXTRACTIONS: tuple[tuple[ModuleType, str, str, str], ...] = (
@@ -42,6 +43,12 @@ EXTRACTIONS: tuple[tuple[ModuleType, str, str, str], ...] = (
         "invoke_vscode_lm_worker_tool_bound",
         "VSCODE_LM_WORKER_TOOL_SEAM_NAMES",
         "_invoke_vscode_lm_worker_tool_bound",
+    ),
+    (
+        review_context,
+        "quality_review_caller_context",
+        "REVIEW_CONTEXT_SEAM_NAMES",
+        "_quality_review_caller_context",
     ),
 )
 EXTRACTION_IDS = [entry[1] for entry in EXTRACTIONS]
