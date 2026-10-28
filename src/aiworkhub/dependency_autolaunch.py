@@ -748,7 +748,7 @@ def _request_id(parent_task_id: str, child_task_id: str) -> str:
     return f"dependency-autolaunch:{parent_task_id}:{child_task_id}"
 
 
-# NF-2026-01777: server startup and the accept hook wire ``core.claim_start_exact``
+# NF-2026-01777: server startup and the accept hook wired ``core.claim_start_exact``
 # in as ``launch``.  That call only moves the card to processing/claimed and
 # spawns no worker, yet its ``ok`` was reported as launched: the claim then sat
 # until the dead-process reconciler blocked it ``launch_never_started``.  A
@@ -758,11 +758,56 @@ def _request_id(parent_task_id: str, child_task_id: str) -> str:
 # released back to pending/unclaimed with the reason recorded.
 LAUNCH_NOT_STARTED = "launch_not_started"
 
+# NF-2026-01780: refusing the bare claim left every dependency-ready child for a
+# manager to launch by hand.  Both production call sites now pass
+# ``launch_registered``, which forwards to the worker launcher the MCP server
+# registers at startup (claim + spawn, the ``aiworkhub_agent_launch_task``
+# path).  Nothing registered -- the CLI, the test suite -- is refused up front
+# exactly like the bare claim, so no card is ever claimed without a spawner.
+# One registration point keeps ``core`` free of a ``process_launcher`` import.
+_registered_launch: LaunchFn | None = None
+NO_WORKER_LAUNCHER = "no_worker_launcher_registered"
 
-def _is_bare_claim_launch(launch: LaunchFn) -> bool:
+
+def register_launcher(launch: LaunchFn | None) -> None:
+    """Install (or, with ``None``, remove) the process-spawning ``LaunchFn``."""
+    global _registered_launch
+    _registered_launch = launch
+
+
+def launch_registered(task_id: str, runner: str, topic: str, request_id: str) -> Mapping[str, Any]:
+    """The ``LaunchFn`` production passes: the registered worker launcher."""
+    launch = _registered_launch
+    if launch is None:
+        return {"ok": False, "stderr": NO_WORKER_LAUNCHER}
+    return launch(task_id, runner, topic, request_id)
+
+
+def spawn_receipt(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Map a ``ProcessManager.launch`` reply onto this module's launch result.
+
+    ``ok`` stays ``ok`` only with ``process_started`` set from the reply itself:
+    a pid, or a running execution (the provider-free validation replay reports
+    ``state: running`` with no pid).  An ``ok`` reply proving neither is
+    ``process_started: False``, so the NF-2026-01777 guard releases the claim
+    the launcher made under its own ``request_id``.
+    """
+    if not result.get("ok"):
+        reason = result.get("blocked_reason") or result.get("stderr") or result.get("error")
+        return {"ok": False, "stderr": str(reason or "launch_refused_without_reason")}
+    started = bool(result.get("pid")) or result.get("state") == "running"
+    return {**result, "process_started": started}
+
+
+def _unspawnable_launch_detail(launch: LaunchFn) -> str:
+    """Name why ``launch`` can never spawn a worker, or ``""`` when it can."""
     from . import core
 
-    return launch is core.claim_start_exact
+    if launch is core.claim_start_exact:
+        return "launch_callable_claims_without_spawning_a_worker"
+    if launch is launch_registered and _registered_launch is None:
+        return NO_WORKER_LAUNCHER
+    return ""
 
 
 def _launch_spawned_no_worker(result: Mapping[str, Any]) -> bool:
@@ -1275,22 +1320,25 @@ def reconcile(
         if capacity is not None and launched_count >= capacity:
             outcome["delayed"].append({"task_id": child.task_id, "reason": "capacity"})
             continue
-        if _is_bare_claim_launch(launch):
+        unspawnable = _unspawnable_launch_detail(launch)
+        if unspawnable:
             # NF-2026-01777: claiming here would strand a card no worker runs.
             outcome["delayed"].append(
                 {
                     "task_id": child.task_id,
                     "reason": LAUNCH_NOT_STARTED,
-                    "detail": "launch_callable_claims_without_spawning_a_worker",
+                    "detail": unspawnable,
                 }
             )
             continue
         request_id = _request_id(trigger_task_id, child.task_id)
         result = dict(launch(child.task_id, child.runner, child.topic, request_id))
         if result.get("ok") and _launch_spawned_no_worker(result):
+            # A real launcher claims under the request id it minted and reports.
+            claim_request_id = str(result.get("request_id") or request_id)
             with _write_connection(db) as conn:
                 conn.execute("BEGIN IMMEDIATE")
-                released = _release_unstarted_claim(conn, child.task_id, request_id)
+                released = _release_unstarted_claim(conn, child.task_id, claim_request_id)
                 hold_state = _record_denial(
                     conn, child, f"{LAUNCH_NOT_STARTED}:claim_without_worker"
                 )

@@ -4187,6 +4187,26 @@ def aiworkhub_task_mark_done(task_id: str, include_card: CardInclude = "none") -
     )
 
 
+def _dependency_autolaunch_launch(
+    task_id: str, runner: str, topic: str, request_id: str
+) -> dict[str, Any]:
+    """NF-2026-01780: dependency autolaunch's ``LaunchFn`` over the real spawn.
+
+    The same claim + spawn ``aiworkhub_agent_launch_task`` runs, under the
+    card's runner and topic.  ``request_id`` names the reconcile attempt only:
+    the launcher mints and reports the worker's own.  Behind the closed launch
+    gate nothing is claimed or spawned and the child is held as a denial.
+    """
+    del request_id
+    if not process_launcher.launch_gates_open():
+        return {"ok": False, "stderr": "dual_gate_closed: require AIWORKHUB_ALLOW_LAUNCH=1 and AIWORKHUB_ALLOW_WRITES=1"}
+    try:
+        result = process_launcher.default_manager().launch(task_id=task_id, runner=runner, topic=topic)
+    except Exception as exc:  # noqa: BLE001 -- one bad spawn must not abort mark_done or the pass
+        return {"ok": False, "stderr": f"launch_raised:{type(exc).__name__}"}
+    return dependency_autolaunch.spawn_receipt(result)
+
+
 @mcp.tool()
 @_serialize_task_lifecycle_write
 def aiworkhub_task_dependency_autolaunch_reconcile(capacity: int | None = None) -> dict[str, Any]:
@@ -4199,7 +4219,7 @@ def aiworkhub_task_dependency_autolaunch_reconcile(capacity: int | None = None) 
     if not core.writes_allowed():
         return {"ok": False, "error": "write_gate_closed"}
     return dependency_autolaunch.reconcile_startup(
-        core.repo_root(), core.claim_start_exact, capacity=capacity
+        core.repo_root(), _dependency_autolaunch_launch, capacity=capacity
     )
 
 
@@ -7208,6 +7228,9 @@ def main() -> None:
     # is exactly what stalls this server on Windows.
     _detach_inheritable_stdin()
     root = core.repo_root()
+    # NF-2026-01780: the one registration point -- mark_done's accept hook
+    # launches dependency-ready children through this server's real launcher.
+    dependency_autolaunch.register_launcher(_dependency_autolaunch_launch)
     # Additive schema migration for repositories created before NeedFix was
     # introduced. This runs before any read-only dashboard/list call so those
     # surfaces remain truthful and do not need hidden write side effects.

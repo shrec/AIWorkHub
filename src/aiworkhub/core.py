@@ -5820,7 +5820,7 @@ def mark_done(task_id: str, runner: str | None = None, topic: str | None = None)
     except Exception as exc:  # noqa: BLE001 -- refresh must never fail mark_done
         result["source_graph_refresh"] = {"ok": False, "error": f"{type(exc).__name__}:{exc}"[:200]}
     result["dependency_autolaunch"] = dependency_autolaunch.reconcile_after_accept(
-        repo_root(), task_id, claim_start_exact
+        repo_root(), task_id, dependency_autolaunch.launch_registered
     )
     _reconcile_retained_workspaces(result)
     return result

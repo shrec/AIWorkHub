@@ -103,7 +103,8 @@ def _state(repo: Path, task_id: str):
 def test_mark_done_hook_is_production_connected_to_reconciler_and_claim_start_path():
     core_source = (SRC / "aiworkhub" / "core.py").read_text(encoding="utf-8")
     assert "dependency_autolaunch.reconcile_after_accept" in core_source
-    assert "claim_start_exact" in core_source
+    # NF-2026-01780: the registered worker launcher (claim + spawn), never the bare claim.
+    assert "dependency_autolaunch.launch_registered" in core_source
     assert "result[\"dependency_autolaunch\"]" in core_source
 
 
