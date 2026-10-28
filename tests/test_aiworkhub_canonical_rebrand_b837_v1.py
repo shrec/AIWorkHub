@@ -43,7 +43,7 @@ def test_environment_state_and_instruction_policy_are_canonical() -> None:
     assert "AIWORKHUB_REPO_ROOT" in repository_state
     assert "AIWorkHub MCP tool-use policy" in instructions
     assert "Source Graph is required for code tasks." in instructions
-    assert "Stop at Codex review." in instructions
+    assert "Stop at manager review." in instructions
     assert "aiworkhub_worker_source_graph_query" in instructions
 
 

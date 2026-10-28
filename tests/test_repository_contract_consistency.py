@@ -46,7 +46,7 @@ def test_repository_root_regression_fails_on_projection_drift(tmp_path: Path) ->
     drifted_path = tmp_path / drifted_provider
     drifted_text = drifted_path.read_text(encoding="utf-8")
     corrupted = drifted_text.replace(
-        "Stop at Codex review.", "Stop at Codex review, unless owner overrides."
+        "Stop at manager review.", "Stop at manager review, unless owner overrides."
     )
     assert corrupted != drifted_text
     drifted_path.write_text(corrupted, encoding="utf-8")

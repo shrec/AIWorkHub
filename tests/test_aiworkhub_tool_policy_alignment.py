@@ -32,7 +32,7 @@ def write_policy_tree_with_host_prose(tmp_path: Path) -> dict[Path, tuple[bytes,
         Path("CLAUDE.md"): (b"claude prefix\n", b"\nclaude suffix\n"),
         Path(".github/copilot-instructions.md"): (b"copilot prefix\n", b"\ncopilot suffix\n"),
     }
-    drifted = policy_sync.generated_block(canonical.replace(b"Stop at Codex review.\n", b"Stop at drift review.\n"))
+    drifted = policy_sync.generated_block(canonical.replace(b"Stop at manager review.\n", b"Stop at drift review.\n"))
     for relative_path, (prefix, suffix) in surrounding.items():
         destination = tmp_path / relative_path
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -58,7 +58,7 @@ def test_check_detects_drift_without_writing(tmp_path: Path) -> None:
 
     drifted_path = tmp_path / policy_sync.HOST_FILES[0]
     original = drifted_path.read_bytes()
-    drifted_path.write_bytes(original.replace(b"Stop at Codex review.", b"Stop at manager review."))
+    drifted_path.write_bytes(original.replace(b"Stop at manager review.", b"Stop at drift review."))
 
     errors = policy_sync.check(tmp_path)
 
@@ -234,7 +234,7 @@ def test_sync_preserves_host_file_mode(tmp_path: Path, monkeypatch) -> None:
 
     drifted_path = tmp_path / policy_sync.HOST_FILES[0]
     original = drifted_path.read_bytes()
-    drifted = original.replace(b"Stop at Codex review.", b"Stop at manager review.")
+    drifted = original.replace(b"Stop at manager review.", b"Stop at drift review.")
     drifted_path.unlink()
     fd = policy_sync.open_new_staged_file(drifted_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     with os.fdopen(fd, "wb") as drifted_file:
@@ -476,7 +476,7 @@ def test_check_reports_docs_canonical_drift_and_sync_regenerates_it(tmp_path: Pa
     source_path = tmp_path / policy_sync.POLICY_SOURCE
     rendered = policy_sync.rendered_canonical()
     assert source_path.read_bytes() == rendered
-    source_path.write_bytes(rendered.replace(b"Stop at Codex review.", b"Stop at drift review."))
+    source_path.write_bytes(rendered.replace(b"Stop at manager review.", b"Stop at drift review."))
 
     assert policy_sync.check(tmp_path) == [
         f"{policy_sync.POLICY_SOURCE}: canonical policy source differs from agent_tool_instructions.render_canonical()"
@@ -582,7 +582,7 @@ def test_sync_preflights_all_hosts_before_writing(tmp_path: Path) -> None:
     originals = {relative_path: (tmp_path / relative_path).read_bytes() for relative_path in policy_sync.HOST_FILES}
 
     first_host = tmp_path / policy_sync.HOST_FILES[0]
-    first_host.write_bytes(originals[policy_sync.HOST_FILES[0]].replace(b"Stop at Codex review.", b"Stop at manager review."))
+    first_host.write_bytes(originals[policy_sync.HOST_FILES[0]].replace(b"Stop at manager review.", b"Stop at drift review."))
     originals[policy_sync.HOST_FILES[0]] = first_host.read_bytes()
 
     malformed_host = tmp_path / policy_sync.HOST_FILES[2]
@@ -610,7 +610,7 @@ def test_sync_requires_write_gate_before_mutating_valid_drift(tmp_path: Path, mo
 
     drifted_path = tmp_path / policy_sync.HOST_FILES[0]
     original = drifted_path.read_bytes()
-    drifted_path.write_bytes(original.replace(b"Stop at Codex review.", b"Stop at manager review."))
+    drifted_path.write_bytes(original.replace(b"Stop at manager review.", b"Stop at drift review."))
     drifted = drifted_path.read_bytes()
 
     try:
@@ -662,7 +662,7 @@ def test_sync_rolls_back_all_hosts_after_second_staged_write_failure(
     for relative_path in policy_sync.HOST_FILES:
         path = tmp_path / relative_path
         original = path.read_bytes()
-        path.write_bytes(original.replace(b"Stop at Codex review.", b"Stop at manager review."))
+        path.write_bytes(original.replace(b"Stop at manager review.", b"Stop at drift review."))
         originals[relative_path] = path.read_bytes()
 
     real_replace = policy_sync.os.replace
@@ -712,7 +712,7 @@ def test_sync_rollback_rename_fallback_never_clobbers_a_recreated_host(
     monkeypatch.setenv(policy_sync.WRITE_GATE_ENV, "1")
     for relative_path in policy_sync.HOST_FILES:
         path = tmp_path / relative_path
-        path.write_bytes(path.read_bytes().replace(b"Stop at Codex review.", b"Stop at manager review."))
+        path.write_bytes(path.read_bytes().replace(b"Stop at manager review.", b"Stop at drift review."))
 
     real_replace = policy_sync.os.replace
     host_names = {relative_path.name for relative_path in policy_sync.HOST_FILES}
@@ -757,12 +757,12 @@ def test_sync_rollback_preserves_concurrent_edit_after_applied_host_changes(
     for relative_path in policy_sync.HOST_FILES:
         path = tmp_path / relative_path
         original = path.read_bytes()
-        path.write_bytes(original.replace(b"Stop at Codex review.", b"Stop at manager review."))
+        path.write_bytes(original.replace(b"Stop at manager review.", b"Stop at drift review."))
         originals[relative_path] = path.read_bytes()
 
     first_host = tmp_path / policy_sync.HOST_FILES[0]
     concurrent = originals[policy_sync.HOST_FILES[0]].replace(
-        b"Stop at manager review.", b"Stop at concurrent review."
+        b"Stop at drift review.", b"Stop at concurrent review."
     )
     host_names = {relative_path.name for relative_path in policy_sync.HOST_FILES}
     staged_write_count = 0
@@ -847,8 +847,8 @@ def test_sync_rejects_concurrent_host_edit_before_backup_without_overwriting(
     host = policy_sync.HOST_FILES[0]
     host_path = tmp_path / host
     original = host_path.read_bytes()
-    drifted = original.replace(b"Stop at Codex review.", b"Stop at manager review.")
-    concurrent = original.replace(b"Stop at Codex review.", b"Stop at concurrent review.")
+    drifted = original.replace(b"Stop at manager review.", b"Stop at drift review.")
+    concurrent = original.replace(b"Stop at manager review.", b"Stop at concurrent review.")
     host_path.write_bytes(drifted)
     replacement_path = tmp_path / "replacement.md"
     replacement_path.write_bytes(concurrent)
@@ -892,7 +892,7 @@ def test_sync_cleans_staged_temp_when_backup_reservation_fails(
     host = policy_sync.HOST_FILES[0]
     host_path = tmp_path / host
     original = host_path.read_bytes()
-    drifted = original.replace(b"Stop at Codex review.", b"Stop at manager review.")
+    drifted = original.replace(b"Stop at manager review.", b"Stop at drift review.")
     host_path.write_bytes(drifted)
 
     def fail_backup_reservation(path: Path):
@@ -920,7 +920,7 @@ def test_sync_cleans_staged_temp_when_backup_reservation_raises_oserror(
     host = policy_sync.HOST_FILES[0]
     host_path = tmp_path / host
     original = host_path.read_bytes()
-    drifted = original.replace(b"Stop at Codex review.", b"Stop at manager review.")
+    drifted = original.replace(b"Stop at manager review.", b"Stop at drift review.")
     host_path.write_bytes(drifted)
 
     def fail_backup_reservation(path: Path):
@@ -948,7 +948,7 @@ def test_sync_does_not_delete_replaced_staged_temp_after_backup_reservation_fail
     host = policy_sync.HOST_FILES[0]
     host_path = tmp_path / host
     original = host_path.read_bytes()
-    drifted = original.replace(b"Stop at Codex review.", b"Stop at manager review.")
+    drifted = original.replace(b"Stop at manager review.", b"Stop at drift review.")
     host_path.write_bytes(drifted)
     attacker_data = b"attacker replacement\n"
 
@@ -988,8 +988,8 @@ def test_sync_rejects_host_swap_between_fd_read_and_path_snapshot_without_overwr
     host = policy_sync.HOST_FILES[0]
     host_path = tmp_path / host
     original = host_path.read_bytes()
-    drifted = original.replace(b"Stop at Codex review.", b"Stop at manager review.")
-    concurrent = original.replace(b"Stop at Codex review.", b"Stop at concurrent review.")
+    drifted = original.replace(b"Stop at manager review.", b"Stop at drift review.")
+    concurrent = original.replace(b"Stop at manager review.", b"Stop at concurrent review.")
     host_path.write_bytes(drifted)
     replacement_path = tmp_path / "replacement.md"
     replacement_path.write_bytes(concurrent)
@@ -1026,7 +1026,7 @@ def test_sync_succeeds_when_final_backup_cleanup_fails(tmp_path: Path, monkeypat
     for relative_path in policy_sync.HOST_FILES:
         path = tmp_path / relative_path
         original = path.read_bytes()
-        path.write_bytes(original.replace(b"Stop at Codex review.", b"Stop at manager review."))
+        path.write_bytes(original.replace(b"Stop at manager review.", b"Stop at drift review."))
         originals[relative_path] = original
 
     real_authenticated_unlink = policy_sync.authenticated_unlink
@@ -1061,7 +1061,7 @@ def test_sync_does_not_follow_existing_staged_path_symlink(tmp_path: Path, monke
 
     drifted_path = tmp_path / policy_sync.HOST_FILES[0]
     original = drifted_path.read_bytes()
-    drifted_path.write_bytes(original.replace(b"Stop at Codex review.", b"Stop at manager review."))
+    drifted_path.write_bytes(original.replace(b"Stop at manager review.", b"Stop at drift review."))
 
     victim_path = tmp_path / "victim"
     victim_data = b"do not overwrite\n"
@@ -1090,7 +1090,7 @@ def test_sync_rejects_swapped_staged_temp_before_install_without_altering_host(
     host = policy_sync.HOST_FILES[0]
     host_path = tmp_path / host
     original = host_path.read_bytes()
-    host_path.write_bytes(original.replace(b"Stop at Codex review.", b"Stop at manager review."))
+    host_path.write_bytes(original.replace(b"Stop at manager review.", b"Stop at drift review."))
     drifted = host_path.read_bytes()
 
     victim_path = tmp_path / "victim"
@@ -1141,7 +1141,7 @@ def test_sync_rejects_swapped_staged_symlink_to_hardlink_without_nofollow(
     host = policy_sync.HOST_FILES[0]
     host_path = tmp_path / host
     original = host_path.read_bytes()
-    host_path.write_bytes(original.replace(b"Stop at Codex review.", b"Stop at manager review."))
+    host_path.write_bytes(original.replace(b"Stop at manager review.", b"Stop at drift review."))
     drifted = host_path.read_bytes()
 
     staged_paths = []
@@ -1229,7 +1229,7 @@ def test_sync_refuses_to_replace_host_symlink(tmp_path: Path, monkeypatch) -> No
     host = policy_sync.HOST_FILES[0]
     host_path = tmp_path / host
     target_path = tmp_path / "host-target.md"
-    target_original = host_path.read_bytes().replace(b"Stop at Codex review.", b"Stop at manager review.")
+    target_original = host_path.read_bytes().replace(b"Stop at manager review.", b"Stop at drift review.")
     target_path.write_bytes(target_original)
     host_path.unlink()
     host_path.symlink_to(target_path)
@@ -1261,7 +1261,7 @@ def test_sync_rejects_symlinked_parent_directory_without_modifying_external_vict
     victim_original = (
         b"external prefix\n"
         + policy_sync.generated_block(
-            canonical.replace(b"Stop at Codex review.\n", b"Stop at external victim review.\n")
+            canonical.replace(b"Stop at manager review.\n", b"Stop at external victim review.\n")
         )
         + b"\nexternal suffix\n"
     )
@@ -1287,7 +1287,7 @@ def test_sync_writes_after_explicit_write_gate(tmp_path: Path, monkeypatch) -> N
 
     drifted_path = tmp_path / policy_sync.HOST_FILES[0]
     original = drifted_path.read_bytes()
-    drifted_path.write_bytes(original.replace(b"Stop at Codex review.", b"Stop at manager review."))
+    drifted_path.write_bytes(original.replace(b"Stop at manager review.", b"Stop at drift review."))
 
     changed = policy_sync.sync(tmp_path)
 

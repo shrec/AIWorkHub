@@ -37,7 +37,7 @@ from . import runtime_adapters
 # NF-2026-00294 then added the shared "Multicore by default:" principle to the
 # same canonical POLICY (so AGENTS.md, CLAUDE.md and copilot all carry it, not
 # just the Claude preamble). Again nothing was cut -- the principle is five new
-# lines appended before "Stop at Codex review."; every prior rule renders
+# lines appended before "Stop at manager review."; every prior rule renders
 # verbatim. The render measured before/after:
 #   canonical 5484 -> 6211, AGENTS.md 5582 -> 6309, copilot 5604 -> 6331,
 #   CLAUDE.md 7338 -> 8065 bytes.
@@ -300,7 +300,7 @@ POLICY = ToolPolicy(
         "Threads for IO-bound work that releases the GIL, processes for CPU-bound work, chosen from a measurement, not a rule of thumb.",
         "A path left sequential after measurement is a valid outcome; the recorded measurement is what justifies it.",
     ),
-    finish="Stop at Codex review.",
+    finish="Stop at manager review.",
 )
 
 

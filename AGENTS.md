@@ -92,5 +92,5 @@ Multicore by default:
 - Parallelism changes only how fast, never what is measured or produced; results stay identical to the sequential path.
 - Threads for IO-bound work that releases the GIL, processes for CPU-bound work, chosen from a measurement, not a rule of thumb.
 - A path left sequential after measurement is a valid outcome; the recorded measurement is what justifies it.
-Stop at Codex review.
+Stop at manager review.
 <!-- AIWORKHUB_TOOL_USE_POLICY_END -->

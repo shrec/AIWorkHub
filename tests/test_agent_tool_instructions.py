@@ -116,7 +116,7 @@ def test_no_existing_protocol_rule_was_removed_or_weakened() -> None:
         assert rule in text, rule
     for forbidden in ("grep", "rg", "find", "tree", "broad cat/sed", "recursive listing"):
         assert forbidden in text
-    assert text.rstrip().endswith("Stop at Codex review.")
+    assert text.rstrip().endswith("Stop at manager review.")
 
 
 def test_three_provider_projections_derive_from_same_policy_and_stay_bounded() -> None:
