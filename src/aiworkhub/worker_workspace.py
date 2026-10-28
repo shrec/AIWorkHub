@@ -7353,12 +7353,12 @@ def provision_validation_exec_scratch(
         if request_boundary is not None:
             candidate_roots.insert(0, request_boundary)
     if backend == WINDOWS_APPCONTAINER_BACKEND:
-        # NF-2026-01341: the container is granted temp only inside its sandbox
-        # root, and the request directory must keep holding only ``worktree``
-        # and ``home`` (``_appcontainer_request_root``).  The repository temp
-        # sits outside every root, so the shared ``...\AC\Temp`` would win.
-        # ``bind_validation_helper_temp`` shortens a too-deep result.
+        # NF-2026-01341: only home is granted inside the sandbox root; the request
+        # dir keeps only ``worktree``/``home``.  NF-2026-01795: an authenticated
+        # home takes the short leaf so a union2 probe stays under MAX_PATH.
         candidate_roots = [workspace.home]
+        if request_boundary is not None:
+            windows_short_leaf_roots.add(workspace.home.resolve())
     elif windows_default_scratch and repo_temp_validation is not None:
         # Windows needs no system-temp executable mount. Prefer the existing
         # repository authority over the much deeper union2 request boundary.

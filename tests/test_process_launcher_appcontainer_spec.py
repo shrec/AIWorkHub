@@ -2931,6 +2931,49 @@ def test_appcontainer_validation_scratch_lives_under_the_request_home(
         worker_workspace.cleanup_validation_exec_scratch(scratch)
 
 
+def test_appcontainer_union2_validation_scratch_takes_the_short_home_leaf(
+    tmp_path: Path, monkeypatch
+) -> None:
+    r"""NF-2026-01795: under the authenticated request home the long
+    ``aiworkhub_validation_exec_<union2 id>`` leaf plus the ``.exe`` probe
+    passed MAX_PATH (WinError 206 -> ``noexec``); the short leaf must win."""
+    monkeypatch.delenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False)
+    monkeypatch.setattr(worker_workspace, "is_windows", lambda *_a, **_k: True)
+    # The fixture root may already be deep; the leaf choice, not the host's
+    # MAX_PATH policy, is under test, so the probe only records its directory.
+    probed: list[Path] = []
+    monkeypatch.setattr(
+        worker_workspace, "_probe_exec_capable_dir", lambda d: probed.append(d) or True
+    )
+    request_id = "union2_" + "a" * 32 + "_" + "0123456789abcdef"
+    repo = tmp_path / ("r" * max(1, 90 - len(str(tmp_path)) - 1))
+    request_dir = _sandbox_request_dir(repo, request_id)
+    worktree, home = request_dir / "worktree", request_dir / "home"
+    worktree.mkdir(parents=True)
+    home.mkdir()
+    workspace = SimpleNamespace(
+        request_id=request_id, repo=repo, path=worktree, home=home
+    )
+
+    scratch = worker_workspace.provision_validation_exec_scratch(
+        workspace, backend=worker_workspace.WINDOWS_APPCONTAINER_BACKEND
+    )
+    try:
+        assert len(str(repo)) >= 90
+        assert scratch == home.resolve() / f"vx_{request_id[-12:]}"
+        assert scratch.parent == home.resolve()
+        assert probed == [scratch]
+        assert sorted(os.listdir(request_dir)) == ["home", "worktree"]
+        # Measure the path as production lays it out under a 96-char repo root.
+        root = str(repo.resolve())
+        assert str(scratch).startswith(root)
+        padded = "r" * 96 + str(scratch)[len(root):]
+        probe = "\\.exec_probe_" + "0" * 32 + ".exe"
+        assert len(padded) + len(probe) < 260
+    finally:
+        worker_workspace.cleanup_validation_exec_scratch(scratch)
+
+
 def test_appcontainer_validation_starts_a_non_python_command_under_the_trampoline(
     tmp_path: Path, monkeypatch, identity_osfhandle
 ) -> None:
