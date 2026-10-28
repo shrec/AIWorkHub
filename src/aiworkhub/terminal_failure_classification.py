@@ -3015,6 +3015,29 @@ _SUBSTATUS_CAUSE: dict[str, str] = {
     "timed_out": CAUSE_TIMEOUT,
     "cancelled": CAUSE_CANCELLED,
     "canceled": CAUSE_CANCELLED,
+    # RM-2026-00015: every other ``task_fsm.KNOWN_TERMINAL_SUBSTATUSES`` member
+    # is named here by judgement, never left to fall through by omission.
+    # Direct entries rather than group members, so the published groups (and
+    # ``learning_commit``'s infrastructure projection of them) stay unchanged.
+    # Each agrees with the ``_REASON_CAUSE`` entry of the same name, if any.
+    "token_budget_exceeded": CAUSE_POLICY_BUDGET,
+    "scope_rejected": CAUSE_CANDIDATE_SCOPE,
+    "required_output_unchanged": CAUSE_CANDIDATE_REQUIRED_OUTPUT,
+    # The candidate exists; only the promotion/finalizer bookkeeping lost.
+    "promotion_conflict": CAUSE_CALLBACK_CONFLICT,
+    "finalize_abandoned": CAUSE_CALLBACK_CONFLICT,
+    "dependency_blocked": CAUSE_DEPENDENCY_UNAVAILABLE,
+    # The worker went away without a handoff -- worker_failed/process_lost
+    # shaped, so a manager decides rather than a relaunch.
+    "exited_without_review": CAUSE_PROVIDER_RUNTIME_UNCLASSIFIED,
+    "stale": CAUSE_PROVIDER_RUNTIME_UNCLASSIFIED,
+    # Deliberately no cause: a bare process exit, the canonical ``blocked``
+    # bucket and AIWorkHub's own monitor failing say nothing about the work,
+    # the provider or the environment. The lookup below treats these as
+    # unestablished, so their evidence authority stays ``none``.
+    "exited": CAUSE_NOT_ESTABLISHED,
+    "blocked": CAUSE_NOT_ESTABLISHED,
+    "monitor_error": CAUSE_NOT_ESTABLISHED,
 }
 
 # A sealed provider receipt's machine code. Split where the old learning table
@@ -3337,7 +3360,7 @@ def failure_disposition_from_substatus(
             terminal_state=substatus,
         )
 
-    if substatus in _SUBSTATUS_CAUSE:
+    if _SUBSTATUS_CAUSE.get(substatus, CAUSE_NOT_ESTABLISHED) != CAUSE_NOT_ESTABLISHED:
         named_state = next(key for key in _SUBSTATUS_CAUSE if key == substatus)
         return _typed_disposition(
             cause=_SUBSTATUS_CAUSE[named_state],
