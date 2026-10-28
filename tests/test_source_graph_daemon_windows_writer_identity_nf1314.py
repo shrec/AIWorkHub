@@ -91,7 +91,7 @@ def test_windows_publication_records_creation_kind(tmp_path, monkeypatch):
 @pytest.mark.parametrize("stamp,alive", [(None, True), (0, True), (-1, True), (123, False)])
 def test_platform_unknown_or_dead_windows_identity_fails_closed(monkeypatch, stamp, alive):
     monkeypatch.setattr(platform_io, "is_windows", lambda: True)
-    monkeypatch.setattr(runtime_temp, "process_start_ticks", lambda _pid: stamp)
+    monkeypatch.setattr("aiworkhub.runtime_temp.process_start_ticks", lambda _pid: stamp)
     monkeypatch.setattr(platform_io, "windows_pid_is_alive", lambda _pid: alive)
     assert platform_io.process_creation_identity(42) is None
 
