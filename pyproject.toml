@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aiworkhub"
 dynamic = ["version"]
-description = "Local-first, repository-native AI engineering control plane for VS Code and MCP"
+description = "Local-first AI manager and MCP server that runs Claude Code, Codex and Copilot as workers, with task cards, a source graph and test-gated review"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
@@ -13,8 +13,17 @@ license-files = ["LICENSE"]
 authors = [{ name = "AIWorkHub contributors" }]
 keywords = [
   "ai-agents",
+  "ai-coding-agents",
+  "agent-orchestration",
+  "claude-code",
+  "code-review",
+  "codex",
+  "copilot",
   "developer-tools",
+  "llm",
   "mcp",
+  "mcp-server",
+  "model-context-protocol",
   "multi-agent",
   "orchestration",
   "source-graph",
@@ -32,6 +41,8 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
   "Topic :: Software Development",
+  "Topic :: Software Development :: Quality Assurance",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
   "mcp>=1.0.0,<2"
@@ -51,7 +62,7 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/shrec/AIWorkHub"
+Homepage = "https://shrec.github.io/AIWorkHub/"
 Documentation = "https://github.com/shrec/AIWorkHub#readme"
 Issues = "https://github.com/shrec/AIWorkHub/issues"
 Changelog = "https://github.com/shrec/AIWorkHub/blob/main/CHANGELOG.md"

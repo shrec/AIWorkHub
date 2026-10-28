@@ -6,7 +6,35 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
-- WorkHub Mail: MCP startup now restarts a listener the owner enabled, and new confirm-gated dashboard tools (`aiworkhub_dashboard_hub_mail_listener`, `_pair_begin`, `_pair_complete`) start/stop the listener and pair machines (NF-2026-01783).
+## [0.12.73] - 2026-10-28
+
+### Added
+
+- MCP tool profiles: one declarative table says which tools the `manager`, `worker` and `dashboard` profiles list and which they accept only as calls. A call to a tool the active profile does not serve is refused with text naming the active profile and the profiles that expose it; a write-gated tool skipped while writes are off gets the generic refusal. The default surface is unchanged (RM-2026-00078).
+- The dashboard's MCP child runs on the `dashboard` profile (`AIWORKHUB_MCP_SURFACE=dashboard`), and workspace repair resets a drifted client surface to `manager` (RM-2026-00078).
+- WorkHub Mail: MCP startup restarts a listener the owner enabled, and confirm-gated dashboard tools (`aiworkhub_dashboard_hub_mail_listener`, `_pair_begin`, `_pair_complete`) start/stop the listener and pair machines (NF-2026-01783).
+- Source Graph `mode=diff` is wired into the manager and worker `source_graph_query` tools (NF-2026-01789, RM-2026-00071).
+- After a release cut the release watcher follows the exact commit's CI and Release runs, and it reports a WSL Python version mismatch (NF-2026-01784).
+- CI lints the MCP tool surface with TDQS (tdqs.dev) and turns its report into NeedFix drafts (NF-2026-01787).
+- Every MCP tool publishes ToolAnnotations (NF-2026-01788).
+- Workforce rates publish the class basis each rate was measured on, and inconclusive outcomes no class can be attributed to are excluded.
+- A golden-path lifecycle canary drives a card through the real stores end to end (NF-2026-00252).
+
+### Changed
+
+- Package and Marketplace metadata: a description that says what AIWorkHub does, more search keywords and classifiers, and the project site https://shrec.github.io/AIWorkHub/ as the PyPI homepage.
+
+### Fixed
+
+- `aiworkhub_task_reject_review` defers a reviewer cleanup OSError after the reject commit instead of raising it (NF-2026-01764).
+- Windows AppContainer: the validation helper temp is measured on the sandbox-drive spelling the child sees (NF-2026-01796), and the exec scratch uses a short request leaf (NF-2026-01795).
+- A reviewer that dies on a transport cancellation is retried on the next distinct route (NF-2026-01772).
+- Every terminal substatus has a named cause class, with coverage pinned.
+- Roadmap counts an accepted-then-archived card as finished, and its snapshot measures linked tasks that are missing (NF-2026-01793).
+- The MCP tool-surface contract tests run in the package gate (NF-2026-01216).
+- A validation amendment that cannot be won is refused before the append-only reject/recover write (NF-2026-01786).
+- A reviewer finding can be re-disposed with a reason, and dispositions freeze after accept (NF-2026-01682).
+- The unwired `workforce_admission` helper is removed; capacity admission is pinned in launch tests.
 
 ## [0.12.72] - 2026-10-28
 

@@ -1,8 +1,8 @@
 {
   "name": "aiworkhub",
   "displayName": "AIWorkHub",
-  "description": "Repository-native multi-model orchestration with dependency-aware tasks, 37 Source Graph modes, durable context and evidence-first review.",
-  "version": "0.12.72",
+  "description": "AI manager that runs Claude Code, Codex and Copilot as workers: dependency-aware task cards routed by cost, a Source Graph for code intelligence, durable context and test-gated review.",
+  "version": "0.12.73",
   "publisher": "IvaneChkheidze",
   "license": "MIT",
   "icon": "media/aiworkhub-marketplace-icon.png",
@@ -19,15 +19,22 @@
   "keywords": [
     "aiworkhub",
     "ai agents",
+    "ai coding agent",
     "agent orchestration",
-    "developer tools",
+    "claude code",
+    "codex",
+    "copilot",
     "mcp",
+    "mcp server",
+    "model context protocol",
     "multi agent",
+    "llm",
+    "developer tools",
     "source graph",
     "code intelligence",
+    "code review",
     "quality evidence",
     "context management",
-    "code review",
     "task planning",
     "remote-ssh"
   ],
@@ -133,7 +140,7 @@
   "bugs": {
     "url": "https://github.com/shrec/AIWorkHub/issues"
   },
-  "homepage": "https://github.com/shrec/AIWorkHub",
+  "homepage": "https://shrec.github.io/AIWorkHub/",
   "dependencies": {
     "@microsoft/mxc-sdk": "0.7.0"
   }

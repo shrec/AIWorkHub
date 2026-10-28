@@ -2,8 +2,20 @@
 
 ## Unreleased
 
+## 0.12.73 — 2026-10-28
+
+### Added
+
 - WorkHub Mail popup: listener status with Start/Stop, "Pair this machine" (shows code and address) and "Pair with another machine" (address, code, TLS); every write goes through a confirm-gated dashboard tool (NF-2026-01783).
 - The dashboard's own MCP child now runs with `AIWORKHUB_MCP_SURFACE=dashboard` instead of the server default, so it keeps its tools if that default changes. LLM client configs still get `manager`, and workspace repair now also resets a `dashboard` or unknown value there to `manager` (RM-2026-00078).
+
+### Changed
+
+- The Marketplace description and keywords say what the extension does: an AI manager that runs Claude Code, Codex and Copilot as workers.
+
+### Fixed
+
+- Bundled runtime 0.12.73: MCP tool profiles with an off-profile refusal that names where a tool is served (RM-2026-00078); Source Graph `mode=diff` (NF-2026-01789); ToolAnnotations on every MCP tool (NF-2026-01788); a reviewer killed by a transport cancellation is retried on another route (NF-2026-01772); AppContainer validation temp and exec scratch paths (NF-2026-01795, NF-2026-01796); reject_review no longer raises on a post-commit reviewer cleanup error (NF-2026-01764). The full list is in the repository CHANGELOG.
 
 ## 0.12.72 — 2026-10-28
 

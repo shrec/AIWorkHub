@@ -24,10 +24,10 @@ MCP stdio runtime on the workspace host. It does not open a browser or require
 an AIWorkHub cloud account, and it binds no port and exposes no LAN service
 unless you start the opt-in WorkHub Mail listener on a host and port you name.
 
-## What's new in 0.12.72
+## What's new in 0.12.73
 
-- 0.12.72 ships the unpublished 0.12.71 (its CI failed on Python 3.14). WorkHub Mail sends signed mail between AIWorkHub runtimes, on one machine or across a LAN: machines pair with a one-time code, unverified mail is quarantined, and a dashboard popup shows the inbox and connected machines. Accept now commits the promoted paths itself, a POSIX replay recipe runs the suite on Linux through WSL before a tag, a quiet reviewer gets one hedge attempt on another route, and Source Graph pages oversized replies on UTF-8 boundaries.
-- Dependency autolaunch follows a superseded dependency to its live successor and never counts a bare claim as a launch, a Windows sandbox drive is never unmapped while another launch still stands on it, and the audit ledger reads past a torn UTF-8 line.
+- MCP tool profiles: one table decides which tools the `manager`, `worker` and `dashboard` profiles list, the dashboard runs on its own profile, and a call to a tool the active profile does not serve is refused with a message naming the profiles that do. WorkHub Mail's listener and pairing are controlled from the dashboard, and Source Graph gains `mode=diff`.
+- Every MCP tool publishes ToolAnnotations and CI lints the tool surface with TDQS; a reviewer killed by a transport cancellation is retried on another route, and the release watcher follows the exact commit's CI and Release runs after a cut.
 
 ## Review automation
 
