@@ -1273,6 +1273,50 @@ CANONICAL_RECIPES: tuple[tr.Recipe, ...] = (
         ),
     ),
     tr.Recipe(
+        id="aiworkhub.operator.posix_replay",
+        version="1.0.0",
+        purpose=(
+            "Replay the test suite on Linux against one COMMITTED ref before a "
+            "release tag: git archive of the resolved commit is extracted into "
+            "a temporary directory outside the repository (inside WSL on a "
+            "Windows host) and pytest runs there with PYTHONPATH=src, because "
+            "Windows skips the POSIX-only tests and CI runs with -x. Reports "
+            "state, counts, failing node ids and a bounded tail; "
+            "state=unavailable when a Windows host has no working wsl. Runs "
+            "src/aiworkhub/recipes/posix_replay.py as a package module; it "
+            "never touches the working tree, but declares CAPABILITY_WRITE "
+            "because it executes repository test code. Parameter 'tests' is "
+            "space-separated repo-relative test paths ('all' = whole tests/ "
+            "suite); 'wsl_user' 'all' = the default WSL user. Catalogue: "
+            "src/aiworkhub/manager_recipe_tools.py."
+        ),
+        task_kind=tr.TaskKind.TEST,
+        parameters=(
+            tr.ParamSpec(name="ref", type=tr.ParamType.STR, default="HEAD"),
+            tr.ParamSpec(name="tests", type=tr.ParamType.STR, default="all"),
+            tr.ParamSpec(name="interpreter", type=tr.ParamType.STR, default="python3"),
+            tr.ParamSpec(name="wsl_user", type=tr.ParamType.STR, default="all"),
+        ),
+        outputs=(_STDOUT_JSON,),
+        capabilities=(tr.CAPABILITY_WRITE,),
+        risk_class=tr.RiskClass.MEDIUM,
+        resource_bounds=tr.ResourceBounds(max_runtime_seconds=1800),
+        cache_policy=tr.CachePolicy.NEVER,
+        argv=(
+            tr.lit("python"),
+            tr.lit("-m"),
+            tr.lit("aiworkhub.recipes.posix_replay"),
+            tr.lit("--ref"),
+            tr.slot("ref"),
+            tr.lit("--tests"),
+            tr.slot("tests"),
+            tr.lit("--interpreter"),
+            tr.slot("interpreter"),
+            tr.lit("--wsl-user"),
+            tr.slot("wsl_user"),
+        ),
+    ),
+    tr.Recipe(
         id="aiworkhub.operator.process_liveness",
         version="2.0.0",
         purpose=(
