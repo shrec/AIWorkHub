@@ -7790,7 +7790,11 @@ def retry_terminal_task(
     bounded_reason = str(reason or "").strip()[:500]
     if not request_id or len(request_id) > 120:
         return _lifecycle_error("terminal_retry_request_id_invalid")
-    if terminal_substatus not in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES:
+    from . import stale_recovery
+
+    if terminal_substatus not in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES and (
+        terminal_substatus != stale_recovery.NEVER_STARTED_SUBSTATUS
+    ):
         return _lifecycle_error(
             f"terminal_retry_substatus_not_operational:{terminal_substatus}"
         )
@@ -7836,14 +7840,20 @@ def retry_terminal_task(
         if isinstance(terminal_failure, dict)
         else None
     )
+    # NF-2026-01777: dead_process_reconciled is operational only when its own
+    # dead_process_reconciliation.evidence.reason is launch_never_started.
+    never_started = stale_recovery.never_started_request_id(card)
+    expected_worker_status = "blocked" if never_started else terminal_substatus
     actual_request_id = str(
         (evidence.get("request_id") if isinstance(evidence, dict) else "")
         or card.get("launch_request_id")
-        or ""
+        or never_started
     ).strip()
     if lifecycle != "blocked":
         return _lifecycle_error(f"terminal_retry_not_blocked:current={lifecycle}")
-    if worker_status != terminal_substatus or actual_substatus != terminal_substatus:
+    if terminal_substatus == stale_recovery.NEVER_STARTED_SUBSTATUS and not never_started:
+        return _lifecycle_error(f"terminal_retry_substatus_not_operational:{terminal_substatus}")
+    if worker_status != expected_worker_status or actual_substatus != terminal_substatus:
         return _lifecycle_error(
             "terminal_retry_substatus_mismatch:"
             f"expected={actual_substatus or worker_status}:got={terminal_substatus}"
@@ -7906,6 +7916,7 @@ def retry_terminal_task(
         "completed_at",
         "claimed_at",
         "started_at",
+        "dead_process_reconciliation",
     ):
         semantic_card.pop(key, None)
     if carried_predecessor is not None:
@@ -7944,7 +7955,7 @@ def retry_terminal_task(
         if (
             row is None
             or str(row["status"] or "") != "blocked"
-            or str(row["worker_status"] or "") != terminal_substatus
+            or str(row["worker_status"] or "") != expected_worker_status
         ):
             conn.rollback()
             return _canonical_result(
@@ -7963,7 +7974,7 @@ def retry_terminal_task(
                 encoded_card,
                 now,
                 task_id,
-                terminal_substatus,
+                expected_worker_status,
                 raw_card_json,
             ),
         )

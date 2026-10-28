@@ -52,7 +52,7 @@ def reconcile_dead_processing_claim(
         return task_store.reconcile_dead_processing_claim(
             root, task_id, request_id=request_id, claim_epoch=claim_epoch,
             terminal_evidence={
-                "state": "not_found", "reason": "launch_never_started",
+                "state": "not_found", "reason": NEVER_STARTED_REASON,
                 "request_id": request_id, "task_id": task_id,
                 "claimed_at": claimed_at, "grace_seconds": grace,
             },
@@ -212,6 +212,37 @@ RELAUNCH_SUBSTATUSES = frozenset({
     "timed_out",
     "cancelled",
 })
+
+# NF-2026-01777: the one dead_process_reconciled episode that is purely operational.
+NEVER_STARTED_SUBSTATUS = "dead_process_reconciled"
+NEVER_STARTED_REASON = "launch_never_started"
+
+
+def never_started_request_id(card: Mapping[str, Any]) -> str:
+    """The launch request id of an episode whose launch never started, else ``""``.
+
+    Qualifies only the exact evidence ``reconcile_dead_processing_claim`` records
+    for a claim with no process record: terminal_substatus
+    ``dead_process_reconciled`` whose ``dead_process_reconciliation`` evidence is
+    ``state=not_found`` and ``reason=launch_never_started`` for the same request
+    and task.  A worker that ran and then died is never this episode.
+    """
+    if str(card.get("terminal_substatus") or "") != NEVER_STARTED_SUBSTATUS:
+        return ""
+    recorded = card.get("dead_process_reconciliation")
+    evidence = recorded.get("evidence") if isinstance(recorded, Mapping) else None
+    if not isinstance(evidence, Mapping):
+        return ""
+    request_id = str(recorded.get("request_id") or "").strip()
+    if (
+        evidence.get("reason") != NEVER_STARTED_REASON
+        or evidence.get("state") != "not_found"
+        or not request_id
+        or str(evidence.get("request_id") or "") != request_id
+        or str(evidence.get("task_id") or "") != str(card.get("task_id") or "")
+    ):
+        return ""
+    return request_id
 
 # A named subset of needfix_store.NEEDFIX_TERMINAL_STATUSES, pinned to it by test.
 NEEDFIX_CLOSED_STATUSES = frozenset({"resolved", "archived"})
@@ -396,6 +427,12 @@ def _classify_blocked(
             return decide("keep", f"Rework delta could not be verified ({delta_failure}).")
     if substatus in RELAUNCH_SUBSTATUSES:
         return decide("relaunch", f"terminal_substatus {substatus} is an operational failure.")
+    if never_started_request_id(card):
+        return decide(
+            "relaunch",
+            f"terminal_substatus {substatus} records {NEVER_STARTED_REASON}: no worker ever ran, "
+            "so the episode is operational and retry_terminal requeues it.",
+        )
     if substatus:
         return decide(
             "keep", f"terminal_substatus {substatus} is not operational and no closing evidence exists.",

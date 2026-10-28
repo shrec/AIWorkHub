@@ -748,6 +748,73 @@ def _request_id(parent_task_id: str, child_task_id: str) -> str:
     return f"dependency-autolaunch:{parent_task_id}:{child_task_id}"
 
 
+# NF-2026-01777: server startup and the accept hook wire ``core.claim_start_exact``
+# in as ``launch``.  That call only moves the card to processing/claimed and
+# spawns no worker, yet its ``ok`` was reported as launched: the claim then sat
+# until the dead-process reconciler blocked it ``launch_never_started``.  A
+# launch now counts only when it is not a bare claim.  The bare-claim callable
+# is refused before it can claim; a result that itself proves no process started
+# (the claim-start receipt, or ``process_started: False``) has its exact claim
+# released back to pending/unclaimed with the reason recorded.
+LAUNCH_NOT_STARTED = "launch_not_started"
+
+
+def _is_bare_claim_launch(launch: LaunchFn) -> bool:
+    from . import core
+
+    return launch is core.claim_start_exact
+
+
+def _launch_spawned_no_worker(result: Mapping[str, Any]) -> bool:
+    if result.get("process_started") is False:
+        return True
+    command = result.get("command")
+    return isinstance(command, (list, tuple)) and bool(command) and command[0] == "claim-start"
+
+
+def _release_unstarted_claim(conn: sqlite3.Connection, task_id: str, request_id: str) -> bool:
+    """Return this request's own processing/claimed card to pending/unclaimed."""
+    row = conn.execute(
+        "SELECT card_json FROM tasks WHERE task_id=? AND status='processing' "
+        "AND worker_status='claimed'",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    card = _load_card(row["card_json"])
+    if str(card.get("launch_request_id") or "") != request_id:
+        return False
+    card.pop("launch_request_id", None)
+    card.update(status="pending", worker_status="unclaimed", claimed_by=None)
+    now = _now()
+    cur = conn.execute(
+        "UPDATE tasks SET status='pending', worker_status='unclaimed', claimed_by=NULL, "
+        "claimed_at=NULL, started_at=NULL, card_json=?, updated_at=? "
+        "WHERE task_id=? AND status='processing' AND worker_status='claimed' AND card_json=?",
+        (json.dumps(card, ensure_ascii=False), now, task_id, row["card_json"]),
+    )
+    if cur.rowcount != 1:
+        return False
+    conn.execute(
+        "INSERT INTO task_events(task_id,event,runner,payload_json,created_at) VALUES(?,?,?,?,?)",
+        (
+            task_id,
+            LAUNCH_NOT_STARTED,
+            "codex",
+            json.dumps(
+                {
+                    "request_id": request_id,
+                    "reason": "claim_without_worker",
+                    "schema_id": SCHEMA_ID,
+                },
+                ensure_ascii=False,
+            ),
+            now,
+        ),
+    )
+    return True
+
+
 def _mark_dependency_blocked(
     conn: sqlite3.Connection,
     child: _TaskRow,
@@ -1208,8 +1275,38 @@ def reconcile(
         if capacity is not None and launched_count >= capacity:
             outcome["delayed"].append({"task_id": child.task_id, "reason": "capacity"})
             continue
-        result = dict(launch(child.task_id, child.runner, child.topic, _request_id(trigger_task_id, child.task_id)))
-        if result.get("ok"):
+        if _is_bare_claim_launch(launch):
+            # NF-2026-01777: claiming here would strand a card no worker runs.
+            outcome["delayed"].append(
+                {
+                    "task_id": child.task_id,
+                    "reason": LAUNCH_NOT_STARTED,
+                    "detail": "launch_callable_claims_without_spawning_a_worker",
+                }
+            )
+            continue
+        request_id = _request_id(trigger_task_id, child.task_id)
+        result = dict(launch(child.task_id, child.runner, child.topic, request_id))
+        if result.get("ok") and _launch_spawned_no_worker(result):
+            with _write_connection(db) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                released = _release_unstarted_claim(conn, child.task_id, request_id)
+                hold_state = _record_denial(
+                    conn, child, f"{LAUNCH_NOT_STARTED}:claim_without_worker"
+                )
+                conn.commit()
+            outcome["delayed"].append(
+                {
+                    "task_id": child.task_id,
+                    "reason": LAUNCH_NOT_STARTED,
+                    "detail": "claim_without_worker",
+                    "claim_released": released,
+                    "denial_kind": hold_state["kind"],
+                    "attempts": hold_state["attempts"],
+                    "next_attempt_at": hold_state["next_attempt_at"],
+                }
+            )
+        elif result.get("ok"):
             launched_count += 1
             with _write_connection(db) as conn:
                 conn.execute("BEGIN IMMEDIATE")
