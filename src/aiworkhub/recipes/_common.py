@@ -115,7 +115,13 @@ def emit(payload: dict[str, Any], *, ok: bool = True, code: int = 0) -> int:
             indent=1,
         )
         code = 2
-    sys.stdout.write(text + "\n")
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is None:
+        sys.stdout.write(text + "\n")
+    else:
+        sys.stdout.flush()
+        buffer.write((text + "\n").encode("utf-8"))
+        buffer.flush()
     return code
 
 
