@@ -372,9 +372,10 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.71
+## What's new in 0.12.72
 
-- WorkHub Mail sends signed mail between AIWorkHub runtimes, on one machine or across a LAN: machines pair with a one-time code, unverified mail is quarantined, and a dashboard popup shows the inbox and connected machines. Accept now commits the promoted paths itself, a POSIX replay recipe runs the suite on Linux through WSL before a tag, a quiet reviewer gets one hedge attempt on another route, and Source Graph pages oversized replies on UTF-8 boundaries.
+- 0.12.72 ships the unpublished 0.12.71 (its CI failed on Python 3.14). WorkHub Mail sends signed mail between AIWorkHub runtimes, on one machine or across a LAN: machines pair with a one-time code, unverified mail is quarantined, and a dashboard popup shows the inbox and connected machines. Accept now commits the promoted paths itself, a POSIX replay recipe runs the suite on Linux through WSL before a tag, a quiet reviewer gets one hedge attempt on another route, and Source Graph pages oversized replies on UTF-8 boundaries.
+- Dependency autolaunch follows a superseded dependency to its live successor and never counts a bare claim as a launch, a Windows sandbox drive is never unmapped while another launch still stands on it, and the audit ledger reads past a torn UTF-8 line.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Continuous Audit as a Service (CAAS)

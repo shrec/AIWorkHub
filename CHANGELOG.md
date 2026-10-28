@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.72] - 2026-10-28
+
+0.12.71 was tagged but never published: its CI run failed on Python 3.14 in a WorkHub Mail test. 0.12.72 ships everything listed under 0.12.71 plus the fixes below.
+
+### Fixed
+
+- A WorkHub Mail inbox file nested past the JSON depth limit is quarantined under either reason Python reports for it, so the test passes on Python 3.14 (NF-2026-01779).
+- Dependency autolaunch follows a superseded dependency's recorded successor chain, bounded and cycle-safe, to the first live card, so its dependents no longer wait forever on a card that was replaced (NF-2026-01776).
+- Dependency autolaunch never counts a bare claim as a launch: a launch callable that only claims is refused before it claims, a result that proves no worker started has its claim released back to pending, and an episode the dead-process reconciler blocked as `launch_never_started` is retryable through `aiworkhub_task_retry_terminal` (NF-2026-01777).
+- The audit ledger counts a line torn mid UTF-8 character as malformed instead of raising, so one torn line no longer fails the whole read (NF-2026-01691).
+- Windows AppContainer: every sandbox drive push holds a session-local named mutex until its pop, and reconcile keeps a dead lease whose drive another live launch still stands on, so one launcher's cleanup never unmaps a drive another launch is using (NF-2026-01715).
+
 ## [0.12.71] - 2026-10-28
 
 ### Added
