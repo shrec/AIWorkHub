@@ -7184,8 +7184,8 @@ def reject_review(
         "failure_category": terminal_disposition,
         "failure_category_source": failure_category_source,
         "request_id": pred_request_id,
-        "to": disposition,
-        "pinned_at": now,
+        "changed_path_hashes": dict(pred_changed_hashes if isinstance(pred_changed_hashes, dict) else {}),
+        "to": disposition, "pinned_at": now,
     }
     # A validation-only replay grant is bound to the episode the manager just
     # adjudicated.  If that candidate is rejected, the successor must invoke a

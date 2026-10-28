@@ -170,10 +170,20 @@ def _operational_disposition_exempts(
     if not isinstance(request_id, str) or not request_id.strip():
         return False
     disposition_request_id = disposition.get("request_id")
-    if (
-        not isinstance(disposition_request_id, str)
-        or disposition_request_id != request_id.strip()
-    ):
+    same_request = (
+        isinstance(disposition_request_id, str)
+        and disposition_request_id == request_id.strip()
+    )
+    # NF-2026-01797: a retry that carries the rejected delta into a new
+    # predecessor request keeps the disposition only for those exact bytes.
+    hashes = disposition.get("changed_path_hashes")
+    same_content = (
+        isinstance(hashes, dict)
+        and bool(hashes)
+        and all(isinstance(digest, str) and digest for digest in hashes.values())
+        and hashes == predecessor.get("changed_path_hashes")
+    )
+    if not (same_request or same_content):
         return False
     category = disposition.get("failure_category")
     return (
@@ -231,6 +241,9 @@ def rework_no_delta_refusal(
     recovery and nothing is minted. ``candidate_code``, a mismatched or empty
     request_id, a missing, non-dict or wrong-schema disposition and an unknown
     or non-str category keep the refusal: unknown is never an exemption.
+    NF-2026-01797: a delta carried into a new predecessor request is matched by
+    content instead -- the disposition's non-empty ``changed_path_hashes`` equal
+    the predecessor's exactly; absent, empty or differing hashes keep the refusal.
     """
     if validation_only_replay or not is_rework_attempt(metadata):
         return ""
