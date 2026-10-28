@@ -95,7 +95,7 @@ def test_derive_risks_empty_with_required_outputs_is_flagged():
     assert "missing_allowed_writes" in _codes(card)
 
 
-def test_task_card_path_contract_rejects_declared_input_also_forbidden():
+def test_task_card_path_contract_allows_declared_input_also_forbidden():
     conflicts = core.task_card_path_conflicts({
         "read_first": ["data/source.jsonl"],
         "immutable_inputs": ["protocols/b1344.json"],
@@ -105,11 +105,21 @@ def test_task_card_path_contract_rejects_declared_input_also_forbidden():
         "validation": [],
         "objective": "classify rows",
     })
-    assert {row["field"] for row in conflicts} == {"read_first", "immutable_inputs"}
-    assert {row["path"] for row in conflicts} == {
-        "data/source.jsonl",
-        "protocols/b1344.json",
-    }
+    assert conflicts == []
+
+
+def test_task_card_path_contract_rejects_written_output_also_forbidden():
+    conflicts = core.task_card_path_conflicts({
+        "read_first": ["data/source.jsonl"],
+        "immutable_inputs": ["protocols/b1344.json"],
+        "required_outputs": ["data/out.json"],
+        "allowed_writes": ["data/out.json"],
+        "forbidden": ["data/**", "protocols/b1344.json", "unrelated prose"],
+        "validation": [],
+        "objective": "classify rows",
+    })
+    assert {row["field"] for row in conflicts} == {"allowed_writes", "required_outputs"}
+    assert {row["path"] for row in conflicts} == {"data/out.json"}
 
 
 def test_task_card_path_contract_detects_objective_and_validation_reference():

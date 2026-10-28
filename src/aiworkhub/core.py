@@ -3790,7 +3790,7 @@ def _paths_overlap(left: str, right: str, *, glob_aware: bool) -> bool:
 
 
 def task_card_path_conflicts(card: dict[str, Any]) -> list[dict[str, str]]:
-    """Return bounded required/forbidden path contradictions in one card."""
+    """Return bounded write-path/forbidden contradictions (forbidden bounds writes, not reads)."""
     forbidden = [
         path
         for path in (_task_contract_path(v) for v in card.get("forbidden") or [])
@@ -3799,7 +3799,7 @@ def task_card_path_conflicts(card: dict[str, Any]) -> list[dict[str, str]]:
     if not forbidden:
         return []
     conflicts: list[dict[str, str]] = []
-    for field in ("allowed_writes", "required_outputs", "read_first", "immutable_inputs"):
+    for field in ("allowed_writes", "required_outputs"):
         values = card.get(field) or []
         if not isinstance(values, list):
             continue
