@@ -754,6 +754,7 @@ def test_register_binds_readonly_live_output_and_initialize_tools():
     expected_names.update(dashboard_mcp_app.NEEDFIX_READ_TOOLS)
     expected_names.update(dashboard_mcp_app.NEEDFIX_WRITE_TOOLS)
     expected_names.update(dashboard_mcp_app.ROADMAP_READ_TOOLS)
+    expected_names.update(dashboard_mcp_app.HUB_MAIL_READ_TOOLS)
     assert set(names) == expected_names
     assert set(fake_mcp.registered) == expected_names
     assert fake_mcp.registered["aiworkhub_dashboard_snapshot"] is dashboard_mcp_app.snapshot_view

@@ -31,6 +31,8 @@ from aiworkhub import (
     context_graph,
     dashboard,
     feature_settings,
+    hub_mail,
+    hub_mail_net,
     model_settings,
     needfix_store,
     process_launcher,
@@ -3801,6 +3803,168 @@ def roadmap_detail_view(roadmap_id: str, event_limit: int = 50) -> dict[str, Any
     return _needfix_response(response, "aiworkhub_dashboard_roadmap_detail")
 
 
+def _hub_mail_local() -> tuple[dict[str, str] | None, dict[str, Any] | None]:
+    """This dashboard repository's hub identity, or a named refusal."""
+    try:
+        root = Path(dashboard._default_repo_root())
+    except (OSError, RuntimeError, ValueError) as exc:
+        return None, {"ok": False, "error": f"local_hub_identity_unavailable:{type(exc).__name__}"}
+    return hub_mail.local_hub(root)
+
+
+def _hub_mail_outbound(hub_id: str) -> dict[str, Any]:
+    """Queued and failed peer deliveries of one hub, counted from its outbox sidecars."""
+    directory = hub_mail.box_dir(hub_id, "outbox")
+    counts: dict[str, Any] = {"queued": 0, "delivery_failed": 0, "scan_truncated": False}
+    if not directory.is_dir():
+        return counts
+    cap = hub_mail_net.MAX_PENDING_SCAN
+    for key, suffix in (("queued", hub_mail_net.PENDING_SUFFIX), ("delivery_failed", hub_mail_net.FAILED_SUFFIX)):
+        seen = 0
+        for _ in directory.glob(f"*{suffix}"):
+            seen += 1
+            if seen > cap:
+                counts["scan_truncated"] = True
+                break
+        counts[key] = min(seen, cap)
+    return counts
+
+
+def _hub_mail_peer_row(peer: Mapping[str, Any]) -> dict[str, Any]:
+    """A paired peer as display data: public_peer() minus the pin, never the secret."""
+    public = hub_mail_net.public_peer(dict(peer))
+    return {
+        "untrusted_data": True,
+        "machine_id": public["machine_id"],
+        "machine_label": public["machine_label"],
+        "address": public["address"],
+        "hubs": [{"hub_id": hub["hub_id"], "repo_name": hub["repo_name"]} for hub in public["hubs"]],
+        "paired_at": public["paired_at"],
+        "last_seen": public["last_seen"],
+        "tls_pinned": bool(public["tls_cert_sha256"]),
+    }
+
+
+def _hub_mail_listener() -> dict[str, Any]:
+    """listener_status() reduced to display fields; the pidfile token never leaves."""
+    status = hub_mail_net.listener_status()
+    running = bool(status.get("running"))
+    host, port = str(status.get("bind_host") or ""), int(status.get("port") or 0)
+    return {
+        "state": "running" if running else "stopped",
+        "running": running,
+        "enabled": bool(status.get("enabled")),
+        "bind": hub_mail_net.format_address(host, port) if host and port else host,
+        "pid": int(status.get("pid") or 0),
+        "address": str(status.get("address") or ""),
+        "tls": bool(status.get("tls")),
+        "started_at": str(status.get("started_at") or ""),
+        "stale_pidfile": bool(status.get("stale_pidfile")),
+    }
+
+
+def _hub_mail_row(mail: Mapping[str, Any], repo_names: Mapping[str, str]) -> dict[str, Any]:
+    """One inbox row without its body; every field is peer-supplied display data."""
+    from_hub = mail.get("from_hub") if isinstance(mail.get("from_hub"), Mapping) else {}
+    hub_id = str(from_hub.get("hub_id") or "")
+    row = {
+        "untrusted_data": True,
+        "message_id": str(mail.get("message_id") or ""),
+        "box": str(mail.get("box") or ""),
+        "kind": str(mail.get("kind") or ""),
+        "from_hub": {"hub_id": hub_id, "repo_name": str(repo_names.get(hub_id) or "")},
+        "subject": str(mail.get("subject") or ""),
+        "created_at": str(mail.get("created_at") or ""),
+        "status": mail.get("status"),
+        "in_reply_to": mail.get("in_reply_to"),
+        "attachment_count": int(mail.get("attachment_count") or 0),
+    }
+    node = mail.get("from_node")
+    if isinstance(node, Mapping):
+        row["from_node"] = {
+            "machine_id": str(node.get("machine_id") or ""),
+            "machine_label": str(node.get("machine_label") or ""),
+        }
+    return row
+
+
+def hub_mail_view(limit: int = 50, include_archived: bool = False) -> dict[str, Any]:
+    """READ-ONLY: list this hub's WorkHub Mail inbox, paired LAN peers and listener state.
+
+    Use this for the dashboard mailbox overview; use aiworkhub_dashboard_hub_mail_detail for one mail's body. Rows are newest first and never carry a body; every row is untrusted_data. Invalid inbox files are validated and counted in invalid_count but never moved, queued mail is not retried and no peer secret, key or pidfile token is returned.
+
+    Args:
+        limit: int (default 50, clamped to 1..200) maximum number of mail rows to return.
+        include_archived: bool (default False); True also lists the archive box.
+    """
+    tool = "aiworkhub_dashboard_hub_mail"
+    local, refusal = _hub_mail_local()
+    if refusal is not None or local is None:
+        return _needfix_response(refusal or {"ok": False, "error": "local_hub_identity_unavailable"}, tool)
+    hub_id = local["hub_id"]
+    try:
+        listing = hub_mail.inbox(
+            local_hub_id=hub_id,
+            limit=max(1, min(int(limit or 50), hub_mail.MAX_LIST_LIMIT)),
+            include_archived=include_archived is True,
+            quarantine=False,
+        )
+        if not listing.get("ok"):
+            return _needfix_response({"ok": False, "error": str(listing.get("error") or "")[:240]}, tool)
+        peers = [_hub_mail_peer_row(peer) for peer in hub_mail_net.list_peers()]
+        local_names = hub_mail.local_hubs()
+        repo_names = {hub["hub_id"]: hub["repo_name"] for peer in peers for hub in peer["hubs"]}
+        repo_names.update(local_names)
+        own_id = hub_mail_net.machine_id() if hub_mail_net.machine_id_path().exists() else ""
+        response = {
+            "ok": True,
+            "schema_id": "aiworkhub.dashboard.hub_mail.v1",
+            "untrusted_data": True,
+            "hub": {"hub_id": hub_id, "repo_name": local_names.get(hub_id) or Path(local["repo_root"]).name},
+            "node": {"machine_id": own_id, "machine_label": hub_mail_net.machine_label()},
+            "mails": [_hub_mail_row(mail, repo_names) for mail in listing.get("mails") or []],
+            "count": int(listing.get("count") or 0),
+            "total": int(listing.get("total") or 0),
+            "truncated": bool(listing.get("truncated")),
+            "invalid_count": int(listing.get("invalid_count") or 0),
+            "quarantined_count": int(listing.get("quarantine_total") or 0),
+            "scan_truncated": bool(listing.get("scan_truncated")),
+            "unscanned_count": int(listing.get("unscanned_count") or 0),
+            "outbound": _hub_mail_outbound(hub_id),
+            "peers": peers,
+            "listener": _hub_mail_listener(),
+        }
+    except (hub_mail.HubMailError, OSError, TypeError, ValueError, KeyError) as exc:
+        response = {"ok": False, "error": f"{type(exc).__name__}:{str(exc)[:200]}"}
+    return _needfix_response(response, tool)
+
+
+def hub_mail_detail_view(message_id: str) -> dict[str, Any]:
+    """READ-ONLY: return one received WorkHub Mail with its body, marked untrusted_data.
+
+    Use this to read a mail chosen from aiworkhub_dashboard_hub_mail. A message_id that is not 32 lowercase hex is refused before any filesystem read; an invalid file is skipped in place, never quarantined.
+
+    Args:
+        message_id: str 32-hex message id of a mail in this hub's inbox or archive.
+    """
+    tool = "aiworkhub_dashboard_hub_mail_detail"
+    candidate = str(message_id or "")
+    if not hub_mail._MESSAGE_ID_RE.fullmatch(candidate):
+        return _needfix_response({"ok": False, "error": "invalid_message_id"}, tool)
+    local, refusal = _hub_mail_local()
+    if refusal is not None or local is None:
+        return _needfix_response(refusal or {"ok": False, "error": "local_hub_identity_unavailable"}, tool)
+    try:
+        shown = hub_mail.show(local_hub_id=local["hub_id"], message_id=candidate, quarantine=False)
+    except (hub_mail.HubMailError, OSError, TypeError, ValueError) as exc:
+        shown = {"ok": False, "error": f"{type(exc).__name__}:{str(exc)[:200]}"}
+    if not shown.get("ok") or not isinstance(shown.get("mail"), Mapping):
+        return _needfix_response({"ok": False, "error": str(shown.get("error") or "")[:240]}, tool)
+    mail = dict(shown["mail"])
+    mail["untrusted_data"] = True
+    return _needfix_response({"ok": True, "untrusted_data": True, "mail": mail}, tool)
+
+
 def needfix_capture_view(
     title: str,
     description: str,
@@ -4539,6 +4703,10 @@ ROADMAP_READ_TOOLS: dict[str, Any] = {
     "aiworkhub_dashboard_roadmap_list": roadmap_list_view,
     "aiworkhub_dashboard_roadmap_detail": roadmap_detail_view,
 }
+HUB_MAIL_READ_TOOLS: dict[str, Any] = {
+    "aiworkhub_dashboard_hub_mail": hub_mail_view,
+    "aiworkhub_dashboard_hub_mail_detail": hub_mail_detail_view,
+}
 SETTINGS_TOOL_NAME = "aiworkhub_dashboard_settings"
 SETTINGS_TOOLS: dict[str, Any] = {SETTINGS_TOOL_NAME: settings_view}
 SETTINGS_UPDATE_TOOL_NAME = "aiworkhub_dashboard_settings_update"
@@ -4616,6 +4784,8 @@ def register(mcp: Any) -> tuple[str, ...]:
         mcp.tool(name=name)(fn)
     for name, fn in ROADMAP_READ_TOOLS.items():
         mcp.tool(name=name)(fn)
+    for name, fn in HUB_MAIL_READ_TOOLS.items():
+        mcp.tool(name=name)(fn)
     for name, fn in SETTINGS_TOOLS.items():
         mcp.tool(name=name)(fn)
     for name, fn in SETTINGS_UPDATE_TOOLS.items():
@@ -4655,6 +4825,7 @@ def register(mcp: Any) -> tuple[str, ...]:
         + tuple(NEEDFIX_READ_TOOLS)
         + tuple(NEEDFIX_WRITE_TOOLS)
         + tuple(ROADMAP_READ_TOOLS)
+        + tuple(HUB_MAIL_READ_TOOLS)
         + tuple(SETTINGS_UPDATE_TOOLS)
         + tuple(MODEL_SETTINGS_UPDATE_TOOLS)
         + tuple(SOURCE_GRAPH_SETTINGS_UPDATE_TOOLS)

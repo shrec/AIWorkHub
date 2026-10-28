@@ -383,12 +383,23 @@ class Keyring:
         return {"machine_id": peer["machine_id"], "machine_label": peer["machine_label"]}
 
 
-def load_keyring(home: Path | None = None) -> Keyring:
+def load_keyring(home: Path | None = None, *, create: bool = True) -> Keyring:
+    """The machine key plus every peer's secret.
+
+    ``create=False`` never writes: with no machine key yet, an ephemeral one
+    stands in, so local mail fails its signature check instead of a key being
+    minted by a read.
+    """
+
     from . import hub_mail_net  # the transport imports this module
 
     local_ids = frozenset(local_hubs(home))
+    if create or key_path(home).exists():
+        local_key = load_or_create_key(home)
+    else:
+        local_key = secrets.token_bytes(KEY_BYTES)
     return Keyring(
-        local_key=load_or_create_key(home),
+        local_key=local_key,
         local_hub_ids=local_ids,
         peers=hub_mail_net.peer_hub_index(home, exclude=local_ids),
     )
@@ -487,9 +498,11 @@ def _project(
 
 def _scan_box(
     hub_id: str, box: str, *, key: bytes | Keyring, home: Path | None, now: datetime | None,
+    quarantine: bool = True,
 ) -> tuple[list[tuple[Path, dict[str, Any]]], list[dict[str, Any]], int]:
     """Valid envelopes of one box; every invalid file is quarantined, not skipped.
 
+    With ``quarantine=False`` an invalid file is reported but left in place.
     The third value counts the files beyond ``MAX_SCAN_FILES`` left unscanned.
     """
 
@@ -514,6 +527,9 @@ def _scan_box(
                 reason = "duplicate_conflict"
         except _UNPROCESSABLE:
             reason = "envelope_unprocessable"
+        if reason and not quarantine:
+            quarantined.append({"file": path.name, "reason": reason, "moved": False})
+            continue
         if reason:
             try:
                 quarantined.append(_quarantine(path, hub_id, reason, home))
@@ -537,7 +553,7 @@ def _quarantine_total(hub_id: str, home: Path | None) -> int:
 
 def _find_local(
     hub_id: str, message_id: str, boxes: tuple[str, ...], *, key: bytes | Keyring,
-    home: Path | None, now: datetime | None,
+    home: Path | None, now: datetime | None, quarantine: bool = True,
 ) -> tuple[str, dict[str, Any]] | None:
     for box in boxes:
         path = box_dir(hub_id, box, home) / f"{message_id}.json"
@@ -557,7 +573,7 @@ def _find_local(
         except _UNPROCESSABLE:
             reason = "envelope_unprocessable"
         if reason:
-            if box != "outbox":
+            if box != "outbox" and quarantine:
                 _quarantine(path, hub_id, reason, home)
             continue
         return box, envelope
@@ -748,20 +764,28 @@ def _send(
 
 def inbox(
     *, local_hub_id: str, limit: int = 50, include_archived: bool = False,
-    home: Path | None = None, now: datetime | None = None,
+    home: Path | None = None, now: datetime | None = None, quarantine: bool = True,
 ) -> dict[str, Any]:
-    """Validate and list this hub's mail; invalid files go to quarantine."""
+    """Validate and list this hub's mail; invalid files go to quarantine.
 
-    _retry_pending(home, now)
+    ``quarantine=False`` is the read-only form the dashboard uses: invalid
+    files are validated and counted in ``invalid_count`` but left where they
+    are, queued peer mail is not retried, and no key is created.
+    """
+
+    if quarantine:
+        _retry_pending(home, now)
     try:
-        keyring = load_keyring(home)
+        keyring = load_keyring(home, create=quarantine)
         boxes = ("inbox", "archive") if include_archived else ("inbox",)
         mails: list[dict[str, Any]] = []
-        quarantined: list[dict[str, Any]] = []
+        invalid: list[dict[str, Any]] = []
         unscanned = 0
         for box in boxes:
-            valid, moved, skipped = _scan_box(local_hub_id, box, key=keyring, home=home, now=now)
-            quarantined.extend(moved)
+            valid, rejected, skipped = _scan_box(
+                local_hub_id, box, key=keyring, home=home, now=now, quarantine=quarantine,
+            )
+            invalid.extend(rejected)
             unscanned += skipped
             mails.extend(
                 _project(envelope, box, full=False, keyring=keyring) for _, envelope in valid
@@ -784,24 +808,30 @@ def inbox(
         "mails": mails[:bounded],
         "scan_truncated": unscanned > 0,
         "unscanned_count": unscanned,
-        "quarantined_count": len(quarantined),
-        "quarantined": quarantined,
+        "invalid_count": len(invalid),
+        "quarantined_count": len(invalid) if quarantine else 0,
+        "quarantined": invalid if quarantine else [],
         "quarantine_total": total,
     }
 
 
 def show(
     *, local_hub_id: str, message_id: str, home: Path | None = None,
-    now: datetime | None = None,
+    now: datetime | None = None, quarantine: bool = True,
 ) -> dict[str, Any]:
-    """One received mail in full, from the inbox or the archive."""
+    """One received mail in full, from the inbox or the archive.
+
+    ``quarantine=False`` is the read-only form: an invalid file is skipped in
+    place instead of being moved to quarantine.
+    """
 
     if not isinstance(message_id, str) or not _MESSAGE_ID_RE.fullmatch(message_id):
         return {"ok": False, "error": "message_id_invalid"}
     try:
-        keyring = load_keyring(home)
+        keyring = load_keyring(home, create=quarantine)
         found = _find_local(
-            local_hub_id, message_id, ("inbox", "archive"), key=keyring, home=home, now=now
+            local_hub_id, message_id, ("inbox", "archive"), key=keyring, home=home, now=now,
+            quarantine=quarantine,
         )
     except HubMailError as exc:
         return {"ok": False, "error": str(exc)}

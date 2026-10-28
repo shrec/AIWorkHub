@@ -371,6 +371,8 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
   "requestNeedfixDetail",
   "requestRoadmap",
   "requestRoadmapDetail",
+  "requestHubMail",
+  "requestHubMailDetail",
   "needfixCapture",
   "needfixUpdate",
   "needfixTransition",
@@ -438,6 +440,8 @@ const OUTBOUND_TYPES = Object.freeze({
   roadmapDetail: "roadmapDetail",
   waveMiniRoadmap: "waveMiniRoadmap",
   waveMiniRoadmapDetail: "waveMiniRoadmapDetail",
+  hubMail: "hubMail",
+  hubMailDetail: "hubMailDetail",
   settings: "settings",
   managerLoopStatus: "managerLoopStatus",
   managerLoopEvents: "managerLoopEvents",
@@ -565,6 +569,11 @@ const ROADMAP_TOOLS = Object.freeze({
   detail: "aiworkhub_dashboard_roadmap_detail",
 });
 const ROADMAP_ID_RE = /^RM-\d{4}-\d{5}$/;
+const HUB_MAIL_TOOLS = Object.freeze({
+  list: "aiworkhub_dashboard_hub_mail",
+  detail: "aiworkhub_dashboard_hub_mail_detail",
+});
+const MESSAGE_ID_RE = /^[0-9a-f]{32}$/;
 const SOURCE_GRAPH_SETTINGS_UPDATE_TOOL = "aiworkhub_dashboard_source_graph_settings_update";
 const FEATURE_SETTING_KEYS = new Set([
   "source_graph",
@@ -10951,6 +10960,41 @@ async function pushRoadmapDetail(view, roadmapId, outboundType = OUTBOUND_TYPES.
   }
 }
 
+async function pushHubMail(view, filters = {}) {
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const payload = await client.callTool(HUB_MAIL_TOOLS.list, {
+      limit: 50,
+      include_archived: Boolean(filters.includeArchived),
+    });
+    if (view.stillBoundTo(client)) {
+      view.postMessage({ type: OUTBOUND_TYPES.hubMail, payload: sanitizeWebviewPayload(payload) });
+    }
+  } catch (err) {
+    view.postMessage({
+      type: OUTBOUND_TYPES.hubMail,
+      payload: { ok: false, error: sanitizeErrorMessage(err), mails: [], peers: [] },
+    });
+  }
+}
+
+async function pushHubMailDetail(view, messageId) {
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const payload = await client.callTool(HUB_MAIL_TOOLS.detail, { message_id: messageId });
+    if (view.stillBoundTo(client)) {
+      view.postMessage({ type: OUTBOUND_TYPES.hubMailDetail, payload: sanitizeWebviewPayload(payload) });
+    }
+  } catch (err) {
+    view.postMessage({
+      type: OUTBOUND_TYPES.hubMailDetail,
+      payload: { ok: false, error: sanitizeErrorMessage(err) },
+    });
+  }
+}
+
 async function runNeedfixAction(view, action, args) {
   const tool = NEEDFIX_TOOLS[action];
   if (!tool) return;
@@ -11905,6 +11949,15 @@ function handleInboundMessage(view, message) {
           Number.isFinite(waveGeneration) ? waveGeneration : null,
         );
       }
+      break;
+    }
+    // WorkHub Mail is read-only and fetched on dialog open/refresh only.
+    case "requestHubMail":
+      pushHubMail(view, { includeArchived: message.includeArchived === true });
+      break;
+    case "requestHubMailDetail": {
+      const messageId = String(message.messageId || "");
+      if (MESSAGE_ID_RE.test(messageId)) pushHubMailDetail(view, messageId);
       break;
     }
     // The three NeedFix mutation tools now answer with a receipt whose `item`
@@ -13803,6 +13856,12 @@ function getHtmlForWebview(webview, extensionUri) {
         <span class="header-insight-detail" id="header-roadmap-detail">No outcomes</span>
       </button>
 
+      <button class="header-insight-card" id="header-mail" type="button" aria-haspopup="dialog" aria-controls="mail-dialog" title="Open WorkHub Mail and the connected LAN machines">
+        <span class="header-storage-label">Mail</span>
+        <strong id="header-mail-value">Open</strong>
+        <span class="header-insight-detail" id="header-mail-detail">Inbox and machines</span>
+      </button>
+
       <div class="header-insight-card" id="header-preflight" title="Unified repository, policy, Source Graph and provider preflight">
         <span class="header-storage-label">Preflight</span>
         <strong id="header-preflight-value">Checking</strong>
@@ -14329,6 +14388,29 @@ function getHtmlForWebview(webview, extensionUri) {
       <div class="needfix-list" id="roadmap-list" aria-live="polite"></div>
       <section class="needfix-detail" id="roadmap-detail-panel" aria-live="polite">
         <div class="panel-list-empty">Select a Roadmap outcome</div>
+      </section>
+    </div>
+  </dialog>
+
+  <dialog class="diagnostic-dialog needfix-dialog" id="mail-dialog">
+    <div class="dialog-heading">
+      <div><h2>WorkHub Mail</h2><span id="mail-summary">Signed hub mail and paired LAN machines (read-only)</span></div>
+      <button type="button" class="dialog-close" data-close-dialog="mail-dialog">Close</button>
+    </div>
+    <div class="needfix-toolbar">
+      <span class="mail-listener" id="mail-listener">Listener: unknown</span>
+      <label class="needfix-archived-toggle"><input id="mail-include-archived" type="checkbox"> Archived</label>
+      <button id="mail-refresh" type="button">Refresh</button>
+    </div>
+    <div class="needfix-workspace mail-workspace">
+      <div class="mail-column">
+        <h3 class="mail-column-title">Inbox</h3>
+        <div class="needfix-list" id="mail-inbox-list" aria-live="polite"></div>
+        <h3 class="mail-column-title">Connected machines</h3>
+        <div class="needfix-list mail-peers-list" id="mail-peers-list" aria-live="polite"></div>
+      </div>
+      <section class="needfix-detail" id="mail-detail-panel" aria-live="polite">
+        <div class="panel-list-empty">Select a mail</div>
       </section>
     </div>
   </dialog>

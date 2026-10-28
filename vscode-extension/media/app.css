@@ -460,6 +460,7 @@ summary:focus-visible,
 .header-tool-use,
 #header-needfix,
 #header-roadmap,
+#header-mail,
 #header-skills,
 #header-tool-recipes,
 #header-semantic-edit-coverage {
@@ -471,10 +472,60 @@ summary:focus-visible,
 .header-tool-use:hover,
 #header-needfix:hover,
 #header-roadmap:hover,
+#header-mail:hover,
 #header-skills:hover,
 #header-tool-recipes:hover,
 #header-semantic-edit-coverage:hover {
   background: var(--vscode-list-hoverBackground, var(--accent-soft));
+}
+
+.mail-column {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  overflow: auto;
+  scrollbar-gutter: stable;
+  overscroll-behavior: contain;
+  contain: paint;
+}
+
+.mail-column-title {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  font-weight: 400;
+}
+
+.mail-listener {
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+
+.mail-peer {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--vscode-panel-border, transparent);
+}
+
+.mail-peer-hubs {
+  margin: 2px 0 0;
+  padding-left: 16px;
+  font-size: var(--fs-xs);
+}
+
+.mail-body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 6px 0;
+}
+
+.mail-attachment-name {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: var(--fs-xs);
 }
 
 .telemetry-section-title {

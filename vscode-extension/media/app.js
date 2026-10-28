@@ -282,6 +282,15 @@ const elements = {
   roadmapRefresh: document.querySelector("#roadmap-refresh"),
   roadmapList: document.querySelector("#roadmap-list"),
   roadmapDetailPanel: document.querySelector("#roadmap-detail-panel"),
+  headerMail: document.querySelector("#header-mail"),
+  mailDialog: document.querySelector("#mail-dialog"),
+  mailSummary: document.querySelector("#mail-summary"),
+  mailListener: document.querySelector("#mail-listener"),
+  mailIncludeArchived: document.querySelector("#mail-include-archived"),
+  mailRefresh: document.querySelector("#mail-refresh"),
+  mailInboxList: document.querySelector("#mail-inbox-list"),
+  mailPeersList: document.querySelector("#mail-peers-list"),
+  mailDetailPanel: document.querySelector("#mail-detail-panel"),
   openSettings: document.querySelector("#open-settings"),
   settingsDialog: document.querySelector("#settings-dialog"),
   settingsSummary: document.querySelector("#settings-summary"),
@@ -3608,6 +3617,141 @@ function renderRoadmapDetail(payload) {
   appendNeedfixEvents(fragment, asArray(payload.events));
   elements.roadmapDetailPanel.replaceChildren(fragment);
 }
+
+// WorkHub Mail popup (read-only). Mail text and peer labels come from other
+// machines: every such field reaches the DOM through createElement/textContent.
+function hubMailIdPrefix(value) {
+  return String(value || "").replace(/^repo_/, "").slice(0, 8);
+}
+
+function hubMailNodeLabel(node) {
+  const value = node && typeof node === "object" ? node : {};
+  return `${String(value.machine_label || "unnamed")} · ${hubMailIdPrefix(value.machine_id) || "????????"}`;
+}
+
+function hubMailHubLabel(hub) {
+  const value = hub && typeof hub === "object" ? hub : {};
+  return `${String(value.repo_name || "unnamed")} · ${hubMailIdPrefix(value.hub_id) || "????????"}`;
+}
+
+function requestHubMail() {
+  vscode.postMessage({
+    type: "requestHubMail",
+    includeArchived: Boolean(elements.mailIncludeArchived.checked),
+  });
+}
+
+function renderHubMailListener(listener) {
+  const value = listener && typeof listener === "object" ? listener : {};
+  if (value.state !== "running") {
+    elements.mailListener.textContent = "Listener: stopped";
+    return;
+  }
+  elements.mailListener.textContent = `Listener: running on ${String(value.bind || "?")} · pid ${String(value.pid || "?")}${value.tls ? " · TLS" : ""}`;
+}
+
+function renderHubMailInbox(mails) {
+  if (!mails.length) {
+    elements.mailInboxList.replaceChildren(createElement("div", "panel-list-empty", "Inbox is empty"));
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  for (const mail of mails) {
+    const button = createElement("button", "needfix-list-item");
+    button.type = "button";
+    button.dataset.mailId = String(mail.message_id || "");
+    const heading = createElement("span", "needfix-list-heading");
+    heading.append(
+      createElement("strong", "", String(mail.subject || "(no subject)")),
+      createElement("span", "status-badge", String(mail.kind || "mail")),
+    );
+    const meta = [`from ${hubMailHubLabel(mail.from_hub)}`];
+    if (mail.from_node) meta.push(`on ${hubMailNodeLabel(mail.from_node)}`);
+    meta.push(String(mail.created_at || ""));
+    if (mail.status) meta.push(String(mail.status));
+    if (mail.in_reply_to) meta.push("reply");
+    meta.push(`${formatCount(mail.attachment_count)} attachments`);
+    button.append(heading, createElement("span", "needfix-list-meta", meta.join(" · ")));
+    fragment.appendChild(button);
+  }
+  elements.mailInboxList.replaceChildren(fragment);
+}
+
+function renderHubMailPeers(peers) {
+  if (!peers.length) {
+    elements.mailPeersList.replaceChildren(createElement("div", "panel-list-empty", "No paired machines"));
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  for (const peer of peers) {
+    const row = createElement("div", "mail-peer");
+    row.append(
+      createElement("strong", "", hubMailNodeLabel(peer)),
+      createElement("span", "needfix-list-meta", `${String(peer.address || "no address")} · last seen ${String(peer.last_seen || "never")}${peer.tls_pinned ? " · TLS pinned" : ""}`),
+    );
+    const hubs = createElement("ul", "mail-peer-hubs");
+    for (const hub of asArray(peer.hubs)) hubs.appendChild(createElement("li", "", hubMailHubLabel(hub)));
+    if (!asArray(peer.hubs).length) hubs.appendChild(createElement("li", "", "No hubs advertised"));
+    row.appendChild(hubs);
+    fragment.appendChild(row);
+  }
+  elements.mailPeersList.replaceChildren(fragment);
+}
+
+function renderHubMail(payload) {
+  if (!payload || payload.ok === false) {
+    elements.mailSummary.textContent = (payload && payload.error) ? String(payload.error) : "WorkHub Mail unavailable";
+    renderHubMailInbox([]);
+    renderHubMailPeers([]);
+    renderHubMailListener(null);
+    return;
+  }
+  const outbound = payload.outbound && typeof payload.outbound === "object" ? payload.outbound : {};
+  const parts = [
+    `${hubMailHubLabel(payload.hub)} on ${hubMailNodeLabel(payload.node)}`,
+    `${formatCount(payload.total)} mail`,
+    `${formatCount(payload.invalid_count)} invalid`,
+    `${formatCount(payload.quarantined_count)} quarantined`,
+    `${formatCount(outbound.queued)} queued`,
+    `${formatCount(outbound.delivery_failed)} delivery failed`,
+  ];
+  if (payload.scan_truncated) parts.push(`partial scan · ${formatCount(payload.unscanned_count)} unscanned`);
+  elements.mailSummary.textContent = parts.join(" · ");
+  renderHubMailInbox(asArray(payload.mails));
+  renderHubMailPeers(asArray(payload.peers));
+  renderHubMailListener(payload.listener);
+}
+
+function renderHubMailDetail(payload) {
+  if (!payload || payload.ok === false || !payload.mail) {
+    elements.mailDetailPanel.replaceChildren(createElement("div", "panel-list-empty", (payload && payload.error) ? String(payload.error) : "Mail unavailable"));
+    return;
+  }
+  const mail = payload.mail;
+  const fragment = document.createDocumentFragment();
+  const heading = createElement("div", "needfix-detail-heading");
+  heading.append(
+    createElement("div", "", "Untrusted mail from another hub"),
+    createElement("h3", "", String(mail.subject || "(no subject)")),
+    createElement("span", "status-badge", String(mail.kind || "mail")),
+  );
+  fragment.appendChild(heading);
+  const metadata = createElement("dl", "metadata-grid needfix-metadata");
+  for (const [label, value] of [
+    ["From hub", hubMailHubLabel(mail.from_hub)],
+    ["From machine", mail.from_node ? hubMailNodeLabel(mail.from_node) : "this machine"],
+    ["Created", mail.created_at], ["Status", mail.status], ["Fixed in", mail.fixed_in],
+    ["In reply to", mail.in_reply_to], ["Box", mail.box], ["Message id", mail.message_id],
+  ]) metadata.append(createElement("dt", "", label), createElement("dd", "", String(value || "—")));
+  fragment.appendChild(metadata);
+  fragment.appendChild(createElement("pre", "mail-body", String(mail.body || "")));
+  for (const attachment of asArray(mail.attachments)) {
+    fragment.appendChild(createElement("div", "mail-attachment-name", String(attachment.name || "attachment")));
+    fragment.appendChild(createElement("pre", "mail-body", String(attachment.text || "")));
+  }
+  elements.mailDetailPanel.replaceChildren(fragment);
+}
+// End WorkHub Mail popup.
 
 function renderWaveMiniRoadmapDetail(payload, correlation) {
   if (!waveCycleCurrent(correlation)) return;
@@ -7895,6 +8039,12 @@ window.addEventListener("message", (event) => {
     case "waveMiniRoadmapDetail":
       renderWaveMiniRoadmapDetail(message.payload, message.correlation);
       break;
+    case "hubMail":
+      renderHubMail(message.payload);
+      break;
+    case "hubMailDetail":
+      renderHubMailDetail(message.payload);
+      break;
     case "settings":
       renderSettings(message.payload);
       break;
@@ -8314,6 +8464,21 @@ elements.roadmapIncludeArchived.addEventListener("change", requestRoadmapList);
 elements.roadmapList.addEventListener("click", (event) => {
   const target = event.target.closest("[data-roadmap-id]");
   if (target) vscode.postMessage({ type: "requestRoadmapDetail", roadmapId: target.dataset.roadmapId });
+});
+
+// WorkHub Mail: fetched when the dialog opens or on refresh, never on the periodic snapshot.
+function openHubMailDialog() {
+  if (!elements.mailDialog.open) elements.mailDialog.showModal();
+  elements.mailSummary.textContent = "Loading WorkHub Mail";
+  requestHubMail();
+}
+
+elements.headerMail.addEventListener("click", openHubMailDialog);
+elements.mailRefresh.addEventListener("click", requestHubMail);
+elements.mailIncludeArchived.addEventListener("change", requestHubMail);
+elements.mailInboxList.addEventListener("click", (event) => {
+  const target = event.target.closest("[data-mail-id]");
+  if (target) vscode.postMessage({ type: "requestHubMailDetail", messageId: target.dataset.mailId });
 });
 
 function applyManagerChatCollapsed(collapsed) {
