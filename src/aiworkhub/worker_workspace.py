@@ -2316,6 +2316,27 @@ def _touch_placeholder(worktree: Path, relative: str) -> None:
     os.close(fd)
 
 
+def rework_predecessor_in_shape(
+    predecessor: Mapping[str, Any], workspace: WorkerWorkspace, *, repo: Path
+) -> bool:
+    """True when ``workspace`` is its request's exact configured workspace.
+
+    False when it is not but ``predecessor`` carries a verified sealed delta: a
+    predecessor provisioned under a root another repository owns relaunches
+    from that delta, and its tree must never be read (NF-2026-01765).  Without
+    one the ``gc_workspace_shape_mismatch`` refusal is raised unchanged.
+    """
+    try:
+        assert_gc_safe_workspace_shape(
+            workspace.request_id, workspace.path, workspace.home, repo=repo
+        )
+    except WorkspaceError:
+        if not has_verified_rework_delta(predecessor, authority_repo=repo):
+            raise
+        return False
+    return True
+
+
 def _materialize_rework_predecessor(
     repo: Path,
     worktree: Path,
@@ -2353,9 +2374,9 @@ def _materialize_rework_predecessor(
         raise WorkspaceError(f"rework_predecessor_workspace_invalid:{exc}") from exc
     if source_workspace.repo != repo or source_workspace.request_id != request_id:
         raise WorkspaceError("rework_predecessor_identity_mismatch")
-    assert_gc_safe_workspace_shape(
-        request_id, source_workspace.path, source_workspace.home, repo=repo
-    )
+    # A foreign-rooted predecessor passes only with a verified sealed delta,
+    # which the ``delta_artifact`` branch below then materializes.
+    rework_predecessor_in_shape(predecessor, source_workspace, repo=repo)
     # Deferred like ``record_base_blobs``: promotion_merge owns the recorded-blob
     # three-way merges and imports this module at its top (NF-2026-01431).
     from .promotion_merge import rework_base_drift_rebase
@@ -3367,6 +3388,56 @@ def configured_runtime_root(repo: Path | None = None) -> Path:
     return (Path(tempfile.gettempdir()) / "aiworkhub-runtime").resolve()
 
 
+FOREIGN_WORKTREE_ROOT_REFUSAL = "worktree_root_foreign_repository"
+
+
+def _tracked_repo_id(owner: Path) -> str:
+    """``repo_id`` from ``owner``'s tracked project.json; empty when unreadable."""
+    try:
+        payload = json.loads(
+            (owner / ".aiworkhub" / "project.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return ""
+    value = payload.get("repo_id") if isinstance(payload, dict) else None
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _repository_owned_worktree_root(root: Path, repo: Path | None) -> Path:
+    """Return an override-derived ``root`` unless another repository owns it.
+
+    Measured 2026-10-27: a relaunch exported another registered repository's
+    runtime/worktree root and was provisioned there (NF-2026-01765).  ``root``
+    is honored beneath ``repo``'s own runtime, when its nearest
+    ``.aiworkhub/project.json`` owner is ``repo``, or when that owner tracks
+    ``repo``'s non-empty ``repo_id`` (a worker worktree of the same
+    repository).  A root no registered repository owns stays neutral.  Only
+    the explicit ``repo`` is identity: AIWORKHUB_REPO_ROOT / AIWORKHUB_REPO and
+    cwd are exported by the hub itself, so they never are.
+    """
+    if repo is None:
+        return root
+    selected = Path(repo).resolve()
+    if _path_is_relative_to(root, selected / ".aiworkhub" / "runtime"):
+        return root
+    owner = next(
+        (
+            candidate
+            for candidate in (root, *root.parents)
+            if (candidate / ".aiworkhub" / "project.json").is_file()
+        ),
+        None,
+    )
+    if owner is None or owner == selected:
+        return root
+    owner_id = _tracked_repo_id(owner)
+    if owner_id and owner_id == _tracked_repo_id(selected):
+        return root
+    raise WorkspaceError(
+        f"{FOREIGN_WORKTREE_ROOT_REFUSAL}:root={root}:owner={owner}:repo={selected}"
+    )
+
+
 def configured_worktree_root(repo: Path | None = None) -> Path:
     """Return the single configured root for isolated worker workspaces.
 
@@ -3374,7 +3445,8 @@ def configured_worktree_root(repo: Path | None = None) -> Path:
     On Windows that directory is an AppContainer sandbox root: the child sees
     it as a per-logon-session drive letter, so no ACE is ever written above it
     (NF-2026-01027).  Explicit worktree and runtime overrides retain their
-    existing precedence.
+    existing precedence unless another registered repository owns the root
+    they name (NF-2026-01765, see ``_repository_owned_worktree_root``).
     """
     authorized_scratch = _nested_landlock_exec_scratch_for_repo(repo)
     override = os.environ.get(WORKTREE_ROOT_ENV, "").strip()
@@ -3383,7 +3455,7 @@ def configured_worktree_root(repo: Path | None = None) -> Path:
         if authorized_scratch is None or _path_is_relative_to(
             resolved, authorized_scratch
         ):
-            return resolved
+            return _repository_owned_worktree_root(resolved, repo)
         return (authorized_scratch / "nested-worktrees").resolve()
 
     runtime_override = os.environ.get(RUNTIME_ROOT_ENV, "").strip()
@@ -3411,7 +3483,7 @@ def configured_worktree_root(repo: Path | None = None) -> Path:
 
     default = (configured_runtime_root(repo) / "worktrees").resolve()
     if authorized_scratch is None or _path_is_relative_to(default, authorized_scratch):
-        return default
+        return _repository_owned_worktree_root(default, repo)
     return (authorized_scratch / "nested-worktrees").resolve()
 
 
@@ -6196,7 +6268,15 @@ def assert_gc_safe_workspace_shape(
     """Fail closed unless this is the request's exact configured workspace."""
     if not _REQUEST_ID_RE.fullmatch(request_id):
         raise WorkspaceError(f"gc_invalid_request_id:{request_id}")
-    candidates = [configured_worktree_root(repo), *_legacy_worktree_roots(repo)]
+    try:
+        configured = [configured_worktree_root(repo)]
+    except WorkspaceError as exc:
+        # A configured root another repository owns is no candidate; the
+        # legacy and repository-default roots still are (NF-2026-01765).
+        if not str(exc).startswith(f"{FOREIGN_WORKTREE_ROOT_REFUSAL}:"):
+            raise
+        configured = []
+    candidates = [*configured, *_legacy_worktree_roots(repo)]
     if repo is not None:
         # The finalizing process may hold the repository-owned default root
         # even when AIWORKHUB_RUNTIME_ROOT / AIWORKHUB_WORKTREE_ROOT resolve
@@ -6714,7 +6794,7 @@ def _promotion_begin(workspace: "WorkerWorkspace") -> Path | None:
         fd = os.open(marker, os.O_CREAT | os.O_WRONLY, 0o600)
         os.close(fd)
         return marker
-    except OSError:
+    except (OSError, WorkspaceError):
         return None
 
 

@@ -9249,11 +9249,8 @@ def _verified_retained_predecessor_receipt(
             or workspace.request_id != request_id
         ):
             return None, "reroute_retained_candidate_identity_mismatch"
-        worker_workspace.assert_gc_safe_workspace_shape(
-            request_id,
-            workspace.path,
-            workspace.home,
-            repo=authority_repo,
+        in_place = worker_workspace.rework_predecessor_in_shape(
+            predecessor, workspace, repo=authority_repo
         )
     except (KeyError, OSError, RuntimeError, TypeError, ValueError, worker_workspace.WorkspaceError):
         return None, "reroute_retained_candidate_workspace_invalid"
@@ -9335,11 +9332,12 @@ def _verified_retained_predecessor_receipt(
                 return "reroute_retained_candidate_hash_mismatch"
         return None
 
-    if workspace.path.is_symlink():
+    if in_place and workspace.path.is_symlink():
         return None, "reroute_retained_candidate_workspace_invalid"
     # A husk holds no candidate bytes: treat it as absent so the sealed delta stands in.
-    husk = worker_workspace.is_workspace_husk(workspace.path)
-    if workspace.path.is_dir() and not husk:
+    # A foreign-rooted tree is never read; its verified delta stands in (NF-2026-01765).
+    husk = not in_place or worker_workspace.is_workspace_husk(workspace.path)
+    if not husk and workspace.path.is_dir():
         try:
             observed_paths = worker_workspace.changed_paths(
                 workspace, git_phase="reroute_retained_candidate"
@@ -9352,7 +9350,7 @@ def _verified_retained_predecessor_receipt(
         ):
             return None, "reroute_retained_candidate_workspace_unverifiable"
         verification_error = verify_candidate(workspace.path, observed_paths)
-    elif workspace.path.exists() and not husk:
+    elif not husk and workspace.path.exists():
         return None, "reroute_retained_candidate_workspace_invalid"
     elif sealed_delta:
         try:
