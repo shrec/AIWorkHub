@@ -3993,7 +3993,7 @@ def hub_mail_listener_action_view(
 ) -> dict[str, Any]:
     """USER WRITE: start or stop this machine's WorkHub Mail listener; status is read-only.
 
-    Use this from the dashboard WorkHub Mail panel; aiworkhub_dashboard_hub_mail shows the same listener state with the inbox. start persists enabled=true, so MCP startup restarts the listener, and stop persists enabled=false. One listener runs per home (pidfile) and there is no default bind address. start and stop require confirm=True and an open write gate; status needs neither. Delegates to the same hub_mail_net.listener_action as aiworkhub_manager_hub_mail_listener and never returns the pidfile token.
+    Use this from the dashboard WorkHub Mail panel; aiworkhub_dashboard_hub_mail shows the same listener state with the inbox. start persists enabled=true so MCP startup restarts the listener; stop persists enabled=false. One listener runs per home; no default bind address. start and stop require confirm=True and an open write gate. Delegates to hub_mail_net.listener_action like aiworkhub_manager_hub_mail_listener and never returns the pidfile token.
 
     Args:
         action: str start, stop or status (default "status"); status is read-only.
