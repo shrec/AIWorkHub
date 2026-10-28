@@ -14,7 +14,7 @@ import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from . import sqlite_readonly
 
@@ -584,6 +584,41 @@ def retired_task_statuses(
         return found
     finally:
         conn.close()
+
+
+def linked_task_outcomes(
+    repo_root: str | Path,
+    task_ids: Sequence[str],
+    cards: Mapping[str, Mapping[str, Any] | None],
+    canonical_status: Callable[[Mapping[str, Any]], str],
+) -> list[tuple[str, str, str | None]]:
+    """Resolve each linked id to ``(task_id, display_status, outcome_status)``.
+
+    A live card displays under the archive overlay while its outcome is read
+    with ``archived_at`` cleared, so an accepted-then-archived card stays
+    ``finished``. An id with no live card falls back to its latest retired
+    record (``purged:<status>``); with neither it is ``missing`` and has no
+    outcome. One retired lookup covers every id without a live card.
+    """
+    retired = retired_task_statuses(
+        repo_root, [task_id for task_id in task_ids if cards.get(task_id) is None]
+    )
+    resolved: list[tuple[str, str, str | None]] = []
+    for task_id in task_ids:
+        card = cards.get(task_id)
+        if card is not None:
+            resolved.append(
+                (
+                    task_id,
+                    canonical_status(card),
+                    canonical_status({**card, "archived_at": ""}),
+                )
+            )
+            continue
+        outcome = retired.get(task_id)
+        status = f"purged:{outcome}" if outcome else "missing"
+        resolved.append((task_id, status, outcome))
+    return resolved
 
 
 # --- Exact wave-goal successor binding ---------------------------------------

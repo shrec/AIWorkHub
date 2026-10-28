@@ -13577,14 +13577,19 @@ def roadmap_transition(
             raise roadmap_ns.RoadmapConflictError(
                 "roadmap completion requires explicit acceptance criteria"
             )
+        cards = {
+            task_id: task_store.get_task(repo_root(), task_id)
+            for task_id in current["task_ids"]
+        }
         unfinished: list[str] = []
         missing: list[str] = []
-        for task_id in current["task_ids"]:
-            card = task_store.get_task(repo_root(), task_id)
-            if card is None:
-                missing.append(task_id)
-            elif task_store.canonical_status(card) != "finished":
-                unfinished.append(task_id)
+        # Outcome is read under the archive overlay; an id with no live card
+        # counts only when its retired record is "finished".
+        for task_id, _status, outcome in roadmap_ns.linked_task_outcomes(
+            repo_root(), current["task_ids"], cards, task_store.canonical_status
+        ):
+            if outcome != "finished":
+                (missing if cards[task_id] is None else unfinished).append(task_id)
         if missing or unfinished:
             raise roadmap_ns.RoadmapConflictError(
                 "roadmap completion blocked by task authority: "
@@ -13641,51 +13646,26 @@ def roadmap_snapshot(
         ]
         if missing_ids:
             fetched_cards = task_store.get_tasks(root, missing_ids)
-    # (task_id, displayed status, outcome status); both None when no live card.
-    # The display keeps the archive overlay; acceptance reads the outcome under it.
-    live_statuses: list[list[tuple[str, str | None, str | None]]] = []
-    for item in items:
-        linked: list[tuple[str, str | None, str | None]] = []
-        for task_id in item["task_ids"]:
-            if task_id in task_cards_by_id:
-                card = task_cards_by_id[task_id]
-            elif task_cards_snapshot_complete:
-                card = None
-            else:
-                card = fetched_cards.get(task_id)
-            if card is None:
-                linked.append((task_id, None, None))
-            else:
-                linked.append(
-                    (
-                        task_id,
-                        task_store.canonical_status(card),
-                        task_store.canonical_status({**card, "archived_at": ""}),
-                    )
-                )
-        live_statuses.append(linked)
-    # One query for every task with no live card; a live card always wins.
-    unresolved_ids = {
-        task_id
-        for linked in live_statuses
-        for task_id, status, _outcome in linked
-        if status is None
+    # Linked id -> live card, or None when no live card exists.
+    cards: dict[str, Mapping[str, Any] | None] = {
+        task_id: task_cards_by_id.get(task_id, fetched_cards.get(task_id))
+        for item in items
+        for task_id in item["task_ids"]
     }
-    retired = (
-        _roadmap_store_module().retired_task_statuses(root, sorted(unresolved_ids))
-        if unresolved_ids
-        else {}
-    )
+    resolved = {
+        task_id: (status, outcome)
+        for task_id, status, outcome in _roadmap_store_module().linked_task_outcomes(
+            root, list(cards), cards, task_store.canonical_status
+        )
+    }
     rows: list[dict[str, Any]] = []
-    for item, linked in zip(items, live_statuses):
-        tasks: list[dict[str, str]] = []
-        accepted = 0
-        for task_id, status, outcome in linked:
-            if status is None:
-                outcome = retired.get(task_id)
-                status = f"purged:{outcome}" if outcome else "missing"
-            accepted += 1 if outcome == "finished" else 0
-            tasks.append({"task_id": task_id, "status": status})
+    for item in items:
+        tasks = [
+            {"task_id": task_id, "status": resolved[task_id][0]}
+            for task_id in item["task_ids"]
+        ]
+        accepted = sum(resolved[t][1] == "finished" for t in item["task_ids"])
+        missing = sum(task["status"] == "missing" for task in tasks)
         dependency_blockers = [
             dependency
             for dependency in item["depends_on"]
@@ -13699,6 +13679,8 @@ def roadmap_snapshot(
                 "linked_total": len(tasks),
                 "accepted": accepted,
                 "unresolved": len(tasks) - accepted,
+                "missing": missing,
+                "progress_unmeasurable": missing > 0,
                 "dependency_blockers": dependency_blockers,
                 "dependency_ready": not dependency_blockers,
             }

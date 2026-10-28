@@ -162,6 +162,92 @@ def test_core_completion_uses_canonical_task_authority(
     assert completed["status"] == "completed"
 
 
+def _in_progress(repo: Path, title: str, task_ids: tuple[str, ...]) -> dict:
+    item = _add(repo, title)
+    for task_id in task_ids:
+        roadmap_store.link_task(repo, item["id"], task_id)
+    roadmap_store.transition_item(repo, item["id"], "approved", reason="approved")
+    roadmap_store.transition_item(repo, item["id"], "in_progress", reason="started")
+    return roadmap_store.get_item(repo, item["id"])
+
+
+def test_completion_reads_accepted_then_archived_card_as_finished(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    monkeypatch.setattr(core, "repo_root", lambda: repo)
+    done = _in_progress(repo, "Done", ("task-done",))
+    pending = _in_progress(repo, "Pending", ("task-pending",))
+    cards = {
+        "task-done": {"status": "finished", "worker_status": "done",
+                      "archived_at": "2026-10-27T00:00:00+00:00"},
+        "task-pending": {"status": "pending", "worker_status": "pending",
+                         "archived_at": "2026-10-27T00:00:00+00:00"},
+    }
+    monkeypatch.setattr(
+        core.task_store, "get_task", lambda _root, task_id: cards.get(task_id)
+    )
+    assert core.task_store.canonical_status(cards["task-done"]) == "archived"
+
+    completed = core.roadmap_transition(done["id"], "completed", reason="done")
+    assert completed["status"] == "completed"
+    with pytest.raises(
+        roadmap_store.RoadmapConflictError,
+        match=r"missing=\[\] unfinished=\['task-pending'\]",
+    ):
+        core.roadmap_transition(pending["id"], "completed", reason="done")
+
+
+def test_completion_uses_retired_record_for_ids_without_live_card(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    monkeypatch.setattr(core, "repo_root", lambda: repo)
+    retired = _in_progress(repo, "Retired", ("task-gone",))
+    lost = _in_progress(repo, "Lost", ("task-gone", "task-lost"))
+    roadmap_store.record_task_retired(repo, "task-gone", "finished")
+    monkeypatch.setattr(core.task_store, "get_task", lambda *_args: None)
+
+    completed = core.roadmap_transition(retired["id"], "completed", reason="done")
+    assert completed["status"] == "completed"
+    with pytest.raises(
+        roadmap_store.RoadmapConflictError,
+        match=r"missing=\['task-lost'\] unfinished=\[\]",
+    ):
+        core.roadmap_transition(lost["id"], "completed", reason="done")
+
+
+def test_snapshot_measures_missing_linked_tasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    monkeypatch.setattr(core, "repo_root", lambda: repo)
+    partial = _add(repo, "Partial")
+    whole = _add(repo, "Whole")
+    for task_id in ("task-done", "task-lost"):
+        roadmap_store.link_task(repo, partial["id"], task_id)
+    roadmap_store.link_task(repo, whole["id"], "task-done")
+
+    snapshot = core.roadmap_snapshot(
+        task_cards_snapshot=({"task_id": "task-done", "status": "finished"},),
+        task_cards_snapshot_complete=True,
+    )
+    rows = {row["id"]: row for row in snapshot["items"]}
+
+    assert rows[partial["id"]]["tasks"] == [
+        {"task_id": "task-done", "status": "finished"},
+        {"task_id": "task-lost", "status": "missing"},
+    ]
+    assert {
+        key: rows[partial["id"]][key]
+        for key in ("linked_total", "accepted", "unresolved", "missing")
+    } == {"linked_total": 2, "accepted": 1, "unresolved": 1, "missing": 1}
+    assert rows[partial["id"]]["progress_unmeasurable"] is True
+    assert (rows[whole["id"]]["accepted"], rows[whole["id"]]["unresolved"]) == (1, 0)
+    assert rows[whole["id"]]["missing"] == 0
+    assert rows[whole["id"]]["progress_unmeasurable"] is False
+
+
 def test_snapshot_joins_tasks_and_dependency_blockers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
