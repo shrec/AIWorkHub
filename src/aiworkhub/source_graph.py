@@ -48,9 +48,10 @@ import subprocess
 import sqlite3
 import stat
 import sys
+import threading
 import time
 import tokenize
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import closing, contextmanager
 from contextvars import ContextVar
@@ -5287,6 +5288,74 @@ def _bodygrep_unquote(term: str) -> tuple[str, bool]:
     return term, False
 
 
+BODYGREP_FILE_CACHE_MAX_BYTES = 64 * 1024 * 1024
+_BODYGREP_FILE_CACHE: OrderedDict[tuple[str, int, int], bytes] = OrderedDict()
+# path -> its one live cache key, so dropping a stale generation is O(1).
+_BODYGREP_FILE_CACHE_KEYS: dict[str, tuple[str, int, int]] = {}
+_BODYGREP_FILE_CACHE_BYTES = 0
+_BODYGREP_FILE_CACHE_LOCK = threading.Lock()
+
+
+def _bodygrep_cache_key(candidate: Path, file_stat: os.stat_result) -> tuple[str, int, int]:
+    return (str(candidate), file_stat.st_mtime_ns, file_stat.st_size)
+
+
+def _bodygrep_cache_has(candidate: Path, file_stat: os.stat_result) -> bool:
+    key = _bodygrep_cache_key(candidate, file_stat)
+    with _BODYGREP_FILE_CACHE_LOCK:
+        return key in _BODYGREP_FILE_CACHE
+
+
+def _bodygrep_cache_clear() -> None:
+    global _BODYGREP_FILE_CACHE_BYTES
+    with _BODYGREP_FILE_CACHE_LOCK:
+        _BODYGREP_FILE_CACHE.clear()
+        _BODYGREP_FILE_CACHE_KEYS.clear()
+        _BODYGREP_FILE_CACHE_BYTES = 0
+
+
+def _bodygrep_cache_store(key: tuple[str, int, int], raw: bytes) -> None:
+    """Cache ``raw`` under ``key``, replacing the path's previous generation."""
+
+    global _BODYGREP_FILE_CACHE_BYTES
+    if len(raw) > BODYGREP_FILE_CACHE_MAX_BYTES:
+        return
+    with _BODYGREP_FILE_CACHE_LOCK:
+        previous = _BODYGREP_FILE_CACHE_KEYS.get(key[0])
+        if previous is not None:
+            stale = _BODYGREP_FILE_CACHE.pop(previous, None)
+            if stale is not None:
+                _BODYGREP_FILE_CACHE_BYTES -= len(stale)
+        _BODYGREP_FILE_CACHE[key] = raw
+        _BODYGREP_FILE_CACHE_KEYS[key[0]] = key
+        _BODYGREP_FILE_CACHE_BYTES += len(raw)
+        while _BODYGREP_FILE_CACHE_BYTES > BODYGREP_FILE_CACHE_MAX_BYTES:
+            old_key, old_raw = _BODYGREP_FILE_CACHE.popitem(last=False)
+            _BODYGREP_FILE_CACHE_BYTES -= len(old_raw)
+            if _BODYGREP_FILE_CACHE_KEYS.get(old_key[0]) == old_key:
+                del _BODYGREP_FILE_CACHE_KEYS[old_key[0]]
+
+
+def _bodygrep_file_bytes(candidate: Path, file_stat: os.stat_result) -> tuple[bytes, bool]:
+    """Return ``(bytes, from_cache)``; a miss reads the disk and may cache it."""
+
+    key = _bodygrep_cache_key(candidate, file_stat)
+    with _BODYGREP_FILE_CACHE_LOCK:
+        cached = _BODYGREP_FILE_CACHE.get(key)
+        if cached is not None:
+            _BODYGREP_FILE_CACHE.move_to_end(key)
+            return cached, True
+    raw = candidate.read_bytes()
+    try:
+        after = candidate.stat()
+    except OSError:
+        return raw, False
+    # Cache only bytes proven to belong to the stat that keyed them.
+    if _bodygrep_cache_key(candidate, after) == key and len(raw) == file_stat.st_size:
+        _bodygrep_cache_store(key, raw)
+    return raw, False
+
+
 def bodygrep_query(
     repo_root: Path,
     term: str,
@@ -5340,7 +5409,7 @@ def bodygrep_query(
     # A token-mode cursor is bound to the kind as well as the term, so a page
     # minted by one kind can never resume a scan of another.
     cursor_term = search_term if match_kind == "literal" else f"{match_kind}:{search_term}"
-    byte_cap = max(512, budget * 512)
+    byte_cap = max(4096, budget * 512)
     scan_file_cap = max(64, min(4000, budget * 32))
     scan_byte_cap = max(1_048_576, min(32 * 1_048_576, budget * 262_144))
     normalized_target = ""
@@ -5433,6 +5502,7 @@ def bodygrep_query(
     matches: list[dict[str, Any]] = []
     files_scanned = 0
     bytes_scanned = 0
+    cache_hits = 0
     # token_and_file files that held every token yet no line scored high enough.
     noise_only_files = 0
     # Files skipped because a single one exceeds the whole byte cap. Reported
@@ -5449,9 +5519,10 @@ def bodygrep_query(
         # 8.68 MB data artifact was fully loaded only to be rejected, and the
         # walk is ORDER BY file_path, so data/ is reached before src/.
         try:
-            file_size = candidate.stat().st_size
+            file_stat = candidate.stat()
         except OSError:
             continue
+        file_size = file_stat.st_size
         if file_size > scan_byte_cap:
             # A file larger than the ENTIRE byte cap can never fit on any page,
             # at any position, so neither scanning it nor stopping on it can
@@ -5480,7 +5551,13 @@ def bodygrep_query(
         # A file that would merely overflow the REMAINING budget is ordinary
         # paging: mint a cursor and let the caller continue from it. At least
         # one in-budget file is always scanned per page, so the cursor moves.
-        if files_scanned > 0 and bytes_scanned + file_size > scan_byte_cap:
+        # A file served from the cache costs no disk bytes, so it never counts
+        # toward the page's byte cap and never forces a cursor by itself.
+        if (
+            files_scanned > 0
+            and not _bodygrep_cache_has(candidate, file_stat)
+            and bytes_scanned + file_size > scan_byte_cap
+        ):
             scan_truncated = True
             # Name the first file not yet scanned, at line 0, so resume includes
             # it instead of skipping it or restarting at the alphabetical start.
@@ -5490,10 +5567,13 @@ def bodygrep_query(
             )
             break
         try:
-            raw = candidate.read_bytes()
+            raw, from_cache = _bodygrep_file_bytes(candidate, file_stat)
         except OSError:
             continue
-        bytes_scanned += len(raw)
+        if from_cache:
+            cache_hits += 1
+        else:
+            bytes_scanned += len(raw)
         files_scanned += 1
         last_scanned_file = file_path
         # Reject files that provably cannot match before paying for a UTF-8
@@ -5625,6 +5705,7 @@ def bodygrep_query(
         "candidate_files": _candidate_files(rows, limit=min(16, budget)),
         "files_scanned": files_scanned,
         "bytes_scanned": bytes_scanned,
+        "cache_hits": cache_hits,
         "scan_file_cap": scan_file_cap,
         "scan_byte_cap": scan_byte_cap,
         "scan_truncated": scan_truncated,
@@ -5653,7 +5734,25 @@ def bodygrep_query(
             + (f" (ignored as common: {', '.join(ignored)})" if ignored else "")
             + "; name an exact identifier or add a rarer word"
         )
-    return _fit_payload_bytes(payload, byte_cap)
+    fitted = _fit_payload_bytes(payload, byte_cap)
+    returned = fitted.get("matches")
+    if (
+        match_kind != "token_and_file"
+        and isinstance(returned, list)
+        and len(returned) < len(matches)
+    ):
+        # Trimming may only drop the tail of the scan-ordered rows, so the
+        # cursor restarts just before the first row that was not returned
+        # instead of staying past it (a row that is never returned and never
+        # re-offered is a false zero).
+        first_dropped = matches[len(returned)]
+        fitted["next_cursor"] = _encode_bodygrep_cursor(
+            first_dropped["file_path"], first_dropped["line_start"] - 1,
+            term=cursor_term, target=normalized_target, budget=budget,
+        )
+        fitted["scan_truncated"] = True
+        fitted["truncated"] = True
+    return fitted
 
 
 def body_query(repo_root: Path, name: str, budget: int = 64) -> dict[str, Any]:

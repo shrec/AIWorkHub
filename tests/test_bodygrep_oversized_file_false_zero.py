@@ -27,6 +27,7 @@ was never opened".
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -114,3 +115,49 @@ def test_ordinary_overflow_still_pages_rather_than_skipping(
     # Budget 1 is a 1 MiB cap: the artifact is oversized for it and skipped,
     # and the walk still either finds rows or hands back a cursor to continue.
     assert result["matches"] or result["next_cursor"]
+
+
+def test_baseline_uncached_repeat_query_disk_reads(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """With the cache cleared before every query, a repeat query re-reads every file."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    bootstrap_repository(repo, repo_name="bodygrep")
+    for i in range(6):
+        _write(repo / "src" / f"mod_{i}.py", f"def probe_{i}():\n    return {_TERM!r}\n")
+    sg.build_index(repo, incremental=False)
+    root = repo.resolve()
+
+    reads: list[str] = []
+    original = Path.read_bytes
+
+    def counting_read_bytes(self: Path) -> bytes:
+        if self.resolve().is_relative_to(root):
+            reads.append(str(self))
+        return original(self)
+
+    sg._bodygrep_cache_clear()
+    first = sg.bodygrep_query(repo, _TERM, budget=20, target="src")
+    sg._bodygrep_cache_clear()
+    monkeypatch.setattr(Path, "read_bytes", counting_read_bytes)
+    second = sg.bodygrep_query(repo, _TERM, budget=20, target="src")
+    monkeypatch.setattr(Path, "read_bytes", original)
+
+    assert first["matches"] == second["matches"]
+    assert len(second["matches"]) == 6
+    assert len(reads) == 6
+    with capsys.disabled():
+        print(
+            "\nAIWORKHUB_METRIC:"
+            + json.dumps(
+                {
+                    "metric": "bodygrep_repeat_query_disk_reads",
+                    "unit": "reads",
+                    "value": len(reads),
+                }
+            )
+        )
