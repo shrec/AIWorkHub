@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+
 from aiworkhub import server, task_plan
 
 
@@ -196,8 +199,15 @@ def test_summary_exposes_terminal_artifacts_excluded_and_agrees_with_full():
     summary = task_plan.summarize_task_plan_snapshot(full)
     assert full["terminal_artifacts_excluded_count"] == 1
     assert summary["terminal_artifacts_excluded_count"] == 1
-    assert summary["terminal_artifacts_excluded"] == full["terminal_artifacts_excluded"]
-    assert summary["terminal_artifacts_excluded"][0]["target_status"] == "accepted"
+    assert "terminal_artifacts_excluded" not in summary
+    assert "terminal_artifacts_excluded" in summary["omitted_fields"]
+    expected_sha = hashlib.sha256(
+        json.dumps(
+            full["terminal_artifacts_excluded"], sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    assert summary["terminal_artifacts_excluded_sha256"] == expected_sha
+    assert full["terminal_artifacts_excluded"][0]["target_status"] == "accepted"
     assert "QR-retry-terminal" not in full["task_ids"]
     assert "READY" in summary["ready"]
 
@@ -440,7 +450,14 @@ def test_summary_keeps_artifact_when_live_target_conflicts_stale_recorded_termin
     summary = task_plan.summarize_task_plan_snapshot(full)
     assert full["terminal_artifacts_excluded_count"] == 0
     assert summary["terminal_artifacts_excluded_count"] == 0
-    assert summary["terminal_artifacts_excluded"] == []
+    assert "terminal_artifacts_excluded" not in summary
+    assert "terminal_artifacts_excluded" in summary["omitted_fields"]
+    expected_sha = hashlib.sha256(
+        json.dumps(
+            full["terminal_artifacts_excluded"], sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    assert summary["terminal_artifacts_excluded_sha256"] == expected_sha
     assert "QR-stale-finished" in full["task_ids"]
     assert "QR-stale-finished" in summary["actionable_lifecycle"]
 
@@ -480,7 +497,14 @@ def test_summary_agrees_when_dependent_of_excluded_artifact_is_ready():
     summary = task_plan.summarize_task_plan_snapshot(full)
     assert full["terminal_artifacts_excluded_count"] == 1
     assert summary["terminal_artifacts_excluded_count"] == 1
-    assert summary["terminal_artifacts_excluded"] == full["terminal_artifacts_excluded"]
+    assert "terminal_artifacts_excluded" not in summary
+    assert "terminal_artifacts_excluded" in summary["omitted_fields"]
+    expected_sha = hashlib.sha256(
+        json.dumps(
+            full["terminal_artifacts_excluded"], sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    assert summary["terminal_artifacts_excluded_sha256"] == expected_sha
     assert full["dependencies"]["CHILD"] == []
     assert "CHILD" in full["ready"]
     assert "CHILD" in summary["ready"]
@@ -563,9 +587,17 @@ def test_summary_keeps_bare_superseded_and_excludes_accepted():
     summary = task_plan.summarize_task_plan_snapshot(full)
     assert full["terminal_artifacts_excluded_count"] == 2
     assert summary["terminal_artifacts_excluded_count"] == 2
+    assert "terminal_artifacts_excluded" not in summary
+    assert "terminal_artifacts_excluded" in summary["omitted_fields"]
+    expected_sha = hashlib.sha256(
+        json.dumps(
+            full["terminal_artifacts_excluded"], sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    assert summary["terminal_artifacts_excluded_sha256"] == expected_sha
     by_target = {
         row["target_task_id"]: row["target_status"]
-        for row in summary["terminal_artifacts_excluded"]
+        for row in full["terminal_artifacts_excluded"]
     }
     assert by_target["T-acc"] == "accepted"
     assert by_target["T-ghost"] == "accepted"
@@ -644,7 +676,14 @@ def test_summary_archive_reason_multi_hop_excludes_and_keeps_bare():
     summary = task_plan.summarize_task_plan_snapshot(full)
     assert full["terminal_artifacts_excluded_count"] == 1
     assert summary["terminal_artifacts_excluded_count"] == 1
-    assert full["terminal_artifacts_excluded"] == summary["terminal_artifacts_excluded"]
+    assert "terminal_artifacts_excluded" not in summary
+    assert "terminal_artifacts_excluded" in summary["omitted_fields"]
+    expected_sha = hashlib.sha256(
+        json.dumps(
+            full["terminal_artifacts_excluded"], sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    assert summary["terminal_artifacts_excluded_sha256"] == expected_sha
     assert "QR-mid" not in full["task_ids"]
     assert "QR-bare" in full["task_ids"]
     assert "QR-bare" in summary["actionable_lifecycle"]
@@ -715,7 +754,14 @@ def test_summary_excludes_every_terminal_artifact_beyond_published_200_cap():
     assert len(full["terminal_artifacts_excluded"]) == 200
     assert full["terminal_artifacts_excluded_count"] == 210
     assert summary["terminal_artifacts_excluded_count"] == 210
-    assert summary["terminal_artifacts_excluded"] == full["terminal_artifacts_excluded"]
+    assert "terminal_artifacts_excluded" not in summary
+    assert "terminal_artifacts_excluded" in summary["omitted_fields"]
+    expected_sha = hashlib.sha256(
+        json.dumps(
+            full["terminal_artifacts_excluded"], sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    assert summary["terminal_artifacts_excluded_sha256"] == expected_sha
     assert "QR-209" not in full["task_ids"]
     assert "QR-209" not in summary["actionable_lifecycle"]
     assert "LIVE-READY" in summary["ready"]
@@ -752,7 +798,14 @@ def test_summary_fail_closed_when_live_target_slot_unusable():
     summary = task_plan.summarize_task_plan_snapshot(full)
     assert full["terminal_artifacts_excluded_count"] == 0
     assert summary["terminal_artifacts_excluded_count"] == 0
-    assert summary["terminal_artifacts_excluded"] == []
+    assert "terminal_artifacts_excluded" not in summary
+    assert "terminal_artifacts_excluded" in summary["omitted_fields"]
+    expected_sha = hashlib.sha256(
+        json.dumps(
+            full["terminal_artifacts_excluded"], sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    assert summary["terminal_artifacts_excluded_sha256"] == expected_sha
     assert "QR-recorded-acc" in full["task_ids"]
     assert "QR-recorded-acc" in summary["actionable_lifecycle"]
     assert task_plan.evaluate_terminal_artifact(qr, {"T-ghost": None}) is None

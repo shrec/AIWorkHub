@@ -14,6 +14,8 @@ FIFO order the rest of AIWorkHub's queue already implies.
 """
 
 import fnmatch
+import hashlib
+import json
 import re
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -1054,6 +1056,12 @@ def summarize_task_plan_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     for field in PLAN_SUMMARY_FIELDS:
         if field in snapshot:
             result[field] = snapshot[field]
+    excluded = snapshot.get("terminal_artifacts_excluded")
+    if excluded is not None:
+        result["terminal_artifacts_excluded_sha256"] = hashlib.sha256(
+            json.dumps(excluded, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    result.pop("terminal_artifacts_excluded", None)
     sample_bounds: dict[str, dict[str, Any]] = {}
     sequence_fields = (
         "ready",
@@ -1113,6 +1121,7 @@ def summarize_task_plan_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
         "layers",
         "lifecycle",
         "task_ids",
+        "terminal_artifacts_excluded",
     ]
     return result
 
