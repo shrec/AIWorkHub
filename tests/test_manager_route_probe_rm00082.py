@@ -312,6 +312,7 @@ def test_bootstrap_omits_the_probe_on_a_verified_claude_route(boot_repo, monkeyp
     assert "claude_route_probe" not in reply
 
 
+@pytest.mark.live_manager_chat_seat
 def test_bootstrap_ensures_the_inbox_of_the_resolved_manager_chat_route(boot_repo, monkeypatch):
     state = boot_repo / ".aiworkhub" / "runtime" / "manager_loop"
     (state / "sessions").mkdir(parents=True, exist_ok=True)

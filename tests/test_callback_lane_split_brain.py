@@ -305,6 +305,7 @@ def repo(tmp_path, monkeypatch):
     return root
 
 
+@pytest.mark.live_manager_chat_seat
 def test_bootstrap_keeps_a_verified_claude_route_while_a_manager_chat_is_open(repo, monkeypatch):
     _select_chat(repo)
     monkeypatch.setattr(core, "_claude_manager_identity", lambda: dict(_CLAUDE))
@@ -317,6 +318,7 @@ def test_bootstrap_keeps_a_verified_claude_route_while_a_manager_chat_is_open(re
     assert reply["manager_chat_seat"]["session_id"] == _ACTIVE_CHAT
 
 
+@pytest.mark.live_manager_chat_seat
 @pytest.mark.parametrize("call", [
     lambda: core.claude_callback_wait(timeout_seconds=1),
     lambda: core.claude_callback_ack("batch", "lease"),

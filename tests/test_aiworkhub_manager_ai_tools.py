@@ -1929,6 +1929,7 @@ def _select_manager_chat_session(root, session_id=_SEAT_SESSION, **fields):
     return state
 
 
+@pytest.mark.live_manager_chat_seat
 def test_task_create_uses_active_manager_chat_session_as_callback_origin(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()
@@ -1969,6 +1970,7 @@ def test_task_create_uses_active_manager_chat_session_as_callback_origin(tmp_pat
     assert card["callback_supported"] is True
 
 
+@pytest.mark.live_manager_chat_seat
 def test_task_create_keeps_codex_thread_and_manager_chat_session(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()
@@ -2009,6 +2011,7 @@ def test_task_create_keeps_codex_thread_and_manager_chat_session(tmp_path, monke
     assert card["callback_supported"] is True
 
 
+@pytest.mark.live_manager_chat_seat
 def test_manager_bootstrap_reports_the_active_manager_chat_seat(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()
@@ -2119,6 +2122,7 @@ def _seen_seat(monkeypatch, root):
         conn.close()
 
 
+@pytest.mark.live_manager_chat_seat
 def test_a_fresh_bound_session_is_the_manager_chat_seat_in_core_and_callback_store(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()
@@ -2143,6 +2147,7 @@ def test_an_active_session_idle_past_the_lease_is_not_the_manager_chat_seat(tmp_
     assert _seen_seat(monkeypatch, root) == (None, "", "", "")
 
 
+@pytest.mark.live_manager_chat_seat
 def test_a_session_stamped_from_the_future_is_not_the_manager_chat_seat(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()
@@ -2166,6 +2171,7 @@ def test_a_passive_session_is_not_the_manager_chat_seat(tmp_path, monkeypatch):
     assert _seen_seat(monkeypatch, root) == (None, "", "", "")
 
 
+@pytest.mark.live_manager_chat_seat
 def test_a_session_created_long_ago_but_still_in_use_keeps_the_manager_chat_seat(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()
@@ -2184,6 +2190,7 @@ def test_a_session_created_long_ago_but_still_in_use_keeps_the_manager_chat_seat
     assert origin == session == callback_origin == _SEAT_SESSION
 
 
+@pytest.mark.live_manager_chat_seat
 def test_core_and_callback_store_both_defer_to_the_one_shared_seat_predicate(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()
