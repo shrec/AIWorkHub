@@ -139,7 +139,7 @@ _READ_VERBS = frozenset({
     "list", "show", "get", "search", "status", "health", "count", "events", "snapshot",
     "preview", "readonly", "query", "inspect", "report", "related", "range", "catalog",
     "rank", "profile", "packet", "summary", "usage", "ledger", "queue", "diagnose", "read",
-    "evaluate", "describe", "dryrun", "check", "bench", "current", "inbox", "peers",
+    "evaluate", "describe", "dryrun", "check", "bench", "current", "inbox",
     "recommend", "metrics", "eval", "gate", "scan", "guard", "wait", "digest",
 })
 
