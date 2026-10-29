@@ -12,6 +12,12 @@ import pytest
 from aiworkhub import needfix_store, sdlc_outcome_metrics, task_engine, task_store
 
 
+@pytest.fixture(autouse=True)
+def _cold_ledger_scans(monkeypatch):
+    # These tests pin cold full-scan byte-bound semantics; the segment cache has its own suite.
+    monkeypatch.setattr(sdlc_outcome_metrics, "_segment_cache_path", lambda _log: None)
+
+
 def _receipt(task_id: str, request_id: str, digest: str, claim_epoch: int = 1):
     hashes = {"fixed.txt": digest}
     unsigned = {
@@ -1713,7 +1719,7 @@ def test_read_attempt_evidence_reports_a_stable_unterminated_tail_as_incomplete(
     assert complete.truncated is False
 
 
-def test_scan_segment_flags_a_discarded_tail_without_growth(tmp_path, monkeypatch):
+def test_scan_range_flags_a_discarded_tail_without_growth(tmp_path, monkeypatch):
     ledger = tmp_path / "process_events.jsonl"
     ledger.write_bytes(b"unfinished")
     monkeypatch.setattr(sdlc_outcome_metrics.os, "open", lambda *_args, **_kwargs: 99)
@@ -1721,7 +1727,8 @@ def test_scan_segment_flags_a_discarded_tail_without_growth(tmp_path, monkeypatc
         sdlc_outcome_metrics.os, "fdopen", lambda *_args, **_kwargs: io.BytesIO(b"unfinished")
     )
     rows: list = []
-    assert sdlc_outcome_metrics._scan_segment(ledger, 10, rows) == (10, 0, True)
+    scan = sdlc_outcome_metrics._scan_range(ledger, 0, 10, rows)
+    assert scan.end == 10 and scan.oversized == 0 and scan.discarded_tail
     assert rows == []
 
 
@@ -2009,14 +2016,14 @@ def test_a_hidden_newer_row_of_a_joined_request_never_yields_a_clean_cohort(
     _write_jsonl(archive, [older])
     _write_jsonl(ledger, [newer])
     if hidden == "segment_unreadable":
-        real_scan = sdlc_outcome_metrics._scan_segment
+        real_scan = sdlc_outcome_metrics._scan_range
 
-        def unreadable(path, size, rows):
+        def unreadable(path, start, size, rows):
             if path == ledger:
                 raise PermissionError(path)
-            return real_scan(path, size, rows)
+            return real_scan(path, start, size, rows)
 
-        monkeypatch.setattr(sdlc_outcome_metrics, "_scan_segment", unreadable)
+        monkeypatch.setattr(sdlc_outcome_metrics, "_scan_range", unreadable)
 
     evidence = sdlc_outcome_metrics.read_attempt_evidence(ledger)
     assert evidence.truncation_causes == (hidden,)

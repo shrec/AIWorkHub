@@ -936,24 +936,33 @@ def _collect_attempt_row(line: bytes, rows: list[dict[str, Any]]) -> None:
         rows.append(_project_attempt_row(row))
 
 
-def _scan_segment(
-    path: Path, size: int, rows: list[dict[str, Any]]
-) -> tuple[int, int, bool]:
-    """Collect projected receipt rows from the first ``size`` bytes of one ledger file.
+class _RangeScan(NamedTuple):
+    end: int
+    oversized: int
+    discarded_tail: bool
+    grew: bool
+    committed: int
+    committed_oversized: int
 
-    Returns (bytes read, oversized rows, incomplete). No read passes the lstat snapshot, so a
-    live append can neither overrun the byte bound nor keep an oversized drain going; only
-    newline-terminated lines are admitted, so a record the snapshot cuts never parses as a
-    receipt. ``incomplete`` reports that the file grew or shrank since the snapshot, or that an
-    unterminated tail was discarded even at a stable EOF, i.e. a row exists that this scan did
-    not admit.
+
+def _scan_range(path: Path, start: int, size: int, rows: list[dict[str, Any]]) -> _RangeScan:
+    """Collect projected receipt rows from bytes ``[start, size)`` of one ledger file.
+
+    ``start`` must be a line start. No read passes the lstat snapshot, so a live append can
+    neither overrun the byte bound nor keep an oversized drain going; only newline-terminated
+    lines are admitted, so a record the snapshot cuts never parses as a receipt. ``committed``
+    is the offset after the last newline-terminated line (the only safe place to resume) and
+    ``committed_oversized`` the oversized rows that ended at or before it.
     """
 
     limit = MAX_LEDGER_ROW_BYTES
-    consumed = oversized = 0
+    consumed = committed = start
+    oversized = committed_oversized = 0
     discarded_tail = False
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(fd, "rb") as handle:
+        if start:
+            handle.seek(start)
         while consumed < size:
             line = handle.readline(min(limit + 1, size - consumed))
             if not line:
@@ -968,38 +977,162 @@ def _scan_segment(
                             break
                         consumed += len(line)
                         if line.endswith(b"\n"):
+                            committed, committed_oversized = consumed, oversized
                             break
                 else:
                     # An unterminated tail is never a receipt, but it is an excluded record.
                     discarded_tail = True
-            elif _ATTEMPT_MARKER in line:
-                _collect_attempt_row(line, rows)
-        incomplete = discarded_tail or consumed != size or bool(handle.read(1))
-    return consumed, oversized, incomplete
+            else:
+                committed = consumed
+                if _ATTEMPT_MARKER in line:
+                    _collect_attempt_row(line, rows)
+        grew = bool(handle.read(1))
+    return _RangeScan(consumed, oversized, discarded_tail, grew, committed, committed_oversized)
+
+
+_SEGMENT_CACHE_VERSION = 1
+_SEGMENT_CACHE_MAX_BYTES = 64 * 1024 * 1024
+_SEGMENT_CACHE_INT_FIELDS = ("size", "mtime_ns", "ino", "row_limit", "committed",
+                             "committed_oversized", "oversized")
+
+
+def _segment_cache_path(process_log: Path) -> Path | None:
+    return process_log.parent.parent / "cache" / "sdlc_ledger_segments_v1.json"
+
+
+def _valid_cache_entry(entry: Any) -> bool:
+    if not isinstance(entry, dict) or not isinstance(entry.get("discarded_tail"), bool):
+        return False
+    for name in _SEGMENT_CACHE_INT_FIELDS:
+        value = entry.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return False
+    rows = entry.get("rows")
+    return (
+        entry["committed"] <= entry["size"]
+        and entry["committed_oversized"] <= entry["oversized"]
+        and isinstance(rows, list)
+        and all(isinstance(row, dict) for row in rows)
+    )
+
+
+def _load_segment_cache(path: Path | None) -> dict[str, dict[str, Any]]:
+    """Cached per-segment scans; a missing, corrupt or version-mismatched file is just empty."""
+
+    if path is None:
+        return {}
+    try:
+        if path.stat().st_size > _SEGMENT_CACHE_MAX_BYTES:
+            return {}
+        payload = json.loads(path.read_bytes())
+    except (OSError, ValueError, RecursionError):
+        return {}
+    if not isinstance(payload, dict) or payload.get("version") != _SEGMENT_CACHE_VERSION:
+        return {}
+    segments = payload.get("segments")
+    if not isinstance(segments, dict) or not all(
+        isinstance(key, str) and _valid_cache_entry(entry) for key, entry in segments.items()
+    ):
+        return {}
+    return segments
+
+
+def _save_segment_cache(path: Path | None, entries: dict[str, dict[str, Any]]) -> None:
+    if path is None:
+        return
+    temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        payload = json.dumps({"version": _SEGMENT_CACHE_VERSION, "segments": entries},
+                             separators=(",", ":"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp.write_text(payload, encoding="utf-8")
+        os.replace(temp, path)
+    except (OSError, ValueError):
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+
+
+def _cache_identity(entry: Mapping[str, Any] | None, info: os.stat_result) -> bool:
+    return (
+        entry is not None
+        and entry["row_limit"] == MAX_LEDGER_ROW_BYTES
+        and entry["ino"] == info.st_ino
+    )
 
 
 def read_attempt_evidence(
     process_log: str | Path, *, byte_bound: int = MAX_LEDGER_BYTES
 ) -> AttemptEvidence:
-    """Newest-first, byte-bounded, read-only scan of the process ledger for attempt receipts."""
+    """Newest-first, read-only scan of the process ledger for attempt receipts.
 
-    segments = process_event_ledger.ledger_paths(Path(process_log))
+    Sealed segments (all but the live newest) whose size, mtime and inode match the persisted
+    cache are served without reading, and the live segment is read only from the offset after
+    its last cached complete line when it merely grew. ``byte_bound`` limits the bytes read in
+    this call, never the bytes covered.
+    """
+
+    log = Path(process_log)
+    segments = process_event_ledger.ledger_paths(log)
+    cache_path = _segment_cache_path(log) if segments else None
+    cached = _load_segment_cache(cache_path)
+    entries: dict[str, dict[str, Any]] = {}
     rows: list[dict[str, Any]] = []
     scanned = bytes_scanned = oversized = 0
     causes: set[str] = set()
-    for segment in reversed(segments):
+    for index in range(len(segments) - 1, -1, -1):
+        segment = segments[index]
+        key = os.path.abspath(segment)
+        entry = cached.get(key)
         try:
-            size = segment.lstat().st_size
-            if bytes_scanned + size > byte_bound:
-                causes.add("byte_bound")
-                break
-            consumed, skipped, changed = _scan_segment(segment, size, rows)
+            info = segment.lstat()
+            size = info.st_size
+            segment_rows: list[dict[str, Any]]
+            if (
+                _cache_identity(entry, info)
+                and entry["size"] == size
+                and entry["mtime_ns"] == info.st_mtime_ns
+            ):
+                segment_rows, skipped = list(entry["rows"]), entry["oversized"]
+                changed = entry["discarded_tail"]
+                entries[key] = entry
+            else:
+                resume = (
+                    entry
+                    if index == len(segments) - 1
+                    and _cache_identity(entry, info)
+                    and size > entry["size"]
+                    and info.st_mtime_ns >= entry["mtime_ns"]
+                    else None
+                )
+                start = resume["committed"] if resume else 0
+                if bytes_scanned + size - start > byte_bound:
+                    causes.add("byte_bound")
+                    break
+                segment_rows = list(resume["rows"]) if resume else []
+                scan = _scan_range(segment, start, size, segment_rows)
+                consumed = scan.end - start
+                skipped = (resume["committed_oversized"] if resume else 0) + scan.oversized
+                changed = scan.discarded_tail or scan.end != size or scan.grew
+                bytes_scanned += consumed
+                if scan.end == size:
+                    entries[key] = {
+                        "size": size, "mtime_ns": info.st_mtime_ns, "ino": info.st_ino,
+                        "row_limit": MAX_LEDGER_ROW_BYTES, "committed": scan.committed,
+                        "committed_oversized": (
+                            (resume["committed_oversized"] if resume else 0)
+                            + scan.committed_oversized
+                        ),
+                        "oversized": skipped, "discarded_tail": scan.discarded_tail,
+                        "rows": segment_rows,
+                    }
         except OSError:
             # Older segments are still read, so the skipped rows may be any request's newest.
             causes.add("segment_unreadable")
             continue
+        rows.extend(segment_rows)
         scanned += 1
-        bytes_scanned += consumed
         oversized += skipped
         if changed:
             causes.add("segment_incomplete")
@@ -1009,6 +1142,15 @@ def read_attempt_evidence(
         if len(rows) > MAX_LEDGER_ROWS:
             causes.add("row_bound")
             break
+    if cache_path is not None:
+        kept = {
+            key: cached[key]
+            for key in (os.path.abspath(segment) for segment in segments)
+            if key in cached and key not in entries
+        }
+        merged = {**kept, **entries}
+        if merged != cached:
+            _save_segment_cache(cache_path, merged)
     return AttemptEvidence(
         rows=tuple(rows),
         available=bool(segments),
