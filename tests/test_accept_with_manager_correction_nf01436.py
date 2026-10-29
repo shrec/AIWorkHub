@@ -38,7 +38,7 @@ import hashlib
 import json
 import sqlite3
 import sys
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -56,6 +56,7 @@ from aiworkhub import (  # noqa: E402
     process_launcher_accept_review,
     process_launcher_acceptance,
     quality_evidence,
+    review_orchestrator,
     task_engine,
     task_store,
 )
@@ -610,7 +611,50 @@ def _accept_env(
         "disposition_reviewer_children",
         lambda *a, **k: {"ok": True, "stdout": json.dumps({"finalized": [QR_TASK_ID]})},
     )
+    _seed_manager_confirmation(manager)
     return manager
+
+
+def _seed_manager_confirmation(manager: _StubManager) -> None:
+    """Store the manager's ``confirmed`` row in the real review DB.
+
+    The stub's ``review_finding_dispositions`` feeds the blocker gate; the system
+    disposition write reads the real table, so both must hold the same decision.
+    """
+    db_path = review_orchestrator.canonical_review_db(manager)
+    assert db_path is not None
+    receipt = {
+        "disposition": "confirmed",
+        "actor": "codex:thread-nf01436",
+        "candidate_sha256": CANDIDATE_SHA,
+        "reviewer_receipt_sha256": RECEIPT_SHA,
+    }
+    with closing(sqlite3.connect(db_path)) as conn, conn:
+        conn.execute(review_orchestrator.FINDING_DISPOSITION_TABLE)
+        conn.execute(review_orchestrator.FINDING_DISPOSITION_HISTORY_TABLE)
+        conn.execute(
+            "INSERT INTO review_orchestrator_finding_dispositions "
+            "(receipt_sha256,target_task_id,target_request_id,reviewer_request_id,"
+            "finding_id,disposition,candidate_sha256,reviewer_receipt_sha256,actor,"
+            "decided_at,receipt_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "f" * 64, TASK_ID, REQUEST_ID, QR_REQUEST_ID, FINDING_ID,
+                "confirmed", CANDIDATE_SHA, RECEIPT_SHA, "codex:thread-nf01436",
+                "2026-10-09T00:30:00+00:00", json.dumps(receipt, sort_keys=True),
+            ),
+        )
+
+
+def _stored_system_rows(manager: _StubManager) -> list[sqlite3.Row]:
+    db_path = review_orchestrator.canonical_review_db(manager)
+    assert db_path is not None
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(
+            "SELECT * FROM review_orchestrator_finding_dispositions "
+            "WHERE actor=? ORDER BY finding_id",
+            (review_orchestrator.SYSTEM_ACCEPT_ACTOR,),
+        ).fetchall()
 
 
 def _accept(manager: _StubManager, **kwargs) -> dict:
@@ -670,6 +714,21 @@ def test_confirmed_low_finding_plus_valid_patch_accepts_the_corrected_bytes(
         == correction
     )
 
+    # NF-2026-01828: the confirmed finding the correction repaired is now stored
+    # as fixed_by_correction under the system actor, bound to the accept receipt.
+    auto = result["auto_finding_dispositions"]
+    assert auto["ok"] is True, auto
+    assert auto["counts"] == {"accepted_nonblocking": 0, "fixed_by_correction": 1}
+    rows = _stored_system_rows(manager)
+    assert [(row["finding_id"], row["disposition"], row["actor"]) for row in rows] == [
+        (FINDING_ID, "fixed_by_correction", "system:accept")
+    ]
+    assert rows[0]["candidate_sha256"] == CANDIDATE_SHA
+    assert rows[0]["reviewer_receipt_sha256"] == RECEIPT_SHA
+    assert json.loads(rows[0]["receipt_json"])["accept_receipt_sha256"] == (
+        auto["accept_receipt_sha256"]
+    )
+
 
 # ---------------------------------------------------------------------------
 # (b) without the correction, the refusal is byte-identical to today.
@@ -689,6 +748,9 @@ def test_without_manager_correction_the_confirmed_finding_still_refuses(
     assert blocker["disposition"] == "confirmed"
     assert manager.promoted == []
     assert not (manager.repo / TARGET).exists()
+    # A refused accept records nothing.
+    assert "auto_finding_dispositions" not in result
+    assert _stored_system_rows(manager) == []
 
 
 # ---------------------------------------------------------------------------

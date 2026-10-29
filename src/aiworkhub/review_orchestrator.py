@@ -1220,6 +1220,10 @@ _FINDING_DISPOSITION_REPLAY_KEYS_IGNORED = frozenset(
     {"decided_at", "prior_disposition", "supersedes_receipt_sha256"}
 )
 FINDING_DISPOSITIONS = frozenset({"confirmed", "dismissed"})
+# NF-2026-01828: dispositions only a SUCCESSFUL accept may record, for findings
+# no manager decided. The manager tool never accepts them.
+SYSTEM_FINDING_DISPOSITIONS = frozenset({"fixed_by_correction", "accepted_nonblocking"})
+SYSTEM_ACCEPT_ACTOR = "system:accept"
 MAX_FINDING_DISPOSITION_TEXT = 4000
 
 MANAGER_HOLD_DECISIONS = frozenset({
@@ -3069,6 +3073,172 @@ class ReviewOrchestrator:
             "state": "review_finding_disposition_recorded",
             **receipt,
             "receipt_sha256": receipt_sha256,
+        }
+
+    def record_accept_system_dispositions(
+        self,
+        *,
+        task_id: str,
+        request_id: str,
+        candidate_sha256: str,
+        accept_receipt_sha256: str,
+        findings: list[Mapping[str, Any]],
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Record the system dispositions of one SUCCESSFUL accept (NF-2026-01828).
+
+        Each ``findings`` entry names one finding of a verified reviewer report
+        (``reviewer_task_id``, ``reviewer_request_id``,
+        ``reviewer_receipt_sha256``, ``finding_id`` in its full
+        ``reviewer:<lens>:<id>`` form, ``lens``, ``severity``) and says whether
+        the accept's manager correction repaired it (``corrected``). All rows
+        are written in one BEGIN IMMEDIATE transaction under actor
+        ``system:accept``, bound to the candidate and to the accept receipt.
+
+        A finding with no stored row gets ``accepted_nonblocking``. A finding
+        whose stored row is a manager ``confirmed`` bound to this exact
+        candidate and reviewer receipt, and which the correction repaired, is
+        superseded by ``fixed_by_correction`` through the same append-only
+        history copy a manager re-disposition uses, so the manager's receipt is
+        kept verbatim. Every other stored row -- a manager decision, or a system
+        row from an earlier call -- is left untouched, which makes a replay a
+        no-op.
+        """
+        if not re.fullmatch(r"[0-9a-f]{64}", str(candidate_sha256 or "")):
+            return {"ok": False, "error": "system_disposition_candidate_unavailable"}
+        if not re.fullmatch(r"[0-9a-f]{64}", str(accept_receipt_sha256 or "")):
+            return {"ok": False, "error": "system_disposition_accept_receipt_invalid"}
+        decided_at = (now or datetime.now(timezone.utc)).isoformat()
+        counts = {name: 0 for name in sorted(SYSTEM_FINDING_DISPOSITIONS)}
+        already_recorded = 0
+        try:
+            with closing(_side_table_connection(self.db_path)) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(FINDING_DISPOSITION_TABLE)
+                conn.execute(FINDING_DISPOSITION_HISTORY_TABLE)
+                for guard in FINDING_DISPOSITION_HISTORY_GUARDS:
+                    conn.execute(guard)
+                for entry in findings:
+                    reviewer_request_id = str(entry.get("reviewer_request_id") or "")
+                    finding_id = str(entry.get("finding_id") or "")
+                    reviewer_receipt_sha256 = str(
+                        entry.get("reviewer_receipt_sha256") or ""
+                    )
+                    if not (
+                        reviewer_request_id
+                        and finding_id
+                        and re.fullmatch(r"[0-9a-f]{64}", reviewer_receipt_sha256)
+                    ):
+                        raise sqlite3.IntegrityError(
+                            "system_disposition_finding_unbound"
+                        )
+                    existing = conn.execute(
+                        "SELECT receipt_json,receipt_sha256 "
+                        "FROM review_orchestrator_finding_dispositions "
+                        "WHERE target_request_id=? AND reviewer_request_id=? "
+                        "AND finding_id=?",
+                        (str(request_id), reviewer_request_id, finding_id),
+                    ).fetchone()
+                    stored: Any = None
+                    if existing is not None:
+                        try:
+                            stored = json.loads(str(existing[0]))
+                        except ValueError:
+                            stored = None
+                    supersedes = (
+                        existing is not None
+                        and bool(entry.get("corrected"))
+                        and isinstance(stored, dict)
+                        and stored.get("disposition") == "confirmed"
+                        and stored.get("actor") != SYSTEM_ACCEPT_ACTOR
+                        and stored.get("candidate_sha256") == str(candidate_sha256)
+                        and stored.get("reviewer_receipt_sha256")
+                        == reviewer_receipt_sha256
+                    )
+                    if existing is not None and not supersedes:
+                        already_recorded += 1
+                        continue
+                    disposition = (
+                        "fixed_by_correction" if supersedes else "accepted_nonblocking"
+                    )
+                    receipt: dict[str, Any] = {
+                        "schema_id": FINDING_DISPOSITION_SCHEMA,
+                        "target_task_id": str(task_id),
+                        "target_request_id": str(request_id),
+                        "reviewer_task_id": str(entry.get("reviewer_task_id") or ""),
+                        "reviewer_request_id": reviewer_request_id,
+                        "finding_id": finding_id,
+                        "lens": str(entry.get("lens") or ""),
+                        "severity": str(entry.get("severity") or ""),
+                        "disposition": disposition,
+                        "counter_evidence": "",
+                        "reason": (
+                            "repaired by the manager correction applied at accept"
+                            if supersedes
+                            else "left undecided at accept; non-blocking"
+                        ),
+                        "candidate_sha256": str(candidate_sha256),
+                        "reviewer_receipt_sha256": reviewer_receipt_sha256,
+                        "actor": SYSTEM_ACCEPT_ACTOR,
+                        "accept_receipt_sha256": str(accept_receipt_sha256),
+                        "decided_at": decided_at,
+                    }
+                    if supersedes:
+                        receipt["prior_disposition"] = "confirmed"
+                        receipt["supersedes_receipt_sha256"] = str(existing[1])
+                    receipt_sha256 = canonical_digest(receipt)
+                    receipt_json = json.dumps(
+                        receipt, ensure_ascii=False, sort_keys=True
+                    )
+                    if supersedes:
+                        copied = conn.execute(
+                            "INSERT INTO review_orchestrator_finding_disposition_history "
+                            f"({_FINDING_DISPOSITION_COLUMNS},superseded_by_receipt_sha256) "
+                            f"SELECT {_FINDING_DISPOSITION_COLUMNS},? "
+                            "FROM review_orchestrator_finding_dispositions "
+                            "WHERE receipt_sha256=?",
+                            (receipt_sha256, str(existing[1])),
+                        ).rowcount
+                        updated = conn.execute(
+                            "UPDATE review_orchestrator_finding_dispositions SET "
+                            "receipt_sha256=?,target_task_id=?,disposition=?,"
+                            "candidate_sha256=?,reviewer_receipt_sha256=?,actor=?,"
+                            "decided_at=?,receipt_json=? WHERE receipt_sha256=?",
+                            (
+                                receipt_sha256, str(task_id), disposition,
+                                str(candidate_sha256), reviewer_receipt_sha256,
+                                SYSTEM_ACCEPT_ACTOR, decided_at, receipt_json,
+                                str(existing[1]),
+                            ),
+                        ).rowcount
+                        if copied != 1 or updated != 1:
+                            raise sqlite3.IntegrityError(
+                                "review_finding_disposition_supersede_incomplete"
+                            )
+                    else:
+                        conn.execute(
+                            "INSERT INTO review_orchestrator_finding_dispositions "
+                            "(receipt_sha256,target_task_id,target_request_id,"
+                            "reviewer_request_id,finding_id,disposition,"
+                            "candidate_sha256,reviewer_receipt_sha256,actor,"
+                            "decided_at,receipt_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                receipt_sha256, str(task_id), str(request_id),
+                                reviewer_request_id, finding_id, disposition,
+                                str(candidate_sha256), reviewer_receipt_sha256,
+                                SYSTEM_ACCEPT_ACTOR, decided_at, receipt_json,
+                            ),
+                        )
+                    counts[disposition] += 1
+        except sqlite3.Error as exc:
+            return {"ok": False, "error": str(exc)}
+        return {
+            "ok": True,
+            "actor": SYSTEM_ACCEPT_ACTOR,
+            "accept_receipt_sha256": str(accept_receipt_sha256),
+            "candidate_sha256": str(candidate_sha256),
+            "counts": counts,
+            "already_recorded": already_recorded,
         }
 
     def review_finding_dispositions(

@@ -658,6 +658,82 @@ def bound_finding_dispositions(
     return bound
 
 
+def record_accept_finding_dispositions(
+    self: Any,
+    *,
+    task_id: str,
+    request_id: str,
+    card: Any,
+    reviewer_ids: Any,
+    reviewer_reports: Any,
+    reviewer_tasks: list[tuple],
+    receipt_sha256_by_reviewer: Mapping[str, str],
+    correction_record: Mapping[str, Any] | None,
+    accepted_outcome_receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    """System dispositions for every finding this ACCEPTED request left undecided.
+
+    Called only after the accept has landed, so a failed or refused accept
+    records nothing (NF-2026-01828). ``reviewer_ids``, ``reviewer_reports`` and
+    ``reviewer_tasks`` (``(task_id, workspace, accepted)`` tuples) are
+    index-aligned: the accept loop appends exactly one of each per verified
+    reviewer. A failure here never undoes the accept; it is reported in the
+    returned receipt instead.
+    """
+    from . import review_orchestrator
+
+    try:
+        ids = list(reviewer_ids)
+        reports = list(reviewer_reports)
+        reviewer_task_ids = [str(entry[0]) for entry in reviewer_tasks]
+        review_db = review_orchestrator.canonical_review_db(self)
+        if review_db is None:
+            return {"ok": False, "error": "review_storage_unavailable"}
+        corrected_ids = frozenset(
+            str(value) for value in ((correction_record or {}).get("finding_ids") or ())
+        )
+        findings: list[dict[str, Any]] = []
+        for reviewer_request_id, report, reviewer_task_id in zip(
+            ids, reports, reviewer_task_ids, strict=True
+        ):
+            lens = str(report.get("lens") or "")
+            rows = report.get("findings")
+            for finding in rows if isinstance(rows, list) else []:
+                if not isinstance(finding, Mapping) or not str(finding.get("id") or ""):
+                    continue
+                finding_id = f"reviewer:{lens}:{str(finding.get('id'))}"
+                findings.append(
+                    {
+                        "reviewer_task_id": reviewer_task_id,
+                        "reviewer_request_id": str(reviewer_request_id),
+                        "reviewer_receipt_sha256": str(
+                            receipt_sha256_by_reviewer.get(str(reviewer_request_id))
+                            or ""
+                        ),
+                        "finding_id": finding_id,
+                        "lens": lens,
+                        "severity": str(finding.get("severity") or ""),
+                        "corrected": finding_id in corrected_ids,
+                    }
+                )
+        return review_orchestrator.ReviewOrchestrator(
+            self, db_path=review_db
+        ).record_accept_system_dispositions(
+            task_id=task_id,
+            request_id=request_id,
+            candidate_sha256=_target_candidate_sha256(card),
+            accept_receipt_sha256=str(
+                accepted_outcome_receipt.get("receipt_id") or ""
+            ).removeprefix("sha256:"),
+            findings=findings,
+        )
+    except Exception as exc:  # noqa: BLE001 -- the accept already landed
+        return {
+            "ok": False,
+            "error": f"system_disposition_failed:{type(exc).__name__}",
+        }
+
+
 def _selected_reviewer_rows(
     reviewers: list[dict[str, Any]], reviewer_request_ids: list[str] | None
 ) -> tuple[list[dict[str, Any]], list[str], str]:
@@ -2251,6 +2327,7 @@ ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
     "fold_accept_blockers",
     "_latest_request_identity_event",
     "manager_skill_tools",
+    "record_accept_finding_dispositions",
     "reviewer_evidence",
     "sealed_review_packet",
     "server_derived_risk_tier",
@@ -3994,6 +4071,21 @@ def accept_review(
                 "promoted_paths": promoted,
             }
 
+        # NF-2026-01828: only AFTER the accept landed, so a refused or failed
+        # accept records nothing. The accept is never undone by a failure here.
+        auto_finding_dispositions = record_accept_finding_dispositions(
+            self,
+            task_id=task_id,
+            request_id=request_id,
+            card=card,
+            reviewer_ids=reviewer_ids,
+            reviewer_reports=verified_reviewer_reports,
+            reviewer_tasks=verified_reviewer_tasks,
+            receipt_sha256_by_reviewer=verified_receipt_sha256,
+            correction_record=correction_record,
+            accepted_outcome_receipt=accepted_outcome_receipt,
+        )
+
         needfix_closure = self._close_accepted_task_needfix(task_id, request_id)
 
         verified_reviewer_ids = [
@@ -4104,6 +4196,7 @@ def accept_review(
             "acceptance_evidence_record": acceptance_evidence_record,
             "accepted_outcome_receipt": accepted_outcome_receipt,
             "needfix_closure": needfix_closure,
+            "auto_finding_dispositions": auto_finding_dispositions,
             "learning_commit_owed": learning_owed,
             "needfix_candidates": surviving_findings,
             "session_decision_event": session_decision_event,
