@@ -153,6 +153,7 @@ REWORK_NO_DELTA_EXEMPT_FAILURE_CATEGORIES = frozenset({
     "provider_runtime",
     "dependency_or_route",
     "cancellation_or_timeout",
+    "base_drift",
 })
 
 REJECTION_DISPOSITION_SCHEMA_ID = "aiworkhub.rejection_disposition.v1"

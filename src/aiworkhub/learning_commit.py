@@ -47,6 +47,7 @@ class FailureCategory(Enum):
     DEPENDENCY_OR_ROUTE = "dependency_or_route"
     POLICY_OR_SCOPE = "policy_or_scope"
     CANCELLATION_OR_TIMEOUT = "cancellation_or_timeout"
+    BASE_DRIFT = "base_drift"
     INCONCLUSIVE = "inconclusive"
 
 
@@ -90,6 +91,7 @@ INFRASTRUCTURE_FAILURE_CATEGORIES: FrozenSet[FailureCategory] = frozenset({
     FailureCategory.DEPENDENCY_OR_ROUTE,
     FailureCategory.CANCELLATION_OR_TIMEOUT,
     FailureCategory.VALIDATION_ENVIRONMENT,
+    FailureCategory.BASE_DRIFT,
 })
 CODE_QUALITY_FAILURE_CATEGORIES: FrozenSet[FailureCategory] = frozenset({
     FailureCategory.CANDIDATE_CODE,

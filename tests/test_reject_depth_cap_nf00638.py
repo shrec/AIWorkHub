@@ -34,6 +34,7 @@ _NEVER_COUNTED = (
     FailureCategory.DEPENDENCY_OR_ROUTE,
     FailureCategory.CANCELLATION_OR_TIMEOUT,
     FailureCategory.INCONCLUSIVE,
+    FailureCategory.BASE_DRIFT,
 )
 
 

@@ -478,7 +478,7 @@ class TestCanonicalFailureTaxonomy:
     """The taxonomy is closed and every member is reachable and classified
     from structured terminal-substatus evidence alone."""
 
-    def test_taxonomy_covers_exactly_the_seven_canonical_categories(self):
+    def test_taxonomy_covers_exactly_the_eight_canonical_categories(self):
         assert {member.value for member in FailureCategory} == {
             "candidate_code",
             "validation_environment",
@@ -487,6 +487,7 @@ class TestCanonicalFailureTaxonomy:
             "policy_or_scope",
             "cancellation_or_timeout",
             "inconclusive",
+            "base_drift",
         }
 
     def test_infrastructure_and_code_quality_groupings_are_disjoint(self):
@@ -686,6 +687,7 @@ class TestFailureCategoryIsAProjectionNotATaxonomy:
             FailureCategory.PROVIDER_RUNTIME,
             FailureCategory.DEPENDENCY_OR_ROUTE,
             FailureCategory.CANCELLATION_OR_TIMEOUT,
+            FailureCategory.BASE_DRIFT,
         }
         # An infrastructure override is never a candidate-code verdict.
         assert allowed <= INFRASTRUCTURE_FAILURE_CATEGORIES

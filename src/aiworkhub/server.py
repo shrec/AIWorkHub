@@ -873,6 +873,7 @@ InfrastructureFailureCategory = Literal[
     "provider_runtime",
     "dependency_or_route",
     "cancellation_or_timeout",
+    "base_drift",
 ]
 
 
@@ -4369,7 +4370,7 @@ def aiworkhub_task_reject_review(
         to: Disposition after the reject: pending (rework, default), blocked, archived or superseded; anything else is refused as an invalid reject-review disposition.
         residual_identities: Residual artifact items that remain in scope for the rework, 1-256 objects like {"path": "data/residual.json", "pointer": "/rows/7"} (path = repo-relative file inside the card's allowed_writes, pointer = JSON pointer starting with /); only with to=pending.
         predecessor_request_id: Exact retained review request to use as the rework workspace authority; omit to use the current review request. An empty string fails closed.
-        failure_category: Infrastructure cause when the review machinery failed rather than the candidate code (validation_environment, provider_runtime, dependency_or_route or cancellation_or_timeout); used with to=blocked, and to=pending is also accepted.
+        failure_category: Infrastructure cause when the review machinery failed rather than the candidate code (validation_environment, provider_runtime, dependency_or_route, cancellation_or_timeout or base_drift); used with to=blocked, and to=pending is also accepted. base_drift means canonical main moved under a sound candidate (rebase needed): it is accepted only when git proves the card's recorded base oid is an ancestor of HEAD and a path the candidate changed differs between them, else refused with base_drift_unproven; it never counts toward the reject-depth cap.
         validation_amendment: Validation commands to amend the reworked card with, checked by the same rules as validation on aiworkhub_task_create, e.g. pytest -q tests/test_target.py; omit for no amendment.
         allowed_writes_amendment: Repo-relative paths to add to the card's allowed_writes (add-only); only with to=pending, otherwise refused with allowed_writes_amendment_requires_pending.
         read_first_amendment: Existing repo files, each optionally suffixed :N or :N-M, to add to the card's read_first (add-only, deduplicated); only with to=pending, otherwise refused with read_first_amendment_requires_pending; an absolute, .., .git, .aiworkhub/runtime or missing path is refused with read_first_amendment_invalid.

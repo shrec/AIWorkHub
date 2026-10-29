@@ -6503,6 +6503,77 @@ def _validate_read_first_amendment_paths(
     return list(entries), None
 
 
+_OID_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+
+
+def _base_drift_candidate_evidence(card: Mapping[str, Any]) -> tuple[str | None, list[str]]:
+    """The card's recorded base oid and the repo paths its candidate changed."""
+    for name in ("terminal_review", "terminal_failure"):
+        event = card.get(name)
+        evidence = event.get("evidence") if isinstance(event, dict) else None
+        workspace = evidence.get("workspace") if isinstance(evidence, dict) else None
+        changed = evidence.get("changed_paths") if isinstance(evidence, dict) else None
+        base_oid = workspace.get("base_oid") if isinstance(workspace, dict) else None
+        paths = [item for item in changed if isinstance(item, str)] if isinstance(changed, list) else []
+        if isinstance(base_oid, str) and paths:
+            return base_oid, paths
+    predecessor = card.get("rework_predecessor")
+    workspace = predecessor.get("workspace") if isinstance(predecessor, dict) else None
+    hashes = predecessor.get("changed_path_hashes") if isinstance(predecessor, dict) else None
+    base_oid = workspace.get("base_oid") if isinstance(workspace, dict) else None
+    if isinstance(base_oid, str) and isinstance(hashes, dict):
+        return base_oid, [str(item) for item in hashes if isinstance(item, str)]
+    return None, []
+
+
+def _base_drift_proof(card: Mapping[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """Prove with git that canonical HEAD moved under a candidate-touched path.
+
+    Returns ``(proof, None)`` or ``(None, reason)``. The proof is only the
+    recorded base oid being an ancestor of HEAD and at least one path the
+    candidate changed differing between the two; anything unprovable refuses.
+    """
+    base_oid, candidate_paths = _base_drift_candidate_evidence(card)
+    if base_oid is None or _OID_PATTERN.fullmatch(base_oid) is None:
+        return None, "base_oid_unrecorded"
+    paths = list(dict.fromkeys(
+        path for path in candidate_paths
+        if path
+        and not path.startswith(("/", "-"))
+        and "\x00" not in path
+        and ".." not in path.replace("\\", "/").split("/")
+    ))
+    if not paths:
+        return None, "candidate_paths_unrecorded"
+    try:
+        repo = repo_root().resolve(strict=True)
+        head = task_store._committed_drift_git(repo, "rev-parse", "--verify", "HEAD")
+        head_oid = str(head.stdout or "").strip()
+        if head.returncode != 0 or _OID_PATTERN.fullmatch(head_oid) is None:
+            return None, "head_unresolvable"
+        ancestry = task_store._committed_drift_git(
+            repo, "merge-base", "--is-ancestor", base_oid, "HEAD"
+        )
+        if ancestry.returncode != 0:
+            return None, "base_not_ancestor_of_head"
+        diff = task_store._committed_drift_git(
+            repo, "diff", "--name-only", "-z", base_oid, "HEAD", "--", *paths
+        )
+    except Exception:
+        return None, "git_probe_failed"
+    if diff.returncode != 0:
+        return None, "git_probe_failed"
+    drifted = sorted(set(item for item in str(diff.stdout or "").split("\x00") if item))
+    if not drifted:
+        return None, "no_candidate_path_drift"
+    return {
+        "base_oid": base_oid,
+        "head_oid": head_oid,
+        "drifted_paths": drifted[:256],
+        "drifted_path_count": len(drifted),
+    }, None
+
+
 def reject_review(
     task_id: str,
     reason: str,
@@ -6570,6 +6641,7 @@ def reject_review(
     if blocked is not None:
         return blocked
     explicit_failure_category: str | None = None
+    base_drift_proof: dict[str, Any] | None = None
     if failure_category is not None:
         # A verified manager may park a candidate because the review machinery
         # itself failed. Keep that signal out of candidate-code learning, but
@@ -6593,6 +6665,10 @@ def reject_review(
         if requested_category not in allowed_categories:
             return _lifecycle_error("rejection_failure_category_not_infrastructure")
         explicit_failure_category = requested_category.value
+        if requested_category is FailureCategory.BASE_DRIFT:
+            base_drift_proof, base_drift_error = _base_drift_proof(card)
+            if base_drift_error is not None:
+                return _lifecycle_error(f"base_drift_unproven:{base_drift_error}")
     # Keep the exact SQL preimage while artifact I/O happens outside a writer
     # transaction. A later review episode must never receive this snapshot.
     snapshot_conn = _canonical_connect(readonly=True)
@@ -7107,6 +7183,8 @@ def reject_review(
         "changed_path_hashes": dict(pred_changed_hashes if isinstance(pred_changed_hashes, dict) else {}),
         "to": disposition, "pinned_at": now,
     }
+    if base_drift_proof is not None:
+        card["rejection_disposition"]["base_drift_proof"] = base_drift_proof
     # A validation-only replay grant is bound to the episode the manager just
     # adjudicated.  If that candidate is rejected, the successor must invoke a
     # provider to apply the feedback instead of replaying the rejected bytes.
@@ -7217,6 +7295,8 @@ def reject_review(
             "prior_episode": prior_episode,
             "rework_delta_reuse_error": rework_delta_reuse_error,
         }
+        if base_drift_proof is not None:
+            reject_payload["base_drift_proof"] = base_drift_proof
         # An amendment applied by this same rejection changes the contract the
         # next launch carries, so its counter starts fresh: no cap record then.
         rejection_depth: dict[str, Any] | None = None
