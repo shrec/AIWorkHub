@@ -4852,6 +4852,9 @@ def test_helper_temp_plan_leaves_a_non_validation_launch_unchanged():
 
 
 @windows_only
+# NF-2026-01855: real host spawns at a host MAX_PATH budget; the lane's nested
+# temp leaves no room for the short private temp.
+@requires_host_win32_privileges
 def test_validation_helper_temp_grant_plan_spawns_under_the_winerror_267_limit():
     """The short private temp is the only new modify grant, and a helper cwd fits.
 

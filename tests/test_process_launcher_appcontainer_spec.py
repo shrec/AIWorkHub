@@ -2906,6 +2906,8 @@ def _exited(code: int = 0):
     )
 
 
+# NF-2026-01855: a host MAX_PATH budget; the lane's nested temp leaves no room.
+@requires_host_win32_privileges
 def test_appcontainer_validation_scratch_lives_under_the_request_home(
     tmp_path: Path, monkeypatch
 ) -> None:
