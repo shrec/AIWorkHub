@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.12.75 — 2026-10-29
+
+### Fixed
+
+- Bundled runtime 0.12.75: Codex is one manager provider among several and a Claude Code chat is never granted a Codex identity (RM-2026-00082); reviewer prewarm works for C++ candidates and for candidates that delete files (NF-2026-01801); Source Graph indexes MSBuild project files (NF-2026-01807); `forbidden` bounds writes only (NF-2026-01805); `doctor_diagnose` fails on a manager route mismatch (NF-2026-01802). The full list is in the repository CHANGELOG.
+
 ## 0.12.74 — 2026-10-28
 
 0.12.73 was tagged but never published (a Source Graph daemon test failed on Python 3.14); 0.12.74 ships everything under 0.12.73 plus this fix.

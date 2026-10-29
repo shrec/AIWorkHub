@@ -24,10 +24,10 @@ MCP stdio runtime on the workspace host. It does not open a browser or require
 an AIWorkHub cloud account, and it binds no port and exposes no LAN service
 unless you start the opt-in WorkHub Mail listener on a host and port you name.
 
-## What's new in 0.12.74
+## What's new in 0.12.75
 
-- 0.12.74 ships the unpublished 0.12.73 (its CI failed on Python 3.14). MCP tool profiles: one table decides which tools the `manager`, `worker` and `dashboard` profiles list, the dashboard runs on its own profile, and a call to a tool the active profile does not serve is refused with a message naming the profiles that do. WorkHub Mail's listener and pairing are controlled from the dashboard, and Source Graph gains `mode=diff`.
-- Every MCP tool publishes ToolAnnotations and CI lints the tool surface with TDQS; a reviewer killed by a transport cancellation is retried on another route, and the release watcher follows the exact commit's CI and Release runs after a cut.
+- Codex is one manager provider among several: one provider registry that includes a plain manager chat, no silent fallback to Codex, accept records the verified manager, and a Claude Code chat is never granted a Codex identity. `doctor_diagnose` fails on a manager route mismatch, and an unset `AIWORKHUB_MCP_SURFACE` serves the manager profile.
+- Reviewers work on C++ candidates and on changes that delete files, Source Graph indexes MSBuild project files, and a language-neutral `custom_validation` template ships with a C++ example. `forbidden` now bounds writes only, and a pytest run that fails on an xdist collection divergence is replayed once without xdist.
 
 ## Review automation
 

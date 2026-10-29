@@ -6,6 +6,36 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.75] - 2026-10-29
+
+### Added
+
+- Card creation: opt-in `apply_contract_advice` merges high-score testmap tests into the previewed plan (NF-2026-01791).
+- The language-neutral `custom_validation` task template is discoverable, with a C++ (MSBuild/CTest) example (NF-2026-01806).
+- Source Graph indexes MSBuild project files (`.vcxproj`, `.vcxproj.filters`, `.props`, `.targets`, `.csproj`) as XML (NF-2026-01807).
+- An audited manager tool claims the callback lane for the verified manager (NF-2026-01802).
+
+### Changed
+
+- Codex is one provider: one manager-provider registry that includes `manager_chat`, no silent `codex` fallback, and accept records the verified manager identity (RM-2026-00082).
+- The canonical tool-use policy and its host projections end with "Stop at manager review." instead of naming one vendor as the reviewer (RM-2026-00082).
+- An unset `AIWORKHUB_MCP_SURFACE` serves the `manager` profile; contract freezes and the TDQS pin cover every profile (RM-2026-00078).
+- `aiworkhub_router_known_repositories` is a callable-only, unlisted, deprecated alias of `aiworkhub_repo_list` on the manager profile (RM-2026-00078).
+- Source Graph `health` and `refresh_now` MCP replies default to a summary projection; `detail="full"` returns the raw payload (NF-2026-01808).
+
+### Fixed
+
+- Reviewer prewarm and overlay focus work for C++ candidates and for candidates that delete files; every `quality_review_candidate_source_graph_empty` error names the path and the reason (NF-2026-01801).
+- A Claude Code chat's MCP is never granted a Codex identity; bootstrap reports why the Claude route did not verify and ensures the inbox for every callback-capable route (RM-2026-00082).
+- `doctor_diagnose` fails on a manager route mismatch or on route_pending cards (NF-2026-01802).
+- `forbidden` bounds writes only: `read_first` and `immutable_inputs` inside a forbidden glob are no longer a contradictory path contract (NF-2026-01805).
+- Dependency-derived `immutable_inputs` are optional at launch; a missing derived path no longer blocks it (NF-2026-01803).
+- The `rework_no_delta` operational exemption follows a carried delta by content, and the replay pre-check checks the predecessor the recovery installs (NF-2026-01797).
+- Validation replays a pytest command once without xdist when the failure is an xdist collection divergence on the worktree mount (NF-2026-01794).
+- Roadmap completion and snapshot follow `superseded_by` to a finished successor (NF-2026-01799).
+- A finished reviewer whose bridge home is gone reconciles as moot instead of staying `reconcile_pending` (NF-2026-01800).
+- `worker_workspace.py` is back under the module-size ratchet: the Linux kernel ABI ctypes structures move to `linux_kernel_abi.py` (NF-2026-01810).
+
 ## [0.12.74] - 2026-10-28
 
 0.12.73 was tagged but never published: its CI run failed on Python 3.14 in a Source Graph daemon test. 0.12.74 ships everything listed under 0.12.73 plus the fix below.
