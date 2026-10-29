@@ -30,10 +30,12 @@
   <img alt="Python 3.12+" src="https://img.shields.io/badge/Python-3.12%2B-38bdf8.svg">
   <img alt="VS Code 1.93+" src="https://img.shields.io/badge/VS%20Code-1.93%2B-0ea5e9.svg">
   <a href="https://glama.ai/mcp/servers/shrec/AIWorkHub"><img alt="AIWorkhub MCP server – quality and maintenance score on Glama" src="https://glama.ai/mcp/servers/shrec/AIWorkHub/badges/score.svg"></a>
+  <a href="https://lobehub.com/mcp/shrec-aiworkhub"><img alt="AIWorkHub MCP server rating on LobeHub" src="https://lobehub.com/badge/mcp/shrec-aiworkhub"></a>
 </p>
 
 <p align="center">
   <a href="https://glama.ai/mcp/servers/shrec/AIWorkHub"><img alt="AIWorkhub MCP server – quality and maintenance score on Glama" src="https://glama.ai/mcp/servers/shrec/AIWorkHub/badges/card.svg"></a>
+  <a href="https://lobehub.com/mcp/shrec-aiworkhub"><img alt="AIWorkHub MCP server on LobeHub" src="https://lobehub.com/badge/mcp-full/shrec-aiworkhub"></a>
 </p>
 
 <!-- mcp-name: io.github.shrec/aiworkhub -->
