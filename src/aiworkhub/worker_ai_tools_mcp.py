@@ -96,13 +96,14 @@ import os
 import re
 import secrets
 import sqlite3
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
@@ -8683,9 +8684,12 @@ def validation_run(
     the commands to ``worker_workspace.run_validations`` with that backend:
     the coordinator's own post-exit lane, which runs them in an AppContainer
     under a separate ``<adapter>_validation`` identity, so its grant cleanup
-    never touches the live worker's own container grants.  Any other
+    never touches the live worker's own container grants.  That lane runs
+    with a fresh HOME beside this server's private runtime directory
+    (``_contained_validation_workspace``), never the packet's own HOME, which
+    the bridge places inside it (NF-2026-01822).  Any other
     contained backend, an unbound adapter, or a validation HOME that would
-    expose this server's private runtime directory
+    still expose that private runtime directory
     (``_contained_validation_blocker``) keeps the refusal, and the
     coordinator's post-exit validation stays the only run.
     """
@@ -8728,26 +8732,26 @@ def validation_run(
         selected = [position]
 
     workspace = _packet_workspace(ctx, packet)
-    if contained:
-        blocker = _contained_validation_blocker(ctx, workspace)
-        if blocker:
-            return _contained_validation_refusal(ctx, blocker)
     candidate_digest = _candidate_bytes_digest(
         Path(workspace.path), workspace.allowed_writes
     )
     run_dir = _validation_run_dir(ctx)
     results: list[dict[str, Any]]
     if contained:
-        results = _run_contained_validations(
-            ctx,
-            workspace=workspace,
-            commands=commands,
-            selected=selected,
-            candidate_digest=candidate_digest,
-            run_dir=run_dir,
-            force=bool(force),
-            timeout_seconds=timeout_seconds,
-        )
+        with _contained_validation_workspace(ctx, workspace) as lane_workspace:
+            blocker = _contained_validation_blocker(ctx, lane_workspace)
+            if blocker:
+                return _contained_validation_refusal(ctx, blocker)
+            results = _run_contained_validations(
+                ctx,
+                workspace=lane_workspace,
+                commands=commands,
+                selected=selected,
+                candidate_digest=candidate_digest,
+                run_dir=run_dir,
+                force=bool(force),
+                timeout_seconds=timeout_seconds,
+            )
     else:
         results = [
             _run_one_validation(
@@ -8898,6 +8902,7 @@ def _run_one_validation(
         "returncode": returncode,
         "duration_seconds": duration,
         "timed_out": timed_out,
+        "candidate_bytes_sha256": candidate_digest,
         "full_output_path": str(output_path),
         "full_output_sha256": hashlib.sha256(raw).hexdigest(),
         "unchanged_since_last_run": False,
@@ -8955,6 +8960,26 @@ def _contained_validation_blocker(ctx: WorkerToolContext, workspace: Any) -> str
                 f"server's private runtime directory {private}"
             )
     return ""
+
+
+@contextmanager
+def _contained_validation_workspace(ctx: WorkerToolContext, workspace: Any):
+    """``workspace`` re-homed to a fresh validation HOME for one contained run.
+
+    The bridge binds the contract packet into this server's private runtime
+    directory, so the packet's own HOME is that directory and the blocker
+    above refuses it (NF-2026-01822).  The lane gets a new empty directory
+    beside the private one instead -- in the request HOME holding it, never
+    inside it -- and the directory is removed again on exit.
+    """
+
+    private = ctx.audit_ledger_path or ctx.audit_hmac_key_path
+    base = Path(workspace.home) if private is None else private.resolve().parent.parent
+    home = Path(tempfile.mkdtemp(prefix="vh", dir=base)).resolve()
+    try:
+        yield replace(workspace, home=home)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
 
 
 def _run_contained_validations(
@@ -9081,10 +9106,12 @@ def _contained_validation_receipt(
         "command_sha256": command_sha256,
         "resolved": True,
         "argv": [str(token) for token in row.get("executed_argv") or row.get("argv") or ()],
+        "declared_head": str((row.get("declared_argv") or [""])[0]),
         "returncode": returncode,
         "duration_seconds": row.get("duration_seconds"),
         "timed_out": timed_out,
         "sandbox_backend": row.get("sandbox_backend"),
+        "candidate_bytes_sha256": memo_key[2],
         "full_output_path": str(output_path),
         "full_output_sha256": hashlib.sha256(raw).hexdigest(),
         "unchanged_since_last_run": False,

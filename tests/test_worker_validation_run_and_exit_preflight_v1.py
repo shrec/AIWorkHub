@@ -341,7 +341,8 @@ def test_the_private_runtime_directory_is_never_the_validation_home(
 ) -> None:
     """The bridge binds the contract packet into the directory holding the audit
     key, so that is the HOME the packet resolves to; its HOME grant would hand
-    candidate code that key."""
+    candidate code that key.  The lane runs with a fresh HOME beside it instead
+    (NF-2026-01822), and removes that HOME again afterwards."""
     import dataclasses
 
     _mute_chmod(monkeypatch)
@@ -353,13 +354,26 @@ def test_the_private_runtime_directory_is_never_the_validation_home(
         audit_ledger_path=runtime / "audit_ledger.jsonl",
         audit_hmac_key_path=runtime / "audit_hmac.key",
     )
-    monkeypatch.setattr(worker_workspace, "run_validations", _never)
+    homes: list[Path] = []
 
-    result = w.validation_run(ctx, index="all")
+    def _run_validations(workspace, commands, **route):
+        homes.append(Path(workspace.home))
+        assert Path(workspace.home).is_dir()
+        return [_container_row(commands[0], returncode=0, stdout="1 passed\n")]
 
-    assert result["ok"] is False
-    assert result["reason"] == "validation_run_unavailable_outside_the_worker_sandbox"
-    assert "private runtime directory" in result["detail"]
+    monkeypatch.setattr(worker_workspace, "run_validations", _run_validations)
+    monkeypatch.setattr(w, "_run_one_validation", _never)
+
+    result = w.validation_run(ctx, index=0)
+
+    assert result["ok"] is True
+    assert result["all_passed"] is True
+    [home] = homes
+    private_dir = runtime.resolve()
+    assert home != private_dir
+    assert home not in private_dir.parents
+    assert private_dir not in home.parents
+    assert not home.exists()
 
 
 def test_the_contained_marker_is_bound_from_the_environment(tmp_path: Path) -> None:
