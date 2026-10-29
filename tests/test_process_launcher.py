@@ -12283,6 +12283,110 @@ def test_zero_delta_tripwire_never_cancels_a_live_worker(
     assert notice["enforced"] is False
 
 
+def _nf01831_clock(monkeypatch: pytest.MonkeyPatch, process, seconds: list[float]):
+    monkeypatch.setattr(
+        process_launcher.time,
+        "monotonic",
+        lambda: seconds[min(process.waits, len(seconds) - 1)],
+    )
+
+
+def test_zero_delta_enforce_runs_the_real_cancel_path_with_stalled_no_edit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _manager(
+        tmp_path,
+        show_task=_show(_card),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    process = _NF548Process(timeouts=2)
+    live = _nf548_live(
+        tmp_path,
+        manager,
+        _nf548_workspace(tmp_path),
+        process=process,
+        timeout_seconds=1_200,
+    )
+    live.isolated = False
+    with manager._lock:
+        manager._live[live.request_id] = live
+    manager._append_event({
+        "request_id": live.request_id,
+        "task_id": live.task_id,
+        "runner": live.runner,
+        "topic": live.topic,
+        "adapter_id": live.adapter_id,
+        "state": "running",
+        "pid": process.pid,
+    })
+    terminated: list[int] = []
+    monkeypatch.setattr(
+        process_launcher,
+        "_terminate_process_group",
+        lambda pid, **_kwargs: terminated.append(pid),
+    )
+    _nf01831_clock(monkeypatch, process, [0.0, 700.0, 2800.0])
+
+    manager._await_exit_watching_zero_delta(live)
+
+    assert terminated == [process.pid]
+    cancels = [
+        event
+        for event in manager._events()
+        if event.get("state") in {"cancelled", "cancel_requested"}
+    ]
+    assert len(cancels) == 1
+    assert cancels[0]["reason"] == "stalled_no_edit"
+    assert live.zero_delta_tripwire_settled is True
+    notices = _nf548_notices(manager)
+    assert [notice["enforced"] for notice in notices] == [False, True]
+    assert notices[1]["cancel_ok"] is True
+
+
+def test_zero_delta_enforce_retries_a_failed_cancel_without_a_second_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _manager(
+        tmp_path,
+        show_task=_show(_card),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    process = _NF548Process(timeouts=3)
+    live = _nf548_live(
+        tmp_path,
+        manager,
+        _nf548_workspace(tmp_path),
+        process=process,
+        timeout_seconds=1_200,
+    )
+    attempts: list[str] = []
+
+    def cancel(request_id: str, reason: str) -> dict:
+        attempts.append(reason)
+        return {"ok": False, "request_id": request_id, "state": "reconcile_pending"}
+
+    monkeypatch.setattr(manager, "cancel", cancel)
+    _nf01831_clock(monkeypatch, process, [0.0, 700.0, 2800.0, 2900.0])
+    settled: list[bool] = []
+    original = manager._maybe_emit_zero_delta_notice
+
+    def observe(live_arg, *, elapsed_seconds):
+        result = original(live_arg, elapsed_seconds=elapsed_seconds)
+        settled.append(live_arg.zero_delta_tripwire_settled)
+        return result
+
+    monkeypatch.setattr(manager, "_maybe_emit_zero_delta_notice", observe)
+
+    manager._await_exit_watching_zero_delta(live)
+
+    assert attempts == ["stalled_no_edit"] * 2
+    assert settled == [False, False, False]
+    notices = _nf548_notices(manager)
+    assert [notice["enforced"] for notice in notices] == [False, True]
+    assert notices[1]["cancel_ok"] is False
+    assert notices[1]["cancel_state"] == "reconcile_pending"
+
+
 def test_zero_delta_tripwire_stays_silent_when_an_allowed_write_changed(
     tmp_path: Path,
 ) -> None:

@@ -3973,10 +3973,12 @@ class _LiveProcess:
     pid_start_ticks: int | None = None
     bridge_request: vscode_lm_bridge.BridgeRequest | None = None
     claim_epoch: int | None = None
-    # Once the zero-delta tripwire has settled (enforcement requested, a real
+    # Once the zero-delta tripwire has settled (a cancel accepted, a real
     # delta observed, or the card exempt) no later observation of this run can
     # change the answer, so the monitor stops re-hashing the workspace.
     zero_delta_tripwire_settled: bool = False
+    zero_delta_notice_emitted: bool = False
+    zero_delta_enforce_noticed: bool = False
 
 
 class _QualityReviewPrepFlight:
@@ -8686,9 +8688,11 @@ class ProcessManager:
         """Wait for the worker exactly as before, observing the delta meanwhile.
 
         The wait is sliced so the already-running monitor thread can look at
-        the isolated workspace it is supervising. Nothing here influences
-        exit, timeout, cancellation or finalization: the loop ends only when
-        the process ends, and the one thing it can do is append a notice.
+        the isolated workspace it is supervising. The loop itself ends only
+        when the process ends; a card still showing no allowed-write change
+        past the enforce threshold is cancelled through ``cancel`` with reason
+        ``stalled_no_edit`` (exit, timeout and finalization stay with their
+        normal owners), and notices are appended along the way.
 
         A test double whose ``wait`` takes no ``timeout`` falls back to the
         original blocking call, so the monitor keeps working against any
@@ -8745,14 +8749,27 @@ class ProcessManager:
                 allow_unchanged_required_outputs=(
                     metadata.get("allow_unchanged_required_outputs") or ()
                 ),
+                notice_emitted=live.zero_delta_notice_emitted,
             )
         except OSError:
             # An unreadable workspace is not evidence of an empty run.
             return None
-        if observation.settled:
-            live.zero_delta_tripwire_settled = True
-        if observation.notice is None:
+        notice = dict(observation.notice) if observation.notice else None
+        cancel_ok = True
+        if observation.enforce and notice:
+            try:
+                reply = self.cancel(live.request_id, reason=str(notice["reason"]))
+            except Exception as exc:
+                reply = {"ok": False, "state": f"cancel_raised:{type(exc).__name__}"}
+            cancel_ok = reply.get("ok") is True
+            notice["cancel_ok"] = cancel_ok
+            notice["cancel_state"] = str(reply.get("state") or "")
+        # A refused or failed cancel stays unsettled so the next poll retries it.
+        live.zero_delta_tripwire_settled = observation.settled and cancel_ok
+        if notice is None or (observation.enforce and live.zero_delta_enforce_noticed):
             return None
+        live.zero_delta_notice_emitted = True
+        live.zero_delta_enforce_noticed = observation.enforce
         return self._append_event({
             "request_id": live.request_id,
             "task_id": live.task_id,
@@ -8762,7 +8779,7 @@ class ProcessManager:
             "model": live.model,
             "event_kind": RUNTIME_NOTICE_EVENT_KIND,
             "pid": live.process.pid,
-            **observation.notice,
+            **notice,
         })
 
     def _bridge_request_for_cancellation(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 from dataclasses import dataclass
 from typing import Any, Iterable
@@ -17,6 +18,9 @@ ZERO_DELTA_DEFAULT_ELAPSED_SHARE = 0.5
 ZERO_DELTA_MIN_SECONDS = 60.0
 ZERO_DELTA_MAX_SECONDS = 600.0
 ZERO_DELTA_POLL_SECONDS = 15.0
+ZERO_DELTA_ENFORCE_SECONDS_ENV = "AIWORKHUB_ZERO_DELTA_ENFORCE_SECONDS"
+ZERO_DELTA_DEFAULT_ENFORCE_SECONDS = 2700.0
+ZERO_DELTA_ENFORCE_REASON = "stalled_no_edit"
 
 
 def split_lifecycle_tail(
@@ -64,6 +68,20 @@ def zero_delta_notice_after_seconds(timeout_seconds: Any) -> float:
     return min(ZERO_DELTA_MAX_SECONDS, max(ZERO_DELTA_MIN_SECONDS, scaled))
 
 
+def zero_delta_enforce_after_seconds(timeout_seconds: Any) -> float:
+    notice_after = zero_delta_notice_after_seconds(timeout_seconds)
+    raw = os.environ.get(ZERO_DELTA_ENFORCE_SECONDS_ENV)
+    configured = ZERO_DELTA_DEFAULT_ENFORCE_SECONDS
+    if raw is not None and str(raw).strip():
+        try:
+            value = float(str(raw).strip())
+        except ValueError:
+            value = 0.0
+        if math.isfinite(value) and value > 0.0:
+            configured = value
+    return max(notice_after, configured)
+
+
 def changed_allowed_write_paths(workspace: WorkerWorkspace) -> list[str]:
     """Name allowed-write paths already differing from their baseline."""
 
@@ -105,6 +123,7 @@ def changed_allowed_write_paths(workspace: WorkerWorkspace) -> list[str]:
 class ZeroDeltaTripwire:
     settled: bool
     notice: dict[str, Any] | None = None
+    enforce: bool = False
 
 
 def evaluate_zero_delta_tripwire(
@@ -115,6 +134,7 @@ def evaluate_zero_delta_tripwire(
     required_outputs: Iterable[str] = (),
     read_only: bool = False,
     allow_unchanged_required_outputs: Iterable[str] = (),
+    notice_emitted: bool = False,
 ) -> ZeroDeltaTripwire:
     allowed_writes = [
         str(value) for value in workspace.allowed_writes if str(value or "").strip()
@@ -129,25 +149,26 @@ def evaluate_zero_delta_tripwire(
     elapsed = float(elapsed_seconds)
     if elapsed < notice_after:
         return ZeroDeltaTripwire(settled=False)
+    enforce_after = zero_delta_enforce_after_seconds(timeout_seconds)
+    if notice_emitted and elapsed < enforce_after:
+        return ZeroDeltaTripwire(settled=False)
+    enforce = notice_emitted
     try:
         ceiling = float(int(timeout_seconds))
     except (TypeError, ValueError):
         ceiling = 0.0
-    return ZeroDeltaTripwire(
-        settled=True,
-        notice={
-            "notice": ZERO_DELTA_NOTICE,
-            "elapsed_seconds": round(elapsed, 3),
-            "elapsed_share": round(elapsed / ceiling, 4) if ceiling > 0 else None,
-            "notice_after_seconds": round(notice_after, 3),
-            "timeout_seconds": int(ceiling),
-            "required_outputs": [str(value) for value in required_outputs],
-            "allowed_writes": allowed_writes,
-            "changed_allowed_writes": [],
-            # Zero required-output delta is an observation, not proof that a
-            # live worker is stuck.  Provider reasoning, reads, and tool calls
-            # can legitimately precede the first edit, so only the normal
-            # liveness/timeout owners may terminate the process.
-            "enforced": False,
-        },
-    )
+    notice: dict[str, Any] = {
+        "notice": ZERO_DELTA_NOTICE,
+        "elapsed_seconds": round(elapsed, 3),
+        "elapsed_share": round(elapsed / ceiling, 4) if ceiling > 0 else None,
+        "notice_after_seconds": round(notice_after, 3),
+        "enforce_after_seconds": round(enforce_after, 3),
+        "timeout_seconds": int(ceiling),
+        "required_outputs": [str(value) for value in required_outputs],
+        "allowed_writes": allowed_writes,
+        "changed_allowed_writes": [],
+        "enforced": enforce,
+    }
+    if enforce:
+        notice["reason"] = ZERO_DELTA_ENFORCE_REASON
+    return ZeroDeltaTripwire(settled=enforce, notice=notice, enforce=enforce)
