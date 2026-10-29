@@ -192,7 +192,7 @@ FROZEN_SCHEMA_FINGERPRINTS: dict[str, str] = {
     "aiworkhub_task_review_summarize": "e535208ce91e843357bb2efb237b656c50ad1a0b4e1be4111c9ae2356c647e01",
     "aiworkhub_task_show": "987a6779aea9974dc849205292e41e5fab2443e04e97f3c2528059a6b60c4ad3",
     "aiworkhub_task_stale_recovery_recommend": "2491f64e91873239bd9085912516f2da57da5a1ad58f9745cbca82a8fcccfcd1",
-    "aiworkhub_task_usage_report": "84fe64116d44bde99ea6a1d850e94a3164e32c12b7a4479ecb4dc10bcc0fe7e3",
+    "aiworkhub_task_usage_report": "4a252f6e08f967ab8bfc471b45c578e3e9b57691625a173dbd4943fdd5a3e174",
 }
 
 # Read-only tools_call payloads (client path) -- required args supplied.

@@ -134,7 +134,7 @@ BAD = "Continuous Automated Assurance System"
 
 def test_allowlist_entries_are_exact_reviewable_occurrences():
     assert [(site.path, site.line, site.column) for site in ALLOWED_CORRECTION_SITES] == [
-        ("README.md", 392, 41),
+        ("README.md", 395, 41),
         ("docs/CAAS_PROTOCOL.md", 4, 42),
         ("docs/CAAS_PROTOCOL.md", 50, 39),
     ]

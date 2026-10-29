@@ -37,6 +37,13 @@ _FILLER_LINES = 3600
 _BUDGET = 1
 
 
+@pytest.fixture(autouse=True)
+def _uncached_bodygrep(monkeypatch: pytest.MonkeyPatch) -> None:
+    # These tests assert byte-cap paging; a cached file costs no disk bytes and
+    # never pages (NF-2026-01820), so every file here is read from disk.
+    monkeypatch.setattr(sg, "BODYGREP_FILE_CACHE_MAX_FILE_BYTES", 0)
+
+
 def _write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
