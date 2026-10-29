@@ -48,6 +48,7 @@ from . import evidence_levels
 from . import kilo_auth
 from . import learning_commit
 from . import needfix_store
+from .required_output_glob import GLOB_SIBLING_UNCHANGED_REASON, split_glob_unchanged
 from .platform_io import (
     AdvisoryLockTimeout,
     atomic_replace,
@@ -339,15 +340,14 @@ def _fallback_validate_required_outputs(
         if not pattern:
             raise WorkspaceError("required_output_invalid")
         matches = sorted(workspace.path.glob(pattern))
+        is_glob = any(ch in pattern for ch in "*?[")
         if not matches:
             missing_required_artifacts.append(pattern)
-            code = (
-                "required_output_no_matches"
-                if any(ch in pattern for ch in "*?[")
-                else "required_output_missing"
-            )
+            code = "required_output_no_matches" if is_glob else "required_output_missing"
             legacy_error_codes.append(f"{code}:{pattern}")
             continue
+        glob_unchanged: dict[str, tuple[int, str]] = {}
+        changed_matches: list[str] = []
         for path in matches:
             relative = path.relative_to(workspace.path).as_posix()
             if path.is_symlink():
@@ -374,6 +374,13 @@ def _fallback_validate_required_outputs(
             is_unchanged = baseline in {digest, current} and not inherited_change
             if is_unchanged:
                 if relative not in unchanged_allowed:
+                    if (
+                        is_glob
+                        and relative not in workspace.inherited_rework_paths
+                        and current == workspace.parent_baseline.get(relative)
+                    ):
+                        glob_unchanged[relative] = (size, current)
+                        continue
                     unchanged_mandatory_outputs.append(relative)
                     legacy_error_codes.append(f"required_output_unchanged:{relative}")
                     continue
@@ -394,6 +401,21 @@ def _fallback_validate_required_outputs(
                 "sha256": current,
                 "unchanged_allowed": is_unchanged,
             })
+            if not is_unchanged:
+                changed_matches.append(relative)
+        failing, allowed = split_glob_unchanged(glob_unchanged, changed_matches)
+        unchanged_mandatory_outputs.extend(failing)
+        legacy_error_codes.extend(f"required_output_unchanged:{p}" for p in failing)
+        records.extend(
+            {
+                "path": p,
+                "bytes": glob_unchanged[p][0],
+                "sha256": glob_unchanged[p][1],
+                "unchanged_allowed": True,
+                "reason": GLOB_SIBLING_UNCHANGED_REASON,
+            }
+            for p in allowed
+        )
     if missing_required_artifacts or unchanged_mandatory_outputs or scope_violations:
         diagnostics = {
             "missing_required_artifacts": missing_required_artifacts,

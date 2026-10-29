@@ -6643,6 +6643,7 @@ def validate_required_outputs(
             sealed_inherited_hashes = {
                 str(k): v for k, v in pinned_hashes.items() if str(k) in inherited_paths
             }
+    from .required_output_glob import GLOB_SIBLING_UNCHANGED_REASON, split_glob_unchanged
     unchanged_allowed: set[str] = set()
     for raw in allow_unchanged or ():
         path = _relative_repo_path(raw)
@@ -6666,7 +6667,7 @@ def validate_required_outputs(
             legacy_error_codes.append(f"required_output_not_allowed:{pattern}")
             continue
         matches: list[str]
-        if any(ch in pattern for ch in "*?["):
+        if is_glob := any(ch in pattern for ch in "*?["):
             matches = _required_output_glob_matches(workspace.path, pattern)
             if not matches:
                 missing_required_artifacts.append(pattern)
@@ -6674,6 +6675,7 @@ def validate_required_outputs(
                 continue
         else:
             matches = [pattern]
+        glob_unchanged: dict[str, tuple[int, str | None]] = {}
         for relative in matches:
             target = workspace.path / relative
             _require_beneath(workspace.path, target)
@@ -6744,6 +6746,17 @@ def validate_required_outputs(
                             claim_epoch=replay_claim_epoch,
                         )
                     if replay_evidence is None:
+                        if (
+                            is_glob
+                            and relative not in workspace.inherited_rework_paths
+                            and current_hash is not None
+                            and current_hash == workspace.parent_baseline.get(relative)
+                            and not target.is_symlink()
+                            and target.is_file()
+                            and size > 0
+                        ):
+                            glob_unchanged[relative] = (size, current_hash)
+                            continue
                         unchanged_mandatory_outputs.append(relative)
                         legacy_error_codes.append(f"required_output_unchanged:{relative}")
                         continue
@@ -6783,6 +6796,16 @@ def validate_required_outputs(
             if replay_evidence is not None:
                 record["replay_evidence"] = replay_evidence
             records.append(record)
+        if glob_unchanged:
+            changed = [r["path"] for r in records if r["pattern"] == pattern and not r["unchanged_allowed"]]
+            failing, allowed = split_glob_unchanged(glob_unchanged, changed)
+            unchanged_mandatory_outputs.extend(failing)
+            legacy_error_codes.extend(f"required_output_unchanged:{p}" for p in failing)
+            records.extend(
+                {"pattern": pattern, "path": p, "bytes": glob_unchanged[p][0], "sha256": glob_unchanged[p][1],
+                 "unchanged_allowed": True, "reason": GLOB_SIBLING_UNCHANGED_REASON}
+                for p in allowed
+            )
     if missing_required_artifacts or unchanged_mandatory_outputs or scope_violations:
         diagnostics = {
             "missing_required_artifacts": missing_required_artifacts,
