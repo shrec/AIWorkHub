@@ -327,6 +327,9 @@ def test_repo_bound_usage_preserves_retries_and_cache_economics(monkeypatch, tmp
         "retry_tokens": 120,
         "retry_cost_usd": 0.0,
         "retry_cost_unknown_records": 0,
+        "by_cause": {
+            "unknown": {"retry_records": 1, "retry_tokens": 120, "retry_cost_usd": 0.0},
+        },
         "accepted_retried_tasks": 1,
         "accepted_rate_among_retried_tasks_percent": 100.0,
         "claim_boundary": (

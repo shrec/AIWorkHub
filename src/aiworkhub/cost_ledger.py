@@ -358,15 +358,18 @@ def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
         task_id = str(entry.get("task_id") or "")
         topic = str(entry.get("topic") or "")
         topic_source = "usage_event" if topic else ""
+        # Resolve the attempt's process event once per row: both the topic
+        # join and the terminal cause read this single lookup, which is a
+        # dict hit against the already-indexed ledger.
+        event = _matching_process_event(
+            entry, repo_root, process_events, resolved_root=resolved_root
+        )
         if not topic:
             # A live writer regression dropped the topic from usage_record
             # payloads; recover it from request-time identity first (the
             # process ledger row for the same task/request), then from the
             # task itself. Provenance stays visible: tokens are unchanged,
             # only the attribution key is joined.
-            event = _matching_process_event(
-                entry, repo_root, process_events, resolved_root=resolved_root
-            )
             joined = str(event.get("topic") or "") if event is not None else ""
             if joined:
                 topic, topic_source = joined, "process_event_join"
@@ -427,6 +430,14 @@ def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
             "source_detail": str(entry.get("source") or ""),
             "note": note,
             "attempt_id": _request_identity(entry),
+            # Why this attempt ended: the terminal substatus when the ledger
+            # recorded one, else its final state. A retry's cause reads this
+            # from the PREVIOUS attempt row.
+            "terminal_cause": (
+                str(event.get("terminal_substatus") or event.get("state") or "")
+                if event is not None
+                else ""
+            ),
             # created_at stays the ledger write time for audit; the day
             # bucket and attempt ordering follow the attempt's own instant.
             "created_at": created_at,
@@ -806,13 +817,27 @@ def _retry_economics(
             by_task[task_id].append(row)
     retry_rows: list[dict[str, Any]] = []
     retried_tasks: set[str] = set()
+    by_cause: dict[str, dict[str, Any]] = {}
     for task_id, rows in by_task.items():
         # Order by when the attempt ran, not when its row was written: a
         # backfilled first attempt otherwise sorts after the live retries.
         ordered = sorted(rows, key=_attempt_time)
         if len(ordered) > 1:
             retried_tasks.add(task_id)
-            retry_rows.extend(ordered[1:])
+            for previous, retry in zip(ordered, ordered[1:]):
+                retry_rows.append(retry)
+                # A retry's cause is why the PREVIOUS attempt ended. Rows
+                # built before the field existed stay cause-unknown rather
+                # than raising: legacy callers must keep working.
+                cause = str(previous.get("terminal_cause") or "") or "unknown"
+                bucket = by_cause.setdefault(
+                    cause,
+                    {"retry_records": 0, "retry_tokens": 0, "retry_cost_usd": 0.0},
+                )
+                bucket["retry_records"] += 1
+                bucket["retry_tokens"] += int(retry.get("total_tokens") or 0)
+                if retry.get("cost_known"):
+                    bucket["retry_cost_usd"] += float(retry.get("cost_usd") or 0.0)
     accepted_retried = sum(
         1
         for task_id in retried_tasks
@@ -841,6 +866,14 @@ def _retry_economics(
         "retry_cost_unknown_records": sum(
             1 for row in retry_rows if not row.get("cost_known")
         ),
+        "by_cause": {
+            cause: {
+                "retry_records": int(bucket["retry_records"]),
+                "retry_tokens": int(bucket["retry_tokens"]),
+                "retry_cost_usd": round(float(bucket["retry_cost_usd"]), 6),
+            }
+            for cause, bucket in sorted(by_cause.items())
+        },
         "accepted_retried_tasks": accepted_retried,
         "accepted_rate_among_retried_tasks_percent": (
             round(100.0 * accepted_retried / len(retried_tasks), 1)
