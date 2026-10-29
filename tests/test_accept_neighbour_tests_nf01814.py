@@ -232,6 +232,63 @@ def test_selector_reuses_the_contract_advice_testmap_pass(
     assert not hasattr(neighbours, "analytics_query")
 
 
+RATCHET = "tests/test_module_size_ratchet.py"
+
+
+def test_invariant_test_is_selected_when_testmap_finds_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _tests_on_disk(tmp_path, RATCHET)
+    _fake_graph(monkeypatch, {})
+    selection = neighbours.select_neighbour_tests(tmp_path, [ENGINE], [])
+    assert selection.tests == (RATCHET,)
+    assert selection.reason == "no_related_tests"
+    assert selection.evidence()["invariant"] == [RATCHET]
+    assert selection.evidence()["selected"] == [RATCHET]
+
+
+def test_invariant_test_is_selected_when_testmap_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _tests_on_disk(tmp_path, RATCHET)
+    _fake_graph(monkeypatch, {}, freshness=sg.SourceGraphError("index_missing: no db"))
+    selection = neighbours.select_neighbour_tests(tmp_path, [ENGINE], [])
+    assert selection.tests == (RATCHET,)
+    assert selection.reason == "index_missing"
+
+
+def test_invariant_test_is_not_selected_without_changed_src_python(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _tests_on_disk(tmp_path, RATCHET)
+    _fake_graph(monkeypatch, {})
+    selection = neighbours.select_neighbour_tests(tmp_path, ["tests/test_a.py", "README.md"], [])
+    assert selection.tests == () and selection.reason == "no_changed_production_python"
+
+
+def test_invariant_test_named_by_the_declared_validation_is_not_duplicated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _tests_on_disk(tmp_path, RATCHET)
+    _fake_graph(monkeypatch, {ENGINE: _related((RATCHET, 50))})
+    selection = neighbours.select_neighbour_tests(
+        tmp_path, [ENGINE], [f"python -m pytest {RATCHET} -q"]
+    )
+    assert selection.tests == ()
+    assert "invariant" not in selection.evidence()
+
+
+def test_invariant_test_does_not_consume_the_neighbour_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = [f"tests/test_n{index:02d}.py" for index in range(20)]
+    _tests_on_disk(tmp_path, RATCHET, *paths)
+    _fake_graph(monkeypatch, {ENGINE: _related(*((path, 50) for path in paths))})
+    selection = neighbours.select_neighbour_tests(tmp_path, [ENGINE], [])
+    assert selection.tests == (*paths[: neighbours.MAX_NEIGHBOUR_TESTS], RATCHET)
+    assert selection.evidence()["omitted"] == 8
+
+
 # --- the run --------------------------------------------------------------------------
 
 

@@ -22,7 +22,7 @@ import json
 import re
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +36,9 @@ from .worker_workspace import WorkspaceError
 # highest-scoring neighbour a smaller cap would also keep.
 MAX_NEIGHBOUR_TESTS = 12
 DEFAULT_NEIGHBOUR_LIMIT = MAX_NEIGHBOUR_TESTS
+# Repository-wide invariants no testmap links to one module; they run whenever
+# a src/ module changed and do not count against the neighbour cap.
+INVARIANT_TESTS = ("tests/test_module_size_ratchet.py",)
 NEIGHBOUR_FAILURE_PREFIX = "neighbour_tests_failed:"
 NEIGHBOUR_FAILURE_DETAIL_CHARS = 4000
 MAX_REPORTED_FAILURES = 20
@@ -59,6 +62,7 @@ class NeighbourSelection:
     production_paths: tuple[str, ...] = ()
     related_count: int = 0
     unavailable_paths: tuple[Mapping[str, str], ...] = field(default=())
+    invariant: tuple[str, ...] = ()
 
     def evidence(self) -> dict[str, Any]:
         record: dict[str, Any] = {
@@ -66,8 +70,10 @@ class NeighbourSelection:
             "limit": self.limit,
             "production_paths": list(self.production_paths),
             "related_count": self.related_count,
-            "omitted": max(0, self.related_count - len(self.tests)),
+            "omitted": max(0, self.related_count - (len(self.tests) - len(self.invariant))),
         }
+        if self.invariant:
+            record["invariant"] = list(self.invariant)
         if self.reason:
             record["reason"] = self.reason
         if self.unavailable_paths:
@@ -109,9 +115,37 @@ def select_neighbour_tests(
     """
     bounded = _bounded_limit(limit)
     try:
-        return _select(Path(repo_root), changed_paths, declared_commands, bounded)
+        selection = _select(Path(repo_root), changed_paths, declared_commands, bounded)
     except Exception as exc:  # the lane is evidence-gathering: it records, never raises
-        return _empty(f"neighbour_selection_failed:{type(exc).__name__}", bounded)
+        selection = _empty(f"neighbour_selection_failed:{type(exc).__name__}", bounded)
+    try:
+        return _with_invariants(Path(repo_root), selection, changed_paths, declared_commands)
+    except Exception:  # the invariant addition must never turn a selection into a raise
+        return selection
+
+
+def _with_invariants(
+    root: Path,
+    selection: NeighbourSelection,
+    changed_paths: Iterable[Any],
+    declared_commands: Sequence[str],
+) -> NeighbourSelection:
+    if selection.limit == 0 or not _production_paths(changed_paths):
+        return selection
+    named = set(
+        _advice._command_names(
+            command for command in declared_commands if isinstance(command, str)
+        )
+    )
+    present = set(selection.tests)
+    invariant = tuple(
+        test
+        for test in INVARIANT_TESTS
+        if test not in named and test not in present and (root / test).is_file()
+    )
+    if not invariant:
+        return selection
+    return replace(selection, tests=selection.tests + invariant, invariant=invariant)
 
 
 def _select(
