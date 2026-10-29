@@ -222,6 +222,88 @@ def _resolve_review_candidate(request_id: str) -> _ReviewCandidate:
     )
 
 
+def _candidate_request_finished(manager: Any, request_id: str) -> bool:
+    """True only when the request is definitively not review_ready any more."""
+
+    from . import process_launcher
+    from .launch_zero_delta import split_lifecycle_tail
+
+    events = manager._request_events(request_id)
+    if not events:
+        return True
+    task_id = str(split_lifecycle_tail(events)[0].get("task_id") or "")
+    if not task_id:
+        return False
+    card = process_launcher._parse_card(manager._show_task(task_id), task_id)
+    return not (
+        str(card.get("status") or "") == "review"
+        and str(card.get("terminal_substatus") or "") == "review_ready"
+    )
+
+
+def _sweep_candidate_overlays(overlay_root: Path, keep_request_id: str) -> int:
+    """Remove request dirs of finished requests; return how many were removed.
+
+    Best effort and never raises: a failed lookup keeps the dir, symlinks are
+    never followed, and an OSError during removal is retried on the next sweep.
+    """
+
+    import shutil
+
+    removed = 0
+    try:
+        from . import process_launcher
+
+        manager = process_launcher.default_manager()
+        with os.scandir(overlay_root) as scan:
+            entries = list(scan)
+    except Exception:
+        return 0
+    for entry in entries:
+        try:
+            if entry.name == keep_request_id:
+                continue
+            if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                continue
+            if not _candidate_request_finished(manager, entry.name):
+                continue
+            shutil.rmtree(entry.path)
+            removed += 1
+        except Exception:
+            continue
+    return removed
+
+
+def _prune_superseded_overlays(cache_dir: Path, db_path: Path) -> None:
+    """Drop older overlay partitions and the base pins only they referenced."""
+
+    from . import source_graph_partition
+
+    try:
+        with os.scandir(cache_dir) as scan:
+            entries = list(scan)
+        for entry in entries:
+            if (
+                entry.name.startswith("overlay_")
+                and entry.name.endswith(".sqlite")
+                and entry.name != db_path.name
+                and not entry.is_symlink()
+                and entry.is_file(follow_symlinks=False)
+            ):
+                try:
+                    os.unlink(entry.path)
+                except OSError:
+                    continue
+        marker = source_graph_partition.read_composed_marker(db_path)
+        base = (marker or {}).get("base")
+        pin = base.get("pin") if isinstance(base, dict) else None
+        name = pin.get("name") if isinstance(pin, dict) else None
+        if isinstance(name, str) and name:
+            source_graph_partition._prune_base_pins(cache_dir, keep=name)
+    except OSError:
+        return
+
+
 def _candidate_overlay_binding(
     ctx: worker_tools.WorkerToolContext, request_id: str
 ) -> worker_tools.AuthorityBinding:
@@ -277,6 +359,9 @@ def _candidate_overlay_binding(
                 == snapshot_digest
             )
             if not ready:
+                _sweep_candidate_overlays(
+                    root / _CANDIDATE_OVERLAY_DIR, candidate.request_id
+                )
                 temporary = cache_dir / f".{db_path.name}.{secrets.token_hex(8)}.tmp"
                 try:
                     source_graph_partition.build_partition(
@@ -291,6 +376,7 @@ def _candidate_overlay_binding(
                     os.replace(temporary, db_path)
                 finally:
                     temporary.unlink(missing_ok=True)
+                _prune_superseded_overlays(cache_dir, db_path)
     except (
         source_graph_partition.PartitionError,
         source_graph.SourceGraphError,
