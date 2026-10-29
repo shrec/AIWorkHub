@@ -44,24 +44,36 @@ for (const marker of [
   'id="mail-peers-list"',
   'id="mail-detail-panel"',
   'id="mail-refresh"',
-  'id="mail-listener-host" type="text" value="localhost"',
-  'id="mail-listener-port" type="number" min="0" max="65535" step="1" value="0"',
-  'id="mail-listener-start"',
-  'id="mail-listener-stop"',
-  'id="mail-pair-begin"',
+  'id="mail-discover"',
+  'id="mail-found-list"',
+  'id="mail-requests-list"',
   'id="mail-pair-address"',
-  'id="mail-pair-code"',
-  'id="mail-pair-tls" type="checkbox"',
-  'id="mail-pair-complete"',
+  'id="mail-pair-manual"',
+  'id="mail-peers-result"',
 ]) assert.ok(extension.includes(marker), `missing WorkHub Mail UI marker: ${marker}`);
 
 for (const tool of [
   "aiworkhub_dashboard_hub_mail",
   "aiworkhub_dashboard_hub_mail_detail",
-  "aiworkhub_dashboard_hub_mail_listener",
-  "aiworkhub_dashboard_hub_mail_pair_begin",
-  "aiworkhub_dashboard_hub_mail_pair_complete",
+  "aiworkhub_dashboard_hub_mail_peers",
 ]) assert.ok(extension.includes(`"${tool}"`), `missing WorkHub Mail bridge tool: ${tool}`);
+
+// The typed-code flow is gone from both the host and the Webview.
+for (const [name, text] of [["extension.js", extension], ["media/app.js", app]]) {
+  for (const gone of [
+    "aiworkhub_dashboard_hub_mail_listener",
+    "aiworkhub_dashboard_hub_mail_pair_begin",
+    "aiworkhub_dashboard_hub_mail_pair_complete",
+    "mail-pair-code",
+    "mail-pair-begin",
+    "mail-pair-complete",
+    "mail-listener-start",
+    "mailPairCode",
+    "hubMailListener",
+    "hubMailPairBegin",
+    "hubMailPairComplete",
+  ]) assert.ok(!text.includes(gone), `${name} must not keep the typed-code flow: ${gone}`);
+}
 
 assert.ok(extension.includes('"requestHubMail"'));
 assert.ok(extension.includes('"requestHubMailDetail"'));
@@ -69,9 +81,7 @@ const inboundAllowlist = extension.slice(
   extension.indexOf("const ALLOWED_INBOUND_MESSAGE_TYPES"),
   extension.indexOf("const OUTBOUND_TYPES"),
 );
-for (const inbound of ["hubMailListener", "hubMailPairBegin", "hubMailPairComplete"]) {
-  assert.ok(inboundAllowlist.includes(`"${inbound}",`), `inbound message type not allowlisted: ${inbound}`);
-}
+assert.ok(inboundAllowlist.includes('"hubMailPeers",'), "inbound message type not allowlisted: hubMailPeers");
 assert.ok(extension.includes('hubMail: "hubMail"'));
 assert.ok(extension.includes('hubMailDetail: "hubMailDetail"'));
 assert.ok(extension.includes('hubMailAction: "hubMailAction"'));
@@ -167,15 +177,11 @@ const elements = {
   mailIncludeArchived: Object.assign(new MockNode("input"), { checked: false }),
   mailInboxList: new MockNode("div"),
   mailPeersList: new MockNode("div"),
+  mailFoundList: new MockNode("div"),
+  mailRequestsList: new MockNode("div"),
   mailDetailPanel: new MockNode("section"),
-  mailListenerHost: Object.assign(new MockNode("input"), { value: "localhost" }),
-  mailListenerPort: Object.assign(new MockNode("input"), { value: "0" }),
-  mailListenerResult: new MockNode("span"),
-  mailPairBeginResult: new MockNode("span"),
   mailPairAddress: Object.assign(new MockNode("input"), { value: "" }),
-  mailPairCode: Object.assign(new MockNode("input"), { value: "" }),
-  mailPairTls: Object.assign(new MockNode("input"), { checked: false }),
-  mailPairCompleteResult: new MockNode("span"),
+  mailPeersResult: new MockNode("span"),
 };
 const sandbox = {
   elements,
@@ -193,8 +199,8 @@ vm.runInContext(
     sliceFunction(app, "asArray", "numberValue"),
     block,
     "this.renderHubMail = renderHubMail; this.renderHubMailDetail = renderHubMailDetail; this.requestHubMail = requestHubMail;",
-    "this.requestHubMailListenerAction = requestHubMailListenerAction; this.requestHubMailPairBegin = requestHubMailPairBegin;",
-    "this.requestHubMailPairComplete = requestHubMailPairComplete; this.renderHubMailAction = renderHubMailAction;",
+    "this.requestHubMailPeers = requestHubMailPeers; this.requestHubMailManualPair = requestHubMailManualPair;",
+    "this.hubMailPeerButtonClick = hubMailPeerButtonClick; this.renderHubMailAction = renderHubMailAction;",
   ].join("\n"),
   sandbox,
 );
@@ -274,57 +280,139 @@ posted.length = 0;
 sandbox.requestHubMail();
 assert.deepStrictEqual(JSON.parse(JSON.stringify(posted)), [{ type: "requestHubMail", includeArchived: false }]);
 
-// ---- listener and pairing controls: validated in the Webview, posted to the host
-posted.length = 0;
-sandbox.requestHubMailListenerAction("start");
-assert.deepStrictEqual(JSON.parse(JSON.stringify(posted)), [{ type: "hubMailListener", action: "start", bindHost: "localhost", port: 0 }]);
-elements.mailListenerPort.value = "70000";
-sandbox.requestHubMailListenerAction("start");
-assert.strictEqual(posted.length, 1, "an out-of-range port is refused before any post");
-assert.ok(elements.mailListenerResult.textContent.includes("port from 0 to 65535"));
-sandbox.requestHubMailListenerAction("stop");
-assert.deepStrictEqual(JSON.parse(JSON.stringify(posted[1])), { type: "hubMailListener", action: "stop" });
+// ---- code-free pairing controls: validated in the Webview, posted to the host
+const plain = (value) => JSON.parse(JSON.stringify(value));
+const buttonsOf = (node) => node.descendants().filter((child) => child.tagName === "BUTTON");
 
 posted.length = 0;
-sandbox.requestHubMailPairBegin();
-assert.deepStrictEqual(JSON.parse(JSON.stringify(posted)), [{ type: "hubMailPairBegin" }]);
-sandbox.requestHubMailPairComplete();
-assert.strictEqual(posted.length, 1, "pairing needs an address and a code");
-elements.mailPairAddress.value = " lab.local:4100 ";
-elements.mailPairCode.value = "ABCD-EFGH";
-elements.mailPairTls.checked = true;
-sandbox.requestHubMailPairComplete();
-assert.deepStrictEqual(JSON.parse(JSON.stringify(posted[1])), {
-  type: "hubMailPairComplete", address: "lab.local:4100", code: "ABCD-EFGH", tls: true,
-});
+sandbox.requestHubMailPeers("discover");
+assert.deepStrictEqual(plain(posted), [{ type: "hubMailPeers", action: "discover" }]);
 
-sandbox.renderHubMailAction("listener", {
-  ok: true, action: "start", already_running: false,
-  listener: { state: "running", bind: "localhost:4100", pid: 7, address: "lab.local:4100" },
-});
-assert.strictEqual(elements.mailListenerResult.textContent, "Listener started");
-assert.ok(elements.mailListener.textContent.includes("running on localhost:4100"));
-sandbox.renderHubMailAction("listener", { ok: false, action: "start", error: hostile });
-assert.strictEqual(elements.mailListenerResult.textContent, `Listener start failed: ${hostile}`);
-sandbox.renderHubMailAction("pairBegin", { ok: true, code: "WXYZ-1234", address: "lab.local:4100", expires_at: "2026-10-28T00:10:00Z" });
-assert.ok(elements.mailPairBeginResult.textContent.includes("Code WXYZ-1234"));
-assert.ok(elements.mailPairBeginResult.textContent.includes("lab.local:4100"));
-sandbox.renderHubMailAction("pairBegin", { ok: true, code: "WXYZ-1234", address: "" });
-assert.ok(elements.mailPairBeginResult.textContent.includes("start the listener first"));
-sandbox.renderHubMailAction("pairComplete", { ok: true, peer: { machine_id: peerA, machine_label: hostile } });
-assert.ok(elements.mailPairCompleteResult.textContent.includes(`Paired with ${hostile} · a1b2c3d4`));
-sandbox.renderHubMailAction("pairComplete", { ok: false, error: "peer_refused:pair_code_invalid" });
-assert.strictEqual(elements.mailPairCompleteResult.textContent, "Pairing failed: peer_refused:pair_code_invalid");
-for (const node of [elements.mailListenerResult, elements.mailPairBeginResult, elements.mailPairCompleteResult]) {
-  assert.ok(node.descendants().every((child) => child.tagName !== "IMG"), "action results are text only");
+posted.length = 0;
+for (const bad of ["", "lab.local", "lab.local:0", "lab.local:70000", "a b:80", "<img>:80"]) {
+  elements.mailPairAddress.value = bad;
+  sandbox.requestHubMailManualPair();
 }
+assert.strictEqual(posted.length, 0, "a bad address is refused before any post");
+assert.ok(elements.mailPeersResult.textContent.includes("host:port"));
+elements.mailPairAddress.value = " lab.local:4100 ";
+sandbox.requestHubMailManualPair();
+assert.deepStrictEqual(plain(posted), [{ type: "hubMailPeers", action: "pair", address: "lab.local:4100" }]);
+
+sandbox.renderHubMailAction("peers", {
+  ok: true, action: "discover",
+  found: [
+    { machine_id: peerA, machine_label: hostile, address: "10.0.0.2:4100", paired: false },
+    { machine_id: peerB, machine_label: "lab", address: "10.0.0.3:4100", paired: true },
+  ],
+});
+assert.strictEqual(elements.mailPeersResult.textContent, "2 machine(s) found");
+const foundRows = elements.mailFoundList.children;
+assert.strictEqual(foundRows.length, 2);
+assert.ok(foundRows[0].textContent.includes(`${hostile} · a1b2c3d4`));
+const [pairButton, ...extraPairButtons] = buttonsOf(foundRows[0]);
+assert.ok(pairButton && extraPairButtons.length === 0, "an unpaired machine offers one Pair button");
+assert.strictEqual(pairButton.dataset.mailPeerAction, "pair");
+assert.strictEqual(pairButton.dataset.address, "10.0.0.2:4100");
+assert.strictEqual(buttonsOf(foundRows[1]).length, 0, "a paired machine offers no Pair button");
+assert.ok(foundRows[1].textContent.includes("already paired"));
+assert.ok(elements.mailFoundList.descendants().every((node) => node.tagName !== "IMG"));
+
+posted.length = 0;
+sandbox.hubMailPeerButtonClick({ target: { closest: () => pairButton } });
+assert.deepStrictEqual(plain(posted), [{ type: "hubMailPeers", action: "pair", address: "10.0.0.2:4100" }]);
+posted.length = 0;
+sandbox.hubMailPeerButtonClick({ target: { closest: () => null } });
+assert.strictEqual(posted.length, 0, "a click outside a pairing button posts nothing");
+
+sandbox.renderHubMailAction("peers", { ok: true, action: "discover", found: [] });
+assert.ok(elements.mailFoundList.textContent.includes("host:port"));
+
+const incomingId = "d".repeat(32);
+const outgoingId = "e".repeat(32);
+const waitingId = "f".repeat(32);
+sandbox.renderHubMailAction("peers", {
+  ok: true, action: "requests",
+  requests: [
+    { request_id: incomingId, direction: "incoming", state: "awaiting_accept", machine_id: peerA, machine_label: hostile,
+      address: "10.0.0.2:4100", sas: "123456", expires_at: "2026-10-29T00:05:00Z" },
+    { request_id: outgoingId, direction: "outgoing", state: "awaiting_peer_accept", machine_id: peerB, machine_label: "lab",
+      address: "10.0.0.3:4100", sas: "654321", expires_at: "2026-10-29T00:05:00Z" },
+    { request_id: waitingId, direction: "incoming", state: "committed", machine_id: peerB, machine_label: "lab",
+      address: "10.0.0.3:4100", sas: "", expires_at: "2026-10-29T00:05:00Z" },
+  ],
+});
+const requestRows = elements.mailRequestsList.children;
+assert.strictEqual(requestRows.length, 3);
+assert.ok(requestRows[0].textContent.includes(`Request from ${hostile} · a1b2c3d4`));
+assert.ok(requestRows[0].textContent.includes("Both screens must show 123456"));
+assert.deepStrictEqual(buttonsOf(requestRows[0]).map((b) => [b.textContent, b.dataset.mailPeerAction, b.dataset.requestId]),
+  [["Accept", "accept", incomingId], ["Reject", "reject", incomingId]]);
+assert.ok(requestRows[1].textContent.includes("Request to lab · e5f6a7b8"));
+assert.deepStrictEqual(buttonsOf(requestRows[1]).map((b) => [b.textContent, b.dataset.mailPeerAction]), [["Cancel", "reject"]]);
+assert.ok(requestRows[2].textContent.includes("Waiting for the other machine"));
+assert.deepStrictEqual(buttonsOf(requestRows[2]).map((b) => b.dataset.mailPeerAction), ["reject"], "no Accept before a SAS shows");
+assert.ok(elements.mailRequestsList.descendants().every((node) => node.tagName !== "IMG"));
+
+posted.length = 0;
+sandbox.hubMailPeerButtonClick({ target: { closest: () => buttonsOf(requestRows[0])[0] } });
+assert.deepStrictEqual(plain(posted), [{ type: "hubMailPeers", action: "accept", requestId: incomingId }]);
+sandbox.hubMailPeerButtonClick({ target: { closest: () => buttonsOf(requestRows[0])[1] } });
+assert.deepStrictEqual(plain(posted[1]), { type: "hubMailPeers", action: "reject", requestId: incomingId });
+
+sandbox.renderHubMail({
+  ok: true, mails: [], listener: { state: "stopped" },
+  peers: [
+    { machine_id: peerA, machine_label: "lab", address: "10.0.0.2:4100", hubs: [] },
+    { machine_label: "legacy", address: "10.0.0.9:4100", hubs: [] },
+  ],
+});
+const forgetRows = elements.mailPeersList.children;
+assert.deepStrictEqual(buttonsOf(forgetRows[0]).map((b) => [b.textContent, b.dataset.mailPeerAction, b.dataset.peerId]),
+  [["Forget", "forget", peerA]]);
+assert.strictEqual(buttonsOf(forgetRows[1]).length, 0, "a peer without a machine id cannot be forgotten from here");
+posted.length = 0;
+sandbox.hubMailPeerButtonClick({ target: { closest: () => buttonsOf(forgetRows[0])[0] } });
+assert.deepStrictEqual(plain(posted), [{ type: "hubMailPeers", action: "forget", peerId: peerA }]);
+
+sandbox.renderHubMailAction("peers", { ok: true, action: "pair", sas: "123456", peer: { machine_id: peerA, machine_label: hostile } });
+assert.ok(elements.mailPeersResult.textContent.includes(`Request sent to ${hostile} · a1b2c3d4`));
+assert.ok(elements.mailPeersResult.textContent.includes("123456"));
+sandbox.renderHubMailAction("peers", { ok: true, action: "accept", confirm: "delivered", peer: { machine_id: peerA, machine_label: hostile } });
+assert.strictEqual(elements.mailPeersResult.textContent, `Paired with ${hostile} · a1b2c3d4`);
+sandbox.renderHubMailAction("peers", { ok: true, action: "accept", confirm: "pending", confirm_error: "peer_unreachable", peer: { machine_id: peerA, machine_label: "lab" } });
+assert.ok(elements.mailPeersResult.textContent.includes("has not confirmed yet (peer_unreachable)"));
+sandbox.renderHubMailAction("peers", { ok: true, action: "reject" });
+assert.strictEqual(elements.mailPeersResult.textContent, "Request closed");
+sandbox.renderHubMailAction("peers", { ok: true, action: "forget" });
+assert.strictEqual(elements.mailPeersResult.textContent, "Machine forgotten");
+sandbox.renderHubMailAction("peers", { ok: false, action: "accept", error: hostile });
+assert.strictEqual(elements.mailPeersResult.textContent, `Hub mail accept failed: ${hostile}`);
+sandbox.renderHubMailAction("peers", { ok: false, error: "confirm_required" });
+assert.strictEqual(elements.mailPeersResult.textContent, "Hub mail request failed: confirm_required");
+sandbox.renderHubMailAction("listener", { ok: true, action: "start" });
+assert.strictEqual(elements.mailPeersResult.textContent, "Hub mail request failed: confirm_required", "only peers results are rendered");
+assert.ok(elements.mailPeersResult.descendants().every((child) => child.tagName !== "IMG"), "action results are text only");
 
 // The host forwards each control only to a confirm=True dashboard write tool.
-const hostControls = extension.slice(extension.indexOf('case "hubMailListener"'), extension.indexOf('case "needfixCapture"'));
-assert.ok(hostControls.includes('runHubMailAction(view, "listener", { action, confirm: true })'));
-assert.ok(hostControls.includes('runHubMailAction(view, "listener", { action, bind_host: bindHost, port, confirm: true })'));
-assert.ok(hostControls.includes('runHubMailAction(view, "pairBegin", { confirm: true })'));
-assert.ok(hostControls.includes('runHubMailAction(view, "pairComplete", { address, code, tls: message.tls === true, confirm: true })'));
+const hostControls = extension.slice(extension.indexOf('case "hubMailPeers"'), extension.indexOf('case "needfixCapture"'));
+assert.ok(hostControls.includes('runHubMailAction(view, "peers", { action, confirm: true })'));
+assert.ok(hostControls.includes('runHubMailAction(view, "peers", { action, address, confirm: true })'));
+assert.ok(hostControls.includes('runHubMailAction(view, "peers", { action, request_id: requestId, confirm: true })'));
+assert.ok(hostControls.includes('runHubMailAction(view, "peers", { action, peer_id: peerId, confirm: true })'));
+assert.ok(hostControls.includes("HUB_MAIL_ADDRESS_RE.test(address)"), "a pair address is shape-checked in the host");
+assert.ok(hostControls.includes("MESSAGE_ID_RE.test(requestId)") && hostControls.includes("MESSAGE_ID_RE.test(peerId)"));
+assert.ok(/showWarningMessage\([^]*modal: true/.test(hostControls), "forgetting a machine is confirmed in a modal");
 assert.ok(!/confirm: false/.test(hostControls));
+
+// An incoming request raises a native notification carrying the SAS, with Accept and Reject.
+const watcher = extension.slice(extension.indexOf("async function notifyHubMailRequest("), extension.indexOf("async function runNeedfixAction("));
+assert.ok(watcher.includes("vscode.window.showInformationMessage("));
+assert.ok(watcher.includes('"Accept"') && watcher.includes('"Reject"'));
+assert.ok(watcher.includes("request.sas"), "the notification shows the SAS");
+assert.ok(watcher.includes('request.direction !== "incoming"'));
+assert.ok(watcher.includes("confirm: true"));
+assert.ok(watcher.includes("if (hubMailRequestPollBusy || !mcpClient) return;"), "the watcher never spawns the MCP client");
+assert.ok(extension.includes("context.subscriptions.push(startHubMailRequestWatcher());"));
 
 console.log("WorkHub Mail popup contract verified");

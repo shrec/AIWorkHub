@@ -6,14 +6,13 @@ Labels (``machine_label``, ``repo_name``) are display text only: capped at
 64 characters, control characters stripped, and never used for routing,
 signing or authentication.
 
-Pairing: ``pair_begin`` mints a single-use out-of-band code (120 bits as
-grouped base32) that expires after 10 minutes and dies after 5 failed proofs.
-The code never crosses the network: both machines derive ``secret =
-HMAC-SHA256(code, "aiworkhub.hub_mail.peer.v1|" + sorted machine ids)`` and
-prove possession of the code with HMACs over the pairing transcript.
+Pairing is code-free (``hub_mail_pairing``): a commit/reveal Diffie-Hellman
+exchange over ``POST /v1/pair/offer|reveal|confirm`` yields the per-peer secret
+and a short SAS both owners compare; the responder's owner accepts or rejects.
+No typed secret ever exists.
 
 Listener: a ThreadingHTTPServer on an EXPLICIT ``bind_host``/``port`` serving
-``POST /v1/pair``, ``POST /v1/mail`` and ``GET /v1/hubs``.  Every non-pair
+the pairing steps, ``POST /v1/mail`` and ``GET /v1/hubs``.  Every mail/hubs
 request carries the caller's machine id, a timestamp, a nonce and
 ``HMAC(secret, method|path|timestamp|nonce|sha256(body))``; every authenticated
 response is signed back over the request nonce.  A refused caller only ever
@@ -29,7 +28,6 @@ on every send/inbox call until delivered, or past ``expires_at`` when a
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import hmac
 import http.client
@@ -58,12 +56,6 @@ PEER_SCHEMA_ID = "aiworkhub.hub_mail.peer.v1"
 PAIRING_SCHEMA_ID = "aiworkhub.hub_mail.pairing.v1"
 LISTENER_SCHEMA_ID = "aiworkhub.hub_mail.listener.v1"
 SIDECAR_SCHEMA_ID = "aiworkhub.hub_mail.delivery.v1"
-SECRET_CONTEXT = "aiworkhub.hub_mail.peer.v1|"
-_PROOF_CONTEXT = b"aiworkhub.hub_mail.pair.proof.v1"
-_RESPONSE_PROOF_CONTEXT = b"aiworkhub.hub_mail.pair.response.v1|"
-PAIR_CODE_BYTES = 15  # 120 bits -> 24 base32 characters, no padding
-PAIR_CODE_TTL_SECONDS = 600
-PAIR_MAX_FAILURES = 5
 CLOCK_SKEW_SECONDS = 300
 MAX_LABEL_CHARS = 64
 MAX_PEERS = 64
@@ -88,7 +80,6 @@ DELIVERIES = ("delivered", "already_delivered", "duplicate_conflict")
 _HEX32_RE = re.compile(r"^[0-9a-f]{32}$")
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _TIMESTAMP_RE = re.compile(r"^[0-9]{1,12}$")
-_CODE_RE = re.compile(r"^[A-Z2-7]{24}$")
 _ADDRESS_RE = re.compile(r"^(?:\[([0-9A-Fa-f:.]{2,45})\]|([A-Za-z0-9.\-]{1,253})):([0-9]{1,5})$")
 _PEM_CERT_RE = re.compile(
     r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", re.DOTALL
@@ -103,7 +94,6 @@ DEFAULT_BIND_HOST = "0.0.0.0"
 DISCOVERY_TARGETS: list[Any] | None = None
 
 _PEER_LOCK = threading.Lock()
-_PAIR_LOCK = threading.Lock()
 _RETRY_LOCK = threading.Lock()
 _ENSURE_ATTEMPTS: dict[str, float] = {}
 _REDISCOVER_ATTEMPTS: dict[str, float] = {}
@@ -144,10 +134,6 @@ def peer_path(machine_id: str, home: Path | None = None) -> Path:
     if not _HEX32_RE.fullmatch(str(machine_id or "")):
         raise hub_mail.HubMailError("machine_id_invalid")
     return peers_dir(home) / f"{machine_id}.json"
-
-
-def pairing_path(home: Path | None = None) -> Path:
-    return hub_mail.mail_root(home) / ".pairing.json"
 
 
 def pidfile_path(home: Path | None = None) -> Path:
@@ -423,36 +409,7 @@ def peer_hub_index(
     }
 
 
-# ---------------------------------------------------------------- pairing crypto
-
-
-def normalize_code(code: Any) -> str:
-    text = re.sub(r"[\s\-]", "", str(code or "")).upper()
-    if not _CODE_RE.fullmatch(text):
-        raise hub_mail.HubMailError("pair_code_invalid")
-    return text
-
-
-def derive_secret(code: str, machine_a: str, machine_b: str) -> bytes:
-    """The per-peer secret both machines derive; the code never leaves either."""
-
-    ids = "|".join(sorted((machine_a, machine_b)))
-    return hmac.new(
-        normalize_code(code).encode("ascii"), (SECRET_CONTEXT + ids).encode("ascii"), hashlib.sha256
-    ).digest()
-
-
-def _proof_key(code: str) -> bytes:
-    return hmac.new(normalize_code(code).encode("ascii"), _PROOF_CONTEXT, hashlib.sha256).digest()
-
-
-def _request_proof(code: str, fields: dict[str, Any]) -> str:
-    return hmac.new(_proof_key(code), _canonical(fields), hashlib.sha256).hexdigest()
-
-
-def _response_proof(secret: bytes, request_body: bytes, fields: dict[str, Any]) -> str:
-    message = _RESPONSE_PROOF_CONTEXT + _sha256_hex(request_body).encode("ascii") + b"|" + _canonical(fields)
-    return hmac.new(secret, message, hashlib.sha256).hexdigest()
+# ---------------------------------------------------------------- signatures
 
 
 def _request_mac(secret: bytes, method: str, path: str, timestamp: str, nonce: str, body: bytes) -> str:
@@ -463,184 +420,6 @@ def _request_mac(secret: bytes, method: str, path: str, timestamp: str, nonce: s
 def _response_mac(secret: bytes, status: int, nonce: str, body: bytes) -> str:
     message = f"response|{status}|{nonce}|{_sha256_hex(body)}"
     return hmac.new(secret, message.encode("ascii"), hashlib.sha256).hexdigest()
-
-
-def pair_begin(home: Path | None = None) -> dict[str, Any]:
-    """Mint this node's single-use pairing code; any older code dies."""
-
-    try:
-        own_id = machine_id(home)
-        text = base64.b32encode(secrets.token_bytes(PAIR_CODE_BYTES)).decode("ascii").rstrip("=")
-        created = _clock()
-        with _PAIR_LOCK:
-            _write_json(
-                pairing_path(home),
-                {
-                    "schema_id": PAIRING_SCHEMA_ID,
-                    "code": text,
-                    "created_at": created,
-                    "expires_at": created + PAIR_CODE_TTL_SECONDS,
-                    "failures": 0,
-                },
-            )
-    except hub_mail.HubMailError as exc:
-        return {"ok": False, "error": str(exc)}
-    except OSError as exc:
-        return {"ok": False, "error": f"pairing_write_failed:{type(exc).__name__}"}
-    return {
-        "ok": True,
-        "schema_id": PAIRING_SCHEMA_ID,
-        "code": "-".join(text[i : i + 4] for i in range(0, len(text), 4)),
-        "expires_at": _iso(created + PAIR_CODE_TTL_SECONDS),
-        "max_failed_proofs": PAIR_MAX_FAILURES,
-        "machine_id": own_id,
-        "machine_label": machine_label(home),
-        "listener": listener_status(home),
-    }
-
-
-def pair_complete(
-    address: str, code: str, *, home: Path | None = None, tls: bool = False,
-    listener_address: str | None = None,
-) -> dict[str, Any]:
-    """Pair with the node listening at ``address`` using its out-of-band code."""
-
-    try:
-        return _pair_complete(address, code, home=home, tls=tls, listener_address=listener_address)
-    except hub_mail.HubMailError as exc:
-        return {"ok": False, "error": str(exc)}
-    except OSError as exc:
-        return {"ok": False, "error": f"peer_store_write_failed:{type(exc).__name__}"}
-
-
-def _pair_complete(
-    address: str, code: str, *, home: Path | None, tls: bool, listener_address: str | None,
-) -> dict[str, Any]:
-    code = normalize_code(code)
-    parse_address(address)
-    own_id = machine_id(home)
-    status = listener_status(home)
-    if listener_address:
-        own_address = listener_address
-    elif not status.get("running"):
-        raise hub_mail.HubMailError("local_listener_not_running")
-    else:
-        # A wildcard bind with no routable interface advertises "": the owner
-        # must name the address peers dial back instead of a loopback one.
-        own_address = str(status.get("address") or "")
-        if not own_address:
-            raise hub_mail.HubMailError("listener_address_unroutable")
-    parse_address(own_address)
-    fields = {
-        "machine_id": own_id,
-        "machine_label": machine_label(home),
-        "address": own_address,
-        "hubs": local_hub_list(home),
-        "nonce": secrets.token_hex(16),
-        "timestamp": int(_clock()),
-        "tls_cert_sha256": str(status.get("tls_cert_sha256") or ""),
-    }
-    body = _canonical({**fields, "proof": _request_proof(code, fields)})
-    status_code, _, data, observed = _exchange(
-        address, "POST", "/v1/pair", body, {"Content-Type": "application/json"}, tls=tls, pin=None,
-    )
-    reply = _json_object(data)
-    if status_code != 200:
-        raise PeerRefused(f"peer_refused:{_error_code(reply, status_code)}")
-    peer_id = str(reply.get("machine_id") or "")
-    if not _HEX32_RE.fullmatch(peer_id) or peer_id == own_id:
-        raise PeerRefused("pair_response_invalid")
-    secret = derive_secret(code, own_id, peer_id)
-    answered = {k: reply.get(k) for k in ("machine_id", "machine_label", "hubs", "tls_cert_sha256")}
-    if not hmac.compare_digest(str(reply.get("proof") or ""), _response_proof(secret, body, answered)):
-        raise PeerRefused("pair_response_proof_invalid")
-    if tls and not hmac.compare_digest(str(reply.get("tls_cert_sha256") or ""), observed):
-        raise PeerRefused("tls_cert_mismatch")
-    now = _iso(_clock())
-    record = {
-        "schema_id": PEER_SCHEMA_ID,
-        "machine_id": peer_id,
-        "machine_label": clean_label(reply.get("machine_label")),
-        "address": address,
-        "hubs": clean_hubs(reply.get("hubs")),
-        "secret": secret.hex(),
-        "paired_at": now,
-        "last_seen": now,
-        "tls_cert_sha256": observed if tls else "",
-    }
-    _store_peer(record, home)
-    return {"ok": True, "schema_id": PEER_SCHEMA_ID, "peer": public_peer(load_peer(peer_id, home) or record)}
-
-
-def _accept_pair(request: dict[str, Any], body: bytes, *, home: Path | None, own_tls: str) -> tuple[int, dict[str, Any]]:
-    """The listener half of pairing: verify the proof, store, answer with ours."""
-
-    fields = {k: request.get(k) for k in (
-        "machine_id", "machine_label", "address", "hubs", "nonce", "timestamp", "tls_cert_sha256",
-    )}
-    peer_id = str(fields["machine_id"] or "")
-    try:
-        parse_address(fields["address"])
-        valid = (
-            _HEX32_RE.fullmatch(peer_id) is not None
-            and _HEX32_RE.fullmatch(str(fields["nonce"] or "")) is not None
-            and isinstance(fields["timestamp"], int)
-            and isinstance(request.get("proof"), str)
-            and (not fields["tls_cert_sha256"] or _HEX64_RE.fullmatch(str(fields["tls_cert_sha256"])) is not None)
-        )
-    except hub_mail.HubMailError:
-        valid = False
-    if not valid or set(request) != {*fields, "proof"}:
-        return 400, {"ok": False, "error": "pair_request_invalid"}
-    own_id = machine_id(home)
-    if peer_id == own_id:
-        return 400, {"ok": False, "error": "pair_self_refused"}
-    with _PAIR_LOCK:
-        pending = _read_json(pairing_path(home))
-        if not pending or pending.get("schema_id") != PAIRING_SCHEMA_ID:
-            return 403, {"ok": False, "error": "pair_code_unavailable"}
-        if _clock() >= float(pending.get("expires_at") or 0):
-            pairing_path(home).unlink(missing_ok=True)
-            return 403, {"ok": False, "error": "pair_code_expired"}
-        failures = int(pending.get("failures") or 0)
-        if failures >= PAIR_MAX_FAILURES:
-            pairing_path(home).unlink(missing_ok=True)
-            return 403, {"ok": False, "error": "pair_code_exhausted"}
-        if abs(_clock() - fields["timestamp"]) > CLOCK_SKEW_SECONDS:
-            return 401, {"ok": False, "error": "timestamp_out_of_window"}
-        code = str(pending.get("code") or "")
-        if not hmac.compare_digest(str(request["proof"]), _request_proof(code, fields)):
-            pending["failures"] = failures + 1
-            if pending["failures"] >= PAIR_MAX_FAILURES:
-                pairing_path(home).unlink(missing_ok=True)
-            else:
-                _write_json(pairing_path(home), pending)
-            return 403, {"ok": False, "error": "pair_proof_invalid"}
-        # Single use: the code is gone before the peer is stored.
-        pairing_path(home).unlink(missing_ok=True)
-    secret = derive_secret(code, own_id, peer_id)
-    now = _iso(_clock())
-    _store_peer(
-        {
-            "schema_id": PEER_SCHEMA_ID,
-            "machine_id": peer_id,
-            "machine_label": clean_label(fields["machine_label"]),
-            "address": str(fields["address"]),
-            "hubs": clean_hubs(fields["hubs"]),
-            "secret": secret.hex(),
-            "paired_at": now,
-            "last_seen": now,
-            "tls_cert_sha256": str(fields["tls_cert_sha256"] or ""),
-        },
-        home,
-    )
-    answer = {
-        "machine_id": own_id,
-        "machine_label": machine_label(home),
-        "hubs": local_hub_list(home),
-        "tls_cert_sha256": own_tls,
-    }
-    return 200, {"ok": True, **answer, "proof": _response_proof(secret, body, answer)}
 
 
 # ---------------------------------------------------------------- client
@@ -1057,7 +836,7 @@ class _Handler(BaseHTTPRequestHandler):
         return body
 
     def _route(self, method: str) -> None:
-        known = {("POST", "/v1/pair"), ("POST", "/v1/mail"), ("GET", "/v1/hubs")}
+        known = {("POST", "/v1/mail"), ("GET", "/v1/hubs")}
         known.update(("POST", path) for path in _PAIR_FLOW_PATHS)
         if (method, self.path) not in known:
             self._refuse(404, "not_found")
@@ -1067,10 +846,6 @@ class _Handler(BaseHTTPRequestHandler):
         if body is None:
             return
         home = self.server.home
-        if self.path == "/v1/pair":
-            status, payload = _accept_pair(_json_object(body), body, home=home, own_tls=self.server.tls_sha256)
-            self._reply(status, payload)
-            return
         if self.path in _PAIR_FLOW_PATHS:
             self._pair_flow(_json_object(body))
             return
@@ -1681,6 +1456,22 @@ def accept(request_id: str, *, home: Path | None = None) -> dict[str, Any]:
 
 def reject(request_id: str, *, home: Path | None = None) -> dict[str, Any]:
     return _pairing().reject(request_id, home=home)
+
+
+def forget_peer(peer_id: str, *, home: Path | None = None) -> dict[str, Any]:
+    """Unpair one machine: its stored secret is removed, so its mail is refused from now on."""
+
+    try:
+        peer = load_peer(peer_id, home)
+    except hub_mail.HubMailError as exc:
+        return {"ok": False, "error": str(exc)}
+    if peer is None:
+        return {"ok": False, "error": "peer_unknown"}
+    try:
+        _pairing()._forget_peer(peer_id, peer["secret"], home)
+    except OSError as exc:
+        return {"ok": False, "error": f"peer_store_write_failed:{type(exc).__name__}"}
+    return {"ok": True, "forgotten": True, "machine_id": peer_id}
 
 
 def listener_action(

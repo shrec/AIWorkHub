@@ -151,7 +151,7 @@ _IDEMPOTENT_SUFFIXES = (
 )
 
 # Only WorkHub Mail reaches another machine (paired LAN peers).
-_OPEN_WORLD_TOKENS = ("hub_mail_send", "hub_mail_pair_", "hub_mail_listener")
+_OPEN_WORLD_TOKENS = ("hub_mail_send", "hub_mail_peers")
 
 
 def derive_annotations(tool_name: str, description: str) -> dict[str, Any]:
@@ -372,12 +372,7 @@ MCP_TOOL_PROFILES: dict[str, Mapping[str, str]] = {
     "aiworkhub_manager_recipe_run": _MANAGER,
     "aiworkhub_manager_hub_mail_send": _MANAGER,
     "aiworkhub_manager_hub_mail_inbox": _MANAGER,
-    "aiworkhub_manager_hub_mail_show": _MANAGER,
-    "aiworkhub_manager_hub_mail_archive": _MANAGER,
-    "aiworkhub_manager_hub_mail_pair_begin": _MANAGER,
-    "aiworkhub_manager_hub_mail_pair_complete": _MANAGER,
     "aiworkhub_manager_hub_mail_peers": _MANAGER,
-    "aiworkhub_manager_hub_mail_listener": _MANAGER,
     "aiworkhub_vscode_lm_worker_tool": _MANAGER_DASHBOARD,
     "aiworkhub_router_known_repositories": _MANAGER_CALLABLE,
     "aiworkhub_repo_list": _MANAGER,
@@ -442,9 +437,7 @@ MCP_TOOL_PROFILES: dict[str, Mapping[str, str]] = {
     "aiworkhub_dashboard_roadmap_detail": _DASHBOARD,
     "aiworkhub_dashboard_hub_mail": _DASHBOARD,
     "aiworkhub_dashboard_hub_mail_detail": _DASHBOARD,
-    "aiworkhub_dashboard_hub_mail_listener": _DASHBOARD,
-    "aiworkhub_dashboard_hub_mail_pair_begin": _DASHBOARD,
-    "aiworkhub_dashboard_hub_mail_pair_complete": _DASHBOARD,
+    "aiworkhub_dashboard_hub_mail_peers": _DASHBOARD,
     "aiworkhub_dashboard_settings": _DASHBOARD,
     "aiworkhub_dashboard_settings_update": _DASHBOARD,
     "aiworkhub_dashboard_model_settings_update": _DASHBOARD,

@@ -257,8 +257,7 @@ def test_key_file_mode_is_0600(home):
 _TOOLS = (
     "aiworkhub_manager_hub_mail_send",
     "aiworkhub_manager_hub_mail_inbox",
-    "aiworkhub_manager_hub_mail_show",
-    "aiworkhub_manager_hub_mail_archive",
+    "aiworkhub_manager_hub_mail_peers",
 )
 
 
@@ -272,14 +271,33 @@ def test_mcp_tools_are_registered_and_document_every_parameter():
             assert f"{parameter}:" in args, (name, parameter)
 
 
-def test_manager_seat_holds_only_the_hub_mail_reads():
+def test_manager_seat_holds_the_inbox_and_peers_but_never_send(home, monkeypatch):
+    from aiworkhub import hub_mail_net
+
     assert "aiworkhub_manager_hub_mail_inbox" in ra.MANAGER_SEAT_MCP_TOOLS
-    assert "aiworkhub_manager_hub_mail_show" in ra.MANAGER_SEAT_MCP_TOOLS
+    assert "aiworkhub_manager_hub_mail_peers" in ra.MANAGER_SEAT_MCP_TOOLS
+    assert "aiworkhub_manager_hub_mail_show" not in ra.MANAGER_SEAT_MCP_TOOLS
     assert "aiworkhub_manager_hub_mail_send" not in ra.MANAGER_SEAT_MCP_TOOLS
-    assert "aiworkhub_manager_hub_mail_archive" not in ra.MANAGER_SEAT_MCP_TOOLS
     seat = ra.resolve_manager_seat_codex_tools()
-    assert {"aiworkhub_manager_hub_mail_inbox", "aiworkhub_manager_hub_mail_show"} <= set(seat)
-    assert not {"aiworkhub_manager_hub_mail_send", "aiworkhub_manager_hub_mail_archive"} & set(seat)
+    assert {"aiworkhub_manager_hub_mail_inbox", "aiworkhub_manager_hub_mail_peers"} <= set(seat)
+    assert "aiworkhub_manager_hub_mail_send" not in set(seat)
+
+    monkeypatch.setattr(core, "manager_bootstrap", lambda: _manager_route(home.parent / "aiworkhub"))
+    monkeypatch.setattr(core, "writes_allowed", lambda: True)
+    monkeypatch.setattr(core, "_manager_chat_seat_identity", lambda: {"provider": "codex"})
+    calls: list[str] = []
+    monkeypatch.setattr(hub_mail_net, "pair", lambda *a, **k: calls.append("pair"))
+    monkeypatch.setattr(hub_mail_net, "ensure_listener", lambda *a, **k: calls.append("listener"))
+    before = _box(home, HUB_B, "inbox")
+    archived = server.aiworkhub_manager_hub_mail_inbox(action="archive", message_id="a" * 32)
+    paired = server.aiworkhub_manager_hub_mail_peers(action="pair", address="127.0.0.1:1")
+    sent = server.aiworkhub_manager_hub_mail_send(to_hub_id=HUB_A, kind="note", subject="s", body="b")
+    assert archived["error"] == paired["error"] == sent["error"] == "hub_mail_write_off_seat"
+    assert calls == [] and _box(home, HUB_B, "inbox") == before
+    assert (
+        server.aiworkhub_manager_hub_mail_peers(action="accept", request_id="a" * 32)["error"]
+        == "hub_mail_peers_action_invalid"
+    )
 
 
 def _manager_route(root: Path) -> dict:
@@ -298,7 +316,8 @@ def test_mcp_tools_are_gated_and_mark_every_mail_untrusted(home, monkeypatch):
         to_hub_id=HUB_B, kind="note", subject="s", body="b"
     )
     assert closed["error"] == "write_gate_closed"
-    assert server.aiworkhub_manager_hub_mail_archive(message_id="a" * 32)["error"] == "write_gate_closed"
+    archive_closed = server.aiworkhub_manager_hub_mail_inbox(action="archive", message_id="a" * 32)
+    assert archive_closed["error"] == "write_gate_closed"
     assert _box(home, HUB_B, "inbox") == []
 
     monkeypatch.setattr(core, "writes_allowed", lambda: True)
@@ -312,9 +331,9 @@ def test_mcp_tools_are_gated_and_mark_every_mail_untrusted(home, monkeypatch):
     listing = server.aiworkhub_manager_hub_mail_inbox()
     assert listing["untrusted_data"] is True
     assert [m["untrusted_data"] for m in listing["mails"]] == [True]
-    shown = server.aiworkhub_manager_hub_mail_show(message_id=message_id)
+    shown = server.aiworkhub_manager_hub_mail_inbox(action="show", message_id=message_id)
     assert shown["mail"]["untrusted_data"] is True and shown["mail"]["body"] == "from geoai"
-    archived = server.aiworkhub_manager_hub_mail_archive(message_id=message_id)
+    archived = server.aiworkhub_manager_hub_mail_inbox(action="archive", message_id=message_id)
     assert archived["ok"] is True and archived["mail"]["untrusted_data"] is True
 
     monkeypatch.setattr(

@@ -3983,131 +3983,99 @@ def _hub_mail_write_refusal(tool: str, confirm: Any) -> dict[str, Any] | None:
     return None
 
 
-def hub_mail_listener_action_view(
-    action: str = "status",
-    bind_host: str | None = None,
-    port: int | None = None,
-    tls_cert: str | None = None,
-    tls_key: str | None = None,
+_HUB_MAIL_PEER_READS = ("list", "requests")
+_HUB_MAIL_PEER_WRITES = ("discover", "pair", "accept", "reject", "forget")
+
+
+def _hub_mail_peers_result(verb: str, address: str, request_id: str, peer_id: str) -> dict[str, Any]:
+    """Run one peers action and reduce its result to display data; no secret is ever copied."""
+    if verb == "list":
+        peers = [_hub_mail_peer_row(peer) for peer in hub_mail_net.list_peers()]
+        return {"ok": True, "untrusted_data": True, "peers": peers, "count": len(peers)}
+    if verb == "requests":
+        result = hub_mail_net.pair_requests()
+        if not result.get("ok"):
+            return {"ok": False, "error": str(result.get("error") or "")[:240]}
+        return {"ok": True, "untrusted_data": True, "requests": list(result.get("requests") or [])}
+    if verb == "discover":
+        result = hub_mail_net.discover()
+        if not result.get("ok"):
+            return {"ok": False, "error": str(result.get("error") or "")[:240]}
+        found = [
+            {
+                "machine_id": str(entry.get("machine_id") or ""),
+                "machine_label": str(entry.get("label") or ""),
+                "address": str(entry.get("address") or ""),
+                "paired": bool(entry.get("paired")),
+                "address_changed": bool(entry.get("address_changed")),
+            }
+            for entry in result.get("found") or []
+        ]
+        return {"ok": True, "untrusted_data": True, "found": found}
+    if verb == "pair":
+        result = hub_mail_net.pair(address) if address else {"ok": False, "error": "address_required"}
+    elif verb == "forget":
+        result = hub_mail_net.forget_peer(peer_id) if peer_id else {"ok": False, "error": "peer_id_required"}
+    elif not request_id:
+        result = {"ok": False, "error": "request_id_required"}
+    elif verb == "accept":
+        result = hub_mail_net.accept(request_id)
+    else:
+        result = hub_mail_net.reject(request_id)
+    if not result.get("ok"):
+        return {"ok": False, "error": str(result.get("error") or "")[:240]}
+    response: dict[str, Any] = {"ok": True, "untrusted_data": True}
+    for key in ("state", "request_id", "sas", "expires_at", "confirm", "confirm_error", "machine_id"):
+        if result.get(key):
+            response[key] = str(result[key])[:240]
+    for key in ("rejected", "forgotten"):
+        if key in result:
+            response[key] = bool(result[key])
+    peer = result.get("peer")
+    if isinstance(peer, Mapping) and peer.get("machine_id"):
+        response["peer"] = {key: str(peer.get(key) or "") for key in ("machine_id", "machine_label", "address")}
+    return response
+
+
+def hub_mail_peers_view(
+    action: str = "list",
+    address: str = "",
+    request_id: str = "",
+    peer_id: str = "",
     confirm: bool = False,
 ) -> dict[str, Any]:
-    """USER WRITE: start or stop this machine's WorkHub Mail listener; status is read-only.
+    """USER WRITE: find, pair with, accept, reject or forget machines for WorkHub Mail.
 
-    Use this from the dashboard WorkHub Mail panel; aiworkhub_dashboard_hub_mail shows the same listener state with the inbox. start persists enabled=true so MCP startup restarts the listener; stop persists enabled=false. One listener runs per home; no default bind address. start and stop require confirm=True and an open write gate. Delegates to hub_mail_net.listener_action like aiworkhub_manager_hub_mail_listener and never returns the pidfile token.
+    Use this from the dashboard WorkHub Mail panel; aiworkhub_dashboard_hub_mail shows the paired peers and listener state with the inbox. Pairing is code-free: pair sends a request and returns a 6-digit SAS, the other owner must see the same SAS and accept, and a request that arrives here is listed by requests with its SAS to accept or reject. list and requests are read-only; discover, pair, accept, reject and forget require confirm=True and an open write gate. Delegates to the same hub_mail_net functions as aiworkhub_manager_hub_mail_peers. No secret is returned; every label and discovery reply is untrusted display text.
 
     Args:
-        action: str start, stop or status (default "status"); status is read-only.
-        bind_host: optional str interface to bind for start, e.g. localhost or a LAN address; required for start.
-        port: optional int TCP port for start; required for start (0 picks a free port).
-        tls_cert: optional str PEM certificate path for TLS; give together with tls_key, omit for plain HTTP.
-        tls_key: optional str PEM private key path for TLS; give together with tls_cert.
-        confirm: bool (default False); must be True to start or stop the listener.
+        action: str list (default), requests, discover, pair, accept, reject or forget; list and requests are read-only.
+        address: str (default empty); for pair, the other machine's listener address as host:port (or [ipv6]:port), taken from discover or entered by hand.
+        request_id: str (default empty); for accept and reject, the request_id of a pending request listed by requests.
+        peer_id: str (default empty); for forget, the 32-hex machine_id of a paired machine listed by list.
+        confirm: bool (default False); must be True for discover, pair, accept, reject and forget.
     """
-    tool = "aiworkhub_dashboard_hub_mail_listener"
-    verb = str(action or "status")
-    if verb == "status":
+    tool = "aiworkhub_dashboard_hub_mail_peers"
+    verb = str(action or "list")
+    if verb not in (*_HUB_MAIL_PEER_READS, *_HUB_MAIL_PEER_WRITES):
+        return _needfix_response({"ok": False, "error": "hub_mail_peers_action_invalid"}, tool)
+    writing = verb in _HUB_MAIL_PEER_WRITES
+    if writing:
+        refusal = _hub_mail_write_refusal(tool, confirm)
+        if refusal is not None:
+            return refusal
+    else:
         local, refusal = _hub_mail_local()
         if refusal is not None or local is None:
             return _needfix_response(refusal or {"ok": False, "error": "local_hub_identity_unavailable"}, tool)
-        status = hub_mail_net.listener_action("status")
-        return _needfix_response({"ok": True, "action": verb, "listener": _hub_mail_listener(status)}, tool)
-    if verb not in ("start", "stop"):
-        return _needfix_response({"ok": False, "error": "listener_action_invalid"}, tool, write=True)
-    refusal = _hub_mail_write_refusal(tool, confirm)
-    if refusal is not None:
-        return refusal
     try:
-        result = hub_mail_net.listener_action(
-            verb, bind_host=str(bind_host or "") or None, port=port,
-            tls_cert=str(tls_cert or "") or None, tls_key=str(tls_key or "") or None,
+        response = _hub_mail_peers_result(
+            verb, str(address or ""), str(request_id or ""), str(peer_id or ""),
         )
-    except (hub_mail.HubMailError, OSError, TypeError, ValueError) as exc:
-        result = {"ok": False, "error": f"{type(exc).__name__}:{str(exc)[:200]}"}
-    response: dict[str, Any] = {
-        "ok": bool(result.get("ok")),
-        "action": verb,
-        "listener": _hub_mail_listener(result if "running" in result else None),
-    }
-    if not response["ok"]:
-        response["error"] = str(result.get("error") or "")[:240]
-    for key in ("already_running", "stopped"):
-        if key in result:
-            response[key] = bool(result[key])
-    if result.get("log"):
-        response["log"] = str(result["log"])[:500]
-    return _needfix_response(response, tool, write=True)
-
-
-def hub_mail_pair_begin_view(machine_label: str | None = None, confirm: bool = False) -> dict[str, Any]:
-    """USER WRITE: mint a single-use code to pair this machine with another for WorkHub Mail.
-
-    Read the code and this machine's listener address to the other machine's owner out of band; they enter both in aiworkhub_dashboard_hub_mail_pair_complete. The code expires after 10 minutes, dies after 5 failed proofs and replaces any older code; this machine's listener must be running to accept the pairing. Requires confirm=True and an open write gate. Delegates to the same hub_mail_net.set_machine_label and pair_begin as aiworkhub_manager_hub_mail_pair_begin; no peer secret is returned.
-
-    Args:
-        machine_label: optional str display label for this machine as peers see it (at most 64 characters, control characters stripped); omit or leave empty to keep the current label.
-        confirm: bool (default False); must be True to mint the code.
-    """
-    tool = "aiworkhub_dashboard_hub_mail_pair_begin"
-    refusal = _hub_mail_write_refusal(tool, confirm)
-    if refusal is not None:
-        return refusal
-    try:
-        if machine_label:
-            hub_mail_net.set_machine_label(str(machine_label))
-        begun = hub_mail_net.pair_begin()
-    except (hub_mail.HubMailError, OSError, TypeError, ValueError) as exc:
-        begun = {"ok": False, "error": f"{type(exc).__name__}:{str(exc)[:200]}"}
-    if not begun.get("ok"):
-        return _needfix_response({"ok": False, "error": str(begun.get("error") or "")[:240]}, tool, write=True)
-    listener = _hub_mail_listener(begun["listener"] if isinstance(begun.get("listener"), Mapping) else None)
-    response = {
-        "ok": True,
-        "schema_id": "aiworkhub.dashboard.hub_mail_pair_begin.v1",
-        "code": str(begun.get("code") or ""),
-        "expires_at": str(begun.get("expires_at") or ""),
-        "max_failed_proofs": int(begun.get("max_failed_proofs") or 0),
-        "machine_id": str(begun.get("machine_id") or ""),
-        "machine_label": str(begun.get("machine_label") or ""),
-        "address": listener["address"],
-        "listener": listener,
-    }
-    return _needfix_response(response, tool, write=True)
-
-
-def hub_mail_pair_complete_view(
-    address: str,
-    code: str,
-    tls: bool = False,
-    listener_address: str = "",
-    confirm: bool = False,
-) -> dict[str, Any]:
-    """USER WRITE: pair this machine with another one's WorkHub Mail listener.
-
-    Use the address and code the other machine's owner read out from its pair_begin. The code itself never crosses the network: both machines derive one per-peer secret from it and prove they hold it. This machine's own listener must be running so the peer can mail back. Requires confirm=True and an open write gate. Delegates to the same hub_mail_net.pair_complete as aiworkhub_manager_hub_mail_pair_complete; the paired peer is returned as display data without its secret.
-
-    Args:
-        address: str the other machine's listener address as host:port (or [ipv6]:port).
-        code: str the pairing code read out by the other machine's owner; dashes and spaces are ignored.
-        tls: bool (default False); True when the other listener runs with TLS, pinning its certificate sha256.
-        listener_address: str (default empty) this machine's own listener address as host:port that the peer dials back; empty uses the running listener's advertised address.
-        confirm: bool (default False); must be True to pair.
-    """
-    tool = "aiworkhub_dashboard_hub_mail_pair_complete"
-    refusal = _hub_mail_write_refusal(tool, confirm)
-    if refusal is not None:
-        return refusal
-    try:
-        result = hub_mail_net.pair_complete(
-            str(address or ""), str(code or ""), tls=tls is True,
-            listener_address=str(listener_address or "") or None,
-        )
-        if not result.get("ok") or not isinstance(result.get("peer"), Mapping):
-            response = {"ok": False, "error": str(result.get("error") or "pair_response_invalid")[:240]}
-        else:
-            response = {"ok": True, "untrusted_data": True, "peer": _hub_mail_peer_row(result["peer"])}
     except (hub_mail.HubMailError, OSError, TypeError, ValueError, KeyError) as exc:
         response = {"ok": False, "error": f"{type(exc).__name__}:{str(exc)[:200]}"}
-    return _needfix_response(response, tool, write=True)
+    response["action"] = verb
+    return _needfix_response(response, tool, write=writing)
 
 
 def needfix_capture_view(
@@ -4853,9 +4821,7 @@ HUB_MAIL_READ_TOOLS: dict[str, Any] = {
     "aiworkhub_dashboard_hub_mail_detail": hub_mail_detail_view,
 }
 HUB_MAIL_WRITE_TOOLS: dict[str, Any] = {
-    "aiworkhub_dashboard_hub_mail_listener": hub_mail_listener_action_view,
-    "aiworkhub_dashboard_hub_mail_pair_begin": hub_mail_pair_begin_view,
-    "aiworkhub_dashboard_hub_mail_pair_complete": hub_mail_pair_complete_view,
+    "aiworkhub_dashboard_hub_mail_peers": hub_mail_peers_view,
 }
 SETTINGS_TOOL_NAME = "aiworkhub_dashboard_settings"
 SETTINGS_TOOLS: dict[str, Any] = {SETTINGS_TOOL_NAME: settings_view}

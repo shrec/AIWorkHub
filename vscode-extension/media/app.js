@@ -291,18 +291,12 @@ const elements = {
   mailInboxList: document.querySelector("#mail-inbox-list"),
   mailPeersList: document.querySelector("#mail-peers-list"),
   mailDetailPanel: document.querySelector("#mail-detail-panel"),
-  mailListenerHost: document.querySelector("#mail-listener-host"),
-  mailListenerPort: document.querySelector("#mail-listener-port"),
-  mailListenerStart: document.querySelector("#mail-listener-start"),
-  mailListenerStop: document.querySelector("#mail-listener-stop"),
-  mailListenerResult: document.querySelector("#mail-listener-result"),
-  mailPairBegin: document.querySelector("#mail-pair-begin"),
-  mailPairBeginResult: document.querySelector("#mail-pair-begin-result"),
+  mailDiscover: document.querySelector("#mail-discover"),
+  mailFoundList: document.querySelector("#mail-found-list"),
+  mailRequestsList: document.querySelector("#mail-requests-list"),
   mailPairAddress: document.querySelector("#mail-pair-address"),
-  mailPairCode: document.querySelector("#mail-pair-code"),
-  mailPairTls: document.querySelector("#mail-pair-tls"),
-  mailPairComplete: document.querySelector("#mail-pair-complete"),
-  mailPairCompleteResult: document.querySelector("#mail-pair-complete-result"),
+  mailPairManual: document.querySelector("#mail-pair-manual"),
+  mailPeersResult: document.querySelector("#mail-peers-result"),
   openSettings: document.querySelector("#open-settings"),
   settingsDialog: document.querySelector("#settings-dialog"),
   settingsSummary: document.querySelector("#settings-summary"),
@@ -3705,6 +3699,7 @@ function renderHubMailPeers(peers) {
     for (const hub of asArray(peer.hubs)) hubs.appendChild(createElement("li", "", hubMailHubLabel(hub)));
     if (!asArray(peer.hubs).length) hubs.appendChild(createElement("li", "", "No hubs advertised"));
     row.appendChild(hubs);
+    if (peer.machine_id) row.appendChild(hubMailPeerButton("Forget", "forget", { peerId: String(peer.machine_id) }));
     fragment.appendChild(row);
   }
   elements.mailPeersList.replaceChildren(fragment);
@@ -3764,45 +3759,100 @@ function renderHubMailDetail(payload) {
   elements.mailDetailPanel.replaceChildren(fragment);
 }
 
-// Listener and pairing controls. Each request goes to the host, which calls a
-// confirm=True dashboard tool; results land in textContent only.
-function hubMailPortValue(value) {
-  const text = String(value ?? "").trim();
-  if (!/^\d{1,5}$/.test(text)) return null;
-  const port = Number(text);
-  return port <= 65535 ? port : null;
+// Code-free pairing controls. The only value an owner compares is the SAS both
+// screens show. Each request goes to the host, which calls the dashboard peers
+// tool; every label and address from the network lands in textContent only.
+const HUB_MAIL_PEERS_PENDING = {
+  discover: "Looking for machines on the network",
+  pair: "Sending the pairing request",
+  accept: "Accepting the request",
+  reject: "Closing the request",
+  forget: "Forgetting the machine",
+};
+
+function hubMailAddressValid(address) {
+  const match = /^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+):(\d{1,5})$/.exec(address);
+  return Boolean(match) && Number(match[1]) >= 1 && Number(match[1]) <= 65535;
 }
 
-function requestHubMailListenerAction(action) {
-  const message = { type: "hubMailListener", action };
-  if (action === "start") {
-    const bindHost = String(elements.mailListenerHost.value || "").trim();
-    const port = hubMailPortValue(elements.mailListenerPort.value);
-    if (!bindHost || /\s/.test(bindHost) || port === null) {
-      elements.mailListenerResult.textContent = "Enter a bind host (e.g. localhost or a LAN address) and a port from 0 to 65535";
-      return;
-    }
-    message.bindHost = bindHost;
-    message.port = port;
-  }
-  elements.mailListenerResult.textContent = action === "start" ? "Starting listener" : "Stopping listener";
-  vscode.postMessage(message);
+function requestHubMailPeers(action, fields = {}) {
+  elements.mailPeersResult.textContent = HUB_MAIL_PEERS_PENDING[action] || "Working";
+  vscode.postMessage({ type: "hubMailPeers", action, ...fields });
 }
 
-function requestHubMailPairBegin() {
-  elements.mailPairBeginResult.textContent = "Minting a pairing code";
-  vscode.postMessage({ type: "hubMailPairBegin" });
-}
-
-function requestHubMailPairComplete() {
+function requestHubMailManualPair() {
   const address = String(elements.mailPairAddress.value || "").trim();
-  const code = String(elements.mailPairCode.value || "").trim();
-  if (!address || !code) {
-    elements.mailPairCompleteResult.textContent = "Enter the other machine's listener address and pairing code";
+  if (!hubMailAddressValid(address)) {
+    elements.mailPeersResult.textContent = "Enter the other machine as host:port";
     return;
   }
-  elements.mailPairCompleteResult.textContent = "Pairing";
-  vscode.postMessage({ type: "hubMailPairComplete", address, code, tls: Boolean(elements.mailPairTls.checked) });
+  requestHubMailPeers("pair", { address });
+}
+
+function hubMailPeerButtonClick(event) {
+  const target = event.target && typeof event.target.closest === "function" ? event.target.closest("[data-mail-peer-action]") : null;
+  if (!target) return;
+  const action = target.dataset.mailPeerAction;
+  if (action === "pair") requestHubMailPeers(action, { address: target.dataset.address || "" });
+  else if (action === "accept" || action === "reject") requestHubMailPeers(action, { requestId: target.dataset.requestId || "" });
+  else if (action === "forget") requestHubMailPeers(action, { peerId: target.dataset.peerId || "" });
+}
+
+function hubMailPeerButton(label, action, data) {
+  const button = createElement("button", "mail-peer-button", label);
+  button.type = "button";
+  button.dataset.mailPeerAction = action;
+  Object.assign(button.dataset, data || {});
+  return button;
+}
+
+function renderHubMailFound(found) {
+  if (!found.length) {
+    elements.mailFoundList.replaceChildren(createElement("div", "panel-list-empty", "No machines found. Use Find machines, or enter host:port"));
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  for (const entry of found) {
+    const row = createElement("div", "mail-peer");
+    const meta = [String(entry.address || "no address"), entry.paired ? "already paired" : "not paired"];
+    if (entry.address_changed) meta.push("address changed");
+    row.append(
+      createElement("strong", "", hubMailNodeLabel(entry)),
+      createElement("span", "needfix-list-meta", meta.join(" · ")),
+    );
+    if (!entry.paired && entry.address) row.appendChild(hubMailPeerButton("Pair", "pair", { address: String(entry.address) }));
+    fragment.appendChild(row);
+  }
+  elements.mailFoundList.replaceChildren(fragment);
+}
+
+function renderHubMailRequests(requests) {
+  if (!requests.length) {
+    elements.mailRequestsList.replaceChildren(createElement("div", "panel-list-empty", "No pending pairing requests"));
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  for (const request of requests) {
+    const incoming = request.direction === "incoming";
+    const sas = String(request.sas || "");
+    const requestId = String(request.request_id || "");
+    const row = createElement("div", "mail-peer mail-request");
+    row.append(
+      createElement("strong", "", `${incoming ? "Request from" : "Request to"} ${hubMailNodeLabel(request)}`),
+      createElement("span", "needfix-list-meta", `${String(request.address || "no address")} · expires ${String(request.expires_at || "?")}`),
+      createElement("div", "mail-sas", sas ? `Both screens must show ${sas}` : "Waiting for the other machine"),
+    );
+    if (incoming && sas) {
+      row.append(
+        hubMailPeerButton("Accept", "accept", { requestId }),
+        hubMailPeerButton("Reject", "reject", { requestId }),
+      );
+    } else {
+      row.appendChild(hubMailPeerButton(incoming ? "Reject" : "Cancel", "reject", { requestId }));
+    }
+    fragment.appendChild(row);
+  }
+  elements.mailRequestsList.replaceChildren(fragment);
 }
 
 function hubMailActionError(payload) {
@@ -3810,31 +3860,29 @@ function hubMailActionError(payload) {
 }
 
 function renderHubMailAction(action, payload) {
+  if (action !== "peers") return;
   const value = payload && typeof payload === "object" ? payload : {};
-  const ok = Boolean(payload) && value.ok !== false;
-  if (action === "listener") {
-    if (value.listener) renderHubMailListener(value.listener);
-    const verb = String(value.action || "listener");
-    if (!ok) elements.mailListenerResult.textContent = `Listener ${verb} failed: ${hubMailActionError(value)}`;
-    else if (verb === "stop") elements.mailListenerResult.textContent = value.stopped ? "Listener stopped" : "Listener was not running";
-    else if (verb === "start") elements.mailListenerResult.textContent = value.already_running ? "Listener already running" : "Listener started";
-    else elements.mailListenerResult.textContent = "";
+  const verb = String(value.action || "request");
+  const result = elements.mailPeersResult;
+  if (!payload || value.ok === false) {
+    result.textContent = `Hub mail ${verb} failed: ${hubMailActionError(value)}`;
     return;
   }
-  if (action === "pairBegin") {
-    if (!ok) {
-      elements.mailPairBeginResult.textContent = `Pairing code failed: ${hubMailActionError(value)}`;
-      return;
-    }
-    if (value.listener) renderHubMailListener(value.listener);
-    const address = String(value.address || "") || "none, start the listener first";
-    elements.mailPairBeginResult.textContent = `Code ${String(value.code || "?")} · this machine's address ${address} · expires ${String(value.expires_at || "?")}`;
-    return;
-  }
-  if (action === "pairComplete") {
-    elements.mailPairCompleteResult.textContent = ok && value.peer
-      ? `Paired with ${hubMailNodeLabel(value.peer)} · Refresh to list it`
-      : `Pairing failed: ${hubMailActionError(value)}`;
+  if (verb === "requests") {
+    renderHubMailRequests(asArray(value.requests));
+  } else if (verb === "discover") {
+    const found = asArray(value.found);
+    renderHubMailFound(found);
+    result.textContent = `${formatCount(found.length)} machine(s) found`;
+  } else if (verb === "pair") {
+    result.textContent = `Request sent to ${hubMailNodeLabel(value.peer)}. Ask its owner to accept it once their screen shows ${String(value.sas || "?")}`;
+  } else if (verb === "accept") {
+    const pending = value.confirm === "pending" ? ` · the other machine has not confirmed yet${value.confirm_error ? ` (${String(value.confirm_error)})` : ""}` : "";
+    result.textContent = `Paired with ${hubMailNodeLabel(value.peer)}${pending}`;
+  } else if (verb === "reject") {
+    result.textContent = "Request closed";
+  } else if (verb === "forget") {
+    result.textContent = "Machine forgotten";
   }
 }
 // End WorkHub Mail popup.
@@ -8569,10 +8617,11 @@ elements.mailInboxList.addEventListener("click", (event) => {
   const target = event.target.closest("[data-mail-id]");
   if (target) vscode.postMessage({ type: "requestHubMailDetail", messageId: target.dataset.mailId });
 });
-elements.mailListenerStart.addEventListener("click", () => requestHubMailListenerAction("start"));
-elements.mailListenerStop.addEventListener("click", () => requestHubMailListenerAction("stop"));
-elements.mailPairBegin.addEventListener("click", requestHubMailPairBegin);
-elements.mailPairComplete.addEventListener("click", requestHubMailPairComplete);
+elements.mailDiscover.addEventListener("click", () => requestHubMailPeers("discover"));
+elements.mailPairManual.addEventListener("click", requestHubMailManualPair);
+elements.mailFoundList.addEventListener("click", hubMailPeerButtonClick);
+elements.mailRequestsList.addEventListener("click", hubMailPeerButtonClick);
+elements.mailPeersList.addEventListener("click", hubMailPeerButtonClick);
 
 function applyManagerChatCollapsed(collapsed) {
   state.managerChatCollapsed = Boolean(collapsed);

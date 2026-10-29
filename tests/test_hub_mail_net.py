@@ -7,7 +7,6 @@ its own listener on 127.0.0.1 port 0, so nothing here touches the real
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import http.client
 import inspect
@@ -105,10 +104,11 @@ def _send(home: Path, sender: str, to: str, **overrides) -> dict:
 
 
 def _pair(client: Path, server_home: Path, listener: hub_mail_net.Listener, **options) -> str:
-    code = hub_mail_net.pair_begin(server_home)["code"]
-    result = hub_mail_net.pair_complete(listener.address, code, home=client, **options)
-    assert result["ok"] is True, result
-    return code
+    started = hub_mail_net.pair(listener.address, home=client, **options)
+    assert started["ok"] is True, started
+    accepted = hub_mail_net.accept(started["request_id"], home=server_home)
+    assert accepted["ok"] is True and accepted["confirm"] == "delivered", accepted
+    return started["sas"]
 
 
 def _inbox_files(home: Path, hub_id: str) -> list[str]:
@@ -153,13 +153,6 @@ def _raw(address: str, method: str, path: str, body: bytes = b"", headers: dict 
         connection.close()
 
 
-def _other_code(code: str) -> str:
-    while True:
-        text = base64.b32encode(secrets.token_bytes(hub_mail_net.PAIR_CODE_BYTES)).decode().rstrip("=")
-        if text != code.replace("-", ""):
-            return "-".join(text[i : i + 4] for i in range(0, len(text), 4))
-
-
 def test_two_machines_pair_then_exchange_a_report_and_a_threaded_receipt(world):
     a = world.machine("machine_a", "alpha", (HUB_A, "geoai"))
     b = world.machine("machine_b", "bravo", (HUB_B, "aiworkhub"))
@@ -195,7 +188,9 @@ def test_two_machines_pair_then_exchange_a_report_and_a_threaded_receipt(world):
     assert received["untrusted_data"] is True and received["from_node"] == node_b
 
 
-def test_pairing_code_never_crosses_the_wire_and_both_sides_derive_one_secret(world, monkeypatch):
+def test_pairing_needs_no_typed_secret_and_both_sides_derive_one_secret_that_never_crosses_the_wire(
+    world, monkeypatch
+):
     a = world.machine("machine_a", "alpha", (HUB_A, "geoai"))
     b = world.machine("machine_b", "bravo", (HUB_B, "aiworkhub"))
     world.listen(a)
@@ -210,53 +205,26 @@ def test_pairing_code_never_crosses_the_wire_and_both_sides_derive_one_secret(wo
         return status, reply_headers, data, observed
 
     monkeypatch.setattr(hub_mail_net, "_exchange", recording)
-    begun = hub_mail_net.pair_begin(b)
-    code = begun["code"]
-    assert len(code.replace("-", "")) * 5 >= 100
-    assert begun["max_failed_proofs"] == 5
-    assert hub_mail_net.pair_complete(listener_b.address, code, home=a)["ok"] is True
-    hub_mail_net.refresh_peers(a)
+    started = hub_mail_net.pair(listener_b.address, home=a)
+    assert started["ok"] is True and len(started["sas"]) == 6 and "code" not in started
+    [incoming] = hub_mail_net.pair_requests(b)["requests"]
+    assert incoming["sas"] == started["sas"]
+    accepted = hub_mail_net.accept(started["request_id"], home=b)
+    assert accepted["ok"] is True and accepted["confirm"] == "delivered", accepted
     assert _send(a, HUB_A, HUB_B)["delivery"] == "delivered"
     assert len(wire) >= 12
-    for blob in wire:
-        assert code.encode() not in blob
-        assert code.replace("-", "").encode() not in blob
 
     id_a, id_b = hub_mail_net.machine_id(a), hub_mail_net.machine_id(b)
     stored_a = json.loads(hub_mail_net.peer_path(id_b, a).read_text(encoding="utf-8"))
     stored_b = json.loads(hub_mail_net.peer_path(id_a, b).read_text(encoding="utf-8"))
-    assert stored_a["secret"] == stored_b["secret"] == hub_mail_net.derive_secret(code, id_a, id_b).hex()
+    secret = stored_a["secret"]
+    assert secret == stored_b["secret"] and len(secret) == 64
+    for blob in wire:
+        assert secret.encode() not in blob
+    assert "secret" not in json.dumps([started, accepted])
 
-    again = hub_mail_net.pair_complete(listener_b.address, code, home=a)
-    assert again == {"ok": False, "error": "peer_refused:pair_code_unavailable"}
-
-
-def test_pairing_code_expires_after_ten_minutes(world, monkeypatch):
-    a = world.machine("machine_a", "alpha", (HUB_A, "geoai"))
-    b = world.machine("machine_b", "bravo", (HUB_B, "aiworkhub"))
-    world.listen(a)
-    listener_b = world.listen(b)
-    code = hub_mail_net.pair_begin(b)["code"]
-    real = time.time
-    monkeypatch.setattr(hub_mail_net, "_clock", lambda: real() + hub_mail_net.PAIR_CODE_TTL_SECONDS + 1)
-    result = hub_mail_net.pair_complete(listener_b.address, code, home=a)
-    assert result == {"ok": False, "error": "peer_refused:pair_code_expired"}
-    assert hub_mail_net.list_peers(a) == [] and hub_mail_net.list_peers(b) == []
-
-
-def test_pairing_code_dies_after_five_failed_proofs(world):
-    a = world.machine("machine_a", "alpha", (HUB_A, "geoai"))
-    b = world.machine("machine_b", "bravo", (HUB_B, "aiworkhub"))
-    world.listen(a)
-    listener_b = world.listen(b)
-    code = hub_mail_net.pair_begin(b)["code"]
-    wrong = _other_code(code)
-    for _ in range(hub_mail_net.PAIR_MAX_FAILURES):
-        result = hub_mail_net.pair_complete(listener_b.address, wrong, home=a)
-        assert result == {"ok": False, "error": "peer_refused:pair_proof_invalid"}
-    result = hub_mail_net.pair_complete(listener_b.address, code, home=a)
-    assert result == {"ok": False, "error": "peer_refused:pair_code_unavailable"}
-    assert hub_mail_net.list_peers(a) == [] and hub_mail_net.list_peers(b) == []
+    again = hub_mail_net.accept(started["request_id"], home=b)
+    assert again["ok"] is False and again["error"].endswith("pair_request_unknown")
 
 
 def test_listener_refuses_unauthenticated_requests_and_writes_nothing(world):
@@ -571,25 +539,12 @@ def test_a_wildcard_bind_advertises_the_routed_interface_not_127_0_1_1(monkeypat
     assert dialed == [(socket.AF_INET, ("192.0.2.1", 9))]
 
 
-def test_a_wildcard_bind_with_only_loopback_advertises_nothing_and_pairing_refuses(world, monkeypatch):
-    a = world.machine("machine_a", "alpha", (HUB_A, "geoai"))
-    b = world.machine("machine_b", "bravo", (HUB_B, "aiworkhub"))
-    code = hub_mail_net.pair_begin(b)["code"]
+def test_a_wildcard_bind_with_only_loopback_advertises_nothing(monkeypatch):
     monkeypatch.setattr(hub_mail_net.socket, "gethostbyname", lambda name: "127.0.1.1")
     _fake_udp_route(monkeypatch, "127.0.0.1")
     assert hub_mail_net._advertised_host("0.0.0.0") == ""
     _fake_udp_route(monkeypatch, "::1")
     assert hub_mail_net._advertised_host("::") == ""
-
-    hub_mail_net._claim_pidfile({
-        "schema_id": hub_mail_net.LISTENER_SCHEMA_ID, "pid": os.getpid(),
-        "start_ticks": runtime_temp.process_start_ticks(os.getpid()), "token": secrets.token_hex(16),
-        "bind_host": "0.0.0.0", "port": 9, "address": "",
-    }, a)
-    assert hub_mail_net.listener_status(a)["running"] is True
-    assert hub_mail_net.pair_complete("127.0.0.1:9", code, home=a) == {
-        "ok": False, "error": "listener_address_unroutable",
-    }
 
 
 def test_an_explicit_bind_host_is_advertised_unchanged(monkeypatch):
@@ -663,9 +618,15 @@ def test_tls_pairing_pins_the_certificate_and_refuses_a_swapped_one(world, tmp_p
 
 
 _NET_TOOLS = (
+    "aiworkhub_manager_hub_mail_send",
+    "aiworkhub_manager_hub_mail_inbox",
+    "aiworkhub_manager_hub_mail_peers",
+)
+_REMOVED_TOOLS = (
+    "aiworkhub_manager_hub_mail_show",
+    "aiworkhub_manager_hub_mail_archive",
     "aiworkhub_manager_hub_mail_pair_begin",
     "aiworkhub_manager_hub_mail_pair_complete",
-    "aiworkhub_manager_hub_mail_peers",
     "aiworkhub_manager_hub_mail_listener",
 )
 
@@ -680,12 +641,12 @@ def test_new_mcp_tools_document_every_parameter():
             assert f"{parameter}:" in args, (name, parameter)
 
 
-def test_manager_seat_holds_only_the_peers_read():
+def test_the_manager_registers_exactly_three_hub_mail_tools():
+    registered = sorted(name for name in dir(server) if name.startswith("aiworkhub_manager_hub_mail_"))
+    assert registered == sorted(_NET_TOOLS)
+    assert not [name for name in _REMOVED_TOOLS if hasattr(server, name)]
+    assert not [name for name in ("pair_begin", "pair_complete") if hasattr(hub_mail_net, name)]
     assert "aiworkhub_manager_hub_mail_peers" in ra.MANAGER_SEAT_MCP_TOOLS
-    writes = set(_NET_TOOLS) - {"aiworkhub_manager_hub_mail_peers"}
-    assert not writes & set(ra.MANAGER_SEAT_MCP_TOOLS)
-    seat = set(ra.resolve_manager_seat_codex_tools())
-    assert "aiworkhub_manager_hub_mail_peers" in seat and not writes & seat
 
 
 def _manager_route(root: Path) -> dict:
@@ -701,36 +662,70 @@ def test_mcp_tools_are_gated_by_the_write_gate_and_the_verified_route(world, mon
     root = world.register(world.default_home, HUB_A, "geoai")
     monkeypatch.setattr(core, "manager_bootstrap", lambda: _manager_route(root))
     monkeypatch.setattr(core, "writes_allowed", lambda: False)
+    peers_tool, inbox_tool = server.aiworkhub_manager_hub_mail_peers, server.aiworkhub_manager_hub_mail_inbox
     closed = [
-        server.aiworkhub_manager_hub_mail_pair_begin(),
-        server.aiworkhub_manager_hub_mail_pair_complete(address="127.0.0.1:9", code="x"),
-        server.aiworkhub_manager_hub_mail_listener(action="start", bind_host="127.0.0.1", port=0),
-        server.aiworkhub_manager_hub_mail_listener(action="stop"),
+        inbox_tool(action="archive", message_id="m" * 8),
+        peers_tool(action="discover"),
+        peers_tool(action="pair", address="127.0.0.1:9"),
+        peers_tool(action="reject", request_id="1" * 32),
+        peers_tool(action="forget", peer_id="2" * 32),
     ]
-    assert [result["error"] for result in closed] == ["write_gate_closed"] * 4
-    assert not hub_mail_net.pairing_path().exists()
-    listing = server.aiworkhub_manager_hub_mail_peers()
+    assert [result["error"] for result in closed] == ["write_gate_closed"] * len(closed)
+    listing = peers_tool()
     assert listing["ok"] is True and listing["peers"] == []
-    assert server.aiworkhub_manager_hub_mail_listener(action="status")["running"] is False
+    assert peers_tool(action="requests")["ok"] is True
+    assert inbox_tool()["ok"] is True
+
+    for tool, bad in ((inbox_tool, "restart"), (peers_tool, "listener")):
+        result = tool(action=bad)
+        assert result["ok"] is False and result["error"].endswith("_action_invalid") and result["allowed"]
 
     monkeypatch.setattr(core, "writes_allowed", lambda: True)
-    begun = server.aiworkhub_manager_hub_mail_pair_begin(machine_label="desk\x07")
-    assert begun["ok"] is True and begun["machine_label"] == "desk"
-    assert server.aiworkhub_manager_hub_mail_listener(action="start") == {
-        "ok": False, "error": "bind_host_required",
-    }
-    assert server.aiworkhub_manager_hub_mail_listener(action="restart")["error"] == "listener_action_invalid"
+    assert peers_tool(action="pair")["error"] == "address_required"
+    assert peers_tool(action="reject")["error"] == "request_id_required"
+    assert peers_tool(action="accept", request_id="1" * 32)["error"] == "hub_mail_peers_action_invalid"
+    assert peers_tool(action="forget")["error"] == "peer_id_required"
+    assert peers_tool(action="forget", peer_id="2" * 32)["error"] == "peer_unknown"
+    assert inbox_tool(action="show")["error"] == "message_id_required"
 
     monkeypatch.setattr(
         core, "manager_bootstrap",
         lambda: {"ok": True, "role": "worker_or_unverified_client", "manager_route": {}},
     )
     for result in (
-        server.aiworkhub_manager_hub_mail_peers(),
-        server.aiworkhub_manager_hub_mail_pair_begin(),
-        server.aiworkhub_manager_hub_mail_listener(action="status"),
+        peers_tool(),
+        peers_tool(action="pair", address="127.0.0.1:9"),
+        peers_tool(action="forget", peer_id="2" * 32),
+        inbox_tool(),
+        inbox_tool(action="archive", message_id="m" * 8),
     ):
         assert result["error"] == "verified_manager_identity_required"
+
+
+def test_forget_peer_removes_the_secret_and_the_peers_mail_is_refused(world):
+    a = world.machine("machine_a", "alpha", (HUB_A, "geoai"))
+    b = world.machine("machine_b", "bravo", (HUB_B, "aiworkhub"))
+    world.listen(a)
+    listener_b = world.listen(b)
+    _pair(a, b, listener_b)
+    id_a, id_b = hub_mail_net.machine_id(a), hub_mail_net.machine_id(b)
+    peer = hub_mail_net.load_peer(id_b, a)
+    assert _send(a, HUB_A, HUB_B)["delivery"] == "delivered"
+
+    assert hub_mail_net.forget_peer(id_b, home=a) == {"ok": True, "forgotten": True, "machine_id": id_b}
+    assert hub_mail_net.load_peer(id_b, a) is None and hub_mail_net.peers(a)["count"] == 0
+    assert peer["secret"] not in json.dumps(hub_mail_net.peers(a))
+    assert hub_mail_net.forget_peer(id_b, home=a) == {"ok": False, "error": "peer_unknown"}
+    assert hub_mail_net.forget_peer("not-an-id", home=a)["ok"] is False
+
+    # B still holds A's side; once B forgets too, A's signed requests are refused.
+    assert hub_mail_net.forget_peer(id_a, home=b)["ok"] is True
+    data = hub_mail.envelope_bytes(_envelope(HUB_A, HUB_B, bytes.fromhex(peer["secret"])))
+    headers = hub_mail_net._signed_headers(peer, a, "POST", "/v1/mail", data)
+    status, payload, _ = _raw(listener_b.address, "POST", "/v1/mail", data, headers)
+    assert (status, payload) == (401, {"ok": False, "error": "unknown_peer"})
+    assert len(_inbox_files(b, HUB_B)) == 1
+    assert _send(a, HUB_A, HUB_B) == {"ok": False, "error": "unknown_recipient"}
 
 
 def test_mcp_startup_hook_ensures_the_listener_and_never_propagates_a_failure(tmp_path, monkeypatch, capsys):

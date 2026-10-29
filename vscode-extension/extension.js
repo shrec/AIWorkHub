@@ -373,9 +373,7 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
   "requestRoadmapDetail",
   "requestHubMail",
   "requestHubMailDetail",
-  "hubMailListener",
-  "hubMailPairBegin",
-  "hubMailPairComplete",
+  "hubMailPeers",
   "needfixCapture",
   "needfixUpdate",
   "needfixTransition",
@@ -576,11 +574,10 @@ const ROADMAP_ID_RE = /^RM-\d{4}-\d{5}$/;
 const HUB_MAIL_TOOLS = Object.freeze({
   list: "aiworkhub_dashboard_hub_mail",
   detail: "aiworkhub_dashboard_hub_mail_detail",
-  listener: "aiworkhub_dashboard_hub_mail_listener",
-  pairBegin: "aiworkhub_dashboard_hub_mail_pair_begin",
-  pairComplete: "aiworkhub_dashboard_hub_mail_pair_complete",
+  peers: "aiworkhub_dashboard_hub_mail_peers",
 });
 const MESSAGE_ID_RE = /^[0-9a-f]{32}$/;
+const HUB_MAIL_ADDRESS_RE = /^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+):\d{1,5}$/;
 const SOURCE_GRAPH_SETTINGS_UPDATE_TOOL = "aiworkhub_dashboard_source_graph_settings_update";
 const FEATURE_SETTING_KEYS = new Set([
   "source_graph",
@@ -11028,10 +11025,96 @@ async function runHubMailAction(view, action, args) {
     const client = getMcpClient();
     view.bindClient(client);
     const payload = await client.callTool(tool, args);
-    if (view.stillBoundTo(client)) postHubMailAction(view, action, sanitizeWebviewPayload(payload));
+    if (!view.stillBoundTo(client)) return;
+    postHubMailAction(view, action, sanitizeWebviewPayload(payload));
+    // A confirmed peers write changes the machines and the pending requests.
+    if (action === "peers" && args.confirm === true && args.action !== "discover" && payload && payload.ok === true) {
+      await pushHubMail(view, {});
+      await runHubMailAction(view, "peers", { action: "requests" });
+    }
   } catch (err) {
     postHubMailAction(view, action, { ok: false, action: args.action, error: sanitizeErrorMessage(err) });
   }
+}
+
+const HUB_MAIL_REQUEST_POLL_MS = 15000;
+const HUB_MAIL_NOTIFIED_MAX = 64;
+const hubMailNotifiedRequests = new Set();
+let hubMailRequestPollBusy = false;
+
+function hubMailDisplayText(value, limit) {
+  return String(value || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, limit) || "unnamed";
+}
+
+async function notifyHubMailRequest(request) {
+  const requestId = String(request.request_id || "");
+  const label = hubMailDisplayText(request.machine_label, 40);
+  const address = hubMailDisplayText(request.address, 80);
+  const choice = await vscode.window.showInformationMessage(
+    `WorkHub Mail: "${label}" at ${address} wants to pair. Accept only if it shows the code ${hubMailDisplayText(request.sas, 8)}.`,
+    "Accept",
+    "Reject",
+  );
+  if (choice !== "Accept" && choice !== "Reject") return;
+  try {
+    const result = await getMcpClient().callTool(HUB_MAIL_TOOLS.peers, {
+      action: choice.toLowerCase(),
+      request_id: requestId,
+      confirm: true,
+    });
+    const failure = result && result.ok === true ? "" : String((result && result.error) || "unavailable");
+    if (failure) {
+      vscode.window.showWarningMessage(`WorkHub Mail: ${choice.toLowerCase()} failed: ${hubMailDisplayText(failure, 120)}`);
+    } else {
+      vscode.window.showInformationMessage(choice === "Accept" ? `WorkHub Mail: paired with "${label}".` : `WorkHub Mail: request from "${label}" rejected.`);
+      const openView = (panel && panel.__aiworkhubViewState) || (sidebarView && sidebarView.__aiworkhubViewState) || null;
+      if (openView) {
+        await pushHubMail(openView, {});
+        await runHubMailAction(openView, "peers", { action: "requests" });
+      }
+    }
+  } catch (err) {
+    vscode.window.showWarningMessage(`WorkHub Mail: ${choice.toLowerCase()} failed: ${sanitizeErrorMessage(err)}`);
+  }
+}
+
+async function pollHubMailRequests() {
+  if (hubMailRequestPollBusy || !mcpClient) return;
+  hubMailRequestPollBusy = true;
+  try {
+    const payload = await mcpClient.callTool(HUB_MAIL_TOOLS.peers, { action: "requests" });
+    // A failed poll says nothing about which requests are still pending; keep the notified set.
+    if (!payload || payload.ok !== true) return;
+    const requests = Array.isArray(payload.requests) ? payload.requests : [];
+    const incomingIds = new Set(
+      requests
+        .filter((request) => request && request.direction === "incoming")
+        .map((request) => String(request.request_id || "")),
+    );
+    for (const notifiedId of [...hubMailNotifiedRequests]) {
+      if (!incomingIds.has(notifiedId)) hubMailNotifiedRequests.delete(notifiedId);
+    }
+    for (const request of requests) {
+      const requestId = String((request && request.request_id) || "");
+      if (!request || request.direction !== "incoming" || !request.sas || !MESSAGE_ID_RE.test(requestId)) continue;
+      if (hubMailNotifiedRequests.has(requestId)) continue;
+      if (hubMailNotifiedRequests.size >= HUB_MAIL_NOTIFIED_MAX) {
+        hubMailNotifiedRequests.delete(hubMailNotifiedRequests.values().next().value);
+      }
+      hubMailNotifiedRequests.add(requestId);
+      notifyHubMailRequest(request).catch((err) => debugTrace("hub_mail.request_notify.error", { reason: sanitizeErrorMessage(err) }));
+    }
+  } catch (err) {
+    debugTrace("hub_mail.request_poll.error", { reason: sanitizeErrorMessage(err) });
+  } finally {
+    hubMailRequestPollBusy = false;
+  }
+}
+
+function startHubMailRequestWatcher() {
+  const timer = setInterval(() => { void pollHubMailRequests(); }, HUB_MAIL_REQUEST_POLL_MS);
+  if (typeof timer.unref === "function") timer.unref();
+  return { dispose: () => clearInterval(timer) };
 }
 
 async function runNeedfixAction(view, action, args) {
@@ -11990,37 +12073,38 @@ function handleInboundMessage(view, message) {
       }
       break;
     }
-    // WorkHub Mail is read-only and fetched on dialog open/refresh only.
+    // WorkHub Mail is fetched on dialog open/refresh only.
     case "requestHubMail":
       pushHubMail(view, { includeArchived: message.includeArchived === true });
+      runHubMailAction(view, "peers", { action: "requests" });
       break;
     case "requestHubMailDetail": {
       const messageId = String(message.messageId || "");
       if (MESSAGE_ID_RE.test(messageId)) pushHubMailDetail(view, messageId);
       break;
     }
-    // WorkHub Mail listener and pairing: every write reaches a confirm=True
-    // dashboard tool, and only after its fields are shape-checked here.
-    case "hubMailListener": {
+    // WorkHub Mail pairing is code-free: the owner compares the SAS both screens
+    // show. Every write reaches a confirm=True dashboard tool, and only after its
+    // fields are shape-checked here; forgetting a machine is confirmed in a modal.
+    case "hubMailPeers": {
       const action = String(message.action || "");
-      const bindHost = String(message.bindHost || "").trim().slice(0, 255);
-      const port = Number(message.port);
-      if (action === "status") runHubMailAction(view, "listener", { action });
-      else if (action === "stop") runHubMailAction(view, "listener", { action, confirm: true });
-      else if (action === "start" && bindHost && !/\s/.test(bindHost) && Number.isInteger(port) && port >= 0 && port <= 65535) {
-        runHubMailAction(view, "listener", { action, bind_host: bindHost, port, confirm: true });
-      } else postHubMailAction(view, "listener", { ok: false, action, error: "listener_request_invalid" });
-      break;
-    }
-    case "hubMailPairBegin":
-      runHubMailAction(view, "pairBegin", { confirm: true });
-      break;
-    case "hubMailPairComplete": {
       const address = String(message.address || "").trim().slice(0, 300);
-      const code = String(message.code || "").trim().slice(0, 64);
-      if (address && code) {
-        runHubMailAction(view, "pairComplete", { address, code, tls: message.tls === true, confirm: true });
-      } else postHubMailAction(view, "pairComplete", { ok: false, error: "address_and_code_required" });
+      const requestId = String(message.requestId || "");
+      const peerId = String(message.peerId || "");
+      if (action === "discover") runHubMailAction(view, "peers", { action, confirm: true });
+      else if (action === "pair" && HUB_MAIL_ADDRESS_RE.test(address)) {
+        runHubMailAction(view, "peers", { action, address, confirm: true });
+      } else if ((action === "accept" || action === "reject") && MESSAGE_ID_RE.test(requestId)) {
+        runHubMailAction(view, "peers", { action, request_id: requestId, confirm: true });
+      } else if (action === "forget" && MESSAGE_ID_RE.test(peerId)) {
+        vscode.window.showWarningMessage(
+          "Forget this machine? Mail to and from it stops until you pair again.",
+          { modal: true },
+          "Forget",
+        ).then((choice) => {
+          if (choice === "Forget") runHubMailAction(view, "peers", { action, peer_id: peerId, confirm: true });
+        });
+      } else postHubMailAction(view, "peers", { ok: false, action, error: "hub_mail_peers_request_invalid" });
       break;
     }
     // The three NeedFix mutation tools now answer with a receipt whose `item`
@@ -14457,7 +14541,7 @@ function getHtmlForWebview(webview, extensionUri) {
 
   <dialog class="diagnostic-dialog needfix-dialog" id="mail-dialog">
     <div class="dialog-heading">
-      <div><h2>WorkHub Mail</h2><span id="mail-summary">Signed hub mail and paired LAN machines (read-only)</span></div>
+      <div><h2>WorkHub Mail</h2><span id="mail-summary">Signed hub mail and paired LAN machines</span></div>
       <button type="button" class="dialog-close" data-close-dialog="mail-dialog">Close</button>
     </div>
     <div class="needfix-toolbar">
@@ -14466,28 +14550,19 @@ function getHtmlForWebview(webview, extensionUri) {
       <button id="mail-refresh" type="button">Refresh</button>
     </div>
     <div class="needfix-toolbar mail-controls">
-      <label class="mail-field">Bind host <input id="mail-listener-host" type="text" value="localhost" placeholder="e.g. localhost or a LAN address" spellcheck="false"></label>
-      <label class="mail-field">Port <input id="mail-listener-port" type="number" min="0" max="65535" step="1" value="0" title="0 picks a free port"></label>
-      <button id="mail-listener-start" type="button">Start listener</button>
-      <button id="mail-listener-stop" type="button">Stop listener</button>
-      <span class="mail-action-result" id="mail-listener-result" aria-live="polite"></span>
-    </div>
-    <div class="needfix-toolbar mail-controls">
-      <button id="mail-pair-begin" type="button">Pair this machine</button>
-      <span class="mail-action-result" id="mail-pair-begin-result" aria-live="polite"></span>
-    </div>
-    <div class="needfix-toolbar mail-controls">
-      <span class="mail-column-title">Pair with another machine</span>
-      <label class="mail-field">Address <input id="mail-pair-address" type="text" placeholder="host:port, e.g. localhost or a LAN address" spellcheck="false"></label>
-      <label class="mail-field">Code <input id="mail-pair-code" type="text" autocomplete="off" spellcheck="false"></label>
-      <label class="needfix-archived-toggle"><input id="mail-pair-tls" type="checkbox"> TLS</label>
-      <button id="mail-pair-complete" type="button">Pair</button>
-      <span class="mail-action-result" id="mail-pair-complete-result" aria-live="polite"></span>
+      <button id="mail-discover" type="button">Find machines</button>
+      <label class="mail-field">Or enter a machine <input id="mail-pair-address" type="text" placeholder="host:port" spellcheck="false" autocomplete="off"></label>
+      <button id="mail-pair-manual" type="button">Pair</button>
+      <span class="mail-action-result" id="mail-peers-result" aria-live="polite"></span>
     </div>
     <div class="needfix-workspace mail-workspace">
       <div class="mail-column">
         <h3 class="mail-column-title">Inbox</h3>
         <div class="needfix-list" id="mail-inbox-list" aria-live="polite"></div>
+        <h3 class="mail-column-title">Machines found</h3>
+        <div class="needfix-list mail-peers-list" id="mail-found-list" aria-live="polite"><div class="panel-list-empty">Use Find machines, or enter host:port</div></div>
+        <h3 class="mail-column-title">Pairing requests</h3>
+        <div class="needfix-list mail-peers-list" id="mail-requests-list" aria-live="polite"></div>
         <h3 class="mail-column-title">Connected machines</h3>
         <div class="needfix-list mail-peers-list" id="mail-peers-list" aria-live="polite"></div>
       </div>
@@ -15042,6 +15117,7 @@ async function activate(context) {
     vscode.commands.registerCommand(`${EXT_ID}.selectRepository`, () => selectRepositoryCommand())
   );
   debugTrace("activation.providers_registered");
+  context.subscriptions.push(startHubMailRequestWatcher());
 
   // NF-2026-00643: this bridge start used to sit ABOVE the registration block
   // and be awaited.  The first thing it does is ask VS Code for the language

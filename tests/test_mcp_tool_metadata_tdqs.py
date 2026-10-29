@@ -108,8 +108,8 @@ def test_derive_annotations_name_rules():
         **_WRITE,
         "openWorldHint": True,
     }
-    assert derive_annotations("aiworkhub_manager_hub_mail_pair_begin", "Pair.")["openWorldHint"] is True
-    assert derive_annotations("aiworkhub_manager_hub_mail_listener", "Listen.")["openWorldHint"] is True
+    assert derive_annotations("aiworkhub_manager_hub_mail_peers", "MANAGER WRITE: pair.")["openWorldHint"] is True
+    assert derive_annotations("aiworkhub_manager_hub_mail_inbox", "MANAGER WRITE: archive.")["openWorldHint"] is False
 
 
 # --- (b) fresh FastMCP publishes descriptions and annotations ----------------

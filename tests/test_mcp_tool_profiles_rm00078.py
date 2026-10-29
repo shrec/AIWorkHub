@@ -42,11 +42,12 @@ _NEVER_EXISTED = "aiworkhub_no_such_tool_rm00078"
 _WORKER_ONLY = "aiworkhub_worker_source_graph_query"
 _WRITE_PROBE = "aiworkhub_task_mark_done"
 
-# Measured on base 739a7c70, plus aiworkhub_manager_callback_lane_claim (NF-2026-01802).
-_PRE_TABLE_ALL_COUNT = 233
-_PRE_TABLE_ALL_READ_ONLY_COUNT = 229
-_LISTED_COUNTS = {"manager": 185, "worker": 19, "dashboard": 69}
-# The 47 webview-only dashboard tools the pre-table manager surface hid.
+# Measured on base 739a7c70, plus aiworkhub_manager_callback_lane_claim (NF-2026-01802), minus the five
+# retired manager Hub Mail tools and the three retired dashboard ones, plus the dashboard peers view.
+_PRE_TABLE_ALL_COUNT = 226
+_PRE_TABLE_ALL_READ_ONLY_COUNT = 222
+_LISTED_COUNTS = {"manager": 180, "worker": 19, "dashboard": 67}
+# The 45 webview-only dashboard tools the pre-table manager surface hid.
 _PRE_TABLE_MANAGER_HIDDEN = frozenset({
     "aiworkhub_dashboard_task_detail",
     "aiworkhub_dashboard_health",
@@ -70,9 +71,7 @@ _PRE_TABLE_MANAGER_HIDDEN = frozenset({
     "aiworkhub_dashboard_roadmap_detail",
     "aiworkhub_dashboard_hub_mail",
     "aiworkhub_dashboard_hub_mail_detail",
-    "aiworkhub_dashboard_hub_mail_listener",
-    "aiworkhub_dashboard_hub_mail_pair_begin",
-    "aiworkhub_dashboard_hub_mail_pair_complete",
+    "aiworkhub_dashboard_hub_mail_peers",
     "aiworkhub_dashboard_settings",
     "aiworkhub_dashboard_settings_update",
     "aiworkhub_dashboard_model_settings_update",
@@ -404,7 +403,7 @@ def test_worker_profile_is_exactly_the_worker_tools(runs: dict) -> None:
 def test_dashboard_profile_is_the_dashboard_app_plus_every_extension_called_tool(runs: dict) -> None:
     app_names = _dashboard_app_tool_names()
     extension_names = _extension_dashboard_tool_names()
-    assert len(app_names) == 49 and all(name.startswith(_DASHBOARD) for name in app_names)
+    assert len(app_names) == 47 and all(name.startswith(_DASHBOARD) for name in app_names)
     assert extension_names
     dashboard = _profile_names("dashboard")
     missing = sorted(extension_names - dashboard)

@@ -2075,10 +2075,9 @@ MANAGER_SEAT_MCP_TOOLS: tuple[str, ...] = (
     "aiworkhub_completion_inbox",
     "aiworkhub_task_cost_ledger",
     "aiworkhub_task_usage_report",
-    # WorkHub Mail reads only: send, archive, pairing and the listener are
-    # outward-facing writes and stay off the seat.
+    # WorkHub Mail on the seat: inbox and peers for their read actions only;
+    # server._hub_mail_local refuses every writing action from a Manager Chat seat.
     "aiworkhub_manager_hub_mail_inbox",
-    "aiworkhub_manager_hub_mail_show",
     "aiworkhub_manager_hub_mail_peers",
 )
 
