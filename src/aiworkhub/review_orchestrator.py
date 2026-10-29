@@ -319,11 +319,26 @@ def select_reviewer_route(
         if not all(identity) or identity in seen:
             continue
         seen.add(identity)
+        # NF-2026-01588: reviewer selection honors the same route failure
+        # circuit that worker launch derivation already consults, so a quota
+        # outage stops relaunching reviewers on the failing route. An
+        # unreadable circuit skips nothing: any exception reads as
+        # "not open", exactly like ``_derivation_route_circuit``.
+        try:
+            circuit_open = (
+                workforce_catalog.route_circuit_for(
+                    repo, route["adapter_id"], route["model"]
+                ).get("state")
+                == "open"
+            )
+        except Exception:
+            circuit_open = False
         if (
             identity in excluded_routes
             or route["adapter_id"] in excluded_adapters
             or _manager_reserved_codex_route(route)
             or not _review_route_policy_enabled(model_policy, route)
+            or circuit_open
         ):
             continue
         return route
