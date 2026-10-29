@@ -4144,6 +4144,8 @@ def aiworkhub_task_show(
         card = core.summarize_evidence(card)
         card = mcp_summary_folds.fold_task_card_facts(card)
         card = _fold_card_manager_bodies(card)
+    elif detail == "evidence":
+        card = mcp_summary_folds.dedupe_repeated_subtrees(card)
     rendered = dict(result)
     rendered["stdout"] = json.dumps(card, ensure_ascii=False, default=str, separators=(",", ":"))
     rendered["detail"] = detail
@@ -6297,6 +6299,8 @@ def aiworkhub_agent_task_status(
             card = core.summarize_evidence(card)
             card = mcp_summary_folds.fold_task_card_for_process_status(card)
             card = _fold_card_manager_bodies(card)
+        elif detail == "evidence":
+            card = mcp_summary_folds.dedupe_repeated_subtrees(card)
         folded["task_card"] = card
     latest = folded.get("latest_event")
     if isinstance(latest, dict):
@@ -6304,6 +6308,8 @@ def aiworkhub_agent_task_status(
         if detail == "summary":
             latest = core.summarize_evidence(latest, paths=core.EVENT_EVIDENCE_PATHS)
             latest = mcp_summary_folds.fold_latest_event_for_process_status(latest)
+        elif detail == "evidence":
+            latest = mcp_summary_folds.dedupe_repeated_subtrees(latest)
         folded["latest_event"] = latest
     if identity is not None:
         folded.update(identity)

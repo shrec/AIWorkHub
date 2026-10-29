@@ -10,6 +10,8 @@ module size ratchet in tests/test_module_size_ratchet.py.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 
 from . import core
@@ -511,3 +513,117 @@ def fold_latest_event_for_process_status(event: Any) -> Any:
                 receipt[name] = fact
         result[key] = receipt
     return result
+
+
+def _scalar_text(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def _canonical_texts(root: Any) -> dict[int, str]:
+    """Canonical JSON text of every dict/list node, composed bottom-up (O(n))."""
+
+    texts: dict[int, str] = {}
+
+    def visit(node: Any) -> str:
+        if isinstance(node, dict):
+            items = sorted(((str(k), v) for k, v in node.items()), key=lambda kv: kv[0])
+            text = "{" + ",".join(f"{_scalar_text(k)}:{visit(v)}" for k, v in items) + "}"
+        elif isinstance(node, list):
+            text = "[" + ",".join(visit(v) for v in node) + "]"
+        else:
+            return _scalar_text(node)
+        texts[id(node)] = text
+        return text
+
+    visit(root)
+    return texts
+
+
+def _child_path(path: str, key: Any) -> str:
+    if isinstance(key, int):
+        return f"{path}[{key}]"
+    text = str(key)
+    if text.isidentifier():
+        return f"{path}.{text}"
+    return f"{path}[{json.dumps(text, ensure_ascii=False)}]"
+
+
+def dedupe_repeated_subtrees(value: Any, min_bytes: int = 2048) -> Any:
+    """Replace repeated dict/list subtrees >= ``min_bytes`` with ``same_as`` refs.
+
+    Lossless: ``expand_same_as`` restores the input. The first occurrence in
+    depth-first document order is kept whole; later identical copies become
+    ``{"same_as": path, "sha256", "bytes"}``. The input is not mutated.
+    """
+
+    texts = _canonical_texts(value)
+    seen: dict[str, str] = {}
+
+    def walk(node: Any, path: str) -> Any:
+        text = texts.get(id(node))
+        if text is None:
+            return node
+        encoded = text.encode("utf-8")
+        if len(encoded) >= min_bytes:
+            earlier = seen.get(text)
+            if earlier is not None:
+                return {
+                    "same_as": earlier,
+                    "sha256": hashlib.sha256(encoded).hexdigest(),
+                    "bytes": len(encoded),
+                }
+            seen[text] = path
+        if isinstance(node, dict):
+            return {k: walk(v, _child_path(path, k)) for k, v in node.items()}
+        return [walk(v, _child_path(path, i)) for i, v in enumerate(node)]
+
+    return walk(value, "$")
+
+
+def _is_ref(node: Any) -> bool:
+    return (
+        isinstance(node, dict)
+        and set(node) == {"same_as", "sha256", "bytes"}
+        and isinstance(node["same_as"], str)
+    )
+
+
+def _resolve_path(root: Any, path: str) -> Any:
+    node = root
+    i = 1
+    while i < len(path):
+        if path[i] == ".":
+            j = i + 1
+            while j < len(path) and path[j] not in ".[":
+                j += 1
+            node = node[path[i + 1 : j]]
+            i = j
+        elif path[i + 1] == '"':
+            key, end = json.JSONDecoder().raw_decode(path, i + 1)
+            node = node[key]
+            i = end + 1
+        else:
+            j = path.index("]", i)
+            node = node[int(path[i + 1 : j])]
+            i = j + 1
+    return node
+
+
+def expand_same_as(value: Any) -> Any:
+    """Inverse of ``dedupe_repeated_subtrees``: restore the exact original value.
+
+    Each ref names an earlier, non-ancestor path of the deduped input, so it is
+    resolved against the input and the target is expanded recursively.
+    """
+
+    def build(node: Any, path: str) -> Any:
+        if _is_ref(node):
+            ref = node["same_as"]
+            return build(_resolve_path(value, ref), ref)
+        if isinstance(node, dict):
+            return {k: build(v, _child_path(path, k)) for k, v in node.items()}
+        if isinstance(node, list):
+            return [build(v, _child_path(path, i)) for i, v in enumerate(node)]
+        return node
+
+    return build(value, "$")

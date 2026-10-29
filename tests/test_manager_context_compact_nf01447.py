@@ -30,7 +30,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import core, dashboard_mcp_app, needfix_store, server  # noqa: E402
+from aiworkhub import core, dashboard_mcp_app, mcp_summary_folds, needfix_store, server  # noqa: E402
 
 _RETRY_TERMINAL_RECEIPT_MAX_BYTES = 2 * 1024
 _TASK_SHOW_SUMMARY_MAX_BYTES = 4 * 1024
@@ -280,7 +280,7 @@ def test_task_show_full_and_evidence_still_carry_every_byte(monkeypatch) -> None
     monkeypatch.setattr(server.core, "show_task", lambda task_id, full=False: _envelope(card))
 
     evidence = server.aiworkhub_task_show("NF01447_FIXTURE", detail="evidence")
-    assert json.loads(evidence["stdout"]) == card
+    assert mcp_summary_folds.expand_same_as(json.loads(evidence["stdout"])) == card
 
     full = server.aiworkhub_task_show("NF01447_FIXTURE", detail="full")
     assert full == _envelope(card)

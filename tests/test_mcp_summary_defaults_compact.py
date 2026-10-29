@@ -315,7 +315,7 @@ def test_task_show_evidence_and_full_keep_the_three_fields_exact(monkeypatch) ->
     monkeypatch.setattr(server.core, "show_task", lambda task_id, full=False: _envelope(card))
 
     evidence = server.aiworkhub_task_show("TASK_SIZE_FIXTURE", detail="evidence")
-    assert json.loads(evidence["stdout"]) == card
+    assert mcp_summary_folds.expand_same_as(json.loads(evidence["stdout"])) == card
 
     full = server.aiworkhub_task_show("TASK_SIZE_FIXTURE", detail="full")
     assert full == _envelope(card)
