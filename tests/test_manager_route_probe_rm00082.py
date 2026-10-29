@@ -87,6 +87,7 @@ def _bind_windows(
     monkeypatch.setattr(core, "repo_root", lambda: repo.resolve())
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: home))
     monkeypatch.setattr(manager_route_probe.sys, "executable", r"D:\repo\.venv\Scripts\python.exe")
+    monkeypatch.delenv("AIWORKHUB_MCP_SUPERVISED", raising=False)
     return repo
 
 
@@ -154,6 +155,7 @@ def test_the_probe_verifies_with_the_same_identity_the_seat_uses(tmp_path, monke
     assert probe.observations == {
         "platform": "windows", "hop_count": 2, "hop_images": ["python.exe", "claude.exe"],
         "descriptor_kind": "interactive", "descriptor_entrypoint": "claude-vscode", "cwd_matches": True,
+        "supervised": False,
     }
 
 
@@ -164,6 +166,26 @@ def test_the_posix_probe_reports_an_unreadable_parent(monkeypatch):
     probe = manager_route_probe.probe_claude_route()
 
     assert (probe.identity, probe.reason) == (None, "no_parent")
+
+
+@pytest.mark.parametrize("supervised, expected", [(True, "verified"), (False, "no_claude_ancestor")])
+def test_the_supervised_posix_server_looks_past_the_supervisor(tmp_path, monkeypatch, supervised, expected):
+    # NF-2026-01816: claude -> stable launcher supervisor -> server. Only the
+    # server the supervisor marked steps over its parent.
+    _bind_windows(monkeypatch, tmp_path, tree=_CLAUDE_CHAIN)
+    proc = {
+        (_STUB_PID, "status"): b"Name:\tpython3\nPPid:\t%d\n" % _CLAUDE_PID,
+        (_STUB_PID, "cmdline"): b"/usr/bin/python3\0/x/aiworkhub-mcp-server.py\0",
+        (_CLAUDE_PID, "cmdline"): b"/usr/local/bin/claude\0--ide\0",
+    }
+    monkeypatch.setattr(manager_route_probe, "_windows", lambda: False)
+    monkeypatch.setattr(manager_route_probe, "_proc_read", lambda pid, name: proc[(pid, name)])
+    if supervised:
+        monkeypatch.setenv("AIWORKHUB_MCP_SUPERVISED", str(_SERVER_PID))
+
+    probe = manager_route_probe.probe_claude_route()
+
+    assert (probe.reason, probe.observations["supervised"]) == (expected, supervised)
 
 
 # --- fail closed: a Claude chat is never granted Codex -----------------------

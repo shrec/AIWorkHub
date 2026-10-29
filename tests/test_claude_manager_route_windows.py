@@ -85,6 +85,7 @@ def _bind(
     monkeypatch.setattr(core, "repo_root", lambda: repo.resolve())
     monkeypatch.setattr(core.Path, "home", classmethod(lambda _cls: home))
     monkeypatch.setattr(core.sys, "executable", r"D:\repo\.venv\Scripts\python.exe")
+    monkeypatch.delenv("AIWORKHUB_MCP_SUPERVISED", raising=False)
 
 
 def test_a_venv_redirector_hop_still_grants_the_claude_seat(tmp_path, monkeypatch):
@@ -303,5 +304,55 @@ def test_a_python_launcher_chain_without_a_descriptor_is_refused(tmp_path, monke
         },
         descriptor_pid=999999,
     )
+
+    assert core._claude_windows_manager_identity() is None
+
+
+# NF-2026-01816: the stable launcher runs the server as its own child, so the
+# real chain is claude.exe -> venv stub -> supervisor -> venv stub -> server.
+_SUPERVISED_CHAIN = {
+    _SERVER_PID: (101, "python.exe"),
+    101: (102, "python.exe"),
+    102: (103, "python.exe"),
+    103: (_CLAUDE_PID, "python.exe"),
+    _CLAUDE_PID: (39124, "claude.exe"),
+}
+
+
+def test_the_server_the_supervisor_marked_gets_the_supervisor_hops(tmp_path, monkeypatch):
+    _bind(monkeypatch, tmp_path, tree=_SUPERVISED_CHAIN)
+    monkeypatch.setenv("AIWORKHUB_MCP_SUPERVISED", str(_SERVER_PID))
+
+    assert core._claude_windows_manager_identity() == {
+        "provider": "claude",
+        "session_id": _SESSION_ID,
+        "window_id": f"claude_vscode_{_CLAUDE_PID}",
+    }
+
+
+def test_an_inherited_supervisor_mark_grants_no_extra_hops(tmp_path, monkeypatch):
+    # A child of the server inherits the variable, but it names the server's
+    # pid, not the child's, so the child keeps the plain launcher budget.
+    _bind(monkeypatch, tmp_path, tree=_SUPERVISED_CHAIN)
+    monkeypatch.setenv("AIWORKHUB_MCP_SUPERVISED", "4242")
+
+    assert core._claude_windows_manager_identity() is None
+
+
+def test_the_supervisor_hops_are_bounded_too(tmp_path, monkeypatch):
+    _bind(
+        monkeypatch,
+        tmp_path,
+        tree={
+            _SERVER_PID: (101, "python.exe"),
+            101: (102, "python.exe"),
+            102: (103, "python.exe"),
+            103: (104, "python.exe"),
+            104: (105, "python.exe"),
+            105: (_CLAUDE_PID, "python.exe"),
+            _CLAUDE_PID: (39124, "claude.exe"),
+        },
+    )
+    monkeypatch.setenv("AIWORKHUB_MCP_SUPERVISED", str(_SERVER_PID))
 
     assert core._claude_windows_manager_identity() is None

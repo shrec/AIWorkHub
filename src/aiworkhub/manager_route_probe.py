@@ -34,6 +34,13 @@ from . import platform_io
 # a launcher shim may add one more, and no further, before the chain is refused.
 CLAUDE_LAUNCHER_HOP_LIMIT = 2
 
+# NF-2026-01816: the stable launcher (NF-2026-01357) runs the server as its own
+# CHILD to hot-swap runtime generations, so on Windows the chain is claude.exe ->
+# venv stub -> supervisor -> venv stub -> server. The supervisor and its stub are
+# two more hops, granted only to the process the supervisor marked as its server
+# (AIWORKHUB_MCP_SUPERVISED == own pid), never to a child that inherits the mark.
+SUPERVISOR_HOPS = 2
+
 # NF-2026-01005: the official Windows Python launcher. ``"command": "py"`` in a
 # ``.mcp.json`` keeps ``py.exe`` alive as the parent of the interpreter it
 # spawns, so it is a re-exec hop exactly like the venv redirector. Matched by
@@ -167,9 +174,10 @@ def probe_claude_windows_route() -> ClaudeRouteProbe:
 
     Only a hop that is THIS interpreter's own image name or exactly ``py.exe``
     / ``pyw.exe``, owned by the same user, is skipped, and at most
-    ``CLAUDE_LAUNCHER_HOP_LIMIT`` of them: the evidence that grants the seat
-    is still one exact ``claude`` ancestor with a valid, repository-bound
-    descriptor.
+    ``CLAUDE_LAUNCHER_HOP_LIMIT`` of them, plus ``SUPERVISOR_HOPS`` for the
+    server the stable launcher supervises (NF-2026-01816): the evidence that
+    grants the seat is still one exact ``claude`` ancestor with a valid,
+    repository-bound descriptor.
     """
     core = _core()
     hops: list[str] = []
@@ -189,8 +197,11 @@ def probe_claude_windows_route() -> ClaudeRouteProbe:
     if tree is None:
         return refuse("no_parent")
     interpreter_image = ntpath.basename(sys.executable).lower()
+    supervised = os.environ.get("AIWORKHUB_MCP_SUPERVISED") == str(os.getpid())
+    observations["supervised"] = supervised
+    hop_limit = CLAUDE_LAUNCHER_HOP_LIMIT + (SUPERVISOR_HOPS if supervised else 0)
     candidate = parent_pid
-    for _hop in range(CLAUDE_LAUNCHER_HOP_LIMIT + 1):
+    for _hop in range(hop_limit + 1):
         entry = tree.get(candidate)
         if entry is None:
             return refuse("no_claude_ancestor" if hops else "no_parent")
@@ -212,13 +223,24 @@ def probe_claude_windows_route() -> ClaudeRouteProbe:
     return refuse("hop_limit_exceeded")
 
 
+def _proc_read(pid: int, name: str) -> bytes:
+    return Path(f"/proc/{pid}/{name}").read_bytes()
+
+
 def _probe_posix_route() -> ClaudeRouteProbe:
     observations: dict[str, Any] = {"platform": "posix", "hop_count": 0, "hop_images": []}
     parent_pid = os.getppid()
+    supervised = os.environ.get("AIWORKHUB_MCP_SUPERVISED") == str(os.getpid())
+    observations["supervised"] = supervised
     try:
-        raw = Path(f"/proc/{parent_pid}/cmdline").read_bytes()
+        if supervised:
+            # NF-2026-01816: the stable launcher's supervisor is the parent of
+            # the server it marked; claude is the supervisor's own parent.
+            status = _proc_read(parent_pid, "status").decode("utf-8")
+            parent_pid = int(next(line.split()[1] for line in status.splitlines() if line.startswith("PPid:")))
+        raw = _proc_read(parent_pid, "cmdline")
         cmdline = raw.replace(b"\0", b" ").decode("utf-8")
-    except (OSError, UnicodeDecodeError):
+    except (OSError, UnicodeDecodeError, StopIteration, ValueError, IndexError):
         return ClaudeRouteProbe(None, "no_parent", observations)
     observations["hop_count"] = 1
     observations["hop_images"] = [_bounded(PurePosixPath(cmdline.split(" ", 1)[0]).name)]
