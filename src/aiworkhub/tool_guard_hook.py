@@ -32,6 +32,7 @@ import base64
 import json
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -585,6 +586,18 @@ def _expand(text: str) -> str:
     return _VARIABLE.sub(lambda match: os.environ.get(match.group(1), match.group(0)), text)
 
 
+def _git_ignored(path: Path) -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path.parent), "check-ignore", "-q", "--", path.name],
+            capture_output=True,
+            timeout=2,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def _worktree_mirror(parts: tuple[str, ...]) -> tuple[tuple[str, ...], str] | None:
     """HEAD + 32 lowercase hex + ``worktree`` + rest, else None.
 
@@ -669,7 +682,11 @@ class _Context:
         rel = self.indexed_rel(path)
         if path is None or rel is None or rel == ".":
             return None
-        return rel if path.suffix.lower() in INDEXED_SUFFIXES else None
+        if path.suffix.lower() not in INDEXED_SUFFIXES:
+            return None
+        if _git_ignored(path):
+            return None
+        return rel
 
     def indexed_dir(self, operand: str) -> str | None:
         if _GLOB.search(operand):
