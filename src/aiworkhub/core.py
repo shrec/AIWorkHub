@@ -11082,7 +11082,7 @@ def record_usage(
     return _canonical_result(ok=True, returncode=0, stdout=f"usage recorded: {task_id}", command=command)
 
 
-def usage_report(runner: str | None = None, topic: str | None = None, status: str | None = None) -> dict[str, Any]:
+def usage_report(runner: str | None = None, topic: str | None = None, status: str | None = None, records_out: list | None = None) -> dict[str, Any]:
     """Read-only aggregate over ``task_events`` rows with ``event='usage_record'``.
 
     Observed rows retain the historical pipe format. Missing provider usage or
@@ -11138,6 +11138,8 @@ def usage_report(runner: str | None = None, topic: str | None = None, status: st
         if status and rec.get("status") != status:
             continue
         records.append(rec)
+        if records_out is not None:
+            records_out.extend(records[-1:])
 
     if not records:
         return _canonical_result(ok=True, returncode=0, stdout="No usage records.", command=command)

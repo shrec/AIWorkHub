@@ -1730,7 +1730,10 @@ def aiworkhub_manager_context_graph_rebuild() -> dict[str, Any]:
 
 
 @mcp.tool()
-def aiworkhub_manager_workforce_catalog(full: bool = False) -> dict[str, Any]:
+def aiworkhub_manager_workforce_catalog(
+    full: bool = False,
+    include_disabled: bool = False,
+) -> dict[str, Any]:
     """MANAGER READ: configured models joined to observed canonical outcomes.
 
     ``full=True`` returns the complete payload exactly as before: every worker
@@ -1742,10 +1745,14 @@ def aiworkhub_manager_workforce_catalog(full: bool = False) -> dict[str, Any]:
     ``accepted_rate`` (read only from ``worker["outcomes"]``, omitted when
     absent, never invented) -- beside ``detail_omitted`` (bytes/sha256 of the canonical
     JSON of the full worker list) and a ``detail_request`` naming the full
-    call (NF-2026-01566).  An error result passes through untouched.
+    call (NF-2026-01566).  The default also omits workers whose ``enabled``
+    and ``launch_eligible`` are both falsy, reporting ``disabled_omitted_count``;
+    ``include_disabled=True`` keeps them as compact rows (NF-2026-01830).
+    An error result passes through untouched.
 
     Args:
         full: True returns every worker field plus outcome history; default False folds each worker to one compact row.
+        include_disabled: True keeps workers whose enabled and launch_eligible are both falsy as compact rows; default False omits them.
     """
 
     result = manager_ai_tools.workforce_catalog_read()
@@ -1754,11 +1761,19 @@ def aiworkhub_manager_workforce_catalog(full: bool = False) -> dict[str, Any]:
     workers = result.get("workers")
     if not isinstance(workers, list):
         return result
+
+    def _enabled(item: Any) -> bool:
+        if not isinstance(item, dict):
+            return True
+        return bool(item.get("enabled")) or bool(item.get("launch_eligible"))
+
+    kept_workers = workers if include_disabled else [item for item in workers if _enabled(item)]
     folded = {key: value for key, value in result.items() if key != "workers"}
     folded["workers"] = [
         _compact_workforce_worker(item) if isinstance(item, dict) else item
-        for item in workers
+        for item in kept_workers
     ]
+    folded["disabled_omitted_count"] = len(workers) - len(kept_workers)
     canonical = json.dumps(workers, sort_keys=True, separators=(",", ":"), default=str)
     folded["detail_omitted"] = _serialized_fingerprint(canonical)
     folded["detail_request"] = {
@@ -4824,16 +4839,84 @@ def aiworkhub_task_usage_report(
     runner: str | None = None,
     topic: str | None = None,
     status: str | None = None,
+    full: bool = False,
 ) -> dict[str, Any]:
     """Return task usage report, optionally filtered.
+
+    ``full=True`` returns the core ``usage_report`` payload exactly as
+    before.  The default keeps every other top-level key verbatim
+    (schema_id, record_count, ``*_observed_records``,
+    ``*_unknown_records``, ...) and replaces ``stdout`` with a bounded
+    summary: a header line, one line per runner (records, observed
+    total_tokens sum, observed cost_usd sum, usage-unknown count) and then
+    the top 20 records by observed total_tokens in the existing pipe
+    format, beside ``detail_omitted`` (fingerprint of the full stdout) and
+    a ``detail_request`` naming the full call (NF-2026-01830).  Error and
+    no-records results pass through untouched.
 
     Args:
         runner: Only report usage by this runner; omit for all runners.
         topic: Only report usage for this topic; omit for all topics.
         status: Only report usage recorded with this task status; omit for all statuses.
+        full: True returns the raw core report; default False replaces stdout with a bounded summary.
     """
+    records: list[dict[str, Any]] = []
+    result = core.usage_report(
+        runner=runner,
+        topic=topic,
+        status=status,
+        records_out=records,
+    )
+    if full or not isinstance(result, dict) or not result.get("ok") or "record_count" not in result:
+        return result
+    summary_lines = ["=== Task Usage Report ==="]
+    runner_stats: dict[str, dict[str, Any]] = {}
+    for rec in records:
+        stats = runner_stats.setdefault(
+            str(rec.get("runner", "?")),
+            {"records": 0, "tokens": 0, "cost": 0.0, "usage_unknown": 0},
+        )
+        stats["records"] += 1
+        if bool(rec.get("usage_observed")):
+            stats["tokens"] += int(rec.get("total_tokens") or 0)
+        else:
+            stats["usage_unknown"] += 1
+        if bool(rec.get("cost_observed")):
+            stats["cost"] += float(rec.get("cost_usd") or 0.0)
+    for name in sorted(runner_stats):
+        stats = runner_stats[name]
+        summary_lines.append(
+            f"runner={name} | records={stats['records']} | tokens={stats['tokens']} | "
+            f"cost=${stats['cost']:.4f} | usage_unknown={stats['usage_unknown']}"
+        )
 
-    return core.usage_report(runner=runner, topic=topic, status=status)
+    def _observed_tokens(rec: dict[str, Any]) -> int:
+        return int(rec.get("total_tokens") or 0) if bool(rec.get("usage_observed")) else -1
+
+    top = sorted(records, key=_observed_tokens, reverse=True)[:20]
+    for rec in top:
+        usage_is_observed = bool(rec.get("usage_observed"))
+        cost_is_observed = bool(rec.get("cost_observed"))
+        tokens = str(int(rec.get("total_tokens") or 0)) if usage_is_observed else "unknown"
+        input_tokens = str(int(rec.get("input_tokens") or 0)) if usage_is_observed else "unknown"
+        output_tokens = str(int(rec.get("output_tokens") or 0)) if usage_is_observed else "unknown"
+        cost = f"${float(rec.get('cost_usd') or 0.0):.4f}" if cost_is_observed else "unknown"
+        summary_lines.append(
+            f"{rec.get('task_id')} | runner={rec.get('runner', '?')} | topic={rec.get('topic', '?')} | "
+            f"records={int(rec.get('records') or 1)} | tokens={tokens} | "
+            f"in={input_tokens} out={output_tokens} | cost={cost} | "
+            f"usage_observed={str(usage_is_observed).lower()} "
+            f"cost_observed={str(cost_is_observed).lower()} "
+            f"telemetry_reason={rec.get('telemetry_reason') or '-'}"
+        )
+    bounded = dict(result)
+    bounded["stdout"] = "\n".join(summary_lines)
+    bounded["detail_omitted"] = _serialized_fingerprint(str(result.get("stdout") or ""))
+    bounded["detail_request"] = {
+        "tool": "aiworkhub_task_usage_report",
+        "full": True,
+    }
+    return bounded
 
 
 @_write_gated_tool()
