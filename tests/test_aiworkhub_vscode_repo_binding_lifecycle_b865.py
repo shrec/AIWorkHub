@@ -136,6 +136,12 @@ def test_dispatcher_ensure_started_converges_then_stop_unregisters(tmp_path, mon
     monkeypatch.setenv("AIWORKHUB_REPO", str(root))
     monkeypatch.setenv("AIWORKHUB_REPO_ROOT", str(root))
     monkeypatch.setenv("AIWORKHUB_WINDOW_ID", "window_b865_dispatcher")
+    # RM-2026-00082: no provider is selected by default; drive a Codex route.
+    monkeypatch.setattr(
+        core,
+        "read_selected_coordinator_target",
+        lambda _root=None: {"selected_provider": "codex", "targets": {"codex": {}}},
+    )
     try:
         started = core.dispatcher_ensure_started()
         assert started["ok"] is True

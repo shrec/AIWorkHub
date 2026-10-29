@@ -132,7 +132,7 @@ print("registered gate contracts passed")
         src = str(Path(__file__).resolve().parents[1] / "src")
         env = dict(
             os.environ, AIWORKHUB_ALLOW_WRITES="0", AIWORKHUB_REPO=str(root),
-            AIWORKHUB_MCP_STDIO_BACKEND=backend,
+            AIWORKHUB_MCP_STDIO_BACKEND=backend, AIWORKHUB_MCP_SURFACE="all",
             PYTHONPATH=os.pathsep.join([src, *inherited]),
             HOME=str(home), USERPROFILE=str(home), APPDATA=str(home), LOCALAPPDATA=str(home),
             TEMP=str(temporary), TMP=str(temporary),

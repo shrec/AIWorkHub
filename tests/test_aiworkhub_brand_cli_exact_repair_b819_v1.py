@@ -112,6 +112,8 @@ def test_aiworkhub_server_alias_is_same_fastmcp_server(monkeypatch):
 def test_dashboard_mcp_app_registration_survives_legacy_import(monkeypatch):
     _drop_imports()
     _install_server_import_stubs(monkeypatch)
+    # RM-2026-00082: an unset surface serves only the manager profile.
+    monkeypatch.setenv("AIWORKHUB_MCP_SURFACE", "all")
 
     legacy = importlib.import_module("aiworkhub.server")
 

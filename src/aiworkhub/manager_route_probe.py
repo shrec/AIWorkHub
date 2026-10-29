@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from . import platform_io
+
 # How many of THIS interpreter's own re-exec stubs may sit between the MCP
 # server and the Claude process that owns it. A Windows venv contributes exactly
 # one (Scripts\python.exe re-executes the base interpreter); the limit is two so
@@ -80,7 +82,7 @@ def _core() -> Any:
 
 
 def _windows() -> bool:
-    return os.name == "nt"
+    return platform_io.is_windows()
 
 
 def _bounded(value: object) -> str:

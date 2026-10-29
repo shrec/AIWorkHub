@@ -303,6 +303,15 @@ def test_core_dispatcher_forwards_extension_selected_sideband_transport(tmp_path
     assert captured["bridge_kwargs"] == {"transport": "sideband"}
 
 
+def _select_codex(monkeypatch):
+    """RM-2026-00082: no provider is selected by default; these tests drive a Codex route."""
+    monkeypatch.setattr(
+        core,
+        "read_selected_coordinator_target",
+        lambda _root=None: {"selected_provider": "codex", "targets": {"codex": {}}},
+    )
+
+
 def test_core_dispatcher_forwards_extension_selected_subprocess_transport(tmp_path, monkeypatch):
     root = tmp_path / "repo_subprocess"
     root.mkdir()
@@ -311,6 +320,7 @@ def test_core_dispatcher_forwards_extension_selected_subprocess_transport(tmp_pa
     monkeypatch.setenv("AIWORKHUB_REPO", str(root))
     monkeypatch.setenv("AIWORKHUB_CALLBACK_TRANSPORT", "subprocess")
     monkeypatch.setenv("AIWORKHUB_WINDOW_ID", "window_subprocess_test")
+    _select_codex(monkeypatch)
     captured = {}
 
     class FakeDispatcher:
@@ -337,6 +347,7 @@ def test_core_native_codex_manager_inbox_never_starts_hidden_app_server(tmp_path
     monkeypatch.setenv("AIWORKHUB_REPO", str(root))
     monkeypatch.setenv("AIWORKHUB_CALLBACK_TRANSPORT", "manager_inbox")
     monkeypatch.setenv("AIWORKHUB_WINDOW_ID", "window_native_codex_test")
+    _select_codex(monkeypatch)
     calls = {"ensure": 0}
 
     def forbidden_ensure(*args, **kwargs):
@@ -707,6 +718,7 @@ def test_core_dispatcher_ensure_started_then_stop_on_initialized_repo(tmp_path, 
     assert init["ok"], init
     monkeypatch.setenv("AIWORKHUB_REPO", str(root))
     monkeypatch.setenv("AIWORKHUB_WINDOW_ID", "window_core_test")
+    _select_codex(monkeypatch)
     # B859: no separate outbox DB / monkeypatch needed -- an initialized
     # repository's CallbackBridge resolves the SAME canonical
     # .aiworkhub/tasking/task_queue.sqlite task_store.py just created,

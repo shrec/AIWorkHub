@@ -455,7 +455,11 @@ def test_ci_lints_the_mcp_image_with_pinned_tdqs_and_never_fails_on_findings():
     steps = _steps(_job("docker-smoke"))
     smoke = _only(steps, "scripts/mcp_stdio_smoke.py -- docker run -i --rm aiworkhub-mcp:ci")
     install = _only(steps, "run: python3 -m pip install tdqs==0.1.0")
-    lint = _only(steps, 'run: tdqs lint --command "docker run -i --rm aiworkhub-mcp:ci"')
+    lint = _only(
+        steps,
+        'run: tdqs lint --command "docker run -i --rm -e AIWORKHUB_MCP_SURFACE=all'
+        ' aiworkhub-mcp:ci"',
+    )
     summary = _only(
         steps,
         "run: python3 scripts/tdqs_report_to_needfix.py tdqs-lint.json --markdown"
@@ -483,7 +487,7 @@ def test_ci_scores_on_tdqs_dev_only_with_the_secret_and_adds_it_to_the_report():
         "env.TDQS_API_KEY != ''",
         "continue-on-error: true",
         "TDQS_API_KEY: ${{ secrets.TDQS_API_KEY }}",
-        '--command "docker run -i --rm aiworkhub-mcp:ci"',
+        '--command "docker run -i --rm -e AIWORKHUB_MCP_SURFACE=all aiworkhub-mcp:ci"',
         "--hosted https://tdqs.dev",
         "--format json",
         "--fail-on never",

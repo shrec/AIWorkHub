@@ -637,6 +637,7 @@ def test_readonly_research_accept_review_records_manager_unverified_when_no_iden
     manager = _readonly_research_fixture
     monkeypatch.setattr(process_launcher.core, "_claude_manager_identity", lambda: None)
     monkeypatch.setattr(process_launcher.core, "_codex_manager_identity", lambda: None)
+    monkeypatch.setattr(process_launcher.core, "_active_manager_chat_record", lambda: None)
 
     result = process_launcher.ProcessManager.accept_review(manager, REQUEST_ID, TASK_ID)
 
@@ -651,11 +652,17 @@ def test_readonly_quality_review_accept_review_records_verified_by_codex_manager
     is codex, never as a default."""
     manager, _receipt = _readonly_quality_review_fixture
     monkeypatch.setattr(process_launcher.core, "_claude_manager_identity", lambda: None)
+    # A codex identity counts only on a live route: a UUID thread on a ready target.
+    thread_id = "019f5097-6dbe-7172-870a-945afc5f3bfa"
     monkeypatch.setattr(
         process_launcher.core,
         "_codex_manager_identity",
-        lambda: {"provider": "codex", "session_id": "s-2", "window_id": "w-2"},
+        lambda: {
+            "provider": "codex", "session_id": thread_id, "thread_id": thread_id,
+            "window_id": "w-2", "route_state": "ready",
+        },
     )
+    monkeypatch.setattr(process_launcher.core, "_active_manager_chat_record", lambda: None)
 
     result = process_launcher.ProcessManager.accept_review(manager, QR_REQUEST_ID, QR_TASK_ID)
 

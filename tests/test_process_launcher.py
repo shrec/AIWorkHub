@@ -2001,6 +2001,7 @@ def test_retry_finalization_reuses_retained_workspace_without_provider(
 
     # NF-2026-01394: a Claude manager's retry is never recorded as Codex.
     monkeypatch.setattr(process_launcher.core, "_manager_chat_seat_identity", lambda: None)
+    monkeypatch.setattr(process_launcher.core, "_active_manager_chat_record", lambda: None)
     monkeypatch.setattr(
         process_launcher.core,
         "_claude_manager_identity",

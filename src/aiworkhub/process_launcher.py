@@ -9481,7 +9481,8 @@ class ProcessManager:
         as recorded, unrestored (fail closed).
         """
         disposition = str(accepted.get("workspace_disposition") or "")
-        if tail.get("state") == "accepted" or disposition not in {
+        # Only the NF-2026-01800 tail: NF-2026-01706 appends nothing over release_pending.
+        if tail.get("state") != "reconcile_pending" or disposition not in {
             "retained_in_place", "quarantined", "removed",
         }:
             return accepted
