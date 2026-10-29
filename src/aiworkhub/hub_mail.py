@@ -607,6 +607,17 @@ def deliver(data: bytes, *, to_hub_id: str, message_id: str, home: Path | None =
     return "duplicate_conflict"
 
 
+def _mark_mail_enabled(home: Path | None) -> None:
+    """First use of Hub Mail persists the listener's enabled flag (a fresh install opens no port)."""
+
+    from . import hub_mail_net
+
+    try:
+        hub_mail_net.mark_enabled(home)
+    except (HubMailError, OSError):
+        pass
+
+
 def send(
     *,
     local: dict[str, str],
@@ -628,6 +639,7 @@ def send(
     """
 
     _retry_pending(home, now)
+    _mark_mail_enabled(home)
     try:
         return _send(
             local=local, to_hub_id=to_hub_id, kind=kind, subject=subject, body=body,

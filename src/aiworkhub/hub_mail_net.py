@@ -97,11 +97,17 @@ _PEM_CERT_RE = re.compile(
 _PERMANENT_STATUSES = frozenset({400, 404, 413})
 # Wall clock for every timestamp and window here; tests move it.
 _clock = time.time
+# The listener binds every interface by default; discovery probes the LAN
+# broadcast unless this is a list of explicit "host:port" targets (tests, off-LAN).
+DEFAULT_BIND_HOST = "0.0.0.0"
+DISCOVERY_TARGETS: list[Any] | None = None
 
 _PEER_LOCK = threading.Lock()
 _PAIR_LOCK = threading.Lock()
 _RETRY_LOCK = threading.Lock()
 _ENSURE_ATTEMPTS: dict[str, float] = {}
+_REDISCOVER_ATTEMPTS: dict[str, float] = {}
+_PAIR_FLOW_PATHS = frozenset({"/v1/pair/offer", "/v1/pair/reveal", "/v1/pair/confirm"})
 # Spawned listener processes are daemons by design; holding the handle stops
 # Popen.__del__ from warning about a child that is meant to outlive the call.
 _SPAWNED: list[subprocess.Popen[bytes]] = []
@@ -158,6 +164,10 @@ def stop_request_path(home: Path | None = None) -> Path:
 
 def listener_log_path(home: Path | None = None) -> Path:
     return hub_mail.mail_root(home) / ".listener.log"
+
+
+def listener_lock_path(home: Path | None = None) -> Path:
+    return hub_mail.mail_root(home) / ".listener.lock"
 
 
 # ---------------------------------------------------------------- helpers
@@ -778,6 +788,35 @@ def _fail(copy: Path, state: dict[str, Any], reason: str) -> None:
     _sidecar(copy, PENDING_SUFFIX).unlink(missing_ok=True)
 
 
+def _rediscover(peer: dict[str, Any], home: Path | None) -> dict[str, Any] | None:
+    """The same machine at a new address, verified by a signed call, else ``None``.
+
+    A discovery reply is only a hint: the stored address changes after the
+    peer proves it holds the pairing secret at the candidate address.
+    """
+
+    key = f"{hub_mail.mail_root(home)}|{peer['machine_id']}"
+    if time.monotonic() - _REDISCOVER_ATTEMPTS.get(key, -ENSURE_BACKOFF_SECONDS) < ENSURE_BACKOFF_SECONDS:
+        return None
+    _REDISCOVER_ATTEMPTS[key] = time.monotonic()
+    pairing = _pairing()
+    found = pairing.discover(
+        pairing.REDISCOVER_TIMEOUT_SECONDS, home=home, until_machine_id=peer["machine_id"],
+    )
+    entry = next((e for e in found.get("found", []) if e["machine_id"] == peer["machine_id"]), None)
+    if entry is None or entry["address"] == peer["address"]:
+        return None
+    candidate = {**peer, "address": entry["address"]}
+    try:
+        reply = call_peer(candidate, home=home, method="GET", path="/v1/hubs")
+    except hub_mail.HubMailError:
+        return None
+    if reply.get("machine_id") != peer["machine_id"]:
+        return None
+    _update_peer(peer["machine_id"], peer["secret"], home, address=entry["address"], last_seen=_iso(_clock()))
+    return candidate
+
+
 def forward(
     data: bytes, *, from_hub_id: str, to_hub_id: str, message_id: str,
     peer: dict[str, Any], home: Path | None,
@@ -785,7 +824,8 @@ def forward(
     """Deliver one already-spooled outbox copy to its peer now, or queue it.
 
     The pending sidecar is written BEFORE the first attempt so a crash between
-    spooling and posting still leaves the mail queued.
+    spooling and posting still leaves the mail queued.  An unreachable peer is
+    looked for once on the LAN; if it answers elsewhere the address is updated.
     """
 
     copy = hub_mail.box_dir(from_hub_id, "outbox", home) / f"{message_id}.json"
@@ -794,7 +834,13 @@ def forward(
              "last_attempt_at": _iso(_clock())}
     _write_sidecar(copy, PENDING_SUFFIX, state)
     try:
-        delivery = post_mail(peer, data, home=home)
+        try:
+            delivery = post_mail(peer, data, home=home)
+        except PeerUnreachable:
+            moved = _rediscover(peer, home)
+            if moved is None:
+                raise
+            delivery = post_mail(moved, data, home=home)
     except PeerRefused as exc:
         if exc.permanent:
             _fail(copy, state, str(exc))
@@ -878,11 +924,15 @@ def _retry_one(
     return "delivered"
 
 
+def _sweep_pair_requests(home: Path | None = None) -> dict[str, Any]:
+    return _pairing().sweep_requests(home)
+
+
 def maintain(home: Path | None = None) -> dict[str, Any]:
-    """One listener-loop pass: refresh peers' hubs, then retry queued mail."""
+    """One listener-loop pass: refresh peers' hubs, retry queued mail, drop expired pair requests."""
 
     report: dict[str, Any] = {"ok": True}
-    for name, step in (("refresh", refresh_peers), ("retry", retry_pending)):
+    for name, step in (("refresh", refresh_peers), ("retry", retry_pending), ("pairing", _sweep_pair_requests)):
         try:
             report[name] = step(home)
         except (hub_mail.HubMailError, OSError) as exc:
@@ -917,11 +967,15 @@ class _NonceStore:
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 16
+    # SO_REUSEADDR on Windows lets a second socket bind a port that is in use.
+    allow_reuse_address = not platform_io.is_windows()
 
     def __init__(self, address: tuple[str, int], *, home: Path | None, tls_sha256: str) -> None:
+        pairing = _pairing()
         self.home = home
         self.tls_sha256 = tls_sha256
         self.nonces = _NonceStore()
+        self.offer_limiter = pairing.RateLimiter(pairing.OFFER_RATE_LIMIT, pairing.OFFER_RATE_WINDOW_SECONDS)
         super().__init__(address, _Handler)
 
     def server_bind(self) -> None:
@@ -1003,10 +1057,12 @@ class _Handler(BaseHTTPRequestHandler):
         return body
 
     def _route(self, method: str) -> None:
-        if (method, self.path) not in {("POST", "/v1/pair"), ("POST", "/v1/mail"), ("GET", "/v1/hubs")}:
+        known = {("POST", "/v1/pair"), ("POST", "/v1/mail"), ("GET", "/v1/hubs")}
+        known.update(("POST", path) for path in _PAIR_FLOW_PATHS)
+        if (method, self.path) not in known:
             self._refuse(404, "not_found")
             return
-        limit = MAX_PAIR_BODY_BYTES if self.path == "/v1/pair" else hub_mail.MAX_ENVELOPE_BYTES
+        limit = MAX_PAIR_BODY_BYTES if self.path.startswith("/v1/pair") else hub_mail.MAX_ENVELOPE_BYTES
         body = self._read_body(method, limit)
         if body is None:
             return
@@ -1014,6 +1070,9 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/pair":
             status, payload = _accept_pair(_json_object(body), body, home=home, own_tls=self.server.tls_sha256)
             self._reply(status, payload)
+            return
+        if self.path in _PAIR_FLOW_PATHS:
+            self._pair_flow(_json_object(body))
             return
         authenticated = self._authenticate(method, body)
         if authenticated is None:
@@ -1027,6 +1086,27 @@ class _Handler(BaseHTTPRequestHandler):
             return
         status, payload = _accept_mail(peer, body, home=home)
         self._reply(status, payload, secret=secret, nonce=nonce)
+
+    def _pair_flow(self, request: dict[str, Any]) -> None:
+        """The code-free pairing steps; the request id (128 random bits) is the only handle."""
+
+        pairing = _pairing()
+        home = self.server.home
+        if self.path == "/v1/pair/offer":
+            status, payload = pairing.handle_offer(
+                request, source=pairing.source_host(str(self.client_address[0])), home=home,
+                limiter=self.server.offer_limiter, own_tls=self.server.tls_sha256,
+            )
+            self._reply(status, payload)
+        elif self.path == "/v1/pair/reveal":
+            status, payload = pairing.handle_reveal(request, home=home)
+            self._reply(status, payload)
+        else:
+            status, payload, secret = pairing.handle_confirm(request, home=home)
+            if secret is None:
+                self._reply(status, payload)
+            else:
+                self._reply(status, payload, secret=secret, nonce=str(request["request_id"]))
 
     def _authenticate(self, method: str, body: bytes) -> tuple[dict[str, Any], str] | None:
         peer_id = self.headers.get(HEADER_PEER) or ""
@@ -1154,24 +1234,54 @@ def _advertised_host(bind_host: str) -> str:
     return next((host for host in candidates if _routable(host, version)), "")
 
 
+def _acquire_listener_lock(home: Path | None) -> int | None:
+    """The per-home listener lock (held for the listener's life), or ``None`` when another holds it."""
+
+    path = listener_lock_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        platform_io.lock_fd(fd, blocking=False)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _release_listener_lock(fd: int) -> None:
+    try:
+        platform_io.unlock_fd(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 class Listener:
     """One home's listener: HTTP(S) server thread plus the maintenance loop.
 
     There is no default bind host: the owner names the interface explicitly.
+    A lock file under the home admits one active listener; a second contender
+    never binds (``start`` raises, or with ``standby_ok`` reports standby).
     """
 
     def __init__(
         self, *, bind_host: str, port: int, home: Path | None = None,
         tls_cert: str | None = None, tls_key: str | None = None,
         retry_interval: float = RETRY_INTERVAL_SECONDS, start_token: str | None = None,
+        discovery_port: int | None = None,
     ) -> None:
         self.bind_host, self.port = _validate_bind(bind_host, port)
         self.home = home
         self.tls_cert, self.tls_key = tls_cert, tls_key
         self.retry_interval = float(retry_interval)
         self.start_token = start_token
+        self.discovery_port = discovery_port
+        self.state = "new"
         self.record: dict[str, Any] = {}
         self._server: _Server | None = None
+        self._discovery: socket.socket | None = None
+        self._lock_fd: int | None = None
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
         self._closed = threading.Event()
@@ -1181,15 +1291,54 @@ class Listener:
     def address(self) -> str:
         return str(self.record.get("address") or "")
 
-    def start(self) -> dict[str, Any]:
+    def start(self, *, standby_ok: bool = False) -> dict[str, Any]:
+        lock_fd = _acquire_listener_lock(self.home)
+        if lock_fd is None:
+            if not standby_ok:
+                raise hub_mail.HubMailError("listener_already_running")
+            self.state = "standby"
+            self._closed.set()
+            return {"state": "standby", "bound": False, "port": 0, "active_port": listener_status(self.home)["port"]}
+        try:
+            record = self._start_locked()
+        except BaseException:
+            _release_listener_lock(lock_fd)
+            raise
+        self._lock_fd = lock_fd
+        return record
+
+    def _open_discovery(self) -> socket.socket | None:
+        """The UDP probe socket; a busy discovery port only disables discovery."""
+
+        if self.discovery_port is None:
+            return None
+        family = socket.AF_INET6 if ":" in self.bind_host else socket.AF_INET
+        udp = socket.socket(family, socket.SOCK_DGRAM)
+        try:
+            udp.bind((self.bind_host, self.discovery_port))
+            udp.settimeout(0.25)
+        except OSError:
+            udp.close()
+            return None
+        return udp
+
+    def _start_locked(self) -> dict[str, Any]:
         context = _server_context(self.tls_cert, self.tls_key)
         tls_sha = cert_sha256(self.tls_cert) if context is not None and self.tls_cert else ""
         server_class = _Server6 if ":" in self.bind_host else _Server
-        server = server_class((self.bind_host, self.port), home=self.home, tls_sha256=tls_sha)
+        fallback = False
+        try:
+            server = server_class((self.bind_host, self.port), home=self.home, tls_sha256=tls_sha)
+        except OSError:
+            if self.port == 0:
+                raise
+            server = server_class((self.bind_host, 0), home=self.home, tls_sha256=tls_sha)
+            fallback = True
         if context is not None:
             server.socket = context.wrap_socket(server.socket, server_side=True, do_handshake_on_connect=False)
         port = int(server.server_address[1])
         advertised = _advertised_host(self.bind_host)
+        discovery = self._open_discovery()
         self.record = {
             "schema_id": LISTENER_SCHEMA_ID,
             "pid": os.getpid(),
@@ -1197,6 +1346,9 @@ class Listener:
             "token": self.start_token or secrets.token_hex(16),
             "bind_host": self.bind_host,
             "port": port,
+            "requested_port": self.port,
+            "port_fallback": fallback,
+            "discovery_port": int(discovery.getsockname()[1]) if discovery is not None else 0,
             "address": format_address(advertised, port) if advertised else "",
             "tls": context is not None,
             "tls_cert_sha256": tls_sha,
@@ -1207,15 +1359,43 @@ class Listener:
             _claim_pidfile(self.record, self.home)
         except BaseException:
             server.server_close()
+            if discovery is not None:
+                discovery.close()
             raise
-        self._server = server
+        self._server, self._discovery = server, discovery
+        self.state = "active"
         serving = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.25},
                                    name="hub-mail-listener", daemon=True)
         looping = threading.Thread(target=self._loop, name="hub-mail-maintenance", daemon=True)
         self._threads = [serving, looping]
+        if discovery is not None:
+            self._threads.append(threading.Thread(target=self._discovery_loop, args=(discovery, port),
+                                                  name="hub-mail-discovery", daemon=True))
         for thread in self._threads:
             thread.start()
         return dict(self.record)
+
+    def _discovery_loop(self, udp: socket.socket, port: int) -> None:
+        pairing = _pairing()
+        limiter = pairing.RateLimiter(pairing.DISCOVER_RATE_LIMIT, pairing.DISCOVER_RATE_WINDOW_SECONDS)
+        while not self._stop.is_set():
+            try:
+                data, origin = udp.recvfrom(pairing.MAX_DATAGRAM_BYTES + 1)
+            except socket.timeout:
+                continue
+            except OSError:
+                # Windows reports an ICMP "port unreachable" for an earlier reply as a recv error.
+                if self._stop.wait(0.01) or udp.fileno() == -1:
+                    break
+                continue
+            reply = pairing.discovery_reply(
+                data, source=pairing.source_host(str(origin[0])), home=self.home, port=port, limiter=limiter,
+            )
+            if reply is not None:
+                try:
+                    udp.sendto(reply, origin)
+                except OSError:
+                    pass
 
     def _loop(self) -> None:
         next_run = time.monotonic() + self.retry_interval
@@ -1245,11 +1425,18 @@ class Listener:
             if server is not None:
                 server.shutdown()
                 server.server_close()
+            discovery, self._discovery = self._discovery, None
+            if discovery is not None:
+                discovery.close()
             current = threading.current_thread()
             for thread in self._threads:
                 if thread is not current:
                     thread.join(timeout=5.0)
             _release_pidfile(self.record, self.home)
+            if self._lock_fd is not None:
+                _release_listener_lock(self._lock_fd)
+                self._lock_fd = None
+            self.state = "closed"
             self._closed.set()
 
     def __enter__(self) -> Listener:
@@ -1310,6 +1497,9 @@ def listener_status(home: Path | None = None) -> dict[str, Any]:
         "pid": int(record.get("pid") or 0) if running else 0,
         "bind_host": str(record.get("bind_host") or config.get("bind_host") or ""),
         "port": int(record.get("port") or 0) if running else 0,
+        "requested_port": int(record.get("requested_port") or 0) if running else 0,
+        "port_fallback": bool(record.get("port_fallback")) if running else False,
+        "discovery_port": int(record.get("discovery_port") or 0) if running else 0,
         "address": str(record.get("address") or "") if running else "",
         "tls": bool(record.get("tls")) if running else False,
         "tls_cert_sha256": str(record.get("tls_cert_sha256") or "") if running else "",
@@ -1371,6 +1561,8 @@ def start_listener(
         if record.get("token") == start_token and _record_alive(record):
             return {**listener_status(home), "already_running": False}
         code = process.poll()
+        if code == 0 and listener_status(home)["running"]:
+            return {**listener_status(home), "already_running": True}
         if code is not None:
             return {"ok": False, "error": f"listener_start_failed:exit_{code}",
                     "log": str(listener_log_path(home))}
@@ -1425,8 +1617,18 @@ def stop_listener(home: Path | None = None, *, wait_seconds: float = LISTENER_ST
     return {**final, "stopped": True}
 
 
+def mark_enabled(home: Path | None = None) -> bool:
+    """Persist enabled=true at first use; an existing config (even enabled=false) stays the owner's word."""
+
+    if listener_config_path(home).exists():
+        return False
+    hub_mail.mail_root(home).mkdir(parents=True, exist_ok=True, mode=0o700)
+    _write_config(home, enabled=True)
+    return True
+
+
 def ensure_listener(home: Path | None = None) -> dict[str, Any] | None:
-    """Restart a listener the owner enabled that is no longer running."""
+    """Start the listener once Hub Mail is enabled; a fresh install opens no port."""
 
     config = _read_json(listener_config_path(home)) or {}
     if not config.get("enabled"):
@@ -1438,10 +1640,47 @@ def ensure_listener(home: Path | None = None) -> dict[str, Any] | None:
     if time.monotonic() - _ENSURE_ATTEMPTS.get(key, -ENSURE_BACKOFF_SECONDS) < ENSURE_BACKOFF_SECONDS:
         return status
     _ENSURE_ATTEMPTS[key] = time.monotonic()
+    port = config.get("port")
+    if isinstance(port, bool) or not isinstance(port, int):
+        port = _pairing().default_port()
     return start_listener(
-        bind_host=str(config.get("bind_host") or ""), port=int(config.get("port") or 0), home=home,
+        bind_host=str(config.get("bind_host") or "") or DEFAULT_BIND_HOST, port=port, home=home,
         tls_cert=str(config.get("tls_cert") or "") or None, tls_key=str(config.get("tls_key") or "") or None,
     )
+
+
+# ---------------------------------------------------------------- code-free pairing (hub_mail_pairing)
+
+
+def _pairing() -> Any:
+    from . import hub_mail_pairing
+
+    return hub_mail_pairing
+
+
+def discover(timeout: float | None = None, targets: Any = None, *, home: Path | None = None) -> dict[str, Any]:
+    """Probe the LAN (or explicit ``targets``) for hubs; replies are hints, never trusted."""
+
+    options = {} if timeout is None else {"timeout": timeout}
+    return _pairing().discover(targets=targets, home=home, **options)
+
+
+def pair(address: str, *, home: Path | None = None, tls: bool = False) -> dict[str, Any]:
+    """Start code-free pairing with the node at ``address``; compare the returned SAS."""
+
+    return _pairing().pair(address, home=home, tls=tls)
+
+
+def pair_requests(home: Path | None = None) -> dict[str, Any]:
+    return _pairing().pair_requests(home)
+
+
+def accept(request_id: str, *, home: Path | None = None) -> dict[str, Any]:
+    return _pairing().accept(request_id, home=home)
+
+
+def reject(request_id: str, *, home: Path | None = None) -> dict[str, Any]:
+    return _pairing().reject(request_id, home=home)
 
 
 def listener_action(
@@ -1469,13 +1708,15 @@ def serve(
     start_token: str | None = None,
 ) -> int:
     listener = Listener(bind_host=bind_host, port=port, home=home, tls_cert=tls_cert, tls_key=tls_key,
-                        start_token=start_token)
+                        start_token=start_token, discovery_port=_pairing().default_port())
     try:
-        record = listener.start()
+        record = listener.start(standby_ok=True)
     except (hub_mail.HubMailError, OSError) as exc:
         print(json.dumps({"ok": False, "error": f"{type(exc).__name__}:{exc}"}), flush=True)
         return 2
     print(json.dumps({"ok": True, "listener": {k: v for k, v in record.items() if k != "token"}}), flush=True)
+    if listener.state == "standby":
+        return 0
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, lambda *_: listener.request_stop())
     try:
