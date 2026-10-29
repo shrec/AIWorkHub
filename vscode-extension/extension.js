@@ -4934,9 +4934,21 @@ function createVscodeLmStagedEditCollector(request) {
       return false;
     }
     if (call.name !== "aiworkhub_worker_semantic_edit_apply") return false;
-    const prepared = preparedTargets.get(input.target_id);
-    if (!prepared || result.schema_id !== "aiworkhub.semantic_edit_apply_receipt.v1" ||
-        result.target_id !== input.target_id || result.path !== prepared.path ||
+    // NF-2026-01605: a one-call apply (file_path/start_line/end_line plus anchors, no
+    // target_id) binds its own target, so its receipt names the range it applied. It
+    // credits the output exactly like the prepare/apply pair; uncredited, forced staging
+    // re-demanded an already-edited output and the run died with zero changes.
+    const oneShotPath = input.target_id ? "" : vscodeLmNormalizedPath(input.file_path || input.path);
+    const oneShotStart = decimalProtocolLine(input.start_line);
+    const oneShotEnd = decimalProtocolLine(input.end_line);
+    const prepared = input.target_id ? preparedTargets.get(input.target_id)
+      : oneShotPath && contractByPath.get(oneShotPath)?.action === "edit" &&
+        Number.isSafeInteger(oneShotStart) && oneShotStart >= 1 &&
+        Number.isSafeInteger(oneShotEnd) && oneShotEnd >= oneShotStart
+        ? { path: oneShotPath, start_line: oneShotStart, end_line: oneShotEnd } : null;
+    const targetId = input.target_id || String(result.target_id || "");
+    if (!prepared || !targetId || result.schema_id !== "aiworkhub.semantic_edit_apply_receipt.v1" ||
+        result.target_id !== targetId || result.path !== prepared.path ||
         result.preimage_verified !== true ||
         !/^[0-9a-f]{64}$/.test(String(result.before_sha256 || "")) ||
         !/^[0-9a-f]{64}$/.test(String(result.after_sha256 || ""))) return false;
@@ -4944,7 +4956,7 @@ function createVscodeLmStagedEditCollector(request) {
       current_sha256: result.before_sha256, ranges: [] };
     const expected = entry.last_sha256 || contractByPath.get(prepared.path).current_sha256;
     if (expected !== result.before_sha256 && !result.idempotent_replay) return false;
-    if (!entry.ranges.some(range => range.mcp_receipt?.target_id === input.target_id)) {
+    if (!entry.ranges.some(range => range.mcp_receipt?.target_id === targetId)) {
       entry.ranges.push({ start_line: prepared.start_line, end_line: prepared.end_line,
         new: input.new, preserve_trailing_newline: true, mcp_receipt: result });
     }
@@ -4998,6 +5010,23 @@ function vscodeLmStagedOutputsReady(stagedEdits) {
 
 function vscodeLmShouldKeepStagedEdit(writableTask, stagedEdits) {
   return Boolean(writableTask) && !vscodeLmStagedOutputsReady(stagedEdits);
+}
+
+// NF-2026-01605: a forced stage refused because the worker's own applied edit shifted
+// that file's lines is not a phase violation. The refusal arms a fresh-read recovery
+// (bounded by the unchanged forced-stage read cap), so it re-grounds instead of spending
+// a forced-stage correction -- once per armed recovery; a repeat while that recovery is
+// still pending counts as before.
+const VSCODE_LM_COORDINATES_SHIFTED_REFUSAL =
+  "semantic_edit_stage_rejected:coordinates_shifted_requires_fresh_worker_pair:";
+function vscodeLmForcedStageRegrounds(toolName, result, stagedEdits, recoveryBefore) {
+  if (toolName !== VSCODE_LM_STAGE_EDIT_TOOL || !result || result.ok !== false ||
+      result.corrective !== true) return false;
+  const reason = String(result.reason || "");
+  if (!reason.startsWith(VSCODE_LM_COORDINATES_SHIFTED_REFUSAL)) return false;
+  const recovery = vscodeLmPendingRecoveryOutput(stagedEdits);
+  return Boolean(recovery) && recovery.path === reason.slice(VSCODE_LM_COORDINATES_SHIFTED_REFUSAL.length) &&
+    stagedEdits.recoveryToolNames().length > 0 && !(recoveryBefore && recoveryBefore.path === recovery.path);
 }
 
 // Exact (non-glob) paths this request declared writable. During forced staging
@@ -6507,7 +6536,7 @@ async function runVscodeLmTextProtocol(
         if (!ingested.ok) {
           protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: ingested.reason });
           if (ingested.corrective === true &&
-              String(ingested.reason).startsWith("semantic_edit_stage_rejected:coordinates_shifted_requires_fresh_worker_pair:") &&
+              String(ingested.reason).startsWith(VSCODE_LM_COORDINATES_SHIFTED_REFUSAL) &&
               stagedEdits.recoveryToolNames().length > 0) {
             messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
             messages.push(vscode.LanguageModelChatMessage.User(ingested.instruction));
@@ -6799,6 +6828,7 @@ async function runVscodeLmTextProtocol(
     let result;
     let toolFailureReported = false;
     const toolStartedAt = Date.now();
+    const recoveryBeforeCall = vscodeLmPendingRecoveryOutput(stagedEdits);
     if (!toolInputTooLarge && typeof onToolTurn === "function") {
       try { onToolTurn(envelope.name, { tool_state: "started", tool_input: envelope.input,
         call_id: String(turnProviderCallId || `emulated-${turn}`), activity_transport: "emulated" }); } catch (_err) { /* advisory activity */ }
@@ -6907,7 +6937,9 @@ async function runVscodeLmTextProtocol(
     if (result && result.ok === true && result.__finalEnvelope) {
       return JSON.stringify(result.__finalEnvelope);
     }
-    if (forceStagedEdit && result && result.ok === false &&
+    if (forceStagedEdit && vscodeLmForcedStageRegrounds(envelope.name, result, stagedEdits, recoveryBeforeCall)) {
+      protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "stage_regrounded" });
+    } else if (forceStagedEdit && result && result.ok === false &&
         result.schema_id !== VSCODE_LM_SOURCE_GRAPH_DUPLICATE_SCHEMA) {
       protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "stage_rejected" });
       vscodeLmNoteForcedStageFailure(
@@ -7292,7 +7324,7 @@ async function runVscodeLmAgent(
         if (!ingested.ok) {
           protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: ingested.reason });
           if (ingested.corrective === true &&
-              String(ingested.reason).startsWith("semantic_edit_stage_rejected:coordinates_shifted_requires_fresh_worker_pair:") &&
+              String(ingested.reason).startsWith(VSCODE_LM_COORDINATES_SHIFTED_REFUSAL) &&
               stagedEdits.recoveryToolNames().length > 0) {
             messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
             messages.push(vscode.LanguageModelChatMessage.User(ingested.instruction));
@@ -7473,6 +7505,7 @@ async function runVscodeLmAgent(
       let result;
       let toolFailureReported = false;
       const toolStartedAt = Date.now();
+      const recoveryBeforeCall = vscodeLmPendingRecoveryOutput(stagedEdits);
       if (typeof onToolTurn === "function") {
         try { onToolTurn(call.name, { tool_state: "started", tool_input: call.input,
           call_id: `${turnProviderCallId || `native-${turn}`}:${results.length}`, activity_transport: "native" }); } catch (_err) { /* advisory activity */ }
@@ -7549,7 +7582,9 @@ async function runVscodeLmAgent(
       if (result && result.ok === true && result.__finalEnvelope) {
         return JSON.stringify(result.__finalEnvelope);
       }
-      if (forceStagedEdit && result && result.ok === false) {
+      if (forceStagedEdit && vscodeLmForcedStageRegrounds(call.name, result, stagedEdits, recoveryBeforeCall)) {
+        protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "stage_regrounded" });
+      } else if (forceStagedEdit && result && result.ok === false) {
         protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "stage_rejected" });
         vscodeLmNoteForcedStageFailure(
           stagedEditFailure,
