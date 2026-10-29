@@ -954,11 +954,20 @@ def _supplemental_segments(count: int, *, truncated: bool) -> list[dict]:
 
 
 class _StubWorkspace:
-    def __init__(self, *, repo: Path, path: Path, home: Path, request_id: str) -> None:
+    def __init__(
+        self,
+        *,
+        repo: Path,
+        path: Path,
+        home: Path,
+        request_id: str,
+        base_oid: str = "0" * 40,
+    ) -> None:
         self.repo = repo
         self.path = path
         self.home = home
         self.request_id = request_id
+        self.base_oid = base_oid
 
     def as_metadata(self) -> dict:
         return {"request_id": self.request_id, "path": str(self.path)}

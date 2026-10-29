@@ -29,6 +29,7 @@ RouteResolver = Callable[[Mapping[str, Any]], dict[str, Any]]
 CombinedWorkspaceFactory = Callable[..., tuple[WorkerWorkspace, dict[str, Any]]]
 
 _VALIDATION_REPLAY_LOCK = Lock()
+ACCEPT_UNION_REUSE_SOURCE = "accept_union"
 _VALIDATION_REPLAYS_IN_FLIGHT: set[tuple[str, str, str]] = set()
 
 # --- NF-2026-01030: the manager-authorized host validation lane -------------
@@ -811,10 +812,13 @@ def _reusable_finalizer_rows(
             or validation_runner._is_failing_row(row)
         ):
             return None
+    source = reuse.get("reused_from")
     return [dict(row) for row in rows], {
         **recorded,
         "reused": True,
-        "reused_from": "finalization",
+        "reused_from": (
+            source if source == ACCEPT_UNION_REUSE_SOURCE else "finalization"
+        ),
     }
 
 
@@ -883,6 +887,61 @@ def run_full_snapshot_validations(
         }
     finally:
         cleanup_workspace(snapshot.repo, snapshot.path, snapshot.home)
+
+
+def run_union_validations_once(
+    workspace: WorkerWorkspace,
+    authority: Mapping[str, Any],
+    route_metadata: Mapping[str, Any],
+    candidate_changed_paths: Iterable[str],
+    *,
+    combined_tree: Mapping[str, Any],
+    snapshot_base_oid: str,
+    run_declared: Callable[[], list[dict[str, Any]]],
+    route_resolver: RouteResolver,
+    reuse: Mapping[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Declared validations for a union the caller already built (NF-2026-01317).
+
+    Returns ``(rows, record)``.  ``record`` is a ``reuse`` mapping the later
+    full-snapshot run accepts, so the same combined tree is never validated
+    twice in one accept; ``None`` when the identity could not be derived, so
+    the later run always falls toward running.  A matching finalizer record
+    runs nothing; any other case runs ``run_declared`` exactly once.
+    """
+
+    candidate = sorted({str(value) for value in candidate_changed_paths})
+    commands = declared_validation_commands(authority)
+    if not commands or not candidate:
+        return run_declared(), None
+    identity = combined_tree_identity(
+        workspace, authority, route_metadata, candidate, route_resolver=route_resolver
+    )
+    reused = _reusable_finalizer_rows(
+        reuse, identity=identity, workspace=workspace, command_count=len(commands)
+    )
+    if reused is not None:
+        return reused[0], dict(reuse or {})
+    rows = run_declared()
+    if identity is None:
+        return rows, None
+    snapshot = {
+        "schema_id": "aiworkhub.full_validation_snapshot.v1",
+        "request_id": workspace.request_id,
+        "repo": str(workspace.repo),
+        "source_base_oid": workspace.base_oid,
+        "snapshot_base_oid": snapshot_base_oid,
+        "combined_tree": dict(combined_tree),
+        "tree_identity_sha256": identity,
+        "validations_all_passed": not any(
+            validation_runner._is_failing_row(row) for row in rows
+        ),
+    }
+    return rows, {
+        "full_validation_snapshot": snapshot,
+        "validations": rows,
+        "reused_from": ACCEPT_UNION_REUSE_SOURCE,
+    }
 
 
 def enforce_behavioral_gate(

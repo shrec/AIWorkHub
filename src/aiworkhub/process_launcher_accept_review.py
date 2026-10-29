@@ -1137,6 +1137,31 @@ def _finalizer_validation_reuse(
     return {"full_validation_snapshot": snapshot, "validations": rows}
 
 
+def _union_validations_once(
+    workspace: _WorkerWorkspaceT,
+    card: Mapping[str, Any],
+    route_metadata: Mapping[str, Any],
+    changed: Any,
+    **kwargs: Any,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Declared validations for the union, run at most once per accept.
+
+    Resolves the route seam off the live ``process_launcher`` module so a
+    patched ``_validation_route_kwargs`` is honoured (NF-2026-01317).
+    """
+    from . import process_launcher as _pl
+    from . import process_launcher_validation as _validation
+
+    return _validation.run_union_validations_once(
+        workspace,
+        card,
+        route_metadata,
+        changed,
+        route_resolver=_pl._validation_route_kwargs,
+        **kwargs,
+    )
+
+
 def _blind_reviewer_lenses(
     reviewers: list[dict[str, Any]],
     finding_dispositions: list[Mapping[str, Any]] | None = None,
@@ -2215,6 +2240,7 @@ ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
     "_accept_manager_identity",
     "_restore_correction_originals",
     "_receipt_sha256",
+    "_union_validations_once",
     "_sealed_receipt_sha256",
     "_stale_inputs_touching_candidate",
     "_target_candidate_sha256",
@@ -3406,6 +3432,13 @@ def accept_review(
                 }
             combined_tree: dict[str, Any] | None = None
             combined_tree_checks: list[dict[str, Any]] = []
+            # One identity decision per accept: the finalizer receipt (never
+            # across a manager correction) and, once the union below has run
+            # the declared commands, that run -- so they execute at most once.
+            validation_reuse = _finalizer_validation_reuse(
+                terminal_review, correction_record=correction_record
+            )
+            union_validation_reuse: dict[str, Any] | None = None
             inherited_policy = (
                 policy_authority.get("candidate_policy_source") == "canonical_unchanged"
                 and (
@@ -3423,8 +3456,19 @@ def accept_review(
                     changed,
                 )
                 try:
-                    union_validations = _run_declared_validations(
-                        union_workspace, card, latest
+                    union_validations, union_validation_reuse = (
+                        _union_validations_once(
+                            workspace,
+                            card,
+                            latest,
+                            changed,
+                            combined_tree=combined_tree,
+                            snapshot_base_oid=union_workspace.base_oid,
+                            run_declared=lambda: _run_declared_validations(
+                                union_workspace, card, latest
+                            ),
+                            reuse=validation_reuse,
+                        )
                     )
                     union_quality = quality_evidence.run_completion_quality_gate(
                         union_workspace.path,
@@ -3772,9 +3816,9 @@ def accept_review(
             quality_gate["destructive_change_confirmed"] = bool(
                 confirm_destructive_change and destructive_blockers
             )
-            validation_reuse = _finalizer_validation_reuse(
-                terminal_review, correction_record=correction_record
-            )
+            # The union run above (when there was one) is the same-identity
+            # evidence for this tree; the finalizer receipt is the fallback.
+            validation_reuse = union_validation_reuse or validation_reuse
             validations, full_validation_snapshot = (
                 _run_full_snapshot_validations(
                     workspace, card, latest, changed,
