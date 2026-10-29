@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import json
 import re
-from collections import defaultdict
+import sqlite3
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from aiworkhub import claude_code_usage, core, launch_queue_persist, task_store
+from aiworkhub import (
+    claude_code_usage,
+    core,
+    launch_queue_persist,
+    task_store,
+    terminal_failure_classification,
+)
 
 
 USAGE_LINE_RE = re.compile(
@@ -187,9 +194,8 @@ def _process_event_index(
     events: dict[tuple[str, str, str], dict[str, Any]] = {}
     try:
         with path.open(encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle):
-                if line_number >= _PROCESS_EVENT_LIMIT:
-                    break
+            # Append-only ledger: keep the newest lines, since usage rows are read newest-first.
+            for line in deque(handle, maxlen=_PROCESS_EVENT_LIMIT):
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
@@ -312,6 +318,125 @@ def _task_topic_index(repo_root: Path | str) -> dict[str, str]:
     }
 
 
+_STORE_CAUSE_EVENT_LIMIT = 50_000
+
+
+def _process_event_miss_reason(
+    entry: dict[str, Any],
+    indexed_requests: set[tuple[str, str]] | None,
+) -> str:
+    """Why one usage row found no process event (diagnostic, never a join)."""
+
+    if not str(entry.get("task_id") or ""):
+        return "no_task_id"
+    if not _request_identity(entry):
+        return "no_request_id"
+    if indexed_requests is None:
+        return "process_ledger_empty"
+    pair = (str(entry.get("task_id") or ""), _request_identity(entry))
+    return "repository_mismatch" if pair in indexed_requests else "no_process_event"
+
+
+def _substatus_cause(substatus: str) -> str:
+    """The failure category of one terminal substatus, else the substatus itself.
+
+    Uses the same classifier ``learning_commit`` does; a substatus the
+    classifier cannot place keeps its own name rather than collapsing into
+    ``inconclusive``, so it stays distinguishable from rows with no evidence.
+    """
+
+    disposition = terminal_failure_classification.failure_disposition_from_substatus(
+        terminal_substatus=substatus
+    )
+    category = terminal_failure_classification.failure_category_projection(disposition)
+    if category == terminal_failure_classification.FAILURE_CATEGORY_INCONCLUSIVE:
+        return substatus
+    return category
+
+
+def _task_store_terminal_causes(
+    repo_root: Path | str, wanted: set[tuple[str, str]]
+) -> tuple[dict[tuple[str, str], str], str]:
+    """``{(task_id, request_id): cause}`` from ONE bulk read of durable events.
+
+    ``terminal_failure`` events carry the request's terminal substatus and
+    ``reject_review`` events the manager-pinned ``failure_category``. Only
+    scalar JSON fields cross the SQL boundary. A failed read returns no causes
+    and a named reason instead of raising.
+    """
+
+    try:
+        _readiness, db_path = task_store._require_ready(repo_root)
+        conn = task_store._connect(db_path, readonly=True)
+        try:
+            rows = conn.execute(
+                "SELECT task_id, event, "
+                "json_extract(payload_json, '$.request_id') AS request_id, "
+                "json_extract(payload_json, '$.substatus') AS substatus, "
+                "json_extract(payload_json, '$.failure_category') AS failure_category "
+                "FROM task_events WHERE event IN ('terminal_failure','reject_review') "
+                "AND json_valid(payload_json) ORDER BY event_id DESC LIMIT ?",
+                (_STORE_CAUSE_EVENT_LIMIT,),
+            ).fetchall()
+        finally:
+            conn.close()
+        terminal: dict[tuple[str, str], str] = {}
+        rejected: dict[tuple[str, str], str] = {}
+        for row in rows:
+            key = (str(row["task_id"] or ""), str(row["request_id"] or ""))
+            if key not in wanted:
+                continue
+            if row["event"] == "terminal_failure":
+                substatus = str(row["substatus"] or "").strip()
+                if substatus and key not in terminal:
+                    terminal[key] = _substatus_cause(substatus)
+            else:
+                category = str(row["failure_category"] or "").strip()
+                if category and key not in rejected:
+                    rejected[key] = f"reject:{category}"
+    except (task_store.TaskStoreError, sqlite3.Error, OSError, ValueError) as exc:
+        return {}, f"task_store_unreadable:{type(exc).__name__}"
+    return {**rejected, **terminal}, ""
+
+
+def _attribute_causes_from_task_store(
+    rows: list[dict[str, Any]], repo_root: Path | str
+) -> None:
+    """Name the cause of rows the process ledger could not, from the task store.
+
+    The store is read once for the whole build and answered by dict lookups.
+    Rows with no evidence stay empty-caused and carry the reason.
+    """
+
+    pending: list[dict[str, Any]] = []
+    for row in rows:
+        if row["terminal_cause"]:
+            row["terminal_cause_source"] = "process_event"
+        else:
+            pending.append(row)
+    wanted = {
+        (str(row["task_id"]), str(row["attempt_id"]))
+        for row in pending
+        if row["task_id"] and row["attempt_id"]
+    }
+    causes: dict[tuple[str, str], str] = {}
+    read_error = ""
+    if wanted:
+        causes, read_error = _task_store_terminal_causes(repo_root, wanted)
+    for row in pending:
+        cause = causes.get((str(row["task_id"]), str(row["attempt_id"])), "")
+        if cause:
+            row["terminal_cause"] = cause
+            row["terminal_cause_source"] = "task_store"
+            continue
+        row["terminal_cause_source"] = "unknown"
+        row["terminal_cause_unresolved"] = (
+            "no_request_id"
+            if not (row["task_id"] and row["attempt_id"])
+            else read_error or "no_store_evidence"
+        )
+
+
 def _records_by_topic_source(rows: list[dict[str, Any]]) -> dict[str, int]:
     """Record counts keyed by where each row's topic came from.
 
@@ -347,6 +472,7 @@ def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
     # lacks an explicit repository id.
     resolved_root = str(Path(repo_root).resolve())
     process_events = _process_event_index(repo_root, resolved_root=resolved_root)
+    indexed_requests = {(key[1], key[2]) for key in process_events} if process_events else None
     topic_index: dict[str, str] | None = None
     for raw_entry in task_store.list_usage_events(repo_root, limit=10_000):
         entry = _fill_process_usage(
@@ -438,12 +564,20 @@ def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
                 if event is not None
                 else ""
             ),
+            "terminal_cause_source": "",
+            "terminal_cause_unresolved": "",
+            "process_event_miss_reason": (
+                ""
+                if event is not None
+                else _process_event_miss_reason(entry, indexed_requests)
+            ),
             # created_at stays the ledger write time for audit; the day
             # bucket and attempt ordering follow the attempt's own instant.
             "created_at": created_at,
             "attempt_recorded_at": attempt_recorded_at,
             "day": attempt_at[:10] if len(attempt_at) >= 10 else "",
         })
+    _attribute_causes_from_task_store(rows, repo_root)
     return rows
 
 
@@ -818,6 +952,9 @@ def _retry_economics(
     retry_rows: list[dict[str, Any]] = []
     retried_tasks: set[str] = set()
     by_cause: dict[str, dict[str, Any]] = {}
+    by_source: dict[str, int] = defaultdict(int)
+    unknown_reasons: dict[str, int] = defaultdict(int)
+    miss_reasons: dict[str, int] = defaultdict(int)
     for task_id, rows in by_task.items():
         # Order by when the attempt ran, not when its row was written: a
         # backfilled first attempt otherwise sorts after the live retries.
@@ -830,6 +967,18 @@ def _retry_economics(
                 # built before the field existed stay cause-unknown rather
                 # than raising: legacy callers must keep working.
                 cause = str(previous.get("terminal_cause") or "") or "unknown"
+                source = (
+                    str(previous.get("terminal_cause_source") or "")
+                    or ("process_event" if cause != "unknown" else "unknown")
+                )
+                by_source[source] += 1
+                if cause == "unknown":
+                    unknown_reasons[
+                        str(previous.get("terminal_cause_unresolved") or "") or "unspecified"
+                    ] += 1
+                miss = str(previous.get("process_event_miss_reason") or "")
+                if miss:
+                    miss_reasons[miss] += 1
                 bucket = by_cause.setdefault(
                     cause,
                     {"retry_records": 0, "retry_tokens": 0, "retry_cost_usd": 0.0},
@@ -874,6 +1023,18 @@ def _retry_economics(
             }
             for cause, bucket in sorted(by_cause.items())
         },
+        "by_cause_source": dict(sorted(by_source.items())),
+        "unknown_retry_records": by_cause.get("unknown", {}).get("retry_records", 0),
+        "unknown_share_percent": (
+            round(
+                100.0 * by_cause.get("unknown", {}).get("retry_records", 0)
+                / len(retry_rows),
+                1,
+            )
+            if retry_rows else None
+        ),
+        "unknown_reasons": dict(sorted(unknown_reasons.items())),
+        "process_event_miss_reasons": dict(sorted(miss_reasons.items())),
         "accepted_retried_tasks": accepted_retried,
         "accepted_rate_among_retried_tasks_percent": (
             round(100.0 * accepted_retried / len(retried_tasks), 1)
