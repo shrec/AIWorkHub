@@ -6,6 +6,29 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.77] - 2026-10-29
+
+### Added
+
+- WorkHub Mail pairs machines without typed codes: discovery finds machines on the LAN, `pair` sends a request over a commit/reveal handshake and both owners compare a 6-digit SAS, and the owner accepts or rejects it in VS Code (notification or the Hub Mail card) — a model never completes a pairing. The listener starts automatically; requests expire after 600 s, are capped at 8 and rate limited per source. The MCP surface is collapsed to send, inbox and peers (NF-2026-01818, NF-2026-01827).
+- Accept records a system disposition for every reviewer finding the manager left undecided, so no finding stays open after an accept (NF-2026-01828).
+- `aiworkhub_task_cost_ledger` retry economics break retry spend down by the previous attempt's terminal cause (NF-2026-01826).
+
+### Changed
+
+- Source Graph `bodygrep` keeps a bounded, generation-keyed file cache that never holds a file over 1 MiB, so a scan still keeps one raw buffer at a time (NF-2026-01820), and a ranged `file` read returns exactly the requested lines (NF-2026-01825).
+- The plan snapshot summary folds `terminal_artifacts_excluded` to a digest (NF-2026-01821), and the reconciler's NeedFix closure pass reads only appended closure events (NF-2026-01819).
+- SDLC outcome metrics serve sealed process-ledger segments from a persisted scan cache and resume the live segment from its last complete line; results match a cold scan (NF-2026-01829).
+- `aiworkhub_task_usage_report` defaults to a bounded per-runner summary with the top 20 records (`full=True` returns the per-record report), and the manager workforce catalog omits workers that are neither enabled nor launch-eligible unless `include_disabled=True` (NF-2026-01830).
+
+### Fixed
+
+- Accept runs the declared validations at most once (NF-2026-01317).
+- Stale candidate overlays are swept, so review diffs no longer leak disk (NF-2026-01824).
+- Reviewer selection skips routes whose failure circuit is open (NF-2026-01588).
+- The tool guard lets Read through for files git ignores (NF-2026-01737).
+- Both `hub_mail_peers` tools are annotated as writes, not read-only.
+
 ## [0.12.76] - 2026-10-29
 
 ### Fixed

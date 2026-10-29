@@ -374,10 +374,11 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.76
+## What's new in 0.12.77
 
-- 0.12.76 is a hotfix for Claude Code chats on 0.12.75: a chat whose MCP server runs under the stable launcher's supervisor keeps its Claude manager seat again, so card creation and semantic edit no longer fail with `manager_identity_required` while bootstrap reports a verified manager.
-- Carried from 0.12.75: Codex is one manager provider among several (one provider registry, no silent fallback to Codex, accept records the verified manager); reviewers work on C++ candidates and on changes that delete files, Source Graph indexes MSBuild project files, and `forbidden` bounds writes only.
+- WorkHub Mail pairs machines without typed codes: discover a machine on the LAN, send a pair request, compare the 6-digit SAS and accept or reject it in VS Code; a model never completes a pairing. The tool surface is now send, inbox and peers.
+- Faster, cheaper manager turns: Source Graph caches bodygrep and returns exact line windows, accept runs validations once, the usage report and workforce catalog default to bounded summaries, and the metrics ledger and reconciler read only what changed.
+- Review closes cleanly: undecided reviewer findings get a system disposition at accept, reviewers skip routes with an open failure circuit, and retry spend is broken down by the previous attempt's terminal cause.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Continuous Audit as a Service (CAAS)

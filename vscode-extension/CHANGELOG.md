@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 0.12.77 — 2026-10-29
+
+### Added
+
+- Bundled runtime 0.12.77: WorkHub Mail pairs machines without typed codes — discover a machine, send a pair request, compare the 6-digit SAS and accept or reject it from the notification or the Hub Mail card. The MCP surface is send, inbox and peers (NF-2026-01818, NF-2026-01827).
+- Accept records a system disposition for every undecided reviewer finding (NF-2026-01828); retry economics break retry spend down by the previous attempt's terminal cause (NF-2026-01826).
+
+### Changed
+
+- Faster, smaller manager replies: bodygrep file cache, exact ranged file reads, a digest-folded plan snapshot, incremental reconciler and metrics-ledger scans, and bounded default usage-report and workforce-catalog replies (NF-2026-01819, NF-2026-01820, NF-2026-01821, NF-2026-01825, NF-2026-01829, NF-2026-01830).
+
+### Fixed
+
+- Accept runs validations once (NF-2026-01317), stale review overlays are swept (NF-2026-01824), reviewers skip routes with an open failure circuit (NF-2026-01588), the tool guard lets Read through for git-ignored files (NF-2026-01737), and the `hub_mail_peers` tools are annotated as writes.
+
 ## 0.12.76 — 2026-10-29
 
 ### Fixed

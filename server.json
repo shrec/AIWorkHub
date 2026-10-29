@@ -6,12 +6,12 @@
     "url": "https://github.com/shrec/AIWorkHub",
     "source": "github"
   },
-  "version": "0.12.76",
+  "version": "0.12.77",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "aiworkhub",
-      "version": "0.12.76",
+      "version": "0.12.77",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

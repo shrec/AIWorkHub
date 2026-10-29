@@ -2,7 +2,7 @@
   "name": "aiworkhub",
   "displayName": "AIWorkHub",
   "description": "AI manager that runs Claude Code, Codex and Copilot as workers: dependency-aware task cards routed by cost, a Source Graph for code intelligence, durable context and test-gated review.",
-  "version": "0.12.76",
+  "version": "0.12.77",
   "publisher": "IvaneChkheidze",
   "license": "MIT",
   "icon": "media/aiworkhub-marketplace-icon.png",
