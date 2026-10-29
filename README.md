@@ -372,10 +372,10 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.75
+## What's new in 0.12.76
 
-- Codex is one manager provider among several: one provider registry that includes a plain manager chat, no silent fallback to Codex, accept records the verified manager, and a Claude Code chat is never granted a Codex identity. `doctor_diagnose` fails on a manager route mismatch, and an unset `AIWORKHUB_MCP_SURFACE` serves the manager profile.
-- Reviewers work on C++ candidates and on changes that delete files, Source Graph indexes MSBuild project files, and a language-neutral `custom_validation` template ships with a C++ example. `forbidden` now bounds writes only, and a pytest run that fails on an xdist collection divergence is replayed once without xdist.
+- 0.12.76 is a hotfix for Claude Code chats on 0.12.75: a chat whose MCP server runs under the stable launcher's supervisor keeps its Claude manager seat again, so card creation and semantic edit no longer fail with `manager_identity_required` while bootstrap reports a verified manager.
+- Carried from 0.12.75: Codex is one manager provider among several (one provider registry, no silent fallback to Codex, accept records the verified manager); reviewers work on C++ candidates and on changes that delete files, Source Graph indexes MSBuild project files, and `forbidden` bounds writes only.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Continuous Audit as a Service (CAAS)

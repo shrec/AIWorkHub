@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.12.76 — 2026-10-29
+
+### Fixed
+
+- Bundled runtime 0.12.76: a Claude Code chat whose MCP server runs under the stable launcher's supervisor keeps its Claude manager seat; card creation and semantic edit no longer refuse with `manager_identity_required` / `manager_route_unverified` (NF-2026-01816).
+
 ## 0.12.75 — 2026-10-29
 
 ### Fixed

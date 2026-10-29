@@ -6,6 +6,12 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.76] - 2026-10-29
+
+### Fixed
+
+- A Claude Code chat whose MCP server runs under the stable launcher's supervisor keeps its Claude manager seat: the supervised server gets the supervisor's two extra Windows hops and steps over its parent on POSIX, so `task_create` and semantic edit no longer refuse with `manager_identity_required` / `manager_route_unverified` while bootstrap reports a verified manager. Only the server the supervisor marked gets the allowance, and the probe reports a `supervised` flag (NF-2026-01816).
+
 ## [0.12.75] - 2026-10-29
 
 ### Added
