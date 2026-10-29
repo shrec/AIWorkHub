@@ -38,23 +38,23 @@ def _write_lines(tmp_path, count):
     return tmp_path, "pkg/mod.py", lines
 
 
-def test_ranged_file_preview_returns_margin_window(tmp_path):
+def test_ranged_file_preview_returns_exact_window(tmp_path):
     root, relative, lines = _write_lines(tmp_path, 400)
     preview = sg._ranged_file_preview(root, relative, (120, 180))
-    assert preview["source_preview_line_start"] == 100
-    assert preview["source_preview_line_end"] == 200
+    assert preview["source_preview_line_start"] == 120
+    assert preview["source_preview_line_end"] == 180
     assert preview["source_preview_total_lines"] == 400
     assert preview["source_preview_truncated"] is False
-    assert preview["source_preview"].splitlines() == lines[99:200]
+    assert preview["source_preview"].splitlines() == lines[119:180]
 
 
 def test_ranged_preview_clamps_past_eof(tmp_path):
     root, relative, lines = _write_lines(tmp_path, 400)
     preview = sg._ranged_file_preview(root, relative, (390, 500))
-    assert preview["source_preview_line_start"] == 370
+    assert preview["source_preview_line_start"] == 390
     assert preview["source_preview_line_end"] == 400
     assert preview["source_preview_total_lines"] == 400
-    assert preview["source_preview"].splitlines() == lines[369:400]
+    assert preview["source_preview"].splitlines() == lines[389:400]
 
 
 def test_ranged_preview_clamps_fully_past_eof(tmp_path):
@@ -120,12 +120,12 @@ def test_merge_rework_overlay_file_range_uses_ranged_slice():
     )
     assert touched is True
     context = merged["contexts"][0]
-    assert context["source_preview_line_start"] == 100
-    assert context["source_preview_line_end"] == 200
+    assert context["source_preview_line_start"] == 120
+    assert context["source_preview_line_end"] == 180
     assert context["source_preview_total_lines"] == 400
     served = context["source_preview"].splitlines()
-    assert served[0] == "overlay 0100"
-    assert served[-1] == "overlay 0200"
+    assert served[0] == "overlay 0120"
+    assert served[-1] == "overlay 0180"
 
 
 def test_apply_rework_overlay_query_forwards_the_file_range():
@@ -136,8 +136,8 @@ def test_apply_rework_overlay_query_forwards_the_file_range():
     )
     assert touched is True
     context = merged["contexts"][0]
-    assert context["source_preview_line_start"] == 100
-    assert context["source_preview_line_end"] == 200
+    assert context["source_preview_line_start"] == 120
+    assert context["source_preview_line_end"] == 180
     assert context["source_preview_total_lines"] == 400
 
 
@@ -168,30 +168,25 @@ def _hundred_byte_lines(count):
     return lines, "\n".join(lines) + "\n"
 
 
-def test_ranged_preview_serves_requested_lines_before_margin():
+def test_ranged_preview_serves_exactly_the_requested_lines_after_a_huge_line():
     text = "x" * 60000 + "\n" + "".join(f"l{i}\n" for i in range(2, 101))
     preview = sg.ranged_text_preview(text, (21, 25))
-    served = preview["source_preview"].split("\n")
-    for number in range(21, 26):
-        assert f"l{number}" in served
-    start = preview["source_preview_line_start"]
-    end = preview["source_preview_line_end"]
-    assert start <= 21 <= 25 <= end
-    assert (start, end) == (2, 45)
-    assert preview["source_preview_truncated"] is True
+    assert preview["source_preview"].split("\n") == [f"l{n}" for n in range(21, 26)] + [""]
+    assert (preview["source_preview_line_start"], preview["source_preview_line_end"]) == (21, 25)
+    assert preview["source_preview_truncated"] is False
     assert preview["source_preview_bytes"] == len(
         preview["source_preview"].encode("utf-8")
     )
 
 
-def test_ranged_preview_spends_leftover_cap_on_leading_margin_first():
+def test_ranged_preview_serves_a_large_window_exactly_within_the_cap():
     lines, text = _hundred_byte_lines(2000)
     preview = sg.ranged_text_preview(text, (1000, 1479))
-    assert preview["source_preview_line_start"] == 989
+    assert preview["source_preview_line_start"] == 1000
     assert preview["source_preview_line_end"] == 1479
-    assert preview["source_preview_bytes"] == 49100
-    assert preview["source_preview_truncated"] is True
-    assert preview["source_preview"].splitlines() == lines[988:1479]
+    assert preview["source_preview_bytes"] == 48000
+    assert preview["source_preview_truncated"] is False
+    assert preview["source_preview"].splitlines() == lines[999:1479]
 
 
 def test_ranged_preview_serves_an_overflowing_request_without_margin():
@@ -270,11 +265,12 @@ def test_file_query_and_worker_serve_the_same_ranged_window(tmp_path):
     root, relative = _indexed_repo(tmp_path, lines)
 
     context = sg.file_query(root, relative, 64, line_range=(120, 180))["contexts"][0]
-    assert context["source_preview_line_start"] == 100
-    assert context["source_preview_line_end"] == 200
+    assert context["source_preview_line_start"] == 120
+    assert context["source_preview_line_end"] == 180
     assert context["source_preview_total_lines"] == 400
     assert context["source_preview_truncated"] is False
-    assert context["source_preview"].splitlines() == lines[99:200]
+    assert context["source_preview"].splitlines() == lines[119:180]
+    assert "entities" not in context and "edges" not in context
     assert "source_preview_line_start" not in sg.file_query(root, relative, 64)["contexts"][0]
 
     ctx = wtm.WorkerToolContext(

@@ -252,7 +252,7 @@ HUNK_REVIEW_SURFACE_INSTRUCTION = (
     "(diff_complete false), and only those line ranges."
     " To read an omitted hunk, call source_graph_query with mode='file', "
     "target='<path>' and query='<start>-<end>' from the packet's hunk header; "
-    "the result includes a 20-line margin.\n"
+    "the result returns exactly those lines.\n"
 )
 # A rework round whose predecessor's sealed delta authenticated carries the
 # predecessor->candidate diff in candidate.delta, so what the predecessor round

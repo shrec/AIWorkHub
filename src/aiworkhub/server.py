@@ -1535,7 +1535,7 @@ def aiworkhub_manager_source_graph_query(
 
     Args:
         mode: Lookup to run: focus, slice, context, file, function, class, body, bodygrep, impact, trace, deps, bundle, diff (a registered worker worktree's changed files, symbols and paged hunks), or an analytic report (hotspots, churn, testmap, calls, ...).
-        query: What to look up, non-blank, at most 512 bytes; its meaning depends on mode. In file mode with an exact file target, a 1-based start-end line range returns those lines plus a 20-line margin.
+        query: What to look up, non-blank, at most 512 bytes; its meaning depends on mode. In file mode with an exact file target, a 1-based start-end line range returns exactly those lines.
         budget: Size budget for the reply; default 64, clamped to 8-160.
         target: Optional scope, at most 256 bytes: an exact symbol (bare name or file.symbol) for slice, body and function modes, the worker request id for diff, otherwise a path prefix; omit for unscoped.
         cursor: Page token for analytic modes, bodygrep and diff only (at most 64 bytes, 4096 for bodygrep, 256 for diff): pass the previous next_cursor back unchanged; other modes refuse it.

@@ -3350,7 +3350,11 @@ def _enforce_selector_allowlist(
     return None, scoped
 
 
-def _declared_input_file_payload(ctx: WorkerToolContext, relative_path: str) -> dict[str, Any] | None:
+def _declared_input_file_payload(
+    ctx: WorkerToolContext,
+    relative_path: str,
+    line_range: tuple[int, int] | None = None,
+) -> dict[str, Any] | None:
     """Return a bounded exact-file receipt from the isolated worker tree.
 
     Source Graph deliberately indexes structure, so a declared JSON/JSONL/XML
@@ -3360,6 +3364,8 @@ def _declared_input_file_payload(ctx: WorkerToolContext, relative_path: str) -> 
     must equal the ``file`` query, stay beneath the immutable worker root, and
     contain no symlink component.  It never performs discovery or globbing.
     """
+
+    from . import source_graph as _source_graph_mod
 
     if not relative_path or "\x00" in relative_path:
         return None
@@ -3385,6 +3391,7 @@ def _declared_input_file_payload(ctx: WorkerToolContext, relative_path: str) -> 
     try:
         size = resolved.stat().st_size
         preview = bytearray()
+        window_source = bytearray()
         digest = hashlib.sha256()
         hashed_bytes = 0
         with resolved.open("rb") as handle:
@@ -3398,6 +3405,8 @@ def _declared_input_file_payload(ctx: WorkerToolContext, relative_path: str) -> 
                 if hashed_bytes + len(chunk) <= MAX_DECLARED_INPUT_HASH_BYTES:
                     digest.update(chunk)
                     hashed_bytes += len(chunk)
+                    if line_range is not None:
+                        window_source.extend(chunk)
                 else:
                     hashed_bytes = MAX_DECLARED_INPUT_HASH_BYTES + 1
                     break
@@ -3405,7 +3414,18 @@ def _declared_input_file_payload(ctx: WorkerToolContext, relative_path: str) -> 
         return None
 
     hash_complete = hashed_bytes <= MAX_DECLARED_INPUT_HASH_BYTES and hashed_bytes == size
-    preview_text = bytes(preview).decode("utf-8", errors="replace")
+    window_fields: dict[str, Any] = {}
+    if line_range is not None:
+        window_fields = _source_graph_mod.ranged_text_preview(
+            bytes(window_source).decode("utf-8", errors="replace"), line_range,
+        )
+        preview_text = str(window_fields.pop("source_preview"))
+        preview_size = int(window_fields.pop("source_preview_bytes"))
+        preview_truncated = bool(window_fields.pop("source_preview_truncated"))
+    else:
+        preview_text = bytes(preview).decode("utf-8", errors="replace")
+        preview_size = len(preview)
+        preview_truncated = size > len(preview)
     return {
         "mode": "file",
         "query": relative_path,
@@ -3417,14 +3437,15 @@ def _declared_input_file_payload(ctx: WorkerToolContext, relative_path: str) -> 
             "sha256": digest.hexdigest() if hash_complete else None,
             "hash_complete": hash_complete,
             "preview": preview_text,
-            "preview_bytes": len(preview),
-            "preview_truncated": size > len(preview),
+            "preview_bytes": preview_size,
+            "preview_truncated": preview_truncated,
+            **window_fields,
             "authority": "worker_workspace_declared_input",
             "fallback_reason": "declared_input_unindexed",
         }],
         "candidate_files": [relative_path],
         "fallback_reason": "declared_input_unindexed",
-        "truncated": size > len(preview),
+        "truncated": preview_truncated,
     }
 
 
@@ -5561,7 +5582,7 @@ def source_graph_query(
     are kept, everything else is dropped. In ``file`` mode an indexed exact
     target is also the requested file authority; directory targets fall back to
     the query path. A ``file`` query of ``<start>-<end>`` (1-based, inclusive)
-    with an exact file target returns those lines plus a 20-line margin instead
+    with an exact file target returns exactly those lines instead
     of the file head. Omitting ``target`` returns the unscoped query result.
 
     For analytic modes (``sganalytics.ANALYTIC_MODES``), ``target`` and
@@ -5917,7 +5938,9 @@ def source_graph_query(
         and scope is not None
         and _json_hit_count(payload) == 0
     ):
-        exact_payload = _declared_input_file_payload(ctx, scope)
+        exact_payload = _declared_input_file_payload(
+            ctx, scope, _source_graph_mod.parse_file_line_range(bounded_query),
+        )
         if exact_payload is not None:
             payload = exact_payload
     # The engine result before any wrapper scope filter: the zero-hit cascade

@@ -211,9 +211,9 @@ def test_a_target_equal_to_the_query_is_never_refused(repo):
 
 def test_a_line_range_with_a_target_is_unchanged(repo):
     context = _served_context(_file_call(repo, "120-180", target=BIG))
-    assert context["source_preview_line_start"] == 100
-    assert context["source_preview_line_end"] == 200
-    assert context["source_preview"].splitlines() == BIG_LINES[99:200]
+    assert context["source_preview_line_start"] == 120
+    assert context["source_preview_line_end"] == 180
+    assert context["source_preview"].splitlines() == BIG_LINES[119:180]
     assert NEXT_WINDOW_KEY not in context
 
 
@@ -387,7 +387,8 @@ def test_overlay_untruncated_and_ranged_previews_are_unchanged():
     assert NEXT_WINDOW_KEY not in short
 
     ranged = _overlay_context(OVERLAY_TEXT, file_line_range=(120, 180))
-    assert ranged["source_preview_line_start"] == 100
+    assert ranged["source_preview_line_start"] == 120
+    assert ranged["source_preview_line_end"] == 180
     assert NEXT_WINDOW_KEY not in ranged
 
 

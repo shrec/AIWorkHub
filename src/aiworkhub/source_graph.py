@@ -5778,7 +5778,7 @@ def body_query(repo_root: Path, name: str, budget: int = 64) -> dict[str, Any]:
 
 
 _FILE_LINE_RANGE_PATTERN = re.compile(r"^(?:L(\d+)-L(\d+)|(\d+)-(\d+)|(\d+):(\d+))$")
-FILE_LINE_RANGE_MARGIN = 20
+FILE_LINE_RANGE_MARGIN = 0
 FILE_LINE_RANGE_PREVIEW_BYTES = 48 * 1024
 
 
@@ -5865,7 +5865,7 @@ def _bounded_file_preview(
 
 
 def ranged_text_preview(text: str, line_range: tuple[int, int]) -> dict[str, Any]:
-    """Slice ``text`` to a 1-based line window plus margin within the byte cap."""
+    """Slice ``text`` to a 1-based line window (plus FILE_LINE_RANGE_MARGIN) within the byte cap."""
 
     # "\n" alone ends a line (git and AST numbering); "\r" stays so CRLF round-trips.
     lines = text.split("\n")
@@ -5931,7 +5931,7 @@ def ranged_text_preview(text: str, line_range: tuple[int, int]) -> dict[str, Any
 def _ranged_file_preview(
     repo_root: Path, file_path: str, line_range: tuple[int, int],
 ) -> dict[str, Any]:
-    """Read one exact line window (plus margin) from a repository file."""
+    """Read one exact line window from a repository file."""
 
     try:
         root = repo_root.resolve()
@@ -5972,8 +5972,12 @@ def file_query(
     *,
     line_range: tuple[int, int] | None = None,
     include_trivial_edges: bool = False,
+    include_structure: bool = False,
 ) -> dict[str, Any]:
-    """Return exact metadata and a bounded preview for one indexed path."""
+    """Return exact metadata and a bounded preview for one indexed path.
+
+    A ranged read carries no module entities/edges unless ``include_structure``.
+    """
 
     budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
     conn = connect(resolve_db_path(repo_root), read_only=True)
@@ -5983,17 +5987,21 @@ def file_query(
         conn.close()
     ranged_fields: dict[str, Any] = {}
     if payload.get("found"):
-        entity_limit = max(1, min(16, budget // 2))
-        edge_limit = max(1, min(16, budget // 2))
-        payload["entities"] = payload["entities"][:entity_limit]
-        # Filter before slicing: trivial edges must not fill the window.
-        edges = payload["edges"]
-        if not include_trivial_edges:
-            language = str((payload.get("file") or {}).get("language") or "")
-            kept = [edge for edge in edges if not _is_trivial_edge(edge, language)]
-            payload["trivial_edges_dropped"] = len(edges) - len(kept)
-            edges = kept
-        payload["edges"] = edges[:edge_limit]
+        if line_range is not None and not include_structure:
+            payload.pop("entities", None)
+            payload.pop("edges", None)
+        else:
+            entity_limit = max(1, min(16, budget // 2))
+            edge_limit = max(1, min(16, budget // 2))
+            payload["entities"] = payload["entities"][:entity_limit]
+            # Filter before slicing: trivial edges must not fill the window.
+            edges = payload["edges"]
+            if not include_trivial_edges:
+                language = str((payload.get("file") or {}).get("language") or "")
+                kept = [edge for edge in edges if not _is_trivial_edge(edge, language)]
+                payload["trivial_edges_dropped"] = len(edges) - len(kept)
+                edges = kept
+            payload["edges"] = edges[:edge_limit]
         if line_range is None:
             payload.update(_bounded_file_preview(
                 repo_root, file_path,
