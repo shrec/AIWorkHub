@@ -13073,7 +13073,7 @@ class ProcessManager:
 
     def _reconcile_pending_needfix_closures(self) -> None:
         """Retry durable accepted-task closures without model/operator action."""
-        events = self._events()
+        events = process_event_ledger.closure_events(self.process_log_path)
         completed = {
             (str(event.get("task_id") or ""), str(event.get("request_id") or ""))
             for event in events

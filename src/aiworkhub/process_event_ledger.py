@@ -1125,3 +1125,186 @@ def events_for_requests(
         path, keys=keys, key_field=key_field, cache_key=cache_key
     )
     return _request_slice(rebuilt, requested)
+
+
+# --- Append-aware state-filtered event projection ---------------------------
+#
+# The reconciler's idle pass only needs the rows of a couple of rare lifecycle
+# states, yet it used to replay every ledger segment on every pass.  This
+# projection retains just those rows and, on pure growth of the active
+# segment, parses only the appended bytes.
+
+CLOSURE_EVENT_STATES = ("needfix_closure_pending", "needfix_closure_reconciled")
+_STATE_EVENT_CACHE_MAX_ENTRIES = 8
+_STATE_EVENT_CACHE_MAX_ROWS = 20_000
+
+
+@dataclass(frozen=True)
+class _StateEventProjection:
+    signatures: tuple[_FileSignature, ...]
+    complete_active_offset: int
+    rows: tuple[dict[str, Any], ...]
+
+
+_StateProjectionKey = tuple[str, tuple[str, ...]]
+
+_STATE_EVENT_CACHE_LOCK = threading.RLock()
+_STATE_EVENT_CACHE: OrderedDict[
+    _StateProjectionKey, _StateEventProjection
+] = OrderedDict()
+
+
+def reset_state_event_cache() -> None:
+    """Drop every retained state projection; costs at most one cold replay."""
+
+    with _STATE_EVENT_CACHE_LOCK:
+        _STATE_EVENT_CACHE.clear()
+
+
+def _cache_state_projection(
+    cache_key: _StateProjectionKey, projection: _StateEventProjection
+) -> None:
+    if len(projection.rows) > _STATE_EVENT_CACHE_MAX_ROWS:
+        with _STATE_EVENT_CACHE_LOCK:
+            _STATE_EVENT_CACHE.pop(cache_key, None)
+        return
+    _cache_bounded_projection(
+        _STATE_EVENT_CACHE,
+        _STATE_EVENT_CACHE_LOCK,
+        cache_key,
+        projection,
+        _STATE_EVENT_CACHE_MAX_ENTRIES,
+    )
+
+
+def _row_has_state(row: dict[str, Any], states: frozenset[str]) -> bool:
+    state = row.get("state")
+    return isinstance(state, str) and state in states
+
+
+def _copy_state_rows(
+    rows: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [_copy_event_value(row) for row in rows]
+
+
+def _read_appended_rows(
+    path: Path,
+    *,
+    cached: _StateEventProjection,
+    current: tuple[_FileSignature, ...],
+    resolved_path: str,
+    states: frozenset[str],
+) -> tuple[list[dict[str, Any]], int] | None:
+    """Matching rows appended since ``cached`` and the new complete offset.
+
+    ``None`` means the change was not pure growth of the same active file, so
+    the caller must replay the canonical ordering instead.
+    """
+
+    old = cached.signatures
+    if not (old and current):
+        return None
+    if any(_is_spill(path, Path(item[0])) for item in current):
+        return None
+    if len(old) != len(current) or old[:-1] != current[:-1]:
+        return None
+    if old[-1][0] != resolved_path or current[-1][0] != resolved_path:
+        return None
+    if old[-1][1:3] != current[-1][1:3]:
+        return None
+    observed_size = current[-1][3]
+    if observed_size <= old[-1][3]:
+        return None
+    start = cached.complete_active_offset
+    try:
+        with path.open("rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if (
+                int(opened.st_dev),
+                int(opened.st_ino),
+                int(opened.st_size),
+            ) != (current[-1][1], current[-1][2], observed_size):
+                return None
+            handle.seek(start)
+            payload = handle.read(observed_size - start)
+    except OSError:
+        return None
+    complete_length = payload.rfind(b"\n") + 1
+    rows: list[dict[str, Any]] = []
+    if complete_length:
+        rows = [
+            row
+            for row in _parse_complete_jsonl(payload[:complete_length])
+            if _row_has_state(row, states)
+        ]
+    return rows, start + complete_length
+
+
+def closure_events(
+    path: Path, states: Iterable[str] = CLOSURE_EVENT_STATES
+) -> list[dict[str, Any]]:
+    """Return the rows whose ``state`` is in ``states`` in ``iter_events`` order.
+
+    Equivalent to filtering a fresh ``iter_events`` replay, but append-aware:
+    an unchanged ledger parses nothing and pure growth of the active segment
+    parses only the appended complete rows. Rotations, spills, truncations and
+    replacements replay the canonical ordering. Rows are copies; the cache is
+    process-local, bounded and never an authority.
+    """
+
+    wanted = tuple(sorted(set(states)))
+    wanted_set = frozenset(wanted)
+    resolved_path = str(path.resolve(strict=False))
+    cache_key = (resolved_path, wanted)
+    current = _ledger_signatures(path)
+    with _STATE_EVENT_CACHE_LOCK:
+        cached = _STATE_EVENT_CACHE.get(cache_key)
+        if cached is not None:
+            _STATE_EVENT_CACHE.move_to_end(cache_key)
+
+    if cached is not None and current is not None:
+        if current == cached.signatures:
+            return _copy_state_rows(cached.rows)
+        appended = _read_appended_rows(
+            path,
+            cached=cached,
+            current=current,
+            resolved_path=resolved_path,
+            states=wanted_set,
+        )
+        if appended is not None:
+            new_rows, offset = appended
+            rows = cached.rows + tuple(new_rows)
+            if _ledger_signatures(path) == current:
+                _cache_state_projection(
+                    cache_key,
+                    _StateEventProjection(
+                        signatures=current,
+                        complete_active_offset=offset,
+                        rows=rows,
+                    ),
+                )
+                return _copy_state_rows(rows)
+
+    before = _ledger_signatures(path)
+    rows = tuple(
+        row for row in iter_events(path) if _row_has_state(row, wanted_set)
+    )
+    after = _ledger_signatures(path)
+    if before is not None and before == after:
+        active_offset = 0
+        complete = True
+        if after and after[-1][0] == resolved_path:
+            active_offset = _active_complete_offset(path, size=after[-1][3])
+            complete = active_offset == after[-1][3]
+        if complete and _ledger_signatures(path) == after:
+            _cache_state_projection(
+                cache_key,
+                _StateEventProjection(
+                    signatures=after,
+                    complete_active_offset=active_offset,
+                    rows=rows,
+                ),
+            )
+    return _copy_state_rows(rows)
