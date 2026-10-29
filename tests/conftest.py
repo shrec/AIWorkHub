@@ -444,3 +444,78 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo):
         f"Skipped: {SYMLINK_CAPABILITY_DENIED_REASON}",
     )
     return report
+
+
+# NF-2026-01813: ``core._active_manager_chat_record`` reads the Manager Chat seat
+# from ``repo_root()/.aiworkhub/runtime/manager_loop``. A test that does not bind
+# AIWORKHUB_REPO to a tmp repo would see the developer's live seat and stamp
+# actor ``manager_chat``. Stub it to "no seat" unless the test opts in with
+# ``@pytest.mark.live_manager_chat_seat``; a test that patches it itself still wins.
+LIVE_MANAGER_CHAT_SEAT_MARKER = "live_manager_chat_seat"
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    _METRIC_CONFIG["config"] = config
+    config.addinivalue_line(
+        "markers",
+        f"{LIVE_MANAGER_CHAT_SEAT_MARKER}: exercise the real "
+        "core._active_manager_chat_record instead of the hermetic no-seat stub",
+    )
+
+
+@pytest.fixture(autouse=True)
+def hermetic_manager_chat_seat(request: pytest.FixtureRequest, monkeypatch):
+    if request.node.get_closest_marker(LIVE_MANAGER_CHAT_SEAT_MARKER) is not None:
+        return
+    from aiworkhub import core
+
+    monkeypatch.setattr(core, "_active_manager_chat_record", lambda: None)
+
+
+# NF-2026-01823: a print inside ``capsys.disabled()`` in an xdist worker never
+# reaches the controller's stdout. A metric line is therefore recorded as a test
+# user property, which xdist ships to the controller, and printed once there.
+AIWORKHUB_METRIC_PROPERTY = "aiworkhub_metric"
+_METRIC_LINES_KEY = pytest.StashKey[dict]()
+
+
+@pytest.fixture
+def aiworkhub_metric(request: pytest.FixtureRequest):
+    def record(line: str) -> None:
+        request.node.user_properties.append((AIWORKHUB_METRIC_PROPERTY, str(line)))
+
+    return record
+
+
+def _in_xdist_worker(config: pytest.Config) -> bool:
+    return hasattr(config, "workerinput")
+
+
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    config = _METRIC_CONFIG.get("config")
+    if config is None or _in_xdist_worker(config):
+        return
+    lines = [
+        value
+        for name, value in getattr(report, "user_properties", ())
+        if name == AIWORKHUB_METRIC_PROPERTY
+    ]
+    if not lines:
+        return
+    collected = config.stash.setdefault(_METRIC_LINES_KEY, {})
+    # Every phase report of one test carries the properties so far; keep the longest.
+    if len(lines) >= len(collected.get(report.nodeid, ())):
+        collected[report.nodeid] = lines
+
+
+_METRIC_CONFIG: dict = {}
+
+
+
+
+def pytest_terminal_summary(terminalreporter, config: pytest.Config) -> None:
+    if _in_xdist_worker(config):
+        return
+    for lines in config.stash.get(_METRIC_LINES_KEY, {}).values():
+        for line in lines:
+            terminalreporter.write_line(line)
