@@ -4680,6 +4680,8 @@ _PRIVILEGED_LANE_SKIP_TEST_NAMES = {
     # and a real AppContainer process that cannot add an instance to one.
     "test_relay_pipe_instances_share_a_name_only_the_first_claims",
     "test_a_contained_process_cannot_add_an_instance_to_a_relay_pipe",
+    # NF-2026-01855: a host MAX_PATH budget the lane's nested temp cannot meet.
+    "test_validation_helper_temp_grant_plan_spawns_under_the_winerror_267_limit",
 }
 
 
