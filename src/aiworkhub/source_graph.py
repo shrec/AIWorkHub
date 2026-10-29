@@ -5289,6 +5289,9 @@ def _bodygrep_unquote(term: str) -> tuple[str, bool]:
 
 
 BODYGREP_FILE_CACHE_MAX_BYTES = 64 * 1024 * 1024
+# A larger file is never cached: a scan must hold one raw buffer at a time, and a
+# cached big file would stay live while the next one is read (peak ~2x one file).
+BODYGREP_FILE_CACHE_MAX_FILE_BYTES = 1024 * 1024
 _BODYGREP_FILE_CACHE: OrderedDict[tuple[str, int, int], bytes] = OrderedDict()
 # path -> its one live cache key, so dropping a stale generation is O(1).
 _BODYGREP_FILE_CACHE_KEYS: dict[str, tuple[str, int, int]] = {}
@@ -5318,7 +5321,7 @@ def _bodygrep_cache_store(key: tuple[str, int, int], raw: bytes) -> None:
     """Cache ``raw`` under ``key``, replacing the path's previous generation."""
 
     global _BODYGREP_FILE_CACHE_BYTES
-    if len(raw) > BODYGREP_FILE_CACHE_MAX_BYTES:
+    if len(raw) > min(BODYGREP_FILE_CACHE_MAX_FILE_BYTES, BODYGREP_FILE_CACHE_MAX_BYTES):
         return
     with _BODYGREP_FILE_CACHE_LOCK:
         previous = _BODYGREP_FILE_CACHE_KEYS.get(key[0])
