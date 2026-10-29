@@ -180,26 +180,26 @@ def _related_rows(payload: Any) -> tuple[list[tuple[str, Any]] | None, str]:
     return parsed, ""
 
 
-def _testmap_part(
-    repo_root: Path | str, allowed: Sequence[str], commands: Sequence[str]
-) -> dict[str, Any]:
-    root = Path(repo_root)
-    files, unexpanded = _scoped_paths(allowed, "src/")
-    production = [path for path in files if not is_test_path(path)]
-    if not production:
-        return _not_applicable("no_production_python_in_allowed_writes", unexpanded)
-    consulted = production[:MAX_PRODUCTION_PATHS]
-    try:
-        freshness = _freshness_states(root, consulted)
-    except Exception as exc:  # unresolved repo, missing or unreadable index, ...
-        return _unavailable(_failure_reason(exc))
+def _related_tests(
+    root: Path,
+    consulted: Sequence[str],
+    freshness: Mapping[str, str],
+    named: Sequence[str],
+) -> tuple[dict[str, tuple[Any, str]], list[dict[str, str]], list[str], int]:
+    """One testmap pass: the best ``(score, production_path)`` per related test.
+
+    Tests scoring under ``RELATED_TEST_SCORE_FLOOR`` or covered by ``named`` are
+    dropped. Also returns the unavailable paths with their reasons, the paths
+    whose answer was truncated and how many paths answered. Never raises; the
+    accept-time neighbour lane (:mod:`aiworkhub.accept_neighbour_tests`) shares
+    this exact pass rather than keeping a second testmap client.
+    """
     unavailable = [
         {"path": path, "reason": _FRESHNESS_REASONS.get(freshness.get(path, ""), "not_indexed")}
         for path in consulted
         if freshness.get(path) != "fresh"
     ]
     queryable = [path for path in consulted if freshness.get(path) == "fresh"]
-    named = _command_names(commands)
     best: dict[str, tuple[Any, str]] = {}
     truncated_paths: list[str] = []
     answered = 0
@@ -226,6 +226,25 @@ def _testmap_part(
                 continue
             if test not in best or score > best[test][0]:
                 best[test] = (score, path)
+    return best, unavailable, truncated_paths, answered
+
+
+def _testmap_part(
+    repo_root: Path | str, allowed: Sequence[str], commands: Sequence[str]
+) -> dict[str, Any]:
+    root = Path(repo_root)
+    files, unexpanded = _scoped_paths(allowed, "src/")
+    production = [path for path in files if not is_test_path(path)]
+    if not production:
+        return _not_applicable("no_production_python_in_allowed_writes", unexpanded)
+    consulted = production[:MAX_PRODUCTION_PATHS]
+    try:
+        freshness = _freshness_states(root, consulted)
+    except Exception as exc:  # unresolved repo, missing or unreadable index, ...
+        return _unavailable(_failure_reason(exc))
+    best, unavailable, truncated_paths, answered = _related_tests(
+        root, consulted, freshness, _command_names(commands)
+    )
     if not answered:
         return {**_unavailable(unavailable[0]["reason"]), "unavailable_paths": unavailable}
     # Tests the card cannot write come first so the cap never drops the actionable ones.

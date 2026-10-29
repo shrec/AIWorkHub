@@ -3523,10 +3523,25 @@ def accept_review(
                     or not policy_authority.get("canonical_config_readable")
                 )
             )
+            # NF-2026-01814: the tests Source Graph relates to the changed
+            # modules that the card's validation does not name run on the
+            # combined tree, so a card cannot break a contract only the full
+            # suite sees. No selection (index unavailable, nothing related)
+            # is recorded with its reason and refuses nothing.
+            from . import accept_neighbour_tests
+
+            neighbour_selection = accept_neighbour_tests.select_neighbour_tests(
+                self.repo, changed, _declared_validation_commands(card)
+            )
+            neighbour_tests = neighbour_selection.evidence()
             # Sparse omission is not policy deletion. Enforce the inherited
             # policy against the complete candidate union, even at low risk;
             # never run full-tree commands against the sparse worker tree.
-            if risk_profile.get("combined_tree_required") or inherited_policy:
+            if (
+                risk_profile.get("combined_tree_required")
+                or inherited_policy
+                or neighbour_selection.tests
+            ):
                 union_workspace, combined_tree = create_combined_validation_workspace(
                     workspace,
                     card,
@@ -3588,8 +3603,19 @@ def accept_review(
                             for index, row in enumerate(union_validations)
                         ],
                     ]
+                    # One ``python -m pytest`` over the selection, through the
+                    # same runner as the declared commands; a red run raises
+                    # ``neighbour_tests_failed:`` and the card stays in review.
+                    neighbour_tests = accept_neighbour_tests.run_neighbour_tests(
+                        neighbour_selection,
+                        card,
+                        run=_run_declared_validations,
+                        workspace=union_workspace,
+                        route_metadata=latest,
+                    )
                     combined_tree["validation"] = union_validations
                     combined_tree["quality_gate"] = union_quality
+                    combined_tree["neighbour_tests"] = neighbour_tests
                 finally:
                     cleanup_workspace(
                         union_workspace.repo,
@@ -3773,6 +3799,7 @@ def accept_review(
                 ),
             )
             quality_gate["combined_tree"] = combined_tree
+            quality_gate["neighbour_tests"] = neighbour_tests
             quality_gate["quality_policy_authority"] = policy_authority
             # WHO accepted, WHO chose the reviewer ids, and WHAT the tier was
             # asked to be -- on the record, in the accept event's own payload.
