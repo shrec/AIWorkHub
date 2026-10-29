@@ -27,6 +27,7 @@ from . import (
     coordinator_config,
     refresh_coordinator_config,
 )
+from . import base_drift_proof as base_drift_proof_module
 from . import manager_route_probe
 from . import platform_io
 from . import repository_state
@@ -859,7 +860,7 @@ def stamped_manager_identity() -> dict[str, Any]:
     ``manager_bootstrap``'s rule, an open seat unless a verified Claude route owns this chat."""
     identity = _live_manager_identity() or {}
     chat = _active_manager_chat_record()
-    if chat and str(identity.get("provider") or "") != "claude":
+    if chat and identity and str(identity.get("provider") or "") != "claude":
         return _manager_chat_route(chat, identity)
     return dict(identity)
 
@@ -3426,6 +3427,11 @@ def manager_bootstrap(
         # (claude_callback_wait accepts exactly this session). Reporting the
         # Manager Chat seat instead told this chat its wakes go elsewhere.
         reply["manager_chat_seat"] = chat
+    elif chat and identity is None:
+        # NF-2026-01817: an open Manager Chat record is not this process's
+        # identity. The write gates refuse without one, so it must not read as verified.
+        reply["provider"] = ""
+        reply["manager_chat_seat_observed"] = chat
     elif chat:
         # The owner seat is the open Manager Chat session. Codex may still
         # deliver on its own thread, but this reply must not look route-pending
@@ -3447,6 +3453,14 @@ def manager_bootstrap(
             reply["claude_route_probe"] = manager_route_probe.probe_claude_route().report()
         except Exception as exc:  # noqa: BLE001 -- bootstrap must remain available
             reply["claude_route_probe"] = {"reason": f"probe_failed:{type(exc).__name__}", "observations": {}}
+    if not reply["manager_verified"]:
+        probe = reply.get("claude_route_probe")
+        refused = str((probe or {}).get("reason") or "route_not_resolved") if isinstance(probe, dict) else "route_not_resolved"
+        reply["remedy"] = (
+            f"This process holds no manager identity (route step refused: {refused}), so task_create, "
+            "sdlc_case and semantic edit refuse. Reload the VS Code window or reconnect the AIWorkHub MCP "
+            "server, then call aiworkhub_manager_bootstrap again."
+        )
     if bootstrap_call:
         # The inbox follows the RESOLVED route: an open Manager Chat seat owns its wakes.
         reply["dispatcher"] = _bootstrap_dispatcher(reply["manager_route"], reply["provider"])
@@ -4221,7 +4235,7 @@ def create_task(
     callback route instead of the live one (NF-2026-01095). The manager
     identity and capability gates still apply.
     """
-    identity = _manager_chat_seat_identity() or _claude_manager_identity() or _codex_manager_identity()
+    identity = _live_manager_identity()
     if identity is None:
         return _lifecycle_error("manager_identity_required:task_create", 126)
     # Creation has no pre-existing card whose runner/topic could authorize the
@@ -5414,7 +5428,7 @@ def _sdlc_verified_repo() -> tuple[Any, str] | dict[str, Any]:
 
 
 def _sdlc_case_write_authority() -> dict[str, Any] | None:
-    identity = _manager_chat_seat_identity() or _claude_manager_identity() or _codex_manager_identity()
+    identity = _live_manager_identity()
     if identity is None:
         return _lifecycle_error("manager_identity_required:sdlc_case", 126)
     blocked = _canonical_write_gate("sdlc-case")
@@ -6503,77 +6517,6 @@ def _validate_read_first_amendment_paths(
     return list(entries), None
 
 
-_OID_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
-
-
-def _base_drift_candidate_evidence(card: Mapping[str, Any]) -> tuple[str | None, list[str]]:
-    """The card's recorded base oid and the repo paths its candidate changed."""
-    for name in ("terminal_review", "terminal_failure"):
-        event = card.get(name)
-        evidence = event.get("evidence") if isinstance(event, dict) else None
-        workspace = evidence.get("workspace") if isinstance(evidence, dict) else None
-        changed = evidence.get("changed_paths") if isinstance(evidence, dict) else None
-        base_oid = workspace.get("base_oid") if isinstance(workspace, dict) else None
-        paths = [item for item in changed if isinstance(item, str)] if isinstance(changed, list) else []
-        if isinstance(base_oid, str) and paths:
-            return base_oid, paths
-    predecessor = card.get("rework_predecessor")
-    workspace = predecessor.get("workspace") if isinstance(predecessor, dict) else None
-    hashes = predecessor.get("changed_path_hashes") if isinstance(predecessor, dict) else None
-    base_oid = workspace.get("base_oid") if isinstance(workspace, dict) else None
-    if isinstance(base_oid, str) and isinstance(hashes, dict):
-        return base_oid, [str(item) for item in hashes if isinstance(item, str)]
-    return None, []
-
-
-def _base_drift_proof(card: Mapping[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
-    """Prove with git that canonical HEAD moved under a candidate-touched path.
-
-    Returns ``(proof, None)`` or ``(None, reason)``. The proof is only the
-    recorded base oid being an ancestor of HEAD and at least one path the
-    candidate changed differing between the two; anything unprovable refuses.
-    """
-    base_oid, candidate_paths = _base_drift_candidate_evidence(card)
-    if base_oid is None or _OID_PATTERN.fullmatch(base_oid) is None:
-        return None, "base_oid_unrecorded"
-    paths = list(dict.fromkeys(
-        path for path in candidate_paths
-        if path
-        and not path.startswith(("/", "-"))
-        and "\x00" not in path
-        and ".." not in path.replace("\\", "/").split("/")
-    ))
-    if not paths:
-        return None, "candidate_paths_unrecorded"
-    try:
-        repo = repo_root().resolve(strict=True)
-        head = task_store._committed_drift_git(repo, "rev-parse", "--verify", "HEAD")
-        head_oid = str(head.stdout or "").strip()
-        if head.returncode != 0 or _OID_PATTERN.fullmatch(head_oid) is None:
-            return None, "head_unresolvable"
-        ancestry = task_store._committed_drift_git(
-            repo, "merge-base", "--is-ancestor", base_oid, "HEAD"
-        )
-        if ancestry.returncode != 0:
-            return None, "base_not_ancestor_of_head"
-        diff = task_store._committed_drift_git(
-            repo, "diff", "--name-only", "-z", base_oid, "HEAD", "--", *paths
-        )
-    except Exception:
-        return None, "git_probe_failed"
-    if diff.returncode != 0:
-        return None, "git_probe_failed"
-    drifted = sorted(set(item for item in str(diff.stdout or "").split("\x00") if item))
-    if not drifted:
-        return None, "no_candidate_path_drift"
-    return {
-        "base_oid": base_oid,
-        "head_oid": head_oid,
-        "drifted_paths": drifted[:256],
-        "drifted_path_count": len(drifted),
-    }, None
-
-
 def reject_review(
     task_id: str,
     reason: str,
@@ -6666,7 +6609,7 @@ def reject_review(
             return _lifecycle_error("rejection_failure_category_not_infrastructure")
         explicit_failure_category = requested_category.value
         if requested_category is FailureCategory.BASE_DRIFT:
-            base_drift_proof, base_drift_error = _base_drift_proof(card)
+            base_drift_proof, base_drift_error = base_drift_proof_module.base_drift_proof(card, repo_root)
             if base_drift_error is not None:
                 return _lifecycle_error(f"base_drift_unproven:{base_drift_error}")
     # Keep the exact SQL preimage while artifact I/O happens outside a writer

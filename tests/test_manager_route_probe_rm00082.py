@@ -323,6 +323,11 @@ def test_bootstrap_ensures_the_inbox_of_the_resolved_manager_chat_route(boot_rep
     }), encoding="utf-8")
     monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
     monkeypatch.setattr(core, "_codex_manager_identity", lambda: None)
+    monkeypatch.setattr(core, "_manager_chat_seat_identity", lambda: {
+        "provider": "manager_chat", "session_id": _ACTIVE_CHAT, "thread_id": _ACTIVE_CHAT,
+        "window_id": "", "route_state": "ready", "callback_supported": "true",
+        "backend_id": "claude_cli", "model": "opus",
+    })
     seen: list[tuple[str, str]] = []
     monkeypatch.setattr(core, "_bootstrap_dispatcher", lambda route, provider: seen.append(
         (provider, route["session_id"])) or {"ensured": True})
