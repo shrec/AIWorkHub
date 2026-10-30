@@ -477,7 +477,13 @@ def launch_isolated(
             risk_tier=card.get("risk_tier"),
             repo=self.repo,
         )
-        memory_admission = _memory_launch_admission()
+        memory_admission = (
+            self._await_reviewer_admission(_memory_launch_admission)
+            if reserved_request_id is not None
+            else _pl.launch_admission.await_memory_admission(
+                kind="worker", probe=_memory_launch_admission, wait_seconds=0
+            )
+        )
         if not memory_admission["admit"]:
             raise LaunchRejected(
                 "memory_launch_capacity_denied:"
@@ -1635,7 +1641,22 @@ def launch_isolated(
             }
         # Provisioned failures must become recoverable blocked claim episodes.
         claim_release_retained = False
-        if not claimed and workspace is not None and request_id:
+        # Capacity refusals never claimed the card; queue it instead of failing it.
+        admission_receipt = (
+            self._admission_deferral(
+                task_id, runner, topic, adapter_id, reason, request_id
+            )
+            if reserved_request_id is None
+            and not claimed
+            and isinstance(exc, LaunchRejected)
+            else None
+        )
+        if (
+            admission_receipt is None
+            and not claimed
+            and workspace is not None
+            and request_id
+        ):
             failed_claim = task_engine.claim_start_exact(
                 self.repo, task_id, runner, topic, request_id=request_id
             )
@@ -1671,7 +1692,7 @@ def launch_isolated(
                     or blocked_result.get("error") or ""
                 )[:200]
                 reason += ":launch_failure_transition_failed:" + release_detail
-        else:
+        elif admission_receipt is None:
             blocker_result = task_engine.record_launch_blocker(
                 self.repo, task_id, runner, topic,
                 adapter_id=adapter_id, reason=reason,
@@ -1697,6 +1718,8 @@ def launch_isolated(
                 unlink_if_regular(launch_file)
         if authority_path is not None:
             unlink_if_regular(authority_path)
+        if admission_receipt is not None:
+            return admission_receipt
         if claim_release_retained:
             return {
                 "ok": False,

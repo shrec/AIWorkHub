@@ -416,6 +416,13 @@ def test_memory_denial_precedes_launch_side_effects(monkeypatch, tmp_path: Path)
         "_available_memory_bytes",
         lambda: process_launcher.MEMORY_LAUNCH_REQUIRED_BYTES - 1,
     )
+    deferred: list[tuple[str, str, str]] = []
+
+    def _defer(repo, task_id, runner, reason):
+        deferred.append((task_id, runner, reason))
+        return True, "pending"
+
+    monkeypatch.setattr(process_launcher.launch_admission, "defer_card", _defer)
 
     result = manager.launch(
         task_id="TASK_B1",
@@ -425,14 +432,17 @@ def test_memory_denial_precedes_launch_side_effects(monkeypatch, tmp_path: Path)
     )
 
     assert result["ok"] is False
+    assert result["state"] == "admission_queued"
+    assert result["retryable"] is True
+    assert result["retry_after_seconds"] > 0
+    assert result["admission_reason"] == "memory_capacity_insufficient"
     reason = result["blocked_reason"]
     assert reason.startswith("memory_launch_capacity_denied:")
-    assert '"retryable":true' in reason
-    assert '"reason":"memory_capacity_insufficient"' in reason
+    assert len(deferred) == 1 and deferred[0][:2] == ("TASK_B1", "claude_worker_b1")
     assert manager._live == {}
     assert not manager.process_dir.exists()
     event = json.loads(manager.process_log_path.read_text(encoding="utf-8"))
-    assert event["state"] == "blocked"
+    assert event["state"] == "admission_queued"
     assert event["blocked_reason"] == reason
 
 

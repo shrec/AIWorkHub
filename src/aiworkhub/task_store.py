@@ -3743,6 +3743,106 @@ def mark_transient_retry(
         return True, "pending"
 
 
+def mark_admission_deferred(
+    root: str | Path,
+    task_id: str,
+    *,
+    runner: str,
+    reason: str,
+    retry_after_seconds: int,
+) -> tuple[bool, str]:
+    """Stamp a pending/unclaimed card so the transient-retry reconciler relaunches it.
+
+    A launch refused for host memory or the concurrency cap never claimed the
+    card, so ``mark_transient_retry`` (processing+claimed only) cannot apply.
+    This writes the same ``transient_retry`` shape and ``retry_not_before`` the
+    reconciler reads, but spends no retry budget: a capacity wait is not a
+    failed attempt, and the wait ends when capacity frees, not after N tries.
+    """
+    _readiness, db_path = _require_ready(root)
+    with _write_connection(db_path) as conn:
+        _begin_immediate(conn)
+        row = conn.execute(
+            "SELECT runner, status, worker_status, card_json "
+            "FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, "task_not_found"
+        if str(row["runner"] or "") != runner:
+            return False, "runner_mismatch"
+        if canonical_status(dict(row)) != "pending":
+            return False, f"not_pending:current={canonical_status(dict(row))}"
+        if str(row["worker_status"] or "") != "unclaimed":
+            return False, f"not_unclaimed:current={row['worker_status']}"
+        raw_card_json = str(row["card_json"] or "{}")
+        try:
+            card = json.loads(raw_card_json)
+        except json.JSONDecodeError:
+            return False, "card_unreadable"
+        if not isinstance(card, dict):
+            return False, "card_unreadable"
+        try:
+            attempts = max(1, int(card.get("transient_retry_attempts") or 0))
+        except (TypeError, ValueError):
+            attempts = 1
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        bounded_reason = blocker_reason_or_named_gap(
+            reason, path="mark_admission_deferred"
+        )
+        card.update(
+            transient_retry={
+                "schema_id": "aiworkhub.transient_retry.v1",
+                "kind": "admission_deferred",
+                "attempts": attempts,
+                "budget": max(TRANSIENT_RETRY_BUDGET, attempts),
+                "reason": bounded_reason,
+                "request_id": "",
+                "recorded_at": now,
+            },
+            retry_not_before=(
+                now_dt + timedelta(seconds=max(1, int(retry_after_seconds)))
+            ).isoformat(),
+        )
+        cur = conn.execute(
+            "UPDATE tasks SET updated_at=?, card_json=? "
+            "WHERE task_id=? AND status='pending' AND worker_status='unclaimed' "
+            "AND runner=? AND card_json=?",
+            (
+                now,
+                json.dumps(card, ensure_ascii=False, sort_keys=True),
+                task_id,
+                runner,
+                raw_card_json,
+            ),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return False, "admission_deferral_conflict"
+        conn.execute(
+            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+            "VALUES (?, 'admission_deferred', ?, ?, ?)",
+            (
+                task_id,
+                runner,
+                json.dumps(
+                    {
+                        "reason": bounded_reason,
+                        "retry_after_seconds": max(1, int(retry_after_seconds)),
+                        "recorded_at": now,
+                        "runner": runner,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                now,
+            ),
+        )
+        conn.commit()
+        return True, "pending"
+
+
 # Post-launch failure substatuses this function accepts, routed to the
 # canonical ``blocked`` bucket. Owned by ``task_fsm``; imported here rather than
 # restated (NF-2026-00339).

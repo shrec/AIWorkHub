@@ -173,6 +173,7 @@ from . import provider_usage
 from . import repo_policy
 from . import review_orchestrator
 from . import runtime_temp
+from . import launch_admission
 from . import task_engine
 from . import task_fsm
 from . import task_store
@@ -8627,6 +8628,38 @@ class ProcessManager:
                 task_id, runner, topic, adapter_id, str(exc), request_id=request_id,
                 diagnostic=getattr(exc, "diagnostic", None) or None,
             )
+
+    def _await_reviewer_admission(
+        self, probe: Callable[[], dict[str, Any]]
+    ) -> dict[str, Any]:
+        return launch_admission.await_memory_admission(
+            kind="reviewer",
+            probe=probe,
+            wait_seconds=launch_admission.configured_wait_seconds(),
+        )
+
+    def _admission_deferral(
+        self,
+        task_id: str,
+        runner: str,
+        topic: str,
+        adapter_id: str,
+        reason: str,
+        request_id: str | None,
+    ) -> dict[str, Any] | None:
+        """Queue a capacity-refused pending card for relaunch, or ``None``."""
+        if not launch_admission.is_admission_refusal(reason):
+            return None
+        deferred, _detail = launch_admission.defer_card(
+            self.repo, task_id, runner, reason
+        )
+        if not deferred:
+            return None
+        return self._blocked(
+            task_id, runner, topic, adapter_id, reason,
+            request_id=request_id, state="admission_queued",
+            extra=launch_admission.queued_receipt_fields(reason),
+        )
 
     def _blocked(
         self,
