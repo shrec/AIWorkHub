@@ -4328,6 +4328,17 @@ def create_task(
             "limit": limit,
         })
 
+    title_warnings: list[dict[str, Any]] = []
+    full_title = title
+    title, original_title_length = task_templates.clip_title(title)
+    if original_title_length is not None:
+        prefixed = f"Full title: {full_title}\n\n{objective}"
+        objective = prefixed if len(prefixed) <= objective_limit else objective
+        title_warnings.append({
+            "code": "title_truncated",
+            "original_length": original_title_length,
+            "limit": title_limit,
+        })
     text_violation("title", title, title_limit)
     text_violation("objective", objective, objective_limit)
     if priority not in allowed_priorities:
@@ -5407,6 +5418,8 @@ def create_task(
         result["validation_normalization"] = validation_normalization
     if validation_head_warnings:
         result["validation_head_warnings"] = sorted(set(validation_head_warnings))
+    if title_warnings:
+        result["warnings"] = title_warnings
     if contract_warnings:
         # Same vocabulary the launcher uses, so the manager reads one wording at
         # creation and at launch. Advisory: see the note at the check.

@@ -544,6 +544,16 @@ def _bounded_text(value: Any, field: str, limit: int) -> str:
     return text
 
 
+def clip_title(title: str) -> tuple[str, int | None]:
+    """Clip an over-long title at a word boundary; return (title, original_length)."""
+
+    if len(title) <= MAX_TITLE_LENGTH:
+        return title, None
+    cut = title.rfind(" ", 0, MAX_TITLE_LENGTH + 1)
+    clipped = title[:cut] if cut > 0 else title[:MAX_TITLE_LENGTH]
+    return clipped.rstrip(), len(title)
+
+
 def _enforce_scope(
     spec: TaskTemplateSpec, production: list[str], tests: list[str]
 ) -> None:
@@ -1231,6 +1241,8 @@ def expand_template(
     else:
         validation = _validation_commands_for(spec, production, tests)
     resolved_title = spec.title if title is None else title
+    if isinstance(resolved_title, str):
+        resolved_title = clip_title(resolved_title.strip())[0]
     resolved_objective = spec.objective if objective is None else objective
     work_kind = _canonical_work_kind(
         spec.work_kind if work_kind is None else str(work_kind)

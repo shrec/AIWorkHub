@@ -487,7 +487,11 @@ def test_title_and_objective_overrides_must_be_bounded_text():
     )
     assert card["title"] == "Doc refresh"
     assert card["objective"] == "Refresh the usage docs."
-    for bad in (7, "", "   ", "x" * 301):
+    trimmed = expand_template(
+        "docs_change", production_paths=["README.md"], title="x" * 301
+    )["title"]
+    assert trimmed == "x" * 300
+    for bad in (7, "", "   "):
         with pytest.raises(TaskTemplateError, match="invalid_title"):
             expand_template("docs_change", production_paths=["README.md"], title=bad)
     for bad in (7, "", "   "):

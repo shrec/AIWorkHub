@@ -3862,6 +3862,18 @@ def aiworkhub_task_create_from_template(
             else {}
         ),
     )
+    original_title_length = (
+        task_templates.clip_title(title.strip())[1] if isinstance(title, str) else None
+    )
+    if original_title_length is not None and isinstance(created, dict) and created.get("ok"):
+        created = {
+            **created,
+            "warnings": [{
+                "code": "title_truncated",
+                "original_length": original_title_length,
+                "limit": task_templates.MAX_TITLE_LENGTH,
+            }],
+        }
     if echo_card:
         return {
             **created,
