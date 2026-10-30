@@ -55,7 +55,8 @@ def _write_terminal_batch(
     )
 
 
-def _wait_ready(repo: Path, timeout: float = 2.0) -> dict:
+# Generous: the loop returns at "ready"; 2s timed out under a loaded full xdist run.
+def _wait_ready(repo: Path, timeout: float = 30.0) -> dict:
     deadline = time.monotonic() + timeout
     result = storage_observability.snapshot(repo)
     while result["scan_status"] in {"scanning", "refreshing"} and time.monotonic() < deadline:
