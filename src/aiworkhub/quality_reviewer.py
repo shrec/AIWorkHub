@@ -1907,27 +1907,59 @@ def _index_proves_preexisting_replacement(
     )
 
 
+_REMOVABLE_SURFACE_SUFFIX = r"(?:\s+(?:\([^\n]*\)|--?\s[^\n]*))?"
+_REMOVABLE_SURFACE_SPAN_CAP = 8
+
+
 def _changed_line_reference(
     value: str,
     *,
     changed_paths: set[str],
     changed_source_lines: Mapping[str, list[tuple[int, int]]],
 ) -> dict[str, Any] | None:
+    value = value.strip()
     for path in sorted(changed_paths, key=lambda item: (-len(item), item)):
-        match = re.fullmatch(rf"{re.escape(path)}:(\d+)(?:-(\d+))?", value)
+        match = re.fullmatch(
+            rf"{re.escape(path)}:(\d+)(?:-(\d+))?{_REMOVABLE_SURFACE_SUFFIX}", value
+        )
         if not match:
             continue
         start = int(match.group(1))
         end = int(match.group(2) or start)
-        spans = changed_source_lines.get(path) or []
-        if any(span_start <= start and end <= span_end for span_start, span_end in spans):
-            return {
-                "kind": "source",
-                "path": path,
-                "line_start": start,
-                "line_end": end,
-            }
+        if start > end:
+            continue
+        for span_start, span_end in changed_source_lines.get(path) or []:
+            if start <= span_end and span_start <= end:
+                return {
+                    "kind": "source",
+                    "path": path,
+                    "line_start": max(start, span_start),
+                    "line_end": min(end, span_end),
+                }
     return None
+
+
+def _removable_surface_refusal_detail(
+    value: str,
+    changed_paths: set[str],
+    changed_source_lines: Mapping[str, list[tuple[int, int]]],
+) -> str:
+    """Name the accepted citation form and the changed spans a retry may cite."""
+    cited = [path for path in changed_paths if value.startswith(f"{path}:")]
+    paths = [max(cited, key=len)] if cited else sorted(changed_paths)
+    spans = [
+        f"{path}:{start}-{end}"
+        for path in paths
+        for start, end in changed_source_lines.get(path) or []
+    ]
+    shown = ", ".join(spans[:_REMOVABLE_SURFACE_SPAN_CAP]) or "none"
+    more = len(spans) - _REMOVABLE_SURFACE_SPAN_CAP
+    if more > 0:
+        shown += f", +{more} more"
+    return (
+        ": removable_surface must be '<path>:N' or '<path>:N-M' overlapping a "
+        f"changed line span (a bare symbol name is not accepted); changed spans: {shown}"
+    )
 
 
 def _write_review_packet_file(
@@ -2574,6 +2606,13 @@ def _validate_overbuild_finding(
         if not removable_surface or replacement:
             raise ReviewerEvidenceError(
                 f"review_finding_{index}_overbuild_removable_surface_required"
+                + (
+                    ": replacement must be omitted for an overbuild finding"
+                    if replacement
+                    else _removable_surface_refusal_detail(
+                        removable_surface, changed_paths, changed_source_lines
+                    )
+                )
             )
         if _changed_line_reference(
             removable_surface,
@@ -2582,6 +2621,9 @@ def _validate_overbuild_finding(
         ) is None:
             raise ReviewerEvidenceError(
                 f"review_finding_{index}_overbuild_removable_surface_unbound"
+                + _removable_surface_refusal_detail(
+                    removable_surface, changed_paths, changed_source_lines
+                )
             )
 
 

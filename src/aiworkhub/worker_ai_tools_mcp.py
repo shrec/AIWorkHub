@@ -7386,6 +7386,43 @@ def _charge_durability_failure(
     return result
 
 
+_OVERBUILD_REASON_RE = re.compile(r"^review_finding_(\d+)_overbuild_")
+
+
+def _normalize_dropping_unbound_overbuild(
+    packet: dict[str, Any],
+    *,
+    lens: str,
+    findings: list[Any],
+    symbol_resolver: Any,
+    drop_overbuild: bool,
+    record: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Canonical normalization; on the terminal attempt, drop refused overbuild rows only."""
+    remaining = list(findings)
+    positions = list(range(len(remaining)))
+    while True:
+        try:
+            return quality_reviewer.normalize_packet_findings(
+                packet, lens=lens, findings=remaining, symbol_resolver=symbol_resolver
+            )
+        except quality_reviewer.ReviewerEvidenceError as exc:
+            reason = str(exc)
+            match = _OVERBUILD_REASON_RE.match(reason)
+            if not drop_overbuild or match is None or int(match.group(1)) >= len(remaining):
+                raise
+            position = int(match.group(1))
+            record.append(
+                {
+                    "index": positions[position],
+                    "dropped": reason,
+                    "note": "dropped_unbound_overbuild",
+                }
+            )
+            del remaining[position]
+            del positions[position]
+
+
 def quality_review_submit(
     ctx: WorkerToolContext,
     *,
@@ -7486,13 +7523,16 @@ def quality_review_submit(
             decoded_findings.append(decoded)
         else:
             decoded_findings.append(raw_finding)
+    dropped_overbuild: list[dict[str, Any]] = []
     try:
         from .quality_review_ingest import canonical_symbol_resolver
-        normalized_findings = quality_reviewer.normalize_packet_findings(
+        normalized_findings = _normalize_dropping_unbound_overbuild(
             packet,
             lens=lens,
             findings=decoded_findings,
             symbol_resolver=canonical_symbol_resolver(ctx.authority_repo),
+            drop_overbuild=spent + 1 >= QUALITY_REVIEW_SUBMIT_MAX_ATTEMPTS,
+            record=dropped_overbuild,
         )
         # Recompute the digest instead of trusting the file's digest field.
         quality_reviewer.verify_reviewer_receipt(
@@ -7610,7 +7650,7 @@ def quality_review_submit(
             )
 
     def durable_ack(*, deduplicated: bool, retry_count: int) -> dict[str, Any]:
-        return {
+        ack = {
             "ok": True,
             "tool": tool,
             "status": "submitted",
@@ -7622,6 +7662,9 @@ def quality_review_submit(
             "packet_sha256": packet_sha256,
             "finding_count": len(normalized_findings),
         }
+        if dropped_overbuild:
+            ack["dropped_unbound_overbuild"] = dropped_overbuild
+        return ack
 
     def verified_payloads() -> tuple[dict[str, Any], list[dict[str, Any]]]:
         if ctx.audit_ledger_path is None or ctx.audit_hmac_key_path is None:
