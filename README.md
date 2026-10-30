@@ -374,10 +374,11 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.80
+## What's new in 0.12.81
 
-- Cheaper worker context: AI Memory and KB rows reach the worker whole and decoded instead of as escaped JSON cut mid-row, and duplicate KB rows are dropped (a measured bundle shrank 14%).
-- Worker usage records show where input tokens go: result bytes per tool, one sample per distinct usage snapshot, and a session init summary.
+- Cheaper rework turns: a worker reading a file it changed gets one compact copy of it instead of per-symbol rows plus the stale base version (about 4.5 times the file size before).
+- A reject-capped card continues as a successor in one call again, including NeedFix-converted cards.
+- The Manager Chat send queue scrolls instead of covering the panel, and the profile/preflight/health tools say when to use each one.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Continuous Audit as a Service (CAAS)

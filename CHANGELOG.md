@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.81] - 2026-10-31
+
+### Changed
+
+- Worker Source Graph `mode="file"` on a file changed in a rework returns one compact context: no per-entity rows and no stale base-version copy of the same path, so a rework file read no longer costs about 4.5 times the file size (NF-2026-01882).
+- The profile, preflight and health MCP tools (`task_health`, `dispatcher_health`, `doctor_diagnose`, `source_graph_health`, `quality_profile`, `session_token_profile`, `suite_profile`, `quality_run_checks`, `environment_preflight`) say when to use each one and which sibling to use instead; a ratchet test keeps the number of tools without usage guidance from growing (NF-2026-01881).
+
+### Fixed
+
+- `continue_capped` supersede creates the successor of a card made through the audited custom-template escape (every NeedFix conversion) instead of failing with `template_expanded_contract_mismatch`: the successor re-derives the escape from the copied contract rather than copying the predecessor's provenance (NF-2026-01878).
+- The Manager Chat send queue is height-bounded and scrolls, so a long pending send no longer covers the whole panel.
+- The CAAS README correction no longer quotes the forbidden expansion, so its allowlist locator survives every "What's new" edit (NF-2026-01877).
+
 ## [0.12.80] - 2026-10-30
 
 ### Changed

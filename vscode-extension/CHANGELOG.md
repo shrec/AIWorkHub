@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.12.81 — 2026-10-31
+
+### Fixed
+
+- The Manager Chat send queue is height-bounded and scrolls, so a long pending send no longer covers the whole panel.
+- Bundled runtime 0.12.81: compact rework-overlay file reads, capped-card continuation for NeedFix-converted cards, and usage guidance on the profile/preflight/health tools. The full list is in the repository CHANGELOG.
+
 ## 0.12.80 — 2026-10-30
 
 ### Changed
