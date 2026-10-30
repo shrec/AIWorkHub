@@ -5,8 +5,12 @@ import sqlite3
 import sys
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import pytest
 
 _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
@@ -329,6 +333,7 @@ def test_no_session_means_no_wake_consumer(monkeypatch: Any, tmp_path: Path) -> 
         "cap": manager_loop_wake.DEFAULT_CAP_PER_HOUR,
         "in_flight": 0,
         "failed_turns": 0,
+        "parked_reason": None,
         "retry_in_seconds": 0.0,
     }
     entry = manager_loop_service._entry_for(tmp_path)
@@ -711,6 +716,7 @@ def test_status_exposes_in_flight_failed_turns_and_retry_in_seconds() -> None:
         "cap": manager_loop_wake.DEFAULT_CAP_PER_HOUR,
         "in_flight": 0,
         "failed_turns": 0,
+        "parked_reason": None,
         "retry_in_seconds": 0.0,
     }
 
@@ -924,6 +930,308 @@ def test_a_wake_on_a_session_that_already_has_its_backend_asks_for_no_authorizat
         assert authority.asked == []
         assert len(backends) == 1
         assert backends[0].messages == ["callback: CARD_A -> s"]
+        assert ack_calls == [("b1", "l1")]
+    finally:
+        assert manager_loop_service.close(tmp_path)["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# Provider-aware parking: limit text parks until its reset, auth text parks
+# until the owner acts, anything else backs off exponentially. The callback
+# is never dropped: it stays queued and un-acked throughout.
+# ---------------------------------------------------------------------------
+
+_LIMIT_TEXT = "You've hit your session limit · resets 4am (UTC)"
+_AUTH_TEXT = "Failed to authenticate: OAuth session expired and could not be refreshed"
+
+
+def _provider_error(text: str) -> list[dict[str, str]]:
+    return [{"source": "provider", "error": text}]
+
+
+def _parking_consumer(
+    task_ids: list[str], clock: _FakeClock, wall_now: datetime | None = None
+) -> tuple[WakeConsumer, _ManualDispatch, list[tuple[str, str]]]:
+    dispatch = _ManualDispatch()
+    ack_calls: list[tuple[str, str]] = []
+
+    def ack(batch_id: str, lease_id: str) -> bool:
+        ack_calls.append((batch_id, lease_id))
+        return True
+
+    consumer = WakeConsumer(
+        claim=_one_batch_claim(task_ids),
+        ack=ack,
+        dispatch=dispatch,
+        clock=clock,
+        wall_clock=(lambda: wall_now) if wall_now is not None else manager_loop_wake._utc_now,
+        idle_poll_seconds=0.02,
+        retry_poll_seconds=0.02,
+    )
+    return consumer, dispatch, ack_calls
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("You've hit your session limit · resets 4am (Asia/Tbilisi)", "provider_limit"),
+        ("Claude usage limit reached", "provider_limit"),
+        ("429 rate limit exceeded", "provider_limit"),
+        (_AUTH_TEXT, "provider_auth"),
+        ("Please run /login", "provider_auth"),
+        ("Incorrect API key: invalid api key", "provider_auth"),
+        ("provider down", None),
+        ("", None),
+    ],
+)
+def test_classify_failure_reads_the_provider_error_text(text: str, expected: str | None) -> None:
+    assert manager_loop_wake.classify_failure(_provider_error(text)) == expected
+    assert manager_loop_wake.classify_failure([text]) == expected
+
+
+def test_a_reset_time_is_parsed_in_its_own_timezone_and_never_in_the_past() -> None:
+    parse = manager_loop_wake.parse_reset_delay_seconds
+    utc = timezone.utc
+
+    assert parse(_LIMIT_TEXT, datetime(2026, 10, 14, 23, 5, tzinfo=utc)) == 17700.0  # tomorrow 04:00
+    assert parse(_LIMIT_TEXT, datetime(2026, 10, 14, 2, 0, tzinfo=utc)) == 7200.0  # today 04:00
+    assert parse(_LIMIT_TEXT, datetime(2026, 10, 14, 4, 0, tzinfo=utc)) == 86400.0  # exactly now -> tomorrow
+    assert parse("limit reached, resets 5:30pm (UTC)", datetime(2026, 10, 14, 12, 0, tzinfo=utc)) == 19800.0
+    assert parse("resets 12am (UTC)", datetime(2026, 10, 14, 23, 0, tzinfo=utc)) == 3600.0
+    plus_four = timezone(timedelta(hours=4))
+    assert parse("resets 4am", datetime(2026, 10, 14, 23, 5, tzinfo=plus_four)) == 17700.0  # no zone: now's own
+    assert parse("resets 4am (Not/AZone)", datetime(2026, 10, 14, tzinfo=utc)) is None
+    assert parse("usage limit reached", datetime(2026, 10, 14, tzinfo=utc)) is None
+    assert parse("resets 13am (UTC)", datetime(2026, 10, 14, tzinfo=utc)) is None
+    assert parse(_LIMIT_TEXT, datetime(2026, 10, 14, 23, 5)) is None  # naive now: refuse to guess
+
+
+def test_the_tbilisi_reset_from_the_measured_failure_is_parsed() -> None:
+    try:
+        ZoneInfo("Asia/Tbilisi")
+    except ZoneInfoNotFoundError:
+        pytest.skip("no IANA timezone database on this host")
+    text = "You've hit your session limit · resets 4am (Asia/Tbilisi)"
+    now = datetime(2026, 10, 14, 19, 5, tzinfo=timezone.utc)  # 23:05 in Tbilisi (UTC+4)
+    assert manager_loop_wake.parse_reset_delay_seconds(text, now) == 17700.0
+
+
+def test_failed_turns_back_off_300_600_1200_capped_at_3600_and_reset_on_a_delivered_turn() -> None:
+    clock = _FakeClock(0.0)
+    consumer, dispatch, ack_calls = _parking_consumer(["A", "B"], clock)
+    consumer.start()
+    try:
+        assert dispatch.wait_calls(1)
+        for attempt, expected in enumerate((300.0, 600.0, 1200.0, 2400.0, 3600.0, 3600.0), start=1):
+            dispatch.dones[attempt - 1](False, _provider_error("provider down"))
+            status = consumer.status()
+            assert status["failed_turns"] == attempt
+            assert status["parked_reason"] == "backoff"
+            assert status["retry_in_seconds"] == expected
+            assert status["queued"] == 2  # never dropped
+
+            clock.value += expected - 1.0
+            assert not dispatch.wait_calls(attempt + 1, timeout=0.2)  # still parked
+            clock.value += 1.0
+            assert dispatch.wait_calls(attempt + 1)
+
+        dispatch.dones[6](True)  # A is delivered: the streak ends
+        assert dispatch.wait_calls(8)
+        assert dispatch.calls == ["A"] * 7 + ["B"]
+        dispatch.dones[7](False, _provider_error("provider down"))
+        status = consumer.status()
+        assert (status["failed_turns"], status["retry_in_seconds"]) == (1, 300.0)
+        assert ack_calls == []
+    finally:
+        consumer.stop()
+
+
+def test_a_failure_without_errors_still_backs_off_from_the_base_delay() -> None:
+    clock = _FakeClock(0.0)
+    consumer, dispatch, _ack_calls = _parking_consumer(["A"], clock)
+    consumer.start()
+    try:
+        assert dispatch.wait_calls(1)
+        dispatch.dones[0](False)
+        status = consumer.status()
+        assert (status["parked_reason"], status["retry_in_seconds"]) == ("backoff", 300.0)
+    finally:
+        consumer.stop()
+
+
+def test_a_session_limit_parks_until_the_reset_time_and_never_dispatches_earlier() -> None:
+    clock = _FakeClock(1000.0)
+    wall_now = datetime(2026, 10, 14, 23, 5, tzinfo=timezone.utc)  # reset 4am UTC is 17700s away
+    consumer, dispatch, ack_calls = _parking_consumer(["A"], clock, wall_now)
+    consumer.start()
+    try:
+        assert dispatch.wait_calls(1)
+        dispatch.dones[0](False, _provider_error(_LIMIT_TEXT))
+
+        status = consumer.status()
+        assert status["parked_reason"] == "provider_limit"
+        assert status["retry_in_seconds"] == 17700.0
+        assert status["queued"] == 1
+        assert status["failed_turns"] == 1
+        assert consumer.resume() is False  # only an auth park yields to the owner
+
+        clock.value += 300.0  # the generic backoff has long passed; the limit has not
+        assert not dispatch.wait_calls(2, timeout=0.3)
+        clock.value += 17700.0 - 300.0 - 1.0  # one second before the reset
+        assert not dispatch.wait_calls(2, timeout=0.3)
+        assert consumer.status()["retry_in_seconds"] == 1.0
+
+        clock.value += 1.0  # the reset moment
+        assert dispatch.wait_calls(2)
+        assert dispatch.calls == ["A", "A"]
+        assert ack_calls == []
+
+        dispatch.dones[1](True)
+        assert ack_calls == [("b1", "l1")]
+        assert consumer.status()["parked_reason"] is None
+    finally:
+        consumer.stop()
+
+
+def test_a_limit_without_a_parsable_reset_falls_back_to_the_escalating_backoff() -> None:
+    clock = _FakeClock(0.0)
+    consumer, dispatch, _ack_calls = _parking_consumer(["A"], clock)
+    consumer.start()
+    try:
+        assert dispatch.wait_calls(1)
+        dispatch.dones[0](False, _provider_error("Claude usage limit reached"))
+        status = consumer.status()
+        assert (status["parked_reason"], status["retry_in_seconds"]) == ("provider_limit", 300.0)
+
+        clock.value += 300.0
+        assert dispatch.wait_calls(2)
+        dispatch.dones[1](False, _provider_error("resets 4am (Not/AZone) usage limit"))
+        status = consumer.status()
+        assert (status["parked_reason"], status["retry_in_seconds"]) == ("provider_limit", 600.0)
+    finally:
+        consumer.stop()
+
+
+def test_an_authentication_failure_parks_without_retry_until_resumed() -> None:
+    clock = _FakeClock(0.0)
+    consumer, dispatch, ack_calls = _parking_consumer(["A"], clock)
+    consumer.start()
+    try:
+        assert dispatch.wait_calls(1)
+        dispatch.dones[0](False, _provider_error(_AUTH_TEXT))
+
+        status = consumer.status()
+        assert status["parked_reason"] == "provider_auth"
+        assert status["retry_in_seconds"] is None  # no automatic retry
+        assert status["queued"] == 1
+        assert ack_calls == []
+
+        clock.value += 10 * 24 * 3600.0
+        assert not dispatch.wait_calls(2, timeout=0.3)  # time alone never un-parks it
+        assert consumer.status()["parked_reason"] == "provider_auth"
+
+        assert consumer.resume() is True
+        assert consumer.status()["parked_reason"] is None
+        assert dispatch.wait_calls(2)
+        assert dispatch.calls == ["A", "A"]
+        assert consumer.resume() is False  # nothing left to un-park
+
+        dispatch.dones[1](True)
+        assert ack_calls == [("b1", "l1")]
+    finally:
+        consumer.stop()
+
+
+def test_a_wake_turns_provider_errors_reach_the_consumer_and_park_it(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    ack_calls = _run_one_wake_turn(
+        monkeypatch,
+        tmp_path,
+        lambda: {"ok": False, "reply": "", "errors": _provider_error(_LIMIT_TEXT)},
+    )
+    try:
+        assert ack_calls == []
+        status = manager_loop_service.status(tmp_path)["wake"]
+        assert status["parked_reason"] == "provider_limit"
+        assert status["queued"] == 1
+        assert status["failed_turns"] == 1
+        assert 0.0 < status["retry_in_seconds"] <= 24 * 3600.0
+    finally:
+        assert manager_loop_service.close(tmp_path)["ok"] is True
+    assert ack_calls == []
+
+
+def test_an_owner_send_unparks_a_wake_parked_on_an_authentication_failure(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    calls = {"n": 0}
+
+    def wake() -> dict[str, Any]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"ok": False, "reply": "", "errors": _provider_error(_AUTH_TEXT)}
+        return {"ok": True, "reply": "seen", "errors": []}
+
+    ack_calls = _run_one_wake_turn(monkeypatch, tmp_path, wake)
+    try:
+        status = manager_loop_service.status(tmp_path)["wake"]
+        assert (status["parked_reason"], status["retry_in_seconds"]) == ("provider_auth", None)
+        assert status["queued"] == 1
+        assert not threading.Event().wait(0.3)  # parked: no automatic retry in the meantime
+        assert calls["n"] == 1
+        assert ack_calls == []
+
+        assert manager_loop_service.send(tmp_path, "i logged in again")["ok"] is True
+        assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+        deadline = time.monotonic() + 10
+        while not ack_calls and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert calls["n"] == 2
+        assert ack_calls == [("b1", "l1")]
+        status = manager_loop_service.status(tmp_path)["wake"]
+        assert (status["parked_reason"], status["queued"], status["failed_turns"]) == (None, 0, 0)
+    finally:
+        assert manager_loop_service.close(tmp_path)["ok"] is True
+
+
+def test_an_owner_send_queued_behind_a_failing_wake_turn_still_unparks_it(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    # The send's own resume runs while the wake turn is still in flight, before
+    # it parks on the auth failure; the queued send must resume again as it runs.
+    _install_fakes(monkeypatch)
+    monkeypatch.setattr(manager_loop_service, "WAKE_IDLE_POLL_SECONDS", 0.02)
+    monkeypatch.setattr(manager_loop_service, "WAKE_RETRY_POLL_SECONDS", 0.02)
+    entered, release = threading.Event(), threading.Event()
+    calls = {"n": 0}
+
+    def fake_wake(self: Any, member: Any) -> dict[str, Any]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            entered.set()
+            release.wait(timeout=5)
+            return {"ok": False, "reply": "", "errors": _provider_error(_AUTH_TEXT)}
+        return {"ok": True, "reply": "seen", "errors": []}
+
+    monkeypatch.setattr(manager_loop.ManagerOrchestrator, "wake", fake_wake)
+    ack_calls: list[tuple[str, str]] = []
+
+    def ack(batch_id: str, lease_id: str) -> bool:
+        ack_calls.append((batch_id, lease_id))
+        return True
+
+    _install_fake_wake_source(monkeypatch, _one_batch_claim(["CARD_A"]), ack)
+    assert manager_loop_service.start(tmp_path, "fake", "model-a")["ok"] is True
+    try:
+        assert entered.wait(timeout=5)
+        assert manager_loop_service.send(tmp_path, "i logged in again")["queued"] is True
+        release.set()
+        assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+        deadline = time.monotonic() + 10
+        while not ack_calls and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert calls["n"] == 2
         assert ack_calls == [("b1", "l1")]
     finally:
         assert manager_loop_service.close(tmp_path)["ok"] is True

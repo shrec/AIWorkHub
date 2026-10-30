@@ -374,8 +374,8 @@ def _run_turn(
     *,
     record_last_turn: bool,
     queued_text: str | None,
-) -> bool:
-    """Run one turn on the turn thread and return whether it was delivered; never raises."""
+) -> tuple[bool, list[Any]]:
+    """Run one turn on the turn thread; return (delivered, the turn's errors); never raises."""
 
     session = entry.orchestrator.session
     turn = session.turn_count + 1 if session is not None else 0
@@ -397,15 +397,16 @@ def _run_turn(
                 )
             except Exception:  # noqa: BLE001 - a failing event log must not kill the turn thread
                 pass
-        return False
+        return False, [detail]
+    errors = list(raw.get("errors") or [])
     if record_last_turn:
         entry.last_turn = {
             "turn": raw.get("turn", turn),
             "ok": bool(raw.get("ok")),
-            "errors": list(raw.get("errors") or []),
+            "errors": errors,
             "reply": str(raw.get("reply", ""))[:500],
         }
-    return _turn_delivered(raw)
+    return _turn_delivered(raw), errors
 
 
 def _dispatch_turn(
@@ -415,7 +416,7 @@ def _dispatch_turn(
     record_last_turn: bool,
     pin_passive_route: bool = False,
     route: tuple[str, str] | None = None,
-    on_finished: Callable[[bool], None] | None = None,
+    on_finished: Callable[[bool, Sequence[Any]], None] | None = None,
     queued: _QueuedSend | None = None,
     clear_suspended: bool = False,
 ) -> dict[str, Any]:
@@ -423,7 +424,7 @@ def _dispatch_turn(
     if err is not None:
         return err
     if clear_suspended:
-        entry.suspended = False
+        _clear_suspension(entry)
     with entry.queue_lock:
         if not entry.turn_lock.acquire(blocking=False):
             return _enqueue_send(entry, queued)
@@ -439,7 +440,7 @@ def _dispatch_turn(
         holding = True
         try:
             while True:
-                delivered = _run_turn(
+                delivered, errors = _run_turn(
                     entry, step, record_last_turn=record_last_turn, queued_text=queued_text
                 )
                 # A queued owner message runs next on this thread under the same
@@ -459,13 +460,18 @@ def _dispatch_turn(
                 # skip the re-arm below.
                 if finished is not None:
                     try:
-                        finished(delivered)
+                        finished(delivered, errors)
                     except Exception:  # noqa: BLE001 - the outcome callback must never kill the turn thread
                         pass
                 if following is None:
                     return
                 step = _queued_send_action(entry, repo, following)
                 finished, queued_text = None, following.text
+                # This send's resume ran when it queued, before the turn above
+                # could park the wake on an auth failure: repeat it as it runs.
+                wake = entry.wake
+                if wake is not None:
+                    wake.resume()
         finally:
             if holding:
                 with entry.queue_lock:
@@ -505,7 +511,7 @@ def start(
     entry, err = _entry_or_error(repo)
     if err is not None:
         return err
-    entry.suspended = False
+    _clear_suspension(entry)
     if not entry.turn_lock.acquire(blocking=False):
         return {"ok": False, "error": "manager_turn_in_progress"}
     try:
@@ -808,7 +814,7 @@ def continue_session(
     entry, err = _entry_or_error(repo)
     if err is not None:
         return err
-    entry.suspended = False
+    _clear_suspension(entry)
     if not entry.turn_lock.acquire(blocking=False):
         return {"ok": False, "error": "manager_turn_in_progress"}
     try:
@@ -996,11 +1002,11 @@ def _wake_on_own_route(
 
 
 def _wake_dispatch(
-    repo: str | Path, member: Mapping[str, Any], done: Callable[[bool], None]
+    repo: str | Path, member: Mapping[str, Any], done: Callable[[bool, Sequence[Any]], None]
 ) -> bool:
     """Start one callback's turn through the SAME non-blocking lock ``send`` uses.
 
-    Returns whether the turn STARTED; ``done(delivered)`` follows once it finishes.
+    Returns whether the turn STARTED; ``done(delivered, errors)`` follows once it finishes.
     """
 
     result = _dispatch_turn(
@@ -1098,6 +1104,15 @@ def _stop_wake(entry: _Entry) -> None:
         wake.stop()
 
 
+def _clear_suspension(entry: _Entry) -> None:
+    """The owner is acting again: lift a stop's suspension and un-park an auth-failed wake."""
+
+    entry.suspended = False
+    wake = entry.wake
+    if wake is not None:
+        wake.resume()
+
+
 def _wake_status(entry: _Entry) -> dict[str, Any]:
     with entry.wake_lock:
         wake = entry.wake
@@ -1109,6 +1124,7 @@ def _wake_status(entry: _Entry) -> dict[str, Any]:
             "cap": entry.wake_cap_per_hour,
             "in_flight": 0,
             "failed_turns": 0,
+            "parked_reason": None,
             "retry_in_seconds": 0.0,
         }
     return wake.status()

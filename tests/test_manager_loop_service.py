@@ -252,11 +252,13 @@ def test_a_queued_owner_message_runs_before_the_next_callback_wake(
     member = {"task_id": "T-1", "state": "review_ready"}
     next_wake_started: list[bool] = []
 
-    def done(delivered: bool) -> None:
+    def done(delivered: bool, errors: Any = ()) -> None:
         # The wake consumer starts its next member once a turn reports done;
         # the queued owner message must already own the lock by then.
         next_wake_started.append(
-            manager_loop_service._wake_dispatch(tmp_path, {"task_id": "T-2", "state": "done"}, lambda _d: None)
+            manager_loop_service._wake_dispatch(
+                tmp_path, {"task_id": "T-2", "state": "done"}, lambda _d, _e=(): None
+            )
         )
 
     assert manager_loop_service._wake_dispatch(tmp_path, member, done) is True
