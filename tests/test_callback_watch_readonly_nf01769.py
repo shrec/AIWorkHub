@@ -38,6 +38,7 @@ def repo(tmp_path, monkeypatch):
     assert task_store.initialize_repository(root)["ok"]
     monkeypatch.setenv("AIWORKHUB_REPO", str(root))
     monkeypatch.setattr(core, "repo_root", lambda: root)
+    # The callback wait/ack group lives in manager_callback_wait and resolves these seams through core at call time, so patching core is the contract (NF-2026-01863).
     monkeypatch.setattr(core, "CALLBACK_WAIT_WATCH_POLL_SECONDS", 0.05)
     monkeypatch.delenv(core.CALLBACK_WAIT_HOST_TIMEOUT_MS_ENV, raising=False)
     monkeypatch.delenv(core.CALLBACK_WAIT_MAX_SECONDS_ENV, raising=False)
