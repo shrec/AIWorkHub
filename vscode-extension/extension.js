@@ -11225,6 +11225,8 @@ async function pushManagerLoopStatus(view) {
     const payload = await client.callTool(MANAGER_LOOP_TOOLS.status, {});
     if (view.stillBoundTo(client)) {
       view.postMessage({ type: OUTBOUND_TYPES.managerLoopStatus, payload: sanitizeWebviewPayload(payload) });
+    } else {
+      view.postMessage({ type: OUTBOUND_TYPES.managerLoopStatus, payload: { ok: false, error: "manager_reply_superseded" } });
     }
   } catch (err) {
     view.postMessage({ type: OUTBOUND_TYPES.managerLoopStatus, payload: { ok: false, error: sanitizeErrorMessage(err) } });
@@ -11240,6 +11242,8 @@ async function pushManagerLoopEvents(view, sessionId, afterSeq) {
     const payload = await client.callTool(MANAGER_LOOP_TOOLS.events, { session_id: sessionId, after_seq: afterSeq });
     if (view.stillBoundTo(client)) {
       view.postMessage({ type: OUTBOUND_TYPES.managerLoopEvents, payload: { ...sanitizeWebviewPayload(payload), session_id: sessionId } });
+    } else {
+      view.postMessage({ type: OUTBOUND_TYPES.managerLoopEvents, payload: { ok: false, error: "manager_reply_superseded", session_id: sessionId } });
     }
   } catch (err) {
     view.postMessage({ type: OUTBOUND_TYPES.managerLoopEvents, payload: { ok: false, error: sanitizeErrorMessage(err), session_id: sessionId } });
@@ -12365,9 +12369,17 @@ function handleInboundMessage(view, message) {
     }
     case "managerLoopRename": {
       const renameId = String(message.sessionId || "");
-      const title = String(message.title || "").trim().slice(0, 80);
-      if (!MANAGER_SESSION_ID_RE.test(renameId) || !title) return;
-      runManagerLoopAction(view, "rename", { session_id: renameId, title });
+      if (!MANAGER_SESSION_ID_RE.test(renameId)) return;
+      const explicitTitle = String(message.title || "").trim().slice(0, 80);
+      if (explicitTitle) {
+        runManagerLoopAction(view, "rename", { session_id: renameId, title: explicitTitle });
+      } else {
+        const currentTitle = String(message.currentTitle || "");
+        vscode.window.showInputBox({ prompt: "Session name", value: currentTitle }).then((input) => {
+          const title = String(input || "").trim().slice(0, 80);
+          if (title) runManagerLoopAction(view, "rename", { session_id: renameId, title });
+        });
+      }
       break;
     }
     case "managerLoopDelete": {
@@ -14458,7 +14470,7 @@ function getHtmlForWebview(webview, extensionUri) {
         </div>
         <button type="button" class="mc-latest" id="manager-chat-latest" hidden>↓ latest</button>
         <div class="sr-only" id="manager-chat-announcer" aria-live="polite"></div>
-        <div class="manager-chat-notice" id="manager-chat-notice" hidden></div>
+        <div class="manager-chat-notice" id="manager-chat-notice" role="alert" hidden></div>
         <ul class="manager-chat-attachments" id="manager-chat-attachments" aria-label="Attached images" hidden></ul>
         <form class="manager-chat-composer" id="manager-chat-composer">
           <textarea id="manager-chat-input" rows="2" placeholder="Message the manager" aria-label="Message the manager"></textarea>
@@ -14977,6 +14989,7 @@ async function selectRepositoryCommand() {
     mcpClient = null;
     await oldClient.stopDispatcherThenTerminate({ restart: false });
   }
+  await disposeManagerLoopMcpClient();
   removeWindowRouteRecord(previousRepoIdentity);
   activeRepoIdentity = null;
   activeRepoLabel = "Switching repository";

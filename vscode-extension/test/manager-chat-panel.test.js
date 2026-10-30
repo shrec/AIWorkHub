@@ -388,13 +388,13 @@ test("managerLoopDelete shows a modal confirmation before discarding; a dismisse
   );
 });
 
-test("the gated manager loop client is torn down from all three required call sites", () => {
-  // 1 definition (async function disposeManagerLoopMcpClient() {) plus 3
+test("the gated manager loop client is torn down from all four required call sites", () => {
+  // 1 definition (async function disposeManagerLoopMcpClient() {) plus 4
   // call sites: runManagerLoopAction's close branch, ViewState.dispose(),
-  // and deactivate(). A regression dropping any of the three call sites
-  // changes this count.
+  // deactivate(), and selectRepositoryCommand. A regression dropping any of
+  // the four call sites changes this count.
   const occurrences = extensionSource.split("disposeManagerLoopMcpClient()").length - 1;
-  assert.equal(occurrences, 4);
+  assert.equal(occurrences, 5);
 });
 
 test("managerLoopStart refuses an unlisted backend without ever calling an MCP tool", async () => {
@@ -618,14 +618,14 @@ function loadWebviewSlice() {
   );
   const managerChat = extractSlice(
     appSource,
-    "function managerChatTaskStatus(task) {",
+    "function showManagerChatNotice(message) {",
     "  showManagerChatNotice(null);\n}",
     "manager chat render/poll functions",
   );
   const managerChatWiring = extractSlice(
     appSource,
     "function applyManagerChatCollapsed(collapsed) {",
-    "  state.managerChatRunning = true;\n  applyManagerChatSessionUi();\n});",
+    "  if (state.managerChatDraft) elements.managerChatInput.value = state.managerChatDraft;\n}",
     "manager chat sidebar wiring",
   );
 
@@ -639,6 +639,14 @@ function loadWebviewSlice() {
     managerChatEvents: [],
     managerChatLastSeq: 0,
     managerChatPollTimer: null,
+    managerChatPendingSends: [],
+    managerChatSentHistory: [],
+    managerChatHistoryIndex: -1,
+    managerChatPollErrors: 0,
+    managerChatPollNoticeFromError: false,
+    managerChatHighestSeenTurn: 0,
+    managerChatQueuePayload: null,
+    managerChatDraft: "",
   };
   const elements = {
     headerManagerChat: makeFakeElement("button"),
@@ -663,9 +671,6 @@ function loadWebviewSlice() {
     managerChatSessionId: makeFakeElement("span"),
     managerChatSessionBackend: makeFakeElement("span"),
     managerChatComposer: makeFakeElement("form"),
-    managerChatTasksHead: makeFakeElement("div"),
-    managerChatTasksList: makeFakeElement("div"),
-    managerChatTaskFilter: Object.assign(makeFakeElement("select"), { value: "open" }),
     managerChatInput: makeFakeElement("textarea"),
     managerChatSend: makeFakeElement("button"),
     managerChatAttach: makeFakeElement("button"),
@@ -676,12 +681,13 @@ function loadWebviewSlice() {
   };
   const posts = [];
   const timers = [];
-  const vscode = { postMessage: (message) => posts.push(message) };
+  const vscode = { postMessage: (message) => posts.push(message), setState: () => {}, getState: () => ({}) };
+  function persistState() { vscode.setState({ managerChatDraft: state.managerChatDraft || "" }); }
   const windowFake = {
     requestAnimationFrame: (fn) => { fn(); return 1; },
-    setTimeout: (fn) => {
+    setTimeout: (fn, delay) => {
       const id = timers.length + 1;
-      timers.push({ id, fn });
+      timers.push({ id, fn, delay });
       return id;
     },
     clearTimeout: (id) => {
@@ -702,6 +708,7 @@ function loadWebviewSlice() {
     vscode,
     state,
     elements,
+    persistState,
     MANAGER_CHAT_POLL_MS: 1500,
     // Reads at once, so a test sees the attached image right after the event.
     FileReader: class {
@@ -716,7 +723,7 @@ function loadWebviewSlice() {
     `"use strict";\n${utilities}\n${constants}\n${consoleSource}\n${managerChat}\n${managerChatWiring}\n` +
       "this.api = { managerChatEventNode, renderManagerChatEvents, renderManagerChatEventsResponse, " +
       "renderManagerChatAction, renderManagerChatStatus, requestManagerChatEvents, scheduleManagerChatPoll, " +
-      "applyManagerChatSessionUi, applyManagerChatComposerState, managerChatEnabledModels, managerChatSelectedRoute, populateManagerChatModelOptions, applyManagerChatCollapsed, toggleManagerChatSidebar, startManagerChatSidebar, renderManagerChatTaskBoard, driveManagerChatTask };",
+      "applyManagerChatSessionUi, applyManagerChatComposerState, managerChatEnabledModels, managerChatSelectedRoute, populateManagerChatModelOptions, applyManagerChatCollapsed, toggleManagerChatSidebar, startManagerChatSidebar };",
     context,
   );
   return { api: context.api, state, elements, posts, timers, window: windowFake };
@@ -1017,7 +1024,7 @@ test("a refused send reverts the optimistic running state and gives the text bac
   assert.doesNotMatch(text, /Thinking/);
 });
 
-test("a refused send never overwrites what the owner typed since", () => {
+test("a refused send's text is restored after what the owner typed since", () => {
   const harness = loadWebviewSlice();
   harness.elements.managerChatBackendSelect.value = "codex_cli";
   harness.elements.managerChatModelInput.value = "gpt-x";
@@ -1027,7 +1034,7 @@ test("a refused send never overwrites what the owner typed since", () => {
 
   harness.api.renderManagerChatAction("send", { ok: false, error: "invalid_backend_id" });
 
-  assert.equal(harness.elements.managerChatInput.value, "typing on");
+  assert.equal(harness.elements.managerChatInput.value, "typing on\nfirst");
   assert.equal(harness.state.managerChatRunning, false);
 });
 
@@ -1639,59 +1646,9 @@ test("the collapse toggle flips sidebar state and never opens a dialog", () => {
   assert.equal(harness.elements.managerChatDialog.open, true, "collapse does not drive dialog.open");
 });
 
-test("the manager session shows canonical tasks and drives one from the chosen model", () => {
+
+test("slash commands stay on this session", () => {
   const harness = loadWebviewSlice();
-  harness.state.featureSettings = MANAGER_CHAT_MODEL_POLICY_PAYLOAD;
-  harness.api.populateManagerChatModelOptions();
-  harness.elements.managerChatModelInput.value = "gpt-5-codex";
-  harness.state.tasks = [
-    { task_id: "TASK_PENDING", status: "pending", objective: "wait" },
-    { task_id: "TASK_RUN", status: "processing", title: "ship <img src=x>" },
-  ];
-
-  harness.api.renderManagerChatTaskBoard();
-
-  const buttons = harness.elements.managerChatTasksList.children.filter((node) => node.tag === "button");
-  assert.deepEqual(buttons.map((button) => button.dataset.taskId), ["TASK_RUN", "TASK_PENDING"]);
-  const text = flattenNodes(harness.elements.managerChatTasksList, []).map((node) => String(node.textContent || "")).join("");
-  assert.match(harness.elements.managerChatTasksHead.textContent, /2 · 1 running/);
-  assert.ok(text.includes("<img"), "task text stays literal");
-  assert.ok(!flattenNodes(harness.elements.managerChatTasksList, []).some((node) => node.tag === "img"));
-
-  harness.api.driveManagerChatTask("TASK_RUN");
-
-  assert.equal(harness.posts.at(-1).type, "managerLoopSend");
-  assert.equal(harness.posts.at(-1).backendId, "codex_cli");
-  assert.equal(harness.posts.at(-1).model, "gpt-5-codex");
-  assert.match(harness.posts.at(-1).text, /TASK_RUN \(processing\)/);
-});
-
-test("the task filter hides closed cards and slash commands stay on this session", () => {
-  const harness = loadWebviewSlice();
-  harness.state.featureSettings = MANAGER_CHAT_MODEL_POLICY_PAYLOAD;
-  harness.elements.managerChatBackendSelect.value = "codex_cli";
-  harness.api.populateManagerChatModelOptions();
-  harness.elements.managerChatModelInput.value = "gpt-5-codex";
-  harness.state.tasks = [
-    { task_id: "TASK_RUN", status: "processing", title: "ship" },
-    { task_id: "TASK_DONE", status: "accepted", title: "landed" },
-  ];
-
-  harness.api.renderManagerChatTaskBoard();
-  let buttons = harness.elements.managerChatTasksList.children.filter((node) => node.tag === "button");
-  assert.deepEqual(buttons.map((button) => button.dataset.taskId), ["TASK_RUN"]);
-  assert.equal(buttons[0].children[0].textContent, "inspect");
-
-  harness.elements.managerChatTaskFilter.value = "all";
-  trigger(harness.elements.managerChatTaskFilter, "change");
-  buttons = harness.elements.managerChatTasksList.children.filter((node) => node.tag === "button");
-  assert.deepEqual(buttons.map((button) => button.dataset.taskId), ["TASK_RUN", "TASK_DONE"]);
-
-  harness.elements.managerChatInput.value = "/task TASK_DONE";
-  trigger(harness.elements.managerChatComposer, "submit");
-  assert.match(harness.posts.at(-1).text, /drive canonical task TASK_DONE \(accepted\)/);
-  assert.equal(harness.elements.managerChatInput.value, "");
-
   harness.elements.managerChatInput.value = "/new";
   trigger(harness.elements.managerChatComposer, "submit");
   assert.deepEqual(plain(harness.posts.at(-1)), { type: "managerLoopNew" });
@@ -2171,4 +2128,312 @@ test("applyManagerChatSessionUi enables Stop only while a turn is running", () =
   state.managerChatRunning = false;
   harness.api.applyManagerChatSessionUi();
   assert.equal(elements.managerChatStop.disabled, true, "a session alone must not enable Stop");
+});
+
+// ── turn_stopped: ends Running, stops Thinking timer, pulls status ──────────
+test("a turn_stopped event ends Running and the Thinking timer and pulls status", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-" + "a".repeat(32);
+  harness.state.managerChatRunning = true;
+  harness.state.managerChatThinkingSince = Date.now() - 500;
+
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    events: [{ seq: 5, type: "turn_stopped", turn: 1, payload: {} }],
+  });
+
+  assert.equal(harness.state.managerChatRunning, false);
+  assert.equal(harness.state.managerChatThinkingSince, 0);
+  assert.deepEqual(plain(harness.posts.at(-1)), { type: "managerLoopStatus" });
+});
+
+// ── Rename: posts managerLoopRename without title ─────────────────────────
+test("a Rename click posts managerLoopRename without title", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-" + "a".repeat(32);
+  harness.state.managerChatTitle = "My Session";
+  harness.window.prompt = () => null;
+
+  trigger(harness.elements.managerChatRenameSession, "click");
+
+  const post = harness.posts.at(-1);
+  assert.equal(post.type, "managerLoopRename");
+  assert.equal(post.sessionId, "mls-" + "a".repeat(32));
+  assert.equal(post.currentTitle, "My Session");
+  assert.equal(post.title, undefined);
+});
+
+// ── stillBoundTo false: posts ok:false manager_reply_superseded ───────────
+test("when stillBoundTo is false the host posts ok:false manager_reply_superseded for status", async () => {
+  const harness = loadHostSlice();
+  const view = makeView();
+  // The binding moves while the call is in flight, as a repo switch would.
+  harness.setClient(makeClient(() => { view.bindClient({}); return { ok: true }; }));
+  harness.api.handleInboundMessage(view, { type: "managerLoopStatus" });
+  await flush();
+
+  const statusPost = view.posts.find((p) => p.type === "managerLoopStatus");
+  assert.ok(statusPost, "status reply posted");
+  assert.equal(statusPost.payload.ok, false);
+  assert.equal(statusPost.payload.error, "manager_reply_superseded");
+});
+
+test("when stillBoundTo is false the host posts ok:false manager_reply_superseded for events", async () => {
+  const harness = loadHostSlice();
+  const view = makeView();
+  // The binding moves while the call is in flight, as a repo switch would.
+  harness.setClient(makeClient(() => { view.bindClient({}); return { ok: true }; }));
+  harness.api.handleInboundMessage(view, { type: "managerLoopEvents", sessionId: "mls-12345678", afterSeq: 0 });
+  await flush();
+
+  const eventsPost = view.posts.find((p) => p.type === "managerLoopEvents");
+  assert.ok(eventsPost, "events reply posted");
+  assert.equal(eventsPost.payload.ok, false);
+  assert.equal(eventsPost.payload.error, "manager_reply_superseded");
+  assert.equal(eventsPost.payload.session_id, "mls-12345678");
+});
+
+// ── Superseded is silent and reschedules ──────────────────────────────────
+test("a superseded events reply is silent and reschedules polling", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-" + "a".repeat(32);
+  harness.state.managerChatRunning = true;
+  harness.posts.length = 0;
+
+  harness.api.renderManagerChatEventsResponse({ ok: false, error: "manager_reply_superseded", session_id: "mls-" + "a".repeat(32) });
+
+  assert.equal(harness.posts.length, 0, "no notice or status post");
+  assert.ok(harness.timers.length > 0, "poll rescheduled");
+});
+
+// ── Poll error backoff ────────────────────────────────────────────────────
+test("a status ok:false shows a notice but does not stop polling", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-" + "a".repeat(32);
+  harness.state.managerChatRunning = true;
+
+  harness.api.renderManagerChatStatus({ ok: false, error: "timeout" });
+
+  assert.ok(harness.timers.length > 0, "poll timer rescheduled");
+  assert.equal(harness.elements.managerChatNotice.hidden, false);
+});
+
+test("consecutive poll errors double the delay up to 30 s and reset on ok", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-" + "a".repeat(32);
+  harness.state.managerChatRunning = true;
+
+  harness.api.renderManagerChatStatus({ ok: false, error: "e1" });
+  harness.api.renderManagerChatStatus({ ok: false, error: "e2" });
+  harness.api.renderManagerChatStatus({ ok: false, error: "e3" });
+
+  const lastTimer = harness.timers.filter((t) => t.id !== undefined).at(-1);
+  assert.ok(lastTimer, "poll timer exists");
+
+  harness.api.renderManagerChatStatus({ ok: true, running: false, session: null });
+  assert.equal(harness.state.managerChatPollErrors, 0);
+});
+
+// ── Watchdog ──────────────────────────────────────────────────────────────
+test("a session with no events reply for 15 s re-requests events", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-" + "a".repeat(32);
+  harness.state.managerChatRunning = true;
+  harness.posts.length = 0;
+
+  harness.api.scheduleManagerChatPoll();
+  assert.equal(harness.timers.length, 1, "the watchdog rides the one poll timer");
+  harness.timers[0].fn();
+  assert.equal(harness.posts.filter((p) => p.type === "managerLoopEvents").length, 1, "the tick requests events");
+
+  // No reply arrives: exactly one live timer remains, the 15 s watchdog
+  // (the fake keeps fired timers in the list, so match the live id).
+  const live = () => harness.timers.filter((t) => t.id === harness.state.managerChatPollTimer);
+  assert.equal(live().length, 1, "one watchdog timer");
+  assert.equal(live()[0].delay, 15000);
+
+  live()[0].fn();
+  assert.equal(harness.posts.filter((p) => p.type === "managerLoopEvents").length, 2, "the watchdog re-requests events");
+  assert.equal(live().length, 1, "and re-arms itself");
+  assert.equal(live()[0].delay, 15000);
+});
+
+// ── Pending FIFO ──────────────────────────────────────────────────────────
+test("two quick sends where the second is refused restore the second text", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-" + "a".repeat(32);
+  harness.state.managerChatRunning = true;
+  harness.state.managerChatPendingSends = [
+    { text: "first message", images: [] },
+    { text: "second message", images: [] },
+  ];
+  harness.elements.managerChatInput.value = "";
+
+  harness.api.renderManagerChatAction("send", { ok: true, session_id: "mls-" + "a".repeat(32) });
+
+  assert.equal(harness.state.managerChatPendingSends.length, 1, "oldest shifted");
+  assert.equal(harness.state.managerChatPendingSends[0].text, "second message");
+
+  harness.api.renderManagerChatAction("send", { ok: false, error: "manager_turn_in_progress" });
+
+  assert.ok(harness.elements.managerChatInput.value.includes("second message"), "refused text restored");
+});
+
+test("pending sends render as Sending rows before server queued rows", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatPendingSends = [{ text: "local pending", images: [] }];
+
+  harness.api.renderManagerChatStatus({
+    ok: true,
+    running: false,
+    session: null,
+    send_queue: [{ text: "server queued" }],
+  });
+
+  const text = flattenNodes(harness.elements.managerChatQueue, []).map((part) => String(part.textContent || "")).join("");
+  assert.ok(text.indexOf("Sending") !== -1 && text.indexOf("local pending") !== -1, "pending row rendered");
+  assert.ok(text.indexOf("local pending") < text.indexOf("server queued"), "pending rows come first");
+});
+
+test("a submit renders a Sending row at once and its send reply removes it", () => {
+  const harness = loadWebviewSlice();
+  harness.elements.managerChatBackendSelect.value = "codex_cli";
+  harness.elements.managerChatModelInput.value = "gpt-x";
+  harness.elements.managerChatInput.value = "hello there";
+  const queueText = () => flattenNodes(harness.elements.managerChatQueue, []).map((part) => String(part.textContent || "")).join("");
+
+  trigger(harness.elements.managerChatComposer, "submit");
+  assert.equal(harness.posts.filter((post) => post.type === "managerLoopSend").length, 1);
+  assert.equal(harness.elements.managerChatQueue.hidden, false);
+  assert.match(queueText(), /Sending/);
+  assert.match(queueText(), /hello there/);
+
+  harness.api.renderManagerChatAction("send", { ok: true, session: { session_id: "mls-" + "a".repeat(32) }, running: true });
+  assert.equal(harness.state.managerChatPendingSends.length, 0);
+  assert.equal(harness.elements.managerChatQueue.hidden, true);
+  assert.doesNotMatch(queueText(), /Sending/);
+});
+
+// ── Idle new-turn status pull ─────────────────────────────────────────────
+test("an idle events reply with a newer non-terminal turn posts exactly one managerLoopStatus", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-" + "a".repeat(32);
+  harness.state.managerChatRunning = false;
+  harness.state.managerChatHighestSeenTurn = 1;
+  harness.posts.length = 0;
+
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    events: [{ seq: 10, type: "assistant_text", turn: 3, payload: { text: "hi" } }],
+  });
+
+  const statusCount = harness.posts.filter((p) => p.type === "managerLoopStatus").length;
+  assert.equal(statusCount, 1);
+});
+
+// ── session_not_found / last_seq / has_more ──────────────────────────────
+test("session_not_found stops polling and pulls status", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-" + "a".repeat(32);
+  harness.state.managerChatRunning = true;
+  harness.posts.length = 0;
+
+  harness.api.renderManagerChatEventsResponse({ ok: false, error: "session_not_found", session_id: "mls-" + "a".repeat(32) });
+
+  assert.deepEqual(plain(harness.posts.at(-1)), { type: "managerLoopStatus" });
+});
+
+test("last_seq below the cursor resets events and re-requests", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-" + "a".repeat(32);
+  harness.state.managerChatRunning = true;
+  harness.state.managerChatLastSeq = 20;
+  harness.state.managerChatEvents = [{ seq: 20, type: "turn_end", turn: 1, payload: {} }];
+  harness.posts.length = 0;
+
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    events: [],
+    last_seq: 5,
+    session_id: "mls-" + "a".repeat(32),
+  });
+
+  assert.equal(harness.state.managerChatLastSeq, 0);
+  assert.equal(harness.state.managerChatEvents.length, 0);
+  assert.ok(harness.posts.some((p) => p.type === "managerLoopEvents"), "re-requested");
+});
+
+test("has_more requests the next page immediately", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-" + "a".repeat(32);
+  harness.state.managerChatRunning = true;
+  harness.posts.length = 0;
+
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    events: [{ seq: 3, type: "assistant_text", turn: 1, payload: { text: "hi" } }],
+    has_more: true,
+    session_id: "mls-" + "a".repeat(32),
+  });
+
+  assert.ok(harness.posts.some((p) => p.type === "managerLoopEvents"), "next page requested");
+});
+
+// ── Draft persistence ─────────────────────────────────────────────────────
+test("the draft survives a reload via vscode state", () => {
+  const harness = loadWebviewSlice();
+  harness.elements.managerChatInput.value = "draft text";
+  trigger(harness.elements.managerChatInput, "input");
+  assert.equal(harness.state.managerChatDraft, "draft text");
+});
+
+// ── Up/Down arrow history ─────────────────────────────────────────────────
+test("Up-arrow in an empty composer recalls the last sent message", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSentHistory = ["first sent", "second sent"];
+  harness.state.managerChatHistoryIndex = -1;
+  harness.elements.managerChatInput.value = "";
+
+  trigger(harness.elements.managerChatInput, "keydown", { key: "ArrowUp" });
+
+  assert.equal(harness.elements.managerChatInput.value, "second sent");
+});
+
+test("Down-arrow walks forward through history", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSentHistory = ["first sent", "second sent"];
+  harness.state.managerChatHistoryIndex = 0;
+  harness.elements.managerChatInput.value = "first sent";
+
+  trigger(harness.elements.managerChatInput, "keydown", { key: "ArrowDown" });
+
+  assert.equal(harness.elements.managerChatInput.value, "second sent");
+});
+
+test("Up-arrow walks back past the last message and Down walks forward again", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSentHistory = ["older sent", "newer sent"];
+  harness.state.managerChatHistoryIndex = -1;
+  harness.elements.managerChatInput.value = "";
+
+  trigger(harness.elements.managerChatInput, "keydown", { key: "ArrowUp" });
+  trigger(harness.elements.managerChatInput, "keydown", { key: "ArrowUp" });
+  assert.equal(harness.elements.managerChatInput.value, "older sent");
+
+  trigger(harness.elements.managerChatInput, "keydown", { key: "ArrowDown" });
+  assert.equal(harness.elements.managerChatInput.value, "newer sent");
+});
+
+test("typing ends history browsing", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSentHistory = ["only sent"];
+  harness.elements.managerChatInput.value = "";
+  trigger(harness.elements.managerChatInput, "keydown", { key: "ArrowUp" });
+  assert.equal(harness.state.managerChatHistoryIndex, 0);
+
+  harness.elements.managerChatInput.value = "only sent!";
+  trigger(harness.elements.managerChatInput, "input");
+  assert.equal(harness.state.managerChatHistoryIndex, -1);
+  trigger(harness.elements.managerChatInput, "keydown", { key: "ArrowUp" });
+  assert.equal(harness.elements.managerChatInput.value, "only sent!", "a typed draft is not replaced");
 });

@@ -93,6 +93,14 @@ const state = {
   managerChatLastSeq: 0,
   managerChatPollTimer: null,
   managerChatCollapsed: Boolean(persisted.managerChatCollapsed),
+  managerChatPendingSends: [],
+  managerChatSentHistory: [],
+  managerChatHistoryIndex: -1,
+  managerChatPollErrors: 0,
+  managerChatPollNoticeFromError: false,
+  managerChatHighestSeenTurn: 0,
+  managerChatQueuePayload: null,
+  managerChatDraft: String(persisted.managerChatDraft || ""),
 };
 
 let readyRetryTimer = null;
@@ -106,6 +114,7 @@ function persistState() {
     sort: state.sort,
     planScope: state.planScope,
     managerChatCollapsed: Boolean(state.managerChatCollapsed),
+    managerChatDraft: state.managerChatDraft || "",
   });
 }
 
@@ -363,9 +372,6 @@ const elements = {
   managerChatNewSession: document.querySelector("#manager-chat-new-session"),
   managerChatSessionId: document.querySelector("#manager-chat-session-id"),
   managerChatSessionBackend: document.querySelector("#manager-chat-session-backend"),
-  managerChatTasksHead: document.querySelector("#manager-chat-tasks-head"),
-  managerChatTasksList: document.querySelector("#manager-chat-tasks-list"),
-  managerChatTaskFilter: document.querySelector("#manager-chat-task-filter"),
   managerChatTranscript: document.querySelector("#manager-chat-transcript"),
   managerChatLatest: document.querySelector("#manager-chat-latest"),
   managerChatAnnouncer: document.querySelector("#manager-chat-announcer"),
@@ -4130,7 +4136,6 @@ function renderSnapshot(snapshot) {
   }
   renderFilterOptions();
   renderTaskTable();
-  if (typeof renderManagerChatTaskBoard === "function") renderManagerChatTaskBoard();
   renderStats(elements.topicStats, snapshot.summaries && snapshot.summaries.topics);
   renderStats(elements.runnerStats, snapshot.summaries && snapshot.summaries.runners);
   renderKpis(snapshot);
@@ -7505,114 +7510,6 @@ renderHeaderSignals();
 // while a session is active. Every event payload is untrusted model/tool
 // output, so every string below is written through createElement's textContent
 // assignment or document.createTextNode -- never innerHTML (see createElement).
-function managerChatTaskStatus(task) {
-  return String((task && (task.status || task.worker_status)) || "unknown");
-}
-
-function managerChatTaskRank(status) {
-  const order = ["processing", "review", "review_ready", "blocked", "pending"];
-  const index = order.indexOf(status);
-  return index === -1 ? order.length : index;
-}
-
-const MANAGER_CHAT_TASK_CLOSED = new Set([
-  "accepted", "rejected", "superseded", "cancelled", "canceled", "done", "completed", "archived"
-]);
-const MANAGER_CHAT_TASK_LIMIT = 40;
-
-function managerChatTaskFilterValue() {
-  const select = elements.managerChatTaskFilter;
-  const value = select && select.value ? String(select.value) : "open";
-  return value || "open";
-}
-
-function managerChatTaskVisible(status, filter) {
-  if (filter === "all") return true;
-  if (filter === "review") return status === "review" || status === "review_ready";
-  if (filter === "open") return !MANAGER_CHAT_TASK_CLOSED.has(status);
-  return status === filter;
-}
-
-function managerChatTaskVerb(status) {
-  if (status === "pending") return "launch";
-  if (status === "review" || status === "review_ready") return "review";
-  if (status === "blocked") return "recover";
-  if (status === "processing") return "inspect";
-  return "drive";
-}
-
-function renderManagerChatTaskBoard() {
-  const list = elements.managerChatTasksList;
-  const head = elements.managerChatTasksHead;
-  if (!list) return;
-  const tasks = Array.isArray(state.tasks) ? state.tasks : [];
-  const filter = managerChatTaskFilterValue();
-  const counts = {};
-  for (const task of tasks) {
-    const status = managerChatTaskStatus(task);
-    counts[status] = (counts[status] || 0) + 1;
-  }
-  const matched = tasks.filter((task) => managerChatTaskVisible(managerChatTaskStatus(task), filter));
-  if (head) {
-    const review = (counts.review || 0) + (counts.review_ready || 0);
-    const extra = matched.length > MANAGER_CHAT_TASK_LIMIT ? " · showing " + MANAGER_CHAT_TASK_LIMIT + " of " + matched.length : "";
-    head.textContent = "Tasks · " + tasks.length + " · " + (counts.processing || 0) + " running · " + review + " review · " + (counts.pending || 0) + " pending" + extra;
-  }
-  const shown = matched
-    .slice()
-    .sort((left, right) => managerChatTaskRank(managerChatTaskStatus(left)) - managerChatTaskRank(managerChatTaskStatus(right)))
-    .slice(0, MANAGER_CHAT_TASK_LIMIT);
-  if (shown.length === 0) {
-    list.replaceChildren(createElement("div", "panel-list-empty compact", tasks.length === 0 ? "No canonical tasks yet" : "No tasks in this filter"));
-    return;
-  }
-  const fragment = document.createDocumentFragment();
-  for (const task of shown) {
-    const taskId = String(task.task_id || "");
-    if (!taskId) continue;
-    const status = managerChatTaskStatus(task);
-    const button = createElement("button", "manager-chat-task");
-    button.type = "button";
-    if (!button.dataset) button.dataset = {};
-    button.dataset.taskId = taskId;
-    button.setAttribute("data-task-id", taskId);
-    button.appendChild(createElement("span", "manager-chat-task-verb", managerChatTaskVerb(status)));
-    button.appendChild(document.createTextNode(" "));
-    button.appendChild(createElement("span", "manager-chat-task-status", status));
-    button.appendChild(document.createTextNode(" "));
-    button.appendChild(createElement("span", "manager-chat-task-id", taskId));
-    const title = String(task.title || task.objective || task.topic || "");
-    if (title) {
-      button.appendChild(document.createTextNode(" "));
-      button.appendChild(createElement("span", "manager-chat-task-title", title));
-    }
-    fragment.appendChild(button);
-  }
-  list.replaceChildren(fragment);
-}
-
-function driveManagerChatTask(taskId) {
-  const id = String(taskId || "").trim();
-  if (!id) return;
-  const tasks = Array.isArray(state.tasks) ? state.tasks : [];
-  const task = tasks.find((item) => String(item && item.task_id || "") === id);
-  const status = task ? managerChatTaskStatus(task) : "unknown";
-  const verb = managerChatTaskVerb(status);
-  const route = managerChatSelectedRoute();
-  const backendId = route.backendId;
-  const model = route.model;
-  if (!MANAGER_CHAT_BACKENDS.has(backendId) || !model) {
-    showManagerChatNotice("Choose a model. This saved session will drive the task.");
-    return;
-  }
-  vscode.postMessage({
-    type: "managerLoopSend",
-    text: verb + " canonical task " + id + " (" + status + ") from this manager session. Inspect it, then launch, review, or recover it. Do not open a second session.",
-    backendId,
-    model,
-    reasoning: String(elements.managerChatReasoningSelect && elements.managerChatReasoningSelect.value || ""),
-  });
-}
 
 function showManagerChatNotice(message) {
   if (!elements.managerChatNotice) return;
@@ -7814,9 +7711,11 @@ function requestManagerChatEvents() {
   vscode.postMessage({ type: "managerLoopEvents", sessionId: state.managerChatSession, afterSeq: state.managerChatLastSeq });
 }
 
-function scheduleManagerChatPoll() {
+function scheduleManagerChatPoll(overrideMs) {
   stopManagerChatPolling();
-  const delay = state.managerChatRunning ? 400 : MANAGER_CHAT_POLL_MS;
+  const base = state.managerChatRunning ? 400 : MANAGER_CHAT_POLL_MS;
+  const errors = state.managerChatPollErrors || 0;
+  const delay = overrideMs || Math.min(base * Math.pow(2, errors), 30000);
   state.managerChatPollTimer = window.setTimeout(() => {
     state.managerChatPollTimer = null;
     if (state.managerChatSession) {
@@ -7829,6 +7728,8 @@ function scheduleManagerChatPoll() {
         vscode.postMessage({ type: "managerLoopStatus" });
       }
       requestManagerChatEvents();
+      // Watchdog: a reply re-arms the normal cadence (replacing this timer); if none arrives this re-requests in 15 s.
+      scheduleManagerChatPoll(15000);
     }
   }, delay);
 }
@@ -7857,9 +7758,19 @@ function ensureManagerChatQueueHost() {
 }
 
 function renderManagerChatSendQueue(payload) {
+  if (payload) state.managerChatQueuePayload = payload; else payload = state.managerChatQueuePayload;
   const host = ensureManagerChatQueueHost();
-  const items = asArray(payload && payload.send_queue);
   const rows = [];
+  // Pending local sends render as "Sending" rows before server queued rows.
+  for (const entry of asArray(state.managerChatPendingSends)) {
+    const text = entry && entry.text ? String(entry.text) : "";
+    if (!text) continue;
+    const row = createElement("li", "manager-chat-queued-send");
+    row.appendChild(createElement("span", "manager-chat-bubble-label", "Sending"));
+    row.appendChild(document.createTextNode(text));
+    rows.push(row);
+  }
+  const items = asArray(payload && payload.send_queue);
   for (const item of items) {
     const text = managerChatQueueText(item);
     if (!text) continue;
@@ -7934,9 +7845,23 @@ function renderManagerChatSessionPicker(payload) {
 
 function renderManagerChatStatus(payload) {
   if (!payload || payload.ok === false) {
-    stopManagerChatPolling();
-    showManagerChatNotice(payload && payload.error ? `Manager error: ${payload.error}` : "Manager status unavailable");
+    const error = payload && payload.error ? String(payload.error) : "";
+    if (error === "manager_reply_superseded") {
+      // Silent: the webview is no longer bound to the client that answered;
+      // reschedule so polling survives the binding change.
+      scheduleManagerChatPoll();
+      return;
+    }
+    state.managerChatPollErrors = (state.managerChatPollErrors || 0) + 1;
+    state.managerChatPollNoticeFromError = true;
+    showManagerChatNotice(error ? `Manager error: ${error}` : "Manager status unavailable");
+    scheduleManagerChatPoll();
     return;
+  }
+  state.managerChatPollErrors = 0;
+  if (state.managerChatPollNoticeFromError) {
+    state.managerChatPollNoticeFromError = false;
+    showManagerChatNotice(null);
   }
   const session = payload.session && typeof payload.session === "object" ? payload.session : null;
   const nextSessionId = session ? String(session.session_id || "") || null : null;
@@ -7974,37 +7899,81 @@ function renderManagerChatStatus(payload) {
 function renderManagerChatEventsResponse(payload) {
   if (payload && payload.session_id && payload.session_id !== state.managerChatSession) return;
   if (!payload || payload.ok === false) {
-    showManagerChatNotice(payload && payload.error ? `Manager error: ${payload.error}` : "Manager events unavailable");
-  } else {
-    // Two events requests can be in flight with the same after_seq (the status
-    // reply and the poll timer); keep only events newer than the last one seen.
-    const events = asArray(payload.events).filter((event) => numberValue(event.seq) > state.managerChatLastSeq);
-    if (events.length > 0) {
-      state.managerChatEvents = state.managerChatEvents.concat(events);
-      state.managerChatLastSeq = events.reduce((max, event) => Math.max(max, numberValue(event.seq)), state.managerChatLastSeq);
-      if (state.managerChatRunning) applyManagerChatSessionUi();
-      // Failed turns carry `error` with no `turn_end`; a rotation ends the
-      // session with `session_close`. Any of them stops the Thinking timer,
-      // whether or not the panel knew a (callback) turn was running.
-      const terminal = events.some((event) => event && (event.type === "turn_end" || event.type === "error" || event.type === "session_close"));
-      if (terminal && state.managerChatThinkingSince) {
-        state.managerChatLastThoughtMs = Date.now() - state.managerChatThinkingSince;
-        state.managerChatThinkingSince = 0;
-      }
-      // A finished turn still needs one status pull: running and send_queue
-      // are authoritative only on status, and nothing else refreshes them
-      // after a background turn ends. The composer stays enabled either way.
-      // A closed session always pulls it: the server already runs (or will
-      // open) the successor, and only status names it.
-      const closed = events.some((event) => event && event.type === "session_close");
-      if ((state.managerChatRunning && terminal) || closed) {
-        state.managerChatRunning = false;
-        applyManagerChatSessionUi();
+    const error = payload && payload.error ? String(payload.error) : "";
+    if (error === "manager_reply_superseded") {
+      scheduleManagerChatPoll();
+      return;
+    }
+    if (error === "session_not_found") {
+      stopManagerChatPolling();
+      vscode.postMessage({ type: "managerLoopStatus" });
+      return;
+    }
+    state.managerChatPollErrors = (state.managerChatPollErrors || 0) + 1;
+    state.managerChatPollNoticeFromError = true;
+    showManagerChatNotice(error ? `Manager error: ${error}` : "Manager events unavailable");
+    scheduleManagerChatPoll();
+    return;
+  }
+  state.managerChatPollErrors = 0;
+  if (state.managerChatPollNoticeFromError) {
+    state.managerChatPollNoticeFromError = false;
+    showManagerChatNotice(null);
+  }
+  // Backend cursor went backwards (e.g. a rotation): reset and re-request.
+  const backendLastSeq = numberValue(payload.last_seq);
+  if (backendLastSeq > 0 && backendLastSeq < state.managerChatLastSeq) {
+    state.managerChatEvents = [];
+    managerConsoleReset();
+    state.managerChatLastSeq = 0;
+    renderManagerChatEvents();
+    requestManagerChatEvents();
+    return;
+  }
+  // Two events requests can be in flight with the same after_seq (the status
+  // reply and the poll timer); keep only events newer than the last one seen.
+  const events = asArray(payload.events).filter((event) => numberValue(event.seq) > state.managerChatLastSeq);
+  if (events.length > 0) {
+    state.managerChatEvents = state.managerChatEvents.concat(events);
+    state.managerChatLastSeq = events.reduce((max, event) => Math.max(max, numberValue(event.seq)), state.managerChatLastSeq);
+    if (state.managerChatRunning) applyManagerChatSessionUi();
+    // Failed turns carry `error` with no `turn_end`; a rotation ends the
+    // session with `session_close`; a stopped turn carries `turn_stopped`.
+    // Any of them stops the Thinking timer.
+    const terminal = events.some((event) => event && (event.type === "turn_end" || event.type === "error" || event.type === "session_close" || event.type === "turn_stopped"));
+    if (terminal && state.managerChatThinkingSince) {
+      state.managerChatLastThoughtMs = Date.now() - state.managerChatThinkingSince;
+      state.managerChatThinkingSince = 0;
+    }
+    // A finished turn still needs one status pull: running and send_queue
+    // are authoritative only on status, and nothing else refreshes them
+    // after a background turn ends. The composer stays enabled either way.
+    // A closed session always pulls it: the server already runs (or will
+    // open) the successor, and only status names it.
+    const closed = events.some((event) => event && event.type === "session_close");
+    if ((state.managerChatRunning && terminal) || closed) {
+      state.managerChatRunning = false;
+      applyManagerChatSessionUi();
+      vscode.postMessage({ type: "managerLoopStatus" });
+    }
+    // When idle, a new non-terminal event with a turn above any seen pulls
+    // one status to pick up the running flag for a callback-started turn.
+    if (!state.managerChatRunning && !terminal) {
+      const maxTurn = events.reduce((max, event) => Math.max(max, numberValue(event.turn)), 0);
+      if (maxTurn > state.managerChatHighestSeenTurn) {
+        state.managerChatHighestSeenTurn = maxTurn;
         vscode.postMessage({ type: "managerLoopStatus" });
       }
+    } else if (terminal) {
+      const maxTurn = events.reduce((max, event) => Math.max(max, numberValue(event.turn)), 0);
+      if (maxTurn > state.managerChatHighestSeenTurn) state.managerChatHighestSeenTurn = maxTurn;
     }
-    state.managerChatPartial = managerConsolePartialIsCurrent(payload.partial) ? payload.partial : null;
-    managerConsoleScheduleRender();
+  }
+  state.managerChatPartial = managerConsolePartialIsCurrent(payload.partial) ? payload.partial : null;
+  managerConsoleScheduleRender();
+  if (payload.has_more) {
+    requestManagerChatEvents();
+    return;
   }
   if (state.managerChatSession) {
     scheduleManagerChatPoll();
@@ -8012,21 +7981,19 @@ function renderManagerChatEventsResponse(payload) {
 }
 
 function renderManagerChatAction(action, payload) {
-  const pendingText = action === "send" ? state.managerChatPendingText : "";
-  const pendingImages = action === "send" ? asArray(state.managerChatPendingImages) : [];
-  if (action === "send") {
-    state.managerChatPendingText = "";
-    state.managerChatPendingImages = [];
-  }
+  const pendingEntry = action === "send" ? (state.managerChatPendingSends.length ? state.managerChatPendingSends.shift() : null) : null;
+  if (action === "send") renderManagerChatSendQueue();
+  const pendingText = pendingEntry ? pendingEntry.text : "";
+  const pendingImages = pendingEntry ? asArray(pendingEntry.images) : [];
   if (payload && payload.ok === false) {
     if (action === "send") {
-      // The submit set Running optimistically; a refusal ran nothing, so the
-      // phantom turn and its Thinking timer go (status follows and corrects
-      // it if another turn really runs), and the refused words come back.
       state.managerChatRunning = false;
       state.managerChatThinkingSince = 0;
-      if (pendingText && elements.managerChatInput && !elements.managerChatInput.value) {
-        elements.managerChatInput.value = pendingText;
+      if (pendingText) {
+        const existing = elements.managerChatInput && elements.managerChatInput.value;
+        if (elements.managerChatInput) {
+          elements.managerChatInput.value = existing ? existing + "\n" + pendingText : pendingText;
+        }
       }
       if (pendingImages.length && asArray(state.managerChatImages).length === 0) {
         state.managerChatImages = pendingImages;
@@ -8040,6 +8007,11 @@ function renderManagerChatAction(action, payload) {
         ? "A manager turn is already running."
         : `Manager error: ${payload.error || "unknown"}`,
     );
+    return;
+  }
+  if (action === "stop") {
+    // Running stays until the terminal event (turn_stopped / turn_end) arrives.
+    showManagerChatNotice(null);
     return;
   }
   if (action === "close") {
@@ -8663,7 +8635,6 @@ function startManagerChatSidebar() {
   resetManagerChatSession();
   vscode.postMessage({ type: "managerLoopStatus" });
   vscode.postMessage({ type: "managerLoopRestore" });
-  renderManagerChatTaskBoard();
 }
 
 if (elements.managerChatLatest && typeof elements.managerChatLatest.addEventListener === "function") {
@@ -8711,9 +8682,7 @@ if (elements.managerChatSessionSelect && typeof elements.managerChatSessionSelec
 if (elements.managerChatRenameSession && typeof elements.managerChatRenameSession.addEventListener === "function") {
   elements.managerChatRenameSession.addEventListener("click", () => {
     if (elements.managerChatRenameSession.disabled || !state.managerChatSession) return;
-    const title = String(window.prompt("Session name", state.managerChatTitle || "") || "").trim();
-    if (!title) return;
-    vscode.postMessage({ type: "managerLoopRename", sessionId: state.managerChatSession, title });
+    vscode.postMessage({ type: "managerLoopRename", sessionId: state.managerChatSession, currentTitle: state.managerChatTitle || "" });
   });
 }
 
@@ -8750,11 +8719,6 @@ if (elements.managerChatStop && typeof elements.managerChatStop.addEventListener
   elements.managerChatStop.addEventListener("click", () => {
     if (elements.managerChatStop.disabled) return;
     vscode.postMessage({ type: "managerLoopStop" });
-  });
-}
-if (elements.managerChatTaskFilter && typeof elements.managerChatTaskFilter.addEventListener === "function") {
-  elements.managerChatTaskFilter.addEventListener("change", () => {
-    renderManagerChatTaskBoard();
   });
 }
 // Owner image attachments (paste, drop, Attach). Mirrors the server limits in
@@ -8830,6 +8794,26 @@ elements.managerChatComposer.addEventListener("drop", (event) => {
   attachManagerChatImages(event.dataTransfer && event.dataTransfer.files);
 });
 elements.managerChatInput.addEventListener("keydown", (event) => {
+  if (event.key === "ArrowUp" && (!elements.managerChatInput.value || state.managerChatHistoryIndex >= 0) && state.managerChatSentHistory.length) {
+    event.preventDefault();
+    if (state.managerChatHistoryIndex < 0) state.managerChatHistoryIndex = state.managerChatSentHistory.length;
+    if (state.managerChatHistoryIndex > 0) {
+      state.managerChatHistoryIndex -= 1;
+      elements.managerChatInput.value = state.managerChatSentHistory[state.managerChatHistoryIndex];
+    }
+    return;
+  }
+  if (event.key === "ArrowDown" && state.managerChatHistoryIndex >= 0) {
+    event.preventDefault();
+    state.managerChatHistoryIndex += 1;
+    if (state.managerChatHistoryIndex >= state.managerChatSentHistory.length) {
+      state.managerChatHistoryIndex = -1;
+      elements.managerChatInput.value = "";
+    } else {
+      elements.managerChatInput.value = state.managerChatSentHistory[state.managerChatHistoryIndex];
+    }
+    return;
+  }
   if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
   event.preventDefault();
   elements.managerChatComposer.requestSubmit();
@@ -8851,12 +8835,6 @@ elements.managerChatComposer.addEventListener("submit", (event) => {
     elements.managerChatInput.value = "";
     return;
   }
-  const taskCommand = text.match(/^\/task\s+(\S+)$/);
-  if (taskCommand) {
-    driveManagerChatTask(taskCommand[1]);
-    elements.managerChatInput.value = "";
-    return;
-  }
   if (!MANAGER_CHAT_BACKENDS.has(backendId) || !model) {
     showManagerChatNotice("Choose a model. This session continues on that model.");
     return;
@@ -8870,26 +8848,44 @@ elements.managerChatComposer.addEventListener("submit", (event) => {
   };
   if (images.length) send.images = images;
   vscode.postMessage(send);
-  // Kept until the send's reply: a refusal puts them back in the composer.
-  state.managerChatPendingText = text;
-  state.managerChatPendingImages = images;
+  // FIFO: each send pushes; each send reply shifts the oldest.
+  state.managerChatPendingSends.push({ text, images });
+  renderManagerChatSendQueue();
+  state.managerChatSentHistory.push(text);
+  if (state.managerChatSentHistory.length > 20) state.managerChatSentHistory.shift();
+  state.managerChatHistoryIndex = -1;
   state.managerChatImages = [];
   renderManagerChatAttachments();
   elements.managerChatInput.value = "";
+  state.managerChatDraft = "";
+  persistState();
   // Optimistic Running label only. The composer stays enabled so the next
   // send can be queued; status.send_queue is what renders that queue.
   state.managerChatRunning = true;
   applyManagerChatSessionUi();
 });
 
-if (elements.managerChatTasksList && typeof elements.managerChatTasksList.addEventListener === "function") {
-  elements.managerChatTasksList.addEventListener("click", (event) => {
-    const target = event.target;
-    const button = target && typeof target.closest === "function" ? target.closest("[data-task-id]") : target;
-    const taskId = button && button.dataset ? button.dataset.taskId : "";
-    if (taskId) driveManagerChatTask(taskId);
+// Scroll listener: show the "latest" button when scrolled away from the bottom.
+if (elements.managerChatTranscript && typeof elements.managerChatTranscript.addEventListener === "function") {
+  elements.managerChatTranscript.addEventListener("scroll", () => {
+    const box = elements.managerChatTranscript;
+    const atBottom = box.scrollHeight - box.scrollTop - (box.clientHeight || 0) < 24;
+    if (elements.managerChatLatest) elements.managerChatLatest.hidden = atBottom;
   });
 }
+
+// Draft persistence: save the composer text on every input change.
+if (elements.managerChatInput && typeof elements.managerChatInput.addEventListener === "function") {
+  elements.managerChatInput.addEventListener("input", () => {
+    state.managerChatDraft = elements.managerChatInput.value;
+    // Typing ends history browsing.
+    state.managerChatHistoryIndex = -1;
+    persistState();
+  });
+  // Restore the draft saved by a previous webview lifecycle.
+  if (state.managerChatDraft) elements.managerChatInput.value = state.managerChatDraft;
+}
+
 // The shipped markup starts the composer disabled. A sidebar must not wait
 // for a dialog open before the owner can type, including during a turn.
 applyManagerChatComposerState();
