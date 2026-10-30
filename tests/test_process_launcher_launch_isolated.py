@@ -142,6 +142,9 @@ class _StubManager:
     def _blocked(self, *args: object, **kwargs: object) -> dict[str, object]:
         return process_launcher.ProcessManager._blocked(self, *args, **kwargs)
 
+    def _admission_deferral(self, *args: object, **kwargs: object) -> dict[str, object] | None:
+        return process_launcher.ProcessManager._admission_deferral(self, *args, **kwargs)
+
 
 def _launch(manager: _StubManager, **overrides: object) -> dict[str, object]:
     kwargs: dict[str, object] = {

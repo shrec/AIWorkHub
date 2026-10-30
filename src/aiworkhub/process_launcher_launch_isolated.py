@@ -97,6 +97,7 @@ LAUNCH_ISOLATED_SEAM_NAMES: tuple[str, ...] = (
     "hashlib",
     "json",
     "kilo_auth",
+    "launch_admission",
     "launch_gates_open",
     "nullcontext",
     "os",
@@ -324,6 +325,7 @@ def launch_isolated(
     hashlib = _pl.hashlib
     json = _pl.json
     kilo_auth = _pl.kilo_auth
+    launch_admission = _pl.launch_admission
     launch_gates_open = _pl.launch_gates_open
     nullcontext = _pl.nullcontext
     os = _pl.os
@@ -480,7 +482,7 @@ def launch_isolated(
         memory_admission = (
             self._await_reviewer_admission(_memory_launch_admission)
             if reserved_request_id is not None
-            else _pl.launch_admission.await_memory_admission(
+            else launch_admission.await_memory_admission(
                 kind="worker", probe=_memory_launch_admission, wait_seconds=0
             )
         )
