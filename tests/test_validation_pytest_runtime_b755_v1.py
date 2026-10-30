@@ -185,6 +185,65 @@ class TestApprovedSitePythonpath(unittest.TestCase):
             "trusted_pytest_runtime_and_candidate_imports",
         )
 
+    @unittest.skipUnless(os.name == "nt", "covers the Windows in-process path")
+    def test_windows_in_process_pytest_denied_active_root_is_not_prepended(
+        self,
+    ) -> None:
+        scratch = self.root / "validation-scratch"
+        scratch.mkdir()
+        denied = self.root / "denied-pytest-root"
+        completed = worker_workspace.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+        real_approved = worker_workspace._approved_pythonpath_site
+
+        def approved(component: str) -> Path:
+            if component == str(denied):
+                raise PermissionError(5, "Access is denied", component)
+            return real_approved(component)
+
+        with mock.patch.object(
+            worker_workspace,
+            "provision_validation_exec_scratch",
+            return_value=scratch,
+        ), mock.patch.object(
+            worker_workspace, "cleanup_validation_exec_scratch"
+        ), mock.patch.object(
+            worker_workspace,
+            "resolve_trusted_pytest_runtime_root",
+            return_value=self.site.resolve(),
+        ), mock.patch.object(
+            worker_workspace, "_current_pytest_runtime_root", return_value=denied
+        ), mock.patch.object(
+            worker_workspace, "_approved_pythonpath_site", side_effect=approved
+        ), mock.patch.object(
+            worker_workspace,
+            "_resolve_trusted_validation_executable",
+            side_effect=worker_workspace.WorkspaceError(
+                "validation_executable_unavailable:pytest"
+            ),
+        ), mock.patch.object(
+            worker_workspace,
+            "_select_module_validator_interpreter",
+            return_value=(
+                None,
+                "validation_executable_no_trusted_interpreter:pytest",
+            ),
+        ), mock.patch.object(
+            worker_workspace.subprocess, "run", return_value=completed
+        ) as run:
+            results = worker_workspace.run_validations(
+                self.workspace,
+                ["python -m pytest --version"],
+                backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+                adapter_id="glm_vscode_lm",
+            )
+
+        self.assertEqual(results[0]["returncode"], 0)
+        env = run.call_args.kwargs["env"]
+        self.assertIn("PYTHONPATH", env)
+        self.assertNotIn(str(denied), env["PYTHONPATH"])
+
 
 @unittest.skipIf(os.name == "nt", "requires POSIX ownership and sandbox semantics")
 class _TolerateNestedSeccompChmodDenial(unittest.TestCase):

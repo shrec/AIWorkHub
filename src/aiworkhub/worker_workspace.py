@@ -4630,6 +4630,10 @@ def preflight_validation_capabilities(
         if isinstance(value, str) and value.strip()
     )
     for command in rows:
+        if command.startswith("lane:"):
+            from .build_lane import preflight_requirements
+            missing.update(preflight_requirements(command))
+            continue
         try:
             argv, _components, _tmpdir, cwd_relative = (
                 _parse_validation_command_detailed(command)
@@ -8066,6 +8070,9 @@ def resolve_worker_validation_argv(
     and which is the only acceptance evidence -- is untouched by this function.
     """
 
+    if command.startswith("lane:"):
+        from .build_lane import resolve_lane_argv
+        return resolve_lane_argv(command)
     tokens, components, _tmpdir_override, cd_relative = (
         _parse_validation_command_detailed(command)
     )
@@ -13181,6 +13188,10 @@ def run_validations(
         if batch_short_tmp is not None:
             tmp_env_value = str(batch_short_tmp)
         for command in rows:
+            if command.startswith("lane:"):
+                from .build_lane import run_lane_validation
+                results.append(run_lane_validation(workspace, command))
+                continue
             (
                 tokens,
                 pythonpath_components,
@@ -13251,7 +13262,7 @@ def run_validations(
                         approved_active_root = _approved_pythonpath_site(
                             str(active_pytest_root)
                         )
-                    except WorkspaceError:
+                    except (WorkspaceError, OSError):
                         pass
                     else:
                         effective_components = (
