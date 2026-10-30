@@ -108,7 +108,8 @@ class ManagerSession:
     passive one leaves both empty, because its route belongs to each turn.
     ``previous_session_id`` names the closed session whose handoff a session continues.
     ``updated_at`` is when the owner last picked it (continue, restore, a route); that
-    pick renews the manager seat lease like a turn does.
+    pick renews the manager seat lease like a turn does. ``context_baseline_tokens`` is
+    the first measured turn's context on the provider conversation now bound to it.
     """
 
     session_id: str
@@ -124,6 +125,7 @@ class ManagerSession:
     previous_session_id: str | None = None
     title: str = ""
     updated_at: str = ""
+    context_baseline_tokens: int | None = None
 
     @property
     def passive(self) -> bool:
@@ -608,6 +610,8 @@ def _manager_rules() -> str:
             "Manager role:",
             "- This Manager Chat session holds the manager seat for this repository: you run the project, create/launch/review cards and decide by measurement.",
             "- The context section is history: any route, version, callback or blocker fact in it is stale until a live AIWorkHub MCP call confirms it; probe (aiworkhub_manager_bootstrap) instead of refusing on it.",
+            # NF-2026-01873: in-turn polling held turns open for the whole turn timeout.
+            "- Launched workers survive the end of your turn and their callbacks wake this session: after launching, or while waiting on workers, end the turn; never poll or sleep inside a turn.",
             *(f"- {rule}" for rule in rules),
         ]
     )
@@ -746,10 +750,10 @@ class ManagerOrchestrator:
     event writer. Once the provider-reported ``context_fill`` reaches ``rotate_fraction``
     (or, while none is reported, ``context_estimate_bytes`` reaches that fraction of
     ``context_window_bytes``), or the last call's context tokens (``context_fill`` x
-    ``context_window``) reach ``rotate_at_tokens`` (``None`` or ``0`` turns that ceiling
-    off), the session rotates and its successor starts on the same backend and model,
-    rehydrated from the handoff; an explicit ``start`` may pick any other backend and
-    model.
+    ``context_window``) have grown by ``rotate_at_tokens`` over the session's first measured
+    turn (``None`` or ``0`` turns that ceiling off), the session rotates and its successor
+    starts on the same backend and model, rehydrated from the handoff; an explicit
+    ``start`` may pick any other backend and model.
     """
 
     def __init__(
@@ -1094,11 +1098,11 @@ class ManagerOrchestrator:
             and (not backend_id or (loaded.backend_id, loaded.model) == (backend_id, model))
         ):
             # The running backend already serves this conversation on this route.
-            self._activate_selected(chosen)
+            self._activate_selected(chosen, explicit=True)
             chosen = loaded
         else:
             self._drop_backend()
-            chosen = self._activate_selected(chosen)
+            chosen = self._activate_selected(chosen, explicit=True)
         route = {"backend_id": backend_id, "model": model} if backend_id else {}
         chosen = self._owner_picked(chosen, **route)
         self.store.write_selection(chosen.session_id)
@@ -1182,7 +1186,8 @@ class ManagerOrchestrator:
                     closed_at=None,
                     context_estimate_bytes=session.context_estimate_bytes + len(brief.encode("utf-8")),
                 )
-            session = self._owner_picked(session)
+            # A started backend is a new provider conversation: its first turn sets a new baseline.
+            session = self._owner_picked(session, context_baseline_tokens=None)
             if not any(event.get("type") == "session_start" for event in self.store.events(session.session_id)):
                 self._record(session, session.turn_count, "session_start", {
                     "provider_ref": str(provider_ref),
@@ -1223,8 +1228,31 @@ class ManagerOrchestrator:
             self.store.clear_selection()
         return chosen
 
-    def _activate_selected(self, selected: ManagerSession) -> ManagerSession:
-        """Reopen ``selected`` if needed and retire every other active record."""
+    # The reasons a record is closed mechanically, by another conversation taking the seat;
+    # every other ``session_close`` reason was a rotation (``_rotate``) that retired it.
+    _RETIRE_REASONS = frozenset({"new_session", "session_switch", "stale_active_session"})
+
+    def _rotated(self, session: ManagerSession) -> bool:
+        """Whether ``session`` is closed and its last ``session_close`` was a rotation."""
+        if session.status == "active":
+            return False
+        closes = [
+            event for event in self.store.events(session.session_id)
+            if event.get("type") == "session_close"
+        ]
+        payload = closes[-1].get("payload") if closes else None
+        return isinstance(payload, Mapping) and payload.get("reason") not in self._RETIRE_REASONS
+
+    def _activate_selected(self, selected: ManagerSession, *, explicit: bool = False) -> ManagerSession:
+        """Reopen ``selected`` if needed and retire every other active record.
+
+        NF-2026-01873: only the owner's explicit continue (``explicit``) reopens a rotated
+        record. Otherwise the rotation stands: the selection is dropped and the conversation
+        continues in a successor attached to the latest handoff, never in the retired one.
+        """
+        if not explicit and self._rotated(selected):
+            self.store.clear_selection()
+            return self._retire_stale(keep_passive=True) or self._create_passive()
         if selected.status != "active":
             selected = dataclasses.replace(selected, status="active", closed_at=None)
             self.store.save(selected)
@@ -1431,8 +1459,15 @@ class ManagerOrchestrator:
             events.append(self._record(session, turn, "error", _not_ok("context_graph_event_write", written)))
             errors.append(events[-1]["payload"])
         grown += len(message.encode("utf-8"))
+        tokens = _measured_tokens(events)
+        baseline = session.context_baseline_tokens
+        if isinstance(baseline, bool) or not isinstance(baseline, int):
+            baseline = tokens
         session = dataclasses.replace(
-            session, turn_count=turn, context_estimate_bytes=session.context_estimate_bytes + grown
+            session,
+            turn_count=turn,
+            context_estimate_bytes=session.context_estimate_bytes + grown,
+            context_baseline_tokens=baseline,
         )
         self.store.save(session)
         self._session = session
@@ -1445,7 +1480,7 @@ class ManagerOrchestrator:
             "errors": errors,
             "context_estimate_bytes": session.context_estimate_bytes,
             "context_fill": _measured_fill(events),
-            "context_tokens": _measured_tokens(events),
+            "context_tokens": tokens,
             "rotation_basis": "provider_context_fill",
             "rotation": None,
         }
@@ -1456,8 +1491,11 @@ class ManagerOrchestrator:
         else:
             result["rotation_basis"] = "byte_estimate"
             full = session.context_estimate_bytes >= self.rotate_at_bytes
-        ceiling, tokens = self.rotate_at_tokens, result["context_tokens"]
-        if not full and ceiling and tokens is not None and tokens >= ceiling:
+        # NF-2026-01873: the ceiling measures growth over the first measured turn. A successor
+        # starts at its brief plus handoff, often past the ceiling already; an absolute
+        # ceiling rotated it after one or two turns, every rotation re-billing that start.
+        ceiling = self.rotate_at_tokens
+        if not full and ceiling and tokens is not None and baseline is not None and tokens - baseline >= ceiling:
             result["rotation_basis"] = "absolute_token_ceiling"
             full = True
         if full:
@@ -1570,6 +1608,12 @@ class ManagerOrchestrator:
                 rotation["successor"] = self._open(session.backend_id, session.model)
             except Exception as exc:  # noqa: BLE001 - the rotation is done; say what did not follow
                 rotation["successor_error"] = _failure(exc)
+                # NF-2026-01873: logged on the closed session, and the selection may not keep
+                # naming it: the next ensure opens a successor from its handoff instead.
+                failed = {"source": "successor_open", "error": rotation["successor_error"]}
+                self._record(closed, closed.turn_count, "error", failed)
+                if self.store.read_selection() == closed.session_id:
+                    self.store.clear_selection()
         return rotation
 
     def _finish(

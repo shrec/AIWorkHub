@@ -507,16 +507,71 @@ def test_a_negative_token_ceiling_is_refused(make) -> None:
 def test_a_turn_at_the_token_ceiling_rotates_below_the_fraction(make) -> None:
     harness = make(rotate_at_tokens=1000)
     first = harness.orch.start("fake", "model-a")
-    harness.backends[0].script.append(_used(context_window=10_000, context_fill=0.1))
+    harness.backends[0].script.extend([
+        _used(context_window=10_000, context_fill=0.01),
+        _used(context_window=10_000, context_fill=0.11),
+    ])
 
-    result = harness.orch.send("hello")
+    baseline = harness.orch.send("hello")
+    result = harness.orch.send("again")
 
-    assert (result["context_fill"], result["context_tokens"]) == (0.1, 1000)
+    assert (baseline["context_tokens"], baseline["rotation"]) == (100, None)
+    assert (result["context_fill"], result["context_tokens"]) == (0.11, 1100)
     assert result["rotation_basis"] == "absolute_token_ceiling"
     rotation = result["rotation"]
     assert rotation is not None and rotation["session"].session_id == first.session_id
     assert rotation["successor"] == harness.orch.session
     assert "context_threshold" in harness.backends[0].messages[-1]
+
+
+def _successor_sized(fill: float) -> list[dict[str, Any]]:
+    return _used(context_window=1_000_000, context_fill=fill)
+
+
+def test_a_successor_that_starts_past_the_ceiling_does_not_rotate_on_it(make) -> None:
+    # NF-2026-01873: field session d096 measured 156k then 158k on a 1M window and was
+    # closed after one owner turn; the ceiling now measures growth over the first turn.
+    harness = make()
+    first = harness.orch.start("fake", "model-a")
+    harness.backends[0].script.extend([_successor_sized(0.156), _successor_sized(0.158)])
+
+    turns = [harness.orch.send("hello"), harness.orch.send("again")]
+
+    assert [turn["context_tokens"] for turn in turns] == [156_000, 158_000]
+    assert [turn["rotation"] for turn in turns] == [None, None]
+    assert [turn["rotation_basis"] for turn in turns] == ["provider_context_fill"] * 2
+    (saved,) = harness.store.sessions()
+    assert (saved.session_id, saved.status) == (first.session_id, "active")
+    assert saved.context_baseline_tokens == 156_000
+
+
+def test_a_session_that_grew_by_the_ceiling_over_its_first_turn_rotates(make) -> None:
+    harness = make()
+    first = harness.orch.start("fake", "model-a")
+    harness.backends[0].script.extend([_successor_sized(fill) for fill in (0.066, 0.109, 0.17)])
+
+    turns = [harness.orch.send(f"message {index}") for index in range(3)]
+
+    assert [turn["context_tokens"] for turn in turns] == [66_000, 109_000, 170_000]
+    assert [turn["rotation"] for turn in turns[:2]] == [None, None]
+    assert turns[2]["rotation_basis"] == "absolute_token_ceiling"
+    assert turns[2]["rotation"]["session"].session_id == first.session_id
+    assert turns[2]["rotation"]["successor"] == harness.orch.session
+
+
+def test_a_rebound_route_measures_its_own_first_turn(make) -> None:
+    harness = make()
+    harness.orch.continue_on_route("fake", "model-a")
+    harness.backends[-1].script.append(_successor_sized(0.05))
+    harness.orch.send("hello")
+    assert harness.store.sessions()[0].context_baseline_tokens == 50_000
+
+    harness.orch.continue_on_route("other", "model-b")
+    harness.backends[-1].script.append(_successor_sized(0.2))
+    result = harness.orch.send("again")
+
+    assert (result["context_tokens"], result["rotation"]) == (200_000, None)
+    assert harness.store.sessions()[0].context_baseline_tokens == 200_000
 
 
 def test_a_turn_below_the_fraction_and_the_token_ceiling_does_not_rotate(make) -> None:
@@ -584,12 +639,88 @@ def test_a_missing_or_invalid_fill_or_window_reports_no_tokens(make, usage: dict
 def test_the_ceiling_is_the_basis_only_when_it_alone_triggered_the_rotation(make, fill: Any, basis: str) -> None:
     harness = make(rotate_at_tokens=1000)
     harness.orch.start("fake", "model-a")
-    harness.backends[0].script.append(_used(context_window=10_000, context_fill=fill))
+    harness.backends[0].script.extend([
+        _used(context_window=10_000, context_fill=0.0),
+        _used(context_window=10_000, context_fill=fill),
+    ])
 
+    assert harness.orch.send("baseline")["rotation"] is None
     result = harness.orch.send("hello")
 
     assert result["rotation"] is not None
     assert result["rotation_basis"] == basis
+
+
+def test_a_failed_successor_is_logged_and_releases_the_selection(make) -> None:
+    harness = make()
+    first = harness.orch.start("fake", "model-a")
+    harness.store.write_selection(first.session_id)
+
+    def unreachable(backend_id: str, model: str) -> FakeBackend:
+        raise RuntimeError("provider offline")
+
+    harness.orch._backend_factory = unreachable
+    harness.backends[0].script.append(_successor_sized(0.8))
+
+    rotation = harness.orch.send("hello")["rotation"]
+
+    assert rotation["session"].session_id == first.session_id and rotation["successor"] is None
+    assert rotation["successor_error"] == "RuntimeError: provider offline"
+    logged = harness.store.events(first.session_id)
+    assert [event["type"] for event in logged[-2:]] == ["session_close", "error"]
+    assert logged[-2]["payload"]["reason"] == "context_threshold"
+    assert logged[-1]["payload"] == {"source": "successor_open", "error": "RuntimeError: provider offline"}
+    assert harness.store.read_selection() is None
+    assert harness.orch.session is None
+
+
+def _rotated_without_successor(harness: Harness) -> ml.ManagerSession:
+    first = harness.orch.start("fake", "model-a")
+
+    def unreachable(backend_id: str, model: str) -> FakeBackend:
+        raise RuntimeError("provider offline")
+
+    harness.orch._backend_factory = unreachable
+    harness.backends[0].script.append(_successor_sized(0.8))
+    closed = harness.orch.send("hello")["rotation"]["session"]
+    # The field state before NF-2026-01873: the selection still names the rotated session.
+    harness.store.write_selection(closed.session_id)
+    return closed
+
+
+@pytest.mark.parametrize("activate", ["ensure", "restore_latest"])
+def test_a_rotated_selection_is_never_reopened_by_ensure_or_restore(make, activate: str) -> None:
+    closed = _rotated_without_successor(make())
+    again = make(prefix="b")
+
+    successor = getattr(again.orch, activate)()
+
+    assert successor is not None and successor.session_id != closed.session_id
+    assert successor.status == "active" and successor.previous_session_id == closed.session_id
+    stored = {item.session_id: item for item in again.store.sessions()}
+    assert (stored[closed.session_id].status, stored[closed.session_id].closed_at) == ("closed", closed.closed_at)
+    assert again.store.read_selection() in (None, successor.session_id)
+    assert again.orch.ensure().session_id == successor.session_id
+
+
+def test_an_explicit_continue_still_reopens_a_rotated_session(make) -> None:
+    closed = _rotated_without_successor(make())
+    again = make(prefix="b")
+
+    reopened = again.orch.attach(closed.session_id)
+
+    assert (reopened.session_id, reopened.status, reopened.closed_at) == (closed.session_id, "active", None)
+    assert again.store.read_selection() == closed.session_id
+    assert again.orch.ensure().session_id == closed.session_id
+
+
+def test_the_brief_rules_end_turns_instead_of_polling() -> None:
+    rules = ml._manager_rules().splitlines()
+
+    assert (
+        "- Launched workers survive the end of your turn and their callbacks wake this session: "
+        "after launching, or while waiting on workers, end the turn; never poll or sleep inside a turn."
+    ) in rules
 
 
 def test_without_a_fill_the_byte_estimate_decides_and_no_tokens_are_reported(make) -> None:
