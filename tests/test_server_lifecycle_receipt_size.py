@@ -95,6 +95,57 @@ def test_task_supersede_rejects_invalid_include_card_before_any_write(monkeypatc
     assert calls == []
 
 
+def test_task_supersede_continue_capped_carries_the_continuation(monkeypatch) -> None:
+    task_id = "AIWORKHUB_01181"
+    card = _huge_card(task_id)
+    continuation = {
+        "successor_task_id": f"{task_id}-c1",
+        "predecessor_request_id": "9" * 32,
+        "delta_digest": "ab" * 32,
+    }
+    calls: list[dict] = []
+
+    def fake_continue(*, task_id, reason="", by=""):
+        calls.append({"task_id": task_id, "reason": reason, "by": by})
+        return {**_canonical_envelope(card, command=["supersede", task_id]),
+                "continuation": continuation}
+
+    def unexpected_supersede(**kwargs):
+        raise AssertionError("continue_capped must not call core.supersede_task directly")
+
+    monkeypatch.setattr(server.core, "continue_capped_task", fake_continue)
+    monkeypatch.setattr(server.core, "supersede_task", unexpected_supersede)
+
+    result = server.aiworkhub_task_supersede(task_id, reason="split", continue_capped=True)
+
+    assert result["continuation"] == continuation
+    assert len(json.dumps(result)) < _RECEIPT_BUDGET_BYTES
+    assert calls == [{"task_id": task_id, "reason": "split", "by": ""}]
+
+
+def test_task_supersede_continue_capped_refusal_is_reported(monkeypatch) -> None:
+    def refusing(**kwargs):
+        raise ValueError("continuation_not_capped")
+
+    monkeypatch.setattr(server.core, "continue_capped_task", refusing)
+
+    result = server.aiworkhub_task_supersede("AIWORKHUB_01181", continue_capped=True)
+
+    assert result["ok"] is False
+    assert result["error"] == "continuation_not_capped"
+
+
+def test_task_supersede_default_reply_has_no_continuation(monkeypatch) -> None:
+    card = _huge_card("AIWORKHUB_01181")
+    monkeypatch.setattr(
+        server.core,
+        "supersede_task",
+        lambda **kwargs: _canonical_envelope(card, command=["supersede", "x"]),
+    )
+
+    assert "continuation" not in server.aiworkhub_task_supersede("AIWORKHUB_01181")
+
+
 def _seed_task_db(tmp_path: Path, task_id: str, card: dict) -> Path:
     db_path = tmp_path / "task.sqlite"
     conn = sqlite3.connect(db_path)

@@ -2085,6 +2085,86 @@ def attach_rework_delta(
     return True, "attached"
 
 
+def inherit_capped_rework(
+    root: str | Path,
+    task_id: str,
+    *,
+    rework_predecessor: Mapping[str, Any],
+    review_feedback: Mapping[str, Any],
+    actor: str,
+) -> tuple[bool, str]:
+    """Pin a capped card's rework predecessor and feedback onto its successor.
+
+    One preimage-guarded UPDATE like :func:`attach_rework_delta`: the write
+    lands only while the successor is still pending, unclaimed, at claim epoch
+    0 and without a rework predecessor, so a successor that was launched or
+    already inherited is never overwritten.
+    """
+    _readiness, db_path = _require_ready(root)
+    with _write_connection(db_path) as conn:
+        _begin_immediate(conn)
+        row = conn.execute(
+            "SELECT status, worker_status, archived_at, claimed_by, card_json "
+            "FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, "task_missing"
+        preimage = str(row["card_json"] or "{}")
+        try:
+            card = json.loads(preimage)
+        except json.JSONDecodeError:
+            card = {}
+        if not isinstance(card, dict):
+            card = {}
+        if (
+            canonical_status(dict(row)) != "pending"
+            or str(row["archived_at"] or "").strip()
+            or str(row["claimed_by"] or "").strip()
+            or card.get("claim_epoch") not in (None, 0)
+            or card.get("rework_predecessor") is not None
+        ):
+            return False, "successor_not_pristine"
+        card["rework_predecessor"] = dict(rework_predecessor)
+        card["review_feedback"] = dict(review_feedback)
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            cur = conn.execute(
+                "UPDATE tasks SET card_json=?, updated_at=? WHERE task_id=? AND card_json=?",
+                (
+                    json.dumps(card, ensure_ascii=False, sort_keys=True),
+                    now,
+                    task_id,
+                    preimage,
+                ),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                return False, "card_changed"
+            conn.execute(
+                "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    "capped_rework_inherited",
+                    actor,
+                    json.dumps(
+                        {
+                            "predecessor_request_id": rework_predecessor.get("request_id"),
+                            "predecessor_task_id": rework_predecessor.get("task_id"),
+                        },
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+            conn.commit()
+        except Exception:  # noqa: BLE001 -- a partial inheritance must never persist
+            conn.rollback()
+            raise
+    return True, "inherited"
+
+
 _REWORK_DELTA_DIGEST_KEYS = frozenset({"artifact_sha256", "digest"})
 _REWORK_DELTA_UNREFERENCING_STATUSES = frozenset({"finished", "archived", "superseded"})
 

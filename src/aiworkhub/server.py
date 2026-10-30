@@ -4742,6 +4742,7 @@ def aiworkhub_task_supersede(
     reason: str = "",
     by: str = "",
     include_card: CardInclude = "none",
+    continue_capped: bool = False,
 ) -> dict[str, Any]:
     """COORDINATOR WRITE: supersede a stale/active task with a replacement.
 
@@ -4757,15 +4758,32 @@ def aiworkhub_task_supersede(
     Args:
         task_id: Id of the stale or active card to supersede; allowed even while it is processing.
         reason: Why the card is being superseded, recorded with the audit event; default empty.
-        by: Id of the replacement task, recorded as superseded_by; it must be an existing task other than task_id and must not create a dependency cycle. Omit for none.
+        by: Id of the replacement task, recorded as superseded_by; it must be an existing task other than task_id and must not create a dependency cycle. Omit for none. With continue_capped it names the successor to create instead.
         include_card: Card view to attach to the receipt: none (default), summary (baselines and evidence folded) or full (the exact post-transition card).
+        continue_capped: When true, task_id must be a pending card stopped by the reject depth cap whose rework predecessor has a verified sealed delta; a pending successor with the same contract (id by, else <task_id>-c<N>) is created, inherits that delta and the reason as rework feedback, and then supersedes task_id. The reply gains continuation {successor_task_id, predecessor_request_id, delta_digest}; the successor is not launched. Default false leaves the call unchanged.
     """
 
     refusal = _include_card_refusal(include_card)
     if refusal is not None:
         return refusal
+    if not continue_capped:
+        return _lifecycle_receipt(
+            core.supersede_task(task_id=task_id, reason=reason, by=by),
+            schema_id="aiworkhub.task_supersede_receipt.v1",
+            task_id=task_id,
+            include_card=include_card,
+        )
+    try:
+        outcome = core.continue_capped_task(task_id=task_id, reason=reason, by=by)
+    except ValueError as exc:
+        return {
+            "schema_id": "aiworkhub.task_supersede_receipt.v1",
+            "ok": False,
+            "task_id": task_id,
+            "error": str(exc),
+        }
     return _lifecycle_receipt(
-        core.supersede_task(task_id=task_id, reason=reason, by=by),
+        outcome,
         schema_id="aiworkhub.task_supersede_receipt.v1",
         task_id=task_id,
         include_card=include_card,

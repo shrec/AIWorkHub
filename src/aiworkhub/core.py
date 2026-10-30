@@ -4166,6 +4166,82 @@ def create_time_runner_route_warnings(runner: str) -> list[str]:
     return warnings
 
 
+def _create_payload_from_card(existing_card: Mapping[str, Any]) -> dict[str, Any]:
+    """The create-time contract payload an existing card reads back as."""
+    from . import quality_evidence
+    existing_context = existing_card.get("project_context")
+    if not isinstance(existing_context, dict):
+        existing_context = {}
+    return {
+        "title": str(existing_card.get("title") or ""),
+        "runner": str(existing_card.get("runner") or ""),
+        "topic": str(existing_card.get("topic") or ""),
+        "objective": str(existing_card.get("objective") or ""),
+        "acceptance": existing_card.get("acceptance") or [],
+        "read_only": existing_card.get("read_only") is True,
+        "allowed_writes": existing_card.get("allowed_writes") or [],
+        "forbidden": existing_card.get("forbidden") or [],
+        "required_outputs": existing_card.get("required_outputs") or [],
+        "allow_empty_required_outputs": (
+            existing_card.get("allow_empty_required_outputs") or []
+        ),
+        "allow_unchanged_required_outputs": (
+            existing_card.get("allow_unchanged_required_outputs") or []
+        ),
+        "validation": existing_card.get("validation") or [],
+        "validation_roles": existing_card.get("validation_roles") or [
+            quality_evidence.VALIDATION_ROLE_GENERIC
+            for _ in (existing_card.get("validation") or [])
+        ],
+        "work_kind": str(
+            existing_card.get("work_kind")
+            or quality_evidence.WORK_KIND_GENERIC
+        ),
+        # Read back the DECLARED tier, mirroring requested_payload. A card
+        # whose tier this module derived carries origin "derived" and was
+        # never declared, so it reads back as None; a card written before
+        # create-time derivation carries no origin at all and keeps the
+        # original behaviour exactly.
+        "risk_tier": (
+            None
+            if str(existing_card.get("risk_tier_origin") or "").strip().lower()
+            == "derived"
+            else (
+                str(existing_card.get("risk_tier") or "").strip().lower()
+                or None
+            )
+        ),
+        # Read back the DECLARED difficulty, mirroring requested_payload. A
+        # card created without one, or written before the field existed,
+        # carries none and reads back as None.
+        "difficulty": (
+            str(existing_card.get("difficulty") or "").strip().lower() or None
+        ),
+        "skill_task_family": str(
+            existing_card.get("skill_task_family") or ""
+        ),
+        "skill_stage": str(existing_card.get("skill_stage") or ""),
+        "skill_triggers": list(existing_card.get("skill_triggers") or []),
+        "skill_applicability": list(
+            existing_card.get("skill_applicability") or []
+        ),
+        "skill_path_scope": str(existing_card.get("skill_path_scope") or ""),
+        "priority": str(existing_card.get("priority") or "normal"),
+        "task_type": str(existing_context.get("task_type") or "code"),
+        "depends_on": existing_card.get("depends_on") or [],
+        "read_first": existing_card.get("read_first") or [],
+        "read_roots": existing_card.get("read_roots") or [],
+        "immutable_inputs": existing_card.get("immutable_inputs") or [],
+        "max_live_tokens": (
+            (existing_card.get("token_budget") or {}).get("cap_tokens")
+            if isinstance(existing_card.get("token_budget"), dict)
+            else None
+        ),
+        "template_provenance": existing_card.get("template_provenance"),
+        "wave_goal_binding": existing_card.get("wave_goal_binding"),
+    }
+
+
 def create_task(
     task_id: str,
     title: str,
@@ -5187,77 +5263,7 @@ def create_task(
                 "terminal_state": existing_lifecycle,
             })
             return result
-        existing_context = existing_card.get("project_context")
-        if not isinstance(existing_context, dict):
-            existing_context = {}
-        existing_payload = {
-            "title": str(existing_card.get("title") or ""),
-            "runner": str(existing_card.get("runner") or ""),
-            "topic": str(existing_card.get("topic") or ""),
-            "objective": str(existing_card.get("objective") or ""),
-            "acceptance": existing_card.get("acceptance") or [],
-            "read_only": existing_card.get("read_only") is True,
-            "allowed_writes": existing_card.get("allowed_writes") or [],
-            "forbidden": existing_card.get("forbidden") or [],
-            "required_outputs": existing_card.get("required_outputs") or [],
-            "allow_empty_required_outputs": (
-                existing_card.get("allow_empty_required_outputs") or []
-            ),
-            "allow_unchanged_required_outputs": (
-                existing_card.get("allow_unchanged_required_outputs") or []
-            ),
-            "validation": existing_card.get("validation") or [],
-            "validation_roles": existing_card.get("validation_roles") or [
-                quality_evidence.VALIDATION_ROLE_GENERIC
-                for _ in (existing_card.get("validation") or [])
-            ],
-            "work_kind": str(
-                existing_card.get("work_kind")
-                or quality_evidence.WORK_KIND_GENERIC
-            ),
-            # Read back the DECLARED tier, mirroring requested_payload. A card
-            # whose tier this module derived carries origin "derived" and was
-            # never declared, so it reads back as None; a card written before
-            # create-time derivation carries no origin at all and keeps the
-            # original behaviour exactly.
-            "risk_tier": (
-                None
-                if str(existing_card.get("risk_tier_origin") or "").strip().lower()
-                == "derived"
-                else (
-                    str(existing_card.get("risk_tier") or "").strip().lower()
-                    or None
-                )
-            ),
-            # Read back the DECLARED difficulty, mirroring requested_payload. A
-            # card created without one, or written before the field existed,
-            # carries none and reads back as None.
-            "difficulty": (
-                str(existing_card.get("difficulty") or "").strip().lower() or None
-            ),
-            "skill_task_family": str(
-                existing_card.get("skill_task_family") or ""
-            ),
-            "skill_stage": str(existing_card.get("skill_stage") or ""),
-            "skill_triggers": list(existing_card.get("skill_triggers") or []),
-            "skill_applicability": list(
-                existing_card.get("skill_applicability") or []
-            ),
-            "skill_path_scope": str(existing_card.get("skill_path_scope") or ""),
-            "priority": str(existing_card.get("priority") or "normal"),
-            "task_type": str(existing_context.get("task_type") or "code"),
-            "depends_on": existing_card.get("depends_on") or [],
-            "read_first": existing_card.get("read_first") or [],
-            "read_roots": existing_card.get("read_roots") or [],
-            "immutable_inputs": existing_card.get("immutable_inputs") or [],
-            "max_live_tokens": (
-                (existing_card.get("token_budget") or {}).get("cap_tokens")
-                if isinstance(existing_card.get("token_budget"), dict)
-                else None
-            ),
-            "template_provenance": existing_card.get("template_provenance"),
-            "wave_goal_binding": existing_card.get("wave_goal_binding"),
-        }
+        existing_payload = _create_payload_from_card(existing_card)
         if existing_payload == requested_payload:
             result = _canonical_result(
                 ok=True,
@@ -10561,6 +10567,13 @@ def supersede_task(
         task_id, by, actor=actor, reason=full_reason
     )
     return result
+
+
+def continue_capped_task(task_id: str, reason: str = "", by: str = "") -> dict[str, Any]:
+    """Supersede a reject-depth-capped card with a successor inheriting its sealed delta."""
+    from . import capped_continuation
+
+    return capped_continuation.continue_capped(task_id, reason=reason, by=by)
 
 
 def _rebind_superseded_needfix(
