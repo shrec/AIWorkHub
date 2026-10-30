@@ -4203,6 +4203,7 @@ def create_task(
     wave_goal_binding: Mapping[str, Any] | None = None,
     *,
     review_target_task_id: str | None = None,
+    read_roots: list[str] | None = None,
 ) -> dict[str, Any]:
     """Create one new canonical task card for the verified manager chat.
 
@@ -4490,6 +4491,11 @@ def create_task(
         )
         read_first2 = bounded_strings(read_first or [], "read_first")
         immutable_inputs2 = bounded_strings(immutable_inputs or [], "immutable_inputs")
+        # Lazy, like ``toolchain_authority`` below: creation must not widen
+        # core's startup dependency surface.
+        from .card_read_roots import validate_read_roots
+
+        read_roots2 = validate_read_roots(read_roots, repo_root=repo_root())
     except ValueError as exc:
         return _lifecycle_error(str(exc), 2)
     if read_only:
@@ -4931,6 +4937,7 @@ def create_task(
             else {}
         ),
         "read_first": read_first2,
+        **({"read_roots": read_roots2} if read_roots2 else {}),
         "immutable_inputs": immutable_inputs2,
         "validation": validation2,
         "validation_roles": validation_roles2,
@@ -5035,6 +5042,7 @@ def create_task(
         "task_type": task_type,
         "depends_on": depends_on2,
         "read_first": read_first2,
+        "read_roots": read_roots2,
         "immutable_inputs": immutable_inputs2,
         "max_live_tokens": max_live_tokens,
         # None for every caller that declares no binding, exactly as a card
@@ -5240,6 +5248,7 @@ def create_task(
             "task_type": str(existing_context.get("task_type") or "code"),
             "depends_on": existing_card.get("depends_on") or [],
             "read_first": existing_card.get("read_first") or [],
+            "read_roots": existing_card.get("read_roots") or [],
             "immutable_inputs": existing_card.get("immutable_inputs") or [],
             "max_live_tokens": (
                 (existing_card.get("token_budget") or {}).get("cap_tokens")

@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .card_read_roots import _contains, _real_key as _norm
 from .validation_toolchains import (
     PYTHON_VALIDATION_EXECUTABLES,
     SYSTEM_VALIDATION_EXECUTABLES,
@@ -72,15 +73,6 @@ def _invalid(detail: str) -> Exception:
 
 def _is_windows() -> bool:
     return os.name == "nt"
-
-
-def _norm(path: str | os.PathLike[str]) -> str:
-    # realpath: a junction or symlink must not hide that a root lies in a writable tree.
-    return os.path.normcase(os.path.realpath(path))
-
-
-def _contains(parent: str, child: str) -> bool:
-    return child == parent or child.startswith(parent.rstrip("\\/") + os.sep)
 
 
 def _under(path: Path, directories: Sequence[str]) -> bool:

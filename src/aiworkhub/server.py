@@ -3521,6 +3521,14 @@ def aiworkhub_task_create(
         "refused. Omit for none.",
         [{"roadmap_id": "RM-2026-00001", "goal_id": "G1", "predecessor_task_id": "EXPORT_RETRY_0"}],
     )] = None,
+    read_roots: typing.Annotated[list[str] | None, _task_create_hint(
+        "Up to 16 absolute host directories OUTSIDE the worktree the provider worker may READ "
+        "(runtime data), granted read-only on Windows AppContainer only. Refused with "
+        "read_root_invalid:<reason>:<path> when not an existing plain directory, or when it is a "
+        "volume/UNC root, reparse point, .git/.aiworkhub path, the repo root or its parent, "
+        "another git repository, the home directory or its credential folders. Omit for none.",
+        [["E:\\Dev\\RuntimeData"]],
+    )] = None,
 ) -> dict[str, Any]:
     """MANAGER WRITE: create one new canonical repo-local task card.
 
@@ -3648,6 +3656,7 @@ def aiworkhub_task_create(
             if wave_goal_binding is not None
             else {}
         ),
+        **({"read_roots": read_roots} if read_roots is not None else {}),
     )
     return _task_create_receipt(created, echo_card=echo_card)
 

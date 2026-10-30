@@ -686,6 +686,17 @@ def _launch_appcontainer_process(
         os.set_inheritable(stderr_write, True)
         environment = os.environ.copy()
         grants = _worker_filesystem_grants(argv, cwd, environment)
+        if spec.get("read_roots"):
+            try:
+                from .card_read_roots import read_root_grants
+            except ImportError:  # direct-script entrypoint
+                from card_read_roots import read_root_grants  # type: ignore[no-redef]
+            grants.extend(
+                read_root_grants(
+                    spec["read_roots"],
+                    covered=[g.path for g in grants if g.access == "modify"],
+                )
+            )
         if bridge_spec is not None:
             sid = windows_appcontainer.container_sid(repo_id, worker_kind)
             # The pipe exists before the worker does, so its MCP shim finds it.

@@ -3883,7 +3883,7 @@ TASK_CONTRACT_KEYS = (
     "forbidden", "review_feedback", "recovery_feedback", "commit_contract",
     "project_context", "required_outputs", "allow_empty_required_outputs",
     "allow_unchanged_required_outputs", "external_readonly_sources",
-    "read_only",
+    "read_only", "read_roots",
 )
 # ``review_feedback`` carries the rework reason and is authenticated on its own
 # axis (``review_feedback_identity``). ``recovery_feedback`` carries the

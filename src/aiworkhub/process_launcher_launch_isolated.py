@@ -492,6 +492,16 @@ def launch_isolated(
                 )
             )
         external_readonly_dirs = _external_readonly_dirs(card, adapter_id)
+        read_roots: list[str] = []
+        if card.get("read_roots"):
+            from .card_read_roots import validate_read_roots
+
+            try:
+                read_roots = validate_read_roots(
+                    card["read_roots"], repo_root=self.repo
+                )
+            except ValueError as exc:
+                raise LaunchRejected(str(exc)) from exc
         authority_repo = _task_authority_repo(self.repo, card)
         context_result = _launch_project_context(
             self.repo, card, quality_review_binding
@@ -512,6 +522,8 @@ def launch_isolated(
                     f"grok_kilo_auth_unavailable:{exc.reason}"
                 ) from exc
         sandbox_backend = _sandbox_backend_for_adapter(adapter_id)
+        if read_roots and sandbox_backend != "windows_appcontainer":
+            raise LaunchRejected("read_roots_unsupported_backend")
         launch_phase = "workspace_and_runtime_provision"
         reservation_ctx = (
             nullcontext()
@@ -1426,6 +1438,7 @@ def launch_isolated(
                 ),
                 **appcontainer_identity_fields,
                 **({"worker_mcp_bridge": worker_mcp_bridge} if worker_mcp_bridge else {}),
+                **({"read_roots": read_roots} if read_roots else {}),
             }
             write_json_0600(spec_path, supervisor_spec)
             if adapter_id == "claude_cli" and stdin_payload is not None:
