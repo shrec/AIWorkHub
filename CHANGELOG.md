@@ -6,6 +6,45 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.78] - 2026-10-30
+
+### Added
+
+- A sandboxed validation can run any compiler: a toolchain registry exposes registered compilers inside the AppContainer (NF-2026-01843), and a `lane:` validation command runs in a pinned container build lane (NF-2026-01842).
+- A card may declare `read_roots` the worker AppContainer reads; they are validated at create and launch (NF-2026-01857).
+- A validation command with role `suite_vs_base` passes when every failing test also fails on the candidate's base, including `python -P -m X` and schema mypy runs (NF-2026-01846, NF-2026-01868).
+- A reject-depth-capped card continues as a successor card that inherits its sealed rework delta in one supersede call (NF-2026-01837).
+- A launch whose writes overlap a live or review-ready candidate reports the overlap as a merge risk in its reply (NF-2026-01836).
+- Source Graph `include_roots` indexes opted-in gitignored source trees (NF-2026-01862), and `body` resolves C++ `Class::method` and `Namespace::Class::method` (NF-2026-01861).
+- Persisted recipes can run detached on the host: `run(detach=true)` returns a `run_id` and `run_status` polls it (NF-2026-01849).
+- Doctor self-reports the answering server process: pid, RSS/peak/private bytes, Python heap blocks, runtime generation and superseded flag (NF-2026-01853).
+- A reconciler scan records how long each phase took and shows the running phase while it scans (NF-2026-01866).
+
+### Changed
+
+- Capacity-refused launches wait in a reviewer-first admission queue instead of failing the card (NF-2026-01844), and review-ready recovery runs on its own short interval, so a long reconciler scan no longer delays reviewer launch (NF-2026-01870).
+- Accept runs the changed modules' neighbour tests on the combined tree (NF-2026-01814), always runs the repository-invariant tests when a src module changed (NF-2026-01840), and refuses a candidate that grows a `src/aiworkhub` module past the module-size ratchet (NF-2026-01864).
+- A base-drift rework reject gets its own infrastructure category, proven by git, and never counts toward the reject-depth cap (NF-2026-01832).
+- A HIGH reviewer finding may be dismissed only with a contract citation; a CRITICAL one never (NF-2026-01838).
+- An over-long card title is clipped at a word boundary with a `title_truncated` warning instead of refusing the create (NF-2026-01854).
+- Callback wait drops stale callbacks for closed cards, names review_ready cards it cannot deliver (NF-2026-01859), and wakes on a new pre-claim launch blocker (NF-2026-01850).
+- Validation rows carry a bounded pytest failure digest that survives packet tail drops (NF-2026-01848); evidence-mode `task_show`/`agent_task_status` dedupe repeated subtrees losslessly (NF-2026-01839); retry economics names a cause for every retry.
+
+### Fixed
+
+- Worker `validation_run` runs inside the AppContainer sandbox (NF-2026-01822).
+- A worker supervisor leaves its MCP server's Windows job, so a window reload or session rotation no longer kills running workers (NF-2026-01094).
+- Reviewer selection falls back to a soft-excluded route instead of parking every lens (NF-2026-01856); an unbindable advisory overbuild finding no longer sinks a whole quality review (NF-2026-01867); a rework that reverts an inherited path to canonical bytes can be quality-reviewed (NF-2026-01865).
+- A manager correction can land a `validation_failed` candidate when the corrected bytes pass every declared validation (NF-2026-01845), and it is observed against the corrected bytes, not the sealed candidate (NF-2026-01869).
+- Path-contract overlap matches a glob per segment, so a disjoint forbidden file no longer refuses the card (NF-2026-01860); a `required_outputs` glob is satisfied when at least one match changed (NF-2026-01834).
+- The zero-delta tripwire enforces (NF-2026-01831), and the vscode_lm forced-stage trap credits worker-pair edits, so a mixed-path worker is not killed with 0 changes (NF-2026-01605).
+- Bootstrap's `manager_verified` comes from the same identity check the write gates use (NF-2026-01817).
+- The candidate overlay names the file and step that failed (NF-2026-01858); Source Graph `file` mode says why an exact path has no row and repo-wide `bodygrep` never ends on an empty truncated page (NF-2026-01851); the review_ready gate reports drifted `path:line` doc citations with a renumber replacement (NF-2026-01847).
+- OpenCode MCP repair strips a runtime-generation `PYTHONPATH` from AIWorkHub-owned entries (NF-2026-01623).
+- Test isolation: no test reads the live Manager Chat seat and `AIWORKHUB_METRIC` lines survive xdist (NF-2026-01813, NF-2026-01823, NF-2026-01841); the VS Code test harness tolerates a loaded Windows machine (NF-2026-01833); a host-dirty root `.gitignore` never enters the candidate delta (NF-2026-01852); MAX_PATH AppContainer tests skip inside the validation lane (NF-2026-01855).
+- A quality-review candidate Source Graph prewarm fails with the first unindexable file instead of publishing a partial reviewer index; the container build lane no longer pulls `core` into a sparse validation closure, and the new toolchain modules use the platform facade.
+- The Windows exec-scratch probe copy has a short name, so an AppContainer validation under a deep repository path no longer fails as `noexec` at MAX_PATH; the unclassified terminal label that hid it is NF-2026-01871.
+
 ## [0.12.77] - 2026-10-29
 
 ### Added

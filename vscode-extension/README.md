@@ -24,11 +24,11 @@ MCP stdio runtime on the workspace host. It does not open a browser or require
 an AIWorkHub cloud account, and it binds no port and exposes no LAN service
 unless you start the opt-in WorkHub Mail listener on a host and port you name.
 
-## What's new in 0.12.77
+## What's new in 0.12.78
 
-- WorkHub Mail pairs machines without typed codes: discover a machine on the LAN, send a pair request, compare the 6-digit SAS and accept or reject it in VS Code; a model never completes a pairing. The tool surface is now send, inbox and peers.
-- Faster, cheaper manager turns: Source Graph caches bodygrep and returns exact line windows, accept runs validations once, the usage report and workforce catalog default to bounded summaries, and the metrics ledger and reconciler read only what changed.
-- Review closes cleanly: undecided reviewer findings get a system disposition at accept, reviewers skip routes with an open failure circuit, and retry spend is broken down by the previous attempt's terminal cause.
+- Fewer failed launches and retries: a capacity-refused launch waits in a reviewer-first queue instead of failing, base-drift rejects never count toward the reject cap, a capped card continues as a successor that keeps its sealed delta, and a window reload no longer kills running workers.
+- Sandboxed validation reaches any toolchain: a registered compiler or a pinned container build lane, opt-in `read_roots` for the worker sandbox, and `suite_vs_base` validations that pass when every failure also fails on the base.
+- Accept is harder to fool and easier to land: it runs neighbour and repository-invariant tests on the combined tree, a manager correction can land a validation-failed candidate whose corrected bytes pass, and recipes can run detached with `run_status` polling.
 
 ## Review automation
 

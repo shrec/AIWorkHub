@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.12.78 — 2026-10-30
+
+### Added
+
+- Bundled runtime 0.12.78: sandboxed validation can run any registered compiler or a pinned container build lane (NF-2026-01842, NF-2026-01843); cards may declare `read_roots` (NF-2026-01857); `suite_vs_base` validations pass when every failure also fails on the base (NF-2026-01846, NF-2026-01868); a reject-capped card continues as a successor that inherits its sealed delta (NF-2026-01837); persisted recipes can run detached (NF-2026-01849); doctor reports the answering server process (NF-2026-01853).
+
+### Changed
+
+- Fewer failed launches and retries: capacity-refused launches wait in a reviewer-first admission queue (NF-2026-01844), review-ready recovery has its own short interval (NF-2026-01870), base-drift rejects never count toward the reject cap (NF-2026-01832), and accept runs neighbour and repository-invariant tests on the combined tree (NF-2026-01814, NF-2026-01840, NF-2026-01864).
+
+### Fixed
+
+- Worker validation runs inside the AppContainer sandbox (NF-2026-01822); a window reload or session rotation no longer kills running workers (NF-2026-01094); reviewer selection no longer parks every lens (NF-2026-01856); a manager correction can land a validation-failed candidate whose corrected bytes pass (NF-2026-01845, NF-2026-01869). The full list is in the repository CHANGELOG.
+
 ## 0.12.77 — 2026-10-29
 
 ### Added
