@@ -96,12 +96,15 @@ from aiworkhub import (
 
 
 def _git(cwd: Path, *args: str) -> None:
-    subprocess.run(
-        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(cwd), *args],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(cwd), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise AssertionError(f"{args}: rc={exc.returncode} stderr={exc.stderr}") from exc
 
 
 def _make_repo(tmp_path: Path, worktrees: int) -> dict[str, Path]:
@@ -110,12 +113,15 @@ def _make_repo(tmp_path: Path, worktrees: int) -> dict[str, Path]:
     base = tmp_path / "worktrees"
     base.mkdir()
     subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
-    _git(tmp_path, "clone", str(remote), str(repo))
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "remote", "add", "origin", str(remote))
     (repo / "file.txt").write_text("base\n", encoding="utf-8")
     _git(repo, "add", "file.txt")
     _git(repo, "commit", "-m", "base")
-    _git(repo, "push", "origin", "HEAD:refs/heads/main")
-    _git(repo, "fetch", "origin")
+    # The validation lane cannot spawn git-upload-pack/receive-pack (NF-2026-01876):
+    # record the pushed state locally instead of clone/push/fetch.
+    _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
     assert task_store.initialize_repository(repo)["ok"]
     for index in range(worktrees):
         entry = base / f"request-{index:03d}"
