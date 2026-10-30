@@ -319,7 +319,7 @@ class CorrectionOccurrence:
 # nothing and therefore suppresses nothing.
 ALLOWED_CORRECTION_SITES: tuple[CorrectionOccurrence, ...] = (
     CorrectionOccurrence(
-        "README.md", 395, 41, "Continuous Automated Assurance System",
+        "README.md", 394, 41, "Continuous Automated Assurance System",
         "The README quotes the upstream expansion while correcting it.",
     ),
     CorrectionOccurrence(
