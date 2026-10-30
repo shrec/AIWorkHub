@@ -3456,7 +3456,8 @@ def aiworkhub_task_create(
         "Accepted validation_roles: " + ", ".join(quality_evidence.VALIDATION_ROLES)
         + ". Supply one role per validation command. Required: bugfix=reproduction+regression; "
         "refactor=parity; performance=baseline+delta; security=negative_fixture; "
-        "data_ml=schema+distribution. Case and surrounding space are normalized by core.",
+        "data_ml=schema+distribution. Case and surrounding space are normalized by core. "
+        "suite_vs_base: a pytest command that passes when every failing test also fails on the candidate's base.",
         [["reproduction", "regression"], ["generic"]],
     )] = None,
     risk_tier: typing.Annotated[str | None, _task_create_hint(
@@ -3536,7 +3537,9 @@ def aiworkhub_task_create(
     difficulty: bounded, standard, complex (optional; never inferred).
     work_kind: generic, bugfix, refactor, performance, security, data_ml.
     validation_roles: generic, reproduction, regression, parity, baseline,
-    delta, negative_fixture, schema, distribution; one per validation command.
+    delta, negative_fixture, schema, distribution, suite_vs_base; one per
+    validation command. suite_vs_base: a pytest command that passes when every
+    failing test also fails on the candidate's base.
     Required roles: bugfix=reproduction+regression; refactor=parity;
     performance=baseline+delta; security=negative_fixture; data_ml=schema+distribution.
     validation: shell-free executable commands; no environment assignments,
@@ -3598,6 +3601,8 @@ def aiworkhub_task_create(
     entry per validation command: bugfix=reproduction+regression,
     refactor=parity, performance=baseline+delta, security=negative_fixture,
     and data_ml=schema+distribution. Missing roles are rejected before launch.
+    suite_vs_base: a pytest command that passes when every failing test also
+    fails on the candidate's base.
     ``risk_tier`` is optional explicit routing/economic evidence. It is never
     inferred from priority or prose; omitted historical cards remain unknown.
     It is a FLOOR: the observed write scope may escalate it, never lower it.
@@ -3748,7 +3753,7 @@ def aiworkhub_task_create_from_template(
         risk_tier: Optional risk-tier floor: low, medium, high or critical. The observed write scope may raise it but never lower it. Omit to derive it from the scope.
         difficulty: Accepted difficulty values: bounded, standard, complex. Optional; omitted remains undeclared, never inferred. Case and surrounding space are normalized by core.
         validation: Shell-free executable commands, one per entry; no environment assignments, pipes, redirects, or command chaining. Give together with validation_roles; omit both to keep the template's generated commands.
-        validation_roles: Accepted validation_roles: generic, reproduction, regression, parity, baseline, delta, negative_fixture, schema, distribution. One role per validation command, given together with validation; omit both to keep the generated roles.
+        validation_roles: Accepted validation_roles: generic, reproduction, regression, parity, baseline, delta, negative_fixture, schema, distribution, suite_vs_base. One role per validation command, given together with validation; omit both to keep the generated roles. suite_vs_base: a pytest command that passes when every failing test also fails on the candidate's base.
         skill_task_family: Skill family: analysis, bugfix, data_ml, docs, implementation, performance, refactor, replay, security or test; an unknown token is refused. Defaults to the family the template declares; an explicit value overrides it.
         skill_stage: Worker workflow stage to select skills for: orientation, implementation, validation, review or rework (not the card status); an unknown token is refused. Not derivable: omitting skill_stage, skill_triggers and skill_applicability selects no skill.
         skill_triggers: Observable conditions that make a skill relevant, from a closed vocabulary (e.g. code_change, public_api, security_sensitive, concurrency); at most 16, an unknown token is refused. Not derivable.

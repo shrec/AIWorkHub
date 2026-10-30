@@ -277,8 +277,7 @@ MYPY_DIAGNOSTIC_RE = re.compile(
 )
 
 
-def exact_schema_mypy_invocation(row: Mapping[str, Any]) -> bool:
-    """Accept only the trusted mypy executable or ``python -m mypy``."""
+def _exact_module_invocation(row: Mapping[str, Any], module: str) -> bool:
     argv = tuple(
         str(value)
         for value in (row.get("executed_argv") or row.get("argv") or ())
@@ -286,13 +285,18 @@ def exact_schema_mypy_invocation(row: Mapping[str, Any]) -> bool:
     if not argv:
         return False
     executable = Path(argv[0]).name.lower()
-    if executable in {"mypy", "mypy.exe"}:
+    if executable in {module, f"{module}.exe"}:
         return True
     return bool(
         len(argv) >= 3
         and re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", executable)
-        and argv[1:3] == ("-m", "mypy")
+        and argv[1:3] == ("-m", module)
     )
+
+
+def exact_schema_mypy_invocation(row: Mapping[str, Any]) -> bool:
+    """Accept only the trusted mypy executable or ``python -m mypy``."""
+    return _exact_module_invocation(row, "mypy")
 
 
 def schema_mypy_diagnostics(
@@ -342,6 +346,100 @@ def schema_mypy_diagnostics(
     return diagnostics
 
 
+PYTEST_FAILED_ID_CAP = 200
+_PYTEST_SUMMARY_RE = re.compile(
+    r"^[=\s]*(?P<body>.*?)\s+in\s+\d+(?:\.\d+)?s\b.*$"
+)
+_PYTEST_SUMMARY_WORD_RE = re.compile(
+    r"\b(?:passed|failed|errors?|skipped|deselected|warnings?|xfailed|xpassed)\b"
+)
+_PYTEST_FAILED_COUNT_RE = re.compile(r"(?<![\w-])(\d+) failed\b")
+_PYTEST_ERROR_COUNT_RE = re.compile(r"(?<![\w-])(\d+) errors?\b")
+
+
+def exact_pytest_invocation(row: Mapping[str, Any]) -> bool:
+    """Accept only ``pytest`` or ``python -m pytest`` as the executed argv."""
+    return _exact_module_invocation(row, "pytest")
+
+
+def _is_schema_mypy_row(row: Mapping[str, Any]) -> bool:
+    return str(
+        row.get("behavioral_role") or ""
+    ).lower() in {"schema", "parity"} and exact_schema_mypy_invocation(row)
+
+
+def _is_suite_vs_base_row(row: Mapping[str, Any]) -> bool:
+    return (
+        str(row.get("behavioral_role") or "").lower()
+        == quality_evidence.VALIDATION_ROLE_SUITE_VS_BASE
+        and exact_pytest_invocation(row)
+    )
+
+
+def pytest_failed_node_ids(row: Mapping[str, Any]) -> frozenset[str]:
+    """Return the failing/erroring pytest node ids of one validation row."""
+    if row.get("timed_out"):
+        raise WorkspaceError("baseline_pytest_failures_unparsed")
+    if row.get("returncode") == 0:
+        return frozenset()
+    if row.get("stdout_truncated") or row.get("stderr_truncated"):
+        raise WorkspaceError("baseline_pytest_failures_unparsed")
+    output = "\n".join(
+        (str(row.get("stdout_tail") or ""), str(row.get("stderr_tail") or ""))
+    )
+    parsed: list[str] = []
+    summary_body: str | None = None
+    for raw in output.splitlines():
+        line = raw.strip()
+        if line.startswith(("FAILED ", "ERROR ")):
+            node_id = line.split(" ", 1)[1].split(" - ", 1)[0].strip()
+            if not node_id:
+                raise WorkspaceError("baseline_pytest_failures_unparsed")
+            parsed.append(node_id)
+            continue
+        match = _PYTEST_SUMMARY_RE.match(line)
+        if match is not None and _PYTEST_SUMMARY_WORD_RE.search(match.group("body")):
+            summary_body = match.group("body")
+    if not parsed or summary_body is None:
+        raise WorkspaceError("baseline_pytest_failures_unparsed")
+    expected = sum(
+        int(value)
+        for pattern in (_PYTEST_FAILED_COUNT_RE, _PYTEST_ERROR_COUNT_RE)
+        for value in pattern.findall(summary_body)
+    )
+    if expected != len(parsed):
+        raise WorkspaceError("baseline_pytest_failures_unparsed")
+    return frozenset(parsed)
+
+
+def _record_pytest_suite_vs_base(
+    row: dict[str, Any], baseline_row: Mapping[str, Any], base_oid: str
+) -> None:
+    candidate_ids = pytest_failed_node_ids(row)
+    if not candidate_ids:
+        raise WorkspaceError("baseline_pytest_failures_unparsed")
+    baseline_ids = pytest_failed_node_ids(baseline_row)
+    new = candidate_ids - baseline_ids
+    pre_existing = candidate_ids & baseline_ids
+    fixed = baseline_ids - candidate_ids
+    row["baseline_comparison"] = {
+        "schema_id": "aiworkhub.baseline_comparison.v1",
+        "kind": "pytest_suite_vs_base",
+        "outcome": "baseline_new_failures" if new else "baseline_no_new_failures",
+        "base_oid": base_oid,
+        "candidate_authority": baseline_validation_identity(row),
+        "baseline_authority": baseline_validation_identity(baseline_row),
+        "new_count": len(new),
+        "pre_existing_count": len(pre_existing),
+        "fixed_count": len(fixed),
+        "new_failures": sorted(new)[:PYTEST_FAILED_ID_CAP],
+        "pre_existing": sorted(pre_existing)[:PYTEST_FAILED_ID_CAP],
+        "fixed": sorted(fixed)[:PYTEST_FAILED_ID_CAP],
+    }
+    if new:
+        raise WorkspaceError("baseline_pytest_new_failures")
+
+
 def baseline_validation_identity(row: Mapping[str, Any]) -> dict[str, Any]:
     """Return execution facts that must match before diagnostics compare."""
     return {
@@ -384,15 +482,14 @@ def compare_schema_mypy_baseline(
     run_validations: ValidationRunner,
     route_resolver: RouteResolver,
 ) -> list[dict[str, Any]]:
-    """Compare candidate mypy diagnostics with its pinned-base execution."""
+    """Compare candidate mypy/pytest failures with the pinned-base execution."""
     failed = [
         row
         for row in candidate
         if row.get("timed_out") or row.get("returncode") != 0
     ]
     if not failed or any(
-        str(row.get("behavioral_role") or "").lower() not in {"schema", "parity"}
-        or not exact_schema_mypy_invocation(row)
+        not (_is_schema_mypy_row(row) or _is_suite_vs_base_row(row))
         for row in failed
     ):
         raise WorkspaceError("baseline_comparison_ineligible")
@@ -413,9 +510,14 @@ def compare_schema_mypy_baseline(
             pinned_base_oid=workspace.base_oid,
         )
         for row in failed:
+            is_pytest = _is_suite_vs_base_row(row)
             command = str(row.get("declared_command") or row.get("command") or "")
             if not command:
-                raise WorkspaceError("baseline_mypy_command_missing")
+                raise WorkspaceError(
+                    "baseline_pytest_command_missing"
+                    if is_pytest
+                    else "baseline_mypy_command_missing"
+                )
             try:
                 baseline_rows = run_validations(
                     baseline_workspace, [command], **route_resolver(route_metadata)
@@ -429,6 +531,9 @@ def compare_schema_mypy_baseline(
                 baseline_row
             ):
                 raise WorkspaceError("baseline_validation_authority_mismatch")
+            if is_pytest:
+                _record_pytest_suite_vs_base(row, baseline_row, workspace.base_oid)
+                continue
             candidate_diagnostics = schema_mypy_diagnostics(row)
             baseline_diagnostics = schema_mypy_diagnostics(baseline_row)
             new_diagnostics = sorted(
