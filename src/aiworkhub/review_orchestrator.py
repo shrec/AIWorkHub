@@ -18,6 +18,7 @@ from . import (
     db_writer,
     model_settings,
     needfix_store,
+    provider_route_contracts,
     quality_evidence,
     review_hedge,
     review_lifecycle,
@@ -263,6 +264,77 @@ def _review_route_policy_enabled(
         return False
 
 
+_REVIEW_ROUTE_SKIP_LIMIT = 16
+# Ranker exclusions a read-only reviewer can still run under; any other reason
+# (unavailable, credentials, quota, provider, pin, kind) means it cannot run.
+_REVIEW_FALLBACK_ELIGIBLE_EXCLUSIONS = (
+    provider_route_contracts.REASON_NOT_DECLARED + ":",
+    "missing_tools:",
+    "observed_or_prior_quality_below_floor",
+    "quality_ceiling_below_floor",
+    "risk_exceeds_worker_limit",
+)
+
+
+class ReviewRouteUnavailable(RuntimeError):
+    """No reviewer route survived; ``skipped`` names why each was passed over."""
+
+    def __init__(self, lens: str, skipped: Iterable[Mapping[str, Any]] = ()) -> None:
+        super().__init__("review_route_unavailable:" + lens)
+        self.skipped = [dict(row) for row in skipped][:_REVIEW_ROUTE_SKIP_LIMIT]
+
+
+def _ranker_exclusion_reasons(candidate: Mapping[str, Any]) -> tuple[str, ...]:
+    raw = candidate.get("exclusion_reasons")
+    if isinstance(raw, str):
+        raw = (raw,)
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(str(reason) for reason in raw if str(reason))
+
+
+def _ranker_exclusion_is_fallback_eligible(reasons: tuple[str, ...]) -> bool:
+    # No stated reason is unknown, and unknown is never eligible.
+    return bool(reasons) and all(
+        reason.startswith(_REVIEW_FALLBACK_ELIGIBLE_EXCLUSIONS) for reason in reasons
+    )
+
+
+def _review_route_refusal(
+    repo: Path,
+    route: Mapping[str, str],
+    identity: tuple[str, str, str],
+    model_policy: Any,
+    excluded_routes: frozenset[tuple[str, str, str]],
+    excluded_adapters: frozenset[str],
+) -> str:
+    """The hard-filter reason this route cannot be launched, or ``""``."""
+    if identity in excluded_routes:
+        return "excluded_route"
+    if route["adapter_id"] in excluded_adapters:
+        return "excluded_adapter"
+    if _manager_reserved_codex_route(route):
+        return "manager_reserved"
+    if not _review_route_policy_enabled(model_policy, route):
+        return "policy_disabled"
+    # NF-2026-01588: reviewer selection honors the same route failure
+    # circuit that worker launch derivation already consults, so a quota
+    # outage stops relaunching reviewers on the failing route. An
+    # unreadable circuit skips nothing: any exception reads as
+    # "not open", exactly like ``_derivation_route_circuit``.
+    try:
+        if (
+            workforce_catalog.route_circuit_for(
+                repo, route["adapter_id"], route["model"]
+            ).get("state")
+            == "open"
+        ):
+            return "circuit_open"
+    except Exception:
+        return ""
+    return ""
+
+
 def select_reviewer_route(
     repo: Path,
     reviewer_task_id: str,
@@ -296,20 +368,36 @@ def select_reviewer_route(
     # A None catalog makes rank_task rebuild the bare one itself, which is
     # precisely the conservative-prior ranking this did unconditionally before.
     ranked = workforce_catalog.rank_task(repo, task, catalog=routing_catalog(repo))
-    candidates: list[Mapping[str, Any]] = []
+    primary: list[Mapping[str, Any]] = []
     contract = ranked.get("launch_contract")
     if isinstance(contract, Mapping):
-        candidates.append(contract)
+        primary.append(contract)
+    ranker_excluded: list[tuple[Mapping[str, Any], tuple[str, ...]]] = []
     for candidate in ranked.get("candidates") or []:
-        if not isinstance(candidate, Mapping) or candidate.get("excluded") is True:
+        if not isinstance(candidate, Mapping):
             continue
-        candidates.append({
+        entry = {
             "runner": candidate.get("execution_runner"),
             "adapter_id": candidate.get("adapter_id"),
             "model": candidate.get("model"),
-        })
+        }
+        if candidate.get("excluded") is True:
+            ranker_excluded.append((entry, _ranker_exclusion_reasons(candidate)))
+        else:
+            primary.append(entry)
     seen: set[tuple[str, str, str]] = set()
-    for candidate in candidates:
+    skipped: list[dict[str, str]] = []
+
+    def _record_skip(route: Mapping[str, str], why: str) -> None:
+        if len(skipped) < _REVIEW_ROUTE_SKIP_LIMIT:
+            skipped.append({
+                "runner": route["runner"],
+                "adapter_id": route["adapter_id"],
+                "model": route["model"],
+                "skip": why,
+            })
+
+    def _examine(candidate: Mapping[str, Any]) -> tuple[dict[str, str], str] | None:
         route = {
             "runner": str(candidate.get("runner") or ""),
             "adapter_id": str(candidate.get("adapter_id") or ""),
@@ -317,32 +405,42 @@ def select_reviewer_route(
         }
         identity = _review_route_identity(route)
         if not all(identity) or identity in seen:
-            continue
+            return None
         seen.add(identity)
-        # NF-2026-01588: reviewer selection honors the same route failure
-        # circuit that worker launch derivation already consults, so a quota
-        # outage stops relaunching reviewers on the failing route. An
-        # unreadable circuit skips nothing: any exception reads as
-        # "not open", exactly like ``_derivation_route_circuit``.
-        try:
-            circuit_open = (
-                workforce_catalog.route_circuit_for(
-                    repo, route["adapter_id"], route["model"]
-                ).get("state")
-                == "open"
-            )
-        except Exception:
-            circuit_open = False
-        if (
-            identity in excluded_routes
-            or route["adapter_id"] in excluded_adapters
-            or _manager_reserved_codex_route(route)
-            or not _review_route_policy_enabled(model_policy, route)
-            or circuit_open
-        ):
+        return route, _review_route_refusal(
+            repo, route, identity, model_policy, excluded_routes, excluded_adapters,
+        )
+
+    for candidate in primary:
+        examined = _examine(candidate)
+        if examined is None:
+            continue
+        route, refusal = examined
+        if refusal:
+            _record_skip(route, refusal)
             continue
         return route
-    raise RuntimeError("review_route_unavailable:" + lens)
+    # Fallback pass: the ranker preferred nothing, so a launchable route it
+    # excluded only for a soft reason beats parking every reviewer lens.
+    for candidate, reasons in ranker_excluded:
+        examined = _examine(candidate)
+        if examined is None:
+            continue
+        route, refusal = examined
+        if not _ranker_exclusion_is_fallback_eligible(reasons):
+            _record_skip(route, "ranker_excluded:" + ",".join(reasons))
+            continue
+        if refusal:
+            _record_skip(route, refusal)
+            continue
+        return {
+            **route,
+            "route_fallback": {
+                "reason": "ranked_routes_exhausted",
+                "ranker_exclusion": list(reasons),
+            },
+        }
+    raise ReviewRouteUnavailable(lens, skipped)
 
 
 _REVIEWER_RUNNING_STATES = frozenset({
@@ -1156,6 +1254,14 @@ ROUTE_ATTEMPT_TABLE = (
     "UNIQUE (chain_id, lens, reviewer_task_id))"
 )
 
+# NF-2026-01856: the ranker exclusion a fallback-selected attempt launched under.
+ROUTE_FALLBACK_TABLE = (
+    "CREATE TABLE IF NOT EXISTS review_orchestrator_route_fallbacks ("
+    "chain_id INTEGER NOT NULL, lens TEXT NOT NULL, attempt_index INTEGER NOT NULL, "
+    "fallback_json TEXT NOT NULL, "
+    "PRIMARY KEY (chain_id, lens, attempt_index))"
+)
+
 MANAGER_HOLD_DECISION_SCHEMA = "aiworkhub.review_manager_hold_decision.v1"
 MANAGER_HOLD_DECISION_TABLE = (
     "CREATE TABLE IF NOT EXISTS review_orchestrator_manager_hold_decisions ("
@@ -1966,10 +2072,25 @@ class DrainResult:
 class _DeferredLaunch(RuntimeError):
     """A recoverable launch gate result, kept distinct from effect failures."""
 
-    def __init__(self, reason: str, receipt: Mapping[str, Any]) -> None:
+    def __init__(
+        self,
+        reason: str,
+        receipt: Mapping[str, Any],
+        *,
+        route_skips: Iterable[Mapping[str, Any]] = (),
+    ) -> None:
         super().__init__(reason)
         self.reason = reason
         self.receipt = dict(receipt)
+        self.route_skips = [dict(row) for row in route_skips]
+
+
+def _exception_route_skips(exc: BaseException) -> list[dict[str, Any]]:
+    """The per-candidate skip rows a route refusal carries, or none."""
+    skipped = getattr(exc, "skipped", None)
+    if not isinstance(skipped, (list, tuple)):
+        return []
+    return [dict(row) for row in skipped if isinstance(row, Mapping)]
 
 
 class ReviewOrchestrator:
@@ -3284,7 +3405,7 @@ class ReviewOrchestrator:
         excluded: frozenset[tuple[str, str, str]],
         *,
         excluded_adapters: frozenset[str] = frozenset(),
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         if self.route_selector is select_reviewer_route:
             selected = select_reviewer_route(
                 self.manager.repo, reviewer_task_id, lens,
@@ -3293,7 +3414,7 @@ class ReviewOrchestrator:
             )
         else:
             selected = self.route_selector(self.manager.repo, reviewer_task_id, lens)
-        route = {
+        route: dict[str, Any] = {
             "runner": str(selected.get("runner") or ""),
             "adapter_id": str(selected.get("adapter_id") or ""),
             "model": str(selected.get("model") or ""),
@@ -3302,7 +3423,15 @@ class ReviewOrchestrator:
         if not all(identity) or _manager_reserved_codex_route(route):
             raise RuntimeError("review_route_identity_invalid")
         if identity in excluded or route["adapter_id"] in excluded_adapters:
-            raise RuntimeError("review_route_unavailable:" + lens)
+            raise ReviewRouteUnavailable(lens, [{
+                **route,
+                "skip": (
+                    "excluded_route" if identity in excluded else "excluded_adapter"
+                ),
+            }])
+        fallback = selected.get("route_fallback")
+        if isinstance(fallback, Mapping):
+            route["route_fallback"] = dict(fallback)
         return route
 
     def _attempt_route_binding_matches(
@@ -3531,6 +3660,16 @@ class ReviewOrchestrator:
                     route["model"],
                 ),
             )
+            if route.get("route_fallback"):
+                conn.execute(ROUTE_FALLBACK_TABLE)
+                conn.execute(
+                    "INSERT OR IGNORE INTO review_orchestrator_route_fallbacks "
+                    "(chain_id,lens,attempt_index,fallback_json) VALUES (?,?,?,?)",
+                    (
+                        int(action.chain_id), action.lens, attempt_index,
+                        json.dumps(route["route_fallback"], sort_keys=True),
+                    ),
+                )
             if manager_authorization is not None:
                 conn.execute(
                     "UPDATE review_orchestrator_manager_hold_decisions "
@@ -3564,6 +3703,7 @@ class ReviewOrchestrator:
             if str(exc).startswith("review_route_"):
                 raise _DeferredLaunch(
                     str(exc), {"outcome": "deferred", "reason": str(exc)},
+                    route_skips=_exception_route_skips(exc),
                 ) from exc
             raise
 
@@ -4123,6 +4263,7 @@ class ReviewOrchestrator:
                                     "model": str(attempt["model"]),
                                 },
                             },
+                            route_skips=_exception_route_skips(exc),
                         ) from exc
                     raise
                 self._launch_with_successor(action, successor)
@@ -4600,18 +4741,21 @@ class ReviewOrchestrator:
         if not callable(append):
             return
         identity = action.descriptor["chain_identity"]
+        automation: dict[str, Any] = {
+            "state": "deferred",
+            "reason": deferred.reason,
+            "action_id": action.action_id,
+            "retry_after_seconds": 60,
+            "recorded_at": now.isoformat(),
+            "readiness_receipt": deferred.receipt,
+        }
+        if deferred.route_skips:
+            automation["route_skips"] = list(deferred.route_skips)
         append({
             "event_type": "review_orchestrator_wait",
             "request_id": identity["target_request_id"],
             "task_id": identity["target_task_id"],
-            "review_automation": {
-                "state": "deferred",
-                "reason": deferred.reason,
-                "action_id": action.action_id,
-                "retry_after_seconds": 60,
-                "recorded_at": now.isoformat(),
-                "readiness_receipt": deferred.receipt,
-            },
+            "review_automation": automation,
         })
 
     def _linked_needfix_rows(self, target_task_id: str) -> list[dict[str, Any]]:
