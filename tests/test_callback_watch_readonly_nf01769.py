@@ -134,6 +134,7 @@ def test_a_codex_owned_lane_with_watch_ids_returns_compact_rows_and_never_delive
     assert _delivery_state() == before
 
 
+@pytest.mark.live_manager_chat_seat
 def test_a_manager_chat_owned_lane_also_watches_read_only(repo, monkeypatch):
     state = repo / ".aiworkhub" / "runtime" / "manager_loop"
     (state / "sessions").mkdir(parents=True, exist_ok=True)

@@ -11930,6 +11930,8 @@ CALLBACK_WAIT_HOST_SAFETY_SECONDS = 15
 CALLBACK_WAIT_WATCH_POLL_SECONDS = 2.0
 CALLBACK_WAIT_WATCH_LIMIT = 64
 CALLBACK_WAIT_SNAPSHOT_LIMIT = 64
+CALLBACK_WAIT_REVIEW_WAITING_LIMIT = 20
+CALLBACK_WAIT_SKIPPED_STALE_LIMIT = 50
 
 
 def callback_wait_limits() -> dict[str, Any]:
@@ -12174,6 +12176,124 @@ def _claude_lane_refusal() -> dict[str, Any]:
     return {"reason": "verified_claude_manager_required"}
 
 
+def _callback_member_stale_reason(conn: sqlite3.Connection, member: Mapping[str, Any]) -> str:
+    """NF-2026-01859: ``task_<state>`` when a claimed callback member no longer
+    describes its task (closed, or moved off the transition it announces), else
+    ''.  A member with no task row is left to the claim's own terminal-state
+    recheck, which already supersedes it."""
+    task_id = str(member.get("task_id") or "")
+    row = conn.execute(
+        "SELECT status, worker_status, archived_at, card_json FROM tasks WHERE task_id=?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return ""
+    try:
+        card = json.loads(row["card_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        card = {}
+    if not isinstance(card, dict):
+        card = {}
+    status = str(row["status"] or "").strip().lower()
+    worker_status = str(row["worker_status"] or "").strip().lower()
+    lifecycle = _lifecycle_state({"status": status, "worker_status": worker_status})
+    if str(row["archived_at"] or "").strip() or lifecycle == "archived":
+        return "task_archived"
+    substatus = str(card.get("terminal_substatus") or "").strip().lower()
+    cancelled = {"cancelled", "canceled"}
+    if status in cancelled or worker_status in cancelled or (
+        lifecycle == "blocked" and substatus in cancelled
+    ):
+        return "task_cancelled"
+    if lifecycle in {"superseded", "finished"}:
+        return f"task_{lifecycle}"
+    if callback_store._task_still_in_matching_terminal_state(
+        conn,
+        task_id,
+        str(member.get("transition") or ""),
+        str(member.get("episode_id") or "0"),
+    ):
+        return ""
+    return "task_transition_changed" if lifecycle in {"review", "blocked"} else f"task_{lifecycle}"
+
+
+def _callback_review_waiting(provider: str, session_id: str) -> dict[str, Any]:
+    """NF-2026-01859: review-bucket cards of ``provider`` this wait cannot
+    deliver, bounded to ``CALLBACK_WAIT_REVIEW_WAITING_LIMIT`` rows.  Visibility
+    only: nothing here claims, seeds or acknowledges, and the claim's route
+    scoping is untouched.  ``reason`` is other_origin (a callback row for the
+    current episode belongs to another origin), deferred_review_chain (the wake
+    is held for the quality-review chain) or no_callback_row."""
+    waiting: list[dict[str, str]] = []
+    try:
+        conn = _canonical_connect(readonly=True)
+        try:
+            tasks = conn.execute(
+                "SELECT task_id, status, card_json FROM tasks "
+                "WHERE status IN ('review', 'blocked') AND (archived_at IS NULL OR archived_at='') "
+                "ORDER BY updated_at DESC, task_id ASC"
+            )
+            for task in tasks:
+                if len(waiting) >= CALLBACK_WAIT_REVIEW_WAITING_LIMIT:
+                    break
+                try:
+                    card = json.loads(task["card_json"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    card = {}
+                if not isinstance(card, dict):
+                    card = {}
+                if str(card.get("coordinator_provider") or provider).strip().lower() != provider:
+                    continue
+                substatus = str(card.get("terminal_substatus") or "").strip()
+                if str(task["status"] or "") == "blocked" and (
+                    callback_store.normalize_callback_transition(substatus)
+                    not in callback_store.CALLBACK_ELIGIBLE_TRANSITIONS
+                ):
+                    continue
+                task_id = str(task["task_id"] or "")
+                outbox = conn.execute(
+                    "SELECT origin_thread_id, state FROM callback_outbox "
+                    "WHERE task_id=? AND provider IN (?, ?) AND episode_id=?",
+                    (
+                        task_id,
+                        provider,
+                        callback_store.MANAGER_CHAT_PROVIDER,
+                        str(card.get("claim_epoch") or 0),
+                    ),
+                ).fetchall()
+                if any(
+                    row["origin_thread_id"] == session_id
+                    and row["state"] in {"pending", "inflight", "delivered"}
+                    for row in outbox
+                ):
+                    continue
+                review = card.get("terminal_review")
+                evidence = review.get("evidence") if isinstance(review, dict) else None
+                if any(row["origin_thread_id"] != session_id for row in outbox):
+                    reason = "other_origin"
+                elif (
+                    isinstance(evidence, dict)
+                    and isinstance(evidence.get("manager_callback_deferred"), dict)
+                    and not card.get("manager_ready_receipt")
+                ):
+                    reason = "deferred_review_chain"
+                else:
+                    reason = "no_callback_row"
+                waiting.append(
+                    {
+                        "task_id": task_id,
+                        "status": str(task["status"] or ""),
+                        "terminal_substatus": substatus,
+                        "reason": reason,
+                    }
+                )
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 -- evidence must never break the wait
+        return {"review_waiting": [], "review_waiting_error": type(exc).__name__}
+    return {"review_waiting": waiting}
+
+
 def claude_callback_wait(
     timeout_seconds: int = 240,
     ack_batch_id: str = "",
@@ -12225,6 +12345,7 @@ def claude_callback_wait(
     watch_baseline = _watch_signature(_watch_rows(), watch) if watch else {}
     next_watch_poll = time.monotonic() + CALLBACK_WAIT_WATCH_POLL_SECONDS
     deadline = time.monotonic() + timeout
+    skipped_stale: list[dict[str, str]] = []
     while True:
         conn = _canonical_connect()
         try:
@@ -12271,30 +12392,68 @@ def claude_callback_wait(
                 finally:
                     conn.close()
             else:
-                members = [
-                    {
-                        "task_id": str(member.get("task_id") or ""),
-                        "state": str(member.get("transition") or ""),
-                        "event_id": str(member.get("event_id") or ""),
-                        "request_id": str(member.get("request_id") or ""),
+                members: list[dict[str, Any]] = []
+                conn = _canonical_connect(readonly=True)
+                try:
+                    for member in batch.get("members", []):
+                        entry: dict[str, Any] = {
+                            "task_id": str(member.get("task_id") or ""),
+                            "state": str(member.get("transition") or ""),
+                            "event_id": str(member.get("event_id") or ""),
+                            "request_id": str(member.get("request_id") or ""),
+                        }
+                        stale_reason = _callback_member_stale_reason(conn, member)
+                        if stale_reason:
+                            entry["actionable"] = False
+                            entry["stale_reason"] = stale_reason
+                        members.append(entry)
+                finally:
+                    conn.close()
+                stale_acked = False
+                if members and all(entry.get("actionable") is False for entry in members):
+                    conn = _canonical_connect()
+                    try:
+                        stale_acked = callback_store.acknowledge_callback_batch(
+                            conn,
+                            str(batch["batch_id"]),
+                            str(batch["lease_id"]),
+                            provider="claude",
+                            origin_thread_id=session_id,
+                        )
+                    finally:
+                        conn.close()
+                # An unacknowledged all-stale batch is delivered like any other, so
+                # skipped_stale only ever names batches that were really consumed.
+                if not stale_acked:
+                    return {
+                        "ok": True,
+                        "status": "callback_ready",
+                        "provider": "claude",
+                        "batch_id": batch["batch_id"],
+                        "lease_id": batch["lease_id"],
+                        "origin_thread_id": batch["origin_thread_id"],
+                        "members": members,
+                        "ack": ack_result,
+                        "ack_hint": (
+                            "pass batch_id/lease_id as ack_batch_id/ack_lease_id on the next "
+                            "aiworkhub_claude_callback_wait, or call aiworkhub_claude_callback_ack"
+                        ),
+                        **({"skipped_stale": list(skipped_stale)} if skipped_stale else {}),
+                        **timing,
                     }
-                    for member in batch.get("members", [])
-                ]
-                return {
-                    "ok": True,
-                    "status": "callback_ready",
-                    "provider": "claude",
-                    "batch_id": batch["batch_id"],
-                    "lease_id": batch["lease_id"],
-                    "origin_thread_id": batch["origin_thread_id"],
-                    "members": members,
-                    "ack": ack_result,
-                    "ack_hint": (
-                        "pass batch_id/lease_id as ack_batch_id/ack_lease_id on the next "
-                        "aiworkhub_claude_callback_wait, or call aiworkhub_claude_callback_ack"
-                    ),
-                    **timing,
-                }
+                for entry in members:
+                    if len(skipped_stale) < CALLBACK_WAIT_SKIPPED_STALE_LIMIT:
+                        skipped_stale.append(
+                            {
+                                "task_id": entry["task_id"],
+                                "batch_id": str(batch["batch_id"]),
+                                "stale_reason": entry["stale_reason"],
+                            }
+                        )
+                # Claim the next batch at once, but never past the wait's deadline;
+                # once it has passed, fall through to the timeout reply below.
+                if deadline - time.monotonic() > 0:
+                    continue
         now = time.monotonic()
         if watch and now >= next_watch_poll:
             next_watch_poll = now + CALLBACK_WAIT_WATCH_POLL_SECONDS
@@ -12317,6 +12476,8 @@ def claude_callback_wait(
                     "changes": changes,
                     "ack": ack_result,
                     "liveness": _claude_session_liveness_snapshot(identity, watch),
+                    **_callback_review_waiting("claude", session_id),
+                    **({"skipped_stale": list(skipped_stale)} if skipped_stale else {}),
                     **timing,
                 }
         remaining = deadline - time.monotonic()
@@ -12328,6 +12489,8 @@ def claude_callback_wait(
                 "waited_seconds": timeout,
                 "ack": ack_result,
                 "liveness": _claude_session_liveness_snapshot(identity, watch),
+                **_callback_review_waiting("claude", session_id),
+                **({"skipped_stale": list(skipped_stale)} if skipped_stale else {}),
                 **timing,
             }
         time.sleep(min(0.5, remaining))
