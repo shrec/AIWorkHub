@@ -4654,6 +4654,9 @@ def preflight_validation_capabilities(
             executable = Path(normalized[0])
             if not executable.is_file() or not os.access(executable, os.X_OK):
                 missing.add(f"executable:{normalized[0]}")
+            unreachable = toolchain_unreachable_reason(repo, argv[0])
+            if unreachable:
+                missing.add(unreachable)
             for module in validation_runner.dash_m_validator_modules(normalized):
                 if not (
                     executable.is_file()
@@ -7745,6 +7748,12 @@ _TRUSTED_VALIDATION_BARE_EXECUTABLES = frozenset({"pytest", "ruff", "mypy"})
 # ``shutil.which`` + repository-owned-rejection path below.  A bare-script
 # Landlock wrapper has no package context and trusts no host tool (fail closed).
 if __package__:
+    from .toolchain_registry import (  # NF-2026-01843: registered compilers
+        _resolve_trusted_system_validation_executable,
+        registered_toolchain,
+        toolchain_for_launch,
+        toolchain_unreachable_reason,
+    )
     from .validation_toolchains import (
         CMAKE_FAMILY_SYSTEM_EXECUTABLES as _CMAKE_FAMILY_SYSTEM_EXECUTABLES,
         NODE_FAMILY_SYSTEM_EXECUTABLES as _NODE_FAMILY_SYSTEM_EXECUTABLES,
@@ -7753,6 +7762,9 @@ if __package__:
 else:
     _CMAKE_FAMILY_SYSTEM_EXECUTABLES = _NODE_FAMILY_SYSTEM_EXECUTABLES = frozenset()
     _TRUSTED_VALIDATION_SYSTEM_EXECUTABLES = frozenset()
+
+    def registered_toolchain(_name: str) -> None:
+        return None
 SANDBOX_VALIDATION_EXECUTABLE_ROOT = "/validation-executable-root"
 
 
@@ -7838,33 +7850,6 @@ def _resolve_trusted_validation_executable(
             raise WorkspaceError(f"validation_executable_runtime_root_world_writable:{root}")
         return _trusted_validation_executable_from_resolved(name, root, resolved)
     raise WorkspaceError(f"validation_executable_unavailable:{name}")
-
-
-def _resolve_trusted_system_validation_executable(
-    name: str, repo: Path | None = None
-) -> Path:
-    """Resolve one explicitly approved host tool to an immutable absolute path."""
-    if name not in _TRUSTED_VALIDATION_SYSTEM_EXECUTABLES:
-        raise WorkspaceError(f"validation_executable_not_approved:{name}")
-    discovered = shutil.which(name)
-    if not discovered:
-        raise WorkspaceError(f"validation_executable_unavailable:{name}")
-    try:
-        resolved = Path(discovered).resolve(strict=True)
-    except OSError as exc:
-        raise WorkspaceError(f"validation_executable_unavailable:{name}") from exc
-    if not resolved.is_file() or not os.access(resolved, os.X_OK):
-        raise WorkspaceError(f"validation_executable_not_executable:{resolved}")
-    if repo is not None:
-        try:
-            resolved.relative_to(repo.resolve(strict=False))
-        except ValueError:
-            pass
-        else:
-            raise WorkspaceError(
-                f"validation_executable_repository_owned:{resolved}"
-            )
-    return resolved
 
 
 def _trusted_validation_executable_from_resolved(
@@ -8844,7 +8829,7 @@ def _normalize_trusted_validation_executable_argv_with_authority(
     # here, preserving their existing fail-closed rules.
     if _BARE_PYTHON_INTERPRETER_RE.match(head):
         return [sys.executable, *argv[1:]], (), None
-    if head in _TRUSTED_VALIDATION_SYSTEM_EXECUTABLES:
+    if head in _TRUSTED_VALIDATION_SYSTEM_EXECUTABLES or registered_toolchain(head):
         executable = _resolve_trusted_system_validation_executable(head, repo)
         # node/npm/npx are commonly installed through nvm outside /usr.
         # Bubblewrap cannot execute that absolute path unless the immutable
@@ -12898,6 +12883,9 @@ def _run_appcontainer_validation(
         # NF-2026-01337: every command, python scripts included -- EntryLink
         # 006a spawns cmake from one, so gating on argv[0] never fires.
         env = {**env, **build_tool_env(env, appcontainer=True)}
+    toolchain = toolchain_for_launch(executable)
+    if toolchain is not None:
+        env = toolchain.launch_env(env)
     launch_argv = effective_argv
     if (
         env.get("TMPDIR")
@@ -12944,14 +12932,13 @@ def _run_appcontainer_validation(
         # NF-2026-01042: the host-owned grammar mirror, read-only, if forwarded.
         *mirror_read_grants(workspace.repo, env),
     ]
+    covered = [grant.path for grant in request_grants if grant.access != "traverse"]
     try:
         request_grants += python_read_grants(
-            executable,
-            str(env.get("PYTHONPATH") or ""),
-            covered=[
-                grant.path for grant in request_grants if grant.access != "traverse"
-            ],
+            executable, str(env.get("PYTHONPATH") or ""), covered=covered
         )
+        if toolchain is not None:
+            request_grants += toolchain.read_grants(covered=covered)
     except AppContainerError as exc:
         raise OSError(f"windows_appcontainer_validation_launch_failed:{exc}") from exc
 
