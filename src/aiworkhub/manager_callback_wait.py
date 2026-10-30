@@ -403,6 +403,53 @@ def _callback_review_waiting(provider: str, session_id: str) -> dict[str, Any]:
     return {"review_waiting": waiting}
 
 
+def _callback_launch_blocked(provider: str) -> dict[str, Any]:
+    """NF-2026-01850: pending, unclaimed cards of ``provider`` carrying a
+    pre-claim ``operational_blocker`` (launch_blocked, quota_circuit_reroute),
+    bounded to ``CALLBACK_WAIT_REVIEW_WAITING_LIMIT`` rows.  Read-only
+    visibility: the callback outbox cannot carry these because they are not
+    terminal."""
+    from . import core  # lazy: core re-exports this module
+    blocked: list[dict[str, str]] = []
+    try:
+        conn = core._canonical_connect(readonly=True)
+        try:
+            tasks = conn.execute(
+                "SELECT task_id, card_json FROM tasks "
+                "WHERE status='pending' AND (archived_at IS NULL OR archived_at='') "
+                "ORDER BY updated_at DESC, task_id ASC"
+            )
+            for task in tasks:
+                if len(blocked) >= CALLBACK_WAIT_REVIEW_WAITING_LIMIT:
+                    break
+                try:
+                    card = json.loads(task["card_json"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    card = {}
+                if not isinstance(card, dict):
+                    card = {}
+                if str(card.get("coordinator_provider") or provider).strip().lower() != provider:
+                    continue
+                blocker = card.get("operational_blocker")
+                if not isinstance(blocker, dict):
+                    continue
+                blocked.append(
+                    {
+                        "task_id": str(task["task_id"] or ""),
+                        "kind": str(blocker.get("kind") or ""),
+                        "reason": str(blocker.get("reason") or ""),
+                        "adapter_id": str(blocker.get("adapter_id") or ""),
+                        "observed_at": str(blocker.get("observed_at") or ""),
+                        "request_id": str(blocker.get("request_id") or ""),
+                    }
+                )
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 -- evidence must never break the wait
+        return {"launch_blocked": [], "launch_blocked_error": type(exc).__name__}
+    return {"launch_blocked": blocked}
+
+
 def claude_callback_wait(
     timeout_seconds: int = 240,
     ack_batch_id: str = "",
@@ -454,6 +501,10 @@ def claude_callback_wait(
             return []
 
     watch_baseline = _watch_signature(_watch_rows(), watch) if watch else {}
+    blocked_baseline = {
+        (entry["task_id"], entry["observed_at"])
+        for entry in _callback_launch_blocked("claude")["launch_blocked"]
+    }
     next_watch_poll = time.monotonic() + core.CALLBACK_WAIT_WATCH_POLL_SECONDS
     deadline = time.monotonic() + timeout
     skipped_stale: list[dict[str, str]] = []
@@ -566,27 +617,48 @@ def claude_callback_wait(
                 if deadline - time.monotonic() > 0:
                     continue
         now = time.monotonic()
-        if watch and now >= next_watch_poll:
+        if now >= next_watch_poll:
             next_watch_poll = now + core.CALLBACK_WAIT_WATCH_POLL_SECONDS
-            current = _watch_signature(_watch_rows(), watch)
-            changes = [
-                {
-                    "request_id": request_id,
-                    "from": {"state": before[0], "preparation_phase": before[1], "exit_code": before[2]},
-                    "to": {"state": after[0], "preparation_phase": after[1], "exit_code": after[2]},
-                }
-                for request_id, before in watch_baseline.items()
-                for after in (current.get(request_id),)
-                if after is not None and after != before
+            if watch:
+                current = _watch_signature(_watch_rows(), watch)
+                changes = [
+                    {
+                        "request_id": request_id,
+                        "from": {"state": before[0], "preparation_phase": before[1], "exit_code": before[2]},
+                        "to": {"state": after[0], "preparation_phase": after[1], "exit_code": after[2]},
+                    }
+                    for request_id, before in watch_baseline.items()
+                    for after in (current.get(request_id),)
+                    if after is not None and after != before
+                ]
+                if changes:
+                    return {
+                        "ok": True,
+                        "status": "watch_changed",
+                        "provider": "claude",
+                        "changes": changes,
+                        "ack": ack_result,
+                        "liveness": core._claude_session_liveness_snapshot(identity, watch),
+                        **_callback_launch_blocked("claude"),
+                        **core._callback_review_waiting("claude", session_id),
+                        **({"skipped_stale": list(skipped_stale)} if skipped_stale else {}),
+                        **timing,
+                    }
+            blocked_now = _callback_launch_blocked("claude")
+            new_blocked = [
+                entry
+                for entry in blocked_now["launch_blocked"]
+                if (entry["task_id"], entry["observed_at"]) not in blocked_baseline
             ]
-            if changes:
+            if new_blocked:
                 return {
                     "ok": True,
-                    "status": "watch_changed",
+                    "status": "launch_blocked",
                     "provider": "claude",
-                    "changes": changes,
+                    "new_launch_blocked": new_blocked,
                     "ack": ack_result,
                     "liveness": core._claude_session_liveness_snapshot(identity, watch),
+                    **blocked_now,
                     **core._callback_review_waiting("claude", session_id),
                     **({"skipped_stale": list(skipped_stale)} if skipped_stale else {}),
                     **timing,
@@ -600,6 +672,7 @@ def claude_callback_wait(
                 "waited_seconds": timeout,
                 "ack": ack_result,
                 "liveness": core._claude_session_liveness_snapshot(identity, watch),
+                **_callback_launch_blocked("claude"),
                 **core._callback_review_waiting("claude", session_id),
                 **({"skipped_stale": list(skipped_stale)} if skipped_stale else {}),
                 **timing,
