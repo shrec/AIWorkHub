@@ -18,6 +18,7 @@ from aiworkhub import (  # noqa: E402
     launch_replay_guard,
     rework_delta_artifact,
     task_store,
+    task_templates,
 )
 from aiworkhub.learning_commit import FailureCategory  # noqa: E402
 
@@ -281,3 +282,32 @@ def test_reason_is_truncated_to_the_byte_limit():
     feedback = capped_continuation._feedback({"request_id": "r"}, "é" * 9000)
 
     assert len(feedback["instruction"].encode("utf-8")) <= capped_continuation.MAX_REASON_BYTES
+
+
+def test_continue_capped_custom_escape_card_creates_successor(repo, monkeypatch):
+    real_payload = core._create_payload_from_card
+    custom = {"template_name": task_templates.CUSTOM_TEMPLATE_NAME, "expanded_contract": {"stale": True}}
+    monkeypatch.setattr(core, "_create_payload_from_card", lambda card: {**real_payload(card), "template_provenance": custom})
+    _capped(repo, "NF1837_CUSTOM")
+
+    result = core.continue_capped_task("NF1837_CUSTOM", reason="decompose by module")
+
+    assert result["ok"] is True
+    (call,) = core._created_for_test
+    assert call["task_id"] == "NF1837_CUSTOM-c1"
+    assert call["template_provenance"] is None
+    assert call["custom_template_escape"] == task_templates.AUDITED_CUSTOM_ESCAPE
+    assert _archived(repo, "NF1837_CUSTOM")
+
+
+def test_continue_capped_named_template_provenance_passes_through(repo, monkeypatch):
+    real_payload = core._create_payload_from_card
+    named = {"template_name": "bugfix_minimal", "expanded_contract": {"kept": True}}
+    monkeypatch.setattr(core, "_create_payload_from_card", lambda card: {**real_payload(card), "template_provenance": named})
+    _capped(repo, "NF1837_NAMED_TPL")
+
+    core.continue_capped_task("NF1837_NAMED_TPL")
+
+    (call,) = core._created_for_test
+    assert call["template_provenance"] == named
+    assert call.get("custom_template_escape") in (None, "")

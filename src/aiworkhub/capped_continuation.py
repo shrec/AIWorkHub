@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from . import core, launch_replay_guard, rework_delta_artifact, task_store
+from . import core, launch_replay_guard, rework_delta_artifact, task_store, task_templates
 
 FEEDBACK_SCHEMA_ID = "aiworkhub.rework_feedback_delta.v1"
 MAX_REASON_BYTES = 8000
@@ -63,7 +63,13 @@ def continue_capped(task_id: str, *, reason: str = "", by: str = "") -> dict[str
     ):
         raise ValueError(PREDECESSOR_UNVERIFIED)
     successor = successor_task_id(task_id, by)
-    created = core.create_task(task_id=successor, **core._create_payload_from_card(card))
+    payload = core._create_payload_from_card(card)
+    provenance = payload["template_provenance"]
+    if isinstance(provenance, dict) and provenance.get("template_name") == task_templates.CUSTOM_TEMPLATE_NAME:
+        # create_task re-derives the audited escape from the copied contract fields.
+        payload["template_provenance"] = None
+        payload["custom_template_escape"] = task_templates.AUDITED_CUSTOM_ESCAPE
+    created = core.create_task(task_id=successor, **payload)
     if not created.get("ok"):
         raise ValueError(f"continuation_create_failed:{successor}:{created.get('stderr', '')}")
     ok, state = task_store.inherit_capped_rework(
