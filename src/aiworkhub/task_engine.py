@@ -872,6 +872,7 @@ def retry_finalize_failed(
 
 
 ACCEPTED_OUTCOME_RECEIPT_SCHEMA = "aiworkhub.accepted_outcome_receipt.v1"
+VALIDATION_FAILED_CORRECTION_ORIGIN = "validation_failed"
 
 
 def _canonical_json_hash(value: Any) -> str:
@@ -901,6 +902,12 @@ def _manager_correction_shape(
         "patch_sha256", "finding_ids", "paths",
         "candidate_path_hashes", "corrected_path_hashes", "reason",
     }
+    # NF-2026-01845: ``correction_origin`` is the one optional field, and its
+    # only legal value is the validation_failed origin.
+    if "correction_origin" in correction:
+        if correction["correction_origin"] != VALIDATION_FAILED_CORRECTION_ORIGIN:
+            return None, "accepted_outcome_receipt_manager_correction_malformed"
+        fields = fields | {"correction_origin"}
     if set(correction) != fields:
         return None, "accepted_outcome_receipt_manager_correction_malformed"
     paths = correction.get("paths")
@@ -1189,14 +1196,25 @@ def accept_review(
                 "stderr": "" if already else "task_already_finished_by_other_request",
             }
         terminal_review = card.get("terminal_review") or {}
-        if str(terminal_review.get("substatus") or "") != "review_ready":
+        terminal_substatus = str(terminal_review.get("substatus") or "")
+        # NF-2026-01845: a validation_failed candidate is admitted only when
+        # the receipt itself declares a validation_failed-origin correction.
+        correction_receipt = (
+            accepted_outcome_receipt.get("manager_correction")
+            if isinstance(accepted_outcome_receipt, dict)
+            else None
+        )
+        from_validation_failed = (
+            terminal_substatus == "validation_failed"
+            and isinstance(correction_receipt, dict)
+            and correction_receipt.get("correction_origin")
+            == VALIDATION_FAILED_CORRECTION_ORIGIN
+        )
+        if terminal_substatus != "review_ready" and not from_validation_failed:
             conn.rollback()
             return {
                 "ok": False, "returncode": 1, "command": command, "stdout": "",
-                "stderr": (
-                    "terminal_substatus_not_review_ready:"
-                    + str(terminal_review.get("substatus") or "")
-                ),
+                "stderr": "terminal_substatus_not_review_ready:" + terminal_substatus,
             }
         request_identity = (terminal_review.get("evidence") or {}).get("request_identity") or {}
         if str(request_identity.get("request_id") or "") != request_id:
@@ -1211,8 +1229,23 @@ def accept_review(
                 "ok": False, "returncode": 1, "command": command, "stdout": "",
                 "stderr": f"task_not_reviewable:status={status}:worker_status={worker_status}",
             }
+        receipt_card = card
+        if from_validation_failed:
+            # The sealed validation_failed evidence omits the attempt-artifact
+            # manifest, which the launcher verified from disk and passes here.
+            sealed_evidence = dict(terminal_review.get("evidence") or {})
+            if not isinstance(sealed_evidence.get("attempt_artifact_manifest"), dict):
+                sealed_evidence["attempt_artifact_manifest"] = (
+                    evidence.get("attempt_artifact_manifest")
+                    if isinstance(evidence, dict)
+                    else None
+                )
+            receipt_card = {
+                **card,
+                "terminal_review": {**terminal_review, "evidence": sealed_evidence},
+            }
         receipt, receipt_error = _validate_accepted_outcome_receipt(
-            repo, card, task_id, request_id, accepted_outcome_receipt
+            repo, receipt_card, task_id, request_id, accepted_outcome_receipt
         )
         if receipt is None:
             conn.rollback()

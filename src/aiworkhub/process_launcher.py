@@ -6619,12 +6619,14 @@ class ProcessManager:
         latest = split_lifecycle_tail(events)[0]
         if str(latest.get("task_id") or "") != target_task_id:
             return {"ok": False, "error": "quality_review_target_identity_mismatch"}
+        # NF-2026-01845: an explicit launch may target a validation_failed
+        # candidate, whose sealing event carries that state instead.
         review_ready_event = next(
             (
                 event
                 for event in reversed(events)
                 if str(event.get("task_id") or "") == target_task_id
-                and str(event.get("state") or "") == "review_ready"
+                and str(event.get("state") or "") in ("review_ready", "validation_failed")
             ),
             None,
         )
@@ -6646,7 +6648,8 @@ class ProcessManager:
             card_review_ready = (
                 str(card.get("status") or "") == "review"
                 and str(card.get("worker_status") or "") == "review"
-                and str(card.get("terminal_substatus") or "") == "review_ready"
+                and str(card.get("terminal_substatus") or "")
+                in ("review_ready", "validation_failed")
             )
             if review_ready_event is None or not card_review_ready:
                 return {
@@ -8181,6 +8184,24 @@ class ProcessManager:
         _target_verdict = quality_review.assess_reviewer_launch_target(
             target_card=_target_card
         )
+        # NF-2026-01845: only the explicit manager launch (the tool passes
+        # ``refuse_live_lens=True``; the orchestrator's automatic launch never
+        # does) may review a validation_failed candidate, so a correction can
+        # be judged. Automatic launches keep requiring ``review_ready``.
+        if (
+            refuse_live_lens
+            and isinstance(_target_card, Mapping)
+            and str(_target_card.get("status") or "") == "review"
+            and str(_target_card.get("worker_status") or "") == "review"
+            and str(_target_card.get("terminal_substatus") or "") == "validation_failed"
+        ):
+            _target_verdict = {
+                **_target_verdict,
+                "can_launch": True,
+                "fails_at_launch": False,
+                "reason": "",
+                "target_substatus": "validation_failed",
+            }
 
         def _bind_visible_card(
             request_id: str, *, terminalize_on_failure: bool

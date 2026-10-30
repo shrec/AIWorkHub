@@ -23,7 +23,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from . import __version__
 from . import manager_skill_tools
@@ -47,6 +47,8 @@ __all__ = [
     "ACCEPT_PREVIEW_SCHEMA_ID",
     "MANAGER_CORRECTION_SCHEMA_ID",
     "SUPPLEMENTAL_REVIEW_SCHEMA_ID",
+    "VALIDATION_ROW_ID_PREFIX",
+    "VALIDATION_ROW_NOT_FAILED_ERROR",
     "ManagerCorrectionError",
     "accept_in_flight",
     "accept_preview",
@@ -58,6 +60,7 @@ __all__ = [
     "create_supplemental_inspection_rounds",
     "dispose_review_finding",
     "effective_requested_risk_tier",
+    "failed_validation_rows",
     "fold_accept_blockers",
     "review_finding_dispositions",
     "reviewer_evidence",
@@ -65,6 +68,7 @@ __all__ = [
     "server_derived_risk_tier",
     "supplemental_rounds_completed",
     "validate_manager_correction",
+    "validation_failed_source_evidence",
 ]
 
 _REVIEWER_USABLE_STATES = ("review_ready", "accepted")
@@ -793,6 +797,51 @@ MANAGER_CORRECTION_SCHEMA_ID = "aiworkhub.manager_correction.v1"
 # than being silently dropped.
 MANAGER_CORRECTION_FIELDS = frozenset({"patch", "finding_ids", "reason"})
 
+# NF-2026-01845: a ``validation_failed`` candidate has no reviewer findings, so
+# a correction names the declared-validation row it repairs as
+# ``validation:<index>``. A row that did not fail is refused by name.
+VALIDATION_ROW_ID_PREFIX = "validation:"
+VALIDATION_ROW_NOT_FAILED_ERROR = "manager_correction_validation_row_not_failed:"
+
+
+def failed_validation_rows(terminal_review: Mapping[str, Any]) -> frozenset[int]:
+    """Indices of the declared-validation rows that failed in sealed evidence."""
+    evidence = terminal_review.get("evidence")
+    rows = evidence.get("validation") if isinstance(evidence, Mapping) else None
+    if not isinstance(rows, (list, tuple)):
+        return frozenset()
+    return frozenset(
+        index
+        for index, row in enumerate(rows)
+        if isinstance(row, Mapping)
+        and (row.get("timed_out") or row.get("returncode") not in (0, None))
+    )
+
+
+def validation_failed_source_evidence(
+    events: Sequence[Mapping[str, Any]], evidence: Mapping[str, Any]
+) -> tuple[Any, Any]:
+    """The attempt-artifact manifest and evidence record of a validation_failed card.
+
+    The sealed terminal evidence of a ``validation_failed`` card omits both;
+    they live only on the finalization event, so the card's own values win
+    and the latest event carrying one is the fallback.
+    """
+    found: dict[str, Any] = {}
+    for key in ("attempt_artifact_manifest", "evidence_record"):
+        value = evidence.get(key)
+        if not isinstance(value, dict):
+            value = next(
+                (
+                    event[key]
+                    for event in reversed(events)
+                    if isinstance(event.get(key), dict)
+                ),
+                None,
+            )
+        found[key] = value
+    return found["attempt_artifact_manifest"], found["evidence_record"]
+
 # Bounded inputs: a correction is a small repair of an already-reviewed
 # candidate, never a second candidate. Each cap refuses by name instead of
 # reading further.
@@ -1078,7 +1127,30 @@ def validate_manager_correction(
         and str(row.get("disposition") or "") == "confirmed"
     }
     finding_ids = sorted({str(value) for value in raw_ids})
+    # NF-2026-01845: on a validation_failed origin ``validation:<index>`` names
+    # a declared-validation row that failed in the sealed evidence. On any
+    # other origin such an id is an unknown finding, refused below as before.
+    terminal_review = card.get("terminal_review")
+    from_validation_failed = isinstance(terminal_review, Mapping) and (
+        str(terminal_review.get("substatus") or "") == "validation_failed"
+    )
+    failed_rows = (
+        failed_validation_rows(terminal_review) if from_validation_failed else ()
+    )
+    named_rows = 0
     for finding_id in finding_ids:
+        if from_validation_failed and finding_id.startswith(VALIDATION_ROW_ID_PREFIX):
+            index_text = finding_id[len(VALIDATION_ROW_ID_PREFIX) :]
+            if not (index_text.isascii() and index_text.isdigit()) or (
+                int(index_text) not in failed_rows
+            ):
+                return (
+                    None,
+                    {},
+                    f"{VALIDATION_ROW_NOT_FAILED_ERROR}{index_text}"[:200],
+                )
+            named_rows += 1
+            continue
         finding = findings.get(finding_id)
         if finding is None:
             return None, {}, f"finding_not_found:{finding_id}"[:200]
@@ -1162,6 +1234,8 @@ def validate_manager_correction(
         "reason": str(reason or "")[:2000],
         "actor": actor,
     }
+    if from_validation_failed and named_rows:
+        record["correction_origin"] = "validation_failed"
     return record, corrected_texts, ""
 
 
@@ -1535,7 +1609,13 @@ def fold_accept_blockers(
         reviewers, reviewer_request_ids
     )
     blockers: list[dict[str, Any]] = []
-    if str(terminal_substatus) != "review_ready":
+    # NF-2026-01845: only a VALIDATED correction whose origin is the
+    # validation_failed substatus itself admits that substatus.
+    if str(terminal_substatus) != "review_ready" and not (
+        str(terminal_substatus) == "validation_failed"
+        and manager_correction is not None
+        and manager_correction.get("correction_origin") == "validation_failed"
+    ):
         blockers.append(
             _blocker("terminal_substatus_not_review_ready", str(terminal_substatus))
         )
@@ -2333,6 +2413,9 @@ ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
     "server_derived_risk_tier",
     "supplemental_rounds_completed",
     "validate_manager_correction",
+    "VALIDATION_ROW_ID_PREFIX",
+    "VALIDATION_ROW_NOT_FAILED_ERROR",
+    "validation_failed_source_evidence",
 )
 
 ACCEPT_REVIEW_SEAM_NAMES: tuple[str, ...] = (
@@ -2587,7 +2670,12 @@ def accept_review(
             }
 
         terminal_review = card.get("terminal_review") or {}
-        if str(terminal_review.get("substatus") or "") != "review_ready":
+        # NF-2026-01845: a validation_failed candidate is admitted ONLY with a
+        # manager correction; without one the refusal below is unchanged.
+        if str(terminal_review.get("substatus") or "") != "review_ready" and not (
+            str(terminal_review.get("substatus") or "") == "validation_failed"
+            and manager_correction is not None
+        ):
             return {
                 "ok": False,
                 "error": (
@@ -2739,19 +2827,33 @@ def accept_review(
                 "task_id": task_id,
             }
         try:
+            # A validation_failed card carries its manifest and (inconclusive)
+            # evidence record only on the finalization event; both are still
+            # verified from disk below. The inconclusive source level is the
+            # reason the correction path re-proves every declared validation,
+            # so the minimum-level floor applies to the acceptance record
+            # minted here, not to that source record.
+            source_manifest = evidence.get("attempt_artifact_manifest")
+            source_record = evidence.get("evidence_record")
+            if str(terminal_review.get("substatus") or "") == "validation_failed":
+                source_manifest, source_record = validation_failed_source_evidence(
+                    events, evidence
+                )
             attempt_artifact_receipt = self._verify_attempt_artifact_receipt(
                 request_id,
-                evidence.get("attempt_artifact_manifest"),
+                source_manifest,
             )
             terminal_evidence_record = evidence_levels.validate_evidence_record(
-                evidence.get("evidence_record")
+                source_record
             )
             minimum_evidence_level = self._minimum_acceptance_evidence_level(
                 card,
                 readonly_quality_review=readonly_quality_review,
                 readonly_research=readonly_research,
             )
-            if not evidence_levels.meets_evidence_level(
+            if str(
+                terminal_review.get("substatus") or ""
+            ) != "validation_failed" and not evidence_levels.meets_evidence_level(
                 terminal_evidence_record.evidence_level,
                 minimum_evidence_level,
             ):
@@ -3437,7 +3539,13 @@ def accept_review(
                 if correction_record is None:
                     return {
                         "ok": False,
-                        "error": f"manager_correction_invalid:{correction_reason}"[:500],
+                        "error": (
+                            correction_reason
+                            if correction_reason.startswith(
+                                VALIDATION_ROW_NOT_FAILED_ERROR
+                            )
+                            else f"manager_correction_invalid:{correction_reason}"
+                        )[:500],
                         "request_id": request_id,
                         "task_id": task_id,
                         "promoted_paths": [],
@@ -3767,6 +3875,15 @@ def accept_review(
                 candidate_sha256=_target_candidate_sha256(card),
                 receipt_sha256_by_reviewer=verified_receipt_sha256,
             )
+            reviewer_corrected_ids = (
+                [
+                    finding_id
+                    for finding_id in correction_record["finding_ids"]
+                    if not finding_id.startswith(VALIDATION_ROW_ID_PREFIX)
+                ]
+                if correction_record is not None
+                else []
+            )
             quality_gate = quality_evidence.run_completion_quality_gate(
                 workspace.path,
                 changed_paths=changed,
@@ -3792,9 +3909,11 @@ def accept_review(
                 # Only a VALIDATED correction reaches the authoritative gate,
                 # so the lift it performs can never rest on a caller's claim
                 # nothing checked (NF-2026-01469).
+                # ``validation:<i>`` ids name a failed declared row, never a
+                # reviewer finding, so they never reach the reviewer gate.
                 **(
-                    {"corrected_finding_ids": correction_record["finding_ids"]}
-                    if correction_record is not None
+                    {"corrected_finding_ids": reviewer_corrected_ids}
+                    if reviewer_corrected_ids
                     else {}
                 ),
             )

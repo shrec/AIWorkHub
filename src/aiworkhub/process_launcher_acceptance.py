@@ -155,7 +155,7 @@ def _correction_identity(
         )
     ):
         raise WorkspaceError("manager_correction_receipt_mismatch")
-    return {
+    identity = {
         "patch_sha256": patch_sha256,
         "finding_ids": finding_ids,
         "paths": paths,
@@ -163,6 +163,9 @@ def _correction_identity(
         "corrected_path_hashes": corrected,
         "reason": str(manager_correction.get("reason") or ""),
     }
+    if manager_correction.get("correction_origin") == "validation_failed":
+        identity["correction_origin"] = "validation_failed"
+    return identity
 
 
 def _merge_identity(
