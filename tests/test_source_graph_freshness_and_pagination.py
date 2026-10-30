@@ -393,7 +393,7 @@ def test_bodygrep_cursor_reaches_files_past_the_byte_cap(tmp_path):
     )
     sg.build_index(repo, incremental=False)
 
-    first = sg.bodygrep_query(repo, "MAGIC_LITERAL_ZZZ", budget=5)
+    first = sg._bodygrep_query_page(repo, "MAGIC_LITERAL_ZZZ", budget=5)
     # The literal is only in tests/, which the first byte-bounded page cannot
     # reach -- but the page says so and hands back a cursor.
     assert first["matches"] == []
@@ -404,7 +404,7 @@ def test_bodygrep_cursor_reaches_files_past_the_byte_cap(tmp_path):
     hits = 0
     pages = 1
     while cursor and hits == 0 and pages < 400:
-        page = sg.bodygrep_query(
+        page = sg._bodygrep_query_page(
             repo, "MAGIC_LITERAL_ZZZ", budget=5, cursor=cursor,
         )
         hits += len(page["matches"])

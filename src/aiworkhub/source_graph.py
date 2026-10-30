@@ -5359,7 +5359,84 @@ def _bodygrep_file_bytes(candidate: Path, file_stat: os.stat_result) -> tuple[by
     return raw, False
 
 
+BODYGREP_EXTRA_PAGES = 4
+BODYGREP_EXTRA_PAGES_SECONDS = 2.5
+
+
+def _bodygrep_indexed_file_count(repo_root: Path) -> int:
+    conn = connect(resolve_db_path(repo_root), read_only=True)
+    try:
+        return int(conn.execute("SELECT COUNT(*) FROM files").fetchone()[0])
+    finally:
+        conn.close()
+
+
 def bodygrep_query(
+    repo_root: Path,
+    term: str,
+    budget: int = 64,
+    *,
+    target: str | None = None,
+    cursor: str | None = None,
+    match_kind: str = "literal",
+) -> dict[str, Any]:
+    """One bodygrep page, continued past empty truncated pages.
+
+    A page that ends with zero matches, ``scan_truncated`` and a ``next_cursor``
+    is a cap artefact, not a confident zero: the scan resumes from that cursor
+    (same term, target, budget and cursor encoding, so the rows equal manual
+    paging) until a match appears, the scan completes, or a bound is reached --
+    ``BODYGREP_EXTRA_PAGES`` extra pages or ``BODYGREP_EXTRA_PAGES_SECONDS``.
+    """
+
+    started = time.monotonic()
+    page = _bodygrep_query_page(
+        repo_root, term, budget, target=target, cursor=cursor, match_kind=match_kind,
+    )
+    if "files_scanned" not in page:
+        return page
+    pages_scanned = 1
+    files_scanned = int(page.get("files_scanned") or 0)
+    bytes_scanned = int(page.get("bytes_scanned") or 0)
+    cache_hits = int(page.get("cache_hits") or 0)
+    oversized_count = int(page.get("oversized_files_skipped") or 0)
+    oversized_names = list(page.get("oversized_files") or [])
+    while (
+        not page.get("matches")
+        and page.get("scan_truncated")
+        and page.get("next_cursor")
+        and pages_scanned <= BODYGREP_EXTRA_PAGES
+        and time.monotonic() - started < BODYGREP_EXTRA_PAGES_SECONDS
+    ):
+        page = _bodygrep_query_page(
+            repo_root, term, budget, target=target,
+            cursor=page["next_cursor"], match_kind=match_kind,
+        )
+        pages_scanned += 1
+        files_scanned += int(page.get("files_scanned") or 0)
+        bytes_scanned += int(page.get("bytes_scanned") or 0)
+        cache_hits += int(page.get("cache_hits") or 0)
+        oversized_count += int(page.get("oversized_files_skipped") or 0)
+        oversized_names.extend(page.get("oversized_files") or [])
+    page["cursor"] = cursor
+    page["pages_scanned"] = pages_scanned
+    page["files_scanned"] = files_scanned
+    page["bytes_scanned"] = bytes_scanned
+    page["cache_hits"] = cache_hits
+    page["oversized_files_skipped"] = oversized_count
+    page["oversized_files"] = oversized_names[:8]
+    if not page.get("matches") and page.get("scan_truncated") and page.get("next_cursor"):
+        hint = (
+            f"0 hits in the first {files_scanned} of "
+            f"{_bodygrep_indexed_file_count(repo_root)} indexed files; "
+            "pass next_cursor or a target prefix"
+        )
+        existing = page.get("hint")
+        page["hint"] = f"{existing}; {hint}" if existing else hint
+    return page
+
+
+def _bodygrep_query_page(
     repo_root: Path,
     term: str,
     budget: int = 64,
@@ -5968,6 +6045,110 @@ def _is_trivial_edge(edge: dict[str, Any], language: str) -> bool:
     return False
 
 
+def _normalize_file_target(repo_root: Path, file_path: str) -> str:
+    """Repo-relative POSIX form of a file-mode target (slashes, ``./``, in-repo absolute)."""
+
+    text = str(file_path).strip().replace("\\", "/")
+    if not text:
+        return text
+    candidate = Path(text)
+    if candidate.is_absolute():
+        root = repo_root.resolve()
+        for resolved in (candidate.resolve(strict=False), candidate):
+            for base in (root, repo_root):
+                try:
+                    return resolved.relative_to(base).as_posix()
+                except ValueError:
+                    continue
+        return text
+    return PurePosixPath(text).as_posix()
+
+
+def _filesystem_case_insensitive(repo_root: Path) -> bool:
+    root = repo_root.resolve()
+    alternate = root.name.swapcase()
+    if alternate == root.name:
+        return False
+    try:
+        return os.path.samefile(root, root.with_name(alternate))
+    except OSError:
+        return False
+
+
+def _casefold_indexed_path(
+    conn: sqlite3.Connection, repo_root: Path, relative: str,
+) -> str | None:
+    """The one indexed row whose casefold equals ``relative``, on a case-insensitive filesystem."""
+
+    folded = relative.casefold()
+    rows = [
+        str(row["file_path"]) for row in conn.execute(
+            "SELECT file_path FROM files WHERE lower(file_path) = lower(?)", (relative,),
+        )
+    ]
+    matches = [row for row in rows if row.casefold() == folded]
+    if len(matches) != 1 or not _filesystem_case_insensitive(repo_root):
+        return None
+    return matches[0]
+
+
+def _policy_exclusion(
+    policy: SourceGraphIgnorePolicy, relative: str, root: Path,
+) -> tuple[str, str] | None:
+    """``(rule_kind, rule)`` of the first discovery rule rejecting ``relative``, else None."""
+
+    suffix = Path(relative).suffix.casefold()
+    if suffix not in policy.indexed_extensions:
+        for language in sorted(policy.disabled_languages):
+            spec = sglanguages.LANGUAGE_BY_ID.get(language)
+            if spec is not None and suffix in spec.extensions:
+                return ("language", language)
+        return ("suffix", suffix or "<none>")
+    parts = relative.split("/")
+    for depth, name in enumerate(parts[:-1]):
+        if name in policy.exclude_dirs or name.endswith(".egg-info"):
+            return ("directory", name)
+        if _is_nested_linked_worktree_dir(root, root.joinpath(*parts[: depth + 1])):
+            return ("directory", "nested_linked_worktree")
+        prefix = "/".join(parts[: depth + 1])
+        for pattern in policy.exclude_globs:
+            if _glob_ignored(prefix, (pattern,), is_dir=True):
+                return ("glob", pattern)
+    for pattern in policy.exclude_globs:
+        if _glob_ignored(relative, (pattern,)):
+            return ("glob", pattern)
+    return None
+
+
+def _file_miss_fields(
+    repo_root: Path, relative: str, line_range: tuple[int, int] | None,
+) -> dict[str, Any]:
+    """Why file mode has no row for ``relative``: not_found, excluded_by_policy or not_yet_indexed."""
+
+    root = repo_root.resolve()
+    target = (root / relative).resolve(strict=False)
+    if not target.is_relative_to(root) or not target.is_file():
+        return {"found": False, "reason": "not_found", "exists_on_disk": False}
+    relative = target.relative_to(root).as_posix()
+    try:
+        policy = load_ignore_policy(root)
+    except SourceGraphError:
+        return {"found": False, "reason": "policy_unreadable", "exists_on_disk": True}
+    exclusion = _policy_exclusion(policy, relative, root)
+    if exclusion is not None:
+        return {
+            "found": False, "reason": "excluded_by_policy", "exists_on_disk": True,
+            "rule_kind": exclusion[0], "rule": exclusion[1],
+        }
+    fields: dict[str, Any] = {
+        "found": False, "reason": "not_yet_indexed", "exists_on_disk": True,
+        "freshness": "unindexed",
+    }
+    if line_range is not None:
+        fields.update(_ranged_file_preview(root, relative, line_range))
+    return fields
+
+
 def file_query(
     repo_root: Path,
     file_path: str,
@@ -5983,9 +6164,16 @@ def file_query(
     """
 
     budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
+    requested_path = file_path
+    file_path = _normalize_file_target(repo_root, file_path)
     conn = connect(resolve_db_path(repo_root), read_only=True)
     try:
         payload = context(conn, file_path)
+        if not payload.get("found"):
+            folded = _casefold_indexed_path(conn, repo_root, file_path)
+            if folded is not None:
+                file_path = folded
+                payload = context(conn, file_path)
     finally:
         conn.close()
     ranged_fields: dict[str, Any] = {}
@@ -6024,6 +6212,11 @@ def file_query(
         }
     else:
         file_match = None
+    miss_fields: dict[str, Any] = {}
+    if not payload.get("found"):
+        miss_fields = _file_miss_fields(repo_root, file_path, line_range)
+        if line_range is not None:
+            ranged_fields = miss_fields
     payload_cap = max(4096, budget * 768)
     if line_range is not None:
         # Hold the measured window whole: a fit-halved preview is cut mid-line.
@@ -6031,10 +6224,11 @@ def file_query(
             json.dumps(ranged_fields, ensure_ascii=False).encode("utf-8")
         ) + 16384
     return _fit_payload_bytes({
-        "mode": "file", "query": file_path, "budget": budget,
+        "mode": "file", "query": requested_path, "budget": budget,
         "matches": [file_match] if file_match else [],
         "contexts": [payload] if payload.get("found") else [],
         "candidate_files": [file_path] if payload.get("found") else [],
+        **miss_fields,
         "truncated": False,
     }, payload_cap)
 
