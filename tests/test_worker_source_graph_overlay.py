@@ -251,6 +251,45 @@ def test_parse_broken_overlay_shadows_canonical_symbols_with_repair_evidence(
     }
 
 
+def test_overlay_file_mode_returns_one_compact_context_for_a_changed_file(tmp_path: Path) -> None:
+    authority = tmp_path / "authority"
+    workspace = tmp_path / "workspace"
+    authority.mkdir()
+    workspace.mkdir()
+    bootstrap_repository(authority, repo_name="authority")
+    bootstrap_repository(workspace, repo_name="workspace")
+    _write(authority / "src/changed.py", "def canonical_symbol():\n    return 'old'\n")
+    source_graph.build_index(authority, incremental=False)
+
+    changed = (
+        "def worktree_one():\n    return 'new'\n\n\n"
+        "def worktree_two():\n    return 'new'\n\n\n"
+        "def worktree_three():\n    return 'new'\n"
+    ).encode("utf-8")
+    _write(workspace / "src/changed.py", changed)
+    packet = _packet(authority, [{
+        "path": "src/changed.py",
+        "sha256": hashlib.sha256(changed).hexdigest(),
+        "content_base64": base64.b64encode(changed).decode("ascii"),
+    }])
+    result = source_graph_query(
+        _ctx(authority, workspace, packet),
+        mode="file", query="src/changed.py", target="src/changed.py",
+        workflow_stage="rework", compact_replay=False,
+    )
+    payload = content_payload(result)
+    changed_contexts = [
+        context for context in payload["contexts"]
+        if (context.get("file_path") or context["file"]["file_path"]) == "src/changed.py"
+    ]
+    assert len(changed_contexts) == 1
+    (context,) = changed_contexts
+    assert "entities" not in context
+    assert "edges" not in context
+    assert "worktree_three" in context["source_preview"]
+    assert "old" not in context["source_preview"]
+
+
 def test_overlay_identity_mismatch_fails_closed(tmp_path: Path) -> None:
     authority = tmp_path / "authority"
     workspace = tmp_path / "workspace"

@@ -4113,11 +4113,6 @@ def _merge_rework_overlay_payload(
             context_base = {
                 "found": True,
                 "file": file_row,
-                "entities": [
-                    _overlay_entity_match(extraction, entity, "")
-                    for entity in extraction.entities[:max(1, min(16, budget // 2))]
-                ],
-                "edges": [],
             }
             from . import source_graph as _source_graph_mod
 
@@ -4252,10 +4247,13 @@ def _merge_rework_overlay_payload(
         if isinstance(row, dict) and str(row.get("file_path") or "")
     })
     if overlay_contexts:
+        overlay_paths = {ctx["file"]["file_path"] for ctx in overlay_contexts}
         canonical_contexts = merged.get("contexts")
-        merged["contexts"] = overlay_contexts + (
-            canonical_contexts if isinstance(canonical_contexts, list) else []
-        )
+        kept_contexts = [
+            row for row in canonical_contexts
+            if not (isinstance(row, dict) and row.get("file_path") in overlay_paths)
+        ] if isinstance(canonical_contexts, list) else []
+        merged["contexts"] = overlay_contexts + kept_contexts
     # Overlay rows already lead ``matches``; focus carries its per-symbol
     # metrics on the match rows now (no ``ranked_symbols`` projection).
     packet = ctx.rework_overlay_packet or {}
