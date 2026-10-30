@@ -176,6 +176,18 @@ def relaunch_input_paths(process_dir: _PathT, request_id: str) -> tuple[_PathT, 
     )
 
 
+def _is_windows_host() -> bool:
+    import os
+
+    return os.name == "nt"
+
+
+def _breakaway_creation_flag() -> int:
+    import subprocess
+
+    return int(getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000))
+
+
 def spawn_with_stdin_payload(
     popen: Callable[..., Any],
     argv: list[str],
@@ -192,11 +204,22 @@ def spawn_with_stdin_payload(
     """
     from . import process_launcher as _pl
 
-    process = popen(
-        argv,
-        stdin=_pl.subprocess.PIPE if stdin_payload is not None else _pl.subprocess.DEVNULL,
-        **popen_kwargs,
-    )
+    stdin_arg = _pl.subprocess.PIPE if stdin_payload is not None else _pl.subprocess.DEVNULL
+    # NF-2026-01094: the MCP server's Windows job dies with its host, taking the
+    # supervisor with it; break away, and retry once if the job forbids it.
+    if _is_windows_host():
+        breakaway_kwargs = dict(popen_kwargs)
+        breakaway_kwargs["creationflags"] = (
+            popen_kwargs.get("creationflags") or 0
+        ) | _breakaway_creation_flag()
+        try:
+            process = popen(argv, stdin=stdin_arg, **breakaway_kwargs)
+        except PermissionError as exc:
+            if getattr(exc, "winerror", None) != 5:
+                raise
+            process = popen(argv, stdin=stdin_arg, **popen_kwargs)
+    else:
+        process = popen(argv, stdin=stdin_arg, **popen_kwargs)
     if stdin_payload is None:
         return process
     # NF-2026-01159: this was a fire-and-forget daemon thread that swallowed
