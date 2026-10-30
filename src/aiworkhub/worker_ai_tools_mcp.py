@@ -3584,31 +3584,78 @@ class _ReworkOverlayView:
     repair_evidence: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
 
 
-def _prepare_rework_overlay_view(
-    ctx: WorkerToolContext,
-    canonical_db_path: Path,
-    *,
-    build_revision: str,
-) -> _ReworkOverlayView | None:
-    """Extract packet-bound files from sealed bytes or digest-bound hashes."""
+class _ReworkOverlayObservation(NamedTuple):
+    """One packet entry after path checks, materialization and admission."""
 
-    packet = ctx.rework_overlay_packet
-    if packet is None:
-        return None
-    from . import source_graph_ast as _source_graph_ast
+    relative: str
+    resolved: Path
+    deleted: bool
+    expected_hash: str
+    sealed: bytes | None
+    # ``None`` for a deleted entry or a hash-only entry absent from the worktree.
+    observed: bytes | None
+    observed_hash: str
+    admission: str
 
-    entries = _build_rework_overlay_map(packet)
-    if not entries:
-        return _ReworkOverlayView({}, frozenset(), str(packet["canonical_digest"]))
 
-    canonical_hashes: dict[str, str] = {}
+# Measured 2026-10-30 (NF-2026-01875): every rework Source Graph call re-ran
+# ``source_graph_ast.extract_file`` for each packet file differing from
+# canonical -- 8.1-11.6 s per call for three files in the worker sandbox, almost
+# all of it AST walking, while reading and hashing those files took ~2.5 ms.
+# The prepared view is therefore memoized under a key covering every input it
+# is a function of (``_rework_overlay_view_cache_key``).  Path checks,
+# materialization, hashing and admission still run on every call, so a refusal
+# is re-checked each time; only a fully built view is ever stored.
+_MAX_REWORK_OVERLAY_VIEW_CACHE_ENTRIES = 4
+_REWORK_OVERLAY_VIEW_CACHE: dict[str, _ReworkOverlayView] = {}
+_REWORK_OVERLAY_VIEW_CACHE_STATS: dict[str, int] = {"hits": 0, "misses": 0}
+_REWORK_OVERLAY_VIEW_CACHE_LOCK = threading.Lock()
+
+
+def _rework_overlay_view_cache_get(key: str) -> _ReworkOverlayView | None:
+    with _REWORK_OVERLAY_VIEW_CACHE_LOCK:
+        view = _REWORK_OVERLAY_VIEW_CACHE.pop(key, None)
+        if view is None:
+            _REWORK_OVERLAY_VIEW_CACHE_STATS["misses"] += 1
+            return None
+        _REWORK_OVERLAY_VIEW_CACHE[key] = view  # most-recently-used tail
+        _REWORK_OVERLAY_VIEW_CACHE_STATS["hits"] += 1
+        return view
+
+
+def _rework_overlay_view_cache_store(key: str, view: _ReworkOverlayView) -> None:
+    with _REWORK_OVERLAY_VIEW_CACHE_LOCK:
+        _REWORK_OVERLAY_VIEW_CACHE.pop(key, None)
+        _REWORK_OVERLAY_VIEW_CACHE[key] = view
+        while len(_REWORK_OVERLAY_VIEW_CACHE) > _MAX_REWORK_OVERLAY_VIEW_CACHE_ENTRIES:
+            _REWORK_OVERLAY_VIEW_CACHE.pop(next(iter(_REWORK_OVERLAY_VIEW_CACHE)))
+
+
+def _rework_overlay_view_cache_clear() -> None:
+    with _REWORK_OVERLAY_VIEW_CACHE_LOCK:
+        _REWORK_OVERLAY_VIEW_CACHE.clear()
+        _REWORK_OVERLAY_VIEW_CACHE_STATS.update(hits=0, misses=0)
+
+
+def _rework_overlay_view_cache_stats() -> dict[str, int]:
+    with _REWORK_OVERLAY_VIEW_CACHE_LOCK:
+        return {
+            **_REWORK_OVERLAY_VIEW_CACHE_STATS,
+            "entries": len(_REWORK_OVERLAY_VIEW_CACHE),
+        }
+
+
+def _rework_overlay_canonical_hashes(
+    canonical_db_path: Path, paths: Mapping[str, Any],
+) -> dict[str, str]:
     from . import source_graph as _source_graph
 
+    canonical_hashes: dict[str, str] = {}
     conn = _source_graph.connect(canonical_db_path, read_only=True)
     try:
-        paths = tuple(sorted(entries))
-        for offset in range(0, len(paths), 400):
-            batch = paths[offset:offset + 400]
+        ordered = tuple(sorted(paths))
+        for offset in range(0, len(ordered), 400):
+            batch = ordered[offset:offset + 400]
             placeholders = ",".join("?" for _ in batch)
             rows = conn.execute(
                 f"SELECT file_path, source_hash FROM files WHERE file_path IN ({placeholders})",
@@ -3617,6 +3664,164 @@ def _prepare_rework_overlay_view(
             canonical_hashes.update({str(row[0]): str(row[1]) for row in rows})
     finally:
         conn.close()
+    return canonical_hashes
+
+
+def _observe_rework_overlay_entries(
+    ctx: WorkerToolContext,
+    entries: Mapping[str, Mapping[str, Any]],
+    canonical_hashes: Mapping[str, str],
+) -> tuple[_ReworkOverlayObservation, ...]:
+    """Path-check, materialize, read, hash and admit every packet entry."""
+
+    repo_root = ctx.repo.resolve()
+    observations: list[_ReworkOverlayObservation] = []
+    for relative in sorted(entries):
+        entry = entries[relative]
+        raw_path = ctx.repo / relative
+        resolved = raw_path.resolve(strict=False)
+        if not resolved.is_relative_to(repo_root):
+            raise WorkerToolError(f"rework_overlay_path_escapes_workspace:{relative}")
+        if raw_path.is_symlink():
+            raise WorkerToolError(f"rework_overlay_path_symlink:{relative}")
+        if entry.get("deleted") is True:
+            observations.append(_ReworkOverlayObservation(
+                relative, resolved, True, "", None, None, "", "",
+            ))
+            continue
+        expected_hash = str(entry.get("sha256") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+            raise WorkerToolError(f"rework_packet_file_hash_invalid:{relative}")
+        sealed = _sealed_rework_overlay_bytes(entry, relative)
+        if sealed is not None and not resolved.exists():
+            materialize_rework_overlay_sealed_files(
+                ctx.repo, {"files": [entry]}, allowed_writes=ctx.allowed_writes,
+            )
+            resolved = raw_path.resolve(strict=False)
+        if not resolved.exists():
+            if sealed is None:
+                observations.append(_ReworkOverlayObservation(
+                    relative, resolved, False, expected_hash, None, None, "", "",
+                ))
+                continue
+            raise WorkerToolError(f"rework_overlay_file_missing:{relative}")
+        if not resolved.is_file():
+            raise WorkerToolError(f"rework_overlay_path_not_file:{relative}")
+        observed = resolved.read_bytes()
+        observed_hash = hashlib.sha256(observed).hexdigest()
+        admission = _admit_rework_overlay_observation(
+            relative=relative,
+            expected_hash=expected_hash,
+            observed_hash=observed_hash,
+            has_sealed=sealed is not None,
+            allowed_writes=ctx.allowed_writes,
+            canonical_hash=canonical_hashes.get(relative),
+        )
+        observations.append(_ReworkOverlayObservation(
+            relative, resolved, False, expected_hash, sealed, observed,
+            observed_hash, admission,
+        ))
+    return tuple(observations)
+
+
+def _rework_overlay_view_cache_key(
+    ctx: WorkerToolContext,
+    packet: Mapping[str, Any],
+    canonical_db_path: Path,
+    canonical_hashes: Mapping[str, str],
+    observations: Sequence[_ReworkOverlayObservation],
+    build_revision: str,
+) -> str:
+    """Digest every input the prepared view is a function of.
+
+    The whole packet (identity fields and sealed bytes), the worktree root,
+    ``allowed_writes``, the canonical database and its hashes for the packet
+    paths, the build revision and each entry's resolved path, admission and
+    observed sha256: change any one and the view is rebuilt.
+    """
+
+    return hashlib.sha256(json.dumps(
+        {
+            "packet": packet,
+            "repo": str(ctx.repo.resolve()),
+            "allowed_writes": list(ctx.allowed_writes),
+            "canonical_db": str(canonical_db_path),
+            "canonical_hashes": dict(canonical_hashes),
+            "build_revision": build_revision,
+            "files": [
+                [
+                    item.relative, str(item.resolved), item.deleted,
+                    item.admission, item.observed_hash,
+                ]
+                for item in observations
+            ],
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")).hexdigest()
+
+
+def _prepare_rework_overlay_view(
+    ctx: WorkerToolContext,
+    canonical_db_path: Path,
+    *,
+    build_revision: str,
+) -> _ReworkOverlayView | None:
+    """Extract packet-bound files from sealed bytes or digest-bound hashes.
+
+    Admission runs on every call; the extracted view is reused from
+    ``_REWORK_OVERLAY_VIEW_CACHE`` only while every keyed input is unchanged.
+    """
+
+    packet = ctx.rework_overlay_packet
+    if packet is None:
+        return None
+
+    entries = _build_rework_overlay_map(packet)
+    if not entries:
+        return _ReworkOverlayView({}, frozenset(), str(packet["canonical_digest"]))
+
+    canonical_hashes = _rework_overlay_canonical_hashes(canonical_db_path, entries)
+    observations = _observe_rework_overlay_entries(ctx, entries, canonical_hashes)
+    key = _rework_overlay_view_cache_key(
+        ctx, packet, canonical_db_path, canonical_hashes, observations,
+        build_revision,
+    )
+    cached = _rework_overlay_view_cache_get(key)
+    if cached is not None:
+        return cached
+    view = _build_rework_overlay_view(
+        ctx, packet, observations, canonical_hashes, build_revision=build_revision,
+    )
+    # The build re-reads each file from disk, so a write racing it would be
+    # cached under the pre-write hash; store only when every file still matches.
+    if all(
+        item.observed is None
+        or _rework_overlay_file_sha256(item.resolved) == item.observed_hash
+        for item in observations
+    ):
+        _rework_overlay_view_cache_store(key, view)
+    return view
+
+
+def _rework_overlay_file_sha256(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _build_rework_overlay_view(
+    ctx: WorkerToolContext,
+    packet: Mapping[str, Any],
+    observations: Sequence[_ReworkOverlayObservation],
+    canonical_hashes: Mapping[str, str],
+    *,
+    build_revision: str,
+) -> _ReworkOverlayView:
+    from . import source_graph_ast as _source_graph_ast
 
     repo_root = ctx.repo.resolve()
     changed: dict[str, Any] = {}
@@ -3627,49 +3832,22 @@ def _prepare_rework_overlay_view(
     authorized_digests: dict[str, str] = {}
     repair_evidence: dict[str, Mapping[str, str]] = {}
     snapshot_rows: list[dict[str, str | bool]] = []
-    for relative in sorted(entries):
-        entry = entries[relative]
-        raw_path = ctx.repo / relative
-        resolved = raw_path.resolve(strict=False)
-        if not resolved.is_relative_to(repo_root):
-            raise WorkerToolError(f"rework_overlay_path_escapes_workspace:{relative}")
-        if raw_path.is_symlink():
-            raise WorkerToolError(f"rework_overlay_path_symlink:{relative}")
-        if entry.get("deleted") is True:
+    for item in observations:
+        relative = item.relative
+        if item.deleted:
             deleted.add(relative)
             snapshot_rows.append({"path": relative, "deleted": True})
             continue
-        expected_hash = str(entry.get("sha256") or "")
-        if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
-            raise WorkerToolError(f"rework_packet_file_hash_invalid:{relative}")
-        sealed = _sealed_rework_overlay_bytes(entry, relative)
-        if sealed is not None:
-            sealed_sources[relative] = sealed.decode("utf-8", errors="replace")
-            if not resolved.exists():
-                materialize_rework_overlay_sealed_files(
-                    ctx.repo, {"files": [entry]}, allowed_writes=ctx.allowed_writes,
-                )
-                resolved = raw_path.resolve(strict=False)
-        if not resolved.exists():
-            if sealed is None:
-                digest_refs[relative] = expected_hash
-                snapshot_rows.append({"path": relative, "sha256": expected_hash})
-                continue
-            raise WorkerToolError(f"rework_overlay_file_missing:{relative}")
-        if not resolved.is_file():
-            raise WorkerToolError(f"rework_overlay_path_not_file:{relative}")
-        observed_bytes = resolved.read_bytes()
-        observed_hash = hashlib.sha256(observed_bytes).hexdigest()
-        admission = _admit_rework_overlay_observation(
-            relative=relative,
-            expected_hash=expected_hash,
-            observed_hash=observed_hash,
-            has_sealed=sealed is not None,
-            allowed_writes=ctx.allowed_writes,
-            canonical_hash=canonical_hashes.get(relative),
-        )
-        if admission == "authorized_overlay":
-            authorized_sources[relative] = observed_bytes.decode(
+        expected_hash = item.expected_hash
+        if item.sealed is not None:
+            sealed_sources[relative] = item.sealed.decode("utf-8", errors="replace")
+        if item.observed is None:
+            digest_refs[relative] = expected_hash
+            snapshot_rows.append({"path": relative, "sha256": expected_hash})
+            continue
+        observed_hash = item.observed_hash
+        if item.admission == "authorized_overlay":
+            authorized_sources[relative] = item.observed.decode(
                 "utf-8", errors="replace",
             )
             authorized_digests[relative] = observed_hash
@@ -3680,13 +3858,13 @@ def _prepare_rework_overlay_view(
             })
         else:
             snapshot_rows.append({"path": relative, "sha256": observed_hash})
-        if sealed is None and admission != "authorized_overlay":
+        if item.sealed is None and item.admission != "authorized_overlay":
             digest_refs[relative] = expected_hash
             continue
         if canonical_hashes.get(relative) == observed_hash:
             continue
         extraction = _source_graph_ast.extract_file(
-            repo_root, resolved, build_revision=build_revision,
+            repo_root, item.resolved, build_revision=build_revision,
         )
         if extraction.status not in _REWORK_OVERLAY_EVIDENCE_ONLY:
             raise WorkerToolError(

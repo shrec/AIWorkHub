@@ -34,6 +34,15 @@ from aiworkhub import worker_ai_tools_mcp as w  # noqa: E402
 from aiworkhub import worker_workspace  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _isolated_rework_overlay_view_cache():
+    # The prepared rework overlay view is memoized module-wide; no test may
+    # observe a view another test prepared.
+    w._rework_overlay_view_cache_clear()
+    yield
+    w._rework_overlay_view_cache_clear()
+
+
 def _write_tool(path: Path, body: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
