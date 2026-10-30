@@ -1114,6 +1114,7 @@ def malformed_write_backstop(conn: sqlite3.Connection, *, operation_name: str):
 
 INDEXED_EXTENSIONS: tuple[str, ...] = sglanguages.INDEXED_EXTENSIONS
 LANGUAGE_CAPABILITIES: dict[str, str] = dict(sglanguages.LANGUAGE_CAPABILITIES)
+MAX_INCLUDE_ROOTS = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -1132,6 +1133,7 @@ class SourceGraphIgnorePolicy:
     disabled_languages: frozenset[str] = frozenset()
     revision: int = 0
     configured: bool = False
+    include_roots: tuple[str, ...] = ()
 
     @property
     def enabled_languages(self) -> frozenset[str]:
@@ -1226,12 +1228,27 @@ def load_ignore_policy(repo_root: Path) -> SourceGraphIgnorePolicy:
             f"source_graph_ignore_invalid:{path}:unknown_languages:"
             f"{','.join(sorted(unknown_languages))}"
         )
+    raw_roots = _string_list(payload.get("include_roots", []), field="include_roots", config_path=path)
+    if len(raw_roots) > MAX_INCLUDE_ROOTS:
+        raise SourceGraphError(f"source_graph_ignore_invalid:{path}:include_roots_too_many")
+    include_roots: list[str] = []
+    for original, item in zip(payload.get("include_roots", []), raw_roots):
+        item = item.rstrip("/")
+        if (
+            "\\" in original
+            or item.startswith("/")
+            or any(part in ("", ".", "..") for part in item.split("/"))
+            or re.match(r"^[A-Za-z]:", item)
+        ):
+            raise SourceGraphError(f"source_graph_ignore_invalid:{path}:include_roots_must_be_relative")
+        include_roots.append(item)
     return SourceGraphIgnorePolicy(
         frozenset((*DEFAULT_EXCLUDE_DIR_NAMES, *extra_dirs)),
         tuple(dict.fromkeys(extra_globs)),
         frozenset(disabled_languages),
         revision,
         True,
+        tuple(dict.fromkeys(include_roots)),
     )
 
 
@@ -1250,6 +1267,7 @@ def source_graph_policy_view(repo_root: Path) -> dict[str, Any]:
         "languages": languages,
         "exclude_dirs": sorted(policy.exclude_dirs - DEFAULT_EXCLUDE_DIR_NAMES),
         "exclude_globs": list(policy.exclude_globs),
+        "include_roots": list(policy.include_roots),
     }
 
 
@@ -1291,6 +1309,8 @@ def update_language_policy(
         "exclude_globs": list(current.exclude_globs),
         "disabled_languages": sorted(disabled),
     }
+    if current.include_roots:
+        payload["include_roots"] = list(current.include_roots)
     path = ignore_config_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.is_symlink():
@@ -1439,6 +1459,20 @@ def _scan_git_ignored_paths(repo_root: Path) -> _GitIgnoreScan:
     )
 
 
+def _under_include_root(rel: str, roots: tuple[str, ...]) -> bool:
+    """Component-wise prefix test: ``vendor/lib`` does not match ``vendor/library``."""
+    return any(rel == root or rel.startswith(root + "/") for root in roots)
+
+
+def _gitignored_rel(rel: str, scan: _GitIgnoreScan) -> bool:
+    ancestor = ""
+    for part in rel.split("/")[:-1]:
+        ancestor = f"{ancestor}/{part}" if ancestor else part
+        if ancestor in scan.ignored_dirs:
+            return True
+    return rel in scan.ignored_files
+
+
 def iter_source_files(
     repo_root: Path, *, gitignore_scan: _GitIgnoreScan | None = None,
 ) -> list[Path]:
@@ -1461,12 +1495,16 @@ def iter_source_files(
         detail = str(exc).replace("\n", " ")[:512]
         traversal_errors.append(f"{location}: {detail or type(exc).__name__}")
 
+    include_roots = policy.include_roots
+    covered: set[str] = set()
     for current, dirnames, filenames in os.walk(
         repo_root,
         followlinks=False,
         onerror=capture_traversal_error,
     ):
         current_path = Path(current)
+        current_rel = "" if current_path == repo_root else current_path.relative_to(repo_root).as_posix()
+        current_covered = current_rel in covered
         kept_dirs: list[str] = []
         for dirname in dirnames:
             candidate = current_path / dirname
@@ -1477,8 +1515,13 @@ def iter_source_files(
                 continue
             if _glob_ignored(rel, policy.exclude_globs, is_dir=True):
                 continue
-            if gitignore.applied and rel in gitignore.ignored_dirs:
-                continue
+            if gitignore.applied and (current_covered or rel in gitignore.ignored_dirs):
+                if _under_include_root(rel, include_roots):
+                    pass
+                elif any(root.startswith(rel + "/") for root in include_roots):
+                    covered.add(rel)
+                else:
+                    continue
             kept_dirs.append(dirname)
         dirnames[:] = sorted(kept_dirs)
         for filename in sorted(filenames):
@@ -1488,7 +1531,11 @@ def iter_source_files(
             rel = path.relative_to(repo_root).as_posix()
             if _glob_ignored(rel, policy.exclude_globs):
                 continue
-            if gitignore.applied and rel in gitignore.ignored_files:
+            if (
+                gitignore.applied
+                and (current_covered or rel in gitignore.ignored_files)
+                and not _under_include_root(rel, include_roots)
+            ):
                 continue
             out.append(path)
     if traversal_errors:
@@ -6437,6 +6484,11 @@ def body(conn: sqlite3.Connection, repo_root: Path, name: str) -> dict[str, Any]
     if row is None:
         return None
     result = dict(row)
+    include_roots = load_ignore_policy(repo_root).include_roots
+    if include_roots and _under_include_root(str(result["file_path"]), include_roots):
+        scan = _scan_git_ignored_paths(repo_root.resolve())
+        if scan.applied and _gitignored_rel(str(result["file_path"]), scan):
+            result["untracked"] = True
     freshness = _file_freshness_state(conn, repo_root, str(result["file_path"]))
     result["freshness"] = freshness
     # Only a file whose on-disk sha256 still matches the indexed source_hash may
@@ -10957,14 +11009,12 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
     # excluded-dir/glob path already is above: fail closed rather than
     # silently indexing a corpus the repository asked to keep out.
     gitignore = _scan_git_ignored_paths(repo_root)
-    if gitignore.applied:
-        ancestor = ""
-        for part in rel.split("/")[:-1]:
-            ancestor = f"{ancestor}/{part}" if ancestor else part
-            if ancestor in gitignore.ignored_dirs:
-                raise SourceGraphError(f"source_graph_single_file_gitignored:{rel}")
-        if rel in gitignore.ignored_files:
-            raise SourceGraphError(f"source_graph_single_file_gitignored:{rel}")
+    if (
+        gitignore.applied
+        and _gitignored_rel(rel, gitignore)
+        and not _under_include_root(rel, load_ignore_policy(repo_root).include_roots)
+    ):
+        raise SourceGraphError(f"source_graph_single_file_gitignored:{rel}")
 
     # Reject unsupported extensions (no LanguageSpec entry).
     suffix = resolved.suffix.casefold()
