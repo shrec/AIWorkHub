@@ -9378,6 +9378,10 @@ function repairOpencodeConfigJsonObject(document, launcherArgs) {
         changed = true;
       }
     }
+    if (typeof environment.PYTHONPATH === "string" && /[\\/]runtime[\\/]generations[\\/]/.test(environment.PYTHONPATH)) {
+      delete environment.PYTHONPATH;
+      changed = true;
+    }
   }
   const name = CANONICAL_OPENCODE_MCP_SERVER_NAME;
   const current = servers[name];

@@ -809,6 +809,87 @@ def test_opencode_global_mcp_repair_is_idempotent(tmp_path: Path) -> None:
     assert result == {"first": True, "second": False}
 
 
+def test_opencode_global_mcp_repair_strips_generation_pythonpath_from_owned_entries(tmp_path: Path) -> None:
+    result = _drive_extension_internals(
+        tmp_path,
+        """(internals) => {
+          const make = () => ({
+            mcp: {
+              aiworkhub_ultrafast: {
+                type: "local",
+                command: ["x", "/u.py"],
+                environment: { PYTHONPATH: "C:\\\\gs\\\\runtime\\\\generations\\\\g1\\\\src", KEEP: "1" },
+              },
+              awh: {
+                type: "local",
+                command: ["python3", "/launcher.py"],
+                environment: { PYTHONPATH: "/gs/runtime/generations/g1/src", KEEP: "2" },
+              },
+            },
+          });
+          const first = internals.repairOpencodeConfigJsonObject(make(), ["python3", "/launcher.py"]);
+          const second = internals.repairOpencodeConfigJsonObject(first.document, ["python3", "/launcher.py"]);
+          return { first: first.changed, second: second.changed, mcp: first.document.mcp };
+        }""",
+    )
+    assert result["first"] is True
+    assert result["second"] is False
+    for name, keep in (("aiworkhub_ultrafast", "1"), ("awh", "2")):
+        assert "PYTHONPATH" not in result["mcp"][name]["environment"]
+        assert result["mcp"][name]["environment"]["KEEP"] == keep
+
+
+def test_opencode_global_mcp_repair_preserves_non_generation_pythonpath(tmp_path: Path) -> None:
+    result = _drive_extension_internals(
+        tmp_path,
+        """(internals) => {
+          const doc = {
+            mcp: {
+              awh: {
+                type: "local",
+                command: ["python3", "/launcher.py"],
+                environment: { PYTHONPATH: "/opt/custom/lib" },
+              },
+              third_party: {
+                type: "local",
+                command: ["other"],
+                environment: { PYTHONPATH: "/gs/runtime/generations/g1/src" },
+              },
+            },
+          };
+          const out = internals.repairOpencodeConfigJsonObject(doc, ["python3", "/launcher.py"]);
+          return { mcp: out.document.mcp };
+        }""",
+    )
+    assert result["mcp"]["awh"]["environment"]["PYTHONPATH"] == "/opt/custom/lib"
+    assert result["mcp"]["third_party"]["environment"]["PYTHONPATH"] == "/gs/runtime/generations/g1/src"
+
+
+def test_opencode_global_mcp_repair_generation_pythonpath_reports_changed(tmp_path: Path) -> None:
+    result = _drive_extension_internals(
+        tmp_path,
+        """(internals) => {
+          const doc = {
+            mcp: {
+              awh: {
+                type: "local",
+                command: ["python3", "/launcher.py"],
+                environment: {
+                  AIWORKHUB_MCP_STDIO_BACKEND: "stdlib",
+                  AIWORKHUB_ALLOW_WRITES: "1",
+                  AIWORKHUB_ALLOW_LAUNCH: "1",
+                  PYTHONPATH: "/gs/runtime/generations/g1/src",
+                },
+                enabled: true,
+              },
+            },
+          };
+          return { changed: internals.repairOpencodeConfigJsonObject(doc, ["python3", "/launcher.py"]).changed };
+        }""",
+    )
+    assert result["changed"] is True
+
+
 def test_opencode_registration_leaves_codex_and_claude_repair_helpers_untouched(
     tmp_path: Path,
 ) -> None:
