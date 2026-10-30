@@ -11,6 +11,7 @@ aiworkhub_task_create's inputSchema matching a direct SDK registration).
 
 import asyncio
 import json
+import re
 import typing
 from functools import wraps
 
@@ -192,6 +193,25 @@ def test_explicit_field_description_beats_args():
 
 
 _DOCSTRING_PENDING: frozenset[str] = frozenset()  # shrink only; every published tool documents itself
+_USAGE_GUIDANCE = re.compile(
+    r"\b(use (this|it )?(when|for|to|before|after|instead)|instead of|prefer|rather than"
+    r"|do not (call|use)|only when|when you need|aiworkhub_\w+|needfix_\w+|roadmap_\w+)",
+    re.I,
+)
+_USAGE_GUIDED = frozenset(
+    {
+        "aiworkhub_quality_profile",
+        "aiworkhub_suite_profile",
+        "aiworkhub_quality_run_checks",
+        "aiworkhub_session_token_profile",
+        "aiworkhub_environment_preflight",
+        "aiworkhub_doctor_diagnose",
+        "aiworkhub_task_health",
+        "aiworkhub_dispatcher_health",
+        "aiworkhub_source_graph_health",
+    }
+)
+_USAGE_GUIDANCE_MISSING_MAX = 132  # shrink only (NF-2026-01881); a family card lowers it
 
 # Registration keeps only the tools the surface active at import can call, so setting
 # AIWORKHUB_MCP_SURFACE after ``from aiworkhub import server`` cannot widen this process's
@@ -258,6 +278,20 @@ def test_every_server_tool_publishes_annotations_with_read_only_hint(all_surface
     assert hints("aiworkhub_claude_callback_ack")["readOnlyHint"] is False
     assert hints("aiworkhub_manager_hub_mail_send")["openWorldHint"] is True
     assert hints("aiworkhub_task_list")["openWorldHint"] is False
+
+
+def test_tool_descriptions_give_usage_guidance(all_surface_tools):
+    tools = all_surface_tools
+    assert _USAGE_GUIDED <= set(tools), sorted(_USAGE_GUIDED - set(tools))
+    for name in sorted(_USAGE_GUIDED):
+        text = tools[name]["description"].replace(name, "")
+        assert _USAGE_GUIDANCE.search(text), f"{name}: description names no usage guidance"
+    missing = [
+        name
+        for name, tool in tools.items()
+        if not _USAGE_GUIDANCE.search(tool["description"].replace(name, ""))
+    ]
+    assert len(missing) <= _USAGE_GUIDANCE_MISSING_MAX, (len(missing), _USAGE_GUIDANCE_MISSING_MAX)
 
 
 def test_string_annotation_registers_without_forward_ref_error():

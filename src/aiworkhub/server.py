@@ -4097,7 +4097,8 @@ def aiworkhub_task_plan_snapshot(full: bool = False) -> dict[str, Any]:
 
 @mcp.tool()
 def aiworkhub_task_health() -> dict[str, Any]:
-    """Check parent AIWorkHub task queue health and write-gate state."""
+    """Check parent AIWorkHub task queue health and write-gate state.
+    Use for the task queue and write gate only; use aiworkhub_doctor_diagnose for a cross-subsystem verdict."""
 
     result = core.health()
     result["server_version"] = __version__
@@ -6931,7 +6932,8 @@ def aiworkhub_dispatcher_ensure_started() -> dict[str, Any]:
 @mcp.tool()
 def aiworkhub_dispatcher_health() -> dict[str, Any]:
     """READ-ONLY: dispatcher running/stopped, selected coordinator target,
-    repository identity, pending callback count, and last delivery/error."""
+    repository identity, pending callback count, and last delivery/error.
+    Use when callbacks stop arriving; use aiworkhub_doctor_diagnose for a cross-subsystem verdict."""
 
     return core.dispatcher_health()
 
@@ -6942,7 +6944,8 @@ def aiworkhub_doctor_diagnose() -> dict[str, Any]:
     source-graph and manager-route health probes concurrently and returns one
     verdict (ok/problem/unavailable) with the non-ok probes and the tool to
     call next, plus server_process: this answering process's pid, memory and
-    runtime generation."""
+    runtime generation.
+    Use first when something fails and the cause is unknown; use aiworkhub_environment_preflight for pre-launch readiness."""
 
     reply = doctor.diagnose(
         {
@@ -7035,6 +7038,7 @@ def _source_graph_detail_reply(result: Any, tool: str, detail: str) -> Any:
 def aiworkhub_source_graph_health(detail: StatusDetail = "summary") -> dict[str, Any]:
     """READ-ONLY: Source Graph indexing daemon health for the active
     repository -- indexing/ready/degraded status, last report/error/time.
+    Use when Source Graph answers look stale or fail; use aiworkhub_doctor_diagnose for a cross-subsystem verdict.
 
     ``detail="summary"`` (default) keeps every top-level scalar exact and folds
     each top-level dict/list to ``{summarized, bytes, sha256}`` plus its own
@@ -7124,7 +7128,8 @@ def aiworkhub_claude_callback_ack(batch_id: str, lease_id: str) -> dict[str, Any
 
 @mcp.tool()
 def aiworkhub_quality_profile() -> dict[str, Any]:
-    """READ-ONLY: zero-config detected languages/declared/installed tools."""
+    """READ-ONLY: zero-config detected languages/declared/installed tools.
+    Use before aiworkhub_quality_run_checks to see what the repo declares; it runs nothing. Use aiworkhub_suite_profile to time one check."""
 
     return quality_evidence.build_zero_config_profile(core.repo_root())
 
@@ -7213,6 +7218,7 @@ def aiworkhub_source_graph_retrieval_eval() -> dict[str, Any]:
 @mcp.tool()
 def aiworkhub_session_token_profile(task_id: str | None = None) -> dict[str, Any]:
     """READ-ONLY: observed provider tokens plus separately-labelled prompt bytes.
+    Use to see where one session's input tokens went; use aiworkhub_task_cost_ledger for per-task cost instead.
 
     Args:
         task_id: Optional task id to restrict the profile to that task's usage records and prompt-budget events; omit to profile every task.
@@ -7256,6 +7262,7 @@ def aiworkhub_suite_profile(
     repeats: int = 2,
 ) -> dict[str, Any]:
     """Execute one repo-declared quality check repeatedly; shell is never used.
+    Use to measure the runtime spread or flakiness of one declared check; use aiworkhub_quality_run_checks for one pass over all checks.
 
     Args:
         check_id: Id of a check declared in the repository's .aiworkhub/quality.json; an unknown id returns declared_check_not_found.
@@ -7311,6 +7318,7 @@ def aiworkhub_quality_run_checks(changed_paths: list[str] | None = None) -> dict
     """Run repo-declared .aiworkhub/quality.json build/test/lint/typecheck
     commands (argv arrays only, shell=False). Fails closed on malformed
     config. Diff/new-code-first: pass ``changed_paths`` to scope evidence.
+    Use to gate a change on the declared checks; use aiworkhub_quality_profile first if unsure what is declared.
 
     Args:
         changed_paths: Repository-relative paths changed by the task; scopes which declared checks apply and is recorded as each check's affected_paths. Omit to run the checks unscoped.
@@ -7365,6 +7373,7 @@ def aiworkhub_environment_preflight(
     adapter_id: str | None = None, detail: StatusDetail = "summary"
 ) -> dict[str, Any]:
     """READ-ONLY: unified repository/policy/Source Graph/provider readiness.
+    Use before launching workers to confirm readiness; use aiworkhub_doctor_diagnose when something is already failing.
 
     Provider access is reported as observed only when an adapter-specific
     bridge or credential readiness source proves it; installed CLI binaries
