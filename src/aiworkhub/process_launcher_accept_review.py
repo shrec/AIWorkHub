@@ -1148,9 +1148,10 @@ def validate_manager_correction(
     if identity_reason:
         return None, {}, identity_reason
 
-    # The findings in play are exactly the ones ``_refinement_blockers`` reads:
-    # the ``defect`` findings on the SELECTED, usable reviewers' already-sealed
-    # receipts. Counting ids over that same population is what makes an
+    # The findings in play are the ``defect`` and ``observation`` findings on the
+    # SELECTED, usable reviewers' already-sealed receipts (``_refinement_blockers``
+    # reads the defects; a confirmed observation is accepted too, NF-2026-01869,
+    # and lifts nothing there). Counting ids over every finding is what makes an
     # ambiguous id refuse here rather than lift the wrong blocker there.
     selected, _unresolved, _source = _selected_reviewer_rows(
         reviewers, reviewer_request_ids
@@ -1171,7 +1172,7 @@ def validate_manager_correction(
                 continue
             finding_id = f"reviewer:{lens}:{str(finding.get('id') or '')}"
             counts[finding_id] = counts.get(finding_id, 0) + 1
-            if finding.get("disposition") != "defect":
+            if finding.get("disposition") not in {"defect", "observation"}:
                 continue
             findings[finding_id] = {
                 "lens": lens,
