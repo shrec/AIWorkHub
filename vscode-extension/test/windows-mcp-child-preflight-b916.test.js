@@ -317,8 +317,8 @@ test(
     // Piped-stdio spawnSync livelocks libuv in the windows_appcontainer sandbox; probe it pipe-free first.
     const probe = childProcess.spawnSync(
       process.execPath,
-      ["-e", "require('child_process').spawnSync(process.execPath, ['-e', ''], { stdio: 'pipe', timeout: 5000 })"],
-      { stdio: "ignore", timeout: 30000, shell: false },
+      ["-e", "require('child_process').spawnSync(process.execPath, ['-e', ''], { stdio: 'pipe', timeout: 30000 })"],
+      { stdio: "ignore", timeout: 60000, shell: false },
     );
     if (probe.error || probe.status !== 0) {
       const reason = `pipe-stdio child spawn did not complete (status=${probe.status}, signal=${probe.signal}, error=${probe.error && probe.error.code}); libuv pipe livelock in this sandbox, real-interpreter preflight cannot run`;

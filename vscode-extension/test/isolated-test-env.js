@@ -61,7 +61,7 @@ function removeFallbackRoot() {
   if (!fallbackRoot) return;
   const root = fallbackRoot;
   fallbackRoot = null;
-  fs.rmSync(root, { recursive: true, force: true });
+  fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 
 function ensureFallbackRoot() {
@@ -73,7 +73,7 @@ function ensureFallbackRoot() {
     verifyFallbackRoot(root);
     fallbackRoot = root;
   } catch (error) {
-    fs.rmSync(created, { recursive: true, force: true });
+    fs.rmSync(created, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     throw error;
   }
   process.once("exit", removeFallbackRoot);
@@ -127,7 +127,7 @@ function cleanupScratch(scratch) {
   if (!ownedScratch.has(identity(scratch))) throw new Error("test_scratch_not_created_by_this_process");
   // rm removes contained symlinks themselves; the owned target and its ancestors
   // above were checked against their canonical root before recursive removal.
-  fs.rmSync(scratch, { recursive: true, force: true });
+  fs.rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   ownedScratch.delete(identity(scratch));
 }
 
