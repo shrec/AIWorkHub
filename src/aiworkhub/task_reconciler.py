@@ -703,7 +703,21 @@ def _prime_drain_process_events(
         return 0
 
 
+_REVIEW_RECOVERY_LOCK = threading.Lock()
+_last_review_recovery_monotonic = 0.0
+
+
 def _scan_review_ready_recovery(manager: Any) -> dict[str, Any]:
+    """Single-flight review recovery shared by the scan phase and drain thread."""
+    global _last_review_recovery_monotonic
+    with _REVIEW_RECOVERY_LOCK:
+        try:
+            return _scan_review_ready_recovery_unlocked(manager)
+        finally:
+            _last_review_recovery_monotonic = time.monotonic()
+
+
+def _scan_review_ready_recovery_unlocked(manager: Any) -> dict[str, Any]:
     """Ensure missing review chains, then let the orchestrator launch."""
     empty: dict[str, Any] = {
         "state": "skipped",
@@ -1142,7 +1156,46 @@ class ReconcilerService:
                         self._authority_state = "released"
                         self._authority_identity = {}
 
+    def _review_drain_loop(self, drain_stop: threading.Event) -> None:
+        while not drain_stop.wait(self.scan_interval_seconds) and not self._stop_event.is_set():
+            if time.monotonic() - _last_review_recovery_monotonic < self.scan_interval_seconds:
+                continue
+            try:
+                _scan_review_ready_recovery(self._manager)
+            except Exception:  # noqa: BLE001 -- the drain thread must never die
+                pass
+
     def _run_as_owner(
+        self,
+        *,
+        max_iterations: int | None = None,
+        on_scan: Any = None,
+        stop_requested: Any = None,
+    ) -> None:
+        # A scan can run for minutes and the next one starts only after it
+        # returns, so reviewer launch must not wait on scan length: review
+        # recovery also runs on its own thread while this owner holds
+        # authority. Results are identical (same function, same leased
+        # outbox); only when it runs changes.
+        drain_stop = threading.Event()
+        drain_thread = threading.Thread(
+            target=self._review_drain_loop,
+            args=(drain_stop,),
+            name=f"aiworkhub-review-drain:{self.repo.name}",
+            daemon=True,
+        )
+        drain_thread.start()
+        try:
+            self._owner_scan_loop(
+                max_iterations=max_iterations,
+                on_scan=on_scan,
+                stop_requested=stop_requested,
+            )
+        finally:
+            drain_stop.set()
+            drain_thread.join(timeout=self.scan_interval_seconds)
+
+    def _owner_scan_loop(
         self,
         *,
         max_iterations: int | None = None,
