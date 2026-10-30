@@ -100,6 +100,10 @@ DETERMINISTIC_DENIAL_REASONS = frozenset(
         "validation_only_replay_hash_manifest_invalid",
         "validation_only_replay_claim_epoch_invalid",
         "validation_only_replay_claim_epoch_mismatch",
+        # process_launcher_launch_isolated.py:550-551.  The card's read_roots
+        # against the sandbox backend of its adapter -- both fixed by the card
+        # and the host, so it denies identically until the card changes.
+        "read_roots_unsupported_backend",
     }
 )
 # Reason families whose concrete suffix is minted by the producer.  A family

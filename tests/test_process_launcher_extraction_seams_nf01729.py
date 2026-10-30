@@ -28,7 +28,9 @@ from aiworkhub import process_launcher_vscode_lm_tool as vscode_lm_tool
 from aiworkhub import process_launcher_workspace_gc as workspace_gc
 from aiworkhub import process_launcher_review_context as review_context
 
-PROCESS_LAUNCHER_MAX_LINES = 13574
+# 13574 -> 13681 (0.12.78): five accepted launch/accept fixes, measured; the
+# next extraction ratchets it back down.
+PROCESS_LAUNCHER_MAX_LINES = 13681
 
 # (module, function, seam tuple attribute, ProcessManager method)
 EXTRACTIONS: tuple[tuple[ModuleType, str, str, str], ...] = (

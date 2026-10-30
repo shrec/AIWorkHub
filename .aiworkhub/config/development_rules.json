@@ -634,6 +634,11 @@
         "count": 1
       },
       {
+        "path": "src/aiworkhub/card_read_roots.py",
+        "pattern": "os_name_eq",
+        "count": 1
+      },
+      {
         "path": "src/aiworkhub/context_cache.py",
         "pattern": "def_atomic",
         "count": 1
@@ -982,8 +987,8 @@
     "measurement": {
       "reference_commit": "4ef0001cf9ef66fc9ebd70d5b724d46c485b1840",
       "reference_total": 161,
-      "current_total": 130,
-      "accepted_predecessor_delta": -31
+      "current_total": 131,
+      "accepted_predecessor_delta": -30
     }
   },
   "single_definition_boundary": {

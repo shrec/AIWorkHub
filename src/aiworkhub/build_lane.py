@@ -110,9 +110,14 @@ def lane_id_from_command(command: str) -> str:
 
 
 def _canonical_root() -> Path:
-    from .core import repo_root
+    # Not ``core``: worker_workspace imports this module, so a ``core`` import
+    # would drag the whole package into every sparse validation closure.
+    from .toolchain_registry import canonical_repo_root
 
-    return repo_root()
+    root = canonical_repo_root()
+    if root is None:
+        raise LaneRefused("lane_canonical_root_unbound")
+    return root
 
 
 def _is_text(value: Any) -> bool:
@@ -271,7 +276,7 @@ def _snapshot(source: Path, destination: Path) -> str:
             for chunk in iter(lambda: reader.read(1 << 20), b""):
                 content.update(chunk)
                 writer.write(chunk)
-        executable = os.name != "nt" and bool(origin.stat().st_mode & 0o111)
+        executable = not platform_io.is_windows() and bool(origin.stat().st_mode & 0o111)
         if executable:
             shutil.copymode(origin, target)
         digest.update(content.hexdigest().encode("ascii") + (b"x\n" if executable else b"\n"))

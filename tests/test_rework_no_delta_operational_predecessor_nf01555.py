@@ -80,6 +80,8 @@ def test_the_exempt_categories_are_exactly_the_operational_ones():
         "provider_runtime",
         "dependency_or_route",
         "cancellation_or_timeout",
+        # A reject against a moved base is not candidate code (release 0.12.78).
+        "base_drift",
     })
     assert "candidate_code" not in evidence.REWORK_NO_DELTA_EXEMPT_FAILURE_CATEGORIES
 

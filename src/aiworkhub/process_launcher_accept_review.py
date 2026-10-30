@@ -2480,6 +2480,7 @@ ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
     "fold_accept_blockers",
     "_latest_request_identity_event",
     "manager_skill_tools",
+    "module_size_ratchet_blockers",
     "record_accept_finding_dispositions",
     "reviewer_evidence",
     "sealed_review_packet",

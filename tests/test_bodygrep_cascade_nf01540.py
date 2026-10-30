@@ -42,6 +42,9 @@ def _uncached_bodygrep(monkeypatch: pytest.MonkeyPatch) -> None:
     # These tests assert byte-cap paging; a cached file costs no disk bytes and
     # never pages (NF-2026-01820), so every file here is read from disk.
     monkeypatch.setattr(sg, "BODYGREP_FILE_CACHE_MAX_FILE_BYTES", 0)
+    # The worker walk is under test, so the core never continues an empty
+    # truncated page on its own (NF-2026-01851).
+    monkeypatch.setattr(sg, "BODYGREP_EXTRA_PAGES", 0)
 
 
 def _write(path: Path, text: str) -> None:

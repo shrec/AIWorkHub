@@ -104,7 +104,11 @@ _TASK_CREATE_SKILL_VOCABULARY = [
 # the manager approves it by reference here. The patch can only ever name paths
 # already present in BOTH lists, so approving one can never widen a card, and
 # the resolved list still faces validate_required_output_exceptions unchanged.
-_TASK_CREATE_TAIL = ["custom_template_escape", "apply_contract_patch", "echo_card", "wave_goal_binding"]
+#
+# ``read_roots`` is the reviewed opt-in read grant for the worker sandbox (release 0.12.78).
+_TASK_CREATE_TAIL = [
+    "custom_template_escape", "apply_contract_patch", "echo_card", "wave_goal_binding", "read_roots",
+]
 
 
 def test_task_create_schema_remains_unchanged():

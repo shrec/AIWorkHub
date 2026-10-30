@@ -43,10 +43,11 @@ _WORKER_ONLY = "aiworkhub_worker_source_graph_query"
 _WRITE_PROBE = "aiworkhub_task_mark_done"
 
 # Measured on base 739a7c70, plus aiworkhub_manager_callback_lane_claim (NF-2026-01802), minus the five
-# retired manager Hub Mail tools and the three retired dashboard ones, plus the dashboard peers view.
-_PRE_TABLE_ALL_COUNT = 226
-_PRE_TABLE_ALL_READ_ONLY_COUNT = 222
-_LISTED_COUNTS = {"manager": 180, "worker": 19, "dashboard": 67}
+# retired manager Hub Mail tools and the three retired dashboard ones, plus the dashboard peers view,
+# plus aiworkhub_manager_recipe_run_status (NF-2026-01849).
+_PRE_TABLE_ALL_COUNT = 227
+_PRE_TABLE_ALL_READ_ONLY_COUNT = 223
+_LISTED_COUNTS = {"manager": 181, "worker": 19, "dashboard": 67}
 # The 45 webview-only dashboard tools the pre-table manager surface hid.
 _PRE_TABLE_MANAGER_HIDDEN = frozenset({
     "aiworkhub_dashboard_task_detail",

@@ -124,6 +124,7 @@ def test_basis_pins_exact_classes_and_counts(tmp_path: Path) -> None:
         "failure_category:inconclusive:attributed_outcome",
     ]
     excluded_classes = [
+        "failure_category:base_drift",
         "failure_category:cancellation_or_timeout",
         "failure_category:dependency_or_route",
         "failure_category:provider_runtime",

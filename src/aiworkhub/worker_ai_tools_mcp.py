@@ -1336,17 +1336,23 @@ def prewarm_quality_review_source_graph(
             # read-only) so a later reviewer query composes the two without any
             # copy. Cost now scales with the changed set, not the base index.
             # ``build_partition`` reconciles each indexable path through the same
-            # exact-file ``index_file``/``remove_file`` primitives as before, so
-            # a Source Graph contract failure still surfaces as a
-            # ``SourceGraphError`` normalized by the handler below; a path-safety
-            # violation keeps its existing WorkerToolError identity.
+            # exact-file ``index_file``/``remove_file`` primitives as before. It
+            # records a per-file Source Graph failure instead of raising
+            # (NF-2026-01858); a reviewer DB is never published partial, so the
+            # first failure surfaces as a ``SourceGraphError`` normalized by the
+            # handler below. A path-safety violation keeps its WorkerToolError identity.
             try:
-                _source_graph_partition.build_partition(
+                report = _source_graph_partition.build_partition(
                     repo, changed_paths, temporary,
                     base_db_path=canonical.db_path,
                 )
             except _source_graph_partition.PartitionError as exc:
                 raise WorkerToolError(str(exc)) from exc
+            if report.failed_files:
+                first = report.failed_files[0]
+                raise _source_graph_mod.SourceGraphError(
+                    f"partition_index_failed:{first['path']}:{first['reason']}"
+                )
             _write_candidate_db_marker(
                 temporary, packet_sha256, target_request_id, target_task_id,
             )

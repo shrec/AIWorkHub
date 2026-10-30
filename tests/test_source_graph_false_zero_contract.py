@@ -148,8 +148,12 @@ def capped_repo(tmp_path_factory) -> Path:
     return repo
 
 
-def test_capped_zero_is_explicitly_incomplete(capped_repo: Path) -> None:
+def test_capped_zero_is_explicitly_incomplete(
+    capped_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Zero matches under a capped scan must carry the incompleteness flag."""
+    # One page: the empty-page continuation (NF-2026-01851) would finish this tiny tree.
+    monkeypatch.setattr(sg, "BODYGREP_EXTRA_PAGES", 0)
     result = sg.bodygrep_query(capped_repo, "nosuchliteralanywhere", budget=20)
     assert result["matches"] == []
     # The scan could not cover the whole tree, so the zero cannot be read as

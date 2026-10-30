@@ -2966,11 +2966,12 @@ def test_appcontainer_union2_validation_scratch_takes_the_short_home_leaf(
         assert scratch.parent == home.resolve()
         assert probed == [scratch]
         assert sorted(os.listdir(request_dir)) == ["home", "worktree"]
-        # Measure the path as production lays it out under a 96-char repo root.
+        # Measure the path as production lays it out under a 128-char repo root
+        # (an xdist pytest basetemp is ~107; the short probe name buys the room).
         root = str(repo.resolve())
         assert str(scratch).startswith(root)
-        padded = "r" * 96 + str(scratch)[len(root):]
-        probe = "\\.exec_probe_" + "0" * 32 + ".exe"
+        padded = "r" * 128 + str(scratch)[len(root):]
+        probe = r"\.xp" + "0" * 8 + ".exe"
         assert len(padded) + len(probe) < 260
     finally:
         worker_workspace.cleanup_validation_exec_scratch(scratch)

@@ -7167,7 +7167,10 @@ def _probe_exec_capable_dir(directory: Path) -> bool:
         return False
     windows = sys.platform == "win32"
     suffix = ".exe" if windows else ""
-    probe_path = directory / f".exec_probe_{uuid.uuid4().hex}{suffix}"
+    # Short name: the AppContainer union2 scratch already sits near MAX_PATH and
+    # CreateProcess refuses a longer image path (WinError 206 -> ``noexec``).
+    # The directory is freshly and exclusively created, so 8 hex chars suffice.
+    probe_path = directory / f".xp{uuid.uuid4().hex[:8]}{suffix}"
     if windows:
         comspec = os.environ.get("COMSPEC", "").strip()
         if not comspec:

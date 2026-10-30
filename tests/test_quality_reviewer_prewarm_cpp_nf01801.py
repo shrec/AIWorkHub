@@ -17,6 +17,7 @@ import json
 import sqlite3
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -292,6 +293,7 @@ def test_prewarm_empty_refusal_names_path_and_reason(
 
     def schema_only_partition(repo_root, changed_paths, partition_db_path, **_):
         source_graph.connect(Path(partition_db_path)).close()
+        return SimpleNamespace(failed_files=())
 
     monkeypatch.setattr(
         source_graph_partition, "build_partition", schema_only_partition,

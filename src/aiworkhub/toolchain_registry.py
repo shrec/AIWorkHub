@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from . import platform_io
 from .card_read_roots import _contains, _real_key as _norm
 from .validation_toolchains import (
     PYTHON_VALIDATION_EXECUTABLES,
@@ -72,7 +73,7 @@ def _invalid(detail: str) -> Exception:
 
 
 def _is_windows() -> bool:
-    return os.name == "nt"
+    return platform_io.is_windows()
 
 
 def _under(path: Path, directories: Sequence[str]) -> bool:

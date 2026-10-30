@@ -148,7 +148,14 @@ def test_current_tree_passes_and_baseline_is_sorted():
     # The new SDLC case store adds one SQLite connection, matching the existing
     # per-store connection precedent. Keep its identity explicit and ratchet
     # every real decrease instead of preserving stale allowance.
-    assert sum(entry.count for entry in boundary.baseline) == 130
+    # 130 -> 131 on 2026-10-30: card_read_roots.py takes one os_name_eq for
+    # drive-relative path rejection. The module must stay import-free so the
+    # direct-script worker supervisor can load it, so it cannot reach the
+    # facade -- recipe_runner.py's single predicate is the precedent. The three
+    # other new identities of the release (build_lane.py, toolchain_registry.py,
+    # process_launcher_launch_isolated.py) were routed through
+    # ``platform_io.is_windows()`` instead of recorded.
+    assert sum(entry.count for entry in boundary.baseline) == 131
 
 
 def test_new_identity_and_same_identity_growth_fail(tmp_path):

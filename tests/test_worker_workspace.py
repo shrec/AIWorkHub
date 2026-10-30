@@ -676,6 +676,14 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "windows_build_env.py",
         # ...and the import-closure resolver, imported lazily by _resolve_local_python_imports.
         "python_import_closure.py",
+        # worker_workspace imports its required_outputs glob matcher (NF-2026-01834).
+        "required_output_glob.py",
+        # ...and its registered-toolchain resolver, which imports the read-root
+        # path helpers from card_read_roots (release 0.12.78).
+        "toolchain_registry.py",
+        "card_read_roots.py",
+        # ...and its container build lane (release 0.12.78).
+        "build_lane.py",
     ):
         shutil.copyfile(source_package / name, destination_package / name)
     # write_bytes, not write_text: several tests compare a raw on-disk byte

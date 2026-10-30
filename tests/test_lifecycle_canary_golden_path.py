@@ -230,6 +230,7 @@ def _callback_outbox_rows(repo: Path, task_id: str) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+@pytest.mark.live_manager_chat_seat
 def test_lifecycle_canary_golden_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     if windows_appcontainer.current_process_is_appcontainer():
         pytest.skip(APPCONTAINER_SKIP)

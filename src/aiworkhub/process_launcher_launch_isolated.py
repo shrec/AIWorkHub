@@ -177,9 +177,9 @@ def relaunch_input_paths(process_dir: _PathT, request_id: str) -> tuple[_PathT, 
 
 
 def _is_windows_host() -> bool:
-    import os
+    from . import platform_io
 
-    return os.name == "nt"
+    return platform_io.is_windows()
 
 
 def _breakaway_creation_flag() -> int:
