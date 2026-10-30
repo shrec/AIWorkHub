@@ -1331,6 +1331,21 @@ FINDING_DISPOSITIONS = frozenset({"confirmed", "dismissed"})
 SYSTEM_FINDING_DISPOSITIONS = frozenset({"fixed_by_correction", "accepted_nonblocking"})
 SYSTEM_ACCEPT_ACTOR = "system:accept"
 MAX_FINDING_DISPOSITION_TEXT = 4000
+_CONTRACT_CITATION_RE = re.compile(
+    r"(?<![\w./\\-])[\w./\\-]+\.\w+:\d+(?:-\d+)?(?!\w)"
+    r"|(?:^|(?<=\s))(?:card|kb):[ \t]*\S[^\n]{0,198}",
+    re.MULTILINE,
+)
+
+
+def _contract_citations(counter_evidence: str) -> list[str]:
+    """Contract references (NF-2026-01838) a HIGH dismissal must cite, in order."""
+    found: list[str] = []
+    for match in _CONTRACT_CITATION_RE.finditer(counter_evidence):
+        text = match.group(0).strip()
+        if text not in found:
+            found.append(text)
+    return found[:20]
 
 MANAGER_HOLD_DECISIONS = frozenset({
     "authorize_distinct_route_successor",
@@ -3042,11 +3057,22 @@ class ReviewOrchestrator:
             # row id must store that same full form.
             finding_id = f"reviewer:{lens}:{str(finding.get('id') or '')}"
         severity = str(finding.get("severity") or "")
-        if severity in quality_evidence.BLOCKING_SEVERITIES:
+        contract_citations: list[str] = []
+        if severity in quality_evidence.NON_DISMISSABLE_SEVERITIES or (
+            severity in quality_evidence.BLOCKING_SEVERITIES
+            and disposition != "dismissed"
+        ):
             return {
                 "ok": False,
                 "error": "review_finding_disposition_blocking_severity",
             }
+        if severity in quality_evidence.BLOCKING_SEVERITIES:
+            contract_citations = _contract_citations(counter_evidence)
+            if not contract_citations:
+                return {
+                    "ok": False,
+                    "error": "review_finding_disposition_contract_citation_required",
+                }
         if disposition == "dismissed" and (
             finding.get("disposition", quality_evidence.FINDING_DISPOSITION_DEFECT)
             not in {
@@ -3079,6 +3105,9 @@ class ReviewOrchestrator:
             "actor": actor,
             "decided_at": (now or datetime.now(timezone.utc)).isoformat(),
         }
+        if severity == quality_evidence.SEVERITY_HIGH:
+            receipt["manager_signed"] = True
+            receipt["contract_citations"] = contract_citations
         receipt_sha256 = canonical_digest(receipt)
 
         def _comparable(value: Mapping[str, Any]) -> dict[str, Any]:

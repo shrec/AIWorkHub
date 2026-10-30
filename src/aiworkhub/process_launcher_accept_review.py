@@ -546,9 +546,16 @@ def _refinement_blockers(
                         "disposition": disposition,
                         "receipt_sha256": str(stored.get("receipt_sha256") or ""),
                         "blocker_lifted": lifted,
-                        # Named only for a manager correction, so a row produced
-                        # by any other path keeps exactly the shape it had.
+                        # Named only for a manager correction or a contract-citing
+                        # HIGH dismissal, so any other row keeps its shape.
                         **({"lifted_by": "manager_correction"} if corrected else {}),
+                        **(
+                            {"lifted_by": "manager_contract_dismissal"}
+                            if lifted
+                            and not corrected
+                            and severity in quality_evidence.BLOCKING_SEVERITIES
+                            else {}
+                        ),
                     }
                 )
             extra: dict[str, Any] = (
@@ -562,6 +569,8 @@ def _refinement_blockers(
                 else {}
             )
             if severity in quality_evidence.BLOCKING_SEVERITIES:
+                if lifted:
+                    continue
                 blockers.append(
                     _blocker(
                         "refinement_required", finding_id[:300],

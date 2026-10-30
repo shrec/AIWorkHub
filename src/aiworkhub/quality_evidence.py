@@ -89,6 +89,7 @@ VALID_SEVERITIES = frozenset(
     {SEVERITY_CRITICAL, SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW}
 )
 BLOCKING_SEVERITIES = frozenset({SEVERITY_CRITICAL, SEVERITY_HIGH})
+NON_DISMISSABLE_SEVERITIES = frozenset({SEVERITY_CRITICAL})
 FINDING_DISPOSITION_DEFECT = "defect"
 FINDING_DISPOSITION_OBSERVATION = "observation"
 FINDING_DISPOSITION_PROCESS_LIMIT = "process_limit"
@@ -1539,12 +1540,14 @@ def dismissal_lifts_finding(
 
     True only when the finding id occurs exactly once across every report the
     caller counted, a bound ``dismissed`` row names it, and its severity is not
-    blocking. ``fold_quality_verdict`` and ``accept_preview`` both call this, so
-    the preview can never drop a blocker the verdict keeps. The caller still
-    owns the lens and actionable conditions of the blocker itself.
+    in ``NON_DISMISSABLE_SEVERITIES`` (a HIGH finding is liftable only because
+    the dismissal receipt had to cite the contract, NF-2026-01838).
+    ``fold_quality_verdict`` and ``accept_preview`` both call this, so the
+    preview can never drop a blocker the verdict keeps. The caller still owns
+    the lens and actionable conditions of the blocker itself.
     """
     return (
-        severity not in BLOCKING_SEVERITIES
+        severity not in NON_DISMISSABLE_SEVERITIES
         and finding_id in dismissed_by_finding
         and finding_id_counts.get(finding_id) == 1
     )
@@ -1727,27 +1730,38 @@ def fold_quality_verdict(
                 row["observation_ids"].append(finding_id)
                 continue
             row["finding_ids"].append(finding_id)
-            if finding["severity"] in BLOCKING_SEVERITIES:
+            dismissal_lifted = lens in {
+                LENS_CORRECTNESS,
+                LENS_SECURITY,
+            } and dismissal_lifts_finding(
+                finding_id,
+                severity=str(finding["severity"]),
+                finding_id_counts=finding_id_counts,
+                dismissed_by_finding=dismissed_by_finding,
+            )
+            if finding["severity"] in BLOCKING_SEVERITIES and not dismissal_lifted:
                 blockers.append(finding_id)
                 row["status"] = STATUS_FAILED
             if lens in {LENS_CORRECTNESS, LENS_SECURITY}:
-                if dismissal_lifts_finding(
-                    finding_id,
-                    severity=str(finding["severity"]),
-                    finding_id_counts=finding_id_counts,
-                    dismissed_by_finding=dismissed_by_finding,
-                ):
-                    # A manager-dismissed false positive: only THIS finding's
-                    # refinement blocker is lifted, on the record. A blocking
-                    # severity never reaches this branch.
+                if dismissal_lifted:
+                    # A manager-dismissed finding: only THIS finding is lifted,
+                    # on the record. A HIGH one is lifted only by a
+                    # contract-citing, manager-signed dismissal
+                    # (NF-2026-01838); CRITICAL never reaches this branch.
+                    contract_dismissal = finding["severity"] in BLOCKING_SEVERITIES
                     manager_dismissed.append(
                         {
                             "finding_id": finding_id,
                             "lens": lens,
                             "severity": str(finding["severity"]),
                             "disposition": "dismissed",
-                            "classification": "manager_dismissed_reviewer_false_positive",
+                            "classification": (
+                                "manager_dismissed_contract_counter_evidence"
+                                if contract_dismissal
+                                else "manager_dismissed_reviewer_false_positive"
+                            ),
                             "receipt_sha256": dismissed_by_finding[finding_id],
+                            **({"manager_signed": True} if contract_dismissal else {}),
                         }
                     )
                     continue

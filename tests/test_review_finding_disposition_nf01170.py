@@ -195,9 +195,9 @@ def test_confirmed_disposition_keeps_the_blocker() -> None:
     assert confirmed == baseline
 
 
-def test_blocking_severity_is_never_suppressed_even_with_a_disposition_row() -> None:
+def test_critical_severity_is_never_suppressed_even_with_a_disposition_row() -> None:
     verdict = _fold(
-        [_report(_finding("finding-1", qe.SEVERITY_HIGH))],
+        [_report(_finding("finding-1", qe.SEVERITY_CRITICAL))],
         finding_dispositions=[
             {"finding_id": FINDING_1, "disposition": "dismissed", "receipt_sha256": "e" * 64}
         ],
@@ -271,8 +271,8 @@ def test_dismissal_with_empty_counter_evidence_is_refused(tmp_path: Path) -> Non
     ) == []
 
 
-def test_high_severity_finding_is_refused(tmp_path: Path) -> None:
-    receipt = _receipt(_finding("finding-1", qe.SEVERITY_HIGH))
+def test_critical_severity_finding_is_refused(tmp_path: Path) -> None:
+    receipt = _receipt(_finding("finding-1", qe.SEVERITY_CRITICAL))
 
     assert _dispose(_driver(tmp_path), receipt) == {
         "ok": False,
