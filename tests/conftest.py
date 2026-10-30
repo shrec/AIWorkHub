@@ -88,6 +88,23 @@ def pinned_toolchain_authority_secret(monkeypatch):
     monkeypatch.setenv("AIWORKHUB_TOOLCHAIN_AUTHORITY_HMAC_KEY", "hex:" + "11" * 32)
 
 
+@pytest.fixture(autouse=True)
+def hermetic_worktree_root_env():
+    """Restore the worktree root after each test, however a test set it.
+
+    The b863 ``_metadata_and_events`` helper writes it into ``os.environ`` raw;
+    leaked, it put a later lifecycle canary's worktree in another test's tmp
+    dir, outside the canary's AppContainer boundary (spawn_failed, exit 126).
+    """
+
+    saved = os.environ.get("AIWORKHUB_WORKTREE_ROOT")
+    yield
+    if saved is None:
+        os.environ.pop("AIWORKHUB_WORKTREE_ROOT", None)
+    else:
+        os.environ["AIWORKHUB_WORKTREE_ROOT"] = saved
+
+
 @pytest.fixture(autouse=True, scope="session")
 def pinned_workforce_cap():
     # Core-derived cap made tests host-dependent (3-core CI: concurrency_limit_reached).
