@@ -3353,6 +3353,7 @@ def run_review_ready_quality_gate(
     affected = [str(value) for value in (changed_paths or ())]
     destructive_rows: list[dict[str, Any]] = []
     destructive_checks: list[EvidenceCheck] = []
+    citation_drift_rows: list[dict[str, Any]] = []
     if canonical_repo is not None and affected:
         try:
             destructive_checks = list(
@@ -3363,6 +3364,12 @@ def run_review_ready_quality_gate(
         except Exception:  # noqa: BLE001 -- a signal source, never a gate failure
             destructive_checks = []
         destructive_rows = [check.to_dict() for check in destructive_checks]
+        try:
+            citation_drift_rows = run_citation_drift_checks(
+                Path(canonical_repo), Path(candidate_root), changed_paths=affected
+            )
+        except Exception:  # noqa: BLE001 -- advisory signal, never a gate failure
+            citation_drift_rows = []
     observation = review_ready_risk_observation(
         card,
         affected,
@@ -3384,6 +3391,7 @@ def run_review_ready_quality_gate(
         for check in destructive_checks
         if check.status == STATUS_FAILED
     ]
+    gate["review_ready_citation_drift"] = citation_drift_rows
     return gate
 
 
@@ -3480,6 +3488,131 @@ def run_destructive_diff_checks(
             ),
         ))
     return checks
+
+
+CITATION_DRIFT_MAX_DOCS = 2000
+CITATION_DRIFT_MAX_FILE_BYTES = 1024 * 1024
+CITATION_DRIFT_MAX_ROWS = 200
+CITATION_DRIFT_GIT_TIMEOUT_SECONDS = 15
+CITATION_DRIFT_STATUS_MOVED = "moved"
+CITATION_DRIFT_STATUS_TARGET_CHANGED = "target_changed"
+
+
+def _citation_line_map(before: str, after: str) -> dict[int, int]:
+    import difflib
+
+    before_lines = before.replace("\r\n", "\n").split("\n")
+    after_lines = after.replace("\r\n", "\n").split("\n")
+    mapping: dict[int, int] = {}
+    matcher = difflib.SequenceMatcher(None, before_lines, after_lines, autojunk=False)
+    for tag, i1, i2, j1, _j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for offset in range(i2 - i1):
+                mapping[i1 + offset + 1] = j1 + offset + 1
+    return mapping
+
+
+def _read_bounded_text(path: Path) -> str | None:
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        if path.stat().st_size > CITATION_DRIFT_MAX_FILE_BYTES:
+            return None
+        return path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeError):
+        return None
+
+
+def run_citation_drift_checks(
+    baseline_root: Path | str,
+    candidate_root: Path | str,
+    *,
+    changed_paths: Iterable[str],
+) -> list[dict[str, Any]]:
+    """Report Markdown ``path:line`` citations that a candidate edit left stale.
+
+    Advisory only: rows never feed a verdict. A moved citation carries the
+    renumbered ``replacement``; a citation whose target line was rewritten is
+    ``target_changed`` and has none.
+    """
+    baseline = Path(baseline_root)
+    candidate = Path(candidate_root)
+    changed = sorted({str(path).replace("\\", "/") for path in changed_paths})
+    line_maps: dict[str, dict[int, int]] = {}
+    for relative in changed[:MAX_AFFECTED_PATHS]:
+        if not relative or relative.lower().endswith(".md"):
+            continue
+        before = _read_bounded_text(baseline / relative)
+        after = _read_bounded_text(candidate / relative)
+        if before is None or after is None:
+            continue
+        line_maps[relative] = _citation_line_map(before, after)
+    if not line_maps:
+        return []
+    try:
+        listing = subprocess.run(
+            ["git", "-C", str(candidate), "ls-files", "-z", "--", "*.md"],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=CITATION_DRIFT_GIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if listing.returncode != 0:
+        return []
+    docs = [
+        name
+        for name in listing.stdout.decode("utf-8", errors="replace").split("\0")
+        if name
+    ][:CITATION_DRIFT_MAX_DOCS]
+    patterns = {
+        relative: re.compile(
+            r"(?<![\w./\\-])" + re.escape(relative) + r":(\d+)(?:-(\d+))?(?!\d)"
+        )
+        for relative in line_maps
+    }
+    rows: list[dict[str, Any]] = []
+    for doc in docs:
+        text = _read_bounded_text(candidate / doc)
+        if text is None:
+            continue
+        active = [relative for relative in line_maps if relative in text]
+        if not active:
+            continue
+        for doc_line, line in enumerate(text.split("\n"), start=1):
+            for relative in active:
+                mapping = line_maps[relative]
+                for match in patterns[relative].finditer(line):
+                    old_start = int(match.group(1))
+                    old_end = int(match.group(2)) if match.group(2) else None
+                    new_start = mapping.get(old_start)
+                    new_end = mapping.get(old_end) if old_end is not None else None
+                    if old_start < 1:
+                        continue
+                    row: dict[str, Any] = {
+                        "doc": doc,
+                        "doc_line": doc_line,
+                        "citation": match.group(0),
+                        "target_path": relative,
+                        "old_line": old_start,
+                        "new_line": new_start,
+                        "replacement": None,
+                        "status": CITATION_DRIFT_STATUS_TARGET_CHANGED,
+                    }
+                    if new_start is not None and (old_end is None or new_end is not None):
+                        if new_start == old_start and (old_end is None or new_end == old_end):
+                            continue
+                        row["status"] = CITATION_DRIFT_STATUS_MOVED
+                        row["replacement"] = (
+                            f"{relative}:{new_start}"
+                            if old_end is None
+                            else f"{relative}:{new_start}-{new_end}"
+                        )
+                    rows.append(row)
+                    if len(rows) >= CITATION_DRIFT_MAX_ROWS:
+                        return rows
+    return rows
 
 
 # ---------------------------------------------------------------------------

@@ -1335,6 +1335,16 @@ def review_packet(
                         or evidence.get("destructive_diff_checks")
                     )
                 ],
+                "citation_drift": [
+                    {
+                        "doc": _packet_text(row.get("doc"), 300),
+                        "doc_line": row.get("doc_line"),
+                        "citation": _packet_text(row.get("citation"), 300),
+                        "replacement": _packet_text(row.get("replacement"), 300),
+                        "status": _packet_text(row.get("status"), 40),
+                    }
+                    for row in _packet_rows(gate.get("review_ready_citation_drift"))
+                ],
                 "behavioral_gate": gate.get("behavioral_gate"),
             },
             "validation_skipped_total": validation_skipped_total,
