@@ -62,17 +62,17 @@ def _git(cwd: Path, *args: str) -> None:
 
 
 def _clone_repo(tmp_path: Path) -> Path:
-    """A parent repository with a local bare 'remote' so 'pushed' is verifiable
-    entirely offline."""
+    """A parent repository whose HEAD reads as pushed via a remote-tracking ref
+    set with update-ref (no local git transport in the validation lane)."""
     remote = tmp_path / "remote.git"
     repo = tmp_path / "repo"
-    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
-    _git(tmp_path, "clone", str(remote), str(repo))
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "remote", "add", "origin", str(remote))
     (repo / "file.txt").write_text("base\n", encoding="utf-8")
     _git(repo, "add", "file.txt")
     _git(repo, "commit", "-m", "base")
-    _git(repo, "push", "origin", "HEAD:refs/heads/main")
-    _git(repo, "fetch", "origin")  # populate refs/remotes/origin/*
+    _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
     return repo
 
 

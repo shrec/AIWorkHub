@@ -45,13 +45,13 @@ def _git(cwd: Path, *args: str) -> None:
 def _clone_repo(tmp_path: Path, name: str = "repo") -> Path:
     remote = tmp_path / f"{name}-remote.git"
     repo = tmp_path / name
-    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
-    _git(tmp_path, "clone", str(remote), str(repo))
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "remote", "add", "origin", str(remote))
     (repo / "file.txt").write_text("base\n", encoding="utf-8")
     _git(repo, "add", "file.txt")
     _git(repo, "commit", "-m", "base")
-    _git(repo, "push", "origin", "HEAD:refs/heads/main")
-    _git(repo, "fetch", "origin")
+    _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
     return repo
 
 

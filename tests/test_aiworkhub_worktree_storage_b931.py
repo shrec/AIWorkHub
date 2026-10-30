@@ -37,18 +37,19 @@ def _git(cwd: Path, *args: str) -> None:
 @pytest.fixture()
 def worktrees(tmp_path):
     """A base dir holding one worktree of each safety class, plus a pushed
-    parent repo (a local bare 'remote' makes 'pushed' verifiable offline)."""
+    parent repo. 'pushed' is set via update-ref on refs/remotes/origin/main:
+    the validation lane has no local git transport (NF-2026-01876)."""
     remote = tmp_path / "remote.git"
     parent = tmp_path / "parent"
     base = tmp_path / "wt-base"
     base.mkdir()
-    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
-    _git(tmp_path, "clone", str(remote), str(parent))
+    parent.mkdir()
+    _git(parent, "init")
+    _git(parent, "remote", "add", "origin", str(remote))
     (parent / "file.txt").write_text("v1\n", encoding="utf-8")
     _git(parent, "add", "file.txt")
     _git(parent, "commit", "-m", "base")
-    _git(parent, "push", "origin", "HEAD:refs/heads/main")
-    _git(parent, "fetch", "origin")  # populate refs/remotes/origin/*
+    _git(parent, "update-ref", "refs/remotes/origin/main", "HEAD")
 
     def add_worktree(name: str) -> Path:
         wt = base / name / "worktree"
@@ -111,14 +112,11 @@ def test_plan_include_orphaned_adds_only_orphans(worktrees) -> None:
 
 def test_repository_scoped_scan_excludes_unowned_and_orphaned_trees(worktrees, tmp_path) -> None:
     foreign = tmp_path / "foreign"
-    _git(
-        tmp_path,
-        "clone",
-        "--branch",
-        "main",
-        str(tmp_path / "remote.git"),
-        str(foreign),
-    )
+    foreign.mkdir()
+    _git(foreign, "init")
+    (foreign / "file.txt").write_text("foreign\n", encoding="utf-8")
+    _git(foreign, "add", "file.txt")
+    _git(foreign, "commit", "-m", "foreign")
     foreign_tree = worktrees["base"] / "W_FOREIGN" / "worktree"
     foreign_tree.parent.mkdir(parents=True)
     _git(foreign, "worktree", "add", "--detach", str(foreign_tree), "HEAD")
