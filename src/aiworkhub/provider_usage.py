@@ -19,6 +19,8 @@ MAX_JSON_EVENTS = 8192
 MAX_WALK_DEPTH = 8
 MAX_WALK_ITEMS = 256
 MAX_USAGE_SAMPLES = 64
+MAX_TOOL_RESULT_NAMES = 64
+MAX_INIT_PLUGIN_NAMES = 32
 
 
 def _as_int(value: Any) -> int:
@@ -178,7 +180,76 @@ def _empty_summary() -> dict[str, Any]:
         "completed_turn_cached_input_tokens": 0,
         "completed_turn_cache_creation_input_tokens": 0,
         "terminal_result_usage_observed": False,
+        "usage_samples_deduped": 0,
+        "tool_result_bytes_by_tool": {},
+        "init_summary": {},
     }
+
+
+def _claude_init_summary(event: dict[str, Any]) -> dict[str, Any]:
+    if event.get("type") != "system" or event.get("subtype") != "init":
+        return {}
+    summary: dict[str, Any] = {}
+    for key in ("tools", "mcp_servers", "slash_commands", "agents", "skills"):
+        value = event.get(key)
+        if isinstance(value, list):
+            summary[key] = len(value)
+    plugins = event.get("plugins")
+    if isinstance(plugins, list):
+        names: list[str] = []
+        for plugin in plugins:
+            raw = plugin.get("name") if isinstance(plugin, dict) else plugin
+            if not isinstance(raw, str) or not raw.strip():
+                continue
+            names.append(raw.strip()[:128])
+            if len(names) == MAX_INIT_PLUGIN_NAMES:
+                break
+        summary["plugins"] = names
+    return summary
+
+
+def _tool_result_bytes(content: Any) -> int:
+    if content is None:
+        return 0
+    if isinstance(content, str):
+        return len(content.encode("utf-8", errors="replace"))
+    encoded = json.dumps(content, ensure_ascii=False)
+    return len(encoded.encode("utf-8", errors="replace"))
+
+
+def _attribute_tool_results(
+    event: dict[str, Any],
+    tool_names: dict[str, str],
+    stats: dict[str, dict[str, int]],
+) -> None:
+    if event.get("type") not in ("assistant", "user"):
+        return
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "tool_use":
+            tool_id = item.get("id")
+            name = item.get("name")
+            if isinstance(tool_id, str) and isinstance(name, str):
+                tool_names[tool_id] = name.strip()[:128]
+        elif item.get("type") == "tool_result":
+            tool_use_id = item.get("tool_use_id")
+            name = (
+                tool_names.get(tool_use_id, "unknown")
+                if isinstance(tool_use_id, str)
+                else "unknown"
+            )
+            if name in stats or name == "unknown" or len(stats) < MAX_TOOL_RESULT_NAMES:
+                bucket = name
+            else:
+                bucket = "other"
+            entry = stats.setdefault(bucket, {"calls": 0, "bytes": 0})
+            entry["calls"] += 1
+            entry["bytes"] += _tool_result_bytes(item.get("content"))
 
 
 def read_provider_usage(
@@ -220,6 +291,10 @@ def read_provider_usage(
     additive_cost_usd = 0.0
     additive_cost_seen = False
     snapshot_cost_usd: float | None = None
+    samples_deduped = 0
+    last_sample_key: tuple[int, ...] | None = None
+    tool_names: dict[str, str] = {}
+    tool_result_stats: dict[str, dict[str, int]] = {}
 
     def consume_usage(
         usage: dict[str, Any],
@@ -229,6 +304,7 @@ def read_provider_usage(
         event_index: int,
     ) -> None:
         nonlocal sample_count, snapshot_cost_usd, additive_cost_usd, additive_cost_seen
+        nonlocal samples_deduped, last_sample_key
         usage_id = id(usage)
         if usage_id in seen_usage:
             return
@@ -382,6 +458,18 @@ def read_provider_usage(
             additive_cost_usd += _as_float(source.get("cost"))
             additive_cost_seen = True
         sample_count += 1
+        sample_key = (
+            input_tokens,
+            output_tokens,
+            reasoning_output_tokens,
+            cached_input_tokens,
+            cache_creation_input_tokens,
+            cache_write_input_tokens,
+        )
+        if sample_key == last_sample_key:
+            samples_deduped += 1
+            return
+        last_sample_key = sample_key
         if include_samples and len(samples) < MAX_USAGE_SAMPLES:
             samples.append({
                 "sequence": sample_count,
@@ -461,6 +549,10 @@ def read_provider_usage(
 
     for event_index, candidate in enumerate(roots[:MAX_JSON_EVENTS]):
         if isinstance(candidate, dict):
+            init_summary = _claude_init_summary(candidate)
+            if init_summary:
+                result["init_summary"] = init_summary
+            _attribute_tool_results(candidate, tool_names, tool_result_stats)
             walk(
                 candidate,
                 root=candidate,
@@ -483,7 +575,9 @@ def read_provider_usage(
             result["cost_usd"] = float(result["cost_usd"]) + snapshot_cost_usd
     result["usage_sample_count"] = sample_count
     result["usage_samples"] = samples
-    result["usage_samples_truncated"] = sample_count > len(samples)
+    result["usage_samples_deduped"] = samples_deduped
+    result["usage_samples_truncated"] = sample_count - samples_deduped > len(samples)
+    result["tool_result_bytes_by_tool"] = tool_result_stats
     return result
 
 
