@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.12.80 — 2026-10-30
+
+### Changed
+
+- Bundled runtime 0.12.80: the worker project context carries AI Memory and KB rows whole and decoded (-14% on a measured bundle), and worker usage records attribute tool-result bytes per tool. The full list is in the repository CHANGELOG.
+
 ## 0.12.79 — 2026-10-30
 
 ### Fixed

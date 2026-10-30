@@ -24,11 +24,10 @@ MCP stdio runtime on the workspace host. It does not open a browser or require
 an AIWorkHub cloud account, and it binds no port and exposes no LAN service
 unless you start the opt-in WorkHub Mail listener on a host and port you name.
 
-## What's new in 0.12.79
+## What's new in 0.12.80
 
-- Manager Chat holds a conversation: a new chat no longer rotates in a spiral, a rotated session is never reopened, and a provider limit or auth failure parks the loop instead of retrying every 5 minutes.
-- The Manager Chat panel keeps polling across repository switches and errors, and Stop, Rename, an ordered send queue, draft and input history all work.
-- Rework turns are faster: worker Source Graph calls reuse the prepared overlay view instead of re-extracting every changed file (8-12 s per call before).
+- Cheaper worker context: AI Memory and KB rows reach the worker whole and decoded instead of as escaped JSON cut mid-row, and duplicate KB rows are dropped (a measured bundle shrank 14%).
+- Worker usage records show where input tokens go: result bytes per tool, one sample per distinct usage snapshot, and a session init summary.
 
 ## Review automation
 

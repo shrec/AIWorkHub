@@ -6,6 +6,17 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.80] - 2026-10-30
+
+### Changed
+
+- The worker project context fits AI Memory and KB rows whole, decoded from their nested JSON and with duplicate KB rows dropped, instead of cutting escaped JSON mid-row; a measured bundle went from 23,946 to 20,648 bytes (-14%).
+- Worker usage records keep one usage sample per distinct provider snapshot (repeats are counted in `usage_samples_deduped`; totals and cost are unchanged) and add `tool_result_bytes_by_tool` (calls and result bytes per tool, at most 64 named buckets plus `other` and `unknown`) and a Claude `init_summary`, so input-token cost can be traced to the tools that produce it.
+
+### Fixed
+
+- `tests/test_windows_report_defects.py` builds its repository fixture without git transport, so it passes in the AppContainer validation lane, which cannot spawn `git-upload-pack`/`git-receive-pack` for a local path (NF-2026-01876; the lane limitation itself stays open).
+
 ## [0.12.79] - 2026-10-30
 
 ### Changed
