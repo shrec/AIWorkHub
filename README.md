@@ -374,11 +374,11 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.78
+## What's new in 0.12.79
 
-- Fewer failed launches and retries: a capacity-refused launch waits in a reviewer-first queue instead of failing, base-drift rejects never count toward the reject cap, a capped card continues as a successor that keeps its sealed delta, and a window reload no longer kills running workers.
-- Sandboxed validation reaches any toolchain: a registered compiler or a pinned container build lane, opt-in `read_roots` for the worker sandbox, and `suite_vs_base` validations that pass when every failure also fails on the base.
-- Accept is harder to fool and easier to land: it runs neighbour and repository-invariant tests on the combined tree, a manager correction can land a validation-failed candidate whose corrected bytes pass, and recipes can run detached with `run_status` polling.
+- Manager Chat holds a conversation: a new chat no longer rotates in a spiral, a rotated session is never reopened, and a provider limit or auth failure parks the loop instead of retrying every 5 minutes.
+- The Manager Chat panel keeps polling across repository switches and errors, and Stop, Rename, an ordered send queue, draft and input history all work.
+- Rework turns are faster: worker Source Graph calls reuse the prepared overlay view instead of re-extracting every changed file (8-12 s per call before).
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Continuous Audit as a Service (CAAS)

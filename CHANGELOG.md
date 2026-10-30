@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.79] - 2026-10-30
+
+### Changed
+
+- A worker `source_graph_query` during a rework reuses the prepared overlay view while the overlay files are unchanged instead of re-extracting every changed file on each call (8.1-11.6 s per call measured); a write racing the build is never cached (NF-2026-01875).
+
+### Fixed
+
+- Manager Chat measures the context ceiling from each conversation's own baseline, so a fresh conversation no longer rotates in a spiral, and a rotated session is never reopened (NF-2026-01873).
+- The Manager Chat wake consumer parks on provider usage limits and auth failures instead of retrying every 5 minutes (NF-2026-01874).
+- Manager Chat panel: polling survives repository-binding changes and errors (backoff and a 15 s watchdog); Stop, Rename, an ordered send queue with Sending rows, a cursor reset on `session_not_found`, draft persistence, Up/Down input history and scroll-to-latest work; switching repository disposes the previous manager loop; the unused task board is removed.
+
 ## [0.12.78] - 2026-10-30
 
 ### Added

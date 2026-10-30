@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.12.79 — 2026-10-30
+
+### Fixed
+
+- Manager Chat panel: polling survives repository-binding changes and errors, Stop and Rename work, messages send in order with Sending rows, the cursor resets when a session disappears, and the draft, input history and scroll-to-latest are kept; switching repository stops the previous manager loop.
+- Bundled runtime 0.12.79: Manager Chat no longer rotates sessions in a spiral or reopens a rotated one (NF-2026-01873), parks on provider limits instead of retrying every 5 minutes (NF-2026-01874), and worker Source Graph calls during a rework reuse the prepared overlay view (NF-2026-01875). The full list is in the repository CHANGELOG.
+
 ## 0.12.78 — 2026-10-30
 
 ### Added
