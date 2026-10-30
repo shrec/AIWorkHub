@@ -144,6 +144,20 @@ def test_uncommitted_canonical_gitignore_edit_is_seeded_and_visible(
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
+def test_host_dirty_gitignore_is_never_candidate_delta(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    edited = _append_line((repo / ".gitignore").read_bytes(), b"dist/")
+    (repo / ".gitignore").write_bytes(edited)
+    workspace = _workspace(monkeypatch, tmp_path, repo, "req-nf01168-edit-delta")
+    try:
+        (workspace.path / "out" / "result.txt").write_bytes(b"result-v2\n")
+        assert worker_workspace.changed_paths(workspace) == ["out/result.txt"]
+        assert worker_workspace.enforce_scope(workspace) == ["out/result.txt"]
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
 def test_uncommitted_nested_gitignore_edit_is_seeded_and_visible(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
 ) -> None:
