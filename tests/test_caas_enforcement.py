@@ -134,7 +134,6 @@ BAD = "Continuous Automated Assurance System"
 
 def test_allowlist_entries_are_exact_reviewable_occurrences():
     assert [(site.path, site.line, site.column) for site in ALLOWED_CORRECTION_SITES] == [
-        ("README.md", 394, 41),
         ("docs/CAAS_PROTOCOL.md", 4, 42),
         ("docs/CAAS_PROTOCOL.md", 50, 39),
     ]
@@ -144,15 +143,16 @@ def test_allowlist_entries_are_exact_reviewable_occurrences():
 def test_allowlisted_path_reports_additional_occurrence(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
-    readme = repo / "README.md"
-    declared_line = "x" * 40 + BAD
-    readme.write_text(
-        "\n" * (ALLOWED_CORRECTION_SITES[0].line - 1) + declared_line + "\nAdditional misuse: " + BAD,
+    site = ALLOWED_CORRECTION_SITES[0]
+    doc = repo / site.path
+    doc.parent.mkdir(parents=True)
+    doc.write_text(
+        "\n" * (site.line - 1) + "x" * (site.column - 1) + BAD + "\nAdditional misuse: " + BAD,
         encoding="utf-8",
     )
     monkeypatch.setattr(caas_enforcement, "_REPO_ROOT", repo)
 
-    assert scan_paths_for_forbidden_expansion([readme]) == {str(readme): [BAD]}
+    assert scan_paths_for_forbidden_expansion([doc]) == {str(doc): [BAD]}
 
 
 def test_duplicate_declaration_fails_closed(tmp_path, monkeypatch):
@@ -173,7 +173,7 @@ def test_repo_correction_docs_are_not_reported_as_violations():
     readme = REPO_ROOT / "README.md"
     protocol = REPO_ROOT / "docs" / "CAAS_PROTOCOL.md"
 
-    assert readme.read_text(encoding="utf-8").count(BAD) == 1
+    assert readme.read_text(encoding="utf-8").count(BAD) == 0
     assert protocol.read_text(encoding="utf-8").count(BAD) == 2
 
     hits = scan_paths_for_forbidden_expansion([readme, protocol])

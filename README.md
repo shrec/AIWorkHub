@@ -391,10 +391,10 @@ lifecycle transition, so a repository cannot drift out of compliance silently;
 `aiworkhub.audit_system` runs read-only, narrow-scope review passes that emit
 structured findings into NeedFix with provenance.
 
-> **Naming correction.** The expansion "Continuous Automated Assurance System"
-> is wrong; the owner-canonical expansion is **Continuous Audit as a Service**.
-> That incorrect wording lives in the separate **UltrafastSecp256k1** README and
-> cannot be fixed from this repository — it must be corrected in that repository.
+> **Naming correction.** The owner-canonical expansion of CAAS is **Continuous Audit as a Service**.
+> The separate **UltrafastSecp256k1** README uses a different, incorrect expansion, recorded in
+> [docs/CAAS_PROTOCOL.md](docs/CAAS_PROTOCOL.md); that wording cannot be fixed from this repository
+> and must be corrected in the UltrafastSecp256k1 repository.
 
 ## Security
 

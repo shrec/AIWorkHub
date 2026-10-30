@@ -319,10 +319,6 @@ class CorrectionOccurrence:
 # nothing and therefore suppresses nothing.
 ALLOWED_CORRECTION_SITES: tuple[CorrectionOccurrence, ...] = (
     CorrectionOccurrence(
-        "README.md", 394, 41, "Continuous Automated Assurance System",
-        "The README quotes the upstream expansion while correcting it.",
-    ),
-    CorrectionOccurrence(
         "docs/CAAS_PROTOCOL.md", 4, 42, "Continuous Automated Assurance System",
         "The protocol declares this expansion wrong.",
     ),
