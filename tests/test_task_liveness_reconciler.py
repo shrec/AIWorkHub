@@ -1503,7 +1503,7 @@ def test_repo_bound_reconciler_service_is_idempotent_and_stoppable(tmp_path, mon
     monkeypatch.setattr(
         task_reconciler,
         "run_scan",
-        lambda manager=None, repo=None, include_gc=True: scans.append(str(repo)) or {"ok": True},
+        lambda manager=None, repo=None, include_gc=True, on_phase=None: scans.append(str(repo)) or {"ok": True},
     )
     service = task_reconciler.ensure_started(repo)
     again = task_reconciler.ensure_started(repo)
@@ -2176,7 +2176,7 @@ def _run_contending_cli_daemon(repo: str, entered, release_path: str) -> None:
     """Run the real CLI authority loop with an observable bounded scan."""
     from aiworkhub import task_reconciler as child_reconciler
 
-    def observable_scan(manager, *, repo, include_gc=True):  # noqa: ARG001
+    def observable_scan(manager, *, repo, include_gc=True, on_phase=None):  # noqa: ARG001
         entered.send(os.getpid())
         deadline = time.monotonic() + 10
         while not Path(release_path).exists() and time.monotonic() < deadline:

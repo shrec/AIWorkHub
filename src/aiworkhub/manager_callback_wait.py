@@ -210,12 +210,20 @@ def _claude_session_liveness_snapshot(
     try:
         record = task_reconciler.read_status(core.repo_root())
         stale, age = task_reconciler._staleness(record)
+        phase_epoch = record.get("scan_phase_started_epoch")
+        phase_known = (
+            bool(record.get("scan_in_progress"))
+            and isinstance(phase_epoch, (int, float))
+            and not isinstance(phase_epoch, bool)
+        )
         snapshot["reconciler"] = {
             "status_present": bool(record),
             "last_scan_age_s": round(age, 1) if age is not None else None,
             "stale": bool(stale),
             "scan_in_progress": bool(record.get("scan_in_progress")),
             "last_error": str(record.get("last_error") or ""),
+            "scan_phase": str(record.get("scan_phase") or ""),
+            "scan_phase_age_s": round(now_epoch - float(phase_epoch), 1) if phase_known else None,
         }
     except Exception as exc:  # noqa: BLE001 -- evidence must never break the wait
         snapshot["reconciler"] = {

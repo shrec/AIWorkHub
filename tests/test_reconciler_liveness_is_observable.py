@@ -160,7 +160,7 @@ def test_finalization_runs_every_pass_and_housekeeping_does_not(tmp_path: Path, 
     passes: list[bool] = []
     svc = _service(tmp_path, None)
 
-    def _scan(_mgr=None, *, repo=None, include_gc=True):
+    def _scan(_mgr=None, *, repo=None, include_gc=True, on_phase=None):
         passes.append(include_gc)
         if len(passes) >= tr.GC_SCAN_EVERY_N_PASSES + 1:
             svc._stop_event.set()
@@ -181,7 +181,7 @@ def test_the_durable_record_says_whether_a_pass_swept(tmp_path: Path, monkeypatc
     """'No workspaces cleaned' and 'no sweep ran' are different facts."""
     svc = _service(tmp_path, None)
 
-    def _scan(_mgr=None, *, repo=None, include_gc=True):
+    def _scan(_mgr=None, *, repo=None, include_gc=True, on_phase=None):
         svc._stop_event.set()
         return {"ok": True, "finalized": 1, "watched": 0,
                 "gc_included": include_gc, "gc_cleaned": 3}

@@ -39,7 +39,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -501,6 +501,7 @@ def run_scan(
     *,
     repo: Path | None = None,
     include_gc: bool = True,
+    on_phase: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Run one idempotent, bounded reconciliation scan.
 
@@ -523,46 +524,70 @@ def run_scan(
     a second copy of the same three lines.
     """
     mgr = manager or process_launcher.ProcessManager(repo=repo)
-    result = mgr.reconcile(include_gc=include_gc)
+    phase_ms: dict[str, int] = {}
+
+    @contextlib.contextmanager
+    def _phase(name: str) -> Iterator[None]:
+        if on_phase is not None:
+            try:
+                on_phase(name)
+            except Exception:  # noqa: BLE001 -- observability must never fail a scan
+                pass
+        began = time.monotonic()
+        try:
+            yield
+        finally:
+            phase_ms[name] = int((time.monotonic() - began) * 1000)
+
+    with _phase("reconcile"):
+        result = mgr.reconcile(include_gc=include_gc)
     callback_prune: dict[str, Any] = {"state": "skipped", "reason": "gc_not_included"}
     task_hygiene: dict[str, Any] = {"state": "skipped", "reason": "gc_not_included"}
     if include_gc:
-        try:
-            callback_prune = core._prune_stale_callbacks(Path(mgr.repo).resolve())
-        except Exception as exc:  # noqa: BLE001 -- a scan must never fail on hygiene
-            callback_prune = {"state": "skipped", "reason": f"{type(exc).__name__}"[:80]}
-        try:
-            # The durable owner of the archive sweep. Bootstrap offers to run
-            # it only on an explicit tool call, so a repository nobody
-            # bootstraps -- or one whose manager only ever touches the route
-            # gate -- would otherwise never be swept. The throttle is the same
-            # one bootstrap consults, so this cannot double-run it.
-            task_hygiene = core._schedule_task_hygiene(run_when_due=True)
-        except Exception as exc:  # noqa: BLE001 -- see above
-            task_hygiene = {"state": "skipped", "reason": f"{type(exc).__name__}"[:80]}
-    review_recovery = _scan_review_ready_recovery(mgr)
+        with _phase("callback_prune"):
+            try:
+                callback_prune = core._prune_stale_callbacks(Path(mgr.repo).resolve())
+            except Exception as exc:  # noqa: BLE001 -- a scan must never fail on hygiene
+                callback_prune = {"state": "skipped", "reason": f"{type(exc).__name__}"[:80]}
+        with _phase("task_hygiene"):
+            try:
+                # The durable owner of the archive sweep. Bootstrap offers to run
+                # it only on an explicit tool call, so a repository nobody
+                # bootstraps -- or one whose manager only ever touches the route
+                # gate -- would otherwise never be swept. The throttle is the same
+                # one bootstrap consults, so this cannot double-run it.
+                task_hygiene = core._schedule_task_hygiene(run_when_due=True)
+            except Exception as exc:  # noqa: BLE001 -- see above
+                task_hygiene = {"state": "skipped", "reason": f"{type(exc).__name__}"[:80]}
+    with _phase("review_recovery"):
+        review_recovery = _scan_review_ready_recovery(mgr)
     # Bounded to cards whose durable exact binding has no verdict yet; a pass
     # with nothing pending reads one index range and writes nothing.
-    wave_goal_bindings = _scan_wave_goal_bindings(Path(mgr.repo).resolve())
+    with _phase("wave_goal_bindings"):
+        wave_goal_bindings = _scan_wave_goal_bindings(Path(mgr.repo).resolve())
     # After binding repair, so completion is decided on current goal pointers.
-    wave_completion = _scan_wave_completion(Path(mgr.repo).resolve())
+    with _phase("wave_completion"):
+        wave_completion = _scan_wave_completion(Path(mgr.repo).resolve())
     # The one named exception to "never automatic retry/relaunch": a card
     # still inside its own finite transient_retry budget, relaunched through
     # mgr.launch, which performs the same claim_start_exact compare-and-update
     # internally before spawning the worker.
-    transient_retry_relaunch = _scan_transient_retry_relaunch(mgr)
+    with _phase("transient_retry_relaunch"):
+        transient_retry_relaunch = _scan_transient_retry_relaunch(mgr)
     # Releases only claims whose launch left no process record at all, after their grace.
-    orphan_claim_release = _scan_orphan_claims(mgr)
+    with _phase("orphan_claim_release"):
+        orphan_claim_release = _scan_orphan_claims(mgr)
     # Sequential by design, not fanned out across cores: the SDLC case store is
     # a single-writer SQLite file and the pass is bounded per scan, so parallel
     # writers would only contend for the same write lock.
-    try:
-        repo_root = Path(mgr.repo).resolve()
-        # The same repository identity the SDLC case store binds every case to.
-        repository_id = repository_state.inspect_repository(repo_root).manifest.repo_id
-        sdlc = sdlc_sync.sync_once(repo_root, repository_id)
-    except Exception as exc:  # noqa: BLE001 -- a scan must never fail on SDLC sync
-        sdlc = {"state": "skipped", "reason": f"{type(exc).__name__}"[:80]}
+    with _phase("sdlc_sync"):
+        try:
+            repo_root = Path(mgr.repo).resolve()
+            # The same repository identity the SDLC case store binds every case to.
+            repository_id = repository_state.inspect_repository(repo_root).manifest.repo_id
+            sdlc = sdlc_sync.sync_once(repo_root, repository_id)
+        except Exception as exc:  # noqa: BLE001 -- a scan must never fail on SDLC sync
+            sdlc = {"state": "skipped", "reason": f"{type(exc).__name__}"[:80]}
     return {
         "ok": True,
         "scanned_at": _utcnow(),
@@ -576,6 +601,7 @@ def run_scan(
         "transient_retry_relaunch": transient_retry_relaunch,
         "orphan_claim_release": orphan_claim_release,
         "sdlc_sync": sdlc,
+        "phase_durations_ms": phase_ms,
     }
 
 
@@ -1150,7 +1176,7 @@ class ReconcilerService:
                 "reduced_guarantees": list(granted.get("reduced_guarantees", [])),
                 "runtime_generation": runtime_generation.own_generation(self._runtime_path),
             }
-            write_status(self.repo, {
+            in_progress = {
                 "pid": owner["owner_pid"],
                 **owner,
                 "repo": str(self.repo),
@@ -1160,13 +1186,25 @@ class ReconcilerService:
                 "scan_started_epoch": started,
                 "scan_finished_epoch": None,
                 "scan_in_progress": True,
+                "scan_phase": "",
+                "scan_phase_started_epoch": None,
                 "scan_interval_seconds": self.scan_interval_seconds,
                 "gc_included": include_gc,
                 "last_error": "",
                 "last_completed_scan": previous.get("last_completed_scan", previous if previous.get("scan_finished_epoch") else {}),
-            })
+            }
+            write_status(self.repo, in_progress)
+
+            def _publish_phase(name: str, record: dict[str, Any] = in_progress) -> None:
+                write_status(self.repo, {
+                    **record, "scan_phase": name, "scan_phase_started_epoch": time.time(),
+                })
+
             try:
-                result = run_scan(self._manager, repo=self.repo, include_gc=include_gc)
+                result = run_scan(
+                    self._manager, repo=self.repo, include_gc=include_gc,
+                    on_phase=_publish_phase,
+                )
                 with self._state_lock:
                     self._last_scan = result
                     self._last_error = ""
@@ -1187,6 +1225,7 @@ class ReconcilerService:
                 "gc_included": include_gc,
                 "gc_cleaned": result.get("gc_cleaned", 0),
                 "scanned_at": result.get("scanned_at", ""),
+                "phase_durations_ms": result.get("phase_durations_ms", {}),
             }
             write_status(self.repo, {
                 "pid": owner["owner_pid"],
@@ -1197,6 +1236,7 @@ class ReconcilerService:
                 **authority_evidence,
                 "scan_started_epoch": started,
                 "scan_in_progress": False,
+                "scan_phase": "",
                 "scan_interval_seconds": self.scan_interval_seconds,
                 **completed,
                 "last_completed_scan": completed,
