@@ -10904,6 +10904,7 @@ def launch_collision_guard(
         if (normalized := _normalize_allowed_write_path(str(raw_path)))
     ]
     blockers: list[dict[str, Any]] = []
+    merge_risks: list[dict[str, Any]] = []
     for other_id, other in by_id.items():
         if other_id == task_id:
             continue
@@ -10930,13 +10931,19 @@ def launch_collision_guard(
             blockers.append(
                 {"task_id": other_id, "lifecycle": lifecycle, "paths": overlaps}
             )
+        elif lifecycle in ("processing", "review"):
+            merge_risks.append(
+                {"task_id": other_id, "lifecycle": lifecycle, "paths": overlaps}
+            )
 
+    merge_risks.sort(key=lambda risk: risk["task_id"])
     result = {
         "schema_id": "aiworkhub.task_launch_collision_report.v1",
         "repo": str(repo_root()),
         "task_id": task_id,
         "collision_free": not blockers,
         "blockers": blockers,
+        "merge_risks": merge_risks,
     }
     stdout = json.dumps(result, ensure_ascii=False, sort_keys=True) if print_json else ""
     return _canonical_result(

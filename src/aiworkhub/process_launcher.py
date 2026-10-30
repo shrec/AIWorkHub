@@ -5710,9 +5710,23 @@ class ProcessManager:
         # derived its route is auditable against one that asserted it.
         if identity_derivation is not None and isinstance(result, dict):
             result["launch_identity_derivation"] = identity_derivation
+        # NF-2026-01836: promotion merges disjoint hunks and overlapping hunks
+        # conflict, so an overlap is advice to the manager, not a gate.
+        if isinstance(result, dict) and (risks := self._launch_merge_risks(task_id)):
+            result["merge_risks"] = risks
         return result
 
     launch_task = launch
+
+    def _launch_merge_risks(self, task_id: str) -> list[Any]:
+        try:
+            guard = self._collision_guard(task_id=task_id, print_json=True)
+            risks = json.loads(guard["stdout"]).get("merge_risks")
+        except Exception:
+            return []
+        if guard.get("returncode") != 0 or not isinstance(risks, list):
+            return []
+        return risks
 
     def _launch_validation_only_replay(
         self,
