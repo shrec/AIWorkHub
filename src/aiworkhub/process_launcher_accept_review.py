@@ -106,6 +106,10 @@ ACCEPT_BLOCKER_KINDS = (
     # Its in-flight marker exists but cannot be read, so whether it still runs
     # is unknown -- and unknown is never "not running".
     "accept_in_flight_marker_unreadable",
+    # A changed src/aiworkhub module is over the descending line ratchet read
+    # from tests/test_module_size_ratchet.py, or could not be measured.
+    "module_size_ratchet_exceeded",
+    "module_size_ratchet_unreadable",
 )
 
 
@@ -117,6 +121,54 @@ def _blocker(kind: str, detail: str = "", **extra: Any) -> dict[str, Any]:
         "error": (f"{kind}:{detail}"[:400] if detail else str(kind)),
         **extra,
     }
+
+
+def module_size_ratchet_blockers(
+    repo: Any,
+    workspace_path: Any,
+    changed: Sequence[str],
+    corrected_texts: Mapping[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Refuse a candidate that grows a ``src/aiworkhub`` module past the ratchet.
+
+    Lines are counted as ``tests/test_module_size_ratchet.py`` counts them and
+    the ceiling is read from that test (never copied). A repository without the
+    test has no ceiling, so nothing is refused. A manager correction is judged
+    on its corrected bytes.
+    """
+    from .card_contract_advice import _ratchet_ceiling
+
+    paths = [
+        path
+        for path in dict.fromkeys(str(value) for value in changed)
+        if path.startswith("src/aiworkhub/")
+        and path.endswith(".py")
+        and posixpath.normpath(path) == path
+    ]
+    if not paths:
+        return []
+    ceiling, _reason = _ratchet_ceiling(Path(repo))
+    if ceiling is None:
+        return []
+    blockers: list[dict[str, Any]] = []
+    for path in paths:
+        if corrected_texts and path in corrected_texts:
+            text = corrected_texts[path]
+        else:
+            target = Path(workspace_path) / path
+            if not target.is_file():
+                continue
+            try:
+                text = target.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                blockers.append(_blocker("module_size_ratchet_unreadable", path))
+                continue
+        lines = len(text.splitlines())
+        if lines > ceiling:
+            blockers.append(
+                _blocker("module_size_ratchet_exceeded", f"{path}:{lines}>{ceiling}")
+            )
+    return blockers
 
 
 def _codex_route_is_live(core: Any, identity: Mapping[str, Any]) -> bool:
@@ -2296,10 +2348,20 @@ def accept_preview(self, request_id: str, task_id: str, **overrides: Any) -> dic
             else {}
         ),
     )
+    # accept_review refuses a missing or invalid workspace on its own, so a
+    # preview that cannot resolve one has no candidate bytes to measure.
+    preview_blockers = list(fold["blockers"])
+    try:
+        preview_workspace = _pl.WorkerWorkspace.from_metadata(evidence.get("workspace"))
+        preview_blockers.extend(
+            module_size_ratchet_blockers(self.repo, preview_workspace.path, changed)
+        )
+    except (KeyError, TypeError, ValueError, AttributeError):
+        pass
     return {
         **result,
         "evaluated": True,
-        "blocked": bool(fold["blockers"]),
+        "blocked": bool(preview_blockers),
         "canonical_status": _pl._canonical_task_status(card),
         "terminal_substatus": str(terminal_review.get("substatus") or ""),
         "changed_path_count": len(changed),
@@ -2317,6 +2379,7 @@ def accept_preview(self, request_id: str, task_id: str, **overrides: Any) -> dic
         },
         "pending_context_write_intents": intents,
         **fold,
+        "blockers": preview_blockers,
     }
 
 
@@ -3590,6 +3653,11 @@ def accept_review(
                 for blocker in accept_fold["blockers"]
                 if blocker["kind"] != "reviewer_could_not_inspect"
             ]
+            early_blockers.extend(
+                module_size_ratchet_blockers(
+                    self.repo, workspace.path, changed, corrected_texts
+                )
+            )
             if early_blockers:
                 return {
                     "ok": False,
