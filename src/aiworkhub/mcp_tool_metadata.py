@@ -370,6 +370,7 @@ MCP_TOOL_PROFILES: dict[str, Mapping[str, str]] = {
     "aiworkhub_manager_recipe_usage": _MANAGER,
     "aiworkhub_manager_recipe_show": _MANAGER,
     "aiworkhub_manager_recipe_run": _MANAGER,
+    "aiworkhub_manager_recipe_run_status": _MANAGER,
     "aiworkhub_manager_hub_mail_send": _MANAGER,
     "aiworkhub_manager_hub_mail_inbox": _MANAGER,
     "aiworkhub_manager_hub_mail_peers": _MANAGER,

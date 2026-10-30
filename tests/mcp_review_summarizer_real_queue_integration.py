@@ -62,7 +62,7 @@ def sha256(s: str) -> str:
 def run_taskctl_raw(args: list[str]) -> subprocess.CompletedProcess:
     """Run real taskctl.py and return raw CompletedProcess."""
     repo = os.environ.get("AIWORKHUB_REPO", "/home/shrek/AIWorkHub")
-    cmd = ["python3", os.path.join(repo, "AITools/taskctl.py")] + args
+    cmd = [sys.executable, os.path.join(repo, "AITools/taskctl.py")] + args
     return subprocess.run(
         cmd, cwd=repo, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,

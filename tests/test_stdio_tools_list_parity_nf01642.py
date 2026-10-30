@@ -28,7 +28,7 @@ _HINTED_PARAMS = {
         "read_first", "immutable_inputs", "read_only", "max_live_tokens", "work_kind",
         "validation_roles", "risk_tier", "difficulty", "skill_task_family", "skill_stage",
         "skill_triggers", "skill_applicability", "skill_path_scope", "custom_template_escape",
-        "apply_contract_patch", "echo_card", "wave_goal_binding",
+        "apply_contract_patch", "echo_card", "wave_goal_binding", "read_roots",
     ),
     "needfix_add": ("status", "kind", "severity"),
     "needfix_update": ("kind", "severity"),

@@ -1092,6 +1092,7 @@ def test_the_mcp_server_exposes_the_recipe_tools():
         "aiworkhub_manager_recipe_list",
         "aiworkhub_manager_recipe_show",
         "aiworkhub_manager_recipe_run",
+        "aiworkhub_manager_recipe_run_status",
     ):
         assert callable(getattr(server, name)), name
     assert server.manager_recipe_tools is mrt
@@ -1137,6 +1138,7 @@ def test_recipe_tools_delegate_to_the_driver(monkeypatch):
         "version": None,
         "params": {},
         "grant_capabilities": [],
+        "detach": False,
     }
 
 
@@ -1177,6 +1179,7 @@ def test_the_actor_cannot_be_supplied_through_the_mcp_surface():
 
     for name in (
         "aiworkhub_manager_recipe_run",
+        "aiworkhub_manager_recipe_run_status",
         "aiworkhub_manager_recipe_register",
         "aiworkhub_manager_recipe_seed_canonical",
         "aiworkhub_manager_recipe_usage",

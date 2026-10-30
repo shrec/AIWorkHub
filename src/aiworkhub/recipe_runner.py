@@ -46,6 +46,7 @@ import hashlib
 import json
 import os
 import shutil
+import re
 import subprocess
 import sys
 import time
@@ -54,6 +55,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
 
+from . import platform_io
 from . import tool_recipes as tr
 from . import tool_recipes_store as store
 
@@ -560,23 +562,374 @@ def run_registered_recipe(
     )
 
 
+DETACHED_SCHEMA_ID = "aiworkhub.recipe_runner.detached.v1"
+# Copy of process_launcher's reserved memory headroom; do not import process_launcher.
+DETACHED_MEMORY_HEADROOM_BYTES = 4 * 1024**3
+DETACHED_ADMISSION_POLL_SECONDS = 5.0
+DETACHED_ADMISSION_MAX_WAIT_SECONDS = 1800.0
+MAX_STATUS_WAIT_SECONDS = 300.0
+REASON_UNKNOWN_RUN = "unknown_run"
+REASON_MEMORY_PROBE_UNAVAILABLE = "memory_probe_unavailable"
+REASON_MEMORY_CAPACITY_INSUFFICIENT = "memory_capacity_insufficient"
+REASON_RECIPE_DIGEST_CHANGED = "recipe_digest_changed"
+
+DETACHED_STATE_QUEUED = "queued"
+DETACHED_STATE_WAITING_MEMORY = "waiting_memory"
+DETACHED_STATE_RUNNING = "running"
+DETACHED_STATE_COMPLETED = "completed"
+DETACHED_STATE_FAILED = "failed"
+DETACHED_STATE_REFUSED = "refused"
+DETACHED_STATE_LOST = "lost"
+DETACHED_TERMINAL_STATES = frozenset(
+    {
+        DETACHED_STATE_COMPLETED,
+        DETACHED_STATE_FAILED,
+        DETACHED_STATE_REFUSED,
+        DETACHED_STATE_LOST,
+    }
+)
+
+_RUN_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
+_HOST_RUN_LOCK_NAME = "host-run.lock"
+_ACTOR_FIELDS = ("provider", "session_id", "request_id", "task_id", "runner")
+_STATUS_READ_RETRIES = 5
+
+# Test seams: the admission loop and the status wait go through these.
+_sleep = time.sleep
+_clock = time.monotonic
+
+
+def _status_path(repo_root: str | Path, run_id: str) -> Path:
+    if not isinstance(run_id, str) or not _RUN_ID_PATTERN.fullmatch(run_id):
+        raise RecipeRunError(
+            REASON_UNKNOWN_RUN, "run_id must be 32 lowercase hexadecimal characters"
+        )
+    return _runs_dir(Path(repo_root)) / f"{run_id}.status.json"
+
+
+def _write_status(path: Path, record: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(record, ensure_ascii=False, indent=1, sort_keys=True),
+        encoding="utf-8",
+    )
+    for attempt in range(_STATUS_READ_RETRIES):
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError:
+            if attempt == _STATUS_READ_RETRIES - 1:
+                raise
+            _sleep(0.05)
+
+
+def _load_status(path: Path) -> dict[str, Any] | None:
+    """The parsed record, ``None`` for a torn read, FileNotFoundError if absent."""
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, UnicodeError, PermissionError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def start_detached_run(
+    repo_root: str | Path,
+    recipe: tr.Recipe,
+    params: Mapping[str, Any] | None = None,
+    *,
+    grant_capabilities: Iterable[str] = (),
+    actor: tr.ActorIdentity | None = None,
+) -> dict[str, Any]:
+    """Queue one recipe run as a detached host process and return at once."""
+    root = Path(repo_root)
+    if not root.is_dir():
+        raise RecipeRunError(
+            REASON_INVALID_REPOSITORY, f"repository root {root} is not a directory"
+        )
+    root = root.resolve()
+    if not isinstance(recipe, tr.Recipe):
+        raise tr.RecipeError(tr.REASON_BAD_MANIFEST, "start_detached_run requires a Recipe")
+    supplied = dict(params or {})
+    granted = tuple(grant_capabilities)
+    tr.validate_invocation(recipe, supplied, capabilities=granted)
+
+    run_id = uuid.uuid4().hex
+    status_path = _status_path(root, run_id)
+    child_log_path = status_path.with_name(f"{run_id}.child.log")
+    record: dict[str, Any] = {
+        "schema_id": DETACHED_SCHEMA_ID,
+        "run_id": run_id,
+        "state": DETACHED_STATE_QUEUED,
+        "repository": str(root),
+        "recipe_id": recipe.id,
+        "recipe_version": recipe.version,
+        "recipe_digest": recipe.digest,
+        "params": supplied,
+        "grant_capabilities": list(granted),
+        "queued_at": _utcnow_iso(),
+        "status_path": str(status_path),
+        "child_log_path": str(child_log_path),
+    }
+    if actor is not None:
+        record["actor"] = {
+            "kind": actor.kind,
+            **{
+                name: getattr(actor, name)
+                for name in _ACTOR_FIELDS
+                if getattr(actor, name) is not None
+            },
+        }
+    try:
+        _write_status(status_path, record)
+    except OSError as exc:
+        raise RecipeRunError(
+            REASON_OUTPUT_UNWRITABLE, f"cannot write detached run status: {exc}"
+        ) from exc
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+    # -P: cwd is the target repository; it must not shadow aiworkhub or stdlib.
+    argv = [
+        sys.executable, "-P", "-m", "aiworkhub.recipe_runner",
+        "--detached-run", str(status_path),
+    ]
+    try:
+        with open(child_log_path, "ab") as log_handle:
+            process = subprocess.Popen(  # noqa: S603 - fixed argv, shell=False
+                argv,
+                cwd=str(root),
+                env=env,
+                shell=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=log_handle,
+                close_fds=True,
+                **platform_io.background_process_launch_kwargs(),
+            )
+    except OSError as exc:
+        failed = {
+            **record,
+            "state": DETACHED_STATE_FAILED,
+            "error": f"{type(exc).__name__}: {exc}"[:240],
+            "reason": REASON_SPAWN_FAILED,
+            "finished_at": _utcnow_iso(),
+        }
+        try:
+            _write_status(status_path, failed)
+        except OSError:
+            pass
+        raise RecipeRunError(
+            REASON_SPAWN_FAILED, f"cannot spawn detached recipe run: {exc}"
+        ) from exc
+    return {
+        "schema_id": DETACHED_SCHEMA_ID,
+        "run_id": run_id,
+        "state": DETACHED_STATE_QUEUED,
+        "status_path": str(status_path),
+        "child_log_path": str(child_log_path),
+        "pid": process.pid,
+    }
+
+
+def _admit_memory(status_path: Path, record: dict[str, Any], max_memory_mb: int | float) -> bool:
+    """Wait until memory admits the run; False (record updated) when refused."""
+    required = int(max_memory_mb * 1024 * 1024) + DETACHED_MEMORY_HEADROOM_BYTES
+    began = _clock()
+    while True:
+        available = platform_io.available_memory_bytes()
+        if available is None:
+            record.update(
+                state=DETACHED_STATE_REFUSED,
+                reason=REASON_MEMORY_PROBE_UNAVAILABLE,
+                error="available memory could not be measured",
+                required_memory_bytes=required,
+            )
+            return False
+        if available >= required:
+            return True
+        record.update(
+            state=DETACHED_STATE_WAITING_MEMORY,
+            available_memory_bytes=available,
+            required_memory_bytes=required,
+        )
+        _write_status(status_path, record)
+        if _clock() - began >= DETACHED_ADMISSION_MAX_WAIT_SECONDS:
+            record.update(
+                state=DETACHED_STATE_REFUSED,
+                reason=REASON_MEMORY_CAPACITY_INSUFFICIENT,
+                error="available memory stayed below the recipe requirement",
+            )
+            return False
+        _sleep(DETACHED_ADMISSION_POLL_SECONDS)
+
+
+def _detached_main(argv: list[str]) -> int:
+    args = list(argv)
+    if args and args[0] == "--detached-run":
+        args = args[1:]
+    if len(args) != 1:
+        return 2
+    status_path = Path(args[0])
+    record = _load_status(status_path)
+    if record is None:
+        return 2
+    lock_handle: int | None = None
+    try:
+        record["pid"] = os.getpid()
+        _write_status(status_path, record)
+        root = Path(str(record["repository"]))
+        lock_handle = platform_io.open_lock_file(_runs_dir(root) / _HOST_RUN_LOCK_NAME)
+        while True:
+            try:
+                platform_io.lock_fd(lock_handle, blocking=True)
+                break
+            except platform_io.AdvisoryLockTimeout:
+                continue
+        recipe = store.load_registry(root).get(
+            str(record["recipe_id"]), str(record["recipe_version"])
+        )
+        if recipe.digest != record.get("recipe_digest"):
+            record.update(
+                state=DETACHED_STATE_FAILED,
+                reason=REASON_RECIPE_DIGEST_CHANGED,
+                error="the stored recipe changed after the run was queued",
+                finished_at=_utcnow_iso(),
+            )
+            _write_status(status_path, record)
+            return 0
+        max_memory_mb = recipe.resource_bounds.max_memory_mb
+        if max_memory_mb is not None and not _admit_memory(
+            status_path, record, max_memory_mb
+        ):
+            record["finished_at"] = _utcnow_iso()
+            _write_status(status_path, record)
+            return 0
+        record.update(state=DETACHED_STATE_RUNNING, started_at=_utcnow_iso())
+        _write_status(status_path, record)
+        actor_fields = record.get("actor")
+        actor = tr.ActorIdentity(**actor_fields) if actor_fields else None
+        digest = run_recipe(
+            root,
+            recipe,
+            record.get("params") or {},
+            grant_capabilities=tuple(record.get("grant_capabilities") or ()),
+            run_id=str(record["run_id"]),
+            actor=actor,
+        )
+        record.update(
+            state=DETACHED_STATE_COMPLETED, digest=digest, finished_at=_utcnow_iso()
+        )
+        _write_status(status_path, record)
+        return 0
+    except Exception as exc:  # noqa: BLE001 - any failure must reach the status record
+        record.update(
+            state=DETACHED_STATE_FAILED,
+            error=f"{type(exc).__name__}: {exc}"[:240],
+            finished_at=_utcnow_iso(),
+        )
+        if isinstance(exc, tr.RecipeErrorBase):
+            record["reason"] = exc.reason
+        try:
+            _write_status(status_path, record)
+        except OSError:
+            pass
+        return 1
+    finally:
+        if lock_handle is not None:
+            try:
+                platform_io.unlock_fd(lock_handle)
+            except OSError:
+                pass
+            try:
+                os.close(lock_handle)
+            except OSError:
+                pass
+
+
+def read_detached_status(
+    repo_root: str | Path, run_id: str, *, wait_seconds: float = 0.0
+) -> dict[str, Any]:
+    """The detached run's record, waiting up to ``wait_seconds`` for a terminal state."""
+    path = _status_path(repo_root, run_id)
+    try:
+        wait = float(wait_seconds)
+    except (TypeError, ValueError):
+        wait = 0.0
+    if wait != wait:
+        wait = 0.0
+    wait = max(0.0, min(wait, MAX_STATUS_WAIT_SECONDS))
+    deadline = _clock() + wait
+    torn = 0
+    while True:
+        try:
+            record = _load_status(path)
+        except FileNotFoundError as exc:
+            raise RecipeRunError(
+                REASON_UNKNOWN_RUN, f"no detached run {run_id}"
+            ) from exc
+        if record is None:
+            torn += 1
+            if torn >= _STATUS_READ_RETRIES and _clock() >= deadline:
+                return {
+                    "schema_id": DETACHED_SCHEMA_ID,
+                    "run_id": run_id,
+                    "state": "unreadable",
+                    "status_path": str(path),
+                }
+            _sleep(0.05)
+            continue
+        if record.get("state") in DETACHED_TERMINAL_STATES:
+            return record
+        pid = record.get("pid")
+        if (
+            isinstance(pid, int)
+            and not isinstance(pid, bool)
+            and not platform_io.process_is_alive(pid)
+        ):
+            latest = _load_status(path)
+            if latest is not None and latest.get("state") in DETACHED_TERMINAL_STATES:
+                return latest
+            return {**(latest or record), "state": DETACHED_STATE_LOST}
+        remaining = deadline - _clock()
+        if remaining <= 0:
+            return record
+        _sleep(min(1.0, remaining))
+
+
+if __name__ == "__main__":
+    raise SystemExit(_detached_main(sys.argv[1:]))
+
+
 __all__ = [
     "CANONICAL_MYPY_ENV",
     "CANONICAL_PYTHON_ENV",
     "CANONICAL_RUFF_ENV",
     "DEFAULT_TIMEOUT_SECONDS",
+    "DETACHED_ADMISSION_MAX_WAIT_SECONDS",
+    "DETACHED_ADMISSION_POLL_SECONDS",
+    "DETACHED_MEMORY_HEADROOM_BYTES",
+    "DETACHED_SCHEMA_ID",
+    "DETACHED_TERMINAL_STATES",
+    "MAX_STATUS_WAIT_SECONDS",
     "MAX_TAIL_CHARS",
     "MAX_TIMEOUT_SECONDS",
     "REASON_EXECUTABLE_UNAVAILABLE",
     "REASON_INVALID_REPOSITORY",
+    "REASON_MEMORY_CAPACITY_INSUFFICIENT",
+    "REASON_MEMORY_PROBE_UNAVAILABLE",
     "REASON_NONDETERMINISTIC_ARGV",
     "REASON_OUTPUT_UNWRITABLE",
+    "REASON_RECIPE_DIGEST_CHANGED",
     "REASON_SPAWN_FAILED",
+    "REASON_UNKNOWN_RUN",
     "RECIPE_RUNS_REL",
     "SCHEMA_ID",
     "RecipeRunError",
     "build_environment",
+    "read_detached_status",
     "resolve_executable",
     "run_recipe",
     "run_registered_recipe",
+    "start_detached_run",
 ]

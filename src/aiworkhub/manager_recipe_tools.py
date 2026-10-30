@@ -307,6 +307,7 @@ def run(
     version: str | None = None,
     params: Mapping[str, Any] | None = None,
     grant_capabilities: Any = (),
+    detach: bool = False,
 ) -> dict[str, Any]:
     """MANAGER EXECUTE: run one PERSISTED recipe and return a bounded digest.
 
@@ -365,13 +366,22 @@ def run(
         return gate
 
     try:
-        digest = recipe_runner.run_recipe(
-            root,
-            recipe,
-            params or {},
-            grant_capabilities=granted,
-            actor=_actor(manager),
-        )
+        if detach:
+            started = recipe_runner.start_detached_run(
+                root,
+                recipe,
+                params or {},
+                grant_capabilities=granted,
+                actor=_actor(manager),
+            )
+        else:
+            digest = recipe_runner.run_recipe(
+                root,
+                recipe,
+                params or {},
+                grant_capabilities=granted,
+                actor=_actor(manager),
+            )
     except tr.RecipeError as exc:
         return {
             "ok": False,
@@ -394,7 +404,29 @@ def run(
             "manager": manager,
             "surface": "manager_mcp",
         }
+    if detach:
+        return {"ok": True, **started, "manager": manager, "surface": "manager_mcp"}
     return {"ok": True, **digest, "manager": manager, "surface": "manager_mcp"}
+
+
+def run_status(*, run_id: str, wait_seconds: float = 0.0) -> dict[str, Any]:
+    """MANAGER READ: the record of one detached recipe run, optionally awaited."""
+    root, manager = _manager_context()
+    if root is None:
+        return manager
+    try:
+        record = recipe_runner.read_detached_status(
+            root, str(run_id or ""), wait_seconds=wait_seconds
+        )
+    except recipe_runner.RecipeRunError as exc:
+        return {
+            "ok": False,
+            "error": exc.message[:240],
+            "reason_code": exc.reason,
+            "manager": manager,
+            "surface": "manager_mcp",
+        }
+    return {"ok": True, **record, "manager": manager, "surface": "manager_mcp"}
 
 
 def list_registered(*, limit: int = DEFAULT_LIST_LIMIT, offset: int = 0) -> dict[str, Any]:

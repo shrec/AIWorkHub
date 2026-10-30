@@ -3054,6 +3054,7 @@ def aiworkhub_manager_recipe_run(
     version: str | None = None,
     params: dict[str, Any] | None = None,
     grant_capabilities: list[str] | None = None,
+    detach: bool = False,
 ) -> dict[str, Any]:
     """MANAGER EXECUTE: run one PERSISTED recipe and return a bounded digest.
 
@@ -3076,6 +3077,7 @@ def aiworkhub_manager_recipe_run(
         version: Recipe version to run, as listed by aiworkhub_manager_recipe_list; omit to run the highest stored version.
         params: Values for the recipe's typed argument slots, keyed by the slot names its manifest declares; omit when the recipe takes none.
         grant_capabilities: Capabilities granted to this run; it must name every capability the recipe declares. Omit for a read-only recipe; a write or network recipe also needs the repository write gate open.
+        detach: When true, queue the run as a detached host process and return its run_id at once; read the outcome with aiworkhub_manager_recipe_run_status. At most one detached run per repository executes at a time.
     """
 
     return manager_recipe_tools.run(
@@ -3083,7 +3085,28 @@ def aiworkhub_manager_recipe_run(
         version=version,
         params=params or {},
         grant_capabilities=grant_capabilities or [],
+        detach=detach,
     )
+
+
+@mcp.tool()
+def aiworkhub_manager_recipe_run_status(
+    run_id: str,
+    wait_seconds: float = 0,
+) -> dict[str, Any]:
+    """MANAGER READ: the state of one detached recipe run, optionally waiting for it to finish.
+
+    Returns the run's state (queued, waiting_memory, running, completed, failed,
+    refused or lost). A completed run carries the same bounded digest the
+    synchronous aiworkhub_manager_recipe_run returns, plus the child log path. A
+    run whose process died before finishing reads as lost.
+
+    Args:
+        run_id: The 32-character lowercase hex run_id returned by aiworkhub_manager_recipe_run with detach=true.
+        wait_seconds: Seconds to wait for a terminal state before returning the current one; clamped to 0-300.
+    """
+
+    return manager_recipe_tools.run_status(run_id=run_id, wait_seconds=wait_seconds)
 
 
 def _hub_mail_local(
