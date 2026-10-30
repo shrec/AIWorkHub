@@ -2314,6 +2314,23 @@ test("a submit renders a Sending row at once and its send reply removes it", () 
   assert.doesNotMatch(queueText(), /Sending/);
 });
 
+test("send queue height is bounded so a long pending send cannot cover the transcript", () => {
+  const queue = extractSlice(cssSource, "\n.manager-chat-send-queue {", "}", "send queue");
+  assert.match(queue, /max-height:\s*30vh;/);
+  assert.match(queue, /overflow-y:\s*auto;/);
+  assert.match(queue, /overscroll-behavior:\s*contain;/);
+
+  const row = extractSlice(cssSource, "\n.manager-chat-queued-send {", "}", "queued send row");
+  assert.match(row, /max-height:\s*6\.5em;/);
+  assert.match(row, /overflow:\s*hidden;/);
+
+  const frameBodies = [...cssSource.matchAll(/([^{}]*)\{([^{}]*)\}/g)]
+    .filter((m) => m[1].includes(".manager-chat-frame > .manager-chat-send-queue"))
+    .map((m) => m[2]);
+  assert.ok(frameBodies.length > 0, "send queue frame rule present");
+  for (const body of frameBodies) assert.doesNotMatch(body, /flex:\s*0 0 auto;/);
+});
+
 // ── Idle new-turn status pull ─────────────────────────────────────────────
 test("an idle events reply with a newer non-terminal turn posts exactly one managerLoopStatus", () => {
   const harness = loadWebviewSlice();

@@ -3020,9 +3020,13 @@ tbody tr.is-selected td:first-child {
 .manager-chat-frame > .manager-chat-session-line,
 .manager-chat-frame > .manager-chat-tasks,
 .manager-chat-frame > .manager-chat-notice,
-.manager-chat-frame > .manager-chat-send-queue,
 .manager-chat-frame > .manager-chat-composer {
   flex: 0 0 auto;
+}
+
+.manager-chat-frame > .manager-chat-send-queue {
+  flex: 0 1 auto;
+  min-height: 0;
 }
 
 .manager-chat-frame > .manager-chat-transcript {
@@ -3271,6 +3275,10 @@ tbody tr.is-selected td:first-child {
 }
 
 .manager-chat-send-queue {
+  max-height: 30vh;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  overscroll-behavior: contain;
   margin: 0;
   padding: 6px 10px 0;
   list-style: none;
@@ -3290,6 +3298,8 @@ tbody tr.is-selected td:first-child {
 }
 
 .manager-chat-queued-send {
+  max-height: 6.5em;
+  overflow: hidden;
   margin: 0 0 6px;
   padding: 6px 8px;
   border: 1px dashed var(--line);
