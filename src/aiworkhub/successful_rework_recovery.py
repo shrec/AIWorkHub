@@ -452,7 +452,19 @@ def successful_candidate_evidence(workspace, metadata, request_id, changed):
     from . import process_launcher
 
     predecessor_hashes = (metadata.get("rework_predecessor") or {}).get("changed_path_hashes") or {}
-    paths = sorted(set(changed) | {path for path in predecessor_hashes if isinstance(path, str) and path})
+    parent_baseline = getattr(workspace, "parent_baseline", None) or {}
+    changed_set = set(changed)
+    # A predecessor path the rework restored to canonical bytes is a no-op, not a delta.
+    inherited = {
+        path for path in predecessor_hashes
+        if isinstance(path, str) and path
+        and (
+            path in changed_set
+            or path not in parent_baseline
+            or worker_workspace._hash_path(workspace.path / path) != parent_baseline[path]
+        )
+    }
+    paths = sorted(changed_set | inherited)
     entries = capture_candidate_paths(workspace.path, paths)
     hashes = captured_path_hashes(entries)
     # Over-inline-cap files are sealed as sidecar blobs from the same capture.
