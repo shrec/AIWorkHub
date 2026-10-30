@@ -3704,6 +3704,19 @@ def _paths_overlap(left: str, right: str, *, glob_aware: bool) -> bool:
             right_dir and left.startswith(right)
         )
 
+    def _is_concrete(value: str) -> bool:
+        return not any(ch in value for ch in "*?[") and not value.endswith("/")
+
+    if _is_concrete(left) != _is_concrete(right):
+        concrete, other = (left, right) if _is_concrete(left) else (right, left)
+        if not other.endswith("/") and any(ch in other for ch in "*?["):
+            from . import worker_workspace
+
+            # A bare name may be a directory, so it still overlaps a glob beneath it.
+            return worker_workspace._matches(concrete, [other]) or other.startswith(
+                concrete + "/"
+            )
+
     if fnmatch.fnmatchcase(left, right) or fnmatch.fnmatchcase(right, left):
         return True
 
