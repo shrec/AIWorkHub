@@ -6370,16 +6370,70 @@ def struct(conn: sqlite3.Connection, name: str, *, limit: int = 24) -> list[dict
     return [dict(row) for row in rows]
 
 
+_BODY_ENTITY_KINDS_SQL = (
+    "('function','method','class','struct','union','enum','namespace')"
+)
+_BODY_QUALIFIED_CANDIDATE_CAP = 4096
+
+
+def _cpp_qualified_body_row(
+    conn: sqlite3.Connection, query: str,
+) -> sqlite3.Row | None:
+    """Resolve ``Scope::member`` to the one indexed row spelled exactly so.
+
+    The stored qualname is ``<file>::<spelling>`` where the spelling is the
+    class-qualified name (an in-class method carries only its class, an
+    out-of-line definition carries whatever was written). The enclosing
+    namespaces are recovered from the file's namespace rows, so
+    ``net::WorldSocket::SendPacket`` resolves both forms. The scope must match
+    on whole ``::`` components; there is no bare-name fallback.
+    """
+
+    spelled = re.sub(r"\s+", "", query)
+    parts = spelled.split("::")
+    if len(parts) < 2 or not all(parts):
+        return None
+    rows = conn.execute(
+        "SELECT file_path, kind, name, qualname, line_start, line_end, signature "
+        "FROM entities WHERE kind IN " + _BODY_ENTITY_KINDS_SQL + " "
+        "AND name = ? ORDER BY confidence DESC, file_path, line_start LIMIT ?",
+        (parts[-1], _BODY_QUALIFIED_CANDIDATE_CAP),
+    ).fetchall()
+    for row in rows:
+        file_path = str(row["file_path"])
+        qualname = re.sub(r"~\d+$", "", str(row["qualname"] or ""))
+        prefix = file_path + "::"
+        if not qualname.startswith(prefix):
+            continue
+        written = qualname[len(prefix):]
+        spellings = [written]
+        namespaces = conn.execute(
+            "SELECT name FROM entities WHERE kind = 'namespace' AND file_path = ? "
+            "AND line_start <= ? AND line_end >= ? ORDER BY line_start, line_end DESC",
+            (file_path, row["line_start"], row["line_end"]),
+        ).fetchall()
+        if namespaces:
+            spellings.append(
+                "::".join([str(item["name"]) for item in namespaces] + [written])
+            )
+        if any(
+            item == spelled or item.endswith("::" + spelled) for item in spellings
+        ):
+            return row
+    return None
+
+
 def body(conn: sqlite3.Connection, repo_root: Path, name: str) -> dict[str, Any] | None:
     row = conn.execute(
         "SELECT file_path, kind, name, qualname, line_start, line_end, signature "
-        "FROM entities WHERE kind IN "
-        "('function','method','class','struct','union','enum','namespace') "
+        "FROM entities WHERE kind IN " + _BODY_ENTITY_KINDS_SQL + " "
         "AND (name = ? OR qualname = ?) "
         "ORDER BY CASE WHEN qualname=? THEN 0 ELSE 1 END, "
         "confidence DESC, file_path, line_start LIMIT 1",
         (name, name, name),
     ).fetchone()
+    if row is None and "::" in name:
+        row = _cpp_qualified_body_row(conn, name)
     if row is None:
         return None
     result = dict(row)
