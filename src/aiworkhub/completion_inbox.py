@@ -897,6 +897,35 @@ def _packet_rows(value: Any) -> list[dict[str, Any]]:
     return [row for row in value[:_PACKET_MAX_ROWS] if isinstance(row, dict)]
 
 
+def _packet_failure_digest(value: Any) -> dict[str, Any] | None:
+    """Re-bound a stored ``pytest_failure_digest``; ``None`` when not one."""
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != validation_runner.PYTEST_FAILURE_DIGEST_SCHEMA
+    ):
+        return None
+    failures = []
+    for entry in value.get("failures") or []:
+        if not isinstance(entry, dict) or len(failures) >= 40:
+            continue
+        failures.append(
+            {
+                "kind": "error" if entry.get("kind") == "error" else "failed",
+                "test": _packet_text(entry.get("test"), 300),
+                "message": _packet_text(entry.get("message"), 300),
+            }
+        )
+    omitted = value.get("omitted")
+    omitted = omitted if isinstance(omitted, int) and not isinstance(omitted, bool) else 0
+    totals = value.get("totals")
+    return {
+        "schema": validation_runner.PYTEST_FAILURE_DIGEST_SCHEMA,
+        "failures": failures,
+        "totals": _packet_text(totals, 300) if isinstance(totals, str) else None,
+        "omitted": max(0, omitted),
+    }
+
+
 def _packet_validation_rows(evidence: dict[str, Any]) -> list[dict[str, Any]]:
     """Validation rows as declared/executed pairs with bounded tails."""
     rows = []
@@ -936,6 +965,9 @@ def _packet_validation_rows(evidence: dict[str, Any]) -> list[dict[str, Any]]:
             packet_row["pytest_first_failure"] = _packet_text(
                 first_failure, _PACKET_TAIL_CHARS
             )
+        failure_digest = _packet_failure_digest(row.get("pytest_failure_digest"))
+        if failure_digest is not None:
+            packet_row["pytest_failure_digest"] = failure_digest
         rows.append(packet_row)
     return rows
 

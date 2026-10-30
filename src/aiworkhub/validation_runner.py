@@ -1267,6 +1267,11 @@ _PYTEST_FIRST_FAILURE_MAX_CHARS = 4_000
 _PYTEST_FIRST_FAILURE_HEAD_CHARS = 1_000
 _PYTEST_FIRST_FAILURE_TAIL_CHARS = 3_000
 _PYTEST_FIRST_FAILURE_TRUNCATION_MARKER = "\n...[truncated]...\n"
+PYTEST_FAILURE_DIGEST_SCHEMA = "aiworkhub.pytest_failure_digest.v1"
+_PYTEST_DIGEST_MAX_FAILURES = 40
+_PYTEST_DIGEST_MESSAGE_MAX_CHARS = 300
+_PYTEST_SHORT_SUMMARY_HEADER_RE = re.compile(r"^=+\s*short test summary info\s*=+$")
+_PYTEST_SHORT_SUMMARY_ENTRY_RE = re.compile(r"^(FAILED|ERROR) (\S.*)$")
 
 
 def _parse_pytest_summary_line(line: str) -> dict[str, int] | None:
@@ -1365,23 +1370,120 @@ def _pytest_first_failure_block(stdout: str) -> str:
     return _bounded_pytest_first_failure("\n".join(lines[header_idx:end_idx]))
 
 
-def pytest_validation_evidence(stdout: str, returncode: int | None) -> dict[str, Any]:
-    """Pytest outcome counts and first-failure excerpt, parsed from ``stdout``.
+def _clip_digest_text(text: str) -> str:
+    text = text.strip()
+    if len(text) <= _PYTEST_DIGEST_MESSAGE_MAX_CHARS:
+        return text
+    return text[: _PYTEST_DIGEST_MESSAGE_MAX_CHARS - 3] + "..."
 
-    SURFACE ONLY (NF-2026-01155): never consulted by
-    ``classify_validation_results``/``row_restriction`` and never changes a
-    verdict -- it only makes a skip-heavy "clean" pass and a truncated
-    traceback visible in the evidence/review packet. ``{}`` when ``stdout``
-    holds no pytest final-summary line.
+
+def _pytest_short_summary_failures(lines: list[str]) -> list[dict[str, str]]:
+    """``FAILED``/``ERROR`` entries inside the ``short test summary info`` section."""
+    failures: list[dict[str, str]] = []
+    in_summary = False
+    for line in lines:
+        stripped = line.strip()
+        if not in_summary:
+            if _PYTEST_SHORT_SUMMARY_HEADER_RE.match(stripped):
+                in_summary = True
+            continue
+        if _PYTEST_ANY_SECTION_LINE_RE.match(stripped):
+            in_summary = False
+            continue
+        match = _PYTEST_SHORT_SUMMARY_ENTRY_RE.match(stripped)
+        if match is None:
+            continue
+        test, _, message = match.group(2).partition(" - ")
+        failures.append(
+            {
+                "kind": match.group(1).lower(),
+                "test": _clip_digest_text(test),
+                "message": _clip_digest_text(message),
+            }
+        )
+    return failures
+
+
+def _pytest_header_failures(lines: list[str]) -> list[dict[str, str]]:
+    """``____ name ____`` headers in FAILURES/ERRORS sections plus their first ``E`` line."""
+    failures: list[dict[str, str]] = []
+    kind = ""
+    current: dict[str, str] | None = None
+    for line in lines:
+        stripped = line.strip()
+        if _PYTEST_ANY_SECTION_LINE_RE.match(stripped):
+            current = None
+            section = _PYTEST_SECTION_HEADER_RE.match(stripped)
+            if section is None:
+                kind = ""
+            else:
+                kind = "error" if "ERRORS" in stripped else "failed"
+            continue
+        if not kind:
+            continue
+        if _PYTEST_TEST_HEADER_RE.match(stripped):
+            name = stripped.strip("_").strip()
+            current = {
+                "kind": "error" if kind == "error" or name.startswith("ERROR ") else "failed",
+                "test": _clip_digest_text(name),
+                "message": "",
+            }
+            failures.append(current)
+            continue
+        if current is not None and not current["message"] and line.startswith("E   "):
+            current["message"] = _clip_digest_text(line[4:])
+    return failures
+
+
+def _pytest_totals_line(lines: list[str]) -> str | None:
+    totals: str | None = None
+    for line in lines:
+        if _parse_pytest_summary_line(line) is not None:
+            totals = line.strip().strip("=").strip()
+    return _clip_digest_text(totals) if totals else None
+
+
+def _pytest_failure_digest(stdout: str) -> dict[str, Any] | None:
+    """Bounded list of WHICH tests failed, parsed from the FULL ``stdout``.
+
+    Primary source is the ``short test summary info`` section; without one the
+    ``____ name ____`` failure headers and their first ``E`` line are used.
+    ``None`` when no failing test was parsed.
     """
+    lines = stdout.splitlines()
+    failures = _pytest_short_summary_failures(lines) or _pytest_header_failures(lines)
+    totals = _pytest_totals_line(lines)
+    if not failures:
+        return None
+    return {
+        "schema": PYTEST_FAILURE_DIGEST_SCHEMA,
+        "failures": failures[:_PYTEST_DIGEST_MAX_FAILURES],
+        "totals": totals,
+        "omitted": max(0, len(failures) - _PYTEST_DIGEST_MAX_FAILURES),
+    }
+
+
+def pytest_validation_evidence(stdout: str, returncode: int | None) -> dict[str, Any]:
+    """Pytest outcome counts, first-failure excerpt and failure digest from ``stdout``.
+
+    SURFACE ONLY (NF-2026-01155, NF-2026-01848): never consulted by
+    ``classify_validation_results``/``row_restriction`` and never changes a
+    verdict -- it only makes a skip-heavy "clean" pass, a truncated traceback
+    and the names of failing tests visible in the evidence/review packet.
+    ``{}`` when ``stdout`` holds nothing parseable.
+    """
+    evidence: dict[str, Any] = {}
     outcomes = _pytest_outcomes_from_stdout(stdout)
-    if outcomes is None:
-        return {}
-    evidence: dict[str, Any] = {"pytest_outcomes": outcomes}
+    if outcomes is not None:
+        evidence["pytest_outcomes"] = outcomes
     if isinstance(returncode, int) and returncode != 0:
-        first_failure = _pytest_first_failure_block(stdout)
-        if first_failure:
-            evidence["pytest_first_failure"] = first_failure
+        if outcomes is not None:
+            first_failure = _pytest_first_failure_block(stdout)
+            if first_failure:
+                evidence["pytest_first_failure"] = first_failure
+        digest = _pytest_failure_digest(stdout)
+        if digest is not None:
+            evidence["pytest_failure_digest"] = digest
     return evidence
 
 
