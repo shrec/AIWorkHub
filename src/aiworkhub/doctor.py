@@ -4,8 +4,11 @@ import concurrent.futures
 import json
 import math
 import os
+import sys
 from collections.abc import Callable, Mapping
 from typing import Any
+
+from . import platform_io, runtime_generation
 
 SCHEMA_ID = "aiworkhub.doctor_diagnose.v1"
 STATE_OK = "ok"
@@ -111,3 +114,22 @@ def diagnose(
             entry["summary"] = ""
         reply["summaries_dropped"] = True
     return reply
+
+
+def _or_none(call: Callable[[], Any]) -> Any:
+    try:
+        return call()
+    except Exception:
+        return None
+
+
+def server_process() -> dict[str, Any]:
+    """Identify and size the process answering this call; never raises."""
+
+    return {
+        "pid": os.getpid(),
+        **platform_io.process_memory_bytes(),
+        "python_allocated_blocks": sys.getallocatedblocks(),
+        "runtime_generation": _or_none(runtime_generation.own_generation),
+        "superseded": _or_none(runtime_generation.superseded),
+    }

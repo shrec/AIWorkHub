@@ -6918,9 +6918,10 @@ def aiworkhub_doctor_diagnose() -> dict[str, Any]:
     """READ-ONLY: what is wrong right now. Runs the task, dispatcher,
     source-graph and manager-route health probes concurrently and returns one
     verdict (ok/problem/unavailable) with the non-ok probes and the tool to
-    call next."""
+    call next, plus server_process: this answering process's pid, memory and
+    runtime generation."""
 
-    return doctor.diagnose(
+    reply = doctor.diagnose(
         {
             "aiworkhub_task_health": aiworkhub_task_health,
             "aiworkhub_dispatcher_health": core.dispatcher_health,
@@ -6928,6 +6929,8 @@ def aiworkhub_doctor_diagnose() -> dict[str, Any]:
             "aiworkhub_manager_route_health": manager_lane.route_health,
         }
     )
+    reply["server_process"] = doctor.server_process()
+    return reply
 
 
 @mcp.tool()

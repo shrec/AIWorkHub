@@ -672,6 +672,73 @@ def available_memory_bytes(platform_name: str | None = None) -> int | None:
         return None
 
 
+def process_memory_bytes() -> dict[str, int | None]:
+    """RSS, peak RSS and private bytes of this process; all ``None`` on any failure."""
+
+    empty: dict[str, int | None] = {
+        "rss_bytes": None,
+        "peak_rss_bytes": None,
+        "private_bytes": None,
+    }
+    try:
+        if is_windows():
+
+            class _Counters(ctypes.Structure):
+                _fields_ = [
+                    ("cb", ctypes.c_ulong),
+                    ("PageFaultCount", ctypes.c_ulong),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                    ("PrivateUsage", ctypes.c_size_t),
+                ]
+
+            kernel32 = ctypes.windll.kernel32
+            get_process = kernel32.GetCurrentProcess
+            get_process.argtypes = ()
+            get_process.restype = ctypes.c_void_p
+            get_info = kernel32.K32GetProcessMemoryInfo
+            get_info.argtypes = (ctypes.c_void_p, ctypes.POINTER(_Counters), ctypes.c_ulong)
+            get_info.restype = ctypes.c_int
+            counters = _Counters()
+            counters.cb = ctypes.sizeof(counters)
+            if not get_info(get_process(), ctypes.byref(counters), counters.cb):
+                return empty
+            return {
+                "rss_bytes": int(counters.WorkingSetSize),
+                "peak_rss_bytes": int(counters.PeakWorkingSetSize),
+                "private_bytes": int(counters.PrivateUsage),
+            }
+        if is_linux():
+            found: dict[str, int] = {}
+            with open("/proc/self/status", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    key, _, rest = line.partition(":")
+                    if key in ("VmRSS", "VmHWM"):
+                        parts = rest.split()
+                        if len(parts) == 2 and parts[1] == "kB":
+                            found[key] = int(parts[0]) * 1024
+            if "VmRSS" not in found or "VmHWM" not in found:
+                return empty
+            return {
+                "rss_bytes": found["VmRSS"],
+                "peak_rss_bytes": found["VmHWM"],
+                "private_bytes": None,
+            }
+        import resource
+
+        peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        peak *= 1 if is_macos() else 1024
+        return {"rss_bytes": None, "peak_rss_bytes": peak, "private_bytes": None}
+    except Exception:
+        return empty
+
+
 def _windows_creation_flag() -> int:
     """Return the named Windows process-group flag through a typed boundary.
 
