@@ -274,6 +274,46 @@ def _sweep_candidate_overlays(overlay_root: Path, keep_request_id: str) -> int:
     return removed
 
 
+_CANDIDATE_OVERLAY_PARTIAL_LIMIT = 20
+
+
+def _overlay_partial_path(db_path: Path) -> Path:
+    return db_path.with_name(db_path.stem + ".partial.json")
+
+
+def _build_failed_reason(step: str, exc: BaseException) -> str:
+    """``candidate_overlay_build_failed:<step>:<path-or-dash>:<ExceptionClass>``."""
+
+    from . import source_graph_partition
+
+    path = "-"
+    if isinstance(exc, source_graph_partition.PartitionError):
+        # PartitionError messages are ``<code>`` or ``<code>:<relative path>``.
+        path = str(exc).partition(":")[2].strip()[:160] or "-"
+    return f"candidate_overlay_build_failed:{step}:{path}:{type(exc).__name__}"
+
+
+def _read_overlay_partial(db_path: Path) -> dict[str, Any] | None:
+    """The bounded failed-file record stored beside a built overlay, if any."""
+
+    path = _overlay_partial_path(db_path)
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        files = [
+            {str(k): str(v) for k, v in item.items()}
+            for item in raw
+            if isinstance(item, dict)
+        ]
+    except (OSError, ValueError, AttributeError, TypeError):
+        return {"failed_files": [], "error": "partial_record_unreadable"}
+    return {
+        "failed_files": files[:_CANDIDATE_OVERLAY_PARTIAL_LIMIT],
+        "failed_count": len(files),
+    }
+
+
 def _prune_superseded_overlays(cache_dir: Path, db_path: Path) -> None:
     """Drop older overlay partitions and the base pins only they referenced."""
 
@@ -285,8 +325,8 @@ def _prune_superseded_overlays(cache_dir: Path, db_path: Path) -> None:
         for entry in entries:
             if (
                 entry.name.startswith("overlay_")
-                and entry.name.endswith(".sqlite")
-                and entry.name != db_path.name
+                and entry.name.endswith((".sqlite", ".partial.json"))
+                and entry.name not in (db_path.name, _overlay_partial_path(db_path).name)
                 and not entry.is_symlink()
                 and entry.is_file(follow_symlinks=False)
             ):
@@ -347,6 +387,7 @@ def _candidate_overlay_binding(
         if probe.is_symlink():
             raise _CandidateOverlayError("candidate_overlay_cache_symlink")
     db_path = cache_dir / f"overlay_{snapshot_digest[:16]}.sqlite"
+    step = "prepare"
     try:
         with worker_tools._SOURCE_GRAPH_DB_OVERRIDE_LOCK:
             cache_dir.mkdir(parents=True, exist_ok=True)
@@ -363,19 +404,37 @@ def _candidate_overlay_binding(
                     root / _CANDIDATE_OVERLAY_DIR, candidate.request_id
                 )
                 temporary = cache_dir / f".{db_path.name}.{secrets.token_hex(8)}.tmp"
+                partial_path = _overlay_partial_path(db_path)
+                partial_tmp = temporary.with_name(temporary.name + ".partial")
                 try:
-                    source_graph_partition.build_partition(
+                    step = "build_partition"
+                    report = source_graph_partition.build_partition(
                         candidate.path,
                         changed_paths,
                         temporary,
                         base_db_path=canonical.db_path,
                     )
+                    step = "write_snapshot_digest"
                     worker_tools._write_rework_overlay_snapshot_digest(
                         temporary, snapshot_digest
                     )
+                    step = "publish"
+                    if report.failed_files:
+                        partial_tmp.write_text(
+                            json.dumps(
+                                list(report.failed_files),
+                                ensure_ascii=True,
+                                sort_keys=True,
+                            ),
+                            encoding="utf-8",
+                        )
+                        os.replace(partial_tmp, partial_path)
+                    else:
+                        partial_path.unlink(missing_ok=True)
                     os.replace(temporary, db_path)
                 finally:
                     temporary.unlink(missing_ok=True)
+                    partial_tmp.unlink(missing_ok=True)
                 _prune_superseded_overlays(cache_dir, db_path)
     except (
         source_graph_partition.PartitionError,
@@ -383,7 +442,7 @@ def _candidate_overlay_binding(
         OSError,
         sqlite3.Error,
     ) as exc:
-        raise _CandidateOverlayError("candidate_overlay_build_failed") from exc
+        raise _CandidateOverlayError(_build_failed_reason(step, exc)) from exc
     return worker_tools.AuthorityBinding(
         db_path=db_path,
         authority_source="candidate_overlay",
@@ -434,13 +493,19 @@ def source_graph_query(
                     "request_id": wanted,
                 }
             ctx = dataclasses.replace(ctx, source_graph_binding_override=binding)
-        return worker_tools.source_graph_query(
+            partial = _read_overlay_partial(binding.db_path)
+        else:
+            partial = None
+        reply = worker_tools.source_graph_query(
             ctx, mode=mode, query=query, budget=budget,
             target=target, cursor=cursor,
             continuation_cursor=continuation_cursor,
             bundle_type=bundle_type, workflow_stage=workflow_stage,
             compact_replay=compact_replay,
         )
+        if partial is not None and isinstance(reply, dict):
+            reply = {**reply, "candidate_overlay_partial": partial}
+        return reply
 
     return _invoke(call, target=target)
 

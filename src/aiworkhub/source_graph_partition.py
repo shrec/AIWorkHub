@@ -138,6 +138,7 @@ class PartitionBuildReport:
     wall_seconds: float
     base_pin: str = "none"
     pin_seconds: float = 0.0
+    failed_files: tuple[dict[str, str], ...] = ()
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -152,6 +153,7 @@ class PartitionBuildReport:
             "wall_seconds": self.wall_seconds,
             "base_pin": self.base_pin,
             "pin_seconds": self.pin_seconds,
+            "failed_files": [dict(item) for item in self.failed_files],
         }
 
 
@@ -249,9 +251,10 @@ def build_partition(
     it the partition stands alone. The generation identity is device + inode +
     size + mtime_ns, with no content hash: an in-place rewrite preserving all
     four is a documented, accepted blind spot, not a detected shift. Source
-    Graph contract failures (hash mismatch, unreadable file) propagate unchanged
-    as :class:`source_graph.SourceGraphError`; path-safety violations raise
-    :class:`PartitionError`.
+    Graph contract failures (hash mismatch, unreadable file, parser error) for
+    one file are recorded in ``failed_files`` and the build continues; the path
+    stays in scope so its stale base row remains hidden. Path-safety
+    violations raise :class:`PartitionError` and abort the whole build.
     """
 
     repo_root = Path(repo_root).resolve()
@@ -266,6 +269,7 @@ def build_partition(
     schema_conn.close()
 
     scope: list[str] = []
+    failed_files: list[dict[str, str]] = []
     files_indexed = files_deleted = files_skipped = 0
     entities = edges = 0
     with sg.database_path_override(partition_db_path):
@@ -292,7 +296,23 @@ def build_partition(
                 if not admitted_changed_path(repo_root, relative, policy):
                     files_skipped += 1
                     continue
-                result = sg.index_file(repo_root, relative, expected_hash)
+                try:
+                    result = sg.index_file(repo_root, relative, expected_hash)
+                except sqlite3.Error:
+                    raise
+                except Exception as exc:
+                    # The path stays in ``scope`` so the stale base row is
+                    # still hidden; only this file's partition row is lost.
+                    failed_files.append({
+                        "path": relative,
+                        "step": "index_file",
+                        "reason": f"{type(exc).__name__}: {exc}"[:160],
+                    })
+                    try:
+                        sg.remove_file(repo_root, relative)
+                    except Exception:
+                        pass
+                    continue
                 files_indexed += 1
                 entities += int(result.get("entities") or 0)
                 edges += int(result.get("edges") or 0)
@@ -329,6 +349,7 @@ def build_partition(
         wall_seconds=max(0.0, time.monotonic() - started),
         base_pin=base_pin,
         pin_seconds=pin_seconds,
+        failed_files=tuple(failed_files),
     )
 
 
