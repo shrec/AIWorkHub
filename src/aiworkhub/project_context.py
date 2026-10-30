@@ -394,7 +394,18 @@ def _section(
     cap_bytes = _tool_cap(name, "bytes", MAX_TOOL_OUTPUT_BYTES)
     cap_rows = _tool_cap(name, "rows", MAX_SECTION_ROWS)
     if len(content.encode("utf-8")) > cap_bytes:
-        content, cap_truncated = _bounded_text(content, cap_bytes)
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("results"), list):
+            content, cap_truncated, kept_rows = _worker_tools.fit_result_rows(
+                parsed, cap_bytes, separators=(",", ":"),
+            )
+            if hit_count is not None and kept_rows is not None:
+                hit_count = min(hit_count, kept_rows)
+        else:
+            content, cap_truncated = _bounded_text(content, cap_bytes)
         truncated = truncated or cap_truncated
     if hit_count is None:
         hit_count = _content_hit_count(name, content) if executed and not degraded else 0
@@ -1149,6 +1160,64 @@ def _canonical_tool_result(result: dict[str, Any], tool: str) -> tuple[str, bool
     return str(result["content"]), bool(result.get("truncated")), int(result.get("hit_count") or 0)
 
 
+# Column that holds a nested learning-commit JSON document, per context store.
+_ROW_JSON_FIELDS = {"ai_memory": "value", "kb": "body"}
+
+
+def _result_rows(parsed: Any) -> list[dict[str, Any]]:
+    rows = parsed.get("results") if isinstance(parsed, dict) else None
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+def _decoded_json_field(row: dict[str, Any], field: str) -> dict[str, Any] | list[Any] | None:
+    raw = row.get(field)
+    if not isinstance(raw, str):
+        return None
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return decoded if isinstance(decoded, (dict, list)) else None
+
+
+def _row_commit_id(row: dict[str, Any], field: str) -> str:
+    decoded = _decoded_json_field(row, field)
+    commit_id = decoded.get("commit_id") if isinstance(decoded, dict) else None
+    return commit_id if isinstance(commit_id, str) else ""
+
+
+def _commit_ids(content: str, field: str) -> set[str]:
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return set()
+    return {cid for row in _result_rows(parsed) if (cid := _row_commit_id(row, field))}
+
+
+def _drop_duplicate_kb_rows(kb_text: str, memory_commit_ids: set[str]) -> str:
+    """Omit KB rows whose learning commit AI Memory already delivered."""
+
+    if not memory_commit_ids:
+        return kb_text
+    try:
+        parsed = json.loads(kb_text)
+    except json.JSONDecodeError:
+        return kb_text
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
+        return kb_text
+    rows = parsed["results"]
+    kept = [
+        row for row in rows
+        if not (isinstance(row, dict) and _row_commit_id(row, "body") in memory_commit_ids)
+    ]
+    if len(kept) == len(rows):
+        return kb_text
+    payload = {**parsed, "results": kept, "duplicates_omitted": len(rows) - len(kept)}
+    if "count" in parsed:
+        payload["count"] = len(kept)
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 def _prompt_evidence_value(section: dict[str, Any]) -> Any:
     """Return model-visible evidence without nested JSON string escaping.
 
@@ -1166,6 +1235,12 @@ def _prompt_evidence_value(section: dict[str, Any]) -> Any:
         parsed = None
     if isinstance(parsed, (dict, list)):
         value = parsed
+        field = _ROW_JSON_FIELDS.get(str(section.get("name")))
+        if field is not None:
+            for row in _result_rows(parsed):
+                decoded = _decoded_json_field(row, field)
+                if decoded is not None:
+                    row[field] = decoded
 
     annotations: dict[str, Any] = {}
     if section.get("truncated"):
@@ -1696,6 +1771,7 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
         hit_count=session_hit_count,
     ))
 
+    memory_commit_ids: set[str] = set()
     if contract.get("ai_memory") is not None:
         try:
             memory_result = _worker_tools.ai_memory_search(
@@ -1707,14 +1783,16 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
             memory_hit_count = 0
         else:
             degraded = ""
-        sections.append(_section(
+        memory_section = _section(
             name="ai_memory",
             query=contract["ai_memory"]["query"],
             content=memory_text,
             truncated=memory_truncated,
             degraded=degraded,
             hit_count=memory_hit_count,
-        ))
+        )
+        sections.append(memory_section)
+        memory_commit_ids = _commit_ids(memory_section["content"], "value")
 
     if contract.get("kb") is not None:
         try:
@@ -1725,6 +1803,10 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
             kb_hit_count = 0
         else:
             degraded = ""
+            deduped = _drop_duplicate_kb_rows(kb_text, memory_commit_ids)
+            if deduped != kb_text:
+                kb_hit_count -= json.loads(deduped)["duplicates_omitted"]
+                kb_text = deduped
         sections.append(_section(
             name="kb",
             query=contract["kb"]["query"],

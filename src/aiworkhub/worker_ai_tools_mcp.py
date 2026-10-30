@@ -657,6 +657,37 @@ def _bounded_text(text: str, max_bytes: int) -> tuple[str, bool]:
     return encoded[:max_bytes].decode("utf-8", errors="ignore"), True
 
 
+def fit_result_rows(
+    payload: dict[str, Any], max_bytes: int, *, separators: tuple[str, str] | None = None,
+) -> tuple[str, bool, int | None]:
+    """Serialize ``payload`` within ``max_bytes`` by dropping trailing ``results`` rows.
+
+    Returns ``(text, truncated, kept_rows)``; ``kept_rows`` is ``None`` when
+    the payload has no ``results`` list. Rows are never cut: the byte cut
+    applies only when a single remaining row alone exceeds the cap.
+    """
+
+    def dump(value: dict[str, Any]) -> str:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=separators)
+
+    text = dump(payload)
+    rows = payload.get("results")
+    if not isinstance(rows, list):
+        return (*_bounded_text(text, max_bytes), None)
+    if len(text.encode("utf-8")) <= max_bytes:
+        return text, False, len(rows)
+    prior = payload.get("results_omitted")
+    prior = prior if isinstance(prior, int) and not isinstance(prior, bool) else 0
+    for keep in range(len(rows) - 1, 0, -1):
+        candidate = {**payload, "results": rows[:keep], "results_omitted": prior + len(rows) - keep}
+        if "count" in payload:
+            candidate["count"] = keep
+        text = dump(candidate)
+        if len(text.encode("utf-8")) <= max_bytes:
+            return text, True, keep
+    return (*_bounded_text(text, max_bytes), min(len(rows), 1))
+
+
 # Structural containers counted for payloads that carry no ``matches`` list.
 # Projections of the primary rows (``related_tests``, ``todos``, the old
 # ``hot_symbols``/``risks``) are deliberately absent: they are not hits.
@@ -6966,8 +6997,8 @@ def ai_memory_search(ctx: WorkerToolContext, *, query: str, limit: int = 8) -> d
         "match_semantics": "any_token_ranked_by_coverage",
         **stats,
     }
-    text, truncated = _bounded_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), 8 * 1024)
-    hit_count = len(rows)
+    text, truncated, kept_rows = fit_result_rows(payload, 8 * 1024)
+    hit_count = len(rows) if kept_rows is None else kept_rows
     bytes_returned = len(text.encode("utf-8"))
     _append_audit(
         ctx, tool=tool, ok=True, cache_hit=False, hit_count=hit_count, bytes_returned=bytes_returned,
@@ -7089,8 +7120,8 @@ def _kb_invoke(ctx: WorkerToolContext, *, subcommand: str, argument: str, tool_l
     finally:
         con.close()
 
-    text, truncated = _bounded_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), 8 * 1024)
-    hit_count = int(payload.get("count") or 0)
+    text, truncated, kept_rows = fit_result_rows(payload, 8 * 1024)
+    hit_count = int(payload.get("count") or 0) if kept_rows is None else kept_rows
     bytes_returned = len(text.encode("utf-8"))
     _append_audit(
         ctx, tool=tool_label, ok=True, cache_hit=False, hit_count=hit_count, bytes_returned=bytes_returned,
