@@ -287,10 +287,11 @@ def _exact_module_invocation(row: Mapping[str, Any], module: str) -> bool:
     executable = Path(argv[0]).name.lower()
     if executable in {module, f"{module}.exe"}:
         return True
+    # worker_workspace executes every ``python -m X`` validation as ``python -P -m X``.
+    rest = argv[2:] if argv[1:2] == ("-P",) else argv[1:]
     return bool(
-        len(argv) >= 3
-        and re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", executable)
-        and argv[1:3] == ("-m", module)
+        re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", executable)
+        and rest[:2] == ("-m", module)
     )
 
 

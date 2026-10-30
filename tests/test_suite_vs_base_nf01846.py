@@ -199,3 +199,19 @@ def test_mypy_branch_evidence_keys_unchanged(tmp_path):
     comparison = rows[0]["baseline_comparison"]
     assert "kind" not in comparison
     assert comparison["outcome"] == "baseline_no_new_diagnostics"
+
+
+def test_launcher_rewritten_dash_p_argv_is_eligible(tmp_path):
+    # worker_workspace runs ``python -m pytest`` as ``<interpreter> -P -m pytest``.
+    argv = [".venv/bin/python", "-P", "-m", "pytest", "-q", "tests"]
+    rows = _compare(
+        tmp_path,
+        _row(["tests/a.py::test_a"], argv=argv),
+        _row(["tests/a.py::test_a"], argv=argv),
+    )
+    assert rows[0]["baseline_comparison"]["outcome"] == "baseline_no_new_failures"
+    assert plv.exact_schema_mypy_invocation(
+        {"executed_argv": ["python.exe", "-P", "-m", "mypy", "src"]}
+    )
+    assert not plv.exact_pytest_invocation({"executed_argv": ["python", "-P", "check.py"]})
+    assert not plv.exact_pytest_invocation({"executed_argv": ["python", "-P"]})
