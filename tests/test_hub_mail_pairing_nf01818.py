@@ -437,6 +437,7 @@ def test_a_busy_port_falls_back_to_a_free_one_and_status_reports_it(world):
         busy.close()
 
 
+@pytest.mark.real_hub_mail_listener
 def test_a_fresh_install_opens_no_port_until_first_use(world, monkeypatch):
     home = world.machine("a", "Alpha")
     spawned: list[dict] = []
@@ -451,6 +452,7 @@ def test_a_fresh_install_opens_no_port_until_first_use(world, monkeypatch):
                         "tls_cert": None, "tls_key": None}]
 
 
+@pytest.mark.real_hub_mail_listener
 def test_the_default_port_is_overridable_by_env_and_config(world, monkeypatch):
     home = world.machine("a", "Alpha")
     spawned: list[dict] = []

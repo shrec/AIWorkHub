@@ -1365,6 +1365,7 @@ def stop_listener(home: Path | None = None, *, wait_seconds: float = LISTENER_ST
             pidfile_path(home).unlink(missing_ok=True)
         return {**listener_status(home), "stopped": False}
     pid = status["pid"]
+    ticks0 = (_read_json(pidfile_path(home)) or {}).get("start_ticks")
     stop_file = stop_request_path(home)
     hub_mail._write_over(stop_file, b"stop")
     deadline = time.monotonic() + wait_seconds
@@ -1386,7 +1387,14 @@ def stop_listener(home: Path | None = None, *, wait_seconds: float = LISTENER_ST
                 pidfile_path(home).unlink(missing_ok=True)
     finally:
         stop_file.unlink(missing_ok=True)
+    exit_deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < exit_deadline and _pid_alive(pid) and (
+        ticks0 is None or runtime_temp.process_start_ticks(pid) == ticks0
+    ):
+        time.sleep(0.1)
     final = listener_status(home)
+    if _pid_alive(pid) and (ticks0 is None or runtime_temp.process_start_ticks(pid) == ticks0):
+        return {**final, "ok": False, "error": "listener_stop_failed", "stopped": False}
     if final["running"]:
         return {**final, "ok": False, "error": "listener_stop_failed", "stopped": False}
     return {**final, "stopped": True}

@@ -478,6 +478,11 @@ def pytest_configure(config: pytest.Config) -> None:
         f"{LIVE_MANAGER_CHAT_SEAT_MARKER}: exercise the real "
         "core._active_manager_chat_record instead of the hermetic no-seat stub",
     )
+    config.addinivalue_line(
+        "markers",
+        "real_hub_mail_listener: exercise the real hub_mail_net.ensure_listener "
+        "(binds 127.0.0.1 and must stop its listener) instead of the no-spawn stub",
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -487,6 +492,56 @@ def hermetic_manager_chat_seat(request: pytest.FixtureRequest, monkeypatch):
     from aiworkhub import core
 
     monkeypatch.setattr(core, "_active_manager_chat_record", lambda: None)
+
+
+# NF-2026-01890: the first Hub Mail use in a fresh tmp home writes enabled=true and
+# ``hub_mail_net.ensure_listener`` then Popen-spawned a detached listener on
+# 0.0.0.0:47731 that nothing stopped, leaving orphans after the run. Stub
+# ``ensure_listener`` to "nothing started" unless the test opts in with
+# ``@pytest.mark.real_hub_mail_listener`` (which must bind 127.0.0.1 and stop it).
+REAL_HUB_MAIL_LISTENER_MARKER = "real_hub_mail_listener"
+
+
+@pytest.fixture(autouse=True)
+def hermetic_hub_mail_listener(request: pytest.FixtureRequest, monkeypatch):
+    if request.node.get_closest_marker(REAL_HUB_MAIL_LISTENER_MARKER) is not None:
+        return
+    from aiworkhub import hub_mail_net
+
+    monkeypatch.setattr(hub_mail_net, "ensure_listener", lambda home=None: None)
+
+
+def stop_leftover_hub_mail_listeners(basetemp: Path) -> None:
+    """Stop listeners whose pidfile lies under ``basetemp`` and reap spawned children.
+
+    Only homes beneath ``basetemp`` are touched; a pidfile elsewhere is never read.
+    """
+
+    from aiworkhub import hub_mail_net
+
+    for pidfile in basetemp.rglob(".aiworkhub/mail/.listener.json"):
+        home = pidfile.parent.parent.parent
+        if not is_beneath(home, basetemp):
+            continue
+        try:
+            hub_mail_net.stop_listener(home, wait_seconds=3.0)
+        except Exception:  # noqa: BLE001 - best-effort teardown, one bad home must not hide the rest
+            pass
+    for process in list(hub_mail_net._SPAWNED):
+        if process.poll() is not None:
+            continue
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def hub_mail_listener_session_finalizer(tmp_path_factory: pytest.TempPathFactory):
+    yield
+    stop_leftover_hub_mail_listeners(tmp_path_factory.getbasetemp())
 
 
 # NF-2026-01823: a print inside ``capsys.disabled()`` in an xdist worker never
