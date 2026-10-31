@@ -5237,6 +5237,8 @@ def create_workspace(
                     )
                 restat_candidates.append(relative)
             _restat_seeds_equal_to_index_blobs(path, restat_candidates)
+            from .worker_workspace_ignore_seed import hide_live_gitignore_seeds
+            hide_live_gitignore_seeds(path, restat_candidates, _run)
         # Re-run the same exact-input checks against the sparse worktree after
         # materialization.  This closes races in the canonical copy window and
         # preserves field/index/path evidence if an input was not actually
