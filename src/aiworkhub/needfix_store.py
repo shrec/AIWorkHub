@@ -3299,6 +3299,9 @@ def _card_input_refusal_reason(
             for value in (card.get("allowed_writes") or [])
         )
         worker_workspace._exact_required_card_inputs(repo, card, allowed)
+        for command in card.get("validation") or []:
+            if isinstance(command, str):
+                worker_workspace._parse_validation_command_detailed(command)
     except worker_workspace.WorkspaceError as exc:
         return str(exc)
     return None
