@@ -931,17 +931,22 @@ def resolve_callback_transition(raw_state: str | None) -> str:
 # covers the whole current terminal backlog for that thread instead of one
 # turn per task.
 
+def _expired_batch_ids(conn: sqlite3.Connection, now_iso: str) -> list[str]:
+    return [
+        row["batch_id"]
+        for row in conn.execute(
+            "SELECT batch_id FROM callback_batches "
+            "WHERE state='inflight' AND lease_expires_at != '' AND lease_expires_at < ?",
+            (now_iso,),
+        ).fetchall()
+    ]
+
+
 def _reclaim_expired_batches(conn: sqlite3.Connection, now_iso: str) -> None:
     """Revert any inflight batch (and its still-inflight member rows) whose
     lease expired back to pending -- a crashed bridge's claim is recoverable
     with the SAME durable batch identity/membership."""
-    expired = conn.execute(
-        "SELECT batch_id FROM callback_batches "
-        "WHERE state='inflight' AND lease_expires_at != '' AND lease_expires_at < ?",
-        (now_iso,),
-    ).fetchall()
-    for row in expired:
-        batch_id = row["batch_id"]
+    for batch_id in _expired_batch_ids(conn, now_iso):
         conn.execute(
             "UPDATE callback_batches SET state='pending', lease_id='', lease_expires_at='', "
             "not_before_at='' WHERE batch_id=?",
@@ -1193,6 +1198,127 @@ def acknowledge_then_claim(
     return ack, batch
 
 
+def _pick_claim_target(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    origin_thread_id: str,
+    now_iso: str,
+    max_members: int,
+    expired_batch_ids: frozenset[str] = frozenset(),
+) -> tuple[str, str, list[Any]] | None:
+    """Read-only selection shared by the claim and ``peek_claimable_callback``.
+
+    Returns ``(batch_id, thread_id, outbox_ids)``: a due pending batch is
+    ``(batch_id, thread_id, [])``; otherwise ``("", thread_id, ids)`` names the
+    unassigned outbox rows a new batch would coalesce.  ``expired_batch_ids``
+    are inflight batches whose lease expired and that the caller has not
+    reverted yet (peek) -- they are treated as pending and not-inflight."""
+    provider_where = " AND provider=?" if provider else ""
+    thread_where = " AND origin_thread_id=?" if origin_thread_id else ""
+    scope_params = tuple(p for p in (provider, origin_thread_id) if p)
+    inflight_threads: set[str] = set()
+    pending_batches = []
+    for row in conn.execute(
+        "SELECT * FROM callback_batches WHERE state IN ('pending', 'inflight')" + provider_where + thread_where +
+        " ORDER BY created_at ASC, batch_id ASC",
+        scope_params,
+    ).fetchall():
+        if row["state"] == "inflight" and row["batch_id"] not in expired_batch_ids:
+            inflight_threads.add(row["origin_thread_id"])
+        else:
+            pending_batches.append(row)
+    for row in pending_batches:
+        if row["origin_thread_id"] in inflight_threads:
+            continue
+        not_before = "" if row["state"] == "inflight" else (row["not_before_at"] or "")
+        if not_before and not_before > now_iso:
+            continue
+        return row["batch_id"], row["origin_thread_id"], []
+    reserved_threads = inflight_threads | {row["origin_thread_id"] for row in pending_batches}
+    thread_id = None
+    for row in conn.execute(
+        "SELECT origin_thread_id FROM callback_outbox "
+        "WHERE state='pending' AND batch_id='' " + provider_where + thread_where +
+        " ORDER BY created_at ASC, outbox_id ASC",
+        scope_params,
+    ).fetchall():
+        if row["origin_thread_id"] not in reserved_threads:
+            thread_id = row["origin_thread_id"]
+            break
+    if thread_id is None:
+        return None
+    candidates = conn.execute(
+        "SELECT outbox_id FROM callback_outbox "
+        "WHERE state='pending' AND batch_id='' AND origin_thread_id=? " + provider_where +
+        " ORDER BY created_at ASC, outbox_id ASC LIMIT ?",
+        (thread_id, provider, max(1, int(max_members))) if provider else (thread_id, max(1, int(max_members))),
+    ).fetchall()
+    return "", thread_id, [candidate["outbox_id"] for candidate in candidates]
+
+
+def peek_claimable_callback(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    origin_thread_id: str,
+    max_members: int = DEFAULT_CALLBACK_BATCH_MAX_MEMBERS,
+) -> dict | None:
+    """Return the batch ``claim_pending_callback_batch`` would claim right now
+    for this exact route, without writing anything (no lease, ack or UPDATE).
+
+    Stale-member supersede still happens only inside a real claim, so a batch
+    whose members are all stale is reported here and consumed by the claim."""
+    provider = str(provider or "").strip().lower()
+    origin_thread_id = str(origin_thread_id or "").strip()
+    if not provider or not origin_thread_id:
+        raise ValueError("provider and origin_thread_id are required")
+    present = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('callback_outbox', 'callback_batches')"
+        ).fetchall()
+    }
+    if present != {"callback_outbox", "callback_batches"}:
+        return None
+    now_iso = utc_now()
+    target = _pick_claim_target(
+        conn,
+        provider=provider,
+        origin_thread_id=origin_thread_id,
+        now_iso=now_iso,
+        max_members=max_members,
+        expired_batch_ids=frozenset(_expired_batch_ids(conn, now_iso)),
+    )
+    if target is None:
+        return None
+    batch_id, _thread_id, outbox_ids = target
+    if batch_id:
+        rows = conn.execute(
+            "SELECT * FROM callback_outbox WHERE batch_id=? AND state IN ('pending', 'inflight') "
+            "ORDER BY created_at ASC, outbox_id ASC",
+            (batch_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM callback_outbox WHERE outbox_id IN (%s) "
+            "ORDER BY created_at ASC, outbox_id ASC" % ",".join("?" * len(outbox_ids)),
+            tuple(outbox_ids),
+        ).fetchall()
+    return {
+        "batch_id": batch_id,
+        "members": [
+            {
+                "task_id": str(row["task_id"]),
+                "request_id": str(row["request_id"]),
+                "state": str(row["transition"]),
+            }
+            for row in rows
+        ],
+    }
+
+
 def _claim_pending_callback_batch(
     conn: sqlite3.Connection,
     *,
@@ -1208,9 +1334,6 @@ def _claim_pending_callback_batch(
     _ensure_callback_batches_table(conn)
     provider = str(provider or "").strip().lower()
     origin_thread_id = str(origin_thread_id or "").strip()
-    provider_where = " AND provider=?" if provider else ""
-    thread_where = " AND origin_thread_id=?" if origin_thread_id else ""
-    scope_params = tuple(p for p in (provider, origin_thread_id) if p)
     ack_pending = acknowledge is not None
     ack_attempts = 0
     ack_result: dict[str, Any] | None = None
@@ -1238,61 +1361,23 @@ def _claim_pending_callback_batch(
                 ack_attempts += 1
             _reclaim_expired_batches(conn, now_iso)
 
-            inflight_threads = {
-                row["origin_thread_id"]
-                for row in conn.execute(
-                    "SELECT DISTINCT origin_thread_id FROM callback_batches WHERE state='inflight'" + provider_where + thread_where,
-                    scope_params,
-                ).fetchall()
-            }
-
-            due_pending_batch = None
-            for row in conn.execute(
-                "SELECT * FROM callback_batches WHERE state='pending' " + provider_where + thread_where +
-                " ORDER BY created_at ASC, batch_id ASC",
-                scope_params,
-            ).fetchall():
-                if row["origin_thread_id"] in inflight_threads:
-                    continue
-                not_before = row["not_before_at"] or ""
-                if not_before and not_before > now_iso:
-                    continue
-                due_pending_batch = row
-                break
-
-            if due_pending_batch is None:
-                reserved_threads = inflight_threads | {
-                    row["origin_thread_id"]
-                    for row in conn.execute(
-                        "SELECT DISTINCT origin_thread_id FROM callback_batches WHERE state='pending'" + provider_where + thread_where,
-                        scope_params,
-                    ).fetchall()
-                }
-                oldest_unassigned = None
-                for row in conn.execute(
-                    "SELECT origin_thread_id FROM callback_outbox "
-                    "WHERE state='pending' AND batch_id='' " + provider_where + thread_where +
-                    " ORDER BY created_at ASC, outbox_id ASC",
-                    scope_params,
-                ).fetchall():
-                    if row["origin_thread_id"] not in reserved_threads:
-                        oldest_unassigned = row
-                        break
-                if oldest_unassigned is None:
-                    conn.commit()
-                    return None, ack_result
-                thread_id = oldest_unassigned["origin_thread_id"]
-                candidates = conn.execute(
-                    "SELECT outbox_id FROM callback_outbox "
-                    "WHERE state='pending' AND batch_id='' AND origin_thread_id=? " + provider_where +
-                    " ORDER BY created_at ASC, outbox_id ASC LIMIT ?",
-                    (thread_id, provider, max(1, int(max_members))) if provider else (thread_id, max(1, int(max_members))),
-                ).fetchall()
+            target = _pick_claim_target(
+                conn,
+                provider=provider,
+                origin_thread_id=origin_thread_id,
+                now_iso=now_iso,
+                max_members=max_members,
+            )
+            if target is None:
+                conn.commit()
+                return None, ack_result
+            batch_id, thread_id, new_outbox_ids = target
+            if not batch_id:
                 batch_id = uuid.uuid4().hex
-                for candidate in candidates:
+                for outbox_id in new_outbox_ids:
                     conn.execute(
                         "UPDATE callback_outbox SET batch_id=? WHERE outbox_id=?",
-                        (batch_id, candidate["outbox_id"]),
+                        (batch_id, outbox_id),
                     )
                 conn.execute(
                     """
@@ -1300,10 +1385,8 @@ def _claim_pending_callback_batch(
                       batch_id, provider, origin_thread_id, state, created_at, updated_at, member_count
                     ) VALUES (?, ?, ?, 'pending', ?, ?, ?)
                     """,
-                    (batch_id, provider, thread_id, now_iso, now_iso, len(candidates)),
+                    (batch_id, provider, thread_id, now_iso, now_iso, len(new_outbox_ids)),
                 )
-            else:
-                batch_id = due_pending_batch["batch_id"]
 
             remaining = _supersede_stale_batch_members(conn, batch_id)
             if remaining == 0:
