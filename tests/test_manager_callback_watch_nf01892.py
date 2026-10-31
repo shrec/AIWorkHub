@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 
 import pytest
 
-from aiworkhub import callback_store, manager_callback_watch
+from aiworkhub import callback_store, db_writer, manager_callback_watch
 
 SESSION = "claude-session-A"
 OTHER_SESSION = "claude-session-B"
@@ -144,3 +145,28 @@ def test_watch_reports_store_error(monkeypatch, capsys):
     )
     assert code == 2
     assert json.loads(capsys.readouterr().out.strip())["status"] == "error"
+
+
+def test_watch_never_holds_write_lease_while_polling(db_path):
+    result: dict = {}
+
+    def _run() -> None:
+        result["code"] = manager_callback_watch.main(
+            ["--repo", ".", "--provider", "claude", "--origin-thread-id", SESSION,
+             "--timeout", "5", "--poll-interval", "0.05"]
+        )
+
+    watcher = threading.Thread(target=_run, daemon=True)
+    watcher.start()
+    try:
+        time.sleep(0.3)
+        assert watcher.is_alive()
+        with db_writer.write_lease(db_path, timeout_s=1.0):
+            pass
+        _enqueue_raw(db_path, "T1")
+        watcher.join(timeout=5.0)
+        assert not watcher.is_alive()
+        assert result["code"] == manager_callback_watch.EXIT_PENDING
+    finally:
+        # --timeout bounds the watcher, so this join always ends it before tmp cleanup.
+        watcher.join(timeout=10.0)

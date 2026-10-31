@@ -3,7 +3,9 @@
 Run as a background command; it exits as soon as a callback is claimable for
 the given route, which re-invokes the model.  It only peeks -- it never claims,
 leases or acknowledges, so ``aiworkhub_claude_callback_wait`` still returns the
-same batch afterwards.
+same batch afterwards.  Each poll reads through a short-lived read-only
+connection and never takes the task_queue write lease, so other writers are
+never blocked by a long-running watch.
 
 Exit codes: 0 callback pending, 3 timeout, 2 store error.
 """
@@ -18,6 +20,7 @@ import time
 from typing import Sequence
 
 from . import callback_store
+from .sqlite_readonly import connect_readonly
 
 EXIT_PENDING = 0
 EXIT_ERROR = 2
@@ -39,15 +42,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     poll_interval = max(0.05, args.poll_interval)
     deadline = time.monotonic() + max(0.0, args.timeout)
-    conn: sqlite3.Connection | None = None
     try:
-        conn = callback_store.open_db(callback_store.resolve_db_path(args.repo))
+        db_path = callback_store.resolve_db_path(args.repo)
         while True:
-            batch = callback_store.peek_claimable_callback(
-                conn,
-                provider=args.provider,
-                origin_thread_id=args.origin_thread_id,
-            )
+            conn = connect_readonly(db_path)
+            try:
+                conn.row_factory = sqlite3.Row
+                batch = callback_store.peek_claimable_callback(
+                    conn,
+                    provider=args.provider,
+                    origin_thread_id=args.origin_thread_id,
+                )
+            finally:
+                conn.close()
             if batch is not None:
                 _emit({"status": "callback_pending", **batch})
                 return EXIT_PENDING
@@ -59,9 +66,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (callback_store.CallbackStoreError, sqlite3.Error, OSError, ValueError) as exc:
         _emit({"status": "error", "reason": f"{type(exc).__name__}: {exc}"})
         return EXIT_ERROR
-    finally:
-        if conn is not None:
-            conn.close()
 
 
 if __name__ == "__main__":
