@@ -10,7 +10,8 @@ already name, and runs them once on the combined tree with
 
 The selection reuses :mod:`aiworkhub.card_contract_advice`'s testmap pass --
 the same freshness check, query budget, payload parsing and score floor -- and
-keeps no testmap client of its own. It never raises: an unavailable index or no
+keeps no testmap client of its own. It selects only the files pytest collects by default
+(test_*.py and *_test.py), and it never raises: an unavailable index or no
 related test yields an empty selection with a named ``reason``, which the lane
 records and which does not block acceptance. A selected run that fails, or that
 returns no evidence, refuses the accept with ``neighbour_tests_failed:``.
@@ -46,6 +47,8 @@ _FIRST_FAILURE_CHARS = 500
 # A selected path becomes one argv token of ``python -m pytest``; anything
 # needing quoting is not a test path this lane runs.
 _TEST_PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.py")
+# pytest's default python_files (test_*.py, *_test.py): the only test files CI collects.
+_COLLECTED_TEST_PATH = re.compile(r"(?:.*/)?(?:test_[^/]*|[^/]*_test)\.py")
 _PYTEST_FAILURE = re.compile(r"^(?:FAILED|ERROR) (\S+)", re.MULTILINE)
 # A neighbour run is its own one-command contract: the card's evidence roles and
 # its toolchain receipt are bound to the card's own validation list.
@@ -178,7 +181,9 @@ def _select(
     runnable = {
         test: score
         for test, (score, _path) in best.items()
-        if _TEST_PATH.fullmatch(test) and (root / test).is_file()
+        if _TEST_PATH.fullmatch(test)
+        and _COLLECTED_TEST_PATH.fullmatch(test)
+        and (root / test).is_file()
     }
     ranked = sorted(runnable.items(), key=lambda item: (-item[1], item[0]))
     tests = tuple(test for test, _score in ranked[:limit])

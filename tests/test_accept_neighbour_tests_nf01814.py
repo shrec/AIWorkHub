@@ -165,6 +165,25 @@ def test_missing_or_unquotable_test_paths_are_dropped(
     assert selection.tests == ("tests/test_here.py",)
 
 
+def test_selection_keeps_only_files_pytest_collects_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _tests_on_disk(
+        tmp_path,
+        "tests/runner_x_smoke.py",
+        "tests/helper_x.py",
+        "tests/test_kept.py",
+        "tests/kept_test.py",
+    )
+    _fake_graph(
+        monkeypatch,
+        {ENGINE: _related(("tests/runner_x_smoke.py", 90), ("tests/helper_x.py", 85),
+                          ("tests/test_kept.py", 10), ("tests/kept_test.py", 10))},
+    )
+    selection = neighbours.select_neighbour_tests(tmp_path, [ENGINE], [])
+    assert selection.tests == ("tests/kept_test.py", "tests/test_kept.py")
+
+
 def test_unavailable_index_returns_no_tests_and_a_reason(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
