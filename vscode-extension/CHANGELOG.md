@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.12.83 — 2026-11-01
+
+### Fixed
+
+- Bundled runtime 0.12.83: a non-claiming callback watcher for direct-chat managers, host-wide heavy-run slots for recipe runs and validation batches, recipe memory-budget fixes, and fewer stuck accepts (expired reviewer reservations, lease timeouts that name their holder). The full list is in the repository CHANGELOG.
+
 ## 0.12.82 — 2026-10-31
 
 ### Fixed

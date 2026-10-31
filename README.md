@@ -374,11 +374,11 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.82
+## What's new in 0.12.83
 
-- A shorter manager tool list: 129 tools instead of 181. The 50 tools no session used stay callable by exact name, so existing callers keep working.
-- Accepting a card reuses a recipe run already made for that exact candidate instead of running it again.
-- Manager Chat polls no longer time out on a slow health scan, and the accept neighbour lane runs only real test files.
+- A direct-chat manager wakes on worker callbacks through a background watcher (`python -m aiworkhub.manager_callback_watch`) instead of blocking in a wait loop, and the watcher never holds the task-queue write lease.
+- Heavy runs share the host: recipe runs and worker validation batches take one of a core-derived number of host slots, with a bounded wait that fails open. Recipe memory budgets no longer misreport a surviving child or abort on a low inherited limit.
+- Fewer stuck accepts: an expired reviewer reservation no longer counts as live, a lease timeout names its holder, and a red card's summary fits in 4 KB.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Continuous Audit as a Service (CAAS)

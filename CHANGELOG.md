@@ -6,6 +6,27 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.83] - 2026-11-01
+
+### Added
+
+- `python -m aiworkhub.manager_callback_watch` peeks at pending worker callbacks without claiming them and exits when one is waiting, so a direct-chat manager wakes on callbacks instead of blocking in `aiworkhub_claude_callback_wait` (NF-2026-01892).
+- Host-wide heavy-run slots under `~/.aiworkhub/host-slots`: detached recipe runs and worker validation batches each hold one of a core-derived number of slots, wait a bounded time for one, and run unslotted (recorded as `host_slot_wait`) when the wait times out or the directory is unusable (NF-2026-01893, NF-2026-01904).
+
+### Fixed
+
+- Recipe memory budget: a child that survives a refused allocation is no longer a limit hit, the POSIX budget is clamped to the inherited hard `RLIMIT_AS`, and `max_memory_mb: 0` takes the host share instead of refusing the spawn (NF-2026-01897).
+- The callback watcher polls through a short-lived read-only connection and never holds the task-queue write lease; `WriteLeaseTimeout` names the holder pid and call site (NF-2026-01903, NF-2026-01898).
+- A pid-null reviewer reservation whose lease expired and whose preparation stopped no longer counts as a live lens (NF-2026-01899).
+- The `task_show` summary folds a `validation_failed` card to at most 4 KB of what the manager needs (NF-2026-01891).
+- Citation drift resolves `path::Qual.name` symbol citations, and Source Graph `body` resolves ambiguous, dotted and path-scoped names (NF-2026-01894, NF-2026-01888).
+- xdist replay maps `union2_*` sandbox worktree paths onto the workspace root before the exists check (NF-2026-01896).
+- `needfix_preview_convert` refuses chained validation commands, as convert and launch already did (NF-2026-01895).
+- Worktrees no longer report live-seeded `.gitignore` edits as changes (NF-2026-01889).
+- The test suite no longer leaks real Hub Mail listeners (NF-2026-01890).
+- The process-event projection cache is bounded by retained bytes (64 MiB), not only by entry count (NF-2026-00679).
+- The AppContainer key-length test asserts the fail-closed DACL refusal instead of failing the accept neighbour lane (NF-2026-01905).
+
 ## [0.12.82] - 2026-10-31
 
 ### Changed
