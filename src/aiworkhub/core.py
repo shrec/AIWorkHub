@@ -3337,8 +3337,9 @@ def manager_bootstrap(
     bootstrap came later would get a suppressed reply it never asked for; and
     the Claude-route dispatcher's real database work (rebind pending callbacks,
     seed review callbacks) would run on every gate check instead of once per
-    bootstrap.  So a gate call keeps the schema v1 behaviour exactly: full
-    prose, no delivery ledger entry, no dispatcher side effect.
+    bootstrap.  So a gate call keeps the schema v1 contract behaviour: full
+    prose, no delivery ledger entry, no dispatcher side effect, and no
+    task_health scan (it reports ``not_evaluated``).
     """
 
     # Only the bootstrap TOOL offers to sweep. A route-gate call reports what
@@ -3405,7 +3406,14 @@ def manager_bootstrap(
         # NF-2026-01359: the cap that admits this server's launches, with its source.
         "workforce_cap": workforce_cap,
         "task_hygiene": hygiene,
-        "task_health": _bootstrap_task_health(root, readiness),
+        "task_health": (
+            _bootstrap_task_health(root, readiness)
+            if bootstrap_call
+            else {
+                "status": "not_evaluated",
+                "reason": "route_gate_call:the_bootstrap_tool_reports_task_health",
+            }
+        ),
         "dispatcher": dispatcher,
         "contract_version": MANAGER_CONTRACT_VERSION,
         "contract_sha256": MANAGER_CONTRACT_SHA256,
