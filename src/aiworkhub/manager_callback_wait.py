@@ -106,23 +106,26 @@ def _claude_session_process_rows(
     )
     if not log_path.is_file():
         return []
-    latest = process_event_ledger.latest_events(
-        log_path,
-        key_field="request_id",
-        skip_event_kinds=(process_launcher.RUNTIME_NOTICE_EVENT_KIND,),
-        replace=True,
-    )
     active_states = (
         process_launcher.ACTIVE_PROCESS_STATES
         | process_launcher.FINALIZATION_PENDING_STATES
         | {process_launcher.REVIEWER_CLAIM_BOUND_STATE}
     )
     watched = set(watch_request_ids)
-    candidates = [
-        dict(row) for request_id, row in latest.items()
-        if isinstance(row, dict)
-        and (str(row.get("state") or "") in active_states or str(request_id) in watched)
-    ]
+    # ``packet`` is the large launch payload; nothing in the wait or the
+    # liveness snapshot reads it, so it never enters the retained projection.
+    latest = process_event_ledger.latest_events_where(
+        log_path,
+        lambda request_id, row: (
+            str(row.get("state") or "") in active_states
+            or str(request_id) in watched
+        ),
+        key_field="request_id",
+        skip_event_kinds=(process_launcher.RUNTIME_NOTICE_EVENT_KIND,),
+        replace=True,
+        drop_fields=("packet",),
+    )
+    candidates = list(latest.values())
     if not candidates:
         return []
     task_ids = sorted({str(row.get("task_id") or "") for row in candidates if row.get("task_id")})

@@ -19,13 +19,16 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from .platform_io import atomic_replace, chmod_fd, lock_fd, unlock_fd
 
 
 ACTIVE_LEDGER_MAX_BYTES = 48 * 1024 * 1024
 _LATEST_EVENT_CACHE_MAX_ENTRIES = 32
+# Estimated retained bytes across every cached latest-event projection; the
+# entry cap alone let 32 projections of a 48 MiB ledger stay resident.
+_LATEST_EVENT_CACHE_MAX_BYTES = 64 * 1024 * 1024
 _FileSignature = tuple[str, int, int, int, int, int]
 
 
@@ -34,6 +37,7 @@ class _LatestEventProjection:
     signatures: tuple[_FileSignature, ...]
     complete_active_offset: int
     latest: dict[str, dict[str, Any]]
+    estimated_bytes: int = 0
 
 
 # A projection's identity is the ledger plus every fold option that changes
@@ -566,7 +570,7 @@ def _merge_latest_row(
     skip_event_kinds: tuple[str, ...] = (),
     replace: bool = False,
     drop_fields: tuple[str, ...] = (),
-) -> None:
+) -> tuple[str, dict[str, Any] | None] | None:
     """Fold one row into the latest-per-key map.
 
     ``replace`` selects the launcher's semantics, where the newest row for a
@@ -584,13 +588,15 @@ def _merge_latest_row(
     """
 
     if skip_event_kinds and str(row.get("event_kind") or "") in skip_event_kinds:
-        return
+        return None
     key = str(row.get(key_field) or "")
     if not key:
-        return
+        return None
     if drop_fields:
         row = {k: v for k, v in row.items() if k not in drop_fields}
-    latest[key] = dict(row) if replace else {**latest.get(key, {}), **row}
+    previous = latest.get(key)
+    latest[key] = dict(row) if replace else {**(previous or {}), **row}
+    return key, previous
 
 
 def _parse_complete_jsonl(payload: bytes) -> Iterator[dict[str, Any]]:
@@ -603,17 +609,35 @@ def _parse_complete_jsonl(payload: bytes) -> Iterator[dict[str, Any]]:
             yield row
 
 
+def _projection_weight(projection: Any) -> int:
+    return int(getattr(projection, "estimated_bytes", 0) or 0)
+
+
 def _cache_bounded_projection(
     cache: OrderedDict[Any, Any],
     lock: Any,
     cache_key: Any,
     projection: Any,
     max_entries: int,
+    *,
+    max_bytes: int | None = None,
 ) -> None:
+    """Store ``projection`` and evict least-recently-used entries until the
+    cache is within ``max_entries`` and, when given, ``max_bytes`` of retained
+    ``estimated_bytes``. A single projection heavier than ``max_bytes`` is not
+    retained at all (and displaces any stale entry for its key)."""
+
     with lock:
+        if max_bytes is not None and _projection_weight(projection) > max_bytes:
+            cache.pop(cache_key, None)
+            return
         cache[cache_key] = projection
         cache.move_to_end(cache_key)
-        while len(cache) > max_entries:
+        while len(cache) > max_entries or (
+            max_bytes is not None
+            and len(cache) > 1
+            and sum(_projection_weight(item) for item in cache.values()) > max_bytes
+        ):
             cache.popitem(last=False)
 
 
@@ -626,7 +650,61 @@ def _cache_projection(
         cache_key,
         projection,
         _LATEST_EVENT_CACHE_MAX_ENTRIES,
+        max_bytes=_LATEST_EVENT_CACHE_MAX_BYTES,
     )
+
+
+def _estimate_value_bytes(value: Any) -> int:
+    """Approximate in-memory footprint of a JSON-shaped value (an estimate, not
+    an exact ``sys.getsizeof`` walk). Iterative, so a row nested deeper than
+    the interpreter stack cannot raise ``RecursionError``."""
+
+    total = 0
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            total += 56 + len(item)
+        elif isinstance(item, dict):
+            total += 64 + 24 * len(item)
+            for k, v in item.items():
+                stack.append(k)
+                stack.append(v)
+        elif isinstance(item, (list, tuple)):
+            total += 56 + 8 * len(item)
+            stack.extend(item)
+        else:
+            total += 32
+    return total
+
+
+def _estimate_row_bytes(key: str, row: Mapping[str, Any]) -> int:
+    return _estimate_value_bytes(key) + _estimate_value_bytes(row)
+
+
+def _copy_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy a retained row so a caller can never mutate the cached projection,
+    including through nested dicts and lists. Iterative for the same reason as
+    ``_estimate_value_bytes``."""
+
+    copied: dict[str, Any] = {}
+    pending: list[tuple[Any, Any]] = [(row, copied)]
+    while pending:
+        source, target = pending.pop()
+        items: Iterable[tuple[Any, Any]] = (
+            enumerate(source) if isinstance(source, list) else source.items()
+        )
+        for k, v in items:
+            if isinstance(v, dict):
+                child: Any = {}
+            elif isinstance(v, list):
+                child = [None] * len(v)
+            else:
+                target[k] = v
+                continue
+            target[k] = child
+            pending.append((v, child))
+    return copied
 
 
 def _rebuild_latest_events(
@@ -638,6 +716,9 @@ def _rebuild_latest_events(
     replace: bool = False,
     drop_fields: tuple[str, ...] = (),
 ) -> dict[str, dict[str, Any]]:
+    """Cold replay. Returns the projection itself, uncopied: callers must copy
+    only the rows they hand out."""
+
     before = _ledger_signatures(path)
     latest: dict[str, dict[str, Any]] = {}
     for row in iter_events(path):
@@ -658,40 +739,31 @@ def _rebuild_latest_events(
         if after and after[-1][0] == str(path.resolve(strict=False)):
             active_offset = _active_complete_offset(path, size=after[-1][3])
             if _ledger_signatures(path) != after:
-                return {key: dict(value) for key, value in latest.items()}
+                return latest
         _cache_projection(
             cache_key,
             _LatestEventProjection(
                 signatures=after,
                 complete_active_offset=active_offset,
                 latest=latest,
+                estimated_bytes=sum(
+                    _estimate_row_bytes(key, value) for key, value in latest.items()
+                ),
             ),
         )
-    return {key: dict(value) for key, value in latest.items()}
+    return latest
 
 
-def latest_events(
+def _latest_view(
     path: Path,
     *,
-    key_field: str = "request_id",
-    skip_event_kinds: tuple[str, ...] = (),
-    replace: bool = False,
-    drop_fields: tuple[str, ...] = (),
+    key_field: str,
+    skip_event_kinds: tuple[str, ...],
+    replace: bool,
+    drop_fields: tuple[str, ...],
 ) -> dict[str, dict[str, Any]]:
-    """Return the latest merged row per key using an append-aware projection.
-
-    The append-only common path parses only complete bytes added since the
-    preceding call. Rotations, spills, replacements, truncations, deletions or
-    any immutable-segment change invalidate the projection and replay the
-    canonical ``iter_events`` ordering. The cache is process-local, bounded and
-    never an authority: a restart merely pays one cold replay.
-
-    ``drop_fields`` names keys a caller never reads (e.g. ``packet``) that are
-    removed from every row before it is retained in the cached projection --
-    during both a cold rebuild and an incremental append replay -- not merely
-    from the dict handed back to the caller. Omitting it preserves the exact
-    default projection byte-for-byte.
-    """
+    """The shared latest-per-key projection, never copied. Read-only: callers
+    must not mutate it and must copy any row they return."""
 
     resolved_path = str(path.resolve(strict=False))
     skip_event_kinds = tuple(sorted(skip_event_kinds))
@@ -710,7 +782,7 @@ def latest_events(
 
     if cached is not None and current is not None:
         if current == cached.signatures:
-            return {key: dict(value) for key, value in cached.latest.items()}
+            return cached.latest
 
         # Incremental replay is safe only for growth of the same active file,
         # with every immutable segment unchanged and no spill merge involved.
@@ -752,10 +824,14 @@ def latest_events(
                 )
 
             complete_length = payload.rfind(b"\n") + 1
-            latest = {key: dict(value) for key, value in cached.latest.items()}
+            # Rows are never mutated in place (the fold builds a new dict per
+            # touched key), so a shallow copy of the mapping is enough to keep
+            # the previously cached projection immutable.
+            latest = dict(cached.latest)
+            estimated_bytes = cached.estimated_bytes
             if complete_length:
                 for row in _parse_complete_jsonl(payload[:complete_length]):
-                    _merge_latest_row(
+                    merged = _merge_latest_row(
                         latest,
                         row,
                         key_field,
@@ -763,6 +839,12 @@ def latest_events(
                         replace=replace,
                         drop_fields=drop_fields,
                     )
+                    if merged is None:
+                        continue
+                    key, previous = merged
+                    estimated_bytes += _estimate_row_bytes(key, latest[key])
+                    if previous is not None:
+                        estimated_bytes -= _estimate_row_bytes(key, previous)
             if _ledger_signatures(path) == current:
                 _cache_projection(
                     cache_key,
@@ -770,9 +852,10 @@ def latest_events(
                         signatures=current,
                         complete_active_offset=start + complete_length,
                         latest=latest,
+                        estimated_bytes=estimated_bytes,
                     ),
                 )
-                return {key: dict(value) for key, value in latest.items()}
+                return latest
 
     return _rebuild_latest_events(
         path,
@@ -782,6 +865,114 @@ def latest_events(
         replace=replace,
         drop_fields=drop_fields,
     )
+
+
+def latest_events(
+    path: Path,
+    *,
+    key_field: str = "request_id",
+    skip_event_kinds: tuple[str, ...] = (),
+    replace: bool = False,
+    drop_fields: tuple[str, ...] = (),
+) -> dict[str, dict[str, Any]]:
+    """Return the latest merged row per key using an append-aware projection.
+
+    The append-only common path parses only complete bytes added since the
+    preceding call. Rotations, spills, replacements, truncations, deletions or
+    any immutable-segment change invalidate the projection and replay the
+    canonical ``iter_events`` ordering. The cache is process-local, bounded by
+    entry count and by estimated retained bytes, and never an authority: a
+    restart merely pays one cold replay.
+
+    ``drop_fields`` names keys a caller never reads (e.g. ``packet``) that are
+    removed from every row before it is retained in the cached projection --
+    during both a cold rebuild and an incremental append replay -- not merely
+    from the dict handed back to the caller. Omitting it preserves the exact
+    default projection byte-for-byte.
+
+    This returns a copy of the WHOLE projection; a caller that needs one key
+    or a filtered subset should use ``latest_event`` / ``latest_events_where``.
+    """
+
+    view = _latest_view(
+        path,
+        key_field=key_field,
+        skip_event_kinds=skip_event_kinds,
+        replace=replace,
+        drop_fields=drop_fields,
+    )
+    return {key: _copy_row(value) for key, value in view.items()}
+
+
+def latest_event(
+    path: Path,
+    key: str,
+    *,
+    key_field: str = "request_id",
+    skip_event_kinds: tuple[str, ...] = (),
+    replace: bool = False,
+    drop_fields: tuple[str, ...] = (),
+) -> dict[str, Any] | None:
+    """The latest merged row for ``key`` (a copy), or ``None``; same cached
+    projection and incremental replay as ``latest_events``, but only the one
+    returned row is copied."""
+
+    view = _latest_view(
+        path,
+        key_field=key_field,
+        skip_event_kinds=skip_event_kinds,
+        replace=replace,
+        drop_fields=drop_fields,
+    )
+    row = view.get(key)
+    return None if row is None else _copy_row(row)
+
+
+def latest_events_where(
+    path: Path,
+    predicate: Callable[[str, Mapping[str, Any]], bool],
+    *,
+    key_field: str = "request_id",
+    skip_event_kinds: tuple[str, ...] = (),
+    replace: bool = False,
+    drop_fields: tuple[str, ...] = (),
+) -> dict[str, dict[str, Any]]:
+    """Latest merged rows for which ``predicate(key, row)`` is true, copying
+    only those rows. ``predicate`` sees the retained row and must neither
+    mutate nor keep a reference to it."""
+
+    view = _latest_view(
+        path,
+        key_field=key_field,
+        skip_event_kinds=skip_event_kinds,
+        replace=replace,
+        drop_fields=drop_fields,
+    )
+    return {
+        key: _copy_row(value) for key, value in view.items() if predicate(key, value)
+    }
+
+
+def latest_event_cache_stats() -> dict[str, int]:
+    """Entry count, estimated retained bytes and the configured bounds of the
+    latest-event projection cache."""
+
+    with _LATEST_EVENT_CACHE_LOCK:
+        return {
+            "entries": len(_LATEST_EVENT_CACHE),
+            "estimated_bytes": sum(
+                _projection_weight(item) for item in _LATEST_EVENT_CACHE.values()
+            ),
+            "budget_bytes": _LATEST_EVENT_CACHE_MAX_BYTES,
+            "max_entries": _LATEST_EVENT_CACHE_MAX_ENTRIES,
+        }
+
+
+def reset_latest_event_cache() -> None:
+    """Drop every retained latest-event projection (costs one cold replay)."""
+
+    with _LATEST_EVENT_CACHE_LOCK:
+        _LATEST_EVENT_CACHE.clear()
 
 
 def sealed_request_field(path: Path, field: str) -> dict[str, Any]:
