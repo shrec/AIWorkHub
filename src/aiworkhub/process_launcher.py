@@ -474,6 +474,13 @@ ACTIVE_PROCESS_STATES = {"starting", "running", "cancel_requested"}
 # ``starting`` reservation reconciled by the same expiry rules -- never an
 # elapsed/quiet-time classification of a live provider.
 QUALITY_REVIEW_ATTEMPT_RESERVATION_SECONDS = 600.0
+# NF-2026-01899: a live owner (the long-lived MCP server) keeps a pid-null
+# reservation live after its lease expires only while the preparation
+# heartbeat is younger than this.  The lease is sized to cover the whole of
+# preparation, so no single legitimate phase (worktree provisioning
+# included) outlasts it; 1.5x that window is the quiet time after which the
+# preparation is judged stopped.  Never below the reservation window.
+QUALITY_REVIEW_PREPARATION_STALE_SECONDS = 900.0
 REVIEWER_CLAIM_BOUND_STATE = "reviewer_claim_bound"
 # A reviewer target that is only a prefix is refused, never resolved; this many
 # matching request ids are named back so the caller can pick the exact one.
@@ -5066,7 +5073,7 @@ class ProcessManager:
         _admission_recovery_authority: object | None = None,
         _unbound_claim_resolutions: dict[str, tuple[str, int | None]] | None = None,
     ) -> int:
-        return reviewer_reservation_recovery.reconcile_expired_starting_reservations(
+        retired = reviewer_reservation_recovery.reconcile_expired_starting_reservations(
             self,
             snapshot,
             resolved=resolved,
@@ -5078,6 +5085,11 @@ class ProcessManager:
             identity_mismatch=PidIdentityVerdict.MISMATCH,
             classify_preparation_stall=derive_preparation_stall,
         )
+        if resolved and snapshot is not None:
+            retired += self._retire_stale_owner_reservations(
+                snapshot[0], _unbound_claim_resolutions
+            )
+        return retired
 
     def _build_adapter(self, **kwargs: Any) -> Any:
         if kwargs.get("executable_overrides") is None:
@@ -6980,15 +6992,20 @@ class ProcessManager:
             return True
         if state == "starting" and not pid:
             owner_pid, owner_pid_ambiguous = _parse_durable_pid(event.get("owner_pid"))
-            if owner_pid_ambiguous or (owner_pid > 0 and _pid_identity_evidence(
+            if owner_pid_ambiguous:
+                return True
+            owner_alive = owner_pid > 0 and _pid_identity_evidence(
                 owner_pid, event.get("owner_pid_start_ticks")
-            ).verdict is not PidIdentityVerdict.MISMATCH):
+            ).verdict is not PidIdentityVerdict.MISMATCH
+            if owner_alive and self._starting_owner_has_progress(event):
                 return True
             if self._reviewer_source_graph_prewarm_live_event(event):
                 return True
             if owner_pid > 0:
-                # NF-2026-01763: reaching here means the recorded owner is a
-                # proven MISMATCH, so its lease alone never keeps the attempt.
+                # NF-2026-01763: a proven-dead owner is not kept live by its
+                # lease.  NF-2026-01899: neither is a live owner whose lease
+                # expired with no fresh preparation heartbeat -- the owner is
+                # the long-lived MCP server, not the stopped preparation.
                 return False
             try:
                 deadline = float(event.get("reservation_expires_at_epoch") or 0.0)
@@ -7001,6 +7018,103 @@ class ProcessManager:
         return bool(pid) and _pid_identity_evidence(
             pid, event.get("pid_start_ticks")
         ).verdict is not PidIdentityVerdict.MISMATCH
+
+    @staticmethod
+    def _starting_owner_has_progress(event: Mapping[str, Any]) -> bool:
+        """Whether a live owner's pid-null reservation shows preparation progress.
+
+        Progress is an unexpired lease or a preparation heartbeat younger than
+        ``QUALITY_REVIEW_PREPARATION_STALE_SECONDS``.  A missing, malformed or
+        non-finite lease, or a malformed heartbeat, is ambiguous and counts as
+        progress so admission never mints a second provider on unreadable
+        evidence.
+        """
+
+        now = time.time()
+        try:
+            deadline = float(event.get("reservation_expires_at_epoch"))
+        except (TypeError, ValueError, OverflowError):
+            return True
+        if not (0.0 < deadline < math.inf) or deadline > now:
+            return True
+        raw_beat = event.get("preparation_heartbeat_epoch")
+        if raw_beat is None:
+            return False
+        try:
+            beat = float(raw_beat)
+        except (TypeError, ValueError, OverflowError):
+            return True
+        return not math.isfinite(beat) or now - beat <= (
+            QUALITY_REVIEW_PREPARATION_STALE_SECONDS
+        )
+
+    def _retire_stale_owner_reservations(
+        self,
+        latest: dict[str, dict[str, Any]],
+        unbound_claim_resolutions: Mapping[str, tuple[str, int | None]] | None,
+    ) -> int:
+        """Terminalize pid-null reservations whose live owner stopped preparing.
+
+        NF-2026-01899: the shared expiry reconciliation preserves every
+        reservation whose owner is not a proven mismatch, and that owner is
+        the long-lived MCP server.  A reservation that
+        :meth:`_reviewer_event_live` now reads as dead therefore has to be
+        retired here, under the caller's proven snapshot and registry lock,
+        or the stopped preparation could still reach
+        ``_reviewer_spawn_transition`` (which requires ``starting``) and spawn
+        a provider beside its replacement.  Retired rows are mirrored back
+        into ``latest``.
+        """
+
+        retired = 0
+        diagnostics_left = self._TERMINAL_INTENT_DIAGNOSTICS_PER_PASS
+        now = time.time()
+        for request_id, event in list(latest.items()):
+            if event.get("state") != "starting":
+                continue
+            pid, pid_ambiguous = _parse_durable_pid(event.get("pid"))
+            owner_pid, owner_ambiguous = _parse_durable_pid(event.get("owner_pid"))
+            if pid or pid_ambiguous or owner_ambiguous or owner_pid <= 0:
+                continue
+            if _pid_identity_evidence(
+                owner_pid, event.get("owner_pid_start_ticks")
+            ).verdict is PidIdentityVerdict.MISMATCH:
+                continue
+            if self._reviewer_event_live(event):
+                continue
+            if (
+                event.get("topic") == "quality_review"
+                and event.get("reviewer_claim_epoch") is None
+            ):
+                resolution = (unbound_claim_resolutions or {}).get(request_id)
+                if resolution is None:
+                    continue
+                kind, resolved_epoch = resolution
+                if kind == "exact" and resolved_epoch is not None:
+                    event = {
+                        **event,
+                        "reviewer_claim_epoch": resolved_epoch,
+                        "claim_binding_state": REVIEWER_CLAIM_BOUND_STATE,
+                    }
+                    self._append_event(event)
+                    latest[request_id] = event
+                elif kind != "legacy":
+                    continue
+            stall = derive_preparation_stall(
+                now_epoch=now,
+                preparation_heartbeat_epoch=event.get("preparation_heartbeat_epoch"),
+                preparation_phase=event.get("preparation_phase"),
+            )
+            terminalized, diagnostics_left = self._terminalize_committed_reservation(
+                request_id,
+                event,
+                stall["reason"] or "reservation_expired",
+                diagnostics_left,
+            )
+            if terminalized:
+                latest[request_id] = {**event, "state": "blocked"}
+                retired += 1
+        return retired
 
     def _lens_reviewer_attempts(
         self,
