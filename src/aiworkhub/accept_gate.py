@@ -53,6 +53,7 @@ _SPAWN_GRACE_SECONDS = 600.0
 _PENDING_STATES = frozenset(
     {
         recipe_runner.DETACHED_STATE_QUEUED,
+        recipe_runner.DETACHED_STATE_WAITING_HOST_SLOT,
         recipe_runner.DETACHED_STATE_WAITING_MEMORY,
         recipe_runner.DETACHED_STATE_RUNNING,
     }

@@ -55,7 +55,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
 
-from . import platform_io
+from . import host_heavy_slots, platform_io
 from . import tool_recipes as tr
 from . import tool_recipes_store as store
 
@@ -583,6 +583,7 @@ REASON_ACCEPT_BINDING_INCOMPLETE = "accept_binding_incomplete"
 
 DETACHED_STATE_QUEUED = "queued"
 DETACHED_STATE_WAITING_MEMORY = "waiting_memory"
+DETACHED_STATE_WAITING_HOST_SLOT = "waiting_host_slot"
 DETACHED_STATE_RUNNING = "running"
 DETACHED_STATE_COMPLETED = "completed"
 DETACHED_STATE_FAILED = "failed"
@@ -803,6 +804,7 @@ def _detached_main(argv: list[str]) -> int:
     if record is None:
         return 2
     lock_handle: int | None = None
+    host_slot: host_heavy_slots.HostSlot | None = None
     try:
         record["pid"] = os.getpid()
         _write_status(status_path, record)
@@ -826,6 +828,16 @@ def _detached_main(argv: list[str]) -> int:
             )
             _write_status(status_path, record)
             return 0
+        host_slot_count = host_heavy_slots.slot_count()
+        while True:
+            host_slot = host_heavy_slots.try_acquire(count=host_slot_count)
+            if host_slot is not None:
+                break
+            record.update(
+                state=DETACHED_STATE_WAITING_HOST_SLOT, host_slots=host_slot_count
+            )
+            _write_status(status_path, record)
+            _sleep(DETACHED_ADMISSION_POLL_SECONDS)
         max_memory_mb = recipe.resource_bounds.max_memory_mb
         if max_memory_mb is not None and not _admit_memory(
             status_path, record, max_memory_mb
@@ -875,6 +887,8 @@ def _detached_main(argv: list[str]) -> int:
             pass
         return 1
     finally:
+        if host_slot is not None:
+            host_slot.release()
         if lock_handle is not None:
             try:
                 platform_io.unlock_fd(lock_handle)
