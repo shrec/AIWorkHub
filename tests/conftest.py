@@ -26,6 +26,10 @@ from pathlib import Path
 
 import pytest
 
+# NF-2026-01904: a test process never takes a real host heavy-run slot;
+# tests/test_validation_host_slot_nf01904.py deletes this to exercise slots.
+os.environ.setdefault("AIWORKHUB_HOST_HEAVY_SLOT_HELD", "1")
+
 # A minimal child that imports aiworkhub and reports the file it resolved to,
 # so the caller can prove WHICH tree the child loaded.
 _CHILD_PROBE = "import aiworkhub, sys; sys.stdout.write(getattr(aiworkhub, '__file__', '') or '')"

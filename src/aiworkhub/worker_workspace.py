@@ -51,7 +51,9 @@ if __package__:
         _LandlockPathBeneathAttr, _LandlockRulesetAttr, _OpenHow,
         _SeccompData, _SeccompNotif, _SeccompNotifResp,
     )
-
+    from .host_heavy_slots import slotted
+else:
+    slotted = lambda max_wait_seconds: lambda fn: fn
 
 # ``VALIDATION_FAILED`` / ``VALIDATION_ENVIRONMENT_BLOCKED`` name the two terminal
 # states this module's ``ValidationRunError`` hierarchy carries at class-definition
@@ -74,13 +76,10 @@ if __package__:
 # site below, which only runs under the package-imported entrypoint.
 VALIDATION_FAILED = "validation_failed"
 VALIDATION_ENVIRONMENT_BLOCKED = "validation_environment_blocked"
-# Worker-side (sandbox-selection) restriction. The sandbox backend itself could
-# not be provisioned BEFORE any command was built or run, so this is outside
-# ``validation_runner``'s per-row classification authority (the candidate never
-# executed). It blocks acceptance exactly like ``VALIDATION_ENVIRONMENT_BLOCKED``
-# but is recovered by re-running in a corrected sandbox -- never reported as
-# ``VALIDATION_FAILED``, and always preserving the retained workspace/hashes for
-# a provider-free ``retry_finalization``.
+# Worker-side restriction: the sandbox backend could not be provisioned before any
+# command ran, so it is outside ``validation_runner``'s per-row classification.
+# It blocks acceptance like ``VALIDATION_ENVIRONMENT_BLOCKED`` but is recovered by
+# a provider-free ``retry_finalization`` in a corrected sandbox.
 VALIDATION_UNSUPPORTED_IN_SANDBOX = "validation_unsupported_in_sandbox"
 OUTER_VALIDATION_AUTHORITY_SCHEMA = "aiworkhub.outer_validation_authority.v1"
 OUTER_VALIDATION_AUTHORITY_RELATIVE = (
@@ -13073,6 +13072,7 @@ def _run_appcontainer_validation(
                 pass
 
 
+@slotted(max_wait_seconds=MAX_VALIDATION_SECONDS)
 def run_validations(
     workspace: WorkerWorkspace,
     commands: Iterable[str],

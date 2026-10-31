@@ -8,8 +8,12 @@ holder never leaks a slot.
 
 from __future__ import annotations
 
+import functools
 import os
+import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from . import parallelism, platform_io
 
@@ -78,3 +82,79 @@ def try_acquire(
             raise
         return HostSlot(index, fd)
     return None
+
+
+HELD_ENV = "AIWORKHUB_HOST_HEAVY_SLOT_HELD"
+POLL_SECONDS = 2.0
+
+
+def wait_acquire(
+    max_wait_seconds: float,
+    *,
+    poll_seconds: float = POLL_SECONDS,
+    slots_dir: Path | None = None,
+    count: int | None = None,
+    sleep: Callable[[float], object] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> tuple[HostSlot | None, float, str]:
+    """Wait at most ``max_wait_seconds`` for a slot; never raises ``OSError``.
+
+    Returns ``(slot_or_None, waited_seconds, reason)`` where reason is
+    ``acquired`` (first try), ``acquired_after_wait``, ``wait_timeout`` or
+    ``slots_dir_unusable`` (fail open: the caller runs unslotted).
+    """
+
+    started = clock()
+    first_try = True
+    while True:
+        try:
+            slot = try_acquire(slots_dir, count)
+        except OSError:
+            return None, max(0.0, clock() - started), "slots_dir_unusable"
+        waited = max(0.0, clock() - started)
+        if slot is not None:
+            return slot, waited, "acquired" if first_try else "acquired_after_wait"
+        remaining = max_wait_seconds - waited
+        if remaining <= 0:
+            return None, waited, "wait_timeout"
+        first_try = False
+        sleep(min(poll_seconds, remaining))
+
+
+def slotted(max_wait_seconds: float) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Hold one host slot while the wrapped batch function runs.
+
+    The wait is bounded by the call's ``timeout_seconds`` keyword (default
+    ``max_wait_seconds``). Anything but an immediate acquire is recorded as
+    ``host_slot_wait`` on every returned row; a timeout or unusable slots
+    directory runs the batch unslotted. Under ``HELD_ENV`` no slot is taken.
+    """
+
+    def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            if os.environ.get(HELD_ENV) == "1":
+                return fn(*args, **kwargs)
+            total = slot_count()
+            limit = kwargs.get("timeout_seconds", max_wait_seconds)
+            slot, waited, reason = wait_acquire(max(0, limit), count=total)
+            try:
+                result = fn(*args, **kwargs)
+            finally:
+                if slot is not None:
+                    slot.release()
+            if reason != "acquired" and isinstance(result, list):
+                note = {
+                    "slots": total,
+                    "waited_seconds": round(waited, 3),
+                    "acquired": slot is not None,
+                    "reason": reason,
+                }
+                for row in result:
+                    if isinstance(row, dict):
+                        row["host_slot_wait"] = dict(note)
+            return result
+
+        return wrapper
+
+    return decorate
