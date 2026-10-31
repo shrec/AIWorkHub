@@ -45,6 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import accept_gate
 from . import core
 from . import recipe_runner
 from . import task_templates
@@ -308,6 +309,8 @@ def run(
     params: Mapping[str, Any] | None = None,
     grant_capabilities: Any = (),
     detach: bool = False,
+    accept_task_id: str | None = None,
+    accept_request_id: str | None = None,
 ) -> dict[str, Any]:
     """MANAGER EXECUTE: run one PERSISTED recipe and return a bounded digest.
 
@@ -321,10 +324,28 @@ def run(
     What runs is the immutable stored manifest, not a mapping typed at call
     time. A non-zero exit is a RESULT, not an error: the digest carries the
     return code, the bounded tails and the path of the full output.
+
+    ``accept_task_id`` + ``accept_request_id`` (both or neither) bind the run
+    to that review_ready request's exact candidate for the accept gate
+    (NF-2026-01835): detach is implied, the recipe, version and params must
+    equal ``.aiworkhub/config/accept_gate.json``, and a receipt naming the run
+    is written under ``.aiworkhub/runtime/accept_gate/``.
     """
     root, manager = _manager_context()
     if root is None:
         return manager
+    accept_task = str(accept_task_id or "").strip()
+    accept_request = str(accept_request_id or "").strip()
+    if bool(accept_task) != bool(accept_request):
+        return {
+            "ok": False,
+            "error": "accept_binding_incomplete: pass accept_task_id and accept_request_id together",
+            "reason_code": recipe_runner.REASON_ACCEPT_BINDING_INCOMPLETE,
+            "manager": manager,
+            "surface": "manager_mcp",
+        }
+    bound = bool(accept_task)
+    detach = detach or bound
     wanted = str(recipe_id or "").strip()
     if not wanted:
         return {
@@ -365,8 +386,30 @@ def run(
         gate["required_capabilities"] = sorted(privileged)
         return gate
 
+    if bound and not core.writes_allowed():
+        return _write_gate(manager)
+
     try:
-        if detach:
+        if bound:
+            started = accept_gate.start_accept_run(
+                root,
+                recipe,
+                task_id=accept_task,
+                request_id=accept_request,
+                params=params or {},
+                grant_capabilities=granted,
+                actor=_actor(manager),
+                manager=manager,
+            )
+            if not started.get("ok"):
+                return {
+                    **started,
+                    "recipe_id": recipe.id,
+                    "version": recipe.version,
+                    "manager": manager,
+                    "surface": "manager_mcp",
+                }
+        elif detach:
             started = recipe_runner.start_detached_run(
                 root,
                 recipe,

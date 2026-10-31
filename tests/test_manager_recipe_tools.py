@@ -1139,6 +1139,8 @@ def test_recipe_tools_delegate_to_the_driver(monkeypatch):
         "params": {},
         "grant_capabilities": [],
         "detach": False,
+        "accept_task_id": None,
+        "accept_request_id": None,
     }
 
 

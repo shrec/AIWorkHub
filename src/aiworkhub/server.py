@@ -3055,6 +3055,8 @@ def aiworkhub_manager_recipe_run(
     params: dict[str, Any] | None = None,
     grant_capabilities: list[str] | None = None,
     detach: bool = False,
+    accept_task_id: str | None = None,
+    accept_request_id: str | None = None,
 ) -> dict[str, Any]:
     """MANAGER EXECUTE: run one PERSISTED recipe and return a bounded digest.
 
@@ -3078,6 +3080,8 @@ def aiworkhub_manager_recipe_run(
         params: Values for the recipe's typed argument slots, keyed by the slot names its manifest declares; omit when the recipe takes none.
         grant_capabilities: Capabilities granted to this run; it must name every capability the recipe declares. Omit for a read-only recipe; a write or network recipe also needs the repository write gate open.
         detach: When true, queue the run as a detached host process and return its run_id at once; read the outcome with aiworkhub_manager_recipe_run_status. At most one detached run per repository executes at a time.
+        accept_task_id: Accept-gate binding, passed together with accept_request_id: the task whose review_ready candidate this run must cover. Implies detach; the recipe, version and params must equal .aiworkhub/config/accept_gate.json and the run executes on the combined candidate tree. Omit for an ordinary run.
+        accept_request_id: Accept-gate binding, passed together with accept_task_id: the review_ready worker request whose exact candidate this run is bound to. Accept is refused until this run completed with returncode 0 on that candidate.
     """
 
     return manager_recipe_tools.run(
@@ -3086,6 +3090,8 @@ def aiworkhub_manager_recipe_run(
         params=params or {},
         grant_capabilities=grant_capabilities or [],
         detach=detach,
+        accept_task_id=accept_task_id,
+        accept_request_id=accept_request_id,
     )
 
 

@@ -75,7 +75,7 @@ MAX_TAIL_CHARS = 4096
 # when a manifest declares none. The ceiling exists so a manifest cannot
 # declare a bound that makes the run effectively unbounded.
 DEFAULT_TIMEOUT_SECONDS = 120.0
-MAX_TIMEOUT_SECONDS = 1800.0
+MAX_TIMEOUT_SECONDS = 7200.0
 MIN_TIMEOUT_SECONDS = 1.0
 
 # Stable refusal reasons owned by this module. The validation/capability
@@ -323,6 +323,7 @@ def run_recipe(
     run_id: str | None = None,
     persist_receipt: bool = True,
     actor: tr.ActorIdentity | None = None,
+    cwd: Path | None = None,
 ) -> dict[str, Any]:
     """Validate, execute and receipt one recipe invocation.
 
@@ -335,6 +336,11 @@ def run_recipe(
     :class:`~aiworkhub.tool_recipes.ActorIdentity`. Omitted, the run is
     recorded as ``unattributed``, which is the honest reading of a run whose
     route could not be verified.
+
+    ``cwd`` is the subprocess working directory; ``None`` is the repository
+    root. Only an accept-gate run passes it, to run on the combined candidate
+    tree. Everything else (output file, environment, executable) stays rooted
+    at ``repo_root``.
 
     Raises :class:`~aiworkhub.tool_recipes.RecipeError` (with its stable
     ``reason``) when the manifest refuses the invocation -- an unknown or
@@ -384,6 +390,7 @@ def run_recipe(
     # (d) execve semantics: a list, never a string; ``shell=False`` is the
     # default and is passed explicitly so the posture is visible at the call.
     argv = [str(executable), *validated.argv[1:]]
+    run_cwd = root if cwd is None else Path(cwd)
     started_at = _utcnow_iso()
     started = time.monotonic()
     timed_out = False
@@ -394,7 +401,7 @@ def run_recipe(
     try:
         completed = subprocess.run(  # noqa: S603 - execve vector, shell=False, fixed argv[0]
             argv,
-            cwd=str(root),
+            cwd=str(run_cwd),
             env=env,
             shell=False,
             capture_output=True,
@@ -434,7 +441,7 @@ def run_recipe(
             "recipe_digest": recipe.digest,
             "argv": list(validated.argv),
             "executed_argv": argv,
-            "cwd": str(root),
+            "cwd": str(run_cwd),
             "environment_names": sorted(env),
             "started_at": started_at,
             "finished_at": finished_at,
@@ -456,7 +463,7 @@ def run_recipe(
         "recipe_digest": recipe.digest,
         "argv": list(validated.argv),
         "executable": str(executable),
-        "cwd": str(root),
+        "cwd": str(run_cwd),
         "required_capabilities": list(recipe.capabilities),
         "granted_capabilities": list(validated.capabilities),
         "exit_status": exit_status,
@@ -572,6 +579,7 @@ REASON_UNKNOWN_RUN = "unknown_run"
 REASON_MEMORY_PROBE_UNAVAILABLE = "memory_probe_unavailable"
 REASON_MEMORY_CAPACITY_INSUFFICIENT = "memory_capacity_insufficient"
 REASON_RECIPE_DIGEST_CHANGED = "recipe_digest_changed"
+REASON_ACCEPT_BINDING_INCOMPLETE = "accept_binding_incomplete"
 
 DETACHED_STATE_QUEUED = "queued"
 DETACHED_STATE_WAITING_MEMORY = "waiting_memory"
@@ -640,8 +648,14 @@ def start_detached_run(
     *,
     grant_capabilities: Iterable[str] = (),
     actor: tr.ActorIdentity | None = None,
+    accept_binding: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Queue one recipe run as a detached host process and return at once."""
+    """Queue one recipe run as a detached host process and return at once.
+
+    ``accept_binding`` (``task_id``, ``request_id``, ``candidate_sha256``) is
+    stored in the status record and makes the child run the recipe on that
+    candidate's combined tree (NF-2026-01835).
+    """
     root = Path(repo_root)
     if not root.is_dir():
         raise RecipeRunError(
@@ -653,6 +667,18 @@ def start_detached_run(
     supplied = dict(params or {})
     granted = tuple(grant_capabilities)
     tr.validate_invocation(recipe, supplied, capabilities=granted)
+    bound: dict[str, str] | None = None
+    if accept_binding is not None:
+        keys = ("task_id", "request_id", "candidate_sha256")
+        if not isinstance(accept_binding, Mapping) or any(
+            not isinstance(accept_binding.get(key), str) or not accept_binding.get(key)
+            for key in keys
+        ):
+            raise RecipeRunError(
+                REASON_ACCEPT_BINDING_INCOMPLETE,
+                "accept_binding needs task_id, request_id and candidate_sha256",
+            )
+        bound = {key: accept_binding[key] for key in keys}
 
     run_id = uuid.uuid4().hex
     status_path = _status_path(root, run_id)
@@ -671,6 +697,8 @@ def start_detached_run(
         "status_path": str(status_path),
         "child_log_path": str(child_log_path),
     }
+    if bound is not None:
+        record["accept_binding"] = bound
     if actor is not None:
         record["actor"] = {
             "kind": actor.kind,
@@ -809,14 +837,25 @@ def _detached_main(argv: list[str]) -> int:
         _write_status(status_path, record)
         actor_fields = record.get("actor")
         actor = tr.ActorIdentity(**actor_fields) if actor_fields else None
-        digest = run_recipe(
-            root,
-            recipe,
-            record.get("params") or {},
-            grant_capabilities=tuple(record.get("grant_capabilities") or ()),
-            run_id=str(record["run_id"]),
-            actor=actor,
-        )
+        run_kwargs: dict[str, Any] = {
+            "grant_capabilities": tuple(record.get("grant_capabilities") or ()),
+            "run_id": str(record["run_id"]),
+            "actor": actor,
+        }
+        if "accept_binding" in record:
+            from . import accept_gate
+
+            digest = accept_gate.run_on_candidate_tree(
+                root,
+                record["accept_binding"],
+                lambda tree: run_recipe(
+                    root, recipe, record.get("params") or {}, cwd=tree, **run_kwargs
+                ),
+            )
+        else:
+            digest = run_recipe(
+                root, recipe, record.get("params") or {}, **run_kwargs
+            )
         record.update(
             state=DETACHED_STATE_COMPLETED, digest=digest, finished_at=_utcnow_iso()
         )

@@ -110,6 +110,13 @@ ACCEPT_BLOCKER_KINDS = (
     # from tests/test_module_size_ratchet.py, or could not be measured.
     "module_size_ratchet_exceeded",
     "module_size_ratchet_unreadable",
+    # The optional .aiworkhub/config/accept_gate.json policy demands a completed
+    # green detached recipe run bound to this exact candidate (NF-2026-01835).
+    "gate_policy_invalid",
+    "gate_receipt_missing",
+    "gate_receipt_pending",
+    "gate_receipt_stale",
+    "gate_receipt_red",
 )
 
 
@@ -121,6 +128,30 @@ def _blocker(kind: str, detail: str = "", **extra: Any) -> dict[str, Any]:
         "error": (f"{kind}:{detail}"[:400] if detail else str(kind)),
         **extra,
     }
+
+
+def accept_gate_blockers(
+    repo: Any, *, task_id: str, request_id: str, card: Any
+) -> list[dict[str, Any]]:
+    """The accept-gate blocker for this exact candidate, or nothing.
+
+    One definition for preview and accept, so both report the same kind. A
+    repository without ``.aiworkhub/config/accept_gate.json`` has no gate.
+    """
+    from . import accept_gate
+
+    gate = accept_gate.gate_blocker(
+        repo,
+        task_id=task_id,
+        request_id=request_id,
+        candidate_sha256=_target_candidate_sha256(card),
+    )
+    if gate is None:
+        return []
+    kind = str(gate["kind"])
+    error = str(gate["error"])
+    detail = error[len(kind) + 1 :] if error.startswith(f"{kind}:") else ""
+    return [_blocker(kind, detail)]
 
 
 def module_size_ratchet_blockers(
@@ -2359,6 +2390,11 @@ def accept_preview(self, request_id: str, task_id: str, **overrides: Any) -> dic
         )
     except (KeyError, TypeError, ValueError, AttributeError):
         pass
+    preview_blockers.extend(
+        accept_gate_blockers(
+            self.repo, task_id=task_id, request_id=request_id, card=card
+        )
+    )
     return {
         **result,
         "evaluated": True,
@@ -2464,6 +2500,7 @@ def _stale_inputs_touching_candidate(
 # global enters this body unannounced" -- and a name that belongs to neither
 # list is exactly the drift it exists to catch.
 ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
+    "accept_gate_blockers",
     "_accept_in_flight_marker",
     "_finalizer_validation_reuse",
     "_accept_manager_identity",
@@ -3658,6 +3695,11 @@ def accept_review(
             early_blockers.extend(
                 module_size_ratchet_blockers(
                     self.repo, workspace.path, changed, corrected_texts
+                )
+            )
+            early_blockers.extend(
+                accept_gate_blockers(
+                    self.repo, task_id=task_id, request_id=request_id, card=card
                 )
             )
             if early_blockers:
