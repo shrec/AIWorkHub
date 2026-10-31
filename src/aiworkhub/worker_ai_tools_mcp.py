@@ -3294,6 +3294,7 @@ def _resolve_symbol_selector(engine_fn, repo, selector: str, budget: int) -> dic
 
 def _selector_scoped_payload(
     engine_fn, repo, scope: str | None, bounded_query: str, budget: int,
+    path_scoped_fn=None,
 ) -> tuple[dict[str, Any], bool]:
     """Selector-first resolution for a symbol-selector mode.
 
@@ -3301,6 +3302,9 @@ def _selector_scoped_payload(
     symbol the resolved payload is returned and the path-prefix filter is
     skipped downstream; otherwise ``scope`` is a path scope, the free-text query
     is searched, and the existing prefix filter/rescue applies to the result.
+    ``path_scoped_fn(repo, query, budget, scope)`` lets an engine filter its
+    candidates by path prefix before limiting, so a path ``target`` still
+    reaches that file's definition when the name is defined in several files.
     """
 
     if scope is None:
@@ -3308,6 +3312,10 @@ def _selector_scoped_payload(
     resolved = _resolve_symbol_selector(engine_fn, repo, scope, budget)
     if _json_hit_count(resolved) > 0:
         return resolved, True
+    if path_scoped_fn is not None:
+        path_scoped = path_scoped_fn(repo, bounded_query, budget, scope)
+        if _json_hit_count(path_scoped) > 0:
+            return path_scoped, False
     return engine_fn(repo, bounded_query, budget), False
 
 
@@ -6115,6 +6123,9 @@ def source_graph_query(
             elif mode == "body":
                 payload, selector_resolved = _selector_scoped_payload(
                     _source_graph_mod.body_query, query_repo, scope, bounded_query, budget,
+                    path_scoped_fn=lambda repo, query, limit, prefix: (
+                        _source_graph_mod.body_query(repo, query, limit, path_prefix=prefix)
+                    ),
                 )
             elif mode == "bodygrep":
                 payload, resumed_fallback_step = _bodygrep_resume_page(

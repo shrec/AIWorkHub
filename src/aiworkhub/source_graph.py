@@ -5882,26 +5882,34 @@ def _bodygrep_query_page(
     return fitted
 
 
-def body_query(repo_root: Path, name: str, budget: int = 64) -> dict[str, Any]:
-    """Return the bounded body of one exact indexed symbol."""
+def body_query(
+    repo_root: Path, name: str, budget: int = 64, path_prefix: str | None = None,
+) -> dict[str, Any]:
+    """Return the bounded bodies of every exact indexed match of one symbol."""
 
     budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
     conn = connect(resolve_db_path(repo_root), read_only=True)
     try:
-        match = body(conn, repo_root, name)
+        matches, total = body_matches(conn, repo_root, name, budget, path_prefix)
     finally:
         conn.close()
-    matches = [match] if match else []
     # Top-level freshness is a scalar state; the indexed/on-disk hashes ride on
     # the match itself (``match["freshness"]``) inside the results container.
-    freshness = str(match["freshness"]["state"]) if match else "no_match"
-    return _fit_payload_bytes({
+    freshness = "no_match"
+    if matches:
+        states = [str(item["freshness"]["state"]) for item in matches]
+        freshness = next((state for state in states if state != "fresh"), "fresh")
+    payload: dict[str, Any] = {
         "mode": "body", "query": name, "budget": budget,
         "matches": matches,
-        "candidate_files": _candidate_files(matches, limit=1),
+        "candidate_files": _candidate_files(matches, limit=max(1, len(matches))),
         "freshness": freshness,
         "truncated": False,
-    }, max(512, budget * 512))
+    }
+    if total > 1:
+        payload["ambiguous_count"] = total
+        payload["ambiguous_truncated"] = total > len(matches)
+    return _fit_payload_bytes(payload, max(512, budget * 512))
 
 
 _FILE_LINE_RANGE_PATTERN = re.compile(r"^(?:L(\d+)-L(\d+)|(\d+)-(\d+)|(\d+):(\d+))$")
@@ -6470,19 +6478,59 @@ def _cpp_qualified_body_row(
     return None
 
 
-def body(conn: sqlite3.Connection, repo_root: Path, name: str) -> dict[str, Any] | None:
-    row = conn.execute(
+def _body_dotted_match(row: sqlite3.Row, name: str) -> bool:
+    """True when ``name`` (``Class.method``, ``stem.func``, ``path.symbol``) spells ``row``.
+
+    Python qualnames are ``<file>.<scope>.<symbol>``; a dotted selector matches
+    on whole ``.`` components, either as the qualname tail or as the
+    module-spelled qualname (file path without extension, ``/`` -> ``.``).
+    """
+
+    file_path = str(row["file_path"])
+    qualname = re.sub(r"~\d+$", "", str(row["qualname"] or ""))
+    if qualname == name or qualname.endswith("." + name):
+        return True
+    prefix = file_path + "."
+    if not qualname.startswith(prefix):
+        return False
+    stem_path, dot, _ext = file_path.rpartition(".")
+    module = (stem_path if dot and "/" not in _ext else file_path).replace("/", ".")
+    spelled = module + "." + qualname[len(prefix):]
+    return spelled == name or spelled.endswith("." + name)
+
+
+def _body_candidate_rows(
+    conn: sqlite3.Connection, name: str, path_prefix: str | None = None,
+) -> list[sqlite3.Row]:
+    """Every exact indexed definition of ``name``, filtered before any limit."""
+
+    last = name.rsplit(".", 1)[-1] if "." in name else name
+    rows = conn.execute(
         "SELECT file_path, kind, name, qualname, line_start, line_end, signature "
         "FROM entities WHERE kind IN " + _BODY_ENTITY_KINDS_SQL + " "
         "AND (name = ? OR qualname = ?) "
         "ORDER BY CASE WHEN qualname=? THEN 0 ELSE 1 END, "
-        "confidence DESC, file_path, line_start LIMIT 1",
-        (name, name, name),
-    ).fetchone()
-    if row is None and "::" in name:
-        row = _cpp_qualified_body_row(conn, name)
-    if row is None:
-        return None
+        "confidence DESC, file_path, line_start LIMIT ?",
+        (last, name, name, _BODY_QUALIFIED_CANDIDATE_CAP),
+    ).fetchall()
+    if "." in name:
+        rows = [row for row in rows if _body_dotted_match(row, name)]
+    if not rows and "::" in name:
+        cpp_row = _cpp_qualified_body_row(conn, name)
+        rows = [cpp_row] if cpp_row is not None else []
+    scope = (path_prefix or "").replace("\\", "/").strip("/")
+    if scope:
+        rows = [
+            row for row in rows
+            if str(row["file_path"]) == scope
+            or str(row["file_path"]).startswith(scope + "/")
+        ]
+    return rows
+
+
+def _body_materialize(
+    conn: sqlite3.Connection, repo_root: Path, row: sqlite3.Row,
+) -> dict[str, Any]:
     result = dict(row)
     include_roots = load_ignore_policy(repo_root).include_roots
     if include_roots and _under_include_root(str(result["file_path"]), include_roots):
@@ -6507,6 +6555,27 @@ def body(conn: sqlite3.Connection, repo_root: Path, name: str) -> dict[str, Any]
             snippet = ""
     result["source"] = snippet
     return result
+
+
+def body_matches(
+    conn: sqlite3.Connection,
+    repo_root: Path,
+    name: str,
+    limit: int = 1,
+    path_prefix: str | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Return up to ``limit`` exact matches and the total candidate count."""
+
+    rows = _body_candidate_rows(conn, name, path_prefix)
+    return (
+        [_body_materialize(conn, repo_root, row) for row in rows[:max(1, limit)]],
+        len(rows),
+    )
+
+
+def body(conn: sqlite3.Connection, repo_root: Path, name: str) -> dict[str, Any] | None:
+    matches, _total = body_matches(conn, repo_root, name, 1)
+    return matches[0] if matches else None
 
 
 def context(conn: sqlite3.Connection, file_path: str) -> dict[str, Any]:
