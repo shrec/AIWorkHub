@@ -46,8 +46,11 @@ returns immediately instead of self-deadlocking.
 
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 import sqlite3
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -75,6 +78,7 @@ __all__ = [
 DEFAULT_LEASE_TIMEOUT_S: float = 30.0
 
 _LOCK_SUFFIX = ".writer.lock"
+_HOLDER_SUFFIX = ".writer.holder.json"
 _POLL_SECONDS = 0.0005
 # Ceiling on the retry sleep. ``flock(LOCK_NB)`` gives no way to be woken when
 # the holder releases, so a waiter polls; a coarse ceiling shows up directly as
@@ -96,14 +100,28 @@ class WriteLeaseTimeout(WriteLeaseError):
     the lease would reintroduce exactly the race the lease exists to remove.
     """
 
-    def __init__(self, db_path: str, waited_s: float, timeout_s: float) -> None:
-        super().__init__(
+    def __init__(
+        self,
+        db_path: str,
+        waited_s: float,
+        timeout_s: float,
+        holder: dict | None = None,
+    ) -> None:
+        message = (
             f"write_lease_timeout:{Path(db_path).name}:"
             f"waited_ms={int(waited_s * 1000)}:timeout_ms={int(timeout_s * 1000)}"
         )
+        if holder:
+            held_ms = int((time.time() - float(holder["acquired_at_epoch"])) * 1000)
+            message += (
+                f":holder_pid={holder['pid']}:held_ms={held_ms}"
+                f":callsite={holder.get('callsite', 'unknown')}"
+            )
+        super().__init__(message)
         self.db_path = str(db_path)
         self.waited_s = float(waited_s)
         self.timeout_s = float(timeout_s)
+        self.holder = holder or None
         self.retryable = True
 # --------------------------------------------------------------------------
 # Platform backend
@@ -143,6 +161,66 @@ def _unlock(fd: int) -> None:
         platform_io.unlock_fd(fd)
     except OSError:
         pass
+
+
+def holder_path_for(db_path: str | Path) -> Path:
+    """Sidecar naming the process that currently holds the lease for ``db_path``."""
+    path = Path(db_path)
+    return path.with_name(path.name + _HOLDER_SUFFIX)
+
+
+def _holder_callsite() -> str:
+    """``module:function:line`` of the first caller frame outside this module."""
+    skip = {os.path.normcase(__file__), os.path.normcase(contextlib.__file__)}
+    frame = sys._getframe(1)
+    while frame is not None:
+        if os.path.normcase(frame.f_code.co_filename) not in skip:
+            module = str(frame.f_globals.get("__name__", "?"))
+            return f"{module}:{frame.f_code.co_name}:{frame.f_lineno}"
+        frame = frame.f_back
+    return "unknown"
+
+
+def _record_holder(db_path: str | Path) -> None:
+    """Best-effort: name this process in the holder sidecar. Never fails a lease."""
+    target = holder_path_for(db_path)
+    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+    try:
+        payload = {
+            "pid": os.getpid(),
+            "thread": threading.current_thread().name,
+            "acquired_at_epoch": time.time(),
+            "callsite": _holder_callsite(),
+        }
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _clear_holder(db_path: str | Path) -> None:
+    try:
+        holder_path_for(db_path).unlink()
+    except OSError:
+        pass
+
+
+def _read_holder(db_path: str | Path) -> dict[str, Any] | None:
+    """Best-effort read of the holder sidecar; any problem yields ``None``."""
+    try:
+        data = json.loads(holder_path_for(db_path).read_text(encoding="utf-8"))
+        if (
+            isinstance(data, dict)
+            and isinstance(data.get("pid"), int)
+            and isinstance(data.get("acquired_at_epoch"), (int, float))
+        ):
+            return data
+    except Exception:  # noqa: BLE001 -- best-effort diagnostics must never mask WriteLeaseTimeout
+        pass
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -338,7 +416,9 @@ def write_lease(
     if not in_process.acquire(timeout=remaining if bounded_timeout else 0.0):
         waited = time.monotonic() - started
         _record("timeouts", 1.0)
-        raise WriteLeaseTimeout(str(db_path), waited, bounded_timeout)
+        raise WriteLeaseTimeout(
+            str(db_path), waited, bounded_timeout, holder=_read_holder(db_path)
+        )
 
     lock_file = lock_path_for(db_path)
     flocked = False
@@ -355,11 +435,14 @@ def write_lease(
         while True:
             if _try_lock(fd):
                 flocked = True
+                _record_holder(db_path)
                 break
             if time.monotonic() >= deadline:
                 waited = time.monotonic() - started
                 _record("timeouts", 1.0)
-                raise WriteLeaseTimeout(str(db_path), waited, bounded_timeout)
+                raise WriteLeaseTimeout(
+                    str(db_path), waited, bounded_timeout, holder=_read_holder(db_path)
+                )
             time.sleep(min(backoff, max(0.0, deadline - time.monotonic())))
             backoff = min(backoff * 2.0, _POLL_MAX_SECONDS)
 
@@ -385,6 +468,7 @@ def write_lease(
         # actually took. Releasing on a bare ``Lock.locked()`` check would drop
         # a lock a *different* thread had since acquired.
         if flocked:
+            _clear_holder(db_path)
             _unlock(fd)
         in_process.release()
 
