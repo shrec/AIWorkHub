@@ -324,6 +324,7 @@ def run_recipe(
     persist_receipt: bool = True,
     actor: tr.ActorIdentity | None = None,
     cwd: Path | None = None,
+    memory_budget_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Validate, execute and receipt one recipe invocation.
 
@@ -398,19 +399,33 @@ def run_recipe(
     returncode: int | None = None
     stdout_text = ""
     stderr_text = ""
+    memory_budget_hit = False
     try:
-        completed = subprocess.run(  # noqa: S603 - execve vector, shell=False, fixed argv[0]
-            argv,
-            cwd=str(run_cwd),
-            env=env,
-            shell=False,
-            capture_output=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
-        returncode = int(completed.returncode)
-        stdout_text = _decode(completed.stdout)
-        stderr_text = _decode(completed.stderr)
+        if memory_budget_bytes is None:
+            completed = subprocess.run(  # noqa: S603 - execve vector, shell=False, fixed argv[0]
+                argv,
+                cwd=str(run_cwd),
+                env=env,
+                shell=False,
+                capture_output=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+            returncode = int(completed.returncode)
+            stdout_text = _decode(completed.stdout)
+            stderr_text = _decode(completed.stderr)
+        else:
+            budgeted = platform_io.run_with_memory_limit(
+                argv,
+                cwd=run_cwd,
+                env=env,
+                memory_limit_bytes=memory_budget_bytes,
+                timeout=timeout_seconds,
+            )
+            returncode = budgeted.returncode
+            stdout_text = _decode(budgeted.stdout)
+            stderr_text = _decode(budgeted.stderr)
+            memory_budget_hit = budgeted.limit_hit
     except subprocess.TimeoutExpired as exc:
         timed_out = True
         stdout_text = _decode(exc.stdout)
@@ -424,6 +439,8 @@ def run_recipe(
         exit_status = tr.EXIT_STATUS_SPAWN_FAILED
     elif timed_out:
         exit_status = tr.EXIT_STATUS_TIMEOUT
+    elif memory_budget_hit:
+        exit_status = tr.EXIT_STATUS_MEMORY_BUDGET_EXCEEDED
     else:
         exit_status = tr.EXIT_STATUS_COMPLETED
 
@@ -849,10 +866,20 @@ def _detached_main(argv: list[str]) -> int:
         _write_status(status_path, record)
         actor_fields = record.get("actor")
         actor = tr.ActorIdentity(**actor_fields) if actor_fields else None
+        # ResourceBounds accepts max_memory_mb=0 ("not declared"); a zero
+        # budget would refuse the spawn, so it takes the host share instead.
+        if max_memory_mb:
+            memory_budget_bytes: int | None = int(max_memory_mb * 1024 * 1024)
+        else:
+            total_memory = platform_io.total_memory_bytes()
+            memory_budget_bytes = (
+                total_memory // host_slot_count if total_memory else None
+            )
         run_kwargs: dict[str, Any] = {
             "grant_capabilities": tuple(record.get("grant_capabilities") or ()),
             "run_id": str(record["run_id"]),
             "actor": actor,
+            "memory_budget_bytes": memory_budget_bytes,
         }
         if "accept_binding" in record:
             from . import accept_gate

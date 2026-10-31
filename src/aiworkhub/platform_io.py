@@ -622,47 +622,9 @@ def available_memory_bytes(platform_name: str | None = None) -> int | None:
     """Return host-available physical memory, or ``None`` when it cannot be measured."""
 
     if is_linux(platform_name):
-        try:
-            with open("/proc/meminfo", encoding="ascii") as handle:
-                for line in handle:
-                    if line.startswith("MemAvailable:"):
-                        parts = line.split()
-                        if len(parts) == 3 and parts[2] == "kB":
-                            value = int(parts[1]) * 1024
-                            return value if value >= 0 else None
-                        return None
-            return None
-        except (OSError, UnicodeError, ValueError):
-            return None
+        return _linux_meminfo_bytes("MemAvailable:")
     if is_windows(platform_name):
-
-        class _MemoryStatus(ctypes.Structure):
-            _fields_ = [
-                ("length", ctypes.c_ulong),
-                ("memory_load", ctypes.c_ulong),
-                ("total_physical", ctypes.c_ulonglong),
-                ("available_physical", ctypes.c_ulonglong),
-                ("total_page_file", ctypes.c_ulonglong),
-                ("available_page_file", ctypes.c_ulonglong),
-                ("total_virtual", ctypes.c_ulonglong),
-                ("available_virtual", ctypes.c_ulonglong),
-                ("available_extended_virtual", ctypes.c_ulonglong),
-            ]
-
-        try:
-            status = _MemoryStatus()
-            status.length = ctypes.sizeof(status)
-            # argtypes/restype are set explicitly, as every other ctypes entry
-            # point in this module does: without them ctypes guesses a 32-bit
-            # int for both the pointer argument and the BOOL return.
-            global_memory_status = ctypes.windll.kernel32.GlobalMemoryStatusEx
-            global_memory_status.argtypes = (ctypes.POINTER(_MemoryStatus),)
-            global_memory_status.restype = ctypes.c_int
-            if not global_memory_status(ctypes.byref(status)):
-                return None
-            return int(status.available_physical)
-        except (AttributeError, OSError, ValueError):
-            return None
+        return _windows_memory_status("available_physical")
     try:
         pages = int(os.sysconf("SC_AVPHYS_PAGES"))
         page_size = int(os.sysconf("SC_PAGE_SIZE"))
@@ -670,6 +632,245 @@ def available_memory_bytes(platform_name: str | None = None) -> int | None:
         return available if pages >= 0 and page_size > 0 else None
     except (AttributeError, OSError, TypeError, ValueError):
         return None
+
+
+def total_memory_bytes(platform_name: str | None = None) -> int | None:
+    """Return host physical memory, or ``None`` when it cannot be measured."""
+
+    if is_linux(platform_name):
+        return _linux_meminfo_bytes("MemTotal:")
+    if is_windows(platform_name):
+        return _windows_memory_status("total_physical")
+    try:
+        pages = int(os.sysconf("SC_PHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        total = pages * page_size
+        return total if pages > 0 and page_size > 0 else None
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _linux_meminfo_bytes(key: str) -> int | None:
+    try:
+        with open("/proc/meminfo", encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith(key):
+                    parts = line.split()
+                    if len(parts) == 3 and parts[2] == "kB":
+                        value = int(parts[1]) * 1024
+                        return value if value >= 0 else None
+                    return None
+        return None
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
+class _WindowsMemoryStatus(ctypes.Structure):
+    _fields_ = [
+        ("length", ctypes.c_ulong),
+        ("memory_load", ctypes.c_ulong),
+        ("total_physical", ctypes.c_ulonglong),
+        ("available_physical", ctypes.c_ulonglong),
+        ("total_page_file", ctypes.c_ulonglong),
+        ("available_page_file", ctypes.c_ulonglong),
+        ("total_virtual", ctypes.c_ulonglong),
+        ("available_virtual", ctypes.c_ulonglong),
+        ("available_extended_virtual", ctypes.c_ulonglong),
+    ]
+
+
+def _windows_memory_status(field: str) -> int | None:
+    try:
+        status = _WindowsMemoryStatus()
+        status.length = ctypes.sizeof(status)
+        # argtypes/restype are set explicitly, as every other ctypes entry
+        # point in this module does: without them ctypes guesses a 32-bit
+        # int for both the pointer argument and the BOOL return.
+        global_memory_status = ctypes.windll.kernel32.GlobalMemoryStatusEx  # type: ignore[attr-defined]
+        global_memory_status.argtypes = (ctypes.POINTER(_WindowsMemoryStatus),)
+        global_memory_status.restype = ctypes.c_int
+        if not global_memory_status(ctypes.byref(status)):
+            return None
+        return int(getattr(status, field))
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+class MemoryLimitedRun(NamedTuple):
+    """A finished child run under a memory limit and whether the limit was hit."""
+
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    limit_hit: bool
+
+
+_JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
+_POSIX_MEMORY_LIMIT_MARKERS = (b"MemoryError", b"Cannot allocate memory")
+
+
+def run_with_memory_limit(
+    argv: list[str],
+    *,
+    cwd: str | os.PathLike[str],
+    env: Mapping[str, str],
+    memory_limit_bytes: int,
+    timeout: float | None,
+    platform_name: str | None = None,
+) -> MemoryLimitedRun:
+    """Run ``argv`` capturing output under a memory limit; raise like ``subprocess.run``.
+
+    ``subprocess.TimeoutExpired`` and ``OSError`` propagate exactly as they do
+    from ``subprocess.run`` so the caller keeps one timeout/spawn-failure path.
+    """
+
+    if memory_limit_bytes <= 0:
+        raise ValueError("memory_limit_bytes must be positive")
+    if is_windows(platform_name):
+        return _run_under_windows_job(argv, cwd, env, memory_limit_bytes, timeout)
+    return _run_under_rlimit(argv, cwd, env, memory_limit_bytes, timeout)
+
+
+def _run_under_windows_job(
+    argv: list[str],
+    cwd: str | os.PathLike[str],
+    env: Mapping[str, str],
+    limit: int,
+    timeout: float | None,
+) -> MemoryLimitedRun:
+    try:
+        from .windows_job_structures import JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    except ImportError:  # direct-file loading used by platform regression tests
+        from windows_job_structures import (  # type: ignore[no-redef]
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+    kernel32.SetInformationJobObject.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32,
+    ]
+    kernel32.SetInformationJobObject.restype = ctypes.c_int
+    kernel32.QueryInformationJobObject.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p,
+    ]
+    kernel32.QueryInformationJobObject.restype = ctypes.c_int
+    kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+    kernel32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.TerminateJobObject.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+    try:
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = (
+            _JOB_OBJECT_LIMIT_JOB_MEMORY | _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        )
+        info.JobMemoryLimit = limit
+        if not kernel32.SetInformationJobObject(
+            job,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+        # ponytail: the child runs unconfined between Popen and
+        # AssignProcessToJobObject (microseconds, before it can allocate much);
+        # spawn with CREATE_SUSPENDED and resume after the assign if a child
+        # ever outruns that window.
+        with subprocess.Popen(  # noqa: S603 - execve vector, shell=False
+            argv,
+            cwd=str(cwd),
+            env=dict(env),
+            shell=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ) as child:
+            try:
+                if not kernel32.AssignProcessToJobObject(
+                    job, int(child._handle)  # type: ignore[attr-defined]
+                ):
+                    raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+                try:
+                    stdout, stderr = child.communicate(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    kernel32.TerminateJobObject(job, 1)
+                    stdout, stderr = child.communicate()
+                    raise subprocess.TimeoutExpired(
+                        argv, timeout if timeout is not None else 0.0,
+                        output=stdout, stderr=stderr,
+                    ) from None
+            except BaseException:
+                child.kill()
+                raise
+        # Measured on Windows: a refused commit surfaces in the child as an
+        # ordinary allocation failure, JobObjectLimitViolationInformation stays
+        # empty, but PeakJobMemoryUsed records the attempted commit above the
+        # limit while an in-budget run peaks below it.
+        usage = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        queried = kernel32.QueryInformationJobObject(
+            job,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+            ctypes.byref(usage),
+            ctypes.sizeof(usage),
+            None,
+        )
+        # A child that survives its refused commit (catches MemoryError, exits
+        # 0) still leaves the peak above the limit; only a failed run counts.
+        limit_hit = (
+            child.returncode != 0
+            and bool(queried)
+            and int(usage.PeakJobMemoryUsed) > limit
+        )
+        return MemoryLimitedRun(int(child.returncode), stdout, stderr, limit_hit)
+    finally:
+        kernel32.CloseHandle(job)
+
+
+def _run_under_rlimit(
+    argv: list[str],
+    cwd: str | os.PathLike[str],
+    env: Mapping[str, str],
+    limit: int,
+    timeout: float | None,
+) -> MemoryLimitedRun:
+    resource = importlib.import_module("resource")
+
+    def _apply_limit() -> None:
+        # An unprivileged child may lower but never raise its inherited hard
+        # limit; asking for more fails setrlimit and aborts the spawn.
+        _soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        capped = limit if hard == resource.RLIM_INFINITY else min(limit, hard)
+        resource.setrlimit(resource.RLIMIT_AS, (capped, capped))
+
+    completed = subprocess.run(  # noqa: S603 - execve vector, shell=False
+        argv,
+        cwd=str(cwd),
+        env=dict(env),
+        shell=False,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+        preexec_fn=_apply_limit,  # noqa: PLW1509 - RLIMIT_AS must be set in the child before exec
+    )
+    # ponytail: RLIMIT_AS gives no limit-hit signal, so this is a heuristic -- a
+    # non-zero exit whose stderr carries a MemoryError / "Cannot allocate
+    # memory" marker. A child that swallows the failure, exits 0, or prints
+    # neither marker is reported as an ordinary run, and a child that prints
+    # the marker for an unrelated reason is misclassified.
+    limit_hit = completed.returncode != 0 and any(
+        marker in completed.stderr for marker in _POSIX_MEMORY_LIMIT_MARKERS
+    )
+    return MemoryLimitedRun(
+        int(completed.returncode), completed.stdout, completed.stderr, limit_hit
+    )
 
 
 def process_memory_bytes() -> dict[str, int | None]:
