@@ -3512,6 +3512,7 @@ CITATION_DRIFT_MAX_ROWS = 200
 CITATION_DRIFT_GIT_TIMEOUT_SECONDS = 15
 CITATION_DRIFT_STATUS_MOVED = "moved"
 CITATION_DRIFT_STATUS_TARGET_CHANGED = "target_changed"
+CITATION_DRIFT_STATUS_SYMBOL_MISSING = "symbol_missing"
 
 
 def _citation_line_map(before: str, after: str) -> dict[int, int]:
@@ -3539,22 +3540,101 @@ def _read_bounded_text(path: Path) -> str | None:
         return None
 
 
+def _python_symbol_spans(source: str) -> dict[str, tuple[int, int]] | None:
+    """Map dotted ``Class.method`` qualnames to their (first, last) line span."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    spans: dict[str, tuple[int, int]] = {}
+
+    def visit(node: ast.AST, prefix: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if not isinstance(child, ast.stmt):
+                continue
+            if isinstance(child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                qualname = prefix + child.name
+                first = min([child.lineno, *(d.lineno for d in child.decorator_list)])
+                spans.setdefault(qualname, (first, child.end_lineno or child.lineno))
+                visit(child, qualname + ".")
+            else:
+                visit(child, prefix)
+
+    try:
+        visit(tree, "")
+    except RecursionError:
+        return None
+    return spans
+
+
+def _enclosing_qualname(spans: dict[str, tuple[int, int]], line: int) -> str | None:
+    best: tuple[int, int, str] | None = None
+    for qualname, (first, last) in spans.items():
+        if first <= line <= last and (
+            best is None or (first, -last) > (best[0], -best[1])
+        ):
+            best = (first, last, qualname)
+    return best[2] if best else None
+
+
+_CITATION_SYMBOL_PATTERN = r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*"
+
+
+def _symbol_citation_row(
+    doc: str,
+    doc_line: int,
+    match: re.Match[str],
+    relative: str,
+    before_spans: dict[str, tuple[int, int]],
+    after_spans: dict[str, tuple[int, int]],
+) -> dict[str, Any] | None:
+    qualname = match.group(1)
+    start = int(match.group(2)) if match.group(2) else None
+    end = int(match.group(3)) if match.group(3) else None
+    span = after_spans.get(qualname)
+    if span is None:
+        if qualname not in before_spans:
+            return None
+        status = CITATION_DRIFT_STATUS_SYMBOL_MISSING
+        replacement = None
+    else:
+        given = [number for number in (start, end) if number is not None]
+        if all(span[0] <= number <= span[1] for number in given):
+            return None
+        status = CITATION_DRIFT_STATUS_MOVED
+        replacement = f"{relative}::{qualname}"
+    return {
+        "doc": doc,
+        "doc_line": doc_line,
+        "citation": match.group(0),
+        "target_path": relative,
+        "old_line": start,
+        "new_line": None,
+        "replacement": replacement,
+        "status": status,
+    }
+
+
 def run_citation_drift_checks(
     baseline_root: Path | str,
     candidate_root: Path | str,
     *,
     changed_paths: Iterable[str],
 ) -> list[dict[str, Any]]:
-    """Report Markdown ``path:line`` citations that a candidate edit left stale.
+    """Report Markdown ``path:line`` and ``path::Qual.name`` citations a candidate edit left stale.
 
-    Advisory only: rows never feed a verdict. A moved citation carries the
+    Advisory only: rows never feed a verdict. A moved line citation carries the
     renumbered ``replacement``; a citation whose target line was rewritten is
-    ``target_changed`` and has none.
+    ``target_changed`` and has none. Line-citation rows for ``.py`` targets also
+    carry ``suggested_citation`` (the non-rotting ``path::qualname`` form).
+    A symbol citation only produces a row when the symbol vanished
+    (``symbol_missing``) or a given line left its span (``moved``).
     """
     baseline = Path(baseline_root)
     candidate = Path(candidate_root)
     changed = sorted({str(path).replace("\\", "/") for path in changed_paths})
     line_maps: dict[str, dict[int, int]] = {}
+    py_spans: dict[str, tuple[Any, Any]] = {}
     for relative in changed[:MAX_AFFECTED_PATHS]:
         if not relative or relative.lower().endswith(".md"):
             continue
@@ -3563,6 +3643,8 @@ def run_citation_drift_checks(
         if before is None or after is None:
             continue
         line_maps[relative] = _citation_line_map(before, after)
+        if relative.lower().endswith(".py"):
+            py_spans[relative] = (_python_symbol_spans(before), _python_symbol_spans(after))
     if not line_maps:
         return []
     try:
@@ -3588,6 +3670,17 @@ def run_citation_drift_checks(
         )
         for relative in line_maps
     }
+    symbol_patterns = {
+        relative: re.compile(
+            r"(?<![\w./\\-])"
+            + re.escape(relative)
+            + r"::("
+            + _CITATION_SYMBOL_PATTERN
+            + r")(?::(\d+)(?:-(\d+))?(?!\d))?"
+        )
+        for relative, (before_spans, after_spans) in py_spans.items()
+        if before_spans is not None and after_spans is not None
+    }
     rows: list[dict[str, Any]] = []
     for doc in docs:
         text = _read_bounded_text(candidate / doc)
@@ -3599,6 +3692,8 @@ def run_citation_drift_checks(
         for doc_line, line in enumerate(text.split("\n"), start=1):
             for relative in active:
                 mapping = line_maps[relative]
+                is_python = relative in py_spans
+                old_spans = py_spans[relative][0] if is_python else None
                 for match in patterns[relative].finditer(line):
                     old_start = int(match.group(1))
                     old_end = int(match.group(2)) if match.group(2) else None
@@ -3616,6 +3711,15 @@ def run_citation_drift_checks(
                         "replacement": None,
                         "status": CITATION_DRIFT_STATUS_TARGET_CHANGED,
                     }
+                    if is_python:
+                        enclosing = (
+                            _enclosing_qualname(old_spans, old_start)
+                            if old_spans is not None
+                            else None
+                        )
+                        row["suggested_citation"] = (
+                            f"{relative}::{enclosing}" if enclosing else None
+                        )
                     if new_start is not None and (old_end is None or new_end is not None):
                         if new_start == old_start and (old_end is None or new_end == old_end):
                             continue
@@ -3626,6 +3730,18 @@ def run_citation_drift_checks(
                             else f"{relative}:{new_start}-{new_end}"
                         )
                     rows.append(row)
+                    if len(rows) >= CITATION_DRIFT_MAX_ROWS:
+                        return rows
+                if relative not in symbol_patterns:
+                    continue
+                before_spans, after_spans = py_spans[relative]
+                for match in symbol_patterns[relative].finditer(line):
+                    symbol_row = _symbol_citation_row(
+                        doc, doc_line, match, relative, before_spans, after_spans
+                    )
+                    if symbol_row is None:
+                        continue
+                    rows.append(symbol_row)
                     if len(rows) >= CITATION_DRIFT_MAX_ROWS:
                         return rows
     return rows
