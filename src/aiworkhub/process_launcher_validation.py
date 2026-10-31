@@ -8,7 +8,7 @@ import re
 import sys
 import uuid
 from collections import Counter
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from threading import Lock
 from typing import Any, Callable, Iterable, Mapping
 
@@ -583,18 +583,43 @@ def _stamp_signatures(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
+def _union2_worktree_exists(root: Path, recorded: str) -> bool:
+    """Map a union2_*/worktree/<tail> sibling checkout path onto ``root``."""
+    parts = PureWindowsPath(recorded).parts
+    for index in range(len(parts) - 1):
+        if (
+            parts[index].lower().startswith("union2_")
+            and parts[index + 1].lower() == "worktree"
+        ):
+            rest = parts[index + 2 :]
+            if not rest or any(
+                part == ".." or PureWindowsPath(part).drive or PureWindowsPath(part).root
+                for part in rest
+            ):
+                return False
+            candidate = root.joinpath(*rest)
+            try:
+                candidate.relative_to(root)
+            except ValueError:
+                return False
+            return candidate.exists()
+    return False
+
+
 def _workspace_path_exists(workspace: WorkerWorkspace, recorded: str) -> bool:
     """Whether ``recorded`` names an existing path inside this worktree."""
     root = Path(workspace.path)
     path = Path(recorded)
     if not path.is_absolute():
+        if PureWindowsPath(recorded).is_absolute():
+            return _union2_worktree_exists(root, recorded)
         path = root / path
     if ".." in path.parts:
         return False
     try:
         path.relative_to(root)
     except ValueError:
-        return False
+        return _union2_worktree_exists(root, recorded)
     return path.exists()
 
 
