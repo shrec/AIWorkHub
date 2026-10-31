@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from aiworkhub import platform_io, process_launcher, terminal_authority
+from aiworkhub import (
+    platform_io,
+    process_launcher,
+    terminal_authority,
+    windows_appcontainer,
+)
 
 
 def test_windows_accepts_acl_protected_key_without_posix_0600(tmp_path: Path) -> None:
@@ -34,6 +39,17 @@ def test_invalid_existing_key_fails_bounded_without_recursion(tmp_path: Path) ->
 
 def test_new_key_is_exactly_32_bytes(tmp_path: Path) -> None:
     key_path = tmp_path / "authority.key"
+
+    if windows_appcontainer.current_process_is_appcontainer():
+        # Measured: an AppContainer token is denied WRITE_DAC (error 5) on the
+        # key it just created, so creation must refuse by name and leave nothing.
+        with pytest.raises(
+            RuntimeError, match=r"terminal_authority_key_dacl_hardening_failed:\S+"
+        ):
+            terminal_authority.load_or_create_key(key_path)
+
+        assert not key_path.exists()
+        return
 
     key = terminal_authority.load_or_create_key(key_path)
 
