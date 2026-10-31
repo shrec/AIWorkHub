@@ -47,7 +47,7 @@ _WRITE_PROBE = "aiworkhub_task_mark_done"
 # plus aiworkhub_manager_recipe_run_status (NF-2026-01849).
 _PRE_TABLE_ALL_COUNT = 227
 _PRE_TABLE_ALL_READ_ONLY_COUNT = 223
-_LISTED_COUNTS = {"manager": 181, "worker": 19, "dashboard": 67}
+_LISTED_COUNTS = {"manager": 129, "worker": 19, "dashboard": 67}
 # The 45 webview-only dashboard tools the pre-table manager surface hid.
 _PRE_TABLE_MANAGER_HIDDEN = frozenset({
     "aiworkhub_dashboard_task_detail",
@@ -201,6 +201,13 @@ def _profile_names(profile: str) -> set:
     return {name for name, entry in mcp_tool_metadata.MCP_TOOL_PROFILES.items() if profile in entry}
 
 
+_UNLISTED = frozenset(
+    name
+    for name, entry in mcp_tool_metadata.MCP_TOOL_PROFILES.items()
+    if entry.get(mcp_tool_metadata.MCP_PROFILE_MANAGER) == mcp_tool_metadata.MCP_VISIBILITY_CALLABLE
+)
+
+
 def _listed_names(profile: str) -> set:
     return {
         name
@@ -273,7 +280,8 @@ def test_profile_table_is_one_literal_and_the_module_scans_nothing() -> None:
     keys = [key.value for key in table.keys if isinstance(key, ast.Constant) and isinstance(key.value, str)]
     assert len(keys) == len(table.keys) == len(set(keys)) == len(mcp_tool_metadata.MCP_TOOL_PROFILES)
     assert {getattr(value, "id", None) for value in table.values} <= {
-        "_MANAGER", "_MANAGER_CALLABLE", "_DASHBOARD", "_MANAGER_DASHBOARD", "_WORKER",
+        "_MANAGER", "_MANAGER_CALLABLE", "_DASHBOARD", "_MANAGER_DASHBOARD",
+        "_MANAGER_CALLABLE_DASHBOARD", "_WORKER",
     }
     module_imports = set()
     for node in ast.parse(_METADATA_PY.read_text(encoding="utf-8")).body:
@@ -328,12 +336,12 @@ def test_default_surface_still_refuses_write_tools_without_allow_writes(runs: di
     }
 
 
-def test_manager_lists_the_pre_table_manager_tools_minus_the_callable_aliases(runs: dict) -> None:
+def test_manager_lists_the_pre_table_manager_tools_minus_the_callable_only_tools(runs: dict) -> None:
     full, manager = runs["all"]["listed"], runs["manager"]
     assert manager["surface"] == "manager"
     manager_visible = [name for name in full if _pre_table_manager_rule(name)]
     assert manager["registered"] == manager_visible
-    assert manager["listed"] == [name for name in manager_visible if name not in mcp_tool_metadata.MCP_TOOL_ALIASES]
+    assert manager["listed"] == [name for name in manager_visible if name not in _UNLISTED]
     assert {name for name in full if not _pre_table_manager_rule(name)} == _PRE_TABLE_MANAGER_HIDDEN
     assert _profile_names("manager") == set(full) - _PRE_TABLE_MANAGER_HIDDEN
     assert {name for name in _profile_names("manager") if name.startswith(_DASHBOARD)} == set(
@@ -564,8 +572,10 @@ def test_alias_description_carries_the_deprecation_prefix() -> None:
         cleaned, _ = mcp_tool_metadata.split_docstring(function.__doc__)
         _args, kwargs, _signature = mcp_tool_metadata.prepare_registration(function, (alias,), {})
         assert kwargs["description"] == _ALIAS_DESCRIPTION_PREFIX.format(canonical=canonical) + cleaned
-        annotations = kwargs.get("annotations")
-        assert annotations.readOnlyHint is True
+        _canonical_args, canonical_kwargs, _canonical_signature = mcp_tool_metadata.prepare_registration(
+            getattr(server, canonical), (canonical,), {}
+        )
+        assert kwargs["annotations"].readOnlyHint == canonical_kwargs["annotations"].readOnlyHint
 
 
 def test_every_tool_named_in_the_manager_banner_is_listed_on_manager() -> None:

@@ -226,17 +226,24 @@ def test_stdlib_backend_can_be_selected_even_when_sdk_is_installed() -> None:
 
 def test_manager_archive_and_supersede_tools_are_write_gated(monkeypatch) -> None:
     monkeypatch.setattr(server.core, "writes_allowed", lambda: False)
-
-    def unexpected_archive(*args, **kwargs):
-        raise AssertionError("archive_task must not run while the write gate is closed")
-
-    monkeypatch.setattr(server.task_engine, "archive_task", unexpected_archive)
+    monkeypatch.setattr(
+        server.core,
+        "_live_card",
+        lambda task_id: ({"task_id": task_id, "topic": "t", "status": "review"}, None),
+    )
+    writes: list[str] = []
+    monkeypatch.setattr(
+        server.task_store,
+        "archive_task",
+        lambda *args, **kwargs: writes.append("archive") or (True, "archived"),
+    )
 
     archive = server.aiworkhub_manager_task_archive("TASK_B891", reason="done")
     supersede = server.aiworkhub_manager_task_supersede("TASK_B891", reason="orphan")
 
-    assert archive == {"ok": False, "error": "write_gate_closed", "task_id": "TASK_B891"}
-    assert supersede == {"ok": False, "error": "write_gate_closed", "task_id": "TASK_B891"}
+    assert archive["ok"] is False
+    assert supersede["ok"] is False
+    assert writes == []
 
 
 def test_manager_archive_and_supersede_use_verified_manager_actor(
@@ -244,33 +251,39 @@ def test_manager_archive_and_supersede_use_verified_manager_actor(
 ) -> None:
     calls: list[dict] = []
     expected_calls: list[dict] = []
-    monkeypatch.setattr(server.core, "writes_allowed", lambda: True)
     monkeypatch.setattr(server.core, "repo_root", lambda: tmp_path)
-    monkeypatch.setattr(server.core, "CODEX_RUNNER", "unexpected-direct-runner")
+    monkeypatch.setattr(
+        server.core,
+        "_live_card",
+        lambda task_id: ({"task_id": task_id, "topic": "t", "status": "review"}, None),
+    )
+    monkeypatch.setattr(server.core, "_canonical_write_gate", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server.core, "_reconcile_retained_workspaces", lambda result: result)
+    monkeypatch.setattr(server.core, "_rebind_superseded_needfix", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server.task_store, "get_task", lambda repo, task_id: None)
 
-    def fake_archive(repo, task_id, *, actor, reason="", supersede=False):
+    def fake_archive(repo, task_id, *, actor, reason="", operation="", allow_processing=False, superseded_by=""):
         calls.append(
             {
                 "repo": repo,
                 "task_id": task_id,
                 "actor": actor,
                 "reason": reason,
-                "supersede": supersede,
+                "operation": operation,
+                "allow_processing": allow_processing,
+                "superseded_by": superseded_by,
             }
         )
-        return {"ok": True, "returncode": 0}
+        return True, operation
 
-    monkeypatch.setattr(server.task_engine, "archive_task", fake_archive)
+    monkeypatch.setattr(server.task_store, "archive_task", fake_archive)
 
     for actor in ("claude", "codex"):
         monkeypatch.setattr(server.core, "_verified_manager_actor", lambda: actor)
         archive_task_id = f"TASK_ARCHIVE_{actor.upper()}"
         supersede_task_id = f"TASK_SUPERSEDE_{actor.upper()}"
         assert server.aiworkhub_manager_task_archive(archive_task_id, reason="done")["ok"] is True
-        assert (
-            server.aiworkhub_manager_task_supersede(supersede_task_id, reason="orphan")["ok"]
-            is True
-        )
+        assert server.aiworkhub_manager_task_supersede(supersede_task_id, reason="orphan")["ok"] is True
         expected_calls.extend(
             [
                 {
@@ -278,14 +291,18 @@ def test_manager_archive_and_supersede_use_verified_manager_actor(
                     "task_id": archive_task_id,
                     "actor": actor,
                     "reason": "done",
-                    "supersede": False,
+                    "operation": "archived",
+                    "allow_processing": False,
+                    "superseded_by": "",
                 },
                 {
                     "repo": tmp_path,
                     "task_id": supersede_task_id,
                     "actor": actor,
                     "reason": "orphan",
-                    "supersede": True,
+                    "operation": "superseded",
+                    "allow_processing": True,
+                    "superseded_by": "",
                 },
             ]
         )

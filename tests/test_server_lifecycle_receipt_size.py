@@ -169,6 +169,7 @@ def _bind_repo(monkeypatch, tmp_path: Path, db_path: Path) -> None:
     monkeypatch.setattr(server.task_store, "_require_ready", lambda repo: (readiness, db_path))
     monkeypatch.setattr(server.task_store, "storage_readiness", lambda repo: readiness)
     monkeypatch.setattr(server.core, "writes_allowed", lambda: True)
+    monkeypatch.setattr(server.core, "_canonical_write_gate", lambda *args, **kwargs: None)
     monkeypatch.setattr(server.core, "_verified_manager_actor", lambda: "codex")
 
 

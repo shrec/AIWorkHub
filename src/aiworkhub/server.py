@@ -4852,27 +4852,15 @@ def aiworkhub_manager_task_archive(
         dry_run: Set true to list the exact ids that would be archived, and the processing cards that would be refused, without writing; default false.
     """
 
-    if not core.writes_allowed():
-        closed: dict[str, Any] = {"ok": False, "error": "write_gate_closed", "task_id": task_id}
-        if task_ids:
-            closed["task_ids"] = list(task_ids)
-        return closed
-    return _archive_many(
-        tool="aiworkhub_manager_task_archive",
+    return aiworkhub_task_archive(
         task_id=task_id,
+        reason=reason,
         task_ids=task_ids,
         status=status,
         topic=topic,
         older_than_hours=older_than_hours,
         task_id_prefix=task_id_prefix,
         dry_run=dry_run,
-        archive_one=lambda candidate: task_engine.archive_task(
-            core.repo_root(),
-            candidate,
-            actor=core._verified_manager_actor(),
-            reason=reason,
-            supersede=False,
-        ),
     )
 
 
@@ -4881,22 +4869,26 @@ def aiworkhub_manager_task_archive(
 def aiworkhub_manager_task_supersede(
     task_id: str,
     reason: str = "",
+    by: str = "",
+    include_card: CardInclude = "none",
+    continue_capped: bool = False,
 ) -> dict[str, Any]:
     """MANAGER WRITE: supersede an orphaned active card while preserving audit history.
 
     Args:
         task_id: Id of the orphaned active card to supersede; allowed even while it is processing.
         reason: Why the card is being superseded, recorded with the audit event; default empty.
+        by: Id of the replacement task, recorded as superseded_by; omit for none.
+        include_card: Card view to attach to the receipt: none (default), summary or full.
+        continue_capped: When true, creates the capped successor instead of superseding outright.
     """
 
-    if not core.writes_allowed():
-        return {"ok": False, "error": "write_gate_closed", "task_id": task_id}
-    return task_engine.archive_task(
-        core.repo_root(),
-        task_id,
-        actor=core._verified_manager_actor(),
+    return aiworkhub_task_supersede(
+        task_id=task_id,
         reason=reason,
-        supersede=True,
+        by=by,
+        include_card=include_card,
+        continue_capped=continue_capped,
     )
 
 

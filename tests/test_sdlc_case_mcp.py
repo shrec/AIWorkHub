@@ -339,11 +339,12 @@ def test_public_case_tools_registered_without_repo_id():
         assert "repo_id" not in params
 
 
-def test_task_case_tools_accept_only_task_and_request_identity():
+def test_task_case_tools_accept_only_task_and_request_identity(monkeypatch):
     create = server.aiworkhub_manager_sdlc_case_create_for_task
     read = server.aiworkhub_manager_sdlc_case_for_task
     assert list(inspect.signature(create).parameters) == ["task_id", "request_id"]
     assert list(inspect.signature(read).parameters) == ["task_id"]
+    monkeypatch.setattr(server, "mcp_surface", lambda: "all")
     schemas = {tool.name: tool.inputSchema for tool in asyncio.run(server.mcp.list_tools())}
     create_schema = schemas["aiworkhub_manager_sdlc_case_create_for_task"]
     read_schema = schemas["aiworkhub_manager_sdlc_case_for_task"]

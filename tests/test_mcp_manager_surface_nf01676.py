@@ -23,7 +23,11 @@ _EXTENSION_JS = _ROOT / "vscode-extension" / "extension.js"
 _PAYLOAD_PREFIX = "NF01676_PAYLOAD="
 _DASHBOARD = "aiworkhub_dashboard_"
 _KEEP = {"aiworkhub_dashboard_needfix_transition", "aiworkhub_dashboard_snapshot"}
-_ALIASES = frozenset(mcp_tool_metadata.MCP_TOOL_ALIASES)
+_UNLISTED = frozenset(
+    name
+    for name, entry in mcp_tool_metadata.MCP_TOOL_PROFILES.items()
+    if entry.get(mcp_tool_metadata.MCP_PROFILE_MANAGER) == mcp_tool_metadata.MCP_VISIBILITY_CALLABLE
+)
 _TEMPLATE_LIST = "aiworkhub_task_template_list"
 _PROBE_ERROR = "unexpected_arguments:['__nf01676_probe__']"
 
@@ -487,7 +491,7 @@ def test_manager_list_drops_only_the_webview_dashboard_tools(all_run: dict, mana
     assert manager_run["snapshots"]["manager"]["surface"] == "manager"
     hidden = _hidden_names(full["names"])
     assert len(hidden) >= 40
-    assert trimmed["names"] == [name for name in full["names"] if name not in set(hidden) and name not in _ALIASES]
+    assert trimmed["names"] == [name for name in full["names"] if name not in set(hidden) and name not in _UNLISTED]
     assert sorted(name for name in trimmed["names"] if name.startswith(_DASHBOARD)) == sorted(_KEEP)
     by_name = {entry["name"]: entry for entry in full["entries"]}
     assert len(by_name) == len(full["names"])
@@ -500,7 +504,7 @@ def test_manager_registers_only_visible_tools_and_matches_call_time_filtering(
     imported = manager_run["snapshots"]["manager"]["list"]
     flipped = all_run["snapshots"]["late_manager"]
     assert flipped["surface"] == "manager"
-    assert [name for name in manager_run["registered"] if name not in _ALIASES] == imported["names"]
+    assert [name for name in manager_run["registered"] if name not in _UNLISTED] == imported["names"]
     assert set(manager_run["registered"]) == set(all_run["registered"]) - set(_hidden_names(all_run["registered"]))
     assert flipped["list"]["names"] == imported["names"]
     assert flipped["list"]["wire_bytes"] == imported["wire_bytes"]
@@ -654,7 +658,8 @@ def test_real_stdio_loop_serves_the_same_surface(all_run: dict, manager_run: dic
 def test_measured_manager_surface_is_smaller(all_run: dict, manager_run: dict, capsys) -> None:
     full = all_run["snapshots"]["all"]
     trimmed = manager_run["snapshots"]["manager"]
-    dropped = set(_hidden_names(full["list"]["names"])) | _ALIASES
+    dropped = set(_hidden_names(full["list"]["names"])) | _UNLISTED
+    assert mcp_tool_metadata.MCP_TOOL_ALIASES.keys() <= _UNLISTED
     all_count, manager_count = len(full["list"]["names"]), len(trimmed["list"]["names"])
     assert all_count >= 217
     assert manager_count == all_count - len(dropped) < all_count
