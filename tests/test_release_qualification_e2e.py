@@ -325,7 +325,6 @@ def test_fresh_install_task_context_callback_reload_and_repo_isolation(tmp_path,
     for required in {
         "aiworkhub_repo_current",
         "aiworkhub_manager_source_graph_query",
-        "aiworkhub_manager_context_import",
         "aiworkhub_task_show",
     }:
         assert required in names

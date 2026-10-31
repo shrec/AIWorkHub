@@ -597,10 +597,12 @@ def test_manager_mine_returns_a_bound_receipt(manager):
     assert result["manager"]["repo"] == str(manager)
 
 
-def test_both_mining_tools_are_registered_on_the_mcp_server():
+def test_both_mining_tools_are_registered_on_the_mcp_server(monkeypatch):
     """The miner must be callable from a real surface, not just importable."""
     import aiworkhub.server as server
 
+    # skill_propose is manager-callable (served by name, absent from the manager list).
+    monkeypatch.setattr(server, "mcp_surface", lambda: "all")
     names = {tool.name for tool in asyncio.run(server.mcp.list_tools())}
     assert "aiworkhub_manager_skill_mine" in names
     assert "aiworkhub_manager_skill_retirement_report" in names
