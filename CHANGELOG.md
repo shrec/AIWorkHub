@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.82] - 2026-10-31
+
+### Changed
+
+- The manager MCP tool list has 129 tools instead of 181: 50 manager tools that no session called are no longer listed but stay callable by exact name, and `aiworkhub_manager_task_archive` / `aiworkhub_manager_task_supersede` are aliases of the canonical `aiworkhub_task_archive` / `aiworkhub_task_supersede` (NF-2026-01690).
+- The accept gate binds a manager-declared recipe run to the exact candidate (`accept_task_id` / `accept_request_id` on `aiworkhub_manager_recipe_run`) and reuses a detached recipe run instead of running it again; the recipe run timeout ceiling is 7200 s (NF-2026-01835).
+
+### Fixed
+
+- Manager Chat route-gate polls skip the `task_health` scan, so a poll stays under the 20 s MCP timeout (NF-2026-01880).
+- The accept neighbour lane selects only pytest-collected test files (`test_*.py`, `*_test.py`); the dead legacy allowlist smoke tests are removed (NF-2026-01884).
+- Validation-lane worktree-storage fixtures are built without git clone/push/fetch, and a guard test keeps local git transport out of them (NF-2026-01876).
+
 ## [0.12.81] - 2026-10-31
 
 ### Changed

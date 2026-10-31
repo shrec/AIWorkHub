@@ -374,11 +374,11 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.81
+## What's new in 0.12.82
 
-- Cheaper rework turns: a worker reading a file it changed gets one compact copy of it instead of per-symbol rows plus the stale base version (about 4.5 times the file size before).
-- A reject-capped card continues as a successor in one call again, including NeedFix-converted cards.
-- The Manager Chat send queue scrolls instead of covering the panel, and the profile/preflight/health tools say when to use each one.
+- A shorter manager tool list: 129 tools instead of 181. The 50 tools no session used stay callable by exact name, so existing callers keep working.
+- Accepting a card reuses a recipe run already made for that exact candidate instead of running it again.
+- Manager Chat polls no longer time out on a slow health scan, and the accept neighbour lane runs only real test files.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Continuous Audit as a Service (CAAS)

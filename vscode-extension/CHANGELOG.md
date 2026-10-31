@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.12.82 — 2026-10-31
+
+### Fixed
+
+- Bundled runtime 0.12.82: a shorter manager tool list (129 instead of 181; unlisted tools stay callable), Manager Chat polls that stay under the MCP timeout, and accept-gate reuse of a recipe run bound to the exact candidate. The full list is in the repository CHANGELOG.
+
 ## 0.12.81 — 2026-10-31
 
 ### Fixed
