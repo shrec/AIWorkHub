@@ -648,6 +648,7 @@ from . import dependency_autolaunch
 from . import quality_evidence
 from . import quality_calibration
 from . import mcp_summary_folds
+from . import validation_failed_packet
 from . import repo_policy
 from . import shared_router
 from . import task_templates
@@ -4196,15 +4197,21 @@ def aiworkhub_task_show(
         return result
     identity = _card_identity(card)
     findings = _review_findings_count(card)
+    packet = None
     if detail == "summary":
+        packet = validation_failed_packet.build_packet(card, repo_root=core.repo_root())
         card = core.summarize_evidence(card)
         card = mcp_summary_folds.fold_task_card_facts(card)
         card = _fold_card_manager_bodies(card)
     elif detail == "evidence":
         card = mcp_summary_folds.dedupe_repeated_subtrees(card)
     rendered = dict(result)
-    rendered["stdout"] = json.dumps(card, ensure_ascii=False, default=str, separators=(",", ":"))
-    rendered["detail"] = detail
+    if packet is not None:
+        rendered["stdout"] = validation_failed_packet.canonical_json(packet)
+        rendered["detail"] = "validation_failed_packet"
+    else:
+        rendered["stdout"] = json.dumps(card, ensure_ascii=False, default=str, separators=(",", ":"))
+        rendered["detail"] = detail
     rendered.update(identity)
     if findings is not None:
         rendered["review_findings_count"] = findings
