@@ -6,9 +6,30 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.84] - 2026-11-01
+
+### Changed
+
+- WorkHub Mail is temporarily switched off in this release: the LAN listener never starts (`start_listener` and `listener_action("start")` answer `hub_mail_disabled_in_release`), and `ensure_listener` stops a listener an earlier version left running. Listener status and stop keep working (NF-2026-01913).
+
 ### Added
 
+- The security reviewer lens carries a fixed checklist: path traversal and normalization, subprocess argument injection, secrets in logs or receipts, and route/tool authorization (RM-2026-00083).
+- A top-level `tools/` file with an `aiworkhub-tool` header is seeded as a versioned `project.<id>` recipe whose version carries the file's sha256; batch files are refused and a run refuses a tool whose bytes changed since the scan. Ships `pyrun`, `json_get`, `sqlite_peek` and `script_census` (NF-2026-01427).
 - A reviewer can now attach a runnable reproduction to a finding (`pytest:<test node>` or `probe:<python source>`). When a manager disposes that finding, AIWorkHub runs it in the validation sandbox on the candidate and on its base and stores a signed receipt with the decision. Only a failing test, or a probe's failed assertion or explicit exit 1, counts as a failure; any other probe error makes the run inconclusive. A finding that reproduces can be dismissed only when the manager cites the task contract, a confirmed one is recorded as reproduced, and a low or medium finding that does not reproduce (or already failed before the change) may be dismissed on that receipt alone; high and critical findings keep their existing rules (RM-2026-00083).
+
+### Fixed
+
+- `aiworkhub_manager_recipe_seed_canonical` is listed on the manager tool surface, so a Claude Code manager can install the canonical recipes (NF-2026-01909).
+- A capped-continuation successor consumes the inherited sealed delta instead of failing the launch identity checks (NF-2026-01908).
+- Accept verifies a sealed file deletion instead of refusing it as `changed_path_invalid`; a deletion never satisfies a required output (NF-2026-01885).
+- Production-surface risk markers skip test paths, so a tests-only diff is no longer escalated to a high tier and a reviewer pair (NF-2026-01883).
+- The sparse validation worktree seeds `tool_guard_hook.py`, so guarded validations no longer fail with `FileNotFoundError` (NF-2026-01886).
+- `validation_exec_scratch_unavailable` is a named terminal-failure class instead of `unclassified` or `auth_forbidden` (NF-2026-01871).
+- `needfix_preview_convert` and `needfix_convert` refuse a reserved reviewer topic and a forbidden path that contradicts the card's writes, outputs or text, as task creation already did (NF-2026-01910, NF-2026-01790).
+- The callback dispatcher reports a healthy idle state when no manager is selected (NF-2026-01811).
+- A registry-lock timeout names its holder (pid, label, time held), and a reviewer spawn retries lock contention (NF-2026-01911).
+- Read-only review projections (`lifecycle_counts`, `drain_projection`) no longer hold the task-queue write lease, and `write_lease_timeout` is a named terminal-failure class (NF-2026-01912).
 
 ## [0.12.83] - 2026-11-01
 

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.12.84 — 2026-11-01
+
+### Changed
+
+- Bundled runtime 0.12.84: WorkHub Mail is temporarily switched off (the LAN listener never starts), reviewer findings can carry a runnable reproduction with a signed receipt, project `tools/` scripts are seeded as versioned recipes, and fixes for stuck accepts, launches and lease waits. The full list is in the repository CHANGELOG.
+
 ## 0.12.83 — 2026-11-01
 
 ### Fixed

@@ -374,11 +374,12 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.83
+## What's new in 0.12.84
 
-- A direct-chat manager wakes on worker callbacks through a background watcher (`python -m aiworkhub.manager_callback_watch`) instead of blocking in a wait loop, and the watcher never holds the task-queue write lease.
-- Heavy runs share the host: recipe runs and worker validation batches take one of a core-derived number of host slots, with a bounded wait that fails open. Recipe memory budgets no longer misreport a surviving child or abort on a low inherited limit.
-- Fewer stuck accepts: an expired reviewer reservation no longer counts as live, a lease timeout names its holder, and a red card's summary fits in 4 KB.
+- WorkHub Mail is temporarily switched off: the LAN listener never starts in this release, and a listener an earlier version left running is stopped. Listener status and stop keep working.
+- A reviewer finding can carry a runnable reproduction: AIWorkHub runs it on the candidate and on its base and stores a signed receipt with the manager's decision. The security lens checks four named vulnerability classes.
+- Scripts in a project's `tools/` directory with an `aiworkhub-tool` header are seeded as versioned recipes, and a Claude Code manager can install the canonical recipes.
+- Fewer stuck cards: a sealed file deletion accepts, a capped continuation launches, a tests-only diff keeps its risk tier, a registry-lock timeout names its holder, and read-only review projections no longer hold the task-queue write lease.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Continuous Audit as a Service (CAAS)
