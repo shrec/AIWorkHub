@@ -32,7 +32,10 @@ from aiworkhub import process_launcher_review_context as review_context
 # next extraction ratchets it back down.
 # 13681 -> 13795 (0.12.83): the NF-2026-01899 stale-owner reservation
 # retirement, measured; the next extraction ratchets it back down.
-PROCESS_LAUNCHER_MAX_LINES = 13795
+# 13795 -> 13855 (0.12.84): NF-2026-01911 registry-lock holder + reviewer
+# spawn retry (+36) and NF-2026-01929 latest-projection cache fit (+24),
+# measured; the next extraction ratchets it back down.
+PROCESS_LAUNCHER_MAX_LINES = 13855
 
 # (module, function, seam tuple attribute, ProcessManager method)
 EXTRACTIONS: tuple[tuple[ModuleType, str, str, str], ...] = (
