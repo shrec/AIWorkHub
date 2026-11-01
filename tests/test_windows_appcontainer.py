@@ -43,6 +43,16 @@ from aiworkhub.windows_appcontainer import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _pin_private_logon_session(monkeypatch):
+    """NF-2026-01154: ``sandbox_drive`` now refuses outside a private logon
+    session. These fakes exercise the drive mechanics, so pin the probe to a
+    private NewCredentials session; production code keeps the real probe.
+    Fakes may pin this; there is no test-only bypass in production."""
+
+    monkeypatch.setattr(wac, "in_private_logon_session", lambda: True)
+
+
 # ---------------------------------------------------------------------------
 # Mocked Windows boundary
 # ---------------------------------------------------------------------------

@@ -18,9 +18,23 @@ import aiworkhub.process_launcher_launch_isolated as module
 import aiworkhub.repository_state as repository_state
 import aiworkhub.windows_appcontainer as windows_appcontainer
 import aiworkhub.windows_build_env as windows_build_env
+import aiworkhub.windows_private_session as windows_private_session
 import aiworkhub.worker_supervisor as worker_supervisor
 import aiworkhub.worker_workspace as worker_workspace
 import aiworkhub.worker_workspace_appcontainer_node as worker_workspace_appcontainer_node
+
+
+@pytest.fixture(autouse=True)
+def _pin_private_logon_session(monkeypatch):
+    """NF-2026-01154: in production these launches reach ``sandbox_drive`` only
+    inside a private logon session (the supervisor/validation hop). These host
+    mechanics tests launch directly, so pin the probe to a private session --
+    fakes may; production keeps the real probe with no test-only bypass.  The
+    validation hop reads the same probe, so a stubbed run_validations lane runs
+    in-process instead of relaying to a real private-session helper."""
+
+    monkeypatch.setattr(windows_appcontainer, "in_private_logon_session", lambda: True)
+    monkeypatch.setattr(windows_private_session, "in_private_logon_session", lambda: True)
 
 CANONICAL_REPO_ID = "repo_57de971f505d4a50a7729a99c32615de"
 
@@ -2273,6 +2287,45 @@ def test_run_validations_runs_diff_check_on_the_host_and_everything_else_contain
     ]
     assert rows[0]["executed_argv"] == [git, *_HARDENED_DIFF_CHECK]
     assert rows[0]["declared_argv"] == ["git", "diff", "--check"]
+
+
+def test_run_validations_relays_the_appcontainer_lane_from_the_owner_session(
+    tmp_path, monkeypatch
+) -> None:
+    """NF-2026-01154: finalize/accept call run_validations from the owner's
+    interactive session, where sandbox_drive must refuse. The AppContainer branch
+    therefore hands the command to the private-session hop: the spec is relayed
+    once and the lane itself never runs in this process."""
+    git = str(tmp_path / "bin" / "git.exe")
+    workspace, container = _routing_stubs(monkeypatch, tmp_path, git)
+    metadata = {"request_id": workspace.request_id, "path": str(workspace.path)}
+    workspace.as_metadata = lambda: dict(metadata)
+    monkeypatch.setattr(windows_appcontainer, "platform_supported", lambda: True)
+    monkeypatch.setattr(windows_private_session, "in_private_logon_session", lambda: False)
+    relayed: list[tuple[dict, float]] = []
+
+    def _relay(payload: bytes, deadline: float):
+        relayed.append((json.loads(payload), deadline))
+        record = {
+            "schema_id": windows_private_session._VALIDATION_RELAY_SCHEMA,
+            "kind": "completed", "args": ["node", "--version"],
+            "returncode": 0, "stdout": "v20.0.0\n", "stderr": "",
+        }
+        return 0, (json.dumps(record).encode(), False), b""
+
+    monkeypatch.setattr(windows_private_session, "_relay_through_private_session", _relay)
+    rows = worker_workspace.run_validations(
+        workspace, ["node --version"],
+        backend="windows_appcontainer", adapter_id="claude_cli",
+    )
+
+    assert container == []  # run_direct never ran in the owner-session parent
+    ((spec, deadline),) = relayed
+    assert spec["argv"] == ["node", "--version"]
+    assert spec["workspace"] == metadata
+    assert spec["adapter_id"] == "claude_cli"
+    assert deadline == spec["timeout_seconds"] + windows_private_session._VALIDATION_RELAY_GRACE_SECONDS
+    assert [row["execution_boundary"] for row in rows] == ["windows_appcontainer"]
 
 
 def test_run_validations_never_runs_any_other_git_command_anywhere(tmp_path, monkeypatch) -> None:

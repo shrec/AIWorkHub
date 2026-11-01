@@ -48,6 +48,13 @@ except ImportError:  # direct-script entrypoint
     from validation_runner import temp_root_blocks_nested_lsp_helper
     from windows_job_structures import JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 
+# NF-2026-01154: sandbox_drive consults this before any DefineDosDeviceW. The
+# module imports nothing from this one at top level, so the reference is safe.
+try:
+    from .windows_private_session import in_private_logon_session
+except ImportError:  # direct-script entrypoint
+    from windows_private_session import in_private_logon_session  # type: ignore[no-redef]
+
 __all__ = [
     "AppContainerError",
     "AppContainerLaunch",
@@ -100,6 +107,10 @@ class AppContainerReason(str, enum.Enum):
     PROCESS_LAUNCH_FAILED = "process_launch_failed"
     LAUNCH_FAILED = "launch_failed"
     FILESYSTEM_GRANT_FAILED = "filesystem_grant_failed"
+    # NF-2026-01154: sandbox_drive refused because the caller is not inside a
+    # private NewCredentials logon session, so any letter it defined would be
+    # visible in the owner's session.  Fails closed BEFORE any DefineDosDeviceW.
+    PRIVATE_LOGON_SESSION_REQUIRED = "sandbox_drive_requires_private_logon_session"
 
 
 # Maps a low-level Win32 operation name to its structured reason.  The
@@ -3645,6 +3656,25 @@ class _CtypesWin32Api:
         without close() leaks its definition only until the next
         sandbox_drive. Neither step can fail the launch.
         """
+        # NF-2026-01154 (owner decision): a letter defined here is per logon
+        # session, so defining one while this process is in the owner's
+        # interactive session would make it visible in Explorer. Refuse before
+        # any DefineDosDeviceW, with no fallback to an owner-session letter,
+        # subst, junction or mount point. Both production lanes reach it only
+        # from a type-9 session via windows_private_session: the worker lane by
+        # re-execing worker_supervisor (reexec_supervisor_if_owner_session), the
+        # finalize/accept validation lane by relaying each run_validations call
+        # to a private helper (run_appcontainer_validation_hopped).
+        if not in_private_logon_session():
+            raise AppContainerError(
+                AppContainerReason.PRIVATE_LOGON_SESSION_REQUIRED,
+                detail=(
+                    "sandbox_drive_requires_private_logon_session: the sandbox "
+                    "drive letter may only be defined inside a private "
+                    "NewCredentials logon session, never the owner's session"
+                ),
+                operation="sandbox_drive",
+            )
         k = self._kernel32
         leases = self._sandbox_drive_leases
 

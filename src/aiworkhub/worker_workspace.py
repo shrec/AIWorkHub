@@ -13538,16 +13538,16 @@ def run_validations(
                     # AppContainer confinement is established by the container
                     # profile and the kill-on-close job object at CreateProcess
                     # time, so this command cannot go through subprocess.run at
-                    # all.  The helper answers in subprocess.run's exact shapes
-                    # (CompletedProcess, TimeoutExpired, OSError) so every
+                    # all; NF-2026-01154 relays it into a private logon session.
+                    # Both answer in subprocess.run's exact shapes, so every
                     # branch below this call stays byte-identical.
-                    result = _run_appcontainer_validation(
+                    from .windows_private_session import run_appcontainer_validation_hopped
+                    result = run_appcontainer_validation_hopped(
                         wrapped,
-                        workspace=workspace,
-                        adapter_id=adapter_id,
+                        workspace=workspace, adapter_id=adapter_id,
                         cwd=subprocess_cwd,
                         env=env,
-                        timeout_seconds=bounded_timeout,
+                        timeout_seconds=bounded_timeout, run_direct=_run_appcontainer_validation,
                     )
                     from .windows_build_env import ninja_pipe_denied
                     if result.returncode != 0 and ninja_pipe_denied(result.stdout, result.stderr):

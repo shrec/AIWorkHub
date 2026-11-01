@@ -18,11 +18,12 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable, cast
 
 try:
-    from . import appcontainer_loopback_relay, windows_appcontainer
+    from . import appcontainer_loopback_relay, windows_appcontainer, windows_private_session
     from .windows_job_structures import JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 except ImportError:  # direct-script entrypoint
     import appcontainer_loopback_relay  # type: ignore[no-redef]
     import windows_appcontainer  # type: ignore[no-redef]
+    import windows_private_session  # type: ignore[no-redef]
     from windows_job_structures import JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 
 try:
@@ -1687,6 +1688,18 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--spec", required=True)
     args = parser.parse_args()
+    # NF-2026-01154: when this supervisor started in the owner's interactive
+    # logon session and the spec is an AppContainer launch, re-exec ourselves
+    # through the private NewCredentials session BEFORE reading stdin or
+    # unlinking the spec. The inherited stdin handle passes straight to the
+    # inner copy, so the prompt stays byte-exact and the private copy -- the one
+    # that actually reads stdin -- is what unlinks the spec exactly once. We stay
+    # the launcher-tracked pid and exit with the inner code.
+    hopped_exit_code = windows_private_session.reexec_supervisor_if_owner_session(
+        Path(args.spec)
+    )
+    if hopped_exit_code is not None:
+        raise SystemExit(hopped_exit_code)
     # The prompt (NF-2026-00042) arrives on our own stdin, never in the spec
     # file: a plain-subprocess DEVNULL launch reads back empty bytes here.
     #
