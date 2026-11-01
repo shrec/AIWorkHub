@@ -68,6 +68,10 @@ _PACKAGE_FILES = (
     "semantic_edit_applier.py",
     "worker_ai_tools_mcp.py",
     "quality_reviewer.py",
+    # quality_reviewer imports the reproduction receipt helpers (RM-2026-00083),
+    # which import the known-bug scanner's canonical receipt bytes.
+    "finding_reproduction.py",
+    "known_bug_scanner.py",
     "evidence_levels.py",
     "scoped_audit.py",
     # worker_ai_tools_mcp imports the shared platform and read-only SQLite
