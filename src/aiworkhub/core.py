@@ -3305,6 +3305,26 @@ def _contract_delivery_decision(
     return True, "first_delivery_this_session"
 
 
+# Exact registered manager tool names the host defers; manager_bootstrap hands them back as one ToolSearch select line.
+MANAGER_TOOLSEARCH_SELECT_NAMES: tuple[str, ...] = (
+    "aiworkhub_task_show",
+    "aiworkhub_agent_task_status",
+    "aiworkhub_review_packet",
+    "aiworkhub_agent_accept_preview",
+    "aiworkhub_agent_accept_review",
+    "aiworkhub_task_reject_review",
+    "needfix_show",
+    "needfix_list",
+    "needfix_preview_convert",
+    "needfix_convert",
+    "aiworkhub_agent_launch_task",
+    "aiworkhub_claude_callback_wait",
+    "aiworkhub_claude_callback_ack",
+    "aiworkhub_manager_source_graph_query",
+    "aiworkhub_manager_workforce_rank",
+)
+
+
 def manager_bootstrap(
     *,
     include_contract: bool = False,
@@ -3473,6 +3493,11 @@ def manager_bootstrap(
         # The inbox follows the RESOLVED route: an open Manager Chat seat owns its wakes.
         reply["dispatcher"] = _bootstrap_dispatcher(reply["manager_route"], reply["provider"])
         reply["callback_adoption"] = _adopt_callbacks_on_bootstrap(reply["manager_route"])
+        # NF-2026-01921: the host re-defers MCP tool schemas after every compaction.
+        reply["toolsearch_select"] = "select:" + ",".join(MANAGER_TOOLSEARCH_SELECT_NAMES)
+        reply["toolsearch_hint"] = (
+            "After a context compaction, run this ToolSearch select first to reload the manager tool schemas."
+        )
     return reply
 
 
