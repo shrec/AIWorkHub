@@ -7,6 +7,8 @@ import stat
 import sys
 from pathlib import Path
 
+import pytest
+
 from aiworkhub import agent_tool_instructions as instructions
 from aiworkhub import evidence_instruments as evidence
 
@@ -935,3 +937,75 @@ def test_missing_adopts_the_sibling_retrieval_eval_vocabulary(tmp_path: Path) ->
     missing = evidence.risk_mode_precision_bench(tmp_path)
     assert missing["reason"].split(":", 1)[0].endswith("_missing")
     assert sibling["reason"].split(":", 1)[0].endswith("_missing")
+
+
+# --- NF-2026-01885: a sealed deletion is verified, not blocked -------------
+
+
+def _deletion_audit(tmp_path: Path, stored: dict[str, object], paths: list[str]) -> dict:
+    candidate = tmp_path / "candidate"
+    candidate.mkdir(exist_ok=True)
+    return evidence.review_evidence_audit(
+        tmp_path, candidate, changed_paths=paths, stored_hashes=stored
+    )
+
+
+def test_deleted_path_with_none_hash_and_absent_file_is_verified_deleted(
+    tmp_path: Path,
+) -> None:
+    report = _deletion_audit(tmp_path, {"gone.py": None}, ["gone.py"])
+    assert report["status"] == "pass"
+    assert report["blockers"] == []
+    assert report["changed_paths_verified"] == [{"path": "gone.py", "deleted": True}]
+
+
+def test_none_hash_over_present_file_still_blocks(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    (candidate / "kept.py").write_bytes(b"x = 1\n")
+    report = _deletion_audit(tmp_path, {"kept.py": None}, ["kept.py"])
+    assert report["blocking"] is True
+    assert report["blockers"] == ["changed_path_hash_mismatch:kept.py"]
+
+
+def test_real_hash_over_absent_file_still_blocks(tmp_path: Path) -> None:
+    report = _deletion_audit(tmp_path, {"gone.py": "a" * 64}, ["gone.py"])
+    assert report["blocking"] is True
+    assert report["blockers"] == [
+        "changed_path_invalid:gone.py:artifact_missing:gone.py"
+    ]
+
+
+def test_none_hash_over_dangling_symlink_still_blocks(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    try:
+        os.symlink(candidate / "no-such-target", candidate / "link.py")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink privilege unavailable")
+    report = _deletion_audit(tmp_path, {"link.py": None}, ["link.py"])
+    assert report["blocking"] is True
+    assert report["blockers"] == [
+        "changed_path_invalid:link.py:artifact_invalid:link.py"
+    ]
+
+
+def test_deletion_never_satisfies_a_required_output(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    report = evidence.review_evidence_audit(
+        tmp_path,
+        candidate,
+        changed_paths=["gone.py"],
+        stored_hashes={"gone.py": None},
+        required_outputs=[{"path": "gone.py"}],
+    )
+    assert report["blocking"] is True
+    assert report["blockers"] == [
+        "required_output_invalid:gone.py:artifact_missing:gone.py"
+    ]
+
+
+def test_deleted_path_absent_from_stored_hashes_still_blocks(tmp_path: Path) -> None:
+    report = _deletion_audit(tmp_path, {}, ["gone.py"])
+    assert report["blocking"] is True

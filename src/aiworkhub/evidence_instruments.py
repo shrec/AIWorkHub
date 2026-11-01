@@ -145,6 +145,17 @@ def review_evidence_audit(
         try:
             relative = _relative(raw)
             normalized.append(relative)
+            # A sealed deletion stores ``None`` for the path (changed_path_hashes)
+            # and the path is gone from the candidate. A present file, a real
+            # hash over an absent file, and a dangling symlink (lexists) all
+            # fall through to the existing checks and stay blockers.
+            if (
+                relative in stored_hashes
+                and stored_hashes[relative] is None
+                and not os.path.lexists(_regular(candidate, relative, must_exist=False))
+            ):
+                verified.append({"path": relative, "deleted": True})
+                continue
             path = _regular(candidate, relative)
             expected = _receipt_sha256(stored_hashes.get(relative))
             observed = _sha256(path)
