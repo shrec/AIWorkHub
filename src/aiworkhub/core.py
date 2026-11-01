@@ -11907,6 +11907,17 @@ def dispatcher_ensure_started() -> dict[str, Any]:
             "repo": str(root),
             "provider": provider,
         }
+    if not provider:
+        # No coordinator is selected: nothing to wake. Tear down a dispatcher
+        # bound to a previously selected target and report a healthy idle state.
+        _callback_bridge_module().stop_dispatcher(root)
+        return {
+            "ok": True,
+            "healthy": True,
+            "status": "no_manager_selected",
+            "dispatcher_started": False,
+            "repo": str(root),
+        }
     bridge = _callback_bridge_module()
     bridge_kwargs: dict[str, Any] = {}
     if provider == "codex":

@@ -748,3 +748,95 @@ def test_core_dispatcher_ensure_started_then_stop_on_initialized_repo(tmp_path, 
         assert health_after_stop["dispatcher_running"] is False
     finally:
         callback_bridge.stop_dispatcher(root)
+
+
+def _bridge_calls(monkeypatch) -> list[str]:
+    calls: list[str] = []
+
+    class _FakeDispatcher:
+        def health(self):
+            return {"dispatcher_running": True}
+
+    def fake_ensure(*_args, **_kwargs):
+        calls.append("ensure_dispatcher")
+        return _FakeDispatcher()
+
+    monkeypatch.setattr(callback_bridge, "ensure_dispatcher", fake_ensure)
+    monkeypatch.setattr(callback_bridge, "stop_dispatcher", lambda *_a, **_k: calls.append("stop_dispatcher"))
+    return calls
+
+
+def _initialized_repo_env(tmp_path, monkeypatch) -> Path:
+    root = tmp_path / "repo"
+    root.mkdir()
+    init = task_store.initialize_repository(root)
+    assert init["ok"], init
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    monkeypatch.setenv("AIWORKHUB_WINDOW_ID", "window_core_test")
+    monkeypatch.delenv("AIWORKHUB_CALLBACK_TRANSPORT", raising=False)
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    return root
+
+
+def test_core_dispatcher_ensure_started_no_manager_selected_is_healthy_idle(tmp_path, monkeypatch):
+    root = _initialized_repo_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        core,
+        "read_selected_coordinator_target",
+        lambda _root=None: {"selected_provider": "", "targets": {}},
+    )
+    calls = _bridge_calls(monkeypatch)
+    result = core.dispatcher_ensure_started()
+    assert result == {
+        "ok": True,
+        "healthy": True,
+        "status": "no_manager_selected",
+        "dispatcher_started": False,
+        "repo": str(root),
+    }
+    assert calls == ["stop_dispatcher"]
+
+
+def test_core_dispatcher_ensure_started_no_manager_selected_without_window_is_headless_worker(
+    tmp_path, monkeypatch
+):
+    _initialized_repo_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        core,
+        "read_selected_coordinator_target",
+        lambda _root=None: {"selected_provider": "", "targets": {}},
+    )
+    calls = _bridge_calls(monkeypatch)
+    monkeypatch.delenv("AIWORKHUB_WINDOW_ID", raising=False)
+    result = core.dispatcher_ensure_started()
+    assert result["status"] == "headless_worker"
+    assert calls == []
+
+
+def test_core_dispatcher_ensure_started_no_manager_selected_manager_inbox_stops_dispatcher(
+    tmp_path, monkeypatch
+):
+    _initialized_repo_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        core,
+        "read_selected_coordinator_target",
+        lambda _root=None: {"selected_provider": "", "targets": {}},
+    )
+    calls = _bridge_calls(monkeypatch)
+    monkeypatch.setenv("AIWORKHUB_CALLBACK_TRANSPORT", "manager_inbox")
+    result = core.dispatcher_ensure_started()
+    assert result["status"] == "manager_inbox"
+    assert result["ok"] is True
+    assert "stop_dispatcher" in calls
+    assert "ensure_dispatcher" not in calls
+
+
+def test_core_dispatcher_ensure_started_selected_provider_still_starts(tmp_path, monkeypatch):
+    _initialized_repo_env(tmp_path, monkeypatch)
+    _select_codex(monkeypatch)
+    calls = _bridge_calls(monkeypatch)
+    result = core.dispatcher_ensure_started()
+    assert result["ok"] is True
+    assert result["status"] == "started"
+    assert result["dispatcher_started"] is True
+    assert calls == ["ensure_dispatcher"]
