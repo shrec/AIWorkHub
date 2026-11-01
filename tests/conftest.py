@@ -508,10 +508,12 @@ REAL_HUB_MAIL_LISTENER_MARKER = "real_hub_mail_listener"
 
 @pytest.fixture(autouse=True)
 def hermetic_hub_mail_listener(request: pytest.FixtureRequest, monkeypatch):
-    if request.node.get_closest_marker(REAL_HUB_MAIL_LISTENER_MARKER) is not None:
-        return
     from aiworkhub import hub_mail_net
 
+    if request.node.get_closest_marker(REAL_HUB_MAIL_LISTENER_MARKER) is not None:
+        # NF-2026-01913: the release kill switch is lifted only for a test that opts in.
+        monkeypatch.setattr(hub_mail_net, "LISTENER_DISABLED_IN_RELEASE", False)
+        return
     monkeypatch.setattr(hub_mail_net, "ensure_listener", lambda home=None: None)
 
 

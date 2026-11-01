@@ -444,6 +444,7 @@ def test_listener_binds_only_an_explicit_host_and_one_per_home(world):
     assert not hub_mail_net.pidfile_path(a).exists()
 
 
+@pytest.mark.real_hub_mail_listener
 def test_start_status_stop_run_one_listener_process_per_home(world):
     a = world.machine("machine_a", "alpha", (HUB_A, "geoai"))
     started = hub_mail_net.start_listener(bind_host="127.0.0.1", port=0, home=a)
@@ -471,6 +472,7 @@ def test_the_listener_records_the_start_token_and_its_start_identity(world):
     assert hub_mail_net.listener_status(a)["running"] is True
 
 
+@pytest.mark.real_hub_mail_listener
 def test_a_stale_pidfile_with_a_recycled_pid_is_never_signalled(world, monkeypatch):
     a = world.machine("machine_a", "alpha", (HUB_A, "geoai"))
     own_ticks = runtime_temp.process_start_ticks(os.getpid())

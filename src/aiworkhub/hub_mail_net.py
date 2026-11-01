@@ -68,6 +68,8 @@ MAX_PENDING_SCAN = 1000
 RETRY_INTERVAL_SECONDS = 60.0
 SOCKET_TIMEOUT_SECONDS = 10.0
 ENSURE_BACKOFF_SECONDS = 30.0
+# Temporary owner kill switch: WorkHub Mail listener is off in release 0.12.84.
+LISTENER_DISABLED_IN_RELEASE = True
 LISTENER_START_WAIT_SECONDS = 15.0
 LISTENER_STOP_WAIT_SECONDS = 10.0
 PENDING_SUFFIX = ".pending.json"
@@ -1299,6 +1301,8 @@ def start_listener(
 ) -> dict[str, Any]:
     """Start this home's listener process (``python -m aiworkhub.hub_mail_net serve``)."""
 
+    if LISTENER_DISABLED_IN_RELEASE:
+        return {"ok": False, "error": "hub_mail_disabled_in_release"}
     try:
         host, port = _validate_bind(bind_host, port)
         _server_context(tls_cert, tls_key)
@@ -1418,6 +1422,13 @@ def mark_enabled(home: Path | None = None) -> bool:
 def ensure_listener(home: Path | None = None) -> dict[str, Any] | None:
     """Start the listener once Hub Mail is enabled; a fresh install opens no port."""
 
+    if LISTENER_DISABLED_IN_RELEASE:
+        if listener_status(home)["running"]:
+            try:
+                stop_listener(home)
+            except Exception:  # noqa: BLE001 - best effort; the switch still never spawns
+                pass
+        return None
     config = _read_json(listener_config_path(home)) or {}
     if not config.get("enabled"):
         return None
