@@ -29,7 +29,11 @@ _UNLISTED = frozenset(
     if entry.get(mcp_tool_metadata.MCP_PROFILE_MANAGER) == mcp_tool_metadata.MCP_VISIBILITY_CALLABLE
 )
 _TEMPLATE_LIST = "aiworkhub_task_template_list"
-_PROBE_ERROR = "unexpected_arguments:['__nf01676_probe__']"
+_PROBE_ERROR_PREFIX = "unexpected_arguments:['__nf01676_probe__']"
+
+
+def _is_probe_error(message: str) -> bool:
+    return message.startswith(_PROBE_ERROR_PREFIX)
 
 _SYNTHETIC_HIDDEN = "aiworkhub_dashboard_synthetic_hidden"
 _SYNTHETIC_ALL = [
@@ -529,10 +533,12 @@ def test_hidden_dashboard_tools_are_unknown_tools_on_manager_and_callable_on_all
             assert payload["error"] == "unknown_tool" and payload["requested"] == name
             assert not set(payload["suggestions"]) & set(hidden)
         for name in _KEEP:
-            assert _error(snap["probes"][name])["message"] == _PROBE_ERROR, (label, name)
+            assert _is_probe_error(_error(snap["probes"][name])["message"]), (label, name)
     snap = all_run["snapshots"]["all"]
     for name in hidden:
-        assert _error(snap["probes"][name]) == {"code": -32602, "message": _PROBE_ERROR}, name
+        error = _error(snap["probes"][name])
+        assert error["code"] == -32602, name
+        assert _is_probe_error(error["message"]), name
 
 
 def test_unknown_tool_error_is_unchanged_for_names_that_never_existed(all_run: dict, manager_run: dict) -> None:
@@ -611,8 +617,8 @@ def test_synthetic_registry_filters_listing_and_calls_by_prefix_and_keep_set(
     for snap in on_all + on_manager:
         synthetic = snap["synthetic"]
         assert _error(synthetic["visible_with_bad_arguments"]["message"])["message"] == "arguments_must_be_object"
-        assert _error(synthetic["visible_with_unexpected_argument"]["message"])["message"] == (
-            "unexpected_arguments:['nope']"
+        assert _error(synthetic["visible_with_unexpected_argument"]["message"])["message"].startswith(
+            "unexpected_arguments:['nope']; accepted: "
         )
 
 
@@ -650,9 +656,12 @@ def test_real_stdio_loop_serves_the_same_surface(all_run: dict, manager_run: dic
         template = _result(loop["3"]["message"])
         assert list(template) == ["content"]
         assert loop["3"]["wire_bytes"] == snap["calls"][_TEMPLATE_LIST]["wire_bytes"]
-        assert _error(loop["5"]["message"])["message"] == _PROBE_ERROR
-        expected_hidden = _off_profile_message(hidden_name, snap["list"]["names"]) if is_manager else _PROBE_ERROR
-        assert _error(loop["4"]["message"])["message"] == expected_hidden
+        assert _is_probe_error(_error(loop["5"]["message"])["message"])
+        hidden_message = _error(loop["4"]["message"])["message"]
+        if is_manager:
+            assert hidden_message == _off_profile_message(hidden_name, snap["list"]["names"])
+        else:
+            assert _is_probe_error(hidden_message)
 
 
 def test_measured_manager_surface_is_smaller(all_run: dict, manager_run: dict, capsys) -> None:

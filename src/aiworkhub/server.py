@@ -25,7 +25,7 @@ from . import (
     tool_recipes_store,
 )
 from . import mcp_tool_metadata as _tool_metadata
-from .tool_recovery import unknown_tool_message
+from .tool_recovery import resolve_tool_arguments, unknown_tool_message
 
 MCP_SURFACE_ENV = "AIWORKHUB_MCP_SURFACE"
 MCP_SURFACE_ALL = _tool_metadata.MCP_PROFILE_ALL
@@ -308,13 +308,9 @@ except ModuleNotFoundError:
         if not isinstance(arguments, dict):
             raise _StdioProtocolError(-32602, "arguments_must_be_object")
         func = tools[name]
-        try:
-            allowed = set(inspect.signature(func).parameters.keys())
-        except (TypeError, ValueError):
-            allowed = set(arguments.keys())
-        unexpected = sorted(set(arguments.keys()) - allowed)
-        if unexpected:
-            raise _StdioProtocolError(-32602, f"unexpected_arguments:{unexpected}")
+        arguments, problem = resolve_tool_arguments(func, arguments)
+        if problem:
+            raise _StdioProtocolError(-32602, problem)
         try:
             result = func(**arguments)
         except Exception as exc:  # tool-level failure -> MCP error content, not a crash

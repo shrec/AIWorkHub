@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .tool_recovery import unknown_tool_message
+from .tool_recovery import resolve_tool_arguments, unknown_tool_message
 
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -270,13 +270,9 @@ def _tool_result(tools: dict[str, Any], params: Any) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise ProtocolError(-32602, "arguments_must_be_object")
     function = tools[name]
-    try:
-        allowed = set(inspect.signature(function).parameters)
-    except (TypeError, ValueError):
-        allowed = set(arguments)
-    unexpected = sorted(set(arguments) - allowed)
-    if unexpected:
-        raise ProtocolError(-32602, f"unexpected_arguments:{unexpected}")
+    arguments, problem = resolve_tool_arguments(function, arguments)
+    if problem:
+        raise ProtocolError(-32602, problem)
     try:
         value = function(**arguments)
     except Exception as exc:  # one tool failure must not terminate the server
