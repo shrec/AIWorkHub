@@ -100,6 +100,25 @@ MANAGER_AMENDMENT_PROMPT_LINE = (
     "Read manager_amendment before judging; it takes precedence over "
     "contract.acceptance; behaviour it requires is not a finding.\n"
 )
+# Guidance only, emitted by build_review_prompt for the security lens alone; it
+# adds no finding schema, evidence level or severity rule.
+SECURITY_LENS_CHECKLIST = (
+    "Security checklist: on the changed hunks, check each of these four "
+    "classes and report a concrete defect in any of them.\n"
+    "1. Path traversal and path normalization: a rooted path, '..', './/', a "
+    "drive letter or a symlink escaping the intended root; the check must run "
+    "on the normalized path, never as a string prefix test on the raw value "
+    "(for example raw.startswith('/') accepts './/x').\n"
+    "2. Subprocess argument injection: shell=True, an argv built by string "
+    "concatenation, or caller text reaching the executable position or an "
+    "option flag (for example a value beginning with '-' passed unseparated).\n"
+    "3. Secrets in logs, receipts, events or error messages: a token, key or "
+    "environment value echoed into a log line, receipt, event payload or "
+    "exception text.\n"
+    "4. Route and tool authorization: a manager-only or request-bound tool "
+    "reachable without its identity check, or a repo_id or route mismatch "
+    "that is accepted instead of refused.\n"
+)
 
 _IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -1258,6 +1277,7 @@ def build_review_prompt(
         f"{repair_block}"
         "You are an independent, strictly read-only quality reviewer.\n"
         f"Review lens: {lens}.\n"
+        f"{SECURITY_LENS_CHECKLIST if lens == 'security' else ''}"
         "Judge the candidate from the deterministic packet below; the exact "
         "candidate workspace is there only for what the packet marks "
         "incomplete, not to re-read what the packet already carries. "
