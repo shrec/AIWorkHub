@@ -1144,8 +1144,13 @@ class ManagerOrchestrator:
             chosen = self._selected_session() or self._latest_session()
             if chosen is None:
                 return None
-            session = self._owner_picked(self._activate_selected(chosen))
-            self.store.write_selection(session.session_id)
+            if self._rotated(chosen):
+                session = self._owner_picked(self._activate_selected(chosen))
+                self.store.write_selection(session.session_id)
+            else:
+                # NF-2026-01914: attach for reading. Only an explicit continue/send/bind
+                # reopens a record or renews its seat lease.
+                session = chosen
         finally:
             self._release_lock()
         self._session = session
@@ -1159,6 +1164,8 @@ class ManagerOrchestrator:
         self._acquire_lock()
         backend: ManagerBackend | None = None
         try:
+            if session.status != "active":
+                session = self._activate_selected(session, explicit=True)
             previous = self.store.latest_closed()
             handoff = self.store.read_handoff(previous.session_id) if previous else ""
             if any(

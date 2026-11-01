@@ -1568,7 +1568,7 @@ def test_restore_loads_the_last_session_and_does_not_create_one(make) -> None:
     empty.store.save(newer)
     restored = empty.orch.restore_latest()
     assert restored is not None and restored.session_id == "newer-passive-02"
-    assert empty.store.read_selection() == "newer-passive-02"
+    assert empty.store.read_selection() is None
     assert empty.backends == []
 
 

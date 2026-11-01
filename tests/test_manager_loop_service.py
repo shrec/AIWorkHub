@@ -1675,12 +1675,11 @@ def _seat_record(
     return session
 
 
-def test_restore_renews_the_seat_lease_of_a_bound_session_idle_past_it(
+def test_restore_does_not_renew_the_seat_lease_of_a_bound_session_idle_past_it(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
-    # Restore is an explicit attach (opening the chat never posts it on the owner's
-    # behalf -- it fires on every panel open); it renews the seat lease like continue
-    # does, but it arms no wake consumer -- only an owner action does that.
+    # NF-2026-01914: restore fires on every panel open and attaches for reading only; it
+    # neither renews the seat lease nor arms a wake consumer. Only an owner action does.
     _install_fakes(monkeypatch)
     entry = manager_loop_service._entry_for(tmp_path)
     stale = _seat_record(entry, "mls-" + "0a" * 16, hours_idle=13)
@@ -1689,7 +1688,7 @@ def test_restore_renews_the_seat_lease_of_a_bound_session_idle_past_it(
 
     assert restored["ok"] is True
     assert restored["session"]["session_id"] == stale.session_id
-    assert restored["session"]["updated_at"]
+    assert restored["session"]["updated_at"] == stale.updated_at
     assert entry.wake is None
     assert manager_loop_service.status(tmp_path)["wake"]["running"] is False
     assert manager_loop_service.close(tmp_path) == {"ok": True}
