@@ -368,7 +368,7 @@ MCP_TOOL_PROFILES: dict[str, Mapping[str, str]] = {
     "aiworkhub_manager_loop_close": _MANAGER_DASHBOARD,
     "aiworkhub_manager_loop_stop": _MANAGER_CALLABLE_DASHBOARD,
     "aiworkhub_manager_recipe_register": _MANAGER_CALLABLE,
-    "aiworkhub_manager_recipe_seed_canonical": _MANAGER_CALLABLE,
+    "aiworkhub_manager_recipe_seed_canonical": _MANAGER,
     "aiworkhub_manager_recipe_seed_plan": _MANAGER_CALLABLE,
     "aiworkhub_manager_recipe_list": _MANAGER,
     "aiworkhub_manager_recipe_usage": _MANAGER,

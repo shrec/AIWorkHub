@@ -47,7 +47,7 @@ _WRITE_PROBE = "aiworkhub_task_mark_done"
 # plus aiworkhub_manager_recipe_run_status (NF-2026-01849).
 _PRE_TABLE_ALL_COUNT = 227
 _PRE_TABLE_ALL_READ_ONLY_COUNT = 223
-_LISTED_COUNTS = {"manager": 129, "worker": 19, "dashboard": 67}
+_LISTED_COUNTS = {"manager": 130, "worker": 19, "dashboard": 67}
 # The 45 webview-only dashboard tools the pre-table manager surface hid.
 _PRE_TABLE_MANAGER_HIDDEN = frozenset({
     "aiworkhub_dashboard_task_detail",
