@@ -2019,16 +2019,24 @@ def attach_rework_delta(
         except json.JSONDecodeError:
             card = {}
         predecessor = card.get("rework_predecessor") if isinstance(card, dict) else None
+        # A capped-continuation successor's predecessor stays bound to the old id.
+        from .capped_continuation import consumable_predecessor_task_id
+
+        owner = (
+            consumable_predecessor_task_id(card, task_id)
+            if isinstance(card, dict)
+            else task_id
+        )
         if (
             not isinstance(predecessor, dict)
             or not request_id
             or str(predecessor.get("request_id") or "").strip() != request_id
             or type(claim_epoch) is not int
             or predecessor.get("claim_epoch") != claim_epoch
-            or str(predecessor.get("task_id") or task_id) != task_id
+            or str(predecessor.get("task_id") or task_id) != owner
             or not isinstance(descriptor, Mapping)
             or descriptor.get("request_id") != request_id
-            or descriptor.get("task_id") != task_id
+            or descriptor.get("task_id") != owner
             or descriptor.get("claim_epoch") != claim_epoch
         ):
             return False, "rework_predecessor_mismatch"
@@ -2039,7 +2047,7 @@ def attach_rework_delta(
             return False, "rework_delta_present"
         sealed = dict(descriptor)
         pinned = dict(predecessor)
-        pinned["task_id"] = task_id
+        pinned["task_id"] = owner
         pinned["rework_delta"] = sealed
         pinned["delta_artifact"] = {
             "path": sealed.get("artifact_path"),
@@ -2098,8 +2106,12 @@ def inherit_capped_rework(
     One preimage-guarded UPDATE like :func:`attach_rework_delta`: the write
     lands only while the successor is still pending, unclaimed, at claim epoch
     0 and without a rework predecessor, so a successor that was launched or
-    already inherited is never overwritten.
+    already inherited is never overwritten.  The same write records the
+    manager-only continuation marker that lets the successor consume the
+    predecessor bound to the capped card's id (NF-2026-01908).
     """
+    from .capped_continuation import MARKER_KEY, continuation_marker
+
     _readiness, db_path = _require_ready(root)
     with _write_connection(db_path) as conn:
         _begin_immediate(conn)
@@ -2123,10 +2135,12 @@ def inherit_capped_rework(
             or str(row["claimed_by"] or "").strip()
             or card.get("claim_epoch") not in (None, 0)
             or card.get("rework_predecessor") is not None
+            or card.get(MARKER_KEY) is not None
         ):
             return False, "successor_not_pristine"
         card["rework_predecessor"] = dict(rework_predecessor)
         card["review_feedback"] = dict(review_feedback)
+        card[MARKER_KEY] = continuation_marker(rework_predecessor)
         now = datetime.now(timezone.utc).isoformat()
         try:
             cur = conn.execute(

@@ -60,13 +60,17 @@ def materialize_crash_retry_packet(
         return None, None
     request_id = str(predecessor.get("request_id") or "").strip()
     predecessor_task_id = str(predecessor.get("task_id") or task_id).strip()
+    # Deferred: capped_continuation imports core, which imports the launcher.
+    from .capped_continuation import consumable_predecessor_task_id
+
+    owner_task_id = consumable_predecessor_task_id(card, task_id)
     if (
         not request_id
-        or predecessor_task_id != task_id
+        or predecessor_task_id != owner_task_id
         or str(rework_overlay_packet.get("predecessor_request_id") or "")
         != request_id
         or str(rework_overlay_packet.get("predecessor_task_id") or "")
-        != task_id
+        != owner_task_id
     ):
         raise WorkspaceError("crash_retry_predecessor_identity_mismatch")
 
@@ -91,7 +95,7 @@ def materialize_crash_retry_packet(
     predecessor_workspace = metadata.get("workspace")
     if (
         str(metadata.get("request_id") or "") != request_id
-        or str(metadata.get("task_id") or "") != task_id
+        or str(metadata.get("task_id") or "") != owner_task_id
         or not isinstance(predecessor_workspace, dict)
     ):
         raise WorkspaceError("crash_retry_predecessor_metadata_identity_mismatch")
@@ -196,7 +200,7 @@ def materialize_crash_retry_packet(
         "successor_request_id": workspace.request_id,
         "successor_task_id": task_id,
         "predecessor_request_id": request_id,
-        "predecessor_task_id": task_id,
+        "predecessor_task_id": owner_task_id,
         "predecessor_state": state,
         "predecessor_exit_code": returncode,
         "predecessor_error": error,

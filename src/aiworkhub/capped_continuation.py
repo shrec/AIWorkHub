@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import copy
-from typing import Any
+from typing import Any, Mapping
 
 from . import core, launch_replay_guard, rework_delta_artifact, task_store, task_templates
 
@@ -12,6 +12,43 @@ MAX_REASON_BYTES = 8000
 MAX_CHANGED_PATHS = 256
 NOT_CAPPED = "continuation_not_capped"
 PREDECESSOR_UNVERIFIED = "continuation_predecessor_unverified"
+# Manager-only card key: written by ``task_store.inherit_capped_rework`` in the
+# same transaction as ``rework_predecessor``; ``create_task`` has no parameter
+# that could set it.
+MARKER_KEY = "capped_continuation"
+
+
+def continuation_marker(predecessor: Mapping[str, Any]) -> dict[str, str]:
+    """The binding a successor carries to the capped card whose delta it inherits."""
+    delta = predecessor.get("rework_delta")
+    return {
+        "predecessor_task_id": str(predecessor.get("task_id") or "").strip(),
+        "predecessor_request_id": str(predecessor.get("request_id") or "").strip(),
+        "delta_digest": str(
+            (delta if isinstance(delta, Mapping) else {}).get("artifact_sha256") or ""
+        ),
+    }
+
+
+def consumable_predecessor_task_id(card: Mapping[str, Any], task_id: str) -> str:
+    """The predecessor task id ``card`` (stored as ``task_id``) may consume.
+
+    The card's own id, or the capped card it continues -- but only while the
+    marker names the request of the card's current ``rework_predecessor``.  A
+    later rejection pins a new predecessor, so the marker stops matching and
+    the card's own id applies again.  The predecessor id itself never changes:
+    the sealed delta and the predecessor's process metadata are bound to it.
+    """
+    marker = card.get(MARKER_KEY)
+    predecessor = card.get("rework_predecessor")
+    if isinstance(marker, Mapping) and isinstance(predecessor, Mapping):
+        request_id = str(marker.get("predecessor_request_id") or "").strip()
+        bound = str(marker.get("predecessor_task_id") or "").strip()
+        if bound and request_id and request_id == str(
+            predecessor.get("request_id") or ""
+        ).strip():
+            return bound
+    return task_id
 
 
 def _task_exists(task_id: str) -> bool:

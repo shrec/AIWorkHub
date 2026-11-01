@@ -1,6 +1,7 @@
 """NF-2026-01837: a reject-depth-capped card continues as a successor in one call."""
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import sys
@@ -16,12 +17,18 @@ from aiworkhub import (  # noqa: E402
     capped_continuation,
     core,
     launch_replay_guard,
+    process_launcher,
+    promotion_merge,
     rework_delta_artifact,
     task_store,
     task_templates,
+    worker_workspace,
 )
 from aiworkhub.learning_commit import FailureCategory  # noqa: E402
 
+# Captured before the ``repo`` fixture patches them, for the end-to-end path.
+_REAL_CREATE_TASK = core.create_task
+_REAL_HAS_VERIFIED_REWORK_DELTA = rework_delta_artifact.has_verified_rework_delta
 _NOW = "2026-10-30T00:00:00+00:00"
 _RUNNER = "claude_task_mcp_runtime_wiring"
 _TOPIC = "task_mcp"
@@ -311,3 +318,221 @@ def test_continue_capped_named_template_provenance_passes_through(repo, monkeypa
     (call,) = core._created_for_test
     assert call["template_provenance"] == named
     assert call.get("custom_template_escape") in (None, "")
+
+
+# NF-2026-01908: the successor must be able to launch from the inherited delta.
+_SUCCESSOR_REQUEST = "5" * 32
+_PRED_REQUEST = "6" * 32
+_PRED_BYTES = b"def inherited():\n    return 'sealed by the capped card'\n"
+_BASE_OID = "c" * 40
+
+
+def _marker(task_id: str, request_id: str) -> dict:
+    return {
+        "predecessor_task_id": task_id,
+        "predecessor_request_id": request_id,
+        "delta_digest": _DIGEST,
+    }
+
+
+def _sealed_predecessor(root: Path, task_id: str, scratch: Path) -> dict:
+    """A rework predecessor bound to ``task_id`` with a real, verified sealed delta."""
+    root = root.resolve()
+    artifact = worker_workspace.seal_rework_delta_artifact(
+        root,
+        task_id,
+        _PRED_REQUEST,
+        1,
+        [("src/existing.py", _PRED_BYTES)],
+        rework_delta_artifact.configured_runtime_root(root) / "rework_deltas",
+    )
+    # The predecessor's worktree is gone: only the sealed delta can seed it.
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id=_PRED_REQUEST,
+        repo=root,
+        path=scratch / "collected" / "worktree",
+        home=scratch / "collected" / "home",
+        allowed_writes=("src/existing.py",),
+        parent_baseline={},
+        workspace_baseline={},
+        base_oid=_BASE_OID,
+    )
+    predecessor = {
+        "schema_id": "aiworkhub.rework_predecessor.v1",
+        "request_id": _PRED_REQUEST,
+        "task_id": task_id,
+        "claim_epoch": 1,
+        "changed_path_hashes": {
+            "src/existing.py": hashlib.sha256(_PRED_BYTES).hexdigest()
+        },
+        "workspace": workspace.as_metadata(),
+        "delta_artifact": {"path": artifact["path"], "digest": artifact["digest"]},
+        "rework_delta": {
+            "schema_id": "aiworkhub.rework_delta_descriptor.v1",
+            "sealed": True,
+            "authority_repo": str(root),
+            "task_id": task_id,
+            "request_id": _PRED_REQUEST,
+            "claim_epoch": 1,
+            "artifact_path": artifact["path"],
+            "artifact_sha256": artifact["digest"],
+        },
+    }
+    assert _REAL_HAS_VERIFIED_REWORK_DELTA(predecessor, authority_repo=root)
+    return predecessor
+
+
+def test_successor_launch_consumes_the_inherited_sealed_delta(repo, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        rework_delta_artifact, "has_verified_rework_delta", _REAL_HAS_VERIFIED_REWORK_DELTA
+    )
+    _capped(repo, "NF1908_CAP", with_delta=False)
+    _rewrite_card(
+        repo, "NF1908_CAP",
+        rework_predecessor=_sealed_predecessor(repo, "NF1908_CAP", tmp_path),
+    )
+
+    result = core.continue_capped_task("NF1908_CAP", reason="decompose by module")
+
+    successor_id = result["continuation"]["successor_task_id"]
+    card = _card(repo, successor_id)
+    # The predecessor stays bound to the capped card's id; the marker carries it.
+    assert card["rework_predecessor"]["task_id"] == "NF1908_CAP"
+    assert card["rework_predecessor"]["rework_delta"]["task_id"] == "NF1908_CAP"
+    assert card[capped_continuation.MARKER_KEY] == {
+        "predecessor_task_id": "NF1908_CAP",
+        "predecessor_request_id": _PRED_REQUEST,
+        "delta_digest": result["continuation"]["delta_digest"],
+    }
+    assert capped_continuation.consumable_predecessor_task_id(card, successor_id) == "NF1908_CAP"
+
+    # Launch preparation in ProcessManager._launch_isolated order: the workspace
+    # overlays the predecessor, then the rework overlay and crash-retry packets
+    # are materialized under the successor's own task id.
+    worktree = tmp_path / "successor" / "worktree"
+    home = tmp_path / "successor" / "home"
+    worktree.mkdir(parents=True)
+    home.mkdir(parents=True)
+    # A plain directory is not an isolated worktree: pin its base to the
+    # predecessor's so only the delta materialization runs, no drift rebase.
+    monkeypatch.setattr(
+        promotion_merge, "_isolated_worktree_base_oid", lambda *_a, **_k: _BASE_OID
+    )
+    allowed = tuple(card["allowed_writes"])
+    seeded, _source = worker_workspace._materialize_rework_predecessor(
+        repo.resolve(), worktree, card, allowed
+    )
+    assert seeded == ["src/existing.py"]
+    assert (worktree / "src" / "existing.py").read_bytes() == _PRED_BYTES
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id=_SUCCESSOR_REQUEST,
+        repo=repo.resolve(),
+        path=worktree,
+        home=home,
+        allowed_writes=allowed,
+        parent_baseline={},
+        workspace_baseline={},
+        inherited_rework_paths=tuple(seeded),
+    )
+    _overlay_path, overlay = process_launcher._materialize_worker_rework_overlay(
+        workspace, task_id=successor_id, card=card
+    )
+    assert overlay is not None
+    assert overlay["successor_task_id"] == successor_id
+    assert overlay["predecessor_task_id"] == "NF1908_CAP"
+
+    process_dir = tmp_path / "processes"
+    process_dir.mkdir()
+    process_launcher.write_json_0600(
+        process_dir / f"{_PRED_REQUEST}.request.json",
+        {"request_id": _PRED_REQUEST, "task_id": "NF1908_CAP", "workspace": {"repo": str(repo)}},
+    )
+    process_launcher.write_json_0600(
+        process_dir / f"{_PRED_REQUEST}.supervisor.json",
+        {"state": "supervisor_error", "exit_code": 1, "error": "bridge crashed"},
+    )
+    (process_dir / f"{_PRED_REQUEST}.stdout.log").write_text("step\n", encoding="utf-8")
+    (process_dir / f"{_PRED_REQUEST}.stderr.log").write_text("predecessor-error\n", encoding="utf-8")
+
+    path, packet = process_launcher._materialize_crash_retry_packet(
+        process_dir, workspace, task_id=successor_id, card=card, rework_overlay_packet=overlay
+    )
+
+    assert path is not None and packet is not None
+    assert packet["successor_task_id"] == successor_id
+    assert packet["predecessor_task_id"] == "NF1908_CAP"
+    assert "predecessor-error" in packet["stderr_tail"]
+
+
+def test_consumable_predecessor_requires_a_marker_naming_the_current_request():
+    predecessor = {"request_id": _PRED_REQUEST, "task_id": "OLD"}
+    consumable = capped_continuation.consumable_predecessor_task_id
+
+    assert consumable({"rework_predecessor": predecessor}, "NEW") == "NEW"
+    assert consumable(
+        {"rework_predecessor": predecessor, capped_continuation.MARKER_KEY: _marker("OLD", "7" * 32)},
+        "NEW",
+    ) == "NEW"
+    assert consumable({capped_continuation.MARKER_KEY: _marker("OLD", _PRED_REQUEST)}, "NEW") == "NEW"
+    assert consumable(
+        {"rework_predecessor": predecessor, capped_continuation.MARKER_KEY: _marker("OLD", _PRED_REQUEST)},
+        "NEW",
+    ) == "OLD"
+
+
+def test_a_marker_naming_another_request_still_refuses_the_crash_retry(tmp_path):
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id=_SUCCESSOR_REQUEST,
+        repo=tmp_path,
+        path=tmp_path / "worktree",
+        home=tmp_path / "home",
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+        inherited_rework_paths=("src/existing.py",),
+    )
+    card = {
+        "rework_predecessor": {"request_id": _PRED_REQUEST, "task_id": "OTHER_TASK"},
+        capped_continuation.MARKER_KEY: _marker("OTHER_TASK", "7" * 32),
+    }
+
+    with pytest.raises(
+        process_launcher.WorkspaceError, match="crash_retry_predecessor_identity_mismatch"
+    ):
+        process_launcher._materialize_crash_retry_packet(
+            tmp_path / "processes",
+            workspace,
+            task_id="TASK_SAME",
+            card=card,
+            rework_overlay_packet={
+                "predecessor_request_id": _PRED_REQUEST,
+                "predecessor_task_id": "OTHER_TASK",
+            },
+        )
+
+
+def test_create_task_cannot_set_the_continuation_marker():
+    with pytest.raises(TypeError, match=capped_continuation.MARKER_KEY):
+        _REAL_CREATE_TASK(
+            task_id="NF1908_FORGED",
+            title="forged",
+            runner=_RUNNER,
+            topic=_TOPIC,
+            objective="objective",
+            acceptance=["a"],
+            allowed_writes=["src/existing.py"],
+            **{capped_continuation.MARKER_KEY: _marker("OLD", _PRED_REQUEST)},
+        )
+
+
+def test_the_setter_refuses_a_successor_already_carrying_a_marker(repo):
+    _insert_task(
+        repo, "NF1908_PREMARKED", {capped_continuation.MARKER_KEY: _marker("OLD", _PRED_REQUEST)}
+    )
+    before = _snapshot(repo)
+
+    assert task_store.inherit_capped_rework(
+        repo, "NF1908_PREMARKED", rework_predecessor=_predecessor("OLD"),
+        review_feedback={}, actor=_MANAGER,
+    ) == (False, "successor_not_pristine")
+    assert _snapshot(repo) == before

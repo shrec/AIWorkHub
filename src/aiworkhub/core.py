@@ -9103,9 +9103,12 @@ def _verified_validation_replay_reroute_receipt(
     hashes = predecessor.get("changed_path_hashes")
     prior_epoch = predecessor.get("claim_epoch")
     actor = _verified_manager_actor()
+    from .capped_continuation import consumable_predecessor_task_id
+
     if (
         predecessor.get("schema_id") != "aiworkhub.rework_predecessor.v1"
-        or str(predecessor.get("task_id") or "") != task_id
+        or str(predecessor.get("task_id") or "")
+        != consumable_predecessor_task_id(card, task_id)
         or re.fullmatch(r"[0-9a-f]{32}", request_id) is None
         or type(epoch) is not int
         or type(prior_epoch) is not int
@@ -9246,6 +9249,7 @@ def _verified_retained_predecessor_receipt(
     canonical ledger even though the later launch will (correctly) reject it.
     """
     from . import worker_workspace
+    from .capped_continuation import consumable_predecessor_task_id
 
     predecessor = card.get("rework_predecessor")
     if not isinstance(predecessor, dict):
@@ -9256,7 +9260,8 @@ def _verified_retained_predecessor_receipt(
     hashes = predecessor.get("changed_path_hashes")
     if (
         predecessor.get("schema_id") != "aiworkhub.rework_predecessor.v1"
-        or str(predecessor.get("task_id") or "") != task_id
+        or str(predecessor.get("task_id") or "")
+        != consumable_predecessor_task_id(card, task_id)
         or re.fullmatch(r"[0-9a-f]{32}", request_id) is None
         or type(claim_epoch) is not int
         or claim_epoch < 1
