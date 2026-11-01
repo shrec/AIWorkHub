@@ -3289,8 +3289,8 @@ def preview_convert(
 def _card_input_refusal_reason(
     repo_root: str | Path, card: Mapping[str, Any]
 ) -> str | None:
-    """Return the worker_workspace missing-input refusal reason, or None."""
-    from . import worker_workspace
+    """Return the first refusal task creation or launch would raise, or None."""
+    from . import core, worker_workspace
 
     repo = Path(repo_root).resolve()
     try:
@@ -3304,6 +3304,16 @@ def _card_input_refusal_reason(
                 worker_workspace._parse_validation_command_detailed(command)
     except worker_workspace.WorkspaceError as exc:
         return str(exc)
+    if str(card.get("topic") or "").strip() == "quality_review":
+        return (
+            "reserved_topic:quality_review: this topic belongs to reviewer cards "
+            "launched by aiworkhub_quality_reviewer_launch, not NeedFix cards"
+        )
+    rows = core.task_card_path_conflicts(dict(card))
+    if rows:
+        return "contradictory_task_path_contract:" + ";".join(
+            f"{r['field']}={r['path']}~{r['forbidden']}" for r in rows[:4]
+        )
     return None
 
 
