@@ -566,8 +566,18 @@ def derive_risk_signals(
     if len(paths) > 1:
         signals.add("combined_change")
 
+    def is_test_path(path: str) -> bool:
+        base = path.rsplit("/", 1)[-1]
+        return (
+            path.split("/", 1)[0] == "tests"
+            or (base.startswith("test_") and base.endswith(".py"))
+            or base.endswith("_test.py")
+        )
+
+    production = tuple(path for path in lowered if not is_test_path(path))
+
     def path_has(*markers: str) -> bool:
-        return any(any(marker in path for marker in markers) for path in lowered)
+        return any(any(marker in path for marker in markers) for path in production)
 
     if path_has("/__init__.py", "/api/", "server.py", "runtime_adapters.py", "public/"):
         signals.add("public_api")
