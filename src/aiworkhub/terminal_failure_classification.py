@@ -527,6 +527,9 @@ _CONTROL_PLANE_REASONS: tuple[str, ...] = (
     "worktree_is_not_detached_and_isolated",
     PROVIDER_NO_EFFECT,
     PROVIDER_TEXT_TOOL_CALL_PROTOCOL,
+    # worker_workspace.py:7481 mints ``"validation_exec_scratch_unavailable:" +
+    # ";".join(tried)`` (NF-2026-01871); previously filed as ``unclassified``.
+    "validation_exec_scratch_unavailable",
     # ------------------------------------------------------------------ #
     # WRAPPERS ONLY BELOW THIS LINE -- see the ordering note above.
     #

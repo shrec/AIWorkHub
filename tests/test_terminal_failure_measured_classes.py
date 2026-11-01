@@ -660,6 +660,23 @@ def test_a_missing_review_worktree_is_named_not_unclassified(error: str) -> None
     assert tfc._control_plane_code(error) == _WORKTREE_NOT_ISOLATED
 
 
+@pytest.mark.parametrize(
+    "tail",
+    ["C:\\Temp:noexec", "/tmp/x:permission denied;/var/tmp:Permission denied"],
+)
+def test_validation_exec_scratch_unavailable_is_named_not_unclassified(tail: str) -> None:
+    """NF-2026-01871: worker_workspace mints this reason; a ``permission denied``
+    tail must not win ``auth_forbidden``."""
+    literal = "validation_exec_scratch_unavailable"
+    result = tfc.terminal_event_authority(
+        state="finalize_failed", exit_code=0, error=f"{literal}:{tail}",
+    )
+    assert result["diagnostic"] == f"finalize_failed:{literal}:exit_code=0"
+    assert "unclassified" not in result["diagnostic"]
+    assert "auth_forbidden" not in result["diagnostic"]
+    assert tfc._control_plane_code(f"{literal}:{tail}") == literal
+
+
 def test_the_missing_worktree_reason_stays_out_of_the_workspace_error_set() -> None:
     """The workspace-error reason set is deliberately narrow; this reason is
     recognised through the control-plane vocabulary only."""
