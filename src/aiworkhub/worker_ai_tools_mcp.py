@@ -8183,6 +8183,8 @@ class WorkerSemanticEditSession:
     def __init__(self, ctx: WorkerToolContext) -> None:
         self.ctx = ctx
         self._targets: dict[str, semantic_edit.PreparedLineTarget] = {}
+        # NF-2026-01928: a create target binds a path that must not exist yet.
+        self._create_targets: dict[str, str] = {}
         self._receipts: dict[str, dict[str, Any]] = {}
         self._one_shot_calls: dict[str, dict[str, Any]] = {}
         self._delivered: dict[tuple[str, str], list[tuple[int, int, str]]] = {}
@@ -8286,8 +8288,15 @@ class WorkerSemanticEditSession:
         include_fragment: bool = False,
         expected_first_line: str | None = None,
         expected_last_line: str | None = None,
+        create: bool = False,
     ) -> dict[str, Any]:
         tool = "semantic_edit_prepare"
+        if create is not False:
+            return self._prepare_create(
+                file_path=file_path, start_line=start_line, end_line=end_line,
+                create=create, expected_first_line=expected_first_line,
+                expected_last_line=expected_last_line,
+            )
         try:
             target = semantic_edit.prepare_line_target(
                 self.ctx.repo,
@@ -8347,6 +8356,70 @@ class WorkerSemanticEditSession:
         )
         return {"ok": True, "tool": tool, **receipt}
 
+    _CREATE_NEXT_CALL = (
+        "To create a NEW file call aiworkhub_worker_semantic_edit_prepare with "
+        "{file_path, start_line: 0, end_line: 0, create: true} and no anchors, "
+        "then aiworkhub_worker_semantic_edit_apply with {target_id, new: <the "
+        "whole file content>, idempotency_key}."
+    )
+
+    def _prepare_create(
+        self, *, file_path: str, start_line: int, end_line: int, create: Any,
+        expected_first_line: str | None, expected_last_line: str | None,
+    ) -> dict[str, Any]:
+        """Bind a path that must not exist yet (NF-2026-01928).
+
+        The containment, ``allowed_writes`` and absence checks are the shared
+        :func:`semantic_edit_applier.create_target`; ``apply`` repeats them
+        when it writes, so a path that appeared in between is refused.
+        """
+
+        tool = "semantic_edit_prepare"
+        invalid_fields = [
+            name for name, bad in (
+                ("create", create is not True),
+                ("start_line", start_line != 0 or isinstance(start_line, bool)),
+                ("end_line", end_line != 0 or isinstance(end_line, bool)),
+                ("expected_first_line", not _input_left_out(expected_first_line)),
+                ("expected_last_line", not _input_left_out(expected_last_line)),
+            ) if bad
+        ]
+        if invalid_fields:
+            return _violation(
+                self.ctx, tool, "semantic_edit_create_input_invalid",
+                invalid_fields=invalid_fields, next_call=self._CREATE_NEXT_CALL,
+            )
+        try:
+            relative = semantic_edit_applier.create_target(
+                self.ctx.repo, file_path, allowed_writes=self.ctx.allowed_writes,
+            )
+        except semantic_edit.SemanticEditError as exc:
+            return _violation(self.ctx, tool, str(exc))
+        target_id = secrets.token_hex(16)
+        with self._lock:
+            self._create_targets[target_id] = relative
+        receipt = {
+            "target_id": target_id,
+            "path": relative,
+            "create": True,
+            "start_line": 0,
+            "end_line": 0,
+            "current_sha256": "",
+            "file_bytes": 0,
+        }
+        _append_audit(
+            self.ctx,
+            tool=tool,
+            ok=True,
+            cache_hit=False,
+            hit_count=1,
+            bytes_returned=0,
+            authority_source="worker_workspace",
+            authority_state="hash_bound_fragment",
+            payload=receipt,
+        )
+        return {"ok": True, "tool": tool, **receipt}
+
     def apply(
         self, *, target_id: str, new: str, idempotency_key: str,
         allow_escape_level_change: bool = False,
@@ -8382,6 +8455,7 @@ class WorkerSemanticEditSession:
         with self._lock:
             existing = self._receipts.get(idempotency_key)
             target = self._targets.get(target_id)
+            created_path = self._create_targets.get(target_id)
         if existing is not None:
             # A replay is the SAME operation only when it names the same
             # prepared target AND the identical replacement bytes.  The cache
@@ -8397,16 +8471,26 @@ class WorkerSemanticEditSession:
                     self.ctx, tool, "semantic_edit_idempotency_key_conflict"
                 )
             return {**existing["receipt"], "idempotent_replay": True}
-        if target is None:
+        if target is None and created_path is None:
             return _violation(self.ctx, tool, "semantic_edit_target_unknown")
         try:
-            with semantic_edit.escape_level_change_allowed(allow_escape_level_change):
-                next_text, metrics = semantic_edit_applier.replace_prepared_range(
+            if created_path is not None:
+                # NF-2026-01928: the shared create re-checks allowed_writes,
+                # containment and absence, and never overwrites.
+                next_text, metrics = semantic_edit_applier.create_new_file(
                     self.ctx.repo,
-                    target,
+                    created_path,
                     new,
                     allowed_writes=self.ctx.allowed_writes,
                 )
+            else:
+                with semantic_edit.escape_level_change_allowed(allow_escape_level_change):
+                    next_text, metrics = semantic_edit_applier.replace_prepared_range(
+                        self.ctx.repo,
+                        target,
+                        new,
+                        allowed_writes=self.ctx.allowed_writes,
+                    )
         except (OSError, semantic_edit.SemanticEditError) as exc:
             # The edge-drop and escape-level refusals name the offending lines
             # and the next call; the file was not written.
@@ -8419,16 +8503,16 @@ class WorkerSemanticEditSession:
             "tool": tool,
             "schema_id": "aiworkhub.semantic_edit_apply_receipt.v1",
             "target_id": target_id,
-            "path": target.path,
+            "path": target.path if target is not None else created_path,
             # The range actually replaced: content anchors may have moved it
             # off the one the caller first asked prepare for.
-            "start_line": target.start_line,
-            "end_line": target.end_line,
-            "before_sha256": target.current_sha256,
+            "start_line": target.start_line if target is not None else 0,
+            "end_line": target.end_line if target is not None else 0,
+            "before_sha256": target.current_sha256 if target is not None else "",
             "after_sha256": hashlib.sha256(next_bytes).hexdigest(),
             "idempotency_key": idempotency_key,
             "idempotent_replay": False,
-            "file_bytes": target.file_bytes,
+            "file_bytes": target.file_bytes if target is not None else 0,
             **metrics,
         }
         # The authenticated audit record is part of the apply contract, not a
@@ -8460,7 +8544,7 @@ class WorkerSemanticEditSession:
                 "tool": tool,
                 "reason": "semantic_edit_apply_not_durable",
                 "target_id": target_id,
-                "path": target.path,
+                "path": receipt["path"],
             }
         # Only cache a receipt the ledger actually recorded (or that needed no
         # ledger); caching a non-durable apply would let a same-key retry
@@ -10216,6 +10300,7 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
         include_fragment: bool = False,
         expected_first_line: str | None = None,
         expected_last_line: str | None = None,
+        create: bool = False,
     ) -> dict[str, Any]:
         """Bind one Source Graph-selected line range's hashes for apply.
 
@@ -10226,12 +10311,17 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
         include_fragment=true to force the text.
         expected_first_line/expected_last_line: the exact text of the first/last line to replace.
         apply's `new` replaces the WHOLE prepared range: prepare only lines you change or delete.
+        create=true with start_line=0, end_line=0 and no anchors binds a NEW
+        file instead: refused if the path exists, escapes the worktree, sits
+        under a symlink/junction or is outside allowed_writes; apply's `new`
+        is then the whole file.
         """
         return semantic_edits.prepare(
             file_path=file_path, start_line=start_line, end_line=end_line,
             include_fragment=include_fragment,
             expected_first_line=expected_first_line,
             expected_last_line=expected_last_line,
+            create=create,
         )
 
     @mcp.tool(name="aiworkhub_worker_semantic_edit_apply")

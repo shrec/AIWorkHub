@@ -16,6 +16,10 @@ what it exposed and what it emitted.
     replacement lines
     NEW
 
+A NEW file is made the same way, never by overwriting (NF-2026-01928):
+
+    python3 scripts/manager_semantic_edit.py --create --path tests/test_new.py < content.py
+
 Read the range first (``sed -n '10,14p'``, or a Source Graph body slice) so the
 replacement is written against bytes that were actually seen.
 """
@@ -23,6 +27,7 @@ replacement is written against bytes that were actually seen.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -34,6 +39,52 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
 from aiworkhub import semantic_edit, semantic_edit_applier  # noqa: E402
 
 
+def _create(root: Path, path: str, new_file: str | None) -> int:
+    """NF-2026-01928: create one NEW file with exactly the given bytes.
+
+    Content is decoded as strict UTF-8 and written with no newline
+    translation, so the file is byte-exact with stdin (or ``--new-file``).
+    The shared :func:`semantic_edit_applier.create_new_file` refuses an
+    existing path, an absolute or ``..`` path and a symlink/junction parent.
+    """
+
+    try:
+        raw = Path(new_file).read_bytes() if new_file else sys.stdin.buffer.read()
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        print(json.dumps({
+            "ok": False,
+            "error": "replacement_not_utf8",
+            "reason": f"replacement_not_utf8:{exc}",
+        }), file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(json.dumps({"ok": False, "reason": f"semantic_edit_content_unreadable:{exc}"}),
+              file=sys.stderr)
+        return 1
+    try:
+        relative = semantic_edit.normalize_relative_path(path)
+        _text, metrics = semantic_edit_applier.create_new_file(
+            root, relative, content, allowed_writes=[relative]
+        )
+    except (OSError, semantic_edit.SemanticEditError) as exc:
+        print(json.dumps({"ok": False, "reason": str(exc), **getattr(exc, "detail", {})}),
+              file=sys.stderr)
+        return 1
+    receipt = {
+        "ok": True,
+        "schema_id": "aiworkhub.manager_semantic_edit_receipt.v1",
+        "path": relative,
+        "start_line": 0,
+        "end_line": 0,
+        "before_sha256": "",
+        "after_sha256": hashlib.sha256(raw).hexdigest(),
+        **{k: v for k, v in metrics.items() if isinstance(v, (int, float, bool, str))},
+    }
+    print(json.dumps(receipt, sort_keys=True))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="manager-semantic-edit",
@@ -41,8 +92,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--repo", default=None, help="repository root (default: cwd)")
     parser.add_argument("--path", required=True, help="repo-relative file path")
-    parser.add_argument("--start", type=int, required=True, help="first line, 1-based")
-    parser.add_argument("--end", type=int, required=True, help="last line, inclusive")
+    parser.add_argument("--start", type=int, default=None, help="first line, 1-based")
+    parser.add_argument("--end", type=int, default=None, help="last line, inclusive")
+    parser.add_argument(
+        "--create",
+        action="store_true",
+        default=False,
+        help="create --path as a NEW file holding exactly the given content; "
+        "refused if anything exists there (no --start/--end/anchors)",
+    )
     parser.add_argument(
         "--new-file",
         default=None,
@@ -65,8 +123,15 @@ def main(argv: list[str] | None = None) -> int:
         help="anchor: expected content of the last line of the range",
     )
     args = parser.parse_args(argv)
+    range_args = (args.start, args.end, args.expected_first_line, args.expected_last_line)
+    if args.create and any(value is not None for value in range_args):
+        parser.error("--create takes no --start/--end/--expected-* arguments")
+    if not args.create and (args.start is None or args.end is None):
+        parser.error("--start and --end are required unless --create is given")
 
     root = Path(args.repo).resolve() if args.repo else Path.cwd().resolve()
+    if args.create:
+        return _create(root, args.path, args.new_file)
     if args.new_file:
         new = Path(args.new_file).read_text(encoding="utf-8")
     else:
