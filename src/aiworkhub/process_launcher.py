@@ -52,6 +52,9 @@ from .required_output_glob import GLOB_SIBLING_UNCHANGED_REASON, split_glob_unch
 from .platform_io import (
     AdvisoryLockTimeout,
     atomic_replace,
+    clear_lock_holder,
+    describe_lock_holder,
+    record_lock_holder,
     available_memory_bytes as _available_memory_bytes,
     chmod_fd,
     chmod_path,
@@ -4243,10 +4246,18 @@ class ProcessManager:
         fd = os.open(lock_path, flags, 0o600)
         chmod_fd(fd, 0o600)
         with os.fdopen(fd, "a+", encoding="utf-8") as fh:
-            lock_fd(fh.fileno(), blocking=True)
+            try:
+                lock_fd(fh.fileno(), blocking=True)
+            except TimeoutError as exc:
+                raise AdvisoryLockTimeout(
+                    f"{exc} {describe_lock_holder(lock_path)}",
+                    errno=getattr(exc, "errno", None),
+                ) from exc
+            record_lock_holder(lock_path, caller_function="_registry_lock")
             try:
                 yield
             finally:
+                clear_lock_holder(lock_path)
                 unlock_fd(fh.fileno())
 
     @contextmanager
@@ -7530,6 +7541,31 @@ class ProcessManager:
             return request_id in self._live
 
     def _reviewer_spawn_transition(
+        self,
+        request_id: str,
+        binding: dict[str, Any] | None = None,
+        *,
+        reviewer_claim_epoch: Any = None,
+    ) -> bool:
+        """Run the locked spawn-commit CAS, retrying a transient lock timeout.
+
+        An advisory registry-lock timeout is contention, not a verdict: each of
+        three attempts re-takes the snapshot, so the CAS semantics are
+        unchanged and the last timeout propagates only when all of them lose.
+        """
+
+        for backoff_seconds in (0.5, 1.0):
+            try:
+                return self._reviewer_spawn_transition_once(
+                    request_id, binding, reviewer_claim_epoch=reviewer_claim_epoch
+                )
+            except AdvisoryLockTimeout:
+                time.sleep(backoff_seconds)
+        return self._reviewer_spawn_transition_once(
+            request_id, binding, reviewer_claim_epoch=reviewer_claim_epoch
+        )
+
+    def _reviewer_spawn_transition_once(
         self,
         request_id: str,
         binding: dict[str, Any] | None = None,

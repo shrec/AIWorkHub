@@ -21,6 +21,7 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import unicodedata
@@ -2465,6 +2466,70 @@ def _advisory_lock_timeout(
         f"(last errno {_advisory_lock_errno_symbol(observed_errno)})",
         errno=observed_errno,
     )
+
+
+def lock_holder_sidecar_path(lock_path: str | os.PathLike[str]) -> Path:
+    """Return the diagnostic sidecar beside ``lock_path``, never the lock itself."""
+
+    return Path(f"{lock_path}.holder.json")
+
+
+def record_lock_holder(
+    lock_path: str | os.PathLike[str], *, caller_function: str
+) -> None:
+    """Best-effort record of who holds ``lock_path`` (pid, thread, time, callsite).
+
+    The record lives in a sidecar so the locked byte range is never touched; a
+    write failure only degrades a later timeout message to ``holder=unknown``.
+    """
+
+    frame = sys._getframe(1)
+    while frame is not None and (
+        frame.f_code.co_name == caller_function
+        or frame.f_code.co_filename.endswith("contextlib.py")
+    ):
+        frame = frame.f_back
+    label = f"{frame.f_code.co_name}:{frame.f_lineno}" if frame else "unknown"
+    payload = json.dumps(
+        {
+            "pid": os.getpid(),
+            "thread": threading.current_thread().name,
+            "acquired_at": time.time(),
+            "label": label,
+        }
+    )
+    sidecar = lock_holder_sidecar_path(lock_path)
+    temp = Path(f"{sidecar}.{os.getpid()}.tmp")
+    try:
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        os.replace(temp, sidecar)
+    except OSError:
+        with contextlib.suppress(OSError):
+            temp.unlink()
+
+
+def clear_lock_holder(lock_path: str | os.PathLike[str]) -> None:
+    """Remove the holder record; call while still holding the lock."""
+
+    with contextlib.suppress(OSError):
+        lock_holder_sidecar_path(lock_path).unlink()
+
+
+def describe_lock_holder(lock_path: str | os.PathLike[str]) -> str:
+    """Return ``holder=<pid>:<label>:held_ms=<n>`` or ``holder=unknown``."""
+
+    try:
+        record = json.loads(
+            lock_holder_sidecar_path(lock_path).read_text(encoding="utf-8")
+        )
+        pid = int(record["pid"])
+        label = str(record.get("label") or "unknown")
+        held_ms = max(0, int((time.time() - float(record["acquired_at"])) * 1000))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError):
+        return "holder=unknown"
+    return f"holder={pid}:{label}:held_ms={held_ms}"
 
 
 def windows_pid_is_alive(pid: int) -> bool:
