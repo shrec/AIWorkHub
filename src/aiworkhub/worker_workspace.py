@@ -287,11 +287,11 @@ _VALIDATION_WORKER_PACKAGE_SUPPORT = (
     "pyproject.toml",
     "src/aiworkhub/__init__.py",
     "src/aiworkhub/_version.py",
-    # Every sibling this module resolves at runtime rather than through a
-    # static import statement.  ``_resolve_local_python_imports`` cannot see a
-    # file-location load or an ``__import__`` call, so they are materialized
-    # from the single ``RUNTIME_LOADED_PACKAGE_SIBLINGS`` declaration instead
-    # of a hand-maintained second list that drifts (NF-2026-00841).
+    # Siblings loaded at runtime, invisible to ``_resolve_local_python_imports``
+    # (file-location load / ``__import__``), come from the single
+    # ``RUNTIME_LOADED_PACKAGE_SIBLINGS`` declaration (NF-2026-00841).
+    # provider_tool_guards reads this one as bytes via with_name (NF-2026-01886).
+    "src/aiworkhub/tool_guard_hook.py",
     *(
         f"src/aiworkhub/{filename}"
         for _module_name, filename in RUNTIME_LOADED_PACKAGE_SIBLINGS

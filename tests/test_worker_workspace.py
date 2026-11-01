@@ -644,6 +644,8 @@ def _commit_validation_worker_package(repo: Path) -> None:
         # worker_workspace imports its trusted host-tool set from this
         # dependency-free sibling (NF-2026-01114).
         "validation_toolchains.py",
+        # provider_tool_guards reads it as bytes, so the support tuple seeds it (NF-2026-01886).
+        "tool_guard_hook.py",
         # worker_workspace's AppContainer validation helper imports these two
         # siblings by name, so the declared seed closure resolves them and this
         # fixture repository has to track them and their own closure.
