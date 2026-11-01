@@ -4070,6 +4070,29 @@ def _sealed_lens_attempts(
     return rows
 
 
+# NF-2026-01929: the replace-fold projection weighed 113 MiB against the 64 MiB
+# cache bound, so it was never retained and every call was a 12-16 s cold
+# replay. These heavy fields are dropped from the CACHED rows because no reader
+# of ``_latest_by_request`` / ``_latest_by_request_stable`` /
+# ``_resolved_reservation_snapshot`` results reads them (Source Graph bodygrep
+# of this module; every other key, incl. quality_review_receipt and
+# worker_mcp_gate, which are read, is kept):
+#   validation   -- every ``get("validation")`` here reads the task card or
+#                   terminal_review evidence; the finalizer's prior-usage and
+#                   host-lane reads walk per-request ``events``, not this map.
+#   usage        -- ``row.get("usage")`` reads the per-request ``events`` list;
+#                   spend is recorded from the provider log, not this map.
+#   token_budget -- written from ``supervisor_status``, never read from rows.
+#   accepted_outcome_receipt -- only the ``_accepted_outcome_receipt`` builder
+#                   is referenced; no row key lookup exists.
+_LATEST_BY_REQUEST_DROP_FIELDS = (
+    "accepted_outcome_receipt",
+    "token_budget",
+    "usage",
+    "validation",
+)
+
+
 class ProcessManager:
     """Thread-safe local process registry with append-only lifecycle events."""
 
@@ -4493,6 +4516,7 @@ class ProcessManager:
             key_field="request_id",
             skip_event_kinds=(RUNTIME_NOTICE_EVENT_KIND,),
             replace=True,
+            drop_fields=_LATEST_BY_REQUEST_DROP_FIELDS,
         )
         # Claim binding is an immutable event in its own right, not a second
         # reservation.  Its payload is a complete snapshot of the reservation
