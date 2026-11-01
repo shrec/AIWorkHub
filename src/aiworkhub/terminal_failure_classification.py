@@ -530,6 +530,9 @@ _CONTROL_PLANE_REASONS: tuple[str, ...] = (
     # worker_workspace.py:7481 mints ``"validation_exec_scratch_unavailable:" +
     # ";".join(tried)`` (NF-2026-01871); previously filed as ``unclassified``.
     "validation_exec_scratch_unavailable",
+    # db_writer.py mints ``"write_lease_timeout:task_queue.sqlite:waited_ms=..."``
+    # (NF-2026-01912); retryable via aiworkhub_agent_retry_finalization.
+    "write_lease_timeout",
     # ------------------------------------------------------------------ #
     # WRAPPERS ONLY BELOW THIS LINE -- see the ordering note above.
     #

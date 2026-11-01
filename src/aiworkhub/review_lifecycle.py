@@ -718,9 +718,9 @@ def lifecycle_counts(db_path: str | Path) -> dict[str, int]:
     reader deciding whether the orchestrator has work cannot tell those apart
     from one number, and 'pending' read as a backlog it would never work off.
     """
-    conn = _connect(db_path)
+    _ensure_schema_released(db_path)
+    conn = _read_connection(db_path)
     try:
-        ensure_schema(conn)
         _verify_all_chains(conn)
         return _state_counts(conn)
     finally:
@@ -837,9 +837,9 @@ def drain_projection(
     """
 
     moment = now if now is not None else datetime.now(timezone.utc)
-    conn = _connect(db_path)
+    _ensure_schema_released(db_path)
+    conn = _read_connection(db_path)
     try:
-        ensure_schema(conn)
         _verify_all_chains(conn)
         return DrainProjection(
             counts=_state_counts(conn),
@@ -1034,6 +1034,61 @@ def _read_connection(db_path: str | Path) -> sqlite3.Connection:
     conn = connect_readonly(db_path)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+_SCHEMA_TRIGGER_NAMES = (
+    "trg_review_action_completed_no_update",
+    "trg_review_action_completed_no_delete",
+)
+
+
+def _schema_is_current(db_path: str | Path) -> bool:
+    if not Path(db_path).is_file():
+        return False
+    try:
+        conn = _read_connection(db_path)
+    except sqlite3.Error:
+        return False
+    try:
+        for table, column in (
+            ("review_action_outbox", "retired_due_to_action_id"),
+            ("review_action_outbox", "receipt_commitment_sha256"),
+            ("review_chains", "contract_identity_sha256"),
+            ("review_reservation_state", "round_high_watermark"),
+        ):
+            columns = {
+                str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")
+            }
+            if column not in columns:
+                return False
+        for table in ("review_reconciliation_state", "review_reservation_state"):
+            if conn.execute(f"SELECT 1 FROM {table} WHERE id=1").fetchone() is None:
+                return False
+        triggers = {
+            str(row[0])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'")
+        }
+        return all(name in triggers for name in _SCHEMA_TRIGGER_NAMES)
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+
+
+def _ensure_schema_released(db_path: str | Path) -> None:
+    """Create or upgrade the schema under a short lease released on return.
+
+    A store whose schema is already current is not touched, so read-only
+    projections never queue behind the task_queue write lease.
+    """
+    if _schema_is_current(db_path):
+        return
+    conn = _connect(db_path)
+    try:
+        ensure_schema(conn)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _canonical_sha256(value: str, field: str) -> str:
@@ -1640,9 +1695,9 @@ def replay_sources(
 
 
 def rows_for_test(db_path: str | Path) -> list[dict[str, Any]]:
-    conn = _connect(db_path)
+    _ensure_schema_released(db_path)
+    conn = _read_connection(db_path)
     try:
-        ensure_schema(conn)
         return [
             dict(row)
             for row in conn.execute(
@@ -1776,10 +1831,9 @@ def terminal_route_binding_failures(
 ) -> list[ReviewAction]:
     """Return exact failed accept actions that require a live binding recheck."""
     limit = max(1, min(int(batch_limit), RECONCILE_BATCH_LIMIT))
-    conn = _connect(db_path)
+    _ensure_schema_released(db_path)
+    conn = _read_connection(db_path)
     try:
-        ensure_schema(conn)
-        conn.commit()
         rows = conn.execute(
             "SELECT * FROM review_action_outbox "
             "WHERE state='failed' AND action_type='accept' "

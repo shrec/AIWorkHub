@@ -677,6 +677,20 @@ def test_validation_exec_scratch_unavailable_is_named_not_unclassified(tail: str
     assert tfc._control_plane_code(f"{literal}:{tail}") == literal
 
 
+def test_write_lease_timeout_is_named_not_unclassified() -> None:
+    """NF-2026-01912: measured lease-starved finalize failure."""
+    error = (
+        "write_lease_timeout:task_queue.sqlite:waited_ms=30015:timeout_ms=30000:"
+        "holder_pid=76712:held_ms=66748:callsite=aiworkhub.review_lifecycle:_connect:1021"
+    )
+    result = tfc.terminal_event_authority(
+        state="finalize_failed", exit_code=0, error=error,
+    )
+    assert result["diagnostic"] == "finalize_failed:write_lease_timeout:exit_code=0"
+    assert "unclassified" not in result["diagnostic"]
+    assert tfc._control_plane_code(error) == "write_lease_timeout"
+
+
 def test_the_missing_worktree_reason_stays_out_of_the_workspace_error_set() -> None:
     """The workspace-error reason set is deliberately narrow; this reason is
     recognised through the control-plane vocabulary only."""
