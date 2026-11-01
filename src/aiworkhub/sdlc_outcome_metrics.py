@@ -40,6 +40,11 @@ CLAIM_BOUNDARY = (
     "never extrapolated. No causal quality claim follows."
 )
 _REJECTION_EVENTS = frozenset({"reject_review", "review_rejected"})
+# Events task_store/core write when a card is reworked, retried or replaced without a reject row.
+_REWORK_EVENTS = frozenset({
+    "blocked_rework_recovery", "retry_terminal", "transient_retry", "superseded",
+})
+_NOT_FIRST_PASS_EVENTS = _REJECTION_EVENTS | _REWORK_EVENTS
 _AUTH_STATUSES = frozenset({401, 403})
 _EFFORT_FIELDS = ("requested_profile", "option_status", "option_key", "option_value")
 _IDENTITY_NAMES = ("adapter_id", "model")
@@ -63,7 +68,8 @@ _CARD_CHUNK = 500
 # A malformed card extracts NULL rather than raising, so it is typed apart from a store error.
 _CARD_SQL = (
     "SELECT task_id, CASE WHEN json_valid(card_json) THEN json_extract(card_json, '$.topic', "
-    "'$.risk_tier', '$.project_context.task_type') END FROM tasks WHERE task_id IN ({})"
+    "'$.risk_tier', '$.project_context.task_type', '$.rework_predecessor') END "
+    "FROM tasks WHERE task_id IN ({})"
 )
 
 # CROSS JOIN keeps the newest-first accept scan outermost, so LIMIT can only cut the last history.
@@ -117,6 +123,7 @@ class TaskCardEvidence:
     cards: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     available: bool = False
     failure: str | None = None
+    rework_successors: frozenset[str] = frozenset()
 
 
 def _payload(event: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -215,6 +222,11 @@ class _Acceptance(NamedTuple):
     claim_epoch: int
     identity_key: str
     elapsed_seconds: float | None
+    reworks: int = 0
+
+    @property
+    def first_pass(self) -> bool:
+        return self.rejections == 0 and self.reworks == 0
 
 
 def _first_verified_acceptance(
@@ -228,12 +240,14 @@ def _first_verified_acceptance(
         key = _verified_identity_key(identity, repository_id) if identity else None
         if identity is None or key is None:
             continue
+        prior_events = [str(prior.get("event") or "") for prior in ordered[:index]]
         return _Acceptance(
-            sum(str(prior.get("event") or "") in _REJECTION_EVENTS for prior in ordered[:index]),
+            sum(name in _REJECTION_EVENTS for name in prior_events),
             identity["request_id"],
             identity["accepted_outcome_receipt"]["claim_epoch"],
             key,
             _seconds_between(ordered[0].get("created_at"), event.get("created_at")),
+            sum(name in _REWORK_EVENTS for name in prior_events),
         )
     return None
 
@@ -467,7 +481,11 @@ def _card_evidence(
         return task_cards
     if task_cards is None:
         return TaskCardEvidence(failure="not_supplied")
-    return TaskCardEvidence(task_cards, available=True)
+    successors = frozenset(
+        task_id for task_id, card in task_cards.items()
+        if isinstance(card, Mapping) and card.get("rework_predecessor")
+    )
+    return TaskCardEvidence(task_cards, available=True, rework_successors=successors)
 
 
 def _index_attempts(
@@ -551,7 +569,7 @@ def _arm_metrics(tasks: Sequence[_Task], cut: bool, needfix_cut: bool) -> dict[s
     sizes = [size for size, _ in capacity if size is not None]
     return {
         "first_pass_acceptance": _metric(
-            sum(task.acceptance.rejections == 0 for task in tasks), count, count, count, cut
+            sum(task.acceptance.first_pass for task in tasks), count, count, count, cut
         ),
         "review_rounds_per_accepted_task": _metric(
             sum(task.acceptance.rejections + 1 for task in tasks), count, count, count, cut
@@ -758,9 +776,11 @@ def aggregate(
     # A selected task with no events in hand can never be vouched for.
     complete = cohort.complete.intersection(per_task)
 
+    card_evidence = _card_evidence(task_cards)
     accepted_tasks = 0
     first_pass = 0
     review_rounds = 0
+    rework_successors = 0
     incomplete_tasks = 0
     unknown_tasks = 0
     excluded: list[dict[str, str]] = []
@@ -775,9 +795,12 @@ def aggregate(
             unknown_tasks += 1
             excluded.append({"task_id": task_id, "reason": "accepted_outcome_unverified"})
             continue
+        if task_id in card_evidence.rework_successors:
+            acceptance = acceptance._replace(reworks=acceptance.reworks + 1)
+            rework_successors += 1
         accepted[task_id] = acceptance
         accepted_tasks += 1
-        first_pass += int(acceptance.rejections == 0)
+        first_pass += int(acceptance.first_pass)
         review_rounds += acceptance.rejections + 1
 
     # Only a NeedFix converted into a task is attributable; the store verified and froze
@@ -830,6 +853,12 @@ def aggregate(
             "evidence_covered": accepted_tasks,
             "evidence_total": len(per_task),
         },
+        "first_pass_acceptance_basis": {
+            "counted_events": sorted(_NOT_FIRST_PASS_EVENTS),
+            "rework_successors": rework_successors,
+            "rework_predecessor_evidence": "read" if card_evidence.available else "UNKNOWN",
+            "unknown_reason": None if card_evidence.available else card_evidence.failure,
+        },
         "review_rounds_per_accepted_task": {
             "numerator": review_rounds,
             "denominator": accepted_tasks,
@@ -851,7 +880,7 @@ def aggregate(
             excluded,
             accepted,
             attempts if attempts is not None else AttemptEvidence(),
-            _card_evidence(task_cards),
+            card_evidence,
             rows,
             repository_id=repository_id,
             population_cut=events_truncated,
@@ -890,6 +919,7 @@ def read_task_cards(conn: sqlite3.Connection, task_ids: Sequence[str]) -> TaskCa
 
     ids = list(dict.fromkeys(task_ids))
     cards: dict[str, dict[str, Any]] = {}
+    successors: set[str] = set()
     try:
         for start in range(0, len(ids), _CARD_CHUNK):
             chunk = ids[start:start + _CARD_CHUNK]
@@ -897,19 +927,21 @@ def read_task_cards(conn: sqlite3.Connection, task_ids: Sequence[str]) -> TaskCa
                 _CARD_SQL.format(",".join("?" * len(chunk))), chunk
             ):
                 decoded = json.loads(fields) if isinstance(fields, str) else None
-                if not isinstance(decoded, list) or len(decoded) != 3:
+                if not isinstance(decoded, list) or len(decoded) != 4:
                     return TaskCardEvidence(failure="card_malformed")
-                topic, risk_tier, task_type = decoded
+                topic, risk_tier, task_type, predecessor = decoded
                 cards[task_id] = {
                     "topic": topic,
                     "risk_tier": risk_tier,
                     "project_context": {"task_type": task_type},
                 }
+                if predecessor:
+                    successors.add(task_id)
     except sqlite3.Error:
         return TaskCardEvidence(failure="store_error")
     except ValueError:
         return TaskCardEvidence(failure="card_malformed")
-    return TaskCardEvidence(cards, available=True)
+    return TaskCardEvidence(cards, available=True, rework_successors=frozenset(successors))
 
 
 def _project_attempt_row(row: Mapping[str, Any]) -> dict[str, Any]:
