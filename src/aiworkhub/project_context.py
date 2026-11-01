@@ -41,7 +41,9 @@ TOOL_CAPS: dict[str, dict[str, int]] = {
     "skills": {"bytes": 8 * 1024, "rows": 32},
     # Measured worst case: 8521 bytes for a 19-path Python+JS card (NF-2026-01535).
     "development_rules": {"bytes": 16 * 1024, "rows": 64},
+    "project_tools": {"bytes": 4 * 1024, "rows": 21},
 }
+PROJECT_TOOLS_LIMIT = 20
 SKILL_PACKET_SCHEMA_ID = "aiworkhub.task_mcp.skill_runtime_packet.v1"
 SKILL_SELECT_LIMIT = 4
 # The injected focus orientation is bounded by the same envelope a worker's own
@@ -1674,6 +1676,38 @@ def _skills_section(repo: Path, card: dict[str, Any]) -> dict[str, Any] | None:
     )
 
 
+def _project_tools_section(repo: Path) -> dict[str, Any] | None:
+    """Return the bounded project tool library listing, or ``None`` when empty.
+
+    No tools means no section at all (the zero-hit rule): there is nothing to
+    steer the worker toward, and an empty heading would only cost prompt bytes.
+    """
+    from . import project_tools
+
+    entries = project_tools.prompt_listing(repo, PROJECT_TOOLS_LIMIT + 1)
+    if not entries:
+        return None
+    # The instruction leads so a byte-cap cut can only drop listing rows.
+    lines = [
+        "Before writing an ad-hoc script, check this list and run the matching "
+        "tool from the worktree root."
+    ]
+    max_bytes = TOOL_CAPS["project_tools"]["bytes"]
+    included = 0
+    for entry in entries[:PROJECT_TOOLS_LIMIT]:
+        row = f"{entry['id']} - {entry['purpose']} - {entry['usage']}"
+        if len("\n".join([*lines, row]).encode("utf-8")) > max_bytes:
+            break
+        lines.append(row)
+        included += 1
+    return _section(
+        name="project_tools",
+        content="\n".join(lines),
+        truncated=included < len(entries),
+        hit_count=included,
+    )
+
+
 def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextResult | None:
     """Return a compact trusted bundle, or ``None`` when no contract exists."""
 
@@ -1828,6 +1862,12 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
 
     if required and not any(s["content"].strip() for s in sections):
         raise ProjectContextError("project_context_required_empty_evidence")
+
+    # Appended after the guard: a tools/ library is steering text, not contract
+    # evidence, so it must never satisfy the required-evidence check.
+    project_tools_section = _project_tools_section(authority_repo)
+    if project_tools_section is not None:
+        sections.append(project_tools_section)
 
     raw_sections = sections
     sections = _suppress_irrelevant_sections(raw_sections)

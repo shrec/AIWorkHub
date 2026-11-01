@@ -47,6 +47,7 @@ from typing import Any
 
 from . import accept_gate
 from . import core
+from . import project_tools
 from . import recipe_runner
 from . import task_templates
 from . import tool_recipes as tr
@@ -1771,6 +1772,14 @@ def seeding_plan(root: str | Path) -> dict[str, Any]:
         {"recipe_id": recipe.id, "version": recipe.version, "reason": "universal"}
         for recipe in UNIVERSAL_RECIPES
     ]
+    # The project's own tools/ library: registered per project, so a changed
+    # tool file yields a new (id, version) and an unchanged one is a no-op.
+    library, library_refused = project_tools.scan(target)
+    for recipe in library:
+        selected.append(recipe)
+        eligible.append(
+            {"recipe_id": recipe.id, "version": recipe.version, "reason": "project_tool"}
+        )
     withheld: list[dict[str, Any]] = []
     by_id = {recipe.id: recipe for recipe in CANONICAL_RECIPES}
     for requirement in CONDITIONAL_REQUIREMENTS:
@@ -1790,6 +1799,10 @@ def seeding_plan(root: str | Path) -> dict[str, Any]:
         "selected": tuple(selected),
         "eligible": eligible,
         "withheld": withheld,
+        "library": {
+            "count": len(library),
+            "refused": dict(sorted(library_refused.items())),
+        },
         "toolchain": {
             "measured": bool(evidence["available"]),
             "declares_toolchain": bool(evidence["declares_toolchain"]),

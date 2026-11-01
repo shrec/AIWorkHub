@@ -16,6 +16,25 @@ _MAX_CONFIG_BYTES = 1 << 20
 
 
 def repo_validation_input_paths(source_root: Path) -> list[str]:
+    """Return the files every workspace must hydrate, deduplicated.
+
+    That is the files ``.aiworkhub/validation_inputs.json`` declares
+    (dot-prefixed matches skipped; a malformed config still raises) followed by
+    the project tool library (``project_tools.library_paths``), which is
+    included even when the config file is absent. A library failure adds
+    nothing and never raises.
+    """
+    declared = _declared_input_paths(source_root)
+    try:
+        from . import project_tools
+
+        library = project_tools.library_paths(source_root)
+    except Exception:  # noqa: BLE001 - the tool library is an optional extra
+        library = []
+    return list(dict.fromkeys([*declared, *library]))
+
+
+def _declared_input_paths(source_root: Path) -> list[str]:
     """Return the files the repository declares, dot-prefixed matches skipped."""
     from . import worker_workspace as _ww
 

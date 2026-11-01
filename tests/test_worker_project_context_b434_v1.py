@@ -1139,3 +1139,81 @@ def test_zero_hit_session_state_is_suppressed_from_prompt_but_credited_in_metada
     assert section["degraded_reason"] == (
         "context_tool_failed:session_current_state:session_store_unavailable"
     )
+
+
+def _library_tool(root: Path, name: str, tool_id: str) -> None:
+    tools = root / "tools"
+    tools.mkdir(exist_ok=True)
+    (tools / name).write_text(
+        f"# aiworkhub-tool id: {tool_id}\n"
+        f"# aiworkhub-tool purpose: Purpose of {tool_id}.\n"
+        f"# aiworkhub-tool usage: python tools/{name}\n",
+        encoding="utf-8",
+    )
+
+
+def test_project_tools_section_lists_each_tool_and_is_absent_without_tools(tmp_path):
+    assert project_context._project_tools_section(tmp_path) is None
+    (tmp_path / "tools").mkdir()
+    assert project_context._project_tools_section(tmp_path) is None
+
+    _library_tool(tmp_path, "alpha.py", "alpha")
+    _library_tool(tmp_path, "beta.py", "beta")
+    section = project_context._project_tools_section(tmp_path)
+
+    assert section is not None
+    assert section["name"] == "project_tools"
+    assert section["hit_count"] == 2
+    assert "project.alpha - Purpose of alpha. - python tools/alpha.py" in section["content"]
+    assert "project.beta - Purpose of beta. - python tools/beta.py" in section["content"]
+    assert "check this list" in section["content"]
+    assert section["truncated"] is False
+
+
+def test_project_tools_section_is_bounded(tmp_path):
+    for index in range(project_context.PROJECT_TOOLS_LIMIT + 5):
+        _library_tool(tmp_path, f"t{index:02d}.py", f"t{index:02d}")
+    section = project_context._project_tools_section(tmp_path)
+
+    assert section is not None
+    assert section["hit_count"] == project_context.PROJECT_TOOLS_LIMIT
+    assert section["truncated"] is True
+    assert section["bytes"] <= project_context.TOOL_CAPS["project_tools"]["bytes"]
+
+
+def test_project_tools_section_never_cuts_a_row_mid_line(tmp_path):
+    for index in range(20):
+        name = f"t{index:02d}"
+        (tmp_path / "tools").mkdir(exist_ok=True)
+        (tmp_path / "tools" / f"{name}.py").write_text(
+            f"# aiworkhub-tool id: {name}\n"
+            f"# aiworkhub-tool purpose: {'p' * 160}\n"
+            f"# aiworkhub-tool usage: {'u' * 240}\n",
+            encoding="utf-8",
+        )
+    section = project_context._project_tools_section(tmp_path)
+
+    assert section is not None
+    rows = section["content"].splitlines()[1:]
+    assert rows
+    for row in rows:
+        ident, purpose, usage = row.split(" - ")
+        assert ident.startswith("project.t") and purpose == "p" * 160 and usage == "u" * 240
+    assert section["hit_count"] == len(rows) < 20
+    assert section["truncated"] is True
+    assert len(section["content"].encode("utf-8")) <= project_context.TOOL_CAPS["project_tools"]["bytes"]
+
+
+def test_a_tools_library_never_satisfies_required_evidence(monkeypatch, tmp_path):
+    _library_tool(tmp_path, "alpha.py", "alpha")
+    monkeypatch.setattr(project_context, "_source_graph_direct", lambda repo, contract: ("", False))
+    monkeypatch.setattr(
+        project_context._worker_tools,
+        "session_current_state",
+        lambda ctx, *, limit=12: {"ok": True, "content": "", "truncated": False, "hit_count": 0},
+    )
+    card = _project_context_card()
+    card["project_context"]["source_graph"]["required"] = False
+    del card["project_context"]["kb"]
+    with pytest.raises(project_context.ProjectContextError, match="project_context_required_empty_evidence"):
+        project_context.collect_project_context(tmp_path, card)

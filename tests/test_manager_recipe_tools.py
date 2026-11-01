@@ -1845,3 +1845,41 @@ def test_the_panel_usage_section_is_unknown_when_the_provider_measured_none():
     unknown = dashboard._project_recipe_usage({"registry": None}, ownership="full")
 
     assert unknown == {"state": "unknown", "denominator": "unknown"}
+
+
+def _library_tool(root: Path, body: str = "print('hi')\n") -> Path:
+    tools = root / "tools"
+    tools.mkdir(exist_ok=True)
+    path = tools / "hello.py"
+    path.write_text(
+        "# aiworkhub-tool id: hello\n"
+        "# aiworkhub-tool purpose: Say hello.\n"
+        "# aiworkhub-tool usage: python tools/hello.py\n"
+        + body,
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_seeding_registers_library_tools_once_and_a_changed_tool_as_a_new_version(manager):
+    """The project's tools/ library is seeded; reseeding is a no-op; an edit is a new version."""
+    baseline = mrt.seed_canonical()
+    assert baseline["ok"] is True
+    stored = len(store.list_recipes(manager))
+
+    _library_tool(manager)
+    plan = mrt.seeding_plan(manager)
+    assert "project.hello" in {recipe.id for recipe in plan["selected"]}
+    assert plan["library"]["count"] == 1
+
+    first = mrt.seed_canonical()
+    assert [entry["recipe_id"] for entry in first["registered"]] == ["project.hello"]
+    again = mrt.seed_canonical()
+    assert again["registered"] == []
+    assert len(store.list_recipes(manager)) == stored + 1
+
+    _library_tool(manager, "print('changed')\n")
+    changed = mrt.seed_canonical()
+    assert [entry["recipe_id"] for entry in changed["registered"]] == ["project.hello"]
+    assert changed["registered"][0]["version"] != first["registered"][0]["version"]
+    assert len(store.list_recipes(manager)) == stored + 2

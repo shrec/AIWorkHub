@@ -55,7 +55,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
 
-from . import host_heavy_slots, platform_io
+from . import host_heavy_slots, platform_io, project_tools
 from . import tool_recipes as tr
 from . import tool_recipes_store as store
 
@@ -85,6 +85,7 @@ REASON_EXECUTABLE_UNAVAILABLE = "executable_unavailable"
 REASON_SPAWN_FAILED = "spawn_failed"
 REASON_OUTPUT_UNWRITABLE = "output_unwritable"
 REASON_NONDETERMINISTIC_ARGV = "nondeterministic_argv"
+REASON_PROJECT_TOOL_CHANGED = "project_tool_changed"
 REASON_INVALID_REPOSITORY = "invalid_repository"
 
 # The canonical toolchain affordance variable NAMES, copied (not imported)
@@ -392,6 +393,15 @@ def run_recipe(
     # default and is passed explicitly so the posture is visible at the call.
     argv = [str(executable), *validated.argv[1:]]
     run_cwd = root if cwd is None else Path(cwd)
+    # ponytail: hash-to-exec TOCTOU is the accepted ceiling -- the same sandbox
+    # can run arbitrary code anyway; this makes the receipt's version truthful at spawn.
+    if recipe.id.startswith(project_tools.RECIPE_ID_PREFIX) and not project_tools.verify_recipe_file(
+        run_cwd, recipe
+    ):
+        raise RecipeRunError(
+            REASON_PROJECT_TOOL_CHANGED,
+            f"project tool file for {recipe.id} is missing or no longer matches version {recipe.version}",
+        )
     started_at = _utcnow_iso()
     started = time.monotonic()
     timed_out = False
@@ -1000,6 +1010,7 @@ __all__ = [
     "REASON_MEMORY_PROBE_UNAVAILABLE",
     "REASON_NONDETERMINISTIC_ARGV",
     "REASON_OUTPUT_UNWRITABLE",
+    "REASON_PROJECT_TOOL_CHANGED",
     "REASON_RECIPE_DIGEST_CHANGED",
     "REASON_SPAWN_FAILED",
     "REASON_UNKNOWN_RUN",
