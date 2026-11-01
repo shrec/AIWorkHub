@@ -684,6 +684,11 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "card_read_roots.py",
         # ...and its container build lane (release 0.12.78).
         "build_lane.py",
+        # ...and its host heavy-run slot gate plus that gate's core count (NF-2026-01904).
+        "host_heavy_slots.py",
+        "parallelism.py",
+        # ...and its live-seeded .gitignore hiding step (NF-2026-01889).
+        "worker_workspace_ignore_seed.py",
     ):
         shutil.copyfile(source_package / name, destination_package / name)
     # write_bytes, not write_text: several tests compare a raw on-disk byte
@@ -1141,6 +1146,7 @@ def test_package_runtime_temp_loader_rejects_missing_private_support_without_top
     for name in (
         "__init__.py",
         "_version.py",
+        "host_heavy_slots.py",
         "linux_kernel_abi.py",
         "platform_io.py",
         "runtime_temp.py",

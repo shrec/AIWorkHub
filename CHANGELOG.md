@@ -24,6 +24,7 @@ noted by package/extension version and release tag.
 - `needfix_preview_convert` refuses chained validation commands, as convert and launch already did (NF-2026-01895).
 - Worktrees no longer report live-seeded `.gitignore` edits as changes (NF-2026-01889).
 - The test suite no longer leaks real Hub Mail listeners (NF-2026-01890).
+- On Linux, stopping a Hub Mail listener this process spawned reaps it first, so an exited listener no longer reports `listener_stop_failed` (NF-2026-01906).
 - The process-event projection cache is bounded by retained bytes (64 MiB), not only by entry count (NF-2026-00679).
 - The AppContainer key-length test asserts the fail-closed DACL refusal instead of failing the accept neighbour lane (NF-2026-01905).
 

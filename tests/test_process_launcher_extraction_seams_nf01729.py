@@ -30,7 +30,9 @@ from aiworkhub import process_launcher_review_context as review_context
 
 # 13574 -> 13681 (0.12.78): five accepted launch/accept fixes, measured; the
 # next extraction ratchets it back down.
-PROCESS_LAUNCHER_MAX_LINES = 13681
+# 13681 -> 13795 (0.12.83): the NF-2026-01899 stale-owner reservation
+# retirement, measured; the next extraction ratchets it back down.
+PROCESS_LAUNCHER_MAX_LINES = 13795
 
 # (module, function, seam tuple attribute, ProcessManager method)
 EXTRACTIONS: tuple[tuple[ModuleType, str, str, str], ...] = (

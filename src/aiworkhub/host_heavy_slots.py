@@ -15,7 +15,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from . import parallelism, platform_io
+# parallelism and platform_io are imported per call: worker_workspace imports this
+# module before _load_runtime_temp has checked platform_io and its private
+# siblings are regular files (NF-00841).
 
 
 def default_slots_dir() -> Path:
@@ -29,6 +31,8 @@ def slot_count(cpu_capacity: int | None = None) -> int:
     budgeted ``per_run = max(2, capacity // 4)`` cores and one run's worth of
     capacity stays free for the host: ``max(1, capacity // per_run - 1)``.
     """
+
+    from . import parallelism
 
     capacity = parallelism.get_cpu_capacity() if cpu_capacity is None else cpu_capacity
     per_run = max(2, capacity // 4)
@@ -46,6 +50,8 @@ class HostSlot:
         fd, self._fd = self._fd, None
         if fd is None:
             return
+        from . import platform_io
+
         try:
             platform_io.unlock_fd(fd)
         except OSError:
@@ -66,6 +72,8 @@ def try_acquire(
     slots_dir: Path | None = None, count: int | None = None
 ) -> HostSlot | None:
     """Take the first free slot without blocking; ``None`` when all are held."""
+
+    from . import platform_io
 
     directory = default_slots_dir() if slots_dir is None else Path(slots_dir)
     total = slot_count() if count is None else count

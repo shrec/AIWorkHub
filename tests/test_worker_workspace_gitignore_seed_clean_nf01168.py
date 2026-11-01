@@ -129,7 +129,7 @@ def test_zero_change_provisioned_worktree_has_empty_porcelain(
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
-def test_uncommitted_canonical_gitignore_edit_is_seeded_and_visible(
+def test_uncommitted_canonical_gitignore_edit_is_seeded_and_hidden(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
 ) -> None:
     edited = _append_line((repo / ".gitignore").read_bytes(), b"dist/")
@@ -139,7 +139,8 @@ def test_uncommitted_canonical_gitignore_edit_is_seeded_and_visible(
         assert (workspace.path / ".gitignore").read_bytes() == edited
         status = _git(workspace.path, "status", "--porcelain")
         assert status.returncode == 0, status.stderr
-        assert status.stdout.splitlines() == [" M .gitignore"]
+        # NF-2026-01889: the live edit stays on disk but is hidden from Git.
+        assert status.stdout.splitlines() == []
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
@@ -158,7 +159,7 @@ def test_host_dirty_gitignore_is_never_candidate_delta(
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
-def test_uncommitted_nested_gitignore_edit_is_seeded_and_visible(
+def test_uncommitted_nested_gitignore_edit_is_seeded_and_hidden(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
 ) -> None:
     nested = repo / "read" / ".gitignore"
@@ -169,7 +170,8 @@ def test_uncommitted_nested_gitignore_edit_is_seeded_and_visible(
         assert (workspace.path / "read" / ".gitignore").read_bytes() == edited
         status = _git(workspace.path, "status", "--porcelain")
         assert status.returncode == 0, status.stderr
-        assert status.stdout.splitlines() == [" M read/.gitignore"]
+        # NF-2026-01889: the live edit stays on disk but is hidden from Git.
+        assert status.stdout.splitlines() == []
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
@@ -239,8 +241,11 @@ def test_seed_restat_runs_a_bounded_number_of_git_processes(
     )
     try:
         subcommands = [call[1] for call in calls if len(call) > 1]
-        for subcommand in ("ls-files", "hash-object", "update-index"):
-            assert subcommands.count(subcommand) == 1, subcommands
+        # One batched call each; the NF-2026-01889 hide step adds one more
+        # batched hash-object over the seeded .gitignore files.
+        bounds = {"ls-files": 1, "hash-object": 2, "update-index": 1}
+        for subcommand, bound in bounds.items():
+            assert subcommands.count(subcommand) == bound, subcommands
         for relative in seeded:
             assert (workspace.path / relative).read_bytes() == (
                 repo / relative

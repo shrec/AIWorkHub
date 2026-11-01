@@ -201,6 +201,11 @@ def _pid_alive(pid: Any) -> bool:
         number = int(pid)
     except (TypeError, ValueError):
         return False
+    # A listener this process spawned stays a zombie until reaped, and a POSIX
+    # zombie still answers kill(pid, 0); poll() reaps it so it reads as exited.
+    for process in _SPAWNED:
+        if process.pid == number:
+            process.poll()
     return number > 0 and bool(shared_router.process_is_alive(number))
 
 

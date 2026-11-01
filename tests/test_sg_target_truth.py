@@ -260,7 +260,7 @@ def test_declared_target_fallback_stays_fail_closed_on_unattributable_match(tmp_
     _write(repo, "pkg/real.py", "def anchor():\n    return 1\n")
     sg.build_index(repo, incremental=True)
 
-    def fake_body_query(_repo, query, _budget):
+    def fake_body_query(_repo, query, _budget, path_prefix=None):
         if query == "ghosthunt":
             # A match the wrapper cannot attribute to any file.
             return {
