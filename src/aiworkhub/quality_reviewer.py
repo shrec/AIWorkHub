@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, NotRequired, TypedDict
 
 from .evidence_levels import EvidenceLevel
+from .finding_reproduction import bounded_reproduction_text
 from .platform_io import atomic_replace
 from .scoped_audit import ScopedAuditPacket, packet_fingerprint
 
@@ -209,7 +210,10 @@ QUALITY_REVIEW_FINDING_SCHEMA_DOC = (
     "higher-priority review obligations and must not be downgraded for "
     "minimality. The tool derives actionable, evidence_level and "
     "evidence_reference; do not invent keys outside this shape. An empty "
-    "findings list is valid."
+    "findings list is valid. When a defect is executable, set reproduction to "
+    "pytest:<one node id under tests/> or probe:<python source of at most 4000 "
+    "bytes>; the coordinator runs it on the candidate and its base, and any "
+    "other reproduction text is never executed."
 )
 QUALITY_REVIEW_SUBMIT_TOOL_DESCRIPTION = (
     "Submit findings for the exact coordinator-bound review packet. "
@@ -1569,7 +1573,11 @@ def normalize_packet_findings(
             "evidence_level": evidence_level.name.lower(),
             "symbol": symbol,
             "claim": str(finding.get("claim") or summary)[:MAX_TEXT_CHARS],
-            "reproduction": str(finding.get("reproduction") or "")[:MAX_TEXT_CHARS],
+            # A parseable spec is kept byte-exact (RM-2026-00083); it is only
+            # ever executed by the coordinator, never promoted here.
+            "reproduction": bounded_reproduction_text(
+                finding.get("reproduction"), MAX_TEXT_CHARS
+            ),
             "required_validation": str(
                 finding.get("required_validation")
                 or (

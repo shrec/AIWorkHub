@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from . import (
     db_writer,
+    finding_reproduction,
     model_settings,
     needfix_store,
     provider_route_contracts,
@@ -30,6 +31,7 @@ from . import (
     workforce_catalog,
     workforce_router,
 )
+from .evidence_levels import EvidenceLevel
 LENSES = ("correctness", "security", "code_quality")
 RECEIPT_SCHEMA = "aiworkhub.review_orchestrator_receipt.v1"
 
@@ -1346,6 +1348,39 @@ def _contract_citations(counter_evidence: str) -> list[str]:
         if text not in found:
             found.append(text)
     return found[:20]
+
+
+def _bound_findings(report: Mapping[str, Any], finding_id: str) -> list[Mapping[str, Any]]:
+    """Rows of one reviewer report that ``finding_id`` names.
+
+    A bare row id matches ``id``; the fold's full ``reviewer:<lens>:<id>`` form
+    matches the report's lens and row id together.
+    """
+    lens = str(report.get("lens") or "")
+    findings = report.get("findings")
+    is_bare_finding_id = not str(finding_id).startswith("reviewer:")
+    return [
+        row
+        for row in (findings if isinstance(findings, list) else [])
+        if isinstance(row, Mapping)
+        and (
+            str(row.get("id") or "") == str(finding_id)
+            if is_bare_finding_id
+            else f"reviewer:{lens}:{str(row.get('id') or '')}" == str(finding_id)
+        )
+    ]
+
+
+def _bound_finding_has_spec(reviewer_receipt: object, finding_id: str) -> bool:
+    """Whether the finding ``finding_id`` names carries its own parseable spec."""
+    report = (
+        reviewer_receipt.get("report") if isinstance(reviewer_receipt, Mapping) else None
+    )
+    return isinstance(report, Mapping) and any(
+        finding_reproduction.parse_reproduction_spec(str(row.get("reproduction") or ""))
+        is not None
+        for row in _bound_findings(report, finding_id)
+    )
 
 MANAGER_HOLD_DECISIONS = frozenset({
     "authorize_distinct_route_successor",
@@ -2966,6 +3001,28 @@ class ReviewOrchestrator:
             **receipt,
         }
 
+    def _stored_reproduction_receipt(
+        self, request_id: str, reviewer_request_id: str, finding_id: str
+    ) -> dict[str, Any] | None:
+        """The reproduction receipt stored with this finding's current row.
+
+        Offered to the reproduce callback, which reuses it only after verifying
+        its signature and binding; any unreadable row simply offers nothing.
+        """
+        try:
+            with closing(_side_table_connection(self.db_path, readonly=True)) as conn:
+                row = conn.execute(
+                    "SELECT receipt_json FROM review_orchestrator_finding_dispositions "
+                    "WHERE target_request_id=? AND reviewer_request_id=? "
+                    "AND finding_id=?",
+                    (str(request_id), str(reviewer_request_id), str(finding_id)),
+                ).fetchone()
+            stored = json.loads(str(row[0])) if row is not None else None
+        except Exception:  # noqa: BLE001 -- no table / no store offers nothing
+            return None
+        receipt = stored.get("reproduction_receipt") if isinstance(stored, dict) else None
+        return dict(receipt) if isinstance(receipt, dict) else None
+
     def dispose_review_finding(
         self,
         *,
@@ -2980,6 +3037,7 @@ class ReviewOrchestrator:
         reviewer_receipt: Mapping[str, Any] | None,
         candidate_sha256: str,
         now: datetime | None = None,
+        reproduce: Callable[..., Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Record one audited manager disposition of one non-blocking finding.
 
@@ -2994,6 +3052,18 @@ class ReviewOrchestrator:
         history table, then updates the current row to the new receipt, which
         names ``prior_disposition`` and ``supersedes_receipt_sha256``. Nothing
         here accepts a candidate or edits a reviewer report.
+
+        ``reproduce`` (RM-2026-00083) is the coordinator's reproduction
+        callback, see :func:`finding_reproduction.dispose_reproducer`. When it
+        is given and the finding carries a parseable spec, its signed receipt
+        is stored in this row: ``reproduced`` refuses a dismissal unless
+        counter_evidence cites the contract exactly as a HIGH dismissal must
+        (otherwise ``review_finding_reproduced_not_dismissable``, nothing
+        stored; with a citation the row is ``manager_signed``) and raises a
+        confirmation to ``evidence_level`` ``reproduced``;
+        ``not_reproduced``/``pre_existing`` stand in for counter_evidence. The
+        severity gates above apply unchanged. The stored receipt is offered
+        back to the callback, so a replay never reruns the reproduction.
         """
         if disposition not in FINDING_DISPOSITIONS:
             return {"ok": False, "error": "review_finding_disposition_invalid"}
@@ -3002,7 +3072,17 @@ class ReviewOrchestrator:
             return {"ok": False, "error": "review_finding_disposition_actor_invalid"}
         counter_evidence = str(counter_evidence or "")
         reason = str(reason or "")
-        if disposition == "dismissed" and not counter_evidence.strip():
+        # Deferred only for a finding whose own reproduction is a spec, and only
+        # with a ``reproduce`` callback: its receipt may stand in for
+        # counter_evidence. Every other finding is refused here, as before.
+        if (
+            disposition == "dismissed"
+            and not counter_evidence.strip()
+            and not (
+                reproduce is not None
+                and _bound_finding_has_spec(reviewer_receipt, finding_id)
+            )
+        ):
             return {
                 "ok": False,
                 "error": "review_finding_disposition_counter_evidence_required",
@@ -3032,18 +3112,8 @@ class ReviewOrchestrator:
                 "error": "review_finding_disposition_candidate_unavailable",
             }
         lens = str(report.get("lens") or "")
-        findings = report.get("findings")
         is_bare_finding_id = not str(finding_id).startswith("reviewer:")
-        matches = [
-            row
-            for row in (findings if isinstance(findings, list) else [])
-            if isinstance(row, Mapping)
-            and (
-                str(row.get("id") or "") == str(finding_id)
-                if is_bare_finding_id
-                else f"reviewer:{lens}:{str(row.get('id') or '')}" == str(finding_id)
-            )
-        ]
+        matches = _bound_findings(report, finding_id)
         if not matches:
             return {"ok": False, "error": "review_finding_disposition_finding_unknown"}
         if len(matches) > 1:
@@ -3086,6 +3156,69 @@ class ReviewOrchestrator:
             # blocker, and a process_limit one is the blindness blocker
             # (NF-2026-01762); dismissing anything else would be a no-op receipt.
             return {"ok": False, "error": "review_finding_disposition_not_a_blocker"}
+        # RM-2026-00083: a finding whose reproduction is an executable spec is
+        # run by the coordinator before anything is recorded. Only past every
+        # gate above, so a refused disposal never pays for a sandbox run.
+        reproduction_receipt: dict[str, Any] | None = None
+        cited_reproduced_dismissal = False
+        spec_text = str(finding.get("reproduction") or "")
+        if (
+            reproduce is not None
+            and finding_reproduction.parse_reproduction_spec(spec_text) is not None
+        ):
+            binding = {
+                "finding_id": str(finding_id),
+                "spec_text": spec_text,
+                "candidate_sha256": str(candidate_sha256),
+                "reviewer_receipt_sha256": canonical_digest(
+                    json.loads(json.dumps(dict(receipt_map)))
+                ),
+            }
+            try:
+                reproduction_receipt = dict(
+                    reproduce(
+                        **binding,
+                        stored=self._stored_reproduction_receipt(
+                            request_id, reviewer_request_id, str(finding_id)
+                        ),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 -- named, never recorded
+                return {
+                    "ok": False,
+                    "error": f"review_finding_reproduction_failed:{exc}"[:300],
+                }
+            if not finding_reproduction.receipt_binds(reproduction_receipt, **binding):
+                return {"ok": False, "error": "review_finding_reproduction_receipt_invalid"}
+            if (
+                disposition == "dismissed"
+                and reproduction_receipt["classification"]
+                == finding_reproduction.REPRODUCED
+            ):
+                # A reproduction proves only that the candidate differs from its
+                # base as the reviewer asserted; the card may mandate exactly
+                # that change. So it is dismissable only on a contract citation,
+                # held to the HIGH rule (NF-2026-01838) and manager_signed.
+                contract_citations = _contract_citations(counter_evidence)
+                if not contract_citations:
+                    return {
+                        "ok": False,
+                        "error": "review_finding_reproduced_not_dismissable",
+                        "reproduction_receipt": reproduction_receipt,
+                    }
+                cited_reproduced_dismissal = True
+        if reproduce is not None and disposition == "dismissed" and not counter_evidence.strip():
+            # The check deferred from the top: only a counter-evidence receipt
+            # stands in for the manager's own counter_evidence.
+            if not finding_reproduction.is_counter_evidence(reproduction_receipt):
+                return {
+                    "ok": False,
+                    "error": "review_finding_disposition_counter_evidence_required",
+                }
+            counter_evidence = (
+                "coordinator reproduction receipt: "
+                + str((reproduction_receipt or {}).get("classification"))
+            )
         receipt = {
             "schema_id": FINDING_DISPOSITION_SCHEMA,
             "target_task_id": str(task_id),
@@ -3105,9 +3238,17 @@ class ReviewOrchestrator:
             "actor": actor,
             "decided_at": (now or datetime.now(timezone.utc)).isoformat(),
         }
-        if severity == quality_evidence.SEVERITY_HIGH:
+        if severity == quality_evidence.SEVERITY_HIGH or cited_reproduced_dismissal:
             receipt["manager_signed"] = True
             receipt["contract_citations"] = contract_citations
+        if reproduction_receipt is not None:
+            receipt["reproduction_receipt"] = reproduction_receipt
+            if (
+                disposition == "confirmed"
+                and reproduction_receipt["classification"]
+                == finding_reproduction.REPRODUCED
+            ):
+                receipt["evidence_level"] = str(EvidenceLevel.REPRODUCED)
         receipt_sha256 = canonical_digest(receipt)
 
         def _comparable(value: Mapping[str, Any]) -> dict[str, Any]:

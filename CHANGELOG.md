@@ -6,6 +6,10 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+### Added
+
+- A reviewer can now attach a runnable reproduction to a finding (`pytest:<test node>` or `probe:<python source>`). When a manager disposes that finding, AIWorkHub runs it in the validation sandbox on the candidate and on its base and stores a signed receipt with the decision. Only a failing test, or a probe's failed assertion or explicit exit 1, counts as a failure; any other probe error makes the run inconclusive. A finding that reproduces can be dismissed only when the manager cites the task contract, a confirmed one is recorded as reproduced, and a low or medium finding that does not reproduce (or already failed before the change) may be dismissed on that receipt alone; high and critical findings keep their existing rules (RM-2026-00083).
+
 ## [0.12.83] - 2026-11-01
 
 ### Added

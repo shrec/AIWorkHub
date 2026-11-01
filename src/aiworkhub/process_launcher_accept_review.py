@@ -4596,6 +4596,19 @@ def dispose_review_finding(
     request_mismatch = bool(target_identity) and target_identity.get(
         "target_request_id"
     ) != str(request_id)
+    # RM-2026-00083: a report carrying an executable reproduction spec gets
+    # the coordinator's reproduction callback; any other report takes the
+    # exact pre-existing path, with no callback at all.
+    from . import finding_reproduction
+
+    reproduction: dict[str, Any] = {}
+    bound_receipt = (bound or {}).get("receipt")
+    if finding_reproduction.report_has_spec(
+        bound_receipt.get("report") if isinstance(bound_receipt, dict) else None
+    ):
+        reproduction["reproduce"] = finding_reproduction.manager_reproducer(
+            self, task_id=task_id, request_id=request_id, card=card
+        )
     result = review_orchestrator.ReviewOrchestrator(
         self, db_path=review_db
     ).dispose_review_finding(
@@ -4611,6 +4624,7 @@ def dispose_review_finding(
         candidate_sha256=(
             "" if request_mismatch else str(target_identity.get("candidate_sha256") or "")
         ),
+        **reproduction,
     )
     if result.get("error") != "review_finding_disposition_candidate_unavailable":
         return result
