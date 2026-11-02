@@ -4984,6 +4984,13 @@ function createVscodeLmStagedEditCollector(request) {
     recoveryRequiredOutput: () => recoveryPath ? { path: recoveryPath, action: "replace_range", recovery: true } : null,
     hasChanges: () => edits.size > 0 || creates.size > 0,
     nextMissingRequired,
+    // NF-2026-01980: every still-missing required output, in required_outputs order.
+    missingRequired: () => !trackRequired ? [] : requiredOutputs
+      .filter((filePath) => !edits.has(filePath) && !creates.has(filePath))
+      .map((filePath) => ({
+        path: filePath,
+        action: contractByPath.get(filePath)?.action === "create" ? "create" : "replace_range",
+      })),
   };
 }
 
@@ -5087,7 +5094,27 @@ const VSCODE_LM_MAX_FORCED_STAGE_CORRECTIONS = 2;
 const VSCODE_LM_MAX_LINE_ONE_PINS = 2;
 const VSCODE_LM_MAX_INVALID_JSON = 2;
 
-function vscodeLmNoteForcedStageFailure(counter, nextMissing, protocolTrace, lastProtocolPreview) {
+// NF-2026-01980: a terminal forced-stage failure names WHY the last stage was
+// refused, not only the outcome label. Bounded, printable, single line.
+function vscodeLmBoundedStageRejectionReason(reason) {
+  return String(reason || "").replace(/[^\x21-\x7e]+/g, "_").slice(0, 240);
+}
+
+function vscodeLmStageRequiredFailure(rejectionReason, protocolTrace, lastProtocolPreview, nextMissing = null) {
+  const reason = vscodeLmBoundedStageRejectionReason(rejectionReason);
+  const failure = vscodeLmProtocolFailure(
+    reason ? `vscode_lm_semantic_edit_stage_required:${reason}` : "vscode_lm_semantic_edit_stage_required",
+    protocolTrace, lastProtocolPreview,
+  );
+  if (reason) failure.rejectionReason = reason;
+  if (nextMissing && nextMissing.path) {
+    failure.missingRequiredOutput = nextMissing.path;
+    failure.missingRequiredAction = nextMissing.action || "";
+  }
+  return failure;
+}
+
+function vscodeLmNoteForcedStageFailure(counter, nextMissing, protocolTrace, lastProtocolPreview, rejectionReason = "") {
   const key = vscodeLmForcedStageMissingKey(nextMissing);
   if (key !== counter.key) {
     counter.key = key;
@@ -5097,11 +5124,49 @@ function vscodeLmNoteForcedStageFailure(counter, nextMissing, protocolTrace, las
   // in prose, then comply on the next turn. Keep both corrections bounded per
   // missing output; a third violation still terminalizes deterministically.
   if (counter.count >= VSCODE_LM_MAX_FORCED_STAGE_CORRECTIONS) {
-    throw vscodeLmProtocolFailure(
-      "vscode_lm_semantic_edit_stage_required", protocolTrace, lastProtocolPreview,
-    );
+    if (!rejectionReason) {
+      throw vscodeLmProtocolFailure(
+        "vscode_lm_semantic_edit_stage_required", protocolTrace, lastProtocolPreview,
+      );
+    }
+    throw vscodeLmStageRequiredFailure(rejectionReason, protocolTrace, lastProtocolPreview, nextMissing);
   }
   counter.count += 1;
+}
+
+function vscodeLmMissingRequiredOutputs(stagedEdits) {
+  return stagedEdits && typeof stagedEdits.missingRequired === "function"
+    ? stagedEdits.missingRequired()
+    : [];
+}
+
+// NF-2026-01980: the forced-stage selector names ONE next missing output, but a
+// stage that completes ANY still-missing required output is real progress. Two
+// claude-sonnet-5 runs staged a valid create of a later required output, kept
+// the refusal budget of the earlier one, and died as stage_required. Progress
+// on any missing output resets the bounded refusal count.
+function vscodeLmNoteForcedStageProgress(counter, toolName, result, missingBefore) {
+  if (toolName !== VSCODE_LM_STAGE_EDIT_TOOL || !result || result.ok !== true ||
+      result.idempotent_replay === true) return false;
+  const filePath = vscodeLmNormalizedPath(result.path);
+  if (!filePath || !missingBefore.some((item) => item.path === filePath)) return false;
+  counter.count = 0;
+  return true;
+}
+
+// NF-2026-01980: a refused stage names the refusal and every exact path/action
+// still owed, so the model can correct the request instead of guessing.
+function vscodeLmForcedStageRejectionInstruction(toolName, result, stagedEdits, native = false) {
+  const reason = vscodeLmBoundedStageRejectionReason(
+    (result && (result.reason || result.error)) || "stage_rejected",
+  );
+  const expected = vscodeLmMissingRequiredOutputs(stagedEdits).map((item) =>
+    `${item.path} (operation ${item.action}, action ${item.action === "create" ? "v3_create" : item.action})`);
+  return `The ${String(toolName || VSCODE_LM_STAGE_EDIT_TOOL).slice(0, 120)} request was rejected: ${reason}. ` +
+    (expected.length
+      ? `Expected exactly one ${VSCODE_LM_STAGE_EDIT_TOOL} request for one of the still-missing required outputs: ${expected.join("; ")}. `
+      : "") +
+    vscodeLmMissingRequiredStageInstruction(vscodeLmNextStageOutput(stagedEdits), native);
 }
 
 function vscodeLmIsLineOnePin(input) {
@@ -6542,8 +6607,8 @@ async function runVscodeLmTextProtocol(
             messages.push(vscode.LanguageModelChatMessage.User(ingested.instruction));
             continue;
           }
-          throw vscodeLmProtocolFailure(
-            "vscode_lm_semantic_edit_stage_required", protocolTrace, lastProtocolPreview,
+          throw vscodeLmStageRequiredFailure(
+            ingested.reason, protocolTrace, lastProtocolPreview, vscodeLmNextStageOutput(stagedEdits),
           );
         }
         const nextMissing = vscodeLmNextMissingRequiredOutput(stagedEdits);
@@ -6555,9 +6620,7 @@ async function runVscodeLmTextProtocol(
             outcome: stagedFinal.ok ? "required_outputs_complete" : stagedFinal.reason,
           });
           if (stagedFinal.ok) return JSON.stringify(stagedFinal.__finalEnvelope);
-          throw vscodeLmProtocolFailure(
-            "vscode_lm_semantic_edit_stage_required", protocolTrace, lastProtocolPreview,
-          );
+          throw vscodeLmStageRequiredFailure(stagedFinal.reason, protocolTrace, lastProtocolPreview);
         }
         const missingIdentity = `required_output:${nextMissing.path}:${nextMissing.action}`;
         protocolTrace.push({
@@ -6829,6 +6892,7 @@ async function runVscodeLmTextProtocol(
     let toolFailureReported = false;
     const toolStartedAt = Date.now();
     const recoveryBeforeCall = vscodeLmPendingRecoveryOutput(stagedEdits);
+    const missingBeforeCall = vscodeLmMissingRequiredOutputs(stagedEdits);
     if (!toolInputTooLarge && typeof onToolTurn === "function") {
       try { onToolTurn(envelope.name, { tool_state: "started", tool_input: envelope.input,
         call_id: String(turnProviderCallId || `emulated-${turn}`), activity_transport: "emulated" }); } catch (_err) { /* advisory activity */ }
@@ -6937,17 +7001,23 @@ async function runVscodeLmTextProtocol(
     if (result && result.ok === true && result.__finalEnvelope) {
       return JSON.stringify(result.__finalEnvelope);
     }
+    let forcedStageRejection = null;
     if (forceStagedEdit && vscodeLmForcedStageRegrounds(envelope.name, result, stagedEdits, recoveryBeforeCall)) {
       protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "stage_regrounded" });
     } else if (forceStagedEdit && result && result.ok === false &&
         result.schema_id !== VSCODE_LM_SOURCE_GRAPH_DUPLICATE_SCHEMA) {
       protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "stage_rejected" });
+      forcedStageRejection = result;
       vscodeLmNoteForcedStageFailure(
         stagedEditFailure,
         vscodeLmNextStageOutput(stagedEdits),
         protocolTrace,
         lastProtocolPreview,
+        result.reason || result.error || "stage_rejected",
       );
+    } else if (forceStagedEdit &&
+        vscodeLmNoteForcedStageProgress(stagedEditFailure, envelope.name, result, missingBeforeCall)) {
+      protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "required_output_progress" });
     }
     // NF-2026-01179: an oversized stage payload is never executed, and every turn
     // already carries the exact missing-required-output instruction, so repeating
@@ -6990,7 +7060,9 @@ async function runVscodeLmTextProtocol(
     const historyText = toolInputTooLarge ? "[oversized tool request omitted]" : text;
     messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(historyText)]));
     const nextMissing = vscodeLmNextStageOutput(stagedEdits);
-    const nextInstruction = nextMissing || forceStagedEdit
+    const nextInstruction = forcedStageRejection
+      ? vscodeLmForcedStageRejectionInstruction(envelope.name, forcedStageRejection, stagedEdits, false)
+      : nextMissing || forceStagedEdit
       ? vscodeLmMissingRequiredStageInstruction(nextMissing, false)
       : "Output only the next strict tool-request JSON or final edit-response JSON object.";
     messages.push(vscode.LanguageModelChatMessage.User(JSON.stringify({
@@ -7506,6 +7578,7 @@ async function runVscodeLmAgent(
       let toolFailureReported = false;
       const toolStartedAt = Date.now();
       const recoveryBeforeCall = vscodeLmPendingRecoveryOutput(stagedEdits);
+      const missingBeforeCall = vscodeLmMissingRequiredOutputs(stagedEdits);
       if (typeof onToolTurn === "function") {
         try { onToolTurn(call.name, { tool_state: "started", tool_input: call.input,
           call_id: `${turnProviderCallId || `native-${turn}`}:${results.length}`, activity_transport: "native" }); } catch (_err) { /* advisory activity */ }
@@ -7591,7 +7664,16 @@ async function runVscodeLmAgent(
           vscodeLmNextStageOutput(stagedEdits),
           protocolTrace,
           lastProtocolPreview,
+          result.reason || result.error || "stage_rejected",
         );
+        result = {
+          ...result,
+          expected_missing_outputs: vscodeLmMissingRequiredOutputs(stagedEdits),
+          instruction: vscodeLmForcedStageRejectionInstruction(call.name, result, stagedEdits, true),
+        };
+      } else if (forceStagedEdit &&
+          vscodeLmNoteForcedStageProgress(stagedEditFailure, call.name, result, missingBeforeCall)) {
+        protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "required_output_progress" });
       }
       results.push(languageModelToolResultPart(call.callId, result));
     }
