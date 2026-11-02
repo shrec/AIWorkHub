@@ -5783,10 +5783,27 @@ def mark_done(task_id: str, runner: str | None = None, topic: str | None = None)
     if isinstance(terminal_review, dict) and terminal_review:
         terminal_substatus = str(terminal_review.get("substatus") or "")
         if terminal_substatus != "review_ready":
-            return _lifecycle_error(
-                "done_terminal_review_not_acceptable:"
-                + (terminal_substatus or "missing_substatus")
+            refusal = "done_terminal_review_not_acceptable:" + (
+                terminal_substatus or "missing_substatus"
             )
+            # NF-2026-01971: a validation_environment terminal is no dead end --
+            # name the recorded validation-only replay and hand back its plan.
+            plan = (
+                terminal_failure_classification.validation_environment_recovery_plan(
+                    terminal_review.get("evidence")
+                )
+                if terminal_substatus == "validation_failed"
+                else None
+            )
+            if plan is None:
+                return _lifecycle_error(refusal)
+            refused = _lifecycle_error(
+                refusal
+                + ";recovery="
+                + terminal_failure_classification.VALIDATION_ENVIRONMENT_RECOVERY_NAME
+            )
+            refused["recovery_plan"] = plan
+            return refused
         evidence = terminal_review.get("evidence")
         request_identity = (
             evidence.get("request_identity")

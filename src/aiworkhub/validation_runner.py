@@ -1499,6 +1499,11 @@ def pytest_validation_evidence(stdout: str, returncode: int | None) -> dict[str,
 # so wherever it travels.
 VALIDATION_ENVIRONMENT_SIGNATURES_VERSION = "aiworkhub.validation_environment_signatures.v1"
 VALIDATION_ENVIRONMENT_EVIDENCE_SOURCE = "candidate_validation_output"
+# NF-2026-01971: the one signature NOT read from candidate output -- the
+# contained build lane measured its own infrastructure failure and stamped the
+# row's ``failure_class`` (``build_lane._row``).
+LANE_INFRASTRUCTURE_SIGNATURE = "lane_infrastructure"
+LANE_INFRASTRUCTURE_EVIDENCE_SOURCE = "validation_lane_measurement"
 
 
 @dataclass(frozen=True)
@@ -1510,6 +1515,7 @@ class ValidationEnvironmentSignature:
     END when ``literal_ends_line``); every ``anchors`` entry must be in each
     failure's own block. The row must come from one of ``backends``, the lanes
     it was measured on: anywhere else the literal is only the candidate's print.
+    A ``candidate_forgeable=False`` entry is never matched by that text scan.
     """
 
     name: str
@@ -1518,6 +1524,8 @@ class ValidationEnvironmentSignature:
     backends: tuple[str, ...]
     anchors: tuple[str, ...] = ()
     literal_ends_line: bool = False
+    evidence_source: str = VALIDATION_ENVIRONMENT_EVIDENCE_SOURCE
+    candidate_forgeable: bool = True
 
     def carried_by(self, line: str) -> bool:
         text = line.rstrip()
@@ -1556,6 +1564,18 @@ VALIDATION_ENVIRONMENT_SIGNATURES: tuple[ValidationEnvironmentSignature, ...] = 
         ),
         anchors=("_multiprocessing.SemLock(",),
         literal_ends_line=True,
+    ),
+    # NF-2026-01971: a row the build lane itself classed ``validation_environment``
+    # (``build_lane._row``: a measured infrastructure failure, never candidate
+    # output). No literal and no backend, so the text scan never yields it; only
+    # the lane-set ``failure_class`` does, in ``match_validation_environment_signature``.
+    ValidationEnvironmentSignature(
+        name=LANE_INFRASTRUCTURE_SIGNATURE,
+        literals=(),
+        backends=(),
+        lane_change_reason="validation_lane_infrastructure_failure_measured",
+        evidence_source=LANE_INFRASTRUCTURE_EVIDENCE_SOURCE,
+        candidate_forgeable=False,
     ),
     # An unresolved ``{python}`` is deliberately absent. As a declared argv[0]
     # it never reaches a test -- the spawn fails and ``row_restriction`` names
@@ -1726,7 +1746,8 @@ def validation_environment_signature(row: Mapping[str, Any]) -> str | None:
     for signature in VALIDATION_ENVIRONMENT_SIGNATURES:
         unproven = [line for line in summary if not signature.carried_by(line)]
         if (
-            backend not in signature.backends
+            not signature.candidate_forgeable
+            or backend not in signature.backends
             or not all(signature.carried_by(line) for line in raised)
             or any(_summary_message_whole(line) for line in unproven)
         ):
@@ -1900,7 +1921,11 @@ def match_validation_environment_signature(
     other way keeps the whole batch a plain ``validation_failed`` -- and every
     declared required output must be named by a hash-bearing record, so a
     candidate that did not produce its declared work is never offered a replay.
+    A row the build lane itself classed ``validation_environment`` carries
+    :data:`LANE_INFRASTRUCTURE_SIGNATURE` (NF-2026-01971).
     """
+    from .build_lane import VALIDATION_ENVIRONMENT_CLASS
+
     rows = list(results)
     if not all(isinstance(row, Mapping) for row in rows):
         return None
@@ -1909,7 +1934,12 @@ def match_validation_environment_signature(
         required_outputs, required_output_records
     ):
         return None
-    names = {validation_environment_signature(row) for row in failing}
+    names = {
+        LANE_INFRASTRUCTURE_SIGNATURE
+        if row.get("failure_class") == VALIDATION_ENVIRONMENT_CLASS
+        else validation_environment_signature(row)
+        for row in failing
+    }
     if len(names) != 1 or None in names:
         return None
     first = failing[0]
@@ -1924,6 +1954,8 @@ __all__ = [
     "CANDIDATE_SOURCE_MAX_BYTES",
     "CREATEPROCESS_CWD_MAX_CHARS",
     "LANDLOCK_SEMLOCK_DEV_SHM",
+    "LANE_INFRASTRUCTURE_EVIDENCE_SOURCE",
+    "LANE_INFRASTRUCTURE_SIGNATURE",
     "LSP_PRIVATE_CWD_SUFFIX",
     "RESTRICTION_ABSENT_INTERPRETER",
     "RESTRICTION_FORBIDDEN_SPAWN",

@@ -203,7 +203,10 @@ def test_a_winerror_1314_row_is_classified_validation_environment_with_the_plan(
 def test_the_signature_table_is_closed_versioned_and_the_match_is_frozen():
     signatures = validation_runner.VALIDATION_ENVIRONMENT_SIGNATURES
     assert isinstance(signatures, tuple)
-    assert [signature.name for signature in signatures] == [_SYMLINK, _SEMLOCK]
+    # NF-2026-01971 adds the one lane-measured, not candidate-forgeable entry.
+    assert [signature.name for signature in signatures] == [
+        _SYMLINK, _SEMLOCK, "lane_infrastructure"
+    ]
     assert validation_runner.VALIDATION_ENVIRONMENT_SIGNATURES_VERSION == (
         "aiworkhub.validation_environment_signatures.v1"
     )

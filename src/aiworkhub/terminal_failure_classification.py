@@ -3462,12 +3462,14 @@ def validation_environment_disposition(
     required output must be hash-recorded -- so every other terminal keeps its
     classification and routing exactly.
 
-    CLASSIFICATION, NEVER EXECUTION. The signature is read from the candidate's
-    own validation output, so it is labelled ``candidate_forgeable`` and names
-    no trusted authority: ``_typed_disposition`` therefore resolves the action
-    to ``manager_judgment_unknown`` and nothing launches. The recovery plan is
-    the two manager calls that park the card and replay its retained bytes in
-    the validation lane; it never runs the candidate on the host.
+    CLASSIFICATION, NEVER EXECUTION. A text signature is read from the
+    candidate's own validation output, so it is labelled ``candidate_forgeable``;
+    the lane-measured ``lane_infrastructure`` entry (NF-2026-01971) is labelled
+    with its own source and ``candidate_forgeable=False``. Either way the
+    disposition names no trusted authority: ``_typed_disposition`` resolves the
+    action to ``manager_judgment_unknown`` and nothing launches. The recovery
+    plan is the two manager calls that park the card and replay its retained
+    bytes in the validation lane; it never runs the candidate on the host.
     """
     if str(terminal_state or "").strip().lower() != "validation_failed":
         return None
@@ -3489,8 +3491,8 @@ def validation_environment_disposition(
     if entry is None:
         return None
     provenance = {
-        "evidence_source": validation_runner.VALIDATION_ENVIRONMENT_EVIDENCE_SOURCE,
-        "candidate_forgeable": True,
+        "evidence_source": entry.evidence_source,
+        "candidate_forgeable": entry.candidate_forgeable,
     }
     return {
         **_typed_disposition(
@@ -3527,6 +3529,33 @@ def validation_environment_disposition(
             ],
         },
     }
+
+
+# The refusal suffix ``core.mark_done`` appends when the plan above is on record.
+VALIDATION_ENVIRONMENT_RECOVERY_NAME = "validation_only_replay"
+
+
+def validation_environment_recovery_plan(evidence: Any) -> list[dict[str, Any]] | None:
+    """The recorded replay plan of a terminal's evidence, else ``None``
+    (NF-2026-01971).
+
+    Reads back only what :func:`validation_environment_disposition` placed --
+    the finalizer's ``validation_environment_recovery`` key -- so a refusal can
+    name the way forward. It never executes the plan.
+    """
+    if not isinstance(evidence, Mapping):
+        return None
+    recovery = evidence.get("validation_environment_recovery")
+    if not isinstance(recovery, Mapping) or (
+        recovery.get("schema_id") != VALIDATION_ENVIRONMENT_RECOVERY_SCHEMA_ID
+    ):
+        return None
+    plan = recovery.get("plan")
+    if not isinstance(plan, list) or not plan or not all(
+        isinstance(step, Mapping) and step.get("tool") for step in plan
+    ):
+        return None
+    return [dict(step) for step in plan]
 
 
 def failure_category_projection(disposition: Any) -> str:
