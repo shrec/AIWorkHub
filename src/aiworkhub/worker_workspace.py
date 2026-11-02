@@ -7096,8 +7096,8 @@ def sanitized_env(
     else:
         safe = {
             **common,
-            "USER": os.environ.get("USER", "shrek"),
-            "LOGNAME": os.environ.get("LOGNAME", os.environ.get("USER", "shrek")),
+            "USER": os.environ.get("USER", "user"),
+            "LOGNAME": os.environ.get("LOGNAME", os.environ.get("USER", "user")),
             "SHELL": "/bin/bash",
             "PATH": "/usr/local/bin:/usr/bin:/bin",
         }
@@ -7109,7 +7109,9 @@ def sanitized_env(
         # would otherwise resolve to (see TASK_QUEUE_ISOLATED_RELATIVE doc).
         safe["BITNN_TASK_QUEUE_DB"] = str(selected_home / TASK_QUEUE_ISOLATED_RELATIVE)
     if adapter_id == "validation":
-        from aiworkhub import tree_sitter_cache as _tsc
+        from aiworkhub import toolchain_authority as _ta, tree_sitter_cache as _tsc
+
+        safe.update(_ta.validation_user_base_env(adapter_id))  # NF-2026-01969: POSIX only
 
         tree_sitter_cache_root = _tsc.trusted_tree_sitter_cache_root()
         if tree_sitter_cache_root is not None and home is not None and repo is not None:
@@ -9083,7 +9085,8 @@ def sandbox_argv(
         SANDBOX_WORKSPACE if value == str(workspace.path) else value
         for value in adapter_argv
     ]
-    validation_binds: list[str] = []
+    from . import toolchain_authority as _ta  # NF-2026-01969: validation-only ro bind
+    validation_binds: list[str] = list(_ta.validation_user_base_bwrap_binds(adapter_id))
     for index, root in enumerate(validation_executable_roots):
         resolved_root = root.resolve(strict=False)
         alias = f"{SANDBOX_VALIDATION_EXECUTABLE_ROOT}/{index}"
@@ -13192,6 +13195,8 @@ def run_validations(
         )
         if batch_short_tmp is not None:
             tmp_env_value = str(batch_short_tmp)
+        from . import toolchain_authority as _ta
+        version_probes = _ta.ExecutableProbeCache()  # one --version probe per path per run
         for command in rows:
             if command.startswith("lane:"):
                 from .build_lane import run_lane_validation
@@ -13274,8 +13279,18 @@ def run_validations(
                             str(approved_active_root),
                             *effective_components,
                         )
-            receipt_fact = _verify_authority_receipt_executable(
-                verified_toolchain_authority_receipt, tokens[0]
+            env = sanitized_env(
+                "validation",
+                home=validation_home,
+                repo=workspace.repo,
+                isolated_task_queue_db=True,
+                verify_preprovisioned_home=selected_backend == "landlock",
+            )
+            tokens, tool_receipt = _ta.select_validation_executable(  # NF-2026-01969
+                declared_argv, tokens, env, version_probes, probe=not validation_executable_roots,
+                fact=_verify_authority_receipt_executable(
+                    verified_toolchain_authority_receipt, tokens[0]
+                ),
             )
             if module_interpreter_authority is not None:
                 # NF-2026-00452: a ``<python> -m <validator>`` command records the
@@ -13350,13 +13365,6 @@ def run_validations(
                 )
                 subprocess_cwd = "/"
                 execution_boundary = "os_sandbox"
-            env = sanitized_env(
-                "validation",
-                home=validation_home,
-                repo=workspace.repo,
-                isolated_task_queue_db=True,
-                verify_preprovisioned_home=selected_backend == "landlock",
-            )
             env["TMPDIR"] = tmp_env_value
             env["TMP"] = tmp_env_value
             env["TEMP"] = tmp_env_value
@@ -13519,6 +13527,21 @@ def run_validations(
                     "variable": "TMPDIR",
                     "value": tmpdir_override,
                 }
+            base_record: dict[str, Any] = {
+                "command": command,
+                "argv": tokens,
+                "declared_command": command,
+                "declared_argv": declared_argv,
+                "executed_argv": tokens,
+                "argv_rewritten": declared_argv != tokens,
+                "cwd": cd_relative,
+                "env_override": env_override_evidence,
+                "sandbox_backend": selected_backend,
+                "execution_boundary": execution_boundary,
+                "python_candidate_authority": candidate_authority_ref,
+                "interpreter_authority": interpreter_authority,
+                "toolchain_authority_receipt": tool_receipt,
+            }
             started = time.monotonic()
             broker_read_fd: int | None = None
             broker_write_fd: int | None = None
@@ -13583,19 +13606,7 @@ def run_validations(
                     else str(exc.stderr or "")
                 )
                 timeout_record = {
-                        "command": command,
-                        "argv": tokens,
-                        "declared_command": command,
-                        "declared_argv": declared_argv,
-                        "executed_argv": tokens,
-                        "argv_rewritten": declared_argv != tokens,
-                        "cwd": cd_relative,
-                        "env_override": env_override_evidence,
-                        "sandbox_backend": selected_backend,
-                        "execution_boundary": execution_boundary,
-                        "python_candidate_authority": candidate_authority_ref,
-                        "interpreter_authority": interpreter_authority,
-                        "toolchain_authority_receipt": dict(receipt_fact or {}),
+                        **base_record,
                         "returncode": None,
                         "timed_out": True,
                         "timeout_seconds": bounded_timeout,
@@ -13619,19 +13630,7 @@ def run_validations(
                 # test/type failure, nor abort the remaining commands.
                 launch_message = str(exc)
                 launch_record = {
-                    "command": command,
-                    "argv": tokens,
-                    "declared_command": command,
-                    "declared_argv": declared_argv,
-                    "executed_argv": tokens,
-                    "argv_rewritten": declared_argv != tokens,
-                    "cwd": cd_relative,
-                    "env_override": env_override_evidence,
-                    "sandbox_backend": selected_backend,
-                    "execution_boundary": execution_boundary,
-                    "python_candidate_authority": candidate_authority_ref,
-                    "interpreter_authority": interpreter_authority,
-                    "toolchain_authority_receipt": dict(receipt_fact or {}),
+                    **base_record,
                     "returncode": None,
                     "timed_out": False,
                     "timeout_seconds": bounded_timeout,
@@ -13667,19 +13666,7 @@ def run_validations(
             stdout = result.stdout or ""
             stderr = result.stderr or ""
             record = {
-                "command": command,
-                "argv": tokens,
-                "declared_command": command,
-                "declared_argv": declared_argv,
-                "executed_argv": tokens,
-                "argv_rewritten": declared_argv != tokens,
-                "cwd": cd_relative,
-                "env_override": env_override_evidence,
-                "sandbox_backend": selected_backend,
-                "execution_boundary": execution_boundary,
-                "python_candidate_authority": candidate_authority_ref,
-                "interpreter_authority": interpreter_authority,
-                "toolchain_authority_receipt": dict(receipt_fact or {}),
+                **base_record,
                 "returncode": result.returncode,
                 "timeout_seconds": bounded_timeout,
                 "duration_seconds": round(time.monotonic() - started, 6),

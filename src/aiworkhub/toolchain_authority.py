@@ -14,9 +14,13 @@ import os
 import platform
 import re
 import shlex
+import site
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -1387,3 +1391,213 @@ def _verified_receipt_snapshot(
     if not authority._executable_identities_match(snapshot):
         raise ValueError("validation_toolchain_authority_executable_identity_drift")
     return snapshot
+
+
+# NF-2026-01969: a ``pip install --user`` console-script shim imports its
+# package from the user site Python derives from PYTHONUSERBASE, else HOME. The
+# validation lane replaces HOME, so the caller's user base is forwarded to the
+# validation adapter only -- never to an agent adapter -- and bound read-only
+# where the backend has a mount namespace. A rewritten argv head is probed with
+# ``--version`` before it is trusted, once per resolved path per run.
+VALIDATION_ADAPTER_ID = "validation"
+VERSION_PROBE_TIMEOUT_SECONDS = 10.0
+_PROBE_STDERR_HEAD_BYTES = 512
+
+
+def caller_python_user_base() -> Path | None:
+    """The coordinator's own Python user base, when it is an existing directory.
+
+    Read from the coordinator's real environment (PYTHONUSERBASE, else
+    ``site.getuserbase()`` from its real HOME); the sanitized child env never
+    feeds it. Windows keeps its native profile layout, so this is POSIX-only.
+    """
+    if os.name == "nt":
+        return None
+    raw = os.environ.get("PYTHONUSERBASE") or site.getuserbase()
+    if not raw or not Path(raw).is_absolute():
+        return None
+    try:
+        resolved = Path(raw).resolve(strict=True)
+    except OSError:
+        return None
+    if resolved == Path(resolved.anchor):
+        return None
+    return resolved if resolved.is_dir() else None
+
+
+def validation_user_base_env(adapter_id: str) -> dict[str, str]:
+    """``PYTHONUSERBASE`` for the validation lane; empty for every agent adapter."""
+    base = caller_python_user_base() if adapter_id == VALIDATION_ADAPTER_ID else None
+    return {} if base is None else {"PYTHONUSERBASE": str(base)}
+
+
+def validation_user_base_bwrap_binds(adapter_id: str) -> tuple[str, ...]:
+    """Read-only bubblewrap binds of the user site-packages, validation only.
+
+    Never the user base itself (it may be ``$HOME`` or carry ``share/`` and
+    ``state/``): only each existing ``<base>/lib/python*/site-packages``,
+    sorted so the argv is deterministic.
+    """
+    base = caller_python_user_base() if adapter_id == VALIDATION_ADAPTER_ID else None
+    if base is None:
+        return ()
+    binds: list[str] = []
+    for site_packages in sorted((base / "lib").glob("python*/site-packages")):
+        if site_packages.is_dir() and not site_packages.is_symlink():
+            binds.extend(("--ro-bind", str(site_packages), str(site_packages)))
+    return tuple(binds)
+
+
+def _kill_probe(process: subprocess.Popen[bytes]) -> None:
+    try:
+        if sys.platform != "win32":
+            import signal
+
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+    except OSError:
+        pass
+
+
+def probe_executable_version(
+    executable: str,
+    env: Mapping[str, str],
+    *,
+    timeout_seconds: float = VERSION_PROBE_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Run ``<executable> --version`` once, shell-free, under the lane env."""
+    bounded = max(0.1, min(float(timeout_seconds), VERSION_PROBE_TIMEOUT_SECONDS))
+    started = time.monotonic()
+    exit_code: int | None = None
+    timed_out = False
+    launch_error = ""
+    stderr: bytes = b""
+    try:
+        # A fresh empty cwd: the probe must not see (e.g. import a conftest.py
+        # from) the coordinator's own working directory.
+        with tempfile.TemporaryDirectory(
+            prefix="aiworkhub-probe-", ignore_cleanup_errors=True
+        ) as probe_cwd, subprocess.Popen(
+            [executable, "--version"],
+            cwd=probe_cwd,
+            env=dict(env),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            shell=False,
+            start_new_session=os.name != "nt",
+        ) as process:
+            try:
+                _, stderr = process.communicate(timeout=bounded)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _kill_probe(process)
+                try:
+                    _, stderr = process.communicate(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    stderr = b""
+            exit_code = None if timed_out else process.returncode
+    except (OSError, ValueError) as exc:
+        launch_error = type(exc).__name__
+        stderr = str(exc).encode("utf-8", "replace")
+    probe: dict[str, Any] = {
+        "argv": [executable, "--version"],
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "duration_seconds": round(time.monotonic() - started, 6),
+        "stderr_head": (stderr or b"")[:_PROBE_STDERR_HEAD_BYTES].decode("utf-8", "replace"),
+    }
+    if launch_error:
+        probe["launch_error"] = launch_error
+    return probe
+
+
+def probe_succeeded(probe: Mapping[str, Any] | None) -> bool:
+    return bool(
+        probe
+        and probe.get("exit_code") == 0
+        and not probe.get("timed_out")
+        and not probe.get("launch_error")
+    )
+
+
+class ExecutableProbeCache:
+    """At most one ``--version`` probe per resolved path per validation run.
+
+    One instance lives for one ``run_validations`` call, so it is bounded by
+    that run's command count (at most two probed paths per command).
+    """
+
+    def __init__(
+        self, runner: Callable[[str, Mapping[str, str]], dict[str, Any]] | None = None
+    ) -> None:
+        self._runner = runner
+        self._results: dict[str, dict[str, Any]] = {}
+
+    def probe(self, executable: str, env: Mapping[str, str]) -> dict[str, Any]:
+        if executable not in self._results:
+            runner = self._runner or probe_executable_version
+            self._results[executable] = runner(executable, env)
+        return dict(self._results[executable])
+
+    @property
+    def probed_paths(self) -> tuple[str, ...]:
+        return tuple(self._results)
+
+
+def select_validation_executable(
+    declared_argv: Sequence[str],
+    tokens: Sequence[str],
+    env: Mapping[str, str],
+    probes: ExecutableProbeCache,
+    *,
+    fact: Mapping[str, Any] | None = None,
+    probe: bool = True,
+) -> tuple[list[str], dict[str, Any]]:
+    """Choose the argv head to execute and record the choice as a receipt.
+
+    A declared head rewritten to a resolved toolchain path is probed under the
+    lane env. The authority-pinned rewrite is always the one executed: a failed
+    probe keeps it and the receipt carries the failed probe; nothing else is
+    resolved, probed or run. ``probe=False`` marks a rewrite whose trusted
+    runtime root is bound by other authority and is recorded without a probe.
+    """
+    chosen = list(tokens)
+    head = str(declared_argv[0]) if declared_argv else ""
+    receipt: dict[str, Any] = {
+        **dict(fact or {}),
+        "declared_argv": [str(token) for token in declared_argv],
+        "resolved_path": chosen[0] if chosen else "",
+        "probe": None,
+        "choice_reason": "",
+    }
+    if not chosen or chosen[0] == head:
+        receipt["choice_reason"] = "declared_argv_not_rewritten"
+        return chosen, receipt
+    if not probe:
+        receipt["choice_reason"] = "trusted_runtime_root_rewrite_not_probed"
+        return chosen, receipt
+    if chosen[0] == sys.executable:
+        receipt["choice_reason"] = "coordinator_interpreter_not_probed"
+        return chosen, receipt
+    receipt["probe"] = probes.probe(chosen[0], env)
+    receipt["choice_reason"] = (
+        "rewritten_probe_succeeded"
+        if probe_succeeded(receipt["probe"])
+        else "rewritten_probe_failed"
+    )
+    return chosen, receipt
+
+
+def docker_lane_receipt(
+    declared_argv: Sequence[str], executed_argv: Sequence[str], lane_id: str
+) -> dict[str, Any]:
+    """The docker build lane's receipt: the lane runs the argv, nothing is probed."""
+    return {
+        "declared_argv": [str(token) for token in declared_argv],
+        "resolved_path": str(executed_argv[0]) if executed_argv else "",
+        "probe": None,
+        "choice_reason": "docker_build_lane",
+        "build_lane": lane_id,
+    }

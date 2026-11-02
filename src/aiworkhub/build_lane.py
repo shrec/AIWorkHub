@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from . import platform_io
+from .toolchain_authority import docker_lane_receipt
 
 LANE_PREFIX = "lane:"
 LANE_CONFIG_RELATIVE = ".aiworkhub/config/build_lanes.json"
@@ -520,7 +521,10 @@ def _row(
         "execution_boundary": "docker_container_lane",
         "python_candidate_authority": None,
         "interpreter_authority": None,
-        "toolchain_authority_receipt": {},
+        # NF-2026-01969: the lane, not a host resolver, chose the argv; no probe.
+        "toolchain_authority_receipt": docker_lane_receipt(
+            [command], argv, lane.lane_id if lane else ""
+        ),
         "returncode": core.get("returncode"),
         "timed_out": bool(core.get("timed_out")),
         "timeout_seconds": lane.timeout_seconds if lane else 0,
