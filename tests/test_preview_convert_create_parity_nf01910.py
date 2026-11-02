@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -117,3 +118,71 @@ def test_convert_refuses_reserved_topic_without_creating_a_card(
     assert "reserved_topic:quality_review" in str(excinfo.value)
     assert calls == []
     assert needfix_store.get_needfix(needfix_repo, rec["id"])["status"] == "accepted"
+
+
+def test_policy_module_plan_converts_to_the_scope_create_stores(
+    needfix_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NF-2026-01946: preview signs the caller's plan, convert commits it, and
+    the created card carries the same derived scope a direct create stores."""
+    from aiworkhub import task_store, task_templates
+    from aiworkhub.agent_tool_instructions import DERIVED_ARTIFACTS
+    from aiworkhub.policy_derived_writes import POLICY_SOURCE
+
+    task_store.initialize_repository(needfix_repo)
+    monkeypatch.setattr(
+        core,
+        "_claude_manager_identity",
+        lambda: {"provider": "claude", "session_id": "SESSION-A", "route_state": "verified"},
+    )
+    monkeypatch.setattr(core, "_canonical_write_gate", lambda *a, **k: None)
+    monkeypatch.setattr(core, "_verify_coordinator_capability", lambda _runner: (True, "ok"))
+    policy = needfix_repo / POLICY_SOURCE
+    policy.parent.mkdir(parents=True, exist_ok=True)
+    policy.write_text("POLICY = None\n", encoding="utf-8")
+    rec = _accepted_needfix(needfix_repo)
+    plan = _plan(
+        runner="claude-worker",
+        allowed_writes=[POLICY_SOURCE],
+        required_outputs=[POLICY_SOURCE],
+        callback_required=False,
+    )
+
+    preview = core.needfix_preview_convert(rec["id"], task_plan=plan)
+    assert preview["convertible"] is True, preview
+    assert preview["task_plan"]["allowed_writes"] == [POLICY_SOURCE]
+
+    committed = core.needfix_convert(rec["id"], plan_digest=preview["plan_digest"])
+    task_id = committed["converted_task_id"]
+    direct = core.create_task(
+        task_id="NF01946-DIRECT",
+        title="direct create of the same scope",
+        runner="claude-worker",
+        topic="needfix-convert",
+        objective="Compare the converted card's scope with a direct create.",
+        acceptance=["same derived scope"],
+        allowed_writes=[POLICY_SOURCE],
+        required_outputs=[POLICY_SOURCE],
+        validation=plan["validation"],
+        custom_template_escape=task_templates.AUDITED_CUSTOM_ESCAPE,
+        callback_required=False,
+    )
+    assert direct.get("created") is True, direct
+
+    conn = core._canonical_connect()
+    try:
+        cards = {
+            row[0]: json.loads(row[1])
+            for row in conn.execute(
+                "SELECT task_id, card_json FROM tasks WHERE task_id IN (?, ?)",
+                (task_id, "NF01946-DIRECT"),
+            )
+        }
+    finally:
+        conn.close()
+    expected = [POLICY_SOURCE, *DERIVED_ARTIFACTS]
+    for card in cards.values():
+        assert card["allowed_writes"] == expected
+        assert card["allowed_writes_derived"] == list(DERIVED_ARTIFACTS)
+    assert set(cards) == {task_id, "NF01946-DIRECT"}
+    assert needfix_store.get_needfix(needfix_repo, rec["id"])["status"] == "task_created"

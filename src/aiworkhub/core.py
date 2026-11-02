@@ -4616,6 +4616,17 @@ def create_task(
             return _lifecycle_error("read_only_output_exceptions_forbidden", 2)
     elif not writes2 and not outputs2:
         return _lifecycle_error("read_only_declaration_required", 2)
+    # NF-2026-01946: a card that writes the tool-use policy module also writes
+    # every file rendered from it. Widened here, before any check reads
+    # writes2, so preview, convert and direct create store one scope. A
+    # template receipt hashes its exact expanded list, so it stays as bound.
+    from .policy_derived_writes import expand_policy_derived_writes
+
+    writes2, derived_writes2 = (
+        expand_policy_derived_writes(writes2, read_only=read_only)
+        if template_provenance is None
+        else (writes2, [])
+    )
     if task_type == "code" and (writes2 or outputs2) and not validation2:
         return _lifecycle_error("code_task_validation_required", 2)
     # The gate above is opt-in twice over: it fires only for task_type "code",
@@ -5243,6 +5254,8 @@ def create_task(
     if not read_only and isinstance(embedded_minimality, str) and embedded_minimality:
         card["minimality_contract"] = embedded_minimality
     card["template_provenance"] = bound_provenance
+    if derived_writes2:
+        card["allowed_writes_derived"] = derived_writes2
     requested_payload["template_provenance"] = bound_provenance
 
     def reconcile_existing(existing_row: Any) -> dict[str, Any]:

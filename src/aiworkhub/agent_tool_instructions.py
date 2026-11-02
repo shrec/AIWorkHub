@@ -127,6 +127,19 @@ PROVIDERS: tuple[Provider, ...] = ("AGENTS.md", "CLAUDE.md", ".github/copilot-in
 
 Provider = Literal["AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md"]
 
+# NF-2026-01946: every repository path whose bytes are rendered from POLICY.
+# The provider projections are taken from PROVIDERS itself, never retyped; the
+# canonical document is render_canonical() verbatim and the two eval artifacts
+# record its byte counts. A card that writes this module changes all of them,
+# so task creation widens its allowed_writes by this tuple
+# (``policy_derived_writes``). Declaring it renders nothing.
+DERIVED_ARTIFACTS: tuple[str, ...] = (
+    *PROVIDERS,
+    "docs/AIWORKHUB_TOOL_USE_POLICY.md",
+    "eval/aiworkhub_agent_tool_instruction_generator_b816_v2.json",
+    "eval/aiworkhub_agent_tool_instruction_activation_b821_v1.json",
+)
+
 
 # ---------------------------------------------------------------------------
 # Derived raw-discovery vocabulary.
