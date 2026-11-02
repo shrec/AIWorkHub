@@ -24,6 +24,7 @@ from . import (
     codex_auth,
     kilo_auth,
     model_settings,
+    opencode_auth,
     provider_route_contracts,
     quality_evidence,
     runtime_adapters,
@@ -776,7 +777,10 @@ def _list_opencode_models(executable: str | None) -> list[str]:
     """Bound ``opencode models`` discovery; listing is not round-trip evidence.
 
     A timed-out or empty probe retries once with a longer timeout; any failed probe serves
-    the last-known-good list for the executable and records a named reason.
+    the last-known-good list for the executable and records a named reason.  Owner-config
+    custom provider models (NF-2026-01534) are appended after the served CLI rows, in
+    config order, skipping any model already listed; they are never stored as
+    last-known-good and never affect the probe record.
     """
 
     if not isinstance(executable, str) or not executable.strip():
@@ -802,6 +806,11 @@ def _list_opencode_models(executable: str | None) -> list[str]:
             }
         _OPENCODE_LAST_PROBE[executable] = record
     _OPENCODE_PROBE_LOCAL.record = dict(record)
+    existing = set(served)
+    for model in opencode_auth.owner_custom_provider_models():
+        if model not in existing:
+            served.append(model)
+            existing.add(model)
     return served
 
 

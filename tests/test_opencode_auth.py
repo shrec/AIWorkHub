@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import stat
 from pathlib import Path
@@ -45,6 +46,105 @@ def test_project_opencode_auth_is_exact_private_and_secret_free(tmp_path: Path) 
         assert stat.S_IMODE(destination.stat().st_mode) == 0o600
         for directory in (isolated, isolated / ".local", isolated / ".local/share", destination.parent):
             assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+
+
+def _owner_config(tmp_path: Path, document: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    xdg = tmp_path / "xdg"
+    (xdg / "opencode").mkdir(parents=True)
+    (xdg / "opencode" / "opencode.json").write_text(json.dumps(document))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+
+
+def test_owner_custom_provider_models_v1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _owner_config(
+        tmp_path,
+        {"provider": {"omniroute": {"models": {"m1": {}, "m2": {}}}}},
+        monkeypatch,
+    )
+    result = opencode_auth.owner_custom_provider_models()
+    assert result == ["omniroute/m1", "omniroute/m2"]
+
+
+def test_owner_custom_provider_models_v2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _owner_config(
+        tmp_path,
+        {"providers": {"omniroute": {"models": {"m1": {}}}}},
+        monkeypatch,
+    )
+    result = opencode_auth.owner_custom_provider_models()
+    assert result == ["omniroute/m1"]
+
+
+def test_owner_custom_provider_models_excludes_builtin_disabled_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _owner_config(
+        tmp_path,
+        {
+            "provider": {
+                "opencode": {"models": {"x": {}}},
+                "blocked": {"models": {"y": {}}},
+                "omniroute": {"models": {"m1": {}}},
+                "notenabled": {"models": {"z": {}}},
+            },
+            "disabled_providers": ["blocked"],
+            "enabled_providers": ["omniroute"],
+        },
+        monkeypatch,
+    )
+    result = opencode_auth.owner_custom_provider_models()
+    assert result == ["omniroute/m1"]
+
+
+def test_owner_custom_provider_models_missing_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    assert opencode_auth.owner_custom_provider_models() == []
+
+
+def test_owner_custom_provider_models_malformed_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    xdg = tmp_path / "xdg"
+    (xdg / "opencode").mkdir(parents=True)
+    (xdg / "opencode" / "opencode.json").write_text("not json")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    assert opencode_auth.owner_custom_provider_models() == []
+
+
+def test_owner_custom_provider_models_non_dict_document(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    xdg = tmp_path / "xdg"
+    (xdg / "opencode").mkdir(parents=True)
+    (xdg / "opencode" / "opencode.json").write_text("[1, 2, 3]")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    assert opencode_auth.owner_custom_provider_models() == []
+
+
+def test_owner_custom_provider_models_never_leaks_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _owner_config(
+        tmp_path,
+        {
+            "provider": {
+                "omniroute": {
+                    "options": {
+                        "apiKey": _CREDENTIAL_SENTINEL,
+                        "baseURL": "http://sentinel.invalid",
+                        "headers": {"X-Sentinel": _CREDENTIAL_SENTINEL},
+                    },
+                    "models": {"m1": {}},
+                }
+            }
+        },
+        monkeypatch,
+    )
+    result = opencode_auth.owner_custom_provider_models()
+    assert result == ["omniroute/m1"]
+    assert _CREDENTIAL_SENTINEL not in repr(result)
 
 
 def test_missing_source_fails_closed(tmp_path: Path) -> None:

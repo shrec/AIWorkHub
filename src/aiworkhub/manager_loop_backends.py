@@ -957,14 +957,12 @@ def _set_opencode_models_cache(models: list[str]) -> None:
 def _opencode_discovered_models() -> list[str]:
     """Bound ``opencode models`` probe; [] on any failure.
 
-    The executable is resolved exactly the way a launch resolves it
-    (:func:`runtime_adapters.resolve_executable`): the manager MCP server's
-    PATH need not carry ``opencode`` for the picker to see the CLI's models,
-    because a host whose PATH lacks it measured as
-    ``manager_backend_unavailable:opencode_cli`` while the CLI was installed
-    and serving (NF-2026-01454).  The first successful probe result is
-    cached: ``opencode models`` costs seconds of gateway round trips, and the
-    manager picker asks per route candidate.
+    Delegates to :func:`repo_policy._list_opencode_models`, the single
+    owner of the probe/retry/last-known-good logic, instead of running its
+    own subprocess.  The cache is only refreshed when that call both
+    produced models and the shared probe record reports an ``ok`` state --
+    a failed probe served from last-known-good or owner-config rows must
+    not freeze the cache.
     """
     cached = _OPENCODE_MODELS_CACHE
     if cached is not None:
@@ -978,22 +976,12 @@ def _opencode_discovered_models() -> list[str]:
     executable = resolution.executable if resolution.ok else shutil.which("opencode")
     if not executable:
         return []
-    try:
-        completed = subprocess.run(
-            [executable, "models"],
-            check=False,
-            capture_output=True,
-            timeout=15,
-        )
-    except (OSError, subprocess.TimeoutExpired, ValueError):
-        return []
-    payload = completed.stdout or b""
-    if not payload:
-        payload = completed.stderr or b""
-    if len(payload) > 64 * 1024:
-        return []
-    models = workforce_catalog.parse_opencode_models_output(payload)
-    if models:
+    from . import repo_policy
+
+    repo_policy._OPENCODE_PROBE_LOCAL.record = None
+    models = repo_policy._list_opencode_models(executable)
+    record = getattr(repo_policy._OPENCODE_PROBE_LOCAL, "record", None)
+    if models and isinstance(record, dict) and record.get("state") == "ok":
         _set_opencode_models_cache(models)
     return models
 

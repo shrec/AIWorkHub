@@ -17,7 +17,10 @@ _EMPTY_POLICY = {"providers": {}, "adapters": {}, "models": {}}
 
 
 @pytest.fixture(autouse=True)
-def _clean_probe_state():
+def _clean_probe_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    xdg = tmp_path / "xdg_empty"
+    xdg.mkdir()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
     with repo_policy._OPENCODE_PROBE_LOCK:
         repo_policy._OPENCODE_LAST_GOOD_MODELS.clear()
         repo_policy._OPENCODE_LAST_PROBE.clear()
@@ -25,6 +28,40 @@ def _clean_probe_state():
     with repo_policy._OPENCODE_PROBE_LOCK:
         repo_policy._OPENCODE_LAST_GOOD_MODELS.clear()
         repo_policy._OPENCODE_LAST_PROBE.clear()
+
+
+def test_config_models_appended_after_cli_rows_no_duplicates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        repo_policy, "_opencode_models_probe_once", lambda *_a, **_k: (_ROWS, None)
+    )
+    monkeypatch.setattr(
+        repo_policy.opencode_auth,
+        "owner_custom_provider_models",
+        lambda: ["omniroute/m1", _ROWS[0]],
+    )
+
+    result = repo_policy._list_opencode_models(_EXE)
+
+    assert result == list(_ROWS) + ["omniroute/m1"]
+
+
+def test_config_models_served_when_probe_fails_no_last_good(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        repo_policy, "_opencode_models_probe_once", lambda *_a, **_k: ([], "timeout")
+    )
+    monkeypatch.setattr(
+        repo_policy.opencode_auth,
+        "owner_custom_provider_models",
+        lambda: ["omniroute/m1"],
+    )
+
+    result = repo_policy._list_opencode_models(_EXE)
+
+    assert result == ["omniroute/m1"]
 
 
 def _script_run(monkeypatch: pytest.MonkeyPatch, steps: list) -> list[dict]:

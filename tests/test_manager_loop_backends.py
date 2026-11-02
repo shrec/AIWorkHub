@@ -16,6 +16,7 @@ import sys
 import textwrap
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Iterator
 
 import pytest
@@ -845,6 +846,57 @@ def test_opencode_discovery_failure_refuses_by_name_not_silently(tmp_path: Path,
 
     with pytest.raises(mlb.ManagerLoopError, match="manager_backend_unavailable:opencode_cli"):
         build("opencode_cli", "opencode-go/muse-spark-1.3-contributor")
+
+
+def test_opencode_discovered_models_delegates_to_repo_policy(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setattr(mlb, "_OPENCODE_MODELS_CACHE", None)
+    from aiworkhub import repo_policy
+
+    monkeypatch.setattr(
+        mlb.runtime_adapters,
+        "resolve_executable",
+        lambda adapter: SimpleNamespace(ok=True, executable="opencode"),
+    )
+
+    calls = []
+
+    def fake_list(executable):
+        calls.append(executable)
+        repo_policy._OPENCODE_PROBE_LOCAL.record = {"state": "ok", "count": 1}
+        return ["opencode-go/m1"]
+
+    monkeypatch.setattr(repo_policy, "_list_opencode_models", fake_list)
+
+    result = mlb._opencode_discovered_models()
+
+    assert result == ["opencode-go/m1"]
+    assert calls == ["opencode"]
+    assert mlb._OPENCODE_MODELS_CACHE == ["opencode-go/m1"]
+
+
+def test_opencode_discovered_models_no_cache_on_failed_probe(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setattr(mlb, "_OPENCODE_MODELS_CACHE", None)
+    from aiworkhub import repo_policy
+
+    monkeypatch.setattr(
+        mlb.runtime_adapters,
+        "resolve_executable",
+        lambda adapter: SimpleNamespace(ok=True, executable="opencode"),
+    )
+
+    def fake_list(executable):
+        repo_policy._OPENCODE_PROBE_LOCAL.record = {"state": "failed", "reason": "timeout"}
+        return ["omniroute/m1"]
+
+    monkeypatch.setattr(repo_policy, "_list_opencode_models", fake_list)
+
+    result = mlb._opencode_discovered_models()
+
+    assert result == ["omniroute/m1"]
+    assert mlb._OPENCODE_MODELS_CACHE is None
+
 
 def test_codex_images_ride_as_attached_image_flags_before_the_prompt_on_fresh_and_resumed_turns(
     tmp_path: Path,

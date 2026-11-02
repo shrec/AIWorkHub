@@ -43,6 +43,7 @@ __all__ = [
     "OpenCodeAuthProjection",
     "OpenCodeAuthSourceError",
     "opencode_go_api_key_env",
+    "owner_custom_provider_models",
     "project_opencode_auth",
     "project_opencode_custom_provider",
 ]
@@ -722,3 +723,48 @@ def project_opencode_custom_provider(
         projected_block["options"] = projected_options
     projected_block["models"] = {name: _project_opencode_model_entry(model_entry, env)}
     return {provider: projected_block}
+
+
+def owner_custom_provider_models() -> list[str]:
+    """List ``<provider>/<model>`` for every owner-config custom provider.
+
+    Reads only the owner's global OpenCode config (the same source
+    :func:`project_opencode_custom_provider` uses).  Any read failure --
+    missing file, unsafe file, malformed JSON, or a non-dict document --
+    returns ``[]``; nothing here ever raises.  A provider id is skipped when
+    it is built-in, listed in ``disabled_providers``, or (when
+    ``enabled_providers`` is present) absent from it -- the same exclusion
+    rule :func:`project_opencode_custom_provider` applies.  Only model keys
+    are read; no ``options``/``apiKey``/``baseURL``/``headers`` value is ever
+    read, returned, or logged.
+    """
+    try:
+        document = _read_bounded_json(_owner_opencode_global_config_path())
+    except (OpenCodeAuthError, OSError, ValueError):
+        return []
+    if not isinstance(document, dict):
+        return []
+    providers = document.get("provider")
+    if not isinstance(providers, dict):
+        providers = document.get("providers")
+        if not isinstance(providers, dict):
+            return []
+    disabled = document.get("disabled_providers")
+    enabled = document.get("enabled_providers")
+    results: list[str] = []
+    for provider_id, block in providers.items():
+        if not isinstance(provider_id, str) or provider_id in _OPENCODE_BUILTIN_PROVIDERS:
+            continue
+        if isinstance(disabled, list) and provider_id in disabled:
+            continue
+        if isinstance(enabled, list) and provider_id not in enabled:
+            continue
+        if not isinstance(block, dict):
+            continue
+        models = block.get("models")
+        if not isinstance(models, dict):
+            continue
+        for model_name in models:
+            if isinstance(model_name, str):
+                results.append(f"{provider_id}/{model_name}")
+    return results
