@@ -22,6 +22,8 @@ sandbox grants ``node`` is adapter policy this module cannot observe.
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -259,11 +261,32 @@ def test_npm_prefix_card_stays_blocked_when_npm_is_absent(
 
 
 def test_repository_tracked_paths_reads_this_repository(tmp_path):
-    # Against the real repository the helper must return a non-empty index
-    # containing a file we know is tracked, and must return empty for a
-    # directory that is not a git work tree.
-    here = Path(__file__).resolve().parents[1]
-    tracked = toolchain_authority.repository_tracked_paths(here)
-    assert "src/aiworkhub/toolchain_authority.py" in tracked
+    # Against a real git repository the helper must return the index, which
+    # holds a committed file and omits an untracked one, and must return empty
+    # for a directory that is not a git work tree. The repository is built
+    # here because a validation lane is a merged file view without a .git.
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git is not on PATH; cannot build a temporary repository")
+    repo = tmp_path / "repo"
+    tracked_file = repo / "src" / "pkg" / "mod.py"
+    tracked_file.parent.mkdir(parents=True)
+    tracked_file.write_text("x = 1\n", encoding="utf-8")
+    untracked_file = repo / ".venv" / "bin" / "mypy"
+    untracked_file.parent.mkdir(parents=True)
+    untracked_file.write_text("#!/bin/sh\n", encoding="utf-8")
+    identity = ("-c", "user.name=nf625", "-c", "user.email=nf625@example.invalid")
+    for argv in (
+        ("init", "-q"),
+        ("add", "src/pkg/mod.py"),
+        (*identity, "commit", "-q", "--no-gpg-sign", "-m", "seed"),
+    ):
+        subprocess.run(
+            [git, "-C", str(repo), *argv], check=True, capture_output=True
+        )
+    tracked = toolchain_authority.repository_tracked_paths(repo)
+    assert "src/pkg/mod.py" in tracked
     assert ".venv/bin/mypy" not in tracked
-    assert toolchain_authority.repository_tracked_paths(tmp_path) == frozenset()
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert toolchain_authority.repository_tracked_paths(plain) == frozenset()
