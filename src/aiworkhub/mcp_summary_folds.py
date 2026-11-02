@@ -515,6 +515,125 @@ def fold_latest_event_for_process_status(event: Any) -> Any:
     return result
 
 
+FIRST_FAILURE_COMMAND_CHARS = 512
+FIRST_FAILURE_TAIL_LINES = 20
+FIRST_FAILURE_TAIL_BYTES = 2_048
+FIRST_FAILURE_FIELD_CHARS = 128
+# command (<=512 chars, <=2 KiB) + tail (<=2 KiB) + a few short scalar fields.
+FIRST_FAILURE_MAX_BYTES = 4_608
+_VALIDATION_ROW_LISTS = ("commands", "results", "rows", "entries")
+
+
+def _bounded_tail(text: str) -> str:
+    """Last <=20 lines of ``text``, capped at 2,048 UTF-8 bytes on a character boundary."""
+
+    raw = "\n".join(text.rstrip().splitlines()[-FIRST_FAILURE_TAIL_LINES:]).encode("utf-8", "replace")
+    if len(raw) > FIRST_FAILURE_TAIL_BYTES:
+        raw = raw[-FIRST_FAILURE_TAIL_BYTES:]
+        while raw and (raw[0] & 0xC0) == 0x80:
+            raw = raw[1:]
+    return raw.decode("utf-8", "ignore")
+
+
+def _pick_tail(*sources: Any) -> tuple[str, str | None]:
+    for label in ("stderr", "stdout"):
+        for source in sources:
+            value = source.get(f"{label}_tail") if isinstance(source, dict) else None
+            if isinstance(value, str) and value.strip():
+                return _bounded_tail(value), label
+    return "", None
+
+
+def _command_text(*sources: Any) -> str:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in ("command", "declared_command", "argv"):
+            value = source.get(key)
+            if isinstance(value, (list, tuple)):
+                value = " ".join(str(part) for part in value)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:FIRST_FAILURE_COMMAND_CHARS]
+    return ""
+
+
+def _short_text(*values: Any) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:FIRST_FAILURE_FIELD_CHARS]
+    return None
+
+
+def _exit_code(*sources: Any) -> int | None:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in ("returncode", "exit_code"):
+            value = source.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+    return None
+
+
+def _validation_rows(event: Any) -> list[Any]:
+    validation = event.get("validation") if isinstance(event, dict) else None
+    if isinstance(validation, dict):
+        for key in _VALIDATION_ROW_LISTS:
+            if isinstance(validation.get(key), list):
+                return validation[key]
+        return []
+    return validation if isinstance(validation, list) else []
+
+
+def first_failure_from_status(event: Any, card: Any) -> dict[str, Any] | None:
+    """First failed validation command (declaration order) from the UNFOLDED event.
+
+    Falls back to the card's ``terminal_failure`` when the event records no
+    failed row. Pure: reads stored records only and never re-runs anything.
+    """
+
+    for index, row in enumerate(_validation_rows(event)):
+        if not isinstance(row, dict):
+            continue
+        timed_out = bool(row.get("timed_out"))
+        code = row.get("returncode")
+        if not timed_out and code in (0, None):
+            continue
+        tail, tail_source = _pick_tail(row)
+        failure: dict[str, Any] = {
+            "command": _command_text(row),
+            "index": index,
+            "exit_code": _exit_code(row),
+            "failure_class": _short_text(row.get("failure_class"), "timed_out" if timed_out else None),
+            "tail": tail,
+            "tail_source": tail_source,
+        }
+        if "timed_out" in row:
+            failure["timed_out"] = timed_out
+        return failure
+    terminal = card.get("terminal_failure") if isinstance(card, dict) else None
+    if not isinstance(terminal, dict) or not terminal:
+        return None
+    evidence = terminal.get("evidence") if isinstance(terminal.get("evidence"), dict) else {}
+    tail, tail_source = _pick_tail(evidence, terminal)
+    failure = {
+        "command": _command_text(evidence, terminal),
+        "index": None,
+        "exit_code": _exit_code(evidence, terminal),
+        "failure_class": _short_text(
+            evidence.get("failure_class"), terminal.get("category"),
+            terminal.get("substatus"), terminal.get("reason"),
+        ),
+        "tail": tail,
+        "tail_source": tail_source,
+    }
+    for source in (evidence, terminal):
+        if "timed_out" in source:
+            failure["timed_out"] = bool(source.get("timed_out"))
+            break
+    return failure
+
+
 def _scalar_text(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
 

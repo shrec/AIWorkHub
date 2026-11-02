@@ -6381,6 +6381,12 @@ def aiworkhub_agent_task_status(
     if detail == "full" or not isinstance(result, dict) or not result.get("ok"):
         return result
     folded = dict(result)
+    if detail == "summary":
+        first_failure = mcp_summary_folds.first_failure_from_status(
+            result.get("latest_event"), result.get("task_card")
+        )
+        if first_failure is not None:
+            folded["first_failure"] = first_failure
     card = folded.get("task_card")
     identity: dict[str, Any] | None = None
     findings: int | None = None
