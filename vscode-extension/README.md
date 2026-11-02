@@ -29,7 +29,9 @@ unless you start the opt-in WorkHub Mail listener on a host and port you name.
 - WorkHub Mail is temporarily switched off: the LAN listener never starts in this release, and a listener an earlier version left running is stopped. Listener status and stop keep working.
 - A reviewer finding can carry a runnable reproduction: AIWorkHub runs it on the candidate and on its base and stores a signed receipt with the manager's decision. The security lens checks four named vulnerability classes.
 - Scripts in a project's `tools/` directory with an `aiworkhub-tool` header are seeded as versioned recipes, and a Claude Code manager can install the canonical recipes.
-- Fewer stuck cards: a sealed file deletion accepts, a capped continuation launches, a tests-only diff keeps its risk tier, a registry-lock timeout names its holder, and read-only review projections no longer hold the task-queue write lease.
+- Fewer stuck cards: a sealed file deletion accepts, a capped continuation launches, a tests-only diff keeps its risk tier, a registry-lock timeout names its holder, read-only review projections no longer hold the task-queue write lease, a dependency output that was never produced no longer fails finalize, and a file present before the worker started is no longer sealed as its change.
+- No more virtual drives in your Windows session: a sandboxed worker's drive letter exists only inside a private logon session opened for it. Restoring a manager chat after a window reload attaches read-only and no longer revives a retired chat.
+- Scratch lives in the repository under `.scratch/<session_id>/`: git-ignored, indexed by Source Graph, edited only with the AIWorkHub tools, pruned after 48 hours and never sealed into a worker's changes. The tool guard and Source Graph decide "indexed" with one shared predicate.
 
 ## Review automation
 

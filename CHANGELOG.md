@@ -6,7 +6,7 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
-## [0.12.84] - 2026-11-01
+## [0.12.84] - 2026-11-02
 
 ### Changed
 
@@ -16,6 +16,8 @@ noted by package/extension version and release tag.
 
 - The security reviewer lens carries a fixed checklist: path traversal and normalization, subprocess argument injection, secrets in logs or receipts, and route/tool authorization (RM-2026-00083).
 - A top-level `tools/` file with an `aiworkhub-tool` header is seeded as a versioned `project.<id>` recipe whose version carries the file's sha256; batch files are refused and a run refuses a tool whose bytes changed since the scan. Ships `pyrun`, `json_get`, `sqlite_peek` and `script_census` (NF-2026-01427).
+- Semantic edit can create a new file (`scripts/manager_semantic_edit.py --create` and the worker semantic-edit MCP tools), so no seat needs the built-in Write for it (NF-2026-01928).
+- Scratch lives in the repository: `.scratch/<session_id>/` is git-ignored, indexed by Source Graph through `include_roots`, and created or edited only with the AIWorkHub create/semantic-edit tools (the tool guard denies built-in Read/Edit/Write there, rule R8). Storage retention prunes a session folder after 48 h, and a worker's scratch never enters its sealed `changed_paths` (NF-2026-01928).
 - A reviewer can now attach a runnable reproduction to a finding (`pytest:<test node>` or `probe:<python source>`). When a manager disposes that finding, AIWorkHub runs it in the validation sandbox on the candidate and on its base and stores a signed receipt with the decision. Only a failing test, or a probe's failed assertion or explicit exit 1, counts as a failure; any other probe error makes the run inconclusive. A finding that reproduces can be dismissed only when the manager cites the task contract, a confirmed one is recorded as reproduced, and a low or medium finding that does not reproduce (or already failed before the change) may be dismissed on that receipt alone; high and critical findings keep their existing rules (RM-2026-00083).
 
 ### Fixed
@@ -30,6 +32,16 @@ noted by package/extension version and release tag.
 - The callback dispatcher reports a healthy idle state when no manager is selected (NF-2026-01811).
 - A registry-lock timeout names its holder (pid, label, time held), and a reviewer spawn retries lock contention (NF-2026-01911).
 - Read-only review projections (`lifecycle_counts`, `drain_projection`) no longer hold the task-queue write lease, and `write_lease_timeout` is a named terminal-failure class (NF-2026-01912).
+- Windows AppContainer sandbox drive letters exist only inside a private logon session opened for the worker; the owner's session no longer gets an X:/Y:/Z: drive for every repository a worker runs in (NF-2026-01154).
+- Restoring a manager chat after a window reload attaches read-only: it no longer reopens a retired chat or renews the seat lease; only an explicit continue, send or bind does (NF-2026-01914).
+- An `unexpected_arguments` refusal names the tool's accepted parameters and a did-you-mean, and two measured parameter aliases are mapped (NF-2026-01919).
+- `aiworkhub_manager_bootstrap` returns one ToolSearch `select:` line for the manager's standard tool set (NF-2026-01921).
+- The process-event latest-by-request projection fits its cache bound again, so it is served from cache instead of rebuilt on every call (NF-2026-01929).
+- SDLC first-pass acceptance counts every rework, supersede and relaunch, not only reject events (NF-2026-01927).
+- The Claude Code tool guard decides "indexed" with the same `index_admits` predicate as Source Graph, so an `include_roots` policy no longer makes the guard deny a Read that Source Graph cannot serve, or allow one it indexes (NF-2026-01928).
+- The Source Graph startup-recovery race test waits a 120 s hang guard instead of 10 s, so a loaded host no longer fails it (NF-2026-01941).
+- The `changed_paths` manifest fallback subtracts the `workspace_baseline` the way the git path does, so a file present before the worker started is no longer sealed as its change; the foreign-worktree-root guard accepts a scratch repository under `.aiworkhub/temp` (NF-2026-01930, NF-2026-01942).
+- Launch metadata persists `dependency_materialized_inputs`, so finalize skips a dependency output the dependency never produced instead of failing the card on that phantom input (NF-2026-01945).
 
 ## [0.12.83] - 2026-11-01
 
