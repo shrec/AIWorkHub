@@ -17,12 +17,12 @@ own key. A reviewer can only propose a reproduction: the evidence level
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import hashlib
 import hmac
 import json
 import re
-import shlex
 import time
 import uuid
 from dataclasses import dataclass
@@ -100,10 +100,20 @@ class ReproductionSpec:
 
     @property
     def command(self) -> str:
-        """The shell-free validation command the sandbox runner executes."""
+        """The shell-free validation command the sandbox runner executes.
+
+        A probe is one line: prelude plus body travel base64-encoded, so the
+        command never carries a newline, ``;``, ``|``, backtick, ``<`` or ``>``
+        that the validation tokenizer refuses (NF-2026-01985). The base64
+        alphabet needs no quoting on POSIX or Windows.
+        """
         if self.kind == "pytest":
             return f"python -m pytest -q -p no:cacheprovider {self.body}"
-        return "python -I -c " + shlex.quote(_PROBE_PRELUDE + self.body)
+        encoded = base64.b64encode((_PROBE_PRELUDE + self.body).encode("utf-8"))
+        return (
+            "python -I -c "
+            f"\"exec(__import__('base64').b64decode('{encoded.decode('ascii')}'))\""
+        )
 
 
 def _materialized_unknown() -> None:

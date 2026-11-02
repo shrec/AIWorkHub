@@ -448,7 +448,18 @@ def test_spec_commands_are_shell_free_and_option_free() -> None:
     ]
     argv = shlex.split(probe_spec.command)
     assert argv[:3] == ["python", "-I", "-c"] and len(argv) == 4
-    assert argv[3].endswith("print('a b; rm -rf /')")
+    import base64
+    import re
+
+    match = re.fullmatch(
+        r"exec\(__import__\('base64'\)\.b64decode\('([A-Za-z0-9+/=]+)'\)\)",
+        argv[3],
+    )
+    assert match is not None, argv[3]
+    source = base64.b64decode(match.group(1)).decode("utf-8")
+    assert source.endswith("print('a b; rm -rf /')")
+    outside = argv[3].replace(match.group(1), "")
+    assert "\n" not in outside and ";" not in outside
 
 
 # --------------------------------------------------------------------------
