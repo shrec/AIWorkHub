@@ -579,11 +579,11 @@ def test_quality_review_prewarm_fails_before_publish_on_wrong_hash(
     packet_path = runtime / "quality_review_packet.json"
     real_index_file = source_graph.index_file
 
-    def fake_index_file(repo: Path, path: str, expected_hash: str) -> dict:
+    def fake_index_file(repo: Path, path: str, expected_hash: str, **kwargs) -> dict:
         # Reconcile the changed path, then corrupt its hash in the private
         # context-bound clone.  Temp verification must fail closed before the
         # clone is atomically published.
-        result = real_index_file(repo, path, expected_hash)
+        result = real_index_file(repo, path, expected_hash, **kwargs)
         conn = sqlite3.connect(str(source_graph.resolve_db_path(repo)))
         try:
             conn.execute(

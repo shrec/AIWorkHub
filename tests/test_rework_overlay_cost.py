@@ -229,9 +229,9 @@ def test_rework_overlay_readiness_reuses_then_rebuilds_on_edit(tmp_path, monkeyp
     real_index_file = source_graph.index_file
     calls = {"n": 0}
 
-    def counting_index_file(repo_root, path, expected_hash):
+    def counting_index_file(repo_root, path, expected_hash, **kwargs):
         calls["n"] += 1
-        return real_index_file(repo_root, path, expected_hash)
+        return real_index_file(repo_root, path, expected_hash, **kwargs)
 
     monkeypatch.setattr(source_graph, "index_file", counting_index_file)
 

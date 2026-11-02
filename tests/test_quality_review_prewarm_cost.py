@@ -303,9 +303,9 @@ def test_prewarm_three_lenses_share_one_partition_build(
     real_index_file = source_graph.index_file
     calls = {"n": 0}
 
-    def counting_index_file(repo_root, path, expected_hash):
+    def counting_index_file(repo_root, path, expected_hash, **kwargs):
         calls["n"] += 1
-        return real_index_file(repo_root, path, expected_hash)
+        return real_index_file(repo_root, path, expected_hash, **kwargs)
 
     monkeypatch.setattr(source_graph, "index_file", counting_index_file)
 

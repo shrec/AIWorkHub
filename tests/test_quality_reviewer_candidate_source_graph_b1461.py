@@ -447,11 +447,11 @@ def test_quality_review_prewarm_same_packet_single_flights(
     call_lock = threading.Lock()
     release = threading.Event()
 
-    def fake_index_file(repo_root: Path, path: str, expected_hash: str):
+    def fake_index_file(repo_root: Path, path: str, expected_hash: str, **kwargs):
         with call_lock:
             call_count["n"] += 1
         release.wait(timeout=10)
-        return real_index_file(repo_root, path, expected_hash)
+        return real_index_file(repo_root, path, expected_hash, **kwargs)
 
     monkeypatch.setattr(source_graph, "index_file", fake_index_file)
 
