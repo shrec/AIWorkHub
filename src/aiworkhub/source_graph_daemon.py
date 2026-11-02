@@ -90,6 +90,16 @@ _RECOVERY_RETRY_JOB_ATTEMPTS = 6
 # behind it -- stalls (NF-2026-01565). A child still working is never timed out.
 _BUILD_OUTPUT_DRAIN_SECONDS = 5.0
 
+# How long stop_daemon waits for the daemon thread to really exit
+# (NF-2026-01987). Once stop is set, the thread's own bounded stop path is
+# observed every 0.25 s by the build wait, then runs the tree termination
+# (<= 2 s graceful + 2 s forced + the descendant reap) and the output drain
+# (<= 2 s + 2 s): about 8-10 s of bounded waits on an idle host, so the old
+# 5 s join expired inside it under worker/xdist load. 30 s keeps ~3x headroom
+# for a loaded host. A thread still alive after this wait is never reported
+# stopped and stays registered.
+_STOP_DAEMON_WAIT_SECONDS = 30.0
+
 # Writer-loop phases that explain who consumes a queued refresh job.
 _LOOP_PHASE_WAITING = "waiting"
 _LOOP_PHASE_BUILDING = "building"
@@ -1813,6 +1823,19 @@ class SourceGraphDaemon:
                 if kind != "success":
                     raise RuntimeError(str(outcome.get("error") or "index_build_failed"))
                 report = dict(outcome["report"])
+                if self._stop_event.is_set():
+                    # NF-2026-01987: a stop requested while the build ran must
+                    # not wait for the in-process recommendation self-check (a
+                    # heavy import plus sampled queries that never observe the
+                    # stop event). The generation is committed; publish it and
+                    # let the thread exit within the stop wait.
+                    with self._state_lock:
+                        self._status = STATUS_STOPPED
+                        self._last_report = report
+                        self._last_error = ""
+                        self._last_run_at = _utcnow()
+                        self._last_success_at = self._last_run_at
+                    return True
                 files_changed = int(report.get("files_changed") or 0)
                 files_removed = int(report.get("files_removed") or 0)
                 with self._state_lock:
@@ -2478,7 +2501,7 @@ def stop_daemon(repo_root: Path | str) -> bool:
         daemon = _REGISTRY.get(key)
         retained_was_present = _read_build_identity(repo_root) is not None
         if daemon is not None:
-            daemon.stop()
+            daemon.stop(timeout=_STOP_DAEMON_WAIT_SECONDS)
             if daemon.is_running():
                 return False
         if not _stop_retained_build(repo_root):
