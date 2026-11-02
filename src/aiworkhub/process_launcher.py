@@ -3165,6 +3165,25 @@ def derive_launch_identity(
         raise LaunchRejected("launch_identity_underivable:card_missing_runner_or_topic")
 
     resolved_adapter = str(adapter_id or "").strip()
+    # NF-2026-01948: ``reroute_launch_identity`` records the operator's chosen
+    # adapter/model on ``card['identity_reroute']``; it only applies to the
+    # runner it was written for, and an explicit launch argument still wins.
+    reroute_adapter = ""
+    reroute_model: str | None = None
+    reroute = card.get("identity_reroute")
+    if (
+        isinstance(reroute, Mapping)
+        and str(reroute.get("to_runner") or "").strip() == resolved_runner
+    ):
+        reroute_adapter = str(reroute.get("to_adapter_id") or "").strip()
+        reroute_model = str(reroute.get("to_model") or "").strip() or None
+    if resolved_adapter and resolved_adapter != reroute_adapter:
+        reroute_adapter, reroute_model = "", None
+    if reroute_model and not reroute_adapter:
+        derived_from["identity_reroute_rejected"] = "to_model_without_to_adapter_id"
+    if str(model or "").strip():
+        # An explicit model wins, so the reroute's model never gates a route.
+        reroute_model = None
     adapter_candidates = adapter_identity_tuple(resolved_runner)
     adapter_rejections: list[str] = []
     catalog_adapter_fallback = False
@@ -3200,8 +3219,21 @@ def derive_launch_identity(
             for candidate in adapter_candidates
             if (resolved_runner, candidate) in _CANONICAL_WORKFORCE
         )
+        candidate_order = tuple(pinnable or adapter_candidates)
+        if reroute_adapter:
+            # The rerouted adapter is tried FIRST but faces every check below;
+            # one outside the derivable set is rejected, never trusted.
+            if reroute_adapter in candidate_order:
+                candidate_order = (reroute_adapter,) + tuple(
+                    candidate for candidate in candidate_order if candidate != reroute_adapter
+                )
+            else:
+                adapter_rejections.append(
+                    f"{reroute_adapter}:identity_reroute_adapter_not_"
+                    + ("pinnable" if pinnable else "in_tuple")
+                )
         circuit_skips: list[str] = []
-        for candidate in pinnable or adapter_candidates:
+        for candidate in candidate_order:
             verdict = repo_policy.validate_launch(repo, card, candidate)
             if not verdict.get("ok"):
                 adapter_rejections.append(
@@ -3215,8 +3247,15 @@ def derive_launch_identity(
             # to the next pinnable candidate and says why; an explicit adapter
             # pin never reaches this loop and is never overridden.
             pinned_route = _CANONICAL_WORKFORCE.get((resolved_runner, candidate))
+            candidate_model = (
+                reroute_model
+                if candidate == reroute_adapter and reroute_model
+                else str(pinned_route["model"])
+                if pinned_route is not None
+                else None
+            )
             circuit = (
-                _derivation_route_circuit(repo, candidate, str(pinned_route["model"]))
+                _derivation_route_circuit(repo, candidate, str(candidate_model))
                 if pinned_route is not None
                 else {}
             )
@@ -3232,20 +3271,30 @@ def derive_launch_identity(
                 # needs a launchable bridge host -- policy/circuit approval
                 # alone can still point at an editor session nothing started.
                 blocker = vscode_lm_bridge.derived_candidate_blocker(
-                    repo, candidate,
-                    str(pinned_route["model"]) if pinned_route is not None else None)
+                    repo, candidate, candidate_model)
                 if blocker:
                     adapter_rejections.append(f"{candidate}:vscode_lm_unavailable:{blocker}")
                     continue
             resolved_adapter = candidate
             break
+        if reroute_adapter and resolved_adapter != reroute_adapter:
+            reroute_reasons = [
+                rejection
+                for rejection in adapter_rejections
+                if rejection.startswith(reroute_adapter + ":")
+            ]
+            derived_from["identity_reroute_rejected"] = (
+                reroute_reasons[0] if reroute_reasons else f"{reroute_adapter}:not_selected"
+            )[:280]
         if not resolved_adapter:
             raise LaunchRejected(
                 "launch_adapter_underivable:runner="
                 f"{resolved_runner}:{';'.join(adapter_rejections)[:280]}"
             )
         derived_from["adapter_id"] = (
-            "catalog_launch_identities"
+            "identity_reroute"
+            if reroute_adapter and resolved_adapter == reroute_adapter
+            else "catalog_launch_identities"
             if catalog_adapter_fallback
             else "first_pinnable_launchable_in_tuple_order"
             if pinnable
@@ -3255,6 +3304,9 @@ def derive_launch_identity(
             derived_from["adapter_circuit_skipped"] = ";".join(circuit_skips)[:280]
 
     resolved_model = str(model or "").strip() or None
+    if resolved_model is None and reroute_model and resolved_adapter == reroute_adapter:
+        resolved_model = reroute_model
+        derived_from["model"] = "identity_reroute"
     if resolved_model is None:
         route = _CANONICAL_WORKFORCE.get((resolved_runner, resolved_adapter))
         if route is not None:
