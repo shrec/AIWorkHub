@@ -193,6 +193,82 @@ def _operational_disposition_exempts(
     )
 
 
+TERMINAL_RETRY_SCHEMA_ID = "aiworkhub.terminal_retry.v1"
+
+
+def _digest_map(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict) or not value or not all(
+        isinstance(path, str) and isinstance(digest, str) and digest
+        for path, digest in value.items()
+    ):
+        return None
+    return dict(value)
+
+
+def _rejected_bytes(
+    workspace: WorkerWorkspace,
+    metadata: Mapping[str, Any],
+    disposition: Mapping[str, Any],
+) -> dict[str, str] | None:
+    """The bytes the card's last reject adjudicated, or ``None`` when unknown."""
+    pinned = _digest_map(disposition.get("changed_path_hashes"))
+    if pinned is not None:
+        return pinned
+    # Legacy disposition: read the bytes back from the review_ready ledger row
+    # of the request it rejected.
+    from . import task_store
+
+    request_id = disposition.get("request_id")
+    task_id = metadata.get("task_id")
+    if not isinstance(request_id, str) or not isinstance(task_id, str):
+        return None
+    return task_store.review_ready_changed_path_hashes(
+        workspace.repo, task_id, request_id.strip()
+    )
+
+
+def _terminal_retry_bytes_never_rejected(
+    workspace: WorkerWorkspace,
+    metadata: Mapping[str, Any],
+    predecessor: Mapping[str, Any],
+) -> bool:
+    from .core import _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
+
+    retry = metadata.get("terminal_retry")
+    if not isinstance(retry, dict) or retry.get("schema_id") != TERMINAL_RETRY_SCHEMA_ID:
+        return False
+    substatus = retry.get("terminal_substatus")
+    if (
+        not isinstance(substatus, str)
+        or substatus not in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
+    ):
+        return False
+    # The retry must have carried THIS predecessor, so the exemption and the
+    # bytes it exempts can never describe two different requests.
+    request_id = predecessor.get("request_id")
+    if (
+        retry.get("predecessor_carry") != "carried"
+        or not isinstance(request_id, str)
+        or not request_id.strip()
+        or retry.get("request_id") != request_id.strip()
+    ):
+        return False
+    carried = _digest_map(predecessor.get("changed_path_hashes"))
+    if carried is None:
+        return False
+    disposition = metadata.get("rejection_disposition")
+    if disposition is None:
+        # Never rejected: no disposition AND a projected, false feedback flag.
+        return metadata.get("review_feedback_present") is False
+    if (
+        not isinstance(disposition, dict)
+        or disposition.get("schema_id") != REJECTION_DISPOSITION_SCHEMA_ID
+    ):
+        return False
+    rejected = _rejected_bytes(workspace, metadata, disposition)
+    return rejected is not None and rejected != carried
+
+
 def rework_no_delta_refusal(
     workspace: WorkerWorkspace,
     metadata: Mapping[str, Any],
@@ -245,6 +321,18 @@ def rework_no_delta_refusal(
     NF-2026-01797: a delta carried into a new predecessor request is matched by
     content instead -- the disposition's non-empty ``changed_path_hashes`` equal
     the predecessor's exactly; absent, empty or differing hashes keep the refusal.
+
+    NF-2026-01952. ``task_retry_terminal`` carries an operationally killed
+    attempt's delta into a new predecessor; reproducing bytes no manager ever
+    rejected as code is not ignored feedback. Nothing is minted when the
+    packet's ``aiworkhub.terminal_retry.v1`` names a substatus in
+    ``core._RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES``, carried exactly this
+    predecessor request, and the carried bytes differ from the card's last
+    rejected bytes -- the disposition's ``changed_path_hashes``, else the
+    ``review_ready`` ledger row of its ``request_id`` -- or the card was never
+    rejected at all (no disposition and ``review_feedback_present`` is False).
+    Unresolvable rejected bytes and bytes identical to them keep the refusal,
+    so reject -> no-delta worker_failed -> retry -> carry launders nothing.
     """
     if validation_only_replay or not is_rework_attempt(metadata):
         return ""
@@ -266,6 +354,9 @@ def rework_no_delta_refusal(
         return ""
     current = changed_path_hashes(workspace, list(changed))
     if any(current.get(path) != digest for path, digest in inherited.items()):
+        return ""
+    # Last, so the ledger is read only for an attempt that really reproduced.
+    if _terminal_retry_bytes_never_rejected(workspace, metadata, predecessor):
         return ""
     reproduced = ",".join(sorted(inherited))
     return (

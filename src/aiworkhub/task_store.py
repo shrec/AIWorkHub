@@ -6507,6 +6507,46 @@ def terminal_retry_rework_carry(
     )
 
 
+def review_ready_changed_path_hashes(
+    root: str | Path, task_id: str, request_id: str
+) -> dict[str, str] | None:
+    """The bytes ``task_id``'s ``review_ready`` ledger row recorded for ``request_id``.
+
+    NF-2026-01952: a legacy ``rejection_disposition`` carries no
+    ``changed_path_hashes``, so the bytes the manager rejected are read back
+    from the immutable ``terminal_review`` event that put that request in
+    review.  Read-only; ``None`` whenever the row is absent, unreadable or
+    names no non-empty map of string digests -- unknown is never a match.
+    """
+    if not task_id or not request_id:
+        return None
+    try:
+        _readiness, db_path = _require_ready(root)
+        conn = _connect(db_path, readonly=True)
+        try:
+            row = conn.execute(
+                "SELECT payload_json FROM task_events "
+                "WHERE task_id=? AND event='terminal_review' "
+                "AND json_extract(payload_json, '$.request_id')=? "
+                "AND json_extract(payload_json, '$.substatus')='review_ready' "
+                "ORDER BY rowid DESC LIMIT 1",
+                (task_id, request_id),
+            ).fetchone()
+        finally:
+            conn.close()
+        payload = json.loads(str(row["payload_json"])) if row is not None else None
+    except (TaskStoreError, sqlite3.Error, OSError, RuntimeError, ValueError):
+        return None
+    evidence = payload.get("evidence") if isinstance(payload, dict) else None
+    hashes = evidence.get("changed_path_hashes") if isinstance(evidence, dict) else None
+    if not isinstance(hashes, dict) or not hashes or not all(
+        isinstance(path, str) and isinstance(digest, str) and digest
+        for path, digest in hashes.items()
+    ):
+        return None
+    return dict(hashes)
+
+
 def _transient_retry_rework_carry(
     root: str | Path,
     db_path: Path,

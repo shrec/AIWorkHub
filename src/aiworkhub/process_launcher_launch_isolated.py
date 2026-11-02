@@ -1221,6 +1221,14 @@ def launch_isolated(
                     if isinstance(card.get("rejection_disposition"), dict)
                     else None
                 ),
+                # NF-2026-01952: what rework_no_delta_refusal needs to tell a
+                # terminal retry of never-reviewed bytes from a rejected rework.
+                "terminal_retry": (
+                    dict(card["terminal_retry"])
+                    if isinstance(card.get("terminal_retry"), dict)
+                    else None
+                ),
+                "review_feedback_present": bool(card.get("review_feedback")),
                 "validation_only_replay_authorization": (
                     dict(card["validation_only_replay_authorization"])
                     if isinstance(
