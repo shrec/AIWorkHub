@@ -17,7 +17,7 @@ import inspect
 import threading
 from contextlib import nullcontext
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -27,6 +27,7 @@ from aiworkhub import process_launcher_source_evidence as source_evidence
 from aiworkhub import process_launcher_vscode_lm_tool as vscode_lm_tool
 from aiworkhub import process_launcher_workspace_gc as workspace_gc
 from aiworkhub import process_launcher_review_context as review_context
+from aiworkhub import process_launcher_accepted_row_restore as accepted_row_restore
 
 # 13574 -> 13681 (0.12.78): five accepted launch/accept fixes, measured; the
 # next extraction ratchets it back down.
@@ -35,7 +36,10 @@ from aiworkhub import process_launcher_review_context as review_context
 # 13795 -> 13855 (0.12.84): NF-2026-01911 registry-lock holder + reviewer
 # spawn retry (+36) and NF-2026-01929 latest-projection cache fit (+24),
 # measured; the next extraction ratchets it back down.
-PROCESS_LAUNCHER_MAX_LINES = 13855
+# 13855 -> 13696 (2026-11-02): NF-2026-01812 moved the accepted-row restore
+# pair and _prior_reviewer_receipts into process_launcher_accepted_row_restore,
+# measured.
+PROCESS_LAUNCHER_MAX_LINES = 13696
 
 # (module, function, seam tuple attribute, ProcessManager method)
 EXTRACTIONS: tuple[tuple[ModuleType, str, str, str], ...] = (
@@ -56,6 +60,24 @@ EXTRACTIONS: tuple[tuple[ModuleType, str, str, str], ...] = (
         "quality_review_caller_context",
         "REVIEW_CONTEXT_SEAM_NAMES",
         "_quality_review_caller_context",
+    ),
+    (
+        accepted_row_restore,
+        "accepted_attempt_row",
+        "ACCEPTED_ATTEMPT_ROW_SEAM_NAMES",
+        "_accepted_attempt_row",
+    ),
+    (
+        accepted_row_restore,
+        "restore_buried_accepted_row",
+        "ACCEPTED_ROW_RESTORE_SEAM_NAMES",
+        "_restore_buried_accepted_row",
+    ),
+    (
+        accepted_row_restore,
+        "prior_reviewer_receipts",
+        "PRIOR_REVIEWER_RECEIPTS_SEAM_NAMES",
+        "_prior_reviewer_receipts",
     ),
 )
 EXTRACTION_IDS = [entry[1] for entry in EXTRACTIONS]
@@ -83,6 +105,12 @@ def _module_globals(tree: ast.Module) -> set[str]:
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for target in targets:
                 names.update(n.id for n in ast.walk(target) if isinstance(n, ast.Name))
+        elif isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING":
+            # Annotation-only imports resolve annotations, which are never
+            # evaluated; a runtime use is still caught by ``runtime_free``.
+            for sub in node.body:
+                if isinstance(sub, (ast.Import, ast.ImportFrom)):
+                    names.update((alias.asname or alias.name).split(".")[0] for alias in sub.names)
     return names
 
 
@@ -290,3 +318,81 @@ def test_vscode_lm_moved_body_observes_a_process_launcher_monkeypatch(
         fake, request_id, "aiworkhub_worker_kb_search", {}
     ) == expected
     assert seen == [events, events]
+
+
+class _AcceptedRowSelf:
+    """The ``self`` collaborators the accepted-row bodies touch."""
+
+    def __init__(self) -> None:
+        self.shown: list[str] = []
+
+    def _show_task(self, task_id: str) -> str:
+        self.shown.append(task_id)
+        return "card-text"
+
+    def _retention_event(self, event: dict[str, Any], *, disposition: str) -> dict[str, Any]:
+        return {"event": event, "disposition": disposition}
+
+
+def test_accepted_attempt_row_moved_body_observes_a_process_launcher_monkeypatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[tuple[str, str]] = []
+
+    def _patched_parse_card(text: str, task_id: str) -> dict[str, Any]:
+        seen.append((text, task_id))
+        raise process_launcher.LaunchRejected("patched_parse_card")
+
+    monkeypatch.setattr(process_launcher, "_parse_card", _patched_parse_card)
+    fake = _AcceptedRowSelf()
+    events = [{"state": "accepted", "accepted": True}]
+    metadata = {"task_id": "T-1"}
+
+    assert accepted_row_restore.accepted_attempt_row(fake, events, metadata, "req-1") is None
+    assert process_launcher.ProcessManager._accepted_attempt_row(fake, events, metadata, "req-1") is None
+    assert seen == [("card-text", "T-1")] * 2
+
+
+def test_restore_buried_accepted_row_moved_body_observes_a_process_launcher_monkeypatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(process_launcher, "_utcnow", lambda: "patched-now")
+    fake = _AcceptedRowSelf()
+    tail = {"state": "reconcile_pending", "reconciliation_deferred": "bridge_cancel_failed"}
+    accepted = {"state": "accepted", "workspace_disposition": "removed", "topic": "code"}
+    metadata = {"task_id": "T-1"}
+
+    expected = {
+        "event": {
+            **accepted,
+            "timestamp": "patched-now",
+            "restored_over_state": "reconcile_pending",
+            "restored_over_reason": "bridge_cancel_failed",
+        },
+        "disposition": "removed",
+    }
+    assert accepted_row_restore.restore_buried_accepted_row(fake, tail, accepted, metadata) == expected
+    assert process_launcher.ProcessManager._restore_buried_accepted_row(
+        fake, tail, accepted, metadata
+    ) == expected
+
+
+def test_prior_reviewer_receipts_moved_body_observes_a_process_launcher_monkeypatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[Any] = []
+
+    def _patched_canonical_db_path(repo: Any) -> str:
+        seen.append(repo)
+        raise OSError("patched_task_store")
+
+    patched_store = SimpleNamespace(
+        canonical_db_path=_patched_canonical_db_path,
+        TaskStoreError=process_launcher.task_store.TaskStoreError,
+    )
+    monkeypatch.setattr(process_launcher, "task_store", patched_store)
+    fake = SimpleNamespace(repo="repo-marker")
+
+    assert accepted_row_restore.prior_reviewer_receipts(fake, "TARGET", "req-now") == ([], {})
+    assert process_launcher.ProcessManager._prior_reviewer_receipts(fake, "TARGET", "req-now") == ([], {})
+    assert seen == ["repo-marker"] * 2
