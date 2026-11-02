@@ -11909,6 +11909,11 @@ def dispatcher_ensure_started() -> dict[str, Any]:
         bridge.stop_dispatcher(root)
         conn = _canonical_connect()
         try:
+            # NF-2026-01962: expire THIS provider's pending callbacks older than
+            # the store's bound BEFORE rebinding, so an abandoned backlog never
+            # becomes the current manager's inbox. Another provider's rows are
+            # never touched. A write path, never the health read.
+            expired_backlog = callback_store.expire_stale_pending_backlog(conn, provider="claude")
             rebound_count = callback_store.rebind_pending_callbacks(
                 conn,
                 provider="claude",
@@ -11931,6 +11936,7 @@ def dispatcher_ensure_started() -> dict[str, Any]:
             "reason": "claude_manager_uses_mcp_callback_wait",
             "rebound_callback_count": rebound_count,
             "seeded_review_callback_count": seeded_review_callback_count,
+            "expired_backlog_count": expired_backlog["expired"],
         }
     if not window_id:
         # Headless worker MCP processes never own callback dispatch. They
@@ -12194,20 +12200,39 @@ def dispatcher_health() -> dict[str, Any]:
         if start_error:
             problems.append(f"start_error:{start_error}")
     backlog: dict[str, Any] = {}
+    if manager_inbox:
+        # NF-2026-01962: polling (callback_wait) is a supported delivery mode.
+        backlog["delivery_mode"] = "poll"
     if dispatch_expected and manager_inbox and not running:
-        # NF-2026-00029: a manager inbox is a mailbox, not a wake-up. No
-        # dispatcher runs and there is no live-subscriber registry (an
-        # in-flight callback_wait is invisible here, so it counts as absent):
-        # pending callbacks sit until the manager asks. Report that once
-        # something waits; a quiet inbox stays clean. Only the watchdog, the
-        # dashboard and the health tool read this result -- no launch,
-        # preflight or bootstrap gate does -- so it is visible, never blocking.
+        # NF-2026-00029 / NF-2026-01962: a manager inbox is a mailbox the
+        # manager polls, not a wake-up. A non-empty backlog is normal between
+        # polls; it is a problem only once the oldest pending callback is
+        # older than the store's bound -- nobody has polled in that long.
+        # With a verified Claude manager the judged backlog is ONLY that
+        # manager's route (provider + its verified origin thread); another
+        # provider's or session's rows never redden it. The repo-wide figure
+        # is the fallback only when no manager is verified. Read-only: no
+        # sweep here.
+        max_age = int(callback_store.CALLBACK_BACKLOG_MAX_AGE_SECONDS)
+        backlog["backlog_max_age_seconds"] = max_age
+        verified_route = claude_identity is not None and target["selected_provider"] == "claude"
+        backlog["backlog_scope"] = "manager_route" if verified_route else "repo"
         try:
-            stats = task_store.callback_bridge_health(root)
-            backlog = {key: stats[key] for key in ("backlog_count", "oldest_pending_at")}
+            if verified_route:
+                stats = _verified_manager_backlog("claude", str(claude_identity["session_id"]))
+            else:
+                stats = task_store.callback_bridge_health(root)
+            backlog.update({key: stats[key] for key in ("backlog_count", "oldest_pending_at")})
             if backlog["backlog_count"] > 0:
-                problems.append("manager_inbox_no_live_delivery")
+                oldest = callback_store.parse_utc_timestamp(backlog["oldest_pending_at"])
+                if oldest is None:
+                    # Fail closed: an unreadable age is never proof of freshness.
+                    problems.append("callback_backlog_age_unknown")
+                elif (datetime.now(timezone.utc) - oldest).total_seconds() > max_age:
+                    problems.append("manager_inbox_no_live_delivery")
         except Exception as exc:  # noqa: BLE001 -- health must never raise
+            backlog.pop("backlog_count", None)
+            backlog.pop("oldest_pending_at", None)
             problems.append(f"callback_backlog_unavailable:{type(exc).__name__}")
     healthy = not problems
     status = "manager_inbox" if manager_inbox else ("running" if running else "stopped")
@@ -12226,6 +12251,17 @@ def dispatcher_health() -> dict[str, Any]:
         "manager_context": _passive_codex_manager_context(root, target),
         **backlog,
     }
+
+
+def _verified_manager_backlog(provider: str, origin_thread_id: str) -> dict[str, Any]:
+    """Read-only pending backlog of one verified manager route (NF-2026-01962)."""
+    conn = _canonical_connect(readonly=True)
+    try:
+        return callback_store.manager_inbox_backlog(
+            conn, provider=provider, origin_thread_id=origin_thread_id,
+        )
+    finally:
+        conn.close()
 
 
 def dispatcher_watchdog() -> dict[str, Any]:

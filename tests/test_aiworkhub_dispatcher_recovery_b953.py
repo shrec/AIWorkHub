@@ -38,6 +38,14 @@ def _readiness(ready: bool = True, repo_id: str = "repo_canon", reason: str = ""
     return types.SimpleNamespace(ready=ready, repo_id=repo_id, reason=reason)
 
 
+def _set_backlog(monkeypatch, stats, *, route_stats=None) -> None:
+    """Feed both backlog sources: the repo-wide fallback and the verified
+    manager route (defaults to the same figures unless ``route_stats``)."""
+    route = stats if route_stats is None else route_stats
+    monkeypatch.setattr(core.task_store, "callback_bridge_health", lambda root: stats())
+    monkeypatch.setattr(core, "_verified_manager_backlog", lambda provider, origin: route())
+
+
 def _patch_core(
     monkeypatch, *, readiness, bridge_health,
     provider: str = "codex", claude_identity=None, window_id: str = "", transport: str = "",
@@ -46,8 +54,7 @@ def _patch_core(
     monkeypatch.setattr(core, "repo_root", lambda: Path("/tmp/aiworkhub-b953-repo"))
     monkeypatch.setattr(core.task_store, "storage_readiness", lambda root: readiness)
     oldest = _OLDEST if backlog else ""
-    monkeypatch.setattr(core.task_store, "callback_bridge_health",
-                        lambda root: {"backlog_count": backlog, "oldest_pending_at": oldest})
+    _set_backlog(monkeypatch, lambda: {"backlog_count": backlog, "oldest_pending_at": oldest})
     fake_bridge = types.SimpleNamespace(dispatcher_health=lambda root: dict(bridge_health))
     monkeypatch.setattr(core, "_callback_bridge_module", lambda: fake_bridge)
     monkeypatch.setattr(core, "read_selected_coordinator_target", lambda root=None: {"selected_provider": provider})
@@ -135,26 +142,93 @@ def test_native_codex_manager_inbox_is_healthy_without_sideband(monkeypatch):
     assert h["backlog_count"] == 0 and h["oldest_pending_at"] == ""
 
 
-# --- NF-2026-00029: a manager inbox with waiting callbacks is not green ------
+# --- NF-2026-00029 / NF-2026-01962: only a STALE manager inbox is not green ---
+# _OLDEST is older than callback_store.CALLBACK_BACKLOG_MAX_AGE_SECONDS, so these
+# backlogs have waited past the bound; a fresh backlog is a normal poll inbox.
 
-def test_claude_manager_inbox_with_backlog_reports_no_live_delivery(monkeypatch):
+def test_claude_manager_inbox_with_stale_backlog_reports_no_live_delivery(monkeypatch):
     identity = {"provider": "claude", "session_id": str(uuid.uuid4()), "window_id": "claude_vscode_1"}
     _patch_core(monkeypatch, readiness=_readiness(), bridge_health=_UNREGISTERED,
                 provider="claude", claude_identity=identity, backlog=7)
     h = core.dispatcher_health()
     assert h["status"] == "manager_inbox" and h["dispatch_expected"] is True
+    assert h["delivery_mode"] == "poll"
+    assert h["backlog_max_age_seconds"] == callback_store.CALLBACK_BACKLOG_MAX_AGE_SECONDS
     assert h["ok"] is False and h["healthy"] is False
     assert h["problems"] == ["manager_inbox_no_live_delivery"]
     assert h["backlog_count"] == 7 and h["oldest_pending_at"] == _OLDEST
 
 
-def test_native_codex_manager_inbox_with_backlog_reports_no_live_delivery(monkeypatch):
+def test_native_codex_manager_inbox_with_stale_backlog_reports_no_live_delivery(monkeypatch):
     _patch_core(monkeypatch, readiness=_readiness(), bridge_health=_UNREGISTERED,
                 window_id="window_native_codex", transport="manager_inbox", backlog=2)
     h = core.dispatcher_health()
-    assert h["status"] == "manager_inbox"
+    assert h["status"] == "manager_inbox" and h["delivery_mode"] == "poll"
     assert h["problems"] == ["manager_inbox_no_live_delivery"]
     assert h["backlog_count"] == 2
+
+
+def test_manager_inbox_with_fresh_backlog_is_healthy(monkeypatch):
+    from datetime import datetime, timezone
+    identity = {"provider": "claude", "session_id": str(uuid.uuid4()), "window_id": "claude_vscode_1"}
+    _patch_core(monkeypatch, readiness=_readiness(), bridge_health=_UNREGISTERED,
+                provider="claude", claude_identity=identity, backlog=3)
+    fresh = datetime.now(timezone.utc).isoformat()
+    _set_backlog(monkeypatch, lambda: {"backlog_count": 3, "oldest_pending_at": fresh})
+    h = core.dispatcher_health()
+    assert h["ok"] is True and h["problems"] == []
+    assert h["delivery_mode"] == "poll" and h["backlog_count"] == 3
+
+
+def test_verified_manager_judges_only_its_own_route(monkeypatch):
+    # A stale repo-wide backlog (another provider / session) must not redden a
+    # verified manager whose own route is fresh -- and vice versa.
+    from datetime import datetime, timezone
+    identity = {"provider": "claude", "session_id": str(uuid.uuid4()), "window_id": "claude_vscode_1"}
+    _patch_core(monkeypatch, readiness=_readiness(), bridge_health=_UNREGISTERED,
+                provider="claude", claude_identity=identity)
+    fresh = datetime.now(timezone.utc).isoformat()
+    seen: list[tuple[str, str]] = []
+
+    def route(provider, origin):
+        seen.append((provider, origin))
+        return {"backlog_count": 1, "oldest_pending_at": fresh}
+
+    monkeypatch.setattr(core.task_store, "callback_bridge_health",
+                        lambda root: {"backlog_count": 59, "oldest_pending_at": _OLDEST})
+    monkeypatch.setattr(core, "_verified_manager_backlog", route)
+    h = core.dispatcher_health()
+    assert seen == [("claude", identity["session_id"])]
+    assert h["ok"] is True and h["problems"] == []
+    assert h["backlog_scope"] == "manager_route" and h["backlog_count"] == 1
+
+    monkeypatch.setattr(core, "_verified_manager_backlog",
+                        lambda provider, origin: {"backlog_count": 2, "oldest_pending_at": _OLDEST})
+    monkeypatch.setattr(core.task_store, "callback_bridge_health",
+                        lambda root: {"backlog_count": 0, "oldest_pending_at": ""})
+    h = core.dispatcher_health()
+    assert h["problems"] == ["manager_inbox_no_live_delivery"] and h["backlog_count"] == 2
+
+
+def test_unverified_manager_inbox_falls_back_to_repo_wide(monkeypatch):
+    _patch_core(monkeypatch, readiness=_readiness(), bridge_health=_UNREGISTERED,
+                window_id="window_native_codex", transport="manager_inbox", backlog=2)
+
+    def unexpected(provider, origin):
+        raise AssertionError("no verified manager: route-scoped read must not run")
+
+    monkeypatch.setattr(core, "_verified_manager_backlog", unexpected)
+    h = core.dispatcher_health()
+    assert h["backlog_scope"] == "repo" and h["backlog_count"] == 2
+
+
+def test_manager_inbox_unreadable_backlog_age_fails_closed(monkeypatch):
+    identity = {"provider": "claude", "session_id": str(uuid.uuid4()), "window_id": "claude_vscode_1"}
+    _patch_core(monkeypatch, readiness=_readiness(), bridge_health=_UNREGISTERED,
+                provider="claude", claude_identity=identity, backlog=1)
+    _set_backlog(monkeypatch, lambda: {"backlog_count": 1, "oldest_pending_at": "not-a-time"})
+    h = core.dispatcher_health()
+    assert h["ok"] is False and h["problems"] == ["callback_backlog_age_unknown"]
 
 
 def test_manager_inbox_backlog_read_failure_is_reported(monkeypatch):
@@ -162,10 +236,10 @@ def test_manager_inbox_backlog_read_failure_is_reported(monkeypatch):
     _patch_core(monkeypatch, readiness=_readiness(), bridge_health=_UNREGISTERED,
                 provider="claude", claude_identity=identity)
 
-    def broken(root):
+    def broken():
         raise RuntimeError("db unavailable")
 
-    monkeypatch.setattr(core.task_store, "callback_bridge_health", broken)
+    _set_backlog(monkeypatch, broken)
     h = core.dispatcher_health()
     assert h["healthy"] is False
     assert h["problems"] == ["callback_backlog_unavailable:RuntimeError"]
@@ -177,10 +251,10 @@ def test_dispatcher_route_never_reads_backlog(monkeypatch):
     for window_id, bridge_health in (("win1", _RUNNING), ("", _UNREGISTERED)):
         _patch_core(monkeypatch, readiness=_readiness(), bridge_health=bridge_health, window_id=window_id)
 
-        def unexpected(root):
+        def unexpected():
             raise AssertionError("backlog must not be read outside a manager inbox")
 
-        monkeypatch.setattr(core.task_store, "callback_bridge_health", unexpected)
+        _set_backlog(monkeypatch, unexpected)
         h = core.dispatcher_health()
         assert h["ok"] is True and h["problems"] == []
         assert "backlog_count" not in h and "oldest_pending_at" not in h

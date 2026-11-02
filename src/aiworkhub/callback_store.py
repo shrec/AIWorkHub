@@ -1946,6 +1946,186 @@ def prune_stale_pending_callbacks(
     }
 
 
+# NF-2026-01962: a polling (manager_inbox) route drains its pending backlog
+# only when the manager asks.  A pending row that nobody claimed within this
+# bound is abandoned work, not a wake still owed: the sweep below moves it out
+# of 'pending', and dispatcher_health flags a manager inbox only once its
+# oldest pending row is older than this.  One definition for both.
+CALLBACK_BACKLOG_MAX_AGE_SECONDS = 7 * 24 * 3600
+EXPIRED_BACKLOG_REASON = "expired_backlog"
+CALLBACK_BACKLOG_EXPIRED_EVENT = "callback_backlog_expired"
+
+
+# Public name for the store's one ISO-8601 parser (health reads backlog age).
+parse_utc_timestamp = _parse_instant
+
+
+def _live_lease_batch_ids(
+    conn: sqlite3.Connection, provider: str, current: datetime,
+) -> set[str]:
+    """Inflight batches of ``provider`` whose delivery lease is still live.
+
+    A lease is live unless its ``lease_expires_at`` is provably in the past:
+    an empty or unreadable stamp fails closed (treated as live), so the sweep
+    never expires work a transport may still be delivering and the backlog
+    never hides it.
+    """
+    live: set[str] = set()
+    for row in conn.execute(
+        "SELECT batch_id, lease_expires_at FROM callback_batches "
+        "WHERE state='inflight' AND provider=?",
+        (provider,),
+    ).fetchall():
+        expires = _parse_instant(row["lease_expires_at"])
+        if expires is None or expires >= current:
+            live.add(str(row["batch_id"]))
+    return live
+
+
+def manager_inbox_backlog(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    origin_thread_id: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Pending backlog of ONE manager route (``provider`` + origin thread).
+
+    ``backlog_count`` counts ``state='pending'`` rows of that route that are
+    not members of a live-lease inflight batch; ``oldest_pending_at`` is the
+    oldest such ``created_at`` (``''`` when empty).  This is the backlog
+    ``dispatcher_health`` judges for a verified manager inbox.  Read-only.
+    """
+    provider = str(provider or "").strip()
+    origin = str(origin_thread_id or "").strip()
+    if not provider or not origin:
+        raise ValueError("manager_inbox_backlog requires provider and origin_thread_id")
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    live = _live_lease_batch_ids(conn, provider, current)
+    count = 0
+    oldest = ""
+    oldest_at: datetime | None = None
+    unreadable = ""
+    for row in conn.execute(
+        "SELECT batch_id, created_at FROM callback_outbox "
+        "WHERE state='pending' AND provider=? AND origin_thread_id=?",
+        (provider, origin),
+    ).fetchall():
+        if row["batch_id"] and str(row["batch_id"]) in live:
+            continue
+        count += 1
+        raw = str(row["created_at"] or "")
+        created = _parse_instant(raw)
+        if created is None:
+            # Fail closed: surface the unreadable stamp so health cannot
+            # mistake it for a fresh backlog.
+            unreadable = unreadable or raw or "unreadable"
+        elif oldest_at is None or created < oldest_at:
+            oldest_at, oldest = created, raw
+    return {"backlog_count": count, "oldest_pending_at": unreadable or oldest}
+
+
+def expire_stale_pending_backlog(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    max_age_seconds: int = CALLBACK_BACKLOG_MAX_AGE_SECONDS,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Supersede ``provider``'s pending callbacks older than ``max_age_seconds``.
+
+    Scoped to the calling manager's provider (every origin thread of it, so a
+    dead or other-session backlog of that provider drains); another
+    provider's rows are never touched.  Only ``state='pending'`` rows whose
+    ``created_at`` is provably older than the bound move (to ``superseded``
+    with ``last_error='expired_backlog'``); a row with an unreadable stamp, a
+    younger row, a member of an inflight batch whose lease is still live, and
+    every inflight/delivered/dead-letter row stay untouched.  A pending member
+    of an inflight batch whose lease has EXPIRED is stale and is swept.  A
+    batch left with no live member is superseded so it can never be claimed
+    empty.  Exactly one ``callback_backlog_expired`` audit event per sweep
+    records the count, the age bound, and the provider/origin of every
+    superseded row; a sweep that expires nothing writes no event.  A write
+    path -- never call it from a health read.
+    """
+    provider = str(provider or "").strip()
+    if not provider:
+        raise ValueError("expire_stale_pending_backlog requires the caller's provider")
+    bound = int(max_age_seconds)
+    if bound <= 0:
+        raise ValueError("max_age_seconds must be positive")
+    _ensure_callback_outbox_table(conn)
+    _ensure_callback_batches_table(conn)
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    cutoff = current - timedelta(seconds=bound)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        live = _live_lease_batch_ids(conn, provider, current)
+        candidates = conn.execute(
+            "SELECT outbox_id, task_id, provider, origin_thread_id, batch_id, created_at "
+            "FROM callback_outbox WHERE state='pending' AND provider=? "
+            "ORDER BY created_at ASC, outbox_id ASC",
+            (provider,),
+        ).fetchall()
+        stamp = utc_now()
+        superseded: list[dict[str, Any]] = []
+        touched_batches: set[str] = set()
+        for row in candidates:
+            if row["batch_id"] and str(row["batch_id"]) in live:
+                continue
+            created = _parse_instant(row["created_at"])
+            if created is None or created >= cutoff:
+                continue
+            updated = conn.execute(
+                "UPDATE callback_outbox SET state='superseded', last_error=?, updated_at=? "
+                "WHERE outbox_id=? AND state='pending' AND provider=?",
+                (EXPIRED_BACKLOG_REASON, stamp, row["outbox_id"], provider),
+            )
+            if updated.rowcount == 1:
+                superseded.append({
+                    "outbox_id": int(row["outbox_id"]),
+                    "task_id": str(row["task_id"] or ""),
+                    "provider": str(row["provider"] or ""),
+                    "origin_thread_id": str(row["origin_thread_id"] or ""),
+                })
+                if row["batch_id"]:
+                    touched_batches.add(str(row["batch_id"]))
+        # Touched batches are pending ones or inflight ones whose lease has
+        # expired (live-lease members were skipped above).
+        batches_superseded = _supersede_emptied_batches(
+            conn, touched_batches, stamp, states=("pending", "inflight"),
+        )
+        expired = len(superseded)
+        if expired:
+            # ``append_event`` commits the whole sweep with its audit record.
+            append_event(
+                conn,
+                "",
+                CALLBACK_BACKLOG_EXPIRED_EVENT,
+                "",
+                {
+                    "count": expired,
+                    "provider": provider,
+                    "max_age_seconds": bound,
+                    "cutoff": cutoff.isoformat(),
+                    "reason": EXPIRED_BACKLOG_REASON,
+                    "batches_superseded": batches_superseded,
+                    "superseded": superseded,
+                },
+            )
+        else:
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {
+        "expired": expired,
+        "batches_superseded": batches_superseded,
+        "max_age_seconds": bound,
+        "provider": provider,
+    }
+
+
 DECIDED_TASK_SUPERSEDE_REASON = "task_decided"
 _DECIDED_TASK_STATUSES = ("finished", "archived", "superseded")
 
