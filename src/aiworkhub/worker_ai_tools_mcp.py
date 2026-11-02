@@ -3201,6 +3201,17 @@ def _bounded_query(value: Any, *, max_bytes: int = MAX_QUERY_BYTES) -> str | Non
     return text
 
 
+def _normalize_source_graph_target(value: str) -> str:
+    """Backslash -> '/', strip whitespace and a trailing ``:N`` / ``:N-M`` range."""
+    normalized = value.strip().replace("\\", "/")
+    prefix, sep, suffix = normalized.rpartition(":")
+    if sep and prefix:
+        parts = suffix.split("-")
+        if len(parts) <= 2 and all(p.isascii() and p.isdigit() for p in parts):
+            return prefix
+    return normalized
+
+
 _SOURCE_GRAPH_FILE_KEYS: tuple[str, ...] = (
     "file", "file_path", "file_name", "caller_file", "callee_file",
 )
@@ -5893,9 +5904,17 @@ def source_graph_query(
         bounded_target = _bounded_query(target, max_bytes=256)
         if bounded_target is None:
             return _violation(ctx, tool, "invalid_target")
-        if ctx.source_graph_targets and bounded_target not in ctx.source_graph_targets:
+
+        normalized_target = _normalize_source_graph_target(bounded_target)
+        normalized_allowed = {
+            _normalize_source_graph_target(t): t for t in ctx.source_graph_targets
+        }
+        if ctx.source_graph_targets and normalized_target not in normalized_allowed:
             # Name the allowed set so the caller does not guess another
-            # target (144 blind retries in the measured window).
+            # target (144 blind retries in the measured window).  Both sides
+            # are normalized (backslash -> '/', trailing :START-END or :LINE
+            # suffix stripped) so target=src/x.py:10-20 is accepted when
+            # src/x.py is a declared target.
             return _violation(
                 ctx, tool, "target_not_allowed",
                 requested_target=bounded_target,
@@ -5905,7 +5924,7 @@ def source_graph_query(
                     "the unscoped query."
                 ),
             )
-        scope = bounded_target
+        scope = normalized_allowed.get(normalized_target, bounded_target)
 
     if continuation_cursor is not None:
         bounded_continuation = _bounded_query(continuation_cursor, max_bytes=1024)

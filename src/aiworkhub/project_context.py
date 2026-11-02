@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re as _re
 import sqlite3
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -158,7 +160,76 @@ def _bounded_targets(raw: Any, *, field: str) -> list[str]:
     return targets
 
 
-def _derive_targets(card: dict[str, Any]) -> list[str]:
+_TRAILING_RANGE_RE = _re.compile(r":\d+(?:-\d+)?$")
+
+
+def _strip_target_suffix(path: str) -> str:
+    return _TRAILING_RANGE_RE.sub("", path)
+
+
+MAX_OBJECTIVE_CANDIDATES = 64
+_GIT_LS_FILES_TIMEOUT_SECONDS = 10
+
+
+def _tracked_subset(repo_root: Path, candidates: list[str]) -> set[str]:
+    """Return the candidates git tracks in ``repo_root`` (empty on any failure)."""
+    if not candidates:
+        return set()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "--literal-pathspecs", "ls-files", "-z", "--", *candidates],
+            capture_output=True,
+            timeout=_GIT_LS_FILES_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if result.returncode != 0:
+        return set()
+    return {
+        part.decode("utf-8", "surrogateescape")
+        for part in result.stdout.split(b"\0")
+        if part
+    }
+
+
+def _objective_path_candidates(
+    card: dict[str, Any], repo_root: Path, seen: set[str], limit: int
+) -> list[str]:
+    """Repo-relative path tokens named in the objective that are tracked files."""
+    from . import core as _core
+
+    objective = str(card.get("objective") or "").replace("\\", "/")
+    objective = _core._OBJECTIVE_URL_RE.sub(" ", objective)
+    candidates: list[str] = []
+    for match in _core._OBJECTIVE_PATH_TOKEN_RE.finditer(objective):
+        token = match.group(0)
+        if "/" not in token:
+            continue
+        # The path-token regex starts at an alphanumeric, so ``/abs/x.py`` and
+        # ``../x/y.py`` surface as ``abs/x.py`` / ``x/y.py``; reject them here
+        # (a plain ``./x/y.py`` stays allowed).
+        start = match.start()
+        before = objective[max(0, start - 3):start]
+        if before.endswith(("../", ":", ".")) or (
+            before.endswith("/") and not before.endswith("./")
+        ):
+            continue
+        declared = _strip_target_suffix(_core._task_contract_path(token))
+        if not declared or ".." in declared.split("/") or declared in seen:
+            continue
+        if declared in candidates:
+            continue
+        if not Path(repo_root, declared).is_file():
+            continue
+        candidates.append(declared)
+        if len(candidates) >= MAX_OBJECTIVE_CANDIDATES:
+            break
+    tracked = _tracked_subset(repo_root, candidates)
+    return [c for c in candidates if c in tracked][:limit]
+
+
+def _derive_targets(card: dict[str, Any], repo_root: Path | None = None) -> list[str]:
     targets: list[str] = []
     seen: set[str] = set()
     # Immutable/dependency inputs are first-class worker evidence.  They must
@@ -178,11 +249,22 @@ def _derive_targets(card: dict[str, Any]) -> list[str]:
                 continue
             if normalized.startswith(".git") or "\x00" in normalized:
                 continue
+            # A declared entry may carry a trailing ``:START-END`` / ``:LINE``
+            # suffix; the bare path is the Source Graph target.
+            normalized = _strip_target_suffix(normalized)
+            if not normalized:
+                continue
             if normalized not in seen:
                 seen.add(normalized)
                 targets.append(normalized)
             if len(targets) >= MAX_TARGETS:
                 return targets
+    if repo_root is not None and len(targets) < MAX_TARGETS:
+        for token in _objective_path_candidates(
+            card, repo_root, seen, MAX_TARGETS - len(targets)
+        ):
+            seen.add(token)
+            targets.append(token)
     return targets
 
 
@@ -608,7 +690,9 @@ def _suppress_irrelevant_sections(sections: list[dict[str, Any]]) -> list[dict[s
     return out
 
 
-def _validate_contract(card: dict[str, Any]) -> dict[str, Any] | None:
+def _validate_contract(
+    card: dict[str, Any], repo_root: Path | None = None
+) -> dict[str, Any] | None:
     raw = card.get("project_context")
     if raw is None:
         return None
@@ -655,7 +739,7 @@ def _validate_contract(card: dict[str, Any]) -> dict[str, Any] | None:
     )
     targets_origin = "declared" if exact_targets else "derived"
     if not exact_targets:
-        exact_targets = _derive_targets(card)
+        exact_targets = _derive_targets(card, repo_root)
 
     session = raw.get("session")
     if not isinstance(session, dict):
@@ -1712,7 +1796,7 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
     """Return a compact trusted bundle, or ``None`` when no contract exists."""
 
     repo = repo.resolve()
-    contract = _validate_contract(card)
+    contract = _validate_contract(card, repo)
     if contract is None:
         return None
     authority_repo = resolve_task_repository_root(repo, card)
