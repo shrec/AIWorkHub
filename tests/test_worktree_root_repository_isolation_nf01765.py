@@ -155,6 +155,30 @@ def test_owner_and_same_repo_id_worker_worktree_keep_the_override(
     assert worker_workspace.configured_worktree_root(worker) == _runtime_worktrees(owner)
 
 
+def test_override_under_owner_validation_scratch_is_honored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    own = _register(tmp_path / "own", REPO_ID)
+    other = _register(tmp_path / "other", FOREIGN_ID)
+    scratch = (other / ".aiworkhub" / "temp" / "validation" / "x" / "worktrees").resolve(
+        strict=False
+    )
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(scratch))
+
+    assert worker_workspace.configured_worktree_root(own) == scratch
+
+
+def test_override_under_owner_runtime_is_still_refused_beside_scratch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    own = _register(tmp_path / "own", REPO_ID)
+    other = _register(tmp_path / "other", FOREIGN_ID)
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(_runtime_worktrees(other)))
+
+    with pytest.raises(worker_workspace.WorkspaceError, match=f"^{REFUSAL}:"):
+        worker_workspace.configured_worktree_root(own)
+
+
 @pytest.mark.parametrize("identity_env", ["AIWORKHUB_REPO_ROOT", "AIWORKHUB_REPO"])
 def test_neutral_override_keeps_precedence_whatever_the_hub_exports(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, identity_env: str

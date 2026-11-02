@@ -1204,12 +1204,7 @@ def _manifest_changed_paths(workspace: WorkerWorkspace, *, git_phase: str) -> li
         # Shell residue absent at creation is not candidate delta (NF-2026-01345).
         and not (relative not in baseline and _is_shell_residue(workspace, relative))
     }
-    # Inherited rework bytes are judged against the canonical parent alone (NF-2026-01618).
-    for relative in workspace.inherited_rework_paths:
-        if current.get(relative) != workspace.parent_baseline.get(relative):
-            rows.add(_relative_repo_path(relative))
-        else:
-            rows.discard(_relative_repo_path(relative))
+    _reconcile_workspace_baseline(workspace, rows)
     return sorted(rows)
 
 
@@ -3444,7 +3439,7 @@ def _repository_owned_worktree_root(root: Path, repo: Path | None) -> Path:
     is honored beneath ``repo``'s own runtime, when its nearest
     ``.aiworkhub/project.json`` owner is ``repo``, or when that owner tracks
     ``repo``'s non-empty ``repo_id`` (a worker worktree of the same
-    repository).  A root no registered repository owns stays neutral.  Only
+    repository).  Unowned roots and roots under the owner's ``.aiworkhub/temp`` (validation scratch) stay neutral.  Only
     the explicit ``repo`` is identity: AIWORKHUB_REPO_ROOT / AIWORKHUB_REPO and
     cwd are exported by the hub itself, so they never are.
     """
@@ -3461,7 +3456,7 @@ def _repository_owned_worktree_root(root: Path, repo: Path | None) -> Path:
         ),
         None,
     )
-    if owner is None or owner == selected:
+    if owner in (None, selected) or _path_is_relative_to(root, owner / ".aiworkhub" / "temp"):
         return root
     owner_id = _tracked_repo_id(owner)
     if owner_id and owner_id == _tracked_repo_id(selected):
@@ -6346,6 +6341,21 @@ def assert_gc_safe_workspace_shape(
     )
 
 
+def _reconcile_workspace_baseline(workspace: WorkerWorkspace, rows: set[str]) -> None:
+    # Shared by git path and manifest fallback: judge workspace_baseline paths by hash;
+    # inherited rework paths against canonical parent_baseline (NF-2026-01618).
+    for relative, initial_hash in workspace.workspace_baseline.items():
+        current_hash = _hash_path(workspace.path / relative)
+        if relative in workspace.inherited_rework_paths:
+            changed = current_hash != workspace.parent_baseline.get(relative)
+        else:
+            changed = current_hash != initial_hash
+        if changed:
+            rows.add(_relative_repo_path(relative))
+        else:
+            rows.discard(_relative_repo_path(relative))
+
+
 def changed_paths(
     workspace: WorkerWorkspace,
     *,
@@ -6434,17 +6444,7 @@ def changed_paths(
         ).returncode
         != 0
     }
-    for relative, initial_hash in workspace.workspace_baseline.items():
-        current_hash = _hash_path(workspace.path / relative)
-        if relative in workspace.inherited_rework_paths:
-            # Judged against canonical: restoring canonical bytes is a revert (NF-2026-01618).
-            changed = current_hash != workspace.parent_baseline.get(relative)
-        else:
-            changed = current_hash != initial_hash
-        if changed:
-            rows.add(_relative_repo_path(relative))
-        else:
-            rows.discard(_relative_repo_path(relative))
+    _reconcile_workspace_baseline(workspace, rows)
     return sorted(rows)
 
 
