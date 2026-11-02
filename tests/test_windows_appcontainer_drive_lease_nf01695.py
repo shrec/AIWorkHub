@@ -35,6 +35,14 @@ _MY_START = 1_000_001
 _GONE, _GONE_START = 4242, 111
 
 
+@pytest.fixture(autouse=True)
+def _pin_private_logon_session(monkeypatch):
+    """NF-2026-01154: ``sandbox_drive`` refuses outside a private logon
+    session; these fakes exercise the drive mechanics, so pin the probe."""
+
+    monkeypatch.setattr(wac, "in_private_logon_session", lambda: True)
+
+
 class _DosKernel:
     """kernel32's mutex and DOS-device calls, recorded.
 

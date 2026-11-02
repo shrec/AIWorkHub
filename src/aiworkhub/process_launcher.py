@@ -5944,9 +5944,7 @@ class ProcessManager:
                     "work_kind": str(card.get("work_kind") or "generic"),
                     "required_outputs": list(card.get("required_outputs") or []),
                     "read_only": card.get("read_only") is True,
-                    "allow_empty_required_outputs": list(
-                        card.get("allow_empty_required_outputs") or []
-                    ),
+                    "allow_empty_required_outputs": list(card.get("allow_empty_required_outputs") or []),
                     "allow_unchanged_required_outputs": list(
                         card.get("allow_unchanged_required_outputs") or []
                     ),

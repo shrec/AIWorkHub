@@ -46,13 +46,13 @@ def _make_repo(base: Path) -> Path:
 
 def test_gitignored_md_is_not_indexed(tmp_path: Path) -> None:
     root = _make_repo(tmp_path)
-    ctx = hook._Context(root, root, "bash")
+    ctx = hook._Context(root, root, "bash", hook.load_index_policy(root))
     assert ctx.indexed_file(str(root / "ignored.md")) is None
 
 
 def test_tracked_and_untracked_py_stay_indexed(tmp_path: Path) -> None:
     root = _make_repo(tmp_path)
-    ctx = hook._Context(root, root, "bash")
+    ctx = hook._Context(root, root, "bash", hook.load_index_policy(root))
     assert ctx.indexed_file(str(root / "tracked.py")) == "tracked.py"
     assert ctx.indexed_file(str(root / "plain.py")) == "plain.py"
 
@@ -61,7 +61,7 @@ def test_git_failure_fails_closed_to_indexed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = _make_repo(tmp_path)
-    ctx = hook._Context(root, root, "bash")
+    ctx = hook._Context(root, root, "bash", hook.load_index_policy(root))
 
     def _boom(*args: object, **kwargs: object) -> object:
         raise FileNotFoundError("git missing")

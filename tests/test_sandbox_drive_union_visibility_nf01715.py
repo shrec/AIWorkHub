@@ -36,6 +36,14 @@ _GONE = 4242
 _GONE_START = 7
 
 
+@pytest.fixture(autouse=True)
+def _pin_private_logon_session(monkeypatch):
+    """NF-2026-01154: ``sandbox_drive`` refuses outside a private logon
+    session; these fakes exercise the drive mechanics, so pin the probe."""
+
+    monkeypatch.setattr(wac, "in_private_logon_session", lambda: True)
+
+
 def _target(root: str) -> str:
     return "\\??\\" + root
 
