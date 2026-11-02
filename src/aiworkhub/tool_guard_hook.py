@@ -21,6 +21,8 @@ Rules, first match wins:
 * R5 Read of an indexed file, whatever its limit or offset.
 * R6 Edit of an existing repository file.
 * R7 Write over an existing repository file; Write only creates new files.
+* R8 Read, Edit or Write (a new file included) of any path inside the
+  repo-local scratch root ``.scratch/``; checked before R5-R7.
 
 R6 and R7 leave ``.git`` and ``.aiworkhub`` alone: VCS and runtime state is not
 source the semantic editor can take over.
@@ -122,6 +124,10 @@ INDEXED_SUFFIXES = frozenset(
     extension for extensions in LANGUAGE_EXTENSIONS.values() for extension in extensions
 )
 _EDIT_EXEMPT_DIRS = frozenset({".git", ".aiworkhub"})
+# The one repo-local scratch root: seats keep scratch in ``.scratch/<session_id>/``.
+# It is gitignored and a Source Graph include root, and ``storage_retention``
+# prunes aged session dirs under it (NF-2026-01928).
+SCRATCH_DIR = ".scratch"
 
 _DENIALS_PARTS = (".aiworkhub", "runtime", "tool_guard", "denials.jsonl")
 _DENIALS_ROTATE_BYTES = 4 * 1024 * 1024
@@ -167,6 +173,12 @@ _REASONS = {
     "R7": (
         "AIWorkHub tool guard R7: Write over existing repository file {target} is denied;"
         " Write only creates new files. " + _EDIT_INSTEAD
+    ),
+    "R8": (
+        "AIWorkHub tool guard R8: built-in Read/Write/Edit in " + SCRATCH_DIR + "/ ({target})"
+        " is denied. Read: " + _SOURCE_GRAPH + ' mode="body", "file" or "bodygrep".'
+        " Create/edit: aiworkhub_worker_semantic_edit_prepare then _apply (worker) or"
+        " scripts/manager_semantic_edit.py --create/--path (manager)."
     ),
 }
 REMINDER = (
@@ -908,6 +920,13 @@ class _Context:
             return None
         return "/".join(parts) if path is not None and path.is_file() else None
 
+    def scratch(self, path: Path | None) -> str | None:
+        """The repository-relative path when ``path`` lies in ``SCRATCH_DIR``, existing or not."""
+        parts = self.inside(path)
+        if not parts or parts[0].lower() != SCRATCH_DIR:
+            return None
+        return "/".join(parts)
+
     def change_directory(self, args: list[str]) -> None:
         target = None
         at = 0
@@ -1487,6 +1506,10 @@ def _tool_verdict(
     file_path = tool_input.get("file_path")
     if not isinstance(file_path, str) or not file_path.strip():
         return None
+    if tool_name in ("Read", "Edit", "MultiEdit", "Write"):
+        scratch = ctx.scratch(ctx.path(file_path))
+        if scratch is not None:
+            return "R8", scratch, ""
     if tool_name == "Read":
         target = ctx.indexed_file(file_path, glob=False)
         return None if target is None else ("R5", target, "")
@@ -1528,7 +1551,8 @@ def _reason(rule: str, target: str, detail: str) -> str:
     if mirror is not None:
         rest, worktree = mirror
         return _mirror_reason(rule, "/".join(rest) or ".", worktree)
-    template = _REASONS[rule] + _UNINDEXED
+    # R8 offers no unindexed fallback: no seat needs a built-in Read in scratch.
+    template = _REASONS[rule] + ("" if rule == "R8" else _UNINDEXED)
     pattern = _CONTROL.sub(" ", detail).strip() if rule == "R1" else ""
     fixed = len(template.format(target="", pattern='""'))
     slots = template.count("{target}") + template.count("{pattern}")
@@ -1649,6 +1673,7 @@ __all__ = [
     "REASON_MAX_CHARS",
     "REMINDER",
     "REMINDER_MAX_BYTES",
+    "SCRATCH_DIR",
     "decide",
     "glob_ignored",
     "index_admits",

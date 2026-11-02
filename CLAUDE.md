@@ -46,6 +46,7 @@ Adaptive use:
 - Task MCP receipt is always required; Source Graph is required for code tasks.
 - Session Manager, AI Memory and KB run only when the card requests them or the task is non-trivial.
 - Workers submit durable context changes only through the session/AI Memory/KB write-intent tools; a verified manager accepts or rejects each intent before canonical apply. Never write context databases directly.
+- Every seat keeps scratch in .scratch/<session_id>/ of the verified repo, never the host/harness scratchpad or system temp, and creates/edits it only with the AIWorkHub create/semantic-edit tools.
 - Do not make empty irrelevant calls to satisfy ceremony.
 Source Graph gate:
 - When source_graph_required is true, stop if its bundle is unavailable, empty, stale or unacknowledged.

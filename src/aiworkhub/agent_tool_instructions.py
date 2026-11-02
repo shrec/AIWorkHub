@@ -107,8 +107,16 @@ from . import runtime_adapters
 # this comment. Nothing was absorbed to pay for it because nothing here is
 # redundant -- the prose cost 33 bytes and the other 71 are headroom bought
 # deliberately, which is the honest description of it.
-CANONICAL_MAX_BYTES = 7300
-PROJECTION_MAX_BYTES = 9200
+#
+# NF-2026-01928 (repo-local scratch) adds one "Adaptive use:" line telling every
+# seat to keep scratch in .scratch/<session_id>/ and to touch it only with the
+# create/semantic-edit tools. Nothing it could absorb says that already, so it
+# is paid for by a cap raise: measured canonical 7256 -> 7454, AGENTS.md
+# 7354 -> 7552, copilot 7376 -> 7574, CLAUDE.md 9058 -> 9256. The caps keep
+# about the same ~100 bytes of headroom the previous raise bought, which the
+# vocabulary-room test still measures against a real extra command.
+CANONICAL_MAX_BYTES = 7560
+PROJECTION_MAX_BYTES = 9360
 START = "<!-- AIWORKHUB_TOOL_USE_POLICY_START -->"
 END = "<!-- AIWORKHUB_TOOL_USE_POLICY_END -->"
 # Annotated with the Literal it is built from (a forward reference, resolved
@@ -240,6 +248,7 @@ POLICY = ToolPolicy(
         "Task MCP receipt is always required; Source Graph is required for code tasks.",
         "Session Manager, AI Memory and KB run only when the card requests them or the task is non-trivial.",
         "Workers submit durable context changes only through the session/AI Memory/KB write-intent tools; a verified manager accepts or rejects each intent before canonical apply. Never write context databases directly.",
+        "Every seat keeps scratch in .scratch/<session_id>/ of the verified repo, never the host/harness scratchpad or system temp, and creates/edits it only with the AIWorkHub create/semantic-edit tools.",
         "Do not make empty irrelevant calls to satisfy ceremony.",
     ),
     source_graph=(

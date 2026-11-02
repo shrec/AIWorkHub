@@ -69,6 +69,9 @@ node_modules/
 /AUDIT_TOKEN_ECONOMY_AND_AGENT_QUALITY_*.md
 /code_audit_report_*.md
 /.scratch_*.md
+# Repo-local seat scratch (.scratch/<session_id>/): never committed, but a Source
+# Graph include root so every seat reads it through Source Graph (NF-2026-01928).
+/.scratch/
 # Host-local MCP client configs (absolute per-machine paths), shell crash dumps, pip cache.
 /.mcp.json
 /.cursor/

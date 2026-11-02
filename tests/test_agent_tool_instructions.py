@@ -410,8 +410,8 @@ def test_the_semantic_edit_rule_is_stated_once() -> None:
     assert "After Source Graph finds an exact target" not in canonical
     assert canonical.count("aiworkhub_worker_semantic_edit_prepare") == 1
     assert canonical.count("never a built-in Read, and never reread an unchanged range") == 1
-    assert instr.CANONICAL_MAX_BYTES == 7300
-    assert instr.PROJECTION_MAX_BYTES == 9200
+    assert instr.CANONICAL_MAX_BYTES == 7560
+    assert instr.PROJECTION_MAX_BYTES == 9360
     assert len(canonical.encode("utf-8")) <= instr.CANONICAL_MAX_BYTES
 
 

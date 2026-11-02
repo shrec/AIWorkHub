@@ -38,6 +38,7 @@ from typing import Any, Callable, Iterator, Mapping
 
 from . import parallelism, repo_policy, task_store, worktree_storage
 from .platform_io import lock_fd, unlock_fd
+from .tool_guard_hook import SCRATCH_DIR
 from .worker_workspace import (
     REWORK_DELTA_BLOB_DIRNAME,
     WorkspaceError,
@@ -3001,10 +3002,11 @@ def _compat_workspace_candidates(
 def _janitor_scratch(root: Path, now: float) -> dict[str, Any]:
     """Delete aged disposable scratch output the other six steps never see.
 
-    Three containers are swept child-by-child; a fixed set of one-off
+    Three containers are swept child-by-child, and so are the session dirs
+    of the repo-local ``.scratch`` root; a fixed set of one-off
     ``runtime/`` dirs is removed whole, matched by name.  A candidate is
-    skipped when younger than 48h, a symlink/junction, outside the
-    repository's ``.aiworkhub`` dir once resolved, or still held by a live
+    skipped when younger than 48h, a symlink/junction, outside its expected
+    parent (``.aiworkhub`` or ``.scratch``) once resolved, or still held by a live
     runtime_temp owner.  A directory goes through the single shared
     workspace-removal helper and any other entry is unlinked; both repair a
     read-only leftover instead of leaving it behind.  A candidate that fails
@@ -3025,6 +3027,23 @@ def _janitor_scratch(root: Path, now: float) -> dict[str, Any]:
             continue
         with contextlib.suppress(OSError):
             candidates.extend((entry, expected_container) for entry in container.iterdir())
+
+    # Repo-local seat scratch (NF-2026-01928): each ``.scratch/<session_id>``
+    # dir is one candidate; loose files directly under ``.scratch`` are kept.
+    scratch_dir = root / SCRATCH_DIR
+    expected_scratch_dir = root.resolve(strict=False) / SCRATCH_DIR
+    if (
+        not scratch_dir.is_symlink()
+        and not scratch_dir.is_junction()
+        and scratch_dir.is_dir()
+        and scratch_dir.resolve(strict=False) == expected_scratch_dir
+    ):
+        with contextlib.suppress(OSError):
+            candidates.extend(
+                (entry, expected_scratch_dir)
+                for entry in scratch_dir.iterdir()
+                if entry.is_dir() and not entry.is_symlink()
+            )
 
     runtime_dir = root / CANONICAL_RUNTIME_RELATIVE_PATH
     expected_runtime_dir = aiworkhub_dir / "runtime"
