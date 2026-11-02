@@ -51,8 +51,9 @@ FILE_EVIDENCE_EXTRACTOR_ID = "aiworkhub.source_graph_ast.file_evidence.v1"
 PHP_LEXICAL_EXTRACTOR_ID = "aiworkhub.source_graph_ast.php_lexical.v1"
 CPP_LEXICAL_EXTRACTOR_ID = "aiworkhub.source_graph_ast.cpp_lexical.v1"
 POLYGLOT_LEXICAL_EXTRACTOR_ID = "aiworkhub.source_graph_ast.polyglot_lexical.v1"
+# v2: JSX component usage (<Header />) is recorded as ``calls`` edges.
 TREE_SITTER_JS_TS_EXTRACTOR_ID = (
-    "aiworkhub.source_graph.tree_sitter.javascript_typescript.v1"
+    "aiworkhub.source_graph.tree_sitter.javascript_typescript.v2"
 )
 
 EXTRACTED = "EXTRACTED"

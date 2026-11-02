@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 
-EXTRACTOR_ID = "aiworkhub.source_graph.tree_sitter.javascript_typescript.v1"
+EXTRACTOR_ID = "aiworkhub.source_graph.tree_sitter.javascript_typescript.v2"
 SUPPORTED_LANGUAGES = frozenset({"javascript", "typescript"})
 
 
@@ -334,12 +334,31 @@ def extract_javascript_typescript(
 
     observed_calls: set[tuple[str, str, int, int]] = set()
     for node in _walk(root):
-        if node.type not in {"call_expression", "new_expression"}:
+        is_jsx = node.type in {"jsx_opening_element", "jsx_self_closing_element"}
+        if not is_jsx and node.type not in {"call_expression", "new_expression"}:
             continue
         src = nearest_callable(node)
         if src is None:
             continue
-        function = node.child_by_field_name("function") or node.child_by_field_name("constructor")
+        if is_jsx:
+            # <Header /> renders a component, so the element name is the
+            # callee. Intrinsics (<div>), namespaced names and fragments have
+            # no component target; closing elements are never visited, so one
+            # usage yields one edge.
+            function = node.child_by_field_name("name")
+            if function is None:
+                continue
+            if function.type == "identifier":
+                if not _text(raw, function)[:1].isupper():
+                    continue
+            elif function.type == "member_expression":
+                object_node = function.child_by_field_name("object")
+                if object_node is None or _text(raw, object_node) not in namespaces:
+                    continue
+            else:
+                continue
+        else:
+            function = node.child_by_field_name("function") or node.child_by_field_name("constructor")
         if function is None:
             continue
         exact_binding = False
