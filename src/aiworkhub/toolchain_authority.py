@@ -21,7 +21,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path, PurePosixPath
@@ -144,7 +144,7 @@ def worker_workspace_unresolvable_paths(
             continue
         seen.add(candidate)
         posix = Path(candidate).as_posix()
-        if posix in generated_paths or posix in externally_supplied_paths:
+        if path_is_generated(posix, generated_paths) or posix in externally_supplied_paths:
             continue
         if posix in tracked:
             continue
@@ -221,13 +221,12 @@ def card_contract_missing_inputs(
                 exempt.add(Path(os.path.normpath(str(value))).as_posix())
             except (OSError, ValueError):
                 continue
-    generated = frozenset(
-        output for command in commands for output in declared_compiler_outputs(command)
-    )
+    generated: set[str] = set()
     tracked = repository_tracked_paths(repo)
     findings: list[tuple[str, str]] = []
     seen: set[str] = set()
     for command in commands:
+        generated.update(declared_compiler_outputs(command))
         try:
             tokens, _components, _tmpdir, cd_relative = (
                 worker_workspace._parse_validation_command_detailed(command)
@@ -268,7 +267,7 @@ def card_contract_missing_inputs(
                 continue
             seen.add(candidate)
             posix = Path(candidate).as_posix()
-            if posix in exempt or posix in generated:
+            if posix in exempt or path_is_generated(posix, generated):
                 continue
             path = repo / candidate
             if not path.exists():
@@ -283,32 +282,70 @@ def card_contract_missing_inputs(
     return tuple(findings)
 
 
+def path_is_generated(posix: str, generated: Iterable[str]) -> bool:
+    """True when ``posix`` is a generated output or lies under one."""
+    return any(posix == output or posix.startswith(output + "/") for output in generated)
+
+
+def _relative_output(raw: str) -> str:
+    if not raw or raw.startswith(("/", "\\")) or ":" in raw:
+        return ""
+    candidate = os.path.normpath(raw)
+    if candidate.startswith("..") or candidate == ".":
+        return ""
+    return Path(candidate).as_posix()
+
+
 def declared_compiler_outputs(command: str) -> frozenset[str]:
-    """Return repository-relative outputs declared with a compiler ``-o``.
+    """Return repository-relative outputs an earlier validation step creates.
 
     A later validation command may execute a binary created by an earlier
-    compile command.  Such a path is intentionally untracked but is still
-    available in the worker workspace, so it must not be classified as an
-    impossible coordinator-only dependency.
+    compile command, or read under a directory created by ``cmake -B``,
+    ``mkdir``, ``meson setup`` or ``--out-dir``.  Such a path is intentionally
+    untracked but is still available in the worker workspace, so it must not be
+    classified as an impossible coordinator-only dependency.
     """
     try:
         tokens = shlex.split(command)
     except ValueError:
         return frozenset()
-    outputs: set[str] = set()
+    if not tokens:
+        return frozenset()
+    head = PurePosixPath(tokens[0].replace("\\", "/")).name
+    head = head[:-4] if head.lower().endswith(".exe") else head
+    raws: list[str] = []
     for index, token in enumerate(tokens):
-        raw = ""
-        if token == "-o" and index + 1 < len(tokens):
-            raw = tokens[index + 1]
+        following = tokens[index + 1] if index + 1 < len(tokens) else ""
+        if token in ("-o", "--out-dir", "--outdir") or (token == "-B" and head == "cmake"):
+            raws.append(following)
+        elif token.startswith("--out-dir=") or token.startswith("--outdir="):
+            raws.append(token.partition("=")[2])
         elif token.startswith("-o") and len(token) > 2:
-            raw = token[2:]
-        if not raw or raw.startswith("/") or ":" in raw:
-            continue
-        candidate = os.path.normpath(raw)
-        if candidate.startswith(".."):
-            continue
-        outputs.add(Path(candidate).as_posix())
-    return frozenset(outputs)
+            raws.append(token[2:])
+        elif token.startswith("-B") and len(token) > 2 and head == "cmake":
+            raws.append(token[2:])
+    if head == "mkdir":
+        # -m/--mode take a value: a permission mode, not a directory.
+        raws.extend(
+            token for previous, token in zip(tokens, tokens[1:])
+            if not token.startswith("-") and previous not in ("-m", "--mode")
+        )
+    elif head == "meson" and len(tokens) > 2 and tokens[1] == "setup":
+        # The builddir is the first positional; a bare "--option" or "-D" before
+        # it takes the next token as its value unless it is a known switch.
+        switches = {"--reconfigure", "--wipe", "--clearcache", "--werror", "--strip",
+                    "--fatal-meson-warnings", "--vsenv"}
+        index = 2
+        while index < len(tokens):
+            token = tokens[index]
+            if not token.startswith("-"):
+                raws.append(token)
+                break
+            takes_value = "=" not in token and (
+                token == "-D" or (token.startswith("--") and token not in switches)
+            )
+            index += 2 if takes_value else 1
+    return frozenset(filter(None, (_relative_output(raw) for raw in raws)))
 
 
 class ProvisioningDomain(str, Enum):
@@ -1060,17 +1097,14 @@ class ToolchainAuthority:
                 for value in (card.get("validation") or [])
                 if isinstance(value, str) and value.strip()
             )
-            generated_paths = frozenset(
-                output
-                for command in commands
-                for output in declared_compiler_outputs(command)
-            )
+            created: set[str] = set()
             for command in commands:
+                created.update(declared_compiler_outputs(command))
                 for token, reason in worker_workspace_unresolvable_paths(
                     self.repo,
                     command,
                     tracked=tracked,
-                    generated_paths=generated_paths,
+                    generated_paths=frozenset(created),
                     externally_supplied_paths=externally_supplied_by_command.get(
                         command, frozenset()
                     ),
