@@ -31,7 +31,7 @@ LANGUAGE_SPECS: tuple[LanguageSpec, ...] = (
     LanguageSpec("php", "PHP", (".php", ".phtml", ".php3", ".php4", ".php5", ".php7", ".php8"), "semantic_lexical"),
     LanguageSpec("javascript", "JavaScript", (".js", ".jsx", ".mjs", ".cjs"), "semantic_lexical"),
     LanguageSpec("typescript", "TypeScript", (".ts", ".tsx", ".mts", ".cts"), "semantic_lexical"),
-    LanguageSpec("cpp", "C / C++ / CUDA / OpenCL / Metal", (".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".ipp", ".inl", ".cu", ".cuh", ".cl", ".metal"), "semantic_lexical"),
+    LanguageSpec("cpp", "C / C++ / CUDA / OpenCL / Metal", (".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".ipp", ".inl", ".inc", ".cu", ".cuh", ".cl", ".metal"), "semantic_lexical"),
     LanguageSpec("csharp", "C#", (".cs",), "semantic_lexical"),
     LanguageSpec("java", "Java", (".java",), "semantic_lexical"),
     LanguageSpec("kotlin", "Kotlin", (".kt", ".kts")),

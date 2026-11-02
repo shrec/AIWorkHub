@@ -11134,7 +11134,13 @@ def lsp_receipt(repo_root: Path, source_path: str) -> dict[str, Any] | None:
         conn.close()
 
 
-def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]:
+def index_file(
+    repo_root: Path,
+    path: str,
+    expected_hash: str,
+    *,
+    admit_gitignored: bool = False,
+) -> dict[str, Any]:
     """Index exactly one file into the canonical Source Graph.
 
     The file must already exist on disk, must pass the bounded path-safety
@@ -11142,6 +11148,11 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
     ``expected_hash``. Everything else fails closed. Only the target file's
     rows are mutated inside a single exclusive transaction; all other rows
     and the generation authority are preserved unchanged.
+
+    ``admit_gitignored`` skips ONLY the ``.gitignore`` refusal. The candidate
+    overlay (:func:`source_graph_partition.build_partition`) passes it because
+    ``admitted_changed_path`` is already the one admit decision for a packet
+    path; every other check (path safety, extension, hash) still applies.
 
     Returns a summary dict with ``ok``, ``file_path``, ``source_hash``,
     ``language``, ``status``, ``entities``, ``edges``, and ``lsp``.
@@ -11153,13 +11164,14 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
     # A path git's own ignore rules exclude is refused the same way an
     # excluded-dir/glob path already is above: fail closed rather than
     # silently indexing a corpus the repository asked to keep out.
-    gitignore = _scan_git_ignored_paths(repo_root)
-    if (
-        gitignore.applied
-        and _gitignored_rel(rel, gitignore)
-        and not _under_include_root(rel, load_ignore_policy(repo_root).include_roots)
-    ):
-        raise SourceGraphError(f"source_graph_single_file_gitignored:{rel}")
+    if not admit_gitignored:
+        gitignore = _scan_git_ignored_paths(repo_root)
+        if (
+            gitignore.applied
+            and _gitignored_rel(rel, gitignore)
+            and not _under_include_root(rel, load_ignore_policy(repo_root).include_roots)
+        ):
+            raise SourceGraphError(f"source_graph_single_file_gitignored:{rel}")
 
     # Reject unsupported extensions (no LanguageSpec entry).
     suffix = resolved.suffix.casefold()

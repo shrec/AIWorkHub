@@ -297,7 +297,11 @@ def build_partition(
                     files_skipped += 1
                     continue
                 try:
-                    result = sg.index_file(repo_root, relative, expected_hash)
+                    # ``admitted_changed_path`` is the one admit decision for
+                    # a packet path, so the gitignore refusal is not reapplied.
+                    result = sg.index_file(
+                        repo_root, relative, expected_hash, admit_gitignored=True,
+                    )
                 except sqlite3.Error:
                     raise
                 except Exception as exc:
