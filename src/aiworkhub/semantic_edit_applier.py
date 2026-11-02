@@ -21,6 +21,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 from . import semantic_edit
+from .platform_io import chmod_fd, posix_path_modes_supported
 
 
 def replace_prepared_range(
@@ -93,18 +94,29 @@ def replace_prepared_range(
         fd, temp_name = tempfile.mkstemp(
             prefix=f".{file_path.name}.aiworkhub-", dir=file_path.parent
         )
+        mode_restored = False
         try:
+            try:
+                chmod_fd(fd, original_mode)
+                mode_restored = posix_path_modes_supported()
+            except OSError:
+                pass
             with os.fdopen(fd, "w", encoding="utf-8", newline="", closefd=False) as handle:
                 handle.write(next_text)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.close(fd)
             fd = -1
-            if original_mode != 0o600:
+            if original_mode == 0o600:
+                mode_restored = True
+            else:
                 try:
                     os.chmod(temp_name, original_mode)
+                    mode_restored = True
                 except OSError:
                     pass
+            metrics["mode_restored"] = mode_restored
+            metrics["original_mode"] = original_mode
             os.replace(temp_name, file_path)
         finally:
             if fd >= 0:
