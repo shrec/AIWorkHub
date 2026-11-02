@@ -2935,6 +2935,98 @@ def _adapt_declared_report(
     )
 
 
+_JSX_DIALECT_PACKAGES = frozenset({"react", "react-scripts"})
+
+
+def _is_jsx_dialect(root: Path, candidate: Path, *, timeout_seconds: int) -> bool:
+    """True when the nearest package.json up to ``root`` lists React.
+
+    Worker worktrees are sparse, so a manifest absent on disk is read from
+    ``git show HEAD:<relpath>``. A missing, unreadable or invalid nearest
+    manifest means plain JavaScript (``node --check``), never JSX.
+    """
+    in_git = (root / ".git").exists()
+    directory = candidate.parent
+    while directory == root or root in directory.parents:
+        manifest = directory / "package.json"
+        text: str | None = None
+        if manifest.is_file():
+            try:
+                text = manifest.read_text(encoding="utf-8-sig")
+            except (OSError, UnicodeError):
+                return False
+        elif in_git:
+            # Bytes output decoded as UTF-8 explicitly: text=True would use the
+            # locale codec (cp1252 on Windows) and mis-decode or raise.
+            try:
+                shown = subprocess.run(
+                    ["git", "show", f"HEAD:{manifest.relative_to(root).as_posix()}"],
+                    cwd=root, capture_output=True, timeout=timeout_seconds, shell=False,
+                )
+                if shown.returncode == 0:
+                    text = shown.stdout.decode("utf-8-sig")
+            except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+                text = None
+        if text is not None:
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                return False
+            return isinstance(data, dict) and any(
+                isinstance(data.get(section), dict)
+                and not _JSX_DIALECT_PACKAGES.isdisjoint(data[section])
+                for section in ("dependencies", "devDependencies", "peerDependencies")
+            )
+        if directory == root:
+            break
+        directory = directory.parent
+    return False
+
+
+def _tree_sitter_syntax(grammar: str, raw: bytes) -> tuple[str, str, str]:
+    """Parse ``raw`` with one tree-sitter grammar. Returns (status, summary, error)."""
+    try:
+        from importlib import metadata
+
+        from tree_sitter_language_pack import get_parser
+
+        version = metadata.version("tree-sitter-language-pack")
+        parser = get_parser(grammar)
+    except Exception as exc:  # ImportError, missing grammar or ABI failure
+        reason = f"jsx_parser_unavailable:{type(exc).__name__}:{exc}"[:MAX_SUMMARY_CHARS]
+        return STATUS_NOT_AVAILABLE, reason, reason
+    # Keep Parser and Tree referenced for the whole walk: some language-pack
+    # builds release native state once either is dropped (see
+    # source_graph_semantic.extract_semantic_file).
+    try:
+        tree = parser.parse(raw)
+        node = tree.root_node
+    except Exception as exc:  # native parse or ABI failure
+        reason = f"jsx_parser_unavailable:{type(exc).__name__}:{exc}"[:MAX_SUMMARY_CHARS]
+        return STATUS_NOT_AVAILABLE, reason, reason
+    label = f"tree-sitter {grammar} (tree-sitter-language-pack {version})"
+    if not node.has_error:
+        return STATUS_PASSED, f"syntax valid: {label}", ""
+    stack = [node]
+    found = None
+    while stack:
+        node = stack.pop()
+        if node.type == "ERROR" or node.is_missing:
+            found = node
+            break
+        stack.extend(reversed([child for child in node.children if child.has_error]))
+    # Without an ERROR/MISSING node, anchor on the last popped node: the
+    # deepest has_error node, since only has_error children are pushed.
+    anchor = found if found is not None else node
+    offset = anchor.start_byte
+    # Byte offsets, not Point accessors, which are unstable on some builds.
+    line = raw.count(b"\n", 0, offset) + 1
+    column = offset - (raw.rfind(b"\n", 0, offset) + 1) + 1
+    kind = "missing node" if found is not None and found.is_missing else "syntax error"
+    error = f"{kind} at line {line}:{column}"
+    return STATUS_FAILED, f"{label}: {error}", error
+
+
 def run_builtin_static_checks(
     repo_root: Path | str,
     *,
@@ -2978,6 +3070,13 @@ def run_builtin_static_checks(
         try:
             if suffix == ".py":
                 ast.parse(candidate.read_text(encoding="utf-8"), filename=relative)
+            elif suffix in {".jsx", ".tsx"} or (
+                suffix == ".js"
+                and _is_jsx_dialect(root, candidate, timeout_seconds=timeout_seconds)
+            ):
+                grammar = "tsx" if suffix == ".tsx" else "javascript"
+                command = ("tree-sitter", grammar)
+                status, summary, error = _tree_sitter_syntax(grammar, candidate.read_bytes())
             elif suffix in {".js", ".cjs", ".mjs"}:
                 command = ("node", "--check", relative)
                 status, stdout, stderr, _duration = _run_command_array(
