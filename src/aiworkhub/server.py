@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import hashlib
+import importlib.abc
+import importlib.machinery
+import importlib.util
 import inspect
 import json
 import os
@@ -15,6 +18,68 @@ from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Any, Literal
+
+
+# NF-2026-01988: ``import aiworkhub.server`` used to execute 197 aiworkhub modules
+# (8-13 s idle, 51.6 s under xdist load, past the client's 30 s connect timeout),
+# although registering the tools needs only names, docstrings and signatures.
+# While this module body runs, an aiworkhub submodule bound by ``from . import
+# name`` -- here or in a module imported from here -- is created through
+# importlib's LazyLoader: the one canonical module object is in sys.modules and
+# on the package at once, and its code runs on the first attribute access. So
+# ``server.task_store`` is ``aiworkhub.task_store`` and
+# ``monkeypatch.setattr(server.task_store, ...)`` patches the real module.
+# ``from .x import name`` still executes ``x`` immediately. The finder serves
+# only the thread importing this module, goes inert when that import fails, and
+# is removed before the module body ends; it never changes which tools register.
+_DEFERRED_IMPORT_PREFIX = f"{__package__}."
+_DEFERRED_IMPORT_LOADERS = (
+    importlib.machinery.SourceFileLoader,
+    importlib.machinery.SourcelessFileLoader,
+)
+# Tool bodies run on worker threads, so two calls may each be first to touch a
+# deferred module. LazyLoader gives every module its own lock; two modules
+# that reference each other could then deadlock A->B against B->A. One shared
+# re-entrant lock orders every deferred execution instead.
+_DEFERRED_EXECUTION_LOCK = threading.RLock()
+
+
+class _SerializedLazyLoader(importlib.util.LazyLoader):
+    """LazyLoader whose deferred module executions share one re-entrant lock."""
+
+    def exec_module(self, module: types.ModuleType) -> None:
+        super().exec_module(module)
+        # Plain attribute access on the lazy module would execute it now.
+        state = object.__getattribute__(module, "__spec__").loader_state
+        if isinstance(state, dict) and "lock" in state:
+            state["lock"] = _DEFERRED_EXECUTION_LOCK
+
+
+class _DeferredImplementationFinder(importlib.abc.MetaPathFinder):
+    """Create aiworkhub submodules imported while server.py loads as lazy modules."""
+
+    def __init__(self, module: types.ModuleType) -> None:
+        self._module = module
+        self._thread_id = threading.get_ident()
+
+    def active(self) -> bool:
+        return (
+            threading.get_ident() == self._thread_id
+            and sys.modules.get(self._module.__name__) is self._module
+        )
+
+    def find_spec(self, fullname: str, path: Any, target: Any = None) -> Any:
+        if not fullname.startswith(_DEFERRED_IMPORT_PREFIX) or not self.active():
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+        if spec is None or not isinstance(spec.loader, _DEFERRED_IMPORT_LOADERS):
+            return None
+        spec.loader = _SerializedLazyLoader(spec.loader)
+        return spec
+
+
+_deferred_import_finder = _DeferredImplementationFinder(sys.modules[__name__])
+sys.meta_path.insert(0, _deferred_import_finder)
 
 from . import (
     needfix_store,
@@ -638,8 +703,17 @@ from . import worker_ai_tools_mcp
 # NF389: single source of truth for bounded provider-call identity and
 # provenance. Manager write tools already accept provenance; these re-exports
 # make the fail-closed validators available to the Server surface (and tests).
-validate_provider_call_id = worker_ai_tools_mcp.validate_provider_call_id
-validate_provenance = worker_ai_tools_mcp.validate_provenance
+# NF-2026-01988: resolved on first access (PEP 562) so reading them is what
+# executes worker_ai_tools_mcp, not importing this module.
+_WORKER_TOOL_REEXPORTS = frozenset({"validate_provider_call_id", "validate_provenance"})
+
+
+def __getattr__(name: str) -> Any:
+    if name in _WORKER_TOOL_REEXPORTS:
+        return getattr(worker_ai_tools_mcp, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 from . import dependency_autolaunch
 from . import quality_evidence
 from . import quality_calibration
@@ -6422,10 +6496,16 @@ def aiworkhub_agent_task_status(
     return folded
 
 
+# NF-2026-01988: process_launcher.MAX_LOG_TAIL_BYTES, mirrored so this default
+# does not execute process_launcher (about 45 modules) at import; the import
+# budget test asserts the two stay equal.
+_COLLECT_RESULT_MAX_LOG_TAIL_BYTES = 65536
+
+
 @mcp.tool()
 def aiworkhub_agent_collect_result(
     request_id: str,
-    max_log_bytes: int = process_launcher.MAX_LOG_TAIL_BYTES,
+    max_log_bytes: int = _COLLECT_RESULT_MAX_LOG_TAIL_BYTES,
 ) -> dict[str, Any]:
     """READ-ONLY: collect bounded worker output and review-readiness evidence.
 
@@ -8465,6 +8545,11 @@ def roadmap_link_task(roadmap_id: str, task_id: str) -> dict:
         task_id: Id of an existing canonical task in this repository; an already-linked task is not duplicated.
     """
     return core.roadmap_link_task(roadmap_id, task_id)
+
+
+# NF-2026-01988: registration is complete; later imports execute normally.
+if _deferred_import_finder in sys.meta_path:
+    sys.meta_path.remove(_deferred_import_finder)
 
 
 if __name__ == "__main__":
