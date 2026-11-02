@@ -20,9 +20,12 @@ returns no evidence, refuses the accept with ``neighbour_tests_failed:``.
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -40,6 +43,17 @@ DEFAULT_NEIGHBOUR_LIMIT = MAX_NEIGHBOUR_TESTS
 # Repository-wide invariants no testmap links to one module; they run whenever
 # a src/ module changed and do not count against the neighbour cap.
 INVARIANT_TESTS = ("tests/test_module_size_ratchet.py",)
+# NF-2026-01947: a test that loads a changed module by path ("<stem>.py") has no
+# testmap import edge, and a NAME_MAX_LINES ratchet on a module with many related
+# tests can rank below the neighbour cap. Both run whenever their module changed,
+# outside the neighbour cap and under their own ceiling.
+MAX_REFERENCING_TESTS = 12
+REFERENCING_SCAN_MAX_BYTES = 1024 * 1024
+_TESTS_DIR = "tests"
+# The tail of a module-level ``<STEM>_MAX_LINES = <int>`` binding (optionally
+# annotated); ``_stem_patterns`` puts the upper-cased changed stems in front of it.
+_RATCHET_BINDING = r"_MAX_LINES[ \t]*(?::[^=\n]*)?=[ \t]*\d[\d_]*[ \t]*(?:#.*)?$"
+_REPARSE_POINT = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT: a Windows symlink or junction
 NEIGHBOUR_FAILURE_PREFIX = "neighbour_tests_failed:"
 NEIGHBOUR_FAILURE_DETAIL_CHARS = 4000
 MAX_REPORTED_FAILURES = 20
@@ -66,17 +80,26 @@ class NeighbourSelection:
     related_count: int = 0
     unavailable_paths: tuple[Mapping[str, str], ...] = field(default=())
     invariant: tuple[str, ...] = ()
+    referencing: tuple[str, ...] = ()
+    referencing_omitted: int = 0
+    referencing_reason: str = ""
 
     def evidence(self) -> dict[str, Any]:
+        ranked = len(self.tests) - len(self.invariant) - len(self.referencing)
         record: dict[str, Any] = {
             "selected": list(self.tests),
             "limit": self.limit,
             "production_paths": list(self.production_paths),
             "related_count": self.related_count,
-            "omitted": max(0, self.related_count - (len(self.tests) - len(self.invariant))),
+            "omitted": max(0, self.related_count - ranked),
         }
         if self.invariant:
             record["invariant"] = list(self.invariant)
+        if self.referencing or self.referencing_omitted:
+            record["referencing"] = list(self.referencing)
+            record["referencing_omitted"] = self.referencing_omitted
+        if self.referencing_reason:
+            record["referencing_reason"] = self.referencing_reason
         if self.reason:
             record["reason"] = self.reason
         if self.unavailable_paths:
@@ -114,7 +137,8 @@ def select_neighbour_tests(
 
     Highest testmap score first, ties by path, capped at ``limit`` (at most
     ``MAX_NEIGHBOUR_TESTS``). Only test files present under ``repo_root`` are
-    kept. Never raises.
+    kept. ``INVARIANT_TESTS`` and the tests that load a changed module by path
+    or ratchet its size follow, outside that cap. Never raises.
     """
     bounded = _bounded_limit(limit)
     try:
@@ -122,9 +146,14 @@ def select_neighbour_tests(
     except Exception as exc:  # the lane is evidence-gathering: it records, never raises
         selection = _empty(f"neighbour_selection_failed:{type(exc).__name__}", bounded)
     try:
-        return _with_invariants(Path(repo_root), selection, changed_paths, declared_commands)
+        selection = _with_invariants(Path(repo_root), selection, changed_paths, declared_commands)
     except Exception:  # the invariant addition must never turn a selection into a raise
-        return selection
+        pass
+    try:
+        return _with_referencing(Path(repo_root), selection, changed_paths, declared_commands)
+    except Exception as exc:  # nor the referencing scan: it names its failure and adds nothing
+        reason = f"referencing_scan_failed:{type(exc).__name__}"
+        return replace(selection, referencing_reason=reason)
 
 
 def _with_invariants(
@@ -149,6 +178,148 @@ def _with_invariants(
     if not invariant:
         return selection
     return replace(selection, tests=selection.tests + invariant, invariant=invariant)
+
+
+def _with_referencing(
+    root: Path,
+    selection: NeighbourSelection,
+    changed_paths: Iterable[Any],
+    declared_commands: Sequence[str],
+) -> NeighbourSelection:
+    """Add the tests that load a changed module by path or ratchet its size.
+
+    Ratchet tests first, then path order, at most ``MAX_REFERENCING_TESTS``;
+    tests the declared validation names, the selection holds or
+    ``INVARIANT_TESTS`` lists are left out.
+    """
+    if selection.limit == 0:
+        return selection
+    stems = sorted(
+        {path.rsplit("/", 1)[-1][: -len(".py")] for path in _production_paths(changed_paths)}
+        - {"__init__"}  # a package's __init__.py is named by fixtures that build packages
+    )
+    if not stems:
+        return selection
+    named = _advice._command_names(
+        command for command in declared_commands if isinstance(command, str)
+    )
+    present = set(selection.tests)
+    candidates = [
+        (test, path)
+        for test, path in _collected_tests(root)
+        if test not in present
+        and test not in INVARIANT_TESTS
+        and not _advice._covers(named, test)
+    ]
+    literal, ratchet = _stem_patterns(stems)
+    needles = tuple(f"{stem}.py" for stem in stems) + tuple(
+        f"{stem.upper()}_MAX_LINES" for stem in stems
+    )
+
+    def rank(item: tuple[str, Path]) -> int | None:
+        text = _read_test(item[1])
+        # Either pattern needs one of these substrings; ``in`` is far cheaper than a regex.
+        if not any(needle in text for needle in needles):
+            return None
+        return _referencing_rank(text, literal, ratchet)
+
+    # Measured 2026-11-02 over the canonical tests/ tree (844 files, 17 MB), three stems:
+    # sequential 1.4-2.6 s, 12 threads 0.75-1.1 s, identical ranks. Without the substring
+    # filter the GIL-bound regexes dominated (3.4-3.8 s) and threads gained little.
+    # pool.map keeps candidate order, so the result equals a sequential scan.
+    with ThreadPoolExecutor(max_workers=_scan_workers(len(candidates))) as pool:
+        ranks = list(pool.map(rank, candidates))
+    ranked = sorted(
+        (rank, test) for rank, (test, _path) in zip(ranks, candidates) if rank is not None
+    )
+    ordered = tuple(test for _rank, test in ranked)
+    if not ordered:
+        return selection
+    kept = ordered[:MAX_REFERENCING_TESTS]
+    return replace(
+        selection,
+        tests=selection.tests + kept,
+        referencing=kept,
+        referencing_omitted=len(ordered) - len(kept),
+    )
+
+
+def _stem_patterns(stems: Sequence[str]) -> tuple[re.Pattern[str], re.Pattern[str]]:
+    """The ``<stem>.py`` file-name literal as a word, and the ``<STEM>_MAX_LINES`` ratchet."""
+    literal = re.compile(
+        "|".join(rf"(?<![A-Za-z0-9_]){re.escape(stem)}\.py(?![A-Za-z0-9_])" for stem in stems)
+    )
+    ratchet = re.compile(
+        "^(?:" + "|".join(re.escape(stem.upper()) for stem in stems) + ")" + _RATCHET_BINDING,
+        re.MULTILINE,
+    )
+    return literal, ratchet
+
+
+def _referencing_rank(
+    text: str, literal: re.Pattern[str], ratchet: re.Pattern[str]
+) -> int | None:
+    """0 for a ratchet named for a changed module, 1 for a path-loading test, else None."""
+    if ratchet.search(text):
+        return 0
+    if literal.search(text):
+        return 1
+    return None
+
+
+def _is_link(status: os.stat_result) -> bool:
+    """A symlink, or on Windows any reparse point such as a junction."""
+    attributes = getattr(status, "st_file_attributes", 0)
+    return stat.S_ISLNK(status.st_mode) or bool(attributes & _REPARSE_POINT)
+
+
+def _collected_tests(root: Path) -> list[tuple[str, Path]]:
+    """Collected test files under ``root/tests``, sorted, never through a link.
+
+    Files over ``REFERENCING_SCAN_MAX_BYTES`` are skipped; an unreadable
+    directory raises, and the caller records that the scan failed.
+    """
+    top = root / _TESTS_DIR
+    try:
+        status = os.lstat(top)
+    except FileNotFoundError:
+        return []
+    if _is_link(status) or not stat.S_ISDIR(status.st_mode):
+        return []
+    found: list[tuple[str, Path]] = []
+    pending = [(top, _TESTS_DIR)]
+    while pending:
+        directory, relative = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                child = f"{relative}/{entry.name}"
+                status = entry.stat(follow_symlinks=False)
+                if _is_link(status):
+                    continue
+                if stat.S_ISDIR(status.st_mode):
+                    pending.append((Path(entry.path), child))
+                elif (
+                    stat.S_ISREG(status.st_mode)
+                    and status.st_size <= REFERENCING_SCAN_MAX_BYTES
+                    and _TEST_PATH.fullmatch(child)
+                    and _COLLECTED_TEST_PATH.fullmatch(child)
+                ):
+                    found.append((child, Path(entry.path)))
+    return sorted(found)
+
+
+def _read_test(path: Path) -> str:
+    """The head of one test file; an unreadable one reads as empty, so only it ranks None."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return handle.read(REFERENCING_SCAN_MAX_BYTES)
+    except OSError:
+        return ""
+
+
+def _scan_workers(count: int) -> int:
+    """Threads for ``count`` reads: a quarter of the cores stay free for the accept."""
+    return max(1, min(count, (os.cpu_count() or 1) * 3 // 4))
 
 
 def _select(
