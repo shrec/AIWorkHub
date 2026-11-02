@@ -72,7 +72,7 @@ def test_non_dict_probe_is_unavailable() -> None:
     assert "list" in entry["summary"]
 
 
-def test_timeout_probe_is_unavailable() -> None:
+def test_timeout_probe_is_slow() -> None:
     def slow() -> dict:
         time.sleep(1.0)
         return {"ok": True}
@@ -81,8 +81,9 @@ def test_timeout_probe_is_unavailable() -> None:
     report = doctor.diagnose({"p": slow}, timeout_seconds=0.2)
     assert time.monotonic() - started < 0.9
     entry = _only(report, "p")
-    assert entry["state"] == "unavailable"
+    assert entry["state"] == "slow"
     assert entry["summary"] == "timeout"
+    assert entry["timeout_seconds"] == 0.2
 
 
 def test_probe_queued_behind_a_hung_probe_is_not_started(monkeypatch) -> None:

@@ -14,6 +14,9 @@ SCHEMA_ID = "aiworkhub.doctor_diagnose.v1"
 STATE_OK = "ok"
 STATE_PROBLEM = "problem"
 STATE_UNAVAILABLE = "unavailable"
+# A probe still running at the deadline only proves it is slow, not that it is down.
+STATE_SLOW = "slow"
+VERDICT_DEGRADED = "degraded"
 SUMMARY_MAX_CHARS = 200
 REPLY_MAX_BYTES = 8 * 1024
 NESTED_PROBE_KEYS = ("reconciler", "learning_coverage")
@@ -45,11 +48,11 @@ def _problem_summary(result: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _entry(name: str, state: str, summary: str) -> dict[str, str]:
+def _entry(name: str, state: str, summary: str) -> dict[str, Any]:
     return {"name": name, "state": state, "summary": summary, "next_tool": name}
 
 
-def _classify(name: str, result: Any) -> dict[str, str]:
+def _classify(name: str, result: Any) -> dict[str, Any]:
     if not isinstance(result, dict):
         return _entry(name, STATE_UNAVAILABLE, _bounded(f"non_dict:{type(result).__name__}"))
     problem = _problem_summary(result)
@@ -58,12 +61,14 @@ def _classify(name: str, result: Any) -> dict[str, str]:
     return _entry(name, STATE_OK, "")
 
 
-def _verdict(entries: list[dict[str, str]]) -> str:
+def _verdict(entries: list[dict[str, Any]]) -> str:
     states = {entry["state"] for entry in entries}
     if STATE_PROBLEM in states:
         return STATE_PROBLEM
     if STATE_UNAVAILABLE in states:
         return STATE_UNAVAILABLE
+    if STATE_SLOW in states:
+        return VERDICT_DEGRADED
     return STATE_OK
 
 
@@ -89,14 +94,17 @@ def diagnose(
         concurrent.futures.wait(futures.values(), timeout=deadline)
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
-    entries: list[dict[str, str]] = []
+    entries: list[dict[str, Any]] = []
     for name, future in futures.items():
         if future.cancelled():
             # Still queued behind a hung probe at the deadline: it never ran.
             entries.append(_entry(name, STATE_UNAVAILABLE, "not_started"))
             continue
         if not future.done():
-            entries.append(_entry(name, STATE_UNAVAILABLE, "timeout"))
+            # Still running at the deadline: slow, not down (NF-2026-01967).
+            slow = _entry(name, STATE_SLOW, "timeout")
+            slow["timeout_seconds"] = timeout_seconds
+            entries.append(slow)
             continue
         error = future.exception()
         if error is not None:
