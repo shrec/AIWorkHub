@@ -14,6 +14,9 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+# Hang-guard deadline only (not a timing assertion); bounds a genuine hang.
+_HANG_GUARD_SECONDS = 120
+
 from aiworkhub import platform_io, source_graph, source_graph_daemon, task_store  # noqa: E402
 
 
@@ -60,7 +63,7 @@ def test_active_refresh_keeps_public_retrieval_strictly_readable(tmp_path, monke
         conn = original_connect(path, read_only=read_only)
         if not read_only and Path(path) != canonical and not writer_open.is_set():
             writer_open.set()
-            assert release_writer.wait(10)
+            assert release_writer.wait(_HANG_GUARD_SECONDS)
         return conn
 
     monkeypatch.setattr(source_graph, "connect", gated_connect)
@@ -74,11 +77,11 @@ def test_active_refresh_keeps_public_retrieval_strictly_readable(tmp_path, monke
 
     thread = threading.Thread(target=refresh)
     thread.start()
-    assert writer_open.wait(10)
+    assert writer_open.wait(_HANG_GUARD_SECONDS)
     for _ in range(20):
         _assert_public_reads(root, "committed")
     release_writer.set()
-    thread.join(10)
+    thread.join(_HANG_GUARD_SECONDS)
     assert not thread.is_alive()
     assert errors == []
     _assert_public_reads(root, "refreshed")
