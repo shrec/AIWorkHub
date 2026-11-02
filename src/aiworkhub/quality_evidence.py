@@ -22,6 +22,7 @@ from . import (
     eval_artifact_gate,
     evidence_levels,
     known_bug_scanner,
+    msbuild_project_check,
     platform_io,
     quality_review,
     quality_reviewer,
@@ -3091,6 +3092,12 @@ def run_builtin_static_checks(
                 )
                 error = stderr if status != STATUS_PASSED else ""
                 summary = (stdout or stderr or "syntax valid").strip()
+            elif msbuild_project_check.is_project_path(relative):
+                command = ("builtin", "msbuild_project_check", relative)
+                passed, summary, error = msbuild_project_check.check_project_file(
+                    root, relative, timeout_seconds=timeout_seconds
+                )
+                status = STATUS_PASSED if passed else STATUS_FAILED
             else:
                 continue
         except (OSError, UnicodeError, SyntaxError, json.JSONDecodeError) as exc:
