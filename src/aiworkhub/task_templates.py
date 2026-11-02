@@ -1331,10 +1331,52 @@ def expanded_contract_digest(
     ).hexdigest()
 
 
+_READ_FIRST_LINE_RANGE = re.compile(
+    r"\A(?P<path>.+?):(?P<start>[0-9]+)(?:-(?P<end>[0-9]+))?\Z"
+)
+
+
+def _read_first_entry_path(entry: Any) -> Any:
+    """Strip one valid ``:N`` / ``:N-M`` line-range suffix from a read_first entry.
+
+    NF-2026-01956: ``reject_review``'s ``read_first_amendment`` accepts read_first
+    entries carrying a line-range suffix, so a card may legitimately declare
+    ``docs/x.md:270-290``. A template expansion only ever emits bare paths, so
+    the suffix is stripped before comparing. Only the exact grammar is
+    stripped -- N and M positive integers with N <= M; anything else (``:abc``,
+    ``:0``, ``:9-3``) is returned unchanged and therefore still fails closed.
+    """
+    if not isinstance(entry, str):
+        return entry
+    match = _READ_FIRST_LINE_RANGE.match(entry)
+    if match is None:
+        return entry
+    start = int(match.group("start"))
+    end_text = match.group("end")
+    end = start if end_text is None else int(end_text)
+    if start < 1 or end < start:
+        return entry
+    return match.group("path")
+
+
+def _read_first_matches(declared: Any, expected: Any) -> bool:
+    """Whether declared read_first equals an expansion's, modulo line ranges."""
+    if not isinstance(declared, (list, tuple)) or not isinstance(
+        expected, (list, tuple)
+    ):
+        return declared == expected
+    return len(declared) == len(expected) and all(
+        left == right or _read_first_entry_path(left) == right
+        for left, right in zip(declared, expected)
+    )
+
+
 def _expansion_field_matches(field: str, declared: Any, expected: Any) -> bool:
     """Whether a persisted card field still matches a fresh template expansion.
 
-    Every field but ``validation`` is compared exactly, as it always was.
+    Every field but ``validation`` and ``read_first`` is compared exactly, as
+    it always was. ``read_first`` is compared after stripping a valid
+    ``:N``/``:N-M`` line-range suffix (see ``_read_first_entry_path``).
 
     ``validation`` is compared on the CANONICAL command instead, and the reason
     is measured: 435 persisted cards in this repository carry template
@@ -1354,6 +1396,8 @@ def _expansion_field_matches(field: str, declared: Any, expected: Any) -> bool:
     against a template that validates different files, different flags, or a
     different tool.
     """
+    if field == "read_first":
+        return _read_first_matches(declared, expected)
     if field != "validation":
         return declared == expected
     if not isinstance(declared, (list, tuple)) or not isinstance(
@@ -2095,7 +2139,7 @@ def classify_task_card(
             if rank > closest_rank:
                 closest_template, closest_field, closest_rank = name, "work_kind", rank
             continue
-        if first != list(expanded["read_first"]):
+        if not _read_first_matches(first, list(expanded["read_first"])):
             rank = field_rank["read_first"]
             if rank > closest_rank:
                 closest_template, closest_field, closest_rank = name, "read_first", rank
