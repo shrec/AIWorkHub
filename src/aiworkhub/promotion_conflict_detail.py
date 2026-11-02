@@ -28,12 +28,16 @@ PROMOTION_CONFLICT_PREFIXES: tuple[str, ...] = (
     "parent_changed",
     "promotion_scope",
     "promotion_merge",
+    # NF-2026-01997: the candidate edits a path whose canonical copy had
+    # uncommitted changes at seed time (``dirty_canonical_seed``).
+    "promotion_canonical_dirty_at_seed",
 )
 # Raised by preflight checks before any canonical byte is written, so an accept
 # can still answer with a structured refusal and leave the task in review.
 PRE_WRITE_CONFLICT_PREFIXES: tuple[str, ...] = (
     "parent_changed_since_launch:",
     "promotion_merge_",
+    "promotion_canonical_dirty_at_seed:",
 )
 MAX_CONFLICT_ENTRIES = 20
 

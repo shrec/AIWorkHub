@@ -585,6 +585,7 @@ class WorkerWorkspace:
     # exact materializer-produced bytes may stand in for that digest
     # (NF-2026-01552); legacy metadata without the record loads as empty.
     inherited_rebased_hashes: dict[str, str] = field(default_factory=dict)
+    dirty_at_seed: tuple[str, ...] = ()  # dirty canonical seeds, NF-2026-01997
 
     def as_metadata(self) -> dict[str, Any]:
         return {
@@ -601,6 +602,7 @@ class WorkerWorkspace:
             "base_oid": self.base_oid,
             "parent_baseline_blob": dict(self.parent_baseline_blob),
             "inherited_rebased_hashes": dict(self.inherited_rebased_hashes),
+            "dirty_at_seed": list(self.dirty_at_seed),
         }
 
     @classmethod
@@ -641,6 +643,8 @@ class WorkerWorkspace:
                 _relative_repo_path(str(k)): str(v)
                 for k, v in dict(payload.get("inherited_rebased_hashes") or {}).items()
             },
+            dirty_at_seed=tuple(
+                _relative_repo_path(str(v)) for v in payload.get("dirty_at_seed") or ()),
         )
 
 
@@ -5207,6 +5211,7 @@ def create_workspace(
         # ``allowed_writes``, so their post-overlay bytes seed
         # ``workspace_baseline`` below and they remain read-only, never enter
         # the candidate delta, and can never be promoted.
+        dirty_at_seed: tuple[str, ...] = ()
         if pinned_base_oid is None:
             restat_candidates: list[str] = []
             for relative in live_seeded:
@@ -5231,6 +5236,8 @@ def create_workspace(
                     )
                 restat_candidates.append(relative)
             _restat_seeds_equal_to_index_blobs(path, restat_candidates)
+            from .dirty_canonical_seed import dirty_seeded_paths  # NF-2026-01997
+            dirty_at_seed = dirty_seeded_paths(path, restat_candidates, _run)
             from .worker_workspace_ignore_seed import hide_live_gitignore_seeds
             hide_live_gitignore_seeds(path, restat_candidates, _run)
         # Re-run the same exact-input checks against the sparse worktree after
@@ -5350,6 +5357,7 @@ def create_workspace(
         base_oid=base_oid,
         parent_baseline_blob=parent_baseline_blob,
         inherited_rebased_hashes=dict(sorted(rework_rebased.items())),
+        dirty_at_seed=dirty_at_seed,
     )
     # Seal the exit-contract inputs the worker MCP server needs for
     # ``aiworkhub_worker_exit_preflight``.  Advisory only; never fails a launch.
@@ -6947,6 +6955,8 @@ def promote(workspace: WorkerWorkspace, changed: Iterable[str]) -> list[str]:
         if current not in {expected, source_hash}:
             raise WorkspaceError(f"parent_changed_since_launch:{relative}"
                                  + conflict_detail(expected, current, source_hash))
+    from .dirty_canonical_seed import refuse_dirty_at_seed  # NF-2026-01997
+    refuse_dirty_at_seed(workspace, paths)
 
     # Mark the parent-tree write window so a concurrent ``create_workspace``
     # refuses to seed rather than capturing a half-promoted, inconsistent tree.

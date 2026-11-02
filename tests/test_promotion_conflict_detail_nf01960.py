@@ -179,5 +179,10 @@ def test_conflict_entries_are_capped_with_a_truncated_count():
 
 
 def test_prefix_mapping_is_single_definition():
-    assert pcd.PROMOTION_CONFLICT_PREFIXES == ("parent_changed", "promotion_scope", "promotion_merge")
+    assert pcd.PROMOTION_CONFLICT_PREFIXES == (
+        "parent_changed",
+        "promotion_scope",
+        "promotion_merge",
+        "promotion_canonical_dirty_at_seed",  # NF-2026-01997
+    )
     assert plv.PROMOTION_CONFLICT_PREFIXES is pcd.PROMOTION_CONFLICT_PREFIXES
