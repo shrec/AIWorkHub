@@ -20,6 +20,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import hmac
+import json
 import re
 import shlex
 import time
@@ -29,7 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
-from .known_bug_scanner import _canonical_receipt_bytes, _source_revision_sha256
+from .known_bug_scanner import _canonical_receipt_bytes
 
 SCHEMA_ID = "aiworkhub.finding_reproduction_receipt.v1"
 PYTEST_PREFIX = "pytest:"
@@ -72,7 +73,17 @@ _PROBE_PRELUDE = (
 )
 _MAX_DETAIL_CHARS = 200
 
+# Root labels of the sealed-tree manifest (NF-2026-01953).
+SEALED_ROOT = "sealed"
+CANONICAL_ROOT = "canonical"
+SEALED_TREE_MUTATED = "finding_reproduction_sealed_tree_mutated"
+_MAX_MUTATION_ENTRIES = 8
+_MAX_MUTATION_MESSAGE_CHARS = 2048
+_MAX_MUTATION_PATH_CHARS = 256
+_MAX_CONCURRENT_CHANGES = 32
+
 Runner = Callable[[Any, list[str]], list[dict[str, Any]]]
+Manifest = Mapping[tuple[str, str], "str | None"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,15 +106,23 @@ class ReproductionSpec:
         return "python -I -c " + shlex.quote(_PROBE_PRELUDE + self.body)
 
 
+def _materialized_unknown() -> None:
+    """No target-declared canonical materialization: every canonical change voids."""
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class ReproductionTarget:
-    """Where one spec runs: both scratch workspaces and the sealed-tree digest.
+    """Where one spec runs: both scratch workspaces and the sealed-tree manifest.
 
     ``create_candidate``/``create_base`` each return one scratch workspace that
     ``cleanup`` disposes; ``run`` is the validation-sandbox runner with the
-    ``run_validations`` shape; ``sealed_digest`` hashes the path set and bytes
-    a reproduction must never change -- see :func:`sealed_digest` for exactly
-    which paths of the sealed candidate and canonical trees that is.
+    ``run_validations`` shape. ``sealed_manifest(also)`` maps each guarded
+    ``(root label, path)`` to the sha256 of its bytes (None when absent) -- see
+    :func:`sealed_manifest`; ``also`` are earlier keys to re-hash.
+    ``candidate_paths`` are guarded under every root. ``canonical_materialized``
+    names, after both sides ran, the canonical working-tree paths either side
+    copied into its workspace, or None when that is unknown.
     """
 
     base_oid: str
@@ -111,7 +130,9 @@ class ReproductionTarget:
     create_base: Callable[[], Any]
     cleanup: Callable[[Any], None]
     run: Runner
-    sealed_digest: Callable[[], str]
+    sealed_manifest: Callable[[Iterable[tuple[str, str]]], Manifest]
+    candidate_paths: tuple[str, ...] = ()
+    canonical_materialized: Callable[[], Iterable[str] | None] = _materialized_unknown
 
 
 def _compiles(source: str) -> bool:
@@ -314,6 +335,64 @@ def _execute(
         cleanup(workspace)
 
 
+def _mutation_message(
+    keys: list[tuple[str, str]], before: Manifest, after: Manifest
+) -> str:
+    """``SEALED_TREE_MUTATED:<json>``: at most 8 entries, at most 2048 chars."""
+    entries = [
+        {
+            "root": root,
+            "path": path[:_MAX_MUTATION_PATH_CHARS],
+            "before_sha256": before.get((root, path)),
+            "after_sha256": after.get((root, path)),
+        }
+        for root, path in keys[:_MAX_MUTATION_ENTRIES]
+    ]
+    while True:
+        message = f"{SEALED_TREE_MUTATED}:" + json.dumps(
+            entries, separators=(",", ":"), sort_keys=True
+        )
+        if len(message) <= _MAX_MUTATION_MESSAGE_CHARS or len(entries) <= 1:
+            return message
+        entries.pop()
+
+
+def _sealed_guard(
+    before: Manifest, after: Manifest, target: ReproductionTarget
+) -> tuple[list[str], int]:
+    """Raise on a guarded change; return the concurrent canonical changes.
+
+    A key only in ``after`` is a path a delta lister named only afterwards, so
+    it changed during the run (its before hash is reported as null). Any change
+    under a root other than the canonical one -- the sealed worktree -- or at a
+    candidate path under any root raises. A canonical change elsewhere raises
+    when a side materialized that path from the canonical working tree, or when
+    that set is unknown; otherwise neither side read those bytes, and it is
+    returned (sorted, at most 32 paths, plus the full count) for the receipt.
+    """
+    changed = sorted(
+        key
+        for key in set(before) | set(after)
+        if key not in before or key not in after or before[key] != after[key]
+    )
+    if not changed:
+        return [], 0
+    candidate = set(target.candidate_paths)
+    declared = target.canonical_materialized()
+    materialized = None if declared is None else {str(path) for path in declared}
+    guarded = [
+        (root, path)
+        for root, path in changed
+        if root != CANONICAL_ROOT
+        or path in candidate
+        or materialized is None
+        or path in materialized
+    ]
+    if guarded:
+        raise RuntimeError(_mutation_message(guarded, before, after))
+    return [path for _root, path in changed][:_MAX_CONCURRENT_CHANGES], len(changed)
+
+
 def reproduce_finding(
     spec: ReproductionSpec,
     *,
@@ -326,18 +405,21 @@ def reproduce_finding(
 ) -> dict[str, Any]:
     """Run ``spec`` on the candidate and on its base; return a signed receipt.
 
-    Raises ``RuntimeError`` when the sealed candidate or canonical bytes
-    changed while the spec ran: such a run proves nothing and is never signed.
+    Raises ``RuntimeError`` ``finding_reproduction_sealed_tree_mutated:<json>``,
+    naming each guarded (root, path) and its before/after sha256, when the
+    sealed candidate or guarded canonical bytes changed while the spec ran:
+    such a run proves nothing and is never signed. A canonical change neither
+    side read is recorded as ``concurrent_canonical_changes`` instead.
     """
-    sealed_before = target.sealed_digest()
+    sealed_before = target.sealed_manifest(())
     candidate = _execute(spec, target.create_candidate, target.run, target.cleanup)
     base = (
         _execute(spec, target.create_base, target.run, target.cleanup)
         if target.base_oid
         else _side(UNRUNNABLE, "base_oid_missing")
     )
-    if target.sealed_digest() != sealed_before:
-        raise RuntimeError("finding_reproduction_sealed_tree_mutated")
+    sealed_after = target.sealed_manifest(tuple(sealed_before))
+    concurrent, concurrent_count = _sealed_guard(sealed_before, sealed_after, target)
     receipt = {
         "schema_id": SCHEMA_ID,
         "finding_id": str(finding_id),
@@ -351,6 +433,9 @@ def reproduce_finding(
         "base": base,
         "executed_at": (now or datetime.now(timezone.utc)).isoformat(),
     }
+    if concurrent:
+        receipt["concurrent_canonical_changes"] = concurrent
+        receipt["concurrent_canonical_change_count"] = concurrent_count
     return sign_receipt(receipt, coordinator_key)
 
 
@@ -394,28 +479,45 @@ def dispose_reproducer(
     return _reproduce
 
 
-def sealed_digest(
-    roots: Iterable[Path],
+def _path_sha256(root: Path, relative: str) -> str | None:
+    """sha256 of one regular file beneath ``root``; None when absent or escaping."""
+    path = (root / relative).resolve(strict=False)
+    if (path == root or root in path.parents) and path.is_file():
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    return None
+
+
+def sealed_manifest(
+    roots: Mapping[str, Path],
     paths: Iterable[str],
     *,
-    deltas: Iterable[Callable[[], Iterable[str]]] = (),
-) -> str:
-    """One digest over the path set and exact bytes under every root.
+    deltas: Mapping[str, Iterable[Callable[[], Iterable[str]]]] | None = None,
+    also: Iterable[tuple[str, str]] = (),
+) -> dict[tuple[str, str], str | None]:
+    """Per-(root label, path) sha256 of the exact bytes a reproduction must keep.
 
-    The path set is ``paths`` plus every path each ``deltas`` lister names at
-    call time (a tree's currently-changed paths), and each root hashes every
-    path in it, absent ones included. So a modification or new file anywhere a
-    lister sees in any root changes the digest; nothing else is covered.
+    Every root hashes ``paths``; each root also hashes every path its own
+    ``deltas`` listers name at call time (that tree's currently-changed paths)
+    and every ``also`` key under it -- the previous manifest's keys, so a path
+    that left a delta is re-hashed rather than dropped. Absent paths hash to
+    None; nothing else is covered. An unknown root label raises.
     """
-    relative_set = set(paths)
-    for listed in deltas:
-        relative_set.update(str(path) for path in listed())
-    relative = sorted(relative_set)
-    return hashlib.sha256(
-        "\0".join(
-            _source_revision_sha256(Path(root).resolve(), relative) for root in roots
-        ).encode("ascii")
-    ).hexdigest()
+    wanted = {label: {str(path) for path in paths} for label in roots}
+    for label, listers in (deltas or {}).items():
+        if label not in wanted:
+            raise ValueError(f"sealed_manifest_root_unknown:{label}")
+        for listed in listers:
+            wanted[label].update(str(path) for path in listed())
+    for label, relative in also:
+        if label not in wanted:
+            raise ValueError(f"sealed_manifest_root_unknown:{label}")
+        wanted[label].add(str(relative))
+    manifest: dict[tuple[str, str], str | None] = {}
+    for label, root in roots.items():
+        resolved = Path(root).resolve()
+        for relative in sorted(wanted[label]):
+            manifest[(label, relative)] = _path_sha256(resolved, relative)
+    return manifest
 
 
 def manager_reproducer(
@@ -427,12 +529,21 @@ def manager_reproducer(
     sealed candidate exactly as a reviewer saw it; the base side is a scratch
     workspace pinned to the candidate's ``base_oid`` with the same empty write
     scope, the pattern of ``compare_schema_mypy_baseline``. The sealed-tree
-    guard covers the candidate's changed paths plus the currently-changed
-    paths of the sealed worktree (``worker_workspace.changed_paths``) and of
-    the canonical repo (``_canonical_worktree_delta_paths``), with their bytes
-    in both trees: any new modification outside .gitignore in either tree
-    raises ``finding_reproduction_sealed_tree_mutated``. Nothing is resolved
-    until a spec runs.
+    guard hashes the candidate's changed paths in both trees plus each tree's
+    own currently-changed paths: the sealed worktree's
+    (``worker_workspace.changed_paths``) and the canonical repo's
+    (``_canonical_worktree_delta_paths``). Any new modification outside
+    .gitignore in the sealed worktree, or at a candidate path in either tree,
+    raises ``finding_reproduction_sealed_tree_mutated``; so does a canonical
+    one at a path the candidate side materialized from the canonical working
+    tree. That set is the candidate workspace's ``workspace_baseline`` keys:
+    ``create_quality_review_workspace`` copies its live seed closure, the
+    canonical delta and the read-only inputs from the canonical working tree
+    and baselines every one of them. The base side is pinned to ``base_oid``,
+    which ``create_workspace`` materializes from git objects alone (no live
+    seed, overlay or rework copy), so it adds none. A candidate workspace that
+    was never created or carries no baseline leaves the set unknown, and any
+    canonical change then still raises. Nothing is resolved until a spec runs.
     """
     # Re-bound from the ``process_launcher`` module object at call time, as in
     # :func:`process_launcher_accept_review.accept_review`.
@@ -457,6 +568,7 @@ def manager_reproducer(
             key: value for key, value in dict(card).items() if key != "rework_predecessor"
         }
         tag = uuid.uuid4().hex[:16]
+        materialized: dict[str, frozenset[str] | None] = {}
 
         def _run(workspace: Any, commands: list[str]) -> list[dict[str, Any]]:
             return _pl._run_validations_with_toolchain_receipt(
@@ -466,11 +578,21 @@ def manager_reproducer(
                 **_pl._validation_route_kwargs({"adapter_id": adapter_id}),
             )
 
+        def _create_candidate() -> Any:
+            workspace = _pl.create_quality_review_workspace(
+                source, f"repro_{tag}", candidate_paths, adapter_id, read_only
+            )[0]
+            baseline = getattr(workspace, "workspace_baseline", None)
+            materialized["candidate"] = (
+                frozenset(str(path) for path in baseline)
+                if isinstance(baseline, Mapping)
+                else None
+            )
+            return workspace
+
         return ReproductionTarget(
             base_oid=str(source.base_oid or ""),
-            create_candidate=lambda: _pl.create_quality_review_workspace(
-                source, f"repro_{tag}", candidate_paths, adapter_id, read_only
-            )[0],
+            create_candidate=_create_candidate,
             # The candidate side is a review workspace with no write scope; the
             # base side gets the same, so a spec that writes inside the tree
             # fails (or passes) identically on both and never reads as reproduced.
@@ -486,16 +608,22 @@ def manager_reproducer(
             ),
             cleanup=lambda ws: _pl.cleanup_workspace(ws.repo, ws.path, ws.home),
             run=_run,
-            sealed_digest=lambda: sealed_digest(
-                (source.path, source.repo),
+            sealed_manifest=lambda also: sealed_manifest(
+                {SEALED_ROOT: source.path, CANONICAL_ROOT: source.repo},
                 candidate_paths,
-                deltas=(
-                    lambda: _pl._worker_workspace.changed_paths(source),
-                    lambda: _pl._worker_workspace._canonical_worktree_delta_paths(
-                        source.repo
+                deltas={
+                    SEALED_ROOT: (lambda: _pl._worker_workspace.changed_paths(source),),
+                    CANONICAL_ROOT: (
+                        lambda: _pl._worker_workspace._canonical_worktree_delta_paths(
+                            source.repo
+                        ),
                     ),
-                ),
+                },
+                also=also,
             ),
+            candidate_paths=tuple(candidate_paths),
+            # Absent key (candidate never created): unknown, never empty.
+            canonical_materialized=lambda: materialized.get("candidate"),
         )
 
     return dispose_reproducer(

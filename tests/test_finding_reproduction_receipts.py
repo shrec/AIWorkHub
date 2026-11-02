@@ -172,19 +172,25 @@ class _Trees:
 
     def target(self, spec: fr.ReproductionSpec | None = None) -> fr.ReproductionTarget:
         self.resolved += 1
-        # The production scope: the candidate's changed paths plus both trees'
-        # current deltas, re-listed on every digest.
+        # The production scope: the candidate's changed paths plus each tree's
+        # own current delta, re-listed on every manifest. No materialized set is
+        # declared, so any canonical change still voids the run.
         return fr.ReproductionTarget(
             base_oid=self.base_oid,
             create_candidate=lambda: self._scratch(self.candidate),
             create_base=lambda: self._scratch(self.canonical),
             cleanup=self._cleanup,
             run=self.run,
-            sealed_digest=lambda: fr.sealed_digest(
-                (self.candidate, self.canonical),
+            sealed_manifest=lambda also: fr.sealed_manifest(
+                {fr.SEALED_ROOT: self.candidate, fr.CANONICAL_ROOT: self.canonical},
                 sorted(CHANGED),
-                deltas=(self.candidate_delta, self.canonical_delta),
+                deltas={
+                    fr.SEALED_ROOT: (self.candidate_delta,),
+                    fr.CANONICAL_ROOT: (self.canonical_delta,),
+                },
+                also=also,
             ),
+            candidate_paths=tuple(sorted(CHANGED)),
         )
 
 
