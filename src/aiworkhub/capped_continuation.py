@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import sqlite3
+from pathlib import Path
 from typing import Any, Mapping
 
 from . import core, launch_replay_guard, rework_delta_artifact, task_store, task_templates
@@ -49,6 +51,58 @@ def consumable_predecessor_task_id(card: Mapping[str, Any], task_id: str) -> str
         ).strip():
             return bound
     return task_id
+
+
+def _superseded_into(
+    task_id: str, predecessor: Mapping[str, Any], authority_repo: Path
+) -> str:
+    """The capped card ``predecessor`` is bound to, iff it was superseded into ``task_id``.
+
+    The canonical archive of the capped card is the durable half of the
+    binding: ``core.supersede_task`` records ``superseded_by`` on it, and it
+    still pins the very request and sealed delta the successor inherited.
+    Any other card -- unrelated, superseded elsewhere, or pinning another
+    request or delta -- is not proven, and an unreadable store proves
+    nothing.
+    """
+    owner = str(predecessor.get("task_id") or "").strip()
+    request_id = str(predecessor.get("request_id") or "").strip()
+    digest = continuation_marker(predecessor)["delta_digest"]
+    if not owner or owner == task_id or not request_id or not digest:
+        return ""
+    try:
+        capped = task_store.get_task(authority_repo, owner)
+    except (task_store.TaskStoreError, OSError, sqlite3.Error):
+        return ""
+    pinned = capped.get("rework_predecessor") if isinstance(capped, Mapping) else None
+    if (
+        not isinstance(capped, Mapping)
+        or not isinstance(pinned, Mapping)
+        or str(capped.get("superseded_by") or "").strip() != task_id
+        or continuation_marker(pinned)
+        != {"predecessor_task_id": owner, "predecessor_request_id": request_id, "delta_digest": digest}
+    ):
+        return ""
+    return owner
+
+
+def launch_predecessor_task_id(
+    card: Mapping[str, Any], task_id: str, *, authority_repo: Path
+) -> str:
+    """The single predecessor owner every launch-time packet builder binds to.
+
+    :func:`consumable_predecessor_task_id` when the card's continuation marker
+    vouches for its predecessor.  A successor whose marker is absent or names
+    another request -- one continued before the marker existed, which
+    ``inherit_capped_rework`` can never re-mark -- falls back to the canonical
+    supersede record of the capped card (NF-2026-01961); otherwise the card's
+    own id, so a cross-task predecessor stays refused.
+    """
+    owner = consumable_predecessor_task_id(card, task_id)
+    predecessor = card.get("rework_predecessor")
+    if owner != task_id or not isinstance(predecessor, Mapping):
+        return owner
+    return _superseded_into(task_id, predecessor, authority_repo) or task_id
 
 
 def _task_exists(task_id: str) -> bool:

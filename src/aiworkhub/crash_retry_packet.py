@@ -59,11 +59,15 @@ def materialize_crash_retry_packet(
     ):
         return None, None
     request_id = str(predecessor.get("request_id") or "").strip()
-    predecessor_task_id = str(predecessor.get("task_id") or task_id).strip()
     # Deferred: capped_continuation imports core, which imports the launcher.
-    from .capped_continuation import consumable_predecessor_task_id
+    from .capped_continuation import launch_predecessor_task_id
 
-    owner_task_id = consumable_predecessor_task_id(card, task_id)
+    # One owner for every launch-time builder (NF-2026-01961): the overlay
+    # binds the same id, so a capped-continuation successor matches here.
+    owner_task_id = launch_predecessor_task_id(
+        card, task_id, authority_repo=workspace.repo
+    )
+    predecessor_task_id = str(predecessor.get("task_id") or owner_task_id).strip()
     if (
         not request_id
         or predecessor_task_id != owner_task_id

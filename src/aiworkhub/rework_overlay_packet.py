@@ -111,7 +111,14 @@ def materialize_worker_rework_overlay(
     if not isinstance(predecessor, Mapping):
         raise error_type("rework_overlay_predecessor_missing")
     predecessor_request_id = str(predecessor.get("request_id") or "").strip()
-    predecessor_task_id = str(predecessor.get("task_id") or task_id).strip()
+    # Deferred: capped_continuation imports core, which imports the launcher.
+    from .capped_continuation import launch_predecessor_task_id
+
+    # The crash-retry packet binds this same owner (NF-2026-01961).
+    owner_task_id = launch_predecessor_task_id(
+        card, task_id, authority_repo=workspace.repo
+    )
+    predecessor_task_id = str(predecessor.get("task_id") or owner_task_id).strip()
     hashes = predecessor.get("changed_path_hashes")
     if not predecessor_request_id or not predecessor_task_id or not isinstance(hashes, Mapping):
         raise error_type("rework_overlay_predecessor_invalid")
