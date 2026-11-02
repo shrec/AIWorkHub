@@ -9227,6 +9227,9 @@ def _run_one_validation(
         timed_out = True
         returncode = 124
     except OSError as exc:
+        argv = [str(token) for token in resolution["argv"]]
+        head = (resolution.get("declared_argv") or argv or [""])[0]
+        diagnosis = _validation_spawn_diagnosis(str(head), str(exc))
         _append_audit(
             ctx,
             tool="validation_command",
@@ -9234,7 +9237,7 @@ def _run_one_validation(
             cache_hit=False,
             hit_count=0,
             bytes_returned=0,
-            violation=str(exc)[:160],
+            violation=f"{diagnosis['reason']}:{exc}"[:160],
             authority_source="worker_advisory",
             authority_state="validation_spawn_failed",
         )
@@ -9243,10 +9246,11 @@ def _run_one_validation(
             "command": command,
             "command_sha256": command_sha256,
             "resolved": True,
-            "argv": [str(token) for token in resolution["argv"]],
+            "argv": argv,
             "returncode": None,
             "failure_class": "tool_unavailable",
             "reason": str(exc)[:300],
+            "spawn_diagnosis": diagnosis,
             "unchanged_since_last_run": False,
         }
     duration = round(time.monotonic() - started, 3)
@@ -9419,6 +9423,18 @@ def _run_contained_validations(
     return [receipts[position] for position in selected]
 
 
+def _validation_spawn_diagnosis(declared_head: str, launch_message: str) -> dict[str, Any]:
+    """Typed reason and remedy for one failed validation launch (NF-2026-01936)."""
+    from .validation_spawn_diagnosis import diagnose_validation_spawn_failure
+
+    return diagnose_validation_spawn_failure(
+        declared_head,
+        launch_message,
+        path=os.environ.get("PATH", ""),
+        pathext=os.environ.get("PATHEXT", ""),
+    )
+
+
 def _contained_validation_receipt(
     ctx: WorkerToolContext,
     *,
@@ -9439,6 +9455,12 @@ def _contained_validation_receipt(
     timed_out = bool(row is not None and row.get("timed_out"))
     if row is None or (row.get("returncode") is None and not timed_out):
         reason = str((row or {}).get("launch_error_message") or failure)
+        diagnosis: dict[str, Any] | None = None
+        violation = reason
+        if row is not None:
+            head = (row.get("declared_argv") or row.get("argv") or [""])[0]
+            diagnosis = _validation_spawn_diagnosis(str(head), reason)
+            violation = f"{diagnosis['reason']}:{reason}"
         _append_audit(
             ctx,
             tool="validation_command",
@@ -9446,11 +9468,11 @@ def _contained_validation_receipt(
             cache_hit=False,
             hit_count=0,
             bytes_returned=0,
-            violation=reason[:160],
+            violation=violation[:160],
             authority_source="worker_advisory",
             authority_state="validation_unresolved" if row is None else "validation_spawn_failed",
         )
-        return {
+        failed: dict[str, Any] = {
             "index": index,
             "command": command,
             "command_sha256": command_sha256,
@@ -9460,6 +9482,9 @@ def _contained_validation_receipt(
             "reason": reason[:300],
             "unchanged_since_last_run": False,
         }
+        if diagnosis is not None:
+            failed["spawn_diagnosis"] = diagnosis
+        return failed
     stdout = str(row.get("stdout_tail") or "")
     stderr = str(row.get("stderr_tail") or "")
     text = stdout + ("\n" if stdout and stderr and not stdout.endswith("\n") else "") + stderr
