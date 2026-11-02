@@ -32,7 +32,6 @@ import argparse
 import ast
 import concurrent.futures
 import errno
-import fnmatch
 import hashlib
 import heapq
 import io
@@ -70,6 +69,14 @@ from . import source_graph_languages as sglanguages
 from . import source_graph_lsp as sglsp
 from .sqlite_readonly import connect_readonly
 from .repository_state import HUB_DIRNAME, RepositoryStateError, inspect_repository
+from .tool_guard_hook import (
+    DEFAULT_EXCLUDE_GLOBS as DEFAULT_CONFIG_EXCLUDE_GLOBS,
+    EXCLUDED_DIRS as DEFAULT_EXCLUDE_DIR_NAMES,
+    IndexPolicy,
+    glob_ignored as _glob_ignored,
+    index_admits,
+    under_include_root as _under_include_root,
+)
 from .storage_registry import (
     StorageRegistryError,
     load_storage_registry,
@@ -142,32 +149,9 @@ _INDEXED_EXTENSION_SET = frozenset(
     suffix.casefold() for suffix in sglanguages.INDEXED_EXTENSIONS
 )
 
-DEFAULT_EXCLUDE_DIR_NAMES = frozenset({
-    ".git", "__pycache__", ".venv", "venv", "env", "node_modules",
-    HUB_DIRNAME, ".mypy_cache", ".pytest_cache", ".tox", ".ruff_cache",
-    "dist", "build", "archive", "logs", ".tmp",
-    # CMake writes non-source ``.ts`` timestamp/dependency-tracking files
-    # here (e.g. ``compiler_depend.ts``) -- indexing them as file-level
-    # "typescript" evidence would be a false language label, not truthful
-    # evidence of real JS/TS source.
-    "CMakeFiles",
-    # Ephemeral nested worktrees and editor/agent state, not canonical
-    # source: ``.claude/worktrees/<task>`` holds full nested checkouts of
-    # this same repository (their own ``tools/``, ``scripts/`` trees would
-    # otherwise be indexed a second time per active worktree).
-    ".claude", ".hg", ".svn", ".cache",
-})
-
-# New repository policy files start with only high-confidence generated
-# measurement artifacts excluded.  JSON/XML remain enabled languages and
-# ordinary configuration/data files remain indexable; owners can remove any
-# of these editable globs from ``.aiworkhub/config/source_graph.json``.
-DEFAULT_CONFIG_EXCLUDE_GLOBS: tuple[str, ...] = (
-    "eval/*.json",
-    "eval/**/*.json",
-    "eval/*.jsonl",
-    "eval/**/*.jsonl",
-)
+# ``DEFAULT_EXCLUDE_DIR_NAMES`` and ``DEFAULT_CONFIG_EXCLUDE_GLOBS`` (imported
+# above) are owned by the stdlib-only ``tool_guard_hook``, so the PreToolUse
+# guard decides "indexed" from the same policy this module walks with.
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -1332,22 +1316,6 @@ def update_language_policy(
     return source_graph_policy_view(root)
 
 
-def _glob_ignored(relative_path: str, patterns: tuple[str, ...], *, is_dir: bool = False) -> bool:
-    relative_path = relative_path.strip("/")
-    for pattern in patterns:
-        normalized = pattern.strip().strip("/")
-        if not normalized:
-            continue
-        if fnmatch.fnmatchcase(relative_path, normalized):
-            return True
-        # ``foo/**`` must prune ``foo`` before os.walk descends into it.
-        if is_dir and normalized.endswith("/**"):
-            base = normalized[:-3].rstrip("/")
-            if relative_path == base or relative_path.startswith(f"{base}/"):
-                return True
-    return False
-
-
 def _is_repository_root_generated_data_jsonl(relative_path: str) -> bool:
     rel = relative_path.replace("\\", "/").strip("/")
     return rel.startswith("data/") and rel.casefold().endswith(".jsonl")
@@ -1459,11 +1427,6 @@ def _scan_git_ignored_paths(repo_root: Path) -> _GitIgnoreScan:
     )
 
 
-def _under_include_root(rel: str, roots: tuple[str, ...]) -> bool:
-    """Component-wise prefix test: ``vendor/lib`` does not match ``vendor/library``."""
-    return any(rel == root or rel.startswith(root + "/") for root in roots)
-
-
 def _gitignored_rel(rel: str, scan: _GitIgnoreScan) -> bool:
     ancestor = ""
     for part in rel.split("/")[:-1]:
@@ -1483,7 +1446,10 @@ def iter_source_files(
     )
     out: list[Path] = []
     traversal_errors: list[str] = []
-    indexed_extensions = policy.indexed_extensions
+    # The tool guard decides "indexed" with this same predicate and policy.
+    index_policy = IndexPolicy(
+        policy.exclude_dirs, policy.exclude_globs, policy.include_roots, policy.indexed_extensions,
+    )
 
     def capture_traversal_error(exc: OSError) -> None:
         location = str(exc.filename or repo_root)
@@ -1504,40 +1470,27 @@ def iter_source_files(
     ):
         current_path = Path(current)
         current_rel = "" if current_path == repo_root else current_path.relative_to(repo_root).as_posix()
-        current_covered = current_rel in covered
+        current_covered = gitignore.applied and current_rel in covered
         kept_dirs: list[str] = []
         for dirname in dirnames:
             candidate = current_path / dirname
             rel = candidate.relative_to(repo_root).as_posix()
-            if dirname in policy.exclude_dirs or dirname.endswith(".egg-info"):
+            ignored = current_covered or (gitignore.applied and rel in gitignore.ignored_dirs)
+            if not index_admits(index_policy, rel, is_dir=True, ignored=ignored):
                 continue
             if _is_nested_linked_worktree_dir(repo_root, candidate):
                 continue
-            if _glob_ignored(rel, policy.exclude_globs, is_dir=True):
-                continue
-            if gitignore.applied and (current_covered or rel in gitignore.ignored_dirs):
-                if _under_include_root(rel, include_roots):
-                    pass
-                elif any(root.startswith(rel + "/") for root in include_roots):
-                    covered.add(rel)
-                else:
-                    continue
+            if ignored and not _under_include_root(rel, include_roots):
+                # Open only so the walk reaches an include root below it.
+                covered.add(rel)
             kept_dirs.append(dirname)
         dirnames[:] = sorted(kept_dirs)
         for filename in sorted(filenames):
-            path = current_path / filename
-            if path.suffix.lower() not in indexed_extensions:
+            rel = f"{current_rel}/{filename}" if current_rel else filename
+            ignored = current_covered or (gitignore.applied and rel in gitignore.ignored_files)
+            if not index_admits(index_policy, rel, is_dir=False, ignored=ignored):
                 continue
-            rel = path.relative_to(repo_root).as_posix()
-            if _glob_ignored(rel, policy.exclude_globs):
-                continue
-            if (
-                gitignore.applied
-                and (current_covered or rel in gitignore.ignored_files)
-                and not _under_include_root(rel, include_roots)
-            ):
-                continue
-            out.append(path)
+            out.append(current_path / filename)
     if traversal_errors:
         evidence = "; ".join(traversal_errors[:8])[:2048]
         raise SourceGraphError(f"source_graph_traversal_error:{evidence}")

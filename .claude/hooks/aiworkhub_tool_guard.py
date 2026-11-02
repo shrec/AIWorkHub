@@ -29,6 +29,7 @@ source the semantic editor can take over.
 from __future__ import annotations
 
 import base64
+import fnmatch
 import json
 import os
 import re
@@ -39,17 +40,86 @@ from pathlib import Path
 
 REASON_MAX_CHARS = 400
 REMINDER_MAX_BYTES = 800
-EXCLUDED_DIRS = frozenset(
-    {".git", ".aiworkhub", ".venv", "node_modules", "third_party", "dist", "build"}
+# Source Graph's non-bypassable directory excludes; ``source_graph`` imports
+# them as ``DEFAULT_EXCLUDE_DIR_NAMES``. This module owns them because it can
+# import nothing from ``aiworkhub``.
+EXCLUDED_DIRS = frozenset({
+    ".git", "__pycache__", ".venv", "venv", "env", "node_modules",
+    ".aiworkhub", ".mypy_cache", ".pytest_cache", ".tox", ".ruff_cache",
+    "dist", "build", "archive", "logs", ".tmp",
+    # CMake writes non-source ``.ts`` timestamp/dependency-tracking files
+    # here (e.g. ``compiler_depend.ts``) -- indexing them as file-level
+    # "typescript" evidence would be a false language label, not truthful
+    # evidence of real JS/TS source.
+    "CMakeFiles",
+    # Ephemeral nested worktrees and editor/agent state, not canonical
+    # source: ``.claude/worktrees/<task>`` holds full nested checkouts of
+    # this same repository (their own ``tools/``, ``scripts/`` trees would
+    # otherwise be indexed a second time per active worktree).
+    ".claude", ".hg", ".svn", ".cache",
+})
+# New repository policy files start with only high-confidence generated
+# measurement artifacts excluded.  JSON/XML remain enabled languages and
+# ordinary configuration/data files remain indexable; owners can remove any
+# of these editable globs from ``.aiworkhub/config/source_graph.json``.
+# ``source_graph`` imports them as ``DEFAULT_CONFIG_EXCLUDE_GLOBS``.
+DEFAULT_EXCLUDE_GLOBS: tuple[str, ...] = (
+    "eval/*.json",
+    "eval/**/*.json",
+    "eval/*.jsonl",
+    "eval/**/*.jsonl",
 )
+_POLICY_PARTS = (".aiworkhub", "config", "source_graph.json")
+_POLICY_MAX_BYTES = 64 * 1024
 _WORKTREE_MIRROR_HEAD = (".aiworkhub", "runtime", "worktrees")
 _WORKTREE_ID = re.compile(r"[0-9a-f]{32}")
+# Language id -> extensions, mirroring ``source_graph_languages.LANGUAGE_SPECS``
+# (a test asserts equality). Source Graph indexes the extensions of every
+# language the repository policy does not list in ``disabled_languages``.
+LANGUAGE_EXTENSIONS: dict[str, tuple[str, ...]] = {
+    "python": (".py", ".pyi"),
+    "php": (".php", ".phtml", ".php3", ".php4", ".php5", ".php7", ".php8"),
+    "javascript": (".js", ".jsx", ".mjs", ".cjs"),
+    "typescript": (".ts", ".tsx", ".mts", ".cts"),
+    "cpp": (
+        ".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".ipp", ".inl",
+        ".cu", ".cuh", ".cl", ".metal",
+    ),
+    "csharp": (".cs",),
+    "java": (".java",),
+    "kotlin": (".kt", ".kts"),
+    "scala": (".scala", ".sc"),
+    "go": (".go",),
+    "rust": (".rs",),
+    "swift": (".swift",),
+    "objective_c": (".m", ".mm"),
+    "ruby": (".rb", ".rake", ".gemspec"),
+    "perl": (".pl", ".pm", ".t"),
+    "lua": (".lua",),
+    "r": (".r", ".rmd"),
+    "julia": (".jl",),
+    "dart": (".dart",),
+    "elixir": (".ex", ".exs"),
+    "erlang": (".erl", ".hrl"),
+    "haskell": (".hs", ".lhs"),
+    "clojure": (".clj", ".cljs", ".cljc", ".edn"),
+    "fsharp": (".fs", ".fsi", ".fsx"),
+    "visual_basic": (".vb",),
+    "shell": (".sh", ".bash", ".zsh", ".fish"),
+    "powershell": (".ps1", ".psm1", ".psd1"),
+    "sql": (".sql",),
+    "json": (".json", ".jsonc", ".json5", ".geojson", ".jsonl", ".ndjson"),
+    "yaml": (".yaml", ".yml"),
+    "toml": (".toml",),
+    "xml": (
+        ".xml", ".xsd", ".xsl", ".xslt", ".svg", ".vcxproj", ".filters", ".props",
+        ".targets", ".csproj", ".vbproj", ".fsproj",
+    ),
+    "web": (".html", ".htm", ".css", ".scss", ".sass", ".less", ".vue", ".svelte"),
+    "documentation": (".md", ".markdown", ".mdx"),
+}
 INDEXED_SUFFIXES = frozenset(
-    {
-        ".py", ".pyi", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".md", ".toml",
-        ".yml", ".yaml", ".c", ".h", ".cpp", ".hpp", ".cs", ".go", ".rs", ".java",
-        ".ps1", ".sh", ".css", ".html",
-    }
+    extension for extensions in LANGUAGE_EXTENSIONS.values() for extension in extensions
 )
 _EDIT_EXEMPT_DIRS = frozenset({".git", ".aiworkhub"})
 
@@ -598,6 +668,115 @@ def _git_ignored(path: Path) -> bool:
         return False
 
 
+class IndexPolicy:
+    """The Source Graph policy fields that decide whether a path is indexed."""
+
+    __slots__ = ("exclude_dirs", "exclude_globs", "include_roots", "indexed_extensions")
+
+    def __init__(
+        self,
+        exclude_dirs: frozenset[str],
+        exclude_globs: tuple[str, ...],
+        include_roots: tuple[str, ...],
+        indexed_extensions: frozenset[str],
+    ) -> None:
+        self.exclude_dirs = exclude_dirs
+        self.exclude_globs = exclude_globs
+        self.include_roots = include_roots
+        self.indexed_extensions = indexed_extensions
+
+
+def glob_ignored(relative_path: str, patterns: tuple[str, ...], *, is_dir: bool = False) -> bool:
+    relative_path = relative_path.strip("/")
+    for pattern in patterns:
+        normalized = pattern.strip().strip("/")
+        if not normalized:
+            continue
+        if fnmatch.fnmatchcase(relative_path, normalized):
+            return True
+        # ``foo/**`` must prune ``foo`` before os.walk descends into it.
+        if is_dir and normalized.endswith("/**"):
+            base = normalized[:-3].rstrip("/")
+            if relative_path == base or relative_path.startswith(f"{base}/"):
+                return True
+    return False
+
+
+def under_include_root(rel: str, roots: tuple[str, ...]) -> bool:
+    """Component-wise prefix test: ``vendor/lib`` does not match ``vendor/library``."""
+    return any(rel == root or rel.startswith(root + "/") for root in roots)
+
+
+def index_admits(policy: IndexPolicy, rel: str, *, is_dir: bool, ignored: bool) -> bool:
+    """The one indexed-path predicate Source Graph and this guard share.
+
+    ``rel`` is repository-relative POSIX. Only its last component and the whole
+    path are judged, so the caller admits every ancestor first: ``os.walk``
+    pruning does that for ``source_graph.iter_source_files``. ``ignored`` says
+    git ignores ``rel`` or an ancestor; an include root re-admits it, and a
+    directory above an include root stays open so the walk can reach it.
+    """
+
+    name = rel.rpartition("/")[2]
+    if is_dir:
+        if name in policy.exclude_dirs or name.endswith(".egg-info"):
+            return False
+        if glob_ignored(rel, policy.exclude_globs, is_dir=True):
+            return False
+    else:
+        # ``PurePath.suffix``, without building a path per walked file.
+        dot = name.rfind(".")
+        suffix = name[dot:] if 0 < dot < len(name) - 1 else ""
+        if suffix.lower() not in policy.indexed_extensions:
+            return False
+        if glob_ignored(rel, policy.exclude_globs):
+            return False
+    if not ignored or under_include_root(rel, policy.include_roots):
+        return True
+    return is_dir and any(root.startswith(rel + "/") for root in policy.include_roots)
+
+
+def load_index_policy(root: Path) -> IndexPolicy:
+    """Read Source Graph's repository policy file for the guard.
+
+    ``source_graph.load_ignore_policy`` validates the same file and refuses a
+    malformed one, indexing nothing. The guard never refuses, so an absent or
+    malformed file leaves the default policy guarded.
+    """
+
+    default = IndexPolicy(EXCLUDED_DIRS, DEFAULT_EXCLUDE_GLOBS, (), INDEXED_SUFFIXES)
+    try:
+        path = root.joinpath(*_POLICY_PARTS)
+        if not path.is_file() or path.stat().st_size > _POLICY_MAX_BYTES:
+            return default
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        fields = [
+            payload.get(key, [])
+            for key in ("exclude_dirs", "exclude_globs", "include_roots", "disabled_languages")
+        ]
+    except (OSError, ValueError, AttributeError):
+        return default
+    if not all(
+        isinstance(field, list) and all(isinstance(item, str) and item.strip() for item in field)
+        for field in fields
+    ):
+        return default
+    dirs, globs, roots, disabled = ([item.strip().replace("\\", "/") for item in field] for field in fields)
+    if not set(disabled) <= LANGUAGE_EXTENSIONS.keys():
+        return default
+    return IndexPolicy(
+        EXCLUDED_DIRS | frozenset(dirs),
+        tuple(dict.fromkeys(globs)),
+        tuple(dict.fromkeys(item.rstrip("/") for item in roots)),
+        frozenset(
+            extension
+            for language, extensions in LANGUAGE_EXTENSIONS.items()
+            if language not in disabled
+            for extension in extensions
+        ),
+    )
+
+
 def _worktree_mirror(parts: tuple[str, ...]) -> tuple[tuple[str, ...], str] | None:
     """HEAD + 32 lowercase hex + ``worktree`` + rest, else None.
 
@@ -618,13 +797,14 @@ def _worktree_mirror(parts: tuple[str, ...]) -> tuple[tuple[str, ...], str] | No
 class _Context:
     """Resolve operands against the repository root and the current directory."""
 
-    def __init__(self, root: Path, cwd: Path, dialect: str) -> None:
+    def __init__(self, root: Path, cwd: Path, dialect: str, policy: IndexPolicy) -> None:
         self.root = root
         self.cwd = cwd
         self.dialect = dialect
+        self.policy = policy
 
     def fork(self, dialect: str | None = None) -> _Context:
-        return _Context(self.root, self.cwd, dialect or self.dialect)
+        return _Context(self.root, self.cwd, dialect or self.dialect, self.policy)
 
     def moved(self, operand: str) -> _Context:
         scope = self.fork()
@@ -664,13 +844,25 @@ class _Context:
         except ValueError:
             return None
 
-    def indexed_rel(self, path: Path | None) -> str | None:
+    def indexed_rel(self, path: Path | None, is_dir: bool = True) -> str | None:
         parts = self.inside(path)
-        if parts is None:
+        if path is None or parts is None:
             return None
         mirror = _worktree_mirror(parts)
         classified = mirror[0] if mirror is not None else parts
-        if any(part.lower() in EXCLUDED_DIRS for part in classified):
+        if classified:
+            policy = self.policy
+            for depth in range(1, len(classified)):
+                if not index_admits(policy, "/".join(classified[:depth]), is_dir=True, ignored=False):
+                    return None
+            rel = "/".join(classified)
+            if not index_admits(policy, rel, is_dir=is_dir, ignored=False):
+                return None
+            # git is asked only when its answer can change the verdict; it
+            # reports a path below an ignored directory as ignored too.
+            if not index_admits(policy, rel, is_dir=is_dir, ignored=True) and _git_ignored(path):
+                return None
+        elif not is_dir:
             return None
         # Keep the denied path so the reason derives this worktree, not a cell.
         return "/".join(parts) or "."
@@ -678,15 +870,7 @@ class _Context:
     def indexed_file(self, operand: str, glob: bool = True) -> str | None:
         if glob and _GLOB.search(operand):
             return self.indexed_glob(operand)
-        path = self.path(operand)
-        rel = self.indexed_rel(path)
-        if path is None or rel is None or rel == ".":
-            return None
-        if path.suffix.lower() not in INDEXED_SUFFIXES:
-            return None
-        if _git_ignored(path):
-            return None
-        return rel
+        return self.indexed_rel(self.path(operand), is_dir=False)
 
     def indexed_dir(self, operand: str) -> str | None:
         if _GLOB.search(operand):
@@ -706,11 +890,12 @@ class _Context:
         base = self.path("/".join(parts[:first]) or ("/" if text.startswith("/") else "."))
         rel = self.indexed_rel(base)
         tail = parts[first:]
-        if base is None or rel is None or any(part.lower() in EXCLUDED_DIRS for part in tail):
+        excluded = self.policy.exclude_dirs
+        if base is None or rel is None or any(part in excluded for part in tail):
             return None
         suffix = _SUFFIX.search(tail[-1])
         if suffix is not None:
-            if "." + suffix.group(1).lower() not in INDEXED_SUFFIXES:
+            if "." + suffix.group(1).lower() not in self.policy.indexed_extensions:
                 return None
         elif not base.is_dir():
             return None
@@ -1131,8 +1316,8 @@ def _program_verdict(ctx: _Context, program: str) -> tuple[str, str, str] | None
         text = literal.replace("\\\\", "/").replace("\\", "/")
         if reads:
             path = ctx.path(text)
-            if path is not None and path.suffix.lower() in INDEXED_SUFFIXES and path.is_file():
-                target = ctx.indexed_rel(path)
+            if path is not None and path.is_file():
+                target = ctx.indexed_rel(path, is_dir=False)
                 if target:
                     return ("R4", target, "")
         # Only glob() expands a wildcard: listdir, scandir, walk, iterdir and readdir
@@ -1369,7 +1554,8 @@ def _evaluate(
     if isinstance(cwd, (str, Path)) and str(cwd).strip():
         where = Path(os.path.realpath(base / cwd))
     dialect = "pwsh" if tool_name == "PowerShell" else "bash"
-    verdict = _tool_verdict(_Context(base, where, dialect), tool_name, tool_input)
+    ctx = _Context(base, where, dialect, load_index_policy(base))
+    verdict = _tool_verdict(ctx, tool_name, tool_input)
     if verdict is None:
         return None
     rule, target, detail = verdict
@@ -1456,13 +1642,19 @@ def main(argv: list[str] | None = None) -> int:
 
 
 __all__ = [
+    "DEFAULT_EXCLUDE_GLOBS",
     "EXCLUDED_DIRS",
     "INDEXED_SUFFIXES",
+    "IndexPolicy",
     "REASON_MAX_CHARS",
     "REMINDER",
     "REMINDER_MAX_BYTES",
     "decide",
+    "glob_ignored",
+    "index_admits",
+    "load_index_policy",
     "main",
+    "under_include_root",
 ]
 
 
