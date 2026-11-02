@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import hashlib
+import shutil
 import sqlite3
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +15,16 @@ import pytest
 
 from aiworkhub import storage_retention, task_store, worker_workspace, worktree_storage
 from support.retention import git, repository
+
+
+@pytest.fixture
+def short_tmp():
+    # The sandbox pytest temp root is so deep that tmp_path-derived union
+    # worktree paths exceed git's path limit ("$GIT_DIR too big"); use a
+    # shallow temp dir instead.
+    path = Path(tempfile.mkdtemp(prefix="lu", dir=tempfile.gettempdir()))
+    yield path
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def _record_card(repo: Path, source_id: str, status: str) -> None:
@@ -36,9 +48,9 @@ def _record_card(repo: Path, source_id: str, status: str) -> None:
 
 @pytest.mark.parametrize("source_id", ["379047b3e889423c95ad42f97dfb2fe0", "a" * 90])
 def test_live_combined_validation_union_survives_over_cap_cleanup(
-    tmp_path: Path, monkeypatch, source_id: str
+    short_tmp: Path, monkeypatch, source_id: str
 ) -> None:
-    roots = repository(tmp_path)
+    roots = repository(short_tmp)
     repo, base = roots["repo"], roots["base"]
     union_id = (
         f"union2_{hashlib.sha256(source_id.encode()).hexdigest()[:32]}_"
@@ -97,9 +109,9 @@ def test_partial_preview_never_names_a_live_combined_union() -> None:
 
 
 def test_union_of_finished_source_not_pinned_by_matching_prefix(
-    tmp_path: Path, monkeypatch
+    short_tmp: Path, monkeypatch
 ) -> None:
-    roots = repository(tmp_path)
+    roots = repository(short_tmp)
     repo, base = roots["repo"], roots["base"]
     common_prefix = "a" * 70
     finished_id = common_prefix + "finished"

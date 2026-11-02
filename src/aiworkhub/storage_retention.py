@@ -17,6 +17,7 @@ artifacts directly and quarantines nothing. Quarantine stays the manual tool.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import hmac
 import json
@@ -3119,6 +3120,280 @@ def _janitor_scratch(root: Path, now: float) -> dict[str, Any]:
     }
 
 
+# The reviewer's candidate Source Graph overlay. Its single writer is
+# ``worker_ai_tools_mcp`` (``candidate_source_graph_<packet_sha256[:16]>.sqlite``
+# beside the review packet); this pattern only RECOGNISES that name for reclaim.
+_CANDIDATE_OVERLAY_NAME = re.compile(r"candidate_source_graph_[0-9a-f]{16}\.sqlite")
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+# Bounds on one runtime home's walk and on the per-entry skip report.
+_BASE_PIN_SCAN_MAX_ENTRIES = 50_000
+_BASE_PIN_SKIP_REPORT_LIMIT = 200
+
+
+def _is_base_pin_artifact(name: str) -> bool:
+    """A base pin or candidate overlay, or one of its SQLite sidecars."""
+    from .source_graph_partition import _BASE_PIN_NAME  # local import: cycle-safe
+
+    for suffix in _SQLITE_SIDECAR_SUFFIXES:
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return bool(_BASE_PIN_NAME.fullmatch(name) or _CANDIDATE_OVERLAY_NAME.fullmatch(name))
+
+
+def _reclaim_home_base_pins(home: Path) -> dict[str, Any]:
+    """Delete every base pin / candidate overlay under one runtime home.
+
+    Never follows a symlink or junction; the walk is bounded by
+    ``_BASE_PIN_SCAN_MAX_ENTRIES`` and reports ``scan_truncated`` when cut.
+    A file that cannot be deleted (e.g. still open on Windows) is an error
+    entry, never a silent skip.
+    """
+    removed = 0
+    reclaimed = 0
+    seen = 0
+    truncated = False
+    errors: list[str] = []
+    stack = [home]
+    while stack and not truncated:
+        directory = stack.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            code = errno.errorcode.get(exc.errno or 0, type(exc).__name__)
+            errors.append(f"scan_failed:{directory.name}:{code}")
+            continue
+        for entry in entries:
+            seen += 1
+            if seen > _BASE_PIN_SCAN_MAX_ENTRIES:
+                truncated = True
+                break
+            try:
+                if entry.is_symlink() or getattr(entry, "is_junction", lambda: False)():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(Path(entry.path))
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                if not _is_base_pin_artifact(entry.name):
+                    continue
+                # os.lstat, not DirEntry.stat: on Windows the latter reports
+                # st_nlink 0. A hard-linked pin frees no disk when unlinked.
+                pin_stat = os.lstat(entry.path)
+                size = int(pin_stat.st_size) if pin_stat.st_nlink <= 1 else 0
+                os.unlink(entry.path)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                code = errno.errorcode.get(exc.errno or 0, type(exc).__name__)
+                errors.append(f"delete_failed:{entry.name}:{code}")
+                continue
+            removed += 1
+            reclaimed += size
+    return {
+        "removed": removed,
+        "bytes": reclaimed,
+        "errors": errors,
+        "scan_truncated": truncated,
+    }
+
+
+def _reclaim_terminal_base_pins(
+    latest: Mapping[str, Mapping[str, Any]],
+    *,
+    terminal_states: frozenset[str] | set[str],
+    active: set[str],
+    protected: Mapping[str, str],
+    verified: bool,
+    process_dead: Callable[[Mapping[str, Any]], bool],
+    reviewers_running: Callable[[str, str], bool],
+    home_of: Callable[[str, Mapping[str, Any]], Path | str | None],
+) -> dict[str, Any]:
+    """Reclaim Source Graph pins/overlays of terminal requests (NF-2026-01931).
+
+    A request's runtime home loses its ``.sg-base-pin.*.sqlite`` and
+    ``candidate_source_graph_*.sqlite`` files (with sidecars) only when every
+    existing decision agrees nothing reads them any more, checked in order and
+    each skip named:
+
+    * ``protection_unverified`` -- :func:`_protected_attempt_ids` could not
+      read task lineage, so nothing is reclaimed (fail closed);
+    * ``review_ready`` -- the manager candidate overlay and reviewer prewarm
+      read it;
+    * ``process_alive`` -- the launcher's liveness rule (``active``) or the
+      pid/start-tick proof (``process_dead``) does not show it dead;
+    * ``process_not_terminal:<state>`` -- not a GC-candidate process state;
+    * a :func:`_protected_attempt_ids` reason (``live_worker``,
+      ``rework_predecessor_retained``, ``blocked_terminal_candidate_retained``);
+    * ``reviewer_running`` / ``reviewer_state_unknown`` -- a reviewer child
+      sealed to this request is still live, or its liveness is unreadable;
+    * ``home_of`` refusals (``metadata_invalid``, ``workspace_identity_mismatch``,
+      ``unsafe_workspace_shape``...). A home that no longer exists needs no
+      reclaim and is only counted as ``home_absent``.
+    """
+    result: dict[str, Any] = {
+        "ok": True,
+        "scanned": 0,
+        "reclaimed_requests": 0,
+        "removed": 0,
+        "bytes": 0,
+        "home_absent": 0,
+        "skipped": [],
+        "skipped_by_reason": {},
+        "skipped_truncated": False,
+        "errors": [],
+    }
+    if not verified:
+        result["refused"] = "protection_unverified"
+
+    def skip(request_id: str, reason: str) -> None:
+        counts = result["skipped_by_reason"]
+        counts[reason] = counts.get(reason, 0) + 1
+        if len(result["skipped"]) < _BASE_PIN_SKIP_REPORT_LIMIT:
+            result["skipped"].append({"request_id": request_id, "reason": reason})
+        else:
+            result["skipped_truncated"] = True
+
+    for request_id in sorted(latest):
+        event = latest[request_id]
+        if not isinstance(event, Mapping):
+            continue
+        result["scanned"] += 1
+        state = str(event.get("state") or "")
+        if not verified:
+            skip(request_id, "protection_unverified")
+            continue
+        if state == "review_ready":
+            skip(request_id, "review_ready")
+            continue
+        if request_id in active:
+            skip(request_id, "process_alive")
+            continue
+        if state not in terminal_states:
+            skip(request_id, f"process_not_terminal:{state or 'unknown'}"[:80])
+            continue
+        protected_reason = protected.get(request_id)
+        if protected_reason:
+            skip(request_id, protected_reason)
+            continue
+        try:
+            running = reviewers_running(str(event.get("task_id") or ""), request_id)
+        except Exception:  # noqa: BLE001 -- unknown liveness is never "not running"
+            skip(request_id, "reviewer_state_unknown")
+            continue
+        if running:
+            skip(request_id, "reviewer_running")
+            continue
+        try:
+            dead = bool(process_dead(event))
+        except Exception:  # noqa: BLE001 -- an unprovable death keeps the files
+            dead = False
+        if not dead:
+            skip(request_id, "process_alive")
+            continue
+        try:
+            home = home_of(request_id, event)
+        except OSError:  # an unreadable home keeps its files; the sweep goes on
+            skip(request_id, "home_unreadable")
+            continue
+        if home is None:
+            result["home_absent"] += 1
+            continue
+        if isinstance(home, str):
+            skip(request_id, home)
+            continue
+        outcome = _reclaim_home_base_pins(home)
+        if outcome["removed"]:
+            result["reclaimed_requests"] += 1
+        result["removed"] += outcome["removed"]
+        result["bytes"] += outcome["bytes"]
+        if outcome["scan_truncated"]:
+            result["errors"].append(f"scan_truncated:{request_id}")
+        result["errors"].extend(
+            f"{request_id}:{error}" for error in outcome["errors"]
+        )
+    result["errors"] = result["errors"][:_BASE_PIN_SKIP_REPORT_LIMIT]
+    result["ok"] = not result["errors"]
+    return result
+
+
+def _janitor_base_pins(root: Path) -> dict[str, Any]:
+    """Janitor step: reclaim pins/overlays of terminal, unread requests.
+
+    Every decision is the launcher's or this module's existing one: the GC's
+    candidate process states, ``_active_request_ids`` and
+    ``_process_proven_dead`` for liveness, ``_live_lens_reviewers`` for
+    reviewer children, :func:`_protected_attempt_ids` for card protection and
+    ``assert_gc_safe_workspace_shape`` for the home it walks.
+    """
+    from . import process_launcher  # local import: cycle-safe
+
+    manager = process_launcher.ProcessManager(repo=root)
+    if not manager.process_log_path.exists():
+        return _reclaim_terminal_base_pins(
+            {}, terminal_states=frozenset(), active=set(), protected={},
+            verified=True, process_dead=lambda _e: False,
+            reviewers_running=lambda _t, _r: True, home_of=lambda _r, _e: None,
+        )
+    latest = manager._latest_by_request()
+    active = manager._active_request_ids(latest)
+    protected, verified, _pinned, _terminal, _unfinished = _protected_attempt_ids(root)
+
+    def process_dead(event: Mapping[str, Any]) -> bool:
+        return bool(process_launcher._process_proven_dead(
+            int(event.get("pid") or 0), event.get("pid_start_ticks")
+        ))
+
+    def reviewers_running(task_id: str, request_id: str) -> bool:
+        return bool(manager._live_lens_reviewers(latest, task_id, request_id))
+
+    def home_of(request_id: str, event: Mapping[str, Any]) -> Path | str | None:
+        metadata_raw = event.get("metadata_path")
+        # The request record lives apart from the home: its absence proves
+        # nothing about the home, so it is a named skip, never home_absent.
+        if not metadata_raw:
+            return "metadata_missing"
+        metadata_path = Path(str(metadata_raw))
+        if not metadata_path.is_file():
+            return "metadata_missing"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            workspace_meta = metadata["workspace"]
+            repo = Path(str(workspace_meta["repo"]))
+            path = Path(str(workspace_meta["path"]))
+            home = Path(str(workspace_meta["home"]))
+            meta_request_id = str(workspace_meta["request_id"])
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return "metadata_invalid"
+        if meta_request_id != request_id or repo.resolve() != root:
+            return "workspace_identity_mismatch"
+        if home.is_symlink():
+            return "unsafe_workspace_shape"
+        if not home.is_dir():
+            return None
+        try:
+            process_launcher.assert_gc_safe_workspace_shape(
+                meta_request_id, path, home, repo=repo
+            )
+        except (KeyError, TypeError, ValueError, WorkspaceError):
+            return "unsafe_workspace_shape"
+        return home
+
+    return _reclaim_terminal_base_pins(
+        latest,
+        terminal_states=process_launcher.GC_CANDIDATE_PROCESS_STATES,
+        active=active,
+        protected=protected,
+        verified=verified,
+        process_dead=process_dead,
+        reviewers_running=reviewers_running,
+        home_of=home_of,
+    )
+
+
 def _run_repository_cleanup(
     repo_root: Path | str, *, base: Path | None = None, now: float
 ) -> dict[str, Any]:
@@ -3138,6 +3413,7 @@ def _run_repository_cleanup(
     result: dict[str, Any] = {"ok": True, "needfix": [], "next_deadline": None}
     steps: tuple[tuple[str, Callable[[], Any]], ...] = (
         ("worktrees", lambda: _janitor_worktrees(root)),
+        ("base_pins", lambda: _janitor_base_pins(root)),
         ("rework_deltas", lambda: _prune_decided_rework_deltas(root, now)),
         ("logs", lambda: _janitor_logs(root)),
         ("unattributed", lambda: _janitor_unattributed(root, worktree_base, now)),

@@ -758,6 +758,10 @@ def write_composed_marker(
             "schema_id": BASE_PIN_SCHEMA_ID,
             "status": "pinned",
             "name": name,
+            # Why this pin is a full byte copy rather than a hard link: the
+            # errno ``_link_base_pin`` returned (NF-2026-01931). The policy is
+            # unchanged; the receipt only names the cause.
+            "link_fallback": {"mode": "copy", "reason": unsupported},
         }
         base_info.clear()
         base_info.update(

@@ -157,6 +157,7 @@ def test_cleanup_result_reports_every_janitor_step(monkeypatch, tmp_path: Path) 
         "needfix",
         "next_deadline",
         "worktrees",
+        "base_pins",
         "rework_deltas",
         "logs",
         "unattributed",
