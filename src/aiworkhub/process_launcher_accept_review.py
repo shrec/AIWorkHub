@@ -4227,6 +4227,24 @@ def accept_review(
             promoted = self._promote_accepted_candidate(
                 workspace, changed, merged_hashes=combined_tree.get("merged_paths")
             )
+        except WorkspaceError as exc:
+            if correction_originals:
+                _restore_correction_originals(workspace, correction_originals)
+            # NF-2026-01960: a pre-write promotion conflict answers with the
+            # full error and its {path, expected/observed/candidate sha256}
+            # entries instead of a bare state name; nothing was written, so the
+            # task stays in review. Any other error propagates unchanged.
+            from .promotion_conflict_detail import promotion_conflict_reply
+
+            conflict_reply = promotion_conflict_reply(str(exc))
+            if conflict_reply is None:
+                raise
+            return {
+                "ok": False,
+                **conflict_reply,
+                "request_id": request_id,
+                "task_id": task_id,
+            }
         except BaseException:
             if correction_originals:
                 _restore_correction_originals(workspace, correction_originals)

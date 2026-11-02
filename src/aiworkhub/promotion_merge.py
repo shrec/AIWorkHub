@@ -28,6 +28,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from .promotion_conflict_detail import conflict_detail
 from .worker_workspace import (
     WorkerWorkspace,
     WorkspaceError,
@@ -202,7 +203,12 @@ def plan_merges(
         if returncode is None:
             continue
         if returncode != 0:
-            raise WorkspaceError(f"promotion_merge_conflict:{rel}:conflicts={returncode}")
+            raise WorkspaceError(
+                f"promotion_merge_conflict:{rel}:conflicts={returncode}"
+                + conflict_detail(
+                    workspace.parent_baseline.get(rel), canonical_hash, candidate_hash
+                )
+            )
         merges[rel] = merged_bytes
         if observed is not None:
             observed[rel] = canonical_hash
@@ -258,7 +264,12 @@ def promote_merged(
             # snapshot parent bytes into merge-file if promotions race that tightly.
             current_parent = _hash_path(workspace.repo / rel)
             if current_parent != observed[rel]:
-                raise WorkspaceError(f"promotion_merge_parent_changed:{rel}")
+                raise WorkspaceError(
+                    f"promotion_merge_parent_changed:{rel}"
+                    + conflict_detail(
+                        observed[rel], current_parent, _hash_path(source / rel)
+                    )
+                )
             parent_baseline[rel] = current_parent
         return promote_fn(
             replace(workspace, path=tmp, parent_baseline=parent_baseline),

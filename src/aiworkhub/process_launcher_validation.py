@@ -13,6 +13,7 @@ from threading import Lock
 from typing import Any, Callable, Iterable, Mapping
 
 from . import quality_evidence, terminal_failure_classification, validation_runner
+from .promotion_conflict_detail import PROMOTION_CONFLICT_PREFIXES
 from . import toolchain_authority as _toolchain_authority
 from . import worker_workspace as _worker_workspace
 from .worker_workspace import (
@@ -1124,7 +1125,8 @@ def terminal_state_for_workspace_error(exc: WorkspaceError) -> str:
     if error.startswith(validation_failures):
         return "validation_failed"
     # promotion_merge_* errors (conflict / changed since validation / parent changed) are promotion conflicts (NF-2026-01381).
-    if error.startswith(("parent_changed", "promotion_scope", "promotion_merge")):
+    # The full text, with its NF-2026-01960 sha256 tail, stays on the error; only the prefix is typed here.
+    if error.startswith(PROMOTION_CONFLICT_PREFIXES):
         return "promotion_conflict"
     if error.startswith(VALIDATION_ENVIRONMENT_RESTRICTION_PREFIXES):
         return "finalize_failed"

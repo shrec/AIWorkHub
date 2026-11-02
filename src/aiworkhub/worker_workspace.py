@@ -6925,6 +6925,7 @@ def promote(workspace: WorkerWorkspace, changed: Iterable[str]) -> list[str]:
     attribute (Windows only) since it already passed the scope and hash
     preflight above.
     """
+    from .promotion_conflict_detail import conflict_detail  # NF-2026-01960
     from .promotion_write import (
         PromotionWriteError,
         make_temp_sibling,
@@ -6944,7 +6945,8 @@ def promote(workspace: WorkerWorkspace, changed: Iterable[str]) -> list[str]:
         source_hash = _hash_path(workspace.path / relative)
         desired[relative] = source_hash
         if current not in {expected, source_hash}:
-            raise WorkspaceError(f"parent_changed_since_launch:{relative}")
+            raise WorkspaceError(f"parent_changed_since_launch:{relative}"
+                                 + conflict_detail(expected, current, source_hash))
 
     # Mark the parent-tree write window so a concurrent ``create_workspace``
     # refuses to seed rather than capturing a half-promoted, inconsistent tree.
@@ -6960,7 +6962,8 @@ def promote(workspace: WorkerWorkspace, changed: Iterable[str]) -> list[str]:
                 promoted.append(relative)
                 continue
             if current != expected:
-                raise WorkspaceError(f"parent_changed_during_promotion:{relative}")
+                raise WorkspaceError(f"parent_changed_during_promotion:{relative}"
+                                     + conflict_detail(expected, current, desired[relative]))
             if not source.exists() and not source.is_symlink():
                 if parent.exists() or parent.is_symlink():
                     run_destination_write_retrying(relative, "unlink", parent, parent.unlink)
