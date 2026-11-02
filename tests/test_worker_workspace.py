@@ -652,6 +652,9 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "repository_state.py",
         "storage_registry.py",
         "windows_appcontainer.py",
+        # worker_workspace relays owner-session AppContainer validations through
+        # this sibling (NF-2026-01154), so the seed closure resolves it too.
+        "windows_private_session.py",
         "windows_job_structures.py",
         # platform_io's relative import of windows_mxc is repository-local.
         # The seed closure fails closed when the sibling is absent.
