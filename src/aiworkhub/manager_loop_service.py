@@ -787,6 +787,7 @@ def status(repo: str | Path) -> dict[str, Any]:
             for item in pending
         ],
         "last_turn": entry.last_turn,
+        "thinking_display": entry.orchestrator.thinking_display,
         "wake": _wake_status(entry),
     }
 

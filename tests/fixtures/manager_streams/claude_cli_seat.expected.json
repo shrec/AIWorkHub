@@ -105,6 +105,7 @@
  },
  {
   "payload": {
+   "reasoning_redacted": 2,
    "usage": {
     "cache_read": 119520,
     "cache_write": 40378,

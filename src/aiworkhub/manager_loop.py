@@ -844,6 +844,11 @@ class ManagerOrchestrator:
         return self._session
 
     @property
+    def thinking_display(self) -> dict[str, Any] | None:
+        """The live backend's ``--thinking-display`` state, or ``None`` with no backend or no probe yet."""
+        return getattr(self._backend, "thinking_display", None)
+
+    @property
     def bound(self) -> bool:
         """Whether the active session has its backend; one loaded from disk has none yet."""
         return self._session is not None and self._backend is not None

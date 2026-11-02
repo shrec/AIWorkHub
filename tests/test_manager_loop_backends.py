@@ -1260,7 +1260,7 @@ def _replay_cli_script(tmp_path: Path) -> Path:
 
 
 def test_a_claude_turn_retries_once_when_the_cli_rejects_thinking_display(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(mlb, "_CLAUDE_THINKING_DISPLAY_REJECTED", False)
+    monkeypatch.setattr(mlb, "_THINKING_DISPLAY_REJECTIONS", {})
     monkeypatch.setattr(
         mlb.cli_model_discovery,
         "record_claude_resolution",
@@ -1300,13 +1300,17 @@ def test_a_claude_turn_retries_once_when_the_cli_rejects_thinking_display(tmp_pa
     assert "--thinking-display" not in calls[1]
     assert "--include-partial-messages" in calls[1]
     assert events and all(event["type"] != "error" for event in events)
-    assert "--thinking-display" not in mlb.manager_stream_tokens("claude_cli")
-    assert "--include-partial-messages" in mlb.manager_stream_tokens("claude_cli")
+    # NF-2026-01977: the rejection is scoped to the binary that refused the flag.
+    identity = mlb.cli_identity(calls[0][0])
+    assert "--thinking-display" not in mlb.manager_stream_tokens("claude_cli", identity=identity)
+    assert "--include-partial-messages" in mlb.manager_stream_tokens("claude_cli", identity=identity)
+    assert "--thinking-display" in mlb.manager_stream_tokens("claude_cli")
+    assert events[-1]["payload"]["thinking_display"]["state"] == "rejected"
     cli.close()
 
 
 def test_a_claude_turn_with_unrelated_nonzero_exit_keeps_the_error_path(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(mlb, "_CLAUDE_THINKING_DISPLAY_REJECTED", False)
+    monkeypatch.setattr(mlb, "_THINKING_DISPLAY_REJECTIONS", {})
     monkeypatch.setattr(
         mlb.cli_model_discovery,
         "record_claude_resolution",
@@ -1344,4 +1348,4 @@ def test_a_claude_turn_with_unrelated_nonzero_exit_keeps_the_error_path(tmp_path
     assert len(calls) == 1
     errors = [event for event in events if event["type"] == "error"]
     assert len(errors) == 1
-    assert "--thinking-display" in mlb.manager_stream_tokens("claude_cli")
+    assert "--thinking-display" in mlb.manager_stream_tokens("claude_cli", identity=mlb.cli_identity(calls[0][0]))

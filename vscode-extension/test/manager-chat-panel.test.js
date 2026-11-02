@@ -2454,3 +2454,168 @@ test("typing ends history browsing", () => {
   trigger(harness.elements.managerChatInput, "keydown", { key: "ArrowUp" });
   assert.equal(harness.elements.managerChatInput.value, "only sent!", "a typed draft is not replaced");
 });
+
+// ── NF-2026-01977: optimistic echo and hidden-thinking note ───────────────
+function transcriptText(harness) {
+  return flattenNodes(harness.elements.managerChatTranscript, []).map((part) => String(part.textContent || "")).join("\n");
+}
+
+function submitManagerChat(harness, text) {
+  harness.elements.managerChatBackendSelect.value = "codex_cli";
+  harness.elements.managerChatModelInput.value = "gpt-x";
+  harness.elements.managerChatInput.value = text;
+  trigger(harness.elements.managerChatComposer, "submit");
+}
+
+test("a submit renders the user turn before any poll and the polled turn replaces it", () => {
+  const harness = loadWebviewSlice();
+  const session = "mls-" + "a".repeat(32);
+  harness.state.managerChatSession = session;
+  submitManagerChat(harness, "echo me");
+
+  assert.equal(harness.posts.filter((post) => post.type === "managerLoopEvents").length, 0, "no poll has run yet");
+  const echoes = harness.state.managerChatEvents.filter((event) => event.type === "user_message");
+  assert.equal(echoes.length, 1);
+  assert.equal(echoes[0].local, "pending");
+  assert.equal(echoes[0].payload.pending, true);
+  assert.equal(echoes[0].payload.client_id, harness.state.managerChatPendingSends[0].clientId);
+  assert.match(transcriptText(harness), /echo me/);
+
+  harness.api.renderManagerChatAction("send", { ok: true, session_id: session });
+  assert.equal(harness.state.managerChatEvents.filter((event) => event.local === "pending").length, 1, "send reply keeps the echo");
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    session_id: session,
+    last_seq: 2,
+    events: [
+      { seq: 1, turn: 1, type: "user_message", payload: { text: "echo me" } },
+      { seq: 2, turn: 1, type: "assistant_text", payload: { text: "done" } },
+    ],
+  });
+
+  const users = harness.state.managerChatEvents.filter((event) => event.type === "user_message");
+  assert.equal(users.length, 1, "the polled turn replaced the echo");
+  assert.equal(users[0].seq, 1);
+  assert.equal(users[0].local, undefined);
+  assert.equal(transcriptText(harness).split("echo me").length - 1, 1, "rendered once");
+  assert.equal(harness.state.managerChatLastSeq, 2);
+});
+
+test("an echo is matched by client id when the backend echoes one, and stays last until then", () => {
+  const harness = loadWebviewSlice();
+  const session = "mls-" + "b".repeat(32);
+  harness.state.managerChatSession = session;
+  submitManagerChat(harness, "same text");
+  submitManagerChat(harness, "same text");
+  const [first, second] = harness.state.managerChatPendingSends.map((entry) => entry.clientId);
+  assert.notEqual(first, second);
+
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    session_id: session,
+    last_seq: 3,
+    events: [
+      { seq: 1, turn: 1, type: "user_message", payload: { text: "same text", client_id: second } },
+      { seq: 2, turn: 1, type: "assistant_text", payload: { text: "reply" } },
+      { seq: 3, turn: 2, type: "user_message", payload: { text: "unrelated callback text" } },
+    ],
+  });
+
+  const pending = harness.state.managerChatEvents.filter((event) => event.local === "pending");
+  assert.deepEqual(plain(pending.map((event) => event.payload.client_id)), [first]);
+  assert.equal(harness.state.managerChatEvents.at(-1).payload.client_id, first, "the unanswered echo renders last");
+});
+
+test("a refused send marks its echo failed with the error text", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-" + "c".repeat(32);
+  submitManagerChat(harness, "will fail");
+
+  harness.api.renderManagerChatAction("send", { ok: false, error: "manager_turn_in_progress" });
+
+  const echo = harness.state.managerChatEvents.find((event) => event.type === "user_message");
+  assert.equal(echo.local, "failed");
+  assert.equal(echo.payload.failed, true);
+  assert.equal(echo.payload.error, "manager_turn_in_progress");
+  const note = harness.state.managerChatEvents.find((event) => event.type === "error");
+  assert.equal(note.payload.error, "Not sent: manager_turn_in_progress");
+  assert.match(transcriptText(harness), /Not sent: manager_turn_in_progress/);
+  assert.ok(harness.elements.managerChatInput.value.includes("will fail"), "refused text restored");
+});
+
+test("a turn_end with hidden thinking blocks renders a one-line note", () => {
+  const harness = loadWebviewSlice();
+  const session = "mls-" + "d".repeat(32);
+  harness.state.managerChatSession = session;
+
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    session_id: session,
+    last_seq: 2,
+    events: [
+      { seq: 1, turn: 1, type: "assistant_text", payload: { text: "answer" } },
+      { seq: 2, turn: 1, type: "turn_end", payload: { reasoning_redacted: 3, thinking_display: { state: "enabled" } } },
+    ],
+  });
+
+  assert.match(transcriptText(harness), /3 thinking blocks hidden by the model/);
+  assert.equal(harness.state.managerChatLastSeq, 2);
+
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    session_id: session,
+    last_seq: 3,
+    events: [{ seq: 3, turn: 2, type: "turn_end", payload: { reasoning_redacted: 1, thinking_display: { state: "rejected" } } }],
+  });
+  assert.match(transcriptText(harness), /1 thinking block hidden by the model · this CLI rejected --thinking-display/);
+});
+
+test("a session switch drops the previous session's pending echoes", () => {
+  const harness = loadWebviewSlice();
+  const sessionA = "mls-" + "e".repeat(32);
+  const sessionB = "mls-" + "f".repeat(32);
+  harness.state.managerChatSession = sessionA;
+  submitManagerChat(harness, "typed in A");
+  assert.equal(harness.state.managerChatEvents.filter((event) => event.local === "pending").length, 1);
+  assert.equal(harness.state.managerChatEvents.find((event) => event.local === "pending").session, sessionA);
+
+  harness.api.renderManagerChatStatus({ ok: true, running: false, session: { session_id: sessionB } });
+
+  assert.equal(harness.state.managerChatSession, sessionB);
+  assert.equal(harness.state.managerChatEvents.filter((event) => event.local === "pending").length, 0, "no A echo in B");
+  assert.doesNotMatch(transcriptText(harness), /typed in A/);
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    session_id: sessionB,
+    last_seq: 1,
+    events: [{ seq: 1, turn: 1, type: "user_message", payload: { text: "typed in A" } }],
+  });
+  const users = harness.state.managerChatEvents.filter((event) => event.type === "user_message");
+  assert.equal(users.length, 1, "B's own user_message renders on its own");
+  assert.equal(users[0].seq, 1);
+});
+
+test("an echo sent with no session survives the send reply that creates the session", () => {
+  const harness = loadWebviewSlice();
+  const sessionB = "mls-" + "1".repeat(32);
+  harness.state.managerChatSession = null;
+  submitManagerChat(harness, "first words");
+  const echo = harness.state.managerChatEvents.find((event) => event.local === "pending");
+  assert.equal(echo.session, "");
+
+  harness.api.renderManagerChatAction("send", { ok: true, session_id: sessionB });
+  assert.equal(harness.state.managerChatSession, sessionB);
+  assert.equal(harness.state.managerChatEvents.filter((event) => event.local === "pending").length, 1, "echo kept");
+  assert.match(transcriptText(harness), /first words/);
+
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    session_id: sessionB,
+    last_seq: 1,
+    events: [{ seq: 1, turn: 1, type: "user_message", payload: { text: "first words" } }],
+  });
+  const users = harness.state.managerChatEvents.filter((event) => event.type === "user_message");
+  assert.equal(users.length, 1, "B's user_message replaced the echo");
+  assert.equal(users[0].seq, 1);
+  assert.equal(users[0].local, undefined);
+});

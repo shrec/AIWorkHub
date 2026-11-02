@@ -115,6 +115,7 @@ class TurnContext:
     last_usage: dict[str, Any] = dataclasses.field(default_factory=dict)
     model: str = ""
     steps: dict[str, Any] = dataclasses.field(default_factory=dict)
+    reasoning_redacted: int = 0
 
 
 def _count(value: Any) -> int:
@@ -189,9 +190,13 @@ def _tool_result(call_id: str, name: str, output: Any, failed: bool) -> dict[str
     }}
 
 
-def _turn_end(usage: Mapping[str, Any] | None) -> dict[str, Any]:
-    """The turn's final event; ``usage`` appears only when the provider reported it."""
-    return {"type": "turn_end", "payload": {"usage": dict(usage)} if usage else {}}
+def _turn_end(usage: Mapping[str, Any] | None, context: TurnContext | None = None) -> dict[str, Any]:
+    """The turn's final event; ``usage`` appears only when the provider reported it,
+    ``reasoning_redacted`` only when the turn had thinking blocks with no text."""
+    payload: dict[str, Any] = {"usage": dict(usage)} if usage else {}
+    if context is not None and context.reasoning_redacted:
+        payload["reasoning_redacted"] = context.reasoning_redacted
+    return {"type": "turn_end", "payload": payload}
 
 
 def _assistant_text(value: Any) -> list[dict[str, Any]]:
@@ -199,9 +204,15 @@ def _assistant_text(value: Any) -> list[dict[str, Any]]:
     return [{"type": "assistant_text", "payload": {"text": text}}] if text else []
 
 
-def _reasoning(value: Any) -> list[dict[str, Any]]:
-    """One bounded model-reasoning event; thinking is evidence, not a secret."""
+def _reasoning(value: Any, context: TurnContext | None = None) -> list[dict[str, Any]]:
+    """One bounded model-reasoning event; thinking is evidence, not a secret.
+
+    A block the model sent without text is counted on ``context`` (NF-2026-01977),
+    never dropped silently: the turn's ``turn_end`` reports it.
+    """
     text = str(value or "").strip()
+    if not text and context is not None:
+        context.reasoning_redacted += 1
     return [{"type": "reasoning", "payload": {"text": text}}] if text else []
 
 
@@ -297,7 +308,7 @@ def _claude_events(event: Mapping[str, Any], context: TurnContext) -> list[dict[
     if kind == "stream_event":
         return _claude_delta(event)
     if kind == "result":
-        return [_turn_end(_claude_usage(event, context))]
+        return [_turn_end(_claude_usage(event, context), context)]
     message = _mapping(event.get("message"))
     if kind == "assistant":
         context.model = str(message.get("model") or context.model)
@@ -314,7 +325,9 @@ def _claude_events(event: Mapping[str, Any], context: TurnContext) -> list[dict[
         elif block.get("type") == "tool_result":
             events.extend(_claude_tool_result(block, context))
         elif block.get("type") == "thinking":
-            events.extend(_reasoning(block.get("thinking")))
+            events.extend(_reasoning(block.get("thinking"), context))
+        elif block.get("type") == "redacted_thinking":
+            events.extend(_reasoning("", context))
     return events
 
 
@@ -334,7 +347,7 @@ def _codex_events(event: Mapping[str, Any], context: TurnContext) -> list[dict[s
     """Codex ``exec --json``: item events, then the completed turn's usage."""
     kind = str(event.get("type") or "")
     if kind == "turn.completed":
-        return [_turn_end(_codex_usage(event.get("usage")))]
+        return [_turn_end(_codex_usage(event.get("usage")), context)]
     if kind == "turn.failed":
         # NF-2026-01232: the provider's own reason, e.g. its HTTP 400 message.
         return [_turn_error("provider", str(_mapping(event.get("error")).get("message") or "turn_failed"))]
@@ -445,18 +458,61 @@ def _opencode_events(event: Mapping[str, Any], context: TurnContext) -> list[dic
     if kind == "text":
         return _assistant_text(part.get("text") or event.get("text"))
     if kind in ("reasoning", "thinking"):
-        return _reasoning(part.get("text") or part.get("thinking") or event.get("text"))
+        return _reasoning(part.get("text") or part.get("thinking") or event.get("text"), context)
     return _opencode_tool(part, context) if kind == "tool" else []
 
 
 REASONING_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
 
 
-# ponytail: per process and resets on server restart.
-_CLAUDE_THINKING_DISPLAY_REJECTED = False
+# NF-2026-01977: a ``--thinking-display`` rejection belongs to the one CLI binary
+# that refused it -- its resolved path plus size and mtime -- so a different
+# claude binary keeps the flag and a replaced one is probed again. Per process,
+# reset on server restart, and bounded: past the cap the oldest identity goes.
+CliIdentity = tuple[str, int, int]
+_THINKING_DISPLAY_REJECTIONS_MAX = 32
+_THINKING_DISPLAY_REJECTIONS: dict[CliIdentity, bool] = {}
+_THINKING_DISPLAY_LOCK = threading.Lock()
 
 
-def manager_stream_tokens(backend_id: str, level: str = "") -> list[str]:
+def cli_identity(executable: str) -> CliIdentity:
+    """``(resolved path, size, mtime_ns)`` of one CLI; an unreadable binary stats as ``-1``."""
+    resolved = shutil.which(executable) or executable
+    try:
+        path = str(Path(resolved).resolve())
+        stat = os.stat(path)
+    except OSError:
+        return (str(resolved), -1, -1)
+    return (path, int(stat.st_size), int(stat.st_mtime_ns))
+
+
+def thinking_display_rejected(identity: CliIdentity | None) -> bool:
+    """Whether this exact binary refused ``--thinking-display``; an unknown one has not."""
+    if identity is None:
+        return False
+    with _THINKING_DISPLAY_LOCK:
+        return identity in _THINKING_DISPLAY_REJECTIONS
+
+
+def record_thinking_display_rejection(identity: CliIdentity) -> None:
+    with _THINKING_DISPLAY_LOCK:
+        _THINKING_DISPLAY_REJECTIONS.pop(identity, None)
+        _THINKING_DISPLAY_REJECTIONS[identity] = True
+        while len(_THINKING_DISPLAY_REJECTIONS) > _THINKING_DISPLAY_REJECTIONS_MAX:
+            del _THINKING_DISPLAY_REJECTIONS[next(iter(_THINKING_DISPLAY_REJECTIONS))]
+
+
+def thinking_display_state(identity: CliIdentity) -> dict[str, Any]:
+    """The flag's state for one claude binary, carried on its turns' ``turn_end``."""
+    path, size, mtime_ns = identity
+    return {
+        "flag": "--thinking-display",
+        "state": "rejected" if thinking_display_rejected(identity) else "enabled",
+        "executable": path, "size": size, "mtime_ns": mtime_ns,
+    }
+
+
+def manager_stream_tokens(backend_id: str, level: str = "", identity: CliIdentity | None = None) -> list[str]:
     """Flags that make a manager turn show thinking and honor a chosen depth.
 
     OpenCode hides thinking blocks unless ``--thinking`` is set. Claude's
@@ -467,10 +523,10 @@ def manager_stream_tokens(backend_id: str, level: str = "") -> list[str]:
     summarized``: 5 blocks, 5995 chars). Effort tokens are added only for a
     level the CLI documents.
 
-    When a claude turn's CLI rejects ``--thinking-display`` (see
-    ``CliManagerBackend._turn``), this memo drops the flag for that one
-    immediate retry and for every later turn in this process, while keeping
-    ``--include-partial-messages`` and any ``--effort`` handling unchanged.
+    When the claude binary ``identity`` (see :func:`cli_identity`) once rejected
+    ``--thinking-display`` (see ``CliManagerBackend._turn``), the flag is dropped
+    for that binary only, while ``--include-partial-messages`` and any
+    ``--effort`` handling stay unchanged.
     """
 
     cleaned = str(level or "").strip().lower()
@@ -480,7 +536,7 @@ def manager_stream_tokens(backend_id: str, level: str = "") -> list[str]:
         return ["--thinking"]
     if backend_id == "claude_cli":
         tokens = ["--include-partial-messages"]
-        if not _CLAUDE_THINKING_DISPLAY_REJECTED:
+        if not thinking_display_rejected(identity):
             tokens += ["--thinking-display", "summarized"]
         if cleaned:
             tokens.extend(("--effort", cleaned))
@@ -490,8 +546,10 @@ def manager_stream_tokens(backend_id: str, level: str = "") -> list[str]:
     return []
 
 
-def apply_manager_stream_tokens(backend_id: str, argv: list[str], level: str = "") -> list[str]:
-    tokens = manager_stream_tokens(backend_id, level)
+def apply_manager_stream_tokens(
+    backend_id: str, argv: list[str], level: str = "", identity: CliIdentity | None = None,
+) -> list[str]:
+    tokens = manager_stream_tokens(backend_id, level, identity)
     if not tokens:
         return list(argv)
     if backend_id == "codex_cli" and argv and argv[-1] == "-":
@@ -519,12 +577,12 @@ def flush(backend_id: str, context: TurnContext) -> list[dict[str, Any]]:
         return []
     steps = context.steps
     if not steps:
-        return [_turn_end(None)]
+        return [_turn_end(None, context)]
     usage = _usage(
         steps["input"], steps["cache_read"], steps["cache_write"], steps["output"], 0,
         {"steps": steps["count"], "last": steps.get("last") or {}},
     )
-    return [_turn_end(usage)]
+    return [_turn_end(usage, context)]
 
 
 def _provider_error(event: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -788,6 +846,9 @@ class CliManagerBackend:
         self.images: tuple[str, ...] = ()
         self._process: Any = None
         self._slot = threading.Lock()
+        # The last claude turn's ``--thinking-display`` state (thinking_display_state),
+        # ``None`` for the other CLIs or before any claude turn ran.
+        self.thinking_display: dict[str, Any] | None = None
     @property
     def conversation_id(self) -> str:
         """The provider conversation later turns resume, or ``""`` before the first turn."""
@@ -832,7 +893,7 @@ class CliManagerBackend:
             argv.extend((flag, str(self.mcp_config_path)))
         return resume_argv(self.backend_id, argv, self._conversation_id)
 
-    def _turn(self, message: str) -> Iterator[dict[str, Any]]:
+    def _turn(self, message: str, *, retried: bool = False) -> Iterator[dict[str, Any]]:
         images, self.images = tuple(self.images), ()
         if images and self.backend_id == "opencode_cli":
             yield _turn_error("images", f"manager_images_unsupported:{self.backend_id}")
@@ -851,7 +912,10 @@ class CliManagerBackend:
             yield _turn_error("launch_plan", plan.validation_reason or "plan_not_launchable")
             return
         try:
-            argv = apply_manager_stream_tokens(self.backend_id, self.argv_for(plan), self.reasoning_level)
+            argv = self.argv_for(plan)
+            identity = cli_identity(argv[0]) if self.backend_id == "claude_cli" else None
+            self.thinking_display = thinking_display_state(identity) if identity is not None else None
+            argv = apply_manager_stream_tokens(self.backend_id, argv, self.reasoning_level, identity)
             if images and self.backend_id == "codex_cli":
                 # The attached --image=<path> form, before the positional prompt
                 # (`-`): a bare `-i <path> -` swallows the `-` as one more image.
@@ -912,14 +976,14 @@ class CliManagerBackend:
         if ended and held is None:
             return
         if (
-            code != 0 and not streamed and not expired.is_set()
-            and self.backend_id == "claude_cli" and "--thinking-display" in argv
+            code != 0 and not streamed and not expired.is_set() and not retried
+            and identity is not None and "--thinking-display" in argv
             and "unknown option" in stderr.lower() and "--thinking-display" in stderr
         ):
-            # NF-2026-01353: retry once; the memo drops the flag (images are already in message).
-            global _CLAUDE_THINKING_DISPLAY_REJECTED
-            _CLAUDE_THINKING_DISPLAY_REJECTED = True
-            yield from self._turn(message)
+            # NF-2026-01353 / NF-2026-01977: retry once without the flag; the rejection
+            # is remembered for this one binary only (images are already in message).
+            record_thinking_display_rejection(identity)
+            yield from self._turn(message, retried=True)
             return
         if expired.is_set():
             yield _turn_error("timeout", f"manager_turn_timeout_seconds={self.timeout_seconds:g}")
@@ -934,10 +998,23 @@ class CliManagerBackend:
                 f"{reason}: {said[-room:]}" if said and room > 0 else reason,
             )
         elif held is not None:
-            yield held
+            yield self._closing(held)
         else:
             # A clean exit that never reported its end still closes the turn once.
-            yield from flush(self.backend_id, context) or [_turn_end(None)]
+            for closing in flush(self.backend_id, context) or [_turn_end(None, context)]:
+                yield self._closing(closing)
+
+    def _closing(self, event: dict[str, Any]) -> dict[str, Any]:
+        """A claude ``turn_end`` names a ``--thinking-display`` its binary rejected.
+
+        An enabled flag is the default and stays implicit, so a turn_end payload
+        is unchanged for it; ``self.thinking_display`` holds the full state.
+        """
+        state = self.thinking_display
+        if state is None or state.get("state") != "rejected" or event.get("type") != "turn_end":
+            return event
+        payload = {**_mapping(event.get("payload")), "thinking_display": dict(self.thinking_display)}
+        return {**event, "payload": payload}
 
 
 # NF-2026-01454: one process-wide cache of the successful ``opencode models``

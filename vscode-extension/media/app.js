@@ -7887,13 +7887,93 @@ function renderManagerChatStatus(payload) {
     return;
   }
   if (sessionChanged) {
-    state.managerChatEvents = [];
+    state.managerChatEvents = managerChatPendingEchoes(nextSessionId);
     managerConsoleReset();
     state.managerChatLastSeq = 0;
     renderManagerChatEvents();
   }
   requestManagerChatEvents();
   scheduleManagerChatPoll();
+}
+
+// NF-2026-01977: a submitted message renders at once as a local user_message
+// marked pending (seq 0, so the poll cursor never moves for it). The polled
+// turn replaces it -- by client id when the backend echoes one, otherwise by
+// the exact text of the oldest pending echo -- and a refused send marks it failed.
+function managerChatLocalEcho(text, images) {
+  state.managerChatLocalEchoCount = (state.managerChatLocalEchoCount || 0) + 1;
+  const clientId = `local-${Date.now().toString(36)}-${state.managerChatLocalEchoCount}`;
+  const payload = { text, client_id: clientId, pending: true };
+  if (images > 0) payload.images = images;
+  // The session the echo was typed in; "" when this send is creating one.
+  const session = state.managerChatSession || "";
+  const echo = { seq: 0, type: "user_message", at: new Date().toISOString(), local: "pending", session, payload };
+  state.managerChatEvents = asArray(state.managerChatEvents).concat([echo]);
+  managerConsoleScheduleRender();
+  return clientId;
+}
+
+// Pending echoes that belong to `sessionId`: typed in it, or typed while no
+// session existed (that send is the one creating it). An echo from another
+// session can never be answered here, so it is dropped on a session switch.
+function managerChatPendingEchoes(sessionId) {
+  const current = sessionId || "";
+  return asArray(state.managerChatEvents).filter(
+    (event) => event && event.local === "pending" && (!event.session || event.session === current),
+  );
+}
+
+function managerChatMergeEvents(incoming) {
+  let pending = managerChatPendingEchoes(state.managerChatSession);
+  for (const event of incoming) {
+    if (!event || event.type !== "user_message" || pending.length === 0) continue;
+    const payload = event.payload && typeof event.payload === "object" ? event.payload : {};
+    const index = payload.client_id
+      ? pending.findIndex((echo) => echo.payload.client_id === payload.client_id)
+      : pending.findIndex((echo) => echo.payload.text === payload.text);
+    if (index !== -1) pending = pending.slice(0, index).concat(pending.slice(index + 1));
+  }
+  // Still-unanswered echoes stay last: they are the newest thing the owner typed.
+  const settled = asArray(state.managerChatEvents).filter((event) => !(event && event.local === "pending"));
+  return settled.concat(incoming, pending);
+}
+
+function managerChatFailLocalEcho(clientId, error) {
+  const events = asArray(state.managerChatEvents);
+  const index = clientId
+    ? events.findIndex((event) => event && event.local === "pending" && event.payload.client_id === clientId)
+    : -1;
+  if (index === -1) return;
+  const echo = events[index];
+  const failed = Object.assign({}, echo, {
+    local: "failed",
+    payload: Object.assign({}, echo.payload, { pending: false, failed: true, error }),
+  });
+  const note = { seq: 0, type: "error", at: echo.at, local: "failed", payload: { source: "send", error: `Not sent: ${error}`, client_id: clientId } };
+  state.managerChatEvents = events.slice(0, index).concat([failed, note], events.slice(index + 1));
+}
+
+// An empty provider thinking block is counted on turn_end, never dropped
+// silently: show the count as a one-line note just before the turn's footer.
+function managerChatThinkingNoteText(payload) {
+  const parts = [];
+  const hidden = numberValue(payload && payload.reasoning_redacted);
+  if (hidden > 0) parts.push(`${hidden} thinking block${hidden === 1 ? "" : "s"} hidden by the model`);
+  const display = payload && payload.thinking_display;
+  if (display && typeof display === "object" && display.state === "rejected") {
+    parts.push("this CLI rejected --thinking-display");
+  }
+  return parts.join(" · ");
+}
+
+function managerChatWithThinkingNotes(events) {
+  const out = [];
+  for (const event of events) {
+    const text = event && event.type === "turn_end" ? managerChatThinkingNoteText(event.payload) : "";
+    if (text) out.push({ seq: 0, turn: event.turn, type: "reasoning", local: "note", payload: { text } });
+    out.push(event);
+  }
+  return out;
 }
 
 function renderManagerChatEventsResponse(payload) {
@@ -7923,7 +8003,7 @@ function renderManagerChatEventsResponse(payload) {
   // Backend cursor went backwards (e.g. a rotation): reset and re-request.
   const backendLastSeq = numberValue(payload.last_seq);
   if (backendLastSeq > 0 && backendLastSeq < state.managerChatLastSeq) {
-    state.managerChatEvents = [];
+    state.managerChatEvents = managerChatPendingEchoes(state.managerChatSession);
     managerConsoleReset();
     state.managerChatLastSeq = 0;
     renderManagerChatEvents();
@@ -7934,7 +8014,7 @@ function renderManagerChatEventsResponse(payload) {
   // reply and the poll timer); keep only events newer than the last one seen.
   const events = asArray(payload.events).filter((event) => numberValue(event.seq) > state.managerChatLastSeq);
   if (events.length > 0) {
-    state.managerChatEvents = state.managerChatEvents.concat(events);
+    state.managerChatEvents = managerChatMergeEvents(managerChatWithThinkingNotes(events));
     state.managerChatLastSeq = events.reduce((max, event) => Math.max(max, numberValue(event.seq)), state.managerChatLastSeq);
     if (state.managerChatRunning) applyManagerChatSessionUi();
     // Failed turns carry `error` with no `turn_end`; a rotation ends the
@@ -7989,6 +8069,7 @@ function renderManagerChatAction(action, payload) {
     if (action === "send") {
       state.managerChatRunning = false;
       state.managerChatThinkingSince = 0;
+      if (pendingEntry) managerChatFailLocalEcho(pendingEntry.clientId, String(payload.error || "unknown"));
       if (pendingText) {
         const existing = elements.managerChatInput && elements.managerChatInput.value;
         if (elements.managerChatInput) {
@@ -8028,7 +8109,7 @@ function renderManagerChatAction(action, payload) {
   if (/^mls-[0-9a-f]{32}$/i.test(sessionId)) {
     if (state.managerChatSession !== sessionId) {
       state.managerChatSession = sessionId;
-      state.managerChatEvents = [];
+      state.managerChatEvents = managerChatPendingEchoes(sessionId);
       managerConsoleReset();
       state.managerChatLastSeq = 0;
       renderManagerChatEvents();
@@ -8848,8 +8929,10 @@ elements.managerChatComposer.addEventListener("submit", (event) => {
   };
   if (images.length) send.images = images;
   vscode.postMessage(send);
-  // FIFO: each send pushes; each send reply shifts the oldest.
-  state.managerChatPendingSends.push({ text, images });
+  // FIFO: each send pushes; each send reply shifts the oldest. The echo shows
+  // the turn at once; the poll that returns it replaces it (NF-2026-01977).
+  const clientId = managerChatLocalEcho(text, images.length);
+  state.managerChatPendingSends.push({ text, images, clientId });
   renderManagerChatSendQueue();
   state.managerChatSentHistory.push(text);
   if (state.managerChatSentHistory.length > 20) state.managerChatSentHistory.shift();
