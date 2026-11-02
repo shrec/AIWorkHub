@@ -1499,7 +1499,7 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
                     "ok", "status", "running", "registered", "last_success_at",
                     "stale_reason", "build_revision", "files_seen",
                     "readable_generation", "last_error", "writer_state",
-                    "refreshable", "refresh_job",
+                    "refreshable", "refresh_unavailable_reason", "refresh_job",
                 )
             },
             "ready_for_code": source_graph_ready_for_code,

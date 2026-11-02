@@ -153,7 +153,9 @@ def test_body_slice_refuses_stale_lines_after_prepend(tmp_path):
     range pointed at ``# pad`` padding and the caller received padding as
     alpha's code with no way to detect the substitution.
     After: the on-disk sha256 no longer matches the indexed ``source_hash``,
-    so the response carries an explicit ``stale`` state and no lines.
+    so the response carries an explicit ``stale`` state, and the file is
+    re-parsed in memory so alpha answers with its CURRENT range and lines,
+    labelled ``served=stale_served_from_disk`` (NF-2026-01963).
     """
 
     repo = _new_repo(tmp_path, "stalebody")
@@ -168,10 +170,13 @@ def test_body_slice_refuses_stale_lines_after_prepend(tmp_path):
     assert result["freshness"] == "stale"
     match = result["matches"][0]
     assert match["freshness"]["state"] == "stale"
+    assert match["freshness"]["served"] == sg.STALE_SERVED_FROM_DISK
     assert match["freshness"]["disk_source_hash"] == _sha256(padded)
+    assert match["freshness"]["served_source_hash"] == _sha256(padded)
     assert match["freshness"]["indexed_source_hash"] != _sha256(padded)
-    # No lines at all -- and certainly not the prepended padding.
-    assert match["source"] == ""
+    assert (match["line_start"], match["line_end"]) == (21, 22)
+    assert match["source"] == "def alpha():\n    return 1"
+    # Never the prepended padding the indexed line numbers would point at.
     assert "# pad" not in match["source"]
 
 
@@ -211,7 +216,7 @@ def test_every_body_style_response_carries_freshness(tmp_path, mode):
     assert payload["freshness"] == "fresh"
 
 
-def test_function_query_drops_source_when_stale(tmp_path):
+def test_function_query_serves_stale_source_from_disk(tmp_path):
     repo = _new_repo(tmp_path, "stalefunc")
     src = "def alpha():\n    return 1\n"
     _write(repo / "m.py", src)
@@ -220,8 +225,12 @@ def test_function_query_drops_source_when_stale(tmp_path):
 
     payload = sg.function_query(repo, "alpha")
     assert payload["freshness"] == "stale"
-    assert payload["matches"][0]["freshness"]["state"] == "stale"
-    assert payload["matches"][0]["source"] == ""
+    match = payload["matches"][0]
+    assert match["freshness"]["state"] == "stale"
+    assert match["freshness"]["served"] == sg.STALE_SERVED_FROM_DISK
+    # The range is re-resolved from the disk bytes, never the indexed one.
+    assert (match["line_start"], match["line_end"]) == (21, 22)
+    assert match["source"] == "def alpha():\n    return 1"
 
 
 # ---------------------------------------------------------------------------

@@ -6175,6 +6175,7 @@ def file_query(
     requested_path = file_path
     file_path = _normalize_file_target(repo_root, file_path)
     conn = connect(resolve_db_path(repo_root), read_only=True)
+    file_freshness: dict[str, Any] | None = None
     try:
         payload = context(conn, file_path)
         if not payload.get("found"):
@@ -6182,8 +6183,21 @@ def file_query(
             if folded is not None:
                 file_path = folded
                 payload = context(conn, file_path)
+        if payload.get("found"):
+            file_freshness = _file_freshness_state(conn, repo_root, file_path)
     finally:
         conn.close()
+    if file_freshness is not None:
+        # File mode always slices the canonical on-disk bytes, never the
+        # indexed generation's view. A stale index entry is named as such so
+        # the caller knows the window is current disk content, not index state.
+        if file_freshness["state"] == "stale":
+            file_freshness = {
+                **file_freshness,
+                "state": STALE_SERVED_FROM_DISK,
+                "served": STALE_SERVED_FROM_DISK,
+            }
+        payload["freshness"] = file_freshness
     ranged_fields: dict[str, Any] = {}
     if payload.get("found"):
         if line_range is not None and not include_structure:
@@ -6236,6 +6250,10 @@ def file_query(
         "matches": [file_match] if file_match else [],
         "contexts": [payload] if payload.get("found") else [],
         "candidate_files": [file_path] if payload.get("found") else [],
+        **(
+            {"freshness": _overall_freshness({file_path: file_freshness})}
+            if file_freshness is not None else {}
+        ),
         **miss_fields,
         "truncated": False,
     }, payload_cap)
@@ -6247,6 +6265,7 @@ def function_query(repo_root: Path, name: str, budget: int = 64) -> dict[str, An
     budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
     conn = connect(resolve_db_path(repo_root), read_only=True)
     file_freshness: dict[str, dict[str, Any]] = {}
+    disk_cache: dict[str, Any] = {}
     try:
         matches = func(conn, name, limit=budget)
         for match in matches:
@@ -6258,6 +6277,9 @@ def function_query(repo_root: Path, name: str, budget: int = 64) -> dict[str, An
             match["freshness"] = fresh
             match["source"] = _source_snippet(
                 repo_root, match, fresh=fresh["state"] == "fresh",
+            )
+            _serve_stale_row_from_disk(
+                repo_root, match, fresh, disk_cache, max_chars=4000,
             )
     finally:
         conn.close()
@@ -6276,6 +6298,7 @@ def class_query(repo_root: Path, name: str, budget: int = 64) -> dict[str, Any]:
     budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
     conn = connect(resolve_db_path(repo_root), read_only=True)
     file_freshness: dict[str, dict[str, Any]] = {}
+    disk_cache: dict[str, Any] = {}
     try:
         matches = struct(conn, name, limit=budget)
         for match in matches:
@@ -6287,6 +6310,9 @@ def class_query(repo_root: Path, name: str, budget: int = 64) -> dict[str, Any]:
             match["freshness"] = fresh
             match["source"] = _source_snippet(
                 repo_root, match, fresh=fresh["state"] == "fresh",
+            )
+            _serve_stale_row_from_disk(
+                repo_root, match, fresh, disk_cache, max_chars=4000,
             )
     finally:
         conn.close()
@@ -6493,9 +6519,11 @@ def _body_materialize(
     freshness = _file_freshness_state(conn, repo_root, str(result["file_path"]))
     result["freshness"] = freshness
     # Only a file whose on-disk sha256 still matches the indexed source_hash may
-    # be sliced with its stored line numbers. A stale/missing/unverifiable file
-    # returns an explicit freshness state and no source, never lines belonging
-    # to a different generation.
+    # be sliced with its stored line numbers. A stale file is re-parsed in
+    # memory from its on-disk bytes and answers with the CURRENT range, labelled
+    # ``served=stale_served_from_disk``; a missing/unverifiable file, or a stale
+    # one whose symbol cannot be re-resolved, returns an explicit freshness
+    # state and no source, never lines belonging to a different generation.
     snippet = ""
     if freshness["state"] == "fresh":
         try:
@@ -6507,6 +6535,8 @@ def _body_materialize(
         except (OSError, ValueError, UnicodeDecodeError):
             snippet = ""
     result["source"] = snippet
+    if freshness["state"] == "stale":
+        _serve_stale_row_from_disk(repo_root, result, freshness)
     return result
 
 
@@ -7025,10 +7055,103 @@ def _overall_freshness(per_file: dict[str, dict[str, Any]]) -> str:
         return "unknown"
     if all(state == "fresh" for state in states):
         return "fresh"
-    for degraded in ("stale", "missing", "unknown"):
+    for degraded in ("stale", "stale_served_from_disk", "missing", "unknown"):
         if degraded in states:
             return degraded
     return "stale"
+
+
+STALE_SERVED_FROM_DISK = "stale_served_from_disk"
+_DISK_EXTRACT_OK = frozenset({"ok", "file_evidence_only"})
+
+
+def _disk_extraction(
+    repo_root: Path, file_path: str, cache: dict[str, Any] | None = None,
+) -> tuple[Any, list[str]] | None:
+    """Parse one file's current on-disk bytes in memory, never writing the index.
+
+    One read of the bytes feeds both the indexer's own extractor and the line
+    list, so every returned range slices the generation it was parsed from.
+    ``None`` when the file is gone, escapes the tree, is not UTF-8 or the
+    extractor refused it; the caller then keeps its explicit stale/missing state.
+    """
+
+    if cache is not None and file_path in cache:
+        return cache[file_path]
+    found: tuple[Any, list[str]] | None = None
+    try:
+        root = repo_root.resolve()
+        target = (root / file_path).resolve()
+        if file_path and target.is_relative_to(root) and target.is_file():
+            raw = target.read_bytes()
+            extraction = sgast.extract_file_from_bytes(
+                root, target, raw, build_revision=BUILD_REVISION,
+            )
+            if extraction.status in _DISK_EXTRACT_OK and extraction.source_hash:
+                found = (extraction, raw.decode("utf-8").splitlines())
+    except (OSError, UnicodeDecodeError, ValueError, RuntimeError, SyntaxError):
+        found = None
+    if cache is not None:
+        cache[file_path] = found
+    return found
+
+
+def _serve_stale_row_from_disk(
+    repo_root: Path,
+    row: dict[str, Any],
+    freshness: dict[str, Any],
+    cache: dict[str, Any] | None = None,
+    *,
+    max_chars: int | None = None,
+) -> bool:
+    """Answer one stale body-style row from the file's canonical on-disk bytes.
+
+    The row's range is re-resolved by re-parsing that single file in memory:
+    the indexed generation's line numbers are never used to slice changed
+    bytes. The symbol is matched by exact qualname, else by a unique
+    (kind, name). ``freshness.state`` stays ``stale`` -- the index is still
+    behind -- and ``served`` names the substitution. Returns False, leaving the
+    row's empty source and stale state untouched, when the symbol cannot be
+    re-resolved (deleted, renamed, unparseable).
+    """
+
+    if freshness.get("state") != "stale":
+        return False
+    found = _disk_extraction(repo_root, str(row.get("file_path") or ""), cache)
+    if found is None:
+        return False
+    extraction, lines = found
+    qualname = str(row.get("qualname") or "")
+    entity = next(
+        (item for item in extraction.entities if qualname and item.qualname == qualname),
+        None,
+    )
+    if entity is None:
+        kind, name = str(row.get("kind") or ""), str(row.get("name") or "")
+        same = [
+            item for item in extraction.entities
+            if item.kind == kind and item.name == name
+        ]
+        entity = same[0] if len(same) == 1 else None
+    if entity is None:
+        return False
+    start = max(0, int(entity.line_start) - 1)
+    end = max(start + 1, int(entity.line_end))
+    source = "\n".join(lines[start:end])
+    if max_chars is not None:
+        source = source[:max_chars]
+    row.update({
+        "line_start": int(entity.line_start),
+        "line_end": int(entity.line_end),
+        "signature": entity.signature,
+        "source": source,
+        "freshness": {
+            **freshness,
+            "served": STALE_SERVED_FROM_DISK,
+            "served_source_hash": extraction.source_hash,
+        },
+    })
+    return True
 
 
 def _source_snippet(

@@ -2609,6 +2609,48 @@ def daemon_health(repo_root: Path | str) -> dict[str, Any]:
     return _project_canonical_generation(out, daemon, repo_root, registered=registered)
 
 
+def _refresh_unavailable_reason(out: dict[str, Any]) -> str:
+    """Name why ``refreshable`` is false, from the gates that made it false.
+
+    Empty when the payload is refreshable. Otherwise the first failing gate of
+    ``health()``'s ``refreshable`` decision (or of the corrupt / unregistered
+    projections that force it false) is named, so a manager reading a stale
+    reply learns whether the writer is busy, stopped, fenced or failed instead
+    of a bare ``refreshable: false``. Never empty for a non-refreshable reply.
+    """
+
+    if out.get("refreshable") is not False:
+        return ""
+    status = str(out.get("status") or "")
+    last_error = str(out.get("last_error") or "")
+    if status == STATUS_CORRUPT:
+        return f"index_corrupt:{last_error or 'unknown'}"
+    if last_error == "unregistered_live_builder":
+        return "writer_active:unregistered_live_builder"
+    if out.get("registered") is False and not out.get("running"):
+        return "daemon_not_registered"
+    consumer = out.get("refresh_consumer")
+    if isinstance(consumer, dict) and not consumer.get("live"):
+        detail = str(consumer.get("reason") or "")
+        return detail or "no_live_writer:daemon_thread_not_running"
+    if status == STATUS_STOPPED:
+        return "daemon_stopped"
+    if status == STATUS_RECOVERY:
+        phase = str((out.get("recovery") or {}).get("phase") or "")
+        return f"recovery_in_progress:{phase or 'unknown'}"
+    if status == STATUS_DEGRADED:
+        return f"daemon_degraded:{last_error or 'unknown'}"
+    if status == STATUS_STALE:
+        writer = str(out.get("writer_state") or "unknown")
+        return f"writer_behind:index_age_exceeds_stale_after:writer_{writer}"
+    if last_error == "build_start_fenced":
+        return "build_start_fenced"
+    job = out.get("refresh_job")
+    if isinstance(job, dict) and job.get("state") == "failed":
+        return f"last_refresh_job_failed:{str(job.get('error') or 'unknown')[:160]}"
+    return f"refresh_unavailable:status_{status or 'unknown'}"
+
+
 def _project_canonical_generation(
     out: dict[str, Any],
     daemon: SourceGraphDaemon | None,
@@ -2634,6 +2676,7 @@ def _project_canonical_generation(
         # Corruption is recorded in a sidecar, so reporting it needs no
         # database connection and stays available in this branch too.
         _apply_index_integrity(out, repo_root)
+        out["refresh_unavailable_reason"] = _refresh_unavailable_reason(out)
         return out
     # The canonical committed generation remains readable while another
     # process is INDEXING, while this daemon is STANDBY, and after a daemon
@@ -2722,6 +2765,7 @@ def _project_canonical_generation(
         out["generation_read_error"] = f"{type(exc).__name__}:{exc}"[:300]
     _apply_index_integrity(out, repo_root)
     out["registered"] = registered
+    out["refresh_unavailable_reason"] = _refresh_unavailable_reason(out)
     return out
 
 
@@ -2737,6 +2781,8 @@ def refresh_now(repo_root: Path | str) -> dict[str, Any]:
         return {
             "ok": False,
             "error": "not_registered",
+            "refreshable": False,
+            "refresh_unavailable_reason": "daemon_not_registered",
             "repo_root": str(Path(repo_root).resolve()),
         }
     return daemon.refresh_now()
