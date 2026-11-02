@@ -967,8 +967,6 @@ def _quality_reviewer(row: Mapping[str, Any]) -> bool:
         parsed
         and parsed.reviewer
         and str(row.get("status") or "").lower() in _TERMINAL_TASK_STATES
-        and str(row.get("worker_status") or "").lower()
-        in {"blocked", "done", "review", "superseded"}
         and str(card.get("topic") or row.get("topic") or "").lower() == "quality_review"
     )
 
