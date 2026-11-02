@@ -792,10 +792,8 @@ def test_a_reject_with_no_resolvable_request_identity_reports_it(
     )
 
     assert reply["ok"] is True, reply
-    assert reply[key] == {
-        "ok": False,
-        "error": "learning_closeout_request_id_unresolved",
-    }
+    assert reply[key] == {"skipped": True, "reason": "no_launch_request_for_task"}
+    assert "learning_commit_owed" not in reply
     _assert_nothing_recorded(decisions.root)
 
 

@@ -1155,6 +1155,11 @@ def _reject_review_receipt_fields(
     rework = card.get("rework_predecessor") if isinstance(card.get("rework_predecessor"), dict) else {}
     reason_bytes = str(reason or "").encode("utf-8")
     event = _latest_task_event_payload(task_id, "reject_review") or {}
+    launch_event = (
+        _latest_task_event_payload(task_id, "review_ready")
+        or _latest_task_event_payload(task_id, "launch")
+        or {}
+    )
     return {
         "to": to,
         "reason_identity": feedback.get("reason_identity") or event.get("reason_identity") or {
@@ -1170,6 +1175,9 @@ def _reject_review_receipt_fields(
             rejection.get("request_id")
             or feedback.get("predecessor_request_id")
             or rework.get("request_id")
+            or event.get("request_id")
+            or card.get("launch_request_id")
+            or launch_event.get("request_id")
         ),
         "claim_epoch": rework.get("claim_epoch"),
         "prior_episode": event.get("prior_episode"),
@@ -2163,6 +2171,7 @@ def _with_learning_closeout(
     promote_ai_memory: bool,
     extra_evidence_ids: list[str] | None,
     no_new_lesson_reason: str | None,
+    skip_unresolved: bool = False,
 ) -> Any:
     """Close a LANDED accept/reject out with the learning the manager supplied.
 
@@ -2172,6 +2181,13 @@ def _with_learning_closeout(
     ``learning_disposition``. The decision has already happened, so a failure
     here is reported under its own key and never changes ``ok`` or drops
     ``learning_commit_owed``.
+
+    With ``skip_unresolved`` (only the reject wrapper passes it) and no
+    resolvable request id -- there was genuinely no launch for this task to
+    close learning out against -- the key reports
+    ``{"skipped": True, "reason": "no_launch_request_for_task"}`` instead of
+    a failure; ``ok`` and ``learning_commit_owed`` are left exactly as they
+    were. Accept keeps ``learning_closeout_request_id_unresolved``.
     """
 
     lesson = str(lesson_candidate or "").strip()
@@ -2187,7 +2203,11 @@ def _with_learning_closeout(
     ).strip()
     key = "learning_commit" if lesson else "learning_disposition"
     if not decided:
-        receipt[key] = {"ok": False, "error": "learning_closeout_request_id_unresolved"}
+        receipt[key] = (
+            {"skipped": True, "reason": "no_launch_request_for_task"}
+            if skip_unresolved
+            else {"ok": False, "error": "learning_closeout_request_id_unresolved"}
+        )
         return receipt
     try:
         if lesson:
@@ -4483,13 +4503,17 @@ def aiworkhub_task_reject_review(
     # cleanup, and that cleanup defers any OSError (WinError 5) to the storage
     # janitor, so a held handle can neither skip the lesson nor fail the
     # committed reject.
+    # NF-2026-01972: an archive/supersede reject writes no rework fields, so the
+    # reviewed launch id resolved for the receipt is passed through explicitly.
     receipt = _with_learning_closeout(
         receipt,
         task_id=task_id,
+        request_id=(extra or {}).get("request_id"),
         lesson_candidate=lesson_candidate,
         promote_ai_memory=promote_ai_memory,
         extra_evidence_ids=extra_evidence_ids,
         no_new_lesson_reason=no_new_lesson_reason,
+        skip_unresolved=True,
     )
     if isinstance(result, dict) and result.get("ok") is True and isinstance(receipt, dict):
         _attach_reviewer_process_cancellation(
