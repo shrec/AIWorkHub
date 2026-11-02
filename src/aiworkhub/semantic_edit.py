@@ -572,6 +572,22 @@ def _line_terminator(fragment: str) -> str:
     return "\n" if fragment.endswith("\n") else ""
 
 
+_BARE_LF_RE = re.compile(r"(?<!\r)\n")
+
+
+def _dominant_line_ending(text: str) -> str:
+    """Return the line ending most of ``text``'s lines use, or ``""`` if none.
+
+    Counts CRLF against bare LF; a tie resolves to LF so the result never
+    turns an LF or evenly mixed text into CRLF.
+    """
+    crlf = text.count("\r\n")
+    lf = text.count("\n") - crlf
+    if crlf == 0 and lf == 0:
+        return ""
+    return "\r\n" if crlf > lf else "\n"
+
+
 def _trailing_blank_line_count(text: str) -> int:
     """Count consecutive trailing lines that are only a terminator.
 
@@ -713,11 +729,21 @@ def apply_line_ranges(
         preserve = item.get("preserve_trailing_newline", True)
         if not isinstance(preserve, bool):
             raise SemanticEditError(f"semantic_edit_newline_policy_invalid:{index}")
-        # Complete the replacement with the terminator ``old`` ended with, exactly
-        # when it does not itself end a ``\n``-numbered line: a bare CR ends
-        # nothing, so ``B\r`` over an LF line becomes ``B\r\n``.
-        if preserve and replacement and not replacement.endswith("\n"):
-            replacement += _line_terminator(old)
+        # NF-2026-01958: write the replacement with the replaced range's line
+        # ending (else the file's dominant one, else LF) so a CRLF file never
+        # gains bare-LF lines.  Only bare ``\n`` is rewritten, so a replacement
+        # that already carries CRLF does not become CR CR LF, and an LF ending
+        # leaves the replacement byte-identical.
+        ending = _dominant_line_ending(old) or _dominant_line_ending(current_text) or "\n"
+        if ending == "\r\n":
+            replacement = _BARE_LF_RE.sub("\r\n", replacement)
+        # Complete the replacement with that ending exactly when ``old`` ended
+        # a line and the replacement does not itself end a ``\n``-numbered
+        # line: a bare CR ends nothing, so ``B\r`` over an LF line becomes
+        # ``B\r\n``.
+        old_terminator = _line_terminator(old)
+        if preserve and replacement and old_terminator and not replacement.endswith("\n"):
+            replacement += ending if ending == "\r\n" else old_terminator
         old_blank = _trailing_blank_line_count(old)
         new_blank = _trailing_blank_line_count(replacement)
         if new_blank < old_blank:
