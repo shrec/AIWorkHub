@@ -26,6 +26,7 @@ import tempfile
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from itertools import accumulate, islice
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Iterator
 
@@ -377,26 +378,27 @@ def _anchor_shown(line: str) -> str:
 def _validated_anchors(
     relative: str, expected_first_line: object, expected_last_line: object,
     *, single_line: bool,
-) -> tuple[str, str] | None:
-    """Return both stripped anchors, or ``None`` when neither was given.
+) -> tuple[str | None, str | None] | None:
+    """Return the stripped anchors, or ``None`` when neither was given.
 
-    On a multi-line range one anchor alone cannot tell a shifted range from a
-    resized one, so it is refused, naming the missing field, rather than
-    half-checked.  On a single-line range the first and last line are the same
-    line, so one anchor is complete and stands for both (NF-2026-01743).
+    On a single-line range the first and last line are the same line, so one
+    anchor is complete and stands for both (NF-2026-01743).  On a multi-line
+    range a lone anchor comes back with ``None`` for the other one: it checks
+    the requested range in place but never relocates it, because one anchor
+    cannot tell a shifted range from a resized one (NF-2026-01976).
     """
     if expected_first_line is None and expected_last_line is None:
         return None
-    if expected_first_line is None or expected_last_line is None:
-        if not single_line:
-            missing = "expected_first_line" if expected_first_line is None else "expected_last_line"
-            raise SemanticEditError(f"semantic_edit_anchor_incomplete:{relative}:missing={missing}")
+    if single_line and (expected_first_line is None or expected_last_line is None):
         expected_first_line = expected_last_line = (
             expected_last_line if expected_first_line is None else expected_first_line
         )
-    if not isinstance(expected_first_line, str) or not isinstance(expected_last_line, str):
-        raise SemanticEditError(f"semantic_edit_anchor_invalid:{relative}")
-    return _anchor_text(expected_first_line), _anchor_text(expected_last_line)
+    anchors: list[str | None] = []
+    for anchor in (expected_first_line, expected_last_line):
+        if anchor is not None and not isinstance(anchor, str):
+            raise SemanticEditError(f"semantic_edit_anchor_invalid:{relative}")
+        anchors.append(None if anchor is None else _anchor_text(anchor))
+    return anchors[0], anchors[1]
 
 
 def _anchored_range(
@@ -404,16 +406,18 @@ def _anchored_range(
     lines: list[str],
     start_line: int,
     end_line: int,
-    first: str,
-    last: str,
+    first: str | None,
+    last: str | None,
 ) -> tuple[int, int]:
     """Return the range whose first and last line strip to ``first`` and ``last``.
 
     The requested range wins when it matches.  Otherwise the same span is tried
     1..``_ANCHOR_SHIFT_LIMIT`` lines away, nearest first (``-d`` then ``+d``),
     and the range moves only when exactly one shift matches and the anchors are
-    not both empty: blank lines identify nothing.  Anything else raises
-    :class:`SemanticEditAnchorMismatch` and binds nothing.
+    not both empty: blank lines identify nothing.  A ``None`` anchor (a lone
+    anchor on a multi-line range, NF-2026-01976) checks nothing, and the range
+    then never moves.  Anything else raises :class:`SemanticEditAnchorMismatch`
+    and binds nothing.
     """
     lines = lines or [""]  # the empty file's one virtual line (``_line_slice``)
     span = end_line - start_line
@@ -423,13 +427,13 @@ def _anchored_range(
         return (
             start >= 1
             and end <= len(lines)
-            and _anchor_text(lines[start - 1]) == first
-            and _anchor_text(lines[end - 1]) == last
+            and (first is None or _anchor_text(lines[start - 1]) == first)
+            and (last is None or _anchor_text(lines[end - 1]) == last)
         )
 
     if anchored(start_line):
         return start_line, end_line
-    if first or last:
+    if first is not None and last is not None and (first or last):
         shifted = [
             start_line + offset
             for distance in range(1, _ANCHOR_SHIFT_LIMIT + 1)
@@ -482,7 +486,8 @@ def prepare_line_target(
     Without anchors the range is bound exactly as requested.  With both, it is
     first checked against them and kept, relocated or refused
     (:func:`_anchored_range`); a relocated target records the requested range
-    in ``anchor_relocated_from``.
+    in ``anchor_relocated_from``.  A lone anchor on a multi-line range only
+    checks its own line of the requested range and never relocates it.
     """
     relative = normalize_relative_path(path)
     if not path_is_allowed(relative, allowed_writes):
@@ -512,12 +517,45 @@ def prepare_line_target(
         start_line=start_line,
         end_line=end_line,
         current_sha256=hashlib.sha256(data).hexdigest(),
-        fragment_sha256=hashlib.sha256(fragment_data).hexdigest(),
+        fragment_sha256=fragment_sha256(fragment),
         fragment=fragment,
         file_bytes=len(data),
         fragment_bytes=len(fragment_data),
         anchor_relocated_from=relocated_from,
     )
+
+
+def fragment_sha256(fragment: str) -> str:
+    """The fragment hash a prepared target binds and apply re-checks."""
+    return hashlib.sha256(fragment.encode("utf-8")).hexdigest()
+
+
+def relocated_range(text: str, target: PreparedLineTarget) -> tuple[int, int]:
+    """Where ``target``'s untouched fragment sits now that an earlier edit moved it.
+
+    A second range prepared in the same file goes whole-file stale once the
+    first range is applied, though its own bytes may merely have shifted
+    (NF-2026-01976).  Every window of the prepared line count whose byte length
+    and :func:`fragment_sha256` equal the target's is a candidate: exactly one
+    is returned, none refuses ``semantic_edit_stale_file:<path>`` and more than
+    one refuses ``semantic_edit_stale_file:<path>:ambiguous``.  Only windows of
+    the right byte length are hashed and the scan stops at the second match.
+    """
+    span = target.end_line - target.start_line + 1
+    lines = _split_lines(text)
+    offsets = [0, *accumulate(len(line.encode("utf-8")) for line in lines)]
+    matches = islice((
+        start
+        for start in range(1, len(lines) - span + 2)
+        if offsets[start - 1 + span] - offsets[start - 1] == target.fragment_bytes
+        and fragment_sha256("".join(lines[start - 1 : start - 1 + span])) == target.fragment_sha256
+    ), 2)
+    found = list(matches)
+    if not found:
+        raise SemanticEditError(f"semantic_edit_stale_file:{target.path}")
+    if len(found) > 1:
+        raise SemanticEditError(f"semantic_edit_stale_file:{target.path}:ambiguous")
+    return found[0], found[0] + span - 1
 
 
 def _line_terminator(fragment: str) -> str:

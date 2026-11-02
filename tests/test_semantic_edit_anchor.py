@@ -281,31 +281,40 @@ def test_both_empty_anchors_never_relocate(tmp_path: Path, blank: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("anchors", "missing"),
+    "anchors",
+    [{"expected_first_line": "line_10 = 10"}, {"expected_last_line": "line_12 = 12"}],
+    ids=["first_only", "last_only"],
+)
+def test_a_single_anchor_checks_a_multi_line_range_in_place(
+    tmp_path: Path, anchors: dict[str, Any],
+) -> None:
+    # NF-2026-01976: one anchor on a multi-line range binds the requested range
+    # when it matches; a single-line range takes one anchor too (NF-2026-01743).
+    _write(tmp_path)
+    kept = _prepare(tmp_path, 10, 12, **anchors)
+    assert (kept.start_line, kept.end_line, kept.anchor_relocated_from) == (10, 12, None)
+    assert kept == _prepare(tmp_path, 10, 12)
+
+    prepared = _session(tmp_path).prepare(file_path=_PATH, start_line=10, end_line=12, **anchors)
+    assert prepared["ok"] is True, prepared
+
+
+@pytest.mark.parametrize(
+    "anchors",
     [
-        ({"expected_first_line": "line_10 = 10"}, "expected_last_line"),
-        ({"expected_last_line": "line_12 = 12"}, "expected_first_line"),
-        ({"expected_first_line": "", "expected_last_line": None}, "expected_last_line"),
+        {"expected_first_line": "line_12 = 12"},
+        {"expected_last_line": "line_10 = 10"},
+        {"expected_first_line": "", "expected_last_line": None},
     ],
     ids=["first_only", "last_only", "empty_first_only"],
 )
-def test_a_single_anchor_is_refused_on_a_multi_line_range(
-    tmp_path: Path, anchors: dict[str, Any], missing: str,
+def test_a_single_wrong_anchor_on_a_multi_line_range_is_a_mismatch_never_a_shift(
+    tmp_path: Path, anchors: dict[str, Any],
 ) -> None:
-    # A single-line range takes one anchor (NF-2026-01743,
-    # tests/test_semantic_edit_single_line_anchor_nf01743.py).
     _write(tmp_path)
-    reason = f"semantic_edit_anchor_incomplete:src/module.py:missing={missing}"
-    with pytest.raises(semantic_edit.SemanticEditError) as excinfo:
-        _prepare(tmp_path, 10, 12, **anchors)
-    assert str(excinfo.value) == reason
-
-    refused = _session(tmp_path).prepare(file_path=_PATH, start_line=10, end_line=12, **anchors)
-    assert refused == {
-        "ok": False,
-        "tool": "semantic_edit_prepare",
-        "reason": reason,
-    }
+    detail = _mismatch(tmp_path, 10, 12, **anchors)
+    assert detail["actual_first_line"] == "line_10 = 10"
+    assert detail["actual_last_line"] == "line_12 = 12"
 
 
 def test_a_non_text_anchor_is_refused(tmp_path: Path) -> None:

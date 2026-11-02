@@ -123,27 +123,24 @@ def test_one_non_text_anchor_on_a_single_line_is_invalid(tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize(
-    ("anchors", "missing"),
-    [
-        ({"expected_first_line": "line_10 = 10"}, "expected_last_line"),
-        ({"expected_last_line": "line_11 = 11"}, "expected_first_line"),
-    ],
+    "anchors",
+    [{"expected_first_line": "line_09 = 9"}, {"expected_last_line": "line_12 = 12"}],
 )
-def test_one_anchor_on_a_multi_line_range_is_refused_naming_the_missing_field(
-    tmp_path: Path, anchors: dict[str, Any], missing: str,
+def test_one_wrong_anchor_on_a_multi_line_range_is_a_mismatch_not_a_shift(
+    tmp_path: Path, anchors: dict[str, Any],
 ) -> None:
+    # NF-2026-01976 replaced the old semantic_edit_anchor_incomplete refusal:
+    # a lone anchor checks its own line in place and never relocates.
     target = _write(tmp_path)
-    with pytest.raises(semantic_edit.SemanticEditError) as excinfo:
+    with pytest.raises(semantic_edit.SemanticEditAnchorMismatch) as excinfo:
         _prepare(tmp_path, 10, 11, **anchors)
-    reason = str(excinfo.value)
-    assert reason.startswith(f"semantic_edit_anchor_incomplete:{_PATH}")
-    assert reason == f"semantic_edit_anchor_incomplete:{_PATH}:missing={missing}"
+    assert str(excinfo.value) == f"semantic_edit_anchor_mismatch:{_PATH}"
 
     refused = _tools(tmp_path)["aiworkhub_worker_semantic_edit_prepare"](
         file_path=_PATH, start_line=10, end_line=11, **anchors,
     )
     assert refused["ok"] is False
-    assert refused["reason"] == reason
+    assert refused["reason"] == f"semantic_edit_anchor_mismatch:{_PATH}"
     assert target.read_bytes() == "".join(_LINES).encode("utf-8")
 
 

@@ -15,6 +15,7 @@ manager both get the same guarantees rather than the manager getting none.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import tempfile
 from pathlib import Path, PurePosixPath
@@ -60,14 +61,23 @@ def replace_prepared_range(
         raise semantic_edit.SemanticEditError(f"semantic_edit_path_not_allowed:{relative}")
     with semantic_edit.held_path(root, relative, include_file=False):
         with semantic_edit.held_path(root, relative):
+            file_path = semantic_edit.resolve_existing_file(root, target.path)
+            original_mode = os.stat(file_path).st_mode & 0o7777
+            data, current_text = semantic_edit.read_utf8_file(file_path, target.path)
+            current_sha256 = hashlib.sha256(data).hexdigest()
+            start_line, end_line = target.start_line, target.end_line
+            if current_sha256 != target.current_sha256:
+                # NF-2026-01976: an earlier apply in this file may only have
+                # shifted the prepared bytes; find them or refuse stale.
+                start_line, end_line = semantic_edit.relocated_range(current_text, target)
             current = semantic_edit.prepare_line_target(
                 root,
                 path=target.path,
-                start_line=target.start_line,
-                end_line=target.end_line,
+                start_line=start_line,
+                end_line=end_line,
                 allowed_writes=allowed_writes,
             )
-            if current.current_sha256 != target.current_sha256:
+            if current.current_sha256 != current_sha256:
                 raise semantic_edit.SemanticEditError(
                     f"semantic_edit_stale_file:{target.path}"
                 )
@@ -76,18 +86,18 @@ def replace_prepared_range(
                     f"semantic_edit_stale_fragment:{target.path}"
                 )
 
-            file_path = semantic_edit.resolve_existing_file(root, target.path)
-            original_mode = os.stat(file_path).st_mode & 0o7777
-            _data, current_text = semantic_edit.read_utf8_file(file_path, target.path)
         next_text, metrics = semantic_edit.apply_line_ranges(
             current_text,
             [{
-                "start_line": target.start_line,
-                "end_line": target.end_line,
+                "start_line": start_line,
+                "end_line": end_line,
                 "new": new,
                 "fragment_sha256": target.fragment_sha256,
             }],
         )
+        if (start_line, end_line) != (target.start_line, target.end_line):
+            metrics["relocated_from"] = [target.start_line, target.end_line]
+            metrics["relocated_to"] = [start_line, end_line]
         regression = semantic_edit.syntax_regression(relative, current_text, next_text)
         if regression:
             raise semantic_edit.SemanticEditError(regression)
