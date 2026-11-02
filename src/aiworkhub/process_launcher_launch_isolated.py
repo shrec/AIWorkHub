@@ -1343,6 +1343,7 @@ def launch_isolated(
                     card.get("allow_unchanged_required_outputs") or []
                 ),
                 "immutable_inputs": declared_immutable_inputs,
+                "dependency_materialized_inputs": list(card.get("dependency_materialized_inputs") or []),
                 "immutable_input_manifest": immutable_input_manifest,
                 "residual_contract_manifest": residual_contract_manifest,
                 "crash_retry_packet": (

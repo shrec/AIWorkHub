@@ -5951,6 +5951,7 @@ class ProcessManager:
                         card.get("allow_unchanged_required_outputs") or []
                     ),
                     "immutable_inputs": immutable_inputs,
+                    "dependency_materialized_inputs": list(card.get("dependency_materialized_inputs") or []),
                     "immutable_input_manifest": immutable_input_manifest,
                     "residual_contract_manifest": residual_contract_manifest,
                     "external_readonly_dirs": [],

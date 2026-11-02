@@ -1,6 +1,7 @@
 """NF-01803: a dependency-derived immutable input that is absent is optional."""
 from __future__ import annotations
 
+import inspect
 import json
 import re
 import sys
@@ -13,6 +14,7 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from aiworkhub import process_launcher, worker_workspace  # noqa: E402
+from aiworkhub import process_launcher_launch_isolated  # noqa: E402
 
 _FILTERS = "UnitTests/UnitTests.vcxproj.filters"
 
@@ -84,3 +86,58 @@ def test_dependency_composition_does_not_block_launch(tmp_path: Path) -> None:
     assert _FILTERS in enriched["dependency_materialized_inputs"]
     result = worker_workspace._exact_required_card_inputs(tmp_path, enriched, ())
     assert result == ("out/made.txt", "src/a.py")
+
+
+def _launch_metadata(**extra: object) -> dict:
+    # NF-2026-01945: finalize validates against the launch METADATA, not the
+    # stored card, so the metadata must carry the widened immutable_inputs and
+    # the dependency_materialized_inputs marker together.
+    metadata = {
+        "task_id": "CHILD",
+        "required_outputs": ["out/final.txt"],
+        "allowed_writes": ["out/final.txt"],
+        "immutable_inputs": ["src/a.py", _FILTERS],
+        "dependency_materialized_inputs": [_FILTERS],
+        "immutable_input_manifest": {},
+    }
+    metadata.update(extra)
+    return metadata
+
+
+def test_launch_metadata_with_marker_skips_unproduced_dependency_output(
+    tmp_path: Path,
+) -> None:
+    _tree(tmp_path, "src/a.py")
+    result = worker_workspace._exact_required_card_inputs(
+        tmp_path, _launch_metadata(), ()
+    )
+    assert result == ("src/a.py",)
+
+
+def test_launch_metadata_without_marker_fails_closed(tmp_path: Path) -> None:
+    _tree(tmp_path, "src/a.py")
+    metadata = _launch_metadata()
+    del metadata["dependency_materialized_inputs"]
+    message = (
+        "workspace_required_input_missing:field=immutable_inputs:index=1:path="
+        + _FILTERS
+    )
+    with pytest.raises(worker_workspace.WorkspaceError, match=re.escape(message)):
+        worker_workspace._exact_required_card_inputs(tmp_path, metadata, ())
+
+
+@pytest.mark.parametrize(
+    "writer",
+    [
+        process_launcher_launch_isolated.launch_isolated,
+        process_launcher.ProcessManager._launch_validation_only_replay,
+    ],
+    ids=["launch_isolated", "validation_only_replay"],
+)
+def test_launch_metadata_writers_persist_dependency_marker(writer: object) -> None:
+    source = inspect.getsource(writer)  # type: ignore[arg-type]
+    assert '"immutable_inputs":' in source
+    assert (
+        '"dependency_materialized_inputs": list(card.get("dependency_materialized_inputs")'
+        in source
+    )
