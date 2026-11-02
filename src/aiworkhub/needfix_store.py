@@ -54,6 +54,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import subprocess
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1135,6 +1136,25 @@ def _check_duplicate_cycle(
         current = row["duplicate_parent_id"] if (row and row["duplicate_parent_id"]) else ""
 
 
+#: Statuses from which :func:`resolve_verified_needfix` may resolve directly.
+RESOLVE_VERIFIED_FROM_STATUSES: tuple[str, ...] = ("accepted", "task_planned")
+
+#: The two supported routes to ``resolved`` for a fix that has no task.
+#: Appended to every refused transition to ``resolved`` (NF-2026-01964): the
+#: bare allowed_next_transitions list never mentioned them, so managers who
+#: fixed a NeedFix with a plain commit archived it instead of resolving it.
+RESOLVE_ROUTES_HINT = (
+    "resolve_routes: action=resolve_verified (current_status accepted or "
+    "task_planned, readiness_score=100, non-empty evidence and evidence_refs "
+    "set via needfix_update; every 'commit:<sha>' ref must be an ancestor of "
+    "HEAD) or a git commit trailer 'Resolves: NF-YYYY-NNNNN' on a "
+    "HEAD-reachable commit"
+)
+
+_COMMIT_REF_RE = re.compile(r"^commit:([0-9a-fA-F]{7,64})$")
+_GIT_ANCESTOR_TIMEOUT_SECONDS = 30
+
+
 def _validate_transition(current_status: str, target_status: str) -> None:
     """Lifecycle guard: fail closed on invalid transitions.
 
@@ -1142,18 +1162,55 @@ def _validate_transition(current_status: str, target_status: str) -> None:
     the current status, the exact allowed next transitions from the
     current status, and the full canonical status list -- so every
     invalid-transition surface (store/dashboard/server) shares one source
-    of truth instead of drifting duplicate messages.
+    of truth instead of drifting duplicate messages. A refused move to
+    ``resolved`` additionally names :data:`RESOLVE_ROUTES_HINT` after those
+    fields, which stay byte-compatible at the front of the message.
     """
     if current_status == target_status:
         return  # idempotent no-op
     allowed = VALID_TRANSITIONS.get(current_status, ())
     if target_status not in allowed:
-        raise NeedFixConflictError(
+        message = (
             f"invalid transition: rejected={target_status!r} "
             f"current_status={current_status!r} "
             f"allowed_next_transitions={list(allowed)!r} "
             f"allowed_statuses={list(STATUSES)!r}"
         )
+        if target_status == "resolved":
+            message = f"{message} {RESOLVE_ROUTES_HINT}"
+        raise NeedFixConflictError(message)
+
+
+def _unreachable_commit_refs(repo_root: str | Path, evidence_refs: Sequence[str]) -> list[str]:
+    """Return every ``commit:<hex sha>`` ref sha that is not an ancestor of HEAD.
+
+    Runs ``git merge-base --is-ancestor <sha> HEAD`` with argv (no shell) and
+    ``repo_root`` as cwd. Fails closed: an unknown sha, a non-ancestor, a git
+    error, a missing git binary or a timeout all count as unreachable.
+    """
+    root = str(Path(repo_root))
+    unreachable: list[str] = []
+    for ref in evidence_refs:
+        match = _COMMIT_REF_RE.match(str(ref).strip())
+        if match is None:
+            continue
+        sha = match.group(1)
+        try:
+            result = subprocess.run(
+                ["git", "-C", root, "merge-base", "--is-ancestor", f"{sha}^{{commit}}", "HEAD"],
+                cwd=root,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=_GIT_ANCESTOR_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            unreachable.append(sha)
+            continue
+        if result.returncode != 0:
+            unreachable.append(sha)
+    return unreachable
 
 
 def _insert(
@@ -2127,13 +2184,17 @@ def resolve_verified_needfix(
     *,
     resolution_note: str,
 ) -> dict[str, Any]:
-    """Resolve an accepted NeedFix from manager-verified durable evidence.
+    """Resolve an accepted or task_planned NeedFix from manager-verified evidence.
 
     This is deliberately separate from :func:`resolve_needfix`: ordinary
     task-backed closure must still follow ``task_created -> resolved``.  The
     direct path exists for fixes that the manager independently verified on
     canonical HEAD without fabricating a task solely to satisfy lifecycle
-    ceremony.  It fails closed unless triage is complete and the row already
+    ceremony; ``task_planned`` qualifies because no task was created yet, and
+    the event records the real ``prior_status``.  Every ``commit:<hex sha>``
+    evidence ref must name an ancestor of the repository HEAD, otherwise the
+    call is refused with ``needfix_resolve_commit_not_reachable:<sha>``.
+    It fails closed unless triage is complete and the row already
     carries bounded durable evidence and evidence references.
     """
     note = str(resolution_note or "").strip()
@@ -2163,10 +2224,12 @@ def resolve_verified_needfix(
                 "noop": True,
             }
             return already
-        if row["status"] != "accepted":
+        prior_status = row["status"]
+        if prior_status not in RESOLVE_VERIFIED_FROM_STATUSES:
             raise NeedFixConflictError(
-                "manager-verified resolution requires current_status='accepted'; "
-                f"current_status={row['status']!r}"
+                "manager-verified resolution requires current_status in "
+                f"{list(RESOLVE_VERIFIED_FROM_STATUSES)!r}; "
+                f"current_status={prior_status!r}; {RESOLVE_ROUTES_HINT}"
             )
         if int(row["readiness_score"] or 0) != 100:
             raise NeedFixConflictError(
@@ -2186,14 +2249,19 @@ def resolve_verified_needfix(
             raise NeedFixConflictError(
                 "manager-verified resolution requires non-empty durable evidence_refs"
             )
+        unreachable = _unreachable_commit_refs(repo_root, evidence_refs)
+        if unreachable:
+            raise NeedFixConflictError(
+                f"needfix_resolve_commit_not_reachable:{unreachable[0]}"
+            )
 
         now = _utcnow_iso()
-        conn.execute(
+        cur = conn.execute(
             "UPDATE needfix SET status = 'resolved', updated_at = ?, resolved_at = ? "
-            "WHERE id = ? AND status = 'accepted'",
-            (now, now, needfix_id),
+            "WHERE id = ? AND status = ?",
+            (now, now, needfix_id, prior_status),
         )
-        if conn.total_changes != 1:
+        if cur.rowcount != 1:
             raise NeedFixConflictError(
                 "manager-verified resolution lost an atomic status race"
             )
@@ -2202,7 +2270,7 @@ def resolve_verified_needfix(
             needfix_id,
             "manager_verified_resolved",
             {
-                "prior_status": "accepted",
+                "prior_status": prior_status,
                 "resolution_note": note,
                 "readiness_score": 100,
                 "evidence_ref_count": len(evidence_refs),
@@ -2218,7 +2286,7 @@ def resolve_verified_needfix(
         result["transition"] = {
             "event": "manager_verified_resolved",
             "event_id": event_id,
-            "status_before": "accepted",
+            "status_before": prior_status,
             "status_after": "resolved",
         }
         return result

@@ -4221,6 +4221,8 @@ def needfix_transition_view(
 
     Use this to triage, accept, reject, defer, mark duplicate, mark task_planned, resolve, or recover a conversion claim; use aiworkhub_dashboard_needfix_archive, aiworkhub_dashboard_needfix_restore, or aiworkhub_dashboard_needfix_convert_commit for archive, restore, or task creation. Requires confirm=True, persists the state transition and audit event in the NeedFix store, and returns a transition receipt.
 
+    action=resolve only moves task_created -> resolved. A fix landed without a task resolves via action=resolve_verified from accepted or task_planned with readiness_score=100 and non-empty evidence and evidence_refs set via needfix_update; every 'commit:<sha>' ref must be an ancestor of HEAD or it is refused with needfix_resolve_commit_not_reachable:<sha>. A `Resolves: NF-YYYY-NNNNN` git trailer on a HEAD-reachable commit also resolves it. A refused resolve names both routes in resolve_routes.
+
     Args:
         needfix_id: str canonical NeedFix identifier to transition.
         action: str transition action: triage, accept, reject, duplicate, defer, task_planned, resolve, resolve_verified, or recover_conversion_claim.
@@ -4312,6 +4314,12 @@ def needfix_transition_view(
                 response["promote_to"] = promote
         except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
             response = {"ok": False, "error": str(exc)[:240]}
+            if selected in {"resolve", "resolve_verified"} and isinstance(
+                exc, needfix_store.NeedFixConflictError
+            ):
+                # The bounded error cuts the store's trailing route hint; name
+                # both no-task routes to resolved in their own field.
+                response["resolve_routes"] = needfix_store.RESOLVE_ROUTES_HINT
     return _needfix_response(response, "aiworkhub_dashboard_needfix_transition", write=True)
 
 
