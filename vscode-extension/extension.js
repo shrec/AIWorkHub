@@ -8347,36 +8347,6 @@ function bundledRuntimeFallback(context) {
   };
 }
 
-/** Publish a usable runtime pointer before any expensive fingerprint/copy work.
- *
- * The packaged runtime is already complete and immutable for the lifetime of
- * this installed extension.  Publishing its pointer early keeps the optional
- * same-host mux shim coherent, but does not configure or replace Codex.  The
- * normal materializer replaces this bootstrap pointer atomically with the
- * content-addressed generation later in the same activation.
- */
-function primeStableMuxRuntimePointer(context) {
-  const runtimeDir = resolveExtensionRuntimeDir(context.extensionUri.fsPath);
-  if (!fs.existsSync(path.join(runtimeDir, "aiworkhub", "app_server_mux.py"))) {
-    throw new Error(`bundled_mux_runtime_missing:${runtimeDir}`);
-  }
-  if (!context.globalStorageUri || !context.globalStorageUri.fsPath) {
-    return { runtimeDir, storageRoot: null };
-  }
-  const storageRoot = context.globalStorageUri.fsPath;
-  atomicWriteJson(path.join(storageRoot, "runtime", "current.json"), {
-    schema_id: STABLE_RUNTIME_SCHEMA,
-    version: String(
-      (context.extension && context.extension.packageJSON && context.extension.packageJSON.version)
-        || EXPECTED_MCP_PACKAGE_VERSION,
-    ),
-    bootstrap: true,
-    runtime_dir: runtimeDir,
-    updated_at: new Date().toISOString(),
-  });
-  return { runtimeDir, storageRoot };
-}
-
 // ── Codex config.toml PYTHONPATH runtime migration (B894a) ─────────────────
 // 0.6.20 compatibility: resolves ~/.codex/config.toml's location, honoring
 // CODEX_HOME when set (matching Codex CLI's own resolution) and otherwise
@@ -9547,162 +9517,6 @@ function ensureOpencodeMcpRegistered(context) {
   }
 }
 
-/** Materialize the same-host App Server mux launcher at a stable host-local
- * path. It is advertised only after OpenAI's extension is proven co-located;
- * the setting is excluded from Settings Sync and repaired independently on
- * every installed host.
- */
-function materializeStableMuxLauncher(context) {
-  if (!context.globalStorageUri || !context.globalStorageUri.fsPath) {
-    const fallbackName = process.platform === "win32" ? "aiworkhub-app-server-mux.cmd" : "aiworkhub-app-server-mux";
-    return path.join(context.extensionUri.fsPath, "bin", fallbackName);
-  }
-  const binDir = path.join(context.globalStorageUri.fsPath, "bin");
-  const pythonLauncher = path.join(binDir, "aiworkhub-app-server-mux.py");
-  const posixLauncher = path.join(binDir, "aiworkhub-app-server-mux");
-  const windowsLauncher = path.join(binDir, "aiworkhub-app-server-mux.cmd");
-  const script = `#!/usr/bin/env python3
-import json
-import sys
-from pathlib import Path
-
-root = Path(__file__).resolve().parents[1]
-current = json.loads((root / "runtime" / "current.json").read_text(encoding="utf-8"))
-runtime = Path(current["runtime_dir"])
-if not (runtime / "aiworkhub" / "app_server_mux.py").is_file():
-    raise SystemExit("AIWorkHub stable mux runtime is missing")
-sys.path.insert(0, str(runtime))
-from aiworkhub.app_server_mux import main
-raise SystemExit(main())
-`;
-  const cmd = `@echo off\r\nwhere py >nul 2>nul\r\nif %errorlevel% equ 0 (\r\n  py -3 "%~dp0aiworkhub-app-server-mux.py" %*\r\n) else (\r\n  python "%~dp0aiworkhub-app-server-mux.py" %*\r\n)\r\n`;
-  fs.mkdirSync(binDir, { recursive: true });
-  fs.writeFileSync(pythonLauncher, script, { encoding: "utf8", mode: 0o755 });
-  fs.writeFileSync(posixLauncher, script, { encoding: "utf8", mode: 0o755 });
-  fs.writeFileSync(windowsLauncher, cmd, "utf8");
-  if (process.platform !== "win32") {
-    fs.chmodSync(pythonLauncher, 0o755);
-    fs.chmodSync(posixLauncher, 0o755);
-  }
-  return process.platform === "win32" ? windowsLauncher : posixLauncher;
-}
-
-/** Install an optional same-host command shim without configuring Codex.
- *
- * A workspace extension runs remotely under Remote-SSH, while Codex may run
- * in the local UI extension host. The shim is materialized only after the
- * co-location gate succeeds. Windows advertises its exact native path because
- * OpenAI can start before this extension mutates PATH; Settings Sync excludes
- * that host-local application setting. POSIX keeps command discovery local to
- * this extension host.
- */
-function materializePathMuxShim(stableLauncher, options = {}) {
-  const platform = options.platform || process.platform;
-  const home = options.home || os.homedir();
-  const env = options.env || process.env;
-  const arch = options.arch || process.arch;
-  let binDir;
-  if (platform === "win32") {
-    // Keep executable materialization in extension-owned global storage.
-    // WindowsApps is an OS-managed execution-alias directory and may reject
-    // writes under Store policy, ACL hardening, or endpoint protection.
-    binDir = path.dirname(stableLauncher);
-  } else {
-    binDir = path.join(home, ".local", "bin");
-  }
-  fs.mkdirSync(binDir, { recursive: true });
-  let shim = path.join(binDir, platform === "win32" ? "aiworkhub-app-server-mux.exe" : "aiworkhub-app-server-mux");
-  if (platform === "win32") {
-    const nativeArch = arch === "arm64" ? "aarch64" : arch === "x64" ? "x86_64" : arch;
-    const nativeLauncher = options.windowsNativeLauncher || (
-      options.extensionFsPath
-        ? path.join(options.extensionFsPath, "bin", `windows-${nativeArch}`, "aiworkhub-app-server-mux.exe")
-        : ""
-    );
-    if (nativeLauncher && fs.existsSync(nativeLauncher)) {
-      try {
-        fs.copyFileSync(nativeLauncher, shim);
-      } catch (copyError) {
-        if (!copyError || copyError.code !== "EPERM") throw copyError;
-        // Some validation/AppContainer policies deny copy_file-range style
-        // operations while allowing ordinary process-owned reads, writes and
-        // renames in the exact extension storage directory. Keep the fallback
-        // byte-exact, same-directory and fail-closed; never widen authority or
-        // fall back to a host-global temporary directory.
-        const sourceBytes = fs.readFileSync(nativeLauncher);
-        const tempShim = `${shim}.tmp-${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
-        let fallbackInstalled = false;
-        try {
-          fs.writeFileSync(tempShim, sourceBytes, { flag: "wx", mode: 0o700 });
-          const stagedBytes = fs.readFileSync(tempShim);
-          if (!Buffer.isBuffer(stagedBytes) || !stagedBytes.equals(sourceBytes)) {
-            const error = new Error("native_mux_fallback_staging_hash_mismatch");
-            error.code = "AIWORKHUB_COPY_VERIFY_FAILED";
-            throw error;
-          }
-          fs.rmSync(shim, { force: true });
-          fs.renameSync(tempShim, shim);
-          fallbackInstalled = true;
-          const installedBytes = fs.readFileSync(shim);
-          if (!Buffer.isBuffer(installedBytes) || !installedBytes.equals(sourceBytes)) {
-            const error = new Error("native_mux_fallback_install_hash_mismatch");
-            error.code = "AIWORKHUB_COPY_VERIFY_FAILED";
-            throw error;
-          }
-        } catch (fallbackError) {
-          const cleanupErrors = [];
-          try {
-            fs.rmSync(tempShim, { force: true });
-          } catch (cleanupError) {
-            cleanupErrors.push(cleanupError);
-          }
-          if (fallbackInstalled) {
-            try {
-              fs.rmSync(shim, { force: true });
-            } catch (cleanupError) {
-              cleanupErrors.push(cleanupError);
-            }
-          }
-          if (cleanupErrors.length) {
-            throw new AggregateError(
-              [fallbackError, ...cleanupErrors],
-              "native_mux_fallback_cleanup_failed",
-            );
-          }
-          throw fallbackError;
-        }
-      }
-      const pythonTarget = path.join(path.dirname(stableLauncher), "aiworkhub-app-server-mux.py");
-      fs.writeFileSync(`${shim}.target`, `${pythonTarget}\r\n`, "utf8");
-    } else {
-      // Development checkout fallback only. Packaged VSIX qualification
-      // requires the native .exe for OpenAI's shell:false spawn path.
-      shim = path.join(binDir, "aiworkhub-app-server-mux.cmd");
-      const escaped = stableLauncher.replace(/"/g, '""');
-      fs.writeFileSync(shim, `@echo off\r\n"${escaped}" %*\r\n`, "utf8");
-    }
-  } else {
-    const escaped = stableLauncher.replace(/'/g, `'\\''`);
-    fs.writeFileSync(shim, `#!/bin/sh\nexec '${escaped}' "$@"\n`, { encoding: "utf8", mode: 0o755 });
-    fs.chmodSync(shim, 0o755);
-  }
-  // Keep POSIX command discovery local to this extension host. Windows uses
-  // the returned absolute native path after the same-host co-location gate,
-  // because OpenAI may launch before this PATH mutation runs.
-  const pathEntries = String(env.PATH || "").split(path.delimiter).filter(Boolean);
-  const normalizedBin = path.resolve(binDir);
-  if (!pathEntries.some((entry) => {
-    try {
-      return path.resolve(entry) === normalizedBin;
-    } catch (_err) {
-      return false;
-    }
-  })) {
-    env.PATH = [binDir, ...pathEntries].join(path.delimiter);
-  }
-  return shim;
-}
-
 function isAiWorkHubMuxExecutable(value) {
   const current = String(value || "").trim();
   if (!current) return false;
@@ -9716,198 +9530,41 @@ function isLegacyAiWorkHubMuxPath(value) {
     && (path.isAbsolute(current) || /[\\/]/.test(current));
 }
 
-function codexMuxLauncherSetting(platform, pathLauncher) {
-  return platform === "win32" ? pathLauncher : "aiworkhub-app-server-mux";
-}
-
-function colocatedCodexExtension() {
-  try {
-    if (!vscode.extensions || typeof vscode.extensions.getExtension !== "function") return null;
-    return vscode.extensions.getExtension("openai.chatgpt") || null;
-  } catch (_err) {
-    return null;
-  }
-}
-
-function resolveBundledCodexExecutable(codexExtension) {
-  const extensionRoot = codexExtension && (
-    codexExtension.extensionPath
-    || (codexExtension.extensionUri && codexExtension.extensionUri.fsPath)
-  );
-  if (!extensionRoot) return "";
-  const arch = process.arch === "arm64" ? "aarch64" : process.arch === "x64" ? "x86_64" : process.arch;
-  const platformAliases = process.platform === "win32"
-    ? ["windows", "win32"]
-    : process.platform === "darwin" ? ["darwin", "macos"] : [process.platform];
-  const executableName = process.platform === "win32" ? "codex.exe" : "codex";
-  const candidates = [];
-  for (const platformName of platformAliases) {
-    candidates.push(path.join(extensionRoot, "bin", `${platformName}-${arch}`, executableName));
-  }
-  candidates.push(path.join(extensionRoot, "bin", executableName));
-  return candidates.find((candidate) => {
-    try {
-      fs.accessSync(candidate, fs.constants.X_OK);
-      return fs.statSync(candidate).isFile();
-    } catch (_err) {
-      return false;
-    }
-  }) || "";
-}
-
-function pinMuxRealExecutable(executable, options = {}) {
-  if (!executable || !path.isAbsolute(executable)) return false;
-  const sidebandDir = options.sidebandDir || appServerMuxSidebandDir();
-  fs.mkdirSync(sidebandDir, { recursive: true, mode: 0o700 });
-  const pinPath = path.join(sidebandDir, "real_executable");
-  fs.writeFileSync(pinPath, `${executable}\n`, { encoding: "utf8", mode: 0o600 });
-  if (process.platform !== "win32") {
-    fs.chmodSync(sidebandDir, 0o700);
-    fs.chmodSync(pinPath, 0o600);
-  }
-  return true;
-}
-
-async function keepMuxSettingHostLocal() {
-  try {
-    const syncConfig = vscode.workspace.getConfiguration("settingsSync");
-    if (!syncConfig || typeof syncConfig.get !== "function" || typeof syncConfig.update !== "function") return false;
-    const current = syncConfig.get("ignoredSettings", []);
-    const values = Array.isArray(current) ? current.filter((value) => typeof value === "string") : [];
-    if (values.includes("chatgpt.cliExecutable")) return false;
-    await syncConfig.update(
-      "ignoredSettings",
-      [...values, "chatgpt.cliExecutable"],
-      vscode.ConfigurationTarget ? vscode.ConfigurationTarget.Global : true,
-    );
-    return true;
-  } catch (_err) {
-    // Settings Sync may be absent or policy-managed. The co-location gate and
-    // activation-time repair still prevent a foreign absolute path from being
-    // trusted on this host.
-    return false;
-  }
-}
-
 function aiworkhubFeatureEnabled(key) {
   return vscode.workspace.getConfiguration(EXT_ID).get(key, false) === true;
 }
 
+/** Reset a chatgpt.cliExecutable that still names an AIWorkHub App Server mux
+ * launcher -- the bare command, its .cmd/.exe form, or another host's legacy
+ * globalStorage path -- so Codex runs natively. The opt-in that wrote it is
+ * retired: AIWorkHub never writes a launcher into this application-scoped
+ * setting, and any other value is the user's and is left untouched.
+ */
 async function restoreNativeCodexExecutable() {
   try {
     const config = vscode.workspace.getConfiguration("chatgpt");
     const current = String(config.get("cliExecutable", "") || "").trim();
-    if (!isAiWorkHubMuxExecutable(current) || typeof config.update !== "function") {
-      return false;
+    if (!current) {
+      return { ok: true, changed: false, reason: "cli_executable_unset" };
     }
-    await config.update(
-      "cliExecutable",
-      undefined,
-      vscode.ConfigurationTarget ? vscode.ConfigurationTarget.Global : true,
-    );
+    if (!isAiWorkHubMuxExecutable(current)) {
+      return { ok: true, changed: false, reason: "custom_cli_executable_preserved" };
+    }
+    if (typeof config.update !== "function") {
+      return { ok: false, changed: false, reason: "configuration_update_unavailable" };
+    }
+    const globalTarget = vscode.ConfigurationTarget ? vscode.ConfigurationTarget.Global : true;
+    await config.update("cliExecutable", undefined, globalTarget);
     if (outputChannel) {
-      outputChannel.appendLine("[codex] restored native Codex executable; callback mux is disabled");
+      outputChannel.appendLine(isLegacyAiWorkHubMuxPath(current)
+        ? "[codex] removed legacy host-specific AIWorkHub mux executable override; restored native Codex"
+        : "[codex] removed AIWorkHub mux executable override; restored native Codex");
     }
-    return true;
+    return { ok: true, changed: true, reason: "aiworkhub_mux_executable_reset" };
   } catch (err) {
     if (outputChannel) {
       outputChannel.appendLine(`[codex] failed to restore native Codex executable: ${sanitizeErrorMessage(err)}`);
     }
-    return false;
-  }
-}
-
-/** Configure direct callbacks only on the host that owns both extensions.
- *
- * `chatgpt.cliExecutable` has application scope, so the stored launcher is
- * ignored by Settings Sync and recomputed from this host's stable global
- * storage on every activation. Split local/Remote-SSH topologies fail open to
- * native Codex + manager inbox; unrelated user overrides remain untouched.
- */
-async function ensureCodexCallbackMuxConfigured(context, options = {}) {
-  try {
-    const config = vscode.workspace.getConfiguration("chatgpt");
-    const current = String(config.get("cliExecutable", "") || "").trim();
-    if (current && !isAiWorkHubMuxExecutable(current)) {
-      if (outputChannel) outputChannel.appendLine("[codex] callback mux not applied: custom chatgpt.cliExecutable is preserved");
-      return { ok: false, changed: false, reason: "custom_cli_executable_preserved" };
-    }
-    const codexExtension = colocatedCodexExtension();
-    const realExecutable = resolveBundledCodexExecutable(codexExtension);
-    if (!codexExtension || !realExecutable) {
-      if (!isLegacyAiWorkHubMuxPath(current)) {
-        return { ok: true, changed: false, launcher: "", mode: "native_codex", reason: "codex_extension_not_colocated" };
-      }
-      if (!config || typeof config.update !== "function") {
-        return { ok: false, changed: false, reason: "configuration_update_unavailable" };
-      }
-      const globalTarget = vscode.ConfigurationTarget
-        ? vscode.ConfigurationTarget.Global
-        : true;
-      await config.update("cliExecutable", undefined, globalTarget);
-      if (outputChannel) {
-        outputChannel.appendLine(
-          "[codex] removed legacy host-specific AIWorkHub executable override; restored native Codex",
-        );
-      }
-      return { ok: true, changed: true, launcher: "", mode: "native_codex", reason: "codex_extension_not_colocated" };
-    }
-    const launcher = materializeStableMuxLauncher(context);
-    const pathLauncher = materializePathMuxShim(launcher, {
-      extensionFsPath: context && context.extensionUri && context.extensionUri.fsPath,
-      ...(options.muxShim || {}),
-    });
-    // The OpenAI extension starts before this workspace extension on Windows,
-    // so a bare command that only becomes discoverable after we prepend PATH
-    // loses the activation-order race and Codex silently stays native. Persist
-    // the extension-owned native launcher path on Windows; Settings Sync is
-    // explicitly told to ignore this host-local application setting. Keep the
-    // existing machine-neutral command on POSIX hosts.
-    const launcherSetting = codexMuxLauncherSetting(process.platform, pathLauncher);
-    pinMuxRealExecutable(realExecutable, { sidebandDir: options.sidebandDir });
-    await keepMuxSettingHostLocal();
-    const activationMarker = `app_server_sideband.v2:${process.platform}:${launcherSetting}`;
-    const markerKey = "aiworkhub.codexCallbackMuxActivation";
-    const previousMarker = context && context.globalState && typeof context.globalState.get === "function"
-      ? String(context.globalState.get(markerKey, "") || "")
-      : activationMarker;
-    if (current === launcherSetting) {
-      // A stale Remote Machine value can equal the correct host-local path
-      // while OpenAI's application-scoped configuration never observed a
-      // change event and its already-running child remains native. Pulse the
-      // value exactly once per host/launcher identity; persistent globalState
-      // prevents a reload/restart loop.
-      if (previousMarker !== activationMarker && config && typeof config.update === "function") {
-        const globalTarget = vscode.ConfigurationTarget ? vscode.ConfigurationTarget.Global : true;
-        await config.update("cliExecutable", undefined, globalTarget);
-        await config.update("cliExecutable", launcherSetting, globalTarget);
-        if (context.globalState && typeof context.globalState.update === "function") {
-          await context.globalState.update(markerKey, activationMarker);
-        }
-        if (outputChannel) {
-          outputChannel.appendLine("[codex] refreshed host-local callback mux activation after stale native child state");
-        }
-        return { ok: true, changed: true, launcher: launcherSetting, mode: "app_server_sideband", activation_refreshed: true };
-      }
-      return { ok: true, changed: false, launcher: launcherSetting, mode: "app_server_sideband" };
-    }
-    if (!config || typeof config.update !== "function") {
-      return { ok: false, changed: false, reason: "configuration_update_unavailable" };
-    }
-    await config.update(
-      "cliExecutable",
-      launcherSetting,
-      vscode.ConfigurationTarget ? vscode.ConfigurationTarget.Global : true,
-    );
-    if (context && context.globalState && typeof context.globalState.update === "function") {
-      await context.globalState.update(markerKey, activationMarker);
-    }
-    if (outputChannel) {
-      outputChannel.appendLine("[codex] enabled host-local AIWorkHub App Server callback mux; one Codex host restart may be required");
-    }
-    return { ok: true, changed: true, launcher: launcherSetting, mode: "app_server_sideband", restart_required: true };
-  } catch (err) {
-    if (outputChannel) outputChannel.appendLine(`[codex] callback mux configuration failed: ${sanitizeErrorMessage(err)}`);
     return { ok: false, changed: false, reason: "configuration_update_failed" };
   }
 }
@@ -15036,9 +14693,8 @@ async function activate(context) {
   debugTrace("activation.begin", { version: EXPECTED_MCP_PACKAGE_VERSION });
   outputChannel = createManagedOutputChannel();
   context.subscriptions.push(outputChannel);
-  const codexCallbackMuxEnabled = aiworkhubFeatureEnabled("enableCodexCallbackMux");
   const vscodeLmBridgeEnabled = aiworkhubFeatureEnabled("enableVscodeLmBridge");
-  debugTrace("activation.features", { codexCallbackMuxEnabled, vscodeLmBridgeEnabled });
+  debugTrace("activation.features", { vscodeLmBridgeEnabled });
   vscodeLmBridgeHost = vscodeLmBridgeEnabled ? new VscodeLmBridgeHost(context) : null;
   if (vscodeLmBridgeHost) context.subscriptions.push(vscodeLmBridgeHost);
   if (typeof vscode.workspace.onDidChangeConfiguration === "function") {
@@ -15060,25 +14716,13 @@ async function activate(context) {
     }));
   }
 
-  // Materialize the same-host mux as a fail-open building block before it can
-  // be advertised to a co-located Codex extension. The bootstrap pointer is
-  // cheap and closes the first-install race where Codex starts the configured
-  // launcher before the immutable generation copy has completed.
-  if (codexCallbackMuxEnabled) {
-    try {
-      const stableMuxLauncher = materializeStableMuxLauncher(context);
-      materializePathMuxShim(stableMuxLauncher, { extensionFsPath: context.extensionUri.fsPath });
-      primeStableMuxRuntimePointer(context);
-    } catch (err) {
-      outputChannel.appendLine(
-        `[codex] optional same-host mux unavailable; native Codex preserved: ${sanitizeErrorMessage(err)}`,
-      );
-    }
-  } else {
-    debugTrace("activation.restore_native_codex.begin");
-    await restoreNativeCodexExecutable();
-    debugTrace("activation.restore_native_codex.end");
-  }
+  // AIWorkHub never points Codex at a launcher of its own. Reset a
+  // chatgpt.cliExecutable that still names the retired App Server mux --
+  // written by an older release on this or another host -- so Codex runs
+  // natively; any other value is the user's and stays untouched.
+  debugTrace("activation.restore_native_codex.begin");
+  await restoreNativeCodexExecutable();
+  debugTrace("activation.restore_native_codex.end");
 
   // Publish this extension-host PID before changing the Codex executable. A
   // newly launched mux waits
@@ -15100,17 +14744,8 @@ async function activate(context) {
     }
   }
 
-  // Activate direct wake only when OpenAI's extension and this workspace
-  // extension are actually co-located on the same host. Split-host
-  // Remote-SSH keeps native Codex + durable manager inbox and never receives
-  // a foreign launcher path. Any legacy host path is repaired here too.
-  if (codexCallbackMuxEnabled) {
-    await ensureCodexCallbackMuxConfigured(context);
-  }
-
-  // The callback launcher and repo route are now available.  Materialize the
-  // heavier content-addressed runtime generation without blocking Codex from
-  // entering the mux.
+  // Native Codex is restored and the repo route is published.  Only now
+  // materialize the heavier content-addressed runtime generation.
   let stableRuntime;
   try {
     debugTrace("activation.runtime_materialize.begin");
@@ -15189,7 +14824,7 @@ async function activate(context) {
   // Startup activation is the callback lifecycle owner.  An initialized
   // repository must start its MCP child and dispatcher even when the user
   // never opens the dashboard during this window/session.
-  if ((codexCallbackMuxEnabled || vscodeLmBridgeEnabled) && activeRepoIdentity && activeRepoIdentity.root) {
+  if (vscodeLmBridgeEnabled && activeRepoIdentity && activeRepoIdentity.root) {
     // B1017: publish route_pending first (fail-closed), then immediately
     // re-run route convergence after the MCP child and dispatcher are both
     // alive so a ready/fresh mux descriptor publishes capability_state=
@@ -15310,19 +14945,14 @@ module.exports = {
     codexConfigTomlPath,
     resolveCodexConfigTomlPath,
     resolveExtensionRuntimeDir,
-    primeStableMuxRuntimePointer,
     materializeStableRuntimeGeneration,
     bundledRuntimeFallback,
     repairCodexConfigTomlText,
     ensureCodexManagerGatesTomlText,
-    ensureCodexCallbackMuxConfigured,
     restoreNativeCodexExecutable,
     aiworkhubFeatureEnabled,
     isAiWorkHubMuxExecutable,
     isLegacyAiWorkHubMuxPath,
-    codexMuxLauncherSetting,
-    materializeStableMuxLauncher,
-    materializePathMuxShim,
     recordSystemLog,
     systemLogSnapshot,
     clearSystemLogs,

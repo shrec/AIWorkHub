@@ -1,37 +1,35 @@
 "use strict";
 
-const { test, after } = require("node:test");
+const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const Module = require("node:module");
 
+// RM-2026-00082: the App Server mux opt-in is retired. Activation only resets
+// a chatgpt.cliExecutable that still names an AIWorkHub mux launcher; it never
+// writes a launcher, never edits Settings Sync and leaves any other value
+// alone. The fake host serves only the chatgpt section, so a regression that
+// reaches for another one fails the call instead of passing quietly.
 let currentValue = "";
-let ignoredSettings = [];
+let updateSupported = true;
+let updateFailure = null;
 const updates = [];
 const fakeVscode = {
   ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
   workspace: {
     workspaceFolders: [],
     getConfiguration: (section) => {
-      if (section === "settingsSync") {
-        return {
-          get: (key, fallback) => key === "ignoredSettings" ? ignoredSettings : fallback,
-          update: async (key, value, global) => {
-            updates.push({ section, key, value, global });
-            ignoredSettings = value;
-          },
+      assert.equal(section, "chatgpt");
+      const config = { get: (key, fallback) => key === "cliExecutable" ? currentValue : fallback };
+      if (updateSupported) {
+        config.update = async (key, value, target) => {
+          if (updateFailure) throw updateFailure;
+          updates.push({ key, value, target });
+          currentValue = value;
         };
       }
-      assert.equal(section, "chatgpt");
-      return {
-        get: (key, fallback) => key === "cliExecutable" ? currentValue : fallback,
-        update: async (key, value, global) => {
-          updates.push({ key, value, global });
-          currentValue = value;
-        },
-      };
+      return config;
     },
   },
   extensions: { getExtension: () => null },
@@ -51,436 +49,170 @@ const extensionPath = path.resolve(__dirname, "..", "extension.js");
 delete require.cache[extensionPath];
 const { __testInternals } = require(extensionPath);
 Module._load = originalLoad;
+const source = fs.readFileSync(extensionPath, "utf8");
 
-const temp = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-mux-config-"));
-const bin = path.join(temp, "bin");
-fs.mkdirSync(bin);
-const launcher = path.join(bin, process.platform === "win32" ? "aiworkhub-app-server-mux.cmd" : "aiworkhub-app-server-mux");
-fs.writeFileSync(launcher, "launcher", { mode: 0o755 });
-const globalStorage = path.join(temp, "global-storage");
-const context = {
-  extensionUri: { fsPath: temp },
-  globalStorageUri: { fsPath: globalStorage },
-};
-const testHostHome = path.join(temp, "host-home");
-const testHostEnv = { PATH: "" };
-const defaultTestSidebandDir = path.join(temp, "sideband-default");
+const GLOBAL_RESET = [{ key: "cliExecutable", value: undefined, target: 1 }];
+const RESET = { ok: true, changed: true, reason: "aiworkhub_mux_executable_reset" };
+const FS_MUTATORS = [
+  "writeFileSync",
+  "appendFileSync",
+  "copyFileSync",
+  "renameSync",
+  "mkdirSync",
+  "rmSync",
+  "unlinkSync",
+  "symlinkSync",
+  "chmodSync",
+];
 
-function testHostOptions() {
-  return {
-    muxShim: { home: testHostHome, env: testHostEnv },
-    sidebandDir: process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR || defaultTestSidebandDir,
-  };
-}
-
-function ensureConfigured(testContext = context) {
-  return __testInternals.ensureCodexCallbackMuxConfigured(testContext, testHostOptions());
-}
-
-function installFakePackagedWindowsLauncher(extensionRoot = temp) {
-  if (process.platform !== "win32") return "";
-  const arch = process.arch === "arm64" ? "aarch64" : process.arch === "x64" ? "x86_64" : process.arch;
-  const native = path.join(extensionRoot, "bin", `windows-${arch}`, "aiworkhub-app-server-mux.exe");
-  fs.mkdirSync(path.dirname(native), { recursive: true });
-  fs.writeFileSync(native, Buffer.from("MZ-native-launcher"));
-  return native;
-}
-
-function expectedConfiguredLauncher() {
-  return process.platform === "win32"
-    ? path.join(globalStorage, "bin", "aiworkhub-app-server-mux.exe")
-    : "aiworkhub-app-server-mux";
-}
-
-after(() => fs.rmSync(temp, { recursive: true, force: true }));
-
-test("empty Codex executable remains native and is never configured", async () => {
-  currentValue = "";
+// Run the activation-time reset against `value` while refusing every
+// synchronous filesystem mutation: restoring native Codex must never
+// materialize a launcher, a PATH shim or an executable pin on this host.
+async function restoreFrom(value) {
+  currentValue = value;
   updates.length = 0;
-  const result = await ensureConfigured();
-  assert.equal(result.ok, true);
-  assert.equal(result.changed, false);
-  assert.deepEqual(updates, []);
-});
-
-test("safe mode removes a legacy AIWorkHub-owned Codex executable override", async () => {
-  currentValue = "aiworkhub-app-server-mux";
-  updates.length = 0;
-  const changed = await __testInternals.restoreNativeCodexExecutable();
-  assert.equal(changed, true);
-  assert.equal(currentValue, undefined);
-  assert.deepEqual(updates, [{ key: "cliExecutable", value: undefined, global: 1 }]);
-});
-
-test("co-located Codex is configured through one host-local stable mux", async () => {
-  const codexRoot = path.join(temp, "openai-chatgpt");
-  const arch = process.arch === "arm64" ? "aarch64" : process.arch === "x64" ? "x86_64" : process.arch;
-  const platformName = process.platform === "win32" ? "windows" : process.platform;
-  const executable = path.join(codexRoot, "bin", `${platformName}-${arch}`, process.platform === "win32" ? "codex.exe" : "codex");
-  fs.mkdirSync(path.dirname(executable), { recursive: true });
-  fs.writeFileSync(executable, "codex", { mode: 0o755 });
-  installFakePackagedWindowsLauncher();
-  fakeVscode.extensions.getExtension = (id) => id === "openai.chatgpt" ? { extensionPath: codexRoot } : null;
-  const previousSidebandDir = process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR;
-  const testSidebandDir = path.join(temp, "sideband");
-  process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR = testSidebandDir;
-  currentValue = "";
-  ignoredSettings = [];
-  updates.length = 0;
+  const mutations = [];
+  const originals = FS_MUTATORS.map((name) => [name, fs[name]]);
+  for (const name of FS_MUTATORS) {
+    fs[name] = (target) => {
+      mutations.push(`${name}:${String(target)}`);
+      throw new Error(`unexpected fs.${name} while restoring native Codex`);
+    };
+  }
   try {
-    const result = await ensureConfigured();
-    assert.equal(result.ok, true);
-    assert.equal(result.mode, "app_server_sideband");
-    assert.equal(result.changed, true);
-    assert.equal(result.launcher, expectedConfiguredLauncher());
-    assert.equal(currentValue, result.launcher);
-    assert.ok(ignoredSettings.includes("chatgpt.cliExecutable"));
-    if (process.platform !== "win32") {
-      const isolatedShim = path.join(testHostHome, ".local", "bin", "aiworkhub-app-server-mux");
-      assert.ok(fs.existsSync(isolatedShim));
-      assert.ok(fs.readFileSync(isolatedShim, "utf8").includes(globalStorage));
-    }
-    const pin = fs.readFileSync(path.join(testSidebandDir, "real_executable"), "utf8").trim();
-    assert.equal(pin, executable);
+    return await __testInternals.restoreNativeCodexExecutable();
   } finally {
-    if (previousSidebandDir === undefined) delete process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR;
-    else process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR = previousSidebandDir;
-    fakeVscode.extensions.getExtension = () => null;
+    for (const [name, original] of originals) fs[name] = original;
+    assert.deepEqual(mutations, []);
+  }
+}
+
+test("bare and packaged mux commands are reset to native Codex at Global scope", async () => {
+  for (const value of [
+    "aiworkhub-app-server-mux",
+    "aiworkhub-app-server-mux.cmd",
+    "aiworkhub-app-server-mux.exe",
+    "AIWorkHub-App-Server-Mux.EXE",
+    "  aiworkhub-app-server-mux  ",
+  ]) {
+    assert.equal(__testInternals.isAiWorkHubMuxExecutable(value), true, value);
+    assert.equal(__testInternals.isLegacyAiWorkHubMuxPath(value), false, value);
+    assert.deepEqual(await restoreFrom(value), RESET, value);
+    assert.deepEqual(updates, GLOBAL_RESET, value);
+    assert.equal(currentValue, undefined, value);
   }
 });
 
-test("stale equal launcher receives one bounded activation pulse, never a reload loop", async () => {
-  const codexRoot = path.join(temp, "openai-chatgpt-pulse");
-  const arch = process.arch === "arm64" ? "aarch64" : process.arch === "x64" ? "x86_64" : process.arch;
-  const platformName = process.platform === "win32" ? "windows" : process.platform;
-  const executable = path.join(codexRoot, "bin", `${platformName}-${arch}`, process.platform === "win32" ? "codex.exe" : "codex");
-  fs.mkdirSync(path.dirname(executable), { recursive: true });
-  fs.writeFileSync(executable, "codex", { mode: 0o755 });
-  installFakePackagedWindowsLauncher();
-  fakeVscode.extensions.getExtension = () => ({ extensionPath: codexRoot });
-  const previousSidebandDir = process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR;
-  process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR = path.join(temp, "sideband-pulse");
-  const marker = new Map();
-  const pulseContext = {
-    ...context,
-    globalState: {
-      get: (key, fallback) => marker.has(key) ? marker.get(key) : fallback,
-      update: async (key, value) => marker.set(key, value),
-    },
-  };
-  __testInternals.materializeStableMuxLauncher(pulseContext);
-  currentValue = expectedConfiguredLauncher();
-  updates.length = 0;
-  try {
-    const first = await ensureConfigured(pulseContext);
-    assert.equal(first.activation_refreshed, true);
-    assert.deepEqual(
-      updates.filter((entry) => entry.key === "cliExecutable"),
-      [
-        { key: "cliExecutable", value: undefined, global: 1 },
-        { key: "cliExecutable", value: currentValue, global: 1 },
-      ],
-    );
-    updates.length = 0;
-    const second = await ensureConfigured(pulseContext);
-    assert.equal(second.changed, false);
-    assert.deepEqual(updates, []);
-  } finally {
-    if (previousSidebandDir === undefined) delete process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR;
-    else process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR = previousSidebandDir;
-    fakeVscode.extensions.getExtension = () => null;
-  }
-});
-
-test("legacy absolute AIWorkHub mux path is removed instead of rewritten", async () => {
-  currentValue = path.join(temp, "old", "aiworkhub-app-server-mux");
-  updates.length = 0;
-  const result = await ensureConfigured();
-  assert.equal(result.changed, true);
-  assert.deepEqual(updates, [{ key: "cliExecutable", value: undefined, global: 1 }]);
-  assert.equal(result.launcher, "");
-  assert.equal(result.mode, "native_codex");
-});
-
-test("legacy mux paths from Linux macOS and Windows hosts are all recognized", () => {
+test("legacy mux paths from other Linux, macOS and Windows hosts are reset at Global scope", async () => {
   for (const value of [
     "/home/metal/.vscode-server/data/User/globalStorage/shrec.aiworkhub/bin/aiworkhub-app-server-mux",
+    "/home/metal/.local/bin/aiworkhub-app-server-mux",
     "/Users/alice/Library/Application Support/Code/User/globalStorage/shrec.aiworkhub/bin/aiworkhub-app-server-mux",
     "C:\\Users\\bob\\AppData\\Roaming\\Code\\User\\globalStorage\\shrec.aiworkhub\\bin\\aiworkhub-app-server-mux.cmd",
+    "C:\\Users\\bob\\AppData\\Roaming\\Code\\User\\globalStorage\\ivanechkheidze.aiworkhub\\bin\\aiworkhub-app-server-mux.exe",
+    "/home/old/.vscode-server/extensions/shrec.aiworkhub-missing/bin/aiworkhub-app-server-mux",
   ]) {
     assert.equal(__testInternals.isLegacyAiWorkHubMuxPath(value), true, value);
+    assert.deepEqual(await restoreFrom(value), RESET, value);
+    assert.deepEqual(updates, GLOBAL_RESET, value);
+    assert.equal(currentValue, undefined, value);
   }
 });
 
-test("Windows upgrades a bare mux command to the activation-order-safe native path", async () => {
-  const codexRoot = path.join(temp, "openai-chatgpt-bare-upgrade");
-  const arch = process.arch === "arm64" ? "aarch64" : process.arch === "x64" ? "x86_64" : process.arch;
-  const platformName = process.platform === "win32" ? "windows" : process.platform;
-  const executable = path.join(codexRoot, "bin", `${platformName}-${arch}`, process.platform === "win32" ? "codex.exe" : "codex");
-  fs.mkdirSync(path.dirname(executable), { recursive: true });
-  fs.writeFileSync(executable, "codex", { mode: 0o755 });
-  fakeVscode.extensions.getExtension = () => ({ extensionPath: codexRoot });
-  installFakePackagedWindowsLauncher();
-  currentValue = "aiworkhub-app-server-mux";
-  updates.length = 0;
-  try {
-      const result = await ensureConfigured();
-    assert.equal(result.ok, true);
-    if (process.platform === "win32") {
-      assert.equal(result.changed, true);
-      assert.equal(currentValue, expectedConfiguredLauncher());
-      assert.deepEqual(updates.filter((entry) => entry.key === "cliExecutable"), [
-        { key: "cliExecutable", value: expectedConfiguredLauncher(), global: 1 },
-      ]);
-    } else {
-      assert.equal(result.changed, false);
-      assert.deepEqual(updates, []);
-    }
-  } finally {
-    fakeVscode.extensions.getExtension = () => null;
+test("a custom Codex executable is never touched", async () => {
+  for (const value of [
+    "/usr/local/bin/codex",
+    "C:\\tools\\codex\\codex.exe",
+    "codex",
+    "my-aiworkhub-app-server-mux",
+    "aiworkhub-app-server-mux-wrapper",
+    "aiworkhub-app-server-mux.sh",
+    "/opt/aiworkhub-app-server-mux/bin/codex",
+  ]) {
+    assert.equal(__testInternals.isAiWorkHubMuxExecutable(value), false, value);
+    assert.deepEqual(
+      await restoreFrom(value),
+      { ok: true, changed: false, reason: "custom_cli_executable_preserved" },
+      value,
+    );
+    assert.deepEqual(updates, [], value);
+    assert.equal(currentValue, value, value);
   }
 });
 
-test("unrelated custom Codex executable is never overwritten", async () => {
-  currentValue = path.join(temp, "custom-codex");
-  updates.length = 0;
-  const result = await ensureConfigured();
-  assert.equal(result.ok, false);
-  assert.equal(result.reason, "custom_cli_executable_preserved");
+test("an empty Codex executable is never touched", async () => {
+  for (const value of ["", "   ", undefined, null]) {
+    assert.deepEqual(
+      await restoreFrom(value),
+      { ok: true, changed: false, reason: "cli_executable_unset" },
+      String(value),
+    );
+    assert.deepEqual(updates, [], String(value));
+    assert.equal(currentValue, value, String(value));
+  }
+});
+
+test("the reset is idempotent: the next activation finds native Codex and writes nothing", async () => {
+  assert.deepEqual(await restoreFrom("aiworkhub-app-server-mux.exe"), RESET);
+  assert.deepEqual(updates, GLOBAL_RESET);
+  assert.deepEqual(
+    await restoreFrom(currentValue),
+    { ok: true, changed: false, reason: "cli_executable_unset" },
+  );
   assert.deepEqual(updates, []);
 });
 
-test("legacy cleanup does not depend on the optional mux launcher existing", async () => {
-  currentValue = "/home/old/.vscode-server/extensions/shrec.aiworkhub-missing/bin/aiworkhub-app-server-mux";
-  updates.length = 0;
-  const missingContext = {
-    extensionUri: { fsPath: path.join(temp, "does-not-exist") },
-  };
-  const result = await ensureConfigured(missingContext);
-  assert.equal(result.ok, true);
-  assert.equal(result.changed, true);
-  assert.deepEqual(updates, [{ key: "cliExecutable", value: undefined, global: 1 }]);
-});
-
-test("stable launcher lives outside versioned VSIX and follows runtime current.json", async () => {
-  const runtimeDir = path.join(globalStorage, "runtime", "generations", "current", "runtime");
-  fs.mkdirSync(path.join(runtimeDir, "aiworkhub"), { recursive: true });
-  fs.writeFileSync(path.join(runtimeDir, "aiworkhub", "app_server_mux.py"), "def main(): return 0\n");
-  fs.mkdirSync(path.join(globalStorage, "runtime"), { recursive: true });
-  fs.writeFileSync(
-    path.join(globalStorage, "runtime", "current.json"),
-    JSON.stringify({ runtime_dir: runtimeDir }),
-  );
-  const stable = __testInternals.materializeStableMuxLauncher(context);
-  assert.ok(stable.startsWith(path.join(globalStorage, "bin")));
-  assert.ok(!stable.startsWith(context.extensionUri.fsPath + path.sep + "bin"));
-  const pythonLauncher = path.join(path.dirname(stable), "aiworkhub-app-server-mux.py");
-  assert.ok(fs.readFileSync(pythonLauncher, "utf8").includes('runtime / "aiworkhub" / "app_server_mux.py"'));
-  if (process.platform === "win32") {
-    assert.ok(stable.endsWith(".cmd"));
-    assert.ok(fs.readFileSync(stable, "utf8").includes("aiworkhub-app-server-mux.py"));
-  } else {
-    assert.ok((fs.statSync(stable).mode & 0o111) !== 0);
-  }
-});
-
-test("macOS uses the executable POSIX launcher instead of a Windows command wrapper", () => {
-  const originalPlatform = process.platform;
-  Object.defineProperty(process, "platform", { value: "darwin" });
+test("a mux value that cannot be reset is reported as a failure, never thrown", async () => {
+  updateSupported = false;
   try {
-    const stable = __testInternals.materializeStableMuxLauncher(context);
-    assert.equal(stable, path.join(globalStorage, "bin", "aiworkhub-app-server-mux"));
-    assert.ok(!stable.endsWith(".cmd"));
-  } finally {
-    Object.defineProperty(process, "platform", { value: originalPlatform });
-  }
-});
-
-test("macOS and Linux keep the machine-neutral mux setting", () => {
-  const hostPath = "/Users/alice/Library/Application Support/Code/User/globalStorage/aiworkhub/bin/aiworkhub-app-server-mux";
-  assert.equal(__testInternals.codexMuxLauncherSetting("darwin", hostPath), "aiworkhub-app-server-mux");
-  assert.equal(__testInternals.codexMuxLauncherSetting("linux", hostPath), "aiworkhub-app-server-mux");
-  assert.equal(__testInternals.codexMuxLauncherSetting("win32", "C:\\runtime\\mux.exe"), "C:\\runtime\\mux.exe");
-});
-
-test("bootstrap runtime pointer is available before immutable generation materialization", () => {
-  const packagedRuntime = path.join(temp, "runtime");
-  fs.mkdirSync(path.join(packagedRuntime, "aiworkhub"), { recursive: true });
-  fs.writeFileSync(path.join(packagedRuntime, "aiworkhub", "__init__.py"), "__version__ = 'test'\n");
-  fs.writeFileSync(path.join(packagedRuntime, "aiworkhub", "app_server_mux.py"), "def main(): return 0\n");
-  const result = __testInternals.primeStableMuxRuntimePointer(context);
-  const pointer = JSON.parse(
-    fs.readFileSync(path.join(globalStorage, "runtime", "current.json"), "utf8"),
-  );
-  assert.equal(result.runtimeDir, packagedRuntime);
-  assert.equal(pointer.runtime_dir, packagedRuntime);
-  assert.equal(pointer.bootstrap, true);
-});
-
-test("manifest-default mux command is materialized on the extension-host PATH", () => {
-  const home = path.join(temp, "shim-home");
-  const env = { PATH: path.join(home, "existing-bin") };
-  const shim = __testInternals.materializePathMuxShim(launcher, {
-    platform: "linux",
-    home,
-    env,
-  });
-  assert.equal(shim, path.join(home, ".local", "bin", "aiworkhub-app-server-mux"));
-  assert.ok(env.PATH.startsWith(path.join(home, ".local", "bin") + path.delimiter));
-  assert.ok(fs.readFileSync(shim, "utf8").includes(launcher));
-  if (process.platform !== "win32") {
-    assert.ok((fs.statSync(shim).mode & 0o111) !== 0);
-  }
-});
-
-test("Windows PATH shim stays in extension-owned storage and never depends on POSIX mode bits", () => {
-  const home = path.join(temp, "windows-shim-home");
-  const shim = __testInternals.materializePathMuxShim(launcher, {
-    platform: "win32",
-    home,
-    env: { PATH: "" },
-  });
-  assert.equal(
-    shim,
-    path.join(path.dirname(launcher), "aiworkhub-app-server-mux.cmd"),
-  );
-  assert.ok(!shim.includes("WindowsApps"));
-  const content = fs.readFileSync(shim, "utf8");
-  assert.ok(content.startsWith("@echo off"));
-  assert.ok(content.includes(launcher));
-});
-
-test("packaged Windows host installs a native shell-free launcher with an exact target", () => {
-  const home = path.join(temp, "windows-native-home");
-  const native = path.join(temp, "packaged", "aiworkhub-app-server-mux.exe");
-  fs.mkdirSync(path.dirname(native), { recursive: true });
-  fs.writeFileSync(native, Buffer.from("MZ-native-launcher"));
-  const shim = __testInternals.materializePathMuxShim(launcher, {
-    platform: "win32",
-    home,
-    env: { PATH: "" },
-    windowsNativeLauncher: native,
-  });
-  assert.equal(
-    shim,
-    path.join(path.dirname(launcher), "aiworkhub-app-server-mux.exe"),
-  );
-  assert.deepEqual(fs.readFileSync(shim), fs.readFileSync(native));
-  assert.equal(
-    fs.readFileSync(`${shim}.target`, "utf8").trim(),
-    path.join(path.dirname(launcher), "aiworkhub-app-server-mux.py"),
-  );
-});
-
-test("native launcher EPERM falls back to exact binary-safe read write rename", () => {
-  const home = path.join(temp, "windows-native-eperm-home");
-  const native = path.join(temp, "packaged-eperm", "aiworkhub-app-server-mux.exe");
-  fs.mkdirSync(path.dirname(native), { recursive: true });
-  const expected = Buffer.from([0x4d, 0x5a, 0x00, 0xff, 0x10, 0x0a]);
-  fs.writeFileSync(native, expected);
-  const originalCopy = fs.copyFileSync;
-  fs.copyFileSync = (source, destination) => {
-    if (source === native) {
-      const error = new Error(`EPERM: copyfile '${source}' -> '${destination}'`);
-      error.code = "EPERM";
-      throw error;
-    }
-    return originalCopy(source, destination);
-  };
-  try {
-    const shim = __testInternals.materializePathMuxShim(launcher, {
-      platform: "win32",
-      home,
-      env: { PATH: "" },
-      windowsNativeLauncher: native,
-    });
-    assert.deepEqual(fs.readFileSync(shim), expected);
-    assert.equal(
-      fs.readdirSync(path.dirname(shim)).filter((name) => name.includes(".tmp-")).length,
-      0,
+    assert.deepEqual(
+      await restoreFrom("aiworkhub-app-server-mux"),
+      { ok: false, changed: false, reason: "configuration_update_unavailable" },
     );
   } finally {
-    fs.copyFileSync = originalCopy;
+    updateSupported = true;
   }
-});
-
-test("native launcher EPERM fallback fails closed when destination removal fails", () => {
-  const home = path.join(temp, "windows-native-remove-failure-home");
-  const native = path.join(temp, "packaged-remove-failure", "aiworkhub-app-server-mux.exe");
-  fs.mkdirSync(path.dirname(native), { recursive: true });
-  fs.writeFileSync(native, Buffer.from("MZ-original"));
-  const shim = __testInternals.materializePathMuxShim(launcher, {
-    platform: "win32",
-    home,
-    env: { PATH: "" },
-    windowsNativeLauncher: native,
-  });
-  const installedBefore = fs.readFileSync(shim);
-  fs.writeFileSync(native, Buffer.from("MZ-replacement"));
-
-  const originalCopy = fs.copyFileSync;
-  const originalRm = fs.rmSync;
-  fs.copyFileSync = () => {
-    const error = new Error("EPERM: injected copy failure");
-    error.code = "EPERM";
-    throw error;
-  };
-  fs.rmSync = (target, options) => {
-    if (target === shim) {
-      const error = new Error("EPERM: injected destination removal failure");
-      error.code = "EPERM";
-      throw error;
-    }
-    return originalRm(target, options);
-  };
+  assert.equal(currentValue, "aiworkhub-app-server-mux");
+  updateFailure = new Error("EACCES: settings.json is read-only");
   try {
-    assert.throws(
-      () => __testInternals.materializePathMuxShim(launcher, {
-        platform: "win32",
-        home,
-        env: { PATH: "" },
-        windowsNativeLauncher: native,
-      }),
-      /destination removal failure/,
-    );
-    assert.deepEqual(fs.readFileSync(shim), installedBefore);
-    assert.equal(
-      fs.readdirSync(path.dirname(shim)).filter((name) => name.includes(".tmp-")).length,
-      0,
+    assert.deepEqual(
+      await restoreFrom("aiworkhub-app-server-mux"),
+      { ok: false, changed: false, reason: "configuration_update_failed" },
     );
   } finally {
-    fs.copyFileSync = originalCopy;
-    fs.rmSync = originalRm;
+    updateFailure = null;
+  }
+  assert.deepEqual(updates, []);
+  assert.equal(currentValue, "aiworkhub-app-server-mux");
+});
+
+test("activation resets the Codex executable unconditionally", () => {
+  const activateStart = source.indexOf("async function activate(context)");
+  const activateEnd = source.indexOf("async function deactivate()", activateStart);
+  assert.ok(activateStart >= 0 && activateEnd > activateStart, "activate() markers are missing or renamed");
+  const activateSource = source.slice(activateStart, activateEnd);
+  // Two-space indentation is the activate() body itself, so no feature flag
+  // or branch can skip the reset.
+  assert.match(activateSource, /\r?\n {2}await restoreNativeCodexExecutable\(\);\r?\n/);
+  assert.equal(activateSource.split("restoreNativeCodexExecutable(").length, 2);
+});
+
+test("no extension code path writes a launcher into chatgpt.cliExecutable", () => {
+  const writes = [...source.matchAll(/\.update\(\s*"cliExecutable",\s*([^,\s)]+)/g)].map((match) => match[1]);
+  assert.deepEqual(writes, ["undefined"]);
+  for (const retired of [
+    "ensureCodexCallbackMuxConfigured",
+    "materializeStableMuxLauncher",
+    "materializePathMuxShim",
+    "primeStableMuxRuntimePointer",
+    "codexMuxLauncherSetting",
+  ]) {
+    assert.equal(__testInternals[retired], undefined, retired);
   }
 });
 
-test("non-EPERM native launcher copy failures remain fail closed", () => {
-  const native = path.join(temp, "packaged-eio", "aiworkhub-app-server-mux.exe");
-  fs.mkdirSync(path.dirname(native), { recursive: true });
-  fs.writeFileSync(native, Buffer.from("MZ-eio"));
-  const originalCopy = fs.copyFileSync;
-  fs.copyFileSync = () => {
-    const error = new Error("EIO: injected copy failure");
-    error.code = "EIO";
-    throw error;
-  };
-  try {
-    assert.throws(
-      () => __testInternals.materializePathMuxShim(launcher, {
-        platform: "win32",
-        home: path.join(temp, "windows-native-eio-home"),
-        env: { PATH: "" },
-        windowsNativeLauncher: native,
-      }),
-      /EIO: injected copy failure/,
-    );
-  } finally {
-    fs.copyFileSync = originalCopy;
-  }
-});
-
-test("package never changes the Codex executable without explicit opt-in", () => {
+test("the package contributes no Codex mux opt-in and no configuration defaults", () => {
   const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, "..", "package.json"), "utf8"));
   assert.equal(manifest.contributes.configurationDefaults, undefined);
-  assert.equal(manifest.contributes.configuration.properties["aiworkhub.enableCodexCallbackMux"].default, false);
+  assert.equal(manifest.contributes.configuration.properties["aiworkhub.enableCodexCallbackMux"], undefined);
 });

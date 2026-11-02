@@ -1,4 +1,3 @@
-const childProcess = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
@@ -19,11 +18,6 @@ let extensionDir = path.join(staging, "extension");
 // at this directory.
 const PY_RUNTIME_SRC = path.join(root, "..", "src", "aiworkhub");
 let PY_RUNTIME_DEST = path.join(extensionDir, "runtime", "aiworkhub");
-const MUX_LAUNCHER_SRC = path.join(root, "..", "scripts", "aiworkhub-app-server-mux");
-let MUX_LAUNCHER_DEST = path.join(extensionDir, "bin", "aiworkhub-app-server-mux");
-const MUX_LAUNCHER_CMD_SRC = path.join(root, "..", "scripts", "aiworkhub-app-server-mux.cmd");
-let MUX_LAUNCHER_CMD_DEST = path.join(extensionDir, "bin", "aiworkhub-app-server-mux.cmd");
-const NATIVE_LAUNCHER_SRC = path.join(root, "native-launcher", "main.go");
 const PACKAGE_SOURCE_OVERRIDES = Object.freeze({
   "media/aiworkhub-block-diagram.png": path.join(
     root,
@@ -104,14 +98,6 @@ function applyPackagingLayout(layout) {
   staging = layout.staging;
   extensionDir = layout.extensionDir;
   PY_RUNTIME_DEST = resolveOutputPath(layout, "vsix-staging", "extension", "runtime", "aiworkhub");
-  MUX_LAUNCHER_DEST = resolveOutputPath(layout, "vsix-staging", "extension", "bin", "aiworkhub-app-server-mux");
-  MUX_LAUNCHER_CMD_DEST = resolveOutputPath(
-    layout,
-    "vsix-staging",
-    "extension",
-    "bin",
-    "aiworkhub-app-server-mux.cmd",
-  );
   return layout;
 }
 
@@ -379,8 +365,8 @@ function packageWithVersionGate({
 
 // VSIX is a regular ZIP container.  Build it with Node primitives so a clean
 // Windows host does not need a separately-installed `zip` executable.  Stored
-// entries are deliberate: the two native launcher binaries are already dense,
-// while a dependency-free writer keeps local and CI packaging identical.
+// entries are deliberate: a dependency-free writer keeps local and CI
+// packaging identical.
 const CRC32_TABLE = (() => {
   const table = new Uint32Array(256);
   for (let index = 0; index < 256; index += 1) {
@@ -532,24 +518,6 @@ if (!fs.existsSync(path.join(PY_RUNTIME_SRC, "__init__.py"))) {
   throw new Error(`aiworkhub Python package not found at ${PY_RUNTIME_SRC}`);
 }
 copyPythonRuntime(PY_RUNTIME_SRC, PY_RUNTIME_DEST);
-fs.mkdirSync(path.dirname(MUX_LAUNCHER_DEST), { recursive: true });
-fs.copyFileSync(MUX_LAUNCHER_SRC, MUX_LAUNCHER_DEST);
-fs.copyFileSync(MUX_LAUNCHER_CMD_SRC, MUX_LAUNCHER_CMD_DEST);
-for (const [goarch, folder] of [["amd64", "windows-x86_64"], ["arm64", "windows-aarch64"]]) {
-  const nativeDest = resolveOutputPath(layout, "vsix-staging", "extension", "bin", folder, "aiworkhub-app-server-mux.exe");
-  fs.mkdirSync(path.dirname(nativeDest), { recursive: true });
-  childProcess.execFileSync("go", ["build", "-trimpath", "-ldflags=-s -w", "-o", nativeDest, NATIVE_LAUNCHER_SRC], {
-    cwd: root,
-    env: { ...process.env, GOOS: "windows", GOARCH: goarch, CGO_ENABLED: "0" },
-    stdio: "inherit",
-  });
-  if (!fs.statSync(nativeDest).isFile() || fs.statSync(nativeDest).size < 1024) {
-    throw new Error(`native Windows mux launcher is missing or invalid: ${folder}`);
-  }
-}
-if (process.platform !== "win32") {
-  fs.chmodSync(MUX_LAUNCHER_DEST, 0o755);
-}
 if (!fs.existsSync(path.join(PY_RUNTIME_DEST, "server.py"))) {
   throw new Error("bundled aiworkhub runtime is missing server.py after copy");
 }
@@ -561,21 +529,6 @@ if (!fs.existsSync(path.join(PY_RUNTIME_DEST, "callback_store.py"))) {
 }
 if (!fs.existsSync(path.join(PY_RUNTIME_DEST, "dashboard_static", "index.html"))) {
   throw new Error("bundled aiworkhub runtime is missing dashboard_static assets after copy");
-}
-{
-  const muxStat = fs.statSync(MUX_LAUNCHER_DEST);
-  if (!muxStat.isFile()) {
-    throw new Error("bundled App Server mux launcher is missing or not a regular file");
-  }
-  if (process.platform !== "win32" && !(muxStat.mode & 0o111)) {
-    throw new Error("bundled App Server mux launcher is missing or not executable");
-  }
-}
-{
-  const cmdStat = fs.statSync(MUX_LAUNCHER_CMD_DEST);
-  if (!cmdStat.isFile()) {
-    throw new Error("bundled App Server mux .cmd launcher is missing or not a regular file");
-  }
 }
 
 const manifest = `<?xml version="1.0" encoding="utf-8"?>
@@ -616,7 +569,6 @@ const contentTypes = `<?xml version="1.0" encoding="utf-8"?>
   <Default Extension="vsixmanifest" ContentType="text/xml"/>
   <Default Extension="py" ContentType="text/x-python"/>
   <Default Extension="html" ContentType="text/html"/>
-  <Default Extension="exe" ContentType="application/octet-stream"/>
 </Types>
 `;
 

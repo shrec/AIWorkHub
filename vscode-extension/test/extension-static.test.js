@@ -43,7 +43,7 @@ for (const title of commands.values()) {
 assert.strictEqual(pkg.contributes.viewsContainers.activitybar[0].id, "aiworkhub");
 assert.strictEqual(pkg.contributes.views.aiworkhub[0].id, "aiworkhub.view");
 assert.ok(pkg.contributes.configuration.properties["aiworkhub.refreshIntervalMs"]);
-assert.strictEqual(pkg.contributes.configuration.properties["aiworkhub.enableCodexCallbackMux"].default, false);
+assert.strictEqual(pkg.contributes.configuration.properties["aiworkhub.enableCodexCallbackMux"], undefined);
 assert.strictEqual(pkg.contributes.configuration.properties["aiworkhub.enableVscodeLmBridge"].default, true);
 assert.ok(ext.includes('onDidChangeConfiguration(async (event) =>'));
 assert.ok(ext.includes('event.affectsConfiguration(`${EXT_ID}.enableVscodeLmBridge`)'));
@@ -164,19 +164,22 @@ assert.ok(ext.includes('"managerLoopStop"'));
 assert.ok(ext.includes('stop: "aiworkhub_manager_loop_stop"'));
 assert.ok(ext.includes('id="manager-chat-stop"'));
 
-// The same-host mux is materialized before it can be advertised, and the
-// application-scoped override is enabled only behind the explicit OpenAI
-// extension co-location gate. Split-host Remote-SSH remains native/fail-open.
-assert.ok(ext.includes("materializeStableMuxLauncher(context)"));
-assert.ok(ext.includes("await ensureCodexCallbackMuxConfigured(context)"));
-assert.ok(
-  ext.lastIndexOf("materializeStableMuxLauncher(context)")
-    < ext.lastIndexOf("await ensureCodexCallbackMuxConfigured(context)"),
-);
-assert.ok(!ext.includes('config.update("cliExecutable", launcher, true)'));
-assert.ok(ext.includes("custom_cli_executable_preserved"));
-assert.ok(ext.includes("codex_extension_not_colocated"));
-assert.match(ext, /syncConfig\.update\(\r?\n\s+"ignoredSettings"/);
+// The App Server mux opt-in is retired: nothing materializes a mux launcher,
+// PATH shim or executable pin, and Settings Sync is never edited. Activation
+// only resets a leftover AIWorkHub mux chatgpt.cliExecutable to native Codex.
+absent(ext, [
+  "enableCodexCallbackMux",
+  "codexCallbackMuxEnabled",
+  "ensureCodexCallbackMuxConfigured",
+  "materializeStableMuxLauncher",
+  "materializePathMuxShim",
+  "primeStableMuxRuntimePointer",
+  "codexMuxLauncherSetting",
+  "pinMuxRealExecutable",
+  "keepMuxSettingHostLocal",
+  'getConfiguration("settingsSync")',
+], "retired Codex App Server mux opt-in");
+assert.ok(ext.includes("await restoreNativeCodexExecutable()"));
 assert.ok(ext.includes("env.PYTHONPATH ="));
 assert.ok(ext.includes("cwd: runtimeDir || root"));
 assert.ok(!ext.includes('cwd: root,'));

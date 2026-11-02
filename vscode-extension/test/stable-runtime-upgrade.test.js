@@ -14,29 +14,21 @@ assert.ok(source.includes("fs.renameSync(staging, generationRoot)"));
 assert.ok(source.includes("if (!fs.existsSync(manifestPath)) throw err"));
 assert.ok(source.includes("generationName = `${version}-${fingerprint.slice(0, 16)}`"));
 assert.ok(!source.includes("mux_path"));
-assert.ok(source.includes("materializeStableMuxLauncher(context)"));
-assert.ok(source.includes("ensureCodexCallbackMuxConfigured(context)"));
-assert.ok(source.includes("primeStableMuxRuntimePointer(context)"));
 assert.ok(source.includes("stableRuntime = bundledRuntimeFallback(context)"));
 assert.ok(source.includes('const runtimeLabel = stableRuntime.generationRoot'));
 
 const activateStart = source.indexOf("async function activate(context)");
 const activateEnd = source.indexOf("async function deactivate()", activateStart);
 const activateSource = source.slice(activateStart, activateEnd);
+const restoreNativeCodex = activateSource.indexOf("await restoreNativeCodexExecutable()");
+assert.ok(restoreNativeCodex >= 0, "activation must restore native Codex");
 assert.ok(
-  activateSource.indexOf("primeStableMuxRuntimePointer(context)")
-    < activateSource.indexOf("materializeStableRuntimeGeneration(context)"),
-  "the mux runtime pointer must be published before expensive generation materialization",
+  restoreNativeCodex < activateSource.indexOf("refreshCoordinatorRouteOwnership(activeRepoIdentity)"),
+  "native Codex must be restored before the exact repo/extension-host route is published",
 );
 assert.ok(
-  activateSource.indexOf("materializeStableMuxLauncher(context)")
-    < activateSource.indexOf("ensureCodexCallbackMuxConfigured(context)"),
-  "the fail-open mux launcher must exist before a co-located Codex can select it",
-);
-assert.ok(
-  activateSource.indexOf("refreshCoordinatorRouteOwnership(activeRepoIdentity)")
-    < activateSource.indexOf("ensureCodexCallbackMuxConfigured(context)"),
-  "the exact repo/extension-host route must exist before Codex can start through the mux",
+  restoreNativeCodex < activateSource.indexOf("materializeStableRuntimeGeneration(context)"),
+  "native Codex must be restored before expensive generation materialization",
 );
 assert.ok(
   activateSource.indexOf("refreshCoordinatorRouteOwnership(activeRepoIdentity)")

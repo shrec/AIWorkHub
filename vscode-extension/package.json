@@ -112,12 +112,6 @@
           "scope": "resource",
           "description": "Optional Python executable. Empty uses the selected repository virtual environment when present, otherwise Python from the system PATH."
         },
-        "aiworkhub.enableCodexCallbackMux": {
-          "type": "boolean",
-          "default": false,
-          "scope": "window",
-          "description": "Opt in to the same-host Codex callback mux. Disabled by default to avoid changing another extension's executable configuration."
-        },
         "aiworkhub.enableVscodeLmBridge": {
           "type": "boolean",
           "default": true,
