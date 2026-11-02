@@ -5392,7 +5392,7 @@ def create_task(
         if depends_on2:
             existing_cards: dict[str, dict[str, Any]] = {}
             for row in conn.execute(
-                "SELECT task_id, card_json, archived_at FROM tasks"
+                "SELECT task_id, card_json, archived_at, worker_status FROM tasks"
             ):
                 try:
                     existing_card = json.loads(row["card_json"] or "{}")
@@ -5403,11 +5403,16 @@ def create_task(
                 if str(row["archived_at"] or "").strip():
                     existing_card["archived_at"] = str(row["archived_at"])
                     existing_card["status"] = "archived"
+                    # archive_task never rewrites worker_status, so the row
+                    # column is the prior state that decides whether the
+                    # archived card's work landed (task_plan owns the rule).
+                    existing_card["worker_status"] = str(row["worker_status"] or "")
                 existing_cards[row["task_id"]] = existing_card
             existing_edges, invalid_ids = task_plan.existing_edges_from_cards(existing_cards)
             try:
                 task_plan.validate_new_dependency_edge(
-                    task_id, depends_on2, existing_edges, invalid_ids=invalid_ids
+                    task_id, depends_on2, existing_edges, invalid_ids=invalid_ids,
+                    archived_unsatisfied=task_plan.archived_unsatisfied_ids(existing_cards),
                 )
             except task_plan.TaskPlanError as exc:
                 conn.rollback()
@@ -6621,6 +6626,50 @@ def _validate_read_first_amendment_paths(
     return list(entries), None
 
 
+_REJECT_CLOSABLE_FAILED_STATES = frozenset({"failed", "worker_failed"})
+_REJECT_CLOSURE_TOOLS = (
+    "aiworkhub_task_archive",
+    "aiworkhub_task_supersede",
+    "aiworkhub_task_retry_terminal",
+)
+
+
+def _reject_closable_terminal_card(card: Mapping[str, Any]) -> bool:
+    """A non-review card reject_review may retire as archived/superseded.
+
+    Only a blocked or failed card qualifies: its last attempt is terminal and
+    no worker is live.  The canonical lifecycle (``task_store.canonical_status``)
+    decides, so a processing/claimed card -- or anything unrecognised -- is
+    never closable here (fail closed).  A held launch reservation is still
+    refused by ``task_store.archive_task`` itself.
+    """
+    canonical = task_store.canonical_status(dict(card))
+    if canonical == "blocked":
+        return True
+    if canonical != "pending":
+        return False
+    status = str(card.get("status") or "").strip().lower()
+    worker_status = str(card.get("worker_status") or "").strip().lower()
+    return (
+        status in _REJECT_CLOSABLE_FAILED_STATES
+        or worker_status in _REJECT_CLOSABLE_FAILED_STATES
+    )
+
+
+def _reject_not_reviewable(task_id: str, command: list[str]) -> dict[str, Any]:
+    """The one reject_not_reviewable refusal, naming the closure tools."""
+    return _canonical_result(
+        ok=False,
+        returncode=1,
+        stderr=(
+            f"reject_not_reviewable:task_id={task_id} -- the card is not in review "
+            "(and not a blocked/failed card closable as archived/superseded); close "
+            "or recover it with " + ", ".join(_REJECT_CLOSURE_TOOLS)
+        ),
+        command=command,
+    )
+
+
 def reject_review(
     task_id: str,
     reason: str,
@@ -7044,17 +7093,20 @@ def reject_review(
     if explicit_failure_category is not None:
         command.extend(["--failure-category", explicit_failure_category])
     # archived / superseded retire the card atomically (archived_at + card_json
-    # + task_events) via the shared archive backend. Only a card actually in
-    # review may be rejected.
+    # + task_events) via the shared archive backend. A card in review may be
+    # retired; so may a blocked/failed card whose last attempt is terminal
+    # (NF-2026-01999) -- it has no live worker, so closing it is the same
+    # archive with the same audit event. A processing card never is.
     if disposition in ("archived", "superseded"):
-        if str(card.get("worker_status") or "").strip().lower() != "review":
-            return _canonical_result(
-                ok=False, returncode=1, stderr=f"reject_not_reviewable:task_id={task_id}", command=command
-            )
+        in_review = str(card.get("worker_status") or "").strip().lower() == "review"
+        closable_terminal = not in_review and _reject_closable_terminal_card(card)
+        if not in_review and not closable_terminal:
+            return _reject_not_reviewable(task_id, command)
         ok, state = task_store.archive_task(
             repo_root(), task_id,
             actor=actor, reason=f"reject_review:{reason}"[:200],
-            allow_processing=(disposition == "superseded"),
+            # A blocked/failed closure never overrides the live-launch guard.
+            allow_processing=(disposition == "superseded" and in_review),
             operation=disposition,
         )
         if not ok:
@@ -7394,9 +7446,7 @@ def reject_review(
         )
         if cur.rowcount != 1:
             conn.rollback()
-            return _canonical_result(
-                ok=False, returncode=1, stderr=f"reject_not_reviewable:task_id={task_id}", command=command
-            )
+            return _reject_not_reviewable(task_id, command)
         conn.execute(
             "INSERT INTO task_events (task_id, event, runner, payload_json, created_at) VALUES (?,?,?,?,?)",
             (

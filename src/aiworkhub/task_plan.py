@@ -395,6 +395,47 @@ def normalize_depends_on(depends_on: list[str] | None) -> list[str]:
     return out
 
 
+ARCHIVED_DEPENDENCY_UNSATISFIED = "dependency_archived_unsatisfied"
+
+
+def archived_dependency_satisfied(card: dict[str, Any]) -> bool:
+    """True iff ``card`` was archived AFTER its work reached the canonical tree.
+
+    ``archive_task`` overwrites ``status`` but never ``worker_status``, and
+    ``worker_status='done'`` is written only together with ``status='finished'``
+    when a card's work is accepted/promoted.  Such a card is a satisfied
+    dependency with no further edges.  A superseded archive is never decided
+    here: it resolves only through its explicit replacement chain
+    (:func:`resolve_superseded_dependency`).  Anything else -- including an
+    unknown/absent ``worker_status`` -- is not landed (fail closed).
+    """
+    if lifecycle_state(card) != "archived":
+        return False
+    if str(card.get("archive_operation") or "").strip().lower() == "superseded":
+        return False
+    return str(card.get("worker_status") or "").strip().lower() == "done"
+
+
+def archived_unsatisfied_ids(cards: dict[str, dict[str, Any]]) -> set[str]:
+    """Archived, non-superseded cards that were retired without landing work."""
+    return {
+        tid
+        for tid, card in cards.items()
+        if lifecycle_state(card) == "archived"
+        and str(card.get("archive_operation") or "").strip().lower() != "superseded"
+        and not archived_dependency_satisfied(card)
+    }
+
+
+def archived_unsatisfied_message(task_id: str) -> str:
+    """Named refusal for a dependency on a card archived without landing work."""
+    return (
+        f"{ARCHIVED_DEPENDENCY_UNSATISFIED}:{task_id} -- card was archived without "
+        "landing work; record its replacement with aiworkhub_task_supersede and "
+        "depend on the replacement card instead"
+    )
+
+
 def existing_edges_from_cards(
     cards: dict[str, dict[str, Any]],
 ) -> tuple[dict[str, list[str]], set[str]]:
@@ -405,11 +446,15 @@ def existing_edges_from_cards(
     treated as ``[]``/edge-free: its task_id is instead returned in the
     second element (``invalid_ids``) so callers can refuse to build new
     edges through it (fail closed) rather than pretending it has no
-    dependencies.
+    dependencies.  A card archived after its work landed
+    (:func:`archived_dependency_satisfied`) is a satisfied node with no edges.
     """
     edges: dict[str, list[str]] = {}
     invalid_ids: set[str] = set()
     for tid, card in cards.items():
+        if archived_dependency_satisfied(card):
+            edges[tid] = []
+            continue
         if lifecycle_state(card) == "archived":
             resolved, _chain, error = resolve_superseded_dependency(tid, cards)
             if error is not None or resolved is None or resolved == tid:
@@ -426,6 +471,9 @@ def existing_edges_from_cards(
             continue
         resolved_dependencies: list[str] = []
         for dependency_id in raw_dependencies:
+            dependency_card = cards.get(dependency_id)
+            if dependency_card is not None and archived_dependency_satisfied(dependency_card):
+                continue
             resolved, _chain, error = resolve_superseded_dependency(dependency_id, cards)
             if error is not None or resolved is None:
                 invalid_ids.add(tid)
@@ -442,6 +490,7 @@ def validate_new_dependency_edge(
     existing_edges: dict[str, list[str]],
     *,
     invalid_ids: set[str] | None = None,
+    archived_unsatisfied: set[str] | None = None,
 ) -> None:
     """Validate that ``task_id -> depends_on`` is a legal edge to add.
 
@@ -451,14 +500,18 @@ def validate_new_dependency_edge(
     edge that would introduce a cycle, or an edge that passes through a card
     whose own ``depends_on`` is malformed (``invalid_ids``) -- such a card's
     true dependency set is unknown, so we fail closed rather than assume it
-    has none.
+    has none.  A card archived without landing work (``archived_unsatisfied``,
+    see :func:`archived_unsatisfied_ids`) is refused by its own name.
     """
     invalid_ids = invalid_ids or set()
+    archived_unsatisfied = archived_unsatisfied or set()
     for dep in depends_on:
         if dep == task_id:
             raise TaskPlanError("self_dependency_forbidden")
         if dep not in existing_edges:
             raise TaskPlanError(f"dependency_not_found:{dep}")
+        if dep in archived_unsatisfied:
+            raise TaskPlanError(archived_unsatisfied_message(dep))
         if dep in invalid_ids:
             raise TaskPlanError(f"dependency_has_invalid_depends_on:{dep}")
     visited: set[str] = set()
@@ -470,6 +523,8 @@ def validate_new_dependency_edge(
         if node in visited:
             continue
         visited.add(node)
+        if node in archived_unsatisfied:
+            raise TaskPlanError(archived_unsatisfied_message(node))
         if node in invalid_ids:
             raise TaskPlanError(f"dependency_has_invalid_depends_on:{node}")
         stack.extend(existing_edges.get(node, []))
@@ -626,6 +681,10 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
         resolution_errors: list[str] = []
         for dependency_id in raw_dependencies:
             if dependency_id in excluded_ids:
+                continue
+            dependency_card = all_by_id.get(dependency_id)
+            if dependency_card is not None and archived_dependency_satisfied(dependency_card):
+                # Archived after its work landed: satisfied, no further edge.
                 continue
             resolved, chain, error = resolve_superseded_dependency(
                 dependency_id, all_by_id
