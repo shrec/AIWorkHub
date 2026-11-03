@@ -8062,23 +8062,22 @@ class ProcessManager:
             or created.get("error")
             or ""
         )
-        if not create_ok and not create_structured:
-            reason = (
-                "quality_review_task_create_failed:" + create_detail[:500]
-            )
-            if terminalize_on_failure:
-                self._terminalize_reviewer_attempt(
-                    request_id, reviewer_task_id, runner, adapter_id, reason=reason
-                )
-            core.release_review_wake(target_task_id, reason)  # NF-2026-01095
-            return {"ok": False, "error": reason}
+        # NF-2026-01993: every non-ok reply names its request, card and adapter.
+        ident = {"request_id": request_id, "task_id": reviewer_task_id,
+                 "target_request_id": target_request_id,
+                 "target_task_id": target_task_id, "adapter_id": adapter_id}
 
         def _fail(reason: str) -> dict[str, Any]:
             if terminalize_on_failure:
                 self._terminalize_reviewer_attempt(
                     request_id, reviewer_task_id, runner, adapter_id, reason=reason
                 )
-            return {"ok": False, "error": reason}
+            return {"ok": False, "error": reason, **ident}
+
+        if not create_ok and not create_structured:
+            failed = _fail("quality_review_task_create_failed:" + create_detail[:500])
+            core.release_review_wake(target_task_id, failed["error"])  # NF-2026-01095
+            return failed
 
         def _verify_durable(*, require_launch_request: bool) -> dict[str, Any] | None:
             try:
@@ -8141,7 +8140,7 @@ class ProcessManager:
             if not retained:
                 return _fail(reason)
             return {
-                "ok": False,
+                "ok": False, **ident,
                 "error": reason,
                 "recovery_state": "starting_reservation_retained",
                 "claim_recovery_bound": True,
@@ -8182,7 +8181,7 @@ class ProcessManager:
                 except Exception:  # noqa: BLE001 -- return stable retry evidence
                     recovery_retained = False
                 return {
-                    "ok": False,
+                    "ok": False, **ident,
                     "error": f"quality_review_claim_failed:{receipt_exc}"[:500],
                     "recovery_state": "starting_reservation_retained",
                     "claim_recovery_bound": recovery_retained,
@@ -8190,13 +8189,17 @@ class ProcessManager:
                 }
         claim_epoch = claimed_card.get("claim_epoch")
         binding_persisted = False
+        bind_reason = "quality_review_claim_binding_failed:binding_not_persisted"
         if type(claim_epoch) is int and claim_epoch >= 1:
             try:
                 binding_persisted = self._bind_reviewer_claim_epoch(
                     request_id, claim_epoch
                 )
-            except Exception:  # noqa: BLE001 -- claim must never be stranded
+            except Exception as exc:  # noqa: BLE001 -- claim must never be stranded
                 binding_persisted = False
+                bind_reason = (
+                    f"quality_review_claim_binding_failed:{type(exc).__name__}:{exc}"
+                )[:500]
         if not binding_persisted:
             # Terminalize the reservation only after the canonical task release
             # succeeds.  If that CAS/store operation fails, preserving the
@@ -8205,7 +8208,7 @@ class ProcessManager:
                 self.repo,
                 reviewer_task_id,
                 runner,
-                reason="quality_review_claim_binding_failed",
+                reason=bind_reason,
                 request_id=request_id,
             )
             if released.get("ok") is not True:
@@ -8219,7 +8222,8 @@ class ProcessManager:
                         recovery_bound = False
                 return {
                     "ok": False,
-                    "error": "quality_review_claim_binding_failed",
+                    "error": bind_reason,
+                    **ident,
                     "recovery_state": "starting_reservation_retained",
                     "claim_recovery_bound": recovery_bound,
                     "release_error": str(
@@ -8229,7 +8233,7 @@ class ProcessManager:
                         or ""
                     )[:500],
                 }
-            return _fail("quality_review_claim_binding_failed")
+            return _fail(bind_reason)
         durable_error = _verify_durable(require_launch_request=True)
         if durable_error is not None:
             return durable_error
@@ -8387,7 +8391,7 @@ class ProcessManager:
                 "error": "quality_review_target_not_review_ready",
                 "reason": _target_verdict.get("reason"),
                 "target_substatus": _target_verdict.get("target_substatus"),
-                "fails_at_launch": True,
+                "fails_at_launch": True, "request_created": False,
             }
         # The named request must be an exact ledger request of the target task
         # BEFORE anything is reserved: the packet build re-checks it, but only
@@ -8397,7 +8401,7 @@ class ProcessManager:
             target_request_id, target_task_id
         )
         if target_refusal is not None:
-            return target_refusal
+            return {**target_refusal, "request_created": False}
         # The target claim epoch is sealed into the reservation so reuse of a
         # live reviewer is keyed to this exact claim, not merely its request.
         # The caller's epoch is the one that commissioned this review; the
