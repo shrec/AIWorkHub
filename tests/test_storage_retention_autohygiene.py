@@ -38,40 +38,87 @@ def test_terminal_hints_coalesce_without_running_scan_inline(monkeypatch, tmp_pa
 def test_cleanup_single_flight_uses_platform_lock_not_sqlite(
     monkeypatch, tmp_path: Path
 ) -> None:
-    entered = threading.Event()
+    # The platform lock is modelled by a non-reentrant lock the test can hold
+    # explicitly, standing in for another process that owns the cleanup lane.
+    platform_lock = threading.Lock()
+    owner_fds: list[int] = []
     lock_calls: list[tuple[int, bool]] = []
     unlock_calls: list[int] = []
+    cleanup_lock_held: list[bool] = []
+    sweeps: list[threading.Thread] = []
+
+    def fake_lock_fd(fd: int, *, blocking: bool) -> None:
+        lock_calls.append((fd, blocking))
+        if not platform_lock.acquire(blocking=blocking):
+            raise OSError("platform cleanup lock held by another owner")
+        owner_fds.append(fd)
+
+    def fake_unlock_fd(fd: int) -> None:
+        unlock_calls.append(fd)
+        if fd in owner_fds:
+            owner_fds.remove(fd)
+            platform_lock.release()
+
+    def fake_cleanup(repo_root, *, base=None):
+        cleanup_lock_held.append(platform_lock.locked() and bool(owner_fds))
+        return {"ok": True}
+
+    class _RecordingThreading:
+        """Delegate to ``threading`` but record the sweep thread to join it."""
+
+        def __getattr__(self, name: str):
+            return getattr(threading, name)
+
+        @staticmethod
+        def Thread(*args, **kwargs) -> threading.Thread:
+            thread = threading.Thread(*args, **kwargs)
+            sweeps.append(thread)
+            return thread
 
     monkeypatch.setattr(
         storage_retention.sqlite3,
         "connect",
         lambda *_args, **_kwargs: pytest.fail("cleanup lock must not open SQLite"),
     )
-    monkeypatch.setattr(
-        storage_retention,
-        "lock_fd",
-        lambda fd, *, blocking: lock_calls.append((fd, blocking)),
-    )
-    monkeypatch.setattr(
-        storage_retention,
-        "unlock_fd",
-        lambda fd: unlock_calls.append(fd),
-    )
-    monkeypatch.setattr(
-        storage_retention,
-        "run_repository_cleanup",
-        lambda repo_root, *, base=None: entered.set() or {"ok": True},
-    )
+    monkeypatch.setattr(storage_retention, "lock_fd", fake_lock_fd)
+    monkeypatch.setattr(storage_retention, "unlock_fd", fake_unlock_fd)
+    monkeypatch.setattr(storage_retention, "run_repository_cleanup", fake_cleanup)
+    monkeypatch.setattr(storage_retention, "threading", _RecordingThreading())
 
+    # A second holder owns the platform lock: the sweep must coalesce on it
+    # without running cleanup, and never fall back to a SQLite lock.
+    assert platform_lock.acquire(blocking=False)
+    try:
+        assert storage_retention.schedule_repository_cleanup(tmp_path) is True
+        assert len(sweeps) == 1
+        sweeps[0].join()
+    finally:
+        platform_lock.release()
+
+    status = storage_retention.repository_cleanup_status(tmp_path)
+    assert status["running"] is False
+    assert status["last_run"] == {
+        "ok": True,
+        "coalesced": True,
+        "reason": "repository_cleanup_owner_active",
+    }
+    assert cleanup_lock_held == []
+    assert len(lock_calls) == 1 and lock_calls[0][1] is False
+
+    # Once the holder releases, the next sweep takes the platform lock
+    # non-blockingly, runs cleanup under it and releases exactly that fd.
     assert storage_retention.schedule_repository_cleanup(tmp_path) is True
-    assert entered.wait(1)
-    for _ in range(100):
-        if not storage_retention.repository_cleanup_status(tmp_path)["running"]:
-            break
-        threading.Event().wait(0.01)
+    assert len(sweeps) == 2
+    sweeps[1].join()
 
-    assert lock_calls and lock_calls[0][1] is False
-    assert unlock_calls == [lock_calls[0][0]]
+    status = storage_retention.repository_cleanup_status(tmp_path)
+    assert status["running"] is False
+    assert status["last_run"] == {"ok": True}
+    assert cleanup_lock_held == [True]
+    assert len(lock_calls) == 2 and lock_calls[1][1] is False
+    assert unlock_calls == [lock_calls[0][0], lock_calls[1][0]]
+    assert owner_fds == []
+    assert not platform_lock.locked()
 
 
 def test_manifest_authentication_detects_deadline_tampering(
