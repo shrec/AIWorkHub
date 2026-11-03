@@ -2277,16 +2277,52 @@ def _write_extraction(
     return inserted_entities, len(seen_edges), dropped
 
 
-def _resolve_cpp_cross_file_edges(conn: sqlite3.Connection) -> int:
+_LEXICAL_TARGET_KINDS = ("function", "method", "class", "struct", "union", "enum")
+_LEXICAL_TARGET_KINDS_SQL = ",".join(f"'{kind}'" for kind in _LEXICAL_TARGET_KINDS)
+
+
+def _lexical_target_identities(
+    conn: sqlite3.Connection, file_paths: set[str],
+) -> set[tuple[str, str, str, str]]:
+    """``(file, name, qualname, kind)`` of every lexical-resolvable entity in ``file_paths``.
+
+    Read BEFORE ``_invalidate_file`` drops the rows: the symmetric difference
+    with the new extraction is the ``affected_names`` input of
+    ``_resolve_cpp_cross_file_edges``.
+    """
+
+    kinds = ",".join("?" for _ in _LEXICAL_TARGET_KINDS)
+    return {
+        (str(row[0]), str(row[1]), str(row[2]), str(row[3]))
+        for row in conn.execute(
+            "SELECT file_path, name, qualname, kind FROM entities "
+            f"WHERE kind IN ({kinds}) "
+            "AND file_path IN (SELECT value FROM json_each(?))",
+            (*_LEXICAL_TARGET_KINDS, json.dumps(sorted(set(file_paths)))),
+        )
+    }
+
+
+def _resolve_cpp_cross_file_edges(
+    conn: sqlite3.Connection,
+    *,
+    changed_files: set[str] | None = None,
+    affected_names: set[str] | None = None,
+) -> int:
     """Resolve lexical-language targets only with unique bounded evidence.
 
     Lexical extraction proves that call syntax exists but not which overload or
     translation unit owns the callee.  A unique canonical entity name is safe
     to bind as inferred evidence. When a name is globally ambiguous, an exact
     import/include-to-file match may disambiguate one candidate. Zero or
-    multiple candidates remain visibly unresolved. Recomputing after every
-    build also clears targets made stale by a rename/delete during an
-    incremental refresh.
+    multiple candidates remain visibly unresolved.
+
+    ``changed_files=None`` recomputes every lexical edge (full build). Otherwise
+    only edges owned by a changed file, or whose ``dst_name`` is an entity name
+    added/removed/renamed by this build (``affected_names``), are reset and
+    re-resolved: nothing else can change a name's candidate count or an
+    import match, so the result equals a full recompute. Both sets empty means
+    no UPDATE at all.
 
     JavaScript and TypeScript calls are excluded. A member call such as
     ``document.createElement`` shares ``dst_name`` with a helper, so a
@@ -2294,19 +2330,32 @@ def _resolve_cpp_cross_file_edges(conn: sqlite3.Connection) -> int:
     ``_resolve_javascript_same_file_calls`` own those calls.
     """
 
-    resolvable_extractors = (
+    resolvable_extractors: tuple[str, ...] = (
         sgast.CPP_LEXICAL_EXTRACTOR_ID,
         sgast.POLYGLOT_LEXICAL_EXTRACTOR_ID,
         sgast.TREE_SITTER_JS_TS_EXTRACTOR_ID,
     )
     placeholders = ",".join("?" for _ in resolvable_extractors)
+    scope_sql = ""
+    if changed_files is not None:
+        if not changed_files and not affected_names:
+            return 0
+        scope_sql = (
+            "AND (e.file_path IN (SELECT value FROM json_each(?)) "
+            "OR e.dst_name IN (SELECT value FROM json_each(?))) "
+        )
+        resolvable_extractors += (
+            json.dumps(sorted(changed_files)),
+            json.dumps(sorted(affected_names or ())),
+        )
     js_calls = (
         "AND NOT (kind='calls' AND file_path IN ("
         "SELECT file_path FROM files WHERE language IN ('javascript', 'typescript'))) "
     )
     conn.execute(
-        f"UPDATE edges SET dst_qualname=NULL WHERE extractor IN ({placeholders}) "
-        f"AND kind IN ('calls','inherits') {js_calls}",
+        f"UPDATE edges SET dst_qualname=NULL WHERE id IN (SELECT e.id FROM edges e "
+        f"WHERE e.extractor IN ({placeholders}) "
+        f"AND e.kind IN ('calls','inherits') {scope_sql}) {js_calls}",
         resolvable_extractors,
     )
     resolved = 0
@@ -2316,7 +2365,7 @@ def _resolve_cpp_cross_file_edges(conn: sqlite3.Connection) -> int:
         f"WHERE e.extractor IN ({placeholders}) "
         "AND e.kind IN ('calls','inherits') AND e.dst_qualname IS NULL "
         "AND NOT (e.kind='calls' AND f.language IN ('javascript', 'typescript')) "
-        "ORDER BY e.id",
+        f"{scope_sql}ORDER BY e.id",
         resolvable_extractors,
     ).fetchall()
     candidates_by_language_and_name: dict[tuple[str, str], list[sqlite3.Row]] = {}
@@ -2328,7 +2377,7 @@ def _resolve_cpp_cross_file_edges(conn: sqlite3.Connection) -> int:
             candidates = conn.execute(
                 "SELECT e.file_path, e.qualname, f.language FROM entities e "
                 "JOIN files f ON f.file_path=e.file_path WHERE e.name=? AND "
-                "e.kind IN ('function','method','class','struct','union','enum') "
+                f"e.kind IN ({_LEXICAL_TARGET_KINDS_SQL}) "
                 "ORDER BY e.file_path, e.qualname",
                 (name,),
             ).fetchall()
@@ -2356,7 +2405,7 @@ def _resolve_cpp_cross_file_edges(conn: sqlite3.Connection) -> int:
         f"WHERE e.extractor IN ({placeholders}) "
         "AND e.kind IN ('calls','inherits') AND e.dst_qualname IS NULL "
         "AND NOT (e.kind='calls' AND f.language IN ('javascript', 'typescript')) "
-        "ORDER BY id",
+        f"{scope_sql}ORDER BY e.id",
         resolvable_extractors,
     ).fetchall()
     imports_by_file: dict[str, list[str]] = {}
@@ -2382,7 +2431,7 @@ def _resolve_cpp_cross_file_edges(conn: sqlite3.Connection) -> int:
             rows = conn.execute(
                 "SELECT e.file_path, e.qualname, f.language FROM entities e "
                 "JOIN files f ON f.file_path=e.file_path WHERE e.name=? AND "
-                "e.kind IN ('function','method','class','struct','union','enum') "
+                f"e.kind IN ({_LEXICAL_TARGET_KINDS_SQL}) "
                 "ORDER BY e.file_path, e.qualname",
                 (name,),
             ).fetchall()
@@ -4224,6 +4273,20 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
             for path in resolver_changed_paths
             if sglanguages.language_for_path(Path(path)) == "python"
         }
+        # Lexical resolver scope (NF-2026-02011): every resolvable entity
+        # name added/removed/renamed by a changed or removed file, read before
+        # ``_invalidate_file`` drops the old rows. A full build recomputes all.
+        lexical_identities = (
+            _lexical_target_identities(conn, resolver_changed_paths)
+            if incremental else set()
+        )
+        lexical_identities.symmetric_difference_update(
+            (extraction.file_path, entity.name, entity.qualname, entity.kind)
+            for extraction, _, _ in (pending_extractions if incremental else ())
+            for entity in extraction.entities
+            if entity.kind in _LEXICAL_TARGET_KINDS
+        )
+        affected_lexical_names = {name for _, name, _, _ in lexical_identities}
         affected_python_names: set[str] = set()
         if python_changed_paths:
             # Only an added/removed/renamed function identity can change a
@@ -4395,8 +4458,14 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                 # Revoke before the resolvers run, while every surviving
                 # binding's edge still carries what it wrote: they may clear or
                 # re-resolve that destination (see ``_lsp_reconcile_generation``).
-                _lsp_reconcile_generation(conn)
-                _resolve_cpp_cross_file_edges(conn)
+                lsp_restored = _lsp_reconcile_generation(conn)
+                _resolve_cpp_cross_file_edges(
+                    conn,
+                    changed_files=(
+                        (resolver_changed_paths | lsp_restored) if incremental else None
+                    ),
+                    affected_names=affected_lexical_names,
+                )
                 if python_changed_paths:
                     _resolve_python_imported_references(
                         conn, repo_root,
@@ -10447,8 +10516,12 @@ def _lsp_clear_file(conn: sqlite3.Connection, rel: str) -> tuple[int, bool]:
 
 def _lsp_reconcile_source(
     conn: sqlite3.Connection, rel: str, counters: dict[str, int]
-) -> None:
-    """Make one caller file's evidence true of this generation again."""
+) -> bool:
+    """Make one caller file's evidence true of this generation again.
+
+    Returns whether any edge of ``rel`` may have gone back to its lexical
+    state, so an incremental lexical resolver re-resolves this file too.
+    """
 
     indexed = _lsp_indexed_hash(conn, rel)
     receipt = _lsp_stored_receipt(conn, rel)
@@ -10465,15 +10538,16 @@ def _lsp_reconcile_source(
         _lsp_delete_file_evidence(conn, rel)
         counters["revoked"] += len(bindings)
         counters["files_revoked"] += int(receipt is not None)
-        return
+        return bool(bindings)
     kept = 0
+    restored = False
     for binding in bindings:
         if _lsp_binding_supported(conn, binding) and (
             _lsp_binding_carried(conn, binding) or _lsp_rebind_edge(conn, binding)
         ):
             kept += 1
             continue
-        _lsp_restore_edge(conn, binding)
+        restored = bool(_lsp_restore_edge(conn, binding)) or restored
         conn.execute(
             "DELETE FROM lsp_edge_provenance WHERE source_path=? "
             "AND source_line=? AND source_column=?",
@@ -10485,13 +10559,14 @@ def _lsp_reconcile_source(
             # Provenance with no receipt is a state no writer may publish.
             revoked, _had = _lsp_clear_file(conn, rel)
             counters["revoked"] += revoked
-        return
+            restored = True
+        return restored
     if kept == len(bindings) and int(receipt.get("edge_count", -1)) == kept:
-        return
+        return restored
     if kept == 0:
         conn.execute("DELETE FROM lsp_file_receipt WHERE source_path=?", (rel,))
         counters["files_revoked"] += 1
-        return
+        return restored
     # Surviving bindings stay verified and carried, but the receipt no longer
     # describes a complete answer: keep it consistent and never reusable, so
     # the next batch re-asks every position of this file.
@@ -10499,9 +10574,10 @@ def _lsp_reconcile_source(
         "UPDATE lsp_file_receipt SET edge_count=?, complete=0 WHERE source_path=?",
         (kept, rel),
     )
+    return restored
 
 
-def _lsp_reconcile_generation(conn: sqlite3.Connection) -> None:
+def _lsp_reconcile_generation(conn: sqlite3.Connection) -> set[str]:
     """Revoke/re-attach LSP evidence inside a merge, in plain SQL.
 
     Runs inside every writer that mutates the graph -- full build, single
@@ -10516,10 +10592,14 @@ def _lsp_reconcile_generation(conn: sqlite3.Connection) -> None:
     answered, and whatever they resolve it to stands. Then after them, to
     re-attach supported bindings a resolver cleared and to revoke any it
     re-resolved elsewhere. Both calls are idempotent.
+
+    Returns the caller files whose edges went back to lexical state: an
+    incremental resolver must re-resolve them even when they are unchanged.
     """
 
+    restored: set[str] = set()
     if not _lsp_tables_present(conn):
-        return
+        return restored
     counters: dict[str, int] = dict.fromkeys(LSP_HEALTH_COUNTERS, 0)
     sources = sorted({
         str(row[0])
@@ -10529,9 +10609,11 @@ def _lsp_reconcile_generation(conn: sqlite3.Connection) -> None:
         )
     })
     for rel in sources:
-        _lsp_reconcile_source(conn, rel, counters)
+        if _lsp_reconcile_source(conn, rel, counters):
+            restored.add(rel)
     if any(counters.values()):
         _lsp_merge_health(conn, counters)
+    return restored
 
 
 def _lsp_write_receipt(
@@ -11308,6 +11390,7 @@ def index_file(
                     if python_file
                     else set()
                 )
+                lexical_identities = _lexical_target_identities(conn, {rel})
                 _invalidate_file(conn, rel)
                 inserted_entities, inserted_edges, _dropped = _write_extraction(
                     conn,
@@ -11323,14 +11406,23 @@ def index_file(
                 # wrote (see ``_lsp_reconcile_generation``). A receipt kept for
                 # identical bytes describes edges just re-extracted as
                 # unresolved, so they are re-attached here too.
-                _lsp_reconcile_generation(conn)
-                # Re-run cross-file edge resolution exactly as a full build's
+                lsp_restored = _lsp_reconcile_generation(conn)
+                # Re-run cross-file edge resolution as an incremental build's
                 # tail does. Re-extracting one file drops its own edges back to
-                # unresolved and can invalidate edges other files aimed at it; a
-                # later incremental build sees changed==0 and skips resolution,
-                # so leaving it unresolved here would strand those edges
-                # permanently. Resolution is idempotent and generation-safe.
-                _resolve_cpp_cross_file_edges(conn)
+                # unresolved and an added/removed/renamed entity can change
+                # edges other files aimed at its names; a later incremental
+                # build sees changed==0 and skips resolution, so leaving them
+                # unresolved here would strand those edges permanently.
+                lexical_identities.symmetric_difference_update(
+                    (rel, entity.name, entity.qualname, entity.kind)
+                    for entity in extraction.entities
+                    if entity.kind in _LEXICAL_TARGET_KINDS
+                )
+                _resolve_cpp_cross_file_edges(
+                    conn,
+                    changed_files={rel} | lsp_restored,
+                    affected_names={name for _, name, _, _ in lexical_identities},
+                )
                 if python_file:
                     new_python_functions = {
                         (entity.name, entity.qualname)
