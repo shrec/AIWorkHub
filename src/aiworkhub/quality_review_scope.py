@@ -39,6 +39,34 @@ from .scoped_audit import (
 
 MAX_SCOPE_ROWS = MAX_COLLECTION_SIZE
 _Row = TypeVar("_Row")
+_TRUNCATION_PREFIX = "scope-rows-truncated-"
+# Neighbourhood collections ranked nearest-first: their truncation is a sample
+# of readable graph rows, not an unread changed hunk (NF-2026-01994).
+SAMPLED_SCOPE_COLLECTIONS = frozenset({"caller_edges", "impact_evidence", "test_evidence"})
+
+
+def is_sampling_unknown(identity: object) -> bool:
+    """True only for the truncation record of a nearest-ranked neighbourhood collection."""
+    return (
+        isinstance(identity, str)
+        and identity.startswith(_TRUNCATION_PREFIX)
+        and identity[len(_TRUNCATION_PREFIX) :] in SAMPLED_SCOPE_COLLECTIONS
+    )
+
+
+def scope_unknowns_are_sampling_only(scope: Mapping[str, Any]) -> bool:
+    """True when a scoped audit's unknowns exist and every one is a sampling record."""
+    packet = scope.get("packet")
+    rows: list[object] = []
+    for holder in (scope, packet if isinstance(packet, Mapping) else {}):
+        for key in ("unknowns", "known_unknowns"):
+            value = holder.get(key)
+            if isinstance(value, list):
+                rows.extend(value)
+    return bool(rows) and all(
+        isinstance(row, Mapping) and is_sampling_unknown(row.get("identity"))
+        for row in rows
+    )
 
 _LENS_RATIONALE = {
     "correctness": "Verify behavior, invariants, contracts and validation evidence.",
@@ -297,6 +325,39 @@ def _path_list(paths: Iterable[str]) -> str:
     return text if len(text) <= 600 else f"{text[:597]}..."
 
 
+MAX_RANK_SPANS_PER_PATH = 16
+
+
+def _caller_rank_sql(
+    changed_spans: Mapping[str, tuple[_Span, ...]],
+) -> tuple[str, list[int | str]]:
+    """Bounded ORDER BY key: callers in a changed path first, nearest segment first.
+
+    The key is 0 inside a changed segment, otherwise the line gap to the
+    nearest one; callers outside every changed path rank after all of them.
+    Past MAX_RANK_SPANS_PER_PATH segments the last kept span is widened to the
+    final segment end, so the parameter count stays bounded per path.
+    """
+    line = "COALESCE(line,1)"
+    whens: list[str] = []
+    params: list[int | str] = []
+    for path, spans in sorted(changed_spans.items()):
+        kept = list(spans[:MAX_RANK_SPANS_PER_PATH])
+        if len(spans) > len(kept):
+            kept[-1] = (kept[-1][0], spans[-1][1])
+        gaps = [f"MAX(0,?-{line},{line}-?)" for _ in kept]
+        # SQLite's one-argument MIN is the aggregate, so a single span stands alone.
+        distance = f"MIN({','.join(gaps)})" if len(gaps) > 1 else (gaps or ["0"])[0]
+        whens.append(f"WHEN file_path=? THEN {distance}")
+        params.append(path)
+        for start, end in kept:
+            params.extend((start, end))
+    if not whens:
+        # A bare integer ORDER BY term is a column index in SQLite; NULL is a no-op key.
+        return "NULL", []
+    return f"CASE {' '.join(whens)} ELSE {2**31} END", params
+
+
 def _cap(rows: list[_Row], collection: str, drops: dict[str, int]) -> list[_Row]:
     """Keep MAX_SCOPE_ROWS rows and record how many were dropped."""
     if len(rows) > MAX_SCOPE_ROWS:
@@ -312,8 +373,25 @@ def _capped_strings(
 
 
 def _truncation_unknown(collection: str, dropped: int) -> KnownUnknown:
+    identity = f"{_TRUNCATION_PREFIX}{collection}"
+    if is_sampling_unknown(identity):
+        return KnownUnknown(
+            identity=identity,
+            question=(
+                f"What is in the {dropped} lower-ranked {collection} rows "
+                "not sampled here?"
+            ),
+            why_relevant=(
+                f"reason=scope_rows_truncated; sampling=nearest_ranked; "
+                f"collection={collection}; dropped={dropped}; "
+                f"the packet keeps the {MAX_SCOPE_ROWS} nearest-ranked rows (changed "
+                "paths and the rows closest to the changed segments, executed "
+                "validation first); the remainder is readable through your Source "
+                "Graph tool. This is a sampling record, not an unread changed hunk."
+            ),
+        )
     return KnownUnknown(
-        identity=f"scope-rows-truncated-{collection}",
+        identity=identity,
         question=f"What is in the {dropped} {collection} rows omitted from this packet?",
         why_relevant=(
             f"reason=scope_rows_truncated; collection={collection}; dropped={dropped}; "
@@ -401,6 +479,7 @@ def build_scoped_audits(
         required_output_paths = {str(value) for value in required_outputs}
 
         target_names: set[str] = set()
+        changed_spans: dict[str, tuple[_Span, ...]] = {}
         unresolved_lines: list[str] = []
         unresolved_deletions: list[str] = []
         for path, digest_value in sorted(changed_path_hashes.items()):
@@ -442,6 +521,9 @@ def build_scoped_audits(
             candidate_spans = () if deleted_file else segments.candidate
             deleted_spans = _WHOLE_FILE if deleted_file else segments.baseline
             replaced_spans = () if deleted_file else segments.replaced
+            changed_spans[path] = _merge_spans(
+                (*candidate_spans, *deleted_spans, *replaced_spans)
+            )
             baseline_rows: list[Any] = []
             if deleted_file:
                 baseline_rows = entity_rows
@@ -561,12 +643,13 @@ def build_scoped_audits(
 
         if conn is not None and target_names:
             placeholders = ",".join("?" for _ in sorted(target_names))
+            rank_sql, rank_params = _caller_rank_sql(changed_spans)
             rows = conn.execute(
                 "SELECT file_path,kind,src_qualname,dst_name,dst_qualname,line,"
                 "evidence_label,confidence FROM edges WHERE dst_name IN ("
                 + placeholders
-                + ") ORDER BY file_path,line,src_qualname LIMIT ?",
-                (*sorted(target_names), MAX_SCOPE_ROWS + 1),
+                + f") ORDER BY {rank_sql},file_path,line,src_qualname LIMIT ?",
+                (*sorted(target_names), *rank_params, MAX_SCOPE_ROWS + 1),
             ).fetchall()
             if len(rows) > MAX_SCOPE_ROWS:
                 total_callers = conn.execute(
@@ -622,6 +705,9 @@ def build_scoped_audits(
                     description="Canonical Source Graph related-test target.",
                 )
 
+        # Executed validation is the strongest test evidence: it ranks before
+        # every static test target so the row cap can never drop it.
+        executed: dict[str, EvidenceReference] = {}
         terminal_rows = _cap(list(terminal_validation), "terminal_validation", drops)
         for index, row in enumerate(terminal_rows):
             if not isinstance(row, Mapping):
@@ -636,7 +722,7 @@ def build_scoped_audits(
             description = f"Executed validation returned {returncode}: {command}"
             if last_line:
                 description += f"; last output line: {last_line}"
-            tests[identity] = EvidenceReference(
+            executed[identity] = EvidenceReference(
                 identity=identity,
                 evidence_kind="test_target",
                 evidence_level=(
@@ -650,6 +736,7 @@ def build_scoped_audits(
                 description=description[:1024],
                 supports_blocker=returncode != 0,
             )
+        tests = {**executed, **tests}
 
         if not impact:
             unknowns["impact-unresolved"] = KnownUnknown(
@@ -740,4 +827,10 @@ def build_scoped_audits(
             conn.close()
 
 
-__all__ = ["ReviewScopeBuildError", "build_scoped_audits"]
+__all__ = [
+    "SAMPLED_SCOPE_COLLECTIONS",
+    "ReviewScopeBuildError",
+    "build_scoped_audits",
+    "is_sampling_unknown",
+    "scope_unknowns_are_sampling_only",
+]

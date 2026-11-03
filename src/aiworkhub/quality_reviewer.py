@@ -20,6 +20,7 @@ from typing import Any, NotRequired, TypedDict
 from .evidence_levels import EvidenceLevel
 from .finding_reproduction import bounded_reproduction_text
 from .platform_io import atomic_replace
+from .quality_review_scope import scope_unknowns_are_sampling_only
 from .scoped_audit import ScopedAuditPacket, packet_fingerprint
 
 
@@ -1216,9 +1217,19 @@ def build_review_prompt(
         "format or other contract; then its explicit known_unknowns. Review "
         "exactly that bounded delta: do not re-read whole files and do not "
         "scan the whole repository.\n"
-        f"Fail closed on unknowns: a non-empty known_unknowns list{unread_clause} "
-        "must be escalated as a process_limit finding and can never support a "
-        f"clean result.\n{unchanged_instruction}"
+        + (
+            "Every known_unknowns row is a sampling record: the kept callers, "
+            "impact and tests are the nearest-ranked rows and the rest is readable "
+            "through Source Graph. Report that sampling as a low-severity "
+            "observation, never as a process_limit finding"
+            + (f"; {unread_evidence} is still a process_limit" if unread_clause else "")
+            + ".\n"
+            if scope_unknowns_are_sampling_only(active_scope)
+            else f"Fail closed on unknowns: a non-empty known_unknowns list{unread_clause} "
+            "must be escalated as a process_limit finding and can never support a "
+            "clean result.\n"
+        )
+        + unchanged_instruction
         if active_scope is not None
         else ""
     )
