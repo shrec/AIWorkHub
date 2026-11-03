@@ -41,7 +41,14 @@ import re
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
-from . import core, launch_replay_guard, sqlite_readonly, task_store, validation_failed_packet
+from . import (
+    core,
+    launch_replay_guard,
+    sqlite_readonly,
+    task_store,
+    validation_base_triage,
+    validation_failed_packet,
+)
 from .process_launcher_validation import is_operational_validation_failure
 
 SCHEMA_ID = "aiworkhub.validation_auto_rework.v1"
@@ -414,6 +421,171 @@ def _reject_pinned(manager: Manager, task_id: str, reason: str, request_id: str)
     return result
 
 
+ENVIRONMENT_BLOCKED = "environment_blocked"
+NEEDFIX_TAGS = ("environment", "validation")
+NEEDFIX_EVIDENCE_SCHEMA_ID = "aiworkhub.validation_base_triage.needfix_evidence.v1"
+
+
+def _evidence_base_oid(evidence: Mapping[str, Any]) -> str:
+    """The candidate's base commit as the launcher recorded it in the terminal evidence."""
+    for holder in (evidence.get("request_identity"), evidence.get("workspace"), evidence):
+        if isinstance(holder, Mapping):
+            value = str(holder.get("base_oid") or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def _unrunnable_triage(reason: str) -> dict[str, Any]:
+    return {
+        "schema_id": validation_base_triage.SCHEMA_ID,
+        "outcome": validation_base_triage.BASE_UNRUNNABLE,
+        "reason": reason[:200],
+        "commands": [],
+    }
+
+
+def _base_triage(
+    repo: Path, card: Mapping[str, Any], record: Mapping[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """(triage, candidate packet) for the planned record's failing commands. Never raises."""
+    packet: dict[str, Any] = {"failing": []}
+    try:
+        review = card.get("terminal_review")
+        evidence = review.get("evidence") if isinstance(review, Mapping) else None
+        evidence = dict(evidence) if isinstance(evidence, Mapping) else {}
+        packet = validation_failed_packet.packet_from_evidence(
+            task_id=card.get("task_id"),
+            request_id=str(evidence.get("request_id") or ""),
+            evidence=evidence,
+            roles=card.get("validation_roles"),
+        )
+        commands = [
+            str(entry.get("command"))
+            for entry in packet.get("failing") or []
+            if isinstance(entry, Mapping) and entry.get("command")
+        ]
+        # The candidate's terminal row per declared command (the last row wins),
+        # so the triage compares failure identities, not just return codes.
+        candidate_rows = {
+            str(row.get("declared_command") or row.get("command") or ""): dict(row)
+            for row in evidence.get("validation") or []
+            if isinstance(row, Mapping)
+        }
+        triage = validation_base_triage.triage(
+            repo,
+            card=card,
+            base_oid=_evidence_base_oid(evidence),
+            adapter_id=str(record.get("adapter_id") or ""),
+            commands=commands,
+            candidate_rows=candidate_rows,
+        )
+    except Exception as exc:  # noqa: BLE001 -- never raises into after_finalize
+        return _unrunnable_triage(type(exc).__name__), packet
+    if not isinstance(triage, Mapping) or triage.get("outcome") not in validation_base_triage.OUTCOMES:
+        return _unrunnable_triage("triage_result_invalid"), packet
+    return dict(triage), packet
+
+
+def _triage_summary(triage: Mapping[str, Any]) -> dict[str, Any]:
+    """The bounded durable view of a triage: no tails."""
+    return {
+        "outcome": triage.get("outcome"),
+        "reason": str(triage.get("reason") or "")[:200] or None,
+        "base_oid": triage.get("base_oid"),
+        "base_tree": triage.get("base_tree"),
+        "cache_hits": triage.get("cache_hits"),
+        "base_runs": triage.get("base_runs"),
+        "commands": [
+            {
+                "command": str(entry.get("command") or "")[:512],
+                "outcome": entry.get("outcome"),
+                "base_returncode": entry.get("base_returncode"),
+                "cached": bool(entry.get("cached")),
+            }
+            for entry in triage.get("commands") or []
+            if isinstance(entry, Mapping)
+        ],
+    }
+
+
+def _bounded_normalized_tail(tail: Any) -> str:
+    return validation_failed_packet._last_bytes(normalize_tail(str(tail or "")), _TAIL_MAX_BYTES)
+
+
+def _file_environment_needfix(
+    task_id: str, request_id: str, triage: Mapping[str, Any], base_entry: Mapping[str, Any],
+    candidate_entry: Mapping[str, Any],
+) -> dict[str, Any]:
+    """File (or dedupe onto) the one NeedFix for (command, base tree)."""
+    command = str(base_entry.get("command") or "")
+    tree = str(triage.get("base_tree") or "")
+    title, description = validation_base_triage.needfix_dedupe_identity(command, tree)
+    evidence = {
+        "schema_id": NEEDFIX_EVIDENCE_SCHEMA_ID,
+        "command": command,
+        "base_oid": triage.get("base_oid"),
+        "base_tree": tree,
+        "adapter_id": triage.get("adapter_id"),
+        "base_returncode": base_entry.get("base_returncode"),
+        "candidate_returncode": candidate_entry.get("exit_code"),
+        "base_tail": _bounded_normalized_tail(base_entry.get("base_tail")),
+        "candidate_tail": _bounded_normalized_tail(candidate_entry.get("tail")),
+        "task_id": task_id,
+        "request_id": request_id,
+    }
+    return core.needfix_add(
+        title,
+        description,
+        provenance={"origin": "validation_base_triage", "actor": ACTOR,
+                    "task_id": task_id, "request_id": request_id},
+        evidence=evidence,
+        kind="other",
+        severity="medium",
+        tags=list(NEEDFIX_TAGS),
+    )
+
+
+def _environment_blocked(
+    repo: Path, task_id: str, request_id: str, receipt: dict[str, Any],
+    triage: Mapping[str, Any], packet: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Base failed too: no reject, no relaunch; a NeedFix, a receipt and a manager wake."""
+    candidates = {
+        str(entry.get("command") or ""): entry
+        for entry in packet.get("failing") or []
+        if isinstance(entry, Mapping)
+    }
+    needfix_ids: list[str] = []
+    errors: list[str] = []
+    for entry in triage.get("commands") or []:
+        if not isinstance(entry, Mapping):
+            continue
+        try:
+            row = _file_environment_needfix(
+                task_id, request_id, triage, entry, candidates.get(str(entry.get("command") or "")) or {}
+            )
+        except Exception as exc:  # noqa: BLE001 -- the manager is still woken below
+            errors.append(f"needfix_add_raised:{type(exc).__name__}")
+            continue
+        needfix_id = str(row.get("id") or "") if isinstance(row, Mapping) else ""
+        if not needfix_id:
+            errors.append("needfix_id_missing")
+        elif needfix_id not in needfix_ids:
+            needfix_ids.append(needfix_id)
+    receipt["state"] = ENVIRONMENT_BLOCKED
+    receipt["needfix_id"] = needfix_ids[0] if needfix_ids else None
+    receipt["needfix_ids"] = needfix_ids
+    if errors:
+        receipt["needfix_error"] = errors[0][:300]
+    try:
+        receipt["manager_woken"] = _wake_manager(repo, task_id, request_id)
+    except Exception:  # noqa: BLE001 -- still record the receipt below
+        receipt["manager_woken"] = False
+    _record_event(repo, task_id, receipt)
+    return receipt
+
+
 def _execute(manager: Manager, event: Mapping[str, Any]) -> dict[str, Any] | None:
     repo = Path(manager.repo)
     task_id = str(event.get("task_id") or "")
@@ -438,6 +610,14 @@ def _execute(manager: Manager, event: Mapping[str, Any]) -> dict[str, Any] | Non
     ):
         receipt["state"] = "skipped_card_moved"
         return receipt
+    # NF-2026-01923: a command that fails identically on the base commit is
+    # environment, never the worker's to fix: no reject, no relaunch.
+    triage, packet = _base_triage(repo, card, record)
+    receipt["base_triage"] = _triage_summary(triage)
+    if triage["outcome"] == validation_base_triage.BASE_FAILED:
+        return _environment_blocked(repo, task_id, request_id, receipt, triage, packet)
+    if triage["outcome"] == validation_base_triage.BASE_UNRUNNABLE:
+        receipt["base_unrunnable_reason"] = str(triage.get("reason") or "unknown")[:200]
     reject = _reject_pinned(manager, task_id, str(record.get("reason") or ""), request_id)
     if not isinstance(reject, Mapping) or reject.get("ok") is not True:
         error = str((reject or {}).get("error") or "reject_review_failed")[:300]

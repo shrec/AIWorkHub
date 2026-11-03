@@ -128,18 +128,56 @@ def _bound(packet: dict[str, Any], tails: list[str]) -> dict[str, Any]:
     return packet
 
 
+def auto_rework_receipt(repo_root: str | Path, task_id: str, request_id: str) -> dict[str, Any] | None:
+    """The latest validation_auto_rework receipt for ``request_id``, read-only.
+
+    ``None`` when the store is absent or unreadable, or the latest receipt
+    belongs to another request: the packet then simply carries no state.
+    """
+    from . import sqlite_readonly, task_store, validation_auto_rework
+
+    if not task_id or not request_id:
+        return None
+    try:
+        db_path = task_store.canonical_db_path(Path(repo_root))
+        if not Path(db_path).is_file():
+            return None
+        conn = sqlite_readonly.connect_readonly(db_path)
+        try:
+            row = conn.execute(
+                "SELECT payload_json FROM task_events WHERE task_id = ? AND event = ?"
+                " ORDER BY event_id DESC LIMIT 1",
+                (str(task_id), validation_auto_rework.EVENT),
+            ).fetchone()
+        finally:
+            conn.close()
+        payload = json.loads(row[0]) if row else None
+    except Exception:  # noqa: BLE001 -- an unreadable receipt is absent, never a state
+        return None
+    if not isinstance(payload, dict) or str(payload.get("request_id") or "") != request_id:
+        return None
+    return payload
+
+
 def build_packet(card: dict[str, Any], repo_root: str | Path | None = None) -> dict[str, Any] | None:
     if not isinstance(card, dict) or _terminal_substatus(card) != "validation_failed":
         return None
     review = card.get("terminal_review")
     review = review if isinstance(review, dict) else {}
     evidence = review.get("evidence")
+    request_id = str(review.get("request_id") or "")
+    receipt = (
+        auto_rework_receipt(repo_root, str(card.get("task_id") or ""), request_id)
+        if repo_root is not None
+        else None
+    )
     return packet_from_evidence(
         task_id=card.get("task_id"),
-        request_id=str(review.get("request_id") or ""),
+        request_id=request_id,
         evidence=evidence if isinstance(evidence, dict) else {},
         roles=card.get("validation_roles"),
         repo_root=repo_root,
+        auto_rework_receipt=receipt,
     )
 
 
@@ -150,6 +188,7 @@ def packet_from_evidence(
     evidence: dict[str, Any],
     roles: Any,
     repo_root: str | Path | None = None,
+    auto_rework_receipt: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The packet from terminal evidence alone (also used before the card is written)."""
     validation = evidence.get("validation")
@@ -180,4 +219,11 @@ def packet_from_evidence(
         prior = auto_rework.get("prior_auto_returns")
         packet["prior_auto_returns"] = prior if isinstance(prior, int) and not isinstance(prior, bool) else None
         packet["auto_rework_decision"] = str(auto_rework.get("cause") or "")[:64] or None
+    # NF-2026-01923: why a planned auto-return did not rework the card (for
+    # instance ``environment_blocked``: the command fails on the base commit
+    # too) and the NeedFix it was filed under.
+    if isinstance(auto_rework_receipt, dict) and auto_rework_receipt.get("state"):
+        packet["auto_rework_state"] = str(auto_rework_receipt.get("state"))[:64]
+        needfix_id = auto_rework_receipt.get("needfix_id")
+        packet["needfix_id"] = str(needfix_id)[:64] if needfix_id else None
     return _bound(packet, tails)
