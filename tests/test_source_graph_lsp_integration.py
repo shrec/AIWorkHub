@@ -1580,8 +1580,16 @@ def test_server_failure_is_not_cached_and_recovers_on_the_next_run(
 ):
     """A crash, timeout, malformed frame or malformed payload is not a server
     answering "nothing"."""
-    monkeypatch.setattr(sg, "LSP_REQUEST_TIMEOUT_S", 1.0)
-    monkeypatch.setattr(sg, "LSP_BATCH_TIMEOUT_S", 10.0)
+    # A healthy reply returns at once, so a budget scaled by core count costs
+    # nothing and keeps server startup under xdist load inside it (NF-2026-01710).
+    healthy_request_s = 5.0 * max(1, min(os.cpu_count() or 1, 32))
+    # Only a hang is classified by a deadline. A crash, malformed frame or bad
+    # payload is observed from the server itself (EOF / frame / payload), so a
+    # short deadline there would race server startup on a loaded host and turn
+    # the crash under test into a timeout (NF-2026-01382).
+    failing_request_s = 1.0 if mode == "hang" else healthy_request_s
+    monkeypatch.setattr(sg, "LSP_REQUEST_TIMEOUT_S", failing_request_s)
+    monkeypatch.setattr(sg, "LSP_BATCH_TIMEOUT_S", failing_request_s * 10)
     fixture = _Lsp(tmp_path, monkeypatch, f"failure_{mode}")
     _python_pair(fixture)
     fixture.fail(CALL_KEY, mode)
@@ -1589,6 +1597,10 @@ def test_server_failure_is_not_cached_and_recovers_on_the_next_run(
 
     failed = fixture.index("a.py")
 
+    if mode != "hang":
+        # The server really reached the failing position: the failure under
+        # test happened, not an unrelated early timeout.
+        assert CALL_KEY in {entry["key"] for entry in fixture.asked()}
     assert failed["lsp"]["unavailable"] >= 1
     assert fixture.edge("a.py", CALL_NAME)["dst_qualname"] is None
     # No reusable receipt: the failure must not block the next attempt.
@@ -1599,12 +1611,8 @@ def test_server_failure_is_not_cached_and_recovers_on_the_next_run(
     _assert_classified(health)
 
     fixture.fail(CALL_KEY, None)
-    # The failing run needs the short timeout to classify a hang; the recovery run
-    # is a healthy server, so under xdist load it gets a budget scaled by core count
-    # (NF-2026-01710). A healthy reply returns at once, so the larger budget costs nothing.
-    recovery_request_s = 5.0 * max(1, min(os.cpu_count() or 1, 32))
-    monkeypatch.setattr(sg, "LSP_REQUEST_TIMEOUT_S", recovery_request_s)
-    monkeypatch.setattr(sg, "LSP_BATCH_TIMEOUT_S", recovery_request_s * 10)
+    monkeypatch.setattr(sg, "LSP_REQUEST_TIMEOUT_S", healthy_request_s)
+    monkeypatch.setattr(sg, "LSP_BATCH_TIMEOUT_S", healthy_request_s * 10)
     asked_before = len(fixture.asked())
     recovered = fixture.index("a.py")
 

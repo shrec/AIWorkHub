@@ -818,50 +818,89 @@ def test_abrupt_supervisor_loss_does_not_orphan_worker(tmp_path: Path) -> None:
     deadline = time.monotonic() + _HANG_GUARD_SECONDS
     status: dict = {}
     while time.monotonic() < deadline:
-        if status_path.is_file():
+        # Poll the real status flag and tolerate a write in flight: a reader
+        # racing the supervisor's replace can see the file absent or partial.
+        try:
             status = _read_status(status_path)
-            if status.get("state") == "running":
-                break
+        except (FileNotFoundError, json.JSONDecodeError):
+            status = {}
+        if status.get("state") == "running":
+            break
         time.sleep(0.02)
     assert status.get("state") == "running"
     child_pid = int(status["child_pid"])
 
     if os.name == "nt":
-        process.kill()
-        assert process.wait(timeout=_HANG_GUARD_SECONDS) != 0
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
         kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
         kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-        deadline = time.monotonic() + _HANG_GUARD_SECONDS
-        while time.monotonic() < deadline:
-            handle = kernel32.OpenProcess(0x1000, False, child_pid)
-            if not handle:
-                break
+        # Pin the worker's process object before the supervisor dies so the
+        # wait observes this exact process terminating (signalled handle),
+        # never a lingering process object or a reused PID.
+        synchronize_and_query = 0x00100000 | 0x1000
+        handle = kernel32.OpenProcess(synchronize_and_query, False, child_pid)
+        assert handle, ctypes.get_last_error()
+        try:
+            process.kill()
+            assert process.wait(timeout=_HANG_GUARD_SECONDS) != 0
+            wait_object_0 = 0
+            if kernel32.WaitForSingleObject(handle, _HANG_GUARD_SECONDS * 1000) != wait_object_0:
+                raise AssertionError("worker survived abrupt supervisor loss")
+        finally:
             kernel32.CloseHandle(handle)
-            time.sleep(0.02)
-        else:
-            raise AssertionError("worker survived abrupt supervisor loss")
         return
 
-    os.kill(process.pid, signal.SIGKILL)
-    assert process.wait(timeout=_HANG_GUARD_SECONDS) == -signal.SIGKILL
-    deadline = time.monotonic() + _HANG_GUARD_SECONDS
-    while time.monotonic() < deadline:
-        proc_stat = Path(f"/proc/{child_pid}/stat")
-        if not proc_stat.exists():
-            break
+    pidfd = None
+    if hasattr(os, "pidfd_open"):
+        try:
+            pidfd = os.pidfd_open(child_pid)
+        except OSError:
+            pidfd = None
+    proc_stat = Path(f"/proc/{child_pid}/stat")
+
+    def _start_ticks() -> str | None:
         try:
             raw = proc_stat.read_text(encoding="utf-8")
         except (FileNotFoundError, ProcessLookupError):
-            # The worker may exit between the existence probe and the read;
-            # disappearing from procfs is the successful outcome under test.
-            break
-        if raw.rpartition(")")[2].strip().split()[0] == "Z":
-            break
-        time.sleep(0.02)
-    else:
-        raise AssertionError("worker survived abrupt supervisor loss")
+            return None
+        fields = raw.rpartition(")")[2].split()
+        if fields[0] == "Z":
+            return None
+        return fields[19]
+
+    started = _start_ticks()
+    # Fail closed: where procfs exists the live worker must be observable
+    # before the kill, or a vanished entry would pass vacuously.
+    assert pidfd is not None or started is not None or not Path("/proc/self/stat").exists()
+    try:
+        os.kill(process.pid, signal.SIGKILL)
+        assert process.wait(timeout=_HANG_GUARD_SECONDS) == -signal.SIGKILL
+        if pidfd is not None:
+            # A pidfd becomes readable exactly when this process exits: an
+            # event wait on the observed state, immune to PID reuse.
+            import select
+
+            poller = select.poll()
+            poller.register(pidfd, select.POLLIN)
+            if not poller.poll(_HANG_GUARD_SECONDS * 1000):
+                raise AssertionError("worker survived abrupt supervisor loss")
+            return
+        deadline = time.monotonic() + _HANG_GUARD_SECONDS
+        while time.monotonic() < deadline:
+            # Gone, a zombie, or a different process reusing the PID (start
+            # tick changed) all mean the original worker no longer runs.
+            current = _start_ticks()
+            if current is None or current != started:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("worker survived abrupt supervisor loss")
+    finally:
+        if pidfd is not None:
+            os.close(pidfd)
 
 
 def test_supervisor_never_enables_shell_execution() -> None:
