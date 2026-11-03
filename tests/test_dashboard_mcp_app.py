@@ -132,25 +132,45 @@ def test_snapshot_view_serializes_allocation_heavy_builds(monkeypatch):
     state_lock = threading.Lock()
     active = 0
     peak = 0
+    callers = 0
+    # Set once BOTH threads are inside snapshot_view: the first build then holds
+    # the build slot while the second caller is provably contending for it, so
+    # the overlap is event-bound instead of a race against wall-clock timing.
+    both_callers_inside = threading.Event()
 
     def fake_build_snapshot(**_kwargs):
         nonlocal active, peak
         with state_lock:
             active += 1
             peak = max(peak, active)
+        both_callers_inside.wait(30)
         time.sleep(0.03)
         with state_lock:
             active -= 1
         return dict(FAKE_SNAPSHOT)
 
+    # Every live-host stage (manager_bootstrap, dispatcher health, repository/
+    # router identity probes, storage inventory) is a fast fake, and the build
+    # cache key never stats a real repository.
     _stub_snapshot_sources(monkeypatch)
     monkeypatch.setattr(dashboard, "build_snapshot", fake_build_snapshot)
+    monkeypatch.setattr(dashboard_mcp_app, "_snapshot_generation_key", lambda _root: None)
+
+    errors: list[BaseException] = []
 
     def run_snapshot():
+        nonlocal callers
         barrier.wait()
-        dashboard_mcp_app.snapshot_view(full=True)
+        with state_lock:
+            callers += 1
+            if callers == 2:
+                both_callers_inside.set()
+        try:
+            dashboard_mcp_app.snapshot_view(full=True)
+        except BaseException as exc:  # noqa: BLE001 -- surfaced by the assertion below
+            errors.append(exc)
 
-    threads = [threading.Thread(target=run_snapshot) for _ in range(2)]
+    threads = [threading.Thread(target=run_snapshot, daemon=True) for _ in range(2)]
     for thread in threads:
         thread.start()
     barrier.wait()
@@ -158,6 +178,8 @@ def test_snapshot_view_serializes_allocation_heavy_builds(monkeypatch):
         thread.join(30)
 
     assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert both_callers_inside.is_set()
     assert peak == 1
 
 

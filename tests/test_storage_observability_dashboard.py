@@ -65,6 +65,25 @@ def _wait_ready(repo: Path, timeout: float = 30.0) -> dict:
     return result
 
 
+def _snapshot_off_thread(repo: Path, bound: float = 30.0) -> dict:
+    """Run ``snapshot`` on its own thread and require it to return.
+
+    The callers gate ``_measure`` on an event the test holds unset, so a
+    snapshot that waited for the scan could never finish: completion within
+    the bound proves the request path does not block on the inventory, with
+    no wall-clock race against host load.
+    """
+    box: dict[str, dict] = {}
+    worker = threading.Thread(
+        target=lambda: box.setdefault("result", storage_observability.snapshot(repo)),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(bound)
+    assert not worker.is_alive(), "storage snapshot blocked on the managed-size scan"
+    return box["result"]
+
+
 def test_storage_snapshot_counts_repo_data_and_never_follows_symlinks(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     data = repo / ".aiworkhub"
@@ -318,19 +337,33 @@ def test_storage_snapshot_flags_material_unattributed_storage(tmp_path, monkeypa
 def test_storage_snapshot_returns_immediately_while_slow_scan_runs(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
+    scan_entered = threading.Event()
+    release_scan = threading.Event()
 
-    def slow_scan(*_args, **_kwargs):
-        time.sleep(0.15)
-        return {"summary": {"total_bytes": 1, "count": 1, "removable_safe_bytes": 0}}
+    def slow_measure(_root):
+        # Stands in for the whole live inventory (storage_readiness, worktree
+        # scan, retention previews): it cannot finish until the test has seen
+        # the first response, so "returned while the scan runs" is event-bound.
+        scan_entered.set()
+        if not release_scan.wait(60):
+            raise AssertionError("slow scan was never released")
+        return {
+            "scan_status": "ready",
+            "scanned_at": "2026-08-20T00:00:00+00:00",
+            "worker_tree_bytes": 1,
+            "worker_tree_count": 1,
+            "errors": [],
+        }
 
-    monkeypatch.setattr(storage_observability.worktree_storage, "scan_worktrees", slow_scan)
+    monkeypatch.setattr(storage_observability, "_measure", slow_measure)
     storage_observability._reset_cache_for_tests()
-    started = time.monotonic()
 
-    first = storage_observability.snapshot(repo)
+    first = _snapshot_off_thread(repo)
 
-    assert time.monotonic() - started < 0.1
+    assert not release_scan.is_set()
+    assert scan_entered.wait(30)
     assert first["scan_status"] == "scanning"
+    release_scan.set()
     assert _wait_ready(repo)["scan_status"] == "ready"
 
 
@@ -353,8 +386,12 @@ def test_storage_scan_failure_is_bounded_and_does_not_break_capacity(tmp_path, m
 
 def test_storage_snapshot_survives_runtime_cache_reset(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
-    repo.mkdir()
-    assert task_store.initialize_repository(repo)["ok"]
+    # ``_persist`` only writes for a canonical repository (one holding the
+    # project manifest).  A manifest file stands in for the live
+    # initialize_repository/storage_readiness SQLite bootstrap, which is not
+    # what this case measures and is slow under a loaded xdist run.
+    (repo / ".aiworkhub").mkdir(parents=True)
+    (repo / ".aiworkhub" / "project.json").write_text("{}", encoding="utf-8")
     measured = {
         "scan_status": "ready",
         "scanned_at": "2026-08-20T00:00:00+00:00",
@@ -381,17 +418,23 @@ def test_storage_snapshot_survives_runtime_cache_reset(tmp_path, monkeypatch):
         "disk_total_bytes": 0,
     }
     storage_observability._persist(repo.resolve(), measured)
+    assert (repo / storage_observability.PERSISTED_CACHE_RELATIVE_PATH).is_file()
     storage_observability._reset_cache_for_tests()
-    monkeypatch.setattr(
-        storage_observability,
-        "_measure",
-        lambda _root: (_ for _ in ()).throw(AssertionError("fresh cache rescanned")),
-    )
+    rescan_entered = threading.Event()
+    never_released = threading.Event()
 
-    started = time.monotonic()
-    result = storage_observability.snapshot(repo)
+    def blocking_rescan(_root):
+        # A synchronous rescan would park the request here; a scheduled one is
+        # recorded by the event.  Either way the fresh cache was not served.
+        rescan_entered.set()
+        never_released.wait(60)
+        raise AssertionError("fresh cache rescanned")
 
-    assert time.monotonic() - started < 0.1
+    monkeypatch.setattr(storage_observability, "_measure", blocking_rescan)
+
+    result = _snapshot_off_thread(repo)
+
+    assert not rescan_entered.is_set()
     assert result["scan_status"] == "ready"
     assert result["managed_total_bytes"] == 123456
     assert result["scanned_at"] == "2026-08-20T00:00:00+00:00"
