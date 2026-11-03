@@ -164,13 +164,18 @@ def test_daemon_cold_start_refresh_stop_restart_needs_no_later_refresh(
     release_writer[0].set()
     assert completed[0].wait(10)
     assert build_outcomes[0].get("ok") is True, build_outcomes[0]
-    # Wait for the cold build to release its lock so refresh scheduling is timing-independent.
+    # The first-build event can fire before the startup build's post-build work
+    # releases _build_lock, so it does not order the second build by itself.
     assert daemon.wait_for_first_build(timeout=10)
     _assert_public_reads(root, "committed")
 
     (root / "app.py").write_text(
         "def refreshed():\n    return 'searchable marker'\n", encoding="utf-8"
     )
+    # Build 1 must never run on this thread: gated_connect blocks it on
+    # release_writer[1], which only this thread sets. refresh_now() would build
+    # synchronously here whenever _build_lock is already free, so trigger the
+    # build through request_refresh(), which always hands it to the daemon thread.
     queued = daemon.request_refresh()
     assert queued["ok"] is True, queued
     assert queued["queued"] is True, queued
