@@ -5784,6 +5784,92 @@ def _source_graph_diff_query(
     }
 
 
+# NF-2026-02012: wall-clock deadline for the MCP-registered Source Graph tool.
+# A measured worker call sent nothing for 1801 s; past this deadline the tool
+# answers a typed ``source_graph_timeout`` naming the last phase reached.
+SOURCE_GRAPH_TOOL_DEADLINE_SECONDS = 120.0
+# Per-thread holder for the coarse phase the running query last reached.
+_SOURCE_GRAPH_PHASE = threading.local()
+
+
+def _source_graph_phase(name: str) -> None:
+    """Record the coarse phase of the Source Graph call on this thread."""
+    holder = getattr(_SOURCE_GRAPH_PHASE, "holder", None)
+    if holder is not None:
+        holder["phase"] = name
+
+
+def _source_graph_query_with_deadline(
+    ctx: WorkerToolContext, **kwargs: Any,
+) -> dict[str, Any]:
+    """Run ``source_graph_query`` on a daemon thread under the tool deadline.
+
+    A Python thread cannot be killed: on expiry it is abandoned and keeps
+    running to completion on its own sqlite connections (opened inside the
+    call, e.g. ``ComposedView.open``, and bound through the ContextVar
+    ``database_path_override``; no connection object reaches a later call).
+    Each later
+    call gets its own thread and its own deadline, so one that queues behind
+    a lock the abandoned call holds (``_SOURCE_GRAPH_DB_OVERRIDE_LOCK``,
+    ``_CACHE_LOCK``) also returns this typed timeout instead of hanging.  A
+    late ledger append from the abandoned call is one more independently
+    HMAC-signed line written by a single ``O_APPEND`` write; the ledger has
+    no hash chain for it to break.
+    """
+    import contextvars
+
+    holder: dict[str, str] = {"phase": "dispatch"}
+    box: dict[str, Any] = {}
+    done = threading.Event()
+
+    def _run() -> None:
+        _SOURCE_GRAPH_PHASE.holder = holder
+        try:
+            box["result"] = source_graph_query(ctx, **kwargs)
+        except BaseException as exc:  # re-raised on the caller's thread
+            box["error"] = exc
+        finally:
+            _SOURCE_GRAPH_PHASE.holder = None
+            done.set()
+
+    deadline = float(SOURCE_GRAPH_TOOL_DEADLINE_SECONDS)
+    started = time.monotonic()
+    context = contextvars.copy_context()
+    threading.Thread(
+        target=context.run, args=(_run,),
+        name="aiworkhub-source-graph-query", daemon=True,
+    ).start()
+    if done.wait(deadline):
+        if "error" in box:
+            raise box["error"]
+        return box["result"]
+    elapsed = round(time.monotonic() - started, 3)
+    phase = str(holder.get("phase") or "dispatch")
+    mode = str(kwargs.get("mode") or "")
+    _append_audit(
+        ctx, tool="source_graph", ok=False, cache_hit=False, hit_count=0,
+        bytes_returned=0, violation="source_graph_timeout",
+        payload={
+            "mode": mode, "phase": phase,
+            "deadline_seconds": deadline, "elapsed_seconds": elapsed,
+        },
+    )
+    return {
+        "ok": False,
+        "tool": "source_graph",
+        "error": "source_graph_timeout",
+        "reason": "source_graph_timeout",
+        "mode": mode,
+        "deadline_seconds": deadline,
+        "elapsed_seconds": elapsed,
+        "phase": phase,
+        "valid_next_call": (
+            "Narrow the query or pass an allowed target; the abandoned call "
+            "keeps no state this reply depends on."
+        ),
+    }
+
+
 def source_graph_query(
     ctx: WorkerToolContext,
     *,
@@ -5837,6 +5923,7 @@ def source_graph_query(
 
     tool = "source_graph"
     started = time.perf_counter()
+    _source_graph_phase("validate")
     from . import feature_settings
 
     if not feature_settings.enabled(ctx.authority_repo, "source_graph"):
@@ -5940,6 +6027,7 @@ def source_graph_query(
             bundle_type=bundle_type, workflow_stage=workflow_stage,
         )
 
+    _source_graph_phase("resolve_binding")
     from . import source_graph as _source_graph_mod
     try:
         if ctx.rework_overlay_packet is None:
@@ -5960,6 +6048,7 @@ def source_graph_query(
     except (WorkerToolError, OSError, sqlite3.Error) as exc:
         return _violation(ctx, tool, str(exc)[:160])
 
+    _source_graph_phase("cache_lookup")
     query_repo = binding.authority_repo or ctx.authority_repo
     index_identity = _source_graph_index_identity(
         binding.db_path, default_revision=_source_graph_mod.BUILD_REVISION,
@@ -6063,6 +6152,7 @@ def source_graph_query(
             "provider_token_savings_measured": False,
         }
 
+    _source_graph_phase("engine_query")
     literal_walk_state = ""
     resumed_fallback_step = ""
     try:
@@ -6297,6 +6387,7 @@ def source_graph_query(
         # token fallback runs only once the literal walk completed with zero hits.
         and literal_walk_state != "incomplete"
     ):
+        _source_graph_phase("zero_hit_fallback")
         fallback = _source_graph_zero_hit_fallback(
             ctx, _source_graph_mod, query_repo,
             mode=mode, query=bounded_query, scope=scope, budget=budget,
@@ -6324,6 +6415,7 @@ def source_graph_query(
     # that file rather than handed back as stale line numbers (source_graph-8).
     refreshed_files: list[str] = []
     if isinstance(payload, dict) and payload and not overlay_applied:
+        _source_graph_phase("inline_refresh")
         refreshed_files = _inline_refresh_stale_rows(_source_graph_mod, query_repo, payload)
 
     hit_payload = (
@@ -6406,6 +6498,7 @@ def source_graph_query(
     # Fit, do not page (source_graph-1): every analytic mode is trimmed to the
     # outer cap in one plain-JSON page; exact-content modes keep their bytes
     # and page below.
+    _source_graph_phase("compact")
     fit_dropped: list[str] = []
     if mode not in SOURCE_GRAPH_EXACT_CONTENT_MODES and isinstance(payload, dict):
         payload, fit_dropped = _fit_response_payload(
@@ -10346,7 +10439,10 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
         workflow_stage: WorkflowStage = "unspecified",
     ) -> dict[str, Any]:
         """Bounded Source Graph discovery for this task."""
-        result = source_graph_query(
+        # NF-2026-02012: a wall-clock deadline at the tool boundary, so a
+        # blocked engine returns a typed source_graph_timeout instead of
+        # silencing the worker until the client aborts.
+        result = _source_graph_query_with_deadline(
             ctx, mode=mode, query=query, budget=budget,
             target=target, cursor=cursor,
             continuation_cursor=continuation_cursor,
