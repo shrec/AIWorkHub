@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -2090,13 +2091,43 @@ class TestReopenGenerationLifecycle:
 
 
 class TestManagerVerifiedResolution:
+    @staticmethod
+    def _real_commit(repo: Path) -> str:
+        """Create a real commit in the test repo and return its sha.
+
+        resolve_verified_needfix refuses a ``commit:<sha>`` ref that is not an
+        ancestor of HEAD (NF-2026-01964); the unreachable-sha refusal itself is
+        covered by tests/test_needfix_resolve_commit_path_nf01964.py.
+        """
+
+        def _git(*args: str) -> str:
+            # cwd= as well as -C: a sandboxed pytest cwd may not be resolvable.
+            return subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(repo), *args],
+                cwd=str(repo),
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        try:
+            _git("init", "-q")
+        except (OSError, subprocess.CalledProcessError) as exc:
+            pytest.skip(f"git init unavailable: {exc}")
+        (repo / "README.md").write_text("seed\n", encoding="utf-8")
+        _git("add", "README.md")
+        _git("commit", "-q", "-m", "seed")
+        return _git("rev-parse", "HEAD")
+
     def _accepted(self, init_store: Path, *, readiness_score: int = 100, evidence=None, refs=None):
+        if refs is None:
+            refs = [f"commit:{self._real_commit(init_store)}"]
         row = needfix_store.capture_proposal(
             init_store,
             title="Canonical fix",
             description="Manager verified this fix directly on canonical HEAD.",
             evidence=evidence if evidence is not None else {"validation": "pytest passed"},
-            evidence_refs=refs if refs is not None else ["commit:0123456789abcdef"],
+            evidence_refs=refs,
         )
         needfix_store.triage_needfix(init_store, row["id"])
         return needfix_store.accept_needfix(

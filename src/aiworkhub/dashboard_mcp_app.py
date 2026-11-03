@@ -4219,19 +4219,19 @@ def needfix_transition_view(
 ) -> dict[str, Any]:
     """USER WRITE: apply one confirmed lifecycle status transition to a NeedFix item.
 
-    Use this to triage, accept, reject, defer, mark duplicate, mark task_planned, resolve, or recover a conversion claim; use aiworkhub_dashboard_needfix_archive, aiworkhub_dashboard_needfix_restore, or aiworkhub_dashboard_needfix_convert_commit for archive, restore, or task creation. Requires confirm=True, persists the state transition and audit event in the NeedFix store, and returns a transition receipt.
+    Use this to triage, accept, reject, defer, mark duplicate or task_planned, resolve, or recover a conversion claim; use aiworkhub_dashboard_needfix_archive, aiworkhub_dashboard_needfix_restore, or aiworkhub_dashboard_needfix_convert_commit instead. Requires confirm=True, persists the transition and audit event, and returns a transition receipt.
 
-    action=resolve only moves task_created -> resolved. A fix landed without a task resolves via action=resolve_verified from accepted or task_planned with readiness_score=100 and non-empty evidence and evidence_refs set via needfix_update; every 'commit:<sha>' ref must be an ancestor of HEAD or it is refused with needfix_resolve_commit_not_reachable:<sha>. A `Resolves: NF-YYYY-NNNNN` git trailer on a HEAD-reachable commit also resolves it. A refused resolve names both routes in resolve_routes.
+    action=resolve only moves task_created -> resolved; a refused resolve names both routes in resolve_routes. A fix landed without a task uses action=resolve_verified from accepted or task_planned with readiness_score=100, evidence and evidence_refs; a 'commit:<sha>' ref not reachable from HEAD is refused with needfix_resolve_commit_not_reachable:<sha>. A `Resolves: NF-YYYY-NNNNN` trailer on a HEAD-reachable commit also resolves it.
 
     Args:
-        needfix_id: str canonical NeedFix identifier to transition.
-        action: str transition action: triage, accept, reject, duplicate, defer, task_planned, resolve, resolve_verified, or recover_conversion_claim.
-        reason: str note or rationale (default "", up to 1000 chars; required for recover_conversion_claim).
-        readiness_score: optional int score for triage or accept (default None).
-        duplicate_parent_id: str parent NeedFix ID when action is duplicate (default "").
-        confirm: bool (default False); must be True to execute the transition.
-        include_item: bool (default False); True adds full detail fields to item.
-        promote_to: str optional chained target (default ""; only "accepted" with action="triage" is allowed).
+        needfix_id: NeedFix ID to transition.
+        action: triage, accept, reject, duplicate, defer, task_planned, resolve, resolve_verified, or recover_conversion_claim.
+        reason: note, up to 1000 chars; required for recover_conversion_claim.
+        readiness_score: optional score for triage or accept.
+        duplicate_parent_id: parent ID for action=duplicate.
+        confirm: must be True to execute.
+        include_item: True adds full item detail.
+        promote_to: optional; only "accepted" with action=triage.
     """
     candidate = str(needfix_id or "")
     selected = str(action or "").strip().lower()
