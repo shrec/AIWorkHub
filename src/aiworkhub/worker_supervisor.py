@@ -1356,6 +1356,69 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
             "last_progress_event": last_progress_event,
             "last_meaningful_progress_event": last_meaningful_progress_event,
         })
+
+        def _observe_output(authority: TelemetryAuthority, report_prefix: str) -> None:
+            """Classify captured output: size growth, trusted progress, usage.
+
+            The single observation step shared by every running heartbeat and
+            the one post-join pass (NF-2026-02024), so bytes that land after
+            the last heartbeat still reach the terminal status.
+            """
+            nonlocal last_stdout_bytes, last_stderr_bytes, last_output_change_epoch
+            nonlocal last_meaningful_progress_epoch, last_actionable_progress_epoch
+            nonlocal last_meaningful_phase, last_progress_sequence, last_progress_event
+            nonlocal last_meaningful_progress_sequence, last_meaningful_progress_event
+            nonlocal last_observed_tokens, token_state
+            stdout_bytes = _file_size(stdout_path)
+            stderr_bytes = _file_size(stderr_path)
+            if stdout_bytes != last_stdout_bytes or stderr_bytes != last_stderr_bytes:
+                last_output_change_epoch = time.time()
+                if adapter_id not in TRUSTED_PROGRESS_ADAPTERS:
+                    last_meaningful_progress_epoch = last_output_change_epoch
+                    last_meaningful_phase = "provider_output"
+                last_stdout_bytes = stdout_bytes
+                last_stderr_bytes = stderr_bytes
+            progress, meaningful_progress = (
+                _latest_progress_events(stdout_path)
+                if adapter_id in TRUSTED_PROGRESS_ADAPTERS
+                else ({}, {})
+            )
+            progress_sequence = int(progress.get("sequence") or 0)
+            if progress_sequence > last_progress_sequence:
+                last_progress_sequence = progress_sequence
+                last_progress_event = progress
+            meaningful_sequence = int(meaningful_progress.get("sequence") or 0)
+            if meaningful_sequence > last_meaningful_progress_sequence:
+                last_meaningful_progress_epoch = time.time()
+                last_actionable_progress_epoch = last_meaningful_progress_epoch
+                # The meaningful event was parsed from captured stdout, so its
+                # observation cannot truthfully post-date the output clock.
+                last_output_change_epoch = max(
+                    last_output_change_epoch, last_meaningful_progress_epoch
+                )
+                last_meaningful_phase = str(meaningful_progress["phase"])
+                last_meaningful_progress_sequence = meaningful_sequence
+                last_meaningful_progress_event = meaningful_progress
+            observed_tokens = _usage_total_from_output(stdout_path, adapter_id)
+            if observed_tokens is not None and observed_tokens != last_observed_tokens:
+                last_meaningful_progress_epoch = time.time()
+                last_meaningful_phase = "provider_usage"
+                decision = consume_sample(
+                    token_state,
+                    TokenSample(
+                        report_id=f"{report_prefix}:{heartbeat_seq}:{observed_tokens}",
+                        authority=authority,
+                        kind=SampleKind.CUMULATIVE,
+                        total_tokens=observed_tokens,
+                        source=f"{adapter_id or 'provider'}:stdout",
+                    ),
+                )
+                token_state = decision.state
+                token_decisions.append(decision)
+                last_observed_tokens = observed_tokens
+                # Provider usage is non-enforcing telemetry only: a crossed
+                # legacy cap never signals, terminates, or reaps the child.
+
         final_state = "exited"
         while True:
             returncode = child.poll()
@@ -1375,53 +1438,7 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
                 # it never touches task lifecycle/updated_at and is
                 # orthogonal to "state" (semantic progress), which is
                 # still set exclusively by the transitions above/below.
-                stdout_bytes = _file_size(stdout_path)
-                stderr_bytes = _file_size(stderr_path)
-                if stdout_bytes != last_stdout_bytes or stderr_bytes != last_stderr_bytes:
-                    last_output_change_epoch = time.time()
-                    if adapter_id not in TRUSTED_PROGRESS_ADAPTERS:
-                        last_meaningful_progress_epoch = last_output_change_epoch
-                        last_meaningful_phase = "provider_output"
-                    last_stdout_bytes = stdout_bytes
-                    last_stderr_bytes = stderr_bytes
-                progress, meaningful_progress = (
-                    _latest_progress_events(stdout_path)
-                    if adapter_id in TRUSTED_PROGRESS_ADAPTERS
-                    else ({}, {})
-                )
-                progress_sequence = int(progress.get("sequence") or 0)
-                if progress_sequence > last_progress_sequence:
-                    last_progress_sequence = progress_sequence
-                    last_progress_event = progress
-                meaningful_sequence = int(meaningful_progress.get("sequence") or 0)
-                if meaningful_sequence > last_meaningful_progress_sequence:
-                    last_meaningful_progress_epoch = time.time()
-                    last_actionable_progress_epoch = last_meaningful_progress_epoch
-                    last_output_change_epoch = max(
-                        last_output_change_epoch, last_meaningful_progress_epoch
-                    )
-                    last_meaningful_phase = str(meaningful_progress["phase"])
-                    last_meaningful_progress_sequence = meaningful_sequence
-                    last_meaningful_progress_event = meaningful_progress
-                observed_tokens = _usage_total_from_output(stdout_path, adapter_id)
-                if observed_tokens is not None and observed_tokens != last_observed_tokens:
-                    last_meaningful_progress_epoch = time.time()
-                    last_meaningful_phase = "provider_usage"
-                    decision = consume_sample(
-                        token_state,
-                        TokenSample(
-                            report_id=f"live:{heartbeat_seq}:{observed_tokens}",
-                            authority=TelemetryAuthority.ENFORCED_LIVE,
-                            kind=SampleKind.CUMULATIVE,
-                            total_tokens=observed_tokens,
-                            source=f"{adapter_id or 'provider'}:stdout",
-                        ),
-                    )
-                    token_state = decision.state
-                    token_decisions.append(decision)
-                    last_observed_tokens = observed_tokens
-                    # Provider usage is non-enforcing telemetry only: a crossed
-                    # legacy cap never signals, terminates, or reaps the child.
+                _observe_output(TelemetryAuthority.ENFORCED_LIVE, "live")
                 heartbeat_seq += 1
                 _write_json_0600(status_path, {
                     "state": "running",
@@ -1477,56 +1494,10 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
         )
         # A large captured byte count never converts a successful exit into a
         # failure; persisted tails remain bounded independently.
-        if (
-            final_stdout_bytes != last_stdout_bytes
-            or final_stderr_bytes != last_stderr_bytes
-        ):
-            last_output_change_epoch = time.time()
-            if adapter_id not in TRUSTED_PROGRESS_ADAPTERS:
-                last_meaningful_progress_epoch = last_output_change_epoch
-                last_meaningful_phase = "provider_output"
-        final_progress, final_meaningful_progress = (
-            _latest_progress_events(stdout_path)
-            if adapter_id in TRUSTED_PROGRESS_ADAPTERS
-            else ({}, {})
-        )
-        final_progress_sequence = int(final_progress.get("sequence") or 0)
-        if final_progress_sequence > last_progress_sequence:
-            last_progress_sequence = final_progress_sequence
-            last_progress_event = final_progress
-        final_meaningful_sequence = int(
-            final_meaningful_progress.get("sequence") or 0
-        )
-        if final_meaningful_sequence > last_meaningful_progress_sequence:
-            last_meaningful_progress_epoch = time.time()
-            last_actionable_progress_epoch = last_meaningful_progress_epoch
-            # The meaningful event was parsed from the captured stdout, so its
-            # observation cannot truthfully post-date the output-change clock.
-            # Keep the two clocks monotonic even when the final capture and
-            # parse happen inside the same sub-millisecond scheduling slice.
-            last_output_change_epoch = max(
-                last_output_change_epoch, last_meaningful_progress_epoch
-            )
-            last_meaningful_phase = str(final_meaningful_progress["phase"])
-            last_meaningful_progress_sequence = final_meaningful_sequence
-            last_meaningful_progress_event = final_meaningful_progress
-        final_observed_tokens = _usage_total_from_output(stdout_path, adapter_id)
-        if (
-            final_observed_tokens is not None
-            and final_observed_tokens != last_observed_tokens
-        ):
-            final_decision = consume_sample(
-                token_state,
-                TokenSample(
-                    report_id=f"posthoc:{heartbeat_seq}:{final_observed_tokens}",
-                    authority=TelemetryAuthority.POSTHOC_ONLY,
-                    kind=SampleKind.CUMULATIVE,
-                    total_tokens=final_observed_tokens,
-                    source=f"{adapter_id or 'provider'}:stdout",
-                ),
-            )
-            token_state = final_decision.state
-            token_decisions.append(final_decision)
+        # NF-2026-02024: classify every byte the capture threads flushed after
+        # the last heartbeat before the terminal status is written. A usage
+        # total first seen here is post-hoc telemetry, never enforced-live.
+        _observe_output(TelemetryAuthority.POSTHOC_ONLY, "posthoc")
         # NF-2026-01523: surface a dead loopback relay / failed worker MCP
         # bridge in the status as diagnostics only. These keys never decide
         # success or failure: the worker's own exit code alone does that.
