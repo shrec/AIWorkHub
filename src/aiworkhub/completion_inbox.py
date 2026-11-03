@@ -1062,6 +1062,15 @@ def _packet_reviewer_sections(
                 duplicates += 1
                 if lens not in bucket[key]["lenses"]:
                     bucket[key]["lenses"].append(lens)
+                merged_reviewer = _packet_text(report.get("reviewer_request_id"), 100)
+                if merged_reviewer:
+                    merged_id = _packet_text(finding.get("id"), 200)
+                    bucket[key].setdefault("merged_dispose_targets", []).append(
+                        {
+                            "reviewer_request_id": merged_reviewer,
+                            "dispose_finding_id": f"reviewer:{lens}:{merged_id}",
+                        }
+                    )
                 continue
             reviewer_request_id = _packet_text(report.get("reviewer_request_id"), 100)
             finding_id = _packet_text(finding.get("id"), 200)
@@ -1142,6 +1151,164 @@ def _packet_drop(packet: dict[str, Any], section: str) -> bool:
         review["findings"] = []
         return had
     return False
+
+
+REVIEW_DECISION_SCHEMA_ID = "aiworkhub.review_decision.v1"
+
+# The three tools a decision section prefills. The decision test asserts every
+# prefilled argument dict against that tool's own ``inspect.signature``.
+_DECISION_ACCEPT_TOOL = "aiworkhub_agent_accept_review"
+_DECISION_DISPOSE_TOOL = "aiworkhub_manager_review_finding_dispose"
+_DECISION_REJECT_TOOL = "aiworkhub_task_reject_review"
+# The accept fold's blocker kinds (process_launcher_accept_review._blocker):
+# a finding blocker is answered by a disposition, the approval blocker by
+# ``confirm_high_risk`` on the accept call -- two different manager acts.
+_DECISION_FINDING_BLOCKER_KIND = "refinement_required"
+_DECISION_HIGH_RISK_APPROVAL_KIND = "explicit_human_approval_missing"
+_DECISION_HIGH_TIER = "high"
+
+
+def _packet_decision(packet: dict[str, Any], preview: dict[str, Any]) -> dict[str, Any]:
+    """Ready-to-run argument dicts for accept, dispose and reject (NF-2026-01925).
+
+    Built only from what the packet already holds -- its identity, effective
+    tier, deduped reviewer findings and the injected ``accept_preview`` fold --
+    so it stays read-only. It prefills identifiers and nothing else: every
+    ``disposition``, ``reason`` and ``no_new_lesson_reason`` is left empty for
+    the manager, and no verdict is chosen. A finding the preview already shows
+    a bound disposition for gets no dispose call.
+    """
+    request_id = str(packet.get("request_id") or "")
+    task_id = str(packet.get("task_id") or "")
+    risk = packet.get("risk")
+    tier = str((risk if isinstance(risk, dict) else {}).get("effective_tier") or "")
+    accept_args: dict[str, Any] = {"request_id": request_id, "task_id": task_id}
+    if tier.strip().lower() == _DECISION_HIGH_TIER:
+        accept_args["confirm_high_risk"] = True
+    accept_args["no_new_lesson_reason"] = ""
+    lens_reviewers: dict[str, str] = {}
+    for row in _packet_rows(preview.get("per_lens")):
+        lens = str(row.get("lens") or "")
+        reviewer = str(row.get("request_id") or "")
+        if lens and reviewer and row.get("usable") and lens not in lens_reviewers:
+            lens_reviewers[lens] = reviewer
+    disposed: set[tuple[str, str]] = set()
+    for row in _packet_rows(preview.get("finding_dispositions")):
+        disposed_id = str(row.get("finding_id") or "")
+        if disposed_id:
+            disposed.add((str(row.get("reviewer_request_id") or ""), disposed_id))
+    disposed_ids = {finding_id for _, finding_id in disposed}
+    review = packet.get("review")
+    findings = (review if isinstance(review, dict) else {}).get("findings") or []
+    dispose_calls: list[dict[str, Any]] = []
+    pending_ids: set[str] = set()
+    disposed_count = 0
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        lenses = finding.get("lenses") or [""]
+        lens = str(lenses[0] or "")
+        primary_finding_id = str(
+            finding.get("dispose_finding_id")
+            or f"reviewer:{lens}:{finding.get('id') or ''}"
+        )
+        targets: list[tuple[str, str, str]] = [
+            (lens, primary_finding_id, str(finding.get("reviewer_request_id") or ""))
+        ]
+        merged = finding.get("merged_dispose_targets")
+        for target in merged if isinstance(merged, list) else []:
+            if not isinstance(target, dict):
+                continue
+            merged_finding_id = str(target.get("dispose_finding_id") or "")
+            merged_reviewer = str(target.get("reviewer_request_id") or "")
+            if not merged_finding_id or not merged_reviewer:
+                continue
+            parts = merged_finding_id.split(":", 2)
+            merged_lens = parts[1] if len(parts) == 3 else ""
+            targets.append((merged_lens, merged_finding_id, merged_reviewer))
+        for target_lens, finding_id, reviewer_request_id in targets:
+            source = "reviewer_report"
+            if not reviewer_request_id:
+                reviewer_request_id = lens_reviewers.get(target_lens, "")
+                source = (
+                    "accept_preview_per_lens" if reviewer_request_id else "unresolved"
+                )
+            if (reviewer_request_id, finding_id) in disposed or (
+                not reviewer_request_id and finding_id in disposed_ids
+            ):
+                disposed_count += 1
+                continue
+            pending_ids.add(finding_id)
+            dispose_calls.append(
+                {
+                    "tool": _DECISION_DISPOSE_TOOL,
+                    "arguments": {
+                        "task_id": task_id,
+                        "request_id": request_id,
+                        "reviewer_request_id": reviewer_request_id,
+                        "finding_id": finding_id,
+                        "disposition": "",
+                    },
+                    "severity": _packet_text(finding.get("severity"), 30),
+                    "lens": _packet_text(target_lens, 40),
+                    "summary": _packet_text(finding.get("summary"), 200),
+                    "reviewer_request_id_source": source,
+                }
+            )
+    preview_section = packet.get("accept_preview")
+    preview_section = preview_section if isinstance(preview_section, dict) else {}
+    finding_prefix = f"{_DECISION_FINDING_BLOCKER_KIND}:"
+    remaining: list[dict[str, Any]] = []
+    finding_blockers: list[dict[str, Any]] = []
+    approval_blockers: list[dict[str, Any]] = []
+    for row in _packet_rows(preview_section.get("blockers")):
+        kind = str(row.get("kind") or "")
+        error = str(row.get("error") or "")
+        if kind == _DECISION_HIGH_RISK_APPROVAL_KIND:
+            approval_blockers.append(dict(row))
+        elif (
+            kind == _DECISION_FINDING_BLOCKER_KIND
+            and error.startswith(finding_prefix)
+            and error[len(finding_prefix):] in pending_ids
+        ):
+            finding_blockers.append(dict(row))
+        else:
+            remaining.append(dict(row))
+    if approval_blockers and "confirm_high_risk" not in accept_args:
+        # The live preview owes explicit approval whatever tier the packet
+        # recorded ('', 'critical', stale); keep the documented key order.
+        lesson_reason = accept_args.pop("no_new_lesson_reason", "")
+        accept_args["confirm_high_risk"] = True
+        accept_args["no_new_lesson_reason"] = lesson_reason
+    return {
+        "schema_id": REVIEW_DECISION_SCHEMA_ID,
+        "effective_tier": _packet_text(tier, 20),
+        "accept_call": {"tool": _DECISION_ACCEPT_TOOL, "arguments": accept_args},
+        "dispose_calls": dispose_calls,
+        "reject_call": {
+            "tool": _DECISION_REJECT_TOOL,
+            # reject_review names the review request ``predecessor_request_id``.
+            "arguments": {
+                "task_id": task_id,
+                "predecessor_request_id": request_id,
+                "reason": "",
+            },
+        },
+        "already_disposed_finding_count": disposed_count,
+        # Blockers no finding disposition answers; an unevaluated preview is
+        # named as such, never read as "nothing remains".
+        "blockers_after_dispositions": remaining,
+        "blockers_after_dispositions_evaluated": bool(preview_section.get("evaluated")),
+        "finding_blockers_pending_disposition": finding_blockers,
+        "high_risk_approval_blockers": approval_blockers,
+        "high_risk_approval_satisfied_by": (
+            "accept_call.arguments.confirm_high_risk"
+            if "confirm_high_risk" in accept_args and approval_blockers
+            else ""
+        ),
+        "disposition_chosen": False,
+        "verdict_chosen": False,
+    }
 
 
 def _packet_preview_lenses(per_lens: Any, reviewer_reports: Any) -> list[dict[str, Any]] | None:
@@ -1413,6 +1580,9 @@ def review_packet(
         packet["outstanding_accept_blockers_evaluated"] = packet["accept_preview"][
             "evaluated"
         ]
+    # NF-2026-01925: built before truncation from the sections already above,
+    # and absent from _PACKET_DROP_ORDER, so evidence is always dropped first.
+    packet["decision"] = _packet_decision(packet, preview)
     for section in _PACKET_DROP_ORDER:
         if _packet_encoded_bytes(packet) <= int(max_bytes):
             break

@@ -6214,41 +6214,11 @@ def aiworkhub_completion_inbox(
     return result
 
 
-@mcp.tool()
-def aiworkhub_review_packet(
-    request_id: str,
-    task_id: str = "",
-    max_bytes: int = 90_000,
-) -> dict[str, Any]:
-    """READ-ONLY: ONE bounded review packet for a ``review_ready`` candidate.
+REVIEW_PACKET_BATCH_MAX = 8
 
-    Every fact a manager needs to decide a candidate is already persisted --
-    validation rows with their declared commands and output tails, the quality
-    gate's checks and blockers, the worker MCP gate and its receipt-conformance
-    verdict, required outputs, destructive-diff checks, the effective tier and
-    its per-lens status, the deduped reviewer findings, the reachability
-    observation -- spread across six nested objects on one card. This returns
-    them together, under a measured byte bound.
 
-    Measured over all 419 real cards carrying a quality gate: min 1,662 B, p50
-    6,387 B, p90 8,813 B, max 13,799 B, 0 needing truncation. It replaces per
-    candidate 10 task-scoped calls at p50 (p90 21) and, session-wide, 1,688
-    hand-written Bash re-derivations (pytest 611, attempt-artifact reads 242,
-    task_queue.sqlite scripts 250, log tails 113, git diff 155) totalling
-    1.45 MB.
-
-    Nothing here is a verdict: every status was decided by the gate that
-    recorded it, and accepting still runs the whole fold in ``accept_review``.
-    The one live computation is ``accept_preview`` -- itself read-only -- which
-    ``completion_inbox`` cannot call because it holds no launch authority, so
-    it is computed here and passed in.
-
-    Args:
-        request_id: Id of the review_ready worker request to build the packet for.
-        task_id: Id of the task card that request belongs to; omit to resolve it from the request's status (the reply's task_id_source says which).
-        max_bytes: Byte bound for the packet, default 90000; lowest-priority sections are dropped until it fits and listed under truncation.dropped_sections.
-    """
-
+def _review_packet_one(request_id: str, task_id: str, max_bytes: int) -> dict[str, Any]:
+    """One request's review packet: the body of a single ``aiworkhub_review_packet`` call."""
     manager = process_launcher.default_manager()
     resolved_task_id = str(task_id or "")
     task_id_source = "caller" if resolved_task_id else ""
@@ -6291,6 +6261,125 @@ def aiworkhub_review_packet(
             # counts fall back to the pre-review verdict and are not live.
             packet["reviewer_reports_unavailable"] = True
     return packet
+
+
+def _review_packet_member(request_id: str, max_bytes: int) -> dict[str, Any]:
+    """One batch member; a failure is that member's named error, never the batch's."""
+    try:
+        packet = _review_packet_one(request_id, "", max_bytes)
+    except Exception as exc:  # noqa: BLE001 -- reported per member, by type
+        return {
+            "schema_id": completion_inbox.REVIEW_PACKET_SCHEMA_ID,
+            "request_id": request_id,
+            "ok": False,
+            "readonly": True,
+            "error": "review_packet_member_failed",
+            "exception_type": type(exc).__name__,
+        }
+    if not isinstance(packet, dict):
+        return {
+            "schema_id": completion_inbox.REVIEW_PACKET_SCHEMA_ID,
+            "request_id": request_id,
+            "ok": False,
+            "readonly": True,
+            "error": "review_packet_member_not_a_packet",
+        }
+    return packet
+
+
+def _review_packet_batch(request_ids: list[Any], max_bytes: int) -> dict[str, Any]:
+    ids = [str(value or "") for value in request_ids]
+    base: dict[str, Any] = {
+        "schema_id": "aiworkhub.review_packet_batch.v1",
+        "readonly": True,
+        "request_count": len(ids),
+        "request_ids_limit": REVIEW_PACKET_BATCH_MAX,
+    }
+    if not ids:
+        return {**base, "ok": False, "error": "request_ids_empty"}
+    if len(ids) > REVIEW_PACKET_BATCH_MAX:
+        return {**base, "ok": False, "error": "request_ids_limit_exceeded"}
+    blank = [index for index, value in enumerate(ids) if not value]
+    if blank:
+        return {**base, "ok": False, "error": "request_ids_blank_member",
+                "blank_indexes": blank}
+    per_packet_max_bytes = int(max_bytes) // len(ids)
+    # Independent read-only reads; map() keeps the caller's order.
+    workers = max(1, min(len(ids), os.cpu_count() or 1))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        packets = list(
+            executor.map(
+                lambda rid: _review_packet_member(rid, per_packet_max_bytes), ids
+            )
+        )
+    return {
+        **base,
+        "ok": True,
+        "per_packet_max_bytes": per_packet_max_bytes,
+        "member_error_count": sum(1 for packet in packets if packet.get("ok") is not True),
+        "packets": packets,
+    }
+
+
+@mcp.tool()
+def aiworkhub_review_packet(
+    request_id: str = "",
+    task_id: str = "",
+    max_bytes: int = 90_000,
+    request_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """READ-ONLY: ONE bounded review packet for a ``review_ready`` candidate.
+
+    Every fact a manager needs to decide a candidate is already persisted --
+    validation rows with their declared commands and output tails, the quality
+    gate's checks and blockers, the worker MCP gate and its receipt-conformance
+    verdict, required outputs, destructive-diff checks, the effective tier and
+    its per-lens status, the deduped reviewer findings, the reachability
+    observation -- spread across six nested objects on one card. This returns
+    them together, under a measured byte bound.
+
+    Measured over all 419 real cards carrying a quality gate: min 1,662 B, p50
+    6,387 B, p90 8,813 B, max 13,799 B, 0 needing truncation. It replaces per
+    candidate 10 task-scoped calls at p50 (p90 21) and, session-wide, 1,688
+    hand-written Bash re-derivations (pytest 611, attempt-artifact reads 242,
+    task_queue.sqlite scripts 250, log tails 113, git diff 155) totalling
+    1.45 MB.
+
+    Nothing here is a verdict: every status was decided by the gate that
+    recorded it, and accepting still runs the whole fold in ``accept_review``.
+    The one live computation is ``accept_preview`` -- itself read-only -- which
+    ``completion_inbox`` cannot call because it holds no launch authority, so
+    it is computed here and passed in.
+
+    The ``decision`` section prefills the argument dicts for accept_review,
+    one review_finding_dispose per undisposed finding, and reject_review; it
+    never picks a disposition or a verdict and is never dropped before an
+    evidence section.
+
+    Args:
+        request_id: Id of the review_ready worker request to build the packet for; leave empty when request_ids is given.
+        task_id: Id of the task card that request belongs to; omit to resolve it from the request's status (the reply's task_id_source says which). Not accepted with request_ids.
+        max_bytes: Byte bound for the packet, default 90000; lowest-priority sections are dropped until it fits and listed under truncation.dropped_sections. With request_ids it is split evenly across the packets.
+        request_ids: Up to 8 review_ready request ids to read in one call instead of request_id; returns {packets, per_packet_max_bytes}, each packet built exactly like a single call with the split budget, and a member that fails carries its own error without failing the batch.
+    """
+
+    if request_ids is not None:
+        if request_id or task_id:
+            return {
+                "schema_id": "aiworkhub.review_packet_batch.v1",
+                "ok": False,
+                "readonly": True,
+                "error": "request_ids_exclusive_with_request_id_and_task_id",
+            }
+        return _review_packet_batch(list(request_ids), max_bytes)
+    if not request_id:
+        return {
+            "schema_id": completion_inbox.REVIEW_PACKET_SCHEMA_ID,
+            "ok": False,
+            "readonly": True,
+            "error": "request_id_or_request_ids_required",
+        }
+    return _review_packet_one(request_id, task_id, max_bytes)
 
 
 _VALIDATION_REPLAY_AUTO_RECOVERY_REASONS = frozenset(
