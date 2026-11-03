@@ -42,7 +42,10 @@ from aiworkhub import process_launcher_accepted_row_restore as accepted_row_rest
 # 13696 -> 13748 (2026-11-03): NF-2026-01948 identity_reroute launch (+52)
 # landed past the cap and left main red; measured, the next extraction
 # ratchets it back down.
-PROCESS_LAUNCHER_MAX_LINES = 13748
+# 13748 -> 13754 (2026-11-03): NF-2026-01922 validation_failed auto-rework
+# hook (+6) landed past the cap through the installed accept lane that
+# skips this ratchet (NF-2026-02020); measured.
+PROCESS_LAUNCHER_MAX_LINES = 13754
 
 # (module, function, seam tuple attribute, ProcessManager method)
 EXTRACTIONS: tuple[tuple[ModuleType, str, str, str], ...] = (
