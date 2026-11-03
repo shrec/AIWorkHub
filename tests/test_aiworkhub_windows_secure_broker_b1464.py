@@ -743,6 +743,21 @@ def _authenticated_native_cli_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         repo_policy.kilo_auth, "auth_status", lambda *_a, **_k: dict(ready)
     )
+    # NF-2026-02042: the opencode_cli row discovers models by running the
+    # real ``opencode models`` binary and by reading the owner's global
+    # OpenCode config for custom providers (NF-2026-01534).  Both are host
+    # state: an owner config whose custom models the repository model policy
+    # disables made this row fail closed on one machine and pass on another.
+    # Pin an authenticated OpenCode that lists a built-in, default-enabled
+    # (``opencode-go/*``) model and has no owner-config custom providers.
+    monkeypatch.setattr(
+        repo_policy,
+        "_opencode_models_probe_once",
+        lambda _executable, _timeout: (["opencode-go/glm-5"], None),
+    )
+    monkeypatch.setattr(
+        repo_policy.opencode_auth, "owner_custom_provider_models", lambda: []
+    )
 
 
 def test_capable_windows_host_admits_the_native_cli_routes_the_flag_excluded(
