@@ -32,6 +32,11 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+# Hang-guard deadline only (not a timing assertion); bounds a genuine hang.
+# Every wait it replaces returns as soon as its event fires, so a passing run
+# is no slower, while parallel (-n 4) load can no longer outlast a short bound.
+_HANG_GUARD_SECONDS = 120
+
 from aiworkhub import core, repository_bootstrap, server, source_graph, source_graph_daemon, task_store, worker_ai_tools_mcp  # noqa: E402
 
 
@@ -180,7 +185,7 @@ def test_init_repo_triggers_initial_index_without_blocking(tmp_path, cleanup_dae
 
     # Wait on the daemon's build-completion event, not timing-sensitive
     # sleep/poll loops. InitRepo itself remains non-blocking.
-    assert daemon.wait_for_first_build(timeout=10), "initial background build never completed"
+    assert daemon.wait_for_first_build(timeout=_HANG_GUARD_SECONDS), "initial background build never completed"
     health = daemon.health()
 
     assert health["status"] == source_graph_daemon.STATUS_READY
@@ -212,7 +217,7 @@ def test_first_build_completion_hands_off_after_build_lock_release(
     daemon._build_completed = CompletionProbe()  # type: ignore[assignment]
     daemon.start()
 
-    assert daemon.wait_for_first_build(timeout=10)
+    assert daemon.wait_for_first_build(timeout=_HANG_GUARD_SECONDS)
     assert lock_state_at_completion == [False]
     assert daemon.refresh_now()["triggered"] is True
 
@@ -226,7 +231,7 @@ def test_stop_fences_initial_build_before_subprocess_launch(tmp_path, monkeypatc
 
     def delayed_journal_probe() -> bool:
         probe_entered.set()
-        assert release_probe.wait(timeout=5)
+        assert release_probe.wait(timeout=_HANG_GUARD_SECONDS)
         return False
 
     def unexpected_build(*, incremental):
@@ -237,12 +242,12 @@ def test_stop_fences_initial_build_before_subprocess_launch(tmp_path, monkeypatc
     monkeypatch.setattr(daemon, "_execute_build", unexpected_build)
 
     daemon.start()
-    assert probe_entered.wait(timeout=5)
+    assert probe_entered.wait(timeout=_HANG_GUARD_SECONDS)
     stopper = threading.Thread(target=daemon.stop)
     stopper.start()
-    assert daemon._stop_event.wait(timeout=5)
+    assert daemon._stop_event.wait(timeout=_HANG_GUARD_SECONDS)
     release_probe.set()
-    stopper.join(timeout=5)
+    stopper.join(timeout=_HANG_GUARD_SECONDS)
 
     assert not stopper.is_alive()
     assert not daemon.is_running()
@@ -273,7 +278,7 @@ def test_health_exposes_current_generation_quality_and_roundtrip_scorecards(
     )
     daemon = source_graph_daemon.ensure_started(root)
 
-    assert daemon.wait_for_first_build(timeout=10)
+    assert daemon.wait_for_first_build(timeout=_HANG_GUARD_SECONDS)
     health = source_graph_daemon.daemon_health(root)
 
     assert health["index_quality"]["current_generation"] is True
@@ -373,6 +378,14 @@ def test_core_source_graph_ensure_started_then_stop(tmp_path, monkeypatch, clean
     root = _init_repo(tmp_path)
     monkeypatch.setenv("AIWORKHUB_REPO_ROOT", str(root))
     monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    # The only short deadline on this path is production's stop-join bound
+    # (source_graph_daemon._STOP_DAEMON_WAIT_SECONDS, 30 s): under parallel
+    # load the first background build can outlast it, stop_daemon() then
+    # reports False and the test failed for load, not behaviour. Widen it to
+    # the hang guard; the stopped/unregistered assertions below are unchanged.
+    monkeypatch.setattr(
+        source_graph_daemon, "_STOP_DAEMON_WAIT_SECONDS", float(_HANG_GUARD_SECONDS)
+    )
     cleanup_daemons.append(root)
 
     started = core.source_graph_ensure_started()
@@ -411,7 +424,7 @@ def test_server_main_bootstraps_source_graph_before_stdio(monkeypatch):
     server.main()
 
     assert len(reconciler_threads) == 1, "main() must start exactly one reconciler daemon thread"
-    reconciler_threads[0].join(timeout=5)
+    reconciler_threads[0].join(timeout=_HANG_GUARD_SECONDS)
     assert not reconciler_threads[0].is_alive(), "reconciler thread never finished"
 
     assert calls[0] == "source_graph"
@@ -444,7 +457,7 @@ def test_server_main_keeps_mcp_available_when_source_graph_bootstrap_fails(monke
     server.main()
 
     assert len(reconciler_threads) == 1, "main() must start exactly one reconciler daemon thread"
-    reconciler_threads[0].join(timeout=5)
+    reconciler_threads[0].join(timeout=_HANG_GUARD_SECONDS)
     assert not reconciler_threads[0].is_alive(), "reconciler thread never finished"
 
     assert calls[0] == "source_graph"
@@ -468,7 +481,7 @@ def test_periodic_and_refresh_now_never_overlap(tmp_path, monkeypatch, cleanup_d
     def fake_build_index(repo_root, *, incremental=True, db_path=None):
         call_count["n"] += 1
         build_started.set()
-        release_build.wait(timeout=5)
+        release_build.wait(timeout=_HANG_GUARD_SECONDS)
         return source_graph.BuildReport(
             repo_root=str(repo_root), db_path="fake.sqlite", incremental=incremental,
             files_seen=0, files_changed=0, files_unchanged=0, files_removed=0,
@@ -483,7 +496,7 @@ def test_periodic_and_refresh_now_never_overlap(tmp_path, monkeypatch, cleanup_d
     )
     daemon.start()
     try:
-        assert build_started.wait(timeout=5), "background build never started"
+        assert build_started.wait(timeout=_HANG_GUARD_SECONDS), "background build never started"
 
         # The periodic loop's first build is still in flight (blocked on
         # release_build) -- an explicit refresh_now() must not join it.
@@ -509,14 +522,14 @@ def test_core_refresh_queues_without_blocking_mcp_caller(
     monkeypatch.setenv("AIWORKHUB_REPO_ROOT", str(root))
     monkeypatch.setenv("AIWORKHUB_REPO", str(root))
     daemon = source_graph_daemon.ensure_started(root)
-    assert daemon.wait_for_first_build(timeout=10)
+    assert daemon.wait_for_first_build(timeout=_HANG_GUARD_SECONDS)
 
     build_started = threading.Event()
     release_build = threading.Event()
 
     def blocking_build(repo_root, *, incremental=True, db_path=None):
         build_started.set()
-        release_build.wait(timeout=5)
+        release_build.wait(timeout=_HANG_GUARD_SECONDS)
         return source_graph.BuildReport(
             repo_root=str(repo_root), db_path="fake.sqlite", incremental=incremental,
             files_seen=0, files_changed=0, files_unchanged=0, files_removed=0,
@@ -529,7 +542,7 @@ def test_core_refresh_queues_without_blocking_mcp_caller(
     assert result["ok"] is True
     assert result["queued"] is True
     assert result["reason"] == "refresh_queued"
-    assert build_started.wait(timeout=5), "queued refresh did not reach daemon"
+    assert build_started.wait(timeout=_HANG_GUARD_SECONDS), "queued refresh did not reach daemon"
     release_build.set()
 
 
@@ -539,14 +552,14 @@ def test_refresh_job_has_durable_identity_and_terminal_success(
     root = _init_repo(tmp_path, "durable_refresh")
     cleanup_daemons.append(root)
     daemon = source_graph_daemon.ensure_started(root)
-    assert daemon.wait_for_first_build(timeout=10)
+    assert daemon.wait_for_first_build(timeout=_HANG_GUARD_SECONDS)
 
     build_started = threading.Event()
     release_build = threading.Event()
 
     def controlled_build(repo_root, *, incremental=True, db_path=None):
         build_started.set()
-        release_build.wait(timeout=5)
+        release_build.wait(timeout=_HANG_GUARD_SECONDS)
         return source_graph.BuildReport(
             repo_root=str(repo_root), db_path="fake.sqlite", incremental=incremental,
             files_seen=1, files_changed=1, files_unchanged=0, files_removed=0,
@@ -559,10 +572,10 @@ def test_refresh_job_has_durable_identity_and_terminal_success(
     assert queued["queued"] is True
     assert queued["refresh_job"]["state"] == "queued"
     assert len(queued["job_id"]) == 32
-    assert build_started.wait(timeout=5)
+    assert build_started.wait(timeout=_HANG_GUARD_SECONDS)
     release_build.set()
 
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + _HANG_GUARD_SECONDS
     while time.monotonic() < deadline:
         job = daemon.health()["refresh_job"]
         if job and job["state"] == "succeeded":
@@ -587,7 +600,7 @@ def test_ensure_started_and_health_share_canonical_generation(
     monkeypatch.setenv("AIWORKHUB_REPO", str(root))
 
     daemon = source_graph_daemon.ensure_started(root)
-    assert daemon.wait_for_first_build(timeout=10)
+    assert daemon.wait_for_first_build(timeout=_HANG_GUARD_SECONDS)
     started = core.source_graph_ensure_started()
     health = core.source_graph_health()
 
@@ -798,17 +811,23 @@ def test_non_stale_sqlite_error_fails_closed_without_retry(tmp_path, monkeypatch
     assert "live_holder" not in health["generation_read_error"]
 
 
-def test_dead_daemon_health_ensure_started_and_stop_agree(tmp_path, cleanup_daemons):
+def test_dead_daemon_health_ensure_started_and_stop_agree(tmp_path, monkeypatch, cleanup_daemons):
     root = _init_repo(tmp_path, "dead_daemon_truth")
     (root / "mod.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    # Same production stop-join bound as test_core_source_graph_ensure_started_then_stop
+    # (_STOP_DAEMON_WAIT_SECONDS, 30 s): widen it to the hang guard so load
+    # cannot turn stop_daemon() into False; the stop assertions are unchanged.
+    monkeypatch.setattr(
+        source_graph_daemon, "_STOP_DAEMON_WAIT_SECONDS", float(_HANG_GUARD_SECONDS)
+    )
     cleanup_daemons.append(root)
     daemon = source_graph_daemon.ensure_started(root)
-    assert daemon.wait_for_first_build(timeout=10)
+    assert daemon.wait_for_first_build(timeout=_HANG_GUARD_SECONDS)
     thread = daemon._thread
     assert thread is not None
     daemon._stop_event.set()
     daemon._refresh_event.set()
-    thread.join(timeout=5)
+    thread.join(timeout=_HANG_GUARD_SECONDS)
     assert thread.is_alive() is False
     assert source_graph_daemon.get_daemon(root) is daemon
 
@@ -966,7 +985,7 @@ def test_refresh_now_coalescing_arms_event_and_runs_one_follow_up_build(
         call_count["n"] += 1
         if call_count["n"] == 1:
             build_started.set()
-            release_build.wait(timeout=5)
+            release_build.wait(timeout=_HANG_GUARD_SECONDS)
         else:
             follow_up_started.set()
         return source_graph.BuildReport(
@@ -991,16 +1010,16 @@ def test_refresh_now_coalescing_arms_event_and_runs_one_follow_up_build(
     )
     daemon.start()
     try:
-        assert build_started.wait(timeout=5), "background build never started"
+        assert build_started.wait(timeout=_HANG_GUARD_SECONDS), "background build never started"
         result = daemon.refresh_now()
         assert result["triggered"] is False
         assert result["reason"] == "build_in_progress"
         assert daemon._refresh_event.is_set()
 
         release_build.set()
-        assert follow_up_started.wait(timeout=5), "follow-up build never started"
+        assert follow_up_started.wait(timeout=_HANG_GUARD_SECONDS), "follow-up build never started"
 
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + _HANG_GUARD_SECONDS
         while True:
             health = daemon.health()
             if health["status"] == source_graph_daemon.STATUS_READY and call_count["n"] == 2:
@@ -1107,7 +1126,7 @@ def test_unchanged_incremental_refresh_reaches_succeeded_terminal_state_quickly(
     daemon = source_graph_daemon.SourceGraphDaemon(root)
     try:
         daemon.start()
-        assert daemon.wait_for_first_build(timeout=20), "first build never completed"
+        assert daemon.wait_for_first_build(timeout=_HANG_GUARD_SECONDS), "first build never completed"
         files_seen_after_full_build = daemon.health()["files_seen"]
         assert files_seen_after_full_build >= 40
 
@@ -1188,7 +1207,7 @@ def test_health_exposes_hash_and_noop_reuse_telemetry_on_unchanged_refresh(
     daemon = source_graph_daemon.SourceGraphDaemon(root)
     try:
         daemon.start()
-        assert daemon.wait_for_first_build(timeout=20)
+        assert daemon.wait_for_first_build(timeout=_HANG_GUARD_SECONDS)
         assert probe_calls == [1]
         first_health = daemon.health()
         assert first_health["last_report"]["quality_reused"] is False
@@ -1198,7 +1217,7 @@ def test_health_exposes_hash_and_noop_reuse_telemetry_on_unchanged_refresh(
         assert queued["triggered"] is True
         job_id = queued["refresh_job"]["job_id"]
 
-        deadline = time.monotonic() + 15.0
+        deadline = time.monotonic() + _HANG_GUARD_SECONDS
         health = daemon.health()
         while True:
             health = daemon.health()
@@ -1344,7 +1363,7 @@ def test_stop_reaps_entire_build_tree_including_pipe_inheriting_grandchild(
     daemon.start()
 
     parent_pid = grandchild_pid = None
-    deadline = time.monotonic() + 10.0
+    deadline = time.monotonic() + _HANG_GUARD_SECONDS
     while time.monotonic() < deadline:
         if pidfile.is_file():
             parts = pidfile.read_text(encoding="ascii").split()
@@ -1430,7 +1449,7 @@ def test_stop_reaps_sigterm_ignoring_pipe_inheriting_grandchild(
     daemon.start()
 
     parent_pid = grandchild_pid = None
-    deadline = time.monotonic() + 10.0
+    deadline = time.monotonic() + _HANG_GUARD_SECONDS
     while time.monotonic() < deadline:
         if pidfile.is_file():
             parts = pidfile.read_text(encoding="ascii").split()
@@ -1509,7 +1528,7 @@ def test_stop_is_bounded_when_group_leader_exits_but_grandchild_survives(
     daemon.start()
 
     parent_pid = grandchild_pid = None
-    deadline = time.monotonic() + 10.0
+    deadline = time.monotonic() + _HANG_GUARD_SECONDS
     while time.monotonic() < deadline:
         if pidfile.is_file():
             parts = pidfile.read_text(encoding="ascii").split()
@@ -1521,7 +1540,7 @@ def test_stop_is_bounded_when_group_leader_exits_but_grandchild_survives(
 
     # Wait until the owned group leader has exited (zombie or gone) while the
     # pipe-inheriting grandchild is still alive -- the exact residual case.
-    deadline = time.monotonic() + 10.0
+    deadline = time.monotonic() + _HANG_GUARD_SECONDS
     while time.monotonic() < deadline:
         if _terminated(parent_pid) and not _terminated(grandchild_pid):
             break
@@ -1573,7 +1592,7 @@ def test_exited_group_leader_pipe_inheriting_grandchild(
     daemon._build_pgid = proc.pid
     try:
         parent_pid = grandchild_pid = None
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + _HANG_GUARD_SECONDS
         while time.monotonic() < deadline:
             if pidfile.is_file():
                 parts = pidfile.read_text(encoding="ascii").split()
@@ -1586,7 +1605,7 @@ def test_exited_group_leader_pipe_inheriting_grandchild(
 
         # Reach the exact residual state: owned leader exited (zombie/gone)
         # while the pipe-inheriting grandchild still names the owned group.
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + _HANG_GUARD_SECONDS
         while time.monotonic() < deadline:
             if _terminated(parent_pid) and not _terminated(grandchild_pid):
                 break
@@ -1806,7 +1825,7 @@ def test_cross_instance_stop_uses_durable_exact_builder_identity(tmp_path, monke
         target=lambda: result.append(daemon._run_build_subprocess(incremental=False))
     )
     runner.start()
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + _HANG_GUARD_SECONDS
     while time.monotonic() < deadline and not pidfile.exists():
         time.sleep(0.02)
     assert pidfile.exists()
@@ -2021,7 +2040,7 @@ def test_standby_builder_cannot_replace_or_clear_live_writer_identity(
         )
     )
     writer_thread.start()
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + _HANG_GUARD_SECONDS
     retained = None
     while time.monotonic() < deadline:
         retained = source_graph_daemon._read_build_identity(root)
@@ -2326,7 +2345,7 @@ def test_dead_stale_identity_is_atomically_replaced_before_child_continues(
         target=lambda: result.append(daemon._run_build_subprocess(incremental=False))
     )
     runner.start()
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + _HANG_GUARD_SECONDS
     retained = stale
     while time.monotonic() < deadline:
         retained = source_graph_daemon._read_build_identity(root) or stale
@@ -2851,7 +2870,7 @@ def test_successful_build_with_held_output_schedules_the_next_tick(tmp_path, mon
     daemon._refresh_event = waits
     daemon.start()
     try:
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + _HANG_GUARD_SECONDS
         while len(waits.timeouts) < 3:
             assert time.monotonic() < deadline, (
                 f"writer stopped ticking: spawns={len(spawned)} waits={waits.timeouts}"
@@ -2886,7 +2905,7 @@ def test_queued_refresh_is_consumed_by_the_active_writer_after_held_output_build
     )
     daemon.start()
     try:
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + _HANG_GUARD_SECONDS
         while daemon._build_process is None:
             assert time.monotonic() < deadline, "initial build child never spawned"
             time.sleep(0.01)
@@ -2903,7 +2922,7 @@ def test_queued_refresh_is_consumed_by_the_active_writer_after_held_output_build
         assert consumer["build_pid"] == spawned[0].pid
 
         first_answer.set()  # the child answers and exits; its output stays held
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + _HANG_GUARD_SECONDS
         while True:
             job = daemon.health()["refresh_job"] or {}
             if job.get("job_id") == queued["job_id"] and job.get("state") == "succeeded":
@@ -2930,10 +2949,10 @@ def test_answered_child_without_result_record_fails_closed_without_waiting_on_ou
         daemon=True,
     )
     runner.start()
-    runner.join(timeout=5)
+    runner.join(timeout=_HANG_GUARD_SECONDS)
     if runner.is_alive():
         daemon._stop_event.set()  # free the wait so the failure is reported, not hung
-        runner.join(timeout=5)
+        runner.join(timeout=_HANG_GUARD_SECONDS)
         pytest.fail("the build wait never returned after its child exited")
 
     # An exit without the child's own outcome is never mistaken for success.
@@ -2976,13 +2995,13 @@ def test_refresh_reply_projects_the_committed_generation_like_health(
 
     def lease_held_elsewhere(repo_root, *, incremental=True, db_path=None):
         build_started.set()
-        release_build.wait(timeout=10)
+        release_build.wait(timeout=_HANG_GUARD_SECONDS)
         raise source_graph.SourceGraphBuildInProgressError("locked_by_other_process")
 
     monkeypatch.setattr(source_graph, "build_index", lease_held_elsewhere)
     daemon = source_graph_daemon.ensure_started(root)
     try:
-        assert build_started.wait(timeout=5)
+        assert build_started.wait(timeout=_HANG_GUARD_SECONDS)
         reply = core.source_graph_refresh_now()
         health = core.source_graph_health()
         local = daemon.health()
@@ -3009,7 +3028,7 @@ def test_queued_refresh_without_a_live_writer_names_reason_and_owner_pid(
     def held_build(repo_root, *, incremental=True, db_path=None):
         builds.append(incremental)
         build_started.set()
-        release_build.wait(timeout=10)
+        release_build.wait(timeout=_HANG_GUARD_SECONDS)
         return source_graph.BuildReport(
             repo_root=str(repo_root), db_path="fake.sqlite", incremental=incremental,
             files_seen=1, files_changed=1, files_unchanged=0, files_removed=0,
@@ -3028,7 +3047,7 @@ def test_queued_refresh_without_a_live_writer_names_reason_and_owner_pid(
     daemon.start()
     thread = daemon._thread
     try:
-        assert build_started.wait(timeout=5)
+        assert build_started.wait(timeout=_HANG_GUARD_SECONDS)
         # A stop() that cannot join the busy loop leaves its thread alive, but
         # that thread exits after this build instead of consuming jobs.
         daemon.stop(timeout=0.05)
@@ -3048,7 +3067,7 @@ def test_queued_refresh_without_a_live_writer_names_reason_and_owner_pid(
     assert consumer["owner_pid"] == os.getpid()
 
     assert thread is not None
-    thread.join(timeout=5)
+    thread.join(timeout=_HANG_GUARD_SECONDS)
     assert not thread.is_alive()
     health = daemon.health()
     assert health["refresh_job"]["job_id"] == reply["job_id"]
@@ -3104,7 +3123,7 @@ def test_failed_loop_tick_is_contained_and_the_writer_keeps_ticking(tmp_path, mo
     daemon._refresh_event = waits
     daemon.start()
     try:
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + _HANG_GUARD_SECONDS
         while len(waits.timeouts) < 4:
             assert time.monotonic() < deadline, (
                 f"writer thread ended at a failed tick: waits={waits.timeouts}"
@@ -3116,7 +3135,7 @@ def test_failed_loop_tick_is_contained_and_the_writer_keeps_ticking(tmp_path, mo
         assert health["last_error"] == "daemon_tick:RuntimeError:tick fault"
         # A job queued now is finished by the next tick, never left queued.
         queued = daemon.request_refresh()
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + _HANG_GUARD_SECONDS
         while True:
             job = daemon.health()["refresh_job"] or {}
             if job.get("job_id") == queued["job_id"] and job.get("state") == "failed":
