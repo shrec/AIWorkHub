@@ -84,7 +84,7 @@ LANGUAGE_EXTENSIONS: dict[str, tuple[str, ...]] = {
     "javascript": (".js", ".jsx", ".mjs", ".cjs"),
     "typescript": (".ts", ".tsx", ".mts", ".cts"),
     "cpp": (
-        ".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".ipp", ".inl",
+        ".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".ipp", ".inl", ".inc",
         ".cu", ".cuh", ".cl", ".metal",
     ),
     "csharp": (".cs",),
