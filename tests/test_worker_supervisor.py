@@ -21,6 +21,11 @@ from aiworkhub import platform_io  # noqa: E402
 from aiworkhub import appcontainer_loopback_relay  # noqa: E402
 from aiworkhub.worker_workspace import write_json_0600  # noqa: E402
 
+# Upper bound for event-driven waits on spawned processes. Every wait returns as
+# soon as its condition holds, so this only bounds a genuine hang; it must stay
+# generous enough that scheduler load under ``-n 4`` can never trip it.
+_HANG_GUARD_SECONDS = 60
+
 
 def test_default_live_stream_log_bound_is_four_mib() -> None:
     assert worker_supervisor.DEFAULT_MAX_OUTPUT_BYTES == 4 * 1024 * 1024
@@ -94,7 +99,7 @@ def _run_supervisor(
 
 
 def _read_status(path: Path) -> dict:
-    deadline = time.monotonic() + 1.0
+    deadline = time.monotonic() + _HANG_GUARD_SECONDS
     while True:
         try:
             return json.loads(path.read_text(encoding="utf-8"))
@@ -657,7 +662,7 @@ def test_supervisor_does_not_terminate_on_output_bytes(
     spec.update(
         max_total_output_bytes=2048,
         heartbeat_interval_seconds=0.05,
-        timeout_seconds=1,
+        timeout_seconds=_HANG_GUARD_SECONDS,
     )
     write_json_0600(spec_path, spec)
 
@@ -667,7 +672,7 @@ def test_supervisor_does_not_terminate_on_output_bytes(
     status = _read_status(Path(spec["status_path"]))
     assert status["state"] == "exited"
     assert status["state"] != "output_budget_exceeded"
-    _assert_hard_deadline(status, 1)
+    _assert_hard_deadline(status, _HANG_GUARD_SECONDS)
     assert status["output_budget"]["cap_bytes"] == 2048
     assert status["output_budget"]["observed_bytes"] >= 4096
     assert status["output_budget"]["byte_labels_are_token_truth"] is False
@@ -675,7 +680,24 @@ def test_supervisor_does_not_terminate_on_output_bytes(
 
 
 def test_terminal_only_usage_is_posthoc_and_never_claimed_enforced(tmp_path: Path) -> None:
-    script = "import json; print(json.dumps({'usage': {'input_tokens': 9, 'output_tokens': 4}}))"
+    # The usage line must be strictly terminal: the child blocks on a sentinel
+    # the test creates only after the supervisor's first heartbeat (which runs
+    # at loop start) is published, then prints and hard-exits. The next
+    # heartbeat is 30s away, beyond the 10s hard deadline, so no live
+    # heartbeat can ever observe the usage line under any scheduling.
+    sentinel = tmp_path / "first_heartbeat_passed.signal"
+    script = (
+        "import json, os, sys, time\n"
+        f"sentinel = {str(sentinel)!r}\n"
+        "deadline = time.monotonic() + 8.0\n"
+        "while not os.path.exists(sentinel):\n"
+        "    if time.monotonic() >= deadline:\n"
+        "        os._exit(3)\n"
+        "    time.sleep(0.01)\n"
+        "sys.stdout.write(json.dumps({'usage': {'input_tokens': 9, 'output_tokens': 4}}) + '\\n')\n"
+        "sys.stdout.flush()\n"
+        "os._exit(0)\n"
+    )
     spec_path, spec = _spec(tmp_path, [sys.executable, "-c", script])
     spec.update(
         adapter_id="vscode_lm",
@@ -683,11 +705,42 @@ def test_terminal_only_usage_is_posthoc_and_never_claimed_enforced(tmp_path: Pat
         heartbeat_interval_seconds=30,
     )
     write_json_0600(spec_path, spec)
+    status_path = Path(spec["status_path"])
+    supervisor_stdout = tmp_path / "supervisor.stdout"
+    supervisor_stderr = tmp_path / "supervisor.stderr"
 
-    result = _run_supervisor(spec_path)
+    with supervisor_stdout.open("wb") as out, supervisor_stderr.open("wb") as err:
+        supervisor = subprocess.Popen(
+            [sys.executable, str(Path(worker_supervisor.__file__)), "--spec", str(spec_path)],
+            cwd="/",
+            stdin=subprocess.DEVNULL,
+            stdout=out,
+            stderr=err,
+            shell=False,
+        )
+        try:
+            # Poll (bounded) for the published first heartbeat; the status
+            # write happens after that heartbeat's usage read.
+            wait_deadline = time.monotonic() + 8.0
+            while True:
+                try:
+                    current = json.loads(status_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    current = {}
+                if int(current.get("heartbeat_seq") or 0) >= 1:
+                    break
+                assert supervisor.poll() is None, "supervisor exited before first heartbeat"
+                assert time.monotonic() < wait_deadline, "first heartbeat never published"
+                time.sleep(0.01)
+            sentinel.write_text("go", encoding="utf-8")
+            returncode = supervisor.wait(timeout=30)
+        finally:
+            if supervisor.poll() is None:
+                supervisor.kill()
+                supervisor.wait()
 
-    assert result.returncode == 0, result.stderr.decode()
-    status = _read_status(Path(spec["status_path"]))
+    assert returncode == 0, supervisor_stderr.read_text(encoding="utf-8", errors="replace")
+    status = _read_status(status_path)
     assert status["state"] == "exited"
     _assert_hard_deadline(status, 10)
     assert status["token_budget"]["accepted_total_tokens"] == 13
@@ -714,7 +767,7 @@ def test_cancel_marker_and_signal_survive_manager_restart_boundary(tmp_path: Pat
         # test_posix_worker_spawn_kwargs_are_platform_specific.
     )
     status_path = Path(spec["status_path"])
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + _HANG_GUARD_SECONDS
     status: dict = {}
     while time.monotonic() < deadline:
         if status_path.is_file():
@@ -730,7 +783,7 @@ def test_cancel_marker_and_signal_survive_manager_restart_boundary(tmp_path: Pat
     write_json_0600(cancel_path, {"reason": "test-restart-cancel"})
     if os.name != "nt":
         os.kill(process.pid, signal.SIGTERM)
-    assert process.wait(timeout=5) == 125
+    assert process.wait(timeout=_HANG_GUARD_SECONDS) == 125
     final = _read_status(status_path)
     assert final["state"] == "cancelled"
     _assert_hard_deadline(final, 10)
@@ -743,9 +796,11 @@ def test_cancel_marker_and_signal_survive_manager_restart_boundary(tmp_path: Pat
 
 
 def test_abrupt_supervisor_loss_does_not_orphan_worker(tmp_path: Path) -> None:
+    # The worker must outlive every hang guard, so only a kill by the
+    # supervisor-loss mechanism (never its own exit) can satisfy the waits.
     spec_path, spec = _spec(
         tmp_path,
-        [sys.executable, "-c", "import time; time.sleep(30)"],
+        [sys.executable, "-c", f"import time; time.sleep({_HANG_GUARD_SECONDS * 5})"],
     )
     process = subprocess.Popen(
         [sys.executable, str(Path(worker_supervisor.__file__)), "--spec", str(spec_path)],
@@ -760,7 +815,7 @@ def test_abrupt_supervisor_loss_does_not_orphan_worker(tmp_path: Path) -> None:
         # test_posix_worker_spawn_kwargs_are_platform_specific.
     )
     status_path = Path(spec["status_path"])
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + _HANG_GUARD_SECONDS
     status: dict = {}
     while time.monotonic() < deadline:
         if status_path.is_file():
@@ -773,12 +828,12 @@ def test_abrupt_supervisor_loss_does_not_orphan_worker(tmp_path: Path) -> None:
 
     if os.name == "nt":
         process.kill()
-        assert process.wait(timeout=5) != 0
+        assert process.wait(timeout=_HANG_GUARD_SECONDS) != 0
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
         kernel32.OpenProcess.restype = ctypes.c_void_p
         kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + _HANG_GUARD_SECONDS
         while time.monotonic() < deadline:
             handle = kernel32.OpenProcess(0x1000, False, child_pid)
             if not handle:
@@ -790,8 +845,8 @@ def test_abrupt_supervisor_loss_does_not_orphan_worker(tmp_path: Path) -> None:
         return
 
     os.kill(process.pid, signal.SIGKILL)
-    assert process.wait(timeout=5) == -signal.SIGKILL
-    deadline = time.monotonic() + 5
+    assert process.wait(timeout=_HANG_GUARD_SECONDS) == -signal.SIGKILL
+    deadline = time.monotonic() + _HANG_GUARD_SECONDS
     while time.monotonic() < deadline:
         proc_stat = Path(f"/proc/{child_pid}/stat")
         if not proc_stat.exists():
