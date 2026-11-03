@@ -2784,11 +2784,16 @@ def accept_review(
         )
     except (LaunchRejected, AttributeError, TypeError):
         readonly_lock_path = False
-    acceptance_lock = (
-        self._request_lock(request_id)
-        if readonly_lock_path
-        else self._promotion_lock()
-    )
+    if readonly_lock_path:
+        acceptance_lock = self._request_lock(request_id)
+    else:
+        try:
+            acceptance_lock = self._promotion_lock(task_id=task_id, request_id=request_id)
+        except TypeError:
+            # Seam stubs written as ``def _promotion_lock(self)`` predate
+            # NF-2026-02006. Building a @contextmanager generator never runs its
+            # body, so the only TypeError here is that signature mismatch.
+            acceptance_lock = self._promotion_lock()
     # NF-2026-01626: claimed before either lock, so a duplicate of an accept
     # that is still validating answers ``accept_in_progress`` at once instead
     # of queueing on those locks for the length of that validation. A refused
@@ -2797,10 +2802,22 @@ def accept_review(
     in_flight = _accept_in_flight_marker(self, task_id, request_id)
     if in_flight.refusal is not None:
         return in_flight.refusal
+    # NF-2026-02006: a promotion-lock wait that timed out names its holder as
+    # ``{ok: false, error: promotion_busy, ...}`` instead of a raw errno string.
+    held = contextlib.ExitStack()
+    held.enter_context(in_flight)
+    try:
+        held.enter_context(acceptance_lock)
+    except _pl.PromotionBusy as busy:
+        held.close()
+        return {"ok": False, **busy.diagnostic, "request_id": request_id, "task_id": task_id}
+    except BaseException:
+        held.close()
+        raise
     # NF-2026-01515: the writable path must also hold the per-request lock so
     # retention GC (_gc_finalized_workspace) cannot quarantine this workspace
     # mid-correction; the read-only path already holds that lock alone.
-    with in_flight, acceptance_lock, (
+    with held, (
         contextlib.nullcontext()
         if readonly_lock_path
         else self._request_lock(request_id)

@@ -69,6 +69,7 @@ from .platform_io import (
     terminate_process_tree,
     unlock_fd,
 )
+from .promotion_lock_holder import PROMOTION_BUSY, promotion_busy_payload, write_promotion_holder
 from . import quality_evidence
 from . import quality_review_ingest
 from . import quality_review_scope
@@ -1446,6 +1447,11 @@ class LaunchRejected(RuntimeError):
     def __init__(self, reason: str, *, diagnostic: Mapping[str, Any] | None = None):
         super().__init__(reason)
         self.diagnostic = dict(diagnostic or {})
+
+
+class PromotionBusy(LaunchRejected):
+    """NF-2026-02006: the promotion-lock wait timed out; ``diagnostic`` is the
+    :func:`promotion_busy_payload` naming the holder, staleness and retry hint."""
 
 
 class _QualityReviewFinalized(RuntimeError):
@@ -4439,7 +4445,9 @@ class ProcessManager:
                 unlock_fd(fh.fileno())
 
     @contextmanager
-    def _promotion_lock(self):
+    def _promotion_lock(
+        self, *, task_id: str = "", request_id: str = "", operation: str = "accept_review"
+    ):
         """Serialize canonical review promotion without blocking launches.
 
         Review acceptance may build a combined tree, rerun validations and
@@ -4447,6 +4455,9 @@ class ProcessManager:
         but they must not occupy the short-lived launch registry lock.  A
         dedicated lock preserves atomic promotion while allowing unrelated
         workers and finalizers to continue.
+
+        NF-2026-02006: the holder is recorded beside the lock while held, and a
+        bounded wait that times out raises :class:`PromotionBusy` naming it.
         """
 
         lock_path = self.process_dir / ".promotion.lock"
@@ -4457,10 +4468,20 @@ class ProcessManager:
         fd = os.open(lock_path, flags, 0o600)
         chmod_fd(fd, 0o600)
         with os.fdopen(fd, "a+", encoding="utf-8") as fh:
-            lock_fd(fh.fileno(), blocking=True)
+            try:
+                lock_fd(fh.fileno(), blocking=True)
+            except AdvisoryLockTimeout as exc:
+                raise PromotionBusy(
+                    PROMOTION_BUSY, diagnostic=promotion_busy_payload(lock_path)
+                ) from exc
+            write_promotion_holder(
+                lock_path, task_id=task_id, request_id=request_id,
+                operation=operation, acquired_at=_utcnow(),
+            )
             try:
                 yield
             finally:
+                clear_lock_holder(lock_path)
                 unlock_fd(fh.fileno())
 
     def _append_event(self, event: dict[str, Any]) -> dict[str, Any]:
