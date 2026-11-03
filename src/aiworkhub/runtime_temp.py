@@ -523,6 +523,51 @@ def write_owner_manifest(root: Path, request_id: str, repo: Path) -> dict[str, A
     return manifest
 
 
+SEAT_MANIFEST_KIND = "manager_seat"
+SCRATCH_DIR_NAME = ".scratch"
+_SEAT_SESSION_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+
+
+def _is_link_or_junction(path: Path) -> bool:
+    return path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)())
+
+
+def write_seat_stamp(repo: Path, session_id: str) -> dict[str, Any] | None:
+    """Stamp ``<repo>/.scratch/<session_id>`` with this seat process's owner identity.
+
+    NF-2026-02029: the janitor reclaims a dead seat's scratch dir after a
+    short grace instead of 48h.  Returns None and writes nothing for a session
+    id that is not one safe path component, or when ``.scratch`` or the
+    session dir is a symlink/junction or not a directory.
+    """
+    sid = str(session_id or "")
+    if not _SEAT_SESSION_ID_RE.fullmatch(sid) or sid in {".", ".."}:
+        return None
+    repo_path = Path(repo).resolve()
+    scratch = repo_path / SCRATCH_DIR_NAME
+    seat_dir = scratch / sid
+    for path in (scratch, seat_dir):
+        if _is_link_or_junction(path):
+            return None
+        if not path.exists():
+            path.mkdir(exist_ok=True)
+            if _is_link_or_junction(path):
+                return None
+        if not path.is_dir():
+            return None
+    manifest = {
+        "schema_id": OWNER_SCHEMA_ID,
+        "kind": SEAT_MANIFEST_KIND,
+        "session_id": sid,
+        "repo_id": _repo_fingerprint(repo_path),
+        "pid": os.getpid(),
+        "starttime": _self_starttime(),
+        "created_at": now_utc().isoformat(),
+    }
+    _atomic_json(seat_dir / OWNER_MANIFEST_NAME, manifest)
+    return manifest
+
+
 def _manifest_identity(info: os.stat_result) -> tuple[int, ...]:
     return (
         int(info.st_dev),

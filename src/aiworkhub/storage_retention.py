@@ -2893,6 +2893,8 @@ _SCRATCH_RUNTIME_NAME_PATTERNS = (
     "hostval",
 )
 _SCRATCH_MAX_AGE_SECONDS = 48 * 60 * 60
+# NF-2026-02029: a provably dead manager seat's .scratch/<session_id> grace.
+_SCRATCH_DEAD_SEAT_GRACE_SECONDS = 2 * 3600
 # Re-creatable build output inside an opencode-compat-* workspace
 # (``bun install --frozen-lockfile``; NF-2026-01614) and its build artifacts.
 _COMPAT_RUNTIME_NAME_PATTERN = "opencode-compat-*"
@@ -3008,7 +3010,9 @@ def _janitor_scratch(root: Path, now: float) -> dict[str, Any]:
     ``runtime/`` dirs is removed whole, matched by name.  A candidate is
     skipped when younger than 48h, a symlink/junction, outside its expected
     parent (``.aiworkhub`` or ``.scratch``) once resolved, or still held by a live
-    runtime_temp owner.  A directory goes through the single shared
+    runtime_temp owner; a ``.scratch/<session_id>`` dir stamped by a manager
+    seat whose owner is provably dead is reclaimed once 2h have passed since
+    its last write (NF-2026-02029).  A directory goes through the single shared
     workspace-removal helper and any other entry is unlinked; both repair a
     read-only leftover instead of leaving it behind.  A candidate that fails
     the pre-deletion re-check is kept and not counted as removed.
@@ -3073,12 +3077,23 @@ def _janitor_scratch(root: Path, now: float) -> dict[str, Any]:
         except OSError:
             continue
         try:
-            if now - _janitor_mtime(candidate) <= _SCRATCH_MAX_AGE_SECONDS:
-                continue
+            age = now - _janitor_mtime(candidate)
         except OSError:
             # Gone since iterdir (a concurrent sweep or test run removed it).
             continue
         manifest = runtime_temp.read_owner_manifest(candidate)
+        if (
+            expected_parent == expected_scratch_dir
+            and manifest is not None
+            and manifest.get("kind") == runtime_temp.SEAT_MANIFEST_KIND
+            and runtime_temp.owner_alive(manifest) is False
+        ):
+            # NF-2026-02029: an ended manager seat's scratch is reclaimed early.
+            if age > _SCRATCH_DEAD_SEAT_GRACE_SECONDS:
+                selected.append((candidate, expected_parent))
+            continue
+        if age <= _SCRATCH_MAX_AGE_SECONDS:
+            continue
         if manifest is not None and runtime_temp.request_alive(root, manifest):
             continue
         selected.append((candidate, expected_parent))

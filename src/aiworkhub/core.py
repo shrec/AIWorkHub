@@ -3324,6 +3324,22 @@ MANAGER_TOOLSEARCH_SELECT_NAMES: tuple[str, ...] = (
     "aiworkhub_manager_workforce_rank",
 )
 
+# NF-2026-02029: session ids whose .scratch/<session_id> this process already stamped.
+_SEAT_SCRATCH_STAMPED: set[str] = set()
+
+
+def _stamp_seat_scratch_once(root: Path, session_id: str) -> None:
+    """Stamp the seat's scratch dir once per process; a failure never fails bootstrap."""
+    if session_id in _SEAT_SCRATCH_STAMPED:
+        return
+    _SEAT_SCRATCH_STAMPED.add(session_id)
+    try:
+        from . import runtime_temp  # local import: cycle-safe
+
+        runtime_temp.write_seat_stamp(root, session_id)
+    except Exception:  # noqa: BLE001 -- the stamp is advisory, bootstrap must stay available
+        pass
+
 
 def manager_bootstrap(
     *,
@@ -3383,6 +3399,8 @@ def manager_bootstrap(
     session_id = str(
         (identity or {}).get("session_id") or (identity or {}).get("thread_id") or ""
     ).strip()
+    if identity and session_id:
+        _stamp_seat_scratch_once(root, session_id)
     if bootstrap_call:
         deliver, delivery_reason = _contract_delivery_decision(
             session_id, known_contract_sha256, include_contract
