@@ -163,8 +163,19 @@ def _correction_identity(
         "corrected_path_hashes": corrected,
         "reason": str(manager_correction.get("reason") or ""),
     }
-    if manager_correction.get("correction_origin") == "validation_failed":
-        identity["correction_origin"] = "validation_failed"
+    origin = manager_correction.get("correction_origin")
+    if origin in {"validation_failed", "manager_gate_evidence"}:
+        identity["correction_origin"] = origin
+    # NF-2026-01935: the manager-measured evidence files the correction cites.
+    manager_evidence = manager_correction.get("manager_evidence")
+    if manager_evidence:
+        identity["manager_evidence"] = sorted(
+            (
+                {"path": str(entry["path"]), "sha256": str(entry["sha256"])}
+                for entry in manager_evidence
+            ),
+            key=lambda entry: (entry["path"], entry["sha256"]),
+        )
     return identity
 
 

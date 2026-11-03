@@ -895,6 +895,78 @@ MANAGER_CORRECTION_FIELDS = frozenset({"patch", "finding_ids", "reason"})
 VALIDATION_ROW_ID_PREFIX = "validation:"
 VALIDATION_ROW_NOT_FAILED_ERROR = "manager_correction_validation_row_not_failed:"
 
+# NF-2026-01935: a defect only the manager's own gate or test run measured is
+# cited as ``manager:<repo-relative path>@<sha256>``, naming an evidence file
+# in the VERIFIED canonical repo under one of these roots. It lifts no reviewer
+# finding; it only lets the correction ride instead of a rework round.
+MANAGER_EVIDENCE_ID_PREFIX = "manager:"
+MANAGER_EVIDENCE_ROOTS = ((".scratch",), (".aiworkhub", "runtime"))
+MAX_MANAGER_EVIDENCE_BYTES = 1024 * 1024
+MANAGER_GATE_EVIDENCE_ORIGIN = "manager_gate_evidence"
+
+
+def manager_evidence_entry(repo: Path, finding_id: str) -> tuple[dict[str, str], str]:
+    """Verify one ``manager:<path>@<sha256>`` id against the canonical ``repo``.
+
+    Returns ``({"path", "sha256"}, "")`` or ``({}, "<manager_evidence_*>")``.
+    Read-only: the path is normalized before anything is opened, every
+    component under ``repo`` is checked for a link, and the bytes hashed are the
+    bytes size-checked, so a swapped or oversized file refuses by name.
+    """
+    body = finding_id[len(MANAGER_EVIDENCE_ID_PREFIX) :]
+    relative, sep, digest = body.rpartition("@")
+    if (
+        not sep
+        or not relative
+        or len(digest) != 64
+        or any(char not in "0123456789abcdef" for char in digest)
+        or "\\" in relative
+        or "\x00" in relative
+    ):
+        return {}, "manager_evidence_malformed"
+    parts = tuple(relative.split("/"))
+    evidence_root = next(
+        (
+            root
+            for root in MANAGER_EVIDENCE_ROOTS
+            if len(parts) > len(root) and parts[: len(root)] == root
+        ),
+        None,
+    )
+    if (
+        relative.startswith("/")
+        or any(":" in part for part in parts)
+        or any(part in {"", ".", ".."} for part in parts)
+        or evidence_root is None
+    ):
+        return {}, "manager_evidence_outside_root"
+    try:
+        root = repo.resolve()
+        current = root
+        for part in parts:
+            current = current / part
+            if current.is_symlink():
+                return {}, "manager_evidence_outside_root"
+        # Contained in the matched evidence root, not merely the repo, and
+        # checked before existence: a link the component walk cannot see (a
+        # Windows junction) cannot redirect it, and a refusal never reveals
+        # whether a file outside the root exists.
+        if not current.resolve().is_relative_to(root.joinpath(*evidence_root)):
+            return {}, "manager_evidence_outside_root"
+        if not current.is_file():
+            return {}, "manager_evidence_missing"
+        if current.stat().st_size > MAX_MANAGER_EVIDENCE_BYTES:
+            return {}, "manager_evidence_too_large"
+        with current.open("rb") as handle:
+            raw = handle.read(MAX_MANAGER_EVIDENCE_BYTES + 1)
+    except OSError:
+        return {}, "manager_evidence_missing"
+    if len(raw) > MAX_MANAGER_EVIDENCE_BYTES:
+        return {}, "manager_evidence_too_large"
+    if hashlib.sha256(raw).hexdigest() != digest:
+        return {}, "manager_evidence_digest_mismatch"
+    return {"path": relative, "sha256": digest}, ""
+
 
 def failed_validation_rows(terminal_review: Mapping[str, Any]) -> frozenset[int]:
     """Indices of the declared-validation rows that failed in sealed evidence."""
@@ -1231,7 +1303,25 @@ def validate_manager_correction(
         failed_validation_rows(terminal_review) if from_validation_failed else ()
     )
     named_rows = 0
+    manager_evidence: list[dict[str, str]] = []
     for finding_id in finding_ids:
+        # NF-2026-01935: a manager-measured evidence file, on any substatus,
+        # verified against the canonical repo (``self.repo``, which
+        # ``_verified_manager_identity`` just bound to the manager route).
+        if finding_id.startswith(MANAGER_EVIDENCE_ID_PREFIX):
+            if not isinstance(reason, str) or not reason.strip():
+                return (
+                    None,
+                    {},
+                    f"manager_evidence_reason_required:{finding_id}"[:200],
+                )
+            entry, evidence_error = manager_evidence_entry(
+                Path(str(self.repo)), finding_id
+            )
+            if evidence_error:
+                return None, {}, f"{evidence_error}:{finding_id}"[:200]
+            manager_evidence.append(entry)
+            continue
         if from_validation_failed and finding_id.startswith(VALIDATION_ROW_ID_PREFIX):
             index_text = finding_id[len(VALIDATION_ROW_ID_PREFIX) :]
             if not (index_text.isascii() and index_text.isdigit()) or (
@@ -1329,6 +1419,12 @@ def validate_manager_correction(
     }
     if from_validation_failed and named_rows:
         record["correction_origin"] = "validation_failed"
+    if manager_evidence:
+        record["manager_evidence"] = sorted(
+            manager_evidence, key=lambda entry: (entry["path"], entry["sha256"])
+        )
+        if not named_rows:
+            record["correction_origin"] = MANAGER_GATE_EVIDENCE_ORIGIN
     return record, corrected_texts, ""
 
 
@@ -2525,6 +2621,7 @@ ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
     "supplemental_rounds_completed",
     "validate_manager_correction",
     "VALIDATION_ROW_ID_PREFIX",
+    "MANAGER_EVIDENCE_ID_PREFIX",
     "VALIDATION_ROW_NOT_FAILED_ERROR",
     "validation_failed_source_evidence",
 )
@@ -3996,11 +4093,15 @@ def accept_review(
                 candidate_sha256=_target_candidate_sha256(card),
                 receipt_sha256_by_reviewer=verified_receipt_sha256,
             )
+            # NF-2026-01935: a ``manager:`` evidence id lifts no reviewer
+            # finding, exactly like a ``validation:`` row id.
             reviewer_corrected_ids = (
                 [
                     finding_id
                     for finding_id in correction_record["finding_ids"]
-                    if not finding_id.startswith(VALIDATION_ROW_ID_PREFIX)
+                    if not finding_id.startswith(
+                        (VALIDATION_ROW_ID_PREFIX, MANAGER_EVIDENCE_ID_PREFIX)
+                    )
                 ]
                 if correction_record is not None
                 else []

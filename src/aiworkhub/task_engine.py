@@ -873,6 +873,10 @@ def retry_finalize_failed(
 
 ACCEPTED_OUTCOME_RECEIPT_SCHEMA = "aiworkhub.accepted_outcome_receipt.v1"
 VALIDATION_FAILED_CORRECTION_ORIGIN = "validation_failed"
+MANAGER_GATE_EVIDENCE_CORRECTION_ORIGIN = "manager_gate_evidence"
+CORRECTION_ORIGINS = frozenset(
+    {VALIDATION_FAILED_CORRECTION_ORIGIN, MANAGER_GATE_EVIDENCE_CORRECTION_ORIGIN}
+)
 
 
 def _canonical_json_hash(value: Any) -> str:
@@ -902,12 +906,32 @@ def _manager_correction_shape(
         "patch_sha256", "finding_ids", "paths",
         "candidate_path_hashes", "corrected_path_hashes", "reason",
     }
-    # NF-2026-01845: ``correction_origin`` is the one optional field, and its
-    # only legal value is the validation_failed origin.
+    # NF-2026-01845: ``correction_origin`` is optional, and its only legal
+    # values are the validation_failed and (NF-2026-01935) manager_gate_evidence
+    # origins.
     if "correction_origin" in correction:
-        if correction["correction_origin"] != VALIDATION_FAILED_CORRECTION_ORIGIN:
+        if correction["correction_origin"] not in CORRECTION_ORIGINS:
             return None, "accepted_outcome_receipt_manager_correction_malformed"
         fields = fields | {"correction_origin"}
+    # NF-2026-01935: the optional, sorted manager-measured evidence list.
+    if "manager_evidence" in correction:
+        evidence = correction["manager_evidence"]
+        if (
+            not isinstance(evidence, list)
+            or not evidence
+            or any(
+                not isinstance(entry, dict)
+                or set(entry) != {"path", "sha256"}
+                or not isinstance(entry["path"], str)
+                or not entry["path"]
+                or not _is_hex_digest(entry["sha256"])
+                for entry in evidence
+            )
+            or evidence
+            != sorted(evidence, key=lambda entry: (entry["path"], entry["sha256"]))
+        ):
+            return None, "accepted_outcome_receipt_manager_correction_malformed"
+        fields = fields | {"manager_evidence"}
     if set(correction) != fields:
         return None, "accepted_outcome_receipt_manager_correction_malformed"
     paths = correction.get("paths")
@@ -937,6 +961,23 @@ def _manager_correction_shape(
             or candidate[relative] != sealed_hashes.get(relative)
             for relative in paths
         )
+    ):
+        return None, "accepted_outcome_receipt_manager_correction_malformed"
+    # NF-2026-01935: every ``manager:`` id names exactly one cited evidence
+    # entry, the manager_gate_evidence origin cites evidence, and cited
+    # evidence always carries an origin.
+    named_evidence = {
+        finding_id for finding_id in finding_ids if finding_id.startswith("manager:")
+    }
+    cited_evidence = {
+        f"manager:{entry['path']}@{entry['sha256']}"
+        for entry in correction.get("manager_evidence") or ()
+    }
+    origin = correction.get("correction_origin")
+    if (
+        named_evidence != cited_evidence
+        or (origin == MANAGER_GATE_EVIDENCE_CORRECTION_ORIGIN and not cited_evidence)
+        or (cited_evidence and origin is None)
     ):
         return None, "accepted_outcome_receipt_manager_correction_malformed"
     return {relative: str(corrected[relative]) for relative in paths}, ""
