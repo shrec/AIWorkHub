@@ -5940,6 +5940,16 @@ def _bodygrep_query_page(
         conn.create_function(
             "bodygrep_scan_tier", 1, _bodygrep_scan_tier, deterministic=True,
         )
+        # NF-2026-02027: an unscoped or non-include-root scope never walks the
+        # include-root overlays (.scratch/ sorts before src/ and would fill the
+        # match budget with copies); a target under .scratch/ still does.
+        omit_roots = _discovery_omit_roots(repo_root, normalized_target)
+        conn.create_function(
+            "discovery_omitted", 1,
+            lambda path: int(_row_under_include_roots(str(path), omit_roots)),
+            deterministic=True,
+        )
+        omit_clause = " AND NOT discovery_omitted(file_path)" if omit_roots else ""
         order = " ORDER BY bodygrep_scan_tier(file_path), file_path LIMIT ?"
         resume_predicate = (
             "(bodygrep_scan_tier(file_path) > ?"
@@ -5971,12 +5981,17 @@ def _bodygrep_query_page(
                 )
                 query = (
                     "SELECT file_path FROM files WHERE file_path LIKE ? ESCAPE '\\'"
+                    + omit_clause
                     + resume_clause
                     + order
                 )
                 params = (f"{escaped}/%", *resume_param, scan_file_cap + 1)
         else:
-            where = (f" WHERE {resume_predicate}" if resume_file is not None else "")
+            conditions = [
+                *(["NOT discovery_omitted(file_path)"] if omit_roots else []),
+                *([resume_predicate] if resume_file is not None else []),
+            ]
+            where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
             query = "SELECT file_path FROM files" + where + order
             params = (*resume_param, scan_file_cap + 1)
         paths = [
@@ -6258,7 +6273,9 @@ def body_query(
     budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
     conn = connect(resolve_db_path(repo_root), read_only=True)
     try:
-        matches, total = body_matches(conn, repo_root, name, budget, path_prefix)
+        matches, total, omitted = _body_matches_counted(
+            conn, repo_root, name, budget, path_prefix,
+        )
     finally:
         conn.close()
     # Top-level freshness is a scalar state; the indexed/on-disk hashes ride on
@@ -6277,6 +6294,8 @@ def body_query(
     if total > 1:
         payload["ambiguous_count"] = total
         payload["ambiguous_truncated"] = total > len(matches)
+    if omitted:
+        payload[INCLUDE_ROOT_OMITTED_KEY] = omitted
     return _fit_payload_bytes(payload, max(512, budget * 512))
 
 
@@ -6924,9 +6943,11 @@ def _body_candidate_rows(
 
 def _body_materialize(
     conn: sqlite3.Connection, repo_root: Path, row: sqlite3.Row,
+    include_roots: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     result = dict(row)
-    include_roots = load_ignore_policy(repo_root).include_roots
+    if include_roots is None:
+        include_roots = load_ignore_policy(repo_root).include_roots
     if include_roots and _under_include_root(str(result["file_path"]), include_roots):
         scan = _scan_git_ignored_paths(repo_root.resolve())
         if scan.applied and _gitignored_rel(str(result["file_path"]), scan):
@@ -6955,6 +6976,100 @@ def _body_materialize(
     return result
 
 
+# NF-2026-02027: discovery answers leave out rows under a policy include_root
+# (``.scratch/`` manager overlays) unless the request's own target is itself
+# under that include root. The roots stay indexed and readable through an
+# exact ``mode="file"`` path; only the discovery replies drop them. Applied at
+# body_matches (body), _bodygrep_query_page (bodygrep), _query_payload
+# (focus/slice) and analytics_query (testmap/coverage and every analytic mode).
+INCLUDE_ROOT_OMITTED_KEY = "include_root_hits_omitted"
+_INCLUDE_ROOT_ROW_PATH_KEYS = (
+    "file_path", "test_file", "test_path", "source_file", "path",
+    "qualname", "src_qualname", "dst_qualname",
+)
+
+
+def _discovery_omit_roots(
+    repo_root: Path, target: str | None, include_roots: tuple[str, ...] | None = None,
+) -> tuple[str, ...]:
+    """Include roots a discovery reply omits for ``target``; () keeps everything."""
+
+    roots = load_ignore_policy(repo_root).include_roots if include_roots is None else include_roots
+    scope = str(target or "").strip().replace("\\", "/").strip("/")
+    # Only the include root that holds the target is walked; the others stay omitted.
+    return tuple(r for r in roots if not (scope and _under_include_root(scope, (r,))))
+
+
+def _row_under_include_roots(row: Any, roots: tuple[str, ...]) -> bool:
+    if isinstance(row, str):
+        return _under_include_root(row.replace("\\", "/"), roots)
+    if isinstance(row, sqlite3.Row):
+        row = {key: row[key] for key in row.keys()}
+    if isinstance(row, dict):
+        return any(
+            isinstance(row.get(key), str)
+            and _under_include_root(row[key].replace("\\", "/"), roots)
+            for key in _INCLUDE_ROOT_ROW_PATH_KEYS
+        )
+    return False
+
+
+def _split_include_root_rows(rows: list[Any], roots: tuple[str, ...]) -> tuple[list[Any], int]:
+    """``(kept rows, omitted count)``; rows are dicts, sqlite rows or path strings."""
+
+    if not roots:
+        return rows, 0
+    kept = [row for row in rows if not _row_under_include_roots(row, roots)]
+    return kept, len(rows) - len(kept)
+
+
+def _omit_include_root_rows(payload: Any, roots: tuple[str, ...], omitted: int = 0) -> Any:
+    """Drop include-root rows from every list in a reply and report the count."""
+
+    if not roots:
+        return payload
+    count = omitted
+
+    def scrub(node: Any) -> Any:
+        nonlocal count
+        if isinstance(node, list):
+            kept, dropped = _split_include_root_rows(node, roots)
+            count += dropped
+            return [scrub(item) for item in kept]
+        if isinstance(node, dict):
+            return {key: scrub(value) for key, value in node.items()}
+        return node
+
+    result = scrub(payload)
+    if count and isinstance(result, dict):
+        result[INCLUDE_ROOT_OMITTED_KEY] = count
+    return result
+
+
+def _body_matches_counted(
+    conn: sqlite3.Connection,
+    repo_root: Path,
+    name: str,
+    limit: int,
+    path_prefix: str | None,
+) -> tuple[list[dict[str, Any]], int, int]:
+    """``(materialized matches, total kept, include-root rows omitted)``."""
+
+    include_roots = load_ignore_policy(repo_root).include_roots
+    rows, omitted = _split_include_root_rows(
+        _body_candidate_rows(conn, name, path_prefix),
+        _discovery_omit_roots(repo_root, path_prefix, include_roots),
+    )
+    return (
+        [
+            _body_materialize(conn, repo_root, row, include_roots)
+            for row in rows[:max(1, limit)]
+        ],
+        len(rows),
+        omitted,
+    )
+
+
 def body_matches(
     conn: sqlite3.Connection,
     repo_root: Path,
@@ -6964,11 +7079,8 @@ def body_matches(
 ) -> tuple[list[dict[str, Any]], int]:
     """Return up to ``limit`` exact matches and the total candidate count."""
 
-    rows = _body_candidate_rows(conn, name, path_prefix)
-    return (
-        [_body_materialize(conn, repo_root, row) for row in rows[:max(1, limit)]],
-        len(rows),
-    )
+    matches, total, _omitted = _body_matches_counted(conn, repo_root, name, limit, path_prefix)
+    return matches, total
 
 
 def body(conn: sqlite3.Connection, repo_root: Path, name: str) -> dict[str, Any] | None:
@@ -7638,11 +7750,18 @@ def _query_payload(
     conn = connect(db_path, read_only=True)
     try:
         lookup = str(target or query).strip()
+        # focus carries no separate target: a lookup that is itself a path
+        # under an include root (".scratch/<sid>") is that request's scope.
+        omit_roots = _discovery_omit_roots(repo_root, lookup)
+        # Over-fetch when include-root copies will be dropped, so the canonical
+        # rows still fill the budget instead of being crowded out by overlays.
+        fetch = min(MAX_BUDGET_ROWS, budget * 4) if omit_roots else budget
         try:
-            matches = find(conn, lookup, limit=budget, retrieval=retrieval)
+            matches = find(conn, lookup, limit=fetch, retrieval=retrieval)
         except SourceGraphCorruptIndexError as exc:
             return _corrupt_query_payload(mode, query, budget, target, exc)
-        matches, truncated = _bounded_rows(matches, budget, byte_cap)
+        matches, find_omitted = _split_include_root_rows(matches, omit_roots)
+        matches, truncated = _bounded_rows(matches[:budget], budget, byte_cap)
         files = _candidate_files(matches, limit=min(budget, 16))
         payload: dict[str, Any] = {
             "mode": mode, "query": query, "budget": budget, "matches": matches,
@@ -7669,6 +7788,7 @@ def _query_payload(
             payload["neighbors"] = neighbors(
                 conn, top["qualname"], depth=1, limit=min(budget, 50)
             )["neighbors"]
+        payload = _omit_include_root_rows(payload, omit_roots, find_omitted)
         return _fit_payload_bytes(payload, byte_cap)
     finally:
         conn.close()
@@ -9074,6 +9194,12 @@ def analytics_query(
         # A find-backed corpus has no cheap full count, so it keeps the
         # "filled its cap" signal. Paging still walks the corpus that was
         # actually handed to the analytic (``total_eligible``).
+        # NF-2026-02027: include-root (.scratch/) copies leave the corpus unless
+        # the explicit target is itself under that include root.
+        omit_roots = _discovery_omit_roots(repo_root, normalized_target)
+        corpus_omitted = 0
+        if omit_roots and line_target is None:
+            corpus, corpus_omitted = _split_include_root_rows(corpus, omit_roots)
         if scope_eligible is None:
             corpus_capped = len(corpus) >= corpus_cap
             reported_eligible = len(corpus)
@@ -9153,6 +9279,9 @@ def analytics_query(
             if offset:
                 payload = _drop_analytics_result_prefix(payload, mode, offset)
             payload = _enforce_analytics_target_scope(payload, mode, corpus, normalized_target, conn)
+            # Related evidence (testmap/coverage test rows, call peers) is drawn
+            # from the whole index, so include-root copies are dropped here too.
+            payload = _omit_include_root_rows(payload, omit_roots, corpus_omitted)
         payload["target"] = normalized_target or None
         # Reserve room for the coverage/cursor block BEFORE fitting content
         # to the byte cap, then fit the fully assembled payload (content
