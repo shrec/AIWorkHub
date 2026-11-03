@@ -1098,6 +1098,20 @@ function _sanitisePreflightStderr(raw) {
   return text.replace(/[A-Za-z0-9_-]{24,}/g, "[REDACTED]").trim() || "(no stderr output)";
 }
 
+// NF-2026-01986: `import aiworkhub.server` took far longer than 15 s on a
+// loaded machine, so a good .venv was rejected as broken. One named deadline
+// serves both preflight paths; the env override is validated like run-all.js
+// validates its own, and an invalid value is refused in favour of the default.
+const PYTHON_PREFLIGHT_TIMEOUT_ENV = "AIWORKHUB_PYTHON_PREFLIGHT_TIMEOUT_MS";
+const DEFAULT_PYTHON_PREFLIGHT_TIMEOUT_MS = 120000;
+
+function preflightTimeoutMs(raw = process.env[PYTHON_PREFLIGHT_TIMEOUT_ENV]) {
+  if (raw === undefined || raw === "") return DEFAULT_PYTHON_PREFLIGHT_TIMEOUT_MS;
+  const value = /^[0-9]+$/.test(String(raw)) ? Number(raw) : NaN;
+  if (!Number.isSafeInteger(value) || value <= 0) return DEFAULT_PYTHON_PREFLIGHT_TIMEOUT_MS;
+  return value;
+}
+
 // Run a single candidate Python through the preflight gate: "import
 // aiworkhub.server". Returns {ok, candidate, ...diagnosticFields}. Never
 // leaks secrets or host-absolute paths into diagnostic strings.
@@ -1118,13 +1132,18 @@ function _preflightPythonCandidate(command, extraArgs, runtimeDir = extensionRun
     stderrFd = "ignore";
   }
   try {
+    const timeoutMs = preflightTimeoutMs();
     const result = childProcess.spawnSync(command, args, {
-      timeout: 15000,
+      timeout: timeoutMs,
       stdio: ["ignore", "ignore", stderrFd],
       shell: false,
       cwd: runtimeDir || undefined,
       env: preflightEnv,
     });
+    // NF-2026-01986: a slow interpreter is reported as slow, never as broken.
+    if (result.error && result.error.code === "ETIMEDOUT") {
+      return { ok: false, candidate: command, timedOut: true, error: `preflight_timeout:${timeoutMs}` };
+    }
     // spawnSync returns result.error for ENOENT / spawn failures without throwing.
     if (result.error) {
       return {
@@ -1175,8 +1194,9 @@ function _preflightPythonCandidateAsync(command, extraArgs, runtimeDir = extensi
     preflightEnv.PYTHONPATH = [runtimeDir, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter);
   }
   return new Promise((resolve) => {
+    const timeoutMs = preflightTimeoutMs();
     childProcess.execFile(command, args, {
-      timeout: 15000,
+      timeout: timeoutMs,
       encoding: "utf8",
       windowsHide: true,
       shell: false,
@@ -1186,6 +1206,12 @@ function _preflightPythonCandidateAsync(command, extraArgs, runtimeDir = extensi
     }, (err, _stdout, stderr) => {
       if (!err) {
         resolve({ ok: true, candidate: command });
+        return;
+      }
+      // execFile reports its own deadline as killed+signal, not ETIMEDOUT; both mean "slow", not "broken".
+      if (err.code === "ETIMEDOUT"
+        || (err.killed && err.signal && err.code !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")) {
+        resolve({ ok: false, candidate: command, timedOut: true, error: `preflight_timeout:${timeoutMs}` });
         return;
       }
       const exitCode = Number.isInteger(err.code) ? err.code : null;
@@ -15020,6 +15046,9 @@ module.exports = {
     resolveWorkerWorktreeRootEnv,
     _preflightPythonCandidate,
     _preflightPythonCandidateAsync,
+    preflightTimeoutMs,
+    PYTHON_PREFLIGHT_TIMEOUT_ENV,
+    DEFAULT_PYTHON_PREFLIGHT_TIMEOUT_MS,
     _buildPreflightDiagnostic,
     getMcpClient,
     sanitizeErrorMessage,

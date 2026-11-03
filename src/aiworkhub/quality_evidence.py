@@ -2615,6 +2615,18 @@ def _windows_native_command_argv(argv: list[str]) -> tuple[list[str] | None, str
     return [str(node), str(npm_cli), *argv[1:]], ""
 
 
+TIMEOUT_STREAM_TAIL_BYTES = 8 * 1024
+
+
+def _timeout_stream_tail(captured: bytes | str | None) -> str:
+    """Return at most TIMEOUT_STREAM_TAIL_BYTES of a timed-out stream's end."""
+
+    if captured is None:
+        return ""
+    raw = captured if isinstance(captured, bytes) else captured.encode("utf-8", errors="replace")
+    return raw[-TIMEOUT_STREAM_TAIL_BYTES:].decode("utf-8", errors="replace")
+
+
 def _run_command_array(
     command: Iterable[str],
     *,
@@ -2702,8 +2714,15 @@ def _run_command_array(
         )
     except FileNotFoundError:
         return STATUS_NOT_AVAILABLE, "", "command_not_found", time.monotonic() - start
-    except subprocess.TimeoutExpired:
-        return STATUS_FAILED, "", "timeout", time.monotonic() - start
+    except subprocess.TimeoutExpired as exc:
+        # NF-2026-01986: keep a bounded tail of what the child printed before
+        # the deadline so the summary names what ran last; status stays failed.
+        elapsed = time.monotonic() - start
+        stdout_tail = _timeout_stream_tail(exc.stdout)
+        stderr_tail = _timeout_stream_tail(exc.stderr)
+        marker = f"timeout after {elapsed:.1f}s (limit {timeout_seconds}s)"
+        stderr_text = f"{stderr_tail}\n{marker}" if stderr_tail else marker
+        return STATUS_FAILED, stdout_tail, stderr_text, elapsed
     except OSError:
         return STATUS_NOT_AVAILABLE, "", "process_start_failed", time.monotonic() - start
     duration = time.monotonic() - start

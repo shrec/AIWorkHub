@@ -345,3 +345,110 @@ test(
     assert.ok(preflight.ok, JSON.stringify({ resolved, preflight }));
   },
 );
+
+// ── NF-2026-01986: preflight deadline and distinct timeout diagnostic ────
+
+describe("preflight timeout (NF-2026-01986)", () => {
+  const preflightTimeoutMs = __testInternals.preflightTimeoutMs;
+  const ENV = __testInternals.PYTHON_PREFLIGHT_TIMEOUT_ENV;
+  const DEFAULT = __testInternals.DEFAULT_PYTHON_PREFLIGHT_TIMEOUT_MS;
+  const _preflightPythonCandidateAsync = __testInternals._preflightPythonCandidateAsync;
+  let savedEnv;
+  beforeEach(() => { savedEnv = process.env[ENV]; delete process.env[ENV]; });
+  afterEach(() => {
+    if (savedEnv === undefined) delete process.env[ENV];
+    else process.env[ENV] = savedEnv;
+  });
+
+  test("named default is at least 120000 ms", () => {
+    assert.equal(ENV, "AIWORKHUB_PYTHON_PREFLIGHT_TIMEOUT_MS");
+    assert.ok(DEFAULT >= 120000, `got ${DEFAULT}`);
+    assert.equal(preflightTimeoutMs(undefined), DEFAULT);
+  });
+
+  test("env override is validated", () => {
+    assert.equal(preflightTimeoutMs("250000"), 250000);
+    for (const bad of ["0", "-5", "12.5", "abc", "1e9", " 100", "99999999999999999999"]) {
+      assert.equal(preflightTimeoutMs(bad), DEFAULT, `value ${JSON.stringify(bad)}`);
+    }
+  });
+
+  test("sync preflight passes the deadline and reports ETIMEDOUT distinctly", () => {
+    const originalSpawnSync = childProcess.spawnSync;
+    process.env[ENV] = "180000";
+    let seenTimeout;
+    childProcess.spawnSync = (_command, _args, options) => {
+      seenTimeout = options.timeout;
+      const error = new Error("spawnSync python ETIMEDOUT");
+      error.code = "ETIMEDOUT";
+      return { error, status: null, signal: "SIGTERM" };
+    };
+    try {
+      const r = _preflightPythonCandidate("slow-python", []);
+      assert.equal(seenTimeout, 180000);
+      assert.equal(r.ok, false);
+      assert.equal(r.timedOut, true);
+      assert.equal(r.error, "preflight_timeout:180000");
+      assert.equal(r.exitCode, undefined);
+      const diag = _buildPreflightDiagnostic([r]);
+      assert.ok(diag.includes("preflight_timeout:180000"), diag);
+    } finally {
+      childProcess.spawnSync = originalSpawnSync;
+    }
+  });
+
+  test("sync preflight uses the default deadline when the env is absent", () => {
+    const originalSpawnSync = childProcess.spawnSync;
+    let seenTimeout;
+    childProcess.spawnSync = (_command, _args, options) => {
+      seenTimeout = options.timeout;
+      return { error: undefined, status: 0, signal: null };
+    };
+    try {
+      const r = _preflightPythonCandidate("fast-python", []);
+      assert.equal(r.ok, true);
+      assert.equal(seenTimeout, DEFAULT);
+    } finally {
+      childProcess.spawnSync = originalSpawnSync;
+    }
+  });
+
+  test("non-timeout spawn error stays a generic error", () => {
+    const originalSpawnSync = childProcess.spawnSync;
+    childProcess.spawnSync = () => {
+      const error = new Error("spawnSync python ENOENT");
+      error.code = "ENOENT";
+      return { error, status: null, signal: null };
+    };
+    try {
+      const r = _preflightPythonCandidate("missing-python", []);
+      assert.equal(r.ok, false);
+      assert.equal(r.timedOut, undefined);
+      assert.ok(r.error.includes("ENOENT"));
+    } finally {
+      childProcess.spawnSync = originalSpawnSync;
+    }
+  });
+
+  test("async preflight reports a killed-on-deadline child as preflight_timeout", async () => {
+    const originalExecFile = childProcess.execFile;
+    let seenTimeout;
+    childProcess.execFile = (_command, _args, options, callback) => {
+      seenTimeout = options.timeout;
+      const err = new Error("Command failed");
+      err.killed = true;
+      err.signal = "SIGTERM";
+      err.code = null;
+      setImmediate(() => callback(err, "", ""));
+    };
+    try {
+      const r = await _preflightPythonCandidateAsync("slow-python", []);
+      assert.equal(seenTimeout, DEFAULT);
+      assert.equal(r.ok, false);
+      assert.equal(r.timedOut, true);
+      assert.equal(r.error, `preflight_timeout:${DEFAULT}`);
+    } finally {
+      childProcess.execFile = originalExecFile;
+    }
+  });
+});
