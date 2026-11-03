@@ -29,6 +29,10 @@ FN = "scratch_probe_fn"
 SCRATCH = ".scratch/s1"
 SCRATCH_SRC = f"{SCRATCH}/ov/src/m.py"
 SCRATCH_TEST = f"{SCRATCH}/ov/tests/test_m.py"
+# NF-2026-02041: a gitignored, non-scratch include root that discovery keeps.
+VENDOR_ROOT = "vendor/lib"
+VENDOR_SRC = f"{VENDOR_ROOT}/v.py"
+VENDOR_FN = "vendored_probe_fn"
 MODULE = f"def {FN}(value):\n    return value + 1\n"
 TEST = (
     f"from m import {FN}\n\n\n"
@@ -65,15 +69,16 @@ def repo(tmp_path_factory: pytest.TempPathFactory) -> Path:
         "exclude_dirs": [],
         "exclude_globs": list(sg.DEFAULT_CONFIG_EXCLUDE_GLOBS),
         "disabled_languages": [],
-        "include_roots": [".scratch"],
+        "include_roots": [".scratch", VENDOR_ROOT],
     }), encoding="utf-8")
     ignore = root / ".gitignore"
     existing = ignore.read_text(encoding="utf-8") if ignore.exists() else ""
-    ignore.write_text(existing + "\n/.scratch/\n", encoding="utf-8")
+    ignore.write_text(existing + "\n/.scratch/\n/vendor/\n", encoding="utf-8")
     _write(root / "src" / "m.py", MODULE)
     _write(root / "tests" / "test_m.py", TEST)
     _write(root / SCRATCH_SRC, MODULE)
     _write(root / SCRATCH_TEST, TEST)
+    _write(root / VENDOR_SRC, f"def {VENDOR_FN}():\n    return 2\n")
     assert ".scratch" in sg.load_ignore_policy(root).include_roots
     sg.build_index(root)
     return root
@@ -174,6 +179,24 @@ def test_file_mode_on_an_exact_scratch_path_returns_its_lines(repo: Path) -> Non
 
 def test_only_the_include_root_holding_the_target_is_walked(repo: Path) -> None:
     roots = (".scratch", "overlay_root")
-    assert sg._discovery_omit_roots(repo, f"{SCRATCH}/ov", roots) == ("overlay_root",)
-    assert sg._discovery_omit_roots(repo, "src", roots) == roots
+    # NF-2026-02041: only the scratch include root is ever omitted.
+    assert sg._discovery_omit_roots(repo, f"{SCRATCH}/ov", roots) == ()
+    assert sg._discovery_omit_roots(repo, "src", roots) == (".scratch",)
+    assert sg._discovery_omit_roots(repo, None, (".scratch/s1", "vendor/lib")) == (".scratch/s1",)
+    assert sg._discovery_omit_roots(repo, None, (".scratchy",)) == ()
     assert sg._row_under_include_roots({"file_path": r".scratch\s1\m.py"}, roots)
+
+
+def test_non_scratch_ignored_include_root_stays_discoverable(repo: Path) -> None:
+    """NF-2026-02041: a gitignored vendored include root is not a scratch copy."""
+
+    payload = sg.body_query(repo, VENDOR_FN, 16)
+    assert _paths(payload) == {VENDOR_SRC}
+    assert sg.INCLUDE_ROOT_OMITTED_KEY not in payload
+    assert VENDOR_SRC in _paths(sg.bodygrep_query(repo, VENDOR_FN, 32))
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        vendored = sg.body(conn, repo, VENDOR_FN)
+    finally:
+        conn.close()
+    assert vendored is not None and vendored["untracked"] is True

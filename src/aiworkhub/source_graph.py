@@ -6976,13 +6976,14 @@ def _body_materialize(
     return result
 
 
-# NF-2026-02027: discovery answers leave out rows under a policy include_root
-# (``.scratch/`` manager overlays) unless the request's own target is itself
-# under that include root. The roots stay indexed and readable through an
-# exact ``mode="file"`` path; only the discovery replies drop them. Applied at
+# NF-2026-02027: discovery answers leave out rows under the scratch include
+# root (``.scratch/<session_id>/`` manager overlays) unless the request's own
+# target is itself under that root. The roots stay indexed and readable through
+# an exact ``mode="file"`` path; only the discovery replies drop them. Applied at
 # body_matches (body), _bodygrep_query_page (bodygrep), _query_payload
 # (focus/slice) and analytics_query (testmap/coverage and every analytic mode).
 INCLUDE_ROOT_OMITTED_KEY = "include_root_hits_omitted"
+SCRATCH_INCLUDE_ROOT = ".scratch"
 _INCLUDE_ROOT_ROW_PATH_KEYS = (
     "file_path", "test_file", "test_path", "source_file", "path",
     "qualname", "src_qualname", "dst_qualname",
@@ -6992,12 +6993,20 @@ _INCLUDE_ROOT_ROW_PATH_KEYS = (
 def _discovery_omit_roots(
     repo_root: Path, target: str | None, include_roots: tuple[str, ...] | None = None,
 ) -> tuple[str, ...]:
-    """Include roots a discovery reply omits for ``target``; () keeps everything."""
+    """Scratch include roots a discovery reply omits for ``target``; () keeps everything.
+
+    NF-2026-02041: only ``.scratch`` and include roots beneath it are omitted;
+    every other include root (a gitignored vendored tree, say) stays discoverable.
+    """
 
     roots = load_ignore_policy(repo_root).include_roots if include_roots is None else include_roots
     scope = str(target or "").strip().replace("\\", "/").strip("/")
-    # Only the include root that holds the target is walked; the others stay omitted.
-    return tuple(r for r in roots if not (scope and _under_include_root(scope, (r,))))
+    # Only scratch roots are omitted, and the one that holds the target is walked.
+    return tuple(
+        r for r in roots
+        if _under_include_root(r.replace("\\", "/").strip("/"), (SCRATCH_INCLUDE_ROOT,))
+        and not (scope and _under_include_root(scope, (r,)))
+    )
 
 
 def _row_under_include_roots(row: Any, roots: tuple[str, ...]) -> bool:
