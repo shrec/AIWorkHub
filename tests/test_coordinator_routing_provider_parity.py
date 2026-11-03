@@ -25,6 +25,7 @@ import os
 import sys
 import types
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 _SRC = Path(__file__).resolve().parents[1] / "src"
@@ -132,12 +133,25 @@ def test_dispatcher_health_manager_inbox_for_verified_claude_with_stale_codex_co
 
 def test_dispatcher_health_manager_inbox_reports_real_pending_backlog(tmp_path, monkeypatch):
     """NF-2026-00029: nothing drains a Claude inbox between turns, so an
-    undelivered callback in the real outbox must turn health non-green."""
+    undelivered callback in the real outbox must turn health non-green.
+
+    NF-2026-02040: since NF-2026-01962 a FRESH pending row is a normal poll
+    state, so the only proof that no live manager polls the inbox is the age
+    of its oldest pending row. The fixture models an unpolled inbox
+    explicitly by backdating the real row past the store's bound."""
     root = _init_repo(tmp_path)
     conn = callback_store.open_db(callback_store.resolve_db_path(root))
     try:
         assert callback_store.enqueue_callback(
             conn, "TASK_NF29", _CLAUDE_IDENTITY["session_id"], "review_ready", provider="claude",
+        )
+        unpolled_since = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=callback_store.CALLBACK_BACKLOG_MAX_AGE_SECONDS + 3600)
+        ).isoformat()
+        conn.execute(
+            "UPDATE callback_outbox SET created_at=?, updated_at=? WHERE task_id=? AND state='pending'",
+            (unpolled_since, unpolled_since, "TASK_NF29"),
         )
         conn.commit()
     finally:
