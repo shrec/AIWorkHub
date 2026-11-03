@@ -1115,16 +1115,22 @@ function preflightTimeoutMs(raw = process.env[PYTHON_PREFLIGHT_TIMEOUT_ENV]) {
 // Run a single candidate Python through the preflight gate: "import
 // aiworkhub.server". Returns {ok, candidate, ...diagnosticFields}. Never
 // leaks secrets or host-absolute paths into diagnostic strings.
-function _preflightPythonCandidate(command, extraArgs, runtimeDir = extensionRuntimeDir) {
+function _preflightPythonCandidate(command, extraArgs, runtimeDir = extensionRuntimeDir, captureRoot = "") {
   const args = [...(Array.isArray(extraArgs) ? extraArgs : []), "-c", "import aiworkhub.server"];
   const preflightEnv = { ...process.env };
   if (runtimeDir) {
     preflightEnv.PYTHONPATH = [runtimeDir, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter);
   }
   // NF-2026-01644: stderr goes to a file, not a pipe: AppContainer livelocks libuv's named-pipe creation.
-  const stderrPath = path.join(os.tmpdir(), `aiworkhub-preflight-${process.pid}-${crypto.randomBytes(8).toString("hex")}.stderr`);
+  // NF-2026-02018: with a repository root the capture lives inside it (NF-2026-02004).
+  const stderrName = `aiworkhub-preflight-${process.pid}-${crypto.randomBytes(8).toString("hex")}.stderr`;
+  const repoCapture = typeof captureRoot === "string" && captureRoot.length > 0;
+  // NO_REPO: without a repository root there is no in-repo location, so the host temp dir is used.
+  const stderrDir = repoCapture ? path.join(captureRoot, ".aiworkhub", "runtime", "tmp") : os.tmpdir();
+  const stderrPath = path.join(stderrDir, stderrName);
   let stderrFd;
   try {
+    if (repoCapture) fs.mkdirSync(stderrDir, { recursive: true });
     stderrFd = fs.openSync(stderrPath, "wx+", 0o600);
   } catch (_err) {
     // The verdict depends only on the interpreter, so a missing capture file just drops stderr.
@@ -1303,7 +1309,7 @@ function findPythonCommand(root, options = {}) {
         diagnostics.push({ ok: false, candidate, reason: "not_found" });
         continue;
       }
-      const preflight = _preflightPythonCandidate(candidate);
+      const preflight = _preflightPythonCandidate(candidate, [], extensionRuntimeDir, root);
       diagnostics.push(preflight);
       if (preflight.ok) {
         return {
@@ -1315,7 +1321,7 @@ function findPythonCommand(root, options = {}) {
     }
     // All repo-local candidates failed. Try py -3 then system python.
     for (const fallback of [{ cmd: "py", args: ["-3"] }, { cmd: "python", args: [] }]) {
-      const pf = _preflightPythonCandidate(fallback.cmd, fallback.args);
+      const pf = _preflightPythonCandidate(fallback.cmd, fallback.args, extensionRuntimeDir, root);
       diagnostics.push(pf);
       if (pf.ok) {
         return {
