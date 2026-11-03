@@ -1018,11 +1018,9 @@ def _candidate_ids(rows: list[dict[str, Any]], cutoff: datetime) -> set[str]:
 def _latest_process_row(root: Path | str, request_id: str) -> Mapping[str, Any] | None:
     from . import process_event_ledger
 
-    return process_event_ledger.latest_events(
-        _process_event_log_path(root),
-        key_field="request_id",
-        drop_fields=("packet",),
-    ).get(request_id)
+    return process_event_ledger.latest_event(
+        _process_event_log_path(root), request_id, key_field="request_id", drop_fields=("packet",)
+    )
 
 
 def _retained_workspace_present(

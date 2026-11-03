@@ -900,9 +900,9 @@ def test_reroute_launch_identity_allows_exact_pending_launch_failure_rework_epoc
     )
     monkeypatch.setattr(
         process_event_ledger,
-        "latest_events",
-        lambda _path: {
-            request_id: {
+        "latest_event",
+        lambda _path, key, **_kwargs: (
+            {
                 "request_id": request_id,
                 "task_id": task_id,
                 "runner": "claude_sonnet-5",
@@ -914,7 +914,9 @@ def test_reroute_launch_identity_allows_exact_pending_launch_failure_rework_epoc
                 "exit_code": 1,
                 "changed_paths": [],
             }
-        },
+            if key == request_id
+            else None
+        ),
     )
     monkeypatch.setattr(
         workforce_catalog,
@@ -985,9 +987,9 @@ def test_reroute_launch_identity_rejects_pending_launch_failure_with_delta(
     )
     monkeypatch.setattr(
         process_event_ledger,
-        "latest_events",
-        lambda _path: {
-            request_id: {
+        "latest_event",
+        lambda _path, key, **_kwargs: (
+            {
                 "request_id": request_id,
                 "task_id": task_id,
                 "runner": "claude_sonnet-5",
@@ -999,7 +1001,9 @@ def test_reroute_launch_identity_rejects_pending_launch_failure_with_delta(
                 "exit_code": 1,
                 "changed_paths": ["out/result.json"],
             }
-        },
+            if key == request_id
+            else None
+        ),
     )
     _insert_pending_reroutable(
         coordinator_repo,

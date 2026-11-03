@@ -856,16 +856,22 @@ def _write_rows(path: Path, rows: list[dict[str, object]], *, mode: str = "a") -
 
 
 def _count_full_passes(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
-    """Count canonical whole-ledger replays, not wall-clock time."""
+    """Count whole-ledger traversals, not wall-clock time.
+
+    A traversal is a canonical ``iter_events`` replay or one of the
+    token-filtered scans that read every segment but parse only matching
+    lines (NF-2026-02013); either costs one pass over the ledger bytes.
+    """
 
     calls = {"count": 0}
-    original = process_event_ledger.iter_events
+    for name in ("iter_events", "_stream_rows_containing", "_fold_request_snapshot"):
+        original = getattr(process_event_ledger, name)
 
-    def counting(path: Path):
-        calls["count"] += 1
-        return original(path)
+        def counting(*args, _original=original, **kwargs):
+            calls["count"] += 1
+            return _original(*args, **kwargs)
 
-    monkeypatch.setattr(process_event_ledger, "iter_events", counting)
+        monkeypatch.setattr(process_event_ledger, name, counting)
     return calls
 
 

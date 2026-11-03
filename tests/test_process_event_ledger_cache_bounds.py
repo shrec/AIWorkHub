@@ -208,7 +208,9 @@ def test_repeated_one_key_and_filtered_reads_retain_bounded_memory(
     tracemalloc.start()
     try:
         base = tracemalloc.get_traced_memory()[0]
-        ledger.latest_event(path, "request-0")
+        # A cold latest_event scans one key and never builds the projection
+        # (NF-2026-02013), so prime it through a copy-free filtered read.
+        assert ledger.latest_events_where(path, lambda _key, _row: False) == {}
         projection_size = tracemalloc.get_traced_memory()[0] - base
         assert projection_size > 300 * 8000
 

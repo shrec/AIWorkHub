@@ -8595,7 +8595,7 @@ def _verified_zero_delta_launch_failure_event(
         )
     )
     try:
-        event = process_event_ledger.latest_events(process_log).get(request_id)
+        event = process_event_ledger.latest_event(process_log, request_id)
     except Exception:  # noqa: BLE001 - unreadable process authority fails closed
         return None
     if not isinstance(event, dict):

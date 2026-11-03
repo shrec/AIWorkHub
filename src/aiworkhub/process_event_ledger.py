@@ -477,42 +477,88 @@ def _iter_ledger_file(path: Path) -> Iterator[dict[str, Any]]:
         return
 
 
+def _json_token(value: str) -> bytes | None:
+    """``value`` as the JSON-quoted bytes a ledger line carries for it, or
+    ``None`` when JSON would escape it (the raw line then need not contain it)."""
+
+    token = json.dumps(value)
+    return token.encode("ascii") if token == f'"{value}"' else None
+
+
+def _key_token(key: Any) -> bytes | None:
+    """The bytes every raw line folded under ``key`` contains, or ``None``.
+
+    The latest-row fold keys a row by ``str(row[key_field])``, so a key a
+    number, boolean or container could stringify to has no exact raw token.
+    """
+
+    if not isinstance(key, str) or not key or key in ("True", "False") or key[0] in "[{":
+        return None
+    try:
+        float(key)
+    except ValueError:
+        return _json_token(key)
+    return None
+
+
+def _rows_containing(lines: Iterable[bytes], tokens: list[bytes]) -> Iterator[dict[str, Any]]:
+    """Parse only the raw lines that contain one of ``tokens``."""
+
+    for raw_line in lines:
+        if not any(token in raw_line for token in tokens):
+            continue
+        try:
+            row = json.loads(raw_line.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            yield row
+
+
+def _stream_rows_containing(
+    ledgers: list[Path], tokens: list[bytes]
+) -> Iterator[dict[str, Any]]:
+    for ledger in ledgers:
+        try:
+            with ledger.open("rb") as handle:
+                yield from _rows_containing(handle, tokens)
+        except OSError:
+            continue
+
+
+def _iter_events_containing(
+    path: Path, tokens: list[bytes | None]
+) -> Iterator[dict[str, Any]] | None:
+    """``iter_events`` restricted to raw lines containing one of ``tokens``.
+
+    Skipping ``json.loads`` for a line without any token is exact whenever a
+    row the caller folds must carry one; a line that merely mentions a token
+    inside a string is parsed and judged exactly as before. ``None`` -- no
+    tokens, a value JSON would escape, or a spill whose timestamp merge
+    reorders lines -- means the caller must use the full ``iter_events``.
+    """
+
+    exact = [token for token in tokens if token is not None]
+    ledgers = ledger_paths(path)
+    if not exact or len(exact) != len(tokens) or any(
+        _is_spill(path, ledger) for ledger in ledgers
+    ):
+        return None
+    return _stream_rows_containing(ledgers, exact)
+
+
 def _iter_events_naming(
     path: Path, fields: tuple[str, ...], key_field: str
 ) -> Iterator[dict[str, Any]]:
     """``iter_events`` restricted to rows whose raw line names a non-key field.
 
     For a keep-fields merge fold a row that names none of those fields is never
-    folded, so skipping ``json.loads`` for a line without the quoted name is
-    exact; a line that merely mentions it inside a string is parsed and folded
-    exactly as before. Spill merges (timestamp-ordered heads) and names JSON
-    would escape fall back to the full ``iter_events`` stream.
+    folded, so the quoted field names are exact tokens (``_iter_events_containing``).
     """
 
-    names = [name for name in fields if name != key_field]
-    tokens = [json.dumps(name).encode("ascii", errors="replace") for name in names]
-    ledgers = ledger_paths(path)
-    if (
-        not tokens
-        or any(token.decode("ascii") != f'"{name}"' for token, name in zip(tokens, names))
-        or any(_is_spill(path, ledger) for ledger in ledgers)
-    ):
-        yield from iter_events(path)
-        return
-    for ledger in ledgers:
-        try:
-            with ledger.open("rb") as handle:
-                for raw_line in handle:
-                    if not any(token in raw_line for token in tokens):
-                        continue
-                    try:
-                        row = json.loads(raw_line.decode("utf-8", errors="replace"))
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(row, dict):
-                        yield row
-        except OSError:
-            continue
+    tokens = [_json_token(name) for name in fields if name != key_field]
+    rows = _iter_events_containing(path, tokens)
+    return iter_events(path) if rows is None else rows
 
 
 def iter_events(path: Path) -> Iterator[dict[str, Any]]:
@@ -809,6 +855,36 @@ def _rebuild_latest_events(
     return latest
 
 
+def _projection_key(
+    path: Path,
+    *,
+    key_field: str,
+    skip_event_kinds: tuple[str, ...],
+    replace: bool,
+    drop_fields: tuple[str, ...],
+    keep_fields: tuple[str, ...] = (),
+) -> _ProjectionKey:
+    """The normalized cache identity of one latest-per-key fold.
+
+    The fold options are part of the identity: a replace-fold that drops
+    notices is a different projection from a merge-fold that keeps them, and
+    serving one for the other would be a silent wrong answer. drop_fields
+    joins the same identity so two different discard sets never share a
+    cached projection. keep_fields extends the key only when given, so every
+    existing projection keeps its exact identity.
+    """
+
+    cache_key: _ProjectionKey = (
+        str(path.resolve(strict=False)),
+        key_field,
+        tuple(sorted(skip_event_kinds)),
+        bool(replace),
+        tuple(sorted(drop_fields)),
+    )
+    keep = tuple(sorted(set(keep_fields)))
+    return (*cache_key, ("keep", *keep)) if keep else cache_key
+
+
 def _latest_view(
     path: Path,
     *,
@@ -825,17 +901,14 @@ def _latest_view(
     skip_event_kinds = tuple(sorted(skip_event_kinds))
     drop_fields = tuple(sorted(drop_fields))
     keep_fields = tuple(sorted(set(keep_fields)))
-    # The fold options are part of the identity: a replace-fold that drops
-    # notices is a different projection from a merge-fold that keeps them, and
-    # serving one for the other would be a silent wrong answer. drop_fields
-    # joins the same identity so two different discard sets never share a
-    # cached projection. keep_fields extends the key only when given, so every
-    # existing projection keeps its exact identity.
-    cache_key: _ProjectionKey = (
-        resolved_path, key_field, skip_event_kinds, bool(replace), drop_fields
+    cache_key = _projection_key(
+        path,
+        key_field=key_field,
+        skip_event_kinds=skip_event_kinds,
+        replace=replace,
+        drop_fields=drop_fields,
+        keep_fields=keep_fields,
     )
-    if keep_fields:
-        cache_key = (*cache_key, ("keep", *keep_fields))
 
     def rebuild() -> dict[str, dict[str, Any]]:
         return _rebuild_latest_events(
@@ -973,19 +1046,43 @@ def latest_event(
     replace: bool = False,
     drop_fields: tuple[str, ...] = (),
 ) -> dict[str, Any] | None:
-    """The latest merged row for ``key`` (a copy), or ``None``; same cached
-    projection and incremental replay as ``latest_events``, but only the one
-    returned row is copied."""
+    """The latest merged row for ``key`` (a copy), or ``None``.
 
-    view = _latest_view(
-        path,
-        key_field=key_field,
-        skip_event_kinds=skip_event_kinds,
-        replace=replace,
-        drop_fields=drop_fields,
-    )
-    row = view.get(key)
-    return None if row is None else _copy_row(row)
+    A cached projection for these exact fold options is served, with its
+    incremental replay, as ``latest_events`` would. Otherwise one exact
+    single-key scan (NF-2026-02013) folds only the rows whose raw line holds
+    the key's JSON-quoted value: under merge, replace, skip_event_kinds and
+    drop_fields a row for another key cannot change this key's row, so the
+    answer equals ``latest_events(...).get(key)`` while the full-projection
+    cache is neither filled nor evicted. Spills and keys without an exact raw
+    token (``_key_token``) use the full projection.
+    """
+
+    options: dict[str, Any] = {
+        "key_field": key_field,
+        "skip_event_kinds": skip_event_kinds,
+        "replace": replace,
+        "drop_fields": drop_fields,
+    }
+    with _LATEST_EVENT_CACHE_LOCK:
+        cached = _projection_key(path, **options) in _LATEST_EVENT_CACHE
+    rows = None if cached else _iter_events_containing(path, [_key_token(key)])
+    if rows is None:
+        row = _latest_view(path, **options).get(key)
+        return None if row is None else _copy_row(row)
+    latest: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if str(row.get(key_field) or "") == key:
+            _merge_latest_row(
+                latest,
+                row,
+                key_field,
+                skip_event_kinds=skip_event_kinds,
+                replace=replace,
+                drop_fields=drop_fields,
+            )
+    # Every retained value came from this scan's own parse: nothing is shared.
+    return latest.get(key)
 
 
 def latest_events_where(
@@ -1156,14 +1253,85 @@ def _fold_request_rows(
             bucket.append(row)
 
 
-def _scan_request_events(
-    path: Path, keys: list[str], *, key_field: str
-) -> dict[str, list[dict[str, Any]]]:
-    """One canonical ledger pass collecting exactly ``keys``."""
+def _complete_lines(
+    lines: Iterable[bytes], limit: int, consumed: list[int]
+) -> Iterator[bytes]:
+    """The newline-terminated lines wholly inside the first ``limit`` bytes;
+    ``consumed[0]`` accumulates their length (the complete-row offset)."""
 
-    events: dict[str, list[dict[str, Any]]] = {key: [] for key in keys}
-    _fold_request_rows(events, iter_events(path), key_field)
-    return events
+    for raw_line in lines:
+        if not raw_line.endswith(b"\n") or consumed[0] + len(raw_line) > limit:
+            return
+        consumed[0] += len(raw_line)
+        yield raw_line
+
+
+def _fold_request_snapshot(
+    path: Path,
+    events: dict[str, list[dict[str, Any]]],
+    snapshot: tuple[_FileSignature, ...],
+    tokens: list[bytes],
+    key_field: str,
+) -> int | None:
+    """Fold exactly the bytes ``snapshot`` describes into ``events``.
+
+    Each segment is checked by device, inode and length when opened, and the
+    active file is read only up to its snapshot length, so appends made while
+    the scan runs never enter it and the result is the projection of
+    ``snapshot`` itself. Returns the active complete-row offset, or ``None``
+    when that is not exact (a spill, or a segment replaced or unreadable).
+    """
+
+    if any(_is_spill(path, Path(item[0])) for item in snapshot):
+        return None
+    resolved_path = str(path.resolve(strict=False))
+    offset = [0]
+    try:
+        for index, item in enumerate(snapshot):
+            active = index == len(snapshot) - 1 and item[0] == resolved_path
+            with Path(item[0]).open("rb") as handle:
+                opened = os.fstat(handle.fileno())
+                size = int(opened.st_size)
+                if (int(opened.st_dev), int(opened.st_ino)) != item[1:3] or (
+                    size != item[3] and not (active and size > item[3])
+                ):
+                    return None
+                lines: Iterable[bytes] = handle
+                if active:
+                    lines = _complete_lines(handle, item[3], offset)
+                _fold_request_rows(events, _rows_containing(lines, tokens), key_field)
+    except OSError:
+        return None
+    return offset[0]
+
+
+def _scan_request_events(
+    path: Path,
+    keys: list[str],
+    *,
+    key_field: str,
+    snapshot: tuple[_FileSignature, ...] | None = None,
+) -> tuple[dict[str, list[dict[str, Any]]], int | None]:
+    """One ledger pass collecting exactly ``keys``, plus the active offset.
+
+    Only raw lines holding a key's JSON-quoted value are parsed: the fold
+    buckets a row by exact string identity, so no other line can land in a
+    bucket. With ``snapshot`` the pass reads exactly those bytes and returns
+    their complete-row offset; otherwise -- or when that is not exact -- it is
+    the canonical ``iter_events`` pass and the offset is ``None``.
+    """
+
+    tokens = [_json_token(key) for key in keys]
+    exact = [token for token in tokens if token is not None]
+    if snapshot is not None and len(exact) == len(tokens):
+        events: dict[str, list[dict[str, Any]]] = {key: [] for key in keys}
+        offset = _fold_request_snapshot(path, events, snapshot, exact, key_field)
+        if offset is not None:
+            return events, offset
+    events = {key: [] for key in keys}
+    rows = _iter_events_containing(path, tokens)
+    _fold_request_rows(events, iter_events(path) if rows is None else rows, key_field)
+    return events, None
 
 
 def _copy_event_value(value: Any) -> Any:
@@ -1230,28 +1398,46 @@ def _rebuild_request_events(
     keys: list[str],
     key_field: str,
     cache_key: _RequestProjectionKey,
+    base: _RequestEventProjection | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
-    before = _ledger_signatures(path)
-    events = _scan_request_events(path, keys, key_field=key_field)
-    after = _ledger_signatures(path)
+    """Collect ``keys`` and cache them as one projection.
 
-    # Cache only a stable read.  A rotation or append concurrent with the pass
-    # still yields iter_events' own bounded semantics to this caller, but must
-    # never seed a projection that later incremental replays would extend.
-    if before is not None and before == after:
-        active_offset = 0
-        if after and after[-1][0] == str(path.resolve(strict=False)):
-            active_offset = _active_complete_offset(path, size=after[-1][3])
-            if _ledger_signatures(path) != after:
-                return events
-        _cache_request_projection(
-            cache_key,
-            _RequestEventProjection(
-                signatures=after,
-                complete_active_offset=active_offset,
-                events=events,
-            ),
-        )
+    Keys ``base`` already tracks keep their folded rows and only the others are
+    scanned, against exactly the bytes ``base`` describes, so a key miss no
+    longer re-reads every tracked key (NF-2026-02013). An exact snapshot scan
+    is cacheable even while the active file grows, so the next call replays
+    only the appended bytes.
+    """
+
+    snapshot = base.signatures if base is not None else _ledger_signatures(path)
+    tracked = base.events if base is not None else {}
+    missing = [key for key in keys if key not in tracked]
+    found, offset = _scan_request_events(
+        path, missing, key_field=key_field, snapshot=snapshot
+    )
+    events = {key: tracked[key] if key in tracked else found[key] for key in keys}
+
+    # The canonical-pass fallback caches only a stable read.  A rotation or
+    # append concurrent with it still yields iter_events' own bounded semantics
+    # to this caller, but must never seed a projection that later incremental
+    # replays would extend; nor is it merged into ``base``'s snapshot.
+    if offset is None and base is None and snapshot is not None:
+        if snapshot == _ledger_signatures(path):
+            offset = 0
+            if snapshot and snapshot[-1][0] == str(path.resolve(strict=False)):
+                offset = _active_complete_offset(path, size=snapshot[-1][3])
+                if _ledger_signatures(path) != snapshot:
+                    offset = None
+    if offset is None or snapshot is None:
+        return events
+    _cache_request_projection(
+        cache_key,
+        _RequestEventProjection(
+            signatures=snapshot,
+            complete_active_offset=offset,
+            events=events,
+        ),
+    )
     return events
 
 
@@ -1263,8 +1449,9 @@ def _replay_appended_request_events(
     resolved_path: str,
     key_field: str,
     cache_key: _RequestProjectionKey,
-) -> dict[str, list[dict[str, Any]]] | None:
-    """Fold only the bytes appended since ``cached``, or return ``None``.
+) -> _RequestEventProjection | None:
+    """Fold only the bytes appended since ``cached`` (and cache the resulting
+    projection, which is returned), or return ``None``.
 
     ``None`` means the change was not pure growth of the same active file --
     a rotation, spill, truncation, replacement or any immutable-segment change
@@ -1314,15 +1501,13 @@ def _replay_appended_request_events(
         )
     if _ledger_signatures(path) != current:
         return None
-    _cache_request_projection(
-        cache_key,
-        _RequestEventProjection(
-            signatures=current,
-            complete_active_offset=start + complete_length,
-            events=events,
-        ),
+    projection = _RequestEventProjection(
+        signatures=current,
+        complete_active_offset=start + complete_length,
+        events=events,
     )
-    return events
+    _cache_request_projection(cache_key, projection)
+    return projection
 
 
 def events_for_requests(
@@ -1357,7 +1542,7 @@ def events_for_requests(
         # More keys than the projection is allowed to retain.  Answer them in
         # one uncached pass rather than truncating the request or degrading
         # back to one pass per key, and leave the retained projection alone.
-        return _scan_request_events(path, requested, key_field=key_field)
+        return _scan_request_events(path, requested, key_field=key_field)[0]
 
     current = _ledger_signatures(path)
     with _REQUEST_EVENT_CACHE_LOCK:
@@ -1365,29 +1550,31 @@ def events_for_requests(
         if cached is not None:
             _REQUEST_EVENT_CACHE.move_to_end(cache_key)
 
-    if (
-        cached is not None
-        and current is not None
-        and all(key in cached.events for key in requested)
-    ):
-        if current == cached.signatures:
-            return _request_slice(cached.events, requested)
-        replayed = _replay_appended_request_events(
-            path,
-            cached=cached,
-            current=current,
-            resolved_path=resolved_path,
-            key_field=key_field,
-            cache_key=cache_key,
+    projection: _RequestEventProjection | None = None
+    if cached is not None and current is not None:
+        projection = (
+            cached
+            if current == cached.signatures
+            else _replay_appended_request_events(
+                path,
+                cached=cached,
+                current=current,
+                resolved_path=resolved_path,
+                key_field=key_field,
+                cache_key=cache_key,
+            )
         )
-        if replayed is not None:
-            return _request_slice(replayed, requested)
+        if projection is not None and all(key in projection.events for key in requested):
+            return _request_slice(projection.events, requested)
 
+    # A key miss: the up-to-date projection keeps its folded keys and only
+    # the missing ones are scanned (NF-2026-02013).
+    retained = projection or cached
     keys = _retained_request_keys(
-        requested, cached.events.keys() if cached is not None else ()
+        requested, retained.events.keys() if retained is not None else ()
     )
     rebuilt = _rebuild_request_events(
-        path, keys=keys, key_field=key_field, cache_key=cache_key
+        path, keys=keys, key_field=key_field, cache_key=cache_key, base=projection
     )
     return _request_slice(rebuilt, requested)
 
