@@ -318,7 +318,16 @@ def _task_topic_index(repo_root: Path | str) -> dict[str, str]:
     }
 
 
+# One window over terminal_failure, reject_review AND claim_start rows. The
+# claim_start rows were added for event-order attribution of legacy rejects
+# (NF-2026-01989); measured on this repository: 2,660 claim_start events
+# (core.py claim census) and 741 legacy request-id-less reject_review rows, so
+# the combined population stays an order of magnitude under this bound.
 _STORE_CAUSE_EVENT_LIMIT = 50_000
+
+# terminal_cause_source of a reject attributed to the task's latest
+# claim_start because its legacy payload carries no request_id.
+_EVENT_ORDER_CAUSE_SOURCE = "task_store_event_order"
 
 
 def _process_event_miss_reason(
@@ -356,25 +365,37 @@ def _substatus_cause(substatus: str) -> str:
 
 def _task_store_terminal_causes(
     repo_root: Path | str, wanted: set[tuple[str, str]]
-) -> tuple[dict[tuple[str, str], str], str]:
-    """``{(task_id, request_id): cause}`` from ONE bulk read of durable events.
+) -> tuple[dict[tuple[str, str], tuple[str, str]], str]:
+    """``{(task_id, request_id): (cause, source)}`` from ONE bulk read.
 
     ``terminal_failure`` events carry the request's terminal substatus and
-    ``reject_review`` events the manager-pinned ``failure_category``. Only
+    ``reject_review`` events the manager-pinned ``failure_category``. A legacy
+    ``reject_review`` (written before NF-00638 pinned ``request_id``) carries
+    neither; it is attributed, in ascending ``event_id`` order, to the request
+    of the task's latest preceding ``claim_start`` as
+    ``reject:<failure_category or terminal_disposition>`` (else
+    ``reject:unclassified``) with source ``task_store_event_order``. A reject
+    before any claim_start of its task attributes nothing. Precedence:
+    terminal substatus > explicit-request reject > event-order reject. Only
     scalar JSON fields cross the SQL boundary. A failed read returns no causes
     and a named reason instead of raising.
     """
 
+    wanted_tasks = {task_id for task_id, _request in wanted}
     try:
         _readiness, db_path = task_store._require_ready(repo_root)
         conn = task_store._connect(db_path, readonly=True)
         try:
             rows = conn.execute(
-                "SELECT task_id, event, "
+                "SELECT event_id, task_id, event, "
                 "json_extract(payload_json, '$.request_id') AS request_id, "
                 "json_extract(payload_json, '$.substatus') AS substatus, "
-                "json_extract(payload_json, '$.failure_category') AS failure_category "
-                "FROM task_events WHERE event IN ('terminal_failure','reject_review') "
+                "json_extract(payload_json, '$.failure_category') AS failure_category, "
+                "CASE WHEN json_type(payload_json, '$.terminal_disposition') = 'text' "
+                "THEN json_extract(payload_json, '$.terminal_disposition') END "
+                "AS terminal_disposition "
+                "FROM task_events "
+                "WHERE event IN ('terminal_failure','reject_review','claim_start') "
                 "AND json_valid(payload_json) ORDER BY event_id DESC LIMIT ?",
                 (_STORE_CAUSE_EVENT_LIMIT,),
             ).fetchall()
@@ -382,21 +403,42 @@ def _task_store_terminal_causes(
             conn.close()
         terminal: dict[tuple[str, str], str] = {}
         rejected: dict[tuple[str, str], str] = {}
-        for row in rows:
-            key = (str(row["task_id"] or ""), str(row["request_id"] or ""))
-            if key not in wanted:
+        ordered: dict[tuple[str, str], str] = {}
+        current_request: dict[str, str] = {}
+        # The window is the newest rows; walk it oldest-first so the latest
+        # claim_start before each reject names the request it judged, and a
+        # later event for the same key overwrites an earlier one.
+        for row in sorted(rows, key=lambda item: int(item["event_id"])):
+            task_id = str(row["task_id"] or "")
+            if task_id not in wanted_tasks:
                 continue
-            if row["event"] == "terminal_failure":
+            request_id = str(row["request_id"] or "").strip()
+            event = row["event"]
+            if event == "claim_start":
+                if request_id:
+                    current_request[task_id] = request_id
+                continue
+            if event == "terminal_failure":
                 substatus = str(row["substatus"] or "").strip()
-                if substatus and key not in terminal:
-                    terminal[key] = _substatus_cause(substatus)
-            else:
-                category = str(row["failure_category"] or "").strip()
-                if category and key not in rejected:
-                    rejected[key] = f"reject:{category}"
+                if substatus and (task_id, request_id) in wanted:
+                    terminal[(task_id, request_id)] = _substatus_cause(substatus)
+                continue
+            category = str(row["failure_category"] or "").strip()
+            if request_id:
+                if category and (task_id, request_id) in wanted:
+                    rejected[(task_id, request_id)] = f"reject:{category}"
+                continue
+            claimed = current_request.get(task_id, "")
+            if not claimed or (task_id, claimed) not in wanted:
+                continue
+            category = category or str(row["terminal_disposition"] or "").strip()
+            ordered[(task_id, claimed)] = f"reject:{category or 'unclassified'}"
     except (task_store.TaskStoreError, sqlite3.Error, OSError, ValueError) as exc:
         return {}, f"task_store_unreadable:{type(exc).__name__}"
-    return {**rejected, **terminal}, ""
+    causes = {key: (cause, _EVENT_ORDER_CAUSE_SOURCE) for key, cause in ordered.items()}
+    causes.update({key: (cause, "task_store") for key, cause in rejected.items()})
+    causes.update({key: (cause, "task_store") for key, cause in terminal.items()})
+    return causes, ""
 
 
 def _attribute_causes_from_task_store(
@@ -419,15 +461,15 @@ def _attribute_causes_from_task_store(
         for row in pending
         if row["task_id"] and row["attempt_id"]
     }
-    causes: dict[tuple[str, str], str] = {}
+    causes: dict[tuple[str, str], tuple[str, str]] = {}
     read_error = ""
     if wanted:
         causes, read_error = _task_store_terminal_causes(repo_root, wanted)
     for row in pending:
-        cause = causes.get((str(row["task_id"]), str(row["attempt_id"])), "")
+        cause, source = causes.get((str(row["task_id"]), str(row["attempt_id"])), ("", ""))
         if cause:
             row["terminal_cause"] = cause
-            row["terminal_cause_source"] = "task_store"
+            row["terminal_cause_source"] = source
             continue
         row["terminal_cause_source"] = "unknown"
         row["terminal_cause_unresolved"] = (
