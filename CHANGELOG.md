@@ -6,6 +6,60 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.85] - 2026-11-03
+
+### Added
+
+- A read-only NeedFix staleness sweep proposes a disposition with evidence for every captured NeedFix row (NF-2026-01990).
+- `review_packet` returns one decision packet per candidate with prefilled accept, dispose and reject calls, and covers several ready candidates in one call (NF-2026-01925).
+- A manager correction may cite a manager-measured evidence file (`manager:<repo-relative path>@<sha256>` under `.scratch/` or `.aiworkhub/runtime/`) instead of a reviewer finding; the accept receipt records it as `manager_evidence` (NF-2026-01935).
+- A builtin structural check runs on changed MSBuild project files (NF-2026-02000).
+- A manager seat stamps its `.scratch/<session_id>` with an owner manifest, and the janitor reclaims it 2 hours after the seat's process is provably dead; live and unknown owners keep the 48-hour rule (NF-2026-02029).
+
+### Changed
+
+- Nothing outside the repository: temp, sandbox temp, caches and leases live under the repository-owned runtime root and are cleaned up, and the extension's Python preflight stderr capture no longer uses the system temp directory (NF-2026-02004, NF-2026-02018).
+- A failing declared validation returns to the same worker automatically, once per failure signature; a validation that also fails on the base commit is classified as environment instead of being reworked (NF-2026-01922, NF-2026-01923).
+- A blocked card with a known operational failure relaunches unattended under a finite budget (NF-2026-01926).
+- `reject_review` and `recover_blocked_rework` can replace or remove a declared validation instead of only appending to it (NF-2026-01984).
+- The Codex callback mux is retired: activation no longer installs the mux launcher, PATH shim or native launcher, and a `chatgpt.cliExecutable` that still points at an AIWorkHub mux is restored (RM-2026-00082).
+- MCP server import defers implementation modules (197 modules executed at import down to 44) (NF-2026-01988).
+- Source Graph incremental refresh re-resolves only the changed files, their importers and the affected names in the C/C++, import and call resolvers (NF-2026-02011, NF-2026-02021).
+- Single-key ledger lookups scan one key instead of cold-folding the whole process ledger (cold lookup 23.66 s to 2.89 s), and the sealed-field lookup folds a small cached seal projection (NF-2026-02013, NF-2026-02009).
+- One reconciler `sdlc_sync` pass stops at a wall-clock budget, names its running part and resumes the same window on the next pass (NF-2026-02019).
+- A worker Source Graph call that blocks returns a typed `source_graph_timeout` with its phase after 120 seconds instead of hanging the worker (NF-2026-02012).
+- Source Graph discovery modes leave out `.scratch` include-root copies unless the request targets `.scratch` (NF-2026-02027).
+
+### Fixed
+
+- A risk tier the manager declares at card creation is an upward-only floor at review_ready and at accept, so a card declared high keeps its security reviewer even when its changed paths alone derive medium (NF-2026-02045).
+- A foreign-owned worktree or runtime root override is ignored with a warning in favour of the repository's own root; an unknown owner or a root that resolves outside the repository is still refused (NF-2026-02032).
+- A launched card's review callback stays in its live owner's lane and carries its request id (NF-2026-02015).
+- A timed-out accept names the promotion lock's holder, a refused reviewer launch names its request, card, target and adapter, and a lost reservation hand-off re-snapshots outside the registry lock (NF-2026-02006, NF-2026-01993, NF-2026-02022).
+- The worker supervisor classifies output that lands after its last heartbeat before writing the terminal status (NF-2026-02024).
+- Stateless review-orchestrator rows never become the lifecycle tail of a review-ready candidate (NF-2026-02010).
+- The retry cost ledger attributes legacy `reject_review` rows without a request id by event order (NF-2026-01989).
+- Launch honours the card's `identity_reroute` adapter and model, and a `continue_capped` successor launches with its predecessor's candidate (NF-2026-01948, NF-2026-01961).
+- An owner's uncommitted canonical edit never becomes a worker change or an auto-commit (NF-2026-01997).
+- An archived dependency is satisfied or refused by name, and a blocked failed card can be closed (NF-2026-01999).
+- A reviewer probe reproduction is one command line the validation tokenizer accepts, and a reproduction is judged by what it read, not by unrelated canonical churn (NF-2026-01985, NF-2026-01953).
+- A terminal retry of never-rejected carried bytes is not refused as `rework_no_delta`, and a reject to archived closes learning out against the reviewed launch (NF-2026-01952, NF-2026-01972).
+- Validation: `pip --user` console scripts keep working under the redirected HOME, paths created by an earlier validation step are not unwinnable, a spawn failure carries a typed reason and the exact `toolchains.json` remedy, and a `validation_environment` failure names its replay recovery (NF-2026-01969, NF-2026-01974, NF-2026-01936, NF-2026-01971).
+- `agent_task_status` carries a bounded `first_failure` block for a failed validation, and a timed-out quality check keeps its captured output (NF-2026-01975, NF-2026-01986).
+- Semantic edit keeps the file's line ending and its executable bit, checks one anchor in place on a multi-line range, and relocates a range shifted by an earlier apply in the same file (NF-2026-01958, NF-2026-01970, NF-2026-01976).
+- `promotion_conflict` names the conflicting path with expected, observed and candidate sha256 (NF-2026-01960).
+- Source Graph: body and file reads of a stale file serve the current bytes, ranked modes see the whole repository instead of the first 4000 symbols, JSX component usage is recorded as call edges, `.inc` files index as C/C++, a gitignored changed path is indexable in the candidate overlay, worker targets drop `read_first` line ranges, and `stop_daemon` waits for the build thread to exit (NF-2026-01963, NF-2026-01992, NF-2026-01982, NF-2026-02001, NF-2026-01973, NF-2026-01987).
+- The janitor reclaims Source Graph base pins and candidate overlays of terminal requests (NF-2026-01931).
+- The `builtin:syntax` gate parses JSX-dialect `.js`, `.jsx` and `.tsx` files with the tree-sitter grammar (NF-2026-01981).
+- A large-file review packet ranks the changed-hunk neighbourhood and records truncation as sampling (NF-2026-01994).
+- The accept neighbour lane always runs the path-loading and ratchet tests of a changed module, and a card that writes `agent_tool_instructions.py` gets every policy-derived artifact in its allowed writes (NF-2026-01947, NF-2026-01946).
+- `dispatcher_health` reports a polling Claude manager inbox as ok and expires a stale callback backlog with an audit event; `doctor_diagnose` reports a timed-out probe as slow (NF-2026-01962, NF-2026-01967).
+- A NeedFix resolve refusal points to `resolve_verified` and the `Resolves:` trailer (NF-2026-01964).
+- The vscode_lm forced-stage refusal names its reason, and progress on any missing output resets its budget (NF-2026-01980).
+- Manager Chat echoes the typed message immediately; OpenCode discovery lists owner-config custom provider models; task hygiene archives failed quality-reviewer children; the `docs_change` template matches `read_first` entries with a line range (NF-2026-01977, NF-2026-01534, NF-2026-01949, NF-2026-01956).
+- Tests that failed under full-suite parallel load are deterministic: Source Graph LSP, daemon lifecycle, dashboard snapshot, cleanup single-flight, startup race and usage tests (NF-2026-01240, NF-2026-01382, NF-2026-01943, NF-2026-01422, NF-2026-01410, NF-2026-01219, NF-2026-01872, NF-2026-01983).
+- An MCP stdio frame probe records every frame written after initialize, to find what makes a client tear the server down (NF-2026-01951).
+
 ## [0.12.84] - 2026-11-02
 
 ### Changed

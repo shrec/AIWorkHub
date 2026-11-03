@@ -24,14 +24,15 @@ MCP stdio runtime on the workspace host. It does not open a browser or require
 an AIWorkHub cloud account, and it binds no port and exposes no LAN service
 unless you start the opt-in WorkHub Mail listener on a host and port you name.
 
-## What's new in 0.12.84
+## What's new in 0.12.85
 
-- WorkHub Mail is temporarily switched off: the LAN listener never starts in this release, and a listener an earlier version left running is stopped. Listener status and stop keep working.
-- A reviewer finding can carry a runnable reproduction: AIWorkHub runs it on the candidate and on its base and stores a signed receipt with the manager's decision. The security lens checks four named vulnerability classes.
-- Scripts in a project's `tools/` directory with an `aiworkhub-tool` header are seeded as versioned recipes, and a Claude Code manager can install the canonical recipes.
-- Fewer stuck cards: a sealed file deletion accepts, a capped continuation launches, a tests-only diff keeps its risk tier, a registry-lock timeout names its holder, read-only review projections no longer hold the task-queue write lease, a dependency output that was never produced no longer fails finalize, and a file present before the worker started is no longer sealed as its change.
-- No more virtual drives in your Windows session: a sandboxed worker's drive letter exists only inside a private logon session opened for it. Restoring a manager chat after a window reload attaches read-only and no longer revives a retired chat.
-- Scratch lives in the repository under `.scratch/<session_id>/`: git-ignored, indexed by Source Graph, edited only with the AIWorkHub tools, pruned after 48 hours and never sealed into a worker's changes. The tool guard and Source Graph decide "indexed" with one shared predicate.
+- Nothing outside the repository: temp files, sandbox temp, caches and leases live under the repository's own runtime root and are cleaned up when no longer needed. A stopped manager's scratch is reclaimed two hours after its process is gone.
+- A failing validation goes back to the same worker automatically, a validation that also fails before the change is treated as an environment problem, and a card blocked by a known operational failure relaunches on its own.
+- Faster and steadier: the MCP server starts with far fewer modules loaded, Source Graph re-resolves only what changed, ledger lookups read one key instead of the whole ledger, and a blocked worker Source Graph call returns a typed timeout after 120 seconds.
+- Clearer reviews: one decision packet per candidate with prefilled calls, a manager correction can cite the manager's own measured evidence, and every refused reviewer launch or timed-out accept names who and what it belonged to.
+- A card you declare high risk keeps its security review: the declared tier is a floor that the path-based checks can raise but never lower.
+- Safer isolation: a worktree root override that belongs to another repository is ignored instead of breaking the launch, and an owner's uncommitted edit never becomes a worker change.
+- The Codex callback mux is retired, and the native Codex executable setting is restored.
 
 ## Review automation
 

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.12.85 — 2026-11-03
+
+### Changed
+
+- Bundled runtime 0.12.85: nothing outside the repository (temp, caches and leases live under the repository runtime root), failing validations return to the same worker automatically, a faster MCP server start and incremental Source Graph resolvers, a 120-second deadline on worker Source Graph calls, review decision packets, a declared high-risk card keeps its security review, and fixes for stuck launches, accepts and callbacks. The full list is in the repository CHANGELOG.
+
 ## 0.12.84 — 2026-11-02
 
 ### Changed
