@@ -385,7 +385,13 @@ def test_a_symlinked_repo_mirror_is_never_forwarded(
     except OSError as exc:
         pytest.skip(f"symlink creation unavailable: {exc}")
     # The outside tree is complete, yet a link out of the repo is not forwarded.
-    assert tsc._parser_complete(mirror)
+    # Completeness is asserted on the link TARGET: ``_parser_complete`` lstat()s
+    # its root and refuses a symlink/junction on every platform (Windows reports
+    # the reparse attribute, POSIX S_ISLNK), so asserting it on ``mirror`` tested
+    # an impossible precondition rather than the forwarding refusal.
+    assert tsc._parser_complete(outside)
+    assert tsc._is_link(mirror)
+    assert not tsc._parser_complete(mirror)
     assert tsc.validation_cache_root(repo) is None
 
 

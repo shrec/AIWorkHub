@@ -27,7 +27,7 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
-from . import terminal_authority
+from . import platform_io, terminal_authority
 
 SCHEMA_ID = "aiworkhub.toolchain_authority.v1"
 RECEIPT_SCHEMA_ID = "aiworkhub.toolchain_authority.receipt.v1"
@@ -1445,7 +1445,7 @@ def caller_python_user_base() -> Path | None:
     ``site.getuserbase()`` from its real HOME); the sanitized child env never
     feeds it. Windows keeps its native profile layout, so this is POSIX-only.
     """
-    if os.name == "nt":
+    if platform_io.is_windows():
         return None
     raw = os.environ.get("PYTHONUSERBASE") or site.getuserbase()
     if not raw or not Path(raw).is_absolute():
@@ -1484,12 +1484,10 @@ def validation_user_base_bwrap_binds(adapter_id: str) -> tuple[str, ...]:
 
 def _kill_probe(process: subprocess.Popen[bytes]) -> None:
     try:
-        if sys.platform != "win32":
-            import signal
-
-            os.killpg(process.pid, signal.SIGKILL)
-        else:
+        if platform_io.is_windows():
             process.kill()
+        else:
+            platform_io.signal_process_group(process.pid, graceful=False)
     except OSError:
         pass
 
@@ -1520,7 +1518,7 @@ def probe_executable_version(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             shell=False,
-            start_new_session=os.name != "nt",
+            start_new_session=not platform_io.is_windows(),
         ) as process:
             try:
                 _, stderr = process.communicate(timeout=bounded)

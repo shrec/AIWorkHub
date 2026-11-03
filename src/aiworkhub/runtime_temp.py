@@ -33,7 +33,6 @@ import re
 import secrets
 import shutil
 import stat
-import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -46,7 +45,7 @@ from typing import Any, Callable, Mapping
 # down with it - the one process whose job is to stop workers being orphaned.
 # Mirror the supervisor's own pattern rather than assuming package context.
 try:
-    from .platform_io import process_is_alive
+    from .platform_io import is_macos, is_windows, process_is_alive
     from .windows_file_structures import (
         FILETIME,
         FILE_BASIC_INFO,
@@ -54,7 +53,11 @@ try:
         FILE_STANDARD_INFO,
     )
 except ImportError:  # direct-script entrypoint (see worker_supervisor)
-    from platform_io import process_is_alive  # type: ignore[no-redef]
+    from platform_io import (  # type: ignore[no-redef]
+        is_macos,
+        is_windows,
+        process_is_alive,
+    )
     from windows_file_structures import (  # type: ignore[no-redef]
         FILETIME,
         FILE_BASIC_INFO,
@@ -304,7 +307,7 @@ def unhomed_child_temp(repo: Path | None) -> Path:
     branch).  POSIX: the sandbox's own private ``/tmp``, never a host path.
     Windows: the repository temp root when a repository is known; the system
     temp only in the no-repository case."""
-    if os.name != "nt":
+    if not is_windows():
         return Path("/tmp")
     known = known_repository(repo)
     if known is None:
@@ -462,12 +465,12 @@ def process_start_ticks(pid: int) -> int | None:
     """
     if pid <= 0:
         return None
-    if os.name == "nt":
+    if is_windows():
         try:
             return _windows_start_ticks(pid)
         except OSError:
             return None
-    if sys.platform == "darwin":
+    if is_macos():
         return _darwin_start_ticks(pid)
     return _proc_stat_starttime(pid)
 
@@ -822,7 +825,7 @@ def _windows_path_identity(path: Path) -> tuple[int, int] | None:
 
 
 def _is_windows() -> bool:
-    return os.name == "nt"
+    return is_windows()
 
 
 @dataclass(frozen=True)
