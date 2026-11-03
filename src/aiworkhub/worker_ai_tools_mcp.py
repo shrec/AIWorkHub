@@ -8984,15 +8984,34 @@ def _validation_digest(
     }
 
 
-def _validation_run_dir(ctx: WorkerToolContext) -> Path:
-    """The request-private directory this server may write full logs into."""
+def _validation_run_dir(ctx: WorkerToolContext, repo: Any = None) -> Path:
+    """The request-private directory this server may write full logs into.
+
+    NF-2026-02004: beside the audit ledger or contract packet, else -- with a
+    repository known -- under its ``.aiworkhub/temp/mcp``; the system temp is
+    the NO_REPO fallback only.
+    """
+
+    from . import runtime_temp
 
     if ctx.audit_ledger_path is not None:
         base = ctx.audit_ledger_path.parent
     elif ctx.contract_packet_path is not None:
         base = ctx.contract_packet_path.parent
     else:
-        base = Path(tempfile.gettempdir())
+        known = runtime_temp.known_repository(repo)
+        if known is not None:
+            # Owner-stamped request dir, so the retention janitor reclaims
+            # it once this server is gone.
+            owner = str(getattr(ctx, "request_id", None) or f"mcp-{os.getpid()}")
+            base = runtime_temp.request_dir(known, owner, "mcp")
+            base.mkdir(parents=True, exist_ok=True, mode=0o700)
+            # Re-stamp a dir inherited from an earlier process with this request id.
+            stamp = runtime_temp.read_owner_manifest(base)
+            if stamp is None or stamp.get("pid") != os.getpid():
+                runtime_temp.write_owner_manifest(base, owner, known)
+        else:
+            base = Path(tempfile.gettempdir())  # NO_REPO: no repository is known
     run_dir = base / "validation_runs"
     run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     return run_dir
@@ -9105,7 +9124,7 @@ def validation_run(
     candidate_digest = _candidate_bytes_digest(
         Path(workspace.path), workspace.allowed_writes
     )
-    run_dir = _validation_run_dir(ctx)
+    run_dir = _validation_run_dir(ctx, getattr(workspace, "repo", None))
     results: list[dict[str, Any]]
     if contained:
         with _contained_validation_workspace(ctx, workspace) as lane_workspace:

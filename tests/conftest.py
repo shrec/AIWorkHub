@@ -588,7 +588,34 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
 
 _METRIC_CONFIG: dict = {}
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
+
+@pytest.fixture
+def short_tmp(tmp_path_factory: pytest.TempPathFactory):
+    """NF-2026-02004: a shallow directory for union-named git worktree tests.
+
+    pytest's own temp root is so deep that tmp_path-derived union worktree
+    paths exceed git's path limit ("$GIT_DIR too big").  This one is
+    ``<repo>/.aiworkhub/temp/s/<8 hex>`` -- the repository-owned temp root,
+    never ``tempfile.gettempdir()`` -- owner-stamped so the retention janitor
+    reclaims it by age if this process dies, and removed at teardown.  A
+    worktree whose ``.aiworkhub`` the sandbox will not let it write falls back
+    to this run's own pytest temp, itself the request's in-repo scratch.
+    """
+    from aiworkhub import runtime_temp
+
+    try:
+        path = runtime_temp.short_temp_dir(_REPO_ROOT)
+        owned = True
+    except (OSError, runtime_temp.RuntimeTempError):
+        path, owned = tmp_path_factory.mktemp("lu"), False
+    yield path
+    if owned:
+        try:
+            runtime_temp.dispose_request_temp(path, repo=_REPO_ROOT)
+        except (OSError, runtime_temp.RuntimeTempError):
+            pass
 
 
 def pytest_terminal_summary(terminalreporter, config: pytest.Config) -> None:

@@ -125,6 +125,8 @@ def trusted_tree_sitter_cache_root() -> Path | None:
     if explicit:
         candidates.append(Path(explicit))
     if _platform_io.is_windows():
+        # The per-user profile cache: with a repository known only a mirror
+        # source (validation_cache_root); forwarded itself only as NO_REPO.
         local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
         if local_app_data and local_app_data != explicit:
             candidates.append(Path(local_app_data))
@@ -240,3 +242,52 @@ def mirror_tree_sitter_cache(source_root: Path, destination_root: Path) -> Path 
         return Path(destination_root).resolve(strict=True)
     except OSError:
         return None
+
+
+def _is_link(path: Path) -> bool:
+    """True when ``path`` is a symlink or a reparse point (junction)."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & _REPARSE
+    )
+
+
+def validation_cache_root(repo: Path | None) -> Path | None:
+    """NF-2026-02004: the grammar cache root a validation child is given.
+
+    With a repository known it is that repository's host-owned mirror
+    (:func:`repo_mirror_root`), refreshed from the trusted source; the
+    per-user ``LOCALAPPDATA`` profile cache is only ever a mirror *source*,
+    never forwarded.  An operator-pinned ``TREE_SITTER_LANGUAGE_PACK_CACHE_DIR``
+    is still forwarded when the mirror cannot be written, as before.  With no
+    repository known (``repo is None``) the trusted source itself is forwarded:
+    the NO_REPO case.
+    """
+
+    source = trusted_tree_sitter_cache_root()
+    if repo is None:
+        return source  # NO_REPO: no repository is known
+    mirror_root = repo_mirror_root(repo)
+    if source is None:
+        # Forward only a real in-repo directory, never a link out of it.
+        try:
+            if _is_link(mirror_root) or not _parser_complete(mirror_root):
+                return None
+            resolved = mirror_root.resolve(strict=True)
+            if not resolved.is_relative_to(Path(repo).resolve(strict=True)):
+                return None  # a linked parent directory leads out of the repository
+        except OSError:
+            return None
+        return resolved
+    mirror = mirror_tree_sitter_cache(source, mirror_root)
+    if mirror is not None:
+        return mirror
+    explicit = os.environ.get(TREE_SITTER_CACHE_ROOT_ENV, "").strip()
+    try:
+        pinned = bool(explicit) and Path(explicit).resolve(strict=True) == source
+    except OSError:
+        pinned = False
+    return source if pinned else None

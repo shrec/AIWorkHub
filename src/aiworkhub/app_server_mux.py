@@ -155,6 +155,11 @@ try:
 except ImportError:  # direct-script Codex mux entrypoint
     import codex_manager_observation as observation
 
+try:
+    from . import runtime_temp as _runtime_temp
+except ImportError:  # direct-script Codex mux entrypoint
+    import runtime_temp as _runtime_temp  # type: ignore[no-redef]
+
 if __package__:
     from . import shared_router
 else:  # direct-file CLI compatibility; package launcher uses the branch above
@@ -170,7 +175,12 @@ def _default_sideband_dir() -> Path:
     try:
         home = Path.home()
     except RuntimeError:
-        # No resolvable home. Fall back under the temp dir, but scope the root
+        # NF-2026-02004: no resolvable home.  With a repository known the
+        # sideband lives in its git-ignored runtime root, never system temp.
+        repo = _runtime_temp.known_repository()
+        if repo is not None:
+            return _runtime_temp.repo_runtime_dir(repo, "app_server_mux")
+        # NO_REPO: fall back under the temp dir, but scope the root
         # by uid so a shared, world-writable /tmp cannot host one predictable
         # path a different local user could pre-create (as a symlink to
         # chmod-hijack, or as their own directory to deny this startup).

@@ -1054,6 +1054,8 @@ _DRIVE_LEASE_MAX_BYTES = 4096
 # Store entries one reconcile reads, and issues one store keeps.
 _DRIVE_LEASE_LIMIT = 256
 _DRIVE_LEASE_ISSUE_LIMIT = 32
+# NF-2026-02004: the store's leaf beside a repository's sandbox root.
+_DRIVE_LEASE_DIRECTORY = "sandbox-drive-leases"
 
 
 def _runtime_temp() -> Any:
@@ -1158,10 +1160,13 @@ class _SandboxDriveLeases:
     same session mutex, and reclaims those.  A malformed or foreign entry is
     never trusted: never popped, never deleted.
 
-    The definitions are per logon session, not per repo, so the store is per
-    user and host-local -- ``%LOCALAPPDATA%\\AIWorkHub\\sandbox-drive-leases``
-    -- and never inside a sandbox root, where the request directories a
-    container may write live.  Nothing here raises: a failure lands in
+    NF-2026-02004: with the repository known -- an existing sandbox root
+    ``<repo>\\.aiworkhub\\runtime\\worktrees`` -- the store is that repository's
+    ``.aiworkhub\\runtime\\sandbox-drive-leases`` (:meth:`place_for`): beside
+    the sandbox root, never inside it, where the request directories a
+    container may write live.  The per-user, host-local
+    ``%LOCALAPPDATA%\\AIWorkHub\\sandbox-drive-leases`` is the NO_REPO
+    fallback only.  Nothing here raises: a failure lands in
     :attr:`issues` (bounded) and the launch goes on, at worst with one push
     unleased.
     """
@@ -1171,12 +1176,45 @@ class _SandboxDriveLeases:
         self.issues: list[str] = []
         # This store's own leases per (drive, real_root), for release().
         self._mine: dict[tuple[str, str], list[Path]] = {}
+        # Only the default store follows the repository; an explicit one stays.
+        self._follows_repository = False
         if unavailable:
             self._note(unavailable)
 
+    @staticmethod
+    def repository_directory(real_root: str) -> Path | None:
+        """``<repo>\\.aiworkhub\\runtime\\sandbox-drive-leases`` for an existing
+        sandbox root ``real_root``, or None when it names no known repository."""
+        if not os.path.isabs(real_root) or not os.path.isdir(real_root):
+            return None
+        root = Path(real_root)
+        if tuple(part.lower() for part in root.parts[-3:]) != _SANDBOX_TAIL:
+            return None
+        runtime_temp = _runtime_temp()
+        try:
+            directory = runtime_temp.repo_runtime_dir(root.parents[2], _DRIVE_LEASE_DIRECTORY)
+        except (runtime_temp.RuntimeTempError, OSError):
+            return None  # nothing here raises
+        return None if _sandbox_root_of(str(directory)) else directory
+
+    def place_for(self, real_root: str) -> None:
+        """Lease ``real_root``'s pushes in its repository's own store."""
+        if not self._follows_repository:
+            return
+        directory = self.repository_directory(real_root)
+        if directory is not None:
+            self.directory = directory
+
     @classmethod
     def for_current_user(cls) -> _SandboxDriveLeases:
-        """The store under this user's LocalAppData, or one that leases nothing."""
+        """The default store: the repository's once :meth:`place_for` knows it,
+        else (NO_REPO) this user's LocalAppData, or one that leases nothing."""
+        store = cls._for_current_user()
+        store._follows_repository = True
+        return store
+
+    @classmethod
+    def _for_current_user(cls) -> _SandboxDriveLeases:
         try:
             local = resolve_local_appdata()
             if not local or not os.path.isabs(local):
@@ -3677,6 +3715,9 @@ class _CtypesWin32Api:
             )
         k = self._kernel32
         leases = self._sandbox_drive_leases
+        if leases is not None:
+            # NF-2026-02004: the repository's own store once real_root names it.
+            leases.place_for(real_root)
 
         def fail(error: int, what: str) -> _Win32Failure:
             return _Win32Failure(error, "sandbox_drive", f"sandbox_drive_unavailable: {what}")

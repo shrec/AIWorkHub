@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterator
 
-from . import repository_state
+from . import repository_state, runtime_temp
 
 try:  # pragma: no cover - platform branch
     import fcntl
@@ -50,11 +50,19 @@ class WorkspaceHygieneError(RuntimeError):
     pass
 
 
-def default_scratch_root() -> Path:
+def default_scratch_root(repo_root: Path | str | None = None) -> Path:
+    """Where build scratch pools live.
+
+    NF-2026-02004: with a repository known, ``<repo>/.aiworkhub/cache/
+    build-scratch`` -- git-ignored and outside the source tree the rogue-build
+    scan reports on.  The per-user cache below is the NO_REPO fallback only.
+    """
     configured = os.environ.get("AIWORKHUB_BUILD_SCRATCH_ROOT")
     if configured:
         return Path(configured).expanduser().resolve()
-    if os.name == "nt":
+    if repo_root is not None:
+        return runtime_temp.repo_cache_dir(Path(repo_root), "build-scratch")
+    if os.name == "nt":  # NO_REPO: no repository is known
         base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
         return Path(base) / "AIWorkHub" / "build-scratch"
     base = os.environ.get("XDG_CACHE_HOME")
@@ -70,8 +78,15 @@ def _repository_id(repo_root: Path) -> str:
 
 def repository_pool(repo_root: Path | str, *, scratch_root: Path | None = None) -> Path:
     root = Path(repo_root).resolve()
-    base = (scratch_root or default_scratch_root()).resolve()
-    if base == root or root in base.parents:
+    base = (scratch_root or default_scratch_root(root)).resolve()
+    # Only the repository's git-ignored ``.aiworkhub/cache`` (and below) is
+    # exempt; anywhere else in the repository, ``.aiworkhub/config`` included,
+    # is its source tree.
+    cache = root / runtime_temp.CACHE_RELATIVE_PATH
+    in_source_tree = base == root or (
+        root in base.parents and cache not in (base, *base.parents)
+    )
+    if in_source_tree:
         raise WorkspaceHygieneError("scratch_root_must_be_outside_repository")
     return base / _repository_id(root)
 

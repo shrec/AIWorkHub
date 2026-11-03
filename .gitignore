@@ -27,7 +27,9 @@ node_modules/
 # Shared development assets: roadmap, recipes, skills, dev rules, KB, memory.
 # Everything else under .aiworkhub is host runtime state, secrets, or a rebuildable
 # index and stays local (runtime/, sessions/, source_graph/, spill/, temp/,
-# worktrees/, toolchain-authority/, task_queue.sqlite, per-host routing).
+# cache/, worktrees/, toolchain-authority/, task_queue.sqlite, per-host routing).
+# NF-2026-02004: runtime/sandbox-drive-leases/, runtime/app_server_mux/,
+# cache/build-scratch/, temp/s/ and temp/mcp/ are covered by .aiworkhub/* above.
 !.aiworkhub/config/
 .aiworkhub/config/*
 !.aiworkhub/config/development_rules.json

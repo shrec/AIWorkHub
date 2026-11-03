@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
 import sys
@@ -173,6 +174,147 @@ def namespace_root(repo: Path, namespace: str) -> Path:
 
 def request_dir(repo: Path, request_id: str, namespace: str) -> Path:
     return namespace_root(repo, namespace) / _validate_request_id(request_id)
+
+
+# ── NF-2026-02004: nothing outside the repository once one is known ─────────
+# Every production path below resolves under ``<repo>/.aiworkhub`` -- runtime,
+# cache or temp -- whenever a repository is known.  A fallback outside it is
+# used only when no repository is known, and each one is spelled NO_REPO_* so
+# the guard test (tests/test_repo_contained_runtime_nf02004.py) can allow-list
+# exactly those.
+RUNTIME_RELATIVE_PATH = Path(".aiworkhub/runtime")
+CACHE_RELATIVE_PATH = Path(".aiworkhub/cache")
+# Short, owner-stamped directories (``<temp>/s/<8 hex>``) for callers whose
+# nested paths would otherwise outgrow a path limit.
+SHORT_NAMESPACE = "s"
+# git refuses a worktree whose ``$GIT_DIR`` path is too long.  Measured on the
+# Windows AppContainer validation lane: a 223-char path failed, 189 passed.
+GIT_DIR_PATH_LIMIT = 189
+PYTEST_BASETEMP_PREFIX = "b"
+_MAX_PYTEST_BASETEMPS = 64
+# The no-repository exec-scratch candidates (B753); with a repository known,
+# ``worker_workspace.provision_validation_exec_scratch`` never probes them.
+NO_REPO_EXEC_SCRATCH_ROOTS: tuple[Path, ...] = (
+    Path("/dev/shm"),
+    Path(tempfile.gettempdir()),
+)
+
+
+def known_repository(repo: Path | str | None = None) -> Path | None:
+    """The repository this process serves, or None when none is known.
+
+    An explicit ``repo`` wins; otherwise ``AIWORKHUB_REPO_ROOT`` /
+    ``AIWORKHUB_REPO`` or the working directory, each only when it carries
+    ``.aiworkhub/project.json``.  Never guesses beyond that.
+    """
+    if repo is not None:
+        return Path(repo).resolve()
+    env_repo = (
+        os.environ.get("AIWORKHUB_REPO_ROOT", "").strip()
+        or os.environ.get("AIWORKHUB_REPO", "").strip()
+    )
+    candidate = Path(env_repo).expanduser().resolve() if env_repo else Path.cwd().resolve()
+    if (candidate / ".aiworkhub" / "project.json").is_file():
+        return candidate
+    return None
+
+
+def _repo_owned_dir(repo: Path, relative: Path, parts: tuple[str, ...]) -> Path:
+    root = Path(repo).resolve()
+    base = root / relative
+    for link in (root / ".aiworkhub", base):
+        if link.is_symlink():
+            raise RuntimeTempError(f"runtime_temp_root_symlink_forbidden:{link}")
+    for part in parts:
+        if (
+            not part
+            or part in {".", ".."}
+            or any(sep in part for sep in ("/", "\\", ":"))
+        ):
+            raise RuntimeTempError(f"runtime_temp_component_invalid:{part!r}")
+    result = base.joinpath(*parts)
+    if os.path.commonpath([str(result), str(base)]) != str(base):
+        raise RuntimeTempError(f"runtime_temp_component_invalid:{result}")
+    return result
+
+
+def repo_runtime_dir(repo: Path, *parts: str) -> Path:
+    """``<repo>/.aiworkhub/runtime/<parts>``: host runtime state (leases, sideband)."""
+    return _repo_owned_dir(repo, RUNTIME_RELATIVE_PATH, parts)
+
+
+def repo_cache_dir(repo: Path, *parts: str) -> Path:
+    """``<repo>/.aiworkhub/cache/<parts>``: rebuildable caches (build scratch)."""
+    return _repo_owned_dir(repo, CACHE_RELATIVE_PATH, parts)
+
+
+def short_temp_dir(repo: Path, request_id: str | None = None) -> Path:
+    """Create one fresh, owner-stamped ``<temp>/s/<8 hex>`` directory.
+
+    Exclusive creation: two callers never share one.  The owner manifest lets
+    ``terminal_log_retention`` reclaim an orphan once its owner is gone
+    (:func:`identify_dead_owner_dirs`); the caller disposes it at its terminal
+    state with :func:`dispose_request_temp`.
+    """
+    parent = namespace_root(repo, SHORT_NAMESPACE)
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if parent.is_symlink() or not parent.resolve().is_dir():
+        raise RuntimeTempError(f"runtime_temp_short_root_invalid:{parent}")
+    for _attempt in range(8):
+        directory = parent.resolve() / secrets.token_hex(4)
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        write_owner_manifest(directory, request_id or directory.name, Path(repo))
+        return directory
+    raise RuntimeTempError(f"runtime_temp_short_dir_exhausted:{parent}")
+
+
+def pytest_basetemp_argv(argv: list[str], scratch: Path | None) -> list[str]:
+    """``argv`` plus its own short ``--basetemp`` beneath ``scratch``.
+
+    pytest's default basetemp adds ``pytest-of-<user>/pytest-<N>`` under the
+    temp dir; a union-named git worktree a test builds there then passes
+    :data:`GIT_DIR_PATH_LIMIT`.  Each command gets the first unused
+    ``<scratch>/b``, ``b1`` ...: never a shared basetemp, and the scratch's own
+    terminal cleanup removes it.  An argv that already names one, or no
+    scratch, is returned unchanged.  Set on argv, not ``PYTEST_ADDOPTS``, so a
+    nested pytest never inherits -- and wipes -- its parent's basetemp.
+    """
+    if scratch is None or any(
+        token == "--basetemp" or token.startswith("--basetemp=") for token in argv
+    ):
+        return list(argv)
+    for index in range(_MAX_PYTEST_BASETEMPS):
+        leaf = PYTEST_BASETEMP_PREFIX + (str(index) if index else "")
+        candidate = Path(scratch) / leaf
+        if not os.path.lexists(candidate):
+            option = f"--basetemp={candidate}"
+            if "--" in argv:
+                # Before the first "--": an option after it is a positional.
+                split = argv.index("--")
+                return [*argv[:split], option, *argv[split:]]
+            return [*argv, option]
+    return list(argv)
+
+
+def unhomed_child_temp(repo: Path | None) -> Path:
+    """TMPDIR for a child given no private HOME (``sanitized_env``'s bubblewrap
+    branch).  POSIX: the sandbox's own private ``/tmp``, never a host path.
+    Windows: the repository temp root when a repository is known; the system
+    temp only in the no-repository case."""
+    if os.name != "nt":
+        return Path("/tmp")
+    known = known_repository(repo)
+    if known is None:
+        return Path(tempfile.gettempdir())  # NO_REPO: no repository is known
+    root = temp_root(known)
+    try:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError:
+        pass
+    return root
 
 
 def _proc_stat_starttime(pid: int) -> int | None:

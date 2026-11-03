@@ -344,7 +344,7 @@ _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # Fails closed (raises WorkspaceError) if nothing usable is found -- never
 # chmods or remounts a shared filesystem to force it to work.
 VALIDATION_EXEC_SCRATCH_ROOT_ENV = "AIWORKHUB_VALIDATION_EXEC_SCRATCH_ROOT"
-_DEFAULT_EXEC_SCRATCH_ROOTS: tuple[Path, ...] = (Path("/dev/shm"), Path(tempfile.gettempdir()))
+_DEFAULT_EXEC_SCRATCH_ROOTS: tuple[Path, ...] = runtime_temp.NO_REPO_EXEC_SCRATCH_ROOTS
 SANDBOX_VALIDATION_EXEC_SCRATCH = "/validation-exec-scratch"
 _EXEC_SCRATCH_NAME_PREFIX = "aiworkhub_validation_exec_"
 _EXEC_PROBE_SCRIPT = b"#!/bin/sh\nexit 0\n"
@@ -3397,27 +3397,14 @@ def configured_runtime_root(repo: Path | None = None) -> Path:
     override = os.environ.get(RUNTIME_ROOT_ENV, "").strip()
     if override:
         return Path(override).expanduser().resolve()
-    selected_repo = Path(repo).resolve() if repo is not None else None
-    if selected_repo is None:
-        env_repo = (
-            os.environ.get("AIWORKHUB_REPO_ROOT", "").strip()
-            or os.environ.get("AIWORKHUB_REPO", "").strip()
-        )
-        if env_repo:
-            candidate = Path(env_repo).expanduser().resolve()
-            if (candidate / ".aiworkhub" / "project.json").is_file():
-                selected_repo = candidate
-        else:
-            candidate = Path.cwd().resolve()
-            if (candidate / ".aiworkhub" / "project.json").is_file():
-                selected_repo = candidate
+    selected_repo = runtime_temp.known_repository(repo)
     if selected_repo is not None:
         hub = selected_repo / ".aiworkhub"
         runtime = hub / "runtime"
         if hub.is_symlink() or runtime.is_symlink():
             raise WorkspaceError("repo_runtime_symlink_forbidden")
         return runtime.resolve(strict=False)
-    return (Path(tempfile.gettempdir()) / "aiworkhub-runtime").resolve()
+    return (Path(tempfile.gettempdir()) / "aiworkhub-runtime").resolve()  # no repository known
 
 
 FOREIGN_WORKTREE_ROOT_REFUSAL = "worktree_root_foreign_repository"
@@ -7074,7 +7061,7 @@ def sanitized_env(
         selected_home = Path(bubblewrap_home_env_value()).resolve()
         # Bubblewrap provides a private /tmp. Do not chmod or create anything
         # in the caller's real HOME while constructing the child environment.
-        temp_home = Path(tempfile.gettempdir()) if os.name == "nt" else Path("/tmp")
+        temp_home = runtime_temp.unhomed_child_temp(repo)  # NF-2026-02004
     common: dict[str, str] = {
         "HOME": str(selected_home),
         "LANG": os.environ.get("LANG", "C.UTF-8"),
@@ -7126,14 +7113,9 @@ def sanitized_env(
 
         safe.update(_ta.validation_user_base_env(adapter_id))  # NF-2026-01969: POSIX only
 
-        tree_sitter_cache_root = _tsc.trusted_tree_sitter_cache_root()
-        if tree_sitter_cache_root is not None and home is not None and repo is not None:
-            # NF-2026-01042: the AppContainer cannot open the C: profile cache;
-            # forward the host-owned repo mirror it reads via mirror_read_grants.
-            mirror = _tsc.mirror_tree_sitter_cache(
-                tree_sitter_cache_root, _tsc.repo_mirror_root(repo)
-            )
-            tree_sitter_cache_root = mirror or tree_sitter_cache_root
+        # NF-2026-01042/02004: with a repo the AppContainer reads the host-owned
+        # repo mirror (mirror_read_grants), never the C: profile cache.
+        tree_sitter_cache_root = _tsc.validation_cache_root(repo if home is not None else None)
         if tree_sitter_cache_root is not None:
             safe[_tsc.TREE_SITTER_CACHE_ROOT_ENV] = str(tree_sitter_cache_root)
     passthrough = {
@@ -7395,7 +7377,7 @@ def provision_validation_exec_scratch(
                 chmod_path(repo_temp_validation, 0o700)
             except OSError:
                 pass
-            candidate_roots.insert(0, repo_temp_validation)
+            candidate_roots = [repo_temp_validation]  # NF-2026-02004: no NO_REPO_* root
         except (
             WorkspaceError, runtime_temp.RuntimeTempError, _platform_io.ReparsePointRefused
         ) as exc:
@@ -13252,7 +13234,10 @@ def run_validations(
                 # byte-equivalent to before.
                 pytest_root = resolve_trusted_pytest_runtime_root()
                 effective_components = (str(pytest_root),) + pythonpath_components
-                tokens = _normalize_pytest_validation_argv(tokens)
+                tokens = runtime_temp.pytest_basetemp_argv(  # NF-2026-02004: short basetemp
+                    _normalize_pytest_validation_argv(tokens),
+                    scratch_dir if selected_backend == WINDOWS_APPCONTAINER_BACKEND else None,
+                )
             if _is_python_validation_command(tokens):
                 effective_components = _candidate_pythonpath_components(
                     workspace, effective_components
