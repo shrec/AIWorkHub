@@ -74,6 +74,18 @@ _PACKAGE_FILES = (
     "known_bug_scanner.py",
     "evidence_levels.py",
     "scoped_audit.py",
+    # quality_reviewer imports quality_review_scope (NF-2026-01994), which
+    # imports the canonical Source Graph and its module-level siblings.
+    "quality_review_scope.py",
+    "source_graph.py",
+    "source_graph_analytics.py",
+    "source_graph_ast.py",
+    "source_graph_insights.py",
+    "source_graph_languages.py",
+    "source_graph_lsp.py",
+    "parallelism.py",
+    "storage_registry.py",
+    "tool_guard_hook.py",
     # worker_ai_tools_mcp imports the shared platform and read-only SQLite
     # helpers; a synthetic layout that omits either cannot import the package
     # at all, which would make this fixture fail for a missing file rather
