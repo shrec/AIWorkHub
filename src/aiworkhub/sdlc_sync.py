@@ -41,6 +41,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -74,6 +75,10 @@ RELEASE_DIGEST = "confirmed_release_digest"
 RELEASE_PENDING = "pending_release_digest"
 RELEASE_RESUME = "release_resume_after"
 MAINTAIN_RESUME = "maintain_resume_after"
+# JSON {"last": <window's last event id>, "task_id": <last recorded task>} left by
+# a stages part the pass budget deferred; cleared when the cursor advances.
+STAGES_RESUME = "stages_resume_after"
+PASS_BUDGET_EXHAUSTED = "pass_budget_exhausted"
 _FIX_CARD_TASK_ID = re.compile(r"needfix-(NF-\d{4}-\d+)(?:-r\d+)?")
 
 
@@ -314,11 +319,35 @@ def _write_state(
         conn.close()
 
 
-def _read_window(root: Path, after: int) -> dict[str, Any]:
+def _read_stages_resume(path: Path) -> dict[str, Any]:
+    """The stages resume marker a deferred pass left: ``{"last", "task_id", "transient"}``, or {}.
+
+    An unreadable marker is no marker: the whole window replays, and an
+    unchanged card replays without a write.
+    """
+
+    raw = _read_release(path).get(STAGES_RESUME, "")
+    try:
+        marker = json.loads(raw) if raw else {}
+    except ValueError:
+        return {}
+    if (
+        not isinstance(marker, dict)
+        or not isinstance(marker.get("last"), int)
+        or isinstance(marker.get("last"), bool)
+        or not isinstance(marker.get("task_id"), str)
+    ):
+        return {}
+    return marker
+
+
+def _read_window(root: Path, after: int, through: int | None = None) -> dict[str, Any]:
     """Task events after ``after``, bounded by events and by distinct tasks.
 
     Reads only event ids, task ids, event names and each touched card; never a
-    payload. ``last`` is the id of the last event this window consumed.
+    payload. ``last`` is the id of the last event this window consumed. With
+    ``through``, events past it are not read, so a window a deferred pass left
+    half recorded is re-read as exactly that window.
     """
 
     readiness = task_store.storage_readiness(root)
@@ -328,8 +357,8 @@ def _read_window(root: Path, after: int) -> dict[str, Any]:
     try:
         rows = conn.execute(
             "SELECT event_id, task_id, event FROM task_events WHERE event_id > ? "
-            "ORDER BY event_id LIMIT ?",
-            (int(after), MAX_EVENTS_PER_PASS),
+            "AND event_id <= ? ORDER BY event_id LIMIT ?",
+            (int(after), int(through) if through is not None else 2**63 - 1, MAX_EVENTS_PER_PASS),
         ).fetchall()
         tasks: dict[str, dict[str, Any]] = {}
         last = int(after)
@@ -534,8 +563,24 @@ def _guarded(result: dict[str, Any], part: str, action: Callable[[], Any]) -> An
     return outcome
 
 
-def sync_once(repo_root: Path, repository_id: str) -> dict[str, Any]:
-    """Run one bounded pass; never raises, and writes nothing when nothing changed."""
+def sync_once(
+    repo_root: Path,
+    repository_id: str,
+    *,
+    on_stage: Callable[[str], None] | None = None,
+    deadline: float | None = None,
+) -> dict[str, Any]:
+    """Run one bounded pass; never raises, and writes nothing when nothing changed.
+
+    ``on_stage(part)`` is called before each part runs; an exception there is
+    swallowed. ``deadline`` is a ``time.monotonic()`` value: stages, release and
+    maintain check it between tasks, persist what they recorded and return
+    ``deferred`` / ``pass_budget_exhausted``; a deferred stages part leaves the
+    task-events cursor where it was and the next pass resumes the same window.
+    """
+
+    def _expired() -> bool:
+        return deadline is not None and time.monotonic() >= deadline
 
     root = Path(repo_root)
     state_path = root.joinpath(*STATE_DB_REL)
@@ -547,15 +592,23 @@ def sync_once(repo_root: Path, repository_id: str) -> dict[str, Any]:
         "refusals": {},
     }
     loaded = _guarded(
-        result, "cursor", lambda: {"summary": {"state": "read"}, "state": _read_state(state_path)}
+        result, "cursor", lambda: {
+            "summary": {"state": "read"},
+            "state": _read_state(state_path),
+            "resume": _read_stages_resume(state_path),
+        }
     )
     cursors: dict[str, int] = loaded["state"][0] if loaded else {}
     after = cursors.get(TASK_EVENTS_CURSOR, 0)
+    stages_resume: dict[str, Any] = loaded["resume"] if loaded else {}
+    if stages_resume and stages_resume["last"] <= after:
+        stages_resume = {}  # a stale marker from a window the cursor already passed
     window: dict[str, Any] = {"tasks": {}, "last": after}
     cases: dict[str, str] = {}
 
     def run_cases() -> dict[str, Any]:
-        window.update(_read_window(root, after))
+        # Bounded by the marker's last event, a resumed window is the same window.
+        window.update(_read_window(root, after, stages_resume.get("last")))
         if not window.get("ready", True):
             return {"summary": {"state": "skipped", "reason": window["reason"]}}
         created, refused, skipped = 0, {}, {}
@@ -586,16 +639,50 @@ def sync_once(repo_root: Path, repository_id: str) -> dict[str, Any]:
 
     def run_stages() -> dict[str, Any]:
         outcomes: dict[str, tuple[int, dict[str, str], dict[str, str]]] = {}
-        for task_id, case_id in cases.items():
+        # A window a deferred pass left half recorded is replayed from the task
+        # after the last one it recorded; an unknown marker task replays it all.
+        position = {task_id: index for index, task_id in enumerate(window["tasks"])}
+        skip_through = position.get(str(stages_resume.get("task_id", "")), -1)
+        # A deferred pass's transient Deploy refusals still withhold the release
+        # digest, though the resumed pass does not replay their tasks.
+        carried = stages_resume.get("transient")
+        window_transient.update(
+            task_id for task_id in (carried if isinstance(carried, list) else ())
+            if isinstance(task_id, str) and task_id in position
+        )
+        pending = [
+            (task_id, case_id) for task_id, case_id in cases.items()
+            if position[task_id] > skip_through
+        ]
+        last_recorded = ""
+        for task_id, case_id in pending:
+            # The pass budget is checked between tasks, never inside one.
+            if outcomes and _expired():
+                break
             states, reasons = _record_stages(
                 root, repository_id, case_id, task_id, window["tasks"][task_id]["card"]
             )
             outcomes[task_id] = (window["last"], states, reasons)
+            last_recorded = task_id
             if _transient(reasons.get("deploy")):
                 window_transient.add(task_id)
-        if outcomes:
+        remaining = len(pending) - len(outcomes)
+        if remaining:
+            # Persist what was recorded and where to resume; the task-events
+            # cursor stays put, so the next pass re-reads this same window.
+            marker = json.dumps({
+                "last": int(window["last"]), "task_id": last_recorded,
+                "transient": sorted(window_transient),
+            }, sort_keys=True)
+            _write_state(state_path, task_states=outcomes, release={STAGES_RESUME: marker})
+        elif outcomes:
             _write_state(state_path, task_states=outcomes)
         ready = sum(states.get(stage) == "ready" for _, states, _ in outcomes.values() for stage in SYNC_STAGES)
+        if remaining:
+            return {"summary": {
+                "state": "deferred", "reason": PASS_BUDGET_EXHAUSTED, "remaining": remaining,
+                "tasks": len(outcomes), "ready": ready,
+            }}
         return {"summary": {"state": "ok", "tasks": len(outcomes), "ready": ready}}
 
     def run_attribution() -> dict[str, Any]:
@@ -686,7 +773,12 @@ def sync_once(repo_root: Path, repository_id: str) -> dict[str, Any]:
         # A transient Deploy refusal anywhere in this pass -- the window's tasks
         # included -- withholds the digest, so that task is retried next pass.
         transient = False
+        done = 0
         for task_id, event_id, _, _ in retry:
+            # The pass budget is checked between tasks, never inside one.
+            if done and _expired():
+                break
+            done += 1
             card = cards.get(task_id)
             accepted = _instant((card or {}).get("accepted_at"))
             if card is None or cutoff is None or accepted is None or accepted >= cutoff:
@@ -696,6 +788,7 @@ def sync_once(repo_root: Path, repository_id: str) -> dict[str, Any]:
             outcomes[task_id] = (event_id, states, reasons)
             touched.add(task_id)
             transient = transient or _transient(reasons.get("deploy"))
+        remaining = len(retry) - done
         if window_retry or transient:
             # The digest is unrecorded -- even one recorded before. A window
             # task may sort before ``resume``, so it restarts from the first
@@ -704,13 +797,20 @@ def sync_once(repo_root: Path, repository_id: str) -> dict[str, Any]:
                 RELEASE_DIGEST: "", RELEASE_PENDING: digest,
                 RELEASE_RESUME: "" if window_retry else resume,
             }
+        elif remaining:
+            # Out of budget: keep draining after the last processed task; a
+            # deferred pass never records the digest as done.
+            state, cursor = "deferred", {RELEASE_PENDING: digest, RELEASE_RESUME: retry[done - 1][0]}
         elif drained:
             state, cursor = "ran", {RELEASE_DIGEST: digest, RELEASE_PENDING: "", RELEASE_RESUME: ""}
         else:
             state, cursor = "draining", {RELEASE_PENDING: digest, RELEASE_RESUME: batch[-1][0]}
         _write_state(state_path, task_states=outcomes, release=cursor)
         deployed = sum(states.get("deploy") == "ready" for _, states, _ in outcomes.values())
-        return {"summary": {"state": state, "retried": len(outcomes), "deployed": deployed}}
+        summary: dict[str, Any] = {"state": state, "retried": len(outcomes), "deployed": deployed}
+        if remaining:
+            summary.update(reason=PASS_BUDGET_EXHAUSTED, remaining=remaining)
+        return {"summary": summary}
 
     def run_maintain() -> dict[str, Any]:
         # Maintain alone, every pass: a cleared band breach or a closed NeedFix
@@ -728,7 +828,12 @@ def sync_once(repo_root: Path, repository_id: str) -> dict[str, Any]:
         if cards is None:
             return {"summary": {"state": "deferred", "reason": "task_store_not_ready"}}
         outcomes: dict[str, tuple[int, dict[str, str], dict[str, str]]] = {}
+        done = 0
         for task_id, event_id, states, reasons in retry:
+            # The pass budget is checked between tasks, never inside one.
+            if done and _expired():
+                break
+            done += 1
             card = cards.get(task_id)
             if card is None:
                 continue
@@ -740,23 +845,50 @@ def sync_once(repo_root: Path, repository_id: str) -> dict[str, Any]:
                 {**states, "maintain": "unknown" if reason else "ready"},
                 {**kept, "maintain": reason} if reason else kept,
             )
-        _write_state(state_path, task_states=outcomes, release={MAINTAIN_RESUME: rows[-1][0]})
+        remaining = len(retry) - done
+        # Out of budget, the rotation resumes after the last task this pass processed.
+        resume_after = retry[done - 1][0] if remaining else rows[-1][0]
+        _write_state(state_path, task_states=outcomes, release={MAINTAIN_RESUME: resume_after})
         maintained = sum(states["maintain"] == "ready" for _, states, _ in outcomes.values())
+        if remaining:
+            return {"summary": {
+                "state": "deferred", "reason": PASS_BUDGET_EXHAUSTED, "remaining": remaining,
+                "retried": len(outcomes), "maintained": maintained,
+            }}
         return {"summary": {"state": "ran", "retried": len(outcomes), "maintained": maintained}}
 
-    cases_ok = _guarded(result, "cases", run_cases) is not None
+    def run_part(part: str, action: Callable[[], Any], *, budgeted: bool = False) -> Any:
+        if on_stage is not None:
+            try:
+                on_stage(part)
+            except Exception:  # noqa: BLE001 -- observability must never fail a pass
+                pass
+        if budgeted and _expired():
+            # Not started once the budget is spent; the next pass picks it up.
+            return _guarded(result, part, lambda: {
+                "summary": {"state": "deferred", "reason": PASS_BUDGET_EXHAUSTED},
+            })
+        return _guarded(result, part, action)
+
+    cases_ok = run_part("cases", run_cases) is not None
     # Every Maintain check this pass shares one control-band evaluation.
     with sdlc_deploy_proof.band_report_per_pass():
-        stages_ok = _guarded(result, "stages", run_stages) is not None
-        _guarded(result, "release", run_release)
-        _guarded(result, "maintain", run_maintain)
-    _guarded(result, "attribution", run_attribution)
-    _guarded(result, "bands", run_bands)
-    if cases_ok and stages_ok and window["last"] > after:
-        # Only a fully recorded window advances the cursor; a failed one is
-        # re-read next pass, where unchanged cards replay without a write.
+        staged = run_part("stages", run_stages, budgeted=True)
+        run_part("release", run_release, budgeted=True)
+        run_part("maintain", run_maintain, budgeted=True)
+    run_part("attribution", run_attribution)
+    run_part("bands", run_bands)
+    stages_done = staged is not None and staged["summary"].get("state") != "deferred"
+    if cases_ok and stages_done and window["last"] > after:
+        # Only a fully recorded window advances the cursor; a failed or deferred
+        # one is re-read next pass, where unchanged cards replay without a write.
+        # The stages resume marker is cleared in the same write.
         _guarded(result, "cursor", lambda: (
-            _write_state(state_path, cursors={TASK_EVENTS_CURSOR: window["last"]})
+            _write_state(
+                state_path,
+                cursors={TASK_EVENTS_CURSOR: window["last"]},
+                release={STAGES_RESUME: ""} if stages_resume else None,
+            )
             or {"summary": {"state": "advanced", "from": after, "to": window["last"]}}
         ))
     reported = _guarded(

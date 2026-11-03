@@ -28,6 +28,7 @@ ALL_PHASES = [
     "wave_goal_bindings",
     "wave_completion",
     "transient_retry_relaunch",
+    "operational_retry_relaunch",
     "orphan_claim_release",
     "sdlc_sync",
 ]
@@ -56,6 +57,9 @@ def _patch_phases(monkeypatch, on_call=None):
     monkeypatch.setattr(tr, "_scan_wave_goal_bindings", _wrap("wave_goal_bindings", {}))
     monkeypatch.setattr(tr, "_scan_wave_completion", _wrap("wave_completion", {}))
     monkeypatch.setattr(tr, "_scan_transient_retry_relaunch", _wrap("transient_retry_relaunch", {}))
+    monkeypatch.setattr(
+        tr, "_scan_operational_retry_relaunch", _wrap("operational_retry_relaunch", {})
+    )
     monkeypatch.setattr(tr, "_scan_orphan_claims", _wrap("orphan_claim_release", {}))
     monkeypatch.setattr(
         tr.repository_state,

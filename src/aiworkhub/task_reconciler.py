@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import inspect
 import json
 import os
 import signal
@@ -79,6 +80,11 @@ from .platform_io import (
 
 DEFAULT_SCAN_INTERVAL_SECONDS = 30.0
 MIN_SCAN_INTERVAL_SECONDS = 5.0
+# Ceiling on one sdlc_sync pass, the scan's last phase (NF-2026-02019). Measured
+# 2026-11-03: a 4250 s pass stalled every later scan's retries, orphan-claim
+# release and review recovery. 120 s bounds that stall; the pass defers between
+# tasks and the next scan resumes it, so nothing recorded is lost.
+SDLC_SYNC_PASS_BUDGET_S = 120.0
 MAX_SCAN_INTERVAL_SECONDS = 3600.0
 SCAN_INTERVAL_ENV = "AIWORKHUB_RECONCILER_SCAN_INTERVAL_SECONDS"
 # Repository-local, non-durable runtime tree (never the historical
@@ -593,7 +599,29 @@ def run_scan(
             repo_root = Path(mgr.repo).resolve()
             # The same repository identity the SDLC case store binds every case to.
             repository_id = repository_state.inspect_repository(repo_root).manifest.repo_id
-            sdlc = sdlc_sync.sync_once(repo_root, repository_id)
+            def _on_stage(part: str) -> None:
+                # Names the running sub-stage, so scan_phase_age_s restarts per
+                # sub-stage; phase_durations_ms keeps the single sdlc_sync total.
+                if on_phase is not None:
+                    try:
+                        on_phase(f"sdlc_sync:{part}")
+                    except Exception:  # noqa: BLE001 -- observability must never fail a scan
+                        pass
+
+            sync_kwargs: dict[str, Any] = {
+                "on_stage": _on_stage,
+                "deadline": time.monotonic() + SDLC_SYNC_PASS_BUDGET_S,
+            }
+            # The canonical sync_once takes both; only a substituted callable
+            # without them (a test seam) is called with what it declares.
+            try:
+                params = inspect.signature(sdlc_sync.sync_once).parameters
+            except (TypeError, ValueError):
+                params = {}  # type: ignore[assignment]
+            open_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+            sdlc = sdlc_sync.sync_once(repo_root, repository_id, **{
+                name: value for name, value in sync_kwargs.items() if open_kwargs or name in params
+            })
         except Exception as exc:  # noqa: BLE001 -- a scan must never fail on SDLC sync
             sdlc = {"state": "skipped", "reason": f"{type(exc).__name__}"[:80]}
     return {
