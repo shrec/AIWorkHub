@@ -106,7 +106,11 @@ def test_plain_js_keeps_node_check(tmp_path):
     (tmp_path / "package.json").write_text(
         json.dumps({"dependencies": {"express": "^4"}}), encoding="utf-8"
     )
-    check = _syntax(tmp_path, _write(tmp_path, "server.js", VALID_JSX))
+    # CommonJS JSX on purpose: ``import`` first makes Node 20/22 retry the file as
+    # ESM, and ``--check`` then exits 0 without parsing it, so the verdict would
+    # depend on the runner's Node version.
+    plain_jsx = "const Comp = ({ a }) => <span>{a}</span>;\nmodule.exports = Comp;\n"
+    check = _syntax(tmp_path, _write(tmp_path, "server.js", plain_jsx))
     assert check.command == ("node", "--check", "server.js")
     assert check.status != quality_evidence.STATUS_PASSED
     if shutil.which("node"):
