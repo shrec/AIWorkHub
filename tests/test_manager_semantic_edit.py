@@ -71,10 +71,14 @@ def test_a_relocated_target_replaces_the_lines_its_anchors_name(tmp_path):
 
 
 def test_a_file_that_moved_underneath_the_edit_is_refused(tmp_path):
-    """Prepared, then the file changes: the write must not land."""
+    """Prepared, then the prepared lines change: the write must not land.
+
+    The fixture changes the fragment itself, byte-exact on every OS: a change
+    that only shifts the fragment is relocated and applied (NF-2026-01976), and
+    a universal-newline rewrite passed here on Windows only as CRLF noise."""
     root = _repo(tmp_path)
     target = _prepare(root, 2, 3)
-    (root / "x.py").write_text("one\ntwo\nthree\nfour\nfive\nsix\n", encoding="utf-8")
+    (root / "x.py").write_text("one\ntwo-changed\nthree\nfour\nfive\nsix\n", encoding="utf-8", newline="")
 
     with pytest.raises(semantic_edit.SemanticEditError, match="semantic_edit_stale"):
         semantic_edit_applier.replace_prepared_range(
@@ -367,7 +371,8 @@ def test_apply_is_refused_when_the_file_moved_between_prepare_and_apply(
     prepared = manager_ai_tools.semantic_edit_prepare(
         file_path="x.py", start_line=2, end_line=3,
     )
-    (root / "x.py").write_text("one\ntwo\nthree\nfour\nfive\nsix\n", encoding="utf-8")
+    # Change the prepared lines themselves: a pure shift is relocated (NF-2026-01976).
+    (root / "x.py").write_text("one\ntwo-changed\nthree\nfour\nfive\nsix\n", encoding="utf-8", newline="")
 
     applied = manager_ai_tools.semantic_edit_apply(
         target_id=prepared["target_id"], new="TWO\n",
