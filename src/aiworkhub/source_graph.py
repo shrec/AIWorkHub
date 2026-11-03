@@ -3350,14 +3350,12 @@ def _python_import_suffix_files(modules: list[str], suffix: str) -> list[str]:
     return hits
 
 
-def _python_import_destination(
-    importer: str,
-    target: str,
-    modules: list[str],
-    module_qualnames: dict[str, str],
-    symbols: dict[tuple[str, str], list[str]],
-) -> str | None:
-    """The one module or symbol a dotted or relative Python import names."""
+def _python_import_dotted(importer: str, target: str) -> str | None:
+    """The absolute dotted name a Python import names, or None when it has none.
+
+    The single normalizer behind ``_python_import_destination`` and the
+    incremental scope keys, so both always agree on what an import names.
+    """
 
     raw = target.strip()
     if not raw:
@@ -3370,11 +3368,102 @@ def _python_import_destination(
         if keep < 0:
             return None
         base = "/".join(parts[:keep]).replace("/", ".")
-        dotted = f"{base}.{body}" if body and base else body or base
-    else:
-        if "." not in raw:
-            return None
-        dotted = raw
+        return f"{base}.{body}" if body and base else body or base
+    if "." not in raw:
+        return None
+    return raw
+
+
+def _python_import_scope_hit(importer: str, target: str, module_names: set[str]) -> bool:
+    """Whether a changed module (``_python_module_dotted_names``) can move this import.
+
+    ``_python_import_destination`` consults only the module files whose path
+    ends at the dotted name or at its parent, plus that parent's symbols. If
+    neither is a dotted suffix of a changed, added or deleted file, the
+    candidate set -- and so the binding -- is unchanged.
+    """
+
+    dotted = _python_import_dotted(importer, target)
+    if not dotted or not module_names:
+        return False
+    folded = dotted.casefold()
+    if folded in module_names:
+        return True
+    return "." in folded and folded.rsplit(".", 1)[0] in module_names
+
+
+def _python_module_dotted_names(paths: set[str]) -> set[str]:
+    """Every casefolded dotted suffix by which an import may name one of ``paths``.
+
+    Mirrors ``_python_import_suffix_files``: a suffix matches at a ``/``
+    boundary of the stem, with or without a trailing ``/__init__``.
+    """
+
+    names: set[str] = set()
+    for path in paths:
+        stem = str(path).replace("\\", "/").casefold()
+        if stem.endswith(".py"):
+            stem = stem[:-3]
+        stems = [stem]
+        if stem.endswith("/__init__"):
+            stems.append(stem[: -len("/__init__")])
+        for candidate in stems:
+            parts = candidate.split("/")
+            names.update(".".join(parts[index:]) for index in range(len(parts)))
+    return names
+
+
+@dataclass(frozen=True)
+class _ResolverScope:
+    """Per-language incremental scope for the import/annotation/JS resolvers."""
+
+    python_files: set[str]
+    python_names: set[str]
+    python_modules: set[str]
+    js_files: set[str]
+    js_names: set[str]
+
+
+def _resolver_scope(
+    changed_paths: set[str], identities: set[tuple[str, str, str, str]],
+) -> _ResolverScope:
+    """Split one build's changed paths and lexical identity delta by language.
+
+    ``identities`` is the symmetric difference of (file, name, qualname, kind)
+    for every ``_LEXICAL_TARGET_KINDS`` entity of the changed files before
+    and after re-extraction -- functions, methods and classes alike -- so a
+    renamed/removed class is an affected name, not only a function.
+    """
+
+    languages = {
+        path: sglanguages.language_for_path(Path(path)) for path in changed_paths
+    }
+    python_files = {path for path, lang in languages.items() if lang == "python"}
+    js_files = {
+        path for path, lang in languages.items()
+        if lang in ("javascript", "typescript")
+    }
+    return _ResolverScope(
+        python_files=python_files,
+        python_names={name for path, name, _, _ in identities if path in python_files},
+        python_modules=_python_module_dotted_names(python_files),
+        js_files=js_files,
+        js_names={name for path, name, _, _ in identities if path in js_files},
+    )
+
+
+def _python_import_destination(
+    importer: str,
+    target: str,
+    modules: list[str],
+    module_qualnames: dict[str, str],
+    symbols: dict[tuple[str, str], list[str]],
+) -> str | None:
+    """The one module or symbol a dotted or relative Python import names."""
+
+    dotted = _python_import_dotted(importer, target)
+    if not dotted:
+        return None
     hits = _python_import_suffix_files(modules, dotted.replace(".", "/"))
     if len(hits) == 1:
         return module_qualnames.get(hits[0])
@@ -3390,26 +3479,85 @@ def _python_import_destination(
     return None
 
 
-def _resolve_python_import_edges(conn: sqlite3.Connection) -> int:
+def _reset_resolved_edges(
+    conn: sqlite3.Connection, edge_ids: list[int], evidence_label: str | None,
+) -> None:
+    """Return in-scope edges to their extracted, unresolved state.
+
+    Used only by an incremental resolver pass on edges a changed file may
+    have moved; ``evidence_label`` restores the label the extractor emitted
+    when the resolver overwrites it on bind, or ``None`` to leave it alone.
+    """
+
+    if not edge_ids:
+        return
+    if evidence_label is None:
+        conn.execute(
+            "UPDATE edges SET dst_qualname=NULL "
+            "WHERE id IN (SELECT value FROM json_each(?))",
+            (json.dumps(edge_ids),),
+        )
+        return
+    conn.execute(
+        "UPDATE edges SET dst_qualname=NULL, evidence_label=? "
+        "WHERE id IN (SELECT value FROM json_each(?))",
+        (evidence_label, json.dumps(edge_ids)),
+    )
+
+
+def _resolve_python_import_edges(
+    conn: sqlite3.Connection,
+    *,
+    changed_files: set[str] | None = None,
+    affected_names: set[str] | None = None,
+) -> int:
     """Bind a Python import whose dotted path names one indexed module.
 
     Bare names such as ``import os`` and ``import ast`` stay unbound. A stem
     collision is not a module identity. A relative import is resolved from the
     importing file. This pass does not read source files.
+
+    ``changed_files=None`` re-resolves every unbound import (full recompute).
+    Otherwise only imports owned by a changed file, or whose dotted name or
+    parent is in ``affected_names`` (``_python_module_dotted_names`` of the
+    changed, added and deleted files), are reset and re-resolved: no other
+    import's candidate modules or symbols moved. Both empty: no UPDATE.
     """
 
-    conn.execute(
-        "UPDATE edges SET dst_qualname=NULL "
-        "WHERE kind='imports' AND dst_qualname IS NOT NULL "
-        "AND file_path IN (SELECT file_path FROM files WHERE language='python') "
-        "AND NOT EXISTS (SELECT 1 FROM entities en WHERE en.qualname=edges.dst_qualname)"
-    )
-    rows = conn.execute(
-        "SELECT e.id, e.file_path, e.dst_name FROM edges e "
-        "JOIN files f ON f.file_path=e.file_path "
-        "WHERE e.kind='imports' AND f.language='python' AND e.dst_qualname IS NULL "
-        "ORDER BY e.id"
-    ).fetchall()
+    if changed_files is not None:
+        if not changed_files and not affected_names:
+            return 0
+        module_names = set(affected_names or ())
+        rows = [
+            row for row in conn.execute(
+                "SELECT e.id, e.file_path, e.dst_name, e.dst_qualname, "
+                "e.evidence_label FROM edges e "
+                "JOIN files f ON f.file_path=e.file_path "
+                "WHERE e.kind='imports' AND f.language='python' ORDER BY e.id"
+            )
+            if str(row["file_path"]) in changed_files
+            or _python_import_scope_hit(
+                str(row["file_path"]), str(row["dst_name"] or ""), module_names,
+            )
+        ]
+        _reset_resolved_edges(
+            conn,
+            [int(row["id"]) for row in rows if row["dst_qualname"] is not None],
+            sgast.EXTRACTED,
+        )
+    else:
+        conn.execute(
+            "UPDATE edges SET dst_qualname=NULL "
+            "WHERE kind='imports' AND dst_qualname IS NOT NULL "
+            "AND file_path IN (SELECT file_path FROM files WHERE language='python') "
+            "AND NOT EXISTS (SELECT 1 FROM entities en WHERE en.qualname=edges.dst_qualname)"
+        )
+        rows = conn.execute(
+            "SELECT e.id, e.file_path, e.dst_name FROM edges e "
+            "JOIN files f ON f.file_path=e.file_path "
+            "WHERE e.kind='imports' AND f.language='python' AND e.dst_qualname IS NULL "
+            "ORDER BY e.id"
+        ).fetchall()
     if not rows:
         return 0
     modules = [
@@ -3452,20 +3600,64 @@ def _resolve_python_import_edges(conn: sqlite3.Connection) -> int:
     return resolved
 
 
-def _resolve_python_annotation_edges(conn: sqlite3.Connection) -> int:
+def _resolve_python_annotation_edges(
+    conn: sqlite3.Connection,
+    *,
+    changed_files: set[str] | None = None,
+    affected_names: set[str] | None = None,
+) -> int:
     """Bind an annotation to one same-file type or one imported symbol.
 
     A local class or function shadows an import. ``Path`` stays unbound when
     this file neither defines it nor imports it from one indexed module.
     Repo-wide uniqueness is not evidence, and this pass does not read files.
+
+    ``changed_files=None`` re-resolves every unbound annotation (full
+    recompute). Otherwise ``affected_names`` holds the class/function names a
+    changed Python file added or removed plus the changed modules' dotted
+    names; only annotations owned by a changed file, naming an affected name,
+    or naming a local import whose destination module is affected are reset
+    and re-resolved. A same-file binding of an unchanged file cannot move.
+    Both sets empty: no UPDATE.
     """
 
-    rows = conn.execute(
-        "SELECT e.id, e.file_path, e.dst_name FROM edges e "
-        "JOIN files f ON f.file_path=e.file_path "
-        "WHERE e.kind='annotates' AND f.language='python' AND e.dst_qualname IS NULL "
-        "ORDER BY e.id"
-    ).fetchall()
+    if changed_files is not None:
+        if not changed_files and not affected_names:
+            return 0
+        scope_names = set(affected_names or ())
+        if affected_names:
+            scope_names.update(
+                str(row["name"])
+                for row in conn.execute(
+                    "SELECT file_path, name, signature FROM entities WHERE kind='import'"
+                )
+                if _python_import_scope_hit(
+                    str(row["file_path"]), str(row["signature"] or ""), affected_names,
+                )
+            )
+        scope_args = (
+            json.dumps(sorted(changed_files)), json.dumps(sorted(scope_names)),
+        )
+        rows = conn.execute(
+            "SELECT e.id, e.file_path, e.dst_name, e.dst_qualname FROM edges e "
+            "JOIN files f ON f.file_path=e.file_path "
+            "WHERE e.kind='annotates' AND f.language='python' "
+            "AND (e.file_path IN (SELECT value FROM json_each(?)) "
+            "OR e.dst_name IN (SELECT value FROM json_each(?))) ORDER BY e.id",
+            scope_args,
+        ).fetchall()
+        _reset_resolved_edges(
+            conn,
+            [int(row["id"]) for row in rows if row["dst_qualname"] is not None],
+            sgast.EXTRACTED,
+        )
+    else:
+        rows = conn.execute(
+            "SELECT e.id, e.file_path, e.dst_name FROM edges e "
+            "JOIN files f ON f.file_path=e.file_path "
+            "WHERE e.kind='annotates' AND f.language='python' AND e.dst_qualname IS NULL "
+            "ORDER BY e.id"
+        ).fetchall()
     if not rows:
         return 0
     local: dict[tuple[str, str], list[str]] = {}
@@ -3535,7 +3727,12 @@ def _resolve_python_annotation_edges(conn: sqlite3.Connection) -> int:
     return resolved
 
 
-def _resolve_javascript_import_bindings(conn: sqlite3.Connection) -> int:
+def _resolve_javascript_import_bindings(
+    conn: sqlite3.Connection,
+    *,
+    changed_files: set[str] | None = None,
+    affected_names: set[str] | None = None,
+) -> int:
     """Bind each JS/TS ``imports`` edge to the one indexed module it names.
 
     Both the tree-sitter and lexical-fallback JS/TS extractors record the
@@ -3549,15 +3746,52 @@ def _resolve_javascript_import_bindings(conn: sqlite3.Connection) -> int:
     one file" apart from "resolution was never attempted". Zero candidates
     (an npm package, an unindexed extension, a path outside the repository)
     are left untouched.
+
+    ``changed_files=None`` re-resolves every unbound import (full recompute).
+    Otherwise ``changed_files`` are the changed/added/deleted JS/TS files:
+    only imports owned by one, whose specifier matches one of them (the only
+    way the candidate module set moves), or whose specifier is in
+    ``affected_names`` are reset and re-resolved. Both empty: no UPDATE.
     """
 
-    unresolved = conn.execute(
-        "SELECT e.id, e.dst_name FROM edges e "
-        "JOIN files f ON f.file_path=e.file_path "
-        "WHERE e.kind='imports' AND e.dst_qualname IS NULL "
-        "AND f.language IN ('javascript', 'typescript') "
-        "ORDER BY e.id"
-    ).fetchall()
+    if changed_files is not None:
+        if not changed_files and not affected_names:
+            return 0
+        names = set(affected_names or ())
+        changed = sorted(changed_files)
+        matches: dict[str, bool] = {}
+        unresolved = []
+        for row in conn.execute(
+            "SELECT e.id, e.file_path, e.dst_name, e.dst_qualname, "
+            "e.evidence_label FROM edges e "
+            "JOIN files f ON f.file_path=e.file_path "
+            "WHERE e.kind='imports' AND f.language IN ('javascript', 'typescript') "
+            "ORDER BY e.id"
+        ):
+            target = str(row["dst_name"])
+            if target not in matches:
+                matches[target] = target in names or any(
+                    _import_target_matches_file(target, path) for path in changed
+                )
+            if matches[target] or str(row["file_path"]) in changed_files:
+                unresolved.append(row)
+        _reset_resolved_edges(
+            conn,
+            [
+                int(row["id"]) for row in unresolved
+                if row["dst_qualname"] is not None
+                or row["evidence_label"] == sgast.AMBIGUOUS
+            ],
+            sgast.EXTRACTED,
+        )
+    else:
+        unresolved = conn.execute(
+            "SELECT e.id, e.dst_name FROM edges e "
+            "JOIN files f ON f.file_path=e.file_path "
+            "WHERE e.kind='imports' AND e.dst_qualname IS NULL "
+            "AND f.language IN ('javascript', 'typescript') "
+            "ORDER BY e.id"
+        ).fetchall()
     if not unresolved:
         return 0
     modules = [
@@ -3615,8 +3849,26 @@ def _javascript_bare_call(line: str, name: str, column: int = -1) -> bool:
     return bare.search(line) is not None
 
 
+def _javascript_call_scope_sql(
+    changed_files: set[str] | None, affected_names: set[str] | None,
+) -> tuple[str, tuple[str, ...]]:
+    """The incremental ``AND (...)`` filter and its args for the JS call passes."""
+
+    if changed_files is None:
+        return "", ()
+    return (
+        "AND (e.file_path IN (SELECT value FROM json_each(?)) "
+        "OR e.dst_name IN (SELECT value FROM json_each(?))) ",
+        (json.dumps(sorted(changed_files)), json.dumps(sorted(affected_names or ()))),
+    )
+
+
 def _resolve_javascript_same_file_calls(
-    conn: sqlite3.Connection, repo_root: Path,
+    conn: sqlite3.Connection,
+    repo_root: Path,
+    *,
+    changed_files: set[str] | None = None,
+    affected_names: set[str] | None = None,
 ) -> int:
     """Bind a bare JS/TS call to the one function defined in that same file.
 
@@ -3624,8 +3876,16 @@ def _resolve_javascript_same_file_calls(
     several files, and ``document.createElement`` must not bind to a local
     helper. The source column must be a bare ``name(`` call, and the file must
     contain exactly one ``function`` entity with that name.
+
+    ``changed_files=None`` retries every unbound call (full recompute). A
+    same-file binding depends only on its own file, so otherwise only calls
+    owned by a changed JS/TS file, or naming an ``affected_names`` entry, are
+    retried. Both empty: no statement at all.
     """
 
+    if changed_files is not None and not changed_files and not affected_names:
+        return 0
+    scope_sql, scope_args = _javascript_call_scope_sql(changed_files, affected_names)
     rows = conn.execute(
         "SELECT e.id, e.file_path, e.line, e.dst_name, e.source_col FROM edges e "
         "JOIN files f ON f.file_path=e.file_path "
@@ -3633,8 +3893,8 @@ def _resolve_javascript_same_file_calls(
         "AND e.evidence_label=? "
         "AND (e.receiver_name IS NULL OR e.receiver_name='') "
         "AND f.language IN ('javascript', 'typescript') "
-        "ORDER BY e.file_path, e.id",
-        (sgast.EXTRACTED,),
+        f"{scope_sql}ORDER BY e.file_path, e.id",
+        (sgast.EXTRACTED, *scope_args),
     ).fetchall()
     if not rows:
         return 0
@@ -3678,22 +3938,51 @@ def _resolve_javascript_same_file_calls(
 
 
 def _resolve_javascript_imported_calls(
-    conn: sqlite3.Connection, repo_root: Path,
+    conn: sqlite3.Connection,
+    repo_root: Path,
+    *,
+    changed_files: set[str] | None = None,
+    affected_names: set[str] | None = None,
 ) -> int:
     """Bind a bare JS/TS call to the one imported file that defines that name.
 
     Repository-wide uniqueness is not evidence. An import specifier that
     matches exactly one indexed file defining the callee is. A member call
     such as ``document.helper`` stays unbound even when that import exists.
+
+    ``changed_files=None`` retries every unbound call (full recompute).
+    Otherwise ``affected_names`` are the function/class names a changed JS/TS
+    file added, removed or moved: the only way an unchanged file's candidate
+    set changes. A cross-file binding naming one is reset first (a same-file
+    binding of an unchanged file cannot move), then only calls owned by a
+    changed file or naming an affected name are retried. Both empty: no
+    UPDATE.
     """
 
+    if changed_files is not None:
+        if not changed_files and not affected_names:
+            return 0
+        if affected_names:
+            conn.execute(
+                "UPDATE edges SET dst_qualname=NULL WHERE id IN ("
+                "SELECT e.id FROM edges e JOIN files f ON f.file_path=e.file_path "
+                "WHERE e.kind='calls' AND e.dst_qualname IS NOT NULL "
+                "AND (e.receiver_name IS NULL OR e.receiver_name='') "
+                "AND f.language IN ('javascript', 'typescript') AND e.extractor<>? "
+                "AND e.dst_name IN (SELECT value FROM json_each(?)) "
+                "AND NOT EXISTS (SELECT 1 FROM entities en "
+                "WHERE en.qualname=e.dst_qualname AND en.file_path=e.file_path))",
+                (_MCP_TOOL_PROTOCOL_EXTRACTOR, json.dumps(sorted(affected_names))),
+            )
+    scope_sql, scope_args = _javascript_call_scope_sql(changed_files, affected_names)
     rows = conn.execute(
         "SELECT e.id, e.file_path, e.line, e.dst_name, e.source_col FROM edges e "
         "JOIN files f ON f.file_path=e.file_path "
         "WHERE e.kind='calls' AND e.dst_qualname IS NULL "
         "AND (e.receiver_name IS NULL OR e.receiver_name='') "
         "AND f.language IN ('javascript', 'typescript') "
-        "ORDER BY e.file_path, e.id"
+        f"{scope_sql}ORDER BY e.file_path, e.id",
+        scope_args,
     ).fetchall()
     if not rows:
         return 0
@@ -3885,6 +4174,55 @@ def _javascript_mcp_tool_calls(
     return found
 
 
+def _resolve_scoped_edges(
+    conn: sqlite3.Connection,
+    repo_root: Path,
+    *,
+    scope: _ResolverScope | None,
+    changed_paths: set[str] | None,
+) -> None:
+    """Run the import/annotation/JS resolvers on one build's incremental scope.
+
+    The one call order both the build tail and ``index_file`` use. ``scope``
+    None (a full build) is a full recompute of every pass; otherwise each
+    pass sees only its own language's changed files and affected names, so a
+    language this build did not touch issues no UPDATE. ``changed_paths`` is
+    every changed path: the MCP registry spans Python and JS/TS.
+    """
+
+    js_files = scope.js_files if scope is not None else None
+    js_names = scope.js_names if scope is not None else None
+    python_files = scope.python_files if scope is not None else None
+    _resolve_javascript_import_bindings(
+        conn, changed_files=js_files, affected_names=js_names,
+    )
+    _resolve_python_import_edges(
+        conn,
+        changed_files=python_files,
+        affected_names=scope.python_modules if scope is not None else None,
+    )
+    _resolve_python_annotation_edges(
+        conn,
+        changed_files=python_files,
+        affected_names=(
+            scope.python_names | scope.python_modules if scope is not None else None
+        ),
+    )
+    _resolve_javascript_same_file_calls(
+        conn, repo_root, changed_files=js_files, affected_names=js_names,
+    )
+    _resolve_javascript_imported_calls(
+        conn, repo_root, changed_files=js_files, affected_names=js_names,
+    )
+    _resolve_javascript_mcp_tool_calls(
+        conn, repo_root, changed_files=changed_paths,
+        affected_names=(
+            scope.python_names | js_names
+            if scope is not None and js_names is not None else None
+        ),
+    )
+
+
 def _mcp_tool_refresh_needed(repo_root: Path, changed_files: set[str]) -> bool:
     """True when this refresh can change a tool registry or a JS call site.
 
@@ -3911,6 +4249,7 @@ def _resolve_javascript_mcp_tool_calls(
     repo_root: Path,
     *,
     changed_files: set[str] | None = None,
+    affected_names: set[str] | None = None,
 ) -> int:
     """Bind a JS callTool name to the one Python function that registry names.
 
@@ -3922,10 +4261,15 @@ def _resolve_javascript_mcp_tool_calls(
     The registry is one merged map, so a refresh that can change it stays
     sequential: an ambiguity is only known after every registry file is read.
     A refresh that cannot change it does not read unrelated Python files.
+    ``changed_files=None`` always refreshes (full recompute). A registry
+    entry binds only a function of its own registry file, so
+    ``affected_names`` never widens the refresh; with both sets empty the
+    pass issues no statement at all.
     """
 
-    if changed_files is not None and not _mcp_tool_refresh_needed(
-        repo_root, changed_files
+    if changed_files is not None and (
+        (not changed_files and not affected_names)
+        or not _mcp_tool_refresh_needed(repo_root, changed_files)
     ):
         return 0
     conn.execute(
@@ -4484,13 +4828,15 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                         changed_files=python_changed_paths,
                         affected_names=affected_python_names,
                     )
-                _resolve_javascript_import_bindings(conn)
-                _resolve_python_import_edges(conn)
-                _resolve_python_annotation_edges(conn)
-                _resolve_javascript_same_file_calls(conn, repo_root)
-                _resolve_javascript_imported_calls(conn, repo_root)
-                _resolve_javascript_mcp_tool_calls(
-                    conn, repo_root, changed_files=resolver_changed_paths,
+                _resolve_scoped_edges(
+                    conn, repo_root,
+                    scope=(
+                        _resolver_scope(
+                            resolver_changed_paths | lsp_restored, lexical_identities
+                        )
+                        if incremental else None
+                    ),
+                    changed_paths=resolver_changed_paths if incremental else None,
                 )
             # Task 3: revoke LSP evidence for every changed/deleted source or
             # target, and re-attach bindings re-extraction or a resolver
@@ -11449,13 +11795,11 @@ def index_file(
                             )
                         },
                     )
-                _resolve_javascript_import_bindings(conn)
-                _resolve_python_import_edges(conn)
-                _resolve_python_annotation_edges(conn)
-                _resolve_javascript_same_file_calls(conn, repo_root)
-                _resolve_javascript_imported_calls(conn, repo_root)
-                _resolve_javascript_mcp_tool_calls(
-                    conn, repo_root, changed_files={rel},
+                # ``lexical_identities`` is now this file's identity delta.
+                _resolve_scoped_edges(
+                    conn, repo_root,
+                    scope=_resolver_scope({rel} | lsp_restored, lexical_identities),
+                    changed_paths={rel},
                 )
                 # A binding that still verifies but whose edge the resolvers
                 # above just cleared is re-attached here: the post-publish pass
