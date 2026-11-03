@@ -340,6 +340,89 @@ def _ensure_tasks_origin_thread_column(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+# ponytail: liveness is "the seat waited within this window"; an idle but live
+# manager seat that stops waiting longer than this has its review backlog
+# adopted by whichever same-provider seat waits next. Upgrade path: an explicit
+# seat heartbeat/close signal instead of wait-loop stamps.
+ROUTE_LIVE_WINDOW = timedelta(minutes=15)
+
+
+def _ensure_callback_route_seen_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS callback_route_seen (
+          provider TEXT NOT NULL,
+          origin_thread_id TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL,
+          PRIMARY KEY (provider, origin_thread_id)
+        )
+        """
+    )
+    conn.commit()
+
+
+def _record_route_origin_seen(conn: sqlite3.Connection, provider: str, origin_thread_id: str) -> None:
+    """Upsert the last-seen stamp of one verified (provider, origin) route."""
+    _ensure_callback_route_seen_table(conn)
+    now = utc_now()
+    conn.execute(
+        "INSERT INTO callback_route_seen(provider, origin_thread_id, last_seen_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(provider, origin_thread_id) DO UPDATE SET last_seen_at=excluded.last_seen_at",
+        (provider, origin_thread_id, now),
+    )
+    conn.commit()
+
+
+def _route_origin_seen_recently(
+    conn: sqlite3.Connection,
+    provider: str,
+    origin_thread_id: str,
+    cache: dict[str, bool],
+) -> bool:
+    """True when ``origin_thread_id`` waited within ROUTE_LIVE_WINDOW.
+
+    Absent or unparseable stamps are not liveness evidence: the origin counts
+    as gone and its backlog may be adopted (reload recovery)."""
+    if origin_thread_id in cache:
+        return cache[origin_thread_id]
+    _ensure_callback_route_seen_table(conn)
+    row = conn.execute(
+        "SELECT last_seen_at FROM callback_route_seen WHERE provider=? AND origin_thread_id=?",
+        (provider, origin_thread_id),
+    ).fetchone()
+    seen_at = _parse_instant(row[0]) if row is not None else None
+    live = seen_at is not None and datetime.now(timezone.utc) - seen_at < ROUTE_LIVE_WINDOW
+    cache[origin_thread_id] = live
+    return live
+
+
+def _seed_callback_request_identity(card: dict[str, Any]) -> tuple[str, str]:
+    """(request_id, event_id) recoverable from a card, '' when unknown.
+
+    The card's launch_request_id wins; otherwise the request id recorded in
+    its terminal evidence. Seeding never depends on these: members also match
+    by task id."""
+    terminal_review = card.get("terminal_review")
+    terminal_review = terminal_review if isinstance(terminal_review, dict) else {}
+    evidence = terminal_review.get("evidence")
+    evidence = evidence if isinstance(evidence, dict) else {}
+    request_id = ""
+    for candidate in (
+        card.get("launch_request_id"),
+        evidence.get("request_id"),
+        terminal_review.get("request_id"),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            request_id = candidate.strip()
+            break
+    event_id = ""
+    for candidate in (evidence.get("event_id"), terminal_review.get("event_id")):
+        if isinstance(candidate, str) and candidate.strip():
+            event_id = candidate.strip()
+            break
+    return request_id, event_id
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     """Ensure every table/column this module needs exists, additively.
     Never drops or rewrites an existing row -- see module docstring."""
@@ -2260,6 +2343,11 @@ def seed_missing_review_callbacks(
     route_origin = str(origin_thread_id or "").strip()
     if provider not in MANAGER_PROVIDERS:
         return 0
+    live_cache: dict[str, bool] = {}
+    if route_origin:
+        # Each waiting seat calls this on every wait loop, so its own stamp is
+        # refreshed continuously and is the liveness evidence other seats read.
+        _record_route_origin_seen(conn, provider, route_origin)
     rows = conn.execute(
         """
         SELECT task_id, status, card_json, origin_thread_id
@@ -2326,7 +2414,26 @@ def seed_missing_review_callbacks(
                     and datetime.now(timezone.utc) - deferred_at < DEFERRED_REVIEW_WAKE_GRACE
                 ):
                     continue
-        callback_origin = route_origin or str(row["origin_thread_id"] or card.get("origin_thread_id") or "").strip()
+        persisted_origin = str(row["origin_thread_id"] or card.get("origin_thread_id") or "").strip()
+        # NF-2026-02015: carry the card's launch request id so the owning seat
+        # can match the member by request id, not only by task id.
+        seed_request_id, seed_event_id = _seed_callback_request_identity(card)
+        # NF-2026-02015: a launched card (it carries a request id) belongs to
+        # its persisted origin seat. The waiting seat's verified route adopts it
+        # only when that owner was not seen within ROUTE_LIVE_WINDOW (reload
+        # recovery); a live owner keeps the wake in its own lane. A card with no
+        # launch identity keeps the legacy any-verified-route retarget: no seat
+        # holds a request to match it against.
+        if (
+            route_origin
+            and seed_request_id
+            and persisted_origin
+            and persisted_origin != route_origin
+            and _route_origin_seen_recently(conn, provider, persisted_origin, live_cache)
+        ):
+            callback_origin = persisted_origin
+        else:
+            callback_origin = route_origin or persisted_origin
         if not callback_origin:
             continue
         def _recover_terminal_row(existing_row) -> None:
@@ -2446,6 +2553,8 @@ def seed_missing_review_callbacks(
             transition,
             provider=provider,
             episode_id=episode_id,
+            event_id=seed_event_id,
+            request_id=seed_request_id,
         ):
             seeded += 1
     return seeded
