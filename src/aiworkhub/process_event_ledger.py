@@ -46,7 +46,9 @@ class _LatestEventProjection:
 # different projection's question. ``drop_fields`` joined the identity for the
 # same reason: a caller that never reads a large field (e.g. ``packet``) must
 # never be served -- or seed the cache for -- a projection that retained it.
-_ProjectionKey = tuple[str, str, tuple[str, ...], bool, tuple[str, ...]]
+# A keep-fields projection appends one ``("keep", *fields)`` element; every
+# other projection keeps the five-element identity unchanged.
+_ProjectionKey = tuple[Any, ...]
 
 _LATEST_EVENT_CACHE_LOCK = threading.RLock()
 _LATEST_EVENT_CACHE: OrderedDict[
@@ -475,6 +477,44 @@ def _iter_ledger_file(path: Path) -> Iterator[dict[str, Any]]:
         return
 
 
+def _iter_events_naming(
+    path: Path, fields: tuple[str, ...], key_field: str
+) -> Iterator[dict[str, Any]]:
+    """``iter_events`` restricted to rows whose raw line names a non-key field.
+
+    For a keep-fields merge fold a row that names none of those fields is never
+    folded, so skipping ``json.loads`` for a line without the quoted name is
+    exact; a line that merely mentions it inside a string is parsed and folded
+    exactly as before. Spill merges (timestamp-ordered heads) and names JSON
+    would escape fall back to the full ``iter_events`` stream.
+    """
+
+    names = [name for name in fields if name != key_field]
+    tokens = [json.dumps(name).encode("ascii", errors="replace") for name in names]
+    ledgers = ledger_paths(path)
+    if (
+        not tokens
+        or any(token.decode("ascii") != f'"{name}"' for token, name in zip(tokens, names))
+        or any(_is_spill(path, ledger) for ledger in ledgers)
+    ):
+        yield from iter_events(path)
+        return
+    for ledger in ledgers:
+        try:
+            with ledger.open("rb") as handle:
+                for raw_line in handle:
+                    if not any(token in raw_line for token in tokens):
+                        continue
+                    try:
+                        row = json.loads(raw_line.decode("utf-8", errors="replace"))
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(row, dict):
+                        yield row
+        except OSError:
+            continue
+
+
 def iter_events(path: Path) -> Iterator[dict[str, Any]]:
     """Stream valid object rows across rotations without whole-file reads."""
 
@@ -570,6 +610,7 @@ def _merge_latest_row(
     skip_event_kinds: tuple[str, ...] = (),
     replace: bool = False,
     drop_fields: tuple[str, ...] = (),
+    keep_fields: tuple[str, ...] = (),
 ) -> tuple[str, dict[str, Any] | None] | None:
     """Fold one row into the latest-per-key map.
 
@@ -585,6 +626,11 @@ def _merge_latest_row(
     field a consumer never reads (e.g. ``packet``) never enters the retained
     projection -- it is stripped before retention, not merely from a returned
     copy.
+
+    ``keep_fields`` is the inverse: only those keys are retained, and a row
+    that carries none of them besides ``key_field`` is not folded at all, so
+    the projection holds only keys that ever carried a kept field. Every kept
+    field still ends with exactly the value the unfiltered fold would hold.
     """
 
     if skip_event_kinds and str(row.get("event_kind") or "") in skip_event_kinds:
@@ -592,6 +638,10 @@ def _merge_latest_row(
     key = str(row.get(key_field) or "")
     if not key:
         return None
+    if keep_fields:
+        row = {k: v for k, v in row.items() if k in keep_fields}
+        if not any(k != key_field for k in row):
+            return None
     if drop_fields:
         row = {k: v for k, v in row.items() if k not in drop_fields}
     previous = latest.get(key)
@@ -715,13 +765,17 @@ def _rebuild_latest_events(
     skip_event_kinds: tuple[str, ...] = (),
     replace: bool = False,
     drop_fields: tuple[str, ...] = (),
+    keep_fields: tuple[str, ...] = (),
 ) -> dict[str, dict[str, Any]]:
     """Cold replay. Returns the projection itself, uncopied: callers must copy
     only the rows they hand out."""
 
     before = _ledger_signatures(path)
     latest: dict[str, dict[str, Any]] = {}
-    for row in iter_events(path):
+    rows: Iterable[dict[str, Any]] = iter_events(path)
+    if keep_fields and not skip_event_kinds and not replace:
+        rows = _iter_events_naming(path, keep_fields, key_field)
+    for row in rows:
         _merge_latest_row(
             latest,
             row,
@@ -729,6 +783,7 @@ def _rebuild_latest_events(
             skip_event_kinds=skip_event_kinds,
             replace=replace,
             drop_fields=drop_fields,
+            keep_fields=keep_fields,
         )
     after = _ledger_signatures(path)
 
@@ -761,6 +816,7 @@ def _latest_view(
     skip_event_kinds: tuple[str, ...],
     replace: bool,
     drop_fields: tuple[str, ...],
+    keep_fields: tuple[str, ...] = (),
 ) -> dict[str, dict[str, Any]]:
     """The shared latest-per-key projection, never copied. Read-only: callers
     must not mutate it and must copy any row they return."""
@@ -768,12 +824,29 @@ def _latest_view(
     resolved_path = str(path.resolve(strict=False))
     skip_event_kinds = tuple(sorted(skip_event_kinds))
     drop_fields = tuple(sorted(drop_fields))
+    keep_fields = tuple(sorted(set(keep_fields)))
     # The fold options are part of the identity: a replace-fold that drops
     # notices is a different projection from a merge-fold that keeps them, and
     # serving one for the other would be a silent wrong answer. drop_fields
     # joins the same identity so two different discard sets never share a
-    # cached projection.
-    cache_key = (resolved_path, key_field, skip_event_kinds, bool(replace), drop_fields)
+    # cached projection. keep_fields extends the key only when given, so every
+    # existing projection keeps its exact identity.
+    cache_key: _ProjectionKey = (
+        resolved_path, key_field, skip_event_kinds, bool(replace), drop_fields
+    )
+    if keep_fields:
+        cache_key = (*cache_key, ("keep", *keep_fields))
+
+    def rebuild() -> dict[str, dict[str, Any]]:
+        return _rebuild_latest_events(
+            path,
+            key_field=key_field,
+            cache_key=cache_key,
+            skip_event_kinds=skip_event_kinds,
+            replace=replace,
+            drop_fields=drop_fields,
+            keep_fields=keep_fields,
+        )
     current = _ledger_signatures(path)
     with _LATEST_EVENT_CACHE_LOCK:
         cached = _LATEST_EVENT_CACHE.get(cache_key)
@@ -814,14 +887,7 @@ def _latest_view(
                     handle.seek(start)
                     payload = handle.read(observed_size - start)
             except OSError:
-                return _rebuild_latest_events(
-                    path,
-                    key_field=key_field,
-                    cache_key=cache_key,
-                    skip_event_kinds=skip_event_kinds,
-                    replace=replace,
-                    drop_fields=drop_fields,
-                )
+                return rebuild()
 
             complete_length = payload.rfind(b"\n") + 1
             # Rows are never mutated in place (the fold builds a new dict per
@@ -838,6 +904,7 @@ def _latest_view(
                         skip_event_kinds=skip_event_kinds,
                         replace=replace,
                         drop_fields=drop_fields,
+                        keep_fields=keep_fields,
                     )
                     if merged is None:
                         continue
@@ -857,14 +924,7 @@ def _latest_view(
                 )
                 return latest
 
-    return _rebuild_latest_events(
-        path,
-        key_field=key_field,
-        cache_key=cache_key,
-        skip_event_kinds=skip_event_kinds,
-        replace=replace,
-        drop_fields=drop_fields,
-    )
+    return rebuild()
 
 
 def latest_events(
@@ -985,11 +1045,25 @@ def sealed_request_field(path: Path, field: str) -> dict[str, Any]:
     the same ledger keeps the last value any row carried, which for an
     immutable seal is the reservation's own. Lifecycle state is never read
     from here: that stays the replace projection's latest row.
+
+    The fold is its own small cached projection (NF-2026-02009): it retains
+    only ``request_id`` and ``field``, so it fits the cache bound and a warm
+    call replays only appended bytes, where the full merge fold (~347 MB on
+    the live ledger) was never cached and cold-replayed under the launcher's
+    registry lock. Only the returned seal mappings are copied.
     """
 
+    view = _latest_view(
+        path,
+        key_field="request_id",
+        skip_event_kinds=(),
+        replace=False,
+        drop_fields=(),
+        keep_fields=("request_id", field),
+    )
     return {
-        key: row[field]
-        for key, row in latest_events(path, key_field="request_id").items()
+        key: _copy_row(row[field])
+        for key, row in view.items()
         if isinstance(row.get(field), Mapping)
     }
 
