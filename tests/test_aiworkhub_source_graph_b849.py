@@ -7002,7 +7002,8 @@ def test_stale_rows_are_answered_from_an_inline_re_extraction(tmp_path):
     )
     engine_row = sg.body_query(repo, "stale_target", 8)["matches"][0]
     assert engine_row["freshness"]["state"] == "stale"
-    assert (engine_row["line_start"], engine_row["line_end"]) == (1, 2)
+    # NF-2026-01963: the engine itself now serves a stale file from its current bytes.
+    assert (engine_row["line_start"], engine_row["line_end"]) == (3, 4)
 
     ctx = _cascade_ctx(repo, tmp_path)
     result = w.source_graph_query(ctx, mode="body", query="stale_target", budget=8)
