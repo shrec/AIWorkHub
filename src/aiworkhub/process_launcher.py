@@ -3748,9 +3748,12 @@ def _provision_worker_mcp_runtime_for_authority(
 def _materialize_worker_rework_overlay(
     workspace: WorkerWorkspace, *, task_id: str, card: Mapping[str, Any],
 ) -> tuple[Path | None, dict[str, Any] | None]:
+    # Deferred: capped_continuation imports core, which imports the launcher.
+    from .capped_continuation import launch_predecessor_task_id
+
     return _rework_overlay_packet.materialize_worker_rework_overlay(
         workspace, task_id, card, materialize_rework_overlay,
-        write_json_0600, WorkspaceError,
+        write_json_0600, WorkspaceError, launch_predecessor_task_id,
     )
 
 

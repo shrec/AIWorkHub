@@ -103,6 +103,7 @@ def materialize_worker_rework_overlay(
     materialize: Callable[..., bytes],
     writer: Callable[[Path, dict[str, Any]], None],
     error_type: type[Exception],
+    predecessor_owner: Callable[..., str],
 ) -> tuple[Path | None, dict[str, Any] | None]:
     """Seal verified inherited predecessor bytes into request-private HOME."""
     if not workspace.inherited_rework_paths:
@@ -111,13 +112,8 @@ def materialize_worker_rework_overlay(
     if not isinstance(predecessor, Mapping):
         raise error_type("rework_overlay_predecessor_missing")
     predecessor_request_id = str(predecessor.get("request_id") or "").strip()
-    # Deferred: capped_continuation imports core, which imports the launcher.
-    from .capped_continuation import launch_predecessor_task_id
-
     # The crash-retry packet binds this same owner (NF-2026-01961).
-    owner_task_id = launch_predecessor_task_id(
-        card, task_id, authority_repo=workspace.repo
-    )
+    owner_task_id = predecessor_owner(card, task_id, authority_repo=workspace.repo)
     predecessor_task_id = str(predecessor.get("task_id") or owner_task_id).strip()
     hashes = predecessor.get("changed_path_hashes")
     if not predecessor_request_id or not predecessor_task_id or not isinstance(hashes, Mapping):

@@ -630,6 +630,7 @@ def _commit_validation_worker_package(repo: Path) -> None:
         # worker_workspace imports its promotion write helper relatively (NF-2026-01198).
         "promotion_write.py",
         "promotion_conflict_detail.py",  # promote's conflict sha256 tail (NF-2026-01960)
+        "dirty_canonical_seed.py",  # lazily imported dirty-at-seed probe/refusal (NF-2026-01997)
         "promotion_merge.py",  # three-way promotion merge, imported locally (NF-2026-01381)
         # NF-2026-00841: worker_workspace loads this sibling at runtime through
         # ``__import__``, so the seed closure must carry it and this fixture
@@ -2252,6 +2253,9 @@ def test_workspace_creation_uses_bounded_metadata_not_post_create_git_probes(
             "ls-files",
             "hash-object",
             "update-index",
+            # NF-2026-01997: the one bounded dirty-at-seed ``git status`` per
+            # argv chunk is the intended contract, not a post-create probe.
+            "--no-optional-locks",
         ]
         assert "--no-checkout" in calls[0]
         assert not (workspace.path / "parent-secret.txt").exists()
@@ -5290,20 +5294,22 @@ def test_empty_validation_never_provisions_exec_scratch(
     assert worker_workspace.run_validations(workspace, []) == []
 
 
-def test_provision_validation_exec_scratch_skips_metadata_hostile_root(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A /dev/shm-like root that execs but rejects chmod must be skipped in
-    favour of the next chmod-capable candidate, never handed back."""
+def _metadata_hostile_scratch_setup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, temp_root: Path, hostile: Path
+) -> worker_workspace.WorkerWorkspace:
+    """Repository temp root at ``temp_root``; ``hostile`` rejects metadata.
+
+    The out-of-repository default roots are offered too, so a test proves they
+    are never used as a fallback (NF-2026-02004: nothing outside the repo).
+    """
     monkeypatch.setattr(worker_workspace, "is_windows", lambda: False)
-    hostile = tmp_path / "shm-like"
-    portable = tmp_path / "tmp-like"
-    hostile.mkdir()
-    portable.mkdir()
+    outside = tmp_path / "tmp-like"
+    for directory in (temp_root, hostile, outside):
+        directory.mkdir(exist_ok=True)
     monkeypatch.delenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False)
-    monkeypatch.setenv(worker_workspace.TEMP_ROOT_ENV, str(hostile))
+    monkeypatch.setenv(worker_workspace.TEMP_ROOT_ENV, str(temp_root))
     monkeypatch.setattr(
-        worker_workspace, "_DEFAULT_EXEC_SCRATCH_ROOTS", (hostile, portable)
+        worker_workspace, "_DEFAULT_EXEC_SCRATCH_ROOTS", (hostile, outside)
     )
     monkeypatch.setattr(worker_workspace, "_probe_exec_capable_dir", lambda _d: True)
     monkeypatch.setattr(
@@ -5313,22 +5319,48 @@ def test_provision_validation_exec_scratch_skips_metadata_hostile_root(
             directory.resolve(), hostile.resolve()
         ),
     )
-    workspace = _bare_workspace(tmp_path, "scratch-meta")
+    return _bare_workspace(tmp_path, "scratch-meta")
+
+
+def test_provision_validation_exec_scratch_prefers_capable_in_repo_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A capable repository temp root is chosen over every default root."""
+    temp_root = tmp_path / "repo-temp"
+    hostile = tmp_path / "shm-like"
+    workspace = _metadata_hostile_scratch_setup(monkeypatch, tmp_path, temp_root, hostile)
     scratch = worker_workspace.provision_validation_exec_scratch(workspace)
     try:
         assert worker_workspace._path_is_relative_to(
-            scratch.resolve(), portable.resolve()
+            scratch.resolve(), (temp_root / "validation").resolve()
         )
         assert not worker_workspace._path_is_relative_to(
             scratch.resolve(), hostile.resolve()
         )
-        # The rejected candidate leaves no scratch directory behind.
-        assert not any(
-            path.name.startswith(worker_workspace._EXEC_SCRATCH_NAME_PREFIX)
-            for path in hostile.rglob("*")
-        )
     finally:
         worker_workspace.cleanup_validation_exec_scratch(scratch)
+
+
+def test_provision_validation_exec_scratch_fails_closed_on_metadata_hostile_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A /dev/shm-like in-repo root that execs but rejects metadata fails
+    closed with the exact code -- never falling back outside the repository --
+    and the rejected candidate leaves no scratch directory behind."""
+    hostile = tmp_path / "shm-like"
+    workspace = _metadata_hostile_scratch_setup(monkeypatch, tmp_path, hostile, hostile)
+    with pytest.raises(worker_workspace.WorkspaceError) as exc:
+        worker_workspace.provision_validation_exec_scratch(workspace)
+    validation_root = worker_workspace.configured_temp_root(tmp_path) / "validation"
+    assert str(exc.value) == (
+        f"validation_exec_scratch_unavailable:{validation_root}:no_metadata"
+    )
+    for root in (hostile, tmp_path / "tmp-like"):
+        assert not any(
+            path.name.startswith(worker_workspace._EXEC_SCRATCH_NAME_PREFIX)
+            or path.name.startswith("vx_")
+            for path in root.rglob("*")
+        )
 
 
 def test_provision_validation_exec_scratch_fails_closed_without_metadata_root(

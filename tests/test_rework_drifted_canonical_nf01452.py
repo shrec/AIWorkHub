@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from aiworkhub import worker_workspace
+from aiworkhub import dirty_canonical_seed, promotion_conflict_detail, worker_workspace
 from aiworkhub.promotion_merge import (
     promote_merged,
     rework_pinned_parent_baseline,
@@ -124,13 +124,52 @@ def _seed_rework(
         worker_workspace.cleanup_workspace(repo, predecessor.path, predecessor.home)
 
 
+def _assert_dirty_at_seed_refusal(
+    successor: worker_workspace.WorkerWorkspace, repo: Path, drifted: bytes
+) -> None:
+    """An uncommitted canonical drift is the owner's dirty edit (NF-2026-01997).
+
+    Promotion refuses it as a ``promotion_conflict`` before any canonical write.
+    """
+
+    with pytest.raises(worker_workspace.WorkspaceError) as raised:
+        promote_merged(successor, [_TARGET])
+    error = str(raised.value)
+    assert error.startswith(f"{dirty_canonical_seed.DIRTY_AT_SEED_CODE}:{_TARGET}")
+    reply = promotion_conflict_detail.promotion_conflict_reply(error)
+    assert reply is not None and reply["error_class"] == "promotion_conflict"
+    assert (repo / "out" / "result.txt").read_bytes() == drifted
+
+
 def test_rework_accept_keeps_the_canonical_hunk_accepted_after_the_predecessor(
     repo: Path,
 ) -> None:
-    """The measured defect: promotion reverted the later accept's hunk."""
+    """The measured defect: promotion reverted the later accept's hunk.
+
+    The later hunk is committed here; its uncommitted twin below is refused.
+    """
 
     candidate = _content(line1="predecessor-1\n")  # hunk X
     drifted = _content(line8="canonical-8\n")  # hunk Y, accepted afterwards
+    successor = _seed_rework(repo, candidate=candidate, drifted=drifted, commit=True)
+    try:
+        promoted = promote_merged(successor, [_TARGET])
+
+        assert promoted == [_TARGET]
+        assert (repo / "out" / "result.txt").read_bytes() == _content(
+            line1="predecessor-1\n", line8="canonical-8\n"
+        )
+    finally:
+        worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
+
+
+def test_rework_over_uncommitted_canonical_drift_is_refused_at_promote(
+    repo: Path,
+) -> None:
+    """Pinned to the predecessor's parent, yet the dirty drift is refused."""
+
+    candidate = _content(line1="predecessor-1\n")
+    drifted = _content(line8="canonical-8\n")
     successor = _seed_rework(repo, candidate=candidate, drifted=drifted)
     try:
         # The seeded worktree is still exactly the predecessor's bytes ...
@@ -140,12 +179,7 @@ def test_rework_accept_keeps_the_canonical_hunk_accepted_after_the_predecessor(
         assert successor.parent_baseline[_TARGET].endswith(_digest(_content()))
         assert successor.parent_baseline_blob[_TARGET]
 
-        promoted = promote_merged(successor, [_TARGET])
-
-        assert promoted == [_TARGET]
-        assert (repo / "out" / "result.txt").read_bytes() == _content(
-            line1="predecessor-1\n", line8="canonical-8\n"
-        )
+        _assert_dirty_at_seed_refusal(successor, repo, drifted)
     finally:
         worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
 
@@ -167,16 +201,40 @@ def test_rework_without_canonical_drift_promotes_the_candidate_unchanged(
         worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
 
 
-def test_unpinnable_drift_merges_at_seed_time_and_promotes_both_hunks(
+def test_unpinnable_drift_merges_at_seed_time_and_dirty_drift_is_refused(
     repo: Path,
 ) -> None:
-    """With no recorded blob the merge cannot be deferred, so it happens now."""
+    """With no recorded blob the merge cannot be deferred, so it happens now.
+
+    The uncommitted drift is the owner's dirty canonical edit, so promotion of
+    the merged bytes is refused (NF-2026-01997); the committed path below
+    proves both hunks still promote.
+    """
 
     candidate = _content(line1="predecessor-1\n")
     drifted = _content(line8="canonical-8\n")
     merged = _content(line1="predecessor-1\n", line8="canonical-8\n")
     successor = _seed_rework(
         repo, candidate=candidate, drifted=drifted, blob_record={}
+    )
+    try:
+        assert (successor.path / "out" / "result.txt").read_bytes() == merged
+
+        _assert_dirty_at_seed_refusal(successor, repo, drifted)
+    finally:
+        worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
+
+
+def test_unpinnable_committed_drift_merges_at_seed_time_and_promotes_both_hunks(
+    repo: Path,
+) -> None:
+    """A committed later accept with no recorded blob promotes both hunks."""
+
+    candidate = _content(line1="predecessor-1\n")
+    drifted = _content(line8="canonical-8\n")
+    merged = _content(line1="predecessor-1\n", line8="canonical-8\n")
+    successor = _seed_rework(
+        repo, candidate=candidate, drifted=drifted, blob_record={}, commit=True
     )
     try:
         assert (successor.path / "out" / "result.txt").read_bytes() == merged
