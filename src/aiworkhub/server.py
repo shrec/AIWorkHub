@@ -4469,6 +4469,8 @@ def aiworkhub_task_reject_review(
     validation_amendment: list[str] | None = None,
     allowed_writes_amendment: list[str] | None = None,
     read_first_amendment: list[str] | None = None,
+    validation_amendment_mode: str = "append",
+    validation_roles_amendment: list[str] | None = None,
     include_card: CardInclude = "none",
     lesson_candidate: str | None = None,
     promote_ai_memory: bool = False,
@@ -4529,6 +4531,8 @@ def aiworkhub_task_reject_review(
         validation_amendment: Validation commands to amend the reworked card with, checked by the same rules as validation on aiworkhub_task_create, e.g. pytest -q tests/test_target.py; omit for no amendment.
         allowed_writes_amendment: Repo-relative paths to add to the card's allowed_writes (add-only); only with to=pending, otherwise refused with allowed_writes_amendment_requires_pending.
         read_first_amendment: Existing repo files, each optionally suffixed :N or :N-M, to add to the card's read_first (add-only, deduplicated); only with to=pending, otherwise refused with read_first_amendment_requires_pending; an absolute, .., .git, .aiworkhub/runtime or missing path is refused with read_first_amendment_invalid.
+        validation_amendment_mode: How validation_amendment changes the card's validation: append (default, add new deduplicated commands), replace (the amendment becomes the whole list) or remove (drop each listed command, which must exactly equal an existing one, else validation_amendment_remove_unknown, plus its role); replace and remove only with to=pending (else validation_amendment_mode_requires_pending), and the result must keep the work_kind role gate (e.g. bugfix needs reproduction and regression) and not be empty; anything else is refused with validation_amendment_mode_invalid.
+        validation_roles_amendment: Roles for a replace, one per validation_amendment command in the same order (each a quality_evidence validation role such as reproduction, regression or generic); required when the card carries validation_roles and refused with validation_amendment_roles_invalid outside replace or when misaligned.
         include_card: Card view to attach to the receipt: none (default), summary (baselines and evidence folded) or full (the exact post-transition card).
         lesson_candidate: Lesson text to commit for this decision in the same call, after the reject lands; omit to commit the lesson separately.
         promote_ai_memory: Set true together with lesson_candidate to also promote the lesson to AI memory; refused without a lesson. Default false.
@@ -4559,6 +4563,10 @@ def aiworkhub_task_reject_review(
         kwargs["allowed_writes_amendment"] = allowed_writes_amendment
     if read_first_amendment:
         kwargs["read_first_amendment"] = read_first_amendment
+    if validation_amendment_mode != "append":
+        kwargs["validation_amendment_mode"] = validation_amendment_mode
+    if validation_roles_amendment is not None:
+        kwargs["validation_roles_amendment"] = validation_roles_amendment
     result = core.reject_review(**kwargs)
     card = _envelope_card(result)
     extra = (
@@ -4636,6 +4644,8 @@ def aiworkhub_task_recover_blocked_rework(
     validation_amendment: list[str] | None = None,
     scope_rejection_resolved: bool = False,
     allowed_writes_amendment: list[str] | None = None,
+    validation_amendment_mode: str = "append",
+    validation_roles_amendment: list[str] | None = None,
 ) -> dict[str, Any]:
     """Recover one exact blocked task through the canonical transaction.
 
@@ -4664,6 +4674,8 @@ def aiworkhub_task_recover_blocked_rework(
         validation_amendment: Validation commands to amend the recovered card with, checked by the same rules as validation on aiworkhub_task_create, e.g. pytest -q tests/test_target.py; omit for no amendment.
         scope_rejection_resolved: Set true to record the manager's audited clean-root resolution of a scope_rejected card; requires feedback_reason and is not combinable with validation_only_replay. Default false.
         allowed_writes_amendment: Repo-relative paths to add to the card's allowed_writes (add-only, reject_review's path rules), e.g. tests/test_target.py; refused with validation_only_replay; omit for no amendment.
+        validation_amendment_mode: How validation_amendment changes the card's validation: append (default, add new deduplicated commands), replace (the amendment becomes the whole list) or remove (drop each listed command, which must exactly equal an existing one, else validation_amendment_remove_unknown, plus its role); the result must keep the work_kind role gate (e.g. bugfix needs reproduction and regression) and not be empty; anything else is refused with validation_amendment_mode_invalid.
+        validation_roles_amendment: Roles for a replace, one per validation_amendment command in the same order (each a quality_evidence validation role such as reproduction, regression or generic); required when the card carries validation_roles and refused with validation_amendment_roles_invalid outside replace or when misaligned.
     """
 
     kwargs: dict[str, Any] = {
@@ -4679,6 +4691,10 @@ def aiworkhub_task_recover_blocked_rework(
         kwargs["validation_amendment"] = validation_amendment
     if allowed_writes_amendment:
         kwargs["allowed_writes_amendment"] = allowed_writes_amendment
+    if validation_amendment_mode != "append":
+        kwargs["validation_amendment_mode"] = validation_amendment_mode
+    if validation_roles_amendment is not None:
+        kwargs["validation_roles_amendment"] = validation_roles_amendment
     result = core.recover_blocked_rework(task_id, **kwargs)
     card = _envelope_card(result)
     extra: dict[str, Any] = {

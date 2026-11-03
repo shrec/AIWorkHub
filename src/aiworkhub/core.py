@@ -6525,6 +6525,50 @@ def _validate_validation_amendment_commands(commands: list[str]) -> dict[str, An
     return None
 
 
+def _validation_amendment_mode_error(
+    card: Mapping[str, Any],
+    commands: list[str],
+    mode: str | None,
+    roles: list[str] | None,
+    *,
+    disposition: str = "pending",
+) -> tuple[str, dict[str, Any] | None]:
+    """NF-2026-01984: resolve ``validation_amendment_mode`` and refuse a bad
+    replace/remove before any write by dry-running task_store's own
+    ``apply_validation_amendment_mode`` (roles, remove-unknown, empty result
+    and the work_kind role gate) on a shallow copy of the live card; the same
+    function re-runs on the locked card inside the transaction."""
+    resolved = "append" if mode is None else str(mode)
+    if resolved not in task_store.VALIDATION_AMENDMENT_MODES:
+        return resolved, _lifecycle_error("validation_amendment_mode_invalid", 2)
+    if resolved == "append":
+        if roles:
+            return resolved, _lifecycle_error("validation_amendment_roles_invalid", 2)
+        return resolved, None
+    if disposition != "pending":
+        return resolved, _lifecycle_error("validation_amendment_mode_requires_pending")
+    if not commands:
+        return resolved, _lifecycle_error("validation_amendment_mode_requires_amendment", 2)
+    try:
+        task_store.apply_validation_amendment_mode(
+            dict(card), commands, mode=resolved, roles=roles
+        )
+    except ValueError as exc:
+        return resolved, _lifecycle_error(str(exc), 2)
+    return resolved, None
+
+
+def _report_validation_amendment_mode(
+    result: dict[str, Any], mode: str, applied: list[str]
+) -> None:
+    """Name a non-append mode on the receipt; append receipts stay unchanged."""
+    if mode == "append":
+        return
+    result["validation_amendment_mode"] = mode
+    if mode == "remove":
+        result["validation_removed"] = list(applied)
+
+
 _AMENDMENT_RESERVED_WRITE_ROOTS = (".git", ".aiworkhub/runtime")
 
 
@@ -6681,6 +6725,8 @@ def reject_review(
     validation_amendment: list[str] | None = None,
     allowed_writes_amendment: list[str] | None = None,
     read_first_amendment: list[str] | None = None,
+    validation_amendment_mode: str = "append",
+    validation_roles_amendment: list[str] | None = None,
 ) -> dict[str, Any]:
     card, error = _live_card(task_id)
     if error:
@@ -6711,6 +6757,18 @@ def reject_review(
         amendment_error = _validate_validation_amendment_commands(amendment_commands)
         if amendment_error is not None:
             return amendment_error
+    amendment_roles = (
+        list(validation_roles_amendment) if validation_roles_amendment is not None else None
+    )
+    amendment_mode, amendment_mode_error = _validation_amendment_mode_error(
+        card,
+        amendment_commands,
+        validation_amendment_mode,
+        amendment_roles,
+        disposition=disposition,
+    )
+    if amendment_mode_error is not None:
+        return amendment_mode_error
     amendment_paths = allowed_writes_amendment or []
     if amendment_paths:
         if disposition != "pending":
@@ -7332,7 +7390,9 @@ def reject_review(
         )
     try:
         applied_validation_amendment = (
-            task_store.apply_validation_amendment(card, amendment_commands)
+            task_store.apply_validation_amendment_mode(
+                card, amendment_commands, mode=amendment_mode, roles=amendment_roles
+            )
             if amendment_commands
             else []
         )
@@ -7467,6 +7527,9 @@ def reject_review(
     )
     if amendment_commands:
         result["validation_amendment_applied"] = applied_validation_amendment
+        _report_validation_amendment_mode(
+            result, amendment_mode, applied_validation_amendment
+        )
     if amendment_paths:
         result["allowed_writes_amendment_applied"] = applied_allowed_writes_amendment
     if applied_read_first_amendment:
@@ -7617,6 +7680,8 @@ def recover_blocked_rework(
     validation_amendment: list[str] | None = None,
     scope_rejection_resolved: bool = False,
     allowed_writes_amendment: list[str] | None = None,
+    validation_amendment_mode: str = "append",
+    validation_roles_amendment: list[str] | None = None,
 ) -> dict[str, Any]:
     """Recover one exact blocked task through the canonical task-store transaction."""
     amendment_paths = allowed_writes_amendment or []
@@ -7640,6 +7705,14 @@ def recover_blocked_rework(
         amendment_error = _validate_validation_amendment_commands(amendment_commands)
         if amendment_error is not None:
             return amendment_error
+    amendment_roles = (
+        list(validation_roles_amendment) if validation_roles_amendment is not None else None
+    )
+    amendment_mode, amendment_mode_error = _validation_amendment_mode_error(
+        card, amendment_commands, validation_amendment_mode, amendment_roles
+    )
+    if amendment_mode_error is not None:
+        return amendment_mode_error
     applied: list[str] = []
     if amendment_paths:
         amendment_paths_error = _validate_allowed_writes_amendment_paths(
@@ -7707,6 +7780,12 @@ def recover_blocked_rework(
         if amendment_commands:
             task_store_kwargs["validation_amendment"] = amendment_commands
             task_store_kwargs["applied_out"] = applied
+            if amendment_mode != "append":
+                # NF-2026-01984: forwarded only for a non-append mode, so the
+                # append call stays byte-for-byte the pre-existing transaction.
+                task_store_kwargs["validation_amendment_mode"] = amendment_mode
+                if amendment_roles is not None:
+                    task_store_kwargs["validation_roles_amendment"] = amendment_roles
         if amendment_paths:
             task_store_kwargs["allowed_writes_amendment"] = amendment_paths
             task_store_kwargs["allowed_writes_applied_out"] = applied_allowed_writes
@@ -7732,6 +7811,7 @@ def recover_blocked_rework(
         # so an idempotent already-recovered success reports [] rather than
         # commands the stored card never received (NF-2026-01151).
         result["validation_amendment_applied"] = applied
+        _report_validation_amendment_mode(result, amendment_mode, applied)
     if amendment_paths:
         result["allowed_writes_amendment_applied"] = applied_allowed_writes
     return result

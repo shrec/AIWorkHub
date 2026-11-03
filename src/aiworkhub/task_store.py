@@ -5594,6 +5594,93 @@ def apply_validation_amendment(card: dict[str, Any], commands: list[str]) -> lis
     return applied
 
 
+VALIDATION_AMENDMENT_MODES: tuple[str, ...] = ("append", "replace", "remove")
+
+
+def apply_validation_amendment_mode(
+    card: dict[str, Any],
+    commands: list[str],
+    *,
+    mode: str = "append",
+    roles: list[str] | None = None,
+) -> list[str]:
+    """Apply a validation amendment in ``mode`` (NF-2026-01984).
+
+    ``append`` is exactly :func:`apply_validation_amendment`.  ``replace``
+    makes ``commands`` the card's whole validation list, with ``roles``
+    aligned one-to-one (required when the card carries ``validation_roles``);
+    ``remove`` drops each exact existing command and the role at its index.
+    Both re-run ``quality_evidence.normalize_behavioral_contract`` -- the
+    work_kind role gate task_create uses -- on the result, assign no card key
+    before every check passed, and append a ``validation_amendments`` history
+    entry (mode, before, after, at).  Returns the installed (replace) or
+    removed (remove) commands; every refusal raises ValueError naming its cause.
+    """
+    if mode not in VALIDATION_AMENDMENT_MODES:
+        raise ValueError("validation_amendment_mode_invalid")
+    if mode == "append":
+        if roles:
+            raise ValueError("validation_amendment_roles_invalid")
+        return apply_validation_amendment(card, commands)
+    from . import quality_evidence, task_templates
+
+    validation = card.get("validation")
+    before = list(validation) if isinstance(validation, list) else []
+    existing_roles = card.get("validation_roles")
+    roles_is_list = isinstance(existing_roles, list)
+    new_roles: list[str] | None
+    if mode == "replace":
+        if len(set(commands)) != len(commands):
+            raise ValueError("validation_amendment_duplicate_command")
+        if roles is None:
+            if roles_is_list:
+                raise ValueError("validation_amendment_roles_invalid")
+            new_roles = None
+        else:
+            new_roles = list(roles)
+            if len(new_roles) != len(commands) or any(
+                role not in quality_evidence.VALIDATION_ROLES for role in new_roles
+            ):
+                raise ValueError("validation_amendment_roles_invalid")
+        after = list(commands)
+        changed = list(commands)
+    else:  # remove
+        if roles is not None:
+            raise ValueError("validation_amendment_roles_invalid")
+        targets = list(dict.fromkeys(commands))
+        if any(command not in before for command in targets):
+            raise ValueError("validation_amendment_remove_unknown")
+        drop = set(targets)
+        keep = [index for index, command in enumerate(before) if command not in drop]
+        after = [before[index] for index in keep]
+        new_roles = (
+            [existing_roles[index] for index in keep if index < len(existing_roles)]
+            if roles_is_list
+            else None
+        )
+        changed = targets
+    if not after:
+        raise ValueError("validation_amendment_empty_result")
+    if len(after) > task_templates.MAX_PATHS_PER_FIELD:
+        raise ValueError("validation_amendment_exceeds_limit")
+    _kind, normalized_roles = quality_evidence.normalize_behavioral_contract(
+        card.get("work_kind"), after, new_roles
+    )
+    history = card.get("validation_amendments")
+    history_list = list(history) if isinstance(history, list) else []
+    history_list.append({
+        "mode": mode,
+        "before": before,
+        "after": list(after),
+        "at": datetime.now(timezone.utc).isoformat(),
+    })
+    card["validation"] = after
+    if new_roles is not None:
+        card["validation_roles"] = normalized_roles
+    card["validation_amendments"] = history_list
+    return changed
+
+
 def apply_allowed_writes_amendment(
     card: dict[str, Any],
     paths: list[str],
@@ -6708,6 +6795,8 @@ def recover_blocked_rework(
     scope_rejection_resolved: bool = False,
     allowed_writes_amendment: list[str] | None = None,
     allowed_writes_applied_out: list[str] | None = None,
+    validation_amendment_mode: str = "append",
+    validation_roles_amendment: list[str] | None = None,
 ) -> tuple[bool, str]:
     """Recover the same blocked task ID for rework when retained predecessor
     evidence and actionable residual feedback are present.
@@ -6796,6 +6885,11 @@ def recover_blocked_rework(
     ``invalid_validation_amendment:validation_amendment_exceeds_limit`` even
     when the task is already recovered; an idempotent success never silently
     drops a caller's amendment.
+
+    ``validation_amendment_mode`` (NF-2026-01984) = append (default, the
+    behaviour above) | replace | remove, with ``validation_roles_amendment``
+    for replace; see ``apply_validation_amendment_mode``.  ``applied_out`` then
+    receives the installed (replace) or removed (remove) commands.
 
     ``allowed_writes_amendment`` (NF-2026-01701) widens ``allowed_writes``
     add-only through ``apply_allowed_writes_amendment`` -- the same history
@@ -6896,8 +6990,11 @@ def recover_blocked_rework(
         pending_amendment: list[str] = []
         if validation_amendment:
             try:
-                pending_amendment = apply_validation_amendment(
-                    card, validation_amendment
+                pending_amendment = apply_validation_amendment_mode(
+                    card,
+                    validation_amendment,
+                    mode=validation_amendment_mode,
+                    roles=validation_roles_amendment,
                 )
             except ValueError as exc:
                 return False, f"invalid_validation_amendment:{exc}"

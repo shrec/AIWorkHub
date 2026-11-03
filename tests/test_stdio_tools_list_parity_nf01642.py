@@ -310,6 +310,7 @@ def test_reject_review_schema_keeps_its_names_types_and_required_list(fallback_t
         "allowed_writes_amendment", "read_first_amendment", "lesson_candidate",
         "no_new_lesson_reason",
         "promote_ai_memory", "extra_evidence_ids",
+        "validation_amendment_mode", "validation_roles_amendment",
     }
     assert schema["properties"]["task_id"]["type"] == "string"
     assert schema["properties"]["residual_identities"]["type"] == "array"
