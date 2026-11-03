@@ -13,6 +13,10 @@ from .worker_workspace import WorkerWorkspace
 
 ZERO_DELTA_NOTICE = "zero_required_output_delta_warning"
 RUNTIME_NOTICE_EVENT_KIND = "runtime_notice"
+ORCHESTRATOR_ADVISORY_EVENT_TYPES = frozenset({
+    "review_orchestrator_wait",
+    "review_orchestrator_mechanical_rework",
+})
 ZERO_DELTA_ELAPSED_SHARE_ENV = "AIWORKHUB_ZERO_DELTA_ELAPSED_SHARE"
 ZERO_DELTA_DEFAULT_ELAPSED_SHARE = 0.5
 ZERO_DELTA_MIN_SECONDS = 60.0
@@ -32,6 +36,8 @@ def split_lifecycle_tail(
     no ``state`` and carries ``pid`` without ``pid_start_ticks``. Every reader
     that took lifecycle state from ``events[-1]`` must read the last LIFECYCLE
     row instead, or a quiet worker's own notice stops reconciliation forever.
+    Stateless review-orchestrator rows (``ORCHESTRATOR_ADVISORY_EVENT_TYPES``)
+    are skipped entirely: they are neither the lifecycle tail nor the notice.
     Returns ``({}, None)`` for an empty or notice-only list so every caller's
     ``.get(...)`` stays safe without its own None-guard.
     """
@@ -39,6 +45,8 @@ def split_lifecycle_tail(
     lifecycle: dict[str, Any] = {}
     advisory: dict[str, Any] | None = None
     for event in events:
+        if str(event.get("event_type") or "") in ORCHESTRATOR_ADVISORY_EVENT_TYPES:
+            continue
         if str(event.get("event_kind") or "") == RUNTIME_NOTICE_EVENT_KIND:
             advisory = event
         else:
