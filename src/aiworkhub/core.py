@@ -7953,6 +7953,47 @@ def _blocked_episode_launch_failed_request_id(task_id: str, *, blocked_at: str) 
     return ""
 
 
+def _automatic_retry_provenance(provenance: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Bounded ``actor``/``retry_of``/``failure_class`` of one unattended retry (NF-2026-01926)."""
+
+    if not isinstance(provenance, Mapping):
+        return {}
+    recorded: dict[str, Any] = {"automatic": True}
+    for key, cap in (("actor", 60), ("retry_of", 120), ("failure_class", 60)):
+        recorded[key] = str(provenance.get(key) or "").strip()[:cap] or None
+    return recorded
+
+
+def automatic_retries_since(task_id: str, *, actor: str, since: str) -> int:
+    """How many durable ``retry_terminal`` events ``actor`` wrote for ``task_id`` at or after ``since``.
+
+    Read from the append-only ``task_events`` history, never process memory, so
+    a reconciler restart cannot reset an unattended retry budget.  An unreadable
+    store raises ``task_store.TaskStoreError``: the caller treats that as an
+    exhausted budget rather than as permission.
+    """
+
+    _readiness, db_path = task_store._require_ready(repo_root())
+    conn = task_store._connect(db_path, readonly=True)
+    try:
+        rows = conn.execute(
+            "SELECT payload_json FROM task_events WHERE task_id=? "
+            "AND event='retry_terminal' AND created_at>=? ORDER BY event_id",
+            (task_id, since),
+        ).fetchall()
+    finally:
+        conn.close()
+    count = 0
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and payload.get("automatic") is True and payload.get("actor") == actor:
+            count += 1
+    return count
+
+
 def retry_terminal_task(
     task_id: str,
     request_id: str,
@@ -7961,6 +8002,7 @@ def retry_terminal_task(
     topic: str | None = None,
     *,
     automatic: bool = False,
+    provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Requeue one exact operational terminal episode under the same task ID.
 
@@ -7982,11 +8024,18 @@ def retry_terminal_task(
     recorded on the card (see ``automatic_terminal_retry_refusal``) and refuses
     every class some other mechanism already owns.  A manager calling this
     surface directly holds the evidence in hand and is not gated.
+
+    ``provenance`` (NF-2026-01926) names who retried and what: ``actor``,
+    ``retry_of`` (the prior request id) and the recorded ``failure_class``.
+    It is honoured only together with ``automatic`` and is written into
+    ``terminal_retry`` and the durable ``retry_terminal`` event, which is the
+    history an unattended retry budget is counted from.
     """
 
     request_id = str(request_id or "").strip()
     terminal_substatus = str(terminal_substatus or "").strip()
     bounded_reason = str(reason or "").strip()[:500]
+    retry_provenance = _automatic_retry_provenance(provenance) if automatic else {}
     if not request_id or len(request_id) > 120:
         return _lifecycle_error("terminal_retry_request_id_invalid")
     from . import stale_recovery
@@ -8139,6 +8188,7 @@ def retry_terminal_task(
             # which of the two this was (NF-2026-01192).
             **({"request_linkage": request_linkage} if request_linkage else {}),
             **predecessor_carry,
+            **retry_provenance,
         },
     )
     encoded_card = json.dumps(semantic_card, ensure_ascii=False, sort_keys=True)
@@ -8201,6 +8251,7 @@ def retry_terminal_task(
                         "transition": "blocked->pending",
                         "prior_episode": prior_episode,
                         **predecessor_carry,
+                        **retry_provenance,
                     },
                     ensure_ascii=False,
                     sort_keys=True,

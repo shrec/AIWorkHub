@@ -15,9 +15,12 @@ only repeatedly drives the EXISTING
 path (scope validation, validation commands, promotion, ``taskctl review``
 for a clean exit; review/blocked routing with a normalized outcome for
 lost/timed-out/cancelled/failed work -- never pending, never automatic
-retry/relaunch, with one named exception: a card still inside its own
+retry/relaunch, with two named exceptions: a card still inside its own
 finite ``task_store.mark_transient_retry`` budget is relaunched by
-``dependency_autolaunch.reconcile_transient_due`` once its backoff elapses)
+``dependency_autolaunch.reconcile_transient_due`` once its backoff elapses,
+and a blocked work card with a purely operational, unclassified failure is
+retried and relaunched inside its own durable per-task budget by
+``_scan_operational_retry_relaunch``, NF-2026-01926)
 on a bounded scan interval, from a process that survives
 every MCP/VS Code/launcher restart. A single-instance advisory lock keeps
 one reconciler running per repo; the reconciliation work itself is already
@@ -39,6 +42,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterator, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -574,6 +578,10 @@ def run_scan(
     # internally before spawning the worker.
     with _phase("transient_retry_relaunch"):
         transient_retry_relaunch = _scan_transient_retry_relaunch(mgr)
+    # NF-2026-01926, the second named exception: a blocked work card whose
+    # failure is purely operational, inside its own finite durable budget.
+    with _phase("operational_retry_relaunch"):
+        operational_retry_relaunch = _scan_operational_retry_relaunch(mgr)
     # Releases only claims whose launch left no process record at all, after their grace.
     with _phase("orphan_claim_release"):
         orphan_claim_release = _scan_orphan_claims(mgr)
@@ -599,6 +607,7 @@ def run_scan(
         "wave_goal_bindings": wave_goal_bindings,
         "wave_completion": wave_completion,
         "transient_retry_relaunch": transient_retry_relaunch,
+        "operational_retry_relaunch": operational_retry_relaunch,
         "orphan_claim_release": orphan_claim_release,
         "sdlc_sync": sdlc,
         "phase_durations_ms": phase_ms,
@@ -911,13 +920,19 @@ def _positive_seconds(value: Any) -> int | None:
 
 
 def _failed_attempt_timeout(
-    mgr: process_launcher.ProcessManager, task_id: str
+    mgr: process_launcher.ProcessManager, task_id: str, failed_request_id: str = ""
 ) -> tuple[int | None, str]:
-    """(timeout_seconds, "") from the failed request's ProcessManager record, else (None, reason)."""
+    """(timeout_seconds, "") from the failed request's ProcessManager record, else (None, reason).
+
+    ``failed_request_id`` names the failed request directly; without it the
+    card's ``transient_retry.request_id`` does.
+    """
     try:
-        card = task_store.get_tasks(Path(mgr.repo).resolve(), [task_id]).get(task_id) or {}
-        transient = card.get("transient_retry")
-        request_id = str(transient.get("request_id") or "") if isinstance(transient, Mapping) else ""
+        request_id = failed_request_id
+        if not request_id:
+            card = task_store.get_tasks(Path(mgr.repo).resolve(), [task_id]).get(task_id) or {}
+            transient = card.get("transient_retry")
+            request_id = str(transient.get("request_id") or "") if isinstance(transient, Mapping) else ""
         if not request_id:
             return None, "no_failed_request_id"
         status = mgr.status(request_id)
@@ -980,6 +995,289 @@ def _scan_transient_retry_relaunch(mgr: process_launcher.ProcessManager) -> dict
         )
     except Exception as exc:  # noqa: BLE001 -- never block worker reconcile
         return {"ok": False, "state": "skipped", "reason": f"{type(exc).__name__}"[:80]}
+
+
+# NF-2026-01926: the second named exception to "never automatic retry/relaunch".
+# Measured 2026-10-18..11-01: 314 friction events across 473 work cards, most of
+# the idle gap a blocked card waiting for a manager to call retry_terminal on a
+# purely operational failure.  The automatic subset is deliberately narrower
+# than ``stale_recovery.RELAUNCH_SUBSTATUSES``: ``cancelled`` is somebody's
+# decision and ``timed_out`` repeats itself, so both still wait for a manager.
+# ``process_lost`` is added here (it is operational in
+# ``core._RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES``) without widening the
+# manager triage's own pinned set.  ``worker_failed`` qualifies only for a
+# supervisor that vanished mid-run; the never-started ``dead_process_reconciled``
+# episode qualifies through ``stale_recovery.never_started_request_id``.
+OPERATIONAL_RETRY_SUBSTATUSES: frozenset[str] = frozenset(
+    {"process_lost", "liveness_lost", "launch_failed", "worker_failed"}
+)
+_SUPERVISOR_INCOMPLETE_MARKER = "supervisor_incomplete"
+OPERATIONAL_RETRY_ACTOR = "reconciler:auto"
+# At most this many unattended operational retries per task inside the window,
+# counted from durable retry_terminal events so a restart cannot reset it.
+OPERATIONAL_RETRY_BUDGET = 2
+OPERATIONAL_RETRY_WINDOW_SECONDS = 24 * 3600
+# Shares the transient relaunch's per-pass ceiling and rationale: a relaunch
+# competes with worker finalization for the same pass.
+OPERATIONAL_RETRY_RELAUNCH_CAPACITY = TRANSIENT_RETRY_RELAUNCH_CAPACITY
+# Cards classified per pass, most recently updated first.
+OPERATIONAL_RETRY_CLASSIFY_LIMIT = 16 * OPERATIONAL_RETRY_RELAUNCH_CAPACITY
+# Informational task event; never a callback-outbox wake, so no manager acts on it.
+OPERATIONAL_RETRY_EVENT = "operational_auto_retry"
+_QUALITY_REVIEW_TASK_PREFIX = "QUALITY_REVIEW_"
+
+
+def _is_quality_reviewer_card(card: Mapping[str, Any]) -> bool:
+    """Reviewer cards belong to reviewer_reservation_recovery, never to this phase."""
+    return (
+        str(card.get("task_id") or "").startswith(_QUALITY_REVIEW_TASK_PREFIX)
+        or str(card.get("topic") or "") == "quality_review"
+    )
+
+
+def _terminal_evidence(card: Mapping[str, Any]) -> Mapping[str, Any]:
+    terminal_failure = card.get("terminal_failure")
+    evidence = terminal_failure.get("evidence") if isinstance(terminal_failure, Mapping) else None
+    return evidence if isinstance(evidence, Mapping) else {}
+
+
+def _blocked_request_id(card: Mapping[str, Any]) -> str:
+    """The request the blocked episode names, in ``core.retry_terminal_task``'s own order."""
+    return str(
+        _terminal_evidence(card).get("request_id")
+        or card.get("launch_request_id")
+        or stale_recovery.never_started_request_id(card)
+        or ""
+    ).strip()
+
+
+def _supervisor_incomplete(card: Mapping[str, Any]) -> bool:
+    texts = (
+        card.get("blocker_reason"),
+        card.get("terminal_reason"),
+        _terminal_evidence(card).get("error"),
+    )
+    return any(_SUPERVISOR_INCOMPLETE_MARKER in str(text or "") for text in texts)
+
+
+@contextlib.contextmanager
+def _core_bound_to(mgr: process_launcher.ProcessManager) -> Iterator[None]:
+    """Bind core's canonical store to this manager's repository, as the reaper does."""
+    with core._REPOSITORY_SWITCH_LOCK:
+        prior_repo_override = core._PROCESS_REPO_ROOT_OVERRIDE
+        core._PROCESS_REPO_ROOT_OVERRIDE = mgr.repo
+        try:
+            yield
+        finally:
+            core._PROCESS_REPO_ROOT_OVERRIDE = prior_repo_override
+
+
+def _operational_launch(
+    mgr: process_launcher.ProcessManager, task_id: str, runner: str, topic: str, failed_request_id: str
+) -> dict[str, Any]:
+    timeout_seconds, _reason = _failed_attempt_timeout(mgr, task_id, failed_request_id)
+    inherited = {} if timeout_seconds is None else {"timeout_seconds": timeout_seconds}
+    try:
+        result = mgr.launch(task_id=task_id, runner=runner, topic=topic, **inherited)
+    except Exception as exc:  # noqa: BLE001 -- one bad spawn must not abort the pass
+        return {"ok": False, "error": f"launch_raised:{type(exc).__name__}"}
+    if result.get("ok"):
+        return {"ok": True, "request_id": str(result.get("request_id") or "")}
+    return {"ok": False, "error": str(result.get("blocked_reason") or result.get("error") or "launch_refused")[:200]}
+
+
+def _reblock_unlaunched(
+    mgr: process_launcher.ProcessManager, task_id: str, runner: str, topic: str, error: str
+) -> str:
+    """Return a requeued card the launch never claimed to ``blocked/launch_failed``.
+
+    A launch refused before its claim leaves the card ``pending/unclaimed``,
+    where nothing would ever look at it again.  Claiming it under a fresh
+    request id and recording the launch failure puts it back where the manager
+    callback and the next pass both see it; a card the launch did claim is left
+    to the launch's own terminal path.
+    """
+    from . import task_engine
+
+    repo = Path(mgr.repo).resolve()
+    card = task_store.get_task(repo, task_id) or {}
+    status = task_store.canonical_status(card) if card else "missing"
+    if status != "pending" or str(card.get("worker_status") or "") != "unclaimed":
+        return f"left_{status}"
+    request_id = uuid.uuid4().hex
+    claim = task_engine.claim_start_exact(repo, task_id, runner, topic, request_id)
+    if not claim.get("ok"):
+        return "reblock_claim_failed"
+    failed = task_engine.mark_launch_failed(
+        repo, task_id, runner,
+        reason=f"operational_auto_retry_launch_failed:{error}"[:200],
+        request_id=request_id,
+    )
+    return "reblocked" if failed.get("ok") else "reblock_mark_failed"
+
+
+def _record_operational_retry(repo: Path, task_id: str, payload: Mapping[str, Any]) -> bool:
+    """Append the one informational event an automatic retry emits."""
+    try:
+        _readiness, db_path = task_store._require_ready(repo)
+        with task_store._write_connection(db_path) as conn:
+            task_store._begin_immediate(conn)
+            conn.execute(
+                "INSERT INTO task_events (task_id, event, runner, payload_json, created_at) "
+                "VALUES (?,?,?,?,?)",
+                (
+                    task_id,
+                    OPERATIONAL_RETRY_EVENT,
+                    OPERATIONAL_RETRY_ACTOR,
+                    json.dumps(dict(payload), ensure_ascii=False, sort_keys=True),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            conn.commit()
+    except Exception:  # noqa: BLE001 -- the retry already happened; report, never raise
+        return False
+    return True
+
+
+def _operational_retry_one(
+    mgr: process_launcher.ProcessManager,
+    card: Mapping[str, Any],
+    row: Mapping[str, Any],
+    since: str,
+) -> dict[str, Any]:
+    task_id = str(row.get("task_id") or "")
+    substatus = str(row.get("terminal_substatus") or "")
+    failure_class = row.get("failure_class")
+    topic = str(card.get("topic") or "")
+    runner = str(card.get("runner") or "")
+    outcome: dict[str, Any] = {
+        "task_id": task_id, "terminal_substatus": substatus, "failure_class": failure_class,
+    }
+    if _is_quality_reviewer_card(card):
+        return {**outcome, "state": "skipped", "reason": "quality_reviewer_card"}
+    never_started = substatus == stale_recovery.NEVER_STARTED_SUBSTATUS
+    if not never_started and substatus not in OPERATIONAL_RETRY_SUBSTATUSES:
+        return {**outcome, "state": "skipped", "reason": "substatus_not_automatic"}
+    if substatus == "worker_failed" and not _supervisor_incomplete(card):
+        return {**outcome, "state": "skipped", "reason": "worker_failed_not_supervisor_incomplete"}
+    refusal = core.automatic_terminal_retry_refusal(card)
+    if refusal:
+        return {**outcome, "state": "refused", "reason": refusal}
+    request_id = _blocked_request_id(card)
+    if not request_id or not topic or not runner:
+        return {**outcome, "state": "skipped", "reason": "episode_identity_incomplete"}
+    try:
+        with _core_bound_to(mgr):
+            used = core.automatic_retries_since(task_id, actor=OPERATIONAL_RETRY_ACTOR, since=since)
+    except Exception as exc:  # noqa: BLE001 -- an unreadable budget is an exhausted one
+        return {**outcome, "state": "budget_unreadable", "error": type(exc).__name__[:80]}
+    if used >= OPERATIONAL_RETRY_BUDGET:
+        return {**outcome, "state": "budget_exhausted", "used": used, "budget": OPERATIONAL_RETRY_BUDGET}
+    outcome["attempted"] = True
+    try:
+        with _core_bound_to(mgr):
+            retry = core.retry_terminal_task(
+                task_id,
+                request_id,
+                substatus,
+                reason=f"operational_auto_retry:{substatus}",
+                topic=topic,
+                automatic=True,
+                provenance={
+                    "actor": OPERATIONAL_RETRY_ACTOR,
+                    "retry_of": request_id,
+                    "failure_class": failure_class,
+                },
+            )
+    except Exception as exc:  # noqa: BLE001 -- one card must not abort the pass
+        retry = {"ok": False, "stderr": f"retry_raised:{type(exc).__name__}"}
+    if not retry.get("ok"):
+        error = str(retry.get("stderr") or retry.get("error") or "retry_refused")[:200]
+        return {**outcome, "state": "retry_failed", "error": error}
+    launch = _operational_launch(mgr, task_id, runner, topic, request_id)
+    if launch["ok"]:
+        outcome.update(state="relaunched", request_id=launch["request_id"])
+    else:
+        try:
+            reblock = _reblock_unlaunched(mgr, task_id, runner, topic, launch["error"])
+        except Exception as exc:  # noqa: BLE001 -- report, never raise
+            reblock = f"reblock_raised:{type(exc).__name__}"
+        outcome.update(state="launch_failed", error=launch["error"], reblock=reblock)
+    outcome["event_recorded"] = _record_operational_retry(
+        Path(mgr.repo).resolve(),
+        task_id,
+        {
+            "schema_id": "aiworkhub.operational_auto_retry.v1",
+            "actor": OPERATIONAL_RETRY_ACTOR,
+            "retry_of": request_id,
+            "terminal_substatus": substatus,
+            "failure_class": failure_class,
+            "state": outcome["state"],
+            "request_id": outcome.get("request_id") or "",
+            "error": outcome.get("error") or "",
+            "informational": True,
+        },
+    )
+    return outcome
+
+
+def _scan_operational_retry_relaunch(mgr: process_launcher.ProcessManager) -> dict[str, Any]:
+    """Retry and relaunch blocked work cards whose failure is purely operational.
+
+    A blocked card qualifies only when ``stale_recovery._classify_blocked``
+    recommends ``relaunch`` for it, its substatus is in the automatic subset,
+    it is not a quality-reviewer card, ``core.automatic_terminal_retry_refusal``
+    is empty, and fewer than ``OPERATIONAL_RETRY_BUDGET`` automatic retries of
+    it were recorded inside the window.  Everything else stays blocked and its
+    existing manager callback is untouched.  Each card's failure is isolated
+    and reported; the pass itself never raises.
+    """
+    repo = Path(mgr.repo).resolve()
+    try:
+        candidates, bounds = stale_recovery.relaunch_candidates(
+            root=repo,
+            substatuses=OPERATIONAL_RETRY_SUBSTATUSES,
+            limit=OPERATIONAL_RETRY_CLASSIFY_LIMIT,
+        )
+    except Exception as exc:  # noqa: BLE001 -- never block worker reconcile
+        return {"ok": False, "state": "skipped", "reason": f"{type(exc).__name__}"[:80]}
+    since = datetime.fromtimestamp(
+        time.time() - OPERATIONAL_RETRY_WINDOW_SECONDS, timezone.utc
+    ).isoformat()
+    results: list[dict[str, Any]] = []
+    attempted = 0
+    deferred = 0
+    for card, row in candidates:
+        if attempted >= OPERATIONAL_RETRY_RELAUNCH_CAPACITY:
+            deferred += 1
+            continue
+        try:
+            outcome = _operational_retry_one(mgr, card, row, since)
+        except Exception as exc:  # noqa: BLE001 -- isolate one card
+            outcome = {"task_id": str(row.get("task_id") or ""), "state": "error",
+                       "error": type(exc).__name__[:80]}
+        if outcome.get("attempted"):
+            attempted += 1
+        results.append(outcome)
+    by_state: dict[str, int] = {}
+    for outcome in results:
+        by_state[outcome["state"]] = by_state.get(outcome["state"], 0) + 1
+    return {
+        "ok": True,
+        "state": "ran",
+        "candidates": len(candidates),
+        "attempted": attempted,
+        "relaunched": by_state.get("relaunched", 0),
+        "deferred": deferred,
+        "capacity": OPERATIONAL_RETRY_RELAUNCH_CAPACITY,
+        "by_state": dict(sorted(by_state.items())),
+        "errors": [
+            {"task_id": o["task_id"], "state": o["state"], "error": o.get("error", "")}
+            for o in results if o["state"] in {"retry_failed", "launch_failed", "budget_unreadable", "error"}
+        ],
+        "results": results,
+        "bounds": bounds,
+    }
 
 
 def _scan_orphan_claims(mgr: process_launcher.ProcessManager) -> dict[str, Any]:

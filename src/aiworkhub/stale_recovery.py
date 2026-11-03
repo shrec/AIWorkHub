@@ -380,6 +380,7 @@ def _classify_blocked(
     root: Path,
     siblings: Mapping[str, list[_Sibling]],
     needfix_status: Callable[[str], str | None],
+    relaunch_substatuses: frozenset[str] = RELAUNCH_SUBSTATUSES,
 ) -> dict[str, Any]:
     # core imports this module, so the owner of the failure-class read is imported lazily.
     from aiworkhub import core
@@ -425,7 +426,7 @@ def _classify_blocked(
             return decide("replay", "Rework predecessor has a verified sealed delta.")
         if delta_failure:
             return decide("keep", f"Rework delta could not be verified ({delta_failure}).")
-    if substatus in RELAUNCH_SUBSTATUSES:
+    if substatus in relaunch_substatuses:
         return decide("relaunch", f"terminal_substatus {substatus} is an operational failure.")
     if never_started_request_id(card):
         return decide(
@@ -510,3 +511,52 @@ def build_blocked_triage(
         },
         "authority_flags": _authority_flags(),
     }
+
+
+def relaunch_candidates(
+    *,
+    root: str | Path,
+    substatuses: frozenset[str],
+    limit: int,
+    needfix_status: Callable[[str], str | None] | None = None,
+) -> tuple[list[tuple[Mapping[str, Any], dict[str, Any]]], dict[str, Any]]:
+    """Blocked cards ``_classify_blocked`` recommends relaunching, read-only.
+
+    NF-2026-01926: the reconciler's unattended operational retry consults the
+    same classifier the manager triage shows, so the two can never disagree
+    about which card is relaunchable.  ``substatuses`` is the caller's named
+    automatic subset; only rows whose ``worker_status`` could carry one of them
+    (or ``blocked``, the never-started episode) are read in full, most recently
+    updated first, and at most ``limit`` cards are classified.  Returns
+    ``[(card, row), ...]`` for every ``relaunch`` recommendation plus bounds.
+    """
+    root = Path(root)
+    limit = max(1, min(int(limit), _STORE_SCAN_CAP))
+    readiness = task_store.storage_readiness(root)
+    listed = task_store.list_tasks(root, status="blocked", limit=_STORE_SCAN_CAP)
+    readable_statuses = set(substatuses) | {"blocked"}
+    matching = [row for row in listed if str(row.get("worker_status") or "") in readable_statuses]
+    chosen = matching[:limit]
+    cards = [_read_card(root, readiness, row) for row in chosen]
+    topics = {str(card.get("topic") or "") for card in cards} - {""}
+    others: list[Mapping[str, Any]] = []
+    for status in (_SIBLING_DONE_STATUSES + _SIBLING_LIVE_STATUSES if topics else ()):
+        rows = task_store.list_tasks(root, status=status, limit=_STORE_SCAN_CAP)
+        others.extend(row for row in rows if str(row.get("topic") or "") in topics)
+    siblings = _sibling_index(others)
+    lookup = needfix_status if needfix_status is not None else _store_needfix_status(root)
+    candidates: list[tuple[Mapping[str, Any], dict[str, Any]]] = []
+    for card in cards:
+        row = _classify_blocked(
+            card, root=root, siblings=siblings, needfix_status=lookup,
+            relaunch_substatuses=substatuses,
+        )
+        if row["recommendation"] == "relaunch":
+            candidates.append((card, row))
+    bounds = {
+        "limit": limit,
+        "blocked_matching": len(matching),
+        "classified": len(cards),
+        "truncated": len(matching) > len(cards),
+    }
+    return candidates, bounds
