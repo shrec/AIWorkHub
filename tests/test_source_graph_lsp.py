@@ -106,7 +106,7 @@ def test_fake_child_imports_only_stdlib_and_preserves_real_handshake(tmp_path: P
         [command[0], "-X", "importtime", *command[1:]],
         input=b"".join(frames), capture_output=True,
         env={**os.environ, **_env(scenario, log_path)}, cwd=tmp_path,
-        timeout=4.0, check=False,
+        timeout=HAPPY_PATH_DEADLINE_S, check=False,  # hang guard only
     )
     assert child.returncode == 0, child.stderr.decode("utf-8", "replace")
     assert child.stdout.count(b"Content-Length:") == 2
@@ -486,7 +486,7 @@ def test_empty_definition_is_unresolved(tmp_path: Path) -> None:
         spec=_spec(scenario),
         queries=[DefinitionQuery("src/mod.py", hashes["src/mod.py"], 2, 11)],
         indexed_hashes=hashes,
-        request_timeout_s=2.0,
+        request_timeout_s=HAPPY_PATH_DEADLINE_S,
         env=_env(scenario),
     )
     assert outcome.results[0].classification == UNRESOLVED
@@ -522,6 +522,8 @@ def test_multiple_targets_are_ambiguous_not_internal(tmp_path: Path) -> None:
 
 
 def test_timeout_and_cancel_reap_child(tmp_path: Path) -> None:
+    import aiworkhub.source_graph_lsp as lsp
+
     source = b"def foo():\n    return foo()\n"
     repo, workspace, hashes = _workspace(tmp_path, [("src/mod.py", source)])
     hang = _write_scenario(tmp_path / "hang.json", {"hang": True})
@@ -531,6 +533,8 @@ def test_timeout_and_cancel_reap_child(tmp_path: Path) -> None:
         spec=_spec(hang),
         queries=[DefinitionQuery("src/mod.py", hashes["src/mod.py"], 2, 11)],
         indexed_hashes=hashes,
+        # Short on purpose: the deadline itself is under test. The server
+        # never answers, so the outcome does not depend on host speed.
         request_timeout_s=0.2,
         batch_timeout_s=1.0,
         env=_env(hang),
@@ -538,24 +542,74 @@ def test_timeout_and_cancel_reap_child(tmp_path: Path) -> None:
     assert timed.results[0].classification == UNRESOLVED
     assert timed.children_reaped
     for pid in timed.child_pids:
-        with pytest.raises(OSError):
-            os.kill(pid, 0)
+        assert not lsp._pid_alive(pid)
 
+    _assert_cancel_mid_request_reaps_child(tmp_path, repo, workspace, hashes, hang)
+
+
+def _assert_cancel_mid_request_reaps_child(
+    tmp_path: Path,
+    repo: Path,
+    workspace: BoundedWorkspace,
+    hashes: dict[str, str],
+    hang: Path,
+) -> None:
+    # Cancel once the server has actually received the definition request
+    # (observed in its method log) instead of after a fixed delay, so the
+    # cancel always lands mid-request however slow the child is to start.
+    # The request/batch timeouts are hang guards only: they sit below the
+    # fake server's 120 s hang, so only the cancel can end this call early.
+    log_path = tmp_path / "cancel-lsp.log"
     cancel = threading.Event()
-    threading.Timer(0.1, cancel.set).start()
-    cancelled = resolve_definitions(
-        repo_root=repo,
-        workspace=workspace,
-        spec=_spec(hang),
-        queries=[DefinitionQuery("src/mod.py", hashes["src/mod.py"], 2, 11)],
-        indexed_hashes=hashes,
-        request_timeout_s=5.0,
-        batch_timeout_s=5.0,
-        cancel_event=cancel,
-        env=_env(hang),
-    )
+    done = threading.Event()
+
+    def _cancel_on_definition() -> None:
+        if _wait_until(
+            lambda: done.is_set()
+            or "textDocument/definition" in _logged_methods(log_path)
+        ) and not done.is_set():
+            cancel.set()
+
+    watcher = threading.Thread(target=_cancel_on_definition, daemon=True)
+    watcher.start()
+    try:
+        cancelled = resolve_definitions(
+            repo_root=repo,
+            workspace=workspace,
+            spec=_spec(hang),
+            queries=[DefinitionQuery("src/mod.py", hashes["src/mod.py"], 2, 11)],
+            indexed_hashes=hashes,
+            request_timeout_s=HAPPY_PATH_DEADLINE_S,
+            batch_timeout_s=HAPPY_PATH_DEADLINE_S,
+            cancel_event=cancel,
+            env=_env(hang, log_path),
+        )
+    finally:
+        done.set()
+        watcher.join(timeout=HAPPY_PATH_DEADLINE_S)
+    assert "textDocument/definition" in _logged_methods(log_path)
+    assert cancel.is_set()
     assert cancelled.results[0].classification == UNRESOLVED
     assert cancelled.children_reaped
+
+
+def _logged_methods(log_path: Path) -> list[str]:
+    try:
+        methods = json.loads(log_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []  # not written yet, or caught mid-rewrite: poll again
+    return methods if isinstance(methods, list) else []
+
+
+def _wait_until(condition: Callable[[], bool], ceiling_s: float = HAPPY_PATH_DEADLINE_S) -> bool:
+    # Poll an observed condition; the ceiling is only a hang guard.
+    deadline = time.monotonic() + ceiling_s
+    while True:
+        if condition():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
 
 
 def test_malformed_framing_reaps_child(tmp_path: Path) -> None:
@@ -568,7 +622,7 @@ def test_malformed_framing_reaps_child(tmp_path: Path) -> None:
         spec=_spec(scenario),
         queries=[DefinitionQuery("src/mod.py", hashes["src/mod.py"], 2, 11)],
         indexed_hashes=hashes,
-        request_timeout_s=1.0,
+        request_timeout_s=HAPPY_PATH_DEADLINE_S,
         env=_env(scenario),
     )
     assert outcome.results[0].classification == UNRESOLVED
@@ -585,7 +639,7 @@ def test_unbounded_output_cannot_be_repo_internal(tmp_path: Path) -> None:
         spec=_spec(scenario),
         queries=[DefinitionQuery("src/mod.py", hashes["src/mod.py"], 2, 11)],
         indexed_hashes=hashes,
-        request_timeout_s=2.0,
+        request_timeout_s=HAPPY_PATH_DEADLINE_S,
         max_output_bytes=64,
         env=_env(scenario),
     )
@@ -594,6 +648,8 @@ def test_unbounded_output_cannot_be_repo_internal(tmp_path: Path) -> None:
 
 
 def test_tiny_max_input_bytes_fails_closed(tmp_path: Path) -> None:
+    import aiworkhub.source_graph_lsp as lsp
+
     source = b"def foo():\n    return foo()\n"
     repo, workspace, hashes = _workspace(tmp_path, [("src/mod.py", source)])
     scenario = _write_scenario(tmp_path / "tiny.json", {})
@@ -603,7 +659,7 @@ def test_tiny_max_input_bytes_fails_closed(tmp_path: Path) -> None:
         spec=_spec(scenario),
         queries=[DefinitionQuery("src/mod.py", hashes["src/mod.py"], 2, 11)],
         indexed_hashes=hashes,
-        request_timeout_s=2.0,
+        request_timeout_s=HAPPY_PATH_DEADLINE_S,
         max_input_bytes=100,
         env=_env(scenario),
     )
@@ -612,8 +668,7 @@ def test_tiny_max_input_bytes_fails_closed(tmp_path: Path) -> None:
     assert outcome.results[0].classification != REPO_INTERNAL
     assert outcome.children_reaped
     for pid in outcome.child_pids:
-        with pytest.raises(OSError):
-            os.kill(pid, 0)
+        assert not lsp._pid_alive(pid)
 
 
 def test_pid_alive_observes_without_signalling(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -675,24 +730,9 @@ def test_windows_stdio_timeout_cancel_and_cleanup(tmp_path: Path, monkeypatch: p
     assert timed.results[0].classification == UNRESOLVED
     assert timed.children_reaped
     for pid in timed.child_pids:
-        with pytest.raises(OSError):
-            os.kill(pid, 0)
+        assert not lsp._pid_alive(pid)
 
-    cancel = threading.Event()
-    threading.Timer(0.1, cancel.set).start()
-    cancelled = resolve_definitions(
-        repo_root=repo,
-        workspace=workspace,
-        spec=_spec(hang),
-        queries=[DefinitionQuery("src/mod.py", hashes["src/mod.py"], 2, 11)],
-        indexed_hashes=hashes,
-        request_timeout_s=5.0,
-        batch_timeout_s=5.0,
-        cancel_event=cancel,
-        env=_env(hang),
-    )
-    assert cancelled.results[0].classification == UNRESOLVED
-    assert cancelled.children_reaped
+    _assert_cancel_mid_request_reaps_child(tmp_path, repo, workspace, hashes, hang)
 
 
 def _stalled_large_didopen(tmp_path: Path) -> None:
@@ -711,15 +751,18 @@ def _stalled_large_didopen(tmp_path: Path) -> None:
         env=_env(stall),
     )
     elapsed = time.monotonic() - started
-    assert elapsed < 1.0
+    # The fake server stalls its stdin for 120 s, so a writer that ignored the
+    # 0.3 s batch deadline could only return after that stall. The ceiling is a
+    # hang guard well below the stall, not a load-sensitive latency budget.
+    assert elapsed < HAPPY_PATH_DEADLINE_S
     assert outcome.results[0].classification == UNRESOLVED
     assert outcome.children_reaped
     for pid in outcome.child_pids:
         assert not process_is_alive(pid)
-    assert not any(
+    assert _wait_until(lambda: not any(
         thread.name == "lsp-stdio-w" and thread.is_alive()
         for thread in threading.enumerate()
-    )
+    ))
 
 
 def test_didopen_write_respects_deadline_when_server_stops_reading(tmp_path: Path) -> None:
@@ -754,7 +797,7 @@ def test_stale_source_hash_cannot_be_repo_internal(tmp_path: Path) -> None:
         spec=_spec(scenario),
         queries=[DefinitionQuery("src/mod.py", "0" * 64, 2, 11)],
         indexed_hashes=hashes,
-        request_timeout_s=2.0,
+        request_timeout_s=HAPPY_PATH_DEADLINE_S,
         env=_env(scenario),
     )
     assert outcome.results[0].classification != REPO_INTERNAL
@@ -881,7 +924,7 @@ def test_batch_order_independent_of_server_completion(tmp_path: Path) -> None:
         spec=_spec(scenario),
         queries=queries,
         indexed_hashes=hashes,
-        request_timeout_s=2.0,
+        request_timeout_s=HAPPY_PATH_DEADLINE_S,
         observed_cores=2,
         env=_env(scenario),
     )
@@ -934,7 +977,7 @@ def test_file_sharded_execution_launches_bounded_servers(tmp_path: Path) -> None
         spec=_spec(scenario),
         queries=queries,
         indexed_hashes=hashes,
-        request_timeout_s=2.0,
+        request_timeout_s=HAPPY_PATH_DEADLINE_S,
         observed_cores=4,
         env=_env(scenario),
     )
@@ -1278,8 +1321,8 @@ def test_server_never_opens_a_symlinked_workspace_file(tmp_path: Path) -> None:
         spec=_spec(scenario),
         queries=[DefinitionQuery("src/mod.py", hashes["src/mod.py"], 2, 11)],
         indexed_hashes=hashes,
-        request_timeout_s=2.0,
-        batch_timeout_s=4.0,
+        request_timeout_s=HAPPY_PATH_DEADLINE_S,
+        batch_timeout_s=HAPPY_PATH_DEADLINE_S,
         env=_env(scenario, log_path),
     )
     assert outcome.results[0].classification == UNRESOLVED
@@ -1299,8 +1342,8 @@ def test_definition_batch_defaults_to_verified_workspace_hashes(tmp_path: Path) 
         workspace=workspace,
         spec=_spec(scenario),
         queries=[DefinitionQuery("src/mod.py", hashes["src/mod.py"], 2, 11)],
-        request_timeout_s=2.0,
-        batch_timeout_s=4.0,
+        request_timeout_s=HAPPY_PATH_DEADLINE_S,
+        batch_timeout_s=HAPPY_PATH_DEADLINE_S,
         env=_env(scenario),
     )
     assert outcome.results[0].classification == REPO_INTERNAL
@@ -1322,8 +1365,8 @@ def test_server_request_with_a_colliding_id_is_not_a_definition_response(
         spec=_spec(scenario),
         queries=[DefinitionQuery("src/mod.py", hashes["src/mod.py"], 2, 11)],
         indexed_hashes=hashes,
-        request_timeout_s=2.0,
-        batch_timeout_s=4.0,
+        request_timeout_s=HAPPY_PATH_DEADLINE_S,
+        batch_timeout_s=HAPPY_PATH_DEADLINE_S,
         env=_env(scenario),
     )
     assert outcome.results[0].classification == REPO_INTERNAL
@@ -1486,7 +1529,7 @@ def _run_fake_lsp_server() -> int:
                 },
             })
             if scenario.get("stall_stdin_after_initialize"):
-                time.sleep(30)
+                time.sleep(120)
             continue
         if method == "initialized":
             continue
@@ -1515,7 +1558,10 @@ def _run_fake_lsp_server() -> int:
                         json.dumps(params.get("position")), encoding="utf-8"
                     )
             if scenario.get("hang"):
-                time.sleep(30)
+                # Far beyond every test's hang-guard ceiling, so a client that
+                # ignored its deadline or cancel could never be rescued by the
+                # server finally answering.
+                time.sleep(120)
             if scenario.get("malformed"):
                 stdout.write(b"not-a-valid-header\r\n\r\n{}")
                 stdout.flush()
