@@ -14150,17 +14150,23 @@ def _append_ledger_rows(path: Path, rows: list[dict]) -> None:
 
 
 def _count_ledger_replays(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
-    """Count whole-ledger replays -- a bounded call count, never a duration."""
+    """Count bounded ledger passes -- a call count, never a duration.
+
+    Since NF-2026-02013 every ledger pass the request projection makes -- a
+    cold replay, a rotation's fail-closed replay or a key miss -- goes through
+    ``_scan_request_events``, which reads a stable snapshot without
+    ``iter_events``; incremental append replays never call it.
+    """
 
     calls = {"count": 0}
-    original = process_launcher.process_event_ledger.iter_events
+    original = process_launcher.process_event_ledger._scan_request_events
 
-    def counting(path: Path):
+    def counting(*args: object, **kwargs: object) -> object:
         calls["count"] += 1
-        return original(path)
+        return original(*args, **kwargs)
 
     monkeypatch.setattr(
-        process_launcher.process_event_ledger, "iter_events", counting
+        process_launcher.process_event_ledger, "_scan_request_events", counting
     )
     return calls
 
