@@ -7828,23 +7828,73 @@ def _analytics_scope_sql_predicate(scope: str) -> tuple[str, tuple[str, str]]:
     )
 
 
+_ANALYTICS_CORPUS_EXCLUDED_KINDS_SQL = "kind NOT IN ('file', 'module')"
+
+# A cheap SQL-side pre-rank per ranked analytic mode, aimed the same way as the
+# mode's own Python ranking, so the capped corpus keeps the HOTTEST rows of the
+# whole eligible scope instead of the first rows alphabetically. Before this,
+# the corpus was ``ORDER BY kind, file_path ... LIMIT`` and the analytic then
+# ranked only its first ``RANKED_POPULATION_ROWS`` rows, so on a repository
+# with more function rows than that every symbol in a late-sorting file
+# (worker_workspace.py, process_launcher.py, server.py) was never ranked at all
+# (NF-2026-01992). Branch/loop counts are lexical and not stored, so
+# complexity/hotspots use ``line_span`` as their SQL proxy; bottlenecks uses the
+# exact ``incoming*3 + outgoing`` call-edge score the analytic sorts by. The
+# score is computed over ALL eligible rows (one GROUP BY pass per edge
+# direction) and only then is LIMIT applied. Other modes keep the plain order.
+_ANALYTICS_RANKED_CORPUS_SCORE_SQL: dict[str, str] = {
+    "bottlenecks": "COALESCE(inc.inc_n, 0) * 3 + COALESCE(outg.out_n, 0)",
+    "complexity": "(line_end - line_start)",
+    "hotspots": (
+        "COALESCE(inc.inc_n, 0) * 4 + COALESCE(outg.out_n, 0) * 2"
+        " + (line_end - line_start) / 8"
+    ),
+}
+_ANALYTICS_CALL_COUNT_JOINS_SQL = (
+    "LEFT JOIN (SELECT dst_qualname AS inc_q, COUNT(*) AS inc_n FROM edges "
+    "WHERE kind = 'calls' AND dst_qualname IS NOT NULL GROUP BY dst_qualname) AS inc "
+    "ON inc.inc_q = entities.qualname "
+    "LEFT JOIN (SELECT src_qualname AS out_q, COUNT(*) AS out_n FROM edges "
+    "WHERE kind = 'calls' GROUP BY src_qualname) AS outg "
+    "ON outg.out_q = entities.qualname "
+)
+
+
+def _scoped_entity_count(conn: sqlite3.Connection, scope: str) -> int:
+    """Every eligible analytic row in ``scope`` -- the truthful ``eligible``."""
+
+    sql = f"SELECT COUNT(*) FROM entities WHERE {_ANALYTICS_CORPUS_EXCLUDED_KINDS_SQL}"
+    if scope:
+        predicate, params = _analytics_scope_sql_predicate(scope)
+        return int(conn.execute(sql + f" AND {predicate}", tuple(params)).fetchone()[0])
+    return int(conn.execute(sql).fetchone()[0])
+
+
 def _scoped_entity_rows(
-    conn: sqlite3.Connection, scope: str, *, limit: int,
+    conn: sqlite3.Connection, scope: str, *, limit: int, mode: str = "",
 ) -> list[dict[str, Any]]:
-    """Bounded entity corpus for analytics, optionally confined to ``scope``."""
+    """Bounded entity corpus for analytics, optionally confined to ``scope``.
+
+    For a ranked ``mode`` the rows kept under ``limit`` are the highest-scoring
+    of the whole scope (see ``_ANALYTICS_RANKED_CORPUS_SCORE_SQL``).
+    """
 
     cap = max(1, limit)
     # ``module``/``file`` rows are containers, never a renderable analytic
     # subject for any mode -- excluding them keeps ``eligible``/``scanned``
     # aligned with what a mode can actually return, instead of inflating
     # coverage with rows no mode will ever emit.
+    score_sql = _ANALYTICS_RANKED_CORPUS_SCORE_SQL.get(mode)
     select = (
         "SELECT file_path, kind, name, qualname, line_start, line_end, signature, "
-        "evidence_label, confidence FROM entities WHERE kind NOT IN ('file', 'module') "
+        "evidence_label, confidence FROM entities "
+        + (_ANALYTICS_CALL_COUNT_JOINS_SQL if score_sql else "")
+        + f"WHERE {_ANALYTICS_CORPUS_EXCLUDED_KINDS_SQL} "
     )
     order_by = (
         "ORDER BY CASE WHEN kind IN ('function','method') THEN 0 ELSE 1 END, "
-        "file_path, line_start, qualname LIMIT ?"
+        + (f"({score_sql}) DESC, " if score_sql else "")
+        + "file_path, line_start, qualname LIMIT ?"
     )
     if scope:
         predicate, params = _analytics_scope_sql_predicate(scope)
@@ -8558,6 +8608,9 @@ def analytics_query(
             # happen to match, which belong to unrelated files.
             corpus = [line_symbol] if line_symbol is not None else []
             corpus_cap = MAX_ANALYTICS_CORPUS_ROWS
+            # ``eligible`` from a full-scope COUNT where the corpus is a capped
+            # SQL scope; None means the corpus itself is the eligible set.
+            scope_eligible: int | None = None
         # An explicit target is a SCOPE, not a filter. The corpus was previously
         # built the other way round -- ``find(query)`` decided membership and the
         # target then filtered what that query happened to match -- so a lens saw
@@ -8582,12 +8635,14 @@ def analytics_query(
         # longer does is decide who is in scope.
         elif normalized_target:
             corpus = _scoped_entity_rows(
-                conn, normalized_target, limit=MAX_ANALYTICS_CORPUS_ROWS,
+                conn, normalized_target, limit=MAX_ANALYTICS_CORPUS_ROWS, mode=mode,
             )
             corpus_cap = MAX_ANALYTICS_CORPUS_ROWS
+            scope_eligible = _scoped_entity_count(conn, normalized_target)
         else:
             corpus = find(conn, query, limit=MAX_ANALYTICS_CORPUS_ROWS)
             corpus_cap = min(MAX_ANALYTICS_CORPUS_ROWS, MAX_BUDGET_ROWS)
+            scope_eligible = None
             if not corpus:
                 # No scope and nothing matched: the repository itself is the
                 # corpus, which is what the per-mode analytic reports as
@@ -8595,10 +8650,21 @@ def analytics_query(
                 # an explicit target with no rows stays empty below, so a scope
                 # can never be widened back out to the whole repository.
                 corpus = _scoped_entity_rows(
-                    conn, normalized_target, limit=MAX_ANALYTICS_CORPUS_ROWS,
+                    conn, normalized_target, limit=MAX_ANALYTICS_CORPUS_ROWS, mode=mode,
                 )
                 corpus_cap = MAX_ANALYTICS_CORPUS_ROWS
-        corpus_capped = len(corpus) >= corpus_cap
+                scope_eligible = _scoped_entity_count(conn, normalized_target)
+        # ``eligible`` is the whole in-scope population, not ``len(corpus)``,
+        # and ``eligible_capped`` is true only when rows were really dropped.
+        # A find-backed corpus has no cheap full count, so it keeps the
+        # "filled its cap" signal. Paging still walks the corpus that was
+        # actually handed to the analytic (``total_eligible``).
+        if scope_eligible is None:
+            corpus_capped = len(corpus) >= corpus_cap
+            reported_eligible = len(corpus)
+        else:
+            corpus_capped = scope_eligible > len(corpus)
+            reported_eligible = max(scope_eligible, len(corpus))
         total_eligible = len(corpus)
         if offset and offset >= total_eligible:
             raise SourceGraphError("invalid_cursor")
@@ -8690,7 +8756,7 @@ def analytics_query(
             "next_cursor": placeholder_cursor,
             "coverage": {
                 "scanned": total_eligible,
-                "eligible": total_eligible,
+                "eligible": reported_eligible,
                 "eligible_capped": corpus_capped,
                 "returned": 0,
                 "requested_budget": requested_budget,
@@ -8750,7 +8816,7 @@ def analytics_query(
         payload["next_cursor"] = next_cursor
         payload["coverage"] = {
             "scanned": examined,
-            "eligible": total_eligible,
+            "eligible": reported_eligible,
             "eligible_capped": corpus_capped,
             "returned": returned,
             "requested_budget": requested_budget,

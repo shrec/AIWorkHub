@@ -1205,10 +1205,20 @@ def query(
         return payload
 
     if mode in {"churn", "ownership"}:
-        available, history, reason = _history_rows(conn, files if matches else [], budget=budget)
+        history_files = files if matches else []
+        available, history, reason = _history_rows(conn, history_files, budget=budget)
+        history_block: dict[str, Any] = {"available": available, "window": "90d", "reason": reason}
+        if available and not history:
+            # Never an unexplained empty list (NF-2026-01992): the query's
+            # matched files carry no file_history rows, or history is empty.
+            history_block["reason"] = (
+                "query_matched_no_history_files" if history_files else "file_history_empty"
+            )
+        if matches:
+            history_block["matched_files"] = len(history_files)
         payload = {
             **base,
-            "history": {"available": available, "window": "90d", "reason": reason},
+            "history": history_block,
             "files": history,
         }
         if mode == "ownership":
