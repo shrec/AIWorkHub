@@ -209,6 +209,25 @@ def _bind(manager, task_id: str, request_id: str) -> dict:
     )
 
 
+def _assert_identified_refusal(
+    result: dict, reason: str, task_id: str, request_id: str
+) -> None:
+    """A fail-closed refusal: the exact ok/error pair plus the launch identity.
+
+    NF-2026-01993 names the request, card, target and adapter by value; nothing
+    else may ride along, so a wrong error or a stray recovery key still fails.
+    """
+    assert result == {
+        "ok": False,
+        "error": reason,
+        "request_id": request_id,
+        "task_id": task_id,
+        "target_request_id": "target-request",
+        "target_task_id": "target-task",
+        "adapter_id": "codex_cli",
+    }
+
+
 def test_reviewer_contention_retains_reservation_and_starts_nothing(
     tmp_path, monkeypatch
 ):
@@ -332,7 +351,7 @@ def test_reviewer_untrusted_claim_failure_still_fails_closed(
     result = _bind(manager, task_id, request_id)
 
     reason = "quality_review_claim_failed:" + claim["stderr"][:500]
-    assert result == {"ok": False, "error": reason}
+    _assert_identified_refusal(result, reason, task_id, request_id)
     assert terminalized == [reason]
     latest = manager._latest_by_request()[request_id]
     assert "claim_recovery_state" not in latest
@@ -362,7 +381,7 @@ def test_reviewer_contention_that_cannot_be_retained_fails_closed(
 
     reason = "quality_review_claim_failed:" + claims[0]["stderr"][:500]
     # Neither retained nor left dangling: the attempt is terminalized.
-    assert result == {"ok": False, "error": reason}
+    _assert_identified_refusal(result, reason, task_id, request_id)
     assert terminalized == [reason]
 
 

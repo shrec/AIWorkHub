@@ -75,6 +75,7 @@ from . import quality_review_ingest
 from . import quality_review_scope
 from . import process_event_ledger
 from . import storage_retention, terminal_failure_classification, validation_auto_rework
+from . import reviewer_launch_refusal as _refusal
 from .process_launcher_acceptance import accepted_outcome_receipt as _accepted_outcome_receipt
 from .process_launcher_acceptance import changed_path_hashes as _changed_path_hashes
 from .process_launcher_acceptance import finished_acceptance_result as _finished_acceptance_result
@@ -8052,27 +8053,21 @@ class ProcessManager:
             review_target_task_id=target_task_id,  # NF-2026-01095: target's route
         )
         create_ok = created.get("ok") is True
-        create_structured = (
-            created.get("reconciled") is True
-            or str(created.get("receipt_state") or "") == "existing_identical"
-        )
-        create_detail = str(
-            created.get("stderr")
-            or created.get("stdout")
-            or created.get("error")
-            or ""
-        )
+        create_structured = _refusal.create_receipt_structured(created)
+        create_detail = _refusal.reply_detail(created)
         # NF-2026-01993: every non-ok reply names its request, card and adapter.
-        ident = {"request_id": request_id, "task_id": reviewer_task_id,
-                 "target_request_id": target_request_id,
-                 "target_task_id": target_task_id, "adapter_id": adapter_id}
+        ident = _refusal.refusal_identity(
+            request_id=request_id, task_id=reviewer_task_id,
+            target_request_id=target_request_id,
+            target_task_id=target_task_id, adapter_id=adapter_id,
+        )
 
         def _fail(reason: str) -> dict[str, Any]:
             if terminalize_on_failure:
                 self._terminalize_reviewer_attempt(
                     request_id, reviewer_task_id, runner, adapter_id, reason=reason
                 )
-            return {"ok": False, "error": reason, **ident}
+            return _refusal.refusal(ident, reason)
 
         if not create_ok and not create_structured:
             failed = _fail("quality_review_task_create_failed:" + create_detail[:500])
@@ -8086,27 +8081,11 @@ class ProcessManager:
                 )
             except LaunchRejected as exc:
                 return _fail(f"quality_review_card_unreadable:{exc}"[:500])
-            allowed_writes = card.get("allowed_writes")
-            mismatches: list[str] = []
-            if card.get("read_only") is not True:
-                mismatches.append("read_only")
-            if not isinstance(allowed_writes, list) or list(allowed_writes) != []:
-                mismatches.append("allowed_writes")
-            if card.get("topic") != "quality_review":
-                mismatches.append("topic")
-            if card.get("runner") != runner:
-                mismatches.append("runner")
-            if (
-                require_launch_request
-                and card.get("launch_request_id") != request_id
-            ):
-                mismatches.append("launch_request_id")
-            if mismatches:
-                return _fail(
-                    "quality_review_card_identity_mismatch:"
-                    + ",".join(mismatches)
-                )
-            return None
+            mismatch = _refusal.card_identity_mismatch(
+                card, runner=runner, request_id=request_id,
+                require_launch_request=require_launch_request,
+            )
+            return _fail(mismatch) if mismatch else None
 
         durable_error = _verify_durable(require_launch_request=False)
         if durable_error is not None:
@@ -8119,10 +8098,7 @@ class ProcessManager:
             request_id=request_id,
         )
         if not claim.get("ok"):
-            reason = (
-                "quality_review_claim_failed:"
-                + str(claim.get("stderr") or claim.get("stdout") or "")[:500]
-            )
+            reason = _refusal.claim_failure_reason(claim)
             contention = task_engine.trusted_claim_contention(
                 claim, task_id=reviewer_task_id, request_id=request_id
             )
@@ -8139,13 +8115,10 @@ class ProcessManager:
                 retained = False
             if not retained:
                 return _fail(reason)
-            return {
-                "ok": False, **ident,
-                "error": reason,
-                "recovery_state": "starting_reservation_retained",
-                "claim_recovery_bound": True,
-                "task_queue_contention": contention,
-            }
+            return _refusal.retained_refusal(
+                ident, reason, claim_recovery_bound=True,
+                task_queue_contention=contention,
+            )
         try:
             claimed_card = _committed_claim_card(
                 claim,
@@ -8180,13 +8153,11 @@ class ProcessManager:
                     )
                 except Exception:  # noqa: BLE001 -- return stable retry evidence
                     recovery_retained = False
-                return {
-                    "ok": False, **ident,
-                    "error": f"quality_review_claim_failed:{receipt_exc}"[:500],
-                    "recovery_state": "starting_reservation_retained",
-                    "claim_recovery_bound": recovery_retained,
-                    "claim_recovery_error": str(recovery_exc)[:500],
-                }
+                return _refusal.retained_refusal(
+                    ident, f"quality_review_claim_failed:{receipt_exc}"[:500],
+                    claim_recovery_bound=recovery_retained,
+                    claim_recovery_error=str(recovery_exc)[:500],
+                )
         claim_epoch = claimed_card.get("claim_epoch")
         binding_persisted = False
         bind_reason = "quality_review_claim_binding_failed:binding_not_persisted"
@@ -8197,9 +8168,7 @@ class ProcessManager:
                 )
             except Exception as exc:  # noqa: BLE001 -- claim must never be stranded
                 binding_persisted = False
-                bind_reason = (
-                    f"quality_review_claim_binding_failed:{type(exc).__name__}:{exc}"
-                )[:500]
+                bind_reason = _refusal.binding_failure_reason(exc)
         if not binding_persisted:
             # Terminalize the reservation only after the canonical task release
             # succeeds.  If that CAS/store operation fails, preserving the
@@ -8220,19 +8189,10 @@ class ProcessManager:
                         )
                     except Exception:  # noqa: BLE001 -- report retryable evidence
                         recovery_bound = False
-                return {
-                    "ok": False,
-                    "error": bind_reason,
-                    **ident,
-                    "recovery_state": "starting_reservation_retained",
-                    "claim_recovery_bound": recovery_bound,
-                    "release_error": str(
-                        released.get("stderr")
-                        or released.get("stdout")
-                        or released.get("error")
-                        or ""
-                    )[:500],
-                }
+                return _refusal.retained_refusal(
+                    ident, bind_reason, claim_recovery_bound=recovery_bound,
+                    release_error=_refusal.reply_detail(released),
+                )
             return _fail(bind_reason)
         durable_error = _verify_durable(require_launch_request=True)
         if durable_error is not None:

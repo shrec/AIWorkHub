@@ -318,8 +318,12 @@ def _launch(substatus: str, *, explicit: bool) -> dict:
 
 
 def test_explicit_reviewer_launch_is_admitted_for_a_validation_failed_target() -> None:
-    assert _launch("validation_failed", explicit=True) == _SENTINEL
-    assert _launch("review_ready", explicit=True) == _SENTINEL
+    # The exact-target refusal fires before any reservation, so the launch
+    # reports ``request_created: False`` on top of the gate's own reply, the
+    # same marker the not-review-ready refusal carries (NF-2026-01748 path).
+    refused = {**_SENTINEL, "request_created": False}
+    assert _launch("validation_failed", explicit=True) == refused
+    assert _launch("review_ready", explicit=True) == refused
 
 
 @pytest.mark.parametrize(
