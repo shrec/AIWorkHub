@@ -21,6 +21,7 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import logging
 import ntpath
 import os
 import re
@@ -3408,6 +3409,7 @@ def configured_runtime_root(repo: Path | None = None) -> Path:
 
 
 FOREIGN_WORKTREE_ROOT_REFUSAL = "worktree_root_foreign_repository"
+FOREIGN_WORKTREE_ROOT_IGNORED = "worktree_root_override_ignored"
 
 
 def _tracked_repo_id(owner: Path) -> str:
@@ -3422,7 +3424,9 @@ def _tracked_repo_id(owner: Path) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
-def _repository_owned_worktree_root(root: Path, repo: Path | None) -> Path:
+def _repository_owned_worktree_root(
+    root: Path, repo: Path | None, env: str = RUNTIME_ROOT_ENV
+) -> Path:
     """Return an override-derived ``root`` unless another repository owns it.
 
     Measured 2026-10-27: a relaunch exported another registered repository's
@@ -3432,7 +3436,9 @@ def _repository_owned_worktree_root(root: Path, repo: Path | None) -> Path:
     ``repo``'s non-empty ``repo_id`` (a worker worktree of the same
     repository).  Unowned roots and roots under the owner's ``.aiworkhub/temp`` (validation scratch) stay neutral.  Only
     the explicit ``repo`` is identity: AIWORKHUB_REPO_ROOT / AIWORKHUB_REPO and
-    cwd are exported by the hub itself, so they never are.
+    cwd are exported by the hub itself, so they never are.  An owner whose
+    readable ``repo_id`` differs is ignored for ``repo``'s own default root
+    (NF-2026-02032); an unknown identity on either side is still refused.
     """
     if repo is None:
         return root
@@ -3449,9 +3455,18 @@ def _repository_owned_worktree_root(root: Path, repo: Path | None) -> Path:
     )
     if owner in (None, selected) or _path_is_relative_to(root, owner / ".aiworkhub" / "temp"):
         return root
-    owner_id = _tracked_repo_id(owner)
-    if owner_id and owner_id == _tracked_repo_id(selected):
+    owner_id, selected_id = _tracked_repo_id(owner), _tracked_repo_id(selected)
+    if owner_id and owner_id == selected_id:
         return root
+    if owner_id and selected_id:
+        fallback = (selected / ".aiworkhub" / "runtime" / "worktrees").resolve(strict=False)
+        # Every symlinked component is followed: a root resolving outside repo is refused below.
+        if _path_is_relative_to(fallback, selected):
+            logging.warning(
+                "%s:env=%s:root=%s:owner=%s:repo=%s",
+                FOREIGN_WORKTREE_ROOT_IGNORED, env, root, owner, selected,
+            )
+            return fallback
     raise WorkspaceError(
         f"{FOREIGN_WORKTREE_ROOT_REFUSAL}:root={root}:owner={owner}:repo={selected}"
     )
@@ -3474,7 +3489,7 @@ def configured_worktree_root(repo: Path | None = None) -> Path:
         if authorized_scratch is None or _path_is_relative_to(
             resolved, authorized_scratch
         ):
-            return _repository_owned_worktree_root(resolved, repo)
+            return _repository_owned_worktree_root(resolved, repo, WORKTREE_ROOT_ENV)
         return (authorized_scratch / "nested-worktrees").resolve()
 
     runtime_override = os.environ.get(RUNTIME_ROOT_ENV, "").strip()

@@ -1,15 +1,18 @@
 """NF-2026-01765: a worktree root owned by another registered repository.
 
 Measured 2026-10-27: a transient-retry relaunch was provisioned under
-``F:/Dev/QT/Mego/MegoProject/.aiworkhub/runtime/worktrees`` because the
+another registered repository's runtime because the
 launching process exported another registered repository's
 AIWORKHUB_RUNTIME_ROOT / AIWORKHUB_WORKTREE_ROOT, and the card was then stuck:
 every rework relaunch refused ``gc_workspace_shape_mismatch`` before it ever
 consulted the predecessor's sealed delta.
 
-``configured_worktree_root`` now refuses an override another repository owns
-(``worktree_root_foreign_repository``), and a predecessor stranded under such a
-root relaunches from its verified sealed delta without its tree being read.
+``configured_worktree_root`` now ignores an override another repository with a
+readable, different repo_id owns (``worktree_root_override_ignored``, falling
+back to the repository's own root, NF-2026-02032), refuses one whose owner
+identity is unknown (``worktree_root_foreign_repository``), and a predecessor
+stranded under such a root relaunches from its verified sealed delta without
+its tree being read.
 """
 
 from __future__ import annotations
@@ -37,6 +40,7 @@ CLAIM_EPOCH = 3
 REPO_ID = "repo_01765000000000000000000000000a"
 FOREIGN_ID = "repo_01765000000000000000000000000f"
 REFUSAL = worker_workspace.FOREIGN_WORKTREE_ROOT_REFUSAL
+IGNORED = worker_workspace.FOREIGN_WORKTREE_ROOT_IGNORED
 
 
 def _git(root: Path, *args: str) -> None:
@@ -88,18 +92,56 @@ def repo(tmp_path: Path) -> Path:
 # --- configured_worktree_root ------------------------------------------------
 
 
+def _assert_ignored(caplog: pytest.LogCaptureFixture, env: str) -> None:
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        message.startswith(f"{IGNORED}:env={env}:") for message in messages
+    ), messages
+
+
 @pytest.mark.parametrize("env", [worker_workspace.WORKTREE_ROOT_ENV, "runtime"])
-def test_override_owned_by_another_repository_is_refused(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env: str
+def test_override_owned_by_another_repository_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     own = _register(tmp_path / "own", REPO_ID)
     foreign = _register(tmp_path / "foreign", FOREIGN_ID)
     if env == "runtime":
-        monkeypatch.setenv(
-            worker_workspace.RUNTIME_ROOT_ENV, str(foreign / ".aiworkhub" / "runtime")
-        )
+        env = worker_workspace.RUNTIME_ROOT_ENV
+        monkeypatch.setenv(env, str(foreign / ".aiworkhub" / "runtime"))
     else:
         monkeypatch.setenv(env, str(_runtime_worktrees(foreign)))
+
+    assert worker_workspace.configured_worktree_root(own) == _runtime_worktrees(own)
+    _assert_ignored(caplog, env)
+    assert not (foreign / ".aiworkhub" / "runtime").exists()
+
+
+def test_nested_repository_under_an_enclosing_runtime_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    outer = _register(tmp_path / "outer", FOREIGN_ID)
+    inner = _register(outer / ".aiworkhub" / "runtime" / "scratch" / "inner", REPO_ID)
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(_runtime_worktrees(outer)))
+
+    assert worker_workspace.configured_worktree_root(inner) == _runtime_worktrees(inner)
+    _assert_ignored(caplog, worker_workspace.WORKTREE_ROOT_ENV)
+
+    # The nested repository's own runtime stays its own.
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(_runtime_worktrees(inner)))
+    assert worker_workspace.configured_worktree_root(inner) == _runtime_worktrees(inner)
+
+
+@pytest.mark.parametrize(
+    "damage", ["empty_repo_id", "unreadable", "own_unknown", "foreign_unknown"]
+)
+def test_unknown_repository_identity_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: str
+) -> None:
+    own = _register(tmp_path / "own", REPO_ID if damage == "foreign_unknown" else None)
+    foreign = _register(tmp_path / "foreign", FOREIGN_ID if damage == "own_unknown" else None)
+    if damage == "unreadable":
+        (foreign / ".aiworkhub" / "project.json").write_bytes(b"{not json")
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(_runtime_worktrees(foreign)))
 
     with pytest.raises(worker_workspace.WorkspaceError) as refused:
         worker_workspace.configured_worktree_root(own)
@@ -107,35 +149,6 @@ def test_override_owned_by_another_repository_is_refused(
     assert str(refused.value) == (
         f"{REFUSAL}:root={_runtime_worktrees(foreign)}:owner={foreign}:repo={own}"
     )
-
-
-def test_nested_repository_under_an_enclosing_runtime_is_refused(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    outer = _register(tmp_path / "outer", FOREIGN_ID)
-    inner = _register(outer / ".aiworkhub" / "runtime" / "scratch" / "inner", REPO_ID)
-    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(_runtime_worktrees(outer)))
-
-    with pytest.raises(worker_workspace.WorkspaceError, match=f"^{REFUSAL}:"):
-        worker_workspace.configured_worktree_root(inner)
-
-    # The nested repository's own runtime stays its own.
-    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(_runtime_worktrees(inner)))
-    assert worker_workspace.configured_worktree_root(inner) == _runtime_worktrees(inner)
-
-
-@pytest.mark.parametrize("damage", ["empty_repo_id", "unreadable"])
-def test_unknown_repository_identity_fails_closed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: str
-) -> None:
-    own = _register(tmp_path / "own", None)
-    foreign = _register(tmp_path / "foreign", None)
-    if damage == "unreadable":
-        (foreign / ".aiworkhub" / "project.json").write_bytes(b"{not json")
-    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(_runtime_worktrees(foreign)))
-
-    with pytest.raises(worker_workspace.WorkspaceError, match=f"^{REFUSAL}:"):
-        worker_workspace.configured_worktree_root(own)
 
 
 @pytest.mark.parametrize("env", [worker_workspace.WORKTREE_ROOT_ENV, "runtime"])
@@ -168,15 +181,15 @@ def test_override_under_owner_validation_scratch_is_honored(
     assert worker_workspace.configured_worktree_root(own) == scratch
 
 
-def test_override_under_owner_runtime_is_still_refused_beside_scratch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_override_under_owner_runtime_is_still_ignored_beside_scratch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     own = _register(tmp_path / "own", REPO_ID)
     other = _register(tmp_path / "other", FOREIGN_ID)
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(_runtime_worktrees(other)))
 
-    with pytest.raises(worker_workspace.WorkspaceError, match=f"^{REFUSAL}:"):
-        worker_workspace.configured_worktree_root(own)
+    assert worker_workspace.configured_worktree_root(own) == _runtime_worktrees(own)
+    _assert_ignored(caplog, worker_workspace.WORKTREE_ROOT_ENV)
 
 
 @pytest.mark.parametrize("identity_env", ["AIWORKHUB_REPO_ROOT", "AIWORKHUB_REPO"])
@@ -195,18 +208,19 @@ def test_neutral_override_keeps_precedence_whatever_the_hub_exports(
 
 
 def test_launch_under_a_foreign_root_provisions_nothing(
-    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     foreign = _register(tmp_path / "foreign", FOREIGN_ID)
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(_runtime_worktrees(foreign)))
 
-    with pytest.raises(worker_workspace.WorkspaceError, match=f"^{REFUSAL}:"):
-        worker_workspace.create_workspace(
-            repo, SUCCESSOR, {"allowed_writes": [OUTPUT]}, "deterministic_validation"
-        )
+    workspace = worker_workspace.create_workspace(
+        repo, SUCCESSOR, {"allowed_writes": [OUTPUT]}, "deterministic_validation"
+    )
 
+    assert workspace.path == _runtime_worktrees(repo) / SUCCESSOR / "worktree"
+    _assert_ignored(caplog, worker_workspace.WORKTREE_ROOT_ENV)
     assert not _runtime_worktrees(foreign).exists()
-    assert not _runtime_worktrees(repo).exists()
+    assert not (foreign / ".aiworkhub" / "runtime").exists()
 
 
 def test_neutral_override_launches_with_a_foreign_repo_root_exported(
@@ -225,7 +239,7 @@ def test_neutral_override_launches_with_a_foreign_repo_root_exported(
     assert not _runtime_worktrees(foreign).exists()
 
 
-def test_promotion_marker_is_best_effort_under_a_foreign_root(
+def test_promotion_marker_ignores_a_foreign_root(
     repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     neutral = (tmp_path / "neutral-worktrees").resolve()
@@ -236,8 +250,9 @@ def test_promotion_marker_is_best_effort_under_a_foreign_root(
     foreign = _register(tmp_path / "foreign", FOREIGN_ID)
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(_runtime_worktrees(foreign)))
 
-    # The refusal skips the marker; it never blocks the promotion itself.
-    assert worker_workspace._promotion_begin(workspace) is None
+    # The foreign override is ignored: the marker lands under repo's own root.
+    marker = worker_workspace._promotion_begin(workspace)
+    assert marker == _runtime_worktrees(repo) / ".promotion_inflight" / SUCCESSOR
     assert not _runtime_worktrees(foreign).exists()
 
 
