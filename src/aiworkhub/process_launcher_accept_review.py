@@ -504,12 +504,17 @@ def effective_requested_risk_tier(card: Any, requested_risk_tier: Any) -> str:
     the tier stops being something a manager has to type correctly.
     """
     derived = server_derived_risk_tier(card)
+    # The manager's create-time declaration is a floor too (NF-2026-02045):
+    # the result is the max of requested, server-derived and declared.
+    declared = quality_evidence.declared_risk_tier_floor(card)
+    ranks = quality_evidence._RISK_RANK
+    if declared and (not derived or ranks[declared] > ranks[derived]):
+        derived = declared
     requested = (
         str(requested_risk_tier)
         if isinstance(requested_risk_tier, str) and requested_risk_tier
         else ""
     )
-    ranks = quality_evidence._RISK_RANK
     if requested and requested not in ranks:
         # Fail closed on a tier nobody defined: ``resolve_risk_profile`` will
         # refuse it, and refusing is the correct outcome.

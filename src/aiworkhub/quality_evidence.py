@@ -3411,6 +3411,22 @@ def run_completion_quality_gate(
 REVIEW_READY_RISK_SCHEMA_ID = "aiworkhub.review_ready_risk_observation.v1"
 
 
+def declared_risk_tier_floor(card: Any) -> str:
+    """The tier the manager DECLARED on ``card``, or "" when there is none.
+
+    The same read-back rule ``core`` applies: origin ``derived`` was never
+    declared; otherwise the stored ``risk_tier`` when it is a known tier. An
+    unknown stored value is ignored, never raised. A floor only: callers fold
+    it upward and it can never lower a requested or derived tier.
+    """
+    if not isinstance(card, Mapping):
+        return ""
+    if str(card.get("risk_tier_origin") or "").strip().lower() == "derived":
+        return ""
+    tier = str(card.get("risk_tier") or "").strip().lower()
+    return tier if tier in _RISK_RANK else ""
+
+
 def review_ready_risk_observation(
     card: Mapping[str, Any] | None,
     changed_paths: Iterable[str],
@@ -3456,7 +3472,11 @@ def review_ready_risk_observation(
             paths,
             destructive_checks=destructive_checks,
         )
-        profile = resolve_risk_profile(str(requested_risk_tier), signals=signals)
+        requested = str(requested_risk_tier)
+        floor = declared_risk_tier_floor(card)
+        if floor and _RISK_RANK[floor] > _RISK_RANK.get(requested, len(_RISK_RANK)):
+            requested = floor
+        profile = resolve_risk_profile(requested, signals=signals)
     except Exception as exc:  # noqa: BLE001 -- describing a candidate never fails it
         observation["error"] = f"{type(exc).__name__}:{exc}"[:300]
         return observation
