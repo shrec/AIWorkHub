@@ -45,7 +45,9 @@ from aiworkhub import process_launcher_accepted_row_restore as accepted_row_rest
 # 13748 -> 13754 (2026-11-03): NF-2026-01922 validation_failed auto-rework
 # hook (+6) landed past the cap through the installed accept lane that
 # skips this ratchet (NF-2026-02020); measured.
-PROCESS_LAUNCHER_MAX_LINES = 13754
+# 13754 -> 13753 (2026-11-03): NF-2026-02022 shared out-of-lock re-snapshot
+# helper for every reservation caller (net -2 from 13755 at HEAD), measured.
+PROCESS_LAUNCHER_MAX_LINES = 13753
 
 # (module, function, seam tuple attribute, ProcessManager method)
 EXTRACTIONS: tuple[tuple[ModuleType, str, str, str], ...] = (

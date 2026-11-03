@@ -4364,16 +4364,12 @@ class ProcessManager:
         snapshot = self._latest_by_request_stable()
         unbound_claim_resolutions = self._resolve_unbound_reviewer_claims(snapshot[0])
         try:
-            with self._lock, self._registry_lock():
-                # Re-prove the handed-in snapshot for this whole critical
-                # section.  The cheap path is one generation sweep.  If a
-                # sibling appended while this launch waited for the lock, take
-                # one fresh bounded bracketed snapshot now that the ledger is
-                # serialized instead of rejecting an otherwise healthy launch.
-                # Reconciliation mirrors the rows it retires back into the
-                # snapshot, so it keeps describing the ledger exactly across
-                # both halves.
-                proven = self._proven_reservation_snapshot(snapshot)
+            def _decide(proven: Any) -> None:
+                # Decided under the registry lock from a snapshot re-proven by
+                # one generation sweep; a lost hand-off re-snapshots OUTSIDE
+                # the lock (``_decide_on_proven_snapshot``).  Reconciliation
+                # mirrors the rows it retires back into the snapshot, so it
+                # keeps describing the ledger exactly across both halves.
                 if proven is None:
                     # No stable generation could be shown, so any row read
                     # here may be one append behind.  Admitting on that could
@@ -4403,6 +4399,7 @@ class ProcessManager:
                     str(event.get("task_id") or ""), latest
                 )
                 self._append_event(reservation)
+            self._decide_on_proven_snapshot(snapshot, _decide, process_lock=True)
         finally:
             # Reconciliation records terminal *intent* under the lock and
             # settles it here, with the lock released.  A task-store read
@@ -4688,27 +4685,39 @@ class ProcessManager:
     ) -> tuple[dict[str, dict[str, Any]], tuple[Any, ...]] | None:
         """The one proven snapshot an in-lock decision may be taken from.
 
-        ``snapshot`` was taken with the registry lock RELEASED, so the cheap
-        path is the single sweep in ``_resolved_reservation_snapshot`` that
-        re-proves it.  That hand-off loses its race whenever a sibling attempt
-        appended while this one waited for the lock -- the ordinary case when
-        several reviewers commit or terminalize together -- and treating the
-        loss as "no authority" would make these one-shot decisions silently do
-        nothing at all.  So a lost hand-off falls back to a fresh bracketed
-        read, paid for only then, and the decision is still taken from a proven
-        generation rather than from a parse a hidden append could falsify.
-
-        ``None`` means no stable generation could be shown at all: an
-        undescribable segment, or a ledger churning faster than the bounded
-        attempts.  Every caller fails closed on it and decides nothing.
+        ``snapshot`` was taken with the registry lock RELEASED; the single
+        sweep in ``_resolved_reservation_snapshot`` re-proves it.  ``None``
+        means the hand-off was lost (a sibling appended while this caller
+        waited) or no stable generation was shown.  It never re-folds the
+        ledger itself: ``_decide_on_proven_snapshot`` owns the retry.
         """
 
         latest, generation = self._resolved_reservation_snapshot(snapshot)
         if generation is None:
-            latest, generation = self._latest_by_request_stable()
-        if generation is None:
             return None
         return latest, generation
+
+    _RESERVATION_RESNAPSHOT_ROUNDS = 3
+
+    def _decide_on_proven_snapshot(
+        self, snapshot: Any, decide: Callable[[Any], Any], *, process_lock: bool = False
+    ) -> Any:
+        """Run ``decide`` under the registry lock on a generation proven there.
+
+        NF-2026-02022: a lost hand-off used to re-fold the whole ledger UNDER
+        the lock (a 607MB ledger held it 26s and timed siblings out).  Now it
+        LEAVES the lock, re-snapshots with it released and re-enters, bounded;
+        the last round hands ``decide`` ``None``, each caller's fail-closed.
+        """
+
+        rounds = self._RESERVATION_RESNAPSHOT_ROUNDS
+        while True:
+            rounds -= 1
+            with (self._lock if process_lock else nullcontext()), self._registry_lock():
+                proven = self._proven_reservation_snapshot(snapshot)
+                if proven is not None or rounds <= 0:
+                    return decide(proven)
+            snapshot = self._latest_by_request_stable()
 
     def _terminalize_committed_reservation(
         self,
@@ -7227,7 +7236,7 @@ class ProcessManager:
             self.process_log_path, "quality_review_attempt"
         )
         try:
-            with self._lock, self._registry_lock():
+            def _decide(proven: Any) -> dict[str, Any]:
                 # ONE proven snapshot backs this whole critical section, and
                 # every decision below is taken from it rather than from a
                 # fresh parse.  Reconciliation, the already-reserved check and
@@ -7236,7 +7245,6 @@ class ProcessManager:
                 # acting on an unproven parse could reserve a second provider
                 # for a reviewer that already has one.  When no generation can
                 # be shown at all the reservation defers instead of guessing.
-                proven = self._proven_reservation_snapshot(snapshot)
                 if proven is None:
                     return {"ok": False, "error": "ledger_snapshot_unproven"}
                 latest = proven[0]
@@ -7329,6 +7337,7 @@ class ProcessManager:
                     "request_id": request_id,
                     "state": "starting",
                 }
+            return self._decide_on_proven_snapshot(snapshot, _decide, process_lock=True)
         finally:
             # Reconciliation above recorded terminal intent only; the SQLite
             # transition and its single manager callback happen here, with the
@@ -7347,9 +7356,7 @@ class ProcessManager:
     ) -> bool:
         """Durably bind a just-committed reviewer claim to its reservation."""
 
-        snapshot = self._latest_by_request_stable()
-        with self._registry_lock():
-            proven = self._proven_reservation_snapshot(snapshot)
+        def _decide(proven: Any) -> bool:
             if proven is None:
                 return False
             latest = proven[0].get(request_id) or {}
@@ -7364,6 +7371,7 @@ class ProcessManager:
             bound["reviewer_claim_epoch"] = reviewer_claim_epoch
             self._append_event(bound)
             return True
+        return self._decide_on_proven_snapshot(self._latest_by_request_stable(), _decide)
 
     def _retain_ambiguous_reviewer_claim_for_reconciliation(
         self,
@@ -7568,9 +7576,7 @@ class ProcessManager:
         provider for a reservation somebody else already committed.
         """
 
-        snapshot = self._latest_by_request_stable()
-        with self._registry_lock():
-            proven = self._proven_reservation_snapshot(snapshot)
+        def _decide(proven: Any) -> bool:
             if proven is None:
                 return False
             latest = proven[0].get(request_id) or {}
@@ -7609,6 +7615,7 @@ class ProcessManager:
                 committed["target_claim_epoch"] = binding.get("target_claim_epoch")
             self._append_event(committed)
             return True
+        return self._decide_on_proven_snapshot(self._latest_by_request_stable(), _decide)
 
     def _reviewer_attach_provider_identity(
         self,
@@ -7636,9 +7643,7 @@ class ProcessManager:
         safe half of the ambiguity, never a second live provider.
         """
 
-        snapshot = self._latest_by_request_stable()
-        with self._registry_lock():
-            proven = self._proven_reservation_snapshot(snapshot)
+        def _decide(proven: Any) -> bool:
             if proven is None:
                 return False
             latest = proven[0].get(request_id) or {}
@@ -7689,6 +7694,7 @@ class ProcessManager:
                     attached[key] = latest[key]
             self._append_event(attached)
             return True
+        return self._decide_on_proven_snapshot(self._latest_by_request_stable(), _decide)
 
     def _terminalize_reviewer_attempt(
         self,
@@ -7718,32 +7724,25 @@ class ProcessManager:
         nothing and a later one retries.
         """
 
-        snapshot = self._latest_by_request_stable()
-        terminal_intent_recorded = False
-        with self._registry_lock():
-            if request_id in self._live:
-                return
-            proven = self._proven_reservation_snapshot(snapshot)
-            if proven is None:
-                return
+        def _decide(proven: Any) -> bool:
+            """True once terminal intent was recorded under the lock."""
+            if request_id in self._live or proven is None:
+                return False
             latest = proven[0].get(request_id) or {}
-            if latest.get("state") in ("provider_spawn_committed", "running"):
-                return
             if latest.get("state") != "starting":
-                return
-            terminal_intent_recorded = self._record_reviewer_terminal_intent(
+                # ``provider_spawn_committed``/``running`` are never stolen.
+                return False
+            recorded = self._record_reviewer_terminal_intent(
                 request_id, latest, reason
             ) in {"recorded", "already_recorded"}
-            if (
-                not terminal_intent_recorded
-                and latest.get("reviewer_claim_epoch") is not None
-            ):
-                return
+            if not recorded and latest.get("reviewer_claim_epoch") is not None:
+                return False
             self._blocked(
                 task_id, runner, "quality_review", adapter_id, reason,
                 request_id=request_id,
             )
-        if terminal_intent_recorded:
+            return recorded
+        if self._decide_on_proven_snapshot(self._latest_by_request_stable(), _decide):
             self._settle_reviewer_terminal_intents_contained()
 
     def _reviewer_source_graph_prewarm_live_event(
