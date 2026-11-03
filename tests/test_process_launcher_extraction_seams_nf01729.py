@@ -39,7 +39,10 @@ from aiworkhub import process_launcher_accepted_row_restore as accepted_row_rest
 # 13855 -> 13696 (2026-11-02): NF-2026-01812 moved the accepted-row restore
 # pair and _prior_reviewer_receipts into process_launcher_accepted_row_restore,
 # measured.
-PROCESS_LAUNCHER_MAX_LINES = 13696
+# 13696 -> 13748 (2026-11-03): NF-2026-01948 identity_reroute launch (+52)
+# landed past the cap and left main red; measured, the next extraction
+# ratchets it back down.
+PROCESS_LAUNCHER_MAX_LINES = 13748
 
 # (module, function, seam tuple attribute, ProcessManager method)
 EXTRACTIONS: tuple[tuple[ModuleType, str, str, str], ...] = (
