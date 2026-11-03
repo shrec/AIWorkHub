@@ -73,7 +73,7 @@ from . import quality_evidence
 from . import quality_review_ingest
 from . import quality_review_scope
 from . import process_event_ledger
-from . import storage_retention, terminal_failure_classification
+from . import storage_retention, terminal_failure_classification, validation_auto_rework
 from .process_launcher_acceptance import accepted_outcome_receipt as _accepted_outcome_receipt
 from .process_launcher_acceptance import changed_path_hashes as _changed_path_hashes
 from .process_launcher_acceptance import finished_acceptance_result as _finished_acceptance_result
@@ -10145,6 +10145,8 @@ class ProcessManager:
                     lock_blocking=lock_blocking,
                 )
                 if event is not None:
+                    # NF-2026-01922: request lock released; a planned auto-return runs now.
+                    validation_auto_rework.after_finalize(self, event)
                     return event
                 deferred = self._request_events(request_id)
                 if deferred:
@@ -11790,6 +11792,7 @@ class ProcessManager:
                             evidence=terminal_evidence,
                         )
                     else:
+                        terminal_evidence.update(validation_auto_rework.plan(self.repo, metadata, terminal_state, error, terminal_evidence))
                         release_result = self._review_terminal_exact(
                             metadata,
                             terminal_state,
@@ -12840,7 +12843,10 @@ class ProcessManager:
         event write or card transition (NF-2026-01645).
         """
         with _FinalizerHeartbeat(request_id) as heartbeat:
-            return self._retry_finalization(request_id, task_id, validation_lane, heartbeat)
+            result = self._retry_finalization(request_id, task_id, validation_lane, heartbeat)
+        # NF-2026-01922: the retried finalize released its lock; a planned auto-return runs now.
+        validation_auto_rework.after_finalize(self, result)
+        return result
 
     def _retry_finalization(
         self,

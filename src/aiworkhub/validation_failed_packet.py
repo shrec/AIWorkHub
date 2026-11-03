@@ -134,10 +134,26 @@ def build_packet(card: dict[str, Any], repo_root: str | Path | None = None) -> d
     review = card.get("terminal_review")
     review = review if isinstance(review, dict) else {}
     evidence = review.get("evidence")
-    evidence = evidence if isinstance(evidence, dict) else {}
+    return packet_from_evidence(
+        task_id=card.get("task_id"),
+        request_id=str(review.get("request_id") or ""),
+        evidence=evidence if isinstance(evidence, dict) else {},
+        roles=card.get("validation_roles"),
+        repo_root=repo_root,
+    )
+
+
+def packet_from_evidence(
+    *,
+    task_id: Any,
+    request_id: str,
+    evidence: dict[str, Any],
+    roles: Any,
+    repo_root: str | Path | None = None,
+) -> dict[str, Any]:
+    """The packet from terminal evidence alone (also used before the card is written)."""
     validation = evidence.get("validation")
     rows = [row for row in validation if isinstance(row, dict)] if isinstance(validation, list) else []
-    roles = card.get("validation_roles")
     roles = roles if isinstance(roles, list) else []
     failing: list[dict[str, Any]] = []
     tails: list[str] = []
@@ -146,15 +162,22 @@ def build_packet(card: dict[str, Any], repo_root: str | Path | None = None) -> d
             entry = _failing_row(row, index, roles)
             failing.append(entry)
             tails.append(entry["tail"])
-    request_id = str(review.get("request_id") or "")
     hashes = evidence.get("changed_path_hashes")
     packet: dict[str, Any] = {
         "schema_id": SCHEMA_ID,
-        "task_id": card.get("task_id"),
+        "task_id": task_id,
         "request_id": request_id or None,
         "candidate_sha256": core._evidence_identity(hashes)[1] if hashes is not None else None,
         "failing": failing,
         "passing_count": len(rows) - len(failing),
         "log_ref": _log_ref(request_id, repo_root),
     }
+    # NF-2026-01922: a validation_failed that reaches the manager says how many
+    # mechanical auto-returns this card already had.
+    auto_rework = evidence.get("validation_auto_rework")
+    if isinstance(auto_rework, dict):
+        # An unreadable history is unknown (None), never reported as zero.
+        prior = auto_rework.get("prior_auto_returns")
+        packet["prior_auto_returns"] = prior if isinstance(prior, int) and not isinstance(prior, bool) else None
+        packet["auto_rework_decision"] = str(auto_rework.get("cause") or "")[:64] or None
     return _bound(packet, tails)
