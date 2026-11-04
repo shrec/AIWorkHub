@@ -2303,11 +2303,142 @@ def _lexical_target_identities(
     }
 
 
+CROSS_FILE_RESOLUTION_HEARTBEAT_SCHEMA_ID = (
+    "aiworkhub.source_graph.cross_file_resolution_heartbeat.v1"
+)
+CROSS_FILE_RESOLUTION_WALL_CLOCK_CAP_SECONDS = 1800.0
+CROSS_FILE_RESOLUTION_STALL_SECONDS = 300.0
+_CROSS_FILE_RESOLUTION_HEARTBEAT_INTERVAL_SECONDS = 1.0
+_CROSS_FILE_RESOLUTION_HEARTBEAT_LOCK = threading.Lock()
+_CROSS_FILE_RESOLUTION_HEARTBEAT: dict[str, Any] = {}
+
+
+class SourceGraphResolutionAbortedError(SourceGraphError):
+    """Cross-file edge resolution stalled or exceeded its wall-clock cap."""
+
+    def __init__(self, reason: str, heartbeat: dict[str, Any]) -> None:
+        super().__init__(f"source_graph_cross_file_resolution_aborted:{reason}")
+        self.reason = reason
+        self.heartbeat = dict(heartbeat)
+
+
+def cross_file_resolution_heartbeat() -> dict[str, Any]:
+    """Return a copy of this process's latest cross-file resolution heartbeat."""
+
+    with _CROSS_FILE_RESOLUTION_HEARTBEAT_LOCK:
+        return dict(_CROSS_FILE_RESOLUTION_HEARTBEAT)
+
+
+class _CrossFileResolutionProgress:
+    """Time-bounded progress heartbeat for one ``_resolve_cpp_cross_file_edges``.
+
+    Progress is one completed edge. ``step`` aborts when the gap since the
+    previous completed edge exceeds ``stall_seconds`` or the run exceeds
+    ``wall_clock_cap_seconds``; the heartbeat is republished at most once per
+    ``_CROSS_FILE_RESOLUTION_HEARTBEAT_INTERVAL_SECONDS``.
+    """
+
+    def __init__(
+        self,
+        *,
+        scope: str,
+        wall_clock_cap_seconds: float,
+        stall_seconds: float,
+        clock: Callable[[], float],
+    ) -> None:
+        self._clock = clock
+        self._files_seen: set[str] = set()
+        self.scope = scope
+        self.wall_clock_cap_seconds = float(wall_clock_cap_seconds)
+        self.stall_seconds = float(stall_seconds)
+        now = clock()
+        self.started = now
+        self.last_progress = now
+        self.last_heartbeat = now
+        self.state = "running"
+        self.phase = "reset"
+        self.edges_total = 0
+        self.edges_processed = 0
+        self.edges_resolved = 0
+        self.abort_reason: str | None = None
+        self._publish(now)
+
+    def begin_phase(self, phase: str, edges_total: int) -> None:
+        now = self._clock()
+        self._check(now)
+        self.phase = phase
+        self.edges_total += int(edges_total)
+        self.last_progress = now
+        self._publish(now)
+
+    def step(self, file_path: str, resolved: int) -> None:
+        now = self._clock()
+        self._check(now)
+        self.edges_processed += 1
+        self.edges_resolved += resolved
+        self._files_seen.add(file_path)
+        self.last_progress = now
+        if now - self.last_heartbeat >= _CROSS_FILE_RESOLUTION_HEARTBEAT_INTERVAL_SECONDS:
+            self._publish(now)
+
+    def finish(self) -> None:
+        self.state = "completed"
+        self._publish(self._clock())
+
+    def _check(self, now: float) -> None:
+        stalled_for = now - self.last_progress
+        if stalled_for > self.stall_seconds:
+            self._abort(
+                now,
+                f"stalled:no_edge_completed_for_{stalled_for:.1f}s"
+                f">stall_seconds={self.stall_seconds:g}",
+            )
+        elapsed = now - self.started
+        if elapsed > self.wall_clock_cap_seconds:
+            self._abort(
+                now,
+                f"wall_clock_cap_exceeded:{elapsed:.1f}s"
+                f">wall_clock_cap_seconds={self.wall_clock_cap_seconds:g}",
+            )
+
+    def _abort(self, now: float, reason: str) -> None:
+        self.state = "aborted"
+        self.abort_reason = reason
+        snapshot = self._publish(now)
+        raise SourceGraphResolutionAbortedError(reason, snapshot)
+
+    def _publish(self, now: float) -> dict[str, Any]:
+        self.last_heartbeat = now
+        snapshot: dict[str, Any] = {
+            "schema_id": CROSS_FILE_RESOLUTION_HEARTBEAT_SCHEMA_ID,
+            "pid": os.getpid(),
+            "scope": self.scope,
+            "state": self.state,
+            "phase": self.phase,
+            "edges_total": self.edges_total,
+            "edges_processed": self.edges_processed,
+            "edges_resolved": self.edges_resolved,
+            "files_processed": len(self._files_seen),
+            "elapsed_seconds": round(max(0.0, now - self.started), 3),
+            "seconds_since_progress": round(max(0.0, now - self.last_progress), 3),
+            "wall_clock_cap_seconds": self.wall_clock_cap_seconds,
+            "stall_seconds": self.stall_seconds,
+            "abort_reason": self.abort_reason,
+        }
+        with _CROSS_FILE_RESOLUTION_HEARTBEAT_LOCK:
+            _CROSS_FILE_RESOLUTION_HEARTBEAT.clear()
+            _CROSS_FILE_RESOLUTION_HEARTBEAT.update(snapshot)
+        return snapshot
+
+
 def _resolve_cpp_cross_file_edges(
     conn: sqlite3.Connection,
     *,
     changed_files: set[str] | None = None,
     affected_names: set[str] | None = None,
+    wall_clock_cap_seconds: float = CROSS_FILE_RESOLUTION_WALL_CLOCK_CAP_SECONDS,
+    stall_seconds: float = CROSS_FILE_RESOLUTION_STALL_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
 ) -> int:
     """Resolve lexical-language targets only with unique bounded evidence.
 
@@ -2322,7 +2453,16 @@ def _resolve_cpp_cross_file_edges(
     added/removed/renamed by this build (``affected_names``), are reset and
     re-resolved: nothing else can change a name's candidate count or an
     import match, so the result equals a full recompute. Both sets empty means
-    no UPDATE at all.
+    no UPDATE at all. Verified for NF-2026-02061: the same ``scope_sql`` bounds
+    the reset UPDATE and both unresolved-edge SELECTs, so an incremental build
+    already reads only the changed files' edges plus edges aimed at affected
+    names; the hours-long runs were the per-edge import matching, not scope.
+
+    Progress is published through :func:`cross_file_resolution_heartbeat`
+    (edges processed/resolved, files processed). The run aborts with
+    :class:`SourceGraphResolutionAbortedError` and a recorded reason when no
+    edge completes within ``stall_seconds`` or the run exceeds
+    ``wall_clock_cap_seconds`` -- never after a fixed number of steps.
 
     JavaScript and TypeScript calls are excluded. A member call such as
     ``document.createElement`` shares ``dst_name`` with a helper, so a
@@ -2359,6 +2499,12 @@ def _resolve_cpp_cross_file_edges(
         resolvable_extractors,
     )
     resolved = 0
+    progress = _CrossFileResolutionProgress(
+        scope="full" if changed_files is None else "incremental",
+        wall_clock_cap_seconds=wall_clock_cap_seconds,
+        stall_seconds=stall_seconds,
+        clock=clock,
+    )
     unresolved_with_language = conn.execute(
         f"SELECT e.id, e.file_path, e.dst_name, f.language FROM edges e "
         "JOIN files f ON f.file_path=e.file_path "
@@ -2368,6 +2514,7 @@ def _resolve_cpp_cross_file_edges(
         f"{scope_sql}ORDER BY e.id",
         resolvable_extractors,
     ).fetchall()
+    progress.begin_phase("unique_name", len(unresolved_with_language))
     candidates_by_language_and_name: dict[tuple[str, str], list[sqlite3.Row]] = {}
     for edge in unresolved_with_language:
         source_language = str(edge["language"])
@@ -2389,12 +2536,15 @@ def _resolve_cpp_cross_file_edges(
             ]
         candidates = candidates_by_language_and_name[key]
         if len(candidates) != 1:
+            progress.step(str(edge["file_path"]), 0)
             continue
         cur = conn.execute(
             "UPDATE edges SET dst_qualname=? WHERE id=? AND dst_qualname IS NULL",
             (candidates[0]["qualname"], edge["id"]),
         )
-        resolved += int(cur.rowcount or 0)
+        bound = int(cur.rowcount or 0)
+        resolved += bound
+        progress.step(str(edge["file_path"]), bound)
 
     # Second pass: imported-file evidence can safely narrow a globally
     # ambiguous short name. This remains INFERRED authority; the resolver only
@@ -2408,53 +2558,88 @@ def _resolve_cpp_cross_file_edges(
         f"{scope_sql}ORDER BY e.id",
         resolvable_extractors,
     ).fetchall()
-    imports_by_file: dict[str, list[str]] = {}
+    progress.begin_phase("import_disambiguation", len(unresolved))
+    # NF-2026-02061: every import target is normalized once per file and every
+    # candidate path once (``_normalized_*`` are LRU-cached pure functions), the
+    # "does any import of this file name that candidate file" answer once per
+    # (file, candidate file) pair, and the final verdict once per
+    # (file, language, name). Duplicate or identity-free import targets cannot
+    # change ``any(...)``, so they are dropped from the per-file tuple. The
+    # UPDATE order (``ORDER BY e.id``) and every verdict equal the former
+    # edges x candidates x imports pathlib loop.
+    imports_by_file: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {}
     candidates_by_name: dict[tuple[str, str], list[sqlite3.Row]] = {}
+    import_match_by_pair: dict[tuple[str, str], bool] = {}
+    verdict_by_file_and_name: dict[tuple[str, str, str], Any] = {}
     for edge in unresolved:
         file_path = str(edge["file_path"])
         if file_path not in imports_by_file:
-            imports_by_file[file_path] = [
-                str(row["dst_name"])
+            import_forms = (
+                _normalized_import_target(str(row["dst_name"]))
                 for row in conn.execute(
                     "SELECT dst_name FROM edges WHERE file_path=? AND kind='imports' "
                     "ORDER BY id",
                     (file_path,),
                 )
-            ]
+            )
+            imports_by_file[file_path] = tuple(
+                dict.fromkeys(form for form in import_forms if form is not None)
+            )
         imports = imports_by_file[file_path]
         if not imports:
+            progress.step(file_path, 0)
             continue
         name = str(edge["dst_name"])
         source_language = str(edge["language"])
-        candidate_key = (source_language, name)
-        if candidate_key not in candidates_by_name:
-            rows = conn.execute(
-                "SELECT e.file_path, e.qualname, f.language FROM entities e "
-                "JOIN files f ON f.file_path=e.file_path WHERE e.name=? AND "
-                f"e.kind IN ({_LEXICAL_TARGET_KINDS_SQL}) "
-                "ORDER BY e.file_path, e.qualname",
-                (name,),
-            ).fetchall()
-            candidates_by_name[candidate_key] = [
-                row for row in rows
-                if _resolution_languages_compatible(
-                    source_language, str(row["language"])
-                )
-            ]
-        candidates = [
-            row for row in candidates_by_name[candidate_key]
-            if any(
-                _import_target_matches_file(target, str(row["file_path"]))
-                for target in imports
-            )
-        ]
-        if len(candidates) != 1:
+        verdict_key = (file_path, source_language, name)
+        if verdict_key in verdict_by_file_and_name:
+            target_qualname = verdict_by_file_and_name[verdict_key]
+        else:
+            candidate_key = (source_language, name)
+            if candidate_key not in candidates_by_name:
+                rows = conn.execute(
+                    "SELECT e.file_path, e.qualname, f.language FROM entities e "
+                    "JOIN files f ON f.file_path=e.file_path WHERE e.name=? AND "
+                    f"e.kind IN ({_LEXICAL_TARGET_KINDS_SQL}) "
+                    "ORDER BY e.file_path, e.qualname",
+                    (name,),
+                ).fetchall()
+                candidates_by_name[candidate_key] = [
+                    row for row in rows
+                    if _resolution_languages_compatible(
+                        source_language, str(row["language"])
+                    )
+                ]
+            matched: list[sqlite3.Row] = []
+            for row in candidates_by_name[candidate_key]:
+                candidate_file = str(row["file_path"])
+                pair = (file_path, candidate_file)
+                hit = import_match_by_pair.get(pair)
+                if hit is None:
+                    file_form = _normalized_candidate_file(candidate_file)
+                    hit = file_form is not None and any(
+                        _normalized_import_matches_file(form, file_form)
+                        for form in imports
+                    )
+                    import_match_by_pair[pair] = hit
+                if hit:
+                    matched.append(row)
+                    if len(matched) > 1:
+                        # Only a unique match binds; a second one settles it.
+                        break
+            target_qualname = matched[0]["qualname"] if len(matched) == 1 else None
+            verdict_by_file_and_name[verdict_key] = target_qualname
+        if target_qualname is None:
+            progress.step(file_path, 0)
             continue
         cur = conn.execute(
             "UPDATE edges SET dst_qualname=? WHERE id=? AND dst_qualname IS NULL",
-            (candidates[0]["qualname"], edge["id"]),
+            (target_qualname, edge["id"]),
         )
-        resolved += int(cur.rowcount or 0)
+        bound = int(cur.rowcount or 0)
+        resolved += bound
+        progress.step(file_path, bound)
+    progress.finish()
     return resolved
 
 
@@ -3283,8 +3468,23 @@ def _resolution_languages_compatible(source: str, target: str) -> bool:
     return {source, target} <= {"javascript", "typescript"}
 
 
-def _import_target_matches_file(target: str, file_path: str) -> bool:
-    """Match an observed import/include target to one candidate source file."""
+_IMPORT_MATCH_NORMALIZER_CACHE_SIZE = 65536
+"""LRU bound for each import/file normalizer below (NF-2026-02061).
+
+Both normalizers are pure functions of one string, so a cached entry can never
+go stale; the bound only caps memory. ``cache_info()`` on each is the measured
+hit rate."""
+
+
+@functools.lru_cache(maxsize=_IMPORT_MATCH_NORMALIZER_CACHE_SIZE)
+def _normalized_import_target(target: str) -> tuple[str, tuple[str, ...]] | None:
+    """Normalize one observed import/include target once (pure, cached).
+
+    Returns ``None`` when the target carries no module identity, otherwise
+    ``(bare_stem, suffixes)``: ``bare_stem`` is the casefolded stem when the
+    target has no directory component (else ``""``) and ``suffixes`` the
+    ``str.endswith`` tuple a candidate's suffix-free path must match.
+    """
 
     normalized_target = str(target).strip().replace("\\", "/")
     normalized_target = normalized_target.removeprefix("./")
@@ -3294,34 +3494,62 @@ def _import_target_matches_file(target: str, file_path: str) -> bool:
     if target_path.suffix.casefold() in _INDEXED_EXTENSION_SET:
         normalized_target = target_path.with_suffix("").as_posix()
     normalized_target = normalized_target.replace("::", "/").replace(".", "/")
-    normalized_file = str(file_path).strip().replace("\\", "/")
     target_path = Path(normalized_target)
-    file_path_obj = Path(normalized_file)
     # ``from . import symbol`` has an empty module component after the
     # imported symbol is removed.  Converting that empty component through
     # the generic dotted-target normalizer produces ``/``.  It carries no
     # module identity, so fail closed instead of calling ``with_suffix`` on a
     # filesystem root (which raises ``ValueError`` and aborts the full index).
-    if target_path.name in {"", ".", ".."} or file_path_obj.name in {"", ".", ".."}:
-        return False
-    target_stem = target_path.stem.casefold()
-    file_stem = file_path_obj.stem.casefold()
+    if target_path.name in {"", ".", ".."}:
+        return None
     # A bare include/module name may match by stem. Once the import carries a
     # directory component, discarding that path would turn ``../b/math`` into
     # a match for both ``a/math.ts`` and ``b/math.ts`` and destroy the exact
     # disambiguating evidence.
-    if "/" not in normalized_target and target_stem and target_stem == file_stem:
-        return True
+    bare_stem = target_path.stem.casefold() if "/" not in normalized_target else ""
     target_no_suffix = target_path.with_suffix("").as_posix().casefold().strip("/")
-    file_no_suffix = file_path_obj.with_suffix("").as_posix().casefold().strip("/")
-    return bool(
-        target_no_suffix
-        and (
-            file_no_suffix.endswith(target_no_suffix)
-            or file_no_suffix.endswith(f"{target_no_suffix}/index")
-            or file_no_suffix.endswith(f"{target_no_suffix}/mod")
-        )
+    suffixes: tuple[str, ...] = (
+        (target_no_suffix, f"{target_no_suffix}/index", f"{target_no_suffix}/mod")
+        if target_no_suffix
+        else ()
     )
+    return bare_stem, suffixes
+
+
+@functools.lru_cache(maxsize=_IMPORT_MATCH_NORMALIZER_CACHE_SIZE)
+def _normalized_candidate_file(file_path: str) -> tuple[str, str] | None:
+    """Normalize one candidate source path once: ``(stem, path_without_suffix)``."""
+
+    file_path_obj = Path(str(file_path).strip().replace("\\", "/"))
+    if file_path_obj.name in {"", ".", ".."}:
+        return None
+    return (
+        file_path_obj.stem.casefold(),
+        file_path_obj.with_suffix("").as_posix().casefold().strip("/"),
+    )
+
+
+def _normalized_import_matches_file(
+    target_form: tuple[str, tuple[str, ...]],
+    file_form: tuple[str, str],
+) -> bool:
+    """Pure string comparison of two already-normalized forms."""
+
+    bare_stem, suffixes = target_form
+    file_stem, file_no_suffix = file_form
+    if bare_stem and bare_stem == file_stem:
+        return True
+    return bool(suffixes) and file_no_suffix.endswith(suffixes)
+
+
+def _import_target_matches_file(target: str, file_path: str) -> bool:
+    """Match an observed import/include target to one candidate source file."""
+
+    target_form = _normalized_import_target(str(target))
+    file_form = _normalized_candidate_file(str(file_path))
+    if target_form is None or file_form is None:
+        return False
+    return _normalized_import_matches_file(target_form, file_form)
 
 
 def _python_import_suffix_files(modules: list[str], suffix: str) -> list[str]:
