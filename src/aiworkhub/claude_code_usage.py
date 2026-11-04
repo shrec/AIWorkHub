@@ -10,14 +10,17 @@ timestamps and session ids.
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import os
 import re
 import tempfile
+import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 
 _SLUG_RE = re.compile(r"[^A-Za-z0-9]")
@@ -33,6 +36,33 @@ _SCHEMA_ID = "aiworkhub.cost_ledger.claude_code_sessions.v1"
 # a plain LRU smaller than a sequential scan evicts every entry before reuse.
 _FILE_CACHE_MAX_ENTRIES = 512
 _FILE_CACHE: OrderedDict[str, _CacheEntry] = OrderedDict()
+
+# NF-2026-02056: a live transcript grows on every append, so a (size, mtime)
+# key alone re-parsed ~50 MB from byte 0 on every polled dashboard snapshot.
+# A cache entry for a recently written file also keeps the resumable parse
+# state; growth whose prefix guard (sha256 of the window just before the old
+# offset) still matches parses only the appended bytes. Shrink, guard mismatch
+# or missing state -> full parse. State is retained only for files written in
+# the last _STATE_RETAIN_MAX_AGE_SECONDS, which bounds its memory to the live
+# transcripts instead of the whole corpus.
+_GUARD_WINDOW_BYTES = 4096
+_STATE_RETAIN_MAX_AGE_SECONDS = 6 * 3600
+
+# Short memo of the whole section per (repo root, config dir): back-to-back
+# snapshots inside the TTL do no file IO at all. Bounded LRU.
+_COLLECT_MEMO_TTL_SECONDS = 30.0
+_COLLECT_MEMO_MAX_ENTRIES = 32
+_COLLECT_MEMO: OrderedDict[tuple[str, str], tuple[float, dict[str, Any]]] = OrderedDict()
+
+# Measured hit rates of the two caches above (process lifetime counters).
+CACHE_STATS: dict[str, int] = {
+    "memo_hits": 0,
+    "memo_misses": 0,
+    "full_parses": 0,
+    "tail_parses": 0,
+    "tail_bytes_read": 0,
+    "transient_failures": 0,
+}
 
 # Bump whenever _parse_transcript_file's output changes: a persisted cache with
 # any other version is ignored and rebuilt by a full parse.
@@ -80,11 +110,51 @@ _EMPTY_FILE_USAGE = _FileUsage(
 )
 
 
+# One billed call: (input, cache_read, cache_creation, output, model).
+_CallSnapshot = tuple[int, int, int, int, str]
+
+
+@dataclass(slots=True)
+class _ParseState:
+    """Resumable parse of every complete line before ``offset``.
+
+    ``offset`` is the byte just past the last newline consumed; a trailing
+    partial line is never folded in, so the next parse re-reads it whole.
+    ``guard`` is the sha256 of up to _GUARD_WINDOW_BYTES just before ``offset``.
+    """
+
+    offset: int
+    guard: bytes
+    calls_by_id: dict[str, _CallSnapshot]
+    anonymous_calls: list[_CallSnapshot]
+    malformed_lines: int
+    first_at: str
+    last_at: str
+
+    def copy(self) -> _ParseState:
+        return _ParseState(
+            self.offset,
+            self.guard,
+            dict(self.calls_by_id),
+            list(self.anonymous_calls),
+            self.malformed_lines,
+            self.first_at,
+            self.last_at,
+        )
+
+
+def _empty_state() -> _ParseState:
+    return _ParseState(0, b"", {}, [], 0, "", "")
+
+
 @dataclass(frozen=True, slots=True)
 class _CacheEntry:
     size: int
     mtime_ns: int
     usage: _FileUsage
+    # In-process only: never persisted and never part of equality, so the
+    # persisted-cache "changed?" comparison is about usage alone.
+    state: _ParseState | None = field(default=None, compare=False)
 
 
 def _as_int(value: Any) -> int:
@@ -120,93 +190,140 @@ def _matching_project_dirs(projects_root: Path, slug: str) -> list[Path]:
 _SYNTHETIC_MODEL = "<synthetic>"
 
 
-def _parse_transcript_file(path: Path) -> _FileUsage:
-    """Parse one transcript. Malformed lines are skipped and counted, never raised.
+def _parse_line(raw_line: bytes, state: _ParseState) -> None:
+    """Fold one transcript line into ``state``. Malformed lines are counted, never raised."""
 
-    Streamed line by line rather than read whole: a live transcript in this
-    repository reaches roughly 50 MB.
+    line = raw_line.decode("utf-8", errors="replace").strip()
+    if not line:
+        return
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        state.malformed_lines += 1
+        return
+    if not isinstance(entry, dict):
+        state.malformed_lines += 1
+        return
+
+    timestamp = entry.get("timestamp")
+    if isinstance(timestamp, str) and timestamp:
+        if not state.first_at or timestamp < state.first_at:
+            state.first_at = timestamp
+        if not state.last_at or timestamp > state.last_at:
+            state.last_at = timestamp
+
+    message = entry.get("message")
+    if not isinstance(message, dict):
+        return
+    usage = message.get("usage")
+    if not isinstance(usage, dict):
+        return
+
+    model = message.get("model")
+    if model == _SYNTHETIC_MODEL:
+        # A local placeholder assistant message Claude Code writes for
+        # itself, never a billed API call.
+        return
+    snapshot: _CallSnapshot = (
+        _as_int(usage.get("input_tokens")),
+        _as_int(usage.get("cache_read_input_tokens")),
+        _as_int(usage.get("cache_creation_input_tokens")),
+        _as_int(usage.get("output_tokens")),
+        model if isinstance(model, str) else "",
+    )
+
+    message_id = message.get("id")
+    if isinstance(message_id, str) and message_id:
+        # A streamed message is rewritten several times under the same id;
+        # the last write in the file carries the final usage. Re-assigning an
+        # existing key keeps its first position, exactly as a cold parse does.
+        state.calls_by_id[message_id] = snapshot
+    else:
+        state.anonymous_calls.append(snapshot)
+
+
+def _summarise(state: _ParseState) -> _FileUsage:
+    all_calls = list(state.calls_by_id.values()) + state.anonymous_calls
+    per_call_context = [call[0] + call[1] + call[2] for call in all_calls]
+    models = tuple(sorted({call[4] for call in all_calls if call[4]}))
+    return _FileUsage(
+        api_calls=len(all_calls),
+        input_tokens=sum(call[0] for call in all_calls),
+        cache_read_input_tokens=sum(call[1] for call in all_calls),
+        cache_creation_input_tokens=sum(call[2] for call in all_calls),
+        output_tokens=sum(call[3] for call in all_calls),
+        context_tokens=sum(per_call_context),
+        max_context=max(per_call_context, default=0),
+        malformed_lines=state.malformed_lines,
+        models=models,
+        first_at=state.first_at,
+        last_at=state.last_at,
+    )
+
+
+def _guard_digest(handle: IO[bytes], offset: int) -> bytes:
+    start = max(0, offset - _GUARD_WINDOW_BYTES)
+    handle.seek(start)
+    return hashlib.sha256(handle.read(offset - start)).digest()
+
+
+def _resume_state(handle: IO[bytes], previous: _ParseState | None) -> _ParseState | None:
+    """Return a copy of ``previous`` when the file is an append-only growth of it, else None."""
+
+    if previous is None or previous.offset <= 0:
+        return None
+    if os.fstat(handle.fileno()).st_size < previous.offset:
+        return None  # truncated
+    if _guard_digest(handle, previous.offset) != previous.guard:
+        return None  # rewritten
+    return previous.copy()
+
+
+def _parse_transcript_file(
+    path: Path, previous: _ParseState | None = None
+) -> tuple[_FileUsage, _ParseState] | None:
+    """Parse one transcript, resuming from ``previous`` when the prefix guard holds.
+
+    Returns None when the file cannot be read (never cached). Streamed line by
+    line rather than read whole: a live transcript in this repository reaches
+    roughly 50 MB. A trailing line without a newline is counted in the returned
+    usage, exactly like a cold parse, but is not consumed into the state.
     """
 
     try:
-        handle = path.open(encoding="utf-8", errors="replace")
+        handle = path.open("rb")
     except OSError:
-        return _EMPTY_FILE_USAGE
+        return None
 
-    calls_by_id: dict[str, dict[str, Any]] = {}
-    anonymous_calls: list[dict[str, Any]] = []
-    malformed_lines = 0
-    first_at = ""
-    last_at = ""
-
+    tail = b""
     with handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except ValueError:
-                malformed_lines += 1
-                continue
-            if not isinstance(entry, dict):
-                malformed_lines += 1
-                continue
+        try:
+            state = _resume_state(handle, previous)
+            resumed = state is not None
+            if state is None:
+                state = _empty_state()
+            start = state.offset
+            handle.seek(start)
+            for raw_line in handle:
+                if not raw_line.endswith(b"\n"):
+                    tail = raw_line
+                    break
+                _parse_line(raw_line, state)
+                state.offset += len(raw_line)
+            state.guard = _guard_digest(handle, state.offset)
+        except OSError:
+            return None
 
-            timestamp = entry.get("timestamp")
-            if isinstance(timestamp, str) and timestamp:
-                if not first_at or timestamp < first_at:
-                    first_at = timestamp
-                if not last_at or timestamp > last_at:
-                    last_at = timestamp
-
-            message = entry.get("message")
-            if not isinstance(message, dict):
-                continue
-            usage = message.get("usage")
-            if not isinstance(usage, dict):
-                continue
-
-            model = message.get("model")
-            if model == _SYNTHETIC_MODEL:
-                # A local placeholder assistant message Claude Code writes
-                # for itself, never a billed API call.
-                continue
-            snapshot = {
-                "input_tokens": _as_int(usage.get("input_tokens")),
-                "cache_read_input_tokens": _as_int(usage.get("cache_read_input_tokens")),
-                "cache_creation_input_tokens": _as_int(usage.get("cache_creation_input_tokens")),
-                "output_tokens": _as_int(usage.get("output_tokens")),
-                "model": model if isinstance(model, str) else "",
-            }
-
-            message_id = message.get("id")
-            if isinstance(message_id, str) and message_id:
-                # A streamed message is rewritten several times under the same
-                # id; the last write in the file carries the final usage.
-                calls_by_id[message_id] = snapshot
-            else:
-                anonymous_calls.append(snapshot)
-
-    all_calls = list(calls_by_id.values()) + anonymous_calls
-    per_call_context = [
-        call["input_tokens"] + call["cache_read_input_tokens"] + call["cache_creation_input_tokens"]
-        for call in all_calls
-    ]
-    models = tuple(sorted({call["model"] for call in all_calls if call["model"]}))
-
-    return _FileUsage(
-        api_calls=len(all_calls),
-        input_tokens=sum(call["input_tokens"] for call in all_calls),
-        cache_read_input_tokens=sum(call["cache_read_input_tokens"] for call in all_calls),
-        cache_creation_input_tokens=sum(call["cache_creation_input_tokens"] for call in all_calls),
-        output_tokens=sum(call["output_tokens"] for call in all_calls),
-        context_tokens=sum(per_call_context),
-        max_context=max(per_call_context, default=0),
-        malformed_lines=malformed_lines,
-        models=models,
-        first_at=first_at,
-        last_at=last_at,
-    )
+    if resumed:
+        CACHE_STATS["tail_parses"] += 1
+        CACHE_STATS["tail_bytes_read"] += state.offset - start + len(tail)
+    else:
+        CACHE_STATS["full_parses"] += 1
+    if not tail:
+        return _summarise(state), state
+    provisional = state.copy()
+    _parse_line(tail, provisional)
+    return _summarise(provisional), state
 
 
 def _persistent_cache_path(repo_root: Path) -> Path:
@@ -308,15 +425,22 @@ def _parse_files(paths: list[Path], cache_path: Path | None = None) -> dict[Path
         key = str(path)
         entry = _FILE_CACHE.get(key)
         if entry is None or not _entry_matches(entry, stat_result):
+            previous = entry.state if entry is not None else None
             entry = persisted.get(key)
             if entry is None or not _entry_matches(entry, stat_result):
-                usage = _parse_transcript_file(path)
-                if usage is _EMPTY_FILE_USAGE:
+                parsed = _parse_transcript_file(path, previous)
+                if parsed is None:
                     # Open failed (e.g. transiently locked): report zero for
                     # this call but never cache it under this size/mtime.
-                    result[path] = usage
+                    CACHE_STATS["transient_failures"] += 1
+                    result[path] = _EMPTY_FILE_USAGE
                     continue
-                entry = _CacheEntry(stat_result.st_size, stat_result.st_mtime_ns, usage)
+                usage, state = parsed
+                age_seconds = time.time() - stat_result.st_mtime_ns / 1e9
+                retained = state if age_seconds < _STATE_RETAIN_MAX_AGE_SECONDS else None
+                entry = _CacheEntry(
+                    stat_result.st_size, stat_result.st_mtime_ns, usage, retained
+                )
         _FILE_CACHE[key] = entry
         _FILE_CACHE.move_to_end(key)
         current[key] = entry
@@ -399,11 +523,36 @@ def collect_claude_code_usage(repo_root: Path | str) -> dict[str, Any]:
     write is dropped and never raised. A missing project directory yields
     ``status: "not_found"``, never an exception. There is no price table, so
     cost stays unknown -- this never reports a dollar figure.
+
+    A result younger than _COLLECT_MEMO_TTL_SECONDS for the same repository
+    root and config dir is returned (as a copy) without any file IO.
     """
 
     root = Path(repo_root)
     if not root.is_absolute():
         root = root.resolve()
+    memo_key = (str(root), str(_config_dir()))
+    now = time.monotonic()
+    memo = _COLLECT_MEMO.get(memo_key)
+    if memo is not None and 0.0 <= now - memo[0] < _COLLECT_MEMO_TTL_SECONDS:
+        CACHE_STATS["memo_hits"] += 1
+        _COLLECT_MEMO.move_to_end(memo_key)
+        return copy.deepcopy(memo[1])
+    CACHE_STATS["memo_misses"] += 1
+    failures_before = CACHE_STATS["transient_failures"]
+    result = _collect_uncached(root)
+    if CACHE_STATS["transient_failures"] != failures_before:
+        # A transiently unreadable file reported zero for this call only; the
+        # memo must not serve that zero for the next TTL.
+        return result
+    _COLLECT_MEMO[memo_key] = (now, copy.deepcopy(result))
+    _COLLECT_MEMO.move_to_end(memo_key)
+    while len(_COLLECT_MEMO) > _COLLECT_MEMO_MAX_ENTRIES:
+        _COLLECT_MEMO.popitem(last=False)
+    return result
+
+
+def _collect_uncached(root: Path) -> dict[str, Any]:
     slug = _slugify(root)
     project_dirs = _matching_project_dirs(_config_dir() / "projects", slug)
 

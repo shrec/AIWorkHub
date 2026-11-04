@@ -1,9 +1,22 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
+import pytest
+
 from aiworkhub import claude_code_usage
+
+
+@pytest.fixture(autouse=True)
+def _no_collect_memo(monkeypatch):
+    # The section memo would hide every on-disk change made inside one test;
+    # the memo has its own dedicated test below.
+    monkeypatch.setattr(claude_code_usage, "_COLLECT_MEMO_TTL_SECONDS", 0.0)
+    claude_code_usage._COLLECT_MEMO.clear()
+    yield
+    claude_code_usage._COLLECT_MEMO.clear()
 
 
 def _usage_line(
@@ -173,10 +186,10 @@ def test_unchanged_file_is_not_reparsed(monkeypatch, tmp_path) -> None:
     calls = 0
     real_parser = claude_code_usage._parse_transcript_file
 
-    def _counting_parser(path):
+    def _counting_parser(path, previous=None):
         nonlocal calls
         calls += 1
-        return real_parser(path)
+        return real_parser(path, previous)
 
     monkeypatch.setattr(claude_code_usage, "_parse_transcript_file", _counting_parser)
 
@@ -293,9 +306,9 @@ def _parse_recorder(monkeypatch) -> list[Path]:
     parsed: list[Path] = []
     real_parser = claude_code_usage._parse_transcript_file
 
-    def _recording_parser(path):
+    def _recording_parser(path, previous=None):
         parsed.append(Path(path))
-        return real_parser(path)
+        return real_parser(path, previous)
 
     monkeypatch.setattr(claude_code_usage, "_parse_transcript_file", _recording_parser)
     return parsed
@@ -466,10 +479,10 @@ def test_unreadable_transcript_is_neither_cached_nor_persisted(monkeypatch, tmp_
     claude_code_usage._FILE_CACHE.clear()
     real_parser = claude_code_usage._parse_transcript_file
 
-    def _locked_parser(path):
+    def _locked_parser(path, previous=None):
         if Path(path) == locked:
-            return claude_code_usage._EMPTY_FILE_USAGE
-        return real_parser(path)
+            return None
+        return real_parser(path, previous)
 
     monkeypatch.setattr(claude_code_usage, "_parse_transcript_file", _locked_parser)
 
@@ -505,3 +518,206 @@ def test_deeply_nested_cache_file_is_ignored_and_rebuilt(monkeypatch, tmp_path) 
     assert len(parsed) == 3
     assert result == expected
     assert json.loads(cache_path.read_text(encoding="utf-8")) == good
+
+
+def _line_counter(monkeypatch) -> list[bytes]:
+    """Record every raw line handed to the per-line JSON parser."""
+
+    seen: list[bytes] = []
+    real_parse_line = claude_code_usage._parse_line
+
+    def _counting_parse_line(raw_line, state):
+        seen.append(bytes(raw_line))
+        return real_parse_line(raw_line, state)
+
+    monkeypatch.setattr(claude_code_usage, "_parse_line", _counting_parse_line)
+    return seen
+
+
+def _append(path: Path, text: str) -> None:
+    with path.open("ab") as handle:
+        handle.write(text.encode("utf-8"))
+
+
+def test_appended_lines_are_tail_parsed_and_match_cold_parse(monkeypatch, tmp_path) -> None:
+    """NF-2026-02056: a growing transcript is not re-parsed from byte 0."""
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    transcript = project_dir / "session-a.jsonl"
+    transcript.write_text(
+        "".join(_usage_line(f"msg_{i}", input_tokens=i + 1) + "\n" for i in range(200)),
+        encoding="utf-8",
+    )
+    claude_code_usage._FILE_CACHE.clear()
+    claude_code_usage.collect_claude_code_usage(repo_root)
+
+    appended = "".join(
+        _usage_line(f"new_{i}", input_tokens=1000 + i, cache_read_input_tokens=7) + "\n"
+        for i in range(3)
+    )
+    _append(transcript, appended)
+    seen = _line_counter(monkeypatch)
+    tails_before = claude_code_usage.CACHE_STATS["tail_parses"]
+    fulls_before = claude_code_usage.CACHE_STATS["full_parses"]
+    bytes_before = claude_code_usage.CACHE_STATS["tail_bytes_read"]
+
+    second = claude_code_usage.collect_claude_code_usage(repo_root)
+
+    assert len(seen) == 3
+    assert b"".join(seen) == appended.encode("utf-8")
+    assert claude_code_usage.CACHE_STATS["tail_parses"] == tails_before + 1
+    assert claude_code_usage.CACHE_STATS["full_parses"] == fulls_before
+    assert claude_code_usage.CACHE_STATS["tail_bytes_read"] - bytes_before == len(
+        appended.encode("utf-8")
+    )
+    assert second["totals"]["main"]["api_calls"] == 203
+    seen.clear()
+    assert second == _fresh_totals(repo_root)
+    assert len(seen) == 203
+
+
+def test_streamed_message_rewritten_across_tail_boundary_keeps_last_write(
+    monkeypatch, tmp_path
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    transcript = project_dir / "session-a.jsonl"
+    transcript.write_text(
+        _usage_line("msg_1", input_tokens=10, output_tokens=1) + "\n"
+        + _usage_line("msg_2", input_tokens=20, output_tokens=2) + "\n",
+        encoding="utf-8",
+    )
+    claude_code_usage._FILE_CACHE.clear()
+    first = claude_code_usage.collect_claude_code_usage(repo_root)
+    assert first["totals"]["main"]["output_tokens"] == 3
+
+    _append(
+        transcript,
+        _usage_line("msg_1", input_tokens=10, output_tokens=50) + "\n"
+        + _usage_line("msg_3", input_tokens=30, output_tokens=3) + "\n",
+    )
+    seen = _line_counter(monkeypatch)
+    second = claude_code_usage.collect_claude_code_usage(repo_root)
+
+    assert len(seen) == 2
+    assert second["totals"]["main"]["api_calls"] == 3
+    assert second["totals"]["main"]["output_tokens"] == 50 + 2 + 3
+    assert second["totals"]["main"]["input_tokens"] == 10 + 20 + 30
+    assert second == _fresh_totals(repo_root)
+
+
+def test_trailing_partial_line_is_counted_but_not_consumed(monkeypatch, tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    transcript = project_dir / "session-a.jsonl"
+    whole = _usage_line("msg_2", input_tokens=20, output_tokens=2)
+    transcript.write_text(
+        _usage_line("msg_1", input_tokens=10) + "\n" + whole[:40], encoding="utf-8"
+    )
+    claude_code_usage._FILE_CACHE.clear()
+
+    first = claude_code_usage.collect_claude_code_usage(repo_root)
+    assert first["totals"]["main"]["malformed_lines"] == 1
+    assert first["totals"]["main"]["api_calls"] == 1
+    assert first == _fresh_totals(repo_root)
+
+    _append(transcript, whole[40:] + "\n")
+    seen = _line_counter(monkeypatch)
+    second = claude_code_usage.collect_claude_code_usage(repo_root)
+
+    # Only the completed line is read, and read whole.
+    assert seen == [(whole + "\n").encode("utf-8")]
+    assert second["totals"]["main"]["malformed_lines"] == 0
+    assert second["totals"]["main"]["api_calls"] == 2
+    assert second == _fresh_totals(repo_root)
+
+
+def test_truncated_or_rewritten_transcript_falls_back_to_full_parse(
+    monkeypatch, tmp_path
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    transcript = project_dir / "session-a.jsonl"
+    transcript.write_text(
+        "".join(_usage_line(f"msg_{i}", input_tokens=5) + "\n" for i in range(4)),
+        encoding="utf-8",
+    )
+    claude_code_usage._FILE_CACHE.clear()
+    claude_code_usage.collect_claude_code_usage(repo_root)
+
+    rewrites = [
+        # Truncated: shorter than the consumed offset.
+        _usage_line("msg_0", input_tokens=5) + "\n",
+        # Rewritten: longer, but the prefix before the old offset differs.
+        "".join(_usage_line(f"other_{i}", input_tokens=9) + "\n" for i in range(6)),
+    ]
+    for content in rewrites:
+        transcript.write_text(content, encoding="utf-8")
+        tails_before = claude_code_usage.CACHE_STATS["tail_parses"]
+        fulls_before = claude_code_usage.CACHE_STATS["full_parses"]
+        result = claude_code_usage.collect_claude_code_usage(repo_root)
+        assert claude_code_usage.CACHE_STATS["full_parses"] == fulls_before + 1
+        assert claude_code_usage.CACHE_STATS["tail_parses"] == tails_before
+        expected_calls = content.count("\n")
+        assert result["totals"]["main"]["api_calls"] == expected_calls
+        assert result == _fresh_totals(repo_root)
+
+
+def test_collect_memo_skips_all_file_io_within_ttl(monkeypatch, tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    transcript = project_dir / "session-a.jsonl"
+    transcript.write_text(_usage_line("msg_1", input_tokens=1) + "\n", encoding="utf-8")
+    monkeypatch.setattr(claude_code_usage, "_COLLECT_MEMO_TTL_SECONDS", 30.0)
+    claude_code_usage._FILE_CACHE.clear()
+
+    first = claude_code_usage.collect_claude_code_usage(repo_root)
+    _append(transcript, _usage_line("msg_2", input_tokens=2) + "\n")
+
+    def _no_io(*_args, **_kwargs):
+        raise AssertionError("memo hit must not touch the filesystem")
+
+    monkeypatch.setattr(claude_code_usage, "_matching_project_dirs", _no_io)
+    monkeypatch.setattr(claude_code_usage, "_parse_files", _no_io)
+    hits_before = claude_code_usage.CACHE_STATS["memo_hits"]
+    second = claude_code_usage.collect_claude_code_usage(repo_root)
+
+    assert second == first
+    assert claude_code_usage.CACHE_STATS["memo_hits"] == hits_before + 1
+    # The caller gets a copy: mutating it never corrupts the memo.
+    second["totals"]["main"]["api_calls"] = -1
+    assert claude_code_usage.collect_claude_code_usage(repo_root) == first
+
+    monkeypatch.undo()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude_home"))
+    claude_code_usage._COLLECT_MEMO.clear()
+    fresh = claude_code_usage.collect_claude_code_usage(repo_root)
+    assert fresh["totals"]["main"]["api_calls"] == 2
+    assert os.path.getsize(transcript) > 0
+
+
+def test_collect_memo_never_keeps_a_transiently_locked_zero(monkeypatch, tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    transcript = project_dir / "session-a.jsonl"
+    transcript.write_text(_usage_line("msg_1", input_tokens=1) + "\n", encoding="utf-8")
+    monkeypatch.setattr(claude_code_usage, "_COLLECT_MEMO_TTL_SECONDS", 30.0)
+    claude_code_usage._FILE_CACHE.clear()
+    real_parser = claude_code_usage._parse_transcript_file
+    monkeypatch.setattr(
+        claude_code_usage, "_parse_transcript_file", lambda path, previous=None: None
+    )
+
+    locked = claude_code_usage.collect_claude_code_usage(repo_root)
+    assert locked["totals"]["main"]["api_calls"] == 0
+
+    monkeypatch.setattr(claude_code_usage, "_parse_transcript_file", real_parser)
+    readable = claude_code_usage.collect_claude_code_usage(repo_root)
+    assert readable["totals"]["main"]["api_calls"] == 1
