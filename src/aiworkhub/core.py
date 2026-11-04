@@ -613,6 +613,26 @@ def _windows_process_parent_map() -> dict[int, int] | None:
         return None
 
 
+# Several manager identity probes run within the same second of one tool call;
+# each used to rebuild a full Toolhelp32 snapshot (NF-2026-02058, ~20% CPU on a
+# busy MCP server). One bounded entry, evicted by age. Only the core read seam
+# is cached: platform_io.windows_process_tree stays uncached so that
+# terminate_process_tree always sees just-spawned children.
+WINDOWS_PROCESS_TREE_TTL_SECONDS = 2.0
+_WINDOWS_PROCESS_TREE_CACHE_LOCK = threading.Lock()
+# (monotonic taken-at, snapshot); None when empty. A failed snapshot is never
+# stored, so an error state is always re-checked.
+_windows_process_tree_cache: tuple[float, dict[int, tuple[int, str]]] | None = None
+
+
+def reset_windows_process_tree_cache() -> None:
+    """Drop the cached Windows process snapshot (test and diagnostic helper)."""
+
+    global _windows_process_tree_cache
+    with _WINDOWS_PROCESS_TREE_CACHE_LOCK:
+        _windows_process_tree_cache = None
+
+
 def _windows_process_tree() -> dict[int, tuple[int, str]] | None:
     """Windows PID -> (parent PID, image name), through the platform facade.
 
@@ -620,9 +640,30 @@ def _windows_process_tree() -> dict[int, tuple[int, str]] | None:
     every "how does this host answer it" difference, and keeping the ctypes
     here would put a second native implementation beside the one that already
     enumerates and terminates process trees.
+
+    A successful snapshot is reused for ``WINDOWS_PROCESS_TREE_TTL_SECONDS``
+    (by ``time.monotonic``); every caller receives its own copy, so mutating
+    the result never alters the cached snapshot. Identity decisions still
+    compare exact pid plus creation time downstream; this only bounds how
+    often the enumeration itself runs.
     """
 
-    return platform_io.windows_process_tree()
+    global _windows_process_tree_cache
+    with _WINDOWS_PROCESS_TREE_CACHE_LOCK:
+        now = time.monotonic()
+        cached = _windows_process_tree_cache
+        if cached is not None:
+            taken_at, snapshot = cached
+            age = now - taken_at
+            if 0.0 <= age < WINDOWS_PROCESS_TREE_TTL_SECONDS:
+                return dict(snapshot)
+        fresh = platform_io.windows_process_tree()
+        if fresh is None:
+            _windows_process_tree_cache = None
+            return None
+        stored = dict(fresh)
+        _windows_process_tree_cache = (now, stored)
+        return dict(stored)
 
 
 def _windows_process_image_names() -> dict[int, str] | None:
