@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from . import (
+    platform_io,
     repo_policy,
     storage_retention,
     task_retention,
@@ -36,6 +37,15 @@ PERSISTED_CACHE_SCHEMA = "aiworkhub.storage-observability-cache.v1"
 PERSISTED_CACHE_RELATIVE_PATH = Path(
     ".aiworkhub/runtime/cache/storage-observability-v1.json"
 )
+# Cross-process single-flight for _measure (NF-2026-02060): one MCP server
+# process per repository walks the store; the others adopt its persisted result.
+MEASURE_LOCK_RELATIVE_PATH = Path(
+    ".aiworkhub/runtime/cache/storage-observability-v1.lock"
+)
+MEASURE_LOCK_STALE_SECONDS = 15 * 60.0
+MEASURE_LOCK_MAX_BYTES = 4096
+MEASURE_LOCK_ATTEMPTS = 3
+MEASURE_RETRY_SECONDS = 15.0
 PERSISTED_PAYLOAD_KEYS = frozenset({
     "scan_status", "scanned_at", "repo_data_bytes", "repo_data_files",
     "worker_tree_bytes", "worker_tree_count", "safe_reclaimable_bytes",
@@ -50,6 +60,8 @@ _cache: dict[str, dict[str, Any]] = {}
 _running: set[str] = set()
 _loaded: set[str] = set()
 _invalidated: set[str] = set()
+# Monotonic instant before which a refresh that lost the measure lock may not retry.
+_deferred_until: dict[str, float] = {}
 
 
 def _repo_binding(repo_root: Path) -> str:
@@ -114,14 +126,7 @@ def _load_persisted(repo_root: Path) -> dict[str, Any]:
 
 def _persist(repo_root: Path, measured: dict[str, Any]) -> None:
     """Atomically persist a successful scan without exposing a partial cache."""
-    # Uninitialised paths used by diagnostics/tests must remain observationally
-    # read-only.  Canonical repositories always have this manifest.
-    hub = repo_root / ".aiworkhub"
-    runtime = hub / "runtime"
-    cache_dir = runtime / "cache"
-    if hub.is_symlink() or runtime.is_symlink() or cache_dir.is_symlink():
-        return
-    if not (hub / "project.json").is_file():
+    if _canonical_cache_dir(repo_root) is None:
         return
     path = repo_root / PERSISTED_CACHE_RELATIVE_PATH
     parent = path.parent
@@ -159,6 +164,156 @@ def _persist(repo_root: Path, measured: dict[str, Any]) -> None:
                 temp.unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+def _canonical_cache_dir(repo_root: Path) -> Path | None:
+    """Return the in-repo runtime cache directory, or None when none may be written.
+
+    Uninitialised paths used by diagnostics/tests must remain observationally
+    read-only.  Canonical repositories always have this manifest.
+    """
+    hub = repo_root / ".aiworkhub"
+    runtime = hub / "runtime"
+    cache_dir = runtime / "cache"
+    if hub.is_symlink() or runtime.is_symlink() or cache_dir.is_symlink():
+        return None
+    if not (hub / "project.json").is_file():
+        return None
+    return cache_dir
+
+
+def _lock_holder(path: Path) -> tuple[bytes, int | None, float] | None:
+    """Return ``(raw, pid, age_seconds)`` of a measure lock, None when unreadable.
+
+    A torn or malformed lock (a holder that died between create and write) has
+    no pid and is aged from its mtime, so it is still taken over once stale.
+    """
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(MEASURE_LOCK_MAX_BYTES + 1)
+            acquired_at = float(os.fstat(handle.fileno()).st_mtime)
+    except OSError:
+        return None
+    pid: int | None = None
+    record: Any = None
+    if len(raw) <= MEASURE_LOCK_MAX_BYTES:
+        try:
+            record = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            record = None
+    if isinstance(record, dict):
+        holder_pid = record.get("pid")
+        if isinstance(holder_pid, int) and not isinstance(holder_pid, bool) and holder_pid > 0:
+            pid = holder_pid
+        stamp = record.get("acquired_at_epoch")
+        if isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
+            try:
+                stamp_value = float(stamp)
+            except (OverflowError, ValueError, TypeError):
+                stamp_value = math.nan  # unrepresentable stamp: keep the mtime age
+            if math.isfinite(stamp_value):
+                acquired_at = stamp_value
+    return raw, pid, time.time() - acquired_at
+
+
+def _lock_is_stale(pid: int | None, age: float) -> bool:
+    if pid == os.getpid():
+        # Only one refresh per repository runs in this process (``_running``),
+        # so a lock naming this pid is a leftover of an earlier failed release.
+        return True
+    if age < 0 or age > MEASURE_LOCK_STALE_SECONDS:
+        # A future stamp is untrustworthy, and a measure outliving the bound is
+        # itself the defect (e.g. a live holder whose release unlink failed).
+        return True
+    return pid is not None and not platform_io.process_is_alive(pid)
+
+
+def _acquire_measure_lock(repo_root: Path) -> tuple[bool, bytes | None]:
+    """Single-flight the managed-size walk across every process bound to the repo.
+
+    Returns ``(may_measure, token)``; ``token`` is the exact lock content this
+    process wrote and must be passed to :func:`_release_measure_lock`.  A
+    repository without a canonical cache directory shares nothing across
+    processes and may not be written, so it measures unlocked as before.
+    """
+    cache_dir = _canonical_cache_dir(repo_root)
+    if cache_dir is None:
+        return True, None
+    path = repo_root / MEASURE_LOCK_RELATIVE_PATH
+    token = json.dumps(
+        {
+            "pid": os.getpid(),
+            "acquired_at_epoch": time.time(),
+            "nonce": os.urandom(8).hex(),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return True, None
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    for _attempt in range(MEASURE_LOCK_ATTEMPTS):
+        try:
+            fd = os.open(path, flags, 0o600)
+        except FileExistsError:
+            holder = _lock_holder(path)
+            if holder is None:
+                continue  # released between our create and our read
+            raw, pid, age = holder
+            if not _lock_is_stale(pid, age):
+                return False, None
+            # Narrow the takeover race: only remove the exact stale bytes judged.
+            current = _lock_holder(path)
+            if current is None or current[0] != raw:
+                continue
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return False, None
+            continue
+        except OSError:
+            # The lock cannot be created at all (read-only or denied cache
+            # directory): measuring unlocked keeps telemetry live, as before.
+            return True, None
+        try:
+            written = os.write(fd, token)
+        except OSError:
+            written = -1
+        finally:
+            os.close(fd)
+        if written != len(token):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return True, None
+        return True, token
+    return False, None
+
+
+def _release_measure_lock(repo_root: Path, token: bytes | None) -> None:
+    """Remove this process's measure lock; never another owner's takeover."""
+    if token is None:
+        return
+    path = repo_root / MEASURE_LOCK_RELATIVE_PATH
+    holder = _lock_holder(path)
+    if holder is None or holder[0] != token:
+        return
+    for attempt in range(MEASURE_LOCK_ATTEMPTS):
+        try:
+            path.unlink()
+            return
+        except PermissionError:
+            # Windows: a peer briefly holds the file open in _lock_holder.
+            if attempt + 1 < MEASURE_LOCK_ATTEMPTS:
+                time.sleep(0.05)
+        except OSError:
+            return
 
 
 def _tree_size(path: Path, *, exclude: tuple[Path, ...] = ()) -> tuple[int, int]:
@@ -464,22 +619,71 @@ def _measure(repo_root: Path) -> dict[str, Any]:
     }
 
 
-def _refresh(key: str, repo_root: Path) -> None:
-    try:
-        measured = _measure(repo_root)
-    except Exception as exc:  # noqa: BLE001 -- telemetry must never break the dashboard
-        measured = {
-            "scan_status": "error",
-            "scanned_at": datetime.now(timezone.utc).isoformat(),
-            "errors": [f"storage_scan_failed:{type(exc).__name__}"],
-        }
-    measured["_completed_monotonic"] = time.monotonic()
-    if measured.get("scan_status") == "ready":
-        _persist(repo_root, measured)
+def _publish(key: str, measured: dict[str, Any]) -> None:
     with _lock:
         _cache[key] = measured
         _running.discard(key)
         _invalidated.discard(key)
+        _deferred_until.pop(key, None)
+
+
+def _refresh(key: str, repo_root: Path) -> None:
+    """Refresh one repository's telemetry, measuring at most once per TTL per repo.
+
+    Every MCP server process bound to the repository shares the persisted cache
+    and an in-repo measure lock, so the full walk in :func:`_measure` runs once
+    per :data:`SCAN_TTL_SECONDS` for the repository rather than once per process.
+    An invalidation (a local retention write) never adopts an older persisted
+    result: it must measure, or retry after the current holder finishes.
+    """
+    with _lock:
+        forced = key in _invalidated
+    try:
+        try:
+            may_measure, token = _acquire_measure_lock(repo_root)
+        except Exception as exc:  # noqa: BLE001 -- telemetry must never break the dashboard
+            failed = _scan_error(exc)
+            failed["_completed_monotonic"] = time.monotonic()
+            _publish(key, failed)
+            return
+        try:
+            if not forced:
+                adopted = _load_persisted(repo_root)
+                if adopted and (
+                    time.monotonic() - float(adopted["_completed_monotonic"])
+                    < SCAN_TTL_SECONDS
+                ):
+                    _publish(key, adopted)
+                    return
+            if not may_measure:
+                # Another live process is measuring: keep serving the in-process
+                # snapshot and retry (adopting its persisted result) after a backoff.
+                with _lock:
+                    _running.discard(key)
+                    _deferred_until[key] = time.monotonic() + MEASURE_RETRY_SECONDS
+                return
+            try:
+                measured = _measure(repo_root)
+            except Exception as exc:  # noqa: BLE001 -- telemetry must never break the dashboard
+                measured = _scan_error(exc)
+            measured["_completed_monotonic"] = time.monotonic()
+            if measured.get("scan_status") == "ready":
+                _persist(repo_root, measured)
+            _publish(key, measured)
+        finally:
+            _release_measure_lock(repo_root, token)
+    finally:
+        # No exception path may strand the key and block every later refresh.
+        with _lock:
+            _running.discard(key)
+
+
+def _scan_error(exc: BaseException) -> dict[str, Any]:
+    return {
+        "scan_status": "error",
+        "scanned_at": datetime.now(timezone.utc).isoformat(),
+        "errors": [f"storage_scan_failed:{type(exc).__name__}"],
+    }
 
 
 def snapshot(repo_root: Path | str) -> dict[str, Any]:
@@ -529,7 +733,10 @@ def snapshot(repo_root: Path | str) -> dict[str, Any]:
             or now - completed >= SCAN_TTL_SECONDS
             or key in _invalidated
         )
-        if stale and key not in _running:
+        # A refresh that lost the cross-process measure lock backs off briefly
+        # instead of re-polling the lock on every dashboard request.
+        deferred = now < _deferred_until.get(key, 0.0)
+        if stale and key not in _running and not deferred:
             _running.add(key)
             threading.Thread(
                 target=_refresh,
@@ -598,6 +805,7 @@ def _reset_cache_for_tests() -> None:
         _running.clear()
         _loaded.clear()
         _invalidated.clear()
+        _deferred_until.clear()
 
 
 def invalidate(repo_root: Path | str) -> None:
