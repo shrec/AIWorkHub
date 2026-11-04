@@ -871,16 +871,46 @@ _QUICK_CHECK_LOCK = threading.RLock()
 _QUICK_CHECK_CACHE: "OrderedDict[tuple[str, int, int], tuple[float, str]]" = OrderedDict()
 
 
+# NF-2026-02059: a POSITIVE readiness verdict is memoized per resolved
+# repository root. Every task_store.get_task used to pay inspect_repository,
+# load_storage_registry and a read-only _schema_ok connection, so per-row loops
+# (needfix_store.reconcile_unlinked_needfix, review_orchestrator
+# .recover_review_ready_targets) became N+1 connection opens. The memo is keyed
+# by a stat fingerprint of every file the verdict read -- the manifest, the
+# storage registry, the canonical database and its WAL -- as
+# (st_mtime_ns, st_size, st_ino, st_dev). Each call re-stats them; any mismatch,
+# missing file or stat error drops the memo and re-runs the full check, so a
+# de-authorised or replaced store is still refused at once. A negative verdict
+# is never memoized. Entries expire with the quick_check TTL so the periodic
+# integrity re-scan of ``_cached_quick_check`` is unchanged, and the memo is
+# bounded in entries. ``_READINESS_MEMO_GENERATION`` stops a check that was in
+# flight across ``reset_storage_readiness_cache`` from storing a stale verdict.
+# ``_READINESS_PATHS`` keeps the inputs the last ready check per root read, even
+# after its memo entry expired or mismatched, so the next check can be bracketed
+# by a fingerprint taken before it and one taken after it; only an unchanged
+# bracket is memoized (same bound, same lock).
+_READINESS_MEMO_MAX_ENTRIES = 32
+_READINESS_MEMO_LOCK = threading.Lock()
+_READINESS_MEMO: "OrderedDict[str, tuple[float, tuple[str, ...], tuple[Any, ...], StorageReadiness]]" = OrderedDict()
+_READINESS_PATHS: "OrderedDict[str, tuple[str, ...]]" = OrderedDict()
+_READINESS_MEMO_GENERATION = 0
+
+
 def reset_storage_readiness_cache() -> None:
-    """Drop the cached integrity results.
+    """Drop the cached integrity results and the memoized readiness verdicts.
 
     Call after any operation that replaces or rebuilds the canonical database
     in place, and from tests that corrupt a database and expect the next
     readiness call to see it.
     """
 
+    global _READINESS_MEMO_GENERATION
     with _QUICK_CHECK_LOCK:
         _QUICK_CHECK_CACHE.clear()
+    with _READINESS_MEMO_LOCK:
+        _READINESS_MEMO.clear()
+        _READINESS_PATHS.clear()
+        _READINESS_MEMO_GENERATION += 1
 
 
 def _cached_quick_check(path: Path) -> str:
@@ -1039,6 +1069,57 @@ def canonical_status(row: Mapping[str, Any]) -> str:
     return "pending"
 
 
+def _readiness_memo_key(root: str | Path) -> str | None:
+    """The resolved root a memo entry is keyed by, or None (never memoize)."""
+    try:
+        return str(Path(root).resolve())
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _readiness_fingerprint(paths: tuple[str, ...]) -> tuple[Any, ...] | None:
+    """Stat fingerprint of every file a ready verdict read, or None.
+
+    ``paths`` is (manifest, registry, canonical_db). The database's ``-wal``
+    sidecar is fingerprinted too, because a schema change committed in WAL mode
+    leaves the main file untouched until a checkpoint; an absent WAL is part of
+    the fingerprint, any other stat error is a miss.
+    """
+    parts: list[Any] = []
+    for path in paths:
+        try:
+            info = os.stat(path)
+        except OSError:
+            return None
+        parts.append((info.st_mtime_ns, info.st_size, getattr(info, "st_ino", 0), getattr(info, "st_dev", 0)))
+    try:
+        wal = os.stat(paths[-1] + "-wal")
+    except FileNotFoundError:
+        parts.append(None)
+    except OSError:
+        return None
+    else:
+        parts.append((wal.st_mtime_ns, wal.st_size, getattr(wal, "st_ino", 0), getattr(wal, "st_dev", 0)))
+    return tuple(parts)
+
+
+def _readiness_memo_lookup(key: str) -> StorageReadiness | None:
+    with _READINESS_MEMO_LOCK:
+        entry = _READINESS_MEMO.get(key)
+    if entry is None:
+        return None
+    stored_at, paths, fingerprint, verdict = entry
+    if time.monotonic() - stored_at > _QUICK_CHECK_TTL_SECONDS or _readiness_fingerprint(paths) != fingerprint:
+        with _READINESS_MEMO_LOCK:
+            if _READINESS_MEMO.get(key) is entry:
+                del _READINESS_MEMO[key]
+        return None
+    with _READINESS_MEMO_LOCK:
+        if _READINESS_MEMO.get(key) is entry:
+            _READINESS_MEMO.move_to_end(key)
+    return verdict
+
+
 def storage_readiness(root: str | Path) -> StorageReadiness:
     """Verified registry/database authority readiness.
 
@@ -1046,47 +1127,125 @@ def storage_readiness(root: str | Path) -> StorageReadiness:
     following must independently pass: manifest identity, storage registry
     repo_id, task_queue canonical_active authority, live cutover metadata,
     canonical DB existence, schema, and an SQLite quick_check.
+
+    A ready verdict is memoized per resolved root and served only while the
+    stat fingerprint of the manifest, registry and database is unchanged
+    (NF-2026-02059); a not-ready verdict always re-runs the full check.
     """
+    key = _readiness_memo_key(root)
+    prior: tuple[str, ...] | None = None
+    before: tuple[Any, ...] | None = None
+    if key is not None:
+        memoized = _readiness_memo_lookup(key)
+        if memoized is not None:
+            return memoized
+        with _READINESS_MEMO_LOCK:
+            prior = _READINESS_PATHS.get(key)
+        if prior is not None:
+            before = _readiness_fingerprint(prior)
+    with _READINESS_MEMO_LOCK:
+        generation = _READINESS_MEMO_GENERATION
+    started_at = time.monotonic()
+    readiness, inputs, repo_root = _storage_readiness_full(root)
+    if not readiness.ready or key is None or inputs is None or repo_root is None:
+        return readiness
+    try:
+        if str(Path(repo_root).resolve()) != key:
+            # The caller passed a path that resolved to some other root; keep
+            # the memo to the exact root its fingerprint describes.
+            return readiness
+    except (OSError, RuntimeError, ValueError):
+        return readiness
+    # Bracket the check with two fingerprints over the same inputs: ``before``
+    # is taken from the inputs the previous ready check for this root read,
+    # ``after`` now. A file replaced while the check ran makes them differ, so
+    # a verdict about bytes nobody verified is never stored. The first call for
+    # a root has no ``before`` and therefore only records its inputs.
+    after = _readiness_fingerprint(inputs)
+    with _READINESS_MEMO_LOCK:
+        if generation != _READINESS_MEMO_GENERATION:
+            return readiness
+        _READINESS_PATHS[key] = inputs
+        _READINESS_PATHS.move_to_end(key)
+        while len(_READINESS_PATHS) > _READINESS_MEMO_MAX_ENTRIES:
+            _READINESS_PATHS.popitem(last=False)
+        if prior == inputs and before is not None and after is not None and after == before:
+            _READINESS_MEMO[key] = (started_at, inputs, after, readiness)
+            _READINESS_MEMO.move_to_end(key)
+            while len(_READINESS_MEMO) > _READINESS_MEMO_MAX_ENTRIES:
+                _READINESS_MEMO.popitem(last=False)
+    return readiness
+
+
+def _storage_readiness_full(
+    root: str | Path,
+) -> tuple[StorageReadiness, tuple[str, ...] | None, Path | None]:
+    """The uncached readiness check, plus the files a ready verdict read."""
     try:
         repo = inspect_repository(root)
     except RepositoryStateError as exc:
-        return StorageReadiness(False, f"manifest_invalid:{exc}", "", "")
+        return StorageReadiness(False, f"manifest_invalid:{exc}", "", ""), None, None
 
     try:
         registry = load_storage_registry(repo.root, expected_repo_id=repo.manifest.repo_id)
     except StorageRegistryError as exc:
-        return StorageReadiness(False, f"registry_invalid:{exc}", repo.manifest.repo_id, "")
+        return StorageReadiness(False, f"registry_invalid:{exc}", repo.manifest.repo_id, ""), None, None
 
     if registry.payload.get("repo_id") != repo.manifest.repo_id:
-        return StorageReadiness(False, "registry_repo_id_mismatch", repo.manifest.repo_id, "")
+        return StorageReadiness(False, "registry_repo_id_mismatch", repo.manifest.repo_id, ""), None, None
 
     try:
         db = registry.databases["task_queue"]
     except KeyError:
-        return StorageReadiness(False, "task_queue_record_missing", repo.manifest.repo_id, "")
+        return StorageReadiness(False, "task_queue_record_missing", repo.manifest.repo_id, ""), None, None
 
     if not (db.canonical_active and not db.legacy_active and db.live_cutover):
-        return StorageReadiness(False, "task_queue_authority_not_canonical", repo.manifest.repo_id, "")
+        return (
+            StorageReadiness(False, "task_queue_authority_not_canonical", repo.manifest.repo_id, ""),
+            None,
+            None,
+        )
 
     try:
         canonical_db = resolve_database_path(registry, "task_queue")
     except StorageRegistryError as exc:
-        return StorageReadiness(False, f"database_path_invalid:{exc}", repo.manifest.repo_id, "")
+        return (
+            StorageReadiness(False, f"database_path_invalid:{exc}", repo.manifest.repo_id, ""),
+            None,
+            None,
+        )
 
     if not canonical_db.is_file():
-        return StorageReadiness(False, "canonical_db_missing", repo.manifest.repo_id, str(canonical_db))
+        return (
+            StorageReadiness(False, "canonical_db_missing", repo.manifest.repo_id, str(canonical_db)),
+            None,
+            None,
+        )
 
     if not _schema_ok(canonical_db):
-        return StorageReadiness(False, "canonical_schema_incomplete", repo.manifest.repo_id, str(canonical_db))
+        return (
+            StorageReadiness(False, "canonical_schema_incomplete", repo.manifest.repo_id, str(canonical_db)),
+            None,
+            None,
+        )
 
     try:
         qc = _cached_quick_check(canonical_db)
     except sqlite3.DatabaseError:
-        return StorageReadiness(False, "canonical_db_corrupt", repo.manifest.repo_id, str(canonical_db))
+        return (
+            StorageReadiness(False, "canonical_db_corrupt", repo.manifest.repo_id, str(canonical_db)),
+            None,
+            None,
+        )
     if qc != "ok":
-        return StorageReadiness(False, f"quick_check_failed:{qc}", repo.manifest.repo_id, str(canonical_db))
+        return (
+            StorageReadiness(False, f"quick_check_failed:{qc}", repo.manifest.repo_id, str(canonical_db)),
+            None,
+            None,
+        )
 
-    return StorageReadiness(True, "ready", repo.manifest.repo_id, str(canonical_db))
+    inputs = (str(repo.manifest_path), str(registry.registry_path), str(canonical_db))
+    return StorageReadiness(True, "ready", repo.manifest.repo_id, str(canonical_db)), inputs, repo.root
 
 
 def _require_ready(root: str | Path) -> tuple[StorageReadiness, Path]:

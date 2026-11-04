@@ -76,11 +76,16 @@ def test_integrity_scan_runs_once_across_many_readiness_calls(
     assert len(scans) == 1, f"expected one integrity scan, ran {len(scans)}"
 
 
-def test_authority_is_rechecked_on_every_call_not_cached(
+def test_authority_is_rechecked_whenever_an_authority_file_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Only the scan is cached. Ownership must be re-verified every time."""
+    """NF-2026-02059: the ready verdict is memoized only while the manifest,
+    registry and database stat fingerprint is unchanged; any change to an
+    authority file re-verifies ownership on the next call."""
     repo = _ready_repo(tmp_path)
+    # The first ready check for a root only records its inputs; the second is
+    # bracketed by two equal fingerprints and memoized.
+    assert task_store.storage_readiness(repo).ready
 
     inspections: list[object] = []
     real = task_store.inspect_repository
@@ -93,8 +98,12 @@ def test_authority_is_rechecked_on_every_call_not_cached(
 
     for _ in range(5):
         task_store.storage_readiness(repo)
+    assert len(inspections) == 0, "an unchanged ready store is served from the memo"
 
-    assert len(inspections) == 5, "authority must not be served from a cache"
+    registry_path = repo / ".aiworkhub" / "config" / "storage.json"
+    registry_path.write_bytes(registry_path.read_bytes() + b"\n")
+    assert task_store.storage_readiness(repo).ready
+    assert len(inspections) == 1, "a changed registry must force the full authority check"
 
 
 def test_a_store_that_stops_being_canonical_is_refused_immediately(
