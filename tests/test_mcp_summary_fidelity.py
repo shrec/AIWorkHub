@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import sys
 
 from aiworkhub import server, task_plan
 
@@ -34,7 +35,18 @@ def _load_stdlib_backed_server():
     module = importlib.util.module_from_spec(spec)
     # Relative imports in server.py resolve against this package name.
     module.__package__ = "aiworkhub"
-    spec.loader.exec_module(module)
+    # server.py looks itself up in sys.modules while its body runs (NF-2026-01988),
+    # as any normally imported module may; register the fresh module for that
+    # window and restore the process-wide entry afterwards.
+    previous = sys.modules.get(spec.name)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if previous is None:
+            sys.modules.pop(spec.name, None)
+        else:
+            sys.modules[spec.name] = previous
     assert module._MCP_SDK_AVAILABLE is False, "stdlib stdio fallback must be active"
     return module
 
