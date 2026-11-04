@@ -469,9 +469,13 @@ def test_broken_rewrite_is_kept_and_probed_once_through_validation_lane(
     monkeypatch.setattr(toolchain_authority, "probe_executable_version", counting_probe)
     _unsandboxed_lane(monkeypatch, tmp_path)
 
-    rows = worker_workspace.run_validations(
-        _shim_workspace(tmp_path), ["cmake --version", "cmake --build build"]
-    )
+    # A failing command fails the batch; its rows ride on the raised error.
+    with pytest.raises(worker_workspace.ValidationRunError) as failure:
+        worker_workspace.run_validations(
+            _shim_workspace(tmp_path), ["cmake --version", "cmake --build build"]
+        )
+    rows = failure.value.results
+    assert rows
 
     assert probed == [str(broken.resolve())]
     for row in rows:

@@ -11,6 +11,7 @@ durable ``retry_terminal`` events.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -32,7 +33,11 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("AIWORKHUB_REPO", str(root))
     monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
     token_path = tmp_path / "coordinator.token"
-    token_path.write_text("coordinator-token\n", encoding="utf-8")
+    # Owner-only from creation: on POSIX the coordinator refuses a token file
+    # that group or others can read (token_file_permissions).
+    fd = os.open(str(token_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write("coordinator-token\n")
     monkeypatch.setenv("BITNN_TASKCTL_COORDINATOR_TOKEN_FILE", str(token_path))
     monkeypatch.setenv("BITNN_TASKCTL_COORDINATOR_TOKEN", "coordinator-token")
     return root
