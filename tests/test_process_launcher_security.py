@@ -118,7 +118,7 @@ def test_quality_reviewer_reservation_is_exact_durable_and_replays_before_ack(
         return {"can_launch": True}
 
     def _stable():
-        return _load_latest()
+        return _load_latest(), ("gen",)
 
     def _proven(snapshot):
         return (_load_latest(), "proven")

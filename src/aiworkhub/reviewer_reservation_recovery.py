@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import stat
@@ -998,3 +999,174 @@ def reconcile_expired_starting_reservations(
     for request_id in retired:
         latest[request_id] = {**latest[request_id], "state": "blocked"}
     return len(retired)
+
+
+# NF-2026-02046 -- the reviewer-reservation registry-lock critical section.
+# Returned by that critical section when the ledger rows the lock-free reuse
+# read was taken over changed; the caller re-reads outside the lock.
+_LENS_REUSE_INPUTS_CHANGED = object()
+
+
+def _registry_lock_contended_deferral(cause: str) -> dict[str, Any]:
+    """Retryable reviewer-reservation deferral: nothing reserved, card untouched.
+
+    Shares the ``ledger_snapshot_unproven`` code the launch-retry vocabulary
+    already treats as retryable, so contention never reads as launch_failed
+    or blocks the reviewer card; ``cause`` names which bound was hit.
+    """
+
+    return {
+        "ok": False,
+        "error": "ledger_snapshot_unproven",
+        "cause": str(cause)[:120],
+        "retryable": True,
+        "deferred": True,
+        "request_created": False,
+    }
+
+
+def _ledger_row_fingerprint(row: Mapping[str, Any]) -> str:
+    """Content identity of one ledger row, binding a lock-free read to it."""
+
+    encoded = json.dumps(row, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _lens_reuse_inputs(
+    manager: Any,
+    latest: Mapping[str, Mapping[str, Any]],
+    *,
+    target_task_id: str,
+    target_request_id: str,
+    lens: str,
+    exclude_task_id: str,
+) -> tuple[tuple[str, str, str, bool], ...]:
+    """The ledger rows the reuse rule reads, as a comparable identity.
+
+    In-memory only (no task-store or git read), so the registry-lock
+    critical section can prove a reuse answer computed outside it still
+    describes exactly these rows.  The claim epoch is part of the identity,
+    so a reconcile that binds a relevant reviewer also changes it.
+    """
+
+    return tuple(sorted(
+        (
+            str(request_id),
+            str(event.get("state") or ""),
+            str(event.get("reviewer_claim_epoch") or ""),
+            bool(live),
+        )
+        for request_id, event, live in manager._lens_reviewer_attempts(
+            latest, target_task_id, target_request_id, lens
+        )
+        if not exclude_task_id or str(event.get("task_id") or "") != exclude_task_id
+    ))
+
+
+def _prefetch_quality_reviewer_reuse(
+    manager: Any,
+    latest: Mapping[str, Mapping[str, Any]],
+    *,
+    target_task_id: str,
+    target_request_id: str,
+    claim_epoch: str,
+    lens: str,
+    exclude_task_id: str,
+) -> dict[str, Any]:
+    """Every store read a reviewer reservation needs, with the lock released.
+
+    Unbound-claim resolution and the reuse rule both load task cards;
+    holding the cross-process registry lock across them held it 20.8 s.
+    Each claim resolution is returned as ``(row_fingerprint, resolution)``
+    over the exact row it was computed from, and ``reuse_inputs`` names the
+    rows ``reused`` was computed over; the critical section uses either only
+    while those rows still stand.
+    """
+
+    resolutions = manager._resolve_unbound_reviewer_claims(
+        cast(dict[str, dict[str, Any]], latest)
+    )
+    return {
+        "unbound_claim_resolutions": {
+            request_id: (_ledger_row_fingerprint(latest[request_id]), resolution)
+            for request_id, resolution in resolutions.items()
+            if request_id in latest
+        },
+        "reuse_inputs": _lens_reuse_inputs(
+            manager, latest,
+            target_task_id=target_task_id,
+            target_request_id=target_request_id,
+            lens=lens,
+            exclude_task_id=exclude_task_id,
+        ),
+        "reused": manager.existing_lens_reviewer(
+            target_task_id=target_task_id,
+            target_request_id=target_request_id,
+            claim_epoch=claim_epoch, lens=lens, latest=latest,
+            exclude_task_id=exclude_task_id,
+        ),
+    }
+
+
+def _fresh_unbound_claim_resolutions(
+    prefetched: Mapping[str, tuple[str, ClaimResolution]],
+    latest: Mapping[str, Mapping[str, Any]],
+) -> dict[str, ClaimResolution]:
+    """Only the prefetched resolutions whose exact row still stands in ``latest``.
+
+    A dropped resolution is the reconcile pass's existing unresolved skip,
+    so a row changed between the lock-free read and the lock is preserved.
+    """
+
+    return {
+        request_id: resolution
+        for request_id, (fingerprint, resolution) in prefetched.items()
+        if request_id in latest
+        and _ledger_row_fingerprint(latest[request_id]) == fingerprint
+    }
+
+
+def reserve_with_prefetched_reuse(
+    manager: Any,
+    snapshot: Any,
+    decide: Callable[[Any], Any],
+    prefetched: dict[str, Any],
+    *,
+    target_task_id: str,
+    target_request_id: str,
+    claim_epoch: str,
+    lens: str,
+    exclude_task_id: str,
+) -> dict[str, Any]:
+    """Bounded prefetch / re-check loop around the reservation critical section.
+
+    NF-2026-02046: ``_reserve_quality_reviewer_attempt`` held the
+    cross-process registry lock for 20.8 s because unbound-claim resolution
+    and the lens-reuse rule load task cards.  Those task-store reads run HERE,
+    with the lock released, into ``prefetched`` (the dict ``decide`` reads).
+    ``decide`` then runs under the lock, re-checks the exact ledger rows the
+    prefetch was computed over and commits; when they changed it returns
+    :data:`_LENS_REUSE_INPUTS_CHANGED` and the round re-runs on a fresh stable
+    snapshot, at most ``manager._RESERVATION_RESNAPSHOT_ROUNDS`` times.
+    Registry-lock contention, or inputs that keep changing past that bound,
+    is a retryable deferral -- never launch_failed and never a blocked card.
+    """
+
+    for _round in range(manager._RESERVATION_RESNAPSHOT_ROUNDS):
+        prefetched.clear()
+        prefetched.update(_prefetch_quality_reviewer_reuse(
+            manager, snapshot[0], target_task_id=target_task_id,
+            target_request_id=target_request_id,
+            claim_epoch=claim_epoch, lens=lens,
+            exclude_task_id=exclude_task_id,
+        ))
+        try:
+            decided = manager._decide_on_proven_snapshot(
+                snapshot, decide, process_lock=True
+            )
+        except AdvisoryLockTimeout:
+            return _registry_lock_contended_deferral("registry_lock_timeout")
+        if decided is not _LENS_REUSE_INPUTS_CHANGED:
+            return cast(dict[str, Any], decided)
+        snapshot = manager._latest_by_request_stable()
+    return _registry_lock_contended_deferral("lens_reuse_inputs_changed")

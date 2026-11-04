@@ -225,6 +225,9 @@ from .quality_review_receipt import (
     _verified_quality_review_receipt,
 )
 from . import quality_reviewer
+from .finalization_phase_clock import (  # noqa: F401 -- re-exported for tests
+    FINALIZATION_EVIDENCE_SUBPHASES, _FinalizationPhaseClock, _finalization_phase_durations,
+)
 from . import reviewer_prewarm_capacity
 from . import reviewer_reservation_recovery
 from . import terminal_authority
@@ -7251,17 +7254,15 @@ class ProcessManager:
         exact live-pid rules are unchanged.
         """
 
-        # The stable snapshot may replay the whole ledger up to
-        # ``_LEDGER_SNAPSHOT_MAX_ATTEMPTS`` times.  Taking it here, before the
-        # cross-process registry lock, keeps that amplified work off every
-        # unrelated reservation acknowledgement waiting on the same lock; so
-        # does warming the NF-2026-01131 seal projection read under the lock.
+        # Snapshot and seal-projection warm-up run before the registry lock.
         snapshot = self._latest_by_request_stable()
         process_event_ledger.sealed_request_field(
             self.process_log_path, "quality_review_attempt"
         )
+        recovery = reviewer_reservation_recovery
+        prefetched: dict[str, Any] = {}  # NF-2026-02046: filled lock-free
         try:
-            def _decide(proven: Any) -> dict[str, Any]:
+            def _decide(proven: Any) -> Any:
                 # ONE proven snapshot backs this whole critical section, and
                 # every decision below is taken from it rather than from a
                 # fresh parse.  Reconciliation, the already-reserved check and
@@ -7273,13 +7274,12 @@ class ProcessManager:
                 if proven is None:
                     return {"ok": False, "error": "ledger_snapshot_unproven"}
                 latest = proven[0]
-                unbound_claim_resolutions = self._resolve_unbound_reviewer_claims(
-                    latest
-                )
+                # A prefetched resolution applies only to its exact row.
                 self._reconcile_expired_starting_reservations(
-                    proven,
-                    resolved=True,
-                    _unbound_claim_resolutions=unbound_claim_resolutions,
+                    proven, resolved=True,
+                    _unbound_claim_resolutions=recovery._fresh_unbound_claim_resolutions(
+                        prefetched["unbound_claim_resolutions"], latest
+                    ),
                 )
                 existing = self._live_reviewer_receipt(
                     reviewer_task_id,
@@ -7315,12 +7315,14 @@ class ProcessManager:
                 # relaunch mints a FRESH reviewer instead of the same blind one.
                 # ``existing_lens_reviewer`` owns that predicate for every reuse
                 # site, so nothing about it is re-decided here or downstream.
-                reused = self.existing_lens_reviewer(
-                    target_task_id=target_task_id,
-                    target_request_id=target_request_id,
-                    claim_epoch=target_claim_epoch, lens=lens, latest=latest,
+                # NF-2026-02046: prefetched reuse holds only while its ledger rows stand.
+                if recovery._lens_reuse_inputs(
+                    self, latest, target_task_id=target_task_id,
+                    target_request_id=target_request_id, lens=lens,
                     exclude_task_id=reviewer_task_id,
-                )
+                ) != prefetched["reuse_inputs"]:
+                    return recovery._LENS_REUSE_INPUTS_CHANGED
+                reused = prefetched["reused"]
                 # NF-2026-00823: a hedge is bought BESIDE its live incumbent.
                 if reused is not None and reused["request_id"] != hedge_incumbent_request_id:
                     return {
@@ -7362,7 +7364,12 @@ class ProcessManager:
                     "request_id": request_id,
                     "state": "starting",
                 }
-            return self._decide_on_proven_snapshot(snapshot, _decide, process_lock=True)
+            # NF-2026-02046: lock-free prefetch, re-checked and committed under the lock.
+            return recovery.reserve_with_prefetched_reuse(
+                self, snapshot, _decide, prefetched, target_task_id=target_task_id,
+                target_request_id=target_request_id, claim_epoch=target_claim_epoch,
+                lens=lens, exclude_task_id=reviewer_task_id,
+            )
         finally:
             # Reconciliation above recorded terminal intent only; the SQLite
             # transition and its single manager callback happen here, with the
@@ -10726,7 +10733,9 @@ class ProcessManager:
         lock_blocking: bool = True,
     ) -> dict[str, Any] | None:
         finalization_started = time.monotonic()
+        phase_clock = _FinalizationPhaseClock()  # NF-2026-02046: named residual sub-phases
         with self._request_lock(request_id, blocking=lock_blocking), _FinalizerHeartbeat(request_id) as heartbeat:
+            phase_clock.add("request_lock_wait", finalization_started)
             events = self._request_events(request_id)
             if not events:
                 return None
@@ -11186,7 +11195,7 @@ class ProcessManager:
                         # decision to make about a card that is back in the
                         # queue.
                         transient_requeued, transient_state = (
-                            task_store.mark_transient_retry(
+                            phase_clock.transition(task_store.mark_transient_retry,
                                 self.repo,
                                 str(metadata["task_id"]),
                                 runner=str(metadata["runner"]),
@@ -11220,7 +11229,7 @@ class ProcessManager:
                         # evidence to record, and no manager decision owed.
                         pass
                     elif terminal_state == "launch_failed":
-                        release_result = task_engine.mark_launch_failed(
+                        release_result = phase_clock.transition(task_engine.mark_launch_failed,
                             self.repo,
                             str(metadata["task_id"]),
                             str(metadata["runner"]),
@@ -11313,7 +11322,7 @@ class ProcessManager:
                                 # bytes can split the published pair.
                                 failure_evidence.update(retained)
                                 failure_evidence["changed_paths"] = timeout_changed
-                        release_result = self._terminal_failure_exact(
+                        release_result = phase_clock.transition(self._terminal_failure_exact,
                             metadata,
                             terminal_state,
                             evidence=failure_evidence,
@@ -11365,7 +11374,8 @@ class ProcessManager:
                             verified_receipt = _verified_quality_review_receipt(
                                 metadata, workspace, request_id
                             )
-                            attempt_artifact_receipt = self._persist_attempt_artifacts(
+                            attempt_artifact_receipt = phase_clock.call(
+                                "attempt_artifacts", self._persist_attempt_artifacts,
                                 request_id,
                                 metadata,
                                 workspace,
@@ -11377,7 +11387,8 @@ class ProcessManager:
                                     "quality_review": metadata["quality_review"],
                                 },
                             )
-                            outcome_evidence_record = self._canonical_outcome_evidence(
+                            outcome_evidence_record = phase_clock.call(
+                                "attempt_artifacts", self._canonical_outcome_evidence,
                                 request_id,
                                 attempt_artifact_receipt,
                                 level=evidence_levels.EvidenceLevel.STATIC_EVIDENCE,
@@ -11386,7 +11397,7 @@ class ProcessManager:
                             cleanup = False
                             terminal_state = "review_ready"
                             review_result = {"ok": True, "idempotent_noop": True}
-                            release_result = self._review_terminal_exact(
+                            release_result = phase_clock.transition(self._review_terminal_exact,
                                 metadata,
                                 "review_ready",
                                 request_id=request_id,
@@ -11599,7 +11610,8 @@ class ProcessManager:
                         successful_candidate_paths, changed_path_hashes, rework_delta = (
                             successful_candidate_evidence(workspace, metadata, request_id, changed)
                         )
-                        attempt_artifact_receipt = self._persist_attempt_artifacts(
+                        attempt_artifact_receipt = phase_clock.call(
+                            "attempt_artifacts", self._persist_attempt_artifacts,
                             request_id,
                             metadata,
                             workspace,
@@ -11631,7 +11643,8 @@ class ProcessManager:
                             outcome_message = (
                                 "Candidate passed scope, hash, and static quality gates."
                             )
-                        outcome_evidence_record = self._canonical_outcome_evidence(
+                        outcome_evidence_record = phase_clock.call(
+                            "attempt_artifacts", self._canonical_outcome_evidence,
                             request_id,
                             attempt_artifact_receipt,
                             level=outcome_level,
@@ -11640,7 +11653,7 @@ class ProcessManager:
                         cleanup = False
                         terminal_state = "review_ready"
                         review_result = {"ok": True, "idempotent_noop": True}
-                        release_result = self._review_terminal_exact(
+                        release_result = phase_clock.transition(self._review_terminal_exact,
                             metadata,
                             "review_ready",
                             request_id=request_id,
@@ -11697,7 +11710,9 @@ class ProcessManager:
                                 review_db = review_orchestrator.canonical_review_db(self)
                                 if review_db is None:
                                     raise RuntimeError("review_lifecycle_store_not_ready")
-                                chain = review_orchestrator.register_candidate(
+                                chain = phase_clock.call(
+                                    "review_registration",
+                                    review_orchestrator.register_candidate,
                                     self, db_path=review_db, registration=registration)
                             except Exception as exc:
                                 review_automation = dict(
@@ -11772,7 +11787,7 @@ class ProcessManager:
                         _is_operational_validation_failure(terminal_state, error)
                     ):
                         terminal_evidence["error"] = error[:500]
-                        release_result = self._terminal_failure_exact(
+                        release_result = phase_clock.transition(self._terminal_failure_exact,
                             metadata,
                             terminal_state,
                             request_id=request_id,
@@ -11780,7 +11795,7 @@ class ProcessManager:
                         )
                     else:
                         terminal_evidence.update(validation_auto_rework.plan(self.repo, metadata, terminal_state, error, terminal_evidence))
-                        release_result = self._review_terminal_exact(
+                        release_result = phase_clock.transition(self._review_terminal_exact,
                             metadata,
                             terminal_state,
                             request_id=request_id,
@@ -11807,7 +11822,7 @@ class ProcessManager:
                         )
                     except WorkspaceError:
                         pass
-                    release_result = self._terminal_failure_exact(
+                    release_result = phase_clock.transition(self._terminal_failure_exact,
                         metadata,
                         terminal_state,
                         request_id=request_id,
@@ -11835,7 +11850,8 @@ class ProcessManager:
                     failure_hashes = (
                         _changed_path_hashes(workspace, changed) if changed else {}
                     )
-                    attempt_artifact_receipt = self._persist_attempt_artifacts(
+                    attempt_artifact_receipt = phase_clock.call(
+                        "attempt_artifacts", self._persist_attempt_artifacts,
                         request_id,
                         metadata,
                         workspace,
@@ -11863,7 +11879,8 @@ class ProcessManager:
                 outcome_evidence_record is None
                 and attempt_artifact_receipt is not None
             ):
-                outcome_evidence_record = self._canonical_outcome_evidence(
+                outcome_evidence_record = phase_clock.call(
+                    "attempt_artifacts", self._canonical_outcome_evidence,
                     request_id,
                     attempt_artifact_receipt,
                     level=evidence_levels.EvidenceLevel.INCONCLUSIVE,
@@ -11891,7 +11908,8 @@ class ProcessManager:
                     # A release_pending predecessor deferred usage recording with
                     # its release transition. Record the spend now -- _record_usage
                     # is idempotent per request_id, so this can never double-count.
-                    usage, usage_recorded, usage_error = self._record_usage(
+                    usage, usage_recorded, usage_error = phase_clock.call(
+                        "usage_record", self._record_usage,
                         request_id,
                         str(metadata["task_id"]),
                         str(metadata["runner"]),
@@ -11907,7 +11925,8 @@ class ProcessManager:
                         },
                     )
             elif terminal_state not in FINALIZATION_PENDING_STATES:
-                usage, usage_recorded, usage_error = self._record_usage(
+                usage, usage_recorded, usage_error = phase_clock.call(
+                    "usage_record", self._record_usage,
                     request_id,
                     str(metadata["task_id"]),
                     str(metadata["runner"]),
@@ -11922,6 +11941,7 @@ class ProcessManager:
                         "claim_epoch": metadata.get("claim_epoch"),
                     },
                 )
+            context_evidence_started = time.monotonic()
             context_ack = _project_context_receipt_from_output(
                 stdout_path,
                 expected_bundle_sha256=str(
@@ -11964,19 +11984,14 @@ class ProcessManager:
                     "token_savings_claimed": False,
                     "measurement_only": True,
                 }
+            phase_clock.add("context_evidence", context_evidence_started)
             finalization_duration_ms = round(
                 (time.monotonic() - finalization_started) * 1000.0, 3
             )
-            validation_duration_ms = round(validation_wall_duration_ms, 3)
-            scope_duration_ms = round(scope_duration_ms, 3)
-            evidence_transition_duration_ms = round(
-                max(
-                    0.0,
-                    finalization_duration_ms
-                    - validation_duration_ms
-                    - scope_duration_ms,
-                ),
-                3,
+            # NF-2026-02046: the residual keeps only what no named sub-phase measured.
+            finalization_phase_durations = _finalization_phase_durations(
+                total_ms=finalization_duration_ms, validation_ms=validation_wall_duration_ms,
+                scope_ms=scope_duration_ms, clock=phase_clock,
             )
             cleanup_error = ""
             if cleanup:
@@ -12100,11 +12115,7 @@ class ProcessManager:
                 "attempt_artifact_error": attempt_artifact_error,
                 "evidence_record": outcome_evidence_record,
                 "finalization_duration_ms": finalization_duration_ms,
-                "finalization_phase_durations_ms": {
-                    "workspace_scope": scope_duration_ms,
-                    "validation": validation_duration_ms,
-                    "evidence_and_transition": evidence_transition_duration_ms,
-                },
+                "finalization_phase_durations_ms": finalization_phase_durations,
                 "cleanup_error": cleanup_error,
                 # NF-2026-01030: the lane this finalization measured in, plus
                 # the digest of the lane it left, travel on the finalization

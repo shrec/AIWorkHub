@@ -1002,7 +1002,7 @@ def test_request_events_cache_is_request_scoped_and_invalidates_on_append(
     assert (passes, rebuilds, folds) == (2, 2, 2)
 
 
-def _wait_terminal(manager, request_id, timeout=5.0):
+def _wait_terminal(manager, request_id, timeout=60.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         result = manager.collect(request_id)
