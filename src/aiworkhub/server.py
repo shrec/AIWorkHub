@@ -1121,6 +1121,65 @@ def _needfix_plan_receipt(reply: Any, *, include_plan: bool, tool: str) -> Any:
     return projected
 
 
+# NF-2026-01920: needfix_preview_convert failed 20-23% of calls on shape errors
+# a manager then fixed by hand and resent. The fills are deterministic for one
+# routing catalog, and needfix_convert applies the same normalization to a
+# resent plan, so ``plan_digest`` always binds the normalized plan.
+_WORKFORCE_RANK_KINDS = frozenset({"mechanical", "code", "research", "linguistic", "review"})
+_WORKFORCE_RANK_RISKS = frozenset({"low", "medium", "high", "critical"})
+_NEEDFIX_FILL_SOURCE_RANK = "workforce_rank:top1"
+# The topic core.needfix_convert's create already falls back to; a workforce
+# ranking names a runner but never a topic.
+_NEEDFIX_DEFAULT_TOPIC = "needfix_conversion"
+_NEEDFIX_FILL_SOURCE_DEFAULT_TOPIC = "needfix_conversion_default"
+
+
+def _needfix_rank_launch_contract(needfix_id: str, plan: Mapping[str, Any]) -> Mapping[str, Any]:
+    task_type = plan.get("task_type")
+    risk = plan.get("risk_tier")
+    try:
+        ranked = manager_ai_tools.workforce_rank(
+            task_id=f"needfix-{needfix_id}",
+            kinds=[task_type if task_type in _WORKFORCE_RANK_KINDS else "code"],
+            risk=risk if risk in _WORKFORCE_RANK_RISKS else "medium",
+        )
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+        return {}
+    contract = ranked.get("launch_contract") if isinstance(ranked, Mapping) else None
+    return contract if isinstance(contract, Mapping) else {}
+
+
+def _normalize_needfix_task_plan(
+    needfix_id: str, task_plan: Any
+) -> tuple[Any, list[dict[str, str]], dict[str, str]]:
+    """Return ``(plan, plan_normalizations, filled_from)`` for a conversion plan.
+
+    Shape coercions are owned by ``needfix_store.coerce_task_plan_shape``. An
+    omitted ``runner`` is filled from the workforce_rank top-1 launch contract
+    and an omitted ``topic`` from that contract, else the conversion default.
+    A runner the ranking cannot name stays missing, so validation still refuses.
+    """
+
+    plan, normalizations = needfix_store.coerce_task_plan_shape(task_plan)
+    filled_from: dict[str, str] = {}
+    if not isinstance(plan, dict):
+        return plan, normalizations, filled_from
+    missing = [field for field in ("runner", "topic") if field not in plan]
+    if not missing:
+        return plan, normalizations, filled_from
+    contract = _needfix_rank_launch_contract(needfix_id, plan)
+    for field in missing:
+        value = contract.get(field)
+        source = _NEEDFIX_FILL_SOURCE_RANK
+        if field == "topic" and not (isinstance(value, str) and value.strip()):
+            value, source = _NEEDFIX_DEFAULT_TOPIC, _NEEDFIX_FILL_SOURCE_DEFAULT_TOPIC
+        if isinstance(value, str) and value.strip():
+            plan[field] = value
+            filled_from[field] = source
+            normalizations.append({"field": field, "normalization": "filled", "filled_from": source})
+    return plan, normalizations, filled_from
+
+
 # NF-2026-01447: with the contract suppressed, the bootstrap reply was measured
 # at up to 11 KB, most of it these two diagnostic bodies.
 _BOOTSTRAP_DIAGNOSTIC_KEYS = ("last", "reconciler", "details", "tasks", "rows")
@@ -1308,6 +1367,121 @@ def _reject_review_receipt_fields(
         "predecessor_changed_paths_count": len(feedback.get("predecessor_changed_paths") or []),
         "residual_identities_count": len(feedback.get("residual_identities") or []),
     }
+
+
+# NF-2026-01940: one deterministic task_id -> request_id resolution for the
+# manager tools that used to demand a request id the caller did not hold.
+# ``review`` prefers the card's current review request (the one core's
+# reject_review defaults to), ``launch`` its latest launched request; each falls
+# back to the other, then to the newest matching audit event.
+_REQUEST_ID_PREFERENCES = ("review", "launch")
+_MAX_ECHOED_ID_CHARS = 128
+
+
+def _event_request_id(task_id: str, event_name: str) -> str:
+    payload = _latest_task_event_payload(task_id, event_name) or {}
+    return str(payload.get("request_id") or "").strip()
+
+
+def _resolve_task_request_id(task_id: str, *, prefer: str) -> tuple[str, str]:
+    """Return ``(request_id, request_id_source)`` for a card, or ``("", "unresolved")``."""
+
+    if prefer not in _REQUEST_ID_PREFERENCES:
+        raise ValueError(f"prefer must be one of {_REQUEST_ID_PREFERENCES}")
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return "", "unresolved"
+    try:
+        card = task_store.get_task(core.repo_root(), task_id)
+    except (task_store.TaskStoreError, OSError, ValueError, TypeError):
+        card = None
+    review = launch = ""
+    if isinstance(card, Mapping):
+        terminal = card.get("terminal_review")
+        evidence = terminal.get("evidence") if isinstance(terminal, Mapping) else None
+        review = core._predecessor_request_id_from_evidence(evidence)
+        launch = str(card.get("launch_request_id") or "").strip()
+    review_steps = (
+        ("card_current_review", lambda: review),
+        ("task_event_review_ready", lambda: _event_request_id(task_id, "review_ready")),
+    )
+    launch_steps = (
+        ("card_latest_launch", lambda: launch),
+        ("task_event_launch", lambda: _event_request_id(task_id, "launch")),
+    )
+    steps = (*review_steps, *launch_steps) if prefer == "review" else (*launch_steps, *review_steps)
+    for source, read in steps:
+        value = read()
+        if value:
+            return value, source
+    return "", "unresolved"
+
+
+def _request_id_for_tool(
+    request_id: str,
+    task_id: str,
+    *,
+    prefer: str,
+    tool: str,
+    require_task_id: bool = False,
+) -> tuple[str, str, dict[str, Any] | None]:
+    """Resolve a tool's request id: the caller's, else the card's (named source)."""
+
+    shown_task = str(task_id or "")[:_MAX_ECHOED_ID_CHARS]
+    if require_task_id and not shown_task.strip():
+        return "", "", {"ok": False, "tool": tool, "error": "task_id_required"}
+    if request_id:
+        return request_id, "caller", None
+    if not shown_task.strip():
+        return "", "", {"ok": False, "tool": tool, "error": "request_id_or_task_id_required"}
+    resolved, source = _resolve_task_request_id(task_id, prefer=prefer)
+    if not resolved:
+        return "", source, {
+            "ok": False,
+            "tool": tool,
+            "task_id": shown_task,
+            "request_id_source": source,
+            "error": f"request_id_unresolved_for_task:{shown_task}",
+        }
+    return resolved, source, None
+
+
+def _with_request_id_source(result: Any, request_id: str, source: str) -> Any:
+    """Name where a task-resolved request id came from; caller ids pass through untouched."""
+
+    if source == "caller" or not isinstance(result, dict):
+        return result
+    annotated = dict(result)
+    annotated.setdefault("request_id", request_id)
+    annotated["request_id_source"] = source
+    return annotated
+
+
+def _current_request_assertion_refusal(
+    task_id: str, request_id: str, *, schema_id: str
+) -> dict[str, Any] | None:
+    """Refuse when an asserted request id is not the card's current review request."""
+
+    full = str(request_id or "").strip()
+    base: dict[str, Any] = {
+        "schema_id": schema_id,
+        "ok": False,
+        "task_id": task_id,
+        "request_id": full[:_MAX_ECHOED_ID_CHARS],
+    }
+    if not full:
+        return {**base, "error": "request_id_empty: omit request_id to skip the identity check"}
+    current, source = _resolve_task_request_id(task_id, prefer="review")
+    if not current:
+        return {**base, "error": "request_id_unverifiable", "request_id_source": source}
+    if full != current:
+        return {
+            **base,
+            "error": "request_id_mismatch",
+            "current_request_id": current,
+            "request_id_source": source,
+        }
+    return None
 
 
 def _task_create_receipt(
@@ -4526,6 +4700,7 @@ def aiworkhub_task_reject_review(
     promote_ai_memory: bool = False,
     extra_evidence_ids: list[str] | None = None,
     no_new_lesson_reason: str | None = None,
+    request_id: str | None = None,
 ) -> dict[str, Any]:
     """Write-gated Codex action: reject a reviewed task with exact feedback and
     an explicit disposition. ``to`` = pending (rework, default) | blocked |
@@ -4588,6 +4763,7 @@ def aiworkhub_task_reject_review(
         promote_ai_memory: Set true together with lesson_candidate to also promote the lesson to AI memory; refused without a lesson. Default false.
         extra_evidence_ids: Additional evidence ids to cite with the lesson; only used together with lesson_candidate.
         no_new_lesson_reason: Instead of a lesson, record why none is owed: duplicate_of_recorded_lesson, no_generalizable_cause, mechanical_change_only, evidence_insufficient or decision_not_about_code; refused together with lesson_candidate.
+        request_id: Optional identity assertion: the review request you are rejecting. It must equal the card's current review request, else the call is refused with request_id_mismatch (or request_id_unverifiable when the card names none) and nothing changes; omit to skip the check.
     """
 
     refusal = _include_card_refusal(include_card) or _learning_closeout_refusal(
@@ -4595,6 +4771,10 @@ def aiworkhub_task_reject_review(
         promote_ai_memory=promote_ai_memory,
         no_new_lesson_reason=no_new_lesson_reason,
     )
+    if refusal is None and request_id is not None:
+        refusal = _current_request_assertion_refusal(
+            task_id, request_id, schema_id="aiworkhub.reject_review_receipt.v1"
+        )
     if refusal is not None:
         return refusal
     kwargs: dict[str, Any] = {"task_id": task_id, "reason": reason, "to": to}
@@ -6407,7 +6587,7 @@ def aiworkhub_review_packet(
     evidence section.
 
     Args:
-        request_id: Id of the review_ready worker request to build the packet for; leave empty when request_ids is given.
+        request_id: Id of the review_ready worker request to build the packet for; leave empty when request_ids is given, or pass task_id alone to use that card's current review request (the reply's request_id_source says which).
         task_id: Id of the task card that request belongs to; omit to resolve it from the request's status (the reply's task_id_source says which). Not accepted with request_ids.
         max_bytes: Byte bound for the packet, default 90000; lowest-priority sections are dropped until it fits and listed under truncation.dropped_sections. With request_ids it is split evenly across the packets.
         request_ids: Up to 8 review_ready request ids to read in one call instead of request_id; returns {packets, per_packet_max_bytes}, each packet built exactly like a single call with the split budget, and a member that fails carries its own error without failing the batch.
@@ -6422,14 +6602,21 @@ def aiworkhub_review_packet(
                 "error": "request_ids_exclusive_with_request_id_and_task_id",
             }
         return _review_packet_batch(list(request_ids), max_bytes)
-    if not request_id:
+    if not request_id and not task_id:
         return {
             "schema_id": completion_inbox.REVIEW_PACKET_SCHEMA_ID,
             "ok": False,
             "readonly": True,
             "error": "request_id_or_request_ids_required",
         }
-    return _review_packet_one(request_id, task_id, max_bytes)
+    resolved, source, refusal = _request_id_for_tool(
+        request_id, task_id, prefer="review", tool="aiworkhub_review_packet"
+    )
+    if refusal is not None:
+        return {"schema_id": completion_inbox.REVIEW_PACKET_SCHEMA_ID, "readonly": True, **refusal}
+    return _with_request_id_source(
+        _review_packet_one(resolved, task_id, max_bytes), resolved, source
+    )
 
 
 _VALIDATION_REPLAY_AUTO_RECOVERY_REASONS = frozenset(
@@ -6573,7 +6760,7 @@ def aiworkhub_quality_reviewer_launch(
 
 @mcp.tool()
 def aiworkhub_agent_task_status(
-    request_id: str, detail: StatusDetail = "summary"
+    request_id: str = "", detail: StatusDetail = "summary", task_id: str = ""
 ) -> dict[str, Any]:
     """READ-ONLY: inspect one launched process and its authoritative task card.
 
@@ -6599,16 +6786,23 @@ def aiworkhub_agent_task_status(
     ``"full"`` returns the raw status payload.
 
     Args:
-        request_id: Id of the launched worker request to inspect.
+        request_id: Id of the launched worker request to inspect; omit and pass task_id to inspect that card's latest launched request (the reply's request_id_source says which).
         detail: summary (default) folds bulky card and event bodies to size and sha256 digests while identity and lifecycle fields stay exact; evidence keeps the evidence exact too; full returns the raw status payload.
+        task_id: Id of the task card whose latest launched request to inspect, used only when request_id is omitted; default empty.
     """
 
     refusal = _detail_refusal(detail)
     if refusal is not None:
         return refusal
+    resolved, source, refusal = _request_id_for_tool(
+        request_id, task_id, prefer="launch", tool="aiworkhub_agent_task_status"
+    )
+    if refusal is not None:
+        return refusal
+    request_id = resolved
     result = process_launcher.default_manager().status(request_id)
     if detail == "full" or not isinstance(result, dict) or not result.get("ok"):
-        return result
+        return _with_request_id_source(result, request_id, source)
     folded = dict(result)
     if detail == "summary":
         first_failure = mcp_summary_folds.first_failure_from_status(
@@ -6648,7 +6842,7 @@ def aiworkhub_agent_task_status(
         "evidence": {"tool": "aiworkhub_agent_task_status", "request_id": request_id, "detail": "evidence"},
         "full": {"tool": "aiworkhub_agent_task_status", "request_id": request_id, "detail": "full"},
     }
-    return folded
+    return _with_request_id_source(folded, request_id, source)
 
 
 # NF-2026-01988: process_launcher.MAX_LOG_TAIL_BYTES, mirrored so this default
@@ -6842,8 +7036,8 @@ def aiworkhub_manager_review_finding_dispose(
 
 @mcp.tool()
 def aiworkhub_agent_accept_preview(
-    request_id: str,
-    task_id: str,
+    request_id: str = "",
+    task_id: str = "",
     requested_risk_tier: str | None = None,
     reviewer_request_ids: list[str] | None = None,
     confirm_high_risk: bool = False,
@@ -6865,22 +7059,29 @@ def aiworkhub_agent_accept_preview(
     finalizer measured; an explicit value can only raise it.
 
     Args:
-        request_id: Id of the worker request to accept; it must be in review_ready state.
-        task_id: Id of the task card that request belongs to.
+        request_id: Id of the worker request to accept; it must be in review_ready state. Omit to resolve the card's current review request from task_id (the reply's request_id_source says which).
+        task_id: Id of the task card that request belongs to; required.
         requested_risk_tier: Risk tier to review at; omit to use the tier the finalizer measured for this candidate. An explicit value can only raise the tier, never lower it.
         reviewer_request_ids: Reviewer request ids to verify; omit to use every verified reviewer bound to this request and task, and pass [] to exclude all reviewers.
         confirm_high_risk: Set true to give the explicit human approval that high or critical risk tiers require; default false.
         confirm_destructive_change: Set true to accept a candidate whose diff failed a destructive-change check; otherwise accept is refused with destructive_diff_requires_manager_confirmation. Default false.
     """
 
-    return process_launcher.default_manager().accept_preview(
-        request_id,
+    resolved, source, refusal = _request_id_for_tool(
+        request_id, task_id, prefer="review", tool="aiworkhub_agent_accept_preview",
+        require_task_id=True,
+    )
+    if refusal is not None:
+        return refusal
+    result = process_launcher.default_manager().accept_preview(
+        resolved,
         task_id,
         requested_risk_tier=requested_risk_tier,
         reviewer_request_ids=reviewer_request_ids,
         confirm_high_risk=confirm_high_risk,
         confirm_destructive_change=confirm_destructive_change,
     )
+    return _with_request_id_source(result, resolved, source)
 
 
 # NF-2026-01626: heartbeats ``notifications/progress`` to a caller that sent a
@@ -8501,14 +8702,24 @@ def needfix_preview_convert(
 
     Args:
         needfix_id: NeedFix id, e.g. NF-2026-01447.
-        task_plan: Task card fields that override the scope-derived default; must name runner and topic, and a writable card needs required_outputs. Unknown fields are refused.
+        task_plan: Task card fields that override the scope-derived default; a writable card needs required_outputs. Omitted runner/topic are filled from aiworkhub_manager_workforce_rank top-1 (reply filled_from), an acceptance string becomes a one-item list, and stray action/task_id keys are dropped with a warning; every change is listed under plan_normalizations and plan_digest binds the normalized plan. Other unknown fields are refused.
         include_plan: Return the signed plan body verbatim instead of a summary of its identity and counts; default false.
     """
-    return _needfix_plan_receipt(
-        core.needfix_preview_convert(needfix_id, task_plan=task_plan),
+    plan, normalizations, filled_from = _normalize_needfix_task_plan(needfix_id, task_plan)
+    reply = _needfix_plan_receipt(
+        core.needfix_preview_convert(needfix_id, task_plan=plan),
         include_plan=bool(include_plan),
         tool="needfix_preview_convert",
     )
+    if isinstance(reply, dict) and (normalizations or filled_from):
+        reply = dict(reply)
+        reply["plan_normalizations"] = normalizations
+        if filled_from:
+            reply["filled_from"] = filled_from
+        warnings = [item["warning"] for item in normalizations if item.get("warning")]
+        if warnings:
+            reply["warnings"] = [*list(reply.get("warnings") or []), *warnings]
+    return reply
 
 
 @mcp.tool()
@@ -8532,9 +8743,12 @@ def needfix_convert(
         plan_digest: plan_digest from the matching needfix_preview_convert; required to commit a new conversion. A digest this server no longer holds is refused.
         include_plan: Return the plan body verbatim instead of a summary of its identity and counts; default false.
     """
+    # NF-2026-01920: a resent task_plan is normalized exactly as the preview
+    # normalized it, so the digest the preview returned still binds.
+    plan, _normalizations, _filled = _normalize_needfix_task_plan(needfix_id, task_plan)
     return _needfix_plan_receipt(
         core.needfix_convert(
-            needfix_id, task_plan=task_plan, plan_digest=plan_digest
+            needfix_id, task_plan=plan, plan_digest=plan_digest
         ),
         include_plan=bool(include_plan),
         tool="needfix_convert",

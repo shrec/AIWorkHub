@@ -3520,6 +3520,46 @@ def validate_task_plan(task_plan: Mapping[str, Any] | None) -> dict[str, Any]:
     return validated
 
 
+# NF-2026-01920: the fillable shape errors that made 20-23% of
+# needfix_preview_convert calls fail and be retried. Only these two are
+# coerced; every other unsupported field or wrong type still fails closed in
+# ``validate_task_plan``.
+TASK_PLAN_STRAY_KEYS = ("action", "task_id")
+TASK_PLAN_STR_TO_LIST_FIELDS = ("acceptance",)
+
+
+def coerce_task_plan_shape(
+    task_plan: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any] | None, list[dict[str, str]]]:
+    """Coerce a plan's known fillable shape errors before strict validation.
+
+    Returns ``(plan, normalizations)``: ``acceptance`` given as one non-empty
+    string becomes a one-item list, and the stray keys ``action``/``task_id``
+    (``task_id`` is never caller-controlled) are dropped with a warning. Each
+    change is listed as ``{field, normalization[, warning]}`` in a fixed order
+    so the same input always yields the same plan and the same list. A
+    non-mapping plan is returned untouched for ``validate_task_plan`` to refuse.
+    """
+    if not isinstance(task_plan, Mapping):
+        return task_plan, []
+    plan = dict(task_plan)
+    normalizations: list[dict[str, str]] = []
+    for field in TASK_PLAN_STR_TO_LIST_FIELDS:
+        value = plan.get(field)
+        if isinstance(value, str) and value.strip():
+            plan[field] = [value]
+            normalizations.append({"field": field, "normalization": "str_to_list"})
+    for key in TASK_PLAN_STRAY_KEYS:
+        if key in plan:
+            del plan[key]
+            normalizations.append({
+                "field": key,
+                "normalization": "dropped_stray_key",
+                "warning": f"task_plan.{key} is not a plan field and was ignored",
+            })
+    return plan, normalizations
+
+
 def normalize_task_plan(
     needfix_snapshot: Mapping[str, Any], task_plan: Mapping[str, Any] | None = None
 ) -> dict[str, Any]:

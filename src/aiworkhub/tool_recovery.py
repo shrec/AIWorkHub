@@ -16,7 +16,15 @@ MAX_PROFILES = 8
 MAX_ACCEPTED_NAMES = 40
 MAX_UNEXPECTED = 10
 ARGUMENT_CUTOFF = 0.6
-_ARGUMENT_ALIASES = (("limit", "budget"), ("id", "needfix_id"), ("nf_id", "needfix_id"))
+# NF-2026-01940: ``successor_task_id`` is the name the supersede continuation
+# reply and every other successor-task surface use for what
+# ``aiworkhub_task_supersede`` takes as ``by``.
+_ARGUMENT_ALIASES = (
+    ("limit", "budget"),
+    ("id", "needfix_id"),
+    ("nf_id", "needfix_id"),
+    ("successor_task_id", "by"),
+)
 _SAFE_NAME = re.compile(r"[A-Za-z0-9_.:/-]+")
 
 

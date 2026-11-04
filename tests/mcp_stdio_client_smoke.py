@@ -167,12 +167,17 @@ WRITE_GATED_TOOLS: tuple[str, ...] = (
 # optional ``validation_amendment_mode`` (default "append") and
 # ``validation_roles_amendment`` (default None) in the NF-2026-01984 commit --
 # additive, every earlier call shape still valid; caught by NF-2026-02039.
+#
+# RE-FROZEN 2026-11-04, two tools (NF-2026-01940): ``aiworkhub_agent_task_status``
+# accepts ``task_id`` alone with ``request_id`` now optional (default ""), and
+# ``aiworkhub_task_reject_review`` gained the optional ``request_id`` identity
+# assertion -- additive, every earlier call shape still valid.
 FROZEN_SCHEMA_FINGERPRINTS: dict[str, str] = {
     "aiworkhub_agent_cancel_task": "f1d9792f94307639105434caa381c54857d7c292dab122b4cd4e9333dd0552f3",
     "aiworkhub_agent_collect_result": "c291cac06bc81689a1b0df1357facb97c5806fefd0a447ef3245e38976077a3f",
     "aiworkhub_agent_launch_task": "02f5d9a9625474dca12ffb80a5afbc8415aa971561799e2041a1557fe0c1d59b",
     "aiworkhub_agent_list_processes": "706c69e343e2b322d11e57bd76279459c4e7296f3906d620fa9c2d643931db28",
-    "aiworkhub_agent_task_status": "2c2f20ce1b0fd6064f7aa7fc34822f6ba82911605ed9eb3924752cc442321455",
+    "aiworkhub_agent_task_status": "ccf52e95afd8f0e59477414bdc35fe517170fb1304aee97caadab1dd429c1f37",
     "aiworkhub_cli_adapter_audit_summary_readonly": "6ab96b247924a28d5d793064a61e50c59f46a771c53459ec1197e3acca973fee",
     "aiworkhub_cli_adapter_plan_readonly": "7a79866fe17cd414929fc7e59898311436ce102d826637f7bac3df870cc49c9e",
     "aiworkhub_cli_adapter_report_readonly": "f80f2283b05d851f6fe1a405930efb9f65e39e7f2d501dc70ed5635ab5ca538c",
@@ -195,7 +200,7 @@ FROZEN_SCHEMA_FINGERPRINTS: dict[str, str] = {
     "aiworkhub_task_mark_review": "1722a2665425d2ebd8573c3425ee2d04b8c71ae3db24ace3c97e5a82d7e92bd4",
     "aiworkhub_task_pending_for_runner": "864d85c9f3a5a7020e270ddd71f9aeea2ab65ca35932aaf869afaa837950b16d",
     "aiworkhub_task_queue_request": "2c43bb4347d3806b3f373390c95cfc7c4f398b4404860ff4a1722269edeb7fa5",
-    "aiworkhub_task_reject_review": "7428514e393e32501ee53cecfaec84bf520177a7e4f53951137c43718bc1aaf2",
+    "aiworkhub_task_reject_review": "d5832c94ca8226c04bc5fedb7184c1a42962de176ae0c456d09bba2dc6c64f60",
     "aiworkhub_task_review_queue": "b5728f6f46c22488977fe80e794f420203cf6725367eb9271cfdad1c6538b878",
     "aiworkhub_task_review_summarize": "e535208ce91e843357bb2efb237b656c50ad1a0b4e1be4111c9ae2356c647e01",
     "aiworkhub_task_show": "987a6779aea9974dc849205292e41e5fab2443e04e97f3c2528059a6b60c4ad3",
