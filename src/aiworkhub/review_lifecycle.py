@@ -12,6 +12,8 @@ import hashlib
 import json
 import re
 import sqlite3
+import threading
+from collections import OrderedDict
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -1204,7 +1206,142 @@ def _stored_sha256_exact(value: object, field: str) -> str:
     return text
 
 
+CHAIN_VERIFY_MEMO_MAX_CHAINS = 65536
+
+
+def _row_snapshot_digest(row: sqlite3.Row) -> bytes:
+    """Exact-content fingerprint of one stored row (no canonicalization).
+
+    ``repr`` of the column tuple is deterministic for SQLite's str/int/float/
+    bytes/None values, so any byte-level change of any column changes it.
+    """
+    return hashlib.blake2b(
+        repr(tuple(row)).encode("utf-8", "surrogatepass"), digest_size=32
+    ).digest()
+
+
+class _ChainVerifyMemo:
+    """Per-process verified-prefix memo for review-chain verification.
+
+    Action rows of a chain are verified in ``action_index`` order and a row's
+    verdict depends only on its own bytes, the chain identity and earlier rows
+    of the same chain (retirement evidence).  So when the first ``k`` row
+    snapshots are byte-identical to an earlier successful pass, their verdict
+    is unchanged and only rows ``k..`` need verification.  Any failure drops
+    the entry so the next pass verifies the chain from the start.  Bounded by
+    LRU eviction; hit/miss counters make the hit rate measurable.
+    """
+
+    def __init__(self, max_chains: int) -> None:
+        self._max = max_chains
+        self._lock = threading.Lock()
+        self._chains: OrderedDict[tuple[str, int], tuple[bytes, ...]] = OrderedDict()
+        self._identities: OrderedDict[bytes, dict[str, str]] = OrderedDict()
+        self._counters = {
+            "chain_hits": 0,
+            "chain_misses": 0,
+            "rows_skipped": 0,
+            "rows_verified": 0,
+            "identity_hits": 0,
+            "identity_misses": 0,
+        }
+
+    def rows_to_verify(
+        self,
+        identity_sha256: str,
+        chain_id: int,
+        digests: tuple[bytes, ...],
+        retired: tuple[bool, ...],
+    ) -> list[int]:
+        """Indexes whose verdict is not already proven by an identical earlier pass.
+
+        A row is re-verified when its bytes changed, or when it is retired and
+        any earlier row changed (its retirement evidence reads earlier rows of
+        the same chain).  No memo, or a memo of another length, verifies all.
+        """
+        key = (identity_sha256, chain_id)
+        with self._lock:
+            stored = self._chains.get(key)
+            if stored is None or len(stored) != len(digests):
+                indexes = list(range(len(digests)))
+            else:
+                self._chains.move_to_end(key)
+                indexes = []
+                earlier_changed = False
+                for index, (old, new) in enumerate(zip(stored, digests)):
+                    if old != new:
+                        indexes.append(index)
+                        earlier_changed = True
+                    elif earlier_changed and retired[index]:
+                        indexes.append(index)
+            skipped = len(digests) - len(indexes)
+            self._counters["chain_hits" if stored is not None else "chain_misses"] += 1
+            self._counters["rows_skipped"] += skipped
+            self._counters["rows_verified"] += len(indexes)
+            return indexes
+
+    def store(self, identity_sha256: str, chain_id: int, digests: tuple[bytes, ...]) -> None:
+        key = (identity_sha256, chain_id)
+        with self._lock:
+            self._chains[key] = digests
+            self._chains.move_to_end(key)
+            while len(self._chains) > self._max:
+                self._chains.popitem(last=False)
+
+    def drop(self, identity_sha256: str, chain_id: int) -> None:
+        with self._lock:
+            self._chains.pop((identity_sha256, chain_id), None)
+
+    def identity(self, row_digest: bytes) -> dict[str, str] | None:
+        with self._lock:
+            found = self._identities.get(row_digest)
+            if found is None:
+                self._counters["identity_misses"] += 1
+                return None
+            self._identities.move_to_end(row_digest)
+            self._counters["identity_hits"] += 1
+            return dict(found)
+
+    def store_identity(self, row_digest: bytes, identity: Mapping[str, str]) -> None:
+        with self._lock:
+            self._identities[row_digest] = dict(identity)
+            self._identities.move_to_end(row_digest)
+            while len(self._identities) > self._max:
+                self._identities.popitem(last=False)
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                **self._counters,
+                "chains": len(self._chains),
+                "identities": len(self._identities),
+                "max_chains": self._max,
+            }
+
+    def clear(self) -> None:
+        with self._lock:
+            self._chains.clear()
+            self._identities.clear()
+            for name in self._counters:
+                self._counters[name] = 0
+
+
+_CHAIN_VERIFY_MEMO = _ChainVerifyMemo(CHAIN_VERIFY_MEMO_MAX_CHAINS)
+
+
+def chain_verify_memo_stats() -> dict[str, int]:
+    return _CHAIN_VERIFY_MEMO.stats()
+
+
+def reset_chain_verify_memo() -> None:
+    _CHAIN_VERIFY_MEMO.clear()
+
+
 def _verify_chain_row(row: sqlite3.Row) -> dict[str, str]:
+    row_digest = _row_snapshot_digest(row)
+    cached = _CHAIN_VERIFY_MEMO.identity(row_digest)
+    if cached is not None:
+        return cached
     packet = _stored_sha256_exact(row["packet_sha256"], "packet_sha256")
     candidate = _stored_sha256_exact(row["candidate_sha256"], "candidate_sha256")
     identity = _chain_identity(
@@ -1217,6 +1354,7 @@ def _verify_chain_row(row: sqlite3.Row) -> dict[str, str]:
     identity_json, identity_sha = _canonical_json_sha(identity)
     if row["chain_identity_json"] != identity_json or row["chain_identity_sha256"] != identity_sha:
         raise ReviewLifecycleError("chain_identity_conflict")
+    _CHAIN_VERIFY_MEMO.store_identity(row_digest, identity)
     return identity
 
 
@@ -1393,11 +1531,23 @@ def _verify_chain_actions(
         (chain_id,),
     ).fetchall()
     if len(rows) != len(PLAN):
+        _CHAIN_VERIFY_MEMO.drop(identity_sha256, chain_id)
         raise ReviewLifecycleError("descriptor_tamper")
     if [int(row["action_index"]) for row in rows] != list(range(len(PLAN))):
+        _CHAIN_VERIFY_MEMO.drop(identity_sha256, chain_id)
         raise ReviewLifecycleError("descriptor_tamper")
-    for row in rows:
-        _verify_action_row(conn, row, identity, identity_sha256)
+    digests = tuple(_row_snapshot_digest(row) for row in rows)
+    retired = tuple(str(row["state"]) == "retired" for row in rows)
+    indexes = _CHAIN_VERIFY_MEMO.rows_to_verify(
+        identity_sha256, chain_id, digests, retired
+    )
+    try:
+        for index in indexes:
+            _verify_action_row(conn, rows[index], identity, identity_sha256)
+    except BaseException:
+        _CHAIN_VERIFY_MEMO.drop(identity_sha256, chain_id)
+        raise
+    _CHAIN_VERIFY_MEMO.store(identity_sha256, chain_id, digests)
 
 
 def _verify_all_chains(conn: sqlite3.Connection) -> None:
