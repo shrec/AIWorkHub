@@ -24,15 +24,11 @@ MCP stdio runtime on the workspace host. It does not open a browser or require
 an AIWorkHub cloud account, and it binds no port and exposes no LAN service
 unless you start the opt-in WorkHub Mail listener on a host and port you name.
 
-## What's new in 0.12.85
+## What's new in 0.12.86
 
-- Nothing outside the repository: temp files, sandbox temp, caches and leases live under the repository's own runtime root and are cleaned up when no longer needed. A stopped manager's scratch is reclaimed two hours after its process is gone.
-- A failing validation goes back to the same worker automatically, a validation that also fails before the change is treated as an environment problem, and a card blocked by a known operational failure relaunches on its own.
-- Faster and steadier: the MCP server starts with far fewer modules loaded, Source Graph re-resolves only what changed, ledger lookups read one key instead of the whole ledger, and a blocked worker Source Graph call returns a typed timeout after 120 seconds.
-- Clearer reviews: one decision packet per candidate with prefilled calls, a manager correction can cite the manager's own measured evidence, and every refused reviewer launch or timed-out accept names who and what it belonged to.
-- A card you declare high risk keeps its security review: the declared tier is a floor that the path-based checks can raise but never lower.
-- Safer isolation: a worktree root override that belongs to another repository is ignored instead of breaking the launch, and an owner's uncommitted edit never becomes a worker change.
-- The Codex callback mux is retired, and the native Codex executable setting is restored.
+- Reconnecting is fast again under load: the MCP server answers its tool list from a schema cache, and the startup cleanup sweep waits until the client has its tools instead of competing with the handshake.
+- Source Graph incremental builds no longer run for hours: cross-file import matching is cached, and the pass stops with a recorded reason if it stalls or runs past its wall-clock cap.
+- Less background CPU: the reconciler and review drain verify a review chain only when its rows change, and the dashboard cost ledger no longer re-parses every live Claude Code transcript on each snapshot.
 
 ## Review automation
 

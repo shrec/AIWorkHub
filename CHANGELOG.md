@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.86] - 2026-11-04
+
+### Changed
+
+- The MCP server answers `tools/list` from a per-tool input schema cache built without executing deferred implementation modules, and the startup cleanup sweep waits for the first `tools/list` (at most 60 seconds) and stops with the server, so a reconnect under host load gets its tool list quickly (NF-2026-02053).
+- Reconciler and review drain verify a review chain's actions once per row digest instead of on every pass (NF-2026-02057).
+- The dashboard cost ledger no longer re-parses every live Claude Code transcript on each polled snapshot (NF-2026-02056).
+
+### Fixed
+
+- A Source Graph incremental build no longer runs for hours in quadratic cross-file edge resolution: import matching is normalized and cached, and the pass is bounded by a stall watchdog and a wall-clock cap that abort with a recorded reason (NF-2026-02061).
+
 ## [0.12.85] - 2026-11-03
 
 ### Added

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.12.86 — 2026-11-04
+
+### Changed
+
+- Bundled runtime 0.12.86: MCP reconnects under host load get their tool list quickly (cached tool schemas and a deferred startup sweep), Source Graph incremental builds no longer run for hours, and the reconciler and dashboard stop repeating work on every pass. The full list is in the repository CHANGELOG.
+
 ## 0.12.85 — 2026-11-03
 
 ### Changed
