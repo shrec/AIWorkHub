@@ -20,7 +20,6 @@ from typing import Any, NotRequired, TypedDict
 from .evidence_levels import EvidenceLevel
 from .finding_reproduction import bounded_reproduction_text
 from .platform_io import atomic_replace
-from .quality_review_scope import scope_unknowns_are_sampling_only
 from .scoped_audit import ScopedAuditPacket, packet_fingerprint
 
 
@@ -1206,6 +1205,10 @@ def build_review_prompt(
     # opposite there: it names known_unknowns alone.  Every other prompt keeps
     # its changed-segment clause, byte for byte.
     unread_clause = "" if rework_instruction else f", or {unread_evidence},"
+    # Imported here, not at module level: quality_review_scope loads the whole
+    # Source Graph stack, and a module-level import put it into every worker
+    # MCP start (NF-2026-02050).
+    from .quality_review_scope import scope_unknowns_are_sampling_only
     scope_instruction = (
         f"candidate.scoped_audits.{lens} is the graph-scoped audit for this "
         "lens: use it as the primary behavior boundary and treat its "
