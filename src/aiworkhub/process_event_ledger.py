@@ -679,7 +679,12 @@ def _merge_latest_row(
     field still ends with exactly the value the unfiltered fold would hold.
     """
 
-    if skip_event_kinds and str(row.get("event_kind") or "") in skip_event_kinds:
+    # A named kind matches ``event_kind`` or ``event_type``: the stateless
+    # review-orchestrator rows carry only the latter (NF-2026-02063).
+    if skip_event_kinds and (
+        str(row.get("event_kind") or "") in skip_event_kinds
+        or str(row.get("event_type") or "") in skip_event_kinds
+    ):
         return None
     key = str(row.get(key_field) or "")
     if not key:

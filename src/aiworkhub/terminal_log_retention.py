@@ -188,6 +188,39 @@ def _owned_regular_file(path: Path, parent: Path) -> os.stat_result | None:
     return info
 
 
+# NF-2026-02063: a request's ``.request.json`` is the workspace GC's only
+# metadata for its retained worktree/home, so its owned files are never deleted
+# while ``<configured worktree root>/<request_id>/worktree`` or ``/home`` exists.
+# Once the workspace GC reclaims them, the next pass deletes the files as before.
+WORKSPACE_PRESENT_REASON = "request_workspace_present"
+WORKSPACE_ROOT_UNRESOLVED_REASON = "request_workspace_root_unresolved"
+
+
+def _request_worktree_root(root: Path) -> Path | None:
+    """The configured worktree root for ``root``, or ``None`` when unresolvable."""
+    from . import worker_workspace  # lazy: keeps this module import-light
+
+    try:
+        return worker_workspace.configured_worktree_root(root)
+    except Exception:  # noqa: BLE001 - unresolvable fails closed in _workspace_hold
+        return None
+
+
+def _workspace_hold(worktree_root: Path | None, request_id: str) -> str:
+    """Why ``request_id``'s owned files must stay, or ``""`` when they may go."""
+    if worktree_root is None:
+        return WORKSPACE_ROOT_UNRESOLVED_REASON
+    entry = worktree_root / request_id
+    for name in ("worktree", "home"):
+        try:
+            (entry / name).lstat()
+        except FileNotFoundError:
+            continue
+        # Present -- or unreadable (any other OSError), which is not absent.
+        return WORKSPACE_PRESENT_REASON
+    return ""
+
+
 def _legacy_store_identity(root: Path) -> dict[str, int]:
     """Return a bounded identity for the fixed legacy ``logs/`` tree."""
 
@@ -581,6 +614,7 @@ def _candidate_payload(root: Path, *, deadline: float | None = None) -> dict[str
     )
     latest_rows = _latest_rows(root)
     usage_capture_ids = _usage_capture_request_ids(root)
+    worktree_root = _request_worktree_root(root)
     # One bulk read of every task status, replacing a per-request ``get_task``
     # N+1 that was the whole 55 s cost of this measurement (see _task_status_map).
     task_status_by_id = _task_status_map(root)
@@ -616,6 +650,9 @@ def _candidate_payload(root: Path, *, deadline: float | None = None) -> dict[str
         if request_id not in usage_capture_ids:
             protected.append({**item, "reason": "usage_capture_receipt_missing"})
             continue
+        if hold := _workspace_hold(worktree_root, request_id):
+            protected.append({**item, "reason": hold})
+            continue
         candidates.append(item)
 
     orphan_file_bytes = 0
@@ -636,10 +673,12 @@ def _candidate_payload(root: Path, *, deadline: float | None = None) -> dict[str
             "size_bytes": sum(int(item["size_bytes"]) for item in files),
             "files": files,
         }
-        if datetime.fromisoformat(orphan_item["modified_at"]) <= cutoff:
-            candidates.append(orphan_item)
-        else:
+        if datetime.fromisoformat(orphan_item["modified_at"]) > cutoff:
             protected.append({**orphan_item, "reason": "orphan_retention_age_not_met"})
+        elif hold := _workspace_hold(worktree_root, request_id):
+            protected.append({**orphan_item, "reason": hold})
+        else:
+            candidates.append(orphan_item)
 
     # An orphan (per-request files with no ledger row) is a candidate once older than logs_days.
     candidates.sort(key=lambda item: item["request_id"])
@@ -1880,18 +1919,24 @@ def _delete_worker_count() -> int:
     return max(1, (os.cpu_count() or 2) - 1)
 
 
-def _delete_candidate(process_root: Path, item: Mapping[str, Any]) -> dict[str, Any]:
+def _delete_candidate(
+    process_root: Path, item: Mapping[str, Any], worktree_root: Path | None
+) -> dict[str, Any]:
     """Delete one candidate's owned files after re-proving their identity.
 
     Per-item isolated: any failure is returned as ``error`` and never escapes,
     so one bad request can never stop the rest of the sweep.  A file whose
-    size or mtime changed since classification is left untouched.
+    size or mtime changed since classification is left untouched, and so is
+    every file of a request whose worktree or home appeared or still exists.
     """
     request_id = str(item.get("request_id") or "")
     outcome: dict[str, Any] = {"request_id": request_id, "files": 0, "bytes": 0, "error": ""}
     try:
         if not _REQUEST_RE.fullmatch(request_id):
             outcome["error"] = "request_id_invalid"
+            return outcome
+        if hold := _workspace_hold(worktree_root, request_id):
+            outcome["error"] = hold
             return outcome
         expected_files = [entry for entry in item.get("files") or [] if isinstance(entry, Mapping)]
         for expected in expected_files:
@@ -1926,12 +1971,15 @@ def _delete_candidates(
     single-threaded path whatever the pool size.
     """
     process_root = root / PROCESS_FILES_RELATIVE_PATH
+    worktree_root = _request_worktree_root(root)
     count = _delete_worker_count() if workers is None else max(1, int(workers))
     if count <= 1 or len(candidates) <= 1:
-        outcomes = [_delete_candidate(process_root, item) for item in candidates]
+        outcomes = [_delete_candidate(process_root, item, worktree_root) for item in candidates]
     else:
         with ThreadPoolExecutor(max_workers=count) as pool:
-            outcomes = list(pool.map(lambda item: _delete_candidate(process_root, item), candidates))
+            outcomes = list(pool.map(
+                lambda item: _delete_candidate(process_root, item, worktree_root), candidates
+            ))
     return {
         "deleted": sum(1 for outcome in outcomes if not outcome["error"]),
         "deleted_files": sum(int(outcome["files"]) for outcome in outcomes),

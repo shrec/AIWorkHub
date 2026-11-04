@@ -343,9 +343,10 @@ def test_undisposed_card_husk_is_kept(tmp_path, monkeypatch, status, worker_stat
 
 
 @pytest.mark.parametrize("files", [("notes.txt",), ("bash.exe.stackdump", "notes.txt")])
-def test_non_husk_with_missing_metadata_stays_metadata_missing(
+def test_non_husk_with_missing_metadata_of_disposed_card_is_reclaimed(
     tmp_path, monkeypatch, files
 ):
+    # NF-2026-02063: a disposed card's workspace has no remaining use, husk or not.
     manager, card = _husk_manager(
         tmp_path, monkeypatch, status="finished", worker_status="done", claimed_by=""
     )
@@ -355,13 +356,51 @@ def test_non_husk_with_missing_metadata_stays_metadata_missing(
         GC_RID, manager._latest_by_request()[GC_RID]
     )
 
-    assert result == {"request_id": GC_RID, "gc": False, "reason": "metadata_missing"}
+    assert result == {
+        "request_id": GC_RID, "gc": True, "reason": "disposed_workspace_reclaimed",
+    }
+    assert not entry.exists()
+
+
+@pytest.mark.parametrize("files", [("notes.txt",), ("bash.exe.stackdump", "notes.txt")])
+def test_non_husk_with_missing_metadata_of_undisposed_card_is_kept(
+    tmp_path, monkeypatch, files
+):
+    manager, card = _husk_manager(
+        tmp_path, monkeypatch, status="pending", worker_status="unclaimed"
+    )
+    entry, path = _seed_husk(manager, tmp_path, card, files=files)
+
+    result = manager._gc_finalized_workspace(
+        GC_RID, manager._latest_by_request()[GC_RID]
+    )
+
+    assert result["gc"] is False
     assert path.exists()
 
 
-def test_husk_with_populated_home_is_not_reclaimed(tmp_path, monkeypatch):
+def test_husk_with_populated_home_of_disposed_card_is_reclaimed(tmp_path, monkeypatch):
     manager, card = _husk_manager(
         tmp_path, monkeypatch, status="finished", worker_status="done", claimed_by=""
+    )
+    entry, path = _seed_husk(manager, tmp_path, card, home=True)
+    (entry / "home" / "state.txt").write_text("base pin")
+
+    result = manager._gc_finalized_workspace(
+        GC_RID, manager._latest_by_request()[GC_RID]
+    )
+
+    assert result == {
+        "request_id": GC_RID, "gc": True, "reason": "disposed_workspace_reclaimed",
+    }
+    assert not entry.exists()
+    latest = manager._request_events(GC_RID)[-1]
+    assert latest["workspace_gc_reason"] == "disposed_workspace_reclaimed"
+
+
+def test_husk_with_populated_home_of_undisposed_card_is_kept(tmp_path, monkeypatch):
+    manager, card = _husk_manager(
+        tmp_path, monkeypatch, status="processing", worker_status="in_progress"
     )
     entry, path = _seed_husk(manager, tmp_path, card, home=True)
     (entry / "home" / "state.txt").write_text("kept")
@@ -371,5 +410,4 @@ def test_husk_with_populated_home_is_not_reclaimed(tmp_path, monkeypatch):
     )
 
     assert result["gc"] is False
-    assert result["reason"] == "metadata_missing"
-    assert entry.exists()
+    assert (entry / "home" / "state.txt").exists()

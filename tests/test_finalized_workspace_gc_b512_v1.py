@@ -1353,10 +1353,22 @@ def test_missing_current_review_cleanup_failure_stays_truthfully_retained_for_re
 # --- fail-closed on ambiguity -------------------------------------------------
 
 
-def test_missing_metadata_file_fails_closed(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "status,worker_status,claimed_by,reclaimed",
+    [
+        # NF-2026-02063: a disposed card's dead workspace is reclaimed even
+        # when its metadata file is gone ...
+        ("finished", "done", "", True),
+        # ... while an undisposed card still fails closed.
+        ("processing", "in_progress", "claude_worker_b512", False),
+    ],
+)
+def test_missing_metadata_file_reclaims_only_a_disposed_card(
+    tmp_path, monkeypatch, status, worker_status, claimed_by, reclaimed
+):
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
     card = _card()
-    card.update({"status": "finished", "worker_status": "done", "claimed_by": ""})
+    card.update({"status": status, "worker_status": worker_status, "claimed_by": claimed_by})
     manager = _build_manager(tmp_path, card)
     path, home, metadata_path = _seed_gc_candidate(
         manager, tmp_path, card,
@@ -1368,8 +1380,12 @@ def test_missing_metadata_file_fails_closed(tmp_path, monkeypatch):
 
     result = manager._gc_finalized_workspaces()
 
-    assert result == {"gc_scanned": 1, "gc_cleaned": 0, "gc_skipped": 1}
-    assert path.exists() and home.exists()
+    if reclaimed:
+        assert result == {"gc_scanned": 1, "gc_cleaned": 1, "gc_skipped": 0}
+        assert not path.exists() and not home.exists()
+    else:
+        assert result == {"gc_scanned": 1, "gc_cleaned": 0, "gc_skipped": 1}
+        assert path.exists() and home.exists()
 
 
 def test_task_lookup_failure_fails_closed_and_preserves_workspace(tmp_path, monkeypatch):

@@ -11,15 +11,22 @@ from typing import Any
 from . import worker_workspace as _worker_workspace
 
 
+DISPOSED_WORKSPACE_RECLAIMED_REASON = "disposed_workspace_reclaimed"
+
+
 def gc_husk_without_metadata(
     manager: Any, request_id: str, latest: dict[str, Any], missing_reason: str
 ) -> dict[str, Any]:
-    """Reclaim a metadata-less worktree husk, but only once its card is disposed.
+    """Reclaim a metadata-less workspace, but only once its card is disposed.
 
-    Anything that is not exactly this request's husk keeps ``missing_reason``.
-    A husk goes only when the disposition gate calls its card finished,
-    archived or superseded -- never because a restart, timeout or lost
-    metadata orphaned it.
+    A workspace whose shape is not exactly this request's keeps
+    ``missing_reason``. Otherwise it goes only when the disposition gate calls
+    its card finished, archived or superseded and its process is proven dead
+    -- never because a restart, timeout or lost metadata orphaned it. A husk is
+    audited ``husk_reclaimed``; a populated worktree or home (a Source Graph
+    base-pin hard link, worker state) of a disposed card has no remaining use
+    and is audited ``disposed_workspace_reclaimed`` (NF-2026-02063). Every keep
+    reason of ``_gc_disposition`` still wins.
     """
     from . import process_launcher as pl
 
@@ -30,8 +37,10 @@ def gc_husk_without_metadata(
         pl.assert_gc_safe_workspace_shape(request_id, path, home, repo=manager.repo)
     except pl.WorkspaceError:
         return kept
-    if not _worker_workspace.is_workspace_husk(path, home):
-        return kept
+    reason = (
+        "husk_reclaimed" if _worker_workspace.is_workspace_husk(path, home)
+        else DISPOSED_WORKSPACE_RECLAIMED_REASON
+    )
     task_id = str(latest.get("task_id") or "")
     runner = str(latest.get("runner") or "")
     if not task_id or not runner:
@@ -76,11 +85,11 @@ def gc_husk_without_metadata(
         request_id=request_id,
         task_id=task_id,
         card_status=status,
-        reason="husk_reclaimed",
+        reason=reason,
         action="purge",
     )
     manager._retention_event({
         **event, "workspace_gc": True, "workspace_gc_at": pl._utcnow(),
-        "workspace_gc_reason": "husk_reclaimed",
+        "workspace_gc_reason": reason,
     }, disposition="removed")
-    return {"request_id": request_id, "gc": True, "reason": "husk_reclaimed"}
+    return {"request_id": request_id, "gc": True, "reason": reason}

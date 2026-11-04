@@ -116,7 +116,7 @@ from .launch_replay_guard import (
     strip_persistence_envelopes as _strip_persistence_envelopes,
 )
 from .launch_zero_delta import (
-    RUNTIME_NOTICE_EVENT_KIND,
+    ORCHESTRATOR_ADVISORY_EVENT_TYPES, RUNTIME_NOTICE_EVENT_KIND,
     ZERO_DELTA_DEFAULT_ELAPSED_SHARE,
     ZERO_DELTA_ELAPSED_SHARE_ENV,
     ZERO_DELTA_MAX_SECONDS,
@@ -4596,7 +4596,7 @@ class ProcessManager:
         latest = process_event_ledger.latest_events(
             self.process_log_path,
             key_field="request_id",
-            skip_event_kinds=(RUNTIME_NOTICE_EVENT_KIND,),
+            skip_event_kinds=(RUNTIME_NOTICE_EVENT_KIND, *sorted(ORCHESTRATOR_ADVISORY_EVENT_TYPES)),
             replace=True,
             drop_fields=_LATEST_BY_REQUEST_DROP_FIELDS,
         )
