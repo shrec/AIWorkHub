@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.12.87 — 2026-11-05
+
+### Changed
+
+- Bundled runtime 0.12.87: closed requests' worktrees are reclaimed instead of accumulating, background scans and task reads stop repeating work, and manager tools normalize fillable arguments instead of refusing them. The full list is in the repository CHANGELOG.
+
 ## 0.12.86 — 2026-11-04
 
 ### Changed

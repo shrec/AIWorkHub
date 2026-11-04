@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.87] - 2026-11-05
+
+### Changed
+
+- The manager identity probe reuses a short-lived Windows process-tree snapshot instead of taking a new one on every call (NF-2026-02058).
+- The storage observability scan runs single-flight per repository instead of independently in every MCP server process every 300 seconds (NF-2026-02060).
+- `get_task` no longer opens a separate read-only connection for a schema-readiness check on every call (NF-2026-02059).
+- `needfix_preview_convert` fills a missing runner/topic, coerces a string `acceptance` and drops stray `action`/`task_id` keys, reporting each normalization. `agent_task_status`, `review_packet` and `accept_preview` resolve a `task_id` alone to the card's current request, `task_reject_review` accepts `request_id` as an identity assertion, and `task_supersede` accepts `successor_task_id` (NF-2026-01920, NF-2026-01940).
+
+### Fixed
+
+- Closed requests' worktrees and homes are reclaimed instead of accumulating: log retention keeps a request's metadata while its workspace still exists, the janitor reclaims a disposed workspace whose metadata is already gone, and review-orchestrator side-event rows no longer erase a request's lifecycle state (NF-2026-02063).
+- Two reviewer lenses launched in parallel no longer both fail on the registry lock (NF-2026-02046).
+
 ## [0.12.86] - 2026-11-04
 
 ### Changed

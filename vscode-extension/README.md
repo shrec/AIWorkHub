@@ -24,11 +24,12 @@ MCP stdio runtime on the workspace host. It does not open a browser or require
 an AIWorkHub cloud account, and it binds no port and exposes no LAN service
 unless you start the opt-in WorkHub Mail listener on a host and port you name.
 
-## What's new in 0.12.86
+## What's new in 0.12.87
 
-- Reconnecting is fast again under load: the MCP server answers its tool list from a schema cache, and the startup cleanup sweep waits until the client has its tools instead of competing with the handshake.
-- Source Graph incremental builds no longer run for hours: cross-file import matching is cached, and the pass stops with a recorded reason if it stalls or runs past its wall-clock cap.
-- Less background CPU: the reconciler and review drain verify a review chain only when its rows change, and the dashboard cost ledger no longer re-parses every live Claude Code transcript on each snapshot.
+- Finished tasks no longer keep their worktree copies: once a request is closed, its worktree and home are reclaimed, even when the request's metadata was already rotated away.
+- Less background load: the manager identity probe, the storage scan and task reads stop repeating the same work on every call or in every server process.
+- Fewer retried manager calls: NeedFix conversion fills and normalizes the plan fields it can determine itself, and the status, review and reject tools accept the same identity parameters consistently.
+- Two reviewer lenses can start at the same time without colliding on the registry lock.
 
 ## Review automation
 
