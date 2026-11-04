@@ -305,15 +305,36 @@ except ModuleNotFoundError:
                     return text
         return ""
 
+    def _stdio_strip_annotated(annotation: Any) -> Any:
+        """Drop ``Annotated`` metadata the way ``get_type_hints`` without extras does.
+
+        NF-2026-02053: one ``get_type_hints(include_extras=True)`` per tool now
+        serves both the JSON type and the Field description. Every container
+        the schema walk descends into is rebuilt with stripped arguments, so
+        the schema equals the one built from the extras-free hints.
+        """
+        while typing.get_origin(annotation) is typing.Annotated:
+            annotation = typing.get_args(annotation)[0]
+        origin = typing.get_origin(annotation)
+        if origin in (typing.Union, types.UnionType, list, tuple, dict):
+            args = typing.get_args(annotation)
+            stripped = tuple(_stdio_strip_annotated(arg) for arg in args)
+            if stripped != args:
+                if origin in (typing.Union, types.UnionType):
+                    return typing.Union[stripped]  # type: ignore[valid-type]
+                return origin[stripped]
+        return annotation
+
+    def _stdio_resolved_schema(annotation: Any) -> dict[str, Any]:
+        return _stdio_json_schema_for_annotation(_stdio_strip_annotated(annotation))
+
     def _stdio_schema_for(func: Any) -> dict[str, Any]:
         try:
             sig = inspect.signature(func)
         except (TypeError, ValueError):
             return {"type": "object", "properties": {}, "additionalProperties": True}
-        try:
-            resolved_hints = typing.get_type_hints(func)
-        except (NameError, TypeError):
-            resolved_hints = {}
+        # One evaluation per tool: the extras-preserving hints carry both the
+        # type (stripped below) and the parameter's own Field description.
         try:
             annotated_hints = typing.get_type_hints(func, include_extras=True)
         except (NameError, TypeError):
@@ -326,8 +347,8 @@ except ModuleNotFoundError:
         for pname, param in sig.parameters.items():
             if pname == "self":
                 continue
-            properties[pname] = _stdio_json_schema_for_annotation(
-                resolved_hints.get(pname, param.annotation)
+            properties[pname] = _stdio_resolved_schema(
+                annotated_hints.get(pname, param.annotation)
             )
             description = _stdio_hint_description(annotated_hints.get(pname)) or documented.get(pname, "")
             if description:
@@ -338,6 +359,31 @@ except ModuleNotFoundError:
         if required:
             schema["required"] = required
         return schema
+
+    # NF-2026-02053: tools/list rebuilt every schema (two get_type_hints each)
+    # on every call. Only the inputSchema is cached, keyed by the callable
+    # itself (the key keeps it alive, so an id can never be recycled); a
+    # re-registered tool is a new key. Listing filters, descriptions and
+    # annotations are re-evaluated on every call, so a profile change is seen
+    # at once. Bounded: one entry per callable this process has listed.
+    # Hits/misses are counted per schema lookup for tests.
+    _STDIO_SCHEMA_CACHE: dict[Any, dict[str, Any]] = {}
+    _STDIO_SCHEMA_CACHE_LOCK = threading.Lock()
+    _STDIO_TOOLS_LIST_STATS = {"hits": 0, "misses": 0}
+
+    def _stdio_cached_schema_for(func: Any) -> dict[str, Any]:
+        import copy
+
+        with _STDIO_SCHEMA_CACHE_LOCK:
+            cached = _STDIO_SCHEMA_CACHE.get(func)
+            if cached is None:
+                _STDIO_TOOLS_LIST_STATS["misses"] += 1
+                cached = _stdio_schema_for(func)
+                _STDIO_SCHEMA_CACHE[func] = cached
+            else:
+                _STDIO_TOOLS_LIST_STATS["hits"] += 1
+        # A private copy per call: callers own (and may mutate) their result.
+        return copy.deepcopy(cached)
 
     def _stdio_tools_list(tools: dict[str, Any]) -> dict[str, Any]:
         surface = mcp_surface()
@@ -350,7 +396,7 @@ except ModuleNotFoundError:
             entry: dict[str, Any] = {
                 "name": name,
                 "description": description,
-                "inputSchema": _stdio_schema_for(func),
+                "inputSchema": _stdio_cached_schema_for(func),
             }
             annotations = _stdio_tool_metadata.derive_annotations(
                 _stdio_tool_metadata.MCP_TOOL_ALIASES.get(name, name), description
@@ -557,6 +603,10 @@ except ModuleNotFoundError:
                 })
                 return
             write({"jsonrpc": "2.0", "id": msg_id, "result": result})
+            if method == "tools/list":
+                # NF-2026-02053: the deferred startup sweep may begin only once
+                # the client holds its first tool listing.
+                _mark_first_tools_list_served()
 
         # Tool calls may legitimately wait on providers or repository locks.
         # Keep the reader and lightweight status calls serviceable while those
@@ -7670,9 +7720,31 @@ def aiworkhub_storage_recover_stranded_worktrees(
     )
 
 
-def _enforce_terminal_retention_safely(root: Path) -> None:
-    """Schedule retention without racing another MCP process's cleanup lane."""
+# NF-2026-02053: the startup sweep imported storage_retention and walked the
+# repository while the client was still waiting for initialize/tools/list, and
+# that work held the GIL the stdio reader needs. Startup now waits for the
+# first tools/list response (set by the stdlib transport) and, for transports
+# that never report it, for a bounded delay; shutdown cancels a pending wait.
+_FIRST_TOOLS_LIST_SERVED = threading.Event()
+_STARTUP_SWEEP_CANCELLED = threading.Event()
+_STARTUP_SWEEP_MAX_DELAY_SECONDS = 60.0
+_STARTUP_SWEEP_JOIN_SECONDS = 2.0
 
+
+def _mark_first_tools_list_served() -> None:
+    _FIRST_TOOLS_LIST_SERVED.set()
+
+
+def _enforce_terminal_retention_safely(root: Path) -> None:
+    """Schedule retention without racing another MCP process's cleanup lane.
+
+    Never before the first tools/list has been answered (or the bounded
+    startup delay has elapsed), and never once shutdown has begun.
+    """
+
+    _FIRST_TOOLS_LIST_SERVED.wait(timeout=_STARTUP_SWEEP_MAX_DELAY_SECONDS)
+    if _STARTUP_SWEEP_CANCELLED.is_set():
+        return
     try:
         from . import storage_retention
 
@@ -7854,13 +7926,15 @@ def main() -> None:
         # indexing; startup indexing failure must not kill the whole server.
         pass
     # Retention is repository policy, not a dashboard-only manual action.
-    # Run it off the MCP stdio thread so startup remains responsive.
-    threading.Thread(
+    # Run it off the MCP stdio thread so startup remains responsive, and only
+    # after the first tools/list was answered (NF-2026-02053).
+    retention_thread = threading.Thread(
         target=_enforce_terminal_retention_safely,
         args=(root,),
         name=f"aiworkhub-log-retention-{abs(hash(str(root))) & 0xffff:x}",
         daemon=True,
-    ).start()
+    )
+    retention_thread.start()
     # Reconciliation scans every task row and every retained workspace, so on a
     # large repository it takes tens of seconds.  Run it off the MCP stdio thread
     # for the same reason retention is: a synchronous call here delays the reply
@@ -7876,6 +7950,12 @@ def main() -> None:
     try:
         mcp.run()
     finally:
+        # A still-pending startup sweep is cancelled, never awaited: the gate
+        # thread only schedules (the sweep itself is a daemon), so this join
+        # is bounded and shutdown never waits on repository cleanup.
+        _STARTUP_SWEEP_CANCELLED.set()
+        _FIRST_TOOLS_LIST_SERVED.set()
+        retention_thread.join(timeout=_STARTUP_SWEEP_JOIN_SECONDS)
         task_reconciler.stop_reconciler(root)
 
 
