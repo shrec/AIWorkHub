@@ -22,7 +22,10 @@ import dataclasses
 import hashlib
 import hmac
 import json
+import math
 import re
+import threading
+from collections import OrderedDict
 import time
 import uuid
 from dataclasses import dataclass
@@ -81,6 +84,23 @@ _MAX_MUTATION_ENTRIES = 8
 _MAX_MUTATION_MESSAGE_CHARS = 2048
 _MAX_MUTATION_PATH_CHARS = 256
 _MAX_CONCURRENT_CHANGES = 32
+
+# NF-2026-02095: wall-clock bound on one dispose-time reproduction, well under
+# an MCP client's 1800 s idle timeout. Past it the dispose stores a signed
+# UNRUNNABLE receipt with candidate detail ``timeout`` instead of hanging.
+# Both are read at call time, so a test may monkeypatch them.
+DISPOSE_REPRODUCTION_DEADLINE_SECONDS = 600.0
+# How often a caller-supplied ``progress`` callback hears from a running
+# reproduction while the dispose waits on it.
+DISPOSE_PROGRESS_INTERVAL_SECONDS = 15.0
+TIMEOUT_DETAIL = "timeout"
+# At most this many dispose reproductions are in flight per process, awaited or
+# abandoned alike (a run its last waiter abandoned at the deadline keeps
+# running); past it a dispose gets a deadline receipt without starting a run.
+DISPOSE_RUN_LIMIT = 4
+# Signed receipts of abandoned runs that finished late, kept (oldest evicted)
+# so a replay returns one at once instead of rerunning.
+DISPOSE_FINISHED_RUN_LIMIT = 64
 
 Runner = Callable[[Any, list[str]], list[dict[str, Any]]]
 Manifest = Mapping[tuple[str, str], "str | None"]
@@ -303,7 +323,7 @@ def _judge(rows: object, duration: float) -> dict[str, Any]:
         "duration_seconds": duration,
     }
     if row.get("timed_out"):
-        return _side(UNRUNNABLE, "timeout", **facts)
+        return _side(UNRUNNABLE, TIMEOUT_DETAIL, **facts)
     if isinstance(returncode, bool) or not isinstance(returncode, int):
         return _side(UNRUNNABLE, "returncode_missing", **facts)
     # 0 passed and 1 failed for both kinds: pytest's 2-5 are collection
@@ -459,16 +479,290 @@ def reproduce_finding(
     return sign_receipt(receipt, coordinator_key)
 
 
+def _deadline_seconds(value: object) -> float:
+    """The positive, finite wall-clock bound; anything else is refused by name."""
+    limit = DISPOSE_REPRODUCTION_DEADLINE_SECONDS if value is None else value
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, (int, float))
+        or not math.isfinite(limit)
+        or limit <= 0
+    ):
+        raise ValueError(f"finding_reproduction_deadline_invalid:{limit!r}"[:200])
+    return float(limit)
+
+
+def _positive_limit(value: object, name: str) -> int:
+    """A positive int registry bound; anything else is refused by name."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"finding_reproduction_{name}_invalid:{value!r}"[:200])
+    return value
+
+
+def _wait_with_progress(
+    finished: threading.Event,
+    *,
+    deadline_seconds: float,
+    progress: Callable[[float, float], Any] | None,
+) -> None:
+    """Wait on ``finished`` at most ``deadline_seconds``, feeding ``progress``.
+
+    ``progress`` is called every :data:`DISPOSE_PROGRESS_INTERVAL_SECONDS` with
+    ``(elapsed_seconds, deadline_seconds)``; a failing progress sink is
+    reporting only and never decides the outcome.
+    """
+    interval = DISPOSE_PROGRESS_INTERVAL_SECONDS
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or not (
+        math.isfinite(interval) and interval > 0
+    ):
+        interval = deadline_seconds
+    started = time.monotonic()
+    while True:
+        remaining = deadline_seconds - (time.monotonic() - started)
+        if remaining <= 0 or finished.wait(min(interval, remaining)):
+            return
+        if progress is not None:
+            try:
+                progress(round(time.monotonic() - started, 3), deadline_seconds)
+            except Exception:  # noqa: BLE001 -- progress is reporting only
+                pass
+
+
+RunKey = tuple[str, str, str, str]
+
+
+class _Run:
+    """One in-flight reproduction; every field but ``finished`` changes under the registry lock.
+
+    ``waiters`` counts callers still waiting on it; ``gave_up`` records that at
+    least one waiter returned a deadline receipt, so the late result is kept
+    for that caller's replay.
+    """
+
+    __slots__ = ("finished", "done", "waiters", "gave_up", "value", "error")
+
+    def __init__(self) -> None:
+        self.finished = threading.Event()
+        self.done = False
+        self.waiters = 0
+        self.gave_up = False
+        self.value: Any = None
+        self.error: BaseException | None = None
+
+    @property
+    def abandoned(self) -> bool:
+        """Still running with no caller left waiting on it."""
+        return not self.done and self.waiters == 0
+
+
+class DisposeRunRegistry:
+    """Process-wide in-flight dispose reproductions, keyed by their binding.
+
+    The key is ``(finding_id, spec sha256, candidate sha256, reviewer receipt
+    sha256)``. A caller whose key already runs joins that run instead of
+    starting another; a joiner's result passes the same ``accept`` check as a
+    kept late result. A run is *abandoned* only once its last waiter gave up
+    at the deadline; it keeps going (its sandbox timeout and ``_execute``
+    cleanup still apply, nothing is killed), and when any waiter gave up its
+    late signed result is kept in a bounded map
+    (:data:`DISPOSE_FINISHED_RUN_LIMIT`, oldest evicted) for the next replay.
+    At most :data:`DISPOSE_RUN_LIMIT` runs are in flight at once, awaited or
+    abandoned; past it no run starts. A run that raised is never kept, so an
+    error state is rechecked rather than cached. Waiters hold no lock while
+    they wait, so concurrent disposes never serialize behind a run.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._running: dict[RunKey, _Run] = {}
+        self._finished: OrderedDict[RunKey, Any] = OrderedDict()
+        self._started = 0
+
+    @property
+    def started(self) -> int:
+        """How many runs this registry has started."""
+        with self._lock:
+            return self._started
+
+    def running_count(self) -> int:
+        """Runs still in flight, abandoned or awaited."""
+        with self._lock:
+            return len(self._running)
+
+    def abandoned_count(self) -> int:
+        """In-flight runs whose last waiter gave up at the deadline."""
+        with self._lock:
+            return sum(1 for run in self._running.values() if run.abandoned)
+
+    def run(
+        self,
+        key: RunKey,
+        work: Callable[[], Any],
+        *,
+        deadline_seconds: float,
+        progress: Callable[[float, float], Any] | None = None,
+        accept: Callable[[Any], bool] = lambda _value: True,
+    ) -> tuple[bool, Any]:
+        """``(True, result)`` once ``key``'s run finished in time, else ``(False, None)``.
+
+        A late result kept for ``key`` that ``accept`` admits is returned at
+        once; a rejected one is dropped. A caller that joined a run another
+        caller started gets its result only when ``accept`` admits it, else
+        ``(False, None)``. An exception the run raised is re-raised here, on
+        the waiting thread. ``(False, None)`` also comes back at once, without
+        starting a run, when :data:`DISPOSE_RUN_LIMIT` runs are in flight.
+        """
+        run_limit = _positive_limit(DISPOSE_RUN_LIMIT, "run_limit")
+        finished_limit = _positive_limit(DISPOSE_FINISHED_RUN_LIMIT, "finished_run_limit")
+        with self._lock:
+            if key in self._finished:
+                late = self._finished[key]
+                if accept(late):
+                    self._finished.move_to_end(key)
+                    return True, late
+                del self._finished[key]
+            run = self._running.get(key)
+            start = run is None
+            if run is None:
+                if len(self._running) >= run_limit:
+                    return False, None
+                run = _Run()
+                self._running[key] = run
+                self._started += 1
+            run.waiters += 1
+        if start:
+            try:
+                threading.Thread(
+                    target=self._work,
+                    args=(key, run, work, finished_limit),
+                    name="finding-reproduction",
+                    daemon=True,
+                ).start()
+            except BaseException as exc:
+                # No worker owns the run: settle it so a joined waiter returns.
+                with self._lock:
+                    if self._running.get(key) is run:
+                        del self._running[key]
+                    run.waiters -= 1
+                    run.error, run.done = exc, True
+                run.finished.set()
+                raise
+        _wait_with_progress(run.finished, deadline_seconds=deadline_seconds, progress=progress)
+        with self._lock:
+            run.waiters -= 1
+            if not run.done:
+                run.gave_up = True
+                return False, None
+        if run.error is not None:
+            raise run.error
+        if not start and not accept(run.value):
+            return False, None
+        return True, run.value
+
+    def _work(
+        self, key: RunKey, run: _Run, work: Callable[[], Any], finished_limit: int
+    ) -> None:
+        value: Any = None
+        error: BaseException | None = None
+        try:
+            value = work()
+        except BaseException as exc:  # noqa: BLE001 -- re-raised on the waiting thread
+            error = exc
+        with self._lock:
+            run.value, run.error, run.done = value, error, True
+            if self._running.get(key) is run:
+                del self._running[key]
+            if run.gave_up and error is None:
+                self._finished[key] = value
+                self._finished.move_to_end(key)
+                while len(self._finished) > finished_limit:
+                    self._finished.popitem(last=False)
+        run.finished.set()
+
+
+_DISPOSE_RUNS = DisposeRunRegistry()
+
+
+def deadline_receipt(
+    spec: ReproductionSpec,
+    *,
+    finding_id: str,
+    candidate_sha256: str,
+    reviewer_receipt_sha256: str,
+    coordinator_key: bytes,
+    deadline_seconds: float,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """The signed UNRUNNABLE receipt of a reproduction that outran its deadline.
+
+    The candidate side is ``timeout`` (``timed_out`` true), the base side was
+    never awaited, and ``deadline_seconds`` marks the receipt as a deadline
+    receipt. The target may never have resolved, so ``base_oid`` is empty.
+    UNRUNNABLE is no counter-evidence, so a dismissal still needs the
+    manager's own.
+    """
+    receipt = {
+        "schema_id": SCHEMA_ID,
+        "finding_id": str(finding_id),
+        "classification": UNRUNNABLE,
+        "spec_kind": spec.kind,
+        "spec_sha256": spec.sha256,
+        "candidate_sha256": str(candidate_sha256),
+        "reviewer_receipt_sha256": str(reviewer_receipt_sha256),
+        "base_oid": "",
+        "candidate": _side(
+            UNRUNNABLE,
+            TIMEOUT_DETAIL,
+            timed_out=True,
+            duration_seconds=round(float(deadline_seconds), 3),
+        ),
+        "base": _side(
+            UNRUNNABLE, f"base_not_run:candidate_{UNRUNNABLE}", duration_seconds=0
+        ),
+        "deadline_seconds": float(deadline_seconds),
+        "executed_at": (now or datetime.now(timezone.utc)).isoformat(),
+    }
+    return sign_receipt(receipt, coordinator_key)
+
+
+def is_deadline_receipt(receipt: object) -> bool:
+    """Whether ``receipt`` records a reproduction that outran its deadline."""
+    candidate = receipt.get("candidate") if isinstance(receipt, Mapping) else None
+    return (
+        isinstance(receipt, Mapping)
+        and receipt.get("classification") == UNRUNNABLE
+        and receipt.get("deadline_seconds") is not None
+        and isinstance(candidate, Mapping)
+        and candidate.get("detail") == TIMEOUT_DETAIL
+    )
+
+
 def dispose_reproducer(
     *,
     coordinator_key: Callable[[], bytes],
     resolve_target: Callable[[ReproductionSpec], ReproductionTarget],
+    deadline_seconds: float | None = None,
+    progress: Callable[[float, float], Any] | None = None,
 ) -> Callable[..., dict[str, Any]]:
     """The ``reproduce`` callback ``ReviewOrchestrator.dispose_review_finding`` takes.
 
     A ``stored`` receipt that verifies under the coordinator key and binds to
     the same finding, spec, candidate and reviewer receipt is returned as is,
     so a replayed dispose never reruns the reproduction.
+
+    NF-2026-02095: target resolution and the run are bounded by
+    ``deadline_seconds`` (default :data:`DISPOSE_REPRODUCTION_DEADLINE_SECONDS`,
+    read at call time) via the process-wide :class:`DisposeRunRegistry`, which
+    feeds ``progress`` while it waits. Past the deadline the callback returns a
+    :func:`deadline_receipt` instead of blocking the dispose. A stored deadline
+    receipt is an error state, so it is rechecked rather than cached, but a
+    recheck never starts a second run for the same binding: it joins the run
+    still in flight (bounded by the deadline again), or returns the signed
+    receipt that run produced after a waiter gave up on it. The stored receipt
+    comes back only when the recheck times out again (or the joined run's
+    receipt does not verify under the current key), which keeps a replay
+    idempotent. With :data:`DISPOSE_RUN_LIMIT` runs in flight no new run
+    starts at all.
     """
 
     def _reproduce(
@@ -482,18 +776,34 @@ def dispose_reproducer(
         spec = parse_reproduction_spec(spec_text)
         if spec is None:
             raise ValueError("finding_reproduction_spec_unparseable")
+        limit = _deadline_seconds(deadline_seconds)
         key = receipt_key(coordinator_key())
         binding = {
             "finding_id": finding_id,
             "candidate_sha256": candidate_sha256,
             "reviewer_receipt_sha256": reviewer_receipt_sha256,
         }
-        if verify_receipt(stored, key) and receipt_binds(
+        reusable = verify_receipt(stored, key) and receipt_binds(
             stored, spec_text=spec_text, **binding
-        ):
+        )
+        if reusable and not is_deadline_receipt(stored):
             return dict(stored or {})
-        return reproduce_finding(
-            spec, target=resolve_target(spec), coordinator_key=key, **binding
+        finished, receipt = _DISPOSE_RUNS.run(
+            (str(finding_id), spec.sha256, str(candidate_sha256), str(reviewer_receipt_sha256)),
+            lambda: reproduce_finding(
+                spec, target=resolve_target(spec), coordinator_key=key, **binding
+            ),
+            deadline_seconds=limit,
+            progress=progress,
+            accept=lambda late: verify_receipt(late, key)
+            and receipt_binds(late, spec_text=spec_text, **binding),
+        )
+        if finished:
+            return receipt
+        if reusable:
+            return dict(stored or {})
+        return deadline_receipt(
+            spec, coordinator_key=key, deadline_seconds=limit, **binding
         )
 
     return _reproduce
@@ -541,7 +851,13 @@ def sealed_manifest(
 
 
 def manager_reproducer(
-    manager: Any, *, task_id: str, request_id: str, card: Mapping[str, Any]
+    manager: Any,
+    *,
+    task_id: str,
+    request_id: str,
+    card: Mapping[str, Any],
+    deadline_seconds: float | None = None,
+    progress: Callable[[float, float], Any] | None = None,
 ) -> Callable[..., dict[str, Any]]:
     """Production wiring: the sandbox, workspaces and key of one ProcessManager.
 
@@ -675,5 +991,8 @@ def manager_reproducer(
         )
 
     return dispose_reproducer(
-        coordinator_key=manager._terminal_authority_key, resolve_target=_target
+        coordinator_key=manager._terminal_authority_key,
+        resolve_target=_target,
+        deadline_seconds=deadline_seconds,
+        progress=progress,
     )

@@ -4690,6 +4690,7 @@ def dispose_review_finding(
     disposition: str,
     counter_evidence: str,
     reason: str,
+    progress: Any = None,
 ) -> dict[str, Any]:
     """Record one manager disposition of one non-blocking reviewer finding.
 
@@ -4697,6 +4698,8 @@ def dispose_review_finding(
     the reviewer receipt and the candidate digest -- is derived here from
     the server-sealed reviewer evidence and the target's terminal evidence,
     never from the caller. It never accepts the target (NF-2026-01170).
+    ``progress`` is an optional ``(elapsed_seconds, deadline_seconds)`` sink
+    called while a coordinator reproduction runs (NF-2026-02095).
     """
     # Re-bound from the ``process_launcher`` module object, as in
     # :func:`accept_review`, so monkeypatches of that module still apply.
@@ -4763,8 +4766,11 @@ def dispose_review_finding(
     if finding_reproduction.report_has_spec(
         bound_receipt.get("report") if isinstance(bound_receipt, dict) else None
     ):
+        # NF-2026-02095: the run is bounded by the module deadline and feeds
+        # ``progress`` while it waits; past the deadline the disposition is
+        # stored with an UNRUNNABLE ``timeout`` receipt instead of hanging.
         reproduction["reproduce"] = finding_reproduction.manager_reproducer(
-            self, task_id=task_id, request_id=request_id, card=card
+            self, task_id=task_id, request_id=request_id, card=card, progress=progress
         )
     result = review_orchestrator.ReviewOrchestrator(
         self, db_path=review_db
