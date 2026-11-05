@@ -95,6 +95,13 @@ ALLOWED: list[tuple[str, Any]] = [
     ("Edit", {"file_path": "../outside.py", "old_string": "a = 1", "new_string": "a = 2"}),
     ("Edit", {"file_path": ".aiworkhub/runtime/x.json", "old_string": "{}", "new_string": "[]"}),
     ("Write", {"file_path": "src/new_module.py", "content": "x = 1\n"}),
+    # NF-2026-02088 (c): a searcher fed by a pipe searches no tree.
+    ("Bash", "git show HEAD:src/x.py | grep foo"),
+    ("Bash", "git show HEAD:src/x.py |\n  grep -n foo"),
+    ("Bash", "rg foo <(git show HEAD:src/x.py)"),
+    ("PowerShell", "git show HEAD:src/x.py |\n  Select-String foo"),
+    # NF-2026-02088 (d): a path outside the repository root is no R3-R7 target.
+    ("Bash", "sed -i 's/a/b/' ../outside.py"),
 ]
 
 _SOURCE_GRAPH = ("aiworkhub_manager_source_graph_query", "aiworkhub_worker_source_graph_query")

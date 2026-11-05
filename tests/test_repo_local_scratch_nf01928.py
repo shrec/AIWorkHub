@@ -99,22 +99,20 @@ def test_scratch_files_are_indexed_although_git_ignores_them(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize(
-    ("tool", "extra", "exists"),
+    ("tool", "extra"),
     [
-        ("Read", {}, True),
-        ("Read", {"offset": 1, "limit": 20}, True),
-        ("Write", {"content": "x = 1\n"}, False),
-        ("Write", {"content": "x = 2\n"}, True),
-        ("Edit", {"old_string": "probe", "new_string": "other"}, True),
-        ("MultiEdit", {"edits": []}, True),
+        ("Read", {}),
+        ("Read", {"offset": 1, "limit": 20}),
+        ("Write", {"content": "x = 2\n"}),
+        ("Edit", {"old_string": "probe", "new_string": "other"}),
+        ("MultiEdit", {"edits": []}),
     ],
 )
-def test_builtin_read_write_and_edit_in_scratch_are_denied_with_replacements(
-    tmp_path: Path, tool: str, extra: dict[str, object], exists: bool
+def test_builtin_read_edit_and_overwrite_in_scratch_are_denied_with_replacements(
+    tmp_path: Path, tool: str, extra: dict[str, object]
 ) -> None:
     root = _repo_with_canonical_scratch_config(tmp_path)
-    if exists:
-        _write(root / SCRATCH_PROBE)
+    _write(root / SCRATCH_PROBE)
     verdict = tool_guard_hook.decide(tool, {"file_path": str(root / SCRATCH_PROBE), **extra}, root)
 
     assert verdict is not None, tool
@@ -130,11 +128,18 @@ def test_builtin_read_write_and_edit_in_scratch_are_denied_with_replacements(
         '"file"',
         '"bodygrep"',
         "aiworkhub_worker_semantic_edit_prepare",
-        "_apply",
-        "scripts/manager_semantic_edit.py --create",
+        "aiworkhub_manager_semantic_edit_prepare/_apply",
     ):
         assert replacement in reason, (replacement, reason)
+    # NF-2026-02088: a managed repository carries no scripts/manager_semantic_edit.py.
+    assert "scripts/manager_semantic_edit.py" not in reason
     assert "unindexed" not in reason
+
+
+def test_write_that_creates_a_new_scratch_file_is_allowed(tmp_path: Path) -> None:
+    root = _repo_with_canonical_scratch_config(tmp_path)
+    tool_input = {"file_path": str(root / SCRATCH_PROBE), "content": "x = 1\n"}
+    assert tool_guard_hook.decide("Write", tool_input, root) is None
 
 
 def test_scratch_denial_is_independent_of_the_file_suffix(tmp_path: Path) -> None:

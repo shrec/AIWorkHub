@@ -13,6 +13,7 @@ input and any exception all mean no output and exit 0.
 Rules, first match wins:
 
 * R1 raw search (grep, rg, findstr, Select-String, git grep) of indexed source.
+  A searcher with no file operand that reads a pipe or stdin searches no tree.
 * R2 recursive listing (find, fd, tree, ls -R, Get-ChildItem -Recurse, dir /s)
   of an indexed directory.
 * R3 raw read (cat, head, sed, Get-Content, ...) of an indexed file.
@@ -21,8 +22,15 @@ Rules, first match wins:
 * R5 Read of an indexed file, whatever its limit or offset.
 * R6 Edit of an existing repository file.
 * R7 Write over an existing repository file; Write only creates new files.
-* R8 Read, Edit or Write (a new file included) of any path inside the
-  repo-local scratch root ``.scratch/``; checked before R5-R7.
+* R8 Read, Edit, or Write over an existing file, of any path inside the
+  repo-local scratch root ``.scratch/``; checked before R5-R7. Write that
+  creates a new scratch file is allowed, as R7 allows it elsewhere.
+
+"Indexed" is Source Graph's own membership when its canonical database
+(``.aiworkhub/source_graph/source_graph.sqlite``) holds a readable generation:
+a path that generation lists as not indexed, or omits, is unindexed. Without
+one the repository ``IndexPolicy`` (suffix, excludes, include roots) decides.
+A path that resolves outside the repository root is never an R1-R7 target.
 
 R6 and R7 leave ``.git`` and ``.aiworkhub`` alone: VCS and runtime state is not
 source the semantic editor can take over.
@@ -35,6 +43,7 @@ import fnmatch
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -128,6 +137,15 @@ _EDIT_EXEMPT_DIRS = frozenset({".git", ".aiworkhub"})
 # It is gitignored and a Source Graph include root, and ``storage_retention``
 # prunes aged session dirs under it (NF-2026-01928).
 SCRATCH_DIR = ".scratch"
+# The manager's script exists only in the AIWorkHub repository itself; a deny
+# reason names it only when the guarded root carries it (NF-2026-02088).
+_MANAGER_SCRIPT_PARTS = ("scripts", "manager_semantic_edit.py")
+# Source Graph's canonical database (``storage_registry``: source_graph) and
+# the file-row statuses that list a path without indexing it. Any other status
+# is a member: an unknown status keeps the path guarded.
+SOURCE_GRAPH_DB_PARTS = (".aiworkhub", "source_graph", "source_graph.sqlite")
+UNINDEXED_STATUSES = ("unindexed", "declared_input_unindexed", "skipped", "excluded")
+_SOURCE_GRAPH_BUSY_SECONDS = 0.25
 
 _DENIALS_PARTS = (".aiworkhub", "runtime", "tool_guard", "denials.jsonl")
 _DENIALS_ROTATE_BYTES = 4 * 1024 * 1024
@@ -174,11 +192,12 @@ _REASONS = {
         "AIWorkHub tool guard R7: Write over existing repository file {target} is denied;"
         " Write only creates new files. " + _EDIT_INSTEAD
     ),
+    # ``{script}`` is filled by ``_reason``: the manager script only where it exists.
     "R8": (
-        "AIWorkHub tool guard R8: built-in Read/Write/Edit in " + SCRATCH_DIR + "/ ({target})"
-        " is denied. Read: " + _SOURCE_GRAPH + ' mode="body", "file" or "bodygrep".'
-        " Create/edit: aiworkhub_worker_semantic_edit_prepare then _apply (worker) or"
-        " scripts/manager_semantic_edit.py --create/--path (manager)."
+        "AIWorkHub tool guard R8: built-in Read, Edit or overwrite of scratch file {target}"
+        " is denied; Write may only create one. Read: " + _SOURCE_GRAPH
+        + ' mode="body"/"file"/"bodygrep". Edit: aiworkhub_worker_semantic_edit_prepare/_apply'
+        " or aiworkhub_manager_semantic_edit_prepare/_apply{script}."
     ),
 }
 REMINDER = (
@@ -361,13 +380,16 @@ _GC_SWITCHES = ("raw", "wait", "force", "asbytestream")
 class _Segment:
     """One simple command: its argv words plus what feeds its stdin."""
 
-    __slots__ = ("words", "piped", "stdin", "inputs")
+    __slots__ = ("words", "piped", "stdin", "inputs", "redirected")
 
     def __init__(self, piped: bool) -> None:
         self.words: list[str] = []
         self.piped = piped
         self.stdin: str | None = None
         self.inputs: list[str] = []
+        # Every "< file" operand, also kept in ``inputs``: stdin, never a FILE
+        # argument. "grep -r x < a < b" redirects twice; neither is a FILE.
+        self.redirected: list[str] = []
 
     def text(self) -> str:
         return " ".join(self.words) + "\n" + (self.stdin or "")
@@ -509,6 +531,7 @@ class _Lexer:
             self.segment.words.append(word)
         elif kind == "in":
             self.segment.inputs.append(word)
+            self.segment.redirected.append(word)
         elif kind == "herestring":
             self.segment.stdin = word
         elif kind.startswith("heredoc"):
@@ -520,7 +543,11 @@ class _Lexer:
         segment = self.segment
         if segment.words or segment.inputs or segment.stdin is not None:
             self.segments.append(segment)
-        self.segment = _Segment(piped)
+            self.segment = _Segment(piped)
+        else:
+            # Nothing was read since the pipe: "a |\n  grep x" and "a | (grep x)"
+            # still feed the next command from that pipe.
+            self.segment = _Segment(piped or segment.piped)
 
     def _ampersand(self, after: str) -> None:
         at = self.at
@@ -651,6 +678,9 @@ class _Lexer:
         elif self.dialect == "bash" and text.startswith("<<", at):
             self.redirect, self.at = "heredoc", at + 2
         elif text.startswith(("<(", ">("), at):
+            if text[at] == "<":
+                # "rg foo <(git show X:p)" reads a pipe, not the tree: "-" is that stream.
+                self.segment.inputs.append("-")
             self.at = at + 1  # process substitution: "(" opens its own segment
         elif text[at] == "<":
             self.redirect = "out" if text.startswith("<&", at) else "in"
@@ -789,6 +819,89 @@ def load_index_policy(root: Path) -> IndexPolicy:
     )
 
 
+def _like_prefix(rel: str) -> str:
+    """A LIKE pattern matching every path below directory ``rel``."""
+    escaped = rel.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return escaped + "/%"
+
+
+class SourceGraphMembership:
+    """Source Graph's own answer to "is this path indexed?", read-only.
+
+    ``member`` returns True when the current generation indexes the path (a
+    directory: anything below it), False when that generation lists it as not
+    indexed or omits it, and None when no generation is readable: a missing,
+    locked or malformed database, or one whose build never finished. None
+    leaves the verdict to ``IndexPolicy``. The connection is opened lazily,
+    once per evaluation, and ``close`` releases it.
+    """
+
+    __slots__ = ("path", "_conn", "_opened")
+
+    def __init__(self, root: Path) -> None:
+        self.path = root.joinpath(*SOURCE_GRAPH_DB_PARTS)
+        self._conn: sqlite3.Connection | None = None
+        self._opened = False
+
+    def _connection(self) -> sqlite3.Connection | None:
+        if self._opened:
+            return self._conn
+        self._opened = True
+        try:
+            if not self.path.is_file():
+                return None
+            conn = sqlite3.connect(
+                self.path.as_uri() + "?mode=ro", uri=True, timeout=_SOURCE_GRAPH_BUSY_SECONDS
+            )
+        except (sqlite3.Error, OSError, ValueError):
+            return None
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            # A generation exists once a build has published ``meta.last_build``.
+            if conn.execute("SELECT 1 FROM meta WHERE key = 'last_build'").fetchone() is None:
+                conn.close()
+                return None
+        except sqlite3.Error:
+            conn.close()
+            return None
+        self._conn = conn
+        return conn
+
+    def member(self, rel: str, is_dir: bool) -> bool | None:
+        conn = self._connection()
+        if conn is None:
+            return None
+        statuses = ",".join("?" * len(UNINDEXED_STATUSES))
+        indexed = f" AND status NOT IN ({statuses}) LIMIT 1"
+        if not is_dir:
+            exact = ("SELECT 1 FROM files WHERE file_path = ?" + indexed, (rel,))
+            # A case-insensitive file system hands over the caller's spelling.
+            folded = ("SELECT 1 FROM files WHERE file_path = ? COLLATE NOCASE" + indexed, (rel,))
+        elif rel == ".":
+            exact = folded = ("SELECT 1 FROM files WHERE 1" + indexed, ())
+        else:
+            exact = (
+                "SELECT 1 FROM files WHERE file_path >= ? AND file_path < ?" + indexed,
+                (rel + "/", rel + "0"),  # "0" is the code point after "/"
+            )
+            folded = (
+                "SELECT 1 FROM files WHERE file_path LIKE ? ESCAPE '\\'" + indexed,
+                (_like_prefix(rel),),
+            )
+        try:
+            for sql, params in (exact, folded):
+                if conn.execute(sql, (*params, *UNINDEXED_STATUSES)).fetchone() is not None:
+                    return True
+        except sqlite3.Error:
+            return None
+        return False
+
+    def close(self) -> None:
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            conn.close()
+
+
 def _worktree_mirror(parts: tuple[str, ...]) -> tuple[tuple[str, ...], str] | None:
     """HEAD + 32 lowercase hex + ``worktree`` + rest, else None.
 
@@ -809,17 +922,28 @@ def _worktree_mirror(parts: tuple[str, ...]) -> tuple[tuple[str, ...], str] | No
 class _Context:
     """Resolve operands against the repository root and the current directory."""
 
-    def __init__(self, root: Path, cwd: Path, dialect: str, policy: IndexPolicy) -> None:
+    def __init__(
+        self,
+        root: Path,
+        cwd: Path | None,
+        dialect: str,
+        policy: IndexPolicy,
+        membership: SourceGraphMembership | None = None,
+    ) -> None:
         self.root = root
         self.cwd = cwd
         self.dialect = dialect
         self.policy = policy
+        # Callers that omit it still consult Source Graph's own membership for
+        # ``root``; its connection opens lazily, only when a verdict needs it.
+        self.membership = SourceGraphMembership(root) if membership is None else membership
 
     def fork(self, dialect: str | None = None) -> _Context:
-        return _Context(self.root, self.cwd, dialect or self.dialect, self.policy)
+        return _Context(self.root, self.cwd, dialect or self.dialect, self.policy, self.membership)
 
     def moved(self, operand: str) -> _Context:
         scope = self.fork()
+        # An unresolvable base keeps the retained cwd (fail closed).
         scope.cwd = self.path(operand) or self.cwd
         return scope
 
@@ -842,7 +966,10 @@ class _Context:
             text = os.path.expanduser(text)
         candidate = Path(text)
         if not candidate.is_absolute():
-            candidate = (base or self.cwd) / candidate
+            anchor = base if base is not None else self.cwd
+            if anchor is None:
+                return None
+            candidate = anchor / candidate
         try:
             return Path(os.path.realpath(candidate))
         except (OSError, ValueError):
@@ -870,11 +997,20 @@ class _Context:
             rel = "/".join(classified)
             if not index_admits(policy, rel, is_dir=is_dir, ignored=False):
                 return None
+            # Source Graph's own generation outranks the policy: a declared but
+            # not (yet) indexed path is unindexed, and a member needs no git.
+            member = self.membership.member(rel, is_dir)
+            if member is False:
+                return None
             # git is asked only when its answer can change the verdict; it
             # reports a path below an ignored directory as ignored too.
-            if not index_admits(policy, rel, is_dir=is_dir, ignored=True) and _git_ignored(path):
+            if (
+                member is None
+                and not index_admits(policy, rel, is_dir=is_dir, ignored=True)
+                and _git_ignored(path)
+            ):
                 return None
-        elif not is_dir:
+        elif not is_dir or self.membership.member(".", True) is False:
             return None
         # Keep the denied path so the reason derives this worktree, not a cell.
         return "/".join(parts) or "."
@@ -942,6 +1078,8 @@ class _Context:
             target = "~"
         if target is None or target == "-":
             return
+        # An unresolvable target ("$TMPDIR/x" with TMPDIR unset) is an unknown
+        # place, not an outside one: every rule keeps the retained cwd.
         self.cwd = self.path(target) or self.cwd
 
 
@@ -1066,6 +1204,10 @@ def _command_words(words: list[str], dialect: str) -> list[str]:
     return []
 
 
+# GNU grep searches recursively only on request, and then never reads stdin.
+_GREPS = frozenset({"grep", "egrep", "fgrep"})
+
+
 def _search_terms(name: str, args: list[str]) -> tuple[str, list[str], bool] | None:
     """``(pattern, operands, recursive)`` of a search command, or None if it searches nothing."""
 
@@ -1095,7 +1237,7 @@ def _search_terms(name: str, args: list[str]) -> tuple[str, list[str], bool] | N
             return None
         patterns.append(operands.pop(0))
     recursive = True
-    if name in ("grep", "egrep", "fgrep"):
+    if name in _GREPS:
         recursive = bool(flags & {"-r", "-R", "--recursive", "--dereference-recursive"}) or any(
             option in ("-d", "--directories") and value == "recurse" for option, value in values
         )
@@ -1133,7 +1275,7 @@ def _findstr_terms(args: list[str]) -> tuple[str, list[str], bool] | None:
 
 
 def _search_verdict(
-    ctx: _Context, segment: _Segment, terms: tuple[str, list[str], bool]
+    ctx: _Context, segment: _Segment, name: str, terms: tuple[str, list[str], bool]
 ) -> tuple[str, str, str] | None:
     pattern, operands, recursive = terms
     explicit = [operand for operand in operands + segment.inputs if operand]
@@ -1141,8 +1283,16 @@ def _search_verdict(
         target = ctx.indexed(operand) if operand != "-" else None
         if target:
             return ("R1", target, pattern)
-    # A pipe consumer with no file operand searches its stdin, not the tree.
-    if explicit or segment.piped or segment.stdin is not None or not recursive:
+    files = list(explicit)
+    for redirected in segment.redirected:
+        if redirected in files:
+            files.remove(redirected)  # "< file" feeds stdin; it is no FILE operand
+    if files or not recursive:
+        return None
+    # A pipe consumer with no file operand searches its stdin, not the tree;
+    # a recursive grep with no FILE ignores stdin and searches the directory.
+    stdin = segment.piped or segment.stdin is not None or bool(segment.redirected)
+    if stdin and name not in _GREPS:
         return None
     target = ctx.indexed_rel(ctx.cwd)
     return ("R1", target, pattern) if target else None
@@ -1425,7 +1575,7 @@ def _command_verdict(
         if name == "rg" and "--files" in args:
             return _listing_verdict(ctx, _gnu(args, _RG_SHORT, _RG_LONG)[2])
         terms = _search_terms(name, args)
-        return None if terms is None else _search_verdict(ctx, segment, terms)
+        return None if terms is None else _search_verdict(ctx, segment, name, terms)
     if name == "git":
         return _git_verdict(ctx, args)
     if name in _LISTERS:
@@ -1507,8 +1657,12 @@ def _tool_verdict(
     if not isinstance(file_path, str) or not file_path.strip():
         return None
     if tool_name in ("Read", "Edit", "MultiEdit", "Write"):
-        scratch = ctx.scratch(ctx.path(file_path))
-        if scratch is not None:
+        path = ctx.path(file_path)
+        scratch = ctx.scratch(path)
+        # Write that creates a new scratch file is the create path R7 allows
+        # everywhere; reading, editing and overwriting stay with the tools.
+        creates = tool_name == "Write" and path is not None and not os.path.lexists(path)
+        if scratch is not None and not creates:
             return "R8", scratch, ""
     if tool_name == "Read":
         target = ctx.indexed_file(file_path, glob=False)
@@ -1546,13 +1700,16 @@ def _mirror_reason(rule: str, rest: str, worktree: str) -> str:
     return _clip(text, REASON_MAX_CHARS)
 
 
-def _reason(rule: str, target: str, detail: str) -> str:
+def _reason(rule: str, target: str, detail: str, manager_script: bool = False) -> str:
     mirror = _worktree_mirror(tuple(target.split("/")))
     if mirror is not None:
         rest, worktree = mirror
         return _mirror_reason(rule, "/".join(rest) or ".", worktree)
     # R8 offers no unindexed fallback: no seat needs a built-in Read in scratch.
     template = _REASONS[rule] + ("" if rule == "R8" else _UNINDEXED)
+    template = template.replace(
+        "{script}", " or " + "/".join(_MANAGER_SCRIPT_PARTS) if manager_script else ""
+    )
     pattern = _CONTROL.sub(" ", detail).strip() if rule == "R1" else ""
     fixed = len(template.format(target="", pattern='""'))
     slots = template.count("{target}") + template.count("{pattern}")
@@ -1578,12 +1735,17 @@ def _evaluate(
     if isinstance(cwd, (str, Path)) and str(cwd).strip():
         where = Path(os.path.realpath(base / cwd))
     dialect = "pwsh" if tool_name == "PowerShell" else "bash"
-    ctx = _Context(base, where, dialect, load_index_policy(base))
-    verdict = _tool_verdict(ctx, tool_name, tool_input)
+    membership = SourceGraphMembership(base)
+    try:
+        ctx = _Context(base, where, dialect, load_index_policy(base), membership)
+        verdict = _tool_verdict(ctx, tool_name, tool_input)
+    finally:
+        membership.close()
     if verdict is None:
         return None
     rule, target, detail = verdict
-    return rule, _reason(rule, target, detail), target
+    script = rule == "R8" and base.joinpath(*_MANAGER_SCRIPT_PARTS).is_file()
+    return rule, _reason(rule, target, detail, script), target
 
 
 def decide(
@@ -1674,6 +1836,9 @@ __all__ = [
     "REMINDER",
     "REMINDER_MAX_BYTES",
     "SCRATCH_DIR",
+    "SOURCE_GRAPH_DB_PARTS",
+    "SourceGraphMembership",
+    "UNINDEXED_STATUSES",
     "decide",
     "glob_ignored",
     "index_admits",
