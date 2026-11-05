@@ -16,7 +16,9 @@ import re
 import secrets
 import stat
 import tempfile
+import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -249,9 +251,92 @@ def bridge_root() -> Path:
     return root.resolve(strict=False)
 
 
-def _repo_id(repo: Path) -> str:
+# NF-2026-02066: ``inspect_repository`` costs ~2 s per call on Windows
+# (pathlib.resolve), and bridge_readiness asked for the same repo_id six times
+# per dashboard snapshot.  The id is memoized per root under a stat
+# fingerprint of the root, hub directory and manifest (same shape as the
+# task_store readiness memo, NF-2026-02059); any fingerprint change, a stat
+# failure, a new ``inspect_repository`` callable or an expired entry runs the
+# full identity verification again.  Failures are never memoized.
+REPO_ID_MEMO_TTL_SECONDS = 60.0
+_REPO_ID_MEMO_MAX_ENTRIES = 32
+_REPO_ID_MEMO_LOCK = threading.Lock()
+_REPO_ID_MEMO: "OrderedDict[str, tuple[float, tuple[Any, ...], str]]" = OrderedDict()
+
+
+def reset_repo_id_memo() -> None:
+    """Drop every memoized repo_id (tests and explicit refresh)."""
+
+    with _REPO_ID_MEMO_LOCK:
+        _REPO_ID_MEMO.clear()
+
+
+def _repo_id_fingerprint(repo: Path) -> tuple[Any, ...] | None:
+    parts: list[Any] = [repository_state.inspect_repository]
+    for path in (
+        repo,
+        repo / repository_state.HUB_DIRNAME,
+        repo / repository_state.PROJECT_MANIFEST_REL,
+    ):
+        try:
+            info = os.lstat(path)
+        except (OSError, ValueError):
+            return None
+        parts.append(
+            (
+                info.st_mode,
+                info.st_ino,
+                info.st_dev,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            )
+        )
+    # inspect_repository also escape/type-checks every hub child: one swapped
+    # for a symlink or a non-directory must run the verification again.
+    hub = repo / repository_state.HUB_DIRNAME
+    for rel in (
+        *repository_state.DURABLE_LAYOUT.values(),
+        repository_state.RUNTIME_DIRNAME,
+    ):
+        try:
+            child = os.lstat(hub / rel)
+        except (OSError, ValueError):
+            parts.append(None)
+            continue
+        parts.append((child.st_mode, child.st_ino, child.st_dev))
+    return tuple(parts)
+
+
+def _repo_id_uncached(repo: Path) -> str:
     state = repository_state.inspect_repository(repo)
     return state.manifest.repo_id
+
+
+def _repo_id(repo: Path) -> str:
+    try:
+        key = os.path.abspath(os.fspath(repo))
+    except (TypeError, ValueError):
+        return _repo_id_uncached(repo)
+    before = _repo_id_fingerprint(Path(key))
+    if before is None:
+        return _repo_id_uncached(repo)
+    now = time.monotonic()
+    with _REPO_ID_MEMO_LOCK:
+        entry = _REPO_ID_MEMO.get(key)
+    if entry is not None:
+        stored_at, fingerprint, repo_id = entry
+        if fingerprint == before and now - stored_at < REPO_ID_MEMO_TTL_SECONDS:
+            return repo_id
+    repo_id = _repo_id_uncached(repo)
+    # Memoize only when nothing changed while the verification ran.
+    if _repo_id_fingerprint(Path(key)) == before:
+        with _REPO_ID_MEMO_LOCK:
+            _REPO_ID_MEMO[key] = (now, before, repo_id)
+            _REPO_ID_MEMO.move_to_end(key)
+            while len(_REPO_ID_MEMO) > _REPO_ID_MEMO_MAX_ENTRIES:
+                _REPO_ID_MEMO.popitem(last=False)
+    return repo_id
 
 
 def discover_editor_models(reported: Iterable[Any]) -> list[str]:

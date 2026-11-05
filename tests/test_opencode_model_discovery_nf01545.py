@@ -21,10 +21,12 @@ def _clean_probe_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     xdg = tmp_path / "xdg_empty"
     xdg.mkdir()
     monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    repo_policy.reset_provider_probe_caches()
     with repo_policy._OPENCODE_PROBE_LOCK:
         repo_policy._OPENCODE_LAST_GOOD_MODELS.clear()
         repo_policy._OPENCODE_LAST_PROBE.clear()
     yield
+    repo_policy.reset_provider_probe_caches()
     with repo_policy._OPENCODE_PROBE_LOCK:
         repo_policy._OPENCODE_LAST_GOOD_MODELS.clear()
         repo_policy._OPENCODE_LAST_PROBE.clear()
@@ -198,6 +200,10 @@ def test_provider_status_exposes_opencode_models_probe(
     assert first["opencode_models_probe"] == {"state": "ok", "count": 2}
     assert first["provider_observed_models"] == _ROWS
 
+    # NF-2026-02066: inside the TTL the ok probe is served from the cache;
+    # dropping it makes the next call re-probe exactly as before.
+    assert status() == first
+    repo_policy.reset_provider_probe_caches()
     second = status()
     assert second["opencode_models_probe"] == {
         "state": "failed",

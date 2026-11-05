@@ -185,7 +185,20 @@ def _resolve_existing_dir(path: Path) -> Path:
     return resolved
 
 
-def _assert_relative_child(root: Path, relative: str | Path) -> Path:
+def _assert_relative_child(
+    root: Path,
+    relative: str | Path,
+    *,
+    root_memo: dict[Path, Path] | None = None,
+) -> Path:
+    """Return ``root / relative`` on the mapped basis, refusing any escape.
+
+    ``root_memo`` lets one caller map the same ``root`` once for several
+    children (NF-2026-02066: ``inspect_repository`` resolved its root per
+    candidate).  It is per-call scratch, never shared across calls, and the
+    mapped root is computed at exactly the point the uncached path computes it,
+    so refusals and their order are unchanged.
+    """
     rel = Path(relative)
     if rel.is_absolute() or "\x00" in rel.as_posix() or ".." in rel.parts:
         raise PathEscapeError(f"path_escape:{relative}")
@@ -217,7 +230,13 @@ def _assert_relative_child(root: Path, relative: str | Path) -> Path:
             resolved = resolved / name
         return resolved
 
-    resolved_root = mapped(root)
+    memoized_root = root_memo.get(root) if root_memo is not None else None
+    if memoized_root is None:
+        resolved_root = mapped(root)
+        if root_memo is not None:
+            root_memo[root] = resolved_root
+    else:
+        resolved_root = memoized_root
     resolved = mapped(candidate)
     if resolved == resolved_root or resolved_root in resolved.parents:
         return resolved
@@ -432,16 +451,20 @@ def inspect_repository(
         if root is not None
         else resolve_repository_root(cwd=cwd, env=env, require_manifest=False)
     )
-    hub = _assert_relative_child(repo, HUB_DIRNAME)
-    manifest_path = _assert_relative_child(repo, PROJECT_MANIFEST_REL)
+    # One mapped root per base for this call (was one resolve per candidate).
+    root_memo: dict[Path, Path] = {}
+    hub = _assert_relative_child(repo, HUB_DIRNAME, root_memo=root_memo)
+    manifest_path = _assert_relative_child(
+        repo, PROJECT_MANIFEST_REL, root_memo=root_memo
+    )
     manifest = _read_manifest(manifest_path)
     if expected_repo_id is not None and manifest.repo_id != expected_repo_id:
         raise ManifestInvalidError("repo_id_mismatch")
     durable_paths = {
-        name: _assert_relative_child(hub, rel)
+        name: _assert_relative_child(hub, rel, root_memo=root_memo)
         for name, rel in DURABLE_LAYOUT.items()
     }
-    runtime_path = _assert_relative_child(hub, RUNTIME_DIRNAME)
+    runtime_path = _assert_relative_child(hub, RUNTIME_DIRNAME, root_memo=root_memo)
     for name, path in durable_paths.items():
         if path.exists() and not path.is_dir():
             raise ManifestInvalidError(f"durable_path_not_directory:{name}")

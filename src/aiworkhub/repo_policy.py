@@ -729,6 +729,245 @@ _OPENCODE_LAST_PROBE: dict[str, dict[str, Any]] = {}
 _OPENCODE_PROBE_LOCAL = threading.local()
 
 
+# NF-2026-02066: the full dashboard snapshot is polled, and every poll re-ran
+# the ``opencode models`` subprocess (6.2 s) and deepseek credential_status.
+# Both are now served from an in-process TTL cache.  The first call for a key
+# is synchronous and returns exactly what the uncached path returns; inside
+# the TTL the cached value is served; after it expires the stale value is
+# served while exactly one background refresh per key runs (single-flight).
+# A value older than ``PROVIDER_PROBE_MAX_STALE_SECONDS`` is never served: the
+# call recomputes synchronously instead.  Nothing is written to disk.
+PROVIDER_PROBE_CACHE_TTL_SECONDS = 60.0
+PROVIDER_PROBE_MAX_STALE_SECONDS = 600.0
+_PROVIDER_PROBE_CACHE_MAX_ENTRIES = 64
+
+
+class _TtlSingleFlightCache:
+    """Bounded TTL cache with stale-while-refresh and single-flight refresh."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self._lock = threading.Lock()
+        self._entries: dict[Any, tuple[float, float, Any]] = {}
+        self._refreshing: set[Any] = set()
+        self._generation = 0
+        self.hits = 0
+        self.misses = 0
+        self.stale_served = 0
+        self.refreshes_started = 0
+
+    def reset(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            self._refreshing.clear()
+            self._generation += 1
+            self.hits = self.misses = self.stale_served = self.refreshes_started = 0
+
+    def observed_at(self, key: Any) -> float | None:
+        """Wall-clock time the cached value for ``key`` was observed."""
+
+        with self._lock:
+            entry = self._entries.get(key)
+        return entry[1] if entry is not None else None
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "name": self.name,
+                "entries": len(self._entries),
+                "refreshing": len(self._refreshing),
+                "hits": self.hits,
+                "misses": self.misses,
+                "stale_served": self.stale_served,
+                "refreshes_started": self.refreshes_started,
+                "ttl_seconds": PROVIDER_PROBE_CACHE_TTL_SECONDS,
+            }
+
+    def _store(self, key: Any, value: Any, generation: int) -> None:
+        with self._lock:
+            if generation != self._generation:
+                return
+            self._entries.pop(key, None)
+            self._entries[key] = (time.monotonic(), time.time(), value)
+            while len(self._entries) > _PROVIDER_PROBE_CACHE_MAX_ENTRIES:
+                self._entries.pop(next(iter(self._entries)))
+
+    def _refresh(
+        self,
+        key: Any,
+        compute: Any,
+        cacheable: Any,
+        generation: int,
+    ) -> None:
+        ok = False
+        value: Any = None
+        try:
+            value = compute()
+            ok = bool(cacheable(value))
+        except Exception:  # noqa: BLE001 - keep serving the last good value
+            ok = False
+        finally:
+            # Publish before clearing the flag, so a get() in between never sees
+            # the stale entry with no refresh in flight and starts a second one.
+            if ok:
+                self._store(key, value, generation)
+            with self._lock:
+                self._refreshing.discard(key)
+
+    def get(self, key: Any, compute: Any, cacheable: Any = None) -> Any:
+        """Return a deep copy of the cached or freshly computed value."""
+
+        accept = cacheable if cacheable is not None else (lambda _value: True)
+        now = time.monotonic()
+        with self._lock:
+            entry = self._entries.get(key)
+            generation = self._generation
+            start_refresh = False
+            if entry is not None:
+                age = now - entry[0]
+                if age < PROVIDER_PROBE_CACHE_TTL_SECONDS:
+                    self.hits += 1
+                    return deepcopy(entry[2])
+                if age < PROVIDER_PROBE_MAX_STALE_SECONDS:
+                    self.stale_served += 1
+                    if key not in self._refreshing:
+                        self._refreshing.add(key)
+                        self.refreshes_started += 1
+                        start_refresh = True
+                else:
+                    entry = None
+            if entry is None:
+                self.misses += 1
+        if entry is not None:
+            if start_refresh:
+                threading.Thread(
+                    target=self._refresh,
+                    args=(key, compute, accept, generation),
+                    name=f"aiworkhub-{self.name}-refresh",
+                    daemon=True,
+                ).start()
+            return deepcopy(entry[2])
+        value = compute()
+        if accept(value):
+            self._store(key, value, generation)
+        return deepcopy(value)
+
+
+_OPENCODE_MODELS_CACHE = _TtlSingleFlightCache("opencode_models")
+_DEEPSEEK_STATUS_CACHE = _TtlSingleFlightCache("deepseek_credential_status")
+_PROBE_CACHE_ENV_KEYS: tuple[str, ...] = (
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "OPENCODE_CONFIG",
+    "OPENCODE_CONFIG_DIR",
+    "PATH",
+)
+
+
+def reset_provider_probe_caches() -> None:
+    """Drop the opencode-models and deepseek-status caches (tests, refresh)."""
+
+    _OPENCODE_MODELS_CACHE.reset()
+    _DEEPSEEK_STATUS_CACHE.reset()
+
+
+def provider_probe_cache_stats() -> list[dict[str, Any]]:
+    """Measured hit/miss/stale counters of the provider probe caches."""
+
+    return [_OPENCODE_MODELS_CACHE.stats(), _DEEPSEEK_STATUS_CACHE.stats()]
+
+
+def _stat_token(path: str | os.PathLike[str] | None) -> tuple[Any, ...] | None:
+    if path is None:
+        return None
+    try:
+        info = os.stat(path)
+    except (OSError, ValueError, TypeError):
+        return ("absent",)
+    return (info.st_mode, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _probe_env_token() -> tuple[str | None, ...]:
+    return tuple(os.environ.get(name) for name in _PROBE_CACHE_ENV_KEYS)
+
+
+def _opencode_models_with_record(
+    executable: str | None,
+) -> tuple[list[str], dict[str, Any] | None]:
+    """Uncached listing plus the probe record this thread's own call published."""
+
+    _OPENCODE_PROBE_LOCAL.record = None
+    listed = _list_opencode_models(executable)
+    record = getattr(_OPENCODE_PROBE_LOCAL, "record", None)
+    return listed, (dict(record) if record is not None else None)
+
+
+def _cached_opencode_models(
+    executable: str | None,
+) -> tuple[list[str], dict[str, Any] | None]:
+    """TTL-cached :func:`_opencode_models_with_record`.
+
+    Only a successful probe is cached: a failed one is rechecked on the next
+    call, never replayed.  The key holds the executable, its stat, the config
+    environment, and the identity of every callable the uncached path uses, so
+    a monkeypatched probe bypasses the cache.
+    """
+
+    if not isinstance(executable, str) or not executable.strip():
+        return _opencode_models_with_record(executable)
+    key = (
+        executable,
+        _stat_token(executable),
+        _probe_env_token(),
+        _list_opencode_models,
+        _opencode_models_probe_once,
+        subprocess.run,
+        opencode_auth.owner_custom_provider_models,
+    )
+
+    def cacheable(value: tuple[list[str], dict[str, Any] | None]) -> bool:
+        record = value[1]
+        return isinstance(record, Mapping) and record.get("state") == "ok"
+
+    value = _OPENCODE_MODELS_CACHE.get(
+        key, lambda: _opencode_models_with_record(executable), cacheable
+    )
+    listed, record = value
+    _OPENCODE_PROBE_LOCAL.record = dict(record) if record is not None else None
+    return list(listed), record
+
+
+def _cached_deepseek_credential_status(repo_root: Path) -> Mapping[str, Any]:
+    """TTL-cached ``deepseek_credentials.credential_status(repo=repo_root)``."""
+
+    if deepseek_credentials is None:
+        raise RuntimeError("deepseek_credentials_unavailable")
+    try:
+        credential_file: Path | None = deepseek_credentials.credential_path()
+    except (OSError, RuntimeError, ValueError):
+        credential_file = None
+    if credential_file is None:
+        return deepseek_credentials.credential_status(repo=repo_root)
+    key = (
+        os.path.abspath(os.fspath(repo_root)),
+        str(credential_file),
+        _stat_token(credential_file),
+        _probe_env_token(),
+        os.environ.get(deepseek_credentials.CREDENTIAL_PATH_ENV),
+        deepseek_credentials.credential_status,
+        deepseek_credentials.load_credential,
+        runtime_adapters.resolve_executable,
+    )
+    status: Mapping[str, Any] = _DEEPSEEK_STATUS_CACHE.get(
+        key, lambda: deepseek_credentials.credential_status(repo=repo_root)
+    )
+    return status
+
+
 def _opencode_probe_record(executable: str | None) -> dict[str, Any] | None:
     """Return a copy of the last ``opencode models`` probe outcome, if any."""
 
@@ -885,7 +1124,7 @@ def _provider_status(
     readiness: Mapping[str, Any] | None = None
     try:
         if adapter_id == runtime_adapters.DEEPSEEK_COPILOT_ADAPTER and deepseek_credentials:
-            readiness = deepseek_credentials.credential_status(repo=repo_root)
+            readiness = _cached_deepseek_credential_status(repo_root)
         elif adapter_id == runtime_adapters.GLM_COPILOT_ADAPTER and glm_credentials:
             readiness = glm_credentials.credential_status(repo=repo_root)
         elif adapter_id == runtime_adapters.DEEPSEEK_VSCODE_LM_ADAPTER and vscode_lm_bridge:
@@ -1011,10 +1250,9 @@ def _provider_status(
         and result["installed"]
         and "observed_models" not in result
     ):
-        _OPENCODE_PROBE_LOCAL.record = None
-        listed = _list_opencode_models(resolution.executable)
-        # The record this thread's own call published, never a concurrent one.
-        probe_record = getattr(_OPENCODE_PROBE_LOCAL, "record", None)
+        # The record this thread's own call published (or the cached one that
+        # call published), never a concurrent one.
+        listed, probe_record = _cached_opencode_models(resolution.executable)
         if probe_record is not None:
             result["opencode_models_probe"] = dict(probe_record)
         provider_observed_models = listed[:128]

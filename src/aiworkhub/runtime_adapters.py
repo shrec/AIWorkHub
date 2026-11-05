@@ -16,8 +16,10 @@ import re
 import shutil
 import stat
 import sys
+import threading
 import time
 import zoneinfo
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -1186,7 +1188,135 @@ def _resolve_codex_windows_stable_shim(
     return True, selected
 
 
+# NF-2026-02066: ``shutil.which`` walks PATH x PATHEXT on every call (17.6k
+# access checks per full dashboard snapshot on Windows).  Resolutions are
+# memoized in-process for a short, named TTL under a key holding every input
+# the uncached path reads -- the adapter, PATH, PATHEXT, the explicit override,
+# the home/profile variables the extension-root discovery reads, the platform,
+# and the identity of ``shutil.which``/``os.access`` and of this module's own
+# discovery helpers -- so a test that monkeypatches any of them, or PATH,
+# bypasses the memo without a reset.  A memoized success is re-verified on
+# every hit (still a regular executable file) and re-resolved when it is not.
+EXECUTABLE_RESOLUTION_TTL_SECONDS = 60.0
+_EXECUTABLE_RESOLUTION_MAX_ENTRIES = 128
+_EXECUTABLE_RESOLUTION_ENV_KEYS: tuple[str, ...] = (
+    "PATH",
+    "PATHEXT",
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "XDG_DATA_HOME",
+)
+_EXECUTABLE_RESOLUTION_HELPERS: tuple[str, ...] = (
+    "_resolve_executable_uncached",
+    "_resolve_override",
+    "_validate_override_mapping",
+    "_resolve_kilo_extension_executable",
+    "_default_kilo_extension_roots",
+    "_resolve_codex_windows_stable_shim",
+    "_is_snap_launcher",
+    "_authenticate_classic_snap_opencode",
+    "_is_linux_host",
+    "OPENCODE_SNAP_BIN",
+)
+_EXECUTABLE_RESOLUTION_LOCK = threading.Lock()
+_EXECUTABLE_RESOLUTION_MEMO: "OrderedDict[tuple[Any, ...], tuple[float, ExecutableResolution]]" = (
+    OrderedDict()
+)
+
+
+def reset_executable_resolution_cache() -> None:
+    """Drop every memoized executable resolution (tests and explicit refresh)."""
+
+    with _EXECUTABLE_RESOLUTION_LOCK:
+        _EXECUTABLE_RESOLUTION_MEMO.clear()
+
+
+def _executable_resolution_key(
+    adapter_id: str, executable_overrides: ExecutableOverrides | None
+) -> tuple[Any, ...] | None:
+    """Return the memo key, or None when an input cannot be keyed exactly."""
+
+    override: Any = None
+    if executable_overrides is not None:
+        if not isinstance(executable_overrides, Mapping):
+            return None
+        try:
+            override = tuple(
+                sorted(
+                    (str(key), type(value).__name__, os.fspath(value))
+                    for key, value in executable_overrides.items()
+                )
+            )
+        except (TypeError, ValueError):
+            return None
+    # The callables themselves (hashed by identity) are held in the key, never
+    # their id(): a freed monkeypatch fake could hand its id to a new one.
+    module_globals = globals()
+    helpers = tuple(module_globals.get(name) for name in _EXECUTABLE_RESOLUTION_HELPERS)
+    return (
+        adapter_id,
+        ADAPTER_EXECUTABLES.get(adapter_id),
+        tuple(os.environ.get(name) for name in _EXECUTABLE_RESOLUTION_ENV_KEYS),
+        override,
+        # Platform branches all go through platform_io (no raw sys.platform).
+        platform_io.is_windows(),
+        platform_io.is_linux(),
+        os.name,
+        shutil.which,
+        os.access,
+        Path.resolve,
+        Path.is_file,
+        Path.home,
+        helpers,
+    )
+
+
+def _memoized_resolution_still_valid(resolution: ExecutableResolution) -> bool:
+    if not resolution.ok:
+        return True
+    executable = resolution.executable
+    if not isinstance(executable, str) or not executable:
+        return False
+    try:
+        return os.path.isfile(executable) and os.access(executable, os.X_OK)
+    except (OSError, ValueError):
+        return False
+
+
 def resolve_executable(
+    adapter_id: str,
+    executable_overrides: ExecutableOverrides | None = None,
+) -> ExecutableResolution:
+    """Memoized :func:`_resolve_executable_uncached` (identical results).
+
+    The memo is in-process only and bounded in entries and age
+    (``EXECUTABLE_RESOLUTION_TTL_SECONDS``).
+    """
+
+    key = _executable_resolution_key(adapter_id, executable_overrides)
+    if key is None:
+        return _resolve_executable_uncached(adapter_id, executable_overrides)
+    now = time.monotonic()
+    with _EXECUTABLE_RESOLUTION_LOCK:
+        entry = _EXECUTABLE_RESOLUTION_MEMO.get(key)
+    if entry is not None:
+        stored_at, memoized = entry
+        if now - stored_at < EXECUTABLE_RESOLUTION_TTL_SECONDS and (
+            _memoized_resolution_still_valid(memoized)
+        ):
+            return memoized
+    resolution = _resolve_executable_uncached(adapter_id, executable_overrides)
+    with _EXECUTABLE_RESOLUTION_LOCK:
+        _EXECUTABLE_RESOLUTION_MEMO[key] = (now, resolution)
+        _EXECUTABLE_RESOLUTION_MEMO.move_to_end(key)
+        while len(_EXECUTABLE_RESOLUTION_MEMO) > _EXECUTABLE_RESOLUTION_MAX_ENTRIES:
+            _EXECUTABLE_RESOLUTION_MEMO.popitem(last=False)
+    return resolution
+
+
+def _resolve_executable_uncached(
     adapter_id: str,
     executable_overrides: ExecutableOverrides | None = None,
 ) -> ExecutableResolution:
