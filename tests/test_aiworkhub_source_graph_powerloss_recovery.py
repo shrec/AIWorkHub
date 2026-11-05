@@ -1711,6 +1711,9 @@ class _ScriptedRefreshEvent:
         self._ticks = ticks
         self._on_wait = on_wait
         self.timeouts: list[float] = []
+        # One wait per loop tick, as this double models: no handoff-poll
+        # slicing of the tick's timeout (NF-2026-02081).
+        daemon._handoff_poll_seconds = float("inf")
 
     def wait(self, timeout=None):
         self.timeouts.append(timeout)

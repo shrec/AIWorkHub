@@ -37,15 +37,56 @@ def _detail(payload: Mapping[str, Any]) -> str:
     return "ok=false"
 
 
+def _source_graph_generation_problem(result: Mapping[str, Any]) -> str | None:
+    """Name a never-built or stale Source Graph index (NF-2026-02081).
+
+    Only a payload carrying the canonical-generation projection
+    (``readable_generation``) is judged. An index that has never produced a
+    readable generation, or whose generation is older than the stale threshold,
+    is a problem even when the writer process itself answers ``ok``.
+    """
+    if "readable_generation" not in result:
+        return None
+    if result.get("readable_generation") is not True:
+        detail = result.get("generation_read_error") or result.get("status") or "unknown"
+        return _bounded(f"source_graph_never_built: no readable generation ({detail})")
+    age = result.get("index_age_seconds")
+    if isinstance(age, bool) or not isinstance(age, (int, float)):
+        return None
+    threshold = result.get("stale_after_seconds")
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or threshold <= 0:
+        # An unregistered daemon reports no threshold; judge it against the
+        # daemon's own default instead of skipping the check.
+        from .source_graph_daemon import (
+            DEFAULT_REFRESH_INTERVAL_SECONDS,
+            DEFAULT_STALE_MULTIPLIER,
+            MIN_STALE_AFTER_SECONDS,
+        )
+
+        threshold = max(
+            MIN_STALE_AFTER_SECONDS,
+            DEFAULT_REFRESH_INTERVAL_SECONDS * DEFAULT_STALE_MULTIPLIER,
+        )
+    if float(age) > float(threshold):
+        return _bounded(
+            f"source_graph_stale: generation age {float(age):.0f}s exceeds {float(threshold):.0f}s"
+        )
+    return None
+
+
 def _problem_summary(result: Mapping[str, Any]) -> str | None:
     """Return the excerpt for a failing probe result, or None when it is healthy."""
     if result.get("ok") is False:
-        return _detail(result)
+        detail = _detail(result)
+        if detail != "ok=false":
+            return detail
+        generation = _source_graph_generation_problem(result)
+        return generation if generation is not None else detail
     for key in NESTED_PROBE_KEYS:
         nested = result.get(key)
         if isinstance(nested, Mapping) and nested.get("ok") is False:
             return _bounded(f"{key}: {_detail(nested)}")
-    return None
+    return _source_graph_generation_problem(result)
 
 
 def _entry(name: str, state: str, summary: str) -> dict[str, Any]:

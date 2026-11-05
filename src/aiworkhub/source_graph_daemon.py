@@ -40,6 +40,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -99,6 +100,20 @@ _BUILD_OUTPUT_DRAIN_SECONDS = 5.0
 # for a loaded host. A thread still alive after this wait is never reported
 # stopped and stays registered.
 _STOP_DAEMON_WAIT_SECONDS = 30.0
+
+# NF-2026-02081: a refresh that lands in STANDBY (another process holds the
+# writer lease) hands its request to the holder and waits at most this long for
+# a generation that finished after the request, taking the lease over whenever
+# it is free. It never reports ``succeeded`` on an older generation; past the
+# bound it fails as ``standby_holder_did_not_refresh`` naming the holder.
+DEFAULT_STANDBY_REFRESH_WAIT_SECONDS = 120.0
+_STANDBY_POLL_SECONDS = 0.5
+# The idle writer loop waits in slices of this length and checks the handoff
+# record between them, so a lease holder sees a standby request within about
+# one slice instead of after a whole refresh interval.
+_REFRESH_HANDOFF_POLL_SECONDS = 1.0
+STANDBY_HOLDER_DID_NOT_REFRESH = "standby_holder_did_not_refresh"
+REFRESH_HANDOFF_FILE = "refresh-handoff.json"
 
 # Writer-loop phases that explain who consumes a queued refresh job.
 _LOOP_PHASE_WAITING = "waiting"
@@ -555,6 +570,151 @@ def _repo_has_readable_generation(repo_root: Path | str) -> bool:
         return False
 
 
+def _parse_utc(text: str) -> datetime | None:
+    """Parse an ISO timestamp as an aware UTC datetime; None when unusable."""
+    if not text:
+        return None
+    try:
+        value = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _generation_finished_after(repo_root: Path | str, requested_at: str) -> str:
+    """``finished_at`` of the committed generation iff it finished after the request.
+
+    Empty when there is no generation, it is a recorded failed build, it is
+    unreadable, or it is not newer than ``requested_at`` -- each of which a
+    refresh must never report as ``succeeded`` (NF-2026-02081).
+    """
+    requested = _parse_utc(requested_at)
+    if requested is None:
+        return ""
+    try:
+        db_path = source_graph.resolve_db_path(Path(repo_root).resolve())
+        if not db_path.exists():
+            return ""
+        rows = _read_canonical_meta_readonly(repo_root, db_path)
+        payload = json.loads(rows.get("last_build") or "{}")
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        json.JSONDecodeError,
+        sqlite3.Error,
+        source_graph.SourceGraphError,
+    ):
+        return ""
+    if not isinstance(payload, dict) or payload.get("status") == "failed":
+        return ""
+    finished_at = str(payload.get("finished_at") or "")
+    finished = _parse_utc(finished_at)
+    if finished is None or finished <= requested:
+        return ""
+    return finished_at
+
+
+def _pid_liveness(pid: Any) -> str:
+    """``alive``/``dead``/``unknown`` for one pid, never signalling it."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return "unknown"
+    if pid == os.getpid():
+        return "alive"
+    if platform_io.is_windows():
+        try:
+            return "alive" if platform_io.windows_pid_is_alive(pid) else "dead"
+        except (OSError, ValueError, TypeError):
+            return "unknown"
+    try:
+        # Signal 0 performs only the existence/permission check on POSIX.
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "dead"
+    except PermissionError:
+        return "alive"
+    except OSError:
+        return "unknown"
+    return "alive"
+
+
+def _standby_lease_holder(repo_root: Path | str) -> dict[str, Any]:
+    """Whether the writer lease is held right now, and by which pid.
+
+    ``held`` is None when the lock backend cannot answer; the caller then
+    neither builds nor reports success.
+    """
+    root = Path(repo_root).resolve()
+    held: bool | None
+    probe_error = ""
+    try:
+        with source_graph.index_write_lease(root) as acquired:
+            held = not acquired
+    except source_graph.SourceGraphError as exc:
+        held = None
+        probe_error = f"{type(exc).__name__}:{exc}"[:200]
+    record = source_graph.read_index_write_lease_holder(root) if held else {}
+    pid = record.get("pid")
+    holder: dict[str, Any] = {
+        "held": held,
+        "pid": pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
+        "liveness": _pid_liveness(pid) if held else "",
+        "acquired_at": str(record.get("acquired_at") or ""),
+    }
+    if held and holder["pid"] is None:
+        holder["liveness"] = "unknown"
+    if probe_error:
+        holder["probe_error"] = probe_error
+    return holder
+
+
+def _refresh_handoff_path(repo_root: Path | str) -> Path:
+    return source_graph.resolve_db_path(Path(repo_root).resolve()).parent / REFRESH_HANDOFF_FILE
+
+
+def _publish_refresh_handoff(
+    repo_root: Path | str, requested_at: str, *, job_id: str = ""
+) -> bool:
+    """Durably hand one refresh request to whichever process holds the lease."""
+    try:
+        path = _refresh_handoff_path(repo_root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        current = _read_refresh_handoff(repo_root)
+        current_at = _parse_utc(str(current.get("requested_at") or ""))
+        requested = _parse_utc(requested_at)
+        if current_at is not None and requested is not None and current_at >= requested:
+            return True  # an equal-or-newer request is already handed off
+        tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        payload = json.dumps(
+            {
+                "schema_id": "aiworkhub.source_graph.refresh_handoff.v1",
+                "repo_root": str(Path(repo_root).resolve()),
+                "requested_at": requested_at,
+                "requester_pid": os.getpid(),
+                "job_id": job_id,
+            },
+            sort_keys=True,
+        )
+        try:
+            tmp.write_text(payload + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return True
+    except (OSError, source_graph.SourceGraphError):
+        return False
+
+
+def _read_refresh_handoff(repo_root: Path | str) -> dict[str, Any]:
+    try:
+        value = json.loads(_refresh_handoff_path(repo_root).read_text(encoding="utf-8"))
+    except (OSError, ValueError, source_graph.SourceGraphError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 _STALE_QUERY_CONNECTION_MARKERS = (
     "database schema has changed",
     "attempt to write a readonly database",
@@ -759,8 +919,26 @@ class SourceGraphDaemon:
         *,
         refresh_interval_seconds: float = DEFAULT_REFRESH_INTERVAL_SECONDS,
         stale_after_seconds: float | None = None,
+        standby_wait_seconds: float | None = None,
     ) -> None:
         self.repo_root = Path(repo_root).resolve()
+        # Writer-loop handoff polling state (NF-2026-02081): the idle wait's
+        # slice length, the start of this process's last build and the
+        # last-seen handoff record identity.
+        self._handoff_poll_seconds = _REFRESH_HANDOFF_POLL_SECONDS
+        self._last_build_started_at = ""
+        self._handoff_path: Path | None = None
+        self._handoff_seen_key: tuple[int, int, int] | None = None
+        # Bound on how long a STANDBY refresh waits for the lease holder's
+        # newer generation before failing by name (NF-2026-02081).
+        self.standby_wait_seconds = max(
+            0.0,
+            float(
+                DEFAULT_STANDBY_REFRESH_WAIT_SECONDS
+                if standby_wait_seconds is None
+                else standby_wait_seconds
+            ),
+        )
         self.refresh_interval_seconds = max(
             MIN_REFRESH_INTERVAL_SECONDS, float(refresh_interval_seconds)
         )
@@ -877,6 +1055,7 @@ class SourceGraphDaemon:
         *,
         state: str,
         error: str = "",
+        standby: dict[str, Any] | None = None,
     ) -> None:
         with self._state_lock:
             finished = {
@@ -886,6 +1065,10 @@ class SourceGraphDaemon:
                 "error": str(error or "")[:500],
                 "report": dict(self._last_report) if self._last_report else None,
             }
+            if standby is not None:
+                # How a STANDBY refresh was resolved, or which holder did not
+                # answer it (NF-2026-02081).
+                finished["standby"] = dict(standby)
             if (
                 self._active_refresh_job is not None
                 and self._active_refresh_job.get("job_id") == job.get("job_id")
@@ -929,17 +1112,123 @@ class SourceGraphDaemon:
     def _refresh_terminal_state(self, status: str, error: str) -> tuple[str, str]:
         """Map a post-build daemon status to a truthful refresh-job state.
 
-        STANDBY means this process yielded its build lease to another
-        writer, not that the refresh failed -- if the canonical database
-        already holds a readable prior generation, the refresh is truthfully
-        ``succeeded``. A STANDBY with no readable generation, or any other
-        non-ready status, remains truthfully ``failed``.
+        NF-2026-02081: STANDBY is never ``succeeded`` by itself -- a readable
+        generation older than the request is not the refresh that was asked
+        for. ``_settle_refresh_job`` resolves STANDBY through the lease holder
+        and only reaches this mapping for a STANDBY it could not resolve.
         """
         if status in {STATUS_READY, STATUS_EMPTY}:
             return "succeeded", ""
-        if status == STATUS_STANDBY and _repo_has_readable_generation(self.repo_root):
-            return "succeeded", ""
+        if status == STATUS_STANDBY:
+            return "failed", error or STANDBY_HOLDER_DID_NOT_REFRESH
         return "failed", error or f"refresh_terminal_status:{status}"
+
+    def _settle_refresh_job(self, job: dict[str, Any]) -> None:
+        """Finish one refresh job after a build attempt that actually ran."""
+        with self._state_lock:
+            status = self._status
+            error = self._last_error
+        if status != STATUS_STANDBY:
+            state, terminal_error = self._refresh_terminal_state(status, error)
+            self._finish_refresh_job(job, state=state, error=terminal_error)
+            return
+        requested_at = str(job.get("requested_at") or "") or _utcnow()
+        state, terminal_error, standby = self._resolve_standby_refresh(
+            requested_at, job_id=str(job.get("job_id") or "")
+        )
+        self._finish_refresh_job(job, state=state, error=terminal_error, standby=standby)
+
+    def _resolve_standby_refresh(
+        self, requested_at: str, *, job_id: str = ""
+    ) -> tuple[str, str, dict[str, Any]]:
+        """Resolve a STANDBY refresh truthfully (NF-2026-02081).
+
+        The request is handed to the lease holder as a durable handoff record,
+        then this waits -- bounded by ``standby_wait_seconds`` -- for a
+        canonical generation whose build finished after ``requested_at``.
+        Whenever the writer lease is free (the holder finished, died, or its
+        record is stale) this caller takes the lease over and builds itself;
+        a never-built repository therefore gets its first generation here.
+        Otherwise the refresh fails as ``standby_holder_did_not_refresh`` with
+        the holder's pid and liveness -- never ``succeeded`` on an older one.
+        """
+        _publish_refresh_handoff(self.repo_root, requested_at, job_id=job_id)
+        deadline = time.monotonic() + self.standby_wait_seconds
+        attempts = 0
+        holder: dict[str, Any] = {}
+        while True:
+            finished_at = _generation_finished_after(self.repo_root, requested_at)
+            if finished_at:
+                return "succeeded", "", {
+                    "requested_at": requested_at,
+                    "resolved_by": "lease_holder_generation",
+                    "generation_finished_at": finished_at,
+                    "takeover_attempts": attempts,
+                }
+            holder = _standby_lease_holder(self.repo_root)
+            if holder.get("held") is False and self._run_one_build():
+                attempts += 1
+                with self._state_lock:
+                    status = self._status
+                    error = self._last_error
+                if status in {STATUS_READY, STATUS_EMPTY}:
+                    return "succeeded", "", {
+                        "requested_at": requested_at,
+                        "resolved_by": "lease_takeover_build",
+                        "generation_finished_at": _generation_finished_after(
+                            self.repo_root, requested_at
+                        ),
+                        "takeover_attempts": attempts,
+                    }
+                if status != STATUS_STANDBY:
+                    state, terminal_error = self._refresh_terminal_state(status, error)
+                    return state, terminal_error, {
+                        "requested_at": requested_at,
+                        "resolved_by": "lease_takeover_build_failed",
+                        "takeover_attempts": attempts,
+                    }
+                # Lost the lease race to another writer: keep waiting on it.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if self._stop_event.wait(min(_STANDBY_POLL_SECONDS, remaining)):
+                return "failed", "standby_wait_stopped", {
+                    "requested_at": requested_at,
+                    "resolved_by": "",
+                    "holder": holder,
+                    "takeover_attempts": attempts,
+                }
+        error = (
+            f"{STANDBY_HOLDER_DID_NOT_REFRESH}:holder_pid={holder.get('pid')}"
+            f":holder_liveness={holder.get('liveness') or 'unknown'}"
+            f":waited_seconds={self.standby_wait_seconds:g}"
+        )
+        return "failed", error[:500], {
+            "requested_at": requested_at,
+            "resolved_by": "",
+            "holder": holder,
+            "takeover_attempts": attempts,
+            "waited_seconds": self.standby_wait_seconds,
+        }
+
+    def _honor_refresh_handoff(self, build_started_at: str) -> None:
+        """As lease holder, schedule one follow-up build for a newer handoff.
+
+        A standby requester's handoff recorded after this build started is
+        not covered by it, so the loop builds once more right away instead of
+        leaving the requester to wait out a whole interval.
+        """
+        if self._stop_event.is_set():
+            return
+        with self._state_lock:
+            status = self._status
+        if status not in {STATUS_READY, STATUS_EMPTY}:
+            return
+        handoff = _read_refresh_handoff(self.repo_root)
+        requested = _parse_utc(str(handoff.get("requested_at") or ""))
+        started = _parse_utc(build_started_at)
+        if requested is not None and started is not None and requested > started:
+            self._refresh_event.set()
 
     @staticmethod
     def _new_process_group_popen_kwargs() -> dict[str, Any]:
@@ -2014,11 +2303,62 @@ class SourceGraphDaemon:
         if refresh_job is not None:
             self._finish_refresh_job(refresh_job, state="failed", error=error)
 
+    def _refresh_handoff_is_newer(self) -> bool:
+        """Whether a standby requester handed off a refresh newer than our last build.
+
+        Cheap per poll: one ``stat`` of the handoff record; the record is read
+        only when its identity (mtime, inode, size) changed since the last
+        poll. A missing or unreadable record means no handoff, never an error.
+        """
+        try:
+            if self._handoff_path is None:
+                self._handoff_path = _refresh_handoff_path(self.repo_root)
+            st = os.stat(self._handoff_path)
+        except (OSError, source_graph.SourceGraphError):
+            return False
+        key = (st.st_mtime_ns, st.st_ino, st.st_size)
+        if key == self._handoff_seen_key:
+            return False
+        self._handoff_seen_key = key
+        handoff = _read_refresh_handoff(self.repo_root)
+        requested = _parse_utc(str(handoff.get("requested_at") or ""))
+        if requested is None:
+            return False
+        started = _parse_utc(self._last_build_started_at)
+        return started is None or requested > started
+
+    def _wait_for_tick(self, timeout: float) -> None:
+        """Wait up to ``timeout`` for the next tick, in handoff-poll slices.
+
+        An idle lease holder must see a standby requester's handoff within
+        about one ``_REFRESH_HANDOFF_POLL_SECONDS`` slice, not after a whole
+        refresh interval (NF-2026-02081); a newer handoff ends the wait as a
+        triggered refresh. ``stop()`` ends the wait within one slice.
+        """
+        remaining = max(0.0, float(timeout))
+        deadline = time.monotonic() + remaining
+        while not self._stop_event.is_set():
+            slice_timeout = min(self._handoff_poll_seconds, remaining)
+            if self._refresh_event.wait(slice_timeout):
+                return
+            if self._stop_event.is_set():
+                return
+            if self._refresh_handoff_is_newer():
+                self._refresh_event.set()
+                return
+            if slice_timeout >= remaining:
+                return  # the last slice covered the rest of the interval
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+
     def _loop(self) -> None:
         # Power-loss recovery: writable single-flight recovery must precede
         # any readonly probe when a non-empty journal/WAL exists.
         wait_timeout = self.refresh_interval_seconds
         transient_attempts = 0
+        # Only a handoff newer than this lifecycle's builds triggers one.
+        self._last_build_started_at = _utcnow()
         try:
             result = self._recovery_gate()
             if result is not None:
@@ -2058,7 +2398,7 @@ class SourceGraphDaemon:
             # Every finished tick -- a successful build included -- schedules
             # the next one and publishes what a queued job waits on.
             self._enter_loop_phase(_LOOP_PHASE_WAITING, wait_timeout)
-            self._refresh_event.wait(wait_timeout)
+            self._wait_for_tick(wait_timeout)
             self._refresh_event.clear()
             if self._stop_event.is_set():
                 break
@@ -2097,7 +2437,11 @@ class SourceGraphDaemon:
                     continue
                 transient_attempts = 0
                 wait_timeout = self.refresh_interval_seconds
+                build_started_at = _utcnow()
+                self._last_build_started_at = build_started_at
                 triggered = self._run_one_build()
+                if triggered:
+                    self._honor_refresh_handoff(build_started_at)
                 if refresh_job is None:
                     continue
                 if not triggered:
@@ -2105,11 +2449,7 @@ class SourceGraphDaemon:
                         refresh_job, state="failed", error="build_in_progress"
                     )
                     continue
-                with self._state_lock:
-                    status = self._status
-                    error = self._last_error
-                state, terminal_error = self._refresh_terminal_state(status, error)
-                self._finish_refresh_job(refresh_job, state=state, error=terminal_error)
+                self._settle_refresh_job(refresh_job)
             except Exception as exc:  # noqa: BLE001 -- a failed tick must never end the writer
                 held_job = None
                 self._record_tick_failure(exc, refresh_job)
@@ -2252,11 +2592,7 @@ class SourceGraphDaemon:
             health = self._projected_health()
             return {**health, "ok": True, "triggered": False, "reason": "build_in_progress"}
         if active_job is not None:
-            with self._state_lock:
-                status = self._status
-                error = self._last_error
-            state, terminal_error = self._refresh_terminal_state(status, error)
-            self._finish_refresh_job(active_job, state=state, error=terminal_error)
+            self._settle_refresh_job(active_job)
         return {**self._projected_health(), "triggered": True}
 
     def request_refresh(self) -> dict[str, Any]:
@@ -2516,6 +2852,57 @@ def stop_all_daemons() -> int:
     with _REGISTRY_LOCK:
         roots = [daemon.repo_root for daemon in _REGISTRY.values()]
     return sum(1 for root in roots if stop_daemon(root))
+
+
+# NF-2026-02081: a query that serves a file ahead of the index (stale /
+# stale_served_from_disk, never indexed, or deleted) nudges this repository's
+# live writer through ``request_refresh`` instead of waiting a whole interval.
+# Coalesced twice: one nudge per repository per window, and one per distinct
+# (file, state, fingerprint) so a file the indexer cannot converge on (an
+# extractor refusal, say) never drives a rebuild loop. Both maps are bounded.
+STALE_READ_NUDGE_COALESCE_SECONDS = 1.0
+_STALE_READ_NUDGE_SEEN_MAX = 1024
+_STALE_READ_NUDGE_LOCK = threading.Lock()
+_STALE_READ_NUDGE_LAST: dict[str, float] = {}
+_STALE_READ_NUDGE_SEEN: OrderedDict[tuple[str, str, str, str], None] = OrderedDict()
+
+
+def _nudge_refresh_on_stale_read(
+    repo_root: Path, file_path: str, state: str, fingerprint: str
+) -> bool:
+    """Queue one coalesced incremental refresh; True iff a request was made."""
+    daemon = get_daemon(repo_root)
+    if daemon is None or not daemon.is_running() or daemon._stop_event.is_set():
+        return False
+    key = _registry_key(repo_root)
+    seen_key = (key, str(file_path), str(state), str(fingerprint))
+    now = time.monotonic()
+    with _STALE_READ_NUDGE_LOCK:
+        if seen_key in _STALE_READ_NUDGE_SEEN:
+            _STALE_READ_NUDGE_SEEN.move_to_end(seen_key)
+            return False
+        last = _STALE_READ_NUDGE_LAST.get(key)
+        if last is not None and now - last < STALE_READ_NUDGE_COALESCE_SECONDS:
+            # Not recorded as seen: a read after the window nudges again.
+            return False
+        _STALE_READ_NUDGE_SEEN[seen_key] = None
+        while len(_STALE_READ_NUDGE_SEEN) > _STALE_READ_NUDGE_SEEN_MAX:
+            _STALE_READ_NUDGE_SEEN.popitem(last=False)
+        _STALE_READ_NUDGE_LAST[key] = now
+        if len(_STALE_READ_NUDGE_LAST) > _STALE_READ_NUDGE_SEEN_MAX:
+            oldest = min(_STALE_READ_NUDGE_LAST, key=_STALE_READ_NUDGE_LAST.__getitem__)
+            _STALE_READ_NUDGE_LAST.pop(oldest, None)
+    daemon.request_refresh()
+    return True
+
+
+def _stale_read_listener(
+    repo_root: Path, file_path: str, state: str, fingerprint: str
+) -> None:
+    _nudge_refresh_on_stale_read(repo_root, file_path, state, fingerprint)
+
+
+source_graph.register_stale_read_listener(_stale_read_listener)
 
 
 def _apply_index_integrity(out: dict[str, Any], repo_root: Path | str) -> None:

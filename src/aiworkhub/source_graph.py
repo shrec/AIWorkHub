@@ -611,9 +611,13 @@ def index_write_lease(repo_root: Path):
                         else "flock"
                     ),
                 ) from exc
+        holder_token = _publish_lease_holder(lock_path) if acquired else ""
         yield acquired
     finally:
         if acquired:
+            # Cleared while the lease is still held, so a successor's record
+            # can never be removed by this releasing owner.
+            _clear_lease_holder(lock_path, holder_token)
             try:
                 handle.seek(0)
                 if _index_write_lease_platform() == "nt":
@@ -627,6 +631,62 @@ def index_write_lease(repo_root: Path):
             except (OSError, ValueError):
                 pass
         handle.close()
+
+
+# NF-2026-02081: the writer lease names its holder so a standby refresh can
+# report WHO holds it (pid, liveness) instead of a bare ``standby``. The OS lock
+# stays the sole authority; this record is diagnostics only and is written and
+# cleared only while the lease is held.
+INDEX_WRITE_LEASE_HOLDER_FILE = "index.lock.holder.json"
+
+
+def _lease_holder_path(lock_path: Path) -> Path:
+    return lock_path.with_name(INDEX_WRITE_LEASE_HOLDER_FILE)
+
+
+def _publish_lease_holder(lock_path: Path) -> str:
+    token = secrets.token_hex(8)
+    path = _lease_holder_path(lock_path)
+    tmp = path.with_name(f".{path.name}.{token}.tmp")
+    record = {
+        "schema_id": "aiworkhub.source_graph.index_write_lease_holder.v1",
+        "pid": os.getpid(),
+        "token": token,
+        "acquired_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        tmp.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return ""
+    return token
+
+
+def _clear_lease_holder(lock_path: Path, token: str) -> None:
+    if not token:
+        return
+    path = _lease_holder_path(lock_path)
+    try:
+        current = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(current, dict) and current.get("token") == token:
+            path.unlink(missing_ok=True)
+    except (OSError, ValueError):
+        pass
+
+
+def read_index_write_lease_holder(repo_root: Path) -> dict[str, Any]:
+    """Last recorded writer-lease holder for ``repo_root``; ``{}`` when none."""
+
+    try:
+        path = _lease_holder_path(resolve_db_path(repo_root).with_name("index.lock"))
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, SourceGraphError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def _now_iso() -> str:
@@ -6814,6 +6874,14 @@ def _file_miss_fields(
         "found": False, "reason": "not_yet_indexed", "exists_on_disk": True,
         "freshness": "unindexed",
     }
+    # A new file the writer has not seen yet: nudge it (NF-2026-02081). The
+    # size/mtime fingerprint lets the listener coalesce repeated reads.
+    try:
+        info = target.stat()
+        fingerprint = f"{info.st_size}:{info.st_mtime_ns}"
+    except OSError:
+        fingerprint = ""
+    notify_stale_read(root, relative, "unindexed", fingerprint)
     if line_range is not None:
         fields.update(_ranged_file_preview(root, relative, line_range))
     return fields
@@ -7792,6 +7860,13 @@ def _file_freshness_state(
         state = "fresh"
     else:
         state = "stale"
+    if (
+        state == "stale"
+        or (state == "unknown" and disk is not None)
+        or (state == "missing" and stored is not None)
+    ):
+        # The index is behind this file: nudge the writer (NF-2026-02081).
+        notify_stale_read(repo_root, file_path, state, disk or "")
     return {
         "state": state,
         "indexed_source_hash": stored,
@@ -7823,6 +7898,46 @@ def _overall_freshness(per_file: dict[str, dict[str, Any]]) -> str:
         if degraded in states:
             return degraded
     return "stale"
+
+
+# NF-2026-02081: a read that finds a file ahead of the index -- edited
+# (stale / stale_served_from_disk), on disk but never indexed, or indexed but
+# deleted -- tells the writer at once instead of waiting for the periodic tick.
+# The daemon module registers the listener; this module never imports it.
+# Listener signature: (repo_root, file_path, state, fingerprint).
+StaleReadListener = Callable[[Path, str, str, str], None]
+_STALE_READ_LISTENERS: list[StaleReadListener] = []
+_STALE_READ_LISTENERS_LOCK = threading.Lock()
+
+
+def register_stale_read_listener(listener: StaleReadListener) -> None:
+    with _STALE_READ_LISTENERS_LOCK:
+        if listener not in _STALE_READ_LISTENERS:
+            _STALE_READ_LISTENERS.append(listener)
+
+
+def unregister_stale_read_listener(listener: StaleReadListener) -> None:
+    with _STALE_READ_LISTENERS_LOCK:
+        if listener in _STALE_READ_LISTENERS:
+            _STALE_READ_LISTENERS.remove(listener)
+
+
+def notify_stale_read(
+    repo_root: Path, file_path: str, state: str, fingerprint: str,
+) -> None:
+    """Tell every registered listener that a read saw ``file_path`` ahead of the index.
+
+    A nudge is advisory: a listener failure never fails the read that observed
+    the staleness, which still reports its own explicit freshness state.
+    """
+
+    with _STALE_READ_LISTENERS_LOCK:
+        listeners = tuple(_STALE_READ_LISTENERS)
+    for listener in listeners:
+        try:
+            listener(Path(repo_root), str(file_path), str(state), str(fingerprint))
+        except Exception:  # noqa: BLE001 -- advisory nudge, the read stays truthful
+            continue
 
 
 STALE_SERVED_FROM_DISK = "stale_served_from_disk"

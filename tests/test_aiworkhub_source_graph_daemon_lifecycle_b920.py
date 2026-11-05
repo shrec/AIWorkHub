@@ -1039,22 +1039,22 @@ def test_refresh_now_coalescing_arms_event_and_runs_one_follow_up_build(
 
 
 # ---------------------------------------------------------------------------
-# 7. NF149: refresh_now()/refresh-job terminal status stays truthful when a
-#    build yields to another writer's lease (STANDBY) instead of fabricating
-#    a false failure or silently discarding a valid prior generation.
+# 7. NF149 / NF-2026-02081: refresh_now()/refresh-job terminal status stays
+#    truthful when a build yields to another writer's lease (STANDBY). A
+#    readable prior generation is NOT the requested refresh: the job fails by
+#    name unless a generation newer than the request appears within the bound.
 # ---------------------------------------------------------------------------
 
 
-def test_refresh_job_maps_standby_with_readable_generation_to_succeeded(
+def test_refresh_job_standby_with_older_readable_generation_is_not_succeeded(
     tmp_path, monkeypatch, cleanup_daemons,
 ):
-    """STANDBY with a readable prior canonical generation is not a failure."""
+    """NF-2026-02081: STANDBY over an older generation never reports succeeded."""
     root = _init_repo(tmp_path)
     cleanup_daemons.append(root)
     (root / "seed.py").write_text("def seeded():\n    return 1\n", encoding="utf-8")
 
-    # A real prior generation must exist and be readable before a later
-    # STANDBY outcome can be truthfully treated as non-failing.
+    # A real prior generation exists and is readable, but predates the request.
     source_graph.build_index(root)
 
     def standby_build(repo_root, *, incremental=True, db_path=None):
@@ -1062,15 +1062,18 @@ def test_refresh_job_maps_standby_with_readable_generation_to_succeeded(
 
     monkeypatch.setattr(source_graph, "build_index", standby_build)
 
-    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    daemon = source_graph_daemon.SourceGraphDaemon(root, standby_wait_seconds=0.3)
     result = daemon.refresh_now()
 
     assert result["triggered"] is True
     assert result["status"] == source_graph_daemon.STATUS_STANDBY
     refresh_job = result["refresh_job"]
     assert refresh_job is not None
-    assert refresh_job["state"] == "succeeded"
-    assert refresh_job["error"] == ""
+    assert refresh_job["state"] == "failed"
+    assert refresh_job["error"].startswith(
+        source_graph_daemon.STANDBY_HOLDER_DID_NOT_REFRESH
+    )
+    assert refresh_job["standby"]["resolved_by"] == ""
     assert result["refresh_job_id"] == refresh_job["job_id"]
 
 
@@ -1086,7 +1089,7 @@ def test_refresh_job_standby_without_readable_generation_remains_failed(
 
     monkeypatch.setattr(source_graph, "build_index", standby_build)
 
-    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    daemon = source_graph_daemon.SourceGraphDaemon(root, standby_wait_seconds=0.3)
     result = daemon.refresh_now()
 
     assert result["triggered"] is True
@@ -1094,7 +1097,9 @@ def test_refresh_job_standby_without_readable_generation_remains_failed(
     refresh_job = result["refresh_job"]
     assert refresh_job is not None
     assert refresh_job["state"] == "failed"
-    assert refresh_job["error"] == "refresh_terminal_status:standby"
+    assert refresh_job["error"].startswith(
+        source_graph_daemon.STANDBY_HOLDER_DID_NOT_REFRESH
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2868,6 +2873,7 @@ def test_successful_build_with_held_output_schedules_the_next_tick(tmp_path, mon
     root, daemon, spawned = _held_output_daemon(tmp_path, monkeypatch, "held_output_ticks")
     waits = _ElapsingRefreshEvent(elapse=2)
     daemon._refresh_event = waits
+    daemon._handoff_poll_seconds = float("inf")  # one wait per tick
     daemon.start()
     try:
         deadline = time.monotonic() + _HANG_GUARD_SECONDS
@@ -3121,6 +3127,7 @@ def test_failed_loop_tick_is_contained_and_the_writer_keeps_ticking(tmp_path, mo
     monkeypatch.setattr(daemon, "_recovery_gate", faulting_gate)
     waits = _ElapsingRefreshEvent(elapse=3)
     daemon._refresh_event = waits
+    daemon._handoff_poll_seconds = float("inf")  # one wait per tick
     daemon.start()
     try:
         deadline = time.monotonic() + _HANG_GUARD_SECONDS
