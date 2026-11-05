@@ -224,12 +224,15 @@ def _call_lines(scope: ast.AST, name: str) -> list[int]:
 
 
 def _attribute_calls(statements) -> set[str]:
-    return {
-        node.func.attr
-        for statement in statements
-        for node in ast.walk(statement)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-    }
+    # ``phase_clock.transition(self._x, ...)`` calls ``self._x`` (NF-2026-02046).
+    names: set[str] = set()
+    for statement in statements:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                names.add(node.func.attr)
+                if node.func.attr == "transition" and node.args and isinstance(node.args[0], ast.Attribute):
+                    names.add(node.args[0].attr)
+    return names
 
 
 def test_finalizer_runs_the_guard_before_the_candidate_review_ready_transition():

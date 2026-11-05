@@ -369,12 +369,16 @@ def test_live_mux_thread_projection_recovers_after_transient_manifest_fault(tmp_
     _install_live_mux(monkeypatch, tmp_path, repo_id)
     fault = _windows_manifest_fault(monkeypatch, root / repository_state.PROJECT_MANIFEST_REL)
 
+    # Both reads start from an empty readiness memo (NF-2026-02059) so each one
+    # reaches the manifest; otherwise setup's memoized verdict skips the open.
+    task_store.reset_storage_readiness_cache()
     baseline = core.read_selected_coordinator_target(root)
     clean_opens = fault["attempts"]
 
     lock_violation = PermissionError(13, "lock violation")
     lock_violation.winerror = _ERROR_LOCK_VIOLATION
     fault["armed"] = lock_violation
+    task_store.reset_storage_readiness_cache()
     recovered = core.read_selected_coordinator_target(root)
     faulted_opens = fault["attempts"] - clean_opens
 
@@ -400,6 +404,9 @@ def test_live_mux_thread_projection_stays_route_pending_on_non_transient_fault(
     fault = _windows_manifest_fault(monkeypatch, root / repository_state.PROJECT_MANIFEST_REL)
     fault["armed"] = OSError(errno.EIO, "Input/output error")
 
+    # Setup already memoized a ready verdict for this root (NF-2026-02059); drop
+    # it so the read reaches the manifest open the fault intercepts.
+    task_store.reset_storage_readiness_cache()
     target = core.read_selected_coordinator_target(root)
 
     codex_target = target["targets"]["codex"]

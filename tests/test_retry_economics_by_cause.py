@@ -226,6 +226,9 @@ def test_task_store_is_read_once_per_build_not_per_row(monkeypatch, tmp_path):
     monkeypatch.setattr(cost_ledger.task_store, "_connect", counting_connect)
     monkeypatch.setattr(cost_ledger, "_task_store_terminal_causes", counting_bulk)
 
+    # Both builds start from an empty readiness memo (NF-2026-02059), so each
+    # pays the same readiness read and only the per-row reads can differ.
+    cost_ledger.task_store.reset_storage_readiness_cache()
     _rows(monkeypatch, tmp_path, [_usage("t1", "r1", 1)])
     single_row_connects = len(connects)
     assert len(bulk_calls) == 1
@@ -233,6 +236,7 @@ def test_task_store_is_read_once_per_build_not_per_row(monkeypatch, tmp_path):
     connects.clear()
     bulk_calls.clear()
     usage = [_usage(f"t{n}", f"r{n}", 1) for n in range(6)] + [_usage("t1", "r1", 2)]
+    cost_ledger.task_store.reset_storage_readiness_cache()
     _rows(monkeypatch, tmp_path, usage)
     assert len(bulk_calls) == 1
     assert len(connects) == single_row_connects

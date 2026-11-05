@@ -290,6 +290,9 @@ def test_idle_resume_manifest_fault_recovers_discovery_and_live_route_without_re
     manifest_repo_id = repository_state.inspect_repository(repo).manifest.repo_id
 
     fault["armed"] = True
+    # Setup memoized a ready verdict (NF-2026-02059); drop it so this read
+    # reaches the manifest open the armed fault intercepts.
+    task_store.reset_storage_readiness_cache()
     readiness = task_store.storage_readiness(repo)
 
     fault["armed"] = True
