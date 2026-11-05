@@ -10,11 +10,12 @@ module size ratchet in tests/test_module_size_ratchet.py.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from typing import Any
 
-from . import core
+from . import core, output_spill_store
 
 _REWORK_OUTCOME_REASON = {
     "delta_reused": "sealed delta artifact reused",
@@ -746,3 +747,154 @@ def expand_same_as(value: Any) -> Any:
         return node
 
     return build(value, "$")
+
+
+# NF-2026-02093: a card with a rework and an accept reached 226 KB and a
+# detail=full reply 195,000 chars, more than an MCP client accepts. The exact
+# card stays exact while it fits CARD_BYTE_BUDGET; above it, old history entries
+# and the heaviest evidence bodies fold to {sha256, bytes, spill_locator} with
+# the exact canonical JSON kept in the output spill store.
+CARD_BYTE_BUDGET = 64_000
+CARD_HISTORY_KEEP = 3
+_CARD_FOLD_PASSES = (2048, 256, 0)
+_CARD_BOUND_RESERVE = 1024
+_CARD_FOLD_DEPTH = 6
+_CARD_UNBOUNDED_KEYS = frozenset(
+    {"task_id", "status", "title", "topic", "created_at", "updated_at", "card_bound"}
+)
+
+
+def _compact_len(value: Any) -> int:
+    text = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+    return len(text.encode("utf-8"))
+
+
+def _is_folded(node: Any) -> bool:
+    return isinstance(node, dict) and node.get("summarized") is True and "sha256" in node
+
+
+def _spill_fold(value: Any, repo: Any) -> dict[str, Any]:
+    """Spill ``value``'s canonical JSON and return its ``{sha256, bytes}`` stand-in."""
+
+    size, digest = core._evidence_identity(value)
+    text = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    folded: dict[str, Any] = {"summarized": True, "bytes": size, "sha256": digest}
+    receipt = output_spill_store.try_spill_text(text, repo=repo)
+    if isinstance(receipt, output_spill_store.SpillReceipt):
+        folded["spill_locator"] = receipt.locator
+    else:
+        folded["spill_unavailable"] = receipt.reason
+    return folded
+
+
+def retrieve_folded(locator: str, *, repo: Any) -> Any:
+    """Exact value a ``spill_locator`` stand-in replaced (digest-verified)."""
+
+    return json.loads(output_spill_store.retrieve_text(locator, repo=repo))
+
+
+def _heavy_leaves(
+    node: Any, path: tuple[Any, ...], threshold: int, found: list[tuple[int, tuple[Any, ...]]]
+) -> bool:
+    """Collect nodes >= ``threshold`` bytes that have no heavy descendant."""
+
+    if not isinstance(node, (dict, list, str)) or _is_folded(node):
+        return False
+    size = _compact_len(node)
+    if size < threshold:
+        return False
+    heavy_child = False
+    if len(path) < _CARD_FOLD_DEPTH and not isinstance(node, str):
+        children = node.items() if isinstance(node, dict) else enumerate(node)
+        for key, child in children:
+            if _heavy_leaves(child, (*path, key), threshold, found):
+                heavy_child = True
+    if not heavy_child:
+        found.append((size, path))
+    return True
+
+
+def _node_at(root: Any, path: tuple[Any, ...]) -> Any:
+    for key in path:
+        root = root[key]
+    return root
+
+
+def bound_task_card(card: dict[str, Any], *, repo: Any, budget: int = CARD_BYTE_BUDGET) -> dict[str, Any]:
+    """Return ``card`` unchanged when it fits ``budget`` bytes, else a bounded copy.
+
+    Over budget, history older than the last ``CARD_HISTORY_KEEP`` entries folds
+    into one spilled stand-in, then the largest evidence bodies fold one by one
+    until the compact card fits. Identity keys are never folded. ``card_bound``
+    records the accounting; ``over_budget`` is set if the unfoldable part alone
+    exceeds the budget.
+    """
+
+    original = _compact_len(card)
+    if original <= budget:
+        return card
+    result = copy.deepcopy(card)
+    target = budget - _CARD_BOUND_RESERVE
+    history_folded = 0
+    folded_nodes = 0
+    history = result.get("history")
+    if isinstance(history, list) and len(history) > CARD_HISTORY_KEEP:
+        old = history[:-CARD_HISTORY_KEEP]
+        stub = _spill_fold(old, repo)
+        stub["count"] = len(old)
+        result["history"] = [stub, *history[-CARD_HISTORY_KEEP:]]
+        history_folded = len(old)
+    total = _compact_len(result)
+    for threshold in _CARD_FOLD_PASSES:
+        if total <= target:
+            break
+        found: list[tuple[int, tuple[Any, ...]]] = []
+        for key in sorted(result, key=str):
+            if key in _CARD_UNBOUNDED_KEYS:
+                continue
+            if threshold:
+                _heavy_leaves(result[key], (key,), threshold, found)
+            elif isinstance(result[key], (dict, list, str)) and not _is_folded(result[key]):
+                found.append((_compact_len(result[key]), (key,)))
+        found.sort(key=lambda item: (-item[0], [str(part) for part in item[1]]))
+        for size, path in found:
+            if total <= target:
+                break
+            stub = _spill_fold(_node_at(result, path), repo)
+            stub_size = _compact_len(stub)
+            if stub_size >= size:
+                continue
+            _node_at(result, path[:-1])[path[-1]] = stub
+            total -= size - stub_size
+            folded_nodes += 1
+    result["card_bound"] = {
+        "budget": budget,
+        "original_bytes": original,
+        "history_entries_folded": history_folded,
+        "folded_nodes": folded_nodes,
+        "retrieve": "retrieve_text(spill_locator, repo=<same repository root>) returns the exact folded JSON",
+    }
+    bounded = _compact_len(result)
+    result["card_bound"]["bounded_bytes"] = bounded
+    if bounded > budget:
+        result["card_bound"]["over_budget"] = True
+    return result
+
+
+def bound_full_task_reply(result: Any, *, repo: Any, budget: int = CARD_BYTE_BUDGET) -> Any:
+    """Bound a ``task_show detail=full`` envelope; an in-budget reply is untouched."""
+
+    stdout = result.get("stdout") if isinstance(result, dict) else None
+    if not isinstance(stdout, str) or len(stdout.encode("utf-8")) <= budget:
+        return result
+    try:
+        card = json.loads(stdout)
+    except ValueError:
+        return result
+    if not isinstance(card, dict):
+        return result
+    rendered = dict(result)
+    bounded = bound_task_card(card, repo=repo, budget=budget)
+    rendered["stdout"] = json.dumps(bounded, ensure_ascii=False, default=str, separators=(",", ":"))
+    rendered["bounded"] = True
+    return rendered

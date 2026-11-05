@@ -4648,7 +4648,10 @@ def aiworkhub_task_show(
     if refusal is not None:
         return refusal
     if full or detail == "full":
-        return core.show_task(task_id, full=True)
+        # NF-2026-02093: exact while it fits the byte budget, else folded + spilled.
+        return mcp_summary_folds.bound_full_task_reply(
+            core.show_task(task_id, full=True), repo=core.repo_root()
+        )
     result = core.show_task(task_id, full=False)
     card = _envelope_card(result)
     if card is None:
