@@ -28,6 +28,31 @@ CALLBACK_WAIT_WATCH_LIMIT = 64
 CALLBACK_WAIT_SNAPSHOT_LIMIT = 64
 CALLBACK_WAIT_REVIEW_WAITING_LIMIT = 20
 CALLBACK_WAIT_SKIPPED_STALE_LIMIT = 50
+# NF-2026-01939: dead quality-reviewer cards drop out of review_waiting.
+CALLBACK_WAIT_REVIEW_WAITING_SCAN_LIMIT = 500
+CALLBACK_WAIT_REVIEW_CAUSE_MAX_CHARS = 200
+_QUALITY_REVIEW_TASK_PREFIX = "QUALITY_REVIEW_"
+_DEAD_REVIEWER_SUBSTATUSES = frozenset(
+    {
+        "worker_failed",
+        "launch_failed",
+        "cancelled",
+        "timed_out",
+        "token_budget_exceeded",
+        "output_budget_exceeded",
+    }
+)
+_FAILED_SUBSTATUSES = _DEAD_REVIEWER_SUBSTATUSES | frozenset(
+    {"validation_failed", "scope_rejected", "blocked"}
+)
+_REVIEW_TARGET_KEYS = (
+    "review_target_task_id",
+    "target_task_id",
+    "reviewed_task_id",
+)
+_REVIEW_TARGET_DONE_STATUSES = frozenset(
+    {"finished", "archived", "superseded", "cancelled"}
+)
 
 
 def callback_wait_limits() -> dict[str, Any]:
@@ -328,26 +353,83 @@ def _callback_member_stale_reason(conn: sqlite3.Connection, member: Mapping[str,
     return "task_transition_changed" if lifecycle in {"review", "blocked"} else f"task_{lifecycle}"
 
 
+def _review_waiting_cause(card: Mapping[str, Any]) -> dict[str, str]:
+    """NF-2026-01939: the recorded cause of a failed card, bounded.  Looks at
+    the card, then at ``terminal_review`` and its evidence; a value may be a
+    plain code or a ``{code|category|reason}`` mapping.  Absent evidence yields
+    no key (never an invented cause)."""
+    review = card.get("terminal_review")
+    evidence = review.get("evidence") if isinstance(review, Mapping) else None
+    sources = [card]
+    if isinstance(review, Mapping):
+        sources.append(review)
+    if isinstance(evidence, Mapping):
+        sources.append(evidence)
+    cause: dict[str, str] = {}
+    for key in ("first_error", "terminal_reason"):
+        for source in sources:
+            value = source.get(key)
+            if isinstance(value, Mapping):
+                value = value.get("code") or value.get("category") or value.get("reason")
+            if isinstance(value, (str, int)) and not isinstance(value, bool):
+                text = str(value).strip()
+                if text:
+                    cause[key] = text[:CALLBACK_WAIT_REVIEW_CAUSE_MAX_CHARS]
+                    break
+    return cause
+
+
+def _review_waiting_target_finished(conn: sqlite3.Connection, card: Mapping[str, Any]) -> bool:
+    """True only when the reviewed target card is positively known to be
+    finished, archived, superseded or cancelled; an unknown target is not."""
+    target_id = ""
+    for key in _REVIEW_TARGET_KEYS:
+        value = card.get(key)
+        if isinstance(value, str) and value.strip():
+            target_id = value.strip()
+            break
+    if not target_id:
+        return False
+    row = conn.execute(
+        "SELECT status, worker_status, archived_at FROM tasks WHERE task_id=?", (target_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    if str(row["archived_at"] or "").strip():
+        return True
+    return (
+        str(row["status"] or "").strip().lower() in _REVIEW_TARGET_DONE_STATUSES
+        or str(row["worker_status"] or "").strip().lower() == "done"
+    )
+
+
 def _callback_review_waiting(provider: str, session_id: str) -> dict[str, Any]:
     """NF-2026-01859: review-bucket cards of ``provider`` this wait cannot
     deliver, bounded to ``CALLBACK_WAIT_REVIEW_WAITING_LIMIT`` rows.  Visibility
     only: nothing here claims, seeds or acknowledges, and the claim's route
     scoping is untouched.  ``reason`` is other_origin (a callback row for the
     current episode belongs to another origin), deferred_review_chain (the wake
-    is held for the quality-review chain) or no_callback_row."""
+    is held for the quality-review chain) or no_callback_row.
+
+    NF-2026-01939: a terminal (worker_failed/launch_failed/cancelled/timed_out/
+    ...) ``QUALITY_REVIEW_*`` card that is other_origin, or whose reviewed target
+    is already finished, is dead weight and is left out of the listing; the
+    count is reported as ``review_waiting_hidden_terminal`` (only when > 0).  A
+    failed card that stays listed carries its ``first_error`` /
+    ``terminal_reason`` when the card recorded one."""
     from . import core  # lazy: core re-exports this module
     waiting: list[dict[str, str]] = []
+    hidden_terminal = 0
     try:
         conn = core._canonical_connect(readonly=True)
         try:
             tasks = conn.execute(
                 "SELECT task_id, status, card_json FROM tasks "
                 "WHERE status IN ('review', 'blocked') AND (archived_at IS NULL OR archived_at='') "
-                "ORDER BY updated_at DESC, task_id ASC"
+                "ORDER BY updated_at DESC, task_id ASC LIMIT ?",
+                (CALLBACK_WAIT_REVIEW_WAITING_SCAN_LIMIT,),
             )
             for task in tasks:
-                if len(waiting) >= CALLBACK_WAIT_REVIEW_WAITING_LIMIT:
-                    break
                 try:
                     card = json.loads(task["card_json"] or "{}")
                 except (TypeError, json.JSONDecodeError):
@@ -391,19 +473,34 @@ def _callback_review_waiting(provider: str, session_id: str) -> dict[str, Any]:
                     reason = "deferred_review_chain"
                 else:
                     reason = "no_callback_row"
-                waiting.append(
-                    {
-                        "task_id": task_id,
-                        "status": str(task["status"] or ""),
-                        "terminal_substatus": substatus,
-                        "reason": reason,
-                    }
+                dead_reviewer = (
+                    task_id.startswith(_QUALITY_REVIEW_TASK_PREFIX)
+                    and substatus in _DEAD_REVIEWER_SUBSTATUSES
                 )
+                if dead_reviewer and (
+                    reason == "other_origin" or _review_waiting_target_finished(conn, card)
+                ):
+                    hidden_terminal += 1
+                    continue
+                if len(waiting) >= CALLBACK_WAIT_REVIEW_WAITING_LIMIT:
+                    continue
+                entry = {
+                    "task_id": task_id,
+                    "status": str(task["status"] or ""),
+                    "terminal_substatus": substatus,
+                    "reason": reason,
+                }
+                if substatus in _FAILED_SUBSTATUSES:
+                    entry.update(_review_waiting_cause(card))
+                waiting.append(entry)
         finally:
             conn.close()
     except Exception as exc:  # noqa: BLE001 -- evidence must never break the wait
         return {"review_waiting": [], "review_waiting_error": type(exc).__name__}
-    return {"review_waiting": waiting}
+    result: dict[str, Any] = {"review_waiting": waiting}
+    if hidden_terminal:
+        result["review_waiting_hidden_terminal"] = hidden_terminal
+    return result
 
 
 def _callback_launch_blocked(provider: str) -> dict[str, Any]:
