@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import threading
+import time
 import types
 import typing
 from collections.abc import Mapping
@@ -551,6 +552,7 @@ except ModuleNotFoundError:
         name: str,
         tools: dict[str, Any],
         instructions: str = "",
+        report_progress_tools: typing.Collection[str] = (),
     ) -> None:
         # Read from the binary buffer with an explicit limit.  Calling the
         # text wrapper's unbounded readline() and checking the length only
@@ -579,31 +581,73 @@ except ModuleNotFoundError:
             msg_id = message.get("id")
             method = message.get("method")
             params = message.get("params")
-            try:
-                result = _stdio_dispatch(name, tools, method, params, instructions, msg_id)
-            except _StdioProtocolError as exc:
-                write({
-                    "jsonrpc": "2.0", "id": msg_id,
-                    "error": {"code": exc.code, "message": exc.message},
-                })
-                return
-            except Exception as exc:  # defensive: one request never kills the lane
-                _stdio_log(
-                    "request_failed",
-                    request_id=msg_id,
-                    method=method,
-                    error_type=type(exc).__name__,
+
+            def respond() -> dict[str, Any]:
+                try:
+                    result = _stdio_dispatch(name, tools, method, params, instructions, msg_id)
+                except _StdioProtocolError as exc:
+                    return {
+                        "jsonrpc": "2.0", "id": msg_id,
+                        "error": {"code": exc.code, "message": exc.message},
+                    }
+                except Exception as exc:  # defensive: one request never kills the lane
+                    _stdio_log(
+                        "request_failed",
+                        request_id=msg_id,
+                        method=method,
+                        error_type=type(exc).__name__,
+                    )
+                    return {
+                        "jsonrpc": "2.0", "id": msg_id,
+                        "error": {
+                            "code": -32603,
+                            "message": f"internal_error:{type(exc).__name__}",
+                        },
+                    }
+                return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+            # NF-2026-02055: only an opted-in tools/call that carries a progress
+            # token gets a heartbeat. Every other request takes the old path.
+            token: str | int | None = None
+            if (
+                method == "tools/call"
+                and isinstance(params, dict)
+                and isinstance(params.get("name"), str)
+                and params["name"] in report_progress_tools
+            ):
+                meta = params.get("_meta")
+                candidate = meta.get("progressToken") if isinstance(meta, dict) else None
+                if isinstance(candidate, (str, int)) and not isinstance(candidate, bool):
+                    token = candidate
+            stop = threading.Event()
+            heartbeat: threading.Thread | None = None
+            if token is not None:
+                started = time.monotonic()
+
+                def beat() -> None:
+                    while not stop.wait(_MCP_PROGRESS_INTERVAL_SECONDS):
+                        write({
+                            "jsonrpc": "2.0",
+                            "method": "notifications/progress",
+                            "params": {
+                                "progressToken": token,
+                                "progress": round(time.monotonic() - started, 3),
+                            },
+                        })
+
+                heartbeat = threading.Thread(
+                    target=beat, name="aiworkhub-mcp-progress", daemon=True,
                 )
-                write({
-                    "jsonrpc": "2.0", "id": msg_id,
-                    "error": {
-                        "code": -32603,
-                        "message": f"internal_error:{type(exc).__name__}",
-                    },
-                })
-                return
-            write({"jsonrpc": "2.0", "id": msg_id, "result": result})
-            if method == "tools/list":
+                heartbeat.start()
+            try:
+                outgoing = respond()
+            finally:
+                # Stop and join before the response: no progress follows the result.
+                stop.set()
+                if heartbeat is not None:
+                    heartbeat.join()
+            write(outgoing)
+            if method == "tools/list" and "result" in outgoing:
                 # NF-2026-02053: the deferred startup sweep may begin only once
                 # the client holds its first tool listing.
                 _mark_first_tools_list_served()
@@ -697,6 +741,10 @@ except ModuleNotFoundError:
             self.name = name
             self.instructions = str(instructions or "")
             self._tools: dict[str, Any] = {}
+            # NF-2026-02055: names registered with report_progress=True get the
+            # same progress heartbeat as the SDK path, so a long accept_review is
+            # not aborted by the client's idle timeout.
+            self._report_progress_tools: set[str] = set()
 
         def tool(self, *args: Any, **kwargs: Any):
             def decorate(func: Any) -> Any:
@@ -704,6 +752,10 @@ except ModuleNotFoundError:
                 if not mcp_tool_callable(tool_name):
                     return func
                 self._tools[tool_name] = func
+                if kwargs.get("report_progress"):
+                    self._report_progress_tools.add(tool_name)
+                else:
+                    self._report_progress_tools.discard(tool_name)
                 return func
 
             return decorate
@@ -713,7 +765,12 @@ except ModuleNotFoundError:
             return list(self._tools.keys())
 
         def run(self) -> None:
-            _run_stdio_fallback_server(self.name, self._tools, self.instructions)
+            _run_stdio_fallback_server(
+                self.name,
+                self._tools,
+                self.instructions,
+                report_progress_tools=self._report_progress_tools,
+            )
 
 from . import __version__
 from . import accept_commit
