@@ -4232,9 +4232,9 @@ def _declared_workspace_seed_closure(
         for relative in _npm_validation_support(source_root, validation_rows)
         if relative not in live_seeded
     )
-    support_seeded = tuple(
-        sorted(set(support_seeded) | set(npm_support_seeded))
-    )
+    from .worker_workspace_native_seed import native_build_support  # NF-2026-02079
+    native_seeded = set(native_build_support(source_root, validation_rows)) - set(live_seeded)
+    support_seeded = tuple(sorted(set(support_seeded) | set(npm_support_seeded) | native_seeded))
     seeded = sorted(set(live_seeded) | set(support_seeded))
     ignore_candidates = {".gitignore"}
     for relative in seeded:
