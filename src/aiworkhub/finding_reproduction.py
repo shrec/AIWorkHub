@@ -545,10 +545,13 @@ def manager_reproducer(
 ) -> Callable[..., dict[str, Any]]:
     """Production wiring: the sandbox, workspaces and key of one ProcessManager.
 
-    The candidate side is a read-only review workspace materialized from the
-    sealed candidate exactly as a reviewer saw it; the base side is a scratch
-    workspace pinned to the candidate's ``base_oid`` with the same empty write
-    scope, the pattern of ``compare_schema_mypy_baseline``. The sealed-tree
+    The candidate side is the combined validation tree (HEAD with the sparse
+    definition disabled, plus the canonical delta, plus the sealed candidate
+    overlay) that accept-time validation runs on, with an empty write scope
+    (NF-2026-02077); the base side is a scratch workspace pinned to the
+    candidate's ``base_oid``, its sparse definition disabled so it is the full
+    base tree, with the same empty write scope. A failed expansion makes the
+    base UNRUNNABLE, never an exception past ``_execute``. The sealed-tree
     guard hashes the candidate's changed paths in both trees plus each tree's
     own currently-changed paths: the sealed worktree's
     (``worker_workspace.changed_paths``) and the canonical repo's
@@ -557,13 +560,13 @@ def manager_reproducer(
     raises ``finding_reproduction_sealed_tree_mutated``; so does a canonical
     one at a path the candidate side materialized from the canonical working
     tree. That set is the candidate workspace's ``workspace_baseline`` keys:
-    ``create_quality_review_workspace`` copies its live seed closure, the
-    canonical delta and the read-only inputs from the canonical working tree
-    and baselines every one of them. The base side is pinned to ``base_oid``,
-    which ``create_workspace`` materializes from git objects alone (no live
-    seed, overlay or rework copy), so it adds none. A candidate workspace that
-    was never created or carries no baseline leaves the set unknown, and any
-    canonical change then still raises. Nothing is resolved until a spec runs.
+    ``create_combined_validation_workspace`` sets them to the seed baseline
+    plus the canonical delta, the paths copied from the canonical working
+    tree. The base side is pinned to ``base_oid``, which ``create_workspace``
+    materializes from git objects alone (no live seed, overlay or rework
+    copy), so it adds none. A candidate workspace that was never created or
+    carries no baseline leaves the set unknown, and any canonical change then
+    still raises. Nothing is resolved until a spec runs.
     """
     # Re-bound from the ``process_launcher`` module object at call time, as in
     # :func:`process_launcher_accept_review.accept_review`.
@@ -580,10 +583,8 @@ def manager_reproducer(
         source = prepared["workspace"]
         candidate_paths = sorted(prepared["changed_hashes"])
         adapter_id = str(prepared.get("worker_adapter_id") or "")
-        read_only = list(prepared.get("read_only_input_paths") or [])
-        node_file = spec.body.split("::", 1)[0] if spec.kind == "pytest" else ""
-        if node_file and node_file not in candidate_paths and node_file not in read_only:
-            read_only.append(node_file)
+        # Sparse-tree plumbing (read-only inputs, the pytest node file) is gone:
+        # the candidate side is a complete tree, so every spec file is present.
         base_card = {
             key: value for key, value in dict(card).items() if key != "rework_predecessor"
         }
@@ -599,9 +600,17 @@ def manager_reproducer(
             )
 
         def _create_candidate() -> Any:
-            workspace = _pl.create_quality_review_workspace(
-                source, f"repro_{tag}", candidate_paths, adapter_id, read_only
-            )[0]
+            # The complete tree accept-time validation runs on: HEAD with the
+            # sparse definition disabled, the canonical delta, then the candidate
+            # overlay. It carries no write scope here, exactly as the base side.
+            workspace = dataclasses.replace(
+                _pl.create_combined_validation_workspace(
+                    source, base_card, candidate_paths
+                )[0],
+                allowed_writes=(),
+            )
+            # Seed baseline plus canonical delta: the paths copied from the
+            # canonical working tree.
             baseline = getattr(workspace, "workspace_baseline", None)
             materialized["candidate"] = (
                 frozenset(str(path) for path in baseline)
@@ -610,13 +619,8 @@ def manager_reproducer(
             )
             return workspace
 
-        return ReproductionTarget(
-            base_oid=str(source.base_oid or ""),
-            create_candidate=_create_candidate,
-            # The candidate side is a review workspace with no write scope; the
-            # base side gets the same, so a spec that writes inside the tree
-            # fails (or passes) identically on both and never reads as reproduced.
-            create_base=lambda: dataclasses.replace(
+        def _create_base() -> Any:
+            workspace = dataclasses.replace(
                 _pl.create_workspace(
                     source.repo,
                     f"repro_base_{tag}",
@@ -625,7 +629,31 @@ def manager_reproducer(
                     pinned_base_oid=source.base_oid,
                 ),
                 allowed_writes=(),
-            ),
+            )
+            try:
+                # ``create_workspace`` is sparse; expand it to the full base_oid
+                # tree. A failure raises, which ``_execute`` records as an
+                # UNRUNNABLE base naming it.
+                expansion = _pl._worker_workspace._run(
+                    ["git", "sparse-checkout", "disable"],
+                    cwd=workspace.path,
+                    timeout=_pl._worker_workspace.WORKTREE_CREATE_TIMEOUT_SECONDS,
+                    phase="workspace_provision",
+                )
+                if expansion.returncode != 0:
+                    raise RuntimeError(
+                        "finding_reproduction_base_sparse_disable_failed:"
+                        + str(expansion.stderr or "")[-300:]
+                    )
+            except Exception:
+                _pl.cleanup_workspace(workspace.repo, workspace.path, workspace.home)
+                raise
+            return workspace
+
+        return ReproductionTarget(
+            base_oid=str(source.base_oid or ""),
+            create_candidate=_create_candidate,
+            create_base=_create_base,
             cleanup=lambda ws: _pl.cleanup_workspace(ws.repo, ws.path, ws.home),
             run=_run,
             sealed_manifest=lambda also: sealed_manifest(

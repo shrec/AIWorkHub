@@ -876,11 +876,11 @@ def test_manager_reproducer_uses_scratch_workspaces_of_the_sealed_candidate(
     )
     calls: dict[str, Any] = {}
 
-    def create_quality_review_workspace(src, request_id, paths, adapter_id, read_only):
-        calls["candidate"] = (src, request_id, list(paths), adapter_id, list(read_only))
+    def create_combined_validation_workspace(src, candidate_card, paths):
+        calls["candidate"] = (src, candidate_card, list(paths))
         return _Workspace(
             path=trees._scratch(trees.candidate), repo=trees.canonical, home=tmp_path,
-            allowed_writes=(),
+            allowed_writes=("src/calc.py", "docs/notes.md"),
         ), {}
 
     def create_workspace(repo, request_id, card, adapter_id, *, pinned_base_oid=None):
@@ -908,11 +908,21 @@ def test_manager_reproducer_uses_scratch_workspaces_of_the_sealed_candidate(
         calls.setdefault("canonical_delta", []).append(repo)
         return trees.canonical_delta()
 
+    def worker_run(argv, **kwargs):
+        calls.setdefault("sparse_disable", []).append(
+            (list(argv), "base" if kwargs["cwd"].name == "ws1" else "other")
+        )
+        assert kwargs["phase"] == "workspace_provision"
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
     monkeypatch.setattr(
-        process_launcher, "create_quality_review_workspace", create_quality_review_workspace
+        process_launcher,
+        "create_combined_validation_workspace",
+        create_combined_validation_workspace,
     )
     monkeypatch.setattr(process_launcher, "create_workspace", create_workspace)
     monkeypatch.setattr(process_launcher, "cleanup_workspace", cleanup_workspace)
+    monkeypatch.setattr(process_launcher._worker_workspace, "_run", worker_run)
     monkeypatch.setattr(
         process_launcher, "_run_validations_with_toolchain_receipt", run_validations
     )
@@ -958,8 +968,9 @@ def test_manager_reproducer_uses_scratch_workspaces_of_the_sealed_candidate(
     assert receipt["classification"] == fr.REPRODUCED
     assert fr.verify_receipt(receipt, fr.receipt_key(KEY))
     assert calls["candidate"][0] is source and calls["candidate"][2] == ["src/calc.py"]
-    assert calls["candidate"][4] == ["tests/test_calc.py"]
+    assert "rework_predecessor" not in calls["candidate"][1]
     assert calls["base"][4] == BASE_OID and "rework_predecessor" not in calls["base"][2]
+    assert calls["sparse_disable"] == [(["git", "sparse-checkout", "disable"], "base")]
     assert all(authority == {} for authority, _route in calls["route"])
     # Both sides run with the same (empty) write scope, whatever the card allows.
     assert calls["allowed_writes"] == [(), ()]

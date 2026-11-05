@@ -354,7 +354,7 @@ def _manager_reproduce(
         path=trees.candidate, repo=trees.canonical, base_oid=rx.BASE_OID, home=tmp_path
     )
 
-    def create_quality_review_workspace(src, request_id, paths, adapter_id, read_only):
+    def create_combined_validation_workspace(src, candidate_card, paths):
         path = trees._scratch(trees.candidate)
         if baseline is None:
             return rx._Workspace(
@@ -381,9 +381,16 @@ def _manager_reproduce(
         return run(workspace.path, list(commands))
 
     monkeypatch.setattr(
-        process_launcher, "create_quality_review_workspace", create_quality_review_workspace
+        process_launcher,
+        "create_combined_validation_workspace",
+        create_combined_validation_workspace,
     )
     monkeypatch.setattr(process_launcher, "create_workspace", create_workspace)
+    monkeypatch.setattr(
+        process_launcher._worker_workspace,
+        "_run",
+        lambda argv, **kwargs: rx.SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
     monkeypatch.setattr(
         process_launcher, "cleanup_workspace", lambda repo, path, home: trees._cleanup(path)
     )
