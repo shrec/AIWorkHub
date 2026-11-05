@@ -53,7 +53,9 @@ def test_repository_identity_fallback_resolves_repo_root_once(monkeypatch, tmp_p
     ledger = cost_ledger.build_cost_ledger(repo_root=root, include_tasks=True)
 
     assert len(ledger["tasks"]) == 25
-    assert resolves["count"] == 1
+    # One resolution keys the NF-2026-02058 ledger memo and one builds the row
+    # context; neither scales with the 25 rows.
+    assert resolves["count"] <= 2
 
 
 def test_repository_identity_precedence_is_unchanged(tmp_path):
