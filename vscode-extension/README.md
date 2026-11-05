@@ -24,12 +24,12 @@ MCP stdio runtime on the workspace host. It does not open a browser or require
 an AIWorkHub cloud account, and it binds no port and exposes no LAN service
 unless you start the opt-in WorkHub Mail listener on a host and port you name.
 
-## What's new in 0.12.87
+## What's new in 0.12.88
 
-- Finished tasks no longer keep their worktree copies: once a request is closed, its worktree and home are reclaimed, even when the request's metadata was already rotated away.
-- Less background load: the manager identity probe, the storage scan and task reads stop repeating the same work on every call or in every server process.
-- Fewer retried manager calls: NeedFix conversion fills and normalizes the plan fields it can determine itself, and the status, review and reject tools accept the same identity parameters consistently.
-- Two reviewer lenses can start at the same time without colliding on the registry lock.
+- Long accepts are no longer cut off: the MCP server sends progress heartbeats while a long tool such as accept review runs, so the client's idle timeout does not abort it.
+- Faster accepts: finalization and accept reuse validation and neighbour tests that already passed, and one load-sensitive test failure is retried instead of costing a full accept cycle.
+- Faster dashboard: snapshots cache provider probes, skip a per-read database integrity check and read tasks in one batch.
+- Fewer manager steps: a verified manager's NeedFix converts in one call, and finding reproduction skips the base run when the candidate side already passes.
 
 ## Review automation
 

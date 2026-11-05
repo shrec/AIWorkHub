@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.12.88 — 2026-11-05
+
+### Changed
+
+- Bundled runtime 0.12.88: long tools such as accept review send progress heartbeats so the client no longer aborts them, accept and finalization reuse validation that already passed, and dashboard snapshots stop repeating probes and per-read checks. The full list is in the repository CHANGELOG.
+
 ## 0.12.87 — 2026-11-05
 
 ### Changed

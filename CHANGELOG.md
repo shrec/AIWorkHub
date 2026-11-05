@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.88] - 2026-11-05
+
+### Changed
+
+- The full dashboard snapshot caches provider and executable probes instead of re-running them on every call (NF-2026-02066), the summary snapshot no longer pays a `PRAGMA quick_check` on every read (NF-2026-02065), and the cost ledger reads tasks in one batch instead of one query per task (NF-2026-02067).
+- The reconciler's sdlc_sync attribution pass runs under a time budget instead of unbounded inside the MCP server (NF-2026-02068).
+- Finalization reuses the worker's verified full-snapshot validation instead of re-running it (NF-2026-02052).
+- Accept reuses neighbour tests that already ran at finalization, and one load-sensitive neighbour failure is re-run once before it fails the accept (NF-2026-02069, NF-2026-02070).
+- Seed import-closure probes are memoised and parses are cached by content hash (NF-2026-02072).
+- A NeedFix added by a verified manager converts in one call (NF-2026-02071), and the conversion preview ranks the runner at the risk tier the card will derive and over the merged conversion card (NF-2026-02074, NF-2026-02075).
+- Finding reproduction runs the base side only when the candidate side failed, and both sides run on a complete tree (NF-2026-02076, NF-2026-02077).
+
+### Fixed
+
+- The stdlib MCP backend, which the extension runs in production, now sends `notifications/progress` heartbeats while a long tool such as `aiworkhub_agent_accept_review` runs, so the client's idle timeout no longer aborts a long accept (NF-2026-02055).
+- A terminal reject reports the request and reason it judged instead of a stale disposition (NF-2026-02073).
+
 ## [0.12.87] - 2026-11-05
 
 ### Changed
