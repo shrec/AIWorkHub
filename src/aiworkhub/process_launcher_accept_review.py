@@ -3954,7 +3954,11 @@ def accept_review(
                     # One ``python -m pytest`` over the selection, through the
                     # same runner as the declared commands; a red run raises
                     # ``neighbour_tests_failed:`` and the card stays in review.
-                    neighbour_tests = accept_neighbour_tests.run_neighbour_tests(
+                    # NF-2026-02069: green finalization evidence on this same
+                    # reused tree and selection is reused instead.
+                    neighbour_tests = accept_neighbour_tests.reused_finalization_neighbours(
+                        validation_reuse, union_validation_reuse, neighbour_selection
+                    ) or accept_neighbour_tests.run_neighbour_tests(
                         neighbour_selection,
                         card,
                         run=_run_declared_validations,

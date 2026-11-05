@@ -322,7 +322,13 @@ _SELECTION = neighbours.NeighbourSelection(
     tests=("tests/test_b.py", "tests/test_a.py"), reason="", limit=12,
     production_paths=(ENGINE,), related_count=2,
 )
-_COMMAND = "python -m pytest tests/test_b.py tests/test_a.py -q"
+# NF-2026-02069: the width is explicit; 16 cores leave 12, so two files run -n 2.
+_COMMAND = "python -m pytest -n 2 tests/test_b.py tests/test_a.py -q"
+
+
+@pytest.fixture(autouse=True)
+def _sixteen_cores(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(neighbours.os, "cpu_count", lambda: 16)
 
 
 class _Runner:

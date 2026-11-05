@@ -1019,7 +1019,8 @@ def run_full_snapshot_validations(
             route_resolver=route_resolver,
             baseline_comparer=baseline_comparer,
         )
-        return validations, {
+        all_passed = not any(validation_runner._is_failing_row(row) for row in validations)
+        record: dict[str, Any] = {
             "schema_id": "aiworkhub.full_validation_snapshot.v1",
             "request_id": workspace.request_id,
             "repo": str(workspace.repo),
@@ -1027,10 +1028,23 @@ def run_full_snapshot_validations(
             "snapshot_base_oid": snapshot.base_oid,
             "combined_tree": combined_tree,
             "tree_identity_sha256": identity,
-            "validations_all_passed": not any(
-                validation_runner._is_failing_row(row) for row in validations
-            ),
+            "validations_all_passed": all_passed,
         }
+        if all_passed:  # NF-2026-02069: neighbours on this sealed tree; red never raises
+            from . import accept_neighbour_tests
+
+            neighbours = accept_neighbour_tests.run_finalization_neighbours(
+                workspace.repo, candidate, authority, commands, workspace=snapshot,
+                route_metadata=route_metadata, run=lambda ws, auth, meta: (
+                    run_declared_validations(
+                        ws, auth, meta, run_validations=run_validations,
+                        route_resolver=route_resolver, baseline_comparer=baseline_comparer,
+                    )
+                ),
+            )
+            if neighbours is not None:
+                record["neighbour_tests"] = neighbours
+        return validations, record
     finally:
         cleanup_workspace(snapshot.repo, snapshot.path, snapshot.home)
 

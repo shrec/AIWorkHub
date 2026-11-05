@@ -26,6 +26,12 @@ def _red(*nodes: str) -> dict[str, Any]:
 _GREEN = {"command": "c", "returncode": 0, "timed_out": False, "stdout_tail": "1 passed"}
 
 
+@pytest.fixture(autouse=True)
+def _sixteen_cores(monkeypatch: pytest.MonkeyPatch) -> None:
+    """NF-2026-02069: the neighbour width is explicit and core-derived; pin the cores."""
+    monkeypatch.setattr(neighbours.os, "cpu_count", lambda: 16)
+
+
 class _Runner:
     """Returns (or raises) one scripted outcome per call and records each command."""
 
@@ -70,7 +76,7 @@ def test_a_node_that_passes_on_the_serial_rerun_is_recorded_not_refused(raised: 
     runner = _Runner(first, [_GREEN])
     evidence = _run(runner)
     assert runner.commands == [
-        "python -m pytest tests/test_b.py tests/test_a.py -q",
+        "python -m pytest -n 2 tests/test_b.py tests/test_a.py -q",
         f"python -m pytest -n 0 {_FLAKY} -q",
     ]
     rerun = evidence["neighbour_flaky_rerun"]
@@ -163,7 +169,7 @@ def test_a_node_outside_the_selection_or_needing_quotes_is_not_rerun(node: str) 
 
 def test_the_serial_command_shares_the_neighbour_command_shape() -> None:
     assert neighbours.neighbour_command(["tests/test_a.py"]) == (
-        "python -m pytest tests/test_a.py -q"
+        "python -m pytest -n 1 tests/test_a.py -q"
     )
     assert neighbours.neighbour_command([_FLAKY], serial=True) == (
         f"python -m pytest -n 0 {_FLAKY} -q"

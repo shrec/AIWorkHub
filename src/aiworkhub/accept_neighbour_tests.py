@@ -371,8 +371,27 @@ def _select(
     )
 
 
+def neighbour_width(tests: Sequence[str]) -> int:
+    """xdist workers for one neighbour run (NF-2026-02069).
+
+    ``max(1, min(distinct test files, cores - headroom))`` with
+    ``headroom = max(2, cores // 4)`` and ``cores`` sampled now, so the run never
+    takes every core and never starts more workers than it has files.
+    """
+    files = {str(test).split("::", 1)[0] for test in tests}
+    cores = os.cpu_count() or 1
+    headroom = max(2, cores // 4)
+    return max(1, min(len(files), cores - headroom))
+
+
 def neighbour_command(tests: Sequence[str], *, serial: bool = False) -> str:
-    return "python -m pytest " + ("-n 0 " if serial else "") + " ".join(tests) + " -q"
+    """One ``python -m pytest`` over ``tests`` with an explicit ``-n`` width.
+
+    The width is always stated, so the repository's ``-n auto`` addopts never
+    decides it; ``serial`` is ``-n 0``.
+    """
+    width = 0 if serial else neighbour_width(tests)
+    return f"python -m pytest -n {width} " + " ".join(tests) + " -q"
 
 
 def neighbour_authority(card: Mapping[str, Any], command: str) -> dict[str, Any]:
@@ -509,3 +528,80 @@ def run_neighbour_tests(
         "validation": rerun_rows,
     }
     return evidence
+
+
+# NF-2026-02069: the neighbour run moves to finalization, on the same sealed
+# combined tree the declared validations ran in; accept reuses a green record
+# only when its own validation reuse matched that tree.
+FINALIZATION_REUSE_SOURCE = "finalization"
+
+
+def run_finalization_neighbours(
+    repo_root: Path | str,
+    candidate_changed_paths: Iterable[Any],
+    card: Mapping[str, Any],
+    declared_commands: Sequence[str],
+    *,
+    run: Callable[[Any, Mapping[str, Any], Mapping[str, Any]], list[dict[str, Any]]],
+    workspace: Any,
+    route_metadata: Mapping[str, Any],
+    clock: Callable[[], float] = time.monotonic,
+) -> dict[str, Any] | None:
+    """Select and run the neighbours once in the finalization snapshot.
+
+    ``None`` when nothing is selected. Never raises: a red, erroring or
+    evidence-free run is recorded with ``passed: False`` (and its refusal text
+    under ``error``), so finalization stands and the accept runs it again.
+    """
+    selection = select_neighbour_tests(repo_root, candidate_changed_paths, declared_commands)
+    if not selection.tests:
+        return None
+    started = clock()
+    try:
+        evidence = run_neighbour_tests(
+            selection, card, run=run, workspace=workspace,
+            route_metadata=route_metadata, clock=clock,
+        )
+    except Exception as exc:  # recorded, never raised: finalization must not fail on it
+        failed = selection.evidence()
+        failed["command"] = neighbour_command(selection.tests)
+        failed["duration_seconds"] = round(max(0.0, clock() - started), 3)
+        failed["passed"] = False
+        failed["error"] = (str(exc) or type(exc).__name__)[:NEIGHBOUR_FAILURE_DETAIL_CHARS]
+        return failed
+    evidence["passed"] = True
+    return evidence
+
+
+def reused_finalization_neighbours(
+    finalizer_reuse: Mapping[str, Any] | None,
+    union_reuse: Mapping[str, Any] | None,
+    selection: NeighbourSelection,
+) -> dict[str, Any] | None:
+    """The finalizer's green neighbour evidence when accept may reuse it, else ``None``.
+
+    Reuse needs all of: a non-empty accept-time selection; the accept's union
+    validation having reused this exact finalizer record (same snapshot, no
+    accept-union run of its own -- which a manager correction already rules
+    out, since it yields no finalizer record); recorded ``passed is True``; and
+    a recorded selection equal to ``selection.tests``.
+    """
+    if not selection.tests:
+        return None
+    if not isinstance(finalizer_reuse, Mapping) or not isinstance(union_reuse, Mapping):
+        return None
+    snapshot = finalizer_reuse.get("full_validation_snapshot")
+    if (
+        not isinstance(snapshot, Mapping)
+        or union_reuse.get("full_validation_snapshot") != snapshot
+        or union_reuse.get("reused_from") != finalizer_reuse.get("reused_from")
+    ):
+        return None
+    recorded = snapshot.get("neighbour_tests")
+    if (
+        not isinstance(recorded, Mapping)
+        or recorded.get("passed") is not True
+        or recorded.get("selected") != list(selection.tests)
+    ):
+        return None
+    return {**dict(recorded), "reused_from": FINALIZATION_REUSE_SOURCE}
