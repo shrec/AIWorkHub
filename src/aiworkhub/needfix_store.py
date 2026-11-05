@@ -3319,7 +3319,8 @@ def preview_convert(
             "converted_task_id": row["converted_task_id"],
             "resolved": True,
         }
-    claimable = row["status"] in CLAIMABLE_STATUSES
+    promotable = _verified_manager_add_promotable(row)
+    claimable = row["status"] in CLAIMABLE_STATUSES or promotable
     card = normalize_task_plan(row, task_plan)
     input_refusal = _card_input_refusal_reason(repo_root, card)
     signed = _signed_task_plan(card)
@@ -3329,8 +3330,8 @@ def preview_convert(
         "claimable": claimable,
         "convertible": claimable and input_refusal is None,
         "current_status": row["status"],
-        "unverified": row["status"] in ("captured",),
-        "triaged": row["status"] == "triaged",
+        "unverified": row["status"] in ("captured",) and not promotable,
+        "triaged": row["status"] == "triaged" and not promotable,
         "task_plan": signed,
         "plan_digest": plan_digest(card),
     }
@@ -3653,15 +3654,43 @@ def _check_already_converted(
     return None
 
 
+_CONVERT_FROM_VERIFIED_MANAGER_ADD = "convert_from_verified_manager_add"
+
+
+def _verified_manager_add_promotable(item: Mapping[str, Any]) -> bool:
+    """True when a captured/triaged item may convert in one call.
+
+    Only a manager-added item (provenance.origin == "manager_add") that is
+    verified, and carries non-empty evidence and
+    scope_files. Every other captured or triaged item keeps the existing gate.
+    """
+    if item.get("status") not in ("captured", "triaged"):
+        return False
+    provenance = item.get("provenance") or {}
+    return (
+        provenance.get("origin") == "manager_add"
+        and provenance.get("verified") is True
+        and bool(item.get("evidence"))
+        and bool(item.get("scope_files"))
+    )
+
+
 def _validate_and_claim(
     conn: sqlite3.Connection, needfix_id: str, row: sqlite3.Row
 ) -> tuple[str, str, str, dict[str, Any]]:
     """Status guard + atomic claim.
 
-    Raises NeedFixConflictError on captured/triaged or failed claim.
-    Returns ``(prior_status, needfix_snapshot)`` on success.
+    A verified manager_add captured or triaged item is promoted to accepted
+    first. The implied triaged and accepted events, with the manager identity
+    and reason ``convert_from_verified_manager_add``, commit in the same
+    savepoint as the claim, so a refused or rolled-back claim leaves no
+    promotion behind. Any other captured or triaged item raises
+    NeedFixConflictError exactly as before.
+    Returns ``(prior_status, claim_updated_at, conversion_claim_id, snapshot)``.
     """
-    if row["status"] in ("captured", "triaged"):
+    if row["status"] in ("captured", "triaged") and not _verified_manager_add_promotable(
+        _row_to_dict(row)
+    ):
         raise NeedFixConflictError(_conversion_refusal_reason(needfix_id, row["status"]))
 
     prior_status: str = row["status"]
@@ -3670,6 +3699,25 @@ def _validate_and_claim(
     conversion_claim_id = uuid.uuid4().hex
     conn.execute("SAVEPOINT conversion_claim")
     try:
+        if prior_status in ("captured", "triaged"):
+            # Re-read inside the savepoint: the promotion must judge the row
+            # it writes, not the snapshot read before the claim.
+            fresh = _row_to_dict(
+                conn.execute("SELECT * FROM needfix WHERE id = ?", (needfix_id,)).fetchone()
+            )
+            if not _verified_manager_add_promotable(fresh):
+                raise NeedFixConflictError(_conversion_refusal_reason(needfix_id, fresh["status"]))
+            detail = {
+                "reason": _CONVERT_FROM_VERIFIED_MANAGER_ADD,
+                "origin": "manager_add",
+            }
+            manager_identity = str((fresh.get("provenance") or {}).get("manager_identity") or "").strip()
+            if manager_identity:
+                detail["manager_identity"] = manager_identity
+            if fresh["status"] == "captured":
+                _apply_transition(conn, needfix_id, "triaged", "triaged", detail=detail)
+            _apply_transition(conn, needfix_id, "accepted", "accepted", detail=detail)
+            prior_status = "accepted"
         cur = conn.execute(
             "UPDATE needfix SET status = 'converting', updated_at = ?, conversion_claim_id = ? "
             "WHERE id = ? AND status IN ('accepted', 'task_planned')",
