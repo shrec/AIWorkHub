@@ -8532,6 +8532,21 @@ class WorkerSemanticEditSession:
         )
         return {"ok": True, "tool": tool, **receipt}
 
+    def _preimage_of(self, relative: str) -> tuple[str, int]:
+        """sha256 and size of the file bytes an apply is about to replace.
+
+        An unreadable file yields ``("", 0)``; the applier then refuses it with
+        its own named cause, so no receipt is ever written for it.
+        """
+
+        try:
+            data = semantic_edit.resolve_existing_file(
+                self.ctx.repo, relative
+            ).read_bytes()
+        except (OSError, semantic_edit.SemanticEditError):
+            return "", 0
+        return hashlib.sha256(data).hexdigest(), len(data)
+
     def apply(
         self, *, target_id: str, new: str, idempotency_key: str,
         allow_escape_level_change: bool = False,
@@ -8585,6 +8600,11 @@ class WorkerSemanticEditSession:
             return {**existing["receipt"], "idempotent_replay": True}
         if target is None and created_path is None:
             return _violation(self.ctx, tool, "semantic_edit_target_unknown")
+        # NF-2026-02092: hash the bytes this apply is about to replace; an
+        # earlier apply to the same file may have moved them off prepare's.
+        preimage_sha256, preimage_bytes = (
+            self._preimage_of(target.path) if target is not None else ("", 0)
+        )
         try:
             if created_path is not None:
                 # NF-2026-01928: the shared create re-checks allowed_writes,
@@ -8620,13 +8640,18 @@ class WorkerSemanticEditSession:
             # off the one the caller first asked prepare for.
             "start_line": target.start_line if target is not None else 0,
             "end_line": target.end_line if target is not None else 0,
-            "before_sha256": target.current_sha256 if target is not None else "",
+            # NF-2026-02092: the bytes this apply read and replaced, not the
+            # ones prepare saw -- an earlier apply may have changed the file.
+            "before_sha256": preimage_sha256,
             "after_sha256": hashlib.sha256(next_bytes).hexdigest(),
             "idempotency_key": idempotency_key,
             "idempotent_replay": False,
-            "file_bytes": target.file_bytes if target is not None else 0,
+            "file_bytes": preimage_bytes,
             **metrics,
         }
+        if target is not None and preimage_sha256 != target.current_sha256:
+            receipt["prepared_sha256"] = target.current_sha256
+            receipt["rebased"] = True
         # The authenticated audit record is part of the apply contract, not a
         # fire-and-forget side effect: process_launcher counts semantic-edit
         # runtime evidence from these ledger receipts, so an apply whose record

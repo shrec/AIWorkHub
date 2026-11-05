@@ -161,6 +161,9 @@ def main(argv: list[str] | None = None) -> int:
                 expected_first_line=args.expected_first_line,
                 expected_last_line=args.expected_last_line,
             )
+            preimage_sha256 = hashlib.sha256(
+                semantic_edit.resolve_existing_file(root, target.path).read_bytes()
+            ).hexdigest()
             next_text, metrics = semantic_edit_applier.replace_prepared_range(
                 root, target, new, allowed_writes=[args.path]
             )
@@ -174,12 +177,17 @@ def main(argv: list[str] | None = None) -> int:
         "path": target.path,
         "start_line": target.start_line,
         "end_line": target.end_line,
-        "before_sha256": target.current_sha256,
+        # NF-2026-02092: the bytes the apply read and replaced, not the ones
+        # prepare saw; the prepared hash is reported only when it differs.
+        "before_sha256": preimage_sha256,
         "old_region_bytes": len(target.fragment.encode("utf-8")),
         "replacement_bytes": len(new.encode("utf-8")),
         "file_bytes": len(next_text.encode("utf-8")),
         **{k: v for k, v in metrics.items() if isinstance(v, (int, float, bool, str))},
     }
+    if preimage_sha256 != target.current_sha256:
+        receipt["prepared_sha256"] = target.current_sha256
+        receipt["rebased"] = True
     if target.anchor_relocated_from is not None:
         receipt["anchor_relocated_from"] = {
             "start_line": target.anchor_relocated_from[0],
