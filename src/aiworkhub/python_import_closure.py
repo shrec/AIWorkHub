@@ -284,7 +284,8 @@ def resolve_local_python_imports(
     # the component walk below has already enforced.  Existing paths are still
     # resolved in full.
     probes: dict[str, tuple[bool, bool]] = {}
-    resolved_paths: dict[str, Path] = {}
+    # ``repo`` was resolved on entry; seeding it keeps that the only resolution.
+    resolved_paths: dict[str, Path] = {str(repo): repo}
 
     def probe(path: Path) -> tuple[bool, bool]:
         """Return ``(exists, is_symlink)`` for ``path``, memoised per call."""

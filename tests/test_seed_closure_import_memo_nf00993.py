@@ -129,12 +129,19 @@ def test_each_candidate_resolved_and_each_module_parsed_once(
     _symlink_or_skip(repo / "tools/extlib.py", outside / "extlib.py")
     resolved, parsed = _count_resolve_and_parse(monkeypatch)
 
-    assert _resolve_local_python_imports(repo, ("src/pkg/seed.py",)) == _CLOSURE
+    # use_cache=False keeps the NF-2026-02072 content-hash records (shared by the
+    # empty modules here and by earlier tests in this process) out of the count.
+    closure = python_import_closure.resolve_local_python_imports(
+        repo, ("src/pkg/seed.py",), use_cache=False
+    )
+    assert closure == _CLOSURE
 
     # ``importlib`` is probed by the import walk, the stdlib-binding check and
     # the binding check; ``extlib`` by two modules and every fallback directory.
-    # Every distinct path still resolves only once (the repo root included).
-    assert len(resolved) >= 10
+    # NF-2026-02072 resolves a missing candidate as its resolved parent plus its
+    # name, so only existing paths reach Path.resolve -- each exactly once (the
+    # repo root included).
+    assert len(resolved) >= 8
     assert max(resolved.values()) == 1, resolved.most_common(3)
     assert set(parsed) == set(_CLOSURE)
     assert max(parsed.values()) == 1
