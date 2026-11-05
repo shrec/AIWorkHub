@@ -696,6 +696,8 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "parallelism.py",
         # ...and its live-seeded .gitignore hiding step (NF-2026-01889).
         "worker_workspace_ignore_seed.py",
+        # ...and its native build-driver tree seed (NF-2026-02079).
+        "worker_workspace_native_seed.py",
     ):
         shutil.copyfile(source_package / name, destination_package / name)
     # write_bytes, not write_text: several tests compare a raw on-disk byte
