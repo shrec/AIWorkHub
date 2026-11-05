@@ -865,10 +865,24 @@ def quick_check(path: Path) -> str:
 # both entries and age. A NON-ok result is never cached: a corrupt database must
 # be re-checked every time so a repair is noticed immediately, which keeps the
 # gate fail-closed in the direction that matters.
+#
+# NF-2026-02065: stale-while-revalidate. At ~640 MB one scan is 5.25 s, and with
+# a synchronous TTL refresh whichever request arrived first after expiry paid it
+# (the dashboard poll, task_show, accept, launch ...). Now an ok verdict older
+# than the TTL is still returned, and ONE background re-scan per database
+# identity is started (single-flight via ``_QUICK_CHECK_REFRESHING``). Only an
+# identity with no ok verdict yet -- the first check in this process, or a
+# replaced/cut-over file -- scans synchronously. A background scan that is not
+# ok (or raises) drops the cached verdict and the readiness memo, so the next
+# request scans synchronously and fails closed. The re-scan period is still the
+# TTL. ``_QUICK_CHECK_GENERATION`` stops a scan in flight across
+# ``reset_storage_readiness_cache`` from storing its verdict.
 _QUICK_CHECK_TTL_SECONDS = 300.0
 _QUICK_CHECK_CACHE_MAX_ENTRIES = 32
 _QUICK_CHECK_LOCK = threading.RLock()
 _QUICK_CHECK_CACHE: "OrderedDict[tuple[str, int, int], tuple[float, str]]" = OrderedDict()
+_QUICK_CHECK_REFRESHING: "dict[tuple[str, int, int], threading.Thread]" = {}
+_QUICK_CHECK_GENERATION = 0
 
 
 # NF-2026-02059: a POSITIVE readiness verdict is memoized per resolved
@@ -901,20 +915,80 @@ def reset_storage_readiness_cache() -> None:
 
     Call after any operation that replaces or rebuilds the canonical database
     in place, and from tests that corrupt a database and expect the next
-    readiness call to see it.
+    readiness call to see it. A background re-scan still in flight is
+    forgotten: it finishes, but its verdict is discarded.
     """
 
-    global _READINESS_MEMO_GENERATION
+    global _READINESS_MEMO_GENERATION, _QUICK_CHECK_GENERATION
     with _QUICK_CHECK_LOCK:
         _QUICK_CHECK_CACHE.clear()
+        _QUICK_CHECK_REFRESHING.clear()
+        _QUICK_CHECK_GENERATION += 1
     with _READINESS_MEMO_LOCK:
         _READINESS_MEMO.clear()
         _READINESS_PATHS.clear()
         _READINESS_MEMO_GENERATION += 1
 
 
+def _store_quick_check_ok(key: tuple[str, int, int], stored_at: float) -> None:
+    """Remember an ok verdict; the caller holds ``_QUICK_CHECK_LOCK``."""
+    _QUICK_CHECK_CACHE[key] = (stored_at, "ok")
+    _QUICK_CHECK_CACHE.move_to_end(key)
+    while len(_QUICK_CHECK_CACHE) > _QUICK_CHECK_CACHE_MAX_ENTRIES:
+        _QUICK_CHECK_CACHE.popitem(last=False)
+
+
+def _refresh_quick_check(path: Path, key: tuple[str, int, int], generation: int) -> None:
+    """Background re-scan for one identity; never raises."""
+    global _READINESS_MEMO_GENERATION
+    started = time.monotonic()
+    try:
+        result: str | None = quick_check(path)
+    except Exception:  # noqa: BLE001 -- an unreadable database is a non-ok verdict
+        result = None
+    failed = False
+    with _QUICK_CHECK_LOCK:
+        if _QUICK_CHECK_REFRESHING.get(key) is threading.current_thread():
+            del _QUICK_CHECK_REFRESHING[key]
+        if generation != _QUICK_CHECK_GENERATION:
+            return
+        if result == "ok":
+            _store_quick_check_ok(key, started)
+        else:
+            # Fail closed: the next request re-scans synchronously and sees it.
+            _QUICK_CHECK_CACHE.pop(key, None)
+            failed = True
+    if failed:
+        with _READINESS_MEMO_LOCK:
+            _READINESS_MEMO.clear()
+            _READINESS_MEMO_GENERATION += 1
+
+
+def _schedule_quick_check_refresh(path: Path, key: tuple[str, int, int]) -> bool:
+    """Start the single background re-scan for ``key``; caller holds the lock.
+
+    Returns False only when no thread could be started, so the caller scans
+    synchronously instead of serving the stale verdict indefinitely.
+    """
+    if key in _QUICK_CHECK_REFRESHING:
+        return True
+    thread = threading.Thread(
+        target=_refresh_quick_check,
+        args=(path, key, _QUICK_CHECK_GENERATION),
+        name="aiworkhub-quick-check-refresh",
+        daemon=True,
+    )
+    _QUICK_CHECK_REFRESHING[key] = thread
+    try:
+        thread.start()
+    except RuntimeError:
+        del _QUICK_CHECK_REFRESHING[key]
+        return False
+    return True
+
+
 def _cached_quick_check(path: Path) -> str:
-    """``quick_check`` bounded by database identity and age."""
+    """``quick_check`` bounded by database identity, stale-while-revalidate."""
 
     try:
         info = path.stat()
@@ -924,17 +998,15 @@ def _cached_quick_check(path: Path) -> str:
     now = time.monotonic()
     with _QUICK_CHECK_LOCK:
         cached = _QUICK_CHECK_CACHE.get(key)
-        if cached is not None and now - cached[0] <= _QUICK_CHECK_TTL_SECONDS:
+        if cached is not None:
             _QUICK_CHECK_CACHE.move_to_end(key)
-            return cached[1]
+            if now - cached[0] <= _QUICK_CHECK_TTL_SECONDS or _schedule_quick_check_refresh(path, key):
+                return cached[1]
     result = quick_check(path)
     if result != "ok":
         return result
     with _QUICK_CHECK_LOCK:
-        _QUICK_CHECK_CACHE[key] = (now, result)
-        _QUICK_CHECK_CACHE.move_to_end(key)
-        while len(_QUICK_CHECK_CACHE) > _QUICK_CHECK_CACHE_MAX_ENTRIES:
-            _QUICK_CHECK_CACHE.popitem(last=False)
+        _store_quick_check_ok(key, now)
     return result
 
 

@@ -97,22 +97,40 @@ _DECISION_POPULATION_SQL = f"""
 # Only these rows are review decisions. An archived/superseded row counts as a
 # rejection solely when its durable reason is a ``reject_review:`` disposition
 # -- identical to ``task_store.latest_manager_decisions``.
-_DECISION_ROW_SQL = """
-    event IN ('accept_review', 'reject_review')
-    OR (
-        event IN ('archived', 'superseded')
-        AND json_extract(payload_json, '$.reason') LIKE 'reject_review:%'
+#
+# NF-2026-02065: the newest ``LIMIT ?`` qualifying rows, one index range per
+# event value. The former single ``WHERE event IN (...) OR (...)`` predicate let
+# the planner, once ``sqlite_stat1`` exists, satisfy ``ORDER BY event_id DESC``
+# by walking the whole table in rowid order -- ``SCAN task_events`` -- which was
+# 7.89 s of a 17.6 s dashboard snapshot on the ~640 MB canonical store. Each
+# branch below is an equality on ``event``, so it is a SEARCH of
+# ``idx_task_store_events_event_id (event, event_id DESC)`` that already yields
+# event_id order, and the compound is a MERGE (UNION ALL). The four predicates
+# are disjoint and together equal the old one, so the selected rows -- and the
+# counts -- are unchanged.
+_DECISION_EVENTS_CTE_SQL = """
+decision_events AS (
+    SELECT task_id, event_id, event FROM (
+        SELECT task_id, event_id, event FROM task_events
+        WHERE event = 'accept_review'
+        UNION ALL
+        SELECT task_id, event_id, event FROM task_events
+        WHERE event = 'reject_review'
+        UNION ALL
+        SELECT task_id, event_id, event FROM task_events
+        WHERE event = 'archived'
+          AND json_extract(payload_json, '$.reason') LIKE 'reject_review:%'
+        UNION ALL
+        SELECT task_id, event_id, event FROM task_events
+        WHERE event = 'superseded'
+          AND json_extract(payload_json, '$.reason') LIKE 'reject_review:%'
     )
-"""
-# One vote per DISTINCT card: its most recent qualifying decision.
-_WORK_CARD_DECISION_CARD_SQL = f"""
-WITH decision_events AS (
-    SELECT task_id, event_id, event
-    FROM task_events
-    WHERE {_DECISION_ROW_SQL}
     ORDER BY event_id DESC
     LIMIT ?
-),
+)"""
+# One vote per DISTINCT card: its most recent qualifying decision.
+_WORK_CARD_DECISION_CARD_SQL = f"""
+WITH {_DECISION_EVENTS_CTE_SQL},
 latest_decision AS (
     SELECT d.task_id, d.event
     FROM decision_events d
@@ -132,13 +150,7 @@ GROUP BY population
 # The same population under the OLD per-event rule, so the payload can state
 # its own inflation factor instead of asking a reader to assume one.
 _WORK_CARD_DECISION_EVENT_SQL = f"""
-WITH decision_events AS (
-    SELECT task_id, event_id, event
-    FROM task_events
-    WHERE {_DECISION_ROW_SQL}
-    ORDER BY event_id DESC
-    LIMIT ?
-)
+WITH {_DECISION_EVENTS_CTE_SQL}
 SELECT
     {_DECISION_POPULATION_SQL} AS population,
     SUM(CASE WHEN e.event = 'accept_review' THEN 1 ELSE 0 END) AS accepted,
