@@ -166,6 +166,52 @@ def _opencode_balance_refusal_from_event(
     }
 
 
+def _balance_detail(event: dict[str, Any]) -> str:
+    """Bounded provider message of a balance envelope; retained detail, never a decision input."""
+
+    error = event.get("error")
+    candidates: list[Any] = [event.get("message")]
+    if isinstance(error, dict):
+        data = error.get("data")
+        candidates.extend((error.get("message"), data.get("message") if isinstance(data, dict) else None))
+    elif isinstance(error, str):
+        candidates.append(error)
+    return next((str(c)[:300] for c in candidates if isinstance(c, str) and c.strip()), "")
+
+
+def _provider_balance_refusal_from_event(
+    event: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Seal ANY adapter's HTTP 402 / balance-exhausted failure envelope (NF-2026-02085).
+
+    Generalises ``_opencode_balance_refusal_from_event``: the predicate is the
+    classifier's own ``provider_event_names_balance_exhaustion`` (one definition),
+    which reads only a CLI-owned failure envelope and never assistant or tool
+    text. The sealed record is identical, so the workforce circuit scoped to
+    adapter and provider prefix opens exactly as it does for NF-2026-01601.
+    """
+
+    if not terminal_failure_classification.provider_event_names_balance_exhaustion(event):
+        return None
+    return {
+        "schema_id": "aiworkhub.provider_launch_failure.v1",
+        "reason": "provider_refused_balance_exhausted",
+        "refusal_kind": runtime_adapters.REFUSAL_BALANCE_EXHAUSTED,
+        "recoverable": False,
+        "http_status": 402,
+        "error_code": "insufficient_balance",
+        "session_id": "",
+        "provider_error": {
+            "schema_id": "aiworkhub.provider_route_error.v1",
+            "owner": "provider",
+            "sealed": True,
+            "code": "insufficient_balance",
+            "http_status": 402,
+            "detail": _balance_detail(event),
+        },
+    }
+
+
 def _provider_auth_failure_from_output(path: Path) -> dict[str, Any] | None:
     """Return a bounded, body-classified provider-refusal record, no secret text.
 
@@ -269,6 +315,11 @@ def _provider_auth_failure_from_output(path: Path) -> dict[str, Any] | None:
             or structured_retry_error
             or structured_assistant_error
         ):
+            # NF-2026-02085: an envelope no structured branch above placed may
+            # still be ANY adapter's balance refusal (HTTP 402 / balance phrase).
+            generic_balance = _provider_balance_refusal_from_event(event)
+            if generic_balance is not None:
+                return generic_balance
             continue
         # Hand the provider's OWN status and machine error code to the classifier
         # -- never the ``result``/message prose, which an agent could author.

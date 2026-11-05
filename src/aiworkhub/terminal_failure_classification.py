@@ -1787,6 +1787,104 @@ _MAX_SIGNAL_LINES = 400
 _MAX_EMBEDDED_BYTES = 8192
 _MAX_EMBEDDED_DEPTH = 2
 
+# --------------------------------------------------------------------------- #
+# ANY ADAPTER'S BALANCE / HTTP 402 REFUSAL (NF-2026-02085).
+#
+# NF-2026-01601 sealed only opencode's ``provider.quota`` envelope. A reviewer
+# routed to deepseek_v4-pro answered ``[402] You have run out of balance`` in an
+# opencode ``APIError`` whose status sits in ``error.data.statusCode`` and whose
+# body code is the unplaced ``invalid_request_error``: no status, no placed code,
+# class ``unknown``, provider left in rotation. This is the ONE definition of
+# "this provider-owned event says the account has no balance"; the launcher's
+# seal (``process_launcher_provider_failures``) imports it rather than keeping a
+# second predicate.
+#
+# WHAT MAY SPEAK. Only a CLI's own failure envelope: an ``error`` /
+# ``turn.failed`` / ``session.error`` event, a failed ``result``, or an
+# ``api_retry``. Assistant and tool text never counts, so a model that prints the
+# sentence mints nothing. The evidence is a 402 status in a typed field, a typed
+# balance code, or a balance sentence in the envelope's own message.
+# --------------------------------------------------------------------------- #
+_BALANCE_CODE = "insufficient_balance"
+_BALANCE_EXHAUSTED_CODES = frozenset({"insufficient_balance", "balance_exhausted"})
+_BALANCE_EXHAUSTED_PHRASE = re.compile(
+    r"run out of (?:balance|credits?)|out of (?:balance|credits?)"
+    r"|insufficient (?:balance|credits?|funds)"
+    r"|(?:balance|credits?) (?:is |has been |was )?(?:exhausted|depleted)"
+    r"|payment required|\[402\]"
+    r"|(?<![0-9A-Za-z])(?:http[ _])?status(?:[ _]?code)?[ :=]+402(?![0-9])",
+    re.I,
+)
+# A plaintext (non-JSON) stderr line is the least trustworthy surface, so it
+# may mint a balance refusal only when it carries a 402 status marker; a bare
+# balance phrase ("insufficient funds") alone must not.
+_BALANCE_STATUS_PHRASE = re.compile(
+    r"\[402\]|payment required"
+    r"|(?<![0-9A-Za-z])status[ _]?(?:code)?[ :=]+402(?![0-9])",
+    re.I,
+)
+_BALANCE_STATUS_FIELDS = ("status", "statusCode", "error_status", "api_error_status")
+_BALANCE_TEXT_FIELDS = ("message", "result")
+_OWNED_ERROR_EVENT_KINDS = frozenset({"error", "turn.failed", "session.error", "session_error"})
+
+
+def _event_names_balance(event: dict[str, Any], depth: int) -> bool:
+    result_event = str(event.get("type") or "").strip().lower() == "result"
+    body = event.get("error")
+    containers: list[dict[str, Any]] = [event]
+    texts: list[str] = []
+    if isinstance(body, str):
+        if body.strip().lower() in _BALANCE_EXHAUSTED_CODES:
+            return True
+        texts.append(body)
+    elif isinstance(body, dict):
+        containers.append(body)
+        data = body.get("data")
+        if isinstance(data, dict):
+            containers.append(data)
+    for container in containers:
+        for field in _BALANCE_STATUS_FIELDS:
+            status = container.get(field)
+            if isinstance(status, int) and not isinstance(status, bool) and status == 402:
+                return True
+        code = container.get("code")
+        if isinstance(code, str) and code.strip().lower() in _BALANCE_EXHAUSTED_CODES:
+            return True
+        for field in _BALANCE_TEXT_FIELDS:
+            value = container.get(field)
+            if not isinstance(value, str):
+                continue
+            # A failed ``result`` event's free-text ``result`` is agent-authorable
+            # prose; only the CLI's own ``API Error:`` sentence may speak.
+            if (
+                field == "result"
+                and result_event
+                and container is event
+                and not value.startswith("API Error:")
+            ):
+                continue
+            texts.append(value)
+    if any(_BALANCE_EXHAUSTED_PHRASE.search(text[:_MAX_EMBEDDED_BYTES]) for text in texts):
+        return True
+    return depth < _MAX_EMBEDDED_DEPTH and any(
+        _event_names_balance(nested, depth + 1)
+        for text in texts
+        for nested in _embedded_objects(text, depth)
+    )
+
+
+def provider_event_names_balance_exhaustion(event: object) -> bool:
+    """True iff one CLI-owned failure envelope says the account is out of balance (HTTP 402)."""
+    if not isinstance(event, dict):
+        return False
+    kind = str(event.get("type") or "").strip().lower()
+    owned = (
+        kind in _OWNED_ERROR_EVENT_KINDS
+        or (kind == "result" and event.get("is_error") is True)
+        or (kind == "system" and str(event.get("subtype") or "").strip().lower() == "api_retry")
+    )
+    return owned and _event_names_balance(event, 0)
+
 # Reasons THIS repository mints, placed by reading the code that raises each.
 #
 # DEFECT is the narrow one on purpose. Only a refusal AIWorkHub itself issued
@@ -2312,6 +2410,13 @@ def _harvest_provider_event(event: object, found: dict[str, Any], depth: int = 0
             and _PROVIDER_UNREACHABLE_RESULT_RE.search(result_text)
         ):
             code = "provider_unreachable"
+    # NF-2026-02085: a balance refusal outranks an envelope label that places
+    # nothing (``invalid_request_error`` is what DeepSeek's 402 body carries).
+    if (
+        PROVIDER_CODE_DISPOSITION.get(code, FAILURE_CLASS_UNKNOWN) == FAILURE_CLASS_UNKNOWN
+        and provider_event_names_balance_exhaustion(event)
+    ):
+        code = _BALANCE_CODE
     if code and not found["code"] and code in PROVIDER_CODE_DISPOSITION:
         # The KEY object is stored, never the parsed argument, so no provider
         # byte can reach a durable field through this path.
@@ -2348,7 +2453,7 @@ def _harvest_provider_event(event: object, found: dict[str, Any], depth: int = 0
 
 
 def provider_terminal_signal(
-    text: str | None, *, structured_tool_seen: bool = False,
+    text: str | None, *, structured_tool_seen: bool = False, plain_text: bool = False,
 ) -> dict[str, Any]:
     """Read the PROVIDER's own typed terminal envelope out of a bounded tail.
 
@@ -2386,6 +2491,13 @@ def provider_terminal_signal(
         if line.startswith("data:"):
             line = line[5:].strip()
         if not line.startswith("{"):
+            if (
+                plain_text
+                and not found["code"]
+                and _BALANCE_STATUS_PHRASE.search(line[:_MAX_EMBEDDED_BYTES])
+            ):
+                found["code"] = _BALANCE_CODE
+                found["envelope"] = found["envelope"] or _PROVIDER_TERMINAL_ENVELOPES[2]
             continue
         try:
             event = json.loads(line)
@@ -2540,8 +2652,12 @@ def _legacy_failure_disposition(
             "envelope": "",
         }
 
-    for tail in (stderr_tail, stdout_tail):
-        signal = provider_terminal_signal(tail, structured_tool_seen=structured_tool_seen)
+    # NF-2026-02085: only stderr (the CLI's own channel, never model output) may
+    # carry a balance sentence as plain text; stdout is read as typed JSON only.
+    for is_stderr, tail in ((True, stderr_tail), (False, stdout_tail)):
+        signal = provider_terminal_signal(
+            tail, structured_tool_seen=structured_tool_seen, plain_text=is_stderr,
+        )
         if signal["envelope"] not in _PROVIDER_TERMINAL_ENVELOPES:
             continue
         code = str(signal["code"])
