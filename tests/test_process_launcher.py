@@ -13325,7 +13325,7 @@ def test_process_manager_finalization_uses_complete_toolchain_receipt_identity(
     monkeypatch.setattr(
         process_launcher,
         "_run_full_snapshot_validations",
-        lambda workspace_arg, authority, route_metadata, _paths: (
+        lambda workspace_arg, authority, route_metadata, _paths, **_kwargs: (
             process_launcher._run_declared_validations(
                 workspace_arg, authority, route_metadata
             ),

@@ -675,7 +675,7 @@ def _finalize(tmp_path: Path, monkeypatch, rows, *, request_id: str, message: st
         process_launcher, "_retained_candidate_seal_evidence", lambda *_a, **_k: {}
     )
 
-    def full_snapshot(target, authority, route_metadata, _paths):
+    def full_snapshot(target, authority, route_metadata, _paths, **_kwargs):
         def run(_workspace, _commands, **_route):
             raise ValidationRunError(message, rows)
 
