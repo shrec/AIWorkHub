@@ -4338,7 +4338,7 @@ def test_finalize_isolated_request_validation_only_replay_authorization(
     )
     snapshot_calls = []
 
-    def fake_full_snapshot(_workspace, _authority, _route, candidate_paths):
+    def fake_full_snapshot(_workspace, _authority, _route, candidate_paths, **_kwargs):
         snapshot_calls.append(list(candidate_paths))
         return [], {"schema_id": "aiworkhub.full_validation_snapshot.v1"}
 
