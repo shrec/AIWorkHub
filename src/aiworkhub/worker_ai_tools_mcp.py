@@ -9150,7 +9150,7 @@ def validation_run(
     *,
     index: Any = "all",
     force: bool = False,
-    timeout_seconds: int = 1800,
+    timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Run the card's own declared validation command(s) and return a digest.
 
@@ -9174,8 +9174,16 @@ def validation_run(
     still expose that private runtime directory
     (``_contained_validation_blocker``) keeps the refusal, and the
     coordinator's post-exit validation stays the only run.
+
+    On the combined full-snapshot lane (``index="all"``, NF-2026-02052) an
+    explicit ``timeout_seconds`` is ignored and reported as
+    ``timeout_seconds_ignored``, because the reuse record must match the
+    declared timeouts the finalizer itself uses.
     """
 
+    timeout_override = timeout_seconds is not None
+    if timeout_seconds is None:
+        timeout_seconds = 1800
     contained = bool(ctx.contained_worker)
     if contained:
         from . import worker_workspace
@@ -9235,7 +9243,17 @@ def validation_run(
                 timeout_seconds=timeout_seconds,
             )
     else:
-        results = [
+        # NF-2026-02052: an "all" run goes to the coordinator's combined
+        # canonical-plus-candidate snapshot and seals a reuse record; a sparse
+        # worktree run is never reusable and runs only when that lane cannot.
+        full: dict[str, Any] = {"ok": False, "reason": "partial_selection"}
+        if set(selected) == set(range(len(commands))):
+            from . import worker_validation_reuse
+
+            full = worker_validation_reuse.run_for_worker_context(
+                ctx, commands, candidate_digest, force=bool(force)
+            )
+        results = list(full["results"]) if full.get("ok") else [
             _run_one_validation(
                 ctx,
                 workspace=workspace,
@@ -9258,6 +9276,13 @@ def validation_run(
         "acceptance_evidence": "coordinator_post_exit_run_validations",
         "results": results,
     }
+    if not contained:
+        result["validation_lane"] = (
+            "combined_full_snapshot" if full.get("ok") else "sparse_worktree"
+        )
+        if full.get("ok") and timeout_override:
+            result["timeout_seconds_ignored"] = True
+        result["full_snapshot_reason"] = str(full.get("reason") or "")
     green = all(row.get("returncode") == 0 for row in results)
     result["all_passed"] = green
     if green and set(selected) == set(range(len(commands))):

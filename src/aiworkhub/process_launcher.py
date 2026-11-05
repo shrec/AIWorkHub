@@ -11137,7 +11137,8 @@ class ProcessManager:
                         return _run_declared_validations(workspace, metadata, metadata)
                     validations, full_validation_snapshot = (
                         _run_full_snapshot_validations(
-                            workspace, metadata, metadata, candidate_changed_paths
+                            workspace, metadata, metadata, candidate_changed_paths,
+                            reuse=_launcher_validation.worker_validation_run_reuse(metadata),
                         )
                     )
                     return validations

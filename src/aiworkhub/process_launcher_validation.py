@@ -31,6 +31,19 @@ CombinedWorkspaceFactory = Callable[..., tuple[WorkerWorkspace, dict[str, Any]]]
 
 _VALIDATION_REPLAY_LOCK = Lock()
 ACCEPT_UNION_REUSE_SOURCE = "accept_union"
+# NF-2026-02052: rows the worker's verified validation_run(all) produced.
+WORKER_VALIDATION_RUN_REUSE_SOURCE = "worker_validation_run"
+
+
+def worker_validation_run_reuse(metadata):
+    """NF-2026-02052: the worker's verified full-snapshot reuse record, or None."""
+    from .worker_validation_reuse import load_verified_reuse  # lazy: that module imports this one
+    return load_verified_reuse(metadata)
+
+
+_NAMED_REUSE_SOURCES = frozenset(
+    {ACCEPT_UNION_REUSE_SOURCE, WORKER_VALIDATION_RUN_REUSE_SOURCE}
+)
 _VALIDATION_REPLAYS_IN_FLIGHT: set[tuple[str, str, str]] = set()
 
 # --- NF-2026-01030: the manager-authorized host validation lane -------------
@@ -945,12 +958,13 @@ def _reusable_finalizer_rows(
         ):
             return None
     source = reuse.get("reused_from")
-    return [dict(row) for row in rows], {
+    named = source if source in _NAMED_REUSE_SOURCES else "finalization"
+    # Rows the worker produced say so in terminal evidence and the review packet.
+    stamp = {"reused_from": named} if named == WORKER_VALIDATION_RUN_REUSE_SOURCE else {}
+    return [{**dict(row), **stamp} for row in rows], {
         **recorded,
         "reused": True,
-        "reused_from": (
-            source if source == ACCEPT_UNION_REUSE_SOURCE else "finalization"
-        ),
+        "reused_from": named,
     }
 
 
