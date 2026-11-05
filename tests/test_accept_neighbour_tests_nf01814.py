@@ -338,7 +338,8 @@ class _Runner:
 
 
 def _clock() -> Any:
-    ticks = iter([10.0, 12.5])
+    # A red run with parseable node ids re-runs them once (NF-2026-02070): two more ticks.
+    ticks = iter([10.0, 12.5, 13.0, 14.0])
     return lambda: next(ticks)
 
 

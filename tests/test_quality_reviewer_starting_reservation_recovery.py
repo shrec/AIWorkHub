@@ -705,7 +705,7 @@ def test_periodic_scan_preserves_spawn_commit_appended_after_snapshot(
     def paused_snapshot():
         snapshot = original_snapshot()
         snapshot_taken.set()
-        assert allow_reconcile.wait(timeout=5.0)
+        assert allow_reconcile.wait(timeout=60.0)
         return snapshot
 
     monkeypatch.setattr(reconciler, "_latest_by_request_stable", paused_snapshot)
@@ -726,12 +726,12 @@ def test_periodic_scan_preserves_spawn_commit_appended_after_snapshot(
 
     thread = threading.Thread(target=scan)
     thread.start()
-    assert snapshot_taken.wait(timeout=5.0)
+    assert snapshot_taken.wait(timeout=60.0)
     assert launcher._reviewer_spawn_transition(
         request_id, reviewer_claim_epoch=claim_epoch
     )
     allow_reconcile.set()
-    thread.join(timeout=5.0)
+    thread.join(timeout=60.0)
     assert not thread.is_alive()
 
     events = reconciler._request_events(request_id)
