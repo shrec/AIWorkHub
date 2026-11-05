@@ -31,6 +31,11 @@ _HOUR = 3600.0
 _NOW = 2_000_000_000.0
 
 
+def _counts(result: dict) -> dict:
+    """The sweep's pass/count fields; NF-2026-02089 adds per-removal report keys."""
+    return {key: result[key] for key in ("ok", "removed", "bytes", "errors")}
+
+
 def _stub_non_scratch_steps(monkeypatch) -> None:
     """Stub the six pre-existing janitor steps so only ``scratch`` is live."""
     monkeypatch.setattr(storage_retention, "_janitor_worktrees", lambda root: {"gc_scanned": 0})
@@ -135,7 +140,7 @@ def test_live_owner_candidate_is_kept(monkeypatch, tmp_path: Path) -> None:
 
     result = storage_retention._janitor_scratch(tmp_path.resolve(), _NOW)
 
-    assert result == {"ok": True, "removed": 0, "bytes": 0, "errors": []}
+    assert _counts(result) == {"ok": True, "removed": 0, "bytes": 0, "errors": []}
     assert candidate.exists()
 
 
@@ -152,7 +157,7 @@ def test_scratch_step_removes_candidate_with_read_only_file(
 
     result = storage_retention._janitor_scratch(tmp_path.resolve(), _NOW)
 
-    assert result == {"ok": True, "removed": 1, "bytes": 0, "errors": []}
+    assert _counts(result) == {"ok": True, "removed": 1, "bytes": 0, "errors": []}
     assert not candidate.exists()
 
 
@@ -456,7 +461,7 @@ def test_compat_aged_caches_and_unregistered_artifact_removed_registered_kept(
 
     result = storage_retention._janitor_scratch(tmp_path.resolve(), _NOW)
 
-    assert result == {"ok": True, "removed": 3, "bytes": 0, "errors": []}
+    assert _counts(result) == {"ok": True, "removed": 3, "bytes": 0, "errors": []}
     assert not paths["bun_cache"].exists()
     assert not paths["node_modules"].exists()
     assert not paths["unregistered"].exists()
@@ -477,7 +482,7 @@ def test_compat_fresh_caches_and_artifact_are_kept(monkeypatch, tmp_path: Path) 
 
     result = storage_retention._janitor_scratch(tmp_path.resolve(), _NOW)
 
-    assert result == {"ok": True, "removed": 0, "bytes": 0, "errors": []}
+    assert _counts(result) == {"ok": True, "removed": 0, "bytes": 0, "errors": []}
     for key in ("bun_cache", "node_modules", "unregistered", "registered", "backup"):
         assert paths[key].exists()
 
@@ -490,7 +495,7 @@ def test_compat_missing_registration_keeps_every_artifact(
 
     result = storage_retention._janitor_scratch(tmp_path.resolve(), _NOW)
 
-    assert result == {"ok": True, "removed": 2, "bytes": 0, "errors": []}
+    assert _counts(result) == {"ok": True, "removed": 2, "bytes": 0, "errors": []}
     assert not paths["bun_cache"].exists()
     assert not paths["node_modules"].exists()
     for key in ("registered", "backup", "unregistered"):

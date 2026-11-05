@@ -2894,7 +2894,9 @@ _SCRATCH_RUNTIME_NAME_PATTERNS = (
 )
 _SCRATCH_MAX_AGE_SECONDS = 48 * 60 * 60
 # NF-2026-02029: a provably dead manager seat's .scratch/<session_id> grace.
-_SCRATCH_DEAD_SEAT_GRACE_SECONDS = 2 * 3600
+# NF-2026-02089: 72h (covers a next-day session), overridable from the repo
+# policy's ``retention.scratch_dead_seat_grace_hours``.
+_SCRATCH_DEAD_SEAT_GRACE_SECONDS = 72 * 3600
 # Re-creatable build output inside an opencode-compat-* workspace
 # (``bun install --frozen-lockfile``; NF-2026-01614) and its build artifacts.
 _COMPAT_RUNTIME_NAME_PATTERN = "opencode-compat-*"
@@ -3002,6 +3004,236 @@ def _compat_workspace_candidates(
     return candidates
 
 
+# NF-2026-02089: what still points at a dead seat's scratch keeps it alive.
+_SCRATCH_REPORT_LIMIT = 50
+_SCRATCH_REFERENCE_FILE_MAX_BYTES = 4 * 1024 * 1024
+_SCRATCH_REFERENCE_MAX_FILES = 2000
+_SCRATCH_REFERENCE_MAX_TABLES = 64
+_SCRATCH_GRACE_POLICY_KEY = "scratch_dead_seat_grace_hours"
+_SCRATCH_GRACE_MAX_HOURS = 24 * 365
+# Session Manager records a handoff or checkpoint as one ``documents`` row of
+# its transcript store; the manager loop keeps its own handoff files and
+# ``mls-*.json`` session records under ``.aiworkhub/runtime/manager_loop``.
+_SCRATCH_REFERENCE_DOCUMENT_KINDS = ("handoff", "checkpoint")
+_SCRATCH_SESSION_RECORD_GLOB = "mls-*.json"
+
+
+def _scratch_dead_seat_grace_seconds(root: Path) -> float:
+    """The dead-seat grace: 72h unless ``retention.scratch_dead_seat_grace_hours`` says otherwise.
+
+    Read straight from the policy file because ``repo_policy.validate_policy``
+    rebuilds ``retention`` from known keys only.  A missing, unreadable or
+    out-of-range value yields the default, never a shorter grace.
+    """
+    try:
+        path = repo_policy.policy_path(root)
+        if path.is_symlink() or path.stat().st_size > repo_policy.MAX_POLICY_BYTES:
+            return float(_SCRATCH_DEAD_SEAT_GRACE_SECONDS)
+        hours = json.loads(path.read_text(encoding="utf-8"))["retention"][
+            _SCRATCH_GRACE_POLICY_KEY
+        ]
+    except (OSError, ValueError, KeyError, TypeError, RecursionError):
+        return float(_SCRATCH_DEAD_SEAT_GRACE_SECONDS)
+    if isinstance(hours, bool) or not isinstance(hours, int):
+        return float(_SCRATCH_DEAD_SEAT_GRACE_SECONDS)
+    if not 1 <= hours <= _SCRATCH_GRACE_MAX_HOURS:
+        return float(_SCRATCH_DEAD_SEAT_GRACE_SECONDS)
+    return float(hours * 3600)
+
+
+def _scratch_seat_ids(candidate: Path, manifest: Mapping[str, Any]) -> list[str]:
+    """The ids a record may use for this seat: its stamped session id, then its dir name."""
+    ids: list[str] = []
+    stamped = manifest.get("session_id")
+    for value in (stamped if isinstance(stamped, str) else "", candidate.name):
+        if value and value not in ids:
+            ids.append(value)
+    return ids
+
+
+def _quote_sql_identifier(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _scratch_database_references(db_path: Path, label: str, needles: list[str]) -> list[str]:
+    """``label:table`` for every table of one SQLite store holding any needle in any column."""
+    ro_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    conn = sqlite3.connect(ro_uri, uri=True, timeout=5.0)
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+        tables = [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' "
+                "AND COALESCE(sql, '') NOT LIKE 'CREATE VIRTUAL%' ORDER BY name LIMIT ?",
+                (_SCRATCH_REFERENCE_MAX_TABLES + 1,),
+            )
+        ]
+        if len(tables) > _SCRATCH_REFERENCE_MAX_TABLES:
+            raise sqlite3.DatabaseError("too_many_tables")
+        hits: list[str] = []
+        for table in tables:
+            quoted_table = _quote_sql_identifier(table)
+            columns = [
+                str(row[1]) for row in conn.execute(f"PRAGMA table_info({quoted_table})")
+            ]
+            if not columns:
+                continue
+            predicate = " OR ".join(
+                f"instr(CAST({_quote_sql_identifier(column)} AS TEXT), ?) > 0"
+                for column in columns
+            )
+            for needle in needles:
+                row = conn.execute(
+                    f"SELECT 1 FROM {quoted_table} WHERE {predicate} LIMIT 1",
+                    (needle,) * len(columns),
+                ).fetchone()
+                if row is not None:
+                    hits.append(f"{label}:{table}")
+                    break
+        return hits
+    finally:
+        conn.close()
+
+
+def _scratch_session_document_references(
+    db_path: Path, label: str, needles: list[str]
+) -> list[str]:
+    """``label:documents`` when a handoff/checkpoint document names a needle.
+
+    Session Manager writes every ``handoff`` and ``checkpoint`` as one
+    ``documents`` row (``kind``, ``content``); no other table or kind of the
+    store is evidence of where a seat's tools live.  A store without a
+    ``documents`` table holds no such record (no reference); a ``documents``
+    table that lacks ``kind``/``content`` cannot be judged and fails closed.
+    """
+    ro_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    conn = sqlite3.connect(ro_uri, uri=True, timeout=5.0)
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+        columns = {str(row[1]) for row in conn.execute('PRAGMA table_info("documents")')}
+        if not columns:
+            return []
+        if not {"kind", "content"} <= columns:
+            raise sqlite3.DatabaseError("documents_schema_unsupported")
+        kinds = _SCRATCH_REFERENCE_DOCUMENT_KINDS
+        kind_marks = ",".join("?" for _ in kinds)
+        for needle in needles:
+            row = conn.execute(
+                f"SELECT 1 FROM documents WHERE kind IN ({kind_marks}) "
+                "AND instr(CAST(content AS TEXT), ?) > 0 LIMIT 1",
+                (*kinds, needle),
+            ).fetchone()
+            if row is not None:
+                return [f"{label}:documents"]
+        return []
+    finally:
+        conn.close()
+
+
+def _scratch_file_references(directory: Path, label: str, needles: list[str]) -> list[str]:
+    """``label:<file>`` for every handoff file naming a needle (fail closed)."""
+    entries = sorted(directory.iterdir())
+    if len(entries) > _SCRATCH_REFERENCE_MAX_FILES:
+        raise OSError("too_many_files")
+    hits: list[str] = []
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_file():
+            continue
+        if entry.stat().st_size > _SCRATCH_REFERENCE_FILE_MAX_BYTES:
+            raise OSError("file_too_large")
+        text = entry.read_bytes().decode("utf-8", errors="replace")
+        if any(needle in text or needle in entry.name for needle in needles):
+            hits.append(f"{label}:{entry.name}")
+    return hits
+
+
+def _scratch_session_record_references(
+    directory: Path, label: str, needles: list[str]
+) -> list[str]:
+    """``label:<file>`` for every NOT-closed ``mls-*.json`` record naming a needle.
+
+    A closed session's record persists for history; it is not a live handoff,
+    so it does not keep a seat's scratch.  A record that cannot be parsed
+    raises ``ValueError`` and the caller keeps the seat (fail closed).
+    """
+    entries = sorted(directory.glob(_SCRATCH_SESSION_RECORD_GLOB))
+    if len(entries) > _SCRATCH_REFERENCE_MAX_FILES:
+        raise OSError("too_many_files")
+    hits: list[str] = []
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_file():
+            continue
+        if entry.stat().st_size > _SCRATCH_REFERENCE_FILE_MAX_BYTES:
+            raise OSError("file_too_large")
+        text = entry.read_bytes().decode("utf-8", errors="replace")
+        record = json.loads(text)
+        if not isinstance(record, dict):
+            raise ValueError("session_record_not_an_object")
+        if record.get("status") == "closed":
+            continue
+        if any(needle in text or needle in entry.name for needle in needles):
+            hits.append(f"{label}:{entry.name}")
+    return hits
+
+
+# (label, directory under manager_loop, scanner).  Handoff files always count;
+# a session record counts only while its status is not "closed".
+_SCRATCH_REFERENCE_FILE_DIRS = (
+    ("handoff", "handoffs", _scratch_file_references),
+    ("session_record", "sessions", _scratch_session_record_references),
+)
+# (label, path under .aiworkhub, scanner).  Session Manager's store is read
+# only for handoff/checkpoint documents; memory and KB are scanned whole.
+_SCRATCH_REFERENCE_DATABASES = (
+    ("session", Path("sessions") / "sessions.sqlite", _scratch_session_document_references),
+    (
+        "transcript",
+        Path("sessions") / "transcript_graph.sqlite",
+        _scratch_session_document_references,
+    ),
+    ("memory", Path("memory") / "memory.sqlite", _scratch_database_references),
+    ("kb", Path("kb") / "knowledge.sqlite", _scratch_database_references),
+)
+
+
+def _scratch_seat_references(root: Path, seat_ids: list[str]) -> list[str]:
+    """What still names this seat's session id or scratch path; empty means unreferenced.
+
+    Reads the manager loop's handoff files and its not-closed session records,
+    the Session Manager's handoff/checkpoint documents, and the AI Memory and
+    KB stores.  A store that exists but cannot be read completely contributes a
+    ``reference_scan_unavailable`` entry, so the seat is kept rather than
+    judged unreferenced on partial evidence.
+    """
+    needles = [seat_id for seat_id in seat_ids if seat_id]
+    if not needles:
+        return ["reference_scan_unavailable:no_session_id"]
+    found: list[str] = []
+    loop_dir = root / CANONICAL_RUNTIME_RELATIVE_PATH / "manager_loop"
+    for label, dirname, scan_directory in _SCRATCH_REFERENCE_FILE_DIRS:
+        directory = loop_dir / dirname
+        try:
+            if not directory.is_dir():
+                continue
+            found.extend(scan_directory(directory, label, needles))
+        except (OSError, ValueError, RecursionError):  # deeply nested JSON
+            found.append(f"reference_scan_unavailable:{label}")
+    hub_dir = root / ".aiworkhub"
+    for label, relative, scan_database in _SCRATCH_REFERENCE_DATABASES:
+        db_path = hub_dir / relative
+        try:
+            if not db_path.is_file():
+                continue
+            found.extend(scan_database(db_path, label, needles))
+        except (sqlite3.Error, OSError, ValueError):
+            found.append(f"reference_scan_unavailable:{label}")
+    return found
+
+
 def _janitor_scratch(root: Path, now: float) -> dict[str, Any]:
     """Delete aged disposable scratch output the other six steps never see.
 
@@ -3011,11 +3243,16 @@ def _janitor_scratch(root: Path, now: float) -> dict[str, Any]:
     skipped when younger than 48h, a symlink/junction, outside its expected
     parent (``.aiworkhub`` or ``.scratch``) once resolved, or still held by a live
     runtime_temp owner; a ``.scratch/<session_id>`` dir stamped by a manager
-    seat whose owner is provably dead is reclaimed once 2h have passed since
-    its last write (NF-2026-02029).  A directory goes through the single shared
+    seat whose owner is provably dead is reclaimed once the dead-seat grace
+    (72h, ``retention.scratch_dead_seat_grace_hours`` in the repo policy) has
+    passed since its last write -- and only while no Session Manager handoff or
+    session record, AI Memory row or KB row still names its session id or path
+    (NF-2026-02029, NF-2026-02089).  A directory goes through the single shared
     workspace-removal helper and any other entry is unlinked; both repair a
     read-only leftover instead of leaving it behind.  A candidate that fails
-    the pre-deletion re-check is kept and not counted as removed.
+    the pre-deletion re-check is kept and not counted as removed.  The result
+    lists every removal (``removals``: path, session id, age, reason) and every
+    dead seat kept because it is still referenced (``kept_referenced``).
     """
     import fnmatch
 
@@ -3068,6 +3305,10 @@ def _janitor_scratch(root: Path, now: float) -> dict[str, Any]:
         candidates.extend(_compat_workspace_candidates(runtime_dir, expected_runtime_dir))
 
     selected: list[tuple[Path, Path]] = []
+    # candidate -> (session_id, age_seconds, reason) for the sweep report.
+    removal_info: dict[Path, tuple[str | None, int, str]] = {}
+    kept_referenced: list[dict[str, Any]] = []
+    dead_seat_grace = _scratch_dead_seat_grace_seconds(root)
     for candidate, expected_parent in candidates:
         if candidate.is_symlink() or candidate.is_junction():
             continue
@@ -3088,15 +3329,39 @@ def _janitor_scratch(root: Path, now: float) -> dict[str, Any]:
             and manifest.get("kind") == runtime_temp.SEAT_MANIFEST_KIND
             and runtime_temp.owner_alive(manifest) is False
         ):
-            # NF-2026-02029: an ended manager seat's scratch is reclaimed early.
-            if age > _SCRATCH_DEAD_SEAT_GRACE_SECONDS:
+            # NF-2026-02029: an ended manager seat's scratch is reclaimed early,
+            # NF-2026-02089: but only once nothing durable still points at it.
+            if age > dead_seat_grace:
+                seat_ids = _scratch_seat_ids(candidate, manifest)
+                references = _scratch_seat_references(root, seat_ids)
+                if references:
+                    kept_referenced.append(
+                        {
+                            "path": str(candidate),
+                            "session_id": seat_ids[0],
+                            "age_seconds": int(age),
+                            "references": references[:_SCRATCH_REPORT_LIMIT],
+                        }
+                    )
+                    continue
                 selected.append((candidate, expected_parent))
+                removal_info[candidate] = (
+                    seat_ids[0],
+                    int(age),
+                    f"dead_seat_unreferenced_past_{int(dead_seat_grace)}s_grace",
+                )
             continue
         if age <= _SCRATCH_MAX_AGE_SECONDS:
             continue
         if manifest is not None and runtime_temp.request_alive(root, manifest):
             continue
         selected.append((candidate, expected_parent))
+        # Opencode caches, artifacts and plain scratch dirs are not sessions.
+        removal_info[candidate] = (
+            None,
+            int(age),
+            f"aged_past_{_SCRATCH_MAX_AGE_SECONDS}s",
+        )
 
     expected_parent_by_candidate = dict(selected)
     skipped: list[Path] = []
@@ -3127,11 +3392,25 @@ def _janitor_scratch(root: Path, now: float) -> dict[str, Any]:
         [candidate for candidate, _ in selected], _remove_verified_scratch_candidate
     )
     errors = [error for _path, error in failures]
+    not_removed = {str(path) for path, _error in failures} | {str(path) for path in skipped}
+    # NF-2026-02089: every removal is reported with what it was and why.
+    removals = [
+        {
+            "path": str(candidate),
+            "session_id": removal_info[candidate][0],
+            "age_seconds": removal_info[candidate][1],
+            "reason": removal_info[candidate][2],
+        }
+        for candidate, _ in selected
+        if str(candidate) not in not_removed
+    ][:_SCRATCH_REPORT_LIMIT]
     return {
         "ok": not errors,
         "removed": len(selected) - len(failures) - len(skipped),
         "bytes": 0,
         "errors": errors,
+        "removals": removals,
+        "kept_referenced": kept_referenced[:_SCRATCH_REPORT_LIMIT],
     }
 
 

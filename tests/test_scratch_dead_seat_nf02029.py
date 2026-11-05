@@ -2,9 +2,10 @@
 
 A seat stamps its scratch dir with the runtime_temp owner manifest
 (``kind == "manager_seat"``).  Once that owner is provably dead the janitor
-reclaims the dir 2h after its last write instead of 48h; a live seat is never
-reclaimed and an unstamped dir keeps the 48h rule.  Process liveness is
-monkeypatched, and ages are injected because utime is denied in the sandbox.
+reclaims the dir 72h (NF-2026-02089; was 2h) after its last write instead of
+48h; a live seat is never reclaimed and an unstamped dir keeps the 48h rule.
+Process liveness is monkeypatched, and ages are injected because utime is
+denied in the sandbox.
 """
 
 from __future__ import annotations
@@ -53,14 +54,14 @@ def _seat(root: Path, session_id: str) -> Path:
     return seat
 
 
-def test_dead_seat_dir_three_hours_old_is_removed(
+def test_dead_seat_dir_past_the_72h_grace_is_removed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = _repo(tmp_path)
     seat = _seat(root, "dead-seat")
     _set_owner_dead(monkeypatch, True)
 
-    result = _sweep(root, monkeypatch, {seat: 3 * _HOUR})
+    result = _sweep(root, monkeypatch, {seat: 73 * _HOUR})
 
     assert result["ok"] is True, result
     assert result["removed"] == 1
@@ -70,17 +71,21 @@ def test_dead_seat_dir_three_hours_old_is_removed(
 def test_dead_seat_removal_depends_on_the_seat_branch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # With the seat branch disabled the same 3h dir falls back to the 48h rule
-    # and stays: test (a) above fails without the new branch.
+    # A stamped dead seat 49h old is inside the 72h grace and stays; with the
+    # seat branch disabled the same dir falls back to the 48h rule and goes.
     root = _repo(tmp_path)
     seat = _seat(root, "dead-seat")
     _set_owner_dead(monkeypatch, True)
-    monkeypatch.setattr(runtime_temp, "SEAT_MANIFEST_KIND", "branch_disabled")
 
-    result = _sweep(root, monkeypatch, {seat: 3 * _HOUR})
-
-    assert result["removed"] == 0
+    kept = _sweep(root, monkeypatch, {seat: 49 * _HOUR})
+    assert kept["removed"] == 0
     assert seat.is_dir()
+
+    monkeypatch.setattr(runtime_temp, "SEAT_MANIFEST_KIND", "branch_disabled")
+    result = _sweep(root, monkeypatch, {seat: 49 * _HOUR})
+
+    assert result["removed"] == 1
+    assert not seat.exists()
 
 
 def test_dead_seat_dir_one_hour_old_is_kept(
