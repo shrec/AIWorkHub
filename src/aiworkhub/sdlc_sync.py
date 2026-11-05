@@ -685,7 +685,7 @@ def sync_once(
             }}
         return {"summary": {"state": "ok", "tasks": len(outcomes), "ready": ready}}
 
-    def run_attribution() -> dict[str, Any]:
+    def queue_attribution() -> list[str]:
         window_ids = {
             needfix_id
             for task_id, entry in window["tasks"].items()
@@ -698,24 +698,49 @@ def sync_once(
         if window_ids:
             # Durable before attributing, so a failed write or attribution is retried.
             _write_state(state_path, pending_add=window_ids)
-        pending = sorted(window_ids | _read_pending(state_path))
+        return sorted(window_ids | _read_pending(state_path))
+
+    def run_attribution() -> dict[str, Any]:
+        pending = queue_attribution()
         if not pending:
             return {"summary": {"state": "idle"}}
         attributed: dict[str, str] = {}
         failed: dict[str, str] = {}
-        for needfix_id in pending:
+        # One catalog per pass: every NeedFix shares its card index and its
+        # (commit, path) hash memo instead of re-reading the whole store.
+        catalog = (
+            None if _expired()
+            else sdlc_attribution.load_accepted_catalog(root, repository_id)
+        )
+        remaining = 0
+        for position, needfix_id in enumerate(pending):
+            if _expired():
+                # Unprocessed ids never reach pending_done, so they stay pending.
+                remaining = len(pending) - position
+                break
             try:
-                outcome = sdlc_attribution.attribute_needfix(root, repository_id, needfix_id)
+                outcome = sdlc_attribution.attribute_needfix(
+                    root, repository_id, needfix_id, catalog=catalog,
+                )
             except Exception as exc:  # noqa: BLE001 -- retried next pass
                 failed[needfix_id] = type(exc).__name__[:80]
                 continue
             attributed[needfix_id] = "attributed" if outcome.attributed else outcome.reason[:80]
         _write_state(state_path, pending_done=set(attributed))
+        if failed:
+            marker = "sdlc_sync:attribution:failed"
+            if marker not in result["failures"]:
+                result["failures"].append(marker)
+        if remaining:
+            summary: dict[str, Any] = {
+                "state": "deferred", "reason": PASS_BUDGET_EXHAUSTED,
+                "remaining": remaining, "attributed": attributed,
+            }
+            if failed:
+                summary["failed"] = failed
+            return {"summary": summary}
         if not failed:
             return {"summary": {"state": "ok", "attributed": attributed}}
-        marker = "sdlc_sync:attribution:failed"
-        if marker not in result["failures"]:
-            result["failures"].append(marker)
         return {"summary": {"state": "partial", "attributed": attributed, "failed": failed}}
 
     def run_bands() -> dict[str, Any]:
@@ -857,7 +882,13 @@ def sync_once(
             }}
         return {"summary": {"state": "ran", "retried": len(outcomes), "maintained": maintained}}
 
-    def run_part(part: str, action: Callable[[], Any], *, budgeted: bool = False) -> Any:
+    def run_part(
+        part: str,
+        action: Callable[[], Any],
+        *,
+        budgeted: bool = False,
+        on_deferred: Callable[[], Any] | None = None,
+    ) -> Any:
         if on_stage is not None:
             try:
                 on_stage(part)
@@ -865,9 +896,13 @@ def sync_once(
                 pass
         if budgeted and _expired():
             # Not started once the budget is spent; the next pass picks it up.
-            return _guarded(result, part, lambda: {
-                "summary": {"state": "deferred", "reason": PASS_BUDGET_EXHAUSTED},
-            })
+            # ``on_deferred`` persists whatever that next pass needs to find it.
+            def deferred() -> dict[str, Any]:
+                if on_deferred is not None:
+                    on_deferred()
+                return {"summary": {"state": "deferred", "reason": PASS_BUDGET_EXHAUSTED}}
+
+            return _guarded(result, part, deferred)
         return _guarded(result, part, action)
 
     cases_ok = run_part("cases", run_cases) is not None
@@ -876,7 +911,7 @@ def sync_once(
         staged = run_part("stages", run_stages, budgeted=True)
         run_part("release", run_release, budgeted=True)
         run_part("maintain", run_maintain, budgeted=True)
-    run_part("attribution", run_attribution)
+    run_part("attribution", run_attribution, budgeted=True, on_deferred=queue_attribution)
     run_part("bands", run_bands)
     stages_done = staged is not None and staged["summary"].get("state") != "deferred"
     if cases_ok and stages_done and window["last"] > after:

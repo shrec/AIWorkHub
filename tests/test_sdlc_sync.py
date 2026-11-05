@@ -75,7 +75,7 @@ def spies(repo, monkeypatch):
     calls = SimpleNamespace(attributed=[], evaluated=0, filed=[])
 
     # Exact canonical signatures, so a drift in sync_once's calls fails here.
-    def attribute_needfix(root, repository_id, needfix_id):
+    def attribute_needfix(root, repository_id, needfix_id, *, catalog):
         assert repository_id == repo.repo_id
         calls.attributed.append(needfix_id)
         return SimpleNamespace(attributed=True, reason="")
@@ -402,10 +402,10 @@ def test_failed_attribution_is_retried_after_the_cursor_moves_past_the_accept(
     _append_task_event(repo.root, second_fix, "accept_review")
     working = sdlc_sync.sdlc_attribution.attribute_needfix
 
-    def flaky(root, repository_id, needfix_id):
+    def flaky(root, repository_id, needfix_id, *, catalog):
         if needfix_id == "NF-2026-00001":
             raise RuntimeError("attribution exploded")
-        return working(root, repository_id, needfix_id)
+        return working(root, repository_id, needfix_id, catalog=catalog)
 
     monkeypatch.setattr(sdlc_sync.sdlc_attribution, "attribute_needfix", flaky)
     first = sdlc_sync.sync_once(repo.root, repo.repo_id)
@@ -436,7 +436,7 @@ def test_failed_attribution_survives_a_failed_post_loop_state_write(repo, spies,
     working_attr = sdlc_sync.sdlc_attribution.attribute_needfix
     working_write = sdlc_sync._write_state
 
-    def exploding_attr(root, repository_id, needfix_id):
+    def exploding_attr(root, repository_id, needfix_id, *, catalog):
         raise RuntimeError("attribution exploded")
 
     def exploding_done(path, **kwargs):

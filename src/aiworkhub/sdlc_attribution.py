@@ -36,7 +36,7 @@ import json
 import os
 import re
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -83,6 +83,8 @@ HASH_MISMATCH = "hash_mismatch"
 
 MAX_TASK_CARDS = 5000
 MAX_NEEDFIX_ROWS = 5000
+#: Bound on one catalog's ``(commit, path) -> sha256`` memo (a digest per entry).
+MAX_PATH_SHA_MEMO = 200_000
 
 _HUNK_RE = re.compile(rb"^@@ -(\d+)(?:,(\d+))? \+")
 # 40 hex for a sha1 object format, 64 for sha256; the repository decides, not us.
@@ -209,6 +211,8 @@ def first_holding_commit(
     base_oid: str,
     paths: Sequence[str],
     path_hashes: Mapping[str, str],
+    *,
+    path_sha256: Callable[[str, str], str | None] | None = None,
 ) -> tuple[str | None, str]:
     """First canonical descendant of ``base_oid`` holding every promoted-path hash.
 
@@ -217,7 +221,11 @@ def first_holding_commit(
     read and no descendant commit's tree carries exactly those bytes. Isolated
     blobs that are in the object database but in no descendant tree are refused:
     a promoted path must have actually landed.
+
+    ``path_sha256(commit, path)`` replaces :func:`commit_path_sha256` -- the
+    ``AcceptedCatalog`` passes its per-pass memo -- and must answer identically.
     """
+    lookup = path_sha256 or (lambda commit, relative: commit_path_sha256(repo, commit, relative))
     commits = descendant_commits(repo, base_oid)
     if commits is None:
         return None, GIT_UNAVAILABLE
@@ -225,7 +233,7 @@ def first_holding_commit(
         observed: dict[str, str] = {}
         missing = False
         for relative in paths:
-            digest = commit_path_sha256(repo, commit, relative)
+            digest = lookup(commit, relative)
             if digest is None:
                 missing = True
                 break
@@ -480,6 +488,12 @@ class AcceptedCatalog:
         self._by_task = {card.task_id: card for card in self._cards}
         self._by_key = {card.key: card for card in self._cards}
         self._holding: dict[tuple[str, str], tuple[str | None, str]] = {}
+        # One catalog lives for one attribution pass; every holding-commit walk
+        # and every blamed-commit lookup in that pass shares these bytes. Bounded
+        # by MAX_PATH_SHA_MEMO, with hits/misses kept so the hit rate is measured.
+        self._path_sha: dict[tuple[str, str], str | None] = {}
+        self.path_sha_hits = 0
+        self.path_sha_misses = 0
 
     @property
     def cards(self) -> tuple[AcceptedCard, ...]:
@@ -491,12 +505,25 @@ class AcceptedCatalog:
     def card_for_key(self, key: tuple[str, str]) -> AcceptedCard | None:
         return self._by_key.get(key)
 
+    def path_sha256(self, commit: str, path: str) -> str | None:
+        """``commit_path_sha256`` memoized per ``(commit, path)`` for this catalog."""
+        key = (commit, path)
+        if key in self._path_sha:
+            self.path_sha_hits += 1
+            return self._path_sha[key]
+        self.path_sha_misses += 1
+        digest = commit_path_sha256(self._repo, commit, path)
+        if len(self._path_sha) < MAX_PATH_SHA_MEMO:
+            self._path_sha[key] = digest
+        return digest
+
     def holding_commit(self, card: AcceptedCard) -> tuple[str | None, str]:
         """``first_holding_commit`` for ``card``, computed at most once."""
         memo = self._holding.get(card.key)
         if memo is None:
             memo = first_holding_commit(
                 self._repo, card.base_oid, card.promoted_paths, card.changed_path_hashes,
+                path_sha256=self.path_sha256,
             )
             self._holding[card.key] = memo
         return memo
@@ -509,9 +536,26 @@ class AcceptedCatalog:
         Both halves are required: a card that promoted the path but landed in a
         different commit did not write this line, and a card whose commit
         matches but never promoted this path did not write it either.
+
+        Inverted for cost, same answer: ``holding_commit(card) == commit`` means
+        ``commit``'s tree carries every promoted-path hash of ``card``, so in
+        particular ``path``'s bytes at ``commit`` hash to
+        ``card.changed_path_hashes[path]``. Cards failing that necessary
+        condition are skipped without walking their history; the survivors are
+        verified exactly as before, in the same card order.
         """
+        observed: str | None = None
+        looked_up = False
         for card in self._cards:
             if card.key == exclude or path not in card.promoted_paths:
+                continue
+            if not looked_up:
+                observed = self.path_sha256(commit, path)
+                looked_up = True
+                if observed is None:
+                    # No regular-file bytes at ``commit``: no card can hold it.
+                    return None
+            if card.changed_path_hashes.get(path) != observed:
                 continue
             if self.holding_commit(card)[0] == commit:
                 return card
