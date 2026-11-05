@@ -160,7 +160,7 @@ def _bounded_final_excerpt(text: str) -> str:
     return collapsed
 
 
-def _report_from_text(text: str) -> dict[str, Any] | None:
+def _strict_report_from_text(text: str) -> dict[str, Any] | None:
     """Extract one review report from a provider final message.
 
     The reviewer prompt asks for exactly one bare JSON object, so a strict
@@ -181,6 +181,179 @@ def _report_from_text(text: str) -> dict[str, Any] | None:
             raise ReviewProtocolError("malformed_structured_output") from None
         return None
     return _report_from_value(value)
+
+
+# A reviewer on a provider that cannot drive the MCP submit tool (measured:
+# opencode + deepseek-v4-pro on needfix-NF-2026-02089) writes the call out as
+# plain text.  The marker is the tool's own name, so prose that merely talks
+# about reviewing is never mistaken for a call.
+REVIEW_SUBMIT_TOOL_MARKER = "quality_review_submit"
+_MAX_SUBMIT_WALK_DEPTH = 6
+# A call, not a mention: the name is followed at once by ``(`` or by
+# argument-shaped text, so "via quality_review_submit (the MCP tool)" is prose.
+# Lookaheads keep the match end right before the arguments.
+_SUBMIT_CALL_RE = re.compile(
+    re.escape(REVIEW_SUBMIT_TOOL_MARKER)
+    + r"(?:\(|\s*(?:\(\s*(?=\{|\"|lens\b|findings\b)|(?=\{)|[\"']?>?\s*(?=<parameter)))"
+)
+_SUBMIT_NAME_FIELD_RE = re.compile(
+    r"\"(?:name|tool|tool_name|function)\"\s*:\s*\"[^\"]*"
+    + re.escape(REVIEW_SUBMIT_TOOL_MARKER)
+)
+_XML_PARAMETER_RE = re.compile(
+    r"<parameter\s+name=[\"'](lens|findings)[\"']\s*>(.*?)</parameter>", re.DOTALL
+)
+
+
+def _looks_like_text_submit_call(text: str) -> bool:
+    """True when ``text`` reads as the submit tool being called in prose."""
+    return bool(_SUBMIT_CALL_RE.search(text) or _SUBMIT_NAME_FIELD_RE.search(text))
+
+
+def _submit_arguments(value: Any, depth: int = 0) -> dict[str, Any] | None:
+    """Find the submit arguments inside one parsed tool-call envelope.
+
+    Providers wrap the arguments differently (``arguments``, ``input``,
+    ``parameters``, a JSON-encoded string, a ``tool_calls`` list), so the walk
+    is shape-agnostic but depth-bounded and keyed on the one thing the tool
+    requires: a ``findings`` list.  The last such object wins.
+    """
+    if depth > _MAX_SUBMIT_WALK_DEPTH:
+        return None
+    found: dict[str, Any] | None = None
+    if isinstance(value, dict):
+        if isinstance(value.get("findings"), list):
+            return value
+        children: Iterable[Any] = value.values()
+    elif isinstance(value, list):
+        children = value
+    elif isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+        try:
+            children = [json.loads(value)]
+        except json.JSONDecodeError:
+            return None
+    else:
+        return None
+    for child in children:
+        nested = _submit_arguments(child, depth + 1)
+        if nested is not None:
+            found = nested
+    return found
+
+
+def _xml_submit_arguments(text: str) -> dict[str, Any] | None:
+    """Read ``<parameter name="lens|findings">`` style call arguments."""
+    arguments: dict[str, Any] = {}
+    for name, raw in _XML_PARAMETER_RE.findall(text):
+        body = raw.strip()
+        if name == "lens":
+            arguments["lens"] = body
+            continue
+        try:
+            arguments["findings"] = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+    return arguments if isinstance(arguments.get("findings"), list) else None
+
+
+def _last_submit_call(text: str) -> tuple[int, int] | None:
+    """(start, end) of the call match that ends last, or ``None``."""
+    last: tuple[int, int] | None = None
+    for pattern in (_SUBMIT_CALL_RE, _SUBMIT_NAME_FIELD_RE):
+        for match in pattern.finditer(text):
+            if last is None or match.end() > last[1]:
+                last = (match.start(), match.end())
+    return last
+
+
+def _final_call_object(text: str, call_start: int) -> str | None:
+    """The first balanced object that reaches the LAST call, never an earlier one.
+
+    An object that closes before ``call_start`` is a quoted example, not the
+    call.  An envelope that names the tool encloses its own match, so the
+    first object still open at ``call_start`` is the call's own.
+    """
+    offset = 0
+    for candidate in _iter_balanced_objects(text):
+        offset = text.find(candidate, offset)
+        end = offset + len(candidate)
+        if end > call_start:
+            return candidate
+        offset = end
+    return None
+
+
+def _salvage_text_submit(text: str, expected_lens: str | None) -> dict[str, Any] | None:
+    """Recover the report from a submit call the reviewer wrote as plain text.
+
+    Only the LAST call in the text is read: a quoted example object before it
+    is never a fallback for a final call that is broken.  The recovered
+    arguments are reduced to exactly ``lens`` and ``findings`` so the normal
+    normalisation and packet-path validation judge them like any report.  A
+    call that omits ``lens`` borrows ``expected_lens``; a lens that is present
+    is kept so a mismatch still fails as ``lens_mismatch``.  Nothing readable
+    returns ``None`` and the caller classifies the final as a protocol failure.
+    """
+    call = _last_submit_call(text)
+    if call is None:
+        return None
+    call_start, call_end = call
+    candidate = _final_call_object(text, call_start)
+    arguments: dict[str, Any] | None = None
+    if candidate is not None:
+        try:
+            arguments = _submit_arguments(json.loads(candidate))
+        except json.JSONDecodeError:
+            return None
+    if arguments is None:
+        # XML-style calls carry their arguments in ``<parameter>`` tags, whose
+        # JSON bodies are not themselves the call envelope.
+        arguments = _xml_submit_arguments(text[call_end:])
+    if arguments is None:
+        return None
+    lens = arguments.get("lens", expected_lens)
+    if not isinstance(lens, str) or not lens:
+        return None
+    return {"lens": lens, "findings": list(arguments["findings"])}
+
+
+def _final_call_has_arguments(text: str) -> bool:
+    """True when argument-shaped text follows the last call, readable or not."""
+    call = _last_submit_call(text)
+    return call is not None and "{" in text[call[1]:]
+
+
+def _report_from_text(text: str, expected_lens: str | None = None) -> dict[str, Any] | None:
+    """Strict/tolerant report parse, then text-submit salvage.
+
+    When the text calls the submit tool, the final call is authoritative: a
+    readable one is salvaged, and an unreadable one never yields an earlier
+    quoted object as the report.  A strict refusal (malformed or multiple
+    objects) stands unless the final call itself is readable.
+    """
+    stripped = text.strip()
+    report: dict[str, Any] | None = None
+    strict_error: ReviewProtocolError | None = None
+    try:
+        report = _strict_report_from_text(text)
+    except ReviewProtocolError as exc:
+        if exc.category not in {"malformed_structured_output", "multiple_report_objects"}:
+            raise
+        strict_error = exc
+    if report is None or strict_error is not None or _looks_like_text_submit_call(stripped):
+        salvaged = _salvage_text_submit(stripped, expected_lens)
+        if salvaged is not None:
+            return salvaged
+        if strict_error is not None:
+            raise strict_error
+        if report is not None and _final_call_has_arguments(stripped):
+            return None
+    if report is not None:
+        if "packet_sha256" in report and _looks_like_text_submit_call(text):
+            # The submit tool's own argument, not part of the report shape.
+            report = {k: v for k, v in report.items() if k != "packet_sha256"}
+        return report
+    return None
 
 
 # Host-provided structured review tools whose typed input IS the report.
@@ -300,6 +473,7 @@ def extract_structured_final(events: Iterable[str], *, expected_lens: str) -> In
     reports: list[dict[str, Any]] = []
     tool_use_findings: list[Any] | None = None
     final_count = 0
+    text_submit_seen = False
     last_final_text = ""
     retained_events = 0
     retained_bytes = 0
@@ -339,9 +513,11 @@ def extract_structured_final(events: Iterable[str], *, expected_lens: str) -> In
             continue
         final_count += 1
         last_final_text = text
-        report = _report_from_text(text)
+        report = _report_from_text(text, expected_lens=expected_lens)
         if report is not None:
             reports.append(report)
+        elif _looks_like_text_submit_call(text):
+            text_submit_seen = True
     compaction = event_compaction_record(
         retained_events=retained_events, retained_bytes=retained_bytes,
         compacted_events=compacted_events, compacted_bytes=compacted_bytes,
@@ -357,8 +533,16 @@ def extract_structured_final(events: Iterable[str], *, expected_lens: str) -> In
                 final_excerpt=_bounded_final_excerpt(last_final_text),
                 event_compaction=compaction,
             )
+        if text_submit_seen:
+            # The reviewer wrote the submit call as text and nothing in it
+            # could be read: a provider protocol failure, never a silent
+            # empty findings list.  ingest_structured_final raises it only
+            # after an explicit receipt has been considered.
+            status = "text_submit_unparsed"
+        else:
+            status = "unstructured_final" if final_count else "missing_final"
         return IngestResult(
-            "unstructured_final" if final_count else "missing_final",
+            status,
             None,
             final_excerpt=_bounded_final_excerpt(last_final_text),
             event_compaction=compaction,
@@ -447,6 +631,9 @@ def ingest_structured_final(
 
 def _no_report_reason(result: IngestResult) -> str:
     """Explain an empty ingest with a bounded excerpt of the reviewer output."""
+    if result.status == "text_submit_unparsed":
+        excerpt = result.final_excerpt or "(empty final message)"
+        return f"text_submit_unparseable:{excerpt}"
     if result.status == "unstructured_final":
         excerpt = result.final_excerpt or "(empty final message)"
         return f"no_report_in_final:{excerpt}"
@@ -500,6 +687,12 @@ _REPAIRABLE_INSTRUCTIONS: dict[str, str] = {
     "no_provider_final": (
         "Your previous turn produced no final message at all. Finish this "
         "turn with exactly one bare JSON object and no text after it."
+    ),
+    "text_submit_unparseable": (
+        "Your previous turn wrote the review-submit call out as plain text "
+        "instead of invoking the tool, and its arguments could not be read. "
+        "Invoke the submit tool itself, or finish with exactly one bare JSON "
+        "object carrying \"lens\" and \"findings\" and no text after it."
     ),
     "malformed_structured_output": (
         "Your previous turn's final object was not parseable as the report. "
