@@ -2072,6 +2072,7 @@ def archive_task(
     allow_processing: bool = False,
     operation: str = "archived",
     superseded_by: str = "",
+    card_updates: Mapping[str, Any] | None = None,
 ) -> tuple[bool, str]:
     """Archive one task in the bound canonical queue without deleting audit history.
 
@@ -2151,6 +2152,7 @@ def archive_task(
         card["status"] = terminal_status
         card["archive_operation"] = operation
         card["archive_reason"] = reason[:200]
+        card.update(card_updates or {})
         if operation == "superseded" and str(superseded_by or "").strip():
             card["superseded_by"] = str(superseded_by).strip()
         try:

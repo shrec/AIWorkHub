@@ -1343,16 +1343,34 @@ def _reject_review_receipt_fields(
         or _latest_task_event_payload(task_id, "launch")
         or {}
     )
+    # NF-2026-02073: a rejection pin is written by every reject for the episode
+    # it judged, so when present it is authoritative for request, reason and
+    # category.  Reading the previous episode's feedback, rework or event fields
+    # instead names the wrong request, reason or category.  The event supplies a
+    # category only when it names the pinned request: a terminal reject writes no
+    # reject_review event of its own, so an earlier episode's event must not.
+    episode_event = (
+        event
+        if not rejection
+        or str(event.get("request_id") or "") == str(rejection.get("request_id") or "")
+        else {}
+    )
     return {
         "to": to,
-        "reason_identity": feedback.get("reason_identity") or event.get("reason_identity") or {
-            "bytes": len(reason_bytes),
-            "sha256": hashlib.sha256(reason_bytes).hexdigest(),
-        },
-        "failure_category": rejection.get("failure_category") or event.get("terminal_disposition"),
+        "reason_identity": (
+            (rejection.get("reason_identity") if rejection else None)
+            or feedback.get("reason_identity")
+            or event.get("reason_identity")
+            or {
+                "bytes": len(reason_bytes),
+                "sha256": hashlib.sha256(reason_bytes).hexdigest(),
+            }
+        ),
+        "failure_category": (
+            rejection.get("failure_category") or episode_event.get("terminal_disposition")
+        ),
         "failure_category_source": (
-            rejection.get("failure_category_source")
-            or event.get("failure_category_source")
+            rejection.get("failure_category_source") or episode_event.get("failure_category_source")
         ),
         "request_id": (
             rejection.get("request_id")
@@ -1362,8 +1380,14 @@ def _reject_review_receipt_fields(
             or card.get("launch_request_id")
             or launch_event.get("request_id")
         ),
-        "claim_epoch": rework.get("claim_epoch"),
-        "prior_episode": event.get("prior_episode"),
+        "claim_epoch": (
+            rejection["claim_epoch"] if "claim_epoch" in rejection
+            else rework.get("claim_epoch")
+        ),
+        "prior_episode": (
+            rejection["prior_episode"] if "prior_episode" in rejection
+            else event.get("prior_episode")
+        ),
         "predecessor_changed_paths_count": len(feedback.get("predecessor_changed_paths") or []),
         "residual_identities_count": len(feedback.get("residual_identities") or []),
     }

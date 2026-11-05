@@ -6773,6 +6773,61 @@ def _reject_not_reviewable(task_id: str, command: list[str]) -> dict[str, Any]:
     )
 
 
+def _review_identity_request_id(card: dict[str, Any]) -> str:
+    """The request id the card's review_ready terminal record names, or ""."""
+    review = card.get("terminal_review")
+    evidence = review.get("evidence") if isinstance(review, dict) else None
+    identity = evidence.get("request_identity") if isinstance(evidence, dict) else None
+    if not isinstance(identity, dict):
+        return ""
+    return str(identity.get("request_id") or "").strip()
+
+
+def _terminal_rejection_updates(
+    *,
+    disposition: str,
+    request_id: str,
+    reason: str,
+    reason_identity: dict[str, Any],
+    explicit_failure_category: str | None,
+) -> dict[str, Any]:
+    """Build the rejection pin an archived/superseded/blocked reject writes.
+
+    The pin names the request and reason this reject judged, never the previous
+    rework episode.  The category is only what the manager named.  It is applied
+    by ``task_store.archive_task`` (``card_updates``) in the same preimage-guarded
+    transaction as the archive, so no separate write can leave it stale.  A card
+    that names no review request gets no pin.
+    """
+    if not request_id:
+        return {}
+    return {
+        "rejection_disposition": {
+            "schema_id": "aiworkhub.rejection_disposition.v1",
+            "failure_category": explicit_failure_category or "",
+            "failure_category_source": (
+                "manager_explicit_infrastructure" if explicit_failure_category else ""
+            ),
+            "request_id": request_id,
+            "changed_path_hashes": {},
+            "to": disposition,
+            "pinned_at": datetime.now(timezone.utc).isoformat(),
+            "reason_identity": reason_identity,
+            # No claim epoch or prior episode applies to a retired card's reject.
+            "claim_epoch": None,
+            "prior_episode": None,
+        },
+        "review_feedback": {
+            "schema_id": "aiworkhub.rework_feedback_delta.v1",
+            "instruction": reason,
+            "reason_identity": reason_identity,
+            "predecessor_request_id": request_id,
+            "predecessor_changed_paths": [],
+            "residual_identities": [],
+        },
+    }
+
+
 def reject_review(
     task_id: str,
     reason: str,
@@ -7076,14 +7131,25 @@ def reject_review(
     rework_delta_reuse_error: str | None = None
     selected_predecessor = predecessor_request_id
     current_terminal = card.get("terminal_review")
-    if (selected_predecessor is None and disposition == "pending"
+    # NF-2026-02073: the review_ready request under judgement is the default
+    # predecessor for every disposition, not only rework.  Without this a
+    # terminal reject falls back to whatever identity the card carries, which
+    # after an earlier rework episode names that episode's request.
+    auto_selected = False
+    if (selected_predecessor is None
             and isinstance(current_terminal, dict)
             and current_terminal.get("substatus") == "review_ready"
             and isinstance(current_terminal.get("evidence", {}).get("attempt_artifact_manifest"), dict)):
         selected_predecessor = str(current_terminal.get("request_id") or "")
+        auto_selected = disposition != "pending"
     resolved_predecessor, pred_error = _resolve_predecessor(
         selected_predecessor, validate_delta=(disposition == "pending")
     )
+    if auto_selected and pred_error:
+        # Only an explicit predecessor may refuse a terminal reject.  The card's
+        # own review identity, read at the rejected_request_id site, still names
+        # the same request.
+        resolved_predecessor, pred_error = None, None
     if (
         disposition == "pending"
         and pred_error is not None
@@ -7116,18 +7182,7 @@ def reject_review(
     if resolved_predecessor is not None:
         rejected_request_id = str(resolved_predecessor["request_id"] or "").strip()
     else:
-        _review = card.get("terminal_review")
-        _review_evidence = _review.get("evidence") if isinstance(_review, dict) else None
-        _review_identity = (
-            _review_evidence.get("request_identity")
-            if isinstance(_review_evidence, dict)
-            else None
-        )
-        rejected_request_id = (
-            str(_review_identity.get("request_id") or "").strip()
-            if isinstance(_review_identity, dict)
-            else ""
-        )
+        rejected_request_id = _review_identity_request_id(card)
 
     def _finalize_bound_reviewers() -> list[dict[str, Any]]:
         """Supersede every quality-review child bound to the rejected request.
@@ -7225,6 +7280,16 @@ def reject_review(
             # A blocked/failed closure never overrides the live-launch guard.
             allow_processing=(disposition == "superseded" and in_review),
             operation=disposition,
+            # NF-2026-02073: this terminal reject's own pin (request, reason and
+            # explicit-only category) is written in the archive's transaction.
+            card_updates=_terminal_rejection_updates(
+                disposition=disposition,
+                # No review record (a failed relaunch): the retired launch is the episode judged.
+                request_id=rejected_request_id or str(card.get("launch_request_id") or "").strip(),
+                reason=bounded_reason,
+                reason_identity=reason_identity,
+                explicit_failure_category=explicit_failure_category,
+            ),
         )
         if not ok:
             return _canonical_result(
@@ -7260,12 +7325,12 @@ def reject_review(
         changed_hashes = (
             evidence.get("changed_path_hashes") if isinstance(evidence, dict) else None
         )
-        if resolved_predecessor is not None and rework_delta_reuse_error is None:
+        if resolved_predecessor is not None and rework_delta_reuse_error is None and not auto_selected:
             pred_request_id: str = resolved_predecessor["request_id"]
             pred_workspace: dict[str, Any] = resolved_predecessor["workspace"]
             pred_changed_hashes: dict[str, str] = resolved_predecessor["changed_path_hashes"]
             pred_rework_delta = resolved_predecessor.get("rework_delta")
-        elif resolved_predecessor is not None:
+        elif resolved_predecessor is not None and not auto_selected:
             pred_request_id = str(resolved_predecessor["request_id"] or "").strip()
             pred_workspace = {}
             pred_changed_hashes = {}
@@ -7398,6 +7463,9 @@ def reject_review(
         "request_id": pred_request_id,
         "changed_path_hashes": dict(pred_changed_hashes if isinstance(pred_changed_hashes, dict) else {}),
         "to": disposition, "pinned_at": now,
+        # NF-2026-02073: the reason this episode judged, so no receipt for a
+        # later terminal reject reads the reason of an older rework episode.
+        "reason_identity": reason_identity,
     }
     if base_drift_proof is not None:
         card["rejection_disposition"]["base_drift_proof"] = base_drift_proof
