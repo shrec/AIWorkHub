@@ -4847,6 +4847,42 @@ def _deterministic_task_id_for(record: Mapping[str, Any]) -> str | None:
     return successor_task_id(nfid, generation)
 
 
+def task_link_candidate_ids(repo_root: str | Path) -> list[str]:
+    """Every task id a read-time NeedFix join may look up, from ONE query.
+
+    The ``converted_task_id`` of each record whose own status still lets its
+    card decide, and the deterministic ``needfix-{NF-ID}`` id of each unlinked
+    one, so a caller can bulk-load the joined cards once instead of issuing one
+    point lookup per row. A superset is harmless and a missing id is not an
+    error: every id is still verified by the caller's own ``get_task_fn``.
+    Terminal records are skipped because the derivation never looks their card
+    up. Order is first-seen and duplicates are dropped, so the result is
+    deterministic for one store state.
+    """
+    conn = _connect(repo_root)
+    try:
+        rows = conn.execute(
+            "SELECT id, status, converted_task_id, reopen_generation FROM needfix"
+            " ORDER BY created_at ASC, id ASC"
+        ).fetchall()
+    finally:
+        conn.close()
+    ids: dict[str, None] = {}
+    for row in rows:
+        if str(row["status"] or "").strip() in NEEDFIX_TERMINAL_STATUSES:
+            continue
+        linked = str(row["converted_task_id"] or "").strip()
+        if linked:
+            ids[linked] = None
+            continue
+        deterministic_id = _deterministic_task_id_for(
+            {"id": row["id"], "reopen_generation": row["reopen_generation"]}
+        )
+        if deterministic_id:
+            ids[deterministic_id] = None
+    return list(ids)
+
+
 def reconcile_unlinked_needfix(
     repo_root: str | Path,
     *,

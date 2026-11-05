@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import copy
 import json
 import re
 import sqlite3
-from collections import defaultdict, deque
+import threading
+from collections import OrderedDict, defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from aiworkhub import (
     claude_code_usage,
@@ -119,6 +121,8 @@ _CACHE_FIELDS = (
 )
 _PROCESS_EVENTS_PATH = Path(".aiworkhub/runtime/process_logs/process_events.jsonl")
 _PROCESS_EVENT_LIMIT = 10_000
+# Newest canonical usage events one ledger build reads (task_store clamps it).
+_USAGE_EVENT_LIMIT = 10_000
 
 
 def _request_identity(entry: dict[str, Any]) -> str:
@@ -508,15 +512,52 @@ def _attempt_time(row: dict[str, Any]) -> str:
     return str(row.get("attempt_recorded_at") or row.get("created_at") or "")
 
 
-def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    # Resolve the repository root once per build instead of once per row that
-    # lacks an explicit repository id.
+def _usage_row_context(repo_root: Path | str) -> dict[str, Any]:
+    """The per-build join inputs every canonical usage row reads.
+
+    Resolves the repository root once per build instead of once per row that
+    lacks an explicit repository id, indexes the bounded process ledger once,
+    and leaves the task-topic index to be built lazily on the first topic-less
+    row. A memoized ledger keeps this context so folding new usage events
+    joins against exactly the inputs the cached rows were built from.
+    """
     resolved_root = str(Path(repo_root).resolve())
     process_events = _process_event_index(repo_root, resolved_root=resolved_root)
-    indexed_requests = {(key[1], key[2]) for key in process_events} if process_events else None
-    topic_index: dict[str, str] | None = None
-    for raw_entry in task_store.list_usage_events(repo_root, limit=10_000):
+    return {
+        "resolved_root": resolved_root,
+        "process_events": process_events,
+        "indexed_requests": (
+            {(key[1], key[2]) for key in process_events} if process_events else None
+        ),
+        "topic_index": None,
+    }
+
+
+def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
+    return _canonical_rows_from_entries(
+        repo_root,
+        task_store.list_usage_events(repo_root, limit=_USAGE_EVENT_LIMIT),
+        _usage_row_context(repo_root),
+    )
+
+
+def _canonical_rows_from_entries(
+    repo_root: Path | str,
+    raw_entries: Iterable[dict[str, Any]],
+    context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Canonical ledger rows for ``raw_entries`` (newest first), in order.
+
+    Each row depends only on its own entry, ``context`` and the task store's
+    terminal-cause events for its own (task, request) key, so rows built for
+    a batch of newly appended events equal the rows a full rebuild would
+    produce for them.
+    """
+    rows: list[dict[str, Any]] = []
+    resolved_root = context["resolved_root"]
+    process_events = context["process_events"]
+    indexed_requests = context["indexed_requests"]
+    for raw_entry in raw_entries:
         entry = _fill_process_usage(
             raw_entry, repo_root, process_events, resolved_root=resolved_root
         )
@@ -542,8 +583,10 @@ def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
             if joined:
                 topic, topic_source = joined, "process_event_join"
         if not topic:
+            topic_index = context.get("topic_index")
             if topic_index is None:
                 topic_index = _task_topic_index(repo_root)
+                context["topic_index"] = topic_index
             joined = topic_index.get(task_id, "")
             topic, topic_source = joined, ("task_join" if joined else "unresolved")
         explicit_role = str(entry.get("role") or "").strip().lower()
@@ -1089,20 +1132,29 @@ def _retry_economics(
     }
 
 
-def build_cost_ledger(
+def _assemble_cost_ledger(
     *,
-    repo_root: Path | str | None = None,
-    runner: str | None = None,
-    topic: str | None = None,
-    status: str | None = None,
-    include_tasks: bool = False,
+    repo_root: Path | str | None,
+    runner: str | None,
+    topic: str | None,
+    status: str | None,
+    include_tasks: bool,
+    inputs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """The ledger payload (without Claude Code sessions) from read inputs.
+
+    A repo-bound build reads only ``inputs`` (see :func:`_read_ledger_inputs`)
+    and copies every row and card it touches, so a memoized ``inputs`` is
+    never mutated by the aggregation below.
+    """
     if repo_root is not None:
-        usage_rows = _canonical_usage_rows(repo_root)
-        try:
-            manager_decisions = task_store.latest_manager_decisions(repo_root)
-        except task_store.TaskStoreError:
-            manager_decisions = {}
+        if inputs is None:
+            inputs = _read_ledger_inputs(repo_root, through_event_id=None)
+        usage_rows = [dict(row) for row in inputs["rows"]]
+        manager_decisions = {
+            task_id: dict(decision) if isinstance(decision, dict) else decision
+            for task_id, decision in inputs["manager_decisions"].items()
+        }
         if runner:
             usage_rows = [row for row in usage_rows if row.get("runner") == runner]
         if topic:
@@ -1149,14 +1201,11 @@ def build_cost_ledger(
             seen.add(ident)
             union_rows.append(row)
 
-    try:
-        cards = (
-            task_store.list_task_routing_facts(repo_root, limit=5000)
-            if repo_root is not None
-            else []
-        )
-    except task_store.TaskStoreError:
-        cards = []
+    cards: list[Any] = (
+        [dict(card) if isinstance(card, dict) else card for card in inputs["cards"]]
+        if repo_root is not None and inputs is not None
+        else []
+    )
     accepted_economics = cost_per_accepted_outcome_view(
         usage_rows, manager_decisions, cards
     )
@@ -1240,8 +1289,287 @@ def build_cost_ledger(
             "launch_log_ok": bool(launch_summary.get("ok")),
         },
     }
-    if repo_root is not None:
-        # Read-only surfacing of Claude Code's own transcript usage; never
-        # touches usage_rows/aggregates above, so existing attribution holds.
-        result["claude_code_sessions"] = claude_code_usage.collect_claude_code_usage(repo_root)
     return result
+
+
+def build_cost_ledger(
+    *,
+    repo_root: Path | str | None = None,
+    runner: str | None = None,
+    topic: str | None = None,
+    status: str | None = None,
+    include_tasks: bool = False,
+) -> dict[str, Any]:
+    if repo_root is None:
+        return _assemble_cost_ledger(
+            repo_root=None,
+            runner=runner,
+            topic=topic,
+            status=status,
+            include_tasks=include_tasks,
+        )
+    result = _memoized_cost_ledger(
+        repo_root,
+        runner=runner,
+        topic=topic,
+        status=status,
+        include_tasks=include_tasks,
+    )
+    # Read-only surfacing of Claude Code's own transcript usage; never
+    # touches usage_rows/aggregates above, so existing attribution holds. It
+    # carries its own bounded TTL memo, so it is never frozen in this one.
+    result["claude_code_sessions"] = claude_code_usage.collect_claude_code_usage(repo_root)
+    return result
+
+
+# --- Per-process memo of the repo-bound ledger (NF-2026-02067) ---------------
+#
+# A dashboard poll rebuilt the whole ledger (every usage event decoded, the
+# process ledger and terminal causes re-joined) even when nothing changed.
+# The memo is keyed by the usage-event high-water mark plus a fingerprint of
+# everything else the ledger joins against. An unchanged key answers from the
+# cache; appended usage events with an unchanged fingerprint are folded in
+# (only the new events are read and joined); any other change rebuilds. It is
+# bounded (LRU over repositories, and over filter combinations per
+# repository), measured (LEDGER_CACHE_STATS) and never holds its lock during
+# IO. A ledger whose marks cannot be read is built uncached, never served
+# stale.
+_LEDGER_MEMO_MAX_REPOSITORIES = 8
+_LEDGER_MEMO_MAX_RESULTS = 8
+_LEDGER_MEMO_LOCK = threading.Lock()
+_LEDGER_MEMO: OrderedDict[str, dict[str, Any]] = OrderedDict()
+LEDGER_CACHE_STATS: dict[str, int] = {
+    "hits": 0,
+    "filter_misses": 0,
+    "incremental_folds": 0,
+    "full_builds": 0,
+    "uncached_builds": 0,
+}
+# The task-store readers a ledger build goes through. A cache entry is valid
+# only for the exact reader set that produced it, and only the canonical set
+# may fold events read through ``list_usage_event_window``.
+_LEDGER_READER_NAMES = (
+    "list_usage_events",
+    "list_usage_event_window",
+    "cost_ledger_marks",
+    "latest_manager_decisions",
+    "list_task_routing_facts",
+    "list_tasks",
+    "list_task_cards",
+    "get_task",
+    "_decode_task_card",
+    "_connect",
+    "_require_ready",
+)
+
+
+def _ledger_readers() -> tuple[Any, ...]:
+    return tuple(getattr(task_store, name, None) for name in _LEDGER_READER_NAMES)
+
+
+_CANONICAL_LEDGER_READERS = _ledger_readers()
+
+
+def reset_cost_ledger_cache() -> None:
+    """Drop every memoized ledger and zero the cache counters."""
+
+    with _LEDGER_MEMO_LOCK:
+        _LEDGER_MEMO.clear()
+        for name in LEDGER_CACHE_STATS:
+            LEDGER_CACHE_STATS[name] = 0
+
+
+def _count_ledger_cache(event: str) -> None:
+    with _LEDGER_MEMO_LOCK:
+        LEDGER_CACHE_STATS[event] += 1
+
+
+def _process_ledger_stamp(repo_root: Path | str) -> tuple[Any, ...]:
+    path = Path(repo_root) / _PROCESS_EVENTS_PATH
+    try:
+        stat = path.stat()
+    except OSError:
+        return (str(_PROCESS_EVENTS_PATH), "absent")
+    return (str(_PROCESS_EVENTS_PATH), stat.st_size, stat.st_mtime_ns)
+
+
+def _read_ledger_inputs(
+    repo_root: Path | str, *, through_event_id: int | None
+) -> dict[str, Any]:
+    """Every store-derived input of one repo-bound ledger build.
+
+    ``through_event_id`` bounds the usage events read to the high-water mark
+    the cache key records, so a cached entry never holds an event newer than
+    its key (which a later fold would then count twice).
+    """
+
+    context = _usage_row_context(repo_root)
+    if through_event_id is None:
+        entries = task_store.list_usage_events(repo_root, limit=_USAGE_EVENT_LIMIT)
+    else:
+        entries = [
+            entry
+            for _event_id, entry in task_store.list_usage_event_window(
+                repo_root, through_event_id=through_event_id, limit=_USAGE_EVENT_LIMIT
+            )
+        ]
+    rows = _canonical_rows_from_entries(repo_root, entries, context)
+    try:
+        manager_decisions = task_store.latest_manager_decisions(repo_root)
+    except task_store.TaskStoreError:
+        manager_decisions = {}
+    try:
+        cards = task_store.list_task_routing_facts(repo_root, limit=5000)
+    except task_store.TaskStoreError:
+        cards = []
+    return {
+        "rows": rows,
+        "context": context,
+        "manager_decisions": manager_decisions,
+        "cards": cards,
+    }
+
+
+def _fold_usage_events(
+    repo_root: Path | str,
+    inputs: dict[str, Any],
+    *,
+    after_event_id: int,
+    through_event_id: int,
+    expected_new: int,
+) -> dict[str, Any] | None:
+    """Fold only the usage events in ``(after, through]`` into cached inputs.
+
+    New events are strictly newer than every cached row, so the newest
+    ``_USAGE_EVENT_LIMIT`` rows of ``new + cached`` are exactly the rows a full
+    rebuild reads. Returns ``None`` (caller rebuilds) when the window does not
+    hold exactly ``expected_new`` events -- a deletion or a burst beyond the
+    read bound is never folded.
+    """
+
+    if expected_new <= 0 or expected_new > _USAGE_EVENT_LIMIT:
+        return None
+    window = task_store.list_usage_event_window(
+        repo_root,
+        after_event_id=after_event_id,
+        through_event_id=through_event_id,
+        limit=_USAGE_EVENT_LIMIT,
+    )
+    if len(window) != expected_new:
+        return None
+    new_rows = _canonical_rows_from_entries(
+        repo_root, [entry for _event_id, entry in window], inputs["context"]
+    )
+    return {**inputs, "rows": (new_rows + inputs["rows"])[:_USAGE_EVENT_LIMIT]}
+
+
+def _copy_ledger(result: dict[str, Any]) -> dict[str, Any]:
+    """An independent copy a caller may mutate without touching the memo."""
+
+    copied: dict[str, Any] = {}
+    for key, value in result.items():
+        if key == "tasks":
+            # Rows hold scalars only; a per-row dict copy is a full copy.
+            copied[key] = [dict(row) for row in value]
+        else:
+            copied[key] = copy.deepcopy(value)
+    return copied
+
+
+def _memoized_cost_ledger(
+    repo_root: Path | str,
+    *,
+    runner: str | None,
+    topic: str | None,
+    status: str | None,
+    include_tasks: bool,
+) -> dict[str, Any]:
+    filters = (runner, topic, status, bool(include_tasks))
+    readers = _ledger_readers()
+    canonical = readers == _CANONICAL_LEDGER_READERS
+    try:
+        marks = task_store.cost_ledger_marks(repo_root)
+        root_key = str(Path(repo_root).resolve())
+    except Exception:
+        # Unreadable marks: no key can prove freshness, so build uncached.
+        _count_ledger_cache("uncached_builds")
+        return _assemble_cost_ledger(
+            repo_root=repo_root,
+            runner=runner,
+            topic=topic,
+            status=status,
+            include_tasks=include_tasks,
+            inputs=_read_ledger_inputs(repo_root, through_event_id=None),
+        )
+    usage_mark = (int(marks["usage_high_water"]), int(marks["usage_count"]))
+    fingerprint = (
+        marks["store_fingerprint"],
+        _process_ledger_stamp(repo_root),
+        readers,
+    )
+    cached: dict[str, Any] | None = None
+    fresh_entry: dict[str, Any] | None = None
+    with _LEDGER_MEMO_LOCK:
+        entry = _LEDGER_MEMO.get(root_key)
+        if entry is not None:
+            _LEDGER_MEMO.move_to_end(root_key)
+            if entry["fingerprint"] == fingerprint and entry["usage"] == usage_mark:
+                fresh_entry = entry
+                cached = entry["results"].get(filters)
+                if cached is not None:
+                    LEDGER_CACHE_STATS["hits"] += 1
+                    entry["results"].move_to_end(filters)
+    if cached is not None:
+        return _copy_ledger(cached)
+    results: OrderedDict[tuple[Any, ...], dict[str, Any]]
+    if fresh_entry is not None:
+        _count_ledger_cache("filter_misses")
+        inputs = fresh_entry["inputs"]
+        results = fresh_entry["results"]
+    else:
+        folded: dict[str, Any] | None = None
+        if (
+            entry is not None
+            and canonical
+            and entry["fingerprint"] == fingerprint
+            and usage_mark[0] > entry["usage"][0]
+        ):
+            folded = _fold_usage_events(
+                repo_root,
+                entry["inputs"],
+                after_event_id=entry["usage"][0],
+                through_event_id=usage_mark[0],
+                expected_new=usage_mark[1] - entry["usage"][1],
+            )
+        if folded is not None:
+            _count_ledger_cache("incremental_folds")
+            inputs = folded
+        else:
+            _count_ledger_cache("full_builds")
+            inputs = _read_ledger_inputs(
+                repo_root, through_event_id=usage_mark[0] if canonical else None
+            )
+        results = OrderedDict()
+    result = _assemble_cost_ledger(
+        repo_root=repo_root,
+        runner=runner,
+        topic=topic,
+        status=status,
+        include_tasks=include_tasks,
+        inputs=inputs,
+    )
+    with _LEDGER_MEMO_LOCK:
+        results[filters] = result
+        results.move_to_end(filters)
+        while len(results) > _LEDGER_MEMO_MAX_RESULTS:
+            results.popitem(last=False)
+        _LEDGER_MEMO[root_key] = {
+            "fingerprint": fingerprint,
+            "usage": usage_mark,
+            "inputs": inputs,
+            "results": results,
+        }
+        _LEDGER_MEMO.move_to_end(root_key)
+        while len(_LEDGER_MEMO) > _LEDGER_MEMO_MAX_REPOSITORIES:
+            _LEDGER_MEMO.popitem(last=False)
+    return _copy_ledger(result)

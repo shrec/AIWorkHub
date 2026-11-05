@@ -8805,21 +8805,95 @@ def list_usage_events(root: str | Path, *, limit: int = 10_000) -> list[dict[str
         ).fetchall()
     finally:
         conn.close()
-    result: list[dict[str, Any]] = []
-    for row in rows:
-        try:
-            payload = json.loads(str(row["payload_json"] or "{}"))
-        except json.JSONDecodeError:
-            payload = {}
-        if not isinstance(payload, dict):
-            payload = {}
-        result.append({
-            **payload,
-            "task_id": str(row["task_id"] or ""),
-            "runner": str(payload.get("runner") or row["runner"] or ""),
-            "created_at": str(row["created_at"] or ""),
-        })
-    return result
+    return [_decode_usage_event_row(row) for row in rows]
+
+
+def _decode_usage_event_row(row: sqlite3.Row) -> dict[str, Any]:
+    """One ``usage_record`` row as the structured entry usage readers return."""
+    try:
+        payload = json.loads(str(row["payload_json"] or "{}"))
+    except json.JSONDecodeError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return {
+        **payload,
+        "task_id": str(row["task_id"] or ""),
+        "runner": str(payload.get("runner") or row["runner"] or ""),
+        "created_at": str(row["created_at"] or ""),
+    }
+
+
+def list_usage_event_window(
+    root: str | Path,
+    *,
+    after_event_id: int = 0,
+    through_event_id: int,
+    limit: int = 10_000,
+) -> list[tuple[int, dict[str, Any]]]:
+    """``(event_id, entry)`` usage events in ``(after, through]``, newest first.
+
+    The same entries :func:`list_usage_events` returns, bounded on both sides
+    by event id so an incremental reader can fold exactly the events appended
+    since its last high-water mark without re-reading (or double counting) the
+    rest. ``limit`` is clamped like :func:`list_usage_events`.
+    """
+    _readiness, db_path = _require_ready(root)
+    conn = _connect(db_path, readonly=True)
+    try:
+        rows = conn.execute(
+            "SELECT event_id, task_id, runner, payload_json, created_at FROM task_events "
+            "WHERE event='usage_record' AND event_id > ? AND event_id <= ? "
+            "ORDER BY event_id DESC LIMIT ?",
+            (
+                int(after_event_id),
+                int(through_event_id),
+                max(1, min(int(limit), 50_000)),
+            ),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [(int(row["event_id"]), _decode_usage_event_row(row)) for row in rows]
+
+
+def cost_ledger_marks(root: str | Path) -> dict[str, Any]:
+    """Cheap change marks for a memoized cost ledger, from one connection.
+
+    ``usage_high_water`` / ``usage_count`` describe the append-only
+    ``usage_record`` stream. ``store_fingerprint`` covers everything else a
+    ledger joins against: the newest non-usage event (terminal causes, manager
+    decisions, claims) and the task table's row count and newest update. A
+    ledger may fold new usage events while the fingerprint is unchanged, and
+    must rebuild when it changes. Index-backed: no payload is decoded.
+    """
+    _readiness, db_path = _require_ready(root)
+    conn = _connect(db_path, readonly=True)
+    try:
+        usage = conn.execute(
+            "SELECT COALESCE(MAX(event_id), 0), COUNT(*) FROM task_events "
+            "WHERE event='usage_record'"
+        ).fetchone()
+        other = conn.execute(
+            "SELECT event_id FROM task_events WHERE event != 'usage_record' "
+            "ORDER BY event_id DESC LIMIT 1"
+        ).fetchone()
+        tasks = conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(updated_at), ''), "
+            "COALESCE(MAX(archived_at), '') FROM tasks"
+        ).fetchone()
+    finally:
+        conn.close()
+    return {
+        "usage_high_water": int(usage[0] or 0),
+        "usage_count": int(usage[1] or 0),
+        "store_fingerprint": (
+            str(db_path),
+            int(other[0]) if other is not None else 0,
+            int(tasks[0] or 0),
+            str(tasks[1] or ""),
+            str(tasks[2] or ""),
+        ),
+    }
 
 
 def append_usage_capture_event(

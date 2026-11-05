@@ -499,6 +499,49 @@ def _prefetch_successor_chain(
     )
 
 
+def _bulk_load_cards(
+    task_ids: Iterable[str],
+    cards_by_id: dict[str, Any],
+    load_many,
+) -> None:
+    """Load unknown ids and their successor closure, one bulk read per round.
+
+    Reaches the same closure :func:`_prefetch_successor_chain` reaches through
+    point lookups, but gathers each round's unknown ids first so a round costs
+    ONE ``load_many`` call (``{task_id: card}``, unknown ids absent). A
+    requested id the store does not hold is recorded as known-absent, which is
+    what a point lookup returning ``None`` already proves for this read. Every
+    card passes the same identity check as a point lookup. Rounds are bounded
+    by the terminal-artifact row cap, so a cyclic chain cannot loop.
+    """
+    pending = [
+        task_id
+        for task_id in dict.fromkeys(str(raw or "").strip() for raw in task_ids)
+        if task_id and task_id not in cards_by_id
+    ]
+    for _round in range(task_plan.MAX_TERMINAL_ARTIFACT_ROWS):
+        if not pending:
+            return
+        found = load_many(pending) or {}
+        loaded: list[Mapping[str, Any]] = []
+        for task_id in pending:
+            card = _cache_point_lookup_card(task_id, found.get(task_id))
+            cards_by_id[task_id] = card
+            if card is not None:
+                loaded.append(card)
+        if not loaded:
+            return
+        wanted: list[str] = []
+        # Ask the shared closure walker which ids it would point-load next,
+        # against a scratch copy so its "not found" marks never leak.
+        task_plan.prefetch_unknown_terminal_cards(
+            loaded, dict(cards_by_id), wanted.append
+        )
+        pending = [
+            task_id for task_id in dict.fromkeys(wanted) if task_id not in cards_by_id
+        ]
+
+
 def _prefetch_terminal_lookups(cards_by_id: dict[str, Any], get_task_fn) -> bool:
     cards = [card for card in cards_by_id.values() if isinstance(card, Mapping)]
     return not task_plan.prefetch_unknown_terminal_cards(
@@ -599,6 +642,26 @@ def _resolve_active_state_hooks(
             task_by_id.update(_index_listed_cards(task_cards))
         return task_cards
 
+    candidates_prefetched = False
+
+    def prefetch_candidates() -> None:
+        # One bulk read for every id the NeedFix join may still ask about,
+        # instead of one point lookup (plus one O(cards) successor walk) per
+        # row. Best-effort: a failed bulk read leaves the point-lookup path
+        # as the authority, exactly as before this optimisation.
+        nonlocal candidates_prefetched
+        if candidates_prefetched:
+            return
+        candidates_prefetched = True
+        try:
+            _bulk_load_cards(
+                needfix_store.task_link_candidate_ids(repo),
+                task_by_id,
+                lambda ids: task_store.get_tasks(repo, ids, readiness=readiness),
+            )
+        except Exception:
+            pass
+
     def get_task_fn(task_id: str):
         load_task_cards()
         requested = str(task_id or "").strip()
@@ -609,16 +672,16 @@ def _resolve_active_state_hooks(
         found = _cache_point_lookup_card(
             requested, task_store.get_task(repo, requested, readiness=readiness)
         )
-        if found is None:
-            return None
-        task_by_id[requested] = found
-        _prefetch_successor_chain(
-            found,
-            task_by_id,
-            lambda successor_id: task_store.get_task(
-                repo, successor_id, readiness=readiness
-            ),
-        )
+        if found is not None:
+            task_by_id[requested] = found
+            _prefetch_successor_chain(
+                found,
+                task_by_id,
+                lambda successor_id: task_store.get_task(
+                    repo, successor_id, readiness=readiness
+                ),
+            )
+        prefetch_candidates()
         return found
 
     def list_task_cards_fn():
