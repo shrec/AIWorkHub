@@ -66,7 +66,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from aiworkhub import core, task_plan, task_store, validation_runner
+from aiworkhub import ci_status, core, task_plan, task_store, validation_runner
 
 READONLY: bool = True
 LAUNCH_IMPLEMENTED: bool = False
@@ -1580,6 +1580,16 @@ def review_packet(
         packet["outstanding_accept_blockers_evaluated"] = packet["accept_preview"][
             "evaluated"
         ]
+    # NF-2026-02080: advisory CI state of the commit this candidate lands on.
+    # The accept preview already fetched it when present; otherwise ask once.
+    # Never a blocker, never raises -- an unreadable base is "unavailable".
+    base_ci = preview.get("base_ci")
+    if not isinstance(base_ci, dict):
+        try:
+            base_ci = ci_status.base_ci_section(core.repo_root())
+        except Exception as exc:  # noqa: BLE001 -- advisory data must not break the packet
+            base_ci = {"state": "unavailable", "reason": type(exc).__name__, "warnings": []}
+    packet["base_ci"] = base_ci
     # NF-2026-01925: built before truncation from the sections already above,
     # and absent from _PACKET_DROP_ORDER, so evidence is always dropped first.
     packet["decision"] = _packet_decision(packet, preview)

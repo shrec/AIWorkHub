@@ -2372,6 +2372,16 @@ def _accept_in_flight_marker(self: Any, task_id: str, request_id: str) -> _Accep
     return _AcceptInFlight(key=key, path=path, data=data)
 
 
+def _base_ci_advisory(repo: Any) -> dict[str, Any]:
+    """Advisory ``base_ci`` section (NF-2026-02080): never raises, never blocks."""
+    from . import ci_status
+
+    try:
+        return ci_status.base_ci_section(repo)
+    except Exception as exc:  # noqa: BLE001 -- advisory data must not break accept
+        return {"state": "unavailable", "reason": type(exc).__name__, "warnings": []}
+
+
 def accept_preview(self, request_id: str, task_id: str, **overrides: Any) -> dict[str, Any]:
     """Read-only: exactly what would block ``accept_review`` right now.
 
@@ -2518,6 +2528,8 @@ def accept_preview(self, request_id: str, task_id: str, **overrides: Any) -> dic
         "pending_context_write_intents": intents,
         **fold,
         "blockers": preview_blockers,
+        # NF-2026-02080: advisory only -- warnings here never join ``blockers``.
+        "base_ci": _base_ci_advisory(self.repo),
     }
 
 
