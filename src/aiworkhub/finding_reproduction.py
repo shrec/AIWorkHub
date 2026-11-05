@@ -413,7 +413,12 @@ def reproduce_finding(
     coordinator_key: bytes,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Run ``spec`` on the candidate and on its base; return a signed receipt.
+    """Run ``spec`` on the candidate, and on its base only if the candidate failed.
+
+    :func:`classify` reads the base outcome only when the candidate outcome is
+    FAILED, so any other candidate outcome records the base as UNRUNNABLE with
+    detail ``base_not_run:candidate_<outcome>`` and duration 0 without creating
+    a base workspace (NF-2026-02076).
 
     Raises ``RuntimeError`` ``finding_reproduction_sealed_tree_mutated:<json>``,
     naming each guarded (root, path) and its before/after sha256, when the
@@ -423,11 +428,16 @@ def reproduce_finding(
     """
     sealed_before = target.sealed_manifest(())
     candidate = _execute(spec, target.create_candidate, target.run, target.cleanup)
-    base = (
-        _execute(spec, target.create_base, target.run, target.cleanup)
-        if target.base_oid
-        else _side(UNRUNNABLE, "base_oid_missing")
-    )
+    if candidate["outcome"] != FAILED:
+        base = _side(
+            UNRUNNABLE,
+            f"base_not_run:candidate_{candidate['outcome']}",
+            duration_seconds=0,
+        )
+    elif target.base_oid:
+        base = _execute(spec, target.create_base, target.run, target.cleanup)
+    else:
+        base = _side(UNRUNNABLE, "base_oid_missing")
     sealed_after = target.sealed_manifest(tuple(sealed_before))
     concurrent, concurrent_count = _sealed_guard(sealed_before, sealed_after, target)
     receipt = {

@@ -215,7 +215,8 @@ def _reproduce(trees: _Trees, spec_text: str) -> dict[str, Any]:
     [
         ("pytest:tests/test_calc.py::test_add", fr.REPRODUCED, fr.FAILED, fr.PASSED),
         ("pytest:tests/test_calc.py::test_preexisting", fr.PRE_EXISTING, fr.FAILED, fr.FAILED),
-        ("pytest:tests/test_calc.py::test_add_zero", fr.NOT_REPRODUCED, fr.PASSED, fr.PASSED),
+        # NF-2026-02076: the base is not run unless the candidate failed.
+        ("pytest:tests/test_calc.py::test_add_zero", fr.NOT_REPRODUCED, fr.PASSED, fr.UNRUNNABLE),
         ("pytest:tests/test_calc.py::test_missing", fr.UNRUNNABLE, fr.UNRUNNABLE, fr.UNRUNNABLE),
         ("pytest:tests/test_broken.py::test_x", fr.UNRUNNABLE, fr.UNRUNNABLE, fr.UNRUNNABLE),
         ("probe:from calc import add\nassert add(2, 3) == 5\n", fr.REPRODUCED, fr.FAILED, fr.PASSED),
@@ -241,7 +242,10 @@ def test_classification_by_real_execution(
     # Scratch workspaces only: the sealed candidate and canonical trees are
     # byte-identical, and every scratch workspace was cleaned up.
     assert (_tree_bytes(trees.candidate), _tree_bytes(trees.canonical)) == sealed_before
-    assert trees.cleaned == trees.created and len(trees.created) == 2
+    base_ran = candidate_outcome == fr.FAILED
+    assert trees.cleaned == trees.created and len(trees.created) == (2 if base_ran else 1)
+    if not base_ran:
+        assert receipt["base"]["detail"] == f"base_not_run:candidate_{candidate_outcome}"
     assert not any(path.exists() for path in trees.created)
 
 
@@ -365,7 +369,9 @@ def test_a_probe_raising_a_non_assertion_error_is_unrunnable(tmp_path: Path) -> 
     )
     assert receipt["candidate"]["outcome"] == fr.UNRUNNABLE
     assert receipt["candidate"]["detail"] == "exit_3"
-    assert receipt["base"]["outcome"] == fr.PASSED
+    # NF-2026-02076: an unrunnable candidate never runs the base.
+    assert receipt["base"]["outcome"] == fr.UNRUNNABLE
+    assert receipt["base"]["detail"] == "base_not_run:candidate_unrunnable"
     assert receipt["classification"] == fr.UNRUNNABLE
 
 
