@@ -26,6 +26,24 @@ HIGH_WRITES = ["src/aiworkhub/example_policy_nf02074.py", "tests/test_example_nf
 VALIDATION = ["python -m pytest -n 0 -q tests/test_example_nf02074.py"]
 
 
+def _snapshot(scope_files: list[str] | None = None) -> dict[str, Any]:
+    return {
+        "id": NEEDFIX_ID,
+        "title": "nf02075 title",
+        "description": "nf02075 description",
+        "scope_files": list(scope_files or []),
+        "reopen_generation": 0,
+    }
+
+
+def _patch_snapshot(monkeypatch: pytest.MonkeyPatch, scope_files: list[str] | None) -> None:
+    monkeypatch.setattr(
+        server.needfix_store,
+        "get_needfix",
+        lambda _root, _nid: _snapshot(scope_files),
+    )
+
+
 @pytest.fixture
 def rank_risks(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     risks: list[str] = []
@@ -35,6 +53,8 @@ def rank_risks(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         return {"launch_contract": {"runner": "ranked-runner-nf02074"}}
 
     monkeypatch.setattr(server.manager_ai_tools, "workforce_rank", _rank)
+    # Hermetic: a NeedFix with no recorded scope, so the plan alone decides.
+    _patch_snapshot(monkeypatch, None)
     return risks
 
 
@@ -113,3 +133,69 @@ def test_derivation_failure_keeps_declared_tier_or_medium(
     server._needfix_rank_launch_contract(NEEDFIX_ID, _plan(risk_tier="high"))
 
     assert rank_risks == ["medium", "high"]
+
+
+def _create_derived_tier_for_conversion(scope_files: list[str], plan: dict[str, Any]) -> str:
+    """The tier create derives over the card conversion really builds."""
+
+    card = server.needfix_store.normalize_task_plan(
+        _snapshot(scope_files), {"runner": "r-nf02075", "topic": "t-nf02075", **plan}
+    )
+    return _create_derived_tier(
+        {
+            "task_type": card["task_type"],
+            "validation": card.get("validation", []),
+            "read_only": card["read_only"],
+            "allowed_writes": card.get("allowed_writes", []),
+        },
+        card.get("risk_tier"),
+    )
+
+
+def test_omitted_allowed_writes_inherits_scope_files_for_the_rank(
+    rank_risks: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scope = list(HIGH_WRITES)
+    _patch_snapshot(monkeypatch, scope)
+    # No allowed_writes, task_type or runner: conversion inherits scope_files
+    # and task_type='code'; the raw plan alone would rank over a test file.
+    plan = {"required_outputs": ["tests/test_example_nf02074.py"]}
+
+    contract = server._needfix_rank_launch_contract(NEEDFIX_ID, plan)
+
+    assert contract == {"runner": "ranked-runner-nf02074"}
+    assert rank_risks == ["high"]
+    assert rank_risks[0] == _create_derived_tier_for_conversion(scope, plan)
+    assert plan == {"required_outputs": ["tests/test_example_nf02074.py"]}
+
+
+def test_plan_allowed_writes_override_scope_files_for_the_rank(
+    rank_risks: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scope = list(HIGH_WRITES)
+    _patch_snapshot(monkeypatch, scope)
+    plan = {
+        "allowed_writes": ["docs/nf02075.md"],
+        "required_outputs": ["docs/nf02075.md"],
+        "validation": [],
+        "task_type": "research",
+    }
+
+    server._needfix_rank_launch_contract(NEEDFIX_ID, plan)
+
+    assert rank_risks[0] == _create_derived_tier_for_conversion(scope, plan)
+    assert rank_risks[0] != "high"
+
+
+def test_unreadable_snapshot_falls_back_to_the_raw_plan(
+    rank_risks: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _unreadable(*_a: Any, **_k: Any) -> dict[str, Any]:
+        raise server.needfix_store.NeedFixNotFoundError(NEEDFIX_ID)
+
+    monkeypatch.setattr(server.needfix_store, "get_needfix", _unreadable)
+
+    contract = server._needfix_rank_launch_contract(NEEDFIX_ID, _plan())
+
+    assert contract == {"runner": "ranked-runner-nf02074"}
+    assert rank_risks == [_create_derived_tier(_plan())] == ["high"]

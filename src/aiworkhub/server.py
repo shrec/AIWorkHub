@@ -1134,32 +1134,61 @@ _NEEDFIX_DEFAULT_TOPIC = "needfix_conversion"
 _NEEDFIX_FILL_SOURCE_DEFAULT_TOPIC = "needfix_conversion_default"
 
 
-def _needfix_rank_risk_tier(plan: Mapping[str, Any]) -> str:
-    """The tier core.create_task will derive for ``plan``; a declared tier is a floor.
+def _needfix_merged_card(needfix_id: str, plan: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The card conversion builds: the NeedFix scope base with ``plan`` laid over it.
 
-    Same two quality_evidence calls create makes, over the plan's own
+    Mirrors ``needfix_store.normalize_task_plan``: ``default_task_card`` supplies
+    allowed_writes, read_first, validation and ``task_type='code'`` from the
+    NeedFix scope_files, and every plan field wins. If the snapshot cannot be
+    read, the raw plan is returned so the rank degrades to today's behaviour and
+    never raises.
+    """
+
+    try:
+        card = dict(needfix_store.default_task_card(
+            needfix_store.get_needfix(core.repo_root(), needfix_id)
+        ))
+    except Exception:  # noqa: BLE001 - any unreadable snapshot falls back to the raw plan
+        # Unchanged pre-merge behaviour: a required output is a path the card
+        # writes, so a plan that omits allowed_writes still ranks over its outputs.
+        fallback = dict(plan)
+        fallback["allowed_writes"] = [
+            item
+            for field in ("allowed_writes", "required_outputs")
+            for item in (plan.get(field) if isinstance(plan.get(field), (list, tuple)) else ())
+        ]
+        return fallback
+    card.update(plan)
+    if "read_only" not in plan and card.get("read_only") and (
+        card.get("allowed_writes") or card.get("required_outputs")
+    ):
+        card["read_only"] = False
+    if card.get("read_only") is True:
+        for field in ("allowed_writes", "required_outputs", "validation"):
+            card.pop(field, None)
+    return card
+
+
+def _needfix_rank_risk_tier(card: Mapping[str, Any]) -> str:
+    """The tier core.create_task will derive for ``card``; a declared tier is a floor.
+
+    Same two quality_evidence calls create makes, over the card's own
     task_type, validation, read_only and allowed_writes. If the derivation
     cannot run, the declared tier or ``medium`` is kept.
     """
 
-    declared = plan.get("risk_tier")
+    declared = card.get("risk_tier")
     declared = declared if declared in _WORKFORCE_RANK_RISKS else None
-    # A required output is a path the card writes, so it counts with
-    # allowed_writes; a plan that omits allowed_writes still names its outputs.
-    writes = [
-        item
-        for field in ("allowed_writes", "required_outputs")
-        for item in (plan.get(field) if isinstance(plan.get(field), (list, tuple)) else ())
-    ]
-    validation = plan.get("validation")
+    writes = card.get("allowed_writes")
+    validation = card.get("validation")
     try:
         signals = quality_evidence.derive_risk_signals(
             {
-                "task_type": plan.get("task_type"),
+                "task_type": card.get("task_type"),
                 "validation": validation if isinstance(validation, (list, tuple)) else [],
-                "read_only": plan.get("read_only"),
+                "read_only": card.get("read_only"),
             },
-            writes,
+            list(writes) if isinstance(writes, (list, tuple)) else [],
         )
         return quality_evidence.resolve_risk_profile(
             declared or quality_evidence.RISK_LOW, signals=signals
@@ -1169,12 +1198,13 @@ def _needfix_rank_risk_tier(plan: Mapping[str, Any]) -> str:
 
 
 def _needfix_rank_launch_contract(needfix_id: str, plan: Mapping[str, Any]) -> Mapping[str, Any]:
-    task_type = plan.get("task_type")
+    card = _needfix_merged_card(needfix_id, plan)
+    task_type = card.get("task_type")
     try:
         ranked = manager_ai_tools.workforce_rank(
             task_id=f"needfix-{needfix_id}",
             kinds=[task_type if task_type in _WORKFORCE_RANK_KINDS else "code"],
-            risk=_needfix_rank_risk_tier(plan),
+            risk=_needfix_rank_risk_tier(card),
         )
     except (OSError, ValueError, TypeError, KeyError, RuntimeError):
         return {}
