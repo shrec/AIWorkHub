@@ -92,6 +92,11 @@ REJECT_DEPTH_NEXT_ACTION = "decompose_or_supersede_required"
 # rework (``to=pending``) rejection is a lap of the loop this axis bounds.
 REJECT_DEPTH_COUNTED_CATEGORY = FailureCategory.CANDIDATE_CODE.value
 REJECT_DEPTH_COUNTED_DISPOSITION = "pending"
+# The automatic validation-rework return (NF-2026-02082). ``validation_auto_rework``
+# imports this module, so it cannot be imported here; the identity with its
+# ``ACTOR`` and ``_HEADER`` is asserted by tests/test_auto_rework_reject_depth_nf02082.py.
+AUTO_REWORK_ACTOR = "aiworkhub_validation_auto_rework"
+AUTO_REWORK_REASON_PREFIX = "validation_auto_rework signature="
 _REJECT_EVENT = "reject_review"
 # One bounded read per launch.  A task with more rejections than this is far
 # past the cap already; the newest rows are the ones that decide.
@@ -573,6 +578,12 @@ def counted_candidate_code_rejects(
     A row counts only when it is a rework rejection, pins the candidate-code
     category AND the source it was derived from, and pins exactly this
     contract identity.  Every missing field means "not counted".
+
+    An automatic return -- the actor is ``validation_auto_rework``, or the
+    reject reason starts with ``validation_auto_rework signature=`` -- was
+    made with no manager decision at all, so it must never count toward the
+    manager's reject-depth cap (NF-2026-02082). The auto-return loop stays
+    bounded by its own ``MAX_AUTO_RETURNS``.
     """
 
     identity = str(contract_identity or "").strip()
@@ -589,6 +600,10 @@ def counted_candidate_code_rejects(
         if not str(event.get("failure_category_source") or "").strip():
             continue
         if str(event.get("contract_identity") or "").strip() != identity:
+            continue
+        if str(event.get("actor") or "") == AUTO_REWORK_ACTOR:
+            continue
+        if str(event.get("reason") or "").startswith(AUTO_REWORK_REASON_PREFIX):
             continue
         counted.append(str(event.get("request_id") or "").strip())
     return counted

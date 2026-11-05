@@ -28,6 +28,7 @@ _TASK = "TASK_AUTO"
 _REQ = "req-auto-0001"
 _CMD = "python -m pytest -q tests/test_x.py"
 _REAL_REJECT_PINNED = auto._reject_pinned
+_REAL_COUNTED = launch_replay_guard.counted_candidate_code_rejects
 
 
 @pytest.fixture(autouse=True)
@@ -166,11 +167,30 @@ def test_new_signature_after_an_auto_return_is_returned_again(history: list) -> 
 
 
 def test_rework_depth_cap_is_respected(monkeypatch: pytest.MonkeyPatch, history: list) -> None:
+    """Only manager rejects count toward the cap (NF-2026-02082): cap-1 manager
+    rejects still stop an auto-return, any number of auto-returns do not."""
     cap = launch_replay_guard.REJECT_DEPTH_CAP
     monkeypatch.setattr(launch_replay_guard, "counted_candidate_code_rejects", lambda evs, identity: ["r"] * (cap - 1))
     record = _plan(_evidence())["validation_auto_rework"]
     assert record["decision"] == "manager"
     assert record["cause"] == "rework_depth_cap"
+
+    def real_counted(evs, identity):
+        return _REAL_COUNTED(evs, "c")
+
+    monkeypatch.setattr(launch_replay_guard, "counted_candidate_code_rejects", real_counted)
+    for index in range(cap + 1):
+        history.append({
+            "to": "pending", "failure_category": "candidate_code", "failure_category_source": "validation",
+            "contract_identity": "c", "request_id": f"a{index}",
+            "actor": auto.ACTOR, "reason": f"validation_auto_rework signature={index:064x} auto_return={index + 1}",
+        })
+    record = _plan(_evidence())["validation_auto_rework"]
+    assert record["decision"] == "manager"
+    assert record["cause"] == "auto_return_cap"
+    monkeypatch.setattr(auto, "MAX_AUTO_RETURNS", cap + 5)
+    record = _plan(_evidence())["validation_auto_rework"]
+    assert record["decision"] == "auto_return"
 
 
 def test_auto_return_count_is_bounded_so_no_loop_is_possible(history: list) -> None:
@@ -480,15 +500,26 @@ def test_real_store_once_per_signature_and_auto_return_cap(tmp_path: Path, monke
         ("relaunched", "mechanical", auto.ACTOR)] * 2
 
 
-def test_real_store_counted_auto_return_respects_the_reject_depth_cap(tmp_path: Path) -> None:
+def test_real_store_counted_auto_return_respects_the_reject_depth_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NF-2026-02082: automatic returns never count toward the manager's reject
+    depth; the loop is bounded by its own ``MAX_AUTO_RETURNS`` instead."""
+    monkeypatch.setattr(auto, "MAX_AUTO_RETURNS", 2)
     repo = _store_repo(tmp_path)
     assert launch_replay_guard.task_contract_identity(task_store.get_task(repo, _TASK))
     manager = _StoreManager(repo, counted=True)
     first, receipt, _ = _attempt(repo, manager, "req-1", "assert 1 == 2")
     assert first["decision"] == "auto_return" and receipt["state"] == "relaunched"
     second, receipt, _ = _attempt(repo, manager, "req-2", "assert 5 == 6")
-    assert (second["decision"], second["cause"]) == ("manager", "rework_depth_cap")
-    assert receipt is None and len(manager.launches) == 1
+    assert second["decision"] == "auto_return" and receipt["state"] == "relaunched"
+    identity = launch_replay_guard.task_contract_identity(task_store.get_task(repo, _TASK))
+    history = launch_replay_guard.recorded_reject_events(repo, _TASK)
+    assert len(history) == 2
+    assert launch_replay_guard.counted_candidate_code_rejects(history, identity) == []
+    third, receipt, _ = _attempt(repo, manager, "req-3", "brand new failure")
+    assert (third["decision"], third["cause"]) == ("manager", "auto_return_cap")
+    assert receipt is None and len(manager.launches) == 2
 
 
 def test_real_store_relaunch_failure_wakes_the_manager(tmp_path: Path) -> None:
