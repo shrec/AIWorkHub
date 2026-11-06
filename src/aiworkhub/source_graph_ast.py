@@ -39,6 +39,7 @@ internal structure is claimed.
 from __future__ import annotations
 
 import ast
+import bisect
 import hashlib
 import re
 from dataclasses import dataclass, field
@@ -698,8 +699,16 @@ def _mask_comments_preserve_strings(text: str) -> str:
     return "".join(chars)
 
 
+_LINE_INDEX_CACHE: tuple[str, list[int]] | None = None
+
+
 def _line_for_offset(text: str, position: int) -> int:
-    return text.count("\n", 0, max(0, position)) + 1
+    global _LINE_INDEX_CACHE
+    cached = _LINE_INDEX_CACHE
+    if cached is None or cached[0] is not text:
+        cached = (text, [m.start() for m in re.finditer("\n", text)])
+        _LINE_INDEX_CACHE = cached
+    return bisect.bisect_left(cached[1], max(0, position)) + 1
 
 
 def _cpp_signature(text: str, start: int, opening_brace: int) -> str:
