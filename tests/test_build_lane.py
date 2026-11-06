@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import os
@@ -334,16 +335,39 @@ def test_corrupt_receipt_is_a_miss(env: SimpleNamespace) -> None:
     assert again["build_lane"]["key"] == first["build_lane"]["key"]
 
 
-def test_per_lane_lock_serializes_concurrent_runs(env: SimpleNamespace) -> None:
+def test_per_lane_lock_serializes_concurrent_runs(
+    env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
     env.fake.delay = 0.3
     rows: list[dict[str, Any]] = []
     workspaces = [env.make_workspace("a", "alpha"), env.make_workspace("b", "beta")]
+    # NF-2026-02119: the workspace snapshot runs before the lock, so without a
+    # forced overlap a loaded host can serialize the two runs naturally and
+    # observe zero queue wait. Force the overlap: the first run holds the real
+    # lane lock until the second run is queued on it.
+    holding = threading.Event()
+    queued = threading.Event()
+    real_lane_lock = build_lane._lane_lock
+
+    @contextlib.contextmanager
+    def forced_overlap_lane_lock(lock_dir: Path, lane_id: str, max_wait: float) -> Any:
+        second = holding.is_set()
+        if second:
+            queued.set()
+        with real_lane_lock(lock_dir, lane_id, max_wait) as wait:
+            if not second:
+                holding.set()
+                queued.wait(timeout=30)
+            yield wait
+
+    monkeypatch.setattr(build_lane, "_lane_lock", forced_overlap_lane_lock)
     threads = [
         threading.Thread(target=lambda w=w: rows.append(build_lane.run_lane_validation(w, "lane:build")))
         for w in workspaces
     ]
-    for thread in threads:
-        thread.start()
+    threads[0].start()
+    assert holding.wait(timeout=30), "first run never acquired the lane lock"
+    threads[1].start()
     for thread in threads:
         thread.join()
 
