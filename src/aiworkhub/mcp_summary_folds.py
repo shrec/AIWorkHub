@@ -15,7 +15,7 @@ import hashlib
 import json
 from typing import Any
 
-from . import core, output_spill_store
+from . import core, output_spill_store, validation_failure_markers
 
 _REWORK_OUTCOME_REASON = {
     "delta_reused": "sealed delta artifact reused",
@@ -537,6 +537,14 @@ def _bounded_tail(text: str) -> str:
 
 
 def _pick_tail(*sources: Any) -> tuple[str, str | None]:
+    # NF-2026-02084: the first failure-marker line (and its context) of either
+    # stream beats an unrelated stderr line; the plain tail is the fallback.
+    for label in ("stderr", "stdout"):
+        for source in sources:
+            value = source.get(f"{label}_tail") if isinstance(source, dict) else None
+            excerpt = validation_failure_markers.failure_excerpt(value) if isinstance(value, str) else None
+            if excerpt:
+                return excerpt.encode("utf-8")[:FIRST_FAILURE_TAIL_BYTES].decode("utf-8", "ignore"), label
     for label in ("stderr", "stdout"):
         for source in sources:
             value = source.get(f"{label}_tail") if isinstance(source, dict) else None

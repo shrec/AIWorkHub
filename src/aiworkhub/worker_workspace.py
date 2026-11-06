@@ -8234,7 +8234,7 @@ def worker_validation_affordance_env(
     temp = PurePosixPath(temp_dir) if os.name != "nt" else Path(temp_dir)
     env["RUFF_CACHE_DIR"] = str(temp / "ruff-cache")
     env["MYPY_CACHE_DIR"] = str(temp / "mypy-cache")
-    env["PYTEST_ADDOPTS"] = _WORKER_PYTEST_ADDOPTS
+    env.update(PYTEST_ADDOPTS=_WORKER_PYTEST_ADDOPTS, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
     return env
 
 

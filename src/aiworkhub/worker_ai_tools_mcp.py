@@ -9143,9 +9143,9 @@ def _validation_child_env(
     ``PYTEST_ADDOPTS`` literal), reusing ``worker_workspace``'s constant rather
     than restating it."""
 
-    from . import worker_workspace
+    from . import validation_runner, worker_workspace
 
-    env = dict(os.environ)
+    env = validation_runner.validation_child_env()  # + PYTHONIOENCODING/PYTHONUTF8 pins
     # A ``<name> -m <module>`` spelling still needs PATH to find the
     # interpreter, and an adapter that REPLACES (rather than merges) this
     # server's environment can leave it unset. Fall back to the platform

@@ -48,6 +48,7 @@ from . import (
     task_store,
     validation_base_triage,
     validation_failed_packet,
+    validation_failure_markers,
 )
 from .process_launcher_validation import is_operational_validation_failure
 
@@ -171,6 +172,13 @@ def build_reason(packet: Mapping[str, Any], signature: str, auto_return: int) ->
         lines.append(f"  exit_code: {entry.get('exit_code')} timed_out: {bool(entry.get('timed_out'))}")
         if nodeids:
             lines.append(f"  failing tests: {nodeids}")
+        # NF-2026-02084: every failing case header, not only those in the tail's last lines.
+        headers, omitted = validation_failure_markers.failing_case_headers(str(entry.get("tail") or ""))
+        if headers:
+            lines.append("  failing cases:")
+            lines.extend(f"    {header}" for header in headers)
+            if omitted:
+                lines.append(f"    ... {omitted} more failing case header(s) omitted")
         tail = validation_failed_packet._last_bytes(str(entry.get("tail") or ""), tail_budget)
         if tail:
             lines.append("  failure tail:")

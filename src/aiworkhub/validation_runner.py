@@ -1487,6 +1487,16 @@ def pytest_validation_evidence(stdout: str, returncode: int | None) -> dict[str,
     return evidence
 
 
+# NF-2026-02084: a validation child writes UTF-8 and is read back as UTF-8 with
+# replacement -- never the locale code page -- so non-ASCII output survives.
+VALIDATION_CHILD_UTF8_ENV: dict[str, str] = {"PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
+
+
+def validation_child_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The child environment: ``base`` (default ``os.environ``) plus the UTF-8 pins."""
+    return {**(os.environ if base is None else base), **VALIDATION_CHILD_UTF8_ENV}
+
+
 # ---- validation-environment signatures (NF-2026-01671) -----------------------
 # A declared command that RAN in the worker sandbox and failed only because the
 # lane cannot do one measured thing still reads as a plain ``validation_failed``:
@@ -1968,6 +1978,7 @@ __all__ = [
     "SEMLOCK_TRUSTED_PROBE_SOURCE",
     "SemlockPreflight",
     "TerminalState",
+    "VALIDATION_CHILD_UTF8_ENV",
     "VALIDATION_ENVIRONMENT_BLOCKED",
     "VALIDATION_ENVIRONMENT_EVIDENCE_SOURCE",
     "VALIDATION_ENVIRONMENT_SIGNATURES",
@@ -1999,6 +2010,7 @@ __all__ = [
     "sandbox_unrunnable_reason",
     "temp_root_blocks_nested_lsp_helper",
     "trusted_semlock_probe_argv",
+    "validation_child_env",
     "validation_environment_signature",
     "validation_environment_signature_evidence",
 ]
