@@ -265,7 +265,7 @@ class _FakeStore:
         ]
         return rows[:limit]
 
-    def list_task_cards(self, _root, *, limit=500):
+    def list_task_cards(self, _root, *, limit=500, projection=None):
         self.window_reads += 1
         cards = sorted(_CARDS, key=lambda c: c["updated_at"], reverse=True)[:limit]
         self.decoded_card_ids.extend(card["task_id"] for card in cards)
