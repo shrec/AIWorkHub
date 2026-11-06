@@ -3829,46 +3829,10 @@ def _paths_overlap(left: str, right: str, *, glob_aware: bool) -> bool:
 
 
 def task_card_path_conflicts(card: dict[str, Any]) -> list[dict[str, str]]:
-    """Return bounded write-path/forbidden contradictions (forbidden bounds writes, not reads)."""
-    forbidden = [
-        path
-        for path in (_task_contract_path(v) for v in card.get("forbidden") or [])
-        if path
-    ]
-    if not forbidden:
-        return []
-    conflicts: list[dict[str, str]] = []
-    for field in ("allowed_writes", "required_outputs"):
-        values = card.get(field) or []
-        if not isinstance(values, list):
-            continue
-        for raw in values:
-            declared = _task_contract_path(raw)
-            if not declared:
-                continue
-            for denied in forbidden:
-                if _paths_overlap(declared, denied, glob_aware=True):
-                    conflicts.append({
-                        "field": field,
-                        "path": declared,
-                        "forbidden": denied,
-                    })
-                    if len(conflicts) >= 32:
-                        return conflicts
-    text_fields = [("objective", str(card.get("objective") or ""))]
-    text_fields.extend(
-        ("validation", str(value)) for value in (card.get("validation") or [])
-    )
-    for field, text in text_fields:
-        normalized_text = text.replace("\\", "/")
-        for denied in forbidden:
-            if denied and denied in normalized_text:
-                row = {"field": field, "path": denied, "forbidden": denied}
-                if row not in conflicts:
-                    conflicts.append(row)
-                    if len(conflicts) >= 32:
-                        return conflicts
-    return conflicts
+    """Bounded forbidden contradictions; the anchored grammar lives in task_scope_contract."""
+    from . import task_scope_contract
+
+    return task_scope_contract.task_card_path_conflicts(card)
 
 
 def bounded_strings(value: list[str] | None, name: str, *, required: bool = False) -> list[str]:
@@ -4956,7 +4920,9 @@ def create_task(
         path_error = _allowed_write_path_error(item)
         if path_error is not None:
             return path_error
-    conflicts = task_card_path_conflicts({
+    from . import task_scope_contract
+
+    scope_refusal = task_scope_contract.creation_scope_refusal(repo_root(), {
         "objective": objective,
         "validation": validation2,
         "allowed_writes": writes2,
@@ -4975,10 +4941,8 @@ def create_task(
         "immutable_inputs": immutable_inputs2,
         "forbidden": forbidden2,
     })
-    if conflicts:
-        result = _lifecycle_error("contradictory_task_path_contract", 2)
-        result["conflicts"] = conflicts
-        return result
+    if scope_refusal is not None:
+        return scope_refusal
 
     # Name an unwinnable contract HERE, not one launch turn later.
     #
@@ -6664,14 +6628,11 @@ def _validate_allowed_writes_amendment_paths(
         path_error = _allowed_write_path_error(item)
         if path_error is not None:
             return path_error
-    conflicts = task_card_path_conflicts(
-        {"forbidden": card.get("forbidden"), "allowed_writes": writes}
+    from . import task_scope_contract
+
+    return task_scope_contract.creation_scope_refusal(
+        repo_root(), {"forbidden": card.get("forbidden"), "allowed_writes": writes}
     )
-    if conflicts:
-        result = _lifecycle_error("contradictory_task_path_contract", 2)
-        result["conflicts"] = conflicts
-        return result
-    return None
 
 
 _READ_FIRST_ENTRY = re.compile(r"^(?P<path>.+?)(?::\d+(?:-\d+)?)?$")

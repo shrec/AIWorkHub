@@ -3359,7 +3359,7 @@ def _card_input_refusal_reason(
     repo_root: str | Path, card: Mapping[str, Any]
 ) -> str | None:
     """Return the first refusal task creation or launch would raise, or None."""
-    from . import core, worker_workspace
+    from . import task_scope_contract, worker_workspace
 
     repo = Path(repo_root).resolve()
     try:
@@ -3378,12 +3378,7 @@ def _card_input_refusal_reason(
             "reserved_topic:quality_review: this topic belongs to reviewer cards "
             "launched by aiworkhub_quality_reviewer_launch, not NeedFix cards"
         )
-    rows = core.task_card_path_conflicts(dict(card))
-    if rows:
-        return "contradictory_task_path_contract:" + ";".join(
-            f"{r['field']}={r['path']}~{r['forbidden']}" for r in rows[:4]
-        )
-    return None
+    return task_scope_contract.creation_scope_reason(repo, dict(card))
 
 
 def default_task_card(needfix_snapshot: Mapping[str, Any]) -> dict[str, Any]:
