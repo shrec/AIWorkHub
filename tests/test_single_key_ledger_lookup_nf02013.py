@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +41,19 @@ _OPTIONS: list[dict[str, Any]] = [
 
 
 @pytest.fixture(autouse=True)
-def _clean_caches():
+def _clean_caches(monkeypatch: pytest.MonkeyPatch):
+    # These tests assert on the process-wide latest-event cache. A storage
+    # retention sweep that an earlier test on this worker started keeps
+    # reading its own ledger through that cache (seen under full-suite load),
+    # so wait it out and let no new sweep start until the test ends.
+    from aiworkhub import storage_retention
+
+    monkeypatch.setattr(
+        storage_retention, "schedule_repository_cleanup", lambda *_a, **_k: False
+    )
+    for thread in threading.enumerate():
+        if thread.name == "aiworkhub-storage-retention":
+            thread.join(timeout=60)
     ledger.reset_latest_event_cache()
     ledger.reset_request_event_cache()
     yield

@@ -291,6 +291,13 @@ def _fake_show(task_id: str):
 def _patch(monkeypatch) -> None:
     monkeypatch.setattr(server.process_launcher, "default_manager", lambda: _Manager())
     monkeypatch.setattr(server.core, "show_task", _fake_show)
+    # base_ci is a live `gh` call: two packets built seconds apart can differ
+    # (one ok, one gh_timeout), so the batch-vs-single equality must not see it.
+    monkeypatch.setattr(
+        completion_inbox.ci_status,
+        "base_ci_section",
+        lambda *_a, **_k: {"state": "unavailable", "reason": "stubbed", "warnings": []},
+    )
 
 
 def test_two_request_ids_return_two_single_call_packets_with_split_budget(monkeypatch):

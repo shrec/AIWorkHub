@@ -127,6 +127,9 @@ def test_owner_hands_the_lock_to_a_newer_generation(tmp_path, monkeypatch):
         _point(storage, "G2")
         new.start()
         assert _wait_for(lambda: new.health()["authority_state"] == "active_owner")
+        # The old owner passes through "released" on its way to standby; on a
+        # loaded host the new owner can win the lock before that step lands.
+        assert _wait_for(lambda: old.health()["authority_state"] == "standby")
         health = old.health()
         assert health["authority_state"] == "standby"
         assert health["last_acquisition_error"] == "superseded_runtime_generation:G1->G2"

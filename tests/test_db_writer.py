@@ -254,7 +254,9 @@ def test_stats_record_real_waiting(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # the behaviour that motivated the module
 # ---------------------------------------------------------------------------
-def _claim_worker(idx: int, db: str, iters: int, leased: bool, busy_ms: int, q) -> None:
+def _claim_worker(
+    idx: int, db: str, iters: int, leased: bool, busy_ms: int, q, start=None
+) -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
     from aiworkhub import db_writer as dw
 
@@ -289,6 +291,8 @@ def _claim_worker(idx: int, db: str, iters: int, leased: bool, busy_ms: int, q) 
         finally:
             conn.close()
 
+    if start is not None:
+        start.wait(timeout=120)
     for _ in range(iters):
         try:
             if leased:
@@ -321,8 +325,11 @@ def test_lease_removes_the_database_is_locked_class(tmp_path: Path, leased: bool
 
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
+    # All six claim at once: started one by one on a loaded host they would
+    # not overlap, and the unleased baseline would see no contention at all.
+    start = ctx.Barrier(6)
     procs = [
-        ctx.Process(target=_claim_worker, args=(i, str(db), 25, leased, 1, q))
+        ctx.Process(target=_claim_worker, args=(i, str(db), 25, leased, 1, q, start))
         for i in range(6)
     ]
     for p in procs:
