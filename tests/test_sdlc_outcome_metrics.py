@@ -813,6 +813,8 @@ def test_small_store_reads_the_same_metrics_as_the_pure_aggregate(tmp_path, monk
         repository_id="repo-one",
         limit=100,
         task_cards={},
+        # The store holds no card rows, so the timeline read is available but empty.
+        phase_evidence=sdlc_outcome_metrics.sdlc_phase_timeline.PhaseEvidence(available=True),
     )
     assert stored == pure
     assert stored["first_pass_acceptance"] == {

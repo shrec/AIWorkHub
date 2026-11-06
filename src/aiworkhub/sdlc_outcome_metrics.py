@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from . import needfix_store, process_event_ledger, runtime_adapters, task_store, vscode_lm_worker
+from . import sdlc_phase_timeline
 from .sqlite_readonly import connect_readonly
 
 SCHEMA_ID = "aiworkhub.sdlc_outcome_metrics.v1"
@@ -739,6 +740,7 @@ def aggregate(
     cohort: DecidedTaskCohort | None = None,
     attempts: AttemptEvidence | None = None,
     task_cards: TaskCardEvidence | Mapping[str, Mapping[str, Any]] | None = None,
+    phase_evidence: sdlc_phase_timeline.PhaseEvidence | None = None,
 ) -> dict[str, Any]:
     """Compute bounded aggregates without consulting prose or mutable status."""
 
@@ -885,6 +887,10 @@ def aggregate(
             repository_id=repository_id,
             population_cut=events_truncated,
             needfix_cut=len(needfix_rows) > cap,
+        ),
+        # Only verified-accepted, whole-history tasks are timed; see sdlc_phase_timeline.
+        "phase_timeline": sdlc_phase_timeline.summarize(
+            phase_evidence, tuple(accepted), attempts.rows if attempts is not None else ()
         ),
     }
 
@@ -1214,6 +1220,9 @@ def read_repository_metrics(
     try:
         event_rows, cohort = read_decided_task_cohort(task_conn, cap)
         cards = read_task_cards(task_conn, cohort.selected)
+        phases = sdlc_phase_timeline.read_phase_evidence(
+            task_conn, cohort.selected, chunk=_CARD_CHUNK
+        )
     finally:
         task_conn.close()
     attempts = AttemptEvidence(byte_bound=ledger_byte_bound)
@@ -1254,4 +1263,5 @@ def read_repository_metrics(
         cohort=cohort,
         attempts=attempts,
         task_cards=cards,
+        phase_evidence=phases,
     )
