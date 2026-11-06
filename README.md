@@ -374,12 +374,12 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.88
+## What's new in 0.12.89
 
-- Long accepts are no longer cut off: the MCP server sends progress heartbeats while a long tool such as accept review runs, so the client's idle timeout does not abort it.
-- Faster accepts: finalization and accept reuse validation and neighbour tests that already passed, and one load-sensitive test failure is retried instead of costing a full accept cycle.
-- Faster dashboard: snapshots cache provider probes, skip a per-read database integrity check and read tasks in one batch.
-- Fewer manager steps: a verified manager's NeedFix converts in one call, and finding reproduction skips the base run when the candidate side already passes.
+- Clean cards can accept themselves: an opt-in auto-accept lane promotes a low- or medium-risk candidate whose gates are all green and whose reviewers found nothing; the manager still reviews everything else.
+- The Claude Code manager no longer forgets finished work: its turn cannot end while review cards wait or workers run without a callback watcher.
+- The task database stops growing with every card: finished cards' evidence is compacted, and retry finalization returns a receipt instead of blocking.
+- Fewer stuck reviews: finding reproduction has a deadline, dead review wakes are released, a refused reviewer fails over to the next provider, and automatic rework no longer uses up the reject budget.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Continuous Audit as a Service (CAAS)

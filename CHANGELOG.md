@@ -6,6 +6,36 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.89] - 2026-11-06
+
+### Added
+
+- An auto-accept lane accepts clean low- and medium-risk candidates (every gate green, zero reviewer defects) without a manager turn; it is a per-host opt-in through the gitignored `.aiworkhub/config/auto_accept.json` and is off by default. A reviewer that spawns child processes now stays live (NF-2026-02103).
+- A direct Claude Code manager cannot end a turn while review cards wait for it or its workers run without a callback watcher; the Stop hook names the cards and the exact watcher command (NF-2026-02110).
+
+### Changed
+
+- The task store compacts finished cards' evidence in a bounded, receipt-verified pass with incremental vacuum, and folds review and accept event payloads at write time, so the database stops growing with every card.
+- `aiworkhub_agent_retry_finalization` enqueues the retry and returns a receipt instead of blocking the MCP call.
+- Automatic validation rework no longer counts toward the manager's reject depth (NF-2026-02082).
+- A reviewer lens refused by its provider fails over to the next ranked provider instead of stalling the card.
+- The phase timeline attributes review and finalize time to measured phases (NF-2026-02105), and the review packet, accept preview and accept show the base commit's CI status (NF-2026-02080).
+- `task_show detail=full` replies are bounded, with large folds spilled to files (NF-2026-02093).
+- Neighbour tests already red on canonical HEAD are excused, and in-repo pytest basetemp roots count as neutral.
+- Validation children run with UTF-8, and rework feedback carries the failing test-case headers.
+
+### Fixed
+
+- Dispose-time finding reproduction runs under a shared deadline, so a long probe no longer holds the MCP call past the client's timeout (NF-2026-02095).
+- A deferred review wake is released when its review chain is dead and the callback watcher sees it (NF-2026-02109), and `callback_wait` no longer lists dead entries as waiting for review (NF-2026-01939).
+- Source Graph `refresh_now` no longer reports success on a stale index (NF-2026-02081).
+- The tool guard decides whether a file is indexed by its extension (NF-2026-02088).
+- Task create refuses scope paths inside a nested repository (NF-2026-02090).
+- A provider "402 insufficient balance" reply is classified as a billing stop, not a crash (NF-2026-02085).
+- Reviewer text-submit salvage uses only the final call's own arguments (NF-2026-02100).
+- The semantic edit apply receipt reports the true `before_sha256` (NF-2026-02092).
+- Worker sparse seeds include native build files (NF-2026-02079), and the dead-seat scratch janitor hands a previous manager session's scratch off correctly (NF-2026-02089).
+
 ## [0.12.88] - 2026-11-05
 
 ### Changed

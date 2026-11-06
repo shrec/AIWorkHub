@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.12.89 — 2026-11-06
+
+### Changed
+
+- Bundled runtime 0.12.89: an opt-in auto-accept lane for clean low- and medium-risk cards, a Stop hook that keeps the Claude Code manager from ending a turn while review cards wait, task-store compaction so the database stops growing with every card, and a deadline on finding reproduction so dispose calls no longer hang. The full list is in the repository CHANGELOG.
+
 ## 0.12.88 — 2026-11-05
 
 ### Changed
