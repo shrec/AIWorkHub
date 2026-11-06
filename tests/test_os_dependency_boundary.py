@@ -155,7 +155,13 @@ def test_current_tree_passes_and_baseline_is_sorted():
     # other new identities of the release (build_lane.py, toolchain_registry.py,
     # process_launcher_launch_isolated.py) were routed through
     # ``platform_io.is_windows()`` instead of recorded.
-    assert sum(entry.count for entry in boundary.baseline) == 131
+    # 131 -> 132 on 2026-11-06: tool_guard_hook.py opens the Source Graph
+    # database read-only (as_uri + mode=ro + query_only) to decide indexed-ness.
+    # It is copied byte-for-byte into .claude/hooks and must import nothing from
+    # aiworkhub, so it cannot reach sqlite_readonly -- card_read_roots.py is the
+    # precedent. storage_retention.py's new session-document reader was routed
+    # through sqlite_readonly.connect_readonly instead of recorded.
+    assert sum(entry.count for entry in boundary.baseline) == 132
 
 
 def test_new_identity_and_same_identity_growth_fail(tmp_path):

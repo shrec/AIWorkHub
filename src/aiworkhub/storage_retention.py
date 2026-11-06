@@ -3109,10 +3109,10 @@ def _scratch_session_document_references(
     ``documents`` table holds no such record (no reference); a ``documents``
     table that lacks ``kind``/``content`` cannot be judged and fails closed.
     """
-    ro_uri = f"{db_path.resolve().as_uri()}?mode=ro"
-    conn = sqlite3.connect(ro_uri, uri=True, timeout=5.0)
+    from . import sqlite_readonly  # local import: cycle-safe
+
+    conn = sqlite_readonly.connect_readonly(db_path, timeout=5.0)
     try:
-        conn.execute("PRAGMA query_only = ON")
         conn.execute("PRAGMA busy_timeout=5000")
         columns = {str(row[1]) for row in conn.execute('PRAGMA table_info("documents")')}
         if not columns:

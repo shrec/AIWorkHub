@@ -889,6 +889,11 @@
         "count": 1
       },
       {
+        "path": "src/aiworkhub/tool_guard_hook.py",
+        "pattern": "sqlite_connect",
+        "count": 1
+      },
+      {
         "path": "src/aiworkhub/tool_recipes_store.py",
         "pattern": "sqlite_connect",
         "count": 1
@@ -987,8 +992,8 @@
     "measurement": {
       "reference_commit": "4ef0001cf9ef66fc9ebd70d5b724d46c485b1840",
       "reference_total": 161,
-      "current_total": 131,
-      "accepted_predecessor_delta": -30
+      "current_total": 132,
+      "accepted_predecessor_delta": -29
     }
   },
   "single_definition_boundary": {
