@@ -26,7 +26,7 @@ import uuid
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from . import db_writer
 from . import task_fsm
@@ -205,6 +205,16 @@ def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return any(row["name"] == column for row in rows)
 
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    """Read-only presence check; never creates anything."""
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (table,)
+        ).fetchone()
+        is not None
+    )
+
 def _ensure_callback_outbox_table(conn: sqlite3.Connection) -> None:
     """Idempotent, fail-closed migration: create/upgrade callback_outbox.
 
@@ -378,14 +388,23 @@ def _route_origin_seen_recently(
     provider: str,
     origin_thread_id: str,
     cache: dict[str, bool],
+    *,
+    readonly: bool = False,
 ) -> bool:
     """True when ``origin_thread_id`` waited within ROUTE_LIVE_WINDOW.
 
     Absent or unparseable stamps are not liveness evidence: the origin counts
-    as gone and its backlog may be adopted (reload recovery)."""
+    as gone and its backlog may be adopted (reload recovery). ``readonly``
+    never creates the stamp table (NF-2026-01903): a missing table reads as
+    no stamp."""
     if origin_thread_id in cache:
         return cache[origin_thread_id]
-    _ensure_callback_route_seen_table(conn)
+    if readonly:
+        if not _table_exists(conn, "callback_route_seen"):
+            cache[origin_thread_id] = False
+            return False
+    else:
+        _ensure_callback_route_seen_table(conn)
     row = conn.execute(
         "SELECT last_seen_at FROM callback_route_seen WHERE provider=? AND origin_thread_id=?",
         (provider, origin_thread_id),
@@ -1351,7 +1370,13 @@ def peek_claimable_callback(
     for this exact route, without writing anything (no lease, ack or UPDATE).
 
     Stale-member supersede still happens only inside a real claim, so a batch
-    whose members are all stale is reported here and consumed by the claim."""
+    whose members are all stale is reported here and consumed by the claim.
+
+    NF-2026-02109: with no claimable outbox row, a review/terminal task that
+    the claim's seed reconciliation would wake on this route is reported too
+    (``batch_id`` '' and ``seed_pending`` True), through the same
+    ``_seed_review_decision`` predicate. The seeding itself still happens only
+    inside the claim; this path stays read-only (NF-2026-01903)."""
     provider = str(provider or "").strip().lower()
     origin_thread_id = str(origin_thread_id or "").strip()
     if not provider or not origin_thread_id:
@@ -1375,7 +1400,15 @@ def peek_claimable_callback(
         expired_batch_ids=frozenset(_expired_batch_ids(conn, now_iso)),
     )
     if target is None:
-        return None
+        seed_members = _peek_seed_eligible_members(
+            conn,
+            provider=provider,
+            origin_thread_id=origin_thread_id,
+            max_members=max_members,
+        )
+        if not seed_members:
+            return None
+        return {"batch_id": "", "members": seed_members, "seed_pending": True}
     batch_id, _thread_id, outbox_ids = target
     if batch_id:
         rows = conn.execute(
@@ -2307,6 +2340,321 @@ def supersede_decided_task_callbacks(conn: sqlite3.Connection) -> dict[str, int]
     }
 
 
+# NF-2026-02109: review_action_outbox states after which an action can never
+# run again. A deferred manager wake is held only while the target's newest
+# review chain has an action outside this set (pending/leased, or an unknown
+# state, which stays held fail-closed and bounded by DEFERRED_REVIEW_WAKE_GRACE).
+_REVIEW_CHAIN_TERMINAL_ACTION_STATES = frozenset({"completed", "failed", "retired"})
+
+
+class _SeedDecision(NamedTuple):
+    """What ``seed_missing_review_callbacks`` would do for one task row."""
+
+    task_id: str
+    transition: str
+    episode_id: str
+    callback_origin: str
+    request_id: str
+    event_id: str
+    # The dead-letter/superseded outbox row the seed re-arms instead of
+    # inserting a new one; None means a fresh enqueue.
+    recover_row: Any
+
+
+def _deferred_review_chain_dead(conn: sqlite3.Connection, task_id: str, card: dict) -> bool:
+    """True only when the target's newest review chain exists, has at least
+    one action, and every action is terminal (NF-2026-02109).
+
+    The chain is matched on target_task_id + any request id the card records.
+    No request id, no review_lifecycle tables, no chain row or a chain with no
+    actions yet is NOT evidence of death: the chain may still be created, so
+    the caller keeps the grace. Read-only."""
+    terminal_review = card.get("terminal_review")
+    terminal_review = terminal_review if isinstance(terminal_review, dict) else {}
+    evidence = terminal_review.get("evidence")
+    evidence = evidence if isinstance(evidence, dict) else {}
+    request_ids = sorted(
+        {
+            candidate.strip()
+            for candidate in (
+                card.get("launch_request_id"),
+                card.get("request_id"),
+                evidence.get("request_id"),
+                terminal_review.get("request_id"),
+            )
+            if isinstance(candidate, str) and candidate.strip()
+        }
+    )
+    if not request_ids:
+        return False
+    if not (_table_exists(conn, "review_chains") and _table_exists(conn, "review_action_outbox")):
+        return False
+    chain = conn.execute(
+        "SELECT chain_id FROM review_chains WHERE target_task_id=? AND target_request_id IN (%s) "
+        "ORDER BY chain_id DESC LIMIT 1" % ",".join("?" * len(request_ids)),
+        (task_id, *request_ids),
+    ).fetchone()
+    if chain is None:
+        return False
+    states = {
+        str(state_row[0] or "")
+        for state_row in conn.execute(
+            "SELECT DISTINCT state FROM review_action_outbox WHERE chain_id=?", (chain[0],)
+        ).fetchall()
+    }
+    return bool(states) and states <= _REVIEW_CHAIN_TERMINAL_ACTION_STATES
+
+
+def _deferred_review_wake_held(conn: sqlite3.Connection, task_id: str, card: dict) -> bool:
+    """Is this review card's manager wake still deliberately deferred?
+
+    A review whose manager wake was deferred until the quality-review chain
+    finishes must not be pre-empted by a seeded review_ready row
+    (NF-2026-01220): publish_manager_ready announces it. Only a young deferral
+    is held back; a missing/unparseable or old recorded_at falls through to
+    the last-resort wake. NF-2026-02109: a young deferral is released at once
+    when the newest review chain is dead (every action terminal), since that
+    chain will never publish manager_ready.
+    ponytail: a chain that is live but stuck (pending/leased forever), or one
+    not created yet, still surfaces only after DEFERRED_REVIEW_WAKE_GRACE."""
+    terminal_review = card.get("terminal_review")
+    terminal_evidence = (
+        terminal_review.get("evidence") if isinstance(terminal_review, dict) else None
+    )
+    if not (
+        isinstance(terminal_evidence, dict)
+        and isinstance(terminal_evidence.get("manager_callback_deferred"), dict)
+        and not card.get("manager_ready_receipt")
+    ):
+        return False
+    deferred_at = _parse_instant(terminal_review.get("recorded_at"))
+    if deferred_at is None or datetime.now(timezone.utc) - deferred_at >= DEFERRED_REVIEW_WAKE_GRACE:
+        return False
+    return not _deferred_review_chain_dead(conn, task_id, card)
+
+
+def _seed_candidate_rows(conn: sqlite3.Connection) -> list:
+    """Task rows the seed reconciliation considers. Read-only: a tasks table
+    without the origin column (not yet migrated) reads it as ''."""
+    if not _table_exists(conn, "tasks"):
+        return []
+    origin_column = (
+        "origin_thread_id"
+        if _column_exists(conn, "tasks", "origin_thread_id")
+        else "'' AS origin_thread_id"
+    )
+    return conn.execute(
+        f"""
+        SELECT task_id, status, card_json, {origin_column}
+          FROM tasks
+         WHERE status IN ('review', 'blocked')
+           AND (archived_at IS NULL OR archived_at='')
+         ORDER BY updated_at ASC, task_id ASC
+        """
+    ).fetchall()
+
+
+def _seed_review_decision(
+    conn: sqlite3.Connection,
+    row: Any,
+    *,
+    provider: str,
+    route_origin: str,
+    live_cache: dict[str, bool],
+    readonly: bool = False,
+) -> _SeedDecision | None:
+    """The single seed-eligibility predicate (NF-2026-02109).
+
+    Shared by ``seed_missing_review_callbacks`` (which then performs the
+    decision) and ``peek_claimable_callback`` (which only reports it). It
+    never writes; ``readonly`` additionally forbids the table-creating
+    liveness lookup so a read-only watcher connection works (NF-2026-01903).
+    None means the seed skips this row."""
+    task_id = str(row["task_id"] or "")
+    try:
+        card = json.loads(row["card_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        card = {}
+    if not isinstance(card, dict):
+        card = {}
+    row_provider = str(card.get("coordinator_provider") or provider).strip().lower()
+    if row_provider != provider:
+        return None
+    episode_id = str(card.get("claim_epoch") or 0)
+    current_status = str(row["status"] or "").strip()
+    raw_terminal = str(card.get("terminal_substatus") or "").strip()
+    # Reconciliation starts from an already-canonical review row. Preserve
+    # known compact terminal states, but recover an unfamiliar persisted
+    # substatus as review_ready so a future/legacy spelling cannot strand
+    # the review. Direct enqueue_callback callers remain fail-closed.
+    if current_status == "blocked":
+        transition = normalize_callback_transition(raw_terminal)
+        if transition not in CALLBACK_ELIGIBLE_TRANSITIONS:
+            return None
+    else:
+        # A canonical review row is, by definition, ready for review: its
+        # substatus is a success spelling (review_ready/exited). An
+        # unfamiliar future/legacy SUCCESS spelling still recovers as
+        # review_ready here so it cannot strand the review. This is the only
+        # place a review-status row defaults to review_ready -- and it does
+        # so explicitly for a known-review row, NOT via
+        # resolve_callback_transition, which is now fail-closed (unknown ->
+        # blocked) so a failure substatus can never be delivered as
+        # review_ready anywhere (NF-2026-00340).
+        transition = normalize_callback_transition(raw_terminal) or "review_ready"
+        # A young deferral is held only while its review chain can still
+        # announce manager_ready; a dead chain releases it at once
+        # (NF-2026-01220, NF-2026-02109; see _deferred_review_wake_held).
+        if _deferred_review_wake_held(conn, task_id, card):
+            return None
+    persisted_origin = str(row["origin_thread_id"] or card.get("origin_thread_id") or "").strip()
+    # NF-2026-02015: carry the card's launch request id so the owning seat
+    # can match the member by request id, not only by task id.
+    seed_request_id, seed_event_id = _seed_callback_request_identity(card)
+    # NF-2026-02015: a launched card (it carries a request id) belongs to
+    # its persisted origin seat. The waiting seat's verified route adopts it
+    # only when that owner was not seen within ROUTE_LIVE_WINDOW (reload
+    # recovery); a live owner keeps the wake in its own lane. A card with no
+    # launch identity keeps the legacy any-verified-route retarget: no seat
+    # holds a request to match it against.
+    if (
+        route_origin
+        and seed_request_id
+        and persisted_origin
+        and persisted_origin != route_origin
+        and _route_origin_seen_recently(
+            conn, provider, persisted_origin, live_cache, readonly=readonly
+        )
+    ):
+        callback_origin = persisted_origin
+    else:
+        callback_origin = route_origin or persisted_origin
+    if not callback_origin:
+        return None
+
+    def _decision(recover_row: Any = None) -> _SeedDecision:
+        return _SeedDecision(
+            task_id=task_id,
+            transition=transition,
+            episode_id=episode_id,
+            callback_origin=callback_origin,
+            request_id=seed_request_id,
+            event_id=seed_event_id,
+            recover_row=recover_row,
+        )
+
+    # NF-2026-00843: look for the row under the provider enqueue_callback
+    # stores it as. An mls- origin is filed as manager_chat, so a lookup by
+    # the caller's provider never found it and every dispatcher pass
+    # enqueued the wake again (275 copies of one blocked wake, measured).
+    lookup_provider = (
+        MANAGER_CHAT_PROVIDER if _MANAGER_CHAT_SESSION_RE.fullmatch(callback_origin) else provider
+    )
+    # The dedup lookup keys on ``transition`` too: a task that already
+    # has a review_ready row but is now (same episode) blocked has NO
+    # wake for its CURRENT transition, and a transition-blind lookup
+    # would wrongly treat the review_ready row as "already handled" and
+    # skip the gap -- the exact way the direct enqueue predicate did.
+    if route_origin:
+        existing = conn.execute(
+            "SELECT outbox_id,batch_id,state,recovery_count FROM callback_outbox WHERE task_id=? AND provider=? "
+            "AND origin_thread_id=? AND transition=? AND episode_id=? LIMIT 1",
+            (task_id, lookup_provider, callback_origin, transition, episode_id),
+        ).fetchone()
+    else:
+        existing = conn.execute(
+            "SELECT outbox_id,batch_id,state,recovery_count FROM callback_outbox WHERE task_id=? AND provider=? "
+            "AND transition=? AND episode_id=? LIMIT 1",
+            (task_id, lookup_provider, transition, episode_id),
+        ).fetchone()
+    if existing is not None:
+        if (
+            route_origin
+            and str(existing["state"] or "") in {"dead_letter", "superseded"}
+            and int(existing["recovery_count"] or 0) == 0
+            and _task_still_in_matching_terminal_state(
+                conn, task_id, transition, episode_id
+            )
+        ):
+            return _decision(existing)
+        return None
+    if route_origin:
+        # NF-2026-01548: an episode+transition already delivered to ANY
+        # manager origin is never seeded again for a new verified route.
+        delivered_elsewhere = conn.execute(
+            "SELECT 1 FROM callback_outbox WHERE task_id=? AND provider IN (?, ?) "
+            "AND transition=? AND episode_id=? AND state='delivered' LIMIT 1",
+            (task_id, lookup_provider, provider, transition, episode_id),
+        ).fetchone()
+        if delivered_elsewhere is not None:
+            return None
+    # No wake exists for the transition the task is in right now. On a
+    # verified route, prefer recovering a dead-letter/superseded row this
+    # task stranded under a DIFFERENT transition in the SAME episode and
+    # re-pointing that single recoverable row at the current transition,
+    # over leaving it stranded and never producing the owed wake. (A
+    # review_ready row superseded when the same card was moved to blocked
+    # in-episode is exactly this case.)
+    if route_origin:
+        stranded = conn.execute(
+            "SELECT outbox_id,batch_id,state,recovery_count FROM callback_outbox "
+            "WHERE task_id=? AND provider=? AND origin_thread_id=? AND episode_id=? "
+            "AND state IN ('dead_letter','superseded') AND recovery_count=0 LIMIT 1",
+            (task_id, lookup_provider, callback_origin, episode_id),
+        ).fetchone()
+        if stranded is not None and _task_still_in_matching_terminal_state(
+            conn, task_id, transition, episode_id
+        ):
+            return _decision(stranded)
+    return _decision()
+
+
+def _recover_seeded_terminal_row(conn: sqlite3.Connection, decision: _SeedDecision) -> None:
+    # Recovery re-points the row at the transition the task is in
+    # RIGHT NOW (``transition``), never leaving the old one. A row
+    # recovered with a stale transition is superseded again by the
+    # very next claim (its transition no longer matches the task's
+    # live terminal state) and, its single recovery budget already
+    # burned here, could then never be recovered again -- the wake
+    # would be lost forever on an otherwise stable manager route.
+    existing_row = decision.recover_row
+    batch_id = str(existing_row["batch_id"] or "")
+    now = utc_now()
+    prior_state = str(existing_row["state"] or "")
+    if batch_id:
+        conn.execute(
+            "UPDATE callback_batches SET state='superseded', updated_at=? "
+            "WHERE batch_id=? AND state IN ('dead_letter','superseded')",
+            (now, batch_id),
+        )
+    conn.execute(
+        "UPDATE callback_outbox SET state='pending', batch_id='', "
+        "lease_id='', lease_expires_at='', attempts=0, "
+        "transition=?, last_error=?, "
+        "recovery_count=recovery_count+1, updated_at=? "
+        "WHERE outbox_id=? AND state=? AND recovery_count=0",
+        (
+            decision.transition,
+            f"verified_route_{prior_state}_recovery",
+            now,
+            existing_row["outbox_id"],
+            prior_state,
+        ),
+    )
+    conn.commit()
+    append_event(
+        conn,
+        decision.task_id,
+        "callback_terminal_recovered_on_verified_route",
+        "",
+        {
+            "transition": decision.transition,
+            "episode_id": decision.episode_id,
+            "prior_state": prior_state,
+        },
+    )
+
+
 def seed_missing_review_callbacks(
     conn: sqlite3.Connection,
     *,
@@ -2336,6 +2684,9 @@ def seed_missing_review_callbacks(
       incorrectly superseded by an older eligibility bug, but only while the
       task is still in that exact terminal episode. ``recovery_count`` prevents
       an endlessly failing transport from being resurrected on every poll.
+
+    Which rows qualify is decided by ``_seed_review_decision`` alone, the
+    predicate ``peek_claimable_callback`` shares (NF-2026-02109).
     """
     _ensure_tasks_origin_thread_column(conn)
     _ensure_callback_outbox_table(conn)
@@ -2348,216 +2699,67 @@ def seed_missing_review_callbacks(
         # Each waiting seat calls this on every wait loop, so its own stamp is
         # refreshed continuously and is the liveness evidence other seats read.
         _record_route_origin_seen(conn, provider, route_origin)
-    rows = conn.execute(
-        """
-        SELECT task_id, status, card_json, origin_thread_id
-          FROM tasks
-         WHERE status IN ('review', 'blocked')
-           AND (archived_at IS NULL OR archived_at='')
-         ORDER BY updated_at ASC, task_id ASC
-        """
-    ).fetchall()
     seeded = 0
-    for row in rows:
-        task_id = str(row["task_id"] or "")
-        try:
-            card = json.loads(row["card_json"] or "{}")
-        except (TypeError, json.JSONDecodeError):
-            card = {}
-        if not isinstance(card, dict):
-            card = {}
-        row_provider = str(card.get("coordinator_provider") or provider).strip().lower()
-        if row_provider != provider:
-            continue
-        episode_id = str(card.get("claim_epoch") or 0)
-        current_status = str(row["status"] or "").strip()
-        raw_terminal = str(card.get("terminal_substatus") or "").strip()
-        # Reconciliation starts from an already-canonical review row. Preserve
-        # known compact terminal states, but recover an unfamiliar persisted
-        # substatus as review_ready so a future/legacy spelling cannot strand
-        # the review. Direct enqueue_callback callers remain fail-closed.
-        if current_status == "blocked":
-            transition = normalize_callback_transition(raw_terminal)
-            if transition not in CALLBACK_ELIGIBLE_TRANSITIONS:
-                continue
-        else:
-            # A canonical review row is, by definition, ready for review: its
-            # substatus is a success spelling (review_ready/exited). An
-            # unfamiliar future/legacy SUCCESS spelling still recovers as
-            # review_ready here so it cannot strand the review. This is the only
-            # place a review-status row defaults to review_ready -- and it does
-            # so explicitly for a known-review row, NOT via
-            # resolve_callback_transition, which is now fail-closed (unknown ->
-            # blocked) so a failure substatus can never be delivered as
-            # review_ready anywhere (NF-2026-00340).
-            transition = normalize_callback_transition(raw_terminal) or "review_ready"
-            # A review whose manager wake was deliberately deferred until the
-            # quality-review chain finishes must not be pre-empted by a seeded
-            # review_ready row (NF-2026-01220): publish_manager_ready announces
-            # it. Only a young deferral is held back; a missing/unparseable or
-            # old recorded_at falls through to the last-resort wake below.
-            # ponytail: a dead or held review chain surfaces only after
-            # DEFERRED_REVIEW_WAKE_GRACE; upgrade path is an explicit release at
-            # fail_action / route hold in review_orchestrator.
-            terminal_review = card.get("terminal_review")
-            terminal_evidence = (
-                terminal_review.get("evidence") if isinstance(terminal_review, dict) else None
-            )
-            if (
-                isinstance(terminal_evidence, dict)
-                and isinstance(terminal_evidence.get("manager_callback_deferred"), dict)
-                and not card.get("manager_ready_receipt")
-            ):
-                deferred_at = _parse_instant(terminal_review.get("recorded_at"))
-                if (
-                    deferred_at is not None
-                    and datetime.now(timezone.utc) - deferred_at < DEFERRED_REVIEW_WAKE_GRACE
-                ):
-                    continue
-        persisted_origin = str(row["origin_thread_id"] or card.get("origin_thread_id") or "").strip()
-        # NF-2026-02015: carry the card's launch request id so the owning seat
-        # can match the member by request id, not only by task id.
-        seed_request_id, seed_event_id = _seed_callback_request_identity(card)
-        # NF-2026-02015: a launched card (it carries a request id) belongs to
-        # its persisted origin seat. The waiting seat's verified route adopts it
-        # only when that owner was not seen within ROUTE_LIVE_WINDOW (reload
-        # recovery); a live owner keeps the wake in its own lane. A card with no
-        # launch identity keeps the legacy any-verified-route retarget: no seat
-        # holds a request to match it against.
-        if (
-            route_origin
-            and seed_request_id
-            and persisted_origin
-            and persisted_origin != route_origin
-            and _route_origin_seen_recently(conn, provider, persisted_origin, live_cache)
-        ):
-            callback_origin = persisted_origin
-        else:
-            callback_origin = route_origin or persisted_origin
-        if not callback_origin:
-            continue
-        def _recover_terminal_row(existing_row) -> None:
-            # Recovery re-points the row at the transition the task is in
-            # RIGHT NOW (``transition``), never leaving the old one. A row
-            # recovered with a stale transition is superseded again by the
-            # very next claim (its transition no longer matches the task's
-            # live terminal state) and, its single recovery budget already
-            # burned here, could then never be recovered again -- the wake
-            # would be lost forever on an otherwise stable manager route.
-            batch_id = str(existing_row["batch_id"] or "")
-            now = utc_now()
-            prior_state = str(existing_row["state"] or "")
-            if batch_id:
-                conn.execute(
-                    "UPDATE callback_batches SET state='superseded', updated_at=? "
-                    "WHERE batch_id=? AND state IN ('dead_letter','superseded')",
-                    (now, batch_id),
-                )
-            conn.execute(
-                "UPDATE callback_outbox SET state='pending', batch_id='', "
-                "lease_id='', lease_expires_at='', attempts=0, "
-                "transition=?, last_error=?, "
-                "recovery_count=recovery_count+1, updated_at=? "
-                "WHERE outbox_id=? AND state=? AND recovery_count=0",
-                (
-                    transition,
-                    f"verified_route_{prior_state}_recovery",
-                    now,
-                    existing_row["outbox_id"],
-                    prior_state,
-                ),
-            )
-            conn.commit()
-            append_event(
-                conn,
-                task_id,
-                "callback_terminal_recovered_on_verified_route",
-                "",
-                {
-                    "transition": transition,
-                    "episode_id": episode_id,
-                    "prior_state": prior_state,
-                },
-            )
-
-        # NF-2026-00843: look for the row under the provider enqueue_callback
-        # stores it as. An mls- origin is filed as manager_chat, so a lookup by
-        # the caller's provider never found it and every dispatcher pass
-        # enqueued the wake again (275 copies of one blocked wake, measured).
-        lookup_provider = (
-            MANAGER_CHAT_PROVIDER if _MANAGER_CHAT_SESSION_RE.fullmatch(callback_origin) else provider
+    for row in _seed_candidate_rows(conn):
+        decision = _seed_review_decision(
+            conn, row, provider=provider, route_origin=route_origin, live_cache=live_cache,
         )
-        # The dedup lookup keys on ``transition`` too: a task that already
-        # has a review_ready row but is now (same episode) blocked has NO
-        # wake for its CURRENT transition, and a transition-blind lookup
-        # would wrongly treat the review_ready row as "already handled" and
-        # skip the gap -- the exact way the direct enqueue predicate did.
-        if route_origin:
-            existing = conn.execute(
-                "SELECT outbox_id,batch_id,state,recovery_count FROM callback_outbox WHERE task_id=? AND provider=? "
-                "AND origin_thread_id=? AND transition=? AND episode_id=? LIMIT 1",
-                (task_id, lookup_provider, callback_origin, transition, episode_id),
-            ).fetchone()
-        else:
-            existing = conn.execute(
-                "SELECT outbox_id,batch_id,state,recovery_count FROM callback_outbox WHERE task_id=? AND provider=? "
-                "AND transition=? AND episode_id=? LIMIT 1",
-                (task_id, lookup_provider, transition, episode_id),
-            ).fetchone()
-        if existing is not None:
-            if (
-                route_origin
-                and str(existing["state"] or "") in {"dead_letter", "superseded"}
-                and int(existing["recovery_count"] or 0) == 0
-                and _task_still_in_matching_terminal_state(
-                    conn, task_id, transition, episode_id
-                )
-            ):
-                _recover_terminal_row(existing)
-                seeded += 1
+        if decision is None:
             continue
-        if route_origin:
-            # NF-2026-01548: an episode+transition already delivered to ANY
-            # manager origin is never seeded again for a new verified route.
-            delivered_elsewhere = conn.execute(
-                "SELECT 1 FROM callback_outbox WHERE task_id=? AND provider IN (?, ?) "
-                "AND transition=? AND episode_id=? AND state='delivered' LIMIT 1",
-                (task_id, lookup_provider, provider, transition, episode_id),
-            ).fetchone()
-            if delivered_elsewhere is not None:
-                continue
-        # No wake exists for the transition the task is in right now. On a
-        # verified route, prefer recovering a dead-letter/superseded row this
-        # task stranded under a DIFFERENT transition in the SAME episode and
-        # re-pointing that single recoverable row at the current transition,
-        # over leaving it stranded and never producing the owed wake. (A
-        # review_ready row superseded when the same card was moved to blocked
-        # in-episode is exactly this case.)
-        if route_origin:
-            stranded = conn.execute(
-                "SELECT outbox_id,batch_id,state,recovery_count FROM callback_outbox "
-                "WHERE task_id=? AND provider=? AND origin_thread_id=? AND episode_id=? "
-                "AND state IN ('dead_letter','superseded') AND recovery_count=0 LIMIT 1",
-                (task_id, lookup_provider, callback_origin, episode_id),
-            ).fetchone()
-            if stranded is not None and _task_still_in_matching_terminal_state(
-                conn, task_id, transition, episode_id
-            ):
-                _recover_terminal_row(stranded)
-                seeded += 1
-                continue
+        if decision.recover_row is not None:
+            _recover_seeded_terminal_row(conn, decision)
+            seeded += 1
+            continue
         if enqueue_callback(
             conn,
-            task_id,
-            callback_origin,
-            transition,
+            decision.task_id,
+            decision.callback_origin,
+            decision.transition,
             provider=provider,
-            episode_id=episode_id,
-            event_id=seed_event_id,
-            request_id=seed_request_id,
+            episode_id=decision.episode_id,
+            event_id=decision.event_id,
+            request_id=decision.request_id,
         ):
             seeded += 1
     return seeded
+
+
+def _peek_seed_eligible_members(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    origin_thread_id: str,
+    max_members: int,
+) -> list[dict[str, str]]:
+    """Members the next claim's seed would create for exactly this route.
+
+    Read-only (NF-2026-01903): the same ``_seed_review_decision`` the seed
+    loop uses, evaluated without creating, migrating or stamping anything."""
+    if provider not in MANAGER_PROVIDERS:
+        return []
+    live_cache: dict[str, bool] = {}
+    members: list[dict[str, str]] = []
+    for row in _seed_candidate_rows(conn):
+        decision = _seed_review_decision(
+            conn,
+            row,
+            provider=provider,
+            route_origin=origin_thread_id,
+            live_cache=live_cache,
+            readonly=True,
+        )
+        if decision is None or decision.callback_origin != origin_thread_id:
+            continue
+        members.append(
+            {
+                "task_id": decision.task_id,
+                "request_id": decision.request_id,
+                "state": decision.transition,
+            }
+        )
+        if len(members) >= max(1, int(max_members)):
+            break
+    return members
 
 
 def release_deferred_review_wake(
