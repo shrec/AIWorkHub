@@ -225,11 +225,16 @@ test("ensureStarted after a terminal stop of a pending start begins a fresh star
   const doomed = owner.ensureStarted();
   owner.stop({ restart: false });
   assert.equal(owner.startingPromise, null, "a terminal stop drops the doomed start's promise");
+  // Hold the fresh start until the doomed one has settled: on Linux the fake
+  // preflight lets it finish first, which would empty the slot legitimately.
+  let releaseFresh;
+  owner.startupBarrier = new Promise((resolve) => { releaseFresh = resolve; });
   const fresh = owner.ensureStarted();
   assert.notEqual(fresh, doomed, "the new caller does not join the doomed start");
   await assert.rejects(doomed, /mcp_stopped_during_startup/);
   // The doomed start settling must not clear the fresh start's slot.
   assert.equal(owner.startingPromise, fresh);
+  releaseFresh();
   await fresh;
   assert.equal(owner.startingPromise, null);
   assert.equal(liveOwnedMcpChildCount(owner), 1, "exactly one live server child after the fresh start");
