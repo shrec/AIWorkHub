@@ -2530,10 +2530,21 @@ def _full_cards_for_plan() -> list[dict[str, Any]]:
     return task_store.list_task_cards(repo_root(), limit=5000)
 
 
+def _summary_cards_for_plan() -> list[dict[str, Any]]:
+    """The same bounded snapshot as :func:`_full_cards_for_plan`, reduced to
+    the columns and card_json paths ``task_plan.build_snapshot`` reads
+    (``task_store.TASK_SUMMARY_PROJECTION``), so the read-only plan snapshot
+    never decodes each card's history/evidence (NF-2026-02114). Claim and
+    supersede paths keep the full read."""
+    return task_store.list_task_cards(
+        repo_root(), limit=5000, projection=task_store.TASK_SUMMARY_PROJECTION
+    )
+
+
 def task_plan_snapshot() -> dict[str, Any]:
     """Read-only Plan-DAG snapshot: dependencies, blockers, write-scope
     overlaps, and the deterministic set of task_ids ready to be claimed."""
-    cards = _full_cards_for_plan()
+    cards = _summary_cards_for_plan()
     snapshot = task_plan.build_snapshot(cards)
     return {
         "ok": True,

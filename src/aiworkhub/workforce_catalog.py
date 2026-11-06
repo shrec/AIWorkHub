@@ -1371,7 +1371,13 @@ def _percentile(values: list[float], fraction: float) -> float | None:
 
 
 def _canonical_cards(root: Path) -> list[dict[str, Any]]:
-    return task_store.list_task_cards(root, limit=5000)
+    # build_catalog reads only the columns and card_json paths the summary
+    # projection carries (terminal_review/terminal_failure substatus and route
+    # evidence, deterministic_verification, project_context.task_type,
+    # risk_tier), never each card's history/evidence body (NF-2026-02114).
+    return task_store.list_task_cards(
+        root, limit=5000, projection=task_store.TASK_SUMMARY_PROJECTION
+    )
 
 
 def _resolve_effective_adapter(

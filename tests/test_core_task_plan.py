@@ -110,11 +110,11 @@ def test_task_plan_snapshot_uses_one_bounded_card_read(monkeypatch):
         depends_on=["t1"],
     )
     real_list_task_cards = task_store.list_task_cards
-    calls: list[tuple[Path, int]] = []
+    calls: list[tuple[Path, int, str | None]] = []
 
-    def _one_batch(root: Path, *, limit: int = 500):
-        calls.append((Path(root), limit))
-        return real_list_task_cards(root, limit=limit)
+    def _one_batch(root: Path, *, limit: int = 500, projection: str | None = None):
+        calls.append((Path(root), limit, projection))
+        return real_list_task_cards(root, limit=limit, projection=projection)
 
     monkeypatch.setattr(task_store, "list_task_cards", _one_batch)
     monkeypatch.setattr(
@@ -130,7 +130,8 @@ def test_task_plan_snapshot_uses_one_bounded_card_read(monkeypatch):
 
     snapshot = core.task_plan_snapshot()
 
-    assert calls == [(repo, 5000)]
+    # NF-2026-02114: one bounded summary-projection read, never full cards.
+    assert calls == [(repo, 5000, task_store.TASK_SUMMARY_PROJECTION)]
     assert snapshot["dependencies"]["t2"] == ["t1"]
     assert snapshot["ready"] == ["t1"]
 

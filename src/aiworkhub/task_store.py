@@ -1561,16 +1561,178 @@ def _decode_active_derivation_card(row: sqlite3.Row | Mapping[str, Any]) -> dict
     return card
 
 
-def _is_active_derivation_projection(projection: str | None) -> bool:
-    """True for the narrow derivation projection, False for full cards.
+# NF-2026-02114: the read-only summary surfaces -- ``core.task_plan_snapshot``,
+# the dashboard snapshot's NeedFix/roadmap/Plan-DAG/workforce panels and the
+# workforce rank -- read the ``tasks`` columns plus a few card_json keys, yet
+# each decoded every card's whole card_json (history, evidence, review packets,
+# launch receipts) for up to 5000 rows. This projection returns every column
+# except card_json, plus only the card_json paths below, with the precedence
+# ``_decode_task_card`` applies (a column wins over the same card_json key;
+# ``topic``/``origin_thread_id`` fall back to card_json) and the same canonical
+# ``status``.
+#
+# A value path carries the JSON value stored at that path (JSON null when the
+# key is absent; every consumer reads through ``.get``). A shape path carries
+# only whether the key holds an object (``{}``), for keys every reader merely
+# type-checks. An intermediate object is rebuilt holding only its projected
+# children and is absent when the card has no such key, so ``isinstance``
+# checks on it answer as on the full card; a present non-object intermediate is
+# projected as ``None`` (every reader of these containers requires a mapping).
+TASK_SUMMARY_PROJECTION = "task_summary"
+
+_TASK_SUMMARY_COLUMNS: tuple[str, ...] = (
+    "task_id", "runner", "topic", "mode", "status", "worker_status", "priority",
+    "objective", "created_at", "updated_at", "claimed_by", "claimed_at",
+    "started_at", "completed_at", "origin_thread_id", "archived_at",
+)
+
+# Beyond the active-derivation paths (``_active_derivation_paths``: the NeedFix
+# join and task_plan's terminal-artifact/supersession helpers):
+_TASK_SUMMARY_VALUE_PATHS: tuple[tuple[str, ...], ...] = (
+    # _decode_task_card's topic/origin_thread_id fallback.
+    ("topic",),
+    ("origin_thread_id",),
+    # task_plan.build_snapshot: dependencies, write scope, pickup order and
+    # operational blockers.
+    ("depends_on",),
+    ("allowed_writes",),
+    ("claim_epoch",),
+    ("rework_predecessor",),
+    ("operational_blocker",),
+    ("launch_request_id",),
+    # workforce_catalog.build_catalog, core.classify_terminal_disposition,
+    # workforce_catalog.retained_route_observations and
+    # cost_ledger._task_family/_task_risk.
+    ("terminal_substatus",),
+    ("risk_tier",),
+    ("project_context", "task_type"),
+    ("deterministic_verification", "passed"),
+    ("terminal_review", "substatus"),
+    ("terminal_review", "evidence", "model"),
+    ("terminal_review", "evidence", "adapter_id"),
+    ("terminal_review", "evidence", "provider_error"),
+    ("terminal_failure", "substatus"),
+    ("terminal_failure", "evidence", "provider_error"),
+)
+
+# Only ever type-checked (task_plan.card_status_evidence).
+_TASK_SUMMARY_SHAPE_PATHS: tuple[tuple[str, ...], ...] = (("accept_evidence",),)
+
+
+@functools.lru_cache(maxsize=1)
+def _task_summary_layout() -> tuple[tuple[tuple[str, ...], ...], tuple[tuple[str, ...], ...]]:
+    """``(value_paths, typed_paths)`` of the summary projection.
+
+    ``typed_paths`` are the intermediates and shape paths whose JSON type is
+    read, ordered parent-first so the decoder can rebuild the nesting.
+    """
+    shape_paths = _TASK_SUMMARY_SHAPE_PATHS
+    value_paths = tuple(
+        path
+        for path in dict.fromkeys(_TASK_SUMMARY_VALUE_PATHS + _active_derivation_paths())
+        if path not in shape_paths
+    )
+    typed: dict[tuple[str, ...], None] = {}
+    for path in value_paths + shape_paths:
+        for depth in range(1, len(path)):
+            typed.setdefault(path[:depth])
+    for path in shape_paths:
+        typed.setdefault(path)
+    overlap = sorted(".".join(path) for path in value_paths if path in typed)
+    if overlap:
+        raise RuntimeError(f"task summary value path is also a container: {overlap}")
+    return value_paths, tuple(sorted(typed, key=len))
+
+
+def _json_path_literal(path: tuple[str, ...]) -> str:
+    return "'$." + ".".join(path) + "'"
+
+
+@functools.lru_cache(maxsize=1)
+def _task_summary_select_sql() -> str:
+    value_paths, typed_paths = _task_summary_layout()
+    columns = ", ".join(f"t.{name} AS {name}" for name in _TASK_SUMMARY_COLUMNS)
+    types = ", ".join(
+        f"json_type(t.card_json, {_json_path_literal(path)})" for path in typed_paths
+    )
+    values = ", ".join(_json_path_literal(path) for path in value_paths)
+    return (
+        f"SELECT {columns}, "
+        f"CASE WHEN json_valid(t.card_json) THEN json_array({types}) END AS card_types, "
+        f"CASE WHEN json_valid(t.card_json) THEN json_extract(t.card_json, {values}) END "
+        "AS card_values, "
+        # Only a card_json SQLite cannot validate ships whole, so Python decodes
+        # it exactly as _decode_task_card would (malformed -> {}).
+        "CASE WHEN json_valid(t.card_json) THEN NULL ELSE t.card_json END "
+        "AS unvalidated_card_json "
+    )
+
+
+def _card_path_type(card_json: Mapping[str, Any], path: tuple[str, ...]) -> str | None:
+    """Python twin of SQLite ``json_type``: None when absent, else object/other."""
+    node: Any = card_json
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            return None
+        node = node[key]
+    return "object" if isinstance(node, dict) else "value"
+
+
+def _decode_task_summary_card(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
+    """Build the summary card for one ``TASK_SUMMARY_PROJECTION`` row."""
+    value_paths, typed_paths = _task_summary_layout()
+    raw_types = row["card_types"]
+    if raw_types is not None:
+        types = json.loads(raw_types)
+        values = json.loads(row["card_values"])
+    else:
+        try:
+            card_json = json.loads(row["unvalidated_card_json"] or "{}")
+        except json.JSONDecodeError:
+            card_json = {}
+        if not isinstance(card_json, dict):
+            card_json = {}
+        types = [_card_path_type(card_json, path) for path in typed_paths]
+        values = [_card_path_value(card_json, path) for path in value_paths]
+    projected: dict[str, Any] = {}
+    containers: dict[tuple[str, ...], dict[str, Any]] = {(): projected}
+    for path, kind in zip(typed_paths, types, strict=True):
+        parent = containers.get(path[:-1])
+        if parent is None or kind is None:
+            continue
+        if kind == "object":
+            node: dict[str, Any] = {}
+            parent[path[-1]] = node
+            containers[path] = node
+        else:
+            parent[path[-1]] = None
+    for path, value in zip(value_paths, values, strict=True):
+        parent = containers.get(path[:-1])
+        if parent is not None:
+            parent[path[-1]] = value
+    card = {**projected, **{name: row[name] for name in _TASK_SUMMARY_COLUMNS}}
+    if not card.get("topic") and projected.get("topic"):
+        card["topic"] = projected["topic"]
+    if not card.get("origin_thread_id") and projected.get("origin_thread_id"):
+        card["origin_thread_id"] = projected["origin_thread_id"]
+    card["status"] = canonical_status(card)
+    return card
+
+
+def _card_projection(
+    projection: str | None,
+) -> tuple[str, Callable[[Any], dict[str, Any]]] | None:
+    """``(select_sql, decode)`` for a narrow card projection, None for full cards.
 
     An unknown projection fails closed rather than silently returning full cards.
     """
     if projection is None:
-        return False
-    if projection != ACTIVE_DERIVATION_PROJECTION:
-        raise ValueError(f"unknown task card projection: {projection!r}")
-    return True
+        return None
+    if projection == ACTIVE_DERIVATION_PROJECTION:
+        return _active_derivation_select_sql(), _decode_active_derivation_card
+    if projection == TASK_SUMMARY_PROJECTION:
+        return _task_summary_select_sql(), _decode_task_summary_card
+    raise ValueError(f"unknown task card projection: {projection!r}")
 
 
 def list_task_cards(
@@ -1600,10 +1762,13 @@ def list_task_cards(
     ``projection=ACTIVE_DERIVATION_PROJECTION`` returns the same rows in the
     same order, each reduced to the fields the NeedFix active derivation reads
     (see ``_ACTIVE_DERIVATION_CARD_PATHS``) without reading or decoding the
-    rest of ``card_json``. It is not combinable with ``decode_errors``.
+    rest of ``card_json``. ``projection=TASK_SUMMARY_PROJECTION`` likewise
+    returns every column plus only the card_json paths the read-only summary
+    surfaces read (see ``_TASK_SUMMARY_VALUE_PATHS``). A projection is not
+    combinable with ``decode_errors``.
     """
-    narrow = _is_active_derivation_projection(projection)
-    if narrow and decode_errors is not None:
+    narrow = _card_projection(projection)
+    if narrow is not None and decode_errors is not None:
         raise ValueError("decode_errors is not supported with a card projection")
     _readiness, db_path = _require_ready(root)
     bounded_limit = max(1, min(int(limit), 5000))
@@ -1615,8 +1780,8 @@ def list_task_cards(
     if topic:
         filters.append(f"{_TASK_TOPIC_FILTER_SQL} = ?")
         params.append(topic)
-    if narrow:
-        query = _active_derivation_select_sql() + _TASK_CARDS_NEWEST_FIRST_TEMPLATE.format(
+    if narrow is not None:
+        query = narrow[0] + _TASK_CARDS_NEWEST_FIRST_TEMPLATE.format(
             where=(" WHERE " + " AND ".join(filters)) if filters else ""
         )
     else:
@@ -1632,8 +1797,9 @@ def list_task_cards(
         rows = conn.execute(query, params).fetchall()
     finally:
         conn.close()
-    if narrow:
-        return [_decode_active_derivation_card(row) for row in rows]
+    if narrow is not None:
+        decode = narrow[1]
+        return [decode(row) for row in rows]
     if decode_errors is None:
         return [_decode_task_card(row) for row in rows]
     cards: list[dict[str, Any]] = []
@@ -1910,13 +2076,13 @@ def get_task(
     the per-call ``storage_readiness`` check; a not-ready value still raises.
     ``projection`` has the meaning :func:`list_task_cards` documents.
     """
-    narrow = _is_active_derivation_projection(projection)
+    narrow = _card_projection(projection)
     db_path = _db_path_for(root, readiness)
     conn = _connect(db_path, readonly=True)
     try:
-        if narrow:
+        if narrow is not None:
             row = conn.execute(
-                _active_derivation_select_sql() + "FROM tasks t WHERE t.task_id=?",
+                narrow[0] + "FROM tasks t WHERE t.task_id=?",
                 (task_id,),
             ).fetchone()
         else:
@@ -1925,8 +2091,8 @@ def get_task(
         conn.close()
     if row is None:
         return None
-    if narrow:
-        return _decode_active_derivation_card(row)
+    if narrow is not None:
+        return narrow[1](row)
     return _decode_task_card(row)
 
 
@@ -1941,13 +2107,13 @@ def get_tasks(
 
     ``projection`` has the meaning :func:`list_task_cards` documents.
     """
-    narrow = _is_active_derivation_projection(projection)
+    narrow = _card_projection(projection)
     ordered = list(dict.fromkeys(task_ids))
     if not ordered:
         return {}
     db_path = _db_path_for(root, readiness)
-    select = _active_derivation_select_sql() + "FROM tasks t" if narrow else "SELECT * FROM tasks t"
-    decode = _decode_active_derivation_card if narrow else _decode_task_card
+    select = narrow[0] + "FROM tasks t" if narrow is not None else "SELECT * FROM tasks t"
+    decode = narrow[1] if narrow is not None else _decode_task_card
     found: dict[str, dict[str, Any]] = {}
     conn = _connect(db_path, readonly=True)
     try:

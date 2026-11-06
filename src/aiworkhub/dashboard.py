@@ -2102,12 +2102,17 @@ class DashboardProvider:
         return future.result()
 
     def _task_cards(self) -> tuple[dict[str, Any], ...]:
+        # Summary projection, never the decoded card_json: the NeedFix,
+        # roadmap, Plan-DAG and workforce panels this snapshot feeds read only
+        # the columns and paths task_store.TASK_SUMMARY_PROJECTION carries
+        # (NF-2026-02114). A panel needing a whole card fetches that row only.
         return self._snapshot_once(
             "task_cards",
             lambda: tuple(
                 task_store.list_task_cards(
                     self.repo_root,
                     limit=TASK_CARD_SNAPSHOT_LIMIT,
+                    projection=task_store.TASK_SUMMARY_PROJECTION,
                 )
             ),
         )
@@ -2386,7 +2391,7 @@ class DashboardProvider:
         return task_store.callback_bridge_health(self.repo_root)
 
     def get_task_plan(self) -> dict[str, Any]:
-        """Read-only Plan-DAG projection from full canonical cards."""
+        """Read-only Plan-DAG projection from the summary-projected cards."""
         cards = list(self._task_cards())
         return {
             "ok": True,
