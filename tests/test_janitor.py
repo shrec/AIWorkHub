@@ -28,7 +28,10 @@ from aiworkhub import (
 _HOUR = 3600.0
 _NOW = 2_000_000_000.0
 _FUTURE = "2099-01-01T00:00:00+00:00"
-_STEPS = ["worktrees", "rework_deltas", "logs", "unattributed", "registrations", "records", "scratch"]
+_STEPS = [
+    "worktrees", "rework_deltas", "logs", "unattributed", "registrations", "records",
+    "task_store", "scratch",
+]
 
 
 def _stub_steps(monkeypatch, calls: list[str], **overrides) -> None:
@@ -46,6 +49,7 @@ def _stub_steps(monkeypatch, calls: list[str], **overrides) -> None:
             lambda root, base: calls.append("registrations") or {"pruned": 0}
         ),
         "_janitor_records": lambda root: calls.append("records") or {"tasks": {}},
+        "_janitor_task_store": lambda root: calls.append("task_store") or {"ok": True},
         "_janitor_scratch": (
             lambda root, now: calls.append("scratch")
             or {"ok": True, "removed": 0, "bytes": 0, "errors": []}

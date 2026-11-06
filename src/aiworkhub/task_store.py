@@ -3267,6 +3267,10 @@ def _mark_terminal_review_transaction(
     callback_provider: str = "",
     callback_request_id: str = "",
 ) -> tuple[bool, str, bool]:
+    # Imported before the write transaction (local import: cycle-safe), so a
+    # first-call module load never runs under the write lock.
+    from . import task_store_compaction
+
     try:
         # Explicit write transaction. The legacy sqlite3 default would open an
         # implicit DEFERRED transaction at the first DML instead, leaving the
@@ -3372,10 +3376,21 @@ def _mark_terminal_review_transaction(
             "WHERE task_id=?",
             (runner, now, now, json.dumps(card, ensure_ascii=False, sort_keys=True), task_id),
         )
+        # NF-2026-02106: the event row duplicates the card, so its bulky
+        # evidence blocks are stored as identities; the card keeps them full.
         conn.execute(
             "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
             "VALUES (?, 'terminal_review', ?, ?, ?)",
-            (task_id, runner, json.dumps(terminal, ensure_ascii=False, sort_keys=True), now),
+            (
+                task_id,
+                runner,
+                json.dumps(
+                    task_store_compaction.bound_event_payload("terminal_review", terminal),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                now,
+            ),
         )
         callback_enqueued = _enqueue_terminal_callback_row(
             conn,
@@ -8209,8 +8224,24 @@ def recover_blocked_rework(
                 terminal_review, retained_predecessor
             )
         ):
-            if card.get(terminal_event) != terminal_review:
-                return False, "retained_terminal_candidate_event_mismatch"
+            card_terminal = card.get(terminal_event)
+            if card_terminal != terminal_review:
+                # NF-2026-02106: a terminal_review event row stores its bulky
+                # evidence blocks as identities of the card's full blocks, so
+                # the attestation is the card block bounded the same way.
+                from . import task_store_compaction  # local import: cycle-safe
+
+                if not (
+                    terminal_event == "terminal_review"
+                    and isinstance(card_terminal, dict)
+                    and task_store_compaction.bound_event_payload(
+                        "terminal_review", card_terminal
+                    )
+                    == terminal_review
+                ):
+                    return False, "retained_terminal_candidate_event_mismatch"
+                # Downstream derivation reads the card's full, attested block.
+                terminal_review = dict(card_terminal)
             superseding_predecessor, refusal = retained_terminal_rework_predecessor(
                 root,
                 task_id,

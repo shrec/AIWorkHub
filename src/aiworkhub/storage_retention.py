@@ -2713,6 +2713,34 @@ def _janitor_records(root: Path) -> dict[str, Any]:
     return task_retention.run_records_janitor(root)
 
 
+def _janitor_task_store(root: Path) -> dict[str, Any]:
+    """Phase A compaction of old finished cards, run by the sweep (NF-2026-02106).
+
+    Non-dry-run, in ``task_store_compaction``'s own bounded batches
+    (``DEFAULT_BATCH_SIZE`` cards, each batch one short write lease). Every
+    folded block is never folded again, so a repeated sweep changes no bytes.
+    A repository without a ready canonical store has no card to compact: that
+    is a named skip, not a pass. Any other refusal raises into
+    ``_janitor_step``, which records it in the sweep result and files the
+    ``janitor:task_store:<ExcClass>`` NeedFix; it never leaves the sweep.
+    """
+    from . import task_store, task_store_compaction  # local import: cycle-safe
+
+    try:
+        report = task_store_compaction.compact_finished_cards(
+            root,
+            dry_run=False,
+            batch_size=task_store_compaction.DEFAULT_BATCH_SIZE,
+        )
+    except task_store.StorageNotReadyError as exc:
+        return {"ok": True, "skipped": "storage_not_ready", "reason": str(exc)[:200]}
+    if report.get("ok") is not True:
+        vacuum = report.get("vacuum")
+        detail = (vacuum.get("error") if isinstance(vacuum, dict) else None) or report.get("error")
+        raise task_store_compaction.CompactionError(str(detail or "compaction_not_ok")[:300])
+    return report
+
+
 # One NeedFix identity per janitor signal, shared by the side that files it and
 # the side that resolves it once the signal clears. With an empty ``signal``
 # the title is the prefix every title of that step shares.
@@ -3693,7 +3721,8 @@ def _run_repository_cleanup(
 ) -> dict[str, Any]:
     """One janitor sweep over this repository; ``now`` is not a public input.
 
-    The seven steps run in order and each is isolated: a step that raises is
+    The steps (``task_store`` is the bounded phase A card compaction,
+    NF-2026-02106) run in order and each is isolated: a step that raises is
     recorded as ``{"ok": False, "error"}`` and filed as one NeedFix titled
     ``janitor:<step>:<ExcClass>``, and the remaining steps still run. A step
     that ends ok resolves the ``janitor:<step>:*`` NeedFix its earlier failures
@@ -3713,6 +3742,8 @@ def _run_repository_cleanup(
         ("unattributed", lambda: _janitor_unattributed(root, worktree_base, now)),
         ("registrations", lambda: _janitor_registrations(root, worktree_base)),
         ("records", lambda: _janitor_records(root)),
+        # After records: cards the records janitor removed are not compacted.
+        ("task_store", lambda: _janitor_task_store(root)),
         ("scratch", lambda: _janitor_scratch(root, now)),
     )
     was_active = getattr(_JANITOR_ACTIVE, "active", False)

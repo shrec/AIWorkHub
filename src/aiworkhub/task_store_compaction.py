@@ -35,8 +35,9 @@ Scope and safety:
 * idempotent: a folded block is never folded again, so a second run is a no-op.
 
 ``dry_run`` (the default) measures the savings over read-only connections and
-writes nothing. Not wired into scheduled cleanup and no write path changes:
-both are phase B (NF-2026-02106).
+writes nothing. Phase B (NF-2026-02106) bounds the two event payloads at write
+time through :func:`bound_event_payload` and runs this compaction non-dry-run
+from ``storage_retention``'s janitor sweep.
 """
 
 from __future__ import annotations
@@ -155,8 +156,13 @@ def _canonical_bytes(value: Any) -> int:
     return len(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8"))
 
 
-def _fold(value: Any, durable: _Durable) -> Any:
-    """``value`` as its identity stand-in, or ``value`` itself when not worth it."""
+def _stand_in(value: Any) -> Any:
+    """``value`` as its ``{summarized, bytes, sha256}`` stand-in, or ``value`` itself.
+
+    The one identity fold of this module: phase A (``_fold``) and the
+    write-time event bound (``bound_event_payload``) both go through it, so an
+    event folded at write time is already folded for phase A (idempotent).
+    """
 
     if mcp_summary_folds._is_folded(value):
         return value
@@ -169,9 +175,33 @@ def _fold(value: Any, durable: _Durable) -> Any:
     # Keep only scalar verdict-like members so a stand-in is always small.
     for key in [k for k, v in folded.items() if isinstance(v, (dict, list))]:
         folded.pop(key)
+    return folded
+
+
+def _fold(value: Any, durable: _Durable) -> Any:
+    """``value`` as its identity stand-in, or ``value`` itself when not worth it."""
+
+    folded = _stand_in(value)
+    if folded is value:
+        return value
     folded["durable_attempt_id"] = durable.attempt_id
     folded["durable_manifest_sha256"] = durable.manifest_sha256
     return folded
+
+
+def _fold_keys(block: Mapping[str, Any], fold: Any) -> tuple[dict[str, Any], bool]:
+    """``block`` with only its ``_FOLDABLE_EVIDENCE_KEYS`` passed through ``fold``."""
+
+    changed = False
+    result = dict(block)
+    for key, value in block.items():
+        if key not in _FOLDABLE_EVIDENCE_KEYS or _preserved_key(str(key)):
+            continue
+        folded = fold(value)
+        if folded is not value:
+            result[key] = folded
+            changed = True
+    return result, changed
 
 
 def _fold_evidence(block: Any, durable: _Durable) -> tuple[Any, bool]:
@@ -179,16 +209,75 @@ def _fold_evidence(block: Any, durable: _Durable) -> tuple[Any, bool]:
 
     if not isinstance(block, dict):
         return block, False
-    changed = False
-    result = dict(block)
-    for key, value in block.items():
-        if key not in _FOLDABLE_EVIDENCE_KEYS or _preserved_key(str(key)):
-            continue
-        folded = _fold(value, durable)
-        if folded is not value:
-            result[key] = folded
-            changed = True
-    return result, changed
+    return _fold_keys(block, lambda value: _fold(value, durable))
+
+
+# NF-2026-02106 (phase B): the ``task_events`` rows ``terminal_review`` and
+# ``accept_review`` duplicate what the card itself holds, so at write time their
+# foldable evidence blocks are stored as identities while the card keeps the
+# full blocks. Every field a reader of these two event payloads extracts is
+# outside ``_FOLDABLE_EVIDENCE_KEYS`` and therefore stays verbatim:
+#   terminal_review: substatus, request_id, runner, claim_epoch, recorded_at,
+#     adapter_id, error_hash, card_content_sha256, review_feedback_identity,
+#     deterministic_verification(.evidence_verdict), evidence_support, and
+#     evidence.{request_identity, workspace, changed_path_hashes,
+#     attempt_artifact_manifest, adapter_id, model, request_id, error}
+#     (task_store recovery/review_ready_changed_path_hashes/route observations,
+#     successful_rework_recovery, process_launcher_accepted_row_restore,
+#     launch_replay_guard, history_series, sdlc_control_bands, attempt
+#     trajectory export, manager decision latency);
+#   accept_review: request_id, accepted_outcome_receipt (sdlc_stage_evidence,
+#     sdlc_outcome_metrics, attempt_trajectory_export); dashboard, history_series
+#     and manager_decision_counts read only the event name and created_at.
+BOUND_EVENTS: tuple[str, ...] = COMPACTED_EVENTS
+EVENT_READ_FIELDS: Mapping[str, frozenset[str]] = {
+    "terminal_review": frozenset(
+        {
+            "substatus",
+            "request_id",
+            "runner",
+            "claim_epoch",
+            "recorded_at",
+            "adapter_id",
+            "error_hash",
+            "card_content_sha256",
+            "review_feedback_identity",
+            "deterministic_verification",
+            "evidence_support",
+            "evidence.request_identity",
+            "evidence.workspace",
+            "evidence.changed_path_hashes",
+            "evidence.attempt_artifact_manifest",
+            "evidence.adapter_id",
+            "evidence.model",
+            "evidence.request_id",
+            "evidence.error",
+        }
+    ),
+    "accept_review": frozenset({"request_id", "accepted_outcome_receipt"}),
+}
+assert not any(
+    field.rsplit(".", 1)[-1] in _FOLDABLE_EVIDENCE_KEYS for fields in EVENT_READ_FIELDS.values() for field in fields
+)
+
+
+def bound_event_payload(event: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    """The ``task_events`` payload to store for ``event`` (NF-2026-02106).
+
+    ``terminal_review``: its ``evidence`` foldable blocks become identities.
+    ``accept_review``: the payload is the acceptance evidence itself, so its
+    own top-level foldable blocks do. Any other event, and every other key, is
+    returned exactly. The caller's mapping (the card's block) is never mutated.
+    """
+
+    result = dict(payload)
+    if event == "terminal_review":
+        evidence = result.get("evidence")
+        if isinstance(evidence, dict):
+            result["evidence"], _changed = _fold_keys(evidence, _stand_in)
+    elif event == "accept_review":
+        result, _changed = _fold_keys(result, _stand_in)
+    return result
 
 
 def _compact_containers(doc: dict[str, Any], durable: _Durable) -> bool:

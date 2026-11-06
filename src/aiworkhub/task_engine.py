@@ -1174,6 +1174,8 @@ def accept_review(
         "--request-id", request_id,
     ]
     now = datetime.now(timezone.utc).isoformat()
+    from . import task_store_compaction  # local import: cycle-safe, outside the write
+
     try:
         _readiness, db_path = task_store._require_ready(repo)
         conn = task_store._connect(db_path)
@@ -1336,15 +1338,17 @@ def accept_review(
                 "stdout": "",
                 "stderr": "accept_review_preimage_changed",
             }
+        # NF-2026-02106: the event row duplicates card["accept_evidence"], so
+        # its bulky evidence blocks are stored as identities; the card keeps
+        # them full. request_id and accepted_outcome_receipt stay verbatim.
         conn.execute(
             "INSERT INTO task_events (task_id, event, runner, payload_json, created_at) VALUES (?,?,?,?,?)",
             (
                 task_id, "accept_review", runner,
                 json.dumps(
-                    {
-                        "request_id": request_id,
-                        **acceptance_evidence,
-                    },
+                    task_store_compaction.bound_event_payload(
+                        "accept_review", {"request_id": request_id, **acceptance_evidence}
+                    ),
                     ensure_ascii=False, default=str, sort_keys=True,
                 ),
                 now,
