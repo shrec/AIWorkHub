@@ -397,6 +397,11 @@ def test_failing_neighbour_refuses_naming_the_failed_test() -> None:
         "tests": ["tests/test_b.py", "tests/test_a.py"],
         "failed": ["tests/test_a.py::test_contract", "tests/test_b.py"],
         "first_failure": "FAILED tests/test_a.py::test_contract - AssertionError: drift",
+        # NF-2026-02101: the still-red nodes were tried on canonical HEAD; a
+        # workspace without a repository HEAD cannot excuse them, and says so.
+        "base_red_refused": (
+            "base_unavailable:WorkspaceError:neighbour_canonical_head_unavailable"
+        ),
     }
 
 

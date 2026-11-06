@@ -14,7 +14,9 @@ keeps no testmap client of its own. It selects only the files pytest collects by
 (test_*.py and *_test.py), and it never raises: an unavailable index or no
 related test yields an empty selection with a named ``reason``, which the lane
 records and which does not block acceptance. A selected run that fails, or that
-returns no evidence, refuses the accept with ``neighbour_tests_failed:``.
+returns no evidence, refuses the accept with ``neighbour_tests_failed:``, unless
+every node still red after the serial rerun also fails on the combined tree's
+base commit: that is recorded as ``base_red`` and does not refuse (NF-2026-02101).
 """
 
 from __future__ import annotations
@@ -24,13 +26,16 @@ import os
 import re
 import stat
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+import uuid
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from . import card_contract_advice as _advice
+from . import worker_workspace as _workspace
 from .sdlc_attribution import is_test_path
 from .toolchain_authority import RECEIPT_CARD_KEY
 from .worker_workspace import ValidationRunError, WorkspaceError
@@ -449,6 +454,7 @@ def _refusal(
     rows: Sequence[Mapping[str, Any]],
     error: str,
     default_failed: Sequence[str] = (),
+    base_red_refused: str = "",
 ) -> WorkspaceError:
     failed, first_line = _failed_tests(rows)
     fallback = "neighbour_validation_failed" if rows else "neighbour_validation_returned_no_rows"
@@ -457,6 +463,9 @@ def _refusal(
         "failed": failed or list(default_failed),
         "first_failure": (first_line or error or fallback)[:_FIRST_FAILURE_CHARS],
     }
+    if base_red_refused:
+        # NF-2026-02101: why the still-red nodes were not excused as base_red.
+        detail["base_red_refused"] = base_red_refused[:_FIRST_FAILURE_CHARS]
     return WorkspaceError(
         NEIGHBOUR_FAILURE_PREFIX + json.dumps(detail)[:NEIGHBOUR_FAILURE_DETAIL_CHARS]
     )
@@ -487,6 +496,7 @@ def run_neighbour_tests(
     workspace: Any,
     route_metadata: Mapping[str, Any],
     clock: Callable[[], float] = time.monotonic,
+    base_workspace: Callable[[Any, Mapping[str, Any]], AbstractContextManager[Any]] | None = None,
 ) -> dict[str, Any]:
     """Run the selection through ``run`` and return its evidence.
 
@@ -497,6 +507,11 @@ def run_neighbour_tests(
     NF-2026-02070: a red run whose failed node ids parse (at most
     ``MAX_REPORTED_FAILURES``) re-runs only those nodes once, serially; an
     all-green rerun is recorded as ``neighbour_flaky_rerun`` and does not refuse.
+    NF-2026-02101: nodes still red after that rerun run once more on
+    ``workspace``'s base commit (``base_workspace``, default
+    :func:`base_commit_workspace`); when every one of them fails there too the
+    failure is not the candidate's and is recorded as ``base_red`` instead of
+    refusing. A base that cannot be built or judged refuses as before.
     """
     evidence = selection.evidence()
     if not selection.tests:
@@ -514,20 +529,107 @@ def run_neighbour_tests(
         raise _refusal(selection.tests, rows, error)
     rerun_command = neighbour_command(nodes, serial=True)
     started = clock()
-    rerun_rows, rerun_error, _ = _attempt(
+    rerun_rows, rerun_error, rerun_verdict = _attempt(
         run, workspace, card, rerun_command, route_metadata
     )
-    rerun_seconds = round(max(0.0, clock() - started), 3)
-    if rerun_error or not rerun_rows or _red(rerun_rows):
-        raise _refusal(selection.tests, rerun_rows, rerun_error, default_failed=nodes)
-    evidence["validation"] = rows
-    evidence["neighbour_flaky_rerun"] = {
+    rerun = {
         "nodes": nodes,
         "command": rerun_command,
-        "duration_seconds": rerun_seconds,
+        "duration_seconds": round(max(0.0, clock() - started), 3),
         "validation": rerun_rows,
     }
+    evidence["validation"] = rows
+    if not rerun_error and rerun_rows and not _red(rerun_rows):
+        evidence["neighbour_flaky_rerun"] = rerun
+        return evidence
+    still_red = _rerun_nodes(selection, rerun_rows, rerun_verdict and _red(rerun_rows))
+    base_red, refused = _base_red(
+        still_red, card, run=run, workspace=workspace, route_metadata=route_metadata,
+        clock=clock, base_workspace=base_workspace or base_commit_workspace,
+    ) if still_red else (None, "rerun_not_a_parseable_test_verdict")
+    if not base_red:
+        raise _refusal(
+            selection.tests, rerun_rows, rerun_error, default_failed=nodes,
+            base_red_refused=refused,
+        )
+    evidence["neighbour_rerun"] = rerun
+    evidence["base_red"] = base_red
     return evidence
+
+
+@contextmanager
+def base_commit_workspace(workspace: Any, card: Mapping[str, Any]) -> Iterator[Any]:
+    """A full, write-free checkout of the canonical HEAD, removed on exit.
+
+    The combined tree is built from ``workspace.repo``'s canonical HEAD plus the
+    candidate, so HEAD is pinned as it is now, at the neighbour run -- never the
+    worker's original ``base_oid``, which would excuse a node canonical already
+    fixed and the candidate broke again. No repository or HEAD raises.
+    """
+    repo = getattr(workspace, "repo", None)
+    if not isinstance(repo, (str, os.PathLike)) or not str(repo):
+        raise WorkspaceError("neighbour_canonical_head_unavailable")
+    head_oid = _workspace._repository_head_oid(Path(repo))
+    base_card = {key: value for key, value in card.items() if key != "rework_predecessor"}
+    base_card.update(allowed_writes=[], required_outputs=[])
+    base = _workspace.create_workspace(
+        Path(repo), f"nbase_{uuid.uuid4().hex[:16]}", base_card, "validation",
+        pinned_base_oid=head_oid,
+    )
+    try:
+        # create_workspace seeds a sparse closure; a neighbour test needs the full tree.
+        expanded = _workspace._run(
+            ["git", "sparse-checkout", "disable"], cwd=base.path,
+            timeout=_workspace.WORKTREE_CREATE_TIMEOUT_SECONDS, phase="workspace_provision",
+        )
+        if expanded.returncode != 0:
+            raise WorkspaceError("neighbour_base_full_tree_failed")
+        yield base
+    finally:
+        _workspace.cleanup_workspace(base.repo, base.path, base.home)
+
+
+def _base_red(
+    nodes: Sequence[str],
+    card: Mapping[str, Any],
+    *,
+    run: Callable[[Any, Mapping[str, Any], Mapping[str, Any]], list[dict[str, Any]]],
+    workspace: Any,
+    route_metadata: Mapping[str, Any],
+    clock: Callable[[], float],
+    base_workspace: Callable[[Any, Mapping[str, Any]], AbstractContextManager[Any]],
+) -> tuple[dict[str, Any] | None, str]:
+    """The base-commit record when every one of ``nodes`` fails there too.
+
+    Unknown is never base_red: an unbuildable base, a refusal that is not a
+    plain test verdict, or a node that passes or goes unreported all yield
+    ``(None, reason)``, and the reason names which of those it was so the
+    refusal states its cause instead of swallowing it.
+    """
+    command = neighbour_command(nodes, serial=True)
+    try:
+        with base_workspace(workspace, card) as base:
+            # Timed once the base exists: an unbuildable base reads no clock.
+            started = clock()
+            rows, error, verdict = _attempt(run, base, card, command, route_metadata)
+            seconds = round(max(0.0, clock() - started), 3)
+    except Exception as exc:  # an unbuildable base is unknown, and unknown never excuses a failure
+        return None, f"base_unavailable:{type(exc).__name__}:{exc}"
+    if not verdict:
+        return None, f"base_not_a_test_verdict:{error or 'no_rows'}"
+    failed, _first = _failed_tests(rows, MAX_REPORTED_FAILURES + 1)
+    green = [node for node in nodes if node not in failed] if _red(rows) else list(nodes)
+    if green:
+        return None, "base_green:" + ",".join(green)
+    return {
+        "nodes": list(nodes),
+        # The commit the base run actually checked out: canonical HEAD at this run.
+        "base_oid": getattr(base, "base_oid", None),
+        "base_source": "canonical_head",
+        "command": command,
+        "duration_seconds": seconds,
+        "validation": rows,
+    }, ""
 
 
 # NF-2026-02069: the neighbour run moves to finalization, on the same sealed

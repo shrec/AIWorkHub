@@ -3430,30 +3430,32 @@ def _repository_owned_worktree_root(
     """Return an override-derived ``root`` unless another repository owns it.
 
     Measured 2026-10-27: a relaunch exported another registered repository's
-    runtime/worktree root and was provisioned there (NF-2026-01765).  ``root``
-    is honored beneath ``repo``'s own runtime, when its nearest
-    ``.aiworkhub/project.json`` owner is ``repo``, or when that owner tracks
-    ``repo``'s non-empty ``repo_id`` (a worker worktree of the same
-    repository).  Unowned roots and roots under the owner's ``.aiworkhub/temp`` (validation scratch) stay neutral.  Only
-    the explicit ``repo`` is identity: AIWORKHUB_REPO_ROOT / AIWORKHUB_REPO and
-    cwd are exported by the hub itself, so they never are.  An owner whose
-    readable ``repo_id`` differs is ignored for ``repo``'s own default root
-    (NF-2026-02032); an unknown identity on either side is still refused.
+    runtime/worktree root and was provisioned there (NF-2026-01765).  ``root`` is
+    honored beneath ``repo``'s own runtime, when its nearest ``.aiworkhub/project.json``
+    owner is ``repo`` or tracks ``repo``'s non-empty ``repo_id`` (a worker worktree).
+    Neutral, so an in-repo pytest basetemp is not foreign (NF-2026-02101): unowned roots,
+    ``.aiworkhub/temp``, a worker home ``runtime/worktrees/<id>/home`` holding ``repo`` too,
+    and anything outside the runtime of an owner enclosing ``repo``.  Only ``repo`` is
+    identity, never AIWORKHUB_REPO_ROOT / AIWORKHUB_REPO or cwd.  A readable, different
+    owner ``repo_id`` is ignored for ``repo``'s root (NF-2026-02032); unknown is refused.
     """
     if repo is None:
         return root
     selected = Path(repo).resolve()
     if _path_is_relative_to(root, selected / ".aiworkhub" / "runtime"):
         return root
-    owner = next(
-        (
-            candidate
-            for candidate in (root, *root.parents)
-            if (candidate / ".aiworkhub" / "project.json").is_file()
-        ),
-        None,
-    )
-    if owner in (None, selected) or _path_is_relative_to(root, owner / ".aiworkhub" / "temp"):
+    marked = (c for c in (root, *root.parents) if (c / ".aiworkhub" / "project.json").is_file())
+    owner = next(marked, None)
+    if owner in (None, selected):
+        return root
+    runtime = owner / ".aiworkhub" / "runtime"
+    rel = root.relative_to(runtime).parts if _path_is_relative_to(root, runtime) else None
+    if (
+        _path_is_relative_to(root, owner / ".aiworkhub" / "temp")
+        or (rel is not None and rel[:1] == ("worktrees",) and rel[2:3] == ("home",)
+            and _path_is_relative_to(selected, runtime.joinpath(*rel[:3])))
+        or (rel is None and _path_is_relative_to(selected, owner))
+    ):
         return root
     owner_id, selected_id = _tracked_repo_id(owner), _tracked_repo_id(selected)
     if owner_id and owner_id == selected_id:
@@ -3462,10 +3464,8 @@ def _repository_owned_worktree_root(
         fallback = (selected / ".aiworkhub" / "runtime" / "worktrees").resolve(strict=False)
         # Every symlinked component is followed: a root resolving outside repo is refused below.
         if _path_is_relative_to(fallback, selected):
-            logging.warning(
-                "%s:env=%s:root=%s:owner=%s:repo=%s",
-                FOREIGN_WORKTREE_ROOT_IGNORED, env, root, owner, selected,
-            )
+            logging.warning("%s:env=%s:root=%s:owner=%s:repo=%s",
+                            FOREIGN_WORKTREE_ROOT_IGNORED, env, root, owner, selected)
             return fallback
     raise WorkspaceError(
         f"{FOREIGN_WORKTREE_ROOT_REFUSAL}:root={root}:owner={owner}:repo={selected}"
