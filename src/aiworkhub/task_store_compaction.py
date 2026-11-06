@@ -686,6 +686,7 @@ def _ensure_incremental_vacuum(db_path: Path) -> dict[str, Any]:
         started = time.monotonic()
         try:
             conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+            conn.execute("PRAGMA temp_store=FILE")
             conn.execute("VACUUM")
         except sqlite3.Error as exc:
             return {"converted": False, "error": f"vacuum_failed:{type(exc).__name__}:{exc}"}
