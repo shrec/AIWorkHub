@@ -9,6 +9,7 @@ unchanged under the ``process_launcher`` module size ratchet (NF-2026-02036);
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -117,3 +118,91 @@ def card_identity_mismatch(
     if not mismatches:
         return ""
     return "quality_review_card_identity_mismatch:" + ",".join(mismatches)
+
+
+# --- launch-class reviewer start failures (NF-2026-02086) -----------------
+#
+# A reviewer START that failed because this sandbox cannot run the adapter at
+# all: the spawn was denied, the executable is missing, or a Windows
+# AppContainer refused it (WinError 5 / WinError 2; errno 13 / errno 2 on
+# POSIX).  No provider ran and the candidate was never read, so it says
+# nothing about the candidate, and another start on the same adapter fails
+# the same way.  ``review_orchestrator._reviewer_failure_class`` -- the one
+# reviewer failure classifier -- names it, the lens fails over to the next
+# ranked adapter, and the ``workforce_catalog`` route circuit keeps the route
+# skipped until a later start of it succeeds.
+#
+# Only a failed START qualifies.  A reviewer that ran and then failed on the
+# candidate or its own review content is never launch-class, whatever its text
+# says, and no model can produce a ``launch_failed`` state: it never ran.
+LAUNCH_FAILURE_CLASS = "launch_denied"
+LAUNCH_FAILURE_STATES = frozenset({"launch_failed"})
+_LAUNCH_FAILURE_MARKER = re.compile(
+    r"winerror\s*[25]\b|\[errno (?:2|13)\]|access[\s_]+(?:is[\s_]+)?denied"
+    r"|spawn[\s_]+denied|executable[\s_]+not[\s_]+found|appcontainer"
+    r"|cannot find the file specified"
+)
+_SKIP_FIELD_UNSAFE = re.compile(r"[^A-Za-z0-9_.\-]")
+SKIP_FIELD_LIMIT = 128
+
+
+def launch_class_signal(
+    status: Mapping[str, Any], card: Mapping[str, Any], signal: str,
+) -> bool:
+    """Whether a terminal reviewer status is a launch-class START failure.
+
+    ``signal`` is the bounded failure text the caller already joined.  The
+    state is resolved the way ``mechanical_reviewer_failure_reason`` resolves
+    it: a ``blocked`` card reads its own terminal substatus, and a synchronous
+    ``ok: False`` receipt carrying no state is a failed launch.
+    """
+
+    state = str(status.get("state") or "").strip().lower()
+    if state in {"", "blocked"}:
+        state = str(
+            card.get("terminal_substatus") or card.get("worker_status") or ""
+        ).strip().lower() or ("launch_failed" if status.get("ok") is False else "")
+    return (
+        state in LAUNCH_FAILURE_STATES
+        and _LAUNCH_FAILURE_MARKER.search(str(signal or "").lower()) is not None
+    )
+
+
+def launch_class_retirement(failure_reason: Any) -> bool:
+    """Whether a retired route attempt's reason is a launch-class failure."""
+
+    parts = str(failure_reason or "").split(":", 2)
+    return (
+        len(parts) >= 2
+        and parts[0] in LAUNCH_FAILURE_STATES
+        and parts[1] == LAUNCH_FAILURE_CLASS
+    )
+
+
+def launch_failure_code(failure_reason: Any) -> str:
+    """``LAUNCH_FAILURE_CLASS`` for a launch-class reason, else ``""``."""
+
+    return LAUNCH_FAILURE_CLASS if launch_class_retirement(failure_reason) else ""
+
+
+def launch_failure_skip_reason(
+    route_failure: str, receipt: Mapping[str, Any], adapter_id: str,
+) -> str:
+    """The retirement reason a launch-class failure records on its lens.
+
+    It names the adapter that could not start and the reviewer request the
+    launcher reserved for it, beside the failure class; any other failure is
+    returned unchanged.  Both fields are reduced to a closed character set so
+    the ``:``-separated reason stays parseable.
+    """
+
+    if not launch_class_retirement(route_failure):
+        return route_failure
+
+    def _field(value: Any) -> str:
+        return _SKIP_FIELD_UNSAFE.sub("", str(value or ""))[:SKIP_FIELD_LIMIT]
+
+    return (
+        f"{route_failure}:adapter={_field(adapter_id) or 'unknown'}"
+        f":reviewer_request={_field(receipt.get('request_id')) or 'unallocated'}"
+    )

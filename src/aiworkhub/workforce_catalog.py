@@ -29,6 +29,7 @@ from . import (
     model_settings,
     provider_route_contracts,
     repo_policy,
+    reviewer_launch_refusal,
     runner_topic_policy,
     runtime_adapters,
     task_store,
@@ -94,12 +95,15 @@ _ROUTE_SUCCESS_STATES = frozenset(
 # provider-owned terminal error rather than the transient retry threshold.
 #
 # ``model_not_found`` joins them because it is the same shape of fact as a
-# dead credential: the provider has told us, from its own sealed response,
-# that this exact route cannot serve this account.  Retrying it cannot change
-# that answer, and the measured cost of treating it as transient was 103
-# launches on one such route (``codex_cli``/``gpt-5.4``) returning 0 accepts
-# and 0 rejects -- NF-2026-00655.
-_ROUTE_SINGLE_FAILURE_KINDS = frozenset({"auth", "quota", "model_not_found"})
+# dead credential: the provider's own sealed response says this route cannot
+# serve this account, and treating it as transient cost 103 launches with 0
+# accepts on ``codex_cli``/``gpt-5.4`` (NF-2026-00655).  A launch-class start
+# failure (NF-2026-02086) is the sandbox's own equivalent: it cannot run the
+# adapter at all, so the route stays skipped until a later start succeeds.
+_ROUTE_LONG_COOLDOWN_KINDS = frozenset(
+    {"model_not_found", reviewer_launch_refusal.LAUNCH_FAILURE_CLASS}
+)
+_ROUTE_SINGLE_FAILURE_KINDS = frozenset({"auth", "quota"}) | _ROUTE_LONG_COOLDOWN_KINDS
 # NF-2026-01674: the kinds an AUTOMATIC reroute may act on -- a named subset of
 # ``_ROUTE_SINGLE_FAILURE_KINDS``.  A refused balance or a dead credential
 # belongs to the route, so moving the card to another route is the repair.
@@ -762,14 +766,15 @@ def _route_failure_kind(process: Mapping[str, Any]) -> str:
         sealed_kind = _sealed_error_kind(sealed)
         if sealed_kind:
             return sealed_kind
-    # Auth/quota hard-failure kinds are classified only from the sealed,
-    # provider-owned structured error handled above.  The free-form ``error``
-    # string is never scanned for auth/quota markers, so assistant/model prose
-    # or substring spoofing cannot forge a single-failure circuit trip; only
-    # unauthenticated transport signals fall through to the multi-failure
-    # transient threshold below.
+    # Auth/quota kinds come only from the sealed provider error above: free-form
+    # ``error`` text is never scanned for them, so model prose cannot forge a
+    # single-failure trip.  A ``launch_failed`` start ran no model, so its error
+    # is the launcher's own and may name a launch-class cause (NF-2026-02086);
+    # other unauthenticated transport signals fall to the transient threshold.
     state = str(process.get("state") or "").strip().casefold()
     error = str(process.get("error") or "").strip().casefold()
+    if reviewer_launch_refusal.launch_class_signal(process, {}, error):
+        return reviewer_launch_refusal.LAUNCH_FAILURE_CLASS
     if state in {"launch_failed", "timed_out"}:
         return "transient"
     if state == "worker_failed" and any(
@@ -903,7 +908,7 @@ def _route_circuit(
     # ``open_now`` measures it below.
     shared_cooldown = (
         ROUTE_CIRCUIT_LOOKBACK_SECONDS
-        if latest_kind == "model_not_found"
+        if latest_kind in _ROUTE_LONG_COOLDOWN_KINDS
         else ROUTE_CIRCUIT_COOLDOWN_SECONDS
     )
     if latest_reset_epoch is not None and latest_failure_epoch is not None:
@@ -920,20 +925,15 @@ def _route_circuit(
         latest_failure_epoch = harness_epoch
         latest_reset_epoch = None
         threshold = ROUTE_CIRCUIT_TRANSIENT_THRESHOLD
-    # The cooldown asks "how long until this is worth trying again?", and the
-    # honest answer differs by kind.  A credential or a balance can be fixed in
-    # minutes, so the transient cooldown is right for them.  A model the
-    # provider says this account does not have is not re-provisioned in ten
-    # minutes: replayed against the real 2026-09-04 sequence, a 600s cooldown
-    # re-admitted the dead ``gpt-5.4`` route 68 times in 16.3 hours.  This kind
-    # therefore stays open for the same window the circuit already trusts its
-    # evidence over -- and a single observed SUCCESS still closes it
-    # immediately, because a success ends the consecutive run above.
-    cooldown = (
-        ROUTE_CIRCUIT_LOOKBACK_SECONDS
-        if latest_kind in {"model_not_found", "harness_behaviour"}
-        else ROUTE_CIRCUIT_COOLDOWN_SECONDS
-    )
+    # "How long until this is worth trying again?" differs by kind.  A
+    # credential or balance can be fixed in minutes (the transient cooldown).  A
+    # model the account does not have is not: a 600s cooldown re-admitted the
+    # dead ``gpt-5.4`` route 68 times in 16.3 hours (2026-09-04), and an adapter
+    # this sandbox cannot start (NF-2026-02086) is no different.  Those stay open
+    # for the evidence window; a single observed SUCCESS still closes them.
+    cooldown = ROUTE_CIRCUIT_LOOKBACK_SECONDS if latest_kind in (
+        _ROUTE_LONG_COOLDOWN_KINDS | {"harness_behaviour"}
+    ) else ROUTE_CIRCUIT_COOLDOWN_SECONDS
     failure_age = (
         max(0.0, now_epoch - latest_failure_epoch)
         if latest_failure_epoch is not None else None

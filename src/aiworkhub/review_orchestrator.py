@@ -23,6 +23,7 @@ from . import (
     quality_evidence,
     review_hedge,
     review_lifecycle,
+    reviewer_launch_refusal,
     runtime_adapters,
     sqlite_readonly,
     task_engine,
@@ -495,10 +496,11 @@ def _reviewer_failure_class(status: Mapping[str, Any], card: Mapping[str, Any]) 
         terminal.get("failure_class"), evidence.get("error"), evidence.get("code"),
     )
     signal = " ".join(
-        str(value).strip().lower()
-        for value in values
+        str(value).strip().lower() for value in values
         if isinstance(value, str) and value.strip()
     )
+    if reviewer_launch_refusal.launch_class_signal(status, card, signal):
+        return reviewer_launch_refusal.LAUNCH_FAILURE_CLASS  # NF-2026-02086
     for failure_class, markers in _REVIEWER_FAILURE_CLASS_MARKERS:
         if any(marker in signal for marker in markers):
             return failure_class
@@ -634,17 +636,18 @@ def reviewer_terminal_disposition(status: Any) -> dict[str, Any]:
         or _structured_field(sources, "error")
         or _structured_field(sources, "diagnostic")
     )
-    # NF-2026-01409: a reviewer's OWN vscode_lm turn-protocol code, buried
-    # past a wrapper like ``worker_failed:``, names the ADAPTER as the route
-    # failure -- not the candidate or the manager -- so it gets route_retry
-    # on a distinct route instead of a manager_judgment_unknown hold.
-    # NF-2026-01772: so does a transport/host code (``vscode_lm_request_cancelled``
-    # and its family) -- unless the manager cancelled the reviewer or it already
-    # submitted, either of which leaves nothing for another route to do.
+    # A reviewer's OWN vscode_lm turn-protocol code (NF-2026-01409), a transport
+    # or host code (NF-2026-01772) and a launch-class START failure in this
+    # sandbox (NF-2026-02086) each name the ADAPTER, not the candidate or the
+    # manager: route_retry on a distinct route instead of a manager hold --
+    # unless the manager cancelled the reviewer or it already submitted.
     if not _reviewer_route_retry_barred(state, card):
         behaviour_code = (
             terminal_failure_classification.reviewer_route_behaviour_code(reason)
             or terminal_failure_classification.reviewer_route_transport_code(reason)
+            or reviewer_launch_refusal.launch_failure_code(
+                mechanical_reviewer_failure_reason(status)
+            )
         )
         if behaviour_code:
             return terminal_failure_classification.reviewer_route_retry_disposition(
@@ -739,12 +742,11 @@ def _route_attempt_exclusions(
         for row in retired
     )
     # NF-2026-01409: a retired attempt whose OWN reason names a vscode_lm
-    # turn-protocol code indicts the ADAPTER, not just the one model that
-    # happened to be ranked, so the next attempt excludes every route on
-    # that adapter -- not only the exact (runner, adapter_id, model) tried.
-    # A rate, quota or session limit indicts the whole provider account the same way.
-    # NF-2026-01620: so does a reviewer that could not inspect the candidate --
-    # that adapter could not read these bytes, so the retry leaves it.
+    # turn-protocol code indicts the ADAPTER, not just the one model ranked, so
+    # the next attempt excludes every route on that adapter. So do a rate, quota
+    # or session limit (the whole provider account), a reviewer that could not
+    # inspect the candidate (NF-2026-01620), and an adapter that could not even
+    # start in this sandbox (NF-2026-02086).
     excluded_adapters = frozenset(
         str(row["adapter_id"])
         for row in retired
@@ -753,6 +755,7 @@ def _route_attempt_exclusions(
         )
         or reviewer_route_account_limited(row["failure_reason"])
         or reviewer_route_could_not_inspect(row["failure_reason"])
+        or reviewer_launch_refusal.launch_class_retirement(row["failure_reason"])
     )
     return excluded, excluded_adapters
 
@@ -4043,15 +4046,10 @@ class ReviewOrchestrator:
             # retiring that durable attempt; an omitted field is legitimate
             # when the provider rejected before allocating a request.
             #
-            # A reconciling launch returns the LAUNCHER's receipt for the
-            # request already recorded against this reviewer task, so its model
-            # is the canonical name that launch resolved while the durable
-            # attempt still holds the alias its route selection named. Compared
-            # byte for byte those two spellings made this branch refuse the
-            # very route it had just invoked -- the same vocabulary split
-            # measured on chains 906 and 916, one call site further in -- so the
-            # model goes through the shared rule and every other field stays
-            # exact.
+            # A reconciling launch returns the LAUNCHER's receipt, whose model is
+            # the canonical name that launch resolved while the durable attempt
+            # holds its route's alias (chains 906 and 916): the model goes
+            # through the shared rule and every other field stays exact.
             exact = {
                 "task_id": str(attempt["reviewer_task_id"]),
                 "runner": str(attempt["runner"]),
@@ -4069,14 +4067,16 @@ class ReviewOrchestrator:
                 )
             ):
                 raise RuntimeError("reviewer_launch_terminal_identity_invalid")
-            # The typed dispatch is computed off this exact synchronous receipt,
-            # so the successor decision below -- and every later pass, which
-            # reads the hold back out of the durable retirement reason -- share
-            # one disposition instead of each re-deriving their own.
+            # The typed dispatch is computed off this exact synchronous receipt, so
+            # the successor decision below and every later pass (which reads the
+            # hold back out of the durable retirement reason) share one disposition.
             dispatch = reviewer_recovery_dispatch(
                 result, attempts_made=int(attempt["attempt_index"]),
             )
-            retirement = route_failure
+            # NF-2026-02086: a launch-class failure names its adapter and request.
+            retirement = reviewer_launch_refusal.launch_failure_skip_reason(
+                route_failure, result, str(attempt["adapter_id"]),
+            )
             pre_provider_credential_hold = (
                 dispatch["action"]
                 == terminal_failure_classification.ACTION_CREDENTIAL_HOLD
