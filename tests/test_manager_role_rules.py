@@ -42,6 +42,9 @@ ROLE_STATEMENTS = (
     "it is never a requirement that one vendor review another",
     "Record obstacles as NeedFix with measured evidence",
     "Intermediate release rule:",
+    # NF-2026-02103: the auto-accept lane and the manager's remaining duty.
+    "Clean low/medium candidates (all gates green, zero reviewer defects) are accepted by the auto-accept lane",
+    "the manager reviews every candidate with findings or high risk and may revert an auto-accept",
 )
 
 

@@ -203,6 +203,7 @@ ROLE_SENTENCES = (
     "a single-provider install is fully supported and not degraded",
     "Every card that reaches review is closed the same turn",
     "Acceptance is decided by measurement",
+    "are accepted by the auto-accept lane",
 )
 
 
@@ -410,8 +411,9 @@ def test_the_semantic_edit_rule_is_stated_once() -> None:
     assert "After Source Graph finds an exact target" not in canonical
     assert canonical.count("aiworkhub_worker_semantic_edit_prepare") == 1
     assert canonical.count("never a built-in Read, and never reread an unchanged range") == 1
-    assert instr.CANONICAL_MAX_BYTES == 7560
-    assert instr.PROJECTION_MAX_BYTES == 9360
+    # NF-2026-02103 raised both caps for the auto-accept lane's Manager role rule.
+    assert instr.CANONICAL_MAX_BYTES == 7760
+    assert instr.PROJECTION_MAX_BYTES == 9560
     assert len(canonical.encode("utf-8")) <= instr.CANONICAL_MAX_BYTES
 
 

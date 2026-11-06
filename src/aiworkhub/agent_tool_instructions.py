@@ -115,8 +115,15 @@ from . import runtime_adapters
 # 7354 -> 7552, copilot 7376 -> 7574, CLAUDE.md 9058 -> 9256. The caps keep
 # about the same ~100 bytes of headroom the previous raise bought, which the
 # vocabulary-room test still measures against a real extra command.
-CANONICAL_MAX_BYTES = 7560
-PROJECTION_MAX_BYTES = 9360
+#
+# NF-2026-02103 (auto-accept lane) adds one "Manager role:" rule saying which
+# candidates the lane accepts and that the manager still owns every candidate
+# with findings or high risk. Nothing it could absorb says that, so it is paid
+# for by a cap raise: measured canonical 7454 -> 7657, AGENTS.md 7552 -> 7755,
+# copilot 7574 -> 7777, CLAUDE.md 9256 -> 9459, keeping the same ~100 bytes of
+# headroom.
+CANONICAL_MAX_BYTES = 7760
+PROJECTION_MAX_BYTES = 9560
 START = "<!-- AIWORKHUB_TOOL_USE_POLICY_START -->"
 END = "<!-- AIWORKHUB_TOOL_USE_POLICY_END -->"
 # Annotated with the Literal it is built from (a forward reference, resolved
@@ -226,6 +233,8 @@ POLICY = ToolPolicy(
         "Review runs the mechanical gates and tests first because they cannot be faked, then the manager reads the code and the rules.",
         "Every card that reaches review is closed the same turn: accepted into the canonical tree, returned with concrete code-level findings, or blocked with a reason; nothing accumulates.",
         "Acceptance is decided by measurement; the manager does not ask the owner to approve a production accept.",
+        # NF-2026-02103: the auto-accept lane (src/aiworkhub/auto_accept_lane.py).
+        "Clean low/medium candidates (all gates green, zero reviewer defects) are accepted by the auto-accept lane; the manager reviews every candidate with findings or high risk and may revert an auto-accept.",
         "Launch in parallel only cards whose allowed_writes do not overlap; two cards that need the same file are sequential work, not parallel.",
         "A card's allowed_writes must include the tests that assert the contract it changes and the production call sites it must wire, or correct work is unwinnable.",
         "Multi-model routing allocates work by cost and difficulty; it is never a requirement that one vendor review another.",

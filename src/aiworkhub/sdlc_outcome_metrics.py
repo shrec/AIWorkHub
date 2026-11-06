@@ -20,6 +20,7 @@ from typing import Any, NamedTuple
 
 from . import needfix_store, process_event_ledger, runtime_adapters, task_store, vscode_lm_worker
 from . import sdlc_phase_timeline
+from .auto_accept_lane import EVENT_AUTO_ACCEPTED
 from .sqlite_readonly import connect_readonly
 
 SCHEMA_ID = "aiworkhub.sdlc_outcome_metrics.v1"
@@ -731,6 +732,21 @@ def _compare_matched_outcomes(
     }
 
 
+def auto_accepted_count(
+    per_task: Mapping[str, Sequence[Mapping[str, Any]]], task_ids: Sequence[str]
+) -> int:
+    """How many of ``task_ids`` carry the lane's ``auto_accepted`` task event."""
+
+    return sum(
+        1
+        for task_id in task_ids
+        if any(
+            str(event.get("event") or "") == EVENT_AUTO_ACCEPTED
+            for event in per_task.get(task_id, ())
+        )
+    )
+
+
 def aggregate(
     task_events: Sequence[Mapping[str, Any]],
     needfix_rows: Sequence[Mapping[str, Any]],
@@ -866,6 +882,12 @@ def aggregate(
             "denominator": accepted_tasks,
             "evidence_covered": accepted_tasks,
             "evidence_total": len(per_task),
+        },
+        # NF-2026-02103: verified-accepted tasks the auto-accept lane accepted.
+        "auto_accepted": {
+            "numerator": auto_accepted_count(per_task, tuple(accepted)),
+            "denominator": accepted_tasks,
+            "event": EVENT_AUTO_ACCEPTED,
         },
         "escaped_defect_attribution": {
             "numerator": attributed,

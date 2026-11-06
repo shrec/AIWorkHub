@@ -4489,6 +4489,38 @@ def test_chain_waits_on_running_manager_reviewer_instead_of_launching(
     assert manager.launches == []
 
 
+@pytest.mark.parametrize(
+    "spawning_state",
+    ["reviewer_claim_bound", "provider_spawn_committed", "cancel_requested"],
+)
+def test_chain_action_stays_pending_while_reviewer_is_still_spawning_nf02108(
+    tmp_path: Path, spawning_state: str,
+) -> None:
+    """A reviewer still spawning or being cancelled is live, not failed.
+
+    NF-2026-02108: these states were missing from the running set, so the
+    chain action failed and retired its remaining actions as
+    dependency_retired while the reviewer was still coming up.
+    """
+    assert spawning_state in review_orchestrator._REVIEWER_RUNNING_STATES
+    manager = _ExistingReviewerManager(
+        tmp_path, {"correctness": {**_MANUAL_REVIEWER, "state": "running"}}
+    )
+    driver, _chain = _nf1064_driver(tmp_path, manager)
+    manager.status_results["manual-request"] = {"ok": True, "state": spawning_state}
+
+    assert driver.drain(max_actions=1, now=NOW).completed == 1
+    waiting = driver.drain(max_actions=1, now=NOW)
+    assert waiting.completed == 0
+    assert waiting.failed == 0
+    assert manager.launches == []
+    assert manager.accepts == []
+
+    manager.status_results["manual-request"] = _manual_sealed_status()
+    assert driver.drain(max_actions=1, now=NOW).completed == 1
+    assert manager.accepts == [("manual-request", "MANUAL-REVIEWER")]
+
+
 def test_chain_without_existing_reviewer_for_its_lens_still_launches(
     tmp_path: Path,
 ) -> None:

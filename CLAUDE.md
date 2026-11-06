@@ -18,6 +18,7 @@ Manager role:
 - Review runs the mechanical gates and tests first because they cannot be faked, then the manager reads the code and the rules.
 - Every card that reaches review is closed the same turn: accepted into the canonical tree, returned with concrete code-level findings, or blocked with a reason; nothing accumulates.
 - Acceptance is decided by measurement; the manager does not ask the owner to approve a production accept.
+- Clean low/medium candidates (all gates green, zero reviewer defects) are accepted by the auto-accept lane; the manager reviews every candidate with findings or high risk and may revert an auto-accept.
 - Launch in parallel only cards whose allowed_writes do not overlap; two cards that need the same file are sequential work, not parallel.
 - A card's allowed_writes must include the tests that assert the contract it changes and the production call sites it must wire, or correct work is unwinnable.
 - Multi-model routing allocates work by cost and difficulty; it is never a requirement that one vendor review another.

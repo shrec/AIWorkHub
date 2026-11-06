@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from . import (
+    auto_accept_lane,
     db_writer,
     finding_reproduction,
     model_settings,
@@ -446,8 +447,12 @@ def select_reviewer_route(
     raise ReviewRouteUnavailable(lens, skipped)
 
 
+# A reviewer still spawning (reviewer_claim_bound / provider_spawn_committed)
+# or being cancelled is live; treating it as not running fails the chain
+# action and retires the chain's remaining actions (NF-2026-02108).
 _REVIEWER_RUNNING_STATES = frozenset({
     "starting", "running", "processing", "finalizing", "reconcile_pending",
+    "reviewer_claim_bound", "provider_spawn_committed", "cancel_requested",
 })
 _REVIEWER_MECHANICAL_TERMINAL_STATES = frozenset({
     "launch_failed", "worker_failed", "validation_failed", "finalize_failed",
@@ -2157,12 +2162,16 @@ class ReviewOrchestrator:
         route_selector: RouteSelector | None = None,
         owner: str = "process-manager-review-driver",
         lease_seconds: int = 300,
+        auto_accept_runner: auto_accept_lane.AutoAcceptRunner | None = None,
     ) -> None:
         self.manager = manager
         self.db_path = Path(db_path)
         self.route_selector = route_selector or select_reviewer_route
         self.owner = str(owner)
         self.lease_seconds = max(1, int(lease_seconds))
+        # NF-2026-02103: None means the per-process runner, so its owner token
+        # (which marks an attempt as live) survives across orchestrators.
+        self.auto_accept_runner = auto_accept_runner
 
     def ensure_chain(
         self,
@@ -2386,6 +2395,7 @@ class ReviewOrchestrator:
                     "SELECT chain_id FROM review_manager_ready_projection"
                 ).fetchall()
             }
+            attempted = auto_accept_lane.attempted_chain_ids(conn)
         def mark_projected(chain_id: int) -> None:
             with closing(_side_table_connection(self.db_path)) as conn, conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -2396,11 +2406,27 @@ class ReviewOrchestrator:
                 )
 
         published = 0
+        lane_enabled = bool(auto_accept_lane.load_config(self.manager.repo)["enabled"])
         for receipt in review_lifecycle.completed_manager_ready_receipts(self.db_path):
             aggregate = receipt["manager_ready"]
             chain_id = int(aggregate["chain_id"])
             if chain_id in projected:
                 continue
+            if lane_enabled or chain_id in attempted:
+                # NF-2026-02103: a clean chain is accepted by the lane off this
+                # loop; its manager callback waits until that attempt is decided.
+                # A chain that already holds an attempt row is settled even with
+                # the lane switched off, so an attempt started before the switch
+                # finishes before any callback. A disabled lane with no row
+                # skips this entirely and publishes manager_ready as before.
+                lane_action = self._auto_accept_projection(
+                    chain_id, aggregate, enabled=lane_enabled
+                )
+                if lane_action == auto_accept_lane.ACTION_AUTO_ACCEPTED:
+                    published += 1
+                    continue
+                if lane_action != auto_accept_lane.ACTION_MANAGER_READY:
+                    continue
             ok, state, _callback_enqueued = task_store.publish_manager_ready(
                 self.manager.repo,
                 task_id=str(aggregate["target_task_id"]),
@@ -2419,6 +2445,78 @@ class ReviewOrchestrator:
             mark_projected(chain_id)
             published += 1
         return published
+
+    def _auto_accept_projection(
+        self, chain_id: int, aggregate: Mapping[str, Any], *, enabled: bool
+    ) -> str:
+        """Settle one chain through the auto-accept lane (NF-2026-02103).
+
+        Called while the lane is enabled, and for any chain that already holds
+        an attempt row whatever the switch says; ``enabled`` gates only a NEW
+        claim, and a disabled lane with no row never opens the lane's tables.
+        The decision, its task event and -- for an accepted chain -- the
+        ``review_ready`` manager wake and the projection row commit in ONE
+        transaction, so a replayed chain can neither accept twice nor enqueue
+        its wake twice. The attempt itself is started only after that commit,
+        never with SQLite open; a claim whose commit fails is released.
+        """
+        runner = self.auto_accept_runner or auto_accept_lane.default_runner()
+        task_id = str(aggregate["target_task_id"])
+        request_id = str(aggregate["target_request_id"])
+        try:
+            with closing(_side_table_connection(self.db_path)) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                decision = auto_accept_lane.settle(
+                    conn, runner, chain_id=chain_id, task_id=task_id, request_id=request_id,
+                    enabled=enabled, now=datetime.now(timezone.utc).isoformat(),
+                    claim_epoch=str(aggregate["claim_epoch"]),
+                )
+                if decision.action == auto_accept_lane.ACTION_AUTO_ACCEPTED:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO review_manager_ready_projection"
+                        "(chain_id, projected_at) VALUES (?, ?)",
+                        (chain_id, datetime.now(timezone.utc).isoformat()),
+                    )
+        except BaseException:
+            # The claim rolled back with the transaction; so does its reservation.
+            runner.release(chain_id)
+            raise
+        if decision.persisted_result:
+            runner.forget(chain_id)
+        if decision.action == auto_accept_lane.ACTION_SUBMIT:
+            runner.submit(
+                chain_id, self.manager, repo=self.manager.repo,
+                task_id=task_id, request_id=request_id,
+            )
+            return auto_accept_lane.ACTION_DEFER
+        if decision.outcome is not None:
+            self._record_auto_accept_event(decision)
+        return decision.action
+
+    def _record_auto_accept_event(self, decision: auto_accept_lane.Decision) -> None:
+        """Best-effort process-ledger copy; the task event is the durable record."""
+        append = getattr(self.manager, "_append_event", None)
+        if not callable(append) or decision.outcome is None:
+            return
+        outcome = decision.outcome
+        accepted = decision.action == auto_accept_lane.ACTION_AUTO_ACCEPTED
+        try:
+            append({
+                "event_type": (
+                    auto_accept_lane.EVENT_AUTO_ACCEPTED if accepted
+                    else auto_accept_lane.EVENT_DECLINED
+                ),
+                "request_id": str(outcome.get("request_id") or ""),
+                "task_id": str(outcome.get("task_id") or ""),
+                "auto_accept": {
+                    "actor": auto_accept_lane.ACTOR,
+                    "state": str(outcome.get("state") or ""),
+                    "reasons": list(outcome.get("reasons") or [])[:20],
+                    "commit": dict(outcome.get("commit") or {}) if accepted else {},
+                },
+            })
+        except Exception:  # noqa: BLE001 -- the task event already carries it
+            return
 
     def _recover_terminal_route_binding_failures(self, *, now: datetime) -> int:
         """Reopen historical alias failures only after the binding now verifies."""
