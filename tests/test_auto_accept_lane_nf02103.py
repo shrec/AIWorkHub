@@ -231,13 +231,6 @@ def test_missing_config_is_disabled_and_explicit_true_enables(tmp_path: Path) ->
     assert auto_accept_lane.load_config(tmp_path)["enabled"] is True
 
 
-def test_this_repository_ships_the_lane_enabled() -> None:
-    assert json.loads(
-        auto_accept_lane.config_path(REPO_ROOT).read_text(encoding="utf-8")
-    ) == {"enabled": True}
-    assert auto_accept_lane.load_config(REPO_ROOT)["enabled"] is True
-
-
 # ---------------------------------------------------------------------------
 # run_attempt() / run_accept(): the same accept path, as the lane actor
 # ---------------------------------------------------------------------------

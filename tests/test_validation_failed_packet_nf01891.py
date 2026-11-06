@@ -196,7 +196,10 @@ def test_task_show_summary_of_a_red_card_returns_the_packet(monkeypatch) -> None
     evidence = server.aiworkhub_task_show("TASK_RED", detail="evidence")
     assert evidence["detail"] == "evidence"
     full = server.aiworkhub_task_show("TASK_RED", detail="full")
-    assert full == _envelope(card)
+    assert full["bounded"] is True
+    full_card = json.loads(full["stdout"])
+    assert full_card["task_id"] == "TASK_RED"
+    assert full_card["card_bound"]["original_bytes"] > 60_000
 
 
 def test_task_show_summary_of_a_review_ready_card_is_unchanged(monkeypatch) -> None:
