@@ -7,11 +7,13 @@ rotated files remain immutable and readers stream them in chronological order.
 
 from __future__ import annotations
 
+import hashlib
 import heapq
 import json
 import os
 import stat
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -526,6 +528,13 @@ def _stream_rows_containing(
             continue
 
 
+def _exact_tokens(tokens: list[bytes | None]) -> list[bytes] | None:
+    """``tokens`` when every one is an exact raw token, else ``None``."""
+
+    exact = [token for token in tokens if token is not None]
+    return exact if exact and len(exact) == len(tokens) else None
+
+
 def _iter_events_containing(
     path: Path, tokens: list[bytes | None]
 ) -> Iterator[dict[str, Any]] | None:
@@ -538,11 +547,9 @@ def _iter_events_containing(
     reorders lines -- means the caller must use the full ``iter_events``.
     """
 
-    exact = [token for token in tokens if token is not None]
+    exact = _exact_tokens(tokens)
     ledgers = ledger_paths(path)
-    if not exact or len(exact) != len(tokens) or any(
-        _is_spill(path, ledger) for ledger in ledgers
-    ):
+    if exact is None or any(_is_spill(path, ledger) for ledger in ledgers):
         return None
     return _stream_rows_containing(ledgers, exact)
 
@@ -808,6 +815,317 @@ def _copy_row(row: Mapping[str, Any]) -> dict[str, Any]:
     return copied
 
 
+# --- Persisted archive checkpoints (NF-2026-02116) ---------------------------
+#
+# A projection heavier than ``_LATEST_EVENT_CACHE_MAX_BYTES`` is never cached
+# in memory -- the launcher's request projection never fit -- so every cold
+# read json-decoded the WHOLE rotated history, and that history only grows
+# (measured: 23 archives, 912 MB, decoded twice per janitor sweep). Rotated
+# archives are immutable, so the fold over them is a pure function of their
+# bytes: it is persisted once per fold identity and a later cold read decodes
+# that checkpoint plus only the segments newer than it.
+#
+# The checkpoint is never an authority. One that is missing, truncated or
+# corrupt (length + sha256 of the payload), from another schema or rule
+# version, for another fold identity, older than an archive it covers, or
+# whose covered archives no longer match the current oldest-first archives
+# exactly by (name, size, mtime_ns) is ignored and the read replays fully --
+# the same answer, only slower. Spills reorder rows by timestamp across
+# segments, so a ledger holding one is never checkpointed nor served from one.
+
+_CHECKPOINT_SCHEMA_ID = "aiworkhub.process_event_checkpoint.v1"
+_CHECKPOINT_RULE_VERSION = 1
+_CHECKPOINT_HEADER_MAX_BYTES = 256 * 1024
+# A checkpoint is bounded by the projection, not by history; one larger than
+# this is neither written nor decoded (that projection keeps the full replay).
+_CHECKPOINT_PAYLOAD_MAX_BYTES = 256 * 1024 * 1024
+_ArchiveCoverage = tuple[str, int, int]
+
+_CHECKPOINT_STATS_LOCK = threading.Lock()
+_CHECKPOINT_STATS: dict[str, int] = {
+    "loaded": 0,
+    "absent": 0,
+    "rejected": 0,
+    "written": 0,
+    "write_failed": 0,
+    "write_skipped_oversize": 0,
+}
+
+
+def _count_checkpoint(outcome: str) -> None:
+    with _CHECKPOINT_STATS_LOCK:
+        _CHECKPOINT_STATS[outcome] = _CHECKPOINT_STATS.get(outcome, 0) + 1
+
+
+def latest_event_checkpoint_stats() -> dict[str, int]:
+    """Process-local counts of checkpoint loads, misses, rejections and writes."""
+
+    with _CHECKPOINT_STATS_LOCK:
+        return dict(_CHECKPOINT_STATS)
+
+
+def checkpoint_dir(path: Path) -> Path:
+    """The directory holding ``path``'s archive checkpoints (never a ledger
+    segment: ``ledger_paths`` only matches ``<stem>.*<suffix>`` regular files)."""
+
+    return path.with_name(f"{path.stem}.checkpoints")
+
+
+def _checkpoint_identity(path: Path, cache_key: _ProjectionKey) -> str:
+    # The resolved path (cache_key[0]) is left out so a relocated repository
+    # keeps its checkpoint; the ledger name and every fold option stay in.
+    return json.dumps([path.name, *cache_key[1:]], ensure_ascii=True)
+
+
+def _checkpoint_path(path: Path, identity: str) -> Path:
+    digest = hashlib.sha256(identity.encode("ascii")).hexdigest()[:32]
+    return checkpoint_dir(path) / f"{digest}.json"
+
+
+def _archive_coverage(archives: tuple[_FileSignature, ...]) -> list[_ArchiveCoverage]:
+    return [(Path(item[0]).name, int(item[3]), int(item[4])) for item in archives]
+
+
+def _checkpoint_segments(
+    path: Path, signatures: tuple[_FileSignature, ...] | None
+) -> tuple[tuple[_FileSignature, ...], _FileSignature | None] | None:
+    """Split ``signatures`` into (archives, active), or ``None`` when the
+    ledger cannot be checkpointed (undescribable, or a spill is present)."""
+
+    if signatures is None or any(_is_spill(path, Path(item[0])) for item in signatures):
+        return None
+    if signatures and signatures[-1][0] == str(path.resolve(strict=False)):
+        return signatures[:-1], signatures[-1]
+    return signatures, None
+
+
+def _valid_coverage(value: Any, expected: list[_ArchiveCoverage]) -> int:
+    """How many leading archives ``value`` covers exactly, or 0."""
+
+    if not isinstance(value, list) or not 0 < len(value) <= len(expected):
+        return 0
+    for entry, wanted in zip(value, expected):
+        if (
+            not isinstance(entry, list)
+            or len(entry) != 3
+            or not isinstance(entry[0], str)
+            or any(type(item) is not int for item in entry[1:])
+            or tuple(entry) != wanted
+        ):
+            return 0
+    return len(value)
+
+
+def _load_checkpoint(
+    path: Path, cache_key: _ProjectionKey, archives: tuple[_FileSignature, ...]
+) -> tuple[int, dict[str, dict[str, Any]]] | None:
+    """(covered archive count, fold over exactly those archives), or ``None``."""
+
+    if not archives:
+        return None
+    identity = _checkpoint_identity(path, cache_key)
+    target = _checkpoint_path(path, identity)
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        _count_checkpoint("absent")
+        return None
+    except OSError:
+        _count_checkpoint("rejected")
+        return None
+    loaded = None
+    if (
+        stat.S_ISREG(info.st_mode)
+        and not stat.S_ISLNK(info.st_mode)
+        and info.st_size
+        <= _CHECKPOINT_PAYLOAD_MAX_BYTES + 2 * _CHECKPOINT_HEADER_MAX_BYTES
+    ):
+        loaded = _decode_checkpoint(target, identity, archives, info.st_mtime_ns)
+    _count_checkpoint("rejected" if loaded is None else "loaded")
+    return loaded
+
+
+def _fold_checkpoint_line(latest: dict[str, dict[str, Any]], line: bytes) -> bool:
+    """Add one ``[key, row]`` payload line; ``False`` when it is malformed or
+    repeats a key (a checkpoint holds each key exactly once)."""
+
+    if not line.endswith(b"\n"):
+        return False
+    entry = json.loads(line)
+    if (
+        not isinstance(entry, list)
+        or len(entry) != 2
+        or not isinstance(entry[0], str)
+        or not isinstance(entry[1], dict)
+        or entry[0] in latest
+    ):
+        return False
+    latest[entry[0]] = entry[1]
+    return True
+
+
+def _decode_checkpoint(
+    target: Path,
+    identity: str,
+    archives: tuple[_FileSignature, ...],
+    checkpoint_mtime_ns: int,
+) -> tuple[int, dict[str, dict[str, Any]]] | None:
+    """Stream-decode one checkpoint: a header line naming its identity and
+    covered archives, one ``[key, row]`` line per key, and a trailer line with
+    the row count, payload length and payload sha256. The payload is decoded
+    one line at a time, so a load never holds its text and its rows at once;
+    any mismatch discards everything decoded."""
+
+    coverage = _archive_coverage(archives)
+    latest: dict[str, dict[str, Any]] = {}
+    digest = hashlib.sha256()
+    payload_bytes = 0
+    pending: bytes | None = None
+    try:
+        with target.open("rb") as handle:
+            header_line = handle.readline(_CHECKPOINT_HEADER_MAX_BYTES + 1)
+            if not header_line.endswith(b"\n"):
+                return None
+            header = json.loads(header_line)
+            if not isinstance(header, dict):
+                return None
+            covered = _valid_coverage(header.get("covers"), coverage)
+            if (
+                header.get("schema_id") != _CHECKPOINT_SCHEMA_ID
+                or header.get("rule_version") != _CHECKPOINT_RULE_VERSION
+                or header.get("identity") != identity
+                or not covered
+                # Stale: written before an archive it claims to cover.
+                or checkpoint_mtime_ns < max(item[2] for item in coverage[:covered])
+            ):
+                return None
+            for line in handle:
+                if pending is not None:
+                    if not _fold_checkpoint_line(latest, pending):
+                        return None
+                    digest.update(pending)
+                    payload_bytes += len(pending)
+                pending = line
+    # RecursionError: json's answer to a deeply nested line is not a ValueError.
+    except (OSError, ValueError, RecursionError):
+        return None
+    if pending is None or not pending.endswith(b"\n"):
+        return None
+    try:
+        trailer = json.loads(pending)
+    except (ValueError, RecursionError):
+        return None
+    if (
+        not isinstance(trailer, dict)
+        or trailer.get("rows") != len(latest)
+        or trailer.get("payload_bytes") != payload_bytes
+        or trailer.get("payload_sha256") != digest.hexdigest()
+    ):
+        return None
+    return covered, latest
+
+
+class _CheckpointOversize(Exception):
+    """The checkpoint would exceed ``_CHECKPOINT_PAYLOAD_MAX_BYTES``."""
+
+
+def _write_checkpoint(
+    path: Path,
+    cache_key: _ProjectionKey,
+    archives: tuple[_FileSignature, ...],
+    latest: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Atomically publish the fold over exactly ``archives``, streamed one row
+    at a time (best effort: a failure is counted and costs the next cold read
+    a full replay, never a different answer)."""
+
+    identity = _checkpoint_identity(path, cache_key)
+    header = (
+        json.dumps(
+            {
+                "schema_id": _CHECKPOINT_SCHEMA_ID,
+                "rule_version": _CHECKPOINT_RULE_VERSION,
+                "identity": identity,
+                "covers": _archive_coverage(archives),
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        ).encode("ascii")
+        + b"\n"
+    )
+    if len(header) > _CHECKPOINT_HEADER_MAX_BYTES:
+        _count_checkpoint("write_skipped_oversize")
+        return
+    target = _checkpoint_path(path, identity)
+    temporary = target.with_name(f".{target.stem}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    published = False
+    outcome = "write_failed"
+    try:
+        target.parent.mkdir(mode=0o700, exist_ok=True)
+        info = target.parent.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise OSError("process_event_checkpoint_dir_invalid")
+        # A writer killed mid-write never reaches the ``finally`` below, so its
+        # temporary would stay forever; a live write takes seconds, so any
+        # temporary older than an hour is such an orphan and is removed first.
+        horizon = time.time() - 3600
+        for orphan in target.parent.glob(".*.tmp"):
+            try:
+                if orphan.lstat().st_mtime < horizon:
+                    orphan.unlink()
+            except OSError:
+                pass
+        digest = hashlib.sha256()
+        payload_bytes = 0
+        with os.fdopen(os.open(temporary, flags, 0o600), "wb") as handle:
+            handle.write(header)
+            for key, row in latest.items():
+                line = (
+                    json.dumps([key, row], ensure_ascii=True, separators=(",", ":"))
+                    + "\n"
+                ).encode("ascii")
+                payload_bytes += len(line)
+                if payload_bytes > _CHECKPOINT_PAYLOAD_MAX_BYTES:
+                    raise _CheckpointOversize
+                digest.update(line)
+                handle.write(line)
+            trailer = {
+                "rows": len(latest),
+                "payload_bytes": payload_bytes,
+                "payload_sha256": digest.hexdigest(),
+            }
+            handle.write(
+                (json.dumps(trailer, ensure_ascii=True, sort_keys=True) + "\n").encode(
+                    "ascii"
+                )
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        atomic_replace(temporary, target)
+        published = True
+        outcome = "written"
+    except _CheckpointOversize:
+        outcome = "write_skipped_oversize"
+    except (OSError, TypeError, ValueError):
+        outcome = "write_failed"
+    finally:
+        if not published:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+    _count_checkpoint(outcome)
+
+
+def _segment_rows(segment: Path, tokens: list[bytes] | None) -> Iterator[dict[str, Any]]:
+    if tokens is None:
+        return _iter_ledger_file(segment)
+    return _stream_rows_containing([segment], tokens)
+
+
 def _rebuild_latest_events(
     path: Path,
     *,
@@ -819,28 +1137,66 @@ def _rebuild_latest_events(
     keep_fields: tuple[str, ...] = (),
 ) -> dict[str, dict[str, Any]]:
     """Cold replay. Returns the projection itself, uncopied: callers must copy
-    only the rows they hand out."""
+    only the rows they hand out.
+
+    Without a spill the replay folds segment by segment, oldest first --
+    exactly ``iter_events``' order -- starting from a valid archive
+    checkpoint when one exists, and publishes a new checkpoint when it folded
+    archives the old one did not cover and the read was stable."""
 
     before = _ledger_signatures(path)
     latest: dict[str, dict[str, Any]] = {}
-    rows: Iterable[dict[str, Any]] = iter_events(path)
-    if keep_fields and not skip_event_kinds and not replace:
-        rows = _iter_events_naming(path, keep_fields, key_field)
-    for row in rows:
-        _merge_latest_row(
-            latest,
-            row,
-            key_field,
-            skip_event_kinds=skip_event_kinds,
-            replace=replace,
-            drop_fields=drop_fields,
-            keep_fields=keep_fields,
+    naming = bool(keep_fields and not skip_event_kinds and not replace)
+
+    def fold(rows: Iterable[dict[str, Any]]) -> None:
+        for row in rows:
+            _merge_latest_row(
+                latest,
+                row,
+                key_field,
+                skip_event_kinds=skip_event_kinds,
+                replace=replace,
+                drop_fields=drop_fields,
+                keep_fields=keep_fields,
+            )
+
+    segments = _checkpoint_segments(path, before)
+    archives: tuple[_FileSignature, ...] = ()
+    archive_fold: dict[str, dict[str, Any]] | None = None
+    if segments is None:
+        fold(
+            _iter_events_naming(path, keep_fields, key_field)
+            if naming
+            else iter_events(path)
         )
+    else:
+        archives, active = segments
+        tokens = (
+            _exact_tokens([_json_token(name) for name in keep_fields if name != key_field])
+            if naming
+            else None
+        )
+        covered = 0
+        loaded = _load_checkpoint(path, cache_key, archives)
+        if loaded is not None:
+            covered, checkpoint_latest = loaded
+            latest.update(checkpoint_latest)
+        for item in archives[covered:]:
+            fold(_segment_rows(Path(item[0]), tokens))
+        if covered < len(archives):
+            # The fold never mutates a retained row (it builds a new dict per
+            # touched key), so a shallow copy freezes the archive-only state.
+            archive_fold = dict(latest)
+        if active is not None:
+            fold(_segment_rows(Path(active[0]), tokens))
     after = _ledger_signatures(path)
 
     # Cache only a stable read. A concurrent rotation/append still returns the
-    # same bounded stream semantics as iter_events, but cannot seed stale state.
+    # same bounded stream semantics as iter_events, but cannot seed stale state
+    # -- neither in memory nor as a persisted checkpoint.
     if before is not None and before == after:
+        if archive_fold is not None:
+            _write_checkpoint(path, cache_key, archives, archive_fold)
         active_offset = 0
         if after and after[-1][0] == str(path.resolve(strict=False)):
             active_offset = _active_complete_offset(path, size=after[-1][3])
@@ -1005,6 +1361,15 @@ def _latest_view(
     return rebuild()
 
 
+def copy_projection(
+    view: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """A deep copy of a latest-per-key projection: no returned row, nested
+    dict or list is shared with ``view``."""
+
+    return {key: _copy_row(value) for key, value in view.items()}
+
+
 def latest_events(
     path: Path,
     *,
@@ -1020,7 +1385,8 @@ def latest_events(
     any immutable-segment change invalidate the projection and replay the
     canonical ``iter_events`` ordering. The cache is process-local, bounded by
     entry count and by estimated retained bytes, and never an authority: a
-    restart merely pays one cold replay.
+    restart merely pays one cold replay -- of a persisted archive checkpoint
+    plus the newer segments when one is valid (NF-2026-02116).
 
     ``drop_fields`` names keys a caller never reads (e.g. ``packet``) that are
     removed from every row before it is retained in the cached projection --
@@ -1039,7 +1405,7 @@ def latest_events(
         replace=replace,
         drop_fields=drop_fields,
     )
-    return {key: _copy_row(value) for key, value in view.items()}
+    return copy_projection(view)
 
 
 def latest_event(

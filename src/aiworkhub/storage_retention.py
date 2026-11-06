@@ -2420,7 +2420,11 @@ def _janitor_parallel(
 def _janitor_worktrees(root: Path) -> dict[str, Any]:
     from . import process_launcher  # local import: cycle-safe
 
-    return process_launcher.ProcessManager(repo=root)._gc_finalized_workspaces()
+    # ONE full projection read per sweep (NF-2026-02116): the short-lived
+    # manager's construction reconcile and its GC sweep share the read while
+    # the ledger generation is unchanged; any append forces a fresh read.
+    with process_launcher.shared_request_projection():
+        return process_launcher.ProcessManager(repo=root)._gc_finalized_workspaces()
 
 
 def _prune_decided_rework_deltas(root: Path, now: float) -> dict[str, Any]:

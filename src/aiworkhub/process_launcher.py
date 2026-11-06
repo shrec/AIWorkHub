@@ -35,7 +35,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, cast
+from typing import Any, Callable, Iterable, Iterator, Mapping, cast
 
 from . import core, rework_overlay_packet as _rework_overlay_packet
 from . import agent_tool_instructions
@@ -4163,6 +4163,34 @@ _LATEST_BY_REQUEST_DROP_FIELDS = (
     "validation",
 )
 
+# NF-2026-02116: thread-local scope in which ``_latest_by_request`` reuses one
+# projection read per unchanged ledger generation. Outside the scope (the
+# default) every call reads the ledger exactly as before.
+_SHARED_REQUEST_PROJECTION = threading.local()
+
+
+@contextmanager
+def shared_request_projection() -> Iterator[None]:
+    """Let one short-lived ProcessManager pay ONE request-projection read.
+
+    The storage janitor builds a manager whose construction reconcile and the
+    GC sweep that follows both read the full request projection; that
+    projection exceeds the in-memory cache bound, so each read was a cold
+    replay. Inside this scope a read proven against a ledger generation (the
+    generation is identical before and after it) is reused, as a fresh deep
+    copy, for every later read on this thread while that generation still
+    holds. Any append, rotation or spill changes the generation and forces a
+    real read, so reconcile and GC decide exactly what they decided before.
+    Watcher threads started by reconcile never see the scope.
+    """
+
+    previous = getattr(_SHARED_REQUEST_PROJECTION, "memo", None)
+    _SHARED_REQUEST_PROJECTION.memo = {}
+    try:
+        yield
+    finally:
+        _SHARED_REQUEST_PROJECTION.memo = previous
+
 
 class ProcessManager:
     """Thread-safe local process registry with append-only lifecycle events."""
@@ -4594,6 +4622,17 @@ class ProcessManager:
         # projection's cache identity, so this view can never be served a merge
         # fold. Folded a raw ``iter_events`` pass until NF-2026-00561 -- 2.19 s
         # per call against 7 ms cached, over ~20 sites and a 30 s reconciler.
+        # NF-2026-02116: inside ``shared_request_projection`` on this thread a
+        # read is reused while the ledger generation it was proven against is
+        # unchanged -- the identical bytes fold to the identical answer -- so a
+        # janitor sweep's construction reconcile and its GC share one replay.
+        memo = getattr(_SHARED_REQUEST_PROJECTION, "memo", None)
+        memo_key = str(self.process_log_path)
+        generation = self._ledger_generation() if memo is not None else None
+        if memo is not None and generation is not None:
+            reused = memo.get(memo_key)
+            if reused is not None and reused[0] == generation:
+                return process_event_ledger.copy_projection(reused[1])
         latest = process_event_ledger.latest_events(
             self.process_log_path,
             key_field="request_id",
@@ -4611,6 +4650,8 @@ class ProcessManager:
             if event.get("state") == REVIEWER_CLAIM_BOUND_STATE:
                 event["state"] = "starting"
                 event["claim_binding_state"] = REVIEWER_CLAIM_BOUND_STATE
+        if memo is not None and generation is not None and self._ledger_generation() == generation:
+            memo[memo_key] = (generation, process_event_ledger.copy_projection(latest))
         return latest
 
     def _latest_by_request_stable(
