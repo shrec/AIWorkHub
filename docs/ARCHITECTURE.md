@@ -257,15 +257,15 @@ from that evidence into the launch decision.
 `callback_bridge.py` closes the loop back to the coordinator: when a
 claimed task reaches a terminal state, a durable, deduplicated
 `callback_outbox`/`callback_batches` entry in the repository-local canonical
-task store wakes the verified manager through its available transport. Codex
-can use manager-inbox delivery or the optional same-host App Server sideband;
-Claude can use its manager inbox, native channel or resumable CLI transport.
-See [Callback delivery](CALLBACKS.md) for the full lease/retry/batching contract
-and compatibility boundary, and
-[Getting Started](GETTING_STARTED.md#6-codex-callback-routing--claude-callback-capability)
-for the current Claude-transport capability/limitations summary.
-`app_server_mux.py` is the VS Code-owned App Server sideband transport used
-for the Codex path when configured; the Claude transport does not use it.
+task store wakes the verified manager through its available transport. The
+built-in Manager seat (`manager_loop_wake.py`) turns each callback batch into a
+manager turn; a Claude Code chat waits on the two-phase
+`aiworkhub_claude_callback_wait`/`_ack` MCP long-poll; a Codex sidebar chat
+reads its manager inbox. See [Callback delivery](CALLBACKS.md) for the full
+lease/retry/batching contract and per-client behaviour, and
+[Getting Started](GETTING_STARTED.md#9-callback-delivery-per-client) for the
+readiness checks. `app_server_mux.py` is the retired Codex App Server sideband:
+since 0.12.85 activation no longer installs it.
 
 ## Source Graph / Session Manager / AI Memory / KB
 

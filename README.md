@@ -61,6 +61,11 @@
    AIWorkHub-managed `CLAUDE.md` block: direct Claude chats must bootstrap as
    managers and use Source Graph before broad built-in file discovery. They
    are not worker sessions.
+5. Choose the chat that receives callbacks. The built-in Manager (dashboard
+   **Manager** chat, any backend including Codex models) and Claude Code are
+   woken automatically when a worker finishes. A Codex VS Code sidebar chat is
+   inbox-only and polls the review queue itself; see
+   [Callback delivery](docs/CALLBACKS.md#manager-transports).
 
 The prompt below is a portable first-run diagnostic for clients that do not
 automatically honor repository instructions; it is not required in a correctly
@@ -411,8 +416,7 @@ structured findings into NeedFix with provenance.
 - fail-closed repository, manager, task and claim-episode identity checks.
 
 Read [SECURITY.md](SECURITY.md) before enabling autonomous launches. Callback
-delivery and its optional Codex compatibility transport are documented in
-[Callback delivery](docs/CALLBACKS.md).
+delivery per client is documented in [Callback delivery](docs/CALLBACKS.md).
 
 ## Development
 

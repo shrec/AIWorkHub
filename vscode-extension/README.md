@@ -109,6 +109,10 @@ repositories.
 4. Choose **Initialize AIWorkHub** on first use.
 5. Open a new Codex, Claude or MCP-capable chat after registration so the new
    runtime tools are discovered by that chat process.
+6. For automatic callbacks use the built-in Manager (dashboard **Manager**
+   chat, any backend including Codex models) or Claude Code. A Codex sidebar
+   chat is inbox-only and polls the review queue itself; see
+   [Callback delivery](https://github.com/shrec/AIWorkHub/blob/main/docs/CALLBACKS.md#manager-transports).
 
 Initialization is explicit and idempotent. It creates repository-local state
 only under `.aiworkhub/` and starts the first Source Graph index in the

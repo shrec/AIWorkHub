@@ -20,36 +20,57 @@ manager reads the full evidence through MCP.
 
 ## Manager transports
 
-- **Codex:** manager inbox is the portable baseline. A same-host VS Code setup
-  may additionally use the optional App Server sideband transport to wake the
-  exact visible thread.
-- **Claude:** cooperative manager inbox and resumable CLI delivery share the
-  same durable outbox. Claude-native channels can provide push delivery when
-  the installed Claude client supports them.
-- **Other clients:** the repository review inbox remains authoritative even
+Which manager chat is woken automatically depends on the client:
+
+- **Built-in Manager (dashboard Manager chat):** the supported fully automatic
+  path for every backend (`codex_cli`, `claude_cli`, `opencode_cli`). The seat
+  bootstraps as `provider=manager_chat` with `route_state=ready` and
+  `callback_supported=true`. Its wake consumer claims each callback batch and
+  runs it as a manager turn, so reviews continue without an owner prompt. Use
+  it to run Codex models with automatic callbacks, including on Windows.
+- **Claude Code chat:** the chat waits on `aiworkhub_claude_callback_wait` and
+  acknowledges with `aiworkhub_claude_callback_ack` (a two-phase MCP
+  long-poll). A background
+  `python -m aiworkhub.manager_callback_watch --provider claude ...` exits when
+  a callback is pending, which re-invokes the model.
+- **Codex VS Code sidebar chat:** manager inbox only. The App Server mux that
+  used to push-wake a Codex thread was retired in 0.12.85 and Codex has no
+  callback-wait tool, so the sidebar chat receives no push. It can still manage
+  the repository; it polls `aiworkhub_task_review_queue` or
+  `aiworkhub_completion_inbox` itself.
+- **Other MCP clients:** the repository review inbox remains authoritative even
   when a client has no push-wake API.
 
 Dashboard route status is evidence, not optimism: `available`, `pending` and
 `degraded` describe the live manager tuple, transport, backlog, retry state and
 last delivery.
 
-## Codex compatibility boundary
+## Codex sidebar route states
 
-The optional sideband implementation wraps the Codex executable selected by VS
-Code and transparently proxies its stdio App Server stream. It does not provide
-a stable public integration contract: the App Server protocol and the
-`chatgpt.cliExecutable` setting are owned by the Codex extension and may change.
+A Codex sidebar chat bootstraps as a verified manager. Its callback route is a
+separate question:
 
-AIWorkHub therefore treats sideband as an adapter, not repository authority:
+- When Codex passes `CODEX_THREAD_ID` (with
+  `CODEX_INTERNAL_ORIGINATOR_OVERRIDE=codex_vscode`) into the MCP server
+  environment, the route binds to that thread and callbacks land in its inbox.
+- Otherwise bootstrap reports `route_pending` with wake reason
+  `codex_thread_id_not_observed`. Since 0.12.85 this is the expected state, not
+  a broken install. `aiworkhub_task_create` then refuses callback-required
+  cards with `callback_route_pending:codex_thread_id_not_observed`, unless a
+  built-in Manager seat is active for the same repository; that seat then owns
+  the callbacks.
+- `callback_adoption` with reason `callback_capable_manager_route_required` in
+  the bootstrap reply is informational: this chat did not take over another
+  provider's pending wakes. It does not gate launches.
 
-1. Task state and callback events remain durable without it.
-2. Unsupported hosts or protocol drift fall back to manager-inbox delivery.
-3. The wrapper must preserve argv, stdio and exit behavior and must never kill
-   or reconfigure a foreign process.
-4. Contract tests qualify supported Codex versions and fail closed on unknown
-   message shapes.
-5. A future documented editor callback API can replace the adapter without a
-   task-store migration.
+## Retired Codex sideband
 
-The architectural decision and upgrade requirements are recorded in
-[ADR 0004](adr/0004-codex-callback-compatibility-boundary.md).
+Up to 0.12.84 an optional adapter wrapped the Codex executable selected by VS
+Code and proxied its stdio App Server stream to wake the exact visible thread.
+The App Server protocol and the `chatgpt.cliExecutable` setting are owned by the
+Codex extension and are not a stable public contract, so 0.12.85 retired it:
+activation no longer installs the launcher and restores a
+`chatgpt.cliExecutable` that still points at it. Task state and callback events
+never depended on the adapter. The original decision is recorded in
+[ADR 0004](adr/0004-codex-callback-compatibility-boundary.md); a documented
+editor callback API could add a push path for the sidebar again.

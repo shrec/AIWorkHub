@@ -250,22 +250,26 @@ The dashboard's task detail view for a selected, currently-running task
 shows **Live Output**: a bounded, incremental read of that one task's
 stdout/stderr, never a repository-wide log stream.
 
-## 9. Codex callback routing / Claude callback capability
+## 9. Callback delivery per client
 
 When a claimed task reaches a terminal state (`review_ready`, `blocked`,
 `launch_failed`, `validation_failed`, `scope_rejected`, `timed_out`,
-`cancelled`), the callback bridge wakes the exact originating Codex thread
-automatically -- see the README's
-[Callback delivery](CALLBACKS.md) guide for the full
-transport/lease/batching contract.
+`cancelled`), the callback bridge records a durable callback for the
+repository's verified manager. Whether a chat is then woken automatically
+depends on the client (see [Callback delivery](CALLBACKS.md) for the full
+transport/lease/batching contract):
 
-Claude callback delivery reuses the same durable outbox: it uses a
-`claude --resume` CLI transport (`ClaudeCliResumeClient`) gated on an
-`event_id`/`request_id` acknowledgement echo before a delivery counts as
-`delivered`. Known limitation: this transport requires a resumable local
-Claude Code CLI session and currently supports the `panel`/`cli_resume`
-adapter modes only -- it does not (yet) speak the VS Code-owned App Server
-sideband transport that the Codex path uses for `transport="sideband"`.
+- **Built-in Manager (dashboard Manager chat)**: automatic for every backend,
+  Codex models included. Readiness check: bootstrap inside the seat reports
+  `provider=manager_chat`, `route_state=ready` and `callback_supported=true`.
+- **Claude Code chat**: automatic through `aiworkhub_claude_callback_wait` /
+  `aiworkhub_claude_callback_ack` plus a background
+  `python -m aiworkhub.manager_callback_watch --provider claude ...`.
+- **Codex VS Code sidebar chat**: inbox only since the Codex mux was retired in
+  0.12.85. A `route_pending` route with `codex_thread_id_not_observed` is the
+  expected state when Codex does not pass its thread id to the MCP server. The
+  chat polls `aiworkhub_task_review_queue` or `aiworkhub_completion_inbox`; use
+  the built-in Manager when you want callbacks to drive the loop.
 
 ## 10. Operations and troubleshooting
 
