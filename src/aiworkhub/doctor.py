@@ -3,9 +3,12 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import math
+import mmap
 import os
 import sys
+import time
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
 
 from . import platform_io, runtime_generation
@@ -21,6 +24,16 @@ SUMMARY_MAX_CHARS = 200
 REPLY_MAX_BYTES = 8 * 1024
 NESTED_PROBE_KEYS = ("reconciler", "learning_coverage")
 DETAIL_KEYS = ("error", "last_error", "reason")
+# Task DB holder scan (NF-2026-00274): every bound is a constant, never a per-call knob.
+TASK_DB_ID = "task_queue"
+TASK_DB_HOLDER_ROLES = ("db", "wal", "shm", "writer_lock")
+TASK_DB_HOLDERS_MAX_PIDS = 4096
+TASK_DB_HOLDERS_MAX_ENTRIES = 8
+TASK_DB_HOLDERS_MAX_ARGS = 64
+TASK_DB_HOLDERS_CMDLINE_BYTES = 64 * 1024
+TASK_DB_HOLDERS_CMDLINE_CHARS = 200
+TASK_DB_HOLDERS_BUDGET_SECONDS = 1.0
+TASK_DB_HOLDERS_SECRET_MARKERS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
 
 Probe = Callable[[], dict[str, Any]]
 
@@ -158,10 +171,16 @@ def diagnose(
         "problems": [entry for entry in entries if entry["state"] != STATE_OK],
         "probes": entries,
     }
+    reply["task_db_holders"] = task_db_holders()
     if _encoded_size(reply) > REPLY_MAX_BYTES:
         for entry in entries:
             entry["summary"] = ""
         reply["summaries_dropped"] = True
+    if _encoded_size(reply) > REPLY_MAX_BYTES:
+        # Still oversized: drop the holder cmdlines (pid, role and generation stay).
+        for holder in reply["task_db_holders"].get("entries", []):
+            holder["cmdline"] = ""
+        reply["holder_cmdlines_dropped"] = True
     return reply
 
 
@@ -182,3 +201,197 @@ def server_process() -> dict[str, Any]:
         "runtime_generation": _or_none(runtime_generation.own_generation),
         "superseded": _or_none(runtime_generation.superseded),
     }
+
+
+def _task_db_path() -> Path:
+    """Canonical task DB path via the storage registry (never a hardcoded path)."""
+    from . import repository_state, storage_registry
+
+    repo = repository_state.inspect_repository()
+    registry = storage_registry.load_storage_registry(
+        repo.root, expected_repo_id=repo.manifest.repo_id
+    )
+    return storage_registry.resolve_database_path(registry, TASK_DB_ID)
+
+
+def _masked_cmdline(raw_args: list[str]) -> str:
+    """Join argv with every secret value replaced by ``***``.
+
+    An argument naming a secret marker is masked. When it carries no inline
+    ``=value``, the following argument is its value and is masked too.
+    """
+    parts: list[str] = []
+    mask_next = False
+    for arg in raw_args:
+        marked = any(marker in arg.upper() for marker in TASK_DB_HOLDERS_SECRET_MARKERS)
+        if mask_next or marked:
+            parts.append("***")
+            # A marker flag in value position still takes the next argument as its value.
+            mask_next = marked and "=" not in arg
+        else:
+            parts.append(arg)
+    return " ".join(parts)
+
+
+def _cmdline_args(pid_dir: str) -> list[str]:
+    """Raw argv of one process; /proc/<pid>/environ is never opened."""
+    try:
+        with open(os.path.join(pid_dir, "cmdline"), "rb") as handle:
+            raw = handle.read(TASK_DB_HOLDERS_CMDLINE_BYTES + 1)
+    except OSError:
+        return []
+    if len(raw) > TASK_DB_HOLDERS_CMDLINE_BYTES:
+        # Fail closed: a cut argv could split a secret argument and leak its prefix.
+        return ["***"]
+    parts = [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+    return parts[:TASK_DB_HOLDERS_MAX_ARGS]
+
+
+def _ppid_and_rss(pid_dir: str) -> tuple[int | None, int | None]:
+    ppid: int | None = None
+    rss: int | None = None
+    try:
+        with open(os.path.join(pid_dir, "stat"), "rb") as handle:
+            stat = handle.read().decode("utf-8", "replace")
+        # Fields after the parenthesised comm are: state, ppid, ...
+        ppid = int(stat[stat.rindex(")") + 2 :].split()[1])
+    except (OSError, ValueError, IndexError):
+        ppid = None
+    try:
+        with open(os.path.join(pid_dir, "statm"), "rb") as handle:
+            resident_pages = int(handle.read().split()[1])
+        rss = resident_pages * mmap.PAGESIZE
+    except (OSError, ValueError, IndexError):
+        rss = None
+    return ppid, rss
+
+
+def _generation_of(path: str) -> str | None:
+    return _or_none(lambda: runtime_generation.own_generation(path))
+
+
+def _superseded_of(path: str) -> bool | None:
+    return _or_none(lambda: runtime_generation.superseded(path))
+
+
+def _holder_generation(raw_args: list[str]) -> tuple[str | None, bool | None]:
+    """Generation of the first install path in argv; (None, None) when not derivable."""
+    for arg in raw_args:
+        generation = _generation_of(arg)
+        if generation is not None:
+            return generation, _superseded_of(arg)
+    return None, None
+
+
+def _holder_entry(
+    proc_root: str, name: str, targets: Mapping[str, str], own_uid: int, deadline: float
+) -> dict[str, Any] | None:
+    pid_dir = os.path.join(proc_root, name)
+    try:
+        if os.stat(pid_dir).st_uid != own_uid:
+            return None
+        fd_dir = os.path.join(pid_dir, "fd")
+        fds = os.listdir(fd_dir)
+    except OSError:
+        # PermissionError (not ours, or hidden) and FileNotFoundError (exited) skip this pid only.
+        return None
+    holds: set[str] = set()
+    for fd in fds:
+        if time.monotonic() > deadline:
+            # Budget spent mid-pid: keep the roles already seen; the caller marks truncated.
+            break
+        try:
+            role = targets.get(os.readlink(os.path.join(fd_dir, fd)))
+        except OSError:
+            continue
+        if role is not None:
+            holds.add(role)
+    if not holds:
+        return None
+    raw_args = _cmdline_args(pid_dir)
+    ppid, rss = _ppid_and_rss(pid_dir)
+    generation, superseded = _holder_generation(raw_args)
+    return {
+        "pid": int(name),
+        "ppid": ppid,
+        "cmdline": _masked_cmdline(raw_args)[:TASK_DB_HOLDERS_CMDLINE_CHARS],
+        "holds": [role for role in TASK_DB_HOLDER_ROLES if role in holds],
+        "runtime_generation": generation,
+        "superseded": superseded,
+        "rss_bytes": rss,
+    }
+
+
+def _scan_task_db_holders(proc_root: str, db_path: Path | None) -> dict[str, Any]:
+    from . import db_writer
+
+    db = os.path.realpath(db_path if db_path is not None else _task_db_path())
+    targets = {
+        db: "db",
+        db + "-wal": "wal",
+        db + "-shm": "shm",
+        str(db_writer.lock_path_for(db)): "writer_lock",
+    }
+    try:
+        pids = sorted(
+            (name for name in os.listdir(proc_root) if name.isdigit()), key=int
+        )
+    except OSError as exc:
+        return {
+            "supported": True,
+            "error": type(exc).__name__,
+            "entries": [],
+            "scanned_pids": 0,
+            "truncated": False,
+        }
+    own_uid = os.getuid()
+    deadline = time.monotonic() + TASK_DB_HOLDERS_BUDGET_SECONDS
+    entries: list[dict[str, Any]] = []
+    scanned = 0
+    truncated = False
+    for name in pids:
+        if (
+            scanned >= TASK_DB_HOLDERS_MAX_PIDS
+            or len(entries) >= TASK_DB_HOLDERS_MAX_ENTRIES
+            or time.monotonic() > deadline
+        ):
+            truncated = True
+            break
+        scanned += 1
+        entry = _holder_entry(proc_root, name, targets, own_uid, deadline)
+        if entry is not None:
+            entries.append(entry)
+    if time.monotonic() > deadline:
+        # The last pid's fd loop may have stopped on the budget; that scan is incomplete.
+        truncated = True
+    # truncated means the scan stopped early (entry, pid or time budget); scanned_pids counts pids read.
+    return {
+        "supported": True,
+        "entries": entries,
+        "scanned_pids": scanned,
+        "truncated": truncated,
+    }
+
+
+def task_db_holders(
+    proc_root: str | os.PathLike[str] = "/proc",
+    *,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    """Processes holding the canonical task DB, with their runtime generation.
+
+    Linux only; stdlib /proc reads of this user's processes. Never raises: an
+    unsupported platform or an unresolvable DB is reported as data.
+    """
+    if not platform_io.is_linux():
+        return {"supported": False, "reason": sys.platform}
+    try:
+        return _scan_task_db_holders(os.fspath(proc_root), db_path)
+    except Exception as exc:
+        return {
+            "supported": True,
+            "error": type(exc).__name__,
+            "entries": [],
+            "scanned_pids": 0,
+            "truncated": False,
+        }
