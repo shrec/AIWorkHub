@@ -64,12 +64,12 @@ _READONLY_STORAGE_MARKERS = (
 # The first statement that actually touches the database file. ``PRAGMA
 # query_only`` does not, so without this the read-only WAL failure surfaces on
 # the CALLER's first query -- long past the point where this helper could
-# still fall back. It is issued ONLY for a WAL-mode database, so every other
-# read-only open behaves exactly as it did before.
+# still fall back. It is issued on EVERY open (NF-2026-02130): deciding
+# whether to issue it used to read the database header with a plain
+# ``open()``, and on POSIX closing that descriptor released every fcntl lock
+# this process's live SQLite connections held on the file. SQLite is now the
+# only thing in this module that ever opens the database or its sidecars.
 _PROBE_SQL = "SELECT 1 FROM sqlite_master LIMIT 1"
-
-_SQLITE_HEADER_MAGIC = b"SQLite format 3\x00"
-_WAL_FORMAT_VERSION = 2
 
 
 class ReadonlyConnection(sqlite3.Connection):
@@ -117,20 +117,28 @@ def connect_readonly(path: str | Path, *, timeout: float = DEFAULT_TIMEOUT) -> s
     inconsistent rows or raise ``SQLITE_CORRUPT``. That is why the open is
     recorded on the connection and reported by callers (see
     :func:`fallback_mode`) rather than presented as a normal read.
+
+    NF-2026-02130: nothing here may open the database or its ``-wal``/``-shm``
+    sidecars outside SQLite. POSIX fcntl locks belong to the (process, inode)
+    pair, so closing ANY descriptor to the file -- even a 20-byte header read
+    -- silently releases the SHARED lock every live SQLite connection in this
+    process holds on it. A peer process then believes it is the last
+    connection, checkpoints and deletes ``-wal``/``-shm`` under those
+    connections (``disk I/O error``, or writes into an unlinked WAL). SQLite's
+    own VFS defers closing its descriptors while a lock is held, so the probe
+    query below, issued through SQLite on every open, is the only file access.
     """
 
     resolved = Path(path).resolve()
     base_uri = resolved.as_uri()
-    probe = _is_wal_mode(resolved)
     try:
-        return _open(f"{base_uri}?mode=ro", timeout=timeout, probe=probe, fallback=None)
+        return _open(f"{base_uri}?mode=ro", timeout=timeout, fallback=None)
     except sqlite3.Error as exc:
         if not _readonly_storage_failure(exc, resolved):
             raise
     return _open(
         f"{base_uri}?mode=ro&immutable=1",
         timeout=timeout,
-        probe=probe,
         fallback=FALLBACK_IMMUTABLE,
     )
 
@@ -149,39 +157,18 @@ def _sqlite_connect(uri: str, *, timeout: float) -> sqlite3.Connection:
     return sqlite3.connect(uri, uri=True, timeout=timeout, factory=ReadonlyConnection)
 
 
-def _open(
-    uri: str, *, timeout: float, probe: bool, fallback: str | None
-) -> sqlite3.Connection:
+def _open(uri: str, *, timeout: float, fallback: str | None) -> sqlite3.Connection:
     conn = _sqlite_connect(uri, timeout=timeout)
     opened = False
     try:
         conn.execute("PRAGMA query_only=ON")
-        if probe:
-            conn.execute(_PROBE_SQL).fetchone()
+        conn.execute(_PROBE_SQL).fetchone()
         opened = True
     finally:
         if not opened:
             conn.close()
     conn.readonly_fallback = fallback
     return conn
-
-
-def _is_wal_mode(db_path: Path) -> bool:
-    """Does ``db_path``'s 100-byte header declare WAL journalling?
-
-    Bytes 18 and 19 are the file-format read/write versions; ``2`` means WAL.
-    A plain 20-byte read, so the common non-WAL open pays nothing beyond it
-    and never runs the probe query or the writability checks below.
-    """
-
-    try:
-        with open(db_path, "rb") as handle:
-            header = handle.read(20)
-    except OSError:
-        return False
-    if len(header) < 20 or not header.startswith(_SQLITE_HEADER_MAGIC):
-        return False
-    return _WAL_FORMAT_VERSION in (header[18], header[19])
 
 
 def _readonly_storage_failure(exc: sqlite3.Error, db_path: Path) -> bool:
@@ -215,11 +202,24 @@ def _sidecar_state_unwritable(db_path: Path) -> bool:
 
 
 def _writable_file(path: Path) -> bool:
-    try:
-        with open(path, "r+b"):
-            return True
-    except OSError:
-        return False
+    """Is ``path`` readable and writable by this process, judged without opening it?
+
+    NF-2026-02130: this must never OPEN a sidecar. POSIX fcntl locks are per
+    (process, inode), so closing ANY descriptor to ``-wal``/``-shm`` releases
+    every lock this process's live SQLite connections hold on that file.
+    ``os.access`` asks the kernel and creates no descriptor at all.
+    """
+
+    if os.name == "nt":
+        # Windows byte-range locks belong to the handle that took them, so this
+        # probe drops none; and only an open sees an ACL deny (an AppContainer
+        # worker sandbox), which os.access misses: it checks the attribute only.
+        try:
+            with open(path, "r+b"):
+                return True
+        except OSError:
+            return False
+    return os.access(path, os.R_OK | os.W_OK)
 
 
 def _writable_directory(directory: Path) -> bool:

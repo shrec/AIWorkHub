@@ -180,19 +180,41 @@ def _block_spill_root(repo: Path) -> Path:
 # (A) the shared read-only open
 # ---------------------------------------------------------------------------
 
-def test_nf01162_wal_header_is_what_arms_the_read_only_probe(tmp_path: Path) -> None:
-    """The extra probe read is issued for WAL databases and nothing else."""
+def test_nf01162_read_only_probe_runs_for_wal_and_non_wal_alike(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe read is issued through SQLite on every open (NF-2026-02130).
+
+    It used to be armed only when a plain 20-byte ``open()`` of the header
+    said WAL; on POSIX closing that descriptor dropped every SQLite lock this
+    process held on the file. There is no header pre-read any more, so a
+    rollback-journal database and a WAL database run the same two statements.
+    """
+
+    assert not hasattr(sqlite_readonly, "_is_wal_mode")
 
     plain = tmp_path / "plain.db"
     _seed_memory_db(plain)
-    assert sqlite_readonly._is_wal_mode(plain) is False
-
-    header_says_wal = bytearray(plain.read_bytes())
-    header_says_wal[18] = 2
-    header_says_wal[19] = 2
     wal = tmp_path / "wal.db"
-    wal.write_bytes(bytes(header_says_wal))
-    assert sqlite_readonly._is_wal_mode(wal) is True
+    _seed_memory_db(wal)
+    con = sqlite3.connect(str(wal))
+    try:
+        assert con.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    finally:
+        con.close()
+
+    real_execute = sqlite_readonly.ReadonlyConnection.execute
+    for db in (plain, wal):
+        statements: list[str] = []
+
+        def recording(self, sql, *args, _sink=statements):
+            _sink.append(sql)
+            return real_execute(self, sql, *args)
+
+        with monkeypatch.context() as mp:
+            mp.setattr(sqlite_readonly.ReadonlyConnection, "execute", recording)
+            connect_readonly(db).close()
+        assert statements == ["PRAGMA query_only=ON", sqlite_readonly._PROBE_SQL], db.name
 
 
 def test_nf01162_sidecar_proof_is_required_before_any_fallback(tmp_path: Path) -> None:
