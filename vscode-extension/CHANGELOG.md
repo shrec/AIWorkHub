@@ -6,7 +6,7 @@
 
 ### Changed
 
-- Bundled runtime 0.12.90: much lower memory use. The plan snapshot, dashboard and workforce catalog read a narrow projection of each task card (one read peaks at about 160 MB instead of 1.5 GB), `needfix_list` no longer loads every card to show one page, the extension keeps one MCP server per owner and reaps it on dispose, and the process-ledger read uses a persisted checkpoint. The full list is in the repository CHANGELOG.
+- Bundled runtime 0.12.90: much lower memory use. The plan snapshot, dashboard and workforce catalog read a narrow projection of each task card (one read peaks at about 160 MB instead of 1.5 GB), `needfix_list` no longer loads every card to show one page, the reconciler's attribution pass no longer decodes every accepted card (about 90 MB instead of 1.5 GB per pass), the extension keeps one MCP server per owner and reaps it on dispose, and the process-ledger read uses a persisted checkpoint. The full list is in the repository CHANGELOG.
 
 ## 0.12.89 — 2026-11-06
 

@@ -28,6 +28,7 @@ unless you start the opt-in WorkHub Mail listener on a host and port you name.
 
 - Much less memory: the plan snapshot, dashboard and workforce catalog read a narrow projection of each task card instead of decoding every card, so one read peaks at about 160 MB instead of 1.5 GB.
 - `needfix_list` no longer holds every task card and NeedFix row in memory to show one page.
+- The reconciler's attribution pass reads only the accepted cards' receipts instead of decoding every card: about 90 MB instead of 1.5 GB per pass.
 - Fewer MCP server processes: the extension keeps one live server per owner across restarts and reaps it on dispose, instead of piling up 2-3 per window plus one per chat.
 - Faster idle housekeeping: the process-ledger read uses a persisted checkpoint, 0.55 s instead of 12.6 s.
 

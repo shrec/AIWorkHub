@@ -14,10 +14,12 @@ noted by package/extension version and release tag.
 - `needfix_list` derives each page from narrow rows instead of holding every task card and every NeedFix row in memory; one call peaked near 1 GB before (NF-2026-02112).
 - The VS Code extension keeps exactly one live MCP server per owner across restarts and reaps it on dispose, and the launcher starts the base interpreter instead of a venv redirector, so a host no longer accumulates 2-3 servers per window plus one per chat (NF-2026-02113).
 - A cold latest-by-request read of the process ledger uses a persisted, validated checkpoint of the immutable rotated archives instead of replaying all history, and the storage janitor's reconcile and GC share one read: 0.55 s instead of 12.6 s on the real ledger (NF-2026-02116).
+- The reconciler's attribution pass builds its accepted-card catalog from a narrow accepted-receipt projection of the accepted cards only, instead of decoding up to 5,000 whole cards: on the real store one pass peaks at 91 MB working set instead of 1,500 MB and leaves 51 MB resident instead of 514 MB (NF-2026-02118).
 
 ### Fixed
 
 - An isolated-reconcile test no longer asserts a 5 ms wall-clock ceiling that failed on the macOS CI runner and blocked the 0.12.89 release (NF-2026-02117).
+- The build-lane serialization test forces the two runs to overlap instead of assuming they do, so it no longer fails on a loaded machine (NF-2026-02119).
 
 ## [0.12.89] - 2026-11-06
 
