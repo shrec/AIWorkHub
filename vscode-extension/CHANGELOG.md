@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.12.92 — 2026-11-07
+
+### Fixed
+
+- Bundles runtime 0.12.92: on Linux and macOS a read-only task-database open no longer drops the process's SQLite locks (the intermittent `disk I/O error`), storage errors are named `canonical_db_unavailable:<SQLITE_*>`, `aiworkhub_doctor_diagnose` lists the processes holding the task database, and compaction no longer builds the database copy in memory.
+
 ## 0.12.91 — 2026-11-06
 
 ### Fixed

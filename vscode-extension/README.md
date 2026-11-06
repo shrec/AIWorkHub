@@ -24,15 +24,13 @@ MCP stdio runtime on the workspace host. It does not open a browser or require
 an AIWorkHub cloud account, and it binds no port and exposes no LAN service
 unless you start the opt-in WorkHub Mail listener on a host and port you name.
 
-## What's new in 0.12.91
+## What's new in 0.12.92
 
-- 0.12.91 publishes the 0.12.90 memory release: the 0.12.90 tag never got a GitHub release because one extension test failed CI on Linux and macOS. The runtime is the same.
-- Much less memory: the plan snapshot, dashboard and workforce catalog read a narrow projection of each task card instead of decoding every card, so one read peaks at about 160 MB instead of 1.5 GB.
-- `needfix_list` no longer holds every task card and NeedFix row in memory to show one page.
-- The reconciler's attribution pass reads only the accepted cards' receipts instead of decoding every card: about 90 MB instead of 1.5 GB per pass.
-- Fewer MCP server processes: the extension keeps one live server per owner across restarts and reaps it on dispose, instead of piling up 2-3 per window plus one per chat.
-- Faster idle housekeeping: the process-ledger read uses a persisted checkpoint, 0.55 s instead of 12.6 s.
-- The built-in Manager starts again on the `codex_cli` backend (GitHub #33), and the [callback docs](https://github.com/shrec/AIWorkHub/blob/main/docs/CALLBACKS.md#manager-transports) now say which chats are woken automatically: the built-in Manager and Claude Code are, a Codex sidebar chat is inbox-only.
+- Linux and macOS: no more intermittent task-database `disk I/O error`. A read-only open checked the live database and its `-wal`/`-shm` files with a plain `open()`/`close()`, which drops every POSIX lock the process holds; another connection could then delete the WAL under a live one. It now asks the kernel with `os.access` and opens no descriptor.
+- Storage errors say what they are: `canonical_db_unavailable:<SQLITE_*>` with the real SQLite error name, retried and never cached, instead of `canonical_schema_incomplete`; a failed card lookup in the write guard is `card_scoped_task_lookup_failed`, not `card_scoped_task_unresolved`.
+- `aiworkhub_doctor_diagnose` lists the processes holding the task database open (`task_db_holders`: pid, role, runtime generation, command line with secrets masked), so a stale server from an older install is easy to spot.
+- Task-database compaction builds its `VACUUM` copy on disk (`temp_store=FILE`) instead of in server memory.
+- Source Graph line lookups are O(log n) from a cached line index.
 
 ## Review automation
 

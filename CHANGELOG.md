@@ -6,6 +6,16 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.92] - 2026-11-07
+
+### Fixed
+
+- Linux and macOS: a read-only open of the task database no longer drops the process's own SQLite locks. A plain `open()`/`close()` of the live database or its `-wal`/`-shm` file released every POSIX lock the process held, so another connection could checkpoint and delete the WAL under a live one. That is the intermittent `disk I/O error`, the 0-byte `-wal` and the spurious `canonical_schema_incomplete` reported from a Linux host (NF-2026-02130).
+- A task-database storage error is reported as `canonical_db_unavailable:<SQLITE_*>` with the real SQLite error name; it is not cached and is retried, instead of being reported as `canonical_schema_incomplete`. The card-scoped write guard says `card_scoped_task_lookup_failed` (transient, with the error detail) when the lookup itself failed, instead of `card_scoped_task_unresolved` (NF-2026-02131).
+- `aiworkhub_doctor_diagnose` lists the processes that hold the task database open (`task_db_holders`: pid, role, runtime generation and a command line with secret values masked), read from Linux `/proc` (NF-2026-02133).
+- Task-database compaction runs `VACUUM` with `temp_store=FILE`, so the database copy is built on disk instead of in server memory (NF-2026-02132).
+- Source Graph maps a byte offset to its line number in O(log n) from a cached line index instead of rescanning the file for every match (NF-2026-02126).
+
 ## [0.12.91] - 2026-11-06
 
 ### Fixed
