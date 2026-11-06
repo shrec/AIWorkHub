@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.90] - 2026-11-06
+
+### Changed
+
+- `task_plan_snapshot`, the dashboard task-card window and the workforce catalog read a narrow SQLite projection of each card (every column plus only the card fields they use) instead of decoding every whole card. Measured on a 3,436-card store: one read peaks at 164 MB working set in 3.7 s instead of 1,486 MB in 10.6 s (NF-2026-02114).
+- `needfix_list` derives each page from narrow rows instead of holding every task card and every NeedFix row in memory; one call peaked near 1 GB before (NF-2026-02112).
+- The VS Code extension keeps exactly one live MCP server per owner across restarts and reaps it on dispose, and the launcher starts the base interpreter instead of a venv redirector, so a host no longer accumulates 2-3 servers per window plus one per chat (NF-2026-02113).
+- A cold latest-by-request read of the process ledger uses a persisted, validated checkpoint of the immutable rotated archives instead of replaying all history, and the storage janitor's reconcile and GC share one read: 0.55 s instead of 12.6 s on the real ledger (NF-2026-02116).
+
+### Fixed
+
+- An isolated-reconcile test no longer asserts a 5 ms wall-clock ceiling that failed on the macOS CI runner and blocked the 0.12.89 release (NF-2026-02117).
+
 ## [0.12.89] - 2026-11-06
 
 ### Added

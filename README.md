@@ -374,12 +374,12 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.89
+## What's new in 0.12.90
 
-- Clean cards can accept themselves: an opt-in auto-accept lane promotes a low- or medium-risk candidate whose gates are all green and whose reviewers found nothing; the manager still reviews everything else.
-- The Claude Code manager no longer forgets finished work: its turn cannot end while review cards wait or workers run without a callback watcher.
-- The task database stops growing with every card: finished cards' evidence is compacted, and retry finalization returns a receipt instead of blocking.
-- Fewer stuck reviews: finding reproduction has a deadline, dead review wakes are released, a refused reviewer fails over to the next provider, and automatic rework no longer uses up the reject budget.
+- Much less memory: the plan snapshot, dashboard and workforce catalog read a narrow projection of each task card instead of decoding every card, so one read peaks at about 160 MB instead of 1.5 GB.
+- `needfix_list` no longer holds every task card and NeedFix row in memory to show one page.
+- Fewer MCP server processes: the extension keeps one live server per owner across restarts and reaps it on dispose, instead of piling up 2-3 per window plus one per chat.
+- Faster idle housekeeping: the process-ledger read uses a persisted checkpoint, 0.55 s instead of 12.6 s.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Continuous Audit as a Service (CAAS)
