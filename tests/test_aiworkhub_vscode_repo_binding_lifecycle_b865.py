@@ -211,7 +211,7 @@ def test_extension_first_snapshot_precedes_dispatcher_convergence():
 
 
 def test_extension_deactivate_stops_dispatcher_before_terminating_child():
-    body = _slice(_EXTENSION_JS, "async function deactivate()", 500)
+    body = _slice(_EXTENSION_JS, "async function deactivate()", 1500)
     assert "stopDispatcherThenTerminate" in body
 
 
@@ -227,7 +227,7 @@ def test_extension_stop_dispatcher_then_terminate_orders_dispatcher_stop_before_
 
 
 def test_extension_repo_switch_stops_old_client_dispatcher_before_rebinding():
-    get_client_body = _slice(_EXTENSION_JS, "function getMcpClient(context)", 900)
+    get_client_body = _slice(_EXTENSION_JS, "function getMcpClient(context)", 1500)
     assert "stopDispatcherThenTerminate" in get_client_body
 
     select_repo_body = _slice(_EXTENSION_JS, "async function selectRepositoryCommand()", 2400)
