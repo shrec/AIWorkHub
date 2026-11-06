@@ -31,8 +31,13 @@ HOOK_REL = provider_tool_guards.CLAUDE_TOOL_GUARD_HOOK_REL
 SETTINGS_REL = provider_tool_guards.CLAUDE_SETTINGS_REL
 GUARD_COMMAND = provider_tool_guards.CLAUDE_TOOL_GUARD_COMMAND
 REMINDER_COMMAND = provider_tool_guards.CLAUDE_TOOL_GUARD_REMINDER_COMMAND
+STOP_COMMAND = provider_tool_guards.CLAUDE_TOOL_GUARD_STOP_COMMAND
 GUARD_MATCHER = "Bash|PowerShell|Read|Edit|Write"
-MANAGED_COMMANDS = {"PreToolUse": [GUARD_COMMAND], "SessionStart": [REMINDER_COMMAND]}
+MANAGED_COMMANDS = {
+    "PreToolUse": [GUARD_COMMAND],
+    "SessionStart": [REMINDER_COMMAND],
+    "Stop": [STOP_COMMAND],
+}
 DENIALS_REL = Path(".aiworkhub", "runtime", "tool_guard", "denials.jsonl")
 
 _CORE = "".join(f"def function_{index}():\n    return {index}\n" for index in range(30))
@@ -363,7 +368,7 @@ def test_the_settings_commands_are_inert_without_the_script(tmp_path: Path) -> N
     (project / "src" / "x.py").write_bytes(b"foo = 1\n")
     payload = _payload(project, "Bash", "grep -rn foo src")
 
-    for command in (GUARD_COMMAND, REMINDER_COMMAND):
+    for command in (GUARD_COMMAND, REMINDER_COMMAND, STOP_COMMAND):
         result = _run(_settings_argv(command), project, payload)
         assert (result.returncode, result.stdout) == (0, b""), result.stderr
 
@@ -383,6 +388,10 @@ def test_the_settings_commands_run_the_installed_script(repo: Path) -> None:
     assert reminder.returncode == 0, reminder.stderr
     text = reminder.stdout.decode("utf-8").replace("\r\n", "\n")
     assert text == tool_guard_hook.REMINDER + "\n"
+
+    # No task queue in this repository: the Stop guard allows, silently.
+    stop = _run(_settings_argv(STOP_COMMAND), repo, b'{"session_id": "s", "cwd": "."}')
+    assert (stop.returncode, stop.stdout) == (0, b""), stop.stderr
 
 
 def test_the_hook_module_imports_only_the_standard_library() -> None:
@@ -439,6 +448,7 @@ def test_the_merge_replaces_managed_hooks_in_place_and_keeps_owner_hooks(
                 ],
                 "SessionStart": [{"matcher": "startup", "hooks": [hook("echo start")]}],
                 "PostToolUse": [{"matcher": "Edit", "hooks": [hook("echo post")]}],
+                "Stop": [{"matcher": "", "hooks": [hook("echo owner stop")]}],
             },
         }),
         encoding="utf-8",
@@ -456,6 +466,11 @@ def test_the_merge_replaces_managed_hooks_in_place_and_keeps_owner_hooks(
         "PreToolUse": ["echo owner", GUARD_COMMAND, "echo mixed"],
         "SessionStart": ["echo start", REMINDER_COMMAND],
         "PostToolUse": ["echo post"],
+        "Stop": ["echo owner stop", STOP_COMMAND],
+    }
+    assert settings["hooks"]["Stop"][1] == {
+        "matcher": "",
+        "hooks": [{"type": "command", "command": STOP_COMMAND, "timeout": 10}],
     }
     pre_tool_use = settings["hooks"]["PreToolUse"]
     assert [row["matcher"] for row in pre_tool_use] == ["Bash", GUARD_MATCHER, "Write"]

@@ -27,6 +27,18 @@
         ],
         "matcher": "compact"
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "python -c \"import os,runpy,sys;p=os.path.join(os.environ.get('CLAUDE_PROJECT_DIR') or os.getcwd(),'.claude','hooks','aiworkhub_tool_guard.py');sys.argv=[p,'--stop'];os.path.isfile(p) and runpy.run_path(p,run_name='__main__')\"",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
     ]
   },
   "permissions": {

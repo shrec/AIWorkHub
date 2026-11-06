@@ -71,8 +71,49 @@ def test_repository_guards_preserve_owner_content_and_are_idempotent(tmp_path: P
     assert commands == {
         "PreToolUse": [provider_tool_guards.CLAUDE_TOOL_GUARD_COMMAND],
         "SessionStart": [provider_tool_guards.CLAUDE_TOOL_GUARD_REMINDER_COMMAND],
+        "Stop": [provider_tool_guards.CLAUDE_TOOL_GUARD_STOP_COMMAND],
     }
     assert ".claude/hooks/aiworkhub_tool_guard.py" in first["changed"]
+
+
+def test_stop_guard_row_is_installed_once_and_replaced_in_place(tmp_path: Path) -> None:
+    """NF-2026-02110: the managed Stop row is idempotent and keeps owner Stop hooks."""
+
+    stop_command = provider_tool_guards.CLAUDE_TOOL_GUARD_STOP_COMMAND
+    assert "'--stop'" in stop_command
+    settings_path = tmp_path / ".claude" / "settings.json"
+    settings_path.parent.mkdir()
+    stale = "python .claude/hooks/aiworkhub_tool_guard.py --stop --old"
+    settings_path.write_text(
+        json.dumps({
+            "hooks": {
+                "Stop": [
+                    {"matcher": "", "hooks": [{"type": "command", "command": "echo owner"}]},
+                    {"matcher": "", "hooks": [{"type": "command", "command": stale}]},
+                ],
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    provider_tool_guards.apply_repository_guards(tmp_path)
+    text = settings_path.read_text(encoding="utf-8")
+    second = provider_tool_guards.apply_repository_guards(tmp_path)
+
+    assert second["changed"] == []
+    assert settings_path.read_text(encoding="utf-8") == text
+    stop_rows = json.loads(text)["hooks"]["Stop"]
+    assert [hook["command"] for row in stop_rows for hook in row["hooks"]] == [
+        "echo owner",
+        stop_command,
+    ]
+    managed = [row for row in stop_rows if row["hooks"][0]["command"] == stop_command]
+    assert managed == [
+        {
+            "matcher": "",
+            "hooks": [{"type": "command", "command": stop_command, "timeout": 10}],
+        }
+    ]
 
 
 def test_corrupt_claude_settings_fail_closed(tmp_path: Path) -> None:

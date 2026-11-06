@@ -37,6 +37,9 @@ CLAUDE_TOOL_GUARD_COMMAND = 'python -c "' + _TOOL_GUARD_LOCATE + _TOOL_GUARD_RUN
 CLAUDE_TOOL_GUARD_REMINDER_COMMAND = (
     'python -c "' + _TOOL_GUARD_LOCATE + "sys.argv=[p,'--reminder'];" + _TOOL_GUARD_RUN + '"'
 )
+CLAUDE_TOOL_GUARD_STOP_COMMAND = (
+    'python -c "' + _TOOL_GUARD_LOCATE + "sys.argv=[p,'--stop'];" + _TOOL_GUARD_RUN + '"'
+)
 
 
 class ProviderGuardError(RuntimeError):
@@ -161,6 +164,8 @@ def _tool_guard_hook_rows() -> tuple[tuple[str, dict[str, Any]], ...]:
     return (
         ("PreToolUse", row(_TOOL_GUARD_MATCHER, CLAUDE_TOOL_GUARD_COMMAND)),
         ("SessionStart", row("compact", CLAUDE_TOOL_GUARD_REMINDER_COMMAND)),
+        # The direct-chat manager's mechanical wake (NF-2026-02110).
+        ("Stop", row("", CLAUDE_TOOL_GUARD_STOP_COMMAND)),
     )
 
 
@@ -374,6 +379,7 @@ __all__ = [
     "CLAUDE_TOOL_GUARD_COMMAND",
     "CLAUDE_TOOL_GUARD_HOOK_REL",
     "CLAUDE_TOOL_GUARD_REMINDER_COMMAND",
+    "CLAUDE_TOOL_GUARD_STOP_COMMAND",
     "ProviderGuardError",
     "apply_repository_guards",
     "apply_workspace_guards",

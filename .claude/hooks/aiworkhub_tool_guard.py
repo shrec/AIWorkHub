@@ -34,6 +34,15 @@ A path that resolves outside the repository root is never an R1-R7 target.
 
 R6 and R7 leave ``.git`` and ``.aiworkhub`` alone: VCS and runtime state is not
 source the semantic editor can take over.
+
+``--stop`` is the direct-chat manager's Stop hook (NF-2026-02110). It reads the
+task queue read-only and blocks the stop -- one ``{"decision": "block"}``
+object, exit 0 -- while a card this session dispatched (its
+``origin_thread_id`` is the hook's ``session_id``) awaits a review decision, or
+is processing with no live ``manager_callback_watch`` heartbeat for the
+session. It fails open: ``stop_hook_active``, a missing or foreign database and
+any error all allow the stop. ``--reminder`` prints the post-compaction
+reminder.
 """
 
 from __future__ import annotations
@@ -43,6 +52,7 @@ import fnmatch
 import json
 import os
 import re
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -825,6 +835,21 @@ def _like_prefix(rel: str) -> str:
     return escaped + "/%"
 
 
+def _connect_readonly_db(path: Path, timeout: float) -> sqlite3.Connection:
+    """Open ``path`` read-only through an SQLite ``mode=ro`` URI.
+
+    The one SQLite open in this hook: Source Graph membership and the Stop
+    guard's task-queue read share it, so neither can write or create a file.
+    """
+    conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=timeout)
+    try:
+        conn.execute("PRAGMA query_only = ON")
+    except sqlite3.Error:
+        conn.close()
+        raise
+    return conn
+
+
 class SourceGraphMembership:
     """Source Graph's own answer to "is this path indexed?", read-only.
 
@@ -850,13 +875,10 @@ class SourceGraphMembership:
         try:
             if not self.path.is_file():
                 return None
-            conn = sqlite3.connect(
-                self.path.as_uri() + "?mode=ro", uri=True, timeout=_SOURCE_GRAPH_BUSY_SECONDS
-            )
+            conn = _connect_readonly_db(self.path, _SOURCE_GRAPH_BUSY_SECONDS)
         except (sqlite3.Error, OSError, ValueError):
             return None
         try:
-            conn.execute("PRAGMA query_only = ON")
             # A generation exists once a build has published ``meta.last_build``.
             if conn.execute("SELECT 1 FROM meta WHERE key = 'last_build'").fetchone() is None:
                 conn.close()
@@ -1794,6 +1816,291 @@ def _record_denial(root: str, rule: str, tool: object, target: str, session_id: 
         pass
 
 
+# --- Stop guard: the direct-chat manager's mechanical wake (NF-2026-02110) ---
+
+TASK_QUEUE_DB_PARTS = (".aiworkhub", "tasking", "task_queue.sqlite")
+MANAGER_WATCH_PARTS = (".aiworkhub", "runtime", "manager_watch")
+STOP_REVIEW_STATUSES = ("review", "review_ready")
+STOP_PROCESSING_STATUSES = ("processing",)
+STOP_REASON_MAX_CHARS = 1200
+STOP_LISTED_TASKS_MAX = 10
+HEARTBEAT_STALE_FACTOR = 3.0
+_TASK_QUEUE_BUSY_SECONDS = 0.25
+_HEARTBEAT_MAX_BYTES = 4096
+_HEARTBEAT_MAX_INTERVAL = 86400.0
+_CARD_JSON_MAX_CHARS = 1024 * 1024
+_SESSION_ID_MAX_CHARS = 128
+_SESSION_ID_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
+_PLAIN_SHELL_ARG = re.compile(r"^[A-Za-z0-9._:/=-]+$")
+_TASK_COLUMNS_REQUIRED = frozenset({"task_id", "status", "card_json"})
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_STILL_ACTIVE = 259
+_ERROR_INVALID_PARAMETER = 87
+
+
+def manager_watch_heartbeat_path(root: str | Path, session_id: object) -> Path | None:
+    """The heartbeat file ``manager_callback_watch`` keeps for ``session_id``.
+
+    The single owner of the path: the watcher writes it and the Stop guard
+    reads it. ``session_id`` is reduced to ``[A-Za-z0-9._-]``; an empty or
+    all-dot result has no heartbeat path.
+    """
+
+    if not isinstance(session_id, str):
+        return None
+    name = _SESSION_ID_UNSAFE.sub("_", session_id.strip())[:_SESSION_ID_MAX_CHARS]
+    if not name.strip("."):
+        return None
+    return Path(root).joinpath(*MANAGER_WATCH_PARTS, name + ".json")
+
+
+def _windows_pid_alive(ctypes_module: object, windll: object, pid: int) -> bool:
+    kernel32 = windll("kernel32", use_last_error=True)  # type: ignore[operator]
+    c_void_p = getattr(ctypes_module, "c_void_p")
+    c_uint32 = getattr(ctypes_module, "c_uint32")
+    kernel32.OpenProcess.restype = c_void_p
+    kernel32.OpenProcess.argtypes = (c_uint32, getattr(ctypes_module, "c_int"), c_uint32)
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        get_last_error = getattr(ctypes_module, "get_last_error", None)
+        error = get_last_error() if callable(get_last_error) else 0
+        # Access denied (5) means the process exists; only "no such process"
+        # (87) is dead. Anything unknown is alive: the guard fails open.
+        return error != _ERROR_INVALID_PARAMETER
+    try:
+        code = c_uint32()
+        kernel32.GetExitCodeProcess.argtypes = (
+            c_void_p,
+            getattr(ctypes_module, "POINTER")(c_uint32),
+        )
+        if not kernel32.GetExitCodeProcess(handle, getattr(ctypes_module, "byref")(code)):
+            return True
+        return bool(code.value == _STILL_ACTIVE)
+    finally:
+        kernel32.CloseHandle.argtypes = (c_void_p,)
+        kernel32.CloseHandle(handle)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether ``pid`` names a running process; unknown means alive (fail open).
+
+    Windows is detected by capability, ``ctypes.WinDLL``, and probed with
+    OpenProcess/GetExitCodeProcess: there ``os.kill(pid, 0)`` would terminate
+    the process. Elsewhere signal 0 only checks existence.
+    """
+
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        import ctypes
+    except Exception:
+        return True
+    windll = getattr(ctypes, "WinDLL", None)
+    try:
+        if windll is not None:
+            return _windows_pid_alive(ctypes, windll, pid)
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except Exception:
+        return True
+    return True
+
+
+def _heartbeat_live(path: Path | None, now: datetime) -> bool:
+    """A heartbeat is live when it parses, is younger than 3x its poll interval
+    and names a running process. Anything else counts as no watcher."""
+
+    if path is None:
+        return False
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(_HEARTBEAT_MAX_BYTES + 1)
+        if len(raw) > _HEARTBEAT_MAX_BYTES:
+            return False
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    pid = data.get("pid")
+    interval = data.get("poll_interval")
+    updated_at = data.get("updated_at")
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        return False
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)):
+        return False
+    if not 0 < float(interval) <= _HEARTBEAT_MAX_INTERVAL:
+        return False
+    if not isinstance(updated_at, str):
+        return False
+    try:
+        stamp = datetime.fromisoformat(updated_at.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    if (now - stamp).total_seconds() > HEARTBEAT_STALE_FACTOR * float(interval):
+        return False
+    return _pid_alive(pid)
+
+
+def _card_origin(card_json: object) -> str | None:
+    if not isinstance(card_json, str) or len(card_json) > _CARD_JSON_MAX_CHARS:
+        return None
+    try:
+        card = json.loads(card_json)
+    except ValueError:
+        return None
+    origin = card.get("origin_thread_id") if isinstance(card, dict) else None
+    return origin if isinstance(origin, str) else None
+
+
+def _session_tasks(
+    conn: sqlite3.Connection, session_id: str
+) -> tuple[list[str], list[str]] | None:
+    """(review task ids, processing task ids) this session dispatched.
+
+    Reads only rows the ``status`` index selects; ``card_json`` is parsed only
+    for a row whose ``origin_thread_id`` column is empty. None: not a task
+    queue this guard understands.
+    """
+
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(tasks)")}
+    if not _TASK_COLUMNS_REQUIRED <= columns:
+        return None
+    statuses = STOP_REVIEW_STATUSES + STOP_PROCESSING_STATUSES
+    params: list[str] = list(statuses)
+    if "origin_thread_id" in columns:
+        select = (
+            "origin_thread_id, CASE WHEN COALESCE(origin_thread_id, '') = '' "
+            "THEN card_json END"
+        )
+        session_filter = " AND (origin_thread_id = ? OR COALESCE(origin_thread_id, '') = '')"
+        params.append(session_id)
+    else:
+        select = "NULL, card_json"
+        session_filter = ""
+    archived = " AND COALESCE(archived_at, '') = ''" if "archived_at" in columns else ""
+    sql = (
+        f"SELECT task_id, status, {select} FROM tasks "
+        f"WHERE status IN ({','.join('?' * len(statuses))}){session_filter}{archived} "
+        "ORDER BY task_id"
+    )
+    review: list[str] = []
+    processing: list[str] = []
+    for task_id, status, origin, card_json in conn.execute(sql, params):
+        owner = origin if isinstance(origin, str) and origin else _card_origin(card_json)
+        if owner != session_id:
+            continue
+        bucket = review if str(status) in STOP_REVIEW_STATUSES else processing
+        bucket.append(str(task_id))
+    return review, processing
+
+
+def _shell_arg(value: str) -> str:
+    if _PLAIN_SHELL_ARG.match(value):
+        return value
+    return shlex.quote(value)
+
+
+def _listed(task_ids: list[str]) -> str:
+    shown = ", ".join(_clip(task_id, 80) for task_id in task_ids[:STOP_LISTED_TASKS_MAX])
+    extra = len(task_ids) - STOP_LISTED_TASKS_MAX
+    return shown + (f" (+{extra} more)" if extra > 0 else "")
+
+
+def manager_watch_command(root: str | Path, session_id: str) -> str:
+    """The exact watcher command the Stop guard asks the manager to start."""
+
+    project = Path(root)
+    python = "python"
+    for candidate in (
+        project / ".venv" / "Scripts" / "python.exe",
+        project / ".venv" / "bin" / "python",
+    ):
+        if candidate.is_file():
+            python = candidate.as_posix()
+            break
+    return " ".join(
+        (
+            _shell_arg(python),
+            "-m aiworkhub.manager_callback_watch",
+            "--repo",
+            _shell_arg(project.as_posix()),
+            "--provider claude",
+            "--origin-thread-id",
+            _shell_arg(session_id),
+            "--timeout 86400",
+        )
+    )
+
+
+def stop_decision(payload: object, root: str | Path) -> str | None:
+    """The block reason for a manager Stop, or None to allow it.
+
+    Fails open: ``stop_hook_active``, no session id, a missing database, a
+    schema this guard does not know and any SQLite or OS error allow the stop.
+    """
+
+    if not isinstance(payload, dict) or payload.get("stop_hook_active"):
+        return None
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None
+    db_path = Path(root).joinpath(*TASK_QUEUE_DB_PARTS)
+    try:
+        if not db_path.is_file():
+            return None
+        conn = _connect_readonly_db(db_path, _TASK_QUEUE_BUSY_SECONDS)
+        try:
+            tasks = _session_tasks(conn, session_id)
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError, ValueError):
+        return None
+    if tasks is None:
+        return None
+    review, processing = tasks
+    if review:
+        reason = (
+            f"AIWorkHub: {len(review)} card(s) this session dispatched await your review "
+            f"decision: {_listed(review)}. Claim them with aiworkhub_claude_callback_wait, "
+            "decide each card, then ack the callback before stopping."
+        )
+        return _clip(reason, STOP_REASON_MAX_CHARS)
+    if not processing:
+        return None
+    heartbeat = manager_watch_heartbeat_path(root, session_id)
+    if _heartbeat_live(heartbeat, datetime.now(timezone.utc)):
+        return None
+    reason = (
+        f"AIWorkHub: card(s) this session dispatched are processing ({_listed(processing)}) "
+        "and no live callback watcher wakes you when they finish. Start it in the "
+        f"background, then stop: {manager_watch_command(root, session_id)}"
+    )
+    return _clip(reason, STOP_REASON_MAX_CHARS)
+
+
+def _stop_main() -> int:
+    """``--stop``: print one Stop-hook block decision or nothing; always 0."""
+
+    try:
+        payload = _read_payload()
+        cwd = payload.get("cwd") if isinstance(payload, dict) else None
+        root = os.environ.get("CLAUDE_PROJECT_DIR") or (cwd if isinstance(cwd, str) else "")
+        reason = stop_decision(payload, root or os.getcwd())
+        if reason is None:
+            return 0
+        sys.stdout.write(json.dumps({"decision": "block", "reason": reason}) + "\n")
+        sys.stdout.flush()
+    except Exception:
+        return 0
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Hook entry point. Always returns 0 so a guard failure never blocks a tool call."""
 
@@ -1803,6 +2110,8 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.write(REMINDER + "\n")
             sys.stdout.flush()
             return 0
+        if "--stop" in args:
+            return _stop_main()
         payload = _read_payload()
         if not isinstance(payload, dict):
             return 0
@@ -1830,20 +2139,30 @@ def main(argv: list[str] | None = None) -> int:
 __all__ = [
     "DEFAULT_EXCLUDE_GLOBS",
     "EXCLUDED_DIRS",
+    "HEARTBEAT_STALE_FACTOR",
     "INDEXED_SUFFIXES",
     "IndexPolicy",
+    "MANAGER_WATCH_PARTS",
     "REASON_MAX_CHARS",
     "REMINDER",
     "REMINDER_MAX_BYTES",
     "SCRATCH_DIR",
     "SOURCE_GRAPH_DB_PARTS",
+    "STOP_LISTED_TASKS_MAX",
+    "STOP_PROCESSING_STATUSES",
+    "STOP_REASON_MAX_CHARS",
+    "STOP_REVIEW_STATUSES",
     "SourceGraphMembership",
+    "TASK_QUEUE_DB_PARTS",
     "UNINDEXED_STATUSES",
     "decide",
     "glob_ignored",
     "index_admits",
     "load_index_policy",
     "main",
+    "manager_watch_command",
+    "manager_watch_heartbeat_path",
+    "stop_decision",
     "under_include_root",
 ]
 
