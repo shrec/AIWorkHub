@@ -1997,6 +1997,121 @@ function sanitizeWebviewPayload(value) {
   return value;
 }
 
+// NF-2026-02113: bounded deactivate budget for the best-effort dispatcher /
+// daemon stop requests that precede each owner's child tree kill.
+const MCP_DEACTIVATE_STOP_TIMEOUT_MS = 1500;
+
+// Resolve when `promise` settles or after `timeoutMs`, whichever is first.
+// Bounds a best-effort owner shutdown from the caller's side; a child that
+// outlives the bound is still killed by terminateAllOwnedMcpChildren().
+function settleWithin(promise, timeoutMs) {
+  let timer = null;
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(resolve, timeoutMs);
+    if (timer && typeof timer.unref === "function") timer.unref();
+  });
+  return Promise.race([Promise.resolve(promise).catch(() => {}), deadline])
+    .finally(() => clearTimeout(timer));
+}
+
+// Every live `-m aiworkhub.server` child this extension host spawned, mapped
+// to its owning McpStdioClient. Bounded by the owner count (dashboard, LM
+// worker bridge, manager loop) because an owner replaces its child before it
+// spawns another; an entry leaves on the child's own exit event.
+const liveOwnedMcpChildren = new Map();
+let ownedMcpChildExitHookInstalled = false;
+
+function mcpChildIsRunning(candidate) {
+  // Loose null check on purpose: a live ChildProcess reports null for both,
+  // an exited one reports a number/signal name.
+  return Boolean(candidate) && candidate.exitCode == null && candidate.signalCode == null;
+}
+
+// Terminate one spawned server child and, on Windows, its whole process tree
+// (py.exe -> python.exe, venv redirector -> python.exe).
+function treeKillMcpChild(candidate) {
+  if (!candidate) return false;
+  const ownedPid = candidate.pid;
+  // A pid identifies our child ONLY while that child is still running.
+  // Once it exits, Windows is free to hand the same pid to any new
+  // process, and `taskkill /T` kills the target *plus every descendant* --
+  // so a recycled pid would destroy an unrelated process tree. If that
+  // stranger happens to sit above this extension host, the host dies with
+  // it, taking every other extension in the window along. Node still owns
+  // the process handle, so exitCode/signalCode are the authoritative
+  // "is this pid still mine" answer; an already-exited child needs no
+  // tree kill anyway. Anything that exposes neither field is treated as
+  // live, so this never silently skips a termination it used to perform.
+  const childStillRunning = mcpChildIsRunning(candidate);
+  if (
+    process.platform === "win32"
+    && childStillRunning
+    && Number.isInteger(ownedPid)
+    && ownedPid > 1
+  ) {
+    try {
+      // NF-2026-01644: only the exit status is read, so no stdio pipes. Inside
+      // a Windows AppContainer libuv's named-pipe creation is denied and retried
+      // forever, so a pipe-stdio spawnSync never returns and its timeout never fires.
+      const result = childProcess.spawnSync(
+        "taskkill",
+        ["/PID", String(ownedPid), "/T", "/F"],
+        { windowsHide: true, stdio: "ignore", timeout: 5000 },
+      );
+      if (!result.error && result.status === 0) return true;
+    } catch (_err) {
+      // Fall through to Node's exact-child termination below.
+    }
+  }
+  if (!candidate.killed) {
+    try {
+      candidate.kill();
+    } catch (_err) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function registerOwnedMcpChild(child, owner) {
+  if (!child || !child.pid) return;
+  liveOwnedMcpChildren.set(child, owner);
+  child.once("exit", () => liveOwnedMcpChildren.delete(child));
+  if (!ownedMcpChildExitHookInstalled) {
+    ownedMcpChildExitHookInstalled = true;
+    // A host that exits without (or before finishing) deactivate still owns
+    // live pipes to these children; tree-kill them synchronously on exit.
+    process.once("exit", () => terminateAllOwnedMcpChildren("host_exit"));
+  }
+}
+
+// Number of spawned server children still running, optionally for one owner.
+function liveOwnedMcpChildCount(owner) {
+  let count = 0;
+  for (const [child, childOwner] of liveOwnedMcpChildren) {
+    if (owner && childOwner !== owner) continue;
+    if (mcpChildIsRunning(child)) count += 1;
+  }
+  return count;
+}
+
+// Tree-kill every still-running child; returns how many were terminated.
+function terminateAllOwnedMcpChildren(reason = "sweep") {
+  let terminated = 0;
+  for (const [child, owner] of Array.from(liveOwnedMcpChildren)) {
+    if (!mcpChildIsRunning(child)) {
+      liveOwnedMcpChildren.delete(child);
+      continue;
+    }
+    const owned = owner && typeof owner._ownsChild === "function" && owner._ownsChild(child);
+    if (owned ? owner._terminateOwnedChild(child) : treeKillMcpChild(child)) terminated += 1;
+  }
+  if (terminated > 0) {
+    debugTrace("mcp.child.sweep", { reason: String(reason).slice(0, 40), terminated });
+  }
+  return terminated;
+}
+
 // Real out-of-process stdio JSON-RPC client for exactly one
 // `python3 -m aiworkhub.server` child. Mirrors the initialize ->
 // notifications/initialized -> tools/call handshake the repo's own
@@ -2015,6 +2130,9 @@ class McpStdioClient {
     this.child = null;
     this.lifecycleChild = null;
     this.lifecyclePid = null;
+    // Bumped by every terminal stop(); a startup captured under an older
+    // epoch aborts before it spawns (see _assertStartEpoch).
+    this._stopEpoch = 0;
     this.buffer = "";
     this.stdoutDecoder = new StringDecoder("utf8");
     this.nextId = 1;
@@ -2148,50 +2266,8 @@ class McpStdioClient {
 
   _terminateOwnedChild(candidate) {
     if (!this._ownsChild(candidate)) return false;
-    const ownedPid = candidate.pid;
     this._clearLifecycleOwnership(candidate);
-    // A pid identifies our child ONLY while that child is still running.
-    // Once it exits, Windows is free to hand the same pid to any new
-    // process, and `taskkill /T` kills the target *plus every descendant* --
-    // so a recycled pid would destroy an unrelated process tree. If that
-    // stranger happens to sit above this extension host, the host dies with
-    // it, taking every other extension in the window along. Node still owns
-    // the process handle, so exitCode/signalCode are the authoritative
-    // "is this pid still mine" answer; an already-exited child needs no
-    // tree kill anyway.
-    // Loose null check on purpose: a live ChildProcess reports null for both,
-    // an exited one reports a number/signal name. Anything that exposes
-    // neither field is treated as live, so this never silently skips a
-    // termination it used to perform.
-    const childStillRunning = candidate.exitCode == null && candidate.signalCode == null;
-    if (
-      process.platform === "win32"
-      && childStillRunning
-      && Number.isInteger(ownedPid)
-      && ownedPid > 1
-    ) {
-      try {
-        // NF-2026-01644: only the exit status is read, so no stdio pipes. Inside
-        // a Windows AppContainer libuv's named-pipe creation is denied and retried
-        // forever, so a pipe-stdio spawnSync never returns and its timeout never fires.
-        const result = childProcess.spawnSync(
-          "taskkill",
-          ["/PID", String(ownedPid), "/T", "/F"],
-          { windowsHide: true, stdio: "ignore", timeout: 5000 },
-        );
-        if (!result.error && result.status === 0) return true;
-      } catch (_err) {
-        // Fall through to Node's exact-child termination below.
-      }
-    }
-    if (!candidate.killed) {
-      try {
-        candidate.kill();
-      } catch (_err) {
-        return false;
-      }
-    }
-    return true;
+    return treeKillMcpChild(candidate);
   }
 
   get running() {
@@ -2221,19 +2297,31 @@ class McpStdioClient {
     }
     const barrier = this.startupBarrier;
     this.startupBarrier = null;
+    // Captured before the barrier: a terminal stop() while waiting on the
+    // previous owner's shutdown cancels this start instead of racing it.
+    const stopEpoch = this._stopEpoch;
     const startOperation = barrier
-      ? Promise.resolve(barrier).catch(() => {}).then(() => this._startWithVersionRepair())
-      : this._startWithVersionRepair();
-    this.startingPromise = startOperation.finally(() => {
-      this.startingPromise = null;
+      ? Promise.resolve(barrier).catch(() => {}).then(() => this._startWithVersionRepair(stopEpoch))
+      : this._startWithVersionRepair(stopEpoch);
+    // Clear only this start's own promise: a terminal stop() may already have
+    // dropped it and a fresh start may own the slot by the time this settles.
+    const pending = startOperation.finally(() => {
+      if (this.startingPromise === pending) this.startingPromise = null;
     });
-    return this.startingPromise;
+    this.startingPromise = pending;
+    return pending;
   }
 
-  async _startWithVersionRepair() {
+  _assertStartEpoch(stopEpoch) {
+    if (stopEpoch !== this._stopEpoch) {
+      throw new Error("mcp_stopped_during_startup");
+    }
+  }
+
+  async _startWithVersionRepair(stopEpoch = this._stopEpoch) {
     for (;;) {
       try {
-        await this._start();
+        await this._start(stopEpoch);
         return;
       } catch (err) {
         const message = sanitizeErrorMessage(err);
@@ -2258,7 +2346,7 @@ class McpStdioClient {
     }
   }
 
-  async _start() {
+  async _start(stopEpoch = this._stopEpoch) {
     // A VSIX can be reinstalled in place without reactivating this extension
     // host. Converge its packaged bytes and current pointer before any owned
     // MCP child starts; the existing materializer publishes atomically.
@@ -2285,16 +2373,23 @@ class McpStdioClient {
         this.outputChannel.appendLine(`[runtime] using immutable generation ${path.basename(stableRuntime.generationRoot)}`);
       }
     }
+    this._assertStartEpoch(stopEpoch);
     const previousChild = this.child;
     const previouslyOwnedChild = this.lifecycleChild;
-    if (previousChild && !previousChild.killed) {
+    // NF-2026-02113: a still-owned child is replaced even when `this.child`
+    // was already cleared, so a reconnect never leaves the prior server alive.
+    if ((previousChild && !previousChild.killed) || previouslyOwnedChild) {
       this.outputChannel.appendLine("[mcp] replacing non-ready child before reconnect");
-      this._failPendingForChild(previousChild, new Error("mcp_reconnect_replaced_non_ready_child"));
+      this._failPendingForChild(previousChild || previouslyOwnedChild, new Error("mcp_reconnect_replaced_non_ready_child"));
       this.child = null;
       this._terminateOwnedChild(previouslyOwnedChild);
     }
     const root = this.repositoryRoot;
     const python = await findPythonCommandForLaunch(root);
+    // The interpreter preflight can take many seconds on Windows. A terminal
+    // stop() during that wait (deactivate, repository switch, dispose) must
+    // win: spawning now would create a server no owner would ever reap.
+    this._assertStartEpoch(stopEpoch);
     this._lastPythonResult = python;
     const runtimeDir = extensionRuntimeDir;
     const env = {
@@ -2389,6 +2484,7 @@ class McpStdioClient {
     });
     this.child = child;
     this.lifecycleChild = child;
+    registerOwnedMcpChild(child, this);
     trackStableRuntimeChild(child, runtimeDir);
     child.once("exit", () => releaseStableRuntimeChild(child));
     // A failed spawn has no process to protect and may emit error without exit.
@@ -2880,6 +2976,15 @@ class McpStdioClient {
   stop({ restart = false } = {}) {
     this._clearRecoveryTimer();
     this.intentionalStop = !restart;
+    // NF-2026-02113: a terminal stop fences every startup already past
+    // ensureStarted(): it must not spawn a server after its owner let go.
+    // The doomed start keeps running until it observes the new epoch; drop
+    // its promise now so a later ensureStarted() begins a fresh start instead
+    // of joining one that will reject with mcp_stopped_during_startup.
+    if (!restart) {
+      this._stopEpoch += 1;
+      this.startingPromise = null;
+    }
     const child = this.lifecycleChild;
     this.child = null;
     this.initialized = false;
@@ -8839,6 +8944,10 @@ def current_runtime_dir(root):
 
 
 def serve_runtime(runtime_dir):
+    # The venv hand-off variable from serve_command() has already selected
+    # this interpreter's prefix; a subprocess the server starts must not
+    # inherit it, or a "py -3" / worker python would resolve the venv prefix.
+    os.environ.pop("__PYVENV_LAUNCHER__", None)
     runtime = Path(runtime_dir)
     if not (runtime / "aiworkhub" / "server.py").is_file():
         raise SystemExit("AIWorkHub stable MCP runtime is missing")
@@ -8849,9 +8958,28 @@ def serve_runtime(runtime_dir):
     return main()
 
 
+def serve_command(runtime_dir):
+    # NF-2026-02113: a Windows venv python.exe is a redirector that starts the
+    # base interpreter as a second process. Start the base interpreter
+    # directly with the redirector's own hand-off variable (the bpo-35797
+    # multiprocessing pattern), so the served runtime is one python process.
+    env = dict(os.environ)
+    executable = sys.executable
+    base = getattr(sys, "_base_executable", "") or ""
+    if (
+        os.name == "nt"
+        and base
+        and os.path.normcase(os.path.abspath(base)) != os.path.normcase(os.path.abspath(executable))
+        and os.path.isfile(base)
+    ):
+        env["__PYVENV_LAUNCHER__"] = executable
+        executable = base
+    return [executable, os.path.abspath(__file__), "--serve-runtime", runtime_dir], env
+
+
 class Child:
     def __init__(self, runtime_dir, private_id):
-        env = dict(os.environ)
+        command, env = serve_command(runtime_dir)
         self.runtime_dir = runtime_dir
         self.private_key = json.dumps(private_id) if private_id else None
         self.lock = threading.Lock()
@@ -8861,7 +8989,7 @@ class Child:
         self.init_ok = False
         self.init_event = threading.Event()
         self.proc = subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "--serve-runtime", runtime_dir],
+            command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             env=env,
@@ -9945,6 +10073,12 @@ function getMcpClient(context) {
   if (!mcpClient || mcpClient.repositoryRoot !== root || mcpClient.repositoryIdentity.repoId !== identity.repoId) {
     let startupBarrier = null;
     disposeVscodeLmWorkerMcpClient();
+    // NF-2026-02113: the manager-loop child is bound to the replaced
+    // repository identity. Keeping it alive left a third server per window
+    // serving the old repository; the next Start spawns a fresh one.
+    // Covers identity changes that bypass selectRepositoryCommand (workspace
+    // folder removal, active-editor repository change).
+    const managerLoopShutdown = managerLoopMcpClient ? settleWithin(disposeManagerLoopMcpClient(), 3000) : null;
     if (mcpClient) {
       // getMcpClient() remains synchronous, but the replacement client's first
       // start is gated by this bounded shutdown. This prevents two Windows
@@ -9953,6 +10087,9 @@ function getMcpClient(context) {
         restart: false,
         timeoutMs: 3000,
       });
+    }
+    if (managerLoopShutdown) {
+      startupBarrier = Promise.all([startupBarrier, managerLoopShutdown]);
     }
     activeClaimEpisode = `episode_${crypto.randomBytes(12).toString("hex")}`;
     activeRepoIdentity = identity;
@@ -14984,15 +15121,29 @@ async function deactivate() {
     vscodeLmBridgeHost.dispose();
     vscodeLmBridgeHost = null;
   }
-  if (mcpClient) {
-    const oldClient = mcpClient;
-    mcpClient = null;
+  // NF-2026-02113: the three owners shut down concurrently, each with a
+  // bounded dispatcher-stop budget. Serial unbounded awaits let the host's
+  // deactivate deadline expire before the later owners' children were killed.
+  const oldClient = mcpClient;
+  mcpClient = null;
+  await Promise.all([
     // Stop dispatcher before child termination to prevent reload orphans.
-    await runDeactivateStep("dispatcher stop", () => oldClient.stopDispatcherThenTerminate({ restart: false }));
-  }
-  // Call syntax, not bare references: source guards count each teardown call site.
-  await runDeactivateStep("manager-loop client dispose", () => disposeManagerLoopMcpClient());
-  await runDeactivateStep("worker client dispose", () => disposeVscodeLmWorkerMcpClient());
+    oldClient
+      ? runDeactivateStep("dispatcher stop", () => oldClient.stopDispatcherThenTerminate({
+        restart: false,
+        timeoutMs: MCP_DEACTIVATE_STOP_TIMEOUT_MS,
+      }))
+      : Promise.resolve(),
+    // Call syntax, not bare references: source guards count each teardown call site.
+    runDeactivateStep("manager-loop client dispose", () => settleWithin(
+      disposeManagerLoopMcpClient(),
+      MCP_DEACTIVATE_STOP_TIMEOUT_MS,
+    )),
+    runDeactivateStep("worker client dispose", () => disposeVscodeLmWorkerMcpClient()),
+  ]);
+  // Last line of defence: any owned server child still alive (a startup that
+  // raced this shutdown, a failed tree kill) is tree-killed before return.
+  await runDeactivateStep("owned MCP child sweep", () => terminateAllOwnedMcpChildren("deactivate"));
   await runDeactivateStep("system log flush", () => flushSystemLogs());
   // The trace writer buffers; a reload cycle must not lose the tail that
   // explains why this window was reloaded.
@@ -15035,6 +15186,10 @@ module.exports = {
     codingFoundationDashboardSource,
     getHtmlForWebview,
     McpStdioClient,
+    liveOwnedMcpChildCount,
+    terminateAllOwnedMcpChildren,
+    getManagerLoopMcpClient,
+    getVscodeLmWorkerMcpClient,
     ViewState,
     pushSnapshot,
     pushSnapshotOnce,

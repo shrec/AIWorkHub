@@ -388,13 +388,15 @@ test("managerLoopDelete shows a modal confirmation before discarding; a dismisse
   );
 });
 
-test("the gated manager loop client is torn down from all four required call sites", () => {
-  // 1 definition (async function disposeManagerLoopMcpClient() {) plus 4
+test("the gated manager loop client is torn down from all five required call sites", () => {
+  // 1 definition (async function disposeManagerLoopMcpClient() {) plus 5
   // call sites: runManagerLoopAction's close branch, ViewState.dispose(),
-  // deactivate(), and selectRepositoryCommand. A regression dropping any of
-  // the four call sites changes this count.
+  // deactivate(), selectRepositoryCommand, and getMcpClient()'s repository
+  // identity change (NF-2026-02113: a switch that bypasses the command must
+  // not leave the old repository's manager-loop server alive). A regression
+  // dropping any of the five call sites changes this count.
   const occurrences = extensionSource.split("disposeManagerLoopMcpClient()").length - 1;
-  assert.equal(occurrences, 5);
+  assert.equal(occurrences, 6);
 });
 
 test("managerLoopStart refuses an unlisted backend without ever calling an MCP tool", async () => {
