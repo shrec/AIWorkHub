@@ -1010,25 +1010,56 @@ def _cached_quick_check(path: Path) -> str:
     return result
 
 
-def _schema_ok(path: Path) -> bool:
+_SCHEMA_OK = "ok"
+_SCHEMA_INCOMPLETE = "incomplete"
+_DB_UNAVAILABLE_PREFIX = "canonical_db_unavailable:"
+_DB_UNAVAILABLE_DETAIL_MAX = 120
+
+
+def _sqlite_error_detail(exc: BaseException) -> str:
+    """Name a sqlite failure: ``SQLITE_*`` when known, else type + message, bounded."""
+    name = getattr(exc, "sqlite_errorname", None)
+    if isinstance(name, str) and name:
+        detail = name
+    else:
+        detail = f"{type(exc).__name__}:{exc}"
+    detail = " ".join(detail.split())
+    return detail[:_DB_UNAVAILABLE_DETAIL_MAX]
+
+
+def _schema_probe(path: Path) -> str:
+    """Return ``ok``, ``incomplete`` or ``canonical_db_unavailable:<detail>``.
+
+    NF-2026-02131: "the DB opened and a required table/column is absent" and
+    "the DB could not be opened/read" are different facts. Only the first is a
+    schema verdict (``incomplete``); an I/O, lock or open failure is a storage
+    error and must never be reported as an incomplete schema, because
+    ``canonical_schema_incomplete`` offers an Initialize/upgrade action.
+    """
     try:
         conn = _connect(path, readonly=True)
-    except sqlite3.DatabaseError:
-        return False
+    except sqlite3.DatabaseError as exc:
+        return _DB_UNAVAILABLE_PREFIX + _sqlite_error_detail(exc)
     try:
         names = {
             str(row[0])
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         }
         if not all(table in names for table in REQUIRED_TABLES):
-            return False
+            return _SCHEMA_INCOMPLETE
         for table, required in REQUIRED_COLUMNS.items():
             columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
             if not set(required).issubset(columns):
-                return False
+                return _SCHEMA_INCOMPLETE
+    except sqlite3.DatabaseError as exc:
+        return _DB_UNAVAILABLE_PREFIX + _sqlite_error_detail(exc)
     finally:
         conn.close()
-    return True
+    return _SCHEMA_OK
+
+
+def _schema_ok(path: Path) -> bool:
+    return _schema_probe(path) == _SCHEMA_OK
 
 
 def _upgrade_compatible_schema(path: Path) -> bool:
@@ -1294,7 +1325,16 @@ def _storage_readiness_full(
             None,
         )
 
-    if not _schema_ok(canonical_db):
+    schema = _schema_probe(canonical_db)
+    if schema.startswith(_DB_UNAVAILABLE_PREFIX):
+        # Storage I/O/lock/open failure: not a schema fact, never cached (the
+        # memo only stores ready verdicts), and never "schema_incomplete".
+        return (
+            StorageReadiness(False, schema, repo.manifest.repo_id, str(canonical_db)),
+            None,
+            None,
+        )
+    if schema != _SCHEMA_OK:
         return (
             StorageReadiness(False, "canonical_schema_incomplete", repo.manifest.repo_id, str(canonical_db)),
             None,

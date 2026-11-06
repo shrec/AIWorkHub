@@ -154,6 +154,16 @@ TRANSIENT_DENIAL_REASONS = frozenset(
         "quality_review_candidate_mismatch",
         "workspace_exists",
         "vscode_lm_initial_source_graph_prefetch_failed",
+        # -- task-DB storage/IO failures (NF-2026-02131), not card-row facts.
+        # core._check_card_scoped_write_authority raises
+        # ``card_scoped_task_lookup_failed`` when show_task could not READ the
+        # task DB (disk I/O error, database is locked, unable to open), and
+        # task_store readiness reports ``canonical_db_unavailable:<SQLITE_*>``
+        # for the same storage error.  The card row was never read, so an
+        # identical relaunch after the storage recovers can succeed; holding
+        # it as deterministic would strand the card until an unrelated row edit.
+        "card_scoped_task_lookup_failed",
+        "canonical_db_unavailable",
         # -- card contract shape.  These read the card, but the launcher also
         # rewrites contract fields during preflight, and a repaired card is a
         # card-row change that releases any hold anyway; claiming them buys

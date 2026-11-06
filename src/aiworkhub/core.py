@@ -1821,7 +1821,13 @@ def _check_card_scoped_write_authority(
     if task_reason:
         return {"allowed": False, "reason": f"malformed_task_id:{task_reason}"}
     card, error = _live_card(task_id)
+    lookup_failure = error.get("lookup_failure") if isinstance(error, dict) else None
+    if isinstance(lookup_failure, str) and lookup_failure:
+        # Task DB unreadable (e.g. canonical_db_unavailable:SQLITE_IOERR): storage, not a card-row fact.
+        reason = f"card_scoped_task_lookup_failed:{lookup_failure}"
+        return {"allowed": False, "reason": reason, "detail": lookup_failure}
     if error:
+        # The card was read and is absent or carries a different task_id.
         return {"allowed": False, "reason": "card_scoped_task_unresolved"}
     assert card is not None
     card_runner = card.get("runner")
@@ -2174,6 +2180,10 @@ def show_task(task_id: str, *, full: bool = True) -> dict[str, Any]:
         card = task_store.get_task(repo_root(), task_id)
     except task_store.TaskStoreError as exc:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
+    except sqlite3.DatabaseError as exc:
+        # NF-2026-02131: a storage error on the card read is named, never raised raw.
+        detail = task_store._DB_UNAVAILABLE_PREFIX + task_store._sqlite_error_detail(exc)
+        return _canonical_result(ok=False, returncode=1, stderr=detail, command=command)
     if card is None:
         return _canonical_result(ok=True, returncode=0, stdout=f"Task not found: {task_id}", command=command)
     rendered = card if full else summarize_card_baselines(card)
@@ -2832,12 +2842,33 @@ def _lifecycle_error(message: str, returncode: int = 126) -> dict[str, Any]:
     }
 
 
+_LIVE_CARD_STDERR_MAX = 240
+
+
 def _live_card(task_id: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Live card or error; a task-DB READ failure carries ``lookup_failure`` (NF-2026-02131)."""
     shown = show_task(task_id)
+    stdout = shown.get("stdout", "")
+    stderr = " ".join(str(shown.get("stderr") or "").split())[:_LIVE_CARD_STDERR_MAX]
     try:
-        card = json.loads(shown.get("stdout", ""))
+        returncode = int(shown.get("returncode") or 0)
+    except (TypeError, ValueError):
+        returncode = 1
+    failed = returncode != 0 or shown.get("ok") is False
+    try:
+        card = json.loads(stdout)
     except (TypeError, json.JSONDecodeError):
-        return None, _lifecycle_error(f"cannot resolve live task identity: {task_id}", 1)
+        card = None
+        if stderr:
+            failed = True
+    if failed:
+        detail = stderr or f"show_task_exit_{returncode}"
+        error = _lifecycle_error(
+            f"cannot resolve live task identity: {task_id}: {detail}",
+            returncode or 1,
+        )
+        error["lookup_failure"] = detail
+        return None, error
     if not isinstance(card, dict) or card.get("task_id") != task_id:
         return None, _lifecycle_error(f"cannot resolve live task identity: {task_id}", 1)
     return card, None
