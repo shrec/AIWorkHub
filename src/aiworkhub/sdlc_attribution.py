@@ -596,10 +596,31 @@ def load_accepted_catalog(repo_root: str | Path, repository_id: str) -> Accepted
     from . import sdlc_outcome_metrics
 
     repo = Path(repo_root)
-    cards = task_store.list_task_cards(repo, limit=MAX_TASK_CARDS)
     decisions = task_store.latest_manager_decisions(repo)
+    accepted_ids = {
+        task_id for task_id, decision in decisions.items()
+        if decision.get("decision") == "accepted"
+    }
+    if not accepted_ids:
+        return AcceptedCatalog(repo, ())
+    # NF-2026-02118: read only the accepted cards, and of each only the request
+    # id and sealed receipt, instead of decoding every card whole. The order is
+    # the one the full ``list_task_cards`` scan produced (same bounded
+    # newest-first snapshot, restricted to accepted ids): ``explaining_card``
+    # returns the first matching card, so card order is observable.
+    ordered_ids = [
+        raw_id
+        for raw_id in task_store.list_task_ids_newest_first(repo, limit=MAX_TASK_CARDS)
+        if raw_id.strip() in accepted_ids
+    ]
+    projected = task_store.get_tasks(
+        repo, ordered_ids, projection=task_store.ACCEPTED_RECEIPT_PROJECTION
+    )
     accepted: list[AcceptedCard] = []
-    for card in cards:
+    for raw_id in ordered_ids:
+        card = projected.get(raw_id)
+        if card is None:
+            continue
         task_id = str(card.get("task_id") or "").strip()
         if decisions.get(task_id, {}).get("decision") != "accepted":
             continue

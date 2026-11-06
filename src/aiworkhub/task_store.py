@@ -1719,6 +1719,58 @@ def _decode_task_summary_card(row: sqlite3.Row | Mapping[str, Any]) -> dict[str,
     return card
 
 
+# NF-2026-02118: the reconciler's escaped-defect attribution
+# (``sdlc_attribution.load_accepted_catalog``) reads, per manager-accepted card,
+# only the accepted request id and the sealed accepted-outcome receipt, yet it
+# decoded every card whole (28 s, ~800 MB tracemalloc peak on the canonical
+# store). This projection returns ``task_id`` plus only those two card_json
+# values. ``accept_evidence`` is rebuilt holding only the receipt and is absent
+# when the card carries no such object, so ``isinstance`` checks on it answer as
+# on the full card; the receipt is JSON null when absent, as ``.get`` answers.
+ACCEPTED_RECEIPT_PROJECTION = "accepted_receipt"
+
+_ACCEPTED_RECEIPT_VALUE_PATHS: tuple[tuple[str, ...], ...] = (
+    ("accepted_request_id",),
+    ("accept_evidence", "accepted_outcome_receipt"),
+)
+
+_ACCEPTED_RECEIPT_SELECT_SQL = (
+    "SELECT t.task_id AS task_id, "
+    "CASE WHEN json_valid(t.card_json) THEN json_extract(t.card_json, "
+    + ", ".join(_json_path_literal(path) for path in _ACCEPTED_RECEIPT_VALUE_PATHS)
+    + ") END AS receipt_values, "
+    "CASE WHEN json_valid(t.card_json) THEN json_type(t.card_json, '$.accept_evidence') END "
+    "AS accept_evidence_type, "
+    # Only a card_json SQLite cannot validate ships whole, so Python decodes it
+    # exactly as _decode_task_card would (malformed -> {}).
+    "CASE WHEN json_valid(t.card_json) THEN NULL ELSE t.card_json END "
+    "AS unvalidated_card_json "
+)
+
+
+def _decode_accepted_receipt_card(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
+    """Build the narrow card for one ``ACCEPTED_RECEIPT_PROJECTION`` row."""
+    raw_values = row["receipt_values"]
+    if raw_values is not None:
+        request_id, receipt = json.loads(raw_values)
+        evidence_is_object = row["accept_evidence_type"] == "object"
+    else:
+        try:
+            card_json = json.loads(row["unvalidated_card_json"] or "{}")
+        except json.JSONDecodeError:
+            card_json = {}
+        if not isinstance(card_json, dict):
+            card_json = {}
+        request_id, receipt = (
+            _card_path_value(card_json, path) for path in _ACCEPTED_RECEIPT_VALUE_PATHS
+        )
+        evidence_is_object = isinstance(card_json.get("accept_evidence"), dict)
+    card: dict[str, Any] = {"task_id": row["task_id"], "accepted_request_id": request_id}
+    if evidence_is_object:
+        card["accept_evidence"] = {"accepted_outcome_receipt": receipt}
+    return card
+
+
 def _card_projection(
     projection: str | None,
 ) -> tuple[str, Callable[[Any], dict[str, Any]]] | None:
@@ -1732,6 +1784,8 @@ def _card_projection(
         return _active_derivation_select_sql(), _decode_active_derivation_card
     if projection == TASK_SUMMARY_PROJECTION:
         return _task_summary_select_sql(), _decode_task_summary_card
+    if projection == ACCEPTED_RECEIPT_PROJECTION:
+        return _ACCEPTED_RECEIPT_SELECT_SQL, _decode_accepted_receipt_card
     raise ValueError(f"unknown task card projection: {projection!r}")
 
 
@@ -1764,8 +1818,11 @@ def list_task_cards(
     (see ``_ACTIVE_DERIVATION_CARD_PATHS``) without reading or decoding the
     rest of ``card_json``. ``projection=TASK_SUMMARY_PROJECTION`` likewise
     returns every column plus only the card_json paths the read-only summary
-    surfaces read (see ``_TASK_SUMMARY_VALUE_PATHS``). A projection is not
-    combinable with ``decode_errors``.
+    surfaces read (see ``_TASK_SUMMARY_VALUE_PATHS``), and
+    ``projection=ACCEPTED_RECEIPT_PROJECTION`` only ``task_id`` plus the
+    accepted request id and sealed receipt (see
+    ``_ACCEPTED_RECEIPT_VALUE_PATHS``). A projection is not combinable with
+    ``decode_errors``.
     """
     narrow = _card_projection(projection)
     if narrow is not None and decode_errors is not None:
@@ -1813,6 +1870,26 @@ def list_task_cards(
                 "error_message": f"{type(exc).__name__}: {exc}"[:200],
             })
     return cards
+
+
+def list_task_ids_newest_first(root: str | Path, *, limit: int = 500) -> list[str]:
+    """The task_ids :func:`list_task_cards` would return, in its order.
+
+    The same bounded newest-``updated_at``-first snapshot query as an unfiltered
+    ``list_task_cards(root, limit=limit)``, selecting only ``task_id``: no
+    ``card_json`` is read, so a caller that only needs the order of a subset
+    can fetch that subset's cards with :func:`get_tasks`.
+    """
+    _readiness, db_path = _require_ready(root)
+    bounded_limit = max(1, min(int(limit), 5000))
+    conn = _connect(db_path, readonly=True)
+    try:
+        rows = conn.execute(
+            "SELECT t.task_id AS task_id " + _TASK_CARDS_NEWEST_FIRST_SQL, (bounded_limit,)
+        ).fetchall()
+    finally:
+        conn.close()
+    return [str(row["task_id"] or "") for row in rows]
 
 
 _LIST_TASK_ROUTING_FACTS_SQL = (
