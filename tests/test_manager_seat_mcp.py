@@ -7,6 +7,7 @@ never finalizes review, and never edits the tree.
 from __future__ import annotations
 
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -54,6 +55,19 @@ def test_manager_codex_config_toml_names_the_seat_server_and_tools() -> None:
     assert "aiworkhub_agent_launch_task" not in text
     assert 'AIWORKHUB_REPO = "D:\\\\r"' in text
     assert text.endswith("\n")
+
+
+def test_manager_codex_config_toml_is_a_valid_codex_stdio_server() -> None:
+    # GitHub #33: a table without ``command`` is refused by Codex as an invalid transport.
+    text = ra.build_manager_codex_config_toml(
+        python_executable=r"C:\Python312\python.exe",
+        launch_args=["--seat"],
+        environment={"AIWORKHUB_REPO": r"D:\r"},
+    )
+    server = tomllib.loads(text)["mcp_servers"]["AIWorkHub"]
+    assert server["command"] == r"C:\Python312\python.exe"
+    assert server["args"] == ["-m", "aiworkhub.server", "--seat"]
+    assert server["env"]["AIWORKHUB_REPO"] == r"D:\r"
 
 
 def test_opencode_manager_contract_denies_everything_but_the_seat() -> None:

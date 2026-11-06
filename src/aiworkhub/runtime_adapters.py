@@ -2276,6 +2276,9 @@ def build_manager_codex_config_toml(
     checked_env = _manager_seat_mcp_environment(environment)
     lines = [
         f"[mcp_servers.{MANAGER_SEAT_MCP_SERVER}]",
+        # Codex resolves a stdio transport from ``command``; without it the
+        # whole table is refused as "invalid transport" (GitHub #33).
+        f"command = {toml_basic_string(python_executable)}",
         f"args = [{', '.join(toml_basic_string(a) for a in ['-m', 'aiworkhub.server', *launch_args])}]",
         f"enabled_tools = {toml_string_array(resolve_manager_seat_codex_tools())}",
         "",
