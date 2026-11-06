@@ -1458,6 +1458,121 @@ def _db_path_for(root: str | Path, readiness: StorageReadiness | None) -> Path:
     return Path(readiness.canonical_db)
 
 
+# NF-2026-02112: the read-time NeedFix active derivation (needfix_ingest ->
+# needfix_store / task_plan) inspects only a handful of card fields, yet it read
+# up to 5000 cards with ``SELECT t.*`` + ``_decode_task_card`` -- hundreds of MB
+# of history/evidence JSON on a mature store, to show one page. This projection
+# returns exactly the fields that derivation reads, with the precedence
+# ``_decode_task_card`` applies (a column wins over the same card_json key) and
+# the same canonical ``status``. Every other key is absent; each consumer reads
+# through ``.get``, so an absent key and a JSON null answer identically.
+ACTIVE_DERIVATION_PROJECTION = "needfix_active_derivation"
+
+_ACTIVE_DERIVATION_COLUMNS: tuple[str, ...] = (
+    "task_id", "status", "worker_status", "archived_at",
+)
+
+# card_json paths read by task_plan.card_status_evidence / successor_task_id /
+# exact_artifact_target and needfix_store's superseded/explicit-reference reads.
+# ``accept_evidence`` is only ever type-checked, so it is projected by type.
+_ACTIVE_DERIVATION_CARD_PATHS: tuple[tuple[str, ...], ...] = (
+    ("archive_operation",),
+    ("archive_reason",),
+    ("superseded_by",),
+    ("accepted_request_id",),
+    ("accepted_by",),
+    ("accepted_at",),
+    ("quality_review", "target_task_id"),
+    ("quality_review", "target_status"),
+    ("terminal_review", "evidence", "quality_review", "target_task_id"),
+    ("terminal_review", "evidence", "quality_review", "target_status"),
+    ("implementation", "target_task_id"),
+    ("implementation", "target_status"),
+    ("retry_target", "target_task_id"),
+    ("retry_target", "task_id"),
+    ("retry_target", "target_status"),
+    ("retry_target", "kind"),
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _active_derivation_paths() -> tuple[tuple[str, ...], ...]:
+    # The explicit NeedFix reference keys are owned by needfix_store; import the
+    # owner lazily (no import-time cost or cycle) instead of restating them.
+    from . import needfix_store
+
+    return _ACTIVE_DERIVATION_CARD_PATHS + tuple(
+        (key,) for key in needfix_store._EXPLICIT_NEEDFIX_REF_KEYS
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _active_derivation_select_sql() -> str:
+    paths = ", ".join("'$." + ".".join(path) + "'" for path in _active_derivation_paths())
+    columns = ", ".join(f"t.{name} AS {name}" for name in _ACTIVE_DERIVATION_COLUMNS)
+    return (
+        f"SELECT {columns}, "
+        f"CASE WHEN json_valid(t.card_json) THEN json_extract(t.card_json, {paths}) END "
+        "AS card_facts, "
+        "CASE WHEN json_valid(t.card_json) THEN json_type(t.card_json, '$.accept_evidence') END "
+        "AS accept_evidence_type, "
+        # Only a card_json SQLite cannot validate ships whole, so Python decodes
+        # it exactly as _decode_task_card would (malformed -> {}).
+        "CASE WHEN json_valid(t.card_json) THEN NULL ELSE t.card_json END "
+        "AS unvalidated_card_json "
+    )
+
+
+def _card_path_value(card_json: Mapping[str, Any], path: tuple[str, ...]) -> Any:
+    node: Any = card_json
+    for key in path:
+        if not isinstance(node, dict):
+            return None
+        node = node.get(key)
+    return node
+
+
+def _decode_active_derivation_card(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
+    """Build the narrow derivation card for one projected ``tasks`` row."""
+    paths = _active_derivation_paths()
+    raw_facts = row["card_facts"]
+    if raw_facts is not None:
+        values = json.loads(raw_facts)
+        accept_evidence_is_object = row["accept_evidence_type"] == "object"
+    else:
+        try:
+            card_json = json.loads(row["unvalidated_card_json"] or "{}")
+        except json.JSONDecodeError:
+            card_json = {}
+        if not isinstance(card_json, dict):
+            card_json = {}
+        values = [_card_path_value(card_json, path) for path in paths]
+        accept_evidence_is_object = isinstance(card_json.get("accept_evidence"), Mapping)
+    card: dict[str, Any] = {}
+    for path, value in zip(paths, values, strict=True):
+        node = card
+        for key in path[:-1]:
+            node = node.setdefault(key, {})
+        node[path[-1]] = value
+    card["accept_evidence"] = {} if accept_evidence_is_object else None
+    for name in _ACTIVE_DERIVATION_COLUMNS:
+        card[name] = row[name]
+    card["status"] = canonical_status(card)
+    return card
+
+
+def _is_active_derivation_projection(projection: str | None) -> bool:
+    """True for the narrow derivation projection, False for full cards.
+
+    An unknown projection fails closed rather than silently returning full cards.
+    """
+    if projection is None:
+        return False
+    if projection != ACTIVE_DERIVATION_PROJECTION:
+        raise ValueError(f"unknown task card projection: {projection!r}")
+    return True
+
+
 def list_task_cards(
     root: str | Path,
     *,
@@ -1465,6 +1580,7 @@ def list_task_cards(
     status: str | None = None,
     topic: str | None = None,
     decode_errors: list[dict[str, Any]] | None = None,
+    projection: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return bounded canonical task cards with one readiness check/query.
 
@@ -1480,7 +1596,15 @@ def list_task_cards(
     list, a row whose card cannot be decoded is recorded there as
     ``{"task_id", "error_kind", "error_message"}`` instead of aborting the
     batch; every other row is still returned.
+
+    ``projection=ACTIVE_DERIVATION_PROJECTION`` returns the same rows in the
+    same order, each reduced to the fields the NeedFix active derivation reads
+    (see ``_ACTIVE_DERIVATION_CARD_PATHS``) without reading or decoding the
+    rest of ``card_json``. It is not combinable with ``decode_errors``.
     """
+    narrow = _is_active_derivation_projection(projection)
+    if narrow and decode_errors is not None:
+        raise ValueError("decode_errors is not supported with a card projection")
     _readiness, db_path = _require_ready(root)
     bounded_limit = max(1, min(int(limit), 5000))
     filters: list[str] = []
@@ -1491,18 +1615,25 @@ def list_task_cards(
     if topic:
         filters.append(f"{_TASK_TOPIC_FILTER_SQL} = ?")
         params.append(topic)
-    query = (
-        "SELECT t.* "
-        + _TASK_CARDS_NEWEST_FIRST_TEMPLATE.format(where=" WHERE " + " AND ".join(filters))
-        if filters
-        else _LIST_TASK_CARDS_SQL
-    )
+    if narrow:
+        query = _active_derivation_select_sql() + _TASK_CARDS_NEWEST_FIRST_TEMPLATE.format(
+            where=(" WHERE " + " AND ".join(filters)) if filters else ""
+        )
+    else:
+        query = (
+            "SELECT t.* "
+            + _TASK_CARDS_NEWEST_FIRST_TEMPLATE.format(where=" WHERE " + " AND ".join(filters))
+            if filters
+            else _LIST_TASK_CARDS_SQL
+        )
     params.append(bounded_limit)
     conn = _connect(db_path, readonly=True)
     try:
         rows = conn.execute(query, params).fetchall()
     finally:
         conn.close()
+    if narrow:
+        return [_decode_active_derivation_card(row) for row in rows]
     if decode_errors is None:
         return [_decode_task_card(row) for row in rows]
     cards: list[dict[str, Any]] = []
@@ -1771,20 +1902,31 @@ def get_task(
     task_id: str,
     *,
     readiness: StorageReadiness | None = None,
+    projection: str | None = None,
 ) -> dict[str, Any] | None:
     """Canonical detail for exactly one bounded task_id, or None if unknown.
 
     A caller that already verified ``readiness`` for ``root`` passes it to skip
     the per-call ``storage_readiness`` check; a not-ready value still raises.
+    ``projection`` has the meaning :func:`list_task_cards` documents.
     """
+    narrow = _is_active_derivation_projection(projection)
     db_path = _db_path_for(root, readiness)
     conn = _connect(db_path, readonly=True)
     try:
-        row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        if narrow:
+            row = conn.execute(
+                _active_derivation_select_sql() + "FROM tasks t WHERE t.task_id=?",
+                (task_id,),
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
     finally:
         conn.close()
     if row is None:
         return None
+    if narrow:
+        return _decode_active_derivation_card(row)
     return _decode_task_card(row)
 
 
@@ -1793,12 +1935,19 @@ def get_tasks(
     task_ids: Iterable[str],
     *,
     readiness: StorageReadiness | None = None,
+    projection: str | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Canonical cards for many task_ids over one connection; unknown ids absent."""
+    """Canonical cards for many task_ids over one connection; unknown ids absent.
+
+    ``projection`` has the meaning :func:`list_task_cards` documents.
+    """
+    narrow = _is_active_derivation_projection(projection)
     ordered = list(dict.fromkeys(task_ids))
     if not ordered:
         return {}
     db_path = _db_path_for(root, readiness)
+    select = _active_derivation_select_sql() + "FROM tasks t" if narrow else "SELECT * FROM tasks t"
+    decode = _decode_active_derivation_card if narrow else _decode_task_card
     found: dict[str, dict[str, Any]] = {}
     conn = _connect(db_path, readonly=True)
     try:
@@ -1806,10 +1955,10 @@ def get_tasks(
             chunk = ordered[start : start + _GET_TASKS_CHUNK]
             placeholders = ",".join("?" * len(chunk))
             rows = conn.execute(
-                f"SELECT * FROM tasks WHERE task_id IN ({placeholders})", chunk
+                f"{select} WHERE t.task_id IN ({placeholders})", chunk
             ).fetchall()
             for row in rows:
-                card = _decode_task_card(row)
+                card = decode(row)
                 found[str(row["task_id"])] = card
     finally:
         conn.close()

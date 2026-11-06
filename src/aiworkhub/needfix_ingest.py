@@ -615,6 +615,13 @@ def _resolve_active_state_hooks(
     re-read from the store. A partial snapshot still point-looks up missing
     successor ids, including those carried only in ``archive_reason``. A store
     miss fails closed instead of keeping stale cached data.
+
+    Every store read here (the bounded list, the bulk prefetch and each point
+    lookup) asks for ``task_store.ACTIVE_DERIVATION_PROJECTION``: the cards
+    carry only the fields the derivation, the terminal-artifact projection and
+    the link reconciliation inspect, never the whole decoded ``card_json``
+    (NF-2026-02112), so the read's memory is bounded by those fields rather
+    than by each card's history and evidence.
     """
     from . import task_store  # lazy: no import-time cost, no import cycle
 
@@ -627,6 +634,7 @@ def _resolve_active_state_hooks(
     if not ready:
         return None, None, None, f"task_store_not_ready:{reason}"
 
+    projection = task_store.ACTIVE_DERIVATION_PROJECTION
     task_cards: Sequence[Mapping[str, Any]] | None = task_cards_snapshot
     task_cards_complete = bool(task_cards_snapshot_complete)
     task_by_id: dict[str, Any] = _index_listed_cards(task_cards or ())
@@ -635,7 +643,7 @@ def _resolve_active_state_hooks(
         nonlocal task_cards, task_cards_complete
         if task_cards is None:
             task_cards = task_store.list_task_cards(
-                repo, limit=_RECONCILE_CARD_SCAN_LIMIT
+                repo, limit=_RECONCILE_CARD_SCAN_LIMIT, projection=projection
             )
             task_cards_complete = len(task_cards) < _RECONCILE_CARD_SCAN_LIMIT
             task_by_id.clear()
@@ -657,7 +665,9 @@ def _resolve_active_state_hooks(
             _bulk_load_cards(
                 needfix_store.task_link_candidate_ids(repo),
                 task_by_id,
-                lambda ids: task_store.get_tasks(repo, ids, readiness=readiness),
+                lambda ids: task_store.get_tasks(
+                    repo, ids, readiness=readiness, projection=projection
+                ),
             )
         except Exception:
             pass
@@ -670,7 +680,10 @@ def _resolve_active_state_hooks(
         if task_cards_complete:
             return None
         found = _cache_point_lookup_card(
-            requested, task_store.get_task(repo, requested, readiness=readiness)
+            requested,
+            task_store.get_task(
+                repo, requested, readiness=readiness, projection=projection
+            ),
         )
         if found is not None:
             task_by_id[requested] = found
@@ -678,7 +691,7 @@ def _resolve_active_state_hooks(
                 found,
                 task_by_id,
                 lambda successor_id: task_store.get_task(
-                    repo, successor_id, readiness=readiness
+                    repo, successor_id, readiness=readiness, projection=projection
                 ),
             )
         prefetch_candidates()

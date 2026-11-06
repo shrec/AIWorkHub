@@ -56,9 +56,10 @@ import re
 import sqlite3
 import subprocess
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 SCHEMA_ID = "aiworkhub.needfix_store.v4"
 CAUSED_BY_SCHEMA_ID = "aiworkhub.accepted_outcome_identity.v1"
@@ -1100,16 +1101,104 @@ def derive_active_state(
     }
 
 
+def _apply_derived(record: dict[str, Any], derived: Mapping[str, Any]) -> dict[str, Any]:
+    record["derived_state"] = derived["state"]
+    record["active"] = derived["active"]
+    record["active_reason"] = derived["reason"]
+    return record
+
+
 def _decorate_derived(
     record: dict[str, Any],
     get_task_fn: Callable[[str], Mapping[str, Any] | None],
     canonical_status_fn: Callable[[Mapping[str, Any]], str],
 ) -> dict[str, Any]:
-    derived = derive_active_state(record, get_task_fn, canonical_status_fn)
-    record["derived_state"] = derived["state"]
-    record["active"] = derived["active"]
-    record["active_reason"] = derived["reason"]
-    return record
+    return _apply_derived(
+        record, derive_active_state(record, get_task_fn, canonical_status_fn)
+    )
+
+
+# NF-2026-02112: the only NeedFix columns ``derive_active_state`` reads (its own
+# ``status``, the linked ``converted_task_id`` and the foreign-origin ``tags``).
+# The active scan reads just these; description/evidence bodies (up to 500 KB
+# each) are read only for the rows of the returned page.
+_ACTIVE_DERIVATION_COLUMNS_SQL = "id, status, converted_task_id, tags_json"
+
+
+def _active_derivation_record(row: sqlite3.Row) -> dict[str, Any]:
+    """The narrow record ``derive_active_state`` reads, decoded as ``_row_to_dict``."""
+    return {
+        "id": row["id"],
+        "status": row["status"],
+        "converted_task_id": row["converted_task_id"],
+        "tags": json.loads(row["tags_json"]),
+    }
+
+
+@contextmanager
+def _read_snapshot(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """One read transaction, so the active scan and its page rows agree."""
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    finally:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+
+
+def _active_derivations(
+    conn: sqlite3.Connection,
+    where: str,
+    params: Sequence[Any],
+    get_task_fn: Callable[[str], Mapping[str, Any] | None],
+    canonical_status_fn: Callable[[Mapping[str, Any]], str],
+    *,
+    order_sql: str = "",
+    stop_after: int | None = None,
+) -> list[tuple[str, dict[str, Any]]]:
+    """``(id, derivation)`` of each ACTIVE row, in ``order_sql`` order.
+
+    One pass over the narrow derivation columns; ``stop_after`` ends the scan
+    once that many ACTIVE rows are found.
+    """
+    active: list[tuple[str, dict[str, Any]]] = []
+    cursor = conn.execute(
+        f"SELECT {_ACTIVE_DERIVATION_COLUMNS_SQL} FROM needfix {where}{order_sql}",
+        params,
+    )
+    for row in cursor:
+        if stop_after is not None and len(active) >= stop_after:
+            break
+        record = _active_derivation_record(row)
+        derived = derive_active_state(record, get_task_fn, canonical_status_fn)
+        if derived["active"]:
+            active.append((record["id"], derived))
+    return active
+
+
+def _decorated_page(
+    conn: sqlite3.Connection, page: Sequence[tuple[str, Mapping[str, Any]]]
+) -> list[dict[str, Any]]:
+    """Full rows for exactly ``page`` (at most ``MAX_LIST_LIMIT`` ids), in order."""
+    if not page:
+        return []
+    ids = [needfix_id for needfix_id, _derived in page]
+    placeholders = ", ".join("?" for _ in ids)
+    full = {
+        row["id"]: row
+        for row in conn.execute(
+            f"SELECT * FROM needfix WHERE id IN ({placeholders})", ids
+        )
+    }
+    items: list[dict[str, Any]] = []
+    for needfix_id, derived in page:
+        row = full.get(needfix_id)
+        if row is None:
+            raise NeedFixError(
+                f"needfix {needfix_id} vanished inside one read snapshot"
+            )
+        items.append(_apply_derived(_row_to_dict(row), derived))
+    return items
 
 
 def _check_duplicate_cycle(
@@ -1787,6 +1876,40 @@ def get_needfix(repo_root: str | Path, needfix_id: str) -> dict[str, Any]:
         conn.close()
 
 
+def _list_window(limit: int, order_by: str, order_dir: str) -> tuple[int, str, str]:
+    """The bounded page size and the allow-listed ordering every listing uses."""
+    bounded_limit = max(1, min(int(limit), MAX_LIST_LIMIT))
+    if order_by not in ("created_at", "updated_at"):
+        order_by = "created_at"
+    if order_dir.upper() not in ("ASC", "DESC"):
+        order_dir = "DESC"
+    return bounded_limit, order_by, order_dir
+
+
+def _needfix_filter(
+    *,
+    status: str | None = None,
+    kind: str | None = None,
+    severity: str | None = None,
+    include_archived: bool = False,
+) -> tuple[str, list[Any]]:
+    """The WHERE clause list/count share; ``include_archived`` only without ``status``."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if status is not None:
+        clauses.append("status = ?")
+        params.append(status)
+    elif not include_archived:
+        clauses.append("status != 'archived'")
+    if kind is not None:
+        clauses.append("kind = ?")
+        params.append(kind)
+    if severity is not None:
+        clauses.append("severity = ?")
+        params.append(severity)
+    return (f"WHERE {' AND '.join(clauses)}" if clauses else ""), params
+
+
 def list_needfix(
     repo_root: str | Path,
     *,
@@ -1815,11 +1938,7 @@ def list_needfix(
     ``active_only=True`` only ACTIVE records are returned. The active
     definition is ``ACTIVE_STATE_DEFINITION``.
     """
-    bounded_limit = max(1, min(int(limit), MAX_LIST_LIMIT))
-    if order_by not in ("created_at", "updated_at"):
-        order_by = "created_at"
-    if order_dir.upper() not in ("ASC", "DESC"):
-        order_dir = "DESC"
+    bounded_limit, order_by, order_dir = _list_window(limit, order_by, order_dir)
     derive = get_task_fn is not None and canonical_status_fn is not None
     if (get_task_fn is None) != (canonical_status_fn is None):
         raise NeedFixValidationError(
@@ -1831,42 +1950,29 @@ def list_needfix(
         )
     conn = _connect(repo_root)
     try:
-        clauses: list[str] = []
-        params: list[Any] = []
-        if status is not None:
-            clauses.append("status = ?")
-            params.append(status)
-        elif not include_archived:
-            clauses.append("status != 'archived'")
-        if kind is not None:
-            clauses.append("kind = ?")
-            params.append(kind)
-        if severity is not None:
-            clauses.append("severity = ?")
-            params.append(severity)
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        where, params = _needfix_filter(
+            status=status, kind=kind, severity=severity, include_archived=include_archived
+        )
         if derive:
             if active_only:
                 # Active-only cannot be filtered in SQL (active is derived), so
-                # stream rows and decorate lazily, stopping as soon as the page
-                # is full. This bounds the work to finding ``offset + limit``
-                # active records instead of decorating every filtered row.
+                # stream the narrow derivation columns, stopping as soon as the
+                # page is full. This bounds the work to finding ``offset +
+                # limit`` active records, and full rows are read only for the
+                # returned page (NF-2026-02112).
                 start = max(0, int(offset))
                 needed = start + bounded_limit
-                active_rows: list[dict[str, Any]] = []
-                cursor = conn.execute(
-                    f"SELECT * FROM needfix {where} ORDER BY {order_by} {order_dir}",
-                    params,
-                )
-                for r in cursor:
-                    if len(active_rows) >= needed:
-                        break
-                    decorated = _decorate_derived(
-                        _row_to_dict(r), get_task_fn, canonical_status_fn
+                with _read_snapshot(conn):
+                    active = _active_derivations(
+                        conn,
+                        where,
+                        params,
+                        get_task_fn,
+                        canonical_status_fn,
+                        order_sql=f" ORDER BY {order_by} {order_dir}",
+                        stop_after=needed,
                     )
-                    if decorated["active"]:
-                        active_rows.append(decorated)
-                return active_rows[start:needed]
+                    return _decorated_page(conn, active[start:needed])
             # Pure annotation: paginate in SQL first, then decorate only the
             # requested page, so the page size bounds the lookups too.
             rows = conn.execute(
@@ -2666,13 +2772,16 @@ def reconcile_orphaned_conversions(
     conn = _connect(repo_root)
     try:
         placeholders = ", ".join("?" for _ in _ORPHAN_RECONCILE_ELIGIBLE_STATUSES)
+        # Only the columns this reconcile reads (NF-2026-02112); it runs on
+        # every derived read, so whole rows with their bodies are never loaded.
         rows = conn.execute(
-            f"SELECT * FROM needfix WHERE status IN ({placeholders}) "
+            "SELECT id, status, converted_task_id "
+            f"FROM needfix WHERE status IN ({placeholders}) "
             "AND converted_task_id IS NOT NULL AND converted_task_id != '' "
             "ORDER BY created_at ASC",
             _ORPHAN_RECONCILE_ELIGIBLE_STATUSES,
         ).fetchall()
-        records = [_row_to_dict(r) for r in rows]
+        records = [dict(r) for r in rows]
     finally:
         conn.close()
 
@@ -3115,28 +3224,14 @@ def count_needfix(
         )
     conn = _connect(repo_root)
     try:
-        clauses: list[str] = []
-        params: list[Any] = []
-        if status is not None:
-            clauses.append("status = ?")
-            params.append(status)
-        elif not include_archived:
-            clauses.append("status != 'archived'")
-        if kind is not None:
-            clauses.append("kind = ?")
-            params.append(kind)
-        if severity is not None:
-            clauses.append("severity = ?")
-            params.append(severity)
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        where, params = _needfix_filter(
+            status=status, kind=kind, severity=severity, include_archived=include_archived
+        )
         if derive and active_only:
-            rows = conn.execute(f"SELECT * FROM needfix {where}", params).fetchall()
-            return sum(
-                1
-                for r in rows
-                if derive_active_state(
-                    _row_to_dict(r), get_task_fn, canonical_status_fn
-                )["active"]
+            # Narrow derivation columns only (NF-2026-02112): the count never
+            # needs a description/evidence body.
+            return len(
+                _active_derivations(conn, where, params, get_task_fn, canonical_status_fn)
             )
         row = conn.execute(f"SELECT COUNT(*) AS n FROM needfix {where}", params).fetchone()
         return int(row["n"])
@@ -3144,12 +3239,16 @@ def count_needfix(
         conn.close()
 
 
+def _count_rows(conn: sqlite3.Connection, where: str, params: Sequence[Any]) -> int:
+    row = conn.execute(f"SELECT COUNT(*) AS n FROM needfix {where}", params).fetchone()
+    return int(row["n"])
+
+
 def _raw_total_rows(repo_root: str | Path) -> int:
     """Total rows in the store, including archived -- the pre-fix table size."""
     conn = _connect(repo_root)
     try:
-        row = conn.execute("SELECT COUNT(*) AS n FROM needfix").fetchone()
-        return int(row["n"])
+        return _count_rows(conn, "", ())
     finally:
         conn.close()
 
@@ -3173,36 +3272,40 @@ def list_active_needfix(
     pagination (equal to ``count_active_needfix`` at every store size). There
     is no background synchronisation, daemon or repair step: state is
     re-derived on every read and self-heals when a card status changes.
+
+    The active set is derived ONCE per call (NF-2026-02112): one ordered pass
+    over the narrow derivation columns yields both the full ``count`` and the
+    page, and full rows are read only for the page's ids -- so the memory a
+    read holds is bounded by the page, not by every row's bodies. The pass
+    honours exactly the filter ``list_needfix``/``count_needfix`` apply,
+    ``include_archived`` included, inside one read snapshot.
     """
-    items = list_needfix(
-        repo_root,
-        include_archived=include_archived,
-        limit=limit,
-        offset=offset,
-        order_by=order_by,
-        order_dir=order_dir,
-        get_task_fn=get_task_fn,
-        canonical_status_fn=canonical_status_fn,
-        active_only=True,
-    )
-    # The count is derived independently of pagination so it agrees with
-    # ``count_active_needfix`` at every store size; ``items`` is the bounded
-    # page, not the full active set. ``include_archived`` is forwarded so the
-    # count honours the exact same filter the items page does -- otherwise the
-    # two would describe different candidate sets under include_archived=True.
-    active_count = count_needfix(
-        repo_root,
-        include_archived=include_archived,
-        get_task_fn=get_task_fn,
-        canonical_status_fn=canonical_status_fn,
-        active_only=True,
-    )
+    bounded_limit, order_by, order_dir = _list_window(limit, order_by, order_dir)
+    start = max(0, int(offset))
+    where, params = _needfix_filter(include_archived=include_archived)
+    conn = _connect(repo_root)
+    try:
+        with _read_snapshot(conn):
+            active = _active_derivations(
+                conn,
+                where,
+                params,
+                get_task_fn,
+                canonical_status_fn,
+                order_sql=f" ORDER BY {order_by} {order_dir}",
+            )
+            items = _decorated_page(conn, active[start:start + bounded_limit])
+            raw_total = _count_rows(conn, "", ())
+            before = _count_rows(conn, *_needfix_filter())
+    finally:
+        conn.close()
+    active_count = len(active)
     return {
         "definition": ACTIVE_STATE_DEFINITION,
         "derivation": "read_time_from_linked_card",
         "no_synchronisation": True,
-        "raw_total": _raw_total_rows(repo_root),
-        "before": count_needfix(repo_root),
+        "raw_total": raw_total,
+        "before": before,
         "after": active_count,
         "count": active_count,
         "items": items,
@@ -4968,10 +5071,13 @@ def reconcile_unlinked_needfix(
     conn = _connect(repo_root)
     try:
         clause = "" if include_archived else " WHERE status != 'archived'"
+        # Only the columns this reconcile reads (NF-2026-02112): it runs on
+        # every derived read, so whole rows with their bodies are never loaded.
         rows = conn.execute(
-            f"SELECT * FROM needfix{clause} ORDER BY created_at ASC"
+            "SELECT id, status, converted_task_id, reopen_generation "
+            f"FROM needfix{clause} ORDER BY created_at ASC"
         ).fetchall()
-        records = [_row_to_dict(r) for r in rows]
+        records = [dict(r) for r in rows]
     finally:
         conn.close()
 
