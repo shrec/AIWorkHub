@@ -31,6 +31,7 @@ unless you start the opt-in WorkHub Mail listener on a host and port you name.
 - The reconciler's attribution pass reads only the accepted cards' receipts instead of decoding every card: about 90 MB instead of 1.5 GB per pass.
 - Fewer MCP server processes: the extension keeps one live server per owner across restarts and reaps it on dispose, instead of piling up 2-3 per window plus one per chat.
 - Faster idle housekeeping: the process-ledger read uses a persisted checkpoint, 0.55 s instead of 12.6 s.
+- The built-in Manager starts again on the `codex_cli` backend (GitHub #33), and the [callback docs](https://github.com/shrec/AIWorkHub/blob/main/docs/CALLBACKS.md#manager-transports) now say which chats are woken automatically: the built-in Manager and Claude Code are, a Codex sidebar chat is inbox-only.
 
 ## Review automation
 

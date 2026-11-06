@@ -20,6 +20,9 @@ noted by package/extension version and release tag.
 
 - An isolated-reconcile test no longer asserts a 5 ms wall-clock ceiling that failed on the macOS CI runner and blocked the 0.12.89 release (NF-2026-02117).
 - The build-lane serialization test forces the two runs to overlap instead of assuming they do, so it no longer fails on a loaded machine (NF-2026-02119).
+- The lifecycle source-guard tests read a wider window, so the new teardown comments no longer push the guarded calls out of range (NF-2026-02120).
+- A built-in Manager turn on the `codex_cli` backend starts again: the generated Codex `config.toml` now names the MCP server's `command`, without which Codex refused the table with "invalid transport in mcp_servers.AIWorkHub" (GitHub #33, NF-2026-02121).
+- The callback docs describe delivery per client after the Codex mux retirement. The built-in Manager and Claude Code are woken automatically; a Codex VS Code sidebar chat is inbox-only, and its `route_pending` / `codex_thread_id_not_observed` state is expected, not a broken install (GitHub #33, NF-2026-02122).
 
 ## [0.12.89] - 2026-11-06
 
