@@ -15,8 +15,8 @@ keeps no testmap client of its own. It selects only the files pytest collects by
 related test yields an empty selection with a named ``reason``, which the lane
 records and which does not block acceptance. A selected run that fails, or that
 returns no evidence, refuses the accept with ``neighbour_tests_failed:``, unless
-every node still red after the serial rerun also fails on the combined tree's
-base commit: that is recorded as ``base_red`` and does not refuse (NF-2026-02101).
+every node still red after the serial rerun also fails on a full checkout of
+canonical HEAD: that is recorded as ``base_red`` and does not refuse (NF-2026-02101).
 """
 
 from __future__ import annotations
@@ -508,7 +508,7 @@ def run_neighbour_tests(
     ``MAX_REPORTED_FAILURES``) re-runs only those nodes once, serially; an
     all-green rerun is recorded as ``neighbour_flaky_rerun`` and does not refuse.
     NF-2026-02101: nodes still red after that rerun run once more on
-    ``workspace``'s base commit (``base_workspace``, default
+    a full checkout of canonical HEAD as it is now (``base_workspace``, default
     :func:`base_commit_workspace`); when every one of them fails there too the
     failure is not the candidate's and is recorded as ``base_red`` instead of
     refusing. A base that cannot be built or judged refuses as before.
