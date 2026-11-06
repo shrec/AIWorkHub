@@ -205,7 +205,7 @@ def test_task_db_holders_entry_cap_marks_truncated(fake_proc, monkeypatch):
 def test_task_db_holders_unsupported_off_linux(monkeypatch):
     monkeypatch.setattr(platform_io, "is_linux", lambda _name=None: False)
     result = doctor.task_db_holders("/definitely/not/proc")
-    assert result == {"supported": False, "reason": sys.platform}
+    assert result == {"supported": False, "reason": "linux_only"}
 
 
 def test_doctor_reply_carries_task_db_holders(monkeypatch):

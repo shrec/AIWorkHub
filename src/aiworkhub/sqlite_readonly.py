@@ -41,6 +41,8 @@ import sqlite3
 import tempfile
 from pathlib import Path
 
+from . import platform_io
+
 # sqlite3.connect()'s documented default timeout; preserved for call sites
 # that previously omitted an explicit timeout argument.
 DEFAULT_TIMEOUT = 5.0
@@ -135,7 +137,12 @@ def connect_readonly(path: str | Path, *, timeout: float = DEFAULT_TIMEOUT) -> s
         return _open(f"{base_uri}?mode=ro", timeout=timeout, fallback=None)
     except sqlite3.Error as exc:
         if not _readonly_storage_failure(exc, resolved):
-            raise
+            # Not the read-only-WAL case the probe exists to catch: hand back an
+            # unprobed reader, so the error (a non-SQLite or corrupt file, a busy
+            # lock) surfaces on the caller's own first query, inside the error
+            # handling every caller already has -- the contract before
+            # NF-2026-02130 made the probe unconditional (NF-2026-02136).
+            return _open(f"{base_uri}?mode=ro", timeout=timeout, fallback=None, probe=False)
     return _open(
         f"{base_uri}?mode=ro&immutable=1",
         timeout=timeout,
@@ -157,12 +164,15 @@ def _sqlite_connect(uri: str, *, timeout: float) -> sqlite3.Connection:
     return sqlite3.connect(uri, uri=True, timeout=timeout, factory=ReadonlyConnection)
 
 
-def _open(uri: str, *, timeout: float, fallback: str | None) -> sqlite3.Connection:
+def _open(
+    uri: str, *, timeout: float, fallback: str | None, probe: bool = True
+) -> sqlite3.Connection:
     conn = _sqlite_connect(uri, timeout=timeout)
     opened = False
     try:
         conn.execute("PRAGMA query_only=ON")
-        conn.execute(_PROBE_SQL).fetchone()
+        if probe:
+            conn.execute(_PROBE_SQL).fetchone()
         opened = True
     finally:
         if not opened:
@@ -210,7 +220,7 @@ def _writable_file(path: Path) -> bool:
     ``os.access`` asks the kernel and creates no descriptor at all.
     """
 
-    if os.name == "nt":
+    if platform_io.is_windows():
         # Windows byte-range locks belong to the handle that took them, so this
         # probe drops none; and only an open sees an ACL deny (an AppContainer
         # worker sandbox), which os.access misses: it checks the attribute only.

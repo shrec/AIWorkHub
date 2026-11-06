@@ -48,7 +48,7 @@ class _Counters:
         self.schema = 0
         self.inspect = 0
         self.registry = 0
-        real_schema = task_store._schema_ok
+        real_schema = task_store._schema_probe
         real_inspect = task_store.inspect_repository
         real_registry = task_store.load_storage_registry
 
@@ -64,7 +64,7 @@ class _Counters:
             self.registry += 1
             return real_registry(root, **kwargs)
 
-        monkeypatch.setattr(task_store, "_schema_ok", schema)
+        monkeypatch.setattr(task_store, "_schema_probe", schema)
         monkeypatch.setattr(task_store, "inspect_repository", inspect)
         monkeypatch.setattr(task_store, "load_storage_registry", registry)
 

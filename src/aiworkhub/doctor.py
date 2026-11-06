@@ -384,7 +384,7 @@ def task_db_holders(
     unsupported platform or an unresolvable DB is reported as data.
     """
     if not platform_io.is_linux():
-        return {"supported": False, "reason": sys.platform}
+        return {"supported": False, "reason": "linux_only"}
     try:
         return _scan_task_db_holders(os.fspath(proc_root), db_path)
     except Exception as exc:
