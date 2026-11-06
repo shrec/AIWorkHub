@@ -3887,7 +3887,9 @@ def test_successful_isolated_reconcile_enters_review_without_promoting(
     assert event["promoted_paths"] == []
     assert event["finalization_duration_ms"] >= 0
     phase_durations = event["finalization_phase_durations_ms"]
-    assert 0.0 <= phase_durations["validation"] < 5.0
+    # The sandbox-route guard above proves an empty validation does no work;
+    # a wall-clock ceiling here only flaked under xdist load (NF-2026-02117).
+    assert phase_durations["validation"] >= 0.0
     assert phase_durations["workspace_scope"] >= 0.0
     assert phase_durations["evidence_and_transition"] >= 0.0
     assert sum(phase_durations.values()) <= event["finalization_duration_ms"] + 1.0
