@@ -30,7 +30,7 @@ import threading
 import time
 import traceback
 import uuid
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -75,6 +75,7 @@ from . import quality_review_ingest
 from . import quality_review_scope
 from . import process_event_ledger
 from . import storage_retention, terminal_failure_classification, validation_auto_rework
+from . import finalize_retry_dispatch
 from . import reviewer_launch_refusal as _refusal
 from .process_launcher_acceptance import accepted_outcome_receipt as _accepted_outcome_receipt
 from .process_launcher_acceptance import changed_path_hashes as _changed_path_hashes
@@ -10190,8 +10191,6 @@ class ProcessManager:
 
         events = self._request_events(request_id)
         event_identity = self._event_identity(events)
-        task_id = str(event_identity.get("task_id") or "")
-        runner = str(event_identity.get("runner") or "")
         error = "finalizer_retries_exhausted:" + "|".join(errors)
 
         # Exhausting three attempts inside a 250ms budget is not by itself
@@ -10241,71 +10240,16 @@ class ProcessManager:
                 ),
             }, disposition="retained_in_place")
 
-        release_result: dict[str, Any] = {
-            "ok": False,
-            "stderr": "request_identity_missing",
-            "callback_enqueued": False,
-        }
-        if task_id and runner:
-            release_result = task_engine.mark_terminal_failure(
-                self.repo,
-                task_id,
-                runner,
-                "finalize_failed",
-                evidence={
-                    "request_id": request_id,
-                    "error": error[:500],
-                    "supervisor_returncode": supervisor_returncode,
-                    "finalize_attempts": len(errors),
-                },
-                request_id=request_id,
-            )
-        transition_reason = str(
-            release_result.get("stderr") or release_result.get("stdout") or ""
+        # NF-2026-02099: one finalize_failed recorder, shared with the detached retry.
+        return finalize_retry_dispatch.record_finalizer_failed(
+            self,
+            request_id,
+            supervisor_returncode,
+            event_identity,
+            error,
+            len(errors),
+            finalization_started,
         )
-        # "retries exhausted" must mean the attempt is over, not that the next
-        # reconcile round begins. When the terminal transition fails because the
-        # target card is no longer processing -- archived, deleted, or reclaimed
-        # -- no future reconcile can move it, so terminalize as
-        # ``finalize_abandoned`` (a terminal, non-re-arming state) with a named
-        # cause an operator can count. Only a card that may still be processing
-        # keeps ``reconcile_pending`` so its legitimate retry survives.
-        abandon_cause = (
-            None
-            if release_result.get("ok")
-            else _finalizer_card_not_processing(transition_reason)
-        )
-        if release_result.get("ok"):
-            terminal_state = "finalize_failed"
-            error_detail = error
-            unlink_if_regular(self._terminal_authority_grant_path(request_id))
-        elif abandon_cause is not None:
-            terminal_state = "finalize_abandoned"
-            error_detail = (
-                error + ":finalize_abandoned:" + abandon_cause + ":" + transition_reason
-            )
-        else:
-            terminal_state = "reconcile_pending"
-            error_detail = error + ":terminal_transition_failed:" + transition_reason
-        return self._retention_event({
-            **event_identity,
-            "request_id": request_id,
-            "state": terminal_state,
-            "worker_terminal_state": (
-                "finalize_abandoned"
-                if terminal_state == "finalize_abandoned"
-                else "finalize_failed"
-            ),
-            "exit_code": supervisor_returncode,
-            "finished_at": _utcnow(),
-            "finalizer_abandoned": terminal_state == "finalize_abandoned",
-            "release_transition_ok": bool(release_result.get("ok")),
-            "callback_enqueued": bool(release_result.get("callback_enqueued")),
-            "finalization_duration_ms": round(
-                (time.monotonic() - finalization_started) * 1000.0, 3
-            ),
-            **terminal_failure_classification.terminal_event_authority(state=terminal_state, exit_code=supervisor_returncode, error=error_detail[:500]),
-        }, disposition="retained_in_place")
 
     def _reconcile_persisted_requests(self) -> dict[str, int]:
         watched = 0
@@ -12840,12 +12784,24 @@ class ProcessManager:
         request whose adapter is outside that allowlist is refused up front
         with ``validation_lane_forbidden_for_adapter:<adapter>`` before any
         event write or card transition (NF-2026-01645).
+
+        NF-2026-02099: admission (every refusal) is answered synchronously;
+        the admitted finalize runs detached and, unless it settles within the
+        dispatcher's short grace, the caller gets a receipt while the terminal
+        review arrives as the usual callback.
         """
-        with _FinalizerHeartbeat(request_id) as heartbeat:
-            result = self._retry_finalization(request_id, task_id, validation_lane, heartbeat)
-        # NF-2026-01922: the retried finalize released its lock; a planned auto-return runs now.
-        validation_auto_rework.after_finalize(self, result)
-        return result
+
+        def _run() -> dict[str, Any]:
+            with _FinalizerHeartbeat(request_id) as heartbeat:
+                result = self._retry_finalization(request_id, task_id, validation_lane, heartbeat)
+            # NF-2026-01922: the retried finalize released its lock; a planned
+            # auto-return runs now -- unless the finalize was deferred, which
+            # (as in ``_finalize_after_process_exit``) settles nothing.
+            if not result.get("reconciliation_deferred"):
+                validation_auto_rework.after_finalize(self, result)
+            return result
+
+        return finalize_retry_dispatch.dispatch(request_id, task_id, _run)
 
     def _retry_finalization(
         self,
@@ -12871,7 +12827,15 @@ class ProcessManager:
                 "error": str(exc)[:200],
             }
         host_lane = lane == _launcher_validation.MANAGER_HOST_VALIDATION_LANE
-        with self._request_lock(request_id):
+        # NF-2026-02099: OS request locks die with their holder, so a busy lock
+        # names a LIVE finalizer: refuse now instead of queueing behind it.
+        admission = ExitStack()
+        try:
+            admission.enter_context(self._request_lock(request_id, blocking=False))
+        except (OSError, AdvisoryLockTimeout) as exc:
+            return {"ok": False, "request_id": request_id, "task_id": task_id,
+                    "error": f"finalization_retry_request_lock_busy:{type(exc).__name__}"}
+        with admission:
             events = self._request_events(request_id)
             if not events:
                 return {
@@ -12930,12 +12894,19 @@ class ProcessManager:
                 host_lane
                 and latest_state in _launcher_validation.HOST_LANE_RETRYABLE_STATES
             )
+            # NF-2026-02099: a finalizing row is reclaimed only on proof of death.
+            finalizer = finalize_retry_dispatch.abandoned_finalizer_state(latest) if latest_state == "finalizing" else "live"
+            if finalizer == "unknown":
+                return {"ok": False, "request_id": request_id, "task_id": task_id,
+                        "error": "finalization_retry_finalizer_liveness_unknown"}
+            retryable_abandoned = finalizer == "abandoned"
             if (
                 latest_state != "finalize_failed"
                 and not retryable_validation_failure
                 and not retryable_release_pending
                 and not retryable_scope_rejection
                 and not retryable_host_lane
+                and not retryable_abandoned
             ):
                 return {
                     "ok": False,
@@ -13053,7 +13024,7 @@ class ProcessManager:
                 )
             except ValueError as exc:
                 return {"ok": False, "request_id": request_id, "task_id": task_id, "error": str(exc)[:500]}
-            if not retryable_release_pending:
+            if not retryable_release_pending and not retryable_abandoned:
                 transition = task_engine.retry_finalize_failed(
                     self.repo,
                     task_id,
@@ -13110,25 +13081,10 @@ class ProcessManager:
                 "finalization_retry_provider_launched": False,
                 "finalization_started_at": _utcnow(),
                 **({"toolchain_authority_receipt_refreshed": receipt_drift} if receipt_drift else {}),
+                **({"finalization_retry_reclaimed_abandoned": True} if retryable_abandoned else {}),
             })
-
-        event = self._finalize_isolated_request(request_id, 0)
-        if event is None:
-            return {
-                "ok": False,
-                "request_id": request_id,
-                "task_id": task_id,
-                "error": "finalization_retry_no_terminal_event",
-            }
-        return {
-            "ok": str(event.get("state") or "") == "review_ready",
-            "request_id": request_id,
-            "task_id": task_id,
-            "state": event.get("state"),
-            "provider_relaunched": False,
-            "workspace_retained": event.get("workspace_retained"),
-            "error": event.get("error") or "",
-        }
+            finalize_retry_dispatch.mark_admitted(request_id)  # NF-2026-02099: caller gets its receipt
+        return finalize_retry_dispatch.settle_admitted(self, request_id, task_id)  # NF-2026-02099
 
     def _candidate_reachability_inputs(
         self, workspace: Any, changed: Iterable[str]
