@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.12.91 — 2026-11-06
+
+### Fixed
+
+- Republishes 0.12.90, whose GitHub release was blocked by a test timing assumption on the Linux and macOS CI runners. The bundled runtime is unchanged.
+
 ## 0.12.90 — 2026-11-06
 
 ### Changed

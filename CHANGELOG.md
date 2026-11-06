@@ -6,6 +6,12 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.91] - 2026-11-06
+
+### Fixed
+
+- The extension test for a fresh MCP start after a terminal stop holds the fresh start until the stopped one settles, so it no longer fails on the Linux and macOS CI runners. That failure kept the 0.12.90 tag from getting a GitHub release, so 0.12.91 ships the 0.12.90 runtime unchanged: every 0.12.90 change in [CHANGELOG.md](https://github.com/shrec/AIWorkHub/blob/main/CHANGELOG.md) (less memory, one MCP server per owner, the GitHub #33 fixes) is in this release (NF-2026-02125).
+
 ## [0.12.90] - 2026-11-06
 
 ### Changed

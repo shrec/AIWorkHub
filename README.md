@@ -379,8 +379,9 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.90
+## What's new in 0.12.91
 
+- 0.12.91 publishes the 0.12.90 memory release: the 0.12.90 tag never got a GitHub release because one extension test failed CI on Linux and macOS. The runtime is the same.
 - Much less memory: the plan snapshot, dashboard and workforce catalog read a narrow projection of each task card instead of decoding every card, so one read peaks at about 160 MB instead of 1.5 GB.
 - `needfix_list` no longer holds every task card and NeedFix row in memory to show one page.
 - The reconciler's attribution pass reads only the accepted cards' receipts instead of decoding every card: about 90 MB instead of 1.5 GB per pass.

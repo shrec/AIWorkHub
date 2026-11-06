@@ -24,8 +24,9 @@ MCP stdio runtime on the workspace host. It does not open a browser or require
 an AIWorkHub cloud account, and it binds no port and exposes no LAN service
 unless you start the opt-in WorkHub Mail listener on a host and port you name.
 
-## What's new in 0.12.90
+## What's new in 0.12.91
 
+- 0.12.91 publishes the 0.12.90 memory release: the 0.12.90 tag never got a GitHub release because one extension test failed CI on Linux and macOS. The runtime is the same.
 - Much less memory: the plan snapshot, dashboard and workforce catalog read a narrow projection of each task card instead of decoding every card, so one read peaks at about 160 MB instead of 1.5 GB.
 - `needfix_list` no longer holds every task card and NeedFix row in memory to show one page.
 - The reconciler's attribution pass reads only the accepted cards' receipts instead of decoding every card: about 90 MB instead of 1.5 GB per pass.
