@@ -3194,7 +3194,7 @@ def _manager_contract() -> dict[str, Any]:
                 ],
                 "recovery_surfaces": [
                     "aiworkhub_task_health and same-task receipts",
-                    "aiworkhub_repository_current and aiworkhub_manager_bootstrap",
+                    "aiworkhub_repo_current and aiworkhub_manager_bootstrap",
                     "provider callback receipt and completion inbox",
                 ],
             },
@@ -3214,7 +3214,7 @@ def _manager_contract() -> dict[str, Any]:
                     "Does not treat callbacks or worker claims as acceptance.",
                 ],
                 "recovery_surfaces": [
-                    "aiworkhub_manager_bootstrap and aiworkhub_repository_current",
+                    "aiworkhub_manager_bootstrap and aiworkhub_repo_current",
                     "aiworkhub_task_plan_snapshot and preflight/workforce receipts",
                     "aiworkhub_task_mark_done or aiworkhub_task_reject_review",
                 ],
@@ -3253,7 +3253,7 @@ def _manager_contract() -> dict[str, Any]:
             ],
             "start_sequence": [
                 "aiworkhub_manager_bootstrap",
-                "aiworkhub_repository_current and aiworkhub_task_health",
+                "aiworkhub_repo_current and aiworkhub_task_health",
                 "aiworkhub_manager_source_graph_query with focus/slice and workflow_stage=orientation before built-in code discovery",
                 "aiworkhub_manager_session_current_state, one task-specific AI Memory query, and KB only when relevant",
                 "aiworkhub_task_plan_snapshot before creating or launching a dependency wave",

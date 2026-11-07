@@ -2615,7 +2615,7 @@ def snapshot_view(
 ) -> dict[str, Any]:
     """READ-ONLY: build the canonical dashboard queue, health, and storage snapshot for the active repository.
 
-    Use the default compact mode for manager queue summaries and status counts, or full=True for the native Webview payload; use aiworkhub_dashboard_health for a cheap connection check or aiworkhub_dashboard_task_detail for one task card. Reads canonical SQLite state and cached storage telemetry without mutating tasks or launching processes.
+    Use the default compact mode for manager queue summaries and status counts, or full=True for the native Webview payload; use the cheap connection-check view or the single task-card detail view instead. Reads canonical SQLite state and cached storage telemetry without mutating tasks or launching processes.
 
     Args:
         full: bool (default False); True returns full task, process, and ledger collections, False returns the compact summary.
@@ -4219,7 +4219,7 @@ def needfix_transition_view(
 ) -> dict[str, Any]:
     """USER WRITE: apply one confirmed lifecycle status transition to a NeedFix item.
 
-    Use this to triage, accept, reject, defer, mark duplicate or task_planned, resolve, or recover a conversion claim; use aiworkhub_dashboard_needfix_archive, aiworkhub_dashboard_needfix_restore, or aiworkhub_dashboard_needfix_convert_commit instead. Requires confirm=True, persists the transition and audit event, and returns a transition receipt.
+    Use this to triage, accept, reject, defer, mark duplicate or task_planned, resolve, or recover a conversion claim; use the archive, restore, or convert-commit action instead. Requires confirm=True, persists the transition and audit event, and returns a transition receipt.
 
     action=resolve only moves task_created -> resolved; a refused resolve names both routes in resolve_routes. A fix landed without a task uses action=resolve_verified from accepted or task_planned with readiness_score=100, evidence and evidence_refs; a 'commit:<sha>' ref not reachable from HEAD is refused with needfix_resolve_commit_not_reachable:<sha>. A `Resolves: NF-YYYY-NNNNN` trailer on a HEAD-reachable commit also resolves it.
 

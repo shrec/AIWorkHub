@@ -3036,8 +3036,8 @@ def aiworkhub_manager_skill_mine(
     selection dimensions are left blank for the manager to fill in.
 
     Read-only. It produces proposals, never activations: the returned draft
-    reaches the store only if a manager passes it to
-    ``aiworkhub_manager_skill_propose``, and activation remains gated on
+    reaches the store only if a manager proposes it through the skill-proposal step,
+    and activation remains gated on
     evidence from two distinct actor identities.
 
     Args:
@@ -7272,7 +7272,7 @@ def aiworkhub_agent_accept_review(
     ``{"patch": <unified diff>, "finding_ids": ["reviewer:<lens>:<id>", ...],
     "reason": str}``. It lifts the ``refinement_required`` blocker of each
     named finding that a selected reviewer reported and
-    ``aiworkhub_agent_dispose_review_finding`` already recorded as
+    ``aiworkhub_manager_review_finding_dispose`` already recorded as
     ``confirmed``, provided its severity is not blocking. The patch is
     validated before any promotion or state change and refuses with
     ``manager_correction_invalid:<reason>`` when the manager is unverified, the
@@ -7559,7 +7559,7 @@ def aiworkhub_dispatcher_ensure_started() -> dict[str, Any]:
 def aiworkhub_dispatcher_health() -> dict[str, Any]:
     """READ-ONLY: dispatcher running/stopped, selected coordinator target,
     repository identity, pending callback count, and last delivery/error.
-    Use when callbacks stop arriving; use aiworkhub_doctor_diagnose for a cross-subsystem verdict."""
+    Use when callbacks stop arriving; for a cross-subsystem verdict run the one-call doctor check."""
 
     return core.dispatcher_health()
 
@@ -7664,7 +7664,7 @@ def _source_graph_detail_reply(result: Any, tool: str, detail: str) -> Any:
 def aiworkhub_source_graph_health(detail: StatusDetail = "summary") -> dict[str, Any]:
     """READ-ONLY: Source Graph indexing daemon health for the active
     repository -- indexing/ready/degraded status, last report/error/time.
-    Use when Source Graph answers look stale or fail; use aiworkhub_doctor_diagnose for a cross-subsystem verdict.
+    Use when Source Graph answers look stale or fail; for a cross-subsystem verdict run the one-call doctor check.
 
     ``detail="summary"`` (default) keeps every top-level scalar exact and folds
     each top-level dict/list to ``{summarized, bytes, sha256}`` plus its own
@@ -7944,7 +7944,7 @@ def aiworkhub_quality_run_checks(changed_paths: list[str] | None = None) -> dict
     """Run repo-declared .aiworkhub/quality.json build/test/lint/typecheck
     commands (argv arrays only, shell=False). Fails closed on malformed
     config. Diff/new-code-first: pass ``changed_paths`` to scope evidence.
-    Use to gate a change on the declared checks; use aiworkhub_quality_profile first if unsure what is declared.
+    Use to gate a change on the declared checks; read the declared profile first if unsure what is declared.
 
     Args:
         changed_paths: Repository-relative paths changed by the task; scopes which declared checks apply and is recorded as each check's affected_paths. Omit to run the checks unscoped.
@@ -9010,7 +9010,7 @@ def roadmap_snapshot(
 
     Use this to see what is done, blocked or ready across the roadmap in one call. The
     other roadmap tools return stored fields only: ``roadmap_list`` the outcome rows,
-    ``roadmap_show`` one outcome and ``roadmap_events`` its audit trail. Read-only.
+    ``roadmap_show`` one outcome with its stored fields. Read-only.
 
     The reply is ``aiworkhub.roadmap_snapshot.v1``: ``total`` and ``active`` outcome
     counts, ``status_counts``, ``items`` (up to ``limit`` outcome rows) and ``truncated``.
