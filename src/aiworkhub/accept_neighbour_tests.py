@@ -34,6 +34,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from . import accept_neighbour_nodes as _nodes
 from . import card_contract_advice as _advice
 from . import worker_workspace as _workspace
 from .sdlc_attribution import is_test_path
@@ -47,7 +48,7 @@ MAX_NEIGHBOUR_TESTS = 12
 DEFAULT_NEIGHBOUR_LIMIT = MAX_NEIGHBOUR_TESTS
 # Repository-wide invariants no testmap links to one module; they run whenever
 # a src/ module changed and do not count against the neighbour cap.
-INVARIANT_TESTS = ("tests/test_module_size_ratchet.py",)
+INVARIANT_TESTS = ("tests/test_module_size_ratchet.py", "tests/test_os_dependency_boundary.py")
 # NF-2026-01947: a test that loads a changed module by path ("<stem>.py") has no
 # testmap import edge, and a NAME_MAX_LINES ratchet on a module with many related
 # tests can rank below the neighbour cap. Both run whenever their module changed,
@@ -91,6 +92,10 @@ class NeighbourSelection:
     referencing: tuple[str, ...] = ()
     referencing_omitted: int = 0
     referencing_reason: str = ""
+    # NF-2026-02102: "node" or "file_fallback"; empty when no candidate_root was given.
+    selection_mode: str = ""
+    node_count: int = 0
+    fallback_reasons: tuple[Mapping[str, str], ...] = field(default=())
 
     def evidence(self) -> dict[str, Any]:
         ranked = len(self.tests) - len(self.invariant) - len(self.referencing)
@@ -112,6 +117,11 @@ class NeighbourSelection:
             record["reason"] = self.reason
         if self.unavailable_paths:
             record["unavailable_paths"] = [dict(row) for row in self.unavailable_paths]
+        if self.selection_mode:
+            record["selection_mode"] = self.selection_mode
+            record["node_level"] = self.selection_mode == "node"
+            record["node_count"] = self.node_count
+            record["fallback_reasons"] = [dict(row) for row in self.fallback_reasons]
         return record
 
 
@@ -140,17 +150,22 @@ def select_neighbour_tests(
     declared_commands: Sequence[str],
     *,
     limit: int = DEFAULT_NEIGHBOUR_LIMIT,
+    candidate_root: Path | str | None = None,
 ) -> NeighbourSelection:
     """Rank the related tests of ``changed_paths`` that ``declared_commands`` miss.
 
     Highest testmap score first, ties by path, capped at ``limit`` (at most
     ``MAX_NEIGHBOUR_TESTS``). Only test files present under ``repo_root`` are
-    kept. ``INVARIANT_TESTS`` and the tests that load a changed module by path
-    or ratchet its size follow, outside that cap. Never raises.
+    kept. With ``candidate_root`` the impacted test nodes replace those files
+    when every changed path maps to nodes (NF-2026-02102). ``INVARIANT_TESTS``
+    and the tests that load a changed module by path or ratchet its size
+    follow, outside that cap. Never raises.
     """
     bounded = _bounded_limit(limit)
     try:
-        selection = _select(Path(repo_root), changed_paths, declared_commands, bounded)
+        selection = _select(
+            Path(repo_root), changed_paths, declared_commands, bounded, candidate_root
+        )
     except Exception as exc:  # the lane is evidence-gathering: it records, never raises
         selection = _empty(f"neighbour_selection_failed:{type(exc).__name__}", bounded)
     try:
@@ -335,6 +350,7 @@ def _select(
     changed_paths: Iterable[Any],
     declared_commands: Sequence[str],
     limit: int,
+    candidate_root: Path | str | None = None,
 ) -> NeighbourSelection:
     if limit == 0:
         return _empty("neighbour_limit_zero", limit)
@@ -366,13 +382,62 @@ def _select(
     }
     ranked = sorted(runnable.items(), key=lambda item: (-item[1], item[0]))
     tests = tuple(test for test, _score in ranked[:limit])
-    return NeighbourSelection(
+    selection = NeighbourSelection(
         tests=tests,
         reason="" if tests else "no_related_tests",
         limit=limit,
         production_paths=consulted,
         related_count=len(ranked),
         unavailable_paths=tuple(unavailable),
+    )
+    if candidate_root is None:
+        return selection
+    try:
+        return _with_nodes(root, Path(candidate_root), selection, freshness, named)
+    except Exception as exc:  # unknown never selects fewer than the file rule
+        failed = ({"path": "", "reason": f"node_selection_failed:{type(exc).__name__}"},)
+        return replace(selection, selection_mode="file_fallback", fallback_reasons=failed)
+
+
+def _with_nodes(
+    root: Path,
+    candidate_root: Path,
+    selection: NeighbourSelection,
+    freshness: Mapping[str, str],
+    named: Sequence[str],
+) -> NeighbourSelection:
+    """NF-2026-02102: the impacted test nodes replace the ranked files only when
+    every production path maps to nodes; any fallback keeps the file selection."""
+    nodes, reasons = _nodes.select_nodes(
+        root, candidate_root, selection.production_paths, freshness
+    )
+    files = {node: node.split("::", 1)[0] for node in nodes}
+    kept = tuple(
+        node for node in nodes
+        if files[node] not in INVARIANT_TESTS and not _advice._covers(named, files[node])
+    )
+    reasons += tuple(
+        {"path": node, "reason": "node_unrunnable"}
+        for node in kept
+        if not (
+            _NODE_ID.fullmatch(node)
+            and _COLLECTED_TEST_PATH.fullmatch(files[node])
+            and (root / files[node]).is_file()
+        )
+    )
+    # Node ids come from the canonical index: a candidate-edited test file may lack them.
+    same = {
+        f: _nodes.unchanged_in_candidate(root, candidate_root, f) for f in {files[n] for n in kept}
+    }
+    reasons += tuple(
+        {"path": node, "reason": "test_file_changed_in_candidate"}
+        for node in kept if not same[files[node]]
+    )
+    if reasons:
+        return replace(selection, selection_mode="file_fallback", fallback_reasons=reasons)
+    return replace(
+        selection, tests=kept, reason="" if kept else "no_related_tests",
+        related_count=len(kept), selection_mode="node", node_count=len(kept),
     )
 
 
@@ -648,6 +713,7 @@ def run_finalization_neighbours(
     workspace: Any,
     route_metadata: Mapping[str, Any],
     clock: Callable[[], float] = time.monotonic,
+    candidate_root: Path | str | None = None,
 ) -> dict[str, Any] | None:
     """Select and run the neighbours once in the finalization snapshot.
 
@@ -655,7 +721,9 @@ def run_finalization_neighbours(
     evidence-free run is recorded with ``passed: False`` (and its refusal text
     under ``error``), so finalization stands and the accept runs it again.
     """
-    selection = select_neighbour_tests(repo_root, candidate_changed_paths, declared_commands)
+    selection = select_neighbour_tests(
+        repo_root, candidate_changed_paths, declared_commands, candidate_root=candidate_root
+    )
     if not selection.tests:
         return None
     started = clock()

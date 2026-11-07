@@ -1035,6 +1035,7 @@ def run_full_snapshot_validations(
 
             neighbours = accept_neighbour_tests.run_finalization_neighbours(
                 workspace.repo, candidate, authority, commands, workspace=snapshot,
+                candidate_root=snapshot.path,
                 route_metadata=route_metadata, run=lambda ws, auth, meta: (
                     run_declared_validations(
                         ws, auth, meta, run_validations=run_validations,

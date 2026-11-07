@@ -3891,7 +3891,9 @@ def accept_review(
             from . import accept_neighbour_tests
 
             neighbour_selection = accept_neighbour_tests.select_neighbour_tests(
-                self.repo, changed, _declared_validation_commands(card)
+                self.repo, changed, _declared_validation_commands(card),
+                # NF-2026-02102: the candidate copy the finalization snapshot also holds.
+                candidate_root=getattr(workspace, "path", None),
             )
             neighbour_tests = neighbour_selection.evidence()
             # Sparse omission is not policy deletion. Enforce the inherited
