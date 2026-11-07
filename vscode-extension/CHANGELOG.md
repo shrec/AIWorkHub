@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.12.94 — 2026-11-08
+
+### Fixed
+
+- Bundles runtime 0.12.94: on Linux a sandboxed worker can run cmake, ninja and the linker in its own temp directory, cards that need a native toolchain or a shell are no longer routed to the VS Code LM adapters, the known-bug gate blocks only on findings a candidate introduces, and `request.json` has one shared size bound.
+- Fewer manager tokens per card: review callbacks carry a compact review digest, task status and show default to a ~2 KB brief view, and a NeedFix converts to a card in one call.
+
 ## 0.12.93 — 2026-11-07
 
 ### Fixed

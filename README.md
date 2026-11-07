@@ -379,15 +379,15 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.93
+## What's new in 0.12.94
 
-- The dashboard no longer shows "Dashboard snapshot delayed (mcp_request_timeout)" every few minutes. The work-card decision counts grouped on an expression that read each card's JSON, so SQLite copied about 450 MB of cards into its sort on every 30 s snapshot (5-8 s). The population is now computed once and the small result is grouped: 0.06 s. A freshly reloaded window gets its first summary in about 2 s.
-- A delayed snapshot is shown under its own heading, "Dashboard snapshot delayed", instead of "MCP connection unavailable".
-- Auto-rework stops when a relaunched candidate is byte-identical to the one that just failed, instead of relaunching the same bytes again.
-- Tool descriptions and the manager bootstrap contract name only tools that exist on the same MCP profile (`aiworkhub_repo_current`, not `aiworkhub_repository_current`), with writes on and off.
-- The manager tool list has 15 fewer entries (115 with writes on): manager-loop control, the VS Code LM worker bridge and legacy lifecycle tools are unlisted but still callable by exact name.
-- Near-duplicate tools (review, status, health, NeedFix, Roadmap) each say which sibling to use instead.
-- The background callback watcher runs its seed-eligible card scan at most once per 30 s instead of on every 2 s poll.
+- Linux: a Landlock-sandboxed worker can run cmake, ninja and the linker in its own temp directory; chmod-family calls there are brokered instead of denied.
+- Cards whose validation needs a native toolchain or a shell (cmake, make, ninja, cargo, npm, bash, ...) are no longer routed to the VS Code LM adapters, which cannot run them.
+- The known-bug-pattern gate blocks only on findings the candidate introduces; findings already in the tree are reported, not blocking. `cpp.literal_divide_zero` no longer matches literals such as `0.25f`.
+- `request.json` has one shared size bound, enforced when the file is written, instead of each reader's own 1-2 MiB cap.
+- Fewer manager tokens per card: review callbacks carry a compact review digest, `aiworkhub_agent_task_status` and `aiworkhub_task_show` default to a ~2 KB brief view, and a NeedFix converts to a card in one call.
+- The accept neighbour lane runs only the test functions that call the changed code, and falls back to whole test files when it cannot tell.
+- `scripts/release_cut.py` runs the whole release cut in order and stops at the first failing step.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Continuous Audit as a Service (CAAS)

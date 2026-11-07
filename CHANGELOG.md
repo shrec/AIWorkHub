@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.94] - 2026-11-08
+
+### Changed
+
+- Fewer manager tokens per card. Review callbacks carry a compact review digest, so the manager decides without a separate status/show/packet round trip (NF-2026-02151). `aiworkhub_agent_task_status` and `aiworkhub_task_show` default to a ~2 KB brief lifecycle view (NF-2026-02153). The manager ToolSearch select line covers the measured working set and rides the compact reminder (NF-2026-02149). A NeedFix converts to a card in one call: an explicit-scope plan auto-promotes, and preview plus commit no longer needs a digest round trip (NF-2026-02150).
+- The accept neighbour lane runs the impacted test nodes (the test functions that call a changed function, at most two call hops away) instead of whole related test files; anything it cannot attribute falls back to the file-level selection (NF-2026-02102).
+- `scripts/release_cut.py` runs the whole release cut as one ordered run (version, changelog and README checks, bump, host suite, VSIX package, release commit, WSL suite from a git archive, receipt, tag, optional push) and stops at the first failing step (NF-2026-02152).
+
+### Fixed
+
+- Linux: a Landlock-sandboxed worker can run cmake, ninja and the linker in its own temp directory. chmod-family syscalls under the worker temp root are brokered through seccomp user notification instead of being denied (NF-2026-02155).
+- Cards whose validation needs a native toolchain or a shell (cmake, make, nmake, ninja, cargo, npm, bash, ...) are no longer auto-routed to the VS Code LM adapters, which cannot run them; they fall through to the CLI adapter (NF-2026-02087).
+- The known-bug-pattern gate blocks only on findings the candidate introduces; findings already present in the canonical tree are reported, not blocking (NF-2026-02157). `cpp.literal_divide_zero` no longer matches non-zero literals such as `0.25f` (NF-2026-02156).
+- `request.json` has one shared size bound, enforced when the file is written; every reader uses it instead of its own hand-written 1-2 MiB cap (NF-2026-02154).
+- `bodygrep`: cached files no longer consume the scan file cap, and a target that is not a repository path is refused instead of returning a silent zero-hit (NF-2026-01918).
+- `task_create` emits each routing warning once per runner per server process, and an objective's mention of a `read_first` path or a non-repository path is no longer a scope warning (NF-2026-01955).
+
 ## [0.12.93] - 2026-11-07
 
 ### Fixed
