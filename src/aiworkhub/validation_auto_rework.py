@@ -226,6 +226,18 @@ def _decide(
     if not failing:
         return _manager_record("no_failing_declared_command", prior)
     signature = failure_signature(packet)
+    predecessor = card.get("rework_predecessor")
+    if isinstance(predecessor, dict):
+        predecessor_hashes = predecessor.get("changed_path_hashes")
+        current_hashes = evidence.get("changed_path_hashes")
+        if (
+            isinstance(predecessor_hashes, dict)
+            and predecessor_hashes
+            and isinstance(current_hashes, dict)
+            and current_hashes
+            and current_hashes == predecessor_hashes
+        ):
+            return _manager_record("no_progress", prior, signature)
     if signature in prior_signatures:
         return _manager_record("repeat_signature", prior, signature)
     if prior >= MAX_AUTO_RETURNS:
