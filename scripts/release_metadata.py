@@ -20,6 +20,41 @@ RUNTIME_LITERAL = re.compile(
     re.MULTILINE,
 )
 VALID_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
+# A cut release is a plain MAJOR.MINOR.PATCH whose patch never passes 99:
+# x.y.99 rolls over to x.(y+1).0, never to x.y.100.
+RELEASE_TRIPLE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+PATCH_CEILING = 99
+
+
+def _release_triple(version: str, role: str) -> tuple[int, int, int]:
+    match = RELEASE_TRIPLE.fullmatch(version)
+    if match is None:
+        raise ValueError(f"{role} version {version!r} is not a MAJOR.MINOR.PATCH release")
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
+def successor_version(current: str) -> str:
+    """The patch release after ``current``; x.y.99 rolls over to x.(y+1).0."""
+    major, minor, patch = _release_triple(current, "current")
+    if patch >= PATCH_CEILING:
+        return f"{major}.{minor + 1}.0"
+    return f"{major}.{minor}.{patch + 1}"
+
+
+def validate_successor(current: str, proposed: str) -> None:
+    """Raise unless ``proposed`` is a release above ``current`` with a patch of at most 99."""
+    expected = successor_version(current)
+    release = _release_triple(proposed, "release")
+    if release[2] > PATCH_CEILING:
+        raise ValueError(
+            f"release {proposed} has patch {release[2]} > {PATCH_CEILING}: x.y.{PATCH_CEILING} "
+            f"rolls over to x.(y+1).0, so the release after {current} is {expected}"
+        )
+    if release <= _release_triple(current, "current"):
+        raise ValueError(
+            f"release {proposed} is not greater than the current version {current}; "
+            f"the next release is {expected}"
+        )
 
 
 def changelog_versions(root: Path) -> set[str]:
@@ -72,6 +107,30 @@ NARRATIVE_PROJECTIONS: tuple[tuple[str, str], ...] = (
 # Each release prepended a "What's new" section, so the extension README grew to 116.
 SINGLE_WHATS_NEW_READMES: tuple[str, ...] = ("README.md", "vscode-extension/README.md")
 WHATS_NEW_HEADING = re.compile(r"^## What's new in ", re.MULTILINE)
+# Every document a release carries that is written by hand before the cut.
+RELEASE_DOCUMENTS: tuple[str, ...] = (
+    "CHANGELOG.md",
+    *(relative for relative, _template in NARRATIVE_PROJECTIONS),
+)
+
+
+def whats_new_gap(text: str, version: str) -> str | None:
+    """Why a README is not exactly one ``## What's new in`` section naming ``version``."""
+    headings = [
+        text[match.end() :].split("\n", 1)[0].strip()
+        for match in WHATS_NEW_HEADING.finditer(text)
+    ]
+    if len(headings) > 1:
+        return (
+            "more than one '## What's new in' section; keep only the current "
+            "release, history lives in the CHANGELOG"
+        )
+    if not headings:
+        return f"no '## What's new in {version}' section heading"
+    named = headings[0]
+    if not named.startswith(version) or named[len(version) : len(version) + 1].strip():
+        return f"its '## What's new in' section names {named!r}, not {version}"
+    return None
 
 
 def narrative_mismatches(root: Path, version: str) -> dict[str, str]:
@@ -87,22 +146,29 @@ def narrative_mismatches(root: Path, version: str) -> dict[str, str]:
             continue
         if needle not in text:
             missing[relative] = f"missing {needle!r}"
-        elif (
-            relative in SINGLE_WHATS_NEW_READMES
-            and len(WHATS_NEW_HEADING.findall(text)) > 1
-        ):
-            missing[relative] = (
-                "more than one '## What's new in' section; keep only the current "
-                "release, history lives in the CHANGELOG"
-            )
+        elif relative in SINGLE_WHATS_NEW_READMES:
+            gap = whats_new_gap(text, version)
+            if gap is not None:
+                missing[relative] = gap
     return missing
 
 
+CANONICAL_VERSION_FILE = "src/aiworkhub/_version.py"
+# The generated projections: what ``sync`` rewrites and ``projected_versions``
+# reads (tests/test_release_cut.py asserts both name the same files).
+PROJECTION_FILES: tuple[str, ...] = (
+    "vscode-extension/package.json",
+    "vscode-extension/package-lock.json",
+    "vscode-extension/extension.js",
+    "server.json",
+)
+
+
 def canonical_version(root: Path) -> str:
-    source = (root / "src" / "aiworkhub" / "_version.py").read_text(encoding="utf-8")
+    source = (root / CANONICAL_VERSION_FILE).read_text(encoding="utf-8")
     match = VERSION_LITERAL.search(source)
     if match is None:
-        raise ValueError("canonical version literal is missing from src/aiworkhub/_version.py")
+        raise ValueError(f"canonical version literal is missing from {CANONICAL_VERSION_FILE}")
     version = match.group(1)
     if VALID_VERSION.fullmatch(version) is None:
         raise ValueError(f"canonical version is not release-safe: {version!r}")
@@ -143,7 +209,7 @@ def check(root: Path, *, tag: str = "") -> dict[str, object]:
     mismatches.update(narrative_mismatches(root, canonical))
     return {
         "ok": not mismatches,
-        "canonical_source": "src/aiworkhub/_version.py",
+        "canonical_source": CANONICAL_VERSION_FILE,
         "canonical_version": canonical,
         "projections": projections,
         "release_tag": tag,
@@ -207,6 +273,26 @@ def sync(root: Path) -> dict[str, object]:
     return check(root)
 
 
+def bump(root: Path, version: str) -> dict[str, object]:
+    """Make ``version`` canonical, then project it the way ``sync`` does.
+
+    Anything but a successor of the current canonical version is refused
+    (``validate_successor``). Only the ``__version__`` literal changes: the rest
+    of the canonical file, its newlines included, is kept byte for byte.
+    """
+
+    validate_successor(canonical_version(root), version)
+    path = root / CANONICAL_VERSION_FILE
+    source = path.read_bytes().decode("utf-8")
+    match = VERSION_LITERAL.search(source)
+    if match is None:
+        raise ValueError(f"canonical version literal is missing from {CANONICAL_VERSION_FILE}")
+    _write_text_preserving_newlines(
+        path, source[: match.start(1)] + version + source[match.end(1) :]
+    )
+    return sync(root)
+
+
 def sha256sums(paths: Iterable[Path], output: Path) -> dict[str, str]:
     resolved = sorted((path.resolve() for path in paths), key=lambda path: path.name)
     if not resolved:
@@ -244,6 +330,8 @@ def _parser() -> argparse.ArgumentParser:
     check_parser = subparsers.add_parser("check")
     check_parser.add_argument("--tag", default="")
     subparsers.add_parser("sync")
+    bump_parser = subparsers.add_parser("bump")
+    bump_parser.add_argument("version")
     sums_parser = subparsers.add_parser("checksums")
     sums_parser.add_argument("--output", type=Path, required=True)
     sums_parser.add_argument("artifacts", type=Path, nargs="+")
@@ -261,6 +349,8 @@ def main(argv: list[str] | None = None) -> int:
             result = check(root, tag=args.tag)
         elif args.command == "sync":
             result = sync(root)
+        elif args.command == "bump":
+            result = bump(root, args.version)
         elif args.command == "notes":
             write_release_notes(root, args.tag, args.output)
             result = {"ok": True, "output": str(args.output), "release_tag": args.tag}
