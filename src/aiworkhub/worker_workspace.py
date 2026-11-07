@@ -9901,6 +9901,36 @@ def _kill_validator_group(child_pid: int) -> None:
             pass
 
 
+def _kill_worker_lane_group(child_pid: int) -> None:
+    """SIGKILL the child, then sweep our group if we lead it (killpg misses it; NF-2026-02155)."""
+    import signal
+
+    with contextlib.suppress(OSError):
+        os.kill(child_pid, signal.SIGKILL)
+    if (me := os.getpid()) != os.getpgrp():
+        return
+    with contextlib.suppress(OSError):  # /proc unreadable: nothing more can be swept
+        for _sweep in range(50):  # bounded; a pass that kills nothing ends it
+            killed = 0
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit() or int(entry) == me:
+                    continue
+                try:  # pidfd before the stat check: a pid recycled later is never signalled
+                    pidfd = os.pidfd_open(int(entry))
+                    try:
+                        with open(f"/proc/{entry}/stat", "rb") as handle:
+                            fields = handle.read().rsplit(b")", 1)[1].split()
+                        if fields[0] != b"Z" and int(fields[2]) == me:  # live, pgrp == ours
+                            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                            killed += 1
+                    finally:
+                        os.close(pidfd)
+                except (OSError, IndexError, ValueError):
+                    continue
+            if not killed:
+                return
+
+
 def _reap_validator(child_pid: int) -> None:
     """Best-effort reap of the broker child so it can never become a zombie."""
     try:
@@ -10001,13 +10031,10 @@ def _metadata_broker_syscall_names(library: Any) -> dict[int, str]:
     return table
 
 
-def _install_metadata_notify_filter() -> int:
-    """Install the disposable child's user-notification metadata filter.
-
-    Metadata syscalls are never globally allowed and no continue flag is
-    used: the brokered family traps to the trusted parent, every other
-    denied metadata syscall still returns EPERM in-kernel.
-    """
+def _install_metadata_notify_filter(chmod_only: bool = False) -> int:
+    """Install the child's notify filter: the brokered family (``chmod_only``:
+    chmod alone, worker lane) traps to the parent; the rest is EPERM in-kernel."""
+    brokered = _METADATA_BROKER_CHMOD_SYSCALLS if chmod_only else _METADATA_BROKER_SYSCALLS
     library = _seccomp_notify_library()
     if library is None:
         raise WorkspaceError("seccomp_user_notification_unavailable")
@@ -10017,7 +10044,7 @@ def _install_metadata_notify_filter() -> int:
     listener = -1
     try:
         notified = 0
-        for name in _METADATA_BROKER_SYSCALLS:
+        for name in brokered:
             number = library.seccomp_syscall_resolve_name(name.encode("ascii"))
             if number < 0:
                 continue
@@ -10027,7 +10054,7 @@ def _install_metadata_notify_filter() -> int:
             raise WorkspaceError("seccomp_notify_rules_unavailable")
         action = _SCMP_ACT_ERRNO | errno.EPERM
         for name in _SECCOMP_DENIED_SYSCALLS:
-            if name in _METADATA_BROKER_SYSCALLS:
+            if name in brokered:
                 continue
             number = library.seccomp_syscall_resolve_name(name.encode("ascii"))
             if number < 0:
@@ -10508,25 +10535,17 @@ def _run_metadata_broker(
     child_pid: int,
     scratch: Path,
     extra_roots: "Iterable[Path]" = (),
+    *,
+    deadline_seconds: Any = ...,
+    worker_lane: bool = False,
 ) -> int:
     """Trusted parent loop: emulate only verified brokered operations.
 
-    Opens one stable directory fd for the exact exec scratch and for each
-    additional authorized request-owned root (NF430: the
-    ``.aiworkhub/temp/worker/<request_id>`` temp authority a worker's TMPDIR
-    points at), the single resolution roots handed to every ``openat2``
-    acquisition; polls with a bounded timeout, reaps the child non-blockingly,
-    and enforces an overall deadline. On any deadline or error the entire
-    validator process group is killed and the child reaped, so a wedged
-    validator can never deadlock the broker, orphan descendants, or leak
-    descriptors; every allocated notification pair is freed on every path.
-
-    A nested sandbox that could not install a listener of its own (the kernel
-    permits exactly one per filter tree) stops denying the chmod family in its
-    own fallback filter and lets this loop decide those calls instead
-    (NF-2026-00841). They arrive here as ordinary notifications and are
-    authenticated and resolved by exactly the same scratch roots, owner,
-    symlink, traversal, hardlink and inode checks as any other request.
+    One stable dir fd per root (scratch plus NF430 extra roots) is the sole
+    ``openat2`` root; the loop polls and reaps boundedly. ``deadline_seconds``
+    (``...``: the live _METADATA_BROKER_DEADLINE_SECONDS) caps the loop unless
+    None (worker lane, NF-2026-02155). Any error kills the child -- with
+    ``worker_lane`` its whole shared group -- and frees every notification pair.
     """
     import select
 
@@ -10534,25 +10553,27 @@ def _run_metadata_broker(
     if library is None:
         raise WorkspaceError("seccomp_user_notification_unavailable")
     scratch_specs: list[tuple[int, PurePosixPath]] = []
+    kill_group = _kill_worker_lane_group if worker_lane else _kill_validator_group
+    if deadline_seconds is ...:  # read per call, never bound at import time
+        deadline_seconds = _METADATA_BROKER_DEADLINE_SECONDS
     try:
-        # The exec scratch is the mandatory anchor -- a failure to open it is a
-        # real fault. Every additional root goes through the identical stable-fd
-        # + owner + identity verification; a missing or foreign extra root is
-        # skipped fail-closed rather than widening the broker's authority.
+        # First root is the mandatory anchor; a bad extra root is skipped fail-closed.
         scratch_specs.append(_open_broker_scratch_root(scratch))
         for extra in extra_roots:
             try:
                 scratch_specs.append(_open_broker_scratch_root(Path(extra)))
             except WorkspaceError:
                 continue
-        deadline = time.monotonic() + _METADATA_BROKER_DEADLINE_SECONDS
+        deadline = (
+            None if deadline_seconds is None else time.monotonic() + deadline_seconds
+        )
         poller = select.poll()
         poller.register(listener_fd, select.POLLIN)
         while True:
             reaped, status = os.waitpid(child_pid, os.WNOHANG)
             if reaped == child_pid:
                 return _metadata_broker_exit_code(status)
-            if time.monotonic() > deadline:
+            if deadline is not None and time.monotonic() > deadline:
                 raise WorkspaceError("metadata_broker_deadline_exceeded")
             try:
                 events = poller.poll(_METADATA_BROKER_POLL_MS)
@@ -10564,9 +10585,7 @@ def _run_metadata_broker(
             for _event_fd, mask in events:
                 event_mask |= mask
             if event_mask & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
-                # Listener teardown and child exit are separate kernel events;
-                # allow the leader a short bounded grace to become waitable so
-                # its real exit status is not replaced by a broker error.
+                # Child exit may trail listener teardown: a short bounded reap grace.
                 for _attempt in range(50):
                     reaped, status = os.waitpid(child_pid, os.WNOHANG)
                     if reaped == child_pid:
@@ -10603,33 +10622,27 @@ def _run_metadata_broker(
                     response.error = 0
                     terminal_denial = False
                 except (WorkspaceError, OSError, ValueError) as exc:
-                    # Fail closed with EPERM, but never swallow the cause: retain
-                    # a bounded, path-free denial record so a real rejection is
-                    # diagnosable instead of an opaque generic EPERM (NF430).
+                    # Fail closed with EPERM, keeping a bounded path-free cause (NF430).
                     response.val = 0
                     response.error = -errno.EPERM
                     terminal_denial = _record_metadata_broker_denial(exc, request)
                 if library.seccomp_notify_respond(listener_fd, response_ptr) != 0:
-                    # A respond failure for a no-longer-valid notification (the
-                    # caller died or was killed mid-request) is benign; a
-                    # failure while the id is still live is a real fault.
+                    # Benign for a caller that died mid-request; a live id is a fault.
                     if (
                         library.seccomp_notify_id_valid(listener_fd, request.id)
                         == 0
                     ):
                         raise WorkspaceError("metadata_broker_respond_failed")
                 if terminal_denial:
-                    # The authenticated record is authoritative only because
-                    # this trusted parent makes the denial structurally
-                    # terminal for the command.  It can therefore never mask
-                    # an unrelated candidate failure from the same process.
-                    _kill_validator_group(child_pid)
+                    # The authenticated record is authoritative only because this
+                    # parent makes the denial terminal; it never masks another failure.
+                    kill_group(child_pid)
                     _reap_validator(child_pid)
                     return 126
             finally:
                 library.seccomp_notify_free(request_ptr, response_ptr)
     except BaseException:
-        _kill_validator_group(child_pid)
+        kill_group(child_pid)
         _reap_validator(child_pid)
         raise
     finally:
@@ -11301,18 +11314,14 @@ def _metadata_broker_handshake_receive(sock: Any, deadline: float) -> tuple[int,
 def _metadata_broker_child_exec(argv: list[str]) -> int:
     """Install the notify filter in a freshly exec'd interpreter.
 
-    ``_landlock_exec`` can run inside a multi-threaded pytest or manager
-    process.  Running Python, ctypes and libseccomp between ``fork`` and
-    ``exec`` is not safe in that situation: an inherited runtime/library lock
-    can make the child disappear before it transfers the listener, which the
-    parent observes only as ``handshake_eof``.  The parent therefore starts
-    this small helper with ``Popen`` (whose fork/exec path stays in CPython's C
-    implementation) and all non-trivial setup happens after a fresh exec.
+    Python/ctypes/libseccomp between fork and exec of a threaded parent can
+    deadlock on an inherited lock (seen as ``handshake_eof``), so setup runs here.
     """
     import socket
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--metadata-broker-child", action="store_true", required=True)
+    parser.add_argument("--chmod-only", action="store_true")
     parser.add_argument("--parent-pid", required=True, type=int)
     parser.add_argument("--socket-fd", required=True, type=int)
     parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -11326,7 +11335,7 @@ def _metadata_broker_child_exec(argv: list[str]) -> int:
     child_sock = socket.socket(fileno=args.socket_fd)
     try:
         _set_pdeathsig_sigkill(args.parent_pid)
-        listener = _install_metadata_notify_filter()
+        listener = _install_metadata_notify_filter(chmod_only=args.chmod_only)
         try:
             _metadata_broker_handshake_send(child_sock, listener)
         finally:
@@ -11498,6 +11507,17 @@ def _adopt_batch_short_tmpdir(raw: str) -> Path:
     return short_tmp
 
 
+def _metadata_broker_root(
+    exec_scratch: Path | None, worker_temp: Path | None, noop_chmod: bool
+) -> Path | None:
+    """Broker root per lane: validation scratch, else an un-noop'd worker temp."""
+    if exec_scratch is not None:
+        return exec_scratch
+    if worker_temp is not None and not noop_chmod:
+        return worker_temp
+    return None
+
+
 def _landlock_exec(argv: list[str]) -> int:
     import socket
 
@@ -11538,8 +11558,7 @@ def _landlock_exec(argv: list[str]) -> int:
     semlock_dev_shm = Path(args.semlock_dev_shm) if args.semlock_dev_shm else None
     if args.outer_validation_authority:
         plant_outer_validation_authority(workspace, exec_scratch=exec_scratch)
-    # NF-2026-01775: the parent minted the batch's short TMPDIR once; this child
-    # only adopts and grants it, so no command of the batch loses its tree.
+    # NF-2026-01775: adopt and grant the batch short TMPDIR the parent minted once.
     short_tmp: Path | None = None
     if args.short_tmp is not None:
         if exec_scratch is None:
@@ -11555,30 +11574,27 @@ def _landlock_exec(argv: list[str]) -> int:
         short_tmp=short_tmp,
     )
     if args.cwd is not None:
-        # Re-validate against this exec'd child's own view of the workspace
-        # (fail closed rather than trusting the parent-provided flag) --
-        # traversal/absolute paths are already rejected before this argv is
-        # built, so only symlink-escape/existence can differ here.
+        # Re-validate in this child's own view (fail closed): traversal/absolute
+        # paths were rejected upstream, so only symlink-escape/existence differ.
         chdir_target = _require_beneath(workspace, workspace / args.cwd)
         if chdir_target.is_symlink() or not chdir_target.is_dir():
             raise WorkspaceError(f"landlock_cwd_not_directory:{args.cwd}")
     else:
         chdir_target = workspace
     os.chdir(chdir_target)
-    if exec_scratch is not None and _seccomp_notify_supported():
-        # NF27: the validator child previously received EPERM for the whole
-        # chmod family, breaking unmodified tools (git init writing
-        # .git/config.lock). Install a user-notification filter in the
-        # disposable child and emulate ONLY verified chmod/fchmod/fchmodat
-        # operations on stable, request-owned regular files and owned
-        # directories beneath this exact validation exec scratch from
-        # this trusted parent.
+    broker_root = _metadata_broker_root(exec_scratch, worker_temp, args.noop_chmod)
+    if broker_root is not None and _seccomp_notify_supported():
+        # NF27/NF-2026-02155: emulate only verified chmod calls beneath broker_root.
+        # The worker lane brokers chmod alone (utime stays denied) and stays in the
+        # launched group, so the supervisor's killpg still reaches every descendant.
+        worker_lane = exec_scratch is None
         parent_sock, child_sock = socket.socketpair()
         broker_parent_pid = os.getpid()
         helper_argv = [
             sys.executable,
             str(Path(__file__).resolve()),
             "--metadata-broker-child",
+            *(["--chmod-only"] if worker_lane else []),
             "--parent-pid",
             str(broker_parent_pid),
             "--socket-fd",
@@ -11586,9 +11602,7 @@ def _landlock_exec(argv: list[str]) -> int:
             "--",
             *command,
         ]
-        # This branch installs a listener of our own, so the roots that decide
-        # every brokered syscall are exactly this request's: nothing is left to
-        # an outer boundary and nothing is declared beyond them.
+        # Own listener: the declared roots are exactly this request's broker roots.
         _publish_metadata_authority_roots(
             (
                 *declared_metadata_authority_roots(exec_scratch, worker_temp),
@@ -11600,7 +11614,7 @@ def _landlock_exec(argv: list[str]) -> int:
                 helper_argv,
                 close_fds=True,
                 pass_fds=(child_sock.fileno(),),
-                start_new_session=True,
+                start_new_session=not worker_lane,
                 env=os.environ.copy(),
             )
         except OSError as exc:
@@ -11619,49 +11633,35 @@ def _landlock_exec(argv: list[str]) -> int:
         finally:
             parent_sock.close()
         if listener_fd < 0:
-            _kill_validator_group(child_pid)
+            (_kill_worker_lane_group if worker_lane else _kill_validator_group)(child_pid)
             _reap_validator(child_pid)
             suffix = f":{listener_error}" if listener_error else ""
-            raise WorkspaceError(
-                f"metadata_broker_listener_transfer_failed{suffix}"
-            )
+            raise WorkspaceError(f"metadata_broker_listener_transfer_failed{suffix}")
         try:
-            # NF430: authorize the request-owned worker temp authority as an
-            # additional broker resolution root (identically owner/inode/symlink
-            # verified) so a worker's TMPDIR-rooted Git/pytest ``config.lock``
-            # chmod beneath ``.aiworkhub/temp/worker/<request_id>`` is emulated,
-            # exactly like the exec scratch, without widening any other path.
+            # NF430 extra validation roots; the worker lane: worker temp only, no deadline.
             return _run_metadata_broker(
                 listener_fd,
                 child_pid,
-                exec_scratch,
-                extra_roots=tuple(
+                broker_root,
+                extra_roots=() if worker_lane else tuple(
                     root for root in (worker_temp, short_tmp) if root is not None
                 ),
+                deadline_seconds=None if worker_lane else ...,
+                worker_lane=worker_lane,
             )
         finally:
             os.close(listener_fd)
     if _metadata_broker_evidence_fd is not None:
         os.close(_metadata_broker_evidence_fd)
         _metadata_broker_evidence_fd = None
-    # NF-2026-00841: this fallback runs when no listener of our own could be
-    # installed. Beneath an outer broker that is already mediating this exec
-    # scratch, denying the chmod family here only outranks (and blinds) that
-    # boundary, which is what stopped nested Git from setting ``core.filemode``
-    # on its own request-owned ``.git/config.lock``. What is left to that
-    # boundary is never "the family": it is exactly the individual syscall
-    # variants the measurement below issued as themselves and watched apply a
-    # real mode change to this request's own scratch inode while being refused
-    # at the filesystem root, one directory beside that scratch, and through a
-    # symlink inside it. Every unmeasured variant, and every other syscall,
-    # keeps the complete historical deny list.
+    # NF-2026-00841: no listener of our own. Beneath an outer broker, leave to it
+    # only the chmod variants measured below to apply on this scratch and to be
+    # refused outside it; every other variant/syscall keeps the full deny list.
     exempted_chmod_syscalls = _outer_metadata_broker_brokered_chmod_syscalls(
         exec_scratch
     )
-    # Whatever was left to the outer boundary is decided against *its* roots,
-    # not this nested run's scratch.  Declare that truthfully before exec so the
-    # widening is stated rather than assumed away; the declaration is telemetry
-    # and grants the command nothing it did not already have.
+    # Declare the outer boundary's roots truthfully before exec; telemetry only,
+    # it grants the command nothing it did not already have.
     _publish_metadata_authority_roots(
         (
             *declared_metadata_authority_roots(

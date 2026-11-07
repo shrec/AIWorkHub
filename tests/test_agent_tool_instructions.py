@@ -536,6 +536,9 @@ def test_worker_policy_states_resolved_toolchain_and_bounded_output() -> None:
         "HMAC-authenticated MCP audit ledger",
     ):
         assert kept in policy, kept
+    # NF-2026-02155: the worker lane brokers chmod beneath TMPDIR; utime does not.
+    assert "beneath your TMPDIR are brokered" in policy
+    assert "under $TMPDIR, never into the worktree; utime stays denied." in policy
     assert "Call aiworkhub_worker_session_current_state for continuity" not in policy
 
 

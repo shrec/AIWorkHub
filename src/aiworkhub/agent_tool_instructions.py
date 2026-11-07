@@ -568,6 +568,9 @@ sandbox policy, so a test or fixture that needs them cannot run here: report
 exactly which tests were blocked with the prefix
 validation_unsupported_in_sandbox: and never stub a denied call to claim a
 pass; the coordinator's canonical validation decides those tests after exit.
+Exception: on the Linux Landlock backend chmod/fchmod/fchmodat on files you own
+beneath your TMPDIR are brokered, so build native code (cmake -B, ninja, link)
+under $TMPDIR, never into the worktree; utime stays denied.
 
 {WORKER_SUBSTITUTION_BLOCK}
 
