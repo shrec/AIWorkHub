@@ -379,13 +379,13 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.92
+## What's new in 0.12.93
 
-- Linux and macOS: no more intermittent task-database `disk I/O error`. A read-only open checked the live database and its `-wal`/`-shm` files with a plain `open()`/`close()`, which drops every POSIX lock the process holds; another connection could then delete the WAL under a live one. It now asks the kernel with `os.access` and opens no descriptor.
-- Storage errors say what they are: `canonical_db_unavailable:<SQLITE_*>` with the real SQLite error name, retried and never cached, instead of `canonical_schema_incomplete`; a failed card lookup in the write guard is `card_scoped_task_lookup_failed`, not `card_scoped_task_unresolved`.
-- `aiworkhub_doctor_diagnose` lists the processes holding the task database open (`task_db_holders`: pid, role, runtime generation, command line with secrets masked), so a stale server from an older install is easy to spot.
-- Task-database compaction builds its `VACUUM` copy on disk (`temp_store=FILE`) instead of in server memory.
-- Source Graph line lookups are O(log n) from a cached line index.
+- The dashboard no longer shows "Dashboard snapshot delayed (mcp_request_timeout)" every few minutes. The work-card decision counts grouped on an expression that read each card's JSON, so SQLite copied about 450 MB of cards into its sort on every 30 s snapshot (5-8 s). The population is now computed once and the small result is grouped: 0.06 s. A freshly reloaded window gets its first summary in about 2 s.
+- A delayed snapshot is shown under its own heading, "Dashboard snapshot delayed", instead of "MCP connection unavailable".
+- Auto-rework stops when a relaunched candidate is byte-identical to the one that just failed, instead of relaunching the same bytes again.
+- Tool descriptions and the manager bootstrap contract name only tools that exist on the same MCP profile (`aiworkhub_repo_current`, not `aiworkhub_repository_current`).
+- The background callback watcher runs its seed-eligible card scan at most once per 30 s instead of on every 2 s poll.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Continuous Audit as a Service (CAAS)

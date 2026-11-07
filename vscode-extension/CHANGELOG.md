@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.12.93 — 2026-11-07
+
+### Fixed
+
+- The dashboard no longer shows "Dashboard snapshot delayed (mcp_request_timeout)" every few minutes: the decision-count query that took 5-8 s on every snapshot now takes 0.06 s, and a delayed snapshot is shown under its own heading instead of "MCP connection unavailable".
+- Bundles runtime 0.12.93: auto-rework stops relaunching a candidate byte-identical to the one that just failed, tool descriptions name only tools that exist on the same MCP profile, and the background callback watcher scans seed-eligible cards at most once per 30 s.
+
 ## 0.12.92 — 2026-11-07
 
 ### Fixed

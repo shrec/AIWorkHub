@@ -6,6 +6,17 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.93] - 2026-11-07
+
+### Fixed
+
+- The dashboard no longer shows "Dashboard snapshot delayed (mcp_request_timeout)" every few minutes. The work-card decision counts grouped on an expression that read `card_json`, so SQLite's GROUP BY sorter copied every decision row's whole card (avg 72 KB, 447 MB in all) into a temp b-tree: 5-8 s on every 30 s snapshot, 82 s once under load. The population is now computed once in a materialized CTE and the small result is grouped: 0.06 s, identical rows (NF-2026-02140). A cold dashboard child's first snapshot drops from 40-55 s to about 2 s for the summary and 5 s for the full view (NF-2026-02078).
+- A delayed dashboard snapshot is shown under its own heading, "Dashboard snapshot delayed", instead of "MCP connection unavailable"; the MCP connection itself is fine in that case (NF-2026-02141).
+- Auto-rework stops with `no_progress` when a relaunched candidate is byte-identical to the one that just failed, instead of relaunching the same bytes again (NF-2026-02129).
+- Tool descriptions and the manager bootstrap contract name only tools that exist on the same MCP profile, for example `aiworkhub_repo_current` instead of the nonexistent `aiworkhub_repository_current` (NF-2026-02138).
+- The background callback watcher (`python -m aiworkhub.manager_callback_watch`) runs the seed-eligible card scan at most once per 30 s instead of on every 2 s poll, so an idle watcher no longer decodes review cards continuously (NF-2026-02111).
+- The b905_v7 dependency holds-table replay test samples its reference time before reconcile, so it no longer fails under full-suite load (NF-2026-02137).
+
 ## [0.12.92] - 2026-11-07
 
 ### Fixed
