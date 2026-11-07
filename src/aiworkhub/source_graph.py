@@ -51,6 +51,7 @@ import threading
 import time
 import tokenize
 from collections import OrderedDict, deque
+from collections.abc import Iterator
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import closing, contextmanager
 from contextvars import ContextVar
@@ -6062,6 +6063,114 @@ def _bodygrep_file_bytes(candidate: Path, file_stat: os.stat_result) -> tuple[by
     return raw, False
 
 
+_BODYGREP_CANDIDATE_PAGE = 256
+
+
+def _bodygrep_target_resolution(repo_root: Path, normalized_target: str) -> tuple[bool, bool]:
+    """Return ``(target is an indexed file, indexed rows lie beneath it)``."""
+
+    if not normalized_target:
+        return False, False
+    conn = connect(resolve_db_path(repo_root), read_only=True)
+    try:
+        exact = conn.execute(
+            "SELECT 1 FROM files WHERE file_path=? LIMIT 1", (normalized_target,),
+        ).fetchone()
+        if exact:
+            return True, True
+        escaped = (
+            normalized_target.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        under = conn.execute(
+            "SELECT 1 FROM files WHERE file_path LIKE ? ESCAPE '\\' LIMIT 1",
+            (f"{escaped}/%",),
+        ).fetchone()
+        return False, under is not None
+    finally:
+        conn.close()
+
+
+def _bodygrep_target_on_disk(repo_root: Path, normalized_target: str) -> bool:
+    """True when ``normalized_target`` names a path inside the repository on disk."""
+
+    root = repo_root.resolve()
+    try:
+        candidate = (root / normalized_target).resolve()
+    except OSError:
+        return False
+    return candidate.is_relative_to(root) and candidate.exists()
+
+
+
+
+def _iter_bodygrep_candidates(
+    repo_root: Path, normalized_target: str, exact_target: bool, resume_file: str | None,
+) -> Iterator[str]:
+    """Yield indexed candidate paths in scan order, from one ordered query.
+
+    The order and resume point are the walk every paged scan has always used:
+    ``(scan tier, file_path)`` ascending, starting at ``resume_file`` inclusive.
+    One read-only connection and one ordered query serve the whole walk; rows
+    are pulled ``_BODYGREP_CANDIDATE_PAGE`` at a time. Nothing here limits how
+    far the walk goes; the scan itself decides how many files it may take from
+    disk (NF-2026-01918), so cache-served files can never starve a later file
+    of its turn.
+    """
+
+    omit_roots = _discovery_omit_roots(repo_root, normalized_target)
+    scope_params: tuple[Any, ...] = ()
+    if exact_target:
+        scope_sql = "file_path=?"
+        scope_params = (normalized_target,)
+    elif normalized_target:
+        escaped = (
+            normalized_target.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        scope_sql = "file_path LIKE ? ESCAPE '\\'"
+        scope_params = (f"{escaped}/%",)
+        if omit_roots:
+            scope_sql += " AND NOT discovery_omitted(file_path)"
+    else:
+        scope_sql = "NOT discovery_omitted(file_path)" if omit_roots else "1=1"
+    conditions = [scope_sql]
+    params: list[Any] = list(scope_params)
+    if resume_file is not None:
+        tier = _bodygrep_scan_tier(resume_file)
+        conditions.append(
+            "(bodygrep_scan_tier(file_path) > ?"
+            " OR (bodygrep_scan_tier(file_path) = ? AND file_path >= ?))"
+        )
+        params.extend((tier, tier, resume_file))
+    query = (
+        "SELECT file_path FROM files WHERE " + " AND ".join(conditions)
+        + " ORDER BY bodygrep_scan_tier(file_path), file_path"
+    )
+    conn = connect(resolve_db_path(repo_root), read_only=True)
+    try:
+        conn.create_function(
+            "bodygrep_scan_tier", 1, _bodygrep_scan_tier, deterministic=True,
+        )
+        if omit_roots:
+            conn.create_function(
+                "discovery_omitted", 1,
+                lambda path: int(_row_under_include_roots(str(path), omit_roots)),
+                deterministic=True,
+            )
+        cursor = conn.execute(query, params)
+        while True:
+            rows = cursor.fetchmany(_BODYGREP_CANDIDATE_PAGE)
+            if not rows:
+                return
+            for row in rows:
+                yield str(row["file_path"])
+    finally:
+        conn.close()
+
+
 BODYGREP_EXTRA_PAGES = 4
 BODYGREP_EXTRA_PAGES_SECONDS = 2.5
 
@@ -6223,74 +6332,20 @@ def _bodygrep_query_page(
     )
     resume_file = resume[0] if resume else None
     resume_line = resume[1] if resume else 0
-    conn = connect(resolve_db_path(repo_root), read_only=True)
-    try:
-        conn.create_function(
-            "bodygrep_scan_tier", 1, _bodygrep_scan_tier, deterministic=True,
-        )
-        # NF-2026-02027: an unscoped or non-include-root scope never walks the
-        # include-root overlays (.scratch/ sorts before src/ and would fill the
-        # match budget with copies); a target under .scratch/ still does.
-        omit_roots = _discovery_omit_roots(repo_root, normalized_target)
-        conn.create_function(
-            "discovery_omitted", 1,
-            lambda path: int(_row_under_include_roots(str(path), omit_roots)),
-            deterministic=True,
-        )
-        omit_clause = " AND NOT discovery_omitted(file_path)" if omit_roots else ""
-        order = " ORDER BY bodygrep_scan_tier(file_path), file_path LIMIT ?"
-        resume_predicate = (
-            "(bodygrep_scan_tier(file_path) > ?"
-            " OR (bodygrep_scan_tier(file_path) = ? AND file_path >= ?))"
-        )
-        resume_clause = f" AND {resume_predicate}" if resume_file is not None else ""
-        resume_param: tuple[Any, ...] = ()
-        if resume_file is not None:
-            resume_tier = _bodygrep_scan_tier(resume_file)
-            resume_param = (resume_tier, resume_tier, resume_file)
-        if normalized_target:
-            exact = conn.execute(
-                "SELECT 1 FROM files WHERE file_path=? LIMIT 1",
-                (normalized_target,),
-            ).fetchone()
-            if exact:
-                query = (
-                    "SELECT file_path FROM files WHERE file_path=?" + resume_clause
-                    + order
-                )
-                params: tuple[Any, ...] = (
-                    normalized_target, *resume_param, scan_file_cap + 1,
-                )
-            else:
-                escaped = (
-                    normalized_target.replace("\\", "\\\\")
-                    .replace("%", "\\%")
-                    .replace("_", "\\_")
-                )
-                query = (
-                    "SELECT file_path FROM files WHERE file_path LIKE ? ESCAPE '\\'"
-                    + omit_clause
-                    + resume_clause
-                    + order
-                )
-                params = (f"{escaped}/%", *resume_param, scan_file_cap + 1)
-        else:
-            conditions = [
-                *(["NOT discovery_omitted(file_path)"] if omit_roots else []),
-                *([resume_predicate] if resume_file is not None else []),
-            ]
-            where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
-            query = "SELECT file_path FROM files" + where + order
-            params = (*resume_param, scan_file_cap + 1)
-        paths = [
-            str(row["file_path"])
-            for row in conn.execute(query, params)
-        ]
-    finally:
-        conn.close()
-
-    scan_truncated = len(paths) > scan_file_cap
-    paths = paths[:scan_file_cap]
+    exact_target, indexed_target = _bodygrep_target_resolution(repo_root, normalized_target)
+    if normalized_target and not indexed_target and not _bodygrep_target_on_disk(
+        repo_root, normalized_target,
+    ):
+        # NF-2026-01957: a target naming neither a repository path nor an indexed
+        # directory is refused by name, never answered as a silent zero-hit scan.
+        raise SourceGraphError(f"target_not_found:{normalized_target}")
+    # The walk is ordered and resumable exactly as before, but it is no longer cut
+    # at a row count: only disk-backed files are bounded by scan_file_cap.
+    candidates = _iter_bodygrep_candidates(
+        repo_root, normalized_target, exact_target, resume_file,
+    )
+    scan_truncated = False
+    disk_files = 0
     repo_root = repo_root.resolve()
     needle = search_term.casefold()
     if match_kind != "literal":
@@ -6309,7 +6364,7 @@ def _bodygrep_query_page(
     oversized_skipped: list[str] = []
     last_scanned_file: str | None = None
     next_cursor: str | None = None
-    for file_path in paths:
+    for file_path in candidates:
         candidate = (repo_root / file_path).resolve()
         if not candidate.is_relative_to(repo_root):
             continue
@@ -6321,6 +6376,20 @@ def _bodygrep_query_page(
         except OSError:
             continue
         file_size = file_stat.st_size
+        # A file served from the bodygrep cache costs no disk bytes and does not
+        # count toward scan_file_cap (NF-2026-01918): a page of cached files walks
+        # on until the match budget or the disk-file cap stops it. Only files this
+        # walk takes from disk are bounded by the cap.
+        cached = _bodygrep_cache_has(candidate, file_stat)
+        if not cached:
+            if disk_files >= scan_file_cap:
+                scan_truncated = True
+                # Name the first file not yet taken, at line 0, so resume includes it.
+                next_cursor = _encode_bodygrep_cursor(
+                    file_path, 0, term=cursor_term, target=normalized_target, budget=budget,
+                )
+                break
+            disk_files += 1
         if file_size > scan_byte_cap:
             # A file larger than the ENTIRE byte cap can never fit on any page,
             # at any position, so neither scanning it nor stopping on it can
@@ -6353,7 +6422,7 @@ def _bodygrep_query_page(
         # toward the page's byte cap and never forces a cursor by itself.
         if (
             files_scanned > 0
-            and not _bodygrep_cache_has(candidate, file_stat)
+            and not cached
             and bytes_scanned + file_size > scan_byte_cap
         ):
             scan_truncated = True
@@ -6485,9 +6554,8 @@ def _bodygrep_query_page(
         if hit_budget:
             break
     if next_cursor is None and scan_truncated and last_scanned_file is not None:
-        # The scan stopped at the file-count cap with every scanned file
-        # complete. Resume strictly past the last scanned file so the caller
-        # reaches the files the cap cut off.
+        # Cache-served and disk-backed files alike are read in full before the
+        # walk moves on, so resuming strictly past the last file read repeats none.
         next_cursor = _encode_bodygrep_cursor(
             last_scanned_file, _BODYGREP_SKIP_ALL_LINES,
             term=cursor_term, target=normalized_target, budget=budget,
@@ -6499,6 +6567,12 @@ def _bodygrep_query_page(
     rows, output_truncated = _bounded_rows(matches, budget, byte_cap)
     payload = {
         "mode": "bodygrep", "query": term, "budget": budget,
+        # NF-2026-01957: which rule combined the terms, named on every reply.
+        "match_semantics": {
+            "literal": "exact_phrase",
+            "token_and_line": "all_tokens_on_one_line",
+            "token_and_file": "any_token_ranked_by_coverage",
+        }.get(match_kind, match_kind),
         "matches": rows,
         "candidate_files": _candidate_files(rows, limit=min(16, budget)),
         "files_scanned": files_scanned,
