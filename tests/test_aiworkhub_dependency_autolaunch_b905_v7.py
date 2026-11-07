@@ -488,12 +488,12 @@ def test_replaying_every_measured_production_denial_fills_the_holds_table(tmp_pa
         launched.append(task_id)
         return {"ok": False, "stderr": reason_by_task[task_id]}
 
+    started = autolaunch._now()[:19]
     outcome = autolaunch.reconcile(repo, trigger_task_id="PARENT", launch=denying_launch)
     assert launched == [task_id for task_id, _ in children]
 
     rows = _holds(repo)
     assert len(rows) == len(MEASURED_PRODUCTION_DENIALS), rows
-    now_prefix = autolaunch._now()[:19]
     for (task_id, reason), (_reason, _count, expected) in zip(
         children, MEASURED_PRODUCTION_DENIALS
     ):
@@ -504,7 +504,7 @@ def test_replaying_every_measured_production_denial_fills_the_holds_table(tmp_pa
         if expected == "deterministic":
             assert row["next_attempt_at"] == "", row
         else:
-            assert row["next_attempt_at"] > now_prefix, row
+            assert row["next_attempt_at"] > started, row
     # The reconcile outcome reports the same classification it persisted.
     delayed = {row["task_id"]: row for row in outcome["delayed"]}
     for task_id, _reason in children:
@@ -543,7 +543,7 @@ def test_replaying_every_measured_production_denial_fills_the_holds_table(tmp_pa
         assert rows[task_id]["attempts"] == 1, rows[task_id]
     for task_id in transient_ids:
         assert rows[task_id]["attempts"] == 2, rows[task_id]
-        assert rows[task_id]["next_attempt_at"] > now_prefix
+        assert rows[task_id]["next_attempt_at"] > started
 
 
 def test_denial_reason_scanner_detects_a_newly_invented_reason(tmp_path):
