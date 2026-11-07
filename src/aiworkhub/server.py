@@ -8932,23 +8932,30 @@ def needfix_convert(
     plan_digest: str | None = None,
     include_plan: bool = False,
 ) -> dict:
-    """Commit the exact previewed workforce-bound task conversion.
+    """Convert an accepted NeedFix into a task card; ``task_plan`` alone commits in one call.
 
-    ``plan_digest`` alone is enough: the matching preview remembered the exact
-    plan it signed and this commits that plan, so the body never has to be
-    resent. The digest re-check is unchanged, so NeedFix drift between preview
-    and commit still fails closed, and a digest this server no longer holds is
-    refused with ``previewed_plan_unavailable`` rather than reconstructed.
+    With ``task_plan`` and no ``plan_digest`` this previews the plan and, only when
+    the preview is convertible with no input refusal, commits it with the digest
+    that preview returned, in the same call. A captured or triaged NeedFix whose
+    task_plan names non-empty allowed_writes is auto-promoted to accepted (reason
+    auto_promoted_by_convert) first. Any refusal returns the preview and commits
+    nothing. ``plan_digest`` alone also commits the exact plan its preview signed;
+    a digest this server no longer holds is refused with ``previewed_plan_unavailable``.
+    The digest re-check is unchanged, so NeedFix drift still fails closed.
 
     Args:
         needfix_id: NeedFix id, e.g. NF-2026-01447.
-        task_plan: Task card fields as in needfix_preview_convert; omit to commit the exact plan remembered under plan_digest.
-        plan_digest: plan_digest from the matching needfix_preview_convert; required to commit a new conversion. A digest this server no longer holds is refused.
+        task_plan: Task card fields as in needfix_preview_convert. Given without plan_digest, the plan is previewed and committed in one call.
+        plan_digest: plan_digest from the matching needfix_preview_convert; optional when task_plan is given. A digest this server no longer holds is refused.
         include_plan: Return the plan body verbatim instead of a summary of its identity and counts; default false.
     """
     # NF-2026-01920: a resent task_plan is normalized exactly as the preview
     # normalized it, so the digest the preview returned still binds.
-    plan, _normalizations, _filled = _normalize_needfix_task_plan(needfix_id, task_plan)
+    plan, normalizations, filled_from = _normalize_needfix_task_plan(needfix_id, task_plan)
+    if task_plan and not plan_digest:
+        return _needfix_one_call_convert(
+            needfix_id, plan, normalizations, filled_from, include_plan=bool(include_plan)
+        )
     return _needfix_plan_receipt(
         core.needfix_convert(
             needfix_id, task_plan=plan, plan_digest=plan_digest
@@ -8956,6 +8963,65 @@ def needfix_convert(
         include_plan=bool(include_plan),
         tool="needfix_convert",
     )
+
+
+def _needfix_one_call_convert(
+    needfix_id: str,
+    plan: Any,
+    normalizations: list[dict[str, str]],
+    filled_from: dict[str, str],
+    *,
+    include_plan: bool,
+) -> dict:
+    """Preview a task_plan and commit it with that preview's digest in one call.
+
+    Commits only when the preview is convertible with no input refusal. Any other
+    preview is returned with its refusal and ``committed`` false, and nothing is
+    written.
+
+    A captured or triaged NeedFix whose own task_plan names allowed_writes is
+    promoted to accepted (reason auto_promoted_by_convert) first, but only when
+    the preview's sole refusal is that row's status. The preview is then taken
+    again and the second preview alone decides the commit. A verified manager_add
+    row is already convertible and never takes the promotion step.
+
+    Promotion and the create are two writes, not one. A commit that fails after
+    promotion leaves the row accepted, the same state the manual triage+accept
+    path leaves, and a retry converts it. ``auto_promoted`` is true whenever
+    promotion ran, including when the second preview then refuses.
+    """
+    preview = core.needfix_preview_convert(needfix_id, task_plan=plan)
+    refusal = preview.get("refusal_reason")
+    status_refusal = needfix_store._conversion_refusal_reason(
+        needfix_id, str(preview.get("current_status") or "")
+    )
+    promoted = False
+    if preview.get("auto_promote") and (not refusal or refusal == status_refusal):
+        needfix_store.promote_for_scoped_convert(core.repo_root(), needfix_id, plan)
+        promoted = True
+        preview = core.needfix_preview_convert(needfix_id, task_plan=plan)
+    digest = preview.get("plan_digest")
+    if not digest or not preview.get("convertible") or preview.get("refusal_reason"):
+        reply = dict(
+            _needfix_plan_receipt(preview, include_plan=include_plan, tool="needfix_preview_convert")
+        )
+        reply["committed"] = False
+    else:
+        reply = dict(core.needfix_convert(needfix_id, task_plan=plan, plan_digest=str(digest)))
+        reply["plan_digest"] = digest
+        reply["committed"] = True
+        reply = dict(
+            _needfix_plan_receipt(reply, include_plan=include_plan, tool="needfix_convert")
+        )
+    if promoted:
+        reply["auto_promoted"] = True
+    reply["plan_normalizations"] = normalizations
+    if filled_from:
+        reply["filled_from"] = filled_from
+    warnings = [item["warning"] for item in normalizations if item.get("warning")]
+    if warnings:
+        reply["warnings"] = [*list(reply.get("warnings") or []), *warnings]
+    return reply
 
 
 @mcp.tool()

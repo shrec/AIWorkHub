@@ -3433,6 +3433,9 @@ def preview_convert(
         "claimable": claimable,
         "convertible": claimable and input_refusal is None,
         "current_status": row["status"],
+        "auto_promote": row["status"] in ("captured", "triaged")
+        and not promotable
+        and _plan_supplies_scope(task_plan),
         "unverified": row["status"] in ("captured",) and not promotable,
         "triaged": row["status"] == "triaged" and not promotable,
         "task_plan": signed,
@@ -3771,6 +3774,69 @@ def _verified_manager_add_promotable(item: Mapping[str, Any]) -> bool:
         and bool(item.get("evidence"))
         and bool(item.get("scope_files"))
     )
+
+
+_AUTO_PROMOTED_BY_CONVERT = "auto_promoted_by_convert"
+
+
+def _plan_supplies_scope(task_plan: Mapping[str, Any] | None) -> bool:
+    """True when the caller's own task_plan names non-empty allowed_writes."""
+    if not isinstance(task_plan, Mapping):
+        return False
+    return bool(validate_task_plan(task_plan).get("allowed_writes"))
+
+
+def _scoped_promotable(item: Mapping[str, Any], task_plan: Mapping[str, Any] | None) -> bool:
+    """True when a captured or triaged item's own task_plan supplies its scope.
+
+    The plan's allowed_writes is the scope, so evidence and scope_files are not
+    required. Every other status keeps refusing exactly as before.
+    """
+    return item.get("status") in ("captured", "triaged") and _plan_supplies_scope(task_plan)
+
+
+def promote_for_scoped_convert(
+    repo_root: str | Path, needfix_id: str, task_plan: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    """Promote one captured or triaged NeedFix whose task_plan supplies its scope.
+
+    Records the same triaged/accepted transitions as the manual path, with
+    reason ``auto_promoted_by_convert``, in one short transaction. Nothing is
+    written unless the row is captured or triaged and the plan names non-empty
+    allowed_writes; any other row fails closed with NeedFixConflictError.
+    """
+    if not _plan_supplies_scope(task_plan):
+        raise NeedFixValidationError(
+            "auto-promotion needs a task_plan with non-empty allowed_writes"
+        )
+    conn = _connect(repo_root)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM needfix WHERE id = ?", (needfix_id,)).fetchone()
+        if row is None:
+            raise NeedFixNotFoundError(needfix_id)
+        item = _row_to_dict(row)
+        if not _scoped_promotable(item, task_plan):
+            raise NeedFixConflictError(_conversion_refusal_reason(needfix_id, item["status"]))
+        detail: dict[str, Any] = {"reason": _AUTO_PROMOTED_BY_CONVERT}
+        manager_identity = str((item.get("provenance") or {}).get("manager_identity") or "").strip()
+        if manager_identity:
+            detail["manager_identity"] = manager_identity
+        if item["status"] == "captured":
+            _apply_transition(conn, needfix_id, "triaged", "triaged", detail=detail)
+        _apply_transition(conn, needfix_id, "accepted", "accepted", detail=detail)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {
+        "needfix_id": needfix_id,
+        "status": "accepted",
+        "prior_status": item["status"],
+        "auto_promoted": True,
+    }
 
 
 def _validate_and_claim(
