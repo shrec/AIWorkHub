@@ -384,7 +384,9 @@ The full block diagram and the Observe → Decide → Delegate → Verify → Pr
 - The dashboard no longer shows "Dashboard snapshot delayed (mcp_request_timeout)" every few minutes. The work-card decision counts grouped on an expression that read each card's JSON, so SQLite copied about 450 MB of cards into its sort on every 30 s snapshot (5-8 s). The population is now computed once and the small result is grouped: 0.06 s. A freshly reloaded window gets its first summary in about 2 s.
 - A delayed snapshot is shown under its own heading, "Dashboard snapshot delayed", instead of "MCP connection unavailable".
 - Auto-rework stops when a relaunched candidate is byte-identical to the one that just failed, instead of relaunching the same bytes again.
-- Tool descriptions and the manager bootstrap contract name only tools that exist on the same MCP profile (`aiworkhub_repo_current`, not `aiworkhub_repository_current`).
+- Tool descriptions and the manager bootstrap contract name only tools that exist on the same MCP profile (`aiworkhub_repo_current`, not `aiworkhub_repository_current`), with writes on and off.
+- The manager tool list has 15 fewer entries (115 with writes on): manager-loop control, the VS Code LM worker bridge and legacy lifecycle tools are unlisted but still callable by exact name.
+- Near-duplicate tools (review, status, health, NeedFix, Roadmap) each say which sibling to use instead.
 - The background callback watcher runs its seed-eligible card scan at most once per 30 s instead of on every 2 s poll.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
