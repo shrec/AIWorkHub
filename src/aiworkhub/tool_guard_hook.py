@@ -727,12 +727,14 @@ def _expand(text: str) -> str:
     return _VARIABLE.sub(lambda match: os.environ.get(match.group(1), match.group(0)), text)
 
 
-def _git_ignored(path: Path) -> bool:
+def _git_ignored(path: Path, root: Path) -> bool:
     try:
+        # Only the guarded root's own repo answers; without the ceiling git walks above a non-repo root.
         result = subprocess.run(
             ["git", "-C", str(path.parent), "check-ignore", "-q", "--", path.name],
             capture_output=True,
             timeout=2,
+            env={**os.environ, "GIT_CEILING_DIRECTORIES": str(root.parent)},
         )
         return result.returncode == 0
     except Exception:
@@ -1048,7 +1050,7 @@ class _Context:
             if (
                 member is None
                 and not index_admits(policy, rel, is_dir=is_dir, ignored=True)
-                and _git_ignored(path)
+                and _git_ignored(path, self.root)
             ):
                 return None
         elif not is_dir or self.membership.member(".", True) is False:
