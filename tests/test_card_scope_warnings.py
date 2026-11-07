@@ -65,6 +65,9 @@ def _create(coord, **overrides):
 # --- NF-2026-00258: warn by name, never refuse -----------------------------
 
 def test_scope_warns_when_objective_path_absent_from_allowed_writes(coord):
+    holder = coord / "src" / "aiworkhub" / "bug_holder.py"
+    holder.parent.mkdir(parents=True, exist_ok=True)
+    holder.write_text("x = 1\n", encoding="utf-8")
     res = _create(
         coord,
         objective="the bug lives in src/aiworkhub/bug_holder.py and must be fixed",
@@ -76,6 +79,9 @@ def test_scope_warns_when_objective_path_absent_from_allowed_writes(coord):
 
 def test_scope_warning_is_not_a_refusal(coord):
     """The card is still created despite the warning -- the manager may override."""
+    other = coord / "src" / "aiworkhub" / "other.py"
+    other.parent.mkdir(parents=True, exist_ok=True)
+    other.write_text("x = 1\n", encoding="utf-8")
     res = _create(
         coord,
         objective="edit src/aiworkhub/other.py to repair the regression",

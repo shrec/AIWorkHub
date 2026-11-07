@@ -36,6 +36,7 @@ from . import shared_router
 from . import sqlite_readonly
 from . import db_writer
 from . import task_store
+from . import task_create_warnings as _task_create_warnings
 from . import task_retention
 from . import callback_store
 from . import task_plan
@@ -3915,6 +3916,8 @@ def card_scope_warnings(card: dict[str, Any]) -> list[str]:
     creation -- the manager only discovered it when the worker reported it could
     not write the file. Cross-check the declared scope against that evidence and
     return, by name, the referenced paths that are absent from ``allowed_writes``.
+    Objective prose counts only for repo-relative paths that name an existing file
+    and are not read-only evidence (see ``task_create_warnings``).
 
     This is advisory only. It is a WARNING the manager may override (a card may
     legitimately reference a read-only path), never a refusal.
@@ -3939,13 +3942,16 @@ def card_scope_warnings(card: dict[str, Any]) -> list[str]:
             referenced.append(declared)
     objective = str(card.get("objective") or "").replace("\\", "/")
     objective = _OBJECTIVE_URL_RE.sub(" ", objective)
+    objective_root = repo_root()
     for token in _OBJECTIVE_PATH_TOKEN_RE.findall(objective):
         if "/" not in token:
             # Bare basenames in prose are too ambiguous to treat as a declared
             # scope path; only warn on genuine repo-relative references.
             continue
         declared = _task_contract_path(token)
-        if declared:
+        if declared and not _task_create_warnings.objective_path_is_scope_noise(
+            declared, read_only_evidence, objective_root
+        ):
             referenced.append(declared)
     warnings: list[str] = []
     seen: set[str] = set()
@@ -5548,7 +5554,9 @@ def create_task(
         )
     if applied_contract_patch is not None:
         result["applied_contract_patch"] = applied_contract_patch
-    runner_route_warnings = create_time_runner_route_warnings(runner)
+    runner_route_warnings = _task_create_warnings.dedupe_runner_route_warnings(
+        repo_root(), runner, create_time_runner_route_warnings(runner)
+    )
     if runner_route_warnings:
         result["runner_route_warnings"] = runner_route_warnings
     if wave_binding is not None:
