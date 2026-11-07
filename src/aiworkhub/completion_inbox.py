@@ -1347,7 +1347,7 @@ def _packet_preview_lenses(per_lens: Any, reviewer_reports: Any) -> list[dict[st
     return rows
 
 
-def review_packet(
+def _review_packet_sections(
     request_id: str,
     *,
     card: dict[str, Any] | None = None,
@@ -1356,20 +1356,12 @@ def review_packet(
     accept_preview: dict[str, Any] | None = None,
     reviewer_reports: Any = None,
     max_bytes: int = REVIEW_PACKET_MAX_BYTES,
-) -> dict[str, Any]:
-    """One bounded review packet for a ``review_ready`` request, from the card.
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The untruncated packet sections and the normalized preview (NF-2026-02151).
 
-    Read-only and total. ``card`` may be supplied directly; otherwise it is
-    fetched with ``show_fn`` (default :func:`core.show_task`), the same
-    read-only path every other facet in this module uses. ``accept_preview`` is
-    the fold from
-    :func:`process_launcher_accept_review.accept_preview` -- passed in rather
-    than called, because that fold needs a live ProcessManager and this module
-    holds no launch authority.
-
-    Nothing here is a verdict. Every status in the packet was decided by the
-    gate that recorded it; assembling them cannot change one, and a manager
-    still accepts through ``accept_review``, which re-runs the whole fold.
+    The single owner of every section :func:`review_packet` and
+    :func:`review_digest` read. Stored evidence only: no gate, test, CI or git
+    call happens here. A packet whose ``ok`` is False is the named read error.
     """
     packet: dict[str, Any] = {
         "schema_id": REVIEW_PACKET_SCHEMA_ID,
@@ -1380,11 +1372,11 @@ def review_packet(
     }
     if card is None:
         if not task_id:
-            return {**packet, "ok": False, "error": "task_id_required_without_card"}
+            return {**packet, "ok": False, "error": "task_id_required_without_card"}, {}
         fetched, read_error = _show_one_card(show_fn or core.show_task, task_id)
         if fetched is None:
             return {**packet, "ok": False, "error": "card_unreadable",
-                    "read_error": read_error}
+                    "read_error": read_error}, {}
         card = fetched
     manager_ready = task_store.manager_ready_marker(card)
     card_terminal = card.get("terminal_review")
@@ -1455,7 +1447,9 @@ def review_packet(
             },
             "status": {
                 "canonical_status": _packet_text(card.get("status"), 40),
-                "terminal_substatus": _packet_text(terminal.get("substatus"), 60),
+                "terminal_substatus": _packet_text(
+                    terminal.get("substatus") or card_substatus, 60
+                ),
                 "error": _packet_text(evidence.get("error")),
             },
             "risk": {
@@ -1580,6 +1574,44 @@ def review_packet(
         packet["outstanding_accept_blockers_evaluated"] = packet["accept_preview"][
             "evaluated"
         ]
+    return packet, preview
+
+
+def review_packet(
+    request_id: str,
+    *,
+    card: dict[str, Any] | None = None,
+    task_id: str = "",
+    show_fn: Any = None,
+    accept_preview: dict[str, Any] | None = None,
+    reviewer_reports: Any = None,
+    max_bytes: int = REVIEW_PACKET_MAX_BYTES,
+) -> dict[str, Any]:
+    """One bounded review packet for a ``review_ready`` request, from the card.
+
+    Read-only and total. ``card`` may be supplied directly; otherwise it is
+    fetched with ``show_fn`` (default :func:`core.show_task`), the same
+    read-only path every other facet in this module uses. ``accept_preview`` is
+    the fold from
+    :func:`process_launcher_accept_review.accept_preview` -- passed in rather
+    than called, because that fold needs a live ProcessManager and this module
+    holds no launch authority.
+
+    Nothing here is a verdict. Every status in the packet was decided by the
+    gate that recorded it; assembling them cannot change one, and a manager
+    still accepts through ``accept_review``, which re-runs the whole fold.
+    """
+    packet, preview = _review_packet_sections(
+        request_id,
+        card=card,
+        task_id=task_id,
+        show_fn=show_fn,
+        accept_preview=accept_preview,
+        reviewer_reports=reviewer_reports,
+        max_bytes=max_bytes,
+    )
+    if not packet.get("ok"):
+        return packet
     # NF-2026-02080: advisory CI state of the commit this candidate lands on.
     # The accept preview already fetched it when present; otherwise ask once.
     # Never a blocker, never raises -- an unreadable base is "unavailable".
@@ -1601,3 +1633,154 @@ def review_packet(
     packet["encoded_bytes"] = _packet_encoded_bytes(packet)
     packet["truncation"]["within_bound"] = packet["encoded_bytes"] <= int(max_bytes)
     return packet
+
+
+# NF-2026-02151: the compact form of a review packet's decision, carried on a
+# review_ready callback member so the manager decides without a
+# status/show/packet round trip. Built by _review_packet_sections and
+# _packet_decision -- the very code review_packet runs -- never a second fold.
+REVIEW_DIGEST_SCHEMA_ID = "aiworkhub.review_digest.v1"
+REVIEW_DIGEST_MAX_BYTES = 700
+REVIEW_DIGEST_HINT = "aiworkhub_review_packet for detail"
+_DIGEST_ITEM_CHARS = 80
+_DIGEST_TRUNCATABLE_LISTS = ("open_finding_ids", "blocker_codes")
+
+
+def review_digest_encoded_bytes(digest: dict[str, Any]) -> int:
+    """Bytes of the digest under ``json.dumps`` defaults (the widest encoding)."""
+    return len(json.dumps(digest, default=str).encode("utf-8"))
+
+
+def _review_digest_verdict(preview_section: dict[str, Any]) -> str:
+    """The accept preview's verdict; anything not a recorded False is not "clear"."""
+    if not preview_section.get("evaluated"):
+        return "unevaluated"
+    blocked = preview_section.get("blocked")
+    if blocked is True:
+        return "blocked"
+    if blocked is False:
+        return "clear"
+    return "unknown"
+
+
+def _review_digest_validation(rows: Any) -> dict[str, int]:
+    """Pass/fail counts of the packet's validation rows; no returncode is unknown."""
+    counts = {"total": 0, "passed": 0, "failed": 0, "unknown": 0}
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        counts["total"] += 1
+        returncode = row.get("returncode")
+        if isinstance(returncode, bool) or not isinstance(returncode, int):
+            counts["unknown"] += 1
+        elif returncode == 0:
+            counts["passed"] += 1
+        else:
+            counts["failed"] += 1
+    return counts
+
+
+def _review_digest_fit(digest: dict[str, Any], max_bytes: int) -> dict[str, Any]:
+    """Drop list tails (counts stay) until the digest fits ``max_bytes``."""
+    while review_digest_encoded_bytes(digest) > int(max_bytes):
+        lists = [
+            key
+            for key in _DIGEST_TRUNCATABLE_LISTS
+            if isinstance(digest.get(key), list) and digest[key]
+        ]
+        if not lists:
+            return {
+                "schema_id": REVIEW_DIGEST_SCHEMA_ID,
+                "ok": False,
+                "error": "digest_over_byte_bound",
+                "max_bytes": int(max_bytes),
+                "hint": REVIEW_DIGEST_HINT,
+            }
+        longest = max(lists, key=lambda key: len(digest[key]))
+        digest[longest].pop()
+        digest["lists_truncated"] = True
+    return digest
+
+
+def review_digest(
+    request_id: str,
+    *,
+    card: dict[str, Any] | None = None,
+    task_id: str = "",
+    show_fn: Any = None,
+    accept_preview: dict[str, Any] | None = None,
+    reviewer_reports: Any = None,
+    unevaluated_reason: str = "accept_preview_not_supplied",
+    max_bytes: int = REVIEW_DIGEST_MAX_BYTES,
+) -> dict[str, Any]:
+    """A <= ``max_bytes`` digest of :func:`review_packet`'s decision.
+
+    Read-only and stored-evidence only: the same sections and decision fold
+    ``review_packet`` builds, minus the advisory ``base_ci`` lookup. An absent
+    ``accept_preview`` is reported as ``unevaluated`` with ``unevaluated_reason``
+    -- never computed here, never read as "no blockers".
+    """
+    packet, preview = _review_packet_sections(
+        request_id,
+        card=card,
+        task_id=task_id,
+        show_fn=show_fn,
+        accept_preview=accept_preview,
+        reviewer_reports=reviewer_reports,
+    )
+    if not packet.get("ok"):
+        read_error = packet.get("read_error")
+        return _review_digest_fit(
+            {
+                "schema_id": REVIEW_DIGEST_SCHEMA_ID,
+                "ok": False,
+                "error": _packet_text(packet.get("error"), _DIGEST_ITEM_CHARS),
+                **(
+                    {"read_error_kind": _packet_text(read_error.get("error_kind"), 40)}
+                    if isinstance(read_error, dict)
+                    else {}
+                ),
+                "hint": REVIEW_DIGEST_HINT,
+            },
+            max_bytes,
+        )
+    decision = _packet_decision(packet, preview)
+    preview_section = packet["accept_preview"]
+    blockers = preview_section.get("blockers") or []
+    blocker_codes: list[str] = []
+    for row in blockers:
+        code = _packet_text(row.get("kind"), _DIGEST_ITEM_CHARS)
+        if code not in blocker_codes:
+            blocker_codes.append(code)
+    open_finding_ids: list[str] = []
+    for call in decision.get("dispose_calls") or []:
+        finding_id = _packet_text(
+            (call.get("arguments") or {}).get("finding_id"), _DIGEST_ITEM_CHARS
+        )
+        if finding_id and finding_id not in open_finding_ids:
+            open_finding_ids.append(finding_id)
+    gates = packet.get("gates") or {}
+    status = packet.get("status") or {}
+    digest: dict[str, Any] = {
+        "schema_id": REVIEW_DIGEST_SCHEMA_ID,
+        "ok": True,
+        "verdict": _review_digest_verdict(preview_section),
+        "blocker_codes": blocker_codes,
+        "blocker_count": len(blockers),
+        "quality_gate_passed": gates.get("quality_gate_passed"),
+        "validation": _review_digest_validation(gates.get("validation")),
+        "open_finding_ids": open_finding_ids,
+        "open_finding_count": len(open_finding_ids),
+        "changed_file_count": int((packet.get("diff") or {}).get("changed_path_count") or 0),
+        "risk_tier": _packet_text(decision.get("effective_tier"), 20),
+        "hint": REVIEW_DIGEST_HINT,
+    }
+    if not preview_section.get("evaluated"):
+        digest["unevaluated_reason"] = _packet_text(unevaluated_reason, 60)
+    if packet.get("manager_readiness"):
+        digest["manager_readiness"] = _packet_text(packet["manager_readiness"], 20)
+    substatus = str(status.get("terminal_substatus") or "")
+    if substatus != "review_ready":
+        # The card holds no review-ready evidence: say so rather than imply it.
+        digest["card_substatus"] = _packet_text(substatus or "absent", 40)
+    return _review_digest_fit(digest, max_bytes)

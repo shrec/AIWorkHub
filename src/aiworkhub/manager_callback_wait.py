@@ -550,6 +550,49 @@ def _callback_launch_blocked(provider: str) -> dict[str, Any]:
     return {"launch_blocked": blocked}
 
 
+# NF-2026-02151: a review_ready member carries the review packet's decision in
+# compact form, so the manager decides without a status/show/packet round trip.
+CALLBACK_REVIEW_DIGEST_STATE = "review_ready"
+CALLBACK_REVIEW_DIGEST_ERROR_CHARS = 200
+_CALLBACK_REVIEW_DIGEST_UNEVALUATED = "accept_preview_not_run_in_callback_wait"
+
+
+def _member_review_digest(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """The stored-evidence review digest for one callback member.
+
+    Reads the card through the read-only ``core.show_task`` path and folds it
+    with ``completion_inbox.review_digest`` -- the review packet's own section
+    and decision code. The live accept fold is never run here (it needs a
+    ProcessManager), so the digest names its preview as unevaluated.
+    """
+    from . import completion_inbox, core  # lazy: core re-exports this module
+
+    return completion_inbox.review_digest(
+        str(entry.get("request_id") or ""),
+        task_id=str(entry.get("task_id") or ""),
+        show_fn=core.show_task,
+        unevaluated_reason=_CALLBACK_REVIEW_DIGEST_UNEVALUATED,
+    )
+
+
+def _attach_review_digests(members: list[dict[str, Any]]) -> None:
+    """Add ``review_digest`` to each review_ready member; other members untouched.
+
+    A builder failure is that member's ``review_digest_error`` only -- it never
+    fails, delays or blocks the wait or the batch's ack/claim.
+    """
+    for entry in members:
+        if entry.get("state") != CALLBACK_REVIEW_DIGEST_STATE:
+            continue
+        try:
+            entry["review_digest"] = _member_review_digest(entry)
+        except Exception as exc:  # noqa: BLE001 -- a digest is evidence, never a failure
+            entry["review_digest_error"] = {
+                "error_kind": type(exc).__name__,
+                "message": str(exc)[:CALLBACK_REVIEW_DIGEST_ERROR_CHARS],
+            }
+
+
 def claude_callback_wait(
     timeout_seconds: int = 240,
     ack_batch_id: str = "",
@@ -687,6 +730,9 @@ def claude_callback_wait(
                 # An unacknowledged all-stale batch is delivered like any other, so
                 # skipped_stale only ever names batches that were really consumed.
                 if not stale_acked:
+                    # NF-2026-02151: read-only, per-member, never raises; the
+                    # batch is returned (and acknowledgeable) whatever it yields.
+                    _attach_review_digests(members)
                     return {
                         "ok": True,
                         "status": "callback_ready",
