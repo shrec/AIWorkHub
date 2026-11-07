@@ -28,6 +28,27 @@ def test_comment_is_not_scanned(tmp_path: Path):
     assert known_bug_scanner.scan_changed_paths(tmp_path, ["safe.py"])["findings"] == []
 
 
+@pytest.mark.parametrize(
+    ("expression", "flagged"),
+    [
+        ("x / 0.25f;", False),
+        ("x / 0.5;", False),
+        ("x / 0.1e3;", False),
+        ("x / 10;", False),
+        ("x / 0;", True),
+        ("x / 0.0;", True),
+        ("x / 0.0f;", True),
+        ("x / 0.;", True),
+        ("x/0)", True),
+    ],
+)
+def test_literal_divide_zero_flags_only_zero_literals(tmp_path: Path, expression: str, flagged: bool):
+    (tmp_path / "divide.cpp").write_text(expression + "\n", encoding="utf-8")
+    report = known_bug_scanner.scan_changed_paths(tmp_path, ["divide.cpp"])
+    rule_ids = [finding["rule_id"] for finding in report["findings"]]
+    assert rule_ids.count("cpp.literal_divide_zero") == (1 if flagged else 0)
+
+
 def test_python_string_literals_are_not_scanned(tmp_path: Path):
     (tmp_path / "safe.py").write_text(
         'message = "subprocess.run(x, shell=True) and eval(user)"\n',

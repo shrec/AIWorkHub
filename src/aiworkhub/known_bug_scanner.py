@@ -59,7 +59,7 @@ RULES = (
          re.compile(r"\b(?:system|popen)\s*\("), "warning", "command_injection",
          "shell command execution requires a trusted-input boundary"),
     Rule("cpp.literal_divide_zero", frozenset({".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".cu", ".cuh"}),
-         re.compile(r"(?<!/)\/(?![/=*])\s*(?:0|0\.0+)\b"), "error", "correctness",
+         re.compile(r"(?<!/)\/(?![/=*])\s*(?:0+(?:\.0*)?|\.0+)(?:[eE][+-]?\d+)?[fFlLuU]*(?![\w.])"), "error", "correctness",
          "division by a literal zero is undefined or invalid"),
     Rule("crypto.weak_c_rng", frozenset({".c", ".cc", ".cpp", ".cxx", ".cu", ".cuh"}),
          re.compile(r"\b(?:rand|srand)\s*\("), "error", "cryptography",
