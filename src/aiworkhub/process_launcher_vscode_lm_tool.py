@@ -125,8 +125,11 @@ def invoke_vscode_lm_worker_tool_bound(
     metadata_path = self._metadata_from_events(events)
     if metadata_path is None or metadata_path.parent.resolve() != self.process_dir.resolve():
         return {"ok": False, "reason": "worker_bridge_metadata_invalid"}
+    # Local, not a seam: the shared request.json ceiling (NF-2026-02154).
+    from .request_metadata_limits import REQUEST_METADATA_MAX_BYTES
+
     try:
-        if metadata_path.is_symlink() or not metadata_path.is_file() or metadata_path.stat().st_size > 2 * 1024 * 1024:
+        if metadata_path.is_symlink() or not metadata_path.is_file() or metadata_path.stat().st_size > REQUEST_METADATA_MAX_BYTES:
             return {"ok": False, "reason": "worker_bridge_metadata_invalid"}
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):

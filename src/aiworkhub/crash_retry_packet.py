@@ -16,6 +16,7 @@ from typing import Any, Callable, Mapping
 
 from . import attempt_artifacts
 from . import worker_workspace as _worker_workspace
+from .request_metadata_limits import REQUEST_METADATA_MAX_BYTES
 from .worker_workspace import WorkerWorkspace, WorkspaceError
 
 MAX_CRASH_RETRY_PACKET_BYTES = 12 * 1024
@@ -84,7 +85,7 @@ def materialize_crash_retry_packet(
         if (
             metadata_path.is_symlink()
             or status_path.is_symlink()
-            or metadata_path.stat().st_size > 1024 * 1024
+            or metadata_path.stat().st_size > REQUEST_METADATA_MAX_BYTES
             or status_path.stat().st_size > 1024 * 1024
         ):
             raise WorkspaceError("crash_retry_predecessor_artifact_unsafe")

@@ -3260,11 +3260,14 @@ def accept_review(
                 metadata_path = self._metadata_from_events(events)
                 if metadata_path is None:
                     raise WorkspaceError("quality_review_metadata_missing")
+                # Local: ``accept_review``'s globals are its declared seam set.
+                from .request_metadata_limits import REQUEST_METADATA_MAX_BYTES
+
                 if (
                     metadata_path.parent.resolve() != self.process_dir.resolve()
                     or metadata_path.is_symlink()
                     or not metadata_path.is_file()
-                    or metadata_path.stat().st_size > 2 * 1024 * 1024
+                    or metadata_path.stat().st_size > REQUEST_METADATA_MAX_BYTES
                 ):
                     raise WorkspaceError("quality_review_metadata_invalid")
                 try:
@@ -4060,12 +4063,14 @@ def accept_review(
                     raise WorkspaceError(
                         f"quality_reviewer_metadata_missing:{reviewer_request_id}"
                     )
+                from .request_metadata_limits import REQUEST_METADATA_MAX_BYTES
+
                 if (
                     reviewer_metadata_path.parent.resolve()
                     != self.process_dir.resolve()
                     or reviewer_metadata_path.is_symlink()
                     or not reviewer_metadata_path.is_file()
-                    or reviewer_metadata_path.stat().st_size > 2 * 1024 * 1024
+                    or reviewer_metadata_path.stat().st_size > REQUEST_METADATA_MAX_BYTES
                 ):
                     raise WorkspaceError(
                         f"quality_reviewer_metadata_invalid:{reviewer_request_id}"

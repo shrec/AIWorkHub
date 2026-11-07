@@ -1393,6 +1393,12 @@ def launch_isolated(
                 ),
             }
             launch_phase = "request_metadata"
+            # NF-2026-02154: refuse an oversize request.json here, by name,
+            # before it is written, instead of at a later rework, crash-retry
+            # or accept.  Imported locally: this body's globals are its seams.
+            from .request_metadata_limits import check_request_metadata_payload
+
+            check_request_metadata_payload(metadata)
             write_json_0600(metadata_path, metadata)
             authority_path = self._terminal_authority_grant_path(request_id)
             launch_phase = "terminal_authority"

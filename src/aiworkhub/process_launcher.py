@@ -292,6 +292,7 @@ from .worker_workspace import (
     write_json_0600,
 )
 from . import worker_workspace as _worker_workspace
+from .request_metadata_limits import REQUEST_METADATA_MAX_BYTES
 
 if hasattr(_worker_workspace, "assert_gc_safe_workspace_shape"):
     assert_gc_safe_workspace_shape = _worker_workspace.assert_gc_safe_workspace_shape
@@ -12344,7 +12345,7 @@ class ProcessManager:
         if metadata_path is None or metadata_path.parent.resolve() != self.process_dir.resolve():
             return None, {"ok": False, "error": "context_intent_metadata_invalid"}
         try:
-            if metadata_path.is_symlink() or not metadata_path.is_file() or metadata_path.stat().st_size > 2 * 1024 * 1024:
+            if metadata_path.is_symlink() or not metadata_path.is_file() or metadata_path.stat().st_size > REQUEST_METADATA_MAX_BYTES:
                 return None, {"ok": False, "error": "context_intent_metadata_invalid"}
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -12964,7 +12965,7 @@ class ProcessManager:
                 or metadata_path.parent.resolve() != self.process_dir.resolve()
                 or metadata_path.is_symlink()
                 or not metadata_path.is_file()
-                or metadata_path.stat().st_size > 2 * 1024 * 1024
+                or metadata_path.stat().st_size > REQUEST_METADATA_MAX_BYTES
             ):
                 return {
                     "ok": False,

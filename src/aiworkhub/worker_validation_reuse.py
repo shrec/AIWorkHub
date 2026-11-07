@@ -31,12 +31,14 @@ from .process_launcher_validation import (
     WORKER_VALIDATION_RUN_REUSE_SOURCE,
     declared_validation_commands,
 )
+from .request_metadata_limits import REQUEST_METADATA_MAX_BYTES
 
 RECORD_SCHEMA_ID = "aiworkhub.worker_validation_reuse.v1"
 RECORD_FILENAME = "worker_validation_reuse.json"
 FULL_SNAPSHOT_LANE = "combined_full_snapshot"
 MAX_RECORD_BYTES = 4 * 1024 * 1024
-MAX_METADATA_BYTES = 2 * 1024 * 1024
+# The coordinator's request.json: one shared ceiling (NF-2026-02154).
+MAX_METADATA_BYTES = REQUEST_METADATA_MAX_BYTES
 MAX_KEY_BYTES = 4096
 
 FullSnapshotRunner = Callable[..., tuple[list[dict[str, Any]], dict[str, Any]]]
