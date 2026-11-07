@@ -3216,7 +3216,7 @@ def _manager_contract() -> dict[str, Any]:
                 "recovery_surfaces": [
                     "aiworkhub_manager_bootstrap and aiworkhub_repo_current",
                     "aiworkhub_task_plan_snapshot and preflight/workforce receipts",
-                    "aiworkhub_task_mark_done or aiworkhub_task_reject_review",
+                    "aiworkhub_agent_accept_review or aiworkhub_task_reject_review",
                 ],
             },
             "worker_model": {
@@ -3236,7 +3236,7 @@ def _manager_contract() -> dict[str, Any]:
                 "recovery_surfaces": [
                     "same task_id, card receipts, and worker session state",
                     "role-specific Source Graph and bounded validation logs",
-                    "aiworkhub_task_mark_review for manager review",
+                    "stop at review_ready for manager review",
                 ],
             },
         },
@@ -3298,9 +3298,9 @@ def _manager_contract() -> dict[str, Any]:
             "aiworkhub_task_create",
             "aiworkhub_task_auto_pickup (optional exact claim)",
             "aiworkhub_agent_launch_task (required worker start; may atomically claim pending)",
-            "aiworkhub_task_mark_review",
+            "worker stops at review_ready (no manager call)",
             "provider callback receipt",
-            "aiworkhub_task_mark_done or aiworkhub_task_reject_review",
+            "aiworkhub_review_packet, then aiworkhub_agent_accept_review or aiworkhub_task_reject_review",
         ],
         "callback": {
             "codex": (

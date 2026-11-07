@@ -47,7 +47,31 @@ _WRITE_PROBE = "aiworkhub_task_mark_done"
 # plus aiworkhub_manager_recipe_run_status (NF-2026-01849).
 _PRE_TABLE_ALL_COUNT = 227
 _PRE_TABLE_ALL_READ_ONLY_COUNT = 223
-_LISTED_COUNTS = {"manager": 130, "worker": 19, "dashboard": 67}
+# NF-2026-02139: manager 130 -> 115, the 15 rows below moved to manager-callable.
+_LISTED_COUNTS = {"manager": 115, "worker": 19, "dashboard": 67}
+# NF-2026-02139: callable by exact name on manager, absent from its tools/list. The extension (dashboard
+# surface) calls the loop/vscode_lm rows; managers finalize with accept_review/reject_review, not mark_*.
+_NF02139_DASHBOARD_LISTED = (
+    "aiworkhub_manager_loop_start",
+    "aiworkhub_manager_loop_ensure",
+    "aiworkhub_manager_loop_restore",
+    "aiworkhub_manager_loop_discard",
+    "aiworkhub_manager_loop_new",
+    "aiworkhub_manager_loop_send",
+    "aiworkhub_manager_loop_close",
+    "aiworkhub_vscode_lm_worker_tool",
+)
+_NF02139_MANAGER_CALLABLE = (
+    *_NF02139_DASHBOARD_LISTED,
+    "aiworkhub_task_queue_request",
+    "aiworkhub_cli_adapter_report_readonly",
+    "aiworkhub_launch_queue_evaluate_readonly",
+    "aiworkhub_task_export_jsonl",
+    "aiworkhub_manager_sdlc_case_for_task",
+    "aiworkhub_task_mark_review",
+    "aiworkhub_task_mark_done",
+)
+_ARG_PROBE_ERROR_PREFIX = "unexpected_arguments:['__rm00078_probe__']"
 # The 45 webview-only dashboard tools the pre-table manager surface hid.
 _PRE_TABLE_MANAGER_HIDDEN = frozenset({
     "aiworkhub_dashboard_task_detail",
@@ -126,6 +150,11 @@ def listed():
 report = {"surface": server.mcp_surface(), "registered": list(real), "listed": listed(), "probes": {}}
 for name in ARGS.get("probes", []):
     report["probes"][name] = rpc("tools/call", {"name": name, "arguments": {}})
+# An unexpected argument is refused before the tool body runs, so the probe proves dispatch without side effects.
+report["arg_probes"] = {
+    name: rpc("tools/call", {"name": name, "arguments": {"__rm00078_probe__": 1}})
+    for name in ARGS.get("arg_probes", [])
+}
 callable_only = ARGS.get("callable_only")
 if callable_only:
     entry = {report["surface"]: mcp_tool_metadata.MCP_VISIBILITY_CALLABLE}
@@ -145,7 +174,10 @@ _RUNS = {
     "unset_read_only": {"surface": None, "writes": False, "args": {"probes": [_WRITE_PROBE]}},
     "manager": {
         "surface": "manager", "writes": True,
-        "args": {"probes": [_HIDDEN_PROBE, _NEVER_EXISTED, _WORKER_ONLY], "callable_only": _CALLABLE_ONLY},
+        "args": {
+            "probes": [_HIDDEN_PROBE, _NEVER_EXISTED, _WORKER_ONLY], "callable_only": _CALLABLE_ONLY,
+            "arg_probes": list(_NF02139_MANAGER_CALLABLE),
+        },
     },
     "unknown": {"surface": "Bogus-Profile", "writes": True},
     "worker": {"surface": "worker", "writes": True, "args": {"probes": [_MANAGER_PROBE]}},
@@ -327,7 +359,8 @@ def test_default_surface_still_refuses_write_tools_without_allow_writes(runs: di
     # The manager default picks the profile; AIWORKHUB_ALLOW_WRITES still decides whether its write tools exist.
     writable, gated = runs["unset"], runs["unset_read_only"]
     assert gated["surface"] == "manager" and gated["stderr_surface_lines"] == []
-    assert _WRITE_GATED <= set(writable["registered"]) and _WRITE_PROBE in writable["listed"]
+    assert _WRITE_GATED <= set(writable["registered"]) and "aiworkhub_task_auto_pickup" in writable["listed"]
+    assert _WRITE_PROBE not in writable["listed"]  # NF-2026-02139: manager-callable only
     assert gated["registered"] == [name for name in writable["registered"] if name not in _WRITE_GATED]
     assert gated["listed"] == [name for name in writable["listed"] if name not in _WRITE_GATED]
     assert _error(gated["probes"][_WRITE_PROBE]) == {
@@ -588,3 +621,19 @@ def test_listed_counts_per_profile_are_pinned(runs: dict) -> None:
     assert {profile: len(_listed_names(profile)) for profile in _LISTED_COUNTS} == _LISTED_COUNTS
     assert len(runs["manager"]["listed"]) == _LISTED_COUNTS["manager"]
     assert len(runs["dashboard"]["listed"]) == _LISTED_COUNTS["dashboard"]
+
+
+def test_nf02139_rows_are_manager_callable_by_exact_name_but_unlisted(runs: dict) -> None:
+    manager, dashboard = runs["manager"], runs["dashboard"]
+    for name in _NF02139_MANAGER_CALLABLE:
+        assert mcp_tool_metadata.MCP_TOOL_PROFILES[name]["manager"] == mcp_tool_metadata.MCP_VISIBILITY_CALLABLE
+        assert server.mcp_tool_callable(name, "manager") is True, name
+        assert server.mcp_tool_listed(name, "manager") is False, name
+        assert name in manager["registered"] and name not in manager["listed"], name
+        # Dispatched by exact name: the call reaches the tool's argument check, not the unknown-tool refusal.
+        assert _error(manager["arg_probes"][name])["message"].startswith(_ARG_PROBE_ERROR_PREFIX), name
+    for name in _NF02139_DASHBOARD_LISTED:
+        assert server.mcp_tool_listed(name, "dashboard") is True and name in dashboard["listed"], name
+    # The Manager Chat seat enables these for its LLM (runtime_adapters.MANAGER_SEAT_MCP_TOOLS): kept listed.
+    for name in ("aiworkhub_manager_loop_status", "aiworkhub_manager_loop_events"):
+        assert name in manager["listed"] and name in dashboard["listed"], name

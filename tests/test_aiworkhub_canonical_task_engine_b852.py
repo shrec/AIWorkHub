@@ -1194,11 +1194,11 @@ def test_manager_bootstrap_advertises_create_and_callback_contract(writable_repo
     assert "aiworkhub_manager_semantic_edit_prepare" in manager["supported_capabilities"][2]
     assert "aiworkhub_manager_semantic_edit_apply" in manager["supported_capabilities"][2]
     assert "callbacks" in manager["fail_closed_limitations"][1]
-    assert "aiworkhub_task_mark_done" in manager["recovery_surfaces"][2]
+    assert "aiworkhub_agent_accept_review" in manager["recovery_surfaces"][2]
     worker = matrix["worker_model"]
     assert "exact card scope" in worker["owned_duties"][0]
     assert "allowed writes" in worker["fail_closed_limitations"][0]
-    assert "aiworkhub_task_mark_review" in worker["recovery_surfaces"][2]
+    assert "review_ready" in worker["recovery_surfaces"][2]
     contract = result["operating_contract"]
     assert contract["schema_id"] == "aiworkhub.manager_operating_contract.v1"
     assert contract["mandatory"] is True
@@ -1216,6 +1216,9 @@ def test_manager_bootstrap_advertises_create_and_callback_contract(writable_repo
     assert "same task_id" in contract["recovery"][1]
     assert result["workflow"][0].startswith("aiworkhub_manager_source_graph_query")
     assert "aiworkhub_task_create" in result["workflow"]
+    assert not any("aiworkhub_task_mark_" in step for step in result["workflow"])
+    assert "aiworkhub_review_packet" in result["workflow"][-1]
+    assert "aiworkhub_agent_accept_review" in result["workflow"][-1]
     assert "aiworkhub_claude_callback_wait" in result["callback"]["claude"]
 
 
