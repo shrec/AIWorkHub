@@ -289,7 +289,7 @@ def test_task_show_summary_folds_the_three_named_fields_and_stays_bounded(monkey
     card = _task_show_card()
     monkeypatch.setattr(server.core, "show_task", lambda task_id, full=False: _envelope(card))
 
-    result = server.aiworkhub_task_show("TASK_SIZE_FIXTURE")
+    result = server.aiworkhub_task_show("TASK_SIZE_FIXTURE", detail="summary")
 
     assert result["detail"] == "summary"
     assert result["detail_request"]["evidence"]["detail"] == "evidence"
@@ -371,7 +371,7 @@ def test_agent_task_status_summary_folds_static_contract_and_stays_bounded(monke
 
     monkeypatch.setattr(server.process_launcher, "default_manager", lambda: FakeManager())
 
-    result = server.aiworkhub_agent_task_status("req-0001")
+    result = server.aiworkhub_agent_task_status("req-0001", detail="summary")
 
     assert result["detail"] == "summary"
     assert result["detail_request"]["evidence"]["detail"] == "evidence"
@@ -485,7 +485,7 @@ def test_agent_task_status_terminal_metadata_compacts_without_losing_truth(monke
 
     monkeypatch.setattr(mcp_summary_folds, "fold_latest_event_for_process_status", capture_fold)
     monkeypatch.setattr(server.process_launcher, "default_manager", lambda: FakeManager())
-    result = server.aiworkhub_agent_task_status("req-0001")
+    result = server.aiworkhub_agent_task_status("req-0001", detail="summary")
     summary = result["latest_event"]
     assert "keys" not in summary["worker_mcp_gate"]
     for key in ("project_context", "worker_mcp_gate", "token_budget", "quality_gate"):

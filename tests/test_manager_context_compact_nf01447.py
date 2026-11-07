@@ -247,7 +247,7 @@ def test_task_show_default_folds_the_manager_authored_bodies(monkeypatch) -> Non
     card = _reviewed_card()
     monkeypatch.setattr(server.core, "show_task", lambda task_id, full=False: _envelope(card))
 
-    result = server.aiworkhub_task_show("NF01447_FIXTURE")
+    result = server.aiworkhub_task_show("NF01447_FIXTURE", detail="summary")
 
     assert result["detail"] == "summary"
     assert len(result["card_sha256"]) == 64
@@ -312,7 +312,7 @@ def test_agent_task_status_default_stays_under_three_kilobytes(monkeypatch) -> N
 
     monkeypatch.setattr(server.process_launcher, "default_manager", lambda: FakeManager())
 
-    result = server.aiworkhub_agent_task_status("req-0002")
+    result = server.aiworkhub_agent_task_status("req-0002", detail="summary")
 
     size = _size(result)
     assert size <= _AGENT_TASK_STATUS_SUMMARY_MAX_BYTES, size

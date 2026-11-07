@@ -214,7 +214,7 @@ def test_task_show_summary_of_a_review_ready_card_is_unchanged(monkeypatch) -> N
     }
     monkeypatch.setattr(server.core, "show_task", lambda task_id, full=False: _envelope(card))
 
-    result = server.aiworkhub_task_show("TASK_OK")
+    result = server.aiworkhub_task_show("TASK_OK", detail="summary")
 
     assert result["detail"] == "summary"
     rendered = json.loads(result["stdout"])

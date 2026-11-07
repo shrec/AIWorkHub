@@ -238,6 +238,98 @@ def fold_task_card_for_process_status(card: Any) -> Any:
     return result
 
 
+# NF-2026-02153: the brief lifecycle view keeps these facts and nothing else.
+_BRIEF_STATUS_KEYS = (
+    "ok",
+    "task_id",
+    "request_id",
+    "request_id_source",
+    "status",
+    "substatus",
+    "state",
+    "runner",
+    "topic",
+    "error",
+    "first_failure",
+    "liveness",
+    "review_findings_count",
+    "card_sha256",
+    "card_bytes",
+)
+_BRIEF_CARD_KEYS = (
+    "task_id",
+    "title",
+    "status",
+    "substatus",
+    "runner",
+    "topic",
+    "current_request_id",
+    "last_request_id",
+    "request_id",
+)
+_BRIEF_TERMINAL_REVIEW_KEYS = ("verdict", "blocker", "blocker_summary")
+_BRIEF_EVENT_KEYS = (
+    "event",
+    "state",
+    "substatus",
+    "exit_code",
+    "returncode",
+    "started",
+    "started_at",
+    "ended",
+    "ended_at",
+)
+
+
+def _brief_member(value: Any) -> Any:
+    """Keep a scalar as is; fold any nested block to identity."""
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return _fold_to_identity(value)
+
+
+def brief_task_card(card: Any) -> Any:
+    """Project a summary-folded task card to its lifecycle scalars."""
+
+    if not isinstance(card, dict):
+        return card
+    result = {key: _brief_member(card[key]) for key in _BRIEF_CARD_KEYS if key in card}
+    review = card.get("terminal_review")
+    if isinstance(review, dict):
+        result["terminal_review"] = {
+            key: _brief_member(review[key]) for key in _BRIEF_TERMINAL_REVIEW_KEYS if key in review
+        }
+    return result
+
+
+def brief_latest_event(event: Any) -> Any:
+    """Keep a latest event's state, exit code, timestamps and numeric usage totals."""
+
+    if not isinstance(event, dict):
+        return event
+    result = {key: _brief_member(event[key]) for key in _BRIEF_EVENT_KEYS if key in event}
+    usage = event.get("usage")
+    if isinstance(usage, dict):
+        result["usage"] = {
+            key: value
+            for key, value in usage.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+    return result
+
+
+def brief_status_reply(reply: dict[str, Any]) -> dict[str, Any]:
+    """Project a summary-folded agent_task_status reply to its brief lifecycle view."""
+
+    result = {key: reply[key] for key in _BRIEF_STATUS_KEYS if key in reply}
+    if "task_card" in reply:
+        result["task_card"] = brief_task_card(reply["task_card"])
+    if "latest_event" in reply:
+        result["latest_event"] = brief_latest_event(reply["latest_event"])
+    return result
+
+
 def _compact_provider_status_map(items: Any, *, adapter_id: str | None) -> dict[str, Any]:
     """Fold provider rows to a flat {adapter_id: status} map."""
 

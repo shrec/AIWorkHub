@@ -1044,8 +1044,10 @@ def _write_gated_tool(*args: Any, **kwargs: Any) -> Any:
 _ENVELOPE_KEYS = frozenset({"ok", "returncode", "command", "stdout", "stderr"})
 _CARD_INCLUDE_MODES = ("none", "summary", "full")
 _STATUS_DETAIL_MODES = ("summary", "evidence", "full")
+_CARD_DETAIL_MODES = ("brief", "summary", "evidence", "full")
 CardInclude = Literal["none", "summary", "full"]
 StatusDetail = Literal["summary", "evidence", "full"]
+CardDetail = Literal["brief", "summary", "evidence", "full"]
 InfrastructureFailureCategory = Literal[
     "validation_environment",
     "provider_runtime",
@@ -1356,7 +1358,7 @@ def _include_card_refusal(include_card: str) -> dict[str, Any] | None:
     }
 
 
-def _detail_refusal(detail: str) -> dict[str, Any] | None:
+def _detail_refusal(detail: str, modes: tuple[str, ...] = _STATUS_DETAIL_MODES) -> dict[str, Any] | None:
     """Refuse an out-of-vocabulary ``detail`` on the two read wrappers.
 
     Without this the wrappers fall through their ``== "summary"`` /
@@ -1366,12 +1368,12 @@ def _detail_refusal(detail: str) -> dict[str, Any] | None:
     covers direct Python callers and tests.
     """
 
-    if detail in _STATUS_DETAIL_MODES:
+    if detail in modes:
         return None
     return {
         "ok": False,
         "error": "invalid_detail",
-        "allowed": list(_STATUS_DETAIL_MODES),
+        "allowed": list(modes),
         "received": str(detail)[:40],
     }
 
@@ -4625,14 +4627,20 @@ def aiworkhub_task_list(status: str = "pending", topic: str | None = None, limit
 
 @mcp.tool()
 def aiworkhub_task_show(
-    task_id: str, full: bool = False, detail: StatusDetail = "summary"
+    task_id: str, full: bool = False, detail: CardDetail = "brief"
 ) -> dict[str, Any]:
     """Show a single task card by task_id.
 
     Use this for one card by task_id; use aiworkhub_task_list to find cards or
     aiworkhub_agent_task_status for a launched request's live state.
 
-    Summary-first by default: retained baseline hash maps (tree, workspace and
+    ``detail="brief"`` (default) keeps the card's lifecycle facts only (status,
+    substatus, title, runner, topic, current/last request ids and the
+    terminal_review verdict and blocker) plus the identity fields. Measured over
+    21 days the former summary default averaged 11,255 B/call (424 calls, 96%
+    the stdout card string). A red card still returns its validation_failed_packet.
+
+    ``detail="summary"``: retained baseline hash maps (tree, workspace and
     parent baselines) are folded to entry count plus sha256, and the evidence
     blobs (terminal_review.evidence.{validation, quality_gate, quality_review,
     quality_review_receipt, worker_mcp_gate, workspace} and
@@ -4655,10 +4663,10 @@ def aiworkhub_task_show(
     Args:
         task_id: Id of the task card to show.
         full: Set true to return the exact stored card, the same as detail=full; default false.
-        detail: How much of the card to return: summary (default, baselines and evidence folded), evidence (evidence kept exact, baselines still folded) or full (the exact stored card).
+        detail: How much of the card to return: brief (default, lifecycle facts only; a red card returns its validation_failed_packet), summary (baselines and evidence folded), evidence (evidence kept exact, baselines still folded) or full (the exact stored card).
     """
 
-    refusal = _detail_refusal(detail)
+    refusal = _detail_refusal(detail, _CARD_DETAIL_MODES)
     if refusal is not None:
         return refusal
     if full or detail == "full":
@@ -4673,11 +4681,13 @@ def aiworkhub_task_show(
     identity = _card_identity(card)
     findings = _review_findings_count(card)
     packet = None
-    if detail == "summary":
+    if detail in ("summary", "brief"):
         packet = validation_failed_packet.build_packet(card, repo_root=core.repo_root())
         card = core.summarize_evidence(card)
         card = mcp_summary_folds.fold_task_card_facts(card)
         card = _fold_card_manager_bodies(card)
+        if detail == "brief":
+            card = mcp_summary_folds.brief_task_card(card)
     elif detail == "evidence":
         card = mcp_summary_folds.dedupe_repeated_subtrees(card)
     rendered = dict(result)
@@ -4690,10 +4700,16 @@ def aiworkhub_task_show(
     rendered.update(identity)
     if findings is not None:
         rendered["review_findings_count"] = findings
-    rendered["detail_request"] = {
+    requests = {
         "evidence": {"tool": "aiworkhub_task_show", "task_id": task_id, "detail": "evidence"},
         "full": {"tool": "aiworkhub_task_show", "task_id": task_id, "detail": "full"},
     }
+    if detail == "brief":
+        requests = {
+            "summary": {"tool": "aiworkhub_task_show", "task_id": task_id, "detail": "summary"},
+            **requests,
+        }
+    rendered["detail_request"] = requests
     return rendered
 
 
@@ -6933,7 +6949,7 @@ def aiworkhub_quality_reviewer_launch(
 
 @mcp.tool()
 def aiworkhub_agent_task_status(
-    request_id: str = "", detail: StatusDetail = "summary", task_id: str = ""
+    request_id: str = "", detail: CardDetail = "brief", task_id: str = ""
 ) -> dict[str, Any]:
     """READ-ONLY: inspect one launched process and its authoritative task card.
 
@@ -6941,7 +6957,12 @@ def aiworkhub_agent_task_status(
     aiworkhub_agent_list_processes to find recent requests or
     aiworkhub_task_show for a card by task_id alone.
 
-    ``detail="summary"`` (default) folds the card's baseline hash maps and
+    ``detail="brief"`` (default) keeps only the lifecycle facts a manager reads
+    to learn state: the identity and lifecycle fields, the card's scalar
+    lifecycle fields and the latest event's state, exit code, timestamps and
+    usage totals. Measured over 21 days the former summary default averaged
+    12,765 B/call (792 calls); review decisions come from aiworkhub_review_packet.
+    ``detail="summary"`` folds the card's baseline hash maps and
     evidence blobs, its ``terminal_failure``/``rework_predecessor``/
     ``template_provenance.expanded_contract``, and its static contract text
     (objective/acceptance/validation/read_first/template_provenance/
@@ -6964,11 +6985,11 @@ def aiworkhub_agent_task_status(
 
     Args:
         request_id: Id of the launched worker request to inspect; omit and pass task_id to inspect that card's latest launched request (the reply's request_id_source says which).
-        detail: summary (default) folds bulky card and event bodies to size and sha256 digests while identity and lifecycle fields stay exact; evidence keeps the evidence exact too; full returns the raw status payload.
+        detail: brief (default) keeps the lifecycle facts only; summary folds bulky card and event bodies to size and sha256 digests while identity and lifecycle fields stay exact; evidence keeps the evidence exact too; full returns the raw status payload.
         task_id: Id of the task card whose latest launched request to inspect, used only when request_id is omitted; default empty.
     """
 
-    refusal = _detail_refusal(detail)
+    refusal = _detail_refusal(detail, _CARD_DETAIL_MODES)
     if refusal is not None:
         return refusal
     resolved, source, refusal = _request_id_for_tool(
@@ -6981,7 +7002,8 @@ def aiworkhub_agent_task_status(
     if detail == "full" or not isinstance(result, dict) or not result.get("ok"):
         return _with_request_id_source(result, request_id, source)
     folded = dict(result)
-    if detail == "summary":
+    summarized = detail in ("summary", "brief")
+    if summarized:
         first_failure = mcp_summary_folds.first_failure_from_status(
             result.get("latest_event"), result.get("task_card")
         )
@@ -6994,7 +7016,7 @@ def aiworkhub_agent_task_status(
         identity = _card_identity(card)
         findings = _review_findings_count(card)
         card = core.summarize_card_baselines(card)
-        if detail == "summary":
+        if summarized:
             card = core.summarize_evidence(card)
             card = mcp_summary_folds.fold_task_card_for_process_status(card)
             card = _fold_card_manager_bodies(card)
@@ -7004,7 +7026,7 @@ def aiworkhub_agent_task_status(
     latest = folded.get("latest_event")
     if isinstance(latest, dict):
         latest = core.summarize_card_baselines(latest)
-        if detail == "summary":
+        if summarized:
             latest = core.summarize_evidence(latest, paths=core.EVENT_EVIDENCE_PATHS)
             latest = mcp_summary_folds.fold_latest_event_for_process_status(latest)
         elif detail == "evidence":
@@ -7014,11 +7036,19 @@ def aiworkhub_agent_task_status(
         folded.update(identity)
     if findings is not None:
         folded["review_findings_count"] = findings
+    if detail == "brief":
+        folded = mcp_summary_folds.brief_status_reply(folded)
     folded["detail"] = detail
-    folded["detail_request"] = {
+    requests = {
         "evidence": {"tool": "aiworkhub_agent_task_status", "request_id": request_id, "detail": "evidence"},
         "full": {"tool": "aiworkhub_agent_task_status", "request_id": request_id, "detail": "full"},
     }
+    if detail == "brief":
+        requests = {
+            "summary": {"tool": "aiworkhub_agent_task_status", "request_id": request_id, "detail": "summary"},
+            **requests,
+        }
+    folded["detail_request"] = requests
     return _with_request_id_source(folded, request_id, source)
 
 
