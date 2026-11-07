@@ -14040,7 +14040,7 @@ function getHtmlForWebview(webview, extensionUri) {
     </section>
 
     <section class="source-alert offline-alert" id="offline-alert" aria-live="polite" hidden>
-      <strong>MCP connection unavailable</strong>
+      <strong id="offline-alert-title">MCP connection unavailable</strong>
       <span id="offline-alert-message"></span>
       <button class="primary-button" id="offline-retry-button" type="button">Retry</button>
     </section>

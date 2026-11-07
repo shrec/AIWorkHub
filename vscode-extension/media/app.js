@@ -184,6 +184,7 @@ const elements = {
   reloadAlertTitle: document.querySelector("#reload-alert-title"),
   reloadAlertMessage: document.querySelector("#reload-alert-message"),
   offlineAlert: document.querySelector("#offline-alert"),
+  offlineAlertTitle: document.querySelector("#offline-alert-title"),
   offlineAlertMessage: document.querySelector("#offline-alert-message"),
   offlineRetryButton: document.querySelector("#offline-retry-button"),
   uninitializedAlert: document.querySelector("#uninitialized-alert"),
@@ -4171,6 +4172,7 @@ function showToast(message) {
 
 function showOffline(reason) {
   elements.offlineAlert.hidden = false;
+  elements.offlineAlertTitle.textContent = "MCP connection unavailable";
   elements.offlineAlertMessage.textContent = reason || "The Task MCP connection is unavailable.";
   setConnection("offline", "Offline");
   if (!state.snapshot) {
@@ -4182,6 +4184,7 @@ function showOffline(reason) {
 
 function showSnapshotDelayed(reason) {
   elements.offlineAlert.hidden = false;
+  elements.offlineAlertTitle.textContent = "Dashboard snapshot delayed";
   const detail = reason ? ` (${reason})` : "";
   elements.offlineAlertMessage.textContent =
     `Dashboard snapshot delayed${detail}; MCP connection remains available.`;

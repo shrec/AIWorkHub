@@ -84,6 +84,56 @@ try {
   });
   assert.deepStrictEqual(offlineMessages.map((message) => message.type), ["offline"]);
 
+  const extensionHtmlSource = fs.readFileSync(extensionPath, "utf8");
+  assert.ok(
+    extensionHtmlSource.includes('<strong id="offline-alert-title">MCP connection unavailable</strong>'),
+    "the offline alert heading needs an id so the webview can retitle it",
+  );
+
+  // Drive the real webview alert functions against a stub DOM, so the heading
+  // is asserted through the same code paths the dashboard uses.
+  const appSource = fs.readFileSync(path.resolve(__dirname, "..", "media", "app.js"), "utf8");
+  const extractFunction = (name) => {
+    const start = appSource.indexOf(`function ${name}(`);
+    assert.ok(start >= 0, `${name} must exist in media/app.js`);
+    let depth = 0;
+    for (let i = appSource.indexOf("{", start); i < appSource.length; i += 1) {
+      if (appSource[i] === "{") depth += 1;
+      else if (appSource[i] === "}") {
+        depth -= 1;
+        if (depth === 0) return appSource.slice(start, i + 1);
+      }
+    }
+    throw new Error(`unterminated function ${name}`);
+  };
+  const stubElement = () => ({ hidden: true, textContent: "" });
+  const alertContext = {
+    elements: {
+      offlineAlert: stubElement(),
+      offlineAlertTitle: stubElement(),
+      offlineAlertMessage: stubElement(),
+      tableLoading: stubElement(),
+      tableEmpty: stubElement(),
+    },
+    state: { snapshot: null },
+    setConnection: () => {},
+  };
+  require("vm").createContext(alertContext);
+  require("vm").runInContext(
+    `${extractFunction("showOffline")}\n${extractFunction("showSnapshotDelayed")}`,
+    alertContext,
+  );
+  const alert = alertContext.elements.offlineAlertTitle;
+
+  require("vm").runInContext('showSnapshotDelayed("mcp_request_timeout")', alertContext);
+  assert.strictEqual(alert.textContent, "Dashboard snapshot delayed");
+  require("vm").runInContext("showOffline()", alertContext);
+  assert.strictEqual(alert.textContent, "MCP connection unavailable");
+  require("vm").runInContext('showSnapshotDelayed("mcp_request_timeout")', alertContext);
+  assert.strictEqual(alert.textContent, "Dashboard snapshot delayed");
+  require("vm").runInContext("showOffline()", alertContext);
+  assert.strictEqual(alert.textContent, "MCP connection unavailable", "delayed -> offline must restore the offline heading");
+
   console.log("dashboard snapshot timeout classification: ok");
 })().catch((err) => {
   console.error(err);
