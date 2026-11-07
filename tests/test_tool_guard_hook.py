@@ -316,7 +316,10 @@ def test_the_reminder_names_the_replacements_within_its_budget(
     assert tool_guard_hook.main(["--reminder"]) == 0
 
     out = capsys.readouterr().out
-    assert out == tool_guard_hook.REMINDER + "\n"
+    assert out.startswith(tool_guard_hook.REMINDER + "\n")
+    assert out.splitlines()[-1] == "ToolSearch select:" + ",".join(
+        tool_guard_hook.MANAGER_TOOLSEARCH_SELECT_NAMES
+    )
     assert len(out.encode("utf-8")) <= tool_guard_hook.REMINDER_MAX_BYTES
     for name in (
         "aiworkhub_worker_source_graph_query",
@@ -325,6 +328,31 @@ def test_the_reminder_names_the_replacements_within_its_budget(
         "unindexed",
     ):
         assert name in out
+
+
+def test_the_reminder_select_line_is_the_bootstrap_working_set() -> None:
+    from aiworkhub import core
+
+    assert core.MANAGER_TOOLSEARCH_SELECT_NAMES is tool_guard_hook.MANAGER_TOOLSEARCH_SELECT_NAMES
+
+
+def test_the_hook_file_run_by_path_prints_the_select_line(tmp_path: Path) -> None:
+    # Run by path with no PYTHONPATH and cwd outside src: the import of
+    # ``aiworkhub`` would fail, so success proves the hook imports nothing from it.
+    env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+    proc = subprocess.run(
+        [sys.executable, str(HOOK_SOURCE), "--reminder"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.splitlines()[-1] == (
+        "ToolSearch select:" + ",".join(tool_guard_hook.MANAGER_TOOLSEARCH_SELECT_NAMES)
+    )
 
 
 def _install_script(root: Path) -> Path:
@@ -387,7 +415,10 @@ def test_the_settings_commands_run_the_installed_script(repo: Path) -> None:
     reminder = _run(_settings_argv(REMINDER_COMMAND), repo, b"")
     assert reminder.returncode == 0, reminder.stderr
     text = reminder.stdout.decode("utf-8").replace("\r\n", "\n")
-    assert text == tool_guard_hook.REMINDER + "\n"
+    assert text.startswith(tool_guard_hook.REMINDER + "\n")
+    assert text.splitlines()[-1] == "ToolSearch select:" + ",".join(
+        tool_guard_hook.MANAGER_TOOLSEARCH_SELECT_NAMES
+    )
 
     # No task queue in this repository: the Stop guard allows, silently.
     stop = _run(_settings_argv(STOP_COMMAND), repo, b'{"session_id": "s", "cwd": "."}')

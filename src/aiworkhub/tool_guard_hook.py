@@ -60,7 +60,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 REASON_MAX_CHARS = 400
-REMINDER_MAX_BYTES = 800
+REMINDER_MAX_BYTES = 1200
+# Exact registered manager tool names the host defers; manager_bootstrap hands
+# them back as one ToolSearch select line, which this hook prints with --reminder.
+MANAGER_TOOLSEARCH_SELECT_NAMES: tuple[str, ...] = (
+    "aiworkhub_task_show",
+    "aiworkhub_agent_task_status",
+    "aiworkhub_review_packet",
+    "aiworkhub_agent_accept_preview",
+    "aiworkhub_agent_accept_review",
+    "aiworkhub_task_reject_review",
+    "needfix_show",
+    "needfix_list",
+    "needfix_preview_convert",
+    "needfix_convert",
+    "aiworkhub_agent_launch_task",
+    "aiworkhub_claude_callback_wait",
+    "aiworkhub_claude_callback_ack",
+    "aiworkhub_manager_source_graph_query",
+    "aiworkhub_manager_workforce_rank",
+)
 # Source Graph's non-bypassable directory excludes; ``source_graph`` imports
 # them as ``DEFAULT_EXCLUDE_DIR_NAMES``. This module owns them because it can
 # import nothing from ``aiworkhub``.
@@ -2107,7 +2126,7 @@ def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else list(argv)
     try:
         if "--reminder" in args:
-            sys.stdout.write(REMINDER + "\n")
+            sys.stdout.write(REMINDER + "\nToolSearch " + "select:" + ",".join(MANAGER_TOOLSEARCH_SELECT_NAMES) + "\n")
             sys.stdout.flush()
             return 0
         if "--stop" in args:
