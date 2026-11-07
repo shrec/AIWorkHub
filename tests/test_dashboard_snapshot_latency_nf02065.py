@@ -372,11 +372,16 @@ def test_decision_counts_match_the_previous_sql_and_avoid_a_full_scan(tmp_path: 
                     (dashboard.WORK_CARD_DECISION_EVENT_LIMIT, dashboard.WORK_CARD_EXCLUDED_TOPICS[0]),
                 )
             ]
-            assert not [step for step in plan if step.startswith("SCAN task_events")], plan
+            scanned = {step.split()[1] for step in plan if step.startswith("SCAN ")}
+            assert not scanned & {"task_events", "tasks", "t"}, plan
             assert any(
                 "SEARCH task_events USING" in step and "idx_task_store_events_event_id" in step
                 for step in plan
             ), plan
+            # NF-2026-02140: the population is materialized once, and the GROUP BY
+            # scans that CTE rather than re-evaluating card_json per decision row.
+            assert any(step.startswith("MATERIALIZE classified") for step in plan), plan
+            assert "classified" in scanned, plan
     finally:
         conn.close()
 
@@ -390,3 +395,27 @@ def test_decision_counts_match_the_previous_sql_and_avoid_a_full_scan(tmp_path: 
         assert counts[names[population]] == {"accepted": accepted, "rejected": rejected}
     (work_events,) = [row for row in old_event if row[0] == "work_card"]
     assert counts["work_card_events"] == {"accepted": work_events[1], "rejected": work_events[2]}
+
+
+def test_decision_counts_identical_with_large_card_json(tmp_path: Path) -> None:
+    """NF-2026-02140: the materialized population must not change a count, even
+    when every referenced card_json is large (the cause of the slow GROUP BY)."""
+    _repo, db = _ready_repo(tmp_path)
+    _seed(db)
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json = json_set(card_json, '$.padding', ?)",
+            ("x" * 200_000,),
+        )
+        conn.commit()
+        assert conn.execute("SELECT MIN(length(card_json)) FROM tasks").fetchone()[0] > 200_000
+        for limit in (dashboard.WORK_CARD_DECISION_EVENT_LIMIT, 1, 7, 250):
+            assert _rows(conn, dashboard._WORK_CARD_DECISION_CARD_SQL, limit) == _rows(
+                conn, _OLD_CARD_SQL, limit
+            ), limit
+            assert _rows(conn, dashboard._WORK_CARD_DECISION_EVENT_SQL, limit) == _rows(
+                conn, _OLD_EVENT_SQL, limit
+            ), limit
+    finally:
+        conn.close()

@@ -129,6 +129,14 @@ decision_events AS (
     LIMIT ?
 )"""
 # One vote per DISTINCT card: its most recent qualifying decision.
+#
+# NF-2026-02140: the population CASE reads t.card_json (through _TASK_TOPIC_SQL).
+# Grouping on it directly made SQLite copy every referenced column of each
+# decision row, card_json included (avg 72 KB, max 2.9 MB), into the GROUP BY
+# sorter. The MATERIALIZED `classified` CTE evaluates the population once per
+# row, so the aggregate sorts only (population, event). Measured on the live
+# ~647 MB store: 2.05 s -> 0.06 s, identical rows. The event statement below
+# (5.14 s -> 0.06 s) uses the same shape.
 _WORK_CARD_DECISION_CARD_SQL = f"""
 WITH {_DECISION_EVENTS_CTE_SQL},
 latest_decision AS (
@@ -138,25 +146,35 @@ latest_decision AS (
         SELECT task_id, MAX(event_id) AS event_id
         FROM decision_events GROUP BY task_id
     ) newest ON newest.task_id = d.task_id AND newest.event_id = d.event_id
+),
+classified AS MATERIALIZED (
+    SELECT {_DECISION_POPULATION_SQL} AS population, l.event AS event
+    FROM latest_decision l
+    LEFT JOIN tasks t ON t.task_id = l.task_id
 )
 SELECT
-    {_DECISION_POPULATION_SQL} AS population,
-    SUM(CASE WHEN l.event = 'accept_review' THEN 1 ELSE 0 END) AS accepted,
-    SUM(CASE WHEN l.event <> 'accept_review' THEN 1 ELSE 0 END) AS rejected
-FROM latest_decision l
-LEFT JOIN tasks t ON t.task_id = l.task_id
+    population,
+    SUM(CASE WHEN event = 'accept_review' THEN 1 ELSE 0 END) AS accepted,
+    SUM(CASE WHEN event <> 'accept_review' THEN 1 ELSE 0 END) AS rejected
+FROM classified
 GROUP BY population
 """
 # The same population under the OLD per-event rule, so the payload can state
-# its own inflation factor instead of asking a reader to assume one.
+# its own inflation factor instead of asking a reader to assume one. Grouped
+# through the same MATERIALIZED `classified` CTE as the card statement above
+# (NF-2026-02140: 5.14 s -> 0.06 s on the live store, identical rows).
 _WORK_CARD_DECISION_EVENT_SQL = f"""
-WITH {_DECISION_EVENTS_CTE_SQL}
+WITH {_DECISION_EVENTS_CTE_SQL},
+classified AS MATERIALIZED (
+    SELECT {_DECISION_POPULATION_SQL} AS population, e.event AS event
+    FROM decision_events e
+    LEFT JOIN tasks t ON t.task_id = e.task_id
+)
 SELECT
-    {_DECISION_POPULATION_SQL} AS population,
-    SUM(CASE WHEN e.event = 'accept_review' THEN 1 ELSE 0 END) AS accepted,
-    SUM(CASE WHEN e.event <> 'accept_review' THEN 1 ELSE 0 END) AS rejected
-FROM decision_events e
-LEFT JOIN tasks t ON t.task_id = e.task_id
+    population,
+    SUM(CASE WHEN event = 'accept_review' THEN 1 ELSE 0 END) AS accepted,
+    SUM(CASE WHEN event <> 'accept_review' THEN 1 ELSE 0 END) AS rejected
+FROM classified
 GROUP BY population
 """
 _DIGEST_PREFIX_LEN = 12
