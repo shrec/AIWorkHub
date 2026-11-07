@@ -81,6 +81,9 @@ def _remove_heartbeat(path: Path | None) -> None:
             pass
 
 
+SEED_PEEK_INTERVAL_SECONDS = 30.0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="aiworkhub.manager_callback_watch")
     parser.add_argument("--repo", required=True)
@@ -95,10 +98,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         heartbeat = manager_watch_heartbeat_path(Path(args.repo).resolve(), args.origin_thread_id)
     except (OSError, RuntimeError, ValueError):
         heartbeat = None
+    last_seed_at: float | None = None
     try:
         db_path = callback_store.resolve_db_path(args.repo)
         while True:
             _write_heartbeat(heartbeat, poll_interval)
+            now = time.monotonic()
+            include_seed = last_seed_at is None or (now - last_seed_at) >= SEED_PEEK_INTERVAL_SECONDS
             conn = connect_readonly(db_path)
             try:
                 conn.row_factory = sqlite3.Row
@@ -106,9 +112,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     conn,
                     provider=args.provider,
                     origin_thread_id=args.origin_thread_id,
+                    include_seed=include_seed,
                 )
             finally:
                 conn.close()
+            if include_seed:
+                # Seed scan ran this poll; throttle until SEED_PEEK_INTERVAL_SECONDS elapses.
+                last_seed_at = now
             if batch is not None:
                 _emit({"status": "callback_pending", **batch})
                 return EXIT_PENDING

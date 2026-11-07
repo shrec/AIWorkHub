@@ -1365,6 +1365,7 @@ def peek_claimable_callback(
     provider: str,
     origin_thread_id: str,
     max_members: int = DEFAULT_CALLBACK_BATCH_MAX_MEMBERS,
+    include_seed: bool = True,
 ) -> dict | None:
     """Return the batch ``claim_pending_callback_batch`` would claim right now
     for this exact route, without writing anything (no lease, ack or UPDATE).
@@ -1400,6 +1401,8 @@ def peek_claimable_callback(
         expired_batch_ids=frozenset(_expired_batch_ids(conn, now_iso)),
     )
     if target is None:
+        if not include_seed:
+            return None
         seed_members = _peek_seed_eligible_members(
             conn,
             provider=provider,
