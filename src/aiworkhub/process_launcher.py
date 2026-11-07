@@ -37,7 +37,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, cast
 
-from . import core, rework_overlay_packet as _rework_overlay_packet
+from . import adapter_capability, core, rework_overlay_packet as _rework_overlay_packet
 from . import agent_tool_instructions
 from . import attempt_artifacts
 from . import claude_auth
@@ -3279,6 +3279,8 @@ def derive_launch_identity(
                 adapter_rejections.append(skip)
                 continue
             if candidate in _VSCODE_LM_IN_PROCESS_ADAPTERS:
+                if adapter_capability.reject_incapable(card, candidate, adapter_rejections):
+                    continue
                 # NF-2026-01482: a derived vscode_lm-family candidate also
                 # needs a launchable bridge host -- policy/circuit approval
                 # alone can still point at an editor session nothing started.
