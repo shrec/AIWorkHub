@@ -8,6 +8,7 @@ import io
 import json
 import re
 import tokenize
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -126,6 +127,19 @@ RELEASE_RE = re.compile(
     r"\bfree\s*\(\s*([A-Za-z_]\w*)\s*\)|"
     r"\bdelete(?:\s*\[\s*\])?\s+([A-Za-z_]\w*)"
 )
+# A reset is an assignment TO the pointer (``p = 0``, ``char *p = x``,
+# ``Foo* p = x``, ``auto p = x``), never a write through it (``*p = 0`` at
+# statement start) or a member store (``s.p = 0``, ``s->p = 0``).
+_DEREF_OR_MEMBER_BEFORE = re.compile(r"(?:(?:^|[;{}(),])\s*\*+\s*|\.\s*|->\s*)$")
+
+
+def _resets(name: str, text: str) -> bool:
+    """Return whether ``text`` assigns a new value to the released ``name``."""
+
+    for match in re.finditer(rf"\b{re.escape(name)}\s*=(?!=)", text):
+        if not _DEREF_OR_MEMBER_BEFORE.search(text[: match.start()]):
+            return True
+    return False
 
 
 def _rotation(selector: int) -> int | None:
@@ -520,7 +534,7 @@ def _scan_path(root: Path, relative: str) -> tuple[list[dict], dict | None]:
             continue
         if suffix in {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".cu", ".cuh"}:
             for name in tuple(released):
-                if re.search(rf"\b{re.escape(name)}\s*=(?!=)", source):
+                if _resets(name, source):
                     released.pop(name, None)
                     continue
                 if re.search(rf"\b{re.escape(name)}\s*->|\*\s*{re.escape(name)}\b", source):
@@ -531,7 +545,8 @@ def _scan_path(root: Path, relative: str) -> tuple[list[dict], dict | None]:
                     )
                     findings.append(_finding(rule, relative, number, 1, raw))
                     released.pop(name, None)
-            for release in RELEASE_RE.finditer(source):
+            releases = list(RELEASE_RE.finditer(source))
+            for index, release in enumerate(releases):
                 name = release.group(1) or release.group(2)
                 if name in released:
                     rule = Rule(
@@ -541,6 +556,13 @@ def _scan_path(root: Path, relative: str) -> tuple[list[dict], dict | None]:
                     )
                     findings.append(_finding(rule, relative, number, release.start() + 1, raw))
                 released[name] = number
+                # ``delete p; p = NULL;`` on ONE line: the assignment check above
+                # ran before this release was recorded, so reset it here from
+                # the text between this release and the next release on the line
+                # (a later ``free(p)`` on the same line is still a double release).
+                nxt = releases[index + 1].start() if index + 1 < len(releases) else len(source)
+                if _resets(name, source[release.end():nxt]):
+                    released.pop(name, None)
         for rule in rules:
             if rule.crypto_only and not crypto:
                 continue
@@ -567,16 +589,58 @@ def scan_file(root: Path, relative: str) -> list[dict]:
     return _scan_path(root, relative)[0]
 
 
-def scan_changed_paths(repo_root: Path | str, changed_paths: Iterable[str]) -> dict:
+def _baseline_fingerprints(baseline_root: Path, relative: str) -> Counter[str]:
+    """Multiset of root-cause fingerprints the baseline copy already carries.
+
+    A baseline path that is missing, a symlink, outside ``baseline_root``,
+    unreadable or over ``MAX_FILE_BYTES`` yields an empty multiset, so every
+    candidate finding in that file stays blocking (fail closed).
+    """
+
+    try:
+        baseline_findings, skip = _scan_path(baseline_root, relative)
+    except (OSError, ValueError):
+        return Counter()
+    if skip is not None:
+        return Counter()
+    return Counter(row["root_cause_fingerprint"] for row in baseline_findings)
+
+
+def scan_changed_paths(
+    repo_root: Path | str,
+    changed_paths: Iterable[str],
+    *,
+    baseline_root: Path | str | None = None,
+) -> dict:
+    """Scan exact changed paths; with ``baseline_root`` only introduced findings block.
+
+    Each candidate file's findings are reduced by the same relative path's
+    baseline findings as a multiset keyed by ``root_cause_fingerprint``: a
+    finding the baseline already had moves to ``pre_existing_findings``, while
+    a duplicated or new one stays in ``findings``.
+    """
+
     root = Path(repo_root).resolve()
+    baseline = Path(baseline_root).resolve() if baseline_root is not None else None
     paths = tuple(sorted(dict.fromkeys(map(str, changed_paths))))[:MAX_PATHS]
     findings = []
+    pre_existing: list[dict] = []
     skipped_paths: list[dict] = []
     for relative in paths:
         file_findings, skip = _scan_path(root, relative)
         if skip is not None:
             skipped_paths.append(skip)
-        findings.extend(file_findings)
+        if baseline is not None and file_findings:
+            remaining = _baseline_fingerprints(baseline, relative)
+            for row in file_findings:
+                fingerprint = row["root_cause_fingerprint"]
+                if remaining[fingerprint] > 0:
+                    remaining[fingerprint] -= 1
+                    pre_existing.append(row)
+                else:
+                    findings.append(row)
+        else:
+            findings.extend(file_findings)
         if len(findings) >= MAX_FINDINGS:
             break
     errors = sum(row["severity"] == "error" for row in findings)
@@ -604,7 +668,10 @@ def scan_changed_paths(repo_root: Path | str, changed_paths: Iterable[str]) -> d
                 "static_candidates": min(len(findings), MAX_FINDINGS),
                 "runtime_validated": 0,
                 "claim_boundary": "static_pattern_not_runtime_reproduction",
-            }}
+            },
+            "pre_existing_findings": pre_existing[:MAX_FINDINGS],
+            "pre_existing_count": len(pre_existing),
+            "baseline_scope": "none" if baseline is None else "baseline_root"}
 
 
 def to_sarif(report: dict) -> dict:

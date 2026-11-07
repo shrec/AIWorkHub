@@ -3052,6 +3052,7 @@ def run_builtin_static_checks(
     *,
     changed_paths: Iterable[str] | None = None,
     timeout_seconds: int = 60,
+    baseline_root: Path | str | None = None,
 ) -> list[EvidenceCheck]:
     """Always-available, diff-scoped syntax/static checks.
 
@@ -3143,7 +3144,7 @@ def run_builtin_static_checks(
             summary="no changed Python/JavaScript/shell source required syntax parsing",
             provenance="builtin:diff_scoped_syntax",
     ))
-    bug_report = known_bug_scanner.scan_changed_paths(root, paths)
+    bug_report = known_bug_scanner.scan_changed_paths(root, paths, baseline_root=baseline_root)
     skipped_paths = bug_report["skipped_paths"]
     checks.append(EvidenceCheck(
         check_id="builtin:known_bug_patterns",
@@ -3158,6 +3159,8 @@ def run_builtin_static_checks(
             "dedupe_summary": bug_report["dedupe_summary"],
             "source_revision_sha256": bug_report["source_revision_sha256"],
             "source_revision_scope": bug_report["source_revision_scope"],
+            "pre_existing_count": bug_report["pre_existing_count"],
+            "baseline_scope": bug_report["baseline_scope"],
         }, sort_keys=True)[:MAX_SUMMARY_CHARS],
         provenance="builtin:diff_scoped_known_bug_registry.v1",
         error=(
@@ -3253,6 +3256,7 @@ def run_completion_quality_gate(
     replay_binding: Mapping[str, Any] | None = None,
     finding_dispositions: Iterable[Mapping[str, Any]] | None = None,
     corrected_finding_ids: Iterable[str] = (),
+    baseline_root: Path | str | None = None,
 ) -> dict[str, Any]:
     """Execute the mandatory review-quality floor for one task delta.
 
@@ -3327,7 +3331,9 @@ def run_completion_quality_gate(
                 "explicit_human_approval_required": False,
                 "required_reviewer_lenses": [],
             }
-        checks = run_builtin_static_checks(root, changed_paths=affected)
+        checks = run_builtin_static_checks(
+            root, changed_paths=affected, baseline_root=baseline_root
+        )
         declared = run_declared_checks(
             root,
             changed_paths=affected,
@@ -3554,6 +3560,8 @@ def run_review_ready_quality_gate(
         risk_signals=observation["signals"],
         reachability_inputs=reachability_inputs,
         review_meta_gates=False,
+        # Only findings the candidate INTRODUCES over the canonical copy block.
+        baseline_root=canonical_repo,
     )
     gate["review_risk_profile"] = observation
     gate["review_ready_destructive_diff_checks"] = destructive_rows

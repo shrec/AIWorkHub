@@ -3934,6 +3934,7 @@ def accept_review(
                         risk_signals=effective_risk_signals,
                         combined_tree_scope=True,
                         policy_root=self.repo if inherited_policy else None,
+                        baseline_root=self.repo,
                     )
                     if not union_quality.get("passed"):
                         union_blockers = union_quality.get("blocking_checks") or []
@@ -4153,6 +4154,7 @@ def accept_review(
             )
             quality_gate = quality_evidence.run_completion_quality_gate(
                 workspace.path,
+                baseline_root=self.repo,
                 changed_paths=changed,
                 requested_risk_tier=effective_requested_tier,
                 risk_signals=effective_risk_signals,
