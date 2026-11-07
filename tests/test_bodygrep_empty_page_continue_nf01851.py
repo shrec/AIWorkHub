@@ -41,6 +41,7 @@ def test_hit_beyond_first_page_is_returned_in_one_call(tmp_path):
     repo = _repo(tmp_path, PAGE_FILES + 6)
     first_page = sg._bodygrep_query_page(repo, NEEDLE, 1)
     assert first_page["matches"] == [] and first_page["scan_truncated"] is True
+    sg._bodygrep_cache_clear()  # the probe warmed the cache; NF-2026-01918 cache hits skip the cap
 
     result = sg.bodygrep_query(repo, NEEDLE, 1)
     assert [row["file_path"] for row in result["matches"]] == ["zz_late/hit.py"]
@@ -49,6 +50,7 @@ def test_hit_beyond_first_page_is_returned_in_one_call(tmp_path):
     assert "hint" not in result
     assert result["cursor"] is None
 
+    sg._bodygrep_cache_clear()  # the probe warmed the cache; NF-2026-01918 cache hits skip the cap
     manual = _manual_first_hit(repo)
     assert result["matches"] == manual["matches"]
     assert result["next_cursor"] == manual["next_cursor"]
