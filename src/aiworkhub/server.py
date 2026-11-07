@@ -1867,7 +1867,7 @@ def aiworkhub_manager_bootstrap(
     The identity block -- role, verified route, repository and storage
     readiness, task health, the last hygiene pass and the Claude-route
     dispatcher state -- is on every reply, so repository_current and
-    task_health need no call of their own.  The contract prose is delivered
+    ``aiworkhub_task_health`` need no call of their own.  The contract prose is delivered
     once per verified session and then suppressed with its sha; pass
     include_contract=true to re-read it, or known_contract_sha256 to prove you
     already hold it.
@@ -4540,11 +4540,15 @@ def _compact_task_plan_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
 def aiworkhub_task_plan_snapshot(full: bool = False) -> dict[str, Any]:
     """READ-ONLY: bounded Plan-DAG summary, or the complete DAG with ``full``.
 
+    Use this for the dependency DAG across cards; use aiworkhub_task_list for a
+    flat card list by status.
+
     Default mode reports actionable lifecycle, ready work, blockers,
     write-scope overlaps, orphaned processing and DAG validity without
     repeating every finished card's dependency history.  Use ``full=true``
     for exact historical dependency/layer inspection.  This tool never claims
-    work; ``aiworkhub_task_auto_pickup``/``_dryrun`` remain the claim surfaces.
+    work; the write-gated claim tool and its read-only preview remain the
+    claim surfaces.
 
     Args:
         full: Set true to return the complete Plan-DAG for exact historical dependency and layer inspection; default false returns the bounded summary.
@@ -4594,7 +4598,11 @@ def aiworkhub_task_health() -> dict[str, Any]:
 
 @mcp.tool()
 def aiworkhub_task_review_queue() -> dict[str, Any]:
-    """List tasks waiting for Codex review."""
+    """List tasks waiting for Codex review.
+
+    Use this for the bare list of review-queue cards; use aiworkhub_review_packet
+    for one candidate's full review evidence or aiworkhub_completion_inbox for the
+    queue together with failures and stale work."""
 
     return core.review_queue()
 
@@ -4602,6 +4610,9 @@ def aiworkhub_task_review_queue() -> dict[str, Any]:
 @mcp.tool()
 def aiworkhub_task_list(status: str = "pending", topic: str | None = None, limit: int = 80) -> dict[str, Any]:
     """List task cards by status and optional topic.
+
+    Use this for a flat card list by status; use aiworkhub_task_show for one card
+    in full or aiworkhub_task_plan_snapshot for the dependency DAG.
 
     Args:
         status: Status to list, e.g. pending, processing, blocked, done or all for every status; default pending.
@@ -4617,6 +4628,9 @@ def aiworkhub_task_show(
     task_id: str, full: bool = False, detail: StatusDetail = "summary"
 ) -> dict[str, Any]:
     """Show a single task card by task_id.
+
+    Use this for one card by task_id; use aiworkhub_task_list to find cards or
+    aiworkhub_agent_task_status for a launched request's live state.
 
     Summary-first by default: retained baseline hash maps (tree, workspace and
     parent baselines) are folded to entry count plus sha256, and the evidence
@@ -4700,7 +4714,7 @@ def aiworkhub_task_pending_for_runner(runner: str, topic: str | None = None) -> 
 def aiworkhub_task_auto_pickup(runner: str, topic: str | None = None) -> dict[str, Any]:
     """Write-gated: claim and start the next task for a runner.
 
-    ``core.auto_pickup``'s public schema has no ``task_id`` parameter, so a
+    The core claim function's public schema has no ``task_id`` parameter, so a
     card-scoped one-off runner/topic (an identity not on the static
     ``core.RUNNER_TOPIC_ALLOWLIST``, authorized only to claim the exact
     pending card that already names it -- see
@@ -4736,12 +4750,12 @@ def aiworkhub_task_auto_pickup(runner: str, topic: str | None = None) -> dict[st
 
 @mcp.tool()
 def aiworkhub_task_auto_pickup_dryrun(runner: str, topic: str | None = None) -> dict[str, Any]:
-    """READ-ONLY: preview which task auto_pickup WOULD claim for a runner/topic.
+    """READ-ONLY: preview which task the write-gated claim WOULD take for a runner/topic.
 
     Reports the candidate task_id, a compact card, and runner/topic filtering
     counts WITHOUT mutating the parent queue and WITHOUT touching the write gate.
     Never invokes the write-gated auto-pickup command; uses only the read-only
-    `export` path. The real claim path (aiworkhub_task_auto_pickup) stays behind
+    `export` path. The real write-gated claim tool stays behind
     AIWORKHUB_ALLOW_WRITES; this preview provides no alternate write path
     and cannot bypass that gate.
 
@@ -4891,7 +4905,7 @@ def aiworkhub_task_reject_review(
     without a lesson are refused before anything changes. A failed close-out
     never undoes the reject: ``ok`` stays true, the failure is reported under
     its own key, and ``learning_commit_owed`` stays in the reply. None of these
-    parameters reaches ``core.reject_review``.
+    parameters reaches the core rejection call.
 
     Args:
         task_id: Id of the reviewed task card to reject.
@@ -5406,7 +5420,7 @@ def aiworkhub_task_usage_report(
 ) -> dict[str, Any]:
     """Return task usage report, optionally filtered.
 
-    ``full=True`` returns the core ``usage_report`` payload exactly as
+    ``full=True`` returns the core usage-report payload exactly as
     before.  The default keeps every other top-level key verbatim
     (schema_id, record_count, ``*_observed_records``,
     ``*_unknown_records``, ...) and replaces ``stdout`` with a bounded
@@ -5511,6 +5525,9 @@ def aiworkhub_task_review_summarize(
 ) -> dict[str, Any]:
     """READ-ONLY: Inspect review queue, group tasks by topic/runner, return Codex review checklist.
 
+    Use this for a topic/runner-grouped review checklist; use
+    aiworkhub_task_codex_handoff for per-task risks and finalize commands.
+
     Calls the B110 review_summarizer core (read-only contract).
     Returns grouped tasks, validation commands, allowed_writes counts,
     and a Codex-ready review checklist shape.
@@ -5548,6 +5565,9 @@ def aiworkhub_task_codex_handoff(
     batch_label: str | None = None,
 ) -> dict[str, Any]:
     """READ-ONLY: Codex-ready HANDOFF report for review-queue tasks.
+
+    Use this for the handoff as JSON; use aiworkhub_task_codex_handoff_markdown
+    for the same report rendered as Markdown.
 
     For each task waiting on Codex review, summarizes task_id, runner, topic,
     allowed_writes, validation commands, derived risks, commit-hygiene status,
@@ -5612,6 +5632,9 @@ def aiworkhub_supervisor_loop_status(
     reported_validation_verdict: str | None = None,
 ) -> dict[str, Any]:
     """READ-ONLY: derive supervisor_state + error taxonomy for a task_id.
+
+    Use this for the derived supervisor state and error class of one task; use
+    aiworkhub_agent_task_status for the raw launched request and its card.
 
     Implements the B08 contract's 7-step derivation over the LIVE queue
     (task_mcp_supervisor_loop_status_tool_b08_v1.json): fetch_status via
@@ -6452,7 +6475,8 @@ def aiworkhub_completion_inbox(
     """READ-ONLY: combined completion-inbox facts for Codex orchestration.
 
     Returns five facets in one call: ``review_queue`` (tasks awaiting Codex
-    review), ``operational_failures`` (legacy finalizer failures eligible for
+    review, as ``aiworkhub_task_review_queue`` lists them),
+    ``operational_failures`` (legacy finalizer failures eligible for
     retained retry), ``stale_processing`` (claimed tasks with no recent
     artifact/validation activity, default threshold 24h), ``runner_mismatch_warnings``
     (batch-token mismatches between a runner name and the task_id it
@@ -6723,13 +6747,15 @@ def aiworkhub_review_packet(
     1.45 MB.
 
     Nothing here is a verdict: every status was decided by the gate that
-    recorded it, and accepting still runs the whole fold in ``accept_review``.
-    The one live computation is ``accept_preview`` -- itself read-only -- which
-    ``completion_inbox`` cannot call because it holds no launch authority, so
-    it is computed here and passed in.
+    recorded it, and accepting still runs the whole fold in
+    ``aiworkhub_agent_accept_review``. The one live computation is
+    ``aiworkhub_agent_accept_preview`` -- itself read-only -- which
+    ``aiworkhub_completion_inbox`` cannot call because it holds no launch
+    authority, so it is computed here and passed in.
 
-    The ``decision`` section prefills the argument dicts for accept_review,
-    one review_finding_dispose per undisposed finding, and reject_review; it
+    The ``decision`` section prefills the argument dicts for
+    aiworkhub_agent_accept_review, one aiworkhub_manager_review_finding_dispose
+    per undisposed finding, and aiworkhub_task_reject_review; it
     never picks a disposition or a verdict and is never dropped before an
     evidence section.
 
@@ -6911,6 +6937,10 @@ def aiworkhub_agent_task_status(
 ) -> dict[str, Any]:
     """READ-ONLY: inspect one launched process and its authoritative task card.
 
+    Use this for one launched request and its card; use
+    aiworkhub_agent_list_processes to find recent requests or
+    aiworkhub_task_show for a card by task_id alone.
+
     ``detail="summary"`` (default) folds the card's baseline hash maps and
     evidence blobs, its ``terminal_failure``/``rework_predecessor``/
     ``template_provenance.expanded_contract``, and its static contract text
@@ -7004,6 +7034,9 @@ def aiworkhub_agent_collect_result(
     max_log_bytes: int = _COLLECT_RESULT_MAX_LOG_TAIL_BYTES,
 ) -> dict[str, Any]:
     """READ-ONLY: collect bounded worker output and review-readiness evidence.
+
+    Use this for one request's raw output and readiness; use
+    aiworkhub_review_packet for the folded review evidence before deciding.
 
     Args:
         request_id: Id of the launched worker request to collect output for.
@@ -7190,7 +7223,10 @@ def aiworkhub_agent_accept_preview(
     confirm_high_risk: bool = False,
     confirm_destructive_change: bool = False,
 ) -> dict[str, Any]:
-    """READ-ONLY: what would block accept_review right now, before any work.
+    """READ-ONLY: what would block aiworkhub_agent_accept_review right now, before any work.
+
+    Use this for the cheap accept blockers of one candidate; use
+    aiworkhub_review_packet for that candidate's full review evidence.
 
     Measured 2026-09-08: 49 of 159 accept attempts (31%) failed on a blocker
     that was knowable in advance -- a required lens still running, a target not
@@ -7200,7 +7236,7 @@ def aiworkhub_agent_accept_preview(
 
     A clear preview is NOT an acceptance and NOT a promise of one. The
     expensive half -- combined tree, declared validations, mechanical gate,
-    reviewer receipt verification by request id -- runs only in accept_review
+    reviewer receipt verification by request id -- runs only in aiworkhub_agent_accept_review
     and can still refuse. ``blocked`` False means only that nothing cheap is
     refusing yet. Leave ``requested_risk_tier`` unset to read the tier the
     finalizer measured; an explicit value can only raise it.
@@ -7414,6 +7450,9 @@ def aiworkhub_agent_list_processes(
 ) -> dict[str, Any]:
     """READ-ONLY: summarize latest processes; use detail='full' for legacy records.
 
+    Use this for the newest worker processes across all tasks; use
+    aiworkhub_agent_task_status for one launched request in detail.
+
     Args:
         limit: Number of latest processes to read, integer 1-1000; default 100, any other value is refused with invalid_limit.
         detail: summary (default) returns counts by state and terminal substatus plus newest/oldest timestamps; full returns the complete legacy process records.
@@ -7559,7 +7598,8 @@ def aiworkhub_dispatcher_ensure_started() -> dict[str, Any]:
 def aiworkhub_dispatcher_health() -> dict[str, Any]:
     """READ-ONLY: dispatcher running/stopped, selected coordinator target,
     repository identity, pending callback count, and last delivery/error.
-    Use when callbacks stop arriving; for a cross-subsystem verdict run the one-call doctor check."""
+    Use this when callbacks stop arriving; use aiworkhub_source_graph_health when Source Graph answers
+    look stale, and for a cross-subsystem verdict run the one-call doctor check."""
 
     return core.dispatcher_health()
 
@@ -7591,7 +7631,7 @@ def aiworkhub_manager_callback_lane_claim() -> dict[str, Any]:
 
     Selects the caller's own verified provider and session in the repository's
     coordinator-target file (atomic replace, unrelated keys kept), so callbacks
-    and task_create route to this manager again. Refuses with a stable reason,
+    and ``aiworkhub_task_create`` route to this manager again. Refuses with a stable reason,
     leaving the file unchanged, when the caller has no verified route, is Codex
     without a live route, or another live Manager Chat or Codex route holds the
     lane. Every claim and refusal appends one audit row."""
@@ -7664,7 +7704,8 @@ def _source_graph_detail_reply(result: Any, tool: str, detail: str) -> Any:
 def aiworkhub_source_graph_health(detail: StatusDetail = "summary") -> dict[str, Any]:
     """READ-ONLY: Source Graph indexing daemon health for the active
     repository -- indexing/ready/degraded status, last report/error/time.
-    Use when Source Graph answers look stale or fail; for a cross-subsystem verdict run the one-call doctor check.
+    Use this when Source Graph answers look stale or fail; use aiworkhub_dispatcher_health when callbacks
+    stop arriving, and for a cross-subsystem verdict run the one-call doctor check.
 
     ``detail="summary"`` (default) keeps every top-level scalar exact and folds
     each top-level dict/list to ``{summarized, bytes, sha256}`` plus its own
@@ -8370,6 +8411,9 @@ def needfix_list(
 def needfix_show(needfix_id: str, full: bool = False) -> dict:
     """Show one NeedFix by id; a body over 1 KB folds to its own identity.
 
+    Use this for one NeedFix's current fields; use needfix_list to find ids or
+    needfix_events for its audit history.
+
     Measured 2026-10-09: 51 calls, avg 4 KB, max 12 KB, almost all of it the
     description and evidence bodies the filer wrote (NF-2026-01447). Each body
     whose own canonical bytes exceed ``core.NEEDFIX_BODY_MAX_BYTES`` is
@@ -8664,6 +8708,9 @@ def needfix_update(
 def needfix_archive(needfix_id: str, reason: str | None = None) -> dict:
     """Explicitly archive (soft, audited, restorable) a NeedFix.
 
+    Use this to retire a NeedFix from the active inbox; use needfix_restore to
+    bring an archived one back or needfix_update to edit its fields instead.
+
     Args:
         needfix_id: NeedFix id, e.g. NF-2026-01447. A NeedFix that is converting cannot be archived; an already archived one is returned unchanged.
         reason: Optional free-text reason recorded in the archived audit event; omit if there is none.
@@ -8674,6 +8721,9 @@ def needfix_archive(needfix_id: str, reason: str | None = None) -> dict:
 @mcp.tool()
 def needfix_restore(needfix_id: str, target_status: str = "captured") -> dict:
     """Explicitly restore an archived NeedFix.
+
+    Use this to bring an archived NeedFix back into the inbox; use
+    needfix_archive to retire an active one.
 
     Args:
         needfix_id: Id of an archived NeedFix, e.g. NF-2026-01447; a NeedFix in any other status is refused.
@@ -8697,6 +8747,9 @@ def needfix_purge(needfix_id: str, audit_reason: str) -> dict:
 def needfix_count(status: str | None = None, kind: str | None = None, severity: str | None = None) -> int:
     """Bounded count of NeedFix entries.
 
+    Use this for a single number; use needfix_list for the matching rows
+    themselves.
+
     Args:
         status: Count only rows with this exact status, e.g. captured or accepted; archived rows are counted only when asked for here. Omit all three filters for the derived active count.
         kind: Count only rows of this exact kind, e.g. bug or improvement; any filter returns the raw row count instead of the derived active count.
@@ -8708,6 +8761,9 @@ def needfix_count(status: str | None = None, kind: str | None = None, severity: 
 @mcp.tool()
 def needfix_events(needfix_id: str, limit: int = 100) -> list[dict]:
     """List events for a NeedFix entry.
+
+    Use this for one NeedFix's audit history; use needfix_show for its current
+    fields.
 
     Args:
         needfix_id: NeedFix id, e.g. NF-2026-01447.
@@ -8983,6 +9039,9 @@ def _fold_roadmap_bodies(row: dict) -> dict:
 def roadmap_show(roadmap_id: str) -> dict:
     """Show one Roadmap outcome.
 
+    Use this for one outcome's stored fields by id; use roadmap_list to find
+    ids or roadmap_snapshot for every outcome joined to its linked tasks.
+
     Args:
         roadmap_id: Roadmap outcome id in the form RM-YYYY-NNNNN, e.g. RM-2026-00001.
     """
@@ -9074,6 +9133,9 @@ def roadmap_add(
 def roadmap_transition(roadmap_id: str, target_status: str, reason: str) -> dict:
     """Manager-only guarded Roadmap lifecycle transition.
 
+    Use this to change an outcome's status; use roadmap_link_task to attach a
+    task without changing status.
+
     Args:
         roadmap_id: Roadmap outcome id in the form RM-YYYY-NNNNN, e.g. RM-2026-00001.
         target_status: Status to move to: approved, in_progress, blocked, deferred, completed or archived; a move the current status does not allow is refused.
@@ -9085,6 +9147,9 @@ def roadmap_transition(roadmap_id: str, target_status: str, reason: str) -> dict
 @mcp.tool()
 def roadmap_link_task(roadmap_id: str, task_id: str) -> dict:
     """Link one existing canonical task to a Roadmap outcome.
+
+    Use this to attach a task to an outcome; use roadmap_transition to change
+    the outcome's status.
 
     Args:
         roadmap_id: Roadmap outcome id in the form RM-YYYY-NNNNN, e.g. RM-2026-00001.
