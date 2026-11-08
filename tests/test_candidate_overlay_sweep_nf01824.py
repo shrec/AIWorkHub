@@ -109,6 +109,23 @@ def test_sweep_never_raises_without_manager_or_root(tmp_path, monkeypatch):
     assert (tmp_path / "root" / FINISHED).is_dir()
 
 
+def test_sweep_uses_the_injected_manager_instead_of_the_default(tmp_path, monkeypatch):
+    def explode():
+        raise RuntimeError("default manager must not be consulted")
+
+    monkeypatch.setattr(process_launcher, "default_manager", explode)
+    root = tmp_path / "injected"
+    for name in (FINISHED, CURRENT):
+        (root / name).mkdir(parents=True)
+    manager = _fake_manager({FINISHED: _card("T-FIN", "done", "accepted")})
+
+    removed = manager_ai_tools._sweep_candidate_overlays(root, CURRENT, manager=manager)
+
+    assert removed == 1
+    assert not (root / FINISHED).exists()
+    assert (root / CURRENT).is_dir()
+
+
 def test_sweep_skips_symlinked_dir_and_never_follows_it(overlay_root, tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()

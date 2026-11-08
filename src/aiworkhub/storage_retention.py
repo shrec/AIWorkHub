@@ -3553,7 +3553,9 @@ def _reclaim_terminal_base_pins(
       pid/start-tick proof (``process_dead``) does not show it dead;
     * ``process_not_terminal:<state>`` -- not a GC-candidate process state;
     * a :func:`_protected_attempt_ids` reason (``live_worker``,
-      ``rework_predecessor_retained``, ``blocked_terminal_candidate_retained``);
+      ``rework_predecessor_retained``). ``blocked_terminal_candidate_retained``
+      does not skip: it keeps a blocked candidate's worktree, and a pin is a
+      recoverable cache of the canonical database;
     * ``reviewer_running`` / ``reviewer_state_unknown`` -- a reviewer child
       sealed to this request is still live, or its liveness is unreadable;
     * ``home_of`` refusals (``metadata_invalid``, ``workspace_identity_mismatch``,
@@ -3602,7 +3604,9 @@ def _reclaim_terminal_base_pins(
             skip(request_id, f"process_not_terminal:{state or 'unknown'}"[:80])
             continue
         protected_reason = protected.get(request_id)
-        if protected_reason:
+        # A blocked candidate keeps its worktree, not its pin: the pin is a
+        # recoverable cache of the canonical database.
+        if protected_reason and protected_reason != "blocked_terminal_candidate_retained":
             skip(request_id, protected_reason)
             continue
         try:
@@ -3708,7 +3712,7 @@ def _janitor_base_pins(root: Path) -> dict[str, Any]:
             return "unsafe_workspace_shape"
         return home
 
-    return _reclaim_terminal_base_pins(
+    result = _reclaim_terminal_base_pins(
         latest,
         terminal_states=process_launcher.GC_CANDIDATE_PROCESS_STATES,
         active=active,
@@ -3718,6 +3722,18 @@ def _janitor_base_pins(root: Path) -> dict[str, Any]:
         reviewers_running=reviewers_running,
         home_of=home_of,
     )
+    # Only past the process-log check: a request with no events counts as
+    # finished, so sweeping without a log would delete every overlay.
+    try:
+        from . import manager_ai_tools  # local import: cycle-safe
+
+        result["candidate_overlays_removed"] = manager_ai_tools._sweep_candidate_overlays(
+            root / manager_ai_tools._CANDIDATE_OVERLAY_DIR, "", manager=manager
+        )
+    except Exception as exc:  # noqa: BLE001 -- the pin result must survive
+        result["candidate_overlays_removed"] = 0
+        result["candidate_overlay_sweep_error"] = type(exc).__name__
+    return result
 
 
 def _run_repository_cleanup(

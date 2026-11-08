@@ -241,11 +241,14 @@ def _candidate_request_finished(manager: Any, request_id: str) -> bool:
     )
 
 
-def _sweep_candidate_overlays(overlay_root: Path, keep_request_id: str) -> int:
+def _sweep_candidate_overlays(
+    overlay_root: Path, keep_request_id: str, *, manager: Any = None
+) -> int:
     """Remove request dirs of finished requests; return how many were removed.
 
     Best effort and never raises: a failed lookup keeps the dir, symlinks are
     never followed, and an OSError during removal is retried on the next sweep.
+    ``manager`` defaults to ``process_launcher.default_manager()``.
     """
 
     import shutil
@@ -254,7 +257,8 @@ def _sweep_candidate_overlays(overlay_root: Path, keep_request_id: str) -> int:
     try:
         from . import process_launcher
 
-        manager = process_launcher.default_manager()
+        if manager is None:
+            manager = process_launcher.default_manager()
         with os.scandir(overlay_root) as scan:
             entries = list(scan)
     except Exception:

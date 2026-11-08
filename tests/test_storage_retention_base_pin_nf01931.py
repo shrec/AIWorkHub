@@ -318,3 +318,177 @@ def test_same_volume_link_is_measured_and_any_fallback_is_named(tmp_path: Path) 
 )
 def test_artifact_recognition_is_exact(name: str, matches: bool) -> None:
     assert storage_retention._is_base_pin_artifact(name) is matches
+
+
+def test_blocked_terminal_candidate_loses_pin_but_keeps_unrelated_files(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "blk"
+    expected = _seed_home(home)
+
+    result = _run(
+        {"blk": _event("blk", "blocked")},
+        {"blk": home},
+        protected={"blk": "blocked_terminal_candidate_retained"},
+    )
+
+    assert result["ok"] is True, result
+    assert result["reclaimed_requests"] == 1
+    assert result["bytes"] == expected
+    assert result["skipped"] == []
+    assert _artifacts(home) == []
+    assert (home / "task_mcp_worker_runtime" / "keep.sqlite").is_file()
+    assert (home / "notes.txt").is_file()
+
+
+def test_live_worker_and_rework_predecessor_still_skip_by_name(tmp_path: Path) -> None:
+    reasons = {"live": "live_worker", "pred": "rework_predecessor_retained"}
+    homes = {rid: tmp_path / rid for rid in reasons}
+    for home in homes.values():
+        _seed_home(home)
+
+    result = _run(
+        {rid: _event(rid, "blocked") for rid in reasons}, homes, protected=reasons,
+    )
+
+    assert result["reclaimed_requests"] == 0
+    assert {row["request_id"]: row["reason"] for row in result["skipped"]} == reasons
+    for home in homes.values():
+        assert len(_artifacts(home)) == 5
+
+
+def _overlay_janitor(
+    tmp_path: Path, monkeypatch, *, log_exists: bool = True, lookup_raises: bool = False,
+) -> tuple[Path, Path, dict[str, Path]]:
+    """Wire ``_janitor_base_pins`` to a fake root-bound manager; return (repo, overlays, dirs)."""
+
+    from aiworkhub import manager_ai_tools
+
+    repo = (tmp_path / "repo").resolve()
+    overlays = repo / manager_ai_tools._CANDIDATE_OVERLAY_DIR
+    dirs = {name: overlays / (name * 32) for name in "ab"}
+    for directory in dirs.values():
+        directory.mkdir(parents=True)
+        (directory / "overlay_x.sqlite").write_bytes(b"x")
+    cards = {"a" * 32: ("T-A", "done", "accepted"), "b" * 32: ("T-B", "review", "review_ready")}
+    log = tmp_path / "process.jsonl"
+    if log_exists:
+        log.write_text("", encoding="utf-8")
+
+    class FakeManager:
+        def __init__(self, repo: Path) -> None:
+            self.process_log_path = log
+
+        def _latest_by_request(self) -> dict[str, dict[str, Any]]:
+            return {}
+
+        def _active_request_ids(self, _latest: Any) -> set[str]:
+            return set()
+
+        def _request_events(self, rid: str) -> list[dict[str, str]]:
+            return [{"task_id": cards[rid][0], "state": "x"}]
+
+        def _show_task(self, task_id: str) -> dict[str, Any]:
+            if lookup_raises:
+                raise RuntimeError("card lookup failed")
+            status, sub = next((c[1], c[2]) for c in cards.values() if c[0] == task_id)
+            return {"returncode": 0, "stdout": json.dumps({
+                "task_id": task_id, "status": status, "worker_status": status,
+                "terminal_substatus": sub,
+            })}
+
+    monkeypatch.setattr(process_launcher, "ProcessManager", FakeManager)
+    monkeypatch.setattr(
+        storage_retention, "_protected_attempt_ids",
+        lambda _root: ({}, True, {}, set(), set()),
+    )
+    return repo, overlays, dirs
+
+
+def test_janitor_sweeps_finished_overlay_and_keeps_review_ready(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo, _overlays, dirs = _overlay_janitor(tmp_path, monkeypatch)
+
+    result = storage_retention._janitor_base_pins(repo)
+
+    assert result["candidate_overlays_removed"] == 1
+    assert not dirs["a"].exists()
+    assert dirs["b"].is_dir()
+
+
+def test_janitor_keeps_overlay_when_lookup_raises(tmp_path: Path, monkeypatch) -> None:
+    repo, _overlays, dirs = _overlay_janitor(tmp_path, monkeypatch, lookup_raises=True)
+
+    result = storage_retention._janitor_base_pins(repo)
+
+    assert result["candidate_overlays_removed"] == 0
+    assert all(directory.is_dir() for directory in dirs.values())
+
+
+def test_janitor_touches_no_overlay_without_a_process_log(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo, _overlays, dirs = _overlay_janitor(tmp_path, monkeypatch, log_exists=False)
+
+    result = storage_retention._janitor_base_pins(repo)
+
+    assert "candidate_overlays_removed" not in result
+    assert all(directory.is_dir() for directory in dirs.values())
+
+
+def test_overlay_sweep_failure_keeps_the_pin_reclaim_result(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from aiworkhub import manager_ai_tools
+
+    repo, _overlays, _dirs = _overlay_janitor(tmp_path, monkeypatch)
+    sentinel = {"ok": True, "reclaimed_requests": 7, "errors": []}
+    monkeypatch.setattr(
+        storage_retention, "_reclaim_terminal_base_pins", lambda *_a, **_k: dict(sentinel)
+    )
+
+    def explode(*_a: Any, **_k: Any) -> int:
+        raise RuntimeError("sweep exploded")
+
+    monkeypatch.setattr(manager_ai_tools, "_sweep_candidate_overlays", explode)
+
+    result = storage_retention._janitor_base_pins(repo)
+
+    assert result["reclaimed_requests"] == 7 and result["ok"] is True
+    assert result["candidate_overlays_removed"] == 0
+    assert result["candidate_overlay_sweep_error"] == "RuntimeError"
+
+
+def test_marked_partition_never_serves_rows_after_its_pin_is_reclaimed(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+
+    helpers = _partition_helpers()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    base_db = helpers._build_base(repo, {"m.py": "def s():\n    return 1\n"})
+    (repo / "m.py").write_text("def s2():\n    return 2\n", encoding="utf-8")
+    runtime = tmp_path / "home" / "task_mcp_worker_runtime"
+    runtime.mkdir(parents=True)
+    overlay_named = runtime / _OVERLAY
+    plain_named = runtime / "p.sqlite"
+    for partition in (overlay_named, plain_named):
+        sgp.build_partition(
+            repo, helpers._changed(repo, ["m.py"]), partition, base_db_path=base_db,
+        )
+        assert sgp.read_composed_marker(partition) is not None
+
+    outcome = storage_retention._reclaim_home_base_pins(tmp_path / "home")
+
+    assert outcome["removed"] >= 2, outcome
+    assert not [p for p in runtime.iterdir() if sgp._BASE_PIN_NAME.fullmatch(p.name)]
+    assert not overlay_named.exists()
+    assert plain_named.exists()
+    conn = sqlite3.connect(str(plain_named))
+    try:
+        with pytest.raises(sgp.PartitionBaseShiftError):
+            sgp.attach_composed_base_if_marked(conn, plain_named)
+    finally:
+        conn.close()
