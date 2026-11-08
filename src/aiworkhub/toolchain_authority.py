@@ -14,6 +14,7 @@ import os
 import platform
 import re
 import shlex
+import shutil
 import site
 import stat
 import subprocess
@@ -444,6 +445,47 @@ class AuthoritySnapshot:
             "registry_fingerprint": self.registry_fingerprint,
             "cache_identity": self.cache_identity,
         }
+
+
+UNWINNABLE_REFUSAL_PREFIX = "task_contract_unwinnable:"
+_MAX_UNWINNABLE_REMEDIES = 4
+
+
+def unwinnable_refusal(missing: Iterable[MissingRequirement]) -> str:
+    """The launch refusal text for unmet toolchain requirements (NF-2026-02166).
+
+    The ``task_contract_unwinnable:<json list>`` prefix is classified on by the
+    dependency autolauncher and is unchanged.  When a missing ``executable`` is
+    a bare name that resolves on PATH it is an unregistered toolchain, so the
+    same ``toolchains.json`` remedy the validation lane gives is appended, with
+    the install root of the symlink-resolved target.  A bare name that is not on
+    PATH, or an absolute path, keeps the plain text.
+    """
+    facts = tuple(missing)
+    detail = json.dumps(
+        [f"{fact.kind}:{fact.value}" for fact in facts],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    remedies: list[str] = []
+    for fact in facts:
+        name = fact.value
+        if fact.kind != "executable" or fact.command or not name:
+            continue
+        if os.path.isabs(name) or "/" in name or "\\" in name:
+            continue
+        found = shutil.which(name)
+        if not found:
+            continue
+        from .validation_spawn_diagnosis import _install_root, registry_entry_remedy
+
+        root = _install_root(Path(found).resolve(strict=False))
+        remedies.append(registry_entry_remedy(name, str(root)))
+        if len(remedies) >= _MAX_UNWINNABLE_REMEDIES:
+            break
+    if not remedies:
+        return f"{UNWINNABLE_REFUSAL_PREFIX}{detail}"
+    return f"{UNWINNABLE_REFUSAL_PREFIX}{detail}; " + "; ".join(remedies)
 
 
 def _decode_secret(value: str) -> bytes:

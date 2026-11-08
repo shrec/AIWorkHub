@@ -1001,7 +1001,7 @@ def test_manager_create_rejects_validation_syntax_worker_cannot_execute(
     )
 
     assert result["ok"] is False
-    assert result["stderr"] == "invalid_validation_embedded_path"
+    assert result["stderr"].startswith("invalid_validation_embedded_path:")
     assert task_store.get_task(writable_repo, "TASK_INVALID_VALIDATION_SYNTAX") is None
 
 

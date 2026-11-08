@@ -5461,12 +5461,8 @@ class ProcessManager:
         authority_snapshot = self._toolchain_authority.evaluate(card)
         self._toolchain_authority.repair(authority_snapshot)
         if not authority_snapshot.available:
-            detail = json.dumps(
-                [f"{fact.kind}:{fact.value}" for fact in authority_snapshot.missing],
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            raise LaunchRejected(f"task_contract_unwinnable:{detail}")
+            detail = _toolchain_authority.unwinnable_refusal(authority_snapshot.missing)
+            raise LaunchRejected(detail)
         card["request_id"] = effective_request_id
         card[_toolchain_authority.RECEIPT_CARD_KEY] = (
             _toolchain_authority.authority_receipt(authority_snapshot, card)

@@ -209,7 +209,10 @@ def test_custom_escape_create_rejects_unsafe_include_root(
         custom_template_escape=task_templates.AUDITED_CUSTOM_ESCAPE,
     )
     assert result["ok"] is False
-    assert result["stderr"] == "invalid_validation_embedded_path"
+    assert (
+        result["stderr"]
+        == "invalid_validation_embedded_path:../secret:invalid_validation_path_escape"
+    )
 
 
 def test_custom_escape_create_rejects_malformed_separated_include_option(
@@ -230,7 +233,10 @@ def test_custom_escape_create_rejects_malformed_separated_include_option(
         custom_template_escape=task_templates.AUDITED_CUSTOM_ESCAPE,
     )
     assert result["ok"] is False
-    assert result["stderr"] == "invalid_validation_embedded_path"
+    assert (
+        result["stderr"]
+        == "invalid_validation_embedded_path:-I:include_root_operand_missing"
+    )
 
 
 def test_task_show_returns_stored_provenance_not_live_registry(

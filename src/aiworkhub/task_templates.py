@@ -1645,6 +1645,40 @@ def _validated_validation_token(token: str) -> None:
     _validated_path(path_token, "validation")
 
 
+_EMBEDDED_PATH_TOKEN_CHARS = 200
+
+
+def _embedded_path_refusal(
+    token: str, reason: str, *, head: bool = False
+) -> TaskTemplateError:
+    """``invalid_validation_embedded_path:<token>:<reason>`` (NF-2026-02166).
+
+    An absolute executable head stays refused by design; the message then also
+    names the ``toolchains.json`` registration that makes the bare name usable.
+    The remedy is purely lexical (no filesystem access on the caller's token)
+    and is added only for a token within the bound, so the text stays bounded.
+    """
+    text = (
+        f"invalid_validation_embedded_path:{token[:_EMBEDDED_PATH_TOKEN_CHARS]}:{reason}"
+    )
+    if (
+        head
+        and reason == "invalid_validation_path_absolute"
+        and len(token) <= _EMBEDDED_PATH_TOKEN_CHARS
+    ):
+        from pathlib import PurePosixPath
+
+        from .toolchain_registry import REGISTRY_RELATIVE_PATH
+        from .validation_spawn_diagnosis import _install_root, registry_entry_remedy
+
+        pure = PurePosixPath(token.replace("\\", "/"))
+        text += (
+            f"; register the bare name in {REGISTRY_RELATIVE_PATH.as_posix()}: "
+            + registry_entry_remedy(pure.name, _install_root(pure).as_posix())
+        )
+    return TaskTemplateError(text)
+
+
 def validate_custom_validation_roles(
     validation: Any, validation_roles: Any
 ) -> None:
@@ -1678,7 +1712,7 @@ def validate_custom_validation_roles(
                 # payload. A dangling ``-I`` or one whose operand is itself an
                 # option is malformed and rejected, never silently skipped.
                 if index >= len(tokens) or tokens[index].startswith("-"):
-                    raise TaskTemplateError("invalid_validation_embedded_path")
+                    raise _embedded_path_refusal(token, "include_root_operand_missing")
                 payload = tokens[index]
                 index += 1
             elif token.startswith(_INCLUDE_ROOT_OPTION):
@@ -1704,7 +1738,9 @@ def validate_custom_validation_roles(
             try:
                 _validated_validation_token(payload)
             except TaskTemplateError as exc:
-                raise TaskTemplateError("invalid_validation_embedded_path") from exc
+                raise _embedded_path_refusal(
+                    payload, str(exc), head=index == 1 and payload == token
+                ) from exc
     for item in () if validation_roles is None else validation_roles:
         if not isinstance(item, str):
             raise TaskTemplateError("invalid_validation_roles_not_string")
