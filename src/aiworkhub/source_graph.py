@@ -128,6 +128,9 @@ MAX_COMPONENT_NODES = 500
 MAX_PATH_VISITS = 5000
 SOURCE_GRAPH_COMPACT_MIN_BYTES = 64 * 1024 * 1024
 SOURCE_GRAPH_COMPACT_MIN_FREELIST_RATIO = 0.20
+SOURCE_GRAPH_STAGED_COMPACT_FREELIST_RATIO = 0.25
+SOURCE_GRAPH_BUILD_RESULT_TMP_PREFIX = "..build-result."
+SOURCE_GRAPH_BUILD_RESULT_TMP_MAX_AGE_SECONDS = 3600.0
 SOURCE_GRAPH_EXTRACT_WORKERS_ENV = "AIWORKHUB_SOURCE_GRAPH_EXTRACT_WORKERS"
 DEFAULT_SOURCE_GRAPH_EXTRACT_WORKERS = 2
 MAX_SOURCE_GRAPH_EXTRACT_WORKERS = 8
@@ -5384,6 +5387,33 @@ def _staging_prefix(canonical_path: Path) -> str:
     return f".{canonical_path.name}.building-"
 
 
+def _reap_stale_build_result_tmp(canonical_path: Path, *, now: float | None = None) -> None:
+    """Delete leaked ``..build-result.*.json.*.tmp`` files older than one hour.
+
+    The age gate is what keeps a tmp a live build is still writing safe: an
+    atomic write finishes in far less than the grace period.
+    """
+
+    cutoff = (time.time() if now is None else now) - SOURCE_GRAPH_BUILD_RESULT_TMP_MAX_AGE_SECONDS
+    try:
+        candidates = list(canonical_path.parent.iterdir())
+    except OSError:
+        return
+    for leaked in candidates:
+        name = leaked.name
+        if not (
+            name.startswith(SOURCE_GRAPH_BUILD_RESULT_TMP_PREFIX)
+            and ".json." in name
+            and name.endswith(".tmp")
+        ):
+            continue
+        try:
+            if leaked.is_file() and leaked.stat().st_mtime < cutoff:
+                leaked.unlink()
+        except OSError:
+            pass
+
+
 def _cleanup_abandoned_staging(canonical_path: Path) -> None:
     """Remove unpublished candidates while holding the repository writer lease."""
 
@@ -5394,6 +5424,69 @@ def _cleanup_abandoned_staging(canonical_path: Path) -> None:
                 abandoned.unlink()
             except OSError:
                 pass
+    _reap_stale_build_result_tmp(canonical_path)
+
+
+def _generation_freelist_ratio(path: Path) -> float:
+    """Return freelist_count / page_count for a generation, read-only."""
+
+    conn = connect_readonly(path, timeout=30.0)
+    try:
+        page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+        freelist_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+    finally:
+        conn.close()
+    return (freelist_count / page_count) if page_count else 0.0
+
+
+def _vacuum_generation_into(canonical_path: Path, staging_path: Path) -> bool:
+    """Write a compact snapshot of ``canonical_path`` into the empty ``staging_path``.
+
+    VACUUM INTO reads one consistent snapshot, so concurrent readers of the
+    live generation are unaffected. Returns False when it could not run.
+    """
+
+    try:
+        conn = connect_readonly(canonical_path, timeout=30.0)
+        try:
+            # query_only blocks VACUUM INTO; the mode=ro URI still protects the source.
+            conn.execute("PRAGMA query_only=OFF")
+            conn.execute("VACUUM INTO ?", (str(staging_path),))
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+    return True
+
+
+def _compact_staged_generation(staging_path: Path, report: BuildReport) -> BuildReport:
+    """VACUUM the private candidate when its freelist ratio is over the threshold."""
+
+    try:
+        ratio = _generation_freelist_ratio(staging_path)
+        if ratio < SOURCE_GRAPH_STAGED_COMPACT_FREELIST_RATIO:
+            return report
+        bytes_before = staging_path.stat().st_size
+        conn = connect(staging_path)
+        try:
+            conn.commit()
+            conn.execute("VACUUM")
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError, SourceGraphBuildInProgressError) as exc:
+        return replace(
+            report,
+            compaction_error=f"staged_compaction_failed:{type(exc).__name__}:{exc}",
+        )
+    return replace(
+        report,
+        compaction_performed=True,
+        database_bytes_before_compaction=bytes_before,
+        database_bytes_after_compaction=staging_path.stat().st_size,
+        freelist_ratio_before_compaction=ratio,
+        compaction_recommended=False,
+        compaction_deferred_reason="",
+    )
 
 
 @contextmanager
@@ -5412,11 +5505,32 @@ def _staged_generation(canonical_path: Path, *, copy_existing: bool):
                 raise SourceGraphError(
                     f"source_graph_generation_missing:{canonical_path}"
                 )
-            with canonical_path.open("rb") as source, os.fdopen(
-                descriptor, "wb", closefd=True
-            ) as destination:
+            compact_copy = False
+            try:
+                live_freelist_ratio = _generation_freelist_ratio(canonical_path)
+            except sqlite3.Error:
+                # A generation that cannot be probed read-only (for example a
+                # hot recovery journal beside it) keeps the byte-for-byte copy
+                # the recovery path has always relied on.
+                live_freelist_ratio = 0.0
+            if live_freelist_ratio >= SOURCE_GRAPH_STAGED_COMPACT_FREELIST_RATIO:
+                # A bloated generation is copied compact (live pages only)
+                # instead of byte for byte, so the free pages are neither
+                # read nor written on every refresh.
+                os.close(descriptor)
                 descriptor = -1
-                shutil.copyfileobj(source, destination)
+                compact_copy = _vacuum_generation_into(canonical_path, staging_path)
+                if not compact_copy:
+                    descriptor = os.open(
+                        staging_path,
+                        os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+                    )
+            if not compact_copy:
+                with canonical_path.open("rb") as source, os.fdopen(
+                    descriptor, "wb", closefd=True
+                ) as destination:
+                    descriptor = -1
+                    shutil.copyfileobj(source, destination)
         else:
             os.close(descriptor)
             descriptor = -1
@@ -5642,6 +5756,10 @@ def build_index(repo_root: Path, *, db_path: Path | None = None, incremental: bo
                         f"{type(metadata_exc).__name__}:{metadata_exc}"
                     ) from metadata_exc
                 raise
+            # The candidate is private until publication, so compacting it
+            # here never blocks a reader; publication stays one atomic rename
+            # of an already compact file.
+            report = _compact_staged_generation(staging_path, report)
             _publish_staged_generation(
                 staging_path, canonical_path, expected_report=report
             )

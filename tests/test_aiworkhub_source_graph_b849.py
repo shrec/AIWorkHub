@@ -1688,6 +1688,7 @@ def test_incremental_build_defers_live_database_compaction(tmp_path, monkeypatch
     }), encoding="utf-8")
     monkeypatch.setattr(sg, "SOURCE_GRAPH_COMPACT_MIN_BYTES", 0)
     monkeypatch.setattr(sg, "SOURCE_GRAPH_COMPACT_MIN_FREELIST_RATIO", 0.000001)
+    monkeypatch.setattr(sg, "SOURCE_GRAPH_STAGED_COMPACT_FREELIST_RATIO", 1.1)
     report = sg.build_index(repo, incremental=True)
     assert report.files_removed == 300
     assert report.freelist_ratio_before_compaction > 0
