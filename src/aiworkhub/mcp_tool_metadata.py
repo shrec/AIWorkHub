@@ -33,9 +33,47 @@ __all__ = [
     "alias_description",
     "tool_profile_visibility",
     "exposing_profiles",
+    "NEEDFIX_BULK_MAX_IDS",
+    "needfix_ids_refusal",
 ]
 
 _SECTION_HEADERS = ("Returns:", "Raises:", "Example:", "Examples:", "Note:")
+
+# NF-2026-02174: one cap and one refusal vocabulary for every NeedFix tool that
+# accepts a bounded ``needfix_ids`` list (needfix_show and the transition tool).
+NEEDFIX_BULK_MAX_IDS = 25
+
+
+def needfix_ids_refusal(needfix_id: Any, needfix_ids: Any) -> dict[str, Any] | None:
+    """Typed refusal for a malformed single/many NeedFix id selection, else None.
+
+    Runs before any row does, so a refused call never half-applies: exactly one
+    of ``needfix_id`` and ``needfix_ids``; at most NEEDFIX_BULK_MAX_IDS ids;
+    no empty list, blank id or duplicate id.
+    """
+    single = str(needfix_id or "").strip()
+    if needfix_ids is None:
+        if single:
+            return None
+        return {"ok": False, "error": "needfix_id_or_needfix_ids_required"}
+    if single:
+        return {"ok": False, "error": "needfix_id_and_needfix_ids_are_exclusive"}
+    if not isinstance(needfix_ids, (list, tuple)) or not needfix_ids:
+        return {"ok": False, "error": "needfix_ids_empty", "max_ids": NEEDFIX_BULK_MAX_IDS}
+    if len(needfix_ids) > NEEDFIX_BULK_MAX_IDS:
+        return {
+            "ok": False,
+            "error": "needfix_ids_over_limit",
+            "max_ids": NEEDFIX_BULK_MAX_IDS,
+            "count": len(needfix_ids),
+        }
+    cleaned = [str(item or "").strip() for item in needfix_ids]
+    if not all(cleaned):
+        return {"ok": False, "error": "needfix_ids_contains_blank_id"}
+    duplicates = sorted({item for item in cleaned if cleaned.count(item) > 1})
+    if duplicates:
+        return {"ok": False, "error": "needfix_ids_duplicate", "duplicates": duplicates}
+    return None
 
 
 def _indent(line: str) -> int:

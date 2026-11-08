@@ -8448,26 +8448,44 @@ def needfix_list(
 
 
 @mcp.tool()
-def needfix_show(needfix_id: str, full: bool = False) -> dict:
-    """Show one NeedFix by id; a body over 1 KB folds to its own identity.
+def needfix_show(needfix_id: str = "", full: bool = False, needfix_ids: list[str] | None = None) -> dict:
+    """Show one NeedFix by id, or up to 25 in one call; a body over 1 KB folds to its own identity.
 
-    Use this for one NeedFix's current fields; use needfix_list to find ids or
-    needfix_events for its audit history.
+    Use this for the current fields of one NeedFix, or pass needfix_ids to read
+    several in one call; use needfix_list to find ids or needfix_events for
+    its audit history.
 
     Measured 2026-10-09: 51 calls, avg 4 KB, max 12 KB, almost all of it the
     description and evidence bodies the filer wrote (NF-2026-01447). Each body
     whose own canonical bytes exceed ``core.NEEDFIX_BODY_MAX_BYTES`` is
     replaced by ``{summarized, bytes, length, sha256}`` so it stays
     addressable; a smaller body is returned verbatim and ``full=true`` returns
-    every byte.
+    every byte. With needfix_ids the reply is ``{items, count}`` in input
+    order, each row folded the same way; an unknown id is its own row with
+    ``ok: false`` and ``error`` and never fails the others.
 
     Args:
-        needfix_id: NeedFix id, e.g. NF-2026-01447.
-        full: Return every body byte verbatim instead of folding bodies over 1 KB to their identity; default false.
+        needfix_id: NeedFix id, e.g. NF-2026-01447. Give exactly one of needfix_id and needfix_ids.
+        full: Return every body byte verbatim instead of folding bodies over 1 KB to their identity; default false. Refused with needfix_ids.
+        needfix_ids: Up to 25 distinct NeedFix ids, answered as {items, count} in input order.
     """
-    return core.needfix_bodies_bounded(
-        core.needfix_show(needfix_id), full=bool(full)
-    )
+    refusal = _tool_metadata.needfix_ids_refusal(needfix_id, needfix_ids)
+    if refusal is not None:
+        return refusal
+    if needfix_ids is None:
+        return core.needfix_bodies_bounded(
+            core.needfix_show(needfix_id), full=bool(full)
+        )
+    if full:
+        return {"ok": False, "error": "full_not_allowed_with_needfix_ids"}
+    items: list[dict] = []
+    for raw_id in needfix_ids:
+        row_id = str(raw_id).strip()
+        try:
+            items.append(core.needfix_bodies_bounded(core.needfix_show(row_id), full=False))
+        except (needfix_store.NeedFixError, OSError, LookupError, TypeError, ValueError) as exc:
+            items.append({"needfix_id": row_id, "ok": False, "error": str(exc)[:240]})
+    return {"items": items, "count": len(items)}
 
 
 @mcp.tool()

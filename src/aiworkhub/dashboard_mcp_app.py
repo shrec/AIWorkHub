@@ -33,6 +33,7 @@ from aiworkhub import (
     feature_settings,
     hub_mail,
     hub_mail_net,
+    mcp_tool_metadata,
     model_settings,
     needfix_store,
     process_launcher,
@@ -4208,23 +4209,26 @@ def needfix_update_view(
 
 
 def needfix_transition_view(
-    needfix_id: str,
-    action: str,
+    needfix_id: str = "",
+    action: str = "",
     reason: str = "",
     readiness_score: int | None = None,
     duplicate_parent_id: str = "",
     confirm: bool = False,
     include_item: bool = False,
     promote_to: str = "",
+    needfix_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    """USER WRITE: apply one confirmed lifecycle status transition to a NeedFix item.
+    """USER WRITE: apply one confirmed lifecycle status transition to a NeedFix item, or to up to 25 in one call.
 
     Use this to triage, accept, reject, defer, mark duplicate or task_planned, resolve, or recover a conversion claim; use the archive, restore, or convert-commit action instead. Requires confirm=True, persists the transition and audit event, and returns a transition receipt.
 
     action=resolve only moves task_created -> resolved; a refused resolve names both routes in resolve_routes. A fix landed without a task uses action=resolve_verified from accepted or task_planned with readiness_score=100, evidence and evidence_refs; a 'commit:<sha>' ref not reachable from HEAD is refused with needfix_resolve_commit_not_reachable:<sha>. A `Resolves: NF-YYYY-NNNNN` trailer on a HEAD-reachable commit also resolves it.
 
+    With needfix_ids the same action, reason, readiness_score and duplicate_parent_id apply to each id through the same gates, and the reply is {results, succeeded, failed}: each result carries its own needfix_id, ok and receipt or error. A refused row leaves the other rows applied; there is no all-or-nothing and no partial row. A malformed list is refused before any row runs.
+
     Args:
-        needfix_id: NeedFix ID to transition.
+        needfix_id: NeedFix ID to transition. Give exactly one of needfix_id and needfix_ids.
         action: triage, accept, reject, duplicate, defer, task_planned, resolve, resolve_verified, or recover_conversion_claim.
         reason: note, up to 1000 chars; required for recover_conversion_claim.
         readiness_score: optional score for triage or accept.
@@ -4232,7 +4236,49 @@ def needfix_transition_view(
         confirm: must be True to execute.
         include_item: True adds full item detail.
         promote_to: optional; only "accepted" with action=triage.
+        needfix_ids: Up to 25 distinct NeedFix IDs to apply the same action to, one result per id.
     """
+    refusal = mcp_tool_metadata.needfix_ids_refusal(needfix_id, needfix_ids)
+    if refusal is not None:
+        return _needfix_response(refusal, "aiworkhub_dashboard_needfix_transition", write=True)
+    if needfix_ids is None:
+        return _needfix_transition_one(
+            needfix_id, action, reason, readiness_score, duplicate_parent_id,
+            confirm, include_item, promote_to,
+        )
+    results: list[dict[str, Any]] = []
+    for raw_id in needfix_ids:
+        row_id = str(raw_id).strip()
+        row = _needfix_transition_one(
+            row_id, action, reason, readiness_score, duplicate_parent_id,
+            confirm, include_item, promote_to,
+        )
+        # server_tool/authority are properties of the tool, reported once below.
+        entry = {
+            key: value for key, value in row.items() if key not in {"server_tool", "authority"}
+        }
+        entry["needfix_id"] = row_id
+        entry["ok"] = entry.get("ok") is True
+        results.append(entry)
+    succeeded = sum(1 for entry in results if entry["ok"])
+    return _needfix_response(
+        {"results": results, "succeeded": succeeded, "failed": len(results) - succeeded},
+        "aiworkhub_dashboard_needfix_transition",
+        write=True,
+    )
+
+
+def _needfix_transition_one(
+    needfix_id: str,
+    action: str,
+    reason: str,
+    readiness_score: int | None,
+    duplicate_parent_id: str,
+    confirm: bool,
+    include_item: bool,
+    promote_to: str,
+) -> dict[str, Any]:
+    """One id through the confirm rule, every gate and the transition receipt."""
     candidate = str(needfix_id or "")
     selected = str(action or "").strip().lower()
     promote = str(promote_to or "").strip().lower()
