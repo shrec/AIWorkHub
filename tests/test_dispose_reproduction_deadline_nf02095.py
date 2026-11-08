@@ -642,3 +642,72 @@ def test_an_invalid_registry_limit_is_refused_by_name(
     with pytest.raises(ValueError, match="_run_limit_invalid"):
         _call(reproduce, "finding-1")
     assert sandbox.resolved == 0 and fr._DISPOSE_RUNS.started == 0
+
+
+# --------------------------------------------------------------------------
+# NF-2026-02184: only a dismissal runs the manager reproducer
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("disposition", "runs"), [("confirmed", 0), ("dismissed", 1)]
+)
+def test_only_a_dismissal_runs_the_manager_reproducer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, disposition: str, runs: int
+) -> None:
+    from aiworkhub import process_launcher as pl
+    from aiworkhub import process_launcher_accept_review as accept_review
+
+    repo = tmp_path.resolve()
+    built: list[str] = []
+    stored: list[dict[str, Any]] = []
+
+    def recorder(_manager: Any, **_kwargs: Any) -> Any:
+        built.append(disposition)
+        return lambda **_args: {}
+
+    class _Orchestrator:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def dispose_review_finding(self, **kwargs: Any) -> dict[str, Any]:
+            stored.append(kwargs)
+            return {"ok": True}
+
+    route = {
+        "role": "manager",
+        "repo": str(repo),
+        "manager_route": {"provider": "claude", "session_id": "session-exact"},
+    }
+    monkeypatch.setattr(fr, "manager_reproducer", recorder)
+    monkeypatch.setattr(pl.core, "manager_bootstrap", lambda: route)
+    monkeypatch.setattr(pl.core, "writes_allowed", lambda: True)
+    monkeypatch.setattr(pl.core, "_lifecycle_state", lambda _card: "open")
+    monkeypatch.setattr(pl, "_parse_card", lambda _text, _task_id: {"task_id": "TARGET"})
+    monkeypatch.setattr(pl.review_orchestrator, "canonical_review_db", lambda _m: tmp_path / "r")
+    monkeypatch.setattr(pl.review_orchestrator, "ReviewOrchestrator", _Orchestrator)
+    monkeypatch.setattr(
+        pl.review_orchestrator,
+        "target_identity_from_card",
+        lambda _card: {"target_request_id": "target-request", "candidate_sha256": CANDIDATE},
+    )
+    monkeypatch.setattr(
+        accept_review,
+        "reviewer_evidence",
+        lambda _m, _task, _request: [
+            {"usable": True, "request_id": "review-req-1", "receipt": _receipt()}
+        ],
+    )
+    manager = SimpleNamespace(repo=repo, _show_task=lambda _task_id: "card")
+    result = accept_review.dispose_review_finding(
+        manager,
+        task_id="TARGET",
+        request_id="target-request",
+        reviewer_request_id="review-req-1",
+        finding_id="reviewer:correctness:finding-1",
+        disposition=disposition,
+        counter_evidence="cites src/calc.py:3" if disposition == "dismissed" else "",
+        reason="",
+    )
+    assert result == {"ok": True}
+    assert len(built) == runs
+    assert [("reproduce" in call) for call in stored] == [bool(runs)]
+    assert stored[0]["disposition"] == disposition

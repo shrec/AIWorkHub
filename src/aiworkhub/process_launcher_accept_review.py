@@ -4767,12 +4767,13 @@ def dispose_review_finding(
     ) != str(request_id)
     # RM-2026-00083: a report carrying an executable reproduction spec gets
     # the coordinator's reproduction callback; any other report takes the
-    # exact pre-existing path, with no callback at all.
+    # exact pre-existing path, with no callback at all. NF-2026-02184: only a
+    # dismissal needs proof -- a confirmation never blocks on a reproduction.
     from . import finding_reproduction
 
     reproduction: dict[str, Any] = {}
     bound_receipt = (bound or {}).get("receipt")
-    if finding_reproduction.report_has_spec(
+    if disposition == "dismissed" and finding_reproduction.report_has_spec(
         bound_receipt.get("report") if isinstance(bound_receipt, dict) else None
     ):
         # NF-2026-02095: the run is bounded by the module deadline and feeds

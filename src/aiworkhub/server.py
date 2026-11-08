@@ -7211,17 +7211,19 @@ def aiworkhub_manager_review_finding_dispose(
     Frozen once the target is accepted. Bound server-side to the reviewer
     receipt and candidate digest; never edits the report or accepts the target.
 
-    When the finding's reproduction is a spec (pytest:<node> or probe:<source>)
+    Reproduction runs only on dismissal. When the finding's reproduction is a
+    spec (pytest:<node> or probe:<source>) and the disposition is dismissed,
     the coordinator first runs it in the validation sandbox on the candidate
-    and on its base, and stores the signed receipt with the disposition. Only
+    and on its base, and stores the signed receipt with the disposition. A
+    confirmed disposition needs no proof and never runs it. Only
     a failed test, or a probe's assertion failure or explicit exit 1, counts as
     failed; any other error is unrunnable. A reproduced finding can be
     dismissed only when counter_evidence cites the contract as for HIGH
     (manager_signed); otherwise review_finding_reproduced_not_dismissable and
-    nothing is stored. Confirmed + reproduced records evidence_level
-    reproduced; not_reproduced or pre_existing may replace counter_evidence
-    for a LOW/MEDIUM finding (HIGH still needs the citation, CRITICAL never);
-    unrunnable changes nothing. A replay reuses the stored receipt.
+    nothing is stored. not_reproduced or pre_existing may replace
+    counter_evidence for a LOW/MEDIUM finding (HIGH still needs the citation,
+    CRITICAL never); unrunnable changes nothing. A replay reuses the stored
+    receipt.
 
     Args:
         task_id: Id of the target task card whose reviewer finding is being disposed.
