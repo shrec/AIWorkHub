@@ -844,4 +844,15 @@ def reused_finalization_neighbours(
         or recorded.get("selected") != list(selection.tests)
     ):
         return None
+    # NF-2026-02062: a HEAD that moved (or whose movement is unknown) leaves the
+    # exact-HEAD guarantee behind; the neighbours' own files must then sit inside
+    # the validation closure the matched digest covered.  An exact-HEAD receipt
+    # reports ``head_moved`` False, and a receipt-less union record is exact-HEAD.
+    receipt = union_reuse.get("tree_identity_receipt")
+    if (
+        isinstance(receipt, Mapping)
+        and receipt.get("head_moved") is not False
+        and recorded.get("closure_covers_selected") is not True
+    ):
+        return None
     return {**dict(recorded), "reused_from": FINALIZATION_REUSE_SOURCE}

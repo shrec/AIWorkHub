@@ -870,6 +870,161 @@ def _file_sha256_or_deleted(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+# NF-2026-02062: which anchor a tree identity used.  ``exact_head`` binds the
+# canonical HEAD oid (any HEAD move misses); ``closure_unchanged`` binds the
+# content of the validation closure instead, so a HEAD that moved only outside
+# that closure still matches.
+EXACT_HEAD_KEY = "exact_head"
+CLOSURE_KEY = "closure_unchanged"
+
+
+class TreeIdentity(str):
+    """A tree-identity digest that also says how it was keyed.
+
+    Equal to, and hashed as, the plain digest string; ``closure`` is the path set
+    the digest covered (empty under ``exact_head``).
+    """
+
+    key: str = EXACT_HEAD_KEY
+    head_oid: str | None = None
+    closure: frozenset[str] = frozenset()
+
+    def __new__(
+        cls,
+        digest: str,
+        *,
+        key: str,
+        head_oid: str | None,
+        closure: Iterable[str] = (),
+    ) -> "TreeIdentity":
+        self = super().__new__(cls, digest)
+        self.key = key
+        self.head_oid = head_oid
+        self.closure = frozenset(closure)
+        return self
+
+
+def _validation_closure_content(
+    workspace: WorkerWorkspace,
+    authority: Mapping[str, Any],
+    candidate_hashes: Mapping[str, str],
+) -> dict[str, str] | None:
+    """Content digest of every path the validation closure names, or ``None``.
+
+    The path set comes only from ``worker_workspace._declared_workspace_seed_closure``.
+    Anything underivable (an error, an empty closure, a non-regular file) is
+    ``None``, which the caller answers with the exact-HEAD identity.
+    """
+
+    try:
+        repo = workspace.repo
+        _live, _support, seeded = _worker_workspace._declared_workspace_seed_closure(
+            repo, authority, tuple(workspace.allowed_writes)
+        )
+        paths = sorted({str(relative) for relative in seeded})
+        if not paths:
+            return None
+        return {
+            relative: (
+                candidate_hashes[relative]
+                if relative in candidate_hashes
+                else _file_sha256_or_deleted(repo / relative)
+            )
+            for relative in paths
+        }
+    except Exception:  # noqa: BLE001 -- an underivable closure falls back to exact_head
+        return None
+
+
+_OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def _identity_record_fields(identity: Any) -> dict[str, Any]:
+    """The key facts a freshly recorded snapshot carries (nothing has moved yet)."""
+
+    if identity is None:
+        return {
+            "tree_identity_key": None,
+            "tree_identity_head_oid": None,
+            "moved_paths_outside_closure": None,
+        }
+    return {
+        "tree_identity_key": getattr(identity, "key", EXACT_HEAD_KEY),
+        "tree_identity_head_oid": getattr(identity, "head_oid", None),
+        "moved_paths_outside_closure": 0,
+    }
+
+
+def _moved_outside_closure(
+    repo: Path, recorded_head: str, current_head: str, closure: frozenset[str]
+) -> int | None:
+    """Paths that differ between two HEADs and are not in the closure; ``None`` if unknown."""
+
+    if not (
+        isinstance(recorded_head, str)
+        and isinstance(current_head, str)
+        and _OID.fullmatch(recorded_head)
+        and _OID.fullmatch(current_head)
+    ):
+        return None  # a persisted non-hex value must never reach git's argv as an option
+    try:
+        result = _worker_workspace._run(
+            ["git", "diff", "--name-only", "--no-renames", "-z", recorded_head, current_head],
+            cwd=repo,
+        )
+        if result.returncode != 0:
+            return None
+        moved = {
+            _worker_workspace._relative_repo_path(value)
+            for value in result.stdout.split("\x00")
+            if value
+        }
+        return len(moved - closure)
+    except Exception:  # noqa: BLE001 -- the count is evidence, never a reuse gate
+        return None
+
+
+def _reuse_key_receipt(
+    identity: Any, recorded: Mapping[str, Any], workspace: WorkerWorkspace
+) -> dict[str, Any]:
+    """Which key matched a reuse, whether HEAD moved, and how many moved paths fell outside."""
+
+    key = getattr(identity, "key", EXACT_HEAD_KEY)
+    if key != CLOSURE_KEY:
+        # The exact-HEAD digest equals the recorded one only at the same HEAD.
+        return {
+            "tree_identity_key": key,
+            "moved_paths_outside_closure": 0,
+            "tree_identity_head_moved": False,
+        }
+    current = getattr(identity, "head_oid", None)
+    recorded_head = recorded.get("tree_identity_head_oid")
+    moved: int | None = None
+    head_moved: bool | None = None
+    if current and isinstance(recorded_head, str) and recorded_head:
+        head_moved = current != recorded_head
+        moved = (
+            _moved_outside_closure(
+                workspace.repo, recorded_head, current, identity.closure
+            )
+            if head_moved
+            else 0
+        )
+    return {
+        "tree_identity_key": key,
+        "moved_paths_outside_closure": moved,
+        "tree_identity_head_moved": head_moved,
+    }
+
+
+def _identity_receipt(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "key": snapshot.get("tree_identity_key"),
+        "moved_paths_outside_closure": snapshot.get("moved_paths_outside_closure"),
+        "head_moved": snapshot.get("tree_identity_head_moved"),
+    }
+
+
 def combined_tree_identity(
     workspace: WorkerWorkspace,
     authority: Mapping[str, Any],
@@ -877,10 +1032,13 @@ def combined_tree_identity(
     candidate_changed_paths: Iterable[str],
     *,
     route_resolver: RouteResolver,
-) -> str | None:
+) -> TreeIdentity | None:
     """Digest every input of the combined-tree validation without building it.
 
-    ``None`` on any failure, so a caller always falls toward running.
+    The tree is anchored by the content of the validation closure when that
+    closure can be derived, else by the exact canonical HEAD oid
+    (NF-2026-02062).  ``None`` on any failure, so a caller always falls toward
+    running.
     """
 
     try:
@@ -894,6 +1052,7 @@ def combined_tree_identity(
         head = _worker_workspace._run(["git", "rev-parse", "HEAD"], cwd=repo)
         if head.returncode != 0:
             return None
+        head_oid = head.stdout.strip()
         canonical_delta = {
             relative: _file_sha256_or_deleted(repo / relative)
             for relative in _worker_workspace._canonical_worktree_delta_paths(repo)
@@ -908,8 +1067,16 @@ def combined_tree_identity(
             )
             for relative in candidate
         }
+        closure_content = _validation_closure_content(
+            workspace, authority, candidate_hashes
+        )
+        if closure_content is None:
+            key, anchor = EXACT_HEAD_KEY, {"head_oid": head_oid}
+        else:
+            key, anchor = CLOSURE_KEY, {"closure": closure_content}
         payload = {
-            "head_oid": head.stdout.strip(),
+            "identity_key": key,
+            **anchor,
             "canonical_delta": canonical_delta,
             "candidate": candidate_hashes,
             "commands": declared_validation_commands(authority),
@@ -923,7 +1090,12 @@ def combined_tree_identity(
         blob = json.dumps(
             payload, sort_keys=True, separators=(",", ":"), default=str
         )
-        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+        return TreeIdentity(
+            hashlib.sha256(blob.encode("utf-8")).hexdigest(),
+            key=key,
+            head_oid=head_oid,
+            closure=closure_content or (),
+        )
     except Exception:  # noqa: BLE001 -- any doubt means "run the validations"
         return None
 
@@ -965,6 +1137,7 @@ def _reusable_finalizer_rows(
         **recorded,
         "reused": True,
         "reused_from": named,
+        **_reuse_key_receipt(identity, recorded, workspace),
     }
 
 
@@ -1027,7 +1200,8 @@ def run_full_snapshot_validations(
             "source_base_oid": workspace.base_oid,
             "snapshot_base_oid": snapshot.base_oid,
             "combined_tree": combined_tree,
-            "tree_identity_sha256": identity,
+            "tree_identity_sha256": None if identity is None else str(identity),
+            **_identity_record_fields(identity),
             "validations_all_passed": all_passed,
         }
         if all_passed:  # NF-2026-02069: neighbours on this sealed tree; red never raises
@@ -1044,6 +1218,12 @@ def run_full_snapshot_validations(
                 ),
             )
             if neighbours is not None:
+                # NF-2026-02062: under the closure key accept may reuse this evidence
+                # across a moved HEAD only if the closure digest covered every test file.
+                closure = getattr(identity, "closure", frozenset())
+                neighbours["closure_covers_selected"] = bool(closure) and all(
+                    str(test) in closure for test in neighbours.get("selected") or ()
+                )
                 record["neighbour_tests"] = neighbours
         return validations, record
     finally:
@@ -1082,7 +1262,12 @@ def run_union_validations_once(
         reuse, identity=identity, workspace=workspace, command_count=len(commands)
     )
     if reused is not None:
-        return reused[0], dict(reuse or {})
+        # The receipt rides beside the snapshot, which stays byte-identical to the
+        # finalizer's so accept_neighbour_tests can still compare the two.
+        return reused[0], {
+            **dict(reuse or {}),
+            "tree_identity_receipt": _identity_receipt(reused[1]),
+        }
     rows = run_declared()
     if identity is None:
         return rows, None
@@ -1093,7 +1278,8 @@ def run_union_validations_once(
         "source_base_oid": workspace.base_oid,
         "snapshot_base_oid": snapshot_base_oid,
         "combined_tree": dict(combined_tree),
-        "tree_identity_sha256": identity,
+        "tree_identity_sha256": str(identity),
+        **_identity_record_fields(identity),
         "validations_all_passed": not any(
             validation_runner._is_failing_row(row) for row in rows
         ),

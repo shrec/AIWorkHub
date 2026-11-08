@@ -168,9 +168,19 @@ def test_candidate_drift_between_paths_reruns(workspace) -> None:
 def test_canonical_drift_against_finalizer_receipt_reruns(workspace) -> None:
     counting = _Counting()
     record = _finalizer_record(workspace, _identity(workspace))
-    _git(workspace.repo, "commit", "--allow-empty", "-m", "moved head")
+    # NF-2026-02062: a HEAD that moved outside the closure no longer forces a rerun;
+    # a canonical working-tree change the combined tree would carry still does.
+    (workspace.repo / "pkg" / "dirty.py").write_text("DIRTY = 1\n", encoding="utf-8")
     _union(workspace, counting, record)
     assert counting.commands == 1
+
+
+def test_head_moved_outside_the_closure_reuses_the_finalizer_receipt(workspace) -> None:
+    counting = _Counting()
+    record = _finalizer_record(workspace, _identity(workspace))
+    _git(workspace.repo, "commit", "--allow-empty", "-m", "moved head")
+    _union(workspace, counting, record)
+    assert counting.commands == 0
 
 
 def test_manager_correction_never_reuses_the_finalizer_receipt(workspace) -> None:

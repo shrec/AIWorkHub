@@ -18,7 +18,7 @@ from aiworkhub.worker_workspace import (
 _COMMAND = "python -c \"print('probe')\""
 _CARD = {
     "allowed_writes": ["pkg/feature.py"],
-    "read_first": [],
+    "read_first": ["scripts/helper.py"],
     "immutable_inputs": [],
     "required_outputs": [],
     "validation": [_COMMAND],
@@ -179,7 +179,11 @@ def test_real_run_records_identity_and_then_is_reused(workspace) -> None:
 
 
 def _mutate_head(ws, _ctx):
-    _git(ws.repo, "commit", "--allow-empty", "-m", "moved head")
+    # NF-2026-02062: a HEAD that moves without touching the validation closure
+    # keeps the identity; one that rewrites a closure path (read_first) does not.
+    (ws.repo / "scripts" / "helper.py").write_text("MARKER = 'moved'\n", encoding="utf-8")
+    _git(ws.repo, "add", "scripts/helper.py")
+    _git(ws.repo, "commit", "-m", "moved head inside the closure")
 
 
 def _mutate_canonical_delta(ws, _ctx):
