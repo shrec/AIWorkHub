@@ -1,4 +1,6 @@
 .manager-chat-bubble {
+  /* Contains the floated .mc-time, which a bubble with no text would otherwise spill. */
+  display: flow-root;
   max-width: 85%;
   margin: 0 0 8px;
   padding: 7px 10px;
@@ -86,13 +88,19 @@
   overflow-wrap: anywhere;
 }
 
+.manager-chat-tool-row:not([open]) > summary {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .manager-chat-tool-row-body {
   margin: 0;
   padding: 0 9px 8px;
   color: var(--muted);
   font-size: var(--fs-2xs);
-  max-height: none;
-  overflow: visible;
+  max-height: 20em;
+  overflow: auto;
   text-overflow: clip;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
@@ -114,7 +122,8 @@
 }
 
 .manager-chat-thinking,
-.manager-chat-thinking-block {
+.manager-chat-thinking-block,
+.mc-thinking {
   margin: 8px 0;
 }
 
@@ -142,14 +151,16 @@
 .manager-chat-thinking-dots span:nth-child(2) { animation-delay: 0.15s; }
 .manager-chat-thinking-dots span:nth-child(3) { animation-delay: 0.3s; }
 
-.manager-chat-thinking-block {
+.manager-chat-thinking-block,
+.mc-thinking {
   border: 1px solid var(--line);
   border-left: 2px solid var(--accent);
   border-radius: 4px;
   background: var(--surface-subtle);
 }
 
-.manager-chat-thinking-block > summary {
+.manager-chat-thinking-block > summary,
+.mc-thinking > summary {
   padding: 6px 9px;
   cursor: pointer;
   color: var(--ink-soft);
@@ -192,6 +203,7 @@
 .mc-body { min-width: 0; }
 .mc-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; }
 .mc-mono, .mc-block pre { font-family: var(--vscode-editor-font-family); font-size: var(--fs-2xs); }
+.mc-mono { overflow-wrap: anywhere; }
 .mc-block pre { margin: 4px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .mc-chip { color: var(--ink-soft); font-size: var(--fs-2xs); }
 .mc-chip.is-ok { color: var(--review-ink); }
@@ -203,7 +215,7 @@
 .mc-show-all { margin-top: 4px; font-size: var(--fs-2xs); }
 .mc-note, .mc-footer { color: var(--muted); font-size: var(--fs-2xs); }
 .mc-error .mc-gutter, .mc-error .mc-body { color: var(--blocked-ink); }
-.mc-task-link { background: none; border: 0; padding: 0; color: var(--ink); cursor: pointer; text-decoration: underline; }
+.mc-task-link { background: none; border: 0; padding: 0; color: var(--ink); cursor: pointer; text-decoration: underline; overflow-wrap: anywhere; white-space: normal; text-align: left; }
 .mc-task-link:focus-visible, .mc-show-all:focus-visible { outline: 1px solid var(--accent); }
 .mc-copy { position: absolute; top: 0; right: 0; padding: 1px 6px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface-subtle); color: var(--ink-soft); font-size: var(--fs-2xs); cursor: pointer; opacity: 0; }
 .mc-block:hover .mc-copy, .mc-block:focus-within .mc-copy, .mc-copy:focus-visible { opacity: 1; }
@@ -219,10 +231,12 @@
 @media (prefers-reduced-motion: reduce) { .mc-caret { animation: none; } }
 .mc-p { margin: 0 0 6px; }
 .mc-list { margin: 0 0 6px; padding-left: 2ch; }
+ol.mc-list { padding-left: 4ch; }
+.mc-list .mc-list { margin-bottom: 0; }
 .mc-code { padding: 6px 8px; background: var(--surface-subtle); border: 1px solid var(--line); }
 .mc-code-block { position: relative; }
 .mc-code-block:hover .mc-copy, .mc-code-block:focus-within .mc-copy { opacity: 1; }
-.mc-time { display: block; margin-bottom: 2px; color: var(--muted); font-size: var(--fs-2xs); }
+.mc-time { float: right; margin-left: 8px; color: var(--muted); font-size: var(--fs-2xs); }
 .mc-stopped { color: var(--blocked-ink); }
 /* A flex sibling of the transcript: the negative margin cancels its height, so showing it never resizes the transcript. .manager-chat-frame declares no gap; add any gap it gains to the margin. */
 .mc-latest { position: relative; z-index: 2; flex: 0 0 auto; align-self: flex-end; height: 24px; margin-top: -24px; margin-right: 12px; font-size: var(--fs-2xs); }
@@ -232,3 +246,17 @@
 .mc-activity-group.has-failed > summary { color: var(--blocked-ink); }
 .mc-activity-body { padding: 0 9px 8px; }
 .mc-thinking { color: var(--ink-soft); }
+.mc-thinking-text { padding: 0 9px 8px; color: var(--muted); font-size: var(--fs-2xs); white-space: pre-wrap; overflow-wrap: anywhere; }
+.mc-h { margin: 8px 0 4px; font-size: var(--fs-base); font-weight: 600; }
+h3.mc-h { font-size: calc(var(--fs-base) * 1.2); }
+h4.mc-h { font-size: calc(var(--fs-base) * 1.1); }
+h6.mc-h { color: var(--ink-soft); }
+.mc-hr { margin: 8px 0; border: 0; border-top: 1px solid var(--line); }
+.mc-quote { margin: 0 0 6px; padding-left: 8px; border-left: 2px solid var(--line); color: var(--ink-soft); }
+.mc-link { color: var(--ink); text-decoration: underline; overflow-wrap: anywhere; }
+.mc-link:focus-visible { outline: 1px solid var(--accent); }
+.mc-table-wrap { max-width: 100%; margin: 0 0 6px; overflow-x: auto; }
+.mc-table { border-collapse: collapse; font-size: var(--fs-2xs); }
+.mc-table th, .mc-table td { padding: 2px 6px; border: 1px solid var(--line); text-align: left; vertical-align: top; overflow-wrap: normal; }
+/* The wrapper scrolls, so a cell keeps its natural width rather than breaking inside every word. */
+.mc-table .mc-mono, .mc-table .mc-link { overflow-wrap: normal; }

@@ -45,7 +45,7 @@ function managerChatEventNode(event) {
     const hasResult = status !== "running";
     const row = createElement("details", "manager-chat-tool-row is-" + status);
     row.open = false;
-    row.appendChild(createElement("summary", "", [name, hint, status].filter(Boolean).join(" · ")));
+    row.appendChild(managerConsoleToolSummary(name, (shown) => [shown, status, hint].filter(Boolean).join(" · ")));
     const body = createElement("div", "manager-chat-tool-row-body");
     if ("input" in payload) {
       body.appendChild(createElement("div", "manager-chat-tool-section", "input"));
@@ -64,8 +64,7 @@ function managerChatEventNode(event) {
     const hint = managerChatToolHint(payload);
     const row = createElement("details", "manager-chat-tool-row is-result");
     row.open = false;
-    const summary = name + " result";
-    row.appendChild(createElement("summary", "", hint ? summary + " · " + hint : summary));
+    row.appendChild(managerConsoleToolSummary(name, (shown) => [shown + " result", hint].filter(Boolean).join(" · ")));
     const body = createElement("div", "manager-chat-tool-row-body");
     const rest = Object.assign({}, payload);
     delete rest.name;
@@ -107,7 +106,6 @@ function managerChatEventNode(event) {
   }
   if (type === "reasoning") {
     const row = createElement("details", "manager-chat-thinking-block");
-    row.open = true;
     const label = managerChatThoughtSummary(event);
     const summary = createElement("summary", "", label);
     if (managerConsoleActiveIndex && label.startsWith(MANAGER_CONSOLE_LIVE_THOUGHT_PREFIX)) managerConsoleLiveSummaries.push({ summary, event });
@@ -178,24 +176,47 @@ function managerChatToolHint(payload) {
   return "";
 }
 
+// The status follows the name directly, so the one-line ellipsis can only ever eat the hint.
+function managerConsoleToolSummary(name, render) {
+  const summary = createElement("summary", "", render(name.replace(/^mcp__.+?__(?=.)/, "")));
+  summary.setAttribute("title", render(name));
+  return summary;
+}
+
+function managerConsoleMcpText(value) {
+  if (!Array.isArray(value) || !value.length) return null;
+  if (!value.every((item) => item && item.type === "text" && typeof item.text === "string")) return null;
+  return value.map((item) => item.text).join("\n");
+}
+
+function managerConsoleToolText(value) {
+  const text = value == null ? "" : String(value);
+  if ((text[0] !== "{" && text[0] !== "[") || text.length >= MANAGER_CONSOLE_PRETTY_JSON_LIMIT) return text;
+  let parsed;
+  try { parsed = JSON.parse(text); } catch (_error) { return text; }
+  const mcp = managerConsoleMcpText(parsed);
+  if (mcp !== null) return managerConsoleToolText(mcp);
+  // JSON.parse rounds integers past 2^53, and this panel must never show digits the tool did not print.
+  return /\d{16,}/.test(text) ? text : JSON.stringify(parsed, null, 2);
+}
+
+function managerConsoleToolValue(parent, text) {
+  const node = createElement("div", "manager-chat-tool-value");
+  node.appendChild(document.createTextNode(text));
+  parent.appendChild(node);
+}
+
 function appendManagerChatToolFields(parent, value, depth) {
-  if (!parent || depth > 4) return;
-  if (value == null || typeof value !== "object") {
-    const text = createElement("div", "manager-chat-tool-value");
-    text.appendChild(document.createTextNode(value == null ? "" : String(value)));
-    parent.appendChild(text);
-    return;
-  }
+  if (!parent) return;
+  const mcp = managerConsoleMcpText(value);
+  if (mcp !== null) return managerConsoleToolValue(parent, managerConsoleToolText(mcp));
+  if (value == null || typeof value !== "object") return managerConsoleToolValue(parent, managerConsoleToolText(value));
+  if (depth > 4) return managerConsoleToolValue(parent, JSON.stringify(value, null, 2));
   const entries = Array.isArray(value) ? value.map((item, index) => [String(index), item]) : Object.keys(value).map((key) => [key, value[key]]);
   for (const pair of entries) {
     const field = createElement("div", "manager-chat-tool-field");
     field.appendChild(createElement("span", "manager-chat-tool-label", pair[0]));
-    if (pair[1] && typeof pair[1] === "object") appendManagerChatToolFields(field, pair[1], depth + 1);
-    else {
-      const text = createElement("div", "manager-chat-tool-value");
-      text.appendChild(document.createTextNode(pair[1] == null ? "" : String(pair[1])));
-      field.appendChild(text);
-    }
+    appendManagerChatToolFields(field, pair[1], depth + 1);
     parent.appendChild(field);
   }
 }
@@ -247,6 +268,7 @@ const MANAGER_CONSOLE_LIVE_THOUGHT_PREFIX = "Thinking ·";
 const MANAGER_CONSOLE_LIVE_THINKING_KEY = "extra:live-thinking";
 const MANAGER_CONSOLE_COMMAND_LINES = 20;
 const MANAGER_CONSOLE_DIFF_LINES = 40;
+const MANAGER_CONSOLE_PRETTY_JSON_LIMIT = 64 * 1024;
 
 function managerConsoleBlock(kind, body) {
   const block = createElement("div", "mc-block mc-" + kind.replace(/_/g, "-"));
@@ -975,7 +997,11 @@ function managerConsoleInline(parent, text) {
     if (match[1] !== undefined) parent.appendChild(createElement("code", "mc-mono", match[1]));
     else if (match[2] !== undefined) parent.appendChild(createElement("strong", "", match[2]));
     else if (match[3] !== undefined || match[4] !== undefined) parent.appendChild(createElement("em", "", match[3] !== undefined ? match[3] : match[4]));
-    else parent.appendChild(document.createTextNode(`${match[5]} (${match[6]})`));
+    else if (/^https?:\/\//i.test(match[6])) {
+      const link = createElement("a", "mc-link", match[5]);
+      link.setAttribute("href", match[6]);
+      parent.appendChild(link);
+    } else parent.appendChild(document.createTextNode(`${match[5]} (${match[6]})`));
   }
   if (cursor < source.length) parent.appendChild(document.createTextNode(source.slice(cursor)));
 }
@@ -991,36 +1017,164 @@ function managerConsoleCodeNode(code) {
   return wrap;
 }
 
-function managerConsoleMarkdown(text) {
+const MANAGER_CONSOLE_FENCE = /^(\s*)(`{3,})/;
+const MANAGER_CONSOLE_HEADING = /^ {0,3}(#{1,6})\s+(\S.*)$/;
+const MANAGER_CONSOLE_HR = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
+const MANAGER_CONSOLE_QUOTE = /^ {0,3}> ?/;
+const MANAGER_CONSOLE_LIST_ITEM = /^(\s*)([-*+]|\d+\.)\s+(.*)$/;
+// Each quote level recurses once, so a line of ">" cannot run the stack out.
+const MANAGER_CONSOLE_QUOTE_DEPTH = 8;
+
+function managerConsoleFenceCloses(line, fence) {
+  const trimmed = line.trim();
+  return trimmed.startsWith(fence) && /^`+$/.test(trimmed);
+}
+
+function managerConsoleFence(parent, lines, start, open) {
+  const indent = new RegExp(`^\\s{0,${open[1].length}}`);
+  const code = [];
+  let index = start + 1;
+  while (index < lines.length && !managerConsoleFenceCloses(lines[index], open[2])) code.push(lines[index++].replace(indent, ""));
+  parent.appendChild(managerConsoleCodeNode(code));
+  return index + 1;
+}
+
+function managerConsoleTableCells(line) {
+  let row = line.trim();
+  if (row.startsWith("|")) row = row.slice(1);
+  if (row.endsWith("|") && !row.endsWith("\\|")) row = row.slice(0, -1);
+  return row.split(/(?<!\\)\|/).map((cell) => cell.trim().replace(/\\\|/g, "|"));
+}
+
+function managerConsoleIsTableStart(lines, index) {
+  if (index + 1 >= lines.length || !lines[index].includes("|") || !lines[index + 1].includes("|")) return false;
+  const delimiter = managerConsoleTableCells(lines[index + 1]);
+  return delimiter.length === managerConsoleTableCells(lines[index]).length && delimiter.every((cell) => /^:?-+:?$/.test(cell));
+}
+
+function managerConsoleIsBlockStart(lines, index) {
+  const line = lines[index];
+  return MANAGER_CONSOLE_FENCE.test(line) || MANAGER_CONSOLE_HEADING.test(line) || MANAGER_CONSOLE_HR.test(line)
+    || MANAGER_CONSOLE_QUOTE.test(line) || MANAGER_CONSOLE_LIST_ITEM.test(line) || managerConsoleIsTableStart(lines, index);
+}
+
+function managerConsoleTableRow(section, tag, columns, cells) {
+  const row = createElement("tr", "");
+  for (let column = 0; column < columns; column += 1) {
+    const cell = createElement(tag, "");
+    managerConsoleInline(cell, cells[column] || "");
+    row.appendChild(cell);
+  }
+  section.appendChild(row);
+}
+
+function managerConsoleTable(parent, lines, start) {
+  const header = managerConsoleTableCells(lines[start]);
+  const wrap = createElement("div", "mc-table-wrap");
+  const table = createElement("table", "mc-table");
+  const head = createElement("thead", "");
+  const body = createElement("tbody", "");
+  managerConsoleTableRow(head, "th", header.length, header);
+  let index = start + 2;
+  while (index < lines.length && lines[index].trim() && lines[index].includes("|") && !managerConsoleIsBlockStart(lines, index)) {
+    managerConsoleTableRow(body, "td", header.length, managerConsoleTableCells(lines[index++]));
+  }
+  table.appendChild(head);
+  table.appendChild(body);
+  wrap.appendChild(table);
+  parent.appendChild(wrap);
+  return index;
+}
+
+function managerConsoleListLevel(container, indent, ordered, marker) {
+  const list = createElement(ordered ? "ol" : "ul", "mc-list");
+  const start = ordered ? Number.parseInt(marker, 10) : 1;
+  if (start !== 1) list.setAttribute("start", String(start));
+  container.appendChild(list);
+  return { container, indent, ordered, list, item: null };
+}
+
+function managerConsoleListItem(parent, levels, match) {
+  const indent = match[1].replace(/\t/g, "    ").length;
+  const ordered = /\d/.test(match[2]);
+  while (levels.length > 1 && indent < levels[levels.length - 1].indent) levels.pop();
+  let level = levels[levels.length - 1];
+  if (!level) {
+    level = managerConsoleListLevel(parent, indent, ordered, match[2]);
+    levels.push(level);
+  } else if (indent >= level.indent + 2) {
+    level = managerConsoleListLevel(level.item, indent, ordered, match[2]);
+    levels.push(level);
+  } else if (level.ordered !== ordered) {
+    level = managerConsoleListLevel(level.container, level.indent, ordered, match[2]);
+    levels[levels.length - 1] = level;
+  }
+  level.item = createElement("li", "");
+  managerConsoleInline(level.item, match[3]);
+  level.list.appendChild(level.item);
+}
+
+function managerConsoleListItemAt(lines, index) {
+  if (index >= lines.length || MANAGER_CONSOLE_HR.test(lines[index])) return null;
+  return MANAGER_CONSOLE_LIST_ITEM.exec(lines[index]);
+}
+
+function managerConsoleList(parent, lines, start) {
+  const levels = [];
+  let index = start;
+  while (index < lines.length) {
+    // A blank line between items does not end the list; only what follows it can.
+    let next = index;
+    while (next < lines.length && !lines[next].trim()) next += 1;
+    const match = managerConsoleListItemAt(lines, next);
+    if (match) {
+      managerConsoleListItem(parent, levels, match);
+      index = next + 1;
+      continue;
+    }
+    if (next !== index || !/^\s{2,}\S/.test(lines[index]) || managerConsoleIsBlockStart(lines, index)) break;
+    managerConsoleInline(levels[levels.length - 1].item, `\n${lines[index].trim()}`);
+    index += 1;
+  }
+  return index;
+}
+
+function managerConsoleMarkdown(text, depth = 0) {
   const fragment = document.createDocumentFragment();
-  const lines = String(text || "").split("\n");
+  const lines = String(text || "").split(/\r?\n/);
   let index = 0;
   while (index < lines.length) {
     const line = lines[index];
-    if (line.startsWith("```")) {
-      const code = [];
-      index += 1;
-      while (index < lines.length && !lines[index].startsWith("```")) code.push(lines[index++]);
-      index += 1;
-      fragment.appendChild(managerConsoleCodeNode(code));
-      continue;
-    }
-    const bullet = /^\s*([-*]|\d+\.)\s+/;
-    if (bullet.test(line)) {
-      const ordered = /^\s*\d+\./.test(line);
-      const list = createElement(ordered ? "ol" : "ul", "mc-list");
-      while (index < lines.length && bullet.test(lines[index])) {
-        const item = createElement("li", "");
-        managerConsoleInline(item, lines[index++].replace(bullet, ""));
-        list.appendChild(item);
-      }
-      fragment.appendChild(list);
-      continue;
-    }
+    // Fences come first: nothing below may ever see a line inside one.
+    const fence = MANAGER_CONSOLE_FENCE.exec(line);
+    if (fence) { index = managerConsoleFence(fragment, lines, index, fence); continue; }
     if (!line.trim()) { index += 1; continue; }
+    const heading = MANAGER_CONSOLE_HEADING.exec(line);
+    if (heading) {
+      const node = createElement(`h${Math.min(heading[1].length + 2, 6)}`, "mc-h");
+      managerConsoleInline(node, heading[2].trimEnd());
+      fragment.appendChild(node);
+      index += 1;
+      continue;
+    }
+    if (MANAGER_CONSOLE_HR.test(line)) {
+      fragment.appendChild(createElement("hr", "mc-hr"));
+      index += 1;
+      continue;
+    }
+    if (depth < MANAGER_CONSOLE_QUOTE_DEPTH && MANAGER_CONSOLE_QUOTE.test(line)) {
+      const quoted = [];
+      while (index < lines.length && MANAGER_CONSOLE_QUOTE.test(lines[index])) quoted.push(lines[index++].replace(MANAGER_CONSOLE_QUOTE, ""));
+      const quote = createElement("blockquote", "mc-quote");
+      quote.appendChild(managerConsoleMarkdown(quoted.join("\n"), depth + 1));
+      fragment.appendChild(quote);
+      continue;
+    }
+    if (managerConsoleIsTableStart(lines, index)) { index = managerConsoleTable(fragment, lines, index); continue; }
+    if (MANAGER_CONSOLE_LIST_ITEM.test(line)) { index = managerConsoleList(fragment, lines, index); continue; }
     const paragraph = createElement("p", "mc-p");
-    const words = [];
-    while (index < lines.length && lines[index].trim() && !lines[index].startsWith("```") && !bullet.test(lines[index])) words.push(lines[index++]);
+    const words = [lines[index++]];
+    while (index < lines.length && lines[index].trim() && !managerConsoleIsBlockStart(lines, index)) words.push(lines[index++]);
     managerConsoleInline(paragraph, words.join("\n"));
     fragment.appendChild(paragraph);
   }

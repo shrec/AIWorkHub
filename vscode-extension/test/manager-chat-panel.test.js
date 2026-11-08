@@ -1820,12 +1820,36 @@ test("manager chat model and tool text is not clipped by ellipsis or a fixed hei
   );
   assert.match(managerCss, /#manager-chat-model \{[^}]*field-sizing:\s*content/);
   assert.match(consoleCss, /\.manager-chat-tool-row > summary \{[^}]*overflow-wrap:\s*anywhere/);
-  assert.match(consoleCss, /\.manager-chat-tool-row-body \{[^}]*overflow:\s*visible/);
-  assert.match(consoleCss, /\.manager-chat-tool-row-body \{[^}]*max-height:\s*none/);
-  for (const css of [managerCss, consoleCss]) {
-    assert.doesNotMatch(css, /text-overflow:\s*ellipsis/);
-    assert.doesNotMatch(css, /line-clamp/);
-  }
+  assert.match(consoleCss, /\.manager-chat-tool-row-body \{[^}]*overflow:\s*auto/);
+  assert.match(consoleCss, /\.manager-chat-tool-row-body \{[^}]*max-height:\s*20em/);
+  assert.doesNotMatch(managerCss, /text-overflow:\s*ellipsis/);
+  assert.doesNotMatch(managerCss, /line-clamp/);
+  assert.doesNotMatch(consoleCss, /line-clamp/);
+  const ellipsisRules = [...consoleCss.matchAll(/([^{}]+)\{[^{}]*text-overflow:\s*ellipsis[^{}]*\}/g)];
+  assert.ok(ellipsisRules.length > 0, "the closed tool row is the one place an ellipsis is expected");
+  for (const [, selector] of ellipsisRules) assert.match(selector, /:not\(\[open\]\)/, selector.trim());
+});
+
+test("console rows wrap long tokens, keep the clock inline and style streaming thinking like the final block", () => {
+  assert.match(consoleCss, /\.mc-mono \{[^}]*overflow-wrap:\s*anywhere/);
+  const taskLink = /\.mc-task-link \{([^}]*)\}/.exec(consoleCss)[1];
+  assert.match(taskLink, /overflow-wrap:\s*anywhere/);
+  assert.match(taskLink, /white-space:\s*normal/);
+  assert.match(taskLink, /text-align:\s*left/);
+  const clock = /\.mc-time \{([^}]*)\}/.exec(consoleCss)[1];
+  assert.match(clock, /float:\s*right/);
+  assert.doesNotMatch(clock, /display:\s*block/);
+  assert.match(consoleCss, /\.manager-chat-bubble \{[^}]*display:\s*flow-root/);
+  const closedSummary = /\.manager-chat-tool-row:not\(\[open\]\) > summary \{([^}]*)\}/.exec(consoleCss)[1];
+  assert.match(closedSummary, /white-space:\s*nowrap/);
+  assert.match(closedSummary, /overflow:\s*hidden/);
+  const thinkingText = /\.mc-thinking-text \{([^}]*)\}/.exec(consoleCss)[1];
+  assert.match(thinkingText, /white-space:\s*pre-wrap/);
+  assert.match(thinkingText, /overflow-wrap:\s*anywhere/);
+  assert.match(thinkingText, /color:\s*var\(--muted\)/);
+  assert.match(consoleCss, /\.manager-chat-thinking-block,\s*\.mc-thinking \{[^}]*border-left/);
+  assert.match(consoleCss, /\.manager-chat-thinking-block > summary,\s*\.mc-thinking > summary \{/);
+  assert.match(consoleCss, /\.mc-table-wrap \{[^}]*overflow-x:\s*auto/);
 });
 
 test("manager console assets load before app.js and ship in the VSIX", () => {
@@ -2798,11 +2822,11 @@ test("an owner-opened tool row stays open when its result arrives", () => {
   const harness = transcriptHarness([userEvent(1), toolCall(2, "c1", "read")]);
   harness.api.renderManagerChatEvents();
   const running = detailsIn(harness.box.children[1])[0];
-  assert.match(running.children[0].textContent, /running$/);
+  assert.match(running.children[0].textContent, /^read · running · a\.py$/);
   running.open = true;
   appendEvents(harness, toolResult(3, "c1"));
   const finished = detailsIn(harness.box.children[1])[0];
-  assert.match(finished.children[0].textContent, /done$/);
+  assert.match(finished.children[0].textContent, /^read · done · a\.py$/);
   assert.equal(finished.open, true);
   assert.equal(harness.box.children.length, 2, "the result merges into its call");
 });
@@ -2811,7 +2835,7 @@ test("a result that adds only undefined fields still moves the row out of runnin
   const harness = transcriptHarness([toolCall(1, "c1", "read")]);
   harness.api.renderManagerChatEvents();
   appendEvents(harness, { seq: 2, turn: 1, type: "tool_result", payload: { call_id: "c1", name: "read" } });
-  assert.match(detailsIn(harness.box.children[0])[0].children[0].textContent, /done$/);
+  assert.match(detailsIn(harness.box.children[0])[0].children[0].textContent, /^read · done · a\.py$/);
 });
 
 test("a tool row starts closed in every status", () => {

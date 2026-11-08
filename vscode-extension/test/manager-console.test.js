@@ -324,7 +324,7 @@ test("hostile payloads render as text in every block", () => {
   }
 });
 
-test("markdown subset is built from nodes and never creates links or html", () => {
+test("markdown subset is built from nodes and links only over http or https", () => {
   const { api } = load();
   const fragment = api.managerConsoleMarkdown("Intro **bold** and `code`\n\n- one\n- two\n\n```\n<img src=x>\n```\n\nsee [docs](https://example.test)");
   const all = flat(fragment);
@@ -332,8 +332,138 @@ test("markdown subset is built from nodes and never creates links or html", () =
   assert.ok(all.some((n) => n.tag === "code" && text(n) === "code"));
   assert.equal(all.filter((n) => n.tag === "li").length, 2);
   assert.ok(all.some((n) => n.tag === "pre" && text(n).includes("<img src=x>")));
-  assert.ok(!all.some((n) => n.tag === "a" || n.tag === "img"));
-  assert.ok(text(fragment).includes("docs (https://example.test)"));
+  assert.ok(!all.some((n) => n.tag === "img"));
+  const link = all.find((n) => n.tag === "a");
+  assert.equal(link.attrs.href, "https://example.test");
+  assert.equal(text(link), "docs");
+  assert.ok(!text(fragment).includes("docs (https://example.test)"));
+});
+
+test("an http link becomes an anchor and any other scheme stays plain text", () => {
+  const { api } = load();
+  const http = flat(api.managerConsoleMarkdown("[site](http://example.test/a)")).find((n) => n.tag === "a");
+  assert.equal(http.attrs.href, "http://example.test/a");
+  for (const [source, shown] of [
+    ["[x](javascript:alert(1))", "x (javascript:alert(1))"],
+    ["[x](JaVaScRiPt:alert)", "x (JaVaScRiPt:alert)"],
+    ["[m](mailto:a@example.test)", "m (mailto:a@example.test)"],
+    ["[f](file:///etc/passwd)", "f (file:///etc/passwd)"],
+  ]) {
+    const fragment = api.managerConsoleMarkdown(source);
+    assert.ok(!flat(fragment).some((n) => n.tag === "a"), source);
+    assert.ok(text(fragment).includes(shown), source);
+  }
+});
+
+test("markdown headings map to h3 through h6 with the mc-h class", () => {
+  const { api } = load();
+  const headings = Array.from(api.managerConsoleMarkdown("# a\n## b\n### c\n#### d\n##### e\n###### f").children);
+  assert.deepEqual(headings.map((n) => n.tag), ["h3", "h4", "h5", "h6", "h6", "h6"]);
+  assert.ok(headings.every((n) => n.className === "mc-h"));
+  assert.deepEqual(headings.map(text), ["a", "b", "c", "d", "e", "f"]);
+  assert.equal(api.managerConsoleMarkdown("#hashtag").children[0].tag, "p");
+});
+
+test("heading, table and quote syntax inside a fence stays literal", () => {
+  const { api } = load();
+  const body = "# not a heading\n| a | b |\n|---|---|\n> not a quote";
+  const all = flat(api.managerConsoleMarkdown("```\n" + body + "\n```\n\n# real"));
+  assert.equal(all.find((n) => n.tag === "pre").textContent, body);
+  assert.ok(!all.some((n) => ["table", "blockquote"].includes(n.tag)));
+  assert.equal(all.filter((n) => n.className === "mc-h").length, 1);
+});
+
+test("markdown lists nest by indent and an ordered list keeps its start", () => {
+  const { api } = load();
+  const [root] = api.managerConsoleMarkdown("- a\n  - b\n    - c\n- d").children;
+  assert.equal(root.tag, "ul");
+  assert.equal(root.children.length, 2);
+  const nested = flat(root.children[0]).filter((n) => n.tag === "ul");
+  assert.equal(nested.length, 2);
+  assert.equal(nested[0].children.length, 1);
+  const [ordered] = api.managerConsoleMarkdown("3. x\n4. y").children;
+  assert.equal(ordered.tag, "ol");
+  assert.equal(ordered.attrs.start, "3");
+  assert.equal(ordered.children.length, 2);
+  assert.equal(api.managerConsoleMarkdown("1. x").children[0].attrs.start, undefined);
+  const loose = api.managerConsoleMarkdown("- a\n\n- b").children;
+  assert.equal(loose.length, 1, "a blank line between items keeps one list");
+  assert.equal(loose[0].children.length, 2);
+});
+
+test("markdown renders a blockquote, a rule and a table inside its scroller", () => {
+  const { api } = load();
+  const quote = api.managerConsoleMarkdown("> quoted **b**").children[0];
+  assert.equal(quote.tag, "blockquote");
+  assert.ok(flat(quote).some((n) => n.tag === "strong" && text(n) === "b"));
+  assert.equal(api.managerConsoleMarkdown("- - -").children[0].tag, "hr");
+  const nodes = api.managerConsoleMarkdown("| a | b |\n|---|:-:|\n| 1 | `x\\|y` |\n| 2 |\n\nafter").children;
+  assert.equal(nodes[0].className, "mc-table-wrap");
+  const all = flat(nodes[0]);
+  assert.equal(nodes[0].children[0].tag, "table");
+  assert.deepEqual(all.filter((n) => n.tag === "th").map(text), ["a", "b"]);
+  assert.deepEqual(all.filter((n) => n.tag === "td").map(text), ["1", "x|y", "2", ""]);
+  assert.ok(all.some((n) => n.tag === "code" && text(n) === "x|y"));
+  assert.equal(nodes[1].tag, "p");
+});
+
+test("markdown quote nesting is bounded and still terminates on a long run", () => {
+  const { api } = load();
+  const nodes = flat(api.managerConsoleMarkdown(">".repeat(5000) + " end"));
+  assert.ok(nodes.filter((n) => n.tag === "blockquote").length <= 8);
+  assert.ok(nodes.some((n) => String(n.textContent || "").endsWith("end")));
+});
+
+test("a finished reasoning row is closed and the streaming one stays open", () => {
+  const { api } = load([{ seq: 1, turn: 3, type: "user_message", payload: { text: "go" } }]);
+  const finished = flat(api.managerChatEventNode({ type: "reasoning", payload: { text: "why" } })).find((n) => n.tag === "details");
+  assert.ok(!finished.open);
+  assert.ok(text(finished).includes("why"));
+  const [streaming] = api.managerConsolePartialNodes({ turn: 3, text: "", reasoning: "hm", command_output: "" });
+  assert.equal(flat(streaming).find((n) => n.tag === "details").open, true);
+});
+
+test("a tool title hides the MCP prefix, keeps it in title and puts status before the hint", () => {
+  const { api } = load();
+  const call = flat(api.managerChatEventNode({ type: "tool_call", payload: { name: "mcp__aiworkhub_tools__task_read", input: { path: "a.py" }, output: "ok", is_error: false } })).find((n) => n.tag === "summary");
+  assert.equal(call.textContent, "task_read · done · a.py");
+  assert.equal(call.attrs.title, "mcp__aiworkhub_tools__task_read · done · a.py");
+  const result = flat(api.managerChatEventNode({ type: "tool_result", payload: { name: "mcp__s__read", output: "x" } })).find((n) => n.tag === "summary");
+  assert.equal(result.textContent, "read result");
+  assert.equal(result.attrs.title, "mcp__s__read result");
+  const plain = flat(api.managerChatEventNode({ type: "tool_call", payload: { name: "Bash", input: {} } })).find((n) => n.tag === "summary");
+  assert.equal(plain.textContent, "Bash · running");
+});
+
+test("tool output pretty-prints JSON strings and shows MCP text", () => {
+  const { api } = load();
+  const output = (value) => text(api.managerChatEventNode({ type: "tool_call", payload: { name: "t", output: value, is_error: false } }));
+  assert.ok(output('{"a":1}').includes('{\n  "a": 1\n}'));
+  assert.ok(output("{not json").includes("{not json"));
+  const huge = JSON.stringify(new Array(40000).fill(1));
+  assert.ok(huge.length >= 64 * 1024);
+  assert.ok(output(huge).includes(huge), "a string at the limit is left as it arrived");
+  const mcp = output([{ type: "text", text: "hello" }, { type: "text", text: "world" }]);
+  assert.ok(mcp.includes("hello\nworld"));
+  assert.ok(!mcp.includes("type"), "the content wrapper is not shown as fields");
+  assert.ok(output('[{"type":"text","text":"from json"}]').includes("from json"));
+  assert.ok(!output('[{"type":"text","text":"from json"}]').includes('"type"'));
+  const nested = output({ content: [{ type: "text", text: "inner" }] });
+  assert.ok(nested.includes("inner"));
+  assert.ok(!nested.includes("type"));
+  const big = '{"id":12345678901234567890}';
+  assert.ok(output(big).includes("12345678901234567890"), "an integer past 2^53 keeps its digits");
+});
+
+test("tool input nested past the field depth is still visible as JSON", () => {
+  const { api } = load();
+  const input = { a: { b: { c: { d: { e: { f: { g: "deep" } } } } } } };
+  const shown = text(api.managerChatEventNode({ type: "tool_call", payload: { name: "t", input } }));
+  assert.ok(shown.includes('"g": "deep"'), shown);
+});
+
+test("manager_console.js never writes markup strings into the DOM", () => {
+  assert.doesNotMatch(consoleSource, /\.(?:innerHTML|outerHTML)\s*\+?=|insertAdjacentHTML/);
 });
 
 test("partial renders only for a turn that has not finished", () => {
