@@ -7,11 +7,12 @@
     "eval/*.json",
     "eval/**/*.json",
     "eval/*.jsonl",
-    "eval/**/*.jsonl"
+    "eval/**/*.jsonl",
+    ".scratch/*/*/*"
   ],
   "include_roots": [
     ".scratch"
   ],
-  "revision": 3,
+  "revision": 4,
   "schema_id": "aiworkhub.source_graph.policy.v2"
 }

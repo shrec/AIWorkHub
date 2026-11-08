@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -237,3 +238,122 @@ def test_a_workers_own_scratch_never_enters_its_changed_paths(
         assert not any(path.startswith(".scratch") for path in changed)
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+OVERLAY_GLOB = ".scratch/*/*/*"
+OVERLAY_FILE = ".scratch/s1/ov/x.py"
+OVERLAY_DEEP_FILE = ".scratch/s1/ov/src/x.py"
+
+
+def _indexed_paths(db_path: Path, table: str) -> set[str]:
+    connection = sqlite3.connect(db_path)
+    try:
+        rows = connection.execute(f"SELECT DISTINCT file_path FROM {table}").fetchall()
+    finally:
+        connection.close()
+    return {row[0] for row in rows}
+
+
+def _full_build(root: Path, db_path: Path) -> None:
+    # The fixture repo has no project manifest, so the database path is explicit.
+    with source_graph.database_path_override(db_path):
+        source_graph.build_index(root, db_path=db_path, incremental=False)
+
+
+def _policy_path(root: Path) -> Path:
+    return root / ".aiworkhub" / "config" / "source_graph.json"
+
+
+def test_canonical_policy_excludes_scratch_overlay_directories() -> None:
+    policy = json.loads(_policy_path(REPO_ROOT).read_text(encoding="utf-8"))
+    assert policy["revision"] == 4
+    assert policy["include_roots"] == [".scratch"]
+    assert policy["exclude_globs"] == [
+        "eval/*.json",
+        "eval/**/*.json",
+        "eval/*.jsonl",
+        "eval/**/*.jsonl",
+        OVERLAY_GLOB,
+    ]
+
+
+def test_full_build_indexes_session_root_scratch_but_not_overlay_directories(
+    tmp_path: Path,
+) -> None:
+    root = _repo_with_canonical_scratch_config(tmp_path)
+    _write(root / SCRATCH_PROBE)
+    _write(root / OVERLAY_FILE)
+    _write(root / OVERLAY_DEEP_FILE)
+    db_path = tmp_path / "graph.sqlite"
+
+    _full_build(root, db_path)
+
+    for table in ("files", "entities"):
+        indexed = _indexed_paths(db_path, table)
+        assert SCRATCH_PROBE in indexed, (table, indexed)
+        assert OVERLAY_FILE not in indexed, (table, indexed)
+        assert OVERLAY_DEEP_FILE not in indexed, (table, indexed)
+        assert "src/app.py" in indexed, (table, indexed)
+
+
+def test_overlay_file_indexed_by_an_earlier_build_is_dropped_by_the_next_full_build(
+    tmp_path: Path,
+) -> None:
+    root = _repo_with_canonical_scratch_config(tmp_path)
+    canonical = _policy_path(root).read_text(encoding="utf-8")
+    earlier = json.loads(canonical)
+    earlier["exclude_globs"].remove(OVERLAY_GLOB)
+    earlier["revision"] = 3
+    _policy_path(root).write_text(json.dumps(earlier), encoding="utf-8")
+    _write(root / SCRATCH_PROBE)
+    overlay = _write(root / OVERLAY_FILE)
+    db_path = tmp_path / "graph.sqlite"
+
+    _full_build(root, db_path)
+    for table in ("files", "entities"):
+        assert OVERLAY_FILE in _indexed_paths(db_path, table), table
+
+    _policy_path(root).write_text(canonical, encoding="utf-8")
+    _full_build(root, db_path)
+
+    assert overlay.is_file()
+    for table in ("files", "entities"):
+        indexed = _indexed_paths(db_path, table)
+        assert OVERLAY_FILE not in indexed, (table, indexed)
+        assert SCRATCH_PROBE in indexed, (table, indexed)
+
+
+def test_read_of_an_overlay_file_is_allowed_but_session_root_text_stays_r8(
+    tmp_path: Path,
+) -> None:
+    root = _repo_with_canonical_scratch_config(tmp_path)
+    overlay = _write(root / OVERLAY_FILE)
+    deep = _write(root / OVERLAY_DEEP_FILE)
+    session_root = _write(root / SCRATCH_PROBE)
+
+    for path in (overlay, deep):
+        assert tool_guard_hook.decide("Read", {"file_path": str(path)}, root) is None, path
+    verdict = tool_guard_hook.decide("Read", {"file_path": str(session_root)}, root)
+    assert verdict is not None and verdict[0] == "R8"
+
+
+def test_edit_and_overwrite_of_an_overlay_file_stay_r8_and_a_new_file_is_allowed(
+    tmp_path: Path,
+) -> None:
+    root = _repo_with_canonical_scratch_config(tmp_path)
+    overlay = _write(root / OVERLAY_FILE)
+    for tool, extra in (
+        ("Edit", {"old_string": "probe", "new_string": "other"}),
+        ("MultiEdit", {"edits": []}),
+        ("Write", {"content": "x = 2\n"}),
+    ):
+        verdict = tool_guard_hook.decide(tool, {"file_path": str(overlay), **extra}, root)
+        assert verdict is not None and verdict[0] == "R8", tool
+    fresh = {"file_path": str(root / ".scratch" / "s1" / "ov" / "new.py"), "content": "x = 1\n"}
+    assert tool_guard_hook.decide("Write", fresh, root) is None
+
+
+def test_the_checked_in_hook_copy_is_byte_identical_to_the_source_module() -> None:
+    source = REPO_ROOT / "src" / "aiworkhub" / "tool_guard_hook.py"
+    copy = REPO_ROOT / ".claude" / "hooks" / "aiworkhub_tool_guard.py"
+    assert source.read_bytes() == copy.read_bytes()

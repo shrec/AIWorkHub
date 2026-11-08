@@ -26,8 +26,11 @@ Rules, first match wins:
   repo-local scratch root ``.scratch/``; checked before R5-R7. Write that
   creates a new scratch file is allowed, as R7 allows it elsewhere. A Read of
   a real PNG/JPEG/WEBP (suffix and magic bytes) under ``.scratch/<session_id>/``
-  of the calling session is also allowed; Edit, Write and other sessions' files
-  stay denied.
+  of the calling session is also allowed, and so is a Read of a scratch file
+  the Source Graph policy excludes (``.scratch/<session_id>/<dir>/...``, which
+  Source Graph answers with excluded_by_policy and no preview). Edit, Write
+  over an existing file, and a Read of the session root's text or of another
+  session's non-excluded files stay denied.
 
 "Indexed" is Source Graph's own membership when its canonical database
 (``.aiworkhub/source_graph/source_graph.sqlite``) holds a readable generation:
@@ -226,7 +229,8 @@ _REASONS = {
     ),
     # ``{script}`` is filled by ``_reason``: the manager script only where it exists.
     "R8": (
-        "AIWorkHub tool guard R8: built-in Read, Edit or overwrite of scratch file {target}"
+        "AIWorkHub tool guard R8: Read (unless policy-excluded), Edit or overwrite"
+        " of scratch file {target}"
         " is denied; Write may only create one. Read: " + _SOURCE_GRAPH
         + ' mode="body"/"file"/"bodygrep". Edit: aiworkhub_worker_semantic_edit_prepare/_apply'
         " or aiworkhub_manager_semantic_edit_prepare/_apply{script}."
@@ -1742,7 +1746,14 @@ def _tool_verdict(
             and path is not None
             and _own_scratch_image(scratch, path, session_id)
         )
-        if scratch is not None and not creates and not own_image:
+        # Source Graph answers excluded_by_policy, with no preview, for a scratch
+        # file its policy excludes (a throwaway repo copy): a Read is the only way in.
+        excluded_read = (
+            tool_name == "Read"
+            and scratch is not None
+            and glob_ignored(scratch, ctx.policy.exclude_globs)
+        )
+        if scratch is not None and not creates and not own_image and not excluded_read:
             return "R8", scratch, ""
     if tool_name == "Read":
         target = ctx.indexed_file(file_path, glob=False)
@@ -1785,7 +1796,8 @@ def _reason(rule: str, target: str, detail: str, manager_script: bool = False) -
     if mirror is not None:
         rest, worktree = mirror
         return _mirror_reason(rule, "/".join(rest) or ".", worktree)
-    # R8 offers no unindexed fallback: no seat needs a built-in Read in scratch.
+    # R8 offers no unindexed fallback: a scratch file Source Graph can answer is
+    # read through it, and one it excludes never reaches R8 for a Read.
     template = _REASONS[rule] + ("" if rule == "R8" else _UNINDEXED)
     template = template.replace(
         "{script}", " or " + "/".join(_MANAGER_SCRIPT_PARTS) if manager_script else ""
@@ -1844,7 +1856,8 @@ def decide(
     Pure: it reads the tree under ``root`` but writes nothing. ``root`` is the
     project directory, and a root without ``.aiworkhub/`` allows everything.
     ``cwd`` (default ``root``) anchors relative shell operands. ``session_id``
-    only lets R8 pass a Read of the session's own scratch image.
+    only lets R8 pass a Read of the session's own scratch image; a Read of a
+    scratch file the Source Graph policy excludes passes R8 without it.
     """
 
     verdict = _evaluate(tool_name, tool_input, root, cwd, session_id=session_id)
