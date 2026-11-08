@@ -46,7 +46,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
@@ -680,7 +682,68 @@ def validation_command_head_warnings(command: Any) -> list[str]:
         warnings.append(f"venv_relative_head_absent_from_worker_worktree:{head}")
     elif head.startswith("/") and "/.venv/" in head:
         warnings.append(f"absolute_venv_head_not_portable:{head}")
+    unapproved = _unapproved_bare_head_warning(argv)
+    if unapproved:
+        warnings.append(unapproved)
     return warnings
+
+
+def _command_executable_head(argv: list[str]) -> str:
+    """The executable token after any env assignments and ``cd DIR &&`` prefix."""
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if "=" in token and token.split("=", 1)[0].isidentifier():
+            index += 1
+        elif token == "cd" and index + 2 < len(argv) and argv[index + 2] == "&&":
+            index += 3
+        else:
+            return token
+    return ""
+
+
+def _unapproved_bare_head_warning(argv: list[str]) -> str:
+    """``validation_head_not_approved:<head>`` naming the registry entry to add.
+
+    Fires only for a bare head that no validation lane will accept: not a
+    trusted system executable, not a Python validation executable or bare
+    interpreter, not registered in ``toolchains.json`` and not a path.
+    Advisory only (NF-2026-02164); an unreadable registry yields no warning
+    rather than a guess.
+    """
+    head = _command_executable_head(argv)
+    if (
+        not head
+        or "/" in head
+        or "\\" in head
+        or ":" in head
+        or head in ("&&", "&")
+        or _BARE_PYTHON_INTERPRETER_RE.match(head)
+    ):
+        return ""
+    from .validation_toolchains import (
+        PYTHON_VALIDATION_EXECUTABLES,
+        SYSTEM_VALIDATION_EXECUTABLES,
+    )
+
+    if head in SYSTEM_VALIDATION_EXECUTABLES or head in PYTHON_VALIDATION_EXECUTABLES:
+        return ""
+    try:
+        from .toolchain_registry import registered_toolchain
+
+        if registered_toolchain(head) is not None:
+            return ""
+    except Exception:
+        return ""
+    from .validation_spawn_diagnosis import registry_entry_remedy
+
+    found = shutil.which(head)
+    if found:
+        directory = Path(found).resolve(strict=False).parent
+        root = str(directory.parent if directory.name.casefold() == "bin" else directory)
+    else:
+        root = f"<install root of {head}>"
+    return f"validation_head_not_approved:{head}: {registry_entry_remedy(head, root)}"
 
 
 # ---------------------------------------------------------------------------

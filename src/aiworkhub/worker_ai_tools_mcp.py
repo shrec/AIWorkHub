@@ -9353,7 +9353,7 @@ def _run_one_validation(
             authority_source="worker_advisory",
             authority_state="validation_unresolved",
         )
-        return {
+        refusal: dict[str, Any] = {
             "index": index,
             "command": command,
             "command_sha256": command_sha256,
@@ -9363,6 +9363,14 @@ def _run_one_validation(
             "failure_class": "tool_unavailable",
             "unchanged_since_last_run": False,
         }
+        refused_head = _refused_validation_executable_name(str(exc))
+        if refused_head:
+            # NF-2026-02164: the same typed reason and toolchains.json remedy
+            # the AppContainer lane returns, on every non-AppContainer lane.
+            refusal["spawn_diagnosis"] = _validation_spawn_diagnosis(
+                refused_head, str(exc)
+            )
+        return refusal
 
     cwd = Path(workspace.path)
     cd_relative = resolution.get("cd_relative")
@@ -9583,6 +9591,20 @@ def _run_contained_validations(
             run_dir=run_dir,
         )
     return [receipts[position] for position in selected]
+
+
+_REFUSED_EXECUTABLE_PREFIXES = (
+    "validation_executable_not_approved:",
+    "validation_executable_unavailable:",
+)
+
+
+def _refused_validation_executable_name(message: str) -> str:
+    """The bare head named by a head-resolution refusal, else ``""`` (NF-2026-02164)."""
+    for prefix in _REFUSED_EXECUTABLE_PREFIXES:
+        if message.startswith(prefix):
+            return message[len(prefix):].strip()
+    return ""
 
 
 def _validation_spawn_diagnosis(declared_head: str, launch_message: str) -> dict[str, Any]:

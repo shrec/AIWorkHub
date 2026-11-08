@@ -28,7 +28,10 @@ NODE_FAMILY_SYSTEM_EXECUTABLES = frozenset({"node", "npm", "npx"})
 # left out: it packages rather than validates, and the bare name can resolve to
 # Chocolatey's legacy ``cpack`` shim instead.
 CMAKE_FAMILY_SYSTEM_EXECUTABLES = frozenset({"cmake", "ctest"})
-_NATIVE = CMAKE_FAMILY_SYSTEM_EXECUTABLES | {"clang", "gcc", "make"}
+# g++ and clang++ are the C++ drivers of the same compilers.  Versioned
+# (``clang++-20``) and cross (``x86_64-w64-mingw32-g++-posix``) names stay
+# registry-only by design: an operator registers them in toolchains.json.
+_NATIVE = CMAKE_FAMILY_SYSTEM_EXECUTABLES | {"clang", "clang++", "g++", "gcc", "make"}
 _DOTNET = frozenset({"dotnet"})
 
 VALIDATION_EXECUTABLES_BY_LANGUAGE: dict[str, frozenset[str]] = {

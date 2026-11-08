@@ -1017,7 +1017,11 @@ def test_every_source_graph_language_has_a_trusted_validation_executable() -> No
         worker_workspace._TRUSTED_VALIDATION_SYSTEM_EXECUTABLES
         == validation_toolchains.SYSTEM_VALIDATION_EXECUTABLES
     )
-    assert {"git", "node", "npm", "npx", "cmake", "ctest"} <= (
+    assert {"git", "node", "npm", "npx", "cmake", "ctest", "g++", "clang++"} <= (
+        validation_toolchains.SYSTEM_VALIDATION_EXECUTABLES
+    )
+    # Versioned and cross driver names stay registry-only (NF-2026-02164).
+    assert not {"clang++-20", "x86_64-w64-mingw32-g++-posix"} & (
         validation_toolchains.SYSTEM_VALIDATION_EXECUTABLES
     )
     assert not (

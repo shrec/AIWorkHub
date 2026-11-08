@@ -66,6 +66,18 @@ def _toolchain_id(name: str) -> str:
     return cleaned or "toolchain"
 
 
+def registry_entry_remedy(executable: str, root: str) -> str:
+    """The exact ``toolchains.json`` addition that registers ``executable`` (NF-2026-02164).
+
+    Single definition shared by the spawn diagnosis and the create-time head
+    advisory, so every lane and the card-creation warning name the same entry.
+    """
+    entry: Mapping[str, Any] = {
+        _toolchain_id(executable): {"executables": [executable], "roots": [root]}
+    }
+    return f"add to \"toolchains\" in {_REGISTRY_PATH_TEXT}: {json.dumps(entry, sort_keys=True)}"
+
+
 def _candidates(head: str, extensions: tuple[str, ...]) -> list[str]:
     suffix = Path(head).suffix.casefold()
     if suffix and suffix in extensions:
@@ -165,19 +177,10 @@ def diagnose_validation_spawn_failure(
                 "remedy": f"`{head}` resolves to {resolved_path}; launch error: {message}",
             }
         executable = Path(name).stem if Path(name).suffix else name
-        entry: Mapping[str, Any] = {
-            _toolchain_id(executable): {
-                "executables": [executable],
-                "roots": [str(_install_root(resolved_path))],
-            }
-        }
         return {
             "reason": "toolchain_not_registered",
             "resolved_path": str(resolved_path),
-            "remedy": (
-                f"add to \"toolchains\" in {_REGISTRY_PATH_TEXT}: "
-                f"{json.dumps(entry, sort_keys=True)}"
-            ),
+            "remedy": registry_entry_remedy(executable, str(_install_root(resolved_path))),
         }
     return {
         "reason": "toolchain_registered_launch_failed",
