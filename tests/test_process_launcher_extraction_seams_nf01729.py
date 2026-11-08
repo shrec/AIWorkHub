@@ -356,8 +356,9 @@ def test_accepted_attempt_row_moved_body_observes_a_process_launcher_monkeypatch
     events = [{"state": "accepted", "accepted": True}]
     metadata = {"task_id": "T-1"}
 
-    assert accepted_row_restore.accepted_attempt_row(fake, events, metadata, "req-1") is None
-    assert process_launcher.ProcessManager._accepted_attempt_row(fake, events, metadata, "req-1") is None
+    for moved in (accepted_row_restore.accepted_attempt_row, process_launcher.ProcessManager._accepted_attempt_row):
+        with pytest.raises(process_launcher._PidIdentityUnknownDeferred, match="accepted_card_unreadable"):
+            moved(fake, events, metadata, "req-1")
     assert seen == [("card-text", "T-1")] * 2
 
 

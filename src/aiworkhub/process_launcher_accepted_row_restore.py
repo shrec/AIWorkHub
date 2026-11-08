@@ -33,7 +33,7 @@ __all__ = [
 # ``Any`` and an annotation-only ``Mapping`` are never evaluated, so they are
 # resolved from this module's own imports and are deliberately NOT re-bound.
 ACCEPTED_ATTEMPT_ROW_SEAM_NAMES: tuple[str, ...] = (
-    "LaunchRejected",
+    "_PidIdentityUnknownDeferred",
     "_parse_card",
     "task_store",
 )
@@ -60,7 +60,13 @@ def accepted_attempt_row(
     request_id: str,
 ) -> Mapping[str, Any] | None:
     """NF-2026-01625/01706: this attempt's ``accepted`` row, only if the card's
-    seal and receipt for this request and epoch confirm it (archived or not)."""
+    seal and receipt for this request and epoch confirm it (archived or not).
+
+    NF-2026-02186: with an accepted row in the ledger, a card that cannot be
+    read is neither sealed nor unsealed, so this raises the finalizer's
+    deferral instead of answering ``None`` -- a readable card without the seal
+    still answers ``None``.
+    """
     # Every module-level name this function used while it lived in
     # ``process_launcher`` is re-bound here from that exact module object, so a
     # ``monkeypatch.setattr(process_launcher, name, ...)`` seam still reaches the
@@ -69,7 +75,7 @@ def accepted_attempt_row(
     # ``test_process_launcher_extraction_seams_nf01729.py``.
     from . import process_launcher as _pl
 
-    LaunchRejected = _pl.LaunchRejected
+    _PidIdentityUnknownDeferred = _pl._PidIdentityUnknownDeferred
     _parse_card = _pl._parse_card
     task_store = _pl.task_store
 
@@ -80,8 +86,8 @@ def accepted_attempt_row(
     task_id = str(metadata.get("task_id") or "")
     try:
         card = _parse_card(self._show_task(task_id), task_id)
-    except LaunchRejected:
-        return None
+    except Exception as exc:  # noqa: BLE001 - any read failure proves nothing about the seal
+        raise _PidIdentityUnknownDeferred("accepted_card_unreadable") from exc
     sealed = task_store.accepted_this_attempt(
         card, request_id=request_id, claim_epoch=metadata.get("claim_epoch")
     )
@@ -101,7 +107,8 @@ def restore_buried_accepted_row(
     preview included -- saw an unfinished reviewer forever. A reviewer row
     is restored only while its receipt is the one acceptance verified,
     identical in the event and both card copies; anything else is returned
-    as recorded, unrestored (fail closed).
+    as recorded, unrestored (fail closed). A second finalize pass's
+    ``finalizing`` row buries the accepted row the same way (NF-2026-02186).
     """
     # Seam re-binding as in :func:`accepted_attempt_row`; the list is
     # ``ACCEPTED_ROW_RESTORE_SEAM_NAMES``.
@@ -111,8 +118,9 @@ def restore_buried_accepted_row(
     _utcnow = _pl._utcnow
 
     disposition = str(accepted.get("workspace_disposition") or "")
-    # Only the NF-2026-01800 tail: NF-2026-01706 appends nothing over release_pending.
-    if tail.get("state") != "reconcile_pending" or disposition not in {
+    # NF-2026-01800's reconcile_pending and NF-2026-02186's finalizing only:
+    # NF-2026-01706 appends nothing over release_pending.
+    if tail.get("state") not in {"reconcile_pending", "finalizing"} or disposition not in {
         "retained_in_place", "quarantined", "removed",
     }:
         return accepted

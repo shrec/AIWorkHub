@@ -587,7 +587,7 @@ class _BridgeCancellationDeferred(RuntimeError):
 
 
 class _PidIdentityUnknownDeferred(RuntimeError):
-    """Supervisor identity is temporarily unknowable; retain active work."""
+    """Supervisor identity or an accepted attempt's card is temporarily unknowable; retain active work."""
 
 
 def sanitized_env(
@@ -10204,13 +10204,13 @@ class ProcessManager:
             except _BridgeCancellationDeferred:
                 deferred = self._request_events(request_id)
                 return deferred[-1] if deferred else None
-            except _PidIdentityUnknownDeferred:
+            except _PidIdentityUnknownDeferred as exc:
                 deferred = self._request_events(request_id)
                 if not deferred:
                     return None
                 return {
                     **deferred[-1],
-                    "reconciliation_deferred": "pid_identity_unknown",
+                    "reconciliation_deferred": str(exc),
                     "workspace_retained": True,
                 }
             except AdvisoryLockTimeout:
@@ -11726,12 +11726,12 @@ class ProcessManager:
                 reason = terminal_failure_classification.workspace_error_reason(error, metadata.get("required_outputs"))
                 terminal_state = _launcher_validation.replay_terminal_state(
                     _terminal_state_for_workspace_error(exc), metadata, validations)
-                # Keep the isolated candidate intact for coordinator
-                # diagnosis/retry on every genuine failure, including a
-                # lost-claim race. B863: a claim_ownership_lost read can be a
-                # false positive (B860/B861), so cleanup is deferred entirely
-                # to _gc_finalized_workspace's canonical-status-gated sweep.
+                # Keep the isolated candidate intact on every genuine failure, including a lost-claim race. B863: a
+                # claim_ownership_lost read can be a false positive (B860/B861), so _gc_finalized_workspace's canonical-status-gated sweep owns cleanup.
                 ownership_lost = error.startswith("claim_ownership_lost")
+                fresh_events = self._request_events(request_id) if ownership_lost else []  # NF-2026-02186: a sealed accepted row outranks a lost claim.
+                if ownership_lost and (sealed := self._accepted_attempt_row(fresh_events, metadata, request_id)) is not None:
+                    return self._restore_buried_accepted_row(split_lifecycle_tail(fresh_events)[0], sealed, metadata)
                 cleanup = False
                 if not ownership_lost and not promoted:
                     retained_candidate: dict[str, Any] = {}

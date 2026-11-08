@@ -10,6 +10,7 @@ receipt for this request and claim epoch are what make an attempt final.
 
 from __future__ import annotations
 
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Callable
@@ -34,7 +35,7 @@ from test_reviewer_accept_before_finalize_nf01625 import (  # noqa: E402
     _usage_records,
 )
 
-from aiworkhub import task_store  # noqa: E402
+from aiworkhub import process_launcher, task_store, worker_workspace  # noqa: E402
 
 
 def _identity(case) -> dict:
@@ -146,3 +147,193 @@ def test_archived_after_accepting_still_requires_the_archive(
     assert card is not None
     assert task_store.archived_after_accepting(card, **kwargs) is True
     assert task_store.accepted_this_attempt(card, **kwargs) is True
+
+
+# NF-2026-02186: 22 reviewers and 1 worker ended finalize_failed after their
+# ledger already held state=accepted. The rows below are the measured sequence.
+DEFERRED = "accepted_card_unreadable"
+CLAIM_LOST = "claim_ownership_lost:state=archived"
+
+
+def _finalizing_review_ready_accepted(case) -> list[str]:
+    """The measured ledger: finalizing, review_ready, accepted on a sealed card."""
+    _ledger(case.manager, {**_identity(case), "state": "finalizing"})
+    path = case.manager.process_log_path
+    *head, review_ready, finalizing = path.read_text(encoding="utf-8").splitlines()
+    path.write_text("\n".join([*head, finalizing, review_ready, ""]), encoding="utf-8")
+    _accept(case)
+    states = _states(case.manager)
+    assert states[-3:] == ["finalizing", "review_ready", "accepted"]
+    return states
+
+
+def _claim_lost_after_scope(
+    case, monkeypatch: pytest.MonkeyPatch, before_raise: Callable[[], object] = lambda: None
+) -> None:
+    """The scope check passes and the claim read reports the card as archived."""
+
+    def lost(_metadata: object) -> str:
+        before_raise()
+        raise worker_workspace.WorkspaceError(CLAIM_LOST)
+
+    monkeypatch.setattr(process_launcher, "enforce_scope", lambda *_a, **_k: [])
+    monkeypatch.setattr(case.manager, "_exact_claim_state", lost)
+
+
+def _tail_state(case) -> str:
+    rows = case.manager._request_events(REQUEST_ID)
+    return str(process_launcher.split_lifecycle_tail(rows)[0].get("state") or "")
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(process_launcher.LaunchRejected("card_unreadable"), id="launch_rejected"),
+        pytest.param(sqlite3.OperationalError("database is locked"), id="store_error"),
+    ],
+)
+def test_unreadable_card_at_the_gate_defers_and_appends_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    case = _review_ready_reviewer(tmp_path, monkeypatch)
+    before = _finalizing_review_ready_accepted(case)
+
+    def unreadable(_task_id: str) -> str:
+        raise failure
+
+    monkeypatch.setattr(case.manager, "_show_task", unreadable)
+
+    event = case.manager._finalize_after_process_exit(REQUEST_ID, 0)
+
+    assert event is not None and event["reconciliation_deferred"] == DEFERRED, event
+    assert event["state"] == "accepted"
+    assert _states(case.manager) == before
+
+
+def test_first_gate_read_failing_cannot_fail_an_accepted_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _review_ready_reviewer(tmp_path, monkeypatch)
+    _automatic_review(case)
+    readable = case.manager._show_task
+    reads: list[str] = []
+
+    def first_read_fails(task_id: str) -> object:
+        reads.append(task_id)
+        if len(reads) == 1:
+            raise process_launcher.LaunchRejected("card_unreadable")
+        return readable(task_id)
+
+    monkeypatch.setattr(case.manager, "_show_task", first_read_fails)
+    _claim_lost_after_scope(case, monkeypatch)
+
+    case.manager._finalize_after_process_exit(REQUEST_ID, 0)
+
+    assert "finalize_failed" not in _states(case.manager)
+    assert _tail_state(case) == "accepted"
+
+    # The card is readable again: the next pass settles on the same row.
+    before = _states(case.manager)
+    event = case.manager._finalize_after_process_exit(REQUEST_ID, 0)
+    assert event is not None and event["state"] == "accepted", event
+    assert _states(case.manager) == before
+
+
+def test_sealed_row_is_restored_over_a_finalizing_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _review_ready_reviewer(tmp_path, monkeypatch)
+    _accept(case)
+    _ledger(case.manager, {**_identity(case), "state": "finalizing"})
+    before = _states(case.manager)
+
+    event = case.manager._finalize_after_process_exit(REQUEST_ID, 0)
+
+    assert event is not None and event["state"] == "accepted", event
+    assert event["restored_over_state"] == "finalizing"
+    assert event["quality_review_receipt"] == case.sealed
+    assert _states(case.manager) == [*before, "accepted"]
+
+
+def test_finalizing_tail_with_a_differing_receipt_is_not_restored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _review_ready_reviewer(tmp_path, monkeypatch)
+    _accept(case)
+    _ledger(
+        case.manager,
+        {
+            **case.accepted_row,
+            "workspace_disposition": "removed",
+            "quality_review_receipt": {**case.sealed, "differs": True},
+        },
+    )
+    _ledger(case.manager, {**_identity(case), "state": "finalizing"})
+    before = _states(case.manager)
+
+    event = case.manager._finalize_after_process_exit(REQUEST_ID, 0)
+
+    assert event is not None and event["state"] == "accepted", event
+    assert "restored_over_state" not in event
+    assert _states(case.manager) == before
+
+
+def test_ownership_loss_restores_the_sealed_row_over_finalizing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _review_ready_reviewer(tmp_path, monkeypatch)
+    _automatic_review(case)
+    real_gate = case.manager._accepted_attempt_row
+    gates: list[str] = []
+
+    def gate_misses_once(events: list, metadata: dict, request_id: str) -> object:
+        gates.append(request_id)
+        return None if len(gates) == 1 else real_gate(events, metadata, request_id)
+
+    monkeypatch.setattr(case.manager, "_accepted_attempt_row", gate_misses_once)
+    _claim_lost_after_scope(case, monkeypatch)
+
+    event = case.manager._finalize_after_process_exit(REQUEST_ID, 0)
+
+    assert event is not None and event["state"] == "accepted", event
+    assert event["restored_over_state"] == "finalizing"
+    assert _states(case.manager)[-2:] == ["finalizing", "accepted"]
+    assert "finalize_failed" not in _states(case.manager)
+
+
+def test_acceptance_landing_during_the_pass_is_not_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _review_ready_reviewer(tmp_path, monkeypatch)
+    # ``review_ready`` is terminal: without this row the pass returns at its first guard.
+    _ledger(case.manager, {**_identity(case), "state": "finalizing"})
+    _claim_lost_after_scope(case, monkeypatch, before_raise=lambda: _accept(case))
+
+    event = case.manager._finalize_after_process_exit(REQUEST_ID, 0)
+
+    assert event is not None and event["state"] == "accepted", event
+    assert "finalize_failed" not in _states(case.manager)
+    assert _tail_state(case) == "accepted"
+
+
+def test_ownership_loss_with_an_unreadable_card_defers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _review_ready_reviewer(tmp_path, monkeypatch)
+    # ``review_ready`` is terminal: without this row the pass returns at its first guard.
+    _ledger(case.manager, {**_identity(case), "state": "finalizing"})
+
+    def unreadable(_task_id: str) -> str:
+        raise process_launcher.LaunchRejected("card_unreadable")
+
+    def accepted_then_unreadable() -> None:
+        _accept(case)
+        monkeypatch.setattr(case.manager, "_show_task", unreadable)
+
+    _claim_lost_after_scope(case, monkeypatch, before_raise=accepted_then_unreadable)
+
+    event = case.manager._finalize_after_process_exit(REQUEST_ID, 0)
+
+    assert event is not None and event["reconciliation_deferred"] == DEFERRED, event
+    assert "finalize_failed" not in _states(case.manager)
+    assert _tail_state(case) == "accepted"
