@@ -3483,6 +3483,15 @@ tbody tr.is-selected td:first-child {
   align-self: flex-end;
 }
 
+/* While a turn runs Stop is the one control that matters, so it carries the
+   danger hue; the disabled look stays the plain button's. */
+#manager-chat-stop:not(:disabled) {
+  border: 1px solid var(--blocked);
+  background: var(--blocked-soft);
+  color: var(--blocked-ink);
+  font-weight: 600;
+}
+
 /* The header breakpoint follows the sidebar's own width, not the viewport's. */
 @container manager-chat-sidebar (max-width: 420px) {
   #manager-chat-sidebar #manager-chat-summary {

@@ -7679,8 +7679,12 @@ function applyManagerChatSessionUi() {
   if (elements.managerChatClose) {
     elements.managerChatClose.disabled = !hasSession || state.managerChatRunning;
   }
+  // The Stopping state outlives only the turn it was requested for.
+  if (!state.managerChatRunning) state.managerChatStopping = false;
   if (elements.managerChatStop) {
-    elements.managerChatStop.disabled = !state.managerChatRunning;
+    const stopping = Boolean(state.managerChatStopping);
+    elements.managerChatStop.disabled = !state.managerChatRunning || stopping;
+    elements.managerChatStop.textContent = stopping ? "Stopping…" : "Stop";
   }
   if (elements.managerChatNewSession) {
     elements.managerChatNewSession.disabled = state.managerChatRunning;
@@ -8101,6 +8105,10 @@ function renderManagerChatAction(action, payload) {
   const pendingText = pendingEntry ? pendingEntry.text : "";
   const pendingImages = pendingEntry ? asArray(pendingEntry.images) : [];
   if (payload && payload.ok === false) {
+    if (action === "stop") {
+      state.managerChatStopping = false;
+      applyManagerChatSessionUi();
+    }
     if (action === "send") {
       state.managerChatRunning = false;
       state.managerChatThinkingSince = 0;
@@ -8127,6 +8135,11 @@ function renderManagerChatAction(action, payload) {
   }
   if (action === "stop") {
     // Running stays until the terminal event (turn_stopped / turn_end) arrives.
+    // A reply that neither stopped nor armed a stop leaves nothing to wait for.
+    if (payload && payload.stopped === false && payload.armed === false) {
+      state.managerChatStopping = false;
+      applyManagerChatSessionUi();
+    }
     showManagerChatNotice(null);
     return;
   }
@@ -8843,7 +8856,10 @@ if (elements.managerChatMenu && typeof elements.managerChatMenu.addEventListener
 
 if (elements.managerChatStop && typeof elements.managerChatStop.addEventListener === "function") {
   elements.managerChatStop.addEventListener("click", () => {
-    if (elements.managerChatStop.disabled) return;
+    if (elements.managerChatStop.disabled || state.managerChatStopping) return;
+    // Show Stopping… at once; the terminal event or the reply clears it.
+    state.managerChatStopping = true;
+    applyManagerChatSessionUi();
     vscode.postMessage({ type: "managerLoopStop" });
   });
 }
@@ -8908,12 +8924,77 @@ if (elements.managerChatAttach && elements.managerChatFile) {
     elements.managerChatFile.value = "";
   });
 }
-elements.managerChatInput.addEventListener("paste", (event) => {
-  const files = event.clipboardData && event.clipboardData.files;
-  if (!files || files.length === 0) return; // text pastes as usual
-  event.preventDefault();
+// Input types that take typed text; a checkbox or a file chooser is not a
+// place a paste can land, so it does not claim the paste.
+const MANAGER_CHAT_NON_TEXT_INPUTS = new Set(["button", "checkbox", "color", "file", "image", "radio", "range", "reset", "submit"]);
+
+function managerChatIsEditableTarget(target) {
+  if (!target) return false;
+  const tag = String(target.tagName || "").toUpperCase();
+  if (tag === "TEXTAREA") return true;
+  if (tag === "INPUT") return !MANAGER_CHAT_NON_TEXT_INPUTS.has(String(target.type || "text").toLowerCase());
+  return Boolean(target.isContentEditable);
+}
+
+function managerChatPasteFiles(clipboard) {
+  const files = Array.from(clipboard.files || []);
+  if (files.length > 0) return files;
+  // Some hosts leave `files` empty and expose the image only as an item.
+  const found = [];
+  for (const item of Array.from(clipboard.items || [])) {
+    if (!item || item.kind !== "file" || typeof item.getAsFile !== "function") continue;
+    const file = item.getAsFile();
+    if (file) found.push(file);
+  }
+  return found;
+}
+
+function insertManagerChatPasteText(rawText) {
+  // A textarea value holds only \n, so a CRLF clipboard would overshoot the caret.
+  const text = String(rawText).replace(/\r\n?/g, "\n");
+  const input = elements.managerChatInput;
+  const value = String(input.value || "");
+  const start = Number.isInteger(input.selectionStart) ? input.selectionStart : value.length;
+  const end = Number.isInteger(input.selectionEnd) ? input.selectionEnd : start;
+  input.value = value.slice(0, start) + text + value.slice(end);
+  const caret = start + text.length;
+  if (typeof input.setSelectionRange === "function") input.setSelectionRange(caret, caret);
+  if (typeof input.focus === "function") input.focus();
+  // A scripted value change fires no input event, so keep the draft here.
+  state.managerChatDraft = input.value;
+  state.managerChatHistoryIndex = -1;
+  persistState();
+}
+
+// The composer listener and the document listener both see a paste that
+// starts in the composer; each event is handled once.
+const managerChatHandledPastes = new WeakSet();
+
+function handleManagerChatPaste(event) {
+  if (!event || managerChatHandledPastes.has(event)) return;
+  managerChatHandledPastes.add(event);
+  if (state.managerChatCollapsed) return;
+  const target = event.target;
+  const inComposer = target === elements.managerChatInput;
+  if (!inComposer && managerChatIsEditableTarget(target)) return; // another field keeps its own paste
+  const clipboard = event.clipboardData;
+  if (!clipboard) return;
+  const files = managerChatPasteFiles(clipboard);
+  const text = typeof clipboard.getData === "function" ? String(clipboard.getData("text/plain") || "") : "";
+  if (files.length === 0) {
+    if (inComposer || !text) return; // the textarea pastes its own text
+    event.preventDefault();
+    insertManagerChatPasteText(text);
+    return;
+  }
+  // Inside the textarea the browser still pastes the text; outside it we do.
+  if (!(inComposer && text)) event.preventDefault();
+  if (text && !inComposer) insertManagerChatPasteText(text);
   attachManagerChatImages(files);
-});
+}
+
+elements.managerChatInput.addEventListener("paste", handleManagerChatPaste);
+document.addEventListener("paste", handleManagerChatPaste);
 elements.managerChatComposer.addEventListener("dragover", (event) => event.preventDefault());
 elements.managerChatComposer.addEventListener("drop", (event) => {
   event.preventDefault();

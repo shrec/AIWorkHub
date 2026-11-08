@@ -723,9 +723,10 @@ function loadWebviewSlice() {
     confirm: () => true,
   };
 
+  const documentListeners = {};
   const context = {
     document: {
-      addEventListener: () => {},
+      addEventListener: (type, handler) => { (documentListeners[type] = documentListeners[type] || []).push(handler); },
       createElement: (tag) => makeFakeElement(tag),
       createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }),
       createDocumentFragment: () => ({ __isFragment: true, children: [], appendChild(child) { this.children.push(child); return child; } }),
@@ -752,7 +753,7 @@ function loadWebviewSlice() {
       "applyManagerChatSessionUi, applyManagerChatComposerState, managerChatEnabledModels, managerChatSelectedRoute, populateManagerChatModelOptions, applyManagerChatCollapsed, toggleManagerChatSidebar, startManagerChatSidebar };",
     context,
   );
-  return { api: context.api, state, elements, posts, timers, window: windowFake, context };
+  return { api: context.api, state, elements, posts, timers, window: windowFake, context, documentListeners };
 }
 
 test("manager chat turn_end shows reported token counts", () => {
@@ -2060,6 +2061,202 @@ test("Escape in the composer clicks Stop only while Stop is enabled and never du
 
   trigger(elements.managerChatInput, "keydown", { key: "Escape" });
   assert.equal(stops(), 1);
+});
+
+test("while a turn runs an enabled Stop has its own danger style in app.css", () => {
+  assert.match(cssSource, /#manager-chat-stop:not\(:disabled\)\s*\{[^}]*var\(--blocked/);
+  assert.match(cssSource, /#manager-chat-stop:not\(:disabled\)\s*\{[^}]*var\(--blocked-ink/);
+});
+
+function runningStopHarness() {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-aaaa1111bbbb2222";
+  harness.state.managerChatRunning = true;
+  harness.api.applyManagerChatSessionUi();
+  harness.stops = () => harness.posts.filter((post) => post.type === "managerLoopStop").length;
+  return harness;
+}
+
+test("a click on Stop posts once and shows Stopping… disabled; a second click or Escape posts nothing", () => {
+  const harness = runningStopHarness();
+  const { elements } = harness;
+  assert.equal(elements.managerChatStop.disabled, false);
+  assert.equal(elements.managerChatStop.textContent, "Stop");
+
+  elements.managerChatStop.click();
+  assert.equal(harness.stops(), 1);
+  assert.equal(elements.managerChatStop.disabled, true);
+  assert.equal(elements.managerChatStop.textContent, "Stopping…");
+
+  elements.managerChatStop.click();
+  trigger(elements.managerChatInput, "keydown", { key: "Escape" });
+  assert.equal(harness.stops(), 1, "nothing more is posted while Stopping");
+
+  // A status refresh that still reports running keeps the Stopping state.
+  harness.api.applyManagerChatSessionUi();
+  assert.equal(elements.managerChatStop.disabled, true);
+  assert.equal(elements.managerChatStop.textContent, "Stopping…");
+});
+
+test("the Stopping state clears when status reports running=false", () => {
+  const harness = runningStopHarness();
+  harness.elements.managerChatStop.click();
+  harness.state.managerChatRunning = false;
+  harness.api.applyManagerChatSessionUi();
+  assert.equal(harness.elements.managerChatStop.textContent, "Stop");
+  assert.equal(harness.state.managerChatStopping, false);
+
+  harness.state.managerChatRunning = true;
+  harness.api.applyManagerChatSessionUi();
+  assert.equal(harness.elements.managerChatStop.disabled, false, "the next turn starts with a live Stop");
+});
+
+test("the Stopping state clears on a terminal event", () => {
+  for (const type of ["turn_stopped", "turn_end", "error"]) {
+    const harness = runningStopHarness();
+    harness.elements.managerChatStop.click();
+    harness.api.renderManagerChatEventsResponse({ ok: true, events: [{ seq: 9, type, turn: 2, payload: {} }] });
+    assert.equal(harness.state.managerChatRunning, false, type);
+    assert.equal(harness.elements.managerChatStop.textContent, "Stop", type);
+    assert.equal(harness.state.managerChatStopping, false, type);
+  }
+});
+
+test("a stop reply that neither stopped nor armed clears Stopping and re-enables Stop", () => {
+  const harness = runningStopHarness();
+  harness.elements.managerChatStop.click();
+  harness.api.renderManagerChatAction("stop", { ok: true, stopped: true, armed: false });
+  assert.equal(harness.elements.managerChatStop.disabled, true, "a stop that took effect keeps waiting for the terminal event");
+
+  harness.api.renderManagerChatAction("stop", { ok: true, stopped: false, armed: false });
+  assert.equal(harness.elements.managerChatStop.disabled, false);
+  assert.equal(harness.elements.managerChatStop.textContent, "Stop");
+});
+
+test("a stop reply with ok false shows the notice and re-enables Stop", () => {
+  const harness = runningStopHarness();
+  harness.elements.managerChatStop.click();
+  harness.api.renderManagerChatAction("stop", { ok: false, error: "stop_failed" });
+  assert.match(String(harness.elements.managerChatNotice.textContent), /stop_failed/);
+  assert.equal(harness.elements.managerChatStop.disabled, false);
+  assert.equal(harness.elements.managerChatStop.textContent, "Stop");
+});
+
+// Dispatches a paste the way the DOM does: the composer listener first when the
+// composer is the target, then the document listener.
+function pasteInto(harness, target, clipboardData) {
+  const calls = { prevented: 0 };
+  const event = { target, clipboardData, preventDefault() { calls.prevented += 1; } };
+  if (target === harness.elements.managerChatInput) {
+    for (const handler of harness.elements.managerChatInput.listeners.paste || []) handler(event);
+  }
+  for (const handler of harness.documentListeners.paste || []) handler(event);
+  return calls;
+}
+
+function pasteHarness() {
+  const harness = loadWebviewSlice();
+  const input = harness.elements.managerChatInput;
+  harness.focused = 0;
+  input.focus = () => { harness.focused += 1; };
+  return harness;
+}
+
+test("a file paste outside any editable field attaches the image; text-only lands in the composer at the caret", () => {
+  const harness = pasteHarness();
+  const { elements, state } = harness;
+  const outside = { tagName: "DIV" };
+
+  const image = pasteInto(harness, outside, { files: [imageFile("shot.png", "image/png", "iVBORw0KGgo=")] });
+  assert.equal(image.prevented, 1);
+  assert.deepEqual(plain(state.managerChatImages), [{ name: "shot.png", data: "iVBORw0KGgo=" }]);
+  assert.equal(elements.managerChatInput.value, "");
+
+  elements.managerChatInput.value = "hello world";
+  elements.managerChatInput.selectionStart = 5;
+  elements.managerChatInput.selectionEnd = 5;
+  const text = pasteInto(harness, outside, { files: [], getData: (type) => (type === "text/plain" ? " big" : "") });
+  assert.equal(text.prevented, 1);
+  assert.equal(elements.managerChatInput.value, "hello big world");
+  assert.equal(harness.focused, 1, "the composer takes focus");
+  assert.equal(state.managerChatDraft, "hello big world");
+  assert.equal(state.managerChatImages.length, 1, "a text paste attaches nothing");
+
+  elements.managerChatInput.selectionStart = 0;
+  elements.managerChatInput.selectionEnd = 5;
+  pasteInto(harness, outside, { getData: () => "bye" });
+  assert.equal(elements.managerChatInput.value, "bye big world", "a selection is replaced");
+});
+
+test("a paste targeting another editable field is left alone", () => {
+  const harness = pasteHarness();
+  for (const target of [{ tagName: "INPUT", type: "text" }, { tagName: "TEXTAREA" }, { tagName: "DIV", isContentEditable: true }]) {
+    const calls = pasteInto(harness, target, {
+      files: [imageFile("shot.png", "image/png", "iVBORw0KGgo=")],
+      getData: () => "text",
+    });
+    assert.equal(calls.prevented, 0, target.tagName);
+  }
+  assert.equal(harness.elements.managerChatInput.value, "");
+  assert.equal(harness.state.managerChatImages === undefined || harness.state.managerChatImages.length === 0, true);
+  assert.equal(harness.focused, 0);
+});
+
+test("a paste with an image and text keeps the text and attaches the image", () => {
+  const harness = pasteHarness();
+  const { elements, state } = harness;
+  const clipboard = () => ({ files: [imageFile("shot.png", "image/png", "iVBORw0KGgo=")], getData: () => "caption" });
+
+  const outside = pasteInto(harness, { tagName: "DIV" }, clipboard());
+  assert.equal(outside.prevented, 1);
+  assert.equal(elements.managerChatInput.value, "caption");
+  assert.equal(state.managerChatImages.length, 1);
+
+  const inside = pasteInto(harness, elements.managerChatInput, clipboard());
+  assert.equal(inside.prevented, 0, "inside the textarea the browser pastes the text itself");
+  assert.equal(elements.managerChatInput.value, "caption", "the handler does not insert it a second time");
+  assert.equal(state.managerChatImages.length, 2, "one attach per paste, though two listeners see it");
+});
+
+test("a CRLF paste from outside the composer stores LF and puts the caret after the text", () => {
+  const harness = pasteHarness();
+  const input = harness.elements.managerChatInput;
+  let caret = -1;
+  input.setSelectionRange = (position) => { caret = position; };
+  input.value = "ab";
+  input.selectionStart = 1;
+  input.selectionEnd = 1;
+  pasteInto(harness, { tagName: "DIV" }, { files: [], getData: () => "x\r\ny\rz" });
+  assert.equal(input.value, "ax\ny\nzb");
+  assert.equal(caret, 6);
+});
+
+test("a text-only paste inside the composer is left to the browser", () => {
+  const harness = pasteHarness();
+  const calls = pasteInto(harness, harness.elements.managerChatInput, { files: [], getData: () => "plain" });
+  assert.equal(calls.prevented, 0);
+  assert.equal(harness.elements.managerChatInput.value, "");
+});
+
+test("with an empty files list a file item attaches through getAsFile()", () => {
+  const harness = pasteHarness();
+  const file = imageFile("clip.png", "image/png", "iVBORw0KGgo=");
+  const calls = pasteInto(harness, { tagName: "BODY" }, {
+    files: [],
+    items: [{ kind: "string", getAsFile: () => null }, { kind: "file", getAsFile: () => file }],
+  });
+  assert.equal(calls.prevented, 1);
+  assert.deepEqual(plain(harness.state.managerChatImages), [{ name: "clip.png", data: "iVBORw0KGgo=" }]);
+});
+
+test("an unsupported pasted file type still shows the notice, and a clipboard of only files works", () => {
+  const harness = pasteHarness();
+  pasteInto(harness, { tagName: "DIV" }, { files: [imageFile("notes.txt", "text/plain", "aGk=")] });
+  assert.match(String(harness.elements.managerChatNotice.textContent), /notes\.txt is not an image/);
+  assert.equal(harness.state.managerChatImages === undefined || harness.state.managerChatImages.length === 0, true);
+
+  pasteInto(harness, { tagName: "DIV" }, { files: [imageFile("a.png", "image/png", "iVBORw0KGgo=")] });
+  assert.equal(harness.state.managerChatImages.length, 1);
 });
 
 test("the status strip and the banner sit directly above the composer, outside the transcript", () => {
