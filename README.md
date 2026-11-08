@@ -379,15 +379,15 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.94
+## What's new in 0.12.95
 
-- Linux: a Landlock-sandboxed worker can run cmake, ninja and the linker in its own temp directory; chmod-family calls there are brokered instead of denied.
-- Cards whose validation needs a native toolchain or a shell (cmake, make, ninja, cargo, npm, bash, ...) are no longer routed to the VS Code LM adapters, which cannot run them.
-- The known-bug-pattern gate blocks only on findings the candidate introduces; findings already in the tree are reported, not blocking. `cpp.literal_divide_zero` no longer matches literals such as `0.25f`.
-- `request.json` has one shared size bound, enforced when the file is written, instead of each reader's own 1-2 MiB cap.
-- Fewer manager tokens per card: review callbacks carry a compact review digest, `aiworkhub_agent_task_status` and `aiworkhub_task_show` default to a ~2 KB brief view, and a NeedFix converts to a card in one call.
-- The accept neighbour lane runs only the test functions that call the changed code, and falls back to whole test files when it cannot tell.
-- `scripts/release_cut.py` runs the whole release cut in order and stops at the first failing step.
+- Manager Chat: rows no longer shift while a turn streams, tool runs are grouped with readable titles, thinking starts collapsed, assistant text uses the full width, queued sends are visible, and Stop sits in the composer.
+- A manager turn stops on stalled output instead of a fixed hour, and a turn that died on a login or usage limit no longer rotates the session.
+- Source Graph compacts its staged copy when at least a quarter of its pages are free and no longer indexes scratch overlays. The janitor reclaims the base pins of blocked cards and finished manager overlays.
+- Accept reuses the recorded full-snapshot validation when HEAD moved only outside its closure, and the neighbour lane pins the MCP schema-freeze gates when a candidate changes an MCP tool surface.
+- A reject after a failed accept is classified from the failure's evidence, and a plain-file base-drift conflict on relaunch gets a worker resolution path.
+- Launch skips a `vscode_lm` adapter that already failed the card. Toolchain refusals name the token and the `toolchains.json` remedy.
+- An MCP tool refusal names every missing required argument and the accepted names in one message. `needfix_show` and the NeedFix transition tool take a bounded list of ids.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Continuous Audit as a Service (CAAS)

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.12.95 — 2026-11-09
+
+### Fixed
+
+- Bundles runtime 0.12.95: Manager Chat rows no longer shift while a turn streams, tool runs are grouped with readable titles, thinking starts collapsed, assistant text uses the full width, queued sends are visible, and Stop sits in the composer.
+- A manager turn stops on stalled output instead of a fixed hour, Source Graph compacts its staged copy and no longer indexes scratch overlays, accept reuses a recorded validation when HEAD moved only outside its closure, and a reject after a failed accept is classified from the failure's evidence.
+
 ## 0.12.94 — 2026-11-08
 
 ### Fixed

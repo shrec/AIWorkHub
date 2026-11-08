@@ -6,6 +6,30 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.95] - 2026-11-09
+
+### Changed
+
+- Manager Chat transcript and controls. Rows are reconciled by key, so nothing shifts while a turn streams, and consecutive tool calls are grouped under one row (NF-2026-02182). Tool titles and bodies are readable, thinking starts collapsed, markdown renders in full, and nothing overflows horizontally (NF-2026-02183). Assistant text uses the full width, a finished turn no longer shows as running, and task rows take one line (NF-2026-02187). The header is compact, Stop sits in the composer, and a status strip and provider banner replace the old chrome (NF-2026-01978). Queued sends are visible, a handoff shows one row pair, Thought timing is truthful, and the duplicate Thinking row and the clipped reasoning select are gone (NF-2026-02188).
+- Source Graph stays small. An incremental build compacts its staged copy when at least a quarter of its pages are free (NF-2026-02127), and scratch overlay directories are no longer indexed, while built-in Read can still reach them (NF-2026-02190).
+- The storage janitor reclaims the base pins of blocked cards and sweeps finished manager overlays (NF-2026-02191). On glibc, freed heap returns to the OS after heavy operations; elsewhere this is a no-op (NF-2026-02169).
+- Accept reuses the recorded full-snapshot validation when HEAD moved only outside the validation closure (NF-2026-02062). The neighbour lane pins the MCP schema-freeze contract gates when a candidate changes an MCP tool surface module (NF-2026-02162).
+- An MCP tool refusal names every missing required argument and the accepted names in one message (NF-2026-02173). `needfix_show` and the NeedFix transition tool accept a bounded list of ids (NF-2026-02174).
+- The SDLC phase timeline reads real evidence paths, so pipeline speed is measurable (NF-2026-02172). A census counts reviewer findings and reject reasons by category, with the mechanically detectable share (NF-2026-02170, RM-00086 phase 0).
+- `scripts/release_cut.py` takes `--wsl-python`, applies the `/mnt` rule in the read-only WSL preflight, and names the ledger line in its recovery hint (NF-2026-02160).
+
+### Fixed
+
+- A manager turn stops on stalled output instead of a fixed one-hour limit (NF-2026-01916). A turn that died on a login or usage limit no longer rotates the session on its context threshold (NF-2026-01915).
+- The neighbour base-red comparison builds the base workspace when the card names tests absent on HEAD (NF-2026-02185).
+- Finding dispose runs the manager reproducer only for dismissals, not for confirmed findings (NF-2026-02184).
+- A reject after a failed accept is classified from the accept failure's structured evidence instead of always `candidate_code` (NF-2026-02171).
+- A sealed accepted row outranks a lost claim at finalize (NF-2026-02186).
+- A plain-file base-drift conflict on rework relaunch gets a worker resolution path instead of a dead end (NF-2026-02165).
+- Launch derivation skips a `vscode_lm` adapter that already failed the card, on a repeated validation failure or a `vscode_lm`-only staging failure (NF-2026-02159).
+- Linux C++ validation trusts g++ and clang++, offers the toolchain-registry remedy on every lane, and gives a head advisory at card creation (NF-2026-02164). Toolchain refusals name the token and the `toolchains.json` remedy (NF-2026-02166).
+- Tool guard rule R8 allows built-in Read of raster images in the session's own `.scratch` directory (NF-2026-02181).
+
 ## [0.12.94] - 2026-11-08
 
 ### Changed
