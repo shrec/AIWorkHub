@@ -14,7 +14,10 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
 from aiworkhub import stdio_fastmcp  # noqa: E402
-from aiworkhub.tool_recovery import resolve_tool_arguments  # noqa: E402
+from aiworkhub.tool_recovery import (  # noqa: E402
+    missing_required_refusal,
+    resolve_tool_arguments,
+)
 
 
 def _search(query: str, budget: int = 10) -> dict:
@@ -176,3 +179,96 @@ print(json.dumps([
     assert "budgt -> budget" in typo["message"]
     assert "alias_conflict" in both["message"]
     assert "alias_conflict" in two["message"]
+
+
+def _two_required(template_id: str, request_id: str, budget: int = 5) -> dict:
+    return {"template_id": template_id, "request_id": request_id, "budget": budget}
+
+
+def test_missing_required_refusal_names_every_missing_and_accepted() -> None:
+    message = missing_required_refusal(_two_required, {}, {})
+    assert message is not None
+    assert message.startswith("missing_required_arguments:[template_id, request_id]")
+    assert "accepted: budget, request_id, template_id" in message
+    assert "aliases_applied" not in message
+    assert missing_required_refusal(_two_required, {"template_id": "t", "request_id": "r"}, {}) is None
+
+
+def test_defaults_and_variadics_are_never_named_missing() -> None:
+    def variadic(name: str, *args: int, flag: bool = False, **kwargs: int) -> None:
+        return None
+
+    message = missing_required_refusal(variadic, {}, {})
+    assert message is not None
+    assert message.startswith("missing_required_arguments:[name];")
+    assert "args" not in message.split(";")[0] and "kwargs" not in message.split(";")[0]
+    assert missing_required_refusal(variadic, {"name": "n"}, {"name": "n"}) is None
+
+
+def test_unexpected_and_missing_arguments_share_one_message() -> None:
+    _, message = resolve_tool_arguments(_two_required, {"template_id": "t", "bogus": 1})
+    assert message is not None and message.startswith("unexpected_arguments:")
+    assert "missing_required: [request_id]" in message
+    _, message = resolve_tool_arguments(_two_required, {"bogus": 1})
+    assert message is not None and "missing_required: [template_id, request_id]" in message
+
+
+def test_alias_with_another_missing_parameter_reports_alias_and_missing() -> None:
+    original = {"limit": 3, "template_id": "t"}
+    resolved, problem = resolve_tool_arguments(_two_required, original)
+    assert problem is None and resolved == {"budget": 3, "template_id": "t"}
+    message = missing_required_refusal(_two_required, resolved, original)
+    assert message is not None
+    assert message.startswith("missing_required_arguments:[request_id]")
+    assert "limit -> budget" in message
+
+
+def test_uninspectable_callable_has_no_missing_required_refusal() -> None:
+    assert missing_required_refusal(object(), {}, {}) is None
+
+
+def test_fastmcp_missing_required_is_one_in_band_error_and_not_invoked() -> None:
+    calls: list[dict] = []
+
+    def tool(template_id: str, request_id: str, budget: int = 1) -> dict:
+        calls.append({"template_id": template_id})
+        return {}
+
+    result = stdio_fastmcp._tool_result(
+        {"tool": tool}, {"name": "tool", "arguments": {"limit": 2}}
+    )
+    assert result["isError"] is True and len(result["content"]) == 1
+    text = result["content"][0]["text"]
+    assert "template_id" in text and "request_id" in text and "limit -> budget" in text
+    assert "accepted:" in text and "TypeError" not in text
+    assert calls == []
+
+
+def test_server_stdlib_missing_required_is_one_in_band_error_and_not_invoked() -> None:
+    env = dict(os.environ, AIWORKHUB_MCP_STDIO_BACKEND="stdlib", PYTHONPATH=str(SRC))
+    script = """
+import json
+from aiworkhub import server
+
+calls = []
+
+def fake(template_id: str, request_id: str, budget: int = 1):
+    calls.append(1)
+    return {}
+
+tools = {"aiworkhub_task_create": fake}
+out = server._stdio_tools_call(tools, {"name": "aiworkhub_task_create", "arguments": {}})
+print(json.dumps({"out": out, "calls": len(calls)}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", script], env=env, capture_output=True,
+        text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    out = payload["out"]
+    assert out["isError"] is True and len(out["content"]) == 1
+    text = out["content"][0]["text"]
+    assert text.startswith("missing_required_arguments:[template_id, request_id]")
+    assert "accepted: budget, request_id, template_id" in text
+    assert payload["calls"] == 0

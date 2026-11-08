@@ -18,7 +18,11 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .tool_recovery import resolve_tool_arguments, unknown_tool_message
+from .tool_recovery import (
+    missing_required_refusal,
+    resolve_tool_arguments,
+    unknown_tool_message,
+)
 
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -270,9 +274,13 @@ def _tool_result(tools: dict[str, Any], params: Any) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise ProtocolError(-32602, "arguments_must_be_object")
     function = tools[name]
+    original = arguments
     arguments, problem = resolve_tool_arguments(function, arguments)
     if problem:
         raise ProtocolError(-32602, problem)
+    missing = missing_required_refusal(function, arguments, original)
+    if missing:
+        return {"content": [{"type": "text", "text": missing}], "isError": True}
     try:
         value = function(**arguments)
     except Exception as exc:  # one tool failure must not terminate the server
