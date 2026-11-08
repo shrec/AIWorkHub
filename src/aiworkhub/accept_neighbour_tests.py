@@ -49,6 +49,17 @@ DEFAULT_NEIGHBOUR_LIMIT = MAX_NEIGHBOUR_TESTS
 # Repository-wide invariants no testmap links to one module; they run whenever
 # a src/ module changed and do not count against the neighbour cap.
 INVARIANT_TESTS = ("tests/test_module_size_ratchet.py", "tests/test_os_dependency_boundary.py")
+# NF-2026-02162: the MCP schema-freeze gates (tests/mcp_*.py) run as subprocesses of
+# tests/test_mcp_contract_gates.py, so no call-graph lane links a tool-surface change to
+# them. Measured: dfa2ea6d changed two tool input schemas in server.py and was accepted
+# green while that gate went red (schema_fingerprints_match_frozen). The modules below are
+# the ones the freeze scripts (mcp_client_smoke_contract_freeze.py, mcp_stdio_client_smoke.py,
+# mcp_stdio_concurrent_client_smoke.py) fingerprint tools/list through: server.py registers
+# the tools (``prepare_registration``, ``_stdio_schema_for``) and mcp_tool_metadata.py
+# supplies the descriptions, parameter descriptions, aliases and annotations they carry.
+# A change to either pins the gate file outside the neighbour cap.
+CONTRACT_GATE_TEST = "tests/test_mcp_contract_gates.py"
+CONTRACT_GATE_MODULES = ("src/aiworkhub/mcp_tool_metadata.py", "src/aiworkhub/server.py")
 # NF-2026-01947: a test that loads a changed module by path ("<stem>.py") has no
 # testmap import edge, and a NAME_MAX_LINES ratchet on a module with many related
 # tests can rank below the neighbour cap. Both run whenever their module changed,
@@ -96,9 +107,14 @@ class NeighbourSelection:
     selection_mode: str = ""
     node_count: int = 0
     fallback_reasons: tuple[Mapping[str, str], ...] = field(default=())
+    # NF-2026-02162: the pinned MCP contract gate and why it was added.
+    contract_gate: tuple[str, ...] = ()
+    contract_gate_reason: str = ""
 
     def evidence(self) -> dict[str, Any]:
-        ranked = len(self.tests) - len(self.invariant) - len(self.referencing)
+        ranked = (
+            len(self.tests) - len(self.invariant) - len(self.contract_gate) - len(self.referencing)
+        )
         record: dict[str, Any] = {
             "selected": list(self.tests),
             "limit": self.limit,
@@ -108,6 +124,10 @@ class NeighbourSelection:
         }
         if self.invariant:
             record["invariant"] = list(self.invariant)
+        if self.contract_gate:
+            record["contract_gate"] = list(self.contract_gate)
+        if self.contract_gate_reason:
+            record["contract_gate_reason"] = self.contract_gate_reason
         if self.referencing or self.referencing_omitted:
             record["referencing"] = list(self.referencing)
             record["referencing_omitted"] = self.referencing_omitted
@@ -173,6 +193,13 @@ def select_neighbour_tests(
     except Exception:  # the invariant addition must never turn a selection into a raise
         pass
     try:
+        selection = _with_contract_gates(
+            Path(repo_root), selection, changed_paths, declared_commands
+        )
+    except Exception as exc:  # a failed pin is named in the evidence, never silently absent
+        failed = f"contract_gate_failed:{type(exc).__name__}"
+        selection = replace(selection, contract_gate_reason=failed)
+    try:
         return _with_referencing(Path(repo_root), selection, changed_paths, declared_commands)
     except Exception as exc:  # nor the referencing scan: it names its failure and adds nothing
         reason = f"referencing_scan_failed:{type(exc).__name__}"
@@ -201,6 +228,49 @@ def _with_invariants(
     if not invariant:
         return selection
     return replace(selection, tests=selection.tests + invariant, invariant=invariant)
+
+
+def _with_contract_gates(
+    root: Path,
+    selection: NeighbourSelection,
+    changed_paths: Iterable[Any],
+    declared_commands: Sequence[str],
+) -> NeighbourSelection:
+    """NF-2026-02162: pin the MCP schema-freeze gate when a tool-surface module changed.
+
+    The whole gate file is appended outside the neighbour cap, so the cap never drops
+    it and a successful node lane does not hide it. Ranked entries of the gate file
+    (file or node ids) fold into the pinned whole file. A gate the declared validation
+    already names is not run twice; a gate file missing from ``root`` is named.
+    """
+    if selection.limit == 0:
+        return selection
+    surface = tuple(
+        path for path in _production_paths(changed_paths) if path in CONTRACT_GATE_MODULES
+    )
+    if not surface:
+        return selection
+    named = _advice._command_names(
+        command for command in declared_commands if isinstance(command, str)
+    )
+    if _advice._covers(named, CONTRACT_GATE_TEST):
+        return selection
+    if not (root / CONTRACT_GATE_TEST).is_file():
+        return replace(
+            selection, contract_gate_reason=f"contract_gate_missing:{CONTRACT_GATE_TEST}"
+        )
+    reason = "contract_gate:" + ",".join(path.rsplit("/", 1)[-1] for path in surface)
+    kept = tuple(test for test in selection.tests if test.split("::", 1)[0] != CONTRACT_GATE_TEST)
+    folded = len(selection.tests) - len(kept)
+    node_count = selection.node_count - folded if selection.selection_mode == "node" else 0
+    return replace(
+        selection,
+        tests=kept + (CONTRACT_GATE_TEST,),
+        contract_gate=(CONTRACT_GATE_TEST,),
+        contract_gate_reason=reason,
+        related_count=max(0, selection.related_count - folded),
+        node_count=max(0, node_count),
+    )
 
 
 def _with_referencing(
