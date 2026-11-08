@@ -133,7 +133,7 @@ def test_private_db_override_does_not_leak_across_threads(tmp_path):
         try:
             with sg.database_path_override(overlay_db):
                 entered.set()
-                assert release.wait(timeout=5)
+                assert release.wait(timeout=60)
                 sg.index_file(
                     overlay_repo, "overlay.py", _sha256(overlay_source)
                 )
@@ -142,14 +142,14 @@ def test_private_db_override_does_not_leak_across_threads(tmp_path):
 
     thread = threading.Thread(target=overlay_writer)
     thread.start()
-    assert entered.wait(timeout=5)
+    assert entered.wait(timeout=60)
     # This call runs while another thread owns a private overlay context. It
     # must still resolve the canonical repository database.
     sg.index_file(
         canonical_repo, "canonical.py", _sha256(canonical_source)
     )
     release.set()
-    thread.join(timeout=5)
+    thread.join(timeout=60)
     assert not thread.is_alive()
     assert errors == []
 

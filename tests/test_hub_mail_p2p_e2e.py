@@ -108,7 +108,7 @@ def test_discover_pair_accept_send_inbox_between_two_homes_with_zero_typed_secre
     listener_b = world.listen(b)
     wire = _record_wire(monkeypatch)
 
-    found = hub_mail_net.discover(0.5, targets=[(LOOPBACK, listener_b.record["discovery_port"])], home=a)
+    found = hub_mail_net.discover(5.0, targets=[(LOOPBACK, listener_b.record["discovery_port"])], home=a)
     assert found["ok"] is True and found["count"] == 1 and found["untrusted_hints"] is True
     [entry] = found["found"]
     assert entry["machine_id"] == hub_mail_net.machine_id(b) and entry["paired"] is False

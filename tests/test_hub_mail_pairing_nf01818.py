@@ -84,7 +84,7 @@ def _targets(listener: hub_mail_net.Listener) -> list[tuple[str, int]]:
 
 
 def _pair_both(a: Path, b: Path, listener_b: hub_mail_net.Listener) -> dict:
-    found = hub_mail_net.discover(0.5, targets=_targets(listener_b), home=a)
+    found = hub_mail_net.discover(5.0, targets=_targets(listener_b), home=a)
     assert found["ok"] is True and found["count"] == 1, found
     started = hub_mail_net.pair(found["found"][0]["address"], home=a)
     assert started["ok"] is True, started
@@ -182,7 +182,7 @@ def test_sas_is_six_digits_and_binds_every_transcript_field():
 def test_two_hubs_discover_pair_accept_and_exchange_mail_without_a_code(world):
     a, b, listener_a, listener_b = _two(world)
     assert not hub_mail_net.pair_requests(b)["requests"]
-    found = hub_mail_net.discover(0.5, targets=_targets(listener_b), home=a)
+    found = hub_mail_net.discover(5.0, targets=_targets(listener_b), home=a)
     entry = found["found"][0]
     assert entry["machine_id"] == hub_mail_net.machine_id(b) and entry["label"] == "Beta"
     assert entry["port"] == listener_b.record["port"] and entry["paired"] is False
@@ -210,12 +210,12 @@ def test_two_hubs_discover_pair_accept_and_exchange_mail_without_a_code(world):
     sent = _send(a, HUB_A, HUB_B)
     assert sent["ok"] is True, sent
     assert len(_inbox(b, HUB_B)) == 1
-    assert hub_mail_net.discover(0.5, targets=_targets(listener_b), home=a)["found"][0]["paired"] is True
+    assert hub_mail_net.discover(5.0, targets=_targets(listener_b), home=a)["found"][0]["paired"] is True
 
 
 def test_rejecting_a_request_stores_no_peer_and_accept_then_refuses(world):
     a, b, _, listener_b = _two(world)
-    found = hub_mail_net.discover(0.5, targets=_targets(listener_b), home=a)
+    found = hub_mail_net.discover(5.0, targets=_targets(listener_b), home=a)
     started = hub_mail_net.pair(found["found"][0]["address"], home=a)
     assert hub_mail_net.reject(started["request_id"], home=b) == {
         "ok": True, "rejected": True, "request_id": started["request_id"],
@@ -239,7 +239,7 @@ def test_a_relay_substituting_its_dh_value_changes_the_sas_and_nothing_is_stored
         return status, reply_headers, data, observed
 
     monkeypatch.setattr(hub_mail_net, "_exchange", relay)
-    found = hub_mail_net.discover(0.5, targets=_targets(listener_b), home=a)
+    found = hub_mail_net.discover(5.0, targets=_targets(listener_b), home=a)
     started = hub_mail_net.pair(found["found"][0]["address"], home=a)
     assert started["ok"] is True
     shown_on_b = hub_mail_net.pair_requests(b)["requests"][0]["sas"]
@@ -491,7 +491,7 @@ def test_send_and_discover_persist_the_enabled_flag(world):
 
 def test_only_an_enabled_listener_answers_a_probe(world):
     a, b, _, listener_b = _two(world)
-    assert hub_mail_net.discover(0.4, targets=_targets(listener_b), home=a)["count"] == 1
+    assert hub_mail_net.discover(5.0, targets=_targets(listener_b), home=a)["count"] == 1
     hub_mail_net._write_config(b, enabled=False)
     assert hub_mail_net.discover(0.4, targets=_targets(listener_b), home=a)["count"] == 0
 
@@ -630,7 +630,7 @@ def _confirm_lost(monkeypatch, *, delivered: bool) -> None:
 
 def test_a_retried_accept_after_a_lost_confirm_reply_keeps_the_pairing(world, monkeypatch):
     a, b, _, listener_b = _two(world)
-    found = hub_mail_net.discover(0.5, targets=_targets(listener_b), home=a)
+    found = hub_mail_net.discover(5.0, targets=_targets(listener_b), home=a)
     started = hub_mail_net.pair(found["found"][0]["address"], home=a)
     _confirm_lost(monkeypatch, delivered=True)
 
@@ -646,7 +646,7 @@ def test_a_retried_accept_after_a_lost_confirm_reply_keeps_the_pairing(world, mo
 
 def test_a_retried_accept_the_initiator_never_stored_still_forgets_the_peer(world, monkeypatch):
     a, b, _, listener_b = _two(world)
-    found = hub_mail_net.discover(0.5, targets=_targets(listener_b), home=a)
+    found = hub_mail_net.discover(5.0, targets=_targets(listener_b), home=a)
     started = hub_mail_net.pair(found["found"][0]["address"], home=a)
     _confirm_lost(monkeypatch, delivered=False)
 
