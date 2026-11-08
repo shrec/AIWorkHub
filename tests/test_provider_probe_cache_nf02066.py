@@ -166,9 +166,13 @@ def test_inspect_repository_maps_each_root_once_and_is_identical(
 
     resolved: list[Path] = []
     original = Path.resolve
+    # Patched process-wide, so count only this thread: a daemon thread left
+    # running by a neighbouring test must not inflate the count.
+    counting_thread = threading.get_ident()
 
     def counting_resolve(self: Path, strict: bool = False) -> Path:
-        resolved.append(self)
+        if threading.get_ident() == counting_thread:
+            resolved.append(self)
         return original(self, strict=strict)
 
     monkeypatch.setattr(Path, "resolve", counting_resolve)

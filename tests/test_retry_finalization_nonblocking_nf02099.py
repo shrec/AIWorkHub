@@ -55,6 +55,9 @@ def _wait_idle() -> bool:
 @pytest.fixture(autouse=True)
 def _short_grace(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(finalize_retry_dispatch, "SETTLE_GRACE_SECONDS", 0.05)
+    # A cold storage quick_check alone took 28 s in the release's Linux tree;
+    # the product's 30 s admission wait is not what these tests measure.
+    monkeypatch.setattr(finalize_retry_dispatch, "ADMISSION_WAIT_SECONDS", 300.0)
     yield
     assert _wait_idle(), "a dispatched retry outlived its test"
 
