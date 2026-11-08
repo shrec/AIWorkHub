@@ -24,7 +24,10 @@ Rules, first match wins:
 * R7 Write over an existing repository file; Write only creates new files.
 * R8 Read, Edit, or Write over an existing file, of any path inside the
   repo-local scratch root ``.scratch/``; checked before R5-R7. Write that
-  creates a new scratch file is allowed, as R7 allows it elsewhere.
+  creates a new scratch file is allowed, as R7 allows it elsewhere. A Read of
+  a real PNG/JPEG/WEBP (suffix and magic bytes) under ``.scratch/<session_id>/``
+  of the calling session is also allowed; Edit, Write and other sessions' files
+  stay denied.
 
 "Indexed" is Source Graph's own membership when its canonical database
 (``.aiworkhub/source_graph/source_graph.sqlite``) holds a readable generation:
@@ -1690,8 +1693,34 @@ def _write_verdict(ctx: _Context, file_path: str) -> tuple[str, str, str] | None
     return None if target is None else ("R7", target, "")
 
 
+_IMAGE_SIGNATURES: dict[str, tuple[tuple[int, bytes], ...]] = {
+    ".png": ((0, b"\x89PNG\r\n\x1a\n"),),
+    ".jpg": ((0, b"\xff\xd8\xff"),),
+    ".jpeg": ((0, b"\xff\xd8\xff"),),
+    ".webp": ((0, b"RIFF"), (8, b"WEBP")),
+}
+
+
+def _own_scratch_image(scratch: str, path: Path, session_id: object) -> bool:
+    """True for a real PNG/JPEG/WEBP file under ``.scratch/<session_id>/`` (R8 exception)."""
+    if not isinstance(session_id, str) or not session_id:
+        return False
+    parts = scratch.split("/")
+    if len(parts) < 3 or parts[1] != session_id:
+        return False
+    signature = _IMAGE_SIGNATURES.get(os.path.splitext(parts[-1])[1].lower())
+    if signature is None:
+        return False
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(12)
+    except OSError:
+        return False
+    return all(head[start : start + len(magic)] == magic for start, magic in signature)
+
+
 def _tool_verdict(
-    ctx: _Context, tool_name: str, tool_input: dict[str, object]
+    ctx: _Context, tool_name: str, tool_input: dict[str, object], session_id: object = None
 ) -> tuple[str, str, str] | None:
     if tool_name in ("Bash", "PowerShell"):
         command = tool_input.get("command")
@@ -1705,7 +1734,15 @@ def _tool_verdict(
         # Write that creates a new scratch file is the create path R7 allows
         # everywhere; reading, editing and overwriting stay with the tools.
         creates = tool_name == "Write" and path is not None and not os.path.lexists(path)
-        if scratch is not None and not creates:
+        # A Read of the session's own rendered image is the one built-in Read
+        # Source Graph cannot answer (it previews 8 bytes of an unindexed file).
+        own_image = (
+            tool_name == "Read"
+            and scratch is not None
+            and path is not None
+            and _own_scratch_image(scratch, path, session_id)
+        )
+        if scratch is not None and not creates and not own_image:
             return "R8", scratch, ""
     if tool_name == "Read":
         target = ctx.indexed_file(file_path, glob=False)
@@ -1765,7 +1802,11 @@ def _reason(rule: str, target: str, detail: str, manager_script: bool = False) -
 
 
 def _evaluate(
-    tool_name: object, tool_input: object, root: str | os.PathLike[str], cwd: object = None
+    tool_name: object,
+    tool_input: object,
+    root: str | os.PathLike[str],
+    cwd: object = None,
+    session_id: object = None,
 ) -> tuple[str, str, str] | None:
     """``(rule_id, reason, target)`` of the first rule the call breaks, else None."""
 
@@ -1781,7 +1822,7 @@ def _evaluate(
     membership = SourceGraphMembership(base)
     try:
         ctx = _Context(base, where, dialect, load_index_policy(base), membership)
-        verdict = _tool_verdict(ctx, tool_name, tool_input)
+        verdict = _tool_verdict(ctx, tool_name, tool_input, session_id)
     finally:
         membership.close()
     if verdict is None:
@@ -1792,16 +1833,21 @@ def _evaluate(
 
 
 def decide(
-    tool_name: object, tool_input: object, root: str | os.PathLike[str], cwd: object = None
+    tool_name: object,
+    tool_input: object,
+    root: str | os.PathLike[str],
+    cwd: object = None,
+    session_id: object = None,
 ) -> tuple[str, str] | None:
     """Return ``(rule_id, reason)`` when the tool call must be denied, else None.
 
     Pure: it reads the tree under ``root`` but writes nothing. ``root`` is the
     project directory, and a root without ``.aiworkhub/`` allows everything.
-    ``cwd`` (default ``root``) anchors relative shell operands.
+    ``cwd`` (default ``root``) anchors relative shell operands. ``session_id``
+    only lets R8 pass a Read of the session's own scratch image.
     """
 
-    verdict = _evaluate(tool_name, tool_input, root, cwd)
+    verdict = _evaluate(tool_name, tool_input, root, cwd, session_id=session_id)
     return None if verdict is None else (verdict[0], verdict[1])
 
 
@@ -2138,7 +2184,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         root = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
         tool_name = payload.get("tool_name")
-        verdict = _evaluate(tool_name, payload.get("tool_input"), root, payload.get("cwd"))
+        verdict = _evaluate(
+            tool_name,
+            payload.get("tool_input"),
+            root,
+            payload.get("cwd"),
+            session_id=payload.get("session_id"),
+        )
         if verdict is None:
             return 0
         rule, reason, target = verdict
