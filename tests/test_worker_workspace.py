@@ -2585,23 +2585,20 @@ def test_rework_overlay_merges_predecessor_delta_onto_newer_base(
 
 
 @pytest.mark.parametrize("sealed", [False, True], ids=["retained", "delta_artifact"])
-def test_rework_overlay_overlapping_base_drift_fails_closed(
+def test_rework_overlay_overlapping_base_drift_provisions_canonical_bytes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path, sealed: bool
 ) -> None:
+    """NF-2026-02165: an overlapping regular-file edit no longer blocks relaunch."""
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
-    written: list[str] = []
-    monkeypatch.setattr(
-        worker_workspace,
-        "_write_rework_path",
-        lambda destination, relative, content, **_: written.append(relative),
-    )
+    # LF checkout even on hosts with a global core.autocrlf=true.
+    assert _git(repo, "config", "core.autocrlf", "false").returncode == 0
     candidate = _rebase_bytes(line1="predecessor-1\n")
     canonical = _rebase_bytes(line1="canonical-1\n")
-    with pytest.raises(
-        worker_workspace.WorkspaceError, match="^rework_base_drift:out/result.txt$"
-    ):
-        _seed_rebased_rework(repo, tmp_path, candidate, canonical, sealed=sealed)
-    assert written == []
+    successor = _seed_rebased_rework(repo, tmp_path, candidate, canonical, sealed=sealed)
+    try:
+        assert (successor.path / "out" / "result.txt").read_bytes() == canonical
+    finally:
+        worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
     assert (repo / "out" / "result.txt").read_bytes() == canonical
     leftovers = [
         path
@@ -2853,19 +2850,14 @@ def test_rework_overlay_rebases_onto_the_predecessor_launch_time_canonical_blob(
 def test_rework_overlay_without_a_verified_launch_blob_keeps_the_base_ancestor(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path, record: str
 ) -> None:
-    """No verified recording, no substituted ancestor: the refusal stands.
+    """No verified recording, no substituted ancestor: the conflict stands.
 
     An absent record and a recorded OID whose bytes miss the ``parent_baseline``
     digest both fall back to ``base_oid`` -- exactly the ancestor that conflicts.
+    The conflict now provisions canonical bytes instead of raising (NF-2026-02165).
     """
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
     assert _git(repo, "config", "core.autocrlf", "false").returncode == 0
-    written: list[str] = []
-    monkeypatch.setattr(
-        worker_workspace,
-        "_write_rework_path",
-        lambda destination, relative, content, **_: written.append(relative),
-    )
     blob_record: dict[str, str] = {}
     if record == "digest_mismatch":
         (foreign := tmp_path / "foreign-blob").write_bytes(b"not the launch bytes\n")
@@ -2875,43 +2867,45 @@ def test_rework_overlay_without_a_verified_launch_blob_keeps_the_base_ancestor(
             ).stdout.strip()
         }
     seeded = _rebase_spliced(*_SEEDED_HUNK)
-    with pytest.raises(
-        worker_workspace.WorkspaceError, match="^rework_base_drift:out/result.txt$"
-    ):
-        _seed_dirty_canonical_rework(
-            repo,
-            _rebase_spliced(*_WORKER_HUNK),
-            uncommitted=seeded,
-            committed=seeded,
-            blob_record=blob_record,
-        )
-    assert written == []
+    successor = _seed_dirty_canonical_rework(
+        repo,
+        _rebase_spliced(*_WORKER_HUNK),
+        uncommitted=seeded,
+        committed=seeded,
+        blob_record=blob_record,
+    )
+    try:
+        assert (successor.path / "out" / "result.txt").read_bytes() == seeded
+        notice = successor.home / "task_mcp_worker_runtime" / "rework_base_drift_conflict.json"
+        assert notice.is_file()
+    finally:
+        worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
     assert (repo / "out" / "result.txt").read_bytes() == seeded
 
 
-def test_rework_overlay_still_refuses_a_canonical_commit_on_the_worker_lines(
+def test_rework_overlay_still_conflicts_on_a_canonical_commit_on_the_worker_lines(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
 ) -> None:
-    """The launch-time ancestor narrows the merge; it never widens acceptance."""
+    """The launch-time ancestor narrows the merge; it never widens acceptance.
+
+    The overlap is still a conflict (NF-2026-02165 only changes its outcome): the
+    path holds canonical bytes and the worker is told, never merged bytes.
+    """
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
     assert _git(repo, "config", "core.autocrlf", "false").returncode == 0
-    written: list[str] = []
-    monkeypatch.setattr(
-        worker_workspace,
-        "_write_rework_path",
-        lambda destination, relative, content, **_: written.append(relative),
-    )
     committed = _rebase_spliced("canonical-a\n", "canonical-c\n")
-    with pytest.raises(
-        worker_workspace.WorkspaceError, match="^rework_base_drift:out/result.txt$"
-    ):
-        _seed_dirty_canonical_rework(
-            repo,
-            _rebase_spliced(*_WORKER_HUNK),
-            uncommitted=_rebase_spliced(*_SEEDED_HUNK),
-            committed=committed,
-        )
-    assert written == []
+    successor = _seed_dirty_canonical_rework(
+        repo,
+        _rebase_spliced(*_WORKER_HUNK),
+        uncommitted=_rebase_spliced(*_SEEDED_HUNK),
+        committed=committed,
+    )
+    try:
+        assert (successor.path / "out" / "result.txt").read_bytes() == committed
+        notice = successor.home / "task_mcp_worker_runtime" / "rework_base_drift_conflict.json"
+        assert json.loads(notice.read_text(encoding="utf-8"))["paths"] == ["out/result.txt"]
+    finally:
+        worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
     assert (repo / "out" / "result.txt").read_bytes() == committed
 
 

@@ -10,6 +10,9 @@ from collections.abc import Callable, Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+# Owner of the notice file name; promotion_merge writes it (NF-2026-02165).
+REWORK_CONFLICT_NOTICE_NAME = "rework_base_drift_conflict.json"
+
 
 def materialize_rework_overlay(
     successor_request_id: str,
@@ -155,5 +158,12 @@ def materialize_worker_rework_overlay(
     except (ValueError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise error_type(f"rework_overlay_materialization_failed:{exc}") from exc
     path = workspace.home / "task_mcp_worker_runtime" / "rework_overlay.json"
+    notice = path.with_name(REWORK_CONFLICT_NOTICE_NAME)
+    if notice.is_file() and not notice.is_symlink():
+        # NF-2026-02165: top-level, outside ``files`` and ``canonical_digest``.
+        try:
+            packet["base_drift_conflicts"] = json.loads(notice.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise error_type(f"rework_base_drift_conflict_notice_invalid:{exc}") from exc
     writer(path, packet)
     return path, packet

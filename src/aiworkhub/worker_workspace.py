@@ -2376,7 +2376,7 @@ def _materialize_rework_predecessor(
     card: dict[str, Any],
     allowed_writes: tuple[str, ...],
     *,
-    rebased_hashes: dict[str, str] | None = None,
+    rebased_hashes: dict[str, str] | None = None, notice_home: Path | None = None,
 ) -> tuple[list[str], WorkerWorkspace | None]:
     """Overlay one hash-pinned predecessor into a successor worktree.
 
@@ -2414,7 +2414,7 @@ def _materialize_rework_predecessor(
     # three-way merges and imports this module at its top (NF-2026-01431).
     from .promotion_merge import rework_base_drift_rebase
 
-    rebase = rework_base_drift_rebase(repo, worktree, source_workspace)
+    rebase = rework_base_drift_rebase(repo, worktree, source_workspace, notice_home)
     if rebase is not None and rebased_hashes is not None:
         rebase = _recording_rebase(rebase, rebased_hashes)
     if predecessor.get("delta_artifact") is not None:
@@ -5261,7 +5261,7 @@ def create_workspace(
             ([], None)
             if pinned_base_oid is not None
             else _materialize_rework_predecessor(
-                repo, path, card, allowed, rebased_hashes=rework_rebased
+                repo, path, card, allowed, rebased_hashes=rework_rebased, notice_home=home,
             )
         )
         seeded = sorted(set(seeded) | set(rework_seeded))

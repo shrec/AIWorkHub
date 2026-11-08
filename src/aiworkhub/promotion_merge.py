@@ -17,7 +17,9 @@ OWN recorded parent (NF-2026-01452).
 
 from __future__ import annotations
 
+import difflib
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -29,12 +31,14 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .promotion_conflict_detail import conflict_detail
+from .rework_overlay_packet import REWORK_CONFLICT_NOTICE_NAME
 from .worker_workspace import (
     WorkerWorkspace,
     WorkspaceError,
     _hash_path,
     _isolated_worktree_base_oid,
     _run,
+    configured_runtime_root,
     promote,
 )
 
@@ -281,14 +285,82 @@ def promote_merged(
 
 ReworkRebase = Callable[[list[tuple[str, bytes | None]]], dict[str, bytes | None]]
 
+REWORK_CONFLICT_SCHEMA_ID = "aiworkhub.rework_base_drift_conflict.v1"
+_CONFLICT_DIFF_PATH_LIMIT = 16_000  # chars of predecessor diff kept per path
+_CONFLICT_DIFF_TOTAL_LIMIT = 48_000  # chars of predecessor diff kept in all
+_DIFF_TRUNCATED = "\n...[diff truncated]"
+
+
+def _predecessor_diff(relative: str, ancestor: bytes, theirs: bytes) -> str:
+    """Unified diff of the predecessor's bytes against its own base, bounded."""
+    diff = "\n".join(
+        difflib.unified_diff(
+            ancestor.decode("utf-8", "replace").splitlines(),
+            theirs.decode("utf-8", "replace").splitlines(),
+            fromfile=f"a/{relative}",
+            tofile=f"b/{relative}",
+            lineterm="",
+        )
+    )
+    if len(diff) > _CONFLICT_DIFF_PATH_LIMIT:
+        return diff[:_CONFLICT_DIFF_PATH_LIMIT] + _DIFF_TRUNCATED
+    return diff
+
+
+def rework_conflict_notice(diffs: dict[str, str]) -> dict[str, Any]:
+    """Typed, bounded ``rework_base_drift_conflict:<paths>`` notice payload."""
+    paths = sorted(diffs)
+    remaining = _CONFLICT_DIFF_TOTAL_LIMIT
+    entries: list[dict[str, Any]] = []
+    for path in paths:
+        full = diffs[path]
+        diff = full[: max(remaining, 0)]
+        remaining -= len(diff)
+        cut = len(diff) < len(full)
+        entries.append({
+            "path": path,
+            "predecessor_diff": diff + _DIFF_TRUNCATED if cut else diff,
+            "truncated": cut or full.endswith(_DIFF_TRUNCATED),
+        })
+    return {
+        "schema_id": REWORK_CONFLICT_SCHEMA_ID,
+        "notice": f"rework_base_drift_conflict:{','.join(paths)}",
+        "paths": paths,
+        "instruction": (
+            "Canonical changed these paths after your predecessor launched, so its "
+            "edits could not be merged. Each path now holds CURRENT canonical "
+            "bytes; re-apply the predecessor's change from predecessor_diff."
+        ),
+        "conflicts": entries,
+    }
+
+
+def write_rework_conflict_notice(home: Path, diffs: dict[str, str]) -> Path:
+    """Write the notice beside ``rework_overlay.json`` in the request HOME."""
+    target = home / "task_mcp_worker_runtime" / REWORK_CONFLICT_NOTICE_NAME
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target.write_text(
+        json.dumps(rework_conflict_notice(diffs), indent=2, ensure_ascii=True),
+        encoding="utf-8",
+    )
+    return target
+
 
 def rework_base_drift_rebase(
-    repo: Path, worktree: Path, source: WorkerWorkspace
+    repo: Path,
+    worktree: Path,
+    source: WorkerWorkspace,
+    notice_home: Path | None = None,
 ) -> ReworkRebase | None:
     """3-way merge P0=``source.base_oid`` predecessor bytes onto S0
     (NF-2026-01113): ours=S0, base=P0, theirs=predecessor; conflicts and
     symlink/gitlink drift fail closed. ``changed_path_hashes`` pins theirs
     before this merge, never the merged output.
+
+    With ``notice_home`` given, a regular-file CONTENT conflict no longer
+    raises: the path merges to S0's current canonical bytes and the typed
+    ``rework_base_drift_conflict`` notice (path -> predecessor diff) is written
+    into that request HOME (NF-2026-02165). Every other refusal is unchanged.
     """
     base = source.base_oid
     if not base or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", base) is None:
@@ -309,7 +381,8 @@ def rework_base_drift_rebase(
         drifted = {path: meta.split()  # [":old_mode", new_mode, P0 oid, S0 oid, status]
                    for meta, path in zip(fields[::2], fields[1::2], strict=False)}
         merged: dict[str, bytes | None] = {}
-        conflicts: list[str] = []
+        hard_conflicts: list[str] = []
+        conflicts: dict[str, str] = {}
         # The sparse worktree holds no .gitattributes and git 2.47 then
         # converts nothing, so both EOL filters read S0's attributes.
         attr_source = f"--attr-source={successor}"
@@ -337,7 +410,11 @@ def rework_base_drift_rebase(
             recorded = (attr_source, "hash-object", "-w", f"--path={relative}", str(scratch_file))
             return os.fsdecode(git(failure, *recorded)).strip() or None
 
-        with tempfile.TemporaryDirectory(prefix="aiworkhub-rebase-") as scratch:
+        # Scratch lives under the repo runtime root, never system temp, and is
+        # removed on exit (NF-2026-02165).
+        scratch_root = configured_runtime_root(repo) / "rebase-scratch"
+        scratch_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.TemporaryDirectory(prefix="aiworkhub-rebase-", dir=scratch_root) as scratch:
             sides = [Path(scratch, name) for name in ("ours", "base", "theirs")]
             for relative, theirs in (entry for entry in planned if entry[0] in drifted):
                 failed = f"rework_base_drift_blob_failed:{relative}"
@@ -358,16 +435,30 @@ def rework_base_drift_rebase(
                 else:
                     for side, oid in zip(sides, (ours, ancestor, result), strict=True):
                         side.write_bytes(git(failed, "cat-file", "blob", str(oid)))
-                    three_way = git("", "merge-file", "-p", *map(str, sides))
-                    sides[2].write_bytes(three_way or b"")
-                    result = "" if three_way is None else os.fsdecode(git(failed, *clean)).strip()
+                    merge = _run(["git", "merge-file", "-p", *map(str, sides)],
+                                 cwd=worktree, phase="rework_base_drift", text=False)
+                    three_way = merge.stdout if merge.returncode == 0 else None
+                    # Exit 1..127 is the conflict count; <0, 255 (binary refusal)
+                    # or any other failure stays a hard refusal.
+                    if notice_home is not None and 1 <= merge.returncode <= 127:
+                        # A regular-file content conflict: provision CURRENT canonical
+                        # bytes and keep the predecessor's own diff for the worker.
+                        conflicts[relative] = _predecessor_diff(
+                            relative, sides[1].read_bytes(), sides[2].read_bytes()
+                        )
+                        result = ours
+                    else:
+                        sides[2].write_bytes(three_way or b"")
+                        result = "" if three_way is None else os.fsdecode(git(failed, *clean)).strip()
                 if result == "":
-                    conflicts.append(relative)
+                    hard_conflicts.append(relative)
                 else:
                     checkout = (attr_source, "cat-file", "--filters", f"--path={relative}", str(result))
                     merged[relative] = result and git(failed, *checkout)
-        if conflicts:
-            raise WorkspaceError(f"rework_base_drift:{','.join(sorted(conflicts))}")
+        if hard_conflicts:
+            raise WorkspaceError(f"rework_base_drift:{','.join(sorted(hard_conflicts))}")
+        if conflicts and notice_home is not None:
+            write_rework_conflict_notice(notice_home, conflicts)
         return merged
 
     return rebase
