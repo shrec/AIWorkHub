@@ -43,6 +43,8 @@ SUMMARY_HEADER = "=========================== short test summary info ==========
 LINUX_ROOT = "/mnt/z/repo"
 LINUX_SCRATCH = f"{LINUX_ROOT}/.scratch/release/{VERSION}"
 WSL_BASETEMP = f"/tmp/aiworkhub-release-{VERSION}"
+# A venv interpreter inside WSL, which --wsl-python names when pytest and xdist live there.
+WSL_VENV_PYTHON = "/root/aiwh-ci-venv/bin/python"
 RELEASE_SHA = "0123456789abcdef0123456789abcdef01234567"
 BUMPED = [release_metadata.CANONICAL_VERSION_FILE, *release_metadata.PROJECTION_FILES]
 
@@ -72,6 +74,7 @@ FULL_CUT = [
     "git symbolic-ref",
     "git rev-parse",
     "wsl python3",
+    "wsl wslpath",  # the preflight's own translation of the scratch directory
     "pytest",
     "npm package",
     "git commit",
@@ -87,7 +90,7 @@ FULL_CUT = [
     "git tag",
     "git push",
 ]
-READ_ONLY = ["git status", "git symbolic-ref", "git rev-parse", "wsl python3"]
+READ_ONLY = ["git status", "git symbolic-ref", "git rev-parse", "wsl python3", "wsl wslpath"]
 
 
 def _write(path: Path, text: str) -> None:
@@ -182,7 +185,11 @@ def _guarded(argv: Sequence[str]) -> tuple[str, list[str]]:
 
 
 class FakeRunner:
-    """Records every command; answers from ``responses`` (by label) or a passing default."""
+    """Records every command; answers from ``responses`` (by label) or a passing default.
+
+    A response may be a callable of the ``Call``: what it returns answers the
+    command, and None leaves the answer to the passing default.
+    """
 
     def __init__(self, root: Path, responses: dict[str, Any] | None = None) -> None:
         self.root = root
@@ -202,7 +209,7 @@ class FakeRunner:
         name = label(call.argv)
         response = self.responses.get(name)
         if callable(response):
-            return response(call)
+            response = response(call)
         if response is not None:
             return response
         return self._passing(name, call)
@@ -267,6 +274,19 @@ def _status(*entries: str) -> Any:
     return Completed(0, "".join(f"{entry}\0" for entry in entries))
 
 
+def _on_call(number: int, response: Any) -> Any:
+    """A response that answers only the ``number``-th call of its label (1-based)."""
+
+    seen = 0
+
+    def respond(_call: Call) -> Any:
+        nonlocal seen
+        seen += 1
+        return response if seen == number else None  # None: the passing default
+
+    return respond
+
+
 # -- step order ------------------------------------------------------------
 
 
@@ -309,7 +329,8 @@ def test_a_cut_runs_every_step_in_order_through_the_injected_runner(tmp_path: Pa
         ("npm package", Completed(0), "package"),
         ("git commit", Completed(1, "", "error: pathspec did not match\n"), "commit"),
         ("git rev-parse HEAD", Completed(128, "", "fatal: bad object HEAD\n"), "commit"),
-        ("wsl wslpath", Completed(1, "", "wslpath: Z:\\repo: Invalid argument\n"), "wsl_tests"),
+        # The wsl preflight translates the scratch directory first, before any commit.
+        ("wsl wslpath", Completed(1, "", "wslpath: Z:\\repo: Invalid argument\n"), "wsl"),
         ("wsl rm", Completed(97, "", f"sh: 1: cd: can't cd to {LINUX_SCRATCH}\n"), "wsl_tests"),
         ("git archive", Completed(128, "", "fatal: not a valid object name\n"), "wsl_tests"),
         ("receipt record", Completed(2, "", '{"error": "vsix not found"}\n'), "receipt"),
@@ -384,6 +405,52 @@ def test_a_failure_after_the_bump_names_what_changed_in_one_recovery_line(
     assert f"release commit {RELEASE_SHA} carries them" in summary["recovery"]
     restore = f"git reset HEAD~1 && git checkout -- {' '.join(BUMPED)}"
     assert summary["recovery"].endswith(restore)
+
+
+@pytest.mark.parametrize(
+    ("failing", "step", "flags"), [("git tag", "tag", ()), ("git push", "push", ("--push",))]
+)
+def test_a_failure_at_tag_or_push_names_the_release_ledger_in_the_recovery_hint(
+    tmp_path: Path, failing: str, step: str, flags: tuple[str, ...]
+) -> None:
+    root = _repo(tmp_path)
+    # The ledger already holds two earlier built lines. The second is still uncommitted, so
+    # this cut's release commit carries it; the fake receipt appends this cut's line, as
+    # release_receipt.py does.
+    ledger = root / ".aiworkhub" / "releases.jsonl"
+    seed = b'{"kind": "built", "version": "0.12.98"}\n{"kind": "built", "version": "0.12.99"}\n'
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_bytes(seed)
+
+    def append_built_line(_call: Call) -> None:
+        with ledger.open("ab") as handle:
+            handle.write(b'{"kind": "built", "version": "0.13.0"}\n')
+
+    runner = FakeRunner(
+        root,
+        {"receipt record": append_built_line, failing: Completed(1, "", "fatal: refused\n")},
+    )
+
+    code, summary, lines, _ = _cut(root, *flags, runner=runner)
+
+    assert code == 1 and summary["failed_step"] == step
+    assert "receipt" in summary["completed_steps"]
+    recovery = summary["recovery"]
+    assert lines[-2] == f"recovery: {recovery}"
+    # The receipt appended this cut's built line after the seed the file held when it began.
+    assert ledger.read_bytes().startswith(seed) and len(ledger.read_bytes()) > len(seed)
+    assert "the receipt appended a built line to .aiworkhub/releases.jsonl" in recovery
+    assert "drops only this cut's built line" in recovery
+    restore = recovery.partition("a rerun must restore them first: ")[2].split(" && ")
+    # The release commit carries the earlier cut's built line and nothing else does, so a
+    # checkout of the ledger after the reset would drop it: only the bumped files are
+    # checked out.
+    checkouts = [part for part in restore if part.startswith("git checkout")]
+    assert checkouts == [f"git checkout -- {' '.join(BUMPED)}"]
+    assert not any("releases.jsonl" in part for part in checkouts)
+    # The ledger is cut back to the size it had before the receipt step appended to it.
+    truncate = f"import os; os.truncate('.aiworkhub/releases.jsonl', {len(seed)})"
+    assert restore[-1] == f'python -c "{truncate}"'
 
 
 # -- version rule -----------------------------------------------------------
@@ -578,7 +645,8 @@ def test_the_wsl_suite_runs_on_a_git_archive_of_head_under_scratch_release(tmp_p
     (archive,) = runner.argv_of("git archive")
     assert archive == ("git", "archive", "--format=tar", f"--output={scratch / 'head.tar'}", "HEAD")
     wsl_calls = [call for call in runner.calls if call.argv[0] == "wsl"]
-    assert len(wsl_calls) == 7
+    # The import check, wslpath twice (preflight, wsl_tests), rm, mkdir, tar, pytest, rm.
+    assert len(wsl_calls) == 8
     assert all(call.env is not None and call.env["MSYS_NO_PATHCONV"] == "1" for call in wsl_calls)
     (suite,) = runner.argv_of("wsl pytest")
     assert _guarded(suite)[0] == f"{LINUX_SCRATCH}/tree"
@@ -597,10 +665,10 @@ def test_every_wsl_tree_command_is_guarded_and_names_only_absolute_linux_paths(
     code, summary, _, runner = _cut(root)
     assert code == 0, summary["reason"]
 
-    # The scratch directory is translated once, through the injected runner.
-    assert runner.argv_of("wsl wslpath") == [
-        ("wsl", "-e", "wslpath", "-a", str(root / ".scratch" / "release" / VERSION))
-    ]
+    # The scratch directory is translated through the injected runner: by the read-only
+    # preflight, and again by wsl_tests once the release commit exists.
+    translate = ("wsl", "-e", "wslpath", "-a", str(root / ".scratch" / "release" / VERSION))
+    assert runner.argv_of("wsl wslpath") == [translate, translate]
     guarded = [call.argv for call in runner.calls if call.argv[:4] == ("wsl", "-e", "sh", "-c")]
     assert [label(argv) for argv in guarded] == [
         "wsl rm",
@@ -634,13 +702,95 @@ def test_a_wsl_path_outside_mnt_stops_the_cut_before_anything_runs_in_it(
     tmp_path: Path, translated: str
 ) -> None:
     root = _repo(tmp_path)
-    runner = FakeRunner(root, {"wsl wslpath": Completed(0, f"{translated}\n")})
+    # The preflight accepted the first translation; wsl_tests translates again once the
+    # release commit exists, and its own check refuses that second answer.
+    runner = FakeRunner(root, {"wsl wslpath": _on_call(2, Completed(0, f"{translated}\n"))})
 
     code, summary, _, _ = _cut(root, runner=runner)
 
     assert code == 1 and summary["failed_step"] == "wsl_tests"
     assert "not a path under /mnt/" in summary["reason"]
     assert runner.labels[-1] == "wsl wslpath"
+
+
+@pytest.mark.parametrize("flags", [("--dry-run",), ()])
+def test_a_wsl_path_outside_mnt_fails_the_read_only_wsl_preflight_before_any_bump_or_commit(
+    tmp_path: Path, flags: tuple[str, ...]
+) -> None:
+    root = _repo(tmp_path)
+    outside = f"/home/me/repo/.scratch/release/{VERSION}"
+    runner = FakeRunner(root, {"wsl wslpath": Completed(0, f"{outside}\n")})
+
+    code, summary, _, _ = _cut(root, *flags, runner=runner)
+
+    # --dry-run runs this step, so it reports what the cut used to find only after committing.
+    assert code == 1 and summary["failed_step"] == "wsl"
+    assert "not a path under /mnt/" in summary["reason"] and outside in summary["reason"]
+    statuses = _statuses(summary)
+    assert [statuses[name] for name in PREFLIGHT[:-1]] == ["ok"] * (len(PREFLIGHT) - 1)
+    assert {statuses[name] for name in CUT} == {"not_run"}
+    assert summary["recovery"] is None
+    # Nothing past the read-only checks ran: no bump, no commit, no scratch directory.
+    assert runner.labels == READ_ONLY
+    assert release_metadata.canonical_version(root) == CURRENT
+    assert not (root / ".scratch").exists()
+
+
+@pytest.mark.parametrize(
+    ("args", "python"),
+    [
+        ([], "python3"),
+        (["--wsl-python", "python3"], "python3"),
+        (["--wsl-python", WSL_VENV_PYTHON], WSL_VENV_PYTHON),
+    ],
+)
+def test_wsl_python_names_the_interpreter_of_the_preflight_the_wsl_suite_and_the_plan(
+    tmp_path: Path, args: list[str], python: str
+) -> None:
+    code, summary, lines, _ = _cut(_repo(tmp_path / "dry"), "--dry-run", *args)
+    assert code == 0, summary["reason"]
+    plan = {line.split()[1].rstrip(":"): line for line in lines if line.startswith("plan ")}
+    assert f"wsl -e {python} -c 'import pytest, xdist'" in plan["wsl"]
+    assert f"PYTHONPATH=src {python} -m pytest" in plan["wsl_tests"]
+
+    root = _repo(tmp_path / "cut")
+    code, summary, _, runner = _cut(root, *args)
+    assert code == 0, summary["reason"]
+    # The read-only preflight and the suite in the archived tree run the same interpreter.
+    (preflight,) = [call.argv for call in runner.calls if call.argv[:2] == ("wsl", "--cd")]
+    assert preflight[2:] == (str(root), "-e", python, "-c", "import pytest, xdist")
+    (suite,) = runner.argv_of("wsl pytest")
+    assert _guarded(suite)[1][:5] == ["env", "PYTHONPATH=src", python, "-m", "pytest"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "venv/bin/python",
+        "./python3",
+        "python",
+        "C:\\Python312\\python.exe",
+        "C:/Python312/python.exe",
+        "\\\\wsl.localhost\\Ubuntu\\usr\\bin\\python3",
+        "/root/my venv/bin/python",
+        "/root/venv\\bin\\python",
+        "/opt/a=b/python",
+        "",
+    ],
+)
+def test_wsl_python_refuses_anything_but_python3_or_an_absolute_posix_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], value: str
+) -> None:
+    runner = FakeRunner(_repo(tmp_path))
+
+    with pytest.raises(SystemExit) as refused:
+        _cut(tmp_path, "--wsl-python", value, runner=runner)
+
+    assert refused.value.code == 2
+    error = capsys.readouterr().err
+    assert "argument --wsl-python: " in error
+    assert "is not python3 or an absolute POSIX path" in error
+    assert runner.calls == []
 
 
 @pytest.mark.parametrize("response", [None, WSL_FAILURE])

@@ -2,7 +2,7 @@
 """Cut one AIWorkHub release as a single deterministic, ordered run.
 
     python scripts/release_cut.py VERSION [--dry-run] [--push] [--skip-wsl]
-        [--wsl-baseline PATH] [--allow-dirty PATH ...]
+        [--wsl-baseline PATH] [--wsl-python PATH] [--allow-dirty PATH ...]
 
 Write the release documents first: CHANGELOG.md, vscode-extension/CHANGELOG.md
 and both READMEs name VERSION, and that prose is the one manual part. This
@@ -26,8 +26,10 @@ Preflight, read-only (``--dry-run`` prints the plan and runs only these):
                   step runs
   branch          HEAD is main
   tag_free        tag vVERSION does not exist yet
-  wsl             a Windows host whose WSL python3 imports pytest and xdist,
-                  and a readable --wsl-baseline
+  wsl             a Windows host whose WSL interpreter (python3, or the absolute
+                  POSIX path --wsl-python names) imports pytest and xdist, whose
+                  wslpath -a names .scratch/release/VERSION under /mnt/, and a
+                  readable --wsl-baseline
 
 The cut:
 
@@ -109,6 +111,7 @@ RECEIPT_SCRIPT = "scripts/release_receipt.py"
 # identity). A cut leaves its own "built" line uncommitted: the next cut's
 # release commit carries it.
 RELEASE_LEDGER = ".aiworkhub/releases.jsonl"
+# The WSL interpreter unless --wsl-python names another: python3 or an absolute POSIX path.
 WSL_PYTHON = "python3"
 # wslpath -a must place the scratch directory on a mounted Windows drive.
 WSL_MOUNT_ROOT = "/mnt/"
@@ -262,6 +265,7 @@ class Options:
     skip_wsl: bool = False
     wsl_baseline: Path | None = None
     allow_dirty: tuple[str, ...] = ()
+    wsl_python: str = WSL_PYTHON
 
 
 @dataclass(frozen=True)
@@ -469,6 +473,9 @@ class ReleaseCut:
         self.baseline: frozenset[str] = frozenset()
         # How the recovery line names the release commit once the commit step made it.
         self.release_commit: str | None = None
+        # The ledger's size just before the receipt step appended its built line, which the
+        # recovery line truncates back to; None until that step starts.
+        self.ledger_bytes_before_receipt: int | None = None
         self.results: list[StepResult] = []
         self._steps: dict[str, Callable[[], str]] = {
             "version": self._step_version,
@@ -605,6 +612,18 @@ class ReleaseCut:
         if self.release_commit is not None:
             changed.append(f"release commit {self.release_commit} carries them")
             restore.insert(0, "git reset HEAD~1")
+        if "receipt" in done and self.ledger_bytes_before_receipt is not None:
+            # The receipt step appended its "built" line to the tracked ledger after the
+            # release commit, and that commit carries the earlier cuts' built lines, which
+            # exist nowhere else: a checkout of the ledger would drop them too. Cut the
+            # file back to its size before the append instead, which drops only this cut's.
+            size = self.ledger_bytes_before_receipt
+            truncate = f"import os; os.truncate('{RELEASE_LEDGER}', {size})"
+            changed.append(
+                f"the receipt appended a built line to {RELEASE_LEDGER} "
+                "(the truncate below drops only this cut's built line)"
+            )
+            restore.append(f'python -c "{truncate}"')
         if "tag" in done:
             changed.append(f"tag {self.tag} exists")
             restore.insert(0, f"git tag -d {self.tag}")
@@ -684,7 +703,7 @@ class ReleaseCut:
         return [
             "env",
             "PYTHONPATH=src",
-            WSL_PYTHON,
+            self.options.wsl_python,
             "-m",
             "pytest",
             "-q",
@@ -737,7 +756,8 @@ class ReleaseCut:
             "worktree": "git status --porcelain=v1 -z --untracked-files=all",
             "branch": f"git symbolic-ref --quiet --short HEAD is {MAIN_BRANCH}",
             "tag_free": f"git rev-parse --quiet --verify refs/tags/{self.tag} finds nothing",
-            "wsl": f"wsl -e {WSL_PYTHON} -c 'import pytest, xdist'; baseline {baseline}",
+            "wsl": f"wsl -e {self.options.wsl_python} -c 'import pytest, xdist'; "
+            f"wslpath -a {scratch} must lie under {WSL_MOUNT_ROOT}; baseline {baseline}",
             "bump": f"release_metadata.bump {self.version}",
             "metadata_check": f"release_metadata.check --tag {self.tag}",
             "host_tests": shlex.join(self._host_test_argv()),
@@ -830,13 +850,18 @@ class ReleaseCut:
             raise StepFailed("the WSL suite runs from a Windows host; elsewhere pass --skip-wsl")
         if self.options.wsl_baseline is not None:
             self.baseline = load_wsl_baseline(self.options.wsl_baseline)
+        python = self.options.wsl_python
         self._require(
-            self._wsl("--cd", str(self.root), "-e", WSL_PYTHON, "-c", "import pytest, xdist"),
-            f"WSL {WSL_PYTHON} importing pytest and xdist",
+            self._wsl("--cd", str(self.root), "-e", python, "-c", "import pytest, xdist"),
+            f"WSL {python} importing pytest and xdist",
         )
+        # The /mnt/ rule _step_wsl_tests applies, checked here as well: this step
+        # is read-only and --dry-run runs it, so a scratch path outside /mnt/ stops
+        # the cut before the bump and the release commit, not after them.
+        scratch = self._wsl_scratch()
         return (
-            f"WSL {WSL_PYTHON} imports pytest and xdist; the baseline lists "
-            f"{len(self.baseline)} node id(s)"
+            f"WSL {python} imports pytest and xdist; WSL names the scratch directory "
+            f"{scratch}; the baseline lists {len(self.baseline)} node id(s)"
         )
 
     # -- the cut -----------------------------------------------------------
@@ -919,9 +944,10 @@ class ReleaseCut:
         if self.options.skip_wsl:
             raise StepSkipped("--skip-wsl")
         self.scratch.mkdir(parents=True, exist_ok=True)
-        # Translated once. Every WSL command below names only absolute paths and
-        # runs behind a cd guard, so a directory WSL cannot enter stops the
-        # command instead of running it in ~.
+        # Translated once here, with the same /mnt/ rule the wsl preflight already
+        # applied before any commit. Every WSL command below names only absolute
+        # paths and runs behind a cd guard, so a directory WSL cannot enter stops
+        # the command instead of running it in ~.
         scratch = self._wsl_scratch()
         tree, archive = scratch / "tree", scratch / "head.tar"
         clear = ("rm", "-rf", "--", str(tree), str(archive), str(self.wsl_basetemp))
@@ -972,6 +998,9 @@ class ReleaseCut:
         return f"{len(failing)} WSL failure(s), each in the baseline: {summary}"
 
     def _step_receipt(self) -> str:
+        # The receipt only appends, so the recovery line can cut the ledger back to this size.
+        ledger = self.root / RELEASE_LEDGER
+        self.ledger_bytes_before_receipt = ledger.stat().st_size if ledger.is_file() else 0
         self._require(self._run(self._receipt_argv()), "release_receipt.py record")
         return f"built receipt for {self.version} appended to {RELEASE_LEDGER}"
 
@@ -986,6 +1015,31 @@ class ReleaseCut:
             )
         self._require(self._git(*self._push_args(), timeout=LONG_GIT_TIMEOUT_SECONDS), "git push")
         return f"{MAIN_BRANCH} and {self.tag} pushed to {REMOTE} together"
+
+
+def _wsl_python_option(value: str) -> str:
+    """The --wsl-python value: ``python3`` or an absolute POSIX path, else a named refusal.
+
+    The interpreter runs inside WSL, so a relative path, a Windows path and a
+    path with whitespace or a backslash cannot name it, and ``env``, which starts
+    the suite, would read a path containing ``=`` as a NAME=VALUE assignment.
+    """
+
+    if value == WSL_PYTHON:
+        return value
+    if not value.startswith("/"):
+        cause = "it does not start with '/'"
+    elif "\\" in value:
+        cause = "it contains a backslash"
+    elif any(char.isspace() for char in value):
+        cause = "it contains whitespace"
+    elif "=" in value:
+        cause = "it contains '=' (env would read it as an assignment)"
+    else:
+        return value
+    raise argparse.ArgumentTypeError(
+        f"{value!r} is not {WSL_PYTHON} or an absolute POSIX path: {cause}"
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1008,6 +1062,17 @@ def _parser() -> argparse.ArgumentParser:
         help="known WSL failures, one pytest node id per line",
     )
     parser.add_argument(
+        "--wsl-python",
+        type=_wsl_python_option,
+        default=WSL_PYTHON,
+        metavar="PATH",
+        help=(
+            f"the WSL interpreter that has pytest and xdist: {WSL_PYTHON} (default) or an "
+            "absolute POSIX path such as /root/venv/bin/python; Git Bash rewrites a leading "
+            "'/' unless MSYS_NO_PATHCONV=1 is set"
+        ),
+    )
+    parser.add_argument(
         "--allow-dirty",
         action="extend",
         nargs="+",
@@ -1026,6 +1091,7 @@ def main(argv: Sequence[str] | None = None, *, host: Host | None = None) -> int:
         push=args.push,
         skip_wsl=args.skip_wsl,
         wsl_baseline=args.wsl_baseline,
+        wsl_python=args.wsl_python,
         allow_dirty=tuple(args.allow_dirty),
     )
     return ReleaseCut(options, host if host is not None else Host.current()).run()
