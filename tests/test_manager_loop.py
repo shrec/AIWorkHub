@@ -455,6 +455,50 @@ def test_crossing_the_threshold_rotates_into_a_rehydrated_successor(make) -> Non
     assert (crossed["context_fill"], crossed["rotation_basis"]) == (None, "byte_estimate")
 
 
+@pytest.mark.parametrize("error", [
+    "usage limit reached",
+    "Failed to authenticate: OAuth session expired, run /login",
+])
+def test_an_empty_turn_that_died_on_a_provider_limit_or_login_does_not_rotate(make, error) -> None:
+    harness = make(brief_bytes=1024, context_window_bytes=2200, rotate_fraction=0.5)
+    first = harness.orch.start("fake", "model-a")
+    harness.backends[0].script.append(RuntimeError(error))
+
+    failed = harness.orch.send("x" * 1000)
+
+    assert failed["ok"] is False and not failed["reply"]
+    assert failed["context_estimate_bytes"] >= harness.orch.rotate_at_bytes
+    assert failed["rotation"] is None
+    assert harness.orch.session.session_id == first.session_id
+    assert harness.orch.session.status == "active"
+
+
+def test_an_empty_turn_with_a_generic_error_past_the_threshold_still_rotates(make) -> None:
+    harness = make(brief_bytes=1024, context_window_bytes=2200, rotate_fraction=0.5)
+    first = harness.orch.start("fake", "model-a")
+    harness.backends[0].script.append(RuntimeError("context overflow"))
+
+    failed = harness.orch.send("x" * 1000)
+
+    assert failed["ok"] is False and not failed["reply"]
+    assert failed["rotation"] is not None
+    assert failed["rotation"]["session"].session_id == first.session_id
+
+
+def test_a_replying_turn_with_a_limit_error_past_the_threshold_still_rotates(make) -> None:
+    harness = make(brief_bytes=1024, context_window_bytes=2200, rotate_fraction=0.5)
+    first = harness.orch.start("fake", "model-a")
+    harness.backends[0].script.append(
+        [{"type": "assistant_text", "payload": {"text": "partial"}}, RuntimeError("usage limit reached")]
+    )
+
+    failed = harness.orch.send("x" * 1000)
+
+    assert failed["reply"] == "partial"
+    assert failed["rotation"] is not None
+    assert failed["rotation"]["session"].session_id == first.session_id
+
+
 def _used(**usage: Any) -> list[dict[str, Any]]:
     return [
         {"type": "assistant_text", "payload": {"text": "ok"}},

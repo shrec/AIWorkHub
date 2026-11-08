@@ -36,6 +36,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, runtime
 
 from . import platform_io, repository_state
 from .callback_store import _MANAGER_CHAT_EVENT_TAIL_BYTES
+from .manager_loop_wake import classify_failure
 
 
 # v1 records pin a route to the session and carry no successor link; they stay readable
@@ -1510,7 +1511,9 @@ class ManagerOrchestrator:
         if not full and ceiling and tokens is not None and baseline is not None and tokens - baseline >= ceiling:
             result["rotation_basis"] = "absolute_token_ceiling"
             full = True
-        if full:
+        # NF-2026-01915: a turn that died on an expired login or a usage limit did no work;
+        # rotating here only re-bills a handoff and mislabels the close as context_threshold.
+        if full and (reply or not classify_failure(errors)):
             result["rotation"] = self._rotate("context_threshold", successor=True)
         return result
 
