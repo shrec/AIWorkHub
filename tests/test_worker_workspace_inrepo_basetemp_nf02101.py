@@ -20,6 +20,7 @@ import json
 import subprocess
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -291,7 +292,11 @@ def test_a_repo_inside_the_same_worker_home_keeps_that_homes_root(
 TEST_FILE = "tests/test_neighbour_x.py"
 NODE_A = f"{TEST_FILE}::test_a"
 NODE_B = f"{TEST_FILE}::test_b"
-CARD: dict[str, Any] = {"task_id": "nf02101", "validation": ["python -m pytest -q x"]}
+CARD: dict[str, Any] = {
+    "task_id": "nf02101",
+    "validation": ["python -m pytest -q x"],
+    "allowed_writes": [],
+}
 
 
 def _rows(failed: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -436,13 +441,21 @@ def _moved_canonical_head(
     head = _commit(repo, {"a.txt": b"fixed\n"}, "canonical fix")
     pinned: list[str | None] = []
 
+    @dataclass(frozen=True)
+    class _FakeWorkspace:
+        repo: Path
+        path: Path
+        home: Path
+        base_oid: str | None
+        allowed_writes: tuple[str, ...] = ("x",)
+
     def create(
         repo_path: Path, request_id: str, card: Mapping[str, Any], role: str,
         *, pinned_base_oid: str | None = None,
-    ) -> SimpleNamespace:
+    ) -> _FakeWorkspace:
         assert card["allowed_writes"] == [] and role == "validation"
         pinned.append(pinned_base_oid)
-        return SimpleNamespace(
+        return _FakeWorkspace(
             repo=Path(repo_path), path=tmp_path / request_id, home=tmp_path / "home",
             base_oid=pinned_base_oid,
         )
@@ -509,7 +522,8 @@ def test_base_commit_workspace_is_the_full_base_tree_and_is_removed(tmp_path: Pa
     head = _commit(repo, {"src/pkg/mod.py": b"VALUE = 2\n", "docs/new.md": b"new\n"}, "canonical")
     union = SimpleNamespace(repo=repo, base_oid=worker_base)
 
-    with neighbours.base_commit_workspace(union, {"task_id": "nf02101", "validation": []}) as base:
+    card = {"task_id": "nf02101", "validation": [], "allowed_writes": []}
+    with neighbours.base_commit_workspace(union, card) as base:
         path = base.path
         assert _git(path, "rev-parse", "HEAD") == head == base.base_oid
         assert b"VALUE = 2" in (path / "src" / "pkg" / "mod.py").read_bytes()
@@ -517,6 +531,23 @@ def test_base_commit_workspace_is_the_full_base_tree_and_is_removed(tmp_path: Pa
         assert (path / "docs" / "new.md").is_file()
 
     assert not path.exists()
+
+
+def test_base_commit_workspace_enters_for_a_card_adding_its_own_test(tmp_path: Path) -> None:
+    # A card whose validation names a test it adds itself (absent on HEAD, listed in
+    # allowed_writes) must still build the base; the base itself stays write-free.
+    repo = _git_repo(tmp_path / "repo", {"src/pkg/mod.py": b"VALUE = 1\n"})
+    union = SimpleNamespace(repo=repo, base_oid=_git(repo, "rev-parse", "HEAD"))
+    new_test = "tests/test_new_nf02185.py"
+    card = {
+        "task_id": "nf02185",
+        "validation": [f"python -m pytest -q {new_test}"],
+        "allowed_writes": [new_test],
+    }
+
+    with neighbours.base_commit_workspace(union, card) as base:
+        assert base.allowed_writes == ()
+        assert not (base.path / new_test).exists()
 
 
 def test_finalization_records_base_red_as_passed(monkeypatch: pytest.MonkeyPatch) -> None:

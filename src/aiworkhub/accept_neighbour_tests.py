@@ -706,10 +706,12 @@ def base_commit_workspace(workspace: Any, card: Mapping[str, Any]) -> Iterator[A
         raise WorkspaceError("neighbour_canonical_head_unavailable")
     head_oid = _workspace._repository_head_oid(Path(repo))
     base_card = {key: value for key, value in card.items() if key != "rework_predecessor"}
-    base_card.update(allowed_writes=[], required_outputs=[])
-    base = _workspace.create_workspace(
-        Path(repo), f"nbase_{uuid.uuid4().hex[:16]}", base_card, "validation",
-        pinned_base_oid=head_oid,
+    base = replace(
+        _workspace.create_workspace(
+            Path(repo), f"nbase_{uuid.uuid4().hex[:16]}", base_card, "validation",
+            pinned_base_oid=head_oid,
+        ),
+        allowed_writes=(),
     )
     try:
         # create_workspace seeds a sparse closure; a neighbour test needs the full tree.
