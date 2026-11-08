@@ -18,6 +18,14 @@
   border-color: var(--accent);
 }
 
+/* Only the user's bubble is tinted, right-aligned and narrowed. */
+.manager-chat-bubble.role-assistant {
+  max-width: none;
+  padding: 0;
+  border: 0;
+  background: none;
+}
+
 .manager-chat-bubble-label {
   display: block;
   margin-bottom: 3px;
@@ -92,6 +100,10 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.manager-chat-tool-row.is-interrupted > summary {
+  color: var(--muted);
 }
 
 .manager-chat-tool-row-body {
@@ -176,7 +188,7 @@
   margin: 6px 0;
   color: var(--muted);
   font-size: var(--fs-2xs);
-  text-align: center;
+  text-align: left;
 }
 
 .manager-chat-error {
@@ -188,10 +200,6 @@
   color: var(--ink);
   font-size: var(--fs-2xs);
   overflow-wrap: anywhere;
-}
-
-@media (max-width: 620px) {
-  .manager-chat-bubble { max-width: 100%; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -208,6 +216,7 @@
 .mc-chip { color: var(--ink-soft); font-size: var(--fs-2xs); }
 .mc-chip.is-ok { color: var(--review-ink); }
 .mc-chip.is-failed { color: var(--blocked-ink); }
+.mc-chip.is-interrupted { color: var(--muted); }
 .mc-diff > span { display: block; }
 .mc-diff .mc-add { background: var(--review-soft); }
 .mc-diff .mc-del { background: var(--blocked-soft); }
@@ -239,7 +248,7 @@ ol.mc-list { padding-left: 4ch; }
 .mc-time { float: right; margin-left: 8px; color: var(--muted); font-size: var(--fs-2xs); }
 .mc-stopped { color: var(--blocked-ink); }
 /* A flex sibling of the transcript: the negative margin cancels its height, so showing it never resizes the transcript. .manager-chat-frame declares no gap; add any gap it gains to the margin. */
-.mc-latest { position: relative; z-index: 2; flex: 0 0 auto; align-self: flex-end; height: 24px; margin-top: -24px; margin-right: 12px; font-size: var(--fs-2xs); }
+.mc-latest { position: relative; z-index: 2; flex: 0 0 auto; align-self: flex-end; height: 24px; margin-top: -24px; margin-right: 12px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface); font-size: var(--fs-2xs); }
 .mc-activity-group { margin: 0 0 6px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface-subtle); }
 .mc-activity-group.has-failed { border-color: var(--blocked); }
 .mc-activity-group > summary { padding: 6px 9px; color: var(--ink-soft); font-size: var(--fs-2xs); cursor: pointer; overflow-wrap: anywhere; }

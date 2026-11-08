@@ -270,6 +270,30 @@ test("a merged tool call whose result output carries a task_id renders as a task
   assert.deepEqual(opened, ["T-2026-00099"]);
 });
 
+for (const [label, event] of [
+  ["tool_result", { type: "tool_result", payload: { call_id: "m", name: "aiworkhub_task_show" } }],
+  ["tool_call", { type: "tool_call", payload: { call_id: "m", name: "aiworkhub_task_show", input: {}, is_error: false } }],
+]) {
+  test(`a ${label} task row carries its link inside the row body, with no line above the row`, () => {
+    const { api, opened } = load();
+    const output = [{ type: "text", text: JSON.stringify({ task_id: "T-2026-00123", status: "review", title: "One line" }) }];
+    const node = api.managerChatEventNode({ ...event, payload: { ...event.payload, output } });
+    const all = flat(node);
+    assert.match(node.className, /\bmc-task\b/);
+    assert.equal(all.filter((n) => /\bmc-body\b/.test(String(n.className || ""))).length, 0, "no .mc-body line");
+    assert.equal(node.children[1].tag, "details", "the row is the block's body");
+    const rowBody = all.find((n) => n.className === "manager-chat-tool-row-body");
+    const head = flat(rowBody.children[0]);
+    const link = head.find((n) => /\bmc-task-link\b/.test(String(n.className || "")));
+    assert.ok(link, "the link starts the row body");
+    assert.ok(head.some((n) => /\bstatus-badge\b/.test(String(n.className || "")) && n.textContent === "review"));
+    assert.ok(head.some((n) => /\bmc-task-title\b/.test(String(n.className || "")) && n.textContent === "One line"));
+    link.listeners.click[0]();
+    assert.deepEqual(opened, ["T-2026-00123"]);
+    assert.ok(all.some((n) => /\bmc-copy\b/.test(String(n.className || ""))), "the copy button stays");
+  });
+}
+
 test("the hairline follows the last reported context fill", () => {
   const { api, elements, state } = load();
   state.managerChatEvents = [{ seq: 1, turn: 1, type: "turn_end", payload: { usage: { input: 1, cache_read: 0, cache_write: 0, output: 1, context_window: 100, context_fill: 0.8 } } }];

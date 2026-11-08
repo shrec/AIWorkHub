@@ -3027,3 +3027,114 @@ test("the latest button adds no net height to the transcript's flex frame", () =
   assert.match(rule, /z-index:\s*\d+/);
   assert.match(rule, /align-self:\s*flex-end/);
 });
+
+// ── A call with no result behind a terminal event is interrupted, not running ─
+
+const runningCommand = (seq, callId = "k1") => ({ seq, turn: 1, type: "command", payload: { call_id: callId, command: "make", status: "running" } });
+const terminalEvent = (seq, type) => ({ seq, turn: 1, type, payload: {} });
+const chipIn = (node) => flattenNodes(node, []).find((part) => /\bmc-chip\b/.test(String(part.className || "")));
+
+for (const terminal of ["turn_end", "turn_stopped", "error", "session_close"]) {
+  test(`a tool_call with no result behind ${terminal} renders interrupted`, () => {
+    const harness = transcriptHarness([toolCall(1, "c1", "read"), terminalEvent(2, terminal)]);
+    harness.api.renderManagerChatEvents();
+    const row = detailsIn(harness.box.children[0])[0];
+    assert.match(row.className, /\bis-interrupted\b/);
+    assert.doesNotMatch(row.className, /\bis-running\b/);
+    assert.match(row.children[0].textContent, /^read · interrupted · a\.py$/);
+    assert.doesNotMatch(nodeText(row), /running/);
+    assert.doesNotMatch(nodeText(row), /output/, "an interrupted call has no result to show");
+  });
+}
+
+test("a tool_call stays running past an earlier terminal event and is interrupted by a later one", () => {
+  const harness = transcriptHarness([terminalEvent(1, "turn_end"), toolCall(2, "c1", "read")]);
+  harness.api.renderManagerChatEvents();
+  const live = flattenNodes(harness.box, []).find((part) => part.tag === "details");
+  assert.match(live.className, /\bis-running\b/);
+  assert.match(live.children[0].textContent, /^read · running · a\.py$/);
+  appendEvents(harness, terminalEvent(3, "turn_stopped"));
+  const stopped = flattenNodes(harness.box, []).find((part) => part.tag === "details");
+  assert.match(stopped.className, /\bis-interrupted\b/);
+  assert.match(stopped.children[0].textContent, /^read · interrupted · a\.py$/);
+});
+
+test("a kept tool row is rebuilt as interrupted when its turn ends", () => {
+  const harness = transcriptHarness([toolCall(1, "c1", "read")]);
+  harness.api.renderManagerChatEvents();
+  assert.match(detailsIn(harness.box.children[0])[0].className, /\bis-running\b/);
+  appendEvents(harness, terminalEvent(2, "turn_end"));
+  const row = detailsIn(harness.box.children[0])[0];
+  assert.match(row.className, /\bis-interrupted\b/);
+  assert.match(row.children[0].textContent, /^read · interrupted · a\.py$/);
+});
+
+test("a group over interrupted members counts them and names nothing as running", () => {
+  const harness = transcriptHarness([toolCall(1, "c1", "read"), toolCall(2, "c2", "grep"), runningCommand(3), terminalEvent(4, "turn_stopped")]);
+  harness.api.renderManagerChatEvents();
+  const [group] = activityGroups(harness);
+  assert.equal(group.children[0].textContent, "2 tools · 1 command · 3 interrupted");
+  assert.match(group.children[0].textContent, /interrupted/);
+  assert.doesNotMatch(group.children[0].textContent, /running/);
+});
+
+test("a kept group changes from running to interrupted when its turn stops", () => {
+  const harness = transcriptHarness([toolCall(1, "c1", "read"), toolCall(2, "c2", "grep")]);
+  harness.api.renderManagerChatEvents();
+  const [group] = activityGroups(harness);
+  assert.equal(group.children[0].textContent, "2 tools · running grep");
+  appendEvents(harness, terminalEvent(3, "turn_stopped"));
+  assert.equal(activityGroups(harness)[0].children[0].textContent, "2 tools · 2 interrupted");
+  for (const row of detailsIn(activityGroups(harness)[0].children[1])) assert.match(row.className, /\bis-interrupted\b/);
+});
+
+test("a command with no result behind a terminal event shows the interrupted chip", () => {
+  const harness = transcriptHarness([runningCommand(1), terminalEvent(2, "turn_end")]);
+  harness.api.renderManagerChatEvents();
+  const chip = chipIn(harness.box.children[0]);
+  assert.match(chip.className, /\bis-interrupted\b/);
+  assert.equal(chip.textContent, "interrupted");
+});
+
+test("a kept command row keeps running while live and is rebuilt when its turn ends", () => {
+  const harness = transcriptHarness([runningCommand(1)]);
+  harness.api.renderManagerChatEvents();
+  const live = chipIn(harness.box.children[0]);
+  assert.match(live.className, /\bis-running\b/);
+  assert.equal(live.textContent, "running");
+  appendEvents(harness, terminalEvent(2, "turn_stopped"));
+  const stopped = chipIn(harness.box.children[0]);
+  assert.match(stopped.className, /\bis-interrupted\b/);
+  assert.equal(stopped.textContent, "interrupted");
+});
+
+// ── Adjacent Stopped rows and the transcript's layout rules ─────────────────
+
+const stoppedRows = (harness) => harness.box.children.filter((child) => /\bmc-turn-stopped\b/.test(child.className));
+
+test("two adjacent turn_stopped events render one Stopped row", () => {
+  const harness = transcriptHarness([userEvent(1), terminalEvent(2, "turn_stopped"), terminalEvent(3, "turn_stopped")]);
+  harness.api.renderManagerChatEvents();
+  assert.equal(stoppedRows(harness).length, 1);
+  assert.equal(harness.box.children.length, 2);
+  const separated = transcriptHarness([terminalEvent(1, "turn_stopped"), textEvent(2), terminalEvent(3, "turn_stopped")]);
+  separated.api.renderManagerChatEvents();
+  assert.equal(stoppedRows(separated).length, 2, "only adjacent markers collapse");
+});
+
+test("assistant text is full width, markers sit left and the latest button is opaque", () => {
+  const assistant = /\.manager-chat-bubble\.role-assistant \{([^}]*)\}/.exec(consoleCss);
+  assert.ok(assistant, "the assistant bubble has its own rule");
+  assert.match(assistant[1], /max-width:\s*none/);
+  assert.match(assistant[1], /padding:\s*0/);
+  assert.match(assistant[1], /border:\s*0/);
+  assert.match(assistant[1], /background:\s*none/);
+  assert.doesNotMatch(consoleCss, /@media \(max-width:\s*620px\)/);
+  assert.match(/\.manager-chat-marker \{([^}]*)\}/.exec(consoleCss)[1], /text-align:\s*left/);
+  const latest = /\.mc-latest \{([^}]*)\}/.exec(consoleCss)[1];
+  assert.match(latest, /background:\s*var\(--surface\)/);
+  assert.match(latest, /border:\s*1px solid var\(--line\)/);
+  assert.match(latest, /border-radius:\s*\d+px/);
+  assert.match(/\.mc-chip\.is-interrupted \{([^}]*)\}/.exec(consoleCss)[1], /color:\s*var\(--muted\)/);
+  assert.match(/\.manager-chat-tool-row\.is-interrupted > summary \{([^}]*)\}/.exec(consoleCss)[1], /color:\s*var\(--muted\)/);
+});

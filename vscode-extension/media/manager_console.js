@@ -14,8 +14,21 @@ function managerConsolePayload(event) {
   return event && event.payload && typeof event.payload === "object" ? event.payload : {};
 }
 
-function managerConsoleToolStatus(payload) {
-  if (!("output" in payload || "is_error" in payload)) return "running";
+function managerConsoleHighestTerminalSeq(events) {
+  let highest = 0;
+  for (const event of events) {
+    if (event && MANAGER_CONSOLE_TERMINAL_TYPES.has(event.type)) highest = Math.max(highest, numberValue(event.seq));
+  }
+  return highest;
+}
+
+// A call with no result is live only while no terminal event follows it in the log.
+function managerConsoleUnfinishedStatus(event) {
+  return numberValue(event && event.seq) < managerConsoleTerminalSeq ? "interrupted" : "running";
+}
+
+function managerConsoleToolStatus(payload, event) {
+  if (!("output" in payload || "is_error" in payload)) return managerConsoleUnfinishedStatus(event);
   return payload.is_error ? "failed" : "done";
 }
 
@@ -23,7 +36,7 @@ function managerChatEventNode(event) {
   const type = String((event && event.type) || "");
   if (!MANAGER_CONSOLE_ROW_TYPES.has(type)) return null;
   const payload = managerConsolePayload(event);
-  if (type === "command") return managerConsoleCommandNode(payload);
+  if (type === "command") return managerConsoleCommandNode(payload, event);
   if (type === "file_change") return managerConsoleFileChangeNode(payload);
   if (type === "assistant_text" || type === "user_message") {
     const bubble = createElement("div", `manager-chat-bubble role-${type === "user_message" ? "user" : "assistant"}`);
@@ -41,12 +54,14 @@ function managerChatEventNode(event) {
   if (type === "tool_call") {
     const name = String(payload.name || payload.tool || "tool");
     const hint = managerChatToolHint(payload);
-    const status = managerConsoleToolStatus(payload);
-    const hasResult = status !== "running";
+    const status = managerConsoleToolStatus(payload, event);
+    const hasResult = status === "done" || status === "failed";
     const row = createElement("details", "manager-chat-tool-row is-" + status);
     row.open = false;
     row.appendChild(managerConsoleToolSummary(name, (shown) => [shown, status, hint].filter(Boolean).join(" · ")));
     const body = createElement("div", "manager-chat-tool-row-body");
+    const task = hasResult ? managerConsoleTaskOf(payload) : null;
+    if (task) body.appendChild(managerConsoleTaskHead(task));
     if ("input" in payload) {
       body.appendChild(createElement("div", "manager-chat-tool-section", "input"));
       appendManagerChatToolFields(body, payload.input, 0);
@@ -56,7 +71,6 @@ function managerChatEventNode(event) {
       appendManagerChatToolFields(body, payload.output, 0);
     }
     row.appendChild(body);
-    const task = hasResult ? managerConsoleTaskOf(payload) : null;
     return task ? managerConsoleTaskNode(task, row) : managerConsoleBlock("tool_call", row);
   }
   if (type === "tool_result") {
@@ -66,12 +80,13 @@ function managerChatEventNode(event) {
     row.open = false;
     row.appendChild(managerConsoleToolSummary(name, (shown) => [shown + " result", hint].filter(Boolean).join(" · ")));
     const body = createElement("div", "manager-chat-tool-row-body");
+    const task = managerConsoleTaskOf(payload);
+    if (task) body.appendChild(managerConsoleTaskHead(task));
     const rest = Object.assign({}, payload);
     delete rest.name;
     delete rest.tool;
     appendManagerChatToolFields(body, rest, 0);
     row.appendChild(body);
-    const task = managerConsoleTaskOf(payload);
     return task ? managerConsoleTaskNode(task, row) : managerConsoleBlock(type, row);
   }
   if (type === "callback") {
@@ -248,7 +263,7 @@ function managerChatThinkingKey() {
       turn = item.turn;
       finished = false;
     }
-    if (item.type === "turn_end" || item.type === "turn_stopped" || item.type === "error" || item.type === "session_close") finished = true;
+    if (MANAGER_CONSOLE_TERMINAL_TYPES.has(item.type)) finished = true;
   }
   return String(state.managerChatSession || "") + ":" + (finished ? turn + 1 : turn);
 }
@@ -264,6 +279,8 @@ const MANAGER_CONSOLE_ROW_TYPES = new Set([
   "session_start", "handoff_request", "session_close", "turn_stopped", "queue_dropped", "reasoning", "turn_end",
 ]);
 const MANAGER_CONSOLE_ACTIVITY_TYPES = new Set(["tool_call", "tool_result", "command", "file_change", "reasoning"]);
+// Every event type after which nothing earlier in the log can still be running.
+const MANAGER_CONSOLE_TERMINAL_TYPES = new Set(["turn_end", "turn_stopped", "error", "session_close"]);
 const MANAGER_CONSOLE_LIVE_THOUGHT_PREFIX = "Thinking ·";
 const MANAGER_CONSOLE_LIVE_THINKING_KEY = "extra:live-thinking";
 const MANAGER_CONSOLE_COMMAND_LINES = 20;
@@ -344,26 +361,26 @@ function managerConsoleMergeTools(events) {
   return merged;
 }
 
-function managerConsoleCommandStatus(payload) {
-  if (payload.status === "running") return "running";
+function managerConsoleCommandStatus(payload, event) {
+  if (payload.status === "running") return managerConsoleUnfinishedStatus(event);
   const code = Number.isInteger(payload.exit_code) ? payload.exit_code : null;
   return payload.status === "failed" || (code !== null && code !== 0) ? "failed" : "done";
 }
 
-function managerConsoleCommandChip(payload) {
-  const status = managerConsoleCommandStatus(payload);
-  if (status === "running") return createElement("span", "mc-chip is-running", "running");
+function managerConsoleCommandChip(payload, event) {
+  const status = managerConsoleCommandStatus(payload, event);
+  if (status === "running" || status === "interrupted") return createElement("span", "mc-chip is-" + status, status);
   const code = Number.isInteger(payload.exit_code) ? payload.exit_code : null;
   const failed = status === "failed";
   const label = code !== null ? "exit " + code : failed ? "failed" : "done";
   return createElement("span", failed ? "mc-chip is-failed" : "mc-chip is-ok", label);
 }
 
-function managerConsoleCommandNode(payload) {
+function managerConsoleCommandNode(payload, event) {
   const body = createElement("div", "mc-body");
   const head = createElement("div", "mc-head");
   head.appendChild(createElement("code", "mc-mono", String(payload.command || "")));
-  head.appendChild(managerConsoleCommandChip(payload));
+  head.appendChild(managerConsoleCommandChip(payload, event));
   body.appendChild(head);
   const lines = String(payload.output_tail || "").split("\n");
   if (payload.output_tail) {
@@ -428,16 +445,20 @@ function managerConsoleTaskOf(payload) {
   return managerConsoleTaskFields(payload.output) || managerConsoleTaskFields(payload.input);
 }
 
-function managerConsoleTaskNode(task, detail) {
-  const body = createElement("div", "mc-body");
+// Goes first in the tool row's body, so a task adds no line above the collapsed row.
+function managerConsoleTaskHead(task) {
+  const head = createElement("div", "mc-head");
   const open = createElement("button", "mc-task-link mc-mono", task.id);
   open.type = "button";
   open.addEventListener("click", () => requestTaskDetail(task.id));
-  body.appendChild(open);
-  if (task.status) body.appendChild(createElement("span", "status-badge " + task.status, task.status));
-  if (task.title) body.appendChild(createElement("span", "mc-task-title", task.title));
-  if (detail) body.appendChild(detail);
-  const block = managerConsoleBlock("task", body);
+  head.appendChild(open);
+  if (task.status) head.appendChild(createElement("span", "status-badge " + task.status, task.status));
+  if (task.title) head.appendChild(createElement("span", "mc-task-title", task.title));
+  return head;
+}
+
+function managerConsoleTaskNode(task, row) {
+  const block = managerConsoleBlock("task", row);
   block.appendChild(managerConsoleCopyButton(() => {
     let text = String(task.id || "");
     if (task.title) text += " — " + task.title;
@@ -552,6 +573,9 @@ let managerConsoleRenderedLimit = null;
 let managerConsoleActiveIndex = null;
 let managerConsoleLiveLabel = null;
 let managerConsoleLiveSummaries = [];
+// Highest seq of a terminal event in the loaded log. Kept between renders because a group's
+// member rows can be built after the render that described them.
+let managerConsoleTerminalSeq = 0;
 // Reconcile state: the rows now in the transcript, the session they belong to, and whether the
 // transcript also holds children no entry owns (the empty placeholder or a dropped session's rows).
 // It starts true because the webview markup ships a placeholder inside the transcript.
@@ -668,10 +692,11 @@ function managerConsoleRowSignature(event) {
     return JSON.stringify([type, label.startsWith(MANAGER_CONSOLE_LIVE_THOUGHT_PREFIX) ? MANAGER_CONSOLE_LIVE_THOUGHT_PREFIX : label, String(payload.text || "")]);
   }
   if (type === "command") {
-    return JSON.stringify([type, payload.command, payload.status, payload.exit_code, payload.output_tail, payload.truncated, payload.original_bytes]);
+    return JSON.stringify([type, managerConsoleCommandStatus(payload, event), payload.command, payload.status, payload.exit_code, payload.output_tail, payload.truncated, payload.original_bytes]);
   }
-  // The status is explicit because a result can add only undefined keys, which JSON drops.
-  if (type === "tool_call") return JSON.stringify([type, managerConsoleToolStatus(payload), payload]);
+  // The status is explicit because a result can add only undefined keys, which JSON drops,
+  // and because a terminal event changes it without touching the payload.
+  if (type === "tool_call") return JSON.stringify([type, managerConsoleToolStatus(payload, event), payload]);
   const clock = type === "assistant_text" || type === "user_message" ? managerChatClockText(event) : "";
   return JSON.stringify([type, clock, payload]);
 }
@@ -703,6 +728,9 @@ function managerConsoleEventRows(merged, visible) {
       continue;
     }
     flushPendingTurnEnd();
+    // A repeated stop records a second marker; the transcript says Stopped once.
+    const previousRow = rows[rows.length - 1];
+    if (event && event.type === "turn_stopped" && previousRow && previousRow.event.type === "turn_stopped") continue;
     pushRow(event);
   }
   flushPendingTurnEnd();
@@ -718,18 +746,21 @@ function managerConsoleActivitySummary(members) {
   let commands = 0;
   let files = 0;
   let failed = 0;
+  let interrupted = 0;
   let running = "";
   for (const { event } of members) {
     const payload = managerConsolePayload(event);
     if (event.type === "tool_call" || event.type === "tool_result") {
       tools += 1;
-      const status = event.type === "tool_call" ? managerConsoleToolStatus(payload) : payload.is_error ? "failed" : "done";
+      const status = event.type === "tool_call" ? managerConsoleToolStatus(payload, event) : payload.is_error ? "failed" : "done";
       if (status === "failed") failed += 1;
+      if (status === "interrupted") interrupted += 1;
       if (status === "running") running = String(payload.name || payload.tool || "tool");
     } else if (event.type === "command") {
       commands += 1;
-      const status = managerConsoleCommandStatus(payload);
+      const status = managerConsoleCommandStatus(payload, event);
       if (status === "failed") failed += 1;
+      if (status === "interrupted") interrupted += 1;
       if (status === "running") running = limitText(String(payload.command || "command"), 60);
     } else if (event.type === "file_change") {
       files += 1;
@@ -740,6 +771,7 @@ function managerConsoleActivitySummary(members) {
   if (commands) parts.push(managerConsoleCountLabel(commands, "command"));
   if (files) parts.push(managerConsoleCountLabel(files, "file"));
   if (failed) parts.push(`${failed} failed`);
+  if (interrupted) parts.push(`${interrupted} interrupted`);
   if (running) parts.push(`running ${running}`);
   return { text: parts.join(" · "), failed: failed > 0 };
 }
@@ -919,6 +951,7 @@ function renderManagerChatEvents() {
   if (!elements.managerChatTranscript) return;
   managerConsoleApplyHairline();
   const events = Array.isArray(state.managerChatEvents) ? state.managerChatEvents : [];
+  managerConsoleTerminalSeq = managerConsoleHighestTerminalSeq(events);
   const limit = state.managerChatRenderLimit || MANAGER_CONSOLE_BLOCK_LIMIT;
   if (managerConsoleRenderSignature(events, limit) === managerConsoleLastSignature) {
     managerConsoleTickThinking();
