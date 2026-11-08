@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 
+from . import platform_io
 from .core import health
 
 
+@platform_io.trim_heap_after
 def main() -> None:
     print(json.dumps(health(), ensure_ascii=False, indent=2))
 

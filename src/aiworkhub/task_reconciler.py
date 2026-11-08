@@ -72,6 +72,7 @@ from .platform_io import (
     nofollow_open_flag,
     open_directory_descriptor,
     stat_owned_by_current_user,
+    trim_heap_after,
     windows_descriptor_secret_trust,
     windows_harden_owner_only_key_dacl,
     unlock_fd,
@@ -506,6 +507,7 @@ def _staleness(record: dict[str, Any]) -> tuple[bool, float | None]:
     return age > budget, age
 
 
+@trim_heap_after
 def run_scan(
     manager: process_launcher.ProcessManager | None = None,
     *,

@@ -54,7 +54,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from . import attempt_artifacts, mcp_summary_folds, storage_retention, task_store
+from . import attempt_artifacts, mcp_summary_folds, platform_io, storage_retention, task_store
 
 SCHEMA_ID = "aiworkhub.task_store_compaction.v1"
 DEFAULT_MAX_AGE_SECONDS = 3 * 86_400
@@ -698,6 +698,7 @@ def _ensure_incremental_vacuum(db_path: Path) -> dict[str, Any]:
         }
 
 
+@platform_io.trim_heap_after
 def compact_finished_cards(
     repo_root: str | Path,
     *,

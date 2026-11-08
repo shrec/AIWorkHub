@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import errno
+import functools
 import importlib
 import json
 import math
@@ -28,7 +29,7 @@ import unicodedata
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypedDict, TypeVar, cast
 
 if TYPE_CHECKING:
     from .windows_appcontainer import AppContainerProbe
@@ -939,6 +940,81 @@ def process_memory_bytes() -> dict[str, int | None]:
         return {"rss_bytes": None, "peak_rss_bytes": peak, "private_bytes": None}
     except Exception:
         return empty
+
+
+# glibc keeps freed arenas mapped, so a transient spike (a VACUUM copy, full
+# card loads, a reconciler or health scan) stays resident for the process
+# lifetime.  malloc_trim(0) hands the free top and interior pages back.
+HEAP_TRIM_MIN_INTERVAL_SECONDS = 5.0
+_HEAP_TRIM_LOCK = threading.Lock()
+_HEAP_TRIM_STATE: dict[str, Any] = {"probed": False, "handle": None, "last": None}
+_HeapTrimmed = TypeVar("_HeapTrimmed", bound=Callable[..., Any])
+
+
+def _glibc_malloc_trim() -> Any:
+    """Return the cached ``malloc_trim`` callable, or ``None`` off glibc Linux.
+
+    Probed once: the glibc version string identifies glibc (musl and every
+    non-Linux host lack it), then the libc handle is loaded and cached.  A
+    load failure is cached as unavailable.  Caller holds ``_HEAP_TRIM_LOCK``.
+    """
+
+    if _HEAP_TRIM_STATE["probed"]:
+        return _HEAP_TRIM_STATE["handle"]
+    _HEAP_TRIM_STATE["probed"] = True
+    try:
+        confstr = getattr(os, "confstr", None)
+        if not is_linux() or not callable(confstr):
+            return None
+        if not str(confstr("CS_GNU_LIBC_VERSION")).lower().startswith("glibc"):
+            return None
+        trim = ctypes.CDLL("libc.so.6").malloc_trim
+        trim.argtypes = (ctypes.c_size_t,)
+        trim.restype = ctypes.c_int
+        _HEAP_TRIM_STATE["handle"] = trim
+    except Exception:
+        _HEAP_TRIM_STATE["handle"] = None
+    return _HEAP_TRIM_STATE["handle"]
+
+
+def trim_process_heap() -> dict[str, Any]:
+    """Return freed heap to the OS (glibc ``malloc_trim(0)``); never raises.
+
+    ``{"available": False, ...}`` anywhere but glibc Linux, ``{"skipped":
+    "rate_limited"}`` within ``HEAP_TRIM_MIN_INTERVAL_SECONDS`` (monotonic) of
+    the previous trim, else ``{"available": True, "trimmed": bool}``.
+    """
+
+    try:
+        with _HEAP_TRIM_LOCK:
+            trim = _glibc_malloc_trim()
+            if trim is None:
+                return {"available": False, "trimmed": False, "reason": "not_glibc_linux"}
+            now = time.monotonic()
+            last = _HEAP_TRIM_STATE["last"]
+            if last is not None and now - last < HEAP_TRIM_MIN_INTERVAL_SECONDS:
+                return {"available": True, "trimmed": False, "skipped": "rate_limited"}
+            _HEAP_TRIM_STATE["last"] = now
+            return {"available": True, "trimmed": bool(trim(0))}
+    except Exception as exc:
+        return {
+            "available": False,
+            "trimmed": False,
+            "reason": f"trim_failed:{type(exc).__name__}",
+        }
+
+
+def trim_heap_after(func: _HeapTrimmed) -> _HeapTrimmed:
+    """Decorate a heavy operation so it trims the heap once at its end, in a ``finally``."""
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(*args, **kwargs)
+        finally:
+            trim_process_heap()
+
+    return cast(_HeapTrimmed, wrapper)
 
 
 def _windows_creation_flag() -> int:

@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, NamedTuple
 
-from . import repo_policy, roadmap_store, task_store
+from . import platform_io, repo_policy, roadmap_store, task_store
 from .sqlite_readonly import connect_readonly
 
 
@@ -1353,6 +1353,7 @@ def _janitor_needfix(root: Path | str) -> dict[str, Any]:
     )
 
 
+@platform_io.trim_heap_after
 def run_records_janitor(
     root: Path | str, *, now: datetime | None = None
 ) -> dict[str, Any]:

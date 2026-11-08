@@ -130,6 +130,7 @@ def _encoded_size(payload: Mapping[str, Any]) -> int:
     return len(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
 
 
+@platform_io.trim_heap_after
 def diagnose(
     probes: Mapping[str, Probe], *, timeout_seconds: float = 10.0
 ) -> dict[str, Any]:
