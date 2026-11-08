@@ -1338,14 +1338,12 @@ test("tool calls render as fields for every model, not as a JSON blob", () => {
   assert.equal(text.includes('{\"input\"'), false);
 });
 
-test("a running turn shows a thinking timer for any model", () => {
-  const harness = loadWebviewSlice();
-  harness.state.managerChatSession = "mls-aaaa1111bbbb2222";
-  harness.state.managerChatRunning = true;
-  harness.state.managerChatEvents = [];
+test("a running turn shows a thinking timer for any model on the status strip, not as a transcript row", () => {
+  const harness = runningStripHarness();
   harness.api.renderManagerChatEvents();
   const text = flattenNodes(harness.elements.managerChatTranscript, []).map((part) => String(part.textContent || "")).join("");
-  assert.match(text, /Thinking/);
+  assert.doesNotMatch(text, /Thinking/);
+  assert.match(harness.elements.managerChatStripPhase.textContent, /^Thinking · \d+s$/);
 });
 
 test("polling continues when the manager dialog is closed", () => {
@@ -3382,4 +3380,51 @@ test("assistant text is full width, markers sit left and the latest button is op
   assert.match(latest, /border-radius:\s*\d+px/);
   assert.match(/\.mc-chip\.is-interrupted \{([^}]*)\}/.exec(consoleCss)[1], /color:\s*var\(--muted\)/);
   assert.match(/\.manager-chat-tool-row\.is-interrupted > summary \{([^}]*)\}/.exec(consoleCss)[1], /color:\s*var\(--muted\)/);
+});
+
+// ── Queued sends stay visible, one handoff pair, truthful Thought timing, one reasoning select ──
+
+test("the transcript's flex basis is 0 so a huge content base cannot starve the send queue", () => {
+  const rule = /\.manager-chat-frame > \.manager-chat-transcript \{([^}]*)\}/.exec(cssSource);
+  assert.ok(rule, "the frame's transcript rule is present");
+  assert.match(rule[1], /flex:\s*1 1 0;/);
+  assert.doesNotMatch(rule[1], /flex:\s*1 1 auto/);
+});
+
+test("a handoff renders exactly Stopped and Handoff requested", () => {
+  const harness = transcriptHarness([
+    { seq: 1, turn: 15, type: "turn_stopped", payload: {} },
+    { seq: 2, turn: 16, type: "handoff_request", payload: { reason: "r" } },
+    { seq: 3, turn: 16, type: "turn_stopped", payload: {} },
+    { seq: 4, turn: 16, type: "session_close", payload: { reason: "r" } },
+  ]);
+  harness.api.renderManagerChatEvents();
+  assert.equal(harness.box.children.length, 2);
+  assert.equal(stoppedRows(harness).length, 1);
+  assert.match(harness.box.children[0].className, /\bmc-turn-stopped\b/);
+  assert.match(nodeText(harness.box.children[1]), /Handoff requested: r/);
+});
+
+test("a Thought label reports the gap before the block when the gap after is short", () => {
+  const label = (events) => {
+    const harness = transcriptHarness(events);
+    harness.api.renderManagerChatEvents();
+    return detailsIn(harness.box.children[1])[0].children[0].textContent;
+  };
+  const user = { seq: 1, turn: 1, ts: CLOCK_START, type: "user_message", payload: { text: "go" } };
+  const closer = (ts, turn = 1) => ({ seq: 3, turn, ts, type: "assistant_text", payload: { text: "ok" } });
+  assert.equal(label([user, reasoningEvent(2, CLOCK_START + 4000), closer(CLOCK_START + 4019)]), "Thought for 4s");
+  assert.equal(label([user, reasoningEvent(2, CLOCK_START + 500), closer(CLOCK_START + 900)]), "Thought");
+  // The only predecessor belongs to another turn: that gap is owner idle time, never thinking time.
+  const other = { ...reasoningEvent(2, CLOCK_START + 9000), turn: 2 };
+  assert.equal(label([user, other, closer(CLOCK_START + 9019, 2)]), "Thought");
+});
+
+test("the narrow sidebar sizes the reasoning select to its content instead of a 4.5rem box", () => {
+  const container = cssSource.slice(cssSource.indexOf("@container manager-chat-sidebar (max-width: 420px)"));
+  const rule = /#manager-chat-sidebar #manager-chat-reasoning \{([^}]*)\}/.exec(container);
+  assert.ok(rule, "the container rule for the reasoning select is present");
+  assert.match(rule[1], /field-sizing:\s*content;/);
+  assert.match(rule[1], /flex:\s*0 0 auto;/);
+  assert.doesNotMatch(rule[1], /4\.5rem/);
 });

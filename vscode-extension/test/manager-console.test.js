@@ -627,18 +627,21 @@ test("a poll that changes nothing does not rebuild the transcript, and a new eve
   assert.equal(counter.writes, 4);
 });
 
-test("an unchanged poll while running only ticks the live Thinking label", () => {
+test("an unchanged poll while running only ticks the strip's Thinking text", () => {
   const { api, elements, state } = load([{ seq: 1, turn: 1, type: "user_message", payload: { text: "go" } }]);
+  for (const name of ["managerChatStrip", "managerChatStripPhase", "managerChatStripAge", "managerChatStripQueued"]) elements[name] = fakeElement("div");
   state.managerChatRunning = true;
   const counter = countWrites(elements);
   api.renderManagerChatEvents();
-  assert.equal(counter.writes, 3);
-  const label = flat(elements.managerChatTranscript).find((n) => n.className === "manager-chat-thinking-label");
-  assert.ok(label);
+  // The inline live row is gone: the transcript holds only the placeholder clear and the one event row.
+  assert.equal(counter.writes, 2);
+  assert.equal(flat(elements.managerChatTranscript).filter((n) => n.className === "manager-chat-thinking-label").length, 0);
+  assert.match(elements.managerChatStripPhase.textContent, /^Thinking · \d+s$/);
   state.managerChatThinkingSince -= 5000;
   api.renderManagerChatEvents();
-  assert.equal(counter.writes, 3);
-  assert.equal(label.textContent, "Thinking · 5s");
+  assert.equal(counter.writes, 2);
+  assert.equal(flat(elements.managerChatTranscript).filter((n) => n.className === "manager-chat-thinking-label").length, 0);
+  assert.equal(elements.managerChatStripPhase.textContent, "Thinking · 5s");
 });
 
 test("1500 events build and attach at most limit + 2 transcript rows", () => {

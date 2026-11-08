@@ -3029,7 +3029,7 @@ tbody tr.is-selected td:first-child {
 }
 
 .manager-chat-frame > .manager-chat-transcript {
-  flex: 1 1 auto;
+  flex: 1 1 0;
 }
 
 /* Heading and toolbar are one row each: 72px together at the narrowest sidebar. */
@@ -3490,7 +3490,8 @@ tbody tr.is-selected td:first-child {
   }
 
   #manager-chat-sidebar #manager-chat-reasoning {
-    flex: 0 1 4.5rem;
+    flex: 0 0 auto;
+    field-sizing: content;
   }
 }
 

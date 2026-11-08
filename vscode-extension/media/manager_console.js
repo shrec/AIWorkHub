@@ -180,8 +180,16 @@ function managerChatClockText(event) {
 
 function managerChatThoughtSummary(event) {
   const start = managerChatEventTime(event);
-  const end = managerConsoleCurrentIndex().reasoningEnd.get(event) || 0;
-  if (start && end >= start && end) return "Thought for " + managerChatFormatDuration(end - start);
+  const index = managerConsoleCurrentIndex();
+  const end = index.reasoningEnd.get(event) || 0;
+  if (start && end >= start) {
+    // Claude CLI delivers a reasoning block whole: the time spent is the gap before it, not after.
+    const after = end - start;
+    if (after >= 1000) return "Thought for " + managerChatFormatDuration(after);
+    const before = index.reasoningStart.get(event) || 0;
+    if (before > 0 && start >= before && start - before >= 1000) return "Thought for " + managerChatFormatDuration(start - before);
+    return "Thought";
+  }
   if (state.managerChatRunning && start) return "Thinking · " + managerChatFormatDuration(Date.now() - start);
   if (state.managerChatLastThoughtMs) return "Thought for " + managerChatFormatDuration(state.managerChatLastThoughtMs);
   return state.managerChatRunning ? "Thinking" : "Thought";
@@ -241,22 +249,6 @@ function appendManagerChatToolFields(parent, value, depth) {
   }
 }
 
-function managerChatLiveThinkingNode() {
-  const elapsed = state.managerChatThinkingSince ? Date.now() - state.managerChatThinkingSince : 0;
-  const row = createElement("div", "manager-chat-thinking is-live");
-  const dots = createElement("span", "manager-chat-thinking-dots");
-  dots.setAttribute("aria-hidden", "true");
-  dots.appendChild(createElement("span", ""));
-  dots.appendChild(createElement("span", ""));
-  dots.appendChild(createElement("span", ""));
-  row.appendChild(dots);
-  const label = createElement("span", "manager-chat-thinking-label", "Thinking · " + managerChatFormatDuration(elapsed));
-  label.id = "manager-chat-thinking-elapsed";
-  managerConsoleLiveLabel = label;
-  row.appendChild(label);
-  return row;
-}
-
 function managerChatThinkingKey() {
   // session:turn the running panel waits on -- the latest turn, or the next
   // one once the latest has ended (an optimistic send before its user_message).
@@ -287,7 +279,6 @@ const MANAGER_CONSOLE_ACTIVITY_TYPES = new Set(["tool_call", "tool_result", "com
 // Every event type after which nothing earlier in the log can still be running.
 const MANAGER_CONSOLE_TERMINAL_TYPES = new Set(["turn_end", "turn_stopped", "error", "session_close"]);
 const MANAGER_CONSOLE_LIVE_THOUGHT_PREFIX = "Thinking ·";
-const MANAGER_CONSOLE_LIVE_THINKING_KEY = "extra:live-thinking";
 const MANAGER_CONSOLE_COMMAND_LINES = 20;
 const MANAGER_CONSOLE_DIFF_LINES = 40;
 const MANAGER_CONSOLE_PRETTY_JSON_LIMIT = 64 * 1024;
@@ -496,17 +487,24 @@ function managerConsoleUsage(usage) {
   return { input: input || 0, cache, output: output || 0 };
 }
 
-// One pass over the raw events: per-turn first event and tool ids, and the end time of each reasoning
-// event (the next non-reasoning event). A render builds it once so no row rescans the whole log.
+// One pass over the raw events: per-turn first event and tool ids, the end time of each reasoning
+// event (the next non-reasoning event) and its start (the time of the immediately preceding event of
+// the same turn: Claude CLI delivers a reasoning block whole, so the time spent is the gap before it).
+// A render builds it once so no row rescans the whole log.
 function managerConsoleBuildIndex(events) {
   const turns = new Map();
   const reasoningEnd = new Map();
+  const reasoningStart = new Map();
   let nextEnd = 0;
   for (let cursor = events.length - 1; cursor >= 0; cursor -= 1) {
     const item = events[cursor];
     if (!item) continue;
-    if (item.type === "reasoning") reasoningEnd.set(item, nextEnd);
-    else nextEnd = managerChatEventTime(item);
+    if (item.type === "reasoning") {
+      reasoningEnd.set(item, nextEnd);
+      // A predecessor of another turn is owner idle time, not thinking time.
+      const previous = cursor > 0 ? events[cursor - 1] : null;
+      if (previous && previous.turn === item.turn) reasoningStart.set(item, managerChatEventTime(previous));
+    } else nextEnd = managerChatEventTime(item);
   }
   for (const item of events) {
     if (!item || !Number.isInteger(item.turn)) continue;
@@ -519,7 +517,7 @@ function managerConsoleBuildIndex(events) {
       info.tools.add((item.payload && item.payload.call_id) || "seq:" + item.seq);
     }
   }
-  return { turns, reasoningEnd };
+  return { turns, reasoningEnd, reasoningStart };
 }
 
 function managerConsoleCurrentIndex() {
@@ -576,7 +574,6 @@ function managerConsoleApplyHairline() {
 let managerConsoleLastSignature = null;
 let managerConsoleRenderedLimit = null;
 let managerConsoleActiveIndex = null;
-let managerConsoleLiveLabel = null;
 let managerConsoleLiveSummaries = [];
 // When the streamed text last grew: partial text carries no time of its own.
 let managerConsoleStripPartialKey = "";
@@ -637,11 +634,8 @@ function managerConsoleUpdateStrip() {
   managerConsoleSetText(elements.managerChatStripQueued, queued > 0 ? queued + " queued" : "");
 }
 
-// Only the live Thinking labels and the strip change between identical renders; touch just those nodes.
+// Only the live Thinking summaries and the strip change between identical renders; touch just those nodes.
 function managerConsoleTickThinking() {
-  if (managerConsoleLiveLabel && state.managerChatThinkingSince) {
-    managerConsoleSetText(managerConsoleLiveLabel, "Thinking · " + managerChatFormatDuration(Date.now() - state.managerChatThinkingSince));
-  }
   for (const entry of managerConsoleLiveSummaries) {
     const start = managerChatEventTime(entry.event);
     if (start) managerConsoleSetText(entry.summary, "Thinking · " + managerChatFormatDuration(Date.now() - start));
@@ -662,10 +656,6 @@ function managerConsoleExtraRows() {
   }
   const partialRows = managerConsolePartialRows(state.managerChatPartial);
   if (partialRows.length > 0) return partialRows;
-  if (state.managerChatRunning) {
-    // The elapsed text is ticked in place, so it is not part of the signature.
-    return [{ key: MANAGER_CONSOLE_LIVE_THINKING_KEY, signature: "live", build: managerChatLiveThinkingNode }];
-  }
   if (state.managerChatLastThoughtMs && !state.managerChatEvents.some((item) => item && item.type === "reasoning")) {
     const label = "Thought for " + managerChatFormatDuration(state.managerChatLastThoughtMs);
     return [{ key: "extra:last-thought", signature: label, build: () => createElement("div", "manager-chat-thinking", label) }];
@@ -766,9 +756,12 @@ function managerConsoleEventRows(merged, visible) {
       continue;
     }
     flushPendingTurnEnd();
+    const previousRow = rows.length > 0 ? rows[rows.length - 1] : null;
     // A repeated stop records a second marker; the transcript says Stopped once.
-    const previousRow = rows[rows.length - 1];
     if (event && event.type === "turn_stopped" && previousRow && previousRow.event.type === "turn_stopped") continue;
+    // A handoff stops its own turn: the Handoff requested row already says so.
+    if (event && event.type === "turn_stopped" && previousRow && previousRow.event.type === "handoff_request"
+      && previousRow.event.turn === event.turn) continue;
     // A handoff closes its session for the same reason: one row says so.
     if (event && event.type === "session_close" && previousRow && previousRow.event.type === "handoff_request"
       && String(managerConsolePayload(event).reason || "") === String(managerConsolePayload(previousRow.event).reason || "")) continue;
@@ -994,7 +987,6 @@ function managerConsoleCollectLive(entries, found = []) {
 function managerConsoleForgetRows() {
   if (managerConsoleRows.length > 0) managerConsoleStaleChildren = true;
   managerConsoleRows = [];
-  managerConsoleLiveLabel = null;
   managerConsoleLiveSummaries = [];
 }
 
@@ -1057,7 +1049,6 @@ function renderManagerChatEvents() {
   managerConsoleRenderedLimit = limit;
   managerConsoleLastSignature = managerConsoleRenderSignature(events, limit);
   managerConsoleLiveSummaries = managerConsoleCollectLive(managerConsoleRows);
-  if (!extras.some((row) => row.key === MANAGER_CONSOLE_LIVE_THINKING_KEY)) managerConsoleLiveLabel = null;
   managerConsoleTickThinking();
   if (pool.writes > 0) {
     if (atBottom) box.scrollTop = box.scrollHeight;

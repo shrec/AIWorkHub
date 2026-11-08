@@ -147,22 +147,6 @@
   font-size: var(--fs-2xs);
 }
 
-.manager-chat-thinking-dots {
-  display: inline-flex;
-  gap: 3px;
-}
-
-.manager-chat-thinking-dots span {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--accent);
-  animation: manager-chat-think 1.2s infinite ease-in-out;
-}
-
-.manager-chat-thinking-dots span:nth-child(2) { animation-delay: 0.15s; }
-.manager-chat-thinking-dots span:nth-child(3) { animation-delay: 0.3s; }
-
 .manager-chat-thinking-block,
 .mc-thinking {
   border: 1px solid var(--line);
@@ -177,11 +161,6 @@
   cursor: pointer;
   color: var(--ink-soft);
   font-size: var(--fs-2xs);
-}
-
-@keyframes manager-chat-think {
-  0%, 80%, 100% { opacity: 0.25; transform: translateY(0); }
-  40% { opacity: 1; transform: translateY(-2px); }
 }
 
 .manager-chat-marker {
@@ -200,10 +179,6 @@
   color: var(--ink);
   font-size: var(--fs-2xs);
   overflow-wrap: anywhere;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .manager-chat-thinking-dots span { animation: none; opacity: 0.8; }
 }
 
 .mc-block { display: grid; grid-template-columns: 2ch minmax(0, 1fr); column-gap: 6px; margin: 0 0 6px; position: relative; }
