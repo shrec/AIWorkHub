@@ -7,7 +7,7 @@ under it, or the failing command was already red on its base commit.
 reply was written nowhere durable, so no structured evidence reached the reject.
 
 This module owns both halves. :func:`record_accept_failures` wraps
-``accept_review`` and appends one ``task_events`` row per ``ok: False`` reply,
+``accept_review`` and appends one ``task_events`` row per failed attempt,
 after accept has returned and released the promotion lock.
 :func:`classify_reject` reads the newest such row back for ``reject_review``.
 Only structured data decides: the accept's machine error code, its validation
@@ -47,12 +47,15 @@ _COMBINED_TREE_QUALITY_PREFIX = "combined_tree_quality_failed:"
 _MAX_ERROR_CHARS = 2_000
 _MAX_COMMANDS = 32
 _MAX_PAYLOAD_BYTES = 64 * 1024
+# Another accept holds this request, or its marker is unreadable: this call
+# attempted nothing and must write nothing (NF-2026-01626), so it gets no row.
+_NOT_A_FAILED_ACCEPT = frozenset({"accept_in_progress", "accept_in_flight_marker_unreadable"})
 
 _AcceptFn = TypeVar("_AcceptFn", bound=Callable[..., dict[str, Any]])
 
 
 def record_accept_failures(accept: _AcceptFn) -> _AcceptFn:
-    """Wrap ``accept_review``: pop the private key, record any ``ok: False``."""
+    """Wrap ``accept_review``: pop the private key, record a failed attempt's ``ok: False``."""
 
     @functools.wraps(accept)
     def wrapper(self: Any, request_id: str, task_id: str, **kwargs: Any) -> dict[str, Any]:
@@ -60,7 +63,7 @@ def record_accept_failures(accept: _AcceptFn) -> _AcceptFn:
         if not isinstance(result, dict):
             return result
         results = result.pop(PRIVATE_RESULTS_KEY, None)
-        if result.get("ok") is False:
+        if result.get("ok") is False and result.get("error") not in _NOT_A_FAILED_ACCEPT:
             try:
                 _record_failure(self, request_id, task_id, str(result.get("error") or ""), results)
             except Exception as exc:  # noqa: BLE001 -- recording never changes accept's reply

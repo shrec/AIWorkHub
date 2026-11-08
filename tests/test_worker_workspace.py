@@ -640,6 +640,9 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "runtime_temp.py",
         "windows_file_structures.py",
         "toolchain_authority.py",
+        # toolchain_authority imports the registry remedy text from this sibling
+        # lazily (NF-2026-02166), so the seed closure resolves it too.
+        "validation_spawn_diagnosis.py",
         # worker_workspace imports the grammar mirror relatively (NF-2026-01042).
         "tree_sitter_cache.py",
         "validation_runner.py",

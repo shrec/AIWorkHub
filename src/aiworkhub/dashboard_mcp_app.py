@@ -4219,16 +4219,14 @@ def needfix_transition_view(
     promote_to: str = "",
     needfix_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    """USER WRITE: apply one confirmed lifecycle status transition to a NeedFix item, or to up to 25 in one call.
+    """USER WRITE: apply one confirmed lifecycle transition to one NeedFix or up to 25.
 
-    Use this to triage, accept, reject, defer, mark duplicate or task_planned, resolve, or recover a conversion claim; use the archive, restore, or convert-commit action instead. Requires confirm=True, persists the transition and audit event, and returns a transition receipt.
+    Use this to triage, accept, reject, defer, mark duplicate or task_planned, resolve, or recover a conversion claim; archive, restore and convert have their own tools. Requires confirm=True and returns a transition receipt.
 
-    action=resolve only moves task_created -> resolved; a refused resolve names both routes in resolve_routes. A fix landed without a task uses action=resolve_verified from accepted or task_planned with readiness_score=100, evidence and evidence_refs; a 'commit:<sha>' ref not reachable from HEAD is refused with needfix_resolve_commit_not_reachable:<sha>. A `Resolves: NF-YYYY-NNNNN` trailer on a HEAD-reachable commit also resolves it.
-
-    With needfix_ids the same action, reason, readiness_score and duplicate_parent_id apply to each id through the same gates, and the reply is {results, succeeded, failed}: each result carries its own needfix_id, ok and receipt or error. A refused row leaves the other rows applied; there is no all-or-nothing and no partial row. A malformed list is refused before any row runs.
+    A fix landed without a task uses action=resolve_verified with readiness_score=100, evidence and evidence_refs, or a `Resolves: NF-YYYY-NNNNN` commit trailer. With needfix_ids the reply is {results, succeeded, failed} and a refused row leaves the others applied.
 
     Args:
-        needfix_id: NeedFix ID to transition. Give exactly one of needfix_id and needfix_ids.
+        needfix_id: ID to transition; exactly one of this and needfix_ids.
         action: triage, accept, reject, duplicate, defer, task_planned, resolve, resolve_verified, or recover_conversion_claim.
         reason: note, up to 1000 chars; required for recover_conversion_claim.
         readiness_score: optional score for triage or accept.
@@ -4236,7 +4234,7 @@ def needfix_transition_view(
         confirm: must be True to execute.
         include_item: True adds full item detail.
         promote_to: optional; only "accepted" with action=triage.
-        needfix_ids: Up to 25 distinct NeedFix IDs to apply the same action to, one result per id.
+        needfix_ids: up to 25 distinct IDs, one result per id.
     """
     refusal = mcp_tool_metadata.needfix_ids_refusal(needfix_id, needfix_ids)
     if refusal is not None:

@@ -68,8 +68,9 @@ def test_missing_registry_is_empty_and_builtin_resolution_is_unchanged(env, monk
     monkeypatch.setattr(registry.shutil, "which", _fake_which(git, calls))
     assert registry._resolve_trusted_system_validation_executable("git") == git.resolve()
     assert calls == [("git", None)]
-    with pytest.raises(WorkspaceError, match="validation_executable_not_approved:g\\+\\+"):
-        registry._resolve_trusted_system_validation_executable("g++")
+    # g++ is a built-in since NF-2026-02164; a versioned driver stays registry-only.
+    with pytest.raises(WorkspaceError, match=r"validation_executable_not_approved:clang\+\+-20"):
+        registry._resolve_trusted_system_validation_executable("clang++-20")
     assert registry.toolchain_for_launch(str(git)) is None
 
 
