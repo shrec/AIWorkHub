@@ -528,6 +528,7 @@ test("runTaskRestart sends confirm:true only after the modal choice, and nothing
 function makeFakeElement(tag) {
   const element = {
     tag,
+    tagName: String(tag).toUpperCase(),
     className: "",
     textContent: "",
     hidden: false,
@@ -546,6 +547,22 @@ function makeFakeElement(tag) {
     },
     appendChild(child) {
       this.children.push(child);
+      return child;
+    },
+    insertBefore(child, reference) {
+      if (reference === null) {
+        this.children.push(child);
+        return child;
+      }
+      const index = this.children.indexOf(reference);
+      assert.notEqual(index, -1, "insertBefore reference must be a child");
+      this.children.splice(index, 0, child);
+      return child;
+    },
+    removeChild(child) {
+      const index = this.children.indexOf(child);
+      assert.notEqual(index, -1, "removeChild target must be a child");
+      this.children.splice(index, 1);
       return child;
     },
     append(...nodes) {
@@ -723,12 +740,12 @@ function loadWebviewSlice() {
   vm.createContext(context);
   vm.runInContext(
     `"use strict";\n${utilities}\n${constants}\n${consoleSource}\n${managerChat}\n${managerChatWiring}\n` +
-      "this.api = { managerChatEventNode, renderManagerChatEvents, renderManagerChatEventsResponse, " +
+      "this.api = { managerChatEventNode, renderManagerChatEvents, renderManagerChatEventsResponse, managerConsoleReset, " +
       "renderManagerChatAction, renderManagerChatStatus, requestManagerChatEvents, scheduleManagerChatPoll, " +
       "applyManagerChatSessionUi, applyManagerChatComposerState, managerChatEnabledModels, managerChatSelectedRoute, populateManagerChatModelOptions, applyManagerChatCollapsed, toggleManagerChatSidebar, startManagerChatSidebar };",
     context,
   );
-  return { api: context.api, state, elements, posts, timers, window: windowFake };
+  return { api: context.api, state, elements, posts, timers, window: windowFake, context };
 }
 
 test("manager chat turn_end shows reported token counts", () => {
@@ -2620,4 +2637,369 @@ test("an echo sent with no session survives the send reply that creates the sess
   assert.equal(users.length, 1, "B's user_message replaced the echo");
   assert.equal(users[0].seq, 1);
   assert.equal(users[0].local, undefined);
+});
+
+// ── media/manager_console.js: the transcript reconciles in place ─────────────
+
+const CLOCK_START = Date.parse("2026-11-08T10:00:00Z");
+const SESSION_A = "mls-aaaa1111bbbb2222";
+const SESSION_B = "mls-cccc3333dddd4444";
+
+function transcriptHarness(events, session = SESSION_A) {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = session;
+  harness.state.managerChatEvents = events;
+  harness.box = harness.elements.managerChatTranscript;
+  return harness;
+}
+
+function setClock(harness, ms) {
+  vm.runInContext("Date", harness.context).now = () => ms;
+}
+
+function appendEvents(harness, ...events) {
+  harness.state.managerChatEvents = harness.state.managerChatEvents.concat(events);
+  harness.api.renderManagerChatEvents();
+}
+
+const nodeText = (node) => flattenNodes(node, []).map((part) => String(part.textContent || "")).join("");
+const textEvent = (seq, text = `m${seq}`) => ({ seq, turn: seq, type: "assistant_text", payload: { text } });
+const userEvent = (seq) => ({ seq, turn: 1, type: "user_message", payload: { text: "go" } });
+const reasoningEvent = (seq, ts) => ({ seq, turn: 1, ts, type: "reasoning", payload: { text: `thought ${seq}` } });
+const toolCall = (seq, callId, name) => ({ seq, turn: 1, type: "tool_call", payload: { call_id: callId, name, input: { path: "a.py" } } });
+const toolResult = (seq, callId, isError = false) => ({ seq, turn: 1, type: "tool_result", payload: { call_id: callId, name: "tool", output: "out", is_error: isError } });
+const activityGroups = (harness) => harness.box.children.filter((child) => /\bmc-activity-group\b/.test(child.className));
+const detailsIn = (node) => flattenNodes(node, []).filter((part) => part.tag === "details");
+
+function assertSameRows(actual, expected, label) {
+  assert.equal(actual.length, expected.length, `${label}: row count`);
+  expected.forEach((row, index) => assert.strictEqual(actual[index], row, `${label}: row ${index} is the same object`));
+}
+
+test("one appended event leaves every rendered row in place and adds one row", () => {
+  const harness = transcriptHarness([userEvent(1), textEvent(2), textEvent(3), textEvent(4)]);
+  harness.api.renderManagerChatEvents();
+  const before = harness.box.children.slice();
+  assert.equal(before.length, 4);
+  appendEvents(harness, textEvent(5));
+  assert.equal(harness.box.children.length, 5);
+  assertSameRows(harness.box.children.slice(0, 4), before, "after append");
+  assert.ok(nodeText(harness.box.children[4]).includes("m5"));
+});
+
+test("elements built for one appended event do not grow with the transcript", () => {
+  const appendedElementCount = (size) => {
+    const harness = transcriptHarness(Array.from({ length: size }, (_, index) => textEvent(index + 1)));
+    harness.api.renderManagerChatEvents();
+    let created = 0;
+    const documentFake = harness.context.document;
+    const createOriginal = documentFake.createElement;
+    documentFake.createElement = (tag) => {
+      created += 1;
+      return createOriginal(tag);
+    };
+    appendEvents(harness, textEvent(size + 1));
+    return created;
+  };
+  const small = appendedElementCount(10);
+  assert.ok(small > 0, "the appended row is built");
+  assert.equal(appendedElementCount(300), small);
+});
+
+test("a render with no change performs no DOM write", () => {
+  const harness = transcriptHarness([
+    { seq: 1, turn: 1, ts: CLOCK_START, type: "reasoning", payload: { text: "hm" } },
+    { seq: 2, turn: 1, ts: CLOCK_START + 3000, type: "assistant_text", payload: { text: "done" } },
+  ]);
+  harness.api.renderManagerChatEvents();
+  const box = harness.box;
+  const writes = [];
+  for (const method of ["appendChild", "insertBefore", "removeChild", "replaceChildren"]) {
+    const original = box[method];
+    box[method] = function (...args) {
+      writes.push(method);
+      return original.apply(this, args);
+    };
+  }
+  let scrollTop = box.scrollTop;
+  Object.defineProperty(box, "scrollTop", {
+    get: () => scrollTop,
+    set: (value) => {
+      scrollTop = value;
+      writes.push("scrollTop");
+    },
+  });
+  const snapshot = flattenNodes(box, []).map((node) => [node, node.className, node.textContent, node.open]);
+  const assertUntouched = (label) => {
+    assert.deepEqual(writes, [], label);
+    const now = flattenNodes(box, []);
+    assert.equal(now.length, snapshot.length, label);
+    snapshot.forEach(([node, className, textContent, open], index) => {
+      assert.strictEqual(now[index], node, label);
+      assert.equal(node.className, className, label);
+      assert.equal(node.textContent, textContent, label);
+      assert.equal(node.open, open, label);
+    });
+  };
+  harness.api.renderManagerChatEvents();
+  assertUntouched("the unchanged render exits early");
+  // Passes the early exit, but no row would render differently.
+  harness.state.managerChatLastThoughtMs = 7000;
+  harness.api.renderManagerChatEvents();
+  assertUntouched("the reconcile finds nothing to do");
+});
+
+test("a kept reasoning row keeps ticking after later renders and is not rebuilt by the tick", () => {
+  const harness = transcriptHarness([userEvent(1), reasoningEvent(2, CLOCK_START)]);
+  harness.state.managerChatRunning = true;
+  setClock(harness, CLOCK_START + 3000);
+  harness.api.renderManagerChatEvents();
+  const row = harness.box.children[1];
+  const summary = detailsIn(row)[0].children[0];
+  assert.equal(summary.textContent, "Thinking · 3s");
+  setClock(harness, CLOCK_START + 9000);
+  // Another reasoning event leaves the first one live; only the duration moved.
+  appendEvents(harness, reasoningEvent(3, CLOCK_START + 8000));
+  assert.strictEqual(harness.box.children[1], row, "the duration does not rebuild the row");
+  assert.equal(summary.textContent, "Thinking · 9s");
+  setClock(harness, CLOCK_START + 12000);
+  harness.api.renderManagerChatEvents();
+  assert.equal(summary.textContent, "Thinking · 12s", "a render with no change still ticks the kept row");
+});
+
+test("a reasoning row becomes Thought for when a later event arrives", () => {
+  const harness = transcriptHarness([userEvent(1), reasoningEvent(2, CLOCK_START)]);
+  harness.state.managerChatRunning = true;
+  setClock(harness, CLOCK_START + 1000);
+  harness.api.renderManagerChatEvents();
+  detailsIn(harness.box.children[1])[0].open = false;
+  appendEvents(harness, { seq: 3, turn: 1, ts: CLOCK_START + 3000, type: "assistant_text", payload: { text: "ok" } });
+  const details = detailsIn(harness.box.children[1])[0];
+  assert.equal(details.children[0].textContent, "Thought for 3s");
+  assert.equal(details.open, false, "the owner's closed state survives the rebuild");
+  setClock(harness, CLOCK_START + 20000);
+  harness.api.renderManagerChatEvents();
+  assert.equal(details.children[0].textContent, "Thought for 3s", "a finished thought no longer ticks");
+});
+
+test("a turn_end row follows the later events its footer depends on", () => {
+  const harness = transcriptHarness([toolCall(1, "c1", "read"), { seq: 2, turn: 1, type: "turn_end", payload: {} }]);
+  harness.api.renderManagerChatEvents();
+  const footer = harness.box.children[1];
+  assert.equal(nodeText(footer), "turn 1 · 1 tool");
+  appendEvents(harness, textEvent(3));
+  assert.strictEqual(harness.box.children[1], footer, "an event of another turn leaves the footer alone");
+  appendEvents(harness, toolCall(4, "c2", "grep"));
+  assert.equal(nodeText(harness.box.children[1]), "turn 1 · 2 tools");
+  assert.notStrictEqual(harness.box.children[1], footer);
+});
+
+test("an owner-opened tool row stays open when its result arrives", () => {
+  const harness = transcriptHarness([userEvent(1), toolCall(2, "c1", "read")]);
+  harness.api.renderManagerChatEvents();
+  const running = detailsIn(harness.box.children[1])[0];
+  assert.match(running.children[0].textContent, /running$/);
+  running.open = true;
+  appendEvents(harness, toolResult(3, "c1"));
+  const finished = detailsIn(harness.box.children[1])[0];
+  assert.match(finished.children[0].textContent, /done$/);
+  assert.equal(finished.open, true);
+  assert.equal(harness.box.children.length, 2, "the result merges into its call");
+});
+
+test("a result that adds only undefined fields still moves the row out of running", () => {
+  const harness = transcriptHarness([toolCall(1, "c1", "read")]);
+  harness.api.renderManagerChatEvents();
+  appendEvents(harness, { seq: 2, turn: 1, type: "tool_result", payload: { call_id: "c1", name: "read" } });
+  assert.match(detailsIn(harness.box.children[0])[0].children[0].textContent, /done$/);
+});
+
+test("a tool row starts closed in every status", () => {
+  const harness = transcriptHarness([]);
+  const rows = {
+    running: { name: "read", input: {} },
+    done: { name: "read", input: {}, output: "ok", is_error: false },
+    failed: { name: "read", input: {}, output: "boom", is_error: true },
+  };
+  for (const [status, payload] of Object.entries(rows)) {
+    const details = detailsIn(harness.api.managerChatEventNode({ type: "tool_call", payload }))[0];
+    assert.equal(details.open, false, status);
+    assert.match(details.children[0].textContent, new RegExp(`${status}$`), status);
+  }
+});
+
+test("a run of two tools and a thought renders one closed group", () => {
+  const harness = transcriptHarness([
+    userEvent(1),
+    reasoningEvent(2, CLOCK_START),
+    toolCall(3, "c1", "read"),
+    toolResult(4, "c1"),
+    toolCall(5, "c2", "grep"),
+    toolResult(6, "c2", true),
+  ]);
+  harness.api.renderManagerChatEvents();
+  assert.equal(harness.box.children.length, 2);
+  const [group] = activityGroups(harness);
+  assert.equal(group.tag, "details");
+  assert.equal(group.open, false);
+  assert.equal(group.children[0].tag, "summary");
+  assert.equal(group.children[0].textContent, "2 tools · 1 failed", "reasoning is not counted");
+  assert.match(group.className, /\bhas-failed\b/);
+  assert.equal(group.children[1].children.length, 3, "the thought is a member");
+});
+
+test("a group counts each kind, omits zero counts and names the running row", () => {
+  const harness = transcriptHarness([
+    toolCall(1, "c1", "read"),
+    { seq: 2, turn: 1, type: "command", payload: { call_id: "k1", command: "make", status: "completed", exit_code: 2 } },
+    { seq: 3, turn: 1, type: "file_change", payload: { path: "a.py", added: 1, removed: 0 } },
+    toolResult(4, "c1"),
+    toolCall(5, "c2", "lint"),
+  ]);
+  harness.api.renderManagerChatEvents();
+  const [group] = activityGroups(harness);
+  assert.equal(group.children[0].textContent, "2 tools · 1 command · 1 file · 1 failed · running lint");
+  appendEvents(harness, toolResult(6, "c2"));
+  assert.equal(group.children[0].textContent, "2 tools · 1 command · 1 file · 1 failed");
+});
+
+test("appending to a group keeps the group, its open state and the other members", () => {
+  const harness = transcriptHarness([toolCall(1, "c1", "read"), toolResult(2, "c1"), toolCall(3, "c2", "grep"), toolResult(4, "c2")]);
+  harness.api.renderManagerChatEvents();
+  const [group] = activityGroups(harness);
+  const body = group.children[1];
+  const members = body.children.slice();
+  group.open = true;
+  appendEvents(harness, toolCall(5, "c3", "lint"));
+  assert.deepEqual(activityGroups(harness).length, 1);
+  assert.strictEqual(activityGroups(harness)[0], group);
+  assert.equal(group.open, true);
+  assert.equal(group.children[0].textContent, "3 tools · running lint");
+  assert.strictEqual(group.children[1], body);
+  assert.equal(body.children.length, 3);
+  assertSameRows(body.children.slice(0, 2), members, "group members");
+});
+
+test("a run with one tool stays ungrouped, and any other row ends a run", () => {
+  const single = transcriptHarness([userEvent(1), reasoningEvent(2, CLOCK_START), toolCall(3, "c1", "read")]);
+  single.api.renderManagerChatEvents();
+  assert.equal(activityGroups(single).length, 0);
+  assert.equal(single.box.children.length, 3);
+  const split = transcriptHarness([toolCall(1, "a", "read"), toolCall(2, "b", "read"), textEvent(3), toolCall(4, "c", "read"), toolCall(5, "d", "read")]);
+  split.api.renderManagerChatEvents();
+  assert.equal(activityGroups(split).length, 2);
+  assert.equal(split.box.children.length, 3);
+});
+
+test("a plain row that joins a new group keeps its object and open state", () => {
+  const harness = transcriptHarness([userEvent(1), toolCall(2, "c1", "read")]);
+  harness.api.renderManagerChatEvents();
+  const row = harness.box.children[1];
+  detailsIn(row)[0].open = true;
+  appendEvents(harness, toolCall(3, "c2", "grep"));
+  assert.equal(harness.box.children.length, 2);
+  const [group] = activityGroups(harness);
+  assert.strictEqual(group.children[1].children[0], row);
+  assert.equal(detailsIn(row)[0].open, true);
+  assert.equal(group.open, false);
+});
+
+test("a repeated call id renders separate rows that keep their identity", () => {
+  const harness = transcriptHarness([toolCall(1, "x", "read"), textEvent(2), { ...toolCall(3, "x", "grep"), turn: 2 }]);
+  harness.api.renderManagerChatEvents();
+  const before = harness.box.children.slice();
+  assert.equal(before.length, 3);
+  assert.match(nodeText(before[0]), /read/);
+  assert.match(nodeText(before[2]), /grep/);
+  appendEvents(harness, textEvent(4));
+  assertSameRows(harness.box.children.slice(0, 3), before, "repeated call id");
+});
+
+test("load earlier prepends rows without touching existing row objects", () => {
+  const harness = transcriptHarness(Array.from({ length: 1000 }, (_, index) => textEvent(index + 1)));
+  harness.api.renderManagerChatEvents();
+  const before = harness.box.children.slice();
+  assert.equal(before.length, 401);
+  const earlier = before[0];
+  earlier.listeners.click[0]();
+  assert.equal(harness.box.children.length, 801);
+  assert.strictEqual(harness.box.children[0], earlier, "the button stays while older rows remain");
+  assertSameRows(harness.box.children.slice(-400), before.slice(1), "existing rows");
+  assert.ok(nodeText(harness.box.children[1]).includes("m201"));
+});
+
+test("load earlier extends a group across the window edge without replacing it", () => {
+  const events = Array.from({ length: 450 }, (_, index) => toolCall(index + 1, `c${index}`, "read"));
+  const harness = transcriptHarness(events);
+  harness.api.renderManagerChatEvents();
+  const [group] = activityGroups(harness);
+  group.open = true;
+  const members = group.children[1].children.slice();
+  assert.equal(members.length, 400);
+  harness.box.children[0].listeners.click[0]();
+  assert.equal(harness.box.children.length, 1);
+  assert.strictEqual(harness.box.children[0], group);
+  assert.equal(group.open, true);
+  assert.equal(group.children[1].children.length, 450);
+  assertSameRows(group.children[1].children.slice(-400), members, "group members");
+});
+
+test("a switched or reset session never reuses the previous session's rows", () => {
+  const switched = transcriptHarness([textEvent(1, "same text")]);
+  switched.api.renderManagerChatEvents();
+  const stale = switched.box.children[0];
+  switched.state.managerChatSession = SESSION_B;
+  switched.state.managerChatEvents = [textEvent(1, "same text")];
+  switched.api.renderManagerChatEvents();
+  assert.equal(switched.box.children.length, 1);
+  assert.notStrictEqual(switched.box.children[0], stale);
+  const reset = transcriptHarness([textEvent(1, "same text")]);
+  reset.api.renderManagerChatEvents();
+  const old = reset.box.children[0];
+  reset.api.managerConsoleReset();
+  reset.state.managerChatEvents = [textEvent(1, "same text")];
+  reset.api.renderManagerChatEvents();
+  assert.equal(reset.box.children.length, 1);
+  assert.notStrictEqual(reset.box.children[0], old);
+});
+
+test("the empty state is replaced by rows and comes back when they go", () => {
+  const harness = transcriptHarness([]);
+  harness.api.renderManagerChatEvents();
+  assert.equal(harness.box.children.length, 1);
+  assert.equal(harness.box.children[0].textContent, "No events yet");
+  appendEvents(harness, textEvent(1));
+  assert.equal(harness.box.children.length, 1);
+  assert.ok(nodeText(harness.box.children[0]).includes("m1"));
+  harness.state.managerChatEvents = [];
+  harness.api.renderManagerChatEvents();
+  assert.equal(harness.box.children.length, 1);
+  assert.equal(harness.box.children[0].textContent, "No events yet");
+});
+
+test("the first render clears the placeholder the webview markup ships in the transcript", () => {
+  assert.match(extensionSource, /id="manager-chat-transcript">\s*<div class="panel-list-empty compact" id="manager-chat-empty">/);
+  const harness = transcriptHarness([textEvent(1)]);
+  const placeholder = { textContent: "Write on the selected model to open the first session", children: [] };
+  harness.box.appendChild(placeholder);
+  harness.api.renderManagerChatEvents();
+  assert.equal(harness.box.children.length, 1);
+  assert.notStrictEqual(harness.box.children[0], placeholder);
+  assert.ok(nodeText(harness.box.children[0]).includes("m1"));
+  const row = harness.box.children[0];
+  appendEvents(harness, textEvent(2));
+  assert.strictEqual(harness.box.children[0], row, "only the first render clears the transcript");
+  assert.equal(harness.box.children.length, 2);
+});
+
+test("the latest button adds no net height to the transcript's flex frame", () => {
+  const rule = /\.mc-latest \{([^}]*)\}/.exec(consoleCss)[1];
+  const height = Number(/(?:^|[;\s])height:\s*(\d+)px/.exec(rule)[1]);
+  const marginTop = Number(/margin-top:\s*(-?\d+)px/.exec(rule)[1]);
+  const frame = /\.manager-chat-frame \{([^}]*)\}/.exec(cssSource)[1];
+  const gap = /(?:^|[;\s])(?:row-)?gap:\s*(\d+)px/.exec(frame);
+  assert.ok(height > 0);
+  assert.equal(height + marginTop + (gap ? Number(gap[1]) : 0), 0);
+  assert.match(rule, /z-index:\s*\d+/);
+  assert.match(rule, /align-self:\s*flex-end/);
 });

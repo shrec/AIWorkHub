@@ -224,5 +224,11 @@
 .mc-code-block:hover .mc-copy, .mc-code-block:focus-within .mc-copy { opacity: 1; }
 .mc-time { display: block; margin-bottom: 2px; color: var(--muted); font-size: var(--fs-2xs); }
 .mc-stopped { color: var(--blocked-ink); }
-.mc-latest { position: sticky; bottom: 8px; margin-left: auto; font-size: var(--fs-2xs); }
+/* A flex sibling of the transcript: the negative margin cancels its height, so showing it never resizes the transcript. .manager-chat-frame declares no gap; add any gap it gains to the margin. */
+.mc-latest { position: relative; z-index: 2; flex: 0 0 auto; align-self: flex-end; height: 24px; margin-top: -24px; margin-right: 12px; font-size: var(--fs-2xs); }
+.mc-activity-group { margin: 0 0 6px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface-subtle); }
+.mc-activity-group.has-failed { border-color: var(--blocked); }
+.mc-activity-group > summary { padding: 6px 9px; color: var(--ink-soft); font-size: var(--fs-2xs); cursor: pointer; overflow-wrap: anywhere; }
+.mc-activity-group.has-failed > summary { color: var(--blocked-ink); }
+.mc-activity-body { padding: 0 9px 8px; }
 .mc-thinking { color: var(--ink-soft); }

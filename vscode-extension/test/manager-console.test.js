@@ -18,11 +18,24 @@ function slice(source, start, end) {
 
 function fakeElement(tag) {
   return {
-    tag, className: "", textContent: "", children: [], attrs: {}, listeners: {}, style: {}, hidden: false,
+    tag, tagName: String(tag).toUpperCase(), className: "", textContent: "", children: [], attrs: {}, listeners: {}, style: {}, hidden: false,
     scrollTop: 0, scrollHeight: 0, clientHeight: 0,
     classList: { values: new Set(), toggle(name, on) { on ? this.values.add(name) : this.values.delete(name); } },
     setAttribute(name, value) { this.attrs[name] = String(value); },
     appendChild(child) { this.children.push(child); return child; },
+    insertBefore(child, reference) {
+      if (reference === null) { this.children.push(child); return child; }
+      const index = this.children.indexOf(reference);
+      assert.notEqual(index, -1, "insertBefore reference must be a child");
+      this.children.splice(index, 0, child);
+      return child;
+    },
+    removeChild(child) {
+      const index = this.children.indexOf(child);
+      assert.notEqual(index, -1, "removeChild target must be a child");
+      this.children.splice(index, 1);
+      return child;
+    },
     replaceChildren(...nodes) { this.children = nodes.length === 1 && nodes[0].__isFragment ? nodes[0].children.slice() : nodes; },
     addEventListener(type, fn) { (this.listeners[type] = this.listeners[type] || []).push(fn); },
     remove() { this.removed = true; },
@@ -160,17 +173,17 @@ test("a tool_call paired with its tool_result by call_id merges into one done ro
   assert.equal(flat(node).find((n) => n.tag === "details").open, false);
 });
 
-test("a tool_call with no result yet renders one running, open row", () => {
+test("a tool_call with no result yet renders one running, closed row", () => {
   const { api } = load();
   const node = api.managerChatEventNode({ type: "tool_call", payload: { call_id: "b1", name: "Bash", input: { command: "ls" } } });
   assert.equal(flat(node).filter((n) => n.tag === "details").length, 1);
   const row = flat(node).find((n) => n.tag === "details");
-  assert.equal(row.open, true);
+  assert.equal(row.open, false);
   assert.ok(text(node).includes("running"));
   assert.ok(!text(node).includes("output"));
 });
 
-test("a failed tool_result merges into one failed, open row", () => {
+test("a failed tool_result merges into one failed, closed row", () => {
   const { api } = load();
   const merged = api.managerConsoleMergeTools([
     { seq: 1, turn: 1, type: "tool_call", payload: { call_id: "c1", name: "Bash", input: { command: "false" } } },
@@ -179,7 +192,7 @@ test("a failed tool_result merges into one failed, open row", () => {
   assert.equal(merged.length, 1);
   const node = api.managerChatEventNode(merged[0]);
   const row = flat(node).find((n) => n.tag === "details");
-  assert.equal(row.open, true);
+  assert.equal(row.open, false);
   assert.ok(text(node).includes("failed"));
   assert.ok(text(node).includes("boom"));
 });
@@ -335,8 +348,8 @@ test("partial renders only for a turn that has not finished", () => {
 test("renders coalesce to one DOM write per animation frame", () => {
   const { api, frames, elements } = load([{ seq: 1, turn: 1, type: "assistant_text", payload: { text: "hi" } }]);
   let writes = 0;
-  const original = elements.managerChatTranscript.replaceChildren;
-  elements.managerChatTranscript.replaceChildren = function (...nodes) { writes += 1; return original.apply(this, nodes); };
+  const original = elements.managerChatTranscript.insertBefore;
+  elements.managerChatTranscript.insertBefore = function (...nodes) { writes += 1; return original.apply(this, nodes); };
   for (let i = 0; i < 5; i += 1) api.managerConsoleScheduleRender();
   assert.equal(frames.length, 1);
   frames[0]();
@@ -372,8 +385,8 @@ test("scrolled-up rendering retains position and bottom rendering follows", () =
   box.scrollHeight = 1000;
   box.clientHeight = 100;
   box.scrollTop = 120;
-  const original = box.replaceChildren;
-  box.replaceChildren = function (...nodes) { original.apply(this, nodes); this.scrollHeight += 100; this.scrollTop = 0; };
+  const original = box.insertBefore;
+  box.insertBefore = function (...nodes) { const inserted = original.apply(this, nodes); this.scrollHeight += 100; this.scrollTop = 0; return inserted; };
   api.renderManagerChatEvents();
   assert.equal(box.scrollTop, 120);
   assert.equal(elements.managerChatLatest.hidden, false);
@@ -431,15 +444,18 @@ test("extension.js allowlists copyText and its handler refuses a non-string", ()
   assert.ok(handler.includes("copy_text_invalid"));
 });
 
+// Counts every change to the transcript's own child list.
 function countWrites(elements) {
   const box = elements.managerChatTranscript;
-  const original = box.replaceChildren;
   const counter = { writes: 0 };
-  box.replaceChildren = function (...nodes) { counter.writes += 1; return original.apply(this, nodes); };
+  for (const method of ["appendChild", "insertBefore", "removeChild", "replaceChildren"]) {
+    const original = box[method];
+    box[method] = function (...nodes) { counter.writes += 1; return original.apply(this, nodes); };
+  }
   return counter;
 }
 
-test("a poll that changes nothing does not rebuild the transcript, and a new event does", () => {
+test("a poll that changes nothing does not rebuild the transcript, and a new event adds only its row", () => {
   const events = [
     { seq: 1, turn: 1, type: "user_message", payload: { text: "go" } },
     { seq: 2, turn: 1, type: "assistant_text", payload: { text: "done" } },
@@ -447,13 +463,14 @@ test("a poll that changes nothing does not rebuild the transcript, and a new eve
   const { api, elements, state } = load(events);
   const counter = countWrites(elements);
   api.renderManagerChatEvents();
-  assert.equal(counter.writes, 1);
+  // The first render clears the markup's placeholder once, then writes one row each.
+  assert.equal(counter.writes, 3);
   api.renderManagerChatEvents();
   api.renderManagerChatEvents();
-  assert.equal(counter.writes, 1);
+  assert.equal(counter.writes, 3);
   state.managerChatEvents = events.concat([{ seq: 3, turn: 2, type: "assistant_text", payload: { text: "more" } }]);
   api.renderManagerChatEvents();
-  assert.equal(counter.writes, 2);
+  assert.equal(counter.writes, 4);
 });
 
 test("an unchanged poll while running only ticks the live Thinking label", () => {
@@ -461,12 +478,12 @@ test("an unchanged poll while running only ticks the live Thinking label", () =>
   state.managerChatRunning = true;
   const counter = countWrites(elements);
   api.renderManagerChatEvents();
-  assert.equal(counter.writes, 1);
+  assert.equal(counter.writes, 3);
   const label = flat(elements.managerChatTranscript).find((n) => n.className === "manager-chat-thinking-label");
   assert.ok(label);
   state.managerChatThinkingSince -= 5000;
   api.renderManagerChatEvents();
-  assert.equal(counter.writes, 1);
+  assert.equal(counter.writes, 3);
   assert.equal(label.textContent, "Thinking · 5s");
 });
 
@@ -515,11 +532,17 @@ test("load earlier keeps the previously first visible row where it was", () => {
   box.scrollHeight = 1000;
   box.clientHeight = 100;
   box.scrollTop = 0;
-  const original = box.replaceChildren;
-  box.replaceChildren = function (...nodes) { original.apply(this, nodes); this.scrollHeight += 600; this.scrollTop = 0; };
   api.renderManagerChatEvents();
   assert.ok(text(box.children[1]).includes("m50"));
   box.scrollTop = 0;
+  // The first row this render inserts grows the list and resets the scroll, as layout would.
+  const original = box.insertBefore;
+  let grown = false;
+  box.insertBefore = function (...nodes) {
+    const inserted = original.apply(this, nodes);
+    if (!grown) { grown = true; this.scrollHeight += 600; this.scrollTop = 0; }
+    return inserted;
+  };
   box.children[0].listeners.click[0]();
   api.renderManagerChatEvents();
   assert.equal(box.children.length, 450);
