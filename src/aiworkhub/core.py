@@ -27,6 +27,7 @@ from . import (
     coordinator_config,
     refresh_coordinator_config,
 )
+from . import accept_failure_cause
 from . import base_drift_proof as base_drift_proof_module
 from . import manager_route_probe
 from . import platform_io
@@ -6932,6 +6933,13 @@ def reject_review(
             base_drift_proof, base_drift_error = base_drift_proof_module.base_drift_proof(card, repo_root)
             if base_drift_error is not None:
                 return _lifecycle_error(f"base_drift_unproven:{base_drift_error}")
+    # NF-2026-02171: absent a manager category, a failed accept's durable record decides.
+    accept_failure_category, accept_failure_proof = (
+        accept_failure_cause.classify_reject(card, task_id, _review_identity_request_id(card), repo_root)
+        if explicit_failure_category is None
+        else (None, None)
+    )
+    base_drift_proof = base_drift_proof or accept_failure_proof
     # Keep the exact SQL preimage while artifact I/O happens outside a writer
     # transaction. A later review episode must never receive this snapshot.
     snapshot_conn = _canonical_connect(readonly=True)
@@ -7240,11 +7248,15 @@ def reject_review(
     # the card, so classifying later -- which is when a learning commit runs --
     # can only ever answer "inconclusive". Classify now, pin the answer below.
     terminal_disposition = (
-        explicit_failure_category or classify_terminal_disposition(card).value
+        explicit_failure_category
+        or accept_failure_category
+        or classify_terminal_disposition(card).value
     )
     failure_category_source = (
         "manager_explicit_infrastructure"
         if explicit_failure_category is not None
+        else accept_failure_cause.FAILURE_CATEGORY_SOURCE
+        if accept_failure_category is not None
         else "terminal_evidence"
     )
     # NF-2026-00638: the contract this rejection judged, pinned on the durable

@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from . import __version__
+from . import accept_failure_cause
 from . import manager_skill_tools
 from . import quality_evidence
 from .platform_io import lock_fd, process_is_alive, unlock_fd
@@ -2613,6 +2614,7 @@ def _stale_inputs_touching_candidate(
 # global enters this body unannounced" -- and a name that belongs to neither
 # list is exactly the drift it exists to catch.
 ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
+    "accept_failure_cause",
     "accept_gate_blockers",
     "_accept_in_flight_marker",
     "_finalizer_validation_reuse",
@@ -2680,6 +2682,7 @@ ACCEPT_REVIEW_SEAM_NAMES: tuple[str, ...] = (
 )
 
 
+@accept_failure_cause.record_accept_failures
 def accept_review(
     self,
     request_id: str,
@@ -3319,6 +3322,7 @@ def accept_review(
                     "error": f"revalidation_failed:{exc}",
                     "request_id": request_id,
                     "task_id": task_id,
+                    accept_failure_cause.PRIVATE_RESULTS_KEY: getattr(exc, "results", None),
                 }
 
             quality_gate = {
@@ -3513,6 +3517,7 @@ def accept_review(
                     "error": f"revalidation_failed:{exc}",
                     "request_id": request_id,
                     "task_id": task_id,
+                    accept_failure_cause.PRIVATE_RESULTS_KEY: getattr(exc, "results", None),
                 }
 
             try:
@@ -4356,6 +4361,7 @@ def accept_review(
                 "error": error_message,
                 "request_id": request_id,
                 "task_id": task_id,
+                accept_failure_cause.PRIVATE_RESULTS_KEY: getattr(exc, "results", None),
             }
         except BaseException:
             # Any other exception after the correction write (an OSError from

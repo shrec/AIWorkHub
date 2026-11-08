@@ -1340,6 +1340,68 @@ def _accept(manager):
     )
 
 
+def test_a_revalidation_failure_hands_its_rows_over_and_replies_without_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """NF-2026-02171, through the real body: rows reach the recorder, not the caller."""
+    from aiworkhub import accept_failure_cause
+    from aiworkhub.worker_workspace import ValidationRunError
+
+    manager, _packet = _supplemental_env(
+        tmp_path, monkeypatch,
+        [
+            {"task_id": "QR-C", "request_id": "rq-c", "lens": "correctness",
+             "findings": _BLIND_FINDINGS, "packet": "sealed"},
+            {"task_id": "QR-C-SUPPLEMENTAL-1", "request_id": "rq-c-s1",
+             "lens": "correctness", "findings": [], "packet": "sealed"},
+        ],
+    )
+    rows = [{"command": "true", "returncode": 1}]
+
+    def red(*_args, **_kwargs):
+        raise ValidationRunError("validation_failed:true:rc=1", rows)
+
+    recorded: list[tuple] = []
+    monkeypatch.setattr(process_launcher, "_run_full_snapshot_validations", red)
+    monkeypatch.setattr(
+        accept_failure_cause, "_record_failure", lambda *args: recorded.append(args)
+    )
+
+    result = _accept(manager)
+
+    assert result == {
+        "ok": False,
+        "error": "revalidation_failed:validation_failed:true:rc=1",
+        "request_id": "R-1",
+        "task_id": "T-1",
+    }
+    assert recorded == [(manager, "R-1", "T-1", result["error"], rows)]
+
+
+def test_every_workspace_error_return_hands_over_its_validation_rows():
+    """The three ``revalidation_failed`` returns, including the two research paths."""
+    handlers = [
+        node
+        for node in ast.walk(_moved_function_node())
+        if isinstance(node, ast.ExceptHandler)
+        and isinstance(node.type, ast.Name)
+        and node.type.id == "WorkspaceError"
+        and node.name == "exc"
+    ]
+    carrying = [
+        ret
+        for handler in handlers
+        for ret in ast.walk(handler)
+        if isinstance(ret, ast.Return)
+        and isinstance(ret.value, ast.Dict)
+        and any(
+            isinstance(key, ast.Attribute) and key.attr == "PRIVATE_RESULTS_KEY"
+            for key in ret.value.keys
+        )
+    ]
+    assert len(carrying) == 3
+
+
 def test_supplemental_rounds_completed_counts_only_the_extra_same_lens_reviewers():
     """The first reviewer for a lens IS the review; every later one is a round."""
     rows = [
