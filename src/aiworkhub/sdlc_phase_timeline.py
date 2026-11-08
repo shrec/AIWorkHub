@@ -3,14 +3,22 @@
 Every duration is derived from timestamps and timings the task system already records:
 
 * ``queue``: ``tasks.created_at`` -> ``tasks.claimed_at``.
-* ``worker``: ``tasks.started_at`` -> ``terminal_review.evidence.finished_at`` (worker done).
+* ``worker``: ``tasks.started_at`` -> worker done, the ``finished_at`` minus
+  ``finalization_duration_ms`` of the accepted request's ``review_ready`` ledger row
+  (``terminal_review.evidence.finished_at`` when a card still carries one and the ledger has
+  no row).
 * ``validation``: declared validation rows (``duration_seconds``, a row reused from an earlier
-  run costs nothing here) + finalization neighbour tests (``full_validation_snapshot.
-  neighbour_tests``) + workspace ``provisioning_timings_ms.total``.
+  run costs nothing here) + finalization neighbour tests (``quality_gate.
+  full_validation_snapshot.neighbour_tests``) + workspace ``provisioning_timings_ms.total``.
+  Compaction removes the per-command rows from stored cards; the phase is then the ledger
+  row's ``finalization_phase_durations_ms.validation``, a wall clock around declared and
+  neighbour runs, so it is neither added to the neighbour time nor to provisioning, which
+  happens before the worker and outside finalization.
 * ``finalize_other``: the rest of finalization, worker done -> ``terminal_review.recorded_at``
   (review ready) minus ``validation``.
 * ``reviewers``: review ready -> the last reviewer receipt (card ``reviewer_receipts[].
-  recorded_at`` or a ``reviewer`` attempt row of the process ledger for the same task).
+  recorded_at`` or the ``terminal_review.recorded_at`` of a reviewer card the target's review
+  chains launched).
 * ``manager_wait``: ``manager_ready_at`` -> the accept decision (``accept_evidence.started_at``).
 * ``accept``: the accept decision -> ``accepted_at``.
 
@@ -27,7 +35,7 @@ import sqlite3
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 SCHEMA_ID = "aiworkhub.sdlc_phase_timeline.v1"
@@ -43,7 +51,7 @@ _REMAINDER_TOLERANCE_SECONDS = 0.5
 PERCENTILE_METHOD = "median: midpoint of the two middle values; p90: nearest rank"
 
 _EVIDENCE = "$.terminal_review.evidence"
-_SNAPSHOT = _EVIDENCE + ".full_validation_snapshot"
+_SNAPSHOT = _EVIDENCE + ".quality_gate.full_validation_snapshot"
 _NEIGHBOURS = _SNAPSHOT + ".neighbour_tests"
 # Order is the field order of the decoded json_extract array.
 _CARD_PATHS: tuple[tuple[str, str], ...] = (
@@ -60,6 +68,7 @@ _CARD_PATHS: tuple[tuple[str, str], ...] = (
     ("manager_ready_at", "$.manager_ready_at"),
     ("accept_started_at", "$.accept_evidence.started_at"),
     ("accepted_at", "$.accepted_at"),
+    ("accepted_request_id", "$.accepted_request_id"),
 )
 _TIMELINE_SQL = (
     "SELECT task_id, created_at, claimed_at, started_at, json_valid(card_json), "
@@ -69,15 +78,64 @@ _TIMELINE_SQL = (
     f"CASE WHEN json_valid(card_json) THEN json_type(card_json, '{_NEIGHBOURS}') END "
     "FROM tasks WHERE task_id IN ({})"
 )
+_REVIEW_JOIN_TABLES = ("review_orchestrator_route_attempts", "review_chains")
+_REVIEWER_JOIN_SQL = (
+    "SELECT c.target_task_id, a.reviewer_task_id "
+    "FROM review_orchestrator_route_attempts a "
+    "JOIN review_chains c ON a.chain_id = c.chain_id "
+    "WHERE a.reviewer_request_id <> '' AND c.target_task_id IN ({})"
+)
+_REVIEWER_CARD_SQL = (
+    "SELECT task_id, CASE WHEN json_valid(card_json) THEN "
+    "json_extract(card_json, '$.terminal_review.recorded_at') END "
+    "FROM tasks WHERE task_id IN ({})"
+)
 
 
 @dataclass(frozen=True)
 class PhaseEvidence:
-    """Decided tasks' timeline inputs; ``available`` is False with a typed ``failure``."""
+    """Decided tasks' timeline inputs; ``available`` is False with a typed ``failure``.
+
+    ``reviewer_times`` holds, per target task, the terminal instants of the reviewer cards
+    the review chains launched for it.
+    """
 
     records: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     available: bool = False
     failure: str | None = None
+    reviewer_times: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+
+
+def _read_reviewer_times(
+    conn: sqlite3.Connection, task_ids: Sequence[str], step: int
+) -> dict[str, tuple[str, ...]]:
+    """Reviewer instants per target: route attempts -> review chains -> reviewer cards.
+
+    A store without the review tables has no join, so ``reviewers`` keeps its typed unknown.
+    """
+
+    present = conn.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN (?, ?)",
+        _REVIEW_JOIN_TABLES,
+    ).fetchone()[0]
+    if present != len(_REVIEW_JOIN_TABLES):
+        return {}
+    targets: dict[str, set[str]] = {}
+    for start in range(0, len(task_ids), step):
+        part = task_ids[start:start + step]
+        sql = _REVIEWER_JOIN_SQL.format(",".join("?" * len(part)))
+        for target, reviewer in conn.execute(sql, part):
+            targets.setdefault(str(reviewer), set()).add(str(target))
+    reviewers = sorted(targets)
+    times: dict[str, list[str]] = {}
+    for start in range(0, len(reviewers), step):
+        part = reviewers[start:start + step]
+        sql = _REVIEWER_CARD_SQL.format(",".join("?" * len(part)))
+        for reviewer, recorded_at in conn.execute(sql, part):
+            if isinstance(recorded_at, str) and recorded_at:
+                for target in targets[str(reviewer)]:
+                    times.setdefault(target, []).append(recorded_at)
+    return {target: tuple(sorted(stamps)) for target, stamps in times.items()}
 
 
 def read_phase_evidence(
@@ -115,11 +173,12 @@ def read_phase_evidence(
                         record.update(zip((name for name, _ in _CARD_PATHS), decoded))
                         record["neighbour_present"] = neighbours not in (None, "null")
                 records[str(task_id)] = record
+        reviewer_times = _read_reviewer_times(conn, ids, step)
     except sqlite3.Error:
         return PhaseEvidence(failure="store_error")
     except (ValueError, RecursionError):
         return PhaseEvidence(failure="card_malformed")
-    return PhaseEvidence(records, available=True)
+    return PhaseEvidence(records, available=True, reviewer_times=reviewer_times)
 
 
 def _instant(value: Any) -> datetime | None:
@@ -155,11 +214,19 @@ def _span(record: Mapping[str, Any], start: str, end: str) -> tuple[float | None
     return round(seconds, 3), None
 
 
+def _validation_rows(record: Mapping[str, Any]) -> list[Any] | None:
+    """The card's per-command validation rows; compaction leaves an identity dict instead."""
+
+    for name in ("validations", "validation"):
+        rows = record.get(name)
+        if isinstance(rows, list) and rows:
+            return rows
+    return None
+
+
 def _declared_seconds(record: Mapping[str, Any]) -> float | None:
-    rows = record.get("validations")
-    if not isinstance(rows, list):
-        rows = record.get("validation")
-    if not isinstance(rows, list) or not rows:
+    rows = _validation_rows(record)
+    if rows is None:
         return None
     total = 0.0
     for row in rows:
@@ -194,10 +261,30 @@ def _provisioning_seconds(record: Mapping[str, Any]) -> float | None:
     return None
 
 
+def _ledger_validation_seconds(record: Mapping[str, Any]) -> float | None:
+    """Finalization's measured validation wall, only for a card whose per-command rows are gone."""
+
+    if _validation_rows(record) is not None:
+        return None
+    millis = _seconds(record.get("ledger_validation_ms"))
+    return None if millis is None else millis / 1000.0
+
+
 def _validation_parts(record: Mapping[str, Any]) -> dict[str, float | None]:
+    """The parts of ``validation``; the ledger wall already contains the neighbour run.
+
+    The wall cannot be split without a recorded neighbour time, so ``declared`` is then
+    unknown even though the phase total is measured.
+    """
+
+    declared = _declared_seconds(record)
+    neighbour = _neighbour_seconds(record)
+    wall = _ledger_validation_seconds(record)
+    if wall is not None:
+        declared = None if neighbour is None else max(0.0, wall - neighbour)
     return {
-        "declared": _declared_seconds(record),
-        "neighbour": _neighbour_seconds(record),
+        "declared": declared,
+        "neighbour": neighbour,
         "provisioning": _provisioning_seconds(record),
     }
 
@@ -249,9 +336,12 @@ def derive_card_phases(
     else:
         put("worker", _span(record, "started_at", "worker_done_at"))
         parts = _validation_parts(record)
-        missing = [name for name in VALIDATION_PARTS if parts[name] is None]
+        wall = _ledger_validation_seconds(record)
+        missing = [] if wall is not None else [
+            name for name in VALIDATION_PARTS if parts[name] is None
+        ]
         measured = [value for value in parts.values() if value is not None]
-        validation = None if missing else round(sum(measured), 3)
+        validation = None if missing else round(sum(measured) if wall is None else wall, 3)
         put("validation", (validation, f"{missing[0]}_timing_missing" if missing else None))
         finalization, cause = _span(record, "worker_done_at", "review_ready_at")
         if finalization is not None and validation is None:
@@ -299,23 +389,55 @@ def _p90(values: Sequence[float]) -> float | None:
     return round(ordered[max(0, math.ceil(0.9 * len(ordered)) - 1)], 3)
 
 
-def _reviewer_times(rows: Iterable[Mapping[str, Any]]) -> dict[str, list[Any]]:
-    """Reviewer attempt-row timestamps from the process ledger, keyed by their task."""
+def _latest_review_ready(
+    rows: Iterable[Mapping[str, Any]],
+) -> dict[tuple[str, str], Mapping[str, Any]]:
+    """Each (task, request)'s newest ``review_ready`` ledger row; a retry's row supersedes."""
 
-    times: dict[str, list[Any]] = {}
+    latest: dict[tuple[str, str], tuple[datetime, Mapping[str, Any]]] = {}
+    floor = datetime.min.replace(tzinfo=timezone.utc)
     for row in rows:
-        usage = row.get("usage")
-        if isinstance(usage, Mapping) and usage.get("role") == "reviewer":
-            task_id = str(row.get("task_id") or "")
-            if task_id:
-                times.setdefault(task_id, []).append(row.get("timestamp"))
-    return times
+        key = (str(row.get("task_id") or ""), str(row.get("request_id") or ""))
+        moment = _instant(row.get("finished_at")) or floor
+        if key not in latest or moment > latest[key][0]:
+            latest[key] = (moment, row)
+    return {key: row for key, (_, row) in latest.items()}
+
+
+def _with_ledger_timing(
+    record: Mapping[str, Any] | None,
+    task_id: str,
+    ledger: Mapping[tuple[str, str], Mapping[str, Any]],
+) -> Mapping[str, Any] | None:
+    """``record`` plus its accepted request's finalization timing, when the ledger has it.
+
+    A zero duration means the finalizer's timer never ran, so it measures nothing and is
+    treated as absent rather than as a real zero.
+    """
+
+    if record is None or record.get("card_failure"):
+        return record
+    row = ledger.get((task_id, str(record.get("accepted_request_id") or "")))
+    if row is None:
+        return record
+    merged = dict(record)
+    finished = _instant(row.get("finished_at"))
+    duration = _seconds(row.get("finalization_duration_ms"))
+    if finished is not None and duration:
+        try:
+            merged["worker_done_at"] = (finished - timedelta(milliseconds=duration)).isoformat()
+        except OverflowError:  # a corrupt ledger duration keeps this card a typed unknown
+            pass
+    wall = _seconds(row.get("validation_ms"))
+    if wall:
+        merged["ledger_validation_ms"] = wall
+    return merged
 
 
 def summarize(
     evidence: PhaseEvidence | None,
     task_ids: Sequence[str],
-    attempt_rows: Iterable[Mapping[str, Any]] = (),
+    review_ready_rows: Iterable[Mapping[str, Any]] = (),
     *,
     slowest_limit: int = MAX_SLOWEST_LISTED,
 ) -> dict[str, Any]:
@@ -323,7 +445,7 @@ def summarize(
 
     evidence = evidence if evidence is not None else PhaseEvidence(failure="phase_evidence_unread")
     ids = list(dict.fromkeys(task_ids))
-    reviewers = _reviewer_times(attempt_rows) if evidence.available else {}
+    ledger = _latest_review_ready(review_ready_rows) if evidence.available else {}
     known: dict[str, list[float]] = {name: [] for name in PHASES}
     causes: dict[str, Counter[str]] = {name: Counter() for name in PHASES}
     with_unknown = 0
@@ -331,7 +453,8 @@ def summarize(
     for task_id in ids:
         if evidence.available:
             derived = derive_card_phases(
-                evidence.records.get(task_id), reviewers.get(task_id, ())
+                _with_ledger_timing(evidence.records.get(task_id), task_id, ledger),
+                evidence.reviewer_times.get(task_id, ()),
             )
         else:
             derived = derive_card_phases(None)

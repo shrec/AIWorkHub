@@ -55,6 +55,7 @@ _RISK_TIERS = frozenset({"low", "medium", "high", "critical"})
 _STATUS_TOKEN = re.compile(r"http_status=([0-9]{3})")
 _LABEL = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _ATTEMPT_MARKER = b'"reasoning_context_attempt"'
+_REVIEW_READY_MARKER = b'"finalization_duration_ms"'
 _ROW_FIELDS = (
     "request_id", "task_id", "adapter_id", "model", "timestamp", "failure_kind", "diagnostic",
 )
@@ -116,6 +117,8 @@ class AttemptEvidence:
     byte_bound: int = MAX_LEDGER_BYTES
     oversized_rows: int = 0
     truncation_causes: tuple[str, ...] = ()
+    # Finalization timings of ``review_ready`` rows, read in the same pass as ``rows``.
+    review_ready_rows: tuple[Mapping[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -912,7 +915,8 @@ def aggregate(
         ),
         # Only verified-accepted, whole-history tasks are timed; see sdlc_phase_timeline.
         "phase_timeline": sdlc_phase_timeline.summarize(
-            phase_evidence, tuple(accepted), attempts.rows if attempts is not None else ()
+            phase_evidence, tuple(accepted),
+            attempts.review_ready_rows if attempts is not None else (),
         ),
     }
 
@@ -982,18 +986,36 @@ def _project_attempt_row(row: Mapping[str, Any]) -> dict[str, Any]:
     return projected
 
 
-def _collect_attempt_row(line: bytes, rows: list[dict[str, Any]]) -> None:
+def _project_review_ready_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    durations = row.get("finalization_phase_durations_ms")
+    return {
+        "request_id": row.get("request_id"),
+        "task_id": row.get("task_id"),
+        "finished_at": row.get("finished_at"),
+        "finalization_duration_ms": row.get("finalization_duration_ms"),
+        "validation_ms": durations.get("validation") if isinstance(durations, Mapping) else None,
+    }
+
+
+def _collect_ledger_row(
+    line: bytes,
+    rows: list[dict[str, Any]] | None,
+    review_ready: list[dict[str, Any]] | None,
+) -> None:
+    """Parse one marked line once; a ``None`` target means its marker was not on the line."""
+
     try:
         row = json.loads(line)
     except (ValueError, RecursionError):
         return
-    if (
-        isinstance(row, dict)
-        and isinstance(row.get("request_id"), str)
-        and row["request_id"]
-        and isinstance(row.get("reasoning_context_attempt"), Mapping)
-    ):
+    if not isinstance(row, dict) or not isinstance(row.get("request_id"), str):
+        return
+    if not row["request_id"]:
+        return
+    if rows is not None and isinstance(row.get("reasoning_context_attempt"), Mapping):
         rows.append(_project_attempt_row(row))
+    if review_ready is not None and row.get("state") == "review_ready":
+        review_ready.append(_project_review_ready_row(row))
 
 
 class _RangeScan(NamedTuple):
@@ -1003,6 +1025,7 @@ class _RangeScan(NamedTuple):
     grew: bool
     committed: int
     committed_oversized: int
+    review_ready: list[dict[str, Any]]
 
 
 def _scan_range(path: Path, start: int, size: int, rows: list[dict[str, Any]]) -> _RangeScan:
@@ -1018,6 +1041,7 @@ def _scan_range(path: Path, start: int, size: int, rows: list[dict[str, Any]]) -
     limit = MAX_LEDGER_ROW_BYTES
     consumed = committed = start
     oversized = committed_oversized = 0
+    review_ready: list[dict[str, Any]] = []
     discarded_tail = False
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(fd, "rb") as handle:
@@ -1044,13 +1068,19 @@ def _scan_range(path: Path, start: int, size: int, rows: list[dict[str, Any]]) -
                     discarded_tail = True
             else:
                 committed = consumed
-                if _ATTEMPT_MARKER in line:
-                    _collect_attempt_row(line, rows)
+                attempt = _ATTEMPT_MARKER in line
+                ready = _REVIEW_READY_MARKER in line
+                if attempt or ready:
+                    _collect_ledger_row(
+                        line, rows if attempt else None, review_ready if ready else None
+                    )
         grew = bool(handle.read(1))
-    return _RangeScan(consumed, oversized, discarded_tail, grew, committed, committed_oversized)
+    return _RangeScan(
+        consumed, oversized, discarded_tail, grew, committed, committed_oversized, review_ready
+    )
 
 
-_SEGMENT_CACHE_VERSION = 1
+_SEGMENT_CACHE_VERSION = 2
 _SEGMENT_CACHE_MAX_BYTES = 64 * 1024 * 1024
 _SEGMENT_CACHE_INT_FIELDS = ("size", "mtime_ns", "ino", "row_limit", "committed",
                              "committed_oversized", "oversized")
@@ -1068,11 +1098,13 @@ def _valid_cache_entry(entry: Any) -> bool:
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             return False
     rows = entry.get("rows")
+    ready = entry.get("review_ready")
     return (
         entry["committed"] <= entry["size"]
         and entry["committed_oversized"] <= entry["oversized"]
         and isinstance(rows, list)
-        and all(isinstance(row, dict) for row in rows)
+        and isinstance(ready, list)
+        and all(isinstance(row, dict) for row in (*rows, *ready))
     )
 
 
@@ -1139,6 +1171,7 @@ def read_attempt_evidence(
     cached = _load_segment_cache(cache_path)
     entries: dict[str, dict[str, Any]] = {}
     rows: list[dict[str, Any]] = []
+    review_ready: list[dict[str, Any]] = []
     scanned = bytes_scanned = oversized = 0
     causes: set[str] = set()
     for index in range(len(segments) - 1, -1, -1):
@@ -1149,12 +1182,14 @@ def read_attempt_evidence(
             info = segment.lstat()
             size = info.st_size
             segment_rows: list[dict[str, Any]]
+            segment_ready: list[dict[str, Any]]
             if (
                 _cache_identity(entry, info)
                 and entry["size"] == size
                 and entry["mtime_ns"] == info.st_mtime_ns
             ):
                 segment_rows, skipped = list(entry["rows"]), entry["oversized"]
+                segment_ready = list(entry["review_ready"])
                 changed = entry["discarded_tail"]
                 entries[key] = entry
             else:
@@ -1172,6 +1207,7 @@ def read_attempt_evidence(
                     break
                 segment_rows = list(resume["rows"]) if resume else []
                 scan = _scan_range(segment, start, size, segment_rows)
+                segment_ready = [*(resume["review_ready"] if resume else ()), *scan.review_ready]
                 consumed = scan.end - start
                 skipped = (resume["committed_oversized"] if resume else 0) + scan.oversized
                 changed = scan.discarded_tail or scan.end != size or scan.grew
@@ -1185,13 +1221,14 @@ def read_attempt_evidence(
                             + scan.committed_oversized
                         ),
                         "oversized": skipped, "discarded_tail": scan.discarded_tail,
-                        "rows": segment_rows,
+                        "rows": segment_rows, "review_ready": segment_ready,
                     }
         except OSError:
             # Older segments are still read, so the skipped rows may be any request's newest.
             causes.add("segment_unreadable")
             continue
         rows.extend(segment_rows)
+        review_ready.extend(segment_ready)
         scanned += 1
         oversized += skipped
         if changed:
@@ -1199,7 +1236,7 @@ def read_attempt_evidence(
         if skipped:
             causes.add("oversized_row")
         # A segment is read whole, so the newest rows are never the ones a row bound drops.
-        if len(rows) > MAX_LEDGER_ROWS:
+        if len(rows) > MAX_LEDGER_ROWS or len(review_ready) > MAX_LEDGER_ROWS:
             causes.add("row_bound")
             break
     if cache_path is not None:
@@ -1221,6 +1258,7 @@ def read_attempt_evidence(
         byte_bound=byte_bound,
         oversized_rows=oversized,
         truncation_causes=tuple(sorted(causes)),
+        review_ready_rows=tuple(review_ready),
     )
 
 

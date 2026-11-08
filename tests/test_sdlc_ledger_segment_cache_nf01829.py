@@ -191,8 +191,10 @@ def test_a_live_segment_that_shrank_is_rescanned_from_zero(ledger, reads, monkey
     [
         "not json at all {",
         json.dumps({"version": 999, "segments": {}}),
-        json.dumps({"version": 1, "segments": {"k": {"size": "x"}}}),
-        json.dumps({"version": 1, "segments": []}),
+        # A cache written before review_ready timing was added to the segment payload.
+        json.dumps({"version": 1, "segments": {}}),
+        json.dumps({"version": metrics._SEGMENT_CACHE_VERSION, "segments": {"k": {"size": "x"}}}),
+        json.dumps({"version": metrics._SEGMENT_CACHE_VERSION, "segments": []}),
         json.dumps([1, 2, 3]),
     ],
 )
@@ -240,3 +242,81 @@ def test_a_missing_ledger_creates_no_cache(tmp_path):
     evidence = metrics.read_attempt_evidence(log)
     assert (evidence.available, evidence.rows) == (False, ())
     assert not (tmp_path / "runtime").exists()
+
+
+def _terminal_row(request_id: str, state: str = "review_ready", **extra) -> str:
+    return json.dumps({
+        "request_id": request_id,
+        "task_id": "T-" + request_id,
+        "state": state,
+        "finished_at": "2026-01-01T00:10:00+00:00",
+        "finalization_duration_ms": 5000.5,
+        "finalization_phase_durations_ms": {"validation": 2000.25, "workspace_scope": 1.0},
+        "noise": "z" * 200,
+        **extra,
+    }) + "\n"
+
+
+def _projected(request_id: str) -> dict:
+    return {
+        "request_id": request_id, "task_id": "T-" + request_id,
+        "finished_at": "2026-01-01T00:10:00+00:00",
+        "finalization_duration_ms": 5000.5, "validation_ms": 2000.25,
+    }
+
+
+def test_review_ready_timing_comes_through_the_cache_without_a_rescan(ledger, reads, monkeypatch):
+    # One line carries both markers: it is an attempt row AND a review_ready row.
+    both = _terminal_row("R-c2", reasoning_context_attempt={"id": "R-c2"})
+    ledger.archive(
+        3, _terminal_row("R-c1") + both + _terminal_row("R-c3", state="validation_failed")
+    )
+
+    first = metrics.read_attempt_evidence(ledger.live)
+
+    assert len(reads) == 4
+    assert first.review_ready_rows == (_projected("R-c1"), _projected("R-c2"))
+    assert "R-c2" in [row["request_id"] for row in first.rows]
+    assert "R-c1" not in [row["request_id"] for row in first.rows]
+    payload = json.loads(ledger.cache.read_text(encoding="utf-8"))
+    assert payload["version"] == metrics._SEGMENT_CACHE_VERSION == 2
+    reads.clear()
+
+    warm = metrics.read_attempt_evidence(ledger.live)
+
+    assert reads == [] and warm.bytes_scanned == 0
+    assert warm.review_ready_rows == first.review_ready_rows
+    cold = _cold(ledger, monkeypatch)
+    _same_result(warm, cold)
+    assert warm.review_ready_rows == cold.review_ready_rows
+
+
+def test_review_ready_rows_survive_an_incremental_live_resume(ledger, reads, monkeypatch):
+    ledger.append('oning_context_attempt": {"id": "x"}}\n' + _terminal_row("R-l5"))
+    metrics.read_attempt_evidence(ledger.live)
+    committed = ledger.live.stat().st_size
+    ledger.append(_terminal_row("R-l6"))
+    size = ledger.live.stat().st_size
+    reads.clear()
+
+    warm = metrics.read_attempt_evidence(ledger.live)
+
+    assert reads == [(ledger.live.name, committed, size)]
+    assert warm.review_ready_rows == (_projected("R-l5"), _projected("R-l6"))
+    assert warm.review_ready_rows == _cold(ledger, monkeypatch).review_ready_rows
+
+
+def test_a_cache_entry_without_review_ready_rows_is_rebuilt(ledger, reads, monkeypatch):
+    metrics.read_attempt_evidence(ledger.live)
+
+    def strip(segments):
+        for entry in segments.values():
+            del entry["review_ready"]
+
+    _rewrite_cache(ledger, strip)
+    reads.clear()
+
+    rebuilt = metrics.read_attempt_evidence(ledger.live)
+
+    assert len(reads) == 3
+    _same_result(rebuilt, _cold(ledger, monkeypatch))

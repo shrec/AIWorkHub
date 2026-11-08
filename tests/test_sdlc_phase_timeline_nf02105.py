@@ -9,7 +9,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from aiworkhub import sdlc_outcome_metrics, sdlc_phase_timeline, task_engine, task_store
+from aiworkhub import (
+    review_lifecycle,
+    review_orchestrator,
+    sdlc_outcome_metrics,
+    sdlc_phase_timeline,
+    task_engine,
+    task_store,
+)
 
 _REPO = "repo-one"
 _T0 = datetime(2026, 11, 1, tzinfo=timezone.utc)
@@ -43,91 +50,136 @@ def _receipt(task_id: str, request_id: str) -> dict:
 
 
 def _timeline_card(
-    *, queue, worker, finalization, reviewers, manager_wait, accept, declared,
+    *, task_id, queue, worker, finalization, reviewers, manager_wait, accept, declared,
     neighbour=None, rerun=None, provisioning_ms=None, workspace_ms=None,
-    manager_ready=True, reused_row=False,
+    manager_ready=True, ledger=True, reviewer_join=True, snapshot=True,
 ):
-    """Columns plus a card whose recorded timestamps give exactly the named phase durations."""
+    """The real stored shape: compacted validation, a quality_gate snapshot, a ledger row.
+
+    ``evidence.validation`` is compaction's identity stand-in, the per-command list and a
+    card-side ``finished_at`` do not exist, and ``accept_evidence.started_at`` is never written.
+    """
 
     claimed = queue
     worker_done = claimed + worker
     review_ready = worker_done + finalization
     last_reviewer = review_ready + reviewers
     manager_ready_at = last_reviewer + 10
-    accept_started = manager_ready_at + manager_wait
-    rows = [{"command": "pytest -q", "duration_seconds": declared}]
-    if reused_row:
-        rows.append({"command": "ruff", "duration_seconds": 999, "reused_from": "worker"})
-    snapshot: dict = {"schema_id": "aiworkhub.full_validation_snapshot.v1"}
-    if neighbour is not None:
-        snapshot["neighbour_tests"] = {"duration_seconds": neighbour, "passed": True}
-        if rerun is not None:
-            snapshot["neighbour_tests"]["neighbour_flaky_rerun"] = {"duration_seconds": rerun}
+    accepted_at = manager_ready_at + manager_wait + accept
+    wall = declared + (neighbour or 0) + (rerun or 0)
     evidence: dict = {
-        "finished_at": _at(worker_done),
-        "validations": rows,
-        "full_validation_snapshot": snapshot,
+        "validation": {
+            "summarized": True, "bytes": 90_000, "sha256": "b" * 64,
+            "durable_attempt_id": f"R-{task_id}", "durable_manifest_sha256": "c" * 64,
+        },
         "workspace": {"base_oid": "base"},
     }
+    if snapshot:
+        full: dict = {"schema_id": "aiworkhub.full_validation_snapshot.v1"}
+        if neighbour is not None:
+            full["neighbour_tests"] = {"duration_seconds": neighbour, "passed": True}
+            if rerun is not None:
+                full["neighbour_tests"]["neighbour_flaky_rerun"] = {"duration_seconds": rerun}
+        evidence["quality_gate"] = {"full_validation_snapshot": full}
     if workspace_ms is not None:
         evidence["workspace"]["provisioning_timings_ms"] = {"total": workspace_ms}
     if provisioning_ms is not None:
         evidence["provisioning_timings_ms"] = {"total": provisioning_ms, "seed_closure": 1.0}
     card = {
+        "task_id": task_id,
+        "accepted_request_id": f"R-{task_id}",
         "terminal_review": {"recorded_at": _at(review_ready), "evidence": evidence},
-        "reviewer_receipts": [
-            {"lens": "previous_round", "recorded_at": _at(review_ready - 5000)},
-            {"lens": "correctness", "recorded_at": _at(review_ready + reviewers / 2)},
-            {"lens": "security", "recorded_at": _at(last_reviewer)},
-        ],
-        "accept_evidence": {"started_at": _at(accept_started)},
-        "accepted_at": _at(accept_started + accept),
+        "accepted_at": _at(accepted_at),
     }
     if manager_ready:
         card["manager_ready_at"] = _at(manager_ready_at)
     return {
         "created_at": _at(0), "claimed_at": _at(claimed), "started_at": _at(claimed),
         "card": card,
+        "ledger": {
+            "request_id": f"R-{task_id}", "task_id": task_id, "state": "review_ready",
+            "finished_at": _at(review_ready),
+            "finalization_duration_ms": finalization * 1000.0,
+            "finalization_phase_durations_ms": {
+                "workspace_scope": 12.5, "validation": wall * 1000.0,
+                "evidence_and_transition": 40.0,
+            },
+        } if ledger else None,
+        "reviewer_cards": [
+            ("previous", _at(review_ready - 5000), f"R-prev-{task_id}"),
+            ("correctness", _at(review_ready + reviewers / 2), f"R-corr-{task_id}"),
+            ("security", _at(last_reviewer), f"R-sec-{task_id}"),
+        ] if reviewer_join else [],
     }
 
 
-# A: 450 s validation (100 declared, 250+50 neighbour incl. flaky rerun, 50 provisioning).
+# A: a 400 s validation wall (100 declared, 250+50 neighbour incl. flaky rerun).
 # B: no neighbours selected, so neighbour time is a measured 0 rather than unknown.
 # C: the NF-2026-02089-c1 shape (1821 s finalization) with manager_ready_at never recorded.
 _CARDS = {
     "TASK-A": _timeline_card(
-        queue=60, worker=600, finalization=1000, reviewers=900, manager_wait=120, accept=30,
-        declared=100, neighbour=250, rerun=50, workspace_ms=50_000, reused_row=True,
+        task_id="TASK-A", queue=60, worker=600, finalization=1000, reviewers=900,
+        manager_wait=120, accept=30, declared=100, neighbour=250, rerun=50, workspace_ms=50_000,
     ),
     "TASK-B": _timeline_card(
-        queue=120, worker=300, finalization=100, reviewers=600, manager_wait=240, accept=60,
-        declared=50, provisioning_ms=20_000,
+        task_id="TASK-B", queue=120, worker=300, finalization=100, reviewers=600,
+        manager_wait=240, accept=60, declared=50, provisioning_ms=20_000,
     ),
     "TASK-C": _timeline_card(
-        queue=30, worker=1200, finalization=1821, reviewers=1200, manager_wait=300, accept=90,
-        declared=200, neighbour=600, workspace_ms=30_600, manager_ready=False,
+        task_id="TASK-C", queue=30, worker=1200, finalization=1821, reviewers=1200,
+        manager_wait=300, accept=90, declared=200, neighbour=600, workspace_ms=30_600,
+        manager_ready=False,
     ),
 }
 
 
-def _seed(root, cards):
+def _insert_task(conn, task_id, card_json, created_at, claimed_at, started_at):
+    conn.execute(
+        "INSERT INTO tasks (task_id, card_json, created_at, updated_at, claimed_at, "
+        "started_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (task_id, card_json, created_at, created_at, claimed_at, started_at),
+    )
+
+
+def _seed_reviewers(conn, task_id, row):
+    cursor = conn.execute(
+        "INSERT INTO review_chains (target_task_id, target_request_id, claim_epoch, "
+        "packet_sha256, candidate_sha256, chain_identity_json, chain_identity_sha256, "
+        "created_at) VALUES (?, ?, '1', 'p', 'c', '{}', ?, ?)",
+        (task_id, f"R-{task_id}", f"identity-{task_id}", row["created_at"]),
+    )
+    for attempt, (lens, recorded_at, request_id) in enumerate(row["reviewer_cards"], start=1):
+        reviewer_task = f"REVIEW-{task_id}-{lens}"
+        _insert_task(
+            conn, reviewer_task, json.dumps({"terminal_review": {"recorded_at": recorded_at}}),
+            row["created_at"], row["created_at"], row["created_at"],
+        )
+        conn.execute(
+            "INSERT INTO review_orchestrator_route_attempts (chain_id, lens, attempt_index, "
+            "reviewer_task_id, reviewer_request_id, runner, adapter_id, model, state) "
+            "VALUES (?, ?, ?, ?, ?, 'runner', 'adapter', 'model', 'launched')",
+            (cursor.lastrowid, lens, attempt, reviewer_task, request_id),
+        )
+
+
+def _seed(root, cards, *, reviewer_tables=True):
     root.mkdir()
     db = root / "tasks.db"
     conn = sqlite3.connect(str(db))
     try:
         conn.executescript(task_store.SCHEMA)
         task_store.ensure_event_indexes(conn)
+        if reviewer_tables:
+            conn.executescript(review_lifecycle.SCHEMA)
+            conn.execute(review_orchestrator.ROUTE_ATTEMPT_TABLE)
         for index, (task_id, row) in enumerate(sorted(cards.items()), start=1):
             card = row["card"]
-            conn.execute(
-                "INSERT INTO tasks (task_id, card_json, created_at, updated_at, claimed_at, "
-                "started_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    task_id,
-                    card if isinstance(card, str) else json.dumps(card),
-                    row["created_at"], row["created_at"], row["claimed_at"], row["started_at"],
-                ),
+            _insert_task(
+                conn, task_id, card if isinstance(card, str) else json.dumps(card),
+                row["created_at"], row["claimed_at"], row["started_at"],
             )
+            if reviewer_tables:
+                _seed_reviewers(conn, task_id, row)
             payload = {
                 "request_id": f"R-{task_id}",
                 "accepted_outcome_receipt": _receipt(task_id, f"R-{task_id}"),
@@ -143,9 +195,17 @@ def _seed(root, cards):
     return db
 
 
-def _metrics(tmp_path, monkeypatch, cards, name="repo"):
+def _write_ledger(root, cards):
+    log = root.joinpath(*sdlc_outcome_metrics.PROCESS_LEDGER_REL)
+    log.parent.mkdir(parents=True)
+    rows = [row["ledger"] for _, row in sorted(cards.items()) if row.get("ledger")]
+    log.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def _metrics(tmp_path, monkeypatch, cards, name="repo", *, reviewer_tables=True):
     root = tmp_path / name
-    db = _seed(root, cards)
+    db = _seed(root, cards, reviewer_tables=reviewer_tables)
+    _write_ledger(root, cards)
     monkeypatch.setattr(
         task_store, "storage_readiness",
         lambda _root: SimpleNamespace(ready=True, reason="", canonical_db=db),
@@ -153,22 +213,24 @@ def _metrics(tmp_path, monkeypatch, cards, name="repo"):
     return sdlc_outcome_metrics.read_repository_metrics(root, repository_id=_REPO, limit=100)
 
 
-def test_derive_card_phases_splits_seeded_timestamps_into_exact_durations():
-    row = _CARDS["TASK-C"]
-    evidence = row["card"]["terminal_review"]["evidence"]
+def test_a_card_that_still_has_per_command_rows_ignores_the_ledger_wall():
     record = {
-        "created_at": row["created_at"], "claimed_at": row["claimed_at"],
-        "started_at": row["started_at"], "card_failure": None,
-        "review_ready_at": row["card"]["terminal_review"]["recorded_at"],
-        "worker_done_at": evidence["finished_at"],
-        "validations": evidence["validations"],
-        "snapshot_schema": evidence["full_validation_snapshot"]["schema_id"],
+        "created_at": _at(0), "claimed_at": _at(30), "started_at": _at(30),
+        "card_failure": None,
+        "review_ready_at": _at(3051),
+        "worker_done_at": _at(1230),
+        "validations": [
+            {"command": "pytest -q", "duration_seconds": 200},
+            {"command": "ruff", "duration_seconds": 999, "reused_from": "worker"},
+        ],
+        "ledger_validation_ms": 7_000_000.0,
+        "snapshot_schema": "aiworkhub.full_validation_snapshot.v1",
         "neighbour_present": True,
         "neighbour_seconds": 600,
         "workspace_provisioning_ms": 30_600,
-        "reviewer_receipts": row["card"]["reviewer_receipts"],
-        "accept_started_at": row["card"]["accept_evidence"]["started_at"],
-        "accepted_at": row["card"]["accepted_at"],
+        "reviewer_receipts": [{"recorded_at": _at(3051 + 1200)}],
+        "accept_started_at": _at(4561),
+        "accepted_at": _at(4651),
     }
     derived = sdlc_phase_timeline.derive_card_phases(record)
     assert derived["phases"] == {
@@ -180,10 +242,10 @@ def test_derive_card_phases_splits_seeded_timestamps_into_exact_durations():
     }
     # A missing manager_ready_at is UNKNOWN with its cause, never a zero wait.
     assert derived["causes"] == {"manager_wait": "manager_ready_at_missing"}
-    assert derived["total_seconds"] == 30 + 1200 + 1821 + 1200 + 10 + 300 + 90
+    assert derived["total_seconds"] == 4651
 
 
-def test_repository_metrics_carry_phase_median_p90_and_bounded_slowest_cards(
+def test_repository_metrics_carry_real_phase_seconds_from_the_stored_shape(
     tmp_path, monkeypatch
 ):
     result = _metrics(tmp_path, monkeypatch, _CARDS)
@@ -199,63 +261,173 @@ def test_repository_metrics_carry_phase_median_p90_and_bounded_slowest_cards(
     assert summary == {
         "queue": (3, 0, 60.0, 120.0),
         "worker": (3, 0, 600.0, 1200.0),
-        "validation": (3, 0, 450.0, 830.6),
-        "finalize_other": (3, 0, 550.0, 990.4),
+        "validation": (3, 0, 400.0, 800.0),
+        "finalize_other": (3, 0, 600.0, 1021.0),
         "reviewers": (3, 0, 900.0, 1200.0),
-        "manager_wait": (2, 1, 180.0, 240.0),
-        "accept": (3, 0, 60.0, 90.0),
+        "manager_wait": (0, 3, None, None),
+        "accept": (0, 3, None, None),
     }
+    # accept_started_at is written nowhere, so these stay typed unknowns, never zero.
     assert timeline["phases"]["manager_wait"]["unknown_causes"] == {
-        "manager_ready_at_missing": 1,
+        "accept_started_at_missing": 2, "manager_ready_at_missing": 1,
     }
-    assert timeline["unknowns"] == {"cards_with_unknown_phase": 1, "phase_values_unknown": 1}
+    assert timeline["phases"]["accept"]["unknown_causes"] == {"accept_started_at_missing": 3}
+    assert timeline["unknowns"] == {"cards_with_unknown_phase": 3, "phase_values_unknown": 6}
     slowest = timeline["slowest_cards"]
     assert [entry["task_id"] for entry in slowest] == ["TASK-C", "TASK-A", "TASK-B"]
     assert [entry["total_seconds"] for entry in slowest] == [4651.0, 2720.0, 1430.0]
     assert slowest[0]["phases"]["manager_wait"] == sdlc_phase_timeline.UNKNOWN
-    assert slowest[0]["phases"]["accept"] == 90.0
+    assert slowest[0]["phases"]["accept"] == sdlc_phase_timeline.UNKNOWN
+    # The ledger wall already contains the neighbour run, so it is not counted twice.
+    assert slowest[1]["phases"]["validation"] == 400.0
     assert slowest[1]["validation_parts"] == {
         "declared": 100.0, "neighbour": 300.0, "provisioning": 50.0,
     }
-    assert slowest[2]["validation_parts"]["neighbour"] == 0.0
+    assert slowest[2]["validation_parts"] == {
+        "declared": 50.0, "neighbour": 0.0, "provisioning": 20.0,
+    }
     assert (timeline["slowest_truncated"], timeline["unranked_total_unknown"]) == (False, 0)
     # The existing outcome metrics are unchanged by the new section.
     assert result["first_pass_acceptance"]["denominator"] == 3
 
 
-def test_missing_validation_timing_is_unknown_and_never_folded_into_finalize_other(
+def test_no_ledger_row_snapshot_or_reviewer_join_keeps_every_phase_typed_unknown(
     tmp_path, monkeypatch
 ):
     row = _timeline_card(
-        queue=10, worker=20, finalization=30, reviewers=40, manager_wait=50, accept=60,
-        declared=5, workspace_ms=1_000,
+        task_id="TASK-D", queue=10, worker=20, finalization=30, reviewers=40, manager_wait=50,
+        accept=60, declared=5, workspace_ms=1_000, ledger=False, reviewer_join=False,
+        snapshot=False,
     )
-    del row["card"]["terminal_review"]["evidence"]["full_validation_snapshot"]
-    del row["card"]["reviewer_receipts"]
     timeline = _metrics(tmp_path, monkeypatch, {"TASK-D": row})["phase_timeline"]
     phases = timeline["phases"]
-    assert phases["validation"]["unknown_causes"] == {"neighbour_timing_missing": 1}
-    assert phases["finalize_other"]["unknown_causes"] == {"validation_unknown": 1}
+    assert phases["worker"]["unknown_causes"] == {"worker_done_at_missing": 1}
+    assert phases["validation"]["unknown_causes"] == {"declared_timing_missing": 1}
+    assert phases["finalize_other"]["unknown_causes"] == {"worker_done_at_missing": 1}
     assert phases["reviewers"]["unknown_causes"] == {"last_reviewer_at_missing": 1}
-    for name in ("validation", "finalize_other", "reviewers"):
+    for name in ("worker", "validation", "finalize_other", "reviewers"):
         assert (phases[name]["known"], phases[name]["median_seconds"]) == (0, None)
-    assert timeline["slowest_cards"][0]["validation_parts"]["neighbour"] == "UNKNOWN"
+    parts = timeline["slowest_cards"][0]["validation_parts"]
+    assert (parts["declared"], parts["neighbour"]) == ("UNKNOWN", "UNKNOWN")
+    assert phases["queue"]["median_seconds"] == 10.0
+
+
+def test_a_ledger_wall_without_a_snapshot_is_a_real_total_with_an_unknown_split(
+    tmp_path, monkeypatch
+):
+    # Compaction may fold quality_gate as well, taking the snapshot with it.
+    row = _timeline_card(
+        task_id="TASK-E", queue=10, worker=20, finalization=30, reviewers=40, manager_wait=50,
+        accept=60, declared=12, workspace_ms=1_000, snapshot=False,
+    )
+    timeline = _metrics(tmp_path, monkeypatch, {"TASK-E": row})["phase_timeline"]
+    phases = timeline["phases"]
+    assert phases["validation"]["median_seconds"] == 12.0
+    assert phases["finalize_other"]["median_seconds"] == 18.0
+    assert phases["worker"]["median_seconds"] == 20.0
+    assert timeline["slowest_cards"][0]["validation_parts"] == {
+        "declared": "UNKNOWN", "neighbour": "UNKNOWN", "provisioning": 1.0,
+    }
+
+
+def test_a_zero_ledger_timing_measured_nothing_and_stays_unknown(tmp_path, monkeypatch):
+    row = _timeline_card(
+        task_id="TASK-Z", queue=10, worker=20, finalization=30, reviewers=40, manager_wait=50,
+        accept=60, declared=5, workspace_ms=1_000,
+    )
+    row["ledger"]["finalization_phase_durations_ms"]["validation"] = 0.0
+    timeline = _metrics(tmp_path, monkeypatch, {"TASK-Z": row})["phase_timeline"]
+    phases = timeline["phases"]
+    assert phases["validation"]["unknown_causes"] == {"declared_timing_missing": 1}
+    assert phases["finalize_other"]["unknown_causes"] == {"validation_unknown": 1}
     assert phases["worker"]["median_seconds"] == 20.0
 
 
-def test_reviewer_receipts_also_come_from_reviewer_attempt_rows():
+def test_ledger_rows_of_another_request_or_task_are_not_used():
+    record = {
+        "created_at": _at(0), "claimed_at": _at(1), "started_at": _at(1),
+        "card_failure": None, "review_ready_at": _at(100), "accepted_request_id": "R-T",
+    }
+    evidence = sdlc_phase_timeline.PhaseEvidence({"T": record}, available=True)
+    timing = {
+        "finished_at": _at(100), "finalization_duration_ms": 50_000.0, "validation_ms": 10_000.0,
+    }
+    summary = sdlc_phase_timeline.summarize(evidence, ["T"], [
+        {"task_id": "T", "request_id": "R-older", **timing},
+        {"task_id": "OTHER", "request_id": "R-T", **timing},
+    ])
+    assert summary["phases"]["worker"]["unknown_causes"] == {"worker_done_at_missing": 1}
+    assert summary["phases"]["validation"]["unknown_causes"] == {"declared_timing_missing": 1}
+
+
+def test_an_out_of_range_ledger_duration_stays_a_typed_unknown():
+    record = {
+        "created_at": _at(0), "claimed_at": _at(1), "started_at": _at(1),
+        "card_failure": None, "review_ready_at": _at(100), "accepted_request_id": "R-T",
+    }
+    evidence = sdlc_phase_timeline.PhaseEvidence({"T": record}, available=True)
+    summary = sdlc_phase_timeline.summarize(evidence, ["T"], [
+        {"task_id": "T", "request_id": "R-T", "finished_at": _at(100),
+         "finalization_duration_ms": 1e30},
+    ])
+    assert summary["phases"]["worker"]["unknown_causes"] == {"worker_done_at_missing": 1}
+
+
+def test_a_retried_finalization_uses_the_newest_review_ready_row():
+    record = {
+        "created_at": _at(0), "claimed_at": _at(1), "started_at": _at(1),
+        "card_failure": None, "review_ready_at": _at(200), "accepted_request_id": "R-T",
+    }
+    evidence = sdlc_phase_timeline.PhaseEvidence({"T": record}, available=True)
+    row = {"task_id": "T", "request_id": "R-T"}
+    summary = sdlc_phase_timeline.summarize(evidence, ["T"], [
+        {**row, "finished_at": _at(200), "finalization_duration_ms": 100_000.0,
+         "validation_ms": 40_000.0},
+        {**row, "finished_at": _at(90), "finalization_duration_ms": 80_000.0,
+         "validation_ms": 9_000.0},
+    ])
+    assert summary["phases"]["worker"]["median_seconds"] == 99.0
+    assert summary["phases"]["validation"]["median_seconds"] == 40.0
+
+
+def test_reviewer_time_is_attributed_to_the_target_through_the_chain_join(tmp_path, monkeypatch):
+    row = _timeline_card(
+        task_id="TASK-R", queue=10, worker=20, finalization=30, reviewers=40, manager_wait=50,
+        accept=60, declared=5, workspace_ms=1_000,
+    )
+    ready = 10 + 20 + 30
+    row["reviewer_cards"] = [
+        # An earlier round's review of the same target is not this attempt's review.
+        ("previous", _at(ready - 5000), "R-previous"),
+        ("correctness", _at(ready + 15), "R-correctness"),
+        ("security", _at(ready + 40), "R-security"),
+        # Planned but never launched: no request id, so it never counts.
+        ("planned", _at(ready + 9000), ""),
+    ]
+    timeline = _metrics(tmp_path, monkeypatch, {"TASK-R": row})["phase_timeline"]
+    assert timeline["phases"]["reviewers"]["median_seconds"] == 40.0
+    assert timeline["phases"]["reviewers"]["unknown"] == 0
+
+
+def test_a_store_without_review_tables_keeps_reviewers_a_typed_unknown(tmp_path, monkeypatch):
+    timeline = _metrics(
+        tmp_path, monkeypatch, _CARDS, reviewer_tables=False
+    )["phase_timeline"]
+    assert timeline["available"] is True
+    assert timeline["phases"]["reviewers"]["unknown_causes"] == {"last_reviewer_at_missing": 3}
+    assert timeline["phases"]["reviewers"]["median_seconds"] is None
+    assert timeline["phases"]["worker"]["known"] == 3
+
+
+def test_a_reviewer_ledger_row_is_never_credited_to_its_own_card():
     record = {
         "created_at": _at(0), "claimed_at": _at(1), "started_at": _at(1),
         "card_failure": None, "review_ready_at": _at(100),
     }
     evidence = sdlc_phase_timeline.PhaseEvidence({"T": record}, available=True)
-    rows = [
-        {"task_id": "T", "timestamp": _at(160), "usage": {"role": "reviewer"}},
-        {"task_id": "T", "timestamp": _at(400), "usage": {"role": "worker"}},
-        {"task_id": "T", "timestamp": _at(50), "usage": {"role": "reviewer"}},
-    ]
+    rows = [{"task_id": "T", "timestamp": _at(160), "usage": {"role": "reviewer"}}]
     summary = sdlc_phase_timeline.summarize(evidence, ["T"], rows)
-    assert summary["phases"]["reviewers"]["median_seconds"] == 60.0
+    assert summary["phases"]["reviewers"]["unknown_causes"] == {"last_reviewer_at_missing": 1}
 
 
 def test_unreadable_store_and_malformed_cards_fail_closed_as_unknown(tmp_path, monkeypatch):
@@ -286,8 +458,8 @@ def test_chunked_read_and_slowest_bound():
         conn.executescript(task_store.SCHEMA)
         for index in range(5):
             row = _timeline_card(
-                queue=index + 1, worker=10, finalization=10, reviewers=10, manager_wait=10,
-                accept=10, declared=1, workspace_ms=1_000,
+                task_id=f"T{index}", queue=index + 1, worker=10, finalization=10, reviewers=10,
+                manager_wait=10, accept=10, declared=1, workspace_ms=1_000,
             )
             conn.execute(
                 "INSERT INTO tasks (task_id, card_json, created_at, updated_at, claimed_at, "
