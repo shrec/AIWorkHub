@@ -53,6 +53,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Iterator, Mapping, Sequence
@@ -61,8 +62,8 @@ from . import cli_model_discovery, context_capture, platform_io, runtime_adapter
 from .manager_loop import TURN_TERMINAL_TYPES, ManagerLoopError, keep_tail
 
 MANAGER_BACKEND_IDS: tuple[str, ...] = ("claude_cli", "codex_cli", "opencode_cli")
-# The worker lane's own launch ceiling, reused as the manager turn default: a
-# manager turn is one non-interactive CLI run of the same shape.
+# The manager turn default silence window: a turn is cut off only when no stdout
+# line arrives for this long; a turn that keeps streaming is never cut off.
 DEFAULT_TURN_TIMEOUT_SECONDS = 3600.0
 MAX_ERROR_DETAIL_CHARS = 500
 MAX_STDERR_CHARS = 2000
@@ -805,7 +806,8 @@ class CliManagerBackend:
     so a started-but-silent session costs nothing. Each ``send`` runs one turn
     and yields its events as the lines arrive; the first turn carries the brief
     with the message, and every later turn resumes the conversation id captured
-    from the stream. A turn that outruns ``timeout_seconds`` has its process
+    from the stream. ``timeout_seconds`` is a silence window: a turn that
+    prints no stdout line for that long has its process
     killed and reports exactly one ``error`` event, as does a non-zero exit, and
     the backend stays closeable either way.
     """
@@ -934,11 +936,17 @@ class CliManagerBackend:
         expired = threading.Event()
         tail = _StderrTail(getattr(process, "stderr", None))
 
-        def cut_off() -> None:
-            expired.set()
-            _end_process(process)
+        deadline = [time.monotonic() + self.timeout_seconds]
+        done = threading.Event()
 
-        watchdog = threading.Timer(self.timeout_seconds, cut_off)
+        def watch() -> None:
+            while not done.wait(max(0.0, deadline[0] - time.monotonic())):
+                if time.monotonic() >= deadline[0]:
+                    expired.set()
+                    _end_process(process)
+                    return
+
+        watchdog = threading.Thread(target=watch, daemon=True)
         watchdog.start()
         context = TurnContext()
         ended = False
@@ -946,6 +954,7 @@ class CliManagerBackend:
         streamed = False
         try:
             for raw in process.stdout or ():
+                deadline[0] = time.monotonic() + self.timeout_seconds
                 event = _decode(raw)
                 if event is None:
                     continue
@@ -967,7 +976,7 @@ class CliManagerBackend:
                     streamed = True
                     yield translated
         finally:
-            watchdog.cancel()
+            done.set()
             code = _reap(process)
             stderr = tail.text()
             with self._slot:

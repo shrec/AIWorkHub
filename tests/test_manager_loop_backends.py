@@ -61,6 +61,8 @@ _FAKE_CLI = textwrap.dedent(
                 time.sleep(0.01)
         elif step == "@hang":
             time.sleep(30)
+        elif isinstance(step, str) and step.startswith("@sleep:"):
+            time.sleep(float(step[len("@sleep:"):]))
         elif isinstance(step, str) and step.startswith("@stderr:"):
             print(step[len("@stderr:"):], file=sys.stderr, flush=True)
         elif isinstance(step, str):
@@ -556,6 +558,23 @@ def test_a_turn_timeout_kills_the_process_and_reports_exactly_one_error(tmp_path
     assert "manager_turn_timeout_seconds=0.5" == errors[0]["payload"]["error"]
     assert kinds(events) == ["assistant_text", "error"]
     assert not cli.is_running()
+    cli.close()
+
+
+def test_a_turn_streaming_past_the_timeout_in_total_is_not_killed(tmp_path: Path):
+    def line(text: str) -> dict:
+        return {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+
+    fake = FakeCli(
+        tmp_path,
+        [[line("one"), "@sleep:1.2", line("two"), "@sleep:1.2", line("three"), "@sleep:1.2", line("four")]],
+    )
+    cli = backend(fake, timeout_seconds=3.0)
+    cli.start("brief")
+    events = drain(cli.send("go"))
+
+    assert not [event for event in events if event["type"] == "error"]
+    assert kinds(events).count("assistant_text") == 4
     cli.close()
 
 
