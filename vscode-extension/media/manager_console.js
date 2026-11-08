@@ -10,6 +10,10 @@ function managerChatImageCount(count) {
   return `${count} image${count === 1 ? "" : "s"} attached`;
 }
 
+function managerConsoleErrorText(payload) {
+  return String(payload.error || payload.message || "Manager error");
+}
+
 function managerConsolePayload(event) {
   return event && event.payload && typeof event.payload === "object" ? event.payload : {};
 }
@@ -93,7 +97,8 @@ function managerChatEventNode(event) {
     return managerConsoleBlock(type, createElement("div", "manager-chat-marker", `Automatic wake-up${payload.text ? `: ${limitText(payload.text, 120)}` : ""}`));
   }
   if (type === "error") {
-    return managerConsoleBlock(type, createElement("div", "manager-chat-error", String(payload.error || payload.message || "Manager error")));
+    const text = managerConsoleErrorText(payload);
+    return managerConsoleBlock(type, createElement("div", "manager-chat-error", payload.repeat_count > 1 ? `${text} x ${payload.repeat_count}` : text));
   }
   if (type === "session_start") {
     const continuation = managerConsoleContinuation(payload);
@@ -573,6 +578,9 @@ let managerConsoleRenderedLimit = null;
 let managerConsoleActiveIndex = null;
 let managerConsoleLiveLabel = null;
 let managerConsoleLiveSummaries = [];
+// When the streamed text last grew: partial text carries no time of its own.
+let managerConsoleStripPartialKey = "";
+let managerConsoleStripPartialAt = 0;
 // Highest seq of a terminal event in the loaded log. Kept between renders because a group's
 // member rows can be built after the render that described them.
 let managerConsoleTerminalSeq = 0;
@@ -603,7 +611,33 @@ function managerConsoleSetText(node, text) {
   if (node.textContent !== text) node.textContent = text;
 }
 
-// Only the live Thinking labels change between identical renders; touch just those nodes.
+// The strip above the composer. Every field is text written in place, so a tick never touches a transcript row.
+function managerConsoleUpdateStrip() {
+  const strip = elements.managerChatStrip;
+  if (!strip) return;
+  const running = Boolean(state.managerChatRunning);
+  const queue = state.managerChatQueuePayload && state.managerChatQueuePayload.send_queue;
+  const queued = Array.isArray(queue) ? queue.length : 0;
+  const active = running || queued > 0;
+  if (strip.hidden === active) strip.hidden = !active;
+  if (!active) return;
+  const now = Date.now();
+  const partial = managerConsolePartialIsCurrent(state.managerChatPartial) ? state.managerChatPartial : null;
+  const partialKey = partial ? [partial.turn, String(partial.text || "").length, String(partial.reasoning || "").length].join(":") : "";
+  if (partialKey !== managerConsoleStripPartialKey) {
+    managerConsoleStripPartialKey = partialKey;
+    managerConsoleStripPartialAt = partialKey ? now : 0;
+  }
+  const since = state.managerChatThinkingSince || 0;
+  const events = Array.isArray(state.managerChatEvents) ? state.managerChatEvents : [];
+  // Anchored on the turn start, so an event from an earlier turn cannot age the new one.
+  const lastAt = Math.max(since, managerChatEventTime(events[events.length - 1]), managerConsoleStripPartialAt);
+  managerConsoleSetText(elements.managerChatStripPhase, running ? (partial && partial.text ? "Writing" : "Thinking") + " · " + managerChatFormatDuration(since ? now - since : 0) : "");
+  managerConsoleSetText(elements.managerChatStripAge, running && lastAt ? "last event " + managerChatFormatDuration(now - lastAt) : "");
+  managerConsoleSetText(elements.managerChatStripQueued, queued > 0 ? queued + " queued" : "");
+}
+
+// Only the live Thinking labels and the strip change between identical renders; touch just those nodes.
 function managerConsoleTickThinking() {
   if (managerConsoleLiveLabel && state.managerChatThinkingSince) {
     managerConsoleSetText(managerConsoleLiveLabel, "Thinking · " + managerChatFormatDuration(Date.now() - state.managerChatThinkingSince));
@@ -612,11 +646,11 @@ function managerConsoleTickThinking() {
     const start = managerChatEventTime(entry.event);
     if (start) managerConsoleSetText(entry.summary, "Thinking · " + managerChatFormatDuration(Date.now() - start));
   }
+  managerConsoleUpdateStrip();
 }
 
 function managerConsoleExtraRows() {
-  const partialRows = managerConsolePartialRows(state.managerChatPartial);
-  if (partialRows.length > 0) return partialRows;
+  // Armed before the partial rows return, so the strip's elapsed keeps counting while text streams.
   if (state.managerChatRunning) {
     // The timer belongs to one session and turn: a start left over from an
     // earlier turn or session restarts instead of counting on (the 64m timer).
@@ -625,6 +659,10 @@ function managerConsoleExtraRows() {
       state.managerChatThinkingSince = Date.now();
       state.managerChatThinkingKey = key;
     }
+  }
+  const partialRows = managerConsolePartialRows(state.managerChatPartial);
+  if (partialRows.length > 0) return partialRows;
+  if (state.managerChatRunning) {
     // The elapsed text is ticked in place, so it is not part of the signature.
     return [{ key: MANAGER_CONSOLE_LIVE_THINKING_KEY, signature: "live", build: managerChatLiveThinkingNode }];
   }
@@ -731,6 +769,19 @@ function managerConsoleEventRows(merged, visible) {
     // A repeated stop records a second marker; the transcript says Stopped once.
     const previousRow = rows[rows.length - 1];
     if (event && event.type === "turn_stopped" && previousRow && previousRow.event.type === "turn_stopped") continue;
+    // A handoff closes its session for the same reason: one row says so.
+    if (event && event.type === "session_close" && previousRow && previousRow.event.type === "handoff_request"
+      && String(managerConsolePayload(event).reason || "") === String(managerConsolePayload(previousRow.event).reason || "")) continue;
+    // A failing provider repeats one error: the first row keeps its key and counts the repeats.
+    if (event && event.type === "error" && previousRow && previousRow.event.type === "error"
+      && managerConsoleErrorText(managerConsolePayload(event)) === managerConsoleErrorText(managerConsolePayload(previousRow.event))) {
+      const previousPayload = managerConsolePayload(previousRow.event);
+      const repeated = { ...previousRow.event, payload: { ...previousPayload, repeat_count: (previousPayload.repeat_count || 1) + 1 } };
+      previousRow.event = repeated;
+      previousRow.signature = managerConsoleRowSignature(repeated);
+      previousRow.build = () => managerChatEventNode(repeated);
+      continue;
+    }
     pushRow(event);
   }
   flushPendingTurnEnd();

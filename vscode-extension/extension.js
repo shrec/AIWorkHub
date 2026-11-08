@@ -14335,7 +14335,22 @@ function getHtmlForWebview(webview, extensionUri) {
     <aside class="manager-chat-sidebar" id="manager-chat-sidebar" aria-label="Manager chat">
       <div class="manager-chat-frame">
         <div class="dialog-heading">
-          <div><h2>Manager</h2><span id="manager-chat-summary">No active session</span></div>
+          <div class="manager-chat-title"><h2>Manager</h2><span id="manager-chat-summary">No active session</span></div>
+          <span class="connection-state" id="manager-chat-status" role="status" aria-live="polite">
+            <span class="connection-dot" aria-hidden="true"></span>
+            <span id="manager-chat-status-label">Idle</span>
+          </span>
+          <details class="manager-chat-menu" id="manager-chat-menu">
+            <summary aria-label="Session actions" title="Session actions">…</summary>
+            <div class="manager-chat-menu-panel">
+              <button type="button" id="manager-chat-rotate" disabled>Rotate</button>
+              <button type="button" id="manager-chat-rename-session">Rename</button>
+              <button type="button" id="manager-chat-new-session">New</button>
+              <button type="button" id="manager-chat-close" disabled>Close</button>
+              <hr class="manager-chat-menu-separator">
+              <button type="button" id="manager-chat-delete-session">Delete</button>
+            </div>
+          </details>
           <button type="button" class="dialog-close" id="manager-chat-collapse" aria-controls="manager-chat-sidebar" aria-expanded="true">Collapse</button>
         </div>
         <div class="needfix-toolbar">
@@ -14344,6 +14359,14 @@ function getHtmlForWebview(webview, extensionUri) {
             <option value="codex_cli">codex_cli</option>
             <option value="opencode_cli">opencode_cli</option>
           </select>
+          <div class="manager-chat-session-line" id="manager-chat-session-line">
+            <select id="manager-chat-session" class="compact-select" aria-label="Manager session">
+              <option value="">Saved sessions</option>
+            </select>
+            <span class="mc-mono" id="manager-chat-context" aria-label="Manager context percent"></span>
+            <span id="manager-chat-session-id" hidden></span>
+            <span id="manager-chat-session-backend" hidden></span>
+          </div>
           <select id="manager-chat-model" class="compact-select" aria-label="Model for this session"></select>
           <select id="manager-chat-reasoning" class="compact-select" aria-label="Reasoning depth">
             <option value="">Default</option>
@@ -14353,24 +14376,6 @@ function getHtmlForWebview(webview, extensionUri) {
             <option value="xhigh">Extra high</option>
             <option value="max">Max</option>
           </select>
-          <button type="button" id="manager-chat-rotate" disabled>Rotate</button>
-          <button type="button" id="manager-chat-close" disabled>Close</button>
-          <button type="button" id="manager-chat-stop" disabled>Stop</button>
-          <span class="connection-state" id="manager-chat-status" role="status" aria-live="polite">
-            <span class="connection-dot" aria-hidden="true"></span>
-            <span id="manager-chat-status-label">Idle</span>
-          </span>
-        </div>
-        <div class="manager-chat-session-line" id="manager-chat-session-line">
-          <select id="manager-chat-session" class="compact-select" aria-label="Manager session">
-            <option value="">Saved sessions</option>
-          </select>
-          <span class="mc-mono" id="manager-chat-context" aria-label="Manager context percent"></span>
-          <button type="button" id="manager-chat-rename-session">Rename</button>
-          <button type="button" id="manager-chat-delete-session">Delete</button>
-          <button type="button" id="manager-chat-new-session">New</button>
-          <span id="manager-chat-session-id" hidden></span>
-          <span id="manager-chat-session-backend" hidden></span>
         </div>
         <div class="mc-hairline" id="manager-chat-hairline" role="meter" aria-label="Manager context use" aria-valuemin="0" aria-valuemax="100" hidden><span></span></div>
         <div class="manager-chat-transcript" id="manager-chat-transcript">
@@ -14380,10 +14385,19 @@ function getHtmlForWebview(webview, extensionUri) {
         <div class="sr-only" id="manager-chat-announcer" aria-live="polite"></div>
         <div class="manager-chat-notice" id="manager-chat-notice" role="alert" hidden></div>
         <ul class="manager-chat-attachments" id="manager-chat-attachments" aria-label="Attached images" hidden></ul>
+        <div class="manager-chat-provider-banner" id="manager-chat-provider-banner" role="alert" hidden></div>
+        <div class="manager-chat-strip-slot">
+          <div class="manager-chat-status-strip" id="manager-chat-strip" hidden>
+            <span id="manager-chat-strip-phase"></span>
+            <span id="manager-chat-strip-age"></span>
+            <span id="manager-chat-strip-queued"></span>
+          </div>
+        </div>
         <form class="manager-chat-composer" id="manager-chat-composer">
           <textarea id="manager-chat-input" rows="2" placeholder="Message the manager" aria-label="Message the manager"></textarea>
           <button type="button" id="manager-chat-attach" title="Attach PNG, JPEG, GIF or WebP images (or paste or drop them)">Attach</button>
           <input type="file" id="manager-chat-file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
+          <button type="button" id="manager-chat-stop" disabled>Stop</button>
           <button type="submit" class="primary-button" id="manager-chat-send">Send</button>
         </form>
       </div>

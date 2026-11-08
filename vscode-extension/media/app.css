@@ -3017,7 +3017,6 @@ tbody tr.is-selected td:first-child {
 
 .manager-chat-frame > .dialog-heading,
 .manager-chat-frame > .needfix-toolbar,
-.manager-chat-frame > .manager-chat-session-line,
 .manager-chat-frame > .manager-chat-tasks,
 .manager-chat-frame > .manager-chat-notice,
 .manager-chat-frame > .manager-chat-composer {
@@ -3033,27 +3032,66 @@ tbody tr.is-selected td:first-child {
   flex: 1 1 auto;
 }
 
-#manager-chat-sidebar .needfix-toolbar,
-#manager-chat-sidebar .manager-chat-session-line {
+/* Heading and toolbar are one row each: 72px together at the narrowest sidebar. */
+#manager-chat-sidebar .dialog-heading {
   position: relative;
-  z-index: 3;
-  overflow: visible;
+  z-index: 4;
+  min-height: 0;
+  gap: 6px;
+  padding: 3px 10px;
+}
+
+.manager-chat-title {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.manager-chat-title h2 {
+  flex: 0 0 auto;
+}
+
+#manager-chat-summary {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+#manager-chat-status {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 45%;
+  overflow: hidden;
+  white-space: nowrap;
 }
 
 #manager-chat-sidebar .needfix-toolbar {
+  position: relative;
+  z-index: 3;
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 6px;
+  padding: 3px 10px;
+  overflow: visible;
 }
 
+/* A fixed 28px box with 6px padding left a 14px line for the text: the box
+   now grows from its line height instead of clipping it. */
 #manager-chat-sidebar .needfix-toolbar select,
-#manager-chat-sidebar .manager-chat-session-line select,
 #manager-chat-model {
+  box-sizing: border-box;
   width: auto;
-  min-width: 8rem;
+  height: auto;
+  min-width: 0;
+  min-height: 26px;
   max-width: 100%;
   flex: 1 1 8rem;
+  padding: 2px 6px;
+  font-size: var(--fs-2xs);
+  line-height: 1.4;
   field-sizing: content;
   pointer-events: auto;
   overflow: visible;
@@ -3088,6 +3126,8 @@ tbody tr.is-selected td:first-child {
   max-height: 100vh;
   min-width: 0;
   overflow: visible;
+  container-name: manager-chat-sidebar;
+  container-type: inline-size;
   border-left: 1px solid var(--line);
   background: var(--surface);
   color: var(--ink);
@@ -3101,12 +3141,6 @@ tbody tr.is-selected td:first-child {
 
 #manager-chat-collapse {
   flex: 0 0 auto;
-  padding: 4px 8px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  color: var(--ink-soft);
-  background: transparent;
-  cursor: pointer;
 }
 
 .dashboard-shell.is-collapsed {
@@ -3127,7 +3161,7 @@ tbody tr.is-selected td:first-child {
   border-bottom: 0;
 }
 
-#manager-chat-sidebar.is-collapsed .dialog-heading > div {
+#manager-chat-sidebar.is-collapsed .dialog-heading > :not(#manager-chat-collapse) {
   display: none;
 }
 
@@ -3155,7 +3189,7 @@ tbody tr.is-selected td:first-child {
     top: auto;
     width: 100%;
     height: auto;
-    max-height: min(50vh, 420px);
+    max-height: min(70vh, 640px);
     border-left: 0;
     border-top: 1px solid var(--line);
   }
@@ -3180,28 +3214,98 @@ tbody tr.is-selected td:first-child {
   }
 }
 
+/* A flex item of the toolbar: the session select and its context percent. */
 .manager-chat-session-line {
   display: flex;
-  flex-wrap: wrap;
-  gap: 4px 10px;
-  padding: 6px 10px;
+  flex: 1 1 8rem;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
   color: var(--muted);
   font-size: var(--fs-2xs);
-  border-bottom: 1px solid var(--line);
-  min-width: 0;
-  overflow: visible;
-  overflow-wrap: anywhere;
-  white-space: pre-wrap;
 }
 
-#manager-chat-session {
-  flex: 1 1 8rem;
-  min-width: 0;
-  max-width: 100%;
-}
-
-#manager-chat-new-session {
+#manager-chat-context {
   flex: 0 0 auto;
+}
+
+/* One style for every header, menu and secondary composer action; only Send is primary. */
+#manager-chat-sidebar .dialog-heading button,
+#manager-chat-sidebar .manager-chat-menu > summary,
+#manager-chat-sidebar .manager-chat-composer button:not(.primary-button) {
+  box-sizing: border-box;
+  min-height: 26px;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: var(--fs-2xs);
+  font-weight: 400;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+#manager-chat-sidebar .dialog-heading button:hover:not(:disabled),
+#manager-chat-sidebar .manager-chat-menu > summary:hover,
+#manager-chat-sidebar .manager-chat-composer button:not(.primary-button):hover:not(:disabled) {
+  background: var(--surface-subtle);
+}
+
+#manager-chat-sidebar .dialog-heading button:focus-visible,
+#manager-chat-sidebar .manager-chat-menu > summary:focus-visible,
+#manager-chat-sidebar .manager-chat-composer button:not(.primary-button):focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+#manager-chat-sidebar .dialog-heading button:disabled,
+#manager-chat-sidebar .manager-chat-composer button:not(.primary-button):disabled {
+  color: var(--muted);
+  opacity: 0.6;
+  cursor: default;
+}
+
+.manager-chat-menu {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.manager-chat-menu > summary {
+  list-style: none;
+}
+
+.manager-chat-menu > summary::-webkit-details-marker {
+  display: none;
+}
+
+.manager-chat-menu-panel {
+  position: absolute;
+  top: calc(100% + 2px);
+  right: 0;
+  display: flex;
+  min-width: 7rem;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px;
+  border: 1px solid var(--vscode-contrastBorder, transparent);
+  border-radius: 4px;
+  background: var(--surface-subtle);
+  box-shadow: 0 0px 0 1px var(--line);
+}
+
+#manager-chat-sidebar .manager-chat-menu-panel button {
+  width: 100%;
+  border-color: transparent;
+  text-align: left;
+}
+
+.manager-chat-menu-separator {
+  width: 100%;
+  margin: 2px 0;
+  border: 0;
+  border-top: 1px solid var(--line);
 }
 
 .manager-chat-tasks {
@@ -3262,6 +3366,40 @@ tbody tr.is-selected td:first-child {
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
   padding: 10px;
+}
+
+/* Words carry the meaning; the contrast border gives high contrast an edge. */
+.manager-chat-provider-banner {
+  flex: 0 0 auto;
+  margin: 4px 10px;
+  padding: 5px 9px;
+  border: 1px solid var(--vscode-contrastBorder, transparent);
+  border-radius: 4px;
+  background: var(--stale-soft);
+  color: var(--ink);
+  font-size: var(--fs-2xs);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+/* The slot keeps its height while the strip inside it is hidden, so a turn
+   starting or ending never moves the transcript. */
+.manager-chat-strip-slot {
+  flex: 0 0 22px;
+  height: 22px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.manager-chat-status-strip {
+  display: flex;
+  height: 100%;
+  align-items: center;
+  gap: 10px;
+  padding: 0 10px;
+  color: var(--ink-soft);
+  font-size: var(--fs-2xs);
+  white-space: nowrap;
 }
 
 .manager-chat-notice {
@@ -3333,6 +3471,27 @@ tbody tr.is-selected td:first-child {
   color: var(--ink);
   font: inherit;
   resize: vertical;
+}
+
+.manager-chat-composer button {
+  min-height: 28px;
+}
+
+#manager-chat-stop,
+#manager-chat-attach {
+  flex: 0 0 auto;
+  align-self: flex-end;
+}
+
+/* The header breakpoint follows the sidebar's own width, not the viewport's. */
+@container manager-chat-sidebar (max-width: 420px) {
+  #manager-chat-sidebar #manager-chat-summary {
+    display: none;
+  }
+
+  #manager-chat-sidebar #manager-chat-reasoning {
+    flex: 0 1 4.5rem;
+  }
 }
 
 .manager-chat-composer .primary-button {
@@ -3550,7 +3709,6 @@ tbody tr.is-selected td:first-child {
   .settings-footnote { overflow-wrap: anywhere; }
   .settings-metric-grid,
   .settings-language-grid { grid-template-columns: 1fr; }
-  #manager-chat-sidebar .needfix-toolbar { grid-template-columns: 1fr 1fr; }
 }
 
 .settings-group-heading {

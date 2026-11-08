@@ -680,7 +680,13 @@ function loadWebviewSlice() {
     managerChatStart: makeFakeElement("button"),
     managerChatRotate: makeFakeElement("button"),
     managerChatClose: makeFakeElement("button"),
-    managerChatStop: makeFakeElement("button"),
+    managerChatStop: Object.assign(makeFakeElement("button"), { click() { trigger(this, "click"); } }),
+    managerChatMenu: makeFakeElement("details"),
+    managerChatProviderBanner: Object.assign(makeFakeElement("div"), { hidden: true }),
+    managerChatStrip: Object.assign(makeFakeElement("div"), { hidden: true }),
+    managerChatStripPhase: makeFakeElement("span"),
+    managerChatStripAge: makeFakeElement("span"),
+    managerChatStripQueued: makeFakeElement("span"),
     managerChatStatus: makeFakeElement("span"),
     managerChatStatusLabel: makeFakeElement("span"),
     managerChatSessionLine: makeFakeElement("div"),
@@ -719,6 +725,7 @@ function loadWebviewSlice() {
 
   const context = {
     document: {
+      addEventListener: () => {},
       createElement: (tag) => makeFakeElement(tag),
       createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }),
       createDocumentFragment: () => ({ __isFragment: true, children: [], appendChild(child) { this.children.push(child); return child; } }),
@@ -1990,20 +1997,258 @@ test("five partial provider batches coalesce and render the latest text once", (
 
 // ── Restore, Rotate and Close: the panel's own three session controls ───────
 
-test("the extension.js webview HTML carries a disabled #manager-chat-close button next to Rotate", () => {
-  const markup = extensionSource.slice(
-    extensionSource.indexOf('id="manager-chat-rotate"') - 40,
-    extensionSource.indexOf('id="manager-chat-status"'),
-  );
+function managerChatMenuMarkup() {
+  const start = extensionSource.indexOf('id="manager-chat-menu"');
+  assert.notEqual(start, -1, "the overflow menu exists");
+  return extensionSource.slice(start, extensionSource.indexOf("</details>", start));
+}
+
+function managerChatComposerMarkup() {
+  const start = extensionSource.indexOf('id="manager-chat-composer"');
+  assert.notEqual(start, -1, "the composer exists");
+  return extensionSource.slice(start, extensionSource.indexOf("</form>", start));
+}
+
+test("the extension.js webview HTML carries a disabled #manager-chat-close button next to Rotate in the overflow menu", () => {
+  const markup = managerChatMenuMarkup();
+  assert.match(markup, /id="manager-chat-rotate" disabled>Rotate<\/button>/);
   assert.match(markup, /<button type="button" id="manager-chat-close" disabled>Close<\/button>/);
 });
 
-test("the extension.js webview HTML carries a disabled #manager-chat-stop button next to Close", () => {
-  const markup = extensionSource.slice(
-    extensionSource.indexOf('id="manager-chat-rotate"') - 40,
-    extensionSource.indexOf('id="manager-chat-status"'),
+test("the extension.js webview HTML carries a disabled #manager-chat-stop button next to Send in the composer", () => {
+  assert.match(
+    managerChatComposerMarkup(),
+    /<button type="button" id="manager-chat-stop" disabled>Stop<\/button>\s*<button type="submit" class="primary-button" id="manager-chat-send">/,
   );
-  assert.match(markup, /<button type="button" id="manager-chat-stop" disabled>Stop<\/button>/);
+});
+
+test("Rotate, Rename, New, Close and Delete sit in the details menu, Delete behind a separator", () => {
+  assert.match(extensionSource, /<details class="manager-chat-menu" id="manager-chat-menu">\s*<summary/);
+  const menu = managerChatMenuMarkup();
+  for (const id of ["manager-chat-rotate", "manager-chat-rename-session", "manager-chat-new-session", "manager-chat-close", "manager-chat-delete-session"]) {
+    assert.match(menu, new RegExp(`id="${id}"`), `${id} belongs to the menu`);
+  }
+  const separatorAt = menu.indexOf("<hr");
+  assert.ok(separatorAt > menu.indexOf('id="manager-chat-close"'), "the separator follows the routine actions");
+  assert.ok(separatorAt < menu.indexOf('id="manager-chat-delete-session"'), "Delete sits behind the separator");
+  const sidebarAt = extensionSource.indexOf('id="manager-chat-sidebar"');
+  const sidebar = extensionSource.slice(sidebarAt, extensionSource.indexOf("</aside>", sidebarAt));
+  assert.equal(sidebar.split("primary-button").length - 1, 1, ".primary-button stays only on Send");
+  assert.match(sidebar, /id="manager-chat-send"/);
+});
+
+test("an action in the overflow menu closes it", () => {
+  const harness = loadWebviewSlice();
+  const { elements } = harness;
+  elements.managerChatMenu.open = true;
+  trigger(elements.managerChatMenu, "click", { target: { tagName: "SUMMARY" } });
+  assert.equal(elements.managerChatMenu.open, true, "the summary toggles natively");
+  trigger(elements.managerChatMenu, "click", { target: { tagName: "BUTTON" } });
+  assert.equal(elements.managerChatMenu.open, false);
+});
+
+test("Escape in the composer clicks Stop only while Stop is enabled and never during IME composition", () => {
+  const harness = loadWebviewSlice();
+  const { elements } = harness;
+  const stops = () => harness.posts.filter((post) => post.type === "managerLoopStop").length;
+
+  elements.managerChatStop.disabled = true;
+  trigger(elements.managerChatInput, "keydown", { key: "Escape" });
+  assert.equal(stops(), 0, "idle: Stop is disabled");
+
+  elements.managerChatStop.disabled = false;
+  trigger(elements.managerChatInput, "keydown", { key: "Escape", isComposing: true });
+  assert.equal(stops(), 0, "Escape cancels the IME composition first");
+
+  trigger(elements.managerChatInput, "keydown", { key: "Escape" });
+  assert.equal(stops(), 1);
+});
+
+test("the status strip and the banner sit directly above the composer, outside the transcript", () => {
+  assert.match(managerChatComposerMarkup(), /id="manager-chat-stop"/, "Stop is inside the composer");
+  const transcript = extensionSource.slice(extensionSource.indexOf('id="manager-chat-transcript"'), extensionSource.indexOf('id="manager-chat-latest"'));
+  assert.doesNotMatch(transcript, /manager-chat-strip/);
+  const stripAt = extensionSource.indexOf('id="manager-chat-strip"');
+  const bannerAt = extensionSource.indexOf('id="manager-chat-provider-banner"');
+  const composerAt = extensionSource.indexOf('id="manager-chat-composer"');
+  assert.ok(extensionSource.indexOf('id="manager-chat-latest"') < bannerAt && bannerAt < stripAt && stripAt < composerAt);
+  assert.match(extensionSource, /id="manager-chat-provider-banner"[^>]*role="alert"[^>]*hidden/);
+  for (const id of ["manager-chat-strip-phase", "manager-chat-strip-age", "manager-chat-strip-queued"]) {
+    assert.match(extensionSource, new RegExp(`id="${id}"`), id);
+  }
+});
+
+function runningStripHarness() {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-" + "c".repeat(32);
+  harness.state.managerChatRunning = true;
+  harness.state.managerChatEvents = [{ seq: 1, turn: 1, type: "user_message", payload: { text: "go" } }];
+  return harness;
+}
+
+test("the status strip keeps elapsed and queued count while partial text streams, and a tick leaves the rows alone", () => {
+  const harness = runningStripHarness();
+  const { state, elements } = harness;
+  state.managerChatPartial = { turn: 1, session_id: state.managerChatSession, text: "streaming" };
+  state.managerChatQueuePayload = { send_queue: [{ text: "next" }, { text: "after" }] };
+
+  harness.api.renderManagerChatEvents();
+
+  assert.equal(elements.managerChatStrip.hidden, false);
+  assert.ok(state.managerChatThinkingSince > 0, "the turn timer runs while the partial is showing");
+  assert.match(elements.managerChatStripPhase.textContent, /^Writing · \ds$/);
+  assert.equal(elements.managerChatStripQueued.textContent, "2 queued");
+
+  const rowsBefore = elements.managerChatTranscript.children.slice();
+  assert.ok(rowsBefore.length > 0);
+  state.managerChatThinkingSince -= 65000;
+  harness.api.renderManagerChatEvents();
+
+  assert.equal(elements.managerChatStripPhase.textContent, "Writing · 1m 5s");
+  assert.equal(elements.managerChatStripQueued.textContent, "2 queued");
+  const rowsAfter = elements.managerChatTranscript.children;
+  assert.equal(rowsAfter.length, rowsBefore.length);
+  rowsBefore.forEach((row, index) => assert.strictEqual(rowsAfter[index], row, `row ${index} kept its node`));
+});
+
+test("the status strip says Thinking before text streams and ages the last event of this turn only", () => {
+  const harness = runningStripHarness();
+  const { state, elements } = harness;
+  state.managerChatEvents[0].at = new Date(Date.now() - 5000).toISOString();
+
+  harness.api.renderManagerChatEvents();
+  assert.match(elements.managerChatStripPhase.textContent, /^Thinking · \ds$/);
+  assert.match(elements.managerChatStripAge.textContent, /^last event 0s$/, "an event older than the turn start cannot age it");
+
+  state.managerChatThinkingSince -= 20000;
+  harness.api.renderManagerChatEvents();
+  assert.equal(elements.managerChatStripPhase.textContent, "Thinking · 20s");
+  assert.equal(elements.managerChatStripAge.textContent, "last event 5s");
+});
+
+test("the status strip shows for queued sends alone and hides once idle and drained", () => {
+  const harness = loadWebviewSlice();
+  const { state, elements } = harness;
+  state.managerChatQueuePayload = { send_queue: [{ text: "next" }] };
+  harness.api.applyManagerChatSessionUi();
+  assert.equal(elements.managerChatStrip.hidden, false);
+  assert.equal(elements.managerChatStripQueued.textContent, "1 queued");
+  assert.equal(elements.managerChatStripPhase.textContent, "");
+  assert.equal(elements.managerChatStripAge.textContent, "");
+
+  state.managerChatQueuePayload = { send_queue: [] };
+  harness.api.applyManagerChatSessionUi();
+  assert.equal(elements.managerChatStrip.hidden, true);
+});
+
+function bannerFor(payload) {
+  const harness = loadWebviewSlice();
+  harness.elements.managerChatProviderBanner.textContent = "stale";
+  harness.elements.managerChatProviderBanner.hidden = false;
+  harness.api.renderManagerChatStatus({ ok: true, session: null, ...payload });
+  return harness.elements.managerChatProviderBanner;
+}
+
+test("the provider banner names an expired login from wake.parked_reason", () => {
+  const banner = bannerFor({ wake: { parked_reason: "provider_auth", retry_in_seconds: 0 }, provider_failure: null });
+  assert.equal(banner.hidden, false);
+  assert.equal(banner.textContent, "Provider login expired. Run /login, then send again.");
+});
+
+test("the provider banner gives the retry clock when a usage limit parks the wake", () => {
+  const clock = (ms) => {
+    const at = new Date(ms);
+    return `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`;
+  };
+  const before = clock(Date.now() + 5400000);
+  const banner = bannerFor({ wake: { parked_reason: "provider_limit", retry_in_seconds: 5400 }, provider_failure: null });
+  const after = clock(Date.now() + 5400000);
+  assert.ok(
+    [`Usage limit reached. Retry at ${before}`, `Usage limit reached. Retry at ${after}`].includes(banner.textContent),
+    banner.textContent,
+  );
+  assert.equal(banner.hidden, false);
+});
+
+test("the provider banner reads provider_failure when no wake is parked", () => {
+  assert.equal(bannerFor({ provider_failure: "provider_limit" }).textContent, "Usage limit reached.");
+  assert.equal(
+    bannerFor({ wake: { parked_reason: "backoff", retry_in_seconds: 30 }, provider_failure: "provider_auth" }).textContent,
+    "Provider login expired. Run /login, then send again.",
+  );
+});
+
+test("the provider banner clears when neither source is set", () => {
+  const banner = bannerFor({ wake: { parked_reason: null, retry_in_seconds: 0 }, provider_failure: null });
+  assert.equal(banner.hidden, true);
+  assert.equal(banner.textContent, "");
+});
+
+function renderedRowsText(events, className) {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-" + "d".repeat(32);
+  harness.state.managerChatEvents = events;
+  harness.api.renderManagerChatEvents();
+  return flattenNodes(harness.elements.managerChatTranscript, [])
+    .filter((node) => node.className === className)
+    .map((node) => node.textContent);
+}
+
+test("a handoff_request then session_close with the same reason render as one row", () => {
+  const rows = renderedRowsText([
+    { seq: 1, turn: 1, type: "handoff_request", payload: { reason: "context full" } },
+    { seq: 2, turn: 1, type: "session_close", payload: { reason: "context full" } },
+  ], "manager-chat-marker");
+  assert.deepEqual(plain(rows), ["Handoff requested: context full"]);
+});
+
+test("a handoff_request then session_close with different reasons stay two rows", () => {
+  const rows = renderedRowsText([
+    { seq: 1, turn: 1, type: "handoff_request", payload: { reason: "context full" } },
+    { seq: 2, turn: 1, type: "session_close", payload: { reason: "owner closed" } },
+  ], "manager-chat-marker");
+  assert.deepEqual(plain(rows), ["Handoff requested: context full", "Session closed: owner closed"]);
+});
+
+test("consecutive errors with the same text render as one row carrying x N", () => {
+  const rows = renderedRowsText([
+    { seq: 1, turn: 1, type: "error", payload: { error: "rate limited" } },
+    { seq: 2, turn: 2, type: "error", payload: { error: "rate limited" } },
+    { seq: 3, turn: 3, type: "error", payload: { message: "rate limited" } },
+  ], "manager-chat-error");
+  assert.deepEqual(plain(rows), ["rate limited x 3"]);
+});
+
+test("consecutive errors with different text stay two rows without a count", () => {
+  const rows = renderedRowsText([
+    { seq: 1, turn: 1, type: "error", payload: { error: "first" } },
+    { seq: 2, turn: 2, type: "error", payload: { error: "second" } },
+  ], "manager-chat-error");
+  assert.deepEqual(plain(rows), ["first", "second"]);
+});
+
+test("manager chat chrome CSS: theme tokens only, a contrast border, the taller stack and a sidebar container", () => {
+  const managerCss = extractSlice(
+    cssSource,
+    ".manager-chat-frame {",
+    ".manager-chat-composer .primary-button {\n  flex: 0 0 auto;\n  align-self: flex-end;\n}",
+    "manager chat css block",
+  );
+  assert.doesNotMatch(managerCss, /#[0-9a-fA-F]{3,8}\b/);
+  assert.doesNotMatch(managerCss, /text-overflow:\s*ellipsis/);
+  assert.doesNotMatch(managerCss, /line-clamp/);
+  assert.match(managerCss, /\.manager-chat-provider-banner \{[^}]*border:\s*1px solid var\(--vscode-contrastBorder,\s*transparent\)/);
+  assert.match(managerCss, /\.manager-chat-menu-panel \{[^}]*border:\s*1px solid var\(--vscode-contrastBorder,\s*transparent\)/);
+  assert.match(managerCss, /#manager-chat-sidebar \{[^}]*container-type:\s*inline-size/);
+  assert.match(managerCss, /@container manager-chat-sidebar \(max-width:[^)]*\) \{\s*#manager-chat-sidebar/);
+  assert.match(managerCss, /#manager-chat-sidebar \.needfix-toolbar select,[^{]*\{[^}]*min-width:\s*0/);
+  assert.match(managerCss, /#manager-chat-sidebar \.needfix-toolbar select,[^{]*\{[^}]*height:\s*auto/);
+  const stackStart = cssSource.indexOf("@media (max-width: 900px)");
+  const stack = cssSource.slice(stackStart, stackStart + 900);
+  assert.match(stack, /position:\s*static/);
+  assert.match(stack, /flex-direction:\s*column/);
+  assert.match(stack, /max-height:\s*min\(70vh,\s*640px\)/);
+  assert.doesNotMatch(cssSource, /max-height:\s*min\(50vh,\s*420px\)/);
 });
 
 test("opening the sidebar posts exactly one managerLoopStatus then one managerLoopRestore", () => {

@@ -377,6 +377,12 @@ const elements = {
   managerChatLatest: document.querySelector("#manager-chat-latest"),
   managerChatAnnouncer: document.querySelector("#manager-chat-announcer"),
   managerChatNotice: document.querySelector("#manager-chat-notice"),
+  managerChatMenu: document.querySelector("#manager-chat-menu"),
+  managerChatProviderBanner: document.querySelector("#manager-chat-provider-banner"),
+  managerChatStrip: document.querySelector("#manager-chat-strip"),
+  managerChatStripPhase: document.querySelector("#manager-chat-strip-phase"),
+  managerChatStripAge: document.querySelector("#manager-chat-strip-age"),
+  managerChatStripQueued: document.querySelector("#manager-chat-strip-queued"),
   managerChatComposer: document.querySelector("#manager-chat-composer"),
   managerChatInput: document.querySelector("#manager-chat-input"),
   managerChatSend: document.querySelector("#manager-chat-send"),
@@ -7700,6 +7706,7 @@ function applyManagerChatSessionUi() {
     ? (state.managerChatRunning ? "Running" : "Active") + " · " + activeName
     : "No session";
   applyManagerChatComposerState();
+  managerConsoleUpdateStrip();
 }
 
 function stopManagerChatPolling() {
@@ -7754,7 +7761,9 @@ function ensureManagerChatQueueHost() {
   const composer = elements.managerChatComposer;
   const parent = composer && composer.parentNode;
   if (parent && typeof parent.insertBefore === "function") {
-    parent.insertBefore(host, composer);
+    // The banner and the strip stay directly above the composer.
+    const banner = elements.managerChatProviderBanner;
+    parent.insertBefore(host, banner && banner.parentNode === parent ? banner : composer);
   }
   elements.managerChatQueue = host;
   return host;
@@ -7791,6 +7800,7 @@ function renderManagerChatSendQueue(payload) {
     if (images > 0) row.appendChild(createElement("span", "manager-chat-queued-images", managerChatImageCount(images)));
     rows.push(row);
   }
+  managerConsoleUpdateStrip();
   if (rows.length === 0) {
     host.hidden = true;
     host.replaceChildren();
@@ -7846,6 +7856,27 @@ function renderManagerChatSessionPicker(payload) {
   state.managerChatSessionPickerSync = false;
 }
 
+function managerChatProviderBannerText(reason, retrySeconds) {
+  if (reason === "provider_auth") return "Provider login expired. Run /login, then send again.";
+  if (reason !== "provider_limit") return "";
+  const seconds = numberValue(retrySeconds);
+  if (seconds <= 0) return "Usage limit reached.";
+  const at = new Date(Date.now() + seconds * 1000);
+  return `Usage limit reached. Retry at ${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`;
+}
+
+// The server classifies; the banner only words its answer. A wake parked for
+// another cause (backoff) falls through to the failed turn's classification.
+function renderManagerChatProviderBanner(payload) {
+  const banner = elements.managerChatProviderBanner;
+  if (!banner) return;
+  const wake = payload.wake && typeof payload.wake === "object" ? payload.wake : {};
+  const text = managerChatProviderBannerText(wake.parked_reason, wake.retry_in_seconds)
+    || managerChatProviderBannerText(payload.provider_failure, wake.retry_in_seconds);
+  if (banner.textContent !== text) banner.textContent = text;
+  banner.hidden = !text;
+}
+
 function renderManagerChatStatus(payload) {
   if (!payload || payload.ok === false) {
     const error = payload && payload.error ? String(payload.error) : "";
@@ -7881,6 +7912,7 @@ function renderManagerChatStatus(payload) {
   renderManagerChatSessionPicker(payload);
   // Latest successful status is authoritative: an empty or missing send_queue drains the list.
   renderManagerChatSendQueue(payload);
+  renderManagerChatProviderBanner(payload);
   if (!state.managerChatSession) {
     stopManagerChatPolling();
     state.managerChatEvents = [];
@@ -8799,6 +8831,16 @@ if (elements.managerChatClose && typeof elements.managerChatClose.addEventListen
     vscode.postMessage({ type: "managerLoopClose" });
   });
 }
+// The overflow menu is a native <details>: an action or a click elsewhere closes it.
+if (elements.managerChatMenu && typeof elements.managerChatMenu.addEventListener === "function") {
+  elements.managerChatMenu.addEventListener("click", (event) => {
+    if (event.target && event.target.tagName === "BUTTON") elements.managerChatMenu.open = false;
+  });
+  document.addEventListener("click", (event) => {
+    if (elements.managerChatMenu.open && !elements.managerChatMenu.contains(event.target)) elements.managerChatMenu.open = false;
+  });
+}
+
 if (elements.managerChatStop && typeof elements.managerChatStop.addEventListener === "function") {
   elements.managerChatStop.addEventListener("click", () => {
     if (elements.managerChatStop.disabled) return;
@@ -8896,6 +8938,12 @@ elements.managerChatInput.addEventListener("keydown", (event) => {
     } else {
       elements.managerChatInput.value = state.managerChatSentHistory[state.managerChatHistoryIndex];
     }
+    return;
+  }
+  if (event.key === "Escape") {
+    if (event.isComposing || !elements.managerChatStop || elements.managerChatStop.disabled) return;
+    event.preventDefault();
+    elements.managerChatStop.click();
     return;
   }
   if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;

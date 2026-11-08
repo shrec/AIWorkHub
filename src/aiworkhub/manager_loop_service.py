@@ -772,6 +772,8 @@ def status(repo: str | Path) -> dict[str, Any]:
     session = entry.orchestrator.session
     with entry.queue_lock:
         pending = list(entry.send_queue)
+    # One read: the turn thread can replace it between the two fields below.
+    last_turn = entry.last_turn
     return {
         "ok": True,
         "session": session.to_json() if session is not None else None,
@@ -786,7 +788,8 @@ def status(repo: str | Path) -> dict[str, Any]:
             }
             for item in pending
         ],
-        "last_turn": entry.last_turn,
+        "last_turn": last_turn,
+        "provider_failure": _provider_failure(last_turn),
         "thinking_display": entry.orchestrator.thinking_display,
         "wake": _wake_status(entry),
     }
@@ -1112,6 +1115,14 @@ def _clear_suspension(entry: _Entry) -> None:
     wake = entry.wake
     if wake is not None:
         wake.resume()
+
+
+def _provider_failure(last_turn: dict[str, Any] | None) -> str | None:
+    """Why the last turn failed, when the provider is the cause; None otherwise."""
+
+    if last_turn is None or last_turn.get("ok") is not False:
+        return None
+    return manager_loop_wake.classify_failure(last_turn.get("errors") or ())
 
 
 def _wake_status(entry: _Entry) -> dict[str, Any]:

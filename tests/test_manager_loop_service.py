@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+import pytest
+
 _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
@@ -36,6 +38,7 @@ class FakeManagerBackend:
         self.gate: threading.Event | None = None
         self.entered = threading.Event()
         self.process_ended_early = False
+        self.next_error: str | None = None
 
     def start(self, brief: str) -> str:
         self.briefs.append(brief)
@@ -47,6 +50,9 @@ class FakeManagerBackend:
         self.entered.set()
         if self.gate is not None:
             assert self.gate.wait(timeout=10)
+        if self.next_error is not None:
+            error, self.next_error = self.next_error, None
+            return iter([{"type": "error", "payload": {"source": "backend", "error": error}}])
         if self.process_ended_early:
             self.process_ended_early = False
             return iter([{"type": "error", "payload": {"source": "backend", "error": "worker_failed"}}])
@@ -127,6 +133,60 @@ def _install_fakes(monkeypatch: Any) -> list[FakeManagerBackend]:
     # Keep service tests off the live probe unless a case lists models itself.
     monkeypatch.setattr(manager_loop_service, "_opencode_discovered_models", lambda: [])
     return backends
+
+
+def _run_turn(tmp_path: Path, text: str = "hello") -> dict[str, Any]:
+    assert manager_loop_service.send(tmp_path, text)["ok"] is True
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+    return manager_loop_service.status(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        ("Usage limit reached, resets 5am", "provider_limit"),
+        ("Failed to authenticate. Please run /login", "provider_auth"),
+    ],
+)
+def test_status_reports_provider_failure_after_a_failed_turn(
+    monkeypatch: Any, tmp_path: Path, error: str, expected: str
+) -> None:
+    backends = _install_fakes(monkeypatch)
+    assert manager_loop_service.start(tmp_path, "fake", "model-a")["ok"] is True
+    backends[-1].next_error = error
+
+    status = _run_turn(tmp_path)
+
+    assert status["last_turn"]["ok"] is False
+    assert status["provider_failure"] == expected
+
+
+def test_status_provider_failure_is_none_after_a_generic_failure(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    backends = _install_fakes(monkeypatch)
+    assert manager_loop_service.start(tmp_path, "fake", "model-a")["ok"] is True
+    backends[-1].next_error = "worker_failed"
+
+    status = _run_turn(tmp_path)
+
+    assert status["last_turn"]["ok"] is False
+    assert status["provider_failure"] is None
+
+
+def test_status_provider_failure_clears_after_a_good_turn(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    backends = _install_fakes(monkeypatch)
+    assert manager_loop_service.start(tmp_path, "fake", "model-a")["ok"] is True
+    assert manager_loop_service.status(tmp_path)["provider_failure"] is None, "no turn yet"
+    backends[-1].next_error = "Usage limit reached"
+    assert _run_turn(tmp_path)["provider_failure"] == "provider_limit"
+
+    status = _run_turn(tmp_path, "again")
+
+    assert status["last_turn"]["ok"] is True
+    assert status["provider_failure"] is None
 
 
 def test_send_runs_in_background_and_status_and_events_catch_up_once_finished(
