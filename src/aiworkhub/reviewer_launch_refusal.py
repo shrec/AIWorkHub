@@ -13,6 +13,8 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
+from . import vscode_lm_activity
+
 RETAINED_RECOVERY_STATE = "starting_reservation_retained"
 DETAIL_LIMIT = 500
 
@@ -183,6 +185,28 @@ def launch_failure_code(failure_reason: Any) -> str:
     """``LAUNCH_FAILURE_CLASS`` for a launch-class reason, else ``""``."""
 
     return LAUNCH_FAILURE_CLASS if launch_class_retirement(failure_reason) else ""
+
+
+LAUNCH_EXCEPTION_PREFIX = "launch_exception"
+_EXCEPTION_MESSAGE_UNSAFE = re.compile(r"[^A-Za-z0-9_.\- ]+")
+EXCEPTION_MESSAGE_LIMIT = 160
+
+
+def launch_exception_reason(exc: BaseException) -> str:
+    """The bounded fault a reviewer launch that raised leaves on its attempt.
+
+    NF-2026-02107. Its class and message, reduced to a closed character set so
+    the ``:``-separated reason stays parseable and no message can spell the
+    route-hold marker. Recognized secrets are redacted first, because the
+    filter strips the ``=`` and ``:`` the redaction patterns need.
+    """
+
+    redacted = vscode_lm_activity.redact_text(str(exc), parse_json=False)
+    message = _EXCEPTION_MESSAGE_UNSAFE.sub(" ", redacted).strip()
+    return (
+        f"{LAUNCH_EXCEPTION_PREFIX}:{type(exc).__name__}"
+        f":{message[:EXCEPTION_MESSAGE_LIMIT]}"
+    )
 
 
 def launch_failure_skip_reason(

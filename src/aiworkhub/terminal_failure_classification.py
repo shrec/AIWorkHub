@@ -250,10 +250,24 @@ _VSCODE_LM_TRANSPORT_CODES: tuple[str, ...] = (
 # The wrapper names only "the bridge turn failed"; what it wraps names why.
 _VSCODE_LM_REQUEST_FAILED = "vscode_lm_request_failed"
 
+# NF-2026-02107: the wrapper names only "the bridge turn failed", and an editor
+# host's expired login arrives inside it. This module's own constant replaces
+# the host's sentence so the diagnosis survives the no-copy rule above. Only the
+# host-owned body right after the wrapper counts: the ``:diagnostics=`` blob
+# carries a preview of model text and is never evidence about a credential.
+VSCODE_LM_CREDENTIAL_REJECTED = "vscode_lm_credential_rejected"
+_VSCODE_LM_CREDENTIAL_ENVELOPE = re.compile(
+    r"\A(?:(?:(?!:diagnostics=)[\s\S])*?[^0-9A-Za-z_])?" + _VSCODE_LM_REQUEST_FAILED + r":"
+    r"(?:(?!:diagnostics=)[^\r\n]){0,512}?"
+    r"(?:token[\s_]+expired|expired[\s_]+token|incorrect[\s_]+token"
+    r"|token[\s_]+(?:is[\s_]+)?(?:invalid|incorrect)|authenticat(?:ion|e|ing))",
+    re.IGNORECASE,
+)
+
 _VSCODE_LM_CODES: tuple[str, ...] = (
     _VSCODE_LM_BEHAVIOUR_CODES
     + _VSCODE_LM_TRANSPORT_CODES
-    + (_VSCODE_LM_REQUEST_FAILED,)
+    + (VSCODE_LM_CREDENTIAL_REJECTED, _VSCODE_LM_REQUEST_FAILED)
 )
 
 # --------------------------------------------------------------------------- #
@@ -317,7 +331,13 @@ _OS_FILESYSTEM_DENIAL = re.compile(
 )
 
 _SIGNATURES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
-    (_whole_token_pattern(code), code) for code in _VSCODE_LM_CODES
+    (
+        _VSCODE_LM_CREDENTIAL_ENVELOPE
+        if code == VSCODE_LM_CREDENTIAL_REJECTED
+        else _whole_token_pattern(code),
+        code,
+    )
+    for code in _VSCODE_LM_CODES
 ) + (
     (_whole_token_pattern(_FILESYSTEM_GRANT_FAILED_REASON), _SANDBOX_FILESYSTEM_GRANT_FAILED),
     (_OS_FILESYSTEM_DENIAL, _SANDBOX_FILESYSTEM_DENIED),
@@ -3179,11 +3199,14 @@ _SUBSTATUS_CAUSE: dict[str, str] = {
 _SEALED_CAPACITY_CODES: frozenset[str] = frozenset({
     "insufficient_quota", "quota_exhausted",
 })
-_SEALED_CREDENTIAL_CODES: frozenset[str] = frozenset({
+_SEALED_BALANCE_CODES: frozenset[str] = frozenset({
     "insufficient_balance", "balance_exhausted",
+})
+_SEALED_CREDENTIAL_CODES: frozenset[str] = _SEALED_BALANCE_CODES | frozenset({
     "invalid_grant", "unknown_refresh_token", "invalid_api_key", "unauthorized",
     "authentication_failed", "authorization_failed",
 })
+_REVIEWER_ROUTE_CREDENTIAL_EVIDENCE = "reviewer_route_credential"
 _SEALED_DEPENDENCY_CODES: frozenset[str] = frozenset({
     "dependency_unavailable", "route_unavailable",
     "upstream_unavailable", "mcp_unavailable",
@@ -3558,6 +3581,35 @@ def reviewer_route_retry_disposition(
     )
 
 
+def reviewer_route_credential_code(reason: Any) -> str:
+    """The adapter-scoped credential code owning one reviewer's reason, or ``""``.
+
+    NF-2026-02107. Selected by the classifier's own whole token, or by the
+    ``vscode_lm_request_failed`` envelope's credential body on a status that
+    still carries that envelope. The value returned is always this module's
+    constant, so no caller text travels. A ``:diagnostics=`` tail is provider
+    controlled and is never evidence about the credential.
+    """
+    text = str(reason or "").partition(":diagnostics=")[0]
+    if any(token.strip() == VSCODE_LM_CREDENTIAL_REJECTED for token in text.split(":")):
+        return VSCODE_LM_CREDENTIAL_REJECTED
+    if _VSCODE_LM_CREDENTIAL_ENVELOPE.search(text):
+        return VSCODE_LM_CREDENTIAL_REJECTED
+    return ""
+
+
+def reviewer_route_credential_disposition(
+    code: str, *, terminal_state: str | None = None,
+) -> dict[str, Any]:
+    """The typed credential hold for one reviewer's own adapter-credential code."""
+    return _typed_disposition(
+        cause=CAUSE_PROVIDER_CREDENTIAL,
+        evidence_authority=EVIDENCE_AUTHORITY_AIWORKHUB_REASON,
+        evidence=f"{_REVIEWER_ROUTE_CREDENTIAL_EVIDENCE}={code}",
+        terminal_state=terminal_state,
+    )
+
+
 VALIDATION_ENVIRONMENT_RECOVERY_SCHEMA_ID = "aiworkhub.validation_environment_recovery.v1"
 
 
@@ -3695,13 +3747,52 @@ def disposition_action(disposition: Any) -> str:
     return action if action in DISPOSITION_ACTIONS else ACTION_MANAGER_JUDGMENT_UNKNOWN
 
 
+def _within_distinct_retry_budget(attempts_made: Any) -> bool:
+    if isinstance(attempts_made, bool) or not isinstance(attempts_made, int):
+        return False
+    return attempts_made <= MAX_DISTINCT_ROUTE_RETRIES
+
+
 def distinct_route_retry_allowed(*, disposition: Any, attempts_made: int) -> bool:
     """One bounded distinct-route retry, and only for a proven route failure."""
     if disposition_action(disposition) != ACTION_ROUTE_RETRY:
         return False
-    if isinstance(attempts_made, bool) or not isinstance(attempts_made, int):
+    return _within_distinct_retry_budget(attempts_made)
+
+
+def adapter_scoped_credential_failure(disposition: Any) -> bool:
+    """Whether a credential hold indicts one adapter's login, not the account.
+
+    NF-2026-02107. A token an editor host or CLI holds is scoped to that
+    adapter, so another adapter can still run the reviewer. An exhausted balance
+    is the account's: no adapter switch adds credit, and it stays a hold. Fails
+    closed: credential evidence this does not name is not adapter-scoped.
+    """
+    if (
+        disposition_action(disposition) != ACTION_CREDENTIAL_HOLD
+        or not isinstance(disposition, dict)
+    ):
         return False
-    return attempts_made <= MAX_DISTINCT_ROUTE_RETRIES
+    kind, _, value = str(disposition.get("evidence") or "").partition("=")
+    if kind == _REVIEWER_ROUTE_CREDENTIAL_EVIDENCE:
+        return True
+    if kind == "refusal_kind":
+        return value == "credential_rejected"
+    if kind == "sealed_provider_code":
+        return value in _SEALED_CREDENTIAL_CODES - _SEALED_BALANCE_CODES
+    if kind == "control_plane_reason":
+        return (
+            value == "claude_subscription_session_refresh_required"
+            or value.startswith("provider_refused_credential_rejected")
+        )
+    return False
+
+
+def adapter_credential_retry_allowed(*, disposition: Any, attempts_made: int) -> bool:
+    """The one relaunch on a different adapter a scoped credential failure earns."""
+    return adapter_scoped_credential_failure(
+        disposition
+    ) and _within_distinct_retry_budget(attempts_made)
 
 
 def same_route_retry_allowed(

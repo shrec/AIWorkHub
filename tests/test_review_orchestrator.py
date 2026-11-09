@@ -557,9 +557,11 @@ def test_provider_asserted_transient_advances_distinct_route_and_converges(
 @pytest.mark.parametrize(
     ("name", "terminal", "action"),
     [
+        # A credential scoped to one adapter is not here: NF-2026-02107 fails it
+        # over, see test_required_lens_never_silent_nf02107.py.
         (
-            "credential",
-            {"state": "launch_failed", "error_code": "credential_rejected"},
+            "balance",
+            {"state": "launch_failed", "error_code": "balance_exhausted"},
             "credential_hold",
         ),
         (
@@ -4519,6 +4521,17 @@ def test_chain_action_stays_pending_while_reviewer_is_still_spawning_nf02108(
     manager.status_results["manual-request"] = _manual_sealed_status()
     assert driver.drain(max_actions=1, now=NOW).completed == 1
     assert manager.accepts == [("manual-request", "MANUAL-REVIEWER")]
+
+
+def test_reviewer_running_states_cover_every_active_process_state_nf02108() -> None:
+    """A state the launcher calls active can never read as a dead reviewer here."""
+    from aiworkhub import process_launcher
+
+    missing = set(process_launcher.ACTIVE_PROCESS_STATES) - set(
+        review_orchestrator._REVIEWER_RUNNING_STATES
+    )
+
+    assert not missing, f"missing from _REVIEWER_RUNNING_STATES: {sorted(missing)}"
 
 
 def test_chain_without_existing_reviewer_for_its_lens_still_launches(

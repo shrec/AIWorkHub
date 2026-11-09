@@ -10,7 +10,7 @@ import time
 import uuid
 from contextlib import ExitStack, closing
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
@@ -556,7 +556,7 @@ def mechanical_reviewer_failure_reason(status: Any) -> str:
 #
 # WHY THAT MATTERS HERE SPECIFICALLY. ``_launch_with_successor`` used to give
 # EVERY terminal route failure a second provider on a distinct route. A quota
-# wall, an expired credential, an unavailable dependency and a finalizer race
+# wall, an exhausted balance, an unavailable dependency and a finalizer race
 # all bought a second reviewer launch that could not possibly succeed -- the
 # blind relaunch this card exists to remove.
 
@@ -647,6 +647,13 @@ def reviewer_terminal_disposition(status: Any) -> dict[str, Any]:
     # manager: route_retry on a distinct route instead of a manager hold --
     # unless the manager cancelled the reviewer or it already submitted.
     if not _reviewer_route_retry_barred(state, card):
+        credential_code = terminal_failure_classification.reviewer_route_credential_code(
+            reason
+        )
+        if credential_code:
+            return terminal_failure_classification.reviewer_route_credential_disposition(
+                credential_code, terminal_state=state,
+            )
         behaviour_code = (
             terminal_failure_classification.reviewer_route_behaviour_code(reason)
             or terminal_failure_classification.reviewer_route_transport_code(reason)
@@ -693,6 +700,8 @@ ROUTE_HOLD_ACTIONS: frozenset[str] = (
 # typed disposition said to do about it.
 _ROUTE_HOLD_MARKER = ":hold="
 _PRE_PROVIDER_HOLD_MARKER = ":provider_launched=false"
+# NF-2026-02107: the retired attempt's adapter failed on its own credential.
+_ADAPTER_CREDENTIAL_MARKER = ":adapter_credential"
 
 
 def route_attempt_hold(failure_reason: Any) -> str:
@@ -733,6 +742,12 @@ def reviewer_route_could_not_inspect(failure_reason: Any) -> bool:
     return quality_evidence.STATUS_REVIEWER_COULD_NOT_INSPECT in tokens
 
 
+def reviewer_route_adapter_credential(failure_reason: Any) -> bool:
+    """Whether a retired attempt's reason says its adapter's credential failed."""
+    tokens = [token.strip() for token in str(failure_reason or "").split(":")]
+    return _ADAPTER_CREDENTIAL_MARKER.lstrip(":") in tokens
+
+
 def _route_attempt_exclusions(
     attempts: Iterable[Mapping[str, Any]],
 ) -> tuple[frozenset[tuple[str, str, str]], frozenset[str]]:
@@ -750,8 +765,9 @@ def _route_attempt_exclusions(
     # turn-protocol code indicts the ADAPTER, not just the one model ranked, so
     # the next attempt excludes every route on that adapter. So do a rate, quota
     # or session limit (the whole provider account), a reviewer that could not
-    # inspect the candidate (NF-2026-01620), and an adapter that could not even
-    # start in this sandbox (NF-2026-02086).
+    # inspect the candidate (NF-2026-01620), an adapter that could not even
+    # start in this sandbox (NF-2026-02086), and a credential scoped to that
+    # adapter (NF-2026-02107).
     excluded_adapters = frozenset(
         str(row["adapter_id"])
         for row in retired
@@ -761,6 +777,7 @@ def _route_attempt_exclusions(
         or reviewer_route_account_limited(row["failure_reason"])
         or reviewer_route_could_not_inspect(row["failure_reason"])
         or reviewer_launch_refusal.launch_class_retirement(row["failure_reason"])
+        or reviewer_route_adapter_credential(row["failure_reason"])
     )
     return excluded, excluded_adapters
 
@@ -771,7 +788,8 @@ def reviewer_recovery_dispatch(
     """The ONE mechanical next step for a terminal reviewer attempt.
 
     ``relaunch_distinct_route`` is true only for a route failure the PROVIDER
-    asserted, and only within the single bounded retry
+    asserted or a credential scoped to this one adapter, and only within the
+    single bounded retry
     ``terminal_failure_classification.MAX_DISTINCT_ROUTE_RETRIES`` allows.
 
     ``route_hold`` is the stronger statement: no further reviewer attempt on
@@ -781,14 +799,20 @@ def reviewer_recovery_dispatch(
     """
     disposition = reviewer_terminal_disposition(status)
     action = terminal_failure_classification.disposition_action(disposition)
+    adapter_credential = (
+        terminal_failure_classification.adapter_scoped_credential_failure(disposition)
+    )
     relaunch = terminal_failure_classification.distinct_route_retry_allowed(
+        disposition=disposition, attempts_made=attempts_made,
+    ) or terminal_failure_classification.adapter_credential_retry_allowed(
         disposition=disposition, attempts_made=attempts_made,
     )
     return {
         "schema_id": REVIEWER_RECOVERY_SCHEMA,
         "action": action,
         "relaunch_distinct_route": relaunch,
-        "route_hold": action in ROUTE_HOLD_ACTIONS,
+        "route_hold": action in ROUTE_HOLD_ACTIONS and not (adapter_credential and relaunch),
+        "adapter_credential": adapter_credential,
         "disposition": dict(disposition),
         "telemetry": terminal_failure_classification.disposition_telemetry(
             disposition,
@@ -1271,6 +1295,39 @@ ROUTE_FALLBACK_TABLE = (
     "fallback_json TEXT NOT NULL, "
     "PRIMARY KEY (chain_id, lens, attempt_index))"
 )
+
+# NF-2026-02107: what each required lens's absence was last reported as, so one
+# reason reaches the target once and not on every pass. Three reserved rows share
+# the table: ``lens=''`` settles a chain nothing further is owed to, chain 0 holds
+# the page cursor, and a settlement fault is named beside the lenses it touched.
+LENS_BLOCKER_TABLE = (
+    "CREATE TABLE IF NOT EXISTS review_orchestrator_lens_blockers ("
+    "chain_id INTEGER NOT NULL, lens TEXT NOT NULL, reason TEXT NOT NULL, "
+    "recorded_at TEXT NOT NULL, PRIMARY KEY (chain_id, lens))"
+)
+_LENS_NOT_OWED = ""
+_LENS_SETTLEMENT_CURSOR = "_cursor"
+_LENS_SETTLEMENT_FAULT = "_fault"
+# The same 60 seconds a deferred launch tells its reader to wait before looking.
+_LENS_SETTLE_WINDOW_SECONDS = 60
+_LENS_SETTLE_CHAIN_LIMIT = 8
+_LENS_REASON_LIMIT = 300
+_LENS_DRIVING_ACTION_STATES = frozenset({"pending", "reserved"})
+_LENS_BLOCKED = "blocked"
+_LENS_RELAUNCH = "relaunch"
+_LENS_WAITING_PREFIX = "waiting_on_lens:"
+_LENS_FAULT_UNREPORTED = "unreported:"
+_TERMINAL_ROUTE_BINDING_INVALID = "reviewer_terminal_route_binding_invalid"
+
+
+@dataclass
+class _LensRelaunchBudget:
+    """What one drain's settlement may still launch, and what those launches did."""
+
+    remaining: int
+    completed: int = 0
+    failed: int = 0
+
 
 MANAGER_HOLD_DECISION_SCHEMA = "aiworkhub.review_manager_hold_decision.v1"
 MANAGER_HOLD_DECISION_TABLE = (
@@ -2579,7 +2636,8 @@ class ReviewOrchestrator:
         # cursor into the new round, so later ready chains remain reachable.
         # The bounded loop still caps work even if storage is adversarial.
         seen_actions: set[int] = set()
-        for _ in range(max(0, min(int(max_actions), DEFAULT_DRAIN_MAX_ACTIONS))):
+        action_bound = max(0, min(int(max_actions), DEFAULT_DRAIN_MAX_ACTIONS))
+        for _ in range(action_bound):
             token = uuid.uuid4().hex
             action = review_lifecycle.reserve_next_action(
                 self.db_path,
@@ -2650,6 +2708,11 @@ class ReviewOrchestrator:
             if isinstance(receipt.get("manager_ready"), Mapping):
                 self._publish_completed_manager_ready()
             completed += 1
+        relaunches = _LensRelaunchBudget(remaining=max(0, action_bound - attempted))
+        self._settle_required_lenses(now=instant, budget=relaunches)
+        attempted += relaunches.completed + relaunches.failed
+        completed += relaunches.completed
+        failed += relaunches.failed
         return DrainResult(
             attempted, completed, failed, pending,
             review_lifecycle.lifecycle_counts(self.db_path),
@@ -3774,13 +3837,15 @@ class ReviewOrchestrator:
             # that reviewer's sealed report. Nothing is retired on a guess.
             return None
         if not self._attempt_route_binding_matches(status, attempt):
-            raise RuntimeError("reviewer_terminal_route_binding_invalid")
+            raise RuntimeError(_TERMINAL_ROUTE_BINDING_INVALID)
         dispatch = reviewer_recovery_dispatch(
             status, attempts_made=int(attempt["attempt_index"]),
         )
-        retirement = route_failure
+        retirement, dispatch = self._credential_failover(
+            action, attempt, route_failure, dispatch,
+        )
         if dispatch["route_hold"]:
-            retirement = f"{route_failure}{_ROUTE_HOLD_MARKER}{dispatch['action']}"
+            retirement = f"{retirement}{_ROUTE_HOLD_MARKER}{dispatch['action']}"
         if not self._retire_route_attempt(action, attempt, retirement):
             return None
         return self._route_attempts(action.chain_id, action.lens)
@@ -3979,9 +4044,13 @@ class ReviewOrchestrator:
             raise
 
     def _successor_route_selectable(
-        self, action: review_lifecycle.ReviewAction, attempt: Mapping[str, Any]
+        self,
+        action: review_lifecycle.ReviewAction,
+        attempt: Mapping[str, Any],
+        *,
+        retirement: str = _COULD_NOT_INSPECT_RETIREMENT,
     ) -> bool:
-        """Whether a route is left once ``attempt`` retires as could-not-inspect.
+        """Whether a route is left once ``attempt`` retires with ``retirement``.
 
         NF-2026-01620: answered BEFORE that retirement commits, and with no side
         effect -- the exclusions ``_plan_route_attempt`` derives from the retired
@@ -3992,7 +4061,7 @@ class ReviewOrchestrator:
         """
         retiring = {
             **attempt, "state": "retired",
-            "failure_reason": _COULD_NOT_INSPECT_RETIREMENT,
+            "failure_reason": retirement,
         }
         attempts = [
             row for row in self._route_attempts(action.chain_id, action.lens)
@@ -4027,12 +4096,16 @@ class ReviewOrchestrator:
                 conn.execute(ROUTE_ATTEMPT_TABLE)
                 conn.execute(
                     "UPDATE review_orchestrator_route_attempts "
-                    "SET reviewer_request_id=?,state='launched' "
+                    "SET reviewer_request_id=?,state='launched',"
+                    "failure_reason=CASE WHEN failure_reason LIKE ? THEN '' "
+                    "ELSE failure_reason END "
                     "WHERE chain_id=? AND lens=? AND attempt_index=? "
                     "AND state IN ('planned','launched') "
                     "AND reviewer_request_id IN ('',?)",
                     (
-                        request_id, int(action.chain_id), action.lens,
+                        request_id,
+                        reviewer_launch_refusal.LAUNCH_EXCEPTION_PREFIX + ":%",
+                        int(action.chain_id), action.lens,
                         int(attempt["attempt_index"]), request_id,
                     ),
                 )
@@ -4135,7 +4208,8 @@ class ReviewOrchestrator:
                 **({"hedge_incumbent_request_id": hedge_incumbent_request_id}
                    if hedge_incumbent_request_id else {}),
             )
-        except Exception:  # noqa: BLE001 -- reconcile the pre-bound task on retry
+        except Exception as exc:  # noqa: BLE001 -- reconcile the pre-bound task on retry
+            self._note_route_attempt_launch_fault(action, attempt, exc)
             return None
         route_failure = mechanical_reviewer_failure_reason(result)
         if route_failure:
@@ -4174,6 +4248,9 @@ class ReviewOrchestrator:
             # NF-2026-02086: a launch-class failure names its adapter and request.
             retirement = reviewer_launch_refusal.launch_failure_skip_reason(
                 route_failure, result, str(attempt["adapter_id"]),
+            )
+            retirement, dispatch = self._credential_failover(
+                action, attempt, retirement, dispatch,
             )
             pre_provider_credential_hold = (
                 dispatch["action"]
@@ -4224,12 +4301,14 @@ class ReviewOrchestrator:
         """Launch an attempt, advancing once when the TYPED action allows it.
 
         The successor launch is no longer automatic. It happens only when the
-        canonical disposition says this was a provider-asserted route failure
-        and the single bounded distinct-route retry is still unspent. A quota
-        wall, an expired credential, a missing dependency, a finalizer race, a
-        candidate defect and an unestablished cause each leave the retired
-        attempt where it is for a manager or a hold to settle -- none of them
-        can be fixed by spending a second reviewer on a different model.
+        canonical disposition says this was a provider-asserted route failure,
+        or a credential scoped to this one adapter (an expired editor-hosted
+        token cannot stop a different adapter), and the single bounded
+        distinct-route retry is still unspent. A quota wall, an exhausted
+        balance, a missing dependency, a finalizer race, a candidate defect and
+        an unestablished cause each leave the retired attempt where it is for a
+        manager or a hold to settle -- none of them can be fixed by spending a
+        second reviewer on a different model.
         """
         current = dict(attempt)
         for launch_index in range(2):
@@ -4250,6 +4329,53 @@ class ReviewOrchestrator:
                 return None
             current = self._plan_deferrable_route_attempt(action)
         return None
+
+    def _credential_failover(
+        self,
+        action: review_lifecycle.ReviewAction,
+        attempt: Mapping[str, Any],
+        retirement: str,
+        dispatch: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        """Stamp a scoped credential failure, keeping its relaunch only if it can run.
+
+        NF-2026-02107. The stamp is what excludes the whole adapter from the next
+        plan. With no route left off that adapter the failure becomes a hold,
+        so the retired attempt names the reason instead of the lens waiting on
+        ``review_route_unavailable``.
+        """
+        if dispatch.get("adapter_credential") is not True:
+            return retirement, dispatch
+        stamped = retirement + _ADAPTER_CREDENTIAL_MARKER
+        if dispatch["relaunch_distinct_route"] is True and self._successor_route_selectable(
+            action, attempt, retirement=stamped,
+        ):
+            return stamped, dispatch
+        return stamped, {**dispatch, "relaunch_distinct_route": False, "route_hold": True}
+
+    def _note_route_attempt_launch_fault(
+        self,
+        action: review_lifecycle.ReviewAction,
+        attempt: Mapping[str, Any],
+        exc: BaseException,
+    ) -> None:
+        """Write why a launch raised on its still-retryable attempt (NF-2026-02107)."""
+        try:
+            with closing(_side_table_connection(self.db_path)) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(ROUTE_ATTEMPT_TABLE)
+                conn.execute(
+                    "UPDATE review_orchestrator_route_attempts SET failure_reason=? "
+                    "WHERE chain_id=? AND lens=? AND attempt_index=? "
+                    "AND state IN ('planned','launched')",
+                    (
+                        reviewer_launch_refusal.launch_exception_reason(exc),
+                        int(action.chain_id), action.lens,
+                        int(attempt["attempt_index"]),
+                    ),
+                )
+        except sqlite3.Error:
+            return  # The retry is what matters; it reaches this path again.
 
     def _retire_route_attempt(
         self,
@@ -4492,7 +4618,7 @@ class ReviewOrchestrator:
                 # exact attempt", shared with the launched-attempt
                 # reconciliation: two copies of an identity rule are two rules.
                 if not self._attempt_route_binding_matches(status, attempt):
-                    raise RuntimeError("reviewer_terminal_route_binding_invalid")
+                    raise RuntimeError(_TERMINAL_ROUTE_BINDING_INVALID)
                 # Same typed gate as the launch path. A reviewer that RAN and
                 # died is the more expensive half of the measured waste: before
                 # this, EVERY terminal reviewer state bought a second reviewer
@@ -4500,10 +4626,12 @@ class ReviewOrchestrator:
                 dispatch = reviewer_recovery_dispatch(
                     status, attempts_made=int(attempt["attempt_index"]),
                 )
-                retirement = route_failure
+                retirement, dispatch = self._credential_failover(
+                    action, attempt, route_failure, dispatch,
+                )
                 if dispatch["route_hold"]:
                     retirement = (
-                        f"{route_failure}{_ROUTE_HOLD_MARKER}{dispatch['action']}"
+                        f"{retirement}{_ROUTE_HOLD_MARKER}{dispatch['action']}"
                     )
                 if not self._retire_route_attempt(action, attempt, retirement):
                     return None
@@ -5025,6 +5153,317 @@ class ReviewOrchestrator:
             "task_id": identity["target_task_id"],
             "review_automation": automation,
         })
+
+    def _settle_required_lenses(
+        self, *, now: datetime, budget: _LensRelaunchBudget,
+    ) -> None:
+        """Leave no required lens absent without a reviewer or a named reason.
+
+        NF-2026-02107: a lens could end a chain with nothing launched and nothing
+        said, so the target sat at ``required_reviewer_missing`` until a manager
+        launched it by hand. Runs once at the end of each drain, over a bounded
+        page of chains old enough to have left the readiness window, and any
+        relaunch spends what is left of that drain's action bound. A store
+        fault leaves the pass's committed effects standing; the next pass reads
+        the same state again.
+        """
+        try:
+            for chain_id in self._lens_settlement_candidates(now):
+                try:
+                    self._settle_chain_lenses(chain_id, now, budget)
+                except Exception as exc:  # noqa: BLE001 -- one chain cannot end the pass
+                    self._record_settlement_fault(chain_id, exc, now)
+        except sqlite3.Error:
+            return
+
+    def _record_settlement_fault(self, chain_id: int, exc: Exception, now: datetime) -> None:
+        """Keep one chain's settlement fault and say each new one on its target.
+
+        Event first, as for a lens: a reason the target could not be told is
+        stored marked unreported, so the next pass sees it as new and says it.
+        """
+        reason = reviewer_launch_refusal.launch_exception_reason(exc)[:_LENS_REASON_LIMIT]
+        if self._lens_blocker_reasons(chain_id).get(_LENS_SETTLEMENT_FAULT) == reason:
+            return
+        try:
+            action = next(
+                row for row in review_lifecycle.actions_for_chain(self.db_path, chain_id)
+                if row.action_type == "launch"
+            )
+            self._append_lens_blocked_event(action, _LENS_SETTLEMENT_FAULT, reason, now)
+        except Exception:  # noqa: BLE001 -- telling the target cannot end the pass
+            reason = _LENS_FAULT_UNREPORTED + reason
+        self._store_lens_blocker(chain_id, _LENS_SETTLEMENT_FAULT, reason, now)
+
+    def _lens_settlement_candidates(self, now: datetime) -> list[int]:
+        """One page of unfinished chains, advancing a durable cursor each pass."""
+        cutoff = review_lifecycle._format_utc(
+            now - timedelta(seconds=_LENS_SETTLE_WINDOW_SECONDS)
+        )
+        page = (
+            "SELECT chain_id FROM review_action_outbox "
+            "WHERE action_type='target_accept' AND state<>'completed' "
+            "AND created_at<=? AND chain_id>? AND chain_id NOT IN ("
+            "SELECT chain_id FROM review_orchestrator_lens_blockers WHERE lens=?) "
+            "ORDER BY chain_id LIMIT ?"
+        )
+        with closing(_side_table_connection(self.db_path)) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(LENS_BLOCKER_TABLE)
+            row = conn.execute(
+                "SELECT reason FROM review_orchestrator_lens_blockers "
+                "WHERE chain_id=0 AND lens=?",
+                (_LENS_SETTLEMENT_CURSOR,),
+            ).fetchone()
+            cursor = int(row[0]) if row is not None and str(row[0]).isdigit() else 0
+            params = (cutoff, cursor, _LENS_NOT_OWED, _LENS_SETTLE_CHAIN_LIMIT)
+            rows = conn.execute(page, params).fetchall()
+            if not rows and cursor:
+                rows = conn.execute(page, (cutoff, 0, *params[2:])).fetchall()
+            conn.execute(
+                "INSERT INTO review_orchestrator_lens_blockers "
+                "(chain_id,lens,reason,recorded_at) VALUES (0,?,?,?) "
+                "ON CONFLICT(chain_id,lens) DO UPDATE SET reason=excluded.reason,"
+                "recorded_at=excluded.recorded_at",
+                (
+                    _LENS_SETTLEMENT_CURSOR,
+                    str(int(rows[-1][0]) if rows else 0),
+                    now.isoformat(),
+                ),
+            )
+        return [int(row[0]) for row in rows]
+
+    def _store_lens_blocker(
+        self, chain_id: int, lens: str, reason: str, now: datetime,
+    ) -> None:
+        with closing(_side_table_connection(self.db_path)) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(LENS_BLOCKER_TABLE)
+            conn.execute(
+                "INSERT INTO review_orchestrator_lens_blockers "
+                "(chain_id,lens,reason,recorded_at) VALUES (?,?,?,?) "
+                "ON CONFLICT(chain_id,lens) DO UPDATE SET reason=excluded.reason,"
+                "recorded_at=excluded.recorded_at",
+                (int(chain_id), lens, str(reason)[:_LENS_REASON_LIMIT], now.isoformat()),
+            )
+
+    def _lens_blocker_reasons(self, chain_id: int) -> dict[str, str]:
+        with closing(_side_table_connection(self.db_path, readonly=True)) as conn:
+            rows = conn.execute(
+                "SELECT lens,reason FROM review_orchestrator_lens_blockers WHERE chain_id=?",
+                (int(chain_id),),
+            ).fetchall()
+        return {str(row[0]): str(row[1]) for row in rows}
+
+    def _outbox_lens_states(self, chain_id: int) -> dict[tuple[str, str], tuple[str, str]]:
+        with closing(_side_table_connection(self.db_path, readonly=True)) as conn:
+            rows = conn.execute(
+                "SELECT action_type,lens,state,failure_reason "
+                "FROM review_action_outbox WHERE chain_id=?",
+                (int(chain_id),),
+            ).fetchall()
+        return {(str(row[0]), str(row[1])): (str(row[2]), str(row[3] or "")) for row in rows}
+
+    @staticmethod
+    def _lens_absence(
+        lens: str,
+        states: Mapping[tuple[str, str], tuple[str, str]],
+        receipts: Iterable[Mapping[str, Any]],
+        attempts: list[dict[str, Any]],
+        blocked_lens: str,
+    ) -> tuple[str, str] | None:
+        """``(kind, reason)`` when this lens has no reviewer and nothing driving one."""
+        launch_state, launch_failure = states.get(("launch", lens), ("", ""))
+        accept_state, _accept_failure = states.get(("accept", lens), ("", ""))
+        if accept_state == "completed":
+            return None
+        driven = bool({launch_state, accept_state} & _LENS_DRIVING_ACTION_STATES)
+        if attempts:
+            last = attempts[-1]
+            reason = str(last["failure_reason"] or "")
+            if last["state"] == "launched":
+                return None
+            if last["state"] == "planned":
+                # A planned attempt with a live action is still being retried,
+                # and any launch fault is already written on it.
+                if driven:
+                    return None
+                return _LENS_BLOCKED, reason or launch_failure or "lens_launch_unfinished"
+            if driven and not route_attempt_hold(reason) and len(attempts) < _MAX_ROUTE_ATTEMPTS:
+                return None  # The drain plans the successor this lens is still owed.
+            return _LENS_BLOCKED, reason or "lens_route_attempts_retired"
+        launch_receipt = next(
+            (
+                row for row in receipts
+                if row.get("lens") == lens and row.get("action_type") == "launch"
+            ),
+            {},
+        )
+        if launch_receipt.get("replay") or launch_receipt.get("reviewer_request_id"):
+            return None
+        if launch_state in _LENS_DRIVING_ACTION_STATES:
+            # Its turn has not come. That is only worth saying when the lens
+            # ahead of it can no longer finish without somebody acting.
+            return (_LENS_BLOCKED, _LENS_WAITING_PREFIX + blocked_lens) if blocked_lens else None
+        if launch_state == "failed":
+            return _LENS_BLOCKED, launch_failure or "lens_launch_failed"
+        return _LENS_RELAUNCH, launch_failure or "lens_never_launched"
+
+    def _reconciled_lens_attempts(
+        self,
+        action: review_lifecycle.ReviewAction,
+        states: Mapping[tuple[str, str], tuple[str, str]],
+    ) -> tuple[list[dict[str, Any]], str]:
+        """This lens's attempts, and the binding fault that stopped reading them.
+
+        ``launched`` is a claim about a process. When no action row drives the
+        lens, as after a settlement relaunch, nothing else ever tests that
+        claim, so a dead reviewer is retired here and reported like any other.
+        """
+        attempts = self._route_attempts(action.chain_id, action.lens)
+        launch_state, _launch_failure = states.get(("launch", action.lens), ("", ""))
+        accept_state, _accept_failure = states.get(("accept", action.lens), ("", ""))
+        if (
+            not attempts
+            or attempts[-1]["state"] != "launched"
+            or accept_state == "completed"
+            or {launch_state, accept_state} & _LENS_DRIVING_ACTION_STATES
+        ):
+            return attempts, ""
+        try:
+            return self._reconcile_launched_attempt(action, attempts[-1]) or attempts, ""
+        except RuntimeError as exc:
+            # One bad binding is this lens's blocker, not the whole chain's fault.
+            if str(exc) != _TERMINAL_ROUTE_BINDING_INVALID:
+                raise
+            return attempts, _TERMINAL_ROUTE_BINDING_INVALID
+
+    def _settle_chain_lenses(
+        self, chain_id: int, now: datetime, budget: _LensRelaunchBudget,
+    ) -> None:
+        launches = {
+            action.lens: action
+            for action in review_lifecycle.actions_for_chain(self.db_path, chain_id)
+            if action.action_type == "launch"
+        }
+        states = self._outbox_lens_states(chain_id)
+        receipts = self._receipts(chain_id)
+        findings: list[tuple[str, str, str]] = []
+        blocked_lens = ""
+        for lens in required_lenses(self.db_path, chain_id):
+            attempts, binding_fault = self._reconciled_lens_attempts(launches[lens], states)
+            absence = (
+                (_LENS_BLOCKED, binding_fault) if binding_fault
+                else self._lens_absence(lens, states, receipts, attempts, blocked_lens)
+            )
+            if absence is not None:
+                findings.append((lens, *absence))
+                blocked_lens = blocked_lens or lens
+        if not findings:
+            return
+        first = launches[findings[0][0]]
+        decided = self._target_left_review(
+            str(first.descriptor["chain_identity"]["target_task_id"])
+        )
+        if decided:
+            self._store_lens_blocker(chain_id, _LENS_NOT_OWED, "target_left_review:" + decided, now)
+            return
+        # The same gate a launch passes: nothing is owed to a candidate that was
+        # superseded, and nothing can be said yet about one not ready for review.
+        readiness = self._launch_readiness(first)
+        if readiness["outcome"] in {"obsolete", "terminal"}:
+            self._store_lens_blocker(chain_id, _LENS_NOT_OWED, str(readiness["reason"]), now)
+            return
+        if readiness["outcome"] != "ready":
+            return
+        recorded = self._lens_blocker_reasons(chain_id)
+        for lens, kind, reason in findings:
+            if kind == _LENS_RELAUNCH:
+                # A waiting record says only that an earlier lens held this one
+                # back, and spends nothing of the relaunch this lens is owed.
+                if lens in recorded and not recorded[lens].startswith(_LENS_WAITING_PREFIX):
+                    continue  # Its one relaunch is spent and the reason is on record.
+                reason = self._relaunch_absent_lens(launches[lens], budget)
+                if not reason:
+                    continue
+            bounded = str(reason)[:_LENS_REASON_LIMIT]
+            if recorded.get(lens) != bounded:
+                self._record_lens_blocker(launches[lens], bounded, now)
+
+    def _lens_reviewer_is_bound(self, action: review_lifecycle.ReviewAction) -> bool:
+        """Whether a reviewer outside this chain's attempts already answers for the lens.
+
+        The launcher's own binding read, so a reviewer started by hand counts,
+        unless its terminal substatus shows it failed. It scans every reviewer
+        card, so it is asked only when a relaunch is about to happen.
+        """
+        from . import process_launcher_accept_review
+
+        identity = action.descriptor["chain_identity"]
+        standing = {"", *_REVIEWER_SEALED_EVENT_STATES}
+        return any(
+            row["lens"] == action.lens and row["terminal_substatus"] in standing
+            for row in process_launcher_accept_review.bound_reviewer_rows(
+                self.manager.repo,
+                str(identity["target_task_id"]),
+                str(identity["target_request_id"]),
+            )
+        )
+
+    def _relaunch_absent_lens(
+        self, action: review_lifecycle.ReviewAction, budget: _LensRelaunchBudget,
+    ) -> str:
+        """The lens's one relaunch: ``""`` when nothing more is owed this pass.
+
+        Otherwise why it could not launch. Out of budget means the next pass
+        decides, so nothing is said about it here.
+        """
+        if budget.remaining <= 0 or self._lens_reviewer_is_bound(action):
+            return ""
+        budget.remaining -= 1
+        budget.failed += 1  # Until the launch is seen to have held.
+        try:
+            self._launch_with_successor(action, self._plan_route_attempt(action))
+        except RuntimeError as exc:
+            return reviewer_launch_refusal.launch_exception_reason(exc)
+        attempts = self._route_attempts(action.chain_id, action.lens)
+        if attempts and attempts[-1]["state"] == "launched":
+            budget.failed -= 1
+            budget.completed += 1
+            return ""
+        reason = str(attempts[-1]["failure_reason"] or "") if attempts else ""
+        return reason or "lens_relaunch_unacknowledged"
+
+    def _record_lens_blocker(
+        self, action: review_lifecycle.ReviewAction, reason: str, now: datetime,
+    ) -> None:
+        """Put the reason on the target, then remember it was said.
+
+        Event first: if the append raises, nothing is remembered, and the next
+        pass says it again.
+        """
+        self._append_lens_blocked_event(action, action.lens, reason, now)
+        self._store_lens_blocker(action.chain_id, action.lens, reason, now)
+
+    def _append_lens_blocked_event(
+        self, action: review_lifecycle.ReviewAction, lens: str, reason: str, now: datetime,
+    ) -> None:
+        identity = action.descriptor["chain_identity"]
+        append = getattr(self.manager, "_append_event", None)
+        if callable(append):
+            append({
+                "event_type": "review_orchestrator_lens_blocked",
+                "request_id": identity["target_request_id"],
+                "task_id": identity["target_task_id"],
+                "review_automation": {
+                    "state": "lens_blocked",
+                    "lens": lens,
+                    "reason": reason,
+                    "action_id": action.action_id,
+                    "chain_id": action.chain_id,
+                    "recorded_at": now.isoformat(),
+                },
+            })
 
     def _linked_needfix_rows(self, target_task_id: str) -> list[dict[str, Any]]:
         """Return every durable NeedFix row already bound to this exact task."""
