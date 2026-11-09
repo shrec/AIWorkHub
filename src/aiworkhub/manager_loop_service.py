@@ -338,7 +338,8 @@ def _enqueue_send(entry: _Entry, queued: _QueuedSend | None) -> dict[str, Any]:
     (start, rename, close...) or a turn still binding its session refuses as before.
     """
 
-    if queued is None or not entry.turn_running:
+    # running_turn is None while the turn binds: a bind failure would strand the message.
+    if queued is None or not entry.turn_running or entry.running_turn is None:
         return {"ok": False, "error": "manager_turn_in_progress"}
     if len(entry.send_queue) >= SEND_QUEUE_LIMIT:
         return {"ok": False, "error": "manager_send_queue_full"}
@@ -428,9 +429,16 @@ def _dispatch_turn(
     with entry.queue_lock:
         if not entry.turn_lock.acquire(blocking=False):
             return _enqueue_send(entry, queued)
+        # stop() must see this turn while it binds; it has no turn number until then.
+        entry.turn_running = True
+        entry.running_turn = None
     session, err = _bind_turn_session(entry, repo, route=route, pin_passive_route=pin_passive_route)
     if err is not None:
-        entry.turn_lock.release()
+        with entry.queue_lock:
+            # A stop armed for this refused turn must not reach the next one.
+            entry.orchestrator.disarm_stop()
+            entry.turn_running = False
+            entry.turn_lock.release()
         return err
     turn = session.turn_count + 1
     session_id = session.session_id
@@ -490,7 +498,6 @@ def _dispatch_turn(
     thread = threading.Thread(target=run, daemon=True)
     entry.thread = thread
     with entry.queue_lock:
-        entry.turn_running = True
         entry.running_turn = (session_id, turn)
     thread.start()
     return {"ok": True, "session_id": session_id, "turn": turn, "state": "running"}

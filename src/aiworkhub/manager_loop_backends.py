@@ -68,6 +68,8 @@ DEFAULT_TURN_TIMEOUT_SECONDS = 3600.0
 MAX_ERROR_DETAIL_CHARS = 500
 MAX_STDERR_CHARS = 2000
 REAP_TIMEOUT_SECONDS = 5.0
+# The owner is waiting on Stop, so close() gets a short graceful window.
+CLOSE_GRACE_SECONDS = 1.0
 
 # The conversation id spellings the three CLIs report; the first non-empty one
 # seen in a turn is what the next turn resumes.
@@ -753,13 +755,17 @@ def _reap(process: Any) -> int:
         return -1
 
 
-def _end_process(process: Any) -> None:
-    """Stop one CLI process tree through the platform facade; never raises."""
+def _end_process(process: Any, *, grace_seconds: float | None = None) -> None:
+    """Stop one CLI process tree through the platform facade; never raises.
+
+    ``grace_seconds`` bounds the facade's graceful window; ``None`` keeps its default.
+    """
     if process is None or process.poll() is not None:
         return
     pid = getattr(process, "pid", None)
     if isinstance(pid, int) and pid > 0:
-        platform_io.terminate_process_tree(pid)
+        options = {} if grace_seconds is None else {"timeout": grace_seconds}
+        platform_io.terminate_process_tree(pid, **options)
     if process.poll() is None:
         try:
             process.kill()
@@ -874,7 +880,7 @@ class CliManagerBackend:
         """End the turn's process if one is alive; safe to call any number of times."""
         with self._slot:
             process, self._process = self._process, None
-        _end_process(process)
+        _end_process(process, grace_seconds=CLOSE_GRACE_SECONDS)
 
     def argv_for(self, plan: Any) -> list[str]:
         """This turn's argv: the adapter plan, minus what a manager turn cannot keep."""

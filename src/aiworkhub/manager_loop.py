@@ -1451,7 +1451,8 @@ class ManagerOrchestrator:
         self._record(session, turn, inbound, asked)
         events, grown, reply = self._exchange(session, turn, message)
         errors = [event["payload"] for event in events if event["type"] == "error"]
-        if any(event["type"] == "turn_stopped" for event in events):
+        stopped = any(event["type"] == "turn_stopped" for event in events)
+        if stopped:
             errors.append({"source": "loop", "error": TURN_STOPPED_ERROR})
         written = self._call(
             self._event_writer,
@@ -1513,7 +1514,8 @@ class ManagerOrchestrator:
             full = True
         # NF-2026-01915: a turn that died on an expired login or a usage limit did no work;
         # rotating here only re-bills a handoff and mislabels the close as context_threshold.
-        if full and (reply or not classify_failure(errors)):
+        # NF-2026-02197: the owner's Stop never starts a model call; the next completed turn rotates.
+        if full and not stopped and (reply or not classify_failure(errors)):
             result["rotation"] = self._rotate("context_threshold", successor=True)
         return result
 
@@ -1549,6 +1551,10 @@ class ManagerOrchestrator:
                 events.append(self._record(session, turn, "turn_stopped", {"by": "owner"}))
                 return events, grown, ""
             for raw in backend.send(message):
+                # A stop that landed before the provider process existed closed nothing.
+                # An event means the process exists now; close is safe to repeat.
+                if self._stop_requested:
+                    backend.close()
                 if isinstance(raw, Mapping) and raw.get("type") == "delta":
                     self._grow_partial(session, turn, raw.get("payload"))
                     continue
