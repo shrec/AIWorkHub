@@ -7476,6 +7476,7 @@ def reject_review(
     }
     if base_drift_proof is not None:
         card["rejection_disposition"]["base_drift_proof"] = base_drift_proof
+    accept_failure_cause.mark_rejected_replay(card, terminal_disposition, rejected_request_id, _review_identity_request_id(card))
     # A validation-only replay grant is bound to the episode the manager just
     # adjudicated.  If that candidate is rejected, the successor must invoke a
     # provider to apply the feedback instead of replaying the rejected bytes.
@@ -7816,6 +7817,7 @@ def recover_blocked_rework(
     allowed_writes_amendment: list[str] | None = None,
     validation_amendment_mode: str = "append",
     validation_roles_amendment: list[str] | None = None,
+    infra_reject_preimage_out: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Recover one exact blocked task through the canonical task-store transaction."""
     amendment_paths = allowed_writes_amendment or []
@@ -7883,7 +7885,7 @@ def recover_blocked_rework(
         return blocked
     if (
         validation_only_replay
-        and str(card.get("status") or "").strip().lower() == "blocked"
+        and (infra_reject_preimage_out is not None or str(card.get("status") or "").strip().lower() == "blocked")
         and _validation_replay_predecessor_gate_missing(card, task_id=task_id)
     ):
         # NF-2026-01112: the launcher refuses such a replay on every launch.
@@ -7907,6 +7909,8 @@ def recover_blocked_rework(
                 clean_root_if_predecessor_missing
             ),
         }
+        if infra_reject_preimage_out is not None:
+            task_store_kwargs.update(infra_reject_replay=True, infra_reject_preimage_out=infra_reject_preimage_out)
         if scope_rejection_resolved:
             # NF-2026-01169: forwarded only when set, so the default call is
             # byte-for-byte the pre-existing transaction.

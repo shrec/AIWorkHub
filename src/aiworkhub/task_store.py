@@ -7461,6 +7461,41 @@ def _transient_retry_rework_carry(
     )
 
 
+def _infra_reject_replay_refusal(card: Mapping[str, Any], status: str) -> str | None:
+    """Why this card may not take the reject handler's automatic replay, or None.
+
+    NF-2026-02189: read under the recovery lease.  The card's own rejection is
+    the authority, so a pending card reaches the replay only straight after an
+    infrastructure reject that pinned this exact predecessor, and a predecessor
+    is never synthesized from a terminal event on this path.
+    """
+    from .accept_failure_cause import INFRA_REJECT_REPLAY_CATEGORIES
+
+    if status not in {"blocked", "pending"}:
+        return f"not_blocked:current={status}"
+    rejection = card.get("rejection_disposition")
+    if (
+        not isinstance(rejection, dict)
+        or rejection.get("to") != status
+        or rejection.get("failure_category") not in INFRA_REJECT_REPLAY_CATEGORIES
+    ):
+        return "infra_reject_replay_rejection_not_infrastructure"
+    if rejection.get("rejected_validation_only_replay") is True:
+        return "infra_reject_replay_already_replayed"
+    predecessor = card.get("rework_predecessor")
+    request_id = (
+        str(predecessor.get("request_id") or "").strip()
+        if isinstance(predecessor, dict)
+        else ""
+    )
+    hashes = predecessor.get("changed_path_hashes") if isinstance(predecessor, dict) else None
+    if not request_id or not isinstance(hashes, dict) or not hashes:
+        return "validation_only_replay_missing_evidence"
+    if str(rejection.get("request_id") or "").strip() != request_id:
+        return "infra_reject_replay_predecessor_mismatch"
+    return None
+
+
 @_os_failure_names_its_operation
 def recover_blocked_rework(
     root: str | Path,
@@ -7477,6 +7512,8 @@ def recover_blocked_rework(
     allowed_writes_applied_out: list[str] | None = None,
     validation_amendment_mode: str = "append",
     validation_roles_amendment: list[str] | None = None,
+    infra_reject_replay: bool = False,
+    infra_reject_preimage_out: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
     """Recover the same blocked task ID for rework when retained predecessor
     evidence and actionable residual feedback are present.
@@ -7578,7 +7615,18 @@ def recover_blocked_rework(
     the ``applied_out`` rule.  It is refused with ``validation_only_replay``
     (``allowed_writes_amendment_conflicts_with_validation_only_replay``)
     before anything is read, because a replay keeps the exact sealed scope.
+
+    ``infra_reject_replay`` (NF-2026-02189) is the reject handler's automatic
+    replay, and it requires ``validation_only_replay``.  It also admits the
+    pending card a default reject leaves, but only through
+    ``_infra_reject_replay_refusal``: the card's own rejection must be an
+    infrastructure one for this exact status and must pin the retained
+    predecessor, which needs a non-empty ``request_id`` and
+    ``changed_path_hashes``.  ``infra_reject_preimage_out`` receives the row
+    this lease read, for ``undo_infra_reject_replay``.
     """
+    if infra_reject_replay and not validation_only_replay:
+        return False, "infra_reject_replay_requires_validation_only_replay"
     if allowed_writes_amendment and validation_only_replay:
         return False, "allowed_writes_amendment_conflicts_with_validation_only_replay"
     # NF-2026-01352: an explicit feedback over the cap is refused before any
@@ -7660,6 +7708,19 @@ def recover_blocked_rework(
             return False, "card_json_invalid"
         if not isinstance(card, dict):
             return False, "card_json_not_dict"
+
+        infra_reject_pending = False
+        if infra_reject_replay:
+            infra_refusal = _infra_reject_replay_refusal(card, current_canonical)
+            if infra_refusal is not None:
+                return False, infra_refusal
+            infra_reject_pending = current_canonical == "pending"
+            if infra_reject_preimage_out is not None:
+                infra_reject_preimage_out.update(dict(conn.execute(
+                    "SELECT status, worker_status, claimed_by, claimed_at, started_at, "
+                    "completed_at, card_json FROM tasks WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()))
 
         # The amendment mutates the in-memory ``card`` here, so every branch
         # that serializes ``card`` persists it -- but the idempotent branches
@@ -7855,7 +7916,9 @@ def recover_blocked_rework(
             and str(card["operational_blocker"].get("kind") or "")
             == "launch_blocked"
         )
-        if already is not None or pending_clean_root_blocker:
+        # NF-2026-02189: an earlier recovery's event does not make this reject's
+        # first replay idempotent; it goes through the full retained-bytes checks.
+        if (already is not None or pending_clean_root_blocker) and not infra_reject_pending:
             if current_canonical == "pending" and scope_rejection_resolved:
                 # A replay of the scope-rejection resolution is idempotent; it
                 # never consumes or rebinds another recovery's authorization.
@@ -8234,7 +8297,7 @@ def recover_blocked_rework(
                 report_applied_amendment()
                 return True, "recovered_clean_root"
 
-        if current_canonical != "blocked":
+        if current_canonical != "blocked" and not infra_reject_pending:
             return False, f"not_blocked:current={current_canonical}"
 
         worker_status = str(row["worker_status"] or "").strip()
@@ -9018,7 +9081,7 @@ def recover_blocked_rework(
         )
 
         recovery_payload = {
-            "transition": "blocked->pending",
+            "transition": f"{current_canonical}->pending",
             "terminal_substatus": terminal_substatus,
             "predecessor": predecessor_evidence,
             "feedback": bounded_feedback,
@@ -9028,6 +9091,8 @@ def recover_blocked_rework(
             "actor": actor[:120],
             "validation_only_replay": bool(validation_only_replay),
         }
+        if infra_reject_replay:
+            recovery_payload["infra_reject_replay"] = True
         if rejection_rebind is not None:
             recovery_payload["rejection_rebind"] = rejection_rebind
         if validation_only_replay:
@@ -9052,9 +9117,111 @@ def recover_blocked_rework(
                 now,
             ),
         )
+        if infra_reject_preimage_out is not None:
+            infra_reject_preimage_out["recovered_claim_epoch"] = claim_epoch
         conn.commit()
         report_applied_amendment()
         return True, "recovered"
+
+
+def undo_infra_reject_replay(
+    root: str | Path,
+    task_id: str,
+    *,
+    preimage: Mapping[str, Any],
+    actor: str = "coordinator",
+) -> tuple[bool, str]:
+    """Restore the row an infrastructure reject left when its replay could not start.
+
+    NF-2026-02189: ``preimage`` is what ``recover_blocked_rework`` captured under
+    its lease for ``infra_reject_replay``.  The row is restored only while it is
+    still that recovery's episode: unclaimed at the recovered epoch, or blocked
+    ``launch_failed`` by the replay's own claim one epoch later.  Anything else
+    means another actor moved the card on, and it is left alone.
+    """
+    recovered_epoch = preimage.get("recovered_claim_epoch")
+    restored_status = preimage.get("status")
+    restored_worker_status = preimage.get("worker_status")
+    restored_card_json = preimage.get("card_json")
+    if (
+        type(recovered_epoch) is not int
+        or not isinstance(restored_status, str)
+        or not isinstance(restored_worker_status, str)
+        or not isinstance(restored_card_json, str)
+    ):
+        return False, "infra_reject_undo_preimage_invalid"
+    _readiness, db_path = _require_ready(root)
+    with _write_connection(db_path) as conn:
+        _begin_immediate(conn)
+        row = conn.execute(
+            "SELECT status, worker_status, claimed_by, card_json FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, "task_not_found"
+        try:
+            card = json.loads(str(row["card_json"] or "{}"))
+        except json.JSONDecodeError:
+            return False, "card_json_invalid"
+        grant = card.get("validation_only_replay_authorization") if isinstance(card, dict) else None
+        if not isinstance(grant, dict) or grant.get("one_episode_binding") is not True:
+            return False, "infra_reject_undo_grant_missing"
+        current_canonical = canonical_status(dict(row))
+        worker_status = str(row["worker_status"] or "")
+        still_unclaimed = (
+            current_canonical == "pending"
+            and worker_status == "unclaimed"
+            and not str(row["claimed_by"] or "")
+            and card.get("claim_epoch") == recovered_epoch
+        )
+        replay_launch_failed = (
+            worker_status == "launch_failed"
+            and card.get("claim_epoch") == recovered_epoch + 1
+            and bool(grant.get("request_id"))
+            and grant.get("request_id") == card.get("launch_request_id")
+        )
+        if not (still_unclaimed or replay_launch_failed):
+            return False, f"infra_reject_undo_state_changed:{current_canonical}/{worker_status}"
+        now = datetime.now(timezone.utc).isoformat()
+        cur = conn.execute(
+            "UPDATE tasks SET status=?, worker_status=?, claimed_by=?, claimed_at=?, "
+            "started_at=?, completed_at=?, updated_at=?, card_json=? WHERE task_id=?",
+            (
+                restored_status,
+                restored_worker_status,
+                preimage.get("claimed_by"),
+                preimage.get("claimed_at"),
+                preimage.get("started_at"),
+                preimage.get("completed_at"),
+                now,
+                restored_card_json,
+                task_id,
+            ),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return False, "infra_reject_undo_conflict"
+        conn.execute(
+            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+            "VALUES (?, 'infra_reject_replay_undone', ?, ?, ?)",
+            (
+                task_id,
+                actor[:120],
+                json.dumps(
+                    {
+                        "actor": actor[:120],
+                        "recovered_claim_epoch": recovered_epoch,
+                        "restored_status": restored_status,
+                        "recorded_at": now,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                now,
+            ),
+        )
+        conn.commit()
+        return True, "restored"
 
 
 def _latest_archive_preimage(conn: Any, task_id: str) -> dict[str, str] | None:

@@ -50,6 +50,11 @@ _MAX_PAYLOAD_BYTES = 64 * 1024
 # Another accept holds this request, or its marker is unreadable: this call
 # attempted nothing and must write nothing (NF-2026-01626), so it gets no row.
 _NOT_A_FAILED_ACCEPT = frozenset({"accept_in_progress", "accept_in_flight_marker_unreadable"})
+# NF-2026-02189: the reject causes that leave the sealed candidate sound, so one
+# provider-free validation replay is the recovery.  Named as strings because
+# task_store reads this and must not import learning_commit; a test pins them
+# to FailureCategory.
+INFRA_REJECT_REPLAY_CATEGORIES: frozenset[str] = frozenset({"base_drift", "validation_environment"})
 
 _AcceptFn = TypeVar("_AcceptFn", bound=Callable[..., dict[str, Any]])
 
@@ -288,3 +293,26 @@ def classify_reject(
             task_id, type(exc).__name__,
         )
         return None, None
+
+
+def mark_rejected_replay(
+    card: dict[str, Any],
+    terminal_disposition: str,
+    rejected_request_id: str,
+    current_request_id: str,
+) -> None:
+    """Record on the pinned disposition that this reject judged a replay."""
+    # NF-2026-02189: one automatic replay per candidate.  The grant below names
+    # the replay request and is about to be dropped, so record here that this
+    # reject judged a replay.  Written only for a category that would replay,
+    # which keeps every other reject's card unchanged; an unreadable grant
+    # counts as a replay, so doubt falls back to the rework path.
+    if terminal_disposition not in INFRA_REJECT_REPLAY_CATEGORIES:
+        return
+    replay_grant = card.get("validation_only_replay_authorization")
+    if replay_grant is not None and (
+        not isinstance(replay_grant, dict)
+        or str(replay_grant.get("request_id") or "").strip()
+        in ("", rejected_request_id, current_request_id)
+    ):
+        card["rejection_disposition"]["rejected_validation_only_replay"] = True

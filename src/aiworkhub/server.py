@@ -782,6 +782,7 @@ except ModuleNotFoundError:
 
 from . import __version__
 from . import accept_commit
+from . import accept_failure_cause
 from . import agent_tool_instruction_mcp
 from . import cli_adapter_readonly_tool
 from . import completion_inbox
@@ -814,6 +815,7 @@ from . import task_engine
 from . import task_plan
 from . import task_reconciler
 from . import terminal_log_retention
+from . import vscode_lm_activity
 from . import worker_ai_tools_mcp
 # NF389: single source of truth for bounded provider-call identity and
 # provenance. Manager write tools already accept provenance; these re-exports
@@ -4917,6 +4919,11 @@ def aiworkhub_task_reject_review(
     learning_commit_owed, card_sha256/card_bytes. The reason and the argv are
     never echoed; ``include_card`` = none (default) | summary | full.
 
+    A base_drift or validation_environment reject also starts one provider-free
+    replay of the retained candidate and adds ``automatic_validation_replay``
+    {attempted, succeeded, reason, request_id}; a replay that cannot start
+    leaves the reject and the card as they were, and no other reject has the key.
+
     ``lesson_candidate`` / ``no_new_lesson_reason`` -- both unset by default, and
     the reply is then exactly as before -- close this decision's learning out in
     the same call, AFTER the reject landed. ``lesson_candidate`` (with optional
@@ -5016,7 +5023,20 @@ def aiworkhub_task_reject_review(
         _attach_reviewer_process_cancellation(
             receipt, rejected_request_id=str((extra or {}).get("request_id") or "")
         )
+        # NF-2026-02189: last, so a replay that cannot start skips nothing above.
+        replay_category = receipt.get("failure_category")
+        if (
+            to in ("blocked", "pending")
+            and isinstance(replay_category, str)
+            and replay_category in accept_failure_cause.INFRA_REJECT_REPLAY_CATEGORIES
+        ):
+            receipt["automatic_validation_replay"] = _automatic_validation_replay(
+                task_id, replay_category, card or {}
+            )
     return receipt
+
+
+_AUTOMATIC_REPLAY_REASON_MAX_CHARS = 500
 
 
 def _attach_reviewer_process_cancellation(
@@ -5047,6 +5067,109 @@ def _attach_reviewer_process_cancellation(
     deferred = cancellation.get("cleanup_deferred") if isinstance(cancellation, dict) else None
     if deferred:
         receipt["cleanup_deferred"] = list(deferred)
+
+
+def _undo_infra_reject_replay(task_id: str, *, preimage: Mapping[str, Any]) -> dict[str, Any]:
+    """Put a card back as its infrastructure reject left it (NF-2026-02189)."""
+    card, error = core._live_card(task_id)
+    if error:
+        return error
+    assert card is not None
+    actor = core._verified_manager_actor()
+    command = ["undo-infra-reject-replay", task_id, "--runner", actor]
+    blocked = core._canonical_write_gate(
+        "recover-blocked-rework",
+        runner=core.CODEX_RUNNER,
+        topic=str(card.get("topic") or ""),
+        coordinator_capability=True,
+        task_id=task_id,
+    )
+    if blocked is not None:
+        return blocked
+    try:
+        ok, state = task_store.undo_infra_reject_replay(
+            core.repo_root(), task_id, preimage=preimage, actor=actor
+        )
+    except task_store.TaskStoreError as exc:
+        return core._canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
+    return core._canonical_result(
+        ok=ok,
+        returncode=0 if ok else 1,
+        stdout=state if ok else "",
+        stderr="" if ok else f"undo_infra_reject_replay_failed:{state}",
+        command=command,
+    )
+
+
+def _automatic_validation_replay(
+    task_id: str, category: str, card: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Start the one provider-free replay an infrastructure reject earns.
+
+    NF-2026-02189.  Runs after the reject committed, so nothing here can undo
+    it: every failure is reported in the returned record and ``ok`` stays true.
+    A replay that cannot start puts the card back as the reject left it.  The
+    launch omits runner, topic and adapter, so ``ProcessManager.launch`` derives
+    them exactly as ``aiworkhub_agent_launch_task`` does.
+    """
+
+    def report(
+        reason: str,
+        *,
+        attempted: bool = True,
+        succeeded: bool = False,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "attempted": attempted,
+            "succeeded": succeeded,
+            "reason": vscode_lm_activity.redact_text(reason, parse_json=False)[
+                :_AUTOMATIC_REPLAY_REASON_MAX_CHARS
+            ],
+            "request_id": request_id,
+        }
+
+    rejection = card.get("rejection_disposition")
+    if isinstance(rejection, dict) and rejection.get("rejected_validation_only_replay") is True:
+        return report("rejected_request_was_validation_only_replay", attempted=False)
+    preimage: dict[str, Any] = {}
+    try:
+        recovery = core.recover_blocked_rework(
+            task_id,
+            feedback_reason=f"Automatic validation-only replay after infrastructure reject: {category}",
+            validation_only_replay=True,
+            infra_reject_preimage_out=preimage,
+        )
+    except Exception as exc:  # noqa: BLE001 -- the committed reject must still reply
+        return report(f"recovery_raised:{type(exc).__name__}")
+    if recovery.get("ok") is not True:
+        return report(f"recovery_refused:{recovery.get('reason') or recovery.get('stderr') or ''}")
+
+    launch_request_id: str | None = None
+    try:
+        core.scrub_coordinator_capability_from_environment()
+        launched = process_launcher.default_manager().launch(task_id=task_id)
+        launch_request_id = str(launched.get("request_id") or "") or None
+        if (
+            launched.get("ok") is True
+            and launched.get("provider_launched") is False
+            and launch_request_id
+        ):
+            return report(
+                f"validation_only_replay_started:{category}",
+                succeeded=True,
+                request_id=launch_request_id,
+            )
+        refusal = f"launch_refused:{launched.get('blocked_reason') or launched.get('stderr') or ''}"
+    except Exception as exc:  # noqa: BLE001 -- the committed reject must still reply
+        refusal = f"launch_raised:{type(exc).__name__}"
+    try:
+        undone = _undo_infra_reject_replay(task_id, preimage=preimage)
+    except Exception as exc:  # noqa: BLE001 -- the committed reject must still reply
+        undone = {"ok": False, "stderr": type(exc).__name__}
+    if undone.get("ok") is not True:
+        refusal += f";restore_refused:{undone.get('stderr') or ''}"
+    return report(refusal, request_id=launch_request_id)
 
 
 @mcp.tool()
