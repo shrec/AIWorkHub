@@ -76,6 +76,10 @@ TRAILER_VALUE_MAX_CHARS = 2000
 GIT_READ_TIMEOUT_SECONDS = 120
 
 _NEEDFIX_ID = re.compile(r"NF-\d{4}-\d{5}")
+# A ``Resolves:`` line whose whole content is one id; prose or backticks never match.
+_RESOLVES_LINE = re.compile(r"[ \t]*Resolves:[ \t]*(" + _NEEDFIX_ID.pattern + r")[ \t]*")
+# An id named anywhere in prose; word boundaries keep a longer number from matching.
+_NAMED_NEEDFIX_ID = re.compile(r"\b" + _NEEDFIX_ID.pattern + r"\b")
 _NEEDFIX_TASK_ID = re.compile(r"needfix-(NF-\d{4}-\d{5})(?:-|$)")
 
 
@@ -150,7 +154,12 @@ def commit_promoted(
         root = snapshot.root
         if not set(paths) & _dirty_paths(root):
             return _reply(_decided(STATE_SKIPPED, SKIP_PROMOTED_PATHS_UNCHANGED), listed, subject)
-        trailers = _trailers(root, head, task_id=task_id, request_id=request_id, needfix_id=needfix_id)
+        declared = _declared_records(card, needfix_id)
+        named = _named_not_declared(card, needfix_id, declared)
+        trailers = _trailers(
+            root, head, task_id=task_id, request_id=request_id, needfix_id=needfix_id,
+            declared=declared,
+        )
         message = head + "\n\n" + "\n".join(trailers) + "\n"
         _run_step(root, FAIL_ADD, "--literal-pathspecs", "add", "-A", "--", *paths, timeout=None)
         _run_step(
@@ -162,7 +171,10 @@ def commit_promoted(
         committed: dict[str, Any] = {"state": STATE_COMMITTED}
         if sha.returncode == 0:
             committed["sha"] = sha.stdout.decode("ascii", "replace").strip()
-        return _reply(committed, listed, subject)
+        reply = _reply(committed, listed, subject)
+        if named:
+            reply["needfix_named_not_declared"] = named
+        return reply
     except _GitStepFailed as failed:
         return _reply(failed.outcome, listed, subject)
     except FileNotFoundError:
@@ -343,8 +355,49 @@ def _message_head(
     return f"{subject}\n\n{title}"
 
 
+def _card_text(card: Mapping[str, Any] | None, key: str) -> str:
+    """A card field as text; a field that is not a string reads as empty."""
+
+    value = card.get(key) if isinstance(card, Mapping) else None
+    return value if isinstance(value, str) else ""
+
+
+def _declared_records(card: Mapping[str, Any] | None, needfix_id: str | None) -> list[str]:
+    """NeedFix ids the card's objective declares fixed: whole ``Resolves: NF-...`` lines.
+
+    Deduplicated against the linked id and against each other, in objective order.
+    """
+
+    declared: list[str] = []
+    # Only a newline ends a line here: str.splitlines also breaks on \x0c, \x85 and friends.
+    for line in re.split(r"\r?\n", _card_text(card, "objective")):
+        match = _RESOLVES_LINE.fullmatch(line)
+        if match is None:
+            continue
+        record = match.group(1)
+        if record != needfix_id and record not in declared:
+            declared.append(record)
+    return declared
+
+
+def _named_not_declared(
+    card: Mapping[str, Any] | None, needfix_id: str | None, declared: Sequence[str]
+) -> list[str]:
+    """NeedFix ids the card names in prose: reported to the manager, never closed."""
+
+    text = _card_text(card, "title") + "\n" + _card_text(card, "objective")
+    known = {*declared, *([needfix_id] if needfix_id else [])}
+    return sorted(set(_NAMED_NEEDFIX_ID.findall(text)) - known)
+
+
 def _trailers(
-    root: Path, head: str, *, task_id: str, request_id: str, needfix_id: str | None
+    root: Path,
+    head: str,
+    *,
+    task_id: str,
+    request_id: str,
+    needfix_id: str | None,
+    declared: Sequence[str] = (),
 ) -> list[str]:
     configured = _git(root, "config", "-z", "--get-all", TRAILER_CONFIG_KEY)
     if configured.returncode not in (0, 1):  # 1: the key is not set
@@ -364,6 +417,7 @@ def _trailers(
             )
         )
     trailers = [f"Resolves: {needfix_id}"] if needfix_id else []
+    trailers += [f"Resolves: {record}" for record in declared]
     trailers += [f"AIWorkHub-Task: {task_id}", f"AIWorkHub-Request: {request_id}", *values]
     # A manager message that already carries a trailer line keeps one copy.
     present = set(head.splitlines())

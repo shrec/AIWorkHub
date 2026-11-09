@@ -395,3 +395,113 @@ def test_auto_commit_false_leaves_the_tree_for_the_manager(through_server):
         "auto_commit_disabled",
     )
     assert _head(through_server) == before
+
+
+def _resolves(repo: Path) -> list[str]:
+    return _git(repo, "log", "-1", "--format=%(trailers:key=Resolves,valueonly)").split()
+
+
+def _linked_receipt(needfix_id: str) -> dict[str, Any]:
+    closure = {"state": "closed", "needfix_id": needfix_id}
+    return {"ok": True, "promoted_paths": list(PROMOTED), "needfix_closure": closure}
+
+
+def test_declared_records_each_get_a_resolves_trailer_after_the_linked_one(repo):
+    objective = "Fixes three records.\nResolves: NF-2026-00001\n\tResolves: NF-2026-00002  \n"
+    card = {**CARD, "objective": objective}
+
+    commit = _accept(repo, receipt=_linked_receipt("NF-2026-00003"), card=card)
+
+    assert commit["state"] == "committed", commit
+    assert _resolves(repo) == ["NF-2026-00003", "NF-2026-00001", "NF-2026-00002"]
+    assert "needfix_named_not_declared" not in commit
+
+
+def test_declared_record_equal_to_the_linked_id_yields_one_trailer(repo):
+    objective = (
+        "Resolves: NF-2026-00003\n"
+        "Resolves: NF-2026-00001\n"
+        "Resolves: NF-2026-00001"
+    )
+    card = {**CARD, "objective": objective}
+
+    commit = _accept(repo, receipt=_linked_receipt("NF-2026-00003"), card=card)
+
+    assert commit["state"] == "committed", commit
+    assert _resolves(repo) == ["NF-2026-00003", "NF-2026-00001"]
+
+
+def test_declared_record_named_in_prose_is_reported_and_never_closed(repo):
+    card = {
+        **CARD,
+        "title": "Also touches NF-2026-00004",
+        "objective": (
+            "The fix covers `NF-2026-00005` and NF-2026-00006.\n"
+            "Resolves: NF-26-1\n"
+            "  Resolves: NF-2026-00007 and more text\n"
+            "Resolves: NF-2026-00008"
+        ),
+    }
+
+    commit = _accept(repo, receipt=_linked_receipt("NF-2026-00003"), card=card)
+
+    assert commit["state"] == "committed", commit
+    assert _resolves(repo) == ["NF-2026-00003", "NF-2026-00008"]
+    assert commit["needfix_named_not_declared"] == [
+        "NF-2026-00004",
+        "NF-2026-00005",
+        "NF-2026-00006",
+        "NF-2026-00007",
+    ]
+
+
+def test_declared_record_malformed_id_declares_nothing(repo):
+    card = {**CARD, "objective": "Resolves: NF-26-1"}
+
+    commit = _accept(repo, card=card)
+
+    assert commit["state"] == "committed", commit
+    assert _resolves(repo) == []
+    assert "needfix_named_not_declared" not in commit
+
+
+@pytest.mark.parametrize(
+    "card",
+    [None, {**CARD, "objective": ["Resolves: NF-2026-00001"]}, {**CARD, "objective": 7}],
+)
+def test_declared_record_none_card_or_non_string_objective_commits_normally(repo, card):
+    commit = _accept(repo, card=card)
+
+    assert commit["state"] == "committed", commit
+    assert _resolves(repo) == []
+    assert "needfix_named_not_declared" not in commit
+
+
+def test_declared_record_advisory_is_absent_from_a_skipped_reply(repo):
+    _write(repo, "src/feature.py", "VALUE = 'owner edit'\n")
+    card = {**CARD, "objective": "Also NF-2026-00009 in prose"}
+
+    commit = _accept(repo, receipt=_linked_receipt("NF-2026-00003"), card=card)
+
+    assert commit["state"] == "skipped", commit
+    assert commit["reason"] == "promoted_path_dirty_before_accept"
+    assert "needfix_named_not_declared" not in commit
+
+
+def test_declared_record_must_end_at_a_newline_not_another_separator(repo):
+    card = {**CARD, "objective": "Prose here\x0cResolves: NF-2026-00001"}
+
+    commit = _accept(repo, card=card)
+
+    assert commit["state"] == "committed", commit
+    assert _resolves(repo) == []
+    assert commit["needfix_named_not_declared"] == ["NF-2026-00001"]
+
+
+def test_declared_records_on_crlf_lines_are_each_declared(repo):
+    card = {**CARD, "objective": "Fix.\r\nResolves: NF-2026-00001\r\nResolves: NF-2026-00002\r\n"}
+
+    commit = _accept(repo, card=card)
+
+    assert commit["state"] == "committed", commit
+    assert _resolves(repo) == ["NF-2026-00001", "NF-2026-00002"]
