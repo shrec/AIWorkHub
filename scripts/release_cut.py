@@ -36,7 +36,9 @@ The cut:
   bump            release_metadata.bump: the canonical version and projections
   metadata_check  release_metadata.check --tag vVERSION
   host_tests      the whole suite on this host, xdist workers derived from
-                  os.cpu_count() with headroom
+                  os.cpu_count() with headroom; up to LOAD_RERUN_MAX_NODES
+                  failed node ids get one serial rerun, and only a node that
+                  fails again stops the cut
   package         npm --prefix vscode-extension run package
   commit          git commit "release: VERSION" of exactly the release files
   wsl_tests       a git archive of HEAD extracted under .scratch/release/VERSION
@@ -44,7 +46,8 @@ The cut:
                   suite has finished; WSL names that directory by its
                   wslpath -a path, which must lie under /mnt/, and every WSL
                   command takes absolute paths behind a cd guard; a failing
-                  node id absent from --wsl-baseline stops the cut
+                  node id absent from --wsl-baseline stops the cut, unless it
+                  passes the same one serial rerun as host_tests
   receipt         scripts/release_receipt.py record
   tag             git tag vVERSION
   push            only with --push: main and the tag in one atomic push,
@@ -128,6 +131,8 @@ MAX_BASELINE_BYTES = 1024 * 1024
 MAX_BASELINE_IDS = 10_000
 MAX_LINE_CHARS = 600
 MAX_LISTED = 5
+# More failures than this is a real break, not load, and is not rerun.
+LOAD_RERUN_MAX_NODES = 25
 SHORT_SUMMARY_HEADER = "short test summary info"
 FAILURE_PREFIXES = ("FAILED ", "ERROR ")
 
@@ -351,6 +356,23 @@ def failing_node_ids(output: str) -> list[str]:
     return list(found)
 
 
+def _rerunnable(nodes: Sequence[str]) -> bool:
+    """Whether one serial rerun of these suite-reported ids may go to pytest.
+
+    The ids are parsed from suite output and become pytest arguments, so each
+    must name a test under tests/. Only the path before "::" is checked: a
+    parametrize id after it may hold anything.
+    """
+
+    def under_tests(path: str) -> bool:
+        parts = path.split("/")
+        return parts[0] == "tests" and ".." not in parts and "\\" not in path
+
+    return bool(nodes) and len(nodes) <= LOAD_RERUN_MAX_NODES and all(
+        under_tests(node.partition("::")[0]) for node in nodes
+    )
+
+
 def load_wsl_baseline(path: Path) -> frozenset[str]:
     """Known WSL failures: one node id, or one pasted FAILED/ERROR line, per line.
 
@@ -570,7 +592,10 @@ class ReleaseCut:
             status, detail = "failed", str(exc) or type(exc).__name__
         except Exception as exc:  # a step bug still ends as a named failure in the summary
             status, detail = "failed", f"{type(exc).__name__}: {exc}"
-        result = StepResult(name, status, _one_line(detail))
+        # An ok detail is the step's own text and the cut report has to name every
+        # node that passed alone, so it is not held to the bounded line.
+        limit = len(detail) if status == "ok" else MAX_LINE_CHARS
+        result = StepResult(name, status, _one_line(detail, limit))
         self.results.append(result)
         self._emit("FAILED" if status == "failed" else status, name, result.detail)
         return result
@@ -681,7 +706,9 @@ class ReleaseCut:
     def _release_files(self) -> tuple[str, ...]:
         return (*self._generated_files(), *release_metadata.RELEASE_DOCUMENTS, RELEASE_LEDGER)
 
-    def _host_test_argv(self) -> list[str]:
+    def _host_test_argv(self, nodes: Sequence[str] = ()) -> list[str]:
+        # With nodes: the serial rerun of exactly those ids, in a basetemp of its own
+        # because deleting the full run's basetemp measured 203 s.
         return [
             self.host.python,
             "-m",
@@ -689,17 +716,18 @@ class ReleaseCut:
             "-q",
             "-rfE",
             "-n",
-            _xdist_flag(self.workers),
-            f"--basetemp={self.scratch / 'b'}",
-            "tests",
+            "0" if nodes else _xdist_flag(self.workers),
+            f"--basetemp={self.scratch / ('br' if nodes else 'b')}",
+            *(nodes or ("tests",)),
         ]
 
-    def _wsl_test_command(self) -> list[str]:
+    def _wsl_test_command(self, nodes: Sequence[str] = ()) -> list[str]:
         # PYTHONPATH=src with the ini pythonpath cleared, the way
         # aiworkhub.recipes.posix_replay runs the suite: children the tests
         # start import the archived tree as well. The basetemp sits on the Linux
         # filesystem, which the POSIX suite needs for sockets and file modes;
-        # _step_wsl_tests removes it after the run.
+        # _step_wsl_tests removes it after the run. With nodes: the serial rerun
+        # of exactly those ids, in the same basetemp.
         return [
             "env",
             "PYTHONPATH=src",
@@ -713,9 +741,9 @@ class ReleaseCut:
             "-o",
             "pythonpath=",
             "-n",
-            _xdist_flag(self.workers),
+            "0" if nodes else _xdist_flag(self.workers),
             f"--basetemp={self.wsl_basetemp}",
-            "tests",
+            *(nodes or ("tests",)),
         ]
 
     @staticmethod
@@ -888,12 +916,25 @@ class ReleaseCut:
         self.scratch.mkdir(parents=True, exist_ok=True)
         done = self._run(self._host_test_argv())
         log = self._write_log("host_tests", done)
-        if done.returncode != 0:
+        cores = max(1, int(self.host.cpu_count or 1))
+        detail = f"{_last_line(done.output)} with {self.workers} worker(s) on {cores} core(s)"
+        if done.returncode == 0:
+            return detail
+        # Exit 1 names failed tests; any other exit is no verdict about a node. One
+        # serial rerun of those nodes tells full-load time bounds from a real failure.
+        nodes = failing_node_ids(done.output) if done.returncode == 1 else []
+        if not _rerunnable(nodes):
             raise StepFailed(
                 f"pytest exited {done.returncode}: {_last_line(done.output)} (log {log})"
             )
-        cores = max(1, int(self.host.cpu_count or 1))
-        return f"{_last_line(done.output)} with {self.workers} worker(s) on {cores} core(s)"
+        redone = self._run(self._host_test_argv(nodes))
+        rerun_log = self._write_log("host_tests_rerun", redone)
+        if redone.returncode != 0:
+            raise StepFailed(
+                f"the serial rerun of {len(nodes)} failed node(s) exited {redone.returncode}: "
+                f"{_listing(nodes)} (logs {log}, {rerun_log})"
+            )
+        return f"{detail}; {len(nodes)} failed node(s) passed alone: {', '.join(nodes)}"
 
     def _step_package(self) -> str:
         done = self._run(self._package_argv())
@@ -974,14 +1015,14 @@ class ReleaseCut:
                 "extracting HEAD in WSL",
             )
             done = self._wsl_in(tree, self._wsl_test_command())
-            return self._wsl_verdict(done, self._write_log("wsl_tests", done))
+            return self._wsl_verdict(done, self._write_log("wsl_tests", done), tree)
         finally:
             # WSL wrote the tree and pytest's basetemp, so WSL removes both, pass
             # or fail. A failed removal leaves only git-ignored scratch and a /tmp
             # directory behind and never changes the verdict.
             self._wsl_in(scratch, clear)
 
-    def _wsl_verdict(self, done: Completed, log: str) -> str:
+    def _wsl_verdict(self, done: Completed, log: str, tree: PurePosixPath) -> str:
         summary = _last_line(done.output)
         if done.returncode == 0:
             return f"WSL suite passed: {summary}"
@@ -992,8 +1033,16 @@ class ReleaseCut:
             raise StepFailed(f"WSL pytest exited 1 without naming a failing node id (log {log})")
         new = [node for node in failing if node not in self.baseline]
         if new:
-            raise StepFailed(
-                f"{len(new)} WSL failure(s) not in the baseline: {_listing(new)} (log {log})"
+            stopped = f"{len(new)} WSL failure(s) not in the baseline: {_listing(new)}"
+            if not _rerunnable(new):
+                raise StepFailed(f"{stopped} (log {log})")
+            redone = self._wsl_in(tree, self._wsl_test_command(new))
+            rerun_log = self._write_log("wsl_tests_rerun", redone)
+            if redone.returncode != 0:
+                raise StepFailed(f"{stopped} (logs {log}, {rerun_log})")
+            return (
+                f"{len(new)} WSL failure(s) passed alone: {', '.join(new)}; "
+                f"{len(failing) - len(new)} failure(s) in the baseline: {summary}"
             )
         return f"{len(failing)} WSL failure(s), each in the baseline: {summary}"
 

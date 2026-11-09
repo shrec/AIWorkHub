@@ -352,10 +352,13 @@ def test_the_first_failing_step_stops_the_cut_and_the_summary_names_it(
     assert [statuses[name] for name in STEP_ORDER[:index]] == ["ok"] * index
     assert statuses[step] == "failed"
     assert {statuses[name] for name in STEP_ORDER[index + 1 :]} <= {"not_run"}
-    # Nothing ran after the failing command but the WSL tree's own cleanup.
+    # Nothing ran after the failing command but the WSL tree's own cleanup and the one
+    # serial rerun of a failed node.
     expected = FULL_CUT[: FULL_CUT.index(failing) + 1]
     if failing == "git archive":
         expected.append("wsl rm")
+    if failing == "pytest":
+        expected.append("pytest")
     assert runner.labels == expected
     reason = summary["reason"]
     assert reason and "\n" not in reason
@@ -596,7 +599,8 @@ def test_a_wsl_failure_not_in_the_baseline_stops_the_cut(tmp_path: Path) -> None
     assert code == 1 and summary["failed_step"] == "wsl_tests"
     assert f"1 WSL failure(s) not in the baseline: {WSL_NODE}" in summary["reason"]
     assert "this line is captured" not in summary["reason"]
-    assert runner.labels == FULL_CUT[: FULL_CUT.index("wsl pytest") + 2]
+    # The full run, the one serial rerun of the new node, and the WSL tree's own cleanup.
+    assert runner.labels == [*FULL_CUT[: FULL_CUT.index("wsl pytest") + 1], "wsl pytest", "wsl rm"]
     assert (root / ".scratch" / "release" / VERSION / "wsl_tests.log").is_file()
 
 
@@ -803,9 +807,11 @@ def test_the_wsl_basetemp_is_under_wsl_tmp_and_removed_after_the_run_pass_or_fai
     code, summary, _, _ = _cut(root, runner=runner)
 
     assert code == (0 if response is None else 1), summary["reason"]
-    (suite,) = runner.argv_of("wsl pytest")
-    assert f"--basetemp={WSL_BASETEMP}" in _guarded(suite)[1]
-    assert runner.labels[runner.labels.index("wsl pytest") + 1] == "wsl rm"
+    # A failed node outside the baseline is rerun alone in that basetemp, before the removal.
+    suites = runner.argv_of("wsl pytest")
+    assert len(suites) == (1 if response is None else 2)
+    assert all(f"--basetemp={WSL_BASETEMP}" in _guarded(suite)[1] for suite in suites)
+    assert runner.labels[runner.labels.index("wsl pytest") + len(suites)] == "wsl rm"
     assert WSL_BASETEMP in _guarded(runner.argv_of("wsl rm")[-1])[1]
 
 
@@ -851,6 +857,346 @@ def test_failing_node_ids_come_only_from_the_short_summary_and_are_uncapped() ->
     assert found[:3] == ["tests/test_a.py::test_x[a - b]", "tests/test_b.py::test_y", "tests/test_c.py"]
     assert found[3:] == nodes
     assert release_cut.failing_node_ids("FAILED tests/x.py::test - no summary header\n") == []
+
+
+# -- one serial rerun of the failed nodes ---------------------------------------------
+
+HOST_NODE = "tests/test_a.py::test_x"
+HOST_FAILURE = Completed(
+    1,
+    f"..F.\n{SUMMARY_HEADER}\nFAILED {HOST_NODE} - assert 0\n1 failed, 11 passed in 1.00s\n",
+)
+PASSED_ALONE = Completed(0, ".\n1 passed in 0.10s\n")
+OVER_THE_CAP = release_cut.LOAD_RERUN_MAX_NODES + 1
+HOST_LOG = f".scratch/release/{VERSION}/host_tests.log"
+HOST_RERUN_LOG = f".scratch/release/{VERSION}/host_tests_rerun.log"
+WSL_LOG = f".scratch/release/{VERSION}/wsl_tests.log"
+WSL_RERUN_LOG = f".scratch/release/{VERSION}/wsl_tests_rerun.log"
+
+
+def _full_then_alone(full: Any, alone: Any) -> Any:
+    """A suite response: ``full`` for the xdist run, ``alone`` for the serial rerun of nodes."""
+
+    def respond(call: Call) -> Any:
+        command = _guarded(call.argv)[1] if call.argv[0] == "wsl" else list(call.argv)
+        return alone if command[command.index("-n") + 1] == "0" else full
+
+    return respond
+
+
+def _many_nodes(count: int) -> list[str]:
+    return [f"tests/test_many.py::test_{index}" for index in range(count)]
+
+
+def _many_failures(count: int) -> Completed:
+    lines = "".join(f"FAILED {node} - boom\n" for node in _many_nodes(count))
+    return Completed(1, f"{SUMMARY_HEADER}\n{lines}{count} failed in 1.00s\n")
+
+
+def _detail(summary: dict[str, Any], name: str) -> str:
+    return next(step["detail"] for step in summary["steps"] if step["name"] == name)
+
+
+def test_a_green_first_run_makes_no_rerun_and_both_suite_commands_stay_byte_identical(
+    tmp_path: Path,
+) -> None:
+    root = _repo(tmp_path)
+
+    code, summary, _, runner = _cut(root, "--push")
+
+    assert code == 0, summary["reason"]
+    assert runner.labels == FULL_CUT
+    scratch = root / ".scratch" / "release" / VERSION
+    assert runner.argv_of("pytest") == [
+        ("python", "-m", "pytest", "-q", "-rfE", "-n", "12", f"--basetemp={scratch / 'b'}", "tests")
+    ]
+    assert runner.argv_of("wsl pytest") == [
+        (
+            "wsl",
+            "-e",
+            "sh",
+            "-c",
+            f"cd -- {LINUX_SCRATCH}/tree || exit 97; exec env PYTHONPATH=src python3 -m pytest "
+            f"-q -rfE -p no:cacheprovider -o pythonpath= -n 12 --basetemp={WSL_BASETEMP} tests",
+        )
+    ]
+    assert _detail(summary, "host_tests") == "12 passed in 1.00s with 12 worker(s) on 16 core(s)"
+    assert _detail(summary, "wsl_tests") == "WSL suite passed: 12 passed in 1.00s"
+    assert not (root / HOST_RERUN_LOG).exists() and not (root / WSL_RERUN_LOG).exists()
+
+
+def test_a_host_node_that_passes_alone_continues_the_cut_and_the_report_names_it(
+    tmp_path: Path,
+) -> None:
+    root = _repo(tmp_path)
+    runner = FakeRunner(root, {"pytest": _full_then_alone(HOST_FAILURE, PASSED_ALONE)})
+
+    code, summary, _, _ = _cut(root, "--push", runner=runner)
+
+    assert code == 0, summary["reason"]
+    assert _statuses(summary)["host_tests"] == "ok"
+    assert _detail(summary, "host_tests") == (
+        "1 failed, 11 passed in 1.00s with 12 worker(s) on 16 core(s); "
+        f"1 failed node(s) passed alone: {HOST_NODE}"
+    )
+    assert (root / HOST_LOG).is_file() and (root / HOST_RERUN_LOG).is_file()
+    after = FULL_CUT.index("pytest") + 1
+    assert runner.labels == [*FULL_CUT[:after], "pytest", *FULL_CUT[after:]]
+    full, rerun = runner.argv_of("pytest")
+    assert full[full.index("-n") + 1] == "12" and full[-1] == "tests"
+    scratch = root / ".scratch" / "release" / VERSION
+    assert rerun == (
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "-rfE",
+        "-n",
+        "0",
+        f"--basetemp={scratch / 'br'}",
+        HOST_NODE,
+    )
+
+
+@pytest.mark.parametrize("exit_code", [1, 2, 4, 5])
+def test_a_host_node_that_does_not_pass_alone_stops_the_cut_and_names_it_and_both_logs(
+    tmp_path: Path, exit_code: int
+) -> None:
+    root = _repo(tmp_path)
+    alone = Completed(exit_code, f"{SUMMARY_HEADER}\nFAILED {HOST_NODE} - assert 0\n1 failed\n")
+    runner = FakeRunner(root, {"pytest": _full_then_alone(HOST_FAILURE, alone)})
+
+    code, summary, _, _ = _cut(root, "--push", runner=runner)
+
+    assert code == 1 and summary["failed_step"] == "host_tests"
+    assert HOST_NODE in summary["reason"]
+    assert HOST_LOG in summary["reason"] and HOST_RERUN_LOG in summary["reason"]
+    # Exactly one rerun, and nothing of the cut ran after it.
+    assert runner.labels == [*FULL_CUT[: FULL_CUT.index("pytest") + 1], "pytest"]
+
+
+@pytest.mark.parametrize(
+    ("response", "last_line"),
+    [
+        (
+            Completed(
+                2,
+                f"{SUMMARY_HEADER}\nERROR {HOST_NODE}\n"
+                "!!! Interrupted: 1 error during collection !!!\n",
+            ),
+            "!!! Interrupted: 1 error during collection !!!",
+        ),
+        (Completed(1, "", "Fatal Python error: boom\n"), "Fatal Python error: boom"),
+        (_many_failures(OVER_THE_CAP), f"{OVER_THE_CAP} failed in 1.00s"),
+    ],
+    ids=["exit_2", "exit_1_without_a_node_id", "over_the_cap"],
+)
+def test_a_host_failure_load_cannot_explain_makes_one_pytest_call_and_fails_as_before(
+    tmp_path: Path, response: Any, last_line: str
+) -> None:
+    root = _repo(tmp_path)
+    runner = FakeRunner(root, {"pytest": response})
+
+    code, summary, _, _ = _cut(root, "--push", runner=runner)
+
+    assert code == 1 and summary["failed_step"] == "host_tests"
+    assert summary["reason"] == f"pytest exited {response.returncode}: {last_line} (log {HOST_LOG})"
+    assert runner.labels == FULL_CUT[: FULL_CUT.index("pytest") + 1]
+    assert not (root / HOST_RERUN_LOG).exists()
+
+
+def test_a_wsl_node_that_passes_alone_continues_the_cut_and_the_report_names_it(
+    tmp_path: Path,
+) -> None:
+    root = _repo(tmp_path)
+    runner = FakeRunner(root, {"wsl pytest": _full_then_alone(WSL_FAILURE, PASSED_ALONE)})
+
+    code, summary, _, _ = _cut(root, "--push", runner=runner)
+
+    assert code == 0, summary["reason"]
+    assert _statuses(summary)["wsl_tests"] == "ok"
+    assert _detail(summary, "wsl_tests") == (
+        f"1 WSL failure(s) passed alone: {WSL_NODE}; "
+        "0 failure(s) in the baseline: 1 failed, 4 passed in 1.00s"
+    )
+    assert (root / WSL_LOG).is_file() and (root / WSL_RERUN_LOG).is_file()
+    # The rerun needs the tree, so it runs after the full run and before the final rm.
+    after = FULL_CUT.index("wsl pytest") + 1
+    assert runner.labels == [*FULL_CUT[:after], "wsl pytest", *FULL_CUT[after:]]
+    full, rerun = runner.argv_of("wsl pytest")
+    assert _guarded(full)[1][-1] == "tests"
+    assert _guarded(rerun) == (
+        f"{LINUX_SCRATCH}/tree",
+        [
+            "env",
+            "PYTHONPATH=src",
+            "python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-rfE",
+            "-p",
+            "no:cacheprovider",
+            "-o",
+            "pythonpath=",
+            "-n",
+            "0",
+            f"--basetemp={WSL_BASETEMP}",
+            WSL_NODE,
+        ],
+    )
+
+
+@pytest.mark.parametrize("exit_code", [1, 4, 5, 97])
+def test_a_wsl_node_that_does_not_pass_alone_stops_the_cut_with_todays_text_and_both_logs(
+    tmp_path: Path, exit_code: int
+) -> None:
+    root = _repo(tmp_path)
+    runner = FakeRunner(root, {"wsl pytest": _full_then_alone(WSL_FAILURE, Completed(exit_code))})
+
+    code, summary, _, _ = _cut(root, "--push", runner=runner)
+
+    assert code == 1 and summary["failed_step"] == "wsl_tests"
+    assert summary["reason"] == (
+        f"1 WSL failure(s) not in the baseline: {WSL_NODE} (logs {WSL_LOG}, {WSL_RERUN_LOG})"
+    )
+    after = FULL_CUT.index("wsl pytest") + 1
+    assert runner.labels == [*FULL_CUT[:after], "wsl pytest", "wsl rm"]
+
+
+def test_only_the_wsl_nodes_outside_the_baseline_are_rerun(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    baseline = tmp_path / "wsl-baseline.txt"
+    _write(baseline, f"{WSL_NODE}\n")
+    new_node = "tests/test_new.py::test_new[a b]"
+    full = Completed(
+        1,
+        f"{SUMMARY_HEADER}\n"
+        f"FAILED {WSL_NODE} - AssertionError: 0o644\n"
+        f"FAILED {new_node} - assert 0\n"
+        "2 failed in 1.00s\n",
+    )
+    runner = FakeRunner(root, {"wsl pytest": _full_then_alone(full, PASSED_ALONE)})
+
+    code, summary, _, _ = _cut(root, "--wsl-baseline", str(baseline), runner=runner)
+
+    assert code == 0, summary["reason"]
+    _, rerun = runner.argv_of("wsl pytest")
+    command = _guarded(rerun)[1]
+    assert command[-1] == new_node and WSL_NODE not in command
+    assert _detail(summary, "wsl_tests") == (
+        f"1 WSL failure(s) passed alone: {new_node}; "
+        "1 failure(s) in the baseline: 2 failed in 1.00s"
+    )
+
+
+def test_a_wsl_run_whose_failures_are_all_in_the_baseline_makes_one_wsl_pytest_call(
+    tmp_path: Path,
+) -> None:
+    root = _repo(tmp_path)
+    baseline = tmp_path / "wsl-baseline.txt"
+    _write(baseline, f"{WSL_NODE}\n")
+    runner = FakeRunner(root, {"wsl pytest": WSL_FAILURE})
+
+    code, summary, _, _ = _cut(root, "--wsl-baseline", str(baseline), runner=runner)
+
+    assert code == 0, summary["reason"]
+    assert len(runner.argv_of("wsl pytest")) == 1
+    assert not (root / WSL_RERUN_LOG).exists()
+
+
+@pytest.mark.parametrize(
+    ("response", "reason"),
+    [
+        (
+            Completed(
+                2,
+                f"{SUMMARY_HEADER}\nERROR {WSL_NODE}\n"
+                "!!! Interrupted: 1 error during collection !!!\n",
+            ),
+            "WSL pytest exited 2: !!! Interrupted: 1 error during collection !!!",
+        ),
+        (
+            Completed(1, "", "/usr/bin/python3: No module named pytest\n"),
+            "WSL pytest exited 1 without naming a failing node id",
+        ),
+        (
+            _many_failures(OVER_THE_CAP),
+            f"{OVER_THE_CAP} WSL failure(s) not in the baseline: "
+            f"{', '.join(_many_nodes(5))} (+{OVER_THE_CAP - 5} more)",
+        ),
+    ],
+    ids=["exit_2", "exit_1_without_a_node_id", "over_the_cap"],
+)
+def test_a_wsl_failure_load_cannot_explain_makes_one_wsl_pytest_call_and_fails_as_before(
+    tmp_path: Path, response: Any, reason: str
+) -> None:
+    root = _repo(tmp_path)
+    runner = FakeRunner(root, {"wsl pytest": response})
+
+    code, summary, _, _ = _cut(root, runner=runner)
+
+    assert code == 1 and summary["failed_step"] == "wsl_tests"
+    assert summary["reason"] == f"{reason} (log {WSL_LOG})"
+    assert len(runner.argv_of("wsl pytest")) == 1
+    assert runner.labels[-2:] == ["wsl pytest", "wsl rm"]
+    assert not (root / WSL_RERUN_LOG).exists()
+
+
+@pytest.mark.parametrize("suite", ["pytest", "wsl pytest"])
+def test_exactly_the_cap_of_failed_nodes_is_still_rerun_serially(
+    tmp_path: Path, suite: str
+) -> None:
+    root = _repo(tmp_path)
+    cap = release_cut.LOAD_RERUN_MAX_NODES
+    runner = FakeRunner(root, {suite: _full_then_alone(_many_failures(cap), PASSED_ALONE)})
+
+    code, summary, _, _ = _cut(root, runner=runner)
+
+    assert code == 0, summary["reason"]
+    _, rerun = runner.argv_of(suite)
+    command = _guarded(rerun)[1] if suite == "wsl pytest" else list(rerun)
+    assert command[-cap:] == _many_nodes(cap)
+    assert command[command.index("-n") + 1] == "0"
+    detail = _detail(summary, "host_tests" if suite == "pytest" else "wsl_tests")
+    assert ", ".join(_many_nodes(cap)) in detail
+
+
+@pytest.mark.parametrize("suite", ["pytest", "wsl pytest"])
+@pytest.mark.parametrize(
+    "node",
+    [
+        "--collect-only",
+        "../x.py::t",
+        "/abs/x.py::t",
+        "C:/x.py::t",
+        "tests/../x.py::t",
+        "tests/..\\x.py::t",
+    ],
+)
+def test_a_node_id_outside_tests_is_never_handed_to_pytest(
+    tmp_path: Path, suite: str, node: str
+) -> None:
+    root = _repo(tmp_path)
+    failure = Completed(1, f"{SUMMARY_HEADER}\nFAILED {node} - assert 0\n1 failed in 1.00s\n")
+    runner = FakeRunner(root, {suite: failure})
+
+    code, summary, _, _ = _cut(root, runner=runner)
+
+    assert code == 1, summary["reason"]
+    assert len(runner.argv_of(suite)) == 1
+
+
+def test_a_parametrized_id_may_hold_dots_and_spaces_and_is_still_rerun(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    node = "tests/test_x.py::test_x[../a b]"
+    failure = Completed(1, f"{SUMMARY_HEADER}\nFAILED {node} - assert 0\n1 failed in 1.00s\n")
+    runner = FakeRunner(root, {"pytest": _full_then_alone(failure, PASSED_ALONE)})
+
+    code, summary, _, _ = _cut(root, runner=runner)
+
+    assert code == 0, summary["reason"]
+    assert runner.argv_of("pytest")[1][-1] == node
 
 
 # -- push, force, dry run ---------------------------------------------------------
