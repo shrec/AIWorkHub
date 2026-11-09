@@ -559,7 +559,8 @@ def record_decision_evidence(
         identity = str(row.get("identity") or "")
         version = str(row.get("version") or "")
         try:
-            registry = store.load_registry(root)
+            # Write-back path: keep the stored lifecycle verbatim, never the demoted view.
+            registry = store.load_registry(root, demote_unverified_active=False)
             record = registry.get(identity, version)
             if record is None:
                 refused.append({"identity": identity, "version": version,
@@ -1063,7 +1064,8 @@ def add_learning_commit_evidence(*, task_id: str, request_id: str = "") -> dict[
             })
             continue
         try:
-            registry = store.load_registry(root)
+            # Write-back path: keep the stored lifecycle verbatim, never the demoted view.
+            registry = store.load_registry(root, demote_unverified_active=False)
             expected = store.stored_state_digest(root, record.identity, record.version)
             authority = sr.Authority(sr.AuthorityRole.WORKER, actor_id=actor_id, token="")
             updated = registry.add_evidence(

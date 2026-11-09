@@ -557,6 +557,35 @@ def test_a_decision_with_no_selection_receipt_records_nothing(manager):
     assert _loaded(manager).evidence == ()
 
 
+def test_a_reject_on_an_active_record_keeps_the_stored_row_active(manager):
+    """NF-2026-02177: the decision write-back keeps the stored lifecycle; selection still demotes."""
+    _propose()
+    assert _accept("actor-a", source="first")["ok"] is True
+    assert _accept("actor-b", source="second")["ok"] is True
+    assert mst.activate(identity=BASE["identity"], version=BASE["version"])["ok"] is True
+    # A first reject leaves the row ACTIVE but failing the gate, so the reject below
+    # loads a record the default (demoting) load would turn into PROPOSED.
+    _seed_card(manager, "T_REJ_FIRST", runner="claude_sonnet-5")
+    _record_selection(manager, "T_REJ_FIRST", "req-3")
+    assert _decide(manager, "T_REJ_FIRST", "req-3", "rejected")["ok"] is True
+    _seed_card(manager, "T_REJ_ACTIVE", runner="claude_sonnet-5")
+    _record_selection(manager, "T_REJ_ACTIVE", "req-4")
+
+    result = _decide(manager, "T_REJ_ACTIVE", "req-4", "rejected")
+
+    assert result["ok"] is True
+    assert result["recorded"][0]["identity"] == BASE["identity"]
+    stored = store.load_registry(manager, demote_unverified_active=False).get(
+        BASE["identity"], BASE["version"]
+    )
+    assert stored.lifecycle_state is sr.LifecycleState.ACTIVE
+    assert stored.evidence[-1].outcome is sr.EvidenceOutcome.NEGATIVE
+    assert stored.evidence[-1].source == "req-4"
+    # Selection still demotes it: the default load is the view runtime serves.
+    selected = store.load_registry(manager).get(BASE["identity"], BASE["version"])
+    assert selected.lifecycle_state is sr.LifecycleState.PROPOSED
+
+
 def test_a_repeated_finalization_cannot_inflate_the_evidence_count(manager):
     _propose()
     _seed_card(manager, "T_IDEM", runner="claude_sonnet-5")

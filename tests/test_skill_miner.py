@@ -616,8 +616,9 @@ def test_both_mining_tools_are_registered_on_the_mcp_server(monkeypatch):
 
 
 # Each filler is appended AFTER the shared ASCII rule prose, so the statements
-# still cluster (``rule_terms`` only sees Latin words) while the 256-byte cut
-# lands inside the filler -- inside a multibyte code point for the Georgian one.
+# still cluster (``rule_terms`` only sees Latin words). The Georgian excerpt is over
+# the 512-byte bound and is cut inside a multibyte code point; the ASCII excerpt is
+# shorter than the bound and is kept whole.
 _ASCII_FILLER = "every emitting branch must be enumerated before delivery " * 4
 _GEORGIAN_FILLER = (
     "ყოველი გამცემი შტო უნდა ჩამოითვალოს სანამ ველის გარანტია მიწოდებულად ჩაითვლება " * 4
@@ -660,7 +661,9 @@ def test_a_long_excerpt_is_cut_to_the_registry_bound_not_refused(manager, filler
     draft = _only_draft(manager)
     bounded = list(draft["procedure_steps"]) + list(draft["avoid_rules"])
     assert bounded, "the draft must carry the mined prose, not discard it"
-    assert any(entry.endswith("…") for entry in bounded), "nothing was cut"
+    if filler == _GEORGIAN_FILLER:
+        # Only the multibyte excerpt is over the 512-byte bound; the ASCII one is kept whole.
+        assert any(entry.endswith("…") for entry in bounded), "nothing was cut"
     for entry in bounded:
         encoded = entry.encode("utf-8")
         assert len(encoded) <= sr.MAX_PACKET_STRING_BYTES
@@ -705,7 +708,8 @@ def test_long_excerpts_sharing_a_bounded_prefix_collapse_to_one_step(manager):
     three steps a reader cannot tell apart, spending the step budget on one
     sentence printed three times.
     """
-    prefix = (RULE + " ") * 3
+    # Five units (570 bytes) clear the 512-byte bound; three (342 bytes) would not.
+    prefix = (RULE + " ") * 5
     assert len(prefix.encode("utf-8")) > sr.MAX_PACKET_STRING_BYTES
     for index in range(3):
         seed_card(
@@ -716,11 +720,13 @@ def test_long_excerpts_sharing_a_bounded_prefix_collapse_to_one_step(manager):
     draft = _only_draft(manager)
     assert len(draft["procedure_steps"]) == 1
     assert len(draft["avoid_rules"]) == 1
-    assert draft["procedure_steps"][0].endswith("…")
+    # The miner's excerpt is already inside the 512-byte bound, so nothing is byte-cut
+    # here; the dedupe above is the behaviour this test pins.
+    assert len(draft["procedure_steps"][0].encode("utf-8")) <= sr.MAX_PACKET_STRING_BYTES
 
 
 def test_the_mined_bound_is_the_registrys_own_constant():
     """single_definition: the miner imports the limit and never restates it."""
-    assert sr.MAX_PACKET_STRING_BYTES == 256
+    assert sr.MAX_PACKET_STRING_BYTES == 512
     assert not hasattr(skill_miner, "MAX_PACKET_STRING_BYTES")
     assert "skill_registry.MAX_PACKET_STRING_BYTES" in inspect.getsource(skill_miner)

@@ -63,7 +63,10 @@ def assert_fails(code, fn):
 # ---------------------------------------------------------------------------
 
 _UNEMITTABLE_OVERRIDES = [
-    pytest.param({"procedure_steps": ("x" * 339,)}, id="over_string_bytes"),
+    pytest.param(
+        {"procedure_steps": ("x" * (sr.MAX_PACKET_STRING_BYTES + 1),)},
+        id="over_string_bytes",
+    ),
     pytest.param(
         {"avoid_rules": tuple(f"rule-{i}" for i in range(17))}, id="over_list_items"
     ),
@@ -94,14 +97,17 @@ def test_adopt_rejects_a_record_the_packet_can_never_emit(overrides):
 
 
 def test_validate_record_does_not_enforce_packet_bounds():
-    record = _active("still-valid-by-validate-record", procedure_steps=("x" * 339,))
+    record = _active(
+        "still-valid-by-validate-record",
+        procedure_steps=("x" * (sr.MAX_PACKET_STRING_BYTES + 1),),
+    )
     assert sr.validate_record(record).identity == "still-valid-by-validate-record"
 
 
 def test_load_registry_still_loads_an_existing_overcap_record(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir(parents=True, exist_ok=True)
-    record = _active("legacy-overcap", procedure_steps=("x" * 339,))
+    record = _active("legacy-overcap", procedure_steps=("x" * (sr.MAX_PACKET_STRING_BYTES + 1),))
     store.put_record(repo, record)
 
     registry = store.load_registry(repo)
@@ -116,7 +122,7 @@ def test_load_registry_still_loads_an_existing_overcap_record(tmp_path):
 
 def test_one_overcap_record_is_excluded_and_the_other_survives():
     good = _active("good-skill")
-    bad = _active("bad-skill", procedure_steps=("x" * 339,))
+    bad = _active("bad-skill", procedure_steps=("x" * (sr.MAX_PACKET_STRING_BYTES + 1),))
     receipt = sr.select([good, bad], _ctx(), limit=2)
     assert {item.identity for item in receipt.selected} == {"good-skill", "bad-skill"}
 
@@ -224,7 +230,7 @@ def _vocab_card(**overrides):
 
 def test_skills_section_over_tmp_store_surfaces_the_exclusion(tmp_path):
     good = _vocab_record("good-skill")
-    bad = _vocab_record("bad-skill", procedure_steps=("x" * 339,))
+    bad = _vocab_record("bad-skill", procedure_steps=("x" * (sr.MAX_PACKET_STRING_BYTES + 1),))
     repo = tmp_path / "repo"
     repo.mkdir(parents=True, exist_ok=True)
     store.put_record(repo, good)
@@ -269,3 +275,28 @@ def test_an_old_receipt_row_without_the_excluded_column_still_reads(tmp_path):
 
     assert result is not None
     assert result["excluded"] == []
+
+
+def test_ladder_length_step_reaches_the_packet():
+    """NF-2026-02177: a 339-byte step is inside the 512-byte bound and reaches the packet."""
+    assert sr.MAX_PACKET_STRING_BYTES == 512
+    ladder = _active("ladder-skill", procedure_steps=("x" * 339,))
+    receipt = sr.select([ladder], _ctx(), limit=1)
+    assert [item.identity for item in receipt.selected] == ["ladder-skill"]
+
+    packet = sr.build_runtime_packet([ladder], receipt)
+
+    assert [row.identity for row in packet.skills] == ["ladder-skill"]
+    assert packet.excluded == ()
+
+
+def test_step_over_the_limit_is_still_excluded():
+    """One byte past the bound is excluded; the other selected record survives."""
+    good = _active("good-skill")
+    bad = _active("bad-skill", procedure_steps=("x" * (sr.MAX_PACKET_STRING_BYTES + 1),))
+    receipt = sr.select([good, bad], _ctx(), limit=2)
+
+    packet = sr.build_runtime_packet([good, bad], receipt)
+
+    assert [row.identity for row in packet.skills] == ["good-skill"]
+    assert packet.excluded == (("bad-skill", "1.0.0", "packet_limit:procedure_steps"),)

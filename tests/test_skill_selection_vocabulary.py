@@ -643,7 +643,7 @@ def test_packet_truncation_surfaces_in_the_metadata_bundle(
     bad = skill_registry.validate_record(
         dataclasses.replace(
             _vocabulary_record(identity="bad-skill"),
-            procedure_steps=("x" * 339,),
+            procedure_steps=("x" * (skill_registry.MAX_PACKET_STRING_BYTES + 1),),
         )
     )
     repo = tmp_path / "repo"

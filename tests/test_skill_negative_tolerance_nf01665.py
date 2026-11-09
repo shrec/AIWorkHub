@@ -48,10 +48,15 @@ WILDCARD_CONTEXT = {
 
 TOLERATED = {
     "at_the_count_floor": {"accepted": 10, "negatives": 1},
-    "at_the_share_floor": {"accepted": 90, "negatives": 10},
+    "at_the_share_floor": {"accepted": 75, "negatives": 25},
     "negative_between_acceptances": {"accepted": 20, "negatives": 1, "position": "middle"},
     "two_independent_actors": {"accepted": 20, "negatives": 1, "actors": 2},
     "resolved_row_is_newest": {"accepted": 20, "negatives": 1, "resolved_tail": True},
+    "newest_row_is_the_negative": {"accepted": 20, "negatives": 1, "position": "last"},
+    "two_newest_rows_are_negative": {"accepted": 20, "negatives": 2, "position": "last"},
+    "resolved_row_among_the_last_three": {
+        "accepted": 20, "negatives": 3, "position": "last", "resolved_tail": True,
+    },
 }
 
 BLOCKED = {
@@ -60,15 +65,15 @@ BLOCKED = {
         NEGATIVE_CODE,
     ),
     "below_the_share_floor": (
-        {"accepted": 10, "negatives": 2},
+        {"accepted": 10, "negatives": 4},
         NEGATIVE_CODE,
     ),
     "just_below_the_share_floor": (
-        {"accepted": 89, "negatives": 10},
+        {"accepted": 74, "negatives": 25},
         NEGATIVE_CODE,
     ),
-    "newest_row_is_the_negative": (
-        {"accepted": 20, "negatives": 1, "position": "last"},
+    "three_newest_rows_are_negative": (
+        {"accepted": 20, "negatives": 3, "position": "last"},
         NEGATIVE_CODE,
     ),
     "single_accepted_actor": (
@@ -218,18 +223,26 @@ def test_zero_negatives_leave_only_the_actor_floor_in_charge():
     )
 
 
-def test_a_fresh_negative_after_a_tolerated_one_blocks_again():
+def test_fresh_negatives_block_only_as_a_run_of_three():
     tolerated = make_record(88, 1)
-    fresh = sr.replace(
+    one_fresh = sr.replace(
         tolerated,
-        evidence=tolerated.evidence + (row("negative", "actor-neg", "incident-new"),),
+        evidence=tolerated.evidence + (row("negative", "actor-neg", "incident-new-1"),),
         negative_count=2,
+    )
+    run_of_three = sr.replace(
+        tolerated,
+        evidence=tolerated.evidence
+        + tuple(row("negative", "actor-neg", f"incident-new-{n}") for n in range(1, 4)),
+        negative_count=4,
     )
 
     assert sr.blocking_negative_evidence(tolerated) == ()
-    assert len(sr.blocking_negative_evidence(fresh)) == 2
-    assert store.activation_supported(fresh, 2) is False
-    assert skill_miner.injectability(fresh) == (False, NEGATIVE_REASON)
+    assert sr.blocking_negative_evidence(one_fresh) == ()
+    assert store.activation_supported(one_fresh, 2) is True
+    assert len(sr.blocking_negative_evidence(run_of_three)) == 4
+    assert store.activation_supported(run_of_three, 2) is False
+    assert skill_miner.injectability(run_of_three) == (False, NEGATIVE_REASON)
 
 
 def test_activation_flow_tolerates_an_earlier_negative():
@@ -240,15 +253,18 @@ def test_activation_flow_tolerates_an_earlier_negative():
     assert activated.lifecycle_state is ACTIVE
 
 
-def test_activation_flow_refuses_a_newest_negative_until_a_manager_resolves_it():
-    registry = registry_with([*accepted_rows(20), ("incident", "negative", "actor-neg")])
+def test_activation_flow_refuses_three_newest_negatives_until_a_manager_resolves_one():
+    sources = ("incident-a", "incident-b", "incident-c")
+    registry = registry_with(
+        [*accepted_rows(20), *((source, "negative", "actor-neg") for source in sources)]
+    )
     identity, version = BASE_DATA["identity"], BASE_DATA["version"]
 
     with pytest.raises(sr.SkillRegistryError) as excinfo:
         registry.activate(identity, version, MANAGER)
     assert excinfo.value.code == NEGATIVE_CODE
 
-    registry.resolve_negative_evidence(identity, version, "incident", "fixed upstream", MANAGER)
+    registry.resolve_negative_evidence(identity, version, "incident-c", "fixed upstream", MANAGER)
     assert registry.activate(identity, version, MANAGER).lifecycle_state is ACTIVE
 
 
@@ -281,7 +297,7 @@ def test_a_stored_active_record_follows_the_negative_gate(tmp_path, accepted, st
 
 def test_tolerance_floors_are_exported_with_their_documented_values():
     assert sr.NEGATIVE_TOLERANCE_MIN_ACCEPTED == 10
-    assert sr.NEGATIVE_TOLERANCE_MIN_SHARE == 0.9
+    assert sr.NEGATIVE_TOLERANCE_MIN_SHARE == 0.75
     assert sr.NEGATIVE_TOLERANCE_MIN_ACTORS == 2
     for name in (
         "blocking_negative_evidence",

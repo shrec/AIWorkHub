@@ -786,8 +786,15 @@ def unresolved_negative_evidence(record: SkillRecord) -> tuple[EvidenceRecord, .
 
 # Floors for tolerating an outvoted negative: accepted rows, accepted share, distinct actors.
 NEGATIVE_TOLERANCE_MIN_ACCEPTED = 10
-NEGATIVE_TOLERANCE_MIN_SHARE = 0.9
+# ponytail: 0.75 is the 2026-11-09 measurement over 769 selection receipts. Negative evidence is an
+# ordinary card reject, so this is an accept rate: the 8 proposed skills with evidence sat at 0.886-0.899
+# under the old 0.9 floor, while the accept rate of cards that received any skill was 95/125 = 0.76 and
+# of all cards 0.50. Upgrade path: derive this from a live accept-rate baseline if the rate moves.
+NEGATIVE_TOLERANCE_MIN_SHARE = 0.75
 NEGATIVE_TOLERANCE_MIN_ACTORS = 2
+# ponytail: a run of 3 unresolved negatives is the blocking shape. At a 24% negative rate that run is
+# expected about once per 94 uses; at 50% about once per 14. Raise it if the negative rate moves.
+NEGATIVE_TOLERANCE_BLOCKING_RUN = 3
 
 
 def blocking_negative_evidence(record: SkillRecord) -> tuple[EvidenceRecord, ...]:
@@ -798,8 +805,9 @@ def blocking_negative_evidence(record: SkillRecord) -> tuple[EvidenceRecord, ...
     hold: at least ``NEGATIVE_TOLERANCE_MIN_ACCEPTED`` accepted rows; an
     accepted share of at least ``NEGATIVE_TOLERANCE_MIN_SHARE`` of accepted
     rows plus unresolved negatives; at least ``NEGATIVE_TOLERANCE_MIN_ACTORS``
-    independent accepted actors; and a newest evidence row that is not itself
-    an unresolved negative. Otherwise this is exactly
+    independent accepted actors; and the newest ``NEGATIVE_TOLERANCE_BLOCKING_RUN``
+    evidence rows are not ALL unresolved negatives. A resolved row or an accepted
+    row anywhere in that run clears it. Otherwise this is exactly
     :func:`unresolved_negative_evidence`, so a refusal names the same rows.
     """
     record = validate_record(record)
@@ -807,13 +815,17 @@ def blocking_negative_evidence(record: SkillRecord) -> tuple[EvidenceRecord, ...
     if not negative:
         return ()
     accepted = record.accepted_count
-    # Evidence is append-only and never reordered, so the last row is the newest.
-    newest = record.evidence[-1]
+    # Evidence is append-only and never reordered, so the tail is the newest.
+    # The accepted floor is checked first, so there are always enough rows here.
+    newest_run = record.evidence[-NEGATIVE_TOLERANCE_BLOCKING_RUN:]
+    run_is_all_negative = all(
+        item.outcome is EvidenceOutcome.NEGATIVE and not item.resolved for item in newest_run
+    )
     if (
         accepted >= NEGATIVE_TOLERANCE_MIN_ACCEPTED
         and accepted / (accepted + len(negative)) >= NEGATIVE_TOLERANCE_MIN_SHARE
         and independent_accepted_evidence_count(record) >= NEGATIVE_TOLERANCE_MIN_ACTORS
-        and (newest.outcome is not EvidenceOutcome.NEGATIVE or newest.resolved)
+        and not run_is_all_negative
     ):
         return ()
     return negative
@@ -1230,7 +1242,7 @@ def card_selection_context(card: Mapping[str, Any]) -> dict[str, Any] | None:
 RUNTIME_PACKET_VERSION = "1.0.0"
 MAX_PACKET_SELECTED = 32
 MAX_PACKET_LIST_ITEMS = 16
-MAX_PACKET_STRING_BYTES = 256
+MAX_PACKET_STRING_BYTES = 512
 MAX_PACKET_BYTES = 8192
 _PACKET_ROW_KEYS = frozenset(
     {

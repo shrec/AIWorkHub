@@ -262,3 +262,55 @@ def test_unresolved_negative_evidence_blocks_auto_activation_even_with_two_actor
     ]
     record = store.load_registry(manager).get("skill-blocked-by-negative-evidence", "1.0.0")
     assert record.lifecycle_state is sr.LifecycleState.PROPOSED
+
+
+def _stored_active_the_gate_refuses(root, identity):
+    """An ACTIVE record the gate refuses: two accepted actors, then four unresolved negatives."""
+    rows = [
+        sr.EvidenceRecord(
+            source=f"ok-{n}", outcome=sr.EvidenceOutcome.ACCEPTED,
+            authority=sr.AuthorityRole.WORKER, actor_id=f"actor-{n}",
+        )
+        for n in range(2)
+    ] + [
+        sr.EvidenceRecord(
+            source=f"incident-{n}", outcome=sr.EvidenceOutcome.NEGATIVE,
+            authority=sr.AuthorityRole.WORKER, actor_id="actor-neg",
+        )
+        for n in range(4)
+    ]
+    record = sr.SkillRecord.from_mapping({
+        "identity": identity, "version": "1.0.0", "scope": "repository",
+        "task_family": "bugfix", "path_or_symbol": _PATH, "risk": "medium",
+        "stage": "implementation", "triggers": ("code_change",),
+        "applicability": ("quality_gate",), "procedure_steps": ("do the thing",),
+        "avoid_rules": (), "preferred_tools": (), "confidence": 0.9,
+        "lifecycle_state": "active", "evidence": rows,
+        "accepted_count": 2, "negative_count": 4,
+    })
+    store.put_record(root, record)
+    return record
+
+
+def test_learning_write_back_keeps_a_gate_refused_active_record_active(manager):
+    """NF-2026-02177: the learning write-back persists the stored lifecycle, not the demoted view.
+
+    A rejected commit never reaches this write (it returns before any write), so the
+    write-back is exercised by an accepted commit that leaves the record still refused.
+    """
+    identity = "skill-stored-active-gate-refused"
+    _stored_active_the_gate_refuses(manager, identity)
+    _seed_card(manager, "T_WB1", runner="claude_sonnet-5")
+    _seed_learning_commit(manager, "T_WB1", "req-wb1", outcome="accepted")
+
+    result = mst.add_learning_commit_evidence(task_id="T_WB1", request_id="req-wb1")
+
+    assert result["ok"] is True
+    assert [row["identity"] for row in result["recorded"]] == [identity]
+    stored = store.load_registry(manager, demote_unverified_active=False).get(identity, "1.0.0")
+    assert stored.lifecycle_state is sr.LifecycleState.ACTIVE
+    assert len(stored.evidence) == 7
+    assert stored.evidence[-1].outcome is sr.EvidenceOutcome.ACCEPTED
+    # Selection still demotes it: the default load is the view runtime serves.
+    selected = store.load_registry(manager).get(identity, "1.0.0")
+    assert selected.lifecycle_state is sr.LifecycleState.PROPOSED
