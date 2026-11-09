@@ -7,7 +7,7 @@ first index; the repository daemon refreshes changed files incrementally.
 
 ## Query modes
 
-The manager and worker MCP surfaces expose exactly 37 bounded modes. All modes
+The manager and worker MCP surfaces expose exactly 38 bounded modes. All modes
 read the one canonical repository database; analytics never create a parallel
 index or decision store.
 

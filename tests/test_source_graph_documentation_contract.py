@@ -17,6 +17,6 @@ def test_source_graph_documentation_covers_count_and_exact_target_modes() -> Non
 
     for doc_path in DOC_PATHS:
         text = doc_path.read_text(encoding="utf-8")
-        assert "exactly 37" in text
+        assert f"exactly {len(SOURCE_GRAPH_MODES)}" in text
         for mode in exact_target_modes:
             assert f"`{mode}`" in text, f"{doc_path} does not document {mode!r}"

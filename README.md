@@ -272,7 +272,7 @@ alternate names for the same feature.
 
 | Surface | What it represents | Who uses it |
 | --- | --- | --- |
-| **Source Graph** | An automatically refreshed structural index with 34 configurable code/data/documentation families and exactly 37 bounded query modes, including exact-target `file`, `function`, `class`, `body`, `bodygrep` and `deps` modes, used to return repository context instead of repeatedly scanning the tree | Managers and workers |
+| **Source Graph** | An automatically refreshed structural index with 34 configurable code/data/documentation families and exactly 38 bounded query modes, including exact-target `file`, `function`, `class`, `body`, `bodygrep` and `deps` modes, used to return repository context instead of repeatedly scanning the tree | Managers and workers |
 | **Manager Context Graph** | An opt-in, append-only ledger and deterministic graph of manager conversation evidence across repository, thread, session and task identities | Verified managers only |
 
 The Manager Context Graph can search an earlier decision, recover the exact

@@ -307,7 +307,7 @@ def render_system_diagram(stamp: str) -> str:
             Row("Template gate", "task_templates.py — required outputs must change"),
         ), index="1"),
         Panel("Context authorities", GREEN, "answer without re-reading the tree", (
-            Row("Source Graph", "source_graph*.py — 37 modes, structural index"),
+            Row("Source Graph", f"source_graph*.py — {len(sg.SOURCE_GRAPH_MODES)} modes, structural index"),
             Row("Context Graph", "context_graph.py — manager seat only"),
             Row("AI Memory + KB", "manager_ai_tools.py — durable decisions and contracts"),
             Row("Session Manager", "session_current_state / session_write"),
