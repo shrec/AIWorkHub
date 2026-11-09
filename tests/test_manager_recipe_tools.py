@@ -348,6 +348,7 @@ def test_read_only_catalogue_entries_declare_no_write_capability():
         "aiworkhub.operator.blocked_queue_triage",
         "aiworkhub.operator.preflight_card_winnability",
         "aiworkhub.operator.process_liveness",
+        "aiworkhub.operator.request_forensics",
         "aiworkhub.operator.request_log_tail",
         "aiworkhub.operator.task_events",
         "aiworkhub.operator.usage_rollup",

@@ -1513,6 +1513,47 @@ CANONICAL_RECIPES: tuple[tr.Recipe, ...] = (
         ),
     ),
     tr.Recipe(
+        id="aiworkhub.operator.request_forensics",
+        version="1.0.0",
+        purpose=(
+            "What happened to one launched request, or the recurring rows across "
+            "requests. With --request-id: the supervisor state, phase and last "
+            "heartbeat, the failure classes and validation checks, the changed "
+            "paths and the worker stderr tail, each section read through its "
+            "owner recipe. Repository-wide with --state, --failure-class, --since "
+            "and --limit: bounded rows. Unknown ids and unanswerable questions "
+            "exit 2. Runs src/aiworkhub/recipes/request_forensics.py as a package "
+            "module; read-only. Catalogue: src/aiworkhub/manager_recipe_tools.py."
+        ),
+        task_kind=tr.TaskKind.SCAN,
+        parameters=(
+            _optional_filter("request_id"),
+            _optional_filter("state"),
+            _optional_filter("failure_class"),
+            _optional_filter("since"),
+            _limit(default=20, maximum=200),
+        ),
+        outputs=(_STDOUT_JSON,),
+        risk_class=tr.RiskClass.NONE,
+        resource_bounds=tr.ResourceBounds(max_runtime_seconds=120),
+        cache_policy=tr.CachePolicy.NEVER,
+        argv=(
+            tr.lit("python"),
+            tr.lit("-m"),
+            tr.lit("aiworkhub.recipes.request_forensics"),
+            tr.lit("--request-id"),
+            tr.slot("request_id"),
+            tr.lit("--state"),
+            tr.slot("state"),
+            tr.lit("--failure-class"),
+            tr.slot("failure_class"),
+            tr.lit("--since"),
+            tr.slot("since"),
+            tr.lit("--limit"),
+            tr.slot("limit"),
+        ),
+    ),
+    tr.Recipe(
         id="aiworkhub.operator.repo_test_subset",
         version="2.0.0",
         purpose=(
