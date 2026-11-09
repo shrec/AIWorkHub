@@ -1,8 +1,9 @@
 """Acceptance tests: NeedFix active state derived at read time from the card.
 
 Covers the eight task-contract acceptance criteria:
-1. The active listing excludes owned (pending/processing/review/blocked) and
-   closed (finished/archived/accepted) records.
+1. The active listing excludes owned (pending/processing/review) and closed
+   (finished/accepted, or archived with accepted evidence) records; a blocked
+   card is stalled and stays listed.
 2. cancelled/superseded WITHOUT a landed successor -> ACTIVE again, with reason.
 3. converted_task_id naming a missing card -> ACTIVE (not silently owned).
 4. Active state is derived at read time (self-heals) and the report states no
@@ -24,7 +25,7 @@ from typing import Any, Mapping
 
 import pytest
 
-from aiworkhub import needfix_store
+from aiworkhub import needfix_store, task_store
 
 
 @pytest.fixture
@@ -38,6 +39,14 @@ def init_store(repo_root: Path) -> Path:
     result = needfix_store.initialize_repository(repo_root)
     assert result["initialized"] is True
     return repo_root
+
+
+_ACCEPTED: dict[str, Any] = {
+    "accepted_request_id": "req-1",
+    "accepted_by": "owner",
+    "accepted_at": "2026-09-01T00:00:00+00:00",
+    "accept_evidence": {"receipt": "r"},
+}
 
 
 def _card(task_id: str, status: str, *, superseded_by: str | None = None) -> dict[str, Any]:
@@ -103,14 +112,16 @@ def _active_ids(init_store: Path, cards: Mapping[str, Mapping[str, Any]]) -> set
 # --- 1. Active listing excludes owned and closed records ---------------------
 
 def test_active_listing_excludes_owned_and_closed(init_store: Path):
-    owned = ("pending", "processing", "review", "blocked")
-    closed = ("finished", "archived", "accepted")
+    owned = ("pending", "processing", "review")
+    closed = ("finished", "accepted")
     cards: dict[str, Mapping[str, Any]] = {}
     excluded_ids: set[str] = set()
     for status in (*owned, *closed):
         task_id = f"T-{status}"
         cards[task_id] = _card(task_id, status)
         excluded_ids.add(_linked(init_store, f"linked-{status}", task_id)["id"])
+    cards["T-archived"] = {**_card("T-archived", "archived"), **_ACCEPTED}
+    excluded_ids.add(_linked(init_store, "linked-archived", "T-archived")["id"])
 
     empty = needfix_store.capture_proposal(init_store, title="unlinked", description="no card")
     dangling = _linked(init_store, "dangling", "T-missing")
@@ -121,6 +132,112 @@ def test_active_listing_excludes_owned_and_closed(init_store: Path):
     assert dangling["id"] in active_ids
     assert active_ids & excluded_ids == set()
     assert active_ids == {empty["id"], dangling["id"]}
+
+
+# --- 1b. A blocked card has no worker: the problem stays on the open list ----
+
+def test_blocked_card_is_stalled_and_listed(init_store: Path):
+    cards = {"T-blocked": _card("T-blocked", "blocked")}
+    rec = _linked(init_store, "behind-blocked", "T-blocked")
+
+    items = needfix_store.list_active_needfix(
+        init_store, get_task_fn=_get_task_fn(cards), canonical_status_fn=_canonical_status_fn()
+    )["items"]
+
+    assert [item["id"] for item in items] == [rec["id"]]
+    assert items[0]["derived_state"] == "stalled"
+    assert items[0]["active"] is True
+    assert "no worker owns this problem" in items[0]["active_reason"]
+
+
+# --- 1c. Archived proves nothing alone: accepted evidence or a landed successor
+
+def _archived_card(
+    task_id: str, *, superseded_by: str | None = None, **extra: Any
+) -> dict[str, Any]:
+    return {
+        **_card(task_id, "failed", superseded_by=superseded_by),
+        "archived_at": "2026-09-02T00:00:00+00:00",
+        **extra,
+    }
+
+
+def _derive_with_real_status(
+    cards: Mapping[str, Mapping[str, Any]], task_id: str
+) -> dict[str, Any]:
+    return needfix_store.derive_active_state(
+        {"id": "NF-1", "converted_task_id": task_id},
+        _get_task_fn(cards),
+        task_store.canonical_status,
+    )
+
+
+def test_archived_failed_card_is_reopened():
+    derived = _derive_with_real_status({"T-failed": _archived_card("T-failed")}, "T-failed")
+    assert derived["state"] == "reopened"
+    assert derived["active"] is True
+    assert "archived without being accepted" in derived["reason"]
+
+
+def test_archived_accepted_card_is_closed():
+    cards = {"T-done": _archived_card("T-done", **_ACCEPTED)}
+    derived = _derive_with_real_status(cards, "T-done")
+    assert derived["state"] == "closed"
+    assert derived["active"] is False
+
+
+def test_archived_cancelled_operation_outranks_accepted_fields():
+    cards = {
+        "T-cancel": _archived_card("T-cancel", archive_operation="cancelled", **_ACCEPTED)
+    }
+    derived = _derive_with_real_status(cards, "T-cancel")
+    assert derived["state"] == "reopened"
+    assert derived["active"] is True
+
+
+def test_archived_superseded_with_landed_successor_is_closed():
+    cards = {
+        "T-old": _archived_card(
+            "T-old", superseded_by="T-new", archive_operation="superseded"
+        ),
+        "T-new": _card("T-new", "finished"),
+    }
+    derived = _derive_with_real_status(cards, "T-old")
+    assert derived["state"] == "closed"
+    assert derived["active"] is False
+    assert "T-new" in derived["reason"]
+
+
+def test_archived_superseded_with_archived_unaccepted_successor_is_reopened():
+    cards = {
+        "T-old": _archived_card(
+            "T-old", superseded_by="T-new", archive_operation="superseded"
+        ),
+        "T-new": _archived_card("T-new"),
+    }
+    derived = _derive_with_real_status(cards, "T-old")
+    assert derived["state"] == "reopened"
+    assert derived["active"] is True
+
+
+def test_live_superseded_with_archived_unaccepted_successor_is_reopened():
+    cards = {
+        "T-old": _card("T-old", "superseded", superseded_by="T-new"),
+        "T-new": _archived_card("T-new"),
+    }
+    derived = _derive_with_real_status(cards, "T-old")
+    assert derived["state"] == "reopened"
+    assert derived["active"] is True
+
+
+def test_superseded_with_archived_accepted_successor_is_closed():
+    cards = {
+        "T-old": _card("T-old", "superseded", superseded_by="T-new"),
+        "T-new": _archived_card("T-new", **_ACCEPTED),
+    }
+    derived = _derive_with_real_status(cards, "T-old")
+    assert derived["state"] == "closed"
+    assert derived["active"] is False
 
 
 # --- 2. cancelled/superseded without a landed successor -> ACTIVE AGAIN ------

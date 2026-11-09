@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import subprocess
 import tempfile
@@ -20,6 +21,7 @@ from aiworkhub.needfix_store import (
     NEEDFIX_TERMINAL_STATUSES,
     OWNED_CARD_STATUSES,
     REOPEN_CARD_STATUSES,
+    STALLED_CARD_STATUSES,
     STATUSES,
     derive_active_state,
 )
@@ -41,6 +43,14 @@ def _row(**kw: Any) -> dict[str, Any]:
     row: dict[str, Any] = {"id": "NF-1", "converted_task_id": None}
     row.update(kw)
     return row
+
+
+_ACCEPTED: dict[str, Any] = {
+    "accepted_request_id": "req-1",
+    "accepted_by": "owner",
+    "accepted_at": "2026-09-01T00:00:00+00:00",
+    "accept_evidence": {"receipt": "r"},
+}
 
 
 def _card(status: str, *, superseded_by: str | None = None) -> dict[str, Any]:
@@ -86,13 +96,33 @@ def test_owned_status_is_hidden(status: str):
     }
 
 
-@pytest.mark.parametrize("status", sorted(CLOSED_CARD_STATUSES))
-def test_closed_status_is_hidden_as_fixed(status: str):
+@pytest.mark.parametrize("status", sorted(STALLED_CARD_STATUSES))
+def test_stalled_status_stays_active(status: str):
     st = derive_active_state(
         _row(converted_task_id="T-1"), _get({"T-1": _card(status)}), _status()
     )
+    assert st == {
+        "state": "stalled",
+        "active": True,
+        "reason": "task 'T-1' is blocked; no worker owns this problem",
+    }
+
+
+@pytest.mark.parametrize("status", sorted(CLOSED_CARD_STATUSES))
+def test_closed_status_is_hidden_as_fixed(status: str):
+    # ``archived`` alone proves nothing: it needs the accepted fields to close.
+    card = {**_card(status), **_ACCEPTED} if status == "archived" else _card(status)
+    st = derive_active_state(_row(converted_task_id="T-1"), _get({"T-1": card}), _status())
     assert st["state"] == "closed" and st["active"] is False
     assert "fixed" in st["reason"]
+
+
+def test_archived_status_without_accepted_fields_is_reopened():
+    st = derive_active_state(
+        _row(converted_task_id="T-1"), _get({"T-1": _card("archived")}), _status()
+    )
+    assert st["state"] == "reopened" and st["active"] is True
+    assert "live again" in st["reason"]
 
 
 @pytest.mark.parametrize("status", sorted(REOPEN_CARD_STATUSES))
@@ -201,6 +231,14 @@ def test_link_existing_task_accepts_closed_status(init: Path):
     assert result["converted_task_id"] == "T-done"
 
 
+def test_link_existing_task_accepts_blocked_status(init: Path):
+    rec = needfix_store.add_needfix(init, title="t", description="d", status="accepted")
+    result = needfix_store.link_existing_task(
+        init, rec["id"], "T-stuck", _get({"T-stuck": _card("blocked")}), _status()
+    )
+    assert result["converted_task_id"] == "T-stuck"
+
+
 def test_link_existing_task_rejects_non_linkable_status(init: Path):
     rec = needfix_store.add_needfix(init, title="t", description="d", status="accepted")
     with pytest.raises(needfix_store.NeedFixConflictError):
@@ -226,17 +264,23 @@ def test_active_state_definition_names_all_rule_branches():
     for word in ("ACTIVE", "OWNED", "CLOSED"):
         assert word in ACTIVE_STATE_DEFINITION
     # Every card status in the rule is accounted for in a status bucket.
-    buckets = OWNED_CARD_STATUSES | CLOSED_CARD_STATUSES | REOPEN_CARD_STATUSES
+    bucket_sets = (
+        OWNED_CARD_STATUSES,
+        STALLED_CARD_STATUSES,
+        CLOSED_CARD_STATUSES,
+        REOPEN_CARD_STATUSES,
+    )
+    buckets = frozenset().union(*bucket_sets)
     assert "pending" in buckets and "finished" in buckets and "superseded" in buckets
     assert "cancelled" in buckets or "canceled" in buckets
     assert LINKABLE_CARD_STATUSES == (
-        OWNED_CARD_STATUSES | CLOSED_CARD_STATUSES
+        OWNED_CARD_STATUSES | STALLED_CARD_STATUSES | CLOSED_CARD_STATUSES
     ) - {"archived"}
-    # The three buckets are pairwise disjoint: a status landing in two buckets
-    # would make derived state depend on evaluation order.
-    assert OWNED_CARD_STATUSES.isdisjoint(CLOSED_CARD_STATUSES)
-    assert OWNED_CARD_STATUSES.isdisjoint(REOPEN_CARD_STATUSES)
-    assert CLOSED_CARD_STATUSES.isdisjoint(REOPEN_CARD_STATUSES)
+    assert "blocked" in LINKABLE_CARD_STATUSES
+    # The buckets are pairwise disjoint: a status landing in two buckets would
+    # make derived state depend on evaluation order.
+    for left, right in itertools.combinations(bucket_sets, 2):
+        assert left.isdisjoint(right)
     # Every card status named in the ACTIVE rule lands in exactly one bucket:
     # pairwise disjointness only proves "at most one", so also prove "at least
     # one" for the exact statuses the rule talks about.
@@ -246,10 +290,7 @@ def test_active_state_definition_names_all_rule_branches():
         "superseded", "cancelled",
     )
     for rule_status in rule_statuses:
-        membership = sum(
-            rule_status in bucket
-            for bucket in (OWNED_CARD_STATUSES, CLOSED_CARD_STATUSES, REOPEN_CARD_STATUSES)
-        )
+        membership = sum(rule_status in bucket for bucket in bucket_sets)
         assert membership == 1, f"{rule_status!r} lands in {membership} buckets"
 
 
@@ -303,12 +344,16 @@ def test_needfix_status_buckets_are_frozensets_disjoint_and_exhaustive():
 
 
 def test_card_status_buckets_are_frozensets_and_pairwise_disjoint():
-    assert isinstance(OWNED_CARD_STATUSES, frozenset)
-    assert isinstance(CLOSED_CARD_STATUSES, frozenset)
-    assert isinstance(REOPEN_CARD_STATUSES, frozenset)
-    assert OWNED_CARD_STATUSES.isdisjoint(CLOSED_CARD_STATUSES)
-    assert OWNED_CARD_STATUSES.isdisjoint(REOPEN_CARD_STATUSES)
-    assert CLOSED_CARD_STATUSES.isdisjoint(REOPEN_CARD_STATUSES)
+    buckets = (
+        OWNED_CARD_STATUSES,
+        STALLED_CARD_STATUSES,
+        CLOSED_CARD_STATUSES,
+        REOPEN_CARD_STATUSES,
+    )
+    for bucket in buckets:
+        assert isinstance(bucket, frozenset)
+    for left, right in itertools.combinations(buckets, 2):
+        assert left.isdisjoint(right)
 
 
 def test_active_state_definition_is_derived_from_the_buckets():
@@ -316,6 +361,7 @@ def test_active_state_definition_is_derived_from_the_buckets():
     # in it verbatim -- proving it cannot drift from the behaviour.
     for bucket in (
         OWNED_CARD_STATUSES,
+        STALLED_CARD_STATUSES,
         CLOSED_CARD_STATUSES,
         REOPEN_CARD_STATUSES,
         NEEDFIX_TERMINAL_STATUSES,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -798,13 +798,14 @@ def test_hygiene_batch_budget_bounds_archives_not_examined_candidates(
     # never examined (measured eligible 263, archived 0, batch_limited 238).
     repo = _repo(tmp_path)
     old = "2026-01-01T00:00:00+00:00"
+    inside_blocked_ttl = "2026-08-31T00:00:00+00:00"
     rows = [
         {
             "task_id": f"GRAVE_V{index}",
             "status": "blocked",
             "worker_status": "blocked",
-            "updated_at": old,
-            "completed_at": old,
+            "updated_at": inside_blocked_ttl if index == 31 else old,
+            "completed_at": inside_blocked_ttl if index == 31 else old,
             "card": {"task_id": f"GRAVE_V{index}", "launch_request_id": f"req-{index}"},
         }
         for index in range(1, 32)
@@ -835,7 +836,8 @@ def test_hygiene_batch_budget_bounds_archives_not_examined_candidates(
         repo, now=datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
     )
 
-    # GRAVE_V31 is the retained family head; the other 30 are eligible, the 25
+    # GRAVE_V31 is the family head still inside BLOCKED_ARCHIVE_TTL, so it is
+    # retained; the other 30 are eligible, the 25
     # fenced ones are skipped without consuming the budget, and the remaining
     # 5 are archived instead of being starved behind the fenced prefix.
     assert result["eligible"] == 30
@@ -973,6 +975,81 @@ def test_automatic_hygiene_archives_standalone_decided_rows_past_ttl(
     assert archived == ["STANDALONE_DONE", "STANDALONE_SUPERSEDED"]
     assert result["eligible"] == 2
     assert result["archived"] == 2
+
+
+def _blocked_row(task_id: str, age_seconds: int) -> dict[str, Any]:
+    observed = _JANITOR_NOW - timedelta(seconds=age_seconds)
+    return {"task_id": task_id, "status": "blocked", "updated_at": observed.isoformat()}
+
+
+_BLOCKED_CUTOFF = _JANITOR_NOW - timedelta(seconds=task_retention.BLOCKED_ARCHIVE_TTL)
+
+
+def test_blocked_head_past_ttl_is_a_candidate_and_one_inside_it_is_not() -> None:
+    past = _blocked_row("OLD_BLOCKED_V2", task_retention.BLOCKED_ARCHIVE_TTL + 1)
+    inside = _blocked_row("NEW_BLOCKED_V2", task_retention.BLOCKED_ARCHIVE_TTL - 1)
+    # The _V2 ids make each row the head of its own family.
+    selected = task_retention._candidate_ids(
+        [past, inside], _JANITOR_NOW, blocked_cutoff=_BLOCKED_CUTOFF
+    )
+    assert selected == {"OLD_BLOCKED_V2"}
+
+
+def test_standalone_blocked_past_ttl_is_a_candidate() -> None:
+    row = _blocked_row("STANDALONE_BLOCKED", task_retention.BLOCKED_ARCHIVE_TTL + 1)
+    assert task_retention._candidate_ids(
+        [row], _JANITOR_NOW, blocked_cutoff=_BLOCKED_CUTOFF
+    ) == {"STANDALONE_BLOCKED"}
+
+
+def test_candidate_ids_without_blocked_cutoff_never_selects_a_blocked_head() -> None:
+    old = _blocked_row("OLD_BLOCKED_V2", task_retention.BLOCKED_ARCHIVE_TTL * 10)
+    assert task_retention._candidate_ids([old], _JANITOR_NOW) == set()
+
+
+def test_blocked_cutoff_selects_only_blocked_rows() -> None:
+    pending = {**_blocked_row("OLD_PENDING_V2", task_retention.BLOCKED_ARCHIVE_TTL + 1)}
+    pending["status"] = "pending"
+    assert (
+        task_retention._candidate_ids([pending], _JANITOR_NOW, blocked_cutoff=_BLOCKED_CUTOFF)
+        == set()
+    )
+
+
+def test_automatic_hygiene_archives_blocked_head_only_past_fourteen_days(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    cards = {
+        "OLD_BLOCKED_V2": _task_row(
+            repo,
+            "OLD_BLOCKED_V2",
+            "blocked",
+            worker_status="blocked",
+            updated_at="2026-08-01T00:00:00+00:00",
+        ),
+        "NEW_BLOCKED_V2": _task_row(
+            repo,
+            "NEW_BLOCKED_V2",
+            "blocked",
+            worker_status="blocked",
+            updated_at="2026-08-20T00:00:00+00:00",
+        ),
+    }
+    archived: list[str] = []
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    monkeypatch.setattr(task_store, "get_task", lambda _root, task_id: cards.get(task_id))
+    monkeypatch.setattr(task_retention, "_latest_process_row", _terminal_ledger())
+    monkeypatch.setattr(
+        task_store,
+        "archive_task",
+        lambda _root, task_id, **_kwargs: (archived.append(task_id) is None, "archived"),
+    )
+
+    result = task_retention.run_automatic_hygiene(repo, now=_JANITOR_NOW)
+
+    assert archived == ["OLD_BLOCKED_V2"]
+    assert result["eligible"] == 1
 
 
 def test_final_archive_fence_returns_dependency_live_for_undecided_dependent(

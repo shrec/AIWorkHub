@@ -38,6 +38,8 @@ HYGIENE_TTL_ENV = "AIWORKHUB_TASK_HYGIENE_TTL_SECONDS"
 HYGIENE_INTERVAL_ENV = "AIWORKHUB_TASK_HYGIENE_INTERVAL_SECONDS"
 HYGIENE_BATCH_ENV = "AIWORKHUB_TASK_HYGIENE_BATCH_SIZE"
 HYGIENE_TTL_DEFAULT = 6 * 60 * 60
+# Deliberately not configurable: recover_blocked_rework is the exit until then.
+BLOCKED_ARCHIVE_TTL = 14 * 24 * 60 * 60
 HYGIENE_INTERVAL_DEFAULT = 15 * 60
 HYGIENE_BATCH_DEFAULT = 25
 _HYGIENE_TTL_RANGE = (60 * 60, 24 * 60 * 60)
@@ -982,7 +984,12 @@ def _expired(row: Mapping[str, Any], cutoff: datetime) -> bool:
     return observed <= cutoff
 
 
-def _candidate_ids(rows: list[dict[str, Any]], cutoff: datetime) -> set[str]:
+def _candidate_ids(
+    rows: list[dict[str, Any]],
+    cutoff: datetime,
+    *,
+    blocked_cutoff: datetime | None = None,
+) -> set[str]:
     families: dict[str, list[tuple[TaskFamily, dict[str, Any]]]] = {}
     selected: set[str] = set()
     for row in rows:
@@ -992,6 +999,14 @@ def _candidate_ids(rows: list[dict[str, Any]], cutoff: datetime) -> set[str]:
         if (
             str(row.get("status") or "").lower() in DECIDED_TASK_STATUSES
             and _expired(row, cutoff)
+        ):
+            selected.add(task_id)
+        # A blocked row is revivable, so it gets the longer window and only
+        # when the caller asks; family heads included, or they never leave.
+        if (
+            blocked_cutoff is not None
+            and str(row.get("status") or "").lower() == "blocked"
+            and _expired(row, blocked_cutoff)
         ):
             selected.add(task_id)
         parsed = task_family(task_id)
@@ -1206,7 +1221,9 @@ def run_automatic_hygiene(
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
     cutoff = current - timedelta(seconds=config["ttl_seconds"])
-    candidates = _candidate_ids(rows, cutoff)
+    candidates = _candidate_ids(
+        rows, cutoff, blocked_cutoff=current - timedelta(seconds=BLOCKED_ARCHIVE_TTL)
+    )
     summary["scanned"] = len(rows)
     summary["eligible"] = len(candidates)
     indexed = {str(row["task_id"]): row for row in rows}

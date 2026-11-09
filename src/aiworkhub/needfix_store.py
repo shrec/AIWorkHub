@@ -61,6 +61,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
+from . import task_plan
+
 SCHEMA_ID = "aiworkhub.needfix_store.v4"
 CAUSED_BY_SCHEMA_ID = "aiworkhub.accepted_outcome_identity.v1"
 ACCEPTED_OUTCOME_RECEIPT_SCHEMA_ID = "aiworkhub.accepted_outcome_receipt.v1"
@@ -217,8 +219,12 @@ SUPERSEDED_REBIND_EVENT = "superseded_task_rebound"
 # --- Inner layer: the linked task CARD's canonical status buckets -----------
 # Canonical card statuses whose task still owns the problem -> hidden (owned).
 OWNED_CARD_STATUSES: frozenset[str] = frozenset(
-    ("pending", "processing", "review", "blocked")
+    ("pending", "processing", "review")
 )
+
+# Canonical card statuses that stopped with no worker holding the problem ->
+# stays on the active list (stalled) while the card remains linkable.
+STALLED_CARD_STATUSES: frozenset[str] = frozenset(("blocked",))
 
 # Canonical card statuses whose fix has landed -> hidden, recorded as fixed.
 CLOSED_CARD_STATUSES: frozenset[str] = frozenset(
@@ -234,7 +240,7 @@ REOPEN_CARD_STATUSES: frozenset[str] = frozenset(
 # Card statuses a manager may link an existing NeedFix to after the fact.
 # Archived tasks are terminal inventory and cannot receive a fresh link.
 LINKABLE_CARD_STATUSES: frozenset[str] = (
-    OWNED_CARD_STATUSES | CLOSED_CARD_STATUSES
+    OWNED_CARD_STATUSES | STALLED_CARD_STATUSES | CLOSED_CARD_STATUSES
 ) - {"archived"}
 
 # Positive manager evidence that an absent linked card is a foreign import,
@@ -270,7 +276,8 @@ NEEDFIX_CARD_DERIVED_STATUSES: frozenset[str] = frozenset(
 
 # Derived states a row may resolve to at read time.
 ACTIVE_STATES: tuple[str, ...] = (
-    "active", "owned", "closed", "reopened", "unknown", "foreign_card_unverified",
+    "active", "owned", "stalled", "closed", "reopened", "unknown",
+    "foreign_card_unverified",
 )
 
 
@@ -286,10 +293,15 @@ ACTIVE_STATE_DEFINITION = (
     "empty, names a card that no longer exists, or names a card whose "
     "canonical status leaves the problem live. It is OWNED (hidden from the "
     f"active list) while the card status is one of {_fmt_statuses(OWNED_CARD_STATUSES)}. "
+    "It is STALLED (on the active list, no worker owns it) while the card "
+    f"status is one of {_fmt_statuses(STALLED_CARD_STATUSES)}. "
     "It is CLOSED (hidden, recorded as fixed) while the card status is one of "
     f"{_fmt_statuses(CLOSED_CARD_STATUSES)}, or was superseded/cancelled with a "
-    "successor that landed. It is ACTIVE AGAIN (reopened) while the card status "
-    f"is one of {_fmt_statuses(REOPEN_CARD_STATUSES)} without a landed successor. "
+    "successor that landed; an archived card or successor counts as closed "
+    "only with accepted evidence or, for the card itself, a landed successor. "
+    "It is ACTIVE AGAIN (reopened) while the card status "
+    f"is one of {_fmt_statuses(REOPEN_CARD_STATUSES)} without a landed successor, "
+    "or the card was archived with neither accepted evidence nor a landed successor. "
     "It is foreign_card_unverified (hidden) only when the linked card is absent "
     f"AND the record is tagged {FOREIGN_ORIGIN_CARD_TAG!r} -- positive manager "
     "evidence the link is a foreign import; an untagged absent card always "
@@ -975,6 +987,10 @@ def _superseded_by(task: Mapping[str, Any] | None) -> str:
     return str(task.get("superseded_by") or "").strip()
 
 
+def _card_accepted(card: Mapping[str, Any] | None) -> bool:
+    return task_plan.card_status_evidence(card) == "accepted"
+
+
 def _successor_landed(
     get_task_fn: Callable[[str], Mapping[str, Any] | None],
     canonical_status_fn: Callable[[Mapping[str, Any]], str],
@@ -986,9 +1002,12 @@ def _successor_landed(
     if successor is None:
         return False
     try:
-        return canonical_status_fn(successor) in CLOSED_CARD_STATUSES
+        status = canonical_status_fn(successor)
     except Exception:
         return False
+    if status not in CLOSED_CARD_STATUSES:
+        return False
+    return status != "archived" or _card_accepted(successor)
 
 
 def derive_active_state(
@@ -999,8 +1018,9 @@ def derive_active_state(
     """Derive a NeedFix's ACTIVE state at read time from its linked task card.
 
     Returns ``{"state": str, "active": bool, "reason": str | None}`` where
-    ``state`` is one of ``active``, ``owned``, ``closed``, ``reopened``,
-    ``unknown`` or ``foreign_card_unverified``. See ``ACTIVE_STATE_DEFINITION``
+    ``state`` is one of ``active``, ``owned``, ``stalled``, ``closed``,
+    ``reopened``, ``unknown`` or ``foreign_card_unverified``. See
+    ``ACTIVE_STATE_DEFINITION``
     for the exact rule.
 
     The derivation has two layers, and the NeedFix's OWN status is the OUTER
@@ -1060,11 +1080,39 @@ def derive_active_state(
     except Exception:
         card_status = ""
 
+    if card_status in STALLED_CARD_STATUSES:
+        return {
+            "state": "stalled",
+            "active": True,
+            "reason": f"task {converted_task_id!r} is blocked; no worker owns this problem",
+        }
     if card_status in OWNED_CARD_STATUSES:
         return {
             "state": "owned",
             "active": False,
             "reason": f"owned by {card_status} task {converted_task_id!r}",
+        }
+    # ``archived`` is reported first for every archived card whatever it ended
+    # as, so on its own it proves nothing: only accepted evidence or a landed
+    # successor makes it a fix.
+    if card_status == "archived" and not _card_accepted(task):
+        successor_id = _superseded_by(task)
+        if _successor_landed(get_task_fn, canonical_status_fn, successor_id):
+            return {
+                "state": "closed",
+                "active": False,
+                "reason": (
+                    f"task {converted_task_id!r} was archived; successor "
+                    f"{successor_id!r} landed the fix"
+                ),
+            }
+        return {
+            "state": "reopened",
+            "active": True,
+            "reason": (
+                f"task {converted_task_id!r} was archived without being "
+                "accepted; the problem is live again"
+            ),
         }
     if card_status in CLOSED_CARD_STATUSES:
         return {
