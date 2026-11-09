@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from . import worker_workspace as _worker_workspace
+from .closure_probe_scope import CLOSURE_PROBE_SCOPE
 from .worker_workspace import (
     WorkspaceError,
     _relative_repo_path,
@@ -250,7 +251,27 @@ def resolve_local_python_imports(
     # replayed with its original message, so fail-closed outcomes and their
     # precedence are those of the uncached checks.  Keys are exact path
     # strings, bounded by the distinct candidates this closure probes.
-    init_states: dict[str, tuple[bool, bool]] = {}
+    #
+    # NF-2026-00630: inside ``shared_closure_probes`` (one launch preflight)
+    # the same five memos are shared by every call for this resolved repo, and
+    # dropped when the scope exits.  ``module_results`` and ``_fallback_cache``
+    # depend on ``roots``, which differ per seed set, so they stay per call.
+    scope = CLOSURE_PROBE_SCOPE.get()
+    memos: tuple[Any, ...] | None = None if scope is None else scope.get(str(repo))
+    if memos is None:
+        memos = ({}, {}, {}, {str(repo): repo}, {})
+        if scope is not None:
+            scope[str(repo)] = memos
+    init_states: dict[str, tuple[bool, bool]]
+    candidate_verdicts: dict[str, bool | WorkspaceError]
+    # NF-2026-02072: ``_require_beneath`` re-walks and re-resolves every ancestor
+    # for every candidate; ``probes`` holds one lstat/symlink probe per distinct
+    # path and ``resolved_paths`` one resolution per distinct path.  ``repo`` was
+    # resolved on entry; seeding it keeps that the only resolution.
+    probes: dict[str, tuple[bool, bool]]
+    resolved_paths: dict[str, Path]
+    first_links: dict[str, Path | None]
+    init_states, candidate_verdicts, probes, resolved_paths, first_links = memos
 
     def init_state(package_init: Path) -> tuple[bool, bool]:
         key = str(package_init)
@@ -274,7 +295,7 @@ def resolve_local_python_imports(
         if relative.endswith(".py") and (repo / relative).is_file():
             package_context(relative)
 
-    candidate_verdicts: dict[str, bool | WorkspaceError] = {}
+    # (``candidate_verdicts`` is created with the other memos above.)
     # NF-2026-02072: ``_require_beneath`` re-walks and re-resolves every ancestor
     # for every candidate.  The same guard is replayed here with per-call memos:
     # one lstat/symlink probe per distinct path (a child of a missing directory
@@ -283,9 +304,7 @@ def resolve_local_python_imports(
     # what a non-strict resolve returns once no component is a symlink, which
     # the component walk below has already enforced.  Existing paths are still
     # resolved in full.
-    probes: dict[str, tuple[bool, bool]] = {}
-    # ``repo`` was resolved on entry; seeding it keeps that the only resolution.
-    resolved_paths: dict[str, Path] = {str(repo): repo}
+    # (``probes`` and ``resolved_paths`` are created with the other memos above.)
 
     def probe(path: Path) -> tuple[bool, bool]:
         """Return ``(exists, is_symlink)`` for ``path``, memoised per call."""
@@ -318,7 +337,7 @@ def resolve_local_python_imports(
             resolved_paths[key] = resolved
         return resolved
 
-    first_links: dict[str, Path | None] = {}
+    # (``first_links`` is created with the other memos above.)
 
     def first_symlink(path: Path) -> Path | None:
         """Return the outermost symlink among repo-relative components of ``path``."""

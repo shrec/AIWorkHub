@@ -53,8 +53,9 @@ if __package__:
         _SeccompData, _SeccompNotif, _SeccompNotifResp,
     )
     from .host_heavy_slots import slotted
+    from .closure_probe_scope import shared_closure_probes
 else:
-    slotted = lambda max_wait_seconds: lambda fn: fn
+    slotted = shared_closure_probes = lambda max_wait_seconds=0: lambda fn: fn
 
 # ``VALIDATION_FAILED`` / ``VALIDATION_ENVIRONMENT_BLOCKED`` name the two terminal
 # states this module's ``ValidationRunError`` hierarchy carries at class-definition
@@ -4608,9 +4609,8 @@ def plan_validation_lane(
     )
 
 
-def preflight_validation_capabilities(
-    repo: Path, card: Mapping[str, Any]
-) -> tuple[str, ...]:
+@shared_closure_probes()
+def preflight_validation_capabilities(repo: Path, card: Mapping[str, Any]) -> tuple[str, ...]:
     """Return every statically provable missing validation capability.
 
     This deliberately composes the command parser, trusted-runtime normalizer,
