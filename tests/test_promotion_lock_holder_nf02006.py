@@ -17,6 +17,7 @@ import errno
 import json
 import os
 import sys
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -198,9 +199,12 @@ def test_release_removes_holder_on_exception(process_dir: Path) -> None:
     assert not _sidecar(process_dir).exists()
 
 
-def test_accept_review_returns_promotion_busy_as_ok_false(
+def test_accept_review_refused_early_never_waits_on_the_promotion_lock(
     process_dir: Path, lock_times_out: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """NF-2026-02026: a busy lock no longer refuses an accept up front; the
+    ``promotion_busy`` reply after validation is asserted, through the real
+    body, in ``test_accept_validation_outside_lock_nf02026.py``."""
     monkeypatch.setattr(
         process_launcher,
         "_parse_card",
@@ -211,21 +215,18 @@ def test_accept_review_returns_promotion_busy_as_ok_false(
         process_launcher, "_card_is_readonly_quality_review", lambda card: False
     )
     monkeypatch.setattr(process_launcher, "_card_is_readonly_research", lambda card: False)
+    monkeypatch.setattr(_Manager, "_request_lock", lambda self, request_id: nullcontext())
     _write_holder(process_dir, pid=os.getpid())
     manager = _Manager(process_dir)
 
     first = process_launcher_accept_review.accept_review(manager, REQUEST_ID, TASK_ID)
-    # The in-flight claim is released on the refusal: a retry is refused by the
-    # busy lock again, never by its own leftover ``accept_in_progress`` marker.
+    # The in-flight claim is released on the refusal: a retry reaches the same
+    # identity refusal, never its own leftover ``accept_in_progress`` marker.
     second = process_launcher_accept_review.accept_review(manager, REQUEST_ID, TASK_ID)
 
     for result in (first, second):
         assert result["ok"] is False
-        assert result["error"] == "promotion_busy"
-        assert result["holder"]["task_id"] == HOLDER_TASK
-        assert result["holder"]["request_id"] == HOLDER_REQUEST
-        assert result["holder_stale"] is False
-        assert result["retry_after_s"] > 0
+        assert result["error"] == "request_identity_incomplete"
         assert result["task_id"] == TASK_ID
         assert result["request_id"] == REQUEST_ID
         assert "advisory_lock_timeout" not in json.dumps(result)

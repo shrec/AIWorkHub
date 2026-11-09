@@ -160,9 +160,11 @@ def test_finalizer_uses_request_lock_not_global_registry(
     assert observed == ["request-1"]
 
 
-def test_review_acceptance_uses_promotion_lock_not_launch_registry(
+def test_review_acceptance_refusal_takes_neither_promotion_lock_nor_launch_registry(
     tmp_path: Path, monkeypatch,
 ) -> None:
+    """NF-2026-02026: the promotion lock is entered only just before promoting,
+    so an accept refused on its first check never touches it."""
     manager = _manager(tmp_path)
     entered: list[bool] = []
 
@@ -183,7 +185,7 @@ def test_review_acceptance_uses_promotion_lock_not_launch_registry(
     result = manager.accept_review("request-1", "task-1")
 
     assert result["error"] == "request_not_found"
-    assert entered == [True]
+    assert entered == []
 
 
 def test_create_and_launch_share_dotted_dashed_topic_grammar() -> None:

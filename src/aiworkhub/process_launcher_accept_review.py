@@ -74,14 +74,6 @@ __all__ = [
 
 _REVIEWER_USABLE_STATES = ("review_ready", "accepted")
 
-# A reviewer that has not finished is not missing evidence, it is unfinished
-# evidence, and the two need different words: 17 of 159 measured accept
-# attempts failed with ``quality_reviewer_not_review_ready`` -- after paying for
-# a combined-tree materialization and two validation runs.
-_REVIEWER_RUNNING_STATES = frozenset(
-    {"starting", "running", "processing", "finalizing", "reconcile_pending"}
-)
-
 ACCEPT_PREVIEW_SCHEMA_ID = "aiworkhub.accept_preview.v1"
 
 # Every blocker the fold can name, so a caller can branch on a closed set
@@ -1455,6 +1447,126 @@ def _restore_correction_originals(
     return failed
 
 
+def _reply_with_correction_restored(
+    workspace: Any, originals: dict[str, bytes], reply: dict[str, Any]
+) -> dict[str, Any]:
+    """``reply`` after restoring correction bytes, naming any path that could not be."""
+    if originals:
+        failed = _restore_correction_originals(workspace, originals)
+        if failed:
+            reply["correction_restore_failed"] = sorted(failed)[:20]
+    return reply
+
+
+# NF-2026-02026: how many bounded promotion-lock waits an accept makes once its
+# validation has finished. Each wait is one advisory-lock bound (20 s), so this
+# is about ten minutes: long enough to outlast a holder re-validating under the
+# lock, because giving up here throws away minutes of finished validation.
+_PROMOTION_LOCK_WAIT_ATTEMPTS = 30
+
+
+def _canonical_head_oid(repo: Path) -> str | None:
+    """Canonical ``HEAD``, or ``None`` when ``repo`` is not a git checkout at all."""
+    from . import worker_workspace
+
+    if not (Path(repo) / ".git").exists():
+        return None
+    head = worker_workspace._run(["git", "rev-parse", "HEAD"], cwd=repo)
+    if head.returncode != 0:
+        raise worker_workspace.WorkspaceError(
+            "canonical_head_unreadable:" + head.stderr[:300]
+        )
+    return head.stdout.strip()
+
+
+def _canonical_path_hash(repo: Path, relative: str) -> object:
+    """``relative``'s content hash; an unreadable path hashes to a value equal to nothing."""
+    from . import worker_workspace
+
+    try:
+        return worker_workspace._hash_path(Path(repo) / relative)
+    except (OSError, worker_workspace.WorkspaceError):
+        return object()
+
+
+def _canonical_delta_hashes(repo: Path) -> dict[str, object]:
+    """The content hash of every path the live canonical tree differs from ``HEAD`` on."""
+    from . import worker_workspace
+
+    if not (Path(repo) / ".git").exists():
+        return {}
+    return {
+        relative: _canonical_path_hash(repo, relative)
+        for relative in worker_workspace._canonical_worktree_delta_paths(Path(repo))
+    }
+
+
+def _canonical_drift_paths(
+    repo: Path, *, pinned_head: str | None, pinned_delta: Mapping[str, object]
+) -> set[str] | None:
+    """Paths whose canonical bytes moved since the pin; ``None`` when that is unknowable.
+
+    A path the validated tree already held with these exact bytes did not move:
+    a peer's promotion that was dirty at the pin and has since been committed
+    changes ``HEAD`` without changing what was validated.
+    """
+    from . import worker_workspace
+
+    head = _canonical_head_oid(repo)
+    if head is None:
+        return set()
+    committed: set[str] = set()
+    if pinned_head != head:
+        if not pinned_head:
+            return None
+        diff = worker_workspace._run(
+            ["git", "diff", "--name-only", "--no-renames", "-z", pinned_head, head, "--"],
+            cwd=repo,
+        )
+        if diff.returncode != 0:
+            return None
+        committed = {value for value in diff.stdout.split("\x00") if value}
+    current_delta = _canonical_delta_hashes(repo)
+    return {
+        relative
+        for relative in committed | set(pinned_delta) | set(current_delta)
+        if relative not in pinned_delta
+        or (
+            current_delta[relative]
+            if relative in current_delta
+            else _canonical_path_hash(repo, relative)
+        )
+        != pinned_delta[relative]
+    }
+
+
+def _validation_neighbourhood_touched(
+    drift: set[str],
+    *,
+    changed: Sequence[str],
+    neighbour_tests: Sequence[str],
+    immutable_inputs: Sequence[str],
+    declared_commands: Sequence[str],
+) -> bool:
+    """Whether a moved path is one this candidate's validation depends on.
+
+    A command that cannot be tokenised has no knowable test paths, so any drift
+    counts against it.
+    """
+    from . import card_contract_advice
+
+    if not drift:
+        return False
+    try:
+        declared_paths = card_contract_advice._command_names(
+            command for command in declared_commands if isinstance(command, str)
+        )
+    except (TypeError, ValueError):
+        return True
+    entries = [*changed, *neighbour_tests, *immutable_inputs, *declared_paths]
+    return any(card_contract_advice._covers(entries, path) for path in drift)
+
+
 def _finalizer_validation_reuse(
     terminal_review: Mapping[str, Any],
     *,
@@ -2617,7 +2729,13 @@ ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
     "accept_failure_cause",
     "accept_gate_blockers",
     "_accept_in_flight_marker",
+    "_canonical_delta_hashes",
+    "_canonical_drift_paths",
+    "_canonical_head_oid",
     "_finalizer_validation_reuse",
+    "_PROMOTION_LOCK_WAIT_ATTEMPTS",
+    "_reply_with_correction_restored",
+    "_validation_neighbourhood_touched",
     "_accept_manager_identity",
     "_restore_correction_originals",
     "_receipt_sha256",
@@ -2804,16 +2922,9 @@ def accept_review(
         )
     except (LaunchRejected, AttributeError, TypeError):
         readonly_lock_path = False
-    if readonly_lock_path:
-        acceptance_lock = self._request_lock(request_id)
-    else:
-        try:
-            acceptance_lock = self._promotion_lock(task_id=task_id, request_id=request_id)
-        except TypeError:
-            # Seam stubs written as ``def _promotion_lock(self)`` predate
-            # NF-2026-02006. Building a @contextmanager generator never runs its
-            # body, so the only TypeError here is that signature mismatch.
-            acceptance_lock = self._promotion_lock()
+    # NF-2026-02026: only the read-only path takes a lock here. The writable path
+    # validates outside the promotion lock and enters it just before promoting.
+    acceptance_lock = self._request_lock(request_id) if readonly_lock_path else None
     # NF-2026-01626: claimed before either lock, so a duplicate of an accept
     # that is still validating answers ``accept_in_progress`` at once instead
     # of queueing on those locks for the length of that validation. A refused
@@ -2822,18 +2933,45 @@ def accept_review(
     in_flight = _accept_in_flight_marker(self, task_id, request_id)
     if in_flight.refusal is not None:
         return in_flight.refusal
-    # NF-2026-02006: a promotion-lock wait that timed out names its holder as
-    # ``{ok: false, error: promotion_busy, ...}`` instead of a raw errno string.
     held = contextlib.ExitStack()
     held.enter_context(in_flight)
-    try:
-        held.enter_context(acceptance_lock)
-    except _pl.PromotionBusy as busy:
-        held.close()
-        return {"ok": False, **busy.diagnostic, "request_id": request_id, "task_id": task_id}
-    except BaseException:
-        held.close()
-        raise
+    if acceptance_lock is not None:
+        try:
+            held.enter_context(acceptance_lock)
+        except BaseException:
+            held.close()
+            raise
+
+    def _enter_promotion_lock():
+        """Hold the promotion lock in ``held``; the ``promotion_busy`` reply if not.
+
+        NF-2026-02026: the lock order is now request-then-promotion (it was
+        promotion-then-request), and no inversion exists because this accept is
+        the only taker of the promotion lock: finalization, retention GC
+        (``_gc_finalized_workspace``) and reviewer recovery take a request lock
+        and never this one, and once this one is held the accept acquires no
+        further request lock, so nothing can hold it while waiting on a request
+        lock that another promotion waiter owns.
+
+        NF-2026-02006: a wait that timed out names its holder as ``{ok: false,
+        error: promotion_busy, ...}`` instead of a raw errno string.
+        """
+        busy_reply = None
+        for _attempt in range(_PROMOTION_LOCK_WAIT_ATTEMPTS):
+            try:
+                # A @contextmanager generator's body has not run yet, so the only
+                # TypeError here is a seam stub written as ``def _promotion_lock(self)``.
+                try:
+                    promotion_lock = self._promotion_lock(task_id=task_id, request_id=request_id)
+                except TypeError:
+                    promotion_lock = self._promotion_lock()
+                held.enter_context(promotion_lock)
+                return None
+            except _pl.PromotionBusy as busy:
+                busy_reply = {
+                    "ok": False, **busy.diagnostic, "request_id": request_id, "task_id": task_id,
+                }
+        return busy_reply
     # NF-2026-01515: the writable path must also hold the per-request lock so
     # retention GC (_gc_finalized_workspace) cannot quarantine this workspace
     # mid-correction; the read-only path already holds that lock alone.
@@ -3898,20 +4036,35 @@ def accept_review(
             # is recorded with its reason and refuses nothing.
             from . import accept_neighbour_tests
 
-            neighbour_selection = accept_neighbour_tests.select_neighbour_tests(
-                self.repo, changed, _declared_validation_commands(card),
-                # NF-2026-02102: the candidate copy the finalization snapshot also holds.
-                candidate_root=getattr(workspace, "path", None),
-            )
+            def _select_neighbour_tests():
+                return accept_neighbour_tests.select_neighbour_tests(
+                    self.repo, changed, _declared_validation_commands(card),
+                    # NF-2026-02102: the candidate copy the finalization snapshot also holds.
+                    candidate_root=getattr(workspace, "path", None),
+                )
+
+            neighbour_selection = _select_neighbour_tests()
             neighbour_tests = neighbour_selection.evidence()
+
             # Sparse omission is not policy deletion. Enforce the inherited
             # policy against the complete candidate union, even at low risk;
             # never run full-tree commands against the sparse worker tree.
-            if (
-                risk_profile.get("combined_tree_required")
-                or inherited_policy
-                or neighbour_selection.tests
-            ):
+            def _combined_tree_required():
+                return bool(
+                    risk_profile.get("combined_tree_required")
+                    or inherited_policy
+                    or neighbour_selection.tests
+                )
+
+            def _validate_combined_tree():
+                """Validate the combined tree; return the ``HEAD`` it was built on.
+
+                NF-2026-02026: one definition for the unlocked first run and the
+                re-validation under the promotion lock, reading ``validation_reuse``
+                and ``neighbour_selection`` as the caller last left them.
+                """
+                nonlocal combined_tree, combined_tree_checks
+                nonlocal neighbour_tests, union_validation_reuse
                 union_workspace, combined_tree = create_combined_validation_workspace(
                     workspace,
                     card,
@@ -3997,6 +4150,18 @@ def accept_review(
                         union_workspace.path,
                         union_workspace.home,
                     )
+                return union_workspace.base_oid
+
+            # NF-2026-02026: the pin every later "did canonical move?" compares
+            # against. The uncommitted delta is read first, and it is pinned at
+            # all because a peer's promotion is uncommitted until its auto-commit
+            # runs after that accept returns: HEAD alone would not show it.
+            pinned_delta = _canonical_delta_hashes(self.repo)
+            pinned_head = (
+                _validate_combined_tree()
+                if _combined_tree_required()
+                else _canonical_head_oid(self.repo)
+            )
             # The manager named these in 24 of 159 measured calls and retyped
             # what the server already knew in the other 135. ``None`` now means
             # "the verified reviewer children bound to this exact (request_id,
@@ -4334,6 +4499,94 @@ def accept_review(
                 for relative in current_hashes
             ):
                 raise WorkspaceError("stored_hash_mismatch")
+            # NF-2026-02026: everything above ran outside the repo-wide promotion
+            # lock, against the canonical pin taken before the first validation.
+            # The lock enters ``held`` here, so the ``with`` above releases it on
+            # every exit, and it stays held through promotion and the rest of the
+            # accept.
+            #
+            # What the unlocked stretch read from live canonical, and why each
+            # read is safe against a promotion that landed meanwhile:
+            # - the combined tree, its union gate (``baseline_root``) and the
+            #   neighbour selection are re-run below whenever canonical moved under
+            #   a candidate or validation-neighbourhood path;
+            # - the declared immutable-input manifest is re-read just below;
+            # - the destructive-diff, policy-authority and main-gate baselines
+            #   only compare candidate paths, so a drift that could change them
+            #   overlaps ``changed`` and re-validates, and ``promote``'s own
+            #   parent-baseline guard stays the last word on those paths;
+            # - the path-hash compare above reads this request's retained worktree,
+            #   which the request lock protects and no other accept writes.
+            promotion_busy_reply = _enter_promotion_lock()
+            if promotion_busy_reply is not None:
+                return _reply_with_correction_restored(
+                    workspace, correction_originals, promotion_busy_reply
+                )
+            inputs_moved = False
+            if declared_immutable_inputs:
+                locked_input_manifest = _path_manifest(self.repo, declared_immutable_inputs)
+                inputs_moved = locked_input_manifest != current_input_manifest
+                if inputs_moved:
+                    stale_input_rebased = sorted(
+                        relative
+                        for relative in declared_immutable_inputs
+                        if locked_input_manifest.get(relative)
+                        != stored_input_manifest.get(relative)
+                    )
+                    if not _declared_validation_commands(
+                        card
+                    ) or _stale_inputs_touching_candidate(
+                        stale_input_rebased,
+                        [*(evidence.get("changed_paths") or []), *stored_hashes],
+                    ):
+                        return _reply_with_correction_restored(
+                            workspace,
+                            correction_originals,
+                            {
+                                "ok": False,
+                                "error": (
+                                    "stale_input:dependency_changed:"
+                                    + ",".join(stale_input_rebased)
+                                )[:500],
+                                "request_id": request_id,
+                                "task_id": task_id,
+                            },
+                        )
+            canonical_drift = _canonical_drift_paths(
+                self.repo, pinned_head=pinned_head, pinned_delta=pinned_delta
+            )
+            if (
+                inputs_moved
+                or canonical_drift is None
+                or _validation_neighbourhood_touched(
+                    canonical_drift,
+                    changed=changed,
+                    neighbour_tests=neighbour_selection.tests,
+                    immutable_inputs=declared_immutable_inputs,
+                    declared_commands=_declared_validation_commands(card),
+                )
+            ):
+                # Today's serial behaviour, confined to this rare case: the moved
+                # canonical tree is validated again while the lock keeps it still.
+                # Nothing recorded before the move may stand in for this run.
+                validation_reuse = None
+                union_validation_reuse = None
+                combined_tree = None
+                combined_tree_checks = []
+                neighbour_selection = _select_neighbour_tests()
+                neighbour_tests = neighbour_selection.evidence()
+                if _combined_tree_required():
+                    _validate_combined_tree()
+                validations, full_validation_snapshot = (
+                    _run_full_snapshot_validations(
+                        workspace, card, latest, changed,
+                        **({"reuse": union_validation_reuse} if union_validation_reuse else {}),
+                    )
+                )
+                quality_gate["combined_tree"] = combined_tree
+                quality_gate["neighbour_tests"] = neighbour_tests
+                quality_gate["full_validation_snapshot"] = full_validation_snapshot
+                _enforce_behavioral_gate(card, validations, quality_gate)
         except GitCommandTimeout as exc:
             error_message = str(exc)[:500]
             if correction_originals:

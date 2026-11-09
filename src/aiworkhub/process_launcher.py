@@ -4489,11 +4489,11 @@ class ProcessManager:
     ):
         """Serialize canonical review promotion without blocking launches.
 
-        Review acceptance may build a combined tree, rerun validations and
-        promote files. Those operations must remain cross-task serialized,
-        but they must not occupy the short-lived launch registry lock.  A
-        dedicated lock preserves atomic promotion while allowing unrelated
-        workers and finalizers to continue.
+        Promotion must remain cross-task serialized, but it must not occupy
+        the short-lived launch registry lock. A dedicated lock preserves atomic
+        promotion while allowing unrelated workers and finalizers to continue.
+        NF-2026-02026: accept takes it only after validating, so it spans the
+        canonical recheck and promotion rather than combined-tree validation.
 
         NF-2026-02006: the holder is recorded beside the lock while held, and a
         bounded wait that times out raises :class:`PromotionBusy` naming it.

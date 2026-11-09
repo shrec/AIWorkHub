@@ -8,9 +8,10 @@ writable path. The retention sweep's ``_gc_finalized_workspace`` holds only
 ``_retained_review_workspace_integrity`` under it; mid-correction it observes
 hashes that differ from the stored ``changed_path_hashes`` (the correction
 bytes are legitimately there) and quarantines the workspace GC races against.
-The fix nests ``self._request_lock(request_id)`` inside the promotion lock
-for the whole writable acceptance; the read-only reviewer/research path
-already held only the request lock and is unchanged.
+The fix holds ``self._request_lock(request_id)`` for the whole writable
+acceptance, with the promotion lock nested inside it just before promotion
+(NF-2026-02026); the read-only reviewer/research path already held only the
+request lock and is unchanged.
 """
 
 from __future__ import annotations
