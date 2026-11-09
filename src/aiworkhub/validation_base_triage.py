@@ -237,7 +237,7 @@ def _unrunnable(base: dict[str, Any], reason: str) -> dict[str, Any]:
 
 def failed_node_ids(row: Any) -> frozenset[str] | None:
     """The strict pytest failure identity of one row, or None when it cannot be parsed."""
-    # ponytail: identity is pytest-only; a non-pytest command never parses, so it always returns to the worker.
+    # ponytail: identity is pytest node ids only; a non-pytest command never parses here, and _judge falls back to the normalized tail (_same_failure_tail).
     from .process_launcher_validation import pytest_failed_node_ids
 
     if not isinstance(row, Mapping):
@@ -248,6 +248,16 @@ def failed_node_ids(row: Any) -> frozenset[str] | None:
         return None
 
 
+def _same_failure_tail(base_tail: str, candidate_row: Any) -> bool:
+    """True when the base and candidate tails match after normalization; never for an empty tail."""
+    if not isinstance(candidate_row, Mapping):
+        return False
+    from .validation_auto_rework import normalize_tail  # lazy: validation_auto_rework imports this module
+
+    base = normalize_tail(base_tail)
+    return bool(base) and base == normalize_tail(_row_tail(candidate_row))
+
+
 def _judge(result: dict[str, Any], candidate_row: Any) -> dict[str, Any]:
     """Compare a raw base_failed result's ids with the candidate's; adds the verdict."""
     if result["outcome"] != BASE_FAILED:
@@ -255,6 +265,8 @@ def _judge(result: dict[str, Any], candidate_row: Any) -> dict[str, Any]:
     stored = result.pop("base_failed_node_ids", None)
     base_ids = frozenset(str(i) for i in stored) if isinstance(stored, list) else None
     candidate_ids = failed_node_ids(candidate_row)
+    if not base_ids and not candidate_ids and _same_failure_tail(str(result.get("base_tail") or ""), candidate_row):
+        return result
     if not base_ids or not candidate_ids:
         return {**result, "outcome": BASE_UNRUNNABLE, "reason": "failure_identity_unparsed"}
     new = sorted(candidate_ids - base_ids)
@@ -277,8 +289,9 @@ def triage(
     """Classify the failing ``commands`` by their base-commit result. Never raises.
 
     ``candidate_rows`` maps each command to the candidate's terminal validation
-    row; a base failure counts as "identical" only when the candidate's failing
-    pytest node ids are a subset of the base's.
+    row; a base failure counts as "identical" when the candidate's failing
+    pytest node ids are a subset of the base's, or, when neither side parses to
+    pytest node ids, when the candidate's normalized tail equals the base tail.
     """
     base: dict[str, Any] = {
         "schema_id": SCHEMA_ID,

@@ -438,11 +438,40 @@ def test_a_new_test_file_missing_on_base_is_auto_returned(launcher, needfixes, r
     assert needfixes["calls"] == []
 
 
-def test_a_non_pytest_command_is_unrunnable_by_identity(launcher, tmp_path) -> None:
+def test_a_non_pytest_command_with_the_same_tail_is_base_failed(launcher, tmp_path) -> None:
+    command = "ruff check src"
+    tail = "src/x.py:1:1: F401 unused import\nFound 1 error.\n"
+    launcher.tail = tail
+    result = vbt.triage(tmp_path, card=_CARD, base_oid=_BASE_OID, adapter_id="claude_cli", commands=[command],
+                        candidate_rows={command: _row(command, tail)})
+    assert result["outcome"] == "base_failed"
+
+
+def test_a_non_pytest_command_with_a_different_tail_is_unrunnable_by_identity(launcher, tmp_path) -> None:
     command = "ruff check src"
     launcher.tail = "src/x.py:1:1: F401 unused import\nFound 1 error.\n"
     result = vbt.triage(tmp_path, card=_CARD, base_oid=_BASE_OID, adapter_id="claude_cli", commands=[command],
-                        candidate_rows={command: _row(command, "src/x.py:1:1: F401 unused import\nFound 1 error.\n")})
+                        candidate_rows={command: _row(command, "src/y.py:2:1: E501 line too long\nFound 1 error.\n")})
+    assert (result["outcome"], result["reason"]) == ("base_unrunnable", "failure_identity_unparsed")
+
+
+def test_a_worktree_mount_difference_alone_is_the_same_failure(launcher, tmp_path) -> None:
+    hex_a, hex_b = "0123456789abcdef" * 2, "fedcba9876543210" * 2
+    base = f"AssertionError: assert 1 == 2\nZ:\\union2_{hex_a}_{hex_a}\\worktree\\tests\\t.py:3\n"
+    cand = f"AssertionError: assert 1 == 2\nZ:\\union2_{hex_b}_{hex_b}\\worktree\\tests\\t.py:3\n"
+    assert auto.normalize_tail(base) == auto.normalize_tail(cand)
+    command = "ruff check src"
+    launcher.tail = base
+    result = vbt.triage(tmp_path, card=_CARD, base_oid=_BASE_OID, adapter_id="claude_cli", commands=[command],
+                        candidate_rows={command: _row(command, cand)})
+    assert result["outcome"] == "base_failed"
+
+
+def test_an_empty_non_pytest_tail_is_never_an_identity(launcher, tmp_path) -> None:
+    command = "ruff check src"
+    launcher.tail = ""
+    result = vbt.triage(tmp_path, card=_CARD, base_oid=_BASE_OID, adapter_id="claude_cli", commands=[command],
+                        candidate_rows={command: _row(command, "")})
     assert (result["outcome"], result["reason"]) == ("base_unrunnable", "failure_identity_unparsed")
 
 

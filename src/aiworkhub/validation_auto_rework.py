@@ -85,6 +85,13 @@ _VOLATILE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
     (re.compile(r"(?i)\bpid\s*[=:]?\s*\d+"), "pid=<pid>"),
     (re.compile(r"\b0x[0-9a-fA-F]+\b"), "<addr>"),
+    (
+        re.compile(
+            r"(?i)(?:[a-z]:)?[\\/]*\bunion2_[0-9a-f]{16,}_[0-9a-f]{16,}[\\/]+worktree\b"
+            r"|\bworktrees[\\/][^\\/\s'\"()\[\]<>,;]+[\\/]+worktree\b"
+        ),
+        "<worktree>",
+    ),
     (re.compile(r"\b[0-9a-fA-F]{16,}\b"), "<hex>"),
     (re.compile(r"\b\d+:\d{2}:\d{2}(?:\.\d+)?\b"), "<dur>"),
     (re.compile(r"(?i)\b\d+(?:\.\d+)?\s*(?:ms|s|sec|secs|seconds)\b"), "<dur>"),
