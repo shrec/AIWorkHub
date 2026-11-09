@@ -252,11 +252,11 @@ assert.ok(!managerVisibleTools.some((tool) => tool.name === "aiworkhub_worker_so
 assert.ok(!managerVisibleTools.some((tool) => tool.name === "aiworkhub_worker_session_current_state"));
 assert.ok(!internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => /grep|find|shell/.test(tool.name)));
 assert.strictEqual(
-  internals.sanitizeWebviewPayload("failed at C:\\Users\\shrek\\secret.txt"),
+  internals.sanitizeWebviewPayload("failed at C:\\Users\\owner\\secret.txt"),
   "failed at <redacted-host-path>",
 );
 assert.strictEqual(
-  internals.sanitizeWebviewPayload("failed at /home/shrek/secret.txt"),
+  internals.sanitizeWebviewPayload("failed at /home/owner/secret.txt"),
   "failed at <redacted-host-path>",
 );
 assert.strictEqual(
@@ -5894,7 +5894,7 @@ async function nf988DiscoveryDoesNotImplicitlyEnterSemanticStage() {
       // NF-2026-01632: valid discovery returns source the worker has not seen yet,
       // which is progress, so it is never cut off by the stall window either.
       return { ok: true, tool: "source_graph", mode: call.input.mode, authority_source: "canonical",
-        authority_repo: "D:/Dev/AIWorkHub", hit_count: 1, content: JSON.stringify({ matches: [{
+        authority_repo: "D:/checkout/AIWorkHub", hit_count: 1, content: JSON.stringify({ matches: [{
           file_path: file, source_hash: "a".repeat(64), line_start: sourceGraphCalls,
           line_end: sourceGraphCalls, source: `discovery ${sourceGraphCalls}`, qualname: `target.d${sourceGraphCalls}`,
         }] }) };
@@ -7173,14 +7173,14 @@ async function nf1290ProgressingProviderLoopsContinue() {
         if (paged) {
           const chunk = bodyBytes.subarray(n * chunkSize, (n + 1) * chunkSize);
           return { ok: true, tool: "source_graph", mode: "body",
-            authority_source: "canonical", authority_repo: "D:/Dev/AIWorkHub", hit_count: 1,
+            authority_source: "canonical", authority_repo: "D:/checkout/AIWorkHub", hit_count: 1,
             content: chunk.toString("base64"), content_encoding: "base64",
             content_sha256: hashBytes(bodyBytes), page_sha256: hashBytes(chunk),
             page_index: n, page_count: reads, bytes: chunk.length, full_bytes: bodyBytes.length,
             continuation_cursor: n + 1 < reads ? `next-${n + 1}` : null };
         }
         return { ok: true, tool: "source_graph", mode: "body",
-          authority_source: "canonical", authority_repo: "D:/Dev/AIWorkHub", hit_count: 1,
+          authority_source: "canonical", authority_repo: "D:/checkout/AIWorkHub", hit_count: 1,
           content: JSON.stringify({ matches: [{ file_path: file, line_start: n + 1,
             line_end: n + 1, source: `return before_${n}`,
             freshness: { state: "fresh", disk_source_hash: "a".repeat(64) },
@@ -7226,7 +7226,7 @@ async function nf1290ProgressingProviderLoopsContinue() {
         calls++;
         return { ok: true, tool: "source_graph", mode: "body", hit_count: 0,
           authority_source: kind === "untrusted" ? "legacy" : "canonical",
-          authority_repo: "D:/Dev/AIWorkHub", content: JSON.stringify({ matches: [] }) };
+          authority_repo: "D:/checkout/AIWorkHub", content: JSON.stringify({ matches: [] }) };
       }), /vscode_lm_source_graph_no_progress/);
       // NF-2026-01632: a spin that never progresses still fails closed as no progress.
       // The acknowledging read opens a fresh stall window but counts against the
@@ -7342,7 +7342,7 @@ async function nf1291ShiftedStageRecovery() {
       const input = call.input;
       if (call.name === "aiworkhub_worker_source_graph_query") {
         return { ok: true, tool: "source_graph", mode: input.mode, authority_source: "canonical",
-          authority_repo: "D:/Dev/AIWorkHub", hit_count: 1,
+          authority_repo: "D:/checkout/AIWorkHub", hit_count: 1,
           content: JSON.stringify({ matches: [{ file_path: file,
             freshness: { state: "fresh", disk_source_hash: digest(lines.join("\n") + "\n"),
               indexed_source_hash: digest(lines.join("\n") + "\n") },

@@ -248,14 +248,14 @@ _LOCAL_ROOT_SEGMENTS = r"(?i:home|users|root|var|tmp|opt|private|mnt|srv|library
 # must hold an alphanumeric, so ``ci://-/home/...`` is no URL context either.
 #
 # The tilde alternative also covers ``~user``. ``~`` alone means the running
-# owner's home, but ``~shrek/report.json`` names the same home directory
+# owner's home, but ``~owner/report.json`` names the same home directory
 # explicitly, and the scheme-relative pattern below already treats a bare
 # ``~user`` as owner-local. An optional user name keeps the two consistent.
 # It must start with a letter or underscore so an approximation in prose --
 # ``retries ~3/attempt``, ``~50/sec`` -- stays free text rather than a path.
 # The URL alternative is what keeps ``https://ci.example.com/~runner/...`` -- a
 # per-user CI directory and a retrievable locator -- out of the tilde's reach,
-# on exactly the same terms as the rooted alternative. ``~shrek/report.json``
+# on exactly the same terms as the rooted alternative. ``~owner/report.json``
 # and ``checkout:~/ci/report.json`` carry no URL authority, so both stay
 # rejected.
 # A URL token ends where the URL ends, not where the line does. Matching the
@@ -296,7 +296,7 @@ _LOCAL_PATH_RE = re.compile(
 
 # The whole-string scan above still cannot decide every spelling a retrievable
 # scheme hides, because those are not path shapes on their own: ``ci://C:`` has
-# no path after the drive letter and ``artifact://~shrek/...`` is a home
+# no path after the drive letter and ``artifact://~owner/...`` is a home
 # reference with no separator. This pattern is anchored at the start of a
 # locator's scheme-relative remainder instead, so a retrievable scheme cannot
 # launder an owner-local path in any spelling or casing.

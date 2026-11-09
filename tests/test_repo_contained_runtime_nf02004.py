@@ -33,9 +33,9 @@ from aiworkhub import worker_workspace as ww
 from aiworkhub import workspace_hygiene as hygiene
 from aiworkhub.repository_state import bootstrap_repository
 
-# The canonical checkout's root (``D:\Dev\AIWorkHub``): production lays the
-# lane's temp out beneath a root this long.
-_PRODUCTION_ROOT_LENGTH = len(r"D:\Dev\AIWorkHub")
+# Production lays the lane's temp out beneath a root this long: a typical
+# Windows checkout root.
+_PRODUCTION_ROOT_LENGTH = 16
 # A union request id as the coordinator mints it.
 _UNION_ID = "union2_" + "a" * 32 + "_" + "0123456789abcdef"
 _SUFFIX = ".dll" if os.name == "nt" else ".so"

@@ -393,9 +393,13 @@ def _distill_schema_affordance() -> list[dict[str, Any]]:
 
 # ── main build ──────────────────────────────────────────────────────
 
-def build(geoai_root: str | None = None) -> dict[str, Any]:
+def build(repo_root: str | None = None) -> dict[str, Any]:
     """Build all neural bridge distill artifacts."""
-    root = Path(geoai_root) if geoai_root else Path(os.environ.get("AIWORKHUB_REPO", "/home/shrek/AIWorkHub"))
+    root = (
+        Path(repo_root)
+        if repo_root
+        else Path(os.environ.get("AIWORKHUB_REPO", str(Path(__file__).resolve().parents[1])))
+    )
     mcp_root = root / "tools" / "aiworkhub"
     eval_dir = mcp_root / "eval"
     data_dir = mcp_root / "data" / "tasking"

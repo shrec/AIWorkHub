@@ -393,7 +393,7 @@ _SECRET_BEARING_MEASURED_SHAPES = (
     "RuntimeError: vscode_lm_request_failed:vscode_lm_agent_turn_limit"
     ':diagnostics={"preview":"Authorization: Bearer abcd1234efgh5678ijkl",'
     '"password":"hunter2plain"}',
-    r"AppContainerError:filesystem_grant_failed: write DACL C:\Users\sk-ABCDEF123456",
+    r"AppContainerError:filesystem_grant_failed: write DACL C:\Users\user\sk-ABCDEF123456",
 )
 
 _FORBIDDEN_SUBSTRINGS = (

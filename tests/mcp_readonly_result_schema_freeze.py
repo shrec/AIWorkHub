@@ -44,8 +44,8 @@ false with ``failing_check`` naming the first failure. Never enables writes for
 real, never launches a process/agent, makes no network call, logs no secrets.
 
 Usage:
-    PYTHONPATH=tools/geoai-task-mcp/src AIWORKHUB_REPO=/home/shrek/AIWorkHub \
-    python3 tools/geoai-task-mcp/tests/mcp_readonly_result_schema_freeze.py \
+    PYTHONPATH=tools/aiworkhub/src AIWORKHUB_REPO=/home/owner/AIWorkHub \
+    python3 tools/aiworkhub/tests/mcp_readonly_result_schema_freeze.py \
         [--out result.json] [--emit-frozen]
 """
 

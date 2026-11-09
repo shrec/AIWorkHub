@@ -55,8 +55,8 @@ become a learned router (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1); no
 regex/keyword cue router is introduced here as launch authority.
 
 Usage:
-    PYTHONPATH=tools/geoai-task-mcp/src AIWORKHUB_REPO=/home/shrek/AIWorkHub \
-    python3 tools/geoai-task-mcp/tests/mcp_stdio_concurrent_client_smoke.py \
+    PYTHONPATH=tools/aiworkhub/src AIWORKHUB_REPO=/home/owner/AIWorkHub \
+    python3 tools/aiworkhub/tests/mcp_stdio_concurrent_client_smoke.py \
         [--out result.json]
 """
 

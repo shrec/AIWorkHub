@@ -1882,7 +1882,7 @@ def test_generate_worker_mcp_runtime_writes_three_adapter_config_shapes(monkeypa
     assert f"[mcp_servers.{w.SERVER_NAME}.env]" in codex_toml
     assert f'args = ["-m", "{expected_package_module}"]' in codex_toml
     assert w.ENV_TASK_ID in codex_toml and "TASK_B833" in codex_toml
-    # TOML escapes backslashes in Windows paths (e.g. ``D:\Dev`` -> ``D:\\Dev``),
+    # TOML escapes backslashes in Windows paths (e.g. ``D:\work`` -> ``D:\\work``),
     # so the raw text never contains the bare ``str(path)``. Parse the TOML and
     # assert on the deserialised value instead, which is platform-independent.
     import tomllib

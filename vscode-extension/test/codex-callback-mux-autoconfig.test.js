@@ -105,12 +105,12 @@ test("bare and packaged mux commands are reset to native Codex at Global scope",
 
 test("legacy mux paths from other Linux, macOS and Windows hosts are reset at Global scope", async () => {
   for (const value of [
-    "/home/metal/.vscode-server/data/User/globalStorage/shrec.aiworkhub/bin/aiworkhub-app-server-mux",
-    "/home/metal/.local/bin/aiworkhub-app-server-mux",
+    "/home/user/.vscode-server/data/User/globalStorage/shrec.aiworkhub/bin/aiworkhub-app-server-mux",
+    "/home/user/.local/bin/aiworkhub-app-server-mux",
     "/Users/alice/Library/Application Support/Code/User/globalStorage/shrec.aiworkhub/bin/aiworkhub-app-server-mux",
-    "C:\\Users\\bob\\AppData\\Roaming\\Code\\User\\globalStorage\\shrec.aiworkhub\\bin\\aiworkhub-app-server-mux.cmd",
-    "C:\\Users\\bob\\AppData\\Roaming\\Code\\User\\globalStorage\\ivanechkheidze.aiworkhub\\bin\\aiworkhub-app-server-mux.exe",
-    "/home/old/.vscode-server/extensions/shrec.aiworkhub-missing/bin/aiworkhub-app-server-mux",
+    "C:\\Users\\user\\AppData\\Roaming\\Code\\User\\globalStorage\\shrec.aiworkhub\\bin\\aiworkhub-app-server-mux.cmd",
+    "C:\\Users\\user\\AppData\\Roaming\\Code\\User\\globalStorage\\ivanechkheidze.aiworkhub\\bin\\aiworkhub-app-server-mux.exe",
+    "/home/user/.vscode-server/extensions/shrec.aiworkhub-missing/bin/aiworkhub-app-server-mux",
   ]) {
     assert.equal(__testInternals.isLegacyAiWorkHubMuxPath(value), true, value);
     assert.deepEqual(await restoreFrom(value), RESET, value);

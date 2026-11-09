@@ -4028,7 +4028,7 @@ def aiworkhub_task_create(
         "read_root_invalid:<reason>:<path> when not an existing plain directory, or when it is a "
         "volume/UNC root, reparse point, .git/.aiworkhub path, the repo root or its parent, "
         "another git repository, the home directory or its credential folders. Omit for none.",
-        [["E:\\Dev\\RuntimeData"]],
+        [["E:\\RuntimeData"]],
     )] = None,
 ) -> dict[str, Any]:
     """MANAGER WRITE: create one new canonical repo-local task card.

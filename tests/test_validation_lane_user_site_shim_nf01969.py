@@ -9,8 +9,10 @@ validation record names that choice in ``toolchain_authority_receipt``.
 
 from __future__ import annotations
 
+import getpass
 import inspect
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -27,6 +29,8 @@ POSIX_ONLY = pytest.mark.skipif(
     reason="POSIX-only: the user-site shim, the POSIX lane PATH and the "
     "USER/LOGNAME fallback exist only in the POSIX sanitized_env branch",
 )
+# Generic logins the guard allowlist also accepts; a real login never belongs here.
+_PLACEHOLDER_LOGINS = frozenset({"owner", "worker", "user", "dev", "u", "probe-user"})
 AGENT_ADAPTERS = ("claude_cli", "codex_cli", "opencode_cli", "grok_kilo_cli")
 
 
@@ -146,9 +150,12 @@ def test_posix_user_and_logname_fallback_is_neutral(
 
 
 def test_sanitized_env_source_names_no_personal_user() -> None:
+    login = getpass.getuser()
+    if login.lower() in _PLACEHOLDER_LOGINS:
+        pytest.skip("the login is a generic placeholder, so it proves nothing")
     source = inspect.getsource(worker_workspace.sanitized_env)
 
-    assert "shrek" not in source
+    assert re.search(rf"\b{re.escape(login)}\b", source) is None
     assert '"user"' in source
 
 

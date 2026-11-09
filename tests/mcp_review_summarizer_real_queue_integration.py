@@ -18,9 +18,9 @@ B113 FIX APPLIED: review_summarizer._REVIEW_LINE_RE now suffix-tolerant
 fetch_errors=[]. This test validates both fixes against real taskctl queue.
 
 Usage:
-    AIWORKHUB_ALLOW_WRITES=0 PYTHONPATH=tools/geoai-task-mcp/src \
-    AIWORKHUB_REPO=/home/shrek/AIWorkHub python3 \
-    tools/geoai-task-mcp/tests/mcp_review_summarizer_real_queue_integration.py
+    AIWORKHUB_ALLOW_WRITES=0 PYTHONPATH=tools/aiworkhub/src \
+    AIWORKHUB_REPO=/home/owner/AIWorkHub python3 \
+    tools/aiworkhub/tests/mcp_review_summarizer_real_queue_integration.py
 """
 
 from __future__ import annotations
@@ -61,7 +61,9 @@ def sha256(s: str) -> str:
 
 def run_taskctl_raw(args: list[str]) -> subprocess.CompletedProcess:
     """Run real taskctl.py and return raw CompletedProcess."""
-    repo = os.environ.get("AIWORKHUB_REPO", "/home/shrek/AIWorkHub")
+    repo = os.environ.get(
+        "AIWORKHUB_REPO", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
     cmd = [sys.executable, os.path.join(repo, "AITools/taskctl.py")] + args
     return subprocess.run(
         cmd, cwd=repo, text=True,

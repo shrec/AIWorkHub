@@ -690,7 +690,7 @@ def test_every_wsl_tree_command_is_guarded_and_names_only_absolute_linux_paths(
 @pytest.mark.parametrize(
     "translated",
     [
-        f"/home/me/repo/.scratch/release/{VERSION}",
+        f"/home/user/repo/.scratch/release/{VERSION}",
         f"mnt/z/repo/.scratch/release/{VERSION}",
         "/mnt/z/repo",
         f"/mnt/z/repo/../../home/me/.scratch/release/{VERSION}",
@@ -718,7 +718,7 @@ def test_a_wsl_path_outside_mnt_fails_the_read_only_wsl_preflight_before_any_bum
     tmp_path: Path, flags: tuple[str, ...]
 ) -> None:
     root = _repo(tmp_path)
-    outside = f"/home/me/repo/.scratch/release/{VERSION}"
+    outside = f"/home/user/repo/.scratch/release/{VERSION}"
     runner = FakeRunner(root, {"wsl wslpath": Completed(0, f"{outside}\n")})
 
     code, summary, _, _ = _cut(root, *flags, runner=runner)

@@ -100,11 +100,11 @@ def test_an_empty_spelling_is_never_a_pattern():
 
 
 def test_user_names_cover_the_account_and_the_home_basename(monkeypatch):
-    monkeypatch.setattr(cms.getpass, "getuser", lambda: "jsmith")
-    names = cms._user_names(Path("C:/Users/jsmith.CORP"))
-    assert names == ["jsmith.CORP", "jsmith"]
-    assert cms.redact_line("by jsmith", [(name, "<user>") for name in names], {}) == "by <user>"
-    assert cms._user_names(Path("C:/Users/jsmith")) == ["jsmith"]
+    monkeypatch.setattr(cms.getpass, "getuser", lambda: "worker")
+    names = cms._user_names(Path("C:/Users/owner"))
+    assert names == ["owner", "worker"]
+    assert cms.redact_line("by worker", [(name, "<user>") for name in names], {}) == "by <user>"
+    assert cms._user_names(Path("C:/Users/worker")) == ["worker"]
 
     def no_account():
         raise KeyError("USERNAME")

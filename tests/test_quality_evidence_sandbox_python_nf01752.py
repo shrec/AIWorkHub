@@ -3,7 +3,7 @@
 Measured in the Windows AppContainer validation sandbox (Windows 11 26200,
 CPython 3.12.4): ``_windows_native_command_argv([sys.executable, "-V"])``
 returned ``(None, "windows_path_component_inspection_failed")``.
-``sys.executable`` is ``D:\\Dev\\AIWorkHub\\.venv\\Scripts\\python.exe``; the
+``sys.executable`` is ``D:\\checkout\\.venv\\Scripts\\python.exe``; the
 container can ``lstat`` ``Scripts`` and ``python.exe`` but every directory
 above them raises ``PermissionError`` (WinError 5) -- the lane's site shim only
 answers for the ancestors of the request's own directory, and ``.venv`` is

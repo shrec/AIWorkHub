@@ -378,7 +378,7 @@ def test_absolute_paths_fail_closed(path):
 
 
 @pytest.mark.parametrize(
-    "path", ["src\\a.py", "C:\\Users\\shrek"]
+    "path", ["src\\a.py", "C:\\Users\\owner"]
 )
 def test_backslash_paths_fail_closed(path):
     with pytest.raises(

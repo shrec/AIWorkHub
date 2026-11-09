@@ -7,8 +7,8 @@
         "aiworkhub.server"
       ],
       "env": {
-        "PYTHONPATH": "/home/shrek/AIWorkHub/tools/aiworkhub/src",
-        "AIWORKHUB_REPO": "/home/shrek/AIWorkHub",
+        "PYTHONPATH": "/path/to/AIWorkHub/tools/aiworkhub/src",
+        "AIWORKHUB_REPO": "/path/to/AIWorkHub",
         "AIWORKHUB_ALLOW_WRITES": "0"
       }
     }

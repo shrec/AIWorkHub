@@ -533,7 +533,7 @@ def test_manifest_rejects_non_public_or_credentialed_urls(url, reason):
 
 def test_manifest_rejects_owner_local_path_in_rationale():
     entries = _entries()
-    entries[0] = dict(entries[0], rationale="/home/shrek/checkouts/llvm-project is cheaper")
+    entries[0] = dict(entries[0], rationale="/home/owner/checkouts/llvm-project is cheaper")
     with pytest.raises(eq.InvalidCorpusError, match="owner-local filesystem path"):
         eq.validate_corpus_manifest(_manifest(entries=entries))
 
@@ -1252,7 +1252,7 @@ def _locator_artifact(normalized: dict[str, Any], locator: str) -> dict[str, Any
 @pytest.mark.parametrize(
     "locator",
     [
-        "/home/shrek/ci/windows-report.json",
+        "/home/owner/ci/windows-report.json",
         "~/ci/windows-report.json",
         "C:/builds/windows-report.json",
         "file:///var/log/windows-report.json",
@@ -1278,16 +1278,16 @@ def test_owner_local_paths_are_not_retrievable_locators(normalized_manifest, loc
         "ci://\\\\buildhost\\share\\windows-report.json",
         # POSIX spellings wearing a retrievable scheme. The empty authority in
         # ``scheme:///…`` is exactly what makes the remainder an absolute path.
-        "artifact:///home/shrek/ci/windows-report.json",
-        "artifact:///Users/shrek/ci/windows-report.json",
+        "artifact:///home/owner/ci/windows-report.json",
+        "artifact:///Users/owner/ci/windows-report.json",
         "ci:///var/log/windows-report.json",
         "https:///tmp/windows-report.json",
         "ci://~/ci/windows-report.json",
-        "artifact://~shrek/ci/windows-report.json",
+        "artifact://~owner/ci/windows-report.json",
         # Case variants of the same POSIX roots. Case-insensitive filesystems
         # resolve these to the identical owner-local directories.
-        "artifact:///users/shrek/ci/windows-report.json",
-        "artifact:///Home/shrek/ci/windows-report.json",
+        "artifact:///users/owner/ci/windows-report.json",
+        "artifact:///Home/owner/ci/windows-report.json",
         "ci:///VAR/log/windows-report.json",
         "https:///Tmp/windows-report.json",
         # The macOS roots behind a retrievable scheme, which is where an
@@ -1300,8 +1300,8 @@ def test_owner_local_paths_are_not_retrievable_locators(normalized_manifest, loc
         # nonempty, so the authority check passes, and each one sits inside the
         # whole-string scan's negative lookbehind, so that scan stays silent too --
         # one character laundering exactly the paths rejected above.
-        "artifact://./Users/shrek/ci/windows-report.json",
-        "ci://-/home/shrek/ci/windows-report.json",
+        "artifact://./Users/owner/ci/windows-report.json",
+        "ci://-/home/owner/ci/windows-report.json",
         "artifact://_/var/log/windows-report.json",
     ],
 )
@@ -1344,22 +1344,22 @@ def test_punctuation_authority_names_no_retrievable_host(normalized_manifest):
     "reason",
     [
         # Colon-adjacent: the path follows a label rather than a text boundary.
-        "macos evidence:/Users/shrek/report.json",
+        "macos evidence:/Users/owner/report.json",
         "windows evidence:C:/builds/windows-report.json",
         "windows evidence:\\\\buildhost\\share\\windows-report.json",
         "checkout:~/ci/windows-report.json",
         # Comma-adjacent: the path follows a separator inside a list.
-        "rejected,/home/shrek/ci/windows-report.json,retry",
+        "rejected,/home/owner/ci/windows-report.json,retry",
         "rejected,C:\\builds\\windows-report.json",
         "rejected,~/ci/windows-report.json",
         # Case variants, still adjacent to punctuation. A case-insensitive
         # filesystem resolves ``/users`` and ``/Home`` to the same owner-local
         # directories as ``/Users`` and ``/home``, so a case-sensitive matcher
         # would seal the very same path into the artifact under another casing.
-        "macos evidence:/users/shrek/report.json",
-        "macos evidence:/USERS/shrek/report.json",
-        "rejected,/Home/shrek/ci/windows-report.json,retry",
-        "rejected,/HOME/shrek/ci/windows-report.json",
+        "macos evidence:/users/owner/report.json",
+        "macos evidence:/USERS/owner/report.json",
+        "rejected,/Home/owner/ci/windows-report.json,retry",
+        "rejected,/HOME/owner/ci/windows-report.json",
         "windows evidence:/Tmp/windows-report.json",
         "logs:/VAR/log/windows-report.json",
         # The macOS roots. ``/Volumes/<disk>`` is a mounted external or network
@@ -1372,13 +1372,13 @@ def test_punctuation_authority_names_no_retrievable_host(normalized_manifest):
         "macos evidence:/Library/Logs/aiworkhub/report.json",
         "rejected,/library/Logs/aiworkhub/report.json,retry",
         "logs:/LIBRARY/Logs/aiworkhub/report.json",
-        # A named home directory. ``~shrek/report.json`` resolves to exactly the
+        # A named home directory. ``~owner/report.json`` resolves to exactly the
         # owner-local home ``~/report.json`` names, so rejecting only the bare
         # ``~/`` spelling would let the same path through under the owner's name.
-        "~shrek/report.json",
-        "macos evidence:~shrek/report.json",
-        "rejected,~shrek/ci/windows-report.json,retry",
-        "windows evidence:~shrek\\ci\\windows-report.json",
+        "~owner/report.json",
+        "macos evidence:~owner/report.json",
+        "rejected,~owner/ci/windows-report.json,retry",
+        "windows evidence:~owner\\ci\\windows-report.json",
     ],
 )
 def test_owner_local_paths_embedded_in_free_text_are_rejected(normalized_manifest, reason):
@@ -1413,7 +1413,7 @@ _PATH_ADJACENT_PUNCTUATION = [".", "_", "~", "%", "+", "-"]
 
 # One root per family the ban names: the Linux home, the macOS home, and a
 # system root that carries a CI report just as plausibly as a home does.
-_OWNER_LOCAL_ROOTS = ["/home/shrek", "/Users/shrek", "/var/log"]
+_OWNER_LOCAL_ROOTS = ["/home/owner", "/Users/owner", "/var/log"]
 
 
 @pytest.mark.parametrize("root", _OWNER_LOCAL_ROOTS)
@@ -1423,8 +1423,8 @@ def test_punctuation_before_a_rooted_path_does_not_launder_it(
 ):
     """Prose punctuation is not a URL, so it cannot exempt the path behind it.
 
-    ``rejected-/home/shrek/ci/windows-report.json`` seals the same owner-local
-    path as ``rejected,/home/shrek/…``. Any left boundary wide enough to keep a
+    ``rejected-/home/owner/ci/windows-report.json`` seals the same owner-local
+    path as ``rejected,/home/owner/…``. Any left boundary wide enough to keep a
     URL path segment accepted accepted these too, because the character in front
     of a URL path segment and the character in front of free text are the same
     character -- only the ``://`` further left tells the two apart.
@@ -1468,7 +1468,7 @@ def test_a_url_token_does_not_absorb_a_path_adjacent_to_it(
 ):
     """A real URL in front of a local path does not exempt the path behind it.
 
-    ``https://ci.example.com/run/1,/home/shrek/report.json`` is one whitespace-free
+    ``https://ci.example.com/run/1,/home/owner/report.json`` is one whitespace-free
     token: the scheme is real, the authority names a host, and the owner-local
     tail begins one separator later. A URL path matched as "everything up to
     whitespace" absorbs that tail into the URL span, where the owner-local
@@ -1489,7 +1489,7 @@ def test_comma_adjacent_local_path_in_a_locator_is_rejected(normalized_manifest)
     else. One that carries an owner-local report path behind a comma is neither
     retrievable nor owner-independent, however well-formed its authority is.
     """
-    locator = "https://ci.example.com/run/1,/home/shrek/report.json"
+    locator = "https://ci.example.com/run/1,/home/owner/report.json"
     with pytest.raises(eq.InvalidRunArtifactError, match="owner-local filesystem path"):
         eq.validate_run_artifact(_locator_artifact(normalized_manifest, locator))
 
@@ -1513,7 +1513,7 @@ def test_url_user_directory_segment_is_a_retrievable_locator(normalized_manifest
     "reason",
     [
         # No ``/`` in front at all: the home reference opens the value.
-        "~shrek/report.json",
+        "~owner/report.json",
         # A ``/`` appears later, but the ``~`` follows a colon, so the URL
         # exception never reaches it.
         "checkout:~/ci/report.json",

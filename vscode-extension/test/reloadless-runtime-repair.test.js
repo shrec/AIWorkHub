@@ -906,7 +906,7 @@ async function testLivePoisonedInvalidParamsShapeRepairsOnce(tmp) {
 }
 
 function testWindowsWorkerRootIsolationPreservesExplicitOverride(tmp) {
-  const repoRoot = path.win32.join("D:\\", "Dev", "AIWorkHub");
+  const repoRoot = path.win32.join("D:\\", "repo", "AIWorkHub");
   const host = loadExtensionHost(tmp);
   const resolveWorkerWorktreeRootEnv = host.extension.__testInternals.resolveWorkerWorktreeRootEnv;
 
@@ -918,7 +918,7 @@ function testWindowsWorkerRootIsolationPreservesExplicitOverride(tmp) {
       { AIWORKHUB_RUNTIME_ROOT: path.win32.join("C:\\", "elsewhere", "runtime") },
       "win32",
     ),
-    "D:\\Dev\\AIWorkHub\\.aiworkhub\\runtime\\worktrees",
+    "D:\\repo\\AIWorkHub\\.aiworkhub\\runtime\\worktrees",
   );
 
   const explicit = path.win32.join("C:\\", "custom", "worktrees");

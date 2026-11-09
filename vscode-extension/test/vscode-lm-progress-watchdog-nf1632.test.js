@@ -48,7 +48,7 @@ const finalText = (summary) => JSON.stringify({
 });
 const evidenceReply = (line) => ({
   ok: true, tool: "source_graph", mode: "body", authority_source: "canonical",
-  authority_repo: "D:/Dev/AIWorkHub", hit_count: 1,
+  authority_repo: "D:/repo/AIWorkHub", hit_count: 1,
   content: JSON.stringify({ matches: [{
     file_path: CONTEXT, source_hash: "a".repeat(64), line_start: line, line_end: line,
     source: `def f${line}(): pass`, qualname: `context.f${line}`,

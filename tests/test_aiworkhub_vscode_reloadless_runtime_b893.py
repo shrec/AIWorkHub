@@ -1,6 +1,6 @@
 """B893: reloadless, repository-isolated MCP runtime repair.
 
-Verifies tools/geoai-task-mcp/vscode-extension/extension.js no longer
+Verifies vscode-extension/extension.js no longer
 requires "Developer: Reload Window" after a runtime/VSIX version mismatch --
 it instead runs one bounded restart of the *same* repository's own MCP
 child and reconnects the already-open dashboard tab automatically. The
@@ -15,6 +15,7 @@ adds static-content guardrails for the contract's forbidden patterns.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -81,10 +82,10 @@ def test_bounded_reloadless_repair_wiring_present() -> None:
 
 def test_forbidden_fallback_and_shell_patterns_absent() -> None:
     ext = _read_extension_js()
-    # forbidden: global_repo_fallback / geoai_hardcoded_path / cross_repo_callback_or_queue
-    assert "GeoAI" not in ext
-    assert "/home/shrek" not in ext
-    assert "H:/Dev" not in ext
+    # forbidden: global_repo_fallback / hardcoded_project_path / cross_repo_callback_or_queue
+    assert re.search(r"/home/[A-Za-z0-9_]", ext) is None
+    # No drive-letter development root (spelled as a pattern, not a literal).
+    assert re.search(r"[A-Za-z]:[\\/]+Dev\b", ext) is None
     # A user-home lookup is legitimate for Codex's own ~/.codex/config.toml;
     # what remains forbidden is deriving a repository binding/state root from
     # the home directory (the cross-repo fallback fixed by B893).

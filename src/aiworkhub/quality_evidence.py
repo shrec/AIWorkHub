@@ -2492,7 +2492,7 @@ def _windows_path_component_chain_error(path: Path) -> str:
 
     The Windows AppContainer validation lane cannot ``lstat`` directories
     above its granted ones (measured NF-2026-01752: WinError 5 on
-    ``D:\\Dev\\AIWorkHub\\.venv`` above the granted ``Scripts`` directory of
+    ``D:\\checkout\\.venv`` above the granted ``Scripts`` directory of
     the trusted interpreter).  A denied component is not trusted: it is
     accepted only when the strict final path of ``path`` names exactly the
     raw path, so no link or junction anywhere in the chain redirected it.

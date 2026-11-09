@@ -222,7 +222,7 @@ def test_sanitized_env_isolated_queue_db_is_under_home_and_never_parent_or_coord
 ) -> None:
     monkeypatch.setenv("BITNN_TASKCTL_COORDINATOR_TOKEN", "top-secret-coordinator-token")
     monkeypatch.setenv(
-        "BITNN_TASKCTL_COORDINATOR_TOKEN_FILE", "/home/shrek/.config/aiworkhub/taskctl_coordinator.token"
+        "BITNN_TASKCTL_COORDINATOR_TOKEN_FILE", "/home/owner/.config/aiworkhub/taskctl_coordinator.token"
     )
     monkeypatch.setenv("BITNN_TASK_QUEUE_DB", str(_AIWORKHUB_REPO / "bitnnv2/data/tasking/task_queue_v1.sqlite"))
     monkeypatch.setenv("AIWORKHUB_ALLOW_LAUNCH", "1")

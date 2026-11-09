@@ -42,8 +42,8 @@ a private mktemp audit dir (passed to the child via
 perturbed by a concurrent worker.
 
 Usage:
-    PYTHONPATH=tools/geoai-task-mcp/src AIWORKHUB_REPO=/home/shrek/AIWorkHub \
-    python3 tools/geoai-task-mcp/tests/mcp_stdio_client_smoke.py [--out result.json]
+    PYTHONPATH=tools/aiworkhub/src AIWORKHUB_REPO=/home/owner/AIWorkHub \
+    python3 tools/aiworkhub/tests/mcp_stdio_client_smoke.py [--out result.json]
 """
 
 from __future__ import annotations

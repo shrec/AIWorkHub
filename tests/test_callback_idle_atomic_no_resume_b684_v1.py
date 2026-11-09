@@ -206,7 +206,7 @@ def test_deliver_callback_sends_only_turn_start_never_resume_or_steer():
         client = SidebandCallbackClient(repo_id=_REPO_ID, sideband_dir=sideband_dir, timeout=5)
         result = client.deliver_callback(
             thread_id, "TASK_B684_IDLE", "review_ready",
-            client_user_message_id="fixed-b684-1", cwd="/home/shrek/AIWorkHub",
+            client_user_message_id="fixed-b684-1", cwd="/home/owner/AIWorkHub",
         )
         assert result["result"]["turn"]["status"] == "inProgress"
         assert endpoint.calls == ["turn/start"]

@@ -66,7 +66,7 @@ function fileReply(filePath, {
   if (edit) edit(payload);
   return {
     ok: true, tool: "source_graph", mode, authority_source: authority,
-    authority_repo: "D:/Dev/AIWorkHub", hit_count: 1, content: JSON.stringify(payload),
+    authority_repo: "D:/repo/AIWorkHub", hit_count: 1, content: JSON.stringify(payload),
   };
 }
 

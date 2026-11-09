@@ -50,7 +50,7 @@ names without weakening denial, revocation or failure-unwind assertions.
 
 A readonly diagnostic of the real _request_traversal_anchor selected the nearest
 nested worktree root, 140 characters. Its 162-character helper leaf projects to
-a 320-character nested LSP cwd for username shrek, exceeding the actual 258 limit.
+a 320-character nested LSP cwd for a five-character username, exceeding the actual 258 limit.
 The outer canonical repo-local worktrees anchor is 45 characters and projects
 to 225 with the same helper shape. These are path measurements, not authority
 or native sandbox proof; no directory, grant or process was created by the check.

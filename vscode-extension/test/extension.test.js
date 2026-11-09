@@ -56,8 +56,8 @@ test("resolveOpencodeConfigJsonPath honors an explicit OPENCODE_CONFIG override"
 });
 
 test("resolveOpencodeConfigJsonPath falls back to XDG_CONFIG_HOME/opencode/opencode.json", () => {
-  const resolved = resolveOpencodeConfigJsonPath({ XDG_CONFIG_HOME: "/home/x/.config" });
-  assert.equal(resolved, path.join("/home/x/.config", "opencode", "opencode.json"));
+  const resolved = resolveOpencodeConfigJsonPath({ XDG_CONFIG_HOME: "/home/user/.config" });
+  assert.equal(resolved, path.join("/home/user/.config", "opencode", "opencode.json"));
 });
 
 test("repairOpencodeConfigJsonObject creates a repository-neutral entry with no repo identity keys", () => {

@@ -62,7 +62,7 @@ function testSanitizeErrorMessage() {
   for (const empty of [null, undefined, ""]) {
     assert.strictEqual(sanitizeErrorMessage(empty), "mcp_unavailable");
   }
-  const unsafe = ["has space", "a/b", "C:\\Users\\someone\\secret.txt", 'say "hi"', "it's", "line1\nline2", "tab\there"];
+  const unsafe = ["has space", "a/b", "C:\\Users\\user\\secret.txt", 'say "hi"', "it's", "line1\nline2", "tab\there"];
   const literals = new Set();
   for (const input of unsafe) {
     const out = sanitizeErrorMessage(input);

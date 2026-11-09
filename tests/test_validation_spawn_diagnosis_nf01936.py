@@ -1,6 +1,6 @@
 """NF-2026-01936: a validation spawn failure carries a typed reason and remedy.
 
-Field reports (EntryLink, megoproject, ultrafastsecp256k1; 2026-11-01/02): a
+Field reports from other projects (2026-11-01/02): a
 worker's declared dotnet/flutter/node/cmake validation came back as a bare
 ``tool_unavailable`` with only the raw OSError text, so nobody could tell
 whether the head was missing, a batch wrapper, or an unregistered install root.

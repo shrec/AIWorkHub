@@ -33,7 +33,7 @@ otherwise the original error stands.
 
 And ``os.stat`` / ``os.lstat`` of the directories above the request's own
 directory: the container can stat none of them (WinError 5 on ``D:\\``,
-``D:\\Dev`` ...), and no grant can open a drive root, so code that walks a
+``D:\\work`` ...), and no grant can open a drive root, so code that walks a
 path from its drive root -- ``repository_state``'s symlink check -- refused
 every path.  When such a call is denied, the answer is the host's own
 ``lstat`` of that exact directory, which the lane passes in

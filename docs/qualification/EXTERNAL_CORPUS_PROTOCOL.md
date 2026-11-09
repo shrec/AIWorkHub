@@ -293,7 +293,7 @@ non-empty authority holding an alphanumeric, and the path that follows are
 matched as one span, and only a filesystem shape found outside such a span is a
 violation. The character to the left cannot decide it, because a URL path
 segment and free-text prose end in the same characters — only the `://` further
-left tells them apart. So `~shrek/report.json`, `checkout:~/ci/report.json` and
+left tells them apart. So `~owner/report.json`, `checkout:~/ci/report.json` and
 the authority-less `artifact:///home/…` carry no URL authority in front of them
 and remain rejected as owner-local paths.
 

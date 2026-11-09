@@ -162,7 +162,7 @@ for (const toolCalling of [false, true]) {
     const run = toolCalling ? bridge.runVscodeLmAgent : bridge.runVscodeLmTextProtocol;
     const transport = authenticatedEditor(request(), async () => ({
       ok: true, tool: "source_graph", mode: "body", authority_source: "canonical",
-      authority_repo: "D:/Dev/AIWorkHub", hit_count: 1,
+      authority_repo: "D:/repo/AIWorkHub", hit_count: 1,
       content: JSON.stringify({ matches: [{
         file_path: "src/app.py", source_hash: "a".repeat(64), line_start: ++reads,
         line_end: reads, source: `def f${reads}(): pass`, qualname: `app.f${reads}`,
@@ -211,7 +211,7 @@ for (const toolCalling of [false, true]) for (const withTarget of [true, false])
       const page = reads++;
       const chunk = bytes.subarray(page * size, (page + 1) * size);
       return { ok: true, tool: "source_graph", mode: "body", authority_source: "canonical",
-        authority_repo: "D:/Dev/AIWorkHub", hit_count: 1, target: withTarget ? "src/app.py" : null,
+        authority_repo: "D:/repo/AIWorkHub", hit_count: 1, target: withTarget ? "src/app.py" : null,
         content_encoding: "base64", content: chunk.toString("base64"),
         content_sha256: contentHash, page_sha256: hash(chunk), page_index: page,
         page_count: 18, bytes: chunk.length, full_bytes: bytes.length,

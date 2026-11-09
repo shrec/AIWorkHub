@@ -47,7 +47,7 @@ const crypto = require("node:crypto");
 const digest = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
 const trusted = (content, overrides = {}) => ({
   ok: true, tool: "source_graph", mode: "body", authority_source: "canonical",
-  authority_repo: "D:/Dev/AIWorkHub", hit_count: 1, content: JSON.stringify(content), ...overrides,
+  authority_repo: "D:/repo/AIWorkHub", hit_count: 1, content: JSON.stringify(content), ...overrides,
 });
 const evidence = (line = 1) => ({ matches: [{
   file_path: "src/app.py", source_hash: "a".repeat(64), line_start: line, line_end: line,

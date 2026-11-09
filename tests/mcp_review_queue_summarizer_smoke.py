@@ -11,9 +11,9 @@ backend to confirm:
   - Never mutate queue/audit state
 
 Usage:
-    AIWORKHUB_ALLOW_WRITES=0 PYTHONPATH=tools/geoai-task-mcp/src \
-    AIWORKHUB_REPO=/home/shrek/AIWorkHub python3 \
-    tools/geoai-task-mcp/tests/mcp_review_queue_summarizer_smoke.py
+    AIWORKHUB_ALLOW_WRITES=0 PYTHONPATH=tools/aiworkhub/src \
+    AIWORKHUB_REPO=/home/owner/AIWorkHub python3 \
+    tools/aiworkhub/tests/mcp_review_queue_summarizer_smoke.py
 """
 
 from __future__ import annotations

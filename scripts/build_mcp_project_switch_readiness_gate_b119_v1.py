@@ -48,7 +48,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-REPO = Path(os.environ.get("AIWORKHUB_REPO", "/home/shrek/AIWorkHub")).expanduser().resolve()
+REPO = Path(
+    os.environ.get("AIWORKHUB_REPO", str(Path(__file__).resolve().parents[1]))
+).expanduser().resolve()
 MCP_ROOT = REPO / "tools" / "aiworkhub"
 EVAL_DIR = MCP_ROOT / "eval"
 DATA_DIR = MCP_ROOT / "data" / "tasking"

@@ -1,8 +1,8 @@
 """B925: repository/thread/channel callback routing isolation regressions.
 
-Reproduces and closes the measured defect: Secp256K1fast tasks
-(BUILD_REGISTRY_CONTRACT_022, UFCI_IMPLEMENT_019) were delivered into the
-GeoAI Codex chat while manager MCP authority reported ``/home/shrek/GeoAI``.
+Reproduces and closes the measured defect, from a field report from another
+project: that project's tasks were delivered into this repository's Codex chat
+while manager MCP authority reported ``/home/owner/other-repo``.
 Root cause -- ``app_server_mux.py``'s sideband instance registry
 (``DEFAULT_SIDEBAND_DIR`` is one machine-wide directory shared by every
 repository's mux instance) resolved thread ownership by ``thread_id``
@@ -561,7 +561,7 @@ def test_callback_dispatcher_forwards_repo_id_to_sideband_repo_id(callback_bridg
 
 def test_route_identity_rejects_windows_path_forms():
     with pytest.raises(ValueError):
-        RepoRouteKey(repo_id="C:\\Users\\dev\\Secp256k1fast", thread_id="t1", task_id="task1")
+        RepoRouteKey(repo_id="C:\\Users\\dev\\other-repo", thread_id="t1", task_id="task1")
     with pytest.raises(ValueError):
         RepoRouteKey(repo_id="repo", thread_id="t1", task_id="task1", event_id="C:\\evil\\path")
     with pytest.raises(ValueError):

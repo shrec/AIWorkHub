@@ -49,7 +49,9 @@ PROCESS_LAUNCH_IMPLEMENTED = False
 SUBPROCESS_LAUNCH_TRIPWIRE = 0
 QUEUE_MUTATION_TRIPWIRE = 0
 
-REPO = Path(os.environ.get("AIWORKHUB_REPO", "/home/shrek/AIWorkHub")).expanduser().resolve()
+REPO = Path(
+    os.environ.get("AIWORKHUB_REPO", str(Path(__file__).resolve().parents[1]))
+).expanduser().resolve()
 sys.path.insert(0, str(REPO / "AITools"))
 import taskdb  # noqa: E402  -- real production canonical_status/card_sort_key/normalize_card
 

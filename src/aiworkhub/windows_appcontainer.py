@@ -446,7 +446,7 @@ def ancestor_stat_facts(path: str) -> str:
     """JSON: the host's ``lstat`` of every directory above ``path``, keyed by
     normcased path, as the fields ``os.stat_result`` is rebuilt from.
 
-    A container cannot stat them -- measured: ``D:\\``, ``D:\\Dev`` and the
+    A container cannot stat them -- measured: ``D:\\``, ``D:\\work`` and the
     worktree root WinError 5 -- and no grant can fix the drive root, so code
     that walks a path from its drive root (``repository_state``'s symlink
     check) refused every path.  ``path`` is a request's own directory, the

@@ -1455,7 +1455,7 @@ def test_opencode_launch_refuses_a_command_the_bubblewrap_mount_cannot_show(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     harness = _prepare_opencode_launch(
-        monkeypatch, tmp_path, "bubblewrap", command="/home/nobody/.venv/bin/python"
+        monkeypatch, tmp_path, "bubblewrap", command="/home/user/.venv/bin/python"
     )
 
     result = _launch_opencode(harness)

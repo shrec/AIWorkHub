@@ -5,8 +5,8 @@ Exercises every read-only tool with AIWORKHUB_ALLOW_WRITES=0
 and confirms write-gated tools are blocked without mutating parent queue.
 
 Usage:
-    AIWORKHUB_ALLOW_WRITES=0 PYTHONPATH=tools/geoai-task-mcp/src \
-    AIWORKHUB_REPO=/home/shrek/AIWorkHub python3 tools/geoai-task-mcp/tests/readonly_tools_smoke.py
+    AIWORKHUB_ALLOW_WRITES=0 PYTHONPATH=tools/aiworkhub/src \
+    AIWORKHUB_REPO=/home/owner/AIWorkHub python3 tools/aiworkhub/tests/readonly_tools_smoke.py
 """
 
 from __future__ import annotations

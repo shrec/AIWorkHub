@@ -9,10 +9,10 @@ set -euo pipefail
 #
 # Usage:
 #   AIWORKHUB_ALLOW_WRITES=0 bash \
-#     tools/geoai-task-mcp/tests/test_mcp_review_summarizer_stdio_smoke_b115_v1.sh
+#     tools/aiworkhub/tests/test_mcp_review_summarizer_stdio_smoke_b115_v1.sh
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-MCPROOT="$ROOT/tools/geoai-task-mcp"
+MCPROOT="$ROOT/tools/aiworkhub"
 
 export PYTHONPATH="$MCPROOT/src"
 export AIWORKHUB_REPO="$ROOT"
@@ -72,7 +72,7 @@ import sys
 import time
 
 
-ROOT = os.environ.get("AIWORKHUB_REPO", "/home/shrek/AIWorkHub")
+ROOT = os.environ.get("AIWORKHUB_REPO", os.getcwd())
 MCPROOT = os.path.join(ROOT, "tools", "aiworkhub")
 ALLOW_WRITES = os.environ.get("AIWORKHUB_ALLOW_WRITES", "0")
 QUEUE_PATH = os.path.join(ROOT, "bitnnv2", "data", "tasking", "task_queue_v1.sqlite")

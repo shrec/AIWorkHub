@@ -47,7 +47,7 @@ def _r4_entry(
         "violation": "",
         "authority_source": "rework_overlay",
         "authority_state": "request_scoped_worktree",
-        "authority_repo": "/home/shrek/AIWorkHub",
+        "authority_repo": "/home/owner/AIWorkHub",
     }
     if payload is not None:
         entry["payload"] = dict(payload)

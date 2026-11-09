@@ -116,7 +116,7 @@ const {
     'args = ["-3", "-m", "aiworkhub.server"]',
     "",
     "[mcp_servers.aiworkhub.env]",
-    "PYTHONPATH = 'D:\\Dev\\AIWorkHub\\src'",
+    "PYTHONPATH = 'D:\\checkout\\AIWorkHub\\src'",
     'AIWORKHUB_ALLOW_WRITES = "1"',
     'AIWORKHUB_ALLOW_LAUNCH = "1"',
     "",
@@ -124,14 +124,14 @@ const {
     'approval_mode = "approve"',
     "",
   ].join("\r\n");
-  const launcher = "C:\\Users\\shrek\\AppData\\Roaming\\Code\\User\\globalStorage\\IvaneChkheidze.aiworkhub\\bin\\aiworkhub-mcp-server.py";
+  const launcher = "C:\\Users\\owner\\AppData\\Roaming\\Code\\User\\globalStorage\\IvaneChkheidze.aiworkhub\\bin\\aiworkhub-mcp-server.py";
   const migrated = ensureCodexStableMcpRegistrationTomlText(
     original,
     launcher,
     { command: "py", argsPrefix: ["-3"] },
   );
   assert.strictEqual(migrated.changed, true);
-  assert.ok(!migrated.text.includes("D:\\Dev\\AIWorkHub\\src"));
+  assert.ok(!migrated.text.includes("D:\\checkout\\AIWorkHub\\src"));
   assert.ok(!migrated.text.includes("PYTHONPATH"));
   assert.ok(migrated.text.includes(JSON.stringify(launcher)));
   assert.ok(migrated.text.includes("[mcp_servers.aiworkhub.tools.aiworkhub_repo_current]"));

@@ -8,7 +8,9 @@ No agent/model launch, no network, no mutation.
 
 import sys, os, json, subprocess, time, hashlib
 
-ROOT = os.environ.get("AIWORKHUB_REPO", "/home/shrek/AIWorkHub")
+ROOT = os.environ.get(
+    "AIWORKHUB_REPO", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 MCPROOT = os.path.join(ROOT, "tools", "aiworkhub")
 ALLOW_WRITES = os.environ.get("AIWORKHUB_ALLOW_WRITES", "0")
 QUEUE_PATH = os.path.join(ROOT, "bitnnv2", "data", "tasking", "task_queue_v1.sqlite")

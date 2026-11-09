@@ -25,10 +25,10 @@ def _receipt(tail: str) -> dict:
     [
         "validation_toolchain_authority_secret_unavailable",
         "tests/test_worker_workspace.py::test_some_very_long_function_name_here",
-        r"C:\Users\someone\projects\AIWorkHub\src\aiworkhub\worker_workspace.py",
+        r"C:\Users\user\projects\AIWorkHub\src\aiworkhub\worker_workspace.py",
         "src/aiworkhub/worker_workspace.py:12138: in _validation_failure_receipt",
         "aiworkhub.worker_workspace._validation_failure_receipt_helper_name",
-        "/home/ci/Work2/AIWorkHub/src/aiworkhub/worker_workspace.py",
+        "/home/user/Work2/AIWorkHub/src/aiworkhub/worker_workspace.py",
         "https://github.com/Org/Repo2/blob/main/src/aiworkhub/worker_workspace.py",
     ],
 )

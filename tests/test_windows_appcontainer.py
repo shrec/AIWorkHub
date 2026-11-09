@@ -2304,7 +2304,7 @@ ALIASES = {
 @pytest.mark.parametrize("alias", sorted(ALIASES))
 @pytest.mark.parametrize(("access", "persistent"), [("read_execute", True), ("modify", False)])
 def test_unc_device_and_long_path_aliases_are_refused(tmp_path, alias, access, persistent):
-    # \\?\C:\Users\x and \\localhost\C$\Users\x alias local trees past every
+    # \\?\C:\Users\owner and \\localhost\C$\Users\owner alias local trees past every
     # string comparison against the protected roots.
     path = ALIASES[alias](str(tmp_path))
     detail = _refused([ContainerGrant(path, access, persistent)], FakeWin32Api())
@@ -2520,7 +2520,7 @@ def test_request_scoped_grants_chain_stops_at_the_sandbox_root(tmp_path):
 @pytest.mark.skipif(os.name != "nt", reason="Windows drive path")
 def test_request_scoped_grants_rejects_a_path_outside_any_sandbox():
     with pytest.raises(AppContainerError) as excinfo:
-        request_scoped_grants({}, r"D:\Dev\AIWorkHub")
+        request_scoped_grants({}, r"D:\elsewhere\checkout")
 
     assert excinfo.value.reason is AppContainerReason.INVALID_REQUEST
     assert "outside sandbox boundary" in excinfo.value.detail
@@ -4737,10 +4737,10 @@ def test_nested_lsp_helper_cwd_budget_names_the_measured_winerror_267_limit():
     )
 
     assert CREATEPROCESS_CWD_MAX_CHARS == 258
-    assert temp_root_blocks_nested_lsp_helper("x" * 190, "shrek")
-    assert projected_nested_lsp_cwd_length("x" * 190, "shrek") > 258
-    assert not temp_root_blocks_nested_lsp_helper("x" * 46, "shrek")
-    assert projected_nested_lsp_cwd_length("x" * 46, "shrek") <= 258
+    assert temp_root_blocks_nested_lsp_helper("x" * 190, "owner")
+    assert projected_nested_lsp_cwd_length("x" * 190, "owner") > 258
+    assert not temp_root_blocks_nested_lsp_helper("x" * 46, "owner")
+    assert projected_nested_lsp_cwd_length("x" * 46, "owner") <= 258
 
 
 _NEUTRAL_USER = "worker"
@@ -4841,7 +4841,7 @@ def test_helper_temp_plan_does_not_grant_a_workspace_outside_a_sandbox():
         filesystem_grants=(),
     )
     rewritten, disposable = wac.bind_validation_helper_temp(
-        request, username="shrek"
+        request, username="owner"
     )
     assert disposable is None
     assert tuple(rewritten.filesystem_grants) == ()
@@ -4856,7 +4856,7 @@ def test_helper_temp_plan_leaves_a_non_validation_launch_unchanged():
         filesystem_grants=(),
     )
     rewritten, disposable = wac.bind_validation_helper_temp(
-        request, username="shrek"
+        request, username="owner"
     )
     assert disposable is None
     assert rewritten.environment["TEMP"] == long_temp
@@ -4991,7 +4991,7 @@ def test_validation_helper_temp_grant_plan_spawns_under_the_winerror_267_limit()
 def test_helper_temp_plan_fails_closed_when_no_short_private_temp_fits(monkeypatch):
     """A too-long scratch is not granted, and neither is any path outside it."""
 
-    long = os.path.abspath(os.path.join(os.sep, "Users", "shrek", "Temp")) + ("n" * 160)
+    long = os.path.abspath(os.path.join(os.sep, "Users", "owner", "Temp")) + ("n" * 160)
     monkeypatch.setattr(wac.os, "name", "nt")
     monkeypatch.setattr(
         wac, "_request_traversal_anchor", lambda _value: os.path.dirname(long)
@@ -5005,7 +5005,7 @@ def test_helper_temp_plan_fails_closed_when_no_short_private_temp_fits(monkeypat
     }
     request = make_request(environment=env, filesystem_grants=(), working_directory=long)
     with pytest.raises(AppContainerError) as excinfo:
-        wac.bind_validation_helper_temp(request, username="shrek")
+        wac.bind_validation_helper_temp(request, username="owner")
     assert excinfo.value.reason is AppContainerReason.INVALID_REQUEST
     assert "no shorter private temp" in excinfo.value.detail
     assert tuple(request.filesystem_grants) == ()
@@ -5034,8 +5034,8 @@ def test_helper_temp_plan_measures_a_same_anchor_temp_on_the_drive_spelling(
     from aiworkhub.validation_runner import temp_root_blocks_nested_lsp_helper
 
     anchor, scratch = _deep_sandbox_scratch()
-    assert temp_root_blocks_nested_lsp_helper(scratch, "shrek")
-    assert not temp_root_blocks_nested_lsp_helper("Z:\\req\\tmp", "shrek")
+    assert temp_root_blocks_nested_lsp_helper(scratch, "owner")
+    assert not temp_root_blocks_nested_lsp_helper("Z:\\req\\tmp", "owner")
     monkeypatch.setattr(wac.os, "name", "nt")
     monkeypatch.setattr(wac, "_request_traversal_anchor", lambda _value: anchor)
     monkeypatch.setattr(wac, "_create_short_helper_temp", _refuse_helper_temp)
@@ -5050,7 +5050,7 @@ def test_helper_temp_plan_measures_a_same_anchor_temp_on_the_drive_spelling(
         filesystem_grants=(),
         working_directory=os.path.join(anchor, "worktree"),
     )
-    rewritten, disposable = wac.bind_validation_helper_temp(request, username="shrek")
+    rewritten, disposable = wac.bind_validation_helper_temp(request, username="owner")
     assert disposable is None
     assert rewritten.environment["TEMP"] == scratch
     assert tuple(rewritten.filesystem_grants) == ()
@@ -5082,7 +5082,7 @@ def test_helper_temp_plan_measures_a_temp_outside_the_workspace_anchor_on_its_re
         working_directory=os.path.join(other, "worktree"),
     )
     with pytest.raises(AppContainerError) as excinfo:
-        wac.bind_validation_helper_temp(request, username="shrek")
+        wac.bind_validation_helper_temp(request, username="owner")
     assert excinfo.value.reason is AppContainerReason.INVALID_REQUEST
     assert "no shorter private temp" in excinfo.value.detail
 
@@ -5110,7 +5110,7 @@ def test_helper_temp_plan_measures_a_prefix_sibling_of_the_anchor_on_its_real_pa
         working_directory=os.path.join(anchor, "worktree"),
     )
     with pytest.raises(AppContainerError) as excinfo:
-        wac.bind_validation_helper_temp(request, username="shrek")
+        wac.bind_validation_helper_temp(request, username="owner")
     assert "no shorter private temp" in excinfo.value.detail
 
 

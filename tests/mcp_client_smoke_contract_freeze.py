@@ -30,8 +30,8 @@ byte-identity proof can never be perturbed by another worker, and it restores
 process env on exit.
 
 Usage:
-    PYTHONPATH=tools/geoai-task-mcp/src AIWORKHUB_REPO=/home/shrek/AIWorkHub \
-    python3 tools/geoai-task-mcp/tests/mcp_client_smoke_contract_freeze.py \
+    PYTHONPATH=tools/aiworkhub/src AIWORKHUB_REPO=/home/owner/AIWorkHub \
+    python3 tools/aiworkhub/tests/mcp_client_smoke_contract_freeze.py \
         [--out result.json]
 """
 

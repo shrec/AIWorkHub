@@ -920,7 +920,7 @@ def test_select_malformed_inputs_fail_closed():
 
 def test_select_receipt_redacts_bodies_secrets_and_host_paths():
     record = _active(
-        procedure_steps=["run /home/secret/tool --token leaked-secret-value"],
+        procedure_steps=["run /home/user/tool --token leaked-secret-value"],
         preferred_tools=["/usr/bin/leaked"],
         avoid_rules=["never print leaked-secret-value"],
     )
@@ -928,7 +928,7 @@ def test_select_receipt_redacts_bodies_secrets_and_host_paths():
     payload = sr.canonical_json(receipt.as_mapping())
     text = str(receipt) + payload
     assert "leaked-secret-value" not in text
-    assert "/home/secret" not in text
+    assert "/home/user" not in text
     assert "procedure" not in payload
     row = receipt.as_mapping()["selected"][0]
     assert set(row) == {"identity", "version", "digest", "reasons"}

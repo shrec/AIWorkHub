@@ -169,10 +169,10 @@ def test_env_is_request_scoped_under_home_and_never_mutates_the_input(
     home = tmp_path / "home"
     declared = {
         "PATH": "x",
-        "DOTNET_CLI_HOME": r"C:\Users\host",
-        "APPDATA": r"C:\Users\host\AppData\Roaming",
-        "LOCALAPPDATA": r"C:\Users\host\AppData\Local",
-        "NUGET_PACKAGES": r"C:\Users\host\.nuget\packages",
+        "DOTNET_CLI_HOME": r"C:\Users\user",
+        "APPDATA": r"C:\Users\user\AppData\Roaming",
+        "LOCALAPPDATA": r"C:\Users\user\AppData\Local",
+        "NUGET_PACKAGES": r"C:\Users\user\.nuget\packages",
     }
     before = dict(declared)
 

@@ -1247,7 +1247,7 @@ def test_opencode_request_config_refuses_paths_the_bubblewrap_mount_cannot_show(
     tmp_path: Path,
 ) -> None:
     workspace, runtime, authority = _opencode_request(
-        tmp_path, "bubblewrap", command="/home/nobody/.venv/bin/python"
+        tmp_path, "bubblewrap", command="/home/user/.venv/bin/python"
     )
     with pytest.raises(runtime_adapters.OpenCodeWorkerConfigError) as excinfo:
         _provision_opencode(workspace, runtime, authority, "bubblewrap")

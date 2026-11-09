@@ -619,7 +619,7 @@ def test_preflight_blocks_when_reconciler_authority_acquisition_failed(
             "standby": False,
             "acquisition_attempts": 230,
             "acquisition_backoff_seconds": 4.0,
-            "last_acquisition_error": "reconciler_lock_unsafe:D:\\Dev\\x\\locks",
+            "last_acquisition_error": "reconciler_lock_unsafe:D:\\work\\x\\locks",
             "durable_status_present": False,
             "durable_scan_stale": True,
         },
@@ -1127,7 +1127,7 @@ def test_global_sandbox_block_never_republishes_selection_host_detail(
     unknown = _preflight_after_selection_refused(
         monkeypatch,
         tmp_path,
-        sandbox_error="future_sandbox_probe_failed:C:\\Users\\shrek\\key.pem",
+        sandbox_error="future_sandbox_probe_failed:C:\\Users\\owner\\key.pem",
         name="unknown",
     )
     assert (
@@ -1177,7 +1177,7 @@ def test_the_publication_guard_scrubs_any_future_unvouched_sandbox_field() -> No
         {
             "native_cli_reason": "bubblewrap_unusable:/usr/bin/bwrap",
             "native_cli_cause": "win32_token_handle_leaked_by_broker",
-            "backend": "C:\\Users\\shrek\\AppData\\bwrap.exe",
+            "backend": "C:\\Users\\owner\\AppData\\bwrap.exe",
             "enforceable": False,
             "route_aware": True,
         }
@@ -1607,7 +1607,7 @@ def test_a_known_selection_family_survives_the_windows_derivation() -> None:
     # Membership still decides. A family this build cannot name carries nothing
     # over, on Windows exactly as anywhere else.
     assert repo_policy._windows_native_sandbox_cause(
-        "", "future_sandbox_probe_failed:C:\\Users\\shrek\\key.pem"
+        "", "future_sandbox_probe_failed:C:\\Users\\owner\\key.pem"
     ) == (
         repo_policy.SANDBOX_CAUSE_UNRECOGNIZED,
         repo_policy.SANDBOX_CAUSE_UNRECOGNIZED,
@@ -1692,7 +1692,7 @@ def test_an_unvouched_identifier_is_emptied_rather_than_given_a_reason_token() -
 
     scrubbed = repo_policy._vouched_sandbox_block(
         {
-            "backend": "C:\\Users\\shrek\\AppData\\bwrap.exe",
+            "backend": "C:\\Users\\owner\\AppData\\bwrap.exe",
             "selected_backend": "invalid_sandbox_backend:s3cret-env-value",
             "native_cli_backend": repo_policy.SANDBOX_BACKEND_BUBBLEWRAP,
             "selected_adapter": "rogue_adapter_from_a_future_build",
