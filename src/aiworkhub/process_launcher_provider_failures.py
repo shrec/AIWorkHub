@@ -610,6 +610,7 @@ _VSCODE_LM_PROVIDER_ERROR_SOURCE = "vscode_lm_extension_response"
 _VSCODE_LM_BALANCE_CODES: frozenset[str] = frozenset({
     "insufficient_balance", "quota_exhausted",
 })
+_VSCODE_LM_CREDENTIAL_CODE = "authentication_failed"
 
 
 def _vscode_lm_balance_failure_from_output(path: Path) -> dict[str, Any] | None:
@@ -667,6 +668,28 @@ def _vscode_lm_balance_failure_from_output(path: Path) -> dict[str, Any] | None:
             or body.get("source") != _VSCODE_LM_PROVIDER_ERROR_SOURCE
         ):
             continue
+        # NF-2026-02143: an expired editor token, sealed by the worker from the
+        # host-owned response field.  The wrapper text is never read for it.
+        if quota_wrapper and body.get("code") == _VSCODE_LM_CREDENTIAL_CODE:
+            return {
+                "schema_id": "aiworkhub.provider_launch_failure.v1",
+                "reason": "provider_refused_credential_rejected_needs_new_credential",
+                "refusal_kind": runtime_adapters.REFUSAL_CREDENTIAL_REJECTED,
+                "recoverable": False,
+                "http_status": 401,
+                "error_code": _VSCODE_LM_CREDENTIAL_CODE,
+                "session_id": "",
+                "provider_error": {
+                    "schema_id": "aiworkhub.provider_route_error.v1",
+                    "owner": "provider",
+                    "sealed": True,
+                    "source": _VSCODE_LM_PROVIDER_ERROR_SOURCE,
+                    "code": _VSCODE_LM_CREDENTIAL_CODE,
+                    # No http_status: the host sends none, and a sealed status
+                    # stops failure_disposition_from_substatus before the code.
+                    "detail": str(body.get("detail") or "")[:300],
+                },
+            }
         code = str(body.get("code") or "").strip().lower()
         if code not in _VSCODE_LM_BALANCE_CODES:
             continue
@@ -729,6 +752,19 @@ def _vscode_lm_balance_failure_from_output(path: Path) -> dict[str, Any] | None:
             "provider_error": sealed,
         }
     return None
+
+
+def _editor_hosted_route_failure_from_output(
+    adapter_id: str, path: Path
+) -> dict[str, Any] | None:
+    """Read the sealed route refusal of any editor-hosted VS Code LM adapter."""
+
+    if (
+        runtime_adapters.route_family(adapter_id)
+        != runtime_adapters.ROUTE_FAMILY_EDITOR_VSCODE_LM
+    ):
+        return None
+    return _vscode_lm_balance_failure_from_output(path)
 
 
 def _receipt_text_candidates(raw_line: str) -> list[str]:

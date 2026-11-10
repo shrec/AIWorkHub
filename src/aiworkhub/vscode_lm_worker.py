@@ -184,6 +184,35 @@ def provider_quota_error(response_error: Any) -> dict[str, Any] | None:
     return sealed
 
 
+# NF-2026-02143: the host's own sentence for an expired or wrong editor token.
+_CREDENTIAL_REJECTED_RE = re.compile(r"token expired or incorrect", re.IGNORECASE)
+
+
+def provider_credential_error(response_error: Any) -> dict[str, Any] | None:
+    """Return the structured provider error for a rejected token, or None.
+
+    ``response_error`` must be the extension host's own ``response["error"]``
+    value, and the whole field must be the provider sentence: the same
+    anchoring contract as ``provider_balance_error``.
+    """
+
+    if not isinstance(response_error, str):
+        return None
+    text = response_error.strip()
+    if _CREDENTIAL_REJECTED_RE.fullmatch(text) is None:
+        return None
+    return {
+        "schema_id": PROVIDER_ROUTE_ERROR_SCHEMA_ID,
+        "owner": "provider",
+        "sealed": True,
+        "source": PROVIDER_ERROR_SOURCE,
+        "code": "authentication_failed",
+        # No http_status: the host sends none, and a sealed status stops
+        # failure_disposition_from_substatus before it reads the code.
+        "detail": text[:300],
+    }
+
+
 def _load_json(path: Path, *, max_bytes: int = 16 * 1024 * 1024) -> dict[str, Any]:
     if path.is_symlink() or not path.is_file() or path.stat().st_size > max_bytes:
         raise RuntimeError("bridge_document_invalid")
@@ -1619,6 +1648,11 @@ def run(spec_path: Path) -> dict[str, Any]:
         if quota_error is not None:
             raise VscodeLmProviderRefusal(
                 quota_error, f"vscode_lm_request_failed:{response.get('error')}"
+            )
+        credential_error = provider_credential_error(response.get("error"))
+        if credential_error is not None:
+            raise VscodeLmProviderRefusal(
+                credential_error, f"vscode_lm_request_failed:{response.get('error')}"
             )
         diagnostics = response.get("diagnostics")
         detail = ""

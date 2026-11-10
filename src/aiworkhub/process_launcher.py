@@ -167,6 +167,7 @@ from .process_launcher_provider_failures import (
     _VSCODE_LM_PROVIDER_ERROR_SOURCE as _VSCODE_LM_PROVIDER_ERROR_SOURCE,
     _bounded_response_body_machine_code as _bounded_response_body_machine_code,
     _coordinator_bound_context_ack,
+    _editor_hosted_route_failure_from_output,
     _is_bounded_machine_code as _is_bounded_machine_code,
     _opencode_provider_refusal_from_event as _opencode_provider_refusal_from_event,
     _project_context_receipt_from_output,
@@ -174,7 +175,7 @@ from .process_launcher_provider_failures import (
     _provider_model_rejection_from_output,
     _provider_timeout_failure_from_output as _provider_timeout_failure_from_output,
     _read_byte_range,
-    _vscode_lm_balance_failure_from_output,
+    _vscode_lm_balance_failure_from_output as _vscode_lm_balance_failure_from_output,
 )
 from .process_launcher_read_efficiency import (
     _provider_read_efficiency_from_output,
@@ -10953,10 +10954,9 @@ class ProcessManager:
             provider_route_failure = None
             if terminal_state == "worker_failed":
                 provider_output_path = Path(str(metadata["stdout_path"]))
-                if str(metadata.get("adapter_id") or "") == "vscode_lm":
-                    provider_route_failure = _vscode_lm_balance_failure_from_output(
-                        provider_output_path
-                    )
+                provider_route_failure = _editor_hosted_route_failure_from_output(
+                    str(metadata.get("adapter_id") or ""), provider_output_path
+                )
                 if provider_route_failure is not None:
                     error = str(provider_route_failure["reason"])
                     reason = terminal_failure_classification.recognised_reason(error)
