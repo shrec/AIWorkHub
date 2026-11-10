@@ -24,15 +24,15 @@ MCP stdio runtime on the workspace host. It does not open a browser or require
 an AIWorkHub cloud account, and it binds no port and exposes no LAN service
 unless you start the opt-in WorkHub Mail listener on a host and port you name.
 
-## What's new in 0.12.95
+## What's new in 0.12.96
 
-- Manager Chat: rows no longer shift while a turn streams, tool runs are grouped with readable titles, thinking starts collapsed, assistant text uses the full width, queued sends are visible, and Stop sits in the composer.
-- A manager turn stops on stalled output instead of a fixed hour, and a turn that died on a login or usage limit no longer rotates the session.
-- Source Graph compacts its staged copy when at least a quarter of its pages are free and no longer indexes scratch overlays. The janitor reclaims the base pins of blocked cards and finished manager overlays.
-- Accept reuses the recorded full-snapshot validation when HEAD moved only outside its closure, and the neighbour lane pins the MCP schema-freeze gates when a candidate changes an MCP tool surface.
-- A reject after a failed accept is classified from the failure's evidence, and a plain-file base-drift conflict on relaunch gets a worker resolution path.
-- Launch skips a `vscode_lm` adapter that already failed the card. Toolchain refusals name the token and the `toolchains.json` remedy.
-- An MCP tool refusal names every missing required argument and the accepted names in one message. `needfix_show` and the NeedFix transition tool take a bounded list of ids.
+- Worker Live Output is a chat for Claude, Codex and OpenCode workers, built from the manager console's rows: assistant text, grouped tool calls, commands, file diffs and a usage footer. A valid provider event never shows as "Unparsed provider line".
+- The dashboard recovers by itself after an extension-host stall: late timers no longer reject answers already in the pipe, dead requests leave the write queue, and the storage scan runs off the host thread.
+- Manager Chat Stop reliably ends the turn and shows a Stopping state; paste works from anywhere in the chat.
+- An infrastructure reject replays the retained candidate with no model run, a rework reject can relaunch in the same call, and accept validates outside the promotion lock.
+- Every required reviewer lens launches or says why it did not, an expired credential fails over to another adapter, and a `vscode_lm` worker that is making progress is no longer killed in staging.
+- One read-only manager tool explains what happened to a request. Test impact records which tests run which lines and selects tests by the changed lines.
+- The release cut reruns failed nodes once before it stops and ends its whole process tree when stopped. Tracked files carry no host paths or logins, and a guard keeps them out.
 
 ## Review automation
 

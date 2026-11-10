@@ -6,6 +6,33 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.96] - 2026-11-10
+
+### Changed
+
+- Worker Live Output renders as a chat for Claude, Codex and OpenCode workers: the webview translates provider lines with a port of the manager loop translator and renders them with the manager console's row builders, oldest first, under a runner/model label; a line no translator knows keeps its compact timeline row (NF-2026-02222). A valid provider event never renders as "Unparsed provider line", and host-path redaction no longer corrupts JSON (NF-2026-02221).
+- One read-only manager tool answers what happened to a request, without ad-hoc log reading (NF-2026-02176).
+- An infrastructure reject replays the retained candidate automatically, with no model run (NF-2026-02189), and `aiworkhub_task_reject_review` with `relaunch=true` launches the rework retry in the same call (NF-2026-02167).
+- Accept validates outside the promotion lock against a pinned canonical HEAD (NF-2026-02026).
+- Every required reviewer lens launches or names why it did not, and an expired credential fails over to another adapter (NF-2026-02107). A VS Code LM credential refusal is sealed and read on every editor-hosted adapter, so an expired token takes the route out of ranking (NF-2026-02143).
+- Workers get their skills back: a long step no longer drops the only clean skill, and the negative-evidence gate matches the measured accept rate (NF-2026-02177).
+- Test impact: a stdlib per-test execution recorder (pytest plugin) and a changed-lines test selector (NF-2026-02054). Launch preflight shares the import-closure memos across the validation rows of one launch (NF-2026-00630).
+- SDLC phases are measurable: accept evidence records its start, and host validation slot wait counts as validation instead of `finalize_other` (NF-2026-02214, NF-2026-02215).
+- The NeedFix chain closes declared records with the accepted card and only reports a named-only one (NF-2026-02204); blocked and failed-archived cards no longer hide the problem, and old blocked cards leave the queue (NF-2026-02200).
+- `scripts/release_cut.py` reruns the failed nodes alone, once, before a test failure stops the cut (NF-2026-02196), and a stopped cut ends the whole process tree it started (NF-2026-02208).
+- Tracked code, `eval/` and `data/` carry no local host paths, logins or other project names, and a guard keeps them out (NF-2026-02033, NF-2026-01061).
+
+### Fixed
+
+- The dashboard recovers by itself after an extension-host stall: MCP request timeouts tolerate timer lag, dead request frames leave the serialized write queue, the runtime retention scan runs off the host thread, and a probe traces host event-loop stalls (NF-2026-02223).
+- Manager Chat Stop reliably ends the turn, with no lost stop before spawn or during bind and no handoff after a stop (NF-2026-02197); the composer shows Stop with a Stopping state, and paste works from anywhere in the chat (NF-2026-02198).
+- A `vscode_lm` worker that is making progress is no longer killed in forced staging (NF-2026-02217), and VS Code LM validation runs under the host OS sandbox instead of in the editor-host process (NF-2026-00410).
+- A reviewer report over 16 KiB lands in the audit ledger, and a truly oversized one asks for a shorter report (NF-2026-02218).
+- A non-pytest validation failure counts as pre-existing when its normalized tail equals the base run's (NF-2026-02207). A multi-file `node --test` row runs one process per file in the AppContainer lane (NF-2026-02206).
+- Validation-only replay refuses a base-drift conflict instead of losing the candidate (NF-2026-02210), and `recover_blocked_rework` lets `allowed_writes_amendment` widen scope on a card with a retained terminal candidate (NF-2026-02209).
+- The finalization neighbour base check runs for a metadata card without `allowed_writes` (NF-2026-02213); two stale test fixtures follow the code they check (NF-2026-02212, NF-2026-02216).
+- The test-impact recorder detects Windows through the platform boundary, and the Live Output and validation-replay tests follow the chat order and the validation sandbox (NF-2026-02224, NF-2026-02225); the host-path guard scans the files on disk when `git ls-files` answers empty from an extracted archive (NF-2026-02228).
+
 ## [0.12.95] - 2026-11-09
 
 ### Changed

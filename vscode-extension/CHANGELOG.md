@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.12.96 — 2026-11-10
+
+### Fixed
+
+- Bundles runtime 0.12.96: worker Live Output renders as a chat for Claude, Codex and OpenCode workers, and a valid provider event never shows as "Unparsed provider line".
+- The dashboard recovers by itself after an extension-host stall, Manager Chat Stop reliably ends the turn, and an infrastructure reject replays the retained candidate with no model run.
+
 ## 0.12.95 — 2026-11-09
 
 ### Fixed
