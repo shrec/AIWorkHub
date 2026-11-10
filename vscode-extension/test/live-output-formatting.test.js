@@ -91,6 +91,13 @@ class FakeDocument {
     return new FakeElement(tagName);
   }
 
+  // The chat's row builders write model and tool text as text nodes.
+  createTextNode(text) {
+    const node = new FakeElement("#text");
+    node.textContent = text;
+    return node;
+  }
+
   createDocumentFragment() {
     const fragment = new FakeElement("#fragment");
     fragment.__fragment = true;
@@ -219,10 +226,11 @@ function lines(...events) {
     { type: "result", result: "done", duration_ms: 10, usage: { input_tokens: 1, output_tokens: 2 } },
   ));
   const rendered = document.querySelector("#detail-live-output-container").textContent;
-  assert(rendered.includes("item started"));
+  // NF-2026-02222: the command is a chat command row; the unrecognised result keeps its compact row.
+  assert(rendered.includes("echo hi"));
   assert(rendered.includes("Raw event"));
   assert(rendered.includes("done"));
-  assert(rendered.indexOf("done") < rendered.indexOf("echo hi"), "newest event renders first");
+  assert(rendered.indexOf("echo hi") < rendered.indexOf("done"), "chronological: the oldest event renders first");
 }
 
 {
@@ -234,7 +242,8 @@ function lines(...events) {
   ) + "\n");
   const rendered = document.querySelector("#detail-live-output-container").textContent;
   assert(rendered.includes("echo first"));
-  assert(rendered.includes("completed"));
+  // NF-2026-02222: the completed item reported no exit code, so its command chip says failed.
+  assert(rendered.includes("failed"));
 }
 
 {
@@ -303,8 +312,8 @@ function lines(...events) {
   assert(rendered.includes("verdict: pass"));
   assert(!rendered.includes("SECRET_SIG_PAYLOAD"), "signature payload absent from the formatted feed");
   assert(!rendered.includes("Unrecognized event"));
-  // Newest-first: the later "result" row still renders above the earlier text row.
-  assert(rendered.indexOf("verdict: pass") < rendered.indexOf("thinking out loud"), "newest event renders first");
+  // NF-2026-02222: chronological chat, the earlier streamed text above the later result.
+  assert(rendered.indexOf("thinking out loud") < rendered.indexOf("verdict: pass"), "oldest event renders first");
 }
 
 {

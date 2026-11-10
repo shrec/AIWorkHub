@@ -244,3 +244,8 @@ h6.mc-h { color: var(--ink-soft); }
 .mc-table th, .mc-table td { padding: 2px 6px; border: 1px solid var(--line); text-align: left; vertical-align: top; overflow-wrap: normal; }
 /* The wrapper scrolls, so a cell keeps its natural width rather than breaking inside every word. */
 .mc-table .mc-mono, .mc-table .mc-link { overflow-wrap: normal; }
+/* Worker Live Output as a chat (NF-2026-02222): the task detail panel reuses these blocks. The
+   container scrolls on its own so a new row follows the bottom only when the reader is already there. */
+#detail-live-output-container { max-height: 70vh; overflow-y: auto; overscroll-behavior: contain; }
+.manager-chat-bubble-label.worker-chat-label { display: block; margin-bottom: 2px; color: var(--ink-soft); font-size: var(--fs-2xs); overflow-wrap: anywhere; }
+.mc-timeline-row > .live-output-row { flex: 1 1 auto; min-width: 0; }

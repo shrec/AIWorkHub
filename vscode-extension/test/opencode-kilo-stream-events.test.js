@@ -44,6 +44,8 @@ class FakeElement {
 class FakeDocument {
   constructor() { this.elements = new Map(); }
   createElement(tagName) { return new FakeElement(tagName); }
+  // The chat's row builders (NF-2026-02222) write model and tool text as text nodes.
+  createTextNode(text) { const node = new FakeElement("#text"); node.textContent = text; return node; }
   createDocumentFragment() {
     const fragment = new FakeElement("#fragment");
     fragment.__fragment = true;
@@ -165,8 +167,9 @@ const lines = (...events) => events.map((event) => JSON.stringify(event)).join("
     { type: "tool_use", part: { type: "tool", tool: "grep", state: { status: "completed", input: { pattern: "TODO" }, output: "3 matches" } } },
   ));
   const rendered = document.querySelector("#detail-live-output-container").textContent;
-  assert(rendered.includes("Tool | grep"));
-  assert(rendered.includes("Tool input"));
+  // NF-2026-02222: chat tool rows named by their tool, with input and output sections.
+  assert(rendered.includes("grep"));
+  assert(rendered.includes("input") && rendered.includes("TODO"));
   assert(rendered.includes("3 matches"));
 }
 

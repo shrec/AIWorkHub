@@ -26,25 +26,30 @@ function managerConsoleHighestTerminalSeq(events) {
   return highest;
 }
 
-// A call with no result is live only while no terminal event follows it in the log.
-function managerConsoleUnfinishedStatus(event) {
-  return numberValue(event && event.seq) < managerConsoleTerminalSeq ? "interrupted" : "running";
+// A call with no result is live only while no terminal event follows it in the log. `chat` is the
+// worker chat's own state (renderWorkerChatEvents); without it the manager console's state applies.
+function managerConsoleUnfinishedStatus(event, chat = null) {
+  const terminalSeq = chat ? chat.terminalSeq : managerConsoleTerminalSeq;
+  return numberValue(event && event.seq) < terminalSeq ? "interrupted" : "running";
 }
 
-function managerConsoleToolStatus(payload, event) {
-  if (!("output" in payload || "is_error" in payload)) return managerConsoleUnfinishedStatus(event);
+function managerConsoleToolStatus(payload, event, chat = null) {
+  if (!("output" in payload || "is_error" in payload)) return managerConsoleUnfinishedStatus(event, chat);
   return payload.is_error ? "failed" : "done";
 }
 
-function managerChatEventNode(event) {
+function managerChatEventNode(event, chat = null) {
   const type = String((event && event.type) || "");
   if (!MANAGER_CONSOLE_ROW_TYPES.has(type)) return null;
   const payload = managerConsolePayload(event);
-  if (type === "command") return managerConsoleCommandNode(payload, event);
+  if (type === "command") return managerConsoleCommandNode(payload, event, chat);
   if (type === "file_change") return managerConsoleFileChangeNode(payload);
+  if (type === "timeline_row") return managerConsoleTimelineRowNode(payload);
   if (type === "assistant_text" || type === "user_message") {
     const bubble = createElement("div", `manager-chat-bubble role-${type === "user_message" ? "user" : "assistant"}`);
-    bubble.appendChild(createElement("span", "manager-chat-bubble-label sr-only", type === "user_message" ? "You" : "Manager"));
+    // The worker chat names its runner/model visibly; the manager console's label is for screen readers.
+    const speaker = type === "user_message" ? "You" : chat ? chat.assistantLabel : "Manager";
+    bubble.appendChild(createElement("span", chat ? "manager-chat-bubble-label worker-chat-label" : "manager-chat-bubble-label sr-only", speaker));
     const clock = managerChatClockText(event);
     if (clock) bubble.appendChild(createElement("span", "mc-time", clock));
     bubble.appendChild(type === "assistant_text" ? managerConsoleMarkdown(payload.text) : document.createTextNode(String(payload.text || "")));
@@ -58,7 +63,7 @@ function managerChatEventNode(event) {
   if (type === "tool_call") {
     const name = String(payload.name || payload.tool || "tool");
     const hint = managerChatToolHint(payload);
-    const status = managerConsoleToolStatus(payload, event);
+    const status = managerConsoleToolStatus(payload, event, chat);
     const hasResult = status === "done" || status === "failed";
     const row = createElement("details", "manager-chat-tool-row is-" + status);
     row.open = false;
@@ -126,9 +131,10 @@ function managerChatEventNode(event) {
   }
   if (type === "reasoning") {
     const row = createElement("details", "manager-chat-thinking-block");
-    const label = managerChatThoughtSummary(event);
+    // A worker's reasoning arrives whole in its log, so it carries no live thinking timer.
+    const label = chat ? "Reasoning" : managerChatThoughtSummary(event);
     const summary = createElement("summary", "", label);
-    if (managerConsoleActiveIndex && label.startsWith(MANAGER_CONSOLE_LIVE_THOUGHT_PREFIX)) managerConsoleLiveSummaries.push({ summary, event });
+    if (!chat && managerConsoleActiveIndex && label.startsWith(MANAGER_CONSOLE_LIVE_THOUGHT_PREFIX)) managerConsoleLiveSummaries.push({ summary, event });
     row.appendChild(summary);
     const body = createElement("div", "manager-chat-tool-row-body");
     body.appendChild(document.createTextNode(String(payload.text || "")));
@@ -136,9 +142,42 @@ function managerChatEventNode(event) {
     return managerConsoleBlock(type, row);
   }
   if (type === "turn_end") {
-    return managerConsoleBlock("turn_end", createElement("div", "mc-footer", managerConsoleFooterText(event)));
+    return managerConsoleBlock("turn_end", createElement("div", "mc-footer", managerConsoleFooterText(event, chat)));
   }
   return null;
+}
+
+function managerConsoleTimelineSection(parent, title, content) {
+  if (content === undefined || content === null || content === "") return;
+  const section = createElement("section", "live-output-section");
+  section.appendChild(createElement("h4", "", title));
+  section.appendChild(createElement("div", "live-output-section-body", String(content)));
+  parent.appendChild(section);
+}
+
+// The compact row the old Live Output timeline built for one line (timelineEventFromObject or the
+// raw-text branch), kept for a provider line no chat translator recognises. Every field is text.
+function managerConsoleTimelineRowNode(row) {
+  const kind = String(row.kind || "event").replace(/[^\w-]/g, "");
+  const card = createElement("div", `mc-body live-output-row is-${kind}`);
+  const head = createElement("div", "live-output-row-head");
+  head.appendChild(createElement("strong", "live-output-row-title", String(row.title || "")));
+  head.appendChild(createElement("span", "live-output-row-state", String(row.state || "")));
+  card.appendChild(head);
+  if (row.label) card.appendChild(createElement("div", "live-output-row-label", String(row.label)));
+  card.appendChild(createElement("div", "live-output-row-message", String(row.message || "No message")));
+  const metrics = Array.isArray(row.metrics) ? row.metrics : [];
+  if (metrics.length) card.appendChild(createElement("div", "live-output-row-meta", metrics.join(" | ")));
+  managerConsoleTimelineSection(card, "Tool input (recognized credentials redacted)", row.activityInput);
+  managerConsoleTimelineSection(card, "Tool result (recognized credentials redacted)", row.activityOutput);
+  if (row.raw) {
+    const raw = createElement("details", "live-output-row-raw");
+    raw.open = false;
+    raw.appendChild(createElement("summary", "", "Raw event"));
+    raw.appendChild(createElement("pre", "", String(row.raw)));
+    card.appendChild(raw);
+  }
+  return managerConsoleBlock("timeline_row", card);
 }
 
 // A session_start that names a predecessor or carries a handoff is a continuation, not a fresh start.
@@ -269,11 +308,14 @@ function managerChatThinkingKey() {
 const MANAGER_CONSOLE_GLYPHS = Object.freeze({
   user_message: "›", assistant_text: "●", reasoning: "∴", command: "$", file_change: "±",
   tool_call: "⚙", tool_result: "⚙", task: "▣", callback: "↯", goal: "◎", error: "!", turn_stopped: "■",
+  timeline_row: "·",
 });
 // Every event type that renders a row; managerChatEventNode returns null for anything else.
+// timeline_row is the worker chat's compact row for a provider line no translator recognises.
 const MANAGER_CONSOLE_ROW_TYPES = new Set([
   "command", "file_change", "assistant_text", "user_message", "tool_call", "tool_result", "callback", "error",
   "session_start", "handoff_request", "session_close", "turn_stopped", "queue_dropped", "reasoning", "turn_end",
+  "timeline_row",
 ]);
 const MANAGER_CONSOLE_ACTIVITY_TYPES = new Set(["tool_call", "tool_result", "command", "file_change", "reasoning"]);
 // Every event type after which nothing earlier in the log can still be running.
@@ -357,14 +399,14 @@ function managerConsoleMergeTools(events) {
   return merged;
 }
 
-function managerConsoleCommandStatus(payload, event) {
-  if (payload.status === "running") return managerConsoleUnfinishedStatus(event);
+function managerConsoleCommandStatus(payload, event, chat = null) {
+  if (payload.status === "running") return managerConsoleUnfinishedStatus(event, chat);
   const code = Number.isInteger(payload.exit_code) ? payload.exit_code : null;
   return payload.status === "failed" || (code !== null && code !== 0) ? "failed" : "done";
 }
 
-function managerConsoleCommandChip(payload, event) {
-  const status = managerConsoleCommandStatus(payload, event);
+function managerConsoleCommandChip(payload, event, chat = null) {
+  const status = managerConsoleCommandStatus(payload, event, chat);
   if (status === "running" || status === "interrupted") return createElement("span", "mc-chip is-" + status, status);
   const code = Number.isInteger(payload.exit_code) ? payload.exit_code : null;
   const failed = status === "failed";
@@ -372,11 +414,11 @@ function managerConsoleCommandChip(payload, event) {
   return createElement("span", failed ? "mc-chip is-failed" : "mc-chip is-ok", label);
 }
 
-function managerConsoleCommandNode(payload, event) {
+function managerConsoleCommandNode(payload, event, chat = null) {
   const body = createElement("div", "mc-body");
   const head = createElement("div", "mc-head");
   head.appendChild(createElement("code", "mc-mono", String(payload.command || "")));
-  head.appendChild(managerConsoleCommandChip(payload, event));
+  head.appendChild(managerConsoleCommandChip(payload, event, chat));
   body.appendChild(head);
   const lines = String(payload.output_tail || "").split("\n");
   if (payload.output_tail) {
@@ -524,9 +566,10 @@ function managerConsoleCurrentIndex() {
   return managerConsoleActiveIndex || managerConsoleBuildIndex(Array.isArray(state.managerChatEvents) ? state.managerChatEvents : []);
 }
 
-function managerConsoleFooterText(event) {
+function managerConsoleFooterText(event, chat = null) {
   const turn = event && event.turn;
-  const info = Number.isInteger(turn) ? managerConsoleCurrentIndex().turns.get(turn) : null;
+  const index = chat ? chat.index : managerConsoleCurrentIndex();
+  const info = Number.isInteger(turn) ? index.turns.get(turn) : null;
   const tools = info ? info.tools.size : 0;
   const parts = [Number.isInteger(turn) ? `turn ${turn}` : "turn", `${tools} tool${tools === 1 ? "" : "s"}`];
   const usage = managerConsoleUsage(event && event.payload && event.payload.usage);
@@ -710,31 +753,33 @@ function managerConsoleRowKeys(merged) {
 }
 
 // Computed without DOM, and while the index is active: footers and reasoning labels read it.
-function managerConsoleRowSignature(event) {
+// `chat` (the worker chat's own state, see renderWorkerChatEvents) replaces every manager-only read.
+function managerConsoleRowSignature(event, chat = null) {
   const type = String(event.type);
   const payload = managerConsolePayload(event);
-  if (type === "turn_end") return JSON.stringify([type, managerConsoleFooterText(event)]);
+  if (type === "turn_end") return JSON.stringify([type, managerConsoleFooterText(event, chat)]);
   if (type === "reasoning") {
+    if (chat) return JSON.stringify([type, String(payload.text || "")]);
     // A live label's duration is ticked in place; only its change to "Thought for" rebuilds the row.
     const label = managerChatThoughtSummary(event);
     return JSON.stringify([type, label.startsWith(MANAGER_CONSOLE_LIVE_THOUGHT_PREFIX) ? MANAGER_CONSOLE_LIVE_THOUGHT_PREFIX : label, String(payload.text || "")]);
   }
   if (type === "command") {
-    return JSON.stringify([type, managerConsoleCommandStatus(payload, event), payload.command, payload.status, payload.exit_code, payload.output_tail, payload.truncated, payload.original_bytes]);
+    return JSON.stringify([type, managerConsoleCommandStatus(payload, event, chat), payload.command, payload.status, payload.exit_code, payload.output_tail, payload.truncated, payload.original_bytes]);
   }
   // The status is explicit because a result can add only undefined keys, which JSON drops,
   // and because a terminal event changes it without touching the payload.
-  if (type === "tool_call") return JSON.stringify([type, managerConsoleToolStatus(payload, event), payload]);
+  if (type === "tool_call") return JSON.stringify([type, managerConsoleToolStatus(payload, event, chat), payload]);
   const clock = type === "assistant_text" || type === "user_message" ? managerChatClockText(event) : "";
   return JSON.stringify([type, clock, payload]);
 }
 
-function managerConsoleEventRows(merged, visible) {
+function managerConsoleEventRows(merged, visible, chat = null) {
   const keys = managerConsoleRowKeys(merged);
   const rows = [];
   const pushRow = (event) => {
     if (!MANAGER_CONSOLE_ROW_TYPES.has(String((event && event.type) || ""))) return;
-    rows.push({ key: keys.get(event), signature: managerConsoleRowSignature(event), event, build: () => managerChatEventNode(event) });
+    rows.push({ key: keys.get(event), signature: managerConsoleRowSignature(event, chat), event, build: () => managerChatEventNode(event, chat) });
   };
   let lastTurnEndTurn = null;
   const pending = [];
@@ -771,8 +816,8 @@ function managerConsoleEventRows(merged, visible) {
       const previousPayload = managerConsolePayload(previousRow.event);
       const repeated = { ...previousRow.event, payload: { ...previousPayload, repeat_count: (previousPayload.repeat_count || 1) + 1 } };
       previousRow.event = repeated;
-      previousRow.signature = managerConsoleRowSignature(repeated);
-      previousRow.build = () => managerChatEventNode(repeated);
+      previousRow.signature = managerConsoleRowSignature(repeated, chat);
+      previousRow.build = () => managerChatEventNode(repeated, chat);
       continue;
     }
     pushRow(event);
@@ -785,7 +830,7 @@ function managerConsoleCountLabel(count, noun) {
   return `${count} ${noun}${count === 1 ? "" : "s"}`;
 }
 
-function managerConsoleActivitySummary(members) {
+function managerConsoleActivitySummary(members, chat = null) {
   let tools = 0;
   let commands = 0;
   let files = 0;
@@ -796,13 +841,13 @@ function managerConsoleActivitySummary(members) {
     const payload = managerConsolePayload(event);
     if (event.type === "tool_call" || event.type === "tool_result") {
       tools += 1;
-      const status = event.type === "tool_call" ? managerConsoleToolStatus(payload, event) : payload.is_error ? "failed" : "done";
+      const status = event.type === "tool_call" ? managerConsoleToolStatus(payload, event, chat) : payload.is_error ? "failed" : "done";
       if (status === "failed") failed += 1;
       if (status === "interrupted") interrupted += 1;
       if (status === "running") running = String(payload.name || payload.tool || "tool");
     } else if (event.type === "command") {
       commands += 1;
-      const status = managerConsoleCommandStatus(payload, event);
+      const status = managerConsoleCommandStatus(payload, event, chat);
       if (status === "failed") failed += 1;
       if (status === "interrupted") interrupted += 1;
       if (status === "running") running = limitText(String(payload.command || "command"), 60);
@@ -820,8 +865,8 @@ function managerConsoleActivitySummary(members) {
   return { text: parts.join(" · "), failed: failed > 0 };
 }
 
-function managerConsoleGroupRow(members) {
-  const summary = managerConsoleActivitySummary(members);
+function managerConsoleGroupRow(members, chat = null) {
+  const summary = managerConsoleActivitySummary(members, chat);
   const className = summary.failed ? "mc-activity-group has-failed" : "mc-activity-group";
   return {
     // Namespaced so a plain row and the group that grew out of it are never "the same row".
@@ -840,11 +885,11 @@ function managerConsoleGroupRow(members) {
   };
 }
 
-function managerConsoleGroupRuns(rows) {
+function managerConsoleGroupRuns(rows, chat = null) {
   const grouped = [];
   let run = [];
   const flushRun = () => {
-    if (run.filter((row) => row.event.type !== "reasoning").length >= 2) grouped.push(managerConsoleGroupRow(run));
+    if (run.filter((row) => row.event.type !== "reasoning").length >= 2) grouped.push(managerConsoleGroupRow(run, chat));
     else grouped.push(...run);
     run = [];
   };
@@ -1270,6 +1315,11 @@ function managerConsolePartialIsCurrent(partial) {
 
 function managerConsolePartialRows(partial) {
   if (!managerConsolePartialIsCurrent(partial)) return [];
+  return managerConsoleStreamingRows(partial);
+}
+
+// The streamed-but-unsettled text and reasoning rows; shared by the manager console and the worker chat.
+function managerConsoleStreamingRows(partial) {
   const rows = [];
   if (partial.reasoning) {
     rows.push({
@@ -1341,4 +1391,826 @@ function managerConsoleReset() {
   if (elements.managerChatAnnouncer) elements.managerChatAnnouncer.textContent = "";
   if (elements.managerChatLatest) elements.managerChatLatest.hidden = true;
   if (elements.managerChatTranscript) elements.managerChatTranscript.scrollTop = elements.managerChatTranscript.scrollHeight;
+}
+
+// ── Worker Live Output as a chat (NF-2026-02222) ──────────────────────────────
+// A port of aiworkhub.manager_loop_backends.translate/flush (claude_cli, codex_cli, opencode_cli),
+// behaviour-identical to the Python and checked against tests/fixtures/manager_streams by
+// live-output-chat-view-nf02222.test.js. Pure: it reads no DOM and no module state. The py*
+// helpers spell out the Python semantics the port depends on (truthiness, str(), strip()).
+
+const LIVE_OUTPUT_OUTPUT_TAIL_BYTES = 8 * 1024;
+const LIVE_OUTPUT_MAX_ERROR_DETAIL_CHARS = 500;
+const LIVE_OUTPUT_CLAUDE_COMMAND_TOOLS = new Set(["Bash"]);
+const LIVE_OUTPUT_CLAUDE_EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write"]);
+const LIVE_OUTPUT_CODEX_TOOL_ITEMS = new Set(["command_execution", "mcp_tool_call", "file_change", "web_search"]);
+// str.strip() whitespace and str.splitlines() boundaries, as code points.
+const LIVE_OUTPUT_PY_SPACE = new Set([
+  9, 10, 11, 12, 13, 28, 29, 30, 31, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199,
+  8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288,
+]);
+const LIVE_OUTPUT_PY_LINE_BREAKS = new Set([10, 11, 12, 13, 28, 29, 30, 133, 8232, 8233]);
+
+function liveOutputIsMapping(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function liveOutputMapping(value) {
+  return liveOutputIsMapping(value) ? value : {};
+}
+
+function liveOutputHas(mapping, key) {
+  return Object.prototype.hasOwnProperty.call(mapping, key);
+}
+
+// mapping.get(key): None (null) when the key is absent.
+function liveOutputGet(mapping, key) {
+  return liveOutputHas(mapping, key) && mapping[key] !== undefined ? mapping[key] : null;
+}
+
+function liveOutputPyTruthy(value) {
+  if (value === null || value === undefined || value === false || value === 0 || value === "") return false;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "object") return Object.keys(value).length > 0;
+  return true;
+}
+
+// Python `a or b or c`: the first truthy value, else the last one.
+function liveOutputPyOr(...values) {
+  for (const value of values) {
+    if (liveOutputPyTruthy(value)) return value;
+  }
+  const last = values[values.length - 1];
+  return last === undefined ? null : last;
+}
+
+// json.dumps(value) with its default separators and ensure_ascii.
+function liveOutputPyJson(value) {
+  if (value === null || value === undefined) return "null";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") return Number.isFinite(value) ? String(value) : Number.isNaN(value) ? "NaN" : value > 0 ? "Infinity" : "-Infinity";
+  if (typeof value === "string") {
+    return JSON.stringify(value).replace(/[^\x00-\x7f]/g, (char) => "\\u" + char.charCodeAt(0).toString(16).padStart(4, "0"));
+  }
+  if (Array.isArray(value)) return "[" + value.map(liveOutputPyJson).join(", ") + "]";
+  return "{" + Object.keys(value).map((key) => liveOutputPyJson(key) + ": " + liveOutputPyJson(value[key])).join(", ") + "}";
+}
+
+function liveOutputPyStr(value) {
+  if (value === null || value === undefined) return "None";
+  if (typeof value === "string") return value;
+  if (typeof value === "boolean") return value ? "True" : "False";
+  if (typeof value === "number") return String(value);
+  return liveOutputPyJson(value);
+}
+
+function liveOutputPyStrip(value) {
+  const text = String(value);
+  let start = 0;
+  let end = text.length;
+  while (start < end && LIVE_OUTPUT_PY_SPACE.has(text.charCodeAt(start))) start += 1;
+  while (end > start && LIVE_OUTPUT_PY_SPACE.has(text.charCodeAt(end - 1))) end -= 1;
+  return text.slice(start, end);
+}
+
+// str.splitlines(): every Python line boundary, "\r\n" as one, no trailing empty line.
+function liveOutputPySplitLines(value) {
+  const text = String(value || "");
+  const lines = [];
+  let start = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (!LIVE_OUTPUT_PY_LINE_BREAKS.has(code)) continue;
+    lines.push(text.slice(start, index));
+    if (code === 13 && text.charCodeAt(index + 1) === 10) index += 1;
+    start = index + 1;
+  }
+  if (start < text.length) lines.push(text.slice(start));
+  return lines;
+}
+
+function liveOutputPyInt(value) {
+  return Number.isInteger(value) || typeof value === "boolean";
+}
+
+function liveOutputUtf8(text) {
+  return new TextEncoder().encode(String(text));
+}
+
+// manager_loop.keep_tail: the last `limit` UTF-8 bytes; a cut leading character is dropped.
+function liveOutputKeepTail(text, limit) {
+  const data = liveOutputUtf8(text);
+  if (data.length <= limit) return String(text);
+  let tail = data.slice(data.length - limit);
+  let skip = 0;
+  while (skip < tail.length && (tail[skip] & 0xc0) === 0x80) skip += 1;
+  tail = tail.slice(skip);
+  return new TextDecoder("utf-8", { fatal: false }).decode(tail);
+}
+
+function liveOutputCount(value) {
+  if (typeof value === "boolean") return value ? 1 : 0;
+  return typeof value === "number" && value > 0 ? Math.trunc(value) : 0;
+}
+
+function liveOutputTurnContext() {
+  return { calls: new Map(), last_usage: {}, model: "", steps: {}, reasoning_redacted: 0, backend: "" };
+}
+
+function liveOutputUsage(input, cacheRead, cacheWrite, output, window, raw, fill = null) {
+  const size = liveOutputCount(window);
+  const fillRatio = size && fill !== null && fill !== undefined ? Number((fill / size).toFixed(4)) : null;
+  return {
+    input: liveOutputCount(input), cache_read: liveOutputCount(cacheRead), cache_write: liveOutputCount(cacheWrite),
+    output: liveOutputCount(output), context_window: size || null, context_fill: fillRatio, raw: { ...raw },
+  };
+}
+
+function liveOutputTurnError(source, detail) {
+  return { type: "error", payload: { source, error: Array.from(liveOutputPyStr(detail)).slice(0, LIVE_OUTPUT_MAX_ERROR_DETAIL_CHARS).join("") } };
+}
+
+function liveOutputResultText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.filter((block) => liveOutputIsMapping(block) && block.type === "text")
+      .map((block) => liveOutputPyStr(liveOutputPyOr(liveOutputGet(block, "text"), ""))).join("\n");
+  }
+  return content === null || content === undefined ? "" : liveOutputPyJson(content);
+}
+
+function liveOutputCommand(callId, command, status, exitCode = null, output = "", cwd = "") {
+  return { type: "command", payload: {
+    call_id: callId, command, cwd, status, exit_code: liveOutputPyInt(exitCode) ? exitCode : null,
+    output_tail: liveOutputKeepTail(output, LIVE_OUTPUT_OUTPUT_TAIL_BYTES), output_bytes: liveOutputUtf8(output).length,
+  } };
+}
+
+// difflib.SequenceMatcher(None, a, b) with its default autojunk, as its matching blocks.
+function liveOutputMatchingBlocks(a, b) {
+  const b2j = new Map();
+  b.forEach((line, index) => {
+    if (!b2j.has(line)) b2j.set(line, []);
+    b2j.get(line).push(index);
+  });
+  if (b.length >= 200) {
+    const ntest = Math.floor(b.length / 100) + 1;
+    for (const [line, indices] of [...b2j]) if (indices.length > ntest) b2j.delete(line);
+  }
+  const longest = (alo, ahi, blo, bhi) => {
+    let besti = alo;
+    let bestj = blo;
+    let bestsize = 0;
+    let j2len = new Map();
+    for (let i = alo; i < ahi; i += 1) {
+      const next = new Map();
+      for (const j of b2j.get(a[i]) || []) {
+        if (j < blo) continue;
+        if (j >= bhi) break;
+        const k = (j2len.get(j - 1) || 0) + 1;
+        next.set(j, k);
+        if (k > bestsize) {
+          besti = i - k + 1;
+          bestj = j - k + 1;
+          bestsize = k;
+        }
+      }
+      j2len = next;
+    }
+    while (besti > alo && bestj > blo && a[besti - 1] === b[bestj - 1]) {
+      besti -= 1;
+      bestj -= 1;
+      bestsize += 1;
+    }
+    while (besti + bestsize < ahi && bestj + bestsize < bhi && a[besti + bestsize] === b[bestj + bestsize]) bestsize += 1;
+    return [besti, bestj, bestsize];
+  };
+  const queue = [[0, a.length, 0, b.length]];
+  const blocks = [];
+  while (queue.length) {
+    const [alo, ahi, blo, bhi] = queue.pop();
+    const match = longest(alo, ahi, blo, bhi);
+    const [i, j, k] = match;
+    if (k) {
+      blocks.push(match);
+      if (alo < i && blo < j) queue.push([alo, i, blo, j]);
+      if (i + k < ahi && j + k < bhi) queue.push([i + k, ahi, j + k, bhi]);
+    }
+  }
+  blocks.sort((x, y) => x[0] - y[0] || x[1] - y[1] || x[2] - y[2]);
+  const joined = [];
+  let [i1, j1, k1] = [0, 0, 0];
+  for (const [i2, j2, k2] of blocks) {
+    if (i1 + k1 === i2 && j1 + k1 === j2) {
+      k1 += k2;
+    } else {
+      if (k1) joined.push([i1, j1, k1]);
+      [i1, j1, k1] = [i2, j2, k2];
+    }
+  }
+  if (k1) joined.push([i1, j1, k1]);
+  joined.push([a.length, b.length, 0]);
+  return joined;
+}
+
+// SequenceMatcher.get_grouped_opcodes(n).
+function liveOutputGroupedOpcodes(a, b, n = 3) {
+  let codes = [];
+  let i = 0;
+  let j = 0;
+  for (const [ai, bj, size] of liveOutputMatchingBlocks(a, b)) {
+    const tag = i < ai && j < bj ? "replace" : i < ai ? "delete" : j < bj ? "insert" : "";
+    if (tag) codes.push([tag, i, ai, j, bj]);
+    i = ai + size;
+    j = bj + size;
+    if (size) codes.push(["equal", ai, i, bj, j]);
+  }
+  if (!codes.length) codes = [["equal", 0, 1, 0, 1]];
+  if (codes[0][0] === "equal") {
+    const [tag, c1, c2, d1, d2] = codes[0];
+    codes[0] = [tag, Math.max(c1, c2 - n), c2, Math.max(d1, d2 - n), d2];
+  }
+  if (codes[codes.length - 1][0] === "equal") {
+    const [tag, c1, c2, d1, d2] = codes[codes.length - 1];
+    codes[codes.length - 1] = [tag, c1, Math.min(c2, c1 + n), d1, Math.min(d2, d1 + n)];
+  }
+  const groups = [];
+  let group = [];
+  for (const code of codes) {
+    let [tag, c1, c2, d1, d2] = code;
+    if (tag === "equal" && c2 - c1 > n + n) {
+      group.push([tag, c1, Math.min(c2, c1 + n), d1, Math.min(d2, d1 + n)]);
+      groups.push(group);
+      group = [];
+      c1 = Math.max(c1, c2 - n);
+      d1 = Math.max(d1, d2 - n);
+    }
+    group.push([tag, c1, c2, d1, d2]);
+  }
+  if (group.length && !(group.length === 1 && group[0][0] === "equal")) groups.push(group);
+  return groups;
+}
+
+function liveOutputUnifiedRange(start, stop) {
+  let beginning = start + 1;
+  const length = stop - start;
+  if (length === 1) return String(beginning);
+  if (!length) beginning -= 1;
+  return `${beginning},${length}`;
+}
+
+// difflib.unified_diff(a, b, fromfile, tofile, lineterm="").
+function liveOutputUnifiedDiff(a, b, fromFile, toFile) {
+  const out = [];
+  for (const group of liveOutputGroupedOpcodes(a, b)) {
+    if (!out.length) out.push(`--- ${fromFile}`, `+++ ${toFile}`);
+    const first = group[0];
+    const last = group[group.length - 1];
+    out.push(`@@ -${liveOutputUnifiedRange(first[1], last[2])} +${liveOutputUnifiedRange(first[3], last[4])} @@`);
+    for (const [tag, i1, i2, j1, j2] of group) {
+      if (tag === "equal") {
+        for (const line of a.slice(i1, i2)) out.push(" " + line);
+        continue;
+      }
+      if (tag === "replace" || tag === "delete") for (const line of a.slice(i1, i2)) out.push("-" + line);
+      if (tag === "replace" || tag === "insert") for (const line of b.slice(j1, j2)) out.push("+" + line);
+    }
+  }
+  return out;
+}
+
+// One file change; each (before, after) pair becomes one hunk of a unified diff.
+function liveOutputFileChange(callId, path, pairs, kind) {
+  const lines = [];
+  let added = 0;
+  let removed = 0;
+  for (const [before, after] of pairs) {
+    const hunk = liveOutputUnifiedDiff(liveOutputPySplitLines(before), liveOutputPySplitLines(after), `a/${path}`, `b/${path}`);
+    const body = hunk.slice(2);
+    added += body.filter((line) => line.startsWith("+")).length;
+    removed += body.filter((line) => line.startsWith("-")).length;
+    lines.push(...(lines.length ? body : hunk));
+  }
+  return { type: "file_change", payload: { call_id: callId, path, kind, diff: lines.join("\n"), added, removed } };
+}
+
+function liveOutputToolCall(callId, name, request) {
+  return { type: "tool_call", payload: { call_id: callId, name, input: request === undefined ? null : request } };
+}
+
+function liveOutputToolResult(callId, name, output, failed) {
+  return { type: "tool_result", payload: { call_id: callId, name, output: output === undefined ? null : output, is_error: failed } };
+}
+
+function liveOutputTurnEnd(usage, context = null) {
+  const payload = liveOutputPyTruthy(usage) ? { usage: { ...usage } } : {};
+  if (context && context.reasoning_redacted) payload.reasoning_redacted = context.reasoning_redacted;
+  return { type: "turn_end", payload };
+}
+
+function liveOutputAssistantText(value) {
+  const text = liveOutputPyStrip(liveOutputPyStr(liveOutputPyOr(value, "")));
+  return text ? [{ type: "assistant_text", payload: { text } }] : [];
+}
+
+function liveOutputReasoning(value, context = null) {
+  const text = liveOutputPyStrip(liveOutputPyStr(liveOutputPyOr(value, "")));
+  if (!text && context) context.reasoning_redacted += 1;
+  return text ? [{ type: "reasoning", payload: { text } }] : [];
+}
+
+function liveOutputDelta(kind, value) {
+  const text = liveOutputPyStr(liveOutputPyOr(value, ""));
+  return text ? [{ type: "delta", payload: { kind, text } }] : [];
+}
+
+// context_capture._message_text: the completed text blocks of a Claude message.
+function liveOutputClaudeMessageText(content) {
+  if (typeof content === "string") return liveOutputPyStrip(content);
+  if (!Array.isArray(content)) return "";
+  const parts = content.filter((part) => liveOutputIsMapping(part) && part.type === "text")
+    .map((part) => liveOutputPyStr(liveOutputPyOr(liveOutputGet(part, "text"), "")));
+  return liveOutputPyStrip(parts.filter(Boolean).join("\n"));
+}
+
+function liveOutputClaudeUsage(event, context) {
+  const usage = liveOutputMapping(event.usage);
+  if (!liveOutputPyTruthy(usage)) return null;
+  const modelUsage = liveOutputMapping(event.modelUsage);
+  let window;
+  if (context.model && liveOutputHas(modelUsage, context.model)) {
+    window = liveOutputMapping(modelUsage[context.model]).contextWindow;
+  } else {
+    window = Object.values(modelUsage).reduce((best, entry) => Math.max(best, liveOutputCount(liveOutputMapping(entry).contextWindow)), 0);
+  }
+  const last = context.last_usage;
+  let fill = null;
+  if (liveOutputPyTruthy(last)) {
+    fill = liveOutputCount(last.input_tokens) + liveOutputCount(last.cache_read_input_tokens) + liveOutputCount(last.cache_creation_input_tokens);
+  }
+  return liveOutputUsage(usage.input_tokens, usage.cache_read_input_tokens, usage.cache_creation_input_tokens, usage.output_tokens, window, usage, fill);
+}
+
+function liveOutputClaudeToolUse(block, context) {
+  const callId = liveOutputPyStr(liveOutputPyOr(liveOutputGet(block, "id"), ""));
+  const name = liveOutputPyStr(liveOutputPyOr(liveOutputGet(block, "name"), ""));
+  const request = liveOutputGet(block, "input");
+  context.calls.set(callId, { name, input: request });
+  if (LIVE_OUTPUT_CLAUDE_COMMAND_TOOLS.has(name)) {
+    return [liveOutputCommand(callId, liveOutputPyStr(liveOutputPyOr(liveOutputGet(liveOutputMapping(request), "command"), "")), "running")];
+  }
+  if (LIVE_OUTPUT_CLAUDE_EDIT_TOOLS.has(name)) return [];
+  return [liveOutputToolCall(callId, name, request)];
+}
+
+function liveOutputClaudeFileChanges(callId, name, request, output) {
+  const path = liveOutputPyStr(liveOutputPyOr(liveOutputGet(request, "file_path"), ""));
+  if (name === "Write") {
+    const kind = output.startsWith("File created") ? "add" : "update";
+    return [liveOutputFileChange(callId, path, [["", liveOutputPyStr(liveOutputPyOr(liveOutputGet(request, "content"), ""))]], kind)];
+  }
+  const edits = name === "MultiEdit" ? liveOutputGet(request, "edits") : [request];
+  const pairs = (Array.isArray(edits) ? edits : []).filter(liveOutputIsMapping).map((edit) => [
+    liveOutputPyStr(liveOutputPyOr(liveOutputGet(edit, "old_string"), "")),
+    liveOutputPyStr(liveOutputPyOr(liveOutputGet(edit, "new_string"), "")),
+  ]);
+  return [liveOutputFileChange(callId, path, pairs, "update")];
+}
+
+function liveOutputClaudeToolResult(block, context) {
+  const callId = liveOutputPyStr(liveOutputPyOr(liveOutputGet(block, "tool_use_id"), ""));
+  const call = context.calls.has(callId) ? context.calls.get(callId) : { name: "", input: null };
+  context.calls.delete(callId);
+  const name = call.name;
+  const request = liveOutputMapping(call.input);
+  const failed = liveOutputPyTruthy(liveOutputGet(block, "is_error"));
+  const output = liveOutputResultText(liveOutputGet(block, "content"));
+  if (LIVE_OUTPUT_CLAUDE_COMMAND_TOOLS.has(name)) {
+    return [liveOutputCommand(callId, liveOutputPyStr(liveOutputPyOr(liveOutputGet(request, "command"), "")), failed ? "failed" : "completed", null, output)];
+  }
+  if (LIVE_OUTPUT_CLAUDE_EDIT_TOOLS.has(name) && !failed) return liveOutputClaudeFileChanges(callId, name, request, output);
+  const shown = LIVE_OUTPUT_CLAUDE_EDIT_TOOLS.has(name) ? [liveOutputToolCall(callId, name, call.input)] : [];
+  return [...shown, liveOutputToolResult(callId, name, liveOutputGet(block, "content"), failed)];
+}
+
+function liveOutputClaudeDelta(event) {
+  const inner = liveOutputMapping(event.event);
+  if (inner.type !== "content_block_delta") return [];
+  const delta = liveOutputMapping(inner.delta);
+  if (delta.type === "text_delta") return liveOutputDelta("text", liveOutputGet(delta, "text"));
+  if (delta.type === "thinking_delta") return liveOutputDelta("reasoning", liveOutputGet(delta, "thinking"));
+  return [];
+}
+
+function liveOutputClaudeEvents(event, context) {
+  const kind = liveOutputPyStr(liveOutputPyOr(liveOutputGet(event, "type"), ""));
+  if (kind === "stream_event") return liveOutputClaudeDelta(event);
+  if (kind === "result") return [liveOutputTurnEnd(liveOutputClaudeUsage(event, context), context)];
+  const message = liveOutputMapping(event.message);
+  if (kind === "assistant") {
+    context.model = liveOutputPyStr(liveOutputPyOr(liveOutputGet(message, "model"), context.model));
+    const usage = liveOutputMapping(message.usage);
+    if (liveOutputPyTruthy(usage)) context.last_usage = { ...usage };
+  }
+  const content = liveOutputGet(message, "content");
+  const events = liveOutputAssistantText(liveOutputClaudeMessageText(content));
+  for (const block of Array.isArray(content) ? content : []) {
+    if (!liveOutputIsMapping(block)) continue;
+    if (block.type === "tool_use") events.push(...liveOutputClaudeToolUse(block, context));
+    else if (block.type === "tool_result") events.push(...liveOutputClaudeToolResult(block, context));
+    else if (block.type === "thinking") events.push(...liveOutputReasoning(liveOutputGet(block, "thinking"), context));
+    else if (block.type === "redacted_thinking") events.push(...liveOutputReasoning("", context));
+  }
+  return events;
+}
+
+function liveOutputCodexUsage(value) {
+  const usage = liveOutputMapping(value);
+  if (!liveOutputPyTruthy(usage)) return null;
+  const cached = liveOutputCount(usage.cached_input_tokens);
+  return liveOutputUsage(Math.max(liveOutputCount(usage.input_tokens) - cached, 0), cached, usage.cache_write_input_tokens, usage.output_tokens, 0, usage);
+}
+
+function liveOutputCodexEvents(event, context) {
+  const kind = liveOutputPyStr(liveOutputPyOr(liveOutputGet(event, "type"), ""));
+  if (kind === "turn.completed") return [liveOutputTurnEnd(liveOutputCodexUsage(event.usage), context)];
+  if (kind === "turn.failed") {
+    return [liveOutputTurnError("provider", liveOutputPyStr(liveOutputPyOr(liveOutputGet(liveOutputMapping(event.error), "message"), "turn_failed")))];
+  }
+  const item = liveOutputMapping(event.item);
+  const itemType = liveOutputPyStr(liveOutputPyOr(liveOutputGet(item, "type"), ""));
+  if (!kind.startsWith("item.") || !itemType) return [];
+  if (itemType === "agent_message" || itemType === "agentMessage") return liveOutputAssistantText(liveOutputGet(item, "text"));
+  const callId = liveOutputPyStr(liveOutputPyOr(liveOutputGet(item, "id"), ""));
+  const done = kind === "item.completed";
+  if (itemType === "command_execution") {
+    const code = done ? liveOutputGet(item, "exit_code") : null;
+    const status = !done ? "running" : code === 0 || code === false ? "completed" : "failed";
+    return [liveOutputCommand(callId, liveOutputPyStr(liveOutputPyOr(liveOutputGet(item, "command"), "")), status, code,
+      liveOutputPyStr(liveOutputPyOr(liveOutputGet(item, "aggregated_output"), "")))];
+  }
+  if (itemType === "file_change") {
+    const changes = done ? liveOutputGet(item, "changes") : null;
+    return (Array.isArray(changes) ? changes : []).filter(liveOutputIsMapping).map((change) => ({ type: "file_change", payload: {
+      call_id: callId, path: liveOutputPyStr(liveOutputPyOr(liveOutputGet(change, "path"), "")),
+      kind: liveOutputPyStr(liveOutputPyOr(liveOutputGet(change, "kind"), "update")), diff: "", added: 0, removed: 0,
+    } }));
+  }
+  if (!LIVE_OUTPUT_CODEX_TOOL_ITEMS.has(itemType)) return [];
+  if (done) {
+    const output = liveOutputPyOr(liveOutputGet(item, "aggregated_output"), liveOutputGet(item, "output"), liveOutputGet(item, "result"));
+    return [liveOutputToolResult(callId, itemType, output, liveOutputPyStr(liveOutputPyOr(liveOutputGet(item, "status"), "")) === "failed")];
+  }
+  return [liveOutputToolCall(callId, itemType, liveOutputGet(item, "arguments"))];
+}
+
+function liveOutputOpencodeCallId(part) {
+  return liveOutputPyStr(liveOutputPyOr(liveOutputGet(part, "id"), liveOutputGet(part, "callID"), liveOutputGet(part, "partID"), ""));
+}
+
+function liveOutputOpencodeCommand(callId, request, state, status) {
+  const metadata = liveOutputMapping(state.metadata);
+  const nested = liveOutputMapping(metadata.metadata);
+  let code = liveOutputHas(nested, "exit") ? liveOutputGet(nested, "exit") : liveOutputGet(metadata, "exit");
+  code = liveOutputPyInt(code) ? code : null;
+  let shown = "completed";
+  if (status === "error") shown = "failed";
+  else if (status !== "completed") shown = "running";
+  else if (code !== null && code !== 0 && code !== false) shown = "failed";
+  return liveOutputCommand(callId, liveOutputPyStr(liveOutputPyOr(liveOutputGet(request, "command"), "")), shown, code,
+    liveOutputPyStr(liveOutputPyOr(liveOutputGet(state, "output"), "")));
+}
+
+function liveOutputOpencodeTool(part, context) {
+  const state = liveOutputMapping(part.state);
+  const name = liveOutputPyStr(liveOutputPyOr(liveOutputGet(part, "tool"), liveOutputGet(part, "name"), liveOutputGet(state, "title"), "tool"));
+  const callId = liveOutputOpencodeCallId(part);
+  const status = liveOutputPyStr(liveOutputPyOr(liveOutputGet(state, "status"), ""));
+  const done = status === "completed" || status === "error";
+  const failed = status === "error";
+  const request = liveOutputMapping(liveOutputPyOr(liveOutputGet(state, "input"), liveOutputGet(part, "input")));
+  if (name === "shell" || name === "bash") return [liveOutputOpencodeCommand(callId, request, state, status)];
+  if ((name === "write" || name === "edit") && status === "completed") {
+    const path = liveOutputPyStr(liveOutputPyOr(liveOutputGet(request, "path"), liveOutputGet(request, "filePath"), ""));
+    if (name === "write") {
+      const output = liveOutputPyStr(liveOutputPyOr(liveOutputGet(state, "output"), ""));
+      return [liveOutputFileChange(callId, path, [["", liveOutputPyStr(liveOutputPyOr(liveOutputGet(request, "content"), ""))]], output.startsWith("Created") ? "add" : "update")];
+    }
+    const pairs = [[liveOutputPyStr(liveOutputPyOr(liveOutputGet(request, "oldString"), "")), liveOutputPyStr(liveOutputPyOr(liveOutputGet(request, "newString"), ""))]];
+    return [liveOutputFileChange(callId, path, pairs, "update")];
+  }
+  if (!done) {
+    context.calls.set(callId, { name });
+    return [liveOutputToolCall(callId, name, liveOutputPyOr(request, liveOutputGet(part, "input")))];
+  }
+  const seenRunning = context.calls.delete(callId);
+  const result = liveOutputToolResult(callId, name, liveOutputGet(state, "output"), failed);
+  return seenRunning ? [result] : [liveOutputToolCall(callId, name, liveOutputPyOr(request, liveOutputGet(part, "input"))), result];
+}
+
+function liveOutputOpencodeKind(event) {
+  let kind = liveOutputPyStrip(liveOutputPyStr(liveOutputPyOr(liveOutputGet(event, "type"), ""))).toLowerCase();
+  const part = liveOutputMapping(event.part);
+  const partType = liveOutputPyStrip(liveOutputPyStr(liveOutputPyOr(liveOutputGet(part, "type"), ""))).toLowerCase().replace(/-/g, "_");
+  if (kind.endsWith("part.updated") || kind.endsWith("part_updated")) kind = partType;
+  else if (partType && !["text", "reasoning", "tool", "step_finish", "step_start"].includes(kind)) kind = partType;
+  return kind;
+}
+
+function liveOutputOpencodeEvents(event, context) {
+  const kind = liveOutputOpencodeKind(event);
+  const part = liveOutputMapping(event.part);
+  if (kind === "step_finish" || kind === "stepfinish") {
+    const tokens = liveOutputMapping(liveOutputPyOr(liveOutputGet(part, "tokens"), liveOutputGet(event, "tokens")));
+    if (liveOutputPyTruthy(tokens)) {
+      const steps = context.steps;
+      if (!liveOutputPyTruthy(steps)) Object.assign(steps, { count: 0, input: 0, cache_read: 0, cache_write: 0, output: 0 });
+      const cache = liveOutputMapping(tokens.cache);
+      steps.count += 1;
+      steps.input += liveOutputCount(tokens.input);
+      steps.cache_read += liveOutputCount(cache.read);
+      steps.cache_write += liveOutputCount(cache.write);
+      steps.output += liveOutputCount(tokens.output);
+      steps.last = { ...tokens };
+    }
+    return [];
+  }
+  if (kind === "text") return liveOutputAssistantText(liveOutputPyOr(liveOutputGet(part, "text"), liveOutputGet(event, "text")));
+  if (kind === "reasoning" || kind === "thinking") {
+    return liveOutputReasoning(liveOutputPyOr(liveOutputGet(part, "text"), liveOutputGet(part, "thinking"), liveOutputGet(event, "text")), context);
+  }
+  return kind === "tool" ? liveOutputOpencodeTool(part, context) : [];
+}
+
+const LIVE_OUTPUT_TRANSLATORS = Object.freeze({
+  claude_cli: liveOutputClaudeEvents,
+  codex_cli: liveOutputCodexEvents,
+  opencode_cli: liveOutputOpencodeEvents,
+});
+
+function liveOutputProviderError(event) {
+  if (liveOutputPyStr(liveOutputPyOr(liveOutputGet(event, "type"), "")) !== "error" && !liveOutputPyTruthy(liveOutputGet(event, "is_error"))) return null;
+  const reported = liveOutputGet(event, "error");
+  let detail;
+  if (liveOutputIsMapping(reported)) {
+    const said = liveOutputPyOr(liveOutputGet(reported, "message"), liveOutputGet(liveOutputMapping(reported.data), "message"));
+    detail = [liveOutputGet(reported, "name"), said].filter(liveOutputPyTruthy).map(liveOutputPyStr).join(": ") || "provider_error";
+  } else {
+    const text = ["error", "result", "message"].map((key) => liveOutputGet(event, key))
+      .find((value) => typeof value === "string" && liveOutputPyStrip(value));
+    detail = text === undefined ? null : text;
+    const subtype = liveOutputGet(event, "subtype");
+    if (detail === null && typeof subtype === "string" && liveOutputPyStrip(subtype)) detail = subtype;
+    if (detail === null || liveOutputPyStrip(detail).toLowerCase() === "success") detail = "provider_error";
+  }
+  return liveOutputTurnError("provider", liveOutputPyStr(detail));
+}
+
+// manager_loop_backends.translate: one provider event as loop events; an unrecognized one yields nothing.
+function liveOutputTranslate(backendId, event, context = null) {
+  if (!liveOutputIsMapping(event)) return [];
+  const failure = liveOutputProviderError(event);
+  if (failure !== null) return [failure];
+  const translator = Object.prototype.hasOwnProperty.call(LIVE_OUTPUT_TRANSLATORS, backendId) ? LIVE_OUTPUT_TRANSLATORS[backendId] : null;
+  return translator ? translator(event, context || liveOutputTurnContext()) : [];
+}
+
+// manager_loop_backends.flush: only OpenCode sums its step usage into the one closing turn_end.
+function liveOutputFlush(backendId, context) {
+  if (backendId !== "opencode_cli") return [];
+  const steps = context.steps;
+  if (!liveOutputPyTruthy(steps)) return [liveOutputTurnEnd(null, context)];
+  const usage = liveOutputUsage(steps.input, steps.cache_read, steps.cache_write, steps.output, 0,
+    { steps: steps.count, last: liveOutputPyOr(steps.last, {}) });
+  return [liveOutputTurnEnd(usage, context)];
+}
+
+// A runner/adapter name from the live-output payload, as one translator id ("" when none applies).
+function liveOutputBackendId(value) {
+  const name = String(value || "").toLowerCase();
+  if (name.includes("claude")) return "claude_cli";
+  if (name.includes("codex")) return "codex_cli";
+  if (name.includes("opencode") || name.includes("kilo")) return "opencode_cli";
+  return "";
+}
+
+// The provider a line comes from, by its shape alone; "" for a shape no translator owns.
+function liveOutputDetectBackend(event) {
+  const type = typeof event.type === "string" ? event.type : "";
+  if (type.startsWith("aiworkhub_")) return "";
+  if (type === "stream_event" || ((type === "assistant" || type === "user") && liveOutputIsMapping(event.message))) return "claude_cli";
+  if ((type === "system" || type === "result") && typeof event.subtype === "string" && typeof event.session_id === "string") return "claude_cli";
+  if (["thread.started", "turn.started", "turn.completed", "turn.failed"].includes(type)
+    || (type.startsWith("item.") && liveOutputIsMapping(event.item))) return "codex_cli";
+  if (type && liveOutputIsMapping(event.part) && typeof event.part.type === "string") return "opencode_cli";
+  return "";
+}
+
+// A line its translator handled even when it yielded nothing yet: a Claude message whose Edit/Write
+// call is shown once its result arrives or whose thinking was redacted, an OpenCode step or empty
+// reasoning part (counted into the turn_end), a Codex item still in progress. Such a line is part of
+// the chat, never a separate timeline row.
+function liveOutputTranslatorOwns(backendId, event) {
+  if (!liveOutputIsMapping(event)) return false;
+  const type = typeof event.type === "string" ? event.type : "";
+  if (backendId === "claude_cli") {
+    return type === "result" || ((type === "assistant" || type === "user") && liveOutputIsMapping(event.message));
+  }
+  if (backendId === "codex_cli") {
+    const itemType = liveOutputMapping(event.item).type;
+    return type.startsWith("item.") && (itemType === "agent_message" || itemType === "agentMessage"
+      || LIVE_OUTPUT_CODEX_TOOL_ITEMS.has(itemType));
+  }
+  if (backendId === "opencode_cli") {
+    return ["step_finish", "stepfinish", "step_start", "text", "reasoning", "thinking", "tool"].includes(liveOutputOpencodeKind(event));
+  }
+  return false;
+}
+
+function liveOutputTurnHasText(events) {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (events[index].type === "turn_end") return false;
+    if (events[index].type === "assistant_text") return true;
+  }
+  return false;
+}
+
+// Every live-output line as chat events, oldest first. `backendId` is the payload's runner/adapter
+// (may be ""); a line without one is attributed by its shape, then to the stream's last provider.
+// A JSON object no translator turns into an event becomes one timeline_row built exactly as the old
+// timeline built it (timelineEventFromObject), a string (a non-JSON line) one row of the raw-text
+// branch; nothing is dropped and a valid object is never "Unparsed provider line". Deltas stay in the
+// list; the caller decides how to show them.
+function liveOutputChatEvents(backendId, lineObjects, options = {}) {
+  const context = options.context || liveOutputTurnContext();
+  const explicit = liveOutputBackendId(backendId);
+  const items = Array.isArray(lineObjects) ? lineObjects : [];
+  const events = [];
+  const seenRows = new Set();
+  let rows = [];
+  const flushRows = () => {
+    for (const row of rows.length ? coalesceTimelineEvents(rows) : []) events.push({ type: "timeline_row", payload: row });
+    rows = [];
+  };
+  let sticky = explicit;
+  items.forEach((line, index) => {
+    if (typeof line === "string") {
+      rows.push(timelineEventFromTextLine(line, Boolean(options.openTail) && index === items.length - 1));
+      return;
+    }
+    if (!line || typeof line !== "object") return;
+    const detected = explicit || (Array.isArray(line) ? "" : liveOutputDetectBackend(line));
+    if (detected) sticky = detected;
+    const internal = typeof line.type === "string" && line.type.startsWith("aiworkhub_");
+    const backend = internal ? "" : detected || sticky;
+    const translated = backend ? liveOutputTranslate(backend, line, context) : [];
+    const consumed = translated.length > 0 || (Boolean(backend) && liveOutputTranslatorOwns(backend, line));
+    if (!consumed) {
+      const key = JSON.stringify(line);
+      if (seenRows.has(key)) return;
+      seenRows.add(key);
+      const row = timelineEventFromObject(line, line);
+      if (row) rows.push(row);
+      return;
+    }
+    flushRows();
+    context.backend = backend;
+    // A Claude result holds the turn's final answer; it is shown only when no assistant text did.
+    const answer = backend === "claude_cli" && line.type === "result" && typeof line.result === "string" ? liveOutputPyStrip(line.result) : "";
+    if (answer && !liveOutputTurnHasText(events)) events.push({ type: "assistant_text", payload: { text: answer } });
+    events.push(...translated);
+    if (translated.some((event) => event.type === "turn_end")) {
+      Object.assign(context, { calls: new Map(), last_usage: {}, steps: {}, reasoning_redacted: 0 });
+    }
+  });
+  flushRows();
+  const flushBackend = explicit || context.backend;
+  // A live tail is never closed here: a closing turn_end after the last step would mark every
+  // still-running call "interrupted". The step usage closes the turn once the run has finished.
+  if (flushBackend && options.flush !== false) events.push(...liveOutputFlush(flushBackend, context));
+  return events;
+}
+
+// ── Worker chat render: the manager console's row builders with the worker's own state ──
+const WORKER_CHAT_EVENT_LIMIT = 200;
+
+function workerChatViewState() {
+  return { entries: [], stale: true };
+}
+
+// Deltas are display-only: a completed message that carries the streamed text supersedes it; any
+// other event first settles the streamed text as its own row, and what is still streaming at the end
+// shows as the live partial rows.
+function workerChatDisplayEvents(events) {
+  const shown = [];
+  let text = "";
+  let reasoning = "";
+  for (const event of events) {
+    if (!event) continue;
+    const payload = managerConsolePayload(event);
+    if (event.type === "delta") {
+      if (payload.kind === "reasoning") reasoning += String(payload.text || "");
+      else text += String(payload.text || "");
+      continue;
+    }
+    if (event.type === "assistant_text" && String(payload.text || "").includes(text.trim())) text = "";
+    if (event.type === "reasoning" && String(payload.text || "").includes(reasoning.trim())) reasoning = "";
+    if (reasoning.trim()) shown.push({ type: "reasoning", payload: { text: reasoning.trim() } });
+    if (text.trim()) shown.push({ type: "assistant_text", payload: { text: text.trim() } });
+    text = "";
+    reasoning = "";
+    shown.push(event);
+  }
+  return { events: shown, partial: { text: text.trim(), reasoning: reasoning.trim() } };
+}
+
+// One list under one parent. A row with the same key and signature keeps its node (so its open
+// <details>, selection and Copied label survive); a changed row is rebuilt with its open states.
+// Rows only appended are appended; any other change re-places the list's nodes in order.
+function workerChatReconcile(parent, previous, descriptors, pool) {
+  // The nodes now under `parent`, read before a changed row swaps its entry's node.
+  const before = previous.map((entry) => entry.node);
+  const entries = descriptors.map((descriptor) => {
+    let entry = managerConsoleClaim(pool, descriptor);
+    if (!entry) {
+      const node = descriptor.build();
+      entry = { key: descriptor.key, signature: descriptor.signature, node, live: [], parent: null };
+      if (descriptor.members) Object.assign(entry, { summary: node.children[0], body: node.children[1], members: [] });
+      pool.writes += 1;
+    }
+    if (descriptor.members) {
+      entry.key = descriptor.key;
+      if (entry.signature !== descriptor.signature) {
+        managerConsoleSetText(entry.summary, descriptor.summaryText);
+        if (entry.node.className !== descriptor.className) entry.node.className = descriptor.className;
+        entry.signature = descriptor.signature;
+        pool.writes += 1;
+      }
+      entry.members = workerChatReconcile(entry.body, entry.members, descriptor.members, pool);
+    } else if (entry.signature !== descriptor.signature) {
+      const node = descriptor.build();
+      const opened = managerConsoleDetailsIn(entry.node);
+      managerConsoleDetailsIn(node).forEach((details, index) => {
+        if (index < opened.length) details.open = opened[index].open;
+      });
+      entry.node = node;
+      entry.signature = descriptor.signature;
+      pool.writes += 1;
+    }
+    return entry;
+  });
+  const after = entries.map((entry) => entry.node);
+  if (before.length <= after.length && before.every((node, index) => node === after[index])) {
+    for (let index = before.length; index < after.length; index += 1) parent.appendChild(after[index]);
+  } else {
+    parent.replaceChildren(...after);
+    pool.writes += 1;
+  }
+  for (const entry of entries) entry.parent = parent;
+  return entries;
+}
+
+// Renders translated worker events (liveOutputChatEvents) into `container` as a chat, oldest at the
+// top. Reads and writes only `options.state` (workerChatViewState()), never the manager console's
+// terminal seq, index, signature, strip or announcer. Returns false when there is nothing to show.
+function renderWorkerChatEvents(container, events, options = {}) {
+  const view = options.state || workerChatViewState();
+  const display = workerChatDisplayEvents(Array.isArray(events) ? events : []);
+  let turn = 1;
+  const list = display.events.map((event, index) => {
+    const item = { type: event.type, payload: event.payload, seq: index + 1, turn };
+    if (event.type === "turn_end") turn += 1;
+    return item;
+  });
+  const chat = {
+    terminalSeq: options.finished ? Number.POSITIVE_INFINITY : managerConsoleHighestTerminalSeq(list),
+    assistantLabel: String(options.label || "Worker"),
+    index: managerConsoleBuildIndex(list),
+  };
+  const merged = managerConsoleMergeTools(managerConsoleMergeCommands(list));
+  const limit = options.limit || WORKER_CHAT_EVENT_LIMIT;
+  const visible = merged.length > limit ? merged.slice(merged.length - limit) : merged;
+  const descriptors = managerConsoleGroupRuns(managerConsoleEventRows(merged, visible, chat), chat);
+  descriptors.push(...managerConsoleStreamingRows(display.partial));
+  if (!descriptors.length) {
+    view.entries = [];
+    view.stale = true;
+    return false;
+  }
+  const atBottom = numberValue(container.scrollHeight) - numberValue(container.scrollTop) - numberValue(container.clientHeight) < 24;
+  if (view.stale) {
+    container.replaceChildren();
+    view.entries = [];
+    view.stale = false;
+  }
+  const pool = managerConsoleRowPool(view.entries);
+  try {
+    view.entries = workerChatReconcile(container, view.entries, descriptors, pool);
+  } catch (error) {
+    view.entries = [];
+    view.stale = true;
+    throw error;
+  }
+  if (pool.writes > 0 && atBottom) container.scrollTop = container.scrollHeight;
+  return true;
 }

@@ -111,6 +111,8 @@ const state = {
 let readyRetryTimer = null;
 let readyAttempts = 0;
 let hostConnected = false;
+// The worker Live Output chat's own render state (workerChatViewState), reset with the panel.
+let liveOutputChatState = null;
 
 function persistState() {
   vscode.setState({
@@ -4518,6 +4520,8 @@ function resetLiveOutputPanel() {
   state.liveOutputCursor = 0;
   state.liveOutputText = "";
   state.liveOutputOversizeChars = 0;
+  state.liveOutputRunner = "";
+  liveOutputChatState = null;
   elements.detailLiveOutputBlock.hidden = true;
   elements.detailLiveOutputState.textContent = "";
   elements.detailLiveOutputState.className = "validation-label";
@@ -4535,6 +4539,8 @@ function startLiveOutputPolling(taskId) {
   state.liveOutputCursor = 0;
   state.liveOutputText = "";
   state.liveOutputOversizeChars = 0;
+  state.liveOutputRunner = "";
+  liveOutputChatState = null;
   elements.detailLiveOutputBlock.hidden = false;
   elements.detailLiveOutputState.textContent = "Loading";
   elements.detailLiveOutputState.className = "validation-label";
@@ -4613,11 +4619,18 @@ function limitText(value, maxLength = 120) {
   return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}...`;
 }
 
-function redactDisplayText(value, maxLength = 120) {
-  return limitText(value, maxLength)
+// The one credential rule every Live Output surface applies: host paths and recognised
+// tokens are masked; whitespace and line breaks are kept. "<redacted-host-path>" (the
+// server's own mask) is left as is.
+function redactCredentialText(value) {
+  return String(value === undefined || value === null ? "" : value)
     .replace(/\b(?:[A-Za-z]:)?\/(?:[\w .:@-]+\/){1,}[\w .:@-]+/g, "[path]")
     .replace(/\b(?:sk|pk|ghp|github_pat|xox[baprs]|ya29|hf)_[A-Za-z0-9._-]{12,}\b/g, "[token]")
     .replace(/\b[A-Za-z0-9+/]{32,}={0,2}\b/g, "[token]");
+}
+
+function redactDisplayText(value, maxLength = 120) {
+  return redactCredentialText(limitText(value, maxLength));
 }
 
 function firstText(...values) {
@@ -4806,10 +4819,7 @@ function redactPreserveLines(value) {
     /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g,
     " ",
   );
-  return text
-    .replace(/\b(?:[A-Za-z]:)?\/(?:[\w .:@-]+\/){1,}[\w .:@-]+/g, "[path]")
-    .replace(/\b(?:sk|pk|ghp|github_pat|xox[baprs]|ya29|hf)_[A-Za-z0-9._-]{12,}\b/g, "[token]")
-    .replace(/\b[A-Za-z0-9+/]{32,}={0,2}\b/g, "[token]");
+  return redactCredentialText(text);
 }
 
 // Unwraps a tool_result content payload. First-class: a string directly on
@@ -5316,39 +5326,43 @@ function timelineEventsFromText(decoded, options = {}) {
     } catch (_error) {
       // Malformed provider output degrades to a text-only row.
     }
-    // A line that failed JSON.parse but still looks structured is a malformed
-    // or partially-buffered provider event. Degrade it to a readable raw
-    // rendering with a named reason (the row title) -- never a blank panel and
-    // never an "unsupported" label. Valid JSON never reaches here: an object
-    // parses above and is rendered by timelineEventFromObject, whose generic
-    // branch summarizes any unrecognised-but-valid shape instead of calling it
-    // unsupported (NF-2026-00282 / NF-2026-00183).
-    const looksStructured = /^[\s]*[\[{]/.test(line) || /\\"(?:type|event|result)\\"\s*:/.test(line);
-    if (index === openTailIndex && looksStructured) {
-      // Live tail only: a structured line whose newline has not arrived yet is not malformed.
-      // Show one neutral size row until the line completes.
-      events.push({
-        kind: "text",
-        title: "Receiving large event...",
-        label: "receiving",
-        state: "line",
-        message: `${Math.max(1, Math.round(line.length / 1024))} KB received`,
-        metrics: [],
-        raw: "",
-      });
-      continue;
-    }
-    events.push({
-      kind: "text",
-      title: looksStructured ? "Unparsed provider line" : "Output",
-      label: looksStructured ? "unparsed structured output" : "plain text",
-      state: "line",
-      message: redactDisplayText(line, 220) || (looksStructured ? "(empty structured line)" : "(empty line)"),
-      metrics: [],
-      raw: safeRawEvent(line),
-    });
+    events.push(timelineEventFromTextLine(line, index === openTailIndex));
   }
   return coalesceTimelineEvents(events);
+}
+
+// One line that is not a JSON object, as its timeline row (also the worker chat's row for it).
+// A line that failed JSON.parse but still looks structured is a malformed
+// or partially-buffered provider event. Degrade it to a readable raw
+// rendering with a named reason (the row title) -- never a blank panel and
+// never an "unsupported" label. Valid JSON never reaches here: an object
+// parses above and is rendered by timelineEventFromObject, whose generic
+// branch summarizes any unrecognised-but-valid shape instead of calling it
+// unsupported (NF-2026-00282 / NF-2026-00183).
+function timelineEventFromTextLine(line, openTail = false) {
+  const looksStructured = /^[\s]*[\[{]/.test(line) || /\\"(?:type|event|result)\\"\s*:/.test(line);
+  if (openTail && looksStructured) {
+    // Live tail only: a structured line whose newline has not arrived yet is not malformed.
+    // Show one neutral size row until the line completes.
+    return {
+      kind: "text",
+      title: "Receiving large event...",
+      label: "receiving",
+      state: "line",
+      message: `${Math.max(1, Math.round(line.length / 1024))} KB received`,
+      metrics: [],
+      raw: "",
+    };
+  }
+  return {
+    kind: "text",
+    title: looksStructured ? "Unparsed provider line" : "Output",
+    label: looksStructured ? "unparsed structured output" : "plain text",
+    state: "line",
+    message: redactDisplayText(line, 220) || (looksStructured ? "(empty structured line)" : "(empty line)"),
+    metrics: [],
+    raw: safeRawEvent(line),
+  };
 }
 
 // Streamed reasoning chunks and model heartbeats would otherwise push tool rows out of the 200-row window.
@@ -5400,51 +5414,83 @@ function formatDuration(milliseconds) {
   return `${minutes}m ${Math.round(seconds % 60)}s`;
 }
 
-function addLiveOutputSection(parent, title, content, className = "") {
-  if (content === undefined || content === null || content === "") return;
-  const section = createElement("section", `live-output-section ${className}`.trim());
-  section.append(createElement("h4", "", title));
-  const body = createElement("div", "live-output-section-body");
-  body.textContent = String(content);
-  section.appendChild(body);
-  parent.appendChild(section);
+// The compact timeline row's sections are built by managerConsoleTimelineRowNode (manager_console.js).
+
+// The decoded log as translator input: each JSON object line (or array item) as its object, each
+// other non-blank line as its text. `openTail` says the last item is a live line still arriving.
+function liveOutputLineItems(decoded, options = {}) {
+  const items = [];
+  const rawLines = String(decoded || "").split(/\r?\n/);
+  const openTailIndex = options.liveTail ? rawLines.length - 1 : -1;
+  let openTail = false;
+  rawLines.forEach((line, index) => {
+    if (!line.trim()) {
+      return;
+    }
+    let parsed = null;
+    try {
+      parsed = parseNestedJson(line);
+    } catch (_error) {
+      parsed = null;
+    }
+    if (parsed && typeof parsed === "object") {
+      for (const item of Array.isArray(parsed) ? parsed : [parsed]) {
+        if (item && typeof item === "object") {
+          items.push(item);
+        }
+      }
+      openTail = false;
+      return;
+    }
+    items.push(line);
+    openTail = index === openTailIndex;
+  });
+  return { items, openTail };
 }
 
-function renderFormattedLiveOutput(decoded, options = {}) {
-  const fragment = document.createDocumentFragment();
-  const events = timelineEventsFromText(decoded, options);
-  if (!events.length) {
-    fragment.appendChild(createElement("div", "panel-list-empty compact", "Waiting for model output..."));
-    elements.detailLiveOutputContainer.replaceChildren(fragment);
-    return;
+// Every string of a translated chat event (model text, tool input and output, commands, diffs),
+// bounded like a tool result and redacted by the one shared credential rule. Object keys are
+// rendered as labels, so they are redacted too.
+function redactLiveOutputValue(value, depth = 0) {
+  if (typeof value === "string") {
+    return redactCredentialText(boundedToolResultText(value));
   }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  if (depth > TOOL_RESULT_MAX_DEPTH * 4) {
+    return redactCredentialText(boundedToolResultText(JSON.stringify(value)));
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactLiveOutputValue(item, depth + 1));
+  }
+  const redacted = {};
+  for (const key of Object.keys(value)) {
+    redacted[redactCredentialText(key)] = redactLiveOutputValue(value[key], depth + 1);
+  }
+  return redacted;
+}
 
-  const timeline = createElement("div", "live-output-timeline");
-  // Newest-first: current activity must be visible without scrolling.
-  for (const event of events.slice(-200).reverse()) {
-    const row = createElement("article", `live-output-row is-${event.kind}`);
-    const head = createElement("div", "live-output-row-head");
-    head.append(
-      createElement("strong", "live-output-row-title", event.title),
-      createElement("span", "live-output-row-state", event.state),
-    );
-    row.append(
-      head,
-      createElement("div", "live-output-row-label", event.label),
-      createElement("div", "live-output-row-message", event.message || "No message"),
-    );
-    if (event.metrics.length) {
-      row.appendChild(createElement("div", "live-output-row-meta", event.metrics.join(" | ")));
-    }
-    addLiveOutputSection(row, "Tool input (recognized credentials redacted)", event.activityInput);
-    addLiveOutputSection(row, "Tool result (recognized credentials redacted)", event.activityOutput);
-    const raw = createElement("details", "live-output-row-raw");
-    raw.append(createElement("summary", "", "Raw event"), createElement("pre", "", event.raw));
-    row.appendChild(raw);
-    timeline.appendChild(row);
+// Worker Live Output as a chat (NF-2026-02222): the lines are translated in the webview by the
+// manager console's translator port and rendered with its row builders, oldest at the top.
+// A line no translator recognises keeps its old compact timeline row. Its render state is
+// liveOutputChatState (declared with the other module state, reset with the panel).
+function renderFormattedLiveOutput(decoded, options = {}) {
+  const container = elements.detailLiveOutputContainer;
+  const context = liveOutputTurnContext();
+  const lines = liveOutputLineItems(decoded, options);
+  const finished = !options.liveTail;
+  const events = liveOutputChatEvents(state.liveOutputRunner || "", lines.items, { context, openTail: lines.openTail, flush: finished })
+    .map((event) => (event.type === "timeline_row" ? event : { type: event.type, payload: redactLiveOutputValue(event.payload) }));
+  if (!liveOutputChatState) {
+    liveOutputChatState = workerChatViewState();
   }
-  fragment.appendChild(timeline);
-  elements.detailLiveOutputContainer.replaceChildren(fragment);
+  const label = [state.liveOutputRunner || context.backend || "worker", context.model]
+    .filter(Boolean).map((part) => redactDisplayText(part, 60)).join(" · ");
+  if (!events.length || !renderWorkerChatEvents(container, events, { state: liveOutputChatState, finished, label })) {
+    liveOutputChatState = workerChatViewState();
+    container.replaceChildren(createElement("div", "panel-list-empty compact", "Waiting for model output..."));
+  }
 }
 
 // The row text for a line too long to keep; timelineEventFromObject renders it as one size row.
@@ -5535,6 +5581,9 @@ function renderLiveOutput(payload) {
   const exited = ["exited", "completed"].includes(liveness);
   // Finished only when the server has nothing more waiting and the process has ended.
   const finished = !info.truncated && (Number.isFinite(info.exit_code) || exited);
+  // The chat names the runner when the payload carries it; otherwise each line's shape decides.
+  const runner = firstText(info.runner, info.adapter, info.runtime_adapter);
+  if (runner) state.liveOutputRunner = runner;
   appendLiveOutputText(String(info.output || ""), finished);
   if (Number.isFinite(info.next_cursor)) {
     state.liveOutputCursor = info.next_cursor;

@@ -117,6 +117,13 @@ class FakeDocument {
     return new FakeElement(tagName);
   }
 
+  // The chat's row builders (NF-2026-02222) write model and tool text as text nodes.
+  createTextNode(text) {
+    const node = new FakeElement("#text");
+    node.textContent = text;
+    return node;
+  }
+
   createDocumentFragment() {
     const fragment = new FakeElement("#fragment");
     fragment.__fragment = true;
@@ -225,7 +232,8 @@ test("a valid provider line split into 8 KiB pages renders once and never as Unp
   });
   assert.ok(sawNeutralRow, "while the line is still arriving it shows the neutral row");
   const rendered = panel();
-  assert.ok(rendered.includes("Tool result"), "the completed line renders as a normal tool result");
+  // NF-2026-02222: the chat's tool row labels it "tool result".
+  assert.ok(/tool result/i.test(rendered), "the completed line renders as a normal tool result");
   assert.ok(!rendered.includes("Receiving large event..."), "the neutral row disappears when the line completes");
 });
 
