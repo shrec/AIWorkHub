@@ -469,11 +469,25 @@ def test_a_selection_forces_the_combined_tree_and_a_failure_refuses_the_accept()
     fn = _accept_review_node()
     run_call = _call_named(fn, "run_neighbour_tests")
     chain = _ancestors(fn, run_call)
-    lane = next(
-        node for node in chain
-        if isinstance(node, ast.If) and "combined_tree_required" in ast.unparse(node.test)
+    # run_neighbour_tests now lives in the nested _validate_combined_tree ...
+    assert any(
+        isinstance(node, ast.FunctionDef) and node.name == "_validate_combined_tree"
+        for node in chain
     )
-    assert "neighbour_selection.tests" in ast.unparse(lane.test)
+    # ... and the gate moved into the nested _combined_tree_required.
+    gate = next(
+        node for node in ast.walk(fn)
+        if isinstance(node, ast.FunctionDef) and node.name == "_combined_tree_required"
+    )
+    gate_source = ast.unparse(gate)
+    assert "combined_tree_required" in gate_source
+    assert "neighbour_selection.tests" in gate_source
+    lane = next(
+        node for node in ast.walk(fn)
+        if isinstance(node, ast.IfExp)
+        and ast.unparse(node.test) == "_combined_tree_required()"
+        and ast.unparse(node.body) == "_validate_combined_tree()"
+    )
     # The run uses the accept's own runner on the union workspace ...
     keywords = {kw.arg: ast.unparse(kw.value) for kw in run_call.keywords}
     assert keywords["run"] == "_run_declared_validations"
@@ -485,7 +499,7 @@ def test_a_selection_forces_the_combined_tree_and_a_failure_refuses_the_accept()
             handler.type is not None and ast.unparse(handler.type) == "WorkspaceError"
             for handler in node.handlers
         )
-        for node in chain
+        for node in _ancestors(fn, lane)
     )
     select_call = _call_named(fn, "select_neighbour_tests")
     assert select_call.lineno < lane.lineno
