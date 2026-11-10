@@ -11,8 +11,9 @@ import os
 import re
 import subprocess
 import threading
+import time
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Callable, Iterable
 
 
 # NF-2026-01009: node grew ``--experimental-test-isolation`` in v22.8.0 and
@@ -33,6 +34,16 @@ _APPCONTAINER_NODE_VERSION_PROBE_SECONDS = 10
 _APPCONTAINER_NODE_VERSION_CACHE_MAX_ENTRIES = 32
 _APPCONTAINER_NODE_VERSION_CACHE: dict[str, str] = {}
 _APPCONTAINER_NODE_VERSION_LOCK = threading.Lock()
+_APPCONTAINER_NODE_TEST_FILE_SUFFIXES = (
+    ".js",
+    ".cjs",
+    ".mjs",
+    ".ts",
+    ".cts",
+    ".mts",
+)
+_APPCONTAINER_NODE_GLOB_METACHARACTERS = frozenset("*?[]{}()!")
+_APPCONTAINER_NODE_VALUE_FLAG = re.compile(r"--[A-Za-z0-9_][A-Za-z0-9_-]*=.+")
 
 
 def _is_appcontainer_node_executable(executable: str) -> bool:
@@ -110,6 +121,15 @@ def _appcontainer_node_version(executable: str) -> str:
     return version
 
 
+def _appcontainer_node_declares_isolation(parts: Iterable[str]) -> bool:
+    """Whether ``parts`` already pick a test isolation, in either spelling."""
+    return any(
+        part == flag or part.startswith(f"{flag}=")
+        for part in parts
+        for flag in _APPCONTAINER_NODE_ISOLATION_FLAGS
+    )
+
+
 def _appcontainer_node_validation_argv(
     argv: Iterable[str], node_version: str
 ) -> list[str]:
@@ -129,6 +149,13 @@ def _appcontainer_node_validation_argv(
       forever: 100% CPU until the validation timeout.  In-process isolation
       spawns no child, and measured 50/50 in 0.2 s on v22.16.0.
 
+    This is the node counterpart of the Python adaptation in
+    ``_run_appcontainer_validation``.  It rewrites argv rather than env, because
+    what a node validation needs inside the container is different flags, not a
+    shim on the import path.  The version probe is the only host call this
+    adds, and every other command still reaches ``launch_appcontainer`` with the
+    argv the card declared, byte for byte.
+
     Pure, so the whole rewrite is provable off Windows.  Every insertion is
     idempotent, an explicit isolation flag on the declared command wins (a card
     that asked for child isolation keeps it, hang included), and an argv that
@@ -142,11 +169,7 @@ def _appcontainer_node_validation_argv(
             rewritten.insert(1, flag)
     if "--test" not in rewritten[1:]:
         return rewritten
-    if any(
-        part == flag or part.startswith(f"{flag}=")
-        for part in rewritten[1:]
-        for flag in _APPCONTAINER_NODE_ISOLATION_FLAGS
-    ):
+    if _appcontainer_node_declares_isolation(rewritten[1:]):
         return rewritten
     isolation = _appcontainer_node_isolation_flag(node_version)
     if isolation:
@@ -155,3 +178,113 @@ def _appcontainer_node_validation_argv(
         # pattern rather than an option.
         rewritten.insert(rewritten.index("--test", 1) + 1, isolation)
     return rewritten
+
+
+def _is_appcontainer_node_test_file(part: str) -> bool:
+    """A literal test-file positional: known suffix, no glob, not an option."""
+    return (
+        not part.startswith("-")
+        and part.endswith(_APPCONTAINER_NODE_TEST_FILE_SUFFIXES)
+        and _APPCONTAINER_NODE_GLOB_METACHARACTERS.isdisjoint(part)
+    )
+
+
+def _appcontainer_node_per_file_argvs(
+    argv: Iterable[str], node_version: str
+) -> list[list[str]] | None:
+    """One argv per test file when the row must fan out, else ``None``.
+
+    Only a row the lane would run in-process can need this: with an explicit
+    isolation flag, or a node that gets none, today's argv keeps its meaning.
+
+    Fail closed on shape.  An argument that is not exactly ``--test``, a
+    ``--name=value`` flag or a literal test file might consume the next one
+    (``--require x.js``) or expand to any number of files (``dir/*.test.js``),
+    so the row is left alone rather than guessed at.  ``--test`` after the
+    first file is a script argument to node, not the test runner's flag.
+
+    Node stops reading its own options at the first positional, so each file
+    takes the first file's slot and every flag stays on its declared side.
+    """
+    parts = [str(part) for part in argv]
+    if (
+        not parts
+        or not _is_appcontainer_node_executable(parts[0])
+        or not _appcontainer_node_isolation_flag(node_version)
+        or _appcontainer_node_declares_isolation(parts[1:])
+    ):
+        return None
+    files: list[str] = []
+    for part in parts[1:]:
+        if _is_appcontainer_node_test_file(part):
+            files.append(part)
+        elif part != "--test" and not _APPCONTAINER_NODE_VALUE_FLAG.fullmatch(part):
+            return None
+    if len(files) < 2:
+        return None
+    first_file = parts.index(files[0], 1)
+    if "--test" not in parts[1:first_file]:
+        return None
+    trailing = [
+        part
+        for part in parts[first_file + 1 :]
+        if not _is_appcontainer_node_test_file(part)
+    ]
+    return [[*parts[:first_file], file, *trailing] for file in files]
+
+
+def _run_appcontainer_node_row_per_file(
+    run_one: Callable[..., subprocess.CompletedProcess[str]],
+    argv: Iterable[str],
+    node_version: str,
+    *,
+    timeout_seconds: float,
+    **run_kwargs: Any,
+) -> subprocess.CompletedProcess[str] | None:
+    """Run a multi-file ``node --test`` row one launch per file, else ``None``.
+
+    The lane's ``--test-isolation=none`` puts every file of a row in one
+    process, so a file that stubs ``vscode`` through ``Module._load`` collides
+    with a cached ``extension.js`` and one ``process.exit(1)`` silently ends
+    the rest (measured on v24.21.0: host rc 0 with 103 tests; lane rc 1 with no
+    stdout; each of the 8 files alone rc 0).  One launch per file is the host's
+    one process per file.
+
+    Every file runs even after one fails, because stopping early would change
+    what the row means on the host.  The fold answers for the declared row:
+    first non-zero returncode, streams concatenated in declared order, and one
+    deadline shared by every launch.  ``OSError`` propagates untouched.
+    """
+    per_file = _appcontainer_node_per_file_argvs(argv, node_version)
+    if per_file is None:
+        return None
+    declared = [str(part) for part in argv]
+    stdout: list[str] = []
+    stderr: list[str] = []
+
+    def _row_timeout() -> subprocess.TimeoutExpired:
+        return subprocess.TimeoutExpired(
+            declared,
+            timeout_seconds,
+            output="".join(stdout),
+            stderr="".join(stderr),
+        )
+
+    returncode = 0
+    deadline = time.monotonic() + timeout_seconds
+    for file_argv in per_file:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _row_timeout()
+        try:
+            completed = run_one(file_argv, timeout_seconds=remaining, **run_kwargs)
+        except subprocess.TimeoutExpired as exc:
+            stdout.append(exc.stdout or "")
+            stderr.append(exc.stderr or "")
+            raise _row_timeout() from exc
+        stdout.append(completed.stdout or "")
+        stderr.append(completed.stderr or "")
+        returncode = returncode or completed.returncode
+    return subprocess.CompletedProcess(
+        declared, returncode, "".join(stdout), "".join(stderr)
+    )

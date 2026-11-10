@@ -12818,13 +12818,13 @@ _APPCONTAINER_TEMP_TRAMPOLINE = (
 )
 
 
-# NF-2026-01009: the node argv rewrite lives in its own sibling (size ratchet).
-# A bare-script Landlock load has no package context and never runs AppContainer.
+# NF-2026-01009: node sibling (size ratchet); bare-script Landlock has no package, never runs AppContainer.
 if __package__:
     from .worker_workspace_appcontainer_node import (  # noqa: E402
         _appcontainer_node_validation_argv,
         _appcontainer_node_version,
         _is_appcontainer_node_executable,
+        _run_appcontainer_node_row_per_file,
     )
 
 
@@ -12882,15 +12882,15 @@ def _run_appcontainer_validation(
     effective_argv = list(argv)
     request_root = _appcontainer_request_root(workspace)
     if _is_appcontainer_node_executable(executable):
-        # NF-2026-01009: the node counterpart of the Python adaptation below.
-        # This one rewrites argv rather than env, because what a node
-        # validation needs inside the container is different flags, not a shim
-        # on the import path.  The version probe is the only host call this
-        # adds, and every other command still reaches launch_appcontainer with
-        # the argv the card declared, byte for byte.
-        effective_argv = _appcontainer_node_validation_argv(
-            effective_argv, _appcontainer_node_version(executable)
+        # NF-2026-01009: node's counterpart of the Python env shim below; the sibling has the why.
+        node_version = _appcontainer_node_version(executable)
+        fanned_out = _run_appcontainer_node_row_per_file(
+            _run_appcontainer_validation, effective_argv, node_version, workspace=workspace,
+            adapter_id=adapter_id, cwd=cwd, env=env, timeout_seconds=timeout_seconds,
         )
+        if fanned_out is not None:
+            return fanned_out
+        effective_argv = _appcontainer_node_validation_argv(effective_argv, node_version)
     from .worker_workspace_appcontainer_dotnet import (
         _appcontainer_dotnet_validation_command,
         _is_appcontainer_dotnet_executable,

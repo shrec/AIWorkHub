@@ -2848,6 +2848,282 @@ def test_appcontainer_validation_node_lane_leaves_a_python_argv_unchanged(
     )
 
 
+_NODE_FAN_OUT_FLAGS = ["--preserve-symlinks", "--preserve-symlinks-main"]
+
+
+@pytest.mark.parametrize(
+    ("node_version", "isolation"),
+    [
+        ("v24.21.0", "--test-isolation=none"),
+        ("v22.16.0", "--experimental-test-isolation=none"),
+    ],
+)
+def test_node_multi_file_row_runs_one_launch_per_file(
+    tmp_path: Path, monkeypatch, node_version: str, isolation: str
+) -> None:
+    """One container per file, in order, each with the lane's usual flags."""
+    declared = ["node", "--test", "a.test.js", "b.test.js"]
+
+    result, launches, _probed = _run_node_lane_validation(
+        tmp_path, monkeypatch, list(declared), node_version=node_version
+    )
+
+    assert [list(launch.request.argv) for launch in launches] == [
+        ["node", *_NODE_FAN_OUT_FLAGS, "--test", isolation, file]
+        for file in ("a.test.js", "b.test.js")
+    ]
+    assert result.args == declared
+    assert result.returncode == 0
+
+
+@pytest.mark.parametrize(
+    ("row", "node_version"),
+    [
+        # A single file.
+        (["node", "--test", "a.test.js"], "v24.21.0"),
+        # No --test, or a --test node reads as the script's own argument.
+        (["node", "a.test.js", "b.test.js"], "v24.21.0"),
+        (["node", "a.test.js", "--test", "b.test.js"], "v24.21.0"),
+        # Any spelling of an explicit isolation flag.
+        (["node", "--test", "--test-isolation=process", "a.js", "b.js"], "v24.21.0"),
+        (["node", "--test", "--test-isolation", "none", "a.js", "b.js"], "v24.21.0"),
+        (
+            ["node", "--test", "--experimental-test-isolation=process", "a.js", "b.js"],
+            "v22.16.0",
+        ),
+        (
+            ["node", "--test", "--experimental-test-isolation", "none", "a.js", "b.js"],
+            "v22.16.0",
+        ),
+        # A node the lane adds no isolation flag to.
+        (["node", "--test", "a.test.js", "b.test.js"], "v22.7.1"),
+        (["node", "--test", "a.test.js", "b.test.js"], ""),
+        (["node", "--test", "a.test.js", "b.test.js"], "not a version"),
+        # An argument that might consume the next one or expand to many files.
+        (["node", "--require", "x.js", "--test", "a.js", "b.js"], "v24.21.0"),
+        (["node", "-r", "x.js", "--test", "a.js", "b.js"], "v24.21.0"),
+        (["node", "--test", "--test-name-pattern", "foo", "a.js", "b.js"], "v24.21.0"),
+        (["node", "--test", "dir/*.test.js", "b.test.js"], "v24.21.0"),
+        (["node", "--test", "--preserve-symlinks", "a.js", "b.js"], "v24.21.0"),
+        (["node", "--test", "a.js", "notes.txt"], "v24.21.0"),
+    ],
+)
+def test_node_single_file_row_stays_one_launch_with_todays_argv(
+    tmp_path: Path, monkeypatch, row: list[str], node_version: str
+) -> None:
+    """Everything outside the fan-out shape is one launch, byte for byte."""
+    expected = worker_workspace._appcontainer_node_validation_argv(row, node_version)
+
+    result, launches, _probed = _run_node_lane_validation(
+        tmp_path, monkeypatch, list(row), node_version=node_version
+    )
+
+    assert [list(launch.request.argv) for launch in launches] == [expected]
+    assert result.args == expected
+
+
+@pytest.mark.parametrize(
+    ("row", "expected"),
+    [
+        (
+            ["node", "--test", "a.cjs", "b.mjs", "c.ts", "d.cts", "e.mts", "f.js"],
+            [
+                ["node", "--test", file]
+                for file in ("a.cjs", "b.mjs", "c.ts", "d.cts", "e.mts", "f.js")
+            ],
+        ),
+        (
+            ["node.exe", "--a=1", "--test", "--b=2", "z.js", "a.js"],
+            [
+                ["node.exe", "--a=1", "--test", "--b=2", "z.js"],
+                ["node.exe", "--a=1", "--test", "--b=2", "a.js"],
+            ],
+        ),
+        # Each file takes the first file's slot, so a flag after it stays after.
+        (
+            ["node", "--test", "a.js", "--b=2", "c.js"],
+            [
+                ["node", "--test", "a.js", "--b=2"],
+                ["node", "--test", "c.js", "--b=2"],
+            ],
+        ),
+    ],
+)
+def test_node_per_file_argvs_keep_flags_and_declared_order(
+    row: list[str], expected: list[list[str]]
+) -> None:
+    assert (
+        worker_workspace_appcontainer_node._appcontainer_node_per_file_argvs(
+            row, "v24.21.0"
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["--=x", "--flag=", "-x=1", "-x.js", "--flag.js", "a.JS", "a?.js", "[a].js"],
+)
+def test_node_per_file_argvs_refuse_anything_outside_the_shape(bad: str) -> None:
+    assert (
+        worker_workspace_appcontainer_node._appcontainer_node_per_file_argvs(
+            ["node", "--test", bad, "a.js", "b.js"], "v24.21.0"
+        )
+        is None
+    )
+
+
+class _NodeRowClock:
+    """Stands in for ``time`` so a row's deadline moves only when told to."""
+
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def _fold_node_row(monkeypatch, steps, *, timeout_seconds: int = 30):
+    """Run a three-file row against scripted per-file outcomes.
+
+    A step is a ``(returncode, stdout, stderr)`` tuple, an exception to raise,
+    or a callable given the clock and returning either.
+    """
+    clock = _NodeRowClock()
+    monkeypatch.setattr(worker_workspace_appcontainer_node, "time", clock)
+    calls: list[tuple[list[str], dict]] = []
+
+    def _run_one(argv, **kwargs):
+        step = steps[len(calls)]
+        calls.append((list(argv), kwargs))
+        if callable(step):
+            step = step(clock)
+        if isinstance(step, BaseException):
+            raise step
+        return subprocess.CompletedProcess(argv, *step)
+
+    declared = ["node", "--test", "a.js", "b.js", "c.js"]
+    outcome: list = []
+    try:
+        outcome.append(
+            worker_workspace_appcontainer_node._run_appcontainer_node_row_per_file(
+                _run_one,
+                declared,
+                "v24.21.0",
+                timeout_seconds=timeout_seconds,
+                cwd="wt",
+            )
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        outcome.append(exc)
+    return outcome[0], calls, declared
+
+
+def test_node_row_returns_none_without_launching_when_it_does_not_fan_out() -> None:
+    def _never(*_args, **_kwargs):
+        raise AssertionError("must not launch")
+
+    assert (
+        worker_workspace_appcontainer_node._run_appcontainer_node_row_per_file(
+            _never, ["node", "--test", "a.js"], "v24.21.0", timeout_seconds=30
+        )
+        is None
+    )
+
+
+def test_node_row_runs_every_file_and_keeps_the_first_failure(monkeypatch) -> None:
+    """A failing file does not stop the row: that would change its meaning."""
+    result, calls, declared = _fold_node_row(
+        monkeypatch, [(0, "a", "A"), (3, "b", "B"), (5, "c", "C")]
+    )
+
+    assert [argv[-1] for argv, _kwargs in calls] == ["a.js", "b.js", "c.js"]
+    assert all(kwargs["cwd"] == "wt" for _argv, kwargs in calls)
+    assert result.returncode == 3
+    assert (result.stdout, result.stderr) == ("abc", "ABC")
+    assert result.args == declared
+
+
+def test_node_row_is_green_only_when_every_file_is(monkeypatch) -> None:
+    result, _calls, _declared = _fold_node_row(
+        monkeypatch, [(0, "", ""), (0, "", ""), (0, "", "")]
+    )
+    assert result.returncode == 0
+
+
+def test_node_row_shares_one_deadline_across_its_launches(monkeypatch) -> None:
+    """Each launch gets what is left of the row's budget, not a fresh one."""
+
+    def _slow(returncode: int, seconds: float):
+        def _step(clock: _NodeRowClock):
+            clock.now += seconds
+            return (returncode, "", "")
+
+        return _step
+
+    _result, calls, _declared = _fold_node_row(
+        monkeypatch, [_slow(0, 10.0), _slow(0, 5.5), (0, "", "")]
+    )
+
+    assert [kwargs["timeout_seconds"] for _argv, kwargs in calls] == [
+        30.0,
+        20.0,
+        14.5,
+    ]
+
+
+def test_node_row_timeout_answers_for_the_row_with_partial_output(monkeypatch) -> None:
+    timed_out = subprocess.TimeoutExpired(
+        ["node", "--test", "b.js"], 12.5, output="b-part", stderr="B-part"
+    )
+
+    raised, calls, declared = _fold_node_row(monkeypatch, [(1, "a", "A"), timed_out])
+
+    assert isinstance(raised, subprocess.TimeoutExpired)
+    assert raised.cmd == declared
+    assert raised.timeout == 30
+    assert (raised.stdout, raised.stderr) == ("ab-part", "AB-part")
+    assert raised.__cause__ is timed_out
+    assert len(calls) == 2
+
+
+def test_node_row_timeout_tolerates_a_launch_with_no_partial_output(
+    monkeypatch,
+) -> None:
+    raised, _calls, _declared = _fold_node_row(
+        monkeypatch,
+        [(0, "a", "A"), subprocess.TimeoutExpired(["node"], 1), (0, "", "")],
+    )
+    assert (raised.stdout, raised.stderr) == ("a", "A")
+
+
+def test_node_row_spent_deadline_never_starts_the_next_file(monkeypatch) -> None:
+    def _spends_it_all(clock: _NodeRowClock):
+        clock.now += 30.0
+        return (0, "a", "A")
+
+    raised, calls, declared = _fold_node_row(
+        monkeypatch, [_spends_it_all, (0, "b", "B"), (0, "c", "C")]
+    )
+
+    assert isinstance(raised, subprocess.TimeoutExpired)
+    assert raised.cmd == declared
+    assert raised.timeout == 30
+    assert (raised.stdout, raised.stderr) == ("a", "A")
+    assert len(calls) == 1
+
+
+def test_node_row_oserror_propagates_unchanged(monkeypatch) -> None:
+    refused = OSError("windows_appcontainer_validation_launch_failed:x")
+
+    raised, calls, _declared = _fold_node_row(
+        monkeypatch, [(0, "a", "A"), refused, (0, "c", "C")]
+    )
+
+    assert raised is refused
+    assert len(calls) == 2
+
+
 @pytest.mark.parametrize(
     "argv",
     [["pytest", "-q"], ["git", "diff", "--check"], ["npm", "--test", "run"]],
