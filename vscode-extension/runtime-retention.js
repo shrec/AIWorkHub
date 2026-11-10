@@ -3,11 +3,13 @@
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const { Worker, isMainThread, parentPort, workerData } = require("worker_threads");
 
 const GENERATION_SCHEMA = "aiworkhub.stable_runtime.v1";
 const LEASE_SCHEMA = "aiworkhub.stable_runtime_lease.v1";
 const RETENTION_SCHEMA = "aiworkhub.runtime_retention.v1";
 const RETENTION_MARKER_SCHEMA = "aiworkhub.runtime_retention_marker.v1";
+const SCAN_WORKER_SCHEMA = "aiworkhub.runtime_retention_scan_worker.v1";
 const KEEP_GENERATIONS = 3;
 const MIN_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const LEASE_FRESH_MS = 10 * 60 * 1000;
@@ -391,6 +393,38 @@ function purge(options) {
   return { ok: true, batch_id: manifest.batch_id, purged: true, bytes };
 }
 
+// NF-2026-02223: scan() walks every generation tree synchronously; on the
+// extension-host thread that stalls every extension in the window. scanAsync
+// runs the same scan() in a worker thread of THIS file (no extra file to
+// package) with the default pidAlive, and resolves with its exact payload.
+function scanAsync(options) {
+  const input = {
+    storageRoot: String(path.resolve(options.storageRoot)),
+    nowMs: Number.isFinite(options.nowMs) ? options.nowMs : Date.now(),
+  };
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      fn(value);
+    };
+    let worker;
+    try {
+      worker = new Worker(__filename, { workerData: { schema_id: SCAN_WORKER_SCHEMA, options: input } });
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    worker.once("message", (reply) => {
+      if (reply && reply.ok === true) settle(resolve, reply.payload);
+      else settle(reject, new Error(String((reply && reply.error) || "runtime_retention_scan_worker_failed")));
+    });
+    worker.once("error", (err) => settle(reject, err));
+    worker.once("exit", (code) => settle(reject, new Error(`runtime_retention_scan_worker_exit:${code}`)));
+  });
+}
+
 module.exports = {
   GENERATION_SCHEMA,
   KEEP_GENERATIONS,
@@ -405,4 +439,15 @@ module.exports = {
   quarantine,
   restore,
   scan,
+  scanAsync,
 };
+
+if (!isMainThread && workerData && workerData.schema_id === SCAN_WORKER_SCHEMA) {
+  let reply;
+  try {
+    reply = { ok: true, payload: scan(workerData.options) };
+  } catch (err) {
+    reply = { ok: false, error: String((err && err.message) || err) };
+  }
+  parentPort.postMessage(reply);
+}

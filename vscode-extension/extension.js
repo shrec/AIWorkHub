@@ -680,6 +680,24 @@ const MCP_DASHBOARD_SNAPSHOT_TIMEOUT_MS = 120000;
 // lightweight dashboard read.  Keep the budget bounded, but do not force the
 // editor model through the dashboard's 20 second latency envelope.
 const VSCODE_LM_WORKER_TOOL_TIMEOUT_MS = 90000;
+// NF-2026-02223: a request timer that fires later than this was delayed by an
+// extension-host stall, not by the server; it re-checks after one grace.
+const MCP_TIMER_LAG_TOLERANCE_MS = 1000;
+const MCP_TIMER_LAG_GRACE_MS = 5000;
+// Event-loop stall probe: tick period and the lateness that is reported.
+const HOST_STALL_PROBE_INTERVAL_MS = 1000;
+const HOST_STALL_REPORT_MS = 2000;
+// Runtime-retention scan results (or failures) are reused for this long.
+const RUNTIME_RETENTION_CACHE_MS = 60000;
+
+// A pending request owns at most one live timer or immediate at a time.
+function clearPendingRequestTimer(record) {
+  if (!record) return;
+  if (record.timer) clearTimeout(record.timer);
+  if (record.immediate) clearImmediate(record.immediate);
+  record.timer = null;
+  record.immediate = null;
+}
 const MCP_MAX_PENDING_REQUESTS = 16;
 const MCP_MAX_LINE_BYTES = 8 * 1024 * 1024;
 const MCP_MAX_STDERR_LOG_BYTES = 4096;
@@ -2717,7 +2735,7 @@ class McpStdioClient {
     }
     this.pending.delete(message.id);
     this.pendingChildren.delete(message.id);
-    clearTimeout(pending.timer);
+    clearPendingRequestTimer(pending);
     if (message.error) {
       if (this._hadValidResponse && isPoisonedInvalidParamsError(message.error)) {
         this._consecutiveInvalidParams += 1;
@@ -2825,7 +2843,7 @@ class McpStdioClient {
 
   _failPending(err) {
     for (const pending of this.pending.values()) {
-      clearTimeout(pending.timer);
+      clearPendingRequestTimer(pending);
       pending.reject(err);
     }
     this.pending.clear();
@@ -2839,7 +2857,7 @@ class McpStdioClient {
       }
       const pending = this.pending.get(id);
       if (pending) {
-        clearTimeout(pending.timer);
+        clearPendingRequestTimer(pending);
         pending.reject(err);
         this.pending.delete(id);
       }
@@ -2860,11 +2878,14 @@ class McpStdioClient {
     this.stdoutDecoder = new StringDecoder("utf8");
   }
 
-  _enqueueWrite(child, payload, callback) {
+  _enqueueWrite(child, payload, callback, request = null) {
     this._outbound.push({
       child,
       payload,
       callback: typeof callback === "function" ? callback : null,
+      // Request frames carry their id and pending record; notify() frames
+      // carry none and are always written.
+      request: request && request.record ? request : null,
     });
     this._drainOutbound();
   }
@@ -2874,6 +2895,18 @@ class McpStdioClient {
     while (this._outbound.length > 0) {
       const frame = this._outbound.shift();
       if (frame.child !== this.child) continue;
+      // NF-2026-02223: a request that already timed out (or was failed) while
+      // queued behind a slow write must never reach the child: the server
+      // would spend time on work nobody awaits any more.
+      if (frame.request && this.pending.get(frame.request.id) !== frame.request.record) {
+        debugTrace("mcp.request.dropped_unwritten", {
+          child_pid: frame.child && frame.child.pid,
+          id: frame.request.id,
+          method: frame.request.method,
+          tool: frame.request.tool,
+        });
+        continue;
+      }
       this._outboundWriting = true;
       const epoch = this._outboundEpoch;
       let settled = false;
@@ -2922,14 +2955,37 @@ class McpStdioClient {
       payload_bytes: Buffer.byteLength(payload, "utf8"),
     });
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        this.pendingChildren.delete(id);
+      // NF-2026-02223: after a host stall Node runs expired timers before it
+      // reads stdout, so a reply already in the pipe would lose to its own
+      // timeout. A timer that fires more than MCP_TIMER_LAG_TOLERANCE_MS late
+      // waits one grace plus one setImmediate (at least one poll phase) and
+      // rejects only if the request is still unanswered. `record.timer` /
+      // `record.immediate` always hold the CURRENT handle so every settle
+      // path clears the right one.
+      let settled = false;
+      const record = {
+        resolve: (value) => { settled = true; resolve(value); },
+        reject: (err) => { settled = true; reject(err); },
+        timer: null,
+        immediate: null,
+        method,
+        tool,
+      };
+      const dueAt = Date.now() + timeoutMs;
+      const owned = () => this.pending.get(id) === record;
+      const rejectTimeout = (lagMs) => {
+        if (settled) return;
+        record.timer = null;
+        record.immediate = null;
+        if (owned()) {
+          this.pending.delete(id);
+          this.pendingChildren.delete(id);
+        }
         if (this.child === requestChild && !this.initialized) {
           this.child = null;
           this._terminateOwnedChild(requestChild);
         }
-        debugTrace("mcp.request.timeout", { child_pid: requestChild.pid, id, method, tool });
+        debugTrace("mcp.request.timeout", { child_pid: requestChild.pid, id, method, tool, lag_ms: lagMs });
         const error = new Error("mcp_request_timeout");
         error.mcpDiagnostics = {
           phase: "request_wait",
@@ -2938,16 +2994,37 @@ class McpStdioClient {
           tool,
           child_pid: requestChild.pid || 0,
           timeout_ms: timeoutMs,
+          lag_ms: lagMs,
         };
-        reject(error);
+        record.reject(error);
+      };
+      record.timer = setTimeout(() => {
+        record.timer = null;
+        if (settled) return;
+        const lagMs = Math.max(0, Date.now() - dueAt);
+        if (lagMs <= MCP_TIMER_LAG_TOLERANCE_MS || !owned()) {
+          rejectTimeout(lagMs);
+          return;
+        }
+        debugTrace("mcp.request.timeout_deferred", { child_pid: requestChild.pid, id, method, tool, lag_ms: lagMs });
+        record.timer = setTimeout(() => {
+          record.timer = null;
+          if (settled) return;
+          record.immediate = setImmediate(() => {
+            record.immediate = null;
+            rejectTimeout(lagMs);
+          });
+        }, MCP_TIMER_LAG_GRACE_MS);
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer, method, tool });
+      this.pending.set(id, record);
       this.pendingChildren.set(id, requestChild);
       this._enqueueWrite(requestChild, payload, (err) => {
         if (err) {
-          this.pending.delete(id);
-          this.pendingChildren.delete(id);
-          clearTimeout(timer);
+          if (owned()) {
+            this.pending.delete(id);
+            this.pendingChildren.delete(id);
+          }
+          clearPendingRequestTimer(record);
           debugTrace("mcp.request.write_error", {
             child_pid: requestChild.pid,
             id,
@@ -2955,11 +3032,11 @@ class McpStdioClient {
             tool,
             ...debugErrorFields(err),
           });
-          reject(err);
+          record.reject(err);
         } else {
           debugTrace("mcp.request.written", { child_pid: requestChild.pid, id, method, tool });
         }
-      });
+      }, { id, record, method, tool });
     });
   }
 
@@ -3095,6 +3172,8 @@ let vscodeLmBridgeHost = null;
 let stableRuntimeInfo = null;
 const stableRuntimeLeases = new Map();
 let runtimeRetentionCache = null;
+let runtimeRetentionScanPromise = null;
+let runtimeRetentionEpoch = 0;
 
 function retireUnusedStableRuntimeLeases() {
   for (const [generationRoot, record] of stableRuntimeLeases) {
@@ -3129,7 +3208,7 @@ function startStableRuntimeLease(runtimeInfo) {
     stableRuntimeLeases.set(runtimeInfo.generationRoot, { lease, timer, children: new Set() });
   }
   stableRuntimeInfo = runtimeInfo;
-  runtimeRetentionCache = null;
+  invalidateRuntimeRetentionCache();
   retireUnusedStableRuntimeLeases();
 }
 
@@ -3144,21 +3223,109 @@ function releaseStableRuntimeChild(child) {
   retireUnusedStableRuntimeLeases();
 }
 
-function runtimeRetentionSnapshot({ force = false } = {}) {
-  if (!stableRuntimeInfo || !stableRuntimeInfo.storageRoot) {
-    return { ok: false, error: "runtime_global_storage_unavailable", candidates: [], quarantine_batches: [] };
-  }
-  const now = Date.now();
-  if (!force && runtimeRetentionCache && now - runtimeRetentionCache.cached_at < 60000) {
-    return runtimeRetentionCache.payload;
-  }
+function runtimeRetentionUnavailable() {
+  return { ok: false, error: "runtime_global_storage_unavailable", candidates: [], quarantine_batches: [] };
+}
+
+function invalidateRuntimeRetentionCache() {
+  runtimeRetentionCache = null;
+  // A scan that started before a quarantine/restore/purge describes the old
+  // tree: its result is still returned to whoever awaits it, never cached,
+  // and the next snapshot starts its own scan instead of joining it.
+  runtimeRetentionEpoch += 1;
+  runtimeRetentionScanPromise = null;
+}
+
+// NF-2026-02223: the retention scan walks every runtime generation and must
+// never run on the extension-host thread. scanAsync runs it in a worker; the
+// result -- or a named failure -- is cached for RUNTIME_RETENTION_CACHE_MS
+// counted from the moment the scan finished.
+function scanRuntimeRetentionOffThread() {
+  const storageRoot = stableRuntimeInfo.storageRoot;
+  const epoch = runtimeRetentionEpoch;
+  let started;
   try {
-    const payload = runtimeRetention.scan({ storageRoot: stableRuntimeInfo.storageRoot, nowMs: now });
-    runtimeRetentionCache = { cached_at: now, payload };
-    return payload;
+    // Started synchronously so a second caller in the same tick joins it.
+    started = Promise.resolve(runtimeRetention.scanAsync({ storageRoot, nowMs: Date.now() }));
   } catch (err) {
-    return { ok: false, error: sanitizeErrorMessage(err), candidates: [], quarantine_batches: [] };
+    started = Promise.reject(err);
   }
+  return started
+    .catch((err) => ({ ok: false, error: sanitizeErrorMessage(err), candidates: [], quarantine_batches: [] }))
+    .then((payload) => {
+      if (epoch === runtimeRetentionEpoch && stableRuntimeInfo && stableRuntimeInfo.storageRoot === storageRoot) {
+        runtimeRetentionCache = { cached_at: Date.now(), payload };
+      }
+      return payload;
+    });
+}
+
+function startRuntimeRetentionScan() {
+  if (runtimeRetentionScanPromise) return runtimeRetentionScanPromise;
+  const run = scanRuntimeRetentionOffThread().finally(() => {
+    if (runtimeRetentionScanPromise === run) runtimeRetentionScanPromise = null;
+  });
+  runtimeRetentionScanPromise = run;
+  return run;
+}
+
+// Never scans on the host thread: returns the last cached payload (undefined
+// before the first background scan finishes) and starts at most one
+// background scan when the cache is missing or stale.
+function runtimeRetentionSnapshot() {
+  if (!stableRuntimeInfo || !stableRuntimeInfo.storageRoot) return runtimeRetentionUnavailable();
+  const cache = runtimeRetentionCache;
+  if (!cache || Date.now() - cache.cached_at >= RUNTIME_RETENTION_CACHE_MS) {
+    startRuntimeRetentionScan();
+  }
+  return cache ? cache.payload : undefined;
+}
+
+// Snapshot posts omit the field until a payload exists, so the Webview keeps
+// the runtime-storage section hidden instead of rendering an empty one.
+function runtimeRetentionSnapshotFields() {
+  const payload = runtimeRetentionSnapshot();
+  return payload === undefined ? {} : { extension_runtime_storage: payload };
+}
+
+// An explicit cleanup needs a preview that is fresh now: await one dedicated
+// off-thread scan instead of serving the cache.
+async function refreshRuntimeRetentionSnapshot() {
+  if (!stableRuntimeInfo || !stableRuntimeInfo.storageRoot) return runtimeRetentionUnavailable();
+  return scanRuntimeRetentionOffThread();
+}
+
+let hostStallProbeTimer = null;
+
+// One unref'd interval measures how late it fires. A tick at least
+// HOST_STALL_REPORT_MS late writes one host.event_loop.stall line with the
+// process CPU spent since the previous tick; healthy ticks write nothing.
+// ponytail: cpu close to stall_ms means JS ran in this host (ours or another
+// extension), cpu near 0 means the host thread was blocked or starved.
+function startHostStallProbe() {
+  stopHostStallProbe();
+  let dueAt = Date.now() + HOST_STALL_PROBE_INTERVAL_MS;
+  let lastCpu = process.cpuUsage();
+  hostStallProbeTimer = setInterval(() => {
+    const now = Date.now();
+    const cpu = process.cpuUsage();
+    const stallMs = now - dueAt;
+    if (stallMs >= HOST_STALL_REPORT_MS) {
+      debugTrace("host.event_loop.stall", {
+        stall_ms: stallMs,
+        cpu_user_ms: Math.round((cpu.user - lastCpu.user) / 1000),
+        cpu_system_ms: Math.round((cpu.system - lastCpu.system) / 1000),
+      });
+    }
+    lastCpu = cpu;
+    dueAt = now + HOST_STALL_PROBE_INTERVAL_MS;
+  }, HOST_STALL_PROBE_INTERVAL_MS);
+  if (typeof hostStallProbeTimer.unref === "function") hostStallProbeTimer.unref();
+}
+
+function stopHostStallProbe() {
+  if (hostStallProbeTimer) clearInterval(hostStallProbeTimer);
+  hostStallProbeTimer = null;
 }
 
 function vscodeLmBridgeRoot() {
@@ -10675,7 +10842,7 @@ async function pushSnapshotOnce(view) {
           payload: sanitizeWebviewPayload({
             ...summaryPayload,
             system_logs: systemLogSnapshot(),
-            extension_runtime_storage: runtimeRetentionSnapshot(),
+            ...runtimeRetentionSnapshotFields(),
           }),
         });
         debugTrace("snapshot.summary.posted", { request_seq: requestSeq });
@@ -10709,7 +10876,7 @@ async function pushSnapshotOnce(view) {
           payload: sanitizeWebviewPayload({
             ...payload,
             system_logs: systemLogSnapshot(),
-            extension_runtime_storage: runtimeRetentionSnapshot(),
+            ...runtimeRetentionSnapshotFields(),
           }),
         });
         view.fullSnapshotPainted = true;
@@ -10770,7 +10937,7 @@ async function pushSnapshotNoRetry(view, options = {}) {
         payload: sanitizeWebviewPayload({
           ...payload,
           system_logs: systemLogSnapshot(),
-          extension_runtime_storage: runtimeRetentionSnapshot(),
+          ...runtimeRetentionSnapshotFields(),
         }),
       });
       view.fullSnapshotPainted = true;
@@ -11729,7 +11896,7 @@ async function runTaskQuarantinePurge(view, batchId) {
 }
 
 async function runRuntimeCleanup(view) {
-  const preview = runtimeRetentionSnapshot({ force: true });
+  const preview = await refreshRuntimeRetentionSnapshot();
   if (!preview || preview.ok !== true) {
     view.postMessage({ type: OUTBOUND_TYPES.error, message: (preview && preview.error) || "runtime_retention_preview_failed" });
     return;
@@ -11752,8 +11919,10 @@ async function runRuntimeCleanup(view) {
       previewDigest: String(preview.preview_digest || ""),
       confirm: true,
     });
-    runtimeRetentionCache = null;
+    invalidateRuntimeRetentionCache();
     view.postMessage({ type: OUTBOUND_TYPES.notification, message: `Quarantined ${Number(result.quarantined || 0)} runtime generation(s)` });
+    // Await a scan of the changed tree so this post carries its storage data.
+    await startRuntimeRetentionScan();
     await pushSnapshot(view);
   } catch (err) {
     view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
@@ -11770,8 +11939,10 @@ async function runRuntimeRestore(view, batchId) {
   if (choice !== "Restore Runtimes") return;
   try {
     const result = runtimeRetention.restore({ storageRoot: stableRuntimeInfo.storageRoot, batchId, confirm: true });
-    runtimeRetentionCache = null;
+    invalidateRuntimeRetentionCache();
     view.postMessage({ type: OUTBOUND_TYPES.notification, message: `Restored ${Number(result.restored || 0)} runtime generation(s)` });
+    // Await a scan of the changed tree so this post carries its storage data.
+    await startRuntimeRetentionScan();
     await pushSnapshot(view);
   } catch (err) {
     view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
@@ -11788,8 +11959,10 @@ async function runRuntimePurge(view, batchId) {
   if (choice !== "Permanently Purge Runtimes") return;
   try {
     const result = runtimeRetention.purge({ storageRoot: stableRuntimeInfo.storageRoot, batchId, confirm: true });
-    runtimeRetentionCache = null;
+    invalidateRuntimeRetentionCache();
     view.postMessage({ type: OUTBOUND_TYPES.notification, message: `Purged ${Number(result.bytes || 0)} bytes of expired runtime cache` });
+    // Await a scan of the changed tree so this post carries its storage data.
+    await startRuntimeRetentionScan();
     await pushSnapshot(view);
   } catch (err) {
     view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
@@ -14987,6 +15160,7 @@ async function activate(context) {
   }
   initializeDebugTracing(context);
   debugTrace("activation.begin", { version: EXPECTED_MCP_PACKAGE_VERSION });
+  startHostStallProbe();
   outputChannel = createManagedOutputChannel();
   context.subscriptions.push(outputChannel);
   const vscodeLmBridgeEnabled = aiworkhubFeatureEnabled("enableVscodeLmBridge");
@@ -15158,6 +15332,7 @@ async function runDeactivateStep(name, step) {
 }
 
 async function deactivate() {
+  stopHostStallProbe();
   stopStableRuntimeLease();
   stopDispatcherWatchdog();
   stopWindowRouteRenewalTimer();
@@ -15240,6 +15415,20 @@ module.exports = {
     pushSnapshot,
     pushSnapshotOnce,
     pushSnapshotNoRetry,
+    runRuntimeCleanup,
+    runtimeRetentionSnapshot,
+    invalidateRuntimeRetentionCache,
+    runtimeRetentionScanForTest: () => runtimeRetentionScanPromise,
+    runtimeRetentionCacheForTest: () => runtimeRetentionCache,
+    bindStableRuntimeInfoForTest: (info) => {
+      stableRuntimeInfo = info || null;
+      invalidateRuntimeRetentionCache();
+      runtimeRetentionScanPromise = null;
+      return stableRuntimeInfo;
+    },
+    startHostStallProbe,
+    stopHostStallProbe,
+    isHostStallProbeActive: () => Boolean(hostStallProbeTimer),
     canonicalSnapshotJson,
     snapshotSectionDigest,
     mergeSnapshotDelta,
@@ -15399,6 +15588,11 @@ module.exports = {
       MCP_REQUEST_TIMEOUT_MS,
       MCP_INITIALIZE_TIMEOUT_MS,
       MCP_DASHBOARD_SNAPSHOT_TIMEOUT_MS,
+      MCP_TIMER_LAG_TOLERANCE_MS,
+      MCP_TIMER_LAG_GRACE_MS,
+      HOST_STALL_PROBE_INTERVAL_MS,
+      HOST_STALL_REPORT_MS,
+      RUNTIME_RETENTION_CACHE_MS,
       VSCODE_LM_WORKER_TOOL_TIMEOUT_MS,
       VSCODE_LM_WORKER_SOURCE_GRAPH_READY_TIMEOUT_MS,
       MCP_SNAPSHOT_RECOVERY_ATTEMPTS,

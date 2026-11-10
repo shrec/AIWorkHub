@@ -146,3 +146,22 @@ function fixture() {
 }
 
 console.log("runtime retention lifecycle: ok");
+
+// NF-2026-02223: the worker-thread scan is the same scan, byte for byte.
+(async () => {
+  const value = fixture();
+  try {
+    const options = { storageRoot: value.storageRoot, nowMs: value.nowMs };
+    const viaWorker = await retention.scanAsync(options);
+    const onThread = retention.scan(options);
+    assert.deepStrictEqual(viaWorker, onThread);
+    assert.equal(viaWorker.preview_digest, onThread.preview_digest);
+    assert.deepEqual(viaWorker.candidates.map((item) => item.name), value.names.slice(0, 2));
+  } finally {
+    fs.rmSync(value.storageRoot, { recursive: true, force: true });
+  }
+  console.log("runtime retention scanAsync: ok");
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
