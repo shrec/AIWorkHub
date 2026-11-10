@@ -65,8 +65,10 @@ def _tracked_files() -> list[str]:
     """Tracked paths under ROOTS.
 
     When git cannot answer (no git binary, or a worktree whose git directory is
-    unreachable, as in a sandbox) the on-disk files under ROOTS are scanned
-    instead, so the guard only gets stricter.
+    unreachable, as in a sandbox), or answers with no paths at all (exit 0 with
+    empty stdout: an extracted archive such as `git archive HEAD` nested inside
+    another work tree, which git resolves to the enclosing repository), the
+    on-disk files under ROOTS are scanned instead, so the guard only gets stricter.
     """
     git = shutil.which("git")
     if git is None:
@@ -77,7 +79,9 @@ def _tracked_files() -> list[str]:
         check=False,
     )
     if result.returncode == 0:
-        return [name for name in result.stdout.decode("utf-8").split("\0") if name]
+        tracked = [name for name in result.stdout.decode("utf-8").split("\0") if name]
+        if tracked:
+            return tracked
     return _on_disk_files()
 
 
@@ -176,3 +180,15 @@ def test_guard_passes_on_its_own_source() -> None:
     text = _read_text(Path(__file__))
     assert text is not None
     assert scan_text(text) == []
+
+
+def test_empty_ls_files_answer_falls_back_to_on_disk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(
+            args=args, returncode=0, stdout=b"", stderr=b""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert _tracked_files() == _on_disk_files()
