@@ -559,6 +559,49 @@ def test_recover_blocked_terminal_failure_retained_delta_without_required_output
         ) == (True, "already_recovered")
 
 
+def test_retained_terminal_scope_amendment_widens_and_recovers(tmp_path: Path) -> None:
+    repo, _candidate, _hashes = _retained_terminal_failure_fixture(tmp_path)
+    task_id = "BLOCKED_RETAINED_EMPTY_OUTPUTS"
+    new_path = "tests/test_retained_scope_amendment_nf02209.py"
+
+    assert task_store.recover_blocked_rework(
+        repo, task_id, actor="coordinator",
+        feedback_reason="NeedFix: widen scope for retained candidate",
+        allowed_writes_amendment=[new_path],
+    ) == (True, "recovered")
+
+    card = _get_card(repo, task_id)
+    assert card["status"] == "pending"
+    assert new_path in card["allowed_writes"]
+    assert "src/aiworkhub/task_store.py" in card["allowed_writes"]
+    (entry,) = card["allowed_writes_amendments"]
+    assert set(entry) == {"paths", "actor", "request_id", "at"}
+    assert entry["paths"] == [new_path]
+    assert entry["request_id"] == "a" * 32
+    assert card["rework_predecessor"]["request_id"] == "a" * 32
+
+
+def test_retained_terminal_scope_narrowed_card_stays_refused(tmp_path: Path) -> None:
+    repo, _candidate, _hashes = _retained_terminal_failure_fixture(
+        tmp_path, required_outputs=True,
+    )
+    task_id = "BLOCKED_RETAINED_EMPTY_OUTPUTS"
+    card = _get_card(repo, task_id)
+    card["allowed_writes"] = [
+        path for path in card["allowed_writes"] if path != "tests/test_retained_candidate.py"
+    ]
+    _ready, db_path = task_store._require_ready(repo)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?", (json.dumps(card), task_id),
+        )
+
+    assert task_store.recover_blocked_rework(
+        repo, task_id, actor="coordinator", feedback_reason="NeedFix: narrowed scope",
+    ) == (False, "retained_terminal_candidate_identity_invalid:workspace_allowed_writes")
+    assert _get_card(repo, task_id)["status"] == "blocked"
+
+
 @pytest.mark.parametrize(("mutation", "expected"), [
     ("missing_event", "no_retained_predecessor_evidence"),
     ("event_mismatch", "retained_terminal_candidate_event_mismatch"),

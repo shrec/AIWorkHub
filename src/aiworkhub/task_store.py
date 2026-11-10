@@ -6934,7 +6934,7 @@ def retained_terminal_rework_predecessor(
         lambda: identity.get("base_oid") != workspace.get("base_oid"),
         lambda: identity.get("parent_baseline") != workspace.get("parent_baseline"),
         lambda: workspace.get("request_id") != request_id,
-        lambda: set(workspace.get("allowed_writes") or ()) != set(allowed_writes),
+        lambda: not set(workspace.get("allowed_writes") or ()) <= set(allowed_writes),
         lambda: not request_id,
     )
     for check_name, check_failed in zip(
