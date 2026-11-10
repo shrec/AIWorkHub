@@ -207,6 +207,40 @@ def test_a_needfix_backed_card_is_a_fix_that_resolves_its_needfix(repo):
     ]
 
 
+def test_a_refs_line_is_a_declared_reference_that_closes_nothing(repo):
+    commit = _accept(repo, card={**CARD, "objective": "Touches the old path.\nRefs: NF-2026-00042"})
+
+    assert commit["state"] == "committed", commit
+    assert "needfix_named_not_declared" not in commit
+    assert not any(line.startswith("Resolves:") for line in _message(repo))
+
+
+def test_a_resolves_line_writes_its_trailer_and_a_refs_line_beside_it_does_not(repo):
+    objective = "Fixes the path.\nResolves: NF-2026-00042\nRefs: NF-2026-00043"
+    commit = _accept(repo, card={**CARD, "objective": objective})
+
+    assert commit["state"] == "committed", commit
+    assert _message(repo)[-3:] == [
+        "Resolves: NF-2026-00042",
+        f"AIWorkHub-Task: {TASK_ID}",
+        f"AIWorkHub-Request: {REQUEST_ID}",
+    ]
+    assert "needfix_named_not_declared" not in commit
+
+
+def test_undeclared_needfix_ids_counts_only_ids_without_a_whole_declaration_line():
+    assert accept_commit.undeclared_needfix_ids("Fix NF-2026-00001", "Done.") == ["NF-2026-00001"]
+    assert accept_commit.undeclared_needfix_ids(
+        "t", "Resolves: NF-2026-00002\nRefs: NF-2026-00003"
+    ) == []
+    assert accept_commit.undeclared_needfix_ids("t", "see `Resolves: NF-2026-00004`") == [
+        "NF-2026-00004"
+    ]
+    assert accept_commit.undeclared_needfix_ids(
+        "t", "Resolves: NF-2026-00005 and NF-2026-00006 in prose"
+    ) == ["NF-2026-00005", "NF-2026-00006"]
+
+
 def test_a_long_title_is_clipped_on_a_word_boundary_and_kept_whole_in_the_body(repo):
     title = " ".join(["promoted"] * 20)
     commit = _accept(repo, card={**CARD, "title": title, "work_kind": "bugfix"})

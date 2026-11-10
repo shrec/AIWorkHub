@@ -1640,6 +1640,38 @@ def _current_request_assertion_refusal(
     return None
 
 
+def _undeclared_needfix_refusal(title: str, objective: str) -> dict[str, Any] | None:
+    """Refuse a card that names an active NeedFix in prose without a whole Resolves:/Refs: line.
+
+    Unknown ids and terminal rows (resolved, rejected, duplicate, ...) never block.
+    """
+
+    active: list[str] = []
+    for needfix_id in accept_commit.undeclared_needfix_ids(title, objective):
+        try:
+            row = needfix_store.get_needfix(core.repo_root(), needfix_id)
+        except needfix_store.NeedFixNotFoundError:
+            continue
+        if row.get("status") not in needfix_store.NEEDFIX_TERMINAL_STATUSES:
+            active.append(needfix_id)
+    if not active:
+        return None
+    fix = (
+        "add one whole line per row to the objective: 'Resolves: <id>' if this card fixes it, "
+        "'Refs: <id>' if it only references it"
+    )
+    return {
+        "ok": False,
+        "error": "needfix_named_not_declared",
+        "needfix_ids": active,
+        "fix": fix,
+        "returncode": 2,
+        "command": [],
+        "stdout": "",
+        "stderr": f"needfix_named_not_declared: {', '.join(active)}; {fix}",
+    }
+
+
 def _task_create_receipt(
     created: Any,
     *,
@@ -4123,6 +4155,9 @@ def aiworkhub_task_create(
     topic, version suffix or prose; the receipt names its state.
     """
 
+    refusal = _undeclared_needfix_refusal(title, objective)
+    if refusal is not None:
+        return refusal
     created = core.create_task(
         task_id=task_id,
         title=title,
@@ -4328,6 +4363,9 @@ def aiworkhub_task_create_from_template(
             "allowed_work_kinds": list(quality_evidence.WORK_KINDS),
             "allowed_validation_roles": list(quality_evidence.VALIDATION_ROLES),
         }
+    refusal = _undeclared_needfix_refusal(card["title"], card["objective"])
+    if refusal is not None:
+        return refusal
     created = core.create_task(
         task_id=task_id,
         title=card["title"],

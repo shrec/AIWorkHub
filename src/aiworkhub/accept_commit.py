@@ -78,6 +78,8 @@ GIT_READ_TIMEOUT_SECONDS = 120
 _NEEDFIX_ID = re.compile(r"NF-\d{4}-\d{5}")
 # A ``Resolves:`` line whose whole content is one id; prose or backticks never match.
 _RESOLVES_LINE = re.compile(r"[ \t]*Resolves:[ \t]*(" + _NEEDFIX_ID.pattern + r")[ \t]*")
+# A ``Refs:`` line: a deliberate reference that closes nothing; the same whole-line rule.
+_REFS_LINE = re.compile(r"[ \t]*Refs:[ \t]*(" + _NEEDFIX_ID.pattern + r")[ \t]*")
 # An id named anywhere in prose; word boundaries keep a longer number from matching.
 _NAMED_NEEDFIX_ID = re.compile(r"\b" + _NEEDFIX_ID.pattern + r"\b")
 _NEEDFIX_TASK_ID = re.compile(r"needfix-(NF-\d{4}-\d{5})(?:-|$)")
@@ -155,7 +157,7 @@ def commit_promoted(
         if not set(paths) & _dirty_paths(root):
             return _reply(_decided(STATE_SKIPPED, SKIP_PROMOTED_PATHS_UNCHANGED), listed, subject)
         declared = _declared_records(card, needfix_id)
-        named = _named_not_declared(card, needfix_id, declared)
+        named = _named_not_declared(card, needfix_id)
         trailers = _trailers(
             root, head, task_id=task_id, request_id=request_id, needfix_id=needfix_id,
             declared=declared,
@@ -380,14 +382,24 @@ def _declared_records(card: Mapping[str, Any] | None, needfix_id: str | None) ->
     return declared
 
 
-def _named_not_declared(
-    card: Mapping[str, Any] | None, needfix_id: str | None, declared: Sequence[str]
-) -> list[str]:
-    """NeedFix ids the card names in prose: reported to the manager, never closed."""
+def _whole_line_ids(text: str, pattern: re.Pattern[str]) -> set[str]:
+    """NeedFix ids on whole lines matching ``pattern``; prose and backticks never match."""
 
-    text = _card_text(card, "title") + "\n" + _card_text(card, "objective")
-    known = {*declared, *([needfix_id] if needfix_id else [])}
-    return sorted(set(_NAMED_NEEDFIX_ID.findall(text)) - known)
+    return {m.group(1) for line in re.split(r"\r?\n", text) if (m := pattern.fullmatch(line))}
+
+
+def undeclared_needfix_ids(title: str, objective: str) -> list[str]:
+    """Sorted NeedFix ids named in title or objective with no whole ``Resolves:`` or ``Refs:`` line."""
+
+    declared = _whole_line_ids(objective, _RESOLVES_LINE) | _whole_line_ids(objective, _REFS_LINE)
+    return sorted(set(_NAMED_NEEDFIX_ID.findall(f"{title}\n{objective}")) - declared)
+
+
+def _named_not_declared(card: Mapping[str, Any] | None, needfix_id: str | None) -> list[str]:
+    """NeedFix ids the card names in prose without a declaration: reported to the manager, never closed."""
+
+    title, objective = _card_text(card, "title"), _card_text(card, "objective")
+    return [named for named in undeclared_needfix_ids(title, objective) if named != needfix_id]
 
 
 def _trailers(
