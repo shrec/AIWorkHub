@@ -170,17 +170,13 @@ def test_editor_response_applier_is_only_unsandboxed_for_editor_adapters(tmp_pat
         )
 
 
-def test_finalizer_reuses_exact_editor_route_instead_of_windows_appcontainer(
+def test_finalizer_validates_editor_route_under_the_real_host_sandbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        process_launcher,
+        worker_workspace,
         "select_sandbox_backend",
-        lambda: (_ for _ in ()).throw(
-            worker_workspace.WorkspaceError(
-                "windows_appcontainer_sandbox_unavailable"
-            )
-        ),
+        lambda: worker_workspace.WINDOWS_APPCONTAINER_BACKEND,
     )
 
     route = process_launcher._validation_route_kwargs({
@@ -189,7 +185,7 @@ def test_finalizer_reuses_exact_editor_route_instead_of_windows_appcontainer(
     })
 
     assert route == {
-        "backend": "vscode_lm_in_process",
+        "backend": worker_workspace.WINDOWS_APPCONTAINER_BACKEND,
         "adapter_id": "vscode_lm",
     }
 
@@ -209,13 +205,9 @@ def test_validation_only_replay_accepts_deterministic_lane_without_provider_reru
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        process_launcher,
+        worker_workspace,
         "select_sandbox_backend",
-        lambda: (_ for _ in ()).throw(
-            worker_workspace.WorkspaceError(
-                "windows_appcontainer_sandbox_unavailable"
-            )
-        ),
+        lambda: worker_workspace.WINDOWS_APPCONTAINER_BACKEND,
     )
 
     route = process_launcher._validation_route_kwargs({
@@ -226,7 +218,7 @@ def test_validation_only_replay_accepts_deterministic_lane_without_provider_reru
     })
 
     assert route == {
-        "backend": "vscode_lm_in_process",
+        "backend": worker_workspace.WINDOWS_APPCONTAINER_BACKEND,
         "adapter_id": "vscode_lm",
         "outer_validation_authority": True,
     }

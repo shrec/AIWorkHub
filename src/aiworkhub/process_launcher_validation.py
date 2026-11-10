@@ -214,11 +214,27 @@ def host_lane_seal_refusal(
     return ""
 
 
+def _validation_boundary_backend(launch_backend: str) -> str | None:
+    """Return the backend validations run under for this launch-bound backend.
+
+    NF-2026-00410: the editor-hosted route is where the provider ran, not where
+    candidate-authored validation commands may run, so that one launch backend
+    is replaced by the real host sandbox.
+    """
+    if launch_backend != HOST_VALIDATION_LANE_BACKEND:
+        return launch_backend
+    try:
+        return _worker_workspace.select_sandbox_backend()
+    except WorkspaceError:
+        # run_validations resolves again only when it has commands, then fails closed by name.
+        return None
+
+
 def validation_route_kwargs(
     metadata: Mapping[str, Any],
     sandbox_backend_for_adapter: Callable[[str], str],
 ) -> dict[str, Any]:
-    """Return the exact launch-bound validation route, failing on drift."""
+    """Return the validation route, failing on drift from the launch-bound backend."""
     adapter_id = str(metadata.get("adapter_id") or "").strip()
     if not adapter_id:
         raise WorkspaceError("validation_route_adapter_missing")
@@ -241,7 +257,10 @@ def validation_route_kwargs(
             route["outer_validation_authority"] = True
         return route
     expected_backend = sandbox_backend_for_adapter(adapter_id)
-    route = {"backend": expected_backend, "adapter_id": adapter_id}
+    route = {
+        "backend": _validation_boundary_backend(expected_backend),
+        "adapter_id": adapter_id,
+    }
     if execution_mode == "validation_only_replay":
         if recorded_backend and recorded_backend not in {
             expected_backend,
