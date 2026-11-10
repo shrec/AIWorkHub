@@ -17,7 +17,7 @@
     "dashboard_case": "The extension posts repo label, repo_id, repo_name, and storage readiness to the native webview."
   },
   "validation_commands": [
-    "PYTHONPATH=tools/aiworkhub/src /home/shrek/AIWorkHub/.venv/bin/python3 -m pytest -p no:cacheprovider -q tools/aiworkhub/tests/test_aiworkhub_multirepo_mux_b828_v1.py",
+    "PYTHONPATH=tools/aiworkhub/src /home/user/AIWorkHub/.venv/bin/python3 -m pytest -p no:cacheprovider -q tools/aiworkhub/tests/test_aiworkhub_multirepo_mux_b828_v1.py",
     "bash tools/vscode-geoai-task-operations/test_extension_smoke.sh",
     "python3 -m json.tool tools/aiworkhub/eval/aiworkhub_multirepo_mux_b828_v1.json",
     "python3 AITools/taskctl.py verify",

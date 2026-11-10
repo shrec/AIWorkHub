@@ -53,7 +53,7 @@
       "id": "AC_03",
       "description": "Workflows contain no fixed host path, LAN address, local port, owner credential, legacy product name or consumer-project path",
       "status": "PASS",
-      "evidence": "All path references are root-relative (pyproject.toml, tests/, vscode-extension/). No tools/geoai-task-mcp/ prefix, no 127.0.0.1, no port numbers, no /home/ paths, no LAN addresses, no shrec/shrek/GeoAI consumer paths, no legacy product references. AIWorkHub/AWH identity only."
+      "evidence": "All path references are root-relative (pyproject.toml, tests/, vscode-extension/). No tools/geoai-task-mcp/ prefix, no 127.0.0.1, no port numbers, no /home/ paths, no LAN addresses, no private consumer paths, no legacy product references. AIWorkHub/AWH identity only."
     },
     {
       "id": "AC_04",

@@ -40,8 +40,8 @@
     "all_python_compiles": true
   },
   "tests": {
-    "command": "PYTHONPATH=tools/aiworkhub/src:AITools /home/shrek/AIWorkHub/.venv/bin/python -m pytest -q tools/aiworkhub/tests/test_dashboard.py AITools/test_taskctl_dashboard_archive_restore_b406_v1.py AITools/test_taskctl_terminal_review_only_b404_v1.py",
-    "interpreter": "/home/shrek/AIWorkHub/.venv/bin/python",
+    "command": "PYTHONPATH=tools/aiworkhub/src:AITools /home/user/AIWorkHub/.venv/bin/python -m pytest -q tools/aiworkhub/tests/test_dashboard.py AITools/test_taskctl_dashboard_archive_restore_b406_v1.py AITools/test_taskctl_terminal_review_only_b404_v1.py",
+    "interpreter": "/home/user/AIWorkHub/.venv/bin/python",
     "result": "80 passed"
   },
   "coordinator_review": {

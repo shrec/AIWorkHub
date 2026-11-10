@@ -65,7 +65,7 @@
   },
   "validation": [
     {
-      "command": "PYTHONPATH=tools/aiworkhub/src /home/shrek/AIWorkHub/.venv/bin/python3 -m pytest -p no:cacheprovider -q tools/aiworkhub/tests/test_aiworkhub_storage_registry_b824_v1.py",
+      "command": "PYTHONPATH=tools/aiworkhub/src /home/user/AIWorkHub/.venv/bin/python3 -m pytest -p no:cacheprovider -q tools/aiworkhub/tests/test_aiworkhub_storage_registry_b824_v1.py",
       "status": "pass",
       "summary": "4 passed in 0.06s"
     },

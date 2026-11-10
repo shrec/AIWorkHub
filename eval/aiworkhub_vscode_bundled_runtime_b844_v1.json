@@ -91,7 +91,7 @@
       "result": "pass",
       "tests_passed": 9,
       "tests_failed": 0,
-      "note": "run with a python3 exposing pytest + the real mcp package installed in site-packages (/home/shrek/GeoAI/.venv); the isolated smoke still forces and exercises the bundled stdlib fallback via -S, proving the fallback path independent of whether mcp happens to be installed on the host interpreter"
+      "note": "run with a python3 exposing pytest + the real mcp package installed in site-packages (/home/user/GeoAI/.venv); the isolated smoke still forces and exercises the bundled stdlib fallback via -S, proving the fallback path independent of whether mcp happens to be installed on the host interpreter"
     },
     "json_tool": {
       "command": "python3 -m json.tool tools/geoai-task-mcp/eval/aiworkhub_vscode_bundled_runtime_b844_v1.json",

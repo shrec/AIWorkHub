@@ -65,7 +65,7 @@
   ],
   "environment": {
     "AIWORKHUB_ALLOW_WRITES": "0",
-    "AIWORKHUB_REPO": "/home/shrek/AIWorkHub",
+    "AIWORKHUB_REPO": "/home/user/AIWorkHub",
     "PYTHONPATH": "tools/aiworkhub/src"
   },
   "next_wave_task": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_NEURAL_BRIDGE_DISTILL_B114_V1"

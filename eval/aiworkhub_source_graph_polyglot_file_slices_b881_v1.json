@@ -9,14 +9,14 @@
   },
   "before": {
     "behavior": "sg.iter_source_files() never yielded .js/.jsx/.mjs/.cjs/.ts/.tsx paths; sgast.extract_file() on any such file returned status='unsupported_fail_closed', entities=(), edges=(). sg.find/focus/slice/bundle on a JS/TS target returned an empty matches list; project_context with task_type=code and source_graph.required=true raised source_graph_required_empty_result for that target.",
-    "canonical_repo_root": "/home/shrek/GeoAI",
+    "canonical_repo_root": "/home/user/GeoAI",
     "canonical_build_before_fix_files_by_status": {"ok": 6379},
     "canonical_build_before_fix_entity_kinds": {"class": 1034, "function": 48103, "import": 47871, "method": 6781, "module": 6379},
-    "note": "Snapshot taken from the pre-existing canonical /home/shrek/GeoAI/.aiworkhub/source_graph/source_graph.sqlite before this task's incremental rebuild."
+    "note": "Snapshot taken from the pre-existing canonical /home/user/GeoAI/.aiworkhub/source_graph/source_graph.sqlite before this task's incremental rebuild."
   },
   "after": {
     "behavior": "sg.iter_source_files() also globs the JS/TS family (INDEXED_EXTENSIONS = ('.py',) + JS_TS_EXTENSIONS). sgast.extract_file() on a JS/TS file returns status='file_evidence_only' with exactly one kind='file' entity carrying real language/path/hash/byte-size, edges=(). find/focus/slice/bundle on a JS/TS target now return a non-empty, budget-bounded match set built entirely from that one file-evidence entity -- no fabricated semantic content.",
-    "canonical_incremental_rebuild_command": "PYTHONPATH=tools/geoai-task-mcp/src python3 -m aiworkhub.source_graph --repo /home/shrek/GeoAI build -i",
+    "canonical_incremental_rebuild_command": "PYTHONPATH=tools/geoai-task-mcp/src python3 -m aiworkhub.source_graph --repo /home/user/GeoAI build -i",
     "canonical_incremental_rebuild_report_pass1_add_js_ts_family": {
       "files_seen": 12193, "files_changed": 5849, "files_unchanged": 6344, "files_removed": 1,
       "entities_written": 7562, "edges_written": 38051, "errors": []

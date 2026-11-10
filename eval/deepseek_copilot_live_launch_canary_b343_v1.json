@@ -11,7 +11,7 @@
   "measured_host_readiness": {
     "adapter_id": "deepseek_copilot_cli",
     "installed": true,
-    "copilot_cli_path": "/home/shrek/.nvm/versions/node/v24.15.0/bin/copilot",
+    "copilot_cli_path": "/home/user/.nvm/versions/node/v24.15.0/bin/copilot",
     "credential_present": false,
     "launchable": false,
     "blocker_reason": "credential_file_absent",

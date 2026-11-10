@@ -14,7 +14,7 @@
     }
   ],
   "full_build": {
-    "repo_root": "/home/shrek/GeoAI",
+    "repo_root": "/home/user/GeoAI",
     "incremental": false,
     "files_seen": 6371,
     "files_changed": 6371,
@@ -26,7 +26,7 @@
   },
   "validation": [
     "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_aiworkhub_source_graph_b849.py tools/geoai-task-mcp/tests/test_aiworkhub_source_graph_bootstrap_b854.py -> 35 passed",
-    "PYTHONPATH=tools/geoai-task-mcp/src python3 -m aiworkhub.source_graph --repo /home/shrek/GeoAI build -> clean full build, 0 errors",
+    "PYTHONPATH=tools/geoai-task-mcp/src python3 -m aiworkhub.source_graph --repo /home/user/GeoAI build -> clean full build, 0 errors",
     "python3 AITools/taskctl.py verify -> PASS",
     "python3 AITools/taskctl.py collision-guard --print -> collision_free=true"
   ]

@@ -34,7 +34,7 @@
     },
     {
       "candidate_id": "CLAUDE_TASK_MCP_DEFAULT_REPO_SUBMODULE_NEUTRALITY_NEXT",
-      "goal": "Remove core.py:13's hardcoded '/home/shrek/AIWorkHub' DEFAULT_REPO fallback (mvp_contract_audit_v1 finding F2) so per_project_isolation's cwd-pin is genuinely parameterized, not owner-path-specific, ahead of the MVP_ROADMAP Phase 3 submodule conversion.",
+      "goal": "Remove core.py:13's hardcoded '/home/user/AIWorkHub' DEFAULT_REPO fallback (mvp_contract_audit_v1 finding F2) so per_project_isolation's cwd-pin is genuinely parameterized, not owner-path-specific, ahead of the MVP_ROADMAP Phase 3 submodule conversion.",
       "why_genuine": "Directly blocks this protocol's own per_project_isolation claim of 'parameterized repo root, not literal multi-tenant' from being fully true; currently only true when AIWORKHUB_REPO is explicitly set."
     }
   ],

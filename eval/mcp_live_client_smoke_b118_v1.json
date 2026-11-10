@@ -17,7 +17,7 @@
     "taskctl_verify_pass": true
   },
   "environment": {
-    "AIWORKHUB_REPO": "/home/shrek/AIWorkHub",
+    "AIWORKHUB_REPO": "/home/user/AIWorkHub",
     "AIWORKHUB_ALLOW_WRITES": "0"
   },
   "eval_id": "mcp_live_client_smoke_b118_v1",

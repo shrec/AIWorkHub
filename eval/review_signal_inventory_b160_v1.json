@@ -277,7 +277,7 @@
       "acceptance_criteria"
     ]
   },
-  "source_registry": "/home/shrek/AIWorkHub/bitnnv2/data/tasking/machine_task_cards_v1.jsonl",
+  "source_registry": "/home/user/AIWorkHub/bitnnv2/data/tasking/machine_task_cards_v1.jsonl",
   "status_family_counts": {
     "blocked": 25,
     "finished": 2647,

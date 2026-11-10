@@ -9,7 +9,7 @@
   "queue_order": 1,
   "status": "pending",
   "worker_status": "unclaimed",
-  "objective": "Repair the canonical repo-local AIWorkHub Source Graph so a clean full build of /home/shrek/GeoAI completes without UNIQUE(file_path, qualname) crashes. The current failures are proven on repeated nested definitions such as main._avg and are amplified by indexing .claude/worktrees. Preserve distinct definitions instead of silently overwriting them, exclude ephemeral nested worktrees and generated state, keep legitimate canonical source trees indexable, and add regression coverage. This is a bootstrap repair only; do not modify the VS Code extension yet.",
+  "objective": "Repair the canonical repo-local AIWorkHub Source Graph so a clean full build of /home/user/GeoAI completes without UNIQUE(file_path, qualname) crashes. The current failures are proven on repeated nested definitions such as main._avg and are amplified by indexing .claude/worktrees. Preserve distinct definitions instead of silently overwriting them, exclude ephemeral nested worktrees and generated state, keep legitimate canonical source trees indexable, and add regression coverage. This is a bootstrap repair only; do not modify the VS Code extension yet.",
   "acceptance": [
     "A clean canonical Source Graph build for the current repository completes successfully.",
     "Repeated same-name nested definitions in one lexical scope receive stable distinct identities and remain queryable.",
@@ -45,7 +45,7 @@
   ],
   "validation": [
     "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_aiworkhub_source_graph_b849.py tools/geoai-task-mcp/tests/test_aiworkhub_source_graph_bootstrap_b854.py",
-    "PYTHONPATH=tools/geoai-task-mcp/src python3 -m aiworkhub.source_graph --repo /home/shrek/GeoAI build",
+    "PYTHONPATH=tools/geoai-task-mcp/src python3 -m aiworkhub.source_graph --repo /home/user/GeoAI build",
     "python3 AITools/taskctl.py verify",
     "python3 AITools/taskctl.py collision-guard --print"
   ],

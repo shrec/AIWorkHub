@@ -25,14 +25,14 @@
   },
   "commands": [
     {
-      "cmd": "/home/shrek/AIWorkHub/.venv/bin/python -m pytest -q tools/aiworkhub/tests/test_worker_ai_infra_context_b437_v1.py",
+      "cmd": "/home/user/AIWorkHub/.venv/bin/python -m pytest -q tools/aiworkhub/tests/test_worker_ai_infra_context_b437_v1.py",
       "result": "pass",
       "returncode": 0,
       "stdout": "5 passed, 1 warning in 0.23s",
       "stderr_note": "pytest cache warning only: cache path creation blocked by sandbox permissions"
     },
     {
-      "cmd": "/home/shrek/AIWorkHub/.venv/bin/python -m pytest -q tools/aiworkhub/tests/test_worker_project_context_b434_v1.py tools/aiworkhub/tests/test_dashboard.py",
+      "cmd": "/home/user/AIWorkHub/.venv/bin/python -m pytest -q tools/aiworkhub/tests/test_worker_project_context_b434_v1.py tools/aiworkhub/tests/test_dashboard.py",
       "result": "blocked_preexisting_environment_or_out_of_scope",
       "returncode": 1,
       "stdout": "36 passed, 11 failed, 2 warnings in 0.47s",

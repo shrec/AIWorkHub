@@ -68,7 +68,7 @@
       "summary": "120 passed"
     },
     {
-      "command": "rg -n \"geoai_task_mcp|aiworkinghub|AIWorkingHub|GeoAI|GEOAI|\\\\.aiworkinghub|/home/shrek|tools/aiworkhub\" tools/geoai-task-mcp/src/aiworkhub tools/geoai-task-mcp/tests/test_aiworkhub_* tools/geoai-task-mcp/tests/test_repository_state.py tools/geoai-task-mcp/tests/test_repository_mux.py tools/geoai-task-mcp/tests/test_callback_bridge.py tools/geoai-task-mcp/README.md tools/geoai-task-mcp/pyproject.toml AITools/taskdb.py AITools/taskctl.py",
+      "command": "rg -n \"geoai_task_mcp|aiworkinghub|AIWorkingHub|GeoAI|GEOAI|\\\\.aiworkinghub|/home/user|tools/aiworkhub\" tools/geoai-task-mcp/src/aiworkhub tools/geoai-task-mcp/tests/test_aiworkhub_* tools/geoai-task-mcp/tests/test_repository_state.py tools/geoai-task-mcp/tests/test_repository_mux.py tools/geoai-task-mcp/tests/test_callback_bridge.py tools/geoai-task-mcp/README.md tools/geoai-task-mcp/pyproject.toml AITools/taskdb.py AITools/taskctl.py",
       "exit_code": 1,
       "status": "PASS",
       "summary": "No stale canonical-scope matches"

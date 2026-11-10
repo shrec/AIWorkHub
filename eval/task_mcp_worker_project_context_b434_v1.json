@@ -62,13 +62,13 @@
       "stderr": "/usr/bin/bash: line 1: .venv/bin/python: No such file or directory"
     },
     {
-      "cmd": "PYTHONPATH=tools/aiworkhub/src /home/shrek/AIWorkHub/.venv/bin/python -m pytest -q -p no:cacheprovider tools/aiworkhub/tests/test_worker_project_context_b434_v1.py",
+      "cmd": "PYTHONPATH=tools/aiworkhub/src /home/user/AIWorkHub/.venv/bin/python -m pytest -q -p no:cacheprovider tools/aiworkhub/tests/test_worker_project_context_b434_v1.py",
       "result": "coordinator_pass",
       "returncode": 0,
       "stdout": "8 passed"
     },
     {
-      "cmd": "PYTHONPATH=tools/aiworkhub/src /home/shrek/AIWorkHub/.venv/bin/python -m pytest -q -p no:cacheprovider tools/aiworkhub/tests/test_process_launcher.py tools/aiworkhub/tests/test_process_launcher_security.py tools/aiworkhub/tests/test_runtime_adapters.py tools/aiworkhub/tests/test_worker_workspace.py",
+      "cmd": "PYTHONPATH=tools/aiworkhub/src /home/user/AIWorkHub/.venv/bin/python -m pytest -q -p no:cacheprovider tools/aiworkhub/tests/test_process_launcher.py tools/aiworkhub/tests/test_process_launcher_security.py tools/aiworkhub/tests/test_runtime_adapters.py tools/aiworkhub/tests/test_worker_workspace.py",
       "result": "coordinator_pass",
       "returncode": 0,
       "stdout": "45 passed"

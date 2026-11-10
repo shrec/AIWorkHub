@@ -92,7 +92,7 @@
   },
   "environment": {
     "AIWORKHUB_ALLOW_WRITES": "0",
-    "AIWORKHUB_REPO": "/home/shrek/AIWorkHub",
+    "AIWORKHUB_REPO": "/home/user/AIWorkHub",
     "PYTHONPATH": "tools/aiworkhub/src"
   },
   "commit_contract": "NO_COMMIT per task contract; working tree left with new/modified files present but uncommitted. Codex finalizes.",

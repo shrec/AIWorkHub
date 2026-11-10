@@ -2,8 +2,7 @@
 
 Scans git-tracked text files under the roots below and fails on a user-home
 path whose user segment is not a generic placeholder, and on a drive-letter
-development root.  Binary files are skipped.  eval/ and data/ hold historical,
-digest-pinned artifacts and are deliberately outside the scanned roots.
+development root.  Binary files are skipped.
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
-ROOTS = ("src/", "tests/", "scripts/", "examples/", "vscode-extension/test/")
+ROOTS = ("src/", "tests/", "scripts/", "examples/", "vscode-extension/test/", "eval/", "data/")
 # Generic words only; a real login never belongs here.
 ALLOWED_SEGMENTS = frozenset({"owner", "worker", "user", "dev", "u", "probe-user"})
 

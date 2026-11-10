@@ -10,7 +10,7 @@
 {"class":"read","gated":false,"kind":"tool","name":"aiworkhub_task_show","note":"show one card by task_id","safe":true,"taskctl_subcmd":"show"}
 {"class":"read","gated":false,"kind":"tool","name":"aiworkhub_task_usage_report","note":"subcmd 'usage-report'; bare 'usage' in WRITE_COMMANDS is invoked by no tool","safe":true,"taskctl_subcmd":"usage-report"}
 {"detail":"WRITE_COMMANDS includes 'start' and 'usage' which are invoked by no registered tool (over-guard superset); harmless, fail-safe direction (core.py:24-31).","id":"F1","kind":"finding","severity":"info"}
-{"detail":"core.py:13 DEFAULT_REPO hardcodes '/home/shrek/AIWorkHub' fallback; overridable via AIWORKHUB_REPO env but not submodule-neutral. README/MCP-config also hardcode this path.","id":"F2","kind":"finding","severity":"low"}
+{"detail":"core.py:13 DEFAULT_REPO hardcodes '/home/user/AIWorkHub' fallback; overridable via AIWORKHUB_REPO env but not submodule-neutral. README/MCP-config also hardcode this path.","id":"F2","kind":"finding","severity":"low"}
 {"detail":"aiworkhub_task_pending_for_runner maps to taskctl 'export' (dump) classified read-only; distinct string from write 'export-jsonl' so not caught by WRITE_COMMANDS by design.","id":"F3","kind":"finding","severity":"info"}
 {"detail":"MCP tool contract v1 not frozen (MVP_ROADMAP Phase 3 unchecked) and external MCP-client smoke test pending (Phase 0 unchecked) -> not yet submodule-ready.","id":"F4","kind":"finding","severity":"low"}
 {"detail":"tools/aiworkhub is already an independent nested git repo (git toplevel == tool dir) with pyproject.toml present and logs/ gitignored -> submodule conversion is mechanically ready once contract is frozen.","id":"F5","kind":"finding","severity":"info"}
