@@ -30,7 +30,13 @@ from typing import Any, Callable
 
 import pytest
 
-from aiworkhub import core, process_launcher, task_store, worker_workspace
+from aiworkhub import (
+    core,
+    process_launcher,
+    process_launcher_validation,
+    task_store,
+    worker_workspace,
+)
 
 OUTPUT = "out/result.txt"
 BASE_CONTENT = b"canonical base\n"
@@ -45,7 +51,6 @@ CLAIM_EPOCH = 4
 FEEDBACK = "NeedFix: rerun the declared validations on the sealed candidate"
 NOW = "2026-10-22T00:00:00+00:00"
 REFUSAL = (False, "validation_only_replay_workspace_invalid")
-SENTINEL = "nf01655-validation-sentinel"
 
 
 def _git(root: Path, *args: str) -> None:
@@ -55,19 +60,19 @@ def _git(root: Path, *args: str) -> None:
     assert result.returncode == 0, result.stderr
 
 
-def _sentinel(repo: Path) -> Path:
-    return repo.parent / SENTINEL
-
-
 def _validation(repo: Path) -> str:
-    """The card's one declared validation: deterministic and provider-free, it
-    copies the candidate it validated to ``_sentinel(repo)``, outside every
-    worktree the replay provisions and removes.  Validation commands admit no
-    ``;``, so it is one expression; the list display keeps the inline code
-    from being read as a repository file operand."""
+    """The card's one declared validation: deterministic and provider-free.  It
+    reads ``OUTPUT`` inside the worktree it runs in and exits 0 only when those
+    bytes hash to ``CANDIDATE_HASH``, otherwise 1.  It no longer copies the
+    candidate to a sentinel outside the worktree: the validation sandbox denies
+    that write, so the old proof failed on the sandbox, not on the candidate.
+    ``repo`` is unused and kept so callers are unchanged.  Validation commands
+    admit no ``;``, so it is one expression; the list display keeps the inline
+    code from being read as a repository file operand."""
     return (
-        "python -c \"[__import__('shutil').copyfile("
-        f"'{OUTPUT}', '{_sentinel(repo).as_posix()}')]\""
+        "python -c \"[__import__('sys').exit(0 if "
+        "__import__('hashlib').sha256(open('"
+        f"{OUTPUT}', 'rb').read()).hexdigest() == '{CANDIDATE_HASH}' else 1)]\""
     )
 
 
@@ -717,15 +722,15 @@ def test_recovered_replay_runs_its_declared_validation_without_a_provider(
     _blocked_replay(repo, predecessor)
     assert _recover(repo) == (True, "recovered")
     assert not Path(predecessor["workspace"]["path"]).exists()
-    assert not _sentinel(repo).exists()
 
     # The real, unpatched replay launcher: it materializes the sealed delta
     # into its own worktree, claims the task through the write gate and
     # finalizes through the normal finalizer, which runs the card's declared
-    # validation.  Only the provider lane stays trapped.  An editor-hosted
-    # adapter keeps that validation the trusted manager's shell-free
-    # subprocess, so it never nests another OS sandbox inside the one that
-    # runs this suite.
+    # validation.  Only the provider lane stays trapped.  NF-2026-00410 runs
+    # editor-hosted validation under the host OS sandbox; this suite may itself
+    # run inside one, so the test pins the pre-sandbox lane to avoid nesting.
+    # The sandbox route itself is covered by
+    # tests/test_lm_validation_sandbox_route_nf00410.py.
     monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
     monkeypatch.setattr(
         process_launcher.core,
@@ -737,6 +742,11 @@ def test_recovered_replay_runs_its_declared_validation_without_a_provider(
         process_launcher.ProcessManager,
         "_terminal_authority_key",
         lambda self: b"test-key",
+    )
+    monkeypatch.setattr(
+        process_launcher_validation,
+        "_validation_boundary_backend",
+        lambda backend: backend,
     )
     selected, result, _replay, manager = _launch_lane(
         repo, tmp_path, monkeypatch, stub_replay=False, adapter_id="vscode_lm"
@@ -753,6 +763,3 @@ def test_recovered_replay_runs_its_declared_validation_without_a_provider(
     assert [
         (row["declared_command"], row["returncode"]) for row in terminal["validation"]
     ] == [(_validation(repo), 0)], json.dumps(terminal, default=str)[:4000]
-    # The declared command really ran, on the candidate rebuilt from the
-    # sealed delta.
-    assert _sentinel(repo).read_bytes() == CANDIDATE
