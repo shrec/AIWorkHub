@@ -4888,6 +4888,8 @@ def aiworkhub_task_reject_review(
     extra_evidence_ids: list[str] | None = None,
     no_new_lesson_reason: str | None = None,
     request_id: str | None = None,
+    relaunch: bool = False,
+    relaunch_adapter_id: str = "",
 ) -> dict[str, Any]:
     """Write-gated Codex action: reject a reviewed task with exact feedback and
     an explicit disposition. ``to`` = pending (rework, default) | blocked |
@@ -4938,6 +4940,11 @@ def aiworkhub_task_reject_review(
     its own key, and ``learning_commit_owed`` stays in the reply. None of these
     parameters reaches the core rejection call.
 
+    ``relaunch`` (default false, and the reply is then unchanged) launches the
+    card's retry after the reject landed and returns the launch reply under
+    ``relaunch``. A failed or raising launch never undoes the reject: ``ok``
+    stays true and the failure is reported under ``relaunch``.
+
     Args:
         task_id: Id of the reviewed task card to reject.
         reason: Exact feedback for the rework, at most 8000 UTF-8 bytes after trimming (longer is refused with reject_reason_too_large); it is never echoed back.
@@ -4956,6 +4963,8 @@ def aiworkhub_task_reject_review(
         extra_evidence_ids: Additional evidence ids to cite with the lesson; only used together with lesson_candidate.
         no_new_lesson_reason: Instead of a lesson, record why none is owed: duplicate_of_recorded_lesson, no_generalizable_cause, mechanical_change_only, evidence_insufficient or decision_not_about_code; refused together with lesson_candidate.
         request_id: Optional identity assertion: the review request you are rejecting. It must equal the card's current review request, else the call is refused with request_id_mismatch (or request_id_unverifiable when the card names none) and nothing changes; omit to skip the check.
+        relaunch: Set true to launch the rework worker for this card in the same call, after the reject has landed (the same launch aiworkhub_agent_launch_task would do with the card's own runner and topic); only with to=pending (else refused with relaunch_requires_pending) and not with failure_category base_drift or validation_environment, which start their own automatic validation replay (refused with relaunch_conflicts_with_automatic_replay). Default false.
+        relaunch_adapter_id: Adapter for the relaunch; empty (default) derives it from the card's runner. Only used with relaunch=true.
     """
 
     refusal = _include_card_refusal(include_card) or _learning_closeout_refusal(
@@ -4963,6 +4972,14 @@ def aiworkhub_task_reject_review(
         promote_ai_memory=promote_ai_memory,
         no_new_lesson_reason=no_new_lesson_reason,
     )
+    if refusal is None and relaunch:
+        # NF-2026-02167: refused before anything is committed.
+        if to != "pending":
+            refusal = {"ok": False, "error": "relaunch_requires_pending"}
+        elif failure_category in accept_failure_cause.INFRA_REJECT_REPLAY_CATEGORIES:
+            # That reject starts its own automatic validation replay; a second
+            # launch would double it.
+            refusal = {"ok": False, "error": "relaunch_conflicts_with_automatic_replay"}
     if refusal is None and request_id is not None:
         refusal = _current_request_assertion_refusal(
             task_id, request_id, schema_id="aiworkhub.reject_review_receipt.v1"
@@ -5033,7 +5050,27 @@ def aiworkhub_task_reject_review(
             receipt["automatic_validation_replay"] = _automatic_validation_replay(
                 task_id, replay_category, card or {}
             )
+        # NF-2026-02167: after the reject is committed; a failed launch never
+        # undoes it, the failure is reported under ``relaunch``.
+        if relaunch:
+            receipt["relaunch"] = _relaunch_after_reject(
+                task_id, adapter_id=relaunch_adapter_id
+            )
     return receipt
+
+
+def _relaunch_after_reject(task_id: str, *, adapter_id: str) -> dict[str, Any]:
+    """Launch the rejected card's retry; never raises, never undoes the reject."""
+
+    try:
+        launched = _launch_task_internal(
+            task_id=task_id, adapter_id=str(adapter_id or "").strip() or None
+        )
+    except Exception as exc:  # noqa: BLE001 - the committed reject must still be reported
+        return {"ok": False, "error": f"relaunch_raised:{type(exc).__name__}"}
+    if not isinstance(launched, dict):
+        return {"ok": False, "error": "relaunch_reply_invalid"}
+    return {**launched, "ok": launched.get("ok") is True}
 
 
 _AUTOMATIC_REPLAY_REASON_MAX_CHARS = 500
@@ -6986,6 +7023,29 @@ def aiworkhub_agent_launch_task(
         owner_prompt: Optional extra instructions from the launching owner for the worker; default empty.
         timeout_seconds: Compatibility metadata only, default 7200; no provider wall-clock deadline is enforced and the value is echoed in the reply.
     """
+
+    return _launch_task_internal(
+        task_id=task_id,
+        runner=runner,
+        topic=topic,
+        adapter_id=adapter_id,
+        model=model,
+        owner_prompt=owner_prompt,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _launch_task_internal(
+    *,
+    task_id: str,
+    runner: str | None = None,
+    topic: str | None = None,
+    adapter_id: str | None = None,
+    model: str | None = None,
+    owner_prompt: str = "",
+    timeout_seconds: int = 7200,
+) -> dict[str, Any]:
+    """Launch body shared by aiworkhub_agent_launch_task and a relaunching reject."""
 
     core.scrub_coordinator_capability_from_environment()
     manager = process_launcher.default_manager()

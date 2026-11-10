@@ -172,6 +172,10 @@ WRITE_GATED_TOOLS: tuple[str, ...] = (
 # accepts ``task_id`` alone with ``request_id`` now optional (default ""), and
 # ``aiworkhub_task_reject_review`` gained the optional ``request_id`` identity
 # assertion -- additive, every earlier call shape still valid.
+#
+# RE-FROZEN 2026-11-10, one tool: ``aiworkhub_task_reject_review`` gained the
+# optional ``relaunch`` (default False) and ``relaunch_adapter_id`` (default "")
+# -- additive, every earlier call shape still valid.
 FROZEN_SCHEMA_FINGERPRINTS: dict[str, str] = {
     "aiworkhub_agent_cancel_task": "f1d9792f94307639105434caa381c54857d7c292dab122b4cd4e9333dd0552f3",
     "aiworkhub_agent_collect_result": "c291cac06bc81689a1b0df1357facb97c5806fefd0a447ef3245e38976077a3f",
@@ -200,7 +204,7 @@ FROZEN_SCHEMA_FINGERPRINTS: dict[str, str] = {
     "aiworkhub_task_mark_review": "1722a2665425d2ebd8573c3425ee2d04b8c71ae3db24ace3c97e5a82d7e92bd4",
     "aiworkhub_task_pending_for_runner": "864d85c9f3a5a7020e270ddd71f9aeea2ab65ca35932aaf869afaa837950b16d",
     "aiworkhub_task_queue_request": "2c43bb4347d3806b3f373390c95cfc7c4f398b4404860ff4a1722269edeb7fa5",
-    "aiworkhub_task_reject_review": "d5832c94ca8226c04bc5fedb7184c1a42962de176ae0c456d09bba2dc6c64f60",
+    "aiworkhub_task_reject_review": "4a26b2769289afaa2353be1d75654801b00ea3eceebf0cf64f33ed9e3d00f365",
     "aiworkhub_task_review_queue": "b5728f6f46c22488977fe80e794f420203cf6725367eb9271cfdad1c6538b878",
     "aiworkhub_task_review_summarize": "e535208ce91e843357bb2efb237b656c50ad1a0b4e1be4111c9ae2356c647e01",
     "aiworkhub_task_show": "99ee8315bb1c8f1ca0e53dba741fa733319ebd5464e0cb236c84142d0d9444ee",

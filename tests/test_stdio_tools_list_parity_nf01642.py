@@ -308,7 +308,7 @@ def test_reject_review_schema_keeps_its_names_types_and_required_list(fallback_t
         "task_id", "reason", "to", "residual_identities", "predecessor_request_id",
         "failure_category", "validation_amendment", "include_card",
         "allowed_writes_amendment", "read_first_amendment", "lesson_candidate",
-        "no_new_lesson_reason", "request_id",
+        "no_new_lesson_reason", "request_id", "relaunch", "relaunch_adapter_id",
         "promote_ai_memory", "extra_evidence_ids",
         "validation_amendment_mode", "validation_roles_amendment",
     }
