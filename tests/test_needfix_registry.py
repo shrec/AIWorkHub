@@ -2230,6 +2230,49 @@ class TestManagerVerifiedResolution:
         assert result["ok"] is True
         assert calls == [("NF-2026-00001", "Canonical tests passed.")]
 
+    def test_dashboard_resolve_verified_closes_captured_row_in_one_call(
+        self, init_store: Path, monkeypatch
+    ):
+        from aiworkhub import core, dashboard_mcp_app
+
+        monkeypatch.setattr(
+            core, "needfix_show", lambda nf: needfix_store.get_needfix(init_store, nf)
+        )
+        monkeypatch.setattr(
+            core,
+            "needfix_update",
+            lambda nf, **kw: needfix_store.update_needfix(init_store, nf, **kw),
+        )
+        monkeypatch.setattr(
+            core,
+            "needfix_resolve_verified",
+            lambda nf, *, resolution_note: needfix_store.resolve_verified_needfix(
+                init_store, nf, resolution_note=resolution_note
+            ),
+        )
+        rec = needfix_store.capture_proposal(init_store, title="T", description="D")
+        result = dashboard_mcp_app.needfix_transition_view(
+            rec["id"],
+            "resolve_verified",
+            reason="Canonical tests passed.",
+            readiness_score=100,
+            evidence={"verified": "pytest green"},
+            evidence_refs=["file:tests/test_needfix_registry.py"],
+            confirm=True,
+        )
+        assert result["ok"] is True
+        assert needfix_store.get_needfix(init_store, rec["id"])["status"] == "resolved"
+
+    def test_dashboard_evidence_refused_for_non_resolve_action(self, init_store: Path):
+        from aiworkhub import dashboard_mcp_app
+
+        rec = needfix_store.capture_proposal(init_store, title="T", description="D")
+        result = dashboard_mcp_app.needfix_transition_view(
+            rec["id"], "reject", reason="no", evidence={"verified": "x"}, confirm=True
+        )
+        assert result["ok"] is False
+        assert needfix_store.get_needfix(init_store, rec["id"])["status"] == "captured"
+
 
 class TestExistingTaskLinkCanonicalDelegation:
     """Core, server MCP, and dashboard MCP call the same canonical implementation."""

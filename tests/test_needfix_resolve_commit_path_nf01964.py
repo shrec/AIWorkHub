@@ -159,14 +159,50 @@ def test_resolve_verified_refuses_commit_not_ancestor_of_head(git_repo: Path) ->
     assert str(info.value) == f"needfix_resolve_commit_not_reachable:{side}"
 
 
-def test_resolve_verified_refusal_from_captured_names_routes(repo_root: Path) -> None:
+def test_resolve_verified_closes_captured_row_with_evidence(repo_root: Path) -> None:
     rec = needfix_store.capture_proposal(repo_root, title="t", description="t")
+    _ready(repo_root, rec["id"], ["file:tests/x.py"])
+    row = needfix_store.resolve_verified_needfix(
+        repo_root, rec["id"], resolution_note="fixed"
+    )
+    assert row["status"] == "resolved"
+    resolved = [
+        detail
+        for kind, detail in _events(repo_root, rec["id"])
+        if kind == "manager_verified_resolved"
+    ]
+    assert resolved and resolved[-1]["prior_status"] == "captured"
+
+
+def test_resolve_verified_refuses_captured_row_without_evidence(repo_root: Path) -> None:
+    rec = needfix_store.capture_proposal(repo_root, title="t", description="t")
+    needfix_store.update_needfix(repo_root, rec["id"], readiness_score=100)
     with pytest.raises(needfix_store.NeedFixConflictError) as info:
         needfix_store.resolve_verified_needfix(repo_root, rec["id"], resolution_note="x")
     message = str(info.value)
-    assert "current_status='captured'" in message
-    assert "task_planned" in message
-    assert "Resolves: NF-YYYY-NNNNN" in message
+    assert "non-empty durable evidence" in message
+    assert "resolve_verified" in message
+    assert needfix_store.get_needfix(repo_root, rec["id"])["status"] == "captured"
+
+
+def test_resolve_verified_refuses_task_created_row_with_converted_task_id(
+    repo_root: Path,
+) -> None:
+    rec = needfix_store.capture_proposal(repo_root, title="t", description="t")
+    _ready(repo_root, rec["id"], ["file:tests/x.py"])
+    conn = sqlite3.connect(str(repo_root.joinpath(*needfix_store.NEEDFIX_DB_REL)))
+    try:
+        conn.execute(
+            "UPDATE needfix SET status = 'task_created', converted_task_id = ? WHERE id = ?",
+            ("task-linked-1", rec["id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(needfix_store.NeedFixConflictError) as info:
+        needfix_store.resolve_verified_needfix(repo_root, rec["id"], resolution_note="x")
+    assert "current_status='task_created'" in str(info.value)
+    assert needfix_store.get_needfix(repo_root, rec["id"])["status"] == "task_created"
 
 
 def test_git_check_uses_argv_and_repo_cwd(repo_root: Path, monkeypatch) -> None:

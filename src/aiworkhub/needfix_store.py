@@ -1274,15 +1274,21 @@ def _check_duplicate_cycle(
 
 
 #: Statuses from which :func:`resolve_verified_needfix` may resolve directly.
-RESOLVE_VERIFIED_FROM_STATUSES: tuple[str, ...] = ("accepted", "task_planned")
+RESOLVE_VERIFIED_FROM_STATUSES: tuple[str, ...] = (
+    "captured",
+    "triaged",
+    "accepted",
+    "task_planned",
+    "deferred",
+)
 
 #: The two supported routes to ``resolved`` for a fix that has no task.
 #: Appended to every refused transition to ``resolved`` (NF-2026-01964): the
 #: bare allowed_next_transitions list never mentioned them, so managers who
 #: fixed a NeedFix with a plain commit archived it instead of resolving it.
 RESOLVE_ROUTES_HINT = (
-    "resolve_routes: action=resolve_verified (current_status accepted or "
-    "task_planned, readiness_score=100, non-empty evidence and evidence_refs "
+    "resolve_routes: action=resolve_verified (current_status captured, "
+    "triaged, accepted, task_planned or deferred, readiness_score=100, non-empty evidence and evidence_refs "
     "set via needfix_update; every 'commit:<sha>' ref must be an ancestor of "
     "HEAD) or a git commit trailer 'Resolves: NF-YYYY-NNNNN' on a "
     "HEAD-reachable commit"
@@ -2338,7 +2344,11 @@ def resolve_verified_needfix(
     *,
     resolution_note: str,
 ) -> dict[str, Any]:
-    """Resolve an accepted or task_planned NeedFix from manager-verified evidence.
+    """Resolve a NeedFix from manager-verified evidence.
+
+    current_status must be one of RESOLVE_VERIFIED_FROM_STATUSES (captured,
+    triaged, accepted, task_planned, deferred); a row with a live linked card
+    is refused and is closed by its card.
 
     This is deliberately separate from :func:`resolve_needfix`: ordinary
     task-backed closure must still follow ``task_created -> resolved``.  The
@@ -2387,13 +2397,15 @@ def resolve_verified_needfix(
             )
         if int(row["readiness_score"] or 0) != 100:
             raise NeedFixConflictError(
-                "manager-verified resolution requires readiness_score=100"
+                "manager-verified resolution requires readiness_score=100; "
+                f"{RESOLVE_ROUTES_HINT}"
             )
         evidence = json.loads(row["evidence_json"] or "{}")
         evidence_refs = json.loads(row["evidence_refs_json"] or "[]")
         if not isinstance(evidence, dict) or not evidence:
             raise NeedFixConflictError(
-                "manager-verified resolution requires non-empty durable evidence"
+                "manager-verified resolution requires non-empty durable evidence; "
+                f"{RESOLVE_ROUTES_HINT}"
             )
         if (
             not isinstance(evidence_refs, list)
@@ -2401,7 +2413,8 @@ def resolve_verified_needfix(
             or any(not isinstance(ref, str) or not ref.strip() for ref in evidence_refs)
         ):
             raise NeedFixConflictError(
-                "manager-verified resolution requires non-empty durable evidence_refs"
+                "manager-verified resolution requires non-empty durable evidence_refs; "
+                f"{RESOLVE_ROUTES_HINT}"
             )
         unreachable = _unreachable_commit_refs(repo_root, evidence_refs)
         if unreachable:

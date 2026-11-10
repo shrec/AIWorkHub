@@ -4218,12 +4218,14 @@ def needfix_transition_view(
     include_item: bool = False,
     promote_to: str = "",
     needfix_ids: list[str] | None = None,
+    evidence: dict[str, Any] | None = None,
+    evidence_refs: list[str] | None = None,
 ) -> dict[str, Any]:
     """USER WRITE: apply one confirmed lifecycle transition to one NeedFix or up to 25.
 
     Use this to triage, accept, reject, defer, mark duplicate or task_planned, resolve, or recover a conversion claim; archive, restore and convert have their own tools. Requires confirm=True and returns a transition receipt.
 
-    A fix landed without a task uses action=resolve_verified with readiness_score=100, evidence and evidence_refs, or a `Resolves: NF-YYYY-NNNNN` commit trailer. With needfix_ids the reply is {results, succeeded, failed} and a refused row leaves the others applied.
+    A task-less fix closes with action=resolve_verified (readiness_score=100, evidence, evidence_refs) or a `Resolves: NF-YYYY-NNNNN` commit trailer. With needfix_ids the reply is {results, succeeded, failed} and a refused row leaves the others applied.
 
     Args:
         needfix_id: ID to transition; exactly one of this and needfix_ids.
@@ -4235,14 +4237,30 @@ def needfix_transition_view(
         include_item: True adds full item detail.
         promote_to: optional; only "accepted" with action=triage.
         needfix_ids: up to 25 distinct IDs, one result per id.
+        evidence: merge-patch object; resolve_verified only.
+        evidence_refs: refs to add; resolve_verified only.
     """
     refusal = mcp_tool_metadata.needfix_ids_refusal(needfix_id, needfix_ids)
     if refusal is not None:
         return _needfix_response(refusal, "aiworkhub_dashboard_needfix_transition", write=True)
+    if evidence is not None or evidence_refs is not None:
+        if str(action or "").strip().lower() != "resolve_verified":
+            return _needfix_response(
+                {"ok": False, "error": "evidence_requires_resolve_verified"},
+                "aiworkhub_dashboard_needfix_transition", write=True,
+            )
+        if (evidence is not None and not isinstance(evidence, Mapping)) or (
+            evidence_refs is not None and not isinstance(evidence_refs, list)
+        ):
+            return _needfix_response(
+                {"ok": False, "error": "evidence_shape_invalid"},
+                "aiworkhub_dashboard_needfix_transition", write=True,
+            )
     if needfix_ids is None:
         return _needfix_transition_one(
             needfix_id, action, reason, readiness_score, duplicate_parent_id,
             confirm, include_item, promote_to,
+            evidence=evidence, evidence_refs=evidence_refs,
         )
     results: list[dict[str, Any]] = []
     for raw_id in needfix_ids:
@@ -4250,6 +4268,7 @@ def needfix_transition_view(
         row = _needfix_transition_one(
             row_id, action, reason, readiness_score, duplicate_parent_id,
             confirm, include_item, promote_to,
+            evidence=evidence, evidence_refs=evidence_refs,
         )
         # server_tool/authority are properties of the tool, reported once below.
         entry = {
@@ -4275,6 +4294,8 @@ def _needfix_transition_one(
     confirm: bool,
     include_item: bool,
     promote_to: str,
+    evidence: Mapping[str, Any] | None = None,
+    evidence_refs: list[str] | None = None,
 ) -> dict[str, Any]:
     """One id through the confirm rule, every gate and the transition receipt."""
     candidate = str(needfix_id or "")
@@ -4324,6 +4345,17 @@ def _needfix_transition_one(
             elif selected == "resolve":
                 row = core.needfix_resolve(candidate, resolution_note=str(reason)[:1000] or None)
             elif selected == "resolve_verified":
+                if evidence is not None or evidence_refs is not None or readiness_score is not None:
+                    # Evidence lands only on a row in a resolvable status; a later
+                    # gate refusal (readiness, evidence, commit) keeps what was written.
+                    current = core.needfix_show(candidate)
+                    if str(current.get("status") or "") in needfix_store.RESOLVE_VERIFIED_FROM_STATUSES:
+                        core.needfix_update(
+                            candidate,
+                            readiness_score=readiness_score,
+                            evidence_patch=evidence,
+                            evidence_refs_add=evidence_refs,
+                        )
                 row = core.needfix_resolve_verified(
                     candidate, resolution_note=str(reason)[:1000]
                 )

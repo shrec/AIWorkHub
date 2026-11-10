@@ -1,6 +1,6 @@
 """Read-only NeedFix staleness sweep (NF-2026-01990).
 
-Proposes a disposition, with evidence, for every ``captured`` NeedFix row so a
+Proposes a disposition, with evidence, for every open NeedFix row so a
 manager can batch-triage the backlog through the existing transition tools.
 This module never writes: no NeedFix transition, update or archive and no file
 writes. Commit-trailer auto-resolve lives in
@@ -35,6 +35,15 @@ DISPOSITIONS: tuple[str, ...] = (
 # Severities that must not wait in the captured inbox without a decision.
 TRIAGE_SEVERITIES: frozenset[str] = frozenset(("critical", "high"))
 
+# Statuses the sweep covers. task_planned counts only while card-less (_open_rows).
+SWEEP_STATUSES: tuple[str, ...] = (
+    "captured",
+    "triaged",
+    "accepted",
+    "deferred",
+    "task_planned",
+)
+
 MAX_MENTIONING_COMMITS = 5
 GIT_LOG_TIMEOUT_SECONDS = 60
 
@@ -47,15 +56,15 @@ _RECORD_SEP = "\x1e"
 _FIELD_SEP = "\x1f"
 
 
-def _captured_rows(repo_root: Path) -> list[dict[str, Any]]:
-    """Every ``captured`` row, paged until exhausted (archived never match)."""
+def _status_rows(repo_root: Path, status: str) -> list[dict[str, Any]]:
+    """Every row in ``status``, paged until exhausted (archived never match)."""
     rows: list[dict[str, Any]] = []
     limit = needfix_store.MAX_LIST_LIMIT
     offset = 0
     while True:
         page = needfix_store.list_needfix(
             repo_root,
-            status="captured",
+            status=status,
             limit=limit,
             offset=offset,
             order_by="created_at",
@@ -65,6 +74,17 @@ def _captured_rows(repo_root: Path) -> list[dict[str, Any]]:
         if len(page) < limit:
             return rows
         offset += limit
+
+
+def _open_rows(repo_root: Path) -> list[dict[str, Any]]:
+    """Every open row, sequentially per status; task_planned only while card-less."""
+    rows: list[dict[str, Any]] = []
+    for status in SWEEP_STATUSES:
+        page = _status_rows(repo_root, status)
+        if status == "task_planned":
+            page = [row for row in page if not row.get("converted_task_id")]
+        rows.extend(page)
+    return rows
 
 
 def _git_commits_since(
@@ -172,14 +192,14 @@ def _sort_key(row: Mapping[str, Any]) -> tuple[int, int, int, str]:
 
 
 def sweep(repo_root: str | Path, *, now: datetime | None = None) -> dict[str, Any]:
-    """Read-only disposition proposal for every captured NeedFix row."""
+    """Read-only disposition proposal for every open NeedFix row (SWEEP_STATUSES)."""
     # Sequential by design: one git process plus path stats on ~300 rows.
     root = Path(repo_root)
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
-    captured = _captured_rows(root)
-    created_by_id = {row["id"]: _parse_ts(row.get("created_at")) for row in captured}
+    open_rows = _open_rows(root)
+    created_by_id = {row["id"]: _parse_ts(row.get("created_at")) for row in open_rows}
     known_created = [ts for ts in created_by_id.values() if ts is not None]
 
     commits: list[tuple[str, datetime, frozenset[str]]] = []
@@ -188,7 +208,7 @@ def sweep(repo_root: str | Path, *, now: datetime | None = None) -> dict[str, An
         commits, git_unavailable = _git_commits_since(root, min(known_created))
 
     out_rows: list[dict[str, Any]] = []
-    for row in captured:
+    for row in open_rows:
         created = created_by_id[row["id"]]
         mentions: list[str] = []
         if created is not None:
@@ -207,6 +227,7 @@ def sweep(repo_root: str | Path, *, now: datetime | None = None) -> dict[str, An
         out_rows.append(
             {
                 "id": row["id"],
+                "status": row.get("status"),
                 "title": row.get("title"),
                 "severity": severity,
                 "created_at": row.get("created_at"),
@@ -224,7 +245,8 @@ def sweep(repo_root: str | Path, *, now: datetime | None = None) -> dict[str, An
     return {
         "schema_id": SCHEMA_ID,
         "generated_at": current.isoformat(),
-        "captured_total": len(out_rows),
+        "captured_total": sum(1 for item in out_rows if item["status"] == "captured"),
+        "open_total": len(out_rows),
         "counts": counts,
         "git_unavailable": git_unavailable,
         "rows": out_rows,

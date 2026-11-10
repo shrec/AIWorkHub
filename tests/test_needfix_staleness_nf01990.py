@@ -131,7 +131,7 @@ def test_high_without_evidence_needs_triage_and_low_is_kept(git_repo: Path) -> N
 
 
 @needs_git
-def test_accepted_and_archived_rows_are_not_listed(git_repo: Path) -> None:
+def test_archived_rows_are_not_listed_and_accepted_rows_are_swept(git_repo: Path) -> None:
     captured = _add(git_repo, "still captured", severity="low")
     accepted = _add(git_repo, "already accepted", severity="high", status="accepted")
     archived = _add(git_repo, "to archive", severity="high")
@@ -140,9 +140,10 @@ def test_accepted_and_archived_rows_are_not_listed(git_repo: Path) -> None:
     report = needfix_staleness.sweep(git_repo)
     ids = {row["id"] for row in report["rows"]}
 
-    assert ids == {captured["id"]}
-    assert accepted["id"] not in ids and archived["id"] not in ids
+    assert ids == {captured["id"], accepted["id"]}
+    assert archived["id"] not in ids
     assert report["captured_total"] == 1
+    assert report["open_total"] == 2
 
 
 def _snapshot(repo: Path) -> dict[str, tuple[str, str]]:
@@ -202,3 +203,21 @@ def test_cli_prints_json_whose_counts_match_sweep(
     narrowed = json.loads(capsys.readouterr().out)
     assert narrowed["counts"] == expected["counts"]
     assert [row["disposition"] for row in narrowed["rows"]] == ["keep"]
+
+
+def test_sweep_covers_every_open_status(init: Path) -> None:
+    captured = _add(init, "captured item", severity="low")
+    triaged = _add(init, "triaged item", severity="low")
+    needfix_store.triage_needfix(init, triaged["id"])
+    accepted = _add(init, "accepted item", severity="low")
+    needfix_store.triage_needfix(init, accepted["id"])
+    needfix_store.accept_needfix(init, accepted["id"])
+
+    report = needfix_staleness.sweep(init)
+    rows = _by_id(report)
+
+    assert rows[captured["id"]]["status"] == "captured"
+    assert rows[triaged["id"]]["status"] == "triaged"
+    assert rows[accepted["id"]]["status"] == "accepted"
+    assert report["captured_total"] == 1
+    assert report["open_total"] == 3
