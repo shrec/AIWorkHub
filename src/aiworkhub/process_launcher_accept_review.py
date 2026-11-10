@@ -2930,6 +2930,7 @@ def accept_review(
     # of queueing on those locks for the length of that validation. A refused
     # claim ran nothing and wrote nothing; a granted one is released by the
     # ``with`` below on every exit, success and exception alike.
+    accept_started_at = _pl._utcnow()
     in_flight = _accept_in_flight_marker(self, task_id, request_id)
     if in_flight.refusal is not None:
         return in_flight.refusal
@@ -3511,6 +3512,7 @@ def accept_review(
                 topic=topic,
                 request_id=request_id,
                 evidence={
+                    "started_at": accept_started_at,
                     "promoted_paths": [],
                     "validation": validations,
                     "required_outputs": required_output_records,
@@ -3707,6 +3709,7 @@ def accept_review(
                 topic=topic,
                 request_id=request_id,
                 evidence={
+                    "started_at": accept_started_at,
                     "promoted_paths": [],
                     "validation": validations,
                     "required_outputs": required_output_records,
@@ -4733,6 +4736,7 @@ def accept_review(
             topic=topic,
             request_id=request_id,
             evidence={
+                "started_at": accept_started_at,
                 "promoted_paths": promoted,
                 "validation": validations,
                 "required_outputs": required_output_records,

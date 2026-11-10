@@ -39,6 +39,7 @@ import json
 import sqlite3
 import sys
 from contextlib import closing, nullcontext
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -728,6 +729,35 @@ def test_confirmed_low_finding_plus_valid_patch_accepts_the_corrected_bytes(
     assert json.loads(rows[0]["receipt_json"])["accept_receipt_sha256"] == (
         auto["accept_receipt_sha256"]
     )
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-02214: sdlc_phase_timeline reads accept_evidence.started_at, so the
+# accept records when it began, before it claimed the in-flight marker.
+# ---------------------------------------------------------------------------
+def test_accept_evidence_records_when_the_accept_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _accept_env(tmp_path, monkeypatch)
+    real_marker = process_launcher_accept_review._accept_in_flight_marker
+    marker_claimed_at: list[str] = []
+
+    def _spy_marker(*args, **kwargs):
+        marker_claimed_at.append(process_launcher._utcnow())
+        return real_marker(*args, **kwargs)
+
+    monkeypatch.setattr(
+        process_launcher_accept_review, "_accept_in_flight_marker", _spy_marker
+    )
+
+    result = _accept(manager, manager_correction=_correction_payload())
+
+    assert result["ok"] is True, result.get("error")
+    card = task_store.get_task(manager.repo, TASK_ID)
+    started_at = datetime.fromisoformat(card["accept_evidence"]["started_at"])
+    assert len(marker_claimed_at) == 1
+    assert started_at <= datetime.fromisoformat(marker_claimed_at[0])
+    assert started_at <= datetime.fromisoformat(card["accepted_at"])
 
 
 # ---------------------------------------------------------------------------
