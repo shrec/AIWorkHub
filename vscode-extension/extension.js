@@ -4663,7 +4663,7 @@ function createVscodeLmStagedEditCollector(request) {
         const bytes = vscodeLmSourceGraphPageBytes(result);
         if (!bytes || result.page_count !== 1) return;
         payload = JSON.parse(bytes.toString("utf8"));
-      } else payload = JSON.parse(result.content);
+      } else payload = vscodeLmSourceGraphReplyPayload(result);
     } catch (_err) { return; }
     recoveryEvidence = (Array.isArray(payload?.matches) ? payload.matches : []).filter(row =>
       vscodeLmNormalizedPath(row.file_path) === recoveryPath && typeof row.source === "string" &&
@@ -5441,6 +5441,12 @@ function vscodeLmIsPagedSourceGraphReply(result) {
   return result.content_encoding === "base64" || result.content_encoding === "utf-8";
 }
 
+// A non-paged reply carries `content` as a JSON string, or as an already-parsed object
+// when the server returns structured content. A non-JSON string still throws.
+function vscodeLmSourceGraphReplyPayload(result) {
+  return typeof result.content === "string" ? JSON.parse(result.content) : result.content;
+}
+
 // Validate the backend's byte-page contract, not a partially decoded JSON page.
 function vscodeLmSourceGraphPageBytes(result) {
   const encoding = result.content_encoding;
@@ -5565,7 +5571,7 @@ function createVscodeLmSourceGraphGuard() {
         keys.push("page:" + result.page_sha256);
       } else {
         let payload;
-        try { payload = JSON.parse(result.content); } catch (_err) { return; }
+        try { payload = vscodeLmSourceGraphReplyPayload(result); } catch (_err) { return; }
         if (!payload || !Array.isArray(payload.matches)) return;
         for (const row of payload.matches) {
           if (!row || !normalize(row.file_path) ||
@@ -6885,7 +6891,8 @@ async function runVscodeLmTextProtocol(
     );
     const stageRead = !permitted && Boolean(nextRequired) && stageReadDeclared &&
       envelope.name === expectedSgTool &&
-      ((stageInput.mode === "file" && stageInput.query === stageReadTarget) ||
+      ((stageInput.mode === "file" && typeof stageInput.query === "string" &&
+        (stageInput.query === stageReadTarget || /^\d+-\d+$/.test(stageInput.query))) ||
         (stageInput.mode === "body" && typeof stageInput.query === "string" &&
           stageInput.query.trim() && stageInput.query.length <= 512)) &&
       (stageInput.budget === undefined ||
