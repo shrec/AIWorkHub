@@ -986,15 +986,46 @@ def _project_attempt_row(row: Mapping[str, Any]) -> dict[str, Any]:
     return projected
 
 
+_SLOT_NOTE_BATCH_FIELDS = ("waited_seconds", "slots", "acquired", "reason")
+
+
+def _declared_slot_wait_seconds(validations: Any) -> float | None:
+    """Host-slot queue time of the declared batches; None when no row has a usable note.
+
+    ``host_heavy_slots.slotted`` copies one note onto every row of a batch, so an identical
+    note counts once. A row reused from an earlier run waited for nothing here. Only the
+    top-level list is read: neighbour-batch wait is already inside the neighbour
+    ``duration_seconds``.
+    """
+
+    if not isinstance(validations, list):
+        return None
+    batches: dict[tuple[Any, ...], float] = {}
+    for row in validations:
+        note = row.get("host_slot_wait") if isinstance(row, Mapping) else None
+        if not isinstance(note, Mapping) or row.get("reused_from"):
+            continue
+        waited = sdlc_phase_timeline._seconds(note.get("waited_seconds"))
+        if waited is not None:
+            fields = (note.get(name) for name in _SLOT_NOTE_BATCH_FIELDS)
+            batch = tuple(item if isinstance(item, (str, int, float)) else None for item in fields)
+            batches[batch] = waited
+    return round(sum(batches.values()), 3) if batches else None
+
+
 def _project_review_ready_row(row: Mapping[str, Any]) -> dict[str, Any]:
     durations = row.get("finalization_phase_durations_ms")
-    return {
+    projected = {
         "request_id": row.get("request_id"),
         "task_id": row.get("task_id"),
         "finished_at": row.get("finished_at"),
         "finalization_duration_ms": row.get("finalization_duration_ms"),
         "validation_ms": durations.get("validation") if isinstance(durations, Mapping) else None,
     }
+    slot_wait = _declared_slot_wait_seconds(row.get("validation"))
+    if slot_wait is not None:
+        projected["declared_slot_wait_seconds"] = slot_wait
+    return projected
 
 
 def _collect_ledger_row(
@@ -1080,7 +1111,7 @@ def _scan_range(path: Path, start: int, size: int, rows: list[dict[str, Any]]) -
     )
 
 
-_SEGMENT_CACHE_VERSION = 2
+_SEGMENT_CACHE_VERSION = 3
 _SEGMENT_CACHE_MAX_BYTES = 64 * 1024 * 1024
 _SEGMENT_CACHE_INT_FIELDS = ("size", "mtime_ns", "ino", "row_limit", "committed",
                              "committed_oversized", "oversized")

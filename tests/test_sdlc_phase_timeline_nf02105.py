@@ -57,7 +57,8 @@ def _timeline_card(
     """The real stored shape: compacted validation, a quality_gate snapshot, a ledger row.
 
     ``evidence.validation`` is compaction's identity stand-in, the per-command list and a
-    card-side ``finished_at`` do not exist, and ``accept_evidence.started_at`` is never written.
+    card-side ``finished_at`` do not exist. This fixture omits ``accept_evidence.started_at``,
+    so ``manager_wait`` and ``accept`` stay typed unknowns here.
     """
 
     claimed = queue
@@ -486,3 +487,125 @@ def test_aggregate_without_phase_evidence_reports_unknown_not_zero():
         False, "phase_evidence_unread",
     )
     assert timeline["cards"] == 0
+
+
+_SLOT_NOTE = {
+    "slots": 4, "waited_seconds": 1358.0, "acquired": True, "reason": "acquired_after_wait",
+}
+
+
+def _per_command_card(task_id, ledger_validation=None):
+    """A card that kept its per-command rows; the wait sits outside their duration_seconds."""
+
+    row = _timeline_card(
+        task_id=task_id, queue=10, worker=100, finalization=2000, reviewers=40, manager_wait=50,
+        accept=60, declared=100, neighbour=200, workspace_ms=1_000,
+    )
+    row["card"]["terminal_review"]["evidence"]["validations"] = [
+        {"command": "pytest -q", "duration_seconds": 100},
+    ]
+    if ledger_validation is not None:
+        row["ledger"]["validation"] = ledger_validation
+    return row
+
+
+def _slot_timeline(tmp_path, monkeypatch, row, name="repo"):
+    return _metrics(tmp_path, monkeypatch, {"TASK-W": row}, name)["phase_timeline"]
+
+
+def test_slot_wait_moves_from_finalize_other_into_validation(tmp_path, monkeypatch):
+    before = _slot_timeline(
+        tmp_path, monkeypatch, _per_command_card("TASK-W"), "before"
+    )["slowest_cards"][0]
+    assert before["phases"]["validation"] == 301.0
+    assert before["phases"]["finalize_other"] == 1699.0
+
+    noted = _per_command_card("TASK-W", [
+        {"command": "pytest -q", "duration_seconds": 100, "host_slot_wait": _SLOT_NOTE},
+    ])
+    after = _slot_timeline(tmp_path, monkeypatch, noted, "after")["slowest_cards"][0]
+    assert after["phases"]["validation"] == 1659.0
+    assert after["phases"]["finalize_other"] == 341.0
+    assert after["validation_parts"] == {
+        "declared": 100.0, "neighbour": 200.0, "provisioning": 1.0, "slot_wait": 1358.0,
+    }
+
+
+def test_slot_wait_on_the_neighbour_path_is_not_counted_again(tmp_path, monkeypatch):
+    row = _per_command_card("TASK-W", [{"command": "pytest -q", "duration_seconds": 100}])
+    row["ledger"]["quality_gate"] = {"full_validation_snapshot": {"neighbour_tests": {
+        "duration_seconds": 200,
+        "host_slot_wait": _SLOT_NOTE,
+        "validation": [{"command": "neighbours", "host_slot_wait": _SLOT_NOTE}],
+    }}}
+    assert "declared_slot_wait_seconds" not in sdlc_outcome_metrics._project_review_ready_row(
+        row["ledger"]
+    )
+    card = _slot_timeline(tmp_path, monkeypatch, row)["slowest_cards"][0]
+    assert card["phases"]["validation"] == 301.0
+    assert "slot_wait" not in card["validation_parts"]
+
+
+def test_slot_wait_of_one_batch_counts_once_and_separate_batches_add_up():
+    project = sdlc_outcome_metrics._project_review_ready_row
+    batch = [{"command": name, "host_slot_wait": dict(_SLOT_NOTE)} for name in "abc"]
+    assert project({"validation": batch})["declared_slot_wait_seconds"] == 1358.0
+    other = {"command": "d", "host_slot_wait": {**_SLOT_NOTE, "waited_seconds": 2.5}}
+    assert project({"validation": [*batch, other]})["declared_slot_wait_seconds"] == 1360.5
+    # A corrupt non-scalar field cannot break the once-per-batch key.
+    odd = {"command": "e", "host_slot_wait": {**_SLOT_NOTE, "slots": [4]}}
+    assert project({"validation": [odd, odd]})["declared_slot_wait_seconds"] == 1358.0
+
+
+def test_slot_wait_absent_keeps_an_old_card_unchanged_and_known(tmp_path, monkeypatch):
+    row = _per_command_card("TASK-W", [{"command": "pytest -q", "duration_seconds": 100}])
+    assert "declared_slot_wait_seconds" not in sdlc_outcome_metrics._project_review_ready_row(
+        row["ledger"]
+    )
+    timeline = _slot_timeline(tmp_path, monkeypatch, row)
+    card = timeline["slowest_cards"][0]
+    assert card["phases"]["validation"] == 301.0
+    assert card["phases"]["finalize_other"] == 1699.0
+    assert card["validation_parts"] == {
+        "declared": 100.0, "neighbour": 200.0, "provisioning": 1.0,
+    }
+    for name in ("validation", "finalize_other"):
+        assert timeline["phases"][name]["unknown"] == 0
+
+
+@pytest.mark.parametrize(("waited", "declared"), [(400.0, 100.0), (5000.0, 0.0)])
+def test_slot_wait_comes_out_of_declared_on_the_wall_path(
+    tmp_path, monkeypatch, waited, declared
+):
+    row = _timeline_card(
+        task_id="TASK-W", queue=10, worker=20, finalization=1000, reviewers=40, manager_wait=50,
+        accept=60, declared=500, neighbour=200, workspace_ms=1_000,
+    )
+    row["ledger"]["validation"] = [
+        {"command": "pytest -q", "host_slot_wait": {**_SLOT_NOTE, "waited_seconds": waited}},
+    ]
+    card = _slot_timeline(tmp_path, monkeypatch, row)["slowest_cards"][0]
+    # The wall already contains the wait, so the phase total does not grow.
+    assert card["phases"]["validation"] == 700.0
+    assert card["phases"]["finalize_other"] == 300.0
+    assert card["validation_parts"] == {
+        "declared": declared, "neighbour": 200.0, "provisioning": 1.0, "slot_wait": waited,
+    }
+
+
+@pytest.mark.parametrize("row", [
+    {"reused_from": "worker_validation_run", "host_slot_wait": _SLOT_NOTE},
+    {"host_slot_wait": {**_SLOT_NOTE, "waited_seconds": -1}},
+    {"host_slot_wait": {**_SLOT_NOTE, "waited_seconds": True}},
+    {"host_slot_wait": {**_SLOT_NOTE, "waited_seconds": float("nan")}},
+    {"host_slot_wait": "1358"},
+    "not-a-row",
+])
+def test_slot_wait_ignores_reused_rows_and_malformed_notes(row):
+    assert "declared_slot_wait_seconds" not in sdlc_outcome_metrics._project_review_ready_row(
+        {"validation": [row]}
+    )
+
+
+def test_slot_wait_projection_invalidates_archived_segments():
+    assert sdlc_outcome_metrics._SEGMENT_CACHE_VERSION >= 3

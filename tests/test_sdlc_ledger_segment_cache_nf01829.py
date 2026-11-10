@@ -279,7 +279,7 @@ def test_review_ready_timing_comes_through_the_cache_without_a_rescan(ledger, re
     assert "R-c2" in [row["request_id"] for row in first.rows]
     assert "R-c1" not in [row["request_id"] for row in first.rows]
     payload = json.loads(ledger.cache.read_text(encoding="utf-8"))
-    assert payload["version"] == metrics._SEGMENT_CACHE_VERSION == 2
+    assert payload["version"] == metrics._SEGMENT_CACHE_VERSION
     reads.clear()
 
     warm = metrics.read_attempt_evidence(ledger.live)

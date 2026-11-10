@@ -13,7 +13,10 @@ Every duration is derived from timestamps and timings the task system already re
   Compaction removes the per-command rows from stored cards; the phase is then the ledger
   row's ``finalization_phase_durations_ms.validation``, a wall clock around declared and
   neighbour runs, so it is neither added to the neighbour time nor to provisioning, which
-  happens before the worker and outside finalization.
+  happens before the worker and outside finalization. Time declared batches spent queued
+  for a host slot (``host_slot_wait`` notes on the ledger row) falls outside each row's
+  ``duration_seconds``, so it is added as ``slot_wait``; the wall already contains it, so
+  on that path it comes out of ``declared`` instead.
 * ``finalize_other``: the rest of finalization, worker done -> ``terminal_review.recorded_at``
   (review ready) minus ``validation``.
 * ``reviewers``: review ready -> the last reviewer receipt (card ``reviewer_receipts[].
@@ -274,19 +277,25 @@ def _validation_parts(record: Mapping[str, Any]) -> dict[str, float | None]:
     """The parts of ``validation``; the ledger wall already contains the neighbour run.
 
     The wall cannot be split without a recorded neighbour time, so ``declared`` is then
-    unknown even though the phase total is measured.
+    unknown even though the phase total is measured. ``slot_wait`` appears only when the
+    ledger reported a host-slot wait; it is not one of ``VALIDATION_PARTS``, so a card
+    without a note keeps its three parts and never turns unknown over it.
     """
 
     declared = _declared_seconds(record)
     neighbour = _neighbour_seconds(record)
+    slot_wait = _seconds(record.get("ledger_slot_wait_seconds"))
     wall = _ledger_validation_seconds(record)
     if wall is not None:
-        declared = None if neighbour is None else max(0.0, wall - neighbour)
-    return {
+        declared = None if neighbour is None else max(0.0, wall - neighbour - (slot_wait or 0.0))
+    parts = {
         "declared": declared,
         "neighbour": neighbour,
         "provisioning": _provisioning_seconds(record),
     }
+    if slot_wait is not None:
+        parts["slot_wait"] = slot_wait
+    return parts
 
 
 def _last_reviewer_receipt(
@@ -431,6 +440,9 @@ def _with_ledger_timing(
     wall = _seconds(row.get("validation_ms"))
     if wall:
         merged["ledger_validation_ms"] = wall
+    slot_wait = _seconds(row.get("declared_slot_wait_seconds"))
+    if slot_wait is not None:
+        merged["ledger_slot_wait_seconds"] = slot_wait
     return merged
 
 
