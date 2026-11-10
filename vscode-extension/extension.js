@@ -1997,6 +1997,30 @@ function sanitizeWebviewPayload(value) {
   return value;
 }
 
+// Host-path redaction for the Live Output payload's output text only. The three rules run in this
+// order. Each stops at the HTML-escaped quote (&quot;) and at a backslash escape, so the JSON line
+// keeps its closing quote. ponytail: ceiling -- redaction runs per 8 KiB page, so a host path split
+// across two pages can show partially.
+function redactLiveOutputHostPaths(text) {
+  return text
+    .replace(/(^|[\s("'=,\[`]|(?<!&lt);|\\[ntr])\/[^\s"'<>|)&\\/][^\s"'<>|)&\\]*/g, "$1<redacted-host-path>")
+    .replace(/(^|[\s("'=,\[`]|(?<!&lt);|\\[ntr])[A-Za-z]:(?:\\\\|\\(?=[^"\\/&])|\/)(?:[^\s"'<>|)&\\]|\\\\|\\(?=[^n"trbfu\\/&]))*/g, "$1<redacted-host-path>")
+    .replace(/(^|[\s("'=,\[`]|(?<!&lt);|\\[ntr])\\\\(?:\\\\)?[^\\\s"'<>|)&]+(?:\\\\|\\(?=[^n"trbfu\\/&]))(?:[^\s"'<>|)&\\]|\\\\|\\(?=[^n"trbfu\\/&]))+/g, "$1<redacted-host-path>");
+}
+
+function sanitizeLiveOutputPayload(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return sanitizeWebviewPayload(payload);
+  }
+  const sanitized = {};
+  for (const [key, value] of Object.entries(payload)) {
+    sanitized[key] = key === "output" && typeof value === "string"
+      ? redactLiveOutputHostPaths(value)
+      : sanitizeWebviewPayload(value);
+  }
+  return sanitized;
+}
+
 // NF-2026-02113: bounded deactivate budget for the best-effort dispatcher /
 // daemon stop requests that precede each owner's child tree kill.
 const MCP_DEACTIVATE_STOP_TIMEOUT_MS = 1500;
@@ -10803,7 +10827,7 @@ async function pushLiveOutput(view, taskId, cursor) {
       cursor: Number.isFinite(cursor) && cursor >= 0 ? cursor : 0,
     });
     if (view.stillBoundTo(client)) {
-      view.postMessage({ type: OUTBOUND_TYPES.liveOutput, payload: sanitizeWebviewPayload(payload) });
+      view.postMessage({ type: OUTBOUND_TYPES.liveOutput, payload: sanitizeLiveOutputPayload(payload) });
     }
   } catch (err) {
     view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
@@ -15183,6 +15207,7 @@ module.exports = {
     vscodeLmRequiredCreateError, vscodeLmStagedOutputsReady,
   vscodeLmActivityRedactText,
     vscodeLmActivityPreview,
+    sanitizeLiveOutputPayload,
     CODING_FOUNDATION_CARD_KEYS,
     CODING_FOUNDATION_SCHEMAS,
     codingFoundationCardModel,

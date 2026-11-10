@@ -18,11 +18,15 @@ const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/;
 // never grows the Webview's own memory past what one server response could
 // ever contain.
 const LIVE_OUTPUT_MAX_CLIENT_CHARS = 64 * 1024;
+// A single line up to this size is never cut; a longer one becomes one size row (appendLiveOutputText).
+const LIVE_OUTPUT_MAX_LINE_CHARS = 1024 * 1024;
 // Bounded, single-task-only poll cadence for the selected task's Live
 // Output -- independent of the dashboard-wide snapshot refresh timer, and
 // only ever running while exactly one task is selected (see
 // startLiveOutputPolling/stopLiveOutputPolling).
 const LIVE_OUTPUT_POLL_MS = 4000;
+// Re-poll quickly while the server reports more output waiting (info.truncated).
+const LIVE_OUTPUT_CATCHUP_POLL_MS = 150;
 const READY_RETRY_MS = 1000;
 const READY_MAX_ATTEMPTS = 30;
 // Bounded poll cadence for the Manager transcript while a session is active --
@@ -46,6 +50,7 @@ const state = {
   liveOutputTaskId: null,
   liveOutputCursor: 0,
   liveOutputText: "",
+  liveOutputOversizeChars: 0,
   liveOutputTimer: null,
   systemLogs: [],
   memoryEntries: [],
@@ -4512,6 +4517,7 @@ function resetLiveOutputPanel() {
   state.liveOutputTaskId = null;
   state.liveOutputCursor = 0;
   state.liveOutputText = "";
+  state.liveOutputOversizeChars = 0;
   elements.detailLiveOutputBlock.hidden = true;
   elements.detailLiveOutputState.textContent = "";
   elements.detailLiveOutputState.className = "validation-label";
@@ -4528,6 +4534,7 @@ function startLiveOutputPolling(taskId) {
   state.liveOutputTaskId = taskId;
   state.liveOutputCursor = 0;
   state.liveOutputText = "";
+  state.liveOutputOversizeChars = 0;
   elements.detailLiveOutputBlock.hidden = false;
   elements.detailLiveOutputState.textContent = "Loading";
   elements.detailLiveOutputState.className = "validation-label";
@@ -4540,7 +4547,7 @@ function startLiveOutputPolling(taskId) {
   vscode.postMessage({ type: "requestLiveOutput", taskId, cursor: 0 });
 }
 
-function scheduleNextLiveOutputPoll(taskId) {
+function scheduleNextLiveOutputPoll(taskId, delayMs = LIVE_OUTPUT_POLL_MS) {
   if (state.liveOutputTaskId !== taskId) {
     return;
   }
@@ -4563,7 +4570,7 @@ function scheduleNextLiveOutputPoll(taskId) {
     if (state.liveOutputTaskId === taskId) {
       vscode.postMessage({ type: "requestLiveOutput", taskId, cursor: state.liveOutputCursor });
     }
-  }, LIVE_OUTPUT_POLL_MS);
+  }, delayMs);
 }
 
 // The stdout tail arrives pre-escaped/redacted from
@@ -5156,6 +5163,19 @@ function vscodeLmProgressEvent(event, rawLine) {
 }
 
 function timelineEventFromObject(event, rawLine) {
+  if (event.type === "aiworkhub_live_output_oversize") {
+    // Written by appendLiveOutputText in place of a line too long to keep: one size row.
+    const chars = Number.isSafeInteger(event.chars) ? event.chars : 0;
+    return {
+      kind: "warning",
+      title: "Line too large",
+      label: "oversize line",
+      state: "advisory",
+      message: `${formatCount(chars)} characters not shown`,
+      metrics: [],
+      raw: safeRawEvent(rawLine),
+    };
+  }
   if (event.type === "aiworkhub_progress") {
     return vscodeLmProgressEvent(event, rawLine);
   }
@@ -5261,10 +5281,15 @@ function timelineEventFromObject(event, rawLine) {
   };
 }
 
-function timelineEventsFromText(decoded) {
+function timelineEventsFromText(decoded, options = {}) {
   const events = [];
   const seenJsonLines = new Set();
-  for (const line of String(decoded || "").split(/\r?\n/)) {
+  // Live tail: only the last line can still be arriving. Only calls that pass liveTail get that rule;
+  // one-argument calls keep the strict behaviour.
+  const rawLines = String(decoded || "").split(/\r?\n/);
+  const openTailIndex = options.liveTail ? rawLines.length - 1 : -1;
+  for (let index = 0; index < rawLines.length; index += 1) {
+    const line = rawLines[index];
     if (!line.trim()) {
       continue;
     }
@@ -5299,6 +5324,20 @@ function timelineEventsFromText(decoded) {
     // branch summarizes any unrecognised-but-valid shape instead of calling it
     // unsupported (NF-2026-00282 / NF-2026-00183).
     const looksStructured = /^[\s]*[\[{]/.test(line) || /\\"(?:type|event|result)\\"\s*:/.test(line);
+    if (index === openTailIndex && looksStructured) {
+      // Live tail only: a structured line whose newline has not arrived yet is not malformed.
+      // Show one neutral size row until the line completes.
+      events.push({
+        kind: "text",
+        title: "Receiving large event...",
+        label: "receiving",
+        state: "line",
+        message: `${Math.max(1, Math.round(line.length / 1024))} KB received`,
+        metrics: [],
+        raw: "",
+      });
+      continue;
+    }
     events.push({
       kind: "text",
       title: looksStructured ? "Unparsed provider line" : "Output",
@@ -5371,9 +5410,9 @@ function addLiveOutputSection(parent, title, content, className = "") {
   parent.appendChild(section);
 }
 
-function renderFormattedLiveOutput(decoded) {
+function renderFormattedLiveOutput(decoded, options = {}) {
   const fragment = document.createDocumentFragment();
-  const events = timelineEventsFromText(decoded);
+  const events = timelineEventsFromText(decoded, options);
   if (!events.length) {
     fragment.appendChild(createElement("div", "panel-list-empty compact", "Waiting for model output..."));
     elements.detailLiveOutputContainer.replaceChildren(fragment);
@@ -5408,18 +5447,62 @@ function renderFormattedLiveOutput(decoded) {
   elements.detailLiveOutputContainer.replaceChildren(fragment);
 }
 
-function appendLiveOutputText(chunk) {
-  if (!chunk) {
+// The row text for a line too long to keep; timelineEventFromObject renders it as one size row.
+function liveOutputOversizeLine(chars) {
+  return `{"type":"aiworkhub_live_output_oversize","chars":${chars}}`;
+}
+
+// Appends a server chunk to the client buffer. Lines up to LIVE_OUTPUT_MAX_LINE_CHARS are never
+// cut. Trimming drops only the oldest whole lines and keeps the newest complete line and the
+// unfinished tail. A longer line is replaced by one size row, and its remaining characters are
+// only counted until its newline.
+function appendLiveOutputText(chunk, finished = false) {
+  // A final empty page still re-renders once so an open tail stops showing as receiving; the poll
+  // keeps running after exit, so later empty pages stay no-ops.
+  if (!chunk && (!finished || state.liveOutputFinalRendered)) {
     return;
   }
-  state.liveOutputText += chunk;
-  if (state.liveOutputText.length > LIVE_OUTPUT_MAX_CLIENT_CHARS) {
-    const excess = state.liveOutputText.length - LIVE_OUTPUT_MAX_CLIENT_CHARS;
-    const newlineIndex = state.liveOutputText.indexOf("\n", excess);
-    state.liveOutputText = state.liveOutputText.slice(newlineIndex !== -1 ? newlineIndex + 1 : excess);
+  state.liveOutputFinalRendered = finished;
+  let buffer = state.liveOutputText;
+  let oversize = state.liveOutputOversizeChars;
+  let cursor = 0;
+  while (cursor < chunk.length) {
+    const newline = chunk.indexOf("\n", cursor);
+    const segment = chunk.slice(cursor, newline === -1 ? chunk.length : newline);
+    if (oversize > 0) {
+      oversize += segment.length;
+    } else {
+      buffer += segment;
+      const tailLength = buffer.length - (buffer.lastIndexOf("\n") + 1);
+      if (tailLength > LIVE_OUTPUT_MAX_LINE_CHARS) {
+        oversize = tailLength;
+        buffer = buffer.slice(0, buffer.length - tailLength);
+      }
+    }
+    if (newline === -1) {
+      break;
+    }
+    if (oversize > 0) {
+      buffer += `${liveOutputOversizeLine(oversize)}\n`;
+      oversize = 0;
+    } else {
+      buffer += "\n";
+    }
+    cursor = newline + 1;
   }
+  if (buffer.length > LIVE_OUTPUT_MAX_CLIENT_CHARS) {
+    // Never drop past the start of the newest complete line, so it and the unfinished tail survive.
+    const tailStart = buffer.lastIndexOf("\n") + 1;
+    const newestLineStart = tailStart >= 2 ? buffer.lastIndexOf("\n", tailStart - 2) + 1 : 0;
+    const newline = buffer.indexOf("\n", buffer.length - LIVE_OUTPUT_MAX_CLIENT_CHARS);
+    const keepFrom = newline === -1 ? newestLineStart : Math.min(newline + 1, newestLineStart);
+    buffer = buffer.slice(keepFrom);
+  }
+  state.liveOutputText = buffer;
+  state.liveOutputOversizeChars = oversize;
+  const oversizeRow = oversize > 0 ? `\n${liveOutputOversizeLine(oversize)}` : "";
   const decoded = decodeLiveOutput(state.liveOutputText);
-  renderFormattedLiveOutput(decoded);
+  renderFormattedLiveOutput(decoded + oversizeRow, { liveTail: !finished });
   elements.detailLiveOutputRaw.hidden = decoded.length === 0;
   elements.detailLiveOutputRawContent.textContent = decoded;
 }
@@ -5448,7 +5531,11 @@ function renderLiveOutput(payload) {
     return;
   }
 
-  appendLiveOutputText(String(info.output || ""));
+  const liveness = String(info.liveness_state || info.state || "unknown");
+  const exited = ["exited", "completed"].includes(liveness);
+  // Finished only when the server has nothing more waiting and the process has ended.
+  const finished = !info.truncated && (Number.isFinite(info.exit_code) || exited);
+  appendLiveOutputText(String(info.output || ""), finished);
   if (Number.isFinite(info.next_cursor)) {
     state.liveOutputCursor = info.next_cursor;
   }
@@ -5459,14 +5546,14 @@ function renderLiveOutput(payload) {
     elements.detailLiveOutputStderr.textContent = decodeLiveOutput(stderrTail);
   }
 
-  const liveness = String(info.liveness_state || info.state || "unknown");
   const activity = info.last_activity_at ? formatRelativeTime(info.last_activity_at) : "unknown";
   const exitSuffix = Number.isFinite(info.exit_code) ? ` | exit ${info.exit_code}` : "";
   elements.detailLiveOutputState.textContent =
     `${liveness} | last activity ${activity}${info.truncated ? " | truncated" : ""}${exitSuffix}`;
-  elements.detailLiveOutputState.className = `validation-label ${["exited", "completed"].includes(liveness) ? "pass" : ""}`;
+  elements.detailLiveOutputState.className = `validation-label ${exited ? "pass" : ""}`;
 
-  scheduleNextLiveOutputPoll(taskId);
+  // A truncated page means more output is already waiting: catch up quickly.
+  scheduleNextLiveOutputPoll(taskId, info.truncated ? LIVE_OUTPUT_CATCHUP_POLL_MS : LIVE_OUTPUT_POLL_MS);
 }
 
 if (typeof globalThis !== "undefined") {
