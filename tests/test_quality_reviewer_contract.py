@@ -1926,6 +1926,76 @@ def test_not_durable_branch_spends_no_correction(
     assert worker_tools._spent_submit_attempts(ctx, "quality_review_submit") == 1
 
 
+def _padded_findings(count: int, pad: int) -> list[object]:
+    findings = []
+    for index in range(count):
+        finding = _in_scope_finding(f"big{index}")
+        finding["summary"] = "x" * pad
+        findings.append(finding)
+    return findings
+
+
+def test_reviewer_report_above_the_tool_output_cap_lands_in_the_ledger(
+    tmp_path: Path,
+) -> None:
+    ctx, packet = _submit_context(tmp_path)
+    result = _submit(ctx, packet, _padded_findings(9, 1900))
+    assert result["ok"] is True, result
+    assert result["durable"] is True
+    payloads = _verified_payloads(ctx)
+    assert len(payloads) == 1
+    size = len(
+        json.dumps(
+            payloads[0], ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+    )
+    assert worker_tools.MAX_TOOL_OUTPUT_BYTES < size
+    assert size < worker_tools.QUALITY_REVIEW_RECEIPT_MAX_BYTES
+
+
+def test_reviewer_report_above_the_receipt_cap_asks_for_a_shorter_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx, packet = _submit_context(tmp_path)
+    # Field normalisation bounds a report, so lower the cap to the old limit
+    # to make the 9-finding receipt (above 16384 bytes) exceed it.
+    monkeypatch.setattr(
+        worker_tools,
+        "QUALITY_REVIEW_RECEIPT_MAX_BYTES",
+        worker_tools.MAX_TOOL_OUTPUT_BYTES,
+    )
+    too_big = _submit(ctx, packet, _padded_findings(9, 1900))
+    assert too_big["ok"] is False
+    assert too_big["reason"] == "quality_review_report_too_large"
+    assert "retry_requires_identical_receipt" not in too_big
+    assert too_big["attempt"] == 1
+    assert too_big["corrections_remaining"] == 1
+    assert _verified_payloads(ctx) == []
+
+    shorter = _submit(ctx, packet, [_in_scope_finding("short")])
+    assert shorter["ok"] is True, shorter
+    assert len(_verified_payloads(ctx)) == 1
+
+
+def test_default_append_audit_payload_limit_is_unchanged(tmp_path: Path) -> None:
+    ctx, _packet_unused = _submit_context(tmp_path)
+    oversized = {"blob": "x" * (worker_tools.MAX_TOOL_OUTPUT_BYTES + 1)}
+    kwargs = dict(
+        tool="t", ok=True, cache_hit=False, hit_count=0, bytes_returned=0
+    )
+    assert worker_tools._append_audit(ctx, payload=oversized, **kwargs) is False
+    assert (
+        worker_tools._append_audit(
+            ctx,
+            payload=oversized,
+            max_payload_bytes=worker_tools.QUALITY_REVIEW_RECEIPT_MAX_BYTES,
+            **kwargs,
+        )
+        is True
+    )
+    assert worker_tools.MAX_TOOL_OUTPUT_BYTES == 16384
+
+
 def test_durability_bound_ends_the_run_without_further_appends(
     tmp_path: Path,
 ) -> None:

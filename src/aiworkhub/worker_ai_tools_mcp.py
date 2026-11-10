@@ -2120,6 +2120,7 @@ def _append_audit(
     payload: Mapping[str, Any] | None = None,
     provider_call_id: str = "",
     provenance: str = "",
+    max_payload_bytes: int = MAX_TOOL_OUTPUT_BYTES,
 ) -> bool:
     _record_tool_call(ctx, tool, ok)
     if ctx.audit_ledger_path is None or ctx.audit_hmac_key_path is None:
@@ -2171,7 +2172,7 @@ def _append_audit(
         encoded_payload = json.dumps(
             payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
         ).encode("utf-8")
-        if len(encoded_payload) > MAX_TOOL_OUTPUT_BYTES:
+        if len(encoded_payload) > max_payload_bytes:
             return False
         entry["payload"] = dict(payload)
     digest = _hmac_entry(entry, key)
@@ -7598,6 +7599,10 @@ def _prior_rejected_finding_intent(
 # way.
 QUALITY_REVIEW_SUBMIT_MAX_ATTEMPTS = 2
 
+# A normalized reviewer receipt may exceed MAX_TOOL_OUTPUT_BYTES (many findings);
+# only the quality_review_submit append gets this larger bound.
+QUALITY_REVIEW_RECEIPT_MAX_BYTES = 64 * 1024
+
 _QUALITY_REVIEW_ATTEMPT_LOCK = threading.Lock()
 _QUALITY_REVIEW_ATTEMPTS: dict[tuple[str, str, str, str], int] = {}
 
@@ -7955,6 +7960,21 @@ def quality_review_submit(
         receipt, ensure_ascii=False, separators=(",", ":"), sort_keys=True
     ).encode("utf-8")
     submission_id = hashlib.sha256(receipt_bytes).hexdigest()
+    if len(receipt_bytes) > QUALITY_REVIEW_RECEIPT_MAX_BYTES:
+        # Nothing landed, so this is the reviewer's to shorten: spend a
+        # correction and do not demand the identical oversized receipt.
+        return _charge_failed_submit_attempt(
+            ctx,
+            tool,
+            _record_rejected_finding_intent(
+                ctx,
+                tool,
+                "quality_review_report_too_large",
+                packet_sha256=packet_sha256,
+                lens=lens,
+                raw_findings=list(findings),
+            ),
+        )
 
     if not normalized_findings:
         # An empty report is only trusted once the ledger shows no rejected
@@ -8049,6 +8069,7 @@ def quality_review_submit(
         authority_source="supervisor" if ctx._supervisor_owned else "runtime",
         authority_state="process_bound",
         payload=receipt,
+        max_payload_bytes=QUALITY_REVIEW_RECEIPT_MAX_BYTES,
     )
     if not appended:
         # The audit ledger is unavailable, so nothing about this submission can
