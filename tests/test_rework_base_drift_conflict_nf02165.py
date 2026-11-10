@@ -80,6 +80,7 @@ def _seed(
     *,
     sealed: bool = False,
     canonical_mode: str = "100644",
+    extra_card: dict | None = None,
 ) -> worker_workspace.WorkerWorkspace:
     scope = {"allowed_writes": [OTHER, RESULT]}
     predecessor = worker_workspace.create_workspace(
@@ -113,7 +114,7 @@ def _seed(
         return worker_workspace.create_workspace(
             repo,
             "drift-successor",
-            {**scope, "rework_predecessor": rework},
+            {**scope, "rework_predecessor": rework, **(extra_card or {})},
             "validation",
         )
     finally:
@@ -177,6 +178,50 @@ def test_non_conflicted_drift_writes_no_notice(tmp_path: Path, repo: Path) -> No
             line1="predecessor-1\n", line8="canonical-8\n"
         )
         assert not (successor.home / "task_mcp_worker_runtime" / NOTICE_NAME).exists()
+    finally:
+        worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
+
+
+_REPLAY_CARD = {"validation_only_replay_authorization": {"granted": True}}
+
+
+@pytest.mark.parametrize("sealed", [False, True], ids=["retained", "delta_artifact"])
+def test_validation_only_replay_conflict_refuses_and_writes_no_notice(
+    tmp_path: Path, repo: Path, sealed: bool
+) -> None:
+    candidates = {
+        RESULT: _bytes(line1="predecessor-1\n"),
+        OTHER: _bytes(line1="predecessor-1\n"),
+    }
+    canonical = {
+        RESULT: _bytes(line1="canonical-1\n"),  # same line: a true conflict
+        OTHER: _bytes(line8="canonical-8\n"),
+    }
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match=f"^rework_base_drift:{RESULT}$"
+    ):
+        _seed(repo, tmp_path, candidates, canonical, sealed=sealed, extra_card=_REPLAY_CARD)
+    assert not list(tmp_path.rglob(NOTICE_NAME))
+
+
+def test_validation_only_replay_clean_drift_still_merges(tmp_path: Path, repo: Path) -> None:
+    candidates = {
+        RESULT: _bytes(line1="predecessor-1\n"),
+        OTHER: _bytes(line1="predecessor-1\n"),
+    }
+    successor = _seed(
+        repo,
+        tmp_path,
+        candidates,
+        {OTHER: _bytes(line8="canonical-8\n")},
+        extra_card=_REPLAY_CARD,
+    )
+    try:
+        assert (successor.path / RESULT).read_bytes() == candidates[RESULT]
+        assert (successor.path / OTHER).read_bytes() == _bytes(
+            line1="predecessor-1\n", line8="canonical-8\n"
+        )
+        assert not list(tmp_path.rglob(NOTICE_NAME))
     finally:
         worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
 

@@ -2414,8 +2414,8 @@ def _materialize_rework_predecessor(
     # Deferred like ``record_base_blobs``: promotion_merge owns the recorded-blob
     # three-way merges and imports this module at its top (NF-2026-01431).
     from .promotion_merge import rework_base_drift_rebase
-
-    rebase = rework_base_drift_rebase(repo, worktree, source_workspace, notice_home)
+    notice = None if card.get("validation_only_replay_authorization") else notice_home
+    rebase = rework_base_drift_rebase(repo, worktree, source_workspace, notice)
     if rebase is not None and rebased_hashes is not None:
         rebase = _recording_rebase(rebase, rebased_hashes)
     if predecessor.get("delta_artifact") is not None:

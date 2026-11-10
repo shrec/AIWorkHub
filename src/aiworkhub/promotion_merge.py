@@ -361,6 +361,8 @@ def rework_base_drift_rebase(
     raises: the path merges to S0's current canonical bytes and the typed
     ``rework_base_drift_conflict`` notice (path -> predecessor diff) is written
     into that request HOME (NF-2026-02165). Every other refusal is unchanged.
+    A validation-only replay passes None because no worker exists to read a
+    notice, so a conflict stays a clear refusal (NF-2026-02210).
     """
     base = source.base_oid
     if not base or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", base) is None:
