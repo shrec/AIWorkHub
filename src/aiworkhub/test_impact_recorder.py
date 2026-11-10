@@ -49,6 +49,7 @@ from typing import Any
 import pytest
 
 from . import test_impact_select as _select
+from .platform_io import is_windows
 
 SHARD_SCHEMA_ID = "aiworkhub.test_impact.shard.v2"
 TOOL_NAME = "aiworkhub.test_impact_recorder"
@@ -183,7 +184,7 @@ def _split_posix_command_line(text: str) -> list[str]:
 
 
 _split_command_line: Callable[[str], list[str]] = (
-    split_windows_command_line if os.name == "nt" else _split_posix_command_line
+    split_windows_command_line if is_windows() else _split_posix_command_line
 )
 
 

@@ -6,8 +6,8 @@ lives in vscode-extension/media/app.js -- the Webview-side renderer for the
 liveOutput message extension.js already forwards unchanged (see
 extension.js::pushLiveOutput). The deep behavioral coverage (signature_delta
 dropped from the feed with zero timeline rows, text_delta still rendering as
-readable text, adjacent result/error rows unaffected, newest-first ordering
-preserved) lives in test/live-output-formatting.test.js, which is real
+readable text, adjacent result/error rows unaffected, oldest-first chat order
+rendered by renderWorkerChatEvents) lives in test/live-output-formatting.test.js, which is real
 Node.js code exercising the real app.js -- this file runs it via subprocess
 and adds static-content guardrails for the contract.
 """
@@ -103,9 +103,11 @@ def test_raw_provider_output_affordance_still_present() -> None:
     assert "Raw provider output" in _read(VSCODE_EXT_DIR / "extension.js")
 
 
-def test_newest_first_ordering_unchanged() -> None:
+def test_live_output_renders_as_chat_oldest_first() -> None:
     app = _read(APP_JS)
-    assert "for (const event of events.slice(-200).reverse())" in app
+    assert "liveOutputChatEvents(" in app
+    assert "renderWorkerChatEvents(" in app
+    assert "for (const event of events.slice(-200).reverse())" not in app
 
 
 def test_live_output_formatting_node_regression_passes() -> None:

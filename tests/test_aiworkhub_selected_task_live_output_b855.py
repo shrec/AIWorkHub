@@ -244,7 +244,7 @@ def test_webview_normalizer_handles_nested_provider_json_without_visible_raw_dum
 
     The browser behavior itself is covered by the extension's JS syntax
     check; these source assertions ensure the formatter keeps the recursive
-    JSON parser, readable unknown-event fallback, and newest-first ordering.
+    JSON parser, readable unknown-event fallback, and oldest-first chat order.
     """
     app_source = (
         _TOOL_ROOT / "vscode-extension" / "media" / "app.js"
@@ -258,5 +258,7 @@ def test_webview_normalizer_handles_nested_provider_json_without_visible_raw_dum
     # both halves - the old label is gone, and the named degradation is here.
     assert "Provider emitted an unsupported event shape" not in app_source
     assert "Unparsed provider line" in app_source
-    assert "for (const event of events.slice(-200).reverse())" in app_source
+    assert "liveOutputChatEvents(" in app_source
+    assert "renderWorkerChatEvents(" in app_source
+    assert "for (const event of events.slice(-200).reverse())" not in app_source
     assert "raw: safeRawEvent(" in app_source
