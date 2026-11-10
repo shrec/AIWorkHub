@@ -70,6 +70,7 @@ installed extension's server reports after a reload.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import importlib.util
 import io
 import json
@@ -85,10 +86,11 @@ from types import ModuleType
 from typing import Callable, Mapping, Protocol, Sequence
 
 
-def _load_sibling(name: str) -> ModuleType:
-    """Load another script of this directory by path: scripts/ is not a package."""
+def _load_sibling(name: str, directory: Path | None = None) -> ModuleType:
+    """Load a module by path, as scripts/ is not a package: from ``directory``, else scripts/."""
 
-    path = Path(__file__).resolve().with_name(f"{name}.py")
+    folder = Path(__file__).resolve().parent if directory is None else directory
+    path = folder / f"{name}.py"
     spec = importlib.util.spec_from_file_location(f"aiworkhub_{name}", path)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load {path}")
@@ -235,6 +237,69 @@ def run_subprocess(
         return Completed(-1, "", f"cannot run {argv[0]}: {exc}")
     stdout, stderr = _decode(done.stdout, wsl=wsl), _decode(done.stderr, wsl=wsl)
     return Completed(done.returncode, stdout, stderr)
+
+
+def _bind_children_to_this_process() -> bool:
+    """Enter a fresh kill-on-close Job Object, so the kernel ends the cut's tree with it.
+
+    Every later child and grandchild inherits the job, whatever ends this process.
+    The cut binds itself, not each child: the interpreter can already sit inside a
+    launcher job that lets its children break away silently, and only an innermost
+    job without breakaway keeps them. On success the job handle stays open until the
+    process ends, because closing it would end the cut. A failed step prints one
+    line and the cut goes on unbound; nothing here raises.
+
+    The WSL side was measured to need no code: killing wsl.exe ended its whole Linux
+    session within one second, so the job that ends wsl.exe ends the Linux side.
+    A POSIX host is not covered: there this returns False and binds nothing.
+    """
+
+    if os.name != "nt":
+        return False
+    kernel32 = ctypes.windll.kernel32
+    step, job, detail = "load", None, ""
+    try:
+        import ctypes.wintypes as wintypes
+
+        kernel32.GetLastError.argtypes = []
+        kernel32.GetLastError.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        layouts = _load_sibling("windows_job_structures", REPO_ROOT / "src" / "aiworkhub")
+        info = layouts.JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = 0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        step = "create"
+        job = kernel32.CreateJobObjectW(None, None)
+        if job:
+            step = "set information"
+            # Class 9 is JobObjectExtendedLimitInformation.
+            if kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+                step = "assign"
+                if kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess()):
+                    return True
+    except Exception as exc:  # whatever the load or a kernel call throws, the cut goes on
+        detail = f", {type(exc).__name__}"
+    code = kernel32.GetLastError()  # read before CloseHandle overwrites it
+    if job:
+        kernel32.CloseHandle(job)
+    print(
+        f"warning child_lifetime: {step} failed (GetLastError {code}{detail}), "
+        "so a stopped cut can leave its child processes behind"
+    )
+    return False
 
 
 @dataclass(frozen=True)
@@ -1143,7 +1208,10 @@ def main(argv: Sequence[str] | None = None, *, host: Host | None = None) -> int:
         wsl_python=args.wsl_python,
         allow_dirty=tuple(args.allow_dirty),
     )
-    return ReleaseCut(options, host if host is not None else Host.current()).run()
+    if host is None:
+        _bind_children_to_this_process()
+        host = Host.current()
+    return ReleaseCut(options, host).run()
 
 
 if __name__ == "__main__":
