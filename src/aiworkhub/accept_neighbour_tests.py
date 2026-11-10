@@ -705,7 +705,8 @@ def base_commit_workspace(workspace: Any, card: Mapping[str, Any]) -> Iterator[A
     if not isinstance(repo, (str, os.PathLike)) or not str(repo):
         raise WorkspaceError("neighbour_canonical_head_unavailable")
     head_oid = _workspace._repository_head_oid(Path(repo))
-    base_card = {key: value for key, value in card.items() if key != "rework_predecessor"}
+    base_card = {key: value for key, value in card.items() if key not in ("rework_predecessor", "required_outputs")}
+    base_card.setdefault("allowed_writes", list(getattr(workspace, "allowed_writes", ())))
     base = replace(
         _workspace.create_workspace(
             Path(repo), f"nbase_{uuid.uuid4().hex[:16]}", base_card, "validation",

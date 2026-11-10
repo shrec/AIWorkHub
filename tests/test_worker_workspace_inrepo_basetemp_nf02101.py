@@ -533,6 +533,33 @@ def test_base_commit_workspace_is_the_full_base_tree_and_is_removed(tmp_path: Pa
     assert not path.exists()
 
 
+def test_base_commit_workspace_enters_for_finalization_metadata_without_allowed_writes(tmp_path: Path) -> None:
+    # At finalization, card is route metadata: no allowed_writes key, possibly
+    # required_outputs. create_workspace must not raise allowed_writes_missing;
+    # base_card inherits allowed_writes from the workspace/union instead.
+    repo = _git_repo(
+        tmp_path / "repo",
+        {"src/pkg/mod.py": b"VALUE = 1\n", "tests/test_mod.py": b"def test_x():\n    pass\n"},
+    )
+    worker_base = _git(repo, "rev-parse", "HEAD")
+    _commit(repo, {"src/pkg/mod.py": b"VALUE = 2\n"}, "canonical")
+
+    union = SimpleNamespace(
+        repo=repo, base_oid=worker_base, allowed_writes=("tests/test_new.py",)
+    )
+    card = {
+        "task_id": "nf02101",
+        "validation": [],
+        "required_outputs": ["tests/test_new.py"],
+    }
+    with neighbours.base_commit_workspace(union, card) as base:
+        assert base.allowed_writes == ()
+
+    union_no_attr = SimpleNamespace(repo=repo, base_oid=worker_base)
+    with neighbours.base_commit_workspace(union_no_attr, card) as base:
+        assert base.allowed_writes == ()
+
+
 def test_base_commit_workspace_enters_for_a_card_adding_its_own_test(tmp_path: Path) -> None:
     # A card whose validation names a test it adds itself (absent on HEAD, listed in
     # allowed_writes) must still build the base; the base itself stays write-free.
