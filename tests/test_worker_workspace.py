@@ -686,6 +686,7 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "windows_build_env.py",
         # ...and the import-closure resolver, imported lazily by _resolve_local_python_imports.
         "python_import_closure.py",
+        "closure_probe_scope.py",
         # worker_workspace imports its required_outputs glob matcher (NF-2026-01834).
         "required_output_glob.py",
         # ...and its registered-toolchain resolver, which imports the read-root
@@ -1160,6 +1161,7 @@ def test_package_runtime_temp_loader_rejects_missing_private_support_without_top
         "_version.py",
         "host_heavy_slots.py",
         "linux_kernel_abi.py",
+        "closure_probe_scope.py",
         "platform_io.py",
         "runtime_temp.py",
         "worker_workspace.py",
