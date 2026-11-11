@@ -6,6 +6,13 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.97] - 2026-11-11
+
+### Changed
+
+- A manager-verified NeedFix resolves in one call from any open status (captured, triaged, accepted, task_planned or task_created) with its evidence inline, and the staleness sweep covers every open row, not only captured ones (NF-2026-01221).
+- Creating a card whose title or objective names an active NeedFix in prose is refused (`needfix_named_not_declared`) unless the card declares it on a whole `Resolves:` or `Refs:` line, so a fix can no longer close work the ledger never hears about.
+
 ## [0.12.96] - 2026-11-10
 
 ### Changed

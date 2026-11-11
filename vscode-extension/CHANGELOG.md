@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.12.97 — 2026-11-11
+
+### Fixed
+
+- Bundles runtime 0.12.97: a manager-verified NeedFix resolves in one call from any open status, the staleness sweep covers every open row, and a card that names an active NeedFix in prose must declare it with `Resolves:` or `Refs:`.
+
 ## 0.12.96 — 2026-11-10
 
 ### Fixed

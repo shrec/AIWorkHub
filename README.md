@@ -379,15 +379,10 @@ are durable and repository state remains local.
 
 The full block diagram and the Observe → Decide → Delegate → Verify → Promote → Learn loop: [The whole system](docs/ARCHITECTURE.md#the-whole-system).
 
-## What's new in 0.12.96
+## What's new in 0.12.97
 
-- Worker Live Output is a chat for Claude, Codex and OpenCode workers, built from the manager console's rows: assistant text, grouped tool calls, commands, file diffs and a usage footer. A valid provider event never shows as "Unparsed provider line".
-- The dashboard recovers by itself after an extension-host stall: late timers no longer reject answers already in the pipe, dead requests leave the write queue, and the storage scan runs off the host thread.
-- Manager Chat Stop reliably ends the turn and shows a Stopping state; paste works from anywhere in the chat.
-- An infrastructure reject replays the retained candidate with no model run, a rework reject can relaunch in the same call, and accept validates outside the promotion lock.
-- Every required reviewer lens launches or says why it did not, an expired credential fails over to another adapter, and a `vscode_lm` worker that is making progress is no longer killed in staging.
-- One read-only manager tool explains what happened to a request. Test impact records which tests run which lines and selects tests by the changed lines.
-- The release cut reruns failed nodes once before it stops and ends its whole process tree when stopped. Tracked files carry no host paths or logins, and a guard keeps them out.
+- Finished NeedFix records leave the active list: a manager-verified fix resolves in one call from any open status with its evidence inline, and the staleness sweep checks every open record, not only new ones.
+- A card that names an active NeedFix in its title or objective must declare it on a `Resolves:` or `Refs:` line, so work that fixes a record can no longer bypass the ledger.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Continuous Audit as a Service (CAAS)
