@@ -306,6 +306,151 @@ class ReviewerEvidenceError(ValueError):
     """Raised when reviewer evidence is not bound to its exact execution."""
 
 
+# NF-2026-02234: the dispositions of a reviewer card that already exists when a
+# launch tries to create it.  A requeued (pending, unclaimed) card is relaunched
+# under the new attempt; a card that already produced a review is never
+# duplicated; anything else stays a create failure.
+REVIEWER_CARD_TITLE_MAX_CHARS = 300
+EXISTING_REVIEWER_CARD_REUSE = "reuse_pending"
+EXISTING_REVIEWER_CARD_REVIEWED = "already_reviewed"
+EXISTING_REVIEWER_CARD_REFUSED = "refused"
+_REVIEWED_REVIEWER_SUBSTATUSES = frozenset({"review_ready"})
+
+
+def reviewer_card_title(*, lens: str, target_task_id: str) -> str:
+    """The one title that binds a reviewer card to its (target task, lens)."""
+
+    return f"Independent {lens} review for {target_task_id}"[
+        :REVIEWER_CARD_TITLE_MAX_CHARS
+    ]
+
+
+def existing_reviewer_card_disposition(
+    card: object,
+    *,
+    reviewer_task_id: str,
+    target_task_id: str,
+    lens: str,
+    runner: str,
+) -> dict[str, str]:
+    """Classify an already-existing reviewer card for one (target, lens).
+
+    Fails closed: a card whose identity does not match the exact reviewer
+    contract for this target and lens, or whose state is neither a requeued
+    pending card nor a finished review, is ``refused`` with a named reason.
+    """
+
+    if not isinstance(card, Mapping):
+        return {
+            "disposition": EXISTING_REVIEWER_CARD_REFUSED,
+            "reason": "existing_reviewer_card_unreadable",
+        }
+    mismatches: list[str] = []
+    if str(card.get("task_id") or "") != reviewer_task_id:
+        mismatches.append("task_id")
+    if card.get("topic") != "quality_review":
+        mismatches.append("topic")
+    if card.get("read_only") is not True:
+        mismatches.append("read_only")
+    allowed_writes = card.get("allowed_writes")
+    if not isinstance(allowed_writes, list) or allowed_writes:
+        mismatches.append("allowed_writes")
+    if card.get("runner") != runner:
+        mismatches.append("runner")
+    if card.get("title") != reviewer_card_title(
+        lens=lens, target_task_id=target_task_id
+    ):
+        mismatches.append("target_or_lens")
+    bound_target = card.get("review_target_task_id")
+    if bound_target not in (None, "") and str(bound_target) != target_task_id:
+        mismatches.append("review_target_task_id")
+    if mismatches:
+        return {
+            "disposition": EXISTING_REVIEWER_CARD_REFUSED,
+            "reason": "existing_reviewer_card_identity_mismatch:"
+            + ",".join(mismatches),
+        }
+    status = str(card.get("status") or "")
+    worker_status = str(card.get("worker_status") or "")
+    terminal_review = card.get("terminal_review")
+    substatus = str(
+        card.get("terminal_substatus")
+        or (
+            terminal_review.get("substatus")
+            if isinstance(terminal_review, Mapping)
+            else ""
+        )
+        or ""
+    )
+    if status == "pending" and worker_status == "unclaimed" and not card.get(
+        "claimed_by"
+    ):
+        return {"disposition": EXISTING_REVIEWER_CARD_REUSE, "reason": "pending"}
+    if status == "accepted":
+        return {"disposition": EXISTING_REVIEWER_CARD_REVIEWED, "reason": "accepted"}
+    if status == "review" and substatus in _REVIEWED_REVIEWER_SUBSTATUSES:
+        return {"disposition": EXISTING_REVIEWER_CARD_REVIEWED, "reason": substatus}
+    return {
+        "disposition": EXISTING_REVIEWER_CARD_REFUSED,
+        "reason": (
+            "existing_reviewer_card_not_reusable:"
+            f"{status or 'unknown'}/{worker_status or 'unknown'}"
+        )[:200],
+    }
+
+
+def existing_reviewer_card_failure(
+    created: Mapping[str, Any],
+    create_detail: str,
+    fail: Callable[[str], dict[str, Any]],
+    read_card: Callable[[str], object],
+    read_errors: tuple[type[BaseException], ...],
+    reviewer_task_id: str,
+    target_task_id: str,
+    *,
+    lens: str,
+    runner: str,
+) -> dict[str, Any] | None:
+    """The refusal for an unstructured reviewer-card create failure, or None to relaunch.
+
+    NF-2026-02234: only a ``task_already_exists`` reply for this exact reviewer
+    card consults the canonical card (``read_card``; ``read_errors`` read it as
+    unreadable).  A pending, unclaimed card bound to this target and lens is
+    relaunched under the new attempt (None); a finished review is named and
+    never duplicated; anything else keeps the create failure plus the named
+    disposition reason.  ``fail`` builds (and terminalizes) every refusal.
+    """
+
+    if str(created.get("stderr") or "").strip() != f"task_already_exists:{reviewer_task_id}":
+        return fail("quality_review_task_create_failed:" + create_detail[:500])
+    try:
+        card = read_card(reviewer_task_id)
+    except read_errors:
+        card = None
+    existing = existing_reviewer_card_disposition(
+        card,
+        reviewer_task_id=reviewer_task_id,
+        target_task_id=target_task_id,
+        lens=lens,
+        runner=runner,
+    )
+    disposition = existing["disposition"]
+    if disposition == EXISTING_REVIEWER_CARD_REUSE:
+        return None
+    if disposition == EXISTING_REVIEWER_CARD_REVIEWED:
+        return {
+            **fail("quality_review_card_already_reviewed:" + existing["reason"]),
+            "existing_task_id": reviewer_task_id,
+            "existing_status": existing["reason"],
+        }
+    return fail(
+        (
+            "quality_review_task_create_failed:"
+            + create_detail[:300] + ":" + existing["reason"]
+        )[:540]
+    )
+
+
 def _identity(value: object, field: str) -> str:
     normalized = str(value or "")
     if not _IDENTITY_RE.fullmatch(normalized):

@@ -8078,7 +8078,7 @@ class ProcessManager:
         )
         created = core.create_task(
             task_id=reviewer_task_id,
-            title=f"Independent {lens} review for {target_task_id}"[:300],
+            title=quality_reviewer.reviewer_card_title(lens=lens, target_task_id=target_task_id),
             runner=runner,
             topic="quality_review",
             objective=(
@@ -8121,10 +8121,13 @@ class ProcessManager:
                 )
             return _refusal.refusal(ident, reason)
 
-        if not create_ok and not create_structured:
-            failed = _fail("quality_review_task_create_failed:" + create_detail[:500])
-            core.release_review_wake(target_task_id, failed["error"])  # NF-2026-01095
-            return failed
+        if not create_ok and not create_structured:  # NF-2026-02234: relaunch a requeued card
+            failed = quality_reviewer.existing_reviewer_card_failure(
+                created, create_detail, _fail, lambda t: _parse_card(self._show_task(t), t),
+                (LaunchRejected,), reviewer_task_id, target_task_id, lens=lens, runner=runner)
+            if failed is not None:
+                core.release_review_wake(target_task_id, failed["error"])  # NF-2026-01095
+                return failed
 
         def _verify_durable(*, require_launch_request: bool) -> dict[str, Any] | None:
             try:
