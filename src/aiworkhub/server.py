@@ -8633,10 +8633,11 @@ def needfix_list(
     order_by: str = "created_at",
     order_dir: str = "DESC",
     full: bool = False,
+    query: str = "",
 ) -> list[dict]:
     """List repo-scoped NeedFix entries (bounded); rows are a compact projection.
 
-    Measured: 379 rows were 452 KB, about 1.2 KB each (NF-2026-01722, NF-2026-01726). By default each row keeps only id, title, status, severity, kind, converted_task_id and updated_at; ``full=true`` or needfix_show returns the full row.
+    Measured: 379 rows were 452 KB, about 1.2 KB each (NF-2026-01722, NF-2026-01726). By default each row keeps only id, title, status, severity, kind, converted_task_id and updated_at; ``full=true`` or needfix_show returns the full row, which on the derived listing also carries work_state and linked_card_id/linked_card_status.
 
     Args:
         status: Only rows with exactly this status, e.g. captured, accepted or archived. Any status, kind or severity filter returns raw rows; omit all three for the derived active listing.
@@ -8648,6 +8649,7 @@ def needfix_list(
         order_by: Sort column, created_at (default) or updated_at; any other value falls back to created_at.
         order_dir: Sort direction, DESC (default, newest first) or ASC; any other value falls back to DESC.
         full: Return the raw stored rows instead of the compact projection; default false.
+        query: Case-insensitive substring of the id or title, applied before limit/offset; empty (default) lists everything.
     """
     listing = core.needfix_list(
         status=status,
@@ -8658,6 +8660,7 @@ def needfix_list(
         offset=offset,
         order_by=order_by,
         order_dir=order_dir,
+        query=query,
     )
     if full:
         return listing
@@ -9023,18 +9026,27 @@ def needfix_purge(needfix_id: str, audit_reason: str) -> dict:
 
 
 @mcp.tool()
-def needfix_count(status: str | None = None, kind: str | None = None, severity: str | None = None) -> int:
+def needfix_count(
+    status: str | None = None,
+    kind: str | None = None,
+    severity: str | None = None,
+    breakdown: bool = False,
+) -> int | dict:
     """Bounded count of NeedFix entries.
 
     Use this for a single number; use needfix_list for the matching rows
-    themselves.
+    themselves. With breakdown=true the reply is {count, by_work_state,
+    by_status, derived, underived_reason}: count is the same number, and the
+    two maps split the same candidate rows by work state (untriaged,
+    decided_no_card, in_work, stalled, reopened, deferred, closed) and by status.
 
     Args:
         status: Count only rows with this exact status, e.g. captured or accepted; archived rows are counted only when asked for here. Omit all three filters for the derived active count.
         kind: Count only rows of this exact kind, e.g. bug or improvement; any filter returns the raw row count instead of the derived active count.
         severity: Count only rows of this exact severity: critical, high, medium, low or info; any filter returns the raw row count.
+        breakdown: Return {count, by_work_state, by_status} instead of the bare number; default false.
     """
-    return core.needfix_count(status=status, kind=kind, severity=severity)
+    return core.needfix_count(status=status, kind=kind, severity=severity, breakdown=breakdown)
 
 
 @mcp.tool()
@@ -9338,6 +9350,7 @@ def roadmap_list(
     limit: int = 100,
     offset: int = 0,
     full: bool = False,
+    query: str = "",
 ) -> list[dict]:
     """List bounded repository Roadmap outcomes; outcome and acceptance bodies fold to their identity.
 
@@ -9349,12 +9362,14 @@ def roadmap_list(
         limit: Maximum outcomes to return; default 100, clamped to 1-500.
         offset: Number of outcomes to skip, for paging; default 0.
         full: Return every outcome and acceptance body verbatim instead of folding each to its identity; default false.
+        query: Case-insensitive substring of the id or title, applied before limit/offset; empty (default) lists everything.
     """
     rows = core.roadmap_list(
         status=status,
         include_archived=include_archived,
         limit=limit,
         offset=offset,
+        query=query,
     )
     if full:
         return rows

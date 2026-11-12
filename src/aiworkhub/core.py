@@ -12826,6 +12826,7 @@ def needfix_list(
     offset: int = 0,
     order_by: str = "created_at",
     order_dir: str = "DESC",
+    query: str = "",
 ) -> "NeedfixListing":
     """Operator-facing NeedFix listing, derived at read time by default.
 
@@ -12841,35 +12842,18 @@ def needfix_list(
     An explicit ``status``/``kind``/``severity`` filter is a raw field browse
     (a terminal status is never in the derived active set), so it returns the
     raw filtered rows marked ``derived=False`` -- not silently, the reason says
-    so -- rather than an empty derived page.
+    so -- rather than an empty derived page. A non-blank ``query`` (id/title
+    substring, before paging) routes through ``needfix_store.operator_list_active``.
     """
+    window = dict(include_archived=include_archived, limit=limit, offset=offset, order_by=order_by, order_dir=order_dir)
     if status is not None or kind is not None or severity is not None:
         ns = _needfix_store_module()
-        rows = ns.list_needfix(
-            repo_root(),
-            status=status,
-            kind=kind,
-            severity=severity,
-            include_archived=include_archived,
-            limit=limit,
-            offset=offset,
-            order_by=order_by,
-            order_dir=order_dir,
-        )
-        return NeedfixListing(
-            rows,
-            derived=False,
-            underived_reason="explicit_status_kind_severity_filter_returns_raw_rows",
-        )
-    ni = _needfix_ingest_module()
-    report = ni.list_active(
-        repo_root(),
-        include_archived=include_archived,
-        limit=limit,
-        offset=offset,
-        order_by=order_by,
-        order_dir=order_dir,
-    )
+        rows = ns.list_needfix(repo_root(), status=status, kind=kind, severity=severity, query=query, **window)
+        return NeedfixListing(rows, derived=False, underived_reason=ns.RAW_FILTER_UNDERIVED_REASON)
+    if query.strip():
+        report = _needfix_store_module().operator_list_active(repo_root(), query=query, **window)
+    else:
+        report = _needfix_ingest_module().list_active(repo_root(), **window)
     return NeedfixListing(
         report["items"],
         derived=report.get("derived", False),
@@ -13084,7 +13068,7 @@ def needfix_purge(needfix_id: str, audit_reason: str) -> dict[str, Any]:
     return ns.purge_needfix(repo_root(), needfix_id, audit_reason=audit_reason)
 
 
-def needfix_count(status: str | None = None, kind: str | None = None, severity: str | None = None) -> "NeedfixCount":
+def needfix_count(status: str | None = None, kind: str | None = None, severity: str | None = None, breakdown: bool = False) -> "NeedfixCount | dict[str, Any]":
     """Operator-facing NeedFix count, derived at read time by default.
 
     Uses ``needfix_ingest.count_active`` -- the same resolved hooks and default
@@ -13093,16 +13077,15 @@ def needfix_count(status: str | None = None, kind: str | None = None, severity: 
     filter is a raw field browse and returns the raw count marked
     ``derived=False``. When no ready task store can resolve the linked-card
     state the count is the raw total, marked underived (with a reason) so it is
-    never mistaken for an authoritative active count.
+    never mistaken for an authoritative active count. ``breakdown=True`` returns
+    ``needfix_store.operator_count_breakdown``: ``{count, by_work_state, by_status}``.
     """
+    if breakdown:
+        return _needfix_store_module().operator_count_breakdown(repo_root(), status=status, kind=kind, severity=severity)
     if status is not None or kind is not None or severity is not None:
         ns = _needfix_store_module()
         raw = ns.count_needfix(repo_root(), status=status, kind=kind, severity=severity)
-        return NeedfixCount(
-            raw,
-            derived=False,
-            underived_reason="explicit_status_kind_severity_filter_returns_raw_rows",
-        )
+        return NeedfixCount(raw, derived=False, underived_reason=ns.RAW_FILTER_UNDERIVED_REASON)
     ni = _needfix_ingest_module()
     report = ni.count_active(repo_root())
     if report.get("count") is None:
@@ -13514,14 +13497,11 @@ def roadmap_list(
     include_archived: bool = False,
     limit: int = 100,
     offset: int = 0,
+    query: str = "",
 ) -> list[dict[str, Any]]:
-    return _roadmap_store_module().list_items(
-        repo_root(),
-        status=status,
-        include_archived=include_archived,
-        limit=limit,
-        offset=offset,
-    )
+    def page(page_limit: int, page_offset: int) -> list[dict[str, Any]]:
+        return _roadmap_store_module().list_items(repo_root(), status=status, include_archived=include_archived, limit=page_limit, offset=page_offset)
+    return _needfix_store_module().query_paged(page, query=query, limit=limit, offset=offset)
 
 
 def roadmap_show(roadmap_id: str) -> dict[str, Any]:

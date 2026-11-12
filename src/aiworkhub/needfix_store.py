@@ -308,6 +308,58 @@ ACTIVE_STATE_DEFINITION = (
     "stays ACTIVE."
 )
 
+# --- Work-state projection (read-time, never persisted) ----------------------
+# A finer operator reading of the SAME derivation: each row's derived state
+# (above) plus, for a derived-active row, its own status projects onto exactly
+# one work state, so the single active count splits into undecided,
+# decided-but-unstarted, stuck and reopened work, and what is in work or
+# finished becomes visible at all. ``derive_work_state`` implements it.
+WORK_STATES: tuple[str, ...] = (
+    "untriaged", "decided_no_card", "in_work", "stalled", "reopened", "deferred",
+    "closed",
+)
+
+# The work states a derived-ACTIVE row projects onto. Every other work state is
+# off the active list, so over any candidate set these sum to the active count.
+ACTIVE_WORK_STATES: frozenset[str] = frozenset(
+    ("untriaged", "decided_no_card", "stalled", "reopened", "deferred")
+)
+
+# Derived states whose work state does not depend on the row's own status.
+# ``active`` is split by own status in ``derive_work_state``. ``unknown`` and
+# ``foreign_card_unverified`` are off the active list by derivation, so they
+# project off it too (``closed``) and are never counted as live work.
+_WORK_STATE_BY_DERIVED_STATE: dict[str, str] = {
+    "owned": "in_work",
+    "stalled": "stalled",
+    "reopened": "reopened",
+    "closed": "closed",
+    "unknown": "closed",
+    "foreign_card_unverified": "closed",
+}
+
+WORK_STATE_DEFINITION = (
+    "work_state projects the derived ACTIVE state onto exactly one of "
+    f"{', '.join(WORK_STATES)}. A derived-active row is deferred when its own "
+    "status is deferred, untriaged when its own status is captured, and "
+    "decided_no_card otherwise (triaged, accepted, task_planned, task_created "
+    "or converting with no live card carrying the fix: unlinked, a linked card "
+    "that no longer exists, or a card status nobody recognises). owned -> "
+    f"in_work (card status {_fmt_statuses(OWNED_CARD_STATUSES)}); stalled -> "
+    f"stalled (card status {_fmt_statuses(STALLED_CARD_STATUSES)}); reopened -> "
+    "reopened; closed (own status terminal or fixed by a card) -> closed, and "
+    "the off-list unknown and foreign_card_unverified states also project to "
+    "closed so they are never counted as live work. The active work states "
+    f"({_fmt_statuses(ACTIVE_WORK_STATES)}) always sum to the active count."
+)
+
+# Longest id/title ``query`` a listing accepts; longer input is refused.
+MAX_QUERY_CHARS = 200
+
+# The underived reason every explicit status/kind/severity filter reports: such
+# a filter is a raw field browse, never the derived active set.
+RAW_FILTER_UNDERIVED_REASON = "explicit_status_kind_severity_filter_returns_raw_rows"
+
 
 class NeedFixError(Exception):
     """Base error for NeedFix registry operations."""
@@ -393,6 +445,30 @@ def _db_path(repo_root: str | Path) -> Path:
     return root.joinpath(*NEEDFIX_DB_REL)
 
 
+def _icontains(haystack: Any, needle: Any) -> int:
+    """1 when ``needle`` (already casefolded) occurs in ``haystack``, casefolded.
+
+    The single id/title match rule: registered as the SQL function
+    ``nf_icontains`` for ``_needfix_filter`` and called directly by
+    ``_record_matches``, so the SQL and in-memory filters cannot disagree.
+    """
+    return int(str(needle or "") in str(haystack or "").casefold())
+
+
+def _normalized_query(query: str | None) -> str:
+    """The casefolded, stripped id/title query; refused over ``MAX_QUERY_CHARS``."""
+    text = str(query or "").strip()
+    if len(text) > MAX_QUERY_CHARS:
+        raise NeedFixValidationError(
+            f"query is {len(text)} characters; the limit is {MAX_QUERY_CHARS}"
+        )
+    return text.casefold()
+
+
+def _record_matches(record: Mapping[str, Any], needle: str) -> bool:
+    return any(_icontains(record.get(key), needle) for key in ("id", "title"))
+
+
 def _connect(repo_root: str | Path) -> sqlite3.Connection:
     path = _db_path(repo_root)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -400,6 +476,7 @@ def _connect(repo_root: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
+    conn.create_function("nf_icontains", 2, _icontains, deterministic=True)
     return conn
 
 
@@ -1010,24 +1087,18 @@ def _successor_landed(
     return status != "archived" or _card_accepted(successor)
 
 
-def derive_active_state(
+def _derive_active_state_and_card(
     needfix_row: Mapping[str, Any],
     get_task_fn: Callable[[str], Mapping[str, Any] | None],
     canonical_status_fn: Callable[[Mapping[str, Any]], str],
+    card_out: dict[str, Any],
 ) -> dict[str, Any]:
-    """Derive a NeedFix's ACTIVE state at read time from its linked task card.
+    """:func:`derive_active_state`, also filling ``card_out`` with the live card.
 
-    Returns ``{"state": str, "active": bool, "reason": str | None}`` where
-    ``state`` is one of ``active``, ``owned``, ``stalled``, ``closed``,
-    ``reopened``, ``unknown`` or ``foreign_card_unverified``. See
-    ``ACTIVE_STATE_DEFINITION``
-    for the exact rule.
-
-    The derivation has two layers, and the NeedFix's OWN status is the OUTER
-    one: a record that is itself terminal (rejected/duplicate/resolved/
-    archived) is never active, whatever any linked card says, and the card
-    lookup does not run for it. Only for a record that is not itself terminal do
-    the linked card's status buckets decide.
+    ``card_out`` receives ``id`` and canonical ``status`` (None when the status
+    read failed) only when the linked card was looked up and exists, so callers
+    expose the card without a second lookup. The returned derivation is
+    exactly ``derive_active_state``'s.
     """
     needfix_status = str(needfix_row.get("status") or "").strip()
 
@@ -1079,6 +1150,8 @@ def derive_active_state(
         card_status = canonical_status_fn(task)
     except Exception:
         card_status = ""
+    card_out["id"] = converted_task_id
+    card_out["status"] = card_status or None
 
     if card_status in STALLED_CARD_STATUSES:
         return {
@@ -1149,11 +1222,81 @@ def derive_active_state(
     }
 
 
+def derive_active_state(
+    needfix_row: Mapping[str, Any],
+    get_task_fn: Callable[[str], Mapping[str, Any] | None],
+    canonical_status_fn: Callable[[Mapping[str, Any]], str],
+) -> dict[str, Any]:
+    """Derive a NeedFix's ACTIVE state at read time from its linked task card.
+
+    Returns ``{"state": str, "active": bool, "reason": str | None}`` where
+    ``state`` is one of ``active``, ``owned``, ``stalled``, ``closed``,
+    ``reopened``, ``unknown`` or ``foreign_card_unverified``. See
+    ``ACTIVE_STATE_DEFINITION``
+    for the exact rule.
+
+    The derivation has two layers, and the NeedFix's OWN status is the OUTER
+    one: a record that is itself terminal (rejected/duplicate/resolved/
+    archived) is never active, whatever any linked card says, and the card
+    lookup does not run for it. Only for a record that is not itself terminal do
+    the linked card's status buckets decide.
+    """
+    return _derive_active_state_and_card(needfix_row, get_task_fn, canonical_status_fn, {})
+
+
+def derive_work_state(needfix_row: Mapping[str, Any], derived: Mapping[str, Any]) -> str:
+    """Project one row's derived ACTIVE state onto exactly one work state.
+
+    Pure: reads only ``derived["state"]`` (a :func:`derive_active_state`
+    result) and, for a derived-active row, the row's own ``status``; it never
+    looks a card up. ``WORK_STATE_DEFINITION`` states the rule. A derived
+    state it does not know raises ``NeedFixValidationError`` rather than
+    being guessed into a work state.
+    """
+    state = str(derived.get("state") or "")
+    if state == "active":
+        own_status = str(needfix_row.get("status") or "").strip()
+        if own_status == "deferred":
+            return "deferred"
+        return "untriaged" if own_status == "captured" else "decided_no_card"
+    work_state = _WORK_STATE_BY_DERIVED_STATE.get(state)
+    if work_state is None:
+        raise NeedFixValidationError(
+            f"derived state {state!r} has no work state; known: {list(ACTIVE_STATES)!r}"
+        )
+    return work_state
+
+
 def _apply_derived(record: dict[str, Any], derived: Mapping[str, Any]) -> dict[str, Any]:
     record["derived_state"] = derived["state"]
     record["active"] = derived["active"]
     record["active_reason"] = derived["reason"]
+    if "work_state" in derived:
+        record["work_state"] = derived["work_state"]
+        record["linked_card_id"] = derived["linked_card_id"]
+        record["linked_card_status"] = derived["linked_card_status"]
     return record
+
+
+def _derive_projection(
+    record: Mapping[str, Any],
+    get_task_fn: Callable[[str], Mapping[str, Any] | None],
+    canonical_status_fn: Callable[[Mapping[str, Any]], str],
+) -> dict[str, Any]:
+    """``derive_active_state`` plus its work state and live linked card.
+
+    All from the ONE derivation: the card id/status are the ones that
+    derivation already looked up, so this adds no lookup. ``linked_card_*``
+    is None when no card was looked up (terminal own status, unlinked) or the
+    linked card no longer exists.
+    """
+    card: dict[str, Any] = {}
+    derived = _derive_active_state_and_card(record, get_task_fn, canonical_status_fn, card)
+    derived["work_state"] = derive_work_state(record, derived)
+    derived["linked_card_id"] = card.get("id")
+    derived["linked_card_status"] = card.get("status")
+    derived["needfix_status"] = record.get("status")
+    return derived
 
 
 def _decorate_derived(
@@ -1162,7 +1305,7 @@ def _decorate_derived(
     canonical_status_fn: Callable[[Mapping[str, Any]], str],
 ) -> dict[str, Any]:
     return _apply_derived(
-        record, derive_active_state(record, get_task_fn, canonical_status_fn)
+        record, _derive_projection(record, get_task_fn, canonical_status_fn)
     )
 
 
@@ -1203,25 +1346,32 @@ def _active_derivations(
     *,
     order_sql: str = "",
     stop_after: int | None = None,
+    active_only: bool = True,
+    work_state: str | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
-    """``(id, derivation)`` of each ACTIVE row, in ``order_sql`` order.
+    """``(id, projection)`` of each kept row, in ``order_sql`` order.
 
-    One pass over the narrow derivation columns; ``stop_after`` ends the scan
-    once that many ACTIVE rows are found.
+    One pass over the narrow derivation columns. A row is kept when it is
+    ACTIVE (any row with ``active_only=False``) and, given ``work_state``,
+    projects onto exactly that work state; ``stop_after`` ends the scan once
+    that many rows are kept. The projection is ``_derive_projection``'s.
     """
-    active: list[tuple[str, dict[str, Any]]] = []
+    kept: list[tuple[str, dict[str, Any]]] = []
     cursor = conn.execute(
         f"SELECT {_ACTIVE_DERIVATION_COLUMNS_SQL} FROM needfix {where}{order_sql}",
         params,
     )
     for row in cursor:
-        if stop_after is not None and len(active) >= stop_after:
+        if stop_after is not None and len(kept) >= stop_after:
             break
         record = _active_derivation_record(row)
-        derived = derive_active_state(record, get_task_fn, canonical_status_fn)
-        if derived["active"]:
-            active.append((record["id"], derived))
-    return active
+        derived = _derive_projection(record, get_task_fn, canonical_status_fn)
+        if active_only and not derived["active"]:
+            continue
+        if work_state is not None and derived["work_state"] != work_state:
+            continue
+        kept.append((record["id"], derived))
+    return kept
 
 
 def _decorated_page(
@@ -1946,8 +2096,13 @@ def _needfix_filter(
     kind: str | None = None,
     severity: str | None = None,
     include_archived: bool = False,
+    query: str = "",
 ) -> tuple[str, list[Any]]:
-    """The WHERE clause list/count share; ``include_archived`` only without ``status``."""
+    """The WHERE clause list/count share; ``include_archived`` only without ``status``.
+
+    A non-empty ``query`` adds the case-insensitive id/title substring match
+    (``_icontains``), so it narrows the candidate rows before any paging.
+    """
     clauses: list[str] = []
     params: list[Any] = []
     if status is not None:
@@ -1961,7 +2116,43 @@ def _needfix_filter(
     if severity is not None:
         clauses.append("severity = ?")
         params.append(severity)
+    needle = _normalized_query(query)
+    if needle:
+        clauses.append("(nf_icontains(id, ?) OR nf_icontains(title, ?))")
+        params.extend((needle, needle))
     return (f"WHERE {' AND '.join(clauses)}" if clauses else ""), params
+
+
+def _check_work_state(work_state: str) -> None:
+    if work_state not in WORK_STATES:
+        raise NeedFixValidationError(
+            f"invalid work_state {work_state!r}; allowed: {list(WORK_STATES)!r}"
+        )
+
+
+def _check_derive_args(
+    get_task_fn: Callable[[str], Mapping[str, Any] | None] | None,
+    canonical_status_fn: Callable[[Mapping[str, Any]], str] | None,
+    active_only: bool,
+    work_state: str | None,
+) -> bool:
+    """Validate the derivation arguments list/count share; True when deriving."""
+    if (get_task_fn is None) != (canonical_status_fn is None):
+        raise NeedFixValidationError(
+            "get_task_fn and canonical_status_fn must be supplied together"
+        )
+    derive = get_task_fn is not None
+    if active_only and not derive:
+        raise NeedFixValidationError(
+            "active_only requires both get_task_fn and canonical_status_fn"
+        )
+    if work_state is not None:
+        _check_work_state(work_state)
+        if not derive:
+            raise NeedFixValidationError(
+                "work_state requires both get_task_fn and canonical_status_fn"
+            )
+    return derive
 
 
 def list_needfix(
@@ -1978,46 +2169,48 @@ def list_needfix(
     get_task_fn: Callable[[str], Mapping[str, Any] | None] | None = None,
     canonical_status_fn: Callable[[Mapping[str, Any]], str] | None = None,
     active_only: bool = False,
+    work_state: str | None = None,
+    query: str = "",
 ) -> list[dict[str, Any]]:
     """Bounded list with filters and pagination.
 
-    Filters: status, kind, severity, include_archived.
+    Filters: status, kind, severity, include_archived, query (case-insensitive
+    id/title substring; empty means no filter).
     Pagination: limit (1-500), offset (>= 0).
     Ordering: created_at or updated_at, ASC or DESC.
 
     Derived ACTIVE state (read-time, never persisted): when both
     ``get_task_fn`` and ``canonical_status_fn`` are supplied every record is
-    annotated with ``derived_state``, ``active`` and ``active_reason``
-    computed from the linked task card's current canonical status. With
-    ``active_only=True`` only ACTIVE records are returned. The active
-    definition is ``ACTIVE_STATE_DEFINITION``.
+    annotated with ``derived_state``, ``active``, ``active_reason``,
+    ``work_state`` and its live linked card (``linked_card_id``,
+    ``linked_card_status``) computed from the linked task card's current
+    canonical status. With ``active_only=True`` only ACTIVE records are
+    returned; with ``work_state`` only records projecting onto that work
+    state. Both filters apply before ``limit``/``offset``. The definitions
+    are ``ACTIVE_STATE_DEFINITION`` and ``WORK_STATE_DEFINITION``.
     """
     bounded_limit, order_by, order_dir = _list_window(limit, order_by, order_dir)
-    derive = get_task_fn is not None and canonical_status_fn is not None
-    if (get_task_fn is None) != (canonical_status_fn is None):
-        raise NeedFixValidationError(
-            "get_task_fn and canonical_status_fn must be supplied together"
-        )
-    if active_only and not derive:
-        raise NeedFixValidationError(
-            "active_only requires both get_task_fn and canonical_status_fn"
-        )
+    derive = _check_derive_args(get_task_fn, canonical_status_fn, active_only, work_state)
     conn = _connect(repo_root)
     try:
         where, params = _needfix_filter(
-            status=status, kind=kind, severity=severity, include_archived=include_archived
+            status=status,
+            kind=kind,
+            severity=severity,
+            include_archived=include_archived,
+            query=query,
         )
         if derive:
-            if active_only:
-                # Active-only cannot be filtered in SQL (active is derived), so
-                # stream the narrow derivation columns, stopping as soon as the
-                # page is full. This bounds the work to finding ``offset +
-                # limit`` active records, and full rows are read only for the
+            if active_only or work_state is not None:
+                # Neither filter can run in SQL (both are derived), so stream
+                # the narrow derivation columns, stopping as soon as the page
+                # is full. This bounds the work to finding ``offset + limit``
+                # matching records, and full rows are read only for the
                 # returned page (NF-2026-02112).
                 start = max(0, int(offset))
                 needed = start + bounded_limit
                 with _read_snapshot(conn):
-                    active = _active_derivations(
+                    kept = _active_derivations(
                         conn,
                         where,
                         params,
@@ -2025,8 +2218,10 @@ def list_needfix(
                         canonical_status_fn,
                         order_sql=f" ORDER BY {order_by} {order_dir}",
                         stop_after=needed,
+                        active_only=active_only,
+                        work_state=work_state,
                     )
-                    return _decorated_page(conn, active[start:needed])
+                    return _decorated_page(conn, kept[start:needed])
             # Pure annotation: paginate in SQL first, then decorate only the
             # requested page, so the page size bounds the lookups too.
             rows = conn.execute(
@@ -3262,6 +3457,8 @@ def count_needfix(
     get_task_fn: Callable[[str], Mapping[str, Any] | None] | None = None,
     canonical_status_fn: Callable[[Mapping[str, Any]], str] | None = None,
     active_only: bool = False,
+    work_state: str | None = None,
+    query: str = "",
 ) -> int:
     """Count records; agrees with ``list_needfix`` on the ACTIVE definition.
 
@@ -3272,27 +3469,32 @@ def count_needfix(
     mirrors ``list_needfix``'s own filter exactly (honoured only when no
     explicit ``status`` is given), so the count and the list scan the same
     candidate set under every filter the listing honours. See
-    ``ACTIVE_STATE_DEFINITION``.
+    ``ACTIVE_STATE_DEFINITION``. ``work_state`` and ``query`` narrow the set
+    exactly as they narrow ``list_needfix``.
     """
-    derive = get_task_fn is not None and canonical_status_fn is not None
-    if (get_task_fn is None) != (canonical_status_fn is None):
-        raise NeedFixValidationError(
-            "get_task_fn and canonical_status_fn must be supplied together"
-        )
-    if active_only and not derive:
-        raise NeedFixValidationError(
-            "active_only requires both get_task_fn and canonical_status_fn"
-        )
+    derive = _check_derive_args(get_task_fn, canonical_status_fn, active_only, work_state)
     conn = _connect(repo_root)
     try:
         where, params = _needfix_filter(
-            status=status, kind=kind, severity=severity, include_archived=include_archived
+            status=status,
+            kind=kind,
+            severity=severity,
+            include_archived=include_archived,
+            query=query,
         )
-        if derive and active_only:
+        if derive and (active_only or work_state is not None):
             # Narrow derivation columns only (NF-2026-02112): the count never
             # needs a description/evidence body.
             return len(
-                _active_derivations(conn, where, params, get_task_fn, canonical_status_fn)
+                _active_derivations(
+                    conn,
+                    where,
+                    params,
+                    get_task_fn,
+                    canonical_status_fn,
+                    active_only=active_only,
+                    work_state=work_state,
+                )
             )
         row = conn.execute(f"SELECT COUNT(*) AS n FROM needfix {where}", params).fetchone()
         return int(row["n"])
@@ -3324,6 +3526,8 @@ def list_active_needfix(
     offset: int = 0,
     order_by: str = "created_at",
     order_dir: str = "DESC",
+    work_state: str | None = None,
+    query: str = "",
 ) -> dict[str, Any]:
     """Read-time ACTIVE view derived from each linked card's current status.
 
@@ -3340,10 +3544,17 @@ def list_active_needfix(
     read holds is bounded by the page, not by every row's bodies. The pass
     honours exactly the filter ``list_needfix``/``count_needfix`` apply,
     ``include_archived`` included, inside one read snapshot.
+
+    Every item carries ``work_state`` and its live linked card
+    (``linked_card_id``/``linked_card_status``). ``work_state`` and ``query``
+    (case-insensitive id/title substring) narrow the set BEFORE paging, so
+    ``count`` is the full filtered total; both default to no filter.
     """
     bounded_limit, order_by, order_dir = _list_window(limit, order_by, order_dir)
+    if work_state is not None:
+        _check_work_state(work_state)
     start = max(0, int(offset))
-    where, params = _needfix_filter(include_archived=include_archived)
+    where, params = _needfix_filter(include_archived=include_archived, query=query)
     conn = _connect(repo_root)
     try:
         with _read_snapshot(conn):
@@ -3354,6 +3565,7 @@ def list_active_needfix(
                 get_task_fn,
                 canonical_status_fn,
                 order_sql=f" ORDER BY {order_by} {order_dir}",
+                work_state=work_state,
             )
             items = _decorated_page(conn, active[start:start + bounded_limit])
             raw_total = _count_rows(conn, "", ())
@@ -3400,6 +3612,210 @@ def count_active_needfix(
         "after": active_count,
         "count": active_count,
     }
+
+
+def work_state_breakdown(
+    repo_root: str | Path,
+    *,
+    get_task_fn: Callable[[str], Mapping[str, Any] | None],
+    canonical_status_fn: Callable[[Mapping[str, Any]], str],
+    status: str | None = None,
+    kind: str | None = None,
+    severity: str | None = None,
+    include_archived: bool = False,
+) -> dict[str, Any]:
+    """Break one candidate set down by work state and own status in ONE pass.
+
+    The candidate rows are exactly those ``count_needfix`` scans under the same
+    filters. ``by_work_state`` (every work state, zeros included) and
+    ``by_status`` each partition them, so both sum to ``total``;
+    ``active_count`` is the ACTIVE rows among them and always equals the sum
+    of ``by_work_state`` over ``ACTIVE_WORK_STATES``. It is the same narrow
+    derivation pass the active count runs: no per-row query and no card lookup
+    beyond the one ``derive_active_state`` already makes.
+    """
+    where, params = _needfix_filter(
+        status=status, kind=kind, severity=severity, include_archived=include_archived
+    )
+    conn = _connect(repo_root)
+    try:
+        rows = _active_derivations(
+            conn, where, params, get_task_fn, canonical_status_fn, active_only=False
+        )
+    finally:
+        conn.close()
+    by_work_state = dict.fromkeys(WORK_STATES, 0)
+    by_status: dict[str, int] = {}
+    for _needfix_id, derived in rows:
+        by_work_state[derived["work_state"]] += 1
+        own_status = str(derived["needfix_status"] or "")
+        by_status[own_status] = by_status.get(own_status, 0) + 1
+    return {
+        "active_count": sum(by_work_state[state] for state in ACTIVE_WORK_STATES),
+        "total": len(rows),
+        "by_work_state": by_work_state,
+        "by_status": dict(sorted(by_status.items())),
+        "work_state_definition": WORK_STATE_DEFINITION,
+    }
+
+
+def _status_counts(repo_root: str | Path, where: str, params: Sequence[Any]) -> dict[str, int]:
+    conn = _connect(repo_root)
+    try:
+        rows = conn.execute(
+            f"SELECT status, COUNT(*) AS n FROM needfix {where} GROUP BY status ORDER BY status",
+            params,
+        ).fetchall()
+    finally:
+        conn.close()
+    return {str(row["status"] or ""): int(row["n"]) for row in rows}
+
+
+def _operator_hooks(
+    repo: Path, include_archived: bool
+) -> tuple[dict[str, Any] | None, str | None]:
+    """The canonical task-store hooks the operator doors derive with.
+
+    Resolved, and the read-time reconciliation run, by the very function
+    ``needfix_ingest.list_active``/``count_active`` use, so a query-filtered
+    list or a breakdown sees the same candidate set as the plain list/count.
+    Imported lazily: ``needfix_ingest`` imports this module.
+    """
+    from . import needfix_ingest
+
+    return needfix_ingest._derive_active_surface(repo, include_archived=include_archived)
+
+
+def operator_list_active(
+    repo_root: str | Path,
+    *,
+    query: str,
+    include_archived: bool = False,
+    limit: int = DEFAULT_LIST_LIMIT,
+    offset: int = 0,
+    order_by: str = "created_at",
+    order_dir: str = "DESC",
+) -> dict[str, Any]:
+    """``needfix_list(query=...)``'s derived door: the active listing narrowed by ``query``.
+
+    Same hooks, reconciliation and report keys as ``needfix_ingest.list_active``;
+    ``query`` (case-insensitive id/title substring) applies BEFORE paging, so
+    ``count`` is the full filtered active total. With no ready task store the
+    report is ``derived=False`` with the raw query-filtered rows, never passed
+    off as an authoritative active set.
+    """
+    repo = Path(repo_root).resolve()
+    hooks, underived_reason = _operator_hooks(repo, include_archived)
+    window = {
+        "include_archived": include_archived,
+        "limit": limit,
+        "offset": offset,
+        "order_by": order_by,
+        "order_dir": order_dir,
+        "query": query,
+    }
+    if hooks is None:
+        return {
+            "derived": False,
+            "underived_reason": underived_reason,
+            "definition": ACTIVE_STATE_DEFINITION,
+            "count": None,
+            "items": list_needfix(repo, **window),
+            "terminal_artifacts_excluded": [],
+            "terminal_artifacts_excluded_count": 0,
+        }
+    report = list_active_needfix(
+        repo,
+        get_task_fn=hooks["get_task_fn"],
+        canonical_status_fn=hooks["canonical_status_fn"],
+        **window,
+    )
+    report["derived"] = True
+    report["underived_reason"] = None
+    report["terminal_artifacts_excluded"] = hooks["excluded"]
+    report["terminal_artifacts_excluded_count"] = len(hooks["excluded_ids"])
+    return report
+
+
+def operator_count_breakdown(
+    repo_root: str | Path,
+    *,
+    status: str | None = None,
+    kind: str | None = None,
+    severity: str | None = None,
+) -> dict[str, Any]:
+    """``needfix_count(breakdown=true)``: ``{count, by_work_state, by_status}``.
+
+    ``count`` is the number plain ``needfix_count`` returns for the same
+    arguments: the derived active count without filters, the raw row count
+    with an explicit status/kind/severity filter. ``by_work_state`` and
+    ``by_status`` partition that same candidate set (every non-archived row,
+    or the filtered rows); without filters the ``ACTIVE_WORK_STATES`` entries
+    sum to ``count``. With no ready task store ``by_work_state`` is None and
+    ``underived_reason`` names why.
+    """
+    repo = Path(repo_root).resolve()
+    explicit = status is not None or kind is not None or severity is not None
+    hooks, underived_reason = _operator_hooks(repo, False)
+    if hooks is None:
+        by_status = _status_counts(
+            repo, *_needfix_filter(status=status, kind=kind, severity=severity)
+        )
+        return {
+            "count": sum(by_status.values()),
+            "by_work_state": None,
+            "by_status": by_status,
+            "derived": False,
+            "underived_reason": RAW_FILTER_UNDERIVED_REASON if explicit else underived_reason,
+        }
+    report = work_state_breakdown(
+        repo,
+        get_task_fn=hooks["get_task_fn"],
+        canonical_status_fn=hooks["canonical_status_fn"],
+        status=status,
+        kind=kind,
+        severity=severity,
+    )
+    return {
+        "count": report["total"] if explicit else report["active_count"],
+        "by_work_state": report["by_work_state"],
+        "by_status": report["by_status"],
+        "derived": not explicit,
+        "underived_reason": RAW_FILTER_UNDERIVED_REASON if explicit else None,
+    }
+
+
+def query_paged(
+    fetch_page: Callable[[int, int], Sequence[Mapping[str, Any]]],
+    *,
+    query: str,
+    limit: int,
+    offset: int,
+    max_limit: int = MAX_LIST_LIMIT,
+) -> Any:
+    """Apply the id/title ``query`` BEFORE ``limit``/``offset`` over a SQL-paging store.
+
+    ``fetch_page(limit, offset)`` is the store's own bounded page read. With an
+    empty query this returns exactly ``fetch_page(limit, offset)``. Otherwise it
+    walks the store in ``max_limit`` pages from offset 0, keeps the rows
+    matching ``query`` (the same case-insensitive substring rule as
+    ``list_needfix``), and stops once ``offset + limit`` matches are found or
+    the store is exhausted, so paging is over the filtered set.
+    """
+    needle = _normalized_query(query)
+    if not needle:
+        return fetch_page(limit, offset)
+    bounded_limit = max(1, min(int(limit), max_limit))
+    start = max(0, int(offset))
+    matched: list[Mapping[str, Any]] = []
+    scanned = 0
+    while len(matched) < start + bounded_limit:
+        page = fetch_page(max_limit, scanned)
+        if not page:
+            break
+        scanned += len(page)
+        matched.extend(row for row in page if _record_matches(row, needle))
+    return matched[start:start + bounded_limit]
 
 
 def list_events(
