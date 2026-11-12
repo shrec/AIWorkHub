@@ -3581,12 +3581,85 @@ def _needfix_transition_receipt(
     }
 
 
+def _needfix_row_work_state(row: Mapping[str, Any]) -> str | None:
+    """The row's derived work state, or None when it is absent or not a known state."""
+    value = str(row.get("work_state") or "")
+    return value if value in needfix_store.WORK_STATES else None
+
+
+def _needfix_derivation_hooks(include_archived: bool) -> dict[str, Any] | None:
+    """The canonical task-store hooks the operator doors derive with.
+
+    None when no ready task store can resolve linked cards; rows then carry no
+    work_state rather than a guessed one.
+    """
+    try:
+        hooks, _reason = needfix_store._operator_hooks(
+            Path(core.repo_root()).resolve(), include_archived
+        )
+    except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError, ImportError):
+        return None
+    return hooks
+
+
+def _needfix_rows_with_work_state(rows: Any, hooks: dict[str, Any] | None) -> list[Any]:
+    """Rows annotated with work_state by the store's own derivation.
+
+    Derived listings already carry it; a raw status/kind/severity browse does
+    not, so those rows get the same ``needfix_store`` projection.
+    """
+    result: list[Any] = []
+    for row in rows:
+        if hooks is not None and "work_state" not in row:
+            row = needfix_store._decorate_derived(
+                dict(row), hooks["get_task_fn"], hooks["canonical_status_fn"]
+            )
+        result.append(row)
+    return result
+
+
+def _needfix_finished_rows(
+    hooks: dict[str, Any] | None, *, include_archived: bool, limit: int, explicit_filter: bool
+) -> list[Any]:
+    """Finished (``closed`` work state) rows the active listing leaves out.
+
+    Only for the unfiltered inbox view: an explicit filter is a raw browse whose
+    rows already include whatever it selected.
+    """
+    if hooks is None or explicit_filter:
+        return []
+    return needfix_store.list_needfix(
+        core.repo_root(),
+        include_archived=include_archived,
+        limit=limit,
+        get_task_fn=hooks["get_task_fn"],
+        canonical_status_fn=hooks["canonical_status_fn"],
+        work_state="closed",
+    )
+
+
+def _needfix_by_work_state(
+    status: str | None, kind: str | None, severity: str | None
+) -> tuple[dict[str, int] | None, str | None]:
+    """``(by_work_state, error)`` from the backend ``operator_count_breakdown``."""
+    try:
+        report = core.needfix_count(status=status, kind=kind, severity=severity, breakdown=True)
+    except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        return None, str(exc)[:240]
+    counts = report.get("by_work_state") if isinstance(report, Mapping) else None
+    if not isinstance(counts, Mapping):
+        reason = report.get("underived_reason") if isinstance(report, Mapping) else None
+        return None, str(reason or "work state breakdown unavailable")[:240]
+    return {state: int(counts.get(state) or 0) for state in needfix_store.WORK_STATES}, None
+
+
 def _bounded_needfix_row(row: Mapping[str, Any], *, include_detail: bool = False) -> dict[str, Any]:
     """Return only bounded fields safe for the native Webview."""
     result: dict[str, Any] = {
         "id": str(row.get("id") or "")[:32],
         "title": str(row.get("title") or "")[:240],
         "status": str(row.get("status") or "")[:40],
+        "work_state": _needfix_row_work_state(row),
         "kind": str(row.get("kind") or "")[:60],
         "severity": str(row.get("severity") or "")[:24],
         "readiness_score": max(0, min(100, int(row.get("readiness_score") or 0))),
@@ -3622,7 +3695,7 @@ def needfix_list_view(
 ) -> dict[str, Any]:
     """READ-ONLY: list bounded NeedFix inbox items with optional status, kind, severity, and archive filters.
 
-    Use this to browse or page through NeedFix summaries; use aiworkhub_dashboard_needfix_detail to fetch full description, scope, provenance, and audit events for one item, or aiworkhub_dashboard_roadmap_list for Roadmap items. Reads the NeedFix SQLite store without mutating state.
+    Use this to browse or page through NeedFix summaries; use aiworkhub_dashboard_needfix_detail to fetch full description, scope, provenance, and audit events for one item, or aiworkhub_dashboard_roadmap_list for Roadmap items. Reads the NeedFix SQLite store without mutating state. Every row carries its derived work_state, the reply carries by_work_state (the needfix_store.operator_count_breakdown count map), and without a filter finished_entries lists the closed rows kept off the main list.
 
     Args:
         status: optional str lifecycle status filter (default None returns all active statuses).
@@ -3634,14 +3707,32 @@ def needfix_list_view(
     """
     bounded_limit = max(1, min(int(limit or 100), 200))
     bounded_offset = max(0, int(offset or 0))
+    status_filter = str(status)[:40] if status else None
+    kind_filter = str(kind)[:60] if kind else None
+    severity_filter = str(severity)[:24] if severity else None
     try:
         rows = core.needfix_list(
-            status=str(status)[:40] if status else None,
-            kind=str(kind)[:60] if kind else None,
-            severity=str(severity)[:24] if severity else None,
+            status=status_filter,
+            kind=kind_filter,
+            severity=severity_filter,
             include_archived=include_archived is True,
             limit=bounded_limit,
             offset=bounded_offset,
+        )
+        hooks = _needfix_derivation_hooks(include_archived is True)
+        # Work-state enrichment is optional: a failure there must not drop the rows already read.
+        try:
+            rows = _needfix_rows_with_work_state(rows, hooks)
+            finished = _needfix_finished_rows(
+                hooks,
+                include_archived=include_archived is True,
+                limit=bounded_limit,
+                explicit_filter=bool(status_filter or kind_filter or severity_filter),
+            )
+        except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError, KeyError):
+            finished = []
+        by_work_state, by_work_state_error = _needfix_by_work_state(
+            status_filter, kind_filter, severity_filter
         )
         response = {
             "ok": True,
@@ -3650,7 +3741,11 @@ def needfix_list_view(
             "limit": bounded_limit,
             "offset": bounded_offset,
             "truncated": len(rows) >= bounded_limit,
+            "by_work_state": by_work_state,
+            "finished_entries": [_bounded_needfix_row(row) for row in finished],
         }
+        if by_work_state_error:
+            response["by_work_state_error"] = by_work_state_error
     except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
         response = {"ok": False, "error": str(exc)[:240], "entries": []}
     return _needfix_response(response, "aiworkhub_dashboard_needfix_list")

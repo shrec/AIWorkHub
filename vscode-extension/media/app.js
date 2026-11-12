@@ -57,6 +57,9 @@ const state = {
   sessionEntries: [],
   kbEntries: [],
   needfixEntries: [],
+  needfixFinished: [],
+  needfixByWorkState: null,
+  needfixWorkFilter: "open",
   needfixDetail: null,
   needfixConversionPreview: null,
   roadmapEntries: [],
@@ -3166,6 +3169,76 @@ function renderKb(payload) {
   renderKbEntries();
 }
 
+// Work state is derived by the NeedFix backend store; the
+// popup only groups and counts by the value each row carries. "closed" is the
+// one finished work state, every other state is open work.
+const NEEDFIX_WORK_STATE_LABELS = {
+  open: "Open",
+  finished: "Finished",
+  all: "All",
+  untriaged: "Untriaged",
+  decided_no_card: "Decided, no card",
+  in_work: "In work",
+  stalled: "Stalled",
+  reopened: "Reopened",
+  deferred: "Deferred",
+  closed: "Closed",
+};
+const NEEDFIX_FINISHED_WORK_STATES = new Set(["closed"]);
+const NEEDFIX_WORK_STATE_FILTERS = [
+  "open", "untriaged", "decided_no_card", "in_work", "stalled", "reopened", "deferred", "finished", "all",
+];
+
+function needfixWorkStateLabel(workState) {
+  const key = String(workState || "");
+  return NEEDFIX_WORK_STATE_LABELS[key] || key.replace(/_/g, " ");
+}
+
+function needfixIsFinished(entry) {
+  return NEEDFIX_FINISHED_WORK_STATES.has(String((entry && entry.work_state) || ""));
+}
+
+function needfixUnionEntries(entries, finishedEntries) {
+  const seen = new Set();
+  const union = [];
+  for (const entry of [...asArray(entries), ...asArray(finishedEntries)]) {
+    const id = String((entry && entry.id) || "");
+    if (id && seen.has(id)) continue;
+    if (id) seen.add(id);
+    union.push(entry);
+  }
+  return union;
+}
+
+function needfixRowsForWorkFilter(entries, finishedEntries, filter) {
+  const rows = needfixUnionEntries(entries, finishedEntries);
+  if (filter === "all") return rows;
+  if (filter === "finished") return rows.filter((entry) => needfixIsFinished(entry));
+  if (filter === "open") return rows.filter((entry) => !needfixIsFinished(entry));
+  return rows.filter((entry) => String(entry.work_state || "") === filter);
+}
+
+// Per-filter chip counts. The backend by_work_state map is authoritative; only
+// when it is absent (no task store) do the loaded rows stand in for it.
+function needfixWorkStateCounts(byWorkState, entries, finishedEntries) {
+  const perState = {};
+  if (byWorkState && typeof byWorkState === "object") {
+    for (const [name, value] of Object.entries(byWorkState)) perState[name] = numberValue(value);
+  } else {
+    for (const entry of needfixUnionEntries(entries, finishedEntries)) {
+      const name = String(entry.work_state || "");
+      if (name) perState[name] = (perState[name] || 0) + 1;
+    }
+  }
+  let finished = 0;
+  let open = 0;
+  for (const [name, count] of Object.entries(perState)) {
+    if (NEEDFIX_FINISHED_WORK_STATES.has(name)) finished += count;
+    else open += count;
+  }
+  return { ...perState, open, finished, all: open + finished };
+}
+
 function needfixFilters() {
   return {
     status: String(elements.needfixStatusFilter.value || ""),
@@ -3250,15 +3323,66 @@ function compareNeedfixEntries(left, right, sortMode) {
   return String(left.id || "").localeCompare(String(right.id || ""));
 }
 
+function needfixWorkStateBar() {
+  let bar = document.querySelector("#needfix-work-state-filter");
+  if (bar) return bar;
+  const host = elements.needfixList && (elements.needfixList.parentElement || elements.needfixList.parentNode);
+  if (!host) return null;
+  bar = createElement("div", "needfix-work-state-filter");
+  bar.id = "needfix-work-state-filter";
+  bar.setAttribute("role", "group");
+  bar.setAttribute("aria-label", "Filter NeedFix by work state");
+  bar.addEventListener("click", (event) => {
+    const chip = event.target.closest("[data-needfix-work-state]");
+    if (!chip) return;
+    state.needfixWorkFilter = String(chip.dataset.needfixWorkState || "open");
+    renderNeedfixList();
+  });
+  host.insertBefore(bar, elements.needfixList);
+  return bar;
+}
+
+function renderNeedfixWorkStateBar() {
+  const bar = needfixWorkStateBar();
+  if (!bar) return;
+  const counts = needfixWorkStateCounts(state.needfixByWorkState, state.needfixEntries, state.needfixFinished);
+  const fragment = document.createDocumentFragment();
+  for (const filter of NEEDFIX_WORK_STATE_FILTERS) {
+    const finished = filter === "finished";
+    const chip = createElement(
+      "button",
+      `needfix-work-state-chip${state.needfixWorkFilter === filter ? " active" : ""}${finished ? " finished" : ""}`,
+      `${needfixWorkStateLabel(filter)} ${formatCount(counts[filter] || 0)}`,
+    );
+    chip.type = "button";
+    chip.dataset.needfixWorkState = filter;
+    chip.setAttribute("aria-pressed", state.needfixWorkFilter === filter ? "true" : "false");
+    fragment.appendChild(chip);
+  }
+  bar.replaceChildren(fragment);
+}
+
 function renderNeedfixList() {
+  renderNeedfixWorkStateBar();
   const query = String(elements.needfixSearch.value || "").trim().toLocaleLowerCase();
   const sortMode = String((elements.needfixSort && elements.needfixSort.value) || "difficulty");
-  const rows = state.needfixEntries.filter((entry) => !query || [
-    entry.id, entry.title, entry.status, entry.kind, entry.severity, asArray(entry.tags).join(" "),
-  ].some((value) => String(value || "").toLocaleLowerCase().includes(query)))
+  // An explicit status filter already chose the rows; the default open view must not hide them.
+  const workFilter = needfixFilters().status && state.needfixWorkFilter === "open" ? "all" : state.needfixWorkFilter;
+  const rows = needfixRowsForWorkFilter(state.needfixEntries, state.needfixFinished, workFilter)
+    .filter((entry) => !query || [
+      entry.id, entry.title, entry.status, entry.kind, entry.severity, entry.work_state, asArray(entry.tags).join(" "),
+    ].some((value) => String(value || "").toLocaleLowerCase().includes(query)))
     .sort((left, right) => compareNeedfixEntries(left, right, sortMode));
   if (!rows.length) {
-    elements.needfixList.replaceChildren(createElement("div", "panel-list-empty", query ? "No matching NeedFix entries" : "NeedFix inbox is empty"));
+    const hidden = workFilter === "open"
+      ? needfixWorkStateCounts(state.needfixByWorkState, state.needfixEntries, state.needfixFinished).finished
+      : 0;
+    const message = query
+      ? "No matching NeedFix entries"
+      : hidden > 0
+        ? `No open NeedFix entries · ${formatCount(hidden)} finished hidden`
+        : "NeedFix inbox is empty";
+    elements.needfixList.replaceChildren(createElement("div", "panel-list-empty", message));
     return;
   }
   const fragment = document.createDocumentFragment();
@@ -3270,8 +3394,18 @@ function renderNeedfixList() {
     const heading = createElement("span", "needfix-list-heading");
     heading.append(
       createElement("strong", "", String(entry.title || entry.id || "Untitled")),
-      createElement("span", `status-badge status-${String(entry.status || "captured")}`, String(entry.status || "captured")),
     );
+    if (entry.work_state) {
+      const finished = needfixIsFinished(entry);
+      const badge = createElement(
+        "span",
+        `work-state-badge work-state-${String(entry.work_state)} ${finished ? "work-state-finished" : "work-state-open"}`,
+        needfixWorkStateLabel(entry.work_state),
+      );
+      badge.title = finished ? "Finished: no longer open work" : "Open work";
+      heading.appendChild(badge);
+    }
+    heading.appendChild(createElement("span", `status-badge status-${String(entry.status || "captured")}`, String(entry.status || "captured")));
     button.append(
       heading,
       createElement("span", "needfix-list-meta", `${String(entry.id || "")} · ${String(entry.kind || "other")} · ${String(entry.severity || "medium")} impact · ${difficulty.label} difficulty (${difficulty.score}) · readiness ${numberValue(entry.readiness_score)}`),
@@ -3285,11 +3419,15 @@ function renderNeedfixList() {
 function renderNeedfix(payload) {
   if (!payload || payload.ok === false) {
     state.needfixEntries = [];
+    state.needfixFinished = [];
+    state.needfixByWorkState = null;
     elements.needfixSummary.textContent = (payload && payload.error) || "NeedFix unavailable";
     renderNeedfixList();
     return;
   }
   state.needfixEntries = asArray(payload.entries);
+  state.needfixFinished = asArray(payload.finished_entries);
+  state.needfixByWorkState = payload.by_work_state && typeof payload.by_work_state === "object" ? payload.by_work_state : null;
   elements.needfixSummary.textContent = `${formatCount(payload.count)} shown${payload.truncated ? " · more available" : ""}`;
   renderNeedfixList();
 }

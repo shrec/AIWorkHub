@@ -1813,6 +1813,49 @@ tbody tr.is-selected td:first-child {
 .status-badge.stale, .signal-badge.stale { color: var(--stale-ink); background: var(--stale-soft); border-color: var(--stale); }
 .status-badge.archived { color: var(--archived-ink); background: var(--archived-soft); border-color: var(--archived); }
 
+.needfix-work-state-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 0 0 6px;
+}
+
+.needfix-work-state-chip {
+  padding: 2px 8px;
+  border: 1px solid var(--vscode-panel-border, #808080);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--vscode-foreground, inherit);
+  font-size: var(--fs-2xs);
+  cursor: pointer;
+}
+
+.needfix-work-state-chip.finished { border-style: dashed; }
+
+.needfix-work-state-chip.active {
+  border-color: var(--vscode-focusBorder, #007fd4);
+  background: var(--vscode-button-secondaryBackground, rgba(128, 128, 128, 0.25));
+  font-weight: 700;
+}
+
+.work-state-badge {
+  display: inline-flex;
+  min-height: 19px;
+  align-items: center;
+  padding: 2px 6px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  font-size: var(--fs-2xs);
+  font-weight: 700;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.work-state-badge.work-state-open { color: var(--processing-ink); background: var(--processing-soft); border-color: var(--processing); }
+.work-state-badge.work-state-stalled,
+.work-state-badge.work-state-reopened { color: var(--blocked-ink); background: var(--blocked-soft); border-color: var(--blocked); }
+.work-state-badge.work-state-finished { color: var(--archived-ink); background: var(--archived-soft); border-color: var(--archived); border-style: dashed; font-weight: 600; }
+
 .task-link {
   display: block;
   width: 100%;
