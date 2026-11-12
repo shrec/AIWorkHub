@@ -47,7 +47,11 @@ The cut:
                   wslpath -a path, which must lie under /mnt/, and every WSL
                   command takes absolute paths behind a cd guard; a failing
                   node id absent from --wsl-baseline stops the cut, unless it
-                  passes the same one serial rerun as host_tests
+                  passes the same one serial rerun as host_tests; before the
+                  suite, git init, add -A and commit (identity given with -c)
+                  make the extracted tree a one-commit repository, which the
+                  tests that run git against the checkout need, and a failing
+                  git command stops the cut with its stderr
   receipt         scripts/release_receipt.py record
   tag             git tag vVERSION
   push            only with --push: main and the tag in one atomic push,
@@ -124,6 +128,15 @@ WSL_MOUNT_ROOT = "/mnt/"
 WSL_CD_FAILED = 97
 # pytest's basetemp inside WSL, on the Linux filesystem; removed after the run.
 WSL_BASETEMP_PREFIX = "/tmp/aiworkhub-release-"
+# Run in order in the extracted WSL tree before its suite: ``git archive`` carries no
+# .git, and the suite's tests that run git against the checkout need a repository. The
+# identity rides on -c, so WSL needs no git config of its own.
+WSL_TREE_GIT_IDENTITY = ("-c", "user.name=release", "-c", "user.email=release@localhost")
+WSL_TREE_GIT_COMMANDS: tuple[tuple[str, ...], ...] = (
+    ("git", "init", "-q"),
+    ("git", *WSL_TREE_GIT_IDENTITY, "add", "-A"),
+    ("git", *WSL_TREE_GIT_IDENTITY, "commit", "-q", "-m", "release-tree"),
+)
 # parallelism_fallback in .aiworkhub/config/development_rules.json: at least a
 # quarter of the cores stays free for the MCP server and editor on this host.
 HOST_TEST_HEADROOM_FRACTION = 0.25
@@ -857,8 +870,9 @@ class ReleaseCut:
             "package": shlex.join(self._package_argv()),
             "commit": shlex.join(["git", *self._commit_args()]),
             "wsl_tests": f"git archive HEAD to {scratch}/head.tar, extracted into {scratch}/tree "
-            f"at its wslpath -a path (refused unless under {WSL_MOUNT_ROOT}), each WSL command "
-            f"behind 'cd -- DIR || exit {WSL_CD_FAILED}'; MSYS_NO_PATHCONV=1 "
+            f"at its wslpath -a path (refused unless under {WSL_MOUNT_ROOT}) and committed "
+            f"there by {', then '.join(shlex.join(argv) for argv in WSL_TREE_GIT_COMMANDS)}, "
+            f"each WSL command behind 'cd -- DIR || exit {WSL_CD_FAILED}'; MSYS_NO_PATHCONV=1 "
             f"{shlex.join(self._wsl_test_command())}; {self.wsl_basetemp} removed after; "
             f"baseline {baseline}",
             "receipt": shlex.join(self._receipt_argv()),
@@ -1079,6 +1093,7 @@ class ReleaseCut:
                 self._wsl_in(scratch, ("tar", "-xf", str(archive), "-C", str(tree))),
                 "extracting HEAD in WSL",
             )
+            self._commit_wsl_tree(tree)
             done = self._wsl_in(tree, self._wsl_test_command())
             return self._wsl_verdict(done, self._write_log("wsl_tests", done), tree)
         finally:
@@ -1086,6 +1101,24 @@ class ReleaseCut:
             # or fail. A failed removal leaves only git-ignored scratch and a /tmp
             # directory behind and never changes the verdict.
             self._wsl_in(scratch, clear)
+
+    def _commit_wsl_tree(self, tree: PurePosixPath) -> None:
+        """Make the extracted tree a repository whose one commit holds every archived file.
+
+        ``git archive`` carries no .git, so without this the suite's tests that run git
+        against the checkout (tests/test_retry_finalization_host_lane_nf01030.py) fail
+        as noise on every cut. Each of WSL_TREE_GIT_COMMANDS runs behind the tree's cd
+        guard, and the first that fails stops the step with its whole stderr: git often
+        prints a hint after the line that names the cause.
+        """
+
+        for argv in WSL_TREE_GIT_COMMANDS:
+            done = self._wsl_in(tree, argv)
+            if done.returncode != 0:
+                raise StepFailed(
+                    f"{shlex.join(argv)} in the WSL tree failed (exit {done.returncode}): "
+                    f"{_one_line(done.stderr) or _last_line(done.output)}"
+                )
 
     def _wsl_verdict(self, done: Completed, log: str, tree: PurePosixPath) -> str:
         summary = _last_line(done.output)
