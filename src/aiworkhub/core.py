@@ -4321,6 +4321,8 @@ def _create_payload_from_card(existing_card: Mapping[str, Any]) -> dict[str, Any
         "depends_on": existing_card.get("depends_on") or [],
         "read_first": existing_card.get("read_first") or [],
         "read_roots": existing_card.get("read_roots") or [],
+        "materialize": existing_card.get("materialize") or [],
+        "checkout": existing_card.get("checkout") or "sparse",
         "immutable_inputs": existing_card.get("immutable_inputs") or [],
         "max_live_tokens": (
             (existing_card.get("token_budget") or {}).get("cap_tokens")
@@ -4370,6 +4372,8 @@ def create_task(
     *,
     review_target_task_id: str | None = None,
     read_roots: list[str] | None = None,
+    materialize: list[str] | None = None,
+    checkout: str | None = None,
 ) -> dict[str, Any]:
     """Create one new canonical task card for the verified manager chat.
 
@@ -4662,6 +4666,9 @@ def create_task(
         from .card_read_roots import validate_read_roots
 
         read_roots2 = validate_read_roots(read_roots, repo_root=repo_root())
+        from .worker_materialize import card_checkout_fields, validate_card_checkout
+
+        materialize2, checkout2 = validate_card_checkout(materialize, checkout)
     except ValueError as exc:
         return _lifecycle_error(str(exc), 2)
     if read_only:
@@ -5115,6 +5122,7 @@ def create_task(
         ),
         "read_first": read_first2,
         **({"read_roots": read_roots2} if read_roots2 else {}),
+        **card_checkout_fields(materialize2, checkout2),
         "immutable_inputs": immutable_inputs2,
         "validation": validation2,
         "validation_roles": validation_roles2,
@@ -5220,6 +5228,8 @@ def create_task(
         "depends_on": depends_on2,
         "read_first": read_first2,
         "read_roots": read_roots2,
+        "materialize": materialize2,
+        "checkout": checkout2,
         "immutable_inputs": immutable_inputs2,
         "max_live_tokens": max_live_tokens,
         # None for every caller that declares no binding, exactly as a card

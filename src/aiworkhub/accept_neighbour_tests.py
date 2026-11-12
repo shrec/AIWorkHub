@@ -935,13 +935,15 @@ def base_commit_workspace(workspace: Any, card: Mapping[str, Any]) -> Iterator[A
         allowed_writes=(),
     )
     try:
-        # create_workspace seeds a sparse closure; a neighbour test needs the full tree.
-        expanded = _workspace._run(
-            ["git", "sparse-checkout", "disable"], cwd=base.path,
-            timeout=_workspace.WORKTREE_CREATE_TIMEOUT_SECONDS, phase="workspace_provision",
+        # create_workspace seeds a sparse closure; a neighbour test needs the full
+        # tree, minus forbidden paths under the card's materialize/checkout rule.
+        from . import worker_materialize
+
+        worker_materialize.expand_full_tree(
+            base.path, base_card, Path(repo), run=_workspace._run,
+            timeout=_workspace.WORKTREE_CREATE_TIMEOUT_SECONDS,
+            failure=lambda _detail: WorkspaceError("neighbour_base_full_tree_failed"),
         )
-        if expanded.returncode != 0:
-            raise WorkspaceError("neighbour_base_full_tree_failed")
         yield base
     finally:
         _workspace.cleanup_workspace(base.repo, base.path, base.home)

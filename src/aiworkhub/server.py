@@ -4062,6 +4062,20 @@ def aiworkhub_task_create(
         "another git repository, the home directory or its credential folders. Omit for none.",
         [["E:\\RuntimeData"]],
     )] = None,
+    materialize: typing.Annotated[list[str] | None, _task_create_hint(
+        "Up to 64 repo-relative globs materialized (present, read-only by scope) in the sparse "
+        "worker, validation and reproduction trees in addition to the declared closure, e.g. "
+        "committed configs/models/eval data. Same path rules as allowed_writes; refused with "
+        "materialize_invalid:<reason>:<value> when absolute, containing .. or .git, or too many. "
+        "Writes stay limited to allowed_writes; forbidden paths are never materialized. Omit for none.",
+        [["configs/**"]],
+    )] = None,
+    checkout: typing.Annotated[str | None, _task_create_hint(
+        "Worker tree checkout: sparse (default, declared closure only) or full (whole HEAD tree "
+        "minus forbidden paths). Writes stay limited to allowed_writes either way. Refused with "
+        "checkout_invalid:unknown_value:<value>. Omit for sparse.",
+        ["full"],
+    )] = None,
 ) -> dict[str, Any]:
     """MANAGER WRITE: create one new canonical repo-local task card.
 
@@ -4197,6 +4211,8 @@ def aiworkhub_task_create(
             else {}
         ),
         **({"read_roots": read_roots} if read_roots is not None else {}),
+        **({"materialize": materialize} if materialize is not None else {}),
+        **({"checkout": checkout} if checkout is not None else {}),
     )
     return _task_create_receipt(created, echo_card=echo_card)
 

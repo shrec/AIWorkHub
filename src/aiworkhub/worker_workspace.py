@@ -785,6 +785,7 @@ def _prepare_sparse_worktree(
     allowed: tuple[str, ...],
     *,
     timeout: float,
+    policy: Any,
 ) -> None:
     """Materialize only declared tracked files while preserving Git truth."""
     patterns = sorted({_sparse_checkout_pattern(relative) for relative in seeded})
@@ -792,9 +793,7 @@ def _prepare_sparse_worktree(
     # output can be staged without ``git add --sparse``. Unlike seeded paths,
     # their glob metacharacters are intentional and retain card semantics.
     patterns.extend(f"/{relative}" for relative in allowed)
-    patterns = sorted(set(patterns))
-    if not patterns:
-        patterns = ["/__AIWORKHUB_EMPTY_SPARSE_WORKTREE__"]
+    patterns = policy.sparse_patterns(sorted(set(patterns)))  # NF-2026-02237
     commands: tuple[tuple[list[str], str | None], ...] = (
         (["git", "sparse-checkout", "init", "--no-cone"], None),
         (
@@ -815,6 +814,8 @@ def _prepare_sparse_worktree(
             raise WorkspaceError(
                 f"workspace_sparse_checkout_failed:{argv[1]}:{result.stderr[-500:]}"
             )
+    policy.finish(path, run=_run, timeout=timeout,
+                  failure=lambda d: WorkspaceError(f"workspace_sparse_checkout_failed:finish:{d}"))
 
 
 def _read_git_control_file(path: Path, *, label: str) -> str:
@@ -5104,6 +5105,8 @@ def create_workspace(
         raise WorkspaceError("allowed_writes_empty")
     if any(PurePosixPath(pattern).parts[0] == ".git" for pattern in allowed):
         raise WorkspaceError("git_metadata_write_forbidden")
+    from . import worker_materialize  # card materialize/checkout rule (NF-2026-02237)
+    policy = worker_materialize.checkout_policy(card, repo, error=WorkspaceError)
     root = configured_worktree_root(repo)
     canonical_repo_root = (repo / ".aiworkhub" / "runtime" / "worktrees").resolve(
         strict=False
@@ -5129,14 +5132,11 @@ def create_workspace(
     provisioning_started = time.monotonic()
     provisioning_timings_ms: dict[str, float] = {}
 
-    # Bottleneck audit T4 (2026-09-01): 85% of a sampled provisioning total was
-    # attributed to no named phase.  The import/require closure resolution
-    # below was the untimed step; it is now its own phase so the named phases
-    # account for the total.
+    # Bottleneck audit T4 (2026-09-01): the closure resolution is its own phase.
     phase_started = time.monotonic()
     if pinned_base_oid is None:
-        live_seeded, support_seeded, seeded = _declared_workspace_seed_closure(
-            repo, card, allowed
+        live_seeded, support_seeded, seeded = policy.drop_forbidden(
+            _declared_workspace_seed_closure(repo, card, allowed)
         )
     else:
         # A pinned comparator must derive its dependency closure from the
@@ -5169,14 +5169,14 @@ def create_workspace(
                 # closure, then immediately prune to the same declared sparse
                 # authority used by candidate validation before any command
                 # executes.
-                live_seeded, support_seeded, seeded = (
+                live_seeded, support_seeded, seeded = policy.drop_forbidden(
                     _declared_workspace_seed_closure(path, card, allowed)
                 )
             _prepare_sparse_worktree(
                 path,
                 seeded,
                 allowed,
-                timeout=WORKTREE_CREATE_TIMEOUT_SECONDS,
+                timeout=WORKTREE_CREATE_TIMEOUT_SECONDS, policy=policy,
             )
             provisioning_timings_ms["sparse_checkout"] = round(
                 (time.monotonic() - phase_started) * 1000.0, 3
@@ -5977,26 +5977,16 @@ def create_combined_validation_workspace(
     request_id = f"union2_{source_digest}_{uuid.uuid4().hex[:16]}"
     combined = create_workspace(repo, request_id, union_card, "validation")
     try:
-        # ``create_workspace`` seeds only the sparse candidate/import closure, so
-        # unchanged tracked modules/tests/config that the repo-declared checks
-        # import (for example ``aiworkhub.declared_invariants``) are absent from
-        # the detached worktree and imports fail even though the module is
-        # tracked at ``HEAD``.  Disable the sparse definition so the full ``HEAD``
-        # union is materialized before the overlays below.  Files already
-        # present (seeded closure, allowed outputs) keep their bytes; only the
-        # missing tracked ``HEAD`` files are filled in at ``HEAD`` content, and
-        # the canonical-delta and candidate overlays that follow still take
-        # precedence.  Fail closed if the expansion errors.
-        expansion = _run(
-            ["git", "sparse-checkout", "disable"],
-            cwd=combined.path,
-            timeout=WORKTREE_CREATE_TIMEOUT_SECONDS,
-            phase="workspace_provision",
+        # ``create_workspace`` seeds only the sparse closure, so tracked modules the
+        # repo-declared checks import are absent.  Expand to the full ``HEAD`` union
+        # (minus forbidden paths under the card's materialize/checkout rule) before
+        # the overlays below, which still take precedence.  Fail closed on error.
+        from . import worker_materialize
+
+        worker_materialize.expand_full_tree(
+            combined.path, union_card, repo, run=_run, timeout=WORKTREE_CREATE_TIMEOUT_SECONDS,
+            failure=lambda d: WorkspaceError("combined_tree_full_union_failed:" + d),
         )
-        if expansion.returncode != 0:
-            raise WorkspaceError(
-                "combined_tree_full_union_failed:" + expansion.stderr[-500:]
-            )
         for relative in canonical_delta:
             _overlay_regular_path(repo, combined.path, relative)
         baseline_paths = sorted(set(combined.workspace_baseline) | set(canonical_delta))

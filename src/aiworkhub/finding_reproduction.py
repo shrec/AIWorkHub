@@ -948,19 +948,21 @@ def manager_reproducer(
             )
             try:
                 # ``create_workspace`` is sparse; expand it to the full base_oid
-                # tree. A failure raises, which ``_execute`` records as an
-                # UNRUNNABLE base naming it.
-                expansion = _pl._worker_workspace._run(
-                    ["git", "sparse-checkout", "disable"],
-                    cwd=workspace.path,
+                # tree minus forbidden paths under the card's materialize/checkout
+                # rule (one shared helper). A failure raises, which ``_execute``
+                # records as an UNRUNNABLE base naming it.
+                from . import worker_materialize
+
+                worker_materialize.expand_full_tree(
+                    workspace.path,
+                    base_card,
+                    source.repo,
+                    run=_pl._worker_workspace._run,
                     timeout=_pl._worker_workspace.WORKTREE_CREATE_TIMEOUT_SECONDS,
-                    phase="workspace_provision",
+                    failure=lambda detail: RuntimeError(
+                        "finding_reproduction_base_sparse_disable_failed:" + detail[-300:]
+                    ),
                 )
-                if expansion.returncode != 0:
-                    raise RuntimeError(
-                        "finding_reproduction_base_sparse_disable_failed:"
-                        + str(expansion.stderr or "")[-300:]
-                    )
             except Exception:
                 _pl.cleanup_workspace(workspace.repo, workspace.path, workspace.home)
                 raise
