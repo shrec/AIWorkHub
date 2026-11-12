@@ -120,12 +120,39 @@ def successor_task_id(task_id: str, by: str = "") -> str:
     return f"{task_id}-c{number}"
 
 
-def _feedback(predecessor: dict[str, Any], reason: str) -> dict[str, Any]:
+def _bounded_reason(text: str) -> str:
+    return str(text or "").strip().encode("utf-8")[:MAX_REASON_BYTES].decode("utf-8", errors="ignore")
+
+
+def _last_reject_reason(card: Mapping[str, Any]) -> str:
+    """The predecessor's latest reject reason: ``review_feedback.instruction`` of the pending card.
+
+    ``reject_review --to pending`` writes it verbatim (bounded at the write), so the
+    successor can carry the exact fix list rather than only the supersede reason.
+    """
+    feedback = card.get("review_feedback")
+    if not isinstance(feedback, Mapping):
+        return ""
+    return str(feedback.get("instruction") or "")
+
+
+def _feedback(predecessor: dict[str, Any], reason: str, prior_reject_reason: str = "") -> dict[str, Any]:
     changed = predecessor.get("changed_path_hashes")
-    instruction = str(reason or "").strip().encode("utf-8")[:MAX_REASON_BYTES]
+    supersede = _bounded_reason(reason)
+    prior = _bounded_reason(prior_reject_reason)
+    if not prior:
+        instruction = supersede
+    else:
+        # The prior reject reason is carried verbatim; the supersede reason follows
+        # it.  With no prior reason neither header is emitted.
+        instruction = f"Previous reject reason:\n{prior}"
+        if supersede:
+            instruction += f"\n\nSupersede reason:\n{supersede}"
+        # The combined text keeps the same MAX_REASON_BYTES bound as a single reason.
+        instruction = _bounded_reason(instruction)
     return {
         "schema_id": FEEDBACK_SCHEMA_ID,
-        "instruction": instruction.decode("utf-8", errors="ignore"),
+        "instruction": instruction,
         "predecessor_request_id": str(predecessor.get("request_id") or ""),
         "predecessor_changed_paths": sorted(
             str(path) for path in (changed if isinstance(changed, dict) else {})
@@ -167,7 +194,7 @@ def continue_capped(task_id: str, *, reason: str = "", by: str = "") -> dict[str
         root,
         successor,
         rework_predecessor=copy.deepcopy(predecessor),
-        review_feedback=_feedback(predecessor, reason),
+        review_feedback=_feedback(predecessor, reason, _last_reject_reason(card)),
         actor=core._verified_manager_actor(),
     )
     if not ok:

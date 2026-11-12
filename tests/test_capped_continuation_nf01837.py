@@ -214,7 +214,7 @@ def test_continuation_creates_successor_inheriting_the_sealed_delta(repo, monkey
     feedback = successor["review_feedback"]
     assert feedback == {
         "schema_id": "aiworkhub.rework_feedback_delta.v1",
-        "instruction": "decompose by module",
+        "instruction": "Previous reject reason:\nstill wrong\n\nSupersede reason:\ndecompose by module",
         "predecessor_request_id": "9" * 32,
         "predecessor_changed_paths": ["src/a.py", "src/b.py"],
         "residual_identities": [],
@@ -289,6 +289,42 @@ def test_reason_is_truncated_to_the_byte_limit():
     feedback = capped_continuation._feedback({"request_id": "r"}, "é" * 9000)
 
     assert len(feedback["instruction"].encode("utf-8")) <= capped_continuation.MAX_REASON_BYTES
+
+
+def test_successor_feedback_carries_prior_reject_reason_verbatim_then_supersede_reason():
+    prior = "1. fix the lane shim\n2. keep PYTHONPATH extended\n3. re-run validation"
+    card = {"review_feedback": {"schema_id": capped_continuation.FEEDBACK_SCHEMA_ID, "instruction": prior}}
+
+    feedback = capped_continuation._feedback(
+        {"request_id": "r"}, "decompose by module", capped_continuation._last_reject_reason(card)
+    )
+
+    assert feedback["instruction"] == (
+        f"Previous reject reason:\n{prior}\n\nSupersede reason:\ndecompose by module"
+    )
+
+
+def test_successor_feedback_without_prior_reject_reason_is_only_the_supersede_reason():
+    for card in ({}, {"review_feedback": {"instruction": "   "}}):
+        feedback = capped_continuation._feedback(
+            {"request_id": "r"}, "decompose by module", capped_continuation._last_reject_reason(card)
+        )
+
+        assert feedback["instruction"] == "decompose by module"
+        assert "Previous reject reason" not in feedback["instruction"]
+
+
+def test_continue_capped_successor_inherits_the_prior_reject_reason(repo):
+    _capped(repo, "NF1837_PRIOR")
+    assert _card(repo, "NF1837_PRIOR")["review_feedback"]["instruction"] == "still wrong"
+
+    result = core.continue_capped_task("NF1837_PRIOR", reason="decompose by module")
+
+    assert result["ok"] is True
+    successor = _card(repo, "NF1837_PRIOR-c1")
+    assert successor["review_feedback"]["instruction"] == (
+        "Previous reject reason:\nstill wrong\n\nSupersede reason:\ndecompose by module"
+    )
 
 
 def test_continue_capped_custom_escape_card_creates_successor(repo, monkeypatch):
