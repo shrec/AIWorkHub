@@ -1534,13 +1534,50 @@ def _kill_probe(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
+class ProbeTempRootUnavailable(RuntimeError):
+    """No repository-owned temp root exists for a version probe's cwd."""
+
+
+def _probe_temp_root(repo: Path | None) -> Path:
+    """The repository-owned temp root a version probe's cwd lives under.
+
+    NF-2026-02044: reuses ``worker_workspace.configured_temp_root`` (the
+    ``.aiworkhub/temp`` authority, or the operator's ``AIWORKHUB_TEMP_ROOT``
+    pin) and creates it when missing. With no repository known and no pin it
+    raises :class:`ProbeTempRootUnavailable` rather than falling back to the
+    system temp directory.
+    """
+    from . import worker_workspace
+
+    # The same runtime_temp module object configured_temp_root itself uses.
+    runtime_temp = worker_workspace.runtime_temp
+    try:
+        root = worker_workspace.configured_temp_root(runtime_temp.known_repository(repo))
+        root.mkdir(parents=True, exist_ok=True)
+        if root.is_symlink() or not root.is_dir():
+            raise ProbeTempRootUnavailable(f"probe_temp_root_not_a_directory:{root}")
+    except (OSError, runtime_temp.RuntimeTempError, worker_workspace.WorkspaceError) as exc:
+        raise ProbeTempRootUnavailable(f"{type(exc).__name__}: {exc}") from exc
+    return root
+
+
 def probe_executable_version(
     executable: str,
     env: Mapping[str, str],
     *,
     timeout_seconds: float = VERSION_PROBE_TIMEOUT_SECONDS,
+    repo: Path | None = None,
 ) -> dict[str, Any]:
-    """Run ``<executable> --version`` once, shell-free, under the lane env."""
+    """Run ``<executable> --version`` once, shell-free, under the lane env.
+
+    The probe cwd is a fresh directory, removed afterwards. With a known
+    repository it lives under the repository temp root (NF-2026-02044). When an
+    explicit ``repo`` is given but its temp root cannot be resolved, nothing is
+    launched: the probe fails closed with
+    ``launch_error="probe_temp_root_unavailable"`` and the cause in
+    ``stderr_head``. With ``repo=None`` and no repository resolvable from the
+    environment, the probe keeps its pre-change behaviour (default temp dir).
+    """
     bounded = max(0.1, min(float(timeout_seconds), VERSION_PROBE_TIMEOUT_SECONDS))
     started = time.monotonic()
     exit_code: int | None = None
@@ -1548,10 +1585,19 @@ def probe_executable_version(
     launch_error = ""
     stderr: bytes = b""
     try:
-        # A fresh empty cwd: the probe must not see (e.g. import a conftest.py
-        # from) the coordinator's own working directory.
+        probe_root: Path | None
+        try:
+            probe_root = _probe_temp_root(repo)
+        except ProbeTempRootUnavailable:
+            if repo is not None:
+                raise
+            # No repository requested and none known: the pre-change default.
+            probe_root = None
+        # A fresh empty cwd, never the coordinator's own working directory. With a
+        # known repository it lives under the repository temp root (NF-2026-02044),
+        # so upward config discovery can reach the repository, as for validation lanes.
         with tempfile.TemporaryDirectory(
-            prefix="aiworkhub-probe-", ignore_cleanup_errors=True
+            prefix="aiworkhub-probe-", dir=probe_root, ignore_cleanup_errors=True
         ) as probe_cwd, subprocess.Popen(
             [executable, "--version"],
             cwd=probe_cwd,
@@ -1572,6 +1618,10 @@ def probe_executable_version(
                 except subprocess.TimeoutExpired:
                     stderr = b""
             exit_code = None if timed_out else process.returncode
+    except ProbeTempRootUnavailable as exc:
+        # Fail closed for an explicit repo: nothing launched, no system-temp fallback.
+        launch_error = "probe_temp_root_unavailable"
+        stderr = str(exc).encode("utf-8", "replace")
     except (OSError, ValueError) as exc:
         launch_error = type(exc).__name__
         stderr = str(exc).encode("utf-8", "replace")
