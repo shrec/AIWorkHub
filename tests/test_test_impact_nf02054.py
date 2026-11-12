@@ -225,9 +225,15 @@ def test_a_def_line_or_module_level_change_selects_every_importer(
     repo: Path, old: str, new: str
 ) -> None:
     _edit(repo, "src/app/core.py", old, new)
+    # tests/conftest.py imports app.other, which imports core: every test under tests/
+    # depends on core at import time (NF-2026-02219); alpha and beta also import it.
+    via = "conftest:tests/conftest.py:imports:src/app/core.py"
     assert _selected(repo) == {
-        ALPHA: ("imports:src/app/core.py",),
-        BETA: ("imports:src/app/core.py",),
+        "tests/test_alpha.py": (via, "imports:src/app/core.py"),
+        "tests/test_beta.py": (via, "imports:src/app/core.py"),
+        "tests/test_child.py": (via,),
+        "tests/test_plain.py": (via,),
+        "tests/test_reader.py": (via,),
     }
 
 
@@ -452,7 +458,15 @@ def test_r1_a_body_edit_of_a_function_called_only_at_module_level_selects_the_im
 
 def test_r1_import_time_code_of_a_module_conftest_imported_is_recorded(import_repo: Path) -> None:
     _edit(import_repo, "src/app/boot.py", "    return 5\n", "    return 5 + 0\n")
-    assert _selected(import_repo) == {BOOT: ("imports:src/app/boot.py",)}
+    # tests/conftest.py imports boot, so every test under tests/ is selected (NF-2026-02219).
+    via = "conftest:tests/conftest.py:imports:src/app/boot.py"
+    assert _selected(import_repo) == {
+        "tests/test_boot.py": (via, "imports:src/app/boot.py"),
+        "tests/test_early.py": (via,),
+        "tests/test_gone.py": (via,),
+        "tests/test_loaded.py": (via,),
+        "tests/test_tear.py": (via,),
+    }
 
 
 def test_r1_a_stale_import_time_file_selects_its_importers(import_repo: Path) -> None:

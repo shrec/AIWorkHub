@@ -12,7 +12,11 @@ the recorder keeps:
 * ``children`` -- for a test that launched a child Python interpreter running
   repository code (``subprocess.Popen`` audit event), the child's entry modules.
   What the child ran is opaque to this process, so the selector re-runs the test
-  whenever the static import closure of those entries changed.
+  whenever the static import closure of those entries changed. A child that cannot
+  be narrowed is ``*``, re-run for any change: a shell (``shell=True``), a console
+  script or other launcher, ``os.spawn*``/``os.system``/``os.fork`` (their audit
+  events), and a multiprocessing process of any start method (``BaseProcess.start``
+  is watched: spawn and forkserver raise no audit event).
 
 Module-level code is deliberately not recorded per test: it runs once per process,
 inside whichever test or collection step imported the module first, so recording it
@@ -30,28 +34,34 @@ are attributed to no test.
 
 xdist workers each write a shard; the controller -- the only process under ``-n 0``
 -- merges the shards into one map with sorted keys and no worker or time fields, so
-``-n 0`` and ``-n 4`` produce byte-identical maps. Everything is written under
+``-n 0`` and ``-n 4`` produce byte-identical maps. The map is written only from a
+session that ran the whole configured suite: a deselected, path-narrowed, stopped,
+interrupted or collection-erroring session leaves the previous map untouched and the
+terminal summary says why. Everything is written under
 ``.aiworkhub/runtime/test_impact/`` of the pytest rootdir and nowhere else.
 """
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import shlex
+import shutil
 import sys
-from collections.abc import Callable, Generator, Iterable
+import sysconfig
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import CodeType
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 
 from . import test_impact_select as _select
 from .platform_io import is_windows
 
-SHARD_SCHEMA_ID = "aiworkhub.test_impact.shard.v2"
+SHARD_SCHEMA_ID = "aiworkhub.test_impact.shard.v3"
 TOOL_NAME = "aiworkhub.test_impact_recorder"
 _PLUGIN_NAME = "aiworkhub_test_impact_recorder"
 # sys.monitoring reserves ids 0 (debugger), 1 (coverage), 2 (profiler) and
@@ -66,6 +76,39 @@ _WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_TRUNC
 _OPTIONS_WITH_VALUE = frozenset({"-W", "-X", "--check-hash-based-pycs"})
 _EXITS_BEFORE_RUNNING = frozenset({"-V", "-VV", "--version", "-h", "-?", "--help"})
 _UNSEEN = object()
+# Children this process cannot narrow (NF-2026-02219): shells and script hosts run any
+# command, and these audit events start a child without a subprocess.Popen event --
+# os.spawn* forks on POSIX. _winapi.CreateProcess counts only outside subprocess.
+_SHELLS = frozenset(
+    {"sh", "bash", "dash", "zsh", "ksh", "csh", "tcsh", "fish", "ash", "busybox", "cmd", "powershell", "pwsh"}
+)
+_SCRIPT_SUFFIXES = frozenset({".bat", ".cmd", ".ps1", ".sh"})
+# Native programs that run the program their argv names; one naming nothing resolvable is unseen.
+_WRAPPERS = frozenset(
+    {
+        "env", "timeout", "nice", "nohup", "ionice", "stdbuf", "time", "taskset", "chrt", "setsid",
+        "sudo", "doas", "xargs", "flock", "strace", "ltrace", "valgrind", "uv", "uvx", "pipx", "poetry",
+        "pipenv", "pdm", "hatch", "rye", "pixi", "conda", "mamba", "micromamba", "tox", "nox", "start",
+    }
+)
+_UNOBSERVED_CHILD_EVENTS = frozenset(
+    {"os.fork", "os.forkpty", "os.spawn", "os.posix_spawn", "os.system", "os.startfile", "_winapi.CreateProcess"}
+)
+_CHILD_EVENTS = _UNOBSERVED_CHILD_EVENTS | {"subprocess.Popen"}
+# Functions that start a child with no audit event at all, by co_qualname -> package
+# directory: multiprocessing's spawn and forkserver launch through _posixsubprocess.
+_UNAUDITED_LAUNCHERS = {"BaseProcess.start": "multiprocessing"}
+# Windows console scripts are .exe launchers; POSIX ones are #! scripts, read instead.
+_LAUNCHER_DIRECTORY_CHECK = is_windows()
+# A session is complete only if every test ran: failures are recorded, an interrupted,
+# erroring or empty session is not.
+_COMPLETE_EXIT_STATUSES = frozenset({int(pytest.ExitCode.OK), int(pytest.ExitCode.TESTS_FAILED)})
+# Command-line options that skip tests without a pytest_deselected call.
+_NARROWING_OPTIONS = frozenset(
+    {"--ignore", "--ignore-glob", "--lf", "--last-failed", "--sw", "--stepwise", "--sw-skip", "--stepwise-skip"}
+)
+# Option destinations under which pytest reports tests without running their bodies.
+_NO_RUN_OPTIONS = (("collectonly", "collect_only"), ("setuponly", "setup_only"), ("setupplan", "setup_plan"))
 
 
 class RecorderError(RuntimeError):
@@ -188,6 +231,110 @@ _split_command_line: Callable[[str], list[str]] = (
 )
 
 
+def _launcher_directories() -> frozenset[str]:
+    places = (os.path.dirname(sys.executable), sysconfig.get_path("scripts"))
+    return frozenset(os.path.normcase(os.path.abspath(place)) for place in places if place)
+
+
+def _locate(program: str, cwd: str, env: object) -> str | None:
+    if os.path.dirname(program):
+        candidate = os.path.join(cwd, program)
+        return candidate if os.path.isfile(candidate) else None
+    search = env.get("PATH") if isinstance(env, Mapping) else None
+    return shutil.which(program, path=search) or shutil.which(program)
+
+
+def _console_script(found: str | None, named: str | None = None) -> bool:
+    """Whether a program launches the interpreter: a ``#!`` script on POSIX, an ``.exe``
+    beside the interpreter or in its Scripts directory on Windows.
+
+    ``found`` is the resolved file; ``named``, the path Popen was given, is judged by
+    its directory when it does not resolve.
+    """
+    target = found or named
+    if _LAUNCHER_DIRECTORY_CHECK and target:
+        place = os.path.dirname(os.path.abspath(target))
+        if os.path.normcase(place) in _launcher_directories():
+            return True
+    if found is None:
+        return False
+    with open(found, "rb") as handle:
+        return handle.read(2) == b"#!"
+
+
+def runs_unseen_code(program: str, args: list[str], cwd: str, env: object) -> bool:
+    """Whether a non-Python program can start Python code this process cannot narrow.
+
+    A shell (``shell=True``) or script host runs whatever its command line says, and a
+    console script launches the interpreter. A native program can start either from its
+    argv (``env``, ``timeout``, ``nice``, ``uv run``): an argv word that is an
+    interpreter or a console script makes the child unseen, and a known wrapper whose
+    argv names no program this process can resolve is unseen too, never dropped. A
+    program that does not exist starts nothing: Popen raises first.
+    """
+    stem, suffix = os.path.splitext(os.path.basename(program).lower())
+    if stem in _SHELLS or suffix in _SCRIPT_SUFFIXES or any(_is_python(word) for word in args):
+        return True
+    found = _locate(program, cwd, env)
+    if _console_script(found, os.path.join(cwd, program)):
+        return True
+    if found is None:
+        return False
+    located = [_locate(word, cwd, env) for word in args if word and not word.startswith("-")]
+    if any(_console_script(place) for place in located if place is not None):
+        return True
+    return stem in _WRAPPERS and all(place is None for place in located)
+
+
+def _inside_subprocess() -> bool:
+    """Whether subprocess.Popen is starting this child: its own audit event recorded it."""
+    frame = sys._getframe(1)
+    while frame is not None:
+        code = frame.f_code
+        if code.co_name == "_execute_child" and os.path.basename(code.co_filename) == "subprocess.py":
+            return True
+        frame = frame.f_back
+    return False
+
+
+def _is_unaudited_launcher(code: CodeType) -> bool:
+    if code.co_qualname not in _UNAUDITED_LAUNCHERS:
+        return False
+    package = os.path.basename(os.path.dirname(code.co_filename))
+    return package == _UNAUDITED_LAUNCHERS[code.co_qualname]
+
+
+def _testpaths(config: pytest.Config) -> list[Path]:
+    root = config.rootpath
+    found: list[Path] = []
+    for entry in config.getini("testpaths"):
+        pattern = str(root / entry)
+        magic = any(char in entry for char in "*?[")
+        matches = glob.glob(pattern, recursive=True) if magic else [pattern]
+        found += [Path(match).resolve() for match in sorted(matches) if os.path.exists(match)]
+    return found or [root.resolve()]
+
+
+def narrowed_invocation(config: pytest.Config) -> list[str]:
+    """Why the command line selects less than the configured suite, if it does."""
+    gaps = sorted(
+        {
+            f"option:{word.split('=', 1)[0]}"
+            for word in config.invocation_params.args
+            if word.split("=", 1)[0] in _NARROWING_OPTIONS
+        }
+    )
+    if getattr(getattr(config, "args_source", None), "name", "") == "TESTPATHS":
+        return gaps
+    here = Path(config.invocation_params.dir)
+    if any("::" in arg for arg in config.args):
+        gaps.append("explicit_test_ids")
+    targets = [(here / arg.split("::", 1)[0]).resolve() for arg in config.args]
+    if not all(any(t == p or t in p.parents for t in targets) for p in _testpaths(config)):
+        gaps.append("explicit_paths")
+    return gaps
+
+
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     staged = path.with_name(f"{path.name}.{os.getpid()}.tmp")
@@ -206,20 +353,38 @@ def clear_shards(root: Path) -> None:
             shard.unlink()
 
 
-def merge_shards(root: Path) -> Path | None:
-    """Merge every shard into the map; None (map untouched) when no shard was written."""
+class MergeResult(NamedTuple):
+    """The map written by :func:`merge_shards`, or why the previous map was kept."""
+
+    map_path: Path | None
+    reason: str | None
+
+
+def merge_shards(
+    root: Path, gaps: Iterable[str] = (), reported: Iterable[str] | None = None
+) -> MergeResult:
+    """Merge every shard into the map, but only from a session that ran the whole suite.
+
+    ``gaps`` are the controller's reasons the session was partial; each shard adds its
+    worker's, and a ``reported`` test with no shard row (a crashed worker) is one too.
+    A partial map would forget every test that did not run -- the selector would then
+    see them as unmapped at best -- so the previous map is left untouched and the
+    reason returned.
+    """
     directory = shard_directory(root)
     shards = sorted(directory.glob("*.json")) if directory.is_dir() else []
     if not shards:
-        return None
+        return MergeResult(None, "no_shards")
     rows: dict[str, _Sink] = {}
     files: dict[str, str] = {}
     import_time: set[str] = set()
     import_reads: dict[str, set[str]] = {}
+    partial = set(gaps)
     for shard in shards:
         payload = json.loads(shard.read_text(encoding="utf-8"))
         if not isinstance(payload, dict) or payload.get("schema_id") != SHARD_SCHEMA_ID:
             raise RecorderError(f"shard_schema_mismatch:{shard.name}")
+        partial.update(payload["gaps"])
         for nodeid, row in payload["tests"].items():
             files[nodeid] = row["file"]
             sink = rows.setdefault(nodeid, _Sink())
@@ -229,6 +394,11 @@ def merge_shards(root: Path) -> Path | None:
         import_time.update(payload["import_time"])
         for data_path, modules in payload["import_reads"].items():
             import_reads.setdefault(data_path, set()).update(modules)
+    unrecorded = set(reported or ()) - set(rows)
+    if unrecorded:
+        partial.add(f"unrecorded_tests:{len(unrecorded)}")
+    if partial:
+        return MergeResult(None, "partial_session:" + ",".join(sorted(partial)))
     objects = sorted({item for sink in rows.values() for item in sink.code})
     index = {item: position for position, item in enumerate(objects)}
     referenced: set[str] = {item.split("::", 1)[0] for item in import_time} | set(import_reads)
@@ -257,7 +427,7 @@ def merge_shards(root: Path) -> Path | None:
             "import_reads": {path: sorted(import_reads[path]) for path in sorted(import_reads)},
         },
     )
-    return map_path
+    return MergeResult(map_path, None)
 
 
 class ImpactRecorder:
@@ -282,6 +452,11 @@ class ImpactRecorder:
         self._import_reads: dict[str, set[str]] = {}
         self._tool_id: int | None = None
         self._in_hook = False
+        # Session completeness: the map is merged only from a run of the whole suite.
+        self._deselected = 0
+        self._collection_errors = 0
+        self._reported: set[str] = set()
+        self.merge_result: MergeResult | None = None
 
     # -- monitoring -------------------------------------------------------------------
 
@@ -351,6 +526,8 @@ class ImpactRecorder:
     def _on_start(self, code: CodeType, offset: int) -> object:
         path = self._code_path(code.co_filename)
         if path is None:
+            if self._windows and _is_unaudited_launcher(code):
+                self._windows[-1].children.add(_select.WHOLE_REPOSITORY)
             return sys.monitoring.DISABLE
         if code.co_name == "<module>":
             if self._windows:  # a lazy import: its body may call what this window already disabled
@@ -379,7 +556,7 @@ class ImpactRecorder:
     # -- audit events -----------------------------------------------------------------
 
     def _audit(self, event: str, args: tuple[Any, ...]) -> None:
-        if event != "open" and event != "subprocess.Popen":
+        if event != "open" and event not in _CHILD_EVENTS:
             return
         if self._in_hook or (event != "open" and not self._windows):
             return  # an open outside any window can still be an import-time read
@@ -388,8 +565,10 @@ class ImpactRecorder:
         try:
             if event == "open":
                 self._on_open(sink, args)
-            elif sink is not None:
+            elif sink is not None and event == "subprocess.Popen":
                 self._on_popen(sink, args)
+            elif sink is not None and not _inside_subprocess():
+                sink.children.add(_select.WHOLE_REPOSITORY)  # os.spawn*, os.system, fork, ...
         except Exception:  # noqa: BLE001 -- raising here would fail the audited call itself
             if sink is not None:
                 sink.errors += 1  # the test is then recorded incomplete and always selected
@@ -413,15 +592,17 @@ class ImpactRecorder:
             sink.reads.add(found)
 
     def _on_popen(self, sink: _Sink, args: tuple[Any, ...]) -> None:
-        executable, argv, cwd, _env = args
+        executable, argv, cwd, env = args
         if isinstance(argv, (str, bytes)):
             words = _split_command_line(os.fsdecode(argv))
         else:
             words = [os.fsdecode(word) for word in argv]
         program = os.fsdecode(executable) if executable is not None else (words[0] if words else "")
+        directory = os.fsdecode(cwd) if cwd is not None else os.getcwd()
         if _is_python(program):
-            directory = os.fsdecode(cwd) if cwd is not None else os.getcwd()
             sink.children.update(self.child_entries(words[1:], directory))
+        elif runs_unseen_code(program, words[1:], directory, env):
+            sink.children.add(_select.WHOLE_REPOSITORY)
 
     def _exists(self, path: str) -> bool:
         return (self.root / path).is_file()
@@ -441,8 +622,10 @@ class ImpactRecorder:
                 payload = value if len(word) == 2 else word[2:]
                 if word.startswith("-m"):
                     return set(_select.resolve_module(payload, self._exists)) or {_select.WHOLE_REPOSITORY}
-                found = _select.imported_files(payload, self._exists)
-                return found or {_select.WHOLE_REPOSITORY}
+                scan = _select.scan_imports(payload, self._exists)
+                if scan is None or scan.dynamic or scan.opaque:  # it imports beyond its statements
+                    return {_select.WHOLE_REPOSITORY}
+                return set(scan.static) or {_select.WHOLE_REPOSITORY}
             if word in _OPTIONS_WITH_VALUE:
                 index += 2
                 continue
@@ -542,20 +725,56 @@ class ImpactRecorder:
                 sink.absorb(fixture)
         self._tests[item.nodeid] = sink.row(item.nodeid.split("::", 1)[0])
 
+    def pytest_deselected(self, items: Sequence[pytest.Item]) -> None:
+        self._deselected += len(items)
+
+    def pytest_collectreport(self, report: pytest.CollectReport) -> None:
+        if report.failed:
+            self._collection_errors += 1
+
+    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        self._reported.add(report.nodeid)  # on the controller: every test, from any worker
+
+    def _session_gaps(self, session: pytest.Session, exitstatus: int) -> list[str]:
+        """Why this process ran less than the whole suite; empty for a complete run."""
+        gaps = []
+        if self._deselected:
+            gaps.append(f"deselected:{self._deselected}")
+        if self._collection_errors:
+            gaps.append(f"collection_errors:{self._collection_errors}")
+        if exitstatus not in _COMPLETE_EXIT_STATUSES:
+            gaps.append(f"exit_status:{exitstatus}")
+        if getattr(session, "shouldstop", False) or getattr(session, "shouldfail", False):
+            gaps.append("stopped_early")
+        option = session.config.option
+        gaps.extend(gap for dest, gap in _NO_RUN_OPTIONS if getattr(option, dest, False))
+        if self.worker_id is None:
+            gaps.extend(narrowed_invocation(session.config))
+        return gaps
+
     @pytest.hookimpl(tryfirst=True)
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
         self.stop()
-        if self._tests:
+        gaps = self._session_gaps(session, int(exitstatus))
+        if self._tests or self.worker_id is not None:  # a worker's gaps must reach the merge
             shard = shard_directory(self.root) / f"{self.worker_id or 'controller'}.json"
             payload = {
                 "schema_id": SHARD_SCHEMA_ID,
                 "tests": self._tests,
+                "gaps": gaps,
                 "import_time": sorted(self._import_code),
                 "import_reads": {k: sorted(v) for k, v in self._import_reads.items()},
             }
             _write_json(shard, payload)
         if self.worker_id is None:
-            merge_shards(self.root)
+            self.merge_result = merge_shards(self.root, gaps, self._reported)
+
+    def pytest_terminal_summary(self, terminalreporter: Any) -> None:
+        result = self.merge_result
+        if result is not None and result.reason is not None:
+            terminalreporter.write_line(
+                f"test_impact: map not written ({result.reason}); the previous map is unchanged"
+            )
 
 
 def _resolves_to(item: pytest.Item, argname: str, baseid: str) -> bool:

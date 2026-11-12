@@ -23,7 +23,15 @@ whose *body* contains it, and the tests are selected by these rules:
   importers of a stale import-time file, a test whose recording was incomplete is
   selected (``incomplete_record``), and a test that launched a child interpreter
   running repository code is selected when the import closure of the child's entry
-  modules changed (``subprocess:<path>``);
+  modules changed (``subprocess:<path>``) -- for any change at all when the child was
+  unobservable (a shell, a console script, multiprocessing, ``os.spawn*``) or its
+  closure holds a dynamic import with a non-literal target;
+* a test file whose code or ``tests/`` helpers import dynamically -- ``importlib``,
+  ``__import__``, ``runpy``, or a ``mock.patch``/``monkeypatch`` string target naming a
+  repository module or an unknown one -- is selected for any change
+  (``dynamic_import:<path>``); a literal target is also an import edge;
+* when the importers of a changed or stale file include a ``conftest.py``, every test
+  file under that conftest's directory is selected (``conftest:<conftest>:<reason>``);
 * a changed ``conftest.py``, ``pyproject.toml``, ``pytest.ini``, ``setup.cfg``,
   ``tox.ini``, ``test_impact_recorder.py`` or ``test_impact_select.py``, or a
   missing/unreadable/foreign map, sets ``full_suite_required`` with its reason instead
@@ -86,6 +94,17 @@ _INERT_TOKENS = frozenset(
     }
 )
 _GIT_DETAIL_CHARS = 400
+_CONFTEST = "conftest.py"
+# Calls that import a module named by their first argument (or this keyword).
+_MODULE_IMPORTERS = frozenset({"import_module", "__import__", "run_module"})
+_PATCH_VARIANTS = frozenset({"dict", "multiple", "object"})
+# ``<receiver>.patch``/``.setattr``/``.delattr``: a string first argument names a target.
+_STRING_TARGET_CALLS = frozenset({"patch", "setattr", "delattr"})
+# Receivers whose string-target calls are always mocking (pytest-mock, monkeypatch, mock).
+_MOCK_RECEIVERS = frozenset({"mock", "mocker", "monkeypatch", "patch"})
+_DOTTED = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+")
+_DOTTED_PIECE = re.compile(r"[\w.]*")
+_TARGET_KEYWORDS = frozenset({"name", "target", "mod_name", "in_dict"})
 
 
 class SelectionError(Exception):
@@ -158,29 +177,104 @@ def _resolve_under(base: str, segments: Sequence[str], exists: Callable[[str], b
     return tuple(found)
 
 
-def imported_files(
+@dataclass(frozen=True)
+class ImportScan:
+    """What one Python source imports: ``import`` statements and dynamic import calls."""
+
+    static: frozenset[str]
+    dynamic: frozenset[str]  # repository files a literal dynamic import target names
+    opaque: bool  # a dynamic import whose target is not a literal: it can be any module
+
+
+def _call_name(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _may_name_a_module(node: ast.expr) -> bool:
+    """Whether a non-literal string can be a dotted target: an f-string or concatenation
+    whose literal pieces hold only identifier characters and dots."""
+    if not isinstance(node, (ast.JoinedStr, ast.BinOp)):
+        return False
+    pieces = (part.value for part in ast.walk(node) if isinstance(part, ast.Constant))
+    return all(isinstance(piece, str) and _DOTTED_PIECE.fullmatch(piece) for piece in pieces)
+
+
+def _dynamic_target(node: ast.Call) -> tuple[bool, str | None]:
+    """(whether the call imports dynamically, its literal dotted target or None).
+
+    ``importlib.import_module``, ``__import__``, ``runpy.run_module``, ``mock.patch`` and
+    ``mocker.patch`` take a module name, ``runpy.run_path`` a file. ``patch.dict`` /
+    ``.multiple`` / ``.object`` and ``setattr``/``delattr`` on a mocking receiver import
+    only when given a string target; on any other receiver a ``.patch``/``.setattr``/
+    ``.delattr`` call imports when its first argument is a dotted string, or can be one.
+    """
+    func = node.func
+    name = _call_name(func)
+    receiver = _call_name(func.value) if isinstance(func, ast.Attribute) else None
+    first = node.args[0] if node.args else next(
+        (keyword.value for keyword in node.keywords if keyword.arg in _TARGET_KEYWORDS), None
+    )
+    if first is None:
+        return False, None
+    literal = first.value if isinstance(first, ast.Constant) and isinstance(first.value, str) else None
+    if name == "run_path":
+        return True, None
+    if name in _MODULE_IMPORTERS or (name == "patch" and receiver in (None, "mock", "mocker")):
+        return True, literal if literal and not literal.startswith(".") else None
+    string_target = receiver is not None and name in _STRING_TARGET_CALLS
+    if not string_target and not (receiver == "patch" and name in _PATCH_VARIANTS):
+        return False, None
+    if literal is not None:
+        if receiver in _MOCK_RECEIVERS or _DOTTED.fullmatch(literal):
+            return True, literal
+        return False, None
+    if receiver in _MOCK_RECEIVERS:
+        return isinstance(first, (ast.JoinedStr, ast.BinOp)), None
+    return _may_name_a_module(first), None
+
+
+def scan_imports(
     source: bytes | str, exists: Callable[[str], bool], *, origin: str | None = None
-) -> set[str] | None:
-    """Repository files ``source`` imports anywhere in its body; None when it does not parse."""
+) -> ImportScan | None:
+    """The repository files ``source`` imports, statically and dynamically; None if unparsable."""
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return None
-    found: set[str] = set()
+    static: set[str] = set()
+    dynamic: set[str] = set()
+    opaque = False
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                found.update(resolve_module(alias.name, exists, origin=origin))
+                static.update(resolve_module(alias.name, exists, origin=origin))
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
-            found.update(resolve_module(module, exists, origin=origin, level=node.level))
+            static.update(resolve_module(module, exists, origin=origin, level=node.level))
             for alias in node.names:
                 if alias.name != "*":
                     dotted = f"{module}.{alias.name}" if module else alias.name
-                    found.update(resolve_module(dotted, exists, origin=origin, level=node.level))
+                    static.update(resolve_module(dotted, exists, origin=origin, level=node.level))
+        elif isinstance(node, ast.Call):
+            is_dynamic, target = _dynamic_target(node)
+            if target is not None:
+                dynamic.update(resolve_module(target, exists, origin=origin))
+            elif is_dynamic:
+                opaque = True
     if origin is not None:
-        found.discard(origin)
-    return found
+        static.discard(origin)
+        dynamic.discard(origin)
+    return ImportScan(frozenset(static), frozenset(dynamic), opaque)
+
+
+def imported_files(
+    source: bytes | str, exists: Callable[[str], bool], *, origin: str | None = None
+) -> set[str] | None:
+    """Repository files ``source`` imports with ``import`` statements; None when it does not parse."""
+    scan = scan_imports(source, exists, origin=origin)
+    return None if scan is None else set(scan.static)
 
 
 def _reach(starts: Iterable[str], edges: Mapping[str, Iterable[str]]) -> set[str]:
@@ -200,10 +294,23 @@ class ImportGraph:
     def __init__(self, sources: Mapping[str, bytes], also_exists: Iterable[str] = ()) -> None:
         # also_exists: files gone from ``sources`` whose importers must still be found.
         exists = {*sources, *also_exists}.__contains__
-        self._edges: dict[str, set[str]] = {
-            path: imported_files(data, exists, origin=path) or set()
-            for path, data in sources.items()
-        }
+        self._edges: dict[str, set[str]] = {}
+        # dynamic: files with a dynamic import naming a repository module or an unknown
+        # target; opaque: the subset whose target is unknown, or that does not parse.
+        self.dynamic: set[str] = set()
+        self.opaque: set[str] = set()
+        for path, data in sources.items():
+            scan = scan_imports(data, exists, origin=path)
+            if scan is None:
+                self._edges[path] = set()
+                self.dynamic.add(path)
+                self.opaque.add(path)
+                continue
+            self._edges[path] = set(scan.static | scan.dynamic)
+            if scan.dynamic or scan.opaque:
+                self.dynamic.add(path)
+            if scan.opaque:
+                self.opaque.add(path)
         self._reverse: dict[str, set[str]] = {}
         for path, targets in self._edges.items():
             for target in targets:
@@ -525,7 +632,8 @@ class _Selector:
         base_blobs = read_blobs(self.root, self.base, wanted)
         for change in changes:
             self._apply_change(change, base_blobs, new_sources, graph)
-        self._apply_children(graph, changed_python)
+        self._apply_children(graph, changed_python, set(changed_paths))
+        self._apply_dynamic(graph, set(changed_paths))
         self._apply_unmapped(new_sources, {c.path for c in changes if c.status == "added"})
         stale = {p for p, digest in self.digests.items() if content_digest(base_blobs.get(p)) != digest}
         for nodeid, test in self.tests.items():
@@ -547,6 +655,11 @@ class _Selector:
         for nodeid, test in self.tests.items():
             if test.file in importers or not importers.isdisjoint(test.code_files):
                 self._pick(nodeid, reason)
+        # A conftest runs before every test under its directory: if importing it can
+        # break, so can every one of them, whatever they executed.
+        for conftest in sorted(importers):
+            if conftest.rsplit("/", 1)[-1] == _CONFTEST:
+                self._pick_tests_under(conftest, f"conftest:{conftest}:{reason}")
 
     def _apply_change(
         self,
@@ -575,19 +688,56 @@ class _Selector:
         if result.module_level or any(f"{path}::{q}" in self.import_code for q in result.functions):
             self._pick_importers(graph, [path], f"imports:{path}")
 
-    def _apply_children(self, graph: ImportGraph, changed_python: set[str]) -> None:
+    def _apply_children(self, graph: ImportGraph, changed_python: set[str], changed: set[str]) -> None:
+        """A child is opaque: re-run its test when the child's import closure changed.
+
+        A child that could not be narrowed (``*``) or whose closure imports a target this
+        selector cannot name can run anything, so any change at all re-runs the test.
+        """
         closures: dict[frozenset[str], set[str]] = {}
         for nodeid, test in self.tests.items():
             if not test.children:
                 continue
-            if WHOLE_REPOSITORY in test.children:
-                hits = changed_python
+            if test.children not in closures:
+                closures[test.children] = graph.closure(test.children - {WHOLE_REPOSITORY})
+            closure = closures[test.children]
+            if WHOLE_REPOSITORY in test.children or not closure.isdisjoint(graph.opaque):
+                hits = changed
             else:
-                if test.children not in closures:
-                    closures[test.children] = graph.closure(test.children)
-                hits = closures[test.children] & changed_python
+                hits = closure & changed_python
             for path in sorted(hits):
                 self._pick(nodeid, f"subprocess:{path}")
+
+    def _apply_dynamic(self, graph: ImportGraph, changed: set[str]) -> None:
+        """A test file that imports dynamically runs for any change (NF-2026-02219).
+
+        Its dynamic targets are not all static edges, so no diff can prove it unaffected.
+        A ``tests/`` helper that imports dynamically marks every test file importing it.
+        A conftest's literal targets are edges, so its tests follow the conftest rule in
+        :meth:`_pick_importers`; a conftest with an unknown target -- its own, or one of a
+        ``tests/`` helper it imports -- marks every test under it.
+        """
+        if not changed:
+            return
+        for path in sorted(self.new_sources):
+            if path.startswith("tests/") and path.rsplit("/", 1)[-1] == _CONFTEST:
+                hidden = {item for item in graph.closure([path]) & graph.opaque if item.startswith("tests/")}
+                for source in sorted(hidden):
+                    self._pick_tests_under(path, f"conftest:{path}:dynamic_import:{source}")
+        for path in sorted(graph.dynamic):
+            if not path.startswith("tests/") or path.rsplit("/", 1)[-1] == _CONFTEST:
+                continue
+            for importer in sorted(graph.importers([path])):
+                if is_test_module(importer):
+                    self._pick(importer, f"dynamic_import:{path}")
+
+    def _pick_tests_under(self, conftest: str, reason: str) -> None:
+        """Every test file in the directory tree a conftest applies to, picked whole."""
+        prefix = conftest[: -len(_CONFTEST)]
+        files = {test.file for test in self.tests.values()} | set(self.new_sources)
+        for path in sorted(files):
+            if path.startswith(prefix) and is_test_module(path):
+                self._pick(path, reason)
 
     def _apply_unmapped(self, new_sources: Mapping[str, bytes], added: set[str]) -> None:
         mapped = {test.file for test in self.tests.values()}
