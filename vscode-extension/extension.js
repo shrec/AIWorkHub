@@ -6836,6 +6836,7 @@ async function runVscodeLmTextProtocol(
     try {
       envelope = parseVscodeLmJsonEnvelope(text, { preferFinal: sourceGraphAcknowledged });
     } catch (err) {
+      let invalidJsonCorrection = ""; // NF-2026-02233: set only by the forced-staging invalid-JSON branch.
       lastProtocolPreview = String((err && err.protocolPreview) || text || "");
       protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: sanitizeErrorMessage(err) });
       if (request.request_kind === "quality_review") {
@@ -6854,6 +6855,18 @@ async function runVscodeLmTextProtocol(
             lastProtocolPreview,
           );
         }
+      } else if (String((err && err.message) || err) === "vscode_lm_text_protocol_invalid_json" &&
+          forceStagedEdit) {
+        // NF-2026-02233: during forced semantic-edit staging, consecutive invalid-JSON
+        // replies each get a corrective turn that quotes the rejected reply and
+        // restates the stage envelope still owed, until the shared forced-stage budget
+        // (2) is spent; the next one is terminal (vscode_lm_semantic_edit_stage_required).
+        // The correction is recorded in protocolTrace only after
+        // vscodeLmNoteForcedStageFailure accepts it.
+        const rejected = String(lastProtocolPreview || "").replace(/\s+/g, " ").slice(0, 300);
+        invalidJsonCorrection = `Your previous reply was rejected as invalid JSON: it is not one parseable ` +
+          `envelope. Rejected reply (first 300 chars): ${JSON.stringify(rejected)}. ` +
+          vscodeLmMissingRequiredStageInstruction(vscodeLmNextStageOutput(stagedEdits), false);
       } else if (String((err && err.message) || err) === "vscode_lm_text_protocol_invalid_json" &&
           !forceStagedEdit) {
         // NF-2026-01179: the per-missing-output correction budget below is only
@@ -6885,8 +6898,12 @@ async function runVscodeLmTextProtocol(
           protocolTrace,
           lastProtocolPreview,
         );
+        if (invalidJsonCorrection) {
+          protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "invalid_json_corrected" });
+        }
         messages.push(vscode.LanguageModelChatMessage.User(
-          vscodeLmMissingRequiredStageInstruction(vscodeLmNextStageOutput(stagedEdits), false),
+          invalidJsonCorrection ||
+            vscodeLmMissingRequiredStageInstruction(vscodeLmNextStageOutput(stagedEdits), false),
         ));
         continue;
       }

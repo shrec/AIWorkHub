@@ -6231,9 +6231,15 @@ async function nf988TwoBoundedCorrectionsDuringForcedStaging() {
   ).then(() => assert.fail("a third forced-stage violation must fail"), (err) => err);
   assert.strictEqual(failureInvocations, discoveryReads);
   assert.match(String(failure.message), /vscode_lm_semantic_edit_stage_required/);
+  // NF-2026-02233: the first forced-staging invalid-JSON reply records its corrective turn.
   assert.deepStrictEqual(
-    failure.protocolTrace.slice(-3).map((entry) => entry.outcome),
-    ["non_stage_tool_rejected", "vscode_lm_text_protocol_invalid_json", "vscode_lm_text_protocol_invalid_json"],
+    failure.protocolTrace.slice(-4).map((entry) => entry.outcome),
+    [
+      "non_stage_tool_rejected",
+      "vscode_lm_text_protocol_invalid_json",
+      "invalid_json_corrected",
+      "vscode_lm_text_protocol_invalid_json",
+    ],
   );
 }
 
