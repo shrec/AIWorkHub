@@ -26,9 +26,10 @@ syntax (including CUDA ``<<<...>>>`` launches). Cross-file call targets are
 resolved later by the canonical index builder and stay explicitly inferred
 when the target is ambiguous.
 
-JavaScript/TypeScript, Rust, Go, Java and C# use the same donor-proven adapter
-model with language-specific declaration/import rules and conservative call
-syntax. Every other language registered by Source Graph receives one truthful
+JavaScript/TypeScript, Rust, Go, Java, C# and Dart use the same donor-proven
+adapter model with language-specific declaration/import rules and conservative
+call syntax; Dart additionally masks raw, triple-quoted and interpolated
+strings with its own lexer. Every other language registered by Source Graph receives one truthful
 *file-level* authority record -- a ``kind="file"`` entity carrying the exact
 language, path, byte size and content hash directly observed from disk
 (``FILE_EVIDENCE``) -- without inventing any function/class/call/import
@@ -75,7 +76,7 @@ PYTHON_EXTENSIONS = tuple(languages.LANGUAGE_BY_ID["python"].extensions)
 PHP_EXTENSIONS = (".php", ".phtml", ".php3", ".php4", ".php5", ".php7", ".php8")
 CPP_EXTENSIONS = tuple(languages.LANGUAGE_BY_ID["cpp"].extensions)
 POLYGLOT_LEXICAL_LANGUAGES = frozenset({
-    "javascript", "typescript", "rust", "go", "java", "csharp",
+    "javascript", "typescript", "rust", "go", "java", "csharp", "dart",
 })
 
 
@@ -968,11 +969,19 @@ def _rust_imports(text: str) -> list[tuple[str, int, str]]:
     return rows
 
 
-def _polyglot_imports(language: str, text: str) -> list[tuple[str, int, str]]:
-    """Return directly observed import target, offset and signature."""
+def _polyglot_imports(
+    language: str, text: str, masked: str | None = None,
+) -> list[tuple[str, int, str]]:
+    """Return directly observed import target, offset and signature.
+
+    ``masked`` is the Dart comment/string-masked text; it is computed here
+    when the caller has not already done so.
+    """
 
     if language == "rust":
         return _rust_imports(text)
+    if language == "dart":
+        return _dart_imports(text, _mask_dart_non_code(text) if masked is None else masked)
 
     patterns: dict[str, tuple[re.Pattern[str], ...]] = {
         "javascript": (
@@ -996,6 +1005,8 @@ def _polyglot_imports(language: str, text: str) -> list[tuple[str, int, str]]:
 
 
 def _polyglot_type_patterns(language: str) -> tuple[re.Pattern[str], ...]:
+    if language == "dart":
+        return _DART_TYPE_PATTERNS
     if language in {"javascript", "typescript"}:
         return (
             re.compile(r"\b(?P<kind>class|interface|enum)\s+(?P<name>[$A-Za-z_]\w*)\b(?P<tail>[^;{]*)\{"),
@@ -1030,6 +1041,8 @@ def _polyglot_type_patterns(language: str) -> tuple[re.Pattern[str], ...]:
 
 
 def _polyglot_function_patterns(language: str) -> tuple[re.Pattern[str], ...]:
+    if language == "dart":
+        return _DART_FUNCTION_PATTERNS
     if language in {"javascript", "typescript"}:
         return (
             re.compile(
@@ -1085,6 +1098,236 @@ def _polyglot_function_patterns(language: str) -> tuple[re.Pattern[str], ...]:
     )
 
 
+# Dart lexical surface. Every pattern runs on ``_mask_dart_non_code`` output,
+# so string, raw-string, triple-quoted and interpolated text never matches.
+_DART_IDENT = r"[A-Za-z_$][\w$]*"
+_DART_DECLARATION_PREFIX = (
+    r"(?m)^[ \t]*(?:@[\w$.]+(?:\([^()\n]*\))?[ \t]+)*"
+    r"(?:(?:static|external|abstract|covariant|const|factory|late|final)\s+)*"
+    r"(?:(?P<rtype>" + _DART_IDENT + r"(?:\." + _DART_IDENT + r")*(?:<[^;{}()=\n]*>)?\??"
+    r"(?:[ \t]+Function[ \t]*(?:<[^;{}()\n]*>)?\([^;{}]*?\)\??)?)[ \t]+)?"
+)
+_DART_BODY_MODIFIER = r"\s*(?:async\*?|sync\*)?\s*"
+# Parameter lists nest one level of ``(...)``, ``{named}`` and ``[optional]``.
+_DART_PARAMETERS = (
+    r"\((?:[^;(){}\[\]]|\([^;(){}]*\)|\{(?:[^;(){}]|\([^;(){}]*\))*\}"
+    r"|\[(?:[^;(){}\[\]]|\([^;(){}]*\))*\])*\)"
+)
+_DART_TYPE_PATTERNS = (
+    re.compile(
+        r"(?m)^[ \t]*(?:(?:abstract|sealed|base|final|interface)\s+)*"
+        r"(?P<kind>class|mixin(?:\s+class)?|enum)\s+(?P<name>" + _DART_IDENT + r")"
+        r"(?P<tail>[^;{]*)\{"
+    ),
+    re.compile(
+        r"(?m)^[ \t]*(?P<kind>extension)\s+(?:type\s+)?(?!on\b)"
+        r"(?P<name>" + _DART_IDENT + r")(?P<tail>[^;{]*)\{"
+    ),
+    re.compile(
+        r"(?m)^[ \t]*(?P<kind>typedef)\s+(?P<name>" + _DART_IDENT + r")"
+        r"(?P<tail>[ \t]*(?:<[^;{=]*>)?\s*=[^;{]*);"
+    ),
+    re.compile(
+        r"(?m)^[ \t]*(?P<kind>typedef)\s+[^;{=()]*?\b(?P<name>" + _DART_IDENT + r")"
+        r"(?P<tail>[ \t]*(?:<[^;{=()]*>)?[ \t]*\([^;{]*\))[ \t]*;"
+    ),
+)
+# Getters run first so a constructor-shaped call statement inside a getter
+# body is already known to be nested when the general pattern meets it.
+_DART_FUNCTION_PATTERNS = (
+    re.compile(
+        _DART_DECLARATION_PREFIX + r"get[ \t]+(?P<name>" + _DART_IDENT + r")"
+        + _DART_BODY_MODIFIER + r"(?P<body>\{|=>)"
+    ),
+    re.compile(
+        _DART_DECLARATION_PREFIX + r"(?:set[ \t]+)?"
+        r"(?P<name>" + _DART_IDENT + r"(?:\." + _DART_IDENT + r")?)"
+        r"[ \t]*(?:<[^;{}()=\n]*>)?[ \t]*" + _DART_PARAMETERS + _DART_BODY_MODIFIER
+        + r"(?:[:=](?!>)[^;{}]*?)?(?P<body>\{|=>|;)"
+    ),
+)
+_DART_DIRECTIVE_KEYWORD = re.compile(
+    r"(?m)^[ \t]*(?P<kw>import|export|part(?:[ \t]+of)?)(?![\w$])"
+)
+_DART_DIRECTIVE_URI = re.compile(r"[ \t]+(?P<q>['\"])(?P<target>[^'\"\n]+)(?P=q)")
+# Spans lines on purpose: show/hide combinators may wrap.
+_DART_DIRECTIVE_TAIL = re.compile(r"[^;]*;")
+_DART_NON_DECLARATION_WORDS = frozenset({
+    "if", "for", "while", "switch", "catch", "return", "await", "throw", "yield",
+    "else", "case", "default", "new", "assert", "super", "this", "in", "is", "as",
+    "do", "try", "on", "rethrow",
+})
+
+
+def _mask_dart_non_code(text: str) -> str:
+    """Mask Dart comments and strings while preserving offsets and lines.
+
+    Beyond the C-family masker this understands raw ``r'...'`` strings (no
+    escapes), triple-quoted strings, nested ``/* */`` comments and ``${...}``
+    interpolation, whose code, braces and nested strings all stay masked.
+    """
+
+    chars = list(text)
+    size = len(text)
+    # A string frame is its delimiter (``r``-prefixed when raw); an
+    # interpolation frame is ``${`` and each nested code brace is ``{``.
+    stack: list[str] = []
+
+    def blank(start: int, end: int) -> None:
+        for index in range(start, min(end, size)):
+            if chars[index] != "\n":
+                chars[index] = " "
+
+    i = 0
+    while i < size:
+        ch = text[i]
+        top = stack[-1] if stack else ""
+        if top and top[-1] in "'\"":
+            raw = top[0] == "r"
+            delimiter = top.lstrip("r")
+            if text.startswith(delimiter, i):
+                stack.pop()
+                blank(i, i + len(delimiter))
+                i += len(delimiter)
+            elif not raw and ch == "\\":
+                blank(i, i + 2)
+                i += 2
+            elif not raw and text.startswith("${", i):
+                stack.append("${")
+                blank(i, i + 2)
+                i += 2
+            else:
+                if ch == "\n" and len(delimiter) == 1:
+                    stack.pop()  # unterminated single-line string: recover here
+                blank(i, i + 1)
+                i += 1
+            continue
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            end = size if end < 0 else end
+            blank(i, end)
+            i = end
+            continue
+        if text.startswith("/*", i):
+            depth, end = 0, i
+            while end < size:
+                if text.startswith("/*", end):
+                    depth, end = depth + 1, end + 2
+                elif text.startswith("*/", end):
+                    depth, end = depth - 1, end + 2
+                    if depth == 0:
+                        break
+                else:
+                    end += 1
+            blank(i, end)
+            i = end
+            continue
+        raw = (
+            ch in "rR" and i + 1 < size and text[i + 1] in "'\""
+            and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] in "_$"))
+        )
+        quote_at = i + 1 if raw else i
+        if text[quote_at] in "'\"":
+            quote = text[quote_at]
+            delimiter = quote * 3 if text.startswith(quote * 3, quote_at) else quote
+            stack.append(("r" if raw else "") + delimiter)
+            blank(i, quote_at + len(delimiter))
+            i = quote_at + len(delimiter)
+            continue
+        if top:
+            if ch == "{":
+                stack.append("{")
+            elif ch == "}":
+                stack.pop()
+            blank(i, i + 1)
+        i += 1
+    return "".join(chars)
+
+
+def _dart_imports(text: str, masked: str) -> list[tuple[str, int, str]]:
+    """Return import/export/part directives with the keyword offset.
+
+    The keyword and the terminating ``;`` are located on ``masked`` (comments
+    and strings blanked, offsets preserved), so commented-out or quoted
+    directive text can neither match nor swallow a real directive; only the
+    URI literal is sliced from the raw ``text`` at the same offsets.
+    """
+
+    directives: list[tuple[str, int, str]] = []
+    for match in _DART_DIRECTIVE_KEYWORD.finditer(masked):
+        uri = _DART_DIRECTIVE_URI.match(text, match.end())
+        if uri is None:
+            continue
+        tail = _DART_DIRECTIVE_TAIL.match(masked, uri.end())
+        if tail is None:
+            continue
+        start = match.start("kw")
+        signature = " ".join((text[start:uri.end()] + masked[uri.end():tail.end()]).split())
+        directives.append((uri.group("target"), start, signature[:500]))
+    return directives
+
+
+def _dart_bases(kind: str, tail: str) -> list[str]:
+    """Return extends/with/implements (and mixin ``on``) names of one header."""
+
+    accepted = {"extends", "with", "implements"} | ({"on"} if kind == "mixin" else set())
+    stripped = tail
+    while True:
+        reduced = re.sub(r"<[^<>]*>", "", stripped)
+        if reduced == stripped:
+            break
+        stripped = reduced
+    # An extension type representation ``(int value)`` is not a base.
+    stripped = re.sub(r"\([^()]*\)", " ", stripped)
+    parts = re.split(r"\b(extends|with|implements|on)\b", stripped)
+    bases: list[str] = []
+    for keyword, clause in zip(parts[1::2], parts[2::2]):
+        if keyword not in accepted:
+            continue
+        for item in clause.split(","):
+            found = re.match(r"\s*(" + _DART_IDENT + r"(?:\." + _DART_IDENT + r")*)", item)
+            if found:
+                bases.append(found.group(1).split(".")[-1])
+    return bases
+
+
+def _dart_function_span(
+    masked: str, match: re.Match[str], owner_name: str | None, *, nested: bool,
+) -> tuple[int, int] | None:
+    """Return the (opening, ending) offsets of one Dart declaration body.
+
+    Block bodies end at their matching brace and ``=>`` bodies at the first
+    top-level ``;``. A body-less ``;`` declaration counts only as a
+    constructor of the enclosing type (``Owner(...)``, ``Owner.named(...)``,
+    redirecting factory); a call statement inside a body never declares one.
+    """
+
+    head = match.group("name").split(".")[0]
+    rtype = match.groupdict().get("rtype") or ""
+    if head in _DART_NON_DECLARATION_WORDS or rtype in _DART_NON_DECLARATION_WORDS:
+        return None
+    opening = match.start("body")
+    token = match.group("body")
+    if token == "{":
+        return opening, _matching_delimiter(masked, opening, "{", "}")
+    if token == "=>":
+        depth = 0
+        for index in range(opening + 2, len(masked)):
+            char = masked[index]
+            if char in "([{":
+                depth += 1
+            elif char in ")]}":
+                if depth == 0:
+                    return opening, index
+                depth -= 1
+            elif char == ";" and depth == 0:
+                return opening, index
+        return opening, len(masked) - 1
+    if nested or owner_name is None or head != owner_name:
+        return None
+    return opening, opening
+
+
 def _extract_polyglot_lexical(
     rel: str,
     text: str,
@@ -1093,9 +1336,9 @@ def _extract_polyglot_lexical(
     *,
     language: str,
 ) -> FileExtraction:
-    """Extract donor-proven structural surfaces for six brace languages."""
+    """Extract donor-proven structural surfaces for seven brace languages."""
 
-    masked = _mask_c_family_non_code(
+    masked = _mask_dart_non_code(text) if language == "dart" else _mask_c_family_non_code(
         text, javascript_regex_literals=language in {"javascript", "typescript"},
     )
     line_count = max(1, text.count("\n") + 1)
@@ -1108,12 +1351,18 @@ def _extract_polyglot_lexical(
     edges: list[Edge] = []
     counts: dict[str, int] = {}
 
-    import_text = _mask_comments_preserve_strings(text)
-    for target, position, signature in _polyglot_imports(language, import_text):
+    # Dart directives are located on ``masked`` and read their URI from the raw
+    # text, so comment/string text never forms or swallows a directive.
+    import_text = text if language == "dart" else _mask_comments_preserve_strings(text)
+    for target, position, signature in _polyglot_imports(language, import_text, masked):
         line = _line_for_offset(text, position)
         qualname = _cpp_qualname(rel, f"import::{target}@{line}", counts)
+        import_name = (
+            re.split(r"[/:]", target)[-1].removesuffix(".dart") if language == "dart"
+            else target.split(".")[-1].split("::")[-1]
+        )
         entities.append(Entity(
-            kind="import", name=target.split(".")[-1].split("::")[-1],
+            kind="import", name=import_name,
             qualname=qualname, file_path=rel, line_start=line, line_end=line,
             signature=signature, evidence_label=EXTRACTED,
             extractor=POLYGLOT_LEXICAL_EXTRACTOR_ID, confidence=1.0,
@@ -1139,7 +1388,11 @@ def _extract_polyglot_lexical(
             seen_type_positions.add(identity)
             raw_kind = match.group("kind")
             opening = masked.rfind("{", match.start(), match.end())
-            ending = _matching_delimiter(masked, opening, "{", "}")
+            if opening < 0:
+                # A Dart ``typedef`` is a body-less declaration ending at ``;``.
+                opening = ending = match.end() - 1
+            else:
+                ending = _matching_delimiter(masked, opening, "{", "}")
             line = _line_for_offset(masked, match.start())
             if raw_kind == "impl":
                 # Rust ``impl Type`` is an owner scope, not a second type
@@ -1152,7 +1405,7 @@ def _extract_polyglot_lexical(
                     pending_inherits.append((qualname, trait.split("::")[-1], line))
                 continue
             kind = "enum" if raw_kind == "enum" else (
-                "struct" if raw_kind in {"struct", "record", "type"} else "class"
+                "struct" if raw_kind in {"struct", "record", "type", "typedef"} else "class"
             )
             qualname = _cpp_qualname(rel, name, counts)
             type_qualnames.setdefault(name, qualname)
@@ -1174,7 +1427,12 @@ def _extract_polyglot_lexical(
             trait = match.groupdict().get("trait")
             if trait:
                 pending_inherits.append((qualname, trait.split("::")[-1], line))
-            for clause in re.findall(r"\b(?:extends|implements)\s+([^\{]+)", tail):
+            for base in _dart_bases(raw_kind, tail) if language == "dart" else ():
+                pending_inherits.append((qualname, base, line))
+            clauses = () if language == "dart" else re.findall(
+                r"\b(?:extends|implements)\s+([^\{]+)", tail,
+            )
+            for clause in clauses:
                 for base in re.findall(r"[A-Za-z_]\w*(?:::\w+|\.\w+)*", clause):
                     pending_inherits.append((qualname, base.split("::")[-1].split(".")[-1], line))
             if language == "csharp" and ":" in tail:
@@ -1190,18 +1448,31 @@ def _extract_polyglot_lexical(
     for pattern in _polyglot_function_patterns(language):
         for match in pattern.finditer(masked):
             name = match.group("name")
-            if language != "rust" and name in _POLYGLOT_CONTROL_NAMES:
+            if language not in {"rust", "dart"} and name in _POLYGLOT_CONTROL_NAMES:
                 continue
             identity = (match.start(), name)
             if identity in seen_functions:
                 continue
             seen_functions.add(identity)
-            opening = masked.rfind("{", match.start(), match.end())
-            ending = _matching_delimiter(masked, opening, "{", "}")
-            if opening < 0 or ending <= opening:
-                continue
             owner = owner_for(match.start())
+            if language == "dart":
+                span = _dart_function_span(
+                    masked, match, owner[2] if owner else None,
+                    nested=any(row[0] < match.start() < row[1] for row in function_ranges),
+                )
+                if span is None:
+                    continue
+                opening, ending = span
+            else:
+                opening = masked.rfind("{", match.start(), match.end())
+                ending = _matching_delimiter(masked, opening, "{", "}")
+            if opening < 0 or ending < opening:
+                continue
             semantic_name = f"{owner[2]}::{name}" if owner else name
+            if language == "dart":
+                # ``Shape.unit`` stays in qualname/signature; the entity name is
+                # the selector body lookup resolves (``unit``, ``fromJson``).
+                name = name.rsplit(".", 1)[-1]
             qualname = _cpp_qualname(rel, semantic_name, counts)
             line = _line_for_offset(masked, match.start())
             entities.append(Entity(

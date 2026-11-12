@@ -2,7 +2,7 @@
 
 The registry is intentionally dependency-free and truthful about capability:
 Python has an AST extractor; PHP, C/C++/CUDA, JavaScript/TypeScript, Rust, Go,
-Java and C# have conservative structural lexical extractors. Every other
+Java, C# and Dart have conservative structural lexical extractors. Every other
 registered language receives exact file-level evidence. Keeping discovery and capability in one table prevents the
 historic bug where VS Code advertised a language but Source Graph silently
 ignored its files.
@@ -45,7 +45,7 @@ LANGUAGE_SPECS: tuple[LanguageSpec, ...] = (
     LanguageSpec("lua", "Lua", (".lua",)),
     LanguageSpec("r", "R", (".r", ".rmd")),
     LanguageSpec("julia", "Julia", (".jl",)),
-    LanguageSpec("dart", "Dart", (".dart",)),
+    LanguageSpec("dart", "Dart", (".dart",), "semantic_lexical"),
     LanguageSpec("elixir", "Elixir", (".ex", ".exs")),
     LanguageSpec("erlang", "Erlang", (".erl", ".hrl")),
     LanguageSpec("haskell", "Haskell", (".hs", ".lhs")),
