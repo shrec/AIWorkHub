@@ -15,15 +15,28 @@ import shutil
 import subprocess
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
 
+# Only a launchable result is cached (a negative one never is). It is served
+# without re-probing for CACHE_REFRESH_SECONDS, and until CACHE_TTL_SECONDS it
+# may still vouch for a launch whose re-probe merely timed out.
 CACHE_TTL_SECONDS = 300.0
-UNAVAILABLE_CACHE_TTL_SECONDS = 30.0
+CACHE_REFRESH_SECONDS = 120.0
 RUNTIME_AUTH_FAILURE_TTL_SECONDS = 300.0
-STATUS_TIMEOUT_SECONDS = 5.0
-STATUS_RETRY_TIMEOUT_SECONDS = 3 * STATUS_TIMEOUT_SECONDS
+# `claude auth status` was measured at 8.7 s wall (0.18 s CPU) on a loaded
+# 16-core host while reporting loggedIn=true. Probe bounds are derived from
+# recently measured latency and never drop below a floor with headroom over it.
+MEASURED_LOADED_STATUS_LATENCY_SECONDS = 8.7
+STATUS_LATENCY_HEADROOM = 2.0
+STATUS_TIMEOUT_FLOOR_SECONDS = 20.0
+STATUS_TIMEOUT_CEILING_SECONDS = 90.0
+STATUS_LATENCY_SAMPLES = 8
+MAX_PROBE_LATENCY_PATHS = 16
+STATUS_RETRY_BACKOFF_SECONDS = 1.0
+STATUS_TRANSIENT_RETRY_AFTER_SECONDS = 30.0
 MAX_STATUS_BYTES = 16 * 1024
 MAX_FAILURE_STATE_BYTES = 4 * 1024
 MAX_SESSION_ID_HASH_BYTES = 64
@@ -32,6 +45,7 @@ RUNTIME_AUTH_FAILURE_REASON = "claude_subscription_session_refresh_required"
 _lock = threading.Lock()
 _cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _runtime_failures: dict[str, tuple[float, int, str]] = {}
+_probe_latencies: dict[str, deque[float]] = {}
 _EDITOR_LAUNCHER_NAMES = frozenset(
     {
         "code",
@@ -204,6 +218,8 @@ def _is_editor_launcher(path: str) -> bool:
 def _status_probe_unavailable(
     path: str, failure: str, attempts: list[dict[str, Any]]
 ) -> dict[str, Any]:
+    """The probe could not run at all: fail closed and never cache it."""
+
     return {
         "ok": False,
         "authenticated": False,
@@ -216,17 +232,74 @@ def _status_probe_unavailable(
     }
 
 
+def _status_probe_transient(path: str, attempts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Every bounded attempt timed out: the login state is unknown, not absent.
+
+    Unknown never maps to launchable, but it is reported as a transient probe
+    condition with a retry hint instead of an authentication failure.
+    """
+
+    return {
+        "ok": False,
+        "authenticated": False,
+        "launchable": False,
+        "status": "auth_status_transient",
+        "transient": True,
+        "blocker_reason": "claude_auth_status_transient:TimeoutExpired",
+        "retry_after_seconds": STATUS_TRANSIENT_RETRY_AFTER_SECONDS,
+        "cache_hit": False,
+        "executable_path": path,
+        "probe_attempts": attempts,
+    }
+
+
+def _record_probe_latency(path: str, seconds: float) -> None:
+    with _lock:
+        samples = _probe_latencies.pop(path, None)
+        if samples is None:
+            samples = deque(maxlen=STATUS_LATENCY_SAMPLES)
+        samples.append(max(0.0, float(seconds)))
+        # Re-insert as most recent; evict the least recently probed executable.
+        _probe_latencies[path] = samples
+        while len(_probe_latencies) > MAX_PROBE_LATENCY_PATHS:
+            _probe_latencies.pop(next(iter(_probe_latencies)))
+
+
+def status_probe_timeouts(path: str) -> tuple[float, float]:
+    """Return the (first, retry) probe bounds derived from measured latency.
+
+    The first bound is ``STATUS_LATENCY_HEADROOM`` times the slowest recently
+    completed probe, never below ``STATUS_TIMEOUT_FLOOR_SECONDS`` and never
+    above ``STATUS_TIMEOUT_CEILING_SECONDS``; the retry doubles it within the
+    same ceiling.
+    """
+
+    with _lock:
+        samples = tuple(_probe_latencies.get(path, ()))
+    observed = max(samples, default=0.0)
+    first = min(
+        STATUS_TIMEOUT_CEILING_SECONDS,
+        max(STATUS_TIMEOUT_FLOOR_SECONDS, STATUS_LATENCY_HEADROOM * observed),
+    )
+    return first, min(STATUS_TIMEOUT_CEILING_SECONDS, 2.0 * first)
+
+
 def _probe_auth_status(path: str) -> dict[str, Any]:
     """Run Claude's bounded local status probe without changing failure circuits.
 
-    A cold start of the CLI shim under load can exceed the first bound, so a
-    timeout is retried once with ``STATUS_RETRY_TIMEOUT_SECONDS``. Each attempt's
-    timeout and elapsed wall time are reported so a remaining failure is
-    measurable rather than mistaken for an authentication failure.
+    The CLI's status call is I/O and scheduler bound: on a loaded host it was
+    measured at 8.7 s wall for 0.18 s CPU. The bounds therefore come from
+    ``status_probe_timeouts``; a timeout is retried once after a short backoff
+    with a longer bound, and if every attempt times out the result is
+    *transient*, never an authentication failure. Each attempt's timeout and
+    elapsed wall time are reported so a remaining failure is measurable.
     """
 
     attempts: list[dict[str, Any]] = []
-    for timeout in (STATUS_TIMEOUT_SECONDS, STATUS_RETRY_TIMEOUT_SECONDS):
+    completed = None
+    for index, timeout in enumerate(status_probe_timeouts(path)):
+        if index:
+            time.sleep(STATUS_RETRY_BACKOFF_SECONDS)
         started = time.monotonic()
         try:
             completed = subprocess.run(
@@ -249,9 +322,10 @@ def _probe_auth_status(path: str) -> dict[str, Any]:
             if isinstance(exc, subprocess.TimeoutExpired):
                 continue
             return _status_probe_unavailable(path, failure, attempts)
+        _record_probe_latency(path, time.monotonic() - started)
         break
-    else:
-        return _status_probe_unavailable(path, "TimeoutExpired", attempts)
+    if completed is None:
+        return _status_probe_transient(path, attempts)
     stdout = bytes(completed.stdout or b"")[:MAX_STATUS_BYTES]
     try:
         payload = json.loads(stdout.decode("utf-8"))
@@ -340,21 +414,40 @@ def auth_status(executable: str | None = None, *, force: bool = False) -> dict[s
                 "cache_hit": True,
                 "persisted_runtime_observation": True,
             }
+        # Only a launchable result is ever cached; within the refresh window it
+        # is served without re-probing.
         cached = _cache.get(path)
-        if cached and cached[1].get("status") == "auth_status_unavailable":
-            # A probe that could not run or timed out says nothing about the
-            # login: throttle re-probing briefly, never park launches for long.
-            ttl = UNAVAILABLE_CACHE_TTL_SECONDS
-        else:
-            ttl = CACHE_TTL_SECONDS
-        if not force and cached and now - cached[0] < ttl:
+        if (
+            not force
+            and cached is not None
+            and 0 <= now - cached[0] < CACHE_REFRESH_SECONDS
+        ):
             return {**cached[1], "cache_hit": True}
     result = _probe_auth_status(path)
+    finished = time.monotonic()
     with _lock:
         if result.get("launchable") is True:
             _runtime_failures.pop(path, None)
             _clear_persisted_runtime_failure(path)
-        _cache[path] = (now, dict(result))
+            _cache[path] = (now, dict(result))
+            return result
+        cached = _cache.get(path)
+        if result.get("transient") is True and cached is not None:
+            # A probe that merely timed out says nothing new about the login: a
+            # positive observed within the bounded TTL still vouches for it.
+            # The cache entry keeps its original timestamp so the TTL bounds
+            # how long the fallback can be used.
+            age = finished - cached[0]
+            if 0 <= age < CACHE_TTL_SECONDS:
+                return {
+                    **cached[1],
+                    "cache_hit": True,
+                    "probe_transient": True,
+                    "cached_age_seconds": round(age, 3),
+                    "probe_attempts": list(result.get("probe_attempts") or []),
+                }
+        # A negative or expired result is never cached and evicts any positive.
+        _cache.pop(path, None)
     return result
 
 
@@ -457,6 +550,7 @@ def invalidate() -> None:
     with _lock:
         _cache.clear()
         _runtime_failures.clear()
+        _probe_latencies.clear()
 
 
 __all__ = [
@@ -466,4 +560,5 @@ __all__ = [
     "invalidate",
     "refresh_subscription_session_for_retry",
     "record_runtime_auth_failure",
+    "status_probe_timeouts",
 ]
