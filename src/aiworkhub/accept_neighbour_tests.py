@@ -17,6 +17,12 @@ records and which does not block acceptance. A selected run that fails, or that
 returns no evidence, refuses the accept with ``neighbour_tests_failed:``, unless
 every node still red after the serial rerun also fails on a full checkout of
 canonical HEAD: that is recorded as ``base_red`` and does not refuse (NF-2026-02101).
+
+NF-2026-02220: when :mod:`aiworkhub.test_impact_select`'s recorded map is fresh for
+every changed path, its selection replaces the testmap ranking (``lane: impact_map``);
+otherwise the ranking above decides unchanged (``lane: structural``), with the reason.
+A collected test the map lacks or records stale always runs whole; any other recorded
+path the map records stale sends the decision to the structural lane.
 """
 
 from __future__ import annotations
@@ -36,8 +42,10 @@ from typing import Any
 
 from . import accept_neighbour_nodes as _nodes
 from . import card_contract_advice as _advice
+from . import test_impact_select as _impact
 from . import worker_workspace as _workspace
 from .sdlc_attribution import is_test_path
+from .task_templates import split_command_argv
 from .toolchain_authority import RECEIPT_CARD_KEY
 from .worker_workspace import ValidationRunError, WorkspaceError
 
@@ -87,6 +95,23 @@ _NODE_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.py(?:::[A-Za-z0-9_.:\[\]/,
 # A neighbour run is its own one-command contract: the card's evidence roles and
 # its toolchain receipt are bound to the card's own validation list.
 _CARD_ONLY_KEYS = ("validation_roles", "work_kind", RECEIPT_CARD_KEY)
+# NF-2026-02220: the lane that decided the ranked part of a selection -- the recorded
+# test-impact map when it is fresh for every changed path, else the structural lane.
+LANE_IMPACT_MAP = "impact_map"
+LANE_STRUCTURAL = "structural"
+# The impact lane is uncapped (never narrower than the selector), so its one argv must
+# stay under the 32767-character Windows command line; node ids fold to files first.
+MAX_IMPACT_COMMAND_CHARS = 24_000
+# A declared pytest run with any of these may collect less than the files it names, or
+# (--co, --collect-only, --collectonly, --setup-only, --setup-plan, --fixtures,
+# --fixtures-per-test, --markers, -h, --help, --version) executes no test at all, so its
+# names never excuse an impacted test from the neighbour run.
+_NARROWING_OPTIONS = frozenset(
+    {"-k", "-m", "--deselect", "--ignore", "--ignore-glob", "--lf", "--last-failed",
+     "--sw", "--stepwise", "--co", "--collect-only", "--setup-only", "--setup-plan",
+     "--fixtures", "--fixtures-per-test", "--markers", "-h", "--help", "--version",
+     "--collectonly", "--sw-skip", "--stepwise-skip"}
+)
 
 
 @dataclass(frozen=True)
@@ -110,6 +135,9 @@ class NeighbourSelection:
     # NF-2026-02162: the pinned MCP contract gate and why it was added.
     contract_gate: tuple[str, ...] = ()
     contract_gate_reason: str = ""
+    # NF-2026-02220: LANE_IMPACT_MAP or LANE_STRUCTURAL, and why that lane decided.
+    lane: str = ""
+    lane_reason: str = ""
 
     def evidence(self) -> dict[str, Any]:
         ranked = (
@@ -142,6 +170,9 @@ class NeighbourSelection:
             record["node_level"] = self.selection_mode == "node"
             record["node_count"] = self.node_count
             record["fallback_reasons"] = [dict(row) for row in self.fallback_reasons]
+        if self.lane:
+            record["lane"] = self.lane
+            record["lane_reason"] = self.lane_reason
         return record
 
 
@@ -174,7 +205,13 @@ def select_neighbour_tests(
 ) -> NeighbourSelection:
     """Rank the related tests of ``changed_paths`` that ``declared_commands`` miss.
 
-    Highest testmap score first, ties by path, capped at ``limit`` (at most
+    NF-2026-02220: when the recorded test-impact map is fresh for every changed
+    path, the selector's tests decide (``lane="impact_map"``), uncapped, so the
+    run is never narrower than that result together with the declared runs.
+    Otherwise -- or when the impact lane raises -- the structural lane below
+    decides unchanged (``lane="structural"``) and ``lane_reason`` names why.
+
+    Structural: highest testmap score first, ties by path, capped at ``limit`` (at most
     ``MAX_NEIGHBOUR_TESTS``). Only test files present under ``repo_root`` are
     kept. With ``candidate_root`` the impacted test nodes replace those files
     when every changed path maps to nodes (NF-2026-02102). ``INVARIANT_TESTS``
@@ -183,11 +220,25 @@ def select_neighbour_tests(
     """
     bounded = _bounded_limit(limit)
     try:
-        selection = _select(
+        changed_paths = tuple(changed_paths)
+    except Exception:  # an unreadable path list selects through no lane, never raises
+        changed_paths = ()
+    try:
+        impact, why = _impact_lane(
             Path(repo_root), changed_paths, declared_commands, bounded, candidate_root
         )
-    except Exception as exc:  # the lane is evidence-gathering: it records, never raises
-        selection = _empty(f"neighbour_selection_failed:{type(exc).__name__}", bounded)
+    except Exception as exc:  # an unknown map never narrows: the structural lane decides
+        impact, why = None, f"impact_map_failed:{type(exc).__name__}"
+    if impact is not None:
+        selection = impact
+    else:
+        try:
+            selection = _select(
+                Path(repo_root), changed_paths, declared_commands, bounded, candidate_root
+            )
+        except Exception as exc:  # the lane is evidence-gathering: it records, never raises
+            selection = _empty(f"neighbour_selection_failed:{type(exc).__name__}", bounded)
+        selection = replace(selection, lane=LANE_STRUCTURAL, lane_reason=why)
     try:
         selection = _with_invariants(Path(repo_root), selection, changed_paths, declared_commands)
     except Exception:  # the invariant addition must never turn a selection into a raise
@@ -204,6 +255,175 @@ def select_neighbour_tests(
     except Exception as exc:  # nor the referencing scan: it names its failure and adds nothing
         reason = f"referencing_scan_failed:{type(exc).__name__}"
         return replace(selection, referencing_reason=reason)
+
+
+def _impact_lane(
+    root: Path,
+    changed_paths: Sequence[Any],
+    declared_commands: Sequence[str],
+    limit: int,
+    candidate_root: Path | str | None,
+) -> tuple[NeighbourSelection | None, str]:
+    """NF-2026-02220: the test-impact selector's tests, or ``(None, reason)``.
+
+    The map under ``root`` must record every changed path with the content
+    ``root`` holds now; a test module ``root`` lacks counts as recorded, since the
+    selector always selects a new test whole. ``candidate_root`` must hold every
+    file the map records and every collected test of ``root``, and the selector's
+    diff of ``candidate_root`` against its ``HEAD`` must show every changed path.
+    Any miss, a full-suite answer or an unrunnable selected test is the named
+    reason, and the caller decides through the structural lane instead.
+    """
+    if limit == 0:
+        return None, "impact_map_skipped:neighbour_limit_zero"
+    production = _production_paths(changed_paths)
+    if not production:
+        return None, "impact_map_skipped:no_changed_production_python"
+    map_path = _impact.map_directory(root) / _impact.MAP_FILE_NAME
+    payload, problem = _impact.load_map(map_path)
+    digests = payload.get("digests") if payload is not None else None
+    if not isinstance(digests, Mapping):
+        return None, f"impact_map_unavailable:{problem or 'map_schema_mismatch'}"
+    changed = sorted({path for path in map(_advice._normalize_path, changed_paths) if path})
+    for path in changed:
+        state = _map_state(root, digests, path)
+        if state:
+            return None, f"impact_map_{state}:{path}"
+    if candidate_root is None:
+        return None, "impact_map_skipped:no_candidate_tree"
+    candidate = Path(candidate_root)
+    collected = [test for test, _path in _collected_tests(root, bounded=False)]
+    present = sorted(set(digests) | set(collected))
+    for path in present:
+        if path not in changed and (root / path).is_file() and not (candidate / path).is_file():
+            return None, f"impact_map_candidate_tree_incomplete:{path}"
+    # Fail open: a collected test the map lacks, or records with other content than
+    # ``root`` holds now, is not fresh, so it runs whole whatever the selector says.
+    kept = {
+        test: ("impact_map_not_fresh_for_test",)
+        for test in collected
+        if test not in changed and _map_state(root, digests, test)
+    }
+    # Any other recorded path (conftest.py, a test helper, an unchanged production
+    # module) whose content moved since recording leaves the selector's edges unknown,
+    # so the structural lane decides.
+    for path in sorted(set(digests) - set(changed) - set(collected)):
+        if _map_state(root, digests, path):
+            return None, f"impact_map_stale_dependency:{path}"
+    result = _impact.select_tests(candidate, "HEAD", paths=changed, map_path=map_path)
+    if result.full_suite_required:
+        return None, "impact_map_full_suite:" + ";".join(result.full_suite_reasons)
+    unseen = [path for path in changed if path not in result.changed_paths]
+    if unseen:
+        return None, f"impact_map_diff_missing:{unseen[0]}"
+    tests, problem = _impact_tests(candidate, {**result.selected, **kept}, declared_commands)
+    if problem:
+        return None, problem
+    lane_reason = f"impact_map_fresh:{len(changed)}"
+    if kept:
+        lane_reason += f";map_stale_tests_kept:{len(kept)}"
+    return NeighbourSelection(
+        tests=tests, reason="" if tests else "no_impacted_tests", limit=limit,
+        production_paths=tuple(production), related_count=len(tests),
+        lane=LANE_IMPACT_MAP, lane_reason=lane_reason,
+    ), ""
+
+
+def _map_state(root: Path, digests: Mapping[str, Any], path: str) -> str:
+    """``""`` when the map records ``path`` as ``root`` holds it now, else why not."""
+    recorded = digests.get(path)
+    target = root / path
+    if recorded is None:
+        absent = not target.exists() and not target.is_symlink()
+        return "" if absent and _impact.is_test_module(path) else "unmapped"
+    data = target.read_bytes() if target.is_file() else None
+    return "" if _impact.content_digest(data) == recorded else "stale"
+
+
+def _impact_tests(
+    candidate: Path, selected: Mapping[str, Any], declared_commands: Sequence[str]
+) -> tuple[tuple[str, ...], str]:
+    """The selector's tests as argv tokens, minus the files a declared run collects whole.
+
+    A node id needing quotes folds into its file, an invariant test's node ids into
+    the whole invariant file, and every node id into its file when the argv would
+    pass ``MAX_IMPACT_COMMAND_CHARS``: each fold runs more, never less. A selected
+    test that is not a present, collected file is a named reason, never dropped.
+    """
+    whole = _pytest_whole_files(declared_commands)
+    entries: list[str] = []
+    for entry in sorted(selected):
+        file = entry.split("::", 1)[0]
+        if not (
+            _TEST_PATH.fullmatch(file)
+            and _COLLECTED_TEST_PATH.fullmatch(file)
+            and (candidate / file).is_file()
+        ):
+            return (), f"impact_map_unrunnable:{entry}"
+        if _advice._covers(whole, file):
+            continue
+        folded = file in INVARIANT_TESTS or not _NODE_ID.fullmatch(entry)
+        entries.append(file if folded else entry)
+    tests = _absorbed(entries)
+    if len(" ".join(tests)) > MAX_IMPACT_COMMAND_CHARS:
+        tests = _absorbed([test.split("::", 1)[0] for test in tests])
+    if len(" ".join(tests)) > MAX_IMPACT_COMMAND_CHARS:
+        return (), f"impact_map_selection_too_wide:{len(tests)}"
+    return tests, ""
+
+
+def _absorbed(entries: Sequence[str]) -> tuple[str, ...]:
+    """``entries`` once each, in order, with a selected whole file absorbing its node ids."""
+    files = {entry for entry in entries if "::" not in entry}
+    return tuple(
+        dict.fromkeys(
+            entry for entry in entries
+            if "::" not in entry or entry.split("::", 1)[0] not in files
+        )
+    )
+
+
+def _short_cluster_narrows(arg: str) -> bool:
+    """A short-option cluster such as ``-qk expr`` or ``-vm slow`` that holds -k, -m or -h.
+
+    Conservative: a stray k/m/h inside an attached short value also counts, which only
+    runs more neighbour tests, never fewer.
+    """
+    return arg.startswith("-") and not arg.startswith("--") and any(c in "kmh" for c in arg[1:])
+
+
+def _pytest_whole_files(declared_commands: Sequence[str]) -> list[str]:
+    """The paths a declared ``pytest`` run collects whole.
+
+    Stricter than ``card_contract_advice._command_names``: a non-pytest command, a
+    ``::`` node id or a run with a ``_NARROWING_OPTIONS`` option names nothing, so
+    the declared runs never excuse an impacted test they would not run.
+    """
+    names: list[str] = []
+    for command in declared_commands:
+        if not isinstance(command, str):
+            continue
+        tokens = [token.strip("\"'") for token in split_command_argv(command)]
+        runner = next(
+            (
+                index for index, token in enumerate(tokens)
+                if token.replace("\\", "/").rsplit("/", 1)[-1] == "pytest"
+            ),
+            None,
+        )
+        if runner is None:
+            continue
+        args = tokens[runner + 1 :]
+        if any(
+            arg.split("=", 1)[0] in _NARROWING_OPTIONS or _short_cluster_narrows(arg)
+            for arg in args
+        ):
+            continue
+        for arg in args:
+            name = "" if arg.startswith("-") or "::" in arg else _advice._normalize_path(arg)
+            if name:
+                names.append(name)
+    return names
 
 
 def _with_invariants(
@@ -366,11 +586,11 @@ def _is_link(status: os.stat_result) -> bool:
     return stat.S_ISLNK(status.st_mode) or bool(attributes & _REPARSE_POINT)
 
 
-def _collected_tests(root: Path) -> list[tuple[str, Path]]:
+def _collected_tests(root: Path, *, bounded: bool = True) -> list[tuple[str, Path]]:
     """Collected test files under ``root/tests``, sorted, never through a link.
 
-    Files over ``REFERENCING_SCAN_MAX_BYTES`` are skipped; an unreadable
-    directory raises, and the caller records that the scan failed.
+    When ``bounded``, files over ``REFERENCING_SCAN_MAX_BYTES`` are skipped; an
+    unreadable directory raises, and the caller records that the scan failed.
     """
     top = root / _TESTS_DIR
     try:
@@ -393,7 +613,7 @@ def _collected_tests(root: Path) -> list[tuple[str, Path]]:
                     pending.append((Path(entry.path), child))
                 elif (
                     stat.S_ISREG(status.st_mode)
-                    and status.st_size <= REFERENCING_SCAN_MAX_BYTES
+                    and (not bounded or status.st_size <= REFERENCING_SCAN_MAX_BYTES)
                     and _TEST_PATH.fullmatch(child)
                     and _COLLECTED_TEST_PATH.fullmatch(child)
                 ):
