@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, cast
 
 from . import adapter_capability, core, rework_overlay_packet as _rework_overlay_packet
-from . import agent_tool_instructions
+from . import agent_tool_instructions, sandbox_cpu_budget
 from . import attempt_artifacts
 from . import claude_auth
 from . import cli_model_discovery
@@ -690,6 +690,7 @@ def worker_launch_env(
             sandbox_backend=sandbox_backend,
         )
     )
+    env.update(sandbox_cpu_budget.cpu_budget_env(sandbox_backend))  # NF-2026-02239
     if sandbox_backend == "windows_appcontainer":
         # NF-2026-01337: this worker inherits VS Code's stale PATH and no
         # INCLUDE/LIB/LIBPATH, so user-profile tools are invisible (WinError 5)

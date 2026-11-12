@@ -8908,27 +8908,6 @@ def _landlock_worker_temp_flags(workspace: WorkerWorkspace) -> list[str]:
     return ["--worker-temp", str(worker_temp)] if worker_temp is not None else []
 
 
-def _landlock_semlock_dev_shm_flags(
-    requested: bool, validation_exec_scratch: Path | None
-) -> list[str]:
-    """Return the ``--semlock-dev-shm`` landlock-exec flag pair, or ``[]``.
-
-    NF-2026-01740: requested only by ``run_validations`` for a command that
-    needs ``multiprocessing.SemLock``. A provider/worker launch carries no exec
-    scratch, so asking for the grant there fails closed instead of widening the
-    worker ruleset. The root is the same ``validation_runner`` check the SemLock
-    preflight grants on, so the rule exists exactly when the grant does.
-    """
-    if not requested:
-        return []
-    if validation_exec_scratch is None:
-        raise WorkspaceError("landlock_semlock_dev_shm_requires_validation")
-    from . import validation_runner
-
-    root = validation_runner.landlock_semlock_dev_shm_root()
-    return ["--semlock-dev-shm", root] if root is not None else []
-
-
 def _validation_needs_semlock_dev_shm(
     workspace: WorkerWorkspace, command: str, backend: str
 ) -> bool:
@@ -9044,10 +9023,10 @@ def sandbox_argv(
             if adapter_id == "opencode_cli" and validation_exec_scratch is None
             else []
         )
-        # NF-2026-01740: only a SemLock-needing VALIDATION gains /dev/shm.
-        semlock_flags = _landlock_semlock_dev_shm_flags(
-            validation_semlock_dev_shm, validation_exec_scratch
-        )
+        # NF-2026-01740/02239: validation gains /dev/shm only when it needs
+        # SemLock; a provider/worker launch gains it under the same root gate.
+        from .sandbox_cpu_budget import landlock_semlock_dev_shm_flags as _shm
+        semlock_flags = _shm(validation_semlock_dev_shm, validation_exec_scratch)
         # NF-2026-01775: the batch-scoped short TMPDIR run_validations minted once;
         # the child adopts it and never creates or removes it.
         if validation_short_tmp is not None and validation_exec_scratch is None:
@@ -9213,19 +9192,22 @@ def _landlock_add_path_rule(libc: Any, ruleset_fd: int, path: Path, rights: int)
 
 
 def _landlock_semlock_dev_shm_rule(
-    semlock_dev_shm: Path | None, exec_scratch: Path | None, handled: int
+    semlock_dev_shm: Path | None, exec_scratch: Path | None, handled: int, worker: bool = False
 ) -> tuple[Path, int] | None:
-    """Return the validation-only /dev/shm beneath-rule, or ``None``.
+    """Return the /dev/shm SemLock beneath-rule, or ``None``.
 
-    NF-2026-01740: the rule exists only for a validation run (one with an exec
-    scratch) whose parent passed ``--semlock-dev-shm`` after the SemLock need
-    and root checks; it grants create/write/remove beneath that real directory
-    and nothing else, masked to the rights this ABI's ruleset handles.
+    NF-2026-01740: a validation run (one with an exec scratch) gets it only when
+    its parent passed ``--semlock-dev-shm`` after the SemLock need and root
+    checks. NF-2026-02239: a provider/worker run (no exec scratch) gets it via
+    ``--worker-semlock-dev-shm`` after the same root check; each flag is refused
+    on the other lane. Either grants create/write/remove beneath that real
+    directory and nothing else, masked to the rights this ABI's ruleset handles.
     """
     if semlock_dev_shm is None:
         return None
-    if exec_scratch is None:
-        raise WorkspaceError("landlock_semlock_dev_shm_requires_validation")
+    if (exec_scratch is None) != worker:
+        lane = "worker" if worker else "validation"
+        raise WorkspaceError(f"landlock_semlock_dev_shm_requires_{lane}")
     if (
         str(semlock_dev_shm) != _LANDLOCK_SEMLOCK_DEV_SHM
         or not semlock_dev_shm.is_absolute()
@@ -9244,6 +9226,7 @@ def _apply_landlock(
     worker_temp: Path | None = None,
     semlock_dev_shm: Path | None = None,
     short_tmp: Path | None = None,
+    worker_semlock_dev_shm: Path | None = None,
 ) -> None:
     workspace = workspace.resolve()
     home = home.resolve()
@@ -9285,11 +9268,10 @@ def _apply_landlock(
             path = Path(device)
             if path.exists():
                 _landlock_add_path_rule(libc, ruleset_fd, path, _LL_WRITE_FILE)
-        semlock_rule = _landlock_semlock_dev_shm_rule(
-            semlock_dev_shm, exec_scratch, handled
-        )
-        if semlock_rule is not None:
-            _landlock_add_path_rule(libc, ruleset_fd, *semlock_rule)
+        for shm, worker in ((semlock_dev_shm, False), (worker_semlock_dev_shm, True)):
+            semlock_rule = _landlock_semlock_dev_shm_rule(shm, exec_scratch, handled, worker)
+            if semlock_rule is not None:
+                _landlock_add_path_rule(libc, ruleset_fd, *semlock_rule)
         for raw in allowed_writes:
             pattern = _relative_repo_path(raw)
             if any(ch in pattern for ch in "*?["):
@@ -11533,6 +11515,7 @@ def _landlock_exec(argv: list[str]) -> int:
     parser.add_argument("--outer-validation-authority", action="store_true")
     parser.add_argument("--noop-chmod", action="store_true")
     parser.add_argument("--semlock-dev-shm", default=None)
+    parser.add_argument("--worker-semlock-dev-shm", default=None)
     parser.add_argument("--short-tmp", default=None)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -11546,6 +11529,8 @@ def _landlock_exec(argv: list[str]) -> int:
     exec_scratch = Path(args.exec_scratch).resolve() if args.exec_scratch else None
     worker_temp = Path(args.worker_temp).resolve() if args.worker_temp else None
     semlock_dev_shm = Path(args.semlock_dev_shm) if args.semlock_dev_shm else None
+    worker_shm = args.worker_semlock_dev_shm  # NF-2026-02239: provider/worker lane
+    worker_semlock_dev_shm = Path(worker_shm) if worker_shm else None
     if args.outer_validation_authority:
         plant_outer_validation_authority(workspace, exec_scratch=exec_scratch)
     # NF-2026-01775: adopt and grant the batch short TMPDIR the parent minted once.
@@ -11561,6 +11546,7 @@ def _landlock_exec(argv: list[str]) -> int:
         exec_scratch,
         worker_temp=worker_temp,
         semlock_dev_shm=semlock_dev_shm,
+        worker_semlock_dev_shm=worker_semlock_dev_shm,
         short_tmp=short_tmp,
     )
     if args.cwd is not None:
@@ -13282,13 +13268,15 @@ def run_validations(
                             str(approved_active_root),
                             *effective_components,
                         )
+            from .sandbox_cpu_budget import cpu_budget_env  # NF-2026-02239
+
             env = sanitized_env(
                 "validation",
                 home=validation_home,
                 repo=workspace.repo,
                 isolated_task_queue_db=True,
                 verify_preprovisioned_home=selected_backend == "landlock",
-            )
+            ) | cpu_budget_env(selected_backend)
             tokens, tool_receipt = _ta.select_validation_executable(  # NF-2026-01969
                 declared_argv, tokens, env, version_probes, probe=not validation_executable_roots,
                 fact=_verify_authority_receipt_executable(
