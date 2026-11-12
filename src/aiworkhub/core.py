@@ -290,7 +290,8 @@ def _codex_shared_repo_route_manager_identity() -> dict[str, str] | None:
 
     try:
         root = repo_root()
-        readiness = task_store.storage_readiness(root)
+        # NF-2026-02195: identity needs a present, openable DB, not quick_check.
+        readiness = task_store.storage_readiness(root, integrity_check=False)
         if not readiness.ready or not readiness.repo_id:
             return None
         registry = shared_router.list_known_repositories(current_root=root, limit=32)

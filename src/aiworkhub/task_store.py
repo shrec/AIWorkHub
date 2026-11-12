@@ -1223,7 +1223,7 @@ def _readiness_memo_lookup(key: str) -> StorageReadiness | None:
     return verdict
 
 
-def storage_readiness(root: str | Path) -> StorageReadiness:
+def storage_readiness(root: str | Path, *, integrity_check: bool = True) -> StorageReadiness:
     """Verified registry/database authority readiness.
 
     Directory existence alone is never sufficient. Every one of the
@@ -1242,6 +1242,11 @@ def storage_readiness(root: str | Path) -> StorageReadiness:
         memoized = _readiness_memo_lookup(key)
         if memoized is not None:
             return memoized
+    if not integrity_check:
+        # NF-2026-02195: present and openable (schema probe) without quick_check;
+        # a fully verified memo above may serve it, a lite verdict is never stored.
+        return _storage_readiness_full(root, integrity_check=False)[0]
+    if key is not None:
         with _READINESS_MEMO_LOCK:
             prior = _READINESS_PATHS.get(key)
         if prior is not None:
@@ -1282,6 +1287,8 @@ def storage_readiness(root: str | Path) -> StorageReadiness:
 
 def _storage_readiness_full(
     root: str | Path,
+    *,
+    integrity_check: bool = True,
 ) -> tuple[StorageReadiness, tuple[str, ...] | None, Path | None]:
     """The uncached readiness check, plus the files a ready verdict read."""
     try:
@@ -1342,7 +1349,7 @@ def _storage_readiness_full(
         )
 
     try:
-        qc = _cached_quick_check(canonical_db)
+        qc = _cached_quick_check(canonical_db) if integrity_check else "ok"
     except sqlite3.DatabaseError:
         return (
             StorageReadiness(False, "canonical_db_corrupt", repo.manifest.repo_id, str(canonical_db)),
