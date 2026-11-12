@@ -1292,6 +1292,119 @@ def _assemble_cost_ledger(
     return result
 
 
+def _normalize_claude_code_model_id(model: str) -> str:
+    """Normalize a raw Claude Code model id to its pricing-family prefix.
+
+    Strips a trailing ``[1m]``-style bracket suffix and a trailing
+    ``-YYYYMMDD`` date suffix, leaving the bare family id that the rate
+    table below is matched against by prefix, never by exact equality.
+    """
+    raw = str(model or "").strip()
+    raw = re.sub(r"\[[^\]]*\]\s*$", "", raw).strip()
+    raw = re.sub(r"-\d{8}$", "", raw).strip()
+    return raw
+
+
+# The declared manager-seat rate table. This is the only token-price table
+# in this file: worker/reviewer costs are never computed from a rate table,
+# they are reported cost_usd observed at the provider, so there is nothing
+# here to duplicate or reuse from that path.
+_CLAUDE_CODE_MODEL_RATES_USD_PER_MTOK: dict[str, dict[str, float]] = {
+    "claude-sonnet-5": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
+    "claude-opus-5": {"input": 15.0, "output": 75.0, "cache_read": 1.5, "cache_write": 18.75},
+    "claude-haiku-5": {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25},
+    "claude-haiku-4-5": {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25},
+    "claude-haiku-4.5": {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25},
+}
+
+
+def _claude_code_model_rates(model: str) -> dict[str, float] | None:
+    """Match one normalized Claude Code model id to its rate row by prefix."""
+    normalized = _normalize_claude_code_model_id(model)
+    for prefix, rates in _CLAUDE_CODE_MODEL_RATES_USD_PER_MTOK.items():
+        if normalized.startswith(prefix):
+            return rates
+    return None
+
+
+def _claude_code_session_usd(session: dict[str, Any]) -> float | str:
+    """Price one Claude Code session from its stored usage, or ``"UNKNOWN"``.
+
+    A session that touched more than one model, or a model whose normalized
+    family is absent from the rate table above, never gets a guessed price.
+    """
+    models = session.get("models") or []
+    if len(models) != 1:
+        return "UNKNOWN"
+    rates = _claude_code_model_rates(models[0])
+    if rates is None:
+        return "UNKNOWN"
+    usd = (
+        int(session.get("input_tokens") or 0) * rates["input"]
+        + int(session.get("output_tokens") or 0) * rates["output"]
+        + int(session.get("cache_read_input_tokens") or 0) * rates["cache_read"]
+        + int(session.get("cache_creation_input_tokens") or 0) * rates["cache_write"]
+    ) / 1_000_000.0
+    return round(usd, 6)
+
+
+def _price_claude_code_sessions(section: dict[str, Any]) -> dict[str, Any]:
+    """Attach per-session USD, a manager_seat total, top sessions and a per-day series.
+
+    Never merged into worker/reviewer totals; an unpriceable model marks
+    ``partial_coverage`` on the total rather than guessing a price. Days
+    where every session is unpriced are still emitted, with ``usd`` null.
+    """
+    sessions = section.get("sessions") or []
+    priced_sessions = []
+    total_usd = 0.0
+    known = 0
+    unknown = 0
+    by_day: dict[str, float] = defaultdict(float)
+    by_day_unknown: dict[str, int] = defaultdict(int)
+    for row in sessions:
+        usd = _claude_code_session_usd(row)
+        priced = dict(row)
+        priced["usd"] = usd
+        priced_sessions.append(priced)
+        day = str(row.get("last_at") or "")[:10]
+        if isinstance(usd, (int, float)):
+            total_usd += usd
+            known += 1
+            if day:
+                by_day[day] += usd
+        else:
+            unknown += 1
+            if day:
+                by_day_unknown[day] += 1
+    top_sessions = sorted(
+        (row for row in priced_sessions if isinstance(row.get("usd"), (int, float))),
+        key=lambda row: row["usd"],
+        reverse=True,
+    )[:10]
+    all_days = sorted(set(by_day) | set(by_day_unknown))
+    per_day_series = [
+        {
+            "day": day,
+            "usd": round(by_day[day], 6) if day in by_day else None,
+            "unknown_sessions": by_day_unknown.get(day, 0),
+        }
+        for day in all_days
+    ]
+    section_out = dict(section)
+    section_out["sessions"] = priced_sessions
+    section_out["pricing"] = {
+        "role": "manager_seat",
+        "total_usd": round(total_usd, 6),
+        "known_sessions": known,
+        "unknown_sessions": unknown,
+        "partial_coverage": unknown > 0,
+        "top_sessions_by_usd": top_sessions,
+        "per_day_usd": per_day_series,
+    }
+    return section_out
+
+
 def build_cost_ledger(
     *,
     repo_root: Path | str | None = None,
@@ -1318,7 +1431,32 @@ def build_cost_ledger(
     # Read-only surfacing of Claude Code's own transcript usage; never
     # touches usage_rows/aggregates above, so existing attribution holds. It
     # carries its own bounded TTL memo, so it is never frozen in this one.
-    result["claude_code_sessions"] = claude_code_usage.collect_claude_code_usage(repo_root)
+    raw_sessions = claude_code_usage.collect_claude_code_usage(repo_root)
+    priced_sessions = _price_claude_code_sessions(raw_sessions)
+    result["claude_code_sessions"] = priced_sessions
+    manager_pricing = priced_sessions.get("pricing", {}) or {}
+    manager_seat_usd = manager_pricing.get("total_usd", 0.0)
+    manager_unknown_sessions = int(manager_pricing.get("unknown_sessions") or 0)
+    by_role = result.get("aggregates", {}).get("by_role", {})
+    worker_reviewer_usd = round(
+        sum(
+            float(by_role.get(role, {}).get("cost_usd") or 0.0)
+            for role in ("worker", "reviewer")
+        ),
+        6,
+    )
+    # manager_seat is never silently folded into worker/reviewer totals; the
+    # grand total is an explicit, separately labelled addition. Either total
+    # carries a partial-coverage flag whenever any manager-seat session
+    # could not be priced.
+    result["cost_totals"] = {
+        "worker_reviewer_usd": worker_reviewer_usd,
+        "manager_seat_usd": manager_seat_usd,
+        "grand_total_usd": round(worker_reviewer_usd + manager_seat_usd, 6),
+        "manager_seat_separately_labelled": True,
+        "priced_complete": manager_unknown_sessions == 0,
+        "unknown_sessions": manager_unknown_sessions,
+    }
     return result
 
 

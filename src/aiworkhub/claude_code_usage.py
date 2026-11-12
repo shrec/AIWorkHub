@@ -521,8 +521,12 @@ def collect_claude_code_usage(repo_root: Path | str) -> dict[str, Any]:
     Best-effort: it reads transcripts and writes only its own derived cache at
     ``.aiworkhub/runtime/cache/claude_code_usage_v1.json``; a failed cache
     write is dropped and never raised. A missing project directory yields
-    ``status: "not_found"``, never an exception. There is no price table, so
-    cost stays unknown -- this never reports a dollar figure.
+    ``status: "not_found"``, never an exception. This module carries no
+    price table of its own; ``src/aiworkhub/cost_ledger.py`` prices each
+    session's stored usage against its own declared manager-seat rate table
+    (normalizing the model id by stripping date/bracket suffixes and
+    matching the family by prefix) under the separately labelled
+    ``manager_seat`` role, so cost here stays measured, never guessed.
 
     A result younger than _COLLECT_MEMO_TTL_SECONDS for the same repository
     root and config dir is returned (as a copy) without any file IO.
