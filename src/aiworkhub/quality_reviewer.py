@@ -480,23 +480,34 @@ def build_review_packet(
             # line, the traceback tail, the linter's final count -- already
             # bounded by the finalizer; ``*_truncated`` says whether a head
             # and tail were cut out of a longer stream.
-            result.append(
-                {
-                    "declared_command": str(
-                        row.get("declared_command") or row.get("command") or ""
-                    )[:MAX_TEXT_CHARS],
-                    "executed_argv": [
-                        str(item)[:MAX_TEXT_CHARS]
-                        for item in list(executed)[:MAX_PACKET_COMMANDS]
-                    ],
-                    "returncode": returncode,
-                    "duration_seconds": duration,
-                    "stdout_tail": _output_tail(row.get("stdout_tail")),
-                    "stdout_truncated": bool(row.get("stdout_truncated")),
-                    "stderr_tail": _output_tail(row.get("stderr_tail")),
-                    "stderr_truncated": bool(row.get("stderr_truncated")),
-                }
+            # Local import keeps the worker MCP import closure unchanged.
+            from .validation_output_distill import distill_tail
+
+            out_text, out_distilled = distill_tail(
+                row.get("stdout_tail"), exit_status=returncode
             )
+            err_text, err_distilled = distill_tail(
+                row.get("stderr_tail"), exit_status=returncode
+            )
+            packet_row: dict[str, Any] = {
+                "declared_command": str(
+                    row.get("declared_command") or row.get("command") or ""
+                )[:MAX_TEXT_CHARS],
+                "executed_argv": [
+                    str(item)[:MAX_TEXT_CHARS]
+                    for item in list(executed)[:MAX_PACKET_COMMANDS]
+                ],
+                "returncode": returncode,
+                "duration_seconds": duration,
+                "stdout_tail": _output_tail(out_text),
+                "stdout_truncated": bool(row.get("stdout_truncated")),
+                "stderr_tail": _output_tail(err_text),
+                "stderr_truncated": bool(row.get("stderr_truncated")),
+            }
+            # ``distilled`` describes a tail; a row with no output has none.
+            if out_text.strip() or err_text.strip():
+                packet_row["distilled"] = out_distilled or err_distilled
+            result.append(packet_row)
         return result
 
     candidate: dict[str, Any] = {"changed_paths": path_rows}

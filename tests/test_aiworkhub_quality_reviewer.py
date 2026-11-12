@@ -439,6 +439,37 @@ def test_validation_output_tails_are_bounded_to_what_the_finalizer_retains():
     assert row["stdout_tail"].endswith("1 failed, 2 passed in 3.01s")
 
 
+def test_pytest_tail_is_distilled_in_the_packet_dropping_passing_noise():
+    noise = "." * 120
+    raw = (
+        "collected 40 items\n"
+        + (noise + "\n") * 20
+        + "=== FAILURES ===\n"
+        + "____ test_wired_failure ____\n\n"
+        + ">       assert 1 == 2\n"
+        + "E       assert 1 == 2\n\n"
+        + "tests/test_wired.py:12: AssertionError\n"
+        + "=== short test summary info ===\n"
+        + "FAILED tests/test_wired.py::test_wired_failure - assert 1 == 2\n"
+        + "=== 1 failed, 39 passed in 0.5s ===\n"
+    )
+    packet = _packet(terminal_validation=[_validation_row(stdout_tail=raw)])
+
+    row = packet["terminal_validation"][0]
+    assert row["distilled"] is True
+    assert "tests/test_wired.py::test_wired_failure" in row["stdout_tail"]
+    assert "tests/test_wired.py:12" in row["stdout_tail"]
+    assert noise not in row["stdout_tail"]
+
+
+def test_unparseable_tail_stays_raw_and_not_distilled_in_the_packet():
+    packet = _packet(terminal_validation=[_validation_row()])
+
+    row = packet["terminal_validation"][0]
+    assert row["distilled"] is False
+    assert row["stderr_tail"] == "Traceback tail"
+
+
 def test_validation_rows_without_tails_or_duration_stay_well_formed():
     """A row from a fixture or an older finalizer is bounded, never rejected."""
     packet = _packet(
