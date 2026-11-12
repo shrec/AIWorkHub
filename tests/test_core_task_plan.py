@@ -98,6 +98,14 @@ def test_task_plan_snapshot_matches_exact_superseded_reviewer_status():
     assert snapshot["critical_path"] == []
 
 
+def test_create_payload_reads_back_card_evidence_for_idempotency():
+    # NF-2026-02241: a same-id create retry compares the stored evidence the way
+    # create_task normalizes the requested one; a card without it reads None.
+    assert core._create_payload_from_card({"evidence": "  measured  "})["evidence"] == "measured"
+    assert core._create_payload_from_card({})["evidence"] is None
+    assert core._create_payload_from_card({"evidence": "   "})["evidence"] is None
+
+
 def test_task_plan_snapshot_uses_one_bounded_card_read(monkeypatch):
     # The plan projection must stay one verified database snapshot regardless of size.
     repo = core.repo_root()

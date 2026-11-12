@@ -4258,7 +4258,7 @@ def create_time_runner_route_warnings(runner: str) -> list[str]:
 
 def _create_payload_from_card(existing_card: Mapping[str, Any]) -> dict[str, Any]:
     """The create-time contract payload an existing card reads back as."""
-    from . import quality_evidence
+    from . import manager_card_amend, quality_evidence
     existing_context = existing_card.get("project_context")
     if not isinstance(existing_context, dict):
         existing_context = {}
@@ -4267,6 +4267,7 @@ def _create_payload_from_card(existing_card: Mapping[str, Any]) -> dict[str, Any
         "runner": str(existing_card.get("runner") or ""),
         "topic": str(existing_card.get("topic") or ""),
         "objective": str(existing_card.get("objective") or ""),
+        "evidence": manager_card_amend.normalize_evidence(existing_card.get("evidence")),
         "acceptance": existing_card.get("acceptance") or [],
         "read_only": existing_card.get("read_only") is True,
         "allowed_writes": existing_card.get("allowed_writes") or [],
@@ -4374,6 +4375,7 @@ def create_task(
     read_roots: list[str] | None = None,
     materialize: list[str] | None = None,
     checkout: str | None = None,
+    evidence: str | None = None,
 ) -> dict[str, Any]:
     """Create one new canonical task card for the verified manager chat.
 
@@ -4474,7 +4476,7 @@ def create_task(
     # accepted and the template create refused -- the same text, two answers,
     # neither of them stating that a second limit existed. The constants now
     # live in exactly one module and both paths read them.
-    from . import task_templates
+    from . import manager_card_amend, task_templates
 
     title_limit = task_templates.MAX_TITLE_LENGTH
     objective_limit = task_templates.MAX_OBJECTIVE_LENGTH
@@ -4512,6 +4514,7 @@ def create_task(
         })
     text_violation("title", title, title_limit)
     text_violation("objective", objective, objective_limit)
+    violations.extend(manager_card_amend.evidence_violations(evidence))
     if priority not in allowed_priorities:
         violations.append({
             "code": "invalid_priority",
@@ -5099,6 +5102,7 @@ def create_task(
         "status": "pending",
         "worker_status": "unclaimed",
         "objective": objective,
+        **manager_card_amend.evidence_card_fields(evidence),
         "origin_thread_id": origin_thread_id,
         "manager_chat_session_id": chat_origin,
         "coordinator_provider": provider,
@@ -5200,6 +5204,7 @@ def create_task(
         "runner": runner,
         "topic": topic,
         "objective": objective,
+        "evidence": manager_card_amend.normalize_evidence(evidence),
         "acceptance": acceptance2,
         "read_only": read_only,
         "allowed_writes": writes2,
@@ -13281,6 +13286,7 @@ def needfix_convert(
     *,
     task_plan: dict[str, Any] | None = None,
     plan_digest: str | None = None,
+    evidence: str | None = None,
 ) -> dict[str, Any]:
     """Explicit conversion using the existing authoritative create_task.
 
@@ -13352,6 +13358,7 @@ def needfix_convert(
             max_live_tokens=card.get("max_live_tokens"),
             skill_task_family=card.get("skill_task_family"),
             custom_template_escape=task_templates.AUDITED_CUSTOM_ESCAPE,
+            evidence=evidence,
         )
 
     def _task_card_builder(needfix_snapshot: dict[str, Any]) -> dict[str, Any]:

@@ -932,6 +932,22 @@ def _manager_correction_shape(
         ):
             return None, "accepted_outcome_receipt_manager_correction_malformed"
         fields = fields | {"manager_evidence"}
+    # NF-2026-02241: the optional, sorted corrected paths an allowed_writes
+    # amendment admitted from OUTSIDE the sealed candidate. Each was patched
+    # against its canonical bytes, so it must not be a sealed path and its
+    # candidate digest is that canonical baseline digest, not a sealed one.
+    amended: set[str] = set()
+    if "amended_paths" in correction:
+        listed = correction["amended_paths"]
+        if (
+            not isinstance(listed, list)
+            or not listed
+            or any(not isinstance(value, str) or not value for value in listed)
+            or listed != sorted(set(listed))
+        ):
+            return None, "accepted_outcome_receipt_manager_correction_malformed"
+        amended = set(listed)
+        fields = fields | {"amended_paths"}
     if set(correction) != fields:
         return None, "accepted_outcome_receipt_manager_correction_malformed"
     paths = correction.get("paths")
@@ -949,6 +965,7 @@ def _manager_correction_shape(
         or not paths
         or any(not isinstance(value, str) or not value for value in paths)
         or paths != sorted(set(paths))
+        or not amended <= set(paths)
         or not isinstance(candidate, dict)
         or not isinstance(corrected, dict)
         or paths != sorted(candidate)
@@ -957,8 +974,14 @@ def _manager_correction_shape(
             not _is_hex_digest(candidate[relative])
             or not _is_hex_digest(corrected[relative])
             or candidate[relative] == corrected[relative]
-            or relative not in sealed_paths
-            or candidate[relative] != sealed_hashes.get(relative)
+            or (
+                relative in sealed_paths
+                if relative in amended
+                else (
+                    relative not in sealed_paths
+                    or candidate[relative] != sealed_hashes.get(relative)
+                )
+            )
             for relative in paths
         )
     ):
@@ -1096,6 +1119,9 @@ def _validate_accepted_outcome_receipt(
     # every comparison below is byte-identical to the pre-NF-2026-01436
     # behaviour.
     expected_hashes: dict[str, Any] = hashes
+    # The promoted set is the sealed set, plus (NF-2026-02241) exactly the
+    # unsealed paths the correction lists in ``amended_paths``.
+    promoted_expected = paths
     if "manager_correction" in optional:
         corrected, correction_error = _manager_correction_shape(
             receipt.get("manager_correction"), paths, hashes
@@ -1103,6 +1129,9 @@ def _validate_accepted_outcome_receipt(
         if corrected is None:
             return None, correction_error
         expected_hashes = {**hashes, **corrected}
+        amended_paths = receipt["manager_correction"].get("amended_paths") or []
+        if amended_paths:
+            promoted_expected = sorted(set(paths) | set(amended_paths))
     if "promotion_merge" in optional:
         # Each merge consumed the sealed-or-corrected bytes and canonical holds
         # what it wrote: sealed + corrected + merged (NF-2026-01518).
@@ -1118,14 +1147,14 @@ def _validate_accepted_outcome_receipt(
         "request_id": request_id,
         "claim_epoch": int(card.get("claim_epoch") or 0),
         "base_oid": str(workspace.get("base_oid") or ""),
-        "promoted_paths": paths,
+        "promoted_paths": promoted_expected,
         "changed_path_hashes": expected_hashes,
         "attempt_artifact_manifest_id": _canonical_json_hash(manifest),
     }
     if any(receipt.get(key) != value for key, value in expected.items()):
         return None, "accepted_outcome_receipt_identity_mismatch"
     canonical_hashes: dict[str, str | None] = {}
-    for relative in paths:
+    for relative in promoted_expected:
         path = repo / relative
         canonical_hashes[relative] = (
             hashlib.sha256(path.read_bytes()).hexdigest()

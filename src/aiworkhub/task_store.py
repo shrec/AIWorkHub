@@ -146,6 +146,9 @@ def is_pristine_pending_card(card: Mapping[str, Any]) -> bool:
         and isinstance(history, list)
         and all(isinstance(entry, dict) and entry.get("event") in {
             "created", "task_created", "reroute_launch_identity",
+            # An add-only contract amendment of a never-launched card
+            # (NF-2026-02241) launches nothing, so the card stays pristine.
+            CARD_AMENDED_PENDING_EVENT,
         } for entry in history)
         and (epoch is None or (type(epoch) is int and epoch == 0))
         and not any(card.get(key) for key in (
@@ -4659,7 +4662,9 @@ _is_bool_safe_int = is_bool_safe_int
 # one identity implementation, and since ``process_launcher`` imports this
 # module (never the reverse), the single home is here.
 TASK_CONTRACT_KEYS = (
-    "task_id", "runner", "topic", "mode", "objective", "read_first",
+    # ``evidence`` (NF-2026-02241) is the manager's bounded supporting text and
+    # follows the objective it supports into the worker's contract and digest.
+    "task_id", "runner", "topic", "mode", "objective", "evidence", "read_first",
     "run_before_writing", "allowed_writes", "acceptance", "validation",
     "forbidden", "review_feedback", "recovery_feedback", "commit_contract",
     "project_context", "required_outputs", "allow_empty_required_outputs",
@@ -6452,6 +6457,204 @@ def _commit_path_amendment(
     })
     card[field] = merged
     card[history_key] = history_list
+
+
+# NF-2026-02241: the card-history event of an add-only amendment of a card no
+# request was ever launched for, and the event of an allowed_writes amendment an
+# accept-time manager correction carried.
+CARD_AMENDED_PENDING_EVENT = "card_amended_pending"
+ALLOWED_WRITES_AMENDED_ON_ACCEPT_EVENT = "allowed_writes_amended_on_accept"
+
+
+def unlaunched_pending_refusal(row: Mapping[str, Any], card: Mapping[str, Any]) -> str:
+    """Why this row is not an unlaunched pending card, else ``""``.
+
+    Typed and ordered from the strongest fact: archived, then claimed (a worker
+    holds it), then any non-pending lifecycle, then a pending card some request
+    was already launched for (``is_pristine_pending_card`` -- the one predicate
+    for "never launched" -- or a recorded ``started_at``).
+    """
+    if str(row.get("archived_at") or "").strip():
+        return "card_archived"
+    worker_status = str(row.get("worker_status") or "").strip().lower()
+    if str(row.get("claimed_by") or "").strip() or worker_status in {"claimed", "in_progress"}:
+        return "card_claimed"
+    state = canonical_status(dict(row))
+    if state != "pending" or str(row.get("status") or "").strip().lower() != "pending":
+        return f"card_not_pending:{state}"
+    if str(row.get("started_at") or "").strip() or not is_pristine_pending_card(card):
+        return "card_already_launched"
+    return ""
+
+
+def _load_card_for_update(
+    conn: sqlite3.Connection, task_id: str
+) -> tuple[sqlite3.Row | None, str, dict[str, Any] | None, str]:
+    """``(row, preimage, card, refusal)`` for one task inside an open transaction."""
+    row = conn.execute(
+        "SELECT status, worker_status, claimed_by, started_at, archived_at, card_json "
+        "FROM tasks WHERE task_id=?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None, "", None, "task_not_found"
+    preimage = str(row["card_json"] or "{}")
+    try:
+        card = json.loads(preimage)
+    except json.JSONDecodeError:
+        return row, preimage, None, "card_json_invalid"
+    if not isinstance(card, dict):
+        return row, preimage, None, "card_json_not_dict"
+    return row, preimage, card, ""
+
+
+def _commit_card_update(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    preimage: str,
+    card: dict[str, Any],
+    event: str,
+    actor: str,
+    payload: Mapping[str, Any],
+    now: str,
+) -> bool:
+    """Compare-and-swap ``card_json`` over its preimage and record ``event``."""
+    cur = conn.execute(
+        "UPDATE tasks SET card_json=?, updated_at=? WHERE task_id=? AND card_json=?",
+        (json.dumps(card, ensure_ascii=False, sort_keys=True), now, task_id, preimage),
+    )
+    if cur.rowcount != 1:
+        conn.rollback()
+        return False
+    conn.execute(
+        "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (task_id, event, actor, json.dumps(dict(payload), sort_keys=True), now),
+    )
+    conn.commit()
+    return True
+
+
+def amend_pending_card(
+    root: str | Path,
+    task_id: str,
+    *,
+    actor: str,
+    allowed_writes: list[str] | None = None,
+    read_first: list[str] | None = None,
+    validation: list[str] | None = None,
+    validation_roles: list[str] | None = None,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Amend one UNLAUNCHED pending card in place (NF-2026-02241).
+
+    ``allowed_writes`` and ``read_first`` are add-only through the same
+    ``apply_*_amendment`` functions reject_review uses; ``validation`` (when
+    given) REPLACES the list through ``apply_validation_amendment_mode`` --
+    including its work_kind role gate -- with ``validation_roles`` aligned.
+    The eligibility check (``unlaunched_pending_refusal``) and the write run in
+    one immediate transaction whose ``card_json`` compare-and-swap enforces
+    it, so a launch that claims the card first makes this refuse instead of
+    widening a running contract. Callers validate path and command shape
+    first; this only decides eligibility and applies. Returns
+    ``(ok, reason, detail)``; ``reason`` is ``amended`` on success.
+    """
+    _readiness, db_path = _require_ready(root)
+    with _write_connection(db_path) as conn:
+        _begin_immediate(conn)
+        row, preimage, card, refusal = _load_card_for_update(conn, task_id)
+        if refusal or row is None or card is None:
+            return False, refusal or "task_not_found", {}
+        refusal = unlaunched_pending_refusal(dict(row), card)
+        if refusal:
+            return False, refusal, {}
+        try:
+            writes_applied = apply_allowed_writes_amendment(
+                card, list(allowed_writes or []), actor=actor, request_id=""
+            )
+            read_first_applied = apply_read_first_amendment(
+                card, list(read_first or []), actor=actor, request_id=""
+            )
+            validation_installed = (
+                apply_validation_amendment_mode(
+                    card, list(validation), mode="replace", roles=validation_roles
+                )
+                if validation
+                else []
+            )
+        except ValueError as exc:
+            return False, str(exc), {}
+        fields = [
+            name
+            for name, applied in (
+                ("allowed_writes", writes_applied),
+                ("read_first", read_first_applied),
+                ("validation", validation_installed),
+            )
+            if applied
+        ]
+        detail: dict[str, Any] = {
+            "fields": fields,
+            "allowed_writes_added": writes_applied,
+            "read_first_added": read_first_applied,
+            "validation": list(card.get("validation") or []),
+        }
+        if not fields:
+            return True, "unchanged", detail
+        now = datetime.now(timezone.utc).isoformat()
+        history = card.get("history")
+        history_list = list(history) if isinstance(history, list) else []
+        history_list.append(
+            {"event": CARD_AMENDED_PENDING_EVENT, "actor": actor, "at": now, "fields": fields}
+        )
+        card["history"] = history_list
+        if not _commit_card_update(
+            conn, task_id, preimage=preimage, card=card, event=CARD_AMENDED_PENDING_EVENT,
+            actor=actor, payload={"fields": fields, "allowed_writes_added": writes_applied,
+                                  "read_first_added": read_first_applied}, now=now,
+        ):
+            return False, "card_changed", {}
+        detail["card_content_sha256"] = card_content_identity(card)
+        return True, "amended", detail
+
+
+def record_allowed_writes_amendment(
+    root: str | Path,
+    task_id: str,
+    paths: list[str],
+    *,
+    actor: str,
+    request_id: str,
+) -> tuple[bool, str, list[str]]:
+    """Add ``paths`` to the card's allowed_writes after an accept (NF-2026-02241).
+
+    The accept-time manager correction already touched and promoted these
+    paths; this records the widened scope on the card, add-only and bound to
+    ``request_id``, under the same ``card_json`` compare-and-swap. It never
+    changes lifecycle state. Returns ``(ok, reason, applied)``.
+    """
+    _readiness, db_path = _require_ready(root)
+    with _write_connection(db_path) as conn:
+        _begin_immediate(conn)
+        _row, preimage, card, refusal = _load_card_for_update(conn, task_id)
+        if refusal or card is None:
+            return False, refusal or "task_not_found", []
+        try:
+            applied = apply_allowed_writes_amendment(
+                card, list(paths), actor=actor, request_id=request_id
+            )
+        except ValueError as exc:
+            return False, str(exc), []
+        if not applied:
+            return True, "unchanged", []
+        now = datetime.now(timezone.utc).isoformat()
+        if not _commit_card_update(
+            conn, task_id, preimage=preimage, card=card,
+            event=ALLOWED_WRITES_AMENDED_ON_ACCEPT_EVENT, actor=actor,
+            payload={"paths": applied, "request_id": request_id}, now=now,
+        ):
+            return False, "card_changed", []
+        return True, "amended", applied
 
 
 def _candidate_path_in_scope(path: object, allowed_writes: Sequence[object]) -> bool:

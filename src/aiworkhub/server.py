@@ -835,6 +835,7 @@ from . import dependency_autolaunch
 from . import quality_evidence
 from . import quality_calibration
 from . import mcp_summary_folds
+from . import manager_card_amend
 from . import validation_failed_packet
 from . import repo_policy
 from . import shared_router
@@ -1085,6 +1086,21 @@ def _envelope_card(result: Any) -> dict[str, Any] | None:
 def _card_identity(card: Mapping[str, Any]) -> dict[str, Any]:
     canonical = json.dumps(card, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return {"card_sha256": hashlib.sha256(canonical).hexdigest(), "card_bytes": len(canonical)}
+
+
+def _card_review_state(card: Mapping[str, Any]) -> dict[str, Any]:
+    """``reject_count``/``reject_cap``/``required_reviewer_lenses`` (NF-2026-02241).
+
+    The process manager is resolved only when the card names a review request
+    whose required lenses need the reviewer ledger.
+    """
+    try:
+        repo: Any = core.repo_root()
+    except Exception:  # noqa: BLE001 -- reported as unavailable, never as zero
+        repo = None
+    return manager_card_amend.review_state_fields(
+        card, repo=repo, manager=process_launcher.default_manager
+    )
 
 
 def _card_view(card: Mapping[str, Any], include_card: str) -> dict[str, Any] | None:
@@ -4076,6 +4092,13 @@ def aiworkhub_task_create(
         "checkout_invalid:unknown_value:<value>. Omit for sparse.",
         ["full"],
     )] = None,
+    evidence: typing.Annotated[str | None, _task_create_hint(
+        "Optional supporting evidence for the worker (measurements, logs, reproduction "
+        "notes), up to 16000 characters after stripping; tab/newline are kept, other control "
+        "characters are refused. Stored on the card and placed in the worker's task contract "
+        "after the objective. The objective keeps its own limit. Omit for none.",
+        ["pytest tests/test_export.py::test_retry fails: TimeoutError after 1 attempt"],
+    )] = None,
 ) -> dict[str, Any]:
     """MANAGER WRITE: create one new canonical repo-local task card.
 
@@ -4213,8 +4236,62 @@ def aiworkhub_task_create(
         **({"read_roots": read_roots} if read_roots is not None else {}),
         **({"materialize": materialize} if materialize is not None else {}),
         **({"checkout": checkout} if checkout is not None else {}),
+        **({"evidence": evidence} if evidence is not None else {}),
     )
     return _task_create_receipt(created, echo_card=echo_card)
+
+
+@mcp.tool()
+@_serialize_task_lifecycle_write
+def aiworkhub_task_amend_pending(
+    task_id: str,
+    allowed_writes: list[str] | None = None,
+    read_first: list[str] | None = None,
+    validation: list[str] | None = None,
+    validation_roles: list[str] | None = None,
+) -> dict[str, Any]:
+    """MANAGER WRITE: amend a pending card that no request was ever launched for.
+
+    Use this to widen a card's scope or fix its validation before its first
+    launch, instead of archiving and re-creating it. ``allowed_writes`` and
+    ``read_first`` are ADD-ONLY (deduplicated; the existing entries stay);
+    ``validation`` REPLACES the whole list, with ``validation_roles`` aligned
+    one-to-one (omitted roles default to generic, which a bugfix/refactor/...
+    card's work_kind role gate refuses exactly as task_create does). Paths and
+    commands obey the same rules as task_create and reject_review's
+    amendments, with the same refusal codes.
+
+    Only a never-launched pending card qualifies: a launched, claimed,
+    archived or non-pending card is refused with
+    ``task_amend_pending_refused:<card_already_launched|card_claimed|
+    card_archived|card_not_pending:<state>|task_not_found>``. The amendment is
+    recorded as a ``card_amended_pending`` event in the card history (the card
+    stays launchable) and the reply carries the new ``card_sha256``.
+
+    Args:
+        task_id: Id of the pending, never-launched card to amend.
+        allowed_writes: Repo-relative paths or globs to ADD to allowed_writes; omit to leave them.
+        read_first: Existing repo files (optional :N or :N-M suffix) to ADD to read_first; omit to leave them.
+        validation: Shell-free commands that REPLACE the card's validation list; omit to keep it.
+        validation_roles: One role per validation command; only with validation. Omit for generic roles.
+    """
+    result = manager_card_amend.amend_pending(
+        task_id,
+        allowed_writes=allowed_writes,
+        read_first=read_first,
+        validation=validation,
+        validation_roles=validation_roles,
+    )
+    if isinstance(result, dict) and result.get("ok"):
+        # Best effort: the amendment already committed, so an unreadable
+        # re-read reports no digest rather than failing a landed write.
+        try:
+            card = task_store.get_task(core.repo_root(), str(task_id).strip())
+        except Exception:  # noqa: BLE001
+            card = None
+        if isinstance(card, dict):
+            result.update(_card_identity(card))
+    return result
 
 
 @mcp.tool()
@@ -4744,6 +4821,8 @@ def aiworkhub_task_show(
         return result
     identity = _card_identity(card)
     findings = _review_findings_count(card)
+    # NF-2026-02241: from the unfolded card, before any render folds it.
+    review_state = _card_review_state(card)
     packet = None
     if detail in ("summary", "brief"):
         packet = validation_failed_packet.build_packet(card, repo_root=core.repo_root())
@@ -4762,6 +4841,7 @@ def aiworkhub_task_show(
         rendered["stdout"] = json.dumps(card, ensure_ascii=False, default=str, separators=(",", ":"))
         rendered["detail"] = detail
     rendered.update(identity)
+    rendered.update(review_state)
     if findings is not None:
         rendered["review_findings_count"] = findings
     requests = {
@@ -7283,6 +7363,11 @@ def aiworkhub_agent_task_status(
         folded["review_findings_count"] = findings
     if detail == "brief":
         folded = mcp_summary_folds.brief_status_reply(folded)
+        raw_card = result.get("task_card")
+        if isinstance(raw_card, dict):
+            # NF-2026-02241: reject depth and per-lens reviewer state, derived
+            # as accept_review derives them, after the brief fold keeps them.
+            folded.update(_card_review_state(raw_card))
     folded["detail"] = detail
     requests = {
         "evidence": {"tool": "aiworkhub_agent_task_status", "request_id": request_id, "detail": "evidence"},
@@ -7595,6 +7680,15 @@ def aiworkhub_agent_accept_review(
     declared validations and the mechanical gate then run on the CORRECTED
     bytes, those are the bytes promoted, and the accepted-outcome receipt binds
     the patch digest with the candidate and corrected hashes.
+    An optional ``"allowed_writes_amendment": [<repo-relative path>, ...]``
+    (NF-2026-02241) lets the patch also touch those exact paths -- e.g. a
+    neighbour test the accept revalidation showed red. Every amended path must
+    be touched by the patch and obey the allowed_writes path rules
+    (``allowed_writes_amendment_*`` refusals otherwise); a path outside the
+    candidate is patched against its canonical bytes and promoted with it.
+    After the accept lands the paths are added to the card's allowed_writes,
+    add-only, and the reply names them under ``allowed_writes_amendment``.
+    Without the key a path outside allowed_writes is refused as before.
 
     A successful reply is the receipt (``aiworkhub.accept_review_receipt.v1``):
     promoted_paths, reviewer_finalization, acceptance_evidence_record,
@@ -7627,7 +7721,7 @@ def aiworkhub_agent_accept_review(
         reviewer_reports: Optional reviewer report objects; normally omitted because acceptance verifies reviewer receipts by request id (see reviewer_request_ids).
         reviewer_request_ids: Reviewer request ids to verify; omit to use every verified reviewer bound to this request and task, and pass [] to exclude all reviewers.
         confirm_high_risk: Set true to give the explicit human approval that high or critical risk tiers require; default false.
-        manager_correction: Accept the sealed candidate plus a manager patch: {"patch": <unified diff>, "finding_ids": ["reviewer:<lens>:<id>", ...], "reason": str}; omit for a plain accept.
+        manager_correction: Accept the sealed candidate plus a manager patch: {"patch": <unified diff>, "finding_ids": ["reviewer:<lens>:<id>", ...], "reason": str, "allowed_writes_amendment": [<exact repo-relative path>, ...] (optional; each must be touched by the patch and is added to the card's allowed_writes once the accept lands)}; omit for a plain accept.
         include_card: none (default), summary or full; adds that view of the finalized card to the reply.
         lesson_candidate: Lesson text to commit for this decision in the same call, after the accept lands; omit to commit the lesson separately.
         promote_ai_memory: Set true together with lesson_candidate to also promote the lesson to AI memory; refused without a lesson. Default false.
@@ -9212,12 +9306,15 @@ def needfix_preview_convert(
 
     Args:
         needfix_id: NeedFix id, e.g. NF-2026-01447.
-        task_plan: Task card fields that override the scope-derived default; a writable card needs required_outputs. Omitted runner/topic are filled from aiworkhub_manager_workforce_rank top-1 (reply filled_from), an acceptance string becomes a one-item list, and stray action/task_id keys are dropped with a warning; every change is listed under plan_normalizations and plan_digest binds the normalized plan. Other unknown fields are refused.
+        task_plan: Task card fields that override the scope-derived default; a writable card needs required_outputs. Omitted runner/topic are filled from aiworkhub_manager_workforce_rank top-1 (reply filled_from), an acceptance string becomes a one-item list, and stray action/task_id keys are dropped with a warning; every change is listed under plan_normalizations and plan_digest binds the normalized plan. Other unknown fields are refused. An optional evidence string (up to 16000 characters) is carried onto the created card; it is not part of plan_digest and a digest-only convert reuses the evidence this preview held.
         include_plan: Return the signed plan body verbatim instead of a summary of its identity and counts; default false.
     """
+    task_plan, evidence = manager_card_amend.split_plan_evidence(task_plan)
     plan, normalizations, filled_from = _normalize_needfix_task_plan(needfix_id, task_plan)
     reply = _needfix_plan_receipt(
-        core.needfix_preview_convert(needfix_id, task_plan=plan),
+        manager_card_amend.bind_preview_evidence(
+            core.needfix_preview_convert(needfix_id, task_plan=plan), evidence
+        ),
         include_plan=bool(include_plan),
         tool="needfix_preview_convert",
     )
@@ -9256,16 +9353,26 @@ def needfix_convert(
         plan_digest: plan_digest from the matching needfix_preview_convert; optional when task_plan is given. A digest this server no longer holds is refused.
         include_plan: Return the plan body verbatim instead of a summary of its identity and counts; default false.
     """
+    # NF-2026-02241: ``evidence`` is a card field, not a NeedFix plan field, so
+    # it is split off before the plan is normalized and signed.
+    task_plan, evidence = manager_card_amend.split_plan_evidence(task_plan)
     # NF-2026-01920: a resent task_plan is normalized exactly as the preview
     # normalized it, so the digest the preview returned still binds.
     plan, normalizations, filled_from = _normalize_needfix_task_plan(needfix_id, task_plan)
     if task_plan and not plan_digest:
         return _needfix_one_call_convert(
-            needfix_id, plan, normalizations, filled_from, include_plan=bool(include_plan)
+            needfix_id, plan, normalizations, filled_from, include_plan=bool(include_plan),
+            evidence=evidence,
         )
+    evidence, evidence_refusal = manager_card_amend.convert_evidence_or_refusal(
+        evidence, plan_digest
+    )
+    if evidence_refusal is not None:
+        return evidence_refusal
     return _needfix_plan_receipt(
         core.needfix_convert(
-            needfix_id, task_plan=plan, plan_digest=plan_digest
+            needfix_id, task_plan=plan, plan_digest=plan_digest,
+            **({"evidence": evidence} if evidence is not None else {}),
         ),
         include_plan=bool(include_plan),
         tool="needfix_convert",
@@ -9279,6 +9386,7 @@ def _needfix_one_call_convert(
     filled_from: dict[str, str],
     *,
     include_plan: bool,
+    evidence: Any = None,
 ) -> dict:
     """Preview a task_plan and commit it with that preview's digest in one call.
 
@@ -9307,6 +9415,7 @@ def _needfix_one_call_convert(
         needfix_store.promote_for_scoped_convert(core.repo_root(), needfix_id, plan)
         promoted = True
         preview = core.needfix_preview_convert(needfix_id, task_plan=plan)
+    preview = manager_card_amend.bind_preview_evidence(preview, evidence)
     digest = preview.get("plan_digest")
     if not digest or not preview.get("convertible") or preview.get("refusal_reason"):
         reply = dict(
@@ -9314,7 +9423,10 @@ def _needfix_one_call_convert(
         )
         reply["committed"] = False
     else:
-        reply = dict(core.needfix_convert(needfix_id, task_plan=plan, plan_digest=str(digest)))
+        reply = dict(core.needfix_convert(
+            needfix_id, task_plan=plan, plan_digest=str(digest),
+            **({"evidence": evidence} if evidence is not None else {}),
+        ))
         reply["plan_digest"] = digest
         reply["committed"] = True
         reply = dict(

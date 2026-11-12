@@ -884,8 +884,11 @@ def _selected_reviewer_rows(
 MANAGER_CORRECTION_SCHEMA_ID = "aiworkhub.manager_correction.v1"
 
 # The only fields a correction may carry; anything else refuses by name rather
-# than being silently dropped.
-MANAGER_CORRECTION_FIELDS = frozenset({"patch", "finding_ids", "reason"})
+# than being silently dropped. ``allowed_writes_amendment`` (NF-2026-02241) is
+# optional: exact paths the patch may touch beyond the card's allowed_writes.
+MANAGER_CORRECTION_FIELDS = frozenset(
+    {"patch", "finding_ids", "reason", "allowed_writes_amendment"}
+)
 
 # NF-2026-01845: a ``validation_failed`` candidate has no reviewer findings, so
 # a correction names the declared-validation row it repairs as
@@ -1248,6 +1251,15 @@ def validate_manager_correction(
     actor, identity_reason = _verified_manager_identity(self, core, path_cls)
     if identity_reason:
         return None, {}, identity_reason
+    from . import manager_card_amend
+
+    amended, amendment_reason = manager_card_amend.correction_allowed_writes_amendment(
+        correction.get("allowed_writes_amendment"),
+        card=card,
+        root=getattr(self, "repo", None),
+    )
+    if amendment_reason:
+        return None, {}, amendment_reason
 
     # The findings in play are the ``defect`` and ``observation`` findings on the
     # SELECTED, usable reviewers' already-sealed receipts (``_refinement_blockers``
@@ -1350,6 +1362,9 @@ def validate_manager_correction(
     allowed = [
         value for value in (card.get("allowed_writes") or []) if isinstance(value, str)
     ]
+    # NF-2026-02241: the amended exact paths join the scope for THIS patch.
+    allowed.extend(amended)
+    amended_set = set(amended)
     in_candidate = set(changed)
     candidate_bytes: dict[str, bytes] = {}
 
@@ -1366,10 +1381,16 @@ def validate_manager_correction(
             )
         # A path the sealed candidate never changed is not in ``changed``, so it
         # would be corrected in the accept tree and then never promoted or
-        # hash-verified. Refuse rather than promote half a correction.
-        if relative not in in_candidate:
+        # hash-verified. Refuse rather than promote half a correction, unless
+        # the correction amends it in by exact path (NF-2026-02241): accept_review
+        # then adds it to the promoted set, and its preimage is the CANONICAL
+        # file that promotion will replace.
+        outside_candidate = relative not in in_candidate
+        if outside_candidate and relative not in amended_set:
             raise ManagerCorrectionError(f"path_not_in_candidate:{relative}"[:200])
-        source = workspace.path / relative
+        source = (
+            Path(str(self.repo)) / relative if outside_candidate else workspace.path / relative
+        )
         if source.is_symlink() or not source.is_file():
             raise ManagerCorrectionError(f"patch_target_missing:{relative}"[:200])
         if source.stat().st_size > MAX_MANAGER_CORRECTION_TARGET_BYTES:
@@ -1394,6 +1415,11 @@ def validate_manager_correction(
         corrected_texts = corrected_candidate_texts(patch, _read_candidate)
     except ManagerCorrectionError as exc:
         return None, {}, str(exc)[:200]
+    # Every amended path must be one this patch actually corrects: the
+    # amendment widens scope for the patch, never for anything else.
+    untouched = [relative for relative in amended if relative not in corrected_texts]
+    if untouched:
+        return None, {}, f"allowed_writes_amendment_path_untouched:{untouched[0]}"[:200]
 
     paths = sorted(corrected_texts)
     candidate_hashes: dict[str, str] = {}
@@ -1423,6 +1449,21 @@ def validate_manager_correction(
         )
         if not named_rows:
             record["correction_origin"] = MANAGER_GATE_EVIDENCE_ORIGIN
+    if amended:
+        # NF-2026-02241: the widened scope travels with the validated record
+        # (the reply and the card history name it); the receipt identity still
+        # binds every corrected path, amended or not, by its digests.
+        record["allowed_writes_amendment"] = list(amended)
+        outside = sorted(relative for relative in paths if relative not in in_candidate)
+        if outside:
+            from . import manager_card_amend
+
+            record["paths_outside_candidate"] = outside
+            # The canonical bytes each outside path was patched against, so the
+            # accept tree re-checks them before seeding and promoting.
+            record[manager_card_amend.CANONICAL_PREIMAGE_KEY] = {
+                relative: candidate_hashes[relative] for relative in outside
+            }
     return record, corrected_texts, ""
 
 
@@ -1439,11 +1480,19 @@ def _restore_correction_originals(
     not be restored are returned (empty list means all restored).
     """
     failed: list[str] = []
+    is_seeded = getattr(originals, "is_seeded", None)
     for relative, original in originals.items():
+        target = workspace.path / relative
+        if is_seeded is not None and is_seeded(target):
+            # NF-2026-02241: seeded only for the correction; removed below.
+            continue
         try:
-            (workspace.path / relative).write_bytes(original)
+            target.write_bytes(original)
         except OSError:
             failed.append(relative)
+    remove_seeded = getattr(originals, "remove_seeded", None)
+    if remove_seeded is not None:
+        failed.extend(remove_seeded(workspace.path))
     return failed
 
 
@@ -3778,7 +3827,11 @@ def accept_review(
         # the retained worktree (NF-2026-01469). Declared here, outside the
         # try, so every except handler can read it regardless of where in
         # the try an exception was raised.
-        correction_originals: dict[str, bytes] = {}
+        # NF-2026-02241: it also records what amended-path seeding created, so
+        # the same restore removes those files and directories.
+        from . import manager_card_amend
+
+        correction_originals = manager_card_amend.CorrectionOriginals()
         try:
             changed = enforce_scope(
                 workspace,
@@ -3941,6 +3994,11 @@ def accept_review(
                         "task_id": task_id,
                         "promoted_paths": [],
                     }
+                # NF-2026-02241: a path the correction amended in by exact path
+                # is promoted, hashed and receipted like every changed path.
+                for relative in correction_record.get("paths_outside_candidate") or ():
+                    if relative not in changed:
+                        changed.append(relative)
             accept_fold = fold_accept_blockers(
                 reviewers=reviewers,
                 reviewer_request_ids=reviewer_request_ids,
@@ -4006,6 +4064,26 @@ def accept_review(
             # CORRECTED candidate, and the bytes promoted below are the bytes
             # that passed. A refusal on any earlier line left the tree alone.
             if correction_record is not None:
+                # NF-2026-02241: amended non-candidate paths enter promotion
+                # scope with their canonical bytes as the parent baseline.
+                from . import manager_card_amend
+
+                try:
+                    workspace = manager_card_amend.widen_workspace_for_correction(
+                        workspace,
+                        correction_record,
+                        self.repo,
+                        seeded=correction_originals.created,
+                    )
+                except manager_card_amend.AmendedPathRefused as exc:
+                    # Nothing was seeded or corrected yet: refuse by name.
+                    return {
+                        "ok": False,
+                        "error": str(exc)[:500],
+                        "request_id": request_id,
+                        "task_id": task_id,
+                        "promoted_paths": [],
+                    }
                 for relative in correction_record["paths"]:
                     target_path = workspace.path / relative
                     correction_originals[relative] = target_path.read_bytes()
@@ -4697,6 +4775,17 @@ def accept_review(
                     else {}
                 ),
             )
+            # NF-2026-02241: corrected paths admitted by an allowed_writes
+            # amendment were never sealed, so the receipt names them
+            # (``manager_correction.amended_paths``); without one it is unchanged.
+            if correction_record is not None and correction_record.get(
+                "paths_outside_candidate"
+            ):
+                from . import manager_card_amend
+
+                accepted_outcome_receipt = manager_card_amend.receipt_with_amended_paths(
+                    accepted_outcome_receipt, correction_record
+                )
         except (OSError, TypeError, ValueError, WorkspaceError) as exc:
             # Canonical keeps the promoted bytes (no rollback), but the retained
             # worktree must not keep CORRECTED bytes, or the next review trips
@@ -4766,6 +4855,14 @@ def accept_review(
                 "task_id": task_id,
                 "promoted_paths": promoted,
             }
+
+        # NF-2026-02241: a correction's allowed_writes amendment lands on the
+        # card only now, add-only, so a refused accept amends nothing.
+        from . import manager_card_amend
+
+        allowed_writes_amendment = manager_card_amend.record_accept_amendment(
+            self.repo, task_id=task_id, request_id=request_id, record=correction_record
+        )
 
         # NF-2026-01828: only AFTER the accept landed, so a refused or failed
         # accept records nothing. The accept is never undone by a failure here.
@@ -4908,6 +5005,13 @@ def accept_review(
             **(
                 {"stale_input_rebased": stale_input_rebased}
                 if stale_input_rebased
+                else {}
+            ),
+            # The correction's recorded allowed_writes amendment (NF-2026-02241);
+            # absent when the correction named none.
+            **(
+                {"allowed_writes_amendment": allowed_writes_amendment}
+                if allowed_writes_amendment is not None
                 else {}
             ),
         }

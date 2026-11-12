@@ -1119,6 +1119,32 @@ def test_validate_accepted_outcome_receipt_accepts_a_well_formed_correction(
             "accepted_outcome_receipt_manager_correction_malformed",
             id="patch_digest_is_not_a_digest",
         ),
+        # NF-2026-02241: ``amended_paths`` admits only UNSEALED corrected paths.
+        pytest.param(
+            lambda correction: {**correction, "amended_paths": [TARGET]},
+            "accepted_outcome_receipt_manager_correction_malformed",
+            id="amended_path_is_a_sealed_path",
+        ),
+        pytest.param(
+            lambda correction: {
+                **correction,
+                "paths": sorted([TARGET, "tests/amended_a.py", "tests/amended_b.py"]),
+                "candidate_path_hashes": {
+                    **correction["candidate_path_hashes"],
+                    "tests/amended_a.py": "a" * 64,
+                    "tests/amended_b.py": "b" * 64,
+                },
+                "corrected_path_hashes": {
+                    **correction["corrected_path_hashes"],
+                    "tests/amended_a.py": "c" * 64,
+                    "tests/amended_b.py": "d" * 64,
+                },
+                # ``tests/amended_b.py`` is unsealed yet not listed.
+                "amended_paths": ["tests/amended_a.py"],
+            },
+            "accepted_outcome_receipt_manager_correction_malformed",
+            id="unsealed_path_missing_from_amended_paths",
+        ),
     ],
 )
 def test_validate_accepted_outcome_receipt_refuses_a_malformed_correction(
