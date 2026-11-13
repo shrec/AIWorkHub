@@ -168,10 +168,10 @@ inherit the manager's launch capability.
 - Linux, macOS, native Windows, WSL and Remote-SSH are supported; Linux is the
   canonical development and validation host.
 
-## What's new in 0.12.97
+## What's new in 0.12.98
 
-- Finished NeedFix records leave the active list: a manager-verified fix resolves in one call from any open status with its evidence inline, and the staleness sweep checks every open record, not only new ones.
-- A card that names an active NeedFix in its title or objective must declare it on a `Resolves:` or `Refs:` line, so work that fixes a record can no longer bypass the ledger.
+- Workers see only what a card allows: Linux read roots through Landlock, a `deny_read` glob list enforced on Landlock and Windows AppContainer, an optional one-time `workspace_prepare` hook per worktree, and a visibility receipt in the review packet.
+- A hub host validation stage runs a card's host commands and test sweep on a full candidate tree in the background before accept, and the manager can amend a pending card or accept with a small correction of confirmed findings.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Documentation

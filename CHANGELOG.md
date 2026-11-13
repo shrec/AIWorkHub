@@ -6,6 +6,32 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.98] - 2026-11-13
+
+### Added
+
+- Linux workers get declared read roots through Landlock (read-only rules on the worker and validation rulesets), a card `deny_read` glob list that is enforced mechanically on both Landlock and Windows AppContainer, an optional repository `workspace_prepare` hook that runs once per worktree outside the worker sandbox, and a `sandbox_visibility` receipt in the review packet (NF-2026-02238).
+- Cards can materialize extra paths by glob, or ask for a full checkout, for the worker, validation and reproduction trees (NF-2026-02237).
+- Source Graph extracts Dart structure lexically: classes, mixins, extensions, enums, functions and imports.
+- NeedFix rows carry a work state with a per-state count breakdown, the dashboard list groups and filters by it, and a "likely fixed" detector lists open rows whose scope files changed after they were filed.
+- The cost ledger prices the manager seat's Claude Code session usage and adds it to the grand total.
+- Manager tools: amend a pending card before it is launched, and accept a reviewed candidate together with a small manager correction of confirmed findings (NF-2026-02241).
+- A hub host validation stage runs a card's `host_commands` and `host_sweep` shards on a full candidate tree in the background before accept, joins declared generated files back into the sealed candidate, queues CPU-heavy work through a FIFO resource, and reports the result in the review packet (NF-2026-02240).
+
+### Changed
+
+- Review packets carry a deterministic distillation of each validation output (final counts, failing node ids, repository frames and assertion lines), falling back to the raw tail whenever the digest cannot account for the summary.
+- Accept-time neighbour tests use the test-impact selector when its map is fresh; the selector now covers fixtures, conftest files, data files, deleted lines and new test files.
+- A capped-continuation successor card carries its predecessor's last reject reason, and a quality-reviewer relaunch reuses the existing pending reviewer card.
+- The GitHub README and the extension README describe the current product (NF-2026-02242).
+
+### Fixed
+
+- The Linux Landlock worker can create multiprocessing semaphores (`/dev/shm` rule) (NF-2026-02239).
+- VS Code LM forced staging corrects an invalid-JSON reply instead of failing the run (NF-2026-02233).
+- `claude_cli` launch survives a slow `claude auth status` probe; manager identity stamping uses a cheap storage readiness read.
+- The toolchain version probe runs inside the repository temp root (NF-2026-02044), and the release cut's WSL tree is a git repository before its tests run.
+
 ## [0.12.97] - 2026-11-11
 
 ### Changed

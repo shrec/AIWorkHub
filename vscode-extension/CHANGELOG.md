@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.12.98 — 2026-11-13
+
+### Fixed
+
+- Bundles runtime 0.12.98: Linux Landlock read roots and an enforced `deny_read` list for workers, a background hub host validation stage before accept, card materialize globs, manager amend/correction tools, and the README rewrite.
+
 ## 0.12.97 — 2026-11-11
 
 ### Fixed
