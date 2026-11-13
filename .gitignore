@@ -38,7 +38,6 @@ node_modules/
 !.aiworkhub/config/policy.json
 !.aiworkhub/config/sdlc_bands.json
 !.aiworkhub/config/source_graph.json
-!.aiworkhub/config/workforce.json
 !.aiworkhub/kb/
 .aiworkhub/kb/*
 !.aiworkhub/kb/knowledge.sqlite
@@ -60,7 +59,6 @@ node_modules/
 !.aiworkhub/release-evidence.json
 !.aiworkhub/release-residual-risks.json
 !.aiworkhub/release-route-parity.json
-!.aiworkhub/releases.jsonl
 
 # Local coordinator handoffs, dated audits, and review scratch reports.
 /AUTONOMOUS_SESSION_SUMMARY.md
