@@ -1549,6 +1549,29 @@ class TestSemLockCapability:
         )
         assert "auth_forbidden" not in classified["diagnostic"]
 
+    def test_denied_probe_on_worker_lane_is_unsupported_never_grant(self) -> None:
+        # Pure decision test: the probe result is supplied explicitly, so the
+        # outcome does not depend on the host kernel or a real child process.
+        probe = {
+            "schema": validation_runner.SEMLOCK_PROBE_SCHEMA,
+            "supported": False,
+            "primitive": validation_runner.SEMLOCK_PRIMITIVE,
+            "backend": "posix_shm",
+        }
+        decision = validation_runner.preflight_semlock_capability(
+            ["python -m pytest tests/test_x.py"],
+            backend="landlock",
+            probe={**probe, "supported": False, "backend": "posix_shm"},
+            source_text=lambda rel: "import multiprocessing as mp\nmp.get_context().Lock()\n",
+            dev_shm_rule=True,
+        )
+        assert decision.action == "unsupported"
+        assert decision.action != "grant"
+        assert decision.evidence == (
+            f"{validation_runner.VALIDATION_UNSUPPORTED_IN_SANDBOX}:"
+            f"{validation_runner.SEMLOCK_PRIMITIVE}:posix_shm"
+        )
+
     def test_grant_retains_candidate_pass_fail(self) -> None:
         probe = {
             "schema": validation_runner.SEMLOCK_PROBE_SCHEMA,
