@@ -27,6 +27,7 @@ path the map records stale sends the decision to the structural lane.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -68,6 +69,57 @@ INVARIANT_TESTS = ("tests/test_module_size_ratchet.py", "tests/test_os_dependenc
 # A change to either pins the gate file outside the neighbour cap.
 CONTRACT_GATE_TEST = "tests/test_mcp_contract_gates.py"
 CONTRACT_GATE_MODULES = ("src/aiworkhub/mcp_tool_metadata.py", "src/aiworkhub/server.py")
+# NF-2026-02245: the 0.12.98 wave accepted many cards clean and the release-cut full
+# suite then found 51 failures, because the selection above only follows the changed
+# module's importers and repository-wide contract tests never ran at accept. This
+# static table is the always-run contract tier: when a rule's trigger matches, its
+# tests run outside the neighbour cap, each with a ``contract_tier:<rule>:<path>``
+# reason. A rule test missing on disk is skipped and named, never a selection failure.
+CONTRACT_TIER_PREFIX = "contract_tier"
+TIER_TRIGGER_CHANGED = "changed"  # one of ``paths`` is a changed path
+TIER_TRIGGER_NEW_RELATIVE_IMPORT = "new_relative_import"  # ``paths`` gained a relative import
+TIER_TRIGGER_ADDED_TEST = "added_test"  # a changed tests/**.py file the repo root lacks
+
+
+@dataclass(frozen=True)
+class ContractTierRule:
+    """One always-run contract rule: a trigger over ``paths`` selects ``tests``."""
+
+    rule: str
+    trigger: str
+    paths: tuple[str, ...]
+    tests: tuple[str, ...]
+
+
+CONTRACT_TIER_RULES: tuple[ContractTierRule, ...] = (
+    ContractTierRule(
+        "tool_surface",
+        TIER_TRIGGER_CHANGED,
+        CONTRACT_GATE_MODULES,
+        ("tests/test_mcp_tool_metadata_tdqs.py", "tests/test_stdio_tools_list_parity_nf01642.py"),
+    ),
+    ContractTierRule(
+        "readme",
+        TIER_TRIGGER_CHANGED,
+        ("README.md", "vscode-extension/README.md"),
+        ("tests/test_public_docs.py", "tests/test_release_metadata.py"),
+    ),
+    ContractTierRule(
+        "worker_workspace_import",
+        TIER_TRIGGER_NEW_RELATIVE_IMPORT,
+        ("src/aiworkhub/worker_workspace.py",),
+        ("tests/test_worker_workspace.py",),
+    ),
+    ContractTierRule(
+        "host_path_guard",
+        TIER_TRIGGER_ADDED_TEST,
+        (),
+        ("tests/test_no_host_paths_in_tracked_files_nf01061.py",),
+    ),
+)
+# A module larger than this is not parsed for its relative imports; the rule then
+# treats the import set as unknown and selects its tests (fail closed).
+TIER_IMPORT_SCAN_MAX_BYTES = 4 * 1024 * 1024
 # NF-2026-01947: a test that loads a changed module by path ("<stem>.py") has no
 # testmap import edge, and a NAME_MAX_LINES ratchet on a module with many related
 # tests can rank below the neighbour cap. Both run whenever their module changed,
@@ -138,10 +190,20 @@ class NeighbourSelection:
     # NF-2026-02220: LANE_IMPACT_MAP or LANE_STRUCTURAL, and why that lane decided.
     lane: str = ""
     lane_reason: str = ""
+    # NF-2026-02245: the contract-tier tests added, each row {"test", "reason"}; the
+    # rule tests missing on disk, each row {"test", "reason"}; or why the tier failed.
+    contract_tier: tuple[str, ...] = ()
+    contract_tier_reasons: tuple[Mapping[str, str], ...] = field(default=())
+    contract_tier_skipped: tuple[Mapping[str, str], ...] = field(default=())
+    contract_tier_reason: str = ""
 
     def evidence(self) -> dict[str, Any]:
         ranked = (
-            len(self.tests) - len(self.invariant) - len(self.contract_gate) - len(self.referencing)
+            len(self.tests)
+            - len(self.invariant)
+            - len(self.contract_gate)
+            - len(self.contract_tier)
+            - len(self.referencing)
         )
         record: dict[str, Any] = {
             "selected": list(self.tests),
@@ -156,6 +218,13 @@ class NeighbourSelection:
             record["contract_gate"] = list(self.contract_gate)
         if self.contract_gate_reason:
             record["contract_gate_reason"] = self.contract_gate_reason
+        if self.contract_tier:
+            record["contract_tier"] = list(self.contract_tier)
+            record["contract_tier_reasons"] = [dict(row) for row in self.contract_tier_reasons]
+        if self.contract_tier_skipped:
+            record["contract_tier_skipped"] = [dict(row) for row in self.contract_tier_skipped]
+        if self.contract_tier_reason:
+            record["contract_tier_reason"] = self.contract_tier_reason
         if self.referencing or self.referencing_omitted:
             record["referencing"] = list(self.referencing)
             record["referencing_omitted"] = self.referencing_omitted
@@ -250,6 +319,13 @@ def select_neighbour_tests(
     except Exception as exc:  # a failed pin is named in the evidence, never silently absent
         failed = f"contract_gate_failed:{type(exc).__name__}"
         selection = replace(selection, contract_gate_reason=failed)
+    try:
+        selection = _with_contract_tier(
+            Path(repo_root), selection, changed_paths, declared_commands, candidate_root
+        )
+    except Exception as exc:  # NF-2026-02245: a failed tier is named, never silently absent
+        failed = f"{CONTRACT_TIER_PREFIX}_failed:{type(exc).__name__}"
+        selection = replace(selection, contract_tier_reason=failed)
     try:
         return _with_referencing(Path(repo_root), selection, changed_paths, declared_commands)
     except Exception as exc:  # nor the referencing scan: it names its failure and adds nothing
@@ -491,6 +567,146 @@ def _with_contract_gates(
         related_count=max(0, selection.related_count - folded),
         node_count=max(0, node_count),
     )
+
+
+def _with_contract_tier(
+    root: Path,
+    selection: NeighbourSelection,
+    changed_paths: Iterable[Any],
+    declared_commands: Sequence[str],
+    candidate_root: Path | str | None,
+) -> NeighbourSelection:
+    """NF-2026-02245: append the contract-tier tests a changed path triggers.
+
+    ``CONTRACT_TIER_RULES`` is read in table order; each rule test is added at most
+    once, outside the neighbour cap, with the reason of the first rule that selected
+    it. A test the declared validation names or the selection already holds as a
+    whole file is not run twice, and ranked node ids of an added test fold into the
+    whole file. A rule test missing from ``root`` is named in
+    ``contract_tier_skipped`` and adds nothing.
+    """
+    if selection.limit == 0:
+        return selection
+    changed = sorted({_advice._normalize_path(path) for path in changed_paths} - {""})
+    if not changed:
+        return selection
+    named = _advice._command_names(
+        command for command in declared_commands if isinstance(command, str)
+    )
+    present = set(selection.tests)
+    added: dict[str, str] = {}
+    skipped: dict[str, str] = {}
+    for rule in CONTRACT_TIER_RULES:
+        trigger = _tier_trigger(rule, root, changed, candidate_root)
+        if not trigger:
+            continue
+        for test in rule.tests:
+            if test in added or test in skipped or test in present:
+                continue
+            if _advice._covers(named, test):
+                continue
+            if not (root / test).is_file():
+                skipped[test] = f"{CONTRACT_TIER_PREFIX}_missing:{rule.rule}"
+                continue
+            added[test] = f"{CONTRACT_TIER_PREFIX}:{rule.rule}:{trigger}"
+    if not added and not skipped:
+        return selection
+    kept = tuple(test for test in selection.tests if test.split("::", 1)[0] not in added)
+    folded = len(selection.tests) - len(kept)
+    node_count = selection.node_count
+    if selection.selection_mode == "node":
+        node_count = max(0, node_count - folded)
+    return replace(
+        selection,
+        tests=kept + tuple(added),
+        related_count=max(0, selection.related_count - folded),
+        node_count=node_count,
+        contract_tier=tuple(added),
+        contract_tier_reasons=tuple(
+            {"test": test, "reason": reason} for test, reason in added.items()
+        ),
+        contract_tier_skipped=tuple(
+            {"test": test, "reason": reason} for test, reason in skipped.items()
+        ),
+    )
+
+
+def _tier_trigger(
+    rule: ContractTierRule,
+    root: Path,
+    changed: Sequence[str],
+    candidate_root: Path | str | None,
+) -> str:
+    """The changed path(s) that trigger ``rule``, as one bounded reason token, or ``""``."""
+    if rule.trigger == TIER_TRIGGER_CHANGED:
+        hits = [path for path in changed if path in rule.paths]
+    elif rule.trigger == TIER_TRIGGER_NEW_RELATIVE_IMPORT:
+        hits = []
+        for path in changed:
+            if path not in rule.paths:
+                continue
+            state = _relative_import_change(root, path, candidate_root)
+            if state == TIER_TRIGGER_NEW_RELATIVE_IMPORT:
+                hits.append(path)
+            elif state:
+                hits.append(f"{path}#{state}")
+    elif rule.trigger == TIER_TRIGGER_ADDED_TEST:
+        hits = [path for path in changed if _is_added_test(root, path, candidate_root)]
+    else:  # an unknown trigger is a table defect: name it rather than skip the rule
+        raise ValueError(f"unknown contract tier trigger: {rule.trigger}")
+    if not hits:
+        return ""
+    return hits[0] if len(hits) == 1 else f"{hits[0]}+{len(hits) - 1}"
+
+
+def _relative_import_change(root: Path, path: str, candidate_root: Path | str | None) -> str:
+    """``new_relative_import`` when the candidate adds a relative import to ``path``.
+
+    ``""`` when it adds none; ``unverified`` when either copy cannot be read or no
+    candidate copy was given -- an unknown import set selects the rule's tests.
+    """
+    if candidate_root is None:
+        return "unverified"
+    before = _relative_imports(root / path)
+    after = _relative_imports(Path(candidate_root) / path)
+    if before is None or after is None:
+        return "unverified"
+    return TIER_TRIGGER_NEW_RELATIVE_IMPORT if after - before else ""
+
+
+def _relative_imports(path: Path) -> frozenset[tuple[int, str, str]] | None:
+    """Every ``from .x import y`` binding of ``path``; empty when absent, None when unreadable."""
+    try:
+        status = os.lstat(path)
+    except FileNotFoundError:
+        return frozenset()
+    except OSError:
+        return None
+    if (
+        _is_link(status)
+        or not stat.S_ISREG(status.st_mode)
+        or status.st_size > TIER_IMPORT_SCAN_MAX_BYTES
+    ):
+        return None
+    try:
+        tree = ast.parse(path.read_bytes())
+    except (OSError, SyntaxError, ValueError):
+        return None
+    return frozenset(
+        (node.level, node.module or "", alias.name)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.level
+        for alias in node.names
+    )
+
+
+def _is_added_test(root: Path, path: str, candidate_root: Path | str | None) -> bool:
+    """A changed ``tests/**.py`` file ``root`` lacks and the candidate (when given) holds."""
+    if not (path.startswith(f"{_TESTS_DIR}/") and path.endswith(".py")):
+        return False
+    if os.path.lexists(root / path):
+        return False
+    return candidate_root is None or os.path.lexists(Path(candidate_root) / path)
 
 
 def _with_referencing(
