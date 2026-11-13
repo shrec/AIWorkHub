@@ -582,7 +582,13 @@ def derive_risk_signals(
 
     if path_has("/__init__.py", "/api/", "server.py", "runtime_adapters.py", "public/"):
         signals.add("public_api")
-    if path_has("authority", "permission", "policy", "sandbox", "credential", "identity", "route"):
+    if path_has("authority", "permission", "policy", "sandbox", "credential", "identity") or any(
+        # NF-2026-02257: "route" as a whole path token (manager_route.py), never a
+        # substring, so a UI router.dart or lib/routes/ link stays out of high tier.
+        token in {"route", "routing"}
+        for path in production
+        for token in re.split(r"[^a-z0-9]+", path)
+    ):
         signals.add("authority_boundary")
     if path_has("thread", "concurr", "callback", "queue", "process_launcher", "worker_workspace"):
         signals.add("concurrency")
