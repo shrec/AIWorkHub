@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>An AI manager that runs Claude Code, Codex and Copilot as its workers.</strong><br>
-  It splits a large project into work cards, sends each card to the cheapest model that can do it, reviews every change against tests before it lands in your tree — and it is building AIWorkHub itself.
+  An open-source control plane for multi-model AI coding agents: it splits a large project into work cards, sends each card to the cheapest model that can do it, reviews every change against tests before it lands in your tree — and it is building AIWorkHub itself.
 </p>
 
 **Proof, from this repository's own history:**
