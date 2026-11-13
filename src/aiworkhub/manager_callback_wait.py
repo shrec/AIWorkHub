@@ -403,7 +403,9 @@ def _review_waiting_target_finished(conn: sqlite3.Connection, card: Mapping[str,
     )
 
 
-def _callback_review_waiting(provider: str, session_id: str) -> dict[str, Any]:
+def _callback_review_waiting(
+    provider: str, session_id: str, *, include_other_origin: bool = False,
+) -> dict[str, Any]:
     """NF-2026-01859: review-bucket cards of ``provider`` this wait cannot
     deliver, bounded to ``CALLBACK_WAIT_REVIEW_WAITING_LIMIT`` rows.  Visibility
     only: nothing here claims, seeds or acknowledges, and the claim's route
@@ -416,15 +418,22 @@ def _callback_review_waiting(provider: str, session_id: str) -> dict[str, Any]:
     is already finished, is dead weight and is left out of the listing; the
     count is reported as ``review_waiting_hidden_terminal`` (only when > 0).  A
     failed card that stays listed carries its ``first_error`` /
-    ``terminal_reason`` when the card recorded one."""
+    ``terminal_reason`` when the card recorded one.
+
+    NF-2026-02255: by default only items owned by ``session_id`` (the task's
+    ``origin_thread_id`` or a callback row for its episode names this session)
+    are listed; items owned by another origin are folded into
+    ``other_origin_count`` and listed only when ``include_other_origin`` is
+    true.  ``review_waiting_scope`` names which listing was returned."""
     from . import core  # lazy: core re-exports this module
     waiting: list[dict[str, str]] = []
     hidden_terminal = 0
+    other_origin = 0
     try:
         conn = core._canonical_connect(readonly=True)
         try:
             tasks = conn.execute(
-                "SELECT task_id, status, card_json FROM tasks "
+                "SELECT task_id, status, card_json, origin_thread_id FROM tasks "
                 "WHERE status IN ('review', 'blocked') AND (archived_at IS NULL OR archived_at='') "
                 "ORDER BY updated_at DESC, task_id ASC LIMIT ?",
                 (CALLBACK_WAIT_REVIEW_WAITING_SCAN_LIMIT,),
@@ -473,6 +482,23 @@ def _callback_review_waiting(provider: str, session_id: str) -> dict[str, Any]:
                     reason = "deferred_review_chain"
                 else:
                     reason = "no_callback_row"
+                # NF-2026-02255: an item is this session's own when its task
+                # or any callback row for this episode names this session;
+                # own items are never folded.  An item with no recorded origin
+                # at all is not provably foreign, so it stays listed.  The
+                # origin check runs before the dead-reviewer branch so a
+                # foreign dead reviewer is counted in other_origin_count, never
+                # in this session's review_waiting_hidden_terminal.
+                task_origin = str(
+                    task["origin_thread_id"] or card.get("origin_thread_id") or ""
+                ).strip()
+                own_origin = task_origin == session_id or any(
+                    row["origin_thread_id"] == session_id for row in outbox
+                )
+                if not own_origin and (task_origin or reason == "other_origin"):
+                    other_origin += 1
+                    if not include_other_origin:
+                        continue
                 dead_reviewer = (
                     task_id.startswith(_QUALITY_REVIEW_TASK_PREFIX)
                     and substatus in _DEAD_REVIEWER_SUBSTATUSES
@@ -496,8 +522,18 @@ def _callback_review_waiting(provider: str, session_id: str) -> dict[str, Any]:
         finally:
             conn.close()
     except Exception as exc:  # noqa: BLE001 -- evidence must never break the wait
-        return {"review_waiting": [], "review_waiting_error": type(exc).__name__}
-    result: dict[str, Any] = {"review_waiting": waiting}
+        # The error reply carries the same scope keys so callers never KeyError.
+        return {
+            "review_waiting": [],
+            "review_waiting_error": type(exc).__name__,
+            "review_waiting_scope": "all_origins" if include_other_origin else "own_origin",
+            "other_origin_count": 0,
+        }
+    result: dict[str, Any] = {
+        "review_waiting": waiting,
+        "review_waiting_scope": "all_origins" if include_other_origin else "own_origin",
+        "other_origin_count": other_origin,
+    }
     if hidden_terminal:
         result["review_waiting_hidden_terminal"] = hidden_terminal
     return result
@@ -598,6 +634,7 @@ def claude_callback_wait(
     ack_batch_id: str = "",
     ack_lease_id: str = "",
     watch_request_ids: Sequence[str] | None = None,
+    include_other_origin: bool = False,
 ) -> dict[str, Any]:
     """Wait for one callback batch belonging to this exact Claude manager.
 
@@ -620,6 +657,10 @@ def claude_callback_wait(
     ``watch_changed``.  When another route owns the lane, a non-empty
     ``watch_request_ids`` runs ``callback_watch.read_only_watch`` instead of
     refusing: it never claims, leases or acknowledges (NF-2026-01769).
+
+    NF-2026-02255: ``review_waiting`` lists only this session's own-origin
+    items unless ``include_other_origin`` is true; other-origin items are
+    always reported as ``other_origin_count``.
     """
     from . import core  # lazy: core re-exports this module
     from . import callback_watch  # local import: cycle-safe
@@ -786,7 +827,9 @@ def claude_callback_wait(
                         "ack": ack_result,
                         "liveness": core._claude_session_liveness_snapshot(identity, watch),
                         **_callback_launch_blocked("claude"),
-                        **core._callback_review_waiting("claude", session_id),
+                        **core._callback_review_waiting(
+                            "claude", session_id, include_other_origin=include_other_origin
+                        ),
                         **({"skipped_stale": list(skipped_stale)} if skipped_stale else {}),
                         **timing,
                     }
@@ -805,7 +848,9 @@ def claude_callback_wait(
                     "ack": ack_result,
                     "liveness": core._claude_session_liveness_snapshot(identity, watch),
                     **blocked_now,
-                    **core._callback_review_waiting("claude", session_id),
+                    **core._callback_review_waiting(
+                        "claude", session_id, include_other_origin=include_other_origin
+                    ),
                     **({"skipped_stale": list(skipped_stale)} if skipped_stale else {}),
                     **timing,
                 }
@@ -819,7 +864,9 @@ def claude_callback_wait(
                 "ack": ack_result,
                 "liveness": core._claude_session_liveness_snapshot(identity, watch),
                 **_callback_launch_blocked("claude"),
-                **core._callback_review_waiting("claude", session_id),
+                **core._callback_review_waiting(
+                    "claude", session_id, include_other_origin=include_other_origin
+                ),
                 **({"skipped_stale": list(skipped_stale)} if skipped_stale else {}),
                 **timing,
             }

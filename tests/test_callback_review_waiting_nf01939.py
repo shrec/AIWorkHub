@@ -103,7 +103,8 @@ def test_terminal_other_origin_reviewer_is_not_in_review_waiting(repo):
     _insert_task("T-LIVE-OTHER", status="review", substatus="review_ready")
     _insert_outbox("T-LIVE-OTHER", OTHER, "delivered", "review_ready")
 
-    reply = core.claude_callback_wait(timeout_seconds=1)
+    # NF-2026-02255: foreign items are listed only on explicit opt-in.
+    reply = core.claude_callback_wait(timeout_seconds=1, include_other_origin=True)
 
     listed = [row["task_id"] for row in reply["review_waiting"]]
     assert not any(task_id.startswith("QUALITY_REVIEW_") for task_id in listed)
@@ -117,7 +118,8 @@ def test_dead_reviewers_do_not_consume_the_review_waiting_limit(repo):
     _insert_task("T-OLD-LIVE", status="review", substatus="review_ready")
     _insert_outbox("T-OLD-LIVE", OTHER, "delivered", "review_ready")
 
-    reply = core.claude_callback_wait(timeout_seconds=1)
+    # NF-2026-02255: foreign items are listed only on explicit opt-in.
+    reply = core.claude_callback_wait(timeout_seconds=1, include_other_origin=True)
 
     assert [row["task_id"] for row in reply["review_waiting"]] == ["T-OLD-LIVE"]
     assert reply["review_waiting_hidden_terminal"] == 25
@@ -126,7 +128,8 @@ def test_dead_reviewers_do_not_consume_the_review_waiting_limit(repo):
 def test_non_reviewer_terminal_other_origin_card_stays_listed(repo):
     _dead_reviewer("T-WORKER-FAILED")
 
-    reply = core.claude_callback_wait(timeout_seconds=1)
+    # NF-2026-02255: foreign items are listed only on explicit opt-in.
+    reply = core.claude_callback_wait(timeout_seconds=1, include_other_origin=True)
 
     assert [(row["task_id"], row["reason"]) for row in reply["review_waiting"]] == [
         ("T-WORKER-FAILED", "other_origin")
