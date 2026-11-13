@@ -25,7 +25,12 @@ from .scoped_audit import ScopedAuditPacket, packet_fingerprint
 
 PACKET_SCHEMA_ID = "aiworkhub.quality_review_packet.v1"
 RECEIPT_SCHEMA_ID = "aiworkhub.quality_reviewer_receipt.v1"
-MAX_PACKET_PATHS = 200
+# Bounds the serialized changed-path rows, not their count: a move-only
+# candidate may name hundreds of paths with no content change, so the packet
+# is refused only when those rows really exceed this byte budget.
+MAX_PACKET_PATH_BYTES = 96 * 1024
+# Smallest serialized changed-path row: {"path":"a","sha256":null}.
+_MIN_PATH_ROW_BYTES = 26
 MAX_PACKET_CHECKS = 200
 MAX_PACKET_COMMANDS = 100
 MAX_TEXT_CHARS = 2_000
@@ -487,18 +492,28 @@ def _bounded_strings(
         for index, value in enumerate(values)
     ]
     if len(rows) > limit:
-        raise ReviewerEvidenceError("review_packet_overflow")
+        raise _packet_overflow()
     return rows
 
 
+def _canonical_bytes(payload: object) -> bytes:
+    return canonical_packet_text(payload).encode("utf-8")
+
+
 def _canonical_digest(payload: Mapping[str, Any]) -> str:
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return hashlib.sha256(_canonical_bytes(payload)).hexdigest()
+
+
+def _packet_overflow() -> ReviewerEvidenceError:
+    """The single refusal every size cap routes through.
+
+    Caps that raise through here: MAX_PACKET_PATH_BYTES (serialized changed-path
+    rows, with the O(1) raw-length pre-check before normalization),
+    MAX_PACKET_CHECKS and MAX_PACKET_COMMANDS (count caps), the ``limit`` count
+    of the bounded list helper, MAX_CALLER_CONTEXT_TOTAL_CHARS (caller context
+    total), MAX_SOURCE_EVIDENCE_CHARS (one source excerpt) and
+    MAX_SOURCE_EVIDENCE_TOTAL_CHARS (source evidence total)."""
+    return ReviewerEvidenceError("review_packet_overflow")
 
 
 def build_review_packet(
@@ -558,8 +573,11 @@ def build_review_packet(
         raise ReviewerEvidenceError("invalid_claim_epoch")
     if not isinstance(changed_path_hashes, Mapping) or not changed_path_hashes:
         raise ReviewerEvidenceError("changed_path_hashes_missing")
-    if len(changed_path_hashes) > MAX_PACKET_PATHS:
-        raise ReviewerEvidenceError("review_packet_overflow")
+    # O(1) pre-check on the raw input, before any per-entry normalization: each
+    # changed-path row serializes to at least _MIN_PATH_ROW_BYTES, so a count
+    # that cannot fit the byte budget is refused here, not after normalizing it.
+    if len(changed_path_hashes) > MAX_PACKET_PATH_BYTES // _MIN_PATH_ROW_BYTES:
+        raise _packet_overflow()
     path_rows: list[dict[str, Any]] = []
     for path, digest in sorted(changed_path_hashes.items()):
         normalized_path = str(path)
@@ -576,10 +594,15 @@ def build_review_packet(
             raise ReviewerEvidenceError("invalid_changed_path_hash")
         path_rows.append({"path": normalized_path, "sha256": normalized_digest})
 
+    # Bounded by serialized bytes, never by path count: a move-only candidate
+    # names many paths and carries no content, so only the bytes matter.
+    if len(_canonical_bytes(path_rows)) > MAX_PACKET_PATH_BYTES:
+        raise _packet_overflow()
+
     def checks(values: Iterable[Mapping[str, Any]]) -> list[dict[str, str]]:
         rows = list(values)
         if len(rows) > MAX_PACKET_CHECKS:
-            raise ReviewerEvidenceError("review_packet_overflow")
+            raise _packet_overflow()
         result: list[dict[str, str]] = []
         for row in rows:
             if not isinstance(row, Mapping):
@@ -602,7 +625,7 @@ def build_review_packet(
     def terminal_validations(values: Iterable[object]) -> list[dict[str, Any]]:
         rows = list(values)
         if len(rows) > MAX_PACKET_COMMANDS:
-            raise ReviewerEvidenceError("review_packet_overflow")
+            raise _packet_overflow()
         result: list[dict[str, Any]] = []
         for row in rows:
             if not isinstance(row, Mapping):
@@ -1248,7 +1271,7 @@ def _rework_delta_instruction(packet: Mapping[str, Any], *, lens: str) -> str:
     return REWORK_DELTA_REVIEW_INSTRUCTION
 
 
-def canonical_packet_text(packet: Mapping[str, Any]) -> str:
+def canonical_packet_text(packet: object) -> str:
     """Serialise *packet* canonically: the text a prompt embeds and a file holds."""
 
     return json.dumps(packet, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
@@ -3050,7 +3073,7 @@ def _caller_context_rows(value: Mapping[str, Any]) -> dict[str, Any]:
             raise ReviewerEvidenceError("invalid_caller_context")
         total += len(text)
         if total > MAX_CALLER_CONTEXT_TOTAL_CHARS:
-            raise ReviewerEvidenceError("review_packet_overflow")
+            raise _packet_overflow()
         result.append(
             {
                 "identity": identity[:200],
@@ -3528,10 +3551,10 @@ def _source_evidence_rows(
         if not isinstance(excerpt, str):
             raise ReviewerEvidenceError("invalid_candidate_source_evidence")
         if len(excerpt) > MAX_SOURCE_EVIDENCE_CHARS:
-            raise ReviewerEvidenceError("review_packet_overflow")
+            raise _packet_overflow()
         total += len(excerpt)
         if total > MAX_SOURCE_EVIDENCE_TOTAL_CHARS:
-            raise ReviewerEvidenceError("review_packet_overflow")
+            raise _packet_overflow()
         source_bytes = bounded_int(row.get("source_bytes"), "source_bytes")
         excerpt_bytes = bounded_int(row.get("excerpt_bytes"), "excerpt_bytes")
         if excerpt_bytes > max(source_bytes, len(excerpt.encode("utf-8"))):
