@@ -29,6 +29,7 @@ _HINTED_PARAMS = {
         "validation_roles", "risk_tier", "difficulty", "skill_task_family", "skill_stage",
         "skill_triggers", "skill_applicability", "skill_path_scope", "custom_template_escape",
         "apply_contract_patch", "echo_card", "wave_goal_binding", "read_roots",
+        "deny_read", "host_commands", "host_sweep", "materialize", "checkout", "evidence",
     ),
     "needfix_add": ("status", "kind", "severity"),
     "needfix_update": ("kind", "severity"),

@@ -45,10 +45,10 @@ _WRITE_PROBE = "aiworkhub_task_mark_done"
 # Measured on base 739a7c70, plus aiworkhub_manager_callback_lane_claim (NF-2026-01802), minus the five
 # retired manager Hub Mail tools and the three retired dashboard ones, plus the dashboard peers view,
 # plus aiworkhub_manager_recipe_run_status (NF-2026-01849).
-_PRE_TABLE_ALL_COUNT = 227
-_PRE_TABLE_ALL_READ_ONLY_COUNT = 223
+_PRE_TABLE_ALL_COUNT = 230
+_PRE_TABLE_ALL_READ_ONLY_COUNT = 226
 # NF-2026-02139: manager 130 -> 115, the 15 rows below moved to manager-callable.
-_LISTED_COUNTS = {"manager": 115, "worker": 19, "dashboard": 67}
+_LISTED_COUNTS = {"manager": 118, "worker": 19, "dashboard": 67}
 # NF-2026-02139: callable by exact name on manager, absent from its tools/list. The extension (dashboard
 # surface) calls the loop/vscode_lm rows; managers finalize with accept_review/reject_review, not mark_*.
 _NF02139_DASHBOARD_LISTED = (

@@ -108,6 +108,7 @@ _TASK_CREATE_SKILL_VOCABULARY = [
 # ``read_roots`` is the reviewed opt-in read grant for the worker sandbox (release 0.12.78).
 _TASK_CREATE_TAIL = [
     "custom_template_escape", "apply_contract_patch", "echo_card", "wave_goal_binding", "read_roots",
+    "deny_read", "host_commands", "host_sweep", "materialize", "checkout", "evidence",
 ]
 
 

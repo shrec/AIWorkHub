@@ -4312,9 +4312,9 @@ def aiworkhub_task_amend_pending(
     ``read_first`` are ADD-ONLY (deduplicated; the existing entries stay);
     ``validation`` REPLACES the whole list, with ``validation_roles`` aligned
     one-to-one (omitted roles default to generic, which a bugfix/refactor/...
-    card's work_kind role gate refuses exactly as task_create does). Paths and
-    commands obey the same rules as task_create and reject_review's
-    amendments, with the same refusal codes.
+    card's work_kind role gate refuses exactly as aiworkhub_task_create does). Paths and
+    commands obey the same rules as aiworkhub_task_create and
+    aiworkhub_task_reject_review's amendments, with the same refusal codes.
 
     Only a never-launched pending card qualifies: a launched, claimed,
     archived or non-pending card is refused with
@@ -8806,8 +8806,8 @@ def needfix_list(
     offset: int = 0,
     order_by: str = "created_at",
     order_dir: str = "DESC",
-    full: bool = False,
     query: str = "",
+    full: bool = False,
 ) -> list[dict]:
     """List repo-scoped NeedFix entries (bounded); rows are a compact projection.
 
@@ -8822,8 +8822,8 @@ def needfix_list(
         offset: Rows to skip before the first one returned, for paging; default 0.
         order_by: Sort column, created_at (default) or updated_at; any other value falls back to created_at.
         order_dir: Sort direction, DESC (default, newest first) or ASC; any other value falls back to DESC.
-        full: Return the raw stored rows instead of the compact projection; default false.
         query: Case-insensitive substring of the id or title, applied before limit/offset; empty (default) lists everything.
+        full: Return the raw stored rows instead of the compact projection; default false.
     """
     listing = core.needfix_list(
         status=status,
