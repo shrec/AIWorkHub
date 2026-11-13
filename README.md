@@ -86,8 +86,12 @@ flowchart LR
   models for bounded work.
 - **Source Graph.** A repository-local, incrementally refreshed code index
   (including Dart) that gives managers and workers bounded symbol, call, test and
-  impact queries instead of broad file scans. Workers change hash-verified line
-  ranges through semantic edit, not whole-file rewrites.
+  impact queries instead of broad file scans, across exactly 38 Source Graph
+  query modes. The exact-target modes are `file`, `function`, `class`, `body`,
+  `bodygrep` and `deps`. Workers change hash-verified line ranges through
+  semantic edit, not whole-file rewrites. See the full-resolution
+  <a href="site/assets/aiworkhub-source-graph-architecture.svg">Source Graph architecture diagram</a>
+  for the complete index and query pipeline.
 - **Sandboxed workers.** Worker processes run inside a Windows AppContainer or a
   Linux Landlock sandbox with explicit write scopes.
 - **NeedFix on the dashboard.** The dashboard groups NeedFix records by work
@@ -167,6 +171,11 @@ inherit the manager's launch capability.
   credentials. The Dashboard's Preflight shows which routes are ready.
 - Linux, macOS, native Windows, WSL and Remote-SSH are supported; Linux is the
   canonical development and validation host.
+
+## Measured claims and limits
+
+- **semantic-edit-historical-cap-boundary**: historical capped a/b observation at 20k/200k ops shows a 29.329% reduction; this is a capped historical sample, not eligible as a live guarantee.
+- **context-bundle-v2-structural-only**: structural-only validation; live fleet remeasurement pending.
 
 ## What's new in 0.12.98
 
