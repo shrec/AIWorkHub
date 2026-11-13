@@ -170,12 +170,19 @@ def test_heartbeat_refreshes_during_silent_child_and_tracks_output_activity(tmp_
     heartbeat/output-tracking, not SIGTERM/cancel handling (which the
     existing supervisor tests and ``ProcessManager``'s own cancel path
     already cover on the real main-thread entry point)."""
+    # Generous bound for every wait: under xdist load a fixed sleep or a tight
+    # deadline is the flake, so each wait polls an observable condition instead.
+    bound = 30.0
+    # Three sequential waits (silent heartbeats, activity, exit), each bounded by
+    # ``bound``, plus one bound of margin: the supervisor must outlive them all.
+    child_timeout = 4 * bound
     monkeypatch.setattr(worker_supervisor.signal, "signal", lambda *a, **k: None)
     status_path = tmp_path / "status.json"
     cancel_path = tmp_path / "cancel.json"
     stdout_path = tmp_path / "out.log"
     stderr_path = tmp_path / "err.log"
     marker = tmp_path / "go"
+    done = tmp_path / "done"
 
     script = (
         "import time, sys, os\n"
@@ -183,12 +190,13 @@ def test_heartbeat_refreshes_during_silent_child_and_tracks_output_activity(tmp_
         "    time.sleep(0.02)\n"
         "sys.stdout.write('x' * 40)\n"
         "sys.stdout.flush()\n"
-        "time.sleep(0.6)\n"
+        f"while not os.path.exists({str(done)!r}):\n"
+        "    time.sleep(0.02)\n"
     )
     spec = {
         "argv": [sys.executable, "-c", script],
         "cwd": "/",
-        "timeout_seconds": 10,
+        "timeout_seconds": child_timeout,
         "status_path": str(status_path),
         "cancel_path": str(cancel_path),
         "stdout_path": str(stdout_path),
@@ -202,7 +210,7 @@ def test_heartbeat_refreshes_during_silent_child_and_tracks_output_activity(tmp_
     thread.start()
     try:
         silent_snapshots = []
-        deadline = time.monotonic() + 6.0
+        deadline = time.monotonic() + bound
         while time.monotonic() < deadline and len(silent_snapshots) < 3:
             if status_path.is_file():
                 payload = _read_status_tolerant(status_path)
@@ -223,7 +231,7 @@ def test_heartbeat_refreshes_during_silent_child_and_tracks_output_activity(tmp_
         assert all(s.get("stdout_bytes", 0) == 0 for s in silent_snapshots)
 
         marker.write_text("go")
-        deadline = time.monotonic() + 6.0
+        deadline = time.monotonic() + bound
         activity_seen = False
         while time.monotonic() < deadline:
             payload = _read_status_tolerant(status_path)
@@ -234,9 +242,10 @@ def test_heartbeat_refreshes_during_silent_child_and_tracks_output_activity(tmp_
             time.sleep(0.05)
         assert activity_seen, "expected stdout activity to be observed after the marker was written"
 
-        thread.join(timeout=10)
+        done.write_text("go")
+        thread.join(timeout=bound)
         final: dict = {}
-        final_deadline = time.monotonic() + 5.0
+        final_deadline = time.monotonic() + bound
         while time.monotonic() < final_deadline:
             final = _read_status_tolerant(status_path)
             if final.get("state") == "exited":
@@ -247,7 +256,8 @@ def test_heartbeat_refreshes_during_silent_child_and_tracks_output_activity(tmp_
         assert final["supervisor_pid_start_ticks"] is not None
     finally:
         marker.write_text("go")
-        thread.join(timeout=5)
+        done.write_text("go")
+        thread.join(timeout=bound)
 
 
 def test_supervisor_status_read_secure_modes_and_symlink_rejection(tmp_path):
