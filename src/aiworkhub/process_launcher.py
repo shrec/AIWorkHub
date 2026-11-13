@@ -6837,7 +6837,8 @@ class ProcessManager:
                 raise quality_reviewer.ReviewerEvidenceError(
                     "review_packet_contract_invalid"
                 )
-            _bind_review_contract(contract, card, self.process_dir, target_request_id)
+            process_dir = getattr(self, "process_dir", None)  # doubles may skip __init__
+            _bind_review_contract(contract, card, process_dir or Path(os.environ.get(PROCESS_DIR_ENV, str(self.repo / PROCESS_DIR_DEFAULT_REL))), target_request_id)
             packet_body = {
                 key: value for key, value in packet.items() if key != "packet_sha256"
             }
