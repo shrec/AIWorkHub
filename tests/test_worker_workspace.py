@@ -627,6 +627,9 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "_version.py",
         "_platform_process.py",
         "platform_io.py",
+        # NF-2026-02239: sandbox_cpu_budget is a relative sibling of worker_workspace
+        # (validation_runner, which it imports, is listed below).
+        "sandbox_cpu_budget.py",
         # worker_workspace imports its promotion write helper relatively (NF-2026-01198).
         "promotion_write.py",
         "promotion_conflict_detail.py",  # promote's conflict sha256 tail (NF-2026-01960)
@@ -896,6 +899,9 @@ def test_worker_workspace_binds_platform_helpers_after_runtime_temp_closure(
         "_platform_process.py",
         "linux_kernel_abi.py",
         "platform_io.py",
+        # NF-2026-02239: sandbox_cpu_budget is a relative sibling of worker_workspace.
+        "sandbox_cpu_budget.py",
+        "validation_runner.py",  # imported by sandbox_cpu_budget (NF-2026-02239)
         "runtime_temp.py",
         "windows_file_structures.py",
         "worker_workspace.py",
@@ -1163,6 +1169,9 @@ def test_package_runtime_temp_loader_rejects_missing_private_support_without_top
         "linux_kernel_abi.py",
         "closure_probe_scope.py",
         "platform_io.py",
+        # NF-2026-02239: sandbox_cpu_budget is a relative sibling of worker_workspace.
+        "sandbox_cpu_budget.py",
+        "validation_runner.py",  # imported by sandbox_cpu_budget (NF-2026-02239)
         "runtime_temp.py",
         "worker_workspace.py",
     ):
@@ -1203,7 +1212,15 @@ def test_direct_runtime_temp_loader_rejects_missing_private_support_without_top_
     source_package = Path(worker_workspace.__file__).resolve().parent
     destination_package = tmp_path / "aiworkhub-direct"
     destination_package.mkdir()
-    for name in ("platform_io.py", "runtime_temp.py", "worker_workspace.py"):
+    # NF-2026-02239: worker_workspace imports sandbox_cpu_budget relatively, which
+    # imports validation_runner, so the fixture must carry both siblings.
+    for name in (
+        "platform_io.py",
+        "runtime_temp.py",
+        "sandbox_cpu_budget.py",  # NF-2026-02239
+        "validation_runner.py",  # imported by sandbox_cpu_budget (NF-2026-02239)
+        "worker_workspace.py",
+    ):
         shutil.copyfile(source_package / name, destination_package / name)
     script = (
         "import importlib.util\n"
