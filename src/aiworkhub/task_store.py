@@ -7706,6 +7706,62 @@ def _infra_reject_replay_refusal(card: Mapping[str, Any], status: str) -> str | 
     return None
 
 
+def _infra_replay_cap(
+    conn: sqlite3.Connection, task_id: str, card: Mapping[str, Any]
+) -> tuple[dict[str, Any] | None, bool]:
+    """``(replay_key, already_replayed)`` for the reject handler's replay.
+
+    NF-2026-02253: a validation_environment reject replayed the same candidate
+    on every reject, and each replay hit the same sandbox launch error.  Read
+    under the recovery lease: the key binds the pinned predecessor and the
+    newest terminal failure, and an earlier ``blocked_rework_recovery`` that
+    replayed the same candidate for the same failure signature refuses the
+    replay.  A history row that cannot be read counts as that earlier replay.
+    Other categories are not capped and get no key.
+    """
+    from . import validation_replay_policy as policy
+
+    rejection = card.get("rejection_disposition")
+    category = (
+        str(rejection.get("failure_category") or "") if isinstance(rejection, dict) else ""
+    )
+    if category not in policy.CAPPED_CATEGORIES:
+        return None, False
+    terminal_row = conn.execute(
+        "SELECT payload_json FROM task_events WHERE task_id=? "
+        "AND event IN ('terminal_review', 'terminal_failure') "
+        "ORDER BY rowid DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    try:
+        terminal = json.loads(str(terminal_row[0] or "{}")) if terminal_row else None
+    except json.JSONDecodeError:
+        terminal = None
+    predecessor = card.get("rework_predecessor")
+    key = policy.replay_key(
+        task_id,
+        predecessor if isinstance(predecessor, dict) else None,
+        terminal if isinstance(terminal, dict) else None,
+        category,
+    )
+    for (payload_json,) in conn.execute(
+        "SELECT payload_json FROM task_events WHERE task_id=? "
+        "AND event='blocked_rework_recovery' ORDER BY rowid DESC LIMIT ?",
+        (task_id, policy.MAX_HISTORY_EVENTS),
+    ).fetchall():
+        try:
+            payload = json.loads(str(payload_json or "{}"))
+        except json.JSONDecodeError:
+            return key, True
+        if not isinstance(payload, dict):
+            return key, True
+        if payload.get("infra_reject_replay") is True and policy.same_failure(
+            payload.get("automatic_replay_key"), key
+        ):
+            return key, True
+    return key, False
+
+
 @_os_failure_names_its_operation
 def recover_blocked_rework(
     root: str | Path,
@@ -7920,10 +7976,17 @@ def recover_blocked_rework(
             return False, "card_json_not_dict"
 
         infra_reject_pending = False
+        infra_replay_key: dict[str, Any] | None = None
         if infra_reject_replay:
             infra_refusal = _infra_reject_replay_refusal(card, current_canonical)
             if infra_refusal is not None:
                 return False, infra_refusal
+            # NF-2026-02253: one automatic replay per failure signature.
+            infra_replay_key, repeated = _infra_replay_cap(conn, task_id, card)
+            if repeated:
+                from .validation_replay_policy import REPEATED_REFUSAL
+
+                return False, REPEATED_REFUSAL
             infra_reject_pending = current_canonical == "pending"
             if infra_reject_preimage_out is not None:
                 infra_reject_preimage_out.update(dict(conn.execute(
@@ -9072,6 +9135,19 @@ def recover_blocked_rework(
                     str(residual.get("reason") or "").strip().encode("utf-8")
                     [:MAX_REWORK_FEEDBACK_BYTES].decode("utf-8", errors="ignore")
                 )
+        if (
+            not bounded_feedback
+            and validation_only_replay
+            and predecessor_request_id
+            and isinstance(predecessor_changed_path_hashes, dict)
+            and predecessor_changed_path_hashes
+        ):
+            # NF-2026-02254: a replay reruns the declared validation on the
+            # retained candidate's unchanged bytes, so the retained predecessor
+            # is the instruction; no reviewer residual is needed for it.
+            from .validation_replay_policy import replay_feedback
+
+            bounded_feedback = replay_feedback(predecessor_request_id)
         if not bounded_feedback:
             return False, "no_residual_feedback"
 
@@ -9303,6 +9379,9 @@ def recover_blocked_rework(
         }
         if infra_reject_replay:
             recovery_payload["infra_reject_replay"] = True
+            if infra_replay_key is not None:
+                # NF-2026-02253: what the next infrastructure reject is capped by.
+                recovery_payload["automatic_replay_key"] = infra_replay_key
         if rejection_rebind is not None:
             recovery_payload["rejection_rebind"] = rejection_rebind
         if validation_only_replay:

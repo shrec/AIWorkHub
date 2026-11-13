@@ -817,6 +817,7 @@ from . import task_engine
 from . import task_plan
 from . import task_reconciler
 from . import terminal_log_retention
+from . import validation_replay_policy
 from . import vscode_lm_activity
 from . import worker_ai_tools_mcp
 # NF389: single source of truth for bounded provider-call identity and
@@ -5114,6 +5115,12 @@ def aiworkhub_task_reject_review(
     replay of the retained candidate and adds ``automatic_validation_replay``
     {attempted, succeeded, reason, request_id}; a replay that cannot start
     leaves the reject and the card as they were, and no other reject has the key.
+    A validation_environment replay runs at most once per candidate and failure
+    signature: a repeat is skipped with ``attempted`` false and reason
+    ``environment_failure_repeated:validation_environment``.  After the replay
+    the receipt's status/worker_status/card identity are re-read from the live
+    card (the same view as aiworkhub_task_show); the status the reject itself
+    left is kept under ``status_at_reject`` when it differs.
 
     ``lesson_candidate`` / ``no_new_lesson_reason`` -- both unset by default, and
     the reply is then exactly as before -- close this decision's learning out in
@@ -5239,6 +5246,7 @@ def aiworkhub_task_reject_review(
             receipt["automatic_validation_replay"] = _automatic_validation_replay(
                 task_id, replay_category, card or {}
             )
+            _refresh_receipt_status(receipt, task_id=task_id, include_card=include_card)
         # NF-2026-02167: after the reject is committed; a failed launch never
         # undoes it, the failure is reported under ``relaunch``.
         if relaunch:
@@ -5260,6 +5268,41 @@ def _relaunch_after_reject(task_id: str, *, adapter_id: str) -> dict[str, Any]:
     if not isinstance(launched, dict):
         return {"ok": False, "error": "relaunch_reply_invalid"}
     return {**launched, "ok": launched.get("ok") is True}
+
+
+def _refresh_receipt_status(
+    receipt: dict[str, Any], *, task_id: str, include_card: str
+) -> None:
+    """Report the card as it stands after the automatic replay (NF-2026-02254).
+
+    The reject receipt was projected before the replay recovered and launched
+    the card, so it said ``blocked`` while ``aiworkhub_task_show`` and
+    ``aiworkhub_agent_task_status`` already saw the replay's state.  Re-read
+    through the same ``show_task`` path task_show uses; the status the reject
+    itself left stays under ``status_at_reject`` when it differs.  A failed
+    read keeps the projected status and names the failure under
+    ``status_refresh``; it never fails the committed reject.
+    """
+    try:
+        live, error = core._live_card(task_id)
+    except Exception as exc:  # noqa: BLE001 -- the committed reject must still reply
+        live, error = None, {"stderr": f"live_card_raised:{type(exc).__name__}"}
+    if live is None:
+        detail = str((error or {}).get("stderr") or "live_card_unavailable")
+        receipt["status_refresh"] = {
+            "ok": False,
+            "reason": detail[:_AUTOMATIC_REPLAY_REASON_MAX_CHARS],
+        }
+        return
+    status_at_reject = receipt.get("status")
+    receipt["status"] = live.get("status")
+    receipt["worker_status"] = live.get("worker_status")
+    receipt.update(_card_identity(live))
+    view = _card_view(live, include_card)
+    if view is not None:
+        receipt["card"] = view
+    if status_at_reject != receipt["status"]:
+        receipt["status_at_reject"] = status_at_reject
 
 
 _AUTOMATIC_REPLAY_REASON_MAX_CHARS = 500
@@ -5369,7 +5412,14 @@ def _automatic_validation_replay(
     except Exception as exc:  # noqa: BLE001 -- the committed reject must still reply
         return report(f"recovery_raised:{type(exc).__name__}")
     if recovery.get("ok") is not True:
-        return report(f"recovery_refused:{recovery.get('reason') or recovery.get('stderr') or ''}")
+        refused = str(recovery.get("reason") or recovery.get("stderr") or "")
+        if validation_replay_policy.REPEATED_REFUSAL in refused:
+            # NF-2026-02253: this candidate already had its one replay for
+            # this exact environment failure; nothing was started.
+            return report(
+                f"{validation_replay_policy.SKIP_REASON}:{category}", attempted=False
+            )
+        return report(f"recovery_refused:{refused}")
 
     launch_request_id: str | None = None
     try:
