@@ -795,8 +795,10 @@ from . import deepseek_credentials
 from . import doctor
 from . import evidence_instruments
 from . import external_qualification
+from . import host_validation_stage
 from . import hub_mail
 from . import hub_mail_net
+from . import hub_resource_queue
 from . import launch_queue_contract
 from . import launch_queue_persist
 from . import known_bug_scanner
@@ -2073,6 +2075,34 @@ def aiworkhub_manager_session_current_state(
     """
 
     return manager_ai_tools.session_current_state(topic=topic, limit=limit)
+
+
+@mcp.tool()
+def aiworkhub_manager_resource_status(resource: str = "") -> dict[str, Any]:
+    """MANAGER READ: queue of a hub-managed resource such as cpu_heavy.
+
+    Returns the holder, the waiters in the order they will be served, and each
+    entry's priority and wait time, from the runtime database.
+
+    Args:
+        resource: Hub resource name, e.g. cpu_heavy; empty returns every known resource.
+    """
+
+    return hub_resource_queue.status_reply(core.repo_root(), resource)
+
+
+@mcp.tool()
+def aiworkhub_manager_candidate_tree(request_id: str) -> dict[str, Any]:
+    """MANAGER READ: path and state of a request's full candidate tree.
+
+    The tree is built by the host validation stage (host_commands/host_sweep)
+    from canonical plus the candidate overlay; ready means the stage finished.
+
+    Args:
+        request_id: Id of the worker request whose host-stage candidate tree to report.
+    """
+
+    return host_validation_stage.candidate_tree(core.repo_root(), request_id)
 
 
 @mcp.tool()
@@ -4087,6 +4117,19 @@ def aiworkhub_task_create(
         "deny_read_invalid:<reason>:<glob>. Omit for none.",
         [["secrets/*.pem", ".env"]],
     )] = None,
+    host_commands: typing.Annotated[list[list[str]] | None, _task_create_hint(
+        "Up to 16 argv lists the coordinator runs in order on a FULL candidate tree after "
+        "review_ready (same parser rules as validation commands, no env/cd prefixes). Files they "
+        "create inside allowed_writes join the candidate; others are only reported. Refused with "
+        "host_command_invalid:<index>:<reason>. Omit for none.",
+        [[["python", "-m", "tools.generate_schema"]]],
+    )] = None,
+    host_sweep: typing.Annotated[dict[str, Any] | None, _task_create_hint(
+        "{tests: up to 512 pytest node ids or files, processes: int} run sharded on the full "
+        "candidate tree, processes capped at the core count minus 25% headroom; a test red on "
+        "base too is not a candidate failure. Refused with host_sweep_<field>_invalid. Omit for none.",
+        [{"tests": ["tests/test_mod.py"], "processes": 4}],
+    )] = None,
     materialize: typing.Annotated[list[str] | None, _task_create_hint(
         "Up to 64 repo-relative globs materialized (present, read-only by scope) in the sparse "
         "worker, validation and reproduction trees in addition to the declared closure, e.g. "
@@ -4244,6 +4287,8 @@ def aiworkhub_task_create(
         ),
         **({"read_roots": read_roots} if read_roots is not None else {}),
         **({"deny_read": deny_read} if deny_read is not None else {}),
+        **({"host_commands": host_commands} if host_commands is not None else {}),
+        **({"host_sweep": host_sweep} if host_sweep is not None else {}),
         **({"materialize": materialize} if materialize is not None else {}),
         **({"checkout": checkout} if checkout is not None else {}),
         **({"evidence": evidence} if evidence is not None else {}),
@@ -6989,6 +7034,15 @@ def _review_packet_one(request_id: str, task_id: str, max_bytes: int) -> dict[st
             # Selected reviewers, but no sealed report was read: the lens
             # counts fall back to the pre-review verdict and are not live.
             packet["reviewer_reports_unavailable"] = True
+        # NF-2026-02240: the host validation stage is its own section, only for an
+        # opted-in card whose stage ran.
+        host_section = host_validation_stage.review_packet_section(
+            core.repo_root(),
+            request_id,
+            host_validation_stage.task_card(core.repo_root(), resolved_task_id),
+        )
+        if host_section is not None:
+            packet["host_validation"] = host_section
     return packet
 
 

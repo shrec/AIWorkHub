@@ -3243,6 +3243,14 @@ def accept_review(
                 "request_id": request_id,
                 "task_id": task_id,
             }
+        # NF-2026-02240: opt-in host validation stage; "" for every other card.
+        from . import host_validation_stage
+
+        host_refusal = host_validation_stage.accept_step(
+            self.repo, card, request_id, task_id, workspace, evidence
+        )
+        if host_refusal:
+            return {"ok": False, "error": host_refusal, "request_id": request_id, "task_id": task_id}
 
         readonly_quality_review = _card_is_readonly_quality_review(card)
         readonly_research = (

@@ -4374,6 +4374,7 @@ def create_task(
     review_target_task_id: str | None = None,
     read_roots: list[str] | None = None,
     deny_read: list[str] | None = None,
+    host_commands: list[list[str]] | None = None, host_sweep: Mapping[str, Any] | None = None,
     materialize: list[str] | None = None,
     checkout: str | None = None,
     evidence: str | None = None,
@@ -4660,9 +4661,7 @@ def create_task(
             "allow_unchanged_required_outputs",
         )
         validation2 = bounded_strings(validation or [], "validation")
-        validation_roles2 = bounded_strings(
-            validation_roles or [], "validation_roles"
-        )
+        validation_roles2 = bounded_strings(validation_roles or [], "validation_roles")
         read_first2 = bounded_strings(read_first or [], "read_first")
         immutable_inputs2 = bounded_strings(immutable_inputs or [], "immutable_inputs")
         # Lazy, like ``toolchain_authority`` below: creation must not widen
@@ -4670,8 +4669,9 @@ def create_task(
         from .linux_read_roots import read_surface_fields, validate_read_surface
         read_roots2, deny_read2 = validate_read_surface(read_roots, deny_read, repo_root())
         from .worker_materialize import card_checkout_fields, validate_card_checkout
-
         materialize2, checkout2 = validate_card_checkout(materialize, checkout)
+        from .host_validation_stage import card_host_fields  # NF-2026-02240, opt-in
+        host_fields = card_host_fields(host_commands, host_sweep)
     except ValueError as exc:
         return _lifecycle_error(str(exc), 2)
     if read_only:
@@ -5126,7 +5126,7 @@ def create_task(
         ),
         "read_first": read_first2,
         **read_surface_fields(read_roots2, deny_read2),
-        **card_checkout_fields(materialize2, checkout2),
+        **card_checkout_fields(materialize2, checkout2), **host_fields,
         "immutable_inputs": immutable_inputs2,
         "validation": validation2,
         "validation_roles": validation_roles2,
@@ -5232,7 +5232,7 @@ def create_task(
         "task_type": task_type,
         "depends_on": depends_on2,
         "read_first": read_first2,
-        **{"read_roots": read_roots2, "deny_read": deny_read2},
+        **{"read_roots": read_roots2, "deny_read": deny_read2}, **host_fields,
         "materialize": materialize2,
         "checkout": checkout2,
         "immutable_inputs": immutable_inputs2,
