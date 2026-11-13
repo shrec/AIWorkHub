@@ -5,6 +5,14 @@ from __future__ import annotations
 import ctypes
 
 __all__ = [
+    "LANDLOCK_ACCESS_FS_READ_DIR",
+    "LANDLOCK_ACCESS_FS_READ_FILE",
+    "LANDLOCK_CREATE_RULESET_VERSION",
+    "LANDLOCK_RULE_PATH_BENEATH",
+    "PR_SET_NO_NEW_PRIVS",
+    "SYS_LANDLOCK_ADD_RULE",
+    "SYS_LANDLOCK_CREATE_RULESET",
+    "SYS_LANDLOCK_RESTRICT_SELF",
     "_LandlockPathBeneathAttr",
     "_LandlockRulesetAttr",
     "_OpenHow",
@@ -12,6 +20,17 @@ __all__ = [
     "_SeccompNotif",
     "_SeccompNotifResp",
 ]
+
+# Landlock syscall numbers are identical on every Linux architecture (unified
+# syscall table since 5.13), and the access bits are the uapi values.
+SYS_LANDLOCK_CREATE_RULESET = 444
+SYS_LANDLOCK_ADD_RULE = 445
+SYS_LANDLOCK_RESTRICT_SELF = 446
+LANDLOCK_CREATE_RULESET_VERSION = 1 << 0
+LANDLOCK_RULE_PATH_BENEATH = 1
+LANDLOCK_ACCESS_FS_READ_FILE = 1 << 2
+LANDLOCK_ACCESS_FS_READ_DIR = 1 << 3
+PR_SET_NO_NEW_PRIVS = 38
 
 
 class _LandlockRulesetAttr(ctypes.Structure):

@@ -85,6 +85,7 @@ from .process_launcher_accept_review import _accept_manager_identity as _calling
 from .process_launcher_accept_review import accept_preview as _accept_preview_impl
 from .process_launcher_accept_review import accept_review as _accept_review_impl
 from .process_launcher_husk_gc import gc_husk_without_metadata
+from .process_launcher_launch_isolated import bind_review_contract as _bind_review_contract
 from .process_launcher_launch_isolated import launch_isolated as _launch_isolated_impl
 from .process_launcher_launch_isolated import relaunch_input_paths as _relaunch_input_paths
 from .process_launcher_launch_isolated import spawn_with_stdin_payload as _spawn_with_stdin_payload
@@ -6829,16 +6830,14 @@ class ProcessManager:
                 prior_findings=prior_findings,
                 manager_amendment=card.get("review_feedback"),
             )
-            # Immutable inputs are authenticated reviewer contract context and
-            # read-only workspace materialization authority. Keep candidate
-            # path gates pure, then bind the same declared paths into the
-            # sealed packet contract and refresh its canonical digest.
+            # Bind immutable inputs and the launch's sandbox_visibility receipt
+            # into the sealed packet contract, then refresh its canonical digest.
             contract = packet.get("contract")
             if not isinstance(contract, dict):
                 raise quality_reviewer.ReviewerEvidenceError(
                     "review_packet_contract_invalid"
                 )
-            contract["immutable_inputs"] = list(card.get("immutable_inputs") or [])
+            _bind_review_contract(contract, card, self.process_dir, target_request_id)
             packet_body = {
                 key: value for key, value in packet.items() if key != "packet_sha256"
             }

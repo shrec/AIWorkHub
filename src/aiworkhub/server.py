@@ -4072,11 +4072,20 @@ def aiworkhub_task_create(
     )] = None,
     read_roots: typing.Annotated[list[str] | None, _task_create_hint(
         "Up to 16 absolute host directories OUTSIDE the worktree the provider worker may READ "
-        "(runtime data), granted read-only on Windows AppContainer only. Refused with "
+        "(runtime data), granted read-only on Windows AppContainer and Linux Landlock. "
+        "Refused with "
         "read_root_invalid:<reason>:<path> when not an existing plain directory, or when it is a "
         "volume/UNC root, reparse point, .git/.aiworkhub path, the repo root or its parent, "
         "another git repository, the home directory or its credential folders. Omit for none.",
         [["E:\\RuntimeData"]],
+    )] = None,
+    deny_read: typing.Annotated[list[str] | None, _task_create_hint(
+        "Up to 32 repo-style POSIX globs (*, ?, [..], ** segments; a glob without '/' matches "
+        "a basename at any depth) whose matching files in the worktree and read_roots are made "
+        "unreadable to the worker: a Landlock read layer on Linux, an explicit deny ACE on "
+        "Windows AppContainer, refused on any other backend. Refused with "
+        "deny_read_invalid:<reason>:<glob>. Omit for none.",
+        [["secrets/*.pem", ".env"]],
     )] = None,
     materialize: typing.Annotated[list[str] | None, _task_create_hint(
         "Up to 64 repo-relative globs materialized (present, read-only by scope) in the sparse "
@@ -4234,6 +4243,7 @@ def aiworkhub_task_create(
             else {}
         ),
         **({"read_roots": read_roots} if read_roots is not None else {}),
+        **({"deny_read": deny_read} if deny_read is not None else {}),
         **({"materialize": materialize} if materialize is not None else {}),
         **({"checkout": checkout} if checkout is not None else {}),
         **({"evidence": evidence} if evidence is not None else {}),

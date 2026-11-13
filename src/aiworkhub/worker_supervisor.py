@@ -698,6 +698,21 @@ def _launch_appcontainer_process(
                     covered=[g.path for g in grants if g.access == "modify"],
                 )
             )
+        if spec.get("deny_read_paths"):
+            # NF-2026-02238: one explicit deny-read ACE per denied file, only
+            # inside this launch's own isolated worktree (deleted with it), so
+            # no teardown removal exists; a path escaping it refuses the launch.
+            try:
+                from .linux_read_roots import apply_appcontainer_deny
+            except ImportError:  # direct-script entrypoint
+                from linux_read_roots import apply_appcontainer_deny  # type: ignore[no-redef]
+            deny_refused = apply_appcontainer_deny(
+                list(spec["deny_read_paths"]),
+                windows_appcontainer.container_sid(repo_id, worker_kind),
+                roots=list(spec.get("deny_read_roots") or ()),
+            )
+            if deny_refused:
+                raise ValueError(f"deny_read_ace_refused:{deny_refused[0]}"[:240])
         if bridge_spec is not None:
             sid = windows_appcontainer.container_sid(repo_id, worker_kind)
             # The pipe exists before the worker does, so its MCP shim finds it.

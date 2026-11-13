@@ -4321,7 +4321,7 @@ def _create_payload_from_card(existing_card: Mapping[str, Any]) -> dict[str, Any
         "task_type": str(existing_context.get("task_type") or "code"),
         "depends_on": existing_card.get("depends_on") or [],
         "read_first": existing_card.get("read_first") or [],
-        "read_roots": existing_card.get("read_roots") or [],
+        **{key: existing_card.get(key) or [] for key in ("read_roots", "deny_read")},
         "materialize": existing_card.get("materialize") or [],
         "checkout": existing_card.get("checkout") or "sparse",
         "immutable_inputs": existing_card.get("immutable_inputs") or [],
@@ -4373,6 +4373,7 @@ def create_task(
     *,
     review_target_task_id: str | None = None,
     read_roots: list[str] | None = None,
+    deny_read: list[str] | None = None,
     materialize: list[str] | None = None,
     checkout: str | None = None,
     evidence: str | None = None,
@@ -4666,9 +4667,8 @@ def create_task(
         immutable_inputs2 = bounded_strings(immutable_inputs or [], "immutable_inputs")
         # Lazy, like ``toolchain_authority`` below: creation must not widen
         # core's startup dependency surface.
-        from .card_read_roots import validate_read_roots
-
-        read_roots2 = validate_read_roots(read_roots, repo_root=repo_root())
+        from .linux_read_roots import read_surface_fields, validate_read_surface
+        read_roots2, deny_read2 = validate_read_surface(read_roots, deny_read, repo_root())
         from .worker_materialize import card_checkout_fields, validate_card_checkout
 
         materialize2, checkout2 = validate_card_checkout(materialize, checkout)
@@ -5125,7 +5125,7 @@ def create_task(
             else {}
         ),
         "read_first": read_first2,
-        **({"read_roots": read_roots2} if read_roots2 else {}),
+        **read_surface_fields(read_roots2, deny_read2),
         **card_checkout_fields(materialize2, checkout2),
         "immutable_inputs": immutable_inputs2,
         "validation": validation2,
@@ -5232,7 +5232,7 @@ def create_task(
         "task_type": task_type,
         "depends_on": depends_on2,
         "read_first": read_first2,
-        "read_roots": read_roots2,
+        **{"read_roots": read_roots2, "deny_read": deny_read2},
         "materialize": materialize2,
         "checkout": checkout2,
         "immutable_inputs": immutable_inputs2,

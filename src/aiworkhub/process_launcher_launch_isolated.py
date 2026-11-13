@@ -22,7 +22,12 @@ if TYPE_CHECKING:  # names used only in annotations, which are never evaluated
     from .vscode_lm_bridge import BridgeRequest as _BridgeRequestT
     from .worker_workspace import WorkerWorkspace as _WorkerWorkspaceT
 
-__all__ = ["launch_isolated", "relaunch_input_paths", "spawn_with_stdin_payload"]
+__all__ = [
+    "bind_review_contract",
+    "launch_isolated",
+    "relaunch_input_paths",
+    "spawn_with_stdin_payload",
+]
 
 # Eight local-variable annotations in the moved body named ``Path``,
 # ``WorkerWorkspace`` and ``vscode_lm_bridge`` -- module-level imports in
@@ -547,8 +552,17 @@ def launch_isolated(
                     f"grok_kilo_auth_unavailable:{exc.reason}"
                 ) from exc
         sandbox_backend = _sandbox_backend_for_adapter(adapter_id)
-        if read_roots and sandbox_backend != "windows_appcontainer":
-            raise LaunchRejected("read_roots_unsupported_backend")
+        # NF-2026-02238: read_roots on Landlock too, and enforced deny_read.
+        from . import linux_read_roots, workspace_prepare
+
+        try:
+            deny_read = linux_read_roots.validate_deny_read(card.get("deny_read"))
+            linux_read_roots.check_backend(
+                sandbox_backend, read_roots=read_roots, deny_read=deny_read
+            )
+        except ValueError as exc:
+            raise LaunchRejected(str(exc)) from exc
+        prepare_receipt: dict[str, Any] | None = None
         launch_phase = "workspace_and_runtime_provision"
         reservation_ctx = (
             nullcontext()
@@ -703,6 +717,12 @@ def launch_isolated(
                 launch_phase = "workspace_and_runtime_provision"
             else:
                 workspace = create_workspace(self.repo, request_id, card, adapter_id)
+                try:
+                    prepare_receipt = workspace_prepare.prepare_once(
+                        self.repo, workspace.path, state_dir=self.process_dir
+                    )
+                except workspace_prepare.WorkspacePrepareError as exc:
+                    raise LaunchRejected(str(exc)) from exc
                 residual_contract_manifest = build_residual_contract_manifest(
                     workspace, card
                 )
@@ -1121,6 +1141,22 @@ def launch_isolated(
                 backend=sandbox_backend,
                 package_import_root=worker_ai_tools_mcp.resolve_host_package_import_root(),
             )
+            try:
+                worker_argv, sandbox_visibility, deny_read_spec = (
+                    linux_read_roots.prepare_launch_visibility(
+                        backend=sandbox_backend,
+                        worktree=workspace.path,
+                        repo=self.repo,
+                        read_roots=read_roots,
+                        deny_read=deny_read,
+                        plan_path=self.process_dir / f"{request_id}.read-layer.json",
+                        worker_argv=worker_argv,
+                        write_plan=write_json_0600,
+                        workspace_prepare=prepare_receipt,
+                    )
+                )
+            except ValueError as exc:
+                raise LaunchRejected(str(exc)) from exc
             launch_cwd = _worker_launch_cwd(workspace.path)
 
             # B919: snapshot every declared immutable/dependency input from
@@ -1339,6 +1375,7 @@ def launch_isolated(
                     ),
                 },
                 "sandbox_backend": sandbox_backend,
+                "sandbox_visibility": sandbox_visibility,
                 "validation": list(card.get("validation") or []),
                 "validation_roles": list(card.get("validation_roles") or []),
                 "work_kind": str(card.get("work_kind") or "generic"),
@@ -1479,6 +1516,7 @@ def launch_isolated(
                 **appcontainer_identity_fields,
                 **({"worker_mcp_bridge": worker_mcp_bridge} if worker_mcp_bridge else {}),
                 **({"read_roots": read_roots} if read_roots else {}),
+                **deny_read_spec,
             }
             write_json_0600(spec_path, supervisor_spec)
             if adapter_id == "claude_cli" and stdin_payload is not None:
@@ -1798,3 +1836,25 @@ def launch_isolated(
             state="launch_failed" if claimed else "blocked",
             diagnostic=diagnostic,
         )
+
+
+def bind_review_contract(
+    contract: dict[str, Any],
+    card: dict[str, Any],
+    process_dir: Any,
+    target_request_id: str,
+) -> None:
+    """Bind reviewer contract context from the card and the launch record.
+
+    Immutable inputs are authenticated reviewer contract context and read-only
+    workspace materialization authority; candidate path gates stay pure and the
+    caller refreshes the packet's canonical digest afterwards.  NF-2026-02238:
+    the launch's ``sandbox_visibility`` receipt (what the worker could and
+    could not see) is bound as well, when the launch record carries one.
+    """
+    from .review_packet import launch_sandbox_visibility
+
+    contract["immutable_inputs"] = list(card.get("immutable_inputs") or [])
+    sandbox_visibility = launch_sandbox_visibility(process_dir, target_request_id)
+    if sandbox_visibility is not None:
+        contract["sandbox_visibility"] = sandbox_visibility
