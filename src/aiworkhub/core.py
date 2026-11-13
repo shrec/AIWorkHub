@@ -5576,6 +5576,7 @@ def create_task(
     )
     if runner_route_warnings:
         result["runner_route_warnings"] = runner_route_warnings
+        result["runner_route_hint"] = manager_card_amend.runner_route_remedy_hint(runner)
     if wave_binding is not None:
         # The card and its pending binding are already durable, so this
         # projection can only ever be repaired later, never lost or guessed.

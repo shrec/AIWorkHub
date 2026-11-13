@@ -4305,6 +4305,7 @@ def aiworkhub_task_amend_pending(
     read_first: list[str] | None = None,
     validation: list[str] | None = None,
     validation_roles: list[str] | None = None,
+    runner: str | None = None,
 ) -> dict[str, Any]:
     """MANAGER WRITE: amend a pending card that no request was ever launched for.
 
@@ -4330,6 +4331,7 @@ def aiworkhub_task_amend_pending(
         read_first: Existing repo files (optional :N or :N-M suffix) to ADD to read_first; omit to leave them.
         validation: Shell-free commands that REPLACE the card's validation list; omit to keep it.
         validation_roles: One role per validation command; only with validation. Omit for generic roles.
+        runner: Replacement runner (folded like task_create); refused as runner_reserved:<r> for the manager identity or runner_route_absent:<r> without a workforce route. Reply carries runner_before/runner_after.
     """
     result = manager_card_amend.amend_pending(
         task_id,
@@ -4337,6 +4339,7 @@ def aiworkhub_task_amend_pending(
         read_first=read_first,
         validation=validation,
         validation_roles=validation_roles,
+        runner=runner,
     )
     if isinstance(result, dict) and result.get("ok"):
         # Best effort: the amendment already committed, so an unreadable

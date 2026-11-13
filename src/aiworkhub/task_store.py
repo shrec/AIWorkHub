@@ -6545,6 +6545,7 @@ def amend_pending_card(
     read_first: list[str] | None = None,
     validation: list[str] | None = None,
     validation_roles: list[str] | None = None,
+    runner: str | None = None,
 ) -> tuple[bool, str, dict[str, Any]]:
     """Amend one UNLAUNCHED pending card in place (NF-2026-02241).
 
@@ -6552,6 +6553,8 @@ def amend_pending_card(
     ``apply_*_amendment`` functions reject_review uses; ``validation`` (when
     given) REPLACES the list through ``apply_validation_amendment_mode`` --
     including its work_kind role gate -- with ``validation_roles`` aligned.
+    ``runner`` (NF-2026-02252, when given) replaces the card's runner and the
+    row's ``runner`` column; the caller folds and route-checks it first.
     The eligibility check (``unlaunched_pending_refusal``) and the write run in
     one immediate transaction whose ``card_json`` compare-and-swap enforces
     it, so a launch that claims the card first makes this refuse instead of
@@ -6584,12 +6587,18 @@ def amend_pending_card(
             )
         except ValueError as exc:
             return False, str(exc), {}
+        new_runner = str(runner or "").strip()
+        runner_before = str(card.get("runner") or dict(row).get("runner") or "").strip()
+        runner_changed = bool(new_runner) and new_runner != runner_before
+        if runner_changed:
+            card["runner"] = new_runner
         fields = [
             name
             for name, applied in (
                 ("allowed_writes", writes_applied),
                 ("read_first", read_first_applied),
                 ("validation", validation_installed),
+                ("runner", runner_changed),
             )
             if applied
         ]
@@ -6599,19 +6608,31 @@ def amend_pending_card(
             "read_first_added": read_first_applied,
             "validation": list(card.get("validation") or []),
         }
+        runner_detail: dict[str, Any] = (
+            {"runner_before": runner_before, "runner_after": str(card.get("runner") or "")}
+            if new_runner
+            else {}
+        )
+        detail.update(runner_detail)
         if not fields:
             return True, "unchanged", detail
         now = datetime.now(timezone.utc).isoformat()
         history = card.get("history")
         history_list = list(history) if isinstance(history, list) else []
         history_list.append(
-            {"event": CARD_AMENDED_PENDING_EVENT, "actor": actor, "at": now, "fields": fields}
+            {"event": CARD_AMENDED_PENDING_EVENT, "actor": actor, "at": now, "fields": fields,
+             **(runner_detail if runner_changed else {})}
         )
         card["history"] = history_list
+        if runner_changed:
+            # Same transaction as the card_json compare-and-swap below: a lost
+            # CAS rolls this back with it.
+            conn.execute("UPDATE tasks SET runner=? WHERE task_id=?", (new_runner, task_id))
         if not _commit_card_update(
             conn, task_id, preimage=preimage, card=card, event=CARD_AMENDED_PENDING_EVENT,
             actor=actor, payload={"fields": fields, "allowed_writes_added": writes_applied,
-                                  "read_first_added": read_first_applied}, now=now,
+                                  "read_first_added": read_first_applied,
+                                  **(runner_detail if runner_changed else {})}, now=now,
         ):
             return False, "card_changed", {}
         detail["card_content_sha256"] = card_content_identity(card)

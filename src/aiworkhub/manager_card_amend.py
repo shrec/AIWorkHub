@@ -239,6 +239,37 @@ def _refusal(code: str, returncode: int = 2, **extra: Any) -> dict[str, Any]:
     return result
 
 
+def runner_route_remedy_hint(runner: str) -> str:
+    """The create receipt's remedy for an unroutable runner (NF-2026-02252)."""
+    return (
+        f"runner {runner!r} has no workforce route, so a launch will refuse it; "
+        "if this card is meant for a launchable worker, correct it before the "
+        "first launch with aiworkhub_task_amend_pending runner=<routable runner> "
+        "(e.g. claude_opus-5) instead of archiving and recreating the card"
+    )
+
+
+def amend_runner_refusal(runner: str) -> tuple[str, str]:
+    """``(folded_runner, refusal)`` for a runner amendment; refusal ``""`` when allowed.
+
+    Folds with ``core.resolve_create_time_runner`` (the create-time fold),
+    refuses the reserved manager identity ``core.CODEX_RUNNER``, and -- strict
+    where create stays advisory, because an amend is an explicit correction --
+    refuses any runner ``core.create_time_runner_route_warnings`` names.
+    """
+    from . import core
+
+    folded, named_refusal = core.resolve_create_time_runner(str(runner or "").strip())
+    if named_refusal is not None:
+        code = named_refusal.get("error") or named_refusal.get("reason")
+        return folded, str(code or f"runner_refused:{folded}")
+    if folded == core.CODEX_RUNNER:
+        return folded, f"runner_reserved:{folded}"
+    if core.create_time_runner_route_warnings(folded):
+        return folded, f"runner_route_absent:{folded}"
+    return folded, ""
+
+
 def amend_pending(
     task_id: str,
     *,
@@ -246,6 +277,7 @@ def amend_pending(
     read_first: list[str] | None = None,
     validation: list[str] | None = None,
     validation_roles: list[str] | None = None,
+    runner: str | None = None,
 ) -> dict[str, Any]:
     """Amend one UNLAUNCHED pending card: add-only paths, replacement validation.
 
@@ -258,6 +290,11 @@ def amend_pending(
     A launched, claimed, archived or non-pending card refuses with
     ``task_amend_pending_refused:<card_already_launched|card_claimed|
     card_archived|card_not_pending:<state>>``.
+
+    ``runner`` (NF-2026-02252) replaces the card's runner, checked by
+    ``amend_runner_refusal``: ``task_amend_pending_refused:runner_reserved:<r>``
+    for the manager identity, ``...:runner_route_absent:<r>`` for a runner with
+    no workforce route. The receipt carries ``runner_before``/``runner_after``.
     """
     from . import core, quality_evidence, task_templates
 
@@ -275,9 +312,10 @@ def amend_pending(
     writes = [str(value) for value in (allowed_writes or [])]
     reads = [str(value) for value in (read_first or [])]
     commands = [str(value) for value in (validation or [])]
+    requested_runner = str(runner or "").strip()
     if validation_roles is not None and not commands:
         return _refusal("validation_roles_require_validation")
-    if not (writes or reads or commands):
+    if not (writes or reads or commands or requested_runner):
         return _refusal("task_amend_pending_empty")
     root = core.repo_root()
     card = task_store.get_task(root, task_id)
@@ -286,6 +324,11 @@ def amend_pending(
     refusal = task_store.unlaunched_pending_refusal(card, card)
     if refusal:
         return _refusal(f"task_amend_pending_refused:{refusal}", task_id=task_id)
+    folded_runner = ""
+    if requested_runner:
+        folded_runner, runner_refusal = amend_runner_refusal(requested_runner)
+        if runner_refusal:
+            return _refusal(f"task_amend_pending_refused:{runner_refusal}", task_id=task_id)
     if writes:
         if card.get("read_only") is True:
             return _refusal("read_only_allowed_writes_forbidden", task_id=task_id)
@@ -328,6 +371,7 @@ def amend_pending(
         read_first=validated_reads,
         validation=commands or None,
         validation_roles=roles,
+        runner=folded_runner or None,
     )
     if not ok:
         return _refusal(f"task_amend_pending_refused:{reason}", task_id=task_id)
