@@ -21,6 +21,7 @@ import shutil
 import sqlite3
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -41,11 +42,19 @@ def _clean_cache():
 
 
 def _join_refreshes(timeout: float = 30.0) -> None:
-    with task_store._QUICK_CHECK_LOCK:
-        threads = list(task_store._QUICK_CHECK_REFRESHING.values())
-    for thread in threads:
-        thread.join(timeout)
-        assert not thread.is_alive(), "background quick_check did not finish"
+    """Wait, under one bounded deadline, until no background quick_check is
+    registered. A one-shot snapshot of the registry can miss a refresh that
+    registers after it was taken, so the registry is re-read until empty."""
+    deadline = time.monotonic() + timeout
+    while True:
+        with task_store._QUICK_CHECK_LOCK:
+            threads = list(task_store._QUICK_CHECK_REFRESHING.values())
+        if not threads:
+            return
+        assert time.monotonic() < deadline, "background quick_check did not finish"
+        for thread in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+            assert not thread.is_alive(), "background quick_check did not finish"
 
 
 def _ready_repo(tmp_path: Path) -> tuple[Path, Path]:
