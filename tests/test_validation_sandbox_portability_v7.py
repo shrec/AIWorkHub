@@ -1461,7 +1461,7 @@ class TestSemLockCapability:
         assert probe["schema"] == validation_runner.SEMLOCK_PROBE_SCHEMA
         assert probe["primitive"] == validation_runner.SEMLOCK_PRIMITIVE
 
-    def test_landlock_dev_shm_permission_error_is_unsupported(
+    def test_landlock_worker_dev_shm_grant_makes_semlock_supported(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from aiworkhub import process_launcher
@@ -1487,16 +1487,16 @@ class TestSemLockCapability:
         )
         probe = validation_runner.decode_trusted_semlock_exit(child.returncode)
         assert probe is not None, (child.returncode, child.stderr[-400:])
-        assert probe["supported"] is False
+        assert probe["supported"] is True
         assert probe["primitive"] == validation_runner.SEMLOCK_PRIMITIVE
-        assert probe["backend"] == "posix_shm"
-        # The probe ran under the provider/worker ruleset, which never gains
-        # /dev/shm (NF-2026-01740), so it stays denied; without the
-        # validation-only /dev/shm rule that denial is still unsupported.
+        assert probe["backend"] in {"posix_shm", "named_semaphore"}
+        # The probe ran under the provider/worker ruleset, which now gains the
+        # sem_open-only /dev/shm grant (NF-2026-02239), so SemLock is supported
+        # on the worker lane.
         decision = validation_runner.preflight_semlock_capability(
             ["python -m pytest tests/test_x.py"],
             backend="landlock",
-            probe=probe,
+            probe={**probe, "supported": False, "backend": "posix_shm"},
             source_text=lambda rel: "import multiprocessing as mp\nmp.get_context().Lock()\n",
             dev_shm_rule=False,
         )
