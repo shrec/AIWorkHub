@@ -562,6 +562,7 @@ def test_a_pytest_host_command_runs_with_the_lane_interpreter_safe_path_and_tree
         "    return os.path.normcase(os.path.realpath(path))\n"
         "def test_lane():\n"
         "    assert sys.flags.safe_path\n"
+        "    assert os.environ['PYTHONSAFEPATH'] == '1'\n"
         "    assert os.path.dirname(real(probe_nf02240.WHERE)) == real(TREE)\n"
         "    assert TREE in os.environ['PYTHONPATH'].split(os.pathsep)\n"
         "    assert 'AIWH_NF02240_SECRET_TOKEN' not in os.environ\n"
@@ -575,6 +576,9 @@ def test_a_pytest_host_command_runs_with_the_lane_interpreter_safe_path_and_tree
     (basetemp,) = [token for token in argv if token.startswith("--basetemp=")]
     assert Path(basetemp.split("=", 1)[1]).parent.parent == tree / hvs.HOST_SCRATCH_DIR
     assert str(tree) in env["PYTHONPATH"].split(os.pathsep)
+    # ``-P`` binds only the lane interpreter; the env carries safe-path to
+    # every interpreter the command spawns (xdist workers included).
+    assert env["PYTHONSAFEPATH"] == "1"
     row = hvs.host_runner(workspace)(declared, tree)
     output = (row.get("stdout_tail") or "")[-1500:] + (row.get("stderr_tail") or "")[-800:]
     assert row["returncode"] == 0, output

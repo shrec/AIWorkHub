@@ -425,6 +425,10 @@ def validation_command(workspace: Any, argv: Sequence[str]) -> tuple[list[str], 
         )
     else:
         env.pop("PYTHONPATH", None)
+    # ``-P`` binds only the interpreter it is passed to; every interpreter a
+    # host command spawns (xdist/execnet workers, subprocess pythons) inherits
+    # this env, so safe-path holds for them too.
+    env["PYTHONSAFEPATH"] = "1"
     return tokens, env
 
 
