@@ -2517,6 +2517,8 @@ def _launch_prepared_appcontainer(
     """Launch body for :func:`launch_appcontainer` after helper-temp binding."""
 
     _validate_request(request)
+    # NF-2026-02249: a flutter/dart command head's SDK root, read/execute.
+    request, toolchain_grants = _with_toolchain_grants(request)
     # Every AppContainer launch -- worker supervisor, validation lane, anything
     # later -- passes through here, so the LOCALAPPDATA requirement is met once
     # at the chokepoint instead of being remembered by each caller.  It runs
@@ -2620,16 +2622,20 @@ def _launch_prepared_appcontainer(
         grants: list[_PathGrant] = []
         persistent_grants: list[tuple[str, str]] = []
         for grant in grant_plan:
-            applied: _PathGrant = _step(
-                "grant_path_access",
-                partial(
-                    api.grant_path_access,
-                    identity,
-                    grant.path,
-                    grant.access,
-                    persistent=grant.persistent,
-                ),
-            )
+            try:
+                applied: _PathGrant = _step(
+                    "grant_path_access",
+                    partial(
+                        api.grant_path_access,
+                        identity,
+                        grant.path,
+                        grant.access,
+                        persistent=grant.persistent,
+                    ),
+                )
+            except AppContainerError as exc:
+                _raise_for_toolchain_grant(toolchain_grants, grant, exc)
+                raise
             if grant.persistent:
                 persistent_grants.append((grant.path, applied.satisfied_by or "granted"))
             else:
@@ -2848,6 +2854,67 @@ def _validate_request(request: AppContainerRequest) -> None:
     if request.environment is not None:
         _validate_environment(request.environment)
     _validate_grants(request.filesystem_grants)
+
+
+def _with_toolchain_grants(
+    request: AppContainerRequest,
+) -> tuple[AppContainerRequest, dict[str, Callable[[object], str]]]:
+    """``request`` plus read/execute on the SDK root its command head runs from.
+
+    NF-2026-02249: ``flutter analyze`` runs ``<sdk>\\bin\\flutter.bat`` through
+    cmd.exe and then the SDK's cached ``dart.exe``; with the SDK outside the
+    request the container could open neither and the launch failed with a bare
+    WinError 5.  The plan is :func:`toolchain_grants.plan_toolchain_grants`
+    (persistent read_execute, like :func:`python_read_grants`).  Each planned
+    grant is validated against the request here, so a root that cannot be
+    granted refuses the launch naming that root and the cause.  Returns the
+    request and its toolchain roots keyed by normcased grant path, which
+    :func:`_raise_for_toolchain_grant` names if applying one fails.
+    """
+    try:
+        from .toolchain_grants import grant_failure_detail, plan_toolchain_grants
+    except ImportError:  # direct-script entrypoint
+        from toolchain_grants import (  # type: ignore[no-redef]
+            grant_failure_detail,
+            plan_toolchain_grants,
+        )
+
+    covered = [grant.path for grant in request.filesystem_grants if grant.access != "traverse"]
+    planned = plan_toolchain_grants(request.argv, request.environment, covered=covered)
+    if not planned:
+        return request, {}
+    toolchains: dict[str, Callable[[object], str]] = {}
+    for item in planned:
+        try:
+            _validate_grants([*request.filesystem_grants, item.grant])
+        except AppContainerError as exc:
+            raise AppContainerError(
+                exc.reason,
+                detail=grant_failure_detail(item.toolchain, exc),
+                operation="grant_path_access",
+            ) from exc
+        toolchains[os.path.normcase(os.path.normpath(item.grant.path))] = partial(
+            grant_failure_detail, item.toolchain
+        )
+    grants = [*request.filesystem_grants, *(item.grant for item in planned)]
+    return replace(request, filesystem_grants=grants), toolchains
+
+
+def _raise_for_toolchain_grant(
+    toolchains: Mapping[str, Callable[[object], str]],
+    grant: ContainerGrant,
+    exc: AppContainerError,
+) -> None:
+    """Re-raise a failed toolchain-root grant naming that root (NF-2026-02249)."""
+    failure_detail = toolchains.get(os.path.normcase(os.path.normpath(grant.path)))
+    if failure_detail is None:
+        return
+    raise AppContainerError(
+        exc.reason,
+        detail=failure_detail(exc),
+        operation=exc.operation,
+        win_error=exc.win_error,
+    ) from exc
 
 
 def _validate_grants(grants: Sequence[ContainerGrant]) -> None:
