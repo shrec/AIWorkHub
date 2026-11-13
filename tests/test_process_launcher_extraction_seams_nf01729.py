@@ -47,7 +47,9 @@ from aiworkhub import process_launcher_accepted_row_restore as accepted_row_rest
 # skips this ratchet (NF-2026-02020); measured.
 # 13754 -> 13753 (2026-11-03): NF-2026-02022 shared out-of-lock re-snapshot
 # helper for every reservation caller (net -2 from 13755 at HEAD), measured.
-PROCESS_LAUNCHER_MAX_LINES = 13753
+# 13753 -> 13924 (2026-11-13): NF-2026-02248 deferred quality reviewer launch
+# (+171), landed by owner-authorised break-glass; extraction owed (follow-up NF).
+PROCESS_LAUNCHER_MAX_LINES = 13924
 
 # (module, function, seam tuple attribute, ProcessManager method)
 EXTRACTIONS: tuple[tuple[ModuleType, str, str, str], ...] = (

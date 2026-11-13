@@ -6238,6 +6238,24 @@ class ProcessManager:
     # is ever time-limited or killed by elapsed time.  Liveness of a real
     # provider still follows exact process evidence only.
     _QUALITY_REVIEW_LAUNCH_OWNER_SECONDS = 300.0
+    # NF-2026-02248 (NF-2026-00034): a reviewer launch deferred for memory or
+    # concurrency capacity waits in ``launch_admission`` for up to its own
+    # configured ceiling (1800 s by default), far past the 300 s owner ceiling
+    # above, so the owner used to terminalize every capacity-deferred reviewer
+    # as a pid-null timeout before it could spawn.  Each live reviewer
+    # admission wait is registered here by thread ident with its (start,
+    # deadline) window; the owner join accounts for it while that bounded
+    # window is live.  Entries are removed on every exit of the wait.
+    _REVIEWER_LAUNCH_STATE_LOCK = threading.Lock()
+    _REVIEWER_ADMISSION_WAIT_WINDOWS: dict[int, tuple[float, float]] = {}
+    # Launcher ident -> monotonic moment its last admission wait ended (``None``
+    # until one ends).  Keys exist only while an owner join is live for that
+    # launcher, so post-admission work gets a fresh ceiling from admission.
+    _REVIEWER_ADMISSION_ENDED_AT: dict[int, float | None] = {}
+    # One admission poll (``launch_admission.DEFAULT_POLL_SECONDS``) of grace.
+    _REVIEWER_ADMISSION_WAIT_GRACE_SECONDS = float(
+        launch_admission.DEFAULT_POLL_SECONDS
+    )
     # The source-evidence budget is sized from the measured change rather than
     # a fixed excerpt.  2026-09-08 reviewer audit over 38 surviving packets:
     # the old 4,000 B per-path / 60,000 B total excerpt with 3 context lines
@@ -6899,7 +6917,12 @@ class ProcessManager:
         }
 
     def _publish_reviewer_progress(
-        self, request_id: str, phase: str, detail: str | None = None
+        self,
+        request_id: str,
+        phase: str,
+        detail: str | None = None,
+        *,
+        adapter_id: str | None = None,
     ) -> None:
         """Append a bounded preparation progress event for a starting reservation.
 
@@ -6908,18 +6931,23 @@ class ProcessManager:
         live pid-null reservation; it only adds observable preparation phase
         and heartbeat fields. Publishing is a no-op once the reservation has
         been terminalized, so a stale owner can never append progress after a
-        truthful terminal state.
+        truthful terminal state.  ``adapter_id`` (NF-2026-02248) is the owner's
+        adapter, used only when the projected row lost it, so a deferred
+        reservation never drops its adapter identity through progress.
         """
 
         base = self._latest_by_request().get(request_id) or {}
         if base.get("state") != "starting":
             return
+        sealed_adapter = base.get("adapter_id")
+        if not sealed_adapter and adapter_id:
+            sealed_adapter = adapter_id
         event: dict[str, Any] = {
             "request_id": request_id,
             "task_id": base.get("task_id"),
             "runner": base.get("runner"),
             "topic": base.get("topic") or "quality_review",
-            "adapter_id": base.get("adapter_id"),
+            "adapter_id": sealed_adapter,
             "state": "starting",
             "reservation_expires_at_epoch": base.get(
                 "reservation_expires_at_epoch"
@@ -7874,18 +7902,127 @@ class ProcessManager:
         should be terminalized.  A live owned Source Graph prewarm extends the
         owner ceiling, but only until it outlives the preparation stall ceiling,
         so a hung build can no longer hold its owner forever.
+
+        NF-2026-02248: a live reviewer admission wait on the launcher thread
+        (capacity deferral, bounded by its own configured ceiling) is accounted
+        pre-provider time too.  The owner keeps joining while that bounded wait
+        is live and heartbeats the reservation so expiry reconciliation still
+        reads it as live.  When the wait ends, post-admission work gets a fresh
+        owner ceiling measured from the admission moment rather than the rest
+        of the current join slice.  Admission-explained extensions stay inside
+        a separate outer bound: one pre-admission owner ceiling, the configured
+        admission wait plus one poll of grace, and one post-admission ceiling.
         """
 
-        while launcher.is_alive():
-            launcher.join(self._QUALITY_REVIEW_LAUNCH_OWNER_SECONDS)
-            if not launcher.is_alive():
-                return "completed"
-            if self._reviewer_provider_committed(request_id):
-                return "provider_committed"
-            if self._reviewer_source_graph_prewarm_live(request_id):
-                continue
-            return "timeout"
-        return "completed"
+        ceiling = self._QUALITY_REVIEW_LAUNCH_OWNER_SECONDS
+        admission_span = (
+            launch_admission.configured_wait_seconds()
+            + self._REVIEWER_ADMISSION_WAIT_GRACE_SECONDS
+        )
+        ident = getattr(launcher, "ident", None)
+        now = time.monotonic()
+        slice_deadline = now + ceiling
+        outer_deadline = now + ceiling + admission_span + ceiling
+        if ident is not None:
+            with self._REVIEWER_LAUNCH_STATE_LOCK:
+                self._REVIEWER_ADMISSION_ENDED_AT.setdefault(ident, None)
+        try:
+            while launcher.is_alive():
+                launcher.join(max(0.0, slice_deadline - time.monotonic()))
+                if not launcher.is_alive():
+                    return "completed"
+                if self._reviewer_provider_committed(request_id):
+                    return "provider_committed"
+                now = time.monotonic()
+                if self._reviewer_source_graph_prewarm_live(request_id):
+                    # The prewarm is bounded by its own stall ceiling; the
+                    # admission outer bound restarts after it.
+                    slice_deadline = now + ceiling
+                    outer_deadline = max(
+                        outer_deadline, now + ceiling + admission_span + ceiling
+                    )
+                    continue
+                if now >= outer_deadline:
+                    return "timeout"
+                waited = self._reviewer_admission_wait_seconds(launcher)
+                if waited is not None:
+                    self._publish_reviewer_progress(
+                        request_id, "admission_waiting", f"waited_seconds={waited:.1f}"
+                    )
+                    slice_deadline = min(now + ceiling, outer_deadline)
+                    continue
+                ended_at = self._reviewer_admission_ended_at(launcher)
+                if ended_at is not None and now < ended_at + ceiling:
+                    # Fresh spawn ceiling from the admission moment.
+                    slice_deadline = min(ended_at + ceiling, outer_deadline)
+                    continue
+                return "timeout"
+            return "completed"
+        finally:
+            if ident is not None:
+                with self._REVIEWER_LAUNCH_STATE_LOCK:
+                    self._REVIEWER_ADMISSION_ENDED_AT.pop(ident, None)
+
+    @classmethod
+    def _reviewer_admission_ended_at(
+        cls, launcher: threading.Thread
+    ) -> float | None:
+        """Monotonic moment the launcher's last admission wait ended, else ``None``."""
+
+        ident = getattr(launcher, "ident", None)
+        if ident is None:
+            return None
+        with cls._REVIEWER_LAUNCH_STATE_LOCK:
+            return cls._REVIEWER_ADMISSION_ENDED_AT.get(ident)
+
+    @classmethod
+    def _reviewer_admission_wait_seconds(
+        cls, launcher: threading.Thread
+    ) -> float | None:
+        """Seconds a live bounded admission wait on ``launcher`` has run, else ``None``.
+
+        A wait whose own deadline (plus one poll of grace) has passed is no
+        longer an explanation: the admission call returns on its own by then,
+        so an owner still alive past it is stalled elsewhere.
+        """
+
+        ident = getattr(launcher, "ident", None)
+        if ident is None:
+            return None
+        with cls._REVIEWER_LAUNCH_STATE_LOCK:
+            window = cls._REVIEWER_ADMISSION_WAIT_WINDOWS.get(ident)
+        if window is None:
+            return None
+        started, deadline = window
+        now = time.monotonic()
+        if now > deadline + cls._REVIEWER_ADMISSION_WAIT_GRACE_SECONDS:
+            return None
+        return max(0.0, now - started)
+
+    def _publish_reviewer_launch_timeout_evidence(
+        self, request_id: str, adapter_id: str
+    ) -> None:
+        """Publish a pre-provider launch timeout's adapter and attempt evidence.
+
+        The evidence is a separate ``launch_timeout_evidence`` progress event
+        (JSON in ``preparation_detail``); the terminal reason itself stays the
+        exact ``quality_review_launch_timeout`` token consumers match.
+        """
+
+        latest = self._latest_by_request().get(request_id) or {}
+        evidence = {
+            "adapter_id": (adapter_id or str(latest.get("adapter_id") or ""))[:80],
+            "last_phase": str(latest.get("preparation_phase") or "")[:80],
+            "owner_ceiling_seconds": self._QUALITY_REVIEW_LAUNCH_OWNER_SECONDS,
+            "provider_spawn_committed": False,
+            "retryable": True,
+        }
+        self._publish_reviewer_progress(
+            request_id,
+            "launch_timeout_evidence",
+            json.dumps(evidence, sort_keys=True, separators=(",", ":")),
+            adapter_id=adapter_id or None,
+        )
 
     def _launch_reserved_quality_reviewer(
         self,
@@ -7918,11 +8055,20 @@ class ProcessManager:
         launched: dict[str, Any] | None = None
 
         def _progress(phase: str, detail: str | None = None) -> None:
-            self._publish_reviewer_progress(request_id, phase, detail)
+            self._publish_reviewer_progress(
+                request_id, phase, detail, adapter_id=adapter_id or None
+            )
 
         try:
             if not self._reviewer_reservation_still_held(request_id):
                 return
+            if not adapter_id:
+                # NF-2026-02248: the deferred owner carries the adapter the
+                # reservation sealed.  An empty caller value must not record a
+                # false provider rung, launch on a re-derived route or
+                # terminalize the attempt without its adapter identity.
+                reserved = self._latest_by_request().get(request_id) or {}
+                adapter_id = str(reserved.get("adapter_id") or "")
             prep = self._prepared_quality_review(
                 target_request_id, target_task_id, progress=_progress
             )
@@ -8026,10 +8172,16 @@ class ProcessManager:
                 return
             if owner_result == "timeout":
                 # The stale pre-provider owner outlived the ceiling with no
-                # live owned prewarm to explain it.  Terminalize the pid-null
-                # reservation exactly once and return; the worker thread is
-                # never killed, but its ownership-aware checkpoints abort it
-                # before it can spawn.
+                # live owned prewarm or bounded admission wait to explain it.
+                # Terminalize the pid-null reservation exactly once and
+                # return; the worker thread is never killed, but its
+                # ownership-aware checkpoints abort it before it can spawn.
+                # NF-2026-02248: the exact ``quality_review_launch_timeout``
+                # token is kept; adapter, phase and no-spawn evidence publish
+                # first so the failure is diagnosable and retryable, not silent.
+                self._publish_reviewer_launch_timeout_evidence(
+                    request_id, adapter_id
+                )
                 _fail("quality_review_launch_timeout")
                 return
             launched = launch_box.get("result")
@@ -8820,11 +8972,30 @@ class ProcessManager:
     def _await_reviewer_admission(
         self, probe: Callable[[], dict[str, Any]]
     ) -> dict[str, Any]:
-        return launch_admission.await_memory_admission(
-            kind="reviewer",
-            probe=probe,
-            wait_seconds=launch_admission.configured_wait_seconds(),
-        )
+        # NF-2026-02248: register this bounded wait under the calling thread so
+        # the reviewer launch owner join accounts for it instead of reading a
+        # capacity-deferred launch as a stalled pre-provider owner.
+        wait_seconds = launch_admission.configured_wait_seconds()
+        ident = threading.get_ident()
+        started = time.monotonic()
+        with ProcessManager._REVIEWER_LAUNCH_STATE_LOCK:
+            ProcessManager._REVIEWER_ADMISSION_WAIT_WINDOWS[ident] = (
+                started, started + wait_seconds,
+            )
+        try:
+            return launch_admission.await_memory_admission(
+                kind="reviewer",
+                probe=probe,
+                wait_seconds=wait_seconds,
+            )
+        finally:
+            ended = time.monotonic()
+            with ProcessManager._REVIEWER_LAUNCH_STATE_LOCK:
+                ProcessManager._REVIEWER_ADMISSION_WAIT_WINDOWS.pop(ident, None)
+                # Only a launcher whose owner join registered it is recorded,
+                # so this map stays bounded by the live owner joins.
+                if ident in ProcessManager._REVIEWER_ADMISSION_ENDED_AT:
+                    ProcessManager._REVIEWER_ADMISSION_ENDED_AT[ident] = ended
 
     def _admission_deferral(
         self,
