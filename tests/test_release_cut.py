@@ -84,6 +84,9 @@ FULL_CUT = [
     "git archive",
     "wsl mkdir",
     "wsl tar",
+    "wsl git",  # the WSL tree's git init, add and commit (_commit_wsl_tree)
+    "wsl git",
+    "wsl git",
     "wsl pytest",
     "wsl rm",
     "receipt record",
@@ -649,8 +652,9 @@ def test_the_wsl_suite_runs_on_a_git_archive_of_head_under_scratch_release(tmp_p
     (archive,) = runner.argv_of("git archive")
     assert archive == ("git", "archive", "--format=tar", f"--output={scratch / 'head.tar'}", "HEAD")
     wsl_calls = [call for call in runner.calls if call.argv[0] == "wsl"]
-    # The import check, wslpath twice (preflight, wsl_tests), rm, mkdir, tar, pytest, rm.
-    assert len(wsl_calls) == 8
+    # The import check, wslpath twice (preflight, wsl_tests), rm, mkdir, tar, git init,
+    # add and commit, pytest, rm.
+    assert len(wsl_calls) == 11
     assert all(call.env is not None and call.env["MSYS_NO_PATHCONV"] == "1" for call in wsl_calls)
     (suite,) = runner.argv_of("wsl pytest")
     assert _guarded(suite)[0] == f"{LINUX_SCRATCH}/tree"
@@ -678,6 +682,9 @@ def test_every_wsl_tree_command_is_guarded_and_names_only_absolute_linux_paths(
         "wsl rm",
         "wsl mkdir",
         "wsl tar",
+        "wsl git",
+        "wsl git",
+        "wsl git",
         "wsl pytest",
         "wsl rm",
     ]
@@ -687,8 +694,27 @@ def test_every_wsl_tree_command_is_guarded_and_names_only_absolute_linux_paths(
     )
     assert _guarded(guarded[1]) == (LINUX_SCRATCH, ["mkdir", "--", tree])
     assert _guarded(guarded[2]) == (LINUX_SCRATCH, ["tar", "-xf", archive, "-C", tree])
-    assert _guarded(guarded[3])[0] == tree
-    assert guarded[4] == guarded[0]
+    assert _guarded(guarded[3]) == (tree, ["git", "init", "-q"])
+    assert _guarded(guarded[4]) == (
+        tree,
+        ["git", "-c", "user.name=release", "-c", "user.email=release@localhost", "add", "-A"],
+    )
+    assert _guarded(guarded[5]) == (
+        tree,
+        [
+            "git",
+            "-c",
+            "user.name=release",
+            "-c",
+            "user.email=release@localhost",
+            "commit",
+            "-q",
+            "-m",
+            "release-tree",
+        ],
+    )
+    assert _guarded(guarded[6])[0] == tree
+    assert guarded[7] == guarded[0]
 
 
 @pytest.mark.parametrize(

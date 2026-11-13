@@ -148,13 +148,13 @@ def test_non_repository_frames_kept_when_they_are_the_only_frames() -> None:
 
 def test_distilled_text_is_deterministic_and_carries_no_host_path() -> None:
     raw = _TRANSCRIPT.replace(
-        "tests/test_foo.py:12:", "/home/someone/repo/tests/test_foo.py:12:"
+        "tests/test_foo.py:12:", "/home/owner/repo/tests/test_foo.py:12:"
     )
     first = distill_validation_output(command="pytest", exit_status=1, output=raw)
     second = distill_validation_output(command="pytest", exit_status=1, output=raw)
 
     assert first.text == second.text
-    assert "/home/someone" not in first.text
+    assert "/home/owner" not in first.text
     assert "tests/test_foo.py:12: AssertionError" in first.text
 
 
@@ -250,7 +250,7 @@ def test_same_function_name_in_two_modules_attaches_no_frames_or_e_lines() -> No
 def test_repo_relative_never_emits_host_prefix_user_or_parent_traversal() -> None:
     assert _repo_relative("/home/u/src/proj/src/aiworkhub/x.py") == "src/aiworkhub/x.py"
     assert _repo_relative("..\\..\\Users\\bob\\AppData\\x.py") == "x.py"
-    assert _repo_relative("C:\\Users\\bob\\proj\\tests\\test_x.py") == "tests/test_x.py"
+    assert _repo_relative("C:\\Users\\owner\\proj\\tests\\test_x.py") == "tests/test_x.py"
     assert _repo_relative("/opt/other/y.py") == "y.py"
     assert _repo_relative("D:\\work\\z.py") == "z.py"
 
@@ -280,4 +280,4 @@ def test_windows_stdlib_and_foreign_paths_never_look_repo_relative() -> None:
     assert _repo_relative(r"C:\Python312\Lib\unittest\case.py") == "case.py"
     assert _repo_relative(r"/venv/lib/python3.11/site-packages/pkg/tests/helpers.py") == "helpers.py"
     assert _repo_relative(r"C:Users\bob\x.py") == "x.py"
-    assert _repo_relative(r"D:\Dev\AIWorkHub\src\aiworkhub\x.py") == "src/aiworkhub/x.py"
+    assert _repo_relative(r"D:\work\repo\src\aiworkhub\x.py") == "src/aiworkhub/x.py"
