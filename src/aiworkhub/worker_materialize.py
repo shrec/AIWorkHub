@@ -8,6 +8,8 @@ widen what is present on disk -- never what it may write:
   absolute path, no ``..``, no ``.git``).  The repo may add a default list
   under ``worker_materialize`` in ``.aiworkhub/config/project.json``.
 * ``checkout``: ``"sparse"`` (default) or ``"full"`` (the whole ``HEAD`` tree).
+  A card that states no ``checkout`` in a Dart/Flutter repository
+  (``pubspec.yaml`` at the root) gets ``"full"`` (NF-2026-02251).
 
 Writes stay limited by ``allowed_writes``: materialized files are tracked
 paths outside it, so the existing scope gate still rejects a change to them.
@@ -32,6 +34,8 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from .dart_project import is_dart_project
 
 MAX_MATERIALIZE = 64
 MAX_PATTERN_CHARS = 512
@@ -107,18 +111,36 @@ def validate_checkout(raw: Any) -> str:
     return raw.strip().lower()
 
 
+class ExplicitCheckout(str):
+    """A ``checkout`` value the card stated, distinct from the absent default.
+
+    In a Dart/Flutter repository the absent default resolves to ``"full"``
+    (NF-2026-02251), so an explicit ``"sparse"`` is no longer the same card as
+    no value and must be persisted.  Compares equal to the plain string.
+    """
+
+    __slots__ = ()
+
+
 def validate_card_checkout(materialize: Any, checkout: Any) -> tuple[list[str], str]:
-    """The task_create validator for both fields."""
-    return validate_materialize(materialize), validate_checkout(checkout)
+    """The task_create validator for both fields.
+
+    A stated checkout comes back as :class:`ExplicitCheckout`.
+    """
+    globs = validate_materialize(materialize)
+    value = validate_checkout(checkout)
+    if checkout is None or checkout == "":
+        return globs, value
+    return globs, ExplicitCheckout(value)
 
 
 def card_checkout_fields(materialize: Sequence[str], checkout: str) -> dict[str, Any]:
-    """Card keys to persist: only non-default values, so old cards stay identical."""
+    """Card keys to persist: only non-default or explicitly stated values."""
     fields: dict[str, Any] = {}
     if materialize:
         fields["materialize"] = list(materialize)
-    if checkout != DEFAULT_CHECKOUT:
-        fields["checkout"] = checkout
+    if checkout != DEFAULT_CHECKOUT or isinstance(checkout, ExplicitCheckout):
+        fields["checkout"] = str(checkout)
     return fields
 
 
@@ -148,6 +170,21 @@ def repo_default_materialize(repo: str | os.PathLike[str]) -> list[str]:
     if not isinstance(data, dict):
         raise CardCheckoutError(field, "config_not_an_object", type(data).__name__)
     return validate_materialize(data.get(field), field=field)
+
+
+def repo_default_checkout(repo: str | os.PathLike[str]) -> str:
+    """The checkout a card that states none gets in ``repo`` (NF-2026-02251).
+
+    ``"full"`` for a Dart/Flutter project (``pubspec.yaml`` at the root): the
+    sparse closure is Python-import driven and leaves ``flutter analyze``
+    without ``lib/``, ``test/``, ``pubspec.*`` or the package config.  Every
+    other repository keeps the sparse default.  An unreadable root refuses.
+    """
+    try:
+        dart = is_dart_project(repo)
+    except OSError as exc:
+        raise CardCheckoutError("checkout", "repo_probe_failed", type(exc).__name__) from exc
+    return "full" if dart else DEFAULT_CHECKOUT
 
 
 def _forbidden_paths(raw: Any) -> tuple[str, ...]:
@@ -323,8 +360,11 @@ def checkout_policy(
     error type; omitted, the ``CardCheckoutError`` propagates.
     """
     try:
-        card_globs, checkout = validate_card_checkout(
+        card_globs, stated = validate_card_checkout(
             card.get("materialize"), card.get("checkout")
+        )
+        checkout = (
+            str(stated) if isinstance(stated, ExplicitCheckout) else repo_default_checkout(repo)
         )
         globs = tuple(dict.fromkeys([*repo_default_materialize(repo), *card_globs]))
         if len(globs) > 2 * MAX_MATERIALIZE:

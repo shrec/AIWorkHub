@@ -56,11 +56,18 @@ from typing import Any, Mapping, Sequence
 # store, or lifecycle import), so this keeps the self-contained contract above.
 # source_graph_languages is likewise a dependency-free constant table.
 from . import skill_registry
+from .dart_project import (
+    DART_TEMPLATE_WORK_KINDS,
+    FLUTTER_VALIDATION,
+    is_dart_path,
+    partition_dart_paths,
+)
 from .source_graph_languages import LANGUAGE_BY_EXTENSION
 
 __all__ = [
     "AUDITED_CUSTOM_ESCAPE",
     "CALLER_VALIDATION_TEMPLATE_NAME",
+    "DART_FLUTTER_TEMPLATE_NAME",
     "CANONICAL_MINIMALITY_CONTRACT",
     "CANONICAL_VALIDATION_PYTHON",
     "COMMAND_NODE",
@@ -158,6 +165,7 @@ DIFF_CHECK_COMMAND = "git diff --check"
 AUDITED_CUSTOM_ESCAPE = "audited_custom_unclassified"
 CUSTOM_TEMPLATE_NAME = "custom"
 CALLER_VALIDATION_TEMPLATE_NAME = "custom_validation"
+DART_FLUTTER_TEMPLATE_NAME = "dart_flutter_with_tests"
 CANONICAL_MINIMALITY_CONTRACT = (
     "Keep changes bounded to the exact card contract. When Source Graph is required, "
     "use a focus or slice query to check an existing repository symbol or primitive "
@@ -391,13 +399,42 @@ _TEMPLATE_SPECS: dict[str, TaskTemplateSpec] = {
         generates_lint=False,
         generates_diff_check=False,
     ),
+    # Dart/Flutter production + test change (NF-2026-02258). Tried after the
+    # seven built-ins and before the caller-validated fallback; like that one
+    # it takes its scope and work kind (bugfix or generic) from the card, but
+    # derives its own validation from ``dart_project.FLUTTER_VALIDATION``. Also
+    # outside the public ``TEMPLATE_IDS``/``TEMPLATE_SPECS``.
+    DART_FLUTTER_TEMPLATE_NAME: TaskTemplateSpec(
+        name=DART_FLUTTER_TEMPLATE_NAME,
+        title="Dart/Flutter change with tests",
+        objective=(
+            "Change the explicit lib/ Dart production paths and cover them "
+            "with the explicit test/ Dart tests; flutter analyze and flutter "
+            "test validate the change and the required outputs must change."
+        ),
+        task_type="code",
+        work_kind="implementation",
+        read_only=False,
+        production_path_policy=_REQUIRED,
+        test_path_policy=_OPTIONAL,
+        read_first_fields=("production", "test"),
+        generates_pytest=False,
+        generates_lint=False,
+        generates_diff_check=False,
+    ),
 }
+
+# Registered for identity/provenance, never public, and expanded from the
+# card's own scope and work kind.
+_CARD_SCOPED_TEMPLATES: frozenset[str] = frozenset(
+    {CALLER_VALIDATION_TEMPLATE_NAME, DART_FLUTTER_TEMPLATE_NAME}
+)
 
 TEMPLATE_SPECS: MappingProxyType = MappingProxyType(
     {
         name: spec
         for name, spec in _TEMPLATE_SPECS.items()
-        if name != CALLER_VALIDATION_TEMPLATE_NAME
+        if name not in _CARD_SCOPED_TEMPLATES
     }
 )
 TEMPLATE_IDS: tuple[str, ...] = tuple(TEMPLATE_SPECS)
@@ -1229,6 +1266,32 @@ def _caller_validation_commands(
     return commands
 
 
+def _dart_flutter_validation(
+    write_set: Sequence[str], required_outputs: Sequence[str], work_kind: Any
+) -> list[str]:
+    """``flutter analyze`` + ``flutter test`` for a ``lib/`` + ``test/`` Dart scope.
+
+    Fail closed: every write must be ``lib/**.dart`` or ``test/**.dart`` with at
+    least one of each, something must be required to change, and the work kind
+    must carry the bugfix or generic role gate (NF-2026-02258).
+    """
+    production, tests, other = partition_dart_paths(write_set)
+    if other:
+        raise TaskTemplateError("dart_flutter_path_outside_lib_or_test")
+    if not production:
+        raise TaskTemplateError("missing_production_paths")
+    if not tests:
+        raise TaskTemplateError("missing_test_paths")
+    if not required_outputs:
+        raise TaskTemplateError("dart_flutter_requires_required_outputs")
+    if (
+        work_kind is not None
+        and _canonical_work_kind(str(work_kind)) not in DART_TEMPLATE_WORK_KINDS
+    ):
+        raise TaskTemplateError("dart_flutter_work_kind_unsupported")
+    return list(FLUTTER_VALIDATION)
+
+
 def expand_template(
     template_id: Any,
     *,
@@ -1264,7 +1327,10 @@ def expand_template(
     """
     spec = resolve_template(template_id)
     caller_validated = spec.name == CALLER_VALIDATION_TEMPLATE_NAME
-    if not caller_validated and (validation is not None or work_kind is not None):
+    dart = spec.name == DART_FLUTTER_TEMPLATE_NAME
+    if (not caller_validated and validation is not None) or (
+        spec.name not in _CARD_SCOPED_TEMPLATES and work_kind is not None
+    ):
         raise TaskTemplateError("template_validation_not_caller_supplied")
     production = _bounded_paths(
         () if production_paths is None else production_paths, "production"
@@ -1274,7 +1340,7 @@ def expand_template(
     if set(production) & set(tests):
         raise TaskTemplateError("duplicate_path_across_fields")
     write_set: list[str] = [] if spec.read_only else [*production, *tests]
-    if spec.name == "bugfix_with_regression" or caller_validated:
+    if spec.name == "bugfix_with_regression" or caller_validated or dart:
         mandatory_default: Sequence[Any] = write_set
     elif spec.name == "test_only":
         mandatory_default = tests
@@ -1301,6 +1367,8 @@ def expand_template(
         if not required_outputs:
             raise TaskTemplateError("caller_validation_requires_required_outputs")
         validation = _caller_validation_commands(validation, write_set)
+    elif dart:
+        validation = _dart_flutter_validation(write_set, required_outputs, work_kind)
     else:
         validation = _validation_commands_for(spec, production, tests)
     resolved_title = spec.title if title is None else title
@@ -1548,8 +1616,8 @@ def _authenticated_current_provenance(
         return None
     writes = list(card.get("allowed_writes") or [])
     spec = _TEMPLATE_SPECS[name]
-    if spec.name == CALLER_VALIDATION_TEMPLATE_NAME:
-        expansion_inputs = _caller_validation_inputs(card)
+    if spec.name in _CARD_SCOPED_TEMPLATES:
+        expansion_inputs = _card_scoped_inputs(spec.name, card)
     else:
         input_paths = (
             list(card.get("read_first") or []) if spec.read_only else writes
@@ -2052,6 +2120,18 @@ def _caller_validation_inputs(card: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _card_scoped_inputs(name: str, card: Mapping[str, Any]) -> dict[str, Any]:
+    """Expansion inputs for a template whose scope and work kind are the card's.
+
+    The Dart/Flutter template derives its own validation, so it gets the
+    caller-validated inputs minus ``validation``.
+    """
+    inputs = _caller_validation_inputs(card)
+    if name == DART_FLUTTER_TEMPLATE_NAME:
+        del inputs["validation"]
+    return inputs
+
+
 def _custom_escape_provenance(card: Mapping[str, Any]) -> dict[str, Any]:
     expanded_digest = expanded_contract_digest(card)
     payload = {
@@ -2144,7 +2224,10 @@ def classify_task_card(
         if name not in seen:
             candidates.append((name, f"compatible_{name}"))
     # Tried strictly after the seven built-ins, so every card one of them
-    # classifies keeps exactly the identity it had before.
+    # classifies keeps exactly the identity it had before. A Dart card tries
+    # the Dart/Flutter template (NF-2026-02258) before the generic fallback.
+    if any(is_dart_path(path) for path in writes):
+        candidates.append((DART_FLUTTER_TEMPLATE_NAME, "compatible_dart_flutter_with_tests"))
     candidates.append(
         (CALLER_VALIDATION_TEMPLATE_NAME, "compatible_caller_supplied_validation")
     )
@@ -2192,9 +2275,9 @@ def classify_task_card(
     }
     for name, reason in candidates:
         try:
-            if name == CALLER_VALIDATION_TEMPLATE_NAME:
+            if name in _CARD_SCOPED_TEMPLATES:
                 expanded = expand_template(
-                    name, **_caller_validation_inputs(card_view)
+                    name, **_card_scoped_inputs(name, card_view)
                 )
             else:
                 expanded = expand_template(
@@ -2228,7 +2311,7 @@ def classify_task_card(
                 closest_template, closest_field, closest_rank = name, bad_field, rank
             continue
         if (
-            name == CALLER_VALIDATION_TEMPLATE_NAME
+            name in _CARD_SCOPED_TEMPLATES
             and expanded["work_kind"] != work_kind
         ):
             # Launch re-expands this card and compares work_kind exactly, so a
