@@ -1124,10 +1124,22 @@ def recover_incompatible_long_inflight_batches(
     return recovered
 
 
+def _outbox_member_deliverable(conn: sqlite3.Connection, member: sqlite3.Row) -> bool:
+    """The one delivery-eligibility predicate for an outbox member
+    (NF-2026-02261): is its task STILL in the terminal state/episode the row
+    announces?  The claim supersedes every member that fails it
+    (``_supersede_stale_batch_members``) and ``peek_claimable_callback``
+    reports only members that pass it, so the watcher's pending scan and the
+    claim can never disagree about a stale member -- e.g. a cancelled request
+    whose card was retried and relaunched."""
+    return _task_still_in_matching_terminal_state(
+        conn, member["task_id"], member["transition"], member["episode_id"],
+    )
+
+
 def _supersede_stale_batch_members(conn: sqlite3.Connection, batch_id: str) -> int:
-    """Mark any member of ``batch_id`` whose task is no longer in the
-    matching eligible terminal state/episode as superseded. Returns the
-    count of members still eligible after pruning."""
+    """Mark any member of ``batch_id`` that fails ``_outbox_member_deliverable``
+    as superseded. Returns the count of members still eligible after pruning."""
     members = conn.execute(
         "SELECT outbox_id, task_id, transition, episode_id FROM callback_outbox "
         "WHERE batch_id=? AND state IN ('pending', 'inflight')",
@@ -1135,9 +1147,7 @@ def _supersede_stale_batch_members(conn: sqlite3.Connection, batch_id: str) -> i
     ).fetchall()
     remaining = 0
     for member in members:
-        if _task_still_in_matching_terminal_state(
-            conn, member["task_id"], member["transition"], member["episode_id"],
-        ):
+        if _outbox_member_deliverable(conn, member):
             remaining += 1
             continue
         conn.execute(
@@ -1308,6 +1318,8 @@ def _pick_claim_target(
     now_iso: str,
     max_members: int,
     expired_batch_ids: frozenset[str] = frozenset(),
+    excluded_batch_ids: frozenset[str] = frozenset(),
+    excluded_outbox_ids: frozenset[Any] = frozenset(),
 ) -> tuple[str, str, list[Any]] | None:
     """Read-only selection shared by the claim and ``peek_claimable_callback``.
 
@@ -1315,7 +1327,10 @@ def _pick_claim_target(
     ``(batch_id, thread_id, [])``; otherwise ``("", thread_id, ids)`` names the
     unassigned outbox rows a new batch would coalesce.  ``expired_batch_ids``
     are inflight batches whose lease expired and that the caller has not
-    reverted yet (peek) -- they are treated as pending and not-inflight."""
+    reverted yet (peek) -- they are treated as pending and not-inflight.
+    ``excluded_batch_ids``/``excluded_outbox_ids`` are targets peek found with
+    no deliverable member (NF-2026-02261): the claim would supersede them, so
+    they are treated as already gone.  The claim never passes them."""
     provider_where = " AND provider=?" if provider else ""
     thread_where = " AND origin_thread_id=?" if origin_thread_id else ""
     scope_params = tuple(p for p in (provider, origin_thread_id) if p)
@@ -1326,6 +1341,8 @@ def _pick_claim_target(
         " ORDER BY created_at ASC, batch_id ASC",
         scope_params,
     ).fetchall():
+        if row["batch_id"] in excluded_batch_ids:
+            continue
         if row["state"] == "inflight" and row["batch_id"] not in expired_batch_ids:
             inflight_threads.add(row["origin_thread_id"])
         else:
@@ -1340,22 +1357,33 @@ def _pick_claim_target(
     reserved_threads = inflight_threads | {row["origin_thread_id"] for row in pending_batches}
     thread_id = None
     for row in conn.execute(
-        "SELECT origin_thread_id FROM callback_outbox "
+        "SELECT outbox_id, origin_thread_id FROM callback_outbox "
         "WHERE state='pending' AND batch_id='' " + provider_where + thread_where +
         " ORDER BY created_at ASC, outbox_id ASC",
         scope_params,
     ).fetchall():
+        if row["outbox_id"] in excluded_outbox_ids:
+            continue
         if row["origin_thread_id"] not in reserved_threads:
             thread_id = row["origin_thread_id"]
             break
     if thread_id is None:
         return None
+    limit = max(1, int(max_members))
+    # Over-fetch by the excluded count so ``limit`` survivors remain whenever
+    # they exist; bounded by limit + len(excluded_outbox_ids).
+    fetch_limit = limit + len(excluded_outbox_ids)
     candidates = conn.execute(
         "SELECT outbox_id FROM callback_outbox "
         "WHERE state='pending' AND batch_id='' AND origin_thread_id=? " + provider_where +
         " ORDER BY created_at ASC, outbox_id ASC LIMIT ?",
-        (thread_id, provider, max(1, int(max_members))) if provider else (thread_id, max(1, int(max_members))),
+        (thread_id, provider, fetch_limit) if provider else (thread_id, fetch_limit),
     ).fetchall()
+    candidates = [
+        candidate
+        for candidate in candidates
+        if candidate["outbox_id"] not in excluded_outbox_ids
+    ][:limit]
     return "", thread_id, [candidate["outbox_id"] for candidate in candidates]
 
 
@@ -1370,8 +1398,14 @@ def peek_claimable_callback(
     """Return the batch ``claim_pending_callback_batch`` would claim right now
     for this exact route, without writing anything (no lease, ack or UPDATE).
 
-    Stale-member supersede still happens only inside a real claim, so a batch
-    whose members are all stale is reported here and consumed by the claim.
+    NF-2026-02261: the claim supersedes every member that fails
+    ``_outbox_member_deliverable`` and, when none is left, retires that batch
+    and moves on to the next target.  Peek applies the same predicate to the
+    same target: it reports only the members the claim would deliver, and a
+    target with none is skipped exactly as the claim skips it.  A stale member
+    -- e.g. a cancelled request superseded by a relaunch on the same card -- is
+    therefore never reported as pending.  The supersede itself still happens
+    only inside a real claim.
 
     NF-2026-02109: with no claimable outbox row, a review/terminal task that
     the claim's seed reconciliation would wake on this route is reported too
@@ -1392,39 +1426,58 @@ def peek_claimable_callback(
     if present != {"callback_outbox", "callback_batches"}:
         return None
     now_iso = utc_now()
-    target = _pick_claim_target(
-        conn,
-        provider=provider,
-        origin_thread_id=origin_thread_id,
-        now_iso=now_iso,
-        max_members=max_members,
-        expired_batch_ids=frozenset(_expired_batch_ids(conn, now_iso)),
-    )
-    if target is None:
-        if not include_seed:
-            return None
-        seed_members = _peek_seed_eligible_members(
+    expired_batch_ids = frozenset(_expired_batch_ids(conn, now_iso))
+    skipped_batch_ids: set[str] = set()
+    skipped_outbox_ids: set[Any] = set()
+    while True:
+        target = _pick_claim_target(
             conn,
             provider=provider,
             origin_thread_id=origin_thread_id,
+            now_iso=now_iso,
             max_members=max_members,
+            expired_batch_ids=expired_batch_ids,
+            excluded_batch_ids=frozenset(skipped_batch_ids),
+            excluded_outbox_ids=frozenset(skipped_outbox_ids),
         )
-        if not seed_members:
+        if target is None:
+            if not include_seed:
+                return None
+            seed_members = _peek_seed_eligible_members(
+                conn,
+                provider=provider,
+                origin_thread_id=origin_thread_id,
+                max_members=max_members,
+            )
+            if not seed_members:
+                return None
+            return {"batch_id": "", "members": seed_members, "seed_pending": True}
+        batch_id, _thread_id, outbox_ids = target
+        if batch_id:
+            rows = conn.execute(
+                "SELECT * FROM callback_outbox WHERE batch_id=? AND state IN ('pending', 'inflight') "
+                "ORDER BY created_at ASC, outbox_id ASC",
+                (batch_id,),
+            ).fetchall()
+        elif outbox_ids:
+            rows = conn.execute(
+                "SELECT * FROM callback_outbox WHERE outbox_id IN (%s) "
+                "ORDER BY created_at ASC, outbox_id ASC" % ",".join("?" * len(outbox_ids)),
+                tuple(outbox_ids),
+            ).fetchall()
+        else:
+            # The rows vanished between two reads (a concurrent claim); there
+            # is nothing to exclude, so stop and let the next poll re-read.
             return None
-        return {"batch_id": "", "members": seed_members, "seed_pending": True}
-    batch_id, _thread_id, outbox_ids = target
-    if batch_id:
-        rows = conn.execute(
-            "SELECT * FROM callback_outbox WHERE batch_id=? AND state IN ('pending', 'inflight') "
-            "ORDER BY created_at ASC, outbox_id ASC",
-            (batch_id,),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM callback_outbox WHERE outbox_id IN (%s) "
-            "ORDER BY created_at ASC, outbox_id ASC" % ",".join("?" * len(outbox_ids)),
-            tuple(outbox_ids),
-        ).fetchall()
+        rows = [row for row in rows if _outbox_member_deliverable(conn, row)]
+        if rows:
+            break
+        # The claim would supersede this whole target and move on; so does
+        # peek.  Each pass excludes at least one row or batch, so it ends.
+        if batch_id:
+            skipped_batch_ids.add(batch_id)
+        else:
+            skipped_outbox_ids.update(outbox_ids)
     return {
         "batch_id": batch_id,
         "members": [
