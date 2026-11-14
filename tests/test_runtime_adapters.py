@@ -57,6 +57,9 @@ def test_claude_argv_is_current_noninteractive_shape(monkeypatch, tmp_path):
         "--verbose",
         "--permission-mode",
         "dontAsk",
+        "--tools",
+        ",".join(runtime_adapters.claude_builtin_tools(read_only=False)),
+        "--disable-slash-commands",
         "--allowedTools",
         *runtime_adapters.claude_allowed_tools(read_only=False),
         "--no-session-persistence",
@@ -113,6 +116,52 @@ def _claude_tool_lists(argv: list[str]) -> tuple[list[str], list[str]]:
     rest = argv[argv.index("--disallowedTools") + 1:]
     denied = rest[: rest.index("--model")] if "--model" in rest else rest
     return allowed, denied
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+@pytest.mark.parametrize("windows_powershell", [False, True])
+def test_claude_worker_tools_flag_is_the_role_builtin_set(
+    monkeypatch, tmp_path, read_only, windows_powershell
+):
+    """``--tools`` is availability: the role's built-in names plus ``ToolSearch``.
+
+    Covers build and read-only roles under Bash and PowerShell. No MCP name,
+    no Claude-wide tool (WebSearch, Workflow, Task, CronCreate ...) may appear.
+    """
+    shell = (
+        runtime_adapters.CLAUDE_SHELL_POWERSHELL
+        if windows_powershell
+        else runtime_adapters.CLAUDE_SHELL_BASH
+    )
+    monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: windows_powershell)
+    executable = _executable(tmp_path, "claude")
+    extra = (
+        {"outer_sandbox_backend": runtime_adapters.WINDOWS_APPCONTAINER_SANDBOX_BACKEND}
+        if windows_powershell
+        else {}
+    )
+    plan = runtime_adapters.build_runtime_command(
+        "claude_cli",
+        "Prompt",
+        tmp_path,
+        read_only=read_only,
+        executable_overrides={"claude_cli": str(executable)},
+        **extra,
+    )
+
+    assert plan.argv, plan.validation_reason
+    names = plan.argv[plan.argv.index("--tools") + 1].split(",")
+    expected = (
+        ["Read", shell, "Grep", "Glob"] if read_only else ["Read", shell, "Write"]
+    ) + ["ToolSearch"]
+    assert names == expected
+    assert "--disable-slash-commands" in plan.argv
+    assert not any(name.startswith("mcp__") for name in names)
+    for banned in (
+        "WebSearch", "WebFetch", "Workflow", "Task", "CronCreate", "Skill", "SendMessage",
+        "ScheduleWakeup", "TaskStop", "EnterWorktree",
+    ):
+        assert banned not in names
 
 
 @pytest.mark.parametrize("read_only", [False, True])
@@ -218,6 +267,9 @@ def test_claude_omits_model_when_not_requested(monkeypatch, tmp_path):
         "--verbose",
         "--permission-mode",
         "dontAsk",
+        "--tools",
+        ",".join(runtime_adapters.claude_builtin_tools(read_only=False)),
+        "--disable-slash-commands",
         "--allowedTools",
         *runtime_adapters.claude_allowed_tools(read_only=False),
         "--no-session-persistence",

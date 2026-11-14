@@ -1814,6 +1814,23 @@ def claude_allowed_tools(
     return tuple(shell if tool == CLAUDE_SHELL_BASH else tool for tool in tools)
 
 
+def claude_builtin_tools(*, read_only: bool, shell: str = CLAUDE_SHELL_BASH) -> tuple[str, ...]:
+    """Built-in tool names for ``claude --tools``: the role's list, MCP names removed.
+
+    ``--allowedTools`` is a permission allowlist only; every built-in tool stays
+    in the model's prompt. ``--tools`` sets availability. The worker's AIWorkHub
+    MCP tools are deferred and reached through ``ToolSearch``, so that loader is
+    the one built-in added back. Order follows ``claude_allowed_tools``.
+    """
+    names = [
+        tool
+        for tool in claude_allowed_tools(read_only=read_only, shell=shell)
+        if not tool.startswith("mcp__")
+    ]
+    names.append("ToolSearch")
+    return tuple(names)
+
+
 def claude_disallowed_tools(
     *, read_only: bool, shell: str = CLAUDE_SHELL_BASH
 ) -> tuple[str, ...]:
@@ -2600,6 +2617,15 @@ def build_runtime_command(
             "--verbose",
             "--permission-mode",
             "dontAsk",
+            *(
+                ()
+                if _manager_host
+                else (
+                    "--tools",
+                    ",".join(claude_builtin_tools(read_only=read_only, shell=worker_shell)),
+                    "--disable-slash-commands",
+                )
+            ),
             "--allowedTools",
             *(
                 CLAUDE_MANAGER_ALLOWED_TOOLS

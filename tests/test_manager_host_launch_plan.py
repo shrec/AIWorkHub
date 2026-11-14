@@ -80,7 +80,21 @@ def test_manager_argv_differs_from_the_worker_only_in_its_tool_lists(
     assert "mcp__AIWorkHub" not in worker_plan.argv
     manager_tools = manager_plan.argv.index("--allowedTools")
     worker_tools = worker_plan.argv.index("--allowedTools")
-    assert manager_plan.argv[:manager_tools] == worker_plan.argv[:worker_tools]
+    worker_prefix = worker_plan.argv[:worker_tools]
+    assert "--tools" in worker_prefix
+    assert "--disable-slash-commands" in worker_prefix
+    # --tools and its one comma-joined value are tool lists, not launch shape:
+    # strip them, and the slash-command switch, before comparing the prefix.
+    tools_at = worker_prefix.index("--tools")
+    shared_prefix = [
+        token
+        for index, token in enumerate(worker_prefix)
+        if index not in (tools_at, tools_at + 1)
+        and token != "--disable-slash-commands"
+    ]
+    assert "--tools" not in manager_plan.argv
+    assert "--disable-slash-commands" not in manager_plan.argv
+    assert manager_plan.argv[:manager_tools] == shared_prefix
     assert worker_plan.stdin_text == "p"
     assert manager_plan.stdin_text == "p"
 
