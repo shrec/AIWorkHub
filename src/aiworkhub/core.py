@@ -12380,11 +12380,11 @@ from .manager_callback_wait import (  # noqa: E402,F401 -- re-exported for calle
     CALLBACK_WAIT_HOST_SAFETY_SECONDS, CALLBACK_WAIT_HOST_TIMEOUT_MS_ENV, CALLBACK_WAIT_MAX_SECONDS_DEFAULT,
     CALLBACK_WAIT_MAX_SECONDS_ENV, CALLBACK_WAIT_REVIEW_WAITING_LIMIT, CALLBACK_WAIT_SKIPPED_STALE_LIMIT,
     CALLBACK_WAIT_SNAPSHOT_LIMIT, CALLBACK_WAIT_WATCH_LIMIT, CALLBACK_WAIT_WATCH_POLL_SECONDS,
-    _CALLBACK_WAIT_MAX_SECONDS_RANGE, _callback_member_stale_reason, _callback_review_waiting,
-    _claude_lane_refusal, _claude_session_liveness_snapshot, _claude_session_process_rows,
-    _epoch_to_iso, _seconds_since_iso, _watch_signature, callback_wait_limits, claude_callback_ack,
-    claude_callback_wait,
+    _CALLBACK_WAIT_MAX_SECONDS_RANGE, _callback_member_stale_reason, _claude_lane_refusal,
+    _claude_session_liveness_snapshot, _claude_session_process_rows, _epoch_to_iso,
+    _seconds_since_iso, _watch_signature, callback_wait_limits, claude_callback_ack, claude_callback_wait,
 )
+from .callback_review_waiting import _callback_review_waiting  # noqa: E402,F401 -- NF-2026-02262 owner
 
 
 def claude_callback_ack_by_reference(*, task_id: str = "", request_id: str = "") -> dict[str, Any]:

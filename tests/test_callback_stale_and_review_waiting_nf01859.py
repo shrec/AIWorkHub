@@ -174,6 +174,26 @@ def test_review_ready_card_delivered_to_another_origin_is_named_in_review_waitin
     assert _scalar("SELECT COUNT(*) FROM callback_outbox WHERE task_id='T-OTHER'") == 1
 
 
+def test_foreign_review_card_without_callback_row_is_named_other_origin(repo):
+    """NF-2026-02262 review: a review card whose task origin is foreign but which
+    has no callback row is still other_origin, not no_callback_row.  The builder
+    is called directly: a full wait would first retarget-seed the row (NF-2026-02015)."""
+    _insert_task("T-FOREIGN-NOROW", status="review", origin=OTHER)
+
+    result = core._callback_review_waiting("claude", SESSION)
+
+    assert result["review_waiting"] == [
+        {
+            "task_id": "T-FOREIGN-NOROW", "status": "review",
+            "terminal_substatus": "review_ready", "reason": "other_origin",
+        }
+    ]
+    assert result["other_origin_count"] == 1
+    # Visibility only: listing never claims or seeds.
+    assert _scalar("SELECT COUNT(*) FROM callback_batches") == 0
+    assert _scalar("SELECT COUNT(*) FROM callback_outbox WHERE task_id='T-FOREIGN-NOROW'") == 0
+
+
 def test_young_deferred_review_chain_is_named(repo):
     _insert_task(
         "T-DEFERRED", status="review", origin=SESSION,
