@@ -6,6 +6,24 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.99] - 2026-11-14
+
+### Fixed
+
+- The callback watcher no longer exits immediately forever on a cancelled request that stays in a seed batch (NF-2026-02261).
+- `callback_wait` lists a review-ready card delivered to another origin under `other_origin` again (NF-2026-02262), and hides other-origin blocked cards by default (NF-2026-02255).
+- An accept in-flight marker held by a live foreign server process is reported with its holder pid and age in accept preview and status (NF-2026-02263).
+- VS Code LM workers are not stopped early by `source_graph_no_progress`, and a rejected card can be rerouted (NF-2026-02246).
+- A finalize cleanup PermissionError no longer destroys a live candidate worktree (NF-2026-02250).
+- `detail=evidence` replies of `task_show` and `agent_task_status` are bounded (NF-2026-02256).
+- Liveness names the host-validation phase instead of `child_alive=false` (NF-2026-02259).
+- Reviewer launch admission helpers moved out of `process_launcher.py` under the module size ratchet (NF-2026-02260).
+- Accept-time neighbour tests always include repository contract tests (NF-2026-02245).
+- `task_amend_pending` can change the runner of an unlaunched card (NF-2026-02252).
+- Flutter/Dart toolchains start inside Windows AppContainer (NF-2026-02249), and non-Python cards get a full validation tree (NF-2026-02251, NF-2026-02258).
+- A `validation_environment` reject stops the auto-replay loop (NF-2026-02253, NF-2026-02254).
+- A deferred quality-reviewer launch keeps its adapter (NF-2026-02248); the review packet cap counts paths, not bytes (NF-2026-02247); the route risk signal matches whole path tokens.
+
 ## [0.12.98] - 2026-11-13
 
 ### Added

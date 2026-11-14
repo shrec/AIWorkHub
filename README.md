@@ -177,10 +177,10 @@ inherit the manager's launch capability.
 - **semantic-edit-historical-cap-boundary**: historical capped a/b observation at 20k/200k ops shows a 29.329% reduction; this is a capped historical sample, not eligible as a live guarantee.
 - **context-bundle-v2-structural-only**: structural-only validation; live fleet remeasurement pending.
 
-## What's new in 0.12.98
+## What's new in 0.12.99
 
-- Workers see only what a card allows: Linux read roots through Landlock, a `deny_read` glob list enforced on Landlock and Windows AppContainer, an optional one-time `workspace_prepare` hook per worktree, and a visibility receipt in the review packet.
-- A hub host validation stage runs a card's host commands and test sweep on a full candidate tree in the background before accept, and the manager can amend a pending card or accept with a small correction of confirmed findings.
+- Callback watching is reliable again: the watcher no longer exits forever on a cancelled request, `callback_wait` names review-ready cards held by another origin and hides other-origin blocked cards by default, and an accept lock held by a live foreign process is reported with its holder and age.
+- Workers and validation are steadier: VS Code LM workers are no longer stopped early for Source Graph no-progress, Flutter/Dart cards start inside Windows AppContainer with a full validation tree, a cleanup PermissionError no longer destroys a live candidate worktree, and liveness names the host-validation phase.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Documentation

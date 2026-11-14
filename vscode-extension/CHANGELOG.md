@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.12.99 — 2026-11-14
+
+### Fixed
+
+- Bundles runtime 0.12.99: reliable callback watching and review-waiting reporting, a visible accept in-flight lock, VS Code LM worker no-progress and reroute fixes, Flutter/Dart cards inside Windows AppContainer, and safer finalize cleanup.
+
 ## 0.12.98 — 2026-11-13
 
 ### Fixed
