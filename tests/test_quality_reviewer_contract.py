@@ -1555,11 +1555,18 @@ def test_nf1358_review_workspace_skips_live_hub_runtime_files(
         db.execute("INSERT INTO t VALUES (1)")
         with (hub / "source_graph" / "index.lock").open("a+b") as handle:
             platform_io.lock_fd(handle.fileno(), blocking=False)
+            # NF-2026-02267: an untracked canonical file is review content only
+            # when the review names it, so these two are explicit inputs.
             review, evidence = worker_workspace.create_quality_review_workspace(
-                source, "4" * 32, ["source.py"], "validation"
+                source,
+                "4" * 32,
+                ["source.py"],
+                "validation",
+                [".aiworkhub/models.json", "uv.lock"],
             )
 
         assert evidence["canonical_delta_paths"] == [".aiworkhub/models.json", "uv.lock"]
+        assert evidence["canonical_untracked_skipped"] == 0
         assert (review.path / "uv.lock").read_text(encoding="utf-8") == "version = 1\n"
         assert not (review.path / ".aiworkhub" / "source_graph").exists()
     finally:

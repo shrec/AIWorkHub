@@ -5883,6 +5883,16 @@ def finalization_preflight_probe_nonblocking(
 def _canonical_worktree_delta_paths(repo: Path) -> list[str]:
     """Return the bounded tracked/untracked delta of the live canonical tree."""
 
+    tracked, untracked = _canonical_worktree_delta_split(repo)
+    rows = sorted(set(tracked) | set(untracked))
+    if len(rows) > MAX_SEED_FILES:
+        raise WorkspaceError(f"combined_tree_path_limit_exceeded:{len(rows)}")
+    return rows
+
+
+def _canonical_worktree_delta_split(repo: Path) -> tuple[list[str], list[str]]:
+    """Return the live canonical delta as sorted ``(tracked, untracked)`` rows (NF-2026-02267)."""
+
     tracked = _run(["git", "diff", "--name-only", "--no-renames", "-z", "HEAD"], cwd=repo)
     if tracked.returncode != 0:
         raise WorkspaceError(f"combined_tree_git_diff_failed:{tracked.stderr[:300]}")
@@ -5903,23 +5913,26 @@ def _canonical_worktree_delta_paths(repo: Path) -> list[str]:
     # state is never canonical content, so the combined tree leaves it out.
     # NF-2026-01391: git lists an untracked nested repository or worktree as one
     # ``dir/`` row it never descends into; it is not this repository's content.
-    rows = sorted(
-        {
-            _relative_repo_path(value)
-            for value in (tracked.stdout + untracked.stdout).split("\x00")
-            if value and not value.endswith("/")
-            and not (
-                value.startswith(f"{HUB_DIRNAME}/")
-                and any(
-                    fnmatch.fnmatchcase(PurePosixPath(value).name, pattern)
-                    for pattern in RUNTIME_ONLY_PATTERNS
+    def _rows(stdout: str) -> list[str]:
+        return sorted(
+            {
+                _relative_repo_path(value)
+                for value in stdout.split("\x00")
+                if value and not value.endswith("/")
+                and not (
+                    value.startswith(f"{HUB_DIRNAME}/")
+                    and any(
+                        fnmatch.fnmatchcase(PurePosixPath(value).name, pattern)
+                        for pattern in RUNTIME_ONLY_PATTERNS
+                    )
                 )
-            )
-        }
-    )
-    if len(rows) > MAX_SEED_FILES:
-        raise WorkspaceError(f"combined_tree_path_limit_exceeded:{len(rows)}")
-    return rows
+            }
+        )
+
+    tracked_rows = _rows(tracked.stdout)
+    tracked_set = set(tracked_rows)
+    untracked_rows = [row for row in _rows(untracked.stdout) if row not in tracked_set]
+    return tracked_rows, untracked_rows
 
 
 def _overlay_regular_path(source_root: Path, target_root: Path, relative: str) -> None:
@@ -6144,7 +6157,12 @@ def create_quality_review_workspace(
     if not candidate:
         raise WorkspaceError("quality_review_candidate_empty")
     read_only_inputs = _quality_review_read_only_input_paths(repo, read_only_input_paths)
-    canonical_delta = _canonical_worktree_delta_paths(repo)
+    # NF-2026-02267: untracked canonical files the review does not name are owner
+    # scratch; copying them all (7,952 files / 492 MB) outlived the launch owner.
+    canonical_tracked, canonical_untracked = _canonical_worktree_delta_split(repo)
+    review_named = set(candidate) | set(read_only_inputs)
+    canonical_delta = sorted(set(canonical_tracked) | (set(canonical_untracked) & review_named))
+    canonical_untracked_skipped = len(set(canonical_untracked) - review_named)
     seed_paths = sorted(set(candidate) | set(canonical_delta) | set(read_only_inputs))
     if len(seed_paths) > MAX_SEED_FILES:
         raise WorkspaceError(f"quality_review_path_limit_exceeded:{len(seed_paths)}")
@@ -6232,6 +6250,7 @@ def create_quality_review_workspace(
             "schema_id": "aiworkhub.quality_review_workspace.v1",
             "candidate_paths": candidate,
             "canonical_delta_paths": canonical_delta,
+            "canonical_untracked_skipped": canonical_untracked_skipped,
             "read_only_input_paths": read_only_inputs,
             "read_only_input_hashes": read_only_input_hashes,
             "readonly": True,

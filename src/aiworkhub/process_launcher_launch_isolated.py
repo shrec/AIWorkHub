@@ -604,6 +604,11 @@ def launch_isolated(
                 source_workspace = WorkerWorkspace.from_metadata(
                     dict(quality_review_binding["source_workspace"])
                 )
+                # NF-2026-02267: name the reviewer worktree materialization in
+                # the preparation evidence, so a slow seed/overlay is reported
+                # as this phase rather than a bare isolated_launch_started.
+                if prewarm_progress is not None:
+                    prewarm_progress("quality_review_workspace_materialize_started")
                 workspace, review_workspace_evidence = create_quality_review_workspace(
                     source_workspace,
                     request_id,
@@ -611,6 +616,8 @@ def launch_isolated(
                     adapter_id,
                     quality_review_binding.get("read_only_input_paths") or (),
                 )
+                if prewarm_progress is not None:
+                    prewarm_progress("quality_review_workspace_materialize_complete")
                 review_packet_path = (
                     workspace.home
                     / "task_mcp_worker_runtime"
