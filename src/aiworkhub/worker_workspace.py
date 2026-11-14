@@ -5607,7 +5607,7 @@ def cleanup_workspace(
     home: Path,
     *,
     git_timeout: float = 120,
-) -> None:
+) -> dict[str, Any] | None:
     repo = repo.resolve()
     path = path.resolve()
     home = home.resolve()
@@ -5627,14 +5627,13 @@ def cleanup_workspace(
     # remove only that exact administrative directory. No global prune and no
     # subprocess are needed.
     _ = git_timeout  # retained API compatibility; cleanup is process-free.
-    admin_dir = _registered_worktree_admin_dir(repo, path)
-    _rmtree_workspace_owned(path.parent)
-    if path.exists() or home.exists() or path.parent.exists():
-        raise WorkspaceError("workspace_cleanup_directory_retained")
-    if admin_dir is not None:
-        _rmtree_workspace_owned(admin_dir)
-        if admin_dir.exists():
-            raise WorkspaceError("workspace_cleanup_registration_retained")
+    # NF-2026-02250: live-candidate hold + bounded lock retry; a residue is returned.
+    # ``from . import`` keeps the sparse seed import closure unchanged (no hard edge).
+    from . import workspace_cleanup_retry
+    residue = workspace_cleanup_retry.remove_request_workspace(
+        repo, path, home, admin_dir=lambda: _registered_worktree_admin_dir(repo, path),
+        remove=_rmtree_workspace_owned, error=WorkspaceError,
+    )
     # NF430: the request-owned worker temp authority shares this workspace's
     # lifecycle.  Whenever the isolated worktree is torn down (accepted,
     # cancelled, provider-crashed, or reclaimed) its
@@ -5648,6 +5647,7 @@ def cleanup_workspace(
         dispose_worker_temp(repo, path.parent.name)
     except Exception:  # noqa: BLE001 - cleanup must never fail on temp disposal
         pass
+    return residue
 
 
 def _finalization_probe_key(repo: Path, adapter_id: str) -> tuple[str, str, str]:
