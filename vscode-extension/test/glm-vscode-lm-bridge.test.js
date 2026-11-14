@@ -6349,7 +6349,10 @@ async function nf998TextSourceGraphDuplicateStopsLiveLoop() {
     name: graph,
     input: { mode: "focus", query, target: null, workflow_stage: "implementation" },
   });
-  const outputs = [toolRequest("src/app.py"), toolRequest("  src/app.py  "), toolRequest("src/app.py")];
+  // NF-2026-02246: the run ends on the repeat after VSCODE_LM_MAX_IDENTICAL_SOURCE_GRAPH_REPEATS duplicates.
+  const outputs = [toolRequest("src/app.py"), toolRequest("  src/app.py  "),
+    ...Array.from({ length: internals.constants.VSCODE_LM_MAX_IDENTICAL_SOURCE_GRAPH_REPEATS },
+      () => toolRequest("src/app.py"))];
   const receipts = [];
   const model = {
     capabilities: { toolCalling: false },
@@ -6496,10 +6499,15 @@ async function nf998NativeSourceGraphDuplicateStopsLiveLoop() {
     return { ok: true, content: "graph" };
   }).then(() => assert.fail("native duplicate loop must stop"), (error) => error);
   assert.strictEqual(liveCalls, 1);
-  assert.deepStrictEqual(pairedResults.map((part) => part.callId), ["duplicate-1", "duplicate-2"],
+  // NF-2026-02246: every exact repeat up to the bound gets the duplicate receipt.
+  const repeats = internals.constants.VSCODE_LM_MAX_IDENTICAL_SOURCE_GRAPH_REPEATS;
+  assert.deepStrictEqual(pairedResults.map((part) => part.callId),
+    Array.from({ length: repeats + 1 }, (_, index) => `duplicate-${index + 1}`),
     "native tool results must pair with their provider call IDs");
   assert.deepStrictEqual(pairedResults[0].result, { ok: true, content: "graph" });
-  assert.strictEqual(pairedResults[1].result.schema_id, "aiworkhub.vscode_lm.source_graph_duplicate.v1");
+  for (const part of pairedResults.slice(1)) {
+    assert.strictEqual(part.result.schema_id, "aiworkhub.vscode_lm.source_graph_duplicate.v1");
+  }
   assert.strictEqual(failure.message, "vscode_lm_source_graph_no_progress");
   assert.ok(turn < internals.constants.VSCODE_LM_STALL_TURNS, "the duplicate guard fails before the stall watchdog");
 }
@@ -6534,7 +6542,7 @@ async function nf998ForcedStageDuplicateAfterReadCap() {
     toolRequest(graph, {
       mode: "body", query: "differentSymbol", target: dependency, workflow_stage: "implementation",
     }),
-    bodyRead, bodyRead,
+    ...Array.from({ length: internals.constants.VSCODE_LM_MAX_IDENTICAL_SOURCE_GRAPH_REPEATS + 1 }, () => bodyRead),
   ];
   const receipts = [];
   const model = {
@@ -6566,11 +6574,15 @@ async function nf998ForcedStageDuplicateAfterReadCap() {
     return { ok: true, content: "bounded graph" };
   })).then(() => assert.fail("a capped duplicate must stop the run"), (error) => error);
   assert.deepStrictEqual(liveDependencyReads, ["file", "body"]);
-  // The last two receipts the model saw before the second duplicate ended the run.
-  assert.strictEqual(receipts.at(-2).result.error, "vscode_lm_semantic_edit_stage_required",
-    "a new query remains subject to the two-read cap");
-  assert.strictEqual(receipts.at(-1).result.schema_id, "aiworkhub.vscode_lm.source_graph_duplicate.v1",
-    "the first duplicate after the read cap gets the typed receipt");
+  // NF-2026-02246: the repeats after the read cap each get the typed duplicate
+  // receipt, never a live read, until the bounded no-progress guard ends the run.
+  const capIndex = receipts.findLastIndex((receipt) =>
+    receipt.result.error === "vscode_lm_semantic_edit_stage_required");
+  assert.ok(capIndex >= 0, "a new query remains subject to the two-read cap");
+  const repeats = receipts.slice(capIndex + 1);
+  assert.ok(repeats.length >= 1 && repeats.length <= internals.constants.VSCODE_LM_MAX_IDENTICAL_SOURCE_GRAPH_REPEATS);
+  assert.ok(repeats.every((receipt) => receipt.result.schema_id === "aiworkhub.vscode_lm.source_graph_duplicate.v1"),
+    "every duplicate after the read cap gets the typed receipt");
   assert.strictEqual(failure.message, "vscode_lm_source_graph_no_progress");
 }
 
@@ -7237,10 +7249,12 @@ async function nf1290ProgressingProviderLoopsContinue() {
       // NF-2026-01632: a spin that never progresses still fails closed as no progress.
       // The acknowledging read opens a fresh stall window but counts against the
       // 16-call Source Graph budget, so the budget refuses the 17th read one turn
-      // before the no-endgame watchdog would end the run. The duplicate guard still
-      // ends a repeated query first.
+      // before the no-endgame watchdog would end the run. NF-2026-02246: an exact
+      // repeat is never executed; it gets the duplicate corrective and trips only
+      // after VSCODE_LM_MAX_IDENTICAL_SOURCE_GRAPH_REPEATS consecutive repeats.
       const budget = internals.constants.VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT;
-      assert.strictEqual(turns, kind === "duplicate" ? 3 : budget + 1);
+      const repeats = internals.constants.VSCODE_LM_MAX_IDENTICAL_SOURCE_GRAPH_REPEATS;
+      assert.strictEqual(turns, kind === "duplicate" ? repeats + 2 : budget + 1);
       assert.strictEqual(calls, kind === "duplicate" ? 1 : budget);
     }
   }

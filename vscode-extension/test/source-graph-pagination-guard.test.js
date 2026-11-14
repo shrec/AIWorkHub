@@ -25,7 +25,9 @@ for (const name of ["aiworkhub_worker_source_graph_query", "aiworkhub_manager_so
         assert.equal(guard.before({ name, input: { ...input, [cursorKey]: cursor } }), null);
       }
       const repeated = { name, input: { ...input, [cursorKey]: "signed-page-2" } };
-      assert.equal(guard.before(repeated).error, "vscode_lm_source_graph_duplicate");
+      for (let n = 0; n < bridge.constants.VSCODE_LM_MAX_IDENTICAL_SOURCE_GRAPH_REPEATS; n++) {
+        assert.equal(guard.before(repeated).error, "vscode_lm_source_graph_duplicate");
+      }
       assert.throws(() => guard.before(repeated), /vscode_lm_source_graph_no_progress/);
     });
   }
@@ -63,7 +65,10 @@ test("verified novel body evidence permits more than sixteen reads without weake
     assert.equal(guard.before(call), null);
     guard.observed(call, trusted(evidence(page + 1)));
   }
-  assert.equal(guard.before(sgCall(17)).error, "vscode_lm_source_graph_duplicate");
+  // NF-2026-02246: a bounded run of exact repeats gets the corrective before no-progress.
+  for (let n = 0; n < bridge.constants.VSCODE_LM_MAX_IDENTICAL_SOURCE_GRAPH_REPEATS; n++) {
+    assert.equal(guard.before(sgCall(17)).error, "vscode_lm_source_graph_duplicate");
+  }
   assert.throws(() => guard.before(sgCall(17)), /source_graph_no_progress/);
 });
 

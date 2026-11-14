@@ -5626,6 +5626,9 @@ async function awaitVscodeLmWorkerSourceGraphReadinessOnce() {
 // It keeps the NF1179 12+4 value as a literal now that the post-source turn
 // allowance it was derived from is gone (NF-2026-01632).
 const VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT = 16;
+// NF-2026-02246: exact repeats with an identical reply tolerated before no-progress.
+// Re-querying the same focus after a page is normal orientation, so two is too few.
+const VSCODE_LM_MAX_IDENTICAL_SOURCE_GRAPH_REPEATS = 4;
 
 // A paged reply carries its bytes as UTF-8 text, or base64 when the page is not valid UTF-8.
 function vscodeLmIsPagedSourceGraphReply(result) {
@@ -5680,7 +5683,10 @@ function vscodeLmSourceGraphFileEvidenceKey(payload) {
 }
 
 // Distinct requests alone are not progress. Novel backend source evidence
-// resets the bounded no-progress streak; duplicates and all protocol limits remain.
+// resets the bounded no-progress streak. An exact repeat is never executed: it
+// gets the duplicate corrective, and trips no-progress only after
+// VSCODE_LM_MAX_IDENTICAL_SOURCE_GRAPH_REPEATS consecutive repeats with no other
+// tool call or edit in between (NF-2026-02246).
 function createVscodeLmSourceGraphGuard() {
   let lastIdentity = "";
   let duplicates = 0;
@@ -5711,7 +5717,12 @@ function createVscodeLmSourceGraphGuard() {
     },
     before(call) {
       const identity = identityFor(call);
-      if (!identity) return null;
+      if (!identity) {
+        // Any other tool call between two Source Graph calls ends a repeat run.
+        lastIdentity = "";
+        duplicates = 0;
+        return null;
+      }
       callsSinceEdit += 1;
       if (callsSinceEdit > VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT) {
         throw new Error("vscode_lm_source_graph_no_progress");
@@ -5722,7 +5733,9 @@ function createVscodeLmSourceGraphGuard() {
         return null;
       }
       duplicates += 1;
-      if (duplicates >= 2) throw new Error("vscode_lm_source_graph_no_progress");
+      if (duplicates > VSCODE_LM_MAX_IDENTICAL_SOURCE_GRAPH_REPEATS) {
+        throw new Error("vscode_lm_source_graph_no_progress");
+      }
       return {
         ok: false,
         schema_id: VSCODE_LM_SOURCE_GRAPH_DUPLICATE_SCHEMA,
@@ -5789,9 +5802,9 @@ function createVscodeLmSourceGraphGuard() {
       if (progressed) { callsSinceEdit = 0; progressRevision += 1; }
     },
     staged(result, validatedStage = false) {
+      lastIdentity = ""; // NF-2026-02246: any edit attempt ends an exact-repeat run.
+      duplicates = 0;
       if (result && result.ok === true && result.idempotent_replay !== true) {
-        lastIdentity = "";
-        duplicates = 0;
         callsSinceEdit = 0;
         if (validatedStage && result.schema_id === "aiworkhub.vscode_lm.staged_edit_receipt.v1") {
           const identity = JSON.stringify([result.operation, result.path, result.content_sha256]);
@@ -15651,6 +15664,7 @@ module.exports = {
       VSCODE_LM_NO_ENDGAME_STALL_TURNS,
       VSCODE_LM_QUALITY_REVIEW_STALL_TURNS,
       VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT,
+      VSCODE_LM_MAX_IDENTICAL_SOURCE_GRAPH_REPEATS,
     },
   },
 };

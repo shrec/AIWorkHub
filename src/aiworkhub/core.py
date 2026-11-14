@@ -9220,7 +9220,7 @@ def _verified_rejection_recovery_rebind_receipt(
 
 
 def _verified_manager_rejection_receipt(
-    card: Mapping[str, Any], *, task_id: str
+    card: Mapping[str, Any], *, task_id: str, to_runner: str = ""
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Bind an explicit manager rejection to the exact retained candidate.
 
@@ -9383,8 +9383,8 @@ def _verified_manager_rejection_receipt(
             )
     if (
         rejection.get("schema_id") != "aiworkhub.rejection_disposition.v1"
-        or rejection.get("to") != "pending"
-        or rejection.get("failure_category") != "candidate_code"
+        or rejection.get("to") != "pending"  # NF-2026-02246: any category, pinned runner
+        or (to_runner and str(rejection.get("runner") or to_runner).strip() != to_runner)
         or re.fullmatch(r"[0-9a-f]{32}", request_id) is None
         or not pinned_at
         or str(predecessor.get("pinned_at") or "").strip() != pinned_at
@@ -10366,7 +10366,7 @@ def reroute_launch_identity(
             )
     if review_rejection:
         manager_rejection, manager_rejection_error = (
-            _verified_manager_rejection_receipt(card, task_id=task_id)
+            _verified_manager_rejection_receipt(card, task_id=task_id, to_runner=to_runner)
         )
         if manager_rejection_error is not None or manager_rejection is None:
             return _lifecycle_error(
