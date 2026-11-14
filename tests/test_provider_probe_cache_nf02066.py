@@ -330,22 +330,74 @@ def test_opencode_models_cache_matches_uncached_and_skips_reprobe(
     assert repo_policy._OPENCODE_PROBE_LOCAL.record == {"state": "ok", "count": 2}
 
 
-def test_opencode_failed_probe_is_rechecked_not_cached(
+def test_opencode_failed_probe_is_cached_and_replaced_by_a_later_success(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     exe = str(tmp_path / "opencode")
     failed = SimpleNamespace(returncode=3, stdout=b"", stderr=b"")
     calls = _fake_opencode(monkeypatch, [failed, _ok(_ROWS)])
+    failed_value = (
+        [],
+        {"state": "failed", "reason": "exit_3", "served_last_known_good": False},
+    )
+
+    assert repo_policy._cached_opencode_models(exe) == failed_value
+    assert repo_policy._cached_opencode_models(exe) == failed_value
+    assert len(calls) == 1, "inside the TTL the failed record is served, not re-run"
+
+    cache = repo_policy._OPENCODE_MODELS_CACHE
+    monkeypatch.setattr(repo_policy, "PROVIDER_PROBE_CACHE_TTL_SECONDS", 0.0)
+    assert repo_policy._cached_opencode_models(exe) == failed_value, "served stale"
+    _wait_idle(cache)
+    assert len(calls) == 2, "exactly one background re-probe ran"
+    monkeypatch.setattr(repo_policy, "PROVIDER_PROBE_CACHE_TTL_SECONDS", 60.0)
+    assert repo_policy._cached_opencode_models(exe) == (
+        _ROWS,
+        {"state": "ok", "count": 2},
+    ), "the successful re-probe replaced the cached failure"
+    assert len(calls) == 2
+    assert repo_policy._OPENCODE_PROBE_LOCAL.record == {"state": "ok", "count": 2}
+
+
+def test_opencode_timing_out_probe_is_not_rerun_within_ttl(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    exe = str(tmp_path / "opencode")
+    probes: list[float] = []
+
+    def timing_out_probe(executable: str, timeout: float):  # noqa: ARG001
+        probes.append(timeout)
+        return [], "timeout"
+
+    monkeypatch.setattr(repo_policy, "_opencode_models_probe_once", timing_out_probe)
 
     first = repo_policy._cached_opencode_models(exe)
-    assert first[1] == {
-        "state": "failed",
-        "reason": "exit_3",
-        "served_last_known_good": False,
-    }
     second = repo_policy._cached_opencode_models(exe)
-    assert second == (_ROWS, {"state": "ok", "count": 2})
-    assert len(calls) == 2
+
+    assert len(probes) == 2, "the first call's probe + retry only, not 4"
+    assert first == second
+    assert first[1] is not None and first[1]["state"] == "failed"
+    assert first[1]["reason"] == "timeout"
+
+
+def test_opencode_missing_or_malformed_record_is_not_cached(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    exe = str(tmp_path / "opencode")
+    calls: list[int] = []
+
+    def no_record_listing(executable):  # noqa: ARG001
+        calls.append(1)
+        if len(calls) > 1:
+            repo_policy._OPENCODE_PROBE_LOCAL.record = {"state": "bogus"}
+        return []
+
+    monkeypatch.setattr(repo_policy, "_list_opencode_models", no_record_listing)
+
+    assert repo_policy._cached_opencode_models(exe) == ([], None)
+    assert repo_policy._cached_opencode_models(exe) == ([], {"state": "bogus"})
+    assert repo_policy._cached_opencode_models(exe) == ([], {"state": "bogus"})
+    assert len(calls) == 3, "None and malformed records are recomputed every call"
 
 
 def test_deepseek_status_cache_matches_uncached_and_tracks_credential_file(

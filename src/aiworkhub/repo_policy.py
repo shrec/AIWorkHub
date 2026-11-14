@@ -911,10 +911,14 @@ def _cached_opencode_models(
 ) -> tuple[list[str], dict[str, Any] | None]:
     """TTL-cached :func:`_opencode_models_with_record`.
 
-    Only a successful probe is cached: a failed one is rechecked on the next
-    call, never replayed.  The key holds the executable, its stat, the config
-    environment, and the identity of every callable the uncached path uses, so
-    a monkeypatched probe bypasses the cache.
+    A successful and a failed probe are both cached (NF-2026-02265): a failed
+    record is served fresh for ``PROVIDER_PROBE_CACHE_TTL_SECONDS`` and then
+    stale, up to ``PROVIDER_PROBE_MAX_STALE_SECONDS``, while one background
+    thread re-probes, so a hanging ``opencode models`` no longer blocks every
+    call and a recovered one is picked up on the next refresh.  A missing or
+    malformed record is never cached.  The key holds the executable, its stat,
+    the config environment, and the identity of every callable the uncached
+    path uses, so a monkeypatched probe bypasses the cache.
     """
 
     if not isinstance(executable, str) or not executable.strip():
@@ -931,7 +935,10 @@ def _cached_opencode_models(
 
     def cacheable(value: tuple[list[str], dict[str, Any] | None]) -> bool:
         record = value[1]
-        return isinstance(record, Mapping) and record.get("state") == "ok"
+        return isinstance(record, Mapping) and record.get("state") in (
+            "ok",
+            "failed",
+        )
 
     value = _OPENCODE_MODELS_CACHE.get(
         key, lambda: _opencode_models_with_record(executable), cacheable
