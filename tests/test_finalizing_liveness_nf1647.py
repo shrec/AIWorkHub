@@ -1166,3 +1166,73 @@ def test_retry_finalization_and_its_nested_finalize_share_one_heartbeat(tmp_path
     assert record
     assert "finalizer" not in record
     assert _heartbeat_threads() == []
+
+
+# --- NF-2026-02259: the snapshot names host validation after a normal worker exit ---
+
+_PHASE_FIELDS = {"liveness_phase": "host_validation_running", "worker_exit": "normal"}
+
+
+def test_normal_worker_exit_with_running_host_validation_names_the_phase(tmp_path):
+    liveness = _snapshot(tmp_path, _supervisor_record(), _finalizer_section())
+
+    assert liveness["liveness_phase"] == "host_validation_running"
+    assert liveness["worker_exit"] == "normal"
+    assert liveness["liveness_state"] == "finalizing"
+    assert liveness["child_alive"] is False
+    assert liveness["supervisor_alive"] is False
+    assert liveness["heartbeat_age_seconds"] < process_launcher.heartbeat_lease_seconds()
+    assert liveness["finalization_progress"] == {
+        "phase": "validating", "total": 3, "elapsed_seconds": 12.5,
+    }
+
+
+def test_the_phase_fields_are_additive_and_leave_every_existing_field_unchanged(tmp_path):
+    normal = _snapshot(tmp_path / "normal", _supervisor_record(), _finalizer_section())
+    failed = _snapshot(tmp_path / "failed", _supervisor_record(exit_code=1), _finalizer_section())
+
+    assert {key: normal[key] for key in _PHASE_FIELDS} == _PHASE_FIELDS
+    assert not set(_PHASE_FIELDS) & set(failed)
+    stripped = {key: value for key, value in normal.items() if key not in _PHASE_FIELDS}
+    assert _without_clock(stripped) == _without_clock(failed)
+
+
+@pytest.mark.parametrize("name", sorted(_DEAD_FINALIZERS))
+def test_a_dead_or_stale_finalizer_never_gets_the_host_validation_phase(tmp_path, name):
+    liveness = _snapshot(tmp_path, _supervisor_record(), _DEAD_FINALIZERS[name]())
+
+    assert liveness["liveness_state"] == "lost"
+    assert not set(_PHASE_FIELDS) & set(liveness)
+
+
+_NOT_A_NORMAL_EXIT = {
+    "nonzero_exit": {"exit_code": 1},
+    "negative_exit": {"exit_code": -9},
+    "exit_code_bool": {"exit_code": False},
+    "exit_code_string": {"exit_code": "0"},
+    "exit_code_missing": {"exit_code": None},
+    "supervisor_still_running": {"state": "running"},
+    "supervisor_state_unknown": {"state": "mystery"},
+}
+
+
+@pytest.mark.parametrize("name", sorted(_NOT_A_NORMAL_EXIT))
+def test_a_live_finalizer_without_a_normal_worker_exit_gets_no_phase(tmp_path, name):
+    liveness = _snapshot(tmp_path, _supervisor_record(**_NOT_A_NORMAL_EXIT[name]), _finalizer_section())
+
+    assert liveness["liveness_state"] == "finalizing"
+    assert not set(_PHASE_FIELDS) & set(liveness)
+
+
+def test_a_live_finalizer_with_no_active_validation_progress_gets_no_phase(tmp_path):
+    liveness = _snapshot(tmp_path, _supervisor_record(), _finalizer_section(phase=_MISSING))
+
+    assert liveness["liveness_state"] == "finalizing"
+    assert liveness["finalization_progress"] == {}
+    assert not set(_PHASE_FIELDS) & set(liveness)
+
+
+def test_the_phase_is_ignored_outside_finalization_pending_states(tmp_path):
+    liveness = _snapshot(tmp_path, _supervisor_record(), _finalizer_section(), state="running")
+
+    assert not set(_PHASE_FIELDS) & set(liveness)

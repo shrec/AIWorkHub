@@ -1286,9 +1286,7 @@ def finalizer_liveness(
     if latest.get("state") not in FINALIZATION_PENDING_STATES or not isinstance(section, dict):
         return {}
     now = time.time() if now_epoch is None else now_epoch
-    pid, ticks, beat = (
-        section.get(key) for key in ("pid", "pid_start_ticks", "heartbeat_at_epoch")
-    )
+    pid, ticks, beat = (section.get(key) for key in ("pid", "pid_start_ticks", "heartbeat_at_epoch"))
     if (
         type(pid) is not int or pid <= 0 or type(ticks) is not int
         or type(beat) not in (int, float)
@@ -1297,17 +1295,18 @@ def finalizer_liveness(
     ):
         return {}
     age = derive_liveness_state(
-        now_epoch=now,
-        supervisor_alive=True,
-        heartbeat_at_epoch=beat,
-        last_output_change_epoch=None,
+        now_epoch=now, supervisor_alive=True, heartbeat_at_epoch=beat, last_output_change_epoch=None,
     )
     if age["liveness_state"] == "lost":
         return {}
+    progress, code = _bounded_finalization_progress(section), supervisor_status.get("exit_code")
+    normal_exit = supervisor_status.get("state") == "exited" and type(code) is int and code == 0
+    phase = {"liveness_phase": "host_validation_running", "worker_exit": "normal"}  # NF-2026-02259
     return {
         "liveness_state": FINALIZING_LIVENESS_STATE,
         "heartbeat_age_seconds": age["heartbeat_age_seconds"],
-        "finalization_progress": _bounded_finalization_progress(section),
+        "finalization_progress": progress,
+        **(phase if progress and normal_exit else {}),
     }
 
 
