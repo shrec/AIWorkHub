@@ -670,6 +670,8 @@ const REAL_REPO_ID_RE = /^repo_[a-f0-9]{32}$/;
 // ── One bounded repo-local Task MCP stdio child + one JSON-RPC session ─────
 const MCP_PROTOCOL_VERSION = "2024-11-05";
 const MCP_REQUEST_TIMEOUT_MS = 20000;
+// Task detail renders a full card (3-7 MB on busy hubs; a cold call measured 11.8 s on 235 KB), so it gets its own longer bound. The global stays at 20 s.
+const TASK_DETAIL_REQUEST_TIMEOUT_MS = 60000;
 // Initialize waits for the first import of a fresh runtime generation (no __pycache__, measured 19.6s cold vs 3s warm), while a crashed server is still rejected immediately by _onExit.
 const MCP_INITIALIZE_TIMEOUT_MS = 120000;
 // A full dashboard snapshot aggregates several repository-local data sources
@@ -10989,15 +10991,27 @@ async function pushSnapshotNoRetry(view, options = {}) {
 }
 
 async function pushTaskDetail(view, taskId) {
+  // Every path must answer the webview's selectTask with a taskDetail message;
+  // otherwise applyTaskDetail never clears the Loading state (NF-2026-02272).
+  const replyFailed = (error) => view.postMessage({
+    type: OUTBOUND_TYPES.taskDetail,
+    payload: { ok: false, task_id: taskId, error },
+  });
   try {
     const client = getMcpClient();
     view.bindClient(client);
-    const payload = await client.callTool(DASHBOARD_TOOLS.taskDetail, { task_id: taskId });
+    const payload = await client.callTool(
+      DASHBOARD_TOOLS.taskDetail,
+      { task_id: taskId },
+      TASK_DETAIL_REQUEST_TIMEOUT_MS,
+    );
     if (view.stillBoundTo(client)) {
       view.postMessage({ type: OUTBOUND_TYPES.taskDetail, payload: sanitizeWebviewPayload(payload) });
+    } else {
+      replyFailed("task_detail_client_rebound");
     }
   } catch (err) {
-    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+    replyFailed(sanitizeErrorMessage(err));
   }
 }
 
