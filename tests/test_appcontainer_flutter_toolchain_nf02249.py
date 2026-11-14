@@ -32,6 +32,8 @@ _PYTHON = "C:\\Python312\\python.exe"
 # worker_workspace._APPCONTAINER_TEMP_TRAMPOLINE: the validation lane's shape.
 _TRAMPOLINE = "import subprocess,sys;c=subprocess.call(sys.argv[1:]);sys.exit(c-(c>>31<<32))"
 _PATHEXT = ".COM;.EXE;.BAT;.CMD"
+# The AppContainer sandbox and its PATHEXT launcher resolution exist only on Windows.
+pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows AppContainer only")
 
 
 def _flutter_sdk(parent):
