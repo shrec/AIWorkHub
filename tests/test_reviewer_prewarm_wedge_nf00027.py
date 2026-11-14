@@ -234,7 +234,11 @@ def test_saturated_prewarm_slots_fail_the_launch_with_a_named_reason(
         "reviewer_prewarm_capacity_exhausted:in_flight=2:capacity=2"
     )
     assert builds == []
-    assert phases == [reviewer_prewarm_capacity.PREWARM_QUEUED]
+    assert phases == [
+        "quality_review_workspace_materialize_started",
+        "quality_review_workspace_materialize_complete",
+        reviewer_prewarm_capacity.PREWARM_QUEUED,
+    ]
 
 
 def test_capacity_is_derived_from_cores_with_headroom(monkeypatch):
