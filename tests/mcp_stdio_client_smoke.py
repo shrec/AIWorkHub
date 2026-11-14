@@ -176,6 +176,12 @@ WRITE_GATED_TOOLS: tuple[str, ...] = (
 # RE-FROZEN 2026-11-10, one tool: ``aiworkhub_task_reject_review`` gained the
 # optional ``relaunch`` (default False) and ``relaunch_adapter_id`` (default "")
 # -- additive, every earlier call shape still valid.
+#
+# RE-FROZEN 2026-11-14, two tools (NF-2026-02270): ``aiworkhub_task_codex_handoff``
+# gained the optional ``format`` (default "json") -- additive, every earlier call
+# shape still valid; ``aiworkhub_task_codex_handoff_markdown`` is now a deprecated
+# alias of ``aiworkhub_task_codex_handoff(format='markdown')`` -- only its
+# description changed, so its description-stripped fingerprint is unchanged.
 FROZEN_SCHEMA_FINGERPRINTS: dict[str, str] = {
     "aiworkhub_agent_cancel_task": "f1d9792f94307639105434caa381c54857d7c292dab122b4cd4e9333dd0552f3",
     "aiworkhub_agent_collect_result": "c291cac06bc81689a1b0df1357facb97c5806fefd0a447ef3245e38976077a3f",
@@ -193,7 +199,7 @@ FROZEN_SCHEMA_FINGERPRINTS: dict[str, str] = {
     "aiworkhub_task_audit_log_read": "5111315e1823d882715a6b1fa754f1c64894ec10eea469b0b2fe7bc5e98ec015",
     "aiworkhub_task_auto_pickup": "02878ab53c86e45277a3c4337c438218de36a3d2d9f82f2385d9afaed2aa243e",
     "aiworkhub_task_auto_pickup_dryrun": "f5c5e3922552fb6813c94f921c9163c8aded29f7db478fd88ab8c60a9e30a29a",
-    "aiworkhub_task_codex_handoff": "5f15fa92c6eb29072587971c5d4226860d9196893a53688bcb027a4e2b07a6aa",
+    "aiworkhub_task_codex_handoff": "9ace83306f71d199f114d350e6d2355513536a0d7553b0774288aec641c3fa33",
     "aiworkhub_task_codex_handoff_markdown": "00f589247e30bcdd709f807b64b3e80452eab0c074fc14326d734e14e0491ece",
     "aiworkhub_task_collision_guard": "9a6a72f9e63acc7e08a9fd4c95e66382530f96b98bb40467801b6679c2adf6fd",
     "aiworkhub_task_cost_ledger": "58b4efbf795ea2d110e6dd630a048afce78bd2dba650aac46e5d2ce5a6660540",

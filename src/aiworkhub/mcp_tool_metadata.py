@@ -30,6 +30,10 @@ __all__ = [
     "prepare_registration",
     "MCP_TOOL_PROFILES",
     "MCP_TOOL_ALIASES",
+    "MCP_DEPRECATED_FACET_ALIASES",
+    "MCP_FOLD_KEPT_REASONS",
+    "DEPRECATED_ALIAS_REPLY_KEY",
+    "deprecated_alias_reply",
     "alias_description",
     "tool_profile_visibility",
     "exposing_profiles",
@@ -614,6 +618,49 @@ MCP_TOOL_ALIASES: Mapping[str, str] = MappingProxyType({
     "aiworkhub_manager_task_archive": "aiworkhub_task_archive",
     "aiworkhub_manager_task_supersede": "aiworkhub_task_supersede",
 })
+
+# NF-2026-02270: facet tools folded behind a parameter on a surviving tool. Each
+# old name stays registered (same profile entry, same parameters) for one release
+# as a thin alias that delegates to ``surviving_tool`` with ``facet`` and adds
+# DEPRECATED_ALIAS_REPLY_KEY to its reply; a later card drops every name here.
+# Kept apart from MCP_TOOL_ALIASES, whose names are same-parameter duplicates
+# already unlisted on manager: these take their own parameters until removal.
+DEPRECATED_ALIAS_REPLY_KEY = "deprecated_alias_of"
+MCP_DEPRECATED_FACET_ALIASES: Mapping[str, Mapping[str, Any]] = MappingProxyType({
+    "needfix_count": MappingProxyType({
+        "surviving_tool": "needfix_list",
+        "facet": MappingProxyType({"count_only": True}),
+    }),
+    "aiworkhub_task_codex_handoff_markdown": MappingProxyType({
+        "surviving_tool": "aiworkhub_task_codex_handoff",
+        "facet": MappingProxyType({"format": "markdown"}),
+    }),
+})
+
+# Fold candidates NF-2026-02270 examined and kept, with the measured reason.
+MCP_FOLD_KEPT_REASONS: Mapping[str, str] = MappingProxyType({
+    "aiworkhub_dashboard_snapshot": (
+        "not a duplicate: it is the only reader that joins storage health, queue counts, "
+        "callback delivery, manager identity and repository routing in one call, and the "
+        "VS Code webview reads its full=true shape; aiworkhub_task_plan_snapshot, "
+        "aiworkhub_task_health and roadmap_snapshot each return one of those parts only"
+    ),
+})
+
+
+def deprecated_alias_reply(alias: str, reply: Mapping[str, Any]) -> dict[str, Any]:
+    """Return ``reply`` stamped with the surviving tool name for deprecated ``alias``.
+
+    Refuses (KeyError) a name MCP_DEPRECATED_FACET_ALIASES does not mark and
+    (TypeError) a non-mapping reply, so an alias can never answer unmarked.
+    """
+    surviving = MCP_DEPRECATED_FACET_ALIASES[alias]["surviving_tool"]
+    if not isinstance(reply, Mapping):
+        raise TypeError(f"deprecated alias {alias} reply must be a mapping, got {type(reply).__name__}")
+    stamped = dict(reply)
+    stamped["server_tool"] = alias
+    stamped[DEPRECATED_ALIAS_REPLY_KEY] = surviving
+    return stamped
 
 
 def alias_description(tool_name: str, cleaned: str) -> str:

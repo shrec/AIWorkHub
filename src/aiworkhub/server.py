@@ -6011,15 +6011,19 @@ def aiworkhub_task_review_summarize(
     return result
 
 
+_CODEX_HANDOFF_FORMATS = ("json", "markdown")
+
+
 @mcp.tool()
 def aiworkhub_task_codex_handoff(
     task_ids: list[str] | None = None,
     batch_label: str | None = None,
+    format: str = "json",
 ) -> dict[str, Any]:
     """READ-ONLY: Codex-ready HANDOFF report for review-queue tasks.
 
-    Use this for the handoff as JSON; use aiworkhub_task_codex_handoff_markdown
-    for the same report rendered as Markdown.
+    Use this for the handoff as JSON, or with format=markdown for the same
+    report plus a deterministic ``markdown`` field (a compact review packet).
 
     For each task waiting on Codex review, summarizes task_id, runner, topic,
     allowed_writes, validation commands, derived risks, commit-hygiene status,
@@ -6034,12 +6038,22 @@ def aiworkhub_task_codex_handoff(
     Args:
         task_ids: Only report these task ids; omit for every task waiting in the review queue.
         batch_label: Free-text label echoed back as batch_label in the reply; it does not filter anything.
+        format: json (default) for the report alone, or markdown to add the rendered markdown and markdown_contract fields; any other value is refused.
     """
 
-    result = review_summarizer.build_codex_handoff_report(
-        task_ids=task_ids,
-        batch_label=batch_label,
+    if format not in _CODEX_HANDOFF_FORMATS:
+        return {
+            "ok": False,
+            "error": "unknown_format",
+            "format": str(format)[:32],
+            "accepted": list(_CODEX_HANDOFF_FORMATS),
+        }
+    build = (
+        review_summarizer.build_codex_handoff_markdown_report
+        if format == "markdown"
+        else review_summarizer.build_codex_handoff_report
     )
+    result = build(task_ids=task_ids, batch_label=batch_label)
     result["server_tool"] = "aiworkhub_task_codex_handoff"
     return result
 
@@ -6049,29 +6063,21 @@ def aiworkhub_task_codex_handoff_markdown(
     task_ids: list[str] | None = None,
     batch_label: str | None = None,
 ) -> dict[str, Any]:
-    """READ-ONLY: Codex-ready HANDOFF report rendered as compact Markdown.
+    """READ-ONLY: Deprecated alias of aiworkhub_task_codex_handoff(format=markdown); call that instead.
 
-    Builds the same B116 handoff report as ``aiworkhub_task_codex_handoff`` (via
-    the identical read-only ``review-queue`` + ``show`` calls, never a write
-    command) and adds a deterministic ``markdown`` field — a compact review
-    packet Codex can read directly instead of manually parsing the JSON.
-
-    FROZEN READ-ONLY CONTRACT — no write-gate toggle, no mutation parameters.
-    Never calls taskctl done/review/start/auto-pickup/add-card.
-    Never mutates queue or audit state. Never launches agents or processes.
-    Writes remain default-off regardless of input values.
+    Kept one release (NF-2026-02270). It returns the aiworkhub_task_codex_handoff
+    format=markdown reply unchanged except server_tool, plus deprecated_alias_of
+    naming aiworkhub_task_codex_handoff. Never mutates queue or audit state.
 
     Args:
         task_ids: Only report these task ids; omit for every task waiting in the review queue.
         batch_label: Free-text label echoed back as batch_label in the reply; it does not filter anything.
     """
 
-    result = review_summarizer.build_codex_handoff_markdown_report(
-        task_ids=task_ids,
-        batch_label=batch_label,
+    result = aiworkhub_task_codex_handoff(
+        task_ids=task_ids, batch_label=batch_label, format="markdown"
     )
-    result["server_tool"] = "aiworkhub_task_codex_handoff_markdown"
-    return result
+    return _tool_metadata.deprecated_alias_reply("aiworkhub_task_codex_handoff_markdown", result)
 
 
 @mcp.tool()
@@ -8917,23 +8923,39 @@ def needfix_list(
     order_dir: str = "DESC",
     query: str = "",
     full: bool = False,
-) -> list[dict]:
+    count_only: bool = False,
+    breakdown: bool = False,
+) -> list[dict] | int | dict:
     """List repo-scoped NeedFix entries (bounded); rows are a compact projection.
 
     Measured: 379 rows were 452 KB, about 1.2 KB each (NF-2026-01722, NF-2026-01726). By default each row keeps only id, title, status, severity, kind, converted_task_id and updated_at; ``full=true`` or needfix_show returns the full row, which on the derived listing also carries work_state and linked_card_id/linked_card_status.
+
+    count_only=true returns the count of the same status/kind/severity selection instead of rows; breakdown=true splits it by work state and status.
 
     Args:
         status: Only rows with exactly this status, e.g. captured, accepted or archived. Any status, kind or severity filter returns raw rows; omit all three for the derived active listing.
         kind: Only rows of exactly this kind, e.g. bug or improvement; omit for all kinds. Any filter returns raw rows.
         severity: Only rows of exactly this severity: critical, high, medium, low or info; omit for all. Any filter returns raw rows.
-        include_archived: Also list archived rows; default false.
+        include_archived: Also list archived rows; default false. Refused with count_only (use status=archived).
         limit: Maximum rows to return; default 100, clamped to 1-500.
         offset: Rows to skip before the first one returned, for paging; default 0.
         order_by: Sort column, created_at (default) or updated_at; any other value falls back to created_at.
         order_dir: Sort direction, DESC (default, newest first) or ASC; any other value falls back to DESC.
-        query: Case-insensitive substring of the id or title, applied before limit/offset; empty (default) lists everything.
+        query: Case-insensitive substring of the id or title, applied before limit/offset; empty (default) lists everything. Refused with count_only.
         full: Return the raw stored rows instead of the compact projection; default false.
+        count_only: Return the count of the status/kind/severity selection instead of rows; default false.
+        breakdown: With count_only, return {count, by_work_state, by_status} instead of the bare number; default false, refused without count_only.
     """
+    if count_only:
+        unsupported = [
+            name for name, used in (("include_archived", include_archived), ("query", bool(query.strip())))
+            if used
+        ]
+        if unsupported:
+            return {"ok": False, "error": "count_only_filter_unsupported", "unsupported": unsupported}
+        return core.needfix_count(status=status, kind=kind, severity=severity, breakdown=bool(breakdown))
+    if breakdown:
+        return {"ok": False, "error": "breakdown_requires_count_only"}
     listing = core.needfix_list(
         status=status,
         kind=kind,
@@ -9315,21 +9337,29 @@ def needfix_count(
     severity: str | None = None,
     breakdown: bool = False,
 ) -> int | dict:
-    """Bounded count of NeedFix entries.
+    """Deprecated alias of needfix_list(count_only=true); call needfix_list instead.
 
-    Use this for a single number; use needfix_list for the matching rows
-    themselves. With breakdown=true the reply is {count, by_work_state,
-    by_status, derived, underived_reason}: count is the same number, and the
-    two maps split the same candidate rows by work state (untriaged,
-    decided_no_card, in_work, stalled, reopened, deferred, closed) and by status.
+    Kept one release (NF-2026-02270). It returns the needfix_list(count_only=true)
+    answer as {count, derived, underived_reason} (with breakdown=true: {count,
+    by_work_state, by_status, derived, underived_reason}) plus deprecated_alias_of
+    naming needfix_list.
 
     Args:
         status: Count only rows with this exact status, e.g. captured or accepted; archived rows are counted only when asked for here. Omit all three filters for the derived active count.
         kind: Count only rows of this exact kind, e.g. bug or improvement; any filter returns the raw row count instead of the derived active count.
         severity: Count only rows of this exact severity: critical, high, medium, low or info; any filter returns the raw row count.
-        breakdown: Return {count, by_work_state, by_status} instead of the bare number; default false.
+        breakdown: Add by_work_state and by_status maps to the reply; default false.
     """
-    return core.needfix_count(status=status, kind=kind, severity=severity, breakdown=breakdown)
+    result = needfix_list(
+        status=status, kind=kind, severity=severity, count_only=True, breakdown=breakdown
+    )
+    if not isinstance(result, Mapping):
+        result = {
+            "count": int(result),
+            "derived": getattr(result, "derived", None),
+            "underived_reason": getattr(result, "underived_reason", None),
+        }
+    return _tool_metadata.deprecated_alias_reply("needfix_count", result)
 
 
 @mcp.tool()
