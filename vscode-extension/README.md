@@ -94,10 +94,10 @@ Source Graph coverage and bounded viewers for logs, sessions, AI Memory and KB.
   <em>Tasks, callback health, source coverage, context stores, preflight and evidence in one retained editor tab.</em>
 </div>
 
-## What's new in 0.13.0
+## What's new in 0.13.1
 
-- Quality reviewer launches start reliably in large working trees: the read-only reviewer workspace copies the tracked canonical delta plus only the untracked files the review names, instead of every untracked file, and launch progress names the workspace materialize phase.
-- Lower RAM and token use: the dashboard snapshot halves its memory peak by indexing only the process-event fields the cost ledger reads, Claude workers receive only the built-in tools their card needs, and failed model probes are cached instead of re-run every snapshot.
+- Opening a task no longer hangs on "Loading task": a failed, slow or reconnected detail request now shows an error you can retry by clicking the task again.
+- Flutter validation runs to completion in the sandbox, and the MCP tool surface is smaller.
 
 ## Get started
 

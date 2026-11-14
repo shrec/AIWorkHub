@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.13.1 — 2026-11-14
+
+### Fixed
+
+- Bundles runtime 0.13.1: opening a task no longer hangs on "Loading task" after a host error, timeout or reconnect, Flutter validation no longer hangs in the sandbox, and the MCP tool surface is smaller.
+
 ## 0.13.0 — 2026-11-14
 
 ### Fixed

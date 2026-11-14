@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-11-14
+
+### Fixed
+
+- Opening a task in the dashboard no longer hangs on "Loading task": the host answers the detail request with an error payload on a failed call, a timeout or an MCP client rebind, and the detail call gets its own 60 s timeout (NF-2026-02272).
+- Flutter validation in the AppContainer sandbox no longer hangs: the Flutter startup lock is skipped and pub gets a writable in-sandbox cache (NF-2026-02268).
+
+### Changed
+
+- The MCP tool surface is measured by an inventory and shrunk by folding overlapping tools (NF-2026-02270).
+- New `scripts/server_memory_profile.py` diagnostic records per-step RSS/peak, top tracemalloc allocators and repeat growth of the MCP server (NF-2026-02134).
+
 ## [0.13.0] - 2026-11-14
 
 ### Fixed
