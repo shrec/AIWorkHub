@@ -8,7 +8,7 @@ import threading
 from collections import OrderedDict, defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, BinaryIO, Iterable
 
 from aiworkhub import (
     claude_code_usage,
@@ -123,6 +123,7 @@ _PROCESS_EVENTS_PATH = Path(".aiworkhub/runtime/process_logs/process_events.json
 _PROCESS_EVENT_LIMIT = 10_000
 # Newest canonical usage events one ledger build reads (task_store clamps it).
 _USAGE_EVENT_LIMIT = 10_000
+_REQUEST_NOTE_PREFIX = "task_mcp_request:"
 
 
 def _request_identity(entry: dict[str, Any]) -> str:
@@ -130,7 +131,7 @@ def _request_identity(entry: dict[str, Any]) -> str:
     return str(
         entry.get("request_id")
         or entry.get("attempt_id")
-        or (note.removeprefix("task_mcp_request:") if note.startswith("task_mcp_request:") else "")
+        or (note.removeprefix(_REQUEST_NOTE_PREFIX) if note.startswith(_REQUEST_NOTE_PREFIX) else "")
     )
 
 
@@ -187,21 +188,105 @@ def _merge_process_events(
     return merged
 
 
+# The only fields of a process event any ledger reader touches
+# (NF-2026-02266): the join identity (_request_identity/_repository_identity),
+# the telemetry _fill_process_usage copies, the topic/role/terminal cause the
+# canonical rows read, and the lifecycle metadata _merge_process_events keeps.
+# The live ledger also carries packets, prompts and stdout chunks; indexing
+# whole parsed events kept ~48 MB of them alive inside every memoized ledger.
+_PROCESS_EVENT_READ_FIELDS = (
+    "task_id", "request_id", "attempt_id",
+    "repository_id", "repo_id", "repository", "repo_root",
+    *_USAGE_FIELDS, *_CACHE_FIELDS, "cost_usd",
+    "usage_observed", "cache_metrics_observed", "cost_observed",
+    "role", "topic", "status", "state", "terminal_substatus",
+    "started_at", "finished_at",
+)
+# A line lacking the task_id key and every request-identity spelling can never
+# enter the index, so it is skipped before json.loads. The writer emits
+# json.dumps output, whose ASCII keys are never escaped.
+_PROCESS_EVENT_TASK_MARK = b'"task_id"'
+_PROCESS_EVENT_REQUEST_MARKS = (
+    b'"request_id"', b'"attempt_id"', _REQUEST_NOTE_PREFIX.encode("ascii"),
+)
+
+
+def _project_process_event(
+    event: dict[str, Any], *, nested: bool = False
+) -> dict[str, Any]:
+    """``event`` reduced to the fields the ledger reads, values unchanged.
+
+    Key presence is preserved (``_merge_process_events`` tests ``in``), a
+    ``note`` is kept only as far as it carries a request identity, and a
+    nested ``usage`` dict (spread over the event by ``_matching_process_event``)
+    is projected the same way. A non-dict ``usage`` becomes ``None``: it still
+    replaces an earlier dict on merge and is still ignored when matched.
+    """
+
+    projected = {
+        field: event[field] for field in _PROCESS_EVENT_READ_FIELDS if field in event
+    }
+    if "note" in event:
+        note = str(event["note"] or "")
+        projected["note"] = note if note.startswith(_REQUEST_NOTE_PREFIX) else ""
+    if not nested and "usage" in event:
+        usage = event["usage"]
+        projected["usage"] = (
+            _project_process_event(usage, nested=True)
+            if isinstance(usage, dict)
+            else None
+        )
+    return projected
+
+
+def _process_event_tail(handle: BinaryIO) -> Iterable[bytes]:
+    """Stream the newest ``_PROCESS_EVENT_LIMIT`` lines of ``handle``.
+
+    The first pass keeps only line start offsets, so at most one raw line is
+    alive at a time instead of the whole window; the second pass reads exactly
+    the bytes the first pass saw, so a concurrent append never widens it.
+    """
+
+    starts: deque[int] = deque(maxlen=_PROCESS_EVENT_LIMIT)
+    end = 0
+    for line in handle:
+        starts.append(end)
+        end += len(line)
+    if not starts:
+        return
+    handle.seek(starts[0])
+    remaining = end - starts[0]
+    for line in handle:
+        if remaining <= 0:
+            return
+        yield line[:remaining]
+        remaining -= len(line)
+
+
 def _process_event_index(
     repo_root: Path | str, *, resolved_root: str | None = None
 ) -> dict[tuple[str, str, str], dict[str, Any]]:
-    """Read the bounded repository-local process ledger, ignoring bad records."""
+    """Read the bounded repository-local process ledger, ignoring bad records.
+
+    Each indexed event is projected to ``_PROCESS_EVENT_READ_FIELDS``; the
+    merge commutes with that projection, so every field a reader touches is
+    exactly what merging the full events would have produced.
+    """
 
     path = Path(repo_root) / _PROCESS_EVENTS_PATH
     if not path.is_file():
         return {}
     events: dict[tuple[str, str, str], dict[str, Any]] = {}
     try:
-        with path.open(encoding="utf-8") as handle:
+        with path.open("rb") as handle:
             # Append-only ledger: keep the newest lines, since usage rows are read newest-first.
-            for line in deque(handle, maxlen=_PROCESS_EVENT_LIMIT):
+            for raw in _process_event_tail(handle):
+                if _PROCESS_EVENT_TASK_MARK not in raw or not any(
+                    mark in raw for mark in _PROCESS_EVENT_REQUEST_MARKS
+                ):
+                    continue
                 try:
-                    event = json.loads(line)
+                    event = json.loads(raw.decode("utf-8"))
                 except json.JSONDecodeError:
                     continue
                 if not isinstance(event, dict):
@@ -213,11 +298,12 @@ def _process_event_index(
                 )
                 if task_id and request_id and repository:
                     identity = (repository, task_id, request_id)
+                    projected = _project_process_event(event)
                     previous = events.get(identity)
                     events[identity] = (
-                        _merge_process_events(previous, event)
+                        _merge_process_events(previous, projected)
                         if previous is not None
-                        else event
+                        else projected
                     )
     except OSError:
         return {}
