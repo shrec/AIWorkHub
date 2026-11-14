@@ -152,7 +152,7 @@ FROZEN_SCHEMA_FINGERPRINTS: dict[str, str] = {
     "aiworkhub_task_mark_review": "1722a2665425d2ebd8573c3425ee2d04b8c71ae3db24ace3c97e5a82d7e92bd4",
     "aiworkhub_task_pending_for_runner": "864d85c9f3a5a7020e270ddd71f9aeea2ab65ca35932aaf869afaa837950b16d",
     "aiworkhub_task_review_queue": "b5728f6f46c22488977fe80e794f420203cf6725367eb9271cfdad1c6538b878",
-    "aiworkhub_task_show": "99ee8315bb1c8f1ca0e53dba741fa733319ebd5464e0cb236c84142d0d9444ee",
+    "aiworkhub_task_show": "e759b7fd116eb1b4762fd62fd1bb65d86b2e3b60afee4ceba6e19fa91ee4df2e",
     "aiworkhub_task_usage_report": "4a252f6e08f967ab8bfc471b45c578e3e9b57691625a173dbd4943fdd5a3e174",
 }
 

@@ -181,7 +181,7 @@ FROZEN_SCHEMA_FINGERPRINTS: dict[str, str] = {
     "aiworkhub_agent_collect_result": "c291cac06bc81689a1b0df1357facb97c5806fefd0a447ef3245e38976077a3f",
     "aiworkhub_agent_launch_task": "02f5d9a9625474dca12ffb80a5afbc8415aa971561799e2041a1557fe0c1d59b",
     "aiworkhub_agent_list_processes": "706c69e343e2b322d11e57bd76279459c4e7296f3906d620fa9c2d643931db28",
-    "aiworkhub_agent_task_status": "3b0f7cda1fdf55cbe1d4fa4d178bd9fce6b8cf3e70c3ff2cdf325794a957d25a",
+    "aiworkhub_agent_task_status": "55bb6cbcc03f31ced1d789b935406a0565fc008479781e5b06a8f307c5853f66",
     "aiworkhub_cli_adapter_audit_summary_readonly": "6ab96b247924a28d5d793064a61e50c59f46a771c53459ec1197e3acca973fee",
     "aiworkhub_cli_adapter_plan_readonly": "7a79866fe17cd414929fc7e59898311436ce102d826637f7bac3df870cc49c9e",
     "aiworkhub_cli_adapter_report_readonly": "f80f2283b05d851f6fe1a405930efb9f65e39e7f2d501dc70ed5635ab5ca538c",
@@ -207,7 +207,7 @@ FROZEN_SCHEMA_FINGERPRINTS: dict[str, str] = {
     "aiworkhub_task_reject_review": "4a26b2769289afaa2353be1d75654801b00ea3eceebf0cf64f33ed9e3d00f365",
     "aiworkhub_task_review_queue": "b5728f6f46c22488977fe80e794f420203cf6725367eb9271cfdad1c6538b878",
     "aiworkhub_task_review_summarize": "e535208ce91e843357bb2efb237b656c50ad1a0b4e1be4111c9ae2356c647e01",
-    "aiworkhub_task_show": "99ee8315bb1c8f1ca0e53dba741fa733319ebd5464e0cb236c84142d0d9444ee",
+    "aiworkhub_task_show": "e759b7fd116eb1b4762fd62fd1bb65d86b2e3b60afee4ceba6e19fa91ee4df2e",
     "aiworkhub_task_stale_recovery_recommend": "2491f64e91873239bd9085912516f2da57da5a1ad58f9745cbca82a8fcccfcd1",
     "aiworkhub_task_usage_report": "4a252f6e08f967ab8bfc471b45c578e3e9b57691625a173dbd4943fdd5a3e174",
 }

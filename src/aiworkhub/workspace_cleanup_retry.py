@@ -194,7 +194,7 @@ def live_candidate_hold(repo: Path, request_id: str) -> str:
         conn.row_factory = sqlite3.Row
         try:
             rows = conn.execute(
-                "SELECT task_id, status, worker_status, archived_at "
+                "SELECT task_id, status, worker_status, archived_at, card_json "
                 "FROM tasks WHERE instr(card_json, ?) > 0",
                 (request_id,),
             ).fetchall()
@@ -205,9 +205,33 @@ def live_candidate_hold(repo: Path, request_id: str) -> str:
 
     for row in rows:
         status = task_store.canonical_status(dict(row))
-        if status not in task_store._ARCHIVE_TERMINAL_STATUSES:
-            return f"non_terminal_candidate:{status}:{row['task_id']}"
+        if status in task_store._ARCHIVE_TERMINAL_STATUSES:
+            continue
+        if not _names_live_candidate(row["card_json"], request_id, status):
+            continue
+        return f"non_terminal_candidate:{status}:{row['task_id']}"
     return ""
+
+
+def _names_live_candidate(card_json: Any, request_id: str, status: str) -> bool:
+    """Whether a non-terminal card names ``request_id`` as a candidate it still needs.
+
+    A mention only inside ``rework_predecessor`` is hash-pinned evidence of a
+    sealed predecessor that the retry, replay and janitor flows release
+    deliberately, and a requeued (pending) card holds a tree only while it
+    keeps it as ``retained_candidate``.  An unreadable card fails closed.
+    """
+    try:
+        card = json.loads(card_json or "{}")
+    except (TypeError, ValueError):
+        return True
+    if not isinstance(card, dict):
+        return True
+    if status == "pending":
+        retained = card.get("retained_candidate")
+        return isinstance(retained, dict) and str(retained.get("request_id") or "") == request_id
+    rest = {key: value for key, value in card.items() if key != "rework_predecessor"}
+    return request_id in json.dumps(rest, sort_keys=True, default=str)
 
 
 def remove_request_workspace(
