@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.13.0 — 2026-11-14
+
+### Fixed
+
+- Bundles runtime 0.13.0: quality reviewer launches no longer time out in repositories with many untracked files, the dashboard snapshot uses half the memory, and Claude workers get a smaller tool catalogue per turn.
+
 ## 0.12.99 — 2026-11-14
 
 ### Fixed

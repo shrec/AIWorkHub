@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-14
+
+### Fixed
+
+- Quality reviewer launches no longer time out in a repository with many untracked files: the read-only reviewer workspace overlays the tracked canonical delta plus only the untracked paths the review names, records how many it left out, and names its materialize phase in launch progress (NF-2026-02267).
+
+### Changed
+
+- The dashboard snapshot halves its memory peak (201 MB to 100 MB, retained 69 MB to 19 MB): the cost ledger indexes process events projected to the fields its readers touch and streams the newest window by offsets (NF-2026-02266).
+- Claude workers receive only the built-in tools their card needs (`--tools`) and no slash-command skills, cutting the per-turn tool catalogue (NF-2026-02264).
+- A failed opencode model probe is cached for its TTL, so a dashboard snapshot no longer re-probes it every build (NF-2026-02265).
+
 ## [0.12.99] - 2026-11-14
 
 ### Fixed

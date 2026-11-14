@@ -94,10 +94,10 @@ Source Graph coverage and bounded viewers for logs, sessions, AI Memory and KB.
   <em>Tasks, callback health, source coverage, context stores, preflight and evidence in one retained editor tab.</em>
 </div>
 
-## What's new in 0.12.99
+## What's new in 0.13.0
 
-- Callback watching is reliable again: the watcher no longer exits forever on a cancelled request, `callback_wait` names review-ready cards held by another origin and hides other-origin blocked cards by default, and an accept lock held by a live foreign process is reported with its holder and age.
-- Workers and validation are steadier: VS Code LM workers are no longer stopped early for Source Graph no-progress, Flutter/Dart cards start inside Windows AppContainer with a full validation tree, a cleanup PermissionError no longer destroys a live candidate worktree, and liveness names the host-validation phase.
+- Quality reviewer launches start reliably in large working trees: the read-only reviewer workspace copies the tracked canonical delta plus only the untracked files the review names, instead of every untracked file, and launch progress names the workspace materialize phase.
+- Lower RAM and token use: the dashboard snapshot halves its memory peak by indexing only the process-event fields the cost ledger reads, Claude workers receive only the built-in tools their card needs, and failed model probes are cached instead of re-run every snapshot.
 
 ## Get started
 
