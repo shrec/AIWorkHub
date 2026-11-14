@@ -838,6 +838,7 @@ from . import dependency_autolaunch
 from . import quality_evidence
 from . import quality_calibration
 from . import mcp_summary_folds
+from . import evidence_paging
 from . import manager_card_amend
 from . import validation_failed_packet
 from . import repo_policy
@@ -4827,7 +4828,7 @@ def aiworkhub_task_list(status: str = "pending", topic: str | None = None, limit
 
 @mcp.tool()
 def aiworkhub_task_show(
-    task_id: str, full: bool = False, detail: CardDetail = "brief"
+    task_id: str, full: bool = False, detail: CardDetail = "brief", cursor: str = ""
 ) -> dict[str, Any]:
     """Show a single task card by task_id.
 
@@ -4860,15 +4861,25 @@ def aiworkhub_task_show(
     ``review_findings_count`` when the card records reviewer reports: measured
     avg 11.5 KB/call over 31 calls (NF-2026-01447).
 
+    ``detail="evidence"`` is bounded (NF-2026-02256): when the card's compact
+    JSON exceeds ``evidence_paging.EVIDENCE_PAGE_CAP_BYTES`` (64 KB) ``stdout``
+    holds the leading card keys that fit and the reply carries
+    ``evidence_truncated``, ``evidence_total_bytes``, ``evidence_sha256`` and
+    ``continuation_cursor``; pass that cursor back to read the next page. A
+    cursor for a card that changed since refuses with ``evidence_cursor_stale``.
+
     Args:
         task_id: Id of the task card to show.
         full: Set true to return the exact stored card, the same as detail=full; default false.
-        detail: How much of the card to return: brief (default, lifecycle facts only; a red card returns its validation_failed_packet), summary (baselines and evidence folded), evidence (evidence kept exact, baselines still folded) or full (the exact stored card).
+        detail: How much of the card to return: brief (default, lifecycle facts only; a red card returns its validation_failed_packet), summary (baselines and evidence folded), evidence (evidence kept exact, baselines still folded, paged at 64 KB) or full (the exact stored card).
+        cursor: continuation_cursor from a previous detail=evidence reply, to read the next evidence page; default empty (first page).
     """
 
     refusal = _detail_refusal(detail, _CARD_DETAIL_MODES)
     if refusal is not None:
         return refusal
+    if cursor and (full or detail != "evidence"):
+        return evidence_paging.cursor_detail_refusal("full" if full else detail)
     if full or detail == "full":
         # NF-2026-02093: exact while it fits the byte budget, else folded + spilled.
         return mcp_summary_folds.bound_full_task_reply(
@@ -4892,6 +4903,17 @@ def aiworkhub_task_show(
             card = mcp_summary_folds.brief_task_card(card)
     elif detail == "evidence":
         card = mcp_summary_folds.dedupe_repeated_subtrees(card)
+        # NF-2026-02256: bound the evidence render; the cursor pages the rest.
+        paged = evidence_paging.page_evidence(
+            card,
+            tool="aiworkhub_task_show",
+            task_id=str(task_id),
+            card_sha256=identity["card_sha256"],
+            cursor=cursor,
+        )
+        if not paged.get("ok"):
+            return paged
+        card = paged["document"]
     rendered = dict(result)
     if packet is not None:
         rendered["stdout"] = validation_failed_packet.canonical_json(packet)
@@ -4912,6 +4934,10 @@ def aiworkhub_task_show(
             "summary": {"tool": "aiworkhub_task_show", "task_id": task_id, "detail": "summary"},
             **requests,
         }
+    if detail == "evidence":
+        rendered.update(paged["meta"])
+        if paged["meta"].get("continuation_cursor"):
+            requests["evidence_next"] = {**requests["evidence"], "cursor": paged["meta"]["continuation_cursor"]}
     rendered["detail_request"] = requests
     return rendered
 
@@ -7391,7 +7417,7 @@ def aiworkhub_quality_reviewer_launch(
 
 @mcp.tool()
 def aiworkhub_agent_task_status(
-    request_id: str = "", detail: CardDetail = "brief", task_id: str = ""
+    request_id: str = "", detail: CardDetail = "brief", task_id: str = "", cursor: str = ""
 ) -> dict[str, Any]:
     """READ-ONLY: inspect one launched process and its authoritative task card.
 
@@ -7424,16 +7450,26 @@ def aiworkhub_agent_task_status(
     (NF-2026-01447).
     ``"evidence"`` keeps all of the above exact (baselines still folded);
     ``"full"`` returns the raw status payload.
+    ``"evidence"`` is bounded (NF-2026-02256): when the compact JSON of the
+    ``task_card`` and ``latest_event`` sections exceeds
+    ``evidence_paging.EVIDENCE_PAGE_CAP_BYTES`` (64 KB) the reply carries the
+    leading section keys that fit plus ``evidence_truncated``,
+    ``evidence_total_bytes``, ``evidence_sha256`` and ``continuation_cursor``;
+    pass that cursor back to read the next page. A cursor for a card that
+    changed since refuses with ``evidence_cursor_stale``.
 
     Args:
         request_id: Id of the launched worker request to inspect; omit and pass task_id to inspect that card's latest launched request (the reply's request_id_source says which).
-        detail: brief (default) keeps the lifecycle facts only; summary folds bulky card and event bodies to size and sha256 digests while identity and lifecycle fields stay exact; evidence keeps the evidence exact too; full returns the raw status payload.
+        detail: brief (default) keeps the lifecycle facts only; summary folds bulky card and event bodies to size and sha256 digests while identity and lifecycle fields stay exact; evidence keeps the evidence exact too, paged at 64 KB; full returns the raw status payload.
         task_id: Id of the task card whose latest launched request to inspect, used only when request_id is omitted; default empty.
+        cursor: continuation_cursor from a previous detail=evidence reply, to read the next evidence page; default empty (first page).
     """
 
     refusal = _detail_refusal(detail, _CARD_DETAIL_MODES)
     if refusal is not None:
         return refusal
+    if cursor and detail != "evidence":
+        return evidence_paging.cursor_detail_refusal(detail)
     resolved, source, refusal = _request_id_for_tool(
         request_id, task_id, prefer="launch", tool="aiworkhub_agent_task_status"
     )
@@ -7474,6 +7510,23 @@ def aiworkhub_agent_task_status(
         elif detail == "evidence":
             latest = mcp_summary_folds.dedupe_repeated_subtrees(latest)
         folded["latest_event"] = latest
+    page_meta: dict[str, Any] = {}
+    if detail == "evidence":
+        # NF-2026-02256: bound the evidence sections; the cursor pages the rest.
+        raw_card = result.get("task_card")
+        bound_task = raw_card.get("task_id") if isinstance(raw_card, dict) else None
+        paged = evidence_paging.page_evidence(
+            folded,
+            tool="aiworkhub_agent_task_status",
+            task_id=str(bound_task or request_id),
+            card_sha256=str((identity or {}).get("card_sha256", "")),
+            cursor=cursor,
+            sections=("task_card", "latest_event"),
+        )
+        if not paged.get("ok"):
+            return _with_request_id_source(paged, request_id, source)
+        folded.update(paged["document"])
+        page_meta = paged["meta"]
     if identity is not None:
         folded.update(identity)
     if findings is not None:
@@ -7495,6 +7548,9 @@ def aiworkhub_agent_task_status(
             "summary": {"tool": "aiworkhub_agent_task_status", "request_id": request_id, "detail": "summary"},
             **requests,
         }
+    folded.update(page_meta)
+    if page_meta.get("continuation_cursor"):
+        requests["evidence_next"] = {**requests["evidence"], "cursor": page_meta["continuation_cursor"]}
     folded["detail_request"] = requests
     return _with_request_id_source(folded, request_id, source)
 
