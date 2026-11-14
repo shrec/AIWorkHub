@@ -22,6 +22,7 @@ import posixpath
 import re
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
@@ -2240,19 +2241,45 @@ def _accept_marker_holder(marker: Mapping[str, Any], *, held_here: bool) -> str:
     return "unknown"
 
 
+def _seconds_since(stamp: Any) -> float | None:
+    """Seconds from an aware ISO-8601 ``stamp`` to now; None when it does not parse."""
+    if not isinstance(stamp, str):
+        return None
+    try:
+        then = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if then.tzinfo is None:
+        return None
+    return round(max(0.0, (datetime.now(timezone.utc) - then).total_seconds()), 3)
+
+
 def _accept_in_progress(
     task_id: str, request_id: str, marker: Mapping[str, Any], *, verified: bool
 ) -> dict[str, Any]:
-    """The one refusal shape for an accept that is still running."""
+    """The one refusal shape for an accept that is still running.
+
+    NF-2026-02263: it names the holder's ``phase`` and both ages -- since the
+    start and since the holder last advanced -- so a stalled holder is told
+    apart from a slow one. A marker from a server older than the phase
+    heartbeat reads as phase ``unreported``, its last update as its start.
+    """
+    started_at = marker.get("started_at")
+    updated_at = marker.get("updated_at") or started_at
+    age = _seconds_since(started_at)
     return {
         "ok": False,
         "error": "accept_in_progress",
         "request_id": request_id,
         "task_id": task_id,
-        "started_at": marker.get("started_at"),
+        "started_at": started_at,
         "holder_pid": marker.get("pid"),
         "holder_server_version": marker.get("server_version"),
         "holder_identity": "verified" if verified else "unverified",
+        "phase": marker.get("phase") or "unreported",
+        "updated_at": updated_at,
+        "age_seconds": age,
+        "updated_age_seconds": age if updated_at == started_at else _seconds_since(updated_at),
     }
 
 
@@ -2344,18 +2371,60 @@ def _append_accept_in_flight_event(directory: Path, record: Mapping[str, Any]) -
         handle.write(line + "\n")
 
 
-def _unlink_accept_marker(path: Path) -> None:
-    """Remove one marker, waiting out the sharing violation a Windows reader causes."""
+def _retry_sharing_violation(action: Any) -> None:
+    """Run ``action``, waiting out the sharing violation a Windows reader causes."""
     for attempt in range(_ACCEPT_IN_FLIGHT_UNLINK_ATTEMPTS):
         try:
-            path.unlink()
-            return
-        except FileNotFoundError:
+            action()
             return
         except PermissionError:
             if attempt + 1 == _ACCEPT_IN_FLIGHT_UNLINK_ATTEMPTS:
                 raise
             time.sleep(_ACCEPT_IN_FLIGHT_RETRY_SECONDS)
+
+
+def _unlink_accept_marker(path: Path) -> None:
+    """Remove one marker; an already-absent marker is removed."""
+    _retry_sharing_violation(lambda: path.unlink(missing_ok=True))
+
+
+def _rewrite_accept_marker(path: Path, data: bytes, payload: Mapping[str, Any]) -> bytes:
+    """Replace this accept's own marker with ``payload``: the bytes now on disk.
+
+    NF-2026-02263. Like a release, only bytes this accept wrote are replaced,
+    under the directory lock, and atomically (stage, then ``os.replace``) so a
+    lock-free reader never sees a half-written marker. A failure is recorded,
+    not raised: the previous phase then stays visible, older but still true
+    about its holder.
+    """
+    new = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    staged = path.with_name(f"{path.name}.next")
+    replaced = False
+    try:
+        with _accept_marker_dir_lock(path.parent):
+            try:
+                if path.read_bytes() != data:
+                    return data
+                staged.write_bytes(new)
+                _retry_sharing_violation(lambda: os.replace(staged, path))
+                replaced = True
+            finally:
+                with contextlib.suppress(OSError):
+                    staged.unlink(missing_ok=True)
+        return new
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            _append_accept_in_flight_event(
+                path.parent,
+                {
+                    "event": "phase_update_failed",
+                    "marker": path.name,
+                    "phase": payload.get("phase"),
+                    "error": type(exc).__name__,
+                },
+            )
+        # A failure after the replace landed: the new bytes are the ones on disk.
+        return new if replaced else data
 
 
 def _create_accept_marker(
@@ -2475,6 +2544,27 @@ class _AcceptInFlight:
     def __enter__(self) -> _AcceptInFlight:
         return self
 
+    def advance(self, phase: str) -> None:
+        """NF-2026-02263: publish ``phase`` and a fresh ``updated_at``.
+
+        The in-process entry and the marker file both move, so a duplicate in
+        this or any other server sees where the accept is and how long since it
+        last moved. Never raises past the accept: a failed rewrite leaves the
+        previous phase on disk and is recorded in the events log.
+        """
+        from . import process_launcher as _pl
+
+        if not self._key:
+            return
+        with _ACCEPT_IN_FLIGHT_GUARD:
+            held = _ACCEPT_IN_FLIGHT_HELD.get(self._key)
+            if held is None:
+                return
+            held.update(phase=phase, updated_at=_pl._utcnow())
+            payload = dict(held)
+        if self._path is not None:
+            self._data = _rewrite_accept_marker(self._path, self._data, payload)
+
     def __exit__(self, *exc_info: object) -> None:
         key, path = self._key, self._path
         self._key, self._path = "", None
@@ -2498,14 +2588,17 @@ def _accept_in_flight_marker(self: Any, task_id: str, request_id: str) -> _Accep
     from . import process_launcher as _pl
 
     key = _accept_in_flight_key(task_id, request_id)
+    started_at = _pl._utcnow()
     payload: dict[str, Any] = {
         "schema_id": ACCEPT_IN_FLIGHT_SCHEMA_ID,
         "task_id": task_id,
         "request_id": request_id,
         "pid": os.getpid(),
         "pid_start_ticks": _pid_start_ticks(os.getpid()),
-        "started_at": _pl._utcnow(),
+        "started_at": started_at,
         "server_version": __version__,
+        "phase": "claimed",
+        "updated_at": started_at,
     }
     with _ACCEPT_IN_FLIGHT_GUARD:
         held = _ACCEPT_IN_FLIGHT_HELD.setdefault(key, payload)
@@ -3502,6 +3595,7 @@ def accept_review(
                     or report.get("can_mutate_repo") is not False
                 ):
                     raise WorkspaceError("quality_review_receipt_not_readonly")
+                in_flight.advance("revalidating")
                 validations = _run_declared_validations(
                     workspace, card, latest
                 )
@@ -3698,6 +3792,7 @@ def accept_review(
                         "validation_required_aiworkhub_mcp_call_missing:"
                         + str(worker_mcp_gate.get("reason") or "")
                     )
+                in_flight.advance("revalidating")
                 validations = _run_declared_validations(
                     workspace, card, latest
                 )
@@ -4154,6 +4249,7 @@ def accept_review(
                 """
                 nonlocal combined_tree, combined_tree_checks
                 nonlocal neighbour_tests, union_validation_reuse
+                in_flight.advance("combined_tree_gate")
                 union_workspace, combined_tree = create_combined_validation_workspace(
                     workspace,
                     card,
@@ -4570,6 +4666,7 @@ def accept_review(
             # The union run above (when there was one) is the same-identity
             # evidence for this tree; the finalizer receipt is the fallback.
             validation_reuse = union_validation_reuse or validation_reuse
+            in_flight.advance("revalidating")
             validations, full_validation_snapshot = (
                 _run_full_snapshot_validations(
                     workspace, card, latest, changed,
@@ -4606,6 +4703,7 @@ def accept_review(
             #   parent-baseline guard stays the last word on those paths;
             # - the path-hash compare above reads this request's retained worktree,
             #   which the request lock protects and no other accept writes.
+            in_flight.advance("awaiting_promotion_lock")
             promotion_busy_reply = _enter_promotion_lock()
             if promotion_busy_reply is not None:
                 return _reply_with_correction_restored(
@@ -4666,6 +4764,7 @@ def accept_review(
                 neighbour_tests = neighbour_selection.evidence()
                 if _combined_tree_required():
                     _validate_combined_tree()
+                in_flight.advance("revalidating")
                 validations, full_validation_snapshot = (
                     _run_full_snapshot_validations(
                         workspace, card, latest, changed,
@@ -4716,6 +4815,7 @@ def accept_review(
             raise
         # Promote exactly the merged bytes validated in the combined tree (NF-2026-01381 part A).
         combined_tree = full_validation_snapshot.get("combined_tree") or {}
+        in_flight.advance("promoting")
         try:
             # NF-2026-01469: promotion can raise before writing any byte (a
             # backwards-version refusal) or mid-write; either way CORRECTED
@@ -4746,6 +4846,7 @@ def accept_review(
                 _restore_correction_originals(workspace, correction_originals)
             raise
 
+        in_flight.advance("recording")
         # NF-2026-01518: the paths promotion three-way merged, exactly as the
         # combined tree validated them; canonical now holds their MERGED bytes.
         merged_paths = combined_tree.get("merged_paths") or {}

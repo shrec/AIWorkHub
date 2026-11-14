@@ -57,6 +57,7 @@ _ACCEPT_PARAMETERS = [
     "extra_evidence_ids", "no_new_lesson_reason", "auto_commit", "commit_message",
 ]
 _PAYLOAD_PREFIX = "NF01626_PAYLOAD="
+_HOLDER_FACTS = ("started_at", "holder_pid", "holder_server_version", "holder_identity")
 _needs_sdk = pytest.mark.skipif(
     not server._MCP_SDK_AVAILABLE,
     reason="the mcp SDK is not importable, so there is no FastMCP tool to drive",
@@ -200,16 +201,19 @@ def test_two_concurrent_accepts_run_validation_exactly_once(accept_env):
 
         assert _tree(env.root) == before, "the refused accept wrote to disk"
         assert env.manager.reviewer_launches == launches
-    assert second == {
+    assert {key: second[key] for key in ("ok", "error", "request_id", "task_id")} == {
         "ok": False,
         "error": "accept_in_progress",
         "request_id": REQUEST_ID,
         "task_id": TASK_ID,
+    }
+    assert {key: second[key] for key in _HOLDER_FACTS} == {
         "started_at": held["started_at"],
         "holder_pid": os.getpid(),
         "holder_server_version": held["server_version"],
         "holder_identity": "verified",
     }
+    assert second["phase"] == held["phase"]
     assert first.get("result", {}).get("ok") is True, first
     assert set(env.validating) == {worker.ident}
 
@@ -223,12 +227,16 @@ def test_accept_preview_reports_the_running_accept(accept_env):
     assert preview["ok"] is True
     assert preview["blocked"] is True
     assert preview["evaluated"] is False
-    assert preview["accept_in_progress"] == {
+    facts = preview["accept_in_progress"]
+    assert {key: facts[key] for key in _HOLDER_FACTS} == {
         "started_at": held["started_at"],
         "holder_pid": os.getpid(),
         "holder_server_version": held["server_version"],
         "holder_identity": "verified",
     }
+    # NF-2026-02263: the phase and both ages ride along.
+    assert facts["phase"] == held["phase"]
+    assert facts["age_seconds"] >= facts["updated_age_seconds"] >= 0
     assert [(row["kind"], row["error"]) for row in preview["blockers"]] == [
         ("accept_in_progress", "accept_in_progress")
     ]
