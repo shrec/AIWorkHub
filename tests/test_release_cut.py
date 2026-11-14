@@ -1358,9 +1358,9 @@ def test_release_documents_and_allow_dirty_paths_may_be_dirty_but_only_the_forme
         release_metadata.CANONICAL_VERSION_FILE,
         *release_metadata.PROJECTION_FILES,
         *release_metadata.RELEASE_DOCUMENTS,
-        release_cut.RELEASE_LEDGER,
     }
     assert not {"-a", "--all", "docs/notes.md", "docs/"} & set(commit)
+    assert release_cut.RELEASE_LEDGER not in commit  # host-local, never committed
 
 
 def test_a_generated_file_must_be_clean_even_under_allow_dirty(tmp_path: Path) -> None:

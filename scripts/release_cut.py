@@ -782,7 +782,8 @@ class ReleaseCut:
         return (release_metadata.CANONICAL_VERSION_FILE, *release_metadata.PROJECTION_FILES)
 
     def _release_files(self) -> tuple[str, ...]:
-        return (*self._generated_files(), *release_metadata.RELEASE_DOCUMENTS, RELEASE_LEDGER)
+        # The release ledger is host-local (.gitignore, 77a9c5ac): it is appended, never committed.
+        return (*self._generated_files(), *release_metadata.RELEASE_DOCUMENTS)
 
     def _host_test_argv(self, nodes: Sequence[str] = ()) -> list[str]:
         # With nodes: the serial rerun of exactly those ids, in a basetemp of its own
