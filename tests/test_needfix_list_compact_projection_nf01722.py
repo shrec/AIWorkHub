@@ -109,6 +109,12 @@ def test_full_parameter_is_final_and_defaults_false():
     import inspect
 
     params = list(inspect.signature(server.needfix_list).parameters.values())
+    names = [param.name for param in params]
 
-    assert params[-1].name == "full"
-    assert params[-1].default is False
+    # full was appended after query, so existing positional callers keep working. NF-2026-02270 folded
+    # needfix_count in as count_only/breakdown appended after full; those stay default-off too.
+    full_index = names.index("full")
+    assert names[full_index - 1] == "query"
+    assert params[full_index].default is False
+    assert names[full_index + 1 :] == ["count_only", "breakdown"]
+    assert all(param.default is False for param in params[full_index + 1 :])

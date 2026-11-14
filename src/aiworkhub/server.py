@@ -6023,7 +6023,8 @@ def aiworkhub_task_codex_handoff(
     """READ-ONLY: Codex-ready HANDOFF report for review-queue tasks.
 
     Use this for the handoff as JSON, or with format=markdown for the same
-    report plus a deterministic ``markdown`` field (a compact review packet).
+    report plus a deterministic ``markdown`` field (a compact review packet);
+    use aiworkhub_review_packet for one candidate's full review evidence.
 
     For each task waiting on Codex review, summarizes task_id, runner, topic,
     allowed_writes, validation commands, derived risks, commit-hygiene status,
