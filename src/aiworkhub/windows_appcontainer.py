@@ -2872,12 +2872,52 @@ def _with_toolchain_grants(
     :func:`_raise_for_toolchain_grant` names if applying one fails.
     """
     try:
-        from .toolchain_grants import grant_failure_detail, plan_toolchain_grants
+        from .toolchain_grants import (
+            grant_failure_detail,
+            plan_toolchain_grants,
+            toolchain_launch_environment,
+        )
     except ImportError:  # direct-script entrypoint
         from toolchain_grants import (  # type: ignore[no-redef]
             grant_failure_detail,
             plan_toolchain_grants,
+            toolchain_launch_environment,
         )
+
+    # NF-2026-02268: a flutter/dart head gets FLUTTER_ALREADY_LOCKED and a
+    # PUB_CACHE inside a directory this request already grants modify on (its
+    # temp first, else its working directory), so it never waits on the SDK's
+    # read-only bin\cache\lockfile.  No write grant is ever planned on the SDK.
+    writable = [
+        os.path.normcase(os.path.normpath(grant.path))
+        for grant in request.filesystem_grants
+        if grant.access == "modify"
+    ]
+    source_env = os.environ if request.environment is None else request.environment
+    pub_cache_dir = next(
+        (
+            os.path.join(candidate, "pub-cache")
+            for candidate in (
+                source_env.get("TEMP", ""),
+                source_env.get("TMP", ""),
+                request.working_directory or "",
+            )
+            if candidate
+            and os.path.isabs(candidate)
+            and any(
+                _within(os.path.normcase(os.path.normpath(candidate)), root)
+                for root in writable
+            )
+        ),
+        None,
+    )
+    additions = toolchain_launch_environment(
+        request.argv, request.environment, pub_cache_dir
+    )
+    # environment=None means "inherit the caller's environment"; keep it None
+    # rather than snapshotting os.environ into an explicit, unvalidated mapping.
+    if additions and request.environment is not None:
+        request = replace(request, environment={**source_env, **additions})
 
     covered = [grant.path for grant in request.filesystem_grants if grant.access != "traverse"]
     planned = plan_toolchain_grants(request.argv, request.environment, covered=covered)

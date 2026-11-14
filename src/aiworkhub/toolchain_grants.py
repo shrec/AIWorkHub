@@ -204,3 +204,39 @@ def grant_failure_detail(toolchain: ToolchainRoot, cause: object) -> str:
         f"toolchain_grant_failed: {toolchain.describe()} could not be granted "
         f"read_execute for the AppContainer: {cause}"
     )
+
+
+def toolchain_launch_environment(
+    argv: Sequence[str],
+    environment: Mapping[str, str] | None,
+    pub_cache_dir: str | None,
+) -> dict[str, str]:
+    """Env additions for a launch whose command heads resolve a flutter/dart SDK.
+
+    Flutter's own startup-lock check (``bin/internal/shared.bat`` /
+    ``bin/internal/shared.sh``, consumed by ``flutter_tools``'
+    ``Cache.lock``/``Cache.checkLockAcquired``) is skipped entirely when the
+    environment variable ``FLUTTER_ALREADY_LOCKED`` is set to ``true``: the
+    tool never tries to open ``<sdk>\\bin\\cache\\lockfile`` for write, which
+    the AppContainer -- granted only ``read_execute`` on the SDK root -- can
+    never obtain.  ``PUB_CACHE`` is pointed at ``pub_cache_dir`` (created here
+    if absent) when the caller supplies a directory the container can already
+    write -- the caller must derive this from an existing ``read_write`` grant
+    on the request, never invent a new one -- so ``pub`` resolution also has a
+    writable cache, since the container is never granted the user's
+    ``%LOCALAPPDATA%\\Pub\\Cache``.
+
+    Both variables are left untouched if the caller's environment (or the
+    card) already sets them.  Nothing is added when ``argv`` resolves no
+    flutter/dart SDK root.
+    """
+    if not launch_toolchain_roots(argv, environment):
+        return {}
+    env = os.environ if environment is None else environment
+    additions: dict[str, str] = {}
+    if not _env_value(env, "FLUTTER_ALREADY_LOCKED"):
+        additions["FLUTTER_ALREADY_LOCKED"] = "true"
+    if not _env_value(env, "PUB_CACHE") and pub_cache_dir:
+        os.makedirs(pub_cache_dir, exist_ok=True)
+        additions["PUB_CACHE"] = pub_cache_dir
+    return additions
