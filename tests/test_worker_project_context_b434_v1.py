@@ -581,6 +581,264 @@ def test_worker_prompt_bounds_contract_and_excludes_recursive_persistence_envelo
         )
 
 
+_CONTEXT_HEADER = "no acknowledgement line is required):\n"
+
+
+def _typical_budget_card(**extra) -> dict:
+    card = {
+        "task_id": "TASK_CTX_BUDGET",
+        "runner": "claude",
+        "topic": "worker-prompt-project-context-budget",
+        "objective": "bound project context",
+        "allowed_writes": ["src/aiworkhub/process_launcher.py", "tests/test_budget.py"],
+        "acceptance": ["ACCEPT_CRITERION_ONE", "ACCEPT_CRITERION_TWO"],
+        "validation": ["python -m pytest tests/test_budget.py -q"],
+        "required_outputs": ["src/aiworkhub/process_launcher.py"],
+        "project_context": {
+            "required": True,
+            "kb": {"limit": 5, "query": "KB_BUDGET_QUERY"},
+            "ai_memory": {"limit": 5, "query": "MEMORY_BUDGET_QUERY"},
+            "session": {"limit": 8, "topic": "SESSION_BUDGET_TOPIC"},
+            "source_graph": {"mode": "focus", "query": "SG_BUDGET_QUERY", "budget": 48},
+        },
+    }
+    card.update(extra)
+    return card
+
+
+def _typical_project_context_bundle() -> str:
+    # Shaped like the measured NF-02269/NF-02243/NF-02220 bundles (~24 KB).
+    rules = {
+        "manifest_digest": "f" * 64,
+        "rules": [
+            {"id": f"rule_{index}", "forbid": [f"FORBID_RULE_{index}"], "allow": ["x" * 40]}
+            for index in range(24)
+        ],
+        "contexts": [{"paths": ["src/aiworkhub/process_launcher.py"], "rule_ids": ["rule_0"]}],
+    }
+    evidence = {
+        "development_rules": rules,
+        "source_graph": {"matches": [{"qualname": "SG_ROW_" + "s" * 90} for _ in range(80)]},
+        # Each of kb/ai_memory alone exceeds the 8 KiB budget, so both are
+        # always replaced by retrieval pointers (unconditional assertions).
+        "kb": {"data": {"results": [{"body": "KB_BODY_" + "k" * 2200} for _ in range(4)]}},
+        "ai_memory": {"data": {"results": [{"value": "MEM_VALUE_" + "m" * 3000} for _ in range(3)]}},
+        "skills": {"skills": [{"procedure_steps": ["SKILL_STEP_" + "p" * 700]} for _ in range(4)]},
+        "project_tools": "project.json_get - Print one value. - python tools/json_get.py",
+    }
+    payload = {
+        "evidence": evidence,
+        "repo_identity": {"repo_id": "repo_x", "scope_root": "."},
+        "schema_id": "aiworkhub.task_mcp.project_context_bundle.v2",
+    }
+    return "PROJECT_CONTEXT_BUNDLE:\n" + json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+def test_initial_project_context_is_bounded_with_named_retrieval_pointers() -> None:
+    bundle = _typical_project_context_bundle()
+    assert len(bundle.encode("utf-8")) > 20_000
+    card = _typical_budget_card()
+    budget: dict = {}
+    prompt = process_launcher.build_worker_prompt(
+        task_id=card["task_id"], runner=card["runner"], topic=card["topic"],
+        card=card, project_context_bundle=bundle, _budget_report=budget,
+    )
+    context = prompt.split(_CONTEXT_HEADER, 1)[1]
+    assert len(context.encode("utf-8")) <= process_launcher._wcb.MAX_INITIAL_PROJECT_CONTEXT_BYTES == 8192
+    assert budget["sections"]["project_context_bytes"] == len(context.encode("utf-8"))
+    assert budget["project_context_source_bytes"] == len(bundle.encode("utf-8"))
+    payload = json.loads(context.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])
+    evidence = payload["evidence"]
+    # Development rules reach the prompt verbatim.
+    original = json.loads(bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])["evidence"]
+    assert evidence["development_rules"] == original["development_rules"]
+    assert "FORBID_RULE_23" in prompt
+    # Every original section is present: either verbatim or a named pointer.
+    assert set(evidence) == set(original)
+    pointers = {name: v for name, v in evidence.items() if isinstance(v, dict) and v.get("omitted")}
+    assert {"source_graph", "kb", "ai_memory"} <= set(pointers)
+    assert "development_rules" not in pointers
+    for name, pointer in pointers.items():
+        assert pointer["omitted"] == "context_budget"
+        assert pointer["bytes"] > 0 and len(pointer["sha256_prefix"]) == 16
+        assert pointer["retrieve"]
+    assert pointers["kb"]["retrieve"] == {"tool": "aiworkhub_worker_kb_search", "query": "KB_BUDGET_QUERY"}
+    assert pointers["ai_memory"]["retrieve"] == {
+        "tool": "aiworkhub_worker_ai_memory_search", "query": "MEMORY_BUDGET_QUERY",
+    }
+    assert pointers["source_graph"]["retrieve"]["query"] == "SG_BUDGET_QUERY"
+    for marker in ("KB_BODY_", "MEM_VALUE_", "SG_ROW_"):
+        assert marker not in prompt
+    assert payload["context_budget"]["original_bytes"] == len(bundle.encode("utf-8"))
+    assert budget["project_context_over_budget"] is False
+    # Card-required fields reach the contract unchanged.
+    contract = json.loads(prompt.split("TASK_CONTRACT_JSON:\n", 1)[1].split("\nEND_TASK_CONTRACT_JSON", 1)[0])
+    for key in ("allowed_writes", "acceptance", "validation", "required_outputs"):
+        assert contract[key] == card[key]
+    # Deterministic rendering.
+    again = process_launcher.build_worker_prompt(
+        task_id=card["task_id"], runner=card["runner"], topic=card["topic"],
+        card=card, project_context_bundle=bundle,
+    )
+    assert again == prompt
+
+
+def test_small_project_context_bundle_passes_through_unchanged() -> None:
+    bundle = "PROJECT_CONTEXT_BUNDLE:\n" + json.dumps({"evidence": {"kb": {"x": 1}}})
+    prompt = process_launcher.build_worker_prompt(
+        task_id="T", runner="claude", topic="t", card={"objective": "o"},
+        project_context_bundle=bundle,
+    )
+    assert prompt.endswith(bundle)
+
+
+def test_rework_delta_ships_only_findings_and_a_context_pointer() -> None:
+    bundle = _typical_project_context_bundle()
+    card = _typical_budget_card(
+        review_feedback={"instruction": "REJECT_FINDING_ROW_7", "residual_identities": [{"path": "a.py"}]},
+    )
+    budget: dict = {}
+    prompt = process_launcher.build_worker_prompt(
+        task_id=card["task_id"], runner=card["runner"], topic=card["topic"],
+        card=card, project_context_bundle=bundle, _budget_report=budget,
+    )
+    assert budget["mode"] == "rework_delta"
+    context = prompt.split(_CONTEXT_HEADER, 1)[1]
+    original = json.loads(bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])["evidence"]
+    rules_bytes = len(json.dumps(
+        original["development_rules"], ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+    ).encode("utf-8"))
+    # development_rules travels verbatim and is counted outside the 1 KiB cap.
+    assert budget["project_context_required_bytes"] == rules_bytes
+    assert budget["project_context_budgeted_bytes"] == len(context.encode("utf-8")) - rules_bytes
+    assert budget["project_context_budgeted_bytes"] <= process_launcher._wcb.MAX_REWORK_PROJECT_CONTEXT_BYTES == 1024
+    assert budget["project_context_over_budget"] is False
+    assert budget["sections"]["project_context_bytes"] == len(context.encode("utf-8"))
+    assert len(context.encode("utf-8")) < len(bundle.encode("utf-8")) // 4
+    assert "REJECT_FINDING_ROW_7" in prompt
+    for marker in ("SG_ROW_", "KB_BODY_", "MEM_VALUE_", "SKILL_STEP_"):
+        assert marker not in prompt
+    assert "FORBID_RULE_23" in prompt
+    pointer = json.loads(context.split("PROJECT_CONTEXT_POINTER:\n", 1)[1])
+    assert pointer["development_rules"] == original["development_rules"]
+    assert pointer["mode"] == "rework_delta"
+    assert pointer["bundle_bytes"] == len(bundle.encode("utf-8"))
+    assert len(pointer["bundle_sha256"]) == 64
+    assert "development_rules" not in pointer["sections"]
+    assert {hint.get("tool") for hint in pointer["retrieve"]} >= {
+        "aiworkhub_worker_source_graph_query", "aiworkhub_worker_kb_search",
+    }
+    contract = json.loads(prompt.split("TASK_CONTRACT_JSON:\n", 1)[1].split("\nEND_TASK_CONTRACT_JSON", 1)[0])
+    for key in ("allowed_writes", "acceptance", "validation", "required_outputs"):
+        assert contract[key] == card[key]
+
+
+def test_rework_delta_passes_small_bundle_through_unchanged() -> None:
+    bundle = "PROJECT_CONTEXT_BUNDLE:\n" + json.dumps({"evidence": {"kb": {"x": 1}}})
+    card = _typical_budget_card(review_feedback={"instruction": "REJECT_FINDING_SMALL"})
+    budget: dict = {}
+    prompt = process_launcher.build_worker_prompt(
+        task_id=card["task_id"], runner=card["runner"], topic=card["topic"],
+        card=card, project_context_bundle=bundle, _budget_report=budget,
+    )
+    assert prompt.split(_CONTEXT_HEADER, 1)[1] == bundle
+    assert "PROJECT_CONTEXT_POINTER:" not in prompt
+    assert budget["project_context_mode"] == "passthrough"
+    assert budget["project_context_over_budget"] is False
+
+
+def test_unparseable_over_budget_bundle_keeps_development_rules() -> None:
+    from aiworkhub import worker_context_budget
+
+    rules = {"manifest_digest": "d" * 64, "rules": [{"id": "RULE_KEPT", "forbid": ["FORBID_KEPT"]}]}
+    broken = (
+        "PROJECT_CONTEXT_BUNDLE:\n{\"evidence\":{\"development_rules\":"
+        + json.dumps(rules) + ",\"kb\":\"" + "BROKEN_KB_" * 2000
+    )  # unterminated JSON
+    for rework in (False, True):
+        result = worker_context_budget.render_worker_project_context(
+            broken, card=_typical_budget_card(), rework=rework,
+        )
+        pointer_text = result.text.split("PROJECT_CONTEXT_POINTER:\n", 1)[1]
+        pointer = json.loads(pointer_text.split("\nPROJECT_CONTEXT_EXCERPT:\n", 1)[0])
+        assert pointer["development_rules"] == rules
+        assert pointer["bundle_bytes"] == len(broken.encode("utf-8"))
+        assert result.over_budget is False
+        if rework:
+            assert result.required_bytes > 0
+            assert result.budgeted_bytes <= worker_context_budget.MAX_REWORK_PROJECT_CONTEXT_BYTES
+        else:
+            assert len(result.text.encode("utf-8")) <= worker_context_budget.MAX_INITIAL_PROJECT_CONTEXT_BYTES
+            tail = result.text.rsplit("\n", 1)[1]
+            assert tail.startswith("[truncated: ") and "bytes, retrieve via " in tail
+            assert "aiworkhub_worker_kb_search" in tail and "BROKEN_KB_" in result.text
+    # No recoverable rules: the pointer names what is missing and how to get it.
+    result = worker_context_budget.render_worker_project_context(
+        "PROJECT_CONTEXT_BUNDLE:\n{" + "x" * 20000, card=None, rework=False,
+    )
+    pointer = json.loads(result.text.split("PROJECT_CONTEXT_POINTER:\n", 1)[1].split("\nPROJECT_CONTEXT_EXCERPT:\n", 1)[0])
+    assert pointer["required_sections_unrecovered"] == ["development_rules"]
+
+
+def test_unparseable_bundle_ignores_nested_decoy_rules_and_dedupes_excerpt() -> None:
+    from aiworkhub import worker_context_budget
+
+    rules = {"rules": [{"id": "REAL_RULE"}]}
+    decoy = {"development_rules": {"rules": [{"id": "DECOY_RULE"}]}}
+    broken = (
+        "PROJECT_CONTEXT_BUNDLE:\n{\"evidence\":{\"ai_memory\":" + json.dumps(decoy)
+        + ",\"development_rules\":" + json.dumps(rules)
+        + ",\"kb\":\"" + "BROKEN_KB_" * 2000
+    )
+    result = worker_context_budget.render_worker_project_context(
+        broken, card=_typical_budget_card(), rework=False,
+    )
+    pointer = json.loads(result.text.split("PROJECT_CONTEXT_POINTER:\n", 1)[1].split("\nPROJECT_CONTEXT_EXCERPT:\n", 1)[0])
+    assert pointer["development_rules"] == rules
+    assert result.text.count("REAL_RULE") == 1
+    assert result.required_bytes > 0
+    # A decoy alone is never taken as the contract.
+    only_decoy = "PROJECT_CONTEXT_BUNDLE:\n{\"evidence\":{\"ai_memory\":" + json.dumps(decoy) + ",\"kb\":\"" + "x" * 20000
+    for rework in (False, True):
+        result = worker_context_budget.render_worker_project_context(
+            only_decoy, card=None, rework=rework,
+        )
+        head = result.text.split("PROJECT_CONTEXT_POINTER:\n", 1)[1].split("\nPROJECT_CONTEXT_EXCERPT:\n", 1)[0]
+        pointer = json.loads(head)
+        assert "development_rules" not in pointer
+        assert pointer["required_sections_unrecovered"] == ["development_rules"]
+        assert pointer["required_sections_retrieve"]
+
+
+def test_rework_passes_through_a_bundle_that_is_mostly_rules() -> None:
+    from aiworkhub import worker_context_budget
+
+    bundle = "PROJECT_CONTEXT_BUNDLE:\n" + json.dumps({"evidence": {
+        "development_rules": {"rules": ["R" * 3000]},
+        "kb": {"x": 1},
+    }})
+    result = worker_context_budget.render_worker_project_context(bundle, card=None, rework=True)
+    assert result.text == bundle
+    assert result.mode == "passthrough"
+    assert result.required_bytes > worker_context_budget.MAX_REWORK_PROJECT_CONTEXT_BYTES
+    assert result.budgeted_bytes <= worker_context_budget.MAX_REWORK_PROJECT_CONTEXT_BYTES
+
+
+def test_required_sections_over_budget_are_flagged_not_dropped() -> None:
+    bundle = "PROJECT_CONTEXT_BUNDLE:\n" + json.dumps({"evidence": {
+        "development_rules": {"rules": ["HUGE_RULE_" + "r" * 10000]},
+        "kb": {"body": "KB_BODY_" + "k" * 3000},
+    }})
+    budget: dict = {}
+    prompt = process_launcher.build_worker_prompt(
+        task_id="T", runner="claude", topic="t", card={"objective": "o"},
+        project_context_bundle=bundle, _budget_report=budget,
+    )
+    assert "HUGE_RULE_" in prompt and "KB_BODY_" not in prompt
+    assert budget["project_context_over_budget"] is True
+    assert budget["project_context_budgeted_bytes"] > budget["project_context_max_bytes"]
+
+
 def test_workspace_creation_does_not_copy_live_context_databases(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     repo = _context_repo(tmp_path)
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)

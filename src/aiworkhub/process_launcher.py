@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, cast
 
 from . import adapter_capability, core, rework_overlay_packet as _rework_overlay_packet
-from . import agent_tool_instructions, sandbox_cpu_budget
+from . import agent_tool_instructions, sandbox_cpu_budget, worker_context_budget as _wcb
 from . import attempt_artifacts
 from . import claude_auth
 from . import cli_model_discovery
@@ -3985,13 +3985,12 @@ def build_worker_prompt(
     # evidence and its absence used to refuse verified work (receipt_not_found).
     # ``request_id`` stays in the signature for its call sites; the binding
     # is recorded in the request metadata, not in prompt text.
+    rendered = _wcb.render_worker_project_context(project_context_bundle, card=card, rework=rework)
     context_block = (
         "\n\nTrusted project context (bounded, read-only, coordinator-provided; "
         "bound to your request id by the coordinator, no acknowledgement line "
         "is required):\n"
-        + project_context_bundle.strip()
-        if project_context_bundle.strip()
-        else ""
+        + rendered.text if rendered.text else ""
     )
     retry_json = ""
     if crash_retry_packet is not None:
@@ -4039,7 +4038,7 @@ def build_worker_prompt(
     if prompt_bytes > prompt_cap:
         raise ValueError("worker_prompt_too_large")
     if _budget_report is not None:
-        context_bytes = len(project_context_bundle.encode("utf-8"))
+        context_bytes = len(rendered.text.encode("utf-8"))
         retry_bytes = len(retry_json.encode("utf-8"))
         static_bytes = max(
             0,
@@ -4059,6 +4058,8 @@ def build_worker_prompt(
                 "crash_retry_evidence_bytes": retry_bytes,
                 "runtime_instructions_bytes": static_bytes,
             },
+            "project_context_source_bytes": len(project_context_bundle.encode("utf-8")),
+            **rendered.report(),
             "stable_prefix_bytes": len(stable_prefix.encode("utf-8")),
             "stable_prefix_precedes_task_contract": True,
             "provider_cache_savings_observed": False,
