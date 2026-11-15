@@ -1776,6 +1776,7 @@ def test_reconciler_finalization_pending_bypasses_identity_and_finalizes_once(
     finalizer_calls = []
     manager = SimpleNamespace(
         _latest_by_request=lambda: {"request-pending": candidate},
+        _request_events=lambda _request_id: [],
         _finalize_after_process_exit=lambda request_id: (
             finalizer_calls.append(request_id) or {"state": "review_ready"}
         ),
