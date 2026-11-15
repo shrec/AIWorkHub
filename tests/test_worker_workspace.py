@@ -707,6 +707,8 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "worker_workspace_ignore_seed.py",
         # ...and its native build-driver tree seed (NF-2026-02079).
         "worker_workspace_native_seed.py",
+        # ...and its validation stall watchdog (NF-2026-02269).
+        "validation_stall.py",
     ):
         shutil.copyfile(source_package / name, destination_package / name)
     # write_bytes, not write_text: several tests compare a raw on-disk byte
@@ -1174,6 +1176,7 @@ def test_package_runtime_temp_loader_rejects_missing_private_support_without_top
         # NF-2026-02239: sandbox_cpu_budget is a relative sibling of worker_workspace.
         "sandbox_cpu_budget.py",
         "validation_runner.py",  # imported by sandbox_cpu_budget (NF-2026-02239)
+        "validation_stall.py",  # worker_workspace's validation stall watchdog (NF-2026-02269)
         "runtime_temp.py",
         "worker_workspace.py",
     ):

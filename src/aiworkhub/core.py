@@ -2040,7 +2040,7 @@ def _fold_validation(entries: list[Any], folded: dict[str, Any]) -> None:
     rows = [entry for entry in entries if isinstance(entry, dict)]
     failed = [
         entry for entry in rows
-        if entry.get("timed_out") or entry.get("returncode") not in (0, None)
+        if entry.get("timed_out") or entry.get("stalled") or entry.get("returncode") not in (0, None)
     ]
     folded["verdict"] = "failed" if failed else ("passed" if rows else "empty")
     folded["command_count"] = len(rows)
@@ -2051,6 +2051,7 @@ def _fold_validation(entries: list[Any], folded: dict[str, Any]) -> None:
             "command": _evidence_text(first.get("command"), first.get("declared_command")),
             "rc": first.get("returncode"),
             "error": _evidence_text(
+                first.get("failure_reason"),
                 first.get("error"), first.get("stderr_tail"), first.get("stderr_head"),
                 first.get("stdout_tail"),
             ),

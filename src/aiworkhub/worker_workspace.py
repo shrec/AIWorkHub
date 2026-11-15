@@ -54,8 +54,13 @@ if __package__:
     )
     from .host_heavy_slots import slotted
     from .closure_probe_scope import shared_closure_probes
+    from .validation_stall import StallWatchdog, annotate_stalled, hung_reason_detail, run_watched, wait_appcontainer_watched
 else:
     slotted = shared_closure_probes = lambda max_wait_seconds=0: lambda fn: fn
+    try:  # script mode: the file's own dir is on sys.path unless loaded bare
+        from validation_stall import StallWatchdog, annotate_stalled, hung_reason_detail, run_watched, wait_appcontainer_watched
+    except ImportError:  # bare Landlock wrapper: no validation backend runs there
+        StallWatchdog = annotate_stalled = hung_reason_detail = run_watched = wait_appcontainer_watched = None  # type: ignore[assignment,misc]
 
 # ``VALIDATION_FAILED`` / ``VALIDATION_ENVIRONMENT_BLOCKED`` name the two terminal
 # states this module's ``ValidationRunError`` hierarchy carries at class-definition
@@ -12702,7 +12707,7 @@ def _run_host_readonly_git(
             return subprocess.CompletedProcess(list(argv), 1, "", str(exc))
         # cwd is the host-only admin record, never a candidate directory:
         # nothing git loads at startup can come from the worktree.
-        result = subprocess.run(
+        result = run_watched(
             list(argv),
             cwd=admin_dir,
             env=env,
@@ -12964,6 +12969,7 @@ def _run_appcontainer_validation(
     stdout_read, stdout_write = os.pipe()
     stderr_read, stderr_write = os.pipe()
     captured: dict[str, bytes] = {"stdout": b"", "stderr": b""}
+    watchdog = StallWatchdog()
 
     def _drain(fd: int, key: str) -> None:
         chunks: list[bytes] = []
@@ -12973,6 +12979,7 @@ def _run_appcontainer_validation(
                 if not chunk:
                     break
                 chunks.append(chunk)
+                watchdog.note_output(len(chunk))
         except OSError:
             pass
         finally:
@@ -13025,12 +13032,7 @@ def _run_appcontainer_validation(
         timeout_ms = max(
             0, min(int(timeout_seconds * 1000), _MAX_APPCONTAINER_WAIT_MS)
         )
-        try:
-            outcome = launch.wait(timeout_ms)
-        except AppContainerError as exc:
-            raise OSError(
-                f"windows_appcontainer_validation_wait_failed:{exc}"
-            ) from exc
+        outcome = wait_appcontainer_watched(launch, timeout_ms, drains, captured, effective_argv, watchdog=watchdog, error_type=AppContainerError, join_seconds=_APPCONTAINER_DRAIN_JOIN_SECONDS)
 
         if outcome.state is not AppContainerLifecycleState.EXITED:
             try:
@@ -13591,7 +13593,7 @@ def run_validations(
                             f"ninja_named_pipe_denied:{command}"
                         )
                 else:
-                    result = subprocess.run(
+                    result = run_watched(
                         wrapped,
                         cwd=subprocess_cwd,
                         env=env,
@@ -13628,6 +13630,7 @@ def run_validations(
                         "stderr_tail": stderr[-4_096:],
                         "stderr_truncated": len(stderr) > 8_192,
                 }
+                annotate_stalled(timeout_record, exc, command)
                 timeout_record["failure_receipt"] = _validation_failure_receipt(
                     timeout_record
                 )
@@ -13743,7 +13746,7 @@ def run_validations(
                     restrictions=terminal.restrictions,
                 )
             if first.get("timed_out"):
-                reason = (
+                reason = hung_reason_detail(first) if first.get("stalled") else (
                     f"validation_timeout:{first.get('command')}:"
                     f"timeout_seconds={bounded_timeout}"
                 )

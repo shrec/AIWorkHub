@@ -766,6 +766,15 @@ def _relayed_validation_result(
                 _relayed_text(record["stdout"]),
                 _relayed_text(record["stderr"]),
             )
+        if kind == "stalled":
+            from .validation_stall import ValidationStalled
+
+            raise ValidationStalled(
+                [str(part) for part in record["args"]],
+                float(record["stall_seconds"]),
+                output=_relayed_text(record["stdout"]),
+                stderr=_relayed_text(record["stderr"]),
+            )
         if kind == "timeout":
             raise subprocess.TimeoutExpired(
                 [str(part) for part in record["args"]],
@@ -867,6 +876,7 @@ def _run_relayed_validation(raw: bytes) -> dict[str, Any]:
     if not in_private_logon_session():
         # Never run the lane where the hop came from: that is the owner session.
         raise PrivateLogonSessionError("validation_relay_not_in_private_logon_session")
+    from .validation_stall import ValidationStalled
     from .worker_workspace import WorkerWorkspace, _run_appcontainer_validation
 
     try:
@@ -878,6 +888,15 @@ def _run_relayed_validation(raw: bytes) -> dict[str, Any]:
             env={str(key): str(value) for key, value in dict(spec["env"]).items()},
             timeout_seconds=spec["timeout_seconds"],
         )
+    except ValidationStalled as exc:
+        # NF-2026-02269: a hang the stall watchdog ended stays a hang across the hop.
+        return {
+            "kind": "stalled",
+            "args": _relayed_args(exc.cmd),
+            "stall_seconds": exc.stall_seconds,
+            "stdout": _captured_text(exc.output),
+            "stderr": _captured_text(exc.stderr),
+        }
     except subprocess.TimeoutExpired as exc:
         return {
             "kind": "timeout",

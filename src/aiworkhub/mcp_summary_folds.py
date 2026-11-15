@@ -686,36 +686,55 @@ def _validation_rows(event: Any) -> list[Any]:
     return validation if isinstance(validation, list) else []
 
 
-def first_failure_from_status(event: Any, card: Any) -> dict[str, Any] | None:
-    """First failed validation command (declaration order) from the UNFOLDED event.
-
-    Falls back to the card's ``terminal_failure`` when the event records no
-    failed row. Pure: reads stored records only and never re-runs anything.
-    """
-
-    for index, row in enumerate(_validation_rows(event)):
+def _first_failed_row(rows: list[Any]) -> dict[str, Any] | None:
+    for index, row in enumerate(rows):
         if not isinstance(row, dict):
             continue
         timed_out = bool(row.get("timed_out"))
+        stalled = bool(row.get("stalled"))
         code = row.get("returncode")
-        if not timed_out and code in (0, None):
+        if not timed_out and not stalled and code in (0, None):
             continue
         tail, tail_source = _pick_tail(row)
         failure: dict[str, Any] = {
             "command": _command_text(row),
             "index": index,
             "exit_code": _exit_code(row),
-            "failure_class": _short_text(row.get("failure_class"), "timed_out" if timed_out else None),
+            "failure_class": _short_text(
+                row.get("failure_class"),
+                "validation_hung" if stalled else None,
+                "timed_out" if timed_out else None,
+            ),
             "tail": tail,
             "tail_source": tail_source,
         }
         if "timed_out" in row:
             failure["timed_out"] = timed_out
+        if stalled:
+            failure["reason"] = _short_text(row.get("failure_reason"))
+        return failure
+    return None
+
+
+def first_failure_from_status(event: Any, card: Any) -> dict[str, Any] | None:
+    """First failed validation command (declaration order) from the UNFOLDED event.
+
+    Falls back to the failed row a finalize/validation failure stored in the
+    card's ``terminal_failure.evidence.validation`` (NF-2026-02269: that is
+    where finalization records it), then to the terminal record itself. Pure:
+    reads stored records only and never re-runs anything.
+    """
+
+    failure = _first_failed_row(_validation_rows(event))
+    if failure is not None:
         return failure
     terminal = card.get("terminal_failure") if isinstance(card, dict) else None
     if not isinstance(terminal, dict) or not terminal:
         return None
     evidence = terminal.get("evidence") if isinstance(terminal.get("evidence"), dict) else {}
+    failure = _first_failed_row(_validation_rows(evidence))
+    if failure is not None:
+        return failure
     tail, tail_source = _pick_tail(evidence, terminal)
     failure = {
         "command": _command_text(evidence, terminal),
