@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Cut one AIWorkHub release as a single deterministic, ordered run.
 
-    python scripts/release_cut.py VERSION [--dry-run] [--push] [--skip-wsl]
+    python scripts/release_cut.py VERSION [--dry-run] [--push] [--skip-wsl] [--full-suite]
         [--wsl-baseline PATH] [--wsl-python PATH] [--allow-dirty PATH ...]
 
 Write the release documents first: CHANGELOG.md, vscode-extension/CHANGELOG.md
@@ -35,10 +35,20 @@ The cut:
 
   bump            release_metadata.bump: the canonical version and projections
   metadata_check  release_metadata.check --tag vVERSION
-  host_tests      the whole suite on this host, xdist workers derived from
+  host_tests      the suite on this host, xdist workers derived from
                   os.cpu_count() with headroom; up to LOAD_RERUN_MAX_NODES
                   failed node ids get one serial rerun, and only a node that
-                  fails again stops the cut
+                  fails again stops the cut. It runs the test-impact selection
+                  (aiworkhub.test_impact_select) from the last v* tag on HEAD's
+                  first parent to the working tree, plus the invariant tests
+                  and every changed test file, when the recorded map is fresh
+                  for every changed path; otherwise, or with --full-suite, a
+                  full_suite_required token in the CHANGELOG [VERSION] notes,
+                  no previous tag, or a selector that raises or answers
+                  full_suite_required, the whole tests directory. wsl_tests
+                  runs the same targets; the JSON summary's test_selection
+                  names the lane, the base tag, the count and the fallback
+                  reason. CI on push still runs the full suite.
   package         npm --prefix vscode-extension run package
   commit          git commit "release: VERSION" of exactly the release files
   wsl_tests       a git archive of HEAD extracted under .scratch/release/VERSION
@@ -87,7 +97,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import ModuleType
-from typing import Callable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 
 def _load_sibling(name: str, directory: Path | None = None) -> ModuleType:
@@ -104,6 +114,25 @@ def _load_sibling(name: str, directory: Path | None = None) -> ModuleType:
 
 
 release_metadata = _load_sibling("release_metadata")
+
+
+def _impact_modules() -> tuple[ModuleType, ModuleType]:
+    """``aiworkhub.accept_neighbour_tests`` and ``aiworkhub.test_impact_select``, in-process.
+
+    Imported only when a cut decides its test lane, from this repository's src/ when
+    the interpreter has no aiworkhub of its own; an import failure is the caller's
+    full-suite fallback.
+    """
+
+    try:
+        import aiworkhub  # noqa: F401
+    except ModuleNotFoundError:
+        sys.path.insert(0, str(REPO_ROOT / "src"))
+    import aiworkhub.accept_neighbour_tests as neighbours
+    import aiworkhub.test_impact_select as impact
+
+    return neighbours, impact
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_ID = "aiworkhub.release_cut.v1"
@@ -150,6 +179,13 @@ MAX_LISTED = 5
 LOAD_RERUN_MAX_NODES = 25
 SHORT_SUMMARY_HEADER = "short test summary info"
 FAILURE_PREFIXES = ("FAILED ", "ERROR ")
+# NF-2026-02220 part C: both suites run the test-impact selection since the last
+# release tag (lane impact_map) or, on any fallback, the whole tests directory.
+FULL_SUITE_TARGET = "tests"
+LANE_IMPACT_MAP = "impact_map"
+LANE_FULL_SUITE = "full_suite"
+# The token in the CHANGELOG [VERSION] notes that makes a release run everything.
+FULL_SUITE_MARKER = "full_suite_required"
 
 PREFLIGHT_STEPS: tuple[str, ...] = (
     "version",
@@ -326,6 +362,8 @@ class Host:
     env: Mapping[str, str]
     is_windows: bool
     out: Callable[[str], None]
+    # aiworkhub.test_impact_select.select_tests(root, base) unless a test injects another.
+    impact_selector: Callable[[Path, str], Any] | None = None
 
     @classmethod
     def current(cls) -> Host:
@@ -349,6 +387,7 @@ class Options:
     wsl_baseline: Path | None = None
     allow_dirty: tuple[str, ...] = ()
     wsl_python: str = WSL_PYTHON
+    full_suite: bool = False
 
 
 @dataclass(frozen=True)
@@ -577,6 +616,15 @@ class ReleaseCut:
         # recovery line truncates back to; None until that step starts.
         self.ledger_bytes_before_receipt: int | None = None
         self.results: list[StepResult] = []
+        # What the host and the WSL suite both run, and the lane that decided it; the
+        # host_tests step decides once (_decide_test_lane), and until then it is everything.
+        self.test_targets: tuple[str, ...] = (FULL_SUITE_TARGET,)
+        self.test_selection: dict[str, object] = {
+            "lane": None,
+            "base_tag": None,
+            "selected_count": None,
+            "fallback_reason": "host_tests_not_run",
+        }
         self._steps: dict[str, Callable[[], str]] = {
             "version": self._step_version,
             "changelog": self._step_changelog,
@@ -692,6 +740,7 @@ class ReleaseCut:
             "push": self.options.push,
             "skip_wsl": self.options.skip_wsl,
             "host_test_workers": self.workers,
+            "test_selection": dict(self.test_selection),
             "failed_step": failed.name if failed is not None else None,
             "reason": failed.detail if failed is not None else None,
             "completed_steps": [result.name for result in self.results if result.status == "ok"],
@@ -797,7 +846,7 @@ class ReleaseCut:
             "-n",
             "0" if nodes else _xdist_flag(self.workers),
             f"--basetemp={self.scratch / ('br' if nodes else 'b')}",
-            *(nodes or ("tests",)),
+            *(nodes or self.test_targets),
         ]
 
     def _wsl_test_command(self, nodes: Sequence[str] = ()) -> list[str]:
@@ -822,7 +871,7 @@ class ReleaseCut:
             "-n",
             "0" if nodes else _xdist_flag(self.workers),
             f"--basetemp={self.wsl_basetemp}",
-            *(nodes or ("tests",)),
+            *(nodes or self.test_targets),
         ]
 
     @staticmethod
@@ -867,7 +916,10 @@ class ReleaseCut:
             f"wslpath -a {scratch} must lie under {WSL_MOUNT_ROOT}; baseline {baseline}",
             "bump": f"release_metadata.bump {self.version}",
             "metadata_check": f"release_metadata.check --tag {self.tag}",
-            "host_tests": shlex.join(self._host_test_argv()),
+            "host_tests": f"{shlex.join(self._host_test_argv())}; {FULL_SUITE_TARGET} narrows to "
+            "the test-impact selection since the last v* tag, the same for wsl_tests, when the "
+            "map is fresh for every changed path and neither --full-suite nor the CHANGELOG "
+            f"notes' {FULL_SUITE_MARKER} asks for everything",
             "package": shlex.join(self._package_argv()),
             "commit": shlex.join(["git", *self._commit_args()]),
             "wsl_tests": f"git archive HEAD to {scratch}/head.tar, extracted into {scratch}/tree "
@@ -992,8 +1044,145 @@ class ReleaseCut:
             )
         return f"projections, tag and release documents all name {self.version}"
 
+    def _decide_test_lane(self) -> None:
+        """Set the one target list the host and the WSL suite both run, and record why.
+
+        The test-impact selection since the last release tag (``impact_map``) when the
+        map is fresh for every path changed since that tag; otherwise the whole
+        ``tests`` directory (``full_suite``) with the named reason. An unknown never
+        selects less: every miss, raise or full-suite answer falls back.
+        """
+
+        targets: tuple[str, ...] = ()
+        base: str | None = None
+        if self.options.full_suite:
+            reason = "full_suite_flag"
+        else:
+            reason = self._metadata_full_suite_reason()
+        if not reason:
+            base = self._last_release_tag()
+            if base is None:
+                reason = "no_previous_tag"
+            else:
+                try:
+                    targets, reason = self._impact_targets(base)
+                except Exception as exc:  # a failed selector never narrows the run
+                    targets, reason = (), f"selector_failed:{type(exc).__name__}"
+                if not targets and not reason:
+                    reason = "impact_map_selected_nothing"
+        if targets:
+            self.test_targets = targets
+            self.test_selection = {
+                "lane": LANE_IMPACT_MAP,
+                "base_tag": base,
+                "selected_count": len(targets),
+                "fallback_reason": None,
+            }
+            return
+        self.test_targets = (FULL_SUITE_TARGET,)
+        self.test_selection = {
+            "lane": LANE_FULL_SUITE,
+            "base_tag": base,
+            "selected_count": None,
+            "fallback_reason": _one_line(reason),
+        }
+
+    def _metadata_full_suite_reason(self) -> str:
+        """Why the release metadata requires the whole suite, else ``""``.
+
+        The CHANGELOG [VERSION] notes naming ``full_suite_required`` mark the release;
+        notes that cannot be read require it too.
+        """
+
+        try:
+            notes = release_metadata.changelog_section(self.root, self.tag)
+        except Exception as exc:  # unreadable metadata is never a narrowed run
+            return f"release_metadata_unreadable:{type(exc).__name__}"
+        return "release_metadata_full_suite_required" if FULL_SUITE_MARKER in notes else ""
+
+    def _last_release_tag(self) -> str | None:
+        """The nearest ``v*`` tag on HEAD's first-parent history, else None."""
+
+        done = self._git(
+            "describe", "--tags", "--abbrev=0", "--match", "v*", "--first-parent", "HEAD"
+        )
+        text = done.stdout.strip()
+        if (
+            done.returncode != 0
+            or not text.startswith("v")
+            or any(char.isspace() for char in text)
+            or text == self.tag
+        ):
+            return None
+        return text
+
+    def _impact_targets(self, base: str) -> tuple[tuple[str, ...], str]:
+        """The selector's tests for ``base`` to the working tree plus the invariants.
+
+        Returns ``(tests, "")``, or ``((), reason)`` when the map is missing, does not
+        record a changed path, records a changed path stale (a file the version bump
+        rewrites is accepted when HEAD's bytes match the map; no other path is), or
+        records any other non-test path stale. The selection always adds every
+        ``accept_neighbour_tests.INVARIANT_TESTS`` file (the module size ratchet among
+        them) and every changed test file; argv folding and the per-entry checks are
+        that module's ``_impact_tests``.
+        """
+
+        neighbours, impact = _impact_modules()
+        selector = self.host.impact_selector or impact.select_tests
+        result = selector(self.root, base)
+        if result.full_suite_required:
+            return (), "selector_full_suite:" + ";".join(result.full_suite_reasons)
+        payload, problem = impact.load_map(impact.map_directory(self.root) / impact.MAP_FILE_NAME)
+        digests = payload.get("digests") if payload is not None else None
+        if not isinstance(digests, Mapping):
+            return (), f"impact_map_unavailable:{problem or 'map_schema_mismatch'}"
+        changed = sorted(set(result.changed_paths))
+        # A changed test file runs whole whatever the map records of it, so only the
+        # other changed paths need the map's edges.
+        states = {
+            path: neighbours._map_state(self.root, digests, path)
+            for path in changed
+            if not impact.is_test_module(path)
+        }
+        unmapped = [path for path, state in states.items() if state == "unmapped"]
+        if unmapped:
+            return (), f"impact_map_unmapped:{unmapped[0]}"
+        stale = [path for path, state in states.items() if state]
+        # Only the files the version bump rewrites may be accepted on a HEAD digest
+        # match; any other stale changed path means the map predates its bytes.
+        generated = set(self._generated_files())
+        relaxable = [path for path in stale if path in generated]
+        if relaxable:
+            try:
+                at_head = impact.read_blobs(self.root, "HEAD", relaxable)
+            except Exception:  # HEAD unreadable: the working tree's answer stands
+                at_head = {}
+            stale = [
+                path
+                for path in stale
+                if path not in generated
+                or at_head.get(path) is None
+                or impact.content_digest(at_head[path]) != digests[path]
+            ]
+        if stale:
+            return (), f"impact_map_stale:{stale[0]}"
+        for path in sorted(set(digests) - set(changed)):
+            if not impact.is_test_module(path) and neighbours._map_state(
+                self.root, digests, path
+            ):
+                return (), f"impact_map_stale_dependency:{path}"
+        entries: dict[str, tuple[str, ...]] = dict(result.selected)
+        for test in neighbours.INVARIANT_TESTS:
+            entries.setdefault(test, ("invariant",))
+        for path in changed:
+            if impact.is_test_module(path) and (self.root / path).is_file():
+                entries.setdefault(path, ("changed_test",))
+        return neighbours._impact_tests(self.root, entries, ())
+
     def _step_host_tests(self) -> str:
         self.scratch.mkdir(parents=True, exist_ok=True)
+        self._decide_test_lane()
         done = self._run(self._host_test_argv())
         log = self._write_log("host_tests", done)
         cores = max(1, int(self.host.cpu_count or 1))
@@ -1204,6 +1393,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--skip-wsl", action="store_true", help="do not run the WSL suite")
     parser.add_argument(
+        "--full-suite",
+        action="store_true",
+        help="run the whole suite on the host and in WSL, never the test-impact selection",
+    )
+    parser.add_argument(
         "--wsl-baseline",
         type=Path,
         metavar="PATH",
@@ -1241,6 +1435,7 @@ def main(argv: Sequence[str] | None = None, *, host: Host | None = None) -> int:
         wsl_baseline=args.wsl_baseline,
         wsl_python=args.wsl_python,
         allow_dirty=tuple(args.allow_dirty),
+        full_suite=args.full_suite,
     )
     if host is None:
         _bind_children_to_this_process()

@@ -75,6 +75,7 @@ FULL_CUT = [
     "git rev-parse",
     "wsl python3",
     "wsl wslpath",  # the preflight's own translation of the scratch directory
+    "git describe",  # the last release tag the test-impact selection starts from
     "pytest",
     "npm package",
     "git commit",
@@ -253,6 +254,7 @@ def _cut(
     runner: FakeRunner | None = None,
     cpu_count: int | None = 16,
     windows: bool = True,
+    selector: Any = None,
 ) -> tuple[int, dict[str, Any], list[str], FakeRunner]:
     runner = runner if runner is not None else FakeRunner(root)
     lines: list[str] = []
@@ -264,6 +266,7 @@ def _cut(
         env={"PATH": "fake-bin"},
         is_windows=windows,
         out=lines.append,
+        impact_selector=selector,
     )
     code = release_cut.main([version, *args], host=host)
     return code, json.loads(lines[-1]), lines, runner
@@ -1511,3 +1514,344 @@ def test_the_packaged_roots_are_the_trees_package_vsix_copies_from() -> None:
     # The extension's files are copied from vscode-extension, the runtime from src/aiworkhub.
     assert 'const PY_RUNTIME_SRC = path.join(root, "..", "src", "aiworkhub");' in source
     assert release_cut.PACKAGED_ROOTS == (release_cut.EXTENSION_DIR, "src/aiworkhub")
+
+
+# -- the test-impact lane (NF-2026-02220 part C) ----------------------------------------
+
+IMPACT_BASE = "v0.12.99"
+IMPACT_MODULE = "src/aiworkhub/alpha.py"
+IMPACT_TEST = "tests/test_alpha.py"
+IMPACT_NODE = f"{IMPACT_TEST}::test_alpha"
+RATCHET = "tests/test_module_size_ratchet.py"
+DESCRIBE = ("git", "describe", "--tags", "--abbrev=0", "--match", "v*", "--first-parent", "HEAD")
+
+
+class FakeSelector:
+    """Stands in for test_impact_select.select_tests(root, base); records each call."""
+
+    def __init__(self, result: Any = None, error: Exception | None = None) -> None:
+        self.result, self.error = result, error
+        self.calls: list[tuple[Path, str]] = []
+
+    def __call__(self, root: Path, base: str) -> Any:
+        self.calls.append((root, base))
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+def _selection(
+    *,
+    full: tuple[str, ...] = (),
+    selected: dict[str, tuple[str, ...]] | None = None,
+    changed: tuple[str, ...] = (IMPACT_MODULE,),
+) -> Any:
+    _, impact = release_cut._impact_modules()
+    chosen = {IMPACT_NODE: (f"executes:{IMPACT_MODULE}::alpha",)} if selected is None else selected
+    return impact.Selection(bool(full), full, {} if full else chosen, changed)
+
+
+def _impact_repo(root: Path) -> Path:
+    """A cut repository with a map recorded for IMPACT_MODULE as it is on disk now."""
+
+    _repo(root)
+    neighbours, impact = release_cut._impact_modules()
+    _write(root / IMPACT_MODULE, "def alpha():\n    return 1\n")
+    for test in (*neighbours.INVARIANT_TESTS, IMPACT_TEST):
+        _write(root / test, "def test_alpha():\n    pass\n")
+    digests = {IMPACT_MODULE: impact.content_digest((root / IMPACT_MODULE).read_bytes())}
+    payload = {"schema_id": impact.SCHEMA_ID, "digests": digests}
+    _write(impact.map_directory(root) / impact.MAP_FILE_NAME, json.dumps(payload))
+    return root
+
+
+def _tagged(root: Path) -> FakeRunner:
+    return FakeRunner(root, {"git describe": Completed(0, f"{IMPACT_BASE}\n")})
+
+
+def _suite_targets(runner: FakeRunner) -> tuple[list[str], list[str]]:
+    """What the host suite and the WSL suite ran: the tokens after their basetemp."""
+
+    (host,) = runner.argv_of("pytest")
+    (suite,) = runner.argv_of("wsl pytest")
+    wsl = _guarded(suite)[1]
+
+    def after_basetemp(argv: Sequence[str]) -> list[str]:
+        argv = list(argv)
+        index = next(i for i, token in enumerate(argv) if token.startswith("--basetemp="))
+        return argv[index + 1 :]
+
+    return after_basetemp(host), after_basetemp(wsl)
+
+
+def test_the_invariant_tests_hold_the_module_size_ratchet() -> None:
+    neighbours, _ = release_cut._impact_modules()
+    assert RATCHET in neighbours.INVARIANT_TESTS
+
+
+def test_a_fresh_map_runs_one_selection_on_host_and_wsl_with_the_ratchet(tmp_path: Path) -> None:
+    root = _impact_repo(tmp_path)
+    selector = FakeSelector(_selection())
+    runner = _tagged(root)
+
+    code, summary, _, _ = _cut(root, runner=runner, selector=selector)
+
+    assert code == 0, summary["reason"]
+    assert runner.labels == [label for label in FULL_CUT if label != "git push"]
+    assert runner.argv_of("git describe") == [DESCRIBE]
+    assert selector.calls == [(root, IMPACT_BASE)]
+    host, wsl = _suite_targets(runner)
+    assert host == wsl
+    neighbours, _ = release_cut._impact_modules()
+    assert set(host) == {IMPACT_NODE, *neighbours.INVARIANT_TESTS}
+    assert RATCHET in host and "tests" not in host
+    # The multicore rule is unchanged: the xdist flag is still derived from the cores.
+    (argv,) = runner.argv_of("pytest")
+    assert argv[argv.index("-n") + 1] == "12"
+    assert summary["test_selection"] == {
+        "lane": "impact_map",
+        "base_tag": IMPACT_BASE,
+        "selected_count": len(host),
+        "fallback_reason": None,
+    }
+
+
+def test_a_changed_test_file_is_selected_whole_in_the_impact_lane(tmp_path: Path) -> None:
+    root = _impact_repo(tmp_path)
+    changed_test = "tests/test_beta.py"
+    _write(root / changed_test, "def test_beta():\n    pass\n")
+    selector = FakeSelector(_selection(changed=(IMPACT_MODULE, changed_test)))
+
+    code, summary, _, runner = _cut(root, runner=_tagged(root), selector=selector)
+
+    assert code == 0, summary["reason"]
+    host, wsl = _suite_targets(runner)
+    assert host == wsl and changed_test in host and RATCHET in host
+    assert summary["test_selection"]["lane"] == "impact_map"
+
+
+def test_the_serial_rerun_in_the_impact_lane_still_names_only_the_failed_nodes(
+    tmp_path: Path,
+) -> None:
+    root = _impact_repo(tmp_path)
+    runner = _tagged(root)
+    runner.responses["pytest"] = _full_then_alone(HOST_FAILURE, PASSED_ALONE)
+
+    code, summary, _, _ = _cut(root, runner=runner, selector=FakeSelector(_selection()))
+
+    assert code == 0, summary["reason"]
+    full, rerun = runner.argv_of("pytest")
+    assert RATCHET in full
+    scratch = root / ".scratch" / "release" / VERSION
+    assert rerun == (
+        "python", "-m", "pytest", "-q", "-rfE", "-n", "0", f"--basetemp={scratch / 'br'}", HOST_NODE
+    )
+
+
+def _stale(root: Path) -> tuple[FakeRunner, FakeSelector, tuple[str, ...]]:
+    _write(root / IMPACT_MODULE, "def alpha():\n    return 2\n")
+    return _tagged(root), FakeSelector(_selection()), ()
+
+
+def _unmapped(root: Path) -> tuple[FakeRunner, FakeSelector, tuple[str, ...]]:
+    _write(root / "src" / "aiworkhub" / "beta.py", "BETA = 1\n")
+    changed = (IMPACT_MODULE, "src/aiworkhub/beta.py")
+    return _tagged(root), FakeSelector(_selection(changed=changed)), ()
+
+
+def _map_missing(root: Path) -> tuple[FakeRunner, FakeSelector, tuple[str, ...]]:
+    _, impact = release_cut._impact_modules()
+    (impact.map_directory(root) / impact.MAP_FILE_NAME).unlink()
+    return _tagged(root), FakeSelector(_selection()), ()
+
+
+def _full_suite_flag(root: Path) -> tuple[FakeRunner, FakeSelector, tuple[str, ...]]:
+    return _tagged(root), FakeSelector(_selection()), ("--full-suite",)
+
+
+def _no_tag(root: Path) -> tuple[FakeRunner, FakeSelector, tuple[str, ...]]:
+    return FakeRunner(root), FakeSelector(_selection()), ()
+
+
+def _selector_raises(root: Path) -> tuple[FakeRunner, FakeSelector, tuple[str, ...]]:
+    return _tagged(root), FakeSelector(error=RuntimeError("git diff failed")), ()
+
+
+def _selector_full_suite(root: Path) -> tuple[FakeRunner, FakeSelector, tuple[str, ...]]:
+    return _tagged(root), FakeSelector(_selection(full=("global_invalidator:conftest.py",))), ()
+
+
+def _metadata_full_suite(root: Path) -> tuple[FakeRunner, FakeSelector, tuple[str, ...]]:
+    changelog = root / "CHANGELOG.md"
+    text = changelog.read_text(encoding="utf-8")
+    marked = text.replace("- One release cut script.", "- One release cut script; full_suite_required.")
+    _write(changelog, marked)
+    return _tagged(root), FakeSelector(_selection()), ()
+
+
+@pytest.mark.parametrize(
+    ("arrange", "reason", "base", "selected"),
+    [
+        (_stale, f"impact_map_stale:{IMPACT_MODULE}", IMPACT_BASE, True),
+        (_unmapped, "impact_map_unmapped:src/aiworkhub/beta.py", IMPACT_BASE, True),
+        (_map_missing, "impact_map_unavailable:map_missing", IMPACT_BASE, True),
+        (_full_suite_flag, "full_suite_flag", None, False),
+        (_no_tag, "no_previous_tag", None, False),
+        (_selector_raises, "selector_failed:RuntimeError", IMPACT_BASE, True),
+        (
+            _selector_full_suite,
+            "selector_full_suite:global_invalidator:conftest.py",
+            IMPACT_BASE,
+            True,
+        ),
+        (_metadata_full_suite, "release_metadata_full_suite_required", None, False),
+    ],
+    ids=[
+        "stale_map",
+        "unmapped_path",
+        "map_missing",
+        "full_suite_flag",
+        "no_tag",
+        "selector_raises",
+        "selector_full_suite",
+        "metadata_full_suite_required",
+    ],
+)
+def test_every_unknown_falls_back_to_the_whole_suite_on_host_and_wsl(
+    tmp_path: Path, arrange: Any, reason: str, base: str | None, selected: bool
+) -> None:
+    root = _impact_repo(tmp_path)
+    runner, selector, flags = arrange(root)
+
+    code, summary, _, _ = _cut(root, *flags, runner=runner, selector=selector)
+
+    assert code == 0, summary["reason"]
+    host, wsl = _suite_targets(runner)
+    assert host == wsl == ["tests"]
+    assert bool(selector.calls) == selected
+    assert summary["test_selection"] == {
+        "lane": "full_suite",
+        "base_tag": base,
+        "selected_count": None,
+        "fallback_reason": reason,
+    }
+
+
+def test_a_dry_run_decides_no_lane_and_its_plan_names_the_narrowing(tmp_path: Path) -> None:
+    root = _impact_repo(tmp_path)
+    selector = FakeSelector(_selection())
+
+    code, summary, lines, runner = _cut(root, "--dry-run", runner=_tagged(root), selector=selector)
+
+    assert code == 0, summary["reason"]
+    assert runner.labels == READ_ONLY and selector.calls == []
+    assert summary["test_selection"]["lane"] is None
+    (plan,) = [line for line in lines if line.startswith("plan    host_tests")]
+    assert "test-impact selection since the last v* tag" in plan
+
+
+def _head_blobs(
+    monkeypatch: pytest.MonkeyPatch, blobs: dict[str, bytes]
+) -> list[tuple[str, tuple[str, ...]]]:
+    """Answer ``read_blobs(root, rev, paths)`` from ``blobs``; returns the recorded calls."""
+
+    _, impact = release_cut._impact_modules()
+    calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def read_blobs(_root: Path, rev: str, paths: Sequence[str]) -> dict[str, bytes | None]:
+        calls.append((rev, tuple(paths)))
+        return {path: blobs.get(path) for path in paths}
+
+    monkeypatch.setattr(impact, "read_blobs", read_blobs)
+    return calls
+
+
+def _full_suite_with(summary: dict[str, Any], runner: FakeRunner, reason: str) -> None:
+    host, wsl = _suite_targets(runner)
+    assert host == wsl == ["tests"]
+    assert summary["test_selection"] == {
+        "lane": "full_suite",
+        "base_tag": IMPACT_BASE,
+        "selected_count": None,
+        "fallback_reason": reason,
+    }
+
+
+def test_a_stale_non_generated_path_matching_head_still_runs_the_whole_suite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _impact_repo(tmp_path)
+    recorded = (root / IMPACT_MODULE).read_bytes()
+    _write(root / IMPACT_MODULE, "def alpha():\n    return 2\n")
+    # HEAD holds exactly the bytes the map recorded: only generated files may use that.
+    calls = _head_blobs(monkeypatch, {IMPACT_MODULE: recorded})
+
+    code, summary, _, runner = _cut(root, runner=_tagged(root), selector=FakeSelector(_selection()))
+
+    assert code == 0, summary["reason"]
+    _full_suite_with(summary, runner, f"impact_map_stale:{IMPACT_MODULE}")
+    assert all(IMPACT_MODULE not in paths for _, paths in calls)
+
+
+def test_a_generated_file_the_bump_rewrote_keeps_the_impact_lane_on_a_head_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _impact_repo(tmp_path)
+    _, impact = release_cut._impact_modules()
+    generated = release_metadata.CANONICAL_VERSION_FILE
+    before_bump = (root / generated).read_bytes()
+    map_file = impact.map_directory(root) / impact.MAP_FILE_NAME
+    payload = json.loads(map_file.read_text(encoding="utf-8"))
+    payload["digests"][generated] = impact.content_digest(before_bump)
+    _write(map_file, json.dumps(payload))
+    calls = _head_blobs(monkeypatch, {generated: before_bump})
+    selector = FakeSelector(_selection(changed=(IMPACT_MODULE, generated)))
+
+    code, summary, _, runner = _cut(root, runner=_tagged(root), selector=selector)
+
+    assert code == 0, summary["reason"]
+    # The bump rewrote the file in the working tree, so only HEAD's bytes could match.
+    assert (root / generated).read_bytes() != before_bump
+    assert calls == [("HEAD", (generated,))]
+    host, wsl = _suite_targets(runner)
+    assert host == wsl and RATCHET in host and "tests" not in host
+    assert summary["test_selection"]["lane"] == "impact_map"
+    assert summary["test_selection"]["fallback_reason"] is None
+
+
+def test_a_generated_file_whose_head_bytes_differ_from_the_map_runs_the_whole_suite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _impact_repo(tmp_path)
+    _, impact = release_cut._impact_modules()
+    generated = release_metadata.CANONICAL_VERSION_FILE
+    map_file = impact.map_directory(root) / impact.MAP_FILE_NAME
+    payload = json.loads(map_file.read_text(encoding="utf-8"))
+    payload["digests"][generated] = impact.content_digest(b"recorded elsewhere\n")
+    _write(map_file, json.dumps(payload))
+    _head_blobs(monkeypatch, {generated: (root / generated).read_bytes()})
+    selector = FakeSelector(_selection(changed=(IMPACT_MODULE, generated)))
+
+    code, summary, _, runner = _cut(root, runner=_tagged(root), selector=selector)
+
+    assert code == 0, summary["reason"]
+    _full_suite_with(summary, runner, f"impact_map_stale:{generated}")
+
+
+def test_an_unchanged_mapped_file_with_other_bytes_runs_the_whole_suite(
+    tmp_path: Path,
+) -> None:
+    root = _impact_repo(tmp_path)
+    _, impact = release_cut._impact_modules()
+    dependency = "src/aiworkhub/gamma.py"
+    _write(root / dependency, "GAMMA = 1\n")
+    map_file = impact.map_directory(root) / impact.MAP_FILE_NAME
+    payload = json.loads(map_file.read_text(encoding="utf-8"))
+    payload["digests"][dependency] = impact.content_digest((root / dependency).read_bytes())
+    _write(map_file, json.dumps(payload))
+    _write(root / dependency, "GAMMA = 2\n")
+
+    code, summary, _, runner = _cut(root, runner=_tagged(root), selector=FakeSelector(_selection()))
+
+    assert code == 0, summary["reason"]
+    _full_suite_with(summary, runner, f"impact_map_stale_dependency:{dependency}")
