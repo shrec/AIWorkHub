@@ -88,12 +88,22 @@ _MAX_CONCURRENT_CHANGES = 32
 # NF-2026-02095: wall-clock bound on one dispose-time reproduction, well under
 # an MCP client's 1800 s idle timeout. Past it the dispose stores a signed
 # UNRUNNABLE receipt with candidate detail ``timeout`` instead of hanging.
+# NF-2026-02243: 120 s, not 600 s. One dismissal waited the full 600 s on a
+# reproduction that never finished, blocking the manager for ten minutes and
+# producing no evidence; a probe that cannot answer in two minutes will not
+# answer in ten, and the deadline receipt now names the phase it stalled in.
 # Both are read at call time, so a test may monkeypatch them.
-DISPOSE_REPRODUCTION_DEADLINE_SECONDS = 600.0
+DISPOSE_REPRODUCTION_DEADLINE_SECONDS = 120.0
 # How often a caller-supplied ``progress`` callback hears from a running
 # reproduction while the dispose waits on it.
 DISPOSE_PROGRESS_INTERVAL_SECONDS = 15.0
 TIMEOUT_DETAIL = "timeout"
+# NF-2026-02243: a deadline receipt's candidate ``timeout_phase``. The probe
+# process never started (target resolution or workspace creation still
+# running, or no run admitted) versus the probe was handed to the sandbox
+# runner and had not returned.
+TIMEOUT_PHASE_SANDBOX_STARTUP = "sandbox_startup"
+TIMEOUT_PHASE_PROBE = "probe"
 # At most this many dispose reproductions are in flight per process, awaited or
 # abandoned alike (a run its last waiter abandoned at the deadline keeps
 # running); past it a dispose gets a deadline receipt without starting a run.
@@ -536,16 +546,18 @@ class _Run:
 
     ``waiters`` counts callers still waiting on it; ``gave_up`` records that at
     least one waiter returned a deadline receipt, so the late result is kept
-    for that caller's replay.
+    for that caller's replay. ``probe_started`` records that the run handed a
+    probe to the sandbox runner (NF-2026-02243).
     """
 
-    __slots__ = ("finished", "done", "waiters", "gave_up", "value", "error")
+    __slots__ = ("finished", "done", "waiters", "gave_up", "probe_started", "value", "error")
 
     def __init__(self) -> None:
         self.finished = threading.Event()
         self.done = False
         self.waiters = 0
         self.gave_up = False
+        self.probe_started = False
         self.value: Any = None
         self.error: BaseException | None = None
 
@@ -593,6 +605,26 @@ class DisposeRunRegistry:
         """In-flight runs whose last waiter gave up at the deadline."""
         with self._lock:
             return sum(1 for run in self._running.values() if run.abandoned)
+
+    def mark_probe_started(self, key: RunKey) -> None:
+        """Record that ``key``'s in-flight run handed its probe to the runner."""
+        with self._lock:
+            run = self._running.get(key)
+            if run is not None:
+                run.probe_started = True
+
+    def timeout_phase(self, key: RunKey) -> str:
+        """Why a waiter on ``key`` timed out (NF-2026-02243).
+
+        :data:`TIMEOUT_PHASE_PROBE` once the in-flight run handed its probe to
+        the runner, else :data:`TIMEOUT_PHASE_SANDBOX_STARTUP` -- also when no
+        run is in flight for ``key`` (none was admitted at the run limit).
+        """
+        with self._lock:
+            run = self._running.get(key)
+            if run is not None and run.probe_started:
+                return TIMEOUT_PHASE_PROBE
+            return TIMEOUT_PHASE_SANDBOX_STARTUP
 
     def run(
         self,
@@ -699,8 +731,43 @@ def deadline_receipt(
     never awaited, and ``deadline_seconds`` marks the receipt as a deadline
     receipt. The target may never have resolved, so ``base_oid`` is empty.
     UNRUNNABLE is no counter-evidence, so a dismissal still needs the
-    manager's own.
+    manager's own. The candidate ``timeout_phase`` here is
+    :data:`TIMEOUT_PHASE_PROBE`; the dispose callback names the phase its run
+    actually stalled in (NF-2026-02243).
     """
+    return _phased_deadline_receipt(
+        spec,
+        timeout_phase=TIMEOUT_PHASE_PROBE,
+        finding_id=finding_id,
+        candidate_sha256=candidate_sha256,
+        reviewer_receipt_sha256=reviewer_receipt_sha256,
+        coordinator_key=coordinator_key,
+        deadline_seconds=deadline_seconds,
+        now=now,
+    )
+
+
+def _phased_deadline_receipt(
+    spec: ReproductionSpec,
+    *,
+    timeout_phase: str,
+    finding_id: str,
+    candidate_sha256: str,
+    reviewer_receipt_sha256: str,
+    coordinator_key: bytes,
+    deadline_seconds: float,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """:func:`deadline_receipt` with the candidate ``timeout_phase`` named."""
+    if timeout_phase not in (TIMEOUT_PHASE_SANDBOX_STARTUP, TIMEOUT_PHASE_PROBE):
+        raise ValueError(f"finding_reproduction_timeout_phase_invalid:{timeout_phase!r}"[:200])
+    candidate = _side(
+        UNRUNNABLE,
+        TIMEOUT_DETAIL,
+        timed_out=True,
+        duration_seconds=round(float(deadline_seconds), 3),
+    )
+    candidate["timeout_phase"] = timeout_phase
     receipt = {
         "schema_id": SCHEMA_ID,
         "finding_id": str(finding_id),
@@ -710,12 +777,7 @@ def deadline_receipt(
         "candidate_sha256": str(candidate_sha256),
         "reviewer_receipt_sha256": str(reviewer_receipt_sha256),
         "base_oid": "",
-        "candidate": _side(
-            UNRUNNABLE,
-            TIMEOUT_DETAIL,
-            timed_out=True,
-            duration_seconds=round(float(deadline_seconds), 3),
-        ),
+        "candidate": candidate,
         "base": _side(
             UNRUNNABLE, f"base_not_run:candidate_{UNRUNNABLE}", duration_seconds=0
         ),
@@ -788,11 +850,37 @@ def dispose_reproducer(
         )
         if reusable and not is_deadline_receipt(stored):
             return dict(stored or {})
-        finished, receipt = _DISPOSE_RUNS.run(
-            (str(finding_id), spec.sha256, str(candidate_sha256), str(reviewer_receipt_sha256)),
-            lambda: reproduce_finding(
-                spec, target=resolve_target(spec), coordinator_key=key, **binding
-            ),
+        runs = _DISPOSE_RUNS
+        run_key = (
+            str(finding_id), spec.sha256, str(candidate_sha256), str(reviewer_receipt_sha256)
+        )
+
+        # Set by this waiter's own run, so a run that finishes between the
+        # deadline and the phase lookup (its registry entry gone) still reads
+        # as a probe timeout.
+        probe_started = threading.Event()
+
+        def _work() -> dict[str, Any]:
+            target = resolve_target(spec)
+            sandbox_run = target.run
+
+            def _run(workspace: Any, commands: list[str]) -> list[dict[str, Any]]:
+                # NF-2026-02243: past this point a deadline is the probe's, not
+                # the sandbox startup's (target resolution, workspace creation).
+                probe_started.set()
+                runs.mark_probe_started(run_key)
+                return sandbox_run(workspace, commands)
+
+            return reproduce_finding(
+                spec,
+                target=dataclasses.replace(target, run=_run),
+                coordinator_key=key,
+                **binding,
+            )
+
+        finished, receipt = runs.run(
+            run_key,
+            _work,
             deadline_seconds=limit,
             progress=progress,
             accept=lambda late: verify_receipt(late, key)
@@ -802,8 +890,14 @@ def dispose_reproducer(
             return receipt
         if reusable:
             return dict(stored or {})
-        return deadline_receipt(
-            spec, coordinator_key=key, deadline_seconds=limit, **binding
+        return _phased_deadline_receipt(
+            spec,
+            timeout_phase=(
+                TIMEOUT_PHASE_PROBE if probe_started.is_set() else runs.timeout_phase(run_key)
+            ),
+            coordinator_key=key,
+            deadline_seconds=limit,
+            **binding,
         )
 
     return _reproduce
