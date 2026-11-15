@@ -917,7 +917,8 @@ def test_production_provider_uses_only_existing_read_paths(monkeypatch, tmp_path
         calls.append(("task_store.get_task", repo_root, task_id))
         return {"task_id": task_id}
 
-    def fake_cost_ledger(*, repo_root, include_tasks):
+    def fake_cost_ledger(*, repo_root, include_tasks, shared_read_only=False):
+        assert shared_read_only is True  # NF-2026-02274: dashboard opts in to the shared view
         calls.append(("cost_ledger.build_cost_ledger", repo_root, include_tasks))
         return {
             "schema_id": "aiworkhub.cost_ledger.v1",

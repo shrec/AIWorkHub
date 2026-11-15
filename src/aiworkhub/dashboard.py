@@ -2138,10 +2138,18 @@ class DashboardProvider:
     def _cost_ledger(self, *, include_tasks: bool) -> dict[str, Any]:
         return self._snapshot_once(
             f"cost_ledger:{include_tasks}",
-            lambda: cost_ledger.build_cost_ledger(
-                repo_root=self.repo_root,
-                include_tasks=include_tasks,
-            ),
+            lambda: self._shared_cost_ledger(include_tasks=include_tasks),
+        )
+
+    def _shared_cost_ledger(self, *, include_tasks: bool) -> dict[str, Any]:
+        # The dashboard only reads the ledger, so it explicitly opts in to the
+        # memoized one with read-only nested sections instead of a per-call
+        # deepcopy (NF-2026-02274).  Top-level keys stay a private plain dict;
+        # every other caller keeps the default independent mutable copy.
+        return cost_ledger.build_cost_ledger(
+            repo_root=self.repo_root,
+            include_tasks=include_tasks,
+            shared_read_only=True,
         )
 
     def get_storage_readiness(self) -> task_store.StorageReadiness:
@@ -2383,10 +2391,15 @@ class DashboardProvider:
 
     def get_environment_preflight(self) -> dict[str, Any]:
         """Unified repository, policy, Source Graph and provider readiness."""
-        return self._snapshot_once(
-            "environment_preflight",
-            lambda: repo_policy.build_preflight(self.repo_root),
-        )
+        return self._snapshot_once("environment_preflight", self._nonblocking_preflight)
+
+    def _nonblocking_preflight(self) -> dict[str, Any]:
+        # Provider probes (``opencode models``) and the finalization probe are
+        # served from their background-refreshed caches; a never-probed one
+        # reads ``probing`` and never blocks the snapshot (NF-2026-02274).
+        scope = getattr(repo_policy, "nonblocking_provider_probes", None)
+        with scope() if callable(scope) else nullcontext():
+            return repo_policy.build_preflight(self.repo_root)
 
     def get_workforce_catalog(self) -> dict[str, Any]:
         """Configured workforce joined to bounded canonical process evidence."""

@@ -15,6 +15,8 @@ import stat
 import subprocess
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping
@@ -740,6 +742,11 @@ _OPENCODE_PROBE_LOCAL = threading.local()
 PROVIDER_PROBE_CACHE_TTL_SECONDS = 60.0
 PROVIDER_PROBE_MAX_STALE_SECONDS = 600.0
 _PROVIDER_PROBE_CACHE_MAX_ENTRIES = 64
+# A background probe whose result ``cacheable`` rejected (or that raised) is
+# remembered for this long as a negative entry: a non-blocking caller is served
+# that real failure instead of ``probing``, and no new probe for the key is
+# launched until it expires (NF-2026-02274 review).
+PROVIDER_PROBE_NEGATIVE_TTL_SECONDS = 60.0
 
 
 class _TtlSingleFlightCache:
@@ -749,19 +756,24 @@ class _TtlSingleFlightCache:
         self.name = name
         self._lock = threading.Lock()
         self._entries: dict[Any, tuple[float, float, Any]] = {}
+        # key -> (monotonic time, rejected value, raised exception or None)
+        self._rejected: dict[Any, tuple[float, Any, BaseException | None]] = {}
         self._refreshing: set[Any] = set()
         self._generation = 0
         self.hits = 0
         self.misses = 0
         self.stale_served = 0
         self.refreshes_started = 0
+        self.negative_served = 0
 
     def reset(self) -> None:
         with self._lock:
             self._entries.clear()
+            self._rejected.clear()
             self._refreshing.clear()
             self._generation += 1
             self.hits = self.misses = self.stale_served = self.refreshes_started = 0
+            self.negative_served = 0
 
     def observed_at(self, key: Any) -> float | None:
         """Wall-clock time the cached value for ``key`` was observed."""
@@ -775,22 +787,56 @@ class _TtlSingleFlightCache:
             return {
                 "name": self.name,
                 "entries": len(self._entries),
+                "negative_entries": len(self._rejected),
                 "refreshing": len(self._refreshing),
                 "hits": self.hits,
                 "misses": self.misses,
                 "stale_served": self.stale_served,
+                "negative_served": self.negative_served,
                 "refreshes_started": self.refreshes_started,
                 "ttl_seconds": PROVIDER_PROBE_CACHE_TTL_SECONDS,
+                "negative_ttl_seconds": PROVIDER_PROBE_NEGATIVE_TTL_SECONDS,
             }
 
     def _store(self, key: Any, value: Any, generation: int) -> None:
         with self._lock:
             if generation != self._generation:
                 return
+            self._rejected.pop(key, None)
             self._entries.pop(key, None)
             self._entries[key] = (time.monotonic(), time.time(), value)
             while len(self._entries) > _PROVIDER_PROBE_CACHE_MAX_ENTRIES:
                 self._entries.pop(next(iter(self._entries)))
+
+    def _store_rejected(
+        self,
+        key: Any,
+        value: Any,
+        error: BaseException | None,
+        generation: int,
+    ) -> None:
+        # Keep only a sanitized, traceback-free form: the probe frames' locals
+        # must not stay alive for the negative TTL.
+        if error is not None:
+            error = _sanitized_probe_exception(error)
+        with self._lock:
+            if generation != self._generation:
+                return
+            self._rejected.pop(key, None)
+            self._rejected[key] = (time.monotonic(), value, error)
+            while len(self._rejected) > _PROVIDER_PROBE_CACHE_MAX_ENTRIES:
+                self._rejected.pop(next(iter(self._rejected)))
+
+    def _fresh_rejected_locked(
+        self, key: Any, now: float
+    ) -> tuple[float, Any, BaseException | None] | None:
+        rejected = self._rejected.get(key)
+        if rejected is None:
+            return None
+        if now - rejected[0] >= PROVIDER_PROBE_NEGATIVE_TTL_SECONDS:
+            self._rejected.pop(key, None)
+            return None
+        return rejected
 
     def _refresh(
         self,
@@ -801,24 +847,46 @@ class _TtlSingleFlightCache:
     ) -> None:
         ok = False
         value: Any = None
+        error: BaseException | None = None
         try:
             value = compute()
             ok = bool(cacheable(value))
-        except Exception:  # noqa: BLE001 - keep serving the last good value
+        except Exception as exc:  # noqa: BLE001 - keep serving the last good value
             ok = False
+            error = exc
         finally:
             # Publish before clearing the flag, so a get() in between never sees
             # the stale entry with no refresh in flight and starts a second one.
             if ok:
                 self._store(key, value, generation)
+            else:
+                self._store_rejected(key, value, error, generation)
             with self._lock:
                 self._refreshing.discard(key)
 
-    def get(self, key: Any, compute: Any, cacheable: Any = None) -> Any:
-        """Return a deep copy of the cached or freshly computed value."""
+    def get(
+        self,
+        key: Any,
+        compute: Any,
+        cacheable: Any = None,
+        *,
+        blocking: bool = True,
+    ) -> Any:
+        """Return a deep copy of the cached or freshly computed value.
+
+        ``blocking=False`` (NF-2026-02274) never runs ``compute`` in the calling
+        thread: a key with no servable value starts one background refresh
+        (single-flight, shared with stale refreshes) and returns
+        :data:`PROBE_PENDING` while that refresh, or one already in flight,
+        runs.  A refresh whose result was rejected is served as that real
+        result (or its exception is re-raised) for
+        ``PROVIDER_PROBE_NEGATIVE_TTL_SECONDS``, and no new refresh for the key
+        starts until then.  Blocking callers keep recomputing a rejected value.
+        """
 
         accept = cacheable if cacheable is not None else (lambda _value: True)
         now = time.monotonic()
+        rejected: tuple[float, Any, BaseException | None] | None = None
         with self._lock:
             entry = self._entries.get(key)
             generation = self._generation
@@ -830,7 +898,10 @@ class _TtlSingleFlightCache:
                     return deepcopy(entry[2])
                 if age < PROVIDER_PROBE_MAX_STALE_SECONDS:
                     self.stale_served += 1
-                    if key not in self._refreshing:
+                    if (
+                        key not in self._refreshing
+                        and self._fresh_rejected_locked(key, now) is None
+                    ):
                         self._refreshing.add(key)
                         self.refreshes_started += 1
                         start_refresh = True
@@ -838,19 +909,104 @@ class _TtlSingleFlightCache:
                     entry = None
             if entry is None:
                 self.misses += 1
+                if not blocking and key not in self._refreshing:
+                    rejected = self._fresh_rejected_locked(key, now)
+                    if rejected is not None:
+                        self.negative_served += 1
+                    else:
+                        self._refreshing.add(key)
+                        self.refreshes_started += 1
+                        start_refresh = True
+        if start_refresh:
+            threading.Thread(
+                target=self._refresh,
+                args=(key, compute, accept, generation),
+                name=f"aiworkhub-{self.name}-refresh",
+                daemon=True,
+            ).start()
         if entry is not None:
-            if start_refresh:
-                threading.Thread(
-                    target=self._refresh,
-                    args=(key, compute, accept, generation),
-                    name=f"aiworkhub-{self.name}-refresh",
-                    daemon=True,
-                ).start()
             return deepcopy(entry[2])
+        if rejected is not None:
+            if rejected[2] is not None:
+                # A FRESH instance per raise: re-raising the stored object
+                # would grow its shared __traceback__ for the whole negative
+                # TTL and let concurrent readers mutate one exception.
+                raise _fresh_probe_exception(rejected[2]) from None
+            return deepcopy(rejected[1])
+        if not blocking:
+            return PROBE_PENDING
         value = compute()
         if accept(value):
             self._store(key, value, generation)
         return deepcopy(value)
+
+
+def _sanitized_probe_exception(error: BaseException) -> BaseException:
+    """A traceback-free copy of a rejected probe's exception for the negative cache."""
+
+    return _fresh_probe_exception(error)
+
+
+def _fresh_probe_exception(error: BaseException) -> BaseException:
+    """A new exception of the same type and arguments, with no traceback or chain.
+
+    ``copy.copy`` rebuilds an exception from ``__reduce__`` (type, args and
+    instance ``__dict__``), never carrying ``__traceback__``, ``__cause__`` or
+    ``__context__``.  A type whose constructor refuses its own ``args`` falls
+    back to ``type(str(error))``, then to a ``RuntimeError`` naming the type.
+    """
+
+    import copy as _copy
+
+    try:
+        fresh = _copy.deepcopy(error)
+    except Exception:  # noqa: BLE001 - constructor refused its own args
+        try:
+            fresh = type(error)(str(error))
+        except Exception:  # noqa: BLE001
+            fresh = RuntimeError(f"{type(error).__name__}: {error}")
+    fresh.__traceback__ = None
+    fresh.__cause__ = None
+    fresh.__context__ = None
+    fresh.__suppress_context__ = True
+    return fresh
+
+
+# Returned by a non-blocking ``_TtlSingleFlightCache.get`` while the first
+# probe for a key is still running in the background.
+PROBE_PENDING: Any = object()
+OPENCODE_PROBE_STATE_PROBING = "probing"
+_PROBE_MODE_LOCAL = threading.local()
+
+
+@contextmanager
+def nonblocking_provider_probes() -> Iterator[None]:
+    """Serve provider probes off the calling thread's request path.
+
+    Inside this scope (the dashboard snapshot, NF-2026-02274) a cached or
+    stale probe value is served as before, and a never-probed one is reported
+    as ``probing`` while one background probe runs, instead of blocking on the
+    ``opencode models`` subprocess.  Thread-local: other callers keep the
+    synchronous first probe.
+    """
+
+    previous = getattr(_PROBE_MODE_LOCAL, "nonblocking", False)
+    _PROBE_MODE_LOCAL.nonblocking = True
+    try:
+        yield
+    finally:
+        _PROBE_MODE_LOCAL.nonblocking = previous
+
+
+def _probes_nonblocking() -> bool:
+    return bool(getattr(_PROBE_MODE_LOCAL, "nonblocking", False))
+
+
+def _provider_probe_pending(row: Mapping[str, Any]) -> bool:
+    """A provider row whose model probe is still running in the background."""
+
+    probe = row.get("opencode_models_probe") if isinstance(row, Mapping) else None
+    return isinstance(probe, Mapping) and probe.get("state") == OPENCODE_PROBE_STATE_PROBING
 
 
 _OPENCODE_MODELS_CACHE = _TtlSingleFlightCache("opencode_models")
@@ -941,8 +1097,15 @@ def _cached_opencode_models(
         )
 
     value = _OPENCODE_MODELS_CACHE.get(
-        key, lambda: _opencode_models_with_record(executable), cacheable
+        key,
+        lambda: _opencode_models_with_record(executable),
+        cacheable,
+        blocking=not _probes_nonblocking(),
     )
+    if value is PROBE_PENDING:
+        # Never probed (or too old to serve) and its one background probe is
+        # running: report that, never a guessed listing.
+        value = ([], {"state": OPENCODE_PROBE_STATE_PROBING})
     listed, record = value
     _OPENCODE_PROBE_LOCAL.record = dict(record) if record is not None else None
     return list(listed), record
@@ -1541,18 +1704,26 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
         for name in _POLICY_ALLOWED_ADAPTERS
     ]
     selected = next((item for item in providers if item["adapter_id"] == adapter_id), None)
+    # A provider whose model probe is still in flight (dashboard, NF-2026-02274)
+    # has not been measured yet: it contributes ``probing``, never ``blocked``.
+    provider_probe_pending = any(_provider_probe_pending(item) for item in providers)
     if adapter_id and selected is None:
         errors.append("selected_adapter_unsupported")
-    elif selected is not None and not selected["launchable"]:
+    elif (
+        selected is not None
+        and not selected["launchable"]
+        and not _provider_probe_pending(selected)
+    ):
         errors.append("selected_adapter_not_launchable")
     eligible_routes = [item for item in providers if item.get("coverage_required", True)]
     excluded_routes = [item for item in providers if not item.get("coverage_required", True)]
     launchable_routes = [item for item in eligible_routes if item.get("launchable")]
     unavailable_routes = [item for item in eligible_routes if not item.get("launchable")]
-    if not launchable_routes:
+    routes_probing = any(_provider_probe_pending(item) for item in eligible_routes)
+    if not launchable_routes and not routes_probing:
         errors.append("no_launchable_provider_routes")
     route_coverage_status = (
-        "blocked"
+        ("probing" if routes_probing else "blocked")
         if not launchable_routes
         else ("degraded" if unavailable_routes else "full")
     )
@@ -1567,6 +1738,12 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
             (selected or launchable_routes[0]).get("adapter_id") or "vscode_lm"
         )
         try:
+            # This is the ONLY way a dashboard snapshot reaches the dirty-seed
+            # git scan (dirty_seeded_paths / hide_live_gitignore_seeds,
+            # NF-2026-02274): the probe provisions a real zero-diff throwaway
+            # worktree, and that provisioning needs both steps for its
+            # zero-delta verdict.  It runs on the probe's own background
+            # thread behind a result cache, never on this thread.
             finalization_probe = worker_workspace.finalization_preflight_probe_nonblocking(
                 root, probe_adapter
             )
@@ -1574,6 +1751,9 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
             # Give that coalesced background probe one bounded warm-up window
             # so callers do not observe a transient hard Blocked result.
             deadline = time.monotonic() + _FINALIZATION_PREFLIGHT_WARMUP_SECONDS
+            if _probes_nonblocking():
+                # A non-blocking (dashboard) caller reports ``probing`` instead.
+                deadline = 0.0
             while (
                 str(finalization_probe.get("status") or "") == "probing"
                 and time.monotonic() < deadline
@@ -1701,15 +1881,18 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
     warnings = list(degraded_reasons)
     if finalization_pending:
         warnings.append("worker_finalization_probe_pending")
+    if provider_probe_pending:
+        warnings.append("provider_models_probe_pending")
+    probe_pending = finalization_pending or provider_probe_pending
     result = {
-        "ok": not unique_errors and not finalization_pending,
+        "ok": not unique_errors and not probe_pending,
         "schema_id": PREFLIGHT_SCHEMA_ID,
         "status": (
             "blocked"
             if unique_errors
             else (
                 "probing"
-                if finalization_pending
+                if probe_pending
                 else ("degraded" if degraded_reasons else "ready")
             )
         ),

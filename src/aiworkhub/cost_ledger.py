@@ -1498,7 +1498,16 @@ def build_cost_ledger(
     topic: str | None = None,
     status: str | None = None,
     include_tasks: bool = False,
+    shared_read_only: bool = False,
 ) -> dict[str, Any]:
+    """Build the cost ledger for ``repo_root``.
+
+    By default the caller gets an independent, fully mutable deep copy.
+    ``shared_read_only=True`` is an explicit opt-in for a pure reader (the
+    dashboard, NF-2026-02274): the top-level dict is private, but its nested
+    sections are the memo's read-only containers, so no per-call deepcopy is
+    made and a mutation raises ``TypeError`` instead of corrupting the memo.
+    """
     if repo_root is None:
         return _assemble_cost_ledger(
             repo_root=None,
@@ -1513,6 +1522,7 @@ def build_cost_ledger(
         topic=topic,
         status=status,
         include_tasks=include_tasks,
+        shared_read_only=shared_read_only,
     )
     # Read-only surfacing of Claude Code's own transcript usage; never
     # touches usage_rows/aggregates above, so existing attribution holds. It
@@ -1687,17 +1697,79 @@ def _fold_usage_events(
     return {**inputs, "rows": (new_rows + inputs["rows"])[:_USAGE_EVENT_LIMIT]}
 
 
-def _copy_ledger(result: dict[str, Any]) -> dict[str, Any]:
-    """An independent copy a caller may mutate without touching the memo."""
+def _read_only(*_args: Any, **_kwargs: Any) -> Any:
+    raise TypeError("shared_cost_ledger_is_read_only")
 
-    copied: dict[str, Any] = {}
-    for key, value in result.items():
-        if key == "tasks":
-            # Rows hold scalars only; a per-row dict copy is a full copy.
-            copied[key] = [dict(row) for row in value]
-        else:
-            copied[key] = copy.deepcopy(value)
-    return copied
+
+class _FrozenDict(dict):  # type: ignore[type-arg]
+    """A memoized ledger section: reads like a dict, refuses every mutation.
+
+    ``copy.deepcopy`` / ``copy.copy`` / pickle yield plain mutable containers,
+    so :func:`_copy_ledger` keeps returning an independent mutable copy.
+    """
+
+    __slots__ = ()
+    __setitem__ = __delitem__ = __ior__ = _read_only
+    clear = pop = popitem = setdefault = update = _read_only
+
+    def __copy__(self) -> dict[str, Any]:
+        return dict(self)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> dict[str, Any]:
+        copied: dict[Any, Any] = {}
+        memo[id(self)] = copied
+        for key, value in self.items():
+            copied[copy.deepcopy(key, memo)] = copy.deepcopy(value, memo)
+        return copied
+
+    def __reduce_ex__(self, _protocol: Any) -> Any:
+        return (dict, (dict(self),))
+
+
+class _FrozenList(list):  # type: ignore[type-arg]
+    """List counterpart of :class:`_FrozenDict`."""
+
+    __slots__ = ()
+    __setitem__ = __delitem__ = __iadd__ = __imul__ = _read_only
+    append = extend = insert = pop = remove = clear = sort = reverse = _read_only
+
+    def __copy__(self) -> list[Any]:
+        return list(self)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> list[Any]:
+        copied: list[Any] = []
+        memo[id(self)] = copied
+        copied.extend(copy.deepcopy(value, memo) for value in self)
+        return copied
+
+    def __reduce_ex__(self, _protocol: Any) -> Any:
+        return (list, (list(self),))
+
+
+def _freeze(value: Any) -> Any:
+    """One O(n) pass per memoized build, so later reads need no deepcopy."""
+    if isinstance(value, dict):
+        return _FrozenDict({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return _FrozenList(_freeze(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
+def _copy_ledger(result: dict[str, Any], *, shared_read_only: bool = False) -> dict[str, Any]:
+    """The ledger a caller receives for a memoized ``result``.
+
+    Default: an independent deep copy whose every nested container is a plain
+    mutable dict/list (the frozen types deep-copy to plain ones), so a caller
+    may mutate any row without touching the memo.  ``shared_read_only``: only
+    the top level is copied and nested sections stay the memo's read-only
+    containers (explicit opt-in, the dashboard only).
+    """
+
+    if shared_read_only:
+        return dict(result)
+    return copy.deepcopy(result)
 
 
 def _memoized_cost_ledger(
@@ -1707,6 +1779,7 @@ def _memoized_cost_ledger(
     topic: str | None,
     status: str | None,
     include_tasks: bool,
+    shared_read_only: bool = False,
 ) -> dict[str, Any]:
     filters = (runner, topic, status, bool(include_tasks))
     readers = _ledger_readers()
@@ -1744,7 +1817,7 @@ def _memoized_cost_ledger(
                     LEDGER_CACHE_STATS["hits"] += 1
                     entry["results"].move_to_end(filters)
     if cached is not None:
-        return _copy_ledger(cached)
+        return _copy_ledger(cached, shared_read_only=shared_read_only)
     results: OrderedDict[tuple[Any, ...], dict[str, Any]]
     if fresh_entry is not None:
         _count_ledger_cache("filter_misses")
@@ -1774,13 +1847,17 @@ def _memoized_cost_ledger(
                 repo_root, through_event_id=usage_mark[0] if canonical else None
             )
         results = OrderedDict()
-    result = _assemble_cost_ledger(
-        repo_root=repo_root,
-        runner=runner,
-        topic=topic,
-        status=status,
-        include_tasks=include_tasks,
-        inputs=inputs,
+    # Frozen once per build: a memo hit then needs no deepcopy for a shared
+    # (dashboard) reader, and a nested mutation can never reach the memo.
+    result = _freeze(
+        _assemble_cost_ledger(
+            repo_root=repo_root,
+            runner=runner,
+            topic=topic,
+            status=status,
+            include_tasks=include_tasks,
+            inputs=inputs,
+        )
     )
     with _LEDGER_MEMO_LOCK:
         results[filters] = result
@@ -1796,4 +1873,4 @@ def _memoized_cost_ledger(
         _LEDGER_MEMO.move_to_end(root_key)
         while len(_LEDGER_MEMO) > _LEDGER_MEMO_MAX_REPOSITORIES:
             _LEDGER_MEMO.popitem(last=False)
-    return _copy_ledger(result)
+    return _copy_ledger(result, shared_read_only=shared_read_only)

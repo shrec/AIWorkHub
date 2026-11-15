@@ -2477,12 +2477,38 @@ def _snapshot_generation_key(root: Path) -> tuple[Any, ...] | None:
     )
 
 
+def _probe_pending(snapshot: Mapping[str, Any]) -> bool:
+    """A provider or finalization probe the snapshot reported as ``probing``.
+
+    The snapshot never waits for those background probes (NF-2026-02274), so
+    such a build is not memoized: the next poll picks up the landed result.
+    """
+    preflight = snapshot.get("environment_preflight")
+    if not isinstance(preflight, Mapping):
+        return False
+    if preflight.get("status") == "probing":
+        return True
+    # The finalization probe is pending even when another error already made
+    # the aggregate ``blocked``: its verdict is transient, never memoized.
+    finalization = preflight.get("worker_finalization")
+    if isinstance(finalization, Mapping) and finalization.get("status") == "probing":
+        return True
+    warnings = preflight.get("warnings")
+    if isinstance(warnings, list) and "worker_finalization_probe_pending" in warnings:
+        return True
+    providers = preflight.get("providers")
+    for row in providers if isinstance(providers, list) else ():
+        if isinstance(row, Mapping) and repo_policy._provider_probe_pending(row):
+            return True
+    return False
+
+
 def _cacheable_build(snapshot: Mapping[str, Any]) -> bool:
-    """Only a ready, error-free build is reused; a degraded one is re-checked."""
+    """Only a ready, error-free, settled build is reused; others are re-checked."""
     storage = snapshot.get("storage")
     if isinstance(storage, Mapping) and not storage.get("ready", True):
         return False
-    return not snapshot.get("errors")
+    return not snapshot.get("errors") and not _probe_pending(snapshot)
 
 
 def _snapshot_build_cache_stats() -> dict[str, int]:
