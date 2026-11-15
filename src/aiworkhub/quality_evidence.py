@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from os import environ as _process_environ, pathsep as _pathsep
 from pathlib import Path, PureWindowsPath
@@ -23,6 +24,7 @@ from . import (
     evidence_levels,
     known_bug_scanner,
     msbuild_project_check,
+    parallelism,
     platform_io,
     quality_review,
     quality_reviewer,
@@ -2633,6 +2635,215 @@ def _timeout_stream_tail(captured: bytes | str | None) -> str:
     return raw[-TIMEOUT_STREAM_TAIL_BYTES:].decode("utf-8", errors="replace")
 
 
+# NF-2026-02284: repository-wide inputs a declared command may need. A sparse
+# validation tree can lack them (ruff E902 on scripts/, "No module named" for an
+# unchanged module, pytest collecting no tests); they are filled in from the
+# canonical toolchain root so the tree becomes canonical + candidate.
+SPARSE_TOOLCHAIN_INPUT_ROOTS = ("scripts", "src", "tests")
+_SPARSE_FILL_SKIPPED_DIRS = frozenset({"__pycache__"})
+SPARSE_FILL_GIT_TIMEOUT_SECONDS = 60
+# Variables git honours over ``-C``: inherited, they would list another index.
+_SPARSE_FILL_GIT_ENV_OVERRIDES = frozenset({
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY", "GIT_NAMESPACE",
+})
+_SPARSE_FILL_FILLED = "filled"
+_SPARSE_FILL_EXISTS = "exists"
+_SPARSE_FILL_REFUSED = "refused"
+
+
+@dataclass(frozen=True)
+class SparseFillResult:
+    """Receipt of one sparse toolchain fill.
+
+    ``filled`` are the sorted repo-relative paths copied in; ``refused``
+    counts destinations skipped because a symlink, junction or other reparse
+    point (or an uninspectable component) sits between the validation root and
+    the destination; ``error`` names why nothing was filled at all (the
+    tracked-file listing failed) and is empty otherwise.
+    """
+
+    filled: tuple[str, ...] = ()
+    refused: int = 0
+    error: str = ""
+
+
+def _tracked_sparse_inputs(source_root: Path) -> tuple[list[str], str]:
+    """Tracked scripts/src/tests paths of the canonical root, or a named error.
+
+    Only ``git ls-files`` decides what is canonical: untracked or ignored host
+    files are never candidates, and a failed listing never falls back to a walk.
+    """
+
+    env = {
+        key: value for key, value in _process_environ.items()
+        if key.upper() not in _SPARSE_FILL_GIT_ENV_OVERRIDES
+    }
+    try:
+        listing = subprocess.run(
+            ["git", "-C", str(source_root), "ls-files", "-z", "--",
+             *SPARSE_TOOLCHAIN_INPUT_ROOTS],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=SPARSE_FILL_GIT_TIMEOUT_SECONDS,
+            check=False,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return [], f"git_ls_files_timeout:{SPARSE_FILL_GIT_TIMEOUT_SECONDS}s"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [], f"git_ls_files_unavailable:{type(exc).__name__}"
+    if listing.returncode != 0:
+        return [], f"git_ls_files_failed:returncode={listing.returncode}"
+    tracked: set[str] = set()
+    for name in listing.stdout.decode("utf-8", errors="replace").split("\0"):
+        relative = posixpath.normpath(name) if name else ""
+        if (
+            not relative
+            or relative == "."
+            or relative.startswith(("/", "../"))
+            or relative == ".."
+        ):
+            continue
+        tracked.add(relative)
+    return sorted(tracked), ""
+
+
+def _sparse_destination_refused(validation_root: Path, relative: str) -> bool:
+    """True when an existing ancestor below the root is a link or reparse point.
+
+    Components are inspected with ``lstat`` from ``validation_root``
+    (exclusive) down to the destination's parent; the first missing component
+    ends the walk because nothing deeper can exist. A component that cannot be
+    inspected is refused (fail closed).
+    """
+
+    current = validation_root
+    for part in relative.split("/")[:-1]:
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        if stat.S_ISLNK(info.st_mode) or os.path.islink(current):
+            return True
+        if getattr(info, "st_file_attributes", 0) & getattr(
+            stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
+        ):
+            return True
+    return False
+
+
+def _copy_sparse_input(source: Path, validation_root: Path, relative: str) -> str:
+    """Copy one file's bytes and mode; never overwrite, never write through links.
+
+    Returns ``filled``, ``exists`` (the exclusive create lost) or ``refused``
+    (a link/junction ancestor, or a parent resolving outside the validation
+    root). Any failure after the exclusive create removes the partial
+    destination and re-raises.
+    """
+
+    destination = validation_root / relative
+    if _sparse_destination_refused(validation_root, relative):
+        return _SPARSE_FILL_REFUSED
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if _sparse_destination_refused(validation_root, relative):
+        return _SPARSE_FILL_REFUSED
+    if not destination.parent.resolve().is_relative_to(validation_root.resolve()):
+        return _SPARSE_FILL_REFUSED
+    with source.open("rb") as reader:
+        try:
+            writer = destination.open("xb")
+        except FileExistsError:
+            return _SPARSE_FILL_EXISTS
+        try:
+            with writer:
+                shutil.copyfileobj(reader, writer)
+            source_mode = stat.S_IMODE(os.stat(source).st_mode)
+            if stat.S_IMODE(os.stat(destination).st_mode) != source_mode:
+                shutil.copymode(source, destination)
+        except BaseException:
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+    return _SPARSE_FILL_FILLED
+
+
+def _fill_sparse_toolchain_inputs(
+    validation_root: Path | str,
+    toolchain_root: Path | str | None,
+    changed_paths: Iterable[str],
+) -> SparseFillResult:
+    """Fill tracked canonical scripts/src/tests files the sparse tree lacks.
+
+    Candidates are the canonical root's ``git ls-files`` entries under
+    ``SPARSE_TOOLCHAIN_INPUT_ROOTS``; a listing failure fills nothing and names
+    the reason in ``SparseFillResult.error``. A tracked regular file is copied
+    only when it is absent from the validation tree AND its repo-relative posix
+    path is not in ``changed_paths``: a candidate deletion is a changed path,
+    so it stays deleted and the check fails honestly. An existing file is never
+    overwritten, so the candidate's bytes are what every check sees, and a
+    destination reached through a symlink or junction is refused and counted.
+    ``toolchain_root=None`` (the full-tree path) or the validation tree itself
+    fills nothing. A copy failure other than "already exists" propagates (fail
+    closed) and leaves no partial destination.
+    """
+
+    if toolchain_root is None:
+        return SparseFillResult()
+    root = Path(validation_root)
+    source_root = Path(toolchain_root)
+    if source_root.resolve() == root.resolve():
+        return SparseFillResult()
+    changed = {
+        posixpath.normpath(str(path).strip().replace("\\", "/"))
+        for path in changed_paths
+        if str(path).strip()
+    }
+    tracked, error = _tracked_sparse_inputs(source_root)
+    if error:
+        return SparseFillResult(error=error)
+    missing: list[str] = []
+    for relative in tracked:
+        if relative in changed or _SPARSE_FILL_SKIPPED_DIRS.intersection(
+            relative.split("/")
+        ):
+            continue
+        candidate = source_root / relative
+        if candidate.is_symlink() or not candidate.is_file():
+            continue
+        destination = root / relative
+        if destination.exists() or destination.is_symlink():
+            continue
+        missing.append(relative)
+    if not missing:
+        return SparseFillResult()
+    capacity = parallelism.get_cpu_capacity()
+    workers, _selection = parallelism.compute_worker_count(
+        candidate_count=len(missing), reserve=max(1, capacity // 4)
+    )
+    with parallelism.worker_pool_scope(), ThreadPoolExecutor(
+        max_workers=max(1, workers)
+    ) as pool:
+        outcomes = list(pool.map(
+            lambda relative: _copy_sparse_input(
+                source_root / relative, root, relative
+            ),
+            missing,
+        ))
+    return SparseFillResult(
+        filled=tuple(sorted(
+            relative for relative, outcome in zip(missing, outcomes)
+            if outcome == _SPARSE_FILL_FILLED
+        )),
+        refused=sum(1 for outcome in outcomes if outcome == _SPARSE_FILL_REFUSED),
+    )
+
+
 def _run_command_array(
     command: Iterable[str],
     *,
@@ -2777,23 +2988,47 @@ def run_declared_checks(
     timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
     effective_risk_tier: str = RISK_LOW,
     policy_root: Path | str | None = None,
+    toolchain_root: Path | str | None = None,
 ) -> list[EvidenceCheck]:
     """Execute repo-local declared quality/security commands for one task delta.
 
     Fails closed (raises MalformedConfigError) on a malformed config instead
     of silently skipping or partially running it. Commands only ever run as
     argv arrays -- never a shell string.
+
+    ``policy_root`` names where the CONFIG comes from; ``toolchain_root``
+    names the canonical toolchain (NF-2026-02284). When it is set and differs
+    from the validation tree, canonical scripts/src/tests files the sparse
+    tree lacks -- and the candidate did not change or delete -- are filled in
+    before any check runs, so checks see canonical + candidate bytes. Without
+    an explicit toolchain root nothing is filled and the policy root, then the
+    validation tree, supplies the pytest entrypoint.
     """
 
     root = Path(repo_root)
     # The coordinator may supply canonical policy for an omitted sparse input;
     # commands and generated reports still belong to the validation tree.
     config = load_repo_config(policy_root if policy_root is not None else root)
+    command_toolchain_root = Path(
+        toolchain_root if toolchain_root is not None
+        else policy_root if policy_root is not None
+        else root
+    )
     if effective_risk_tier not in _RISK_RANK:
         raise MalformedConfigError(
             f"unknown effective risk tier: {effective_risk_tier!r}"
         )
     affected = tuple(sorted(str(p) for p in (changed_paths or ())))
+    sparse_fill = _fill_sparse_toolchain_inputs(root, toolchain_root, affected)
+    fill_provenance = (
+        f":sparse_inputs_filled={len(sparse_fill.filled)}"
+        + (f":sparse_inputs_refused={sparse_fill.refused}"
+           if sparse_fill.refused else "")
+        + (f":sparse_inputs_fill_error={sparse_fill.error}"
+           if sparse_fill.error else "")
+        if toolchain_root is not None
+        else ""
+    )
     results: list[EvidenceCheck] = []
     for entry in config.get("checks", []):
         check_id = str(entry["id"])
@@ -2815,13 +3050,17 @@ def run_declared_checks(
                 provenance=f"repo_config:{CONFIG_RELATIVE_PATH}:applicability",
             ))
             continue
-        execution_receipt: dict[str, Any] = {}
+        execution_receipt: dict[str, Any] = {
+            "sparse_inputs_filled": len(sparse_fill.filled),
+            "sparse_inputs_refused": sparse_fill.refused,
+            "sparse_inputs_fill_error": sparse_fill.error,
+        }
         status, stdout, stderr, duration = _run_command_array(
             command,
             cwd=root,
             timeout_seconds=timeout_seconds,
             execution_receipt=execution_receipt,
-            toolchain_root=Path(policy_root) if policy_root is not None else root,
+            toolchain_root=command_toolchain_root,
         )
         summary = f"stdout:\n{stdout}\nstderr:\n{stderr}"
         results.append(
@@ -2838,7 +3077,7 @@ def run_declared_checks(
                 affected_paths=affected,
                 summary=summary.strip(),
                 provenance=(f"repo_config:{CONFIG_RELATIVE_PATH}:cwd={root}:"
-                            f"source_root={root / 'src'}"),
+                            f"source_root={root / 'src'}{fill_provenance}"),
                 error="" if status != STATUS_NOT_AVAILABLE else stderr,
             )
         )
@@ -3345,6 +3584,10 @@ def run_completion_quality_gate(
             changed_paths=affected,
             effective_risk_tier=str(risk_profile["effective_tier"]),
             policy_root=policy_root,
+            # NF-2026-02284: a candidate that changed quality.json supplies the
+            # config (policy_root=None) but never the toolchain: imports and
+            # repo-wide inputs still resolve from the canonical baseline.
+            toolchain_root=policy_root if policy_root is not None else baseline_root,
         )
         config_error = ""
     except MalformedConfigError as exc:
