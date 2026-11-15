@@ -8156,12 +8156,14 @@ def aiworkhub_dispatcher_health() -> dict[str, Any]:
 
 
 @mcp.tool()
-def aiworkhub_doctor_diagnose() -> dict[str, Any]:
+def aiworkhub_doctor_diagnose(heap_census: bool = False) -> dict[str, Any]:
     """READ-ONLY: what is wrong right now. Runs the task, dispatcher,
     source-graph and manager-route health probes concurrently and returns one
     verdict (ok/problem/unavailable) with the non-ok probes and the tool to
     call next, plus server_process: this answering process's pid, memory and
-    runtime generation.
+    runtime generation. heap_census=true adds server_process.heap_census, a
+    bounded live-heap census (top types, largest containers, gc counts; type
+    names and sizes only) -- slower, use when hunting the server's memory.
     Use first when something fails and the cause is unknown; use aiworkhub_environment_preflight for pre-launch readiness."""
 
     reply = doctor.diagnose(
@@ -8170,9 +8172,11 @@ def aiworkhub_doctor_diagnose() -> dict[str, Any]:
             "aiworkhub_dispatcher_health": core.dispatcher_health,
             "aiworkhub_source_graph_health": core.source_graph_health,
             "aiworkhub_manager_route_health": manager_lane.route_health,
-        }
+        },
+        heap_census=heap_census,
     )
-    reply["server_process"] = doctor.server_process()
+    if "server_process" not in reply:
+        reply["server_process"] = doctor.server_process()
     return reply
 
 

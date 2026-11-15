@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import concurrent.futures
+import gc
+import heapq
+import itertools
 import json
 import math
 import mmap
 import os
 import sys
 import time
+import types
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -22,6 +26,13 @@ STATE_SLOW = "slow"
 VERDICT_DEGRADED = "degraded"
 SUMMARY_MAX_CHARS = 200
 REPLY_MAX_BYTES = 8 * 1024
+# Opt-in heap census (NF-2026-02273): every bound is a module constant.
+HEAP_CENSUS_MAX_OBJECTS = 3_000_000
+HEAP_CENSUS_TOP_TYPES = 15
+HEAP_CENSUS_LARGEST_OBJECTS = 10
+HEAP_CENSUS_MAX_REFERRERS = 256
+HEAP_CENSUS_NAME_CHARS = 120
+HEAP_CENSUS_CONTAINER_TYPES = (dict, list, str, bytes, bytearray)
 NESTED_PROBE_KEYS = ("reconciler", "learning_coverage")
 DETAIL_KEYS = ("error", "last_error", "reason")
 # Task DB holder scan (NF-2026-00274): every bound is a constant, never a per-call knob.
@@ -132,9 +143,13 @@ def _encoded_size(payload: Mapping[str, Any]) -> int:
 
 @platform_io.trim_heap_after
 def diagnose(
-    probes: Mapping[str, Probe], *, timeout_seconds: float = 10.0
+    probes: Mapping[str, Probe], *, timeout_seconds: float = 10.0, heap_census: bool = False
 ) -> dict[str, Any]:
-    """Run every probe concurrently and fold the results into one verdict."""
+    """Run every probe concurrently and fold the results into one verdict.
+
+    ``heap_census=True`` also attaches ``server_process`` with its heap census,
+    fitted into REPLY_MAX_BYTES; the default reply is unchanged.
+    """
     if not probes:
         raise ValueError("doctor_diagnose_requires_at_least_one_probe")
     # Probes are IO-bound; keep one core free for the MCP server itself.
@@ -173,6 +188,14 @@ def diagnose(
         "probes": entries,
     }
     reply["task_db_holders"] = task_db_holders()
+    if heap_census:
+        reply["server_process"] = server_process(heap_census=True)
+        census = reply["server_process"]["heap_census"]
+        # The census gives way first: the largest-objects list, then the type table.
+        for key in ("largest_objects", "top_types"):
+            if key in census and _encoded_size(reply) > REPLY_MAX_BYTES:
+                census[key] = []
+                census[f"{key}_dropped"] = True
     if _encoded_size(reply) > REPLY_MAX_BYTES:
         for entry in entries:
             entry["summary"] = ""
@@ -192,16 +215,172 @@ def _or_none(call: Callable[[], Any]) -> Any:
         return None
 
 
-def server_process() -> dict[str, Any]:
-    """Identify and size the process answering this call; never raises."""
+def _type_name(kind: type) -> str:
+    """Bounded ``module.qualname`` of a type; a name only, never an instance repr."""
+    try:
+        module = type.__dict__["__module__"].__get__(kind)
+        qualname = type.__dict__["__qualname__"].__get__(kind)
+    except Exception:
+        return "?"
+    if isinstance(module, str) and module != "builtins":
+        return f"{module}.{qualname}"[:HEAP_CENSUS_NAME_CHARS]
+    return str(qualname)[:HEAP_CENSUS_NAME_CHARS]
 
+
+def _shallow_size(obj: Any) -> int:
+    try:
+        return int(sys.getsizeof(obj))
+    except Exception:
+        return 0
+
+
+def _container_len(obj: Any) -> int | None:
+    # The base-class __len__ never runs a subclass override.
+    for base in HEAP_CENSUS_CONTAINER_TYPES:
+        if issubclass(type(obj), base):
+            return int(base.__len__(obj))
+    return None
+
+
+def _register_owner(obj: Any, owners: dict[int, tuple[str, str]]) -> None:
+    """Remember the namespace dict of a module, class or function by id."""
+    kind = type(obj)
+    if issubclass(kind, types.ModuleType):
+        namespace = types.ModuleType.__dict__["__dict__"].__get__(obj)
+        if type(namespace) is dict:
+            name = namespace.get("__name__")
+            owners[id(namespace)] = ("module", str(name)[:HEAP_CENSUS_NAME_CHARS])
+    elif issubclass(kind, type):
+        proxy = type.__dict__["__dict__"].__get__(obj)
+        for ref in gc.get_referents(proxy):
+            if type(ref) is dict:
+                owners[id(ref)] = ("class", _type_name(obj))
+    elif kind is types.FunctionType:
+        # Reading __dict__ would create it; the referents expose it without allocating.
+        for ref in gc.get_referents(obj):
+            if type(ref) is dict and ref is not obj.__globals__ and ref is not obj.__kwdefaults__:
+                owners[id(ref)] = ("function", str(obj.__qualname__)[:HEAP_CENSUS_NAME_CHARS])
+
+
+def _first_owner(obj: Any, owners: Mapping[int, tuple[str, str]]) -> tuple[str, str] | None:
+    """Best effort: the first referrer that is a module/class/function namespace dict."""
+    for ref in itertools.islice(gc.get_referrers(obj), HEAP_CENSUS_MAX_REFERRERS):
+        if type(ref) is dict:
+            owner = owners.get(id(ref))
+            if owner is not None:
+                return owner
+    return None
+
+
+def _heap_census(max_objects: int) -> dict[str, Any]:
+    """Bounded stdlib census of the live heap: type names, counts and sizes only.
+
+    Type counts cover gc-tracked objects; untracked str/bytes/bytearray/dict
+    values are reached through their referring containers for the largest list.
+    Ceiling: gc.get_objects() materialises one list of every tracked object
+    (8 bytes each), and each largest-object referrer lookup walks the heap once.
+    """
+    started = time.monotonic()
+    before = list(gc.get_count())
+    collected = gc.collect()
+    after = list(gc.get_count())
+    objects = gc.get_objects()
+    truncated = len(objects) > max_objects
+    by_type: dict[type, list[int]] = {}
+    owners: dict[int, tuple[str, str]] = {}
+    largest: list[tuple[int, int, Any]] = []
+    largest_ids: set[int] = set()
+    sequence = 0
+
+    def offer(candidate: Any, size: int) -> None:
+        nonlocal sequence
+        if id(candidate) in largest_ids:
+            return
+        sequence += 1
+        if len(largest) < HEAP_CENSUS_LARGEST_OBJECTS:
+            heapq.heappush(largest, (size, sequence, candidate))
+        elif size > largest[0][0]:
+            gone = heapq.heapreplace(largest, (size, sequence, candidate))[2]
+            largest_ids.discard(id(gone))
+        else:
+            return
+        largest_ids.add(id(candidate))
+
+    scanned = 0
+    skipped = 0
+    for obj in itertools.islice(objects, max_objects):
+        scanned += 1
+        # type(obj), never isinstance: a weakref proxy forwards __class__ to its referent.
+        kind = type(obj)
+        size = _shallow_size(obj)
+        slot = by_type.get(kind)
+        if slot is None:
+            by_type[kind] = [1, size]
+        else:
+            slot[0] += 1
+            slot[1] += size
+        try:
+            _register_owner(obj, owners)
+            if issubclass(kind, HEAP_CENSUS_CONTAINER_TYPES):
+                offer(obj, size)
+            for ref in gc.get_referents(obj):
+                if issubclass(type(ref), HEAP_CENSUS_CONTAINER_TYPES) and not gc.is_tracked(ref):
+                    offer(ref, _shallow_size(ref))
+        except Exception:
+            # One exotic object costs its owner/largest entry, never the census.
+            skipped += 1
+    del objects
+    top = heapq.nlargest(HEAP_CENSUS_TOP_TYPES, by_type.items(), key=lambda item: item[1])
+    largest_objects: list[dict[str, Any]] = []
+    for size, _, obj in sorted(largest, key=lambda item: (-item[0], item[1])):
+        owner = _or_none(lambda target=obj: _first_owner(target, owners))
+        largest_objects.append(
+            {
+                "type": _type_name(type(obj)),
+                "len": _or_none(lambda target=obj: _container_len(target)),
+                "shallow_bytes": size,
+                "referrer": owner[0] if owner else None,
+                "referrer_name": owner[1] if owner else None,
+            }
+        )
     return {
+        "top_types": [
+            {"type": _type_name(kind), "count": count, "shallow_bytes": total}
+            for kind, (count, total) in top
+        ],
+        "largest_objects": largest_objects,
+        "gc_counts": {
+            "before_collect": before,
+            "collected": collected,
+            "after_collect": after,
+        },
+        "objects_scanned": scanned,
+        "objects_skipped": skipped,
+        "census_truncated": truncated,
+        "census_seconds": round(time.monotonic() - started, 3),
+    }
+
+
+def server_process(*, heap_census: bool = False) -> dict[str, Any]:
+    """Identify and size the process answering this call; never raises.
+
+    ``heap_census=True`` adds a bounded live-heap census (NF-2026-02273):
+    type names, counts and shallow sizes only, never object contents.
+    """
+
+    reply: dict[str, Any] = {
         "pid": os.getpid(),
         **platform_io.process_memory_bytes(),
         "python_allocated_blocks": sys.getallocatedblocks(),
         "runtime_generation": _or_none(runtime_generation.own_generation),
         "superseded": _or_none(runtime_generation.superseded),
     }
+    if heap_census:
+        try:
+            reply["heap_census"] = _heap_census(HEAP_CENSUS_MAX_OBJECTS)
+        except Exception as error:
+            reply["heap_census"] = {"error": type(error).__name__}
+    return reply
 
 
 def _task_db_path() -> Path:
