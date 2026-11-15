@@ -216,6 +216,8 @@ def _bodygrep_fixture(count: int = 31) -> dict:
         "scan_byte_cap": 16777216,
         "scan_file_cap": 2048,
         "scan_truncated": False,
+        # NF-2026-02281: every real bodygrep payload names its scan scope.
+        "scan_scope": "git_tracked_first",
     }
 
 

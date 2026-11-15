@@ -5949,6 +5949,73 @@ def _bodygrep_scan_tier(file_path: str) -> int:
     return 1 if _is_vendored_path(str(file_path)) else 0
 
 
+# Directory names that conventionally hold build output (``bin/Debug/*.xml``,
+# ``obj/``). A repo-wide bodygrep never spends its cap there (NF-2026-02281);
+# a caller that targets such a tree explicitly still scans it.
+BODYGREP_BUILD_OUTPUT_DIR_NAMES = frozenset({"bin", "obj"})
+# Tier of a path a repo-wide bodygrep does not scan at all.
+BODYGREP_SCOPE_EXCLUDED_TIER = -1
+
+
+def _is_build_output_path(relative_path: str) -> bool:
+    directories = relative_path.replace("\\", "/").casefold().split("/")[:-1]
+    return not BODYGREP_BUILD_OUTPUT_DIR_NAMES.isdisjoint(directories)
+
+
+def _scan_git_tracked_paths(repo_root: Path) -> frozenset[str] | None:
+    """Paths git tracks below ``repo_root`` (relative, POSIX), or None if git cannot say."""
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-files", "-z", "--cached"],
+            capture_output=True,
+            timeout=_GIT_LS_FILES_IGNORED_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return frozenset(
+        entry.decode("utf-8", "surrogateescape")
+        for entry in completed.stdout.split(b"\0")
+        if entry
+    )
+
+
+def _bodygrep_repo_scope(repo_root: Path) -> tuple[Callable[[str], int], str]:
+    """Scan-tier function and scope name for a repo-wide (untargeted) bodygrep.
+
+    In a git work tree (NF-2026-02281) git-tracked first-party source is tier 0;
+    tracked vendored files and untracked files git does not ignore are tier 1.
+    A git-tracked path is never excluded: only UNTRACKED ignored paths, vendored
+    trees and ``bin/``/``obj/`` build output are excluded
+    (``BODYGREP_SCOPE_EXCLUDED_TIER``), so the file/byte cap is spent on code.
+    When git cannot be asked, the walk keeps the first-party-then-vendored
+    order unchanged rather than guessing what is tracked.
+    """
+
+    tracked = _scan_git_tracked_paths(repo_root)
+    ignored = _scan_git_ignored_paths(repo_root) if tracked is not None else None
+    if tracked is None or ignored is None or not ignored.applied:
+        return _bodygrep_scan_tier, "indexed"
+    # NF-2026-02041: a gitignored path under a policy include_root stays
+    # discoverable, exactly as the indexer admits it.
+    include_roots = load_ignore_policy(repo_root).include_roots
+
+    def tier(file_path: str) -> int:
+        path = str(file_path)
+        vendored = _is_vendored_path(path)
+        if path in tracked:
+            return 1 if vendored else 0
+        if include_roots and _under_include_root(path, include_roots):
+            return 1
+        if vendored or _is_build_output_path(path) or _gitignored_rel(path, ignored):
+            return BODYGREP_SCOPE_EXCLUDED_TIER
+        return 1
+
+    return tier, "git_tracked_first"
+
+
 def _bodygrep_cursor_digest(term: str, target: str, budget: int) -> str:
     payload = f"{term}\x1f{target}\x1f{budget}".encode("utf-8")
     return hashlib.sha256(payload).hexdigest()[:16]
@@ -6225,6 +6292,7 @@ def _bodygrep_target_on_disk(repo_root: Path, normalized_target: str) -> bool:
 
 def _iter_bodygrep_candidates(
     repo_root: Path, normalized_target: str, exact_target: bool, resume_file: str | None,
+    scan_tier: Callable[[str], int] = _bodygrep_scan_tier,
 ) -> Iterator[str]:
     """Yield indexed candidate paths in scan order, from one ordered query.
 
@@ -6234,7 +6302,8 @@ def _iter_bodygrep_candidates(
     are pulled ``_BODYGREP_CANDIDATE_PAGE`` at a time. Nothing here limits how
     far the walk goes; the scan itself decides how many files it may take from
     disk (NF-2026-01918), so cache-served files can never starve a later file
-    of its turn.
+    of its turn. A path whose ``scan_tier`` is ``BODYGREP_SCOPE_EXCLUDED_TIER``
+    is never yielded (NF-2026-02281).
     """
 
     omit_roots = _discovery_omit_roots(repo_root, normalized_target)
@@ -6254,10 +6323,10 @@ def _iter_bodygrep_candidates(
             scope_sql += " AND NOT discovery_omitted(file_path)"
     else:
         scope_sql = "NOT discovery_omitted(file_path)" if omit_roots else "1=1"
-    conditions = [scope_sql]
-    params: list[Any] = list(scope_params)
+    conditions = [scope_sql, "bodygrep_scan_tier(file_path) > ?"]
+    params: list[Any] = [*scope_params, BODYGREP_SCOPE_EXCLUDED_TIER]
     if resume_file is not None:
-        tier = _bodygrep_scan_tier(resume_file)
+        tier = scan_tier(resume_file)
         conditions.append(
             "(bodygrep_scan_tier(file_path) > ?"
             " OR (bodygrep_scan_tier(file_path) = ? AND file_path >= ?))"
@@ -6270,7 +6339,7 @@ def _iter_bodygrep_candidates(
     conn = connect(resolve_db_path(repo_root), read_only=True)
     try:
         conn.create_function(
-            "bodygrep_scan_tier", 1, _bodygrep_scan_tier, deterministic=True,
+            "bodygrep_scan_tier", 1, lambda path: scan_tier(str(path)), deterministic=True,
         )
         if omit_roots:
             conn.create_function(
@@ -6459,8 +6528,15 @@ def _bodygrep_query_page(
         raise SourceGraphError(f"target_not_found:{normalized_target}")
     # The walk is ordered and resumable exactly as before, but it is no longer cut
     # at a row count: only disk-backed files are bounded by scan_file_cap.
+    # NF-2026-02281: a repo-wide scan walks git-tracked source first and never
+    # opens ignored paths, vendored trees or bin/obj build output; a target
+    # keeps the walk exactly as before, so naming such a tree still scans it.
+    if normalized_target:
+        scan_tier, scan_scope = _bodygrep_scan_tier, "target"
+    else:
+        scan_tier, scan_scope = _bodygrep_repo_scope(repo_root)
     candidates = _iter_bodygrep_candidates(
-        repo_root, normalized_target, exact_target, resume_file,
+        repo_root, normalized_target, exact_target, resume_file, scan_tier,
     )
     scan_truncated = False
     disk_files = 0
@@ -6699,6 +6775,9 @@ def _bodygrep_query_page(
         "scan_file_cap": scan_file_cap,
         "scan_byte_cap": scan_byte_cap,
         "scan_truncated": scan_truncated,
+        # NF-2026-02281: "git_tracked_first" skips ignored, vendored and bin/obj
+        # paths; target one of them explicitly to scan it.
+        "scan_scope": scan_scope,
         # Named, not silent: a caller can tell "the literal is not there"
         # from "these files were never opened".
         "oversized_files_skipped": len(oversized_skipped),
@@ -6802,6 +6881,8 @@ def parse_file_line_range(text: str) -> tuple[int, int] | None:
 FILE_NEXT_WINDOW_LINES = 200
 _FILE_QUERY_PATH_SEPARATORS = re.compile(r"[\s,]+")
 _FILE_QUERY_LINE_SUFFIX = re.compile(r":\d+(?:-\d+)?$")
+# A whole file-mode target ``path:START-END`` or ``path:N`` (NF-2026-02281).
+_FILE_TARGET_LINE_SUFFIX = re.compile(r"(.+?):(\d+)(?:-(\d+))?")
 # A directory part and an extension: ``pkg/new.py`` counts by shape alone,
 # a dotted identifier (``os.path``) or a slash word (``I/O``) never does.
 _FILE_QUERY_PATH_SHAPE = re.compile(r"[/\x5c][^/\x5c]*\.[A-Za-z][A-Za-z0-9]*$")
@@ -7105,6 +7186,29 @@ def file_query(
             if folded is not None:
                 file_path = folded
                 payload = context(conn, file_path)
+        suffix = (
+            _FILE_TARGET_LINE_SUFFIX.fullmatch(file_path)
+            if not payload.get("found") and line_range is None else None
+        )
+        if suffix is not None:
+            # NF-2026-02281: target="path:START-END" (or "path:N") names an
+            # exact window of an indexed path; serve it instead of a silent miss.
+            base = suffix.group(1)
+            base_payload = context(conn, base)
+            if not base_payload.get("found"):
+                folded = _casefold_indexed_path(conn, repo_root, base)
+                if folded is not None:
+                    base = folded
+                    base_payload = context(conn, base)
+            if base_payload.get("found"):
+                start = int(suffix.group(2))
+                end = int(suffix.group(3) or suffix.group(2))
+                if start < 1 or end < start:
+                    raise SourceGraphError(
+                        f"file_line_range_invalid:{start}-{end}: use "
+                        f'target={base} query="START-END" with 1 <= START <= END'
+                    )
+                file_path, line_range, payload = base, (start, end), base_payload
         if payload.get("found"):
             file_freshness = _file_freshness_state(conn, repo_root, file_path)
     finally:
