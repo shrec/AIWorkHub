@@ -1175,6 +1175,62 @@ def canonical_status(row: Mapping[str, Any]) -> str:
     return "pending"
 
 
+# NF-2026-02276: the lifecycle words a cancel or supersede leaves behind. A row
+# carrying one is closed even while a stale ``worker_status`` (``claimed``)
+# still makes ``canonical_status`` project it as ``processing``.
+_DISPOSAL_CLOSED_STATUSES = frozenset({"superseded", "cancelled", "archived"})
+
+
+def closed_by_disposal(row: Mapping[str, Any]) -> bool:
+    """Whether a card was closed by archive, supersede or cancel.
+
+    Advisory only (it decides what a launch reports as an active writer); it
+    never authorizes a disposal, so ``archive_processing_forbidden`` keeps
+    deciding from ``canonical_status`` alone.
+    """
+    if str(row.get("archived_at") or "").strip():
+        return True
+    if str(row.get("archive_operation") or "").strip():
+        return True
+    status = str(row.get("status") or "").strip().lower()
+    worker_status = str(row.get("worker_status") or "").strip().lower()
+    return bool({status, worker_status} & _DISPOSAL_CLOSED_STATUSES)
+
+
+def task_closed_by_disposal(root: str | Path, task_id: str) -> bool:
+    """:func:`closed_by_disposal` for one stored row; unreadable means not closed.
+
+    Reads the raw lifecycle columns: a decoded card already carries the
+    projected bucket in ``status``, which is exactly what hides the closure.
+    """
+    if not task_id:
+        return False
+    try:
+        conn = _connect(_db_path_for(root, None), readonly=True)
+        try:
+            row = conn.execute(
+                "SELECT status, worker_status, archived_at, card_json FROM tasks WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except (TaskStoreError, sqlite3.Error, OSError):
+        return False  # keep the risk listed: unknown is never "closed"
+    if row is None:
+        return False
+    try:
+        card = json.loads(str(row["card_json"] or "{}"))
+    except json.JSONDecodeError:
+        card = {}
+    operation = card.get("archive_operation") if isinstance(card, dict) else ""
+    return closed_by_disposal({
+        "status": row["status"],
+        "worker_status": row["worker_status"],
+        "archived_at": row["archived_at"],
+        "archive_operation": operation,
+    })
+
+
 def _readiness_memo_key(root: str | Path) -> str | None:
     """The resolved root a memo entry is keyed by, or None (never memoize)."""
     try:

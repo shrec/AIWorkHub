@@ -1323,8 +1323,9 @@ class _FinalizerHeartbeat:
 
     _active = threading.local()
 
-    def __init__(self, request_id: str = "") -> None:
+    def __init__(self, request_id: str = "", *, claim_epoch: int | None = None) -> None:
         self._request_id = request_id
+        self.claim_epoch = claim_epoch  # NF-2026-02275: a fence naming it drops its writes
         self._guard = threading.Lock()
         self._path: Path | None = None
         self._identity: dict[str, Any] = {}
@@ -4530,6 +4531,8 @@ class ProcessManager:
                 unlock_fd(fh.fileno())
 
     def _append_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        if finalize_retry_dispatch.active_finalizer_fenced(self, str(event.get("request_id") or "")):
+            return {**event, "finalizer_fenced": True, "recorded": False}  # NF-2026-02275
         clean = {
             "schema_id": "aiworkhub.task_mcp.process_event.v1",
             "timestamp": _utcnow(),
@@ -5914,7 +5917,7 @@ class ProcessManager:
             return []
         if guard.get("returncode") != 0 or not isinstance(risks, list):
             return []
-        return risks
+        return finalize_retry_dispatch.drop_closed_writers(self.repo, risks)  # NF-2026-02276
 
     def _launch_validation_only_replay(
         self,
@@ -9806,6 +9809,8 @@ class ProcessManager:
         evidence: dict[str, Any] | None = None,
         notify_manager: bool = True,
     ) -> dict[str, Any]:
+        if (fenced := finalize_retry_dispatch.fenced_transition_refusal(self, request_id)) is not None:
+            return fenced  # NF-2026-02275: a fenced finalizer moves no card
         task_id = str(metadata["task_id"])
         runner = str(metadata["runner"])
         # The queue is authoritative over a still-exiting child.  A manager
@@ -9863,6 +9868,8 @@ class ProcessManager:
         evidence: dict[str, Any],
     ) -> dict[str, Any]:
         """Record a no-candidate failure without resurrecting disposed work."""
+        if (fenced := finalize_retry_dispatch.fenced_transition_refusal(self, request_id)) is not None:
+            return fenced  # NF-2026-02275: a fenced finalizer moves no card
         task_id = str(metadata["task_id"])
         runner = str(metadata["runner"])
         try:
@@ -10310,12 +10317,7 @@ class ProcessManager:
         for request_id, event in candidates.items():
             state = event.get("state")
             if state in FINALIZATION_PENDING_STATES:
-                finalized_event = self._finalize_after_process_exit(request_id)
-                if (
-                    finalized_event is not None
-                    and finalized_event.get("state") in TERMINAL_PROCESS_STATES
-                ):
-                    finalized += 1
+                finalized += finalize_retry_dispatch.reconcile_pending_finalization(self, request_id, state)
                 continue
 
             pid, pid_ambiguous = _parse_durable_pid(event.get("pid"))
@@ -10728,6 +10730,7 @@ class ProcessManager:
             if not events:
                 return None
             latest = split_lifecycle_tail(events)[0]
+            heartbeat.claim_epoch = finalize_retry_dispatch.bound_claim_epoch(heartbeat.claim_epoch, events)
             finalization_retry = bool(latest.get("finalization_retry"))
             if latest.get("state") in TERMINAL_PROCESS_STATES:
                 return latest
@@ -12682,13 +12685,8 @@ class ProcessManager:
                 self._live.pop(request_id, None)
             return {"ok": True, "request_id": request_id, "state": event["state"]}
 
-        if status.get("state") in FINALIZATION_PENDING_STATES:
-            return {
-                "ok": False,
-                "request_id": request_id,
-                "state": status.get("state"),
-                "blocked_reason": "finalization_pending",
-            }
+        if status.get("state") in FINALIZATION_PENDING_STATES:  # NF-2026-02276
+            return finalize_retry_dispatch.cancel_pending_finalization(self, request_id, reason)
 
         should_finalize = False
         with self._registry_lock():
@@ -13105,10 +13103,12 @@ class ProcessManager:
                 write_json_0600(metadata_path, metadata)
             # The retry owns the finalizer heartbeat from the moment the request
             # reads as finalizing; the nested finalize shares it.
+            heartbeat.claim_epoch = finalize_retry_dispatch.fresh_finalizer_epoch(self, request_id)
             heartbeat.start(status_path)
             self._append_event({
                 **self._event_identity(events),
                 **_launcher_validation.host_lane_receipt_stamp(metadata),
+                "finalizer_claim_epoch": heartbeat.claim_epoch,
                 "request_id": request_id,
                 "task_id": task_id,
                 "runner": runner,
