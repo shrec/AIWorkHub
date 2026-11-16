@@ -695,6 +695,21 @@ def record_finalizer_failed(
     if active_finalizer_fenced(manager, request_id):
         # NF-2026-02275: a fenced (cancelled or ended) finalizer never moves the card.
         return {**event_identity, "request_id": request_id, "finalizer_fenced": True, "recorded": False}
+    events = manager._request_events(request_id)
+    tail = pl.split_lifecycle_tail(events)[0]
+    if tail.get("state") == "review_ready" or (
+        tail.get("state") == "accepted" and tail.get("accepted") is True
+    ):
+        # NF-2026-01680: a request that already SUCCEEDED (e.g. an accepted
+        # reviewer) keeps that decision; a late exhausted finalize appends no
+        # terminal row over it and moves no card, so no callback is enqueued
+        # either. Any other tail (exited, failed, ...) still moves the card.
+        return {
+            **tail,
+            "request_id": request_id,
+            "skipped_decided_tail": True,
+            "recorded": False,
+        }
     task_id = str(event_identity.get("task_id") or "")
     runner = str(event_identity.get("runner") or "")
     release_result: dict[str, Any] = {

@@ -75,6 +75,26 @@ __all__ = [
 ]
 
 _REVIEWER_USABLE_STATES = ("review_ready", "accepted")
+# Janitor rows a late finalize can append after a reviewer request already
+# succeeded; they never void that success (NF-2026-01680).
+_LATE_FINALIZE_STATES = ("finalize_abandoned", "finalize_failed")
+
+
+def _reviewer_decided_event(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return a reviewer request's deciding row.
+
+    Walk back from the newest event skipping only late finalize rows; the
+    first other row decides when it is a ``review_ready``/``accepted``
+    success. Otherwise (a cancel/failure voided the success, or the request
+    only ever failed) the newest (unusable) row is returned.
+    """
+    latest = events[-1]
+    for event in reversed(events):
+        state = str(event.get("state") or "")
+        if state in _LATE_FINALIZE_STATES:
+            continue
+        return event if state in _REVIEWER_USABLE_STATES else latest
+    return latest
 
 ACCEPT_PREVIEW_SCHEMA_ID = "aiworkhub.accept_preview.v1"
 
@@ -408,11 +428,22 @@ def reviewer_evidence(
         reviewer_task_id = str(event.get("task_id") or "")
         if not reviewer_task_id:
             continue
+        decided = event
+        if (
+            str(event.get("state") or "") in _LATE_FINALIZE_STATES
+            and reviewer_task_id in bound_task_ids
+        ):
+            # NF-2026-01680: a late finalize row never voids an earlier success.
+            try:
+                events = self._request_events(str(request_id)) or [event]
+                decided = _reviewer_decided_event(events)
+            except Exception:  # noqa: BLE001 -- unreadable ledger keeps the failed state (fail closed)
+                decided = event
         attempts.setdefault(reviewer_task_id, []).append(
             {
                 "request_id": str(request_id),
-                "state": str(event.get("state") or ""),
-                "finished_at": str(event.get("finished_at") or ""),
+                "state": str(decided.get("state") or ""),
+                "finished_at": str(decided.get("finished_at") or ""),
             }
         )
     resolved: list[dict[str, Any]] = []
@@ -2907,6 +2938,7 @@ ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
     "effective_requested_risk_tier",
     "fold_accept_blockers",
     "_latest_request_identity_event",
+    "_reviewer_decided_event",
     "manager_skill_tools",
     "module_size_ratchet_blockers",
     "record_accept_finding_dispositions",
@@ -4400,7 +4432,8 @@ def accept_review(
                     raise WorkspaceError(
                         f"quality_reviewer_request_not_found:{reviewer_request_id}"
                     )
-                reviewer_latest = reviewer_events[-1]
+                # NF-2026-01680: a late finalize row never voids an earlier success.
+                reviewer_latest = _reviewer_decided_event(reviewer_events)
                 # NF-2026-02308: measured from this reviewer request's own
                 # authenticated MCP audit ledger; accept and accept_preview
                 # read the same fact. Unknown is never blind.
