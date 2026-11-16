@@ -4655,6 +4655,20 @@ function isLanguageModelToolCallPart(part) {
   return Boolean(part && typeof part.callId === "string" && typeof part.name === "string" && part.input && typeof part.input === "object");
 }
 
+// NF-2026-02288: a provider data part (mimeType + bytes, e.g. a stateful/cache marker)
+// carries neither model text nor a tool call.
+function vscodeLmIsDataPart(part) {
+  if (!part || typeof part !== "object" || isLanguageModelToolCallPart(part)) return false;
+  if (typeof vscode.LanguageModelDataPart === "function" && part instanceof vscode.LanguageModelDataPart) return true;
+  return typeof part.mimeType === "string" && part.data instanceof Uint8Array;
+}
+
+// A turn whose stream carried only data parts did no work: it is a no-progress turn
+// for the progress watchdog, never a work turn and never a forced-stage violation.
+function vscodeLmIsDataOnlyTurn(parts) {
+  return Array.isArray(parts) && parts.length > 0 && parts.every(vscodeLmIsDataPart);
+}
+
 // NF-2026-00168: strip tool-call parts from corrective retry assistant messages so
 // GLM/OpenAI-style provider history never contains unmatched tool-call parts that
 // would cause a 400 validation error.
@@ -5128,6 +5142,11 @@ function createVscodeLmStagedEditCollector(request) {
   let recoveryPath = "";
   let recoveryTarget = "";
   let recoveryEvidence = [];
+  // NF-2026-02288: stale-coordinate retries per path; never reset when the recovery switches
+  // paths, so alternating refusals stay bounded by the cap for each path.
+  const staleRetriesByPath = new Map();
+  const staleRetriesFor = filePath => staleRetriesByPath.get(filePath) ?? 0;
+  let recoveryRange = null;
   let recoveryReadsTotal = 0;
   const recoveryReads = new Map();
   const replacementLineCount = value => value === "" ? 0
@@ -5252,6 +5271,44 @@ function createVscodeLmStagedEditCollector(request) {
     reason: `semantic_edit_stage_rejected:${reason}`,
     ...requiredProgress(),
   });
+  // NF-2026-02288: the one corrective result every stale-coordinate refusal returns. It arms
+  // (or keeps) the fresh-read recovery of filePath and tells the model to re-prepare the exact
+  // refused range from a fresh read; the bounded retry count decides when a repeat stops
+  // re-grounding and starts spending forced-stage corrections.
+  const staleRecoveryResult = () => {
+    const range = recoveryRange
+      ? ` lines ${recoveryRange.start_line}-${recoveryRange.end_line} (old coordinates)` : "";
+    const retries = Math.min(staleRetriesFor(recoveryPath), VSCODE_LM_MAX_STALE_COORDINATE_RETRIES);
+    return { ...reject(`coordinates_shifted_requires_fresh_worker_pair:${recoveryPath}`),
+      corrective: true, stale_coordinate_retries: retries,
+      stale_coordinate_retry_limit: VSCODE_LM_MAX_STALE_COORDINATE_RETRIES,
+      ...(recoveryRange ? { reprepare_range: { ...recoveryRange } } : {}),
+      instruction: `Line numbers of ${recoveryPath} moved after an applied edit; earlier applied edits are kept. ` +
+        `Read a fresh bounded Source Graph body (mode body, target ${recoveryPath}) covering the range you meant${range}, ` +
+        `then re-prepare exactly that range with its CURRENT line numbers and expected_first_line/expected_last_line ` +
+        `anchors from that read (worker semantic-edit prepare, then apply the returned target_id, or stage it again). ` +
+        `Do not reuse launch coordinates. Stale-coordinate retries used: ${retries} of ` +
+        `${VSCODE_LM_MAX_STALE_COORDINATE_RETRIES}.` };
+  };
+  const staleCoordinatesRefusal = (filePath, input = null) => {
+    const retries = (staleRetriesByPath.get(filePath) ?? -1) + 1;
+    staleRetriesByPath.set(filePath, retries);
+    const samePath = recoveryPath === filePath;
+    recoveryPath = filePath;
+    recoveryTarget = "";
+    recoveryEvidence = [];
+    if (input && Number.isSafeInteger(input.start_line) && Number.isSafeInteger(input.end_line)) {
+      recoveryRange = { start_line: input.start_line, end_line: input.end_line };
+    } else if (!samePath || retries === 0) recoveryRange = null;
+    return staleRecoveryResult();
+  };
+  // A rejected recovery-tool call (for example a prepare before the fresh read) while the
+  // recovery is pending re-grounds within the same per-path bound; null once it is spent.
+  const regroundRecoveryCall = () => {
+    if (!recoveryPath || staleRetriesFor(recoveryPath) >= VSCODE_LM_MAX_STALE_COORDINATE_RETRIES) return null;
+    staleRetriesByPath.set(recoveryPath, staleRetriesFor(recoveryPath) + 1);
+    return staleRecoveryResult();
+  };
 
   const decimalProtocolLine = (value) => {
     if (typeof value === "boolean" || typeof value === "number") return value;
@@ -5334,11 +5391,7 @@ function createVscodeLmStagedEditCollector(request) {
       recoveryEvidence.some(row => row.source_hash === recoveryEntry.last_sha256 &&
         row.line_start <= input.start_line && row.line_end >= input.end_line);
     if (Number.isSafeInteger(shiftedFrom) && !(input.end_line < shiftedFrom) && !originalCoordinateBatch && !freshRecovery) {
-      recoveryPath = filePath;
-      recoveryTarget = "";
-      recoveryEvidence = [];
-      return { ...reject(`coordinates_shifted_requires_fresh_worker_pair:${filePath}`),
-        corrective: true, instruction: "Read a fresh bounded Source Graph body for this path, then call worker semantic-edit prepare/apply using its current coordinates. Do not reuse launch coordinates." };
+      return staleCoordinatesRefusal(filePath, input);
     }
     const unknown = unexpectedKeys("replace_range");
     if (unknown.length > 0) return reject(`stage_payload_extra_fields:${filePath}:${unknown.join(",")}`);
@@ -5374,11 +5427,7 @@ function createVscodeLmStagedEditCollector(request) {
         if (!originalCoordinateBatch && request.request_kind === "worker" &&
             exact.mcp_receipt && typeof authenticate === "function" &&
             input.preserve_trailing_newline !== false) {
-          recoveryPath = filePath;
-          recoveryTarget = "";
-          recoveryEvidence = [];
-          return { ...reject(`coordinates_shifted_requires_fresh_worker_pair:${filePath}`),
-            corrective: true, instruction: "Read a fresh bounded Source Graph body for this path, then call worker semantic-edit prepare/apply using its current coordinates. Do not reuse launch coordinates." };
+          return staleCoordinatesRefusal(filePath, input);
         }
         return reject(`range_conflict:${filePath}:${input.start_line}:${input.end_line}`);
       }
@@ -5526,11 +5575,7 @@ function createVscodeLmStagedEditCollector(request) {
     for (const edit of envelope.edits) {
       const filePath = vscodeLmNormalizedPath(edit.path);
       if (!edits.get(filePath)?.coordinatesShifted) continue;
-      recoveryPath = filePath;
-      recoveryTarget = "";
-      recoveryEvidence = [];
-      return { ...reject(`coordinates_shifted_requires_fresh_worker_pair:${filePath}`),
-        corrective: true, instruction: "Read a fresh bounded Source Graph body for this path, then call worker semantic-edit prepare/apply using its current coordinates. Do not reuse launch coordinates." };
+      return staleCoordinatesRefusal(filePath);
     }
     // Descending original coordinates keep earlier edits stable when line counts change.
     const ranges = envelope.edits.flatMap(edit => edit.ranges.map(range => ({ path: edit.path, range })))
@@ -5624,6 +5669,8 @@ function createVscodeLmStagedEditCollector(request) {
     recoveryToolNames,
     allowsRecoveryCall,
     noteRecoverySourceGraph,
+    regroundRecoveryCall,
+    staleCoordinateRetries: () => recoveryPath ? staleRetriesFor(recoveryPath) : 0,
     recoveryRequiredOutput: () => recoveryPath ? { path: recoveryPath, action: "replace_range", recovery: true } : null,
     hasChanges: () => edits.size > 0 || creates.size > 0,
     nextMissingRequired,
@@ -5665,18 +5712,34 @@ function vscodeLmShouldKeepStagedEdit(writableTask, stagedEdits) {
 // NF-2026-01605: a forced stage refused because the worker's own applied edit shifted
 // that file's lines is not a phase violation. The refusal arms a fresh-read recovery
 // (bounded by the unchanged forced-stage read cap), so it re-grounds instead of spending
-// a forced-stage correction -- once per armed recovery; a repeat while that recovery is
-// still pending counts as before.
+// a forced-stage correction. NF-2026-02288: a repeat while that recovery is still pending
+// re-grounds too while the path's retries stay below VSCODE_LM_MAX_STALE_COORDINATE_RETRIES
+// (counted per path, never reset by a path switch); only then does it spend forced-stage
+// corrections and fail closed as before.
 const VSCODE_LM_COORDINATES_SHIFTED_REFUSAL =
   "semantic_edit_stage_rejected:coordinates_shifted_requires_fresh_worker_pair:";
-function vscodeLmForcedStageRegrounds(toolName, result, stagedEdits, recoveryBefore) {
+const VSCODE_LM_MAX_STALE_COORDINATE_RETRIES = 3;
+function vscodeLmForcedStageRegrounds(toolName, result, stagedEdits) {
   if (toolName !== VSCODE_LM_STAGE_EDIT_TOOL || !result || result.ok !== false ||
       result.corrective !== true) return false;
   const reason = String(result.reason || "");
   if (!reason.startsWith(VSCODE_LM_COORDINATES_SHIFTED_REFUSAL)) return false;
   const recovery = vscodeLmPendingRecoveryOutput(stagedEdits);
   return Boolean(recovery) && recovery.path === reason.slice(VSCODE_LM_COORDINATES_SHIFTED_REFUSAL.length) &&
-    stagedEdits.recoveryToolNames().length > 0 && !(recoveryBefore && recoveryBefore.path === recovery.path);
+    stagedEdits.recoveryToolNames().length > 0 &&
+    stagedEdits.staleCoordinateRetries() < VSCODE_LM_MAX_STALE_COORDINATE_RETRIES;
+}
+
+// NF-2026-02288: during a pending recovery, forced staging refuses a recovery-tool call it
+// cannot authorize yet (a prepare before the fresh body read, a stale target). That refusal
+// re-grounds the model with a tool result naming the range to re-prepare, within the same
+// per-recovery retry bound; null means the bound is spent and the refusal counts as before.
+function vscodeLmRecoveryCallReground(stagedEdits, calls) {
+  if (!stagedEdits || typeof stagedEdits.regroundRecoveryCall !== "function" ||
+      !vscodeLmPendingRecoveryOutput(stagedEdits)) return null;
+  const names = stagedEdits.recoveryToolNames();
+  if (!names.length || !calls.length || !calls.every((call) => call && names.includes(call.name))) return null;
+  return stagedEdits.regroundRecoveryCall();
 }
 
 // Exact (non-glob) paths this request declared writable. During forced staging
@@ -6273,6 +6336,7 @@ async function raceVscodeLmCancellation(value, cancellationToken) {
 async function collectVscodeLmResponseText(response, onProviderPart = null, cancellationToken = null) {
   const textParts = [];
   const observations = { text: [], stream: [] };
+  const partCounts = { total: 0, data: 0 }; // NF-2026-02288: a data-only turn is no progress.
   // VS Code documents `response.text` as a filtered view of `response.stream`,
   // not an independent response channel.  Draining the filtered view first
   // can consume and discard non-text parts before diagnostics or a native
@@ -6286,6 +6350,8 @@ async function collectVscodeLmResponseText(response, onProviderPart = null, canc
       if (!step || step.done) break;
       const part = step.value;
       throwIfVscodeLmCancelled(cancellationToken);
+      partCounts.total += 1;
+      if (vscodeLmIsDataPart(part)) partCounts.data += 1;
       if (typeof onProviderPart === "function") {
         try { onProviderPart(part); } catch (_err) { /* liveness only */ }
       }
@@ -6318,6 +6384,7 @@ async function collectVscodeLmResponseText(response, onProviderPart = null, canc
       stream_channel_available: Boolean(streamChannel && typeof streamChannel[Symbol.asyncIterator] === "function"),
       text_parts: observations.text,
       stream_parts: observations.stream,
+      ...(partCounts.total > 0 && partCounts.data === partCounts.total ? { data_only: true } : {}),
     };
     throw error;
   }
@@ -7144,13 +7211,16 @@ async function runVscodeLmTextProtocol(
           : `The previous provider turn contained no text. Retry without prose and output only the next strict ` +
             `${VSCODE_LM_TOOL_REQUEST_SCHEMA} tool request or final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object.`,
       ));
+      // NF-2026-02288: a data-only turn is a no-progress turn for the progress watchdog
+      // (which bounds it), not a work turn and not a forced-stage violation.
+      const dataOnly = Boolean(err && err.responseDiagnostics && err.responseDiagnostics.data_only === true);
       protocolTrace.push({
         turn,
-        phase: forceFinal ? "final" : "work",
-        outcome: "empty",
+        phase: dataOnly ? "no_progress" : forceFinal ? "final" : "work",
+        outcome: dataOnly ? "data_only" : "empty",
         response: err && err.responseDiagnostics || {},
       });
-      if (forceStagedEdit) {
+      if (forceStagedEdit && !dataOnly) {
         vscodeLmNoteForcedStageFailure(
           stagedEditFailure,
           vscodeLmNextStageOutput(stagedEdits),
@@ -7442,6 +7512,18 @@ async function runVscodeLmTextProtocol(
       // an authority violation. Correct it once without invoking MCP; a repeated
       // request fails with one bounded structured error.
       if (forceStagedEdit) {
+        const regrounded = vscodeLmRecoveryCallReground(stagedEdits, [envelope]);
+        if (regrounded) {
+          protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "recovery_call_regrounded" });
+          messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+          messages.push(vscode.LanguageModelChatMessage.User(JSON.stringify({
+            schema_id: VSCODE_LM_TOOL_RESULT_SCHEMA,
+            name: envelope.name,
+            result: regrounded,
+            instruction: regrounded.instruction,
+          })));
+          continue;
+        }
         const nextMissing = vscodeLmNextStageOutput(stagedEdits);
         protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "non_stage_tool_rejected" });
         vscodeLmNoteForcedStageFailure(
@@ -7973,27 +8055,49 @@ async function runVscodeLmAgent(
         if (responseText) textParts.push(responseText);
       }
     }
+    // NF-2026-02288: refused recovery-tool calls of a turn are answered with the re-grounding
+    // result. A turn that also carries allowed calls (stage, fresh recovery read) still runs
+    // those through the normal loop below; only the refused calls are answered without MCP.
+    let regroundedCallIds = null;
+    let regroundedResult = null;
     if (forceStagedEdit && calls.some(call => call.name !== VSCODE_LM_STAGE_EDIT_TOOL &&
         !stagedEdits.allowsRecoveryCall(call))) {
-      const nextMissing = vscodeLmNextStageOutput(stagedEdits);
-      protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "non_stage_tool_rejected" });
-      vscodeLmNoteForcedStageFailure(
-        stagedEditFailure,
-        nextMissing,
-        protocolTrace,
-        lastProtocolPreview,
-      );
-      messages.push(vscode.LanguageModelChatMessage.Assistant(assistantParts));
-      messages.push(vscode.LanguageModelChatMessage.User(
-        calls.map((call) => languageModelToolResultPart(
-          call.callId,
-          vscodeLmForcedStageCorrection(nextMissing),
-        )),
-      ));
-      messages.push(vscode.LanguageModelChatMessage.User(
-        vscodeLmMissingRequiredStageInstruction(nextMissing, true),
-      ));
-      continue;
+      const refusedCalls = calls.filter((call) => call.name !== VSCODE_LM_STAGE_EDIT_TOOL &&
+        !stagedEdits.allowsRecoveryCall(call));
+      const regrounded = vscodeLmRecoveryCallReground(stagedEdits, refusedCalls);
+      if (regrounded && refusedCalls.length === calls.length) {
+        protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "recovery_call_regrounded" });
+        messages.push(vscode.LanguageModelChatMessage.Assistant(assistantParts));
+        messages.push(vscode.LanguageModelChatMessage.User(
+          calls.map((call) => languageModelToolResultPart(call.callId, regrounded)),
+        ));
+        continue;
+      }
+      if (regrounded) {
+        protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "recovery_call_regrounded" });
+        regroundedCallIds = new Set(refusedCalls.map((call) => call.callId));
+        regroundedResult = regrounded;
+      } else {
+        const nextMissing = vscodeLmNextStageOutput(stagedEdits);
+        protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "non_stage_tool_rejected" });
+        vscodeLmNoteForcedStageFailure(
+          stagedEditFailure,
+          nextMissing,
+          protocolTrace,
+          lastProtocolPreview,
+        );
+        messages.push(vscode.LanguageModelChatMessage.Assistant(assistantParts));
+        messages.push(vscode.LanguageModelChatMessage.User(
+          calls.map((call) => languageModelToolResultPart(
+            call.callId,
+            vscodeLmForcedStageCorrection(nextMissing),
+          )),
+        ));
+        messages.push(vscode.LanguageModelChatMessage.User(
+          vscodeLmMissingRequiredStageInstruction(nextMissing, true),
+        ));
+        continue;
+      }
     }
     if (calls.length === 0) {
       if (!sourceGraphAcknowledged) throw new Error("vscode_lm_source_graph_not_acknowledged");
@@ -8010,8 +8114,13 @@ async function runVscodeLmAgent(
         );
       }
       if (!text) {
-        protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: "empty" });
-        if (forceStagedEdit) {
+        // NF-2026-02288: a data-only turn is a no-progress turn for the progress watchdog
+        // (which bounds it), not a work turn and not a forced-stage violation.
+        const dataOnly = vscodeLmIsDataOnlyTurn(assistantParts);
+        protocolTrace.push(dataOnly
+          ? { turn, phase: "no_progress", outcome: "data_only" }
+          : { turn, phase: forceFinal ? "final" : "work", outcome: "empty" });
+        if (forceStagedEdit && !dataOnly) {
           vscodeLmNoteForcedStageFailure(
             stagedEditFailure,
             vscodeLmNextStageOutput(stagedEdits),
@@ -8254,6 +8363,11 @@ async function runVscodeLmAgent(
     const results = [];
     let submitIncompleteThisTurn = false;
     for (const call of calls) {
+      if (regroundedCallIds && regroundedCallIds.has(call.callId)) {
+        // NF-2026-02288: a refused recovery call of a mixed turn never reaches MCP.
+        results.push(languageModelToolResultPart(call.callId, regroundedResult));
+        continue;
+      }
       let result;
       let toolFailureReported = false;
       const toolStartedAt = Date.now();
@@ -15852,6 +15966,8 @@ module.exports = {
   __testInternals: {
     createVscodeLmActivityJournal, vscodeLmThinkingPartText, collectVscodeLmResponseText,
     vscodeLmRequiredCreateError, vscodeLmStagedOutputsReady,
+    vscodeLmIsDataOnlyTurn, vscodeLmForcedStageRegrounds, vscodeLmRecoveryCallReground,
+    VSCODE_LM_MAX_STALE_COORDINATE_RETRIES,
   vscodeLmActivityRedactText,
     vscodeLmActivityPreview,
     sanitizeLiveOutputPayload,
