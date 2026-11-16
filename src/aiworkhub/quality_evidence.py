@@ -1308,6 +1308,7 @@ def reviewer_report_could_not_inspect(
     report: Mapping[str, Any],
     *,
     disposed_finding_ids: frozenset[str] = frozenset(),
+    overlay_unreachable_reviewers: frozenset[str] = frozenset(),
 ) -> bool:
     """Detect a positive signal that a reviewer could not inspect its packet.
 
@@ -1325,8 +1326,18 @@ def reviewer_report_could_not_inspect(
     Missing telemetry is unknown, never blindness: a report with no ``usage``
     field keeps satisfying its lens. This function performs no I/O and never
     requires proof of inspection.
+
+    ``overlay_unreachable_reviewers`` (NF-2026-02308) are reviewer request ids
+    the HUB measured, from their own authenticated MCP audit ledger
+    (``reviewer_hub_inspection``), as never having read the candidate. A report
+    stamped by the caller with one of those ids is blind whatever it found.
+    Omitted, this is exactly the rule above.
     """
 
+    if overlay_unreachable_reviewers:
+        stamped = report.get("reviewer_request_id")
+        if isinstance(stamped, str) and stamped in overlay_unreachable_reviewers:
+            return True
     findings = report.get("findings")
     if isinstance(findings, list) and findings:
         all_process_limit = True
@@ -1361,6 +1372,7 @@ def blind_reviewer_lenses(
     reports: Iterable[Any],
     *,
     dismissed_by_finding: Mapping[str, str] | None = None,
+    overlay_unreachable_reviewers: frozenset[str] = frozenset(),
 ) -> set[str]:
     """The judgment lenses NOTHING inspected, from raw reviewer reports.
 
@@ -1434,7 +1446,11 @@ def blind_reviewer_lenses(
             )
         (
             blind
-            if reviewer_report_could_not_inspect(report, disposed_finding_ids=disposed)
+            if reviewer_report_could_not_inspect(
+                report,
+                disposed_finding_ids=disposed,
+                overlay_unreachable_reviewers=overlay_unreachable_reviewers,
+            )
             else sighted
         ).add(lens)
     return blind - sighted
@@ -1589,6 +1605,7 @@ def fold_quality_verdict(
     supplemental_rounds: Mapping[str, int] | None = None,
     finding_dispositions: Iterable[Mapping[str, Any]] | None = None,
     corrected_finding_ids: Iterable[str] = (),
+    overlay_unreachable_reviewers: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Purely fold mechanical and reviewer evidence into one final verdict.
 
@@ -1722,7 +1739,9 @@ def fold_quality_verdict(
     # the acceptance and the decision to buy a fresh reviewer cannot disagree
     # about which lens nothing inspected.
     blind_lenses: set[str] = blind_reviewer_lenses(
-        raw_reports, dismissed_by_finding=dismissed_by_finding
+        raw_reports,
+        dismissed_by_finding=dismissed_by_finding,
+        overlay_unreachable_reviewers=overlay_unreachable_reviewers,
     )
 
     reports_by_lens: dict[str, list[dict[str, Any]]] = {}
@@ -3520,6 +3539,7 @@ def run_completion_quality_gate(
     replay_binding: Mapping[str, Any] | None = None,
     finding_dispositions: Iterable[Mapping[str, Any]] | None = None,
     corrected_finding_ids: Iterable[str] = (),
+    overlay_unreachable_reviewers: frozenset[str] = frozenset(),
     baseline_root: Path | str | None = None,
 ) -> dict[str, Any]:
     """Execute the mandatory review-quality floor for one task delta.
@@ -3632,6 +3652,7 @@ def run_completion_quality_gate(
             supplemental_rounds=supplemental_rounds,
             finding_dispositions=finding_dispositions,
             corrected_finding_ids=corrected_finding_ids,
+            overlay_unreachable_reviewers=overlay_unreachable_reviewers,
         )
     except MalformedConfigError as exc:
         risk_profile = {}

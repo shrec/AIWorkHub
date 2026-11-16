@@ -30,6 +30,7 @@ from . import __version__
 from . import accept_failure_cause
 from . import manager_skill_tools
 from . import quality_evidence
+from . import reviewer_hub_inspection
 from .platform_io import lock_fd, process_is_alive, unlock_fd
 from .process_identity import (
     PidIdentityVerdict,
@@ -428,10 +429,11 @@ def reviewer_evidence(
             default=None,
         )
         running = live_by_task.get(row["task_id"])
+        chosen_request_id = str((chosen or {}).get("request_id") or "")
         resolved.append(
             {
                 **row,
-                "request_id": str((chosen or {}).get("request_id") or ""),
+                "request_id": chosen_request_id,
                 "state": str((chosen or {}).get("state") or ""),
                 "usable": bool(usable) and chosen is not None,
                 "attempt_count": len(candidates),
@@ -439,6 +441,18 @@ def reviewer_evidence(
                 "running_request_id": running[0] if running else "",
                 "state_unknown": False,
                 "state_unknown_cause": "",
+                # NF-2026-02308: present only when the reviewer's OWN
+                # authenticated MCP audit ledger proves it never read the
+                # candidate; never derived from its report.
+                **(
+                    {"overlay_unreachable": True}
+                    if usable
+                    and reviewer_hub_inspection.overlay_unreachable(
+                        lambda rid=chosen_request_id: self._request_events(rid),
+                        chosen_request_id,
+                    )
+                    else {}
+                ),
             }
         )
     return sorted(resolved, key=lambda entry: (entry["lens"], entry["task_id"]))
@@ -1688,15 +1702,16 @@ def _blind_reviewer_lenses(
     sealed by the server: nothing here re-verifies anything, and no report a
     model, worker or manager supplied can reach this function.
     """
+    # NF-2026-02308: the hub-measured set, stamped onto the reports by id, so the
+    # preview predicts the fold's refusal for a reviewer that never read the
+    # candidate exactly where the fold makes it.
+    reports, unreachable = reviewer_hub_inspection.blind_inputs(reviewers)
     return quality_evidence.blind_reviewer_lenses(
-        (
-            reviewer["receipt"].get("report")
-            for reviewer in reviewers
-            if isinstance(reviewer.get("receipt"), Mapping)
-        ),
+        reports,
         dismissed_by_finding=quality_evidence.dismissed_finding_receipts(
             finding_dispositions
         ),
+        **({"overlay_unreachable_reviewers": unreachable} if unreachable else {}),
     )
 
 
@@ -2869,6 +2884,7 @@ def _stale_inputs_touching_candidate(
 # list is exactly the drift it exists to catch.
 ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
     "accept_failure_cause",
+    "reviewer_hub_inspection",
     "accept_gate_blockers",
     "_accept_in_flight_marker",
     "_canonical_delta_hashes",
@@ -4377,6 +4393,7 @@ def accept_review(
             # The digest of each reviewer receipt verified in THIS accept, the
             # only value a stored finding disposition may be bound to.
             verified_receipt_sha256: dict[str, str] = {}
+            overlay_unreachable_ids: set[str] = set()
             for reviewer_request_id in reviewer_ids:
                 reviewer_events = self._request_events(reviewer_request_id)
                 if not reviewer_events:
@@ -4384,6 +4401,14 @@ def accept_review(
                         f"quality_reviewer_request_not_found:{reviewer_request_id}"
                     )
                 reviewer_latest = reviewer_events[-1]
+                # NF-2026-02308: measured from this reviewer request's own
+                # authenticated MCP audit ledger; accept and accept_preview
+                # read the same fact. Unknown is never blind.
+                reviewer_unreachable = reviewer_hub_inspection.overlay_unreachable(
+                    reviewer_events, reviewer_request_id
+                )
+                if reviewer_unreachable:
+                    overlay_unreachable_ids.add(reviewer_request_id)
                 reviewer_state = str(reviewer_latest.get("state") or "")
                 if reviewer_state == "accepted":
                     reviewer_task_id = str(reviewer_latest.get("task_id") or "")
@@ -4402,7 +4427,11 @@ def accept_review(
                         raise WorkspaceError(
                             f"quality_reviewer_accepted_invalid:{reviewer_request_id}:{exc}"
                         ) from exc
-                    verified_reviewer_reports.append(dict(receipt["report"]))
+                    verified_reviewer_reports.append(
+                        reviewer_hub_inspection.stamp_report(
+                            receipt["report"], reviewer_request_id, reviewer_unreachable
+                        )
+                    )
                     verified_receipt_sha256[reviewer_request_id] = _receipt_sha256(
                         receipt
                     )
@@ -4463,7 +4492,11 @@ def accept_review(
                     reviewer_workspace,
                     reviewer_request_id,
                 )
-                verified_reviewer_reports.append(dict(receipt["report"]))
+                verified_reviewer_reports.append(
+                    reviewer_hub_inspection.stamp_report(
+                        receipt["report"], reviewer_request_id, reviewer_unreachable
+                    )
+                )
                 verified_receipt_sha256[reviewer_request_id] = _receipt_sha256(receipt)
                 verified_reviewer_tasks.append(
                     (
@@ -4538,6 +4571,17 @@ def accept_review(
                 **(
                     {"corrected_finding_ids": reviewer_corrected_ids}
                     if reviewer_corrected_ids
+                    else {}
+                ),
+                # NF-2026-02308: reviewers the hub MEASURED as never having
+                # read the candidate are blind whatever they filed.
+                **(
+                    {
+                        "overlay_unreachable_reviewers": frozenset(
+                            overlay_unreachable_ids
+                        )
+                    }
+                    if overlay_unreachable_ids
                     else {}
                 ),
             )

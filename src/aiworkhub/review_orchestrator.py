@@ -24,6 +24,7 @@ from . import (
     quality_evidence,
     review_hedge,
     review_lifecycle,
+    reviewer_hub_inspection,
     reviewer_launch_refusal,
     runtime_adapters,
     sqlite_readonly,
@@ -1968,7 +1969,14 @@ def existing_lens_reviewer(
             # use, which is what keeps this single reuse decision -- the one the
             # launcher's reservation and the chain's adoption both read -- from
             # disagreeing with the gate that judges the result.
+            #
+            # NF-2026-02308: and a reviewer the HUB measured, from its own
+            # authenticated MCP audit ledger, as never having read the
+            # candidate is blind whatever its report says, so it is not reused.
             and not quality_evidence.reviewer_card_lens_verdict_is_blind(card, lens)
+            and not reviewer_hub_inspection.overlay_unreachable(
+                event, str(request_id)
+            )
         ):
             return {**found, "state": "sealed"}
         if live and running is None:

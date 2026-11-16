@@ -137,6 +137,13 @@ SERVER_NAME = "aiworkhub_worker_ai_tools"
 AUDIT_ENTRY_SCHEMA_ID = "aiworkhub.task_mcp.worker_mcp_audit_entry.v1"
 AUDIT_LEDGER_VERIFICATION_SCHEMA_ID = "aiworkhub.task_mcp.worker_mcp_audit_verification.v1"
 RUNTIME_SCHEMA_ID = "aiworkhub.task_mcp.worker_mcp_runtime.v1"
+# NF-2026-02308: the refusals a reviewer's source_graph call gets when the
+# candidate overlay cannot be read, and the modes that read candidate bytes.
+CANDIDATE_OVERLAY_UNAVAILABLE_VIOLATIONS = frozenset({
+    "candidate_overlay_unavailable",
+    "quality_review_candidate_source_graph_unavailable",
+})
+CANDIDATE_READ_MODES = frozenset({"body", "file", "diff", "bodygrep"})
 
 ENV_TASK_ID = "AIWORKHUB_WORKER_MCP_TASK_ID"
 ENV_RUNNER = "AIWORKHUB_WORKER_MCP_RUNNER"
@@ -2237,6 +2244,8 @@ def verify_audit_ledger(
         "failed_call_count_by_tool": {},
         "bounded_bytes_returned": 0,
         "bounded_bytes_by_tool": {},
+        "candidate_overlay_unavailable_calls": 0,
+        "candidate_overlay_read_successes": 0,
         "cache_hits": 0,
         "cache_hits_by_tool": {},
         "compact_replay": {
@@ -2697,6 +2706,24 @@ def verify_audit_ledger(
                 "exception": str(payload.get("exception") or "")[:64],
                 "reason": str(payload.get("reason") or "")[:200],
             })
+        # NF-2026-02308: hub-measured candidate-overlay reachability, counted
+        # only from authenticated rows (see ``reviewer_hub_inspection``).
+        if tool == "source_graph":
+            overlay_mode = payload.get("mode") if isinstance(payload, dict) else None
+            if (
+                not entry.get("ok")
+                and str(entry.get("violation") or "")
+                in CANDIDATE_OVERLAY_UNAVAILABLE_VIOLATIONS
+            ):
+                result["candidate_overlay_unavailable_calls"] += 1
+            elif (
+                entry.get("ok")
+                and not entry.get("violation")
+                and overlay_mode in CANDIDATE_READ_MODES
+                and authority_source
+                in {"candidate_overlay", SOURCE_GRAPH_DIFF_AUTHORITY_SOURCE}
+            ):
+                result["candidate_overlay_read_successes"] += 1
         authoritative_source_graph = (
             authority_source == "canonical"
             and authority_state in {"canonical_active", "sole_authority"}
