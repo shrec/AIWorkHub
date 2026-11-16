@@ -143,5 +143,5 @@ def test_a_route_whose_canonical_model_differs_is_still_refused(monkeypatch, rep
     result = _reroute(task_id, _ALIAS)
 
     assert result["ok"] is False
-    assert result["stderr"] == "reroute_target_rejected:implementation_worker_role_required"
+    assert result["stderr"].startswith("reroute_target_rejected:route_not_found:")
     assert _row(repo, task_id) == before

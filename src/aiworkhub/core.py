@@ -10492,6 +10492,7 @@ def reroute_launch_identity(
 
     if pristine_authorization:
         from . import workforce_catalog
+        from .reroute_route_match import match_reroute_route
 
         try:
             catalog = workforce_catalog.build_catalog(repo_root())
@@ -10499,17 +10500,16 @@ def reroute_launch_identity(
             return _lifecycle_error(
                 f"reroute_target_rejected:workforce_catalog_unreadable:{type(exc).__name__}"
             )
-        routes = [
-            route for route in catalog.get("workers", [])
-            if route.get("execution_runner") == to_runner
-            and route.get("effective_adapter_id") == to_adapter_id
-            and process_launcher._normalize_workforce_model(
-                str(route.get("model") or ""), to_adapter_id
-            ) == canonical_model
-        ]
-        if len(routes) != 1 or routes[0].get("implementation_worker") is not True:
-            return _lifecycle_error("reroute_target_rejected:implementation_worker_role_required")
-        if not all(routes[0].get(key) for key in ("enabled", "available", "launch_eligible")):
+        route, match_error = match_reroute_route(  # NF-2026-02303
+            catalog.get("workers", []), to_runner=to_runner, to_adapter_id=to_adapter_id,
+            canonical_model=canonical_model,
+            normalize_model=process_launcher._normalize_workforce_model,
+        )
+        if route is None:
+            return _lifecycle_error(match_error)
+        # The card stores the launchable identity, never the worker_id alias.
+        to_runner = str(route.get("execution_runner") or to_runner)
+        if not all(route.get(key) for key in ("enabled", "available", "launch_eligible")):
             return _lifecycle_error("reroute_target_rejected:workforce_route_unavailable")
 
     if to_runner == card_runner:
