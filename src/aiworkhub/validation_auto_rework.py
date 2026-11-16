@@ -196,6 +196,13 @@ def build_reason(packet: Mapping[str, Any], signature: str, auto_return: int) ->
     return validation_failed_packet._first_bytes("\n".join(lines), REASON_MAX_BYTES)
 
 
+# NF-2026-02306: a size-ratchet / line-cap failure needs scope the card lacks; hold for the manager.
+_SCOPE_CHANGE_MARKERS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"module_size_ratchet|size ratchet|ratchet_exceeded", re.IGNORECASE),
+    re.compile(r"line[ _]cap(?=[\s\S]*exceed)|exceed(?=[\s\S]*line[ _]cap)", re.IGNORECASE),
+)
+
+
 def _manager_record(cause: str, prior: int | None, signature: str = "") -> dict[str, Any]:
     # ``prior`` is None when the reject history could not be read: unknown is
     # recorded as unknown, never as zero auto-returns.
@@ -233,6 +240,12 @@ def _decide(
     if not failing:
         return _manager_record("no_failing_declared_command", prior)
     signature = failure_signature(packet)
+    if any(
+        marker.search(str(entry.get("tail") or ""))
+        for entry in failing
+        for marker in _SCOPE_CHANGE_MARKERS
+    ):
+        return _manager_record("scope_change_needed", prior, signature)
     predecessor = card.get("rework_predecessor")
     if isinstance(predecessor, dict):
         predecessor_hashes = predecessor.get("changed_path_hashes")
