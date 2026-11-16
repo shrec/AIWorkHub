@@ -211,10 +211,36 @@ def _quiet_incumbent(manager, incumbent, adapter_id="deepseek_vscode_lm") -> Non
     )
 
 
+def _lens_launches(manager) -> list[dict]:
+    """Launches of the lens under test. Other required lenses run in parallel."""
+    return [call for call in manager.launches if call["lens"] == LENS]
+
+
+def _drain_until_cancelled(driver, manager) -> None:
+    """Drain in bounded passes until the race names a loser to cancel.
+
+    Parallel per-phase contract: a pass's action bound can be spent on another
+    required lens first, so one pass may not reach this lens's race.
+    """
+    # Each pass takes up to the drain's own bound: the other required lenses'
+    # rows sit ahead of this lens's arbitration in the reservation order.
+    for _ in range(3):
+        driver.drain(max_actions=12, now=NOW)
+        if manager.cancels:
+            return
+    raise AssertionError("race was not decided within the bounded passes")
+
+
 def _hedged(tmp_path: Path):
     manager, driver, chain, incumbent = _incumbent_running(tmp_path)
     _quiet_incumbent(manager, incumbent)
-    assert driver.drain(max_actions=1, now=NOW).completed == 0
+    # Parallel per-phase contract: a drain's action bound can be spent on another
+    # required lens before this lens's row is reserved again, so drain bounded
+    # passes until the lens has its hedge.
+    for _ in range(4):
+        driver.drain(max_actions=1, now=NOW)
+        if len(driver._route_attempts(chain.chain_id, LENS)) == 2:
+            break
     attempts = driver._route_attempts(chain.chain_id, LENS)
     assert len(attempts) == 2
     return manager, driver, chain, attempts[0], attempts[1]
@@ -236,8 +262,8 @@ def _events(driver, chain) -> list[str]:
 def test_quiet_incumbent_gets_exactly_one_hedge_on_a_distinct_route(tmp_path: Path) -> None:
     manager, driver, chain, incumbent, hedge = _hedged(tmp_path)
 
-    assert len(manager.launches) == 2
-    first, second = manager.launches
+    assert len(_lens_launches(manager)) == 2
+    first, second = _lens_launches(manager)
     assert second["hedge_incumbent_request_id"] == incumbent["reviewer_request_id"]
     assert "hedge_incumbent_request_id" not in first
     for key in ("lens", "target_request_id", "target_task_id", "target_claim_epoch"):
@@ -263,8 +289,8 @@ def test_quiet_incumbent_gets_exactly_one_hedge_on_a_distinct_route(tmp_path: Pa
         "vscode_lm", runtime=QUIET + 60.0,
     )
     for _ in range(3):
-        assert driver.drain(max_actions=1, now=NOW).completed == 0
-    assert len(manager.launches) == 2
+        driver.drain(max_actions=1, now=NOW)
+    assert len(_lens_launches(manager)) == 2
     assert len(driver._route_attempts(chain.chain_id, LENS)) == 2
     assert manager.cancels == []
 
@@ -284,7 +310,7 @@ def test_hedge_submits_first_cancels_incumbent_and_reads_hedge(tmp_path: Path) -
     manager, driver, chain, incumbent, hedge = _hedged(tmp_path)
     manager.status_results[hedge["reviewer_request_id"]] = _sealed(hedge)
 
-    assert driver.drain(max_actions=1, now=NOW).completed == 1
+    _drain_until_cancelled(driver, manager)
 
     assert manager.cancels == [
         (incumbent["reviewer_request_id"], review_hedge.LOSER_RETIREMENT)
@@ -318,7 +344,7 @@ def test_incumbent_submits_first_cancels_hedge(tmp_path: Path) -> None:
     )
     manager.status_results[incumbent["reviewer_request_id"]] = _sealed(incumbent)
 
-    assert driver.drain(max_actions=1, now=NOW).completed == 1
+    _drain_until_cancelled(driver, manager)
 
     assert manager.cancels == [
         (hedge["reviewer_request_id"], review_hedge.LOSER_RETIREMENT)
@@ -348,9 +374,9 @@ def test_no_distinct_route_records_skip_and_leaves_incumbent(tmp_path: Path) -> 
     _quiet_incumbent(manager, incumbent)
 
     for _ in range(2):
-        assert driver.drain(max_actions=1, now=NOW).completed == 0
+        driver.drain(max_actions=1, now=NOW)
 
-    assert len(manager.launches) == 1
+    assert len(_lens_launches(manager)) == 1
     assert manager.cancels == []
     attempts = driver._route_attempts(chain.chain_id, LENS)
     assert len(attempts) == 1 and attempts[0]["state"] == "launched"
@@ -414,8 +440,10 @@ def test_hedge_is_the_one_distinct_route_retry(tmp_path: Path) -> None:
         }
 
     for _ in range(3):
-        assert driver.drain(max_actions=1, now=NOW).completed == 0
-        assert len(manager.launches) == 2
+        # Parallel per-phase contract: other required lenses may complete in
+        # the same pass; the assertions below are scoped to this lens.
+        driver.drain(max_actions=12, now=NOW)
+        assert len(_lens_launches(manager)) == 2
         assert len(driver._route_attempts(chain.chain_id, LENS)) == 2
     record = review_hedge.hedge_record(driver.db_path, chain.chain_id, LENS)
     assert record["state"] == review_hedge.HEDGE_STATE_DECIDED

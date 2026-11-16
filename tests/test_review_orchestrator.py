@@ -113,6 +113,57 @@ def _target_status(*, state: str = "review_ready", **card_overrides: object) -> 
     return {"ok": True, "state": state, "task_card": card}
 
 
+# Parallel per-phase contract (NF-2026-02292, commit 85576d4b): the required
+# reviewer lenses of one chain run in parallel. A lens row gates only on the
+# earlier rows of its OWN phase, so one drain may attempt several lenses, while
+# the target and needfix rows still wait for every earlier row. These helpers
+# let a test about ONE lens's hold/relaunch logic assert per lens instead of
+# assuming the sequential order the lenses used to run in.
+ONE_LENS = ("correctness",)
+
+
+def _lens_plan(lenses: tuple[str, ...] | None) -> dict:
+    """``ensure_chain`` keywords that restrict a chain to ``lenses`` (or none)."""
+    if lenses is None:
+        return {}
+    return {"required_reviewer_lenses": list(lenses), "effective_tier": "medium"}
+
+
+def _one_lens_plan() -> dict:
+    return _lens_plan(ONE_LENS)
+
+
+def _reserved_phase(db_path: Path) -> str:
+    """Phase of the row the durable reservation cursor last selected, or ``""``."""
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT o.phase FROM review_action_outbox AS o "
+            "JOIN review_reservation_state AS s ON s.last_pending_action_id=o.action_id "
+            "WHERE s.id=1"
+        ).fetchone()
+    finally:
+        conn.close()
+    return str(row[0]) if row else ""
+
+
+def _drain_lens(driver, lens: str, *, now: datetime = NOW, bound: int = 24):
+    """Drain one action at a time until ``lens``'s own row was the one attempted.
+
+    Under the parallel per-phase contract a one-action drain may be spent on a
+    sibling lens's row (its launch, or its obsolete retirement) before the
+    deferred row of ``lens`` comes round again. The reservation cursor names the
+    row each drain selected, so this returns the ``DrainResult`` of the pass that
+    attempted a ``lens`` row -- the result a single-lens chain used to give
+    directly. It never skips an assertion: no pass reaching the lens fails.
+    """
+    for _ in range(bound):
+        result = driver.drain(max_actions=1, now=now)
+        if result.attempted and _reserved_phase(driver.db_path) == lens:
+            return result
+    raise AssertionError(f"no drain pass attempted a {lens} action within {bound} passes")
+
+
 def test_driver_launches_one_action_and_persists_exact_identity(tmp_path: Path) -> None:
     manager = _Manager(tmp_path)
     driver = review_orchestrator.ReviewOrchestrator(
@@ -150,15 +201,23 @@ def test_launch_waits_until_target_is_ready_then_launches_once(tmp_path: Path) -
 
     deferred = driver.drain(max_actions=2, now=NOW)
 
-    assert deferred.attempted == 1
-    assert deferred.pending == 1
+    # Parallel per-phase contract: the correctness and security launch rows are
+    # both reserved in one drain (each lens gates only on its own phase), and
+    # both defer while the target is still processing.
+    assert deferred.attempted == 2
+    assert deferred.pending == 2
     assert manager.launches == []
     assert manager.events[-1]["review_automation"]["reason"] == "target_not_review_ready"
     manager.target_status = _target_status()
-    launched = driver.drain(max_actions=2, now=NOW)
+    # The reservation cursor now sits after the security launch row, so a
+    # two-action pass reaches the third lens first. Drain bounded passes: every
+    # required lens launches, and each launches exactly once.
+    for _ in range(3):
+        driver.drain(max_actions=12, now=NOW)
 
-    assert launched.completed == 1
-    assert len(manager.launches) == 1
+    assert sorted(call["lens"] for call in manager.launches) == [
+        "code_quality", "correctness", "security",
+    ]
 
 
 def test_round_rollover_duplicate_does_not_starve_later_chain(
@@ -203,12 +262,17 @@ def test_round_rollover_duplicate_does_not_starve_later_chain(
         packet_sha256="a" * 64, candidate_sha256="c" * 64, now=NOW,
     )
 
-    result = driver.drain(max_actions=3, now=NOW)
+    # Parallel per-phase contract: the waiting chain's three lens launch rows
+    # each defer (every lens gates only on its own phase), the round-rollover
+    # duplicate is released without counting as an attempt, and the next ready
+    # chain is still reached inside the bound.
+    result = driver.drain(max_actions=5, now=NOW)
 
-    assert result.attempted == 2
-    assert result.pending == 1
+    assert result.attempted == 4
+    assert result.pending == 3
     assert result.completed == 1
     assert len(manager.launches) == 1
+    assert manager.launches[0]["target_task_id"] == "READY"
 
 
 def test_production_multichain_rollover_releases_duplicate_and_continues(
@@ -394,6 +458,7 @@ def test_terminal_reviewer_before_restart_launches_distinct_successor_and_conver
     chain = seed.ensure_chain(
         target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
         packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+        **_one_lens_plan(),
     )
     first_task = seed._reviewer_task_id(chain.chain_identity, "correctness")
     seed.route_selector = _two_route_selector(first_task)
@@ -423,9 +488,13 @@ def test_terminal_reviewer_before_restart_launches_distinct_successor_and_conver
         provider=SUCCESSOR_ROUTE["adapter_id"],
         route=SUCCESSOR_ROUTE,
     )
-    converged = review_orchestrator.ReviewOrchestrator(
-        manager, db_path=db_path, route_selector=_two_route_selector(first_task)
-    ).drain(max_actions=1, now=NOW)
+    # Parallel per-phase contract: steer the pass to THIS lens's accept row.
+    converged = _drain_lens(
+        review_orchestrator.ReviewOrchestrator(
+            manager, db_path=db_path, route_selector=_two_route_selector(first_task)
+        ),
+        "correctness",
+    )
 
     assert converged.completed == 1
     assert len(manager.provider_launches) == 2
@@ -445,6 +514,7 @@ def test_launch_ack_before_attempt_request_persistence_reconciles_without_duplic
     chain = driver.ensure_chain(
         target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
         packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+        **_one_lens_plan(),
     )
     first_task = driver._reviewer_task_id(chain.chain_identity, "correctness")
     driver.route_selector = _two_route_selector(first_task)
@@ -471,7 +541,8 @@ def test_launch_ack_before_attempt_request_persistence_reconciles_without_duplic
     restarted = review_orchestrator.ReviewOrchestrator(
         manager, db_path=db_path, route_selector=_two_route_selector(first_task)
     )
-    assert restarted.drain(max_actions=1, now=NOW).pending == 1
+    # Parallel per-phase contract: steer the pass to THIS lens's row.
+    assert _drain_lens(restarted, "correctness").pending == 1
     assert len(manager.provider_launches) == 2, "same task must bind the prior provider"
     recovered = restarted._route_attempts(chain.chain_id, "correctness")[-1]
     assert recovered["state"] == "launched"
@@ -482,8 +553,14 @@ def test_launch_ack_before_attempt_request_persistence_reconciles_without_duplic
 
 def _seed_terminal_launch(
     tmp_path: Path, name: str, terminal: dict,
+    *, lenses: tuple[str, ...] | None = None,
 ) -> tuple[_FailoverManager, Path, object, str, review_orchestrator.ReviewOrchestrator]:
-    """One chain whose first reviewer launch returns ``terminal`` synchronously."""
+    """One chain whose first reviewer launch returns ``terminal`` synchronously.
+
+    ``lenses`` restricts the chain's required reviewer lenses, so a test about one
+    lens's hold or relaunch logic is not also driving the sibling lenses' rows
+    (parallel per-phase contract: each lens's rows gate only on its own phase).
+    """
     manager = _FailoverManager(tmp_path)
     db_path = tmp_path / f"typed-{name}.sqlite"
     seed = review_orchestrator.ReviewOrchestrator(
@@ -492,6 +569,7 @@ def _seed_terminal_launch(
     chain = seed.ensure_chain(
         target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
         packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+        **_lens_plan(lenses),
     )
     first_task = seed._reviewer_task_id(chain.chain_identity, "correctness")
     seed.route_selector = _two_route_selector(first_task)
@@ -601,7 +679,7 @@ def test_terminal_receipt_without_a_route_cause_holds_instead_of_relaunching(
     tmp_path: Path, name: str, terminal: dict, action: str,
 ) -> None:
     manager, _db_path, chain, _first_task, seed = _seed_terminal_launch(
-        tmp_path, name, terminal,
+        tmp_path, name, terminal, lenses=ONE_LENS,
     )
 
     launched = seed.drain(max_actions=1, now=NOW)
@@ -620,7 +698,9 @@ def test_terminal_receipt_without_a_route_cause_holds_instead_of_relaunching(
     # And the hold is DURABLE: a later reconcile pass, and a restarted driver,
     # both refuse to plan a fresh route rather than spending the launch a pass
     # later. That is the difference between a hold and a delay.
-    assert seed.drain(max_actions=1, now=NOW).completed == 0
+    # Parallel per-phase contract: other lenses' rows are attempted in the
+    # passes in between, so steer the pass to THIS lens's held launch row.
+    assert _drain_lens(seed, "correctness").completed == 0
     assert len(seed._route_attempts(chain.chain_id, "correctness")) == 1
     assert len(manager.provider_launches) == 0
 
@@ -648,6 +728,7 @@ def test_manager_hold_decision_binds_exact_candidate_and_authorizes_one_successo
     manager, db_path, chain, first_task, driver = _seed_terminal_launch(
         tmp_path, "manager-resolution",
         {"state": "launch_failed", "error_code": "runtime_error"},
+        lenses=ONE_LENS,
     )
     assert driver.drain(max_actions=1, now=NOW).pending == 1
     attempt = driver._route_attempts(chain.chain_id, "correctness")[-1]
@@ -663,7 +744,8 @@ def test_manager_hold_decision_binds_exact_candidate_and_authorizes_one_successo
     assert authorized["reviewer_task_id"] == first_task
     assert len(manager.provider_launches) == 0
 
-    assert driver.drain(max_actions=1, now=NOW).completed == 1
+    # Parallel per-phase contract: steer the pass to THIS lens's held launch row.
+    assert _drain_lens(driver, "correctness").completed == 1
     attempts = driver._route_attempts(chain.chain_id, "correctness")
     assert len(attempts) == 2
     assert attempts[-1]["state"] == "launched"
@@ -700,6 +782,7 @@ def test_manager_rearms_exact_credential_held_attempt_two_without_attempt_three(
     manager, _db_path, chain, first_task, driver = _seed_terminal_launch(
         tmp_path, "credential-attempt-two",
         {"state": "launch_failed", "error_code": "provider_unavailable"},
+        lenses=ONE_LENS,
     )
     assert driver.drain(max_actions=1, now=NOW).completed == 1
     successor = driver._route_attempts(chain.chain_id, "correctness")[-1]
@@ -717,7 +800,7 @@ def test_manager_rearms_exact_credential_held_attempt_two_without_attempt_three(
             "worker_status": "launch_failed",
         },
     }
-    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    assert _drain_lens(driver, "correctness").pending == 1
     held = driver._route_attempts(chain.chain_id, "correctness")[-1]
     assert int(held["attempt_index"]) == 2
     assert review_orchestrator.route_attempt_hold(held["failure_reason"]) == "credential_hold"
@@ -746,7 +829,7 @@ def test_manager_rearms_exact_credential_held_attempt_two_without_attempt_three(
 
     manager.requests_by_task.pop(successor_task)
     manager.requests_by_task["already-used-request-slot"] = successor_request
-    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    assert _drain_lens(driver, "correctness").pending == 1
     relaunched = driver._route_attempts(chain.chain_id, "correctness")
     assert len(relaunched) == 2, "manager recovery must never create attempt three"
     assert relaunched[-1]["state"] == "launched"
@@ -766,6 +849,7 @@ def test_pre_provider_auth_hold_rearms_exact_attempt_two_without_attempt_three(
     chain = driver.ensure_chain(
         target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
         packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+        **_one_lens_plan(),
     )
     first_task = driver._reviewer_task_id(chain.chain_identity, "correctness")
     second_task = driver._reviewer_task_id(
@@ -800,7 +884,7 @@ def test_pre_provider_auth_hold_rearms_exact_attempt_two_without_attempt_three(
 
     # The hold survives later passes without consuming another route or silently
     # retrying stale credentials.
-    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    assert _drain_lens(driver, "correctness").pending == 1
     assert len(driver._route_attempts(chain.chain_id, "correctness")) == 2
     assert len(manager.launches) == 2
     assert len(manager.provider_launches) == 1
@@ -823,7 +907,7 @@ def test_pre_provider_auth_hold_rearms_exact_attempt_two_without_attempt_three(
     assert rearmed[-1]["reviewer_task_id"] == second_task
     assert {key: rearmed[-1][key] for key in SUCCESSOR_ROUTE} == SUCCESSOR_ROUTE
 
-    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    assert _drain_lens(driver, "correctness").pending == 1
     launched = driver._route_attempts(chain.chain_id, "correctness")
     assert len(launched) == 2
     assert launched[-1]["state"] == "launched"
@@ -835,7 +919,7 @@ def test_pre_provider_auth_hold_rearms_exact_attempt_two_without_attempt_three(
         **_terminal_status(second_request, second_task),
         **SUCCESSOR_ROUTE,
     }
-    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    assert _drain_lens(driver, "correctness").pending == 1
     assert len(driver._route_attempts(chain.chain_id, "correctness")) == 2
     assert len(manager.provider_launches) == 2
     assert manager.accepts == []
@@ -852,6 +936,7 @@ def test_manager_callback_reconcile_requires_exact_ready_evidence(
     chain = driver.ensure_chain(
         target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
         packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+        **_one_lens_plan(),
     )
     assert driver.drain(max_actions=1, now=NOW).completed == 1
     attempt = driver._route_attempts(chain.chain_id, "correctness")[-1]
@@ -862,7 +947,7 @@ def test_manager_callback_reconcile_requires_exact_ready_evidence(
         "state": "finalize_failed", **FIRST_ROUTE,
         "task_card": {"terminal_substatus": "finalize_failed"},
     }
-    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    assert _drain_lens(driver, "correctness").pending == 1
     held = driver._route_attempts(chain.chain_id, "correctness")[-1]
     args = _hold_resolution_args(chain, held, decision="callback_reconcile")
     refused = driver.resolve_manager_hold(**args)
@@ -877,7 +962,7 @@ def test_manager_callback_reconcile_requires_exact_ready_evidence(
     recovered = driver.resolve_manager_hold(**args)
     assert recovered["ok"] is True
     assert driver._route_attempts(chain.chain_id, "correctness")[-1]["state"] == "launched"
-    assert driver.drain(max_actions=1, now=NOW).completed == 1
+    assert _drain_lens(driver, "correctness").completed == 1
     assert manager.accepts == [(request_id, reviewer_task)]
 
 
@@ -892,6 +977,7 @@ def test_capacity_is_never_a_credential_hold_and_keeps_a_distinct_route(
     manager, _db_path, chain, first_task, seed = _seed_terminal_launch(
         tmp_path, "capacity",
         {"state": "launch_failed", "error_code": "quota_exhausted"},
+        lenses=ONE_LENS,
     )
 
     assert seed.drain(max_actions=1, now=NOW).completed == 0
@@ -910,8 +996,9 @@ def test_capacity_is_never_a_credential_hold_and_keeps_a_distinct_route(
     assert dispatch["disposition"]["failure_class"] != "credential"
     assert dispatch["telemetry"]["avoided_provider_launches"] == 1
 
-    # A later pass may take a DISTINCT route, and does.
-    later = seed.drain(max_actions=1, now=NOW)
+    # A later pass may take a DISTINCT route, and does. Parallel per-phase
+    # contract: steer the pass to THIS lens's row.
+    later = _drain_lens(seed, "correctness")
     assert later.completed == 1
     successor = seed._route_attempts(chain.chain_id, "correctness")[-1]
     assert successor["reviewer_task_id"] != first_task
@@ -1000,6 +1087,7 @@ def test_sequential_mid_run_reviewer_deaths_stop_after_one_distinct_route_retry(
     chain = driver.ensure_chain(
         target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
         packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+        **_one_lens_plan(),
     )
     assert driver.drain(max_actions=1, now=NOW).completed == 1
     assert len(manager.provider_launches) == 1
@@ -1028,7 +1116,9 @@ def test_sequential_mid_run_reviewer_deaths_stop_after_one_distinct_route_retry(
     # First mid-run death spends the ONE distinct-route retry the typed
     # disposition allows.
     kill_running_attempt()
-    assert driver.drain(max_actions=1, now=NOW).completed == 0
+    # Parallel per-phase contract: steer each pass to THIS lens's row; the
+    # sibling lenses' rows are attempted in the passes in between.
+    assert _drain_lens(driver, "correctness").completed == 0
     assert len(manager.provider_launches) == 2
     attempts = driver._route_attempts(chain.chain_id, "correctness")
     assert len(attempts) == 2
@@ -1040,7 +1130,7 @@ def test_sequential_mid_run_reviewer_deaths_stop_after_one_distinct_route_retry(
     # must hold on the durable retirement -- no third reviewer, ever.
     kill_running_attempt()
     for _ in range(3):
-        assert driver.drain(max_actions=1, now=NOW).completed == 0
+        assert _drain_lens(driver, "correctness").completed == 0
         assert len(manager.provider_launches) == 2
         held = driver._route_attempts(chain.chain_id, "correctness")
         assert len(held) == 2
@@ -1051,7 +1141,7 @@ def test_sequential_mid_run_reviewer_deaths_stop_after_one_distinct_route_retry(
     restarted = review_orchestrator.ReviewOrchestrator(
         manager, db_path=db_path, route_selector=_unlimited_route_selector()
     )
-    assert restarted.drain(max_actions=1, now=NOW).completed == 0
+    assert _drain_lens(restarted, "correctness").completed == 0
     assert len(manager.provider_launches) == 2
     assert len(restarted._route_attempts(chain.chain_id, "correctness")) == 2
 
@@ -2737,7 +2827,10 @@ class _RejectingManager(_Manager):
         }
 
 
-def _drive_rejecting(tmp_path: Path, db: str, manager, monkeypatch, **card_overrides):
+def _drive_rejecting(
+    tmp_path: Path, db: str, manager, monkeypatch, *,
+    plan: dict | None = None, **card_overrides,
+):
     """Drive one mechanically failing chain against a live-ish card reader."""
     monkeypatch.setattr(
         review_orchestrator.task_engine,
@@ -2757,6 +2850,7 @@ def _drive_rejecting(tmp_path: Path, db: str, manager, monkeypatch, **card_overr
     driver.ensure_chain(
         target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
         packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+        **(plan or {}),
     )
     return driver
 
@@ -2948,7 +3042,9 @@ def test_returning_a_target_to_pending_does_not_retire_the_rest_of_its_chain(
     """
     assert "pending" in review_orchestrator.REVIEWABLE_TARGET_STATUSES
     manager = _RejectingManager(tmp_path)
-    driver = _drive_rejecting(tmp_path, "chain.sqlite", manager, monkeypatch)
+    driver = _drive_rejecting(
+        tmp_path, "chain.sqlite", manager, monkeypatch, plan=_one_lens_plan(),
+    )
 
     first = driver.drain(max_actions=12, now=NOW)
 
@@ -2960,7 +3056,28 @@ def test_returning_a_target_to_pending_does_not_retire_the_rest_of_its_chain(
     rows = review_lifecycle.rows_for_test(tmp_path / "chain.sqlite")
     assert [row["state"] for row in rows] == ["failed"] + ["pending"] * 11
 
-    # And the chain is genuinely parked: a second pass reserves nothing.
+    # Parallel per-phase contract: the failed lens row retires only its own
+    # phase's later rows and the target/needfix rows; the other lenses' rows
+    # gate on nothing here, so the next pass attempts them. This chain's plan
+    # requires only correctness, so those rows retire as obsolete without a
+    # reviewer and without a second rejection of the card.
+    second = driver.drain(max_actions=12, now=NOW)
+
+    assert second.failed == 0
+    assert second.attempted == second.completed > 0
+    assert len(manager.rejects) == 1, "one rejection, never a retry storm"
+    assert manager.launches == []
+    after = {
+        int(row["action_index"]): row["state"]
+        for row in review_lifecycle.rows_for_test(tmp_path / "chain.sqlite")
+    }
+    assert after[0] == "failed"
+    assert {after[index] for index in (1, 2, 9, 10, 11)} == {"retired"}, (
+        "the rest of the failed lens and the target rows are never carried on"
+    )
+    assert {after[index] for index in range(3, 9)} == {"completed"}
+
+    # Nothing is left to reserve: the chain stays at its failed row.
     assert driver.drain(max_actions=12, now=NOW).attempted == 0
 
 
@@ -3749,6 +3866,7 @@ def _nf888_chain(
     chain = driver.ensure_chain(
         target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
         packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+        **_one_lens_plan(),
     )
     return manager, driver, chain
 
@@ -3794,7 +3912,8 @@ def test_nf888_a_retired_attempt_on_accept_reaches_its_distinct_successor(
         manager, driver, chain, state="launch_failed", error_code="quota_exhausted",
     )
     # Capacity spends nothing NOW: retired, and no second provider this pass.
-    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    # Parallel per-phase contract: each pass is steered to THIS lens's row.
+    assert _drain_lens(driver, "correctness").pending == 1
     attempts = driver._route_attempts(chain.chain_id, "correctness")
     assert len(attempts) == 1
     assert attempts[0]["state"] == "retired"
@@ -3802,7 +3921,7 @@ def test_nf888_a_retired_attempt_on_accept_reaches_its_distinct_successor(
     assert len(manager.provider_launches) == 1
 
     # THE DEFECT, pinned: a later pass takes the distinct eligible route.
-    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    assert _drain_lens(driver, "correctness").pending == 1
     attempts = driver._route_attempts(chain.chain_id, "correctness")
     assert len(attempts) == 2
     assert attempts[1]["state"] == "launched"
@@ -3817,7 +3936,7 @@ def test_nf888_a_retired_attempt_on_accept_reaches_its_distinct_successor(
         route={key: str(attempts[1][key]) for key in ROUTE},
     )
 
-    converged = driver.drain(max_actions=1, now=NOW)
+    converged = _drain_lens(driver, "correctness")
 
     assert converged.completed == 1
     assert manager.accepts == [
@@ -3865,7 +3984,8 @@ def test_nf888_a_launched_attempt_whose_process_died_is_reconciled_not_relaunche
     assert str(stale["reviewer_request_id"])
     _nf888_kill(manager, driver, chain, state=state, error_code=error_code)
 
-    driver.drain(max_actions=1, now=NOW)
+    # Parallel per-phase contract: reach THIS lens's launch row, not a sibling's.
+    _drain_lens(driver, "correctness")
 
     attempts = driver._route_attempts(chain.chain_id, "correctness")
     assert attempts[0]["state"] == "retired"
@@ -3923,6 +4043,7 @@ def _nf888_alias_chain(tmp_path: Path, name: str):
     chain = driver.ensure_chain(
         target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
         packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+        **_one_lens_plan(),
     )
     return manager, driver, chain
 
@@ -4005,7 +4126,8 @@ def test_nf888_a_planned_model_alias_and_its_launched_canonical_name_are_one_rou
     reported = manager.status_results[str(killed["reviewer_request_id"])]
     assert reported["model"] == "claude-opus-5"
 
-    result = driver.drain(max_actions=1, now=NOW)
+    # Parallel per-phase contract: reach THIS lens's launch row, not a sibling's.
+    result = _drain_lens(driver, "correctness")
 
     # THE DEFECT: reviewer_terminal_route_binding_invalid, every pass.
     assert result.failed == 0
@@ -4057,9 +4179,12 @@ def test_nf888_historical_binding_failure_recovers_after_alias_fix(
         now=NOW,
     )
     review_lifecycle.reconcile_dead_chains(driver.db_path, now=NOW)
-    assert review_lifecycle.lifecycle_counts(driver.db_path)["retired"] == 10
+    # Parallel per-phase contract: a failed lens row retires only its own
+    # phase's later row (archive) and the target/needfix rows (3), never a
+    # sibling lens's rows.
+    assert review_lifecycle.lifecycle_counts(driver.db_path)["retired"] == 4
 
-    result = driver.drain(max_actions=1, now=NOW)
+    result = _drain_lens(driver, "correctness")
 
     assert result.failed == 0
     assert result.pending == 1
@@ -4104,7 +4229,8 @@ def test_nf888_a_terminal_status_naming_another_process_is_still_foreign(
         manager.status_results[request_id], killed
     )
 
-    result = driver.drain(max_actions=1, now=NOW)
+    # Parallel per-phase contract: reach THIS lens's launch row, not a sibling's.
+    result = _drain_lens(driver, "correctness")
 
     assert result.failed == 1
     attempts = driver._route_attempts(chain.chain_id, "correctness")
@@ -4130,21 +4256,21 @@ def test_nf888_a_spent_retry_ceiling_waits_on_a_named_reason(
         manager, driver, chain,
         state="worker_failed", error_code="provider_unavailable",
     )
-    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    assert _drain_lens(driver, "correctness").pending == 1
     assert len(manager.provider_launches) == 2, "the one retry, spent"
 
     _nf888_kill(
         manager, driver, chain,
         state="worker_failed", error_code="provider_unavailable",
     )
-    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    assert _drain_lens(driver, "correctness").pending == 1
     assert [
         row["state"]
         for row in driver._route_attempts(chain.chain_id, "correctness")
     ] == ["retired", "retired"]
 
     for _ in range(3):
-        assert driver.drain(max_actions=1, now=NOW).pending == 1
+        assert _drain_lens(driver, "correctness").pending == 1
         assert len(manager.provider_launches) == 2
         assert len(driver._route_attempts(chain.chain_id, "correctness")) == 2
 
@@ -4363,7 +4489,9 @@ def test_nf888_a_finalize_failed_hold_is_re_read_on_every_later_pass(
         manager, driver, chain, state="finalize_failed", error_code="",
     )
 
-    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    # Parallel per-phase contract: the lens is reached through its own row;
+    # sibling lens rows are attempted in the passes in between.
+    assert _drain_lens(driver, "correctness").pending == 1
     held = driver._route_attempts(chain.chain_id, "correctness")
     assert len(held) == 1
     assert held[0]["state"] == "retired"
@@ -4372,7 +4500,7 @@ def test_nf888_a_finalize_failed_hold_is_re_read_on_every_later_pass(
     ) == "callback_reconcile"
 
     for _ in range(3):
-        assert driver.drain(max_actions=1, now=NOW).pending == 1
+        assert _drain_lens(driver, "correctness").pending == 1
         assert driver._route_attempts(chain.chain_id, "correctness") == held
         assert len(manager.provider_launches) == 1
         wait = manager.events[-1]["review_automation"]
@@ -4426,6 +4554,7 @@ def _nf1064_driver(tmp_path: Path, manager: _Manager):
     chain = driver.ensure_chain(
         target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
         packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+        **_one_lens_plan(),
     )
     return driver, chain
 
@@ -4478,7 +4607,9 @@ def test_chain_waits_on_running_manager_reviewer_instead_of_launching(
 
     assert driver.drain(max_actions=1, now=NOW).completed == 1
     for _ in range(2):
-        waiting = driver.drain(max_actions=1, now=NOW)
+        # Parallel per-phase contract: reach this lens's waiting accept, not
+        # whichever sibling-lens row the reservation cursor reaches first.
+        waiting = _drain_lens(driver, "correctness")
         assert waiting.completed == 0
         assert waiting.failed == 0
 
@@ -4486,7 +4617,7 @@ def test_chain_waits_on_running_manager_reviewer_instead_of_launching(
     assert manager.accepts == []
 
     manager.status_results["manual-request"] = _manual_sealed_status()
-    assert driver.drain(max_actions=1, now=NOW).completed == 1
+    assert _drain_lens(driver, "correctness").completed == 1
     assert manager.accepts == [("manual-request", "MANUAL-REVIEWER")]
     assert manager.launches == []
 
@@ -4512,14 +4643,16 @@ def test_chain_action_stays_pending_while_reviewer_is_still_spawning_nf02108(
     manager.status_results["manual-request"] = {"ok": True, "state": spawning_state}
 
     assert driver.drain(max_actions=1, now=NOW).completed == 1
-    waiting = driver.drain(max_actions=1, now=NOW)
+    # Parallel per-phase contract: the other lenses' rows are attempted in the
+    # same drains, so reach THIS lens's next action instead of the next row.
+    waiting = _drain_lens(driver, "correctness")
     assert waiting.completed == 0
     assert waiting.failed == 0
     assert manager.launches == []
     assert manager.accepts == []
 
     manager.status_results["manual-request"] = _manual_sealed_status()
-    assert driver.drain(max_actions=1, now=NOW).completed == 1
+    assert _drain_lens(driver, "correctness").completed == 1
     assert manager.accepts == [("manual-request", "MANUAL-REVIEWER")]
 
 

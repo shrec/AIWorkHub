@@ -22,6 +22,7 @@ import pytest  # noqa: E402
 
 import test_review_orchestrator as base  # noqa: E402
 from aiworkhub import process_launcher_accept_review  # noqa: E402
+from aiworkhub import review_lifecycle  # noqa: E402
 from aiworkhub import review_orchestrator  # noqa: E402
 from aiworkhub import reviewer_launch_refusal  # noqa: E402
 from aiworkhub import terminal_failure_classification as tfc  # noqa: E402
@@ -87,7 +88,10 @@ def test_launch_exception_is_recorded_on_the_attempt_and_retry_is_kept(
     assert attempt["failure_reason"].startswith("launch_exception:OSError:")
     assert "launcher pipe closed" in attempt["failure_reason"]
 
-    assert driver.drain(max_actions=1, now=NOW).completed == 1
+    # Parallel per-phase contract: the launcher's one fault was spent by this
+    # lens, so the sibling lenses launch from their own rows; steer the retry
+    # to THIS lens's row instead of whichever sibling row comes next.
+    assert base._drain_lens(driver, "correctness").completed == 1
     retried = driver._route_attempts(chain.chain_id, "correctness")
     assert len(retried) == 1, "the retry reconciles the same attempt"
     assert retried[-1]["state"] == "launched"
@@ -198,7 +202,7 @@ def test_second_credential_failure_holds_instead_of_a_third_attempt(
 ) -> None:
     terminal = _credential_terminal(f"worker_failed:{CREDENTIAL_CODE}:exit_code=1")
     manager, _db, chain, _first_task, seed = base._seed_terminal_launch(
-        tmp_path, "second", terminal,
+        tmp_path, "second", terminal, lenses=base.ONE_LENS,
     )
     second_task = seed._reviewer_task_id(
         chain.chain_identity, "correctness", attempt_index=2,
@@ -206,7 +210,8 @@ def test_second_credential_failure_holds_instead_of_a_third_attempt(
     manager.terminal_launch_results[second_task] = {"ok": False, **terminal}
 
     assert seed.drain(max_actions=1, now=NOW).completed == 0
-    assert seed.drain(max_actions=1, now=NOW).completed == 0
+    # Parallel per-phase contract: steer the second pass to THIS lens's row.
+    assert base._drain_lens(seed, "correctness").completed == 0
 
     assert len(manager.launches) == 2, "exactly one relaunch"
     attempts = seed._route_attempts(chain.chain_id, "correctness")
@@ -221,12 +226,13 @@ def test_credential_failure_with_no_other_adapter_records_a_reasoned_hold(
     tmp_path: Path, terminal: dict,
 ) -> None:
     manager, _db, chain, _first_task, seed = base._seed_terminal_launch(
-        tmp_path, "single-adapter", terminal,
+        tmp_path, "single-adapter", terminal, lenses=base.ONE_LENS,
     )
     seed.route_selector = _first_route
 
     assert seed.drain(max_actions=1, now=NOW).completed == 0
-    assert seed.drain(max_actions=1, now=NOW).completed == 0
+    # Parallel per-phase contract: steer the second pass to THIS lens's row.
+    assert base._drain_lens(seed, "correctness").completed == 0
 
     assert len(manager.launches) == 1, "no second launch on the indicted adapter"
     attempts = seed._route_attempts(chain.chain_id, "correctness")
@@ -312,11 +318,38 @@ class _DeadFirstLensManager(base._FailoverManager):
         return super().launch_quality_reviewer(**kwargs)
 
 
-def test_lens_retired_with_its_chain_relaunches_exactly_once(tmp_path: Path) -> None:
+def test_a_dead_lens_does_not_hold_its_sibling_lenses_back(tmp_path: Path) -> None:
+    """Parallel per-phase contract: a failed lens retires only its own phase.
+
+    The correctness launch fails closed. Its later rows and the target rows are
+    retired, but the security and code_quality rows gate on nothing of its, so
+    the very next pass launches each of them -- once, from its own row, with no
+    settlement relaunch needed.
+    """
+    manager = _DeadFirstLensManager(tmp_path)
+    driver, chain = _driver(manager, tmp_path, "parallel", _first_route)
+
+    assert driver.drain(max_actions=1, now=NOW).failed == 1
+    driver.drain(max_actions=12, now=NOW)
+
+    assert _launched_lenses(manager) == ["code_quality", "security"]
+    for lens in ("security", "code_quality"):
+        attempts = driver._route_attempts(chain.chain_id, lens)
+        assert [row["state"] for row in attempts] == ["launched"]
+    driver.drain(max_actions=12, now=MUCH_LATER)
+    assert len(manager.provider_launches) == 2, "launched once, not once per pass"
+
+
+def test_lens_retired_with_its_chain_relaunches_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager = _DeadFirstLensManager(tmp_path)
     driver, chain = _driver(manager, tmp_path, "dead-chain", _first_route)
 
     assert driver.drain(max_actions=1, now=NOW).failed == 1
+    # A chain a sequentially-gated build left behind: the failure retired the
+    # later lens rows with it, which the settlement below must still repair.
+    _persist_sequential_retirement(driver, monkeypatch)
     # The chain failed inside the window and nobody has judged it silent yet.
     assert len(manager.provider_launches) == 0
 
@@ -332,7 +365,9 @@ def test_lens_retired_with_its_chain_relaunches_exactly_once(tmp_path: Path) -> 
     assert len(manager.provider_launches) == 2, "relaunch is once, not per pass"
 
 
-def test_lens_that_cannot_relaunch_records_the_reason_once(tmp_path: Path) -> None:
+def test_lens_that_cannot_relaunch_records_the_reason_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager = _DeadFirstLensManager(tmp_path)
 
     def selector(_repo, _task, lens):
@@ -342,6 +377,8 @@ def test_lens_that_cannot_relaunch_records_the_reason_once(tmp_path: Path) -> No
 
     driver, _chain = _driver(manager, tmp_path, "no-route", selector)
     driver.drain(max_actions=1, now=NOW)
+    # Rows a sequentially-gated build retired with the failed first lens.
+    _persist_sequential_retirement(driver, monkeypatch)
 
     driver.drain(max_actions=1, now=LATER)
     driver.drain(max_actions=1, now=MUCH_LATER)
@@ -372,19 +409,28 @@ def test_every_required_lens_has_a_reviewer_or_a_reason_after_a_pass(
 
 
 def test_held_lens_and_the_lens_behind_it_carry_reasons(tmp_path: Path) -> None:
-    manager, _db, _chain, _first_task, seed = base._seed_terminal_launch(
+    """Parallel per-phase contract: the held lens says why; the others launch.
+
+    Lens rows gate only on their own phase, so a held correctness lens no longer
+    holds security and code_quality behind it: each launches from its own row,
+    and none is reported as ``waiting_on_lens`` for an earlier one. Each lens
+    still ends with a reviewer or a reason -- here, one reason and two reviewers.
+    """
+    manager, _db, chain, _first_task, seed = base._seed_terminal_launch(
         tmp_path, "held", {"state": "launch_failed", "error_code": "runtime_error"},
     )
     seed.drain(max_actions=1, now=NOW)
 
-    seed.drain(max_actions=1, now=LATER)
+    seed.drain(max_actions=12, now=LATER)
     seed.drain(max_actions=1, now=MUCH_LATER)
 
     reasons = {row["lens"]: row["reason"] for row in _blockers(manager)}
     assert reasons["correctness"].endswith(":hold=manager_judgment_unknown")
-    assert reasons["security"] == "waiting_on_lens:correctness"
-    assert reasons["code_quality"] == "waiting_on_lens:correctness"
-    assert len(_blockers(manager)) == len(LENSES)
+    assert set(reasons) == {"correctness"}, "only the held lens is blocked"
+    assert len(_blockers(manager)) == 1, "one record, not one per pass"
+    assert _launched_lenses(manager) == ["code_quality", "security"]
+    for lens in ("security", "code_quality"):
+        assert seed._route_attempts(chain.chain_id, lens)[-1]["state"] == "launched"
 
 
 def test_lens_waiting_behind_a_live_reviewer_is_not_called_blocked(
@@ -434,10 +480,30 @@ def test_a_superseded_target_is_settled_and_never_relaunched(tmp_path: Path) -> 
 SECRET = "sk-" + "a1B2c3D4e5F6"
 
 
-def _settled_dead_chain(tmp_path: Path, name: str, selector=_first_route):
+def _persist_sequential_retirement(driver, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Persist the rows a sequentially-gated build left behind a failed first lens.
+
+    Before NF-2026-02292 a failed lens row retired every later lens row with its
+    chain, and stores written then still hold such chains: this settlement is the
+    net that relaunches their absent lenses. Under the parallel per-phase
+    contract a sibling lens is no longer retired by that failure, so the old
+    retirement is written by ONE reconcile pass under the old gating policy;
+    every drain after it runs under the current one.
+    """
+    with monkeypatch.context() as legacy:
+        legacy.setattr(
+            review_lifecycle, "_action_gates_on", lambda _phase, _prior: True,
+        )
+        review_lifecycle.reconcile_dead_chains(driver.db_path, now=NOW)
+
+
+def _settled_dead_chain(
+    tmp_path: Path, name: str, monkeypatch: pytest.MonkeyPatch, selector=_first_route,
+):
     manager = _DeadFirstLensManager(tmp_path)
     driver, chain = _driver(manager, tmp_path, name, selector)
     driver.drain(max_actions=1, now=NOW)
+    _persist_sequential_retirement(driver, monkeypatch)
     return manager, driver, chain
 
 
@@ -464,8 +530,10 @@ def _no_route_past_correctness(_repo, _task, lens):
     raise review_orchestrator.ReviewRouteUnavailable(lens)
 
 
-def test_waiting_record_does_not_spend_the_lens_relaunch(tmp_path: Path) -> None:
-    manager, driver, chain = _settled_dead_chain(tmp_path, "waiting")
+def test_waiting_record_does_not_spend_the_lens_relaunch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, driver, chain = _settled_dead_chain(tmp_path, "waiting", monkeypatch)
     driver._store_lens_blocker(
         chain.chain_id, "security", "waiting_on_lens:correctness", NOW,
     )
@@ -476,8 +544,10 @@ def test_waiting_record_does_not_spend_the_lens_relaunch(tmp_path: Path) -> None
     assert _launched_lenses(manager).count("security") == 1
 
 
-def test_settlement_launched_reviewer_that_dies_is_reported(tmp_path: Path) -> None:
-    manager, driver, chain = _settled_dead_chain(tmp_path, "died")
+def test_settlement_launched_reviewer_that_dies_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, driver, chain = _settled_dead_chain(tmp_path, "died", monkeypatch)
     driver.drain(max_actions=3, now=LATER)
     assert len(manager.provider_launches) == 2
     _reviewer_died(manager, driver._route_attempts(chain.chain_id, "security")[-1])
@@ -491,8 +561,10 @@ def test_settlement_launched_reviewer_that_dies_is_reported(tmp_path: Path) -> N
     assert len(manager.provider_launches) == 2, "reported, not relaunched again"
 
 
-def test_invalid_route_binding_is_that_lens_blocker(tmp_path: Path) -> None:
-    manager, driver, chain = _settled_dead_chain(tmp_path, "binding")
+def test_invalid_route_binding_is_that_lens_blocker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, driver, chain = _settled_dead_chain(tmp_path, "binding", monkeypatch)
     driver.drain(max_actions=3, now=LATER)
     _reviewer_died(
         manager, driver._route_attempts(chain.chain_id, "security")[-1],
@@ -514,7 +586,7 @@ def test_invalid_route_binding_is_that_lens_blocker(tmp_path: Path) -> None:
 def test_relaunch_defers_to_a_reviewer_already_bound_to_the_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, substatus: str, relaunched: bool,
 ) -> None:
-    manager, driver, _chain = _settled_dead_chain(tmp_path, "bound")
+    manager, driver, _chain = _settled_dead_chain(tmp_path, "bound", monkeypatch)
     asked: list[tuple] = []
 
     def bound(*args):
@@ -531,8 +603,10 @@ def test_relaunch_defers_to_a_reviewer_already_bound_to_the_target(
     assert asked[0] == (manager.repo, "TARGET", "target-request")
 
 
-def test_settlement_relaunch_spends_the_drain_bound(tmp_path: Path) -> None:
-    manager, driver, chain = _settled_dead_chain(tmp_path, "budget")
+def test_settlement_relaunch_spends_the_drain_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, driver, chain = _settled_dead_chain(tmp_path, "budget", monkeypatch)
 
     starved = driver.drain(max_actions=0, now=LATER)
 
@@ -548,9 +622,11 @@ def test_settlement_relaunch_spends_the_drain_bound(tmp_path: Path) -> None:
     assert len(manager.provider_launches) == 1
 
 
-def test_settlement_relaunch_that_cannot_launch_counts_as_failed(tmp_path: Path) -> None:
+def test_settlement_relaunch_that_cannot_launch_counts_as_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _manager, driver, _chain = _settled_dead_chain(
-        tmp_path, "budget-failed", _no_route_past_correctness,
+        tmp_path, "budget-failed", monkeypatch, _no_route_past_correctness,
     )
 
     result = driver.drain(max_actions=1, now=LATER)
@@ -618,7 +694,7 @@ def test_refused_fault_event_cannot_stop_the_next_chain_and_is_said_later(
 def test_relaunch_exception_text_cannot_carry_a_token_to_the_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manager, driver, chain = _settled_dead_chain(tmp_path, "token-relaunch")
+    manager, driver, chain = _settled_dead_chain(tmp_path, "token-relaunch", monkeypatch)
 
     def refuse(_action):
         raise RuntimeError(f"launcher said {SECRET}")
