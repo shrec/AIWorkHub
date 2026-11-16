@@ -2320,10 +2320,16 @@ def _validate_declared_check(entry: Any) -> None:
             raise MalformedConfigError(
                 f"declared check {check_id!r} 'paths' must be a bounded non-empty array of patterns"
             )
+        positive_count = 0
         for pattern in paths:
             normalized = pattern.strip().replace("\\", "/")
+            if normalized.startswith("!"):
+                normalized = normalized[1:].strip()
+            else:
+                positive_count += 1
             if (
-                len(normalized.encode("utf-8")) > MAX_CHECK_PATH_PATTERN_BYTES
+                not normalized
+                or len(normalized.encode("utf-8")) > MAX_CHECK_PATH_PATTERN_BYTES
                 or normalized.startswith("/")
                 or "\x00" in normalized
                 or ".." in normalized.split("/")
@@ -2331,6 +2337,10 @@ def _validate_declared_check(entry: Any) -> None:
                 raise MalformedConfigError(
                     f"declared check {check_id!r} has unsafe path pattern"
                 )
+        if positive_count == 0:
+            raise MalformedConfigError(
+                f"declared check {check_id!r} 'paths' must contain at least one non-negated pattern"
+            )
     minimum_risk = entry.get("minimum_risk")
     if minimum_risk is not None and minimum_risk not in _RISK_RANK:
         raise MalformedConfigError(
@@ -2469,9 +2479,18 @@ def _declared_check_applicability(
     )
     if not patterns or not changed_paths:
         return True, ""
+    positive = tuple(pattern for pattern in patterns if not pattern.startswith("!"))
+    negated = tuple(
+        pattern[1:].strip() for pattern in patterns if pattern.startswith("!")
+    )
+    if not positive:
+        # Fail closed: a negation-only selector never proves irrelevance.
+        return True, ""
     for relative in changed_paths:
         normalized = relative.replace("\\", "/")
-        if any(fnmatch.fnmatchcase(normalized, pattern) for pattern in patterns):
+        if any(fnmatch.fnmatchcase(normalized, pattern) for pattern in positive) and not any(
+            fnmatch.fnmatchcase(normalized, pattern) for pattern in negated
+        ):
             return True, ""
     return False, APPLICABILITY_SKIP_CHANGED_PATHS
 

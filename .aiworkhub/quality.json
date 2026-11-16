@@ -79,7 +79,9 @@
         "test"
       ],
       "paths": [
-        "vscode-extension/**"
+        "vscode-extension/**",
+        "!vscode-extension/**/*.md",
+        "!vscode-extension/*.md"
       ]
     },
     {
