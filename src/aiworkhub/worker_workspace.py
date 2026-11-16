@@ -13390,14 +13390,14 @@ def run_validations(
             # helper's own temporaries and this explicit scratch authority point
             # at one and the same mechanically verified per-invocation root.
             env[VALIDATION_EXEC_SCRATCH_ROOT_ENV] = scratch_env_value
-            # Ruff writes its cache below the current working tree by default.
-            # Validation worktrees are intentionally read-only, so that
-            # default turns a clean lint result into a false permission
-            # failure.  Keep Ruff's disposable cache inside the same private,
-            # request-scoped writable scratch used for other validation
-            # temporaries.  Setting this for every validation command is
-            # harmless; only Ruff consumes it.
+            # Ruff caches below the (read-only) working tree by default, a false
+            # permission failure; keep its disposable cache in the private
+            # request-scoped scratch.  Harmless for every command.
             env["RUFF_CACHE_DIR"] = scratch_env_value
+            from .validation_compiler_cache import compiler_cache_env  # NF-2026-02097
+            env |= compiler_cache_env(
+                workspace.repo, selected_backend, getattr(workspace, "base_oid", None),
+                workspace.path, env)
             # NF180: mypy writes its incremental cache into ``.mypy_cache``
             # relative to the current directory by default. Validation
             # worktrees are intentionally read-only, so that default either

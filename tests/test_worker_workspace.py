@@ -642,6 +642,7 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "sqlite_readonly.py",  # opencode_auth opens its credential store through this sibling
         "runtime_temp.py",
         "validation_skip_audit.py",  # run_validations' env-skip audit (NF-2026-02307)
+        "validation_compiler_cache.py",  # run_validations' compiler cache (NF-2026-02097)
         "windows_file_structures.py",
         "toolchain_authority.py",
         # toolchain_authority imports the registry remedy text from this sibling
@@ -909,6 +910,7 @@ def test_worker_workspace_binds_platform_helpers_after_runtime_temp_closure(
         "validation_runner.py",  # imported by sandbox_cpu_budget (NF-2026-02239)
         "runtime_temp.py",
         "validation_skip_audit.py",  # NF-2026-02307
+        "validation_compiler_cache.py",  # NF-2026-02097
         "windows_file_structures.py",
         "worker_workspace.py",
     ):
@@ -1181,6 +1183,7 @@ def test_package_runtime_temp_loader_rejects_missing_private_support_without_top
         "validation_stall.py",  # worker_workspace's validation stall watchdog (NF-2026-02269)
         "runtime_temp.py",
         "validation_skip_audit.py",  # NF-2026-02307
+        "validation_compiler_cache.py",  # NF-2026-02097
         "worker_workspace.py",
     ):
         shutil.copyfile(source_package / name, destination_package / name)
@@ -1226,6 +1229,7 @@ def test_direct_runtime_temp_loader_rejects_missing_private_support_without_top_
         "platform_io.py",
         "runtime_temp.py",
         "validation_skip_audit.py",  # NF-2026-02307
+        "validation_compiler_cache.py",  # NF-2026-02097
         "sandbox_cpu_budget.py",  # NF-2026-02239
         "validation_runner.py",  # imported by sandbox_cpu_budget (NF-2026-02239)
         "worker_workspace.py",
