@@ -6,6 +6,21 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.13.3] - 2026-11-16
+
+### Fixed
+
+- Accept revalidation no longer counts canonical files that leaked byte-identical into a retained review worktree as a scope violation (NF-2026-02290).
+- A vscode_lm worker re-grounds after a stale-coordinates semantic-edit refusal instead of retrying the same edit (NF-2026-02288).
+- The reconciler bounds its sdlc_sync attribution phase so one pass cannot hold the scan (NF-2026-02203).
+- Declared quality checks support `!`negated path patterns (NF-2026-02244).
+
+### Changed
+
+- Required reviewer lenses run in parallel instead of one after another (NF-2026-02292).
+- The VS Code dashboard runs in its own dashboard-only process, isolated from the MCP server, and the last `aiworkhub_dashboard_*` tools leave the manager MCP surface (NF-2026-02287, NF-2026-02291).
+- The doctor heap census reports native memory: SQLite memory used/highwater and live connections (NF-2026-02289).
+
 ## [0.13.2] - 2026-11-16
 
 ### Fixed

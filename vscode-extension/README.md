@@ -94,10 +94,10 @@ Source Graph coverage and bounded viewers for logs, sessions, AI Memory and KB.
   <em>Tasks, callback health, source coverage, context stores, preflight and evidence in one retained editor tab.</em>
 </div>
 
-## What's new in 0.13.2
+## What's new in 0.13.3
 
-- Cards no longer hang on a dead finalizer or a silent validation command, and worker prompts carry a bounded project context instead of the whole bundle.
-- Source Graph text search and the dashboard snapshot are faster.
+- The dashboard runs in its own process, isolated from the MCP server, and the manager tool surface is smaller.
+- Reviewer lenses run in parallel, and accept no longer fails on canonical files leaked into a review worktree.
 
 ## Get started
 

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.13.3 — 2026-11-16
+
+### Fixed
+
+- Bundles runtime 0.13.3: the dashboard runs in its own process isolated from the MCP server, reviewer lenses run in parallel, and accept no longer fails on canonical files leaked into a review worktree.
+
 ## 0.13.2 — 2026-11-16
 
 ### Fixed
