@@ -177,10 +177,10 @@ inherit the manager's launch capability.
 - **semantic-edit-historical-cap-boundary**: historical capped a/b observation at 20k/200k ops shows a 29.329% reduction; this is a capped historical sample, not eligible as a live guarantee.
 - **context-bundle-v2-structural-only**: structural-only validation; live fleet remeasurement pending.
 
-## What's new in 0.13.1
+## What's new in 0.13.2
 
-- Opening a task no longer hangs on "Loading task": a failed, slow or reconnected detail request now shows an error you can retry by clicking the task again.
-- Flutter validation runs to completion in the sandbox, and the MCP tool surface is smaller.
+- Cards no longer hang on a dead finalizer or a silent validation command, and worker prompts carry a bounded project context instead of the whole bundle.
+- Source Graph text search and the dashboard snapshot are faster.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Documentation

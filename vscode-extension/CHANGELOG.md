@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.13.2 — 2026-11-16
+
+### Fixed
+
+- Bundles runtime 0.13.2: dead finalizers and silent validation stalls end cards instead of hanging them, worker prompts carry a bounded project context, and Source Graph text search and the dashboard snapshot are faster.
+
 ## 0.13.1 — 2026-11-14
 
 ### Fixed

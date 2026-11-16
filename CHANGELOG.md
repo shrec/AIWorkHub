@@ -6,6 +6,22 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-11-16
+
+### Fixed
+
+- A finalizer that died mid-finalization ends the request explicitly and the manager can cancel a finalizing request (NF-2026-02275).
+- Declared quality checks always run with the canonical toolchain root (NF-2026-02284).
+- A validation command with no output and no CPU progress is ended by a stall watchdog instead of hanging the card (NF-2026-02269).
+- The dispose-time finding reproduction deadline drops from 600 s to 120 s and records its timeout cause (NF-2026-02243).
+
+### Changed
+
+- Worker prompts bound the project context to 8 KiB (1 KiB on rework, development rules always carried verbatim) instead of resending the whole bundle (NF-2026-02285).
+- Repo-wide Source Graph bodygrep scans tracked source first (NF-2026-02281), and the dashboard snapshot moves provider probes off the hot path.
+- `doctor_diagnose` reports a bounded live-heap census of the MCP server for the memory-growth investigation.
+- The release cut runs the test-impact selection since the last release tag (NF-2026-02220).
+
 ## [0.13.1] - 2026-11-14
 
 ### Fixed

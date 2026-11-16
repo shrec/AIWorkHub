@@ -94,10 +94,10 @@ Source Graph coverage and bounded viewers for logs, sessions, AI Memory and KB.
   <em>Tasks, callback health, source coverage, context stores, preflight and evidence in one retained editor tab.</em>
 </div>
 
-## What's new in 0.13.1
+## What's new in 0.13.2
 
-- Opening a task no longer hangs on "Loading task": a failed, slow or reconnected detail request now shows an error you can retry by clicking the task again.
-- Flutter validation runs to completion in the sandbox, and the MCP tool surface is smaller.
+- Cards no longer hang on a dead finalizer or a silent validation command, and worker prompts carry a bounded project context instead of the whole bundle.
+- Source Graph text search and the dashboard snapshot are faster.
 
 ## Get started
 
