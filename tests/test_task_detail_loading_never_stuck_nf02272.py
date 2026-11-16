@@ -74,12 +74,12 @@ const DASHBOARD_TOOLS = { taskDetail: "aiworkhub_dashboard_task_detail" };
 const sanitizeWebviewPayload = (p) => p;
 const sanitizeErrorMessage = (e) => String((e && e.message) || e);
 const buildPush = new Function(
-  "getMcpClient", "DASHBOARD_TOOLS", "OUTBOUND_TYPES", "sanitizeWebviewPayload",
+  "getDashboardClient", "DASHBOARD_TOOLS", "OUTBOUND_TYPES", "sanitizeWebviewPayload",
   "sanitizeErrorMessage", "TASK_DETAIL_REQUEST_TIMEOUT_MS",
   fnSrc + "\nreturn pushTaskDetail;",
 );
-const pushFor = (getMcpClient) => buildPush(
-  getMcpClient, DASHBOARD_TOOLS, OUTBOUND_TYPES, sanitizeWebviewPayload,
+const pushFor = (getDashboardClient) => buildPush(
+  getDashboardClient, DASHBOARD_TOOLS, OUTBOUND_TYPES, sanitizeWebviewPayload,
   sanitizeErrorMessage, TASK_DETAIL_TIMEOUT_MS,
 );
 

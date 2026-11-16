@@ -100,10 +100,14 @@ def test_forbidden_fallback_and_shell_patterns_absent() -> None:
     # forbidden: git_commit_or_push -- this extension never shells out to git.
     assert "git commit" not in ext
     assert "git push" not in ext
-    # Repair restarts the SAME client -- there is exactly one childProcess.spawn
-    # call site in the whole module, so a restart can only ever respawn the
-    # repository it was already bound to.
-    assert ext.count("childProcess.spawn(") == 1
+    # Repair restarts the SAME client. Exactly two childProcess.spawn call
+    # sites are sanctioned, both shell-free and both bound to one repository:
+    # the MCP routing child (McpStdioClient._start) and the dashboard reader
+    # (DashboardProcessClient._spawn, NF-2026-02287). Each named site appears
+    # once, so a third spawn site or a repository-agnostic respawn fails here.
+    assert ext.count("childProcess.spawn(") == 2
+    assert ext.count('[...python.argsPrefix, "-m", "aiworkhub.server"]') == 1
+    assert ext.count('[...python.argsPrefix, "-m", DASHBOARD_READER_MODULE, "--repo", root]') == 1
 
 
 def test_repo_isolated_child_env_wiring_unchanged() -> None:
