@@ -36,6 +36,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,6 +58,13 @@ UNKNOWN_NO_SOURCE_PATHS = "no_non_test_promoted_paths"
 UNKNOWN_FIX_COMMIT_NOT_FOUND = "fix_commit_not_found"
 UNKNOWN_GIT_UNAVAILABLE = "git_unavailable"
 UNKNOWN_ROW_UNREADABLE = "row_unreadable"
+class BudgetExceeded(Exception):
+    """Raised mid-``attribute_needfix`` when the pass deadline has passed.
+
+    The id must never reach ``pending_done``: it stays pending for the next
+    pass, exactly like an id the loop never started.
+    """
+
 
 UNKNOWN_REASONS: tuple[str, ...] = (
     UNKNOWN_ADDITIVE_ONLY,
@@ -580,7 +588,9 @@ class AcceptedCatalog:
         return {**dict(card.identity), "outcome": "accepted"}
 
 
-def load_accepted_catalog(repo_root: str | Path, repository_id: str) -> AcceptedCatalog:
+def load_accepted_catalog(
+    repo_root: str | Path, repository_id: str, *, deadline: float | None = None,
+) -> AcceptedCatalog | None:
     """Index every manager-accepted card whose sealed receipt is well formed.
 
     Manager acceptance is the canonical decision index's answer, never a status
@@ -588,6 +598,11 @@ def load_accepted_catalog(repo_root: str | Path, repository_id: str) -> Accepted
     ``sdlc_outcome_metrics.accepted_outcome_identity`` -- one definition of what
     an accepted identity is -- fed the ``accept_review`` event shape the card's
     own sealed accept evidence reconstructs exactly.
+
+    ``deadline`` is a ``time.monotonic()`` value. A pass that runs out of time
+    while this scales with the full accepted-card count returns ``None`` --
+    never a partial catalog -- so the caller defers every pending id rather
+    than attributing against an incomplete index.
     """
     # Deferred: only the store-reading half of this module needs the metrics
     # module, while the git half above is what ``scripts`` imports. Keeping the
@@ -603,6 +618,8 @@ def load_accepted_catalog(repo_root: str | Path, repository_id: str) -> Accepted
     }
     if not accepted_ids:
         return AcceptedCatalog(repo, ())
+    if deadline is not None and time.monotonic() >= deadline:
+        return None
     # NF-2026-02118: read only the accepted cards, and of each only the request
     # id and sealed receipt, instead of decoding every card whole. The order is
     # the one the full ``list_task_cards`` scan produced (same bounded
@@ -613,11 +630,15 @@ def load_accepted_catalog(repo_root: str | Path, repository_id: str) -> Accepted
         for raw_id in task_store.list_task_ids_newest_first(repo, limit=MAX_TASK_CARDS)
         if raw_id.strip() in accepted_ids
     ]
+    if deadline is not None and time.monotonic() >= deadline:
+        return None
     projected = task_store.get_tasks(
         repo, ordered_ids, projection=task_store.ACCEPTED_RECEIPT_PROJECTION
     )
     accepted: list[AcceptedCard] = []
-    for raw_id in ordered_ids:
+    for position, raw_id in enumerate(ordered_ids):
+        if deadline is not None and position % 256 == 0 and time.monotonic() >= deadline:
+            return None
         card = projected.get(raw_id)
         if card is None:
             continue
@@ -694,6 +715,7 @@ def attribute_needfix(
     *,
     catalog: AcceptedCatalog | None = None,
     write: bool = True,
+    deadline: float | None = None,
 ) -> Attribution:
     """Attribute one NeedFix to the accepted card whose bytes its fix overwrote.
 
@@ -706,14 +728,30 @@ def attribute_needfix(
     happens (``written`` is False while ``caused_by`` still reports the cause).
     A *different* cause on a row that already has one is refused by
     ``needfix_store`` with a typed error rather than rewritten here.
+
+    ``deadline`` is a ``time.monotonic()`` value. If it passes while the git
+    blame work below -- the part that scales per blamed line -- is still
+    running, :class:`BudgetExceeded` is raised and nothing is written; the
+    caller leaves this id pending rather than marking it attributed or failed.
     """
+    def _expired() -> bool:
+        return deadline is not None and time.monotonic() >= deadline
+
+    if _expired():
+        raise BudgetExceeded(needfix_id)
+
     repo = Path(repo_root)
     row = needfix_store.get_needfix(repo, needfix_id)
     fix_task_id = str(row.get("converted_task_id") or "").strip()
     if not fix_task_id:
         return _attribution(needfix_id, repository_id, UNKNOWN_NOT_CONVERTED)
 
-    index = catalog if catalog is not None else load_accepted_catalog(repo, repository_id)
+    index = (
+        catalog if catalog is not None
+        else load_accepted_catalog(repo, repository_id, deadline=deadline)
+    )
+    if index is None:
+        raise BudgetExceeded(needfix_id)
     fix = index.card_for_task(fix_task_id)
     if fix is None:
         return _attribution(
@@ -738,6 +776,8 @@ def attribute_needfix(
     preimage_lines = 0
     unexplained = 0
     for path in subject:
+        if _expired():
+            raise BudgetExceeded(needfix_id)
         ranges = deleted_preimage_ranges(repo, fix.base_oid, fix_commit, path)
         if ranges is None:
             return _attribution(
@@ -745,6 +785,8 @@ def attribute_needfix(
                 fix_task_id=fix_task_id, fix_commit=fix_commit,
             )
         for start, end in ranges:
+            if _expired():
+                raise BudgetExceeded(needfix_id)
             preimage_lines += end - start + 1
             blamed = blamed_commits(repo, fix.base_oid, path, start, end)
             if blamed is None:
@@ -753,6 +795,10 @@ def attribute_needfix(
                     fix_task_id=fix_task_id, fix_commit=fix_commit,
                 )
             for commit in blamed:
+                # explaining_card can walk a candidate's history (git per commit
+                # on a memo miss), so the budget is re-checked per blamed line.
+                if _expired():
+                    raise BudgetExceeded(needfix_id)
                 cause = index.explaining_card(path, commit, exclude=fix.key)
                 if cause is None:
                     unexplained += 1

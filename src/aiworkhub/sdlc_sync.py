@@ -710,22 +710,29 @@ def sync_once(
         # (commit, path) hash memo instead of re-reading the whole store.
         catalog = (
             None if _expired()
-            else sdlc_attribution.load_accepted_catalog(root, repository_id)
+            else sdlc_attribution.load_accepted_catalog(root, repository_id, deadline=deadline)
         )
         remaining = 0
-        for position, needfix_id in enumerate(pending):
-            if _expired():
-                # Unprocessed ids never reach pending_done, so they stay pending.
-                remaining = len(pending) - position
-                break
-            try:
-                outcome = sdlc_attribution.attribute_needfix(
-                    root, repository_id, needfix_id, catalog=catalog,
-                )
-            except Exception as exc:  # noqa: BLE001 -- retried next pass
-                failed[needfix_id] = type(exc).__name__[:80]
-                continue
-            attributed[needfix_id] = "attributed" if outcome.attributed else outcome.reason[:80]
+        if catalog is None:
+            remaining = len(pending)
+        else:
+            for position, needfix_id in enumerate(pending):
+                if _expired():
+                    # Unprocessed ids never reach pending_done, so they stay pending.
+                    remaining = len(pending) - position
+                    break
+                try:
+                    outcome = sdlc_attribution.attribute_needfix(
+                        root, repository_id, needfix_id, catalog=catalog, deadline=deadline,
+                    )
+                except sdlc_attribution.BudgetExceeded:
+                    # Never reaches pending_done: stays pending for the next pass.
+                    remaining = len(pending) - position
+                    break
+                except Exception as exc:  # noqa: BLE001 -- retried next pass
+                    failed[needfix_id] = type(exc).__name__[:80]
+                    continue
+                attributed[needfix_id] = "attributed" if outcome.attributed else outcome.reason[:80]
         _write_state(state_path, pending_done=set(attributed))
         if failed:
             marker = "sdlc_sync:attribution:failed"

@@ -57,11 +57,11 @@ def test_the_accepted_catalog_is_loaded_once_per_pass(repo, spies, monkeypatch):
     loads: list[tuple] = []
     seen: list[tuple[str, object]] = []
 
-    def load_accepted_catalog(root, repository_id):
+    def load_accepted_catalog(root, repository_id, *, deadline=None):
         loads.append((root, repository_id))
         return sentinel
 
-    def attribute_needfix(root, repository_id, needfix_id, *, catalog):
+    def attribute_needfix(root, repository_id, needfix_id, *, catalog, deadline=None):
         seen.append((needfix_id, catalog))
         return SimpleNamespace(attributed=True, reason="")
 
@@ -85,10 +85,13 @@ def test_attribution_stops_at_the_deadline_and_leaves_the_rest_pending(repo, spi
     _accept_fixes(repo.root)
     clock = {"now": 1000.0}
     monkeypatch.setattr(sdlc_sync, "time", SimpleNamespace(monotonic=lambda: clock["now"]))
-    monkeypatch.setattr(sdlc_sync.sdlc_attribution, "load_accepted_catalog", lambda r, i: "catalog")
+    monkeypatch.setattr(
+        sdlc_sync.sdlc_attribution, "load_accepted_catalog",
+        lambda r, i, deadline=None: "catalog",
+    )
     seen: list[str] = []
 
-    def slow_attribute(root, repository_id, needfix_id, *, catalog):
+    def slow_attribute(root, repository_id, needfix_id, *, catalog, deadline=None):
         seen.append(needfix_id)
         clock["now"] += 60.0  # one NeedFix spends the whole budget
         return SimpleNamespace(attributed=True, reason="")
@@ -121,7 +124,7 @@ def test_an_already_expired_pass_still_queues_the_window_for_the_next_pass(
     loads: list[str] = []
     monkeypatch.setattr(
         sdlc_sync.sdlc_attribution, "load_accepted_catalog",
-        lambda r, i: loads.append("load") or "catalog",
+        lambda r, i, deadline=None: loads.append("load") or "catalog",
     )
 
     first = sdlc_sync.sync_once(repo.root, repo.repo_id, deadline=clock["now"] - 1.0)
