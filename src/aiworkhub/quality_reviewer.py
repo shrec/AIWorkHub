@@ -772,8 +772,14 @@ def build_lens_packet(packet: Mapping[str, Any], *, lens: str) -> dict[str, Any]
     every lens judges against, so each lens packet carries it whole and its
     re-seal covers it.
 
-    A packet with nothing left to slice -- no scoped audits and no other-lens
-    prior review -- is returned as a copy and never re-sealed.
+    The delta is sliced per lens too (NF-2026-02305): ``unchanged_since_reviewed``
+    and ``rework_hunks`` say "already reviewed", which only a lens whose own
+    judged report covers the predecessor may be told (``_lens_may_narrow_delta``).
+    Any other lens gets every path ``unchanged_since_reviewed=False`` and no
+    hunks, so its surface is ``source_evidence``: the candidate against the task base.
+
+    A packet with nothing left to slice -- no scoped audits, no other-lens
+    prior review and no delta to widen -- is returned as a copy and never re-sealed.
     """
 
     if lens not in REVIEWER_LENSES:
@@ -783,6 +789,7 @@ def build_lens_packet(packet: Mapping[str, Any], *, lens: str) -> dict[str, Any]
     prior = packet.get("prior_review")
     prior_lenses = prior.get("lenses") if isinstance(prior, Mapping) else None
     slice_prior = isinstance(prior_lenses, Mapping) and set(prior_lenses) != {lens}
+    slice_prior = slice_prior or not _lens_may_narrow_delta(packet, lens)
     if not isinstance(scoped, Mapping):
         if not slice_prior:
             return dict(packet)
@@ -799,9 +806,11 @@ def build_lens_packet(packet: Mapping[str, Any], *, lens: str) -> dict[str, Any]
         lens_body["candidate"]["scoped_audits"] = {
             lens: lens_body["candidate"]["scoped_audits"][lens]
         }
-    if slice_prior:
+    if isinstance(prior_lenses, Mapping) and set(prior_lenses) != {lens}:
         kept = lens_body["prior_review"]["lenses"].get(lens)
         lens_body["prior_review"]["lenses"] = {lens: kept} if kept is not None else {}
+    if not _lens_may_narrow_delta(packet, lens):
+        _widen_delta_to_task_base(lens_body)
     return {**lens_body, "packet_sha256": _canonical_digest(lens_body)}
 
 
@@ -1231,6 +1240,49 @@ def _lens_reviewed_predecessor(
     return False
 
 
+def _lens_may_narrow_delta(packet: Mapping[str, Any], lens: str) -> bool:
+    """Whether ``candidate.delta`` may narrow ``lens``'s surface (the one predicate).
+
+    ``unchanged_since_reviewed`` and ``rework_hunks`` mean "already reviewed",
+    which is true only for a lens whose own judged report covers the
+    predecessor.  A delta without ``rework_delta_complete`` (the pre-NF-2026-01093
+    byte-identity shape) keeps its unconditional meaning.  The prompt and
+    ``build_lens_packet`` both ask this, so they cannot disagree.
+    """
+
+    candidate = packet.get("candidate")
+    delta = candidate.get("delta") if isinstance(candidate, Mapping) else None
+    if not isinstance(delta, Mapping):
+        return True  # no delta, nothing to narrow
+    return "rework_delta_complete" not in delta or _lens_reviewed_predecessor(
+        packet, lens, delta.get("predecessor_request_id")
+    )
+
+
+def _widen_delta_to_task_base(lens_body: dict[str, Any]) -> bool:
+    """Strip the narrowing from a lens body's delta in place; True when it changed.
+
+    Every path becomes ``unchanged_since_reviewed=False`` and ``rework_hunks`` is
+    dropped, so the lens's surface is ``source_evidence`` (candidate vs task
+    base).  The delta is then incomplete, which keeps the sealed all-or-nothing
+    hunk rule valid.
+    """
+
+    delta = lens_body["candidate"]["delta"]
+    rows = delta.get("paths")
+    if not isinstance(rows, Mapping) or not (
+        delta.get("rework_delta_complete") is True
+        or any(isinstance(row, Mapping) and row.get("unchanged_since_reviewed") for row in rows.values())
+    ):
+        return False
+    for row in rows.values():
+        row["unchanged_since_reviewed"] = False
+        row.pop("rework_hunks", None)
+    delta["rework_delta_complete"] = False
+    delta.setdefault("rework_delta_fallback_reason", "predecessor_not_reviewed_by_lens")
+    return True
+
+
 def _rework_delta_instruction(packet: Mapping[str, Any], *, lens: str) -> str:
     """Render the narrowed rework review surface for ``lens``, or ``""`` when unearned.
 
@@ -1266,7 +1318,7 @@ def _rework_delta_instruction(packet: Mapping[str, Any], *, lens: str) -> str:
         return ""
     if not any(row["rework_hunks"] for row in rows.values()):
         return ""
-    if not _lens_reviewed_predecessor(packet, lens, delta.get("predecessor_request_id")):
+    if not _lens_may_narrow_delta(packet, lens):
         return ""
     return REWORK_DELTA_REVIEW_INSTRUCTION
 
@@ -1354,7 +1406,13 @@ def build_review_prompt(
         else None
     )
     unchanged_paths: list[str] = []
-    if isinstance(delta_paths, Mapping):
+    # NF-2026-02305: "previously reviewed" is true only for a lens whose own
+    # judged report covers the predecessor.  The predecessor is pinned after any
+    # terminal (a failed validation included), so byte identity alone must not
+    # take a path off a lens's surface.  The launcher always seals
+    # ``rework_delta_complete``; a bare byte-identity delta without it (the
+    # pre-NF-2026-01093 shape) keeps its unconditional meaning.
+    if isinstance(delta_paths, Mapping) and _lens_may_narrow_delta(packet, lens):
         unchanged_paths = sorted(
             path
             for path, row in delta_paths.items()
