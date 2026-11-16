@@ -86,9 +86,12 @@ _APPCONTAINER_CMAKE_GENERATOR = "NMake Makefiles"
 # /Z7 writes the same information into the object file and needs no server.
 _APPCONTAINER_CL_APPENDED_OPTIONS = "/Z7"
 
-# All three are required: a named-pipe denial from some other tool is a
-# different fact and must never be reported under ninja's name.
-_NINJA_PIPE_DENIAL_TOKENS = ("ninja", "createnamedpipe", "access is denied")
+# The denial is ninja's own fatal line, so it must START a line (after strip),
+# not merely appear somewhere in the text.  A test or pytest run that prints
+# this text as fixture data or inside an assertion is quoting it, and quoted
+# text is a different fact (NF-2026-02310).
+_NINJA_FATAL_PREFIX = "ninja: fatal:"
+_NINJA_PIPE_DENIAL_TOKENS = ("createnamedpipe", "access is denied")
 
 
 def _path_key(entry: str) -> str:
@@ -467,5 +470,11 @@ def ninja_pipe_denied(stdout: str, stderr: str) -> bool:
     that sees this must report an environment restriction rather than a failed
     gate.  Not gated on Windows: this reads text, and the text is the evidence.
     """
-    text = f"{stdout or ''}\n{stderr or ''}".casefold()
-    return all(token in text for token in _NINJA_PIPE_DENIAL_TOKENS)
+    for stream in (stdout or "", stderr or ""):
+        for line in stream.splitlines():
+            folded = line.strip().casefold()
+            if folded.startswith(_NINJA_FATAL_PREFIX) and all(
+                token in folded for token in _NINJA_PIPE_DENIAL_TOKENS
+            ):
+                return True
+    return False
