@@ -66,8 +66,12 @@ try {
   const snapshotEnd = source.indexOf("async function pushSnapshotNoRetry", snapshotStart);
   const snapshotBody = source.slice(snapshotStart, snapshotEnd);
   assert.ok(
-    snapshotBody.includes('if (snapshotRecovery.reason === "mcp_request_timeout") break;'),
+    snapshotBody.includes("if (isSnapshotTimeoutReason(snapshotRecovery.reason)) break;"),
     "the auto-refresh path must stop retrying a delayed full snapshot",
+  );
+  assert.ok(
+    source.includes('const DASHBOARD_REQUEST_TIMEOUT_REASON = "dashboard_reader_timeout";'),
+    "a dashboard reader timeout must name the reader, not the MCP transport",
   );
   assert.ok(snapshotBody.includes("OUTBOUND_TYPES.snapshotDelayed"));
 

@@ -742,9 +742,14 @@ const DASHBOARD_PROCESS_STRIPPED_ENV = Object.freeze([
   "AIWORKHUB_ALLOW_WRITES",
   "AIWORKHUB_ALLOW_LAUNCH",
 ]);
-// A dashboard read that exceeds its budget reports the same reason code as an
-// MCP read did, so the existing snapshotDelayed/no-retry classification holds.
-const DASHBOARD_REQUEST_TIMEOUT_REASON = "mcp_request_timeout";
+// A dashboard read that exceeds its budget names the dashboard reader, not the
+// MCP transport: the reader is its own process, so the banner must not blame MCP.
+const DASHBOARD_REQUEST_TIMEOUT_REASON = "dashboard_reader_timeout";
+// Both codes classify as a delayed (not offline) snapshot and are not retried.
+const SNAPSHOT_TIMEOUT_REASONS = Object.freeze(["mcp_request_timeout", DASHBOARD_REQUEST_TIMEOUT_REASON]);
+function isSnapshotTimeoutReason(reason) {
+  return SNAPSHOT_TIMEOUT_REASONS.includes(reason);
+}
 // B893: bounded self-repair budget for a DETECTED runtime version/capability
 // mismatch (a stale bundled runtime after a VSIX update or an in-place
 // runtime repair). Separate from MCP_MAX_RESTART_ATTEMPTS, which bounds
@@ -11473,11 +11478,11 @@ async function pushSnapshotOnce(view) {
       // A single slow aggregation is not connection-loss evidence.  Avoid an
       // immediate retry storm on the same serialized transport and preserve
       // the last truthful snapshot in the Webview.
-      if (snapshotRecovery.reason === "mcp_request_timeout") break;
+      if (isSnapshotTimeoutReason(snapshotRecovery.reason)) break;
     }
   }
   if (requestSeq === view.snapshotRequestSeq) {
-    const delayed = snapshotRecovery.reason === "mcp_request_timeout";
+    const delayed = isSnapshotTimeoutReason(snapshotRecovery.reason);
     view.postMessage({
       type: delayed ? OUTBOUND_TYPES.snapshotDelayed : OUTBOUND_TYPES.offline,
       reason: sanitizeErrorMessage(lastError),
@@ -11485,7 +11490,7 @@ async function pushSnapshotOnce(view) {
     });
   }
   debugTrace(
-    snapshotRecovery.reason === "mcp_request_timeout" ? "snapshot.delayed" : "snapshot.offline",
+    isSnapshotTimeoutReason(snapshotRecovery.reason) ? "snapshot.delayed" : "snapshot.offline",
     { request_seq: requestSeq, ...debugErrorFields(lastError) },
   );
 }
@@ -11518,7 +11523,7 @@ async function pushSnapshotNoRetry(view, options = {}) {
     if (authoritative || requestSeq === view.snapshotRequestSeq) {
       const reason = sanitizeErrorMessage(err);
       view.postMessage({
-        type: reason === "mcp_request_timeout" ? OUTBOUND_TYPES.snapshotDelayed : OUTBOUND_TYPES.offline,
+        type: isSnapshotTimeoutReason(reason) ? OUTBOUND_TYPES.snapshotDelayed : OUTBOUND_TYPES.offline,
         reason,
       });
     }
