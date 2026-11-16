@@ -46,7 +46,7 @@ CLUSTERS = {
     ),
     "NEEDFIX": _cluster(
         "needfix_update", "needfix_archive", "needfix_restore", "needfix_add", "needfix_list", "needfix_show",
-        "needfix_count", "needfix_events", "manager_needfix_draft", "dashboard_needfix_transition",
+        "needfix_count", "needfix_events", "manager_needfix_draft", "needfix_transition",
     ),
     "ROADMAP": _cluster(
         "roadmap_list", "roadmap_show", "roadmap_snapshot", "roadmap_transition", "roadmap_link_task",
@@ -111,10 +111,10 @@ def test_every_listed_cluster_member_names_a_listed_sibling(listings):
                     violations.setdefault(f"{cluster} {name}", []).append(f"writes={key[1]}")
     # Fail closed: the manager profile must list cluster members for this check to mean anything.
     assert checked >= sum(len(members) for members in CLUSTERS.values()), checked
-    # Measured: the dashboard profile lists aiworkhub_dashboard_needfix_transition but none of its manager
-    # NEEDFIX siblings (its own siblings are aiworkhub_dashboard_needfix_*, hidden on manager), so no name
-    # satisfies both profiles. Pinned exactly, so a new case or a shared sibling appearing fails here.
-    assert no_shared_sibling == {"aiworkhub_dashboard_needfix_transition"}, sorted(no_shared_sibling)
+    # The manager transition tool is needfix_transition, listed on manager only, so every listed NEEDFIX
+    # member has a nameable sibling (aiworkhub_dashboard_needfix_transition left the manager profile).
+    # Pinned exactly, so a member that loses its last shared sibling fails here.
+    assert no_shared_sibling == set(), sorted(no_shared_sibling)
     if violations:
         pytest.fail(
             "cluster members naming no listed sibling:\n"

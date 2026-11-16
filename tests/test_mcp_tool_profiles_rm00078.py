@@ -28,7 +28,8 @@ _METADATA_PY = _SRC / "aiworkhub" / "mcp_tool_metadata.py"
 _WORKER_MCP_PY = _SRC / "aiworkhub" / "worker_ai_tools_mcp.py"
 _EXTENSION_JS = _ROOT / "vscode-extension" / "extension.js"
 _DASHBOARD = "aiworkhub_dashboard_"
-_KEEP = {"aiworkhub_dashboard_needfix_transition", "aiworkhub_dashboard_snapshot"}
+# The dashboard runs in its own process: the manager profile keeps no dashboard tool.
+_KEEP: frozenset = frozenset()
 _WRITE_GATED = {
     "aiworkhub_task_auto_pickup",
     "aiworkhub_task_mark_review",
@@ -44,11 +45,12 @@ _WRITE_PROBE = "aiworkhub_task_mark_done"
 
 # Measured on base 739a7c70, plus aiworkhub_manager_callback_lane_claim (NF-2026-01802), minus the five
 # retired manager Hub Mail tools and the three retired dashboard ones, plus the dashboard peers view,
-# plus aiworkhub_manager_recipe_run_status (NF-2026-01849).
-_PRE_TABLE_ALL_COUNT = 230
-_PRE_TABLE_ALL_READ_ONLY_COUNT = 226
-# NF-2026-02139: manager 130 -> 115, the 15 rows below moved to manager-callable.
-_LISTED_COUNTS = {"manager": 118, "worker": 19, "dashboard": 67}
+# plus aiworkhub_manager_recipe_run_status (NF-2026-01849), plus the manager needfix_transition.
+_PRE_TABLE_ALL_COUNT = 231
+_PRE_TABLE_ALL_READ_ONLY_COUNT = 227
+# NF-2026-02139: manager 130 -> 115, the 15 rows below moved to manager-callable. Then 118 -> 117:
+# aiworkhub_dashboard_snapshot and aiworkhub_dashboard_needfix_transition left, needfix_transition joined.
+_LISTED_COUNTS = {"manager": 117, "worker": 19, "dashboard": 67}
 # NF-2026-02139: callable by exact name on manager, absent from its tools/list. The extension (dashboard
 # surface) calls the loop/vscode_lm rows; managers finalize with accept_review/reject_review, not mark_*.
 _NF02139_DASHBOARD_LISTED = (
@@ -72,8 +74,11 @@ _NF02139_MANAGER_CALLABLE = (
     "aiworkhub_task_mark_done",
 )
 _ARG_PROBE_ERROR_PREFIX = "unexpected_arguments:['__rm00078_probe__']"
-# The 45 webview-only dashboard tools the pre-table manager surface hid.
+# The 45 webview-only dashboard tools the pre-table manager surface hid, plus the two it kept
+# (snapshot, needfix_transition) until the dashboard moved to its own process: all 47 now.
 _PRE_TABLE_MANAGER_HIDDEN = frozenset({
+    "aiworkhub_dashboard_snapshot",
+    "aiworkhub_dashboard_needfix_transition",
     "aiworkhub_dashboard_task_detail",
     "aiworkhub_dashboard_health",
     "aiworkhub_dashboard_task_live_output",

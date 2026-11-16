@@ -3857,7 +3857,10 @@ def _signed_task_plan(card: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-_TRANSITION_TOOL = "aiworkhub_dashboard_needfix_transition"
+# The manager MCP tool that triages/accepts a NeedFix; conversion refusals and
+# preview next_action name it. The dashboard webview keeps its own tool name.
+TRANSITION_TOOL = "needfix_transition"
+_TRANSITION_TOOL = TRANSITION_TOOL
 
 
 def _conversion_refusal_reason(needfix_id: str, status: str) -> str:

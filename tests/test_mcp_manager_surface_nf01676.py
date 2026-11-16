@@ -22,7 +22,8 @@ from aiworkhub.tool_recovery import unknown_tool_message  # noqa: E402
 _EXTENSION_JS = _ROOT / "vscode-extension" / "extension.js"
 _PAYLOAD_PREFIX = "NF01676_PAYLOAD="
 _DASHBOARD = "aiworkhub_dashboard_"
-_KEEP = {"aiworkhub_dashboard_needfix_transition", "aiworkhub_dashboard_snapshot"}
+# The dashboard runs in its own process: the manager profile keeps no dashboard tool.
+_KEEP: frozenset = frozenset()
 _UNLISTED = frozenset(
     name
     for name, entry in mcp_tool_metadata.MCP_TOOL_PROFILES.items()
@@ -36,13 +37,17 @@ def _is_probe_error(message: str) -> bool:
     return message.startswith(_PROBE_ERROR_PREFIX)
 
 _SYNTHETIC_HIDDEN = "aiworkhub_dashboard_synthetic_hidden"
+# Once the manager keep set; now dashboard-only rows of the profile table, refused on manager.
+_SYNTHETIC_DASHBOARD_ONLY = ("aiworkhub_dashboard_snapshot", "aiworkhub_dashboard_needfix_transition")
 _SYNTHETIC_ALL = [
     "synthetic_echo", "synthetic_accented", "synthetic_list", "synthetic_int", "synthetic_none",
     "synthetic_text", "synthetic_path", "synthetic_failing", _SYNTHETIC_HIDDEN,
-    "aiworkhub_dashboard_snapshot", "aiworkhub_dashboard_needfix_transition",
+    *_SYNTHETIC_DASHBOARD_ONLY, "needfix_transition",
     "aiworkhub_dashboard", "aiworkhub_manager_dashboard_view",
 ]
-_SYNTHETIC_MANAGER = [name for name in _SYNTHETIC_ALL if name != _SYNTHETIC_HIDDEN]
+_SYNTHETIC_MANAGER = [
+    name for name in _SYNTHETIC_ALL if name != _SYNTHETIC_HIDDEN and name not in _SYNTHETIC_DASHBOARD_ONLY
+]
 _SYNTHETIC_RESULTS = {
     "synthetic_echo": {"echo": "plain", "nested": {"items": [1, 2, 3], "ratio": 0.5, "flag": True, "none": None}},
     "synthetic_accented": {"word": "café", "quote": 'say "hi"'},
@@ -54,13 +59,15 @@ _SYNTHETIC_RESULTS = {
     _SYNTHETIC_HIDDEN: {"tool": "hidden"},
     "aiworkhub_dashboard_snapshot": {"tool": "snapshot"},
     "aiworkhub_dashboard_needfix_transition": {"tool": "transition"},
+    "needfix_transition": {"tool": "manager_transition"},
     "aiworkhub_dashboard": {"tool": "bare"},
     "aiworkhub_manager_dashboard_view": {"tool": "view"},
 }
 _MANAGER_VISIBILITY = {
     "aiworkhub_dashboard_health": False,
-    "aiworkhub_dashboard_needfix_transition": True,
-    "aiworkhub_dashboard_snapshot": True,
+    "aiworkhub_dashboard_needfix_transition": False,
+    "aiworkhub_dashboard_snapshot": False,
+    "needfix_transition": True,
     "aiworkhub_dashboard": True,
     "aiworkhub_manager_dashboard_view": True,
     "aiworkhub_task_create": True,
@@ -87,7 +94,9 @@ from pathlib import Path
 ARGS = json.loads(os.environ["NF01676_ARGS"])
 SERVER_NAME = "AIWorkHub MCP"
 DASHBOARD = "aiworkhub_dashboard_"
-KEEP = ("aiworkhub_dashboard_needfix_transition", "aiworkhub_dashboard_snapshot")
+KEEP = ()
+# A real tool every surface under test serves; the probe argument is refused before its body runs.
+MANAGER_KEPT = "needfix_transition"
 PROBE = {"__nf01676_probe__": 1}
 assert not server._MCP_SDK_AVAILABLE
 real = server.mcp._tools
@@ -168,13 +177,18 @@ def dashboard_hidden():
 
 
 def dashboard_snapshot():
-    '''A kept dashboard tool.'''
+    '''A dashboard-only profile row, once kept on manager.'''
     return {"tool": "snapshot"}
 
 
 def dashboard_transition():
-    '''A kept dashboard tool.'''
+    '''A dashboard-only profile row, once kept on manager.'''
     return {"tool": "transition"}
+
+
+def manager_transition():
+    '''The manager NeedFix transition name.'''
+    return {"tool": "manager_transition"}
 
 
 def dashboard_bare():
@@ -199,6 +213,7 @@ synthetic = {
     "aiworkhub_dashboard_synthetic_hidden": dashboard_hidden,
     "aiworkhub_dashboard_snapshot": dashboard_snapshot,
     "aiworkhub_dashboard_needfix_transition": dashboard_transition,
+    "needfix_transition": manager_transition,
     "aiworkhub_dashboard": dashboard_bare,
     "aiworkhub_manager_dashboard_view": manager_dashboard_view,
 }
@@ -216,7 +231,7 @@ def run_loop():
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
         {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "aiworkhub_task_template_list", "arguments": {}}},
         {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": hidden_example, "arguments": PROBE}},
-        {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": KEEP[1], "arguments": PROBE}},
+        {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": MANAGER_KEPT, "arguments": PROBE}},
     ]
     data = b"".join(json.dumps(item).encode("utf-8") + b"\n" for item in requests)
     sink = io.BytesIO()
@@ -243,7 +258,7 @@ def decorator_probe():
         return 1
 
     def aiworkhub_dashboard_snapshot():
-        '''Decorated kept candidate.'''
+        '''Decorated dashboard-only profile row.'''
         return 2
 
     def plain_decorated():
@@ -445,17 +460,22 @@ def test_visibility_predicate_hides_only_webview_dashboard_tools(monkeypatch) ->
     # RM-2026-00078: the unset default is the manager rule.
     assert {name: server.mcp_tool_listed(name) for name in _MANAGER_VISIBILITY} == _MANAGER_VISIBILITY
     assert server.mcp_tool_callable("aiworkhub_dashboard_health", "manager") is False
-    assert server.mcp_tool_callable("aiworkhub_dashboard_snapshot", "manager") is True
+    assert server.mcp_tool_callable("aiworkhub_dashboard_snapshot", "manager") is False
+    assert server.mcp_tool_callable("aiworkhub_dashboard_snapshot", "dashboard") is True
+    assert server.mcp_tool_callable("needfix_transition", "manager") is True
     assert server.mcp_tool_callable(None, "manager") is True
     assert server.mcp_tool_callable(5, "manager") is True
 
 
-def test_documented_keep_set_is_the_two_manager_dashboard_tools(all_run: dict, manager_run: dict) -> None:
-    assert set(server.MANAGER_SURFACE_DASHBOARD_KEEP) == _KEEP
-    assert set(server.MANAGER_SURFACE_DASHBOARD_KEEP_REASONS) == _KEEP
-    assert all(reason.strip() for reason in server.MANAGER_SURFACE_DASHBOARD_KEEP_REASONS.values())
-    assert _KEEP <= set(all_run["registered"])
-    assert _KEEP <= set(manager_run["registered"])
+def test_manager_keep_set_is_empty_and_manager_registers_no_dashboard_tool(
+    all_run: dict, manager_run: dict
+) -> None:
+    # The dashboard runs in its own process: no aiworkhub_dashboard_* tool stays on manager.
+    assert server.MANAGER_SURFACE_DASHBOARD_KEEP == frozenset() == _KEEP
+    assert server.MANAGER_SURFACE_DASHBOARD_KEEP_REASONS == {}
+    assert not [name for name in manager_run["registered"] if name.startswith(_DASHBOARD)]
+    assert {"aiworkhub_dashboard_needfix_transition", "aiworkhub_dashboard_snapshot"} <= set(all_run["registered"])
+    assert "needfix_transition" in manager_run["registered"]
 
 
 def test_explicit_all_surface_lists_the_full_registry(all_run: dict) -> None:
@@ -560,7 +580,7 @@ def test_manager_results_carry_one_text_copy_and_no_structured_content(all_run: 
         ("late_flip", all_run["snapshots"]["late_manager"]),
     ):
         for name in _SYNTHETIC_RESULTS:
-            if name == _SYNTHETIC_HIDDEN:
+            if name == _SYNTHETIC_HIDDEN or name in _SYNTHETIC_DASHBOARD_ONLY:
                 continue
             assert _result(snap["synthetic"]["calls"][name]["message"]) == {
                 "content": [{"type": "text", "text": _expected_text(name)}],
@@ -614,6 +634,11 @@ def test_synthetic_registry_filters_listing_and_calls_by_prefix_and_keep_set(
         assert _names(synthetic["list"]) == _SYNTHETIC_MANAGER
         assert _error(synthetic["calls"][_SYNTHETIC_HIDDEN]["message"]) == {"code": -32602, "message": expected}
         assert _error(synthetic["hidden_with_bad_arguments"]["message"]) == {"code": -32602, "message": expected}
+        # The former keep-set names are dashboard-only profile rows: refused on manager, naming dashboard and all.
+        for name in _SYNTHETIC_DASHBOARD_ONLY:
+            assert _error(synthetic["calls"][name]["message"]) == {
+                "code": -32602, "message": _off_profile_message(name, _SYNTHETIC_MANAGER),
+            }, name
     for snap in on_all + on_manager:
         synthetic = snap["synthetic"]
         assert _error(synthetic["visible_with_bad_arguments"]["message"])["message"] == "arguments_must_be_object"
@@ -625,7 +650,8 @@ def test_synthetic_registry_filters_listing_and_calls_by_prefix_and_keep_set(
 def test_decorator_skips_hidden_tools_yet_returns_the_function_unchanged(
     all_run: dict, manager_run: dict
 ) -> None:
-    hidden_on_manager = {"aiworkhub_dashboard_decorated", "renamed_plain"}
+    # aiworkhub_dashboard_snapshot is a dashboard-only profile row now, so manager skips it too.
+    hidden_on_manager = {"aiworkhub_dashboard_decorated", "aiworkhub_dashboard_snapshot", "renamed_plain"}
     for name, report in all_run["snapshots"]["all"]["decorator"].items():
         assert report["same_object"] and report["registered"], name
     for decorated in (

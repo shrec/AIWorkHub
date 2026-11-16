@@ -865,7 +865,7 @@ _CONVERT_PLAN: dict[str, Any] = {
     "allowed_writes": ["src/x.py"],
     "required_outputs": ["src/x.py"],
 }
-_TRANSITION = "aiworkhub_dashboard_needfix_transition"
+_TRANSITION = "needfix_transition"
 
 
 @pytest.mark.parametrize(
@@ -911,7 +911,9 @@ def test_convert_refusal_names_the_rule_and_the_transition_call(init: Path, stat
         needfix_store.convert_needfix(init, rec["id"], _reopen_create_task_fn)
     text = str(excinfo.value)
     assert "only status 'accepted'" in text
-    assert _TRANSITION in text
+    assert f"call {_TRANSITION} action=" in text
+    # The manager tool, never a webview-only dashboard name a manager surface cannot call.
+    assert "aiworkhub_dashboard_" not in text
     assert f"is '{status}'" in text
     if status == "captured":
         assert "action=triage" in text

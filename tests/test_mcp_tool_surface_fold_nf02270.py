@@ -179,7 +179,8 @@ def test_dashboard_snapshot_stays_with_a_recorded_reason() -> None:
     reason = mcp_tool_metadata.MCP_FOLD_KEPT_REASONS["aiworkhub_dashboard_snapshot"]
     assert "not a duplicate" in reason
     assert "aiworkhub_dashboard_snapshot" not in mcp_tool_metadata.MCP_DEPRECATED_FACET_ALIASES
-    assert server.mcp_tool_listed("aiworkhub_dashboard_snapshot", "manager") is True
+    assert server.mcp_tool_listed("aiworkhub_dashboard_snapshot", "manager") is False
+    assert server.mcp_tool_listed("aiworkhub_dashboard_snapshot", "dashboard") is True
 
 
 def test_inventory_ledger_counts_are_null_when_unmeasured(tmp_path: Path) -> None:

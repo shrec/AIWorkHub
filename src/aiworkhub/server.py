@@ -103,16 +103,11 @@ MCP_SURFACE_MANAGER = _tool_metadata.MCP_PROFILE_MANAGER
 MCP_SURFACES = _tool_metadata.MCP_SURFACES
 MCP_DASHBOARD_TOOL_PREFIX = _tool_metadata.MCP_DASHBOARD_TOOL_PREFIX
 
-# Why the manager profile keeps these dashboard tools; the rest serve the webview only.
-# MCP_TOOL_PROFILES is authoritative; a test pins this set to its manager dashboard entries.
-MANAGER_SURFACE_DASHBOARD_KEEP_REASONS: dict[str, str] = {
-    "aiworkhub_dashboard_needfix_transition": (
-        "the only NeedFix triage/accept transition, and needfix_store refusals name it"
-    ),
-    "aiworkhub_dashboard_snapshot": (
-        "the one-call queue summary its description addresses to managers"
-    ),
-}
+# The dashboard runs in its own process, so the manager profile keeps no dashboard tool:
+# NeedFix triage/accept is needfix_transition, the queue summary aiworkhub_task_plan_snapshot.
+# Both names stay exported (empty) for importers. MCP_TOOL_PROFILES is authoritative; a test
+# pins this set to its manager dashboard entries.
+MANAGER_SURFACE_DASHBOARD_KEEP_REASONS: dict[str, str] = {}
 MANAGER_SURFACE_DASHBOARD_KEEP = frozenset(MANAGER_SURFACE_DASHBOARD_KEEP_REASONS)
 
 _UNKNOWN_SURFACE_LOCK = threading.Lock()
@@ -9298,6 +9293,67 @@ def needfix_update(
         expected_updated_at=expected_updated_at,
     )
     return _needfix_update_receipt(row, kind_normalized=kind_normalized)
+
+
+NEEDFIX_TRANSITION_TOOL = needfix_store.TRANSITION_TOOL
+
+
+@mcp.tool()
+def needfix_transition(
+    needfix_id: str = "",
+    action: str = "",
+    reason: str = "",
+    readiness_score: int | None = None,
+    duplicate_parent_id: str = "",
+    confirm: bool = False,
+    include_item: bool = False,
+    promote_to: str = "",
+    needfix_ids: list[str] | None = None,
+    evidence: dict | None = None,
+    evidence_refs: list[str] | None = None,
+) -> dict:
+    """Manager lifecycle move of one NeedFix or up to 25: triage, accept, reject, defer, resolve and more.
+
+    Use this to triage and accept a captured NeedFix before converting it, or to
+    reject, defer, mark duplicate or task_planned, resolve, or recover a
+    conversion claim. Edit fields with needfix_update and retire an item with
+    needfix_archive instead. Requires confirm=True and returns the transition
+    receipt; ``server_tool`` names this tool.
+
+    A task-less fix closes with action=resolve_verified (readiness_score=100,
+    evidence, evidence_refs) or a `Resolves: NF-YYYY-NNNNN` commit trailer.
+    With needfix_ids the reply is {results, succeeded, failed} and a refused
+    row leaves the others applied.
+
+    Args:
+        needfix_id: ID to transition, e.g. NF-2026-01447; exactly one of this and needfix_ids.
+        action: triage, accept, reject, duplicate, defer, task_planned, resolve, resolve_verified, or recover_conversion_claim.
+        reason: Note, up to 1000 chars; required for recover_conversion_claim.
+        readiness_score: Optional integer score from 0 to 100 for triage, accept or resolve_verified.
+        duplicate_parent_id: Parent NeedFix ID for action=duplicate.
+        confirm: Must be True to execute; anything else is refused without a write.
+        include_item: True adds the full item detail to the receipt.
+        promote_to: Optional; only "accepted", and only with action=triage, to triage and accept in one call.
+        needfix_ids: Up to 25 distinct IDs, one result per id.
+        evidence: Merge-patch object written before the transition; resolve_verified only.
+        evidence_refs: Evidence reference strings to add; resolve_verified only.
+    """
+    # One transition path: the dashboard view owns the confirm rule, every gate
+    # and the receipt; only the reporting tool name differs.
+    result = dashboard_mcp_app.needfix_transition_view(
+        needfix_id=needfix_id,
+        action=action,
+        reason=reason,
+        readiness_score=readiness_score,
+        duplicate_parent_id=duplicate_parent_id,
+        confirm=confirm,
+        include_item=include_item,
+        promote_to=promote_to,
+        needfix_ids=needfix_ids,
+        evidence=evidence,
+        evidence_refs=evidence_refs,
+    )
+    return {**result, "server_tool": NEEDFIX_TRANSITION_TOOL}
 
 
 @mcp.tool()

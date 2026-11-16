@@ -782,23 +782,27 @@ def test_isolated_vsix_runtime_smoke_no_site_packages_fresh_repo(extracted_vsix,
         tools_list = session.recv()
         assert "error" not in tools_list, tools_list.get("error")
         names = {t["name"] for t in tools_list["result"]["tools"]}
-        assert "aiworkhub_dashboard_snapshot" in names
+        assert "aiworkhub_task_template_list" in names
         # RM-2026-00078: the unset default is the manager surface, which hides the webview-only tools.
         assert "aiworkhub_dashboard_health" not in names
+        # The dashboard runs in its own process; no aiworkhub_dashboard_* tool is on the manager surface.
+        assert "aiworkhub_dashboard_snapshot" not in names
+        assert not any(name.startswith("aiworkhub_dashboard_") for name in names)
 
+        # aiworkhub_task_template_list is a read-only manager-surface tool that
+        # needs no repository manifest, so it succeeds in a fresh repo.
         session.send({
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-            "params": {"name": "aiworkhub_dashboard_snapshot", "arguments": {}},
+            "params": {"name": "aiworkhub_task_template_list", "arguments": {}},
         })
-        snapshot = session.recv(30)
-        assert "error" not in snapshot, snapshot.get("error")
-        result = snapshot["result"]
+        listing = session.recv(30)
+        assert "error" not in listing, listing.get("error")
+        result = listing["result"]
         assert result.get("isError") is not True
         assert "structuredContent" not in result
         structured = json.loads(result["content"][0]["text"])
-        assert structured["server_tool"] == "aiworkhub_dashboard_snapshot"
-        assert "status_counts" in structured
-        assert "row_counts" in structured
+        assert structured.get("schema_id") == "aiworkhub.task_template_list.v1"
+        assert isinstance(structured["templates"], list) and structured["templates"]
     finally:
         _terminate(proc)
 
@@ -847,17 +851,16 @@ def test_isolated_vsix_runtime_bounded_protocol_errors_never_crash(extracted_vsi
 
         # A real call after all of the above still succeeds -- one bad
         # request never tears down the bounded fallback's read loop. Uses
-        # aiworkhub_dashboard_snapshot (not aiworkhub_dashboard_health):
-        # build_snapshot() isolates every provider failure via _safe_read,
-        # so it stays MCP-successful even in a fresh repo with no
-        # AITools/taskctl.py, unlike the raw health check.
+        # aiworkhub_task_template_list: it is a read-only tool on the default
+        # manager surface (no aiworkhub_dashboard_* tool is) that needs no
+        # repository manifest, so it stays MCP-successful in a fresh repo.
         session.send({
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-            "params": {"name": "aiworkhub_dashboard_snapshot", "arguments": {}},
+            "params": {"name": "aiworkhub_task_template_list", "arguments": {}},
         })
-        snapshot = session.recv(30)
-        assert "error" not in snapshot, snapshot.get("error")
-        assert snapshot["result"].get("isError") is not True
+        listing = session.recv(30)
+        assert "error" not in listing, listing.get("error")
+        assert listing["result"].get("isError") is not True
     finally:
         _terminate(proc)
 
