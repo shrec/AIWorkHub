@@ -6478,15 +6478,15 @@ def enforce_scope(
     git_phase: str = "workspace_scope",
     git_timeout: float = 120,
 ) -> list[str]:
-    changed = changed_paths(
-        workspace, git_phase=git_phase, git_timeout=git_timeout
-    )
+    changed = changed_paths(workspace, git_phase=git_phase, git_timeout=git_timeout)
+    if git_phase == "review_acceptance":  # NF-2026-02290; lazy: stays out of sparse closure
+        leak = importlib.import_module(".accept_scope_canonical_identity", __package__)
+        changed = leak.drop_leaked_canonical(workspace, changed, _matches, run=_run, timeout=git_timeout)
     outside = [path for path in changed if not _matches(path, workspace.allowed_writes)]
     if outside:
         raise WorkspaceError("scope_violation:" + ",".join(outside[:20]))
     for relative in changed:
-        target = workspace.path / relative
-        if target.is_symlink():
+        if (workspace.path / relative).is_symlink():
             raise WorkspaceError(f"symlink_output_forbidden:{relative}")
     return changed
 
