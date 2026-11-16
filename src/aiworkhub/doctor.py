@@ -361,11 +361,153 @@ def _heap_census(max_objects: int) -> dict[str, Any]:
     }
 
 
+NATIVE_MEMORY_KEYS = (
+    "sqlite_memory_used",
+    "sqlite_memory_highwater",
+    "live_sqlite_connections",
+    "python_allocated_blocks",
+    "private_bytes",
+    "peak_working_set_bytes",
+)
+
+
+class _NativeUnavailable(Exception):
+    """A native probe cannot run here; the message is the named reason."""
+
+
+def _sqlite_library() -> Any:
+    """ctypes handle on the sqlite3 library that the stdlib ``_sqlite3`` module loaded."""
+    try:
+        import ctypes
+        import _sqlite3
+
+        module_file = Path(str(_sqlite3.__file__))
+        if platform_io.is_windows():
+            return ctypes.CDLL(str(module_file.parent / "sqlite3.dll"))
+        return ctypes.CDLL(str(module_file))
+    except (ImportError, OSError, AttributeError, TypeError) as error:
+        raise _NativeUnavailable(f"sqlite_library_unresolved:{type(error).__name__}") from error
+
+
+def _sqlite_counter(symbol: str, *args: int) -> int:
+    """Read-only call of a sqlite3 ``sqlite3_int64 f(...)`` memory counter."""
+    import ctypes
+
+    library = _sqlite_library()
+    try:
+        function = getattr(library, symbol)
+    except AttributeError as error:
+        raise _NativeUnavailable(f"sqlite_symbol_missing:{symbol}") from error
+    function.restype = ctypes.c_int64
+    function.argtypes = [ctypes.c_int] * len(args)
+    return int(function(*args))
+
+
+def _sqlite_memory_used() -> int:
+    return _sqlite_counter("sqlite3_memory_used")
+
+
+def _sqlite_memory_highwater() -> int:
+    # resetFlag=0: the high-water mark is read, never reset.
+    return _sqlite_counter("sqlite3_memory_highwater", 0)
+
+
+def _live_sqlite_connections() -> int:
+    import sqlite3
+
+    connection_type = sqlite3.Connection
+    objects = gc.get_objects()
+    try:
+        # type(), never isinstance: a weakref proxy forwards __class__ to its referent.
+        return sum(1 for obj in objects if issubclass(type(obj), connection_type))
+    finally:
+        del objects
+
+
+def _windows_memory_counters() -> Mapping[str, int]:
+    if not platform_io.is_windows():
+        raise _NativeUnavailable("windows_only")
+    import ctypes
+    from ctypes import wintypes
+
+    class ProcessMemoryCountersEx(ctypes.Structure):
+        _fields_ = (
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+            ("PrivateUsage", ctypes.c_size_t),
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.K32GetProcessMemoryInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(ProcessMemoryCountersEx),
+        wintypes.DWORD,
+    ]
+    kernel32.K32GetProcessMemoryInfo.restype = wintypes.BOOL
+    counters = ProcessMemoryCountersEx()
+    counters.cb = ctypes.sizeof(counters)
+    if not kernel32.K32GetProcessMemoryInfo(
+        kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+    ):
+        raise OSError(ctypes.get_last_error(), "GetProcessMemoryInfo failed")
+    return {
+        "private_bytes": int(counters.PrivateUsage),
+        "peak_working_set_bytes": int(counters.PeakWorkingSetSize),
+    }
+
+
+def _private_bytes() -> int:
+    return _windows_memory_counters()["private_bytes"]
+
+
+def _peak_working_set_bytes() -> int:
+    return _windows_memory_counters()["peak_working_set_bytes"]
+
+
+def _native_memory() -> dict[str, Any]:
+    """Bounded read-only native-memory probes; each value is an int, null or ``{error}``.
+
+    A null value names its cause under ``reasons``; a probe that raises reports
+    ``{"error": <exception type name>}`` and never affects the other probes.
+    Nothing is mutated: sqlite's high-water mark is read with resetFlag=0.
+    """
+    probes: dict[str, Callable[[], int]] = {
+        "sqlite_memory_used": _sqlite_memory_used,
+        "sqlite_memory_highwater": _sqlite_memory_highwater,
+        "live_sqlite_connections": _live_sqlite_connections,
+        "python_allocated_blocks": sys.getallocatedblocks,
+        "private_bytes": _private_bytes,
+        "peak_working_set_bytes": _peak_working_set_bytes,
+    }
+    section: dict[str, Any] = {}
+    reasons: dict[str, str] = {}
+    for key in NATIVE_MEMORY_KEYS:
+        try:
+            section[key] = probes[key]()
+        except _NativeUnavailable as unavailable:
+            section[key] = None
+            reasons[key] = _bounded(unavailable)
+        except Exception as error:
+            section[key] = {"error": type(error).__name__}
+    section["reasons"] = reasons
+    return section
+
+
 def server_process(*, heap_census: bool = False) -> dict[str, Any]:
     """Identify and size the process answering this call; never raises.
 
     ``heap_census=True`` adds a bounded live-heap census (NF-2026-02273):
-    type names, counts and shallow sizes only, never object contents.
+    type names, counts and shallow sizes only, never object contents, and a
+    read-only ``native_memory`` section (NF-2026-02289).
     """
 
     reply: dict[str, Any] = {
@@ -380,6 +522,10 @@ def server_process(*, heap_census: bool = False) -> dict[str, Any]:
             reply["heap_census"] = _heap_census(HEAP_CENSUS_MAX_OBJECTS)
         except Exception as error:
             reply["heap_census"] = {"error": type(error).__name__}
+        try:
+            reply["native_memory"] = _native_memory()
+        except Exception as error:
+            reply["native_memory"] = {"error": type(error).__name__}
     return reply
 
 
