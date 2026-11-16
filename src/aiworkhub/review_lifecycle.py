@@ -71,6 +71,9 @@ PLAN: tuple[tuple[int, str, str, str], ...] = (
     (10, "target", "target_archive", ""),
     (11, "needfix", "needfix_close", ""),
 )
+# Reviewer-lens phases, derived from PLAN so the set has a single owner. See
+# ``_action_gates_on`` for how a lens phase changes action gating.
+LENS_PHASES: frozenset[str] = frozenset(phase for _, phase, _, lens in PLAN if lens)
 
 MANAGER_READY_SCHEMA_ID = "aiworkhub.manager_ready_receipt.v1"
 MANAGER_READY_ACTION_TYPES = frozenset({"target_accept"})
@@ -713,9 +716,9 @@ def defer_action(
 def lifecycle_counts(db_path: str | Path) -> dict[str, int]:
     """Return truthful bounded state counts after authenticating every chain.
 
-    ``pending`` alone is not a queue depth. An action whose chain already has a
-    failed action can never be reserved -- every later action in that chain
-    waits on it -- so it is parked, not queued. Measured on this repository:
+    ``pending`` alone is not a queue depth. An action behind an earlier failed
+    action it gates on (see ``_action_gates_on``) can never be reserved, so it
+    is parked, not queued. Measured on this repository:
     1,847 pending, of which 1,389 were parked behind 129 failed chains. A
     reader deciding whether the orchestrator has work cannot tell those apart
     from one number, and 'pending' read as a backlog it would never work off.
@@ -742,10 +745,19 @@ def _state_counts(conn: sqlite3.Connection) -> dict[str, int]:
         "SELECT state, COUNT(*) AS count FROM review_action_outbox GROUP BY state"
     ):
         counts[str(row["state"])] = int(row["count"])
+    # A pending row is parked only behind an earlier failed row it gates on:
+    # this is ``_action_gates_on`` expressed in SQL (a lens row gates on its
+    # own phase only, a non-lens row on every phase), parameterised by
+    # ``LENS_PHASES`` so a sibling lens stays counted as reservable.
+    lens_phases = sorted(LENS_PHASES)
+    placeholders = ",".join("?" for _ in lens_phases)
     parked = conn.execute(
-        "SELECT COUNT(*) FROM review_action_outbox WHERE state='pending' "
-        "AND chain_id IN (SELECT chain_id FROM review_action_outbox "
-        "WHERE state='failed')"
+        "SELECT COUNT(*) FROM review_action_outbox AS p WHERE p.state='pending' "
+        "AND EXISTS (SELECT 1 FROM review_action_outbox AS f "
+        "WHERE f.chain_id=p.chain_id AND f.state='failed' "
+        "AND f.action_index<p.action_index "
+        f"AND (f.phase=p.phase OR p.phase NOT IN ({placeholders})))",
+        lens_phases,
     ).fetchone()[0]
     counts["pending_parked"] = int(parked)
     counts["pending_reservable"] = max(0, counts.get("pending", 0) - int(parked))
@@ -1564,6 +1576,17 @@ def _verify_all_chains(conn: sqlite3.Connection) -> None:
         )
 
 
+def _action_gates_on(phase: str, prior_phase: str) -> bool:
+    """Whether a row in ``phase`` must wait for an earlier row in ``prior_phase``.
+
+    The single owner of the gating policy, used both to reserve and to retire
+    descendants of a failure. A lens row waits only for earlier rows of its own
+    lens, so the required reviewer lenses run in parallel; any non-lens row
+    ('target', 'needfix') waits for every earlier row of the chain.
+    """
+    return phase not in LENS_PHASES or prior_phase == phase
+
+
 def _prior_actions_completed(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -1578,8 +1601,11 @@ def _prior_actions_completed(
     ).fetchall()
     if len(prior_rows) != action_index:
         raise ReviewLifecycleError("descriptor_tamper")
+    phase = str(row["phase"])
     for prior in prior_rows:
         _verify_action_row(conn, prior, identity, identity_sha256)
+        if not _action_gates_on(phase, str(prior["phase"])):
+            continue
         if str(prior["state"]) != "completed":
             return False
     return True
@@ -2054,9 +2080,12 @@ def reconcile_dead_chains(
 ) -> dict[str, int]:
     """Bounded, idempotent pass that retires dead-chain descendants.
 
-    A failed action permanently blocks every later action in its chain --
+    A failed action permanently blocks the later actions that gate on it --
     ``_prior_actions_completed`` never sees a failed prior as complete -- so
-    those descendants would stay ``pending`` forever without this. Each call
+    those descendants would stay ``pending`` forever without this. A failed
+    lens action retires the pending rows of its own phase plus every non-lens
+    row, never a sibling lens's rows (they do not gate on it); a failed
+    non-lens action retires every later pending row. Each call
     inspects at most ``batch_limit`` failed actions through an indexed keyset
     cursor that always advances and wraps back to the start once exhausted,
     so a chain that fails after a busy one is never permanently starved.
@@ -2111,6 +2140,12 @@ def reconcile_dead_chains(
             ).fetchall()
             for descendant in descendants:
                 _verify_action_row(conn, descendant, identity, chain_identity_sha256)
+            failed_phase = str(failed["phase"])
+            for descendant in descendants:
+                if not _action_gates_on(str(descendant["phase"]), failed_phase):
+                    # A sibling lens never gates on this lens's rows, so it
+                    # stays reservable; its own failure is retired by itself.
+                    continue
                 updated = conn.execute(
                     "UPDATE review_action_outbox SET state='retired', "
                     "retired_due_to_action_id=?, failure_reason=?, completed_at=?, "

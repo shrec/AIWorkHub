@@ -43,6 +43,32 @@ def _reserve(db: Path, *, now: datetime = NOW) -> review_lifecycle.ReviewAction:
     return action
 
 
+def _reserve_chain_head(
+    db: Path,
+    chain_id: int,
+    *,
+    owner: str = "worker-a",
+    lease_token: str = "lease-a",
+) -> review_lifecycle.ReviewAction:
+    """Reserve ``chain_id``'s head, deferring other ready rows on the way.
+
+    NF-2026-02292 lets a chain's sibling lens launches run in parallel, so a
+    test can no longer assume the next reservation is a newer chain's head.
+    """
+    for _ in range(64):
+        action = review_lifecycle.reserve_next_action(
+            db, owner=owner, lease_token=lease_token, now=NOW, lease_seconds=60
+        )
+        assert action is not None
+        if action.chain_id == chain_id and action.action_index == 0:
+            return action
+        assert review_lifecycle.defer_action(
+            db, action_id=action.action_id, owner=owner,
+            lease_token=lease_token, now=NOW,
+        )
+    raise AssertionError(f"chain {chain_id} head was never reserved")
+
+
 def _tamper(db: Path, column: str, value: object, *, action_index: int = 0) -> None:
     conn = sqlite3.connect(db)
     try:
@@ -226,8 +252,11 @@ def test_two_connection_concurrency_blocks_behind_reserved_head_action(tmp_path:
         thread.join()
 
     assert errors == []
+    # NF-2026-02292: lenses run in parallel, so the second concurrent reserver
+    # gets the security launch (3) instead of None; the correctness accept (1)
+    # still blocks behind the reserved correctness launch (0).
     ordered_results = sorted(results, key=lambda value: -1 if value is None else value)
-    assert ordered_results == [None, 0]
+    assert ordered_results == [0, 3]
 
     first = next(row for row in review_lifecycle.rows_for_test(db) if row["action_index"] == 0)
     assert review_lifecycle.complete_action(
@@ -238,11 +267,19 @@ def test_two_connection_concurrency_blocks_behind_reserved_head_action(tmp_path:
         receipt={"ok": True},
         now=NOW + timedelta(seconds=1),
     )
-    second = review_lifecycle.reserve_next_action(
-        db, owner="worker-after", lease_token="worker-after-token", now=NOW, lease_seconds=60
-    )
-    assert second is not None
-    assert second.action_index == 1
+    reserved: list[int] = []
+    for attempt in range(4):
+        nxt = review_lifecycle.reserve_next_action(
+            db, owner="worker-after", lease_token=f"worker-after-token-{attempt}",
+            now=NOW, lease_seconds=60,
+        )
+        if nxt is None:
+            break
+        reserved.append(nxt.action_index)
+    # The cursor continues past the security launch: code_quality launch (6),
+    # then the now-unblocked correctness accept (1) after the round wraps; the
+    # security accept (4) still waits on the reserved security launch.
+    assert reserved == [6, 1]
 
 
 def test_expired_reclaim_is_deterministic_and_malformed_time_fails(tmp_path: Path) -> None:
@@ -724,23 +761,31 @@ def test_reconcile_retires_pending_descendants_of_a_failed_action_and_blocks_the
         reason="boom", now=NOW,
     )
 
+    # NF-2026-02292: lenses run in parallel. The failed correctness launch
+    # retires its own phase (1, 2) and every non-lens row (9-11); the security
+    # and code_quality rows (3-8) never gated on it and stay reservable.
     result = review_lifecycle.reconcile_dead_chains(db, now=NOW)
-    assert result["retired"] == 11
+    assert result["retired"] == 5
     assert result["examined_failed"] == 1
 
     rows = {row["action_index"]: row for row in review_lifecycle.rows_for_test(db)}
-    for index in range(1, 12):
+    for index in (1, 2, 9, 10, 11):
         assert rows[index]["state"] == "retired"
         assert rows[index]["retired_due_to_action_id"] == str(action.action_id)
+    for index in range(3, 9):
+        assert rows[index]["state"] == "pending"
 
     counts = review_lifecycle.lifecycle_counts(db)
     assert counts["failed"] == 1
-    assert counts["retired"] == 11
-    assert counts["pending"] == 0
+    assert counts["retired"] == 5
+    assert counts["pending"] == 6
+    assert counts["pending_parked"] == 0
 
-    assert review_lifecycle.reserve_next_action(
+    nxt = review_lifecycle.reserve_next_action(
         db, owner="worker-b", lease_token="lease-b", now=NOW,
-    ) is None
+    )
+    assert nxt is not None
+    assert (nxt.phase, nxt.action_type) == ("security", "launch")
 
 
 def test_reconcile_dead_chains_is_idempotent_across_repeated_passes(tmp_path: Path) -> None:
@@ -752,8 +797,10 @@ def test_reconcile_dead_chains_is_idempotent_across_repeated_passes(tmp_path: Pa
         reason="boom", now=NOW,
     )
 
+    # NF-2026-02292: own phase (2) + non-lens rows (3); the 6 sibling lens rows
+    # do not gate on the failed correctness launch and stay pending.
     first = review_lifecycle.reconcile_dead_chains(db, now=NOW)
-    assert first["retired"] == 11
+    assert first["retired"] == 5
 
     second = review_lifecycle.reconcile_dead_chains(db, now=NOW)
     assert second["retired"] == 0
@@ -763,8 +810,8 @@ def test_reconcile_dead_chains_is_idempotent_across_repeated_passes(tmp_path: Pa
     assert third["retired"] == 0
 
     counts = review_lifecycle.lifecycle_counts(db)
-    assert counts["retired"] == 11
-    assert counts["pending"] == 0
+    assert counts["retired"] == 5
+    assert counts["pending"] == 6
 
 
 def test_route_unavailable_failure_requeues_exact_chain_and_descendants(
@@ -778,14 +825,15 @@ def test_route_unavailable_failure_requeues_exact_chain_and_descendants(
         db, action_id=action.action_id, owner="worker-a", lease_token="lease-a",
         reason=reason, now=NOW,
     )
-    assert review_lifecycle.reconcile_dead_chains(db, now=NOW)["retired"] == 11
+    # NF-2026-02292: own phase (2) + non-lens rows (3); sibling lenses stay pending.
+    assert review_lifecycle.reconcile_dead_chains(db, now=NOW)["retired"] == 5
 
     recovered = review_lifecycle.recover_route_unavailable_chains(db, now=NOW)
 
     assert recovered == {
         "examined": 1,
         "recovered": 1,
-        "descendants_requeued": 11,
+        "descendants_requeued": 5,
     }
     rows = review_lifecycle.rows_for_test(db)
     assert {row["state"] for row in rows} == {"pending"}
@@ -812,7 +860,8 @@ def test_route_unavailable_recovery_does_not_requeue_other_failures(
 
     assert recovered["recovered"] == 0
     assert review_lifecycle.lifecycle_counts(db)["failed"] == 1
-    assert review_lifecycle.lifecycle_counts(db)["retired"] == 11
+    # NF-2026-02292: own phase (2) + non-lens rows (3); sibling lenses stay pending.
+    assert review_lifecycle.lifecycle_counts(db)["retired"] == 5
 
 
 def test_terminal_binding_recovery_reopens_only_the_exact_authorized_action(
@@ -839,7 +888,9 @@ def test_terminal_binding_recovery_reopens_only_the_exact_authorized_action(
         reason=review_lifecycle.TERMINAL_ROUTE_BINDING_FAILURE,
         now=NOW,
     )
-    assert review_lifecycle.reconcile_dead_chains(db, now=NOW)["retired"] == 10
+    # NF-2026-02292: the failed correctness accept retires only its own phase
+    # (archive) and the 3 non-lens rows; sibling lens rows do not gate on it.
+    assert review_lifecycle.reconcile_dead_chains(db, now=NOW)["retired"] == 4
 
     failures = review_lifecycle.terminal_route_binding_failures(db)
     assert [item.action_id for item in failures] == [accept.action_id]
@@ -847,7 +898,7 @@ def test_terminal_binding_recovery_reopens_only_the_exact_authorized_action(
         db, action_id=accept.action_id, now=NOW,
     )
 
-    assert recovered == {"recovered": 1, "descendants_requeued": 10}
+    assert recovered == {"recovered": 1, "descendants_requeued": 4}
     rows = {row["action_index"]: row for row in review_lifecycle.rows_for_test(db)}
     assert rows[0]["state"] == "completed"
     assert {rows[index]["state"] for index in range(1, 12)} == {"pending"}
@@ -861,7 +912,7 @@ def test_reconcile_dead_chains_is_bounded_per_pass_and_progresses_deterministica
 ) -> None:
     db = tmp_path / "task.sqlite"
     for index in range(5):
-        review_lifecycle.create_or_replay_chain(
+        new_chain = review_lifecycle.create_or_replay_chain(
             db,
             target_task_id=f"BOUND-{index}",
             target_request_id=f"req-bound-{index}",
@@ -870,27 +921,29 @@ def test_reconcile_dead_chains_is_bounded_per_pass_and_progresses_deterministica
             candidate_sha256=f"{(index + 1) % 10}" * 64,
             now=NOW,
         )
-        head = review_lifecycle.reserve_next_action(
-            db, owner=f"worker-{index}", lease_token=f"lease-{index}",
-            now=NOW, lease_seconds=60,
+        # NF-2026-02292: earlier chains' sibling lens launches stay ready after
+        # their correctness head fails, so reach this chain's head explicitly.
+        head = _reserve_chain_head(
+            db, new_chain.chain_id, owner=f"worker-{index}", lease_token=f"lease-{index}"
         )
-        assert head is not None
         review_lifecycle.fail_action(
             db, action_id=head.action_id, owner=f"worker-{index}",
             lease_token=f"lease-{index}", reason="boom", now=NOW,
         )
 
+    # NF-2026-02292: a failed correctness launch retires its own phase (2) plus
+    # the non-lens rows (3) = 5 per chain; sibling lens rows stay pending.
     first = review_lifecycle.reconcile_dead_chains(db, now=NOW, batch_limit=2)
     assert first["examined_failed"] == 2
-    assert first["retired"] == 22
+    assert first["retired"] == 10
 
     second = review_lifecycle.reconcile_dead_chains(db, now=NOW, batch_limit=2)
     assert second["examined_failed"] == 2
-    assert second["retired"] == 22
+    assert second["retired"] == 10
 
     third = review_lifecycle.reconcile_dead_chains(db, now=NOW, batch_limit=2)
     assert third["examined_failed"] == 1
-    assert third["retired"] == 11
+    assert third["retired"] == 5
 
     fourth = review_lifecycle.reconcile_dead_chains(db, now=NOW, batch_limit=2)
     assert fourth["wrapped"] == 1
@@ -899,8 +952,9 @@ def test_reconcile_dead_chains_is_bounded_per_pass_and_progresses_deterministica
 
     counts = review_lifecycle.lifecycle_counts(db)
     assert counts["failed"] == 5
-    assert counts["retired"] == 55
-    assert counts["pending"] == 0
+    assert counts["retired"] == 25
+    assert counts["pending"] == 30
+    assert counts["pending_parked"] == 0
 
 
 def test_reconcile_dead_chains_fails_closed_when_a_descendant_descriptor_is_tampered(
@@ -1014,15 +1068,27 @@ def test_deferred_head_does_not_starve_a_later_ready_chain_in_same_round(
         lease_token="lease-first", now=NOW,
     )
 
-    second = review_lifecycle.reserve_next_action(
-        db, owner="worker-second", lease_token="lease-second", now=NOW,
-        lease_seconds=60,
-    )
+    # NF-2026-02292: lenses run in parallel, so the first chain's security and
+    # code_quality launches are ready too and sit between the deferred head
+    # and the later chain. The invariant is unchanged: the deferred head is
+    # not reselected before the round reaches the later chain's head.
+    seen: list[review_lifecycle.ReviewAction] = []
+    for attempt in range(8):
+        second = review_lifecycle.reserve_next_action(
+            db, owner="worker-second", lease_token=f"lease-second-{attempt}",
+            now=NOW, lease_seconds=60,
+        )
+        assert second is not None
+        assert second.action_id != first.action_id
+        seen.append(second)
+        if second.chain_id == later_chain.chain_id:
+            break
 
-    assert second is not None
-    assert second.action_id != first.action_id
-    assert second.chain_id == later_chain.chain_id
-    assert second.action_index == 0
+    assert [(a.chain_id, a.action_index) for a in seen] == [
+        (first_chain.chain_id, 3),
+        (first_chain.chain_id, 6),
+        (later_chain.chain_id, 0),
+    ]
 
 
 def test_retired_evidence_fails_closed_for_malformed_cross_chain_later_and_nonfailed_causes(
@@ -1077,10 +1143,15 @@ def test_retired_evidence_fails_closed_for_malformed_cross_chain_later_and_nonfa
         review_lifecycle.actions_for_chain(db, chain_a.chain_id)
 
     # cross-chain: points at a real failed action in a different chain.
-    head_b = review_lifecycle.reserve_next_action(
-        db, owner="worker-b", lease_token="lease-b", now=NOW, lease_seconds=60,
+    # NF-2026-02292: chain A's security launch is reservable after its failed
+    # correctness head (lenses run in parallel), so reach chain B's head
+    # explicitly rather than assuming it is the next reservation. Chain A's
+    # pending security rows now authenticate retired row 1 while reserving,
+    # so restore its valid cause first or that reservation fails closed.
+    set_cause(valid_cause)
+    head_b = _reserve_chain_head(
+        db, chain_b.chain_id, owner="worker-b", lease_token="lease-b"
     )
-    assert head_b is not None
     assert head_b.chain_id == chain_b.chain_id
     review_lifecycle.fail_action(
         db, action_id=head_b.action_id, owner="worker-b", lease_token="lease-b",
@@ -1237,7 +1308,11 @@ def test_more_than_256_blocked_pending_descendants_do_not_starve_a_later_ready_h
     """
     db = tmp_path / "task.sqlite"
     chain_ids = []
-    for index in range(24):
+    # NF-2026-02292: lenses run in parallel, so a failed correctness launch no
+    # longer blocks the security/code_quality launches. Every lens launch is
+    # force-failed instead (3 per chain), and 30 chains keep the blocked
+    # population above the 256-row scan window.
+    for index in range(30):
         chain = review_lifecycle.create_or_replay_chain(
             db,
             target_task_id=f"BLOCK-{index}",
@@ -1254,7 +1329,7 @@ def test_more_than_256_blocked_pending_descendants_do_not_starve_a_later_ready_h
             conn.execute(
                 "UPDATE review_action_outbox SET state='failed', owner='forced', "
                 "lease_token='forced-token', lease_expires_at=?, completed_at=?, "
-                "failure_reason='boom' WHERE chain_id=? AND action_index=0",
+                "failure_reason='boom' WHERE chain_id=? AND action_index IN (0, 3, 6)",
                 (
                     NOW.isoformat(timespec="microseconds"),
                     NOW.isoformat(timespec="microseconds"),
@@ -1264,9 +1339,9 @@ def test_more_than_256_blocked_pending_descendants_do_not_starve_a_later_ready_h
         conn.commit()
     finally:
         conn.close()
-    # 24 failed heads leave 24 * 11 = 264 same-chain-blocked pending
-    # descendants -- more than the 256-row scan window -- all with a lower
-    # action_id than the later chain created below.
+    # 30 chains with every lens launch failed leave 30 * 9 = 270
+    # same-chain-blocked pending descendants -- more than the 256-row scan
+    # window -- all with a lower action_id than the later chain created below.
     target = review_lifecycle.create_or_replay_chain(
         db, target_task_id="LATE-TARGET", target_request_id="req-late-target",
         claim_epoch=1, packet_sha256="e" * 64, candidate_sha256="f" * 64, now=NOW,
@@ -1388,9 +1463,13 @@ def test_orchestrator_drain_reconciles_dead_chain_descendants_before_reserving(
     assert result.attempted == 0
     counts = review_lifecycle.lifecycle_counts(db)
     assert counts["failed"] == 1
-    assert counts["retired"] == len(review_lifecycle.PLAN) - 1
-    assert counts["pending"] == 0
+    # NF-2026-02292: a failed correctness launch retires its own phase (2 rows)
+    # plus the 3 non-lens rows; the 6 security/code_quality rows do not gate on
+    # it, so they stay pending and reservable rather than parked.
+    assert counts["retired"] == 5
+    assert counts["pending"] == 6
     assert counts["pending_parked"] == 0
+    assert counts["pending_reservable"] == 6
     assert manager.events == []
 
 
@@ -1419,7 +1498,10 @@ def test_drain_recovers_a_stalled_chain_while_binding_recovery_stays_fail_closed
         reason=review_lifecycle.TERMINAL_ROUTE_BINDING_FAILURE, now=NOW,
     )
     successor = _named_chain(db, index=1)
-    stalled = _reserve(db)
+    # NF-2026-02292: the stranded chain's security launch is reservable now
+    # (lenses run in parallel), so reach the successor's head explicitly
+    # instead of assuming it is the very next reservation.
+    stalled = _reserve_chain_head(db, successor.chain_id)
     assert stalled.chain_id == successor.chain_id
     assert stalled.action_index == 0
     review_lifecycle.fail_action(
@@ -1445,10 +1527,11 @@ def test_drain_recovers_a_stalled_chain_while_binding_recovery_stays_fail_closed
     }
     assert stranded_rows[0]["state"] == "completed"
     assert stranded_rows[1]["state"] == "failed"
-    assert {
-        stranded_rows[index]["state"]
-        for index in range(2, len(review_lifecycle.PLAN))
-    } == {"retired"}
+    # NF-2026-02292: lenses run in parallel, so the failed correctness accept
+    # retires only its own phase (index 2) and the non-lens rows (9-11); the
+    # security and code_quality rows (3-8) do not gate on it and stay pending.
+    assert {stranded_rows[index]["state"] for index in (2, 9, 10, 11)} == {"retired"}
+    assert {stranded_rows[index]["state"] for index in range(3, 9)} == {"pending"}
     remaining = review_lifecycle.terminal_route_binding_failures(db)
     assert [item.action_id for item in remaining] == [held.action_id]
 
