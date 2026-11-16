@@ -1281,6 +1281,96 @@ def _needfix_rank_risk_tier(card: Mapping[str, Any]) -> str:
         return declared or "medium"
 
 
+# NF-2026-02302: when no candidate has a decided outcome every worker shares the
+# conservative prior, so "cheapest estimated cost" alone picks the runner and
+# every converted card landed on the cheapest tier regardless of difficulty.
+_NEEDFIX_FILL_SOURCE_RANK_PRIOR_ONLY = "workforce_rank:prior_only_mid_tier"
+_NEEDFIX_CONTRACT_FILL_SOURCE_KEY = "runner_fill_source"
+
+
+def _needfix_candidate_sample_count(candidate: Mapping[str, Any]) -> int:
+    components = candidate.get("score_components")
+    if not isinstance(components, Mapping):
+        return 0
+    try:
+        return int(components.get("sample_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _needfix_candidate_cost(candidate: Mapping[str, Any]) -> float | None:
+    components = candidate.get("score_components")
+    cost = components.get("estimated_cost_usd") if isinstance(components, Mapping) else None
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+        return None
+    return float(cost)
+
+
+# The only exclusion a prior-only ranking can earn without a hard fault: the
+# conservative prior (0.5) sits under the requested quality floor, so EVERY
+# candidate carries this reason. It is not evidence against the route.
+_NEEDFIX_PRIOR_FLOOR_EXCLUSION_REASON = "observed_or_prior_quality_below_floor"
+
+
+def _needfix_candidate_usable_for_prior_only_fill(candidate: Mapping[str, Any]) -> bool:
+    """True for a launchable candidate; a prior-driven floor exclusion alone is tolerated.
+
+    Any other exclusion (unavailable, credentials, capability, ...) is a hard
+    reason. An excluded candidate with no named reasons is refused (fail closed).
+    """
+
+    runner = candidate.get("execution_runner")
+    if not (isinstance(runner, str) and runner.strip()):
+        return False
+    if not candidate.get("excluded"):
+        return True
+    reasons = candidate.get("exclusion_reasons")
+    if not isinstance(reasons, (list, tuple)) or not reasons:
+        return False
+    return all(reason == _NEEDFIX_PRIOR_FLOOR_EXCLUSION_REASON for reason in reasons)
+
+
+def _needfix_prior_only_mid_tier_contract(
+    ranked: Mapping[str, Any], contract: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    """``contract`` re-pointed at the best candidate above the cheapest cost tier.
+
+    Applies only when EVERY usable candidate rests on the conservative prior
+    alone (``score_components.sample_count`` 0). Candidates excluded solely by
+    the prior-driven quality floor stay usable; candidates excluded for any
+    other reason are skipped. The first usable candidate in rank order whose
+    known ``estimated_cost_usd`` exceeds the minimum among the usable
+    candidates is chosen. An unknown cost never counts as a higher tier. When no
+    such candidate exists, or it is the top-1 runner already, ``contract`` is
+    returned unchanged.
+    """
+
+    candidates = [
+        item
+        for item in (ranked.get("candidates") or ())
+        if isinstance(item, Mapping) and _needfix_candidate_usable_for_prior_only_fill(item)
+    ]
+    if not candidates or any(_needfix_candidate_sample_count(item) != 0 for item in candidates):
+        return contract
+    costs = [cost for cost in map(_needfix_candidate_cost, candidates) if cost is not None]
+    if not costs:
+        return contract
+    floor_cost = min(costs)
+    for item in candidates:
+        cost = _needfix_candidate_cost(item)
+        if cost is not None and cost > floor_cost:
+            if item["execution_runner"] == contract.get("runner"):
+                return contract
+            return {
+                **contract,
+                "runner": item["execution_runner"],
+                "adapter_id": item.get("adapter_id"),
+                "model": item.get("model"),
+                _NEEDFIX_CONTRACT_FILL_SOURCE_KEY: _NEEDFIX_FILL_SOURCE_RANK_PRIOR_ONLY,
+            }
+    return contract
+
+
 def _needfix_rank_launch_contract(needfix_id: str, plan: Mapping[str, Any]) -> Mapping[str, Any]:
     card = _needfix_merged_card(needfix_id, plan)
     task_type = card.get("task_type")
@@ -1293,7 +1383,9 @@ def _needfix_rank_launch_contract(needfix_id: str, plan: Mapping[str, Any]) -> M
     except (OSError, ValueError, TypeError, KeyError, RuntimeError):
         return {}
     contract = ranked.get("launch_contract") if isinstance(ranked, Mapping) else None
-    return contract if isinstance(contract, Mapping) else {}
+    if not isinstance(contract, Mapping):
+        return {}
+    return _needfix_prior_only_mid_tier_contract(ranked, contract)
 
 
 def _normalize_needfix_task_plan(
@@ -1303,8 +1395,12 @@ def _normalize_needfix_task_plan(
 
     Shape coercions are owned by ``needfix_store.coerce_task_plan_shape``. An
     omitted ``runner`` is filled from the workforce_rank top-1 launch contract
-    and an omitted ``topic`` from that contract, else the conversion default.
-    A runner the ranking cannot name stays missing, so validation still refuses.
+    (``workforce_rank:top1``), or, when that ranking rests on the conservative
+    prior only, from the best candidate above the cheapest cost tier
+    (``workforce_rank:prior_only_mid_tier``). An omitted ``topic`` is filled
+    from that contract, else the conversion default. An explicit runner is never
+    touched. A runner the ranking cannot name stays missing, so validation
+    still refuses.
     """
 
     plan, normalizations = needfix_store.coerce_task_plan_shape(task_plan)
@@ -1318,6 +1414,8 @@ def _normalize_needfix_task_plan(
     for field in missing:
         value = contract.get(field)
         source = _NEEDFIX_FILL_SOURCE_RANK
+        if field == "runner":
+            source = contract.get(_NEEDFIX_CONTRACT_FILL_SOURCE_KEY) or source
         if field == "topic" and not (isinstance(value, str) and value.strip()):
             value, source = _NEEDFIX_DEFAULT_TOPIC, _NEEDFIX_FILL_SOURCE_DEFAULT_TOPIC
         if isinstance(value, str) and value.strip():
