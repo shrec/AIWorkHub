@@ -9,7 +9,9 @@ and both READMEs name VERSION, and that prose is the one manual part. This
 script does the rest of the release procedure in order, stops at the first
 failing step with a one-line reason, and ends with one JSON summary line on
 stdout. A failure after the bump prints one recovery line before it, naming
-what the cut already changed, which a rerun must restore first.
+what the cut already changed, which a rerun must restore first. Each line is
+flushed as it is printed: with stdout redirected to a file, the file names the
+step that runs.
 
 Preflight, read-only (``--dry-run`` prints the plan and runs only these):
 
@@ -27,16 +29,19 @@ Preflight, read-only (``--dry-run`` prints the plan and runs only these):
   branch          HEAD is main
   tag_free        tag vVERSION does not exist yet
   wsl             a Windows host whose WSL interpreter (python3, or the absolute
-                  POSIX path --wsl-python names) imports pytest and xdist, whose
-                  wslpath -a names .scratch/release/VERSION under /mnt/, and a
-                  readable --wsl-baseline
+                  POSIX path --wsl-python names) imports pytest, xdist and
+                  pytest_timeout, whose wslpath -a names .scratch/release/VERSION
+                  under /mnt/, and a readable --wsl-baseline
 
 The cut:
 
   bump            release_metadata.bump: the canonical version and projections
   metadata_check  release_metadata.check --tag vVERSION
   host_tests      the suite on this host, xdist workers derived from
-                  os.cpu_count() with headroom; up to LOAD_RERUN_MAX_NODES
+                  os.cpu_count() with headroom; every run here and in
+                  wsl_tests passes --timeout=PYTEST_TIMEOUT_SECONDS
+                  (pytest-timeout), so a stuck test fails with its stack
+                  instead of hanging the cut; up to LOAD_RERUN_MAX_NODES
                   failed node ids get one serial rerun, and only a node that
                   fails again stops the cut. It runs the test-impact selection
                   (aiworkhub.test_impact_select) from the last v* tag on HEAD's
@@ -151,6 +156,10 @@ RECEIPT_SCRIPT = "scripts/release_receipt.py"
 RELEASE_LEDGER = ".aiworkhub/releases.jsonl"
 # The WSL interpreter unless --wsl-python names another: python3 or an absolute POSIX path.
 WSL_PYTHON = "python3"
+# What the wsl preflight makes that interpreter import before the cut changes anything:
+# its suite runs with -n (xdist) and --timeout (pytest_timeout).
+WSL_SUITE_MODULES: tuple[str, ...] = ("pytest", "xdist", "pytest_timeout")
+WSL_IMPORT_PROBE = f"import {', '.join(WSL_SUITE_MODULES)}"
 # wslpath -a must place the scratch directory on a mounted Windows drive.
 WSL_MOUNT_ROOT = "/mnt/"
 # What a guarded WSL command exits with when WSL cannot enter its directory.
@@ -171,6 +180,14 @@ WSL_TREE_GIT_COMMANDS: tuple[tuple[str, ...], ...] = (
 HOST_TEST_HEADROOM_FRACTION = 0.25
 GIT_TIMEOUT_SECONDS = 120.0
 LONG_GIT_TIMEOUT_SECONDS = 900.0
+# pytest-timeout's per-test limit, which every host and WSL suite run passes, the
+# serial reruns included. The 0.13.3 cut sat ~55 min in host_tests on a test that
+# never ended; with the limit such a test fails instead of hanging the cut. Under
+# xdist on Windows pytest-timeout ends the worker, so the log names the node as
+# crashed and the thread dump stays in that worker's stderr, not in the cut log.
+# The same suite run with --timeout=420
+# finished in 26.5 min; 600 s keeps headroom for a slow test under full xdist load.
+PYTEST_TIMEOUT_SECONDS = 600
 MAX_BASELINE_BYTES = 1024 * 1024
 MAX_BASELINE_IDS = 10_000
 MAX_LINE_CHARS = 600
@@ -288,6 +305,17 @@ def run_subprocess(
     return Completed(done.returncode, stdout, stderr)
 
 
+def _print_flushed(line: str) -> None:
+    """Print one line on stdout and flush it at once; every line the cut prints comes here.
+
+    Redirected to a file, stdout is block-buffered: the 0.13.3 cut's log stayed
+    empty for the ~55 min it hung in host_tests, so nobody could tell which step
+    it was in before it was killed. Flushed, the log names the step that runs.
+    """
+
+    print(line, flush=True)
+
+
 def _bind_children_to_this_process() -> bool:
     """Enter a fresh kill-on-close Job Object, so the kernel ends the cut's tree with it.
 
@@ -344,7 +372,7 @@ def _bind_children_to_this_process() -> bool:
     code = kernel32.GetLastError()  # read before CloseHandle overwrites it
     if job:
         kernel32.CloseHandle(job)
-    print(
+    _print_flushed(
         f"warning child_lifetime: {step} failed (GetLastError {code}{detail}), "
         "so a stopped cut can leave its child processes behind"
     )
@@ -374,7 +402,7 @@ class Host:
             cpu_count=os.cpu_count(),
             env=dict(os.environ),
             is_windows=os.name == "nt",
-            out=print,
+            out=_print_flushed,
         )
 
 
@@ -836,13 +864,15 @@ class ReleaseCut:
 
     def _host_test_argv(self, nodes: Sequence[str] = ()) -> list[str]:
         # With nodes: the serial rerun of exactly those ids, in a basetemp of its own
-        # because deleting the full run's basetemp measured 203 s.
+        # because deleting the full run's basetemp measured 203 s. Both pass the
+        # per-test --timeout, so a stuck test fails with its stack instead of hanging.
         return [
             self.host.python,
             "-m",
             "pytest",
             "-q",
             "-rfE",
+            f"--timeout={PYTEST_TIMEOUT_SECONDS}",
             "-n",
             "0" if nodes else _xdist_flag(self.workers),
             f"--basetemp={self.scratch / ('br' if nodes else 'b')}",
@@ -855,7 +885,8 @@ class ReleaseCut:
         # start import the archived tree as well. The basetemp sits on the Linux
         # filesystem, which the POSIX suite needs for sockets and file modes;
         # _step_wsl_tests removes it after the run. With nodes: the serial rerun
-        # of exactly those ids, in the same basetemp.
+        # of exactly those ids, in the same basetemp. Both pass the per-test
+        # --timeout the host suite does, which the wsl preflight checks WSL can load.
         return [
             "env",
             "PYTHONPATH=src",
@@ -864,6 +895,7 @@ class ReleaseCut:
             "pytest",
             "-q",
             "-rfE",
+            f"--timeout={PYTEST_TIMEOUT_SECONDS}",
             "-p",
             "no:cacheprovider",
             "-o",
@@ -912,7 +944,7 @@ class ReleaseCut:
             "worktree": "git status --porcelain=v1 -z --untracked-files=all",
             "branch": f"git symbolic-ref --quiet --short HEAD is {MAIN_BRANCH}",
             "tag_free": f"git rev-parse --quiet --verify refs/tags/{self.tag} finds nothing",
-            "wsl": f"wsl -e {self.options.wsl_python} -c 'import pytest, xdist'; "
+            "wsl": f"wsl -e {self.options.wsl_python} -c {shlex.quote(WSL_IMPORT_PROBE)}; "
             f"wslpath -a {scratch} must lie under {WSL_MOUNT_ROOT}; baseline {baseline}",
             "bump": f"release_metadata.bump {self.version}",
             "metadata_check": f"release_metadata.check --tag {self.tag}",
@@ -1011,16 +1043,17 @@ class ReleaseCut:
         if self.options.wsl_baseline is not None:
             self.baseline = load_wsl_baseline(self.options.wsl_baseline)
         python = self.options.wsl_python
+        modules = ", ".join(WSL_SUITE_MODULES)
         self._require(
-            self._wsl("--cd", str(self.root), "-e", python, "-c", "import pytest, xdist"),
-            f"WSL {python} importing pytest and xdist",
+            self._wsl("--cd", str(self.root), "-e", python, "-c", WSL_IMPORT_PROBE),
+            f"WSL {python} importing {modules}",
         )
         # The /mnt/ rule _step_wsl_tests applies, checked here as well: this step
         # is read-only and --dry-run runs it, so a scratch path outside /mnt/ stops
         # the cut before the bump and the release commit, not after them.
         scratch = self._wsl_scratch()
         return (
-            f"WSL {python} imports pytest and xdist; WSL names the scratch directory "
+            f"WSL {python} imports {modules}; WSL names the scratch directory "
             f"{scratch}; the baseline lists {len(self.baseline)} node id(s)"
         )
 
@@ -1409,9 +1442,9 @@ def _parser() -> argparse.ArgumentParser:
         default=WSL_PYTHON,
         metavar="PATH",
         help=(
-            f"the WSL interpreter that has pytest and xdist: {WSL_PYTHON} (default) or an "
-            "absolute POSIX path such as /root/venv/bin/python; Git Bash rewrites a leading "
-            "'/' unless MSYS_NO_PATHCONV=1 is set"
+            f"the WSL interpreter that has pytest, xdist and pytest-timeout: {WSL_PYTHON} "
+            "(default) or an absolute POSIX path such as /root/venv/bin/python; Git Bash "
+            "rewrites a leading '/' unless MSYS_NO_PATHCONV=1 is set"
         ),
     )
     parser.add_argument(

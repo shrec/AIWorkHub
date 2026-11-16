@@ -10,6 +10,7 @@ real runner's git against a throwaway repository there as well.
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import shlex
@@ -43,6 +44,11 @@ SUMMARY_HEADER = "=========================== short test summary info ==========
 LINUX_ROOT = "/mnt/z/repo"
 LINUX_SCRATCH = f"{LINUX_ROOT}/.scratch/release/{VERSION}"
 WSL_BASETEMP = f"/tmp/aiworkhub-release-{VERSION}"
+# The per-test limit every host and WSL suite run passes (release_cut.PYTEST_TIMEOUT_SECONDS).
+PYTEST_TIMEOUT = "--timeout=600"
+# What the wsl preflight imports with the WSL interpreter: xdist for -n and
+# pytest_timeout for --timeout.
+WSL_IMPORT_PROBE = "import pytest, xdist, pytest_timeout"
 # A venv interpreter inside WSL, which --wsl-python names when pytest and xdist live there.
 WSL_VENV_PYTHON = "/root/aiwh-ci-venv/bin/python"
 RELEASE_SHA = "0123456789abcdef0123456789abcdef01234567"
@@ -783,7 +789,7 @@ def test_wsl_python_names_the_interpreter_of_the_preflight_the_wsl_suite_and_the
     code, summary, lines, _ = _cut(_repo(tmp_path / "dry"), "--dry-run", *args)
     assert code == 0, summary["reason"]
     plan = {line.split()[1].rstrip(":"): line for line in lines if line.startswith("plan ")}
-    assert f"wsl -e {python} -c 'import pytest, xdist'" in plan["wsl"]
+    assert f"wsl -e {python} -c '{WSL_IMPORT_PROBE}'" in plan["wsl"]
     assert f"PYTHONPATH=src {python} -m pytest" in plan["wsl_tests"]
 
     root = _repo(tmp_path / "cut")
@@ -791,7 +797,7 @@ def test_wsl_python_names_the_interpreter_of_the_preflight_the_wsl_suite_and_the
     assert code == 0, summary["reason"]
     # The read-only preflight and the suite in the archived tree run the same interpreter.
     (preflight,) = [call.argv for call in runner.calls if call.argv[:2] == ("wsl", "--cd")]
-    assert preflight[2:] == (str(root), "-e", python, "-c", "import pytest, xdist")
+    assert preflight[2:] == (str(root), "-e", python, "-c", WSL_IMPORT_PROBE)
     (suite,) = runner.argv_of("wsl pytest")
     assert _guarded(suite)[1][:5] == ["env", "PYTHONPATH=src", python, "-m", "pytest"]
 
@@ -937,7 +943,18 @@ def test_a_green_first_run_makes_no_rerun_and_both_suite_commands_stay_byte_iden
     assert runner.labels == FULL_CUT
     scratch = root / ".scratch" / "release" / VERSION
     assert runner.argv_of("pytest") == [
-        ("python", "-m", "pytest", "-q", "-rfE", "-n", "12", f"--basetemp={scratch / 'b'}", "tests")
+        (
+            "python",
+            "-m",
+            "pytest",
+            "-q",
+            "-rfE",
+            PYTEST_TIMEOUT,
+            "-n",
+            "12",
+            f"--basetemp={scratch / 'b'}",
+            "tests",
+        )
     ]
     assert runner.argv_of("wsl pytest") == [
         (
@@ -946,7 +963,8 @@ def test_a_green_first_run_makes_no_rerun_and_both_suite_commands_stay_byte_iden
             "sh",
             "-c",
             f"cd -- {LINUX_SCRATCH}/tree || exit 97; exec env PYTHONPATH=src python3 -m pytest "
-            f"-q -rfE -p no:cacheprovider -o pythonpath= -n 12 --basetemp={WSL_BASETEMP} tests",
+            f"-q -rfE {PYTEST_TIMEOUT} -p no:cacheprovider -o pythonpath= -n 12 "
+            f"--basetemp={WSL_BASETEMP} tests",
         )
     ]
     assert _detail(summary, "host_tests") == "12 passed in 1.00s with 12 worker(s) on 16 core(s)"
@@ -980,6 +998,7 @@ def test_a_host_node_that_passes_alone_continues_the_cut_and_the_report_names_it
         "pytest",
         "-q",
         "-rfE",
+        PYTEST_TIMEOUT,
         "-n",
         "0",
         f"--basetemp={scratch / 'br'}",
@@ -1064,6 +1083,7 @@ def test_a_wsl_node_that_passes_alone_continues_the_cut_and_the_report_names_it(
             "pytest",
             "-q",
             "-rfE",
+            PYTEST_TIMEOUT,
             "-p",
             "no:cacheprovider",
             "-o",
@@ -1644,7 +1664,16 @@ def test_the_serial_rerun_in_the_impact_lane_still_names_only_the_failed_nodes(
     assert RATCHET in full
     scratch = root / ".scratch" / "release" / VERSION
     assert rerun == (
-        "python", "-m", "pytest", "-q", "-rfE", "-n", "0", f"--basetemp={scratch / 'br'}", HOST_NODE
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "-rfE",
+        PYTEST_TIMEOUT,
+        "-n",
+        "0",
+        f"--basetemp={scratch / 'br'}",
+        HOST_NODE,
     )
 
 
@@ -1855,3 +1884,68 @@ def test_an_unchanged_mapped_file_with_other_bytes_runs_the_whole_suite(
 
     assert code == 0, summary["reason"]
     _full_suite_with(summary, runner, f"impact_map_stale_dependency:{dependency}")
+
+
+# -- a stuck test fails instead of hanging the cut (NF-2026-02297) ----------------------
+
+
+def test_both_suites_and_their_serial_reruns_pass_the_per_test_timeout(tmp_path: Path) -> None:
+    """The 0.13.3 cut hung ~55 min on one test; with --timeout that test fails with its stack."""
+
+    root = _repo(tmp_path / "cut")
+    runner = FakeRunner(
+        root,
+        {
+            "pytest": _full_then_alone(HOST_FAILURE, PASSED_ALONE),
+            "wsl pytest": _full_then_alone(WSL_FAILURE, PASSED_ALONE),
+        },
+    )
+
+    code, summary, _, _ = _cut(root, runner=runner)
+
+    assert code == 0, summary["reason"]
+    assert PYTEST_TIMEOUT == f"--timeout={release_cut.PYTEST_TIMEOUT_SECONDS}"
+    host = [list(argv) for argv in runner.argv_of("pytest")]
+    wsl = [_guarded(argv)[1] for argv in runner.argv_of("wsl pytest")]
+    # The full run and the serial rerun of each suite each pass the limit once, as an
+    # option ahead of the basetemp and the targets, so it is never read as a node id.
+    assert len(host) == len(wsl) == 2
+    for argv in (*host, *wsl):
+        basetemp = next(i for i, token in enumerate(argv) if token.startswith("--basetemp="))
+        assert argv.count(PYTEST_TIMEOUT) == 1 and argv.index(PYTEST_TIMEOUT) < basetemp
+    # The WSL interpreter is asked for the plugin before the cut changes anything.
+    (preflight,) = [call.argv for call in runner.calls if call.argv[:2] == ("wsl", "--cd")]
+    assert preflight[-1] == WSL_IMPORT_PROBE
+    # --dry-run's plan names the same commands.
+    code, summary, lines, _ = _cut(_repo(tmp_path / "dry"), "--dry-run")
+    assert code == 0, summary["reason"]
+    plan = {line.split()[1].rstrip(":"): line for line in lines if line.startswith("plan ")}
+    assert PYTEST_TIMEOUT in plan["host_tests"] and PYTEST_TIMEOUT in plan["wsl_tests"]
+
+
+def test_the_real_host_flushes_every_line_it_prints(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Redirected stdout is block-buffered: the 0.13.3 cut's log stayed empty while it hung."""
+
+    class Recorder(io.StringIO):
+        """A stdout that keeps what it had been given each time it was flushed."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.flushed: list[str] = []
+
+        def flush(self) -> None:
+            self.flushed.append(self.getvalue())
+            super().flush()
+
+    stdout = Recorder()
+    monkeypatch.setattr(sys, "stdout", stdout)
+    out = release_cut.Host.current().out
+
+    out("run     host_tests: python -m pytest")
+    out("ok      host_tests: 12 passed")
+
+    # Each line was flushed as it was printed, before the next one.
+    assert stdout.flushed == [
+        "run     host_tests: python -m pytest\n",
+        "run     host_tests: python -m pytest\nok      host_tests: 12 passed\n",
+    ]
