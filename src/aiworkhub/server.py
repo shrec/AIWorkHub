@@ -8164,7 +8164,11 @@ def aiworkhub_doctor_diagnose(heap_census: bool = False) -> dict[str, Any]:
     runtime generation. heap_census=true adds server_process.heap_census, a
     bounded live-heap census (top types, largest containers, gc counts; type
     names and sizes only) -- slower, use when hunting the server's memory.
-    Use first when something fails and the cause is unknown; use aiworkhub_environment_preflight for pre-launch readiness."""
+    Use first when something fails and the cause is unknown; use aiworkhub_environment_preflight for pre-launch readiness.
+
+    Args:
+        heap_census: true adds the bounded live-heap census to server_process (slower).
+    """
 
     reply = doctor.diagnose(
         {

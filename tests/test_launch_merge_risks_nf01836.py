@@ -139,7 +139,7 @@ def _launcher_with_guard(guard):
     for _name, cls in inspect.getmembers(process_launcher, inspect.isclass):
         if "_launch_merge_risks" in vars(cls):
             return lambda: cls._launch_merge_risks(
-                SimpleNamespace(_collision_guard=guard), "candidate"
+                SimpleNamespace(_collision_guard=guard, repo="missing-repo"), "candidate"
             )
     raise AssertionError("launcher class with _launch_merge_risks not found")
 
