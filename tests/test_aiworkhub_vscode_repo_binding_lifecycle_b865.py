@@ -191,23 +191,40 @@ def test_repository_switch_stops_old_dispatcher_never_shares_with_new(tmp_path):
 def test_extension_reload_restore_disposes_stale_controller_before_adopting_new_panel():
     # Keep the bounded static check large enough to cover the whole restore
     # function as lifecycle diagnostics grow; character count is not a
-    # product invariant, the three ordered actions below are.
-    body = _slice(_EXTENSION_JS, "function reviveDashboardPanel(", 2600)
-    assert "panel.__aiworkhubViewState.dispose()" in body
-    assert "getMcpClient(context)" in body
-    assert "pushSnapshot(view)" in body
+    # product invariant, the ordered actions below are.
+    body = _slice(_EXTENSION_JS, "function reviveDashboardPanel(", 3600)
+    stale_dispose = body.index("panel.__aiworkhubViewState.dispose()")
+    adopt_new_panel = body.index("panel = ownedPanel;")
+    bind_client = body.index("getDashboardClient(context)")
+    first_snapshot = body.index('runBackgroundTask("revived dashboard snapshot", () => pushSnapshot(view))')
+    # The stale controller is disposed BEFORE the new panel is adopted, and
+    # only then is the repo-bound dashboard process client bound and the
+    # first snapshot requested.
+    assert stale_dispose < adopt_new_panel < bind_client < first_snapshot
 
 
-def test_extension_first_snapshot_precedes_dispatcher_convergence():
+def test_extension_first_snapshot_precedes_background_convergence():
     handshake = _slice(_EXTENSION_JS, "async _handshake()", 1800)
-    convergence = _slice(_EXTENSION_JS, "_convergeBackgroundServices()", 1800)
-    # The first snapshot now posts a bounded summary before the full payload;
-    # retain enough of the function to reach the deliberately later dispatcher
+    # The dashboard client delegates convergence to the routing child ...
+    dashboard_convergence = _slice(_EXTENSION_JS, "_convergeBackgroundServices() {", 80)
+    routing_entry = _slice(_EXTENSION_JS, "function convergeRoutingServicesInBackground()", 400)
+    # ... whose own convergence is the routing child's dispatcher/source-graph
+    # start-up.
+    routing_convergence = _slice(_EXTENSION_JS, "if (this.backgroundConvergencePromise) return", 600)
+    # The first snapshot posts a bounded summary before the full payload;
+    # retain enough of the function to reach the deliberately later
     # convergence call.
-    snapshot = _slice(_EXTENSION_JS, "async function pushSnapshotOnce(view)", 4200)
+    snapshot = _slice(_EXTENSION_JS, "async function pushSnapshotOnce(view)", 5200)
     assert "this._convergeBackgroundServices()" not in handshake
-    assert "this.ensureDispatcherStarted(5000)" in convergence
-    assert snapshot.index("view.postMessage({") < snapshot.index("client._convergeBackgroundServices()")
+    assert "convergeRoutingServicesInBackground();" in dashboard_convergence
+    assert routing_entry.index("client.ensureStarted()") < routing_entry.index(
+        "client._convergeBackgroundServices()"
+    )
+    assert "this.ensureDispatcherStarted(5000)" in routing_convergence
+    summary_post = snapshot.index("type: OUTBOUND_TYPES.snapshotSummary")
+    full_post = snapshot.index("type: OUTBOUND_TYPES.snapshot,")
+    convergence_call = snapshot.index("client._convergeBackgroundServices()")
+    assert summary_post < full_post < convergence_call
 
 
 def test_extension_deactivate_stops_dispatcher_before_terminating_child():
@@ -235,9 +252,15 @@ def test_extension_repo_switch_stops_old_client_dispatcher_before_rebinding():
 
 
 def test_extension_never_spawns_a_second_child_while_one_is_live():
-    body = _slice(_EXTENSION_JS, "ensureStarted() {", 1000)
-    assert "this.running && this.initialized" in body
-    assert "this.startingPromise" in body
+    # DashboardProcessClient.ensureStarted is the only ``async ensureStarted``;
+    # the routing McpStdioClient's is a plain method with its own guards.
+    body = _slice(_EXTENSION_JS, "async ensureStarted() {", 700)
+    live_child_guard = body.index("if (this.child) return;")
+    pending_start_guard = body.index("if (this.startPromise) return this.startPromise;")
+    spawn = body.index("this._spawn()")
+    # A live child returns early, a start already in flight is shared, and
+    # only after both guards may a new child be spawned.
+    assert live_child_guard < pending_start_guard < spawn
 
 
 # ---------------------------------------------------------------------------

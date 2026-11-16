@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from aiworkhub import dashboard_mcp_app, dashboard_reader, needfix_store, task_store
+from aiworkhub import dashboard_mcp_app, dashboard_reader, needfix_store, shared_router, task_store
 
 SRC_ROOT = Path(dashboard_reader.__file__).parent.parent
 
@@ -42,6 +42,13 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("AIWORKHUB_REPO_ROOT", str(root))
     monkeypatch.setenv("AIWORKHUB_REPO", str(root))
     monkeypatch.delenv("AIWORKHUB_WINDOW_ID", raising=False)
+    # ``known_repositories`` in the snapshot reads the host-wide shared repo
+    # route registry (``~/.aiworkhub/router/repos``), which other windows and
+    # tests mutate between the two reads being compared. Point it at an empty
+    # per-test directory so both reads see the same registry.
+    registry = tmp_path / "router_registry"
+    registry.mkdir()
+    monkeypatch.setattr(shared_router, "registry_dir", lambda home=None: registry)
     dashboard_mcp_app._SNAPSHOT_BUILD_CACHE.clear()
     return root
 
