@@ -13413,14 +13413,10 @@ def run_validations(
             if candidate_authority["digest"]:
                 env[PYTHON_CANDIDATE_AUTHORITY_ENV] = candidate_authority["digest"]
             if _is_pytest_validation_command(tokens):
-                # Validation workspaces are intentionally read-only outside
-                # the declared task outputs.  Pytest's cache provider writes
-                # ``.pytest_cache`` beside the tests even when the tests
-                # themselves are read-only, turning a green suite into a
-                # false ``validation_failed`` under Landlock/bubblewrap.
-                # The cache is not validation evidence, so disable only that
-                # plugin while preserving the exact test selection/arguments.
-                env["PYTEST_ADDOPTS"] = "-p no:cacheprovider"
+                # Read-only workspaces: pytest's cache provider would write
+                # ``.pytest_cache`` (false validation_failed); disable only it.
+                # NF-2026-02307: ``-rs`` (pytest only) feeds the skip audit.
+                env["PYTEST_ADDOPTS"] = "-p no:cacheprovider -rs"
             env_override_evidence: dict[str, Any] | None = None
             if effective_components:
                 resolved_pythonpath = resolve_validation_pythonpath(
@@ -13690,9 +13686,11 @@ def run_validations(
                 "stderr_tail": stderr[-4_096:],
                 "stderr_truncated": len(stderr) > 8_192,
             }
-            from . import validation_runner
+            from . import validation_runner, validation_skip_audit
 
             record.update(validation_runner.pytest_validation_evidence(stdout, result.returncode))
+            if _is_pytest_validation_command(tokens):  # NF-2026-02307
+                record = validation_skip_audit.apply_env_skip_audit(record, stdout)
             if broker_evidence:
                 record["metadata_broker_denials"] = broker_evidence
                 # This attribution is launcher-authored from the private pipe;
