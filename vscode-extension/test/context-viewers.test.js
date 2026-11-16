@@ -82,7 +82,10 @@ test("model setting updates preserve slash-qualified OpenCode model identities",
     {
       MODEL_SETTINGS_UPDATE_TOOL: "aiworkhub_dashboard_model_settings_update",
       OUTBOUND_TYPES: { error: "error", notification: "notification" },
-      getMcpClient: () => client,
+      // NF-2026-02287: dashboard actions go to the isolated dashboard process,
+      // never to the MCP client.
+      getDashboardClient: () => client,
+      getMcpClient: () => { throw new Error("dashboard action must not reach the MCP client"); },
       pushSettings: async () => {},
       sanitizeErrorMessage: (err) => String(err),
     },

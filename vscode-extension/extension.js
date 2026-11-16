@@ -706,6 +706,45 @@ const MCP_MAX_STDERR_LOG_BYTES = 4096;
 const MCP_MAX_RESTART_ATTEMPTS = 3;
 const MCP_SNAPSHOT_RECOVERY_ATTEMPTS = 3;
 const MCP_RECOVERY_BACKOFF_MS = Object.freeze([100, 200, 400]);
+// ── NF-2026-02287: the dashboard-only process ─────────────────────────────
+// Every dashboard view and action is served by `python -m
+// aiworkhub.dashboard_reader` (DashboardProcessClient), never by the MCP
+// child: the dashboard reads and writes repository data itself and never
+// loads the MCP/dispatcher process. getMcpClient() keeps only routing,
+// dispatcher, Source Graph daemon and manager-loop duties.
+const DASHBOARD_READER_MODULE = "aiworkhub.dashboard_reader";
+// The exact tool set the dashboard process may be asked for; the Python side
+// refuses anything outside its own named dashboard tool maps as well.
+const DASHBOARD_PROCESS_TOOLS = new Set([
+  ...Object.values(DASHBOARD_TOOLS),
+  SETTINGS_UPDATE_TOOL,
+  MODEL_SETTINGS_UPDATE_TOOL,
+  SOURCE_GRAPH_SETTINGS_UPDATE_TOOL,
+  ...Object.values(NEEDFIX_TOOLS),
+  ...Object.values(ROADMAP_TOOLS),
+  ...Object.values(HUB_MAIL_TOOLS),
+  ...Object.values(STORAGE_RETENTION_TOOLS),
+  ...Object.values(TERMINAL_LOG_RETENTION_TOOLS),
+  INITIALIZE_TOOL,
+]);
+// Stopped once no dashboard surface has been visible for this long; the next
+// show respawns it on its first call.
+const DASHBOARD_PROCESS_HIDDEN_STOP_MS = 60 * 1000;
+// Respawn delay after the Nth consecutive spawn failure/death (last repeats).
+// The first respawn is immediate so a single crash heals on the next refresh.
+const DASHBOARD_PROCESS_RESPAWN_BACKOFF_MS = Object.freeze([0, 1000, 2000, 5000, 10000, 30000]);
+const DASHBOARD_PROCESS_MAX_PENDING_REQUESTS = 64;
+// Process-control variables only the MCP server/dispatcher reads; the
+// dashboard child never receives them.
+const DASHBOARD_PROCESS_STRIPPED_ENV = Object.freeze([
+  "AIWORKHUB_MCP_SURFACE",
+  "AIWORKHUB_MCP_STDIO_BACKEND",
+  "AIWORKHUB_ALLOW_WRITES",
+  "AIWORKHUB_ALLOW_LAUNCH",
+]);
+// A dashboard read that exceeds its budget reports the same reason code as an
+// MCP read did, so the existing snapshotDelayed/no-retry classification holds.
+const DASHBOARD_REQUEST_TIMEOUT_REASON = "mcp_request_timeout";
 // B893: bounded self-repair budget for a DETECTED runtime version/capability
 // mismatch (a stale bundled runtime after a VSIX update or an in-place
 // runtime repair). Separate from MCP_MAX_RESTART_ATTEMPTS, which bounds
@@ -2156,6 +2195,329 @@ function terminateAllOwnedMcpChildren(reason = "sweep") {
   return terminated;
 }
 
+// The repository-bound environment every Python child this extension owns
+// starts with (MCP server and dashboard process alike). Data authority stays
+// in the AIWORKHUB_REPO* variables; imports resolve to the bundled runtime.
+function repoBoundPythonChildEnv(root, repositoryIdentity, claimEpisode, runtimeDir) {
+  const env = {
+    ...process.env,
+    PYTHONIOENCODING: "utf-8",
+    AIWORKHUB_MCP_STDIO_BACKEND: "stdlib",
+    AIWORKHUB_REPO_ROOT: root,
+    AIWORKHUB_REPO: root,
+    AIWORKHUB_REPO_ID: repositoryIdentity.repoId,
+    AIWORKHUB_WINDOW_ID: WINDOW_SCOPE_ID,
+    AIWORKHUB_CLAIM_EPISODE: claimEpisode,
+    // This workspace extension may run on a Remote-SSH host while Codex
+    // runs in the local UI host.  Never claim sideband ownership unless a
+    // verified UI-host companion exists; keep durable review delivery in
+    // the cooperative manager inbox and report direct wake as unavailable.
+    AIWORKHUB_CALLBACK_TRANSPORT: "manager_inbox",
+  };
+  const workerWorktreeRoot = resolveWorkerWorktreeRootEnv(root);
+  if (workerWorktreeRoot) {
+    // Keep an explicit worker-root override; otherwise pin Windows
+    // AppContainer worktrees to this repository's sandbox root, whatever
+    // an ambient runtime root says.
+    env.AIWORKHUB_WORKTREE_ROOT = workerWorktreeRoot;
+  }
+  if (mcpDebugTraceFile) {
+    env.AIWORKHUB_DEBUG_TRACE_FILE = mcpDebugTraceFile;
+  }
+  // Extension-local runtime import path: `import aiworkhub` must always
+  // resolve to the package this extension bundled under its own
+  // `runtime/` directory (see test/package-vsix.js), never to the
+  // selected repository, an editable install, or a fixed host path. Both
+  // PYTHONPATH and the child's own cwd point at runtimeDir -- `python -m`
+  // prepends cwd to sys.path[0] ahead of PYTHONPATH entries, so cwd is the
+  // authoritative one; PYTHONPATH is defense in depth for interpreters
+  // that alter that ordering. Data authority (which repository this
+  // session is bound to) stays entirely in the AIWORKHUB_REPO* env vars
+  // above -- never in cwd or an import path.
+  if (runtimeDir) {
+    env.PYTHONPATH = [runtimeDir, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter);
+  }
+  // Never inherit a stale coordinator secret from the extension host.
+  // Load the current owner-only file into this private child environment;
+  // package init scrubs it before any submodule can copy the environment.
+  delete env.BITNN_TASKCTL_COORDINATOR_TOKEN;
+  delete env.BITNN_TASKCTL_COORDINATOR_TOKEN_FILE;
+  try {
+    const capability = ensureRepositoryCoordinatorCapability(root);
+    env.BITNN_TASKCTL_COORDINATOR_TOKEN = capability.token;
+    env.BITNN_TASKCTL_COORDINATOR_TOKEN_FILE = capability.tokenFile;
+  } catch (_err) {
+    // Missing/unsafe token leaves coordinator mutations fail-closed.
+  }
+  return env;
+}
+
+// Dashboard children are owned separately from MCP children so the MCP
+// child-count accounting is unchanged; a host exit still tree-kills them.
+const liveOwnedDashboardChildren = new Set();
+let ownedDashboardChildExitHookInstalled = false;
+
+function registerOwnedDashboardChild(child) {
+  if (!child || !child.pid) return;
+  liveOwnedDashboardChildren.add(child);
+  child.once("exit", () => liveOwnedDashboardChildren.delete(child));
+  if (!ownedDashboardChildExitHookInstalled) {
+    ownedDashboardChildExitHookInstalled = true;
+    process.once("exit", () => {
+      for (const owned of Array.from(liveOwnedDashboardChildren)) treeKillMcpChild(owned);
+    });
+  }
+}
+
+// NF-2026-02287: newline-delimited JSON client for exactly one
+// `python -m aiworkhub.dashboard_reader --repo <root>` child. Request
+// {id, tool, arguments}; reply {id, result} or {id, error: {code}}. The child
+// runs the existing dashboard view callables single-threaded, so requests
+// queue FIFO on its stdin. Same interpreter and repository environment as the
+// MCP child, minus the MCP/dispatcher process controls. A spawn failure or
+// death rejects every pending call with a readable reason the dashboard
+// shows; the next call respawns after a bounded backoff. Never falls back to
+// the MCP client.
+class DashboardProcessClient {
+  constructor(repositoryRoot, outputChannel, repositoryIdentity, claimEpisode) {
+    this.repositoryRoot = repositoryRoot;
+    this.outputChannel = outputChannel;
+    this.repositoryIdentity = repositoryIdentity;
+    this.claimEpisode = claimEpisode;
+    this.child = null;
+    this.startPromise = null;
+    this.pending = new Map();
+    this.nextId = 1;
+    this.buffer = "";
+    this.stdoutDecoder = new StringDecoder("utf8");
+    this.disposed = false;
+    this.spawnCount = 0;
+    this.consecutiveFailures = 0;
+    this.lastFailure = "";
+    this.retryNotBefore = 0;
+    // The child runs this extension's own bundled runtime, so it always
+    // speaks the snapshot delta protocol (see clientSpeaksSnapshotDelta).
+    this.runtimePreflight = Object.freeze({ matches: true });
+  }
+
+  // pushSnapshotOnce consults recovery.open between attempts. A dashboard
+  // failure never opens the MCP recovery circuit; backoff lives here. While a
+  // respawn backoff is pending the circuit reads open, so one refresh stops
+  // retrying and reports the death; the next refresh after the backoff
+  // respawns. Derived from retryNotBefore so it never goes stale.
+  get recovery() {
+    return { open: this.consecutiveFailures > 0 && Date.now() < this.retryNotBefore };
+  }
+
+  get running() {
+    return Boolean(this.child) && mcpChildIsRunning(this.child);
+  }
+
+  _log(line) {
+    if (this.outputChannel) this.outputChannel.appendLine(line);
+  }
+
+  async ensureStarted() {
+    if (this.disposed) throw new Error("dashboard_process_disposed");
+    if (this.child) return;
+    if (this.startPromise) return this.startPromise;
+    if (Date.now() < this.retryNotBefore) {
+      throw new Error(`dashboard_process_backoff:${this.lastFailure || "unavailable"}`);
+    }
+    const start = this._spawn().finally(() => {
+      if (this.startPromise === start) this.startPromise = null;
+    });
+    this.startPromise = start;
+    return start;
+  }
+
+  async _resolvePython() {
+    // Reuse the interpreter the repo-bound MCP child already preflighted;
+    // otherwise run the same bounded launch preflight it uses.
+    if (mcpClient && mcpClient.repositoryRoot === this.repositoryRoot && mcpClient._lastPythonResult) {
+      return mcpClient._lastPythonResult;
+    }
+    return findPythonCommandForLaunch(this.repositoryRoot);
+  }
+
+  async _spawn() {
+    const root = this.repositoryRoot;
+    let python;
+    try {
+      python = await this._resolvePython();
+    } catch (err) {
+      this._recordFailure("dashboard_process_python_unavailable");
+      throw new Error("dashboard_process_python_unavailable");
+    }
+    if (this.disposed) throw new Error("dashboard_process_disposed");
+    const runtimeDir = extensionRuntimeDir;
+    const env = repoBoundPythonChildEnv(root, this.repositoryIdentity, this.claimEpisode, runtimeDir);
+    for (const key of DASHBOARD_PROCESS_STRIPPED_ENV) delete env[key];
+    let child;
+    try {
+      child = childProcess.spawn(
+        python.command,
+        [...python.argsPrefix, "-m", DASHBOARD_READER_MODULE, "--repo", root],
+        { cwd: runtimeDir || root, env, stdio: ["pipe", "pipe", "pipe"], shell: false, windowsHide: true },
+      );
+    } catch (_err) {
+      this._recordFailure("dashboard_process_spawn_failed");
+      throw new Error("dashboard_process_spawn_failed");
+    }
+    this.child = child;
+    this.spawnCount += 1;
+    this.buffer = "";
+    this.stdoutDecoder = new StringDecoder("utf8");
+    registerOwnedDashboardChild(child);
+    trackStableRuntimeChild(child, runtimeDir);
+    child.once("exit", () => releaseStableRuntimeChild(child));
+    child.once("error", () => { if (!child.pid) releaseStableRuntimeChild(child); });
+    for (const stream of [child.stdin, child.stdout, child.stderr]) {
+      // A pipe error is followed by exit/error on the child itself.
+      if (stream && typeof stream.on === "function") stream.on("error", () => {});
+    }
+    child.stdout.on("data", (chunk) => this._onStdout(child, chunk));
+    child.stderr.on("data", (chunk) => this._log(`[dashboard stderr] ${sanitizeStderrChunk(chunk)}`));
+    child.on("exit", (code, signal) => this._onExit(child, code == null ? `signal_${signal || "unknown"}` : `code_${code}`));
+    child.on("error", () => this._onExit(child, "spawn_error"));
+    debugTrace("dashboard_process.spawn", { child_pid: child.pid || null, spawn_count: this.spawnCount });
+  }
+
+  _onStdout(child, chunk) {
+    if (child !== this.child) return;
+    this.buffer += this.stdoutDecoder.write(chunk);
+    let newline;
+    while ((newline = this.buffer.indexOf("\n")) >= 0) {
+      const line = this.buffer.slice(0, newline).trim();
+      this.buffer = this.buffer.slice(newline + 1);
+      if (!line) continue;
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch (_err) {
+        this._abandonChild(child, "dashboard_process_protocol_error");
+        return;
+      }
+      // Any well-formed reply proves the child is serving again.
+      this.consecutiveFailures = 0;
+      this.lastFailure = "";
+      this.retryNotBefore = 0;
+      const record = message && this.pending.get(message.id);
+      if (!record) continue;
+      this.pending.delete(message.id);
+      clearTimeout(record.timer);
+      if (message.error) {
+        const code = String((message.error && message.error.code) || "unknown").slice(0, 80);
+        record.reject(new Error(`dashboard_${code}`));
+      } else {
+        record.resolve(message.result);
+      }
+    }
+    if (this.buffer.length > MCP_MAX_LINE_BYTES) {
+      this._abandonChild(child, "dashboard_process_reply_too_large");
+    }
+  }
+
+  _recordFailure(reason) {
+    this.consecutiveFailures += 1;
+    this.lastFailure = reason;
+    const schedule = DASHBOARD_PROCESS_RESPAWN_BACKOFF_MS;
+    this.retryNotBefore = Date.now() + schedule[Math.min(this.consecutiveFailures, schedule.length) - 1];
+    this._log(`[dashboard] ${reason}; respawn after ${this.retryNotBefore - Date.now()} ms`);
+    debugTrace("dashboard_process.failure", { reason, consecutive_failures: this.consecutiveFailures });
+  }
+
+  _failPending(err) {
+    const records = Array.from(this.pending.values());
+    this.pending.clear();
+    for (const record of records) {
+      clearTimeout(record.timer);
+      record.reject(err);
+    }
+  }
+
+  _onExit(child, detail) {
+    if (child !== this.child) return;
+    this.child = null;
+    this.buffer = "";
+    const reason = `dashboard_process_exited:${detail}`;
+    this._recordFailure(reason);
+    this._failPending(new Error(reason));
+  }
+
+  // A child that broke the protocol is replaced, never trusted again.
+  _abandonChild(child, reason) {
+    if (child !== this.child) return;
+    this.child = null;
+    this.buffer = "";
+    this._recordFailure(reason);
+    this._failPending(new Error(reason));
+    treeKillMcpChild(child);
+  }
+
+  async callTool(name, args = {}, timeoutMs = MCP_REQUEST_TIMEOUT_MS) {
+    if (!DASHBOARD_PROCESS_TOOLS.has(name)) {
+      throw new Error("dashboard_tool_not_allowed");
+    }
+    await this.ensureStarted();
+    const child = this.child;
+    if (!child) {
+      throw new Error(`dashboard_process_unavailable:${this.lastFailure || "unknown"}`);
+    }
+    if (this.pending.size >= DASHBOARD_PROCESS_MAX_PENDING_REQUESTS) {
+      throw new Error("dashboard_process_busy");
+    }
+    const id = this.nextId++;
+    const frame = `${JSON.stringify({ id, tool: name, arguments: args || {} })}\n`;
+    return new Promise((resolve, reject) => {
+      const record = { resolve, reject, timer: null };
+      const fail = (err) => {
+        if (this.pending.get(id) !== record) return;
+        this.pending.delete(id);
+        clearTimeout(record.timer);
+        reject(err);
+      };
+      record.timer = setTimeout(() => fail(new Error(DASHBOARD_REQUEST_TIMEOUT_REASON)), timeoutMs);
+      this.pending.set(id, record);
+      try {
+        child.stdin.write(frame, (err) => { if (err) fail(new Error("dashboard_process_write_failed")); });
+      } catch (_err) {
+        fail(new Error("dashboard_process_write_failed"));
+      }
+    });
+  }
+
+  // Once the dashboard has painted, routing services may converge on the
+  // MCP child exactly as before -- never carrying a dashboard tool.
+  _convergeBackgroundServices() {
+    convergeRoutingServicesInBackground();
+  }
+
+  // An explicit Retry clears the respawn backoff and replaces the child.
+  resetForExplicitRetry() {
+    this.consecutiveFailures = 0;
+    this.lastFailure = "";
+    this.retryNotBefore = 0;
+    this.stop("dashboard_process_retry");
+  }
+
+  stop(reason = "dashboard_process_stopped") {
+    const child = this.child;
+    this.child = null;
+    this.buffer = "";
+    this._failPending(new Error(reason));
+    if (child) {
+      debugTrace("dashboard_process.stop", { reason });
+      treeKillMcpChild(child);
+    }
+  }
+
+  dispose() {
+    this.disposed = true;
+    this.stop("dashboard_process_disposed");
+  }
+}
+
 // Real out-of-process stdio JSON-RPC client for exactly one
 // `python3 -m aiworkhub.server` child. Mirrors the initialize ->
 // notifications/initialized -> tools/call handshake the repo's own
@@ -2436,44 +2798,7 @@ class McpStdioClient {
     this._assertStartEpoch(stopEpoch);
     this._lastPythonResult = python;
     const runtimeDir = extensionRuntimeDir;
-    const env = {
-      ...process.env,
-      PYTHONIOENCODING: "utf-8",
-      AIWORKHUB_MCP_STDIO_BACKEND: "stdlib",
-      AIWORKHUB_REPO_ROOT: root,
-      AIWORKHUB_REPO: root,
-      AIWORKHUB_REPO_ID: this.repositoryIdentity.repoId,
-      AIWORKHUB_WINDOW_ID: WINDOW_SCOPE_ID,
-      AIWORKHUB_CLAIM_EPISODE: this.claimEpisode,
-      // This workspace extension may run on a Remote-SSH host while Codex
-      // runs in the local UI host.  Never claim sideband ownership unless a
-      // verified UI-host companion exists; keep durable review delivery in
-      // the cooperative manager inbox and report direct wake as unavailable.
-      AIWORKHUB_CALLBACK_TRANSPORT: "manager_inbox",
-    };
-    const workerWorktreeRoot = resolveWorkerWorktreeRootEnv(root);
-    if (workerWorktreeRoot) {
-      // Keep an explicit worker-root override; otherwise pin Windows
-      // AppContainer worktrees to this repository's sandbox root, whatever
-      // an ambient runtime root says.
-      env.AIWORKHUB_WORKTREE_ROOT = workerWorktreeRoot;
-    }
-    if (mcpDebugTraceFile) {
-      env.AIWORKHUB_DEBUG_TRACE_FILE = mcpDebugTraceFile;
-    }
-    // Extension-local runtime import path: `import aiworkhub` must always
-    // resolve to the package this extension bundled under its own
-    // `runtime/` directory (see test/package-vsix.js), never to the
-    // selected repository, an editable install, or a fixed host path. Both
-    // PYTHONPATH and the child's own cwd point at runtimeDir -- `python -m`
-    // prepends cwd to sys.path[0] ahead of PYTHONPATH entries, so cwd is the
-    // authoritative one; PYTHONPATH is defense in depth for interpreters
-    // that alter that ordering. Data authority (which repository this
-    // session is bound to) stays entirely in the AIWORKHUB_REPO* env vars
-    // above -- never in cwd or an import path.
-    if (runtimeDir) {
-      env.PYTHONPATH = [runtimeDir, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter);
-    }
+    const env = repoBoundPythonChildEnv(root, this.repositoryIdentity, this.claimEpisode, runtimeDir);
     // Ambient gates never authorize the dashboard. The private worker child
     // explicitly enables writes only; Python still validates every task claim.
     if (this.grantManagerLoopGates || this.grantWorkerBridgeWrites) {
@@ -2486,22 +2811,10 @@ class McpStdioClient {
     } else {
       delete env.AIWORKHUB_ALLOW_LAUNCH;
     }
-    // The webview needs the dashboard tools the manager surface hides, so its
-    // child pins the `dashboard` profile instead of relying on the server
-    // default or inheriting an ambient value.
+    // The MCP child pins the `dashboard` tool profile instead of relying on the
+    // server default or inheriting an ambient value. The dashboard webview
+    // itself never talks to this child (NF-2026-02287: DashboardProcessClient).
     env.AIWORKHUB_MCP_SURFACE = "dashboard";
-    // Never inherit a stale coordinator secret from the extension host.
-    // Load the current owner-only file into this private child environment;
-    // package init scrubs it before any submodule can copy the environment.
-    delete env.BITNN_TASKCTL_COORDINATOR_TOKEN;
-    delete env.BITNN_TASKCTL_COORDINATOR_TOKEN_FILE;
-    try {
-      const capability = ensureRepositoryCoordinatorCapability(root);
-      env.BITNN_TASKCTL_COORDINATOR_TOKEN = capability.token;
-      env.BITNN_TASKCTL_COORDINATOR_TOKEN_FILE = capability.tokenFile;
-    } catch (_err) {
-      // Missing/unsafe token leaves coordinator mutations fail-closed.
-    }
 
     this.intentionalStop = false;
     this.initialized = false;
@@ -10321,7 +10634,12 @@ function getMcpClient(context) {
     if (managerLoopShutdown) {
       startupBarrier = Promise.all([startupBarrier, managerLoopShutdown]);
     }
-    activeClaimEpisode = `episode_${crypto.randomBytes(12).toString("hex")}`;
+    // One claim episode per repository identity: adopt the dashboard
+    // process's when it is already bound here, so a view bound to either
+    // client stays bound across both (ViewState.stillBoundTo).
+    activeClaimEpisode = dashboardClientBoundTo(root, identity.repoId)
+      ? dashboardProcessClient.claimEpisode
+      : `episode_${crypto.randomBytes(12).toString("hex")}`;
     activeRepoIdentity = identity;
     activeRepoLabel = displayLabel;
     // Manifest identity is enough to persist routing ownership. The Python
@@ -10345,6 +10663,107 @@ function getMcpClient(context) {
   }
   if (vscodeLmProviderBridgeReady()) resolveVscodeLmProviderBridgeReadiness();
   return mcpClient;
+}
+
+// ── NF-2026-02287: the dashboard-only process lifecycle ───────────────────
+// One DashboardProcessClient per repository identity. It is created lazily by
+// the first dashboard call, so the child spawns when a dashboard surface is
+// shown; it stops when every surface is disposed or none has been visible
+// for DASHBOARD_PROCESS_HIDDEN_STOP_MS, and the next shown surface's first
+// call respawns it.
+let dashboardProcessClient = null;
+const openDashboardViews = new Set();
+const visibleDashboardViews = new Set();
+let dashboardHiddenStopTimer = null;
+
+function dashboardClientBoundTo(root, repoId) {
+  return Boolean(
+    dashboardProcessClient
+    && dashboardProcessClient.repositoryRoot === root
+    && dashboardProcessClient.repositoryIdentity.repoId === repoId,
+  );
+}
+
+function getDashboardClient(context) {
+  const repo = getActiveRepositoryRoot(context || extensionContext);
+  const displayLabel = repositoryLabel(vscode.workspace.workspaceFolders || [], repo.uriStr);
+  const identity = { ...repo, label: displayLabel };
+  if (!dashboardClientBoundTo(repo.root, identity.repoId)) {
+    if (dashboardProcessClient) dashboardProcessClient.dispose();
+    // Share the routing child's claim episode when it already serves this
+    // exact identity; otherwise mint the identity's episode here and the
+    // routing child adopts it when it rebinds (see getMcpClient).
+    if (!(mcpClient && mcpClient.repositoryRoot === repo.root && mcpClient.repositoryIdentity.repoId === identity.repoId)) {
+      activeClaimEpisode = `episode_${crypto.randomBytes(12).toString("hex")}`;
+    } else {
+      activeClaimEpisode = mcpClient.claimEpisode || activeClaimEpisode;
+    }
+    dashboardProcessClient = new DashboardProcessClient(repo.root, outputChannel, identity, activeClaimEpisode);
+  }
+  activeRepoIdentity = identity;
+  activeRepoLabel = displayLabel;
+  return dashboardProcessClient;
+}
+
+function disposeDashboardProcessClient() {
+  if (dashboardHiddenStopTimer) {
+    clearTimeout(dashboardHiddenStopTimer);
+    dashboardHiddenStopTimer = null;
+  }
+  const client = dashboardProcessClient;
+  dashboardProcessClient = null;
+  if (client) client.dispose();
+}
+
+function armDashboardHiddenStop() {
+  if (dashboardHiddenStopTimer || visibleDashboardViews.size > 0) return;
+  dashboardHiddenStopTimer = setTimeout(() => {
+    dashboardHiddenStopTimer = null;
+    if (visibleDashboardViews.size === 0 && dashboardProcessClient) {
+      dashboardProcessClient.stop("dashboard_process_hidden");
+    }
+  }, DASHBOARD_PROCESS_HIDDEN_STOP_MS);
+  if (typeof dashboardHiddenStopTimer.unref === "function") dashboardHiddenStopTimer.unref();
+}
+
+function noteDashboardViewVisibility(view, visible) {
+  openDashboardViews.add(view);
+  if (visible) {
+    visibleDashboardViews.add(view);
+    if (dashboardHiddenStopTimer) {
+      clearTimeout(dashboardHiddenStopTimer);
+      dashboardHiddenStopTimer = null;
+    }
+    return;
+  }
+  visibleDashboardViews.delete(view);
+  armDashboardHiddenStop();
+}
+
+function noteDashboardViewDisposed(view) {
+  openDashboardViews.delete(view);
+  visibleDashboardViews.delete(view);
+  if (openDashboardViews.size > 0) {
+    armDashboardHiddenStop();
+    return;
+  }
+  if (dashboardHiddenStopTimer) {
+    clearTimeout(dashboardHiddenStopTimer);
+    dashboardHiddenStopTimer = null;
+  }
+  if (dashboardProcessClient) dashboardProcessClient.stop("dashboard_process_disposed");
+}
+
+// Routing/dispatcher duty only: after a dashboard paint, keep this window's
+// MCP child and its dispatcher/Source Graph services converging, as the first
+// dashboard snapshot always triggered. No dashboard tool is sent to it.
+function convergeRoutingServicesInBackground() {
+  if (!extensionContext) return;
+  runBackgroundTask("routing service convergence", async () => {
+    const client = getMcpClient();
+    await client.ensureStarted();
+    await client._convergeBackgroundServices();
+  });
 }
 
 let vscodeLmWorkerMcpClient = null;
@@ -10680,6 +11099,8 @@ class ViewState {
 
   setVisible(visible) {
     this.visible = visible;
+    // Host-side visibility also owns the dashboard process lifetime.
+    noteDashboardViewVisibility(this, Boolean(visible));
     this.reschedule();
   }
 
@@ -10688,6 +11109,7 @@ class ViewState {
       clearInterval(this.timer);
     }
     this.timer = null;
+    noteDashboardViewDisposed(this);
     // Belt and suspenders: any dashboard surface closing tears down the
     // manager loop's write+launch-capable child too, even if a different
     // surface created it. Re-opening the Manager dialog spawns a fresh one.
@@ -10841,12 +11263,12 @@ async function callFullSnapshot(view, client, timeoutMs) {
 async function pushSnapshotOnce(view) {
   // The optional second argument is test-only dependency injection. Keep the
   // public host call shape stable: production always resolves the repo-bound
-  // singleton through getMcpClient().
+  // dashboard process through getDashboardClient() -- never the MCP child.
   const options = arguments.length > 1 && arguments[1] ? arguments[1] : {};
   const requestSeq = ++view.snapshotRequestSeq;
   let lastError = null;
   debugTrace("snapshot.begin", { request_seq: requestSeq });
-  const client = options.client || getMcpClient();
+  const client = options.client || getDashboardClient();
   view.bindClient(client);
   const snapshotRecovery = {
     category: "snapshot",
@@ -10959,7 +11381,7 @@ async function pushSnapshotNoRetry(view, options = {}) {
   const authoritative = options.authoritative === true;
   const convergeBackgroundServices = options.convergeBackgroundServices !== false;
   try {
-    const client = options.client || getMcpClient();
+    const client = options.client || getDashboardClient();
     view.bindClient(client);
     refreshCoordinatorRouteBeforeSnapshot();
     const payload = await callFullSnapshot(view, client, MCP_DASHBOARD_SNAPSHOT_TIMEOUT_MS);
@@ -10998,7 +11420,7 @@ async function pushTaskDetail(view, taskId) {
     payload: { ok: false, task_id: taskId, error },
   });
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const payload = await client.callTool(
       DASHBOARD_TOOLS.taskDetail,
@@ -11031,7 +11453,7 @@ async function pushTaskDetail(view, taskId) {
 // DASHBOARD_TOOLS.liveOutput) are only the host-side half of the wiring.
 async function pushLiveOutput(view, taskId, cursor) {
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const payload = await client.callTool(DASHBOARD_TOOLS.liveOutput, {
       task_id: taskId,
@@ -11047,7 +11469,7 @@ async function pushLiveOutput(view, taskId, cursor) {
 
 async function pushMemory(view) {
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const payload = await client.callTool(DASHBOARD_TOOLS.memory, { limit: 200 });
     if (view.stillBoundTo(client)) {
@@ -11060,7 +11482,7 @@ async function pushMemory(view) {
 
 async function pushSessions(view) {
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const payload = await client.callTool(DASHBOARD_TOOLS.sessions, { limit: 200 });
     if (view.stillBoundTo(client)) {
@@ -11073,7 +11495,7 @@ async function pushSessions(view) {
 
 async function pushKb(view) {
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const payload = await client.callTool(DASHBOARD_TOOLS.kb, { limit: 200 });
     if (view.stillBoundTo(client)) {
@@ -11086,7 +11508,7 @@ async function pushKb(view) {
 
 async function pushNeedfixList(view, filters = {}) {
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const payload = await client.callTool(NEEDFIX_TOOLS.list, {
       status: String(filters.status || "").slice(0, 40) || null,
@@ -11109,7 +11531,7 @@ async function pushNeedfixList(view, filters = {}) {
 
 async function pushNeedfixDetail(view, needfixId) {
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const payload = await client.callTool(NEEDFIX_TOOLS.detail, {
       needfix_id: needfixId,
@@ -11128,7 +11550,7 @@ async function pushNeedfixDetail(view, needfixId) {
 
 async function pushRoadmapList(view, filters = {}, outboundType = OUTBOUND_TYPES.roadmap, correlation = null) {
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const payload = await client.callTool(ROADMAP_TOOLS.list, {
       status: String(filters.status || "").slice(0, 40) || null,
@@ -11150,7 +11572,7 @@ async function pushRoadmapList(view, filters = {}, outboundType = OUTBOUND_TYPES
 
 async function pushRoadmapDetail(view, roadmapId, outboundType = OUTBOUND_TYPES.roadmapDetail, correlation = null) {
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const payload = await client.callTool(ROADMAP_TOOLS.detail, {
       roadmap_id: roadmapId,
@@ -11170,7 +11592,7 @@ async function pushRoadmapDetail(view, roadmapId, outboundType = OUTBOUND_TYPES.
 
 async function pushHubMail(view, filters = {}) {
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const payload = await client.callTool(HUB_MAIL_TOOLS.list, {
       limit: 50,
@@ -11189,7 +11611,7 @@ async function pushHubMail(view, filters = {}) {
 
 async function pushHubMailDetail(view, messageId) {
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const payload = await client.callTool(HUB_MAIL_TOOLS.detail, { message_id: messageId });
     if (view.stillBoundTo(client)) {
@@ -11211,7 +11633,7 @@ async function runHubMailAction(view, action, args) {
   const tool = HUB_MAIL_TOOLS[action];
   if (!tool) return;
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const payload = await client.callTool(tool, args);
     if (!view.stillBoundTo(client)) return;
@@ -11246,11 +11668,12 @@ async function notifyHubMailRequest(request) {
   );
   if (choice !== "Accept" && choice !== "Reject") return;
   try {
-    const result = await getMcpClient().callTool(HUB_MAIL_TOOLS.peers, {
+    const result = await getDashboardClient().callTool(HUB_MAIL_TOOLS.peers, {
       action: choice.toLowerCase(),
       request_id: requestId,
       confirm: true,
     });
+    armDashboardHiddenStop();
     const failure = result && result.ok === true ? "" : String((result && result.error) || "unavailable");
     if (failure) {
       vscode.window.showWarningMessage(`WorkHub Mail: ${choice.toLowerCase()} failed: ${hubMailDisplayText(failure, 120)}`);
@@ -11268,10 +11691,13 @@ async function notifyHubMailRequest(request) {
 }
 
 async function pollHubMailRequests() {
-  if (hubMailRequestPollBusy || !mcpClient) return;
+  // Polls through the dashboard process only while it is already running:
+  // the background watcher never spawns it and never falls back to MCP.
+  const client = dashboardProcessClient;
+  if (hubMailRequestPollBusy || !client || !client.running) return;
   hubMailRequestPollBusy = true;
   try {
-    const payload = await mcpClient.callTool(HUB_MAIL_TOOLS.peers, { action: "requests" });
+    const payload = await client.callTool(HUB_MAIL_TOOLS.peers, { action: "requests" });
     // A failed poll says nothing about which requests are still pending; keep the notified set.
     if (!payload || payload.ok !== true) return;
     const requests = Array.isArray(payload.requests) ? payload.requests : [];
@@ -11310,7 +11736,7 @@ async function runNeedfixAction(view, action, args) {
   const tool = NEEDFIX_TOOLS[action];
   if (!tool) return;
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const payload = await client.callTool(tool, args);
     if (!view.stillBoundTo(client)) return;
@@ -11434,7 +11860,7 @@ async function runManagerLoopAction(view, action, args) {
 async function pushSettings(view) {
   try {
     const options = arguments.length > 1 && arguments[1] ? arguments[1] : {};
-    const client = options.client || getMcpClient();
+    const client = options.client || getDashboardClient();
     view.bindClient(client);
     // NF-2026-00811 cold-start ordering: an immediate requestSettings must
     // never overtake the initial full snapshot. The repo-bound preflight
@@ -11464,7 +11890,7 @@ async function updateFeatureSetting(view, feature, enabled, expectedRevision) {
     return;
   }
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const payload = await client.callTool(SETTINGS_UPDATE_TOOL, {
       changes: { [feature]: enabled },
@@ -11497,7 +11923,7 @@ async function updateModelSetting(view, provider, adapter, model, enabled, expec
     return;
   }
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const args = {
       provider,
@@ -11530,7 +11956,7 @@ async function updateSourceGraphLanguage(view, language, enabled, expectedRevisi
     return;
   }
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const payload = await client.callTool(SOURCE_GRAPH_SETTINGS_UPDATE_TOOL, {
       language_changes: { [language]: enabled },
@@ -11554,7 +11980,7 @@ async function updateSourceGraphLanguage(view, language, enabled, expectedRevisi
 
 async function runStorageCleanup(view) {
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const preview = await client.callTool(STORAGE_RETENTION_TOOLS.preview, {});
     if (!preview || preview.ok !== true) {
@@ -11590,7 +12016,7 @@ async function runStorageCleanup(view) {
 
 async function runStorageRegistrationPrune(view) {
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const preview = await client.callTool(STORAGE_RETENTION_TOOLS.preview, {});
     if (!preview || preview.ok !== true) {
@@ -11639,7 +12065,7 @@ async function runStorageRestore(view, batchId) {
   );
   if (choice !== "Restore") return;
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const result = await client.callTool(STORAGE_RETENTION_TOOLS.restore, { batch_id: batchId, confirm: true });
     if (!result || result.ok !== true) {
@@ -11662,7 +12088,7 @@ async function runStoragePurge(view, batchId) {
   );
   if (choice !== "Permanently Purge") return;
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const result = await client.callTool(STORAGE_RETENTION_TOOLS.purge, { batch_id: batchId, confirm: true });
     if (!result || result.ok !== true) {
@@ -11678,7 +12104,7 @@ async function runStoragePurge(view, batchId) {
 
 async function runTerminalLogCleanup(view) {
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const preview = await client.callTool(TERMINAL_LOG_RETENTION_TOOLS.preview, {});
     if (!preview || preview.ok !== true) {
@@ -11721,7 +12147,7 @@ async function runTerminalLogRestore(view, batchId) {
   );
   if (choice !== "Restore Logs") return;
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const result = await client.callTool(TERMINAL_LOG_RETENTION_TOOLS.restore, { batch_id: batchId, confirm: true });
     if (!result || result.ok !== true) {
@@ -11744,7 +12170,7 @@ async function runTerminalLogPurge(view, batchId) {
   );
   if (choice !== "Permanently Purge Logs") return;
   try {
-    const client = getMcpClient();
+    const client = getDashboardClient();
     view.bindClient(client);
     const result = await client.callTool(TERMINAL_LOG_RETENTION_TOOLS.purge, { batch_id: batchId, confirm: true });
     if (!result || result.ok !== true) {
@@ -12026,7 +12452,7 @@ async function pushInitializeStorage(view) {
   let initializeError = "";
   let initializationClient = null;
   try {
-    initializationClient = getMcpClient();
+    initializationClient = getDashboardClient();
     view.bindClient(initializationClient);
     const repoId = activeRepoIdentity && REAL_REPO_ID_RE.test(String(activeRepoIdentity.repoId || ""))
       ? activeRepoIdentity.repoId
@@ -12089,14 +12515,21 @@ async function pushInitializeStorage(view) {
       await vscodeLmBridgeHost.start(activeRepoIdentity);
     }
     // Only after the ready state is visible may the repository identity change
-    // from manifest-missing to its real repo_id and create a replacement child.
+    // from manifest-missing to its real repo_id and create replacement
+    // children. The dashboard process is rebound first so it mints the claim
+    // episode; the routing child then adopts that same episode (getMcpClient),
+    // so binding the view to the routing child's identity keeps it bound to
+    // the dashboard process too (ViewState.stillBoundTo). bindClient records
+    // identity only -- no dashboard tool is ever called on the routing child.
+    getDashboardClient();
     const initializedClient = getMcpClient();
     view.bindClient(initializedClient);
     pushRepositoryInfo(view, activeRepoIdentity);
 
     // Storage readiness is already rendered. Source Graph convergence on the
-    // NEW child can now take as long as Windows process/SQLite cleanup needs
-    // without holding the Webview on Connecting.
+    // NEW routing child can now take as long as Windows process/SQLite cleanup
+    // needs without holding the Webview on Connecting. The index daemon is an
+    // MCP service, never a dashboard-process duty.
     const sourceGraphStart = await initializedClient.callTool(
       SOURCE_GRAPH_DAEMON_TOOLS.ensureStarted,
       {},
@@ -12133,18 +12566,12 @@ function handleInboundMessage(view, message) {
       runBackgroundTask("dashboard refresh", () => pushSnapshot(view));
       break;
     case "retry": {
-      const client = getMcpClient();
+      const client = getDashboardClient();
       runBackgroundTask("dashboard retry", async () => {
-        // Explicit Retry replaces this window's exact child even when the
-        // old process still looks initialized. Reusing cached preflight from
-        // a nonresponsive child kept one window permanently offline while a
-        // second window on the same machine worked normally.
-        try {
-          await client.replaceForExplicitRecovery();
-        } catch (_err) {
-          // pushRuntimeInfo renders the phase-specific startup failure and
-          // owns the bounded repair accounting.
-        }
+        // Explicit Retry replaces this window's dashboard process and clears
+        // its respawn backoff, even when the old process still looks alive.
+        // The routing child's runtime health/repair stays with pushRuntimeInfo.
+        client.resetForExplicitRetry();
         await pushRuntimeInfo(view);
         await pushSnapshot(view);
       });
@@ -15037,10 +15464,10 @@ function reviveDashboardPanel(webviewPanel, extensionUri, context) {
   recordSystemLog("[webview] dashboard panel revived");
   applyWebviewOptions(ownedPanel.webview, extensionUri);
   ownedPanel.webview.html = getHtmlForWebview(ownedPanel.webview, extensionUri);
-  // Re-create a fresh McpStdioClient binding for the revived panel -- the
-  // extension host, not the Webview, owns MCP identity/session state, and a
+  // Re-create a fresh dashboard-process binding for the revived panel -- the
+  // extension host, not the Webview, owns identity/session state, and a
   // deserialized panel starts with none of it until this call.
-  const client = getMcpClient(context);
+  const client = getDashboardClient(context);
   const view = new ViewState((msg) => {
     if (ownedPanel.__aiworkhubViewState === view) {
       ownedPanel.webview.postMessage(msg);
@@ -15404,6 +15831,7 @@ async function deactivate() {
       MCP_DEACTIVATE_STOP_TIMEOUT_MS,
     )),
     runDeactivateStep("worker client dispose", () => disposeVscodeLmWorkerMcpClient()),
+    runDeactivateStep("dashboard process dispose", () => disposeDashboardProcessClient()),
   ]);
   // Last line of defence: any owned server child still alive (a startup that
   // raced this shutdown, a failed tree kill) is tree-killed before return.
@@ -15491,6 +15919,31 @@ module.exports = {
     DEFAULT_PYTHON_PREFLIGHT_TIMEOUT_MS,
     _buildPreflightDiagnostic,
     getMcpClient,
+    getDashboardClient,
+    disposeDashboardProcessClient,
+    DashboardProcessClient,
+    DASHBOARD_PROCESS_TOOLS,
+    dashboardProcessClientForTest: () => dashboardProcessClient,
+    pushTaskDetail,
+    pushLiveOutput,
+    pushMemory,
+    pushSessions,
+    pushKb,
+    pushNeedfixList,
+    pushNeedfixDetail,
+    pushRoadmapList,
+    pushRoadmapDetail,
+    pushHubMail,
+    pushHubMailDetail,
+    runHubMailAction,
+    runNeedfixAction,
+    updateFeatureSetting,
+    updateModelSetting,
+    updateSourceGraphLanguage,
+    pushInitializeStorage,
+    handleInboundMessage,
+    runStorageCleanup,
+    runTerminalLogCleanup,
     sanitizeErrorMessage,
     sanitizeWebviewPayload,
     codexConfigTomlPath,
@@ -15583,6 +16036,7 @@ module.exports = {
     armVscodeLmProviderBridgeReadiness,
     bindVscodeLmProviderBridgeForTest,
     resetVscodeLmWorkerSourceGraphReadinessForTest,
+    repoBoundPythonChildEnv,
     setVscodeLmWorkerSourceGraphReadyTimeoutMsForTest,
     vscodeLmProtocolToolTransport,
     vscodeLmPathMatchesPattern,

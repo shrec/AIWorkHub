@@ -113,8 +113,37 @@ assert.ok(ext.includes("getHtmlForNavigatorWebview"));
 assert.ok(ext.includes("Open Dashboard"));
 assert.ok(ext.includes("Select Repository"));
 
-assert.strictEqual((ext.match(/childProcess\.spawn\(/g) || []).length, 1);
+// Exactly two owned Python children: the MCP routing/dispatcher server and
+// the dashboard-only process (NF-2026-02287).
+assert.strictEqual((ext.match(/childProcess\.spawn\(/g) || []).length, 2);
 assert.ok(ext.includes('[...python.argsPrefix, "-m", "aiworkhub.server"]'));
+assert.ok(ext.includes('const DASHBOARD_READER_MODULE = "aiworkhub.dashboard_reader"'));
+assert.ok(ext.includes('[...python.argsPrefix, "-m", DASHBOARD_READER_MODULE, "--repo", root]'));
+{
+  // NF-2026-02287: no dashboard view/action resolves the MCP client.
+  for (const fn of [
+    "async function pushSnapshotOnce(view)",
+    "async function pushSnapshotNoRetry(view",
+    "async function pushTaskDetail(view",
+    "async function pushLiveOutput(view",
+    "async function pushMemory(view",
+    "async function pushNeedfixList(view",
+    "async function runNeedfixAction(view",
+    "async function pushHubMail(view",
+    "async function runHubMailAction(view",
+    "async function pushSettings(view",
+    "async function updateFeatureSetting(view",
+    "async function runStorageCleanup(view",
+    "async function runTerminalLogPurge(view",
+  ]) {
+    const start = ext.indexOf(fn);
+    assert.ok(start >= 0, fn);
+    const end = ext.indexOf("\n}\n", start);
+    const body = ext.slice(start, end);
+    assert.ok(body.includes("getDashboardClient()"), `${fn} must use the dashboard process`);
+    assert.ok(!body.includes("getMcpClient("), `${fn} must never call the MCP client`);
+  }
+}
 assert.ok(ext.includes("AIWORKHUB_REPO_ROOT"));
 assert.ok(ext.includes("AIWORKHUB_REPO_ID"));
 assert.ok(ext.includes("AIWORKHUB_WINDOW_ID"));

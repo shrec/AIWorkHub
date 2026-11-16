@@ -8,6 +8,7 @@ const path = require("path");
 
 const extensionPath = path.resolve(__dirname, "..", "extension.js");
 const packageVersion = require("../package.json").version;
+const { FakeDashboardChild, isDashboardReaderSpawn } = require("./dashboard-reader-nf02287.test.js");
 
 function writeRepo(root, repoId, repoName) {
   fs.mkdirSync(path.join(root, ".aiworkhub"), { recursive: true });
@@ -202,9 +203,17 @@ async function snapshotFor(host) {
   writeRepo(repoB, "repo_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "beta");
 
   const spawns = [];
+  // NF-2026-02287: dashboard snapshots come from the dashboard-only process;
+  // the MCP child (spawns) keeps only routing/dispatcher duties.
+  const dashboardSpawns = [];
   const behaviors = new Map([
-    [repoA, ["slow-snapshot"]],
     [repoB, ["die-before-initialize", "live"]],
+  ]);
+  const dashboardBehaviors = new Map([
+    [repoA, ["slow-snapshot"]],
+    // Repo B's first dashboard process dies; the dashboard must still reach
+    // Live through the respawned one.
+    [repoB, ["die-on-first-request", "live"]],
   ]);
   const originalSpawn = childProcess.spawn;
   childProcess.spawn = (cmd, args, options) => {
@@ -218,6 +227,11 @@ async function snapshotFor(host) {
       windowId: options.env.AIWORKHUB_WINDOW_ID,
       toolCalls: [],
     };
+    if (isDashboardReaderSpawn(args)) {
+      dashboardSpawns.push(spawnRecord);
+      const dashboardQueue = dashboardBehaviors.get(spawnRecord.repoRoot) || [];
+      return new FakeDashboardChild(spawnRecord, dashboardQueue.shift() || "live");
+    }
     spawns.push(spawnRecord);
     const queue = behaviors.get(spawnRecord.repoRoot) || [];
     return new FakeChild(spawnRecord, queue.shift() || "live");
@@ -291,17 +305,27 @@ async function snapshotFor(host) {
     assert.ok(snapB, `repo B did not reach Live after reconnect: ${JSON.stringify(secondMessages)}`);
     assert.strictEqual(snapA.payload.repo_id, "repo_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     assert.strictEqual(snapB.payload.repo_id, "repo_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-    assert.notStrictEqual(spawns[0].windowId, spawns[1].windowId);
+    const dashboardFor = (repoId) => dashboardSpawns.filter((spawn) => spawn.repoId === repoId);
+    const dashboardA = dashboardFor("repo_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    const dashboardB = dashboardFor("repo_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    assert.ok(dashboardA.length >= 1 && dashboardB.length === 2, JSON.stringify(dashboardSpawns.map((s) => s.repoId)));
+    assert.notStrictEqual(dashboardA[0].windowId, dashboardB[0].windowId);
+    // Snapshots are served by the dashboard process only, never the MCP child.
+    assert.ok(spawns.every((spawn) => !spawn.toolCalls.includes("aiworkhub_dashboard_snapshot")));
+    assert.ok(dashboardSpawns.every((spawn) => spawn.toolCalls.every((tool) => tool === "aiworkhub_dashboard_snapshot")));
+    // Every owned Python child (dashboard and routing) carries the same
+    // repository-bound environment.
+    const children = [...dashboardSpawns, ...spawns];
     assert.ok(
-      spawns.every((spawn) => spawn.env.BITNN_TASKCTL_COORDINATOR_TOKEN),
-      JSON.stringify(spawns.map((spawn) => ({ repoRoot: spawn.repoRoot, repoId: spawn.repoId, token: Boolean(spawn.env.BITNN_TASKCTL_COORDINATOR_TOKEN) }))),
+      children.every((spawn) => spawn.env.BITNN_TASKCTL_COORDINATOR_TOKEN),
+      JSON.stringify(children.map((spawn) => ({ repoRoot: spawn.repoRoot, repoId: spawn.repoId, token: Boolean(spawn.env.BITNN_TASKCTL_COORDINATOR_TOKEN) }))),
     );
-    assert.ok(spawns.every((spawn) => spawn.env.BITNN_TASKCTL_COORDINATOR_TOKEN_FILE.startsWith(spawn.repoRoot)));
-    assert.deepStrictEqual(new Set(spawns.map((spawn) => spawn.repoId)), new Set([
+    assert.ok(children.every((spawn) => spawn.env.BITNN_TASKCTL_COORDINATOR_TOKEN_FILE.startsWith(spawn.repoRoot)));
+    assert.deepStrictEqual(new Set(children.map((spawn) => spawn.repoId)), new Set([
       "repo_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "repo_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     ]));
-    assert.ok(spawns.every((spawn) => spawn.env.AIWORKHUB_CALLBACK_TRANSPORT === "manager_inbox"));
+    assert.ok(children.every((spawn) => spawn.env.AIWORKHUB_CALLBACK_TRANSPORT === "manager_inbox"));
     assert.ok(!JSON.stringify(secondMessages).includes("repo_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
     assert.ok(!JSON.stringify(firstMessages).includes("repo_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
 

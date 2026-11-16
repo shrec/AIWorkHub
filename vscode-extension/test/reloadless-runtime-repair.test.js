@@ -20,6 +20,7 @@ const path = require("path");
 
 const extensionPath = path.resolve(__dirname, "..", "extension.js");
 const EXPECTED_VERSION = require("../package.json").version;
+const { FakeDashboardChild, isDashboardReaderSpawn } = require("./dashboard-reader-nf02287.test.js");
 
 function writeRepo(root, repoId, repoName) {
   fs.mkdirSync(path.join(root, ".aiworkhub"), { recursive: true });
@@ -183,6 +184,7 @@ function canonicalRepositoryRoot(root) {
 
 function installSpawnFake(generationsByRoot) {
   const spawns = [];
+  const dashboardSpawns = [];
   const original = childProcess.spawn;
   const originalExecFile = childProcess.execFile;
   // extension.js canonicalizes repository roots with realpath before
@@ -209,6 +211,13 @@ function installSpawnFake(generationsByRoot) {
       windowId: options.env.AIWORKHUB_WINDOW_ID,
       requests: [],
     };
+    // NF-2026-02287: dashboard snapshots come from the dashboard-only
+    // process. It is recorded apart so every MCP spawn count below still
+    // counts exactly the repo-bound MCP children a repair replaces.
+    if (isDashboardReaderSpawn(args)) {
+      dashboardSpawns.push(spawnRecord);
+      return new FakeDashboardChild(spawnRecord);
+    }
     spawns.push(spawnRecord);
     const canonicalRoot = path.normalize(canonicalRepositoryRoot(spawnRecord.repoRoot));
     const queue = canonicalGenerations.get(canonicalRoot) || [];
@@ -220,6 +229,7 @@ function installSpawnFake(generationsByRoot) {
   };
   return {
     spawns,
+    dashboardSpawns,
     restore: () => {
       childProcess.execFile = originalExecFile;
       childProcess.spawn = original;
@@ -388,6 +398,10 @@ async function testSelfHealsAndReconnectsWithoutReload(tmp) {
     const snapshotMsg = messages.find((m) => m.type === "snapshot");
     assert.ok(snapshotMsg, "an already-open dashboard tab must reconnect automatically after startup repair");
     assert.strictEqual(snapshotMsg.payload.repo_id, "repo_selfheal00000000000000000000001");
+    // NF-2026-02287: the reconnect is served by the dashboard process; the
+    // repaired MCP child never answers a dashboard snapshot.
+    assert.strictEqual(fake.dashboardSpawns.length, 1);
+    assert.ok(fake.spawns.every((spawn) => spawn.requests.every((request) => request.tool !== "aiworkhub_dashboard_snapshot")));
 
     await host.extension.deactivate();
   } finally {

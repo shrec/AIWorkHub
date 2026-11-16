@@ -7863,20 +7863,25 @@ async function nf1300ChildEnvironments() {
   ]) {
     let spawnedEnv;
     const ambientEnv = { AIWORKHUB_ALLOW_WRITES: "1", AIWORKHUB_ALLOW_LAUNCH: "1" };
-    const start = vm.runInNewContext(
+    // Both the production _start and the env helper it calls are evaluated in
+    // the SAME isolated context, so the helper sees only `ambientEnv`.
+    const ctx = vm.createContext({
+      extensionContext: null, extensionRuntimeDir: "", mcpDebugTraceFile: "",
+      path, process: { env: ambientEnv }, WINDOW_SCOPE_ID: "window_nf1300",
+      findPythonCommandForLaunch: async () => ({ command: "python", argsPrefix: [] }),
+      resolveWorkerWorktreeRootEnv: () => "",
+      ensureRepositoryCoordinatorCapability: () => { throw new Error("test_no_capability"); },
+      debugTrace() {},
+      childProcess: { spawn(_command, _args, spawnOptions) {
+        spawnedEnv = spawnOptions.env;
+        throw new Error("nf1300_spawn_captured");
+      } },
+    });
+    assert.strictEqual(typeof internals.repoBoundPythonChildEnv, "function");
+    vm.runInContext(internals.repoBoundPythonChildEnv.toString(), ctx);
+    const start = vm.runInContext(
       "({ " + internals.McpStdioClient.prototype._start.toString() + " })._start",
-      {
-        extensionContext: null, extensionRuntimeDir: "", mcpDebugTraceFile: "",
-        path, process: { env: ambientEnv }, WINDOW_SCOPE_ID: "window_nf1300",
-        findPythonCommandForLaunch: async () => ({ command: "python", argsPrefix: [] }),
-        resolveWorkerWorktreeRootEnv: () => "",
-        ensureRepositoryCoordinatorCapability: () => { throw new Error("test_no_capability"); },
-        debugTrace() {},
-        childProcess: { spawn(_command, _args, spawnOptions) {
-          spawnedEnv = spawnOptions.env;
-          throw new Error("nf1300_spawn_captured");
-        } },
-      },
+      ctx,
     );
     const client = new internals.McpStdioClient("/tmp/nf1300", null,
       { repoId: "repo_" + "1".repeat(32) }, "episode_nf1300", options);

@@ -412,7 +412,8 @@ assert.ok(watcher.includes('"Accept"') && watcher.includes('"Reject"'));
 assert.ok(watcher.includes("request.sas"), "the notification shows the SAS");
 assert.ok(watcher.includes('request.direction !== "incoming"'));
 assert.ok(watcher.includes("confirm: true"));
-assert.ok(watcher.includes("if (hubMailRequestPollBusy || !mcpClient) return;"), "the watcher never spawns the MCP client");
+assert.ok(watcher.includes("async function pollHubMailRequests("), "the slice still covers pollHubMailRequests");
+assert.ok(watcher.includes("if (hubMailRequestPollBusy || !client || !client.running) return;"), "the watcher never spawns the MCP client");
 assert.ok(extension.includes("context.subscriptions.push(startHubMailRequestWatcher());"));
 
 console.log("WorkHub Mail popup contract verified");
