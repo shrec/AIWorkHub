@@ -118,6 +118,27 @@ def pinned_workforce_cap():
         yield
 
 
+@pytest.fixture(autouse=True, scope="session")
+def git_ceiling_at_basetemp(tmp_path_factory: pytest.TempPathFactory):
+    # NF-2026-02309: a fixture directory that is not itself a git repo makes git
+    # discovery walk up into the canonical .git, so `git worktree add` registers
+    # there and the registration goes stale once pytest deletes the basetemp.
+    # Ceiling the basetemp so discovery stops inside it. Runs per xdist worker.
+    basetemp = str(tmp_path_factory.getbasetemp().resolve())
+    previous = os.environ.get("GIT_CEILING_DIRECTORIES")
+    if previous:
+        os.environ["GIT_CEILING_DIRECTORIES"] = basetemp + os.pathsep + previous
+    else:
+        os.environ["GIT_CEILING_DIRECTORIES"] = basetemp
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("GIT_CEILING_DIRECTORIES", None)
+        else:
+            os.environ["GIT_CEILING_DIRECTORIES"] = previous
+
+
 def is_beneath(path: os.PathLike[str] | str, root: os.PathLike[str] | str) -> bool:
     try:
         Path(path).resolve().relative_to(Path(root).resolve())
