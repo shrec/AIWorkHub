@@ -41,7 +41,10 @@ The cut:
                   os.cpu_count() with headroom; every run here and in
                   wsl_tests passes --timeout=PYTEST_TIMEOUT_SECONDS
                   (pytest-timeout), so a stuck test fails with its stack
-                  instead of hanging the cut; up to LOAD_RERUN_MAX_NODES
+                  instead of hanging the cut; a run with no new output and,
+                  on this host, no basetemp change for STALL_BUDGET_SECONDS
+                  has its process tree ended and fails the step, naming the
+                  basetemp entries touched last; up to LOAD_RERUN_MAX_NODES
                   failed node ids get one serial rerun, and only a node that
                   fails again stops the cut. It runs the test-impact selection
                   (aiworkhub.test_impact_select) from the last v* tag on HEAD's
@@ -89,20 +92,25 @@ installed extension's server reports after a reload.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
 import importlib.util
 import io
+import itertools
 import json
 import math
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import ModuleType
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import IO, Any, Callable, Mapping, Protocol, Sequence
 
 
 def _load_sibling(name: str, directory: Path | None = None) -> ModuleType:
@@ -188,6 +196,22 @@ LONG_GIT_TIMEOUT_SECONDS = 900.0
 # The same suite run with --timeout=420
 # finished in 26.5 min; 600 s keeps headroom for a slow test under full xdist load.
 PYTEST_TIMEOUT_SECONDS = 600
+# NF-2026-02312: on 2026-11-17 host_tests stopped advancing at 06:29 (no new basetemp
+# entry across 12 xdist workers) and the cut waited until it was cancelled at 08:08;
+# --timeout=600 did not end it. A suite run without progress, no new output and no
+# basetemp change, for this long is ended with its process tree (_run_watched). Twice
+# the per-test limit: a legitimately slow test holds its worker at most
+# PYTEST_TIMEOUT_SECONDS, and its result is printed when it ends.
+STALL_BUDGET_SECONDS = 2.0 * PYTEST_TIMEOUT_SECONDS
+# Seconds between two looks of the watchdog, so watching costs no CPU worth measuring.
+STALL_POLL_SECONDS = 10.0
+# The most entries one look lists under a basetemp, which bounds a look on any suite.
+STALL_SCAN_MAX_ENTRIES = 20_000
+# How long a finished or ended suite run's output pipes may take to close.
+PIPE_DRAIN_SECONDS = 10.0
+PIPE_READ_BYTES = 65_536
+# The pytest option every suite run passes, by which run_subprocess tells one apart.
+BASETEMP_OPTION = "--basetemp="
 MAX_BASELINE_BYTES = 1024 * 1024
 MAX_BASELINE_IDS = 10_000
 MAX_LINE_CHARS = 600
@@ -280,13 +304,23 @@ def run_subprocess(
     env: Mapping[str, str] | None = None,
     timeout: float | None = None,
 ) -> Completed:
-    """The real runner: an argv list, no shell, no stdin, output captured."""
+    """The real runner: an argv list, no shell, no stdin, output captured.
+
+    A suite run, the one command that hands pytest a basetemp (_pytest_basetemp), is
+    watched for progress and ended with its whole process tree once it stalls
+    (_run_watched); every other command runs as it always did.
+    """
 
     command = list(argv)
     wsl = _is_wsl(command[0])
+    basetemp = _pytest_basetemp(command)
     # PATHEXT lookup: on Windows ``npm`` is npm.cmd, which a bare name misses.
     command[0] = shutil.which(command[0]) or command[0]
     try:
+        if basetemp is not None:
+            return _run_watched(
+                command, cwd=cwd, env=env, timeout=timeout, wsl=wsl, basetemp=basetemp
+            )
         done = subprocess.run(
             command,
             cwd=cwd,
@@ -305,6 +339,234 @@ def run_subprocess(
     return Completed(done.returncode, stdout, stderr)
 
 
+def _pytest_basetemp(argv: Sequence[str]) -> str | None:
+    """The basetemp a suite run hands pytest, which makes run_subprocess watch the run.
+
+    A host suite run passes it as one argv token (_host_test_argv), a WSL one as a token
+    of the ``sh -c`` script _wsl_in wraps _wsl_test_command in. No other command of the
+    cut passes it, and for those this answers None.
+    """
+
+    tokens = list(argv)
+    if tokens and _is_wsl(tokens[0]) and "-c" in tokens[:-1]:
+        try:
+            tokens = shlex.split(tokens[-1])
+        except ValueError:  # not a script _wsl_guarded_script built
+            return None
+    found = [
+        token[len(BASETEMP_OPTION) :] for token in tokens if token.startswith(BASETEMP_OPTION)
+    ]
+    return found[-1] if found else None
+
+
+def _run_watched(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str] | None,
+    timeout: float | None,
+    wsl: bool,
+    basetemp: str,
+) -> Completed:
+    """One suite run to its end, unless it stops making progress (NF-2026-02312).
+
+    Progress is captured output that grew or, on this host, a change of the newest mtime
+    at most two levels under the run's basetemp (_basetemp_scan); a WSL run's basetemp
+    lies on the Linux filesystem, so there the output alone tells. A run with neither
+    for STALL_BUDGET_SECONDS has its whole process tree ended (_ProcessTree) and answers
+    exit -1 with a last stderr line naming how long it stalled and the basetemp entries
+    touched last, which name the tests still running. Past ``timeout`` it ends the same
+    way and answers as the plain runner does. A run that ends by itself answers exactly
+    what it exited with and printed, and what it left running is ended.
+    """
+
+    watched = None if wsl else cwd / basetemp
+    drains: list[_Drain] = []
+    verdict: tuple[str, float] | None = None
+    with subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=None if env is None else dict(env),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,  # POSIX: the child leads a process group; unused on Windows
+    ) as proc:
+        tree = _ProcessTree(proc)
+        try:
+            drains.append(_Drain(proc.stdout))
+            drains.append(_Drain(proc.stderr))
+            verdict = _watch(proc, drains, watched, timeout)
+        finally:
+            tree.end()
+            for name, drain in zip(("stdout", "stderr"), drains):
+                if not drain.finish(PIPE_DRAIN_SECONDS):
+                    # Something the tree did not reach still holds this pipe, and closing
+                    # it under the blocked read could hang, so the read keeps the stream.
+                    setattr(proc, name, None)
+        returncode = proc.wait()
+    out, err = drains[0].data, drains[1].data
+    if verdict is None:
+        return Completed(returncode, _decode(out, wsl=wsl), _decode(err, wsl=wsl))
+    kind, seconds = verdict
+    if kind == "timeout":
+        raise subprocess.TimeoutExpired(command, seconds, output=out, stderr=err)
+    line = _stall_line(seconds, watched, basetemp, tree.reach)
+    return Completed(-1, _decode(out, wsl=wsl), f"{_decode(err, wsl=wsl)}\n{line}")
+
+
+def _watch(
+    proc: subprocess.Popen[bytes],
+    drains: Sequence[_Drain],
+    watched: Path | None,
+    timeout: float | None,
+) -> tuple[str, float] | None:
+    """Wait for ``proc``: None once it exits, else why the runner has to end it.
+
+    ``("timeout", timeout)`` once ``timeout`` passed, ``("stall", seconds)`` once neither
+    the output nor the newest basetemp mtime changed for STALL_BUDGET_SECONDS. One look
+    comes every STALL_POLL_SECONDS, and between looks the wait blocks.
+    """
+
+    started = last = time.monotonic()
+    seen = _progress(drains, watched)
+    while True:
+        wait = STALL_POLL_SECONDS
+        if timeout is not None:
+            wait = max(0.0, min(wait, started + timeout - time.monotonic()))
+        try:
+            proc.wait(timeout=wait)
+            return None
+        except subprocess.TimeoutExpired:
+            pass
+        now = time.monotonic()
+        if timeout is not None and now - started >= timeout:
+            return "timeout", timeout
+        mark = _progress(drains, watched)
+        if mark != seen:
+            seen, last = mark, now
+        elif now - last >= STALL_BUDGET_SECONDS:
+            return "stall", now - last
+
+
+def _progress(drains: Sequence[_Drain], watched: Path | None) -> tuple[int, int | None]:
+    """What one look compares: the output bytes so far and the newest basetemp mtime."""
+
+    newest = None if watched is None else _basetemp_scan(watched)[0]
+    return sum(drain.size for drain in drains), newest
+
+
+def _stall_line(seconds: float, watched: Path | None, basetemp: str, reach: str) -> str:
+    """A stalled suite run's last stderr line: how long, what was ended, what ran last."""
+
+    if watched is None:
+        return (
+            f"stalled {seconds:.0f} s (no new output; the WSL basetemp {basetemp} is not "
+            f"visible from this host), {reach}"
+        )
+    touched = _basetemp_scan(watched)[1]
+    return (
+        f"stalled {seconds:.0f} s (no new output, no basetemp change), {reach}; "
+        f"last touched: {_listing(touched) if touched else 'nothing under the basetemp'}"
+    )
+
+
+def _listed(directory: str | Path, limit: int) -> list[os.DirEntry[str]]:
+    """At most ``limit`` entries of ``directory``; none when it is absent or unreadable."""
+
+    try:
+        with os.scandir(directory) as entries:
+            return list(itertools.islice(entries, max(0, limit)))
+    except OSError:
+        return []
+
+
+def _mtime_ns(entry: os.DirEntry[str]) -> int | None:
+    try:
+        return entry.stat(follow_symlinks=False).st_mtime_ns
+    except OSError:
+        return None
+
+
+def _basetemp_scan(basetemp: Path) -> tuple[int | None, list[str]]:
+    """The newest mtime (ns) at most two levels under ``basetemp``, and what ran last.
+
+    pytest names a test's directory after the test: ``test_x0`` in a serial run,
+    ``popen-gwN/test_x0`` under xdist. So each top-level entry stands for its newest
+    child, or for itself when it has none, and the second answer lists those newest
+    first: under xdist, every worker's latest test. Two levels and
+    STALL_SCAN_MAX_ENTRIES bound one look, and an absent or unreadable entry adds
+    nothing, so it never counts as progress.
+    """
+
+    try:
+        newest = basetemp.stat().st_mtime_ns
+    except OSError:
+        return None, []
+    left = STALL_SCAN_MAX_ENTRIES
+    picks: list[tuple[int, str]] = []
+    tops = _listed(basetemp, left)
+    left -= len(tops)
+    for top in tops:
+        stamp = _mtime_ns(top)
+        if stamp is None:
+            continue
+        try:
+            # is_junction: a Windows junction is no symlink to is_dir, and leads elsewhere.
+            nested = left > 0 and top.is_dir(follow_symlinks=False) and not top.is_junction()
+        except OSError:
+            nested = False
+        pick: tuple[int, str] | None = None
+        if nested:
+            children = _listed(top.path, left)
+            left -= len(children)
+            for child in children:
+                child_stamp = _mtime_ns(child)
+                if child_stamp is not None:
+                    candidate = (child_stamp, f"{top.name}/{child.name}")
+                    pick = candidate if pick is None else max(pick, candidate)
+        if pick is None:
+            pick = (stamp, top.name)
+        newest = max(newest, stamp, pick[0])
+        picks.append(pick)
+    picks.sort(key=lambda item: (-item[0], item[1]))
+    return newest, [name for _stamp, name in picks]
+
+
+class _Drain:
+    """One output pipe of a suite run, read to its end on a daemon thread.
+
+    ``size`` counts the bytes read so far, the output half of the watchdog's progress.
+    The thread reads the descriptor itself, never through the stream's buffer, whose
+    lock a read that a surviving writer blocks would hold against any close.
+    """
+
+    def __init__(self, stream: IO[bytes] | None) -> None:
+        self._chunks: list[bytes] = []
+        self.size = 0
+        self._thread = threading.Thread(target=self._read, args=(stream,), daemon=True)
+        self._thread.start()
+
+    def _read(self, stream: IO[bytes] | None) -> None:
+        if stream is None:
+            return
+        with contextlib.suppress(OSError, ValueError):
+            descriptor = stream.fileno()
+            while chunk := os.read(descriptor, PIPE_READ_BYTES):
+                self._chunks.append(chunk)
+                self.size += len(chunk)
+
+    def finish(self, grace: float) -> bool:
+        """Wait up to ``grace`` s for the pipe to close; False while something holds it."""
+
+        self._thread.join(grace)
+        return not self._thread.is_alive()
+
+    @property
+    def data(self) -> bytes:
+        return b"".join(self._chunks)
+
+
 def _print_flushed(line: str) -> None:
     """Print one line on stdout and flush it at once; every line the cut prints comes here.
 
@@ -316,23 +578,17 @@ def _print_flushed(line: str) -> None:
     print(line, flush=True)
 
 
-def _bind_children_to_this_process() -> bool:
-    """Enter a fresh kill-on-close Job Object, so the kernel ends the cut's tree with it.
+def _kill_on_close_job(process: Callable[[Any], Any]) -> tuple[Any, str]:
+    """A fresh kill-on-close Job Object holding the process ``process(kernel32)`` answers.
 
-    Every later child and grandchild inherits the job, whatever ends this process.
-    The cut binds itself, not each child: the interpreter can already sit inside a
-    launcher job that lets its children break away silently, and only an innermost
-    job without breakaway keeps them. On success the job handle stays open until the
-    process ends, because closing it would end the cut. A failed step prints one
-    line and the cut goes on unbound; nothing here raises.
-
-    The WSL side was measured to need no code: killing wsl.exe ended its whole Linux
-    session within one second, so the job that ends wsl.exe ends the Linux side.
-    A POSIX host is not covered: there this returns False and binds nothing.
+    Answers ``(job, "")``, else ``(None, "STEP failed (GetLastError N)")`` with the job
+    closed again; nothing here raises. Every child and grandchild a member starts later
+    joins the job as well, and closing its last handle makes the kernel end them all.
+    ``process`` is asked only once the job is ready. Windows only: callers check
+    ``os.name`` first. The cut's one job mechanism (NF-2026-02208): the cut binds
+    itself with it, and the stall watchdog binds each suite run (_ProcessTree).
     """
 
-    if os.name != "nt":
-        return False
     kernel32 = ctypes.windll.kernel32
     step, job, detail = "load", None, ""
     try:
@@ -365,18 +621,80 @@ def _bind_children_to_this_process() -> bool:
             # Class 9 is JobObjectExtendedLimitInformation.
             if kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
                 step = "assign"
-                if kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess()):
-                    return True
-    except Exception as exc:  # whatever the load or a kernel call throws, the cut goes on
+                if kernel32.AssignProcessToJobObject(job, process(kernel32)):
+                    return job, ""
+    except Exception as exc:  # whatever the load or a kernel call throws, the caller goes on
         detail = f", {type(exc).__name__}"
     code = kernel32.GetLastError()  # read before CloseHandle overwrites it
     if job:
         kernel32.CloseHandle(job)
+    return None, f"{step} failed (GetLastError {code}{detail})"
+
+
+def _bind_children_to_this_process() -> bool:
+    """Enter a fresh kill-on-close Job Object, so the kernel ends the cut's tree with it.
+
+    Every later child and grandchild inherits the job, whatever ends this process.
+    The cut binds itself, not each child: the interpreter can already sit inside a
+    launcher job that lets its children break away silently, and only an innermost
+    job without breakaway keeps them. On success the job handle stays open until the
+    process ends, because closing it would end the cut. A failed step prints one
+    line and the cut goes on unbound; nothing here raises.
+
+    The WSL side was measured to need no code: killing wsl.exe ended its whole Linux
+    session within one second, so the job that ends wsl.exe ends the Linux side.
+    A POSIX host is not covered: there this returns False and binds nothing.
+    """
+
+    if os.name != "nt":
+        return False
+    job, failure = _kill_on_close_job(lambda kernel32: kernel32.GetCurrentProcess())
+    if job:
+        return True
     _print_flushed(
-        f"warning child_lifetime: {step} failed (GetLastError {code}{detail}), "
+        f"warning child_lifetime: {failure}, "
         "so a stopped cut can leave its child processes behind"
     )
     return False
+
+
+class _ProcessTree:
+    """A suite run's child and every process it starts, ended together by ``end``.
+
+    On Windows the child joins a kill-on-close Job Object of its own, the NF-2026-02208
+    mechanism (_kill_on_close_job), as soon as it starts, long before pytest starts a
+    worker. That job nests inside the cut's, so closing it ends the child, its xdist
+    workers and, through wsl.exe, the Linux side while the cut goes on. On POSIX, where
+    NF-2026-02208 binds nothing, start_new_session made the child lead a process group,
+    which one SIGKILL ends. ``reach`` names what ``end`` ends, a failed bind included;
+    ``end`` never raises.
+    """
+
+    def __init__(self, proc: subprocess.Popen[bytes]) -> None:
+        self._proc = proc
+        self._job: Any = None
+        self.reach = "process tree ended"
+        if os.name == "nt":
+            # Popen's own handle from CreateProcess: full access, and it pins the pid.
+            handle = getattr(proc, "_handle", None)
+            self._job, failure = _kill_on_close_job(lambda _kernel32: handle)
+            if not self._job:
+                self.reach = f"process ended, not its unbound tree ({failure})"
+
+    def end(self) -> None:
+        """End what still runs: a stalled tree, or whatever a finished run left behind."""
+
+        if self._job:
+            job, self._job = self._job, None
+            # The job's only handle: closing it makes the kernel end every process in it.
+            with contextlib.suppress(Exception):
+                ctypes.windll.kernel32.CloseHandle(job)
+        elif sys.platform != "win32" and self._proc.returncode is None:
+            # Only an unreaped leader pins the group id; after a reap it could be reused.
+            with contextlib.suppress(OSError):
+                os.killpg(self._proc.pid, signal.SIGKILL)
+        with contextlib.suppress(OSError):
+            self._proc.kill()
 
 
 @dataclass(frozen=True)
@@ -875,7 +1193,7 @@ class ReleaseCut:
             f"--timeout={PYTEST_TIMEOUT_SECONDS}",
             "-n",
             "0" if nodes else _xdist_flag(self.workers),
-            f"--basetemp={self.scratch / ('br' if nodes else 'b')}",
+            f"{BASETEMP_OPTION}{self.scratch / ('br' if nodes else 'b')}",
             *(nodes or self.test_targets),
         ]
 
@@ -902,7 +1220,7 @@ class ReleaseCut:
             "pythonpath=",
             "-n",
             "0" if nodes else _xdist_flag(self.workers),
-            f"--basetemp={self.wsl_basetemp}",
+            f"{BASETEMP_OPTION}{self.wsl_basetemp}",
             *(nodes or self.test_targets),
         ]
 
