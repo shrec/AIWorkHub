@@ -171,6 +171,7 @@ class _Child:
         self.pid = CHILD_PID
         self._handle = CHILD_HANDLE
         self.kills = 0
+        self.returncode = None
 
     def kill(self) -> None:
         self.kills += 1
