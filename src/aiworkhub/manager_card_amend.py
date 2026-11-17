@@ -270,6 +270,52 @@ def amend_runner_refusal(runner: str) -> tuple[str, str]:
     return folded, ""
 
 
+CANCEL_FOR_AMEND_REASON = "manager_cancel_for_amend"
+
+
+def _cancel_live_launch_for_amend(
+    root: Path, task_id: str, card: Mapping[str, Any]
+) -> tuple[dict[str, Any] | None, str]:
+    """Cancel the card's launch and return it to pending (NF-2026-02311).
+
+    ``(refusal, "")`` when the launch cannot be cancelled to a terminal state or
+    the card cannot be returned to pending, else ``(None, request_id)``. A
+    non-terminal cancel result changes nothing on the card.
+    """
+    from . import core, process_launcher
+
+    request_id = str(card.get("launch_request_id") or "").strip()
+    if not request_id:
+        return _refusal("task_amend_pending_refused:cancel_no_launch_request", task_id=task_id), ""
+    try:
+        cancelled = process_launcher.default_manager().cancel(
+            request_id, reason=CANCEL_FOR_AMEND_REASON
+        )
+    except Exception as exc:  # noqa: BLE001 -- refused by name, never treated as cancelled
+        return _refusal(
+            f"task_amend_pending_refused:cancel_failed:{type(exc).__name__}",
+            task_id=task_id, request_id=request_id, detail=str(exc)[:300],
+        ), ""
+    state = str(cancelled.get("state") or "") if isinstance(cancelled, Mapping) else ""
+    if state not in process_launcher.TERMINAL_PROCESS_STATES:
+        blocked = cancelled.get("blocked_reason") if isinstance(cancelled, Mapping) else None
+        return _refusal(
+            f"task_amend_pending_refused:cancel_not_terminal:{state or 'unknown'}",
+            task_id=task_id, request_id=request_id,
+            **({"blocked_reason": str(blocked)[:300]} if blocked else {}),
+        ), ""
+    ok, reason, _detail = task_store.return_cancelled_launch_to_pending(
+        root, task_id, actor=core._verified_manager_actor(),
+        request_id=request_id, reason=CANCEL_FOR_AMEND_REASON,
+    )
+    if not ok:
+        return _refusal(
+            f"task_amend_pending_refused:{reason}", task_id=task_id,
+            cancelled_request_id=request_id,
+        ), ""
+    return None, request_id
+
+
 def amend_pending(
     task_id: str,
     *,
@@ -278,6 +324,7 @@ def amend_pending(
     validation: list[str] | None = None,
     validation_roles: list[str] | None = None,
     runner: str | None = None,
+    cancel_live_launch: bool = False,
 ) -> dict[str, Any]:
     """Amend one pending card with no live launch: add-only paths, replacement validation.
 
@@ -296,6 +343,19 @@ def amend_pending(
     ``amend_runner_refusal``: ``task_amend_pending_refused:runner_reserved:<r>``
     for the manager identity, ``...:runner_route_absent:<r>`` for a runner with
     no workforce route. The receipt carries ``runner_before``/``runner_after``.
+
+    ``cancel_live_launch`` (NF-2026-02311): when true and the refusal is one of
+    ``task_store.CANCEL_FOR_AMEND_REFUSALS`` (card_claimed,
+    card_already_launched, card_not_pending:processing), the card's
+    ``launch_request_id`` is cancelled first through the process manager's
+    public ``cancel`` (reason ``manager_cancel_for_amend``). Only a terminal
+    returned state proceeds -- else ``task_amend_pending_refused:
+    cancel_not_terminal:<state>`` with the card unchanged -- then
+    ``task_store.return_cancelled_launch_to_pending`` returns the card to
+    pending/unclaimed with ``cancelled_launch`` recorded, and the normal
+    amendment runs; every reply after the cancel carries
+    ``cancelled_request_id``. An archived card is still ``card_archived``.
+    False (the default) keeps every refusal exactly as before.
     """
     from . import core, quality_evidence, task_templates
 
@@ -323,7 +383,10 @@ def amend_pending(
     if not isinstance(card, dict):
         return _refusal("task_amend_pending_refused:task_not_found", task_id=task_id)
     refusal = task_store.unlaunched_pending_refusal(card, card)
-    if refusal:
+    cancel_first = bool(
+        refusal and cancel_live_launch and refusal in task_store.CANCEL_FOR_AMEND_REFUSALS
+    )
+    if refusal and not cancel_first:
         return _refusal(f"task_amend_pending_refused:{refusal}", task_id=task_id)
     folded_runner = ""
     if requested_runner:
@@ -363,6 +426,23 @@ def amend_pending(
             )
         except ValueError as exc:
             return _refusal(str(exc), task_id=task_id)
+    if cancel_first:
+        # Every input above is valid for this card, so the cancel cannot be
+        # wasted on an amendment that would be refused anyway; the reloaded
+        # pending card is re-gated by the flag-off call.
+        cancel_error, cancelled_request_id = _cancel_live_launch_for_amend(root, task_id, card)
+        if cancel_error is not None:
+            return cancel_error
+        result = amend_pending(
+            task_id,
+            allowed_writes=allowed_writes,
+            read_first=read_first,
+            validation=validation,
+            validation_roles=validation_roles,
+            runner=runner,
+        )
+        result["cancelled_request_id"] = cancelled_request_id
+        return result
     actor = core._verified_manager_actor()
     ok, reason, detail = task_store.amend_pending_card(
         root,

@@ -6520,6 +6520,16 @@ def _commit_path_amendment(
 # accept-time manager correction carried.
 CARD_AMENDED_PENDING_EVENT = "card_amended_pending"
 ALLOWED_WRITES_AMENDED_ON_ACCEPT_EVENT = "allowed_writes_amended_on_accept"
+# NF-2026-02311: a manager cancelled a claimed/live launch so the card can be
+# amended. The card records ``cancelled_launch = {request_id, reason,
+# cancelled_at}``; ``_live_launch_request`` reads it as terminal evidence.
+CANCELLED_LAUNCH_KEY = "cancelled_launch"
+CARD_LAUNCH_CANCELLED_FOR_AMEND_EVENT = "card_launch_cancelled_for_amend"
+# The ``unlaunched_pending_refusal`` codes a cancel-for-amend may clear; every
+# other refusal (``card_archived`` first) stands even with the cancel flag.
+CANCEL_FOR_AMEND_REFUSALS = frozenset(
+    {"card_claimed", "card_already_launched", "card_not_pending:processing"}
+)
 
 
 def _live_launch_request(card: Mapping[str, Any]) -> bool:
@@ -6527,13 +6537,14 @@ def _live_launch_request(card: Mapping[str, Any]) -> bool:
 
     Read regardless of ``started_at``: a relaunch keeps the earlier launch's
     ``started_at``. A request is terminal only on the card's own evidence -- the
-    reject (``rejection_disposition``) or supersede (``rework_predecessor``)
-    that named it; no evidence means live (fail closed).
+    reject (``rejection_disposition``), supersede (``rework_predecessor``) or
+    manager cancel-for-amend (``cancelled_launch``, NF-2026-02311) that named
+    it; no evidence means live (fail closed).
     """
     request_id = str(card.get("launch_request_id") or "").strip()
     if not request_id:
         return False
-    for key in ("rejection_disposition", "rework_predecessor"):
+    for key in ("rejection_disposition", "rework_predecessor", CANCELLED_LAUNCH_KEY):
         record = card.get(key)
         if isinstance(record, Mapping) and str(record.get("request_id") or "").strip() == request_id:
             return False
@@ -6609,6 +6620,72 @@ def _commit_card_update(
     )
     conn.commit()
     return True
+
+
+def return_cancelled_launch_to_pending(
+    root: str | Path,
+    task_id: str,
+    *,
+    actor: str,
+    request_id: str,
+    reason: str,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Return a card whose launch the manager cancelled to pending (NF-2026-02311).
+
+    The caller has already cancelled ``request_id`` and seen a terminal
+    process state. Inside one immediate transaction with a ``card_json``
+    compare-and-swap, this re-decides eligibility -- the card's refusal must
+    still be one of ``CANCEL_FOR_AMEND_REFUSALS`` and its ``launch_request_id``
+    must still be ``request_id`` -- then sets status pending, worker_status
+    unclaimed, clears the claim, and records ``cancelled_launch = {request_id,
+    reason, cancelled_at}`` so ``_live_launch_request`` reads that request as
+    terminal. Returns ``(ok, reason, detail)``; ``reason`` is
+    ``returned_to_pending`` on success, otherwise the named refusal
+    (``launch_request_changed`` when the card now names another request).
+    """
+    wanted = str(request_id or "").strip()
+    if not wanted:
+        return False, "cancel_no_launch_request", {}
+    _readiness, db_path = _require_ready(root)
+    with _write_connection(db_path) as conn:
+        _begin_immediate(conn)
+        row, preimage, card, refusal = _load_card_for_update(conn, task_id)
+        if refusal or row is None or card is None:
+            return False, refusal or "task_not_found", {}
+        refusal = unlaunched_pending_refusal(dict(row), card)
+        if refusal not in CANCEL_FOR_AMEND_REFUSALS:
+            return False, refusal or "card_not_launched", {}
+        if str(card.get("launch_request_id") or "").strip() != wanted:
+            return False, "launch_request_changed", {}
+        now = datetime.now(timezone.utc).isoformat()
+        record = {"request_id": wanted, "reason": str(reason or "")[:300], "cancelled_at": now}
+        card[CANCELLED_LAUNCH_KEY] = record
+        card["status"] = "pending"
+        card["worker_status"] = "unclaimed"
+        card.pop("claimed_by", None)
+        history = card.get("history")
+        history_list = list(history) if isinstance(history, list) else []
+        history_list.append(
+            {"event": CARD_LAUNCH_CANCELLED_FOR_AMEND_EVENT, "actor": actor, "at": now,
+             "request_id": wanted, "refusal_cleared": refusal}
+        )
+        card["history"] = history_list
+        cur = conn.execute(
+            "UPDATE tasks SET status='pending', worker_status='unclaimed', claimed_by=NULL, "
+            "claimed_at=NULL, card_json=?, updated_at=? WHERE task_id=? AND card_json=?",
+            (json.dumps(card, ensure_ascii=False, sort_keys=True), now, task_id, preimage),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return False, "card_changed", {}
+        conn.execute(
+            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (task_id, CARD_LAUNCH_CANCELLED_FOR_AMEND_EVENT, actor,
+             json.dumps({**record, "refusal_cleared": refusal}, sort_keys=True), now),
+        )
+        conn.commit()
+        return True, "returned_to_pending", {CANCELLED_LAUNCH_KEY: dict(record)}
 
 
 def amend_pending_card(

@@ -4400,6 +4400,7 @@ def aiworkhub_task_amend_pending(
     validation: list[str] | None = None,
     validation_roles: list[str] | None = None,
     runner: str | None = None,
+    cancel_live_launch: bool = False,
 ) -> dict[str, Any]:
     """MANAGER WRITE: amend a pending card that no request was ever launched for.
 
@@ -4419,6 +4420,16 @@ def aiworkhub_task_amend_pending(
     recorded as a ``card_amended_pending`` event in the card history (the card
     stays launchable) and the reply carries the new ``card_sha256``.
 
+    ``cancel_live_launch=true`` (NF-2026-02311) is the manager path for a
+    claimed/processing auto-rework that cannot pass without the amendment: a
+    card refused card_claimed, card_already_launched or
+    card_not_pending:processing has its launch_request_id cancelled first
+    (reason manager_cancel_for_amend). Only a terminal cancel state proceeds,
+    else ``task_amend_pending_refused:cancel_not_terminal:<state>`` with the
+    card unchanged; the card then returns to pending/unclaimed with
+    ``cancelled_launch`` recorded, the amendment runs in the same call and the
+    reply carries ``cancelled_request_id``. An archived card stays refused.
+
     Args:
         task_id: Id of the pending, never-launched card to amend.
         allowed_writes: Repo-relative paths or globs to ADD to allowed_writes; omit to leave them.
@@ -4426,6 +4437,7 @@ def aiworkhub_task_amend_pending(
         validation: Shell-free commands that REPLACE the card's validation list; omit to keep it.
         validation_roles: One role per validation command; only with validation. Omit for generic roles.
         runner: Replacement runner (folded like task_create); refused as runner_reserved:<r> for the manager identity or runner_route_absent:<r> without a workforce route. Reply carries runner_before/runner_after.
+        cancel_live_launch: True to cancel a claimed/live launch to a terminal state and return the card to pending before amending; default false keeps every refusal unchanged.
     """
     result = manager_card_amend.amend_pending(
         task_id,
@@ -4434,6 +4446,7 @@ def aiworkhub_task_amend_pending(
         validation=validation,
         validation_roles=validation_roles,
         runner=runner,
+        cancel_live_launch=bool(cancel_live_launch),
     )
     if isinstance(result, dict) and result.get("ok"):
         # Best effort: the amendment already committed, so an unreadable
