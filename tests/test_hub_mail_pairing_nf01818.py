@@ -7,10 +7,12 @@ machine and no real ``~/.aiworkhub`` is touched.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import secrets
 import socket
+import threading
 import sys
 import time
 from pathlib import Path
@@ -508,6 +510,62 @@ def test_discovery_ignores_replies_that_do_not_answer_this_probe(world):
     ):
         assert parse(json.dumps(bad).encode(), nonce, own) is None
     assert parse(b"x" * 5000, nonce, own) is None and parse(b"[]", nonce, own) is None
+
+
+@contextlib.contextmanager
+def _probe_responder(machine_id: str, answer_on: int):
+    """A loopback UDP responder that records every probe and answers only the ``answer_on``-th one."""
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((LOOPBACK, 0))
+    sock.settimeout(0.1)
+    seen: list[bytes] = []
+    stop = threading.Event()
+
+    def serve() -> None:
+        while not stop.is_set():
+            try:
+                data, origin = sock.recvfrom(4096)
+            except OSError:
+                continue
+            seen.append(data)
+            if len(seen) == answer_on:
+                reply = {"p": hub_mail_pairing.DISCOVER_REPLY_ID, "n": json.loads(data)["n"],
+                         "machine_id": machine_id, "label": "Gamma", "port": 4000,
+                         "proto": hub_mail_pairing.PROTO}
+                sock.sendto(json.dumps(reply).encode(), origin)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        yield seen, sock.getsockname()[1]
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+        sock.close()
+
+
+def test_a_lost_probe_is_resent_and_the_second_answer_is_found(world):
+    a = world.machine("a", "Alpha", HUB_A)
+    with _probe_responder("2" * 32, answer_on=2) as (seen, port):
+        found = hub_mail_pairing.discover(2.0, targets=[(LOOPBACK, port)], home=a)
+    assert found["ok"] is True and found["count"] == 1, found
+    assert found["found"][0]["machine_id"] == "2" * 32
+    assert len(seen) >= 2
+
+
+def test_resends_stop_once_the_wanted_machine_is_found(world):
+    a = world.machine("a", "Alpha", HUB_A)
+    with _probe_responder("2" * 32, answer_on=1) as (seen, port):
+        started = time.monotonic()
+        found = hub_mail_pairing.discover(5.0, targets=[(LOOPBACK, port)], home=a, until_machine_id="2" * 32)
+        elapsed = time.monotonic() - started
+        time.sleep(0.2)
+        sent_at_return = len(seen)
+        time.sleep(0.8)
+        assert len(seen) == sent_at_return, (sent_at_return, len(seen))
+    assert found["count"] == 1 and sent_at_return >= 1
+    assert elapsed < 4.5
 
 
 def test_a_probe_with_a_bad_shape_gets_no_reply(world):

@@ -50,6 +50,7 @@ OFFER_RATE_LIMIT = 10
 OFFER_RATE_WINDOW_SECONDS = 60.0
 DISCOVER_RATE_LIMIT = 30
 DISCOVER_RATE_WINDOW_SECONDS = 10.0
+DISCOVER_RESEND_SECONDS = 0.5
 MAX_RATE_SOURCES = 1024
 MAX_DATAGRAM_BYTES = 1024
 MAX_DISCOVERED = 64
@@ -704,19 +705,16 @@ def discover(
     sockets: dict[int, socket.socket] = {}
     found: dict[str, dict[str, Any]] = {}
     try:
-        for host, port in probes:
-            family = socket.AF_INET6 if ":" in host else socket.AF_INET
-            try:
-                if family not in sockets:
-                    sockets[family] = _probe_socket(family)
-                sockets[family].sendto(packet, (host, port))
-            except OSError:
-                continue
+        _send_probe_round(sockets, probes, packet)
+        next_resend = time.monotonic() + DISCOVER_RESEND_SECONDS
         deadline = time.monotonic() + max(0.0, float(timeout))
         while sockets and len(found) < MAX_DISCOVERED:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
+            if time.monotonic() >= next_resend:
+                _send_probe_round(sockets, probes, packet)
+                next_resend = time.monotonic() + DISCOVER_RESEND_SECONDS
             try:
                 ready, _, _ = select.select(list(sockets.values()), [], [], min(remaining, 0.1))
             except (OSError, ValueError):
@@ -753,3 +751,16 @@ def _probe_socket(family: int) -> socket.socket:
         probe.close()
         raise
     return probe
+
+
+def _send_probe_round(sockets: dict[int, socket.socket], probes: list[tuple[str, int]], packet: bytes) -> None:
+    """Send one copy of the probe to every target; a send failure skips only that target."""
+
+    for host, port in probes:
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        try:
+            if family not in sockets:
+                sockets[family] = _probe_socket(family)
+            sockets[family].sendto(packet, (host, port))
+        except OSError:
+            continue
