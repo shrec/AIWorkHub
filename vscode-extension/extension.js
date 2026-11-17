@@ -734,6 +734,8 @@ const DASHBOARD_PROCESS_HIDDEN_STOP_MS = 60 * 1000;
 // The first respawn is immediate so a single crash heals on the next refresh.
 const DASHBOARD_PROCESS_RESPAWN_BACKOFF_MS = Object.freeze([0, 1000, 2000, 5000, 10000, 30000]);
 const DASHBOARD_PROCESS_MAX_PENDING_REQUESTS = 64;
+// NF-2026-02317: a cold reader's first call takes ~55 s (one-time imports + DB warm-up) vs 20 s MCP default.
+const DASHBOARD_PROCESS_COLD_START_TIMEOUT_MS = 90000;
 // Process-control variables only the MCP server/dispatcher reads; the
 // dashboard child never receives them.
 const DASHBOARD_PROCESS_STRIPPED_ENV = Object.freeze([
@@ -2372,6 +2374,8 @@ class DashboardProcessClient {
     this.child = child;
     this.spawnCount += 1;
     this.buffer = "";
+    // A fresh child gets the cold-start budget until it answers once.
+    this.childAnswered = false;
     this.stdoutDecoder = new StringDecoder("utf8");
     registerOwnedDashboardChild(child);
     trackStableRuntimeChild(child, runtimeDir);
@@ -2409,6 +2413,8 @@ class DashboardProcessClient {
       this.retryNotBefore = 0;
       const record = message && this.pending.get(message.id);
       if (!record) continue;
+      // The child has answered once: later calls keep the caller's own timeout.
+      this.childAnswered = true;
       this.pending.delete(message.id);
       clearTimeout(record.timer);
       if (message.error) {
@@ -2482,7 +2488,8 @@ class DashboardProcessClient {
         clearTimeout(record.timer);
         reject(err);
       };
-      record.timer = setTimeout(() => fail(new Error(DASHBOARD_REQUEST_TIMEOUT_REASON)), timeoutMs);
+      const coldBudgetMs = this.childAnswered ? timeoutMs : Math.max(timeoutMs, DASHBOARD_PROCESS_COLD_START_TIMEOUT_MS);
+      record.timer = setTimeout(() => fail(new Error(DASHBOARD_REQUEST_TIMEOUT_REASON)), coldBudgetMs);
       this.pending.set(id, record);
       try {
         child.stdin.write(frame, (err) => { if (err) fail(new Error("dashboard_process_write_failed")); });
