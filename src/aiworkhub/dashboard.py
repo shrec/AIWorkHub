@@ -2155,8 +2155,10 @@ class DashboardProvider:
     def get_storage_readiness(self) -> task_store.StorageReadiness:
         """Verified registry/database authority readiness for the active
         repository -- never directory existence alone. Every dashboard read
-        path below must check this before touching the canonical DB."""
-        return task_store.storage_readiness(self.repo_root)
+        path below must check this before touching the canonical DB.
+        The PRAGMA quick_check integrity scan belongs to the MCP server or
+        doctor, not the dashboard read path, so this uses the lite mode."""
+        return task_store.storage_readiness(self.repo_root, integrity_check=False)
 
     def _task_rows(self, status: str) -> tuple[dict[str, Any], ...]:
         # Narrow canonical row columns, never a decoded card. The task
