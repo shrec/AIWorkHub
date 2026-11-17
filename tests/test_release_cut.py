@@ -44,6 +44,8 @@ SUMMARY_HEADER = "=========================== short test summary info ==========
 LINUX_ROOT = "/mnt/z/repo"
 LINUX_SCRATCH = f"{LINUX_ROOT}/.scratch/release/{VERSION}"
 WSL_BASETEMP = f"/tmp/aiworkhub-release-{VERSION}"
+# Where WSL extracts HEAD and runs the suite: on the Linux filesystem, beside the basetemp.
+WSL_TREE = f"/tmp/aiworkhub-release-{VERSION}-tree"
 # The per-test limit every host and WSL suite run passes (release_cut.PYTEST_TIMEOUT_SECONDS).
 PYTEST_TIMEOUT = "--timeout=600"
 # What the wsl preflight imports with the WSL interpreter: xdist for -n and
@@ -666,7 +668,12 @@ def test_the_wsl_suite_runs_on_a_git_archive_of_head_under_scratch_release(tmp_p
     assert len(wsl_calls) == 11
     assert all(call.env is not None and call.env["MSYS_NO_PATHCONV"] == "1" for call in wsl_calls)
     (suite,) = runner.argv_of("wsl pytest")
-    assert _guarded(suite)[0] == f"{LINUX_SCRATCH}/tree"
+    # NF-2026-02315: the suite runs in a tree on the Linux filesystem, not on the 9p /mnt/
+    # mount where it sat in IO wait, and beside the basetemp pytest removes, not inside it.
+    tree = _guarded(suite)[0]
+    assert tree == WSL_TREE
+    assert tree.startswith("/tmp/aiworkhub-release-") and not tree.startswith("/mnt/")
+    assert not tree.startswith(f"{WSL_BASETEMP}/")
     # The archive commit is the release commit, and the host suite was over before.
     assert runner.labels.index("git commit") < runner.labels.index("git archive")
     assert runner.labels.index("pytest") < runner.labels.index("wsl pytest")
@@ -697,7 +704,7 @@ def test_every_wsl_tree_command_is_guarded_and_names_only_absolute_linux_paths(
         "wsl pytest",
         "wsl rm",
     ]
-    tree, archive = f"{LINUX_SCRATCH}/tree", f"{LINUX_SCRATCH}/head.tar"
+    tree, archive = WSL_TREE, f"{LINUX_SCRATCH}/head.tar"
     assert guarded[0][4] == (
         f"cd -- {LINUX_SCRATCH} || exit 97; exec rm -rf -- {tree} {archive} {WSL_BASETEMP}"
     )
@@ -847,7 +854,13 @@ def test_the_wsl_basetemp_is_under_wsl_tmp_and_removed_after_the_run_pass_or_fai
     assert len(suites) == (1 if response is None else 2)
     assert all(f"--basetemp={WSL_BASETEMP}" in _guarded(suite)[1] for suite in suites)
     assert runner.labels[runner.labels.index("wsl pytest") + len(suites)] == "wsl rm"
-    assert WSL_BASETEMP in _guarded(runner.argv_of("wsl rm")[-1])[1]
+    # The tree, the archive and the basetemp go before the run and after it, pass or fail.
+    before, after = runner.argv_of("wsl rm")
+    assert before == after
+    assert _guarded(after) == (
+        LINUX_SCRATCH,
+        ["rm", "-rf", "--", WSL_TREE, f"{LINUX_SCRATCH}/head.tar", WSL_BASETEMP],
+    )
 
 
 def test_the_wsl_suite_needs_a_windows_host_unless_skipped(tmp_path: Path) -> None:
@@ -962,7 +975,7 @@ def test_a_green_first_run_makes_no_rerun_and_both_suite_commands_stay_byte_iden
             "-e",
             "sh",
             "-c",
-            f"cd -- {LINUX_SCRATCH}/tree || exit 97; exec env PYTHONPATH=src python3 -m pytest "
+            f"cd -- {WSL_TREE} || exit 97; exec env PYTHONPATH=src python3 -m pytest "
             f"-q -rfE {PYTEST_TIMEOUT} -p no:cacheprovider -o pythonpath= -n 12 "
             f"--basetemp={WSL_BASETEMP} tests",
         )
@@ -1074,7 +1087,7 @@ def test_a_wsl_node_that_passes_alone_continues_the_cut_and_the_report_names_it(
     full, rerun = runner.argv_of("wsl pytest")
     assert _guarded(full)[1][-1] == "tests"
     assert _guarded(rerun) == (
-        f"{LINUX_SCRATCH}/tree",
+        WSL_TREE,
         [
             "env",
             "PYTHONPATH=src",

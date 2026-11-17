@@ -59,12 +59,14 @@ The cut:
                   reason. CI on push still runs the full suite.
   package         npm --prefix vscode-extension run package
   commit          git commit "release: VERSION" of exactly the release files
-  wsl_tests       a git archive of HEAD extracted under .scratch/release/VERSION
-                  and run in WSL with MSYS_NO_PATHCONV=1, only after the host
-                  suite has finished; WSL names that directory by its
-                  wslpath -a path, which must lie under /mnt/, and every WSL
-                  command takes absolute paths behind a cd guard; a failing
-                  node id absent from --wsl-baseline stops the cut, unless it
+  wsl_tests       a git archive of HEAD written under .scratch/release/VERSION,
+                  which WSL names by its wslpath -a path and which must lie
+                  under /mnt/, extracted by WSL into
+                  /tmp/aiworkhub-release-VERSION-tree on the Linux filesystem
+                  and run there with MSYS_NO_PATHCONV=1, only after the host
+                  suite has finished; every WSL command takes absolute paths
+                  behind a cd guard; a failing node id absent from
+                  --wsl-baseline stops the cut, unless it
                   passes the same one serial rerun as host_tests; before the
                   suite, git init, add -A and commit (identity given with -c)
                   make the extracted tree a one-commit repository, which the
@@ -79,11 +81,13 @@ Every subprocess goes through one injectable runner (``Host.runner``), so the
 tests never run npm, WSL or git push. The version, changelog and README rules
 belong to scripts/release_metadata.py and the receipt to
 scripts/release_receipt.py; this script orders them and adds no second copy.
-It writes nothing outside the repository: the archive, the WSL tree, the host
+On this host it writes nothing outside the repository: the archive, the host
 suite's basetemp and the step logs live under .scratch/release/VERSION. Inside
-WSL, pytest's basetemp is /tmp/aiworkhub-release-VERSION on the Linux
-filesystem, which the POSIX suite needs for sockets and file modes; the cut
-removes it after the run, pass or fail. Two steps stay outside the cut:
+WSL, the extracted tree is /tmp/aiworkhub-release-VERSION-tree and pytest's
+basetemp its sibling /tmp/aiworkhub-release-VERSION, both on the Linux
+filesystem, which the POSIX suite needs for sockets and file modes and where
+it does not sit in IO wait as on the 9p-mounted /mnt/; the cut removes both
+before and after the run, pass or fail. Two steps stay outside the cut:
 installing the VSIX (``code --install-extension``) writes to the editor's own
 extension directory, and ``release_receipt.py confirm`` needs the version the
 installed extension's server reports after a reload.
@@ -172,7 +176,8 @@ WSL_IMPORT_PROBE = f"import {', '.join(WSL_SUITE_MODULES)}"
 WSL_MOUNT_ROOT = "/mnt/"
 # What a guarded WSL command exits with when WSL cannot enter its directory.
 WSL_CD_FAILED = 97
-# pytest's basetemp inside WSL, on the Linux filesystem; removed after the run.
+# pytest's basetemp inside WSL, on the Linux filesystem, and with a -tree suffix the
+# HEAD tree the suite runs in (ReleaseCut.wsl_tree); both removed before and after the run.
 WSL_BASETEMP_PREFIX = "/tmp/aiworkhub-release-"
 # Run in order in the extracted WSL tree before its suite: ``git archive`` carries no
 # .git, and the suite's tests that run git against the checkout need a repository. The
@@ -1000,6 +1005,17 @@ class ReleaseCut:
     def wsl_basetemp(self) -> PurePosixPath:
         return PurePosixPath(f"{WSL_BASETEMP_PREFIX}{self.version}")
 
+    @property
+    def wsl_tree(self) -> PurePosixPath:
+        """Where WSL extracts HEAD and runs its suite: beside wsl_basetemp, never inside it.
+
+        On the Linux filesystem, as a suite run in a tree on the 9p-mounted /mnt/ scratch
+        sat in IO wait (NF-2026-02315: 18.8% iowait, 75% idle, workers in D state). A
+        sibling, because pytest removes an existing --basetemp before it uses it.
+        """
+
+        return PurePosixPath(f"{WSL_BASETEMP_PREFIX}{self.version}-tree")
+
     # -- the run -----------------------------------------------------------
 
     def run(self) -> int:
@@ -1272,12 +1288,13 @@ class ReleaseCut:
             f"notes' {FULL_SUITE_MARKER} asks for everything",
             "package": shlex.join(self._package_argv()),
             "commit": shlex.join(["git", *self._commit_args()]),
-            "wsl_tests": f"git archive HEAD to {scratch}/head.tar, extracted into {scratch}/tree "
-            f"at its wslpath -a path (refused unless under {WSL_MOUNT_ROOT}) and committed "
-            f"there by {', then '.join(shlex.join(argv) for argv in WSL_TREE_GIT_COMMANDS)}, "
+            "wsl_tests": f"git archive HEAD to {scratch}/head.tar, read at its wslpath -a path "
+            f"(refused unless under {WSL_MOUNT_ROOT}) and extracted into {self.wsl_tree} on the "
+            "Linux filesystem, committed there by "
+            f"{', then '.join(shlex.join(argv) for argv in WSL_TREE_GIT_COMMANDS)}, "
             f"each WSL command behind 'cd -- DIR || exit {WSL_CD_FAILED}'; MSYS_NO_PATHCONV=1 "
-            f"{shlex.join(self._wsl_test_command())}; {self.wsl_basetemp} removed after; "
-            f"baseline {baseline}",
+            f"{shlex.join(self._wsl_test_command())} in {self.wsl_tree}; the tree, head.tar and "
+            f"{self.wsl_basetemp} removed before and after; baseline {baseline}",
             "receipt": shlex.join(self._receipt_argv()),
             "tag": f"git tag {self.tag}",
             "push": shlex.join(["git", *self._push_args()]),
@@ -1608,9 +1625,11 @@ class ReleaseCut:
         # Translated once here, with the same /mnt/ rule the wsl preflight already
         # applied before any commit. Every WSL command below names only absolute
         # paths and runs behind a cd guard, so a directory WSL cannot enter stops
-        # the command instead of running it in ~.
+        # the command instead of running it in ~. The archive stays in the scratch,
+        # where Windows git writes it and tar reads it once; the tree the suite works
+        # in for the whole run lies on the Linux filesystem (wsl_tree).
         scratch = self._wsl_scratch()
-        tree, archive = scratch / "tree", scratch / "head.tar"
+        tree, archive = self.wsl_tree, scratch / "head.tar"
         clear = ("rm", "-rf", "--", str(tree), str(archive), str(self.wsl_basetemp))
         self._require(self._wsl_in(scratch, clear), "clearing the previous WSL tree")
         try:
@@ -1638,9 +1657,9 @@ class ReleaseCut:
             done = self._wsl_in(tree, self._wsl_test_command())
             return self._wsl_verdict(done, self._write_log("wsl_tests", done), tree)
         finally:
-            # WSL wrote the tree and pytest's basetemp, so WSL removes both, pass
-            # or fail. A failed removal leaves only git-ignored scratch and a /tmp
-            # directory behind and never changes the verdict.
+            # WSL removes the tree, the archive and pytest's basetemp, pass or fail.
+            # A failed removal leaves only git-ignored scratch and /tmp directories
+            # behind and never changes the verdict.
             self._wsl_in(scratch, clear)
 
     def _commit_wsl_tree(self, tree: PurePosixPath) -> None:

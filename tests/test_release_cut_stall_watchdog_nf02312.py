@@ -216,7 +216,8 @@ def test_the_runner_watches_every_suite_run_and_no_other_command(tmp_path: Path)
         out=lambda _line: None,
     )
     cut = release_cut.ReleaseCut(release_cut.Options(version=VERSION), host)
-    tree = PurePosixPath(f"/mnt/c/repo/.scratch/release/{VERSION}/tree")
+    scratch = PurePosixPath(f"/mnt/c/repo/.scratch/release/{VERSION}")
+    tree = cut.wsl_tree
 
     cut._run(cut._host_test_argv())
     cut._run(cut._host_test_argv([NODE]))
@@ -236,7 +237,8 @@ def test_the_runner_watches_every_suite_run_and_no_other_command(tmp_path: Path)
     cut._run(cut._receipt_argv())
     cut._wsl("-e", "wslpath", "-a", str(cut.scratch))
     cut._wsl("--cd", str(tmp_path), "-e", "python3", "-c", release_cut.WSL_IMPORT_PROBE)
-    cut._wsl_in(tree, ("rm", "-rf", "--", str(tree), str(cut.wsl_basetemp)))
+    clear = ("rm", "-rf", "--", str(tree), str(scratch / "head.tar"), str(cut.wsl_basetemp))
+    cut._wsl_in(scratch, clear)
     for argv in release_cut.WSL_TREE_GIT_COMMANDS:
         cut._wsl_in(tree, argv)
 
