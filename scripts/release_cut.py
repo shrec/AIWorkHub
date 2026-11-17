@@ -53,10 +53,14 @@ The cut:
                   for every changed path; otherwise, or with --full-suite, a
                   full_suite_required token in the CHANGELOG [VERSION] notes,
                   no previous tag, or a selector that raises or answers
-                  full_suite_required, the whole tests directory. wsl_tests
-                  runs the same targets; the JSON summary's test_selection
-                  names the lane, the base tag, the count and the fallback
-                  reason. CI on push still runs the full suite.
+                  full_suite_required, the whole tests directory; only that
+                  whole-suite run loads -p aiworkhub.test_impact_recorder,
+                  which records the map the next cut narrows with, and the
+                  narrowed run and every serial rerun never do. wsl_tests
+                  runs the same targets without the plugin; the JSON
+                  summary's test_selection names the lane, the base tag, the
+                  count and the fallback reason. CI on push still runs the
+                  full suite.
   package         npm --prefix vscode-extension run package
   commit          git commit "release: VERSION" of exactly the release files
   wsl_tests       a git archive of HEAD written under .scratch/release/VERSION,
@@ -232,6 +236,13 @@ LANE_IMPACT_MAP = "impact_map"
 LANE_FULL_SUITE = "full_suite"
 # The token in the CHANGELOG [VERSION] notes that makes a release run everything.
 FULL_SUITE_MARKER = "full_suite_required"
+# NF-2026-02314: the pytest plugin that records the map the impact_map lane reads. It
+# writes the map only from a session that ran the whole configured suite, so only the
+# whole-suite host run loads it (_host_test_argv): the release commit's run leaves the
+# map the next cut narrows with from this cut's tag. Without it every cut fell back
+# with selector_full_suite:map_missing. tests/test_release_cut.py asserts the module
+# documents this opt-in.
+TEST_IMPACT_RECORDER_PLUGIN = "aiworkhub.test_impact_recorder"
 
 PREFLIGHT_STEPS: tuple[str, ...] = (
     "version",
@@ -1200,6 +1211,9 @@ class ReleaseCut:
         # With nodes: the serial rerun of exactly those ids, in a basetemp of its own
         # because deleting the full run's basetemp measured 203 s. Both pass the
         # per-test --timeout, so a stuck test fails with its stack instead of hanging.
+        # Only the whole-suite run loads TEST_IMPACT_RECORDER_PLUGIN: the recorder would
+        # refuse a narrowed run or a rerun the map anyway, so neither carries it.
+        records = not nodes and self.test_targets == (FULL_SUITE_TARGET,)
         return [
             self.host.python,
             "-m",
@@ -1207,6 +1221,7 @@ class ReleaseCut:
             "-q",
             "-rfE",
             f"--timeout={PYTEST_TIMEOUT_SECONDS}",
+            *(("-p", TEST_IMPACT_RECORDER_PLUGIN) if records else ()),
             "-n",
             "0" if nodes else _xdist_flag(self.workers),
             f"{BASETEMP_OPTION}{self.scratch / ('br' if nodes else 'b')}",
@@ -1285,7 +1300,8 @@ class ReleaseCut:
             "host_tests": f"{shlex.join(self._host_test_argv())}; {FULL_SUITE_TARGET} narrows to "
             "the test-impact selection since the last v* tag, the same for wsl_tests, when the "
             "map is fresh for every changed path and neither --full-suite nor the CHANGELOG "
-            f"notes' {FULL_SUITE_MARKER} asks for everything",
+            f"notes' {FULL_SUITE_MARKER} asks for everything; only a whole-suite run loads "
+            f"-p {TEST_IMPACT_RECORDER_PLUGIN}, which records the map the next cut narrows with",
             "package": shlex.join(self._package_argv()),
             "commit": shlex.join(["git", *self._commit_args()]),
             "wsl_tests": f"git archive HEAD to {scratch}/head.tar, read at its wslpath -a path "

@@ -48,6 +48,8 @@ WSL_BASETEMP = f"/tmp/aiworkhub-release-{VERSION}"
 WSL_TREE = f"/tmp/aiworkhub-release-{VERSION}-tree"
 # The per-test limit every host and WSL suite run passes (release_cut.PYTEST_TIMEOUT_SECONDS).
 PYTEST_TIMEOUT = "--timeout=600"
+# The plugin only the whole-suite host run loads (release_cut.TEST_IMPACT_RECORDER_PLUGIN).
+RECORDER_PLUGIN = "aiworkhub.test_impact_recorder"
 # What the wsl preflight imports with the WSL interpreter: xdist for -n and
 # pytest_timeout for --timeout.
 WSL_IMPORT_PROBE = "import pytest, xdist, pytest_timeout"
@@ -963,6 +965,8 @@ def test_a_green_first_run_makes_no_rerun_and_both_suite_commands_stay_byte_iden
             "-q",
             "-rfE",
             PYTEST_TIMEOUT,
+            "-p",
+            RECORDER_PLUGIN,
             "-n",
             "12",
             f"--basetemp={scratch / 'b'}",
@@ -1790,6 +1794,53 @@ def test_a_dry_run_decides_no_lane_and_its_plan_names_the_narrowing(tmp_path: Pa
     assert summary["test_selection"]["lane"] is None
     (plan,) = [line for line in lines if line.startswith("plan    host_tests")]
     assert "test-impact selection since the last v* tag" in plan
+
+
+def test_only_the_whole_suite_host_run_loads_the_test_impact_recorder(tmp_path: Path) -> None:
+    """NF-2026-02314: the whole-suite host run records the map the next cut narrows with.
+
+    Nothing loaded the recorder, so every cut found no map and ran the whole suite. The
+    narrowed run and each serial rerun leave the plugin out, as the WSL suite does.
+    """
+
+    release_cut._impact_modules()  # src/ on sys.path when the interpreter has no aiworkhub
+    recorder = importlib.import_module(release_cut.TEST_IMPACT_RECORDER_PLUGIN)
+    assert release_cut.TEST_IMPACT_RECORDER_PLUGIN == RECORDER_PLUGIN
+    assert f"-p {RECORDER_PLUGIN}" in (recorder.__doc__ or "")
+
+    # No map, so the whole suite: its run loads the recorder, while the serial rerun of
+    # its failed node and the WSL suite do not.
+    root = _impact_repo(tmp_path / "full")
+    runner, selector, _ = _map_missing(root)
+    runner.responses["pytest"] = _full_then_alone(HOST_FAILURE, PASSED_ALONE)
+    code, summary, _, _ = _cut(root, runner=runner, selector=selector)
+    assert code == 0, summary["reason"]
+    assert summary["test_selection"]["lane"] == "full_suite"
+    full, rerun = runner.argv_of("pytest")
+    plugin = full.index("-p")
+    assert full[plugin : plugin + 2] == ("-p", RECORDER_PLUGIN) and full[-1] == "tests"
+    assert "-p" not in rerun and RECORDER_PLUGIN not in rerun and rerun[-1] == HOST_NODE
+    (suite,) = runner.argv_of("wsl pytest")
+    assert RECORDER_PLUGIN not in _guarded(suite)[1]
+
+    # A fresh map narrows the lane: neither the narrowed run nor its rerun loads it.
+    root = _impact_repo(tmp_path / "narrowed")
+    runner = _tagged(root)
+    runner.responses["pytest"] = _full_then_alone(HOST_FAILURE, PASSED_ALONE)
+    code, summary, _, _ = _cut(root, runner=runner, selector=FakeSelector(_selection()))
+    assert code == 0, summary["reason"]
+    assert summary["test_selection"]["lane"] == "impact_map"
+    narrowed, rerun = runner.argv_of("pytest")
+    assert RATCHET in narrowed and "tests" not in narrowed
+    for argv in (narrowed, rerun):
+        assert "-p" not in argv and RECORDER_PLUGIN not in argv
+
+    # The plan names the whole-suite command with the plugin and the WSL one without it.
+    code, summary, lines, _ = _cut(_repo(tmp_path / "dry"), "--dry-run")
+    assert code == 0, summary["reason"]
+    plan = {line.split()[1].rstrip(":"): line for line in lines if line.startswith("plan ")}
+    assert f"{PYTEST_TIMEOUT} -p {RECORDER_PLUGIN} -n 12 " in plan["host_tests"]
+    assert RECORDER_PLUGIN not in plan["wsl_tests"]
 
 
 def _head_blobs(
