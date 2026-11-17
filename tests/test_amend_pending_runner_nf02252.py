@@ -132,7 +132,9 @@ def test_runner_amend_folds_variant_spelling(manager_repo: Path) -> None:
 
 
 def test_runner_amend_on_launched_card_refuses(manager_repo: Path) -> None:
-    _insert_card(manager_repo, "T_LAUNCHED", started_at="2026-01-02T00:00:00+00:00")
+    _insert_card(
+        manager_repo, "T_LAUNCHED", started_at="2026-01-02T00:00:00+00:00", launch_request_id="R1"
+    )
     before = _stored(manager_repo, "T_LAUNCHED")
     result = manager_card_amend.amend_pending("T_LAUNCHED", runner=ROUTED)
     assert result["ok"] is False
