@@ -169,8 +169,6 @@ def test_server_tool_returns_the_new_card_sha256(manager_repo: Path) -> None:
     ("overrides", "refusal"),
     [
         ({"launch_request_id": "req-1"}, "card_already_launched"),
-        ({"history": [{"event": "created"}, {"event": "claimed"}]}, "card_already_launched"),
-        ({"started_at": "2026-01-02T00:00:00+00:00"}, "card_already_launched"),
         ({"status": "processing", "worker_status": "claimed", "claimed_by": "w"}, "card_claimed"),
         ({"status": "review", "worker_status": "review"}, "card_not_pending:review"),
         ({"status": "blocked", "worker_status": "blocked"}, "card_not_pending:blocked"),
@@ -188,6 +186,27 @@ def test_amend_pending_refuses_every_card_that_is_not_unlaunched_pending(
     assert result["ok"] is False
     assert result["error"] == f"task_amend_pending_refused:{refusal}"
     assert _stored(manager_repo, "AMEND_NO") == before
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"history": [{"event": "created"}, {"event": "claimed"}]},
+        {"started_at": "2026-01-02T00:00:00+00:00"},
+    ],
+)
+def test_amend_pending_admits_a_relaunched_card_with_no_live_launch(
+    manager_repo: Path, overrides: dict[str, Any]
+) -> None:
+    # NF-2026-02283: launch history alone no longer refuses; only a live launch does.
+    _insert_card(manager_repo, "AMEND_AGAIN", **overrides)
+
+    result = manager_card_amend.amend_pending(
+        "AMEND_AGAIN", allowed_writes=["tests/test_widget.py"]
+    )
+
+    assert result["ok"] is True, result
+    assert result["state"] == "amended"
 
 
 def test_store_rechecks_eligibility_inside_its_transaction(manager_repo: Path) -> None:

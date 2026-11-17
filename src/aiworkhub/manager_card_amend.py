@@ -279,7 +279,7 @@ def amend_pending(
     validation_roles: list[str] | None = None,
     runner: str | None = None,
 ) -> dict[str, Any]:
-    """Amend one UNLAUNCHED pending card: add-only paths, replacement validation.
+    """Amend one pending card with no live launch: add-only paths, replacement validation.
 
     Gates exactly as task_create: a live manager identity, the canonical write
     gate and the coordinator capability. Paths and commands are validated with
@@ -287,9 +287,10 @@ def amend_pending(
     code), validation replacement is dry-run through task_store's own
     ``apply_validation_amendment_mode`` (work_kind role gate included), and the
     store then re-decides eligibility inside its compare-and-swap transaction.
-    A launched, claimed, archived or non-pending card refuses with
-    ``task_amend_pending_refused:<card_already_launched|card_claimed|
-    card_archived|card_not_pending:<state>>``.
+    A card with a still-live launch, a claimed, archived or non-pending card
+    refuses with ``task_amend_pending_refused:<card_already_launched|card_claimed|
+    card_archived|card_not_pending:<state>>``; a card back to pending and
+    unclaimed after a reject or supersede is amendable (NF-2026-02283).
 
     ``runner`` (NF-2026-02252) replaces the card's runner, checked by
     ``amend_runner_refusal``: ``task_amend_pending_refused:runner_reserved:<r>``

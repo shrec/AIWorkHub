@@ -6522,13 +6522,32 @@ CARD_AMENDED_PENDING_EVENT = "card_amended_pending"
 ALLOWED_WRITES_AMENDED_ON_ACCEPT_EVENT = "allowed_writes_amended_on_accept"
 
 
+def _live_launch_request(card: Mapping[str, Any]) -> bool:
+    """True when the card's ``launch_request_id`` is not recorded as terminal.
+
+    Read regardless of ``started_at``: a relaunch keeps the earlier launch's
+    ``started_at``. A request is terminal only on the card's own evidence -- the
+    reject (``rejection_disposition``) or supersede (``rework_predecessor``)
+    that named it; no evidence means live (fail closed).
+    """
+    request_id = str(card.get("launch_request_id") or "").strip()
+    if not request_id:
+        return False
+    for key in ("rejection_disposition", "rework_predecessor"):
+        record = card.get(key)
+        if isinstance(record, Mapping) and str(record.get("request_id") or "").strip() == request_id:
+            return False
+    return True
+
+
 def unlaunched_pending_refusal(row: Mapping[str, Any], card: Mapping[str, Any]) -> str:
-    """Why this row is not an unlaunched pending card, else ``""``.
+    """Why this row is not an amendable pending card, else ``""``.
 
     Typed and ordered from the strongest fact: archived, then claimed (a worker
-    holds it), then any non-pending lifecycle, then a pending card some request
-    was already launched for (``is_pristine_pending_card`` -- the one predicate
-    for "never launched" -- or a recorded ``started_at``).
+    holds it), then any non-pending lifecycle, then a pending card a launch is
+    still live for (NF-2026-02283: ``_live_launch_request``, the current state,
+    never launch history -- a card back to pending and unclaimed after a reject
+    or supersede, its every request terminal, is amendable).
     """
     if str(row.get("archived_at") or "").strip():
         return "card_archived"
@@ -6538,7 +6557,7 @@ def unlaunched_pending_refusal(row: Mapping[str, Any], card: Mapping[str, Any]) 
     state = canonical_status(dict(row))
     if state != "pending" or str(row.get("status") or "").strip().lower() != "pending":
         return f"card_not_pending:{state}"
-    if str(row.get("started_at") or "").strip() or not is_pristine_pending_card(card):
+    if _live_launch_request(card):
         return "card_already_launched"
     return ""
 
@@ -6603,7 +6622,7 @@ def amend_pending_card(
     validation_roles: list[str] | None = None,
     runner: str | None = None,
 ) -> tuple[bool, str, dict[str, Any]]:
-    """Amend one UNLAUNCHED pending card in place (NF-2026-02241).
+    """Amend one pending card with no live launch in place (NF-2026-02241/02283).
 
     ``allowed_writes`` and ``read_first`` are add-only through the same
     ``apply_*_amendment`` functions reject_review uses; ``validation`` (when
