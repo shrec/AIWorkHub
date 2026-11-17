@@ -932,9 +932,50 @@ MANAGER_CORRECTION_SCHEMA_ID = "aiworkhub.manager_correction.v1"
 # The only fields a correction may carry; anything else refuses by name rather
 # than being silently dropped. ``allowed_writes_amendment`` (NF-2026-02241) is
 # optional: exact paths the patch may touch beyond the card's allowed_writes.
+# ``manager_measured`` (NF-2026-02304) is optional too: see below.
 MANAGER_CORRECTION_FIELDS = frozenset(
-    {"patch", "finding_ids", "reason", "allowed_writes_amendment"}
+    {"patch", "finding_ids", "reason", "allowed_writes_amendment", "manager_measured"}
 )
+
+# NF-2026-02304: a failure the manager measured itself (e.g. a neighbour test no
+# reviewer lens flagged) is stated inline as ``{"command", "failing_output"}``,
+# both non-empty strings within these caps; anything else refuses
+# ``manager_measured_invalid``. With it ``finding_ids`` may be empty: it lifts
+# no reviewer blocker, and its canonical-JSON digest is bound into the record
+# as ``manager_measured_sha256``.
+MANAGER_MEASURED_FIELDS = frozenset({"command", "failing_output"})
+MAX_MANAGER_MEASURED_COMMAND_CHARS = 1000
+MAX_MANAGER_MEASURED_OUTPUT_CHARS = 4000
+MANAGER_MEASURED_INVALID_ERROR = "manager_measured_invalid"
+
+
+def manager_measured_digest(value: Any) -> tuple[str, str]:
+    """``(sha256, "")`` for a valid ``manager_measured`` object, else ``("", reason)``.
+
+    The digest is over the canonical JSON (sorted keys, compact separators) of
+    exactly the validated object, so the record binds what the manager stated.
+    """
+    caps = {
+        "command": MAX_MANAGER_MEASURED_COMMAND_CHARS,
+        "failing_output": MAX_MANAGER_MEASURED_OUTPUT_CHARS,
+    }
+    if not isinstance(value, Mapping) or set(value) != MANAGER_MEASURED_FIELDS:
+        return "", MANAGER_MEASURED_INVALID_ERROR
+    for key, cap in caps.items():
+        text = value[key]
+        if not isinstance(text, str) or not text.strip() or len(text) > cap:
+            return "", MANAGER_MEASURED_INVALID_ERROR
+        try:
+            text.encode("utf-8")
+        except UnicodeEncodeError:  # a lone surrogate cannot be bound by digest
+            return "", MANAGER_MEASURED_INVALID_ERROR
+    canonical = json.dumps(
+        {key: value[key] for key in sorted(MANAGER_MEASURED_FIELDS)},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest(), ""
 
 # NF-2026-01845: a ``validation_failed`` candidate has no reviewer findings, so
 # a correction names the declared-validation row it repairs as
@@ -1286,9 +1327,21 @@ def validate_manager_correction(
     reason = correction.get("reason")
     if not isinstance(patch, str) or not patch.strip():
         return None, {}, "patch_empty"
+    # NF-2026-02304: a valid ``manager_measured`` lets ``finding_ids`` be empty
+    # or absent; it names no finding, so it lifts no reviewer blocker. Neither
+    # a finding id nor a valid measurement still refuses ``finding_ids_empty``.
+    measured_sha256 = ""
+    if correction.get("manager_measured") is not None:
+        measured_sha256, measured_reason = manager_measured_digest(
+            correction.get("manager_measured")
+        )
+        if measured_reason:
+            return None, {}, measured_reason
+    if raw_ids is None and measured_sha256:
+        raw_ids = []
     if (
         not isinstance(raw_ids, (list, tuple))
-        or not raw_ids
+        or (not raw_ids and not measured_sha256)
         or any(not isinstance(value, str) or not value.strip() for value in raw_ids)
     ):
         return None, {}, "finding_ids_empty"
@@ -1487,6 +1540,9 @@ def validate_manager_correction(
         "reason": str(reason or "")[:2000],
         "actor": actor,
     }
+    if measured_sha256:
+        # NF-2026-02304: the manager's own measured failure, bound by digest.
+        record["manager_measured_sha256"] = measured_sha256
     if from_validation_failed and named_rows:
         record["correction_origin"] = "validation_failed"
     if manager_evidence:
