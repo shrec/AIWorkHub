@@ -177,10 +177,9 @@ inherit the manager's launch capability.
 - **semantic-edit-historical-cap-boundary**: historical capped a/b observation at 20k/200k ops shows a 29.329% reduction; this is a capped historical sample, not eligible as a live guarantee.
 - **context-bundle-v2-structural-only**: structural-only validation; live fleet remeasurement pending.
 
-## What's new in 0.13.4
+## What's new in 0.13.5
 
-- The manager can cancel a claimed rework that cannot pass and widen its allowed writes in one call, instead of waiting out a doomed run.
-- Validation reworks that need a path outside the card are held for the manager, and environment-skipped validations are no longer counted green.
+- Hub mail discovery keeps resending its probe until the deadline, so one lost UDP datagram on a busy machine no longer reports zero hubs.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Documentation

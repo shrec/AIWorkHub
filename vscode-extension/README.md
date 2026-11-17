@@ -94,10 +94,9 @@ Source Graph coverage and bounded viewers for logs, sessions, AI Memory and KB.
   <em>Tasks, callback health, source coverage, context stores, preflight and evidence in one retained editor tab.</em>
 </div>
 
-## What's new in 0.13.4
+## What's new in 0.13.5
 
-- The manager can cancel a claimed rework that cannot pass and widen its allowed writes in one call, instead of waiting out a doomed run.
-- Validation reworks that need a path outside the card are held for the manager, and environment-skipped validations are no longer counted green.
+- Hub mail discovery keeps resending its probe until the deadline, so one lost UDP datagram on a busy machine no longer reports zero hubs.
 
 ## Get started
 

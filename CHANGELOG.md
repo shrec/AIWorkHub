@@ -6,6 +6,12 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.13.5] - 2026-11-17
+
+### Fixed
+
+- Hub mail discovery resends its UDP probe every 0.5 s until the deadline, so one lost datagram on a loaded host no longer returns zero hubs; this flake had failed the 0.13.4 push CI and blocked the GitHub Release (NF-2026-02316).
+
 ## [0.13.4] - 2026-11-17
 
 ### Fixed

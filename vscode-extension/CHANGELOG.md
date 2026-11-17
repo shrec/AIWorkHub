@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.13.5 — 2026-11-17
+
+### Fixed
+
+- Bundles runtime 0.13.5: hub mail discovery retries its probe until the deadline, so a single lost UDP datagram no longer finds zero hubs.
+
 ## 0.13.4 — 2026-11-17
 
 ### Fixed
