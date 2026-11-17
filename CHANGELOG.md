@@ -6,6 +6,24 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.13.4] - 2026-11-17
+
+### Fixed
+
+- `task_amend_pending(cancel_live_launch=true)` cancels a claimed auto-rework and widens its allowed_writes in one call, so a rework the manager knows cannot pass no longer burns a full run (NF-2026-02311).
+- `task_amend_pending` decides on the live launch, not launch history: a card back to pending after a reject or supersede is amendable (NF-2026-02283).
+- A manager correction may fix a failure the manager measured itself (`manager_measured`), not only a reviewer finding (NF-2026-02304).
+- Validation auto-rework holds for the manager when the fix needs a path outside allowed_writes instead of returning a doomed rework (NF-2026-02306).
+- A rework reviewer is never narrowed to the rework hunks when the earlier delta is unreviewed (NF-2026-02305).
+- An environment-skipped pytest validation is not counted green (NF-2026-02307); a reviewer that never read the candidate overlay is not counted as verified (NF-2026-02308).
+- A late finalize never voids an already-decided request (NF-2026-01680).
+- The ninja named-pipe classifier no longer hides a real pytest failure (NF-2026-02310); test fixture repos no longer leak worktree registrations into the canonical repo (NF-2026-02309).
+- `needfix_convert` no longer auto-fills the cheapest runner on a tied ranking (NF-2026-02302); `reroute_launch_identity` accepts `worker_id` or `execution_runner` (NF-2026-02303); the dashboard snapshot timeout names the dashboard reader (NF-2026-02301).
+
+### Changed
+
+- Validation lanes of the same base share one ccache, so C/C++ validations stop recompiling from cold (NF-2026-02097).
+
 ## [0.13.3] - 2026-11-16
 
 ### Fixed

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.13.4 — 2026-11-17
+
+### Fixed
+
+- Bundles runtime 0.13.4: the manager can cancel a doomed claimed rework and amend it in one call, validation reworks that cannot pass are held instead of burned, environment-skipped validations are no longer green, and validation lanes share one ccache.
+
 ## 0.13.3 — 2026-11-16
 
 ### Fixed
