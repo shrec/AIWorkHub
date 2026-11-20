@@ -48,6 +48,7 @@ from . import worker_workspace as _workspace
 from .sdlc_attribution import is_test_path
 from .task_templates import split_command_argv
 from .toolchain_authority import RECEIPT_CARD_KEY
+from .validation_skip_audit import VALIDATION_ENV_SKIPPED
 from .worker_workspace import ValidationRunError, WorkspaceError
 
 # No commit history was readable when this was written, so recall at a lower cap
@@ -1000,6 +1001,23 @@ def _red(rows: Sequence[Mapping[str, Any]]) -> bool:
     return any(row.get("returncode") != 0 or row.get("timed_out") for row in rows)
 
 
+def _env_skipped_only(rows: Sequence[Mapping[str, Any]]) -> bool:
+    """True when every red row is a sandbox env-skip row whose pytest exit was 0.
+
+    NF-2026-02319: an AppContainer-skipped neighbour test rewrites its green row to
+    ``returncode`` None (NF-2026-02307), but pytest itself exited 0, so every
+    collected non-skipped test passed. A timed-out row, a real non-zero returncode,
+    or an env-skip row whose ``pytest_returncode`` is not 0 is never excused.
+    """
+    red = [row for row in rows if row.get("returncode") != 0 or row.get("timed_out")]
+    return bool(red) and all(
+        row.get(VALIDATION_ENV_SKIPPED)
+        and row.get("pytest_returncode") == 0
+        and not row.get("timed_out")
+        for row in red
+    )
+
+
 def _attempt(
     run: Callable[[Any, Mapping[str, Any], Mapping[str, Any]], list[dict[str, Any]]],
     workspace: Any,
@@ -1094,6 +1112,13 @@ def run_neighbour_tests(
     evidence["duration_seconds"] = round(max(0.0, clock() - started), 3)
     if rows and not error and not _red(rows):
         evidence["validation"] = rows
+        return evidence
+    if rows and rerunnable and _env_skipped_only(rows):
+        # NF-2026-02319: an env-skipped green row is evidence, not a refusal.
+        evidence["validation"] = rows
+        evidence["env_skipped"] = [
+            dict(item) for row in rows for item in row.get("env_skipped_tests") or ()
+        ]
         return evidence
     nodes = _rerun_nodes(selection, rows, rerunnable and _red(rows))
     if not nodes:

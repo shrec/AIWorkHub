@@ -20,6 +20,7 @@ from aiworkhub import card_contract_advice
 from aiworkhub import process_launcher_accept_review
 from aiworkhub import source_graph as sg
 from aiworkhub.toolchain_authority import RECEIPT_CARD_KEY
+from aiworkhub.validation_skip_audit import env_skip_row_fields
 from aiworkhub.worker_workspace import ValidationRunError, WorkspaceError
 
 ENGINE = "src/tinypkg/engine.py"
@@ -509,3 +510,58 @@ def test_accept_review_records_neighbour_evidence_on_the_combined_tree_and_gate(
     source = ast.unparse(_accept_review_node())
     assert "combined_tree['neighbour_tests'] = neighbour_tests" in source
     assert "quality_gate['neighbour_tests'] = neighbour_tests" in source
+
+
+# --- NF-2026-02319: an env-skipped green neighbour row is evidence, not a refusal --------
+
+_ENV_SKIP_ITEM = {
+    "location": "tests/test_lifecycle_canary_golden_path.py:236",
+    "count": 1,
+    "reason": "APPCONTAINER_SKIP",
+}
+
+
+def _env_skip_row(**extra: Any) -> dict[str, Any]:
+    # The skip audit's rewrite of a green pytest row (pytest itself exited 0).
+    row: dict[str, Any] = {"command": _COMMAND, "returncode": 0, "timed_out": False, "stdout": ""}
+    row.update(env_skip_row_fields([dict(_ENV_SKIP_ITEM)]))
+    row.update(extra)
+    return row
+
+
+def test_env_skip_only_red_run_raised_as_validation_run_error_is_not_a_refusal() -> None:
+    row = _env_skip_row()
+    runner = _Runner(ValidationRunError("validation_failed:rc=None", [row]))
+    evidence = _run(runner)
+    assert evidence["env_skipped"] == [_ENV_SKIP_ITEM]
+    assert evidence["validation"] == [row]
+    assert "neighbour_rerun" not in evidence and "neighbour_flaky_rerun" not in evidence
+    assert len(runner.calls) == 1
+
+
+def test_env_skip_only_red_run_returned_as_rows_is_not_a_refusal() -> None:
+    row = _env_skip_row()
+    runner = _Runner([row])
+    evidence = _run(runner)
+    assert evidence["env_skipped"] == [_ENV_SKIP_ITEM]
+    assert evidence["validation"] == [row]
+    assert len(runner.calls) == 1
+
+
+def test_env_skip_row_beside_a_real_failure_still_refuses_with_neighbour_tests_failed() -> None:
+    failed = {"command": _COMMAND, "returncode": 1, "timed_out": False, "stdout": ""}
+    runner = _Runner([_env_skip_row(), failed])
+    with pytest.raises(WorkspaceError, match="neighbour_tests_failed:"):
+        _run(runner)
+
+
+def test_env_skip_shaped_row_with_a_nonzero_pytest_returncode_still_refuses() -> None:
+    runner = _Runner([_env_skip_row(pytest_returncode=1)])
+    with pytest.raises(WorkspaceError, match="neighbour_tests_failed:"):
+        _run(runner)
+
+
+def test_env_skip_row_that_timed_out_still_refuses() -> None:
+    runner = _Runner([_env_skip_row(timed_out=True)])
+    with pytest.raises(WorkspaceError, match="neighbour_tests_failed:"):
+        _run(runner)
