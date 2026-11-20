@@ -427,20 +427,34 @@ class WakeConsumer:
 
 
 def default_callback_source(
-    *, session_id: str | Callable[[], str], provider: str | None = None, lease_seconds: int = 120
+    *,
+    session_id: str | Callable[[], str],
+    provider: str | None = None,
+    lease_seconds: int = 120,
+    holds_seat: bool | Callable[[], bool] = True,
 ) -> tuple[ClaimFn, AckFn]:
     """The real claim/ack wiring: the same lease API behind the legacy MCP poll tools.
 
-    ``provider=None`` is the Manager Chat seat. It copies still-pending
-    Codex/Claude rows onto the active session and claims only that copy.
-    It does not rebind those original rows, so the existing mux can still
-    deliver them. An explicit provider keeps the older single-family claim.
-    The ack resolves each batch's own provider/origin from its row.
+    ``provider=None`` is the Manager Chat seat. Each claim first seeds the
+    review wakes this session's own cards are owed
+    (``callback_store.seed_missing_review_callbacks`` for ``manager_chat``: a
+    deferred review_ready wake released after its grace is seeded here, or it
+    never reaches the chat), then moves still-pending lane rows of the cards
+    this session launched onto it (``mirror_pending_to_manager_chat`` settles
+    each original row, so exactly one consumer handles it). Only while
+    ``holds_seat`` is true does it also rebind other pending Manager Chat rows
+    onto this session: a bound session idle past the seat lease still claims
+    its own stamped cards, and nothing else. An explicit provider keeps the
+    older single-family claim. The ack resolves each batch's own
+    provider/origin from its row.
     """
 
     def origin() -> str:
         current = session_id() if callable(session_id) else session_id
         return str(current or "").strip()
+
+    def seated() -> bool:
+        return bool(holds_seat() if callable(holds_seat) else holds_seat)
 
     def claim() -> Optional[Mapping[str, Any]]:
         from . import callback_store
@@ -452,11 +466,15 @@ def default_callback_source(
         conn = _canonical_connect()
         try:
             if provider is None:
-                callback_store.mirror_pending_to_manager_chat(conn, active_id)
                 family = callback_store.MANAGER_CHAT_PROVIDER
-                callback_store.rebind_pending_callbacks(
+                callback_store.mirror_pending_to_manager_chat(conn, active_id)
+                callback_store.seed_missing_review_callbacks(
                     conn, provider=family, origin_thread_id=active_id,
                 )
+                if seated():
+                    callback_store.rebind_pending_callbacks(
+                        conn, provider=family, origin_thread_id=active_id,
+                    )
                 batch = callback_store.claim_pending_callback_batch(
                     conn,
                     lease_seconds=lease_seconds,

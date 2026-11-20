@@ -3672,12 +3672,20 @@ def _enqueue_terminal_callback_row(
     claim one of them quietly contradicts.
     """
 
+    from . import callback_store
+
     normalized_provider = str(provider or "").strip().lower()
     normalized_origin = str(origin_thread_id or "").strip()
     if normalized_provider and normalized_provider not in MANAGER_PROVIDERS:
         return False
     if not normalized_origin or transition not in _ATOMIC_CALLBACK_TRANSITIONS:
         return False
+    # The one routing rule enqueue_callback shares: an mls- origin, or a card a
+    # Manager Chat session launched, is filed as manager_chat on that session,
+    # so no lane manager can claim or rebind the row first.
+    normalized_provider, normalized_origin = callback_store.manager_chat_callback_route(
+        conn, task_id, normalized_provider, normalized_origin
+    )
     cur = conn.execute(
         """
         INSERT INTO callback_outbox(

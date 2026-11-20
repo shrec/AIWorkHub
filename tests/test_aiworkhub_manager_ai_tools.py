@@ -2413,7 +2413,9 @@ def test_manager_chat_seat_fails_closed_when_the_newest_event_line_outgrows_the_
     assert not holds_with_a_newest_line_of(tail + 1)
 
 
-def test_a_stale_manager_chat_session_gets_no_mirrored_callback_copy(tmp_path):
+def test_no_manager_chat_session_gets_a_copy_of_a_card_it_did_not_launch(tmp_path):
+    # Stale or live, a seated chat session gets no copy of a lane card no chat
+    # launched: that callback has exactly one consumer, its lane manager.
     root = tmp_path / "repo"
     root.mkdir()
     thread = "11111111-1111-4111-8111-111111111111"
@@ -2445,7 +2447,6 @@ def test_a_stale_manager_chat_session_gets_no_mirrored_callback_copy(tmp_path):
         assert [tuple(row) for row in rows] == [
             ("TASK_IDLE_SEAT", "codex", thread),
             ("TASK_LIVE_SEAT", "codex", thread),
-            ("TASK_LIVE_SEAT", "manager_chat", _SEAT_SESSION),
         ]
     finally:
         conn.close()

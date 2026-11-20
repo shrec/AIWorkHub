@@ -632,22 +632,14 @@ def _manager_chat_last_event_at(
     return None
 
 
-def manager_chat_record_holds_seat(
-    record: Any, *, state_dir: Path | None = None, now: datetime | None = None
-) -> bool:
-    """Whether one Manager Chat session record is the manager seat right now.
+def manager_chat_record_bound(record: Any) -> bool:
+    """Whether one Manager Chat session record is active and pinned to a backend and model.
 
-    The one rule every reader shares: the callback origin here, the seat
-    ``core`` reports, and the wake consumer in ``manager_loop_service``. A
-    record holds the seat only when it is ``active``, pinned to a backend and
-    model (a passive conversation has neither and owns no route to answer on),
-    and used recently: one of ``last_turn_at``, ``updated_at`` or ``created_at``
-    satisfies ``now - MANAGER_CHAT_SEAT_LEASE <= stamp <= now +
-    MANAGER_CHAT_SEAT_CLOCK_SKEW``. When none does, the newest event in its log
-    under ``state_dir`` (the ``manager_loop`` runtime directory) inside that same
-    bound still counts. A stamp older than the lease is a leftover and one
-    ahead of the skew is a wrong clock; neither keeps the seat, so a record
-    with no such stamp and no such event is not the seat.
+    The lease-free half of :func:`manager_chat_record_holds_seat`: a passive or
+    closed conversation owns no route to answer on. A bound record that idled
+    past the seat lease no longer holds the seat, but it still answers the
+    callbacks of the cards it launched (the wake consumer in
+    ``manager_loop_service``).
     """
 
     if not isinstance(record, dict):
@@ -656,7 +648,28 @@ def manager_chat_record_holds_seat(
         return False
     backend_id = str(record.get("backend_id") or "").strip()
     model = str(record.get("model") or "").strip()
-    if not backend_id or not model:
+    return bool(backend_id and model)
+
+
+def manager_chat_record_holds_seat(
+    record: Any, *, state_dir: Path | None = None, now: datetime | None = None
+) -> bool:
+    """Whether one Manager Chat session record is the manager seat right now.
+
+    The one rule every reader shares: the callback origin here, the seat
+    ``core`` reports, and the wake consumer in ``manager_loop_service``. A
+    record holds the seat only when it is bound (:func:`manager_chat_record_bound`:
+    ``active``, pinned to a backend and model -- a passive conversation has
+    neither and owns no route to answer on), and used recently: one of ``last_turn_at``, ``updated_at`` or ``created_at``
+    satisfies ``now - MANAGER_CHAT_SEAT_LEASE <= stamp <= now +
+    MANAGER_CHAT_SEAT_CLOCK_SKEW``. When none does, the newest event in its log
+    under ``state_dir`` (the ``manager_loop`` runtime directory) inside that same
+    bound still counts. A stamp older than the lease is a leftover and one
+    ahead of the skew is a wrong clock; neither keeps the seat, so a record
+    with no such stamp and no such event is not the seat.
+    """
+
+    if not manager_chat_record_bound(record):
         return False
     current = now or datetime.now(timezone.utc)
     earliest = current - MANAGER_CHAT_SEAT_LEASE
@@ -703,12 +716,27 @@ def _active_manager_chat_session_from_conn(conn: sqlite3.Connection) -> str:
     return session_id
 
 
-def _callback_manager_chat_session(conn: sqlite3.Connection, task_id: str) -> str:
-    """Where this task's Manager Chat copy should land.
+def _card_manager_chat_owner(card: Any, row_origin: Any = "") -> str:
+    """The Manager Chat session that launched one card, else ''.
 
-    The card's stamped session wins. Otherwise the selected session, when it
-    still holds the seat. Window ids and episode ids are not sessions.
+    Its stamped ``manager_chat_session_id`` wins; otherwise an ``mls-`` origin
+    (the card's own, then the task row's). Window ids and episode ids are not
+    sessions.
     """
+
+    if not isinstance(card, dict):
+        card = {}
+    stamped = str(card.get("manager_chat_session_id") or "").strip()
+    if _MANAGER_CHAT_SESSION_RE.fullmatch(stamped):
+        return stamped
+    origin = str(card.get("origin_thread_id") or row_origin or "").strip()
+    if _MANAGER_CHAT_SESSION_RE.fullmatch(origin):
+        return origin
+    return ""
+
+
+def _manager_chat_owner_session(conn: sqlite3.Connection, task_id: str) -> str:
+    """The Manager Chat session that launched ``task_id`` (:func:`_card_manager_chat_owner`), else ''."""
 
     try:
         row = conn.execute(
@@ -716,28 +744,61 @@ def _callback_manager_chat_session(conn: sqlite3.Connection, task_id: str) -> st
             (task_id,),
         ).fetchone()
     except sqlite3.Error:
-        row = None
-    if row is not None:
-        raw = _row_value(row, "card_json", 0)
-        try:
-            card = json.loads(raw) if raw else {}
-        except (TypeError, json.JSONDecodeError):
-            card = {}
-        if isinstance(card, dict):
-            stamped = str(card.get("manager_chat_session_id") or "").strip()
-            if _MANAGER_CHAT_SESSION_RE.fullmatch(stamped):
-                return stamped
-            origin = str(card.get("origin_thread_id") or _row_value(row, "origin_thread_id", 1) or "").strip()
-            if _MANAGER_CHAT_SESSION_RE.fullmatch(origin):
-                return origin
-    return _active_manager_chat_session_from_conn(conn)
+        return ""
+    if row is None:
+        return ""
+    raw = _row_value(row, "card_json", 0)
+    try:
+        card = json.loads(raw) if raw else {}
+    except (TypeError, json.JSONDecodeError):
+        card = {}
+    return _card_manager_chat_owner(card, _row_value(row, "origin_thread_id", 1))
+
+
+def _callback_manager_chat_session(conn: sqlite3.Connection, task_id: str) -> str:
+    """Where this task's Manager Chat copy should land.
+
+    The session that launched the card wins (:func:`_manager_chat_owner_session`).
+    Otherwise the selected session, when it still holds the seat.
+    """
+
+    return _manager_chat_owner_session(conn, task_id) or _active_manager_chat_session_from_conn(conn)
+
+
+def manager_chat_callback_route(
+    conn: sqlite3.Connection, task_id: str, provider: str, origin_thread_id: str
+) -> tuple[str, str]:
+    """The ``(provider, origin_thread_id)`` one terminal callback row is filed under.
+
+    The single routing rule ``enqueue_callback`` and
+    ``task_store.publish_manager_ready`` share. An ``mls-`` origin is a Manager
+    Chat session, never a Codex/Claude thread, so it is filed as
+    ``manager_chat``. A card a Manager Chat session launched (its stamped or
+    ``mls-`` origin session, the owner half of
+    :func:`_callback_manager_chat_session`) is filed on that session, so no lane
+    manager can claim or rebind it first. Anything else keeps the caller's route.
+    """
+
+    route_provider = str(provider or "").strip().lower()
+    route_origin = str(origin_thread_id or "").strip()
+    # The launching session wins even over a different mls- origin (a rework
+    # another session launched): the seed and the claim look for the row there.
+    owner = _manager_chat_owner_session(conn, task_id)
+    if owner:
+        return MANAGER_CHAT_PROVIDER, owner
+    if _MANAGER_CHAT_SESSION_RE.fullmatch(route_origin):
+        return MANAGER_CHAT_PROVIDER, route_origin
+    return route_provider, route_origin
 
 
 def mirror_pending_to_manager_chat(conn: sqlite3.Connection, session_id: str) -> int:
-    """Copy still-pending Codex/Claude/Copilot rows onto one Manager Chat session.
+    """Move still-pending Codex/Claude/Copilot rows of this session's own cards onto it.
 
-    The original row stays pending so the existing mux can still deliver it.
-    This is a copy, not a rebind.
+    Only a card the session launched (:func:`_manager_chat_owner_session`) is
+    mirrored. Once its Manager Chat copy exists the original lane row is
+    settled (``superseded``, with its single recovery spent so no seed
+    resurrects it), so exactly one consumer handles the callback. Returns how
+    many copies were newly enqueued.
     """
 
     session_id = str(session_id or "").strip()
@@ -746,7 +807,7 @@ def mirror_pending_to_manager_chat(conn: sqlite3.Connection, session_id: str) ->
     _ensure_callback_outbox_table(conn)
     try:
         rows = conn.execute(
-            "SELECT task_id, transition, episode_id, event_id, request_id "
+            "SELECT outbox_id, task_id, transition, episode_id, event_id, request_id "
             f"FROM callback_outbox WHERE state='pending' AND provider IN ({_LANE_PROVIDER_PLACEHOLDERS})",
             _LANE_PROVIDERS,
         ).fetchall()
@@ -754,41 +815,63 @@ def mirror_pending_to_manager_chat(conn: sqlite3.Connection, session_id: str) ->
         return 0
     copied = 0
     for row in rows:
+        task_id = _row_value(row, "task_id", 1)
+        if _manager_chat_owner_session(conn, task_id) != session_id:
+            continue
+        transition = _row_value(row, "transition", 2)
+        episode_id = _row_value(row, "episode_id", 3)
         if enqueue_callback(
             conn,
-            _row_value(row, "task_id", 0),
+            task_id,
             session_id,
-            _row_value(row, "transition", 1),
+            transition,
             provider=MANAGER_CHAT_PROVIDER,
-            episode_id=_row_value(row, "episode_id", 2),
-            event_id=_row_value(row, "event_id", 3),
-            request_id=_row_value(row, "request_id", 4),
+            episode_id=episode_id,
+            event_id=_row_value(row, "event_id", 4),
+            request_id=_row_value(row, "request_id", 5),
         ):
             copied += 1
+        _settle_mirrored_lane_row(conn, row[0], task_id, session_id, transition, episode_id)
     return copied
 
 
-def _mirror_callback_to_manager_chat(
+def _settle_mirrored_lane_row(
     conn: sqlite3.Connection,
+    outbox_id: Any,
     task_id: str,
+    session_id: str,
     transition: str,
     episode_id: str,
-    event_id: str,
-    request_id: str,
 ) -> bool:
-    session_id = _callback_manager_chat_session(conn, task_id)
-    if not session_id:
+    """Supersede one lane row whose Manager Chat copy exists; False when there is no copy."""
+
+    try:
+        copy = conn.execute(
+            "SELECT 1 FROM callback_outbox WHERE task_id=? AND provider=? AND origin_thread_id=? "
+            "AND transition=? AND episode_id=? LIMIT 1",
+            (task_id, MANAGER_CHAT_PROVIDER, session_id, transition, episode_id),
+        ).fetchone()
+        if copy is None:
+            return False
+        settled = conn.execute(
+            "UPDATE callback_outbox SET state='superseded', last_error='mirrored_to_manager_chat', "
+            "recovery_count=MAX(recovery_count, 1), updated_at=? "
+            "WHERE outbox_id=? AND state='pending'",
+            (utc_now(), outbox_id),
+        ).rowcount
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
         return False
-    return enqueue_callback(
-        conn,
-        task_id,
-        session_id,
-        transition,
-        provider=MANAGER_CHAT_PROVIDER,
-        episode_id=episode_id,
-        event_id=event_id,
-        request_id=request_id,
-    )
+    if settled:
+        append_event(
+            conn,
+            task_id,
+            "callback_superseded",
+            "",
+            {"transition": transition, "reason": "mirrored_to_manager_chat", "session_id": session_id},
+        )
+    return bool(settled)
 
 
 def enqueue_callback(
@@ -812,12 +895,17 @@ def enqueue_callback(
         return False
     validated_thread = str(origin_thread_id or "").strip()
     validated_provider = str(provider or "").strip().lower()
-    # An mls- id is a Manager Chat session, never a Codex/Claude thread.
-    if _MANAGER_CHAT_SESSION_RE.fullmatch(validated_thread):
-        validated_provider = MANAGER_CHAT_PROVIDER
-    if validated_provider not in _CALLBACK_PROVIDERS:
+    if validated_provider not in _CALLBACK_PROVIDERS and not _MANAGER_CHAT_SESSION_RE.fullmatch(validated_thread):
         return False
     if not validated_thread:
+        return False
+    # An mls- id is a Manager Chat session, never a Codex/Claude thread, and a
+    # card a Manager Chat session launched is filed on that session: the one
+    # routing rule publish_manager_ready shares (manager_chat_callback_route).
+    validated_provider, validated_thread = manager_chat_callback_route(
+        conn, str(task_id or ""), validated_provider, validated_thread
+    )
+    if validated_provider not in _CALLBACK_PROVIDERS:
         return False
     _ensure_callback_outbox_table(conn)
     # Validate the outbox schema before enqueue; a malformed row is
@@ -872,20 +960,9 @@ def enqueue_callback(
         conn.rollback()
         raise
     append_event(conn, task_id, "callback_enqueued", "", {"transition": transition, "episode_id": resolved_episode, "provider": validated_provider})
-    if validated_provider != MANAGER_CHAT_PROVIDER:
-        try:
-            _mirror_callback_to_manager_chat(
-                conn,
-                task_id,
-                transition,
-                str(resolved_episode),
-                event_id,
-                request_id,
-            )
-        except sqlite3.Error:
-            # The Codex/Claude row is already durable. A chat copy failure
-            # must not look like the original enqueue failed.
-            pass
+    # No Manager Chat copy of a lane row: a card a chat launched was filed on
+    # it above, and one no chat launched stays with its lane manager alone, so
+    # exactly one consumer handles each callback.
     return True
 
 
@@ -2533,9 +2610,16 @@ def _seed_review_decision(
         card = {}
     if not isinstance(card, dict):
         card = {}
-    row_provider = str(card.get("coordinator_provider") or provider).strip().lower()
-    if row_provider != provider:
-        return None
+    owner_session = _card_manager_chat_owner(card, row["origin_thread_id"])
+    if provider == MANAGER_CHAT_PROVIDER:
+        # Manager Chat seeds only the cards a chat session launched, whatever
+        # backend family coordinated them, and only for that session.
+        if not owner_session or (route_origin and owner_session != route_origin):
+            return None
+    else:
+        row_provider = str(card.get("coordinator_provider") or provider).strip().lower()
+        if row_provider != provider:
+            return None
     episode_id = str(card.get("claim_epoch") or 0)
     current_status = str(row["status"] or "").strip()
     raw_terminal = str(card.get("terminal_substatus") or "").strip()
@@ -2573,7 +2657,11 @@ def _seed_review_decision(
     # recovery); a live owner keeps the wake in its own lane. A card with no
     # launch identity keeps the legacy any-verified-route retarget: no seat
     # holds a request to match it against.
-    if (
+    if owner_session:
+        # A card a Manager Chat session launched is filed on that session
+        # (manager_chat_callback_route), so the seed looks for it there.
+        callback_origin = owner_session
+    elif (
         route_origin
         and seed_request_id
         and persisted_origin
@@ -2587,6 +2675,16 @@ def _seed_review_decision(
         callback_origin = route_origin or persisted_origin
     if not callback_origin:
         return None
+    if provider == MANAGER_CHAT_PROVIDER:
+        # A lane manager already holds or delivered this wake: the chat must
+        # not handle the same callback a second time.
+        handled = conn.execute(
+            "SELECT 1 FROM callback_outbox WHERE task_id=? AND transition=? AND episode_id=? "
+            "AND state IN ('inflight', 'delivered') LIMIT 1",
+            (task_id, transition, episode_id),
+        ).fetchone()
+        if handled is not None:
+            return None
 
     def _decision(recover_row: Any = None) -> _SeedDecision:
         return _SeedDecision(

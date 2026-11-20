@@ -314,7 +314,8 @@ def test_a_queued_owner_message_runs_before_the_next_callback_wake(
 
     def done(delivered: bool, errors: Any = ()) -> None:
         # The wake consumer starts its next member once a turn reports done;
-        # the queued owner message must already own the lock by then.
+        # the queued owner message already owns the lock by then, so the next
+        # wake is queued behind it instead of refused.
         next_wake_started.append(
             manager_loop_service._wake_dispatch(
                 tmp_path, {"task_id": "T-2", "state": "done"}, lambda _d, _e=(): None
@@ -328,8 +329,12 @@ def test_a_queued_owner_message_runs_before_the_next_callback_wake(
 
     backend.gate.set()
     assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
-    assert next_wake_started == [False]
-    assert backend.messages == ["callback: T-1 -> review_ready", "owner says hi"]
+    assert next_wake_started == [True]
+    assert backend.messages == [
+        "callback: T-1 -> review_ready",
+        "owner says hi",
+        "callback: T-2 -> done",
+    ]
 
 
 def test_a_queued_message_that_cannot_bind_its_route_is_that_turns_error_event(
@@ -421,7 +426,7 @@ def test_stop_drops_and_counts_the_queued_sends(monkeypatch: Any, tmp_path: Path
     assert backend.messages == ["one"]
 
 
-def test_stop_suspends_the_entry_until_the_next_send_clears_it(
+def test_stop_pauses_the_running_turn_and_keeps_the_wake_consumer(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
     backends = _install_fakes(monkeypatch)
@@ -438,15 +443,16 @@ def test_stop_suspends_the_entry_until_the_next_send_clears_it(
     assert manager_loop_service.stop(tmp_path)["ok"] is True
     assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
 
-    assert entry.suspended is True
-    assert entry.wake is None
-    assert old_wake.status()["running"] is False
+    # Stop pauses the current turn only: the consumer that wakes this session stays.
+    assert entry.suspended is False
+    assert entry.wake is old_wake
+    assert old_wake.status()["running"] is True
 
     second = manager_loop_service.send(tmp_path, "two")
     assert second["ok"] is True
-    assert entry.suspended is False
     assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
     assert manager_loop_service.status(tmp_path)["wake"]["running"] is True
+    assert manager_loop_service.close(tmp_path) == {"ok": True}
 
 
 def test_stop_when_idle_is_a_no_op(monkeypatch: Any, tmp_path: Path) -> None:
@@ -1735,12 +1741,27 @@ def _seat_record(
     return session
 
 
+def _watching_wake_source(monkeypatch: Any) -> list[dict[str, Any]]:
+    """Record each ``default_callback_source`` call's keyword arguments; claim nothing."""
+
+    sources: list[dict[str, Any]] = []
+
+    def watching_source(**kwargs: Any) -> tuple[Callable[[], Any], Callable[[str, str], bool]]:
+        sources.append(kwargs)
+        return (lambda: None, lambda batch_id, lease_id: True)
+
+    monkeypatch.setattr(manager_loop_service, "default_callback_source", watching_source)
+    return sources
+
+
 def test_restore_does_not_renew_the_seat_lease_of_a_bound_session_idle_past_it(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
-    # NF-2026-01914: restore fires on every panel open and attaches for reading only; it
-    # neither renews the seat lease nor arms a wake consumer. Only an owner action does.
+    # NF-2026-01914: restore fires on every panel open and never renews the seat lease.
+    # The restored bound session still gets its wake consumer, which claims the cards
+    # stamped with it but, past the lease, rebinds nothing else onto it.
     _install_fakes(monkeypatch)
+    sources = _watching_wake_source(monkeypatch)
     entry = manager_loop_service._entry_for(tmp_path)
     stale = _seat_record(entry, "mls-" + "0a" * 16, hours_idle=13)
 
@@ -1749,8 +1770,10 @@ def test_restore_does_not_renew_the_seat_lease_of_a_bound_session_idle_past_it(
     assert restored["ok"] is True
     assert restored["session"]["session_id"] == stale.session_id
     assert restored["session"]["updated_at"] == stale.updated_at
-    assert entry.wake is None
-    assert manager_loop_service.status(tmp_path)["wake"]["running"] is False
+    assert manager_loop_service.status(tmp_path)["wake"]["running"] is True
+    (source,) = sources
+    assert source["session_id"]() == stale.session_id
+    assert source["holds_seat"]() is False
     assert manager_loop_service.close(tmp_path) == {"ok": True}
 
 
@@ -1770,7 +1793,7 @@ def test_restore_starts_no_wake_consumer_for_a_passive_conversation(
     assert manager_loop_service.close(tmp_path) == {"ok": True}
 
 
-def test_restore_does_not_arm_the_wake_consumer(
+def test_restore_and_ensure_arm_the_wake_consumer_of_a_bound_selected_session(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
     _install_fakes(monkeypatch)
@@ -1781,12 +1804,30 @@ def test_restore_does_not_arm_the_wake_consumer(
 
     assert restored["ok"] is True
     assert restored["session"]["session_id"] == fresh.session_id
-    assert entry.wake is None
-    assert manager_loop_service.status(tmp_path)["wake"]["running"] is False
+    consumer = entry.wake
+    assert consumer is not None
+    assert manager_loop_service.status(tmp_path)["wake"]["running"] is True
 
+    assert manager_loop_service.ensure(tmp_path)["ok"] is True
     attached = manager_loop_service.continue_session(tmp_path, fresh.session_id)
 
     assert attached["ok"] is True
+    assert entry.wake is consumer
+    assert manager_loop_service.status(tmp_path)["wake"]["running"] is True
+    assert manager_loop_service.close(tmp_path) == {"ok": True}
+
+
+def test_ensure_arms_the_wake_consumer_of_a_bound_selected_session(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    _install_fakes(monkeypatch)
+    entry = manager_loop_service._entry_for(tmp_path)
+    stale = _seat_record(entry, "mls-" + "0f" * 16, hours_idle=13)
+
+    ensured = manager_loop_service.ensure(tmp_path)
+
+    assert ensured["ok"] is True
+    assert ensured["session"]["session_id"] == stale.session_id
     assert entry.wake is not None
     assert manager_loop_service.status(tmp_path)["wake"]["running"] is True
     assert manager_loop_service.close(tmp_path) == {"ok": True}
@@ -1826,10 +1867,11 @@ def test_no_session_means_no_wake_consumer_even_when_asked_for_one(
     assert entry.wake is None
 
 
-def test_start_asks_the_shared_seat_predicate_before_starting_a_wake_consumer(
+def test_the_wake_claim_asks_the_shared_seat_predicate_before_rebinding_for_others(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
     _install_fakes(monkeypatch)
+    sources = _watching_wake_source(monkeypatch)
     asked: list[Any] = []
 
     def refuse(record: Any, **_kwargs: Any) -> bool:
@@ -1841,8 +1883,13 @@ def test_start_asks_the_shared_seat_predicate_before_starting_a_wake_consumer(
     started = manager_loop_service.start(tmp_path, "fake", "model-a")
 
     assert started["ok"] is True
+    # A bound session gets its consumer whatever the seat says; the seat only
+    # decides whether its claim may rebind other sessions' pending rows.
+    assert manager_loop_service._entry_for(tmp_path).wake is not None
+    (source,) = sources
+    assert source["session_id"]() == started["session"]["session_id"]
+    assert source["holds_seat"]() is False
     assert [record["session_id"] for record in asked] == [started["session"]["session_id"]]
-    assert manager_loop_service._entry_for(tmp_path).wake is None
     assert manager_loop_service.close(tmp_path) == {"ok": True}
 
 
@@ -2102,7 +2149,7 @@ def test_discarding_the_loaded_session_stops_the_running_wake_consumer(
     assert manager_loop_service.close(tmp_path) == {"ok": True}
 
 
-def test_a_running_wake_consumer_stops_as_soon_as_the_shared_seat_predicate_refuses(
+def test_a_running_wake_consumer_survives_the_seat_lease_and_stops_once_the_session_is_unbound(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
     _install_fakes(monkeypatch)
@@ -2113,6 +2160,12 @@ def test_a_running_wake_consumer_stops_as_soon_as_the_shared_seat_predicate_refu
         callback_store, "manager_chat_record_holds_seat", lambda record, **_kwargs: False
     )
 
+    manager_loop_service._ensure_wake_started(entry, tmp_path)
+
+    assert entry.wake is consumer
+    assert consumer.status()["running"] is True
+
+    monkeypatch.setattr(callback_store, "manager_chat_record_bound", lambda record: False)
     manager_loop_service._ensure_wake_started(entry, tmp_path)
 
     assert entry.wake is None
@@ -2197,24 +2250,18 @@ def test_a_session_swapped_for_a_passive_one_as_the_wake_is_armed_gets_no_consum
     assert manager_loop_service.close(tmp_path) == {"ok": True}
 
 
-def test_the_wake_consumer_claims_for_no_session_once_its_session_idles_past_the_seat_lease(
+def test_a_seated_session_idle_past_the_lease_still_claims_for_itself_but_rebinds_nothing(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
     _install_fakes(monkeypatch)
-    claim_origins: list[Callable[[], str]] = []
-
-    def watching_source(
-        *, session_id: Callable[[], str], **_kwargs: Any
-    ) -> tuple[Callable[[], Any], Callable[[str, str], bool]]:
-        claim_origins.append(session_id)
-        return (lambda: None, lambda batch_id, lease_id: True)
-
-    monkeypatch.setattr(manager_loop_service, "default_callback_source", watching_source)
+    sources = _watching_wake_source(monkeypatch)
     started = manager_loop_service.start(tmp_path, "fake", "model-a")
     assert started["ok"] is True
     session_id = started["session"]["session_id"]
-    (claim_origin,) = claim_origins
+    (source,) = sources
+    claim_origin, holds_seat = source["session_id"], source["holds_seat"]
     assert claim_origin() == session_id
+    assert holds_seat() is True
 
     # Judge the same session 13 hours on: its record and log are all older than the lease.
     seat_rule = callback_store.manager_chat_record_holds_seat
@@ -2224,9 +2271,11 @@ def test_the_wake_consumer_claims_for_no_session_once_its_session_idles_past_the
         "manager_chat_record_holds_seat",
         lambda record, **kwargs: seat_rule(record, **{**kwargs, "now": later}),
     )
-    assert claim_origin() == ""
+    # Its stamped cards still wake it; only other sessions' rows are no longer rebound.
+    assert claim_origin() == session_id
+    assert holds_seat() is False
 
-    # Activity logged since then holds the seat again, and the origin follows it back.
+    # Activity logged since then holds the seat again.
     entry = manager_loop_service._entry_for(tmp_path)
     entry.orchestrator.store.append_event(
         session_id,
@@ -2238,6 +2287,7 @@ def test_the_wake_consumer_claims_for_no_session_once_its_session_idles_past_the
         },
     )
     assert claim_origin() == session_id
+    assert holds_seat() is True
     assert manager_loop_service.close(tmp_path) == {"ok": True}
 
 
@@ -2304,3 +2354,50 @@ def test_events_carry_a_null_partial_once_the_turn_is_over(monkeypatch: Any, tmp
 
     assert "partial" in result
     assert result["partial"] is None
+
+
+def test_rotate_on_an_unbound_session_is_an_error_not_a_running_turn(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    _install_fakes(monkeypatch)
+
+    assert manager_loop_service.rotate(tmp_path, "handing off") == {
+        "ok": False,
+        "error": "no_active_manager_session",
+    }
+
+    entry = manager_loop_service._entry_for(tmp_path)
+    _seat_record(entry, "mls-" + "4a" * 16, backend_id="", model="")
+    assert manager_loop_service.ensure(tmp_path)["ok"] is True
+
+    assert manager_loop_service.rotate(tmp_path, "handing off") == {
+        "ok": False,
+        "error": "manager_session_not_bound",
+    }
+    assert entry.turn_lock.locked() is False
+    assert entry.orchestrator.session is not None
+    assert manager_loop_service.close(tmp_path) == {"ok": True}
+
+
+def test_start_and_close_turn_unexpected_exceptions_into_errors(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    _install_fakes(monkeypatch)
+    entry = manager_loop_service._entry_for(tmp_path)
+
+    def explode(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("backend build failed")
+
+    monkeypatch.setattr(entry.orchestrator, "start", explode)
+    assert manager_loop_service.start(tmp_path, "fake", "model-a") == {
+        "ok": False,
+        "error": "manager_loop_unavailable:RuntimeError",
+    }
+    assert entry.turn_lock.locked() is False
+
+    monkeypatch.setattr(entry.orchestrator, "close", explode)
+    assert manager_loop_service.close(tmp_path) == {
+        "ok": False,
+        "error": "manager_loop_unavailable:RuntimeError",
+    }
+    assert entry.turn_lock.locked() is False

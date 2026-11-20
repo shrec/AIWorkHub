@@ -407,21 +407,18 @@ def test_a_callback_while_idle_starts_a_formatted_wake_turn_and_acks_it(
     assert status["wake"]["turns_this_hour"] == 1
 
 
-def test_a_real_callback_with_an_arbitrary_origin_thread_id_is_claimed_and_woken_while_a_session_is_active(
-    monkeypatch: Any, tmp_path: Path
-) -> None:
-    """No fake claim/ack here: a real ``callback_store`` against a tmp sqlite
-    file proves ``default_callback_source`` actually sees a callback whose
-    ``origin_thread_id`` is whoever created the task -- never this manager
-    loop session's own id -- the gap a fake claim/ack pair can never expose.
+def _real_task_db(monkeypatch: Any, tmp_path: Path) -> Any:
+    """A real ``callback_store`` on a tmp sqlite file behind ``default_callback_source``.
+
+    Call after ``_install_fakes``: it puts the real claim/ack wiring back in place
+    of the no-op source. Returns the connect function the claim itself uses.
     """
-    backends = _install_fakes(monkeypatch)
+
     monkeypatch.setattr(
         manager_loop_service, "default_callback_source", manager_loop_wake.default_callback_source
     )
     monkeypatch.setattr(manager_loop_service, "WAKE_IDLE_POLL_SECONDS", 0.02)
     monkeypatch.setattr(manager_loop_service, "WAKE_RETRY_POLL_SECONDS", 0.02)
-
     db_path = tmp_path / "task_queue.sqlite"
 
     def fake_canonical_connect(*, readonly: bool = False) -> sqlite3.Connection:
@@ -430,15 +427,51 @@ def test_a_real_callback_with_an_arbitrary_origin_thread_id_is_claimed_and_woken
         return conn
 
     monkeypatch.setattr(aiworkhub_core, "_canonical_connect", fake_canonical_connect)
-
     conn = fake_canonical_connect()
     try:
         callback_store.init_db(conn)
-        conn.execute(
-            "INSERT INTO tasks (task_id, status, card_json, created_at, updated_at) "
-            "VALUES (?, 'review', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
-            ("CARD_X", json.dumps({"claim_epoch": 0})),
-        )
+    finally:
+        conn.close()
+    return fake_canonical_connect
+
+
+def _insert_review_card(conn: sqlite3.Connection, task_id: str, card: dict[str, Any]) -> None:
+    conn.execute(
+        "INSERT INTO tasks (task_id, status, card_json, created_at, updated_at) "
+        "VALUES (?, 'review', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        (task_id, json.dumps({"claim_epoch": 0, **card})),
+    )
+
+
+def _outbox_rows(connect: Any, task_id: str) -> list[tuple[str, str, str, str]]:
+    conn = connect()
+    try:
+        return [
+            (str(row["provider"]), str(row["origin_thread_id"]), str(row["state"]), str(row["last_error"] or ""))
+            for row in conn.execute(
+                "SELECT provider, origin_thread_id, state, last_error FROM callback_outbox "
+                "WHERE task_id=? ORDER BY outbox_id",
+                (task_id,),
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+
+def test_a_pending_lane_row_of_a_card_the_chat_launched_is_moved_onto_it_and_settled(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """No fake claim/ack here: a real ``callback_store`` against a tmp sqlite
+    file proves ``default_callback_source`` sees a callback whose lane
+    ``origin_thread_id`` is whoever created the task, once the card is this
+    chat's own -- and that the original lane row is settled, so exactly one
+    consumer handles it.
+    """
+    backends = _install_fakes(monkeypatch)
+    connect = _real_task_db(monkeypatch, tmp_path)
+    conn = connect()
+    try:
+        _insert_review_card(conn, "CARD_X", {})
         assert callback_store.enqueue_callback(
             conn,
             "CARD_X",
@@ -450,51 +483,58 @@ def test_a_real_callback_with_an_arbitrary_origin_thread_id_is_claimed_and_woken
     finally:
         conn.close()
 
-    assert manager_loop_service.start(tmp_path, "fake", "model-a")["ok"] is True
+    started = manager_loop_service.start(tmp_path, "fake", "model-a")
+    assert started["ok"] is True
+    session_id = started["session"]["session_id"]
     backend = backends[0]
+    # The chat launched this card; its lane row predates the stamp.
+    conn = connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id='CARD_X'",
+            (json.dumps({"claim_epoch": 0, "manager_chat_session_id": session_id}),),
+        )
+    finally:
+        conn.close()
 
-    assert backend.entered.wait(timeout=5)
+    assert backend.entered.wait(timeout=10)
     assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
     assert backend.messages == ["callback: CARD_X -> review_ready"]
 
     status = manager_loop_service.status(tmp_path)
     assert status["last_turn"]["ok"] is True
     assert status["wake"]["turns_this_hour"] == 1
-
     assert manager_loop_service.close(tmp_path)["ok"] is True
+    assert _outbox_rows(connect, "CARD_X") == [
+        (
+            "claude",
+            "some-other-route-thread-id-unrelated-to-the-manager-loop-session",
+            "superseded",
+            "mirrored_to_manager_chat",
+        ),
+        ("manager_chat", session_id, "delivered", ""),
+    ]
 
 
 def test_wake_claims_callbacks_from_every_provider_family_not_just_claude(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
     """A worker terminal under another family (e.g. codex) must still wake
-    an opencode/claude seat: the default source iterates every pending
-    family instead of assuming one provider."""
+    the chat that launched it: a stamped card and an mls- origin card are each
+    filed on the chat session whatever family coordinated them."""
     backends = _install_fakes(monkeypatch)
-    monkeypatch.setattr(
-        manager_loop_service, "default_callback_source", manager_loop_wake.default_callback_source
-    )
-    monkeypatch.setattr(manager_loop_service, "WAKE_IDLE_POLL_SECONDS", 0.02)
-    monkeypatch.setattr(manager_loop_service, "WAKE_RETRY_POLL_SECONDS", 0.02)
+    connect = _real_task_db(monkeypatch, tmp_path)
+    started = manager_loop_service.start(tmp_path, "fake", "model-a")
+    assert started["ok"] is True
+    session_id = started["session"]["session_id"]
 
-    db_path = tmp_path / "task_queue.sqlite"
-
-    def fake_canonical_connect(*, readonly: bool = False) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(db_path), isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    monkeypatch.setattr(aiworkhub_core, "_canonical_connect", fake_canonical_connect)
-
-    conn = fake_canonical_connect()
+    conn = connect()
     try:
-        callback_store.init_db(conn)
-        for card, family in (("CARD_C", "claude"), ("CARD_X", "codex")):
-            conn.execute(
-                "INSERT INTO tasks (task_id, status, card_json, created_at, updated_at) "
-                "VALUES (?, 'review', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
-                (card, json.dumps({"claim_epoch": 0})),
-            )
+        for card, family, owner in (
+            ("CARD_C", "claude", {"manager_chat_session_id": session_id}),
+            ("CARD_X", "codex", {"origin_thread_id": session_id}),
+        ):
+            _insert_review_card(conn, card, {"coordinator_provider": family, **owner})
             assert callback_store.enqueue_callback(
                 conn,
                 card,
@@ -503,11 +543,13 @@ def test_wake_claims_callbacks_from_every_provider_family_not_just_claude(
                 provider=family,
                 episode_id="0",
             )
-        assert sorted(callback_store.pending_callback_providers(conn)) == ["claude", "codex"]
+        # Filed on the chat directly: no lane manager can claim or rebind them first.
+        lane_rows = conn.execute(
+            "SELECT COUNT(*) FROM callback_outbox WHERE provider IN ('claude', 'codex')"
+        ).fetchone()[0]
+        assert lane_rows == 0
     finally:
         conn.close()
-
-    assert manager_loop_service.start(tmp_path, "fake", "model-a")["ok"] is True
 
     assert backends[0].entered.wait(timeout=10)
     deadline = time.monotonic() + 15
@@ -520,6 +562,270 @@ def test_wake_claims_callbacks_from_every_provider_family_not_just_claude(
         "callback: CARD_X -> review_ready",
     ]
     assert manager_loop_service.close(tmp_path)["ok"] is True
+
+
+def test_claim_does_not_wake_cards_the_chat_did_not_launch(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    connect = _real_task_db(monkeypatch, tmp_path)
+    session_id = "mls-" + "ab" * 16
+    conn = connect()
+    try:
+        _insert_review_card(conn, "CARD_OTHER", {"coordinator_provider": "claude"})
+        _insert_review_card(
+            conn, "CARD_MINE", {"coordinator_provider": "claude", "manager_chat_session_id": session_id}
+        )
+        for card in ("CARD_OTHER", "CARD_MINE"):
+            assert callback_store.enqueue_callback(
+                conn, card, "claude-thread", "review_ready", provider="claude", episode_id="0"
+            )
+    finally:
+        conn.close()
+
+    claim, ack = manager_loop_wake.default_callback_source(session_id=session_id)
+    batch = claim()
+
+    assert batch is not None
+    assert [member["task_id"] for member in batch["members"]] == ["CARD_MINE"]
+    assert ack(batch["batch_id"], batch["lease_id"]) is True
+    assert claim() is None
+    # The card the chat did not launch stays with its own lane manager, untouched.
+    assert _outbox_rows(connect, "CARD_OTHER") == [("claude", "claude-thread", "pending", "")]
+    assert _outbox_rows(connect, "CARD_MINE") == [("manager_chat", session_id, "delivered", "")]
+
+
+def test_manager_chat_claim_releases_a_deferred_review_wake(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    # The review's manager wake was deferred to the quality-review chain, whose
+    # grace has run out: the seed releases it, and the chat's own claim must seed
+    # it -- even for a session idle past the seat lease, whatever family coordinated it.
+    connect = _real_task_db(monkeypatch, tmp_path)
+    session_id = "mls-" + "cd" * 16
+    deferred_at = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    conn = connect()
+    try:
+        _insert_review_card(
+            conn,
+            "CARD_D",
+            {
+                "coordinator_provider": "claude",
+                "manager_chat_session_id": session_id,
+                "terminal_substatus": "review_ready",
+                "terminal_review": {
+                    "recorded_at": deferred_at,
+                    "evidence": {"manager_callback_deferred": {"reason": "quality_review_chain"}},
+                },
+            },
+        )
+    finally:
+        conn.close()
+
+    claim, ack = manager_loop_wake.default_callback_source(session_id=session_id, holds_seat=False)
+    batch = claim()
+
+    assert batch is not None
+    assert [(member["task_id"], member["state"]) for member in batch["members"]] == [
+        ("CARD_D", "review_ready")
+    ]
+    assert ack(batch["batch_id"], batch["lease_id"]) is True
+    assert claim() is None
+    assert _outbox_rows(connect, "CARD_D") == [("manager_chat", session_id, "delivered", "")]
+
+
+def test_publish_manager_ready_row_reaches_the_stamped_chat_session(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    # publish_manager_ready files its review_ready row through
+    # task_store._enqueue_terminal_callback_row, in the review transaction. It
+    # shares enqueue_callback's routing rule: the stamped chat session gets it,
+    # and an mls- origin is manager_chat, so no lane manager can take it first.
+    from aiworkhub import task_store
+
+    connect = _real_task_db(monkeypatch, tmp_path)
+    session_id = "mls-" + "ef" * 16
+    conn = connect()
+    try:
+        _insert_review_card(
+            conn, "CARD_P", {"coordinator_provider": "claude", "manager_chat_session_id": session_id}
+        )
+        _insert_review_card(conn, "CARD_M", {"coordinator_provider": "claude"})
+        for card, origin in (("CARD_P", "claude-thread"), ("CARD_M", session_id)):
+            assert task_store._enqueue_terminal_callback_row(
+                conn,
+                task_id=card,
+                provider="claude",
+                origin_thread_id=origin,
+                transition="review_ready",
+                episode_id="0",
+                request_id="req-" + card,
+                now="2026-01-01T00:00:01Z",
+            )
+        # A lane manager's rebind finds nothing of either card to take.
+        assert callback_store.rebind_pending_callbacks(
+            conn, provider="claude", origin_thread_id="claude-thread"
+        ) == 0
+    finally:
+        conn.close()
+
+    assert _outbox_rows(connect, "CARD_P") == [("manager_chat", session_id, "pending", "")]
+    assert _outbox_rows(connect, "CARD_M") == [("manager_chat", session_id, "pending", "")]
+    claim, _ack = manager_loop_wake.default_callback_source(session_id=session_id)
+    batch = claim()
+    assert batch is not None
+    assert sorted(member["task_id"] for member in batch["members"]) == ["CARD_M", "CARD_P"]
+
+
+def test_a_seated_session_idle_past_the_lease_still_wakes_its_stamped_cards(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    backends = _install_fakes(monkeypatch)
+    connect = _real_task_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        manager_loop_service, "authorize_selected_route", lambda repo, backend_id, model: (backend_id, model)
+    )
+    entry = manager_loop_service._entry_for(tmp_path)
+    stale = _seat_record(entry, "mls-" + "3c" * 16, hours_idle=13)
+    conn = connect()
+    try:
+        _insert_review_card(
+            conn, "CARD_S", {"coordinator_provider": "claude", "manager_chat_session_id": stale.session_id}
+        )
+        assert callback_store.enqueue_callback(
+            conn, "CARD_S", "claude-thread", "review_ready", provider="claude", episode_id="0"
+        )
+    finally:
+        conn.close()
+
+    # A restart: the panel restores the bound session, idle past the seat lease.
+    assert manager_loop_service.restore(tmp_path)["ok"] is True
+    try:
+        deadline = time.monotonic() + 10
+        while not backends and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert backends, "the restored session's wake consumer never started a turn"
+        assert backends[0].entered.wait(timeout=10)
+        assert manager_loop_service.wait_for_idle(tmp_path, timeout=10) is True
+        assert backends[0].messages == ["callback: CARD_S -> review_ready"]
+    finally:
+        assert manager_loop_service.close(tmp_path)["ok"] is True
+    assert _outbox_rows(connect, "CARD_S") == [("manager_chat", stale.session_id, "delivered", "")]
+
+
+def test_a_wake_arriving_during_a_running_turn_is_delivered_after_it(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    backends = _install_fakes(monkeypatch)
+    assert manager_loop_service.start(tmp_path, "fake", "model-a")["ok"] is True
+    backend = backends[0]
+    backend.gate = threading.Event()
+    outcomes: list[bool] = []
+    finished = threading.Event()
+
+    def done(delivered: bool, errors: Any = ()) -> None:
+        outcomes.append(delivered)
+        finished.set()
+
+    try:
+        assert manager_loop_service.send(tmp_path, "one")["ok"] is True
+        assert backend.entered.wait(timeout=5)
+        assert manager_loop_service.send(tmp_path, "two")["queued"] is True
+
+        # The turn is busy: the wake is queued, not refused, and is not run yet.
+        assert manager_loop_service._wake_dispatch(
+            tmp_path, {"task_id": "CARD_Q", "state": "review_ready"}, done
+        ) is True
+        assert not finished.is_set()
+
+        backend.gate.set()
+        assert finished.wait(timeout=5)
+        assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+        # After the running turn and the queued owner send, never dropped.
+        assert backend.messages == ["one", "two", "callback: CARD_Q -> review_ready"]
+        assert outcomes == [True]
+    finally:
+        backend.gate.set()
+        assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+        assert manager_loop_service.close(tmp_path)["ok"] is True
+
+
+def test_a_seated_chat_gets_no_copy_of_a_card_it_did_not_launch(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    # Even while a chat session holds the seat, a card no chat launched stays
+    # with its lane manager alone: exactly one consumer handles the callback.
+    connect = _real_task_db(monkeypatch, tmp_path)
+    session_id = "mls-" + "9a" * 16
+    monkeypatch.setattr(callback_store, "_active_manager_chat_session_from_conn", lambda conn: session_id)
+    conn = connect()
+    try:
+        _insert_review_card(conn, "CARD_LANE", {"coordinator_provider": "claude"})
+        assert callback_store.enqueue_callback(
+            conn, "CARD_LANE", "claude-thread", "review_ready", provider="claude", episode_id="0"
+        )
+    finally:
+        conn.close()
+
+    assert _outbox_rows(connect, "CARD_LANE") == [("claude", "claude-thread", "pending", "")]
+
+
+def test_the_launching_session_wins_over_a_different_mls_origin(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    # A rework another chat session launched: the card's origin is the session
+    # that created it, its stamp the one that launched it. The row is filed on
+    # the launcher, where the seed and the claim look for it.
+    connect = _real_task_db(monkeypatch, tmp_path)
+    creator, launcher = "mls-" + "1a" * 16, "mls-" + "2b" * 16
+    conn = connect()
+    try:
+        _insert_review_card(
+            conn,
+            "CARD_RW",
+            {"coordinator_provider": "claude", "origin_thread_id": creator, "manager_chat_session_id": launcher},
+        )
+        assert callback_store.enqueue_callback(
+            conn, "CARD_RW", creator, "review_ready", provider="claude", episode_id="0"
+        )
+    finally:
+        conn.close()
+
+    assert _outbox_rows(connect, "CARD_RW") == [("manager_chat", launcher, "pending", "")]
+
+
+def test_a_wake_queued_behind_an_unrecorded_turn_records_its_own_last_turn(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    # rotate dispatches with record_last_turn=False; the wake queued behind it is
+    # an ordinary wake turn and reports its outcome in status like any other.
+    _install_fakes(monkeypatch)
+    assert manager_loop_service.start(tmp_path, "fake", "model-a")["ok"] is True
+    entry = manager_loop_service._entry_for(tmp_path)
+    entry.last_turn = None
+    gate = threading.Event()
+    finished = threading.Event()
+
+    def unrecorded(orchestrator: Any) -> dict[str, Any]:
+        gate.wait(timeout=5)
+        return {"ok": True, "reply": "handoff", "errors": []}
+
+    def done(delivered: bool, errors: Any = ()) -> None:
+        finished.set()
+
+    try:
+        assert manager_loop_service._dispatch_turn(tmp_path, unrecorded, record_last_turn=False)["ok"] is True
+        assert manager_loop_service._wake_dispatch(
+            tmp_path, {"task_id": "CARD_R", "state": "review_ready"}, done
+        ) is True
+        gate.set()
+        assert finished.wait(timeout=5)
+        assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+        assert entry.last_turn is not None and entry.last_turn["ok"] is True
+        assert entry.last_turn["reply"] != "handoff"
+    finally:
+        gate.set()
+        assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+        assert manager_loop_service.close(tmp_path)["ok"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -810,9 +1116,11 @@ def test_a_provider_failure_whose_text_arrived_as_a_reply_leaves_its_batch_unack
     assert ack_calls == []
 
 
-def test_a_turn_whose_only_errors_arose_after_delivery_acks_its_batch(
+def test_an_ok_false_turn_does_not_ack_its_callback(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
+    # Even when the model replied, an ok=false turn (an event-cap or Context Graph
+    # write error, an empty provider turn) leaves its row for retry on the backoff.
     ack_calls = _run_one_wake_turn(
         monkeypatch,
         tmp_path,
@@ -826,12 +1134,15 @@ def test_a_turn_whose_only_errors_arose_after_delivery_acks_its_batch(
         },
     )
     try:
-        assert ack_calls == [("b1", "l1")]
+        assert ack_calls == []
         status = manager_loop_service.status(tmp_path)
-        assert status["wake"]["turns_this_hour"] == 1
-        assert status["wake"]["failed_turns"] == 0
+        assert status["wake"]["turns_this_hour"] == 0
+        assert status["wake"]["failed_turns"] == 1
+        assert status["wake"]["queued"] == 1
+        assert status["wake"]["parked_reason"] == manager_loop_wake.PARKED_BACKOFF
     finally:
         assert manager_loop_service.close(tmp_path)["ok"] is True
+    assert ack_calls == []
 
 
 class _RouteAuthority:
@@ -866,16 +1177,15 @@ def _claim_one_callback(monkeypatch: Any, authority: _RouteAuthority) -> tuple[l
 def test_a_wake_rebinds_a_restored_session_onto_its_own_authorized_route(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
-    # A session loaded from disk (a server restart, a panel reload) holds the seat
-    # but has no backend yet. Restoring it arms nothing (NF-2026-01475); once the
-    # owner continues it, its callback must still reach the model.
+    # A session loaded from disk (a server restart, a panel reload) is bound but has
+    # no backend yet. Restoring it arms its wake consumer, and its callback must
+    # still reach the model on the session's own authorized route.
     authority = _RouteAuthority(allowed=True)
     backends, ack_calls = _claim_one_callback(monkeypatch, authority)
     entry = manager_loop_service._entry_for(tmp_path)
     restored = _seat_record(entry, "mls-" + "0d" * 16)
 
     assert manager_loop_service.restore(tmp_path)["ok"] is True
-    assert manager_loop_service.continue_session(tmp_path, restored.session_id)["ok"] is True
     try:
         assert authority.called.wait(timeout=5)
         assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
@@ -897,10 +1207,9 @@ def test_a_wake_never_rebinds_a_restored_session_onto_a_route_policy_no_longer_a
     authority = _RouteAuthority(allowed=False)
     backends, ack_calls = _claim_one_callback(monkeypatch, authority)
     entry = manager_loop_service._entry_for(tmp_path)
-    seated = _seat_record(entry, "mls-" + "0e" * 16)
+    _seat_record(entry, "mls-" + "0e" * 16)
 
     assert manager_loop_service.restore(tmp_path)["ok"] is True
-    assert manager_loop_service.continue_session(tmp_path, seated.session_id)["ok"] is True
     try:
         assert authority.called.wait(timeout=5)
         assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True

@@ -4,7 +4,9 @@
 at once. A ``send`` that arrives while a turn runs waits in the repository's
 bounded owner send queue (:data:`SEND_QUEUE_LIMIT`, in memory only: a process
 restart drops it) and runs on the same turn thread before the lock is freed, so
-a callback wake cannot start between two owner messages. Every other concurrent
+a callback wake cannot start between two owner messages. A callback wake that
+arrives while a background turn runs is queued too and delivered after that turn
+and every queued owner send, never dropped. Every other concurrent
 call is refused with ``manager_turn_in_progress``. ``status`` and ``events`` let
 a caller poll a running session incrementally. Every :class:`~aiworkhub.manager_loop.ManagerLoopError`
 becomes ``{"ok": False, "error": <reason code>}`` here -- nothing raises
@@ -73,6 +75,14 @@ class _QueuedSend:
     images: tuple[str, ...] = ()
 
 
+@dataclasses.dataclass(frozen=True)
+class _QueuedWake:
+    """One callback member waiting for the running turn, and the consumer's ``done`` for it."""
+
+    member: Mapping[str, Any]
+    done: Callable[[bool, Sequence[Any]], None]
+
+
 @dataclasses.dataclass
 class _Entry:
     """One repository's orchestrator plus the service's own turn-in-flight lock.
@@ -84,15 +94,17 @@ class _Entry:
     inside a thread it can no longer observe.
 
     ``send_queue`` holds owner messages that arrived while a background turn
-    ran (``turn_running``); ``queue_lock`` orders enqueueing against the turn
-    thread's pop-or-release, so a message is either queued while the lock is
-    still held or finds the lock free.
+    ran (``turn_running``); ``wake_queue`` holds the callback wakes that did,
+    delivered after the running turn and every queued owner send. ``queue_lock``
+    orders enqueueing against the turn thread's pop-or-release, so a message
+    or wake is either queued while the lock is still held or finds the lock free.
     """
 
     orchestrator: ManagerOrchestrator
     turn_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
     queue_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
     send_queue: collections.deque["_QueuedSend"] = dataclasses.field(default_factory=collections.deque)
+    wake_queue: collections.deque["_QueuedWake"] = dataclasses.field(default_factory=collections.deque)
     turn_running: bool = False
     running_turn: tuple[str, int] | None = None
     thread: threading.Thread | None = None
@@ -277,22 +289,14 @@ def _pin_first_route(
 
 
 def _turn_delivered(raw: Mapping[str, Any]) -> bool:
-    """Whether the model received the turn's message.
+    """Whether the turn counts as delivered, so its callback may be acked.
 
-    A turn is delivered when it is ok, or when every error it carries arose
-    after the model was reached (the Context Graph turn write, the event cap).
+    Only an ``ok`` turn does. An ``ok=False`` turn -- an empty provider reply,
+    a failed Context Graph write, the event cap -- never acks its callback:
+    the row stays un-acked and the consumer retries it on the existing backoff.
     """
-    if raw.get("ok"):
-        return True
-    errors = raw.get("errors") or ()
-    return bool(errors) and all(
-        isinstance(error, Mapping)
-        and (
-            error.get("source") == "context_graph_event_write"
-            or (error.get("source"), error.get("error")) == ("loop", "turn_event_limit")
-        )
-        for error in errors
-    )
+
+    return bool(raw.get("ok"))
 
 
 def _bind_turn_session(
@@ -349,6 +353,30 @@ def _enqueue_send(entry: _Entry, queued: _QueuedSend | None) -> dict[str, Any]:
         "ok": True,
         "queued": True,
         "position": len(entry.send_queue),
+        "session_id": session.session_id if session is not None else "",
+    }
+
+
+def _enqueue_wake(entry: _Entry, queued: _QueuedWake) -> dict[str, Any]:
+    """Queue a callback wake behind the running turn; the caller holds ``queue_lock``.
+
+    The turn thread delivers it after the running turn and every queued owner
+    send, under the same lock, and reports its outcome through ``queued.done``,
+    so a wake that arrives mid-turn is never dropped. Like a send, it queues only
+    behind a background turn that has bound its session; otherwise it is refused
+    and stays queued in the consumer, which retries it.
+    """
+
+    if not entry.turn_running or entry.running_turn is None:
+        return {"ok": False, "error": "manager_turn_in_progress"}
+    if len(entry.wake_queue) >= SEND_QUEUE_LIMIT:
+        return {"ok": False, "error": "manager_wake_queue_full"}
+    entry.wake_queue.append(queued)
+    session = entry.orchestrator.session
+    return {
+        "ok": True,
+        "queued": True,
+        "position": len(entry.wake_queue),
         "session_id": session.session_id if session is not None else "",
     }
 
@@ -419,6 +447,7 @@ def _dispatch_turn(
     route: tuple[str, str] | None = None,
     on_finished: Callable[[bool, Sequence[Any]], None] | None = None,
     queued: _QueuedSend | None = None,
+    queued_wake: _QueuedWake | None = None,
     clear_suspended: bool = False,
 ) -> dict[str, Any]:
     entry, err = _entry_or_error(repo)
@@ -428,6 +457,8 @@ def _dispatch_turn(
         _clear_suspension(entry)
     with entry.queue_lock:
         if not entry.turn_lock.acquire(blocking=False):
+            if queued_wake is not None:
+                return _enqueue_wake(entry, queued_wake)
             return _enqueue_send(entry, queued)
         # stop() must see this turn while it binds; it has no turn number until then.
         entry.turn_running = True
@@ -445,25 +476,34 @@ def _dispatch_turn(
 
     def run() -> None:
         step, finished, queued_text = action, on_finished, None
+        # Only the dispatched action may skip the last-turn record (rotate); a
+        # queued send or wake after it is an ordinary turn and records its own.
+        recording = record_last_turn
         holding = True
         try:
             while True:
                 delivered, errors = _run_turn(
-                    entry, step, record_last_turn=record_last_turn, queued_text=queued_text
+                    entry, step, record_last_turn=recording, queued_text=queued_text
                 )
+                recording = True
                 # A queued owner message runs next on this thread under the same
-                # lock, so no wake member slips in between; only an empty queue
-                # frees the lock.
+                # lock, then a queued callback wake; only empty queues free the
+                # lock, so a wake that arrived mid-turn is delivered, never dropped.
                 with entry.queue_lock:
                     # A stop armed for this turn dies with it, never reaching the next one.
                     entry.orchestrator.disarm_stop()
                     following = entry.send_queue.popleft() if entry.send_queue else None
-                    if following is None:
+                    wake_next = (
+                        entry.wake_queue.popleft()
+                        if following is None and entry.wake_queue
+                        else None
+                    )
+                    if following is None and wake_next is None:
                         entry.turn_running = False
                         entry.turn_lock.release()
                         holding = False
-                # Report the started turn's outcome exactly once; with an empty
-                # queue the lock is already free (a wake consumer may start its
+                # Report the started turn's outcome exactly once; with empty
+                # queues the lock is already free (a wake consumer may start its
                 # next member from the callback). A failing callback must never
                 # skip the re-arm below.
                 if finished is not None:
@@ -471,8 +511,12 @@ def _dispatch_turn(
                         finished(delivered, errors)
                     except Exception:  # noqa: BLE001 - the outcome callback must never kill the turn thread
                         pass
-                if following is None:
+                if following is None and wake_next is None:
                     return
+                if following is None:
+                    step = _wake_turn_action(repo, wake_next.member)
+                    finished, queued_text = wake_next.done, None
+                    continue
                 step = _queued_send_action(entry, repo, following)
                 finished, queued_text = None, following.text
                 # This send's resume ran when it queued, before the turn above
@@ -481,18 +525,27 @@ def _dispatch_turn(
                 if wake is not None:
                     wake.resume()
         finally:
+            abandoned: list[_QueuedWake] = []
             if holding:
                 with entry.queue_lock:
+                    abandoned = list(entry.wake_queue)
+                    entry.wake_queue.clear()
                     entry.turn_running = False
                     entry.turn_lock.release()
-            # Re-read the seat now the turn is over. A session that idled past the
-            # seat lease got no wake consumer when it was loaded, and whichever send
-            # revived it just logged its activity: that arms the consumer, leaves a
-            # running one alone while the session still holds the seat, and stops it
-            # when the turn ended the session (rotate). A close() that lands between
-            # the release above and this call has already dropped the orchestrator's
-            # session, so the re-arm reads none and starts nothing: a closed entry
-            # does not get a consumer back from the turn that ended just before it.
+            # Only an escaped error reaches here still holding the lock: every
+            # wake still queued is reported undelivered, so its consumer requeues
+            # it on the backoff instead of waiting forever for a done().
+            for queued_member in abandoned:
+                try:
+                    queued_member.done(False, ["manager_wake_queue_abandoned"])
+                except Exception:  # noqa: BLE001 - the outcome callback must never kill the turn thread
+                    pass
+            # Re-read the session now the turn is over. A selected, bound session
+            # keeps (or gets) its consumer; the consumer stops when the turn ended
+            # the session (rotate). A close() that lands between the release above
+            # and this call has already dropped the orchestrator's session, so the
+            # re-arm reads none and starts nothing: a closed entry does not get a
+            # consumer back from the turn that ended just before it.
             _ensure_wake_started(entry, repo)
 
     thread = threading.Thread(target=run, daemon=True)
@@ -525,6 +578,8 @@ def start(
         session = entry.orchestrator.start(backend_id, model)
     except ManagerLoopError as exc:
         return _error(exc)
+    except Exception as exc:  # noqa: BLE001 - start must never cross the MCP boundary
+        return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
     finally:
         entry.turn_lock.release()
     entry.wake_cap_per_hour = cap
@@ -533,7 +588,11 @@ def start(
 
 
 def ensure(repo: str | Path) -> dict[str, Any]:
-    """Attach to the repository's one passive conversation; synchronous, provider-free."""
+    """Attach to the repository's one passive conversation; synchronous, provider-free.
+
+    A selected session that is bound to a route gets its callback wake consumer
+    here, so a callback reaches it without waiting for an owner action.
+    """
 
     entry, err = _entry_or_error(repo)
     if err is not None:
@@ -544,13 +603,16 @@ def ensure(repo: str | Path) -> dict[str, Any]:
         return _error(exc)
     except Exception as exc:  # noqa: BLE001 - ensure must never cross the MCP boundary
         return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
+    _ensure_wake_started(entry, repo)
     return {"ok": True, "session": session.to_json(), "running": entry.turn_lock.locked()}
 
 
 def restore(repo: str | Path) -> dict[str, Any]:
     """Attach the last saved conversation for reading. Does not create one.
 
-    Arms no callback wake: only an owner action (continue_session, send, ...) does.
+    It renews no seat lease. A restored session that is bound to a route gets
+    its callback wake consumer (the cards it launched still wake it after a
+    restart); a passive one gets none.
     """
 
     entry, err = _entry_or_error(repo)
@@ -562,6 +624,7 @@ def restore(repo: str | Path) -> dict[str, Any]:
         return _error(exc)
     except Exception as exc:  # noqa: BLE001 - restore must never cross the MCP boundary
         return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
+    _ensure_wake_started(entry, repo)
     return {
         "ok": True,
         "session": session.to_json() if session is not None else None,
@@ -739,8 +802,18 @@ def rotate(repo: str | Path, reason: str) -> dict[str, Any]:
     """End the session with a handoff, on a background thread.
 
     Refused with ``manager_turn_in_progress``, not queued, while a turn runs.
+    A handoff needs the session's live backend: with no session it is refused
+    as ``no_active_manager_session``, and a session with no backend bound (a
+    passive or just-restored one) as ``manager_session_not_bound``.
     """
 
+    entry, err = _entry_or_error(repo)
+    if err is not None:
+        return err
+    if entry.orchestrator.session is None:
+        return {"ok": False, "error": "no_active_manager_session"}
+    if not entry.orchestrator.bound:
+        return {"ok": False, "error": "manager_session_not_bound"}
     return _dispatch_turn(
         repo, lambda orchestrator: orchestrator.rotate(reason), record_last_turn=False
     )
@@ -927,6 +1000,8 @@ def close(repo: str | Path) -> dict[str, Any]:
         entry.orchestrator.close()
     except ManagerLoopError as exc:
         return _error(exc)
+    except Exception as exc:  # noqa: BLE001 - close must never cross the MCP boundary
+        return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
     finally:
         entry.turn_lock.release()
     _stop_wake(entry)
@@ -936,15 +1011,16 @@ def close(repo: str | Path) -> dict[str, Any]:
 def stop(repo: str | Path) -> dict[str, Any]:
     """End a running turn's backend now, without waiting for it; a no-op while idle.
 
-    The queued owner sends waiting behind the running turn are dropped and
-    counted (``dropped_queued``) and logged as one ``queue_dropped`` event on the
-    turn that was running; the wake consumer is retired and the entry stays
-    suspended until ``start``, ``send`` or ``continue_session`` clears it, so a
-    callback cannot restart the turn that was just stopped. ``stopped`` is true
-    when the turn held the orchestrator's slot and its backend was ended. A stop
-    that lands before the turn has taken the slot is armed instead (``armed``,
-    ``stopped`` false): that turn ends as ``turn_stopped`` when its exchange
-    begins, which is the outcome to read from the event log.
+    Stop pauses the current turn only. The queued owner sends waiting behind it
+    are dropped and counted (``dropped_queued``) and logged as one
+    ``queue_dropped`` event on the turn that was running. The wake consumer stays:
+    a queued callback wake is still delivered after the stopped turn, and a
+    stopped wake turn fails undelivered, so its callback stays un-acked and is
+    retried on the consumer's backoff. ``stopped`` is true when the turn held
+    the orchestrator's slot and its backend was ended. A stop that lands before
+    the turn has taken the slot is armed instead (``armed``, ``stopped`` false):
+    that turn ends as ``turn_stopped`` when its exchange begins, which is the
+    outcome to read from the event log.
     """
 
     entry, err = _entry_or_error(repo)
@@ -957,8 +1033,6 @@ def stop(repo: str | Path) -> dict[str, Any]:
         entry.send_queue.clear()
         entry.orchestrator.arm_stop()
         running = entry.running_turn
-    entry.suspended = True
-    _stop_wake(entry)
     try:
         if running is not None:
             try:
@@ -1012,19 +1086,34 @@ def _wake_on_own_route(
     return orchestrator.wake(member)
 
 
+def _wake_turn_action(
+    repo: str | Path, member: Mapping[str, Any]
+) -> Callable[[ManagerOrchestrator], dict[str, Any]]:
+    """One callback member's turn, bound to its own member (see :func:`_wake_on_own_route`)."""
+
+    def action(orchestrator: ManagerOrchestrator) -> dict[str, Any]:
+        return _wake_on_own_route(repo, orchestrator, member)
+
+    return action
+
+
 def _wake_dispatch(
     repo: str | Path, member: Mapping[str, Any], done: Callable[[bool, Sequence[Any]], None]
 ) -> bool:
     """Start one callback's turn through the SAME non-blocking lock ``send`` uses.
 
-    Returns whether the turn STARTED; ``done(delivered, errors)`` follows once it finishes.
+    Returns whether the turn STARTED or was queued behind the running background
+    turn (delivered after it and every queued owner send); ``done(delivered,
+    errors)`` follows once that turn finishes. False means neither happened
+    and no ``done`` follows: the consumer keeps the member and retries it.
     """
 
     result = _dispatch_turn(
         repo,
-        lambda orchestrator: _wake_on_own_route(repo, orchestrator, member),
+        _wake_turn_action(repo, member),
         record_last_turn=True,
         on_finished=done,
+        queued_wake=_QueuedWake(member=member, done=done),
     )
     return bool(result.get("ok"))
 
@@ -1042,47 +1131,56 @@ def _session_holds_seat(entry: _Entry, session: ManagerSession | None) -> bool:
     )
 
 
-def _ensure_wake_started(entry: _Entry, repo: str | Path) -> None:
-    """Run this repository's one wake consumer exactly while its session holds the seat.
+def _session_is_bound(session: ManagerSession | None) -> bool:
+    """Whether ``session`` is active and pinned to a route (``callback_store.manager_chat_record_bound``)."""
 
-    A second call is a no-op. Only a session that holds the manager seat gets a
-    consumer: a passive conversation has no route to wake, and one nobody has
-    used within the seat lease is a leftover, not the manager
-    (``callback_store.manager_chat_record_holds_seat``, the rule the callback
-    origin and the bootstrap seat share). The same rule stops a consumer that is
-    already running once the attached session is gone, passive or idle past the
-    lease: left alone, its claim would keep copying pending callbacks onto a
-    conversation that is not the manager.
+    return session is not None and callback_store.manager_chat_record_bound(session.to_json())
+
+
+def _ensure_wake_started(entry: _Entry, repo: str | Path) -> None:
+    """Run this repository's one wake consumer exactly while its selected session is bound.
+
+    A second call is a no-op. The selected session gets a consumer when it is
+    active and pinned to a route (``callback_store.manager_chat_record_bound``);
+    a passive conversation has no route to wake, and a closed entry has no
+    session. The same rule stops a consumer that is already running once the
+    attached session is gone or passive.
+
+    A bound session idle past the seat lease keeps its consumer, but the
+    consumer then claims only the callbacks of the cards stamped with that
+    session (``default_callback_source``'s ``holds_seat``): only the seat
+    holder rebinds other pending Manager Chat rows onto itself.
 
     The session is read and judged inside ``wake_lock``, the lock that installs
     and retires the consumer. A swap that lands before the read is seen by it;
     one that lands after is followed by its own call, which waits for the lock
     and reads the new session. Either way the last call decides, so a consumer
-    never outlives the session that failed the rule. A closed entry has no session
-    (``ManagerOrchestrator.close`` drops it) and so fails the rule like any other: a
-    re-arm that lands after ``close`` starts nothing.
+    never outlives the session that failed the rule. A re-arm that lands after
+    ``close`` reads no session and starts nothing.
 
-    The claim origin is read at claim time, so a session switch rebinds
-    pending callbacks onto whichever conversation is active, and it is empty
-    (nothing is claimed) once the attached session no longer holds the seat.
-
-    A no-op while ``entry.suspended``: a stopped turn stays that way until
-    ``start``, ``send`` or ``continue_session`` clears the suspension.
+    The claim origin is read at claim time, so a session switch claims for
+    whichever conversation is selected, and it is empty (nothing is claimed)
+    once the attached session is no longer bound.
     """
 
     if entry.suspended:
         return
     with entry.wake_lock:
-        if not _session_holds_seat(entry, entry.orchestrator.session):
+        if not _session_is_bound(entry.orchestrator.session):
             retired = _detach_wake(entry)
         else:
             retired = None
             if entry.wake is None:
                 def active_session_id() -> str:
                     session = entry.orchestrator.session
-                    return session.session_id if _session_holds_seat(entry, session) else ""
+                    return session.session_id if _session_is_bound(session) else ""
 
-                claim, ack = default_callback_source(session_id=active_session_id)
+                def holds_seat() -> bool:
+                    return _session_holds_seat(entry, entry.orchestrator.session)
+
+                claim, ack = default_callback_source(
+                    session_id=active_session_id, holds_seat=holds_seat
+                )
                 entry.wake = manager_loop_wake.WakeConsumer(
                     claim=claim,
                     ack=ack,
