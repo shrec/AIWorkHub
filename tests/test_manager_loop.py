@@ -732,19 +732,72 @@ def _rotated_without_successor(harness: Harness) -> ml.ManagerSession:
     return closed
 
 
-@pytest.mark.parametrize("activate", ["ensure", "restore_latest"])
-def test_a_rotated_selection_is_never_reopened_by_ensure_or_restore(make, activate: str) -> None:
+def _session_files(root: Path) -> dict[str, bytes]:
+    return {path.name: path.read_bytes() for path in (root / "manager_loop" / "sessions").iterdir()}
+
+
+def test_a_rotated_selection_is_never_reopened_by_ensure(make) -> None:
     closed = _rotated_without_successor(make())
     again = make(prefix="b")
 
-    successor = getattr(again.orch, activate)()
+    successor = again.orch.ensure()
 
-    assert successor is not None and successor.session_id != closed.session_id
+    assert successor.session_id != closed.session_id
     assert successor.status == "active" and successor.previous_session_id == closed.session_id
     stored = {item.session_id: item for item in again.store.sessions()}
     assert (stored[closed.session_id].status, stored[closed.session_id].closed_at) == ("closed", closed.closed_at)
     assert again.store.read_selection() in (None, successor.session_id)
     assert again.orch.ensure().session_id == successor.session_id
+
+
+def test_restore_of_a_rotated_selection_creates_and_selects_nothing(make, tmp_path: Path) -> None:
+    # NF-2026-02318: restore created a passive successor and pointed selected.json at it.
+    closed = _rotated_without_successor(make())
+    again = make(prefix="b")
+    before = _session_files(tmp_path)
+
+    assert again.orch.restore_latest() is None
+
+    assert _session_files(tmp_path) == before
+    assert again.store.read_selection() == closed.session_id
+    assert again.backends == []
+    successor = again.orch.ensure()
+    assert successor.session_id != closed.session_id
+    assert successor.previous_session_id == closed.session_id
+
+
+def test_restore_of_a_rotated_selection_attaches_its_successor_read_only(make, tmp_path: Path) -> None:
+    harness = make()
+    first = harness.orch.start("fake", "model-a")
+    harness.orch.rotate("operator_request")
+    successor = harness.orch.start("fake", "model-a")
+    harness.orch.close()
+    harness.store.write_selection(first.session_id)
+    before = _session_files(tmp_path)
+    again = make(prefix="b")
+
+    restored = again.orch.restore_latest()
+
+    assert restored is not None and restored.session_id == successor.session_id
+    assert successor.previous_session_id == first.session_id
+    assert _session_files(tmp_path) == before
+    assert again.store.read_selection() == first.session_id
+    assert again.backends == []
+
+
+def test_rotate_moves_the_selection_to_its_successor_or_clears_it(make) -> None:
+    harness = make(brief_bytes=1024, context_window_bytes=2200, rotate_fraction=0.5)
+    first = harness.orch.start("fake", "model-a")
+    harness.store.write_selection(first.session_id)
+
+    successor = harness.orch.send("x" * 1000)["rotation"]["successor"]
+
+    assert successor is not None and harness.store.read_selection() == successor.session_id
+
+    harness.orch.rotate("operator_request")
+
+    assert harness.store.read_selection() is None
+    assert harness.orch.ensure().session_id != successor.session_id
 
 
 def test_an_explicit_continue_still_reopens_a_rotated_session(make) -> None:
@@ -756,6 +809,155 @@ def test_an_explicit_continue_still_reopens_a_rotated_session(make) -> None:
     assert (reopened.session_id, reopened.status, reopened.closed_at) == (closed.session_id, "active", None)
     assert again.store.read_selection() == closed.session_id
     assert again.orch.ensure().session_id == closed.session_id
+
+
+def test_a_routeless_send_on_a_restored_pinned_session_rebinds_its_own_route(make) -> None:
+    # NF-2026-02318: this raised no_active_manager_session and the owner's text was lost.
+    first = make()
+    pinned = first.orch.start("fake", "model-a")
+    first.orch.send("hello")
+    first.orch.close()
+    again = make(prefix="b")
+    assert again.orch.restore_latest().session_id == pinned.session_id
+    assert not again.orch.bound
+
+    result = again.orch.send("after restore")
+
+    assert (result["ok"], result["session_id"], result["turn"]) == (True, pinned.session_id, 2)
+    assert result["reply"] == "ack: after restore"
+    assert [(backend.backend_id, backend.model) for backend in again.backends] == [("fake", "model-a")]
+    assert again.backends[0].messages == ["after restore"]
+
+
+def test_a_send_that_cannot_rebind_still_logs_the_owner_text(make) -> None:
+    first = make()
+    pinned = first.orch.start("fake", "model-a")
+    first.orch.close()
+    again = make(prefix="b")
+    again.orch.restore_latest()
+
+    def unreachable(backend_id: str, model: str) -> FakeBackend:
+        raise RuntimeError("provider offline")
+
+    again.orch._backend_factory = unreachable
+
+    with pytest.raises(RuntimeError, match="provider offline"):
+        again.orch.send("are you there")
+
+    logged = again.store.events(pinned.session_id)
+    assert [(event["type"], event["turn"]) for event in logged[-2:]] == [("user_message", 1), ("error", 1)]
+    assert logged[-2]["payload"] == {"text": "are you there"}
+    assert logged[-1]["payload"] == {"source": "route_bind", "error": "RuntimeError: provider offline"}
+    (saved,) = again.store.sessions()
+    assert saved.turn_count == 1
+
+
+def test_a_route_switch_restarts_the_byte_estimate_from_the_new_brief(make) -> None:
+    # NF-2026-02318: the old route's estimate carried over and rotated the new route early.
+    harness = make()
+    harness.orch.continue_on_route("fake", "model-a")
+    harness.orch.send("x" * 5000)
+    grown = harness.orch.session.context_estimate_bytes
+
+    switched = harness.orch.continue_on_route("other", "model-b")
+
+    assert switched.context_estimate_bytes == len(harness.backends[-1].briefs[0].encode("utf-8"))
+    assert switched.context_estimate_bytes < grown
+
+
+_ZERO_USAGE = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "context_window": 200000, "context_fill": 0.1}
+
+
+@pytest.mark.parametrize("step", [
+    [],
+    [{"type": "turn_end", "payload": {}}],
+    [{"type": "assistant_text", "payload": {"text": "  "}}, {"type": "turn_end", "payload": {"usage": _ZERO_USAGE}}],
+])
+def test_an_empty_provider_turn_is_an_error_not_a_clean_turn(make, step: list[Any]) -> None:
+    # NF-2026-02318: field session mls-87078ebc turn 2 ended clean with all-zero usage.
+    harness = make()
+    session = harness.orch.start("fake", "model-a")
+    harness.backends[0].script.append(step)
+
+    result = harness.orch.send("hello")
+
+    empty = {"source": "loop", "error": ml.EMPTY_TURN_ERROR}
+    assert (result["ok"], result["errors"]) == (False, [empty])
+    last = harness.store.events(session.session_id)[-1]
+    assert (last["type"], last["turn"], last["payload"]) == ("error", 1, empty)
+    assert harness.graph_events[-1]["metadata"]["errors"] == 1
+
+
+@pytest.mark.parametrize("step", [
+    [{"type": "tool_call", "payload": {"name": "probe"}}, {"type": "turn_end", "payload": {}}],
+    [{"type": "turn_end", "payload": {"usage": {"input": 12, "output": 0}}}],
+])
+def test_a_turn_with_tool_events_or_usage_but_no_text_stays_clean(make, step: list[Any]) -> None:
+    harness = make()
+    harness.orch.start("fake", "model-a")
+    harness.backends[0].script.append(step)
+
+    result = harness.orch.send("hello")
+
+    assert (result["ok"], result["errors"]) == (True, [])
+
+
+def test_a_raise_logging_the_empty_turn_error_still_uses_the_turn_number(make) -> None:
+    # The empty-turn error is logged inside the guard that persists the turn number.
+    harness = make()
+    harness.orch.start("fake", "model-a")
+    harness.backends[0].script.append([])
+    append = harness.store.append_event
+
+    def failing(session_id: str, event: dict[str, Any]) -> dict[str, Any]:
+        if (event.get("payload") or {}).get("error") == ml.EMPTY_TURN_ERROR:
+            raise OSError("disk full")
+        return append(session_id, event)
+
+    harness.store.append_event = failing
+
+    with pytest.raises(OSError, match="disk full"):
+        harness.orch.send("hello")
+
+    assert harness.store.sessions()[0].turn_count == 1
+
+
+def test_an_event_capped_turn_closes_its_backend_and_the_session_stays_usable(make, monkeypatch) -> None:
+    monkeypatch.setattr(ml, "MAX_TURN_EVENTS", 2)
+    harness = make()
+    harness.orch.start("fake", "model-a")
+    harness.backends[0].script.append(
+        [{"type": "assistant_text", "payload": {"text": str(index)}} for index in range(5)]
+    )
+
+    capped = harness.orch.send("hello")
+
+    assert {"source": "loop", "error": "turn_event_limit"} in capped["errors"]
+    assert harness.backends[0].closed is True
+    assert harness.orch.send("again")["turn"] == 2
+
+
+def test_a_failing_event_log_closes_the_backend_and_still_uses_the_turn_number(make) -> None:
+    harness = make()
+    harness.orch.start("fake", "model-a")
+    append = harness.store.append_event
+    failing = {"on": True}
+
+    def flaky(session_id: str, event: dict[str, Any]) -> dict[str, Any]:
+        if failing["on"] and event.get("type") != "user_message":
+            raise OSError("disk full")
+        return append(session_id, event)
+
+    harness.store.append_event = flaky
+
+    with pytest.raises(OSError, match="disk full"):
+        harness.orch.send("hello")
+
+    assert harness.backends[0].closed is True
+    assert harness.orch.session.turn_count == 1
+    assert harness.store.sessions()[0].turn_count == 1
+    failing["on"] = False
+    assert harness.orch.send("again")["turn"] == 2
 
 
 def test_the_brief_rules_end_turns_instead_of_polling() -> None:
@@ -1059,11 +1261,16 @@ def test_a_foreign_or_malformed_session_record_fails_closed(tmp_path: Path) -> N
         ml.ManagerSession.from_json({"session_id": "x"})
 
 
-def test_production_defaults_call_the_existing_functions(tmp_path: Path, monkeypatch) -> None:
-    from aiworkhub import agent_tool_instructions, manager_ai_tools, repository_state, task_store
+def _production_stubs(
+    monkeypatch, authority: Path
+) -> tuple[list[tuple[str, dict[str, Any]]], list[Path]]:
+    """Stub every production source and writer; the manager tools resolve ``authority``."""
+    from types import SimpleNamespace
 
-    state = repository_state.bootstrap_repository(tmp_path)
+    from aiworkhub import context_graph, manager_ai_tools, task_store
+
     calls: list[tuple[str, dict[str, Any]]] = []
+    appended: list[Path] = []
 
     def recorder(name: str, answer: dict[str, Any]) -> Callable[..., dict[str, Any]]:
         def call(**fields: Any) -> dict[str, Any]:
@@ -1072,17 +1279,30 @@ def test_production_defaults_call_the_existing_functions(tmp_path: Path, monkeyp
 
         return call
 
+    context = SimpleNamespace(authority_repo=authority)
+    monkeypatch.setattr(
+        manager_ai_tools, "_manager_context", lambda **_kw: (context, {"session_id": "fixture"})
+    )
     monkeypatch.setattr(manager_ai_tools, "session_current_state", recorder("state", {"ok": True}))
     monkeypatch.setattr(manager_ai_tools, "context_graph_search", recorder("context", {"ok": True}))
     monkeypatch.setattr(manager_ai_tools, "context_graph_event_write", recorder("event", {"ok": True}))
     monkeypatch.setattr(
         manager_ai_tools, "session_write", recorder("session", {"ok": True, "document_id": 7})
     )
+    monkeypatch.setattr(context_graph, "append_event", lambda repo, **_fields: appended.append(Path(repo)))
     monkeypatch.setattr(
         task_store,
         "list_tasks",
         lambda root, *, status, limit: [{"task_id": f"CARD_{status}", "topic": "t", "runner": "r"}],
     )
+    return calls, appended
+
+
+def test_production_defaults_call_the_existing_functions(tmp_path: Path, monkeypatch) -> None:
+    from aiworkhub import agent_tool_instructions, repository_state
+
+    state = repository_state.bootstrap_repository(tmp_path)
+    calls, appended = _production_stubs(monkeypatch, state.root)
     backends: list[FakeBackend] = []
 
     def factory(backend_id: str, model: str) -> FakeBackend:
@@ -1093,7 +1313,7 @@ def test_production_defaults_call_the_existing_functions(tmp_path: Path, monkeyp
         assert orch.store.root == state.runtime_path / ml.STATE_DIRNAME
         assert orch.store.repo_id == state.manifest.repo_id
         orch.start("fake", "model-a")
-        orch.send("hello")
+        assert orch.send("hello")["ok"] is True
         rotation = orch.rotate("operator_request")
 
     brief = backends[0].briefs[0]
@@ -1103,6 +1323,48 @@ def test_production_defaults_call_the_existing_functions(tmp_path: Path, monkeyp
     assert calls[1][1] == {"query": ml.CONTEXT_QUERY, "limit": 8}
     assert calls[3][1]["action"] == "handoff"
     assert rotation["session"].handoff_ref == "session_document:7"
+    # NF-2026-02318: the chat rows go to this loop's own repository, never outside tmp_path.
+    assert len(appended) == 2
+    assert all(path.resolve().is_relative_to(tmp_path.resolve()) for path in appended)
+
+
+def test_a_session_outside_the_manager_authority_writes_nothing_there(
+    tmp_path: Path, tmp_path_factory, monkeypatch
+) -> None:
+    # NF-2026-02318: a fake-backend loop under tmp_path wrote "hello" chat rows into the
+    # canonical Context Graph, because the writer resolved the process's manager repo.
+    from aiworkhub import repository_state
+
+    repository_state.bootstrap_repository(tmp_path)
+    canonical = tmp_path_factory.mktemp("canonical_authority")
+    calls, appended = _production_stubs(monkeypatch, canonical)
+    backends: list[FakeBackend] = []
+
+    def factory(backend_id: str, model: str) -> FakeBackend:
+        backends.append(FakeBackend(backend_id, model))
+        return backends[-1]
+
+    with ml.ManagerOrchestrator.for_repository(tmp_path, factory) as orch:
+        orch.start("fake", "model-a")
+        result = orch.send("hello")
+
+    assert calls == [] and appended == []
+    assert list(canonical.iterdir()) == []
+    assert "manager_authority_mismatch" in backends[0].briefs[0]
+    # A skipped log write is not a failed turn: a wake would otherwise never ack its callback.
+    assert (result["reply"], result["ok"], result["errors"]) == ("ack: hello", True, [])
+
+
+def test_the_default_event_writer_refuses_without_a_bound_repository(monkeypatch) -> None:
+    from aiworkhub import manager_ai_tools
+
+    monkeypatch.setattr(
+        manager_ai_tools, "_manager_context", lambda **_kw: pytest.fail("no authority lookup without a repo")
+    )
+
+    assert ml._manager_event_write(thread_id="t-0001", user_text="hello") == {
+        "ok": False, "error": "manager_repo_unbound",
+    }
 
 
 LEGACY_ID = "legacy-pinned-0001"

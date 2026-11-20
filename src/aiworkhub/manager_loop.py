@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import hashlib
 import json
 import os
@@ -79,6 +80,10 @@ CONTEXT_QUERY = "manager_loop"
 TURN_EVENT_TYPE = "manager_loop_turn"
 TURN_TERMINAL_TYPES = frozenset({"turn_end", "error", "turn_stopped"})
 TURN_STOPPED_ERROR = "turn_stopped"
+# NF-2026-02318: a provider turn with no reply, no tool event and no usage is this error.
+EMPTY_TURN_ERROR = "empty_provider_turn"
+_TOOL_EVENT_TYPES = frozenset({"tool_call", "tool_result", "command", "file_change"})
+_USAGE_CONTEXT_FIELDS = frozenset({"context_window", "context_fill"})
 NO_HANDOFF = "(none: this is the first session)"
 HANDOFF_PROMPT = (
     "Session rotation ({reason}). Write the handoff your successor session starts from, "
@@ -339,6 +344,23 @@ def _measured_tokens(events: Iterable[Mapping[str, Any]]) -> int | None:
         return None
 
 
+def _empty_turn(events: Iterable[Mapping[str, Any]], reply: str) -> bool:
+    """Whether a turn produced nothing: no reply, no tool event and zero or absent usage.
+
+    Only token counts are evidence of work; ``context_window`` and ``context_fill``
+    describe the conversation, not this turn.
+    """
+    events = list(events)
+    if reply.strip() or any(event.get("type") in _TOOL_EVENT_TYPES for event in events):
+        return False
+    usage = _last_turn_usage(events) or {}
+    return not any(
+        not isinstance(value, bool) and isinstance(value, (int, float)) and value > 0
+        for key, value in usage.items()
+        if key not in _USAGE_CONTEXT_FIELDS
+    )
+
+
 def _rotate_at_tokens_from_env() -> int:
     """``AIWORKHUB_MANAGER_ROTATE_AT_TOKENS`` as a non-negative int; the default when unset or invalid."""
     try:
@@ -590,15 +612,37 @@ def _open_cards(repo: Path) -> str:
     return "\n".join(lines) or "(no open cards)"
 
 
-def _manager_state() -> object:
+def _manager_authority(repo: Path | str | None) -> Path:
+    """The manager tools' authority repository, refused unless it is the loop's own ``repo``.
+
+    NF-2026-02318: the manager tools resolve the process's manager repository, never a
+    session's, so a loop over another root (a test's ``tmp_path``) wrote its turns into
+    the canonical Context Graph. Raises a named :class:`ManagerLoopError` instead.
+    """
     from . import manager_ai_tools
 
+    if repo is None:
+        raise ManagerLoopError("manager_repo_unbound")
+    context, manager = manager_ai_tools._manager_context()
+    if context is None:
+        raise ManagerLoopError(str(manager.get("error") or "verified_manager_identity_required"))
+    authority = Path(context.authority_repo)
+    if os.path.normcase(str(authority.resolve())) != os.path.normcase(str(Path(repo).resolve())):
+        raise ManagerLoopError("manager_authority_mismatch")
+    return authority
+
+
+def _manager_state(repo: Path | str | None) -> object:
+    from . import manager_ai_tools
+
+    _manager_authority(repo)
     return manager_ai_tools.session_current_state()
 
 
-def _manager_context() -> object:
+def _manager_context(repo: Path | str | None) -> object:
     from . import manager_ai_tools
 
+    _manager_authority(repo)
     return manager_ai_tools.context_graph_search(query=CONTEXT_QUERY, limit=8)
 
 
@@ -617,16 +661,24 @@ def _manager_rules() -> str:
         ]
     )
 
-def _manager_event_write(**fields: Any) -> Mapping[str, Any]:
+def _manager_event_write(*, repo: Path | None = None, **fields: Any) -> Mapping[str, Any]:
     """Bind this turn to the manager-chat thread, the way Codex binds its own.
 
     The audit turn stays one event. The user text and assistant reply are also
     ``chat_message`` rows on ``thread_id`` = the manager session id, so Context
     Graph lists that conversation beside Codex threads instead of folding it
-    into the MCP manager episode.
+    into the MCP manager episode. Every write goes to ``repo``, the loop's own
+    root, and is skipped when the manager tools resolve another authority.
     """
     from . import context_graph, manager_ai_tools
 
+    try:
+        authority = _manager_authority(repo)
+    except ManagerLoopError as exc:
+        if str(exc) == "manager_authority_mismatch":
+            # Another repository's store is never written; a skipped log write is not a failed turn.
+            return {"ok": True, "skipped": str(exc)}
+        return {"ok": False, "error": str(exc)}
     thread_id = str(fields.pop("thread_id", "") or "")
     session_id = str(fields.pop("session_id", "") or "") or thread_id
     provider = str(fields.pop("provider", "") or "") or "manager_chat"
@@ -640,9 +692,6 @@ def _manager_event_write(**fields: Any) -> Mapping[str, Any]:
     )
     if not thread_id or not written.get("ok"):
         return written
-    context, _manager = manager_ai_tools._manager_context()
-    if context is None:
-        return written
     turn_key = str(fields.get("idempotency_key") or thread_id)
     pairs = (("user", user_text), ("assistant", assistant_text))
     for role, text in pairs:
@@ -650,7 +699,7 @@ def _manager_event_write(**fields: Any) -> Mapping[str, Any]:
             continue
         try:
             context_graph.append_event(
-                context.authority_repo,
+                authority,
                 thread_id=thread_id,
                 session_id=session_id,
                 provider=provider,
@@ -664,7 +713,6 @@ def _manager_event_write(**fields: Any) -> Mapping[str, Any]:
         except (context_graph.ContextGraphError, OSError):
             continue
     return written
-    return manager_ai_tools.context_graph_event_write(**fields)
 
 
 def _manager_session_write(**fields: Any) -> Mapping[str, Any]:
@@ -717,8 +765,8 @@ class BriefBuilder:
         """Production sources: the task store, the manager tools and the role policy."""
         return cls(
             open_cards=lambda: _open_cards(repo),
-            state=_manager_state,
-            context=_manager_context,
+            state=lambda: _manager_state(repo),
+            context=lambda: _manager_context(repo),
             rules=_manager_rules,
             max_bytes=max_bytes,
         )
@@ -829,9 +877,14 @@ class ManagerOrchestrator:
         brief_bytes: int = DEFAULT_BRIEF_BYTES,
         **options: Any,
     ) -> ManagerOrchestrator:
-        """Production wiring for ``repo``: its runtime store and the existing tools."""
+        """Production wiring for ``repo``: its runtime store and the existing tools.
+
+        The Context Graph writer and the brief sources are bound to ``repo``'s root and
+        refuse when the manager tools resolve another authority repository.
+        """
         state = repository_state.inspect_repository(repo)
         options.setdefault("rotate_at_tokens", _rotate_at_tokens_from_env())
+        options.setdefault("event_writer", functools.partial(_manager_event_write, repo=state.root))
         return cls(
             SessionStore.for_repository(state),
             backend_factory=backend_factory,
@@ -909,15 +962,42 @@ class ManagerOrchestrator:
         """Run one turn; refused while another runs (the service queues owner sends).
 
         ``images`` are stored image file paths the backend hands its CLI; the
-        transcript records only how many there were.
+        transcript records only how many there were. A restored pinned session
+        gets its own persisted route back first, the way a wake rebinds it.
         """
         if not text.strip():
             raise ValueError("the message is empty")
-        if self._backend is not None:
-            self._backend.reasoning_level = str(reasoning or "").strip().lower()
-            self._backend.images = tuple(images)
         with self._exclusive():
+            self._rebind_for_send(text, images=len(images))
+            if self._backend is not None:
+                self._backend.reasoning_level = str(reasoning or "").strip().lower()
+                self._backend.images = tuple(images)
             return self._turn(text, "user_message", "", images=len(images))
+
+    def _rebind_for_send(self, text: str, *, images: int) -> None:
+        """NF-2026-02318: bind an attached session with no backend before an owner turn.
+
+        Restore and continue attach a conversation without a backend. A pinned one is
+        bound onto the route it persisted instead of refusing ``no_active_manager_session``;
+        when nothing can be bound, the owner's text is logged with the refusal, the turn
+        number is used and the refusal propagates.
+        """
+        session = self._session
+        if session is None or self._backend is not None:
+            return
+        try:
+            if session.passive:
+                raise ManagerLoopError("no_active_manager_session")
+            self._bind_existing(session.backend_id, session.model)
+        except Exception as exc:
+            turn = session.turn_count + 1
+            asked: dict[str, Any] = {"text": text, "images": images} if images else {"text": text}
+            refused = {"source": "route_bind", "error": str(exc) if isinstance(exc, ManagerLoopError) else _failure(exc)}
+            with contextlib.suppress(Exception):  # the refusal below must not be masked
+                self._record(session, turn, "user_message", asked)
+                self._record(session, turn, "error", refused)
+            self._consume_turn(session, turn)
+            raise
 
     def record_error(self, payload: Mapping[str, Any]) -> dict[str, Any] | None:
         """Log one ``error`` event as the attached session's next turn; none attached logs nothing.
@@ -1015,10 +1095,11 @@ class ManagerOrchestrator:
             return self._begin_new()
 
     def restore_latest(self) -> ManagerSession | None:
-        """Attach the last conversation. None when the repository has no sessions.
+        """Attach the last conversation for reading. None when there is nothing to attach.
 
-        Provider-free and does not create a session. An explicit selection wins;
-        otherwise the newest active record, or the newest record if all are closed.
+        Provider-free and read-only: no record is created, saved or selected. An explicit
+        selection wins; otherwise the newest active record, or the newest record if all
+        are closed. A rotated record yields to its active successor, or to nothing.
         """
         if self._session is not None:
             return self._session
@@ -1144,23 +1225,28 @@ class ManagerOrchestrator:
         return max(pool, key=lambda item: (item.created_at, item.session_id))
 
     def _restore_latest(self) -> ManagerSession | None:
+        """Attach for reading: no record is created, saved, reopened or selected.
+
+        NF-2026-01914: only an explicit continue/send/bind reopens a record or renews its
+        seat lease. NF-2026-02318: a rotated pick is never attached, since a send would
+        reopen it; its active successor is attached instead, else nothing, and the next
+        ``ensure`` opens the successor from the handoff.
+        """
         self._acquire_lock()
-        session: ManagerSession | None = None
         try:
             chosen = self._selected_session() or self._latest_session()
-            if chosen is None:
-                return None
-            if self._rotated(chosen):
-                session = self._owner_picked(self._activate_selected(chosen))
-                self.store.write_selection(session.session_id)
-            else:
-                # NF-2026-01914: attach for reading. Only an explicit continue/send/bind
-                # reopens a record or renews its seat lease.
-                session = chosen
+            if chosen is not None and self._rotated(chosen):
+                chosen = self._active_successor(chosen)
         finally:
             self._release_lock()
-        self._session = session
-        return session
+        self._session = chosen
+        return chosen
+
+    def _active_successor(self, closed: ManagerSession) -> ManagerSession | None:
+        """The newest active record, preferring one that names ``closed`` as its predecessor."""
+        active = [item for item in self.store.sessions() if item.status == "active"]
+        pool = [item for item in active if item.previous_session_id == closed.session_id] or active
+        return max(pool, key=lambda item: (item.created_at, item.session_id)) if pool else None
 
     def _bind_existing(self, backend_id: str, model: str) -> ManagerSession:
         """Start the selected route on the loaded session. The session id does not change."""
@@ -1191,13 +1277,15 @@ class ManagerOrchestrator:
             backend = self._backend_factory(backend_id, model)
             provider_ref = backend.start(brief)
             if session.passive or (session.backend_id, session.model) != (backend_id, model):
+                # NF-2026-02318: another route is a new provider conversation that starts from
+                # this brief; carrying the old route's estimate over rotated it early.
                 session = dataclasses.replace(
                     session,
                     backend_id=backend_id,
                     model=model,
                     status="active",
                     closed_at=None,
-                    context_estimate_bytes=session.context_estimate_bytes + len(brief.encode("utf-8")),
+                    context_estimate_bytes=len(brief.encode("utf-8")),
                 )
             # A started backend is a new provider conversation: its first turn sets a new baseline.
             session = self._owner_picked(session, context_baseline_tokens=None)
@@ -1442,18 +1530,42 @@ class ManagerOrchestrator:
         })
         return session
 
+    def _consume_turn(self, session: ManagerSession, turn: int) -> None:
+        """Persist ``turn`` as used for a turn that raised, so the next one never reuses it.
+
+        A failing save keeps the in-memory count and leaves the caller's exception to propagate.
+        """
+        consumed = dataclasses.replace(session, turn_count=max(session.turn_count, turn))
+        if self._session is not None and self._session.session_id == session.session_id:
+            self._session = consumed
+        with contextlib.suppress(Exception):
+            self.store.save(consumed)
+
     def _turn(self, message: str, inbound: str, task_id: str, *, images: int = 0) -> dict[str, Any]:
         session, _ = self._active()
         turn = session.turn_count + 1
         asked: dict[str, Any] = {"text": message, "task_id": task_id} if task_id else {"text": message}
         if images:
             asked["images"] = images
-        self._record(session, turn, inbound, asked)
-        events, grown, reply = self._exchange(session, turn, message)
-        errors = [event["payload"] for event in events if event["type"] == "error"]
-        stopped = any(event["type"] == "turn_stopped" for event in events)
-        if stopped:
-            errors.append({"source": "loop", "error": TURN_STOPPED_ERROR})
+        try:
+            self._record(session, turn, inbound, asked)
+            events, grown, reply = self._exchange(session, turn, message)
+            errors = [event["payload"] for event in events if event["type"] == "error"]
+            stopped = any(event["type"] == "turn_stopped" for event in events)
+            empty = False
+            if stopped:
+                errors.append({"source": "loop", "error": TURN_STOPPED_ERROR})
+            elif not errors and _empty_turn(events, reply):
+                # NF-2026-02318: a clean exit with no reply, no tool event and no usage never
+                # reached the model; as a success it acked a callback the model never saw.
+                empty = True
+                failed = {"source": "loop", "error": EMPTY_TURN_ERROR}
+                events.append(self._record(session, turn, "error", failed))
+                errors.append(events[-1]["payload"])
+        except BaseException:
+            # NF-2026-02318: a turn that died in the event log still used its number.
+            self._consume_turn(session, turn)
+            raise
         written = self._call(
             self._event_writer,
             role="manager",
@@ -1515,7 +1627,8 @@ class ManagerOrchestrator:
         # NF-2026-01915: a turn that died on an expired login or a usage limit did no work;
         # rotating here only re-bills a handoff and mislabels the close as context_threshold.
         # NF-2026-02197: the owner's Stop never starts a model call; the next completed turn rotates.
-        if full and not stopped and (reply or not classify_failure(errors)):
+        # NF-2026-02318: an empty provider turn did no work either.
+        if full and not stopped and not empty and (reply or not classify_failure(errors)):
             result["rotation"] = self._rotate("context_threshold", successor=True)
         return result
 
@@ -1543,14 +1656,20 @@ class ManagerOrchestrator:
         if owner_turn:
             stopping, self._stop_armed = self._stop_armed, False
         self._stop_requested = stopping
+        # NF-2026-02318: a stream the loop leaves unfinished -- the event cap, a raise while
+        # logging an event -- is closed with its backend, so no provider process outlives it.
+        stream: Iterator[Any] | None = None
+        finished = False
         try:
             if stopping:
                 # send() handed this turn's images to the backend, which clears them
                 # only when it runs a turn; drop them so a later handoff cannot carry them.
                 backend.images = ()
                 events.append(self._record(session, turn, "turn_stopped", {"by": "owner"}))
+                finished = True
                 return events, grown, ""
-            for raw in backend.send(message):
+            stream = iter(backend.send(message))
+            for raw in stream:
                 # A stop that landed before the provider process existed closed nothing.
                 # An event means the process exists now; close is safe to repeat.
                 if self._stop_requested:
@@ -1572,6 +1691,8 @@ class ManagerOrchestrator:
                 # The final event is logged before its streamed partial is cleared, so a
                 # poll between the two sees one of them, never neither.
                 self._settle_partial(kind)
+            else:
+                finished = True
         except Exception as exc:  # noqa: BLE001 - a failed turn is an error event, not a dead session
             if self._stop_requested:
                 broke: dict[str, Any] = {"by": "owner"}
@@ -1583,7 +1704,22 @@ class ManagerOrchestrator:
             self._partial = None
             if owner_turn:
                 self._stop_armed = False
+            if stream is not None and not finished:
+                self._abandon(session, turn, stream, backend)
         return events, grown, "".join(texts)
+
+    def _abandon(
+        self, session: ManagerSession, turn: int, stream: Iterator[Any], backend: ManagerBackend
+    ) -> None:
+        """Close an unfinished turn's stream, then its backend; both closes are safe to repeat."""
+        for closer, source in ((getattr(stream, "close", None), "stream_close"), (backend.close, "backend_close")):
+            if not callable(closer):
+                continue
+            try:
+                closer()
+            except Exception as exc:  # noqa: BLE001 - cleanup reports its failure and goes on
+                with contextlib.suppress(Exception):  # the event log may be what failed
+                    self._record(session, turn, "error", {"source": source, "error": _failure(exc)})
 
     def _rotate(self, reason: str, *, successor: bool) -> dict[str, Any]:
         session, backend = self._active()
@@ -1629,12 +1765,13 @@ class ManagerOrchestrator:
                 rotation["successor"] = self._open(session.backend_id, session.model)
             except Exception as exc:  # noqa: BLE001 - the rotation is done; say what did not follow
                 rotation["successor_error"] = _failure(exc)
-                # NF-2026-01873: logged on the closed session, and the selection may not keep
-                # naming it: the next ensure opens a successor from its handoff instead.
                 failed = {"source": "successor_open", "error": rotation["successor_error"]}
                 self._record(closed, closed.turn_count, "error", failed)
-                if self.store.read_selection() == closed.session_id:
-                    self.store.clear_selection()
+        # NF-2026-01873 / NF-2026-02318: the selection never keeps naming the closed record.
+        # ``_open`` moved an explicit selection onto the successor; otherwise it is cleared,
+        # so the next ensure opens a successor from the handoff instead.
+        if self.store.read_selection() == closed.session_id:
+            self.store.clear_selection()
         return rotation
 
     def _finish(
