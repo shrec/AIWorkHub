@@ -623,6 +623,12 @@ const MANAGER_LOOP_TOOLS = Object.freeze({
   close: "aiworkhub_manager_loop_close",
   stop: "aiworkhub_manager_loop_stop",
 });
+// Host wait for one manager loop action reply (start/send/rotate/close/...).
+// Starting a backend or closing a session can outlast the 20 s
+// MCP_REQUEST_TIMEOUT_MS while the server still finishes; a host timeout is
+// reported as manager_loop_outcome_unknown, never as a plain failure. This
+// bounds only the host's wait -- it never stops the manager turn itself.
+const MANAGER_LOOP_ACTION_TIMEOUT_MS = 120000;
 // The dashboard's Manager chat panel offers exactly these three CLI backends.
 // MANAGER_LOOP_TOOLS is deliberately never folded into EXPECTED_DASHBOARD_TOOL_NAMES:
 // these tools are mutating and session-scoped, not the read-only dashboard
@@ -2044,11 +2050,14 @@ function extractToolResult(result) {
 // Canonical dashboard rows may contain an absolute Remote-SSH host path in
 // old process errors or provider diagnostics. Keep all operational fields,
 // including repo-relative task metadata, but redact host-absolute paths at
-// the final extension-host -> Webview boundary.
+// the final extension-host -> Webview boundary. A POSIX path counts as
+// host-absolute once it has two segments ("/app/x", an MSYS "/d/Dev"), so a
+// one-segment slash command ("/help") reaches the Webview intact; a URL path
+// ("/api/tasks") cannot be told apart from a host root and is redacted too.
 function sanitizeWebviewPayload(value) {
   if (typeof value === "string") {
     return value
-      .replace(/(^|[\s("'=])\/[^\s"'<>|)]+/g, "$1<redacted-host-path>")
+      .replace(/(^|[\s("'=])\/[^\s"'<>|)\/]+\/[^\s"'<>|)]*/g, "$1<redacted-host-path>")
       .replace(/(^|[\s("'=])[A-Za-z]:[\\/][^\s"'<>|)]+/g, "$1<redacted-host-path>")
       .replace(/(^|[\s("'=])\\\\[^\\\s"'<>|)]+\\[^\s"'<>|)]+/g, "$1<redacted-host-path>");
   }
@@ -10919,15 +10928,16 @@ function disposeVscodeLmWorkerMcpClient() {
 let managerLoopMcpClient = null;
 // The manager loop is the one caller in this extension explicitly allowed to
 // write and launch: the owner opted in by clicking Start in the Manager
-// dialog. It gets its own child -- bound to the same repository identity the
-// dashboard's read-only child already resolved -- so every other dashboard
-// message keeps talking to a child that can do neither. Only the six
-// managerLoop* handlers (pushManagerLoopStatus, pushManagerLoopEvents,
-// runManagerLoopAction) ever call this; everything else keeps using
-// getMcpClient().
+// dialog. It gets its own child -- bound to the same repository identity and
+// claim episode the routing child resolved -- so every other dashboard
+// message keeps talking to a child that can do neither. Only the managerLoop*
+// handlers (resolveManagerLoopReadClient and runManagerLoopAction) ever call
+// this; everything else keeps using getMcpClient().
 function getManagerLoopMcpClient() {
+  const dashboardClient = getMcpClient();
+  // The identity moved under a live child: rebuild one bound to the current identity.
+  retireMovedManagerLoopMcpClient(dashboardClient);
   if (!managerLoopMcpClient) {
-    const dashboardClient = getMcpClient();
     managerLoopMcpClient = new McpStdioClient(
       dashboardClient.repositoryRoot,
       outputChannel,
@@ -10939,6 +10949,21 @@ function getManagerLoopMcpClient() {
   return managerLoopMcpClient;
 }
 
+// A gated child bound to an identity the routing child no longer serves is
+// retired; the reference is cleared synchronously, so the caller sees none.
+function retireMovedManagerLoopMcpClient(dashboardClient) {
+  if (
+    managerLoopMcpClient && (
+      managerLoopMcpClient.repositoryRoot !== dashboardClient.repositoryRoot ||
+      managerLoopMcpClient.repositoryIdentity.repoId !== dashboardClient.repositoryIdentity.repoId ||
+      managerLoopMcpClient.repositoryIdentity.uriStr !== dashboardClient.repositoryIdentity.uriStr ||
+      managerLoopMcpClient.claimEpisode !== dashboardClient.claimEpisode
+    )
+  ) {
+    disposeManagerLoopMcpClient();
+  }
+}
+
 async function disposeManagerLoopMcpClient() {
   if (!managerLoopMcpClient) {
     return;
@@ -10946,7 +10971,10 @@ async function disposeManagerLoopMcpClient() {
   const client = managerLoopMcpClient;
   managerLoopMcpClient = null;
   try {
-    await client.stopDispatcherThenTerminate({ restart: false });
+    // Like the worker child, this child owns no dispatcher or Source Graph
+    // service: the routing child does. Stop only its own process -- never
+    // dispatcher_stop/source_graph_stop on the repository's services.
+    client.stop({ restart: false });
   } catch (_err) {
     // Best-effort shutdown -- the reference above is already cleared.
   }
@@ -11236,10 +11264,9 @@ class ViewState {
     }
     this.timer = null;
     noteDashboardViewDisposed(this);
-    // Belt and suspenders: any dashboard surface closing tears down the
-    // manager loop's write+launch-capable child too, even if a different
-    // surface created it. Re-opening the Manager dialog spawns a fresh one.
-    disposeManagerLoopMcpClient();
+    // A surface closing or hiding never ends the manager loop: the running
+    // turn and the callback wake consumer live in its gated child. Only a
+    // successful Close, a repository switch or deactivate dispose it.
   }
 }
 
@@ -11918,15 +11945,34 @@ async function confirmNeedfixRequest(action, needfixId) {
   return choice === label ? { reason, duplicateParentId } : null;
 }
 
+// send_queue, partial and running live only in the gated child's memory, so
+// status and events read from it whenever it exists. The read-only routing
+// child answers only while no gated child exists: before the first Start,
+// after a successful Close, or once the identity moved -- a moved child is
+// retired, never rebuilt for a poll, so a read never spawns a write+launch-
+// capable child.
+function resolveManagerLoopReadClient() {
+  const routingClient = getMcpClient();
+  retireMovedManagerLoopMcpClient(routingClient);
+  return managerLoopMcpClient || routingClient;
+}
+
+// A null or non-object tool result (extractToolResult found no readable
+// payload) is a named failure, never a silent empty success.
+function managerLoopReplyPayload(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { ok: false, error: "manager_loop_reply_unreadable" };
+  }
+  return sanitizeWebviewPayload(payload);
+}
+
 async function pushManagerLoopStatus(view) {
   try {
-    // Read-only: before the owner presses Start there is no loop child and
-    // no session, so the read-only dashboard child answers.
-    const client = managerLoopMcpClient || getMcpClient();
+    const client = resolveManagerLoopReadClient();
     view.bindClient(client);
     const payload = await client.callTool(MANAGER_LOOP_TOOLS.status, {});
     if (view.stillBoundTo(client)) {
-      view.postMessage({ type: OUTBOUND_TYPES.managerLoopStatus, payload: sanitizeWebviewPayload(payload) });
+      view.postMessage({ type: OUTBOUND_TYPES.managerLoopStatus, payload: managerLoopReplyPayload(payload) });
     } else {
       view.postMessage({ type: OUTBOUND_TYPES.managerLoopStatus, payload: { ok: false, error: "manager_reply_superseded" } });
     }
@@ -11937,13 +11983,11 @@ async function pushManagerLoopStatus(view) {
 
 async function pushManagerLoopEvents(view, sessionId, afterSeq) {
   try {
-    // Read-only: before the owner presses Start there is no loop child and
-    // no session, so the read-only dashboard child answers.
-    const client = managerLoopMcpClient || getMcpClient();
+    const client = resolveManagerLoopReadClient();
     view.bindClient(client);
     const payload = await client.callTool(MANAGER_LOOP_TOOLS.events, { session_id: sessionId, after_seq: afterSeq });
     if (view.stillBoundTo(client)) {
-      view.postMessage({ type: OUTBOUND_TYPES.managerLoopEvents, payload: { ...sanitizeWebviewPayload(payload), session_id: sessionId } });
+      view.postMessage({ type: OUTBOUND_TYPES.managerLoopEvents, payload: { ...managerLoopReplyPayload(payload), session_id: sessionId } });
     } else {
       view.postMessage({ type: OUTBOUND_TYPES.managerLoopEvents, payload: { ok: false, error: "manager_reply_superseded", session_id: sessionId } });
     }
@@ -11952,29 +11996,49 @@ async function pushManagerLoopEvents(view, sessionId, afterSeq) {
   }
 }
 
-// The six aiworkhub_manager_loop_* tools all answer {ok, ...}: start/rotate/
-// send's OWN reply is forwarded as-is (so a manager_turn_in_progress refusal
-// carries its reason code), and a status refresh always follows so the panel's
-// session/running state comes from one authoritative source regardless of
-// which of the four differently-shaped mutating replies just arrived.
+// Every aiworkhub_manager_loop_* tool answers {ok, ...}. The tool's OWN reply
+// is forwarded (send queues behind a running turn; a refusal carries its
+// reason code), and a status refresh follows so the panel's session/running
+// state comes from one authoritative source. Every action gets exactly one
+// final reply: manager_reply_superseded when the view moved to another child,
+// manager_loop_outcome_unknown when the host stopped waiting first.
 async function runManagerLoopAction(view, action, args) {
   const tool = MANAGER_LOOP_TOOLS[action];
-  if (!tool) return;
+  if (!tool) {
+    view.postMessage({ type: OUTBOUND_TYPES.managerLoopAction, action, payload: { ok: false, error: "invalid_manager_loop_action" } });
+    return;
+  }
+  let client = null;
   try {
-    const client = getManagerLoopMcpClient();
+    client = getManagerLoopMcpClient();
     view.bindClient(client);
-    const payload = await client.callTool(tool, args);
+    const payload = managerLoopReplyPayload(await client.callTool(tool, args, MANAGER_LOOP_ACTION_TIMEOUT_MS));
     if (view.stillBoundTo(client)) {
-      view.postMessage({ type: OUTBOUND_TYPES.managerLoopAction, action, payload: sanitizeWebviewPayload(payload) });
+      view.postMessage({ type: OUTBOUND_TYPES.managerLoopAction, action, payload });
       await pushManagerLoopStatus(view);
+    } else {
+      view.postMessage({ type: OUTBOUND_TYPES.managerLoopAction, action, payload: { ok: false, error: "manager_reply_superseded" } });
     }
-    if (action === "close") {
-      // The owner ended the session: tear down the write+launch-capable
-      // child now instead of leaving it idle. The next managerLoopStart
-      // lazily spawns a fresh one.
+    if (action === "close" && payload.ok === true && managerLoopMcpClient === client) {
+      // Only a successful Close ends the session: tear down this exact
+      // write+launch-capable child. A refused Close keeps the turn alive.
       await disposeManagerLoopMcpClient();
     }
   } catch (err) {
+    if (client && (managerLoopMcpClient !== client || !view.stillBoundTo(client))) {
+      // The view moved on: a repository switch retired this child and its
+      // stop() failed the pending request with mcp_stopped. That is the same
+      // one final superseded reply, never a plain failure.
+      view.postMessage({ type: OUTBOUND_TYPES.managerLoopAction, action, payload: { ok: false, error: "manager_reply_superseded" } });
+      return;
+    }
+    if (err && err.message === "mcp_request_timeout") {
+      // The server may still finish this action: never report a plain
+      // failure the panel would answer with a duplicate resend.
+      view.postMessage({ type: OUTBOUND_TYPES.managerLoopAction, action, payload: { ok: false, error: "manager_loop_outcome_unknown" } });
+      await pushManagerLoopStatus(view);
+      return;
+    }
     view.postMessage({
       type: OUTBOUND_TYPES.managerLoopAction,
       action,
@@ -13078,7 +13142,10 @@ function handleInboundMessage(view, message) {
     }
     case "managerLoopRename": {
       const renameId = String(message.sessionId || "");
-      if (!MANAGER_SESSION_ID_RE.test(renameId)) return;
+      if (!MANAGER_SESSION_ID_RE.test(renameId)) {
+        view.postMessage({ type: OUTBOUND_TYPES.managerLoopAction, action: "rename", payload: { ok: false, error: "invalid_session_id" } });
+        return;
+      }
       const explicitTitle = String(message.title || "").trim().slice(0, 80);
       if (explicitTitle) {
         runManagerLoopAction(view, "rename", { session_id: renameId, title: explicitTitle });
@@ -13093,7 +13160,10 @@ function handleInboundMessage(view, message) {
     }
     case "managerLoopDelete": {
       const deleteId = String(message.sessionId || "");
-      if (!MANAGER_SESSION_ID_RE.test(deleteId)) return;
+      if (!MANAGER_SESSION_ID_RE.test(deleteId)) {
+        view.postMessage({ type: OUTBOUND_TYPES.managerLoopAction, action: "discard", payload: { ok: false, error: "invalid_session_id" } });
+        return;
+      }
       vscode.window.showWarningMessage("Delete this manager session?", { modal: true }, "Delete").then((choice) => {
         if (choice === "Delete") runManagerLoopAction(view, "discard", { session_id: deleteId });
       });
@@ -13101,7 +13171,10 @@ function handleInboundMessage(view, message) {
     }
     case "managerLoopContinue": {
       const sessionId = String(message.sessionId || "");
-      if (!MANAGER_SESSION_ID_RE.test(sessionId)) return;
+      if (!MANAGER_SESSION_ID_RE.test(sessionId)) {
+        view.postMessage({ type: OUTBOUND_TYPES.managerLoopAction, action: "continue", payload: { ok: false, error: "invalid_session_id" } });
+        return;
+      }
       // A picked model travels with the continue: the server pins it on this
       // conversation and the pick makes it the manager seat. An unlisted backend
       // or a half route is dropped, so the continue stays a plain one.

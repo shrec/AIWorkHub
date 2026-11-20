@@ -32,10 +32,26 @@ function flush() {
 
 // ── extension.js: the seven new message types routed to their MCP tools ──────
 
-function makeClient(responder) {
+const REPO_A = Object.freeze({
+  repositoryRoot: "/repo-a",
+  repositoryIdentity: Object.freeze({ uriStr: "file:///repo-a", repoId: `repo_${"a".repeat(32)}` }),
+  claimEpisode: "episode_a",
+});
+const REPO_B = Object.freeze({
+  repositoryRoot: "/repo-b",
+  repositoryIdentity: Object.freeze({ uriStr: "file:///repo-b", repoId: `repo_${"b".repeat(32)}` }),
+  claimEpisode: "episode_b",
+});
+
+// The routing (read-only) client carries the repository identity the gated
+// child is spawned with, exactly like getMcpClient()'s McpStdioClient.
+function makeClient(responder, identity = REPO_A) {
   const calls = [];
   return {
     calls,
+    repositoryRoot: identity.repositoryRoot,
+    repositoryIdentity: identity.repositoryIdentity,
+    claimEpisode: identity.claimEpisode,
     async callTool(name, args) {
       calls.push({ name, args });
       return responder ? responder(name, args) : { ok: true };
@@ -43,21 +59,44 @@ function makeClient(responder) {
   };
 }
 
+// Binds by repository identity and claim episode, like ViewState.bindClient /
+// ViewState.stillBoundTo -- never by client object.
 function makeView() {
   const posts = [];
   return {
     posts,
-    boundClient: null,
+    repoUriStr: null,
+    repoId: null,
+    claimEpisode: null,
     bindClient(client) {
-      this.boundClient = client;
+      // A client without an identity (bindClient({})) binds to nothing.
+      const identity = (client && client.repositoryIdentity) || {};
+      this.repoUriStr = identity.uriStr;
+      this.repoId = identity.repoId;
+      this.claimEpisode = client && client.claimEpisode;
     },
     stillBoundTo(client) {
-      return this.boundClient === client;
+      return Boolean(
+        client &&
+        this.repoUriStr === client.repositoryIdentity.uriStr &&
+        this.repoId === client.repositoryIdentity.repoId &&
+        this.claimEpisode === client.claimEpisode,
+      );
     },
     postMessage(message) {
       posts.push(message);
     },
   };
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
 function loadHostSlice() {
@@ -85,9 +124,12 @@ function loadHostSlice() {
     "    // Best-effort shutdown -- the reference above is already cleared.\n  }\n}",
     "getManagerLoopMcpClient/disposeManagerLoopMcpClient",
   );
+  const helpersStart = extensionSource.includes("function resolveManagerLoopReadClient() {")
+    ? "function resolveManagerLoopReadClient() {"
+    : "async function pushManagerLoopStatus(view) {";
   const helpers = extractSlice(
     extensionSource,
-    "async function pushManagerLoopStatus(view) {",
+    helpersStart,
     "      payload: { ok: false, error: sanitizeErrorMessage(err) },\n    });\n  }\n}",
     "manager loop host functions",
   );
@@ -97,6 +139,14 @@ function loadHostSlice() {
     '      pushManagerLoopEvents(view, sessionId, Number.isFinite(afterSeq) && afterSeq >= 0 ? afterSeq : 0);\n      break;\n    }\n    default:\n      break;\n  }\n}',
     "handleInboundMessage",
   );
+  // The real ViewState.dispose() tail: what closing or hiding a dashboard
+  // surface does to the manager loop.
+  const surfaceDispose = extractSlice(
+    extensionSource,
+    "    this.timer = null;\n    noteDashboardViewDisposed(this);",
+    "\n  }",
+    "ViewState.dispose",
+  );
 
   let currentClient = null;
   // Every gated child this test run spawns, in creation order -- lets tests
@@ -104,6 +154,7 @@ function loadHostSlice() {
   const managerLoopClientInstances = [];
   const warningCalls = [];
   const warningResponses = [];
+  let gatedResponder = null;
 
   class FakeMcpStdioClient {
     constructor(repositoryRoot, outputChannel, repositoryIdentity, claimEpisode, options) {
@@ -113,14 +164,24 @@ function loadHostSlice() {
       this.claimEpisode = claimEpisode;
       this.options = options || {};
       this.calls = [];
+      this.stopCalls = [];
       this.terminated = false;
+      this.dispatcherStopped = false;
       managerLoopClientInstances.push(this);
     }
-    async callTool(name, args) {
-      this.calls.push({ name, args });
-      return { ok: true };
+    async callTool(name, args, timeoutMs) {
+      this.calls.push({ name, args, timeoutMs });
+      return gatedResponder ? gatedResponder(name, args, this) : { ok: true };
     }
+    // McpStdioClient.stop: ends only this child's own process.
+    stop(options) {
+      this.stopCalls.push(options);
+      this.terminated = true;
+    }
+    // McpStdioClient.stopDispatcherThenTerminate: dispatcher_stop and
+    // source_graph_stop on the repository's services, then the kill.
     async stopDispatcherThenTerminate() {
+      this.dispatcherStopped = true;
       this.terminated = true;
     }
   }
@@ -131,6 +192,7 @@ function loadHostSlice() {
     McpStdioClient: FakeMcpStdioClient,
     sanitizeWebviewPayload: (value) => value,
     sanitizeErrorMessage: (err) => String((err && err.message) || "mcp_unavailable"),
+    noteDashboardViewDisposed: () => {},
     // Confirmation modal: a queued response simulates a dismissed dialog
     // (undefined); with none queued it auto-confirms with the offered label,
     // matching how the other managerLoop* host tests exercise the real path.
@@ -147,7 +209,9 @@ function loadHostSlice() {
   vm.createContext(context);
   vm.runInContext(
     `"use strict";\n${allowed}\n${outbound}\n${tools}\n${managerLoopClient}\n${helpers}\n${handler}\n` +
-      "this.api = { handleInboundMessage, OUTBOUND_TYPES, MANAGER_LOOP_TOOLS, MANAGER_LOOP_BACKENDS, getManagerLoopMcpClient, disposeManagerLoopMcpClient };",
+      `class SurfaceView {\n  constructor() { this.timer = null; }\n  dispose() {\n${surfaceDispose}\n}\n` +
+      "this.api = { handleInboundMessage, OUTBOUND_TYPES, MANAGER_LOOP_TOOLS, MANAGER_LOOP_BACKENDS, getManagerLoopMcpClient, disposeManagerLoopMcpClient, SurfaceView, " +
+      "actionTimeoutMs: typeof MANAGER_LOOP_ACTION_TIMEOUT_MS === 'undefined' ? undefined : MANAGER_LOOP_ACTION_TIMEOUT_MS };",
     context,
   );
   return {
@@ -159,6 +223,9 @@ function loadHostSlice() {
     },
     setClient(client) {
       currentClient = client;
+    },
+    setGatedResponder(responder) {
+      gatedResponder = responder;
     },
   };
 }
@@ -335,6 +402,9 @@ test("managerLoopClose disposes the gated client; the next managerLoopStart spaw
   harness.api.handleInboundMessage(view, { type: "managerLoopClose" });
   await flush();
   assert.equal(firstClient.terminated, true);
+  // Only the child's own process stops: never dispatcher_stop/source_graph_stop.
+  assert.deepEqual(plain(firstClient.stopCalls), [{ restart: false }]);
+  assert.equal(firstClient.dispatcherStopped, false);
 
   harness.api.handleInboundMessage(view, { type: "managerLoopStart", backendId: "claude_cli", model: "opus" });
   await flush();
@@ -388,15 +458,268 @@ test("managerLoopDelete shows a modal confirmation before discarding; a dismisse
   );
 });
 
-test("the gated manager loop client is torn down from all five required call sites", () => {
+test("the gated manager loop client is torn down only by a successful Close, a repository switch, deactivate or an identity move", () => {
   // 1 definition (async function disposeManagerLoopMcpClient() {) plus 5
-  // call sites: runManagerLoopAction's close branch, ViewState.dispose(),
-  // deactivate(), selectRepositoryCommand, and getMcpClient()'s repository
-  // identity change (NF-2026-02113: a switch that bypasses the command must
-  // not leave the old repository's manager-loop server alive). A regression
-  // dropping any of the five call sites changes this count.
+  // call sites: runManagerLoopAction's successful-close branch,
+  // retireMovedManagerLoopMcpClient()'s identity move, deactivate(),
+  // selectRepositoryCommand, and getMcpClient()'s repository identity change
+  // (NF-2026-02113: a switch that bypasses the command must not leave the old
+  // repository's manager-loop server alive). Closing or hiding a dashboard
+  // surface is deliberately NOT a call site: the running turn and the
+  // callback wake consumer live in this child.
   const occurrences = extensionSource.split("disposeManagerLoopMcpClient()").length - 1;
   assert.equal(occurrences, 6);
+  const surfaceDispose = extractSlice(
+    extensionSource,
+    "    this.timer = null;\n    noteDashboardViewDisposed(this);",
+    "\n  }",
+    "ViewState.dispose",
+  );
+  assert.ok(!surfaceDispose.includes("disposeManagerLoopMcpClient"), "a surface close never ends the manager loop");
+  const disposeBody = extractSlice(
+    extensionSource,
+    "async function disposeManagerLoopMcpClient() {",
+    "\n}",
+    "disposeManagerLoopMcpClient",
+  );
+  assert.ok(!disposeBody.includes("stopDispatcherThenTerminate"), "the gated child never stops the repository's dispatcher/source graph");
+  assert.match(disposeBody, /client\.stop\(\{ restart: false \}\)/);
+});
+
+test("disposing a surface mid-turn keeps the gated child and never calls dispatcher_stop", async () => {
+  const harness = loadHostSlice();
+  harness.setClient(makeClient());
+  const view = makeView();
+  const turn = deferred();
+  harness.setGatedResponder((name) => (name === "aiworkhub_manager_loop_send" ? turn.promise : { ok: true }));
+
+  harness.api.handleInboundMessage(view, { type: "managerLoopSend", text: "work", backendId: "claude_cli", model: "opus" });
+  await flush();
+  assert.equal(harness.managerLoopClientInstances.length, 1);
+  const gated = harness.managerLoopClientInstances[0];
+
+  // The real ViewState.dispose() tail -- the sidebar hidden or the panel closed.
+  new harness.api.SurfaceView().dispose();
+  await flush();
+  assert.equal(gated.terminated, false, "the running turn's child survives a surface close");
+  assert.equal(gated.dispatcherStopped, false, "no dispatcher_stop/source_graph_stop");
+
+  turn.resolve({ ok: true, queued: false });
+  await flush();
+  const actions = view.posts.filter((post) => post.type === harness.api.OUTBOUND_TYPES.managerLoopAction);
+  assert.deepEqual(plain(actions), [{
+    type: harness.api.OUTBOUND_TYPES.managerLoopAction,
+    action: "send",
+    payload: { ok: true, queued: false },
+  }]);
+
+  harness.api.handleInboundMessage(view, { type: "managerLoopStatus" });
+  await flush();
+  assert.equal(harness.managerLoopClientInstances.length, 1, "status keeps reading the same gated child");
+  assert.ok(gated.calls.filter((call) => call.name === "aiworkhub_manager_loop_status").length >= 2);
+});
+
+test("a refused Close keeps the gated child and its turn alive", async () => {
+  const harness = loadHostSlice();
+  harness.setClient(makeClient());
+  const view = makeView();
+  harness.setGatedResponder((name) => (
+    name === "aiworkhub_manager_loop_close" ? { ok: false, error: "manager_close_refused" } : { ok: true }
+  ));
+
+  harness.api.handleInboundMessage(view, { type: "managerLoopStart", backendId: "claude_cli", model: "opus" });
+  await flush();
+  harness.api.handleInboundMessage(view, { type: "managerLoopClose" });
+  await flush();
+
+  const gated = harness.managerLoopClientInstances[0];
+  assert.equal(gated.terminated, false);
+  assert.equal(gated.dispatcherStopped, false);
+  assert.ok(view.posts.some((post) =>
+    post.type === harness.api.OUTBOUND_TYPES.managerLoopAction && post.action === "close" &&
+    post.payload.ok === false && post.payload.error === "manager_close_refused"));
+
+  harness.api.handleInboundMessage(view, { type: "managerLoopStatus" });
+  await flush();
+  assert.equal(harness.managerLoopClientInstances.length, 1, "no respawn: the same child still serves");
+});
+
+test("status and events read the gated child whenever it exists; the routing child answers only before Start and after a successful Close", async () => {
+  const harness = loadHostSlice();
+  const routing = makeClient();
+  harness.setClient(routing);
+  const view = makeView();
+  const sessionId = "mls-aaaa1111bbbb2222";
+
+  harness.api.handleInboundMessage(view, { type: "managerLoopStatus" });
+  await flush();
+  assert.equal(harness.managerLoopClientInstances.length, 0, "a status read never spawns the gated child");
+  assert.deepEqual(routing.calls.map((call) => call.name), ["aiworkhub_manager_loop_status"]);
+
+  harness.api.handleInboundMessage(view, { type: "managerLoopStart", backendId: "claude_cli", model: "opus" });
+  await flush();
+  const gated = harness.managerLoopClientInstances[0];
+  harness.api.handleInboundMessage(view, { type: "managerLoopStatus" });
+  harness.api.handleInboundMessage(view, { type: "managerLoopEvents", sessionId, afterSeq: 3 });
+  await flush();
+  assert.equal(routing.calls.length, 1, "send_queue/partial/running come from the gated child only");
+  assert.ok(gated.calls.some((call) => call.name === "aiworkhub_manager_loop_events"));
+
+  harness.api.handleInboundMessage(view, { type: "managerLoopClose" });
+  await flush();
+  assert.equal(gated.terminated, true);
+  harness.api.handleInboundMessage(view, { type: "managerLoopStatus" });
+  await flush();
+  assert.equal(routing.calls.length, 2, "after a successful Close the routing child answers again");
+  assert.equal(harness.managerLoopClientInstances.length, 1);
+});
+
+test("a null tool result maps to manager_loop_reply_unreadable for status, events and actions", async () => {
+  const harness = loadHostSlice();
+  harness.setClient(makeClient());
+  const view = makeView();
+  const sessionId = "mls-aaaa1111bbbb2222";
+
+  harness.api.handleInboundMessage(view, { type: "managerLoopStart", backendId: "claude_cli", model: "opus" });
+  await flush();
+  harness.setGatedResponder(() => null);
+  view.posts.length = 0;
+
+  harness.api.handleInboundMessage(view, { type: "managerLoopStatus" });
+  harness.api.handleInboundMessage(view, { type: "managerLoopEvents", sessionId, afterSeq: 0 });
+  harness.api.handleInboundMessage(view, { type: "managerLoopRotate", reason: "x" });
+  await flush();
+
+  const unreadable = { ok: false, error: "manager_loop_reply_unreadable" };
+  const byType = (type) => view.posts.filter((post) => post.type === type).map((post) => plain(post.payload));
+  assert.ok(byType(harness.api.OUTBOUND_TYPES.managerLoopStatus).length >= 1);
+  for (const payload of byType(harness.api.OUTBOUND_TYPES.managerLoopStatus)) assert.deepEqual(payload, unreadable);
+  assert.deepEqual(byType(harness.api.OUTBOUND_TYPES.managerLoopEvents), [{ ...unreadable, session_id: sessionId }]);
+  assert.deepEqual(byType(harness.api.OUTBOUND_TYPES.managerLoopAction), [unreadable]);
+});
+
+for (const [outcome, settle] of [
+  ["resolves", (turn) => turn.resolve({ ok: true })],
+  // What McpStdioClient.stop() does to every pending request of the retired child.
+  ["fails with mcp_stopped", (turn) => turn.reject(new Error("mcp_stopped"))],
+]) {
+  test(`a repository identity change retires the gated child: a poll falls back to the routing child and a moved send that ${outcome} gets manager_reply_superseded`, async () => {
+    const harness = loadHostSlice();
+    harness.setClient(makeClient(null, REPO_A));
+    const view = makeView();
+    const turn = deferred();
+    harness.setGatedResponder((name) => (name === "aiworkhub_manager_loop_send" ? turn.promise : { ok: true }));
+
+    harness.api.handleInboundMessage(view, { type: "managerLoopSend", text: "work", backendId: "claude_cli", model: "opus" });
+    await flush();
+    const oldGated = harness.managerLoopClientInstances[0];
+    assert.equal(oldGated.repositoryIdentity.repoId, REPO_A.repositoryIdentity.repoId);
+
+    // The dashboard's routing child now serves another repository.
+    const routingB = makeClient(null, REPO_B);
+    harness.setClient(routingB);
+    harness.api.handleInboundMessage(view, { type: "managerLoopStatus" });
+    await flush();
+    assert.equal(oldGated.terminated, true);
+    assert.equal(oldGated.dispatcherStopped, false);
+    assert.equal(harness.managerLoopClientInstances.length, 1, "a poll never spawns a write+launch-capable child");
+    assert.deepEqual(routingB.calls.map((call) => call.name), ["aiworkhub_manager_loop_status"]);
+
+    settle(turn);
+    await flush();
+    const sendReplies = view.posts.filter((post) =>
+      post.type === harness.api.OUTBOUND_TYPES.managerLoopAction && post.action === "send");
+    assert.deepEqual(plain(sendReplies.map((post) => post.payload)), [{ ok: false, error: "manager_reply_superseded" }],
+      "the send still gets one final reply, so the panel never stays Running");
+
+    // The next action spawns a gated child bound to the new identity.
+    harness.api.handleInboundMessage(view, { type: "managerLoopStart", backendId: "claude_cli", model: "opus" });
+    await flush();
+    assert.equal(harness.managerLoopClientInstances.length, 2);
+    const newGated = harness.managerLoopClientInstances[1];
+    assert.equal(newGated.repositoryIdentity.repoId, REPO_B.repositoryIdentity.repoId);
+    assert.equal(newGated.claimEpisode, REPO_B.claimEpisode);
+  });
+}
+
+test("manager loop actions use the named longer timeout; a host timeout replies manager_loop_outcome_unknown and refreshes status", async () => {
+  const harness = loadHostSlice();
+  harness.setClient(makeClient());
+  const view = makeView();
+  harness.setGatedResponder((name) => {
+    if (name === "aiworkhub_manager_loop_send") throw new Error("mcp_request_timeout");
+    return { ok: true, running: true };
+  });
+
+  harness.api.handleInboundMessage(view, { type: "managerLoopSend", text: "work", backendId: "claude_cli", model: "opus" });
+  await flush();
+
+  assert.ok(Number.isFinite(harness.api.actionTimeoutMs) && harness.api.actionTimeoutMs > 20000);
+  const gated = harness.managerLoopClientInstances[0];
+  const sendCall = gated.calls.find((call) => call.name === "aiworkhub_manager_loop_send");
+  assert.equal(sendCall.timeoutMs, harness.api.actionTimeoutMs);
+  assert.deepEqual(plain(view.posts.map((post) => post.type)), [
+    harness.api.OUTBOUND_TYPES.managerLoopAction,
+    harness.api.OUTBOUND_TYPES.managerLoopStatus,
+  ]);
+  assert.deepEqual(plain(view.posts[0]), {
+    type: harness.api.OUTBOUND_TYPES.managerLoopAction,
+    action: "send",
+    payload: { ok: false, error: "manager_loop_outcome_unknown" },
+  });
+  assert.deepEqual(plain(view.posts[1].payload), { ok: true, running: true });
+});
+
+test("invalid rename/delete/continue ids get an action reply instead of silence", async () => {
+  const harness = loadHostSlice();
+  harness.setClient(makeClient());
+  const view = makeView();
+
+  harness.api.handleInboundMessage(view, { type: "managerLoopRename", sessionId: "nope", title: "x" });
+  harness.api.handleInboundMessage(view, { type: "managerLoopDelete", sessionId: "nope" });
+  harness.api.handleInboundMessage(view, { type: "managerLoopContinue", sessionId: "nope" });
+  await flush();
+
+  assert.equal(harness.managerLoopClientInstances.length, 0);
+  assert.equal(harness.warningCalls.length, 0, "no modal for an id that can never be deleted");
+  assert.deepEqual(plain(view.posts), ["rename", "discard", "continue"].map((action) => ({
+    type: harness.api.OUTBOUND_TYPES.managerLoopAction,
+    action,
+    payload: { ok: false, error: "invalid_session_id" },
+  })));
+});
+
+test("sanitizeWebviewPayload hides every two-segment host path but keeps one-segment slash commands in chat text", () => {
+  const fnSource = extractSlice(
+    extensionSource,
+    "function sanitizeWebviewPayload(value) {",
+    "\n  return value;\n}",
+    "sanitizeWebviewPayload",
+  );
+  const context = {};
+  vm.createContext(context);
+  vm.runInContext(`"use strict";\n${fnSource}\nthis.sanitize = sanitizeWebviewPayload;`, context);
+  const sanitize = context.sanitize;
+
+  for (const text of [
+    "try /help or /compact next",
+    "see https://example.com/docs/page",
+    "(/review the diff)",
+  ]) {
+    assert.equal(sanitize(text), text);
+  }
+  assert.equal(sanitize("failed at /home/owner/secret.txt"), "failed at <redacted-host-path>");
+  assert.equal(sanitize("cwd=/Users/owner/repo"), "cwd=<redacted-host-path>");
+  // Deny by default: a root outside any list, an MSYS drive, and a URL path alike.
+  assert.equal(sanitize("at /app/server.js:12"), "at <redacted-host-path>");
+  assert.equal(sanitize("cd /d/Dev/repo && ls"), "cd <redacted-host-path> && ls");
+  assert.equal(sanitize("GET /api/tasks?limit=5 returned 200"), "GET <redacted-host-path> returned 200");
+  assert.equal(sanitize("failed at C:\\Users\\owner\\secret.txt"), "failed at <redacted-host-path>");
+  assert.equal(sanitize("failed at \\\\server\\share\\secret.txt"), "failed at <redacted-host-path>");
+  assert.deepEqual(
+    plain(sanitize({ text: "/review the diff", input: { path: "/tmp/build/out.log", url: "/api/v1/items" } })),
+    { text: "/review the diff", input: { path: "<redacted-host-path>", url: "<redacted-host-path>" } },
+  );
 });
 
 test("managerLoopStart refuses an unlisted backend without ever calling an MCP tool", async () => {
