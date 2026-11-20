@@ -979,7 +979,8 @@ test("a manager_turn_in_progress reply shows a notice and sends nothing else", (
 
   assert.equal(harness.elements.managerChatNotice.hidden, false);
   assert.match(harness.elements.managerChatNotice.textContent, /already running/i);
-  assert.equal(harness.posts.length, 0, "the busy reply must never trigger a resend");
+  assert.deepEqual(plain(harness.posts), [{ type: "managerLoopStatus" }], "the busy reply only pulls status");
+  assert.ok(!harness.posts.some((post) => post && post.type === "managerLoopSend"), "the busy reply must never trigger a resend");
 });
 
 test("a session_close for the current session pulls status even when the panel is idle", () => {
@@ -1146,6 +1147,7 @@ test("a pasted, dropped or chosen image attaches and Send carries it with the te
     backendId: "codex_cli",
     model: "gpt-x",
     reasoning: "",
+    clientId: harness.state.managerChatPendingSends.at(-1).clientId,
     images: [
       { name: "shot.png", data: "iVBORw0KGgo=" },
       { name: "a.gif", data: "R0lGODlh" },
@@ -1230,6 +1232,7 @@ test("submitting the composer posts the picker route with the text", () => {
     backendId: "codex_cli",
     model: "gpt-x",
     reasoning: "",
+    clientId: harness.state.managerChatPendingSends.at(-1).clientId,
   });
 });
 
@@ -1248,6 +1251,7 @@ test("submitting while a turn is running still sends and leaves the composer ena
     backendId: "codex_cli",
     model: "gpt-x",
     reasoning: "",
+    clientId: harness.state.managerChatPendingSends.at(-1).clientId,
   });
   assert.equal(harness.elements.managerChatInput.disabled, false);
   assert.equal(harness.elements.managerChatSend.disabled, false);
@@ -1490,6 +1494,7 @@ test("a discovered row's label is shown as the option text while the value stays
     backendId: "claude_cli",
     model: "opus",
     reasoning: "",
+    clientId: harness.state.managerChatPendingSends.at(-1).clientId,
   });
 });
 
@@ -1544,6 +1549,7 @@ test("Send continues the saved session with the exact backend and model chosen i
     backendId: "claude_cli",
     model: "claude-sonnet-5",
     reasoning: "",
+    clientId: harness.state.managerChatPendingSends.at(-1).clientId,
   });
 });
 test("Send is refused when no model is available", () => {
@@ -1616,6 +1622,7 @@ test("opening the chat with two enabled models and no previous selection leaves 
     backendId: "codex_cli",
     model: "gpt-5-codex",
     reasoning: "",
+    clientId: harness.state.managerChatPendingSends.at(-1).clientId,
   });
 });
 
@@ -2456,14 +2463,18 @@ test("opening the sidebar posts exactly one managerLoopStatus then one managerLo
   assert.deepEqual(plain(relevant), [{ type: "managerLoopStatus" }, { type: "managerLoopRestore" }]);
 });
 
-test("a restore reply with a session posts a status refresh and does not force the running flag", () => {
+test("a restore reply with a session binds it, posts a status refresh and does not force the running flag", () => {
   const harness = loadWebviewSlice();
   const sessionId = "mls-" + "c".repeat(32);
   harness.posts.length = 0;
 
   harness.api.renderManagerChatAction("restore", { ok: true, session: { session_id: sessionId }, running: false });
 
-  assert.deepEqual(plain(harness.posts), [{ type: "managerLoopStatus" }]);
+  assert.equal(harness.state.managerChatSession, sessionId, "the nested continue shape binds the session");
+  assert.deepEqual(plain(harness.posts), [
+    { type: "managerLoopStatus" },
+    { type: "managerLoopEvents", sessionId, afterSeq: 0 },
+  ]);
   assert.equal(harness.state.managerChatRunning, false);
 });
 
@@ -2477,7 +2488,7 @@ test("a restore reply with a null session keeps the no-session state", () => {
   assert.deepEqual(plain(harness.posts), [{ type: "managerLoopStatus" }]);
 });
 
-test("a restore error shows a notice and posts nothing further", () => {
+test("a restore error shows a notice and only pulls status", () => {
   const harness = loadWebviewSlice();
   harness.posts.length = 0;
 
@@ -2486,7 +2497,7 @@ test("a restore error shows a notice and posts nothing further", () => {
   assert.equal(harness.elements.managerChatNotice.hidden, false);
   assert.match(harness.elements.managerChatNotice.textContent, /Manager error/);
   assert.equal(harness.state.managerChatSession, null);
-  assert.deepEqual(plain(harness.posts), []);
+  assert.deepEqual(plain(harness.posts), [{ type: "managerLoopStatus" }]);
 });
 
 test("Rotate posts the owner-requested reason only when enabled with a session", () => {
@@ -2676,8 +2687,8 @@ test("when stillBoundTo is false the host posts ok:false manager_reply_supersede
   assert.equal(eventsPost.payload.session_id, "mls-12345678");
 });
 
-// ── Superseded is silent and reschedules ──────────────────────────────────
-test("a superseded events reply is silent and reschedules polling", () => {
+// ── Superseded clears Running and reschedules ─────────────────────────────
+test("a superseded events reply clears Running, posts nothing at once and reschedules polling", () => {
   const harness = loadWebviewSlice();
   harness.state.managerChatSession = "mls-" + "a".repeat(32);
   harness.state.managerChatRunning = true;
@@ -2685,8 +2696,9 @@ test("a superseded events reply is silent and reschedules polling", () => {
 
   harness.api.renderManagerChatEventsResponse({ ok: false, error: "manager_reply_superseded", session_id: "mls-" + "a".repeat(32) });
 
-  assert.equal(harness.posts.length, 0, "no notice or status post");
+  assert.equal(harness.posts.length, 0, "no status post before the backoff");
   assert.ok(harness.timers.length > 0, "poll rescheduled");
+  assert.equal(harness.state.managerChatRunning, false, "the panel no longer claims a live turn it cannot see");
 });
 
 // ── Poll error backoff ────────────────────────────────────────────────────
@@ -3624,4 +3636,439 @@ test("the narrow sidebar sizes the reasoning select to its content instead of a 
   assert.match(rule[1], /field-sizing:\s*content;/);
   assert.match(rule[1], /flex:\s*0 0 auto;/);
   assert.doesNotMatch(rule[1], /4\.5rem/);
+});
+
+// ── Webview state machine: reply binding, echoes, empty turns, stale state ──
+// Every test below drives the handlers the inbound message switch calls
+// (renderManagerChatStatus / EventsResponse / Action) with host-shaped payloads.
+
+const LIVE_SESSION = "mls-" + "7".repeat(32);
+
+function liveStatus(harness, running, session = LIVE_SESSION) {
+  harness.api.renderManagerChatStatus({
+    ok: true,
+    running,
+    session: { session_id: session, backend_id: "codex_cli", model: "gpt-x" },
+    send_queue: [],
+  });
+}
+
+const postsOf = (harness, type) => harness.posts.filter((post) => post.type === type);
+// The fake keeps fired timers in its list; the live one is the id the state holds.
+const liveTimer = (harness) => harness.timers.find((timer) => timer.id === harness.state.managerChatPollTimer);
+
+test("a nested continue reply binds its session without marking Running, and every accepted reply pulls status once", () => {
+  const harness = loadWebviewSlice();
+  harness.api.renderManagerChatAction("restore", { ok: true, session: { session_id: LIVE_SESSION, state: "idle" } });
+  assert.equal(harness.state.managerChatSession, LIVE_SESSION, "the nested continue_session shape binds");
+  assert.equal(harness.state.managerChatRunning, false, "an idle continue is not a running turn");
+  assert.equal(postsOf(harness, "managerLoopStatus").length, 1);
+  assert.deepEqual(plain(postsOf(harness, "managerLoopEvents")), [{ type: "managerLoopEvents", sessionId: LIVE_SESSION, afterSeq: 0 }]);
+
+  const next = "mls-" + "8".repeat(32);
+  harness.posts.length = 0;
+  harness.api.renderManagerChatAction("new", { ok: true, session_id: next });
+  assert.equal(harness.state.managerChatSession, next);
+  assert.equal(harness.state.managerChatRunning, false, "a reply that says nothing about running starts no turn");
+  assert.equal(postsOf(harness, "managerLoopStatus").length, 1);
+
+  harness.posts.length = 0;
+  harness.api.renderManagerChatAction("send", { ok: true, session: { session_id: next, state: "running" } });
+  assert.equal(harness.state.managerChatRunning, true, "running follows the reply's own state");
+  assert.equal(postsOf(harness, "managerLoopStatus").length, 1);
+
+  harness.posts.length = 0;
+  harness.api.renderManagerChatAction("stop", { ok: true, stopped: true });
+  assert.equal(postsOf(harness, "managerLoopStatus").length, 1, "a stop reply pulls status too");
+});
+
+test("a refused second send leaves the running first turn running", () => {
+  const harness = loadWebviewSlice();
+  liveStatus(harness, true);
+  submitManagerChat(harness, "second");
+
+  harness.api.renderManagerChatAction("send", { ok: false, error: "manager_send_queue_full" });
+
+  assert.equal(harness.state.managerChatRunning, true, "turn 1 is still running");
+  assert.match(harness.elements.managerChatStatusLabel.textContent, /^Running/);
+  assert.equal(harness.elements.managerChatInput.value, "second", "the refused words still come back");
+});
+
+test("a send carries its echo's clientId, and echoes dropped by queue_dropped or Stop render as not delivered", () => {
+  const harness = loadWebviewSlice();
+  liveStatus(harness, true);
+  submitManagerChat(harness, "first");
+  submitManagerChat(harness, "second");
+  submitManagerChat(harness, "third");
+  const ids = harness.state.managerChatPendingSends.map((entry) => entry.clientId);
+  assert.equal(new Set(ids).size, 3);
+  assert.deepEqual(plain(postsOf(harness, "managerLoopSend").map((post) => post.clientId)), plain(ids), "each send names its echo");
+
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    session_id: LIVE_SESSION,
+    last_seq: 2,
+    events: [
+      { seq: 1, turn: 1, type: "user_message", payload: { text: "first", client_id: ids[0] } },
+      { seq: 2, turn: 1, type: "queue_dropped", payload: { dropped_queued: 1 } },
+    ],
+  });
+  const echo = (id) => harness.state.managerChatEvents.find((event) => event.local && event.type === "user_message" && event.payload.client_id === id);
+  assert.equal(echo(ids[0]), undefined, "the answered echo is replaced by its turn");
+  assert.equal(echo(ids[1]).local, "dropped", "the dropped send settles");
+  assert.equal(echo(ids[1]).payload.pending, false);
+  assert.equal(echo(ids[2]).local, "pending", "only the reported count settles");
+  const undelivered = flattenNodes(harness.elements.managerChatTranscript, [])
+    .filter((node) => /\bmanager-chat-bubble\b/.test(String(node.className || "")) && /\bis-undelivered\b/.test(node.className));
+  assert.equal(undelivered.length, 1, "the dropped echo renders distinctly");
+  assert.ok(flattenNodes(undelivered[0], []).some((node) => node.textContent === "not delivered"));
+  assert.ok(flattenNodes(undelivered[0], []).some((node) => node.textContent === "second"));
+
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    session_id: LIVE_SESSION,
+    last_seq: 3,
+    events: [{ seq: 3, turn: 1, type: "turn_stopped", at: new Date(Date.now() + 60000).toISOString(), payload: {} }],
+  });
+  assert.equal(echo(ids[2]).local, "dropped", "a Stop settles what was queued before it");
+  assert.equal(harness.state.managerChatEvents.filter((event) => event.local === "pending").length, 0, "nothing stays sending forever");
+});
+
+test("a zero-usage turn_end with no output renders as an empty, failed turn", () => {
+  const harness = loadWebviewSlice();
+  liveStatus(harness, true);
+  harness.state.managerChatThinkingSince = Date.now() - 5000;
+  const zero = { input: 0, cache_read: 0, cache_write: 0, output: 0 };
+
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    session_id: LIVE_SESSION,
+    last_seq: 2,
+    events: [
+      { seq: 1, turn: 1, type: "user_message", payload: { text: "go" } },
+      { seq: 2, turn: 1, type: "turn_end", payload: { usage: zero } },
+    ],
+  });
+
+  const footers = () => harness.elements.managerChatTranscript.children.filter((row) => /\bmc-turn-end\b/.test(String(row.className || "")));
+  const [empty] = footers();
+  assert.ok(empty, "the turn_end row renders");
+  assert.match(empty.className, /\bis-empty-turn\b/);
+  assert.match(flattenNodes(empty, []).map((node) => String(node.textContent || "")).join(""), /empty turn: no output/);
+  assert.equal(harness.state.managerChatLastThoughtMs, 0, "an empty turn is never reported as a finished thought");
+  assert.doesNotMatch(String(harness.elements.managerChatNotice.textContent || ""), /ended with no output/, "a page replayed from cursor 0 raises no live notice");
+
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    session_id: LIVE_SESSION,
+    last_seq: 4,
+    events: [
+      { seq: 3, turn: 2, type: "assistant_text", payload: { text: "answer" } },
+      { seq: 4, turn: 2, type: "turn_end", payload: { usage: zero } },
+    ],
+  });
+  const normal = footers().at(-1);
+  assert.doesNotMatch(normal.className, /\bis-empty-turn\b/, "a turn that produced output keeps a normal footer");
+  assert.doesNotMatch(flattenNodes(normal, []).map((node) => String(node.textContent || "")).join(""), /empty turn/);
+});
+
+test("status and events errors and a superseded reply clear Running and show a disconnected state that backs off", () => {
+  const failures = {
+    "status error": (h) => h.api.renderManagerChatStatus({ ok: false, error: "timeout" }),
+    "events error": (h) => h.api.renderManagerChatEventsResponse({ ok: false, error: "timeout", session_id: LIVE_SESSION }),
+    "superseded status": (h) => h.api.renderManagerChatStatus({ ok: false, error: "manager_reply_superseded" }),
+    "superseded events": (h) => h.api.renderManagerChatEventsResponse({ ok: false, error: "manager_reply_superseded", session_id: LIVE_SESSION }),
+  };
+  for (const [label, fail] of Object.entries(failures)) {
+    const harness = loadWebviewSlice();
+    liveStatus(harness, true);
+    fail(harness);
+    assert.equal(harness.state.managerChatRunning, false, `${label}: an unseen turn is not shown as running`);
+    assert.equal(harness.state.managerChatThinkingSince, 0, label);
+    assert.equal(harness.elements.managerChatStatusLabel.textContent, "Disconnected · retrying", label);
+    assert.equal(harness.elements.managerChatNotice.hidden, false, label);
+    assert.match(harness.elements.managerChatNotice.textContent, /^Disconnected .* Retrying in \d+s\.$/, label);
+    const first = liveTimer(harness).delay;
+    fail(harness);
+    assert.equal(liveTimer(harness).delay, first * 2, `${label}: each consecutive failure doubles the retry`);
+
+    harness.posts.length = 0;
+    liveTimer(harness).fn();
+    assert.equal(postsOf(harness, "managerLoopStatus").length, 1, `${label}: the retry pulls status`);
+    liveStatus(harness, true);
+    assert.match(harness.elements.managerChatStatusLabel.textContent, /^Running/, `${label}: a good status ends the stale state`);
+    assert.equal(harness.elements.managerChatNotice.hidden, true, label);
+  }
+});
+
+test("a repeating session_not_found backs off instead of looping status and events", () => {
+  const harness = loadWebviewSlice();
+  liveStatus(harness, false);
+  const notFound = () => harness.api.renderManagerChatEventsResponse({ ok: false, error: "session_not_found", session_id: LIVE_SESSION });
+
+  harness.posts.length = 0;
+  notFound();
+  assert.equal(postsOf(harness, "managerLoopStatus").length, 1, "the first miss pulls status at once");
+  liveStatus(harness, false);
+  harness.posts.length = 0;
+  notFound();
+  assert.equal(harness.posts.length, 0, "a repeated miss waits before pulling status");
+  const wait = liveTimer(harness).delay;
+  assert.ok(wait >= 1000, "the wait is real");
+  liveTimer(harness).fn();
+  assert.equal(postsOf(harness, "managerLoopStatus").length, 1, "then pulls status");
+  liveStatus(harness, false);
+  notFound();
+  assert.equal(liveTimer(harness).delay, wait * 2, "and waits longer each time");
+
+  harness.api.renderManagerChatEventsResponse({ ok: true, session_id: LIVE_SESSION, events: [] });
+  harness.posts.length = 0;
+  notFound();
+  assert.equal(postsOf(harness, "managerLoopStatus").length, 1, "a good events reply resets the backoff");
+});
+
+test("an unanswered Stop re-arms after a bounded wait so the owner can stop again", () => {
+  const harness = runningStopHarness();
+  const { elements } = harness;
+  elements.managerChatStop.click();
+  assert.equal(elements.managerChatStop.textContent, "Stopping…");
+  assert.equal(elements.managerChatStop.disabled, true);
+
+  const retryMs = vm.runInContext("MANAGER_CHAT_STOP_RETRY_MS", harness.context);
+  assert.ok(retryMs > 0 && retryMs <= 30000, "the wait is bounded");
+  const retry = harness.timers.find((timer) => timer.id === harness.state.managerChatStopTimer);
+  assert.ok(retry, "the click arms a retry timer");
+  assert.equal(retry.delay, retryMs);
+  retry.fn();
+
+  assert.equal(harness.state.managerChatRunning, true, "the turn is still running");
+  assert.equal(elements.managerChatStop.disabled, false);
+  assert.equal(elements.managerChatStop.textContent, "Stop");
+  elements.managerChatStop.click();
+  assert.equal(harness.stops(), 2, "Stop can be sent again");
+});
+
+test("a session switch resets the highest seen turn so the new session's first turn pulls status", () => {
+  const harness = loadWebviewSlice();
+  liveStatus(harness, false, "mls-" + "a".repeat(32));
+  harness.state.managerChatHighestSeenTurn = 6;
+
+  liveStatus(harness, false, LIVE_SESSION);
+  assert.equal(harness.state.managerChatHighestSeenTurn, 0);
+
+  harness.posts.length = 0;
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    session_id: LIVE_SESSION,
+    events: [{ seq: 1, turn: 1, type: "assistant_text", payload: { text: "callback turn" } }],
+  });
+  assert.equal(postsOf(harness, "managerLoopStatus").length, 1, "the callback-started turn 1 is noticed");
+});
+
+test("the event log merges incrementally and keeps at most MANAGER_CHAT_EVENT_LOG_LIMIT events", () => {
+  const harness = loadWebviewSlice();
+  liveStatus(harness, false);
+  const limit = vm.runInContext("MANAGER_CHAT_EVENT_LOG_LIMIT", harness.context);
+  assert.ok(Number.isInteger(limit) && limit >= 400, "a named bound at least one render window deep");
+  const text = (seq) => ({ seq, turn: 1, type: "assistant_text", payload: { text: `m${seq}` } });
+
+  harness.api.renderManagerChatEventsResponse({ ok: true, session_id: LIVE_SESSION, events: Array.from({ length: limit + 10 }, (_, index) => text(index + 1)) });
+  const log = harness.state.managerChatEvents;
+  assert.equal(log.length, limit);
+  assert.equal(log[0].seq, 11, "the oldest events leave first");
+  assert.equal(harness.state.managerChatLastSeq, limit + 10, "the cursor still covers every event seen");
+
+  harness.api.renderManagerChatEventsResponse({ ok: true, session_id: LIVE_SESSION, events: [text(limit + 11)] });
+  assert.strictEqual(harness.state.managerChatEvents, log, "a poll appends in place instead of rebuilding the log");
+  assert.equal(log.length, limit);
+  assert.equal(log.at(-1).seq, limit + 11);
+});
+
+test("a long callback row is cut in its summary and expands to the whole text", () => {
+  const harness = loadWebviewSlice();
+  const long = "callback: T-1 -> review_ready " + "x".repeat(300);
+  const node = harness.api.managerChatEventNode({ seq: 1, turn: 2, type: "callback", payload: { text: long } });
+  const details = flattenNodes(node, []).find((part) => part.tag === "details");
+  assert.ok(details, "a long wake-up is expandable");
+  assert.equal(details.open, false);
+  const summary = details.children[0];
+  assert.equal(summary.tag, "summary");
+  assert.ok(summary.textContent.startsWith("Automatic wake-up: callback: T-1"));
+  assert.ok(summary.textContent.length < long.length);
+  assert.ok(flattenNodes(details, []).some((part) => part.nodeType === 3 && part.textContent === long), "the whole text stays inert text");
+
+  const short = harness.api.managerChatEventNode({ seq: 2, turn: 3, type: "callback", payload: { text: "callback: T-2 -> done" } });
+  assert.ok(!flattenNodes(short, []).some((part) => part.tag === "details"), "a short wake-up stays one line");
+});
+
+// ── Rework: late dropped echoes, refusal status pull, per-tick failure count, stale watchdog, live-only empty notice ──
+
+test("a replayed queue_dropped older than a pending echo never settles that echo", () => {
+  const harness = loadWebviewSlice();
+  liveStatus(harness, true);
+  submitManagerChat(harness, "typed after the drop");
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    session_id: LIVE_SESSION,
+    last_seq: 1,
+    events: [{ seq: 1, turn: 1, type: "queue_dropped", at: new Date(Date.now() - 60000).toISOString(), payload: { dropped_queued: 1 } }],
+  });
+  const rows = harness.state.managerChatEvents.filter((event) => event.type === "user_message" && event.payload.text === "typed after the drop");
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].local, "pending", "an older drop is history, not this send's fate");
+});
+
+test("a session switch restarts the session_not_found backoff with an immediate status pull", () => {
+  const harness = loadWebviewSlice();
+  liveStatus(harness, true);
+  harness.state.managerChatNotFoundStreak = 3;
+  harness.api.renderManagerChatAction("restore", { ok: true, session_id: "mls-" + "b".repeat(32), running: false });
+  assert.equal(harness.state.managerChatNotFoundStreak, 0, "a new session starts with no misses");
+  harness.posts.length = 0;
+  harness.api.renderManagerChatEventsResponse({ ok: false, error: "session_not_found" });
+  assert.deepEqual(plain(postsOf(harness, "managerLoopStatus")), [{ type: "managerLoopStatus" }], "its first miss pulls status at once");
+});
+
+test("a dropped marker settled by an earlier page is replaced by its late user_message on a later page", () => {
+  const harness = loadWebviewSlice();
+  liveStatus(harness, true);
+  submitManagerChat(harness, "late words");
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    session_id: LIVE_SESSION,
+    last_seq: 2,
+    events: [
+      { seq: 1, turn: 1, type: "queue_dropped", payload: { dropped_queued: 1 } },
+      { seq: 2, turn: 1, type: "assistant_text", payload: { text: "still working" } },
+    ],
+  });
+  const rows = () => harness.state.managerChatEvents.filter((event) => event.type === "user_message" && event.payload.text === "late words");
+  assert.equal(rows().length, 1);
+  assert.equal(rows()[0].local, "dropped", "page 1 settles the echo as not delivered");
+
+  // The host forwards no client id yet, so the late turn matches the marker by text.
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    session_id: LIVE_SESSION,
+    last_seq: 3,
+    events: [{ seq: 3, turn: 2, type: "user_message", payload: { text: "late words" } }],
+  });
+  assert.equal(rows().length, 1, "exactly one row for the message");
+  assert.equal(rows()[0].local, undefined, "the server's own turn replaced the marker");
+  assert.equal(harness.state.managerChatEvents.filter((event) => event.local === "dropped").length, 0, "no not-delivered marker remains");
+});
+
+test("a refused send reply pulls status exactly once and leaves running unchanged", () => {
+  const harness = loadWebviewSlice();
+  liveStatus(harness, true);
+  submitManagerChat(harness, "second");
+  harness.posts.length = 0;
+
+  harness.api.renderManagerChatAction("send", { ok: false, error: "manager_send_queue_full" });
+
+  assert.equal(postsOf(harness, "managerLoopStatus").length, 1, "status corrects running, the refusal does not");
+  assert.equal(postsOf(harness, "managerLoopSend").length, 0, "the pull is never a resend");
+  assert.equal(harness.state.managerChatRunning, true);
+});
+
+test("a stale tick whose status and events replies both fail counts one failure and doubles the delay once", () => {
+  const harness = loadWebviewSlice();
+  liveStatus(harness, false);
+  harness.api.renderManagerChatStatus({ ok: false, error: "timeout" });
+  const errors = harness.state.managerChatPollErrors;
+  const before = liveTimer(harness).delay;
+
+  harness.posts.length = 0;
+  liveTimer(harness).fn();
+  assert.equal(postsOf(harness, "managerLoopStatus").length, 1, "the stale tick pulls status");
+  assert.equal(postsOf(harness, "managerLoopEvents").length, 1, "and events");
+  harness.api.renderManagerChatStatus({ ok: false, error: "timeout" });
+  harness.api.renderManagerChatEventsResponse({ ok: false, error: "timeout", session_id: LIVE_SESSION });
+
+  assert.equal(harness.state.managerChatPollErrors, errors + 1, "one tick, one failure");
+  assert.equal(liveTimer(harness).delay, before * 2);
+  assert.match(harness.elements.managerChatNotice.textContent, new RegExp(`Retrying in ${Math.round((before * 2) / 1000)}s\\.$`));
+});
+
+test("a stale tick with no session re-arms the status retry when its reply never arrives", () => {
+  const harness = loadWebviewSlice();
+  harness.api.renderManagerChatStatus({ ok: false, error: "timeout" });
+  assert.ok(!harness.state.managerChatSession);
+  harness.posts.length = 0;
+
+  liveTimer(harness).fn();
+  assert.equal(postsOf(harness, "managerLoopStatus").length, 1);
+  const retry = liveTimer(harness);
+  assert.ok(retry, "the backoff delay re-arms the tick");
+  retry.fn();
+  assert.equal(postsOf(harness, "managerLoopStatus").length, 2, "a second status goes out");
+
+  liveStatus(harness, false, null);
+  harness.posts.length = 0;
+  const last = liveTimer(harness);
+  if (last) last.fn();
+  assert.equal(postsOf(harness, "managerLoopStatus").length, 0, "once connected again the idle chain stops");
+});
+
+test("an events reply replaying an old empty turn from cursor 0 shows no notice", () => {
+  const harness = loadWebviewSlice();
+  liveStatus(harness, false);
+  assert.equal(harness.state.managerChatLastSeq, 0);
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    session_id: LIVE_SESSION,
+    last_seq: 2,
+    events: [
+      { seq: 1, turn: 1, type: "user_message", payload: { text: "go" } },
+      { seq: 2, turn: 1, type: "turn_end", payload: { usage: { input: 0, cache_read: 0, cache_write: 0, output: 0 } } },
+    ],
+  });
+  assert.doesNotMatch(String(harness.elements.managerChatNotice.textContent || ""), /ended with no output/);
+});
+
+test("a live page whose newest turn_end is empty shows the notice once, and only then", () => {
+  const harness = loadWebviewSlice();
+  liveStatus(harness, true);
+  const zero = { input: 0, cache_read: 0, cache_write: 0, output: 0 };
+  const notice = harness.elements.managerChatNotice;
+  const clear = () => { notice.textContent = ""; notice.hidden = true; };
+  const reply = (events, extra = {}) =>
+    harness.api.renderManagerChatEventsResponse({ ok: true, session_id: LIVE_SESSION, last_seq: events.at(-1).seq, events, ...extra });
+
+  reply([{ seq: 1, turn: 1, type: "user_message", payload: { text: "go" } }]);
+  clear();
+  const live = [{ seq: 2, turn: 1, type: "turn_end", payload: { usage: zero } }];
+  reply(live);
+  assert.match(notice.textContent, /^Manager turn 1 ended with no output\.$/);
+  clear();
+  reply(live);
+  assert.equal(notice.textContent, "", "a re-delivered page does not repeat it");
+
+  reply([
+    { seq: 3, turn: 2, type: "user_message", payload: { text: "again" } },
+    { seq: 4, turn: 2, type: "turn_end", payload: { usage: zero } },
+    { seq: 5, turn: 3, type: "assistant_text", payload: { text: "answer" } },
+    { seq: 6, turn: 3, type: "turn_end", payload: { usage: { input: 3, cache_read: 0, cache_write: 0, output: 5 } } },
+  ]);
+  assert.equal(notice.textContent, "", "an empty turn superseded by a newer turn_end in the page is not news");
+});
+
+test("an empty turn superseded by a newer turn in the same page keeps the finished thought's duration", () => {
+  const harness = loadWebviewSlice();
+  liveStatus(harness, true);
+  harness.state.managerChatThinkingSince = Date.now() - 5000;
+  const zero = { input: 0, cache_read: 0, cache_write: 0, output: 0 };
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    session_id: LIVE_SESSION,
+    last_seq: 5,
+    events: [
+      { seq: 1, turn: 1, type: "user_message", payload: { text: "go" } },
+      { seq: 2, turn: 1, type: "turn_end", payload: { usage: zero } },
+      { seq: 3, turn: 2, type: "user_message", payload: { text: "again" } },
+      { seq: 4, turn: 2, type: "assistant_text", payload: { text: "answer" } },
+      { seq: 5, turn: 2, type: "turn_end", payload: { usage: { input: 3, cache_read: 0, cache_write: 0, output: 5 } } },
+    ],
+  });
+  assert.ok(harness.state.managerChatLastThoughtMs >= 4000, "the newest turn produced output, so its thought is reported");
 });

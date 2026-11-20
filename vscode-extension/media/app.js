@@ -107,6 +107,15 @@ const state = {
   managerChatPollErrors: 0,
   managerChatPollNoticeFromError: false,
   managerChatHighestSeenTurn: 0,
+  // Non-empty while status/events replies fail: the error the header's Disconnected state names.
+  managerChatStale: "",
+  // True while Running is only the submit's optimistic guess, not something a reply or status said.
+  managerChatRunningOptimistic: false,
+  managerChatStopping: false,
+  managerChatStopTimer: null,
+  managerChatNotFoundStreak: 0,
+  // Highest turn the capped event log (MANAGER_CHAT_EVENT_LOG_LIMIT) dropped events of.
+  managerChatTrimmedTurn: 0,
   managerChatQueuePayload: null,
   managerChatDraft: String(persisted.managerChatDraft || ""),
 };
@@ -7970,10 +7979,15 @@ function applyManagerChatSessionUi() {
     const selected = String(elements.managerChatSessionSelect && elements.managerChatSessionSelect.value || "");
     elements.managerChatDeleteSession.disabled = state.managerChatRunning || (!hasSession && !selected);
   }
+  const stale = Boolean(state.managerChatStale);
   if (elements.managerChatStatus && elements.managerChatStatus.classList) {
     elements.managerChatStatus.classList.toggle("is-live", state.managerChatRunning);
+    elements.managerChatStatus.classList.toggle("is-stale", stale);
   }
-  elements.managerChatStatusLabel.textContent = state.managerChatRunning ? "Running" + managerChatLiveActivity() : hasSession ? "Idle" : "No session";
+  // A panel that cannot reach the server says so instead of showing a last-known Idle or Running.
+  elements.managerChatStatusLabel.textContent = stale
+    ? "Disconnected · retrying"
+    : state.managerChatRunning ? "Running" + managerChatLiveActivity() : hasSession ? "Idle" : "No session";
   elements.managerChatSessionLine.hidden = false;
   const activeName = String(state.managerChatTitle || state.managerChatSession || "");
   elements.managerChatSessionId.textContent = hasSession ? activeName : "";
@@ -7981,8 +7995,8 @@ function applyManagerChatSessionUi() {
     ? (state.managerChatBackend || "") + " / " + (state.managerChatModel || "")
     : "";
   elements.managerChatSummary.textContent = hasSession
-    ? (state.managerChatRunning ? "Running" : "Active") + " · " + activeName
-    : "No session";
+    ? (stale ? "Disconnected" : state.managerChatRunning ? "Running" : "Active") + " · " + activeName
+    : stale ? "Disconnected" : "No session";
   applyManagerChatComposerState();
   managerConsoleUpdateStrip();
 }
@@ -7999,27 +8013,103 @@ function requestManagerChatEvents() {
   vscode.postMessage({ type: "managerLoopEvents", sessionId: state.managerChatSession, afterSeq: state.managerChatLastSeq });
 }
 
+// Poll backoff ceiling, the Stop button's re-arm wait, and the session_not_found backoff base.
+const MANAGER_CHAT_MAX_BACKOFF_MS = 30000;
+const MANAGER_CHAT_STOP_RETRY_MS = 10000;
+const MANAGER_CHAT_NOT_FOUND_BASE_MS = 1000;
+
+// The next poll's delay: a running turn polls fast, an idle one slower, and each consecutive failed reply doubles it.
+function managerChatPollDelay() {
+  const base = state.managerChatRunning ? 400 : MANAGER_CHAT_POLL_MS;
+  return Math.min(base * Math.pow(2, state.managerChatPollErrors || 0), MANAGER_CHAT_MAX_BACKOFF_MS);
+}
+
 function scheduleManagerChatPoll(overrideMs) {
   stopManagerChatPolling();
-  const base = state.managerChatRunning ? 400 : MANAGER_CHAT_POLL_MS;
-  const errors = state.managerChatPollErrors || 0;
-  const delay = overrideMs || Math.min(base * Math.pow(2, errors), 30000);
+  const delay = overrideMs || managerChatPollDelay();
   state.managerChatPollTimer = window.setTimeout(() => {
     state.managerChatPollTimer = null;
+    // Arms the one-failure-per-tick count (managerChatConnectionLost).
+    state.managerChatTickFailureCounted = false;
+    // Callback turns start and rotate the session server-side with nothing
+    // posted to the panel, so every ~6s of polling also pulls status (one
+    // read). Events still go out: a lost status reply never stops the chain.
+    // A disconnected panel retries status on every tick, session or not.
+    state.managerChatStatusAgeMs = (state.managerChatStatusAgeMs || 0) + delay;
+    if (state.managerChatStale || (state.managerChatSession && state.managerChatStatusAgeMs >= 6000)) {
+      state.managerChatStatusAgeMs = 0;
+      vscode.postMessage({ type: "managerLoopStatus" });
+    }
     if (state.managerChatSession) {
-      // Callback turns start and rotate the session server-side with nothing
-      // posted to the panel, so every ~6s of polling also pulls status (one
-      // read). Events still go out: a lost status reply never stops the chain.
-      state.managerChatStatusAgeMs = (state.managerChatStatusAgeMs || 0) + delay;
-      if (state.managerChatStatusAgeMs >= 6000) {
-        state.managerChatStatusAgeMs = 0;
-        vscode.postMessage({ type: "managerLoopStatus" });
-      }
       requestManagerChatEvents();
       // Watchdog: a reply re-arms the normal cadence (replacing this timer); if none arrives this re-requests in 15 s.
       scheduleManagerChatPoll(15000);
+    } else if (state.managerChatStale) {
+      // A disconnected panel with no session has no events reply to re-arm it: the backoff delay
+      // re-arms the status retry, and a good status (ending the stale state) lets the chain stop.
+      scheduleManagerChatPoll();
     }
   }, delay);
+}
+
+// One error path for a failed status or events reply and for manager_reply_superseded (an answer to
+// a client this webview is no longer bound to): the panel cannot see the server, so it does not claim
+// a live turn. Running and the Thinking timer clear, the header reads Disconnected, and the poll
+// retries with backoff until a successful reply (managerChatConnectionRestored) ends the stale state.
+function managerChatConnectionLost(error) {
+  // A stale tick posts status and events at once; both failing is one failed attempt, not two, so
+  // the backoff doubles once per tick. Outside a tick (flag never armed) every failure counts.
+  if (state.managerChatTickFailureCounted !== true) {
+    state.managerChatPollErrors = (state.managerChatPollErrors || 0) + 1;
+    if (state.managerChatTickFailureCounted === false) state.managerChatTickFailureCounted = true;
+  }
+  state.managerChatStale = String(error || "unavailable");
+  state.managerChatRunning = false;
+  state.managerChatRunningOptimistic = false;
+  state.managerChatThinkingSince = 0;
+  state.managerChatPollNoticeFromError = true;
+  scheduleManagerChatPoll();
+  const seconds = Math.max(1, Math.round(managerChatPollDelay() / 1000));
+  showManagerChatNotice(`Disconnected (${state.managerChatStale}). Retrying in ${seconds}s.`);
+  applyManagerChatSessionUi();
+  managerConsoleScheduleRender();
+}
+
+function managerChatConnectionRestored() {
+  state.managerChatPollErrors = 0;
+  state.managerChatStale = "";
+  if (!state.managerChatPollNoticeFromError) return;
+  state.managerChatPollNoticeFromError = false;
+  showManagerChatNotice(null);
+  applyManagerChatSessionUi();
+}
+
+// session_not_found -> status -> events can repeat when status still names the gone session: the
+// first miss pulls status at once, each further consecutive miss waits twice as long (capped).
+function managerChatSessionNotFound() {
+  stopManagerChatPolling();
+  state.managerChatNotFoundStreak = (state.managerChatNotFoundStreak || 0) + 1;
+  if (state.managerChatNotFoundStreak === 1) {
+    vscode.postMessage({ type: "managerLoopStatus" });
+    return;
+  }
+  const delay = Math.min(MANAGER_CHAT_NOT_FOUND_BASE_MS * Math.pow(2, state.managerChatNotFoundStreak - 2), MANAGER_CHAT_MAX_BACKOFF_MS);
+  state.managerChatPollTimer = window.setTimeout(() => {
+    state.managerChatPollTimer = null;
+    vscode.postMessage({ type: "managerLoopStatus" });
+  }, delay);
+}
+
+// An armed Stop that no terminal event or reply answers re-enables the button after a bounded wait,
+// so the owner can stop again instead of facing "Stopping…" for the rest of the turn.
+function managerChatArmStopRetry() {
+  if (state.managerChatStopTimer) window.clearTimeout(state.managerChatStopTimer);
+  state.managerChatStopTimer = window.setTimeout(() => {
+    state.managerChatStopTimer = null;
+    if (!state.managerChatStopping) return;
+    state.managerChatStopping = false;
+    applyManagerChatSessionUi();
+  }, MANAGER_CHAT_STOP_RETRY_MS);
 }
 
 function managerChatQueueText(item) {
@@ -8158,23 +8248,10 @@ function renderManagerChatProviderBanner(payload) {
 function renderManagerChatStatus(payload) {
   if (!payload || payload.ok === false) {
     const error = payload && payload.error ? String(payload.error) : "";
-    if (error === "manager_reply_superseded") {
-      // Silent: the webview is no longer bound to the client that answered;
-      // reschedule so polling survives the binding change.
-      scheduleManagerChatPoll();
-      return;
-    }
-    state.managerChatPollErrors = (state.managerChatPollErrors || 0) + 1;
-    state.managerChatPollNoticeFromError = true;
-    showManagerChatNotice(error ? `Manager error: ${error}` : "Manager status unavailable");
-    scheduleManagerChatPoll();
+    managerChatConnectionLost(error || "status unavailable");
     return;
   }
-  state.managerChatPollErrors = 0;
-  if (state.managerChatPollNoticeFromError) {
-    state.managerChatPollNoticeFromError = false;
-    showManagerChatNotice(null);
-  }
+  managerChatConnectionRestored();
   const session = payload.session && typeof payload.session === "object" ? payload.session : null;
   const nextSessionId = session ? String(session.session_id || "") || null : null;
   const sessionChanged = nextSessionId !== state.managerChatSession;
@@ -8183,6 +8260,7 @@ function renderManagerChatStatus(payload) {
   state.managerChatModel = session ? String(session.model || "") : null;
   state.managerChatTitle = session ? String(session.title || "").trim() : "";
   state.managerChatRunning = Boolean(payload.running);
+  state.managerChatRunningOptimistic = false;
   state.managerChatStatusAgeMs = 0;
   // An idle server owns no Thinking timer; a later turn starts a fresh one.
   if (!state.managerChatRunning) state.managerChatThinkingSince = 0;
@@ -8193,29 +8271,25 @@ function renderManagerChatStatus(payload) {
   renderManagerChatProviderBanner(payload);
   if (!state.managerChatSession) {
     stopManagerChatPolling();
-    state.managerChatEvents = [];
-    managerConsoleReset();
-    state.managerChatLastSeq = 0;
-    renderManagerChatEvents();
+    managerChatAdoptSession(null);
     return;
   }
-  if (sessionChanged) {
-    state.managerChatEvents = managerChatPendingEchoes(nextSessionId);
-    managerConsoleReset();
-    state.managerChatLastSeq = 0;
-    renderManagerChatEvents();
-  }
+  if (sessionChanged) managerChatAdoptSession(nextSessionId);
   requestManagerChatEvents();
   scheduleManagerChatPoll();
+}
+
+function managerChatNewClientId() {
+  state.managerChatLocalEchoCount = (state.managerChatLocalEchoCount || 0) + 1;
+  return `local-${Date.now().toString(36)}-${state.managerChatLocalEchoCount}`;
 }
 
 // NF-2026-01977: a submitted message renders at once as a local user_message
 // marked pending (seq 0, so the poll cursor never moves for it). The polled
 // turn replaces it -- by client id when the backend echoes one, otherwise by
-// the exact text of the oldest pending echo -- and a refused send marks it failed.
-function managerChatLocalEcho(text, images) {
-  state.managerChatLocalEchoCount = (state.managerChatLocalEchoCount || 0) + 1;
-  const clientId = `local-${Date.now().toString(36)}-${state.managerChatLocalEchoCount}`;
+// the exact text of the oldest pending echo -- a refused send marks it failed,
+// and a send the server dropped (queue_dropped, Stop) settles as not delivered.
+function managerChatLocalEcho(text, images, clientId = managerChatNewClientId()) {
   const payload = { text, client_id: clientId, pending: true };
   if (images > 0) payload.images = images;
   // The session the echo was typed in; "" when this send is creating one.
@@ -8236,19 +8310,102 @@ function managerChatPendingEchoes(sessionId) {
   );
 }
 
+// Binds the panel to `sessionId` with a fresh log: only that session's pending echoes carry over,
+// the cursor restarts at 0 (which fetches the log again) and every per-session marker resets with it.
+function managerChatAdoptSession(sessionId) {
+  state.managerChatSession = sessionId || null;
+  state.managerChatEvents = sessionId ? managerChatPendingEchoes(sessionId) : [];
+  state.managerChatLastSeq = 0;
+  state.managerChatHighestSeenTurn = 0;
+  state.managerChatTrimmedTurn = 0;
+  state.managerChatNotFoundStreak = 0;
+  managerConsoleReset();
+  renderManagerChatEvents();
+}
+
+// Whether a polled user_message answers `echo`: by client id when the backend echoes one, else by exact text.
+function managerChatEchoAnswers(echo, payload) {
+  return payload.client_id ? echo.payload.client_id === payload.client_id : echo.payload.text === payload.text;
+}
+
+function managerChatDroppedEcho(echo) {
+  return Object.assign({}, echo, { local: "dropped", payload: Object.assign({}, echo.payload, { pending: false, dropped: true }) });
+}
+
+// Bounds the in-memory log to MANAGER_CHAT_EVENT_LOG_LIMIT: the oldest events leave, and the highest
+// turn they touched is kept so no footer judges a turn whose first events are gone.
+function managerChatTrimEvents(events) {
+  const excess = events.length - MANAGER_CHAT_EVENT_LOG_LIMIT;
+  if (excess <= 0) return;
+  for (const event of events.splice(0, excess)) {
+    if (event && Number.isInteger(event.turn)) state.managerChatTrimmedTurn = Math.max(numberValue(state.managerChatTrimmedTurn), event.turn);
+  }
+}
+
+// Incremental by seq: local rows (echoes, their notes) only ever follow the last polled event, so the
+// merge splices off that tail and appends the new page; the settled log before it is never copied.
 function managerChatMergeEvents(incoming) {
-  let pending = managerChatPendingEchoes(state.managerChatSession);
+  const events = asArray(state.managerChatEvents);
+  const session = state.managerChatSession || "";
+  let split = events.length;
+  while (split > 0 && events[split - 1] && events[split - 1].local) split -= 1;
+  const kept = [];
+  let pending = [];
+  for (const event of events.splice(split)) {
+    if (event.local !== "pending") kept.push(event);
+    else if (!event.session || event.session === session) pending.push(event);
+  }
   for (const event of incoming) {
-    if (!event || event.type !== "user_message" || pending.length === 0) continue;
+    if (!event) continue;
     const payload = event.payload && typeof event.payload === "object" ? event.payload : {};
-    const index = payload.client_id
-      ? pending.findIndex((echo) => echo.payload.client_id === payload.client_id)
-      : pending.findIndex((echo) => echo.payload.text === payload.text);
-    if (index !== -1) pending = pending.slice(0, index).concat(pending.slice(index + 1));
+    if (event.type === "user_message") {
+      const index = pending.findIndex((echo) => managerChatEchoAnswers(echo, payload));
+      if (index !== -1) {
+        pending.splice(index, 1);
+        continue;
+      }
+      // A send settled as dropped that the server ran after all: its own turn replaces the newest
+      // marker it answers, whether that marker is still in the local tail or an earlier page already
+      // settled it into the log (indices below split). Exactly one row goes.
+      const isLate = (row) => Boolean(row) && row.local === "dropped" && managerChatEchoAnswers(row, payload);
+      const late = kept.findLastIndex(isLate);
+      if (late !== -1) kept.splice(late, 1);
+      else {
+        const settled = events.findLastIndex(isLate);
+        if (settled !== -1) events.splice(settled, 1);
+      }
+    } else if (event.type === "queue_dropped") {
+      // Only echoes typed before the drop can be what it dropped: a history replay from cursor 0
+      // never settles a send typed after it.
+      const droppedAt = managerChatEventTime(event);
+      const eligible = pending.filter((echo) => !droppedAt || managerChatEventTime(echo) <= droppedAt);
+      const dropped = eligible.slice(0, managerConsoleDroppedCount(payload));
+      pending = pending.filter((echo) => !dropped.includes(echo));
+      kept.push(...dropped.map(managerChatDroppedEcho));
+    } else if (event.type === "turn_stopped") {
+      // A Stop drops what was queued before it; an echo typed after the stop still waits for its turn.
+      const stoppedAt = managerChatEventTime(event);
+      const dropped = pending.filter((echo) => !stoppedAt || managerChatEventTime(echo) <= stoppedAt);
+      pending = pending.filter((echo) => !dropped.includes(echo));
+      kept.push(...dropped.map(managerChatDroppedEcho));
+    }
   }
   // Still-unanswered echoes stay last: they are the newest thing the owner typed.
-  const settled = asArray(state.managerChatEvents).filter((event) => !(event && event.local === "pending"));
-  return settled.concat(incoming, pending);
+  events.push(...kept, ...incoming, ...pending);
+  managerChatTrimEvents(events);
+  return events;
+}
+
+// The newest turn_end in `events` whose turn ended empty (managerConsoleTurnIsEmpty), or null.
+function managerChatEmptyTurnEnd(events) {
+  const ends = events.filter((event) => event && event.type === "turn_end");
+  if (ends.length === 0) return null;
+  const index = managerConsoleBuildIndex(asArray(state.managerChatEvents));
+  const trimmed = numberValue(state.managerChatTrimmedTurn);
+  for (let at = ends.length - 1; at >= 0; at -= 1) {
+    if (managerConsoleTurnIsEmpty(ends[at], index, trimmed)) return ends[at];
+  }
+  return null;
 }
 
 function managerChatFailLocalEcho(clientId, error) {
@@ -8293,39 +8450,27 @@ function renderManagerChatEventsResponse(payload) {
   if (payload && payload.session_id && payload.session_id !== state.managerChatSession) return;
   if (!payload || payload.ok === false) {
     const error = payload && payload.error ? String(payload.error) : "";
-    if (error === "manager_reply_superseded") {
-      scheduleManagerChatPoll();
-      return;
-    }
     if (error === "session_not_found") {
-      stopManagerChatPolling();
-      vscode.postMessage({ type: "managerLoopStatus" });
+      managerChatSessionNotFound();
       return;
     }
-    state.managerChatPollErrors = (state.managerChatPollErrors || 0) + 1;
-    state.managerChatPollNoticeFromError = true;
-    showManagerChatNotice(error ? `Manager error: ${error}` : "Manager events unavailable");
-    scheduleManagerChatPoll();
+    managerChatConnectionLost(error || "events unavailable");
     return;
   }
-  state.managerChatPollErrors = 0;
-  if (state.managerChatPollNoticeFromError) {
-    state.managerChatPollNoticeFromError = false;
-    showManagerChatNotice(null);
-  }
+  state.managerChatNotFoundStreak = 0;
+  managerChatConnectionRestored();
   // Backend cursor went backwards (e.g. a rotation): reset and re-request.
   const backendLastSeq = numberValue(payload.last_seq);
   if (backendLastSeq > 0 && backendLastSeq < state.managerChatLastSeq) {
-    state.managerChatEvents = managerChatPendingEchoes(state.managerChatSession);
-    managerConsoleReset();
-    state.managerChatLastSeq = 0;
-    renderManagerChatEvents();
+    managerChatAdoptSession(state.managerChatSession);
     requestManagerChatEvents();
     return;
   }
   // Two events requests can be in flight with the same after_seq (the status
   // reply and the poll timer); keep only events newer than the last one seen.
-  const events = asArray(payload.events).filter((event) => numberValue(event.seq) > state.managerChatLastSeq);
+  // The cursor before this page: 0 means history is being replayed (adopt, reload, cursor reset).
+  const priorSeq = state.managerChatLastSeq;
+  const events = asArray(payload.events).filter((event) => numberValue(event.seq) > priorSeq);
   if (events.length > 0) {
     state.managerChatEvents = managerChatMergeEvents(managerChatWithThinkingNotes(events));
     state.managerChatLastSeq = events.reduce((max, event) => Math.max(max, numberValue(event.seq)), state.managerChatLastSeq);
@@ -8333,10 +8478,19 @@ function renderManagerChatEventsResponse(payload) {
     // Failed turns carry `error` with no `turn_end`; a rotation ends the
     // session with `session_close`; a stopped turn carries `turn_stopped`.
     // Any of them stops the Thinking timer.
-    const terminal = events.some((event) => event && (event.type === "turn_end" || event.type === "error" || event.type === "session_close" || event.type === "turn_stopped"));
+    const terminal = events.some((event) => event && MANAGER_CONSOLE_TERMINAL_TYPES.has(event.type));
+    // A turn that ended with no output and no output tokens failed: it is never reported as a finished thought.
+    // An empty turn that a newer turn_end in the same page superseded decides nothing.
+    const emptyTurn = managerChatEmptyTurnEnd(events);
+    const newestEnd = events.filter((event) => event && event.type === "turn_end").at(-1);
+    const latestEmpty = Boolean(emptyTurn) && emptyTurn === newestEnd;
     if (terminal && state.managerChatThinkingSince) {
-      state.managerChatLastThoughtMs = Date.now() - state.managerChatThinkingSince;
+      state.managerChatLastThoughtMs = latestEmpty ? 0 : Date.now() - state.managerChatThinkingSince;
       state.managerChatThinkingSince = 0;
+    }
+    // The notice is live news only: never for replayed history or a page with more behind it.
+    if (latestEmpty && priorSeq > 0 && !payload.has_more) {
+      showManagerChatNotice(`Manager turn ${emptyTurn.turn} ended with no output.`);
     }
     // A finished turn still needs one status pull: running and send_queue
     // are authoritative only on status, and nothing else refreshes them
@@ -8373,7 +8527,50 @@ function renderManagerChatEventsResponse(payload) {
   }
 }
 
+// Status is the authority on running and the send queue, so every action reply pulls it exactly once,
+// a refusal included: the refusal itself never changes running, the status reply corrects it. The
+// pull is never a resend, and it goes out first so the reply's own events request, if any, is the
+// last thing posted.
 function renderManagerChatAction(action, payload) {
+  vscode.postMessage({ type: "managerLoopStatus" });
+  managerChatApplyActionReply(action, payload);
+}
+
+const MANAGER_CHAT_SESSION_ID_RE = /^mls-[0-9a-f]{32}$/i;
+
+// What an action reply itself says about running: a boolean `running`, else a `state` string
+// ("running" is the only live one), flat or on the nested session. null when it says nothing.
+function managerChatReplyRunning(sources) {
+  for (const source of sources) {
+    if (!source) continue;
+    if (typeof source.running === "boolean") return source.running;
+    if (typeof source.state === "string" && source.state) return source.state.toLowerCase() === "running";
+  }
+  return null;
+}
+
+// An action reply names its session flat ({ ok, session_id, running }) or nested
+// ({ ok, session: { session_id, state } }, the continue_session shape). Either binds the panel to it;
+// running follows only what the reply says, never the mere fact that an action was answered.
+function managerChatBindReply(payload) {
+  if (!payload || typeof payload !== "object") return false;
+  const nested = payload.session && typeof payload.session === "object" && !Array.isArray(payload.session) ? payload.session : null;
+  const sessionId = String(payload.session_id || (nested && nested.session_id) || "");
+  if (!MANAGER_CHAT_SESSION_ID_RE.test(sessionId)) return false;
+  if (state.managerChatSession !== sessionId) managerChatAdoptSession(sessionId);
+  const running = managerChatReplyRunning([payload, nested]);
+  if (running !== null) {
+    state.managerChatRunning = running;
+    state.managerChatRunningOptimistic = false;
+    if (!running) state.managerChatThinkingSince = 0;
+  }
+  applyManagerChatSessionUi();
+  requestManagerChatEvents();
+  scheduleManagerChatPoll();
+  return true;
+}
+
+function managerChatApplyActionReply(action, payload) {
   const pendingEntry = action === "send" ? (state.managerChatPendingSends.length ? state.managerChatPendingSends.shift() : null) : null;
   if (action === "send") renderManagerChatSendQueue();
   const pendingText = pendingEntry ? pendingEntry.text : "";
@@ -8384,8 +8581,13 @@ function renderManagerChatAction(action, payload) {
       applyManagerChatSessionUi();
     }
     if (action === "send") {
-      state.managerChatRunning = false;
-      state.managerChatThinkingSince = 0;
+      // A refusal answers this send only. A turn that was already live (a refused second send)
+      // keeps running; only the optimistic Running this very send switched on is withdrawn.
+      if (pendingEntry && pendingEntry.wasRunning === false && state.managerChatRunningOptimistic) {
+        state.managerChatRunning = false;
+        state.managerChatRunningOptimistic = false;
+        state.managerChatThinkingSince = 0;
+      }
       if (pendingEntry) managerChatFailLocalEcho(pendingEntry.clientId, String(payload.error || "unknown"));
       if (pendingText) {
         const existing = elements.managerChatInput && elements.managerChatInput.value;
@@ -8419,32 +8621,10 @@ function renderManagerChatAction(action, payload) {
   }
   if (action === "close") {
     resetManagerChatSession();
-    vscode.postMessage({ type: "managerLoopStatus" });
     return;
   }
-  if (action === "restore") {
-    vscode.postMessage({ type: "managerLoopStatus" });
-    showManagerChatNotice(null);
-    return;
-  }
-  const sessionId = String(payload && payload.session_id || "");
-  if (/^mls-[0-9a-f]{32}$/i.test(sessionId)) {
-    if (state.managerChatSession !== sessionId) {
-      state.managerChatSession = sessionId;
-      state.managerChatEvents = managerChatPendingEchoes(sessionId);
-      managerConsoleReset();
-      state.managerChatLastSeq = 0;
-      renderManagerChatEvents();
-    }
-    state.managerChatRunning = true;
-    applyManagerChatSessionUi();
-    requestManagerChatEvents();
-    scheduleManagerChatPoll();
-  }
-  if (action === "rotate") {
-    vscode.postMessage({ type: "managerLoopStatus" });
-    requestManagerChatEvents();
-  }
+  managerChatBindReply(payload);
+  if (action === "rotate") requestManagerChatEvents();
   showManagerChatNotice(null);
 }
 
@@ -9017,12 +9197,10 @@ function toggleManagerChatSidebar() {
 }
 
 function resetManagerChatSession() {
-  state.managerChatSession = null;
-  state.managerChatEvents = [];
-  managerConsoleReset();
-  state.managerChatLastSeq = 0;
+  // The no-session switch: every per-session marker resets with the log (managerChatAdoptSession).
+  managerChatAdoptSession(null);
   state.managerChatRunning = false;
-  renderManagerChatEvents();
+  state.managerChatRunningOptimistic = false;
   applyManagerChatSessionUi();
 }
 
@@ -9131,8 +9309,10 @@ if (elements.managerChatMenu && typeof elements.managerChatMenu.addEventListener
 if (elements.managerChatStop && typeof elements.managerChatStop.addEventListener === "function") {
   elements.managerChatStop.addEventListener("click", () => {
     if (elements.managerChatStop.disabled || state.managerChatStopping) return;
-    // Show Stopping… at once; the terminal event or the reply clears it.
+    // Show Stopping… at once; the terminal event or the reply clears it, and
+    // if neither comes within MANAGER_CHAT_STOP_RETRY_MS the button re-arms.
     state.managerChatStopping = true;
+    managerChatArmStopRetry();
     applyManagerChatSessionUi();
     vscode.postMessage({ type: "managerLoopStop" });
   });
@@ -9326,19 +9506,23 @@ elements.managerChatComposer.addEventListener("submit", (event) => {
     showManagerChatNotice("Choose a model. This session continues on that model.");
     return;
   }
+  // The echo's client id rides the send, so the polled turn that answers it is matched by id, not text.
+  const clientId = managerChatNewClientId();
   const send = {
     type: "managerLoopSend",
     text,
     backendId,
     model,
     reasoning: String(elements.managerChatReasoningSelect && elements.managerChatReasoningSelect.value || ""),
+    clientId,
   };
   if (images.length) send.images = images;
   vscode.postMessage(send);
   // FIFO: each send pushes; each send reply shifts the oldest. The echo shows
   // the turn at once; the poll that returns it replaces it (NF-2026-01977).
-  const clientId = managerChatLocalEcho(text, images.length);
-  state.managerChatPendingSends.push({ text, images, clientId });
+  managerChatLocalEcho(text, images.length, clientId);
+  // Whether a turn was already live: a refusal of this send restores exactly that.
+  state.managerChatPendingSends.push({ text, images, clientId, wasRunning: Boolean(state.managerChatRunning) });
   renderManagerChatSendQueue();
   state.managerChatSentHistory.push(text);
   if (state.managerChatSentHistory.length > 20) state.managerChatSentHistory.shift();
@@ -9350,6 +9534,7 @@ elements.managerChatComposer.addEventListener("submit", (event) => {
   persistState();
   // Optimistic Running label only. The composer stays enabled so the next
   // send can be queued; status.send_queue is what renders that queue.
+  if (!state.managerChatRunning) state.managerChatRunningOptimistic = true;
   state.managerChatRunning = true;
   applyManagerChatSessionUi();
 });

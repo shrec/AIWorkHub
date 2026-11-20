@@ -46,12 +46,15 @@ function managerChatEventNode(event, chat = null) {
   if (type === "file_change") return managerConsoleFileChangeNode(payload);
   if (type === "timeline_row") return managerConsoleTimelineRowNode(payload);
   if (type === "assistant_text" || type === "user_message") {
-    const bubble = createElement("div", `manager-chat-bubble role-${type === "user_message" ? "user" : "assistant"}`);
+    // A local echo says how far it got; an echo still "sending" or never delivered must not look like a sent turn.
+    const delivery = type === "user_message" ? managerConsoleDeliveryLabel(event) : null;
+    const bubble = createElement("div", `manager-chat-bubble role-${type === "user_message" ? "user" : "assistant"}${delivery ? " " + delivery.className : ""}`);
     // The worker chat names its runner/model visibly; the manager console's label is for screen readers.
     const speaker = type === "user_message" ? "You" : chat ? chat.assistantLabel : "Manager";
     bubble.appendChild(createElement("span", chat ? "manager-chat-bubble-label worker-chat-label" : "manager-chat-bubble-label sr-only", speaker));
     const clock = managerChatClockText(event);
     if (clock) bubble.appendChild(createElement("span", "mc-time", clock));
+    if (delivery) bubble.appendChild(createElement("span", "mc-delivery", delivery.text));
     bubble.appendChild(type === "assistant_text" ? managerConsoleMarkdown(payload.text) : document.createTextNode(String(payload.text || "")));
     // The log records only how many images the owner attached, never the image.
     const images = type === "user_message" ? numberValue(payload.images) : 0;
@@ -99,7 +102,7 @@ function managerChatEventNode(event, chat = null) {
     return task ? managerConsoleTaskNode(task, row) : managerConsoleBlock(type, row);
   }
   if (type === "callback") {
-    return managerConsoleBlock(type, createElement("div", "manager-chat-marker", `Automatic wake-up${payload.text ? `: ${limitText(payload.text, 120)}` : ""}`));
+    return managerConsoleBlock(type, managerConsoleCallbackNode(payload));
   }
   if (type === "error") {
     const text = managerConsoleErrorText(payload);
@@ -126,7 +129,7 @@ function managerChatEventNode(event, chat = null) {
     return managerConsoleBlock(type, createElement("div", "manager-chat-marker mc-stopped", "Stopped"));
   }
   if (type === "queue_dropped") {
-    const count = Math.max(0, numberValue([payload.dropped_queued, payload.count, payload.dropped, payload.n].find((value) => value !== undefined && value !== null)));
+    const count = managerConsoleDroppedCount(payload);
     return managerConsoleBlock(type, createElement("div", "manager-chat-marker", `${count} queued message${count === 1 ? "" : "s"} dropped`));
   }
   if (type === "reasoning") {
@@ -142,9 +145,44 @@ function managerChatEventNode(event, chat = null) {
     return managerConsoleBlock(type, row);
   }
   if (type === "turn_end") {
-    return managerConsoleBlock("turn_end", createElement("div", "mc-footer", managerConsoleFooterText(event, chat)));
+    const block = managerConsoleBlock("turn_end", createElement("div", "mc-footer", managerConsoleFooterText(event, chat)));
+    // An empty turn is a failed turn: the row says so in its class as well as in its text.
+    if (managerConsoleFooterIsEmpty(event, chat)) block.className += " is-empty-turn";
+    return block;
   }
   return null;
+}
+
+// How many queued sends a queue_dropped event reports; the backends name the count differently.
+function managerConsoleDroppedCount(payload) {
+  const value = [payload.dropped_queued, payload.count, payload.dropped, payload.n].find((item) => item !== undefined && item !== null);
+  return Math.max(0, numberValue(value));
+}
+
+// An owner echo's delivery, shown on its bubble: only a polled user_message (no `local`) was delivered.
+function managerConsoleDeliveryLabel(event) {
+  const local = event && event.local;
+  if (local === "pending") return { className: "is-pending", text: "sending" };
+  if (local === "dropped") return { className: "is-undelivered", text: "not delivered" };
+  if (local === "failed") return { className: "is-failed", text: "not sent" };
+  return null;
+}
+
+const MANAGER_CONSOLE_CALLBACK_PREVIEW = 120;
+
+// A long wake-up text collapses to its first line's worth; the whole text is one click away.
+function managerConsoleCallbackNode(payload) {
+  const text = payload.text ? String(payload.text) : "";
+  if (text.length <= MANAGER_CONSOLE_CALLBACK_PREVIEW) {
+    return createElement("div", "manager-chat-marker", `Automatic wake-up${text ? `: ${text}` : ""}`);
+  }
+  const row = createElement("details", "manager-chat-tool-row is-callback");
+  row.open = false;
+  row.appendChild(createElement("summary", "manager-chat-marker", `Automatic wake-up: ${limitText(text, MANAGER_CONSOLE_CALLBACK_PREVIEW)}`));
+  const body = createElement("div", "manager-chat-tool-row-body");
+  body.appendChild(document.createTextNode(text));
+  row.appendChild(body);
+  return row;
 }
 
 function managerConsoleTimelineSection(parent, title, content) {
@@ -552,18 +590,46 @@ function managerConsoleBuildIndex(events) {
     if (!item || !Number.isInteger(item.turn)) continue;
     let info = turns.get(item.turn);
     if (!info) {
-      info = { first: item, tools: new Set() };
+      info = { first: item, tools: new Set(), hasOutput: false };
       turns.set(item.turn, info);
     }
     if (item.type === "tool_call" || item.type === "command" || item.type === "file_change") {
       info.tools.add((item.payload && item.payload.call_id) || "seq:" + item.seq);
     }
+    // A panel-made row (a hidden-thinking note, an echo) is not something the model produced.
+    if (!item.local && MANAGER_CONSOLE_OUTPUT_TYPES.has(item.type)) info.hasOutput = true;
   }
   return { turns, reasoningEnd, reasoningStart };
 }
 
+// Event types that show a turn produced something; a turn with none of them and no output tokens is empty.
+const MANAGER_CONSOLE_OUTPUT_TYPES = new Set([
+  "assistant_text", "reasoning", "tool_call", "tool_result", "command", "file_change", "handoff_request",
+]);
+
 function managerConsoleCurrentIndex() {
   return managerConsoleActiveIndex || managerConsoleBuildIndex(Array.isArray(state.managerChatEvents) ? state.managerChatEvents : []);
+}
+
+// A turn_end whose turn logged no output and reported no output tokens (missing usage counts as none,
+// fail-closed) ended empty: it is a failed turn, never a normal footer. Only a turn the index fully holds
+// is judged: turns at or below `trimmedTurn` may have lost their first events to the manager log's cap.
+function managerConsoleTurnIsEmpty(event, index, trimmedTurn = 0) {
+  const turn = event && event.turn;
+  if (!event || event.type !== "turn_end" || !Number.isInteger(turn) || turn <= trimmedTurn) return false;
+  const info = index.turns.get(turn);
+  if (!info || info.hasOutput) return false;
+  const payload = managerConsolePayload(event);
+  if (numberValue(payload.reasoning_redacted) > 0) return false;
+  const usage = managerConsoleUsage(payload.usage);
+  return !usage || usage.output === 0;
+}
+
+// Whether a manager console turn_end row is an empty turn. Only the manager console judges: its
+// log carries the turn's usage and its trim point; a worker chat's footer stays as it was.
+function managerConsoleFooterIsEmpty(event, chat = null) {
+  if (chat) return false;
+  return managerConsoleTurnIsEmpty(event, managerConsoleCurrentIndex(), numberValue(state.managerChatTrimmedTurn));
 }
 
 function managerConsoleFooterText(event, chat = null) {
@@ -578,8 +644,11 @@ function managerConsoleFooterText(event, chat = null) {
   const start = info ? managerChatEventTime(info.first) : 0;
   const end = managerChatEventTime(event);
   if (start > 0 && end > 0 && end >= start) parts.push(managerChatFormatDuration(end - start));
+  if (managerConsoleFooterIsEmpty(event, chat)) parts.push(MANAGER_CONSOLE_EMPTY_TURN_TEXT);
   return parts.join(" · ");
 }
+
+const MANAGER_CONSOLE_EMPTY_TURN_TEXT = "empty turn: no output";
 
 function managerConsoleContextFill(events) {
   for (let index = events.length - 1; index >= 0; index -= 1) {
@@ -770,9 +839,18 @@ function managerConsoleRowSignature(event, chat = null) {
   // The status is explicit because a result can add only undefined keys, which JSON drops,
   // and because a terminal event changes it without touching the payload.
   if (type === "tool_call") return JSON.stringify([type, managerConsoleToolStatus(payload, event, chat), payload]);
+  // Every other row reads only its own event, and a merged event object is never changed in place (a
+  // settled echo is a new object), so its signature is serialized once, not on every poll's render.
+  const cached = managerConsoleSignatureCache.get(event);
+  if (cached !== undefined) return cached;
   const clock = type === "assistant_text" || type === "user_message" ? managerChatClockText(event) : "";
-  return JSON.stringify([type, clock, payload]);
+  const signature = JSON.stringify([type, clock, event.local || "", payload]);
+  managerConsoleSignatureCache.set(event, signature);
+  return signature;
 }
+
+// Weakly keyed, so an event the capped log (MANAGER_CHAT_EVENT_LOG_LIMIT) drops takes its entry with it.
+const managerConsoleSignatureCache = new WeakMap();
 
 function managerConsoleEventRows(merged, visible, chat = null) {
   const keys = managerConsoleRowKeys(merged);
@@ -1104,6 +1182,9 @@ function renderManagerChatEvents() {
 }
 
 const MANAGER_CONSOLE_BLOCK_LIMIT = 400;
+// The most polled events the panel keeps in memory. The oldest leave first; the server log keeps them,
+// and a cursor reset (afterSeq 0, as a session switch does) fetches them again. Five render windows.
+const MANAGER_CHAT_EVENT_LOG_LIMIT = 5 * MANAGER_CONSOLE_BLOCK_LIMIT;
 // Emphasis needs non-space just inside the delimiters and no word or delimiter character just outside
 // them, so snake_case_name, "a * b * c" and 2**10 stay verbatim.
 const MANAGER_CONSOLE_INLINE = /`([^`]+)`|(?<![\w*])\*\*(?=[^\s*])([^*]*[^\s*])\*\*(?![\w*])|(?<![\w*])\*(?=[^\s*])([^*]*[^\s*])\*(?![\w*])|(?<![\w])_(?=[^\s_])([^_]*[^\s_])_(?!\w)|\[([^\]]+)\]\(([^)\s]+)\)/g;
