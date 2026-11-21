@@ -395,7 +395,8 @@ def test_real_node_and_python_operations_through_validation_broker(
     )
     results = worker_workspace.run_validations(
         workspace,
-        [f"python3 {python_script}", f"node {node_script}"],
+        # Worktree-relative, like real card commands: bubblewrap shows the worktree only at its sandbox alias (host tmp path is hidden); every backend chdirs there.
+        [f"python3 {python_script.name}", f"node {node_script.name}"],
         timeout_seconds=180,
     )
     assert [row["returncode"] for row in results] == [0, 0], results
