@@ -177,11 +177,13 @@ inherit the manager's launch capability.
 - **semantic-edit-historical-cap-boundary**: historical capped a/b observation at 20k/200k ops shows a 29.329% reduction; this is a capped historical sample, not eligible as a live guarantee.
 - **context-bundle-v2-structural-only**: structural-only validation; live fleet remeasurement pending.
 
-## What's new in 0.13.6
+## What's new in 0.13.7
 
-- Manager Chat: an empty turn is an error, not a silent success, so a wake is never acknowledged for a callback the model never saw.
-- Manager Chat: every finished card the chat launched reaches that chat, with no duplicate copies and no lost wakes after a rework or rotate.
+- Manager Chat: a turn ends at the provider's terminal event, a stop kills the whole CLI process tree (even a stop right after send), and a provider error is reported as an error.
+- Manager Chat: an empty turn is an error, not a silent success; every finished card the chat launched reaches that chat, with no duplicate copies and no lost wakes after a rework or rotate.
 - Manager Chat: busy/idle state, reply binding and the settling of typed messages stay correct across replays, session switches and stops; closing the panel no longer kills the running turn.
+- Dashboard: no more "Dashboard snapshot delayed" loop. The opencode model probe no longer blocks the reader, a late snapshot is painted instead of dropped, Retry keeps a live reader, and a running Claude Code manager shows as ✓ Route / ✓ Callback.
+- 0.13.7 includes everything in 0.13.6, which was tagged but not published because its Linux CI failed.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Documentation

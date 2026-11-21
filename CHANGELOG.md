@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.13.7] - 2026-11-21
+
+0.13.6 was tagged but never published: its Linux CI failed (see the CI entry below). 0.13.7 carries all of 0.13.6 plus these fixes.
+
+### Fixed
+
+- Manager Chat backends: a turn ends at the provider's terminal event instead of waiting for the CLI to close stdout; stop or drop kills the whole process tree; a provider error subtype is reported as an error, not a success.
+- Manager Chat CLI backend: a stop that lands between send and the first stream read stops the turn before the CLI is launched; a non-zero exit that follows a late stdout close still replaces the clean end; a cancelled turn's process tree is never killed twice (NF-2026-02321).
+- NeedFix: `needfix_transition` action `resolve_verified` with a readiness score, evidence or evidence refs writes them through the store instead of failing on the legacy forwarder (NF-2026-02322).
+- Dashboard: the reader runs the `opencode models` probe as a polled child process instead of inline, so the 20.8 s probe no longer stalls the next snapshot every time its cache expires (NF-2026-02324).
+- Dashboard: a snapshot reply that arrives after the soft budget is painted instead of dropped, and Retry on a live reader joins the in-flight snapshot instead of killing the reader; only a request past the hard cap marks the reader hung (NF-2026-02323). A full snapshot measured 17 s idle but 146 s under load against a 120 s budget, which is why "Dashboard snapshot delayed (dashboard_reader_timeout)" kept coming back.
+- Dashboard: the identity panel sees a running Claude Code manager across processes (session descriptor plus pid liveness), so it shows ✓ Route / ✓ Callback instead of "! Route ! Callback"; a dead session never keeps a stale "available" (NF-2026-02325).
+- CI: the timestamp-broker end-to-end test gives its hand-built worktree the `.git` marker the bubblewrap validation sandbox binds read-only, which unblocks Linux CI on the ubuntu-26.04 runner image (NF-2026-02320).
+
 ## [0.13.6] - 2026-11-21
 
 ### Fixed

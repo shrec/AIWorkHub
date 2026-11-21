@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.13.7 — 2026-11-21
+
+### Fixed
+
+- Bundles runtime 0.13.7: Manager Chat ends a turn at the provider's terminal event, kills the whole CLI process tree on stop (including a stop right after send), and reports a provider error as an error. Includes all of 0.13.6, which was tagged but not published.
+- Dashboard: a snapshot reply that arrives after the soft budget is painted instead of dropped, and Retry on a live reader joins the in-flight snapshot instead of killing it; only a request past the hard cap marks the reader hung. The identity panel shows a running Claude Code manager as ✓ Route / ✓ Callback.
+
 ## 0.13.6 — 2026-11-21
 
 ### Fixed
