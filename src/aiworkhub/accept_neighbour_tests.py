@@ -265,6 +265,49 @@ def _production_paths(changed_paths: Iterable[Any]) -> list[str]:
     )
 
 
+# NF-2026-02298: a candidate that changed only vscode-extension/extension.js ran no
+# neighbour test at accept, though a Python test reads that file (84831f41). Every changed
+# non-test path outside src/**.py is now a selector path. Documentation (.md, .rst) keeps
+# today's behaviour: CONTRACT_TIER_RULES owns it. conftest.py is a test-tree file.
+_DOC_SUFFIXES = (".md", ".rst")
+_NON_SOURCE_PREFIXES = (".git/", ".aiworkhub/runtime/")
+# A basename that appears in too many unrelated tests to name its file; only the
+# repo-relative path matches for these.
+_GENERIC_BASENAMES = frozenset(
+    {"__init__.py", "__main__.py", "conftest.py", "main.py", "index.js", "setup.py",
+     "package.json", "package-lock.json", "tsconfig.json", "config.json", "settings.json"}
+)
+_MIN_BASENAME_CHARS = 8
+
+
+def _non_python_paths(changed_paths: Iterable[Any]) -> list[str]:
+    """Changed non-test paths that are not ``src/**.py`` modules or documentation."""
+    paths = {_advice._normalize_path(path) for path in changed_paths}
+    return sorted(
+        path
+        for path in paths
+        if path
+        and not (path.startswith("src/") and path.endswith(".py"))
+        and not path.endswith(_DOC_SUFFIXES)
+        and not path.startswith(_NON_SOURCE_PREFIXES)
+        and path.rsplit("/", 1)[-1] != "conftest.py"
+        and not is_test_path(path)
+    )
+
+
+def _distinctive_basename(path: str) -> str:
+    """The basename of ``path`` when a bare mention of it names that file, else ``""``.
+
+    A test that spells ``extension.js`` without the directory still loads that file
+    in practice, so the basename matches too -- unless it is short or one of the
+    ``_GENERIC_BASENAMES`` every package has, where a bare mention proves nothing.
+    """
+    name = path.rsplit("/", 1)[-1]
+    if len(name) < _MIN_BASENAME_CHARS or name in _GENERIC_BASENAMES:
+        return ""
+    return name
+
+
 def select_neighbour_tests(
     repo_root: Path | str,
     changed_paths: Iterable[Any],
@@ -354,7 +397,8 @@ def _impact_lane(
     if limit == 0:
         return None, "impact_map_skipped:neighbour_limit_zero"
     production = _production_paths(changed_paths)
-    if not production:
+    non_python = _non_python_paths(changed_paths)  # NF-2026-02298: selector paths too
+    if not production and not non_python:
         return None, "impact_map_skipped:no_changed_production_python"
     map_path = _impact.map_directory(root) / _impact.MAP_FILE_NAME
     payload, problem = _impact.load_map(map_path)
@@ -401,7 +445,7 @@ def _impact_lane(
         lane_reason += f";map_stale_tests_kept:{len(kept)}"
     return NeighbourSelection(
         tests=tests, reason="" if tests else "no_impacted_tests", limit=limit,
-        production_paths=tuple(production), related_count=len(tests),
+        production_paths=(*production, *non_python), related_count=len(tests),
         lane=LANE_IMPACT_MAP, lane_reason=lane_reason,
     ), ""
 
@@ -720,7 +764,9 @@ def _with_referencing(
 
     Ratchet tests first, then path order, at most ``MAX_REFERENCING_TESTS``;
     tests the declared validation names, the selection holds or
-    ``INVARIANT_TESTS`` lists are left out.
+    ``INVARIANT_TESTS`` lists are left out. NF-2026-02298: when the impact lane did
+    not decide, a changed non-Python path also selects the tests whose text names its
+    repo-relative path (rank 2) or a distinctive basename (rank 3), after the stem ranks.
     """
     if selection.limit == 0:
         return selection
@@ -728,7 +774,12 @@ def _with_referencing(
         {path.rsplit("/", 1)[-1][: -len(".py")] for path in _production_paths(changed_paths)}
         - {"__init__"}  # a package's __init__.py is named by fixtures that build packages
     )
-    if not stems:
+    extra = [] if selection.lane == LANE_IMPACT_MAP else _non_python_paths(changed_paths)
+    if extra:  # the receipt shows why these tests ran
+        named_paths = tuple(dict.fromkeys((*selection.production_paths, *extra)))
+        selection = replace(selection, production_paths=named_paths)
+    basenames = sorted({name for name in map(_distinctive_basename, extra) if name})
+    if not stems and not extra:
         return selection
     named = _advice._command_names(
         command for command in declared_commands if isinstance(command, str)
@@ -741,9 +792,12 @@ def _with_referencing(
         and test not in INVARIANT_TESTS
         and not _advice._covers(named, test)
     ]
-    literal, ratchet = _stem_patterns(stems)
-    needles = tuple(f"{stem}.py" for stem in stems) + tuple(
-        f"{stem.upper()}_MAX_LINES" for stem in stems
+    literal, ratchet = _stem_patterns(stems) if stems else (None, None)
+    needles = (
+        tuple(f"{stem}.py" for stem in stems)
+        + tuple(f"{stem.upper()}_MAX_LINES" for stem in stems)
+        + tuple(extra)
+        + tuple(basenames)
     )
 
     def rank(item: tuple[str, Path]) -> int | None:
@@ -751,7 +805,12 @@ def _with_referencing(
         # Either pattern needs one of these substrings; ``in`` is far cheaper than a regex.
         if not any(needle in text for needle in needles):
             return None
-        return _referencing_rank(text, literal, ratchet)
+        found = _referencing_rank(text, literal, ratchet) if literal and ratchet else None
+        if found is not None:
+            return found
+        if any(path in text for path in extra):
+            return 2
+        return 3 if any(name in text for name in basenames) else None
 
     # Measured 2026-11-02 over the canonical tests/ tree (844 files, 17 MB), three stems:
     # sequential 1.4-2.6 s, 12 threads 0.75-1.1 s, identical ranks. Without the substring
