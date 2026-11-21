@@ -21,6 +21,9 @@ def test_enqueue_callback_rolls_back_owned_transaction_on_commit_error(
     class _Cursor:
         rowcount = 1
 
+        def fetchone(self):
+            return None
+
     class _Connection:
         def __init__(self) -> None:
             self.rollbacks = 0
@@ -124,7 +127,7 @@ def test_reconciliation_unknown_review_substatus_falls_back_without_weakening_di
         conn.close()
 
 
-def test_enqueue_copies_to_manager_chat_without_removing_the_codex_row(tmp_path: Path) -> None:
+def test_a_chat_launched_card_is_filed_only_on_its_launching_session(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     db_path = root / ".aiworkhub" / "tasking" / "task_queue.sqlite"
     session_id = "mls-" + "ab" * 16
@@ -167,7 +170,6 @@ def test_enqueue_copies_to_manager_chat_without_removing_the_codex_row(tmp_path:
             ("TASK_DUAL_CALLBACK",),
         ).fetchall()
         assert [(row["provider"], row["origin_thread_id"], row["state"]) for row in rows] == [
-            ("codex", card["origin_thread_id"], "pending"),
             ("manager_chat", session_id, "pending"),
         ]
 
@@ -186,11 +188,11 @@ def test_enqueue_copies_to_manager_chat_without_removing_the_codex_row(tmp_path:
             ("TASK_DUAL_CALLBACK",),
         ).fetchone()
         assert retagged["provider"] == "manager_chat"
-        assert retagged["origin_thread_id"] == chat_only
-        still = conn.execute(
+        assert retagged["origin_thread_id"] == session_id
+        no_codex = conn.execute(
             "SELECT state FROM callback_outbox WHERE provider='codex' AND task_id=?",
             ("TASK_DUAL_CALLBACK",),
         ).fetchone()
-        assert still["state"] == "pending"
+        assert no_codex is None
     finally:
         conn.close()

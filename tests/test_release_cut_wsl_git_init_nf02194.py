@@ -39,7 +39,7 @@ VERSION = "0.12.98"
 # What the fake wslpath answers: the repository root as WSL mounts it.
 LINUX_ROOT = "/mnt/z/repo"
 SCRATCH = f"{LINUX_ROOT}/.scratch/release/{VERSION}"
-TREE = f"{SCRATCH}/tree"
+TREE = f"{release_cut.WSL_BASETEMP_PREFIX}{VERSION}-tree"
 IDENTITY = "-c user.name=release -c user.email=release@localhost"
 # The three git commands as the sh -c text WSL runs: each inside the tree's cd guard.
 GIT_IN_TREE = (
@@ -52,7 +52,7 @@ EXTRACT = release_cut._wsl_guarded_script(
 )
 CLEAR = release_cut._wsl_guarded_script(
     PurePosixPath(SCRATCH),
-    ("rm", "-rf", "--", TREE, f"{SCRATCH}/head.tar", f"/tmp/aiworkhub-release-{VERSION}"),
+    ("rm", "-rf", "--", TREE, f"{SCRATCH}/head.tar", f"{release_cut.WSL_BASETEMP_PREFIX}{VERSION}"),
 )
 
 
