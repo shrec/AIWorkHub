@@ -48,7 +48,7 @@ STATE_DIRNAME = "manager_loop"
 SESSION_STATUSES = frozenset({"active", "closed"})
 EVENT_TYPES = frozenset({
     "assistant_text", "reasoning", "tool_call", "tool_result", "command", "file_change",
-    "turn_end", "error",
+    "turn_end", "error", "provider_compacted",
 })
 OPEN_CARD_STATUSES = ("pending", "processing", "review", "blocked")
 DEFAULT_BRIEF_BYTES = 12 * 1024
@@ -1647,12 +1647,18 @@ class ManagerOrchestrator:
         if not full and ceiling and tokens is not None and baseline is not None and tokens - baseline >= ceiling:
             result["rotation_basis"] = "absolute_token_ceiling"
             full = True
+        # NF-2026-02329: the provider compacted its own context mid-turn; its summary is lossy,
+        # so the session hands off to a successor instead of continuing on that summary.
+        compacted = any(event.get("type") == "provider_compacted" for event in events)
+        if compacted:
+            result["rotation_basis"] = "provider_compaction"
         # NF-2026-01915: a turn that died on an expired login or a usage limit did no work;
         # rotating here only re-bills a handoff and mislabels the close as context_threshold.
         # NF-2026-02197: the owner's Stop never starts a model call; the next completed turn rotates.
         # NF-2026-02318: an empty provider turn did no work either.
-        if full and not stopped and not empty and (reply or not classify_failure(errors)):
-            result["rotation"] = self._rotate("context_threshold", successor=True)
+        if (full or compacted) and not stopped and not empty and (reply or not classify_failure(errors)):
+            reason = "provider_compaction" if compacted else "context_threshold"
+            result["rotation"] = self._rotate(reason, successor=True)
         return result
 
     def _exchange(

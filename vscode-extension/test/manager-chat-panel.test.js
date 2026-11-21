@@ -2754,6 +2754,14 @@ test("a handoff_request then session_close with different reasons stay two rows"
   assert.deepEqual(plain(rows), ["Handoff requested: context full", "Session closed: owner closed"]);
 });
 
+test("NF-2026-02329: provider_compacted renders as a one-line marker row", () => {
+  const rows = renderedRowsText([
+    { seq: 1, turn: 1, type: "provider_compacted", payload: { trigger: "auto", pre_tokens: 150000 } },
+    { seq: 2, turn: 1, type: "handoff_request", payload: { reason: "provider_compaction" } },
+  ], "manager-chat-marker");
+  assert.deepEqual(plain(rows), ["Provider compacted context", "Handoff requested: provider_compaction"]);
+});
+
 test("consecutive errors with the same text render as one row carrying x N", () => {
   const rows = renderedRowsText([
     { seq: 1, turn: 1, type: "error", payload: { error: "rate limited" } },

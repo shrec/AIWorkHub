@@ -323,6 +323,8 @@ def _claude_events(event: Mapping[str, Any], context: TurnContext) -> list[dict[
         return _claude_delta(event)
     if kind == "result":
         return [_turn_end(_claude_usage(event, context), context)]
+    if kind == "system" and event.get("subtype") == "compact_boundary":
+        return [_claude_compacted(event)]
     message = _mapping(event.get("message"))
     if kind == "assistant":
         context.model = str(message.get("model") or context.model)
@@ -330,7 +332,9 @@ def _claude_events(event: Mapping[str, Any], context: TurnContext) -> list[dict[
         if usage:
             context.last_usage = dict(usage)
     content = message.get("content")
-    events = _assistant_text(context_capture._message_text(content))
+    # NF-2026-02329: user-role text (a compaction summary, an interrupt notice, a hook
+    # injection) is never the manager's reply; a user line yields only its tool results.
+    events = _assistant_text(context_capture._message_text(content)) if kind == "assistant" else []
     for block in content if isinstance(content, list) else []:
         if not isinstance(block, Mapping):
             continue
@@ -343,6 +347,19 @@ def _claude_events(event: Mapping[str, Any], context: TurnContext) -> list[dict[
         elif block.get("type") == "redacted_thinking":
             events.extend(_reasoning("", context))
     return events
+
+
+def _claude_compacted(event: Mapping[str, Any]) -> dict[str, Any]:
+    """Claude ``system``/``compact_boundary``: the provider compacted its own context."""
+    metadata = _mapping(event.get("compact_metadata"))
+    pre_tokens = metadata.get("pre_tokens")
+    if isinstance(pre_tokens, bool) or not isinstance(pre_tokens, int):
+        pre_tokens = None
+    trigger = metadata.get("trigger")
+    return {
+        "type": "provider_compacted",
+        "payload": {"trigger": trigger if isinstance(trigger, str) else "", "pre_tokens": pre_tokens},
+    }
 
 
 def _codex_usage(usage: Any) -> dict[str, Any] | None:

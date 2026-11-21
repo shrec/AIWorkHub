@@ -275,6 +275,65 @@ def test_every_provider_event_maps_to_its_loop_event(tmp_path: Path):
     cli.close()
 
 
+_SUMMARY = "This session is being continued from a previous conversation that ran out of context."
+
+
+def test_claude_user_string_content_never_becomes_assistant_text(tmp_path: Path):
+    # NF-2026-02329: the compaction summary arrives as a user line whose content is a string.
+    claude = [
+        {"type": "user", "message": {"role": "user", "content": _SUMMARY}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "real reply"}]}},
+        {"type": "result", "usage": {"input_tokens": 3, "output_tokens": 1}},
+    ]
+    cli = backend(FakeCli(tmp_path, [claude]))
+    cli.start("brief")
+    events = drain(cli.send("go"))
+    assert kinds(events) == ["assistant_text", "turn_end"]
+    assert events[0]["payload"]["text"] == "real reply"
+    assert _SUMMARY not in json.dumps(events)
+    cli.close()
+
+
+def test_claude_user_text_block_beside_a_tool_result_yields_only_the_tool_result(tmp_path: Path):
+    claude = [
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "t1", "name": "Read", "input": {"path": "a.py"}},
+        ]}},
+        {"type": "user", "message": {"content": [
+            {"type": "text", "text": "[Request interrupted by user]"},
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+        ]}},
+        {"type": "result", "usage": {"input_tokens": 3, "output_tokens": 1}},
+    ]
+    cli = backend(FakeCli(tmp_path, [claude]))
+    cli.start("brief")
+    events = drain(cli.send("go"))
+    assert kinds(events) == ["tool_call", "tool_result", "turn_end"]
+    assert "Request interrupted" not in json.dumps(events)
+    cli.close()
+
+
+def test_claude_compact_boundary_translates_to_provider_compacted():
+    context = mlb.TurnContext()
+    boundary = {
+        "type": "system", "subtype": "compact_boundary",
+        "compact_metadata": {"trigger": "auto", "pre_tokens": 151234},
+    }
+    assert mlb._claude_events(boundary, context) == [
+        {"type": "provider_compacted", "payload": {"trigger": "auto", "pre_tokens": 151234}},
+    ]
+
+
+@pytest.mark.parametrize("metadata", [None, {}, "junk", {"trigger": 7, "pre_tokens": "many"}, {"pre_tokens": True}])
+def test_claude_compact_boundary_with_missing_metadata_does_not_raise(metadata):
+    boundary: dict = {"type": "system", "subtype": "compact_boundary"}
+    if metadata is not None:
+        boundary["compact_metadata"] = metadata
+    assert mlb._claude_events(boundary, mlb.TurnContext()) == [
+        {"type": "provider_compacted", "payload": {"trigger": "", "pre_tokens": None}},
+    ]
+
+
 def test_codex_and_opencode_streams_map_to_the_same_loop_events():
     codex = [
         {"type": "item.completed", "item": {"type": "agent_message", "text": "codex reply"}},
@@ -1055,6 +1114,53 @@ def test_the_orchestrator_drives_the_cli_backend_end_to_end(tmp_path: Path):
     assert len(fake.argv_calls) == 3, "start, two turns and the handoff ran one CLI turn each"
     assert all(child.poll() is not None for child in fake.children), "no turn leaked a child"
     orchestrator.close()
+
+
+def test_a_compacted_claude_turn_keeps_the_summary_out_of_the_reply_and_rotates(tmp_path: Path):
+    # NF-2026-02329: end to end through the real translator and a fake CLI process.
+    compacted = [
+        {"type": "system", "session_id": "conv-c"},
+        {"type": "system", "subtype": "compact_boundary", "compact_metadata": {"trigger": "auto", "pre_tokens": 9}},
+        {"type": "user", "message": {"role": "user", "content": _SUMMARY}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "after compaction"}]}},
+        {"type": "result", "usage": {"input_tokens": 5, "output_tokens": 2}},
+    ]
+    handoff = {"type": "assistant", "message": {"content": [{"type": "text", "text": "done: x\nopen: -\nnext: -"}]}}
+    fake = FakeCli(tmp_path, [compacted, [handoff, {"type": "result", "usage": {}}]])
+    store = ml.SessionStore(tmp_path / "manager_loop", REPO_ID)
+    writes: list[dict[str, Any]] = []
+
+    def writer(**fields: Any) -> dict[str, Any]:
+        writes.append(dict(fields))
+        return {"ok": True, "document_id": "doc-1"}
+
+    orchestrator = ml.ManagerOrchestrator(
+        store,
+        backend_factory=mlb.manager_backend_factory(
+            tmp_path,
+            declares_route=lambda *_: True,
+            plan_builder=fake.plan_builder,
+            spawn=fake.spawn,
+            timeout_seconds=30,
+        ),
+        brief_builder=ml.BriefBuilder(max_bytes=4096, **BRIEF_SOURCES),
+        event_writer=writer,
+        session_writer=writer,
+    )
+    session = orchestrator.start("claude_cli", "fixture-model")
+
+    result = orchestrator.send("go on")
+
+    assert result["reply"] == "after compaction"
+    assert "provider_compacted" in kinds(result["events"])
+    turn_writes = [w for w in writes if w.get("event_type") == ml.TURN_EVENT_TYPE]
+    assert turn_writes and all(_SUMMARY not in str(w.get("content")) for w in turn_writes)
+    assert all(_SUMMARY not in str(w.get("assistant_text")) for w in turn_writes)
+    assert result["rotation_basis"] == "provider_compaction"
+    assert result["rotation"] is not None
+    assert result["rotation"]["session"].session_id == session.session_id
+    assert len(fake.argv_calls) == 2, "the compacted turn and its handoff ran one CLI turn each"
+    assert all(child.poll() is not None for child in fake.children), "no turn leaked a child"
 
 
 def test_the_factory_accepts_a_model_the_cli_itself_discovers(tmp_path: Path, monkeypatch):

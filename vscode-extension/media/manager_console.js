@@ -125,6 +125,9 @@ function managerChatEventNode(event, chat = null) {
   if (type === "session_close") {
     return managerConsoleBlock(type, createElement("div", "manager-chat-marker", `Session closed${payload.reason ? `: ${limitText(payload.reason, 120)}` : ""}`));
   }
+  if (type === "provider_compacted") {
+    return managerConsoleBlock(type, createElement("div", "manager-chat-marker", "Provider compacted context"));
+  }
   if (type === "turn_stopped") {
     return managerConsoleBlock(type, createElement("div", "manager-chat-marker mc-stopped", "Stopped"));
   }
@@ -353,7 +356,7 @@ const MANAGER_CONSOLE_GLYPHS = Object.freeze({
 const MANAGER_CONSOLE_ROW_TYPES = new Set([
   "command", "file_change", "assistant_text", "user_message", "tool_call", "tool_result", "callback", "error",
   "session_start", "handoff_request", "session_close", "turn_stopped", "queue_dropped", "reasoning", "turn_end",
-  "timeline_row",
+  "timeline_row", "provider_compacted",
 ]);
 const MANAGER_CONSOLE_ACTIVITY_TYPES = new Set(["tool_call", "tool_result", "command", "file_change", "reasoning"]);
 // Every event type after which nothing earlier in the log can still be running.

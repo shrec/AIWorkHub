@@ -568,6 +568,72 @@ def test_a_turn_at_the_token_ceiling_rotates_below_the_fraction(make) -> None:
     assert "context_threshold" in harness.backends[0].messages[-1]
 
 
+_COMPACTED = {"type": "provider_compacted", "payload": {"trigger": "auto", "pre_tokens": 150_000}}
+
+
+def test_provider_compacted_is_a_known_event_type_that_survives_normalize() -> None:
+    # NF-2026-02329
+    assert "provider_compacted" in ml.EVENT_TYPES
+    assert ml._normalize(_COMPACTED) == ("provider_compacted", {"trigger": "auto", "pre_tokens": 150_000})
+
+
+def test_a_completed_turn_with_provider_compaction_rotates_into_a_successor(make) -> None:
+    # NF-2026-02329: well below every threshold, the provider's own compaction still rotates.
+    harness = make()
+    first = harness.orch.start("fake", "model-a")
+    harness.backends[0].script.append([
+        _COMPACTED, {"type": "assistant_text", "payload": {"text": "done"}}, {"type": "turn_end", "payload": {}},
+    ])
+
+    result = harness.orch.send("hello")
+
+    assert result["reply"] == "done"
+    assert result["rotation_basis"] == "provider_compaction"
+    rotation = result["rotation"]
+    assert rotation is not None and rotation["session"].session_id == first.session_id
+    assert rotation["successor"] == harness.orch.session
+    assert "provider_compaction" in harness.backends[0].messages[-1]
+    requests = [e for e in harness.store.events(first.session_id) if e["type"] == "handoff_request"]
+    assert [e["payload"]["reason"] for e in requests] == ["provider_compaction"]
+    assert any(e["type"] == "provider_compacted" for e in harness.store.events(first.session_id))
+
+
+def test_an_empty_turn_with_provider_compaction_does_not_rotate(make) -> None:
+    harness = make()
+    first = harness.orch.start("fake", "model-a")
+    harness.backends[0].script.append([_COMPACTED, {"type": "turn_end", "payload": {}}])
+
+    result = harness.orch.send("hello")
+
+    assert result["ok"] is False and result["rotation"] is None
+    assert harness.orch.session.session_id == first.session_id
+    assert harness.orch.session.status == "active"
+
+
+def test_a_stopped_turn_with_provider_compaction_does_not_rotate(make) -> None:
+    harness = make()
+    first = harness.orch.start("fake", "model-a")
+    backend = harness.backends[0]
+    backend.gate = threading.Event()
+    backend.entered.clear()
+    backend.script.append([_COMPACTED, {"type": "error", "payload": {"source": "backend", "error": "killed"}}])
+    done: list[dict[str, Any]] = []
+    runner = threading.Thread(target=lambda: done.append(harness.orch.send("work")), daemon=True)
+    runner.start()
+    try:
+        assert backend.entered.wait(timeout=10)
+        assert harness.orch.interrupt() is True
+    finally:
+        backend.gate.set()
+        runner.join(timeout=10)
+    backend.gate = None
+    assert not runner.is_alive() and len(done) == 1
+
+    assert done[0]["rotation"] is None
+    assert harness.orch.session.session_id == first.session_id
+    assert harness.orch.session.status == "active"
+
+
 def _successor_sized(fill: float) -> list[dict[str, Any]]:
     return _used(context_window=1_000_000, context_fill=fill)
 
