@@ -935,10 +935,16 @@ function renderManagerIdentity(snapshot) {
     && Boolean(delivery.repo_id)
     && delivery.repo_id === delivery.dispatcher_repo_id
   );
-  const callbackReady = chatActive || managerInboxReady || dispatcherReady;
   const target = snapshot && snapshot.manager_identity_target && typeof snapshot.manager_identity_target === "object"
     ? snapshot.manager_identity_target
     : {};
+  // NF-2026-02325: a live, claimed Claude Code session waits for callbacks itself.
+  const claudeLaneReady = (
+    target.selected_provider === "claude"
+    && target.capability_state === "available"
+    && target.callback_lane === "claude_callback_wait"
+  );
+  const callbackReady = chatActive || managerInboxReady || dispatcherReady || claudeLaneReady;
   const routeState = chatActive
     ? "ready"
     : String(target.capability_state || route.route_state || "unknown").toLowerCase();
@@ -953,9 +959,11 @@ function renderManagerIdentity(snapshot) {
   setIdentityCheck(elements.identityRouteCheck, routeReady, "Route");
   setIdentityCheck(elements.identityCallbackCheck, callbackReady, "Callback");
   elements.identityRoleBadge.textContent = `role: ${role}`;
+  // NF-2026-02325: the selected route names the provider; a Claude lane never says provider: codex.
+  const targetProvider = String(target.selected_provider || "");
   const providerLabel = chatActive
     ? String(chat.backend_id || identity.provider || "manager_chat")
-    : String(identity.provider || "unknown");
+    : String(targetProvider || identity.provider || "unknown");
   elements.identityProviderBadge.textContent = `provider: ${providerLabel}`;
   const deliveryProblems = Array.isArray(delivery.problems) ? delivery.problems.filter(Boolean) : [];
   setIdentityDetailLabel(elements.identityWindowId, chatActive ? "Session" : "Window ID");
@@ -971,7 +979,9 @@ function renderManagerIdentity(snapshot) {
     ? String(chat.backend_id || "manager_chat")
     : String(route.session_id || "Not available");
   elements.identityRouteState.textContent = routeState;
-  elements.identityCallbackState.textContent = chatActive ? "manager_chat" : String(delivery.status || "unknown");
+  elements.identityCallbackState.textContent = chatActive
+    ? "manager_chat"
+    : (claudeLaneReady ? "claude_callback_wait" : String(delivery.status || "unknown"));
   elements.identityRepoId.textContent = String(delivery.repo_id || identity.repo_id || "Not available");
   const diagnostics = [identity.reason, routeReason, ...deliveryProblems].filter((item) => item && !(chatActive && item === "codex_thread_id_not_observed"));
   elements.identityDiagnostics.textContent = diagnostics.length ? diagnostics.join(" · ") : "none";

@@ -33,6 +33,7 @@ from aiworkhub import (
     feature_settings,
     hub_mail,
     hub_mail_net,
+    manager_route_probe,
     mcp_tool_metadata,
     model_settings,
     needfix_store,
@@ -2634,6 +2635,48 @@ def _snapshot_delta(result: Mapping[str, Any], known: Mapping[str, Any]) -> dict
     }
 
 
+CLAUDE_SESSION_NOT_RUNNING_REASON = "claude_session_not_running"
+CLAUDE_CALLBACK_LANE = "claude_callback_wait"
+CODEX_ROUTE_NOT_LIVE_REASON = "codex_route_not_live:claim_with_aiworkhub_manager_callback_lane_claim"
+
+
+def _provider_identity_target(selected: str, selected_target: object) -> dict[str, Any]:
+    """The persisted provider route, corrected by cross-process liveness (NF-2026-02325).
+
+    The persisted coordinator-targets file only says what was selected; a
+    claimed Claude Code session is published as available only while its
+    per-PID descriptor validates and its pid is alive. The Manager Chat seat
+    override is applied by the caller afterwards and still wins.
+    """
+    target_map = selected_target if isinstance(selected_target, dict) else {}
+    wake = target_map.get("wake", {})
+    capability_state = target_map.get("capability_state") if isinstance(selected_target, dict) else ""
+    target: dict[str, Any] = {
+        "selected_provider": selected,
+        "capability_state": capability_state,
+        "reason": wake.get("reason") or wake.get("action") if isinstance(wake, dict) else "",
+    }
+    if selected == "claude":
+        route = target_map.get("route")
+        session_id = str(route.get("session_id") or "").strip() if isinstance(route, dict) else ""
+        liveness = manager_route_probe.claude_session_live(session_id) if session_id else {}
+        if isinstance(liveness, dict) and liveness.get("live") is True:
+            target.update(
+                capability_state="available",
+                reason="",
+                callback_lane=CLAUDE_CALLBACK_LANE,
+                session_id=session_id,
+            )
+        else:
+            target["reason"] = CLAUDE_SESSION_NOT_RUNNING_REASON
+            if capability_state in ("available", "ready"):
+                # A dead session must not keep a stale persisted "available" (a false ✓ Route).
+                target["capability_state"] = "callback_required"
+    elif selected == "codex" and capability_state == "route_pending":
+        target["reason"] = CODEX_ROUTE_NOT_LIVE_REASON
+    return target
+
+
 def snapshot_view(
     full: bool = False,
     previous: Mapping[str, Any] | None = None,
@@ -2713,12 +2756,7 @@ def snapshot_view(
         )
         selected = str(targets.get("selected_provider") or "")
         selected_target = targets.get("targets", {}).get(selected, {}) if isinstance(targets.get("targets"), dict) else {}
-        wake = selected_target.get("wake", {}) if isinstance(selected_target, dict) else {}
-        snapshot["manager_identity_target"] = {
-            "selected_provider": selected,
-            "capability_state": selected_target.get("capability_state") if isinstance(selected_target, dict) else "",
-            "reason": wake.get("reason") or wake.get("action") if isinstance(wake, dict) else "",
-        }
+        snapshot["manager_identity_target"] = _provider_identity_target(selected, selected_target)
         chat_route = manager.get("manager_route") if isinstance(manager, dict) else {}
         chat = chat_route.get("manager_chat") if isinstance(chat_route, dict) else None
         if not isinstance(chat, dict) and isinstance(manager, dict):

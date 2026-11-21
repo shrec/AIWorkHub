@@ -142,13 +142,149 @@ def claude_descriptor_identity(parent_pid: int, descriptor: object) -> dict[str,
     return descriptor_probe(parent_pid, descriptor).identity
 
 
+def claude_sessions_dir() -> Path:
+    """Claude Code's per-PID session descriptor directory (``<pid>.json`` files)."""
+    return Path.home() / ".claude" / "sessions"
+
+
 def _read_descriptor(owner_pid: int, observations: dict[str, Any]) -> ClaudeRouteProbe:
     try:
-        descriptor_path = Path.home() / ".claude" / "sessions" / f"{owner_pid}.json"
+        descriptor_path = claude_sessions_dir() / f"{owner_pid}.json"
         descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return ClaudeRouteProbe(None, "descriptor_unreadable", observations)
     return descriptor_probe(owner_pid, descriptor, observations)
+
+
+# NF-2026-02325: bounds for the cross-process Claude session liveness scan.
+CLAUDE_SESSION_SCAN_LIMIT = 256
+CLAUDE_DESCRIPTOR_MAX_BYTES = 64 * 1024
+_WINDOWS_STILL_ACTIVE = 259
+_WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_WINDOWS_ERROR_ACCESS_DENIED = 5
+
+
+def _windows_pid_alive(pid: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    open_process.restype = wintypes.HANDLE
+    get_exit_code = kernel32.GetExitCodeProcess
+    get_exit_code.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    get_exit_code.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    handle = open_process(_WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        # Access denied means the process exists but belongs to someone else.
+        return ctypes.get_last_error() == _WINDOWS_ERROR_ACCESS_DENIED  # type: ignore[attr-defined]
+    try:
+        code = wintypes.DWORD()
+        if not get_exit_code(handle, ctypes.byref(code)):
+            return False
+        return code.value == _WINDOWS_STILL_ACTIVE
+    finally:
+        close_handle(handle)
+
+
+def _posix_pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True  # exists, owned by another user
+    except OSError:
+        return False
+    return True
+
+
+def pid_alive(pid: int) -> bool:
+    """True when ``pid`` names a running process; unknown fails closed (False).
+
+    Never signals anything: POSIX uses signal 0, Windows a query-only handle.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        return _windows_pid_alive(pid) if _windows() else _posix_pid_alive(pid)
+    except Exception:  # noqa: BLE001 -- an unprovable liveness is "not alive"
+        return False
+
+
+def _claude_descriptor_candidates(directory: Path) -> list[tuple[int, Path]]:
+    candidates: list[tuple[int, Path]] = []
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if len(candidates) >= CLAUDE_SESSION_SCAN_LIMIT:
+                break
+            stem, dot, suffix = entry.name.partition(".")
+            if dot != "." or suffix != "json" or not stem.isdigit():
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                continue  # never follow a symlink or read a non-regular file out of the sessions dir
+            candidates.append((int(stem), Path(entry.path)))
+    candidates.sort()
+    return candidates
+
+
+def claude_session_live(
+    session_id: str,
+    *,
+    sessions_dir: Path | None = None,
+    is_alive: Any = None,
+) -> dict[str, Any]:
+    """READ-ONLY: is the claimed Claude Code session running right now (NF-2026-02325)?
+
+    Scans at most ``CLAUDE_SESSION_SCAN_LIMIT`` ``<pid>.json`` descriptors under
+    ``claude_sessions_dir()``, selects the one whose ``sessionId`` equals
+    ``session_id``, validates it with ``descriptor_probe`` (interactive,
+    claude-vscode, UUID session, cwd == this repository) and requires its pid
+    to be alive. Malformed or oversized descriptors are skipped. Only those
+    descriptor files are read; never credentials or auth files. Never raises:
+    any failure is ``live=False`` with a named reason.
+    """
+    result: dict[str, Any] = {"live": False, "reason": "descriptor_not_found", "window_id": ""}
+    try:
+        wanted = str(session_id or "").strip()
+        if not wanted:
+            result["reason"] = "session_id_missing"
+            return result
+        alive = is_alive if callable(is_alive) else pid_alive
+        directory = sessions_dir if sessions_dir is not None else claude_sessions_dir()
+        try:
+            candidates = _claude_descriptor_candidates(directory)
+        except OSError:
+            result["reason"] = "sessions_dir_unreadable"
+            return result
+        for pid, path in candidates:
+            try:
+                with path.open("rb") as handle:
+                    raw = handle.read(CLAUDE_DESCRIPTOR_MAX_BYTES + 1)
+                if len(raw) > CLAUDE_DESCRIPTOR_MAX_BYTES:
+                    continue
+                descriptor = json.loads(raw.decode("utf-8"))
+            except (OSError, UnicodeDecodeError, ValueError):
+                continue
+            if not isinstance(descriptor, dict) or descriptor.get("sessionId") != wanted:
+                continue
+            probe = descriptor_probe(pid, descriptor)
+            if probe.identity is None:
+                result["reason"] = probe.reason
+                continue
+            if not alive(pid):
+                result["reason"] = "pid_not_alive"
+                continue
+            return {
+                "live": True,
+                "reason": "verified",
+                "window_id": str(probe.identity.get("window_id") or ""),
+            }
+        return result
+    except Exception as exc:  # noqa: BLE001 -- a liveness probe never breaks its caller
+        return {"live": False, "reason": f"probe_failed:{type(exc).__name__}", "window_id": ""}
 
 
 def probe_claude_windows_route() -> ClaudeRouteProbe:
